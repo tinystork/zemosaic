@@ -61,6 +61,7 @@ import math
 import csv
 import threading
 import time
+import json
 from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -131,6 +132,53 @@ def _reset_filter_log() -> None:
 
 
 _reset_filter_log()
+
+
+def _ensure_filter_file_logger() -> None:
+    """Ensure a file handler is attached to the root logger for filter logs.
+
+    Key points:
+    - Avoid duplicate FileHandlers pointing to the same file.
+    - Make sure INFO/DEBUG actually reach the file (set levels).
+    - Do not crash UI startup if logging setup fails.
+    """
+    try:
+        log_path = Path(__file__).with_name("zemosaic_filter.log")
+        target_path = log_path.resolve()
+
+        root_logger = logging.getLogger()  # root
+
+        # If a FileHandler already targets this file, we're done.
+        for handler in list(root_logger.handlers):
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            try:
+                handler_path = Path(getattr(handler, "baseFilename", "")).resolve()
+            except Exception:
+                continue
+            if handler_path == target_path:
+                return
+
+        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+
+        # Ensure messages aren't filtered out by handler/root default levels.
+        file_handler.setLevel(logging.DEBUG)
+        if root_logger.level in (logging.NOTSET, 0) or root_logger.level > logging.DEBUG:
+            root_logger.setLevel(logging.DEBUG)
+
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        )
+        file_handler.setFormatter(formatter)
+
+        root_logger.addHandler(file_handler)
+        root_logger.info("Filter log file handler enabled: %s", str(log_path))
+    except Exception:
+        # UI startup must not fail if file logging fails
+        pass
+
+
+_ensure_filter_file_logger()
 
 
 def _resolve_tristate_flag() -> Qt.ItemFlag:
@@ -224,6 +272,9 @@ def _load_zemosaic_qicon() -> QIcon | None:
 
 
 PREVIEW_REFRESH_INTERVAL_SEC = 0.15
+PREVIEW_DRAW_THROTTLE_SEC = 0.30
+PREVIEW_HARD_LIMIT = 1500
+PREVIEW_LEGEND_MAX_GROUPS = 30
 
 if importlib.util.find_spec("locales.zemosaic_localization") is not None:
     from locales.zemosaic_localization import ZeMosaicLocalization  # type: ignore
@@ -246,15 +297,28 @@ try:  # pragma: no cover - optional dependency guard
     from matplotlib.collections import LineCollection
     from matplotlib.figure import Figure
     from matplotlib.colors import to_rgba
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Rectangle
     from matplotlib.widgets import RectangleSelector
-except Exception:  # pragma: no cover - matplotlib optional
+    # Monkey-patch matplotlib's _draw_idle to handle deleted canvases without error
+    if FigureCanvasQTAgg is not None:
+        original_draw_idle = FigureCanvasQTAgg._draw_idle
+        def patched_draw_idle(self):
+            try:
+                return original_draw_idle(self)
+            except RuntimeError as e:
+                if "already deleted" in str(e):
+                    return  # Silently ignore draw calls on deleted canvases
+                raise
+        FigureCanvasQTAgg._draw_idle = patched_draw_idle
+except Exception:  # pragma: no matplotlib optional
     FigureCanvasQTAgg = None  # type: ignore[assignment]
     LineCollection = None  # type: ignore[assignment]
     Figure = None  # type: ignore[assignment]
     Rectangle = None  # type: ignore[assignment]
     RectangleSelector = None  # type: ignore[assignment]
     to_rgba = None  # type: ignore[assignment]
+    Line2D = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_astrometry import (
@@ -475,6 +539,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_utils import (  # type: ignore
         EXCLUDED_DIRS,
+        apply_borrowing_v1,
         get_app_base_dir,
         get_user_config_dir,
         ensure_user_config_dir,
@@ -501,6 +566,13 @@ except Exception:  # pragma: no cover - optional dependency guard
     parse_global_wcs_resolution_override = None  # type: ignore[assignment]
     resolve_global_wcs_output_paths = None  # type: ignore[assignment]
     write_global_wcs_files = None  # type: ignore[assignment]
+    apply_borrowing_v1 = None  # type: ignore[assignment]
+
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 
 
 logger = logging.getLogger(__name__)
@@ -1280,6 +1352,9 @@ class _DirectoryScanWorker(QObject):
                     search_radius_deg=config.get("radius"),
                     downsample_factor=config.get("downsample"),
                     sensitivity=config.get("sensitivity"),
+                    astap_drizzled_fallback_enabled=config.get(
+                        "astap_drizzled_fallback_enabled", False
+                    ),
                     timeout_sec=timeout_val,
                     update_original_header_in_place=write_inplace,
                 )
@@ -1496,6 +1571,12 @@ class _DirectoryScanWorker(QObject):
             self._overrides.get("astap_timeout_sec"),
             default=180,
         )
+        fallback_enabled = self._overrides.get("astap_drizzled_fallback_enabled")
+        if fallback_enabled is None:
+            fallback_enabled = self._solver_settings.get(
+                "astap_drizzled_fallback_enabled", False
+            )
+        fallback_enabled = bool(fallback_enabled)
 
         concurrency = self._coerce_int(
             self._solver_settings.get("astap_max_instances"),
@@ -1518,6 +1599,7 @@ class _DirectoryScanWorker(QObject):
             "sensitivity": sensitivity,
             "timeout": timeout,
             "concurrency": concurrency_value,
+            "astap_drizzled_fallback_enabled": fallback_enabled,
         }
 
     @staticmethod
@@ -1618,6 +1700,7 @@ class FilterQtDialog(QDialog):
 
     _async_log_signal = Signal(str, str)
     _auto_group_finished_signal = Signal(object, object)
+    _auto_group_stage_signal = Signal(str)
 
     def __init__(
         self,
@@ -1711,6 +1794,7 @@ class FilterQtDialog(QDialog):
         self._dialog_button_box: QDialogButtonBox | None = None
         self._async_log_signal.connect(self._append_log_from_signal)
         self._auto_group_finished_signal.connect(self._handle_auto_group_finished)
+        self._auto_group_stage_signal.connect(self._handle_auto_group_stage_update)
 
         if self._stream_scan:
             self._normalized_items = []
@@ -1758,6 +1842,9 @@ class FilterQtDialog(QDialog):
         self._preview_refresh_pending = False
         self._preview_last_refresh = 0.0
         self._preview_refresh_interval = PREVIEW_REFRESH_INTERVAL_SEC
+        self._preview_draw_throttle = PREVIEW_DRAW_THROTTLE_SEC
+        self._last_preview_draw_ts = 0.0
+        self._preview_draw_attempts = 0
         self._cluster_groups: list[list[_NormalizedItem]] = []
         self._cluster_threshold_used: float | None = None
         self._cluster_refresh_pending = False
@@ -1768,6 +1855,9 @@ class FilterQtDialog(QDialog):
         self._solve_animation: QMovie | None = None
         self._auto_group_running = False
         self._auto_group_override_groups: list[list[dict[str, Any]]] | None = None
+        self._auto_group_stage_text = ""
+        self._auto_group_started_at: float | None = None
+        self._auto_group_elapsed_timer: QTimer | None = None
         self._header_cache: dict[str, Any] = {}
         self._global_wcs_state: dict[str, Any] = {
             "descriptor": None,
@@ -2476,6 +2566,9 @@ class FilterQtDialog(QDialog):
         self._status_label.setText(
             self._localizer.get("filter.cluster.running", "Preparing master-tile groups…")
         )
+        self._start_auto_group_elapsed_timer(
+            self._localizer.get("filter.cluster.running", "Preparing master-tile groups…")
+        )
 
         optimize_flag = normalized_mode == "auto"
         max_raw_snapshot = int(getattr(self, "_max_raw_per_tile_value", 0) or 0)
@@ -2502,6 +2595,7 @@ class FilterQtDialog(QDialog):
             self._show_processing_overlay()
         except Exception as exc:
             self._hide_processing_overlay()
+            self._stop_auto_group_elapsed_timer()
             self._auto_group_running = False
             self._set_group_buttons_enabled(True)
             message = self._localizer.get(
@@ -2524,6 +2618,49 @@ class FilterQtDialog(QDialog):
             except Exception:
                 pass
 
+    def _start_auto_group_elapsed_timer(self, stage: str) -> None:
+        self._auto_group_started_at = time.perf_counter()
+        self._auto_group_stage_text = stage
+        if self._auto_group_elapsed_timer is None:
+            timer = QTimer(self)
+            timer.setInterval(1000)
+            timer.timeout.connect(self._update_auto_group_elapsed_label)
+            self._auto_group_elapsed_timer = timer
+        if self._auto_group_elapsed_timer is not None and not self._auto_group_elapsed_timer.isActive():
+            self._auto_group_elapsed_timer.start()
+        self._update_auto_group_elapsed_label(force=True)
+
+    def _stop_auto_group_elapsed_timer(self) -> None:
+        self._auto_group_started_at = None
+        if self._auto_group_elapsed_timer is not None:
+            try:
+                self._auto_group_elapsed_timer.stop()
+            except Exception:
+                pass
+
+    def _update_auto_group_elapsed_label(self, *, force: bool = False) -> None:
+        if not getattr(self, "_auto_group_running", False):
+            self._stop_auto_group_elapsed_timer()
+            return
+        if self._auto_group_started_at is None:
+            if force:
+                self._status_label.setText(self._auto_group_stage_text)
+            return
+        elapsed = max(0, int(time.perf_counter() - self._auto_group_started_at))
+        stage_text = self._auto_group_stage_text or self._localizer.get(
+            "filter.cluster.running",
+            "Preparing master-tile groups…",
+        )
+        try:
+            self._status_label.setText(f"{stage_text} (elapsed: {elapsed}s)")
+        except Exception:
+            self._status_label.setText(stage_text)
+
+    @Slot(str)
+    def _handle_auto_group_stage_update(self, stage: str) -> None:
+        self._auto_group_stage_text = stage
+        self._update_auto_group_elapsed_label(force=True)
+
     def _handle_auto_group_empty_selection(self) -> None:
         self._auto_group_running = False
         self._group_outline_bounds = []
@@ -2532,6 +2669,7 @@ class FilterQtDialog(QDialog):
         self._append_log(summary_text)
         self._update_auto_group_summary_display(summary_text, summary_text)
         self._status_label.setText(summary_text)
+        self._stop_auto_group_elapsed_timer()
         self._set_group_buttons_enabled(True)
         self._hide_processing_overlay()
 
@@ -2550,45 +2688,72 @@ class FilterQtDialog(QDialog):
         normalized_mode = "manual" if str(mode).lower().startswith("manual") else "auto"
         messages: list[str | tuple[str, str]] = []
         result_payload: dict[str, Any] | None = None
+        start_time = time.perf_counter()
+        timings: dict[str, float] = {}
         try:
-            result_payload = self._compute_auto_groups(
-                selected_indices,
-                overcap_pct,
-                coverage_enabled_flag,
-                messages,
-            )
-            if isinstance(result_payload, dict):
-                result_payload["mode"] = normalized_mode
-                result_payload["auto_optimised"] = bool(optimize_flag)
-                if optimize_flag:
-                    self._optimize_auto_group_result(
-                        result_payload,
-                        max_raw_cap=int(max_raw_cap),
-                        min_safe_stack=int(min_safe_stack),
-                        target_stack_size=int(target_stack_size),
-                        overlap_percent=int(overlap_percent),
-                        messages=messages,
-                    )
-        except Exception as exc:  # pragma: no cover - defensive guard
-            error_text = self._localizer.get(
-                "filter.cluster.failed",
-                "Auto-organisation failed: {error}",
-            )
             try:
-                formatted = error_text.format(error=exc)
-            except Exception:
-                formatted = f"Auto-organisation failed: {exc}"
-            messages.append((formatted, "ERROR"))
-        if result_payload and result_payload.get("coverage_first"):
-            groups_count = len(result_payload.get("final_groups") or [])
+                self._auto_group_stage_signal.emit("Clustering frames…")
+                self._async_log_signal.emit("Stage: clustering connected groups", "INFO")
+                result_payload = self._compute_auto_groups(
+                    selected_indices,
+                    overcap_pct,
+                    coverage_enabled_flag,
+                    messages,
+                )
+                if isinstance(result_payload, dict):
+                    timings = result_payload.get("timings") or {}
+                    self._auto_group_stage_signal.emit("Post-processing groups…")
+                    self._async_log_signal.emit("Stage: post-processing clusters", "INFO")
+                    result_payload["mode"] = normalized_mode
+                    result_payload["auto_optimised"] = bool(optimize_flag)
+                    if optimize_flag:
+                        self._auto_group_stage_signal.emit("Auto-optimiser…")
+                        self._async_log_signal.emit("Stage: running auto-optimiser", "INFO")
+                        t_start_optimiser = time.perf_counter()
+                        self._optimize_auto_group_result(
+                            result_payload,
+                            max_raw_cap=int(max_raw_cap),
+                            min_safe_stack=int(min_safe_stack),
+                            target_stack_size=int(target_stack_size),
+                            overlap_percent=int(overlap_percent),
+                            messages=messages,
+                        )
+                        timings["auto_optimiser"] = time.perf_counter() - t_start_optimiser
+            except Exception as exc:  # pragma: no cover - defensive guard
+                error_text = self._localizer.get(
+                    "filter.cluster.failed",
+                    "Auto-organisation failed: {error}",
+                )
+                try:
+                    formatted = error_text.format(error=exc)
+                except Exception:
+                    formatted = f"Auto-organisation failed: {exc}"
+                messages.append((formatted, "ERROR"))
+            if result_payload and result_payload.get("coverage_first"):
+                groups_count = len(result_payload.get("final_groups") or [])
+                messages.append(
+                    self._format_message(
+                        "log_covfirst_done",
+                        "Coverage-first preplan ready: {N} groups written to overrides_state.preplan_master_groups",
+                        N=groups_count,
+                    )
+                )
+            elapsed_total = time.perf_counter() - start_time
+            timings["total"] = elapsed_total
+            timing_summary = " ".join(f"{k}={v:.2f}s" for k, v in timings.items())
+            logger.info("[AutoGroupTiming] %s", timing_summary)
+            messages.append(f"Timings: {timing_summary}")
             messages.append(
                 self._format_message(
-                    "log_covfirst_done",
-                    "Coverage-first preplan ready: {N} groups written to overrides_state.preplan_master_groups",
-                    N=groups_count,
+                    "auto_group_total_time",
+                    "Auto-group completed in {DT:.1f}s",
+                    DT=elapsed_total,
                 )
             )
-        self._auto_group_finished_signal.emit(result_payload, list(messages))
+        finally:
+            self._auto_group_stage_signal.emit("Finalizing…")
+            self._async_log_signal.emit(f"Stage: finalize (elapsed {time.perf_counter() - start_time:.1f}s)", "INFO")
+            self._auto_group_finished_signal.emit(result_payload, list(messages))
 
     @Slot(object, object)
     def _handle_auto_group_finished(
@@ -2596,37 +2761,379 @@ class FilterQtDialog(QDialog):
         result_payload: object,
         messages_payload: object,
     ) -> None:
-        self._auto_group_running = False
-        self._set_group_buttons_enabled(True)
-        entries: list[Any] = []
-        if isinstance(messages_payload, list):
-            entries = list(messages_payload)
-        elif messages_payload:
-            entries = [messages_payload]
-        for entry in entries:
-            if isinstance(entry, tuple):
-                text = entry[0]
-                level = entry[1] if len(entry) > 1 else "INFO"
-                self._append_log(str(text), level=str(level))
-            else:
-                self._append_log(str(entry))
-        if not isinstance(result_payload, dict) or not result_payload:
-            if not entries:
-                fallback = self._localizer.get(
-                    "filter.cluster.failed_generic",
-                    "Unable to prepare master-tile groups.",
+        try:
+            entries: list[Any] = []
+            if isinstance(messages_payload, list):
+                entries = list(messages_payload)
+            elif messages_payload:
+                entries = [messages_payload]
+            for entry in entries:
+                if isinstance(entry, tuple):
+                    text = entry[0]
+                    level = entry[1] if len(entry) > 1 else "INFO"
+                    self._append_log(str(text), level=str(level))
+                else:
+                    self._append_log(str(entry))
+            if not isinstance(result_payload, dict) or not result_payload:
+                if not entries:
+                    fallback = self._localizer.get(
+                        "filter.cluster.failed_generic",
+                        "Unable to prepare master-tile groups.",
+                    )
+                    self._append_log(fallback, level="WARN")
+                self._status_label.setText(
+                    self._localizer.get(
+                        "filter.cluster.failed_short",
+                        "Auto-organisation failed.",
+                    )
                 )
-                self._append_log(fallback, level="WARN")
+                return
+            self._apply_auto_group_result(result_payload)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self._append_log(f"Auto-group apply failed: {exc}", level="ERROR")
             self._status_label.setText(
-                self._localizer.get(
-                    "filter.cluster.failed_short",
-                    "Auto-organisation failed.",
-                )
+                self._localizer.get("filter.cluster.failed_short", "Auto-organisation failed.")
             )
+        finally:
+            self._auto_group_running = False
+            self._set_group_buttons_enabled(True)
+            self._stop_auto_group_elapsed_timer()
             self._hide_processing_overlay()
+
+    def _coerce_eqmode_mode(self, raw_value: Any) -> tuple[str | None, int | None]:
+        if raw_value is None:
+            return None, None
+        value_int: int | None = None
+        try:
+            value_int = int(raw_value)
+        except Exception:
+            try:
+                value_int = int(str(raw_value).strip())
+            except Exception:
+                value_int = None
+        if value_int == 1:
+            return "EQ", 1
+        if value_int == 0:
+            return "ALTZ", 0
+        return None, None
+
+    def _extract_eqmode_from_entry(self, entry: dict[str, Any]) -> str | None:
+        if not isinstance(entry, dict):
+            return None
+        cached = entry.get("_eqmode_mode")
+        if isinstance(cached, str):
+            return cached
+        raw_value = entry.get("EQMODE")
+        header = entry.get("header") or entry.get("header_subset")
+        if raw_value is None:
+            path_val = None
+            for key in ("path", "path_raw", "path_preprocessed_cache", "file", "filename"):
+                candidate = entry.get(key)
+                if candidate:
+                    path_val = candidate
+                    break
+            if header is None and path_val:
+                header = self._load_header(str(path_val))
+                if header is not None:
+                    entry.setdefault("header", header)
+            if header is not None:
+                try:
+                    raw_value = header.get("EQMODE")
+                except Exception:
+                    raw_value = None
+        mode, _value_int = self._coerce_eqmode_mode(raw_value)
+        if mode:
+            entry["_eqmode_mode"] = mode
+        return mode
+
+    def _split_group_by_eqmode(
+        self,
+        group: list[dict[str, Any]],
+        log_fn: Callable[[str], None] | None = None,
+    ) -> list[list[dict[str, Any]]]:
+        if not group:
+            return [group]
+        eq_bucket: list[dict[str, Any]] = []
+        altz_bucket: list[dict[str, Any]] = []
+        unknown_bucket: list[dict[str, Any]] = []
+        for entry in group:
+            mode = self._extract_eqmode_from_entry(entry)
+            if mode == "EQ":
+                eq_bucket.append(entry)
+            elif mode == "ALTZ":
+                altz_bucket.append(entry)
+            else:
+                unknown_bucket.append(entry)
+        if eq_bucket and altz_bucket:
+            message = (
+                "eqmode_split: group mixed (EQ=%d ALTZ=%d UNKNOWN=%d) -> split"
+                % (len(eq_bucket), len(altz_bucket), len(unknown_bucket))
+            )
+            logger.info(message)
+            if log_fn is not None:
+                log_fn(message)
+            return [bucket for bucket in (eq_bucket, altz_bucket, unknown_bucket) if bucket]
+        return [group]
+
+    def _group_eqmode_signature(self, group: Sequence[dict[str, Any]]) -> str:
+        has_eq = False
+        has_altz = False
+        for entry in group or []:
+            mode = self._extract_eqmode_from_entry(entry)
+            if mode == "EQ":
+                has_eq = True
+            elif mode == "ALTZ":
+                has_altz = True
+        if has_eq and has_altz:
+            return "MIXED"
+        if has_eq:
+            return "EQ"
+        if has_altz:
+            return "ALTZ"
+        return "UNKNOWN"
+
+    def _prefetch_eqmode_for_candidates(
+        self,
+        candidate_infos: Sequence[dict[str, Any]],
+        messages: list[str | tuple[str, str]],
+    ) -> None:
+        if not candidate_infos:
             return
-        self._apply_auto_group_result(result_payload)
-        self._hide_processing_overlay()
+
+        start_time = time.perf_counter()
+
+        def _resolve_entry_path(entry_obj: dict[str, Any]) -> str | None:
+            for key in ("path", "path_raw", "path_preprocessed_cache", "file", "filename"):
+                candidate = entry_obj.get(key)
+                if candidate:
+                    return str(candidate)
+            return None
+
+        def _stat_file(path_value: str) -> tuple[int | None, float | None]:
+            size_val: int | None = None
+            mtime_val: float | None = None
+            try:
+                size_val = int(ospath.getsize(path_value))
+            except Exception:
+                size_val = None
+            try:
+                mtime_val = float(ospath.getmtime(path_value))
+            except Exception:
+                mtime_val = None
+            return size_val, mtime_val
+
+        def _prime_entry_mode(entry_obj: dict[str, Any]) -> bool:
+            cached_mode = entry_obj.get("_eqmode_mode")
+            if isinstance(cached_mode, str):
+                return True
+            mode_from_value, _mode_int = self._coerce_eqmode_mode(entry_obj.get("EQMODE"))
+            if mode_from_value:
+                entry_obj["_eqmode_mode"] = mode_from_value
+                return True
+            header_obj = entry_obj.get("header_subset") or entry_obj.get("header")
+            if header_obj is not None:
+                try:
+                    header_value = header_obj.get("EQMODE")  # type: ignore[attr-defined]
+                except Exception:
+                    header_value = None
+                mode_from_header, _ = self._coerce_eqmode_mode(header_value)
+                if mode_from_header:
+                    entry_obj["_eqmode_mode"] = mode_from_header
+                    return True
+            return False
+
+        def _resolve_cache_path(entries: Sequence[dict[str, Any]]) -> str | None:
+            directories: list[str] = []
+            for info in entries:
+                if not isinstance(info, dict):
+                    continue
+                candidate_path = _resolve_entry_path(info)
+                if not candidate_path:
+                    continue
+                try:
+                    directories.append(ospath.dirname(ospath.abspath(candidate_path)))
+                except Exception:
+                    continue
+            if not directories:
+                return None
+            common_dir: str | None = None
+            try:
+                common_dir = ospath.commonpath(directories)
+            except Exception:
+                common_dir = directories[0]
+            if not common_dir:
+                return None
+            return ospath.join(common_dir, ".zemosaic_eqmode_cache.json")
+
+        cache_path = _resolve_cache_path(candidate_infos)
+        cache_store: dict[str, dict[str, Any]] = {}
+        if cache_path and ospath.isfile(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    for key, payload in loaded.items():
+                        if isinstance(key, str) and isinstance(payload, dict):
+                            cache_store[key] = dict(payload)
+            except Exception:
+                cache_store = {}
+
+        cache_dirty = False
+        cache_hits = 0
+        cache_miss = 0
+        reads_header = 0
+        worker_count = 0
+
+        needs: list[dict[str, Any]] = []
+
+        for entry in candidate_infos:
+            if not isinstance(entry, dict):
+                continue
+            if _prime_entry_mode(entry):
+                continue
+            entry_path = _resolve_entry_path(entry)
+            if not entry_path:
+                continue
+            norm_path = casefold_path(entry_path)
+            size_val, mtime_val = _stat_file(entry_path)
+            cache_entry = cache_store.get(norm_path)
+            cache_valid = False
+            mode_from_cache = None
+            if cache_entry and size_val is not None and mtime_val is not None:
+                try:
+                    cached_size = int(cache_entry.get("size"))  # type: ignore[arg-type]
+                except Exception:
+                    cached_size = None
+                try:
+                    cached_mtime = float(cache_entry.get("mtime"))  # type: ignore[arg-type]
+                except Exception:
+                    cached_mtime = None
+                if cached_size == size_val and cached_mtime == mtime_val:
+                    cache_valid = True
+                    eq_value = cache_entry.get("eqmode")
+                    eq_int: int | None
+                    try:
+                        eq_int = int(eq_value)
+                    except Exception:
+                        eq_int = None
+                    if eq_int == 1:
+                        mode_from_cache = "EQ"
+                    elif eq_int == 0:
+                        mode_from_cache = "ALTZ"
+                else:
+                    cache_valid = False
+            if cache_valid:
+                cache_hits += 1
+                if mode_from_cache:
+                    entry["_eqmode_mode"] = mode_from_cache
+                continue
+            cache_miss += 1
+            if cache_entry and cache_path:
+                cache_store.pop(norm_path, None)
+                cache_dirty = True
+            needs.append(
+                {
+                    "entry": entry,
+                    "path": entry_path,
+                    "key": norm_path,
+                    "size": size_val,
+                    "mtime": mtime_val,
+                }
+            )
+
+        def _read_from_path(path_value: str) -> tuple[str | None, int | None]:
+            return self._read_eqmode_from_path(path_value)
+
+        if needs and fits is not None:
+            worker_count = min(16, max(4, int(os.cpu_count() or 8)))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_map = {
+                    executor.submit(_read_from_path, payload["path"]): payload for payload in needs
+                }
+                for future in as_completed(future_map):
+                    payload = future_map[future]
+                    reads_header += 1
+                    mode_value: str | None = None
+                    mode_int: int | None = None
+                    try:
+                        mode_value, mode_int = future.result()
+                    except Exception:
+                        mode_value = None
+                        mode_int = None
+                    if mode_value:
+                        payload["entry"]["_eqmode_mode"] = mode_value
+                    if (payload["size"] is None or payload["mtime"] is None) and payload["path"]:
+                        payload["size"], payload["mtime"] = _stat_file(payload["path"])
+                    if cache_path and payload["size"] is not None and payload["mtime"] is not None:
+                        cache_store[payload["key"]] = {
+                            "eqmode": mode_int if mode_int in (0, 1) else None,
+                            "size": int(payload["size"]),
+                            "mtime": float(payload["mtime"]),
+                        }
+                        cache_dirty = True
+
+        if cache_path and cache_dirty:
+            try:
+                cache_dir = ospath.dirname(cache_path)
+                if cache_dir and not ospath.isdir(cache_dir):
+                    os.makedirs(cache_dir, exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as handle:
+                    json.dump(cache_store, handle)
+            except Exception:
+                pass
+
+        eq_count = 0
+        altz_count = 0
+        unknown_count = 0
+        for entry in candidate_infos:
+            if not isinstance(entry, dict):
+                continue
+            mode = entry.get("_eqmode_mode")
+            if mode == "EQ":
+                eq_count += 1
+            elif mode == "ALTZ":
+                altz_count += 1
+            else:
+                unknown_count += 1
+
+        duration = time.perf_counter() - start_time
+        cache_label = cache_path or "none"
+        summary = (
+            "eqmode_summary: EQ=%d ALTZ=%d UNKNOWN=%d "
+            "(cache_hit=%d cache_miss=%d read=%d workers=%d dt=%.2fs) cache=%s"
+            % (
+                eq_count,
+                altz_count,
+                unknown_count,
+                cache_hits,
+                cache_miss,
+                reads_header,
+                worker_count,
+                duration,
+                cache_label,
+            )
+        )
+        logger.info(summary)
+        if isinstance(messages, list):
+            messages.append(summary)
+
+    def _read_eqmode_from_path(self, path: str) -> tuple[str | None, int | None]:
+        if not path or fits is None:
+            return None, None
+        raw_value: Any = None
+        try:
+            raw_value = fits.getval(path, "EQMODE", ext=0, ignore_missing_end=True)
+        except Exception:
+            try:
+                header = fits.getheader(path, ext=0, ignore_missing_end=True)
+            except Exception:
+                header = None
+            if header is not None:
+                try:
+                    raw_value = header.get("EQMODE")
+                except Exception:
+                    raw_value = None
+        return self._coerce_eqmode_mode(raw_value)
 
     def _compute_auto_groups(
         self,
@@ -2635,6 +3142,7 @@ class FilterQtDialog(QDialog):
         coverage_requested: bool,
         messages: list[str | tuple[str, str]],
     ) -> dict[str, Any]:
+        timings: dict[str, float] = {}
         sds_mode = bool(self._sds_checkbox.isChecked()) if self._sds_checkbox is not None else False
         coverage_enabled = bool(coverage_requested)
         if sds_mode and compute_global_wcs_descriptor is not None:
@@ -2669,7 +3177,11 @@ class FilterQtDialog(QDialog):
                         count=len(sds_groups),
                         sizes=sizes,
                     )
-                    self._append_log(log_text)
+                    messages.append(log_text)
+                    try:
+                        self._async_log_signal.emit(log_text, "INFO")
+                    except Exception:
+                        pass
                     messages.append(
                         self._format_message(
                             "filter.cluster.sds_ready",
@@ -2683,6 +3195,7 @@ class FilterQtDialog(QDialog):
                         "coverage_first": True,
                         "threshold_used": 0.0,
                         "angle_split": 0.0,
+                        "timings": timings,
                     }
                 else:
                     messages.append(
@@ -2704,6 +3217,7 @@ class FilterQtDialog(QDialog):
                         "WARN",
                     )
                 )
+        t_start = time.perf_counter()
         candidate_infos: list[dict[str, Any]] = []
         coord_samples: list[tuple[float, float]] = []
         for idx in selected_indices:
@@ -2715,11 +3229,16 @@ class FilterQtDialog(QDialog):
             candidate_infos.append(payload)
             if coords and None not in coords:
                 coord_samples.append((float(coords[0]), float(coords[1])))
+        timings["build_candidates"] = time.perf_counter() - t_start
 
         if not candidate_infos:
             raise RuntimeError("No candidate entries were usable for grouping.")
         if WCS is None and SkyCoord is None:
             raise RuntimeError("Astropy is required to compute WCS-based clusters.")
+
+        t_start = time.perf_counter()
+        self._prefetch_eqmode_for_candidates(candidate_infos, messages)
+        timings["prefetch_eqmode"] = time.perf_counter() - t_start
 
         threshold_override = self._resolve_cluster_threshold_override()
         threshold_heuristic = self._estimate_threshold_from_coords(coord_samples)
@@ -2745,17 +3264,21 @@ class FilterQtDialog(QDialog):
                 )
             )
 
+        t_start = time.perf_counter()
         groups_initial = _CLUSTER_CONNECTED(
             candidate_infos,
             float(threshold_initial),
             None,
             orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
         )
+        timings["clustering"] = time.perf_counter() - t_start
         if not groups_initial:
             raise RuntimeError("Worker clustering returned no groups.")
 
         threshold_used = float(threshold_initial)
-        groups_used = groups_initial
+        groups_used: list[list[dict[str, Any]]] = []
+        for group in groups_initial:
+            groups_used.extend(self._split_group_by_eqmode(group, log_fn=messages.append))
         candidate_count = len(candidate_infos)
         ratio = (len(groups_initial) / float(candidate_count)) if candidate_count else 0.0
         pathological = candidate_count > 0 and (
@@ -2783,12 +3306,14 @@ class FilterQtDialog(QDialog):
             if p90_value and math.isfinite(p90_value):
                 threshold_relaxed = max(threshold_used, float(p90_value) * 1.1)
                 if threshold_relaxed > threshold_used * 1.001:
+                    t_start = time.perf_counter()
                     relaxed_groups = _CLUSTER_CONNECTED(
                         candidate_infos,
                         float(threshold_relaxed),
                         None,
                         orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
                     )
+                    timings["clustering"] += time.perf_counter() - t_start
                     if relaxed_groups and len(relaxed_groups) < len(groups_used):
                         messages.append(
                             self._format_message(
@@ -2856,6 +3381,7 @@ class FilterQtDialog(QDialog):
         final_groups: list[list[dict[str, Any]]]
         overlap_pct = self._resolve_overlap_percent()
         overlap_fraction = max(0.0, min(0.7, float(overlap_pct) / 100.0))
+        t_start_autosplit = time.perf_counter()
         if cap_effective > 0:
             if overlap_fraction <= 0.0 and _AUTOSPLIT_GROUPS is not None:
                 groups_after_autosplit = _AUTOSPLIT_GROUPS(
@@ -2899,15 +3425,23 @@ class FilterQtDialog(QDialog):
             merge_fn = _tk_merge_small_groups or (
                 lambda groups, min_size, cap, **_: groups  # type: ignore[misc]
             )
-            final_groups = merge_fn(
-                groups_after_autosplit,
-                min_size=int(max(1, min_cap)),
-                cap=int(max(1, cap_effective)),
-                cap_allowance=cap_allowance,
-                compute_dispersion=_COMPUTE_MAX_SEPARATION,
-                max_dispersion_deg=max_dispersion,
-                log_fn=messages.append,
-            )
+            final_groups = []
+            signature_buckets: dict[str, list[list[dict[str, Any]]]] = {}
+            for group in groups_after_autosplit:
+                signature = self._group_eqmode_signature(group)
+                signature_buckets.setdefault(signature, []).append(group)
+            for grouped in signature_buckets.values():
+                final_groups.extend(
+                    merge_fn(
+                        grouped,
+                        min_size=int(max(1, min_cap)),
+                        cap=int(max(1, cap_effective)),
+                        cap_allowance=cap_allowance,
+                        compute_dispersion=_COMPUTE_MAX_SEPARATION,
+                        max_dispersion_deg=max_dispersion,
+                        log_fn=messages.append,
+                    )
+                )
             if coverage_enabled:
                 messages.append(
                     self._format_message(
@@ -2927,6 +3461,7 @@ class FilterQtDialog(QDialog):
                     )
                 )
             final_groups = groups_after_autosplit
+        timings["autosplit"] = time.perf_counter() - t_start_autosplit
 
         self._log_batching_summary(
             final_groups,
@@ -2939,14 +3474,47 @@ class FilterQtDialog(QDialog):
             for info in group:
                 if info.pop("_fallback_wcs_used", False):
                     info.pop("wcs", None)
+        
+        t_start_borrow = time.perf_counter()
+        if coverage_enabled and apply_borrowing_v1 is not None:
+            try:
+                self._auto_group_stage_signal.emit("Borrowing v1…")
+                self._async_log_signal.emit("Stage: borrowing coverage batches", "INFO")
+            except Exception:
+                pass
+            final_groups, _borrow_stats = apply_borrowing_v1(
+                final_groups,
+                None,
+                logger=logger,
+            )
+            borrowed_unique = 0
+            borrowed_total = 0
+            if isinstance(_borrow_stats, dict):
+                try:
+                    borrowed_unique = int(_borrow_stats.get("borrowed_unique_images", 0))
+                except Exception:
+                    borrowed_unique = 0
+                try:
+                    borrowed_total = int(_borrow_stats.get("borrowed_total_assignments", 0))
+                except Exception:
+                    borrowed_total = 0
+            logger.info(
+                "Borrowing v1 applied: groups=%d borrowed_unique=%d borrowed_total=%d",
+                len(final_groups) if isinstance(final_groups, list) else 0,
+                borrowed_unique,
+                borrowed_total,
+            )
+        timings["borrowing"] = time.perf_counter() - t_start_borrow
 
-        return {
+        result = {
             "final_groups": final_groups,
             "sizes": [len(group) for group in final_groups],
             "coverage_first": bool(coverage_enabled),
             "threshold_used": threshold_used,
             "angle_split": angle_split_effective,
         }
+        result["timings"] = timings
+        return result
 
     def _optimize_auto_group_result(
         self,
@@ -3051,15 +3619,18 @@ class FilterQtDialog(QDialog):
             if not group:
                 continue
             coords = self._gather_group_coordinates(group, path_map)
-            center = self._compute_center_from_coords(coords)
+            center, radius = self._compute_center_and_radius(coords)
             dispersion = self._compute_dispersion_for_coords(coords)
+            eqmode_sig = self._group_eqmode_signature(group)
             records.append(
                 {
                     "entries": list(group),
                     "coords": coords,
                     "center": center,
+                    "radius": radius,
                     "size": len(group),
                     "dispersion": dispersion,
+                    "eqmode_sig": eqmode_sig,
                 }
             )
         return records
@@ -3110,6 +3681,22 @@ class FilterQtDialog(QDialog):
         if count <= 0:
             return None
         return (sum_ra / count, sum_dec / count)
+
+    def _compute_center_and_radius(
+        self,
+        coords: list[tuple[float, float]],
+    ) -> tuple[tuple[float, float] | None, float]:
+        center = self._compute_center_from_coords(coords)
+        if center is None:
+            return None, 0.0
+        if not coords:
+            return center, 0.0
+        max_dist_sq = 0.0
+        for point in coords:
+            dist_sq = (point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2
+            if dist_sq > max_dist_sq:
+                max_dist_sq = dist_sq
+        return center, math.sqrt(max_dist_sq)
 
     def _compute_dispersion_for_coords(self, coords: list[tuple[float, float]]) -> float:
         if not coords or len(coords) < 2:
@@ -3162,7 +3749,7 @@ class FilterQtDialog(QDialog):
                 )
                 if partner is None:
                     continue
-                partner_idx, coords, dispersion = partner
+                partner_idx, coords, dispersion_upper = partner
                 keep_idx = min(idx, partner_idx)
                 drop_idx = max(idx, partner_idx)
                 keep = records[keep_idx]
@@ -3172,11 +3759,14 @@ class FilterQtDialog(QDialog):
                     continue
                 if cap_limit is not None and len(combined_entries) > cap_limit:
                     continue
+
+                center, radius = self._compute_center_and_radius(coords or [])
                 keep["entries"] = combined_entries
                 keep["coords"] = coords or []
-                keep["center"] = self._compute_center_from_coords(coords or [])
+                keep["center"] = center
+                keep["radius"] = radius
                 keep["size"] = len(combined_entries)
-                keep["dispersion"] = dispersion
+                keep["dispersion"] = dispersion_upper
                 records.pop(drop_idx)
                 merges += 1
                 merged_this_round = True
@@ -3199,51 +3789,85 @@ class FilterQtDialog(QDialog):
         source = records[idx]
         source_coords = list(source.get("coords") or [])
         source_center = source.get("center")
+        source_sig = str(source.get("eqmode_sig") or "UNKNOWN")
+        source_radius = float(source.get("radius", 0.0))
+        source_dispersion = float(source.get("dispersion", 0.0))
+
         if not source_coords or source_center is None:
             return None
+
         source_size = int(source.get("size", len(source_coords)))
         neighbors: list[tuple[float, int, int]] = []
         for other_idx, other in enumerate(records):
             if other_idx == idx:
                 continue
+            other_sig = str(other.get("eqmode_sig") or "UNKNOWN")
+            if other_sig != source_sig:
+                continue
+
             other_coords = other.get("coords") or []
             other_center = other.get("center")
             if not other_coords or other_center is None:
                 continue
+
             other_size = int(other.get("size", len(other_coords)))
             combined_size = source_size + other_size
             if cap_limit is not None and combined_size > cap_limit:
                 continue
+
             distance = self._angular_distance(source_center, other_center)
             neighbors.append((distance, other_idx, combined_size))
+
         if not neighbors:
             return None
+
         neighbors.sort(key=lambda item: item[0])
+        neighbor_cap = self._config_value("auto_optimiser_neighbor_cap", 64)
+        if neighbor_cap > 0:
+            neighbors = neighbors[: int(neighbor_cap)]
+
         best_idx: int | None = None
         best_coords: list[tuple[float, float]] | None = None
-        best_dispersion = 0.0
+        best_dispersion_upper = 0.0
         best_score = float("inf")
         best_distance = float("inf")
+
         for distance, other_idx, combined_size in neighbors:
-            combined_coords = source_coords + list(records[other_idx].get("coords") or [])
-            if not combined_coords:
+            other = records[other_idx]
+            other_radius = float(other.get("radius", 0.0))
+            other_dispersion = float(other.get("dispersion", 0.0))
+
+            # Estimate dispersion upper bound without full computation
+            cross_upper = distance + source_radius + other_radius
+            disp_upper = max(source_dispersion, other_dispersion, cross_upper)
+
+            if dispersion_limit > 0 and disp_upper > dispersion_limit:
                 continue
-            dispersion = self._compute_dispersion_for_coords(combined_coords)
-            if dispersion_limit > 0 and dispersion > dispersion_limit:
-                continue
+
             size_score = abs(desired_target - combined_size)
             if (
                 size_score < best_score - 1e-6
-                or (abs(size_score - best_score) <= 1e-6 and distance < best_distance)
+                or (abs(size_score - best_score) <= 1e-6 and disp_upper < best_dispersion_upper - 1e-6)
+                or (
+                    abs(size_score - best_score) <= 1e-6
+                    and abs(disp_upper - best_dispersion_upper) <= 1e-6
+                    and distance < best_distance
+                )
             ):
+                combined_coords = source_coords + list(other.get("coords") or [])
+                if not combined_coords:
+                    continue
+
                 best_idx = other_idx
                 best_coords = combined_coords
-                best_dispersion = dispersion
+                best_dispersion_upper = disp_upper
                 best_score = size_score
                 best_distance = distance
+
         if best_idx is None or best_coords is None:
             return None
-        return best_idx, best_coords, best_dispersion
+
+        return best_idx, best_coords, best_dispersion_upper
 
     def _split_large_groups_for_auto(
         self,
@@ -5749,11 +6373,11 @@ class FilterQtDialog(QDialog):
             entry.original["footprint_radec"] = footprint
         return footprint
 
-    def _collect_preview_points(self) -> List[Tuple[float, float, int | None]]:
+    def _collect_preview_points(self) -> List[Tuple[int, float, float, int | None]]:
         if self._preview_canvas is None:
             return []
         limit = self._resolve_preview_cap()
-        points: list[Tuple[float, float, int | None]] = []
+        points: list[Tuple[int, float, float, int | None]] = []
         for row, entry in enumerate(self._normalized_items):
             if not self._entry_is_checked(row):
                 continue
@@ -5763,10 +6387,468 @@ class FilterQtDialog(QDialog):
             if ra_deg is None or dec_deg is None:
                 continue
             cluster_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
-            points.append((ra_deg, dec_deg, cluster_idx))
+            points.append((row, ra_deg, dec_deg, cluster_idx))
             if limit is not None and len(points) >= limit:
                 break
         return points
+
+    def _resolve_preview_hard_limit(self) -> int:
+        try:
+            value = self._config_value("preview_hard_limit", PREVIEW_HARD_LIMIT)
+            if value in (None, ""):
+                return PREVIEW_HARD_LIMIT
+            return max(200, int(value))
+        except Exception:
+            return PREVIEW_HARD_LIMIT
+
+    def _build_preview_geometry(
+        self,
+        collected_points: Sequence[tuple[int, float, float, int | None]] | None = None,
+    ) -> dict[str, Any]:
+        colorize = self._should_color_footprints_by_group()
+        preview_cap = self._resolve_preview_cap()
+        hard_limit = self._resolve_preview_hard_limit()
+        points_by_group: dict[int | None, list[Tuple[float, float]]] = {}
+        highlight_points: list[Tuple[float, float]] = []
+        footprints: list[list[Tuple[float, float]]] = []
+        footprint_colors: list[Any] = []
+        total_entries = 0
+        points_added = 0
+        highlight_cap = preview_cap if preview_cap is not None else hard_limit
+        footprint_mode = "footprints"
+        selected_keys = set(self._selected_group_keys)
+        collected_by_row: dict[int, tuple[float, float, int | None]] = {}
+
+        if collected_points:
+            for row_idx, ra_deg, dec_deg, group_idx in collected_points:
+                try:
+                    ra_val = float(ra_deg)
+                    dec_val = float(dec_deg)
+                except Exception:
+                    continue
+                collected_by_row[int(row_idx)] = (ra_val, dec_val, group_idx)
+                points_by_group.setdefault(group_idx, []).append((ra_val, dec_val))
+                points_added += 1
+
+        for row, entry in enumerate(self._normalized_items):
+            if not self._entry_is_checked(row):
+                continue
+            total_entries += 1
+            if hard_limit is not None and total_entries > hard_limit and footprint_mode != "centroid_only":
+                footprint_mode = "centroid_only"
+                footprints = []
+                footprint_colors = []
+            cached_coords = collected_by_row.get(row)
+            group_idx: int | None = None
+            if cached_coords is not None:
+                ra_deg, dec_deg, group_idx = cached_coords
+            else:
+                ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
+                if ra_deg is None or dec_deg is None:
+                    ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
+                if ra_deg is None or dec_deg is None:
+                    continue
+                group_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
+                if preview_cap is None or points_added < preview_cap:
+                    points_by_group.setdefault(group_idx, []).append((ra_deg, dec_deg))
+                    points_added += 1
+
+            if selected_keys and self._group_key_for_entry(entry) in selected_keys:
+                if highlight_cap is None or len(highlight_points) < highlight_cap:
+                    try:
+                        highlight_points.append((float(ra_deg), float(dec_deg)))
+                    except Exception:
+                        pass
+
+            if footprint_mode == "centroid_only":
+                continue
+            if hard_limit is not None and len(footprints) >= hard_limit:
+                footprint_mode = "thin_lines"
+                continue
+
+            footprint = entry.footprint_radec or self._ensure_entry_footprint(entry)
+            if not footprint:
+                continue
+
+            segment: list[Tuple[float, float]] = []
+            for point_ra, point_dec in footprint:
+                try:
+                    ra_val = float(point_ra)
+                    dec_val = float(point_dec)
+                except Exception:
+                    continue
+                if not (math.isfinite(ra_val) and math.isfinite(dec_val)):
+                    continue
+                segment.append((ra_val, dec_val))
+            if len(segment) < 2:
+                continue
+            if segment[0] != segment[-1]:
+                segment.append(segment[0])
+            footprints.append(segment)
+            color_value: Any = (
+                self._resolve_group_color(group_idx) if colorize else "#3f7ad6"
+            )
+            if to_rgba is not None:
+                try:
+                    color_value = to_rgba(color_value)
+                except Exception:
+                    pass
+            footprint_colors.append(color_value)
+            if hard_limit is not None and len(footprints) >= hard_limit:
+                footprint_mode = "thin_lines"
+
+        if hard_limit is not None and total_entries > hard_limit:
+            footprint_mode = "centroid_only"
+            footprints = []
+            footprint_colors = []
+
+        group_count = sum(1 for key in points_by_group.keys() if isinstance(key, int))
+        preview_count = points_added
+        return {
+            "points_by_group": points_by_group,
+            "highlight_points": highlight_points,
+            "footprints": footprints,
+            "footprint_colors": footprint_colors,
+            "footprint_mode": footprint_mode,
+            "total_entries": total_entries,
+            "group_count": group_count,
+            "preview_count": preview_count,
+        }
+
+    def _render_sky_preview_fast(
+        self,
+        axes: Any,
+        geometry: dict[str, Any],
+        *,
+        selection_bounds: tuple[float, float, float, float] | None,
+        outline_bounds: list[_GroupOutline],
+        should_draw_outlines: bool,
+        timing: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        points_by_group: dict[int | None, list[Tuple[float, float]]] = geometry.get("points_by_group") or {}
+        highlight_points: list[Tuple[float, float]] = geometry.get("highlight_points") or []
+        footprints: list[list[Tuple[float, float]]] = geometry.get("footprints") or []
+        footprint_colors: list[Any] = geometry.get("footprint_colors") or []
+        footprint_mode = str(geometry.get("footprint_mode") or "footprints")
+        preview_count = int(geometry.get("preview_count") or 0)
+        total_entries = int(geometry.get("total_entries") or 0)
+        group_count = int(geometry.get("group_count") or 0)
+        if timing is not None:
+            timing["build_arrays_dt"] = 0.0
+            timing["add_artists_dt"] = 0.0
+
+        axes.clear()
+        if self._group_outline_collection is not None:
+            try:
+                self._group_outline_collection.remove()
+            except Exception:
+                pass
+            self._group_outline_collection = None
+
+        if not outline_bounds:
+            candidate_groups: list[list[Any]] | None = None
+            if self._auto_group_override_groups:
+                candidate_groups = self._auto_group_override_groups
+            elif self._cluster_groups:
+                candidate_groups = self._cluster_groups
+            if candidate_groups:
+                try:
+                    outline_bounds = self._compute_group_outline_bounds(candidate_groups)
+                except Exception:
+                    outline_bounds = []
+        self._group_outline_bounds = outline_bounds
+
+        axes.set_xlabel(self._localizer.get("filter.preview.ra", "Right Ascension (°)"))
+        axes.set_ylabel(self._localizer.get("filter.preview.dec", "Declination (°)"))
+        axes.set_title(self._localizer.get("filter.preview.title", "Sky preview"))
+        axes.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+
+        if preview_count <= 0 or not any(points_by_group.values()):
+            message = self._localizer.get(
+                "filter.preview.empty",
+                "No WCS information available for the current selection.",
+            )
+            if not self._preview_empty_logged:
+                hint = self._localizer.get(
+                    "filter.preview.empty_hint",
+                    "No WCS/center information available; the sky preview will remain empty but you can still select files.",
+                )
+                self._append_log(hint, level="WARN")
+                self._preview_empty_logged = True
+            axes.text(0.5, 0.5, message, ha="center", va="center", transform=axes.transAxes)
+            self._preview_hint_label.setText(self._preview_default_hint)
+            return {
+                "legend": False,
+                "footprint_mode": footprint_mode,
+                "preview_count": preview_count,
+                "total_entries": total_entries,
+            }
+        self._preview_empty_logged = False
+
+        colorize = self._should_color_footprints_by_group()
+        legend_cap = max(3, PREVIEW_LEGEND_MAX_GROUPS)
+        legend_allowed = colorize and group_count > 0 and group_count <= legend_cap
+        legend_hidden_hint = colorize and group_count > legend_cap
+        ra_values: list[float] = []
+        dec_values: list[float] = []
+        scatter_ra: list[float] = []
+        scatter_dec: list[float] = []
+        scatter_colors: list[Any] = []
+        legend_labels: list[tuple[str, Any]] = []
+        outline_segments: list[list[tuple[float, float]]] = []
+        outline_colors: list[Any] = []
+        outline_corners: list[tuple[float, float]] = []
+        build_arrays_start = time.monotonic()
+        default_color = "#3f7ad6"
+        for group_idx, coords in points_by_group.items():
+            if not coords:
+                continue
+            color = self._resolve_group_color(group_idx) if colorize else default_color
+            appended = 0
+            for coord in coords:
+                try:
+                    ra_val = float(coord[0])
+                    dec_val = float(coord[1])
+                except Exception:
+                    continue
+                scatter_ra.append(ra_val)
+                scatter_dec.append(dec_val)
+                scatter_colors.append(color)
+                ra_values.append(ra_val)
+                dec_values.append(dec_val)
+                appended += 1
+            if legend_allowed and appended:
+                label = None
+                if isinstance(group_idx, int):
+                    label_template = self._localizer.get("filter.preview.group_label", "Group {index}")
+                    try:
+                        label = label_template.format(index=group_idx + 1)
+                    except Exception:
+                        label = f"Group {group_idx + 1}"
+                elif len(points_by_group) > 1:
+                    label = self._localizer.get("filter.preview.group_unassigned", "Unassigned")
+                if label:
+                    legend_labels.append((label, color))
+        colorize_outlines = self._should_color_footprints_by_group()
+        default_outline_color: Any = to_rgba("red", 0.9) if to_rgba is not None else "#d64b3f"
+        if should_draw_outlines and outline_bounds:
+            for outline_entry in outline_bounds:
+                group_idx: int | None = None
+                coords: tuple[float, float, float, float] | None = None
+                if isinstance(outline_entry, (list, tuple)):
+                    if len(outline_entry) == 5:
+                        idx_candidate = outline_entry[0]
+                        if isinstance(idx_candidate, int):
+                            group_idx = idx_candidate
+                        try:
+                            ra_min = float(outline_entry[1])
+                            ra_max = float(outline_entry[2])
+                            dec_min = float(outline_entry[3])
+                            dec_max = float(outline_entry[4])
+                            coords = (ra_min, ra_max, dec_min, dec_max)
+                        except Exception:
+                            coords = None
+                    elif len(outline_entry) == 4:
+                        try:
+                            ra_min = float(outline_entry[0])
+                            ra_max = float(outline_entry[1])
+                            dec_min = float(outline_entry[2])
+                            dec_max = float(outline_entry[3])
+                            coords = (ra_min, ra_max, dec_min, dec_max)
+                        except Exception:
+                            coords = None
+                if coords is None:
+                    continue
+                ra_min, ra_max, dec_min, dec_max = coords
+                width = float(ra_max) - float(ra_min)
+                height = float(dec_max) - float(dec_min)
+                if width <= 0 or height <= 0:
+                    continue
+                corners = [
+                    (float(ra_min), float(dec_min)),
+                    (float(ra_max), float(dec_min)),
+                    (float(ra_max), float(dec_max)),
+                    (float(ra_min), float(dec_max)),
+                    (float(ra_min), float(dec_min)),
+                ]
+                outline_segments.append(corners)
+                outline_corners.extend(corners)
+                outline_color = default_outline_color
+                if colorize_outlines and isinstance(group_idx, int):
+                    outline_color = (
+                        to_rgba(self._resolve_group_color(group_idx), 0.95)
+                        if to_rgba is not None
+                        else self._resolve_group_color(group_idx)
+                    )
+                outline_colors.append(outline_color)
+        build_arrays_dt = time.monotonic() - build_arrays_start
+        if timing is not None:
+            timing["build_arrays_dt"] = build_arrays_dt
+
+        add_artists_start = time.monotonic()
+        if scatter_ra and scatter_dec:
+            axes.scatter(
+                scatter_ra,
+                scatter_dec,
+                c=scatter_colors or default_color,
+                s=24,
+                alpha=0.85,
+                edgecolors="none",
+                zorder=2,
+            )
+
+        if selection_bounds and Rectangle is not None:
+            try:
+                ra_min, ra_max, dec_min, dec_max = selection_bounds
+                width = float(ra_max) - float(ra_min)
+                height = float(dec_max) - float(dec_min)
+                if width > 0 and height > 0:
+                    selection_rect = Rectangle(
+                        (float(ra_min), float(dec_min)),
+                        width,
+                        height,
+                        linewidth=1.4,
+                        edgecolor="#1f54d6",
+                        facecolor=(0.1, 0.35, 0.85, 0.18),
+                        linestyle="-",
+                        zorder=4,
+                    )
+                    axes.add_patch(selection_rect)
+                    ra_values.extend([float(ra_min), float(ra_max)])
+                    dec_values.extend([float(dec_min), float(dec_max)])
+            except Exception:
+                pass
+
+        if highlight_points:
+            axes.scatter(
+                [pt[0] for pt in highlight_points],
+                [pt[1] for pt in highlight_points],
+                s=80,
+                facecolors="none",
+                edgecolors="#f5f542",
+                linewidths=1.5,
+                zorder=6,
+            )
+
+        if footprints and LineCollection is not None and footprint_mode != "centroid_only":
+            footprint_collection = LineCollection(
+                footprints,
+                colors=footprint_colors or "#3f7ad6",
+                linewidths=0.8 if footprint_mode == "thin_lines" else 1.2,
+                linestyles="-",
+                alpha=0.65 if footprint_mode == "thin_lines" else 0.9,
+                zorder=3,
+            )
+            axes.add_collection(footprint_collection)
+            try:
+                for segment in footprints:
+                    for ra_val, dec_val in segment:
+                        ra_values.append(float(ra_val))
+                        dec_values.append(float(dec_val))
+            except Exception:
+                pass
+
+        if outline_segments and LineCollection is not None:
+            coll = LineCollection(
+                outline_segments,
+                colors=outline_colors or [default_outline_color],
+                linewidths=1.6,
+                linestyles="--",
+                alpha=0.9,
+                zorder=5,
+            )
+            axes.add_collection(coll)
+            self._group_outline_collection = coll
+        else:
+            self._group_outline_collection = None
+
+        legend_shown = False
+        if legend_allowed and legend_labels and Line2D is not None:
+            handles: list[Any] = []
+            seen_labels: set[str] = set()
+            for label, color in legend_labels:
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                try:
+                    handles.append(
+                        Line2D(
+                            [0],
+                            [0],
+                            marker="o",
+                            linestyle="",
+                            markersize=6,
+                            markerfacecolor=color,
+                            markeredgecolor=color,
+                            alpha=0.85,
+                        )
+                    )
+                except Exception:
+                    continue
+            if handles:
+                axes.legend(handles=handles, loc="upper right", fontsize="small")
+                legend_shown = True
+        add_artists_dt = time.monotonic() - add_artists_start
+        if timing is not None:
+            timing["add_artists_dt"] = add_artists_dt
+
+        for ra_corner, dec_corner in outline_corners:
+            ra_values.append(ra_corner)
+            dec_values.append(dec_corner)
+
+        if ra_values and dec_values:
+            ra_min, ra_max = min(ra_values), max(ra_values)
+            dec_min, dec_max = min(dec_values), max(dec_values)
+            if ra_min == ra_max:
+                ra_margin = max(1.0, abs(ra_min) * 0.01 + 0.5)
+            else:
+                ra_margin = (ra_max - ra_min) * 0.05
+            if dec_min == dec_max:
+                dec_margin = max(1.0, abs(dec_min) * 0.01 + 0.5)
+            else:
+                dec_margin = (dec_max - dec_min) * 0.05
+            axes.set_xlim(ra_max + ra_margin, ra_min - ra_margin)
+            axes.set_ylim(dec_min - dec_margin, dec_max + dec_margin)
+            axes.set_aspect("equal", adjustable="datalim")
+
+        preview_cap_value = self._resolve_preview_cap()
+        summary_text = self._localizer.get(
+            "filter.preview.summary",
+            "Showing {count} frame(s) in preview (cap {cap}).",
+            count=preview_count,
+            cap=preview_cap_value or "∞",
+        )
+        clusters_present = group_count
+        if clusters_present:
+            cluster_fragment = self._localizer.get("filter.preview.groups_hint", "{groups} cluster(s)")
+            try:
+                cluster_formatted = cluster_fragment.format(groups=clusters_present)
+            except Exception:
+                cluster_formatted = f"{clusters_present} cluster(s)"
+            summary_text = f"{summary_text} – {cluster_formatted}"
+        mode_fragment = f"mode={footprint_mode}"
+        summary_text = f"{summary_text} [{mode_fragment}]"
+        if legend_hidden_hint:
+            legend_hint_text = self._localizer.get(
+                "filter.preview.legend_hidden_hint",
+                "Legend hidden (too many groups)",
+            )
+            summary_text = f"{summary_text} – {legend_hint_text}"
+        try:
+            self._preview_hint_label.setText(
+                summary_text.format(count=preview_count, cap=preview_cap_value or "∞")
+            )
+        except Exception:
+            self._preview_hint_label.setText(summary_text)
+
+        return {
+            "legend": legend_shown and legend_allowed,
+            "legend_hidden": legend_hidden_hint,
+            "footprint_mode": footprint_mode,
+            "preview_count": preview_count,
+            "total_entries": total_entries,
+            "group_count": group_count,
+        }
 
     def _on_preview_rectangle_selected(self, eclick, erelease) -> None:
         if eclick is None or erelease is None:
@@ -6083,13 +7165,32 @@ class FilterQtDialog(QDialog):
             self._rectangle_selector = None
         if canvas is not None:
             try:
+                canvas.setParent(None)
+            except Exception:
+                pass
+            try:
+                canvas.deleteLater()
+            except Exception:
+                pass
+            try:
                 canvas.hide()
             except Exception:
                 pass
 
     def _dispose_coverage_canvas(self) -> None:
+        canvas = self._coverage_canvas
         self._coverage_canvas = None
         self._coverage_axes = None
+        if canvas is not None:
+            try:
+                canvas.setParent(None)
+            except Exception:
+                pass
+            try:
+                canvas.deleteLater()
+            except Exception:
+                pass
+
 
     def _on_preview_canvas_destroyed(self, _obj: QObject | None = None) -> None:  # pragma: no cover - Qt signal glue
         self._dispose_preview_canvas()
@@ -6097,18 +7198,22 @@ class FilterQtDialog(QDialog):
     def _on_coverage_canvas_destroyed(self, _obj: QObject | None = None) -> None:  # pragma: no cover - Qt signal glue
         self._dispose_coverage_canvas()
 
-    def _safe_draw_preview_canvas(self) -> None:
-        self._safe_draw_canvas("preview")
+    def _safe_draw_preview_canvas(self, *, force: bool = False) -> bool:
+        if force:
+            self._last_preview_draw_ts = 0.0
+        return self._safe_draw_canvas("preview")
 
-    def _safe_draw_coverage_canvas(self) -> None:
-        self._safe_draw_canvas("coverage")
+    def _safe_draw_coverage_canvas(self) -> bool:
+        return self._safe_draw_canvas("coverage")
 
-    def _safe_draw_canvas(self, canvas_type: str) -> None:
+    def _safe_draw_canvas(self, canvas_type: str) -> bool:
         canvas = self._preview_canvas if canvas_type == "preview" else self._coverage_canvas
         if canvas is None:
-            return
+            return False
         try:
             canvas.draw_idle()
+            if canvas_type == "preview":
+                self._preview_draw_attempts += 1
         except RuntimeError as exc:
             message = str(exc).lower()
             if "already deleted" not in message:
@@ -6117,6 +7222,20 @@ class FilterQtDialog(QDialog):
                 self._dispose_preview_canvas()
             else:
                 self._dispose_coverage_canvas()
+            return False
+        return True
+
+    def _throttled_preview_draw(self, *, force: bool = False) -> bool:
+        if self._preview_canvas is None:
+            return False
+        now = time.monotonic()
+        throttle = max(0.0, float(self._preview_draw_throttle or 0.0))
+        if not force and self._last_preview_draw_ts and (now - self._last_preview_draw_ts) < throttle:
+            return False
+        drawn = self._safe_draw_preview_canvas(force=force)
+        if drawn:
+            self._last_preview_draw_ts = time.monotonic()
+        return drawn
 
     def _schedule_cluster_refresh(self) -> None:
         if self._cluster_refresh_pending:
@@ -6237,253 +7356,68 @@ class FilterQtDialog(QDialog):
         return math.hypot(dra, ddec)
 
     def _update_preview_plot(self) -> None:
+        total_start = time.monotonic()
         self._preview_refresh_pending = False
         self._preview_last_refresh = time.monotonic()
         if self._preview_axes is None or self._preview_canvas is None:
             return
 
-        points = self._collect_preview_points()
         axes = self._preview_axes
-        axes.clear()
-        if self._group_outline_collection is not None:
-            try:
-                self._group_outline_collection.remove()
-            except Exception:
-                pass
-            self._group_outline_collection = None
-        if not self._group_outline_bounds:
-            candidate_groups: list[list[Any]] | None = None
-            if self._auto_group_override_groups:
-                candidate_groups = self._auto_group_override_groups
-            elif self._cluster_groups:
-                candidate_groups = self._cluster_groups
-            if candidate_groups:
-                try:
-                    self._group_outline_bounds = self._compute_group_outline_bounds(candidate_groups)
-                except Exception:
-                    self._group_outline_bounds = []
-        axes.set_xlabel(self._localizer.get("filter.preview.ra", "Right Ascension (°)"))
-        axes.set_ylabel(self._localizer.get("filter.preview.dec", "Declination (°)"))
-        axes.set_title(self._localizer.get("filter.preview.title", "Sky preview"))
-        axes.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+        start_draws = self._preview_draw_attempts
+        collect_start = time.monotonic()
+        collected_points = self._collect_preview_points()
+        collect_dt = time.monotonic() - collect_start
 
-        if not points:
-            message = self._localizer.get(
-                "filter.preview.empty",
-                "No WCS information available for the current selection.",
-            )
-            if not self._preview_empty_logged:
-                hint = self._localizer.get(
-                    "filter.preview.empty_hint",
-                    "No WCS/center information available; the sky preview will remain empty but you can still select files.",
-                )
-                self._append_log(hint, level="WARN")
-                self._preview_empty_logged = True
-            axes.text(0.5, 0.5, message, ha="center", va="center", transform=axes.transAxes)
-            self._preview_hint_label.setText(self._preview_default_hint)
-            self._safe_draw_preview_canvas()
-            return
-        self._preview_empty_logged = False
-
-        grouped_points: dict[int | None, list[Tuple[float, float]]] = {}
-        for ra_deg, dec_deg, group_idx in points:
-            grouped_points.setdefault(group_idx, []).append((ra_deg, dec_deg))
-
-        legend_needed = False
-        for group_idx, coords in grouped_points.items():
-            ra_coords = [coord[0] for coord in coords]
-            dec_coords = [coord[1] for coord in coords]
-            if isinstance(group_idx, int):
-                color = self._resolve_group_color(group_idx)
-                label_template = self._localizer.get("filter.preview.group_label", "Group {index}")
-                try:
-                    label = label_template.format(index=group_idx + 1)
-                except Exception:
-                    label = f"Group {group_idx + 1}"
-                legend_needed = True
-            else:
-                color = "#3f7ad6"
-                label = None
-                if len(grouped_points) > 1:
-                    label = self._localizer.get("filter.preview.group_unassigned", "Unassigned")
-                    legend_needed = True
-
-            scatter_kwargs = dict(c=color, s=24, alpha=0.85, edgecolors="none")
-            if label:
-                scatter_kwargs["label"] = label
-            axes.scatter(ra_coords, dec_coords, **scatter_kwargs)
-
-        if self._selection_bounds and Rectangle is not None:
-            try:
-                ra_min, ra_max, dec_min, dec_max = self._selection_bounds
-                width = float(ra_max) - float(ra_min)
-                height = float(dec_max) - float(dec_min)
-                if width > 0 and height > 0:
-                    selection_rect = Rectangle(
-                        (float(ra_min), float(dec_min)),
-                        width,
-                        height,
-                        linewidth=1.4,
-                        edgecolor="#1f54d6",
-                        facecolor=(0.1, 0.35, 0.85, 0.18),
-                        linestyle="-",
-                        zorder=4,
-                    )
-                    axes.add_patch(selection_rect)
-            except Exception:
-                pass
-
-        if self._selected_group_keys:
-            highlight_ra: list[float] = []
-            highlight_dec: list[float] = []
-            highlight_limit = self._resolve_preview_cap()
-            added = 0
-            for idx, entry in enumerate(self._normalized_items):
-                if not self._entry_is_checked(idx):
-                    continue
-                ra_val, dec_val = entry.center_ra_deg, entry.center_dec_deg
-                if ra_val is None or dec_val is None:
-                    ra_val, dec_val = self._ensure_entry_coordinates(entry)
-                if ra_val is None or dec_val is None:
-                    continue
-                if highlight_limit is not None and added >= highlight_limit:
-                    break
-                added += 1
-                if self._group_key_for_entry(entry) not in self._selected_group_keys:
-                    continue
-                highlight_ra.append(ra_val)
-                highlight_dec.append(dec_val)
-            if highlight_ra and highlight_dec:
-                axes.scatter(
-                    highlight_ra,
-                    highlight_dec,
-                    s=80,
-                    facecolors="none",
-                    edgecolors="#f5f542",
-                    linewidths=1.5,
-                    zorder=6,
-                )
-
+        build_start = time.monotonic()
+        geometry = self._build_preview_geometry(collected_points)
+        outline_bounds = self._group_outline_bounds
         should_draw_outlines = self._should_draw_group_outlines()
+        build_dt = time.monotonic() - build_start
 
-        # Store the group outline segments and corners for bounds tracking.
-        outline_segments: list[list[tuple[float, float]]] = []
-        outline_corners: list[tuple[float, float]] = []
-        outline_colors: list[Any] = []
-        colorize_outlines = self._should_color_footprints_by_group()
-        default_outline_color: Any = (
-            to_rgba("red", 0.9) if to_rgba is not None else "#d64b3f"
+        render_timing: dict[str, float] = {}
+        render_result = self._render_sky_preview_fast(
+            axes,
+            geometry,
+            selection_bounds=self._selection_bounds,
+            outline_bounds=outline_bounds or [],
+            should_draw_outlines=should_draw_outlines,
+            timing=render_timing,
         )
-        if self._group_outline_bounds:
-            for outline_entry in self._group_outline_bounds:
-                group_idx: int | None = None
-                coords: tuple[float, float, float, float] | None = None
-                if isinstance(outline_entry, (list, tuple)):
-                    if len(outline_entry) == 5:
-                        idx_candidate = outline_entry[0]
-                        if isinstance(idx_candidate, int):
-                            group_idx = idx_candidate
-                        try:
-                            ra_min = float(outline_entry[1])
-                            ra_max = float(outline_entry[2])
-                            dec_min = float(outline_entry[3])
-                            dec_max = float(outline_entry[4])
-                            coords = (ra_min, ra_max, dec_min, dec_max)
-                        except Exception:
-                            coords = None
-                    elif len(outline_entry) == 4:
-                        try:
-                            ra_min = float(outline_entry[0])
-                            ra_max = float(outline_entry[1])
-                            dec_min = float(outline_entry[2])
-                            dec_max = float(outline_entry[3])
-                            coords = (ra_min, ra_max, dec_min, dec_max)
-                        except Exception:
-                            coords = None
-                if coords is None:
-                    continue
-                ra_min, ra_max, dec_min, dec_max = coords
-                width = float(ra_max) - float(ra_min)
-                height = float(dec_max) - float(dec_min)
-                if width <= 0 or height <= 0:
-                    continue
-                corners = [
-                    (float(ra_min), float(dec_min)),
-                    (float(ra_max), float(dec_min)),
-                    (float(ra_max), float(dec_max)),
-                    (float(ra_min), float(dec_max)),
-                    (float(ra_min), float(dec_min)),
-                ]
-                outline_segments.append(corners)
-                outline_corners.extend(corners)
-                outline_color = default_outline_color
-                if colorize_outlines and isinstance(group_idx, int):
-                    outline_color = (
-                        to_rgba(self._resolve_group_color(group_idx), 0.95)
-                        if to_rgba is not None
-                        else self._resolve_group_color(group_idx)
-                    )
-                outline_colors.append(outline_color)
-        if should_draw_outlines and outline_segments and LineCollection is not None:
-            coll = LineCollection(
-                outline_segments,
-                colors=outline_colors or [default_outline_color],
-                linewidths=1.6,
-                linestyles="--",
-                alpha=0.9,
-                zorder=5,
-            )
-            axes.add_collection(coll)
-            self._group_outline_collection = coll
-        else:
-            self._group_outline_collection = None
+        build_arrays_dt = build_dt + float(render_timing.get("build_arrays_dt", 0.0))
+        add_artists_dt = float(render_timing.get("add_artists_dt", 0.0))
 
-        if legend_needed and len(grouped_points) > 1:
-            axes.legend(loc="upper right", fontsize="small")
-
-        ra_values = [pt[0] for pt in points]
-        dec_values = [pt[1] for pt in points]
-        for ra_corner, dec_corner in outline_corners:
-            ra_values.append(ra_corner)
-            dec_values.append(dec_corner)
-        if not ra_values or not dec_values:
-            self._safe_draw_preview_canvas()
-            return
-        ra_min, ra_max = min(ra_values), max(ra_values)
-        dec_min, dec_max = min(dec_values), max(dec_values)
-        if ra_min == ra_max:
-            ra_margin = max(1.0, abs(ra_min) * 0.01 + 0.5)
-        else:
-            ra_margin = (ra_max - ra_min) * 0.05
-        if dec_min == dec_max:
-            dec_margin = max(1.0, abs(dec_min) * 0.01 + 0.5)
-        else:
-            dec_margin = (dec_max - dec_min) * 0.05
-        axes.set_xlim(ra_max + ra_margin, ra_min - ra_margin)
-        axes.set_ylim(dec_min - dec_margin, dec_max + dec_margin)
-        axes.set_aspect("equal", adjustable="datalim")
-        preview_cap_value = self._resolve_preview_cap()
-        summary_text = self._localizer.get(
-            "filter.preview.summary",
-            "Showing {count} frame(s) in preview (cap {cap}).",
-            count=len(points),
-            cap=preview_cap_value or "∞",
-        )
-        clusters_present = sum(1 for key in grouped_points.keys() if isinstance(key, int))
-        if clusters_present:
-            cluster_fragment = self._localizer.get("filter.preview.groups_hint", "{groups} cluster(s)")
-            try:
-                cluster_formatted = cluster_fragment.format(groups=clusters_present)
-            except Exception:
-                cluster_formatted = f"{clusters_present} cluster(s)"
-            summary_text = f"{summary_text} – {cluster_formatted}"
+        draw_start = time.monotonic()
+        force_draw = not getattr(self, "_auto_group_running", False)
+        drew = self._throttled_preview_draw(force=force_draw)
+        draw_dt = time.monotonic() - draw_start
+        redraw_delta = self._preview_draw_attempts - start_draws
+        if not drew:
+            delay_ms = int(max(0.0, float(self._preview_draw_throttle or 0.0)) * 1_000)
+            QTimer.singleShot(delay_ms, lambda: self._throttled_preview_draw(force=True))
         try:
-            self._preview_hint_label.setText(
-                summary_text.format(count=len(points), cap=preview_cap_value or "∞")
+            total_dt = time.monotonic() - total_start
+            perf_message = (
+                "sky_preview_perf: N=%s groups=%s collect=%.3fs build=%.3fs artists=%.3fs draw=%.3fs "
+                "total=%.3fs redraws=%s mode=%s"
+            ) % (
+                render_result.get("preview_count"),
+                render_result.get("group_count", geometry.get("group_count", 0)),
+                collect_dt,
+                build_arrays_dt,
+                add_artists_dt,
+                draw_dt,
+                total_dt,
+                redraw_delta,
+                render_result.get("footprint_mode", "footprints"),
             )
+            logger.info(
+                "%s total=%s",
+                perf_message,
+                render_result.get("total_entries"),
+            )
+            self._append_log(perf_message)
         except Exception:
-            self._preview_hint_label.setText(summary_text)
-        self._safe_draw_preview_canvas()
+            pass
 
     # ------------------------------------------------------------------
     # QDialog API
@@ -6499,7 +7433,18 @@ class FilterQtDialog(QDialog):
         self._hide_processing_overlay()
         self._dispose_preview_canvas()
         self._dispose_coverage_canvas()
+        self._safe_shutdown_matplotlib()
         super().closeEvent(event)
+
+    def _safe_shutdown_matplotlib(self) -> None:
+        """Safely close all Matplotlib figures during shutdown."""
+        if plt is None:
+            return
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
 
     def accept(self) -> None:  # noqa: D401 - inherit docstring
         self._accepted = True

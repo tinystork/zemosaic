@@ -80,6 +80,7 @@ DEFAULT_CONFIG = {
     "astap_default_downsample": 2,
     "astap_default_sensitivity": 100,
     "astap_max_instances": 1,
+    "astap_drizzled_fallback_enabled": False,
     "language": "en",
     "preferred_gui_backend": "tk",  # "tk" or "qt"
     "preferred_gui_backend_explicit": False,
@@ -90,6 +91,7 @@ DEFAULT_CONFIG = {
     "qt_main_left_state": None,
     "input_dir": "",
     "output_dir": "",
+    "use_existing_master_tiles": False,
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
@@ -112,6 +114,8 @@ DEFAULT_CONFIG = {
     "use_gpu_grid": True,
     "gpu_id_phase5": 0,
     "gpu_selector": "",
+    "phase5_chunk_auto": True,
+    "phase5_chunk_mb": 128,
     "enable_tile_weighting": True,
     "tile_weight_mode": "n_frames",
     "final_assembly_method": "reproject_coadd",  # Options: "reproject_coadd", "incremental",
@@ -226,6 +230,7 @@ DEFAULT_CONFIG = {
     "altaz_margin_percent": 5.0,  # UI: "AltAz margin %"
     "altaz_decay": 0.15,  # UI: "AltAz decay"
     "altaz_nanize": True,  # UI: "Alt-Az → NaN"
+    "altaz_nanize_threshold": 0.001,
     # --- Alt-Az Alpha export ---
     "altaz_export_alpha_fits": True,
     "altaz_export_alpha_sidecar": False,

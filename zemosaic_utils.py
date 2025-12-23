@@ -54,6 +54,7 @@ import time
 import sys
 import platform
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from contextlib import nullcontext
 from pathlib import Path
@@ -2083,8 +2084,15 @@ def compute_intertile_affine_calibration(
     use_auto_intertile: bool = False,
     logger=None,
     progress_callback=None,
+    tile_weights=None,
+    cpu_workers: int | None = None,
 ):
-    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection."""
+    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
+
+    ``tile_data_with_wcs`` peut contenir des tuples ``(data, wcs)`` ou
+    ``(data, wcs, mask2d)`` pour injecter un masque (0..1) optionnel sur la zone
+    d'overlap.
+    """
 
     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
         return {}
@@ -2093,6 +2101,18 @@ def compute_intertile_affine_calibration(
     try:
         header_full = final_output_wcs.to_header()
     except Exception:
+        return {}
+
+    parsed_entries: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
+    for entry in tile_data_with_wcs:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        data = entry[0]
+        wcs_obj = entry[1]
+        mask = entry[2] if len(entry) >= 3 else None
+        parsed_entries.append((data, wcs_obj, mask))
+
+    if len(parsed_entries) < 2:
         return {}
 
     try:
@@ -2111,26 +2131,46 @@ def compute_intertile_affine_calibration(
     except Exception:
         sky_low, sky_high = 30.0, 70.0
 
-    wcs_list = [wcs for _data, wcs in tile_data_with_wcs]
+    wcs_list = [wcs for _data, wcs, _mask in parsed_entries]
     shapes_hw = []
     luminance_tiles = []
-    for data, _wcs in tile_data_with_wcs:
+    mask_tiles: list[np.ndarray | None] = []
+    for data, _wcs, mask in parsed_entries:
         arr = np.asarray(data)
         if arr.ndim == 3 and arr.shape[-1] == 0:
             luminance_tiles.append(None)
             shapes_hw.append((0, 0))
+            mask_tiles.append(None)
             continue
         luminance = _extract_luminance_plane(arr)
         luminance_tiles.append(luminance)
         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
+        mask_arr = None
+        if mask is not None:
+            try:
+                mask_arr = np.asarray(mask, dtype=np.float32)
+                if mask_arr.ndim == 3:
+                    mask_arr = mask_arr[..., 0]
+                if mask_arr.shape != luminance.shape[:2]:
+                    mask_arr = None
+            except Exception:
+                mask_arr = None
+        mask_tiles.append(mask_arr)
 
-    num_tiles = len(tile_data_with_wcs)
+    num_tiles = len(parsed_entries)
 
     try:
         preview_size = int(preview_size)
     except Exception:
         preview_size = 512
     preview_size = max(128, preview_size)
+
+    try:
+        cpu_workers = int(cpu_workers) if cpu_workers is not None else None
+    except Exception:
+        cpu_workers = None
+    if cpu_workers is not None and cpu_workers < 1:
+        cpu_workers = 1
 
     try:
         min_overlap_fraction = float(min_overlap_fraction)
@@ -2169,6 +2209,17 @@ def compute_intertile_affine_calibration(
         min_overlap_fraction = float(tuned_overlap)
         _log_intertile(
             f"Auto-tune enabled for {num_tiles} tiles — using preview={preview_size}, min_overlap={min_overlap_fraction:.4f}",
+            level="INFO",
+        )
+
+    if preview_size >= 1024 and min_overlap_fraction <= 0.015:
+        prev_preview = preview_size
+        prev_overlap = min_overlap_fraction
+        preview_size = 512
+        min_overlap_fraction = max(min_overlap_fraction, 0.03)
+        _log_intertile(
+            f"INTERTILE_AUTOTUNE_GUARDRAIL: adjusted preview={preview_size} min_overlap={min_overlap_fraction:.4f} "
+            f"(was preview={prev_preview} min_overlap={prev_overlap:.4f})",
             level="INFO",
         )
 
@@ -2247,7 +2298,7 @@ def compute_intertile_affine_calibration(
                 use_gpu = False
 
             medians = []
-            for data, _ in tile_data_with_wcs:
+            for data, _wcs_obj, _mask in parsed_entries:
                 if data is None:
                     continue
                 arr = xp.asarray(data, dtype=xp.float32)
@@ -2266,7 +2317,7 @@ def compute_intertile_affine_calibration(
             )
 
             new_tile_data = []
-            for data, wcs_obj in tile_data_with_wcs:
+            for data, wcs_obj, mask in parsed_entries:
                 if data is None:
                     new_tile_data.append((data, wcs_obj))
                     continue
@@ -2276,7 +2327,7 @@ def compute_intertile_affine_calibration(
                 scaled = arr * scale
                 if use_gpu and cp is not None:
                     scaled = cp.asnumpy(scaled)  # type: ignore
-                new_tile_data.append((scaled, wcs_obj))
+                new_tile_data.append((scaled, wcs_obj, mask) if mask is not None else (scaled, wcs_obj))
             tile_data_with_wcs[:] = new_tile_data
 
             _log_intertile("Applied global normalization to all master tiles.", level="INFO")
@@ -2298,105 +2349,239 @@ def compute_intertile_affine_calibration(
         return {}
 
     pair_entries = []
-    connectivity = np.zeros(len(tile_data_with_wcs), dtype=np.float64)
+    connectivity = np.zeros(num_tiles, dtype=np.float64)
+    preview_size = max(128, int(preview_size))
+    weight_scores = None
+    weights_for_anchor = None
+
+    if tile_weights is not None:
+        try:
+            weights_array = np.asarray(tile_weights, dtype=np.float64).reshape(-1)
+        except Exception:
+            weights_array = None
+        if weights_array is not None and len(weights_array) != num_tiles:
+            _log_intertile(
+                f"tile_weights ignored: expected {num_tiles}, got {len(weights_array)}",
+                level="WARN",
+            )
+            weights_array = None
+        if weights_array is not None:
+            with np.errstate(invalid="ignore"):
+                weights_array = np.where(np.isfinite(weights_array) & (weights_array > 0.0), weights_array, 1.0)
+            try:
+                positive = weights_array[weights_array > 0.0]
+                median_ref = float(np.median(positive)) if positive.size else 1.0
+            except Exception:
+                median_ref = 1.0
+            if not math.isfinite(median_ref) or median_ref <= 0.0:
+                median_ref = 1.0
+            with np.errstate(invalid="ignore", divide="ignore"):
+                normed = weights_array / median_ref
+                scores = np.sqrt(normed)
+            if scores is not None:
+                scores = np.where(np.isfinite(scores) & (scores > 0.0), scores, 1.0)
+            weight_scores = scores
+            weights_for_anchor = weights_array
+
     preview_size = max(128, int(preview_size))
 
-    for idx, overlap in enumerate(overlaps, 1):
-        i = overlap["i"]
-        j = overlap["j"]
-        bbox = overlap["bbox"]
-        weight = float(overlap.get("weight", 1.0))
-        if luminance_tiles[i] is None or luminance_tiles[j] is None:
-            continue
-        x0, x1, y0, y1 = bbox
-        sub_w = max(1, x1 - x0)
-        sub_h = max(1, y1 - y0)
-        header = header_full.copy()
-        header["NAXIS1"] = sub_w
-        header["NAXIS2"] = sub_h
-        if "CRPIX1" in header:
-            header["CRPIX1"] = float(header["CRPIX1"]) - x0
-        if "CRPIX2" in header:
-            header["CRPIX2"] = float(header["CRPIX2"]) - y0
+    def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
+        if mask_arr is None:
+            return None
+        mask_arr = np.asarray(mask_arr, dtype=np.float32)
+        if mask_arr.size == 0:
+            return None
+        finite_mask = np.isfinite(mask_arr)
         try:
-            target_wcs = _WCS(header)
+            max_val = float(np.nanmax(mask_arr))
         except Exception:
-            continue
-        try:
-            reproj_i, _ = reproject_interp(
-                (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
-            )
-            reproj_j, _ = reproject_interp(
-                (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-            )
-        except Exception:
-            continue
-        if reproj_i is None or reproj_j is None:
-            continue
-        arr_i = np.asarray(reproj_i, dtype=np.float32)
-        arr_j = np.asarray(reproj_j, dtype=np.float32)
-        if arr_i.size == 0 or arr_j.size == 0:
-            continue
-        max_dim = max(arr_i.shape[0], arr_i.shape[1])
-        if max_dim > preview_size:
-            scale = preview_size / max_dim
-            new_w = max(8, int(round(arr_i.shape[1] * scale)))
-            new_h = max(8, int(round(arr_i.shape[0] * scale)))
-            arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        valid = np.isfinite(arr_i) & np.isfinite(arr_j)
-        if not np.any(valid):
-            continue
-        sample_i = arr_i[valid]
-        sample_j = arr_j[valid]
-        if sample_i.size < 64:
-            continue
-        sky_proxy = 0.5 * (sample_i + sample_j)
-        try:
-            p_low = np.percentile(sky_proxy, sky_low)
-            p_high = np.percentile(sky_proxy, sky_high)
-        except Exception:
-            p_low = np.nanmin(sky_proxy)
-            p_high = np.nanmax(sky_proxy)
-        if not np.isfinite(p_low) or not np.isfinite(p_high):
-            continue
-        if p_high <= p_low:
-            p_low = np.nanmin(sky_proxy)
-            p_high = np.nanmax(sky_proxy)
-        mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
-        if mask.sum() < 32:
-            mask = np.ones_like(sky_proxy, dtype=bool)
-        x_samples = sample_i[mask]
-        y_samples = sample_j[mask]
-        fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
-        if fit is None:
-            continue
-        a_ij, b_ij = fit
-        pair_entries.append((i, j, a_ij, b_ij, weight))
+            max_val = 0.0
+        threshold = 0.5 if max_val > 0.5 else 0.0
+        return finite_mask & (mask_arr > threshold)
 
-        a_ij, b_ij = fit
-        pair_entries.append((i, j, a_ij, b_ij, weight))
-        connectivity[i] += weight
-        connectivity[j] += weight
-
-        # [ETA] Tick fin de traitement de la paire idx
-        if progress_callback:
+    def _process_overlap_pair(idx_overlap: int, overlap_entry: dict) -> tuple[list[tuple[int, int, float, float, float]] | None, tuple[int, int, float] | None]:
+        try:
+            i = overlap_entry["i"]
+            j = overlap_entry["j"]
+            bbox = overlap_entry["bbox"]
+            weight = float(overlap_entry.get("weight", 1.0))
+            if luminance_tiles[i] is None or luminance_tiles[j] is None:
+                return None, None
+            x0, x1, y0, y1 = bbox
+            sub_w = max(1, x1 - x0)
+            sub_h = max(1, y1 - y0)
+            header = header_full.copy()
+            header["NAXIS1"] = sub_w
+            header["NAXIS2"] = sub_h
+            if "CRPIX1" in header:
+                header["CRPIX1"] = float(header["CRPIX1"]) - x0
+            if "CRPIX2" in header:
+                header["CRPIX2"] = float(header["CRPIX2"]) - y0
             try:
-                progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
+                target_wcs = _WCS(header)
             except Exception:
-                pass
-
-        if progress_callback and idx % 5 == 0:
+                return None, None
             try:
-                progress_callback("phase5_intertile", idx, len(overlaps))
+                reproj_i, _ = reproject_interp(
+                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                )
+                reproj_j, _ = reproject_interp(
+                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+                )
             except Exception:
-                pass
+                return None, None
+            if reproj_i is None or reproj_j is None:
+                return None, None
+            arr_i = np.asarray(reproj_i, dtype=np.float32)
+            arr_j = np.asarray(reproj_j, dtype=np.float32)
+            mask_i_reproj = None
+            mask_j_reproj = None
+            if mask_tiles[i] is not None:
+                try:
+                    mask_i_reproj, _ = reproject_interp(
+                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                    )
+                except Exception:
+                    mask_i_reproj = None
+            if mask_tiles[j] is not None:
+                try:
+                    mask_j_reproj, _ = reproject_interp(
+                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+                    )
+                except Exception:
+                    mask_j_reproj = None
+            if arr_i.size == 0 or arr_j.size == 0:
+                return None, None
+            max_dim = max(arr_i.shape[0], arr_i.shape[1])
+            if max_dim > preview_size:
+                scale = preview_size / max_dim
+                new_w = max(8, int(round(arr_i.shape[1] * scale)))
+                new_h = max(8, int(round(arr_i.shape[0] * scale)))
+                arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                if mask_i_reproj is not None:
+                    mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                if mask_j_reproj is not None:
+                    mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            valid = np.isfinite(arr_i) & np.isfinite(arr_j)
+            mask_i_valid = _mask_valid_pixels(mask_i_reproj)
+            mask_j_valid = _mask_valid_pixels(mask_j_reproj)
+            if mask_i_valid is not None:
+                valid &= mask_i_valid
+            if mask_j_valid is not None:
+                valid &= mask_j_valid
+            if not np.any(valid):
+                return None, None
+            sample_i = arr_i[valid]
+            sample_j = arr_j[valid]
+            if sample_i.size < 64:
+                return None, None
+            sky_proxy = 0.5 * (sample_i + sample_j)
+            try:
+                p_low = np.percentile(sky_proxy, sky_low)
+                p_high = np.percentile(sky_proxy, sky_high)
+            except Exception:
+                p_low = np.nanmin(sky_proxy)
+                p_high = np.nanmax(sky_proxy)
+            if not np.isfinite(p_low) or not np.isfinite(p_high):
+                return None, None
+            if p_high <= p_low:
+                p_low = np.nanmin(sky_proxy)
+                p_high = np.nanmax(sky_proxy)
+            mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
+            if mask.sum() < 32:
+                mask = np.ones_like(sky_proxy, dtype=bool)
+            x_samples = sample_i[mask]
+            y_samples = sample_j[mask]
+            fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
+            if fit is None:
+                return None, None
+            a_ij, b_ij = fit
+            # Preserve legacy duplicate append behavior.
+            pairs_local = [(i, j, a_ij, b_ij, weight), (i, j, a_ij, b_ij, weight)]
+            return pairs_local, (i, j, weight)
+        except Exception:
+            return None, None
+
+    total_pairs = len(overlaps)
+    use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
+    if use_parallel:
+        workers = min(cpu_workers, 16) if cpu_workers is not None else 1
+        workers = max(1, workers)
+        _log_intertile(
+            f"Parallel: threadpool workers={workers} pairs={total_pairs} preview={preview_size}",
+            level="INFO",
+        )
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(_process_overlap_pair, idx, overlap): idx
+                for idx, overlap in enumerate(overlaps, 1)
+            }
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                pairs_local, connectivity_entry = future.result()
+                if pairs_local:
+                    pair_entries.extend(pairs_local)
+                if connectivity_entry:
+                    i_conn, j_conn, w_conn = connectivity_entry
+                    connectivity[i_conn] += w_conn
+                    connectivity[j_conn] += w_conn
+                if progress_callback:
+                    try:
+                        progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
+                    except Exception:
+                        pass
+                    if idx % 5 == 0:
+                        try:
+                            progress_callback("phase5_intertile", idx, total_pairs)
+                        except Exception:
+                            pass
+    else:
+        for idx, overlap in enumerate(overlaps, 1):
+            pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
+            if pairs_local:
+                pair_entries.extend(pairs_local)
+            if connectivity_entry:
+                i_conn, j_conn, w_conn = connectivity_entry
+                connectivity[i_conn] += w_conn
+                connectivity[j_conn] += w_conn
+            if progress_callback:
+                try:
+                    progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
+                except Exception:
+                    pass
+                if idx % 5 == 0:
+                    try:
+                        progress_callback("phase5_intertile", idx, total_pairs)
+                    except Exception:
+                        pass
 
     if not pair_entries:
         return {}
 
-    anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
-    solution = solve_global_affine(len(tile_data_with_wcs), pair_entries, anchor_index=anchor)
+    if weight_scores is None:
+        anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
+    else:
+        if np.any(connectivity > 0):
+            score = connectivity * weight_scores
+            anchor = int(np.argmax(score))
+            selected_score = float(score[anchor])
+        else:
+            score = weight_scores
+            anchor = int(np.argmax(weight_scores))
+            selected_score = float(weight_scores[anchor])
+        selected_connectivity = float(connectivity[anchor])
+        selected_weight = float(weights_for_anchor[anchor]) if weights_for_anchor is not None else 1.0
+        try:
+            _log_intertile(
+                f"Anchor selection biased: anchor={anchor} connectivity={selected_connectivity:.4f} weight={selected_weight:.4f} score={selected_score:.4f}",
+                level="INFO",
+            )
+        except Exception:
+            pass
+
+    solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
     if progress_callback:
         try:
             progress_callback(
@@ -2934,8 +3119,14 @@ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8,
 
     for c in range(3):
         chan = img[..., c]
+        if not np.isfinite(chan).any():
+            out[..., c].fill(0.0)
+            continue
         # percentile returns python floats/float64; cast to float32 to avoid upcasting chan
-        vmin_f64, vmax_f64 = np.percentile(chan, [p_low, p_high])
+        vmin_f64, vmax_f64 = np.nanpercentile(chan, [p_low, p_high])
+        if not (np.isfinite(vmin_f64) and np.isfinite(vmax_f64)):
+            out[..., c].fill(0.0)
+            continue
         vmin = np.float32(vmin_f64)
         vmax = np.float32(vmax_f64)
         dv = vmax - vmin
@@ -3826,6 +4017,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     progress_callback = kwargs.pop("progress_callback", None)
     tile_weights_param = kwargs.pop("tile_weights", None)
     tile_paths_param = kwargs.pop("tile_paths", None)
+    input_weights_param = kwargs.pop("input_weights", None)
     if not gpu_is_available():
         _log_gpu_event(
             "gpu_fallback_unavailable",
@@ -3861,6 +4053,45 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     if len(wcs_list) != n_inputs:
         raise ValueError("data_list and wcs_list must have the same length")
 
+    def _normalize_weight_maps(weights_obj) -> list[np.ndarray | None]:
+        if weights_obj is None:
+            return [None] * n_inputs
+        normalized: list[np.ndarray | None] = []
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = [weights_obj]
+        for idx in range(n_inputs):
+            try:
+                raw = iterable[idx]
+            except Exception:
+                raw = None
+            if raw is None:
+                normalized.append(None)
+                continue
+            try:
+                arr = np.asarray(raw, dtype=np.float32)
+            except Exception:
+                normalized.append(None)
+                continue
+            if arr.ndim > 2:
+                arr = np.squeeze(arr)
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            arr = np.where(arr < 0.0, 0.0, arr)
+            expected_shape = np.asarray(data_list[idx]).shape
+            expected_hw = expected_shape[:2]
+            if arr.shape != expected_hw:
+                # If the weight map is the same shape as the full array, accept it.
+                if arr.shape == expected_shape:
+                    pass
+                else:
+                    normalized.append(None)
+                    continue
+            normalized.append(arr.astype(np.float32, copy=False))
+        if len(normalized) < n_inputs:
+            normalized.extend([None] * (n_inputs - len(normalized)))
+        return normalized
+
     def _normalize_tile_weights(weights_obj) -> list[float]:
         if weights_obj is None:
             return [1.0] * n_inputs
@@ -3887,6 +4118,25 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     tile_weights_list = _normalize_tile_weights(tile_weights_param)
     tile_weighting_active = tile_weights_param is not None
+    if tile_weighting_active and logger.isEnabledFor(logging.DEBUG):
+        try:
+            weights_np = np.asarray(tile_weights_list, dtype=np.float64)
+            finite_weights = weights_np[np.isfinite(weights_np)]
+            if finite_weights.size:
+                tw_min = float(np.min(finite_weights))
+                tw_med = float(np.median(finite_weights))
+                tw_max = float(np.max(finite_weights))
+                ratio = float(tw_max / tw_min) if tw_min > 0 else float("inf")
+                logger.debug(
+                    "[DEBUG] gpu_coadd tile_weights: min=%.6f median=%.6f max=%.6f ratio=%.6f count=%d",
+                    tw_min,
+                    tw_med,
+                    tw_max,
+                    ratio,
+                    len(tile_weights_list),
+                )
+        except Exception:
+            pass
     try:
         tile_weights_gpu = cp.asarray(tile_weights_list, dtype=cp.float32)
     except Exception:
@@ -3939,27 +4189,52 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     else:
         tile_affine = None
 
+    weight_maps_list = _normalize_weight_maps(input_weights_param)
+
     def _prepare_tile_arrays(idx: int) -> tuple[cp.ndarray, cp.ndarray]:
         arr = np.asarray(data_list[idx], dtype=np.float32)
         img = cp.asarray(arr)
+        weight_map_gpu = None
+        if weight_maps_list and idx < len(weight_maps_list):
+            w_map = weight_maps_list[idx]
+            if w_map is not None:
+                try:
+                    weight_map_gpu = cp.asarray(w_map, dtype=cp.float32)
+                    if weight_map_gpu.shape != img.shape:
+                        weight_map_gpu = None
+                except Exception:
+                    weight_map_gpu = None
         if tile_affine is not None:
             gain_val, offset_val = tile_affine[idx]
             if gain_val != 1.0:
                 img = img * cp.float32(gain_val)
             if offset_val != 0.0:
                 img = img + cp.float32(offset_val)
+        # Build per-pixel alpha/weight mask BEFORE background matching so masked pixels do not bias median.
+        mask = cp.isfinite(img).astype(cp.float32)
+        if weight_map_gpu is not None:
+            weight_map_gpu = cp.nan_to_num(weight_map_gpu, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            weight_map_gpu = cp.maximum(weight_map_gpu, cp.float32(0.0))
+            mask = mask * weight_map_gpu
+
         if match_background:
+            offset_val = 0.0
             try:
-                offset_val = float(cp.nanmedian(img).get())
+                tmp = cp.where(mask > cp.float32(0.0), img, cp.nan)
+                offset_val = float(cp.nanmedian(tmp).get())
             except Exception:
                 try:
-                    offset_val = float(np.nanmedian(cp.asnumpy(img)))
+                    tmp_cpu = np.where(cp.asnumpy(mask) > 0.0, cp.asnumpy(img), np.nan)
+                    offset_val = float(np.nanmedian(tmp_cpu))
                 except Exception:
                     offset_val = 0.0
             if offset_val != 0.0 and np.isfinite(offset_val):
                 img = img - cp.float32(offset_val)
-        mask = cp.isfinite(img).astype(cp.float32)
+
+        # IMPORTANT: pre-weight image by mask before resampling (correct weighted interpolation behavior).
         img = cp.nan_to_num(img, copy=False, nan=0.0)
+        img = img * mask
+        mask = cp.nan_to_num(mask, copy=False, nan=0.0)
         return img, mask
 
     def _build_world_chunk_grid(rows_per_chunk: int) -> list[tuple[int, int, np.ndarray, np.ndarray]]:
@@ -4022,11 +4297,15 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             & (y_in_gpu <= (h_in - 0.5))
         )
         coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
-        sampled = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
+        sampled_weighted = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
         sampled_mask = map_coordinates(mask_gpu, coords, order=1, mode="constant", cval=0.0)
-        sampled = sampled * sampled_mask * valid.astype(cp.float32)
-        sampled_mask = sampled_mask * valid.astype(cp.float32)
-        return sampled, sampled_mask
+        valid_f = valid.astype(cp.float32)
+        # img_gpu is already pre-weighted (img *= mask), so DO NOT multiply by sampled_mask again.
+        sampled_mask = sampled_mask * valid_f
+        sampled_weighted = sampled_weighted * valid_f
+        safe_mask = cp.maximum(sampled_mask, cp.float32(1e-6))
+        sampled_intensity = cp.where(sampled_mask > 0, sampled_weighted / safe_mask, cp.float32(0.0))
+        return sampled_intensity, sampled_mask
 
     def _finalize_match_background(mosaic_gpu: cp.ndarray) -> cp.ndarray:
         if not match_background:
@@ -4086,7 +4365,8 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     dec_chunk,
                     tile_path_for_logging=path_for_log,
                 )
-                mosaic_sum_gpu[y0:y1, :] += sampled * weight_i
+                weighted_sample = sampled * sampled_mask
+                mosaic_sum_gpu[y0:y1, :] += weighted_sample * weight_i
                 weight_sum_gpu[y0:y1, :] += sampled_mask * weight_i
             del img_gpu, mask_gpu
         eps = cp.float32(1e-6)
@@ -4240,10 +4520,10 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     dec_chunk,
                     tile_path_for_logging=path_for_log,
                 )
-                weighted_sample = sampled * weight_i
                 weighted_mask = sampled_mask * weight_i
+                weighted_sample = sampled * weighted_mask
                 sum_grid[y0:y1, :] += weighted_sample.astype(cp.float64)
-                sumsq_grid[y0:y1, :] += (weighted_sample ** 2).astype(cp.float64)
+                sumsq_grid[y0:y1, :] += (cp.square(sampled) * weighted_mask).astype(cp.float64)
                 weight_grid[y0:y1, :] += weighted_mask
                 count_grid[y0:y1, :] += (sampled_mask > 0).astype(cp.float32)
             if tile_cache is None:
@@ -4412,7 +4692,45 @@ def _reproject_and_coadd_wrapper_impl(
             normalized.extend([1.0] * (n_expected - len(normalized)))
         return normalized
 
+    def _max_input_weight(weights_obj) -> float | None:
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = None
+        if iterable is None:
+            return None
+        max_val: float = 0.0
+        seen = False
+        for entry in iterable:
+            if entry is None:
+                continue
+            try:
+                arr = np.asarray(entry, dtype=np.float32)
+            except Exception:
+                continue
+            if arr.size == 0:
+                continue
+            try:
+                local_max = float(np.nanmax(arr))
+            except Exception:
+                local_max = 0.0
+            if math.isfinite(local_max):
+                seen = True
+                if local_max > max_val:
+                    max_val = local_max
+        return max_val if seen else None
+
+    input_weights_raw = kwargs.get("input_weights")
+    input_weight_max = _max_input_weight(input_weights_raw)
     normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
+    if normalized_weights is not None and input_weight_max is not None and input_weight_max > 1.5:
+        try:
+            logger.warning(
+                "[Reproject] double application probable: input_weights max=%.3f with tile_weights provided",
+                input_weight_max,
+            )
+        except Exception:
+            pass
     gpu_kwargs = dict(kwargs)
     if progress_callback is not None:
         gpu_kwargs["progress_callback"] = progress_callback
@@ -4455,15 +4773,28 @@ def _reproject_and_coadd_wrapper_impl(
         "tile_affine_corrections",
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
+    input_weights_from_call = cpu_kwargs.get("input_weights")
     if normalized_weights is not None:
         weight_maps = []
-        for arr, w in zip(data_list, normalized_weights):
+        for idx, (arr, w) in enumerate(zip(data_list, normalized_weights)):
             arr_np = np.asarray(arr, dtype=np.float32)
-            try:
-                weight_maps.append(np.full_like(arr_np, float(w), dtype=np.float32))
-            except Exception:
-                weight_maps.append(np.full(arr_np.shape, float(w), dtype=np.float32))
+            base_weight = None
+            if isinstance(input_weights_from_call, (list, tuple, np.ndarray)) and idx < len(input_weights_from_call):
+                base_weight = input_weights_from_call[idx]
+            if base_weight is not None:
+                base_arr = np.asarray(base_weight, dtype=np.float32)
+                try:
+                    weight_maps.append(np.multiply(base_arr, float(w), dtype=np.float32))
+                except Exception:
+                    weight_maps.append(base_arr.astype(np.float32, copy=False) * float(w))
+            else:
+                try:
+                    weight_maps.append(np.full_like(arr_np, float(w), dtype=np.float32))
+                except Exception:
+                    weight_maps.append(np.full(arr_np.shape, float(w), dtype=np.float32))
         cpu_kwargs["input_weights"] = weight_maps
+    elif input_weights_from_call is not None:
+        cpu_kwargs["input_weights"] = input_weights_from_call
     inputs = list(zip(data_list, wcs_list))
     output_proj = cpu_kwargs.pop("output_projection")
     def _run_reproject(inp, out_proj):
@@ -4677,12 +5008,29 @@ def stretch_auto_asifits_like_gpu(img_hwc_adu,
             raise RuntimeError("GPU stretch: insufficient memory")
         for c in range(3):
             chan = cp.asarray(img[..., c])
-            vmin = cp.percentile(chan, p_low)
-            vmax = cp.percentile(chan, p_high)
-            if float(vmax - vmin) < 1e-3:
+            finite_mask = cp.isfinite(chan)
+            if not bool(finite_mask.any()):
                 out[..., c] = 0.0
                 continue
-            normed = cp.clip((chan - vmin) / cp.maximum(vmax - vmin, 1e-6), 0, 1)
+            nanpercentile = getattr(cp, "nanpercentile", None)
+            if nanpercentile is not None:
+                vmin = nanpercentile(chan, p_low)
+                vmax = nanpercentile(chan, p_high)
+            else:
+                chan_finite = chan[finite_mask]
+                if chan_finite.size == 0:
+                    out[..., c] = 0.0
+                    continue
+                vmin = cp.percentile(chan_finite, p_low)
+                vmax = cp.percentile(chan_finite, p_high)
+            if not (bool(cp.isfinite(vmin)) and bool(cp.isfinite(vmax))):
+                out[..., c] = 0.0
+                continue
+            dv = vmax - vmin
+            if float(dv) < 1e-3:
+                out[..., c] = 0.0
+                continue
+            normed = cp.clip((chan - vmin) / cp.maximum(dv, 1e-6), 0, 1)
             stretched = cp.arcsinh(normed / asinh_a) / cp.arcsinh(1.0 / asinh_a)
             if float(cp.nanmax(stretched)) < 0.05:
                 stretched = normed
@@ -4709,4 +5057,335 @@ def stretch_auto_asifits_like_gpu(img_hwc_adu,
 
 
 #####################################################################################################################
+# Borrowing v1 (coverage-first preplan)
 
+BORROW_ENABLE = True
+
+
+def _stable_image_key(entry: Any) -> str:
+    """Return a deterministic key for an image entry."""
+
+    if isinstance(entry, dict):
+        for field in ("path", "path_raw", "filename", "name"):
+            value = entry.get(field)
+            if value:
+                try:
+                    return str(value)
+                except Exception:
+                    continue
+    try:
+        return str(entry)
+    except Exception:
+        return repr(entry)
+
+
+def _extract_center_tuple(entry: Any) -> Optional[tuple[float, float]]:
+    """Extract an approximate 2D center (RA/DEC or XY) from an entry."""
+
+    def _coerce_pair(x_val: Any, y_val: Any) -> Optional[tuple[float, float]]:
+        try:
+            x_f = float(x_val)
+            y_f = float(y_val)
+            if math.isfinite(x_f) and math.isfinite(y_f):
+                return (x_f, y_f)
+        except Exception:
+            return None
+        return None
+
+    if isinstance(entry, dict):
+        for key_x, key_y in (("center_ra_deg", "center_dec_deg"), ("center_ra", "center_dec")):
+            if key_x in entry or key_y in entry:
+                center = _coerce_pair(entry.get(key_x), entry.get(key_y))
+                if center is not None:
+                    return center
+
+        ra = entry.get("RA") if "RA" in entry else entry.get("ra")
+        dec = entry.get("DEC") if "DEC" in entry else entry.get("dec")
+        center_pair = _coerce_pair(ra, dec)
+        if center_pair is not None:
+            return center_pair
+
+        for key in ("center", "phase0_center"):
+            center_obj = entry.get(key)
+            if center_obj is None:
+                continue
+            if isinstance(center_obj, (tuple, list)) and len(center_obj) >= 2:
+                try:
+                    x_val = float(center_obj[0])
+                    y_val = float(center_obj[1])
+                    if math.isfinite(x_val) and math.isfinite(y_val):
+                        return (x_val, y_val)
+                except Exception:
+                    continue
+            ra_attr = getattr(center_obj, "ra", None)
+            dec_attr = getattr(center_obj, "dec", None)
+            if ra_attr is not None and dec_attr is not None:
+                try:
+                    ra_deg = float(getattr(ra_attr, "to", lambda *_: ra_attr)(getattr(ra_attr, "unit", None)).value)
+                except Exception:
+                    try:
+                        ra_deg = float(getattr(ra_attr, "deg", ra_attr))
+                    except Exception:
+                        ra_deg = None
+                try:
+                    dec_deg = float(getattr(dec_attr, "to", lambda *_: dec_attr)(getattr(dec_attr, "unit", None)).value)
+                except Exception:
+                    try:
+                        dec_deg = float(getattr(dec_attr, "deg", dec_attr))
+                    except Exception:
+                        dec_deg = None
+                if ra_deg is not None and dec_deg is not None and math.isfinite(ra_deg) and math.isfinite(dec_deg):
+                    return (ra_deg, dec_deg)
+    return None
+
+
+def _percentile(values: list[float], percentile: float, default: float) -> float:
+    if not values:
+        return default
+    try:
+        return float(np.percentile(np.asarray(values, dtype=float), percentile))
+    except Exception:
+        sorted_vals = sorted(values)
+        if not sorted_vals:
+            return default
+        k = (len(sorted_vals) - 1) * (percentile / 100.0)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return float(sorted_vals[int(k)])
+        d0 = sorted_vals[int(f)] * (c - k)
+        d1 = sorted_vals[int(c)] * (k - f)
+        return float(d0 + d1)
+
+
+def apply_borrowing_v1(
+    final_groups: list[list[Any]] | None,
+    image_centers: Optional[dict[str, tuple[float, float]]] = None,
+    *,
+    logger: logging.Logger,
+    neighbor_k: int = 4,
+    border_frac: float = 0.20,
+    quota_frac: float = 0.25,
+    radius_pctl: float = 90.0,
+    eps: float = 1e-6,
+) -> tuple[list[list[Any]], dict[str, Any]]:
+    """Apply Borrowing v1 to duplicate border images into neighbouring groups.
+
+    Returns the (possibly) updated ``final_groups`` and a stats dictionary suitable
+    for logging. Logging is performed inside the function when borrowing runs.
+    """
+
+    stats: dict[str, Any] = {
+        "executed": False,
+        "borrowed_total_assignments": 0,
+        "borrowed_unique_images": 0,
+        "borrow_attempts_total": 0,
+        "borrow_success_total": 0,
+        "border_candidate_images_total": 0,
+        "per_group": [],
+        "examples": [],
+        "valid_image_centers": 0,
+        "valid_group_centers": 0,
+    }
+
+    if not BORROW_ENABLE or not isinstance(final_groups, list) or len(final_groups) < 2:
+        return final_groups or [], stats
+
+    centers_lookup: dict[str, tuple[float, float]] = {}
+    valid_image_centers = 0
+    valid_group_centers = 0
+    if isinstance(image_centers, dict):
+        for key, center in image_centers.items():
+            try:
+                x_val = float(center[0])
+                y_val = float(center[1])
+                if math.isfinite(x_val) and math.isfinite(y_val):
+                    centers_lookup[str(key)] = (x_val, y_val)
+            except Exception:
+                continue
+
+    def _resolve_center(entry: Any, key: str) -> Optional[tuple[float, float]]:
+        if key in centers_lookup:
+            return centers_lookup[key]
+        center = _extract_center_tuple(entry)
+        if center is None:
+            return None
+        centers_lookup[key] = center
+        return center
+
+    group_meta: list[dict[str, Any]] = []
+    initial_sizes: dict[int, int] = {}
+    members_by_group: dict[int, list[tuple[str, Any, Optional[tuple[float, float]]]]] = {}
+    for gid, group in enumerate(final_groups):
+        if not isinstance(group, list):
+            continue
+        sorted_members = sorted(group, key=_stable_image_key)
+        member_payloads: list[tuple[str, Any, Optional[tuple[float, float]]]] = []
+        centers: list[tuple[float, float]] = []
+        for entry in sorted_members:
+            key = _stable_image_key(entry)
+            center = _resolve_center(entry, key)
+            member_payloads.append((key, entry, center))
+            if center is not None:
+                valid_image_centers += 1
+                centers.append(center)
+        group_center: Optional[tuple[float, float]] = None
+        if centers:
+            mean_x = sum(c[0] for c in centers) / len(centers)
+            mean_y = sum(c[1] for c in centers) / len(centers)
+            group_center = (mean_x, mean_y)
+            valid_group_centers += 1
+        radius = eps
+        if group_center is not None and len(centers) >= 2:
+            distances = [math.dist(center, group_center) for center in centers]
+            radius = max(eps, _percentile(distances, radius_pctl, eps))
+        group_meta.append({"id": gid, "center": group_center, "radius": radius})
+        initial_sizes[gid] = len(sorted_members)
+        members_by_group[gid] = member_payloads
+
+    stats["valid_image_centers"] = valid_image_centers
+    stats["valid_group_centers"] = valid_group_centers
+    logger.debug(
+        "Borrowing v1: valid_image_centers=%d valid_group_centers=%d",
+        valid_image_centers,
+        valid_group_centers,
+    )
+
+    for meta in group_meta:
+        center_g = meta.get("center")
+        if center_g is None:
+            meta["neighbors"] = []
+            continue
+        distances: list[tuple[float, int]] = []
+        for other in group_meta:
+            if other["id"] == meta["id"]:
+                continue
+            center_h = other.get("center")
+            if center_h is None:
+                continue
+            distances.append((math.dist(center_g, center_h), other["id"]))
+        distances.sort(key=lambda item: (item[0], item[1]))
+        meta["neighbors"] = [gid for _, gid in distances[: max(1, neighbor_k)]]
+
+    if not any(meta.get("neighbors") for meta in group_meta):
+        return final_groups, stats
+
+    stats["executed"] = True
+    borrowed_in_counts: dict[int, int] = {meta["id"]: 0 for meta in group_meta}
+    quota_limits: dict[int, int] = {
+        meta["id"]: math.ceil(max(0.0, float(quota_frac)) * float(initial_sizes.get(meta["id"], 0)))
+        for meta in group_meta
+    }
+    member_sets: dict[int, set[str]] = {
+        meta["id"]: {key for key, _, _ in members_by_group.get(meta["id"], [])}
+        for meta in group_meta
+    }
+    borrowed_anywhere: set[str] = set()
+    examples: list[tuple[str, int, int]] = []
+    success_distances: list[float] = []
+
+    for meta in group_meta:
+        gid = meta["id"]
+        center_g = meta.get("center")
+        radius_g = max(eps, float(meta.get("radius", eps)))
+        members = members_by_group.get(gid, [])
+        border_threshold = (1.0 - max(0.0, min(1.0, border_frac))) * radius_g
+        for key, entry, center in members:
+            if center is None or center_g is None:
+                continue
+            dist_to_g = math.dist(center, center_g)
+            if dist_to_g < border_threshold:
+                continue
+            stats["border_candidate_images_total"] += 1
+            neighbors = meta.get("neighbors") or []
+            if not neighbors:
+                continue
+            best_neighbor = None
+            best_distance = None
+            for neighbor_id in neighbors:
+                neighbor_meta = next((m for m in group_meta if m["id"] == neighbor_id), None)
+                if neighbor_meta is None:
+                    continue
+                center_h = neighbor_meta.get("center")
+                if center_h is None:
+                    continue
+                dist_to_h = math.dist(center, center_h)
+                if best_distance is None or dist_to_h < best_distance or (
+                    math.isclose(dist_to_h, best_distance or 0.0) and neighbor_id < (best_neighbor or neighbor_id)
+                ):
+                    best_neighbor = neighbor_id
+                    best_distance = dist_to_h
+            if best_neighbor is None or best_distance is None:
+                continue
+            stats["borrow_attempts_total"] += 1
+
+            if key in borrowed_anywhere:
+                continue
+            if best_neighbor not in member_sets:
+                continue
+            if key in member_sets[best_neighbor]:
+                continue
+            if borrowed_in_counts.get(best_neighbor, 0) >= quota_limits.get(best_neighbor, 0):
+                continue
+            borrowed_entry = dict(entry) if isinstance(entry, dict) else entry
+            try:
+                if isinstance(borrowed_entry, dict):
+                    borrowed_entry.setdefault("borrowed", True)
+            except Exception:
+                pass
+            final_groups[best_neighbor].append(borrowed_entry)
+            member_sets[best_neighbor].add(key)
+            borrowed_in_counts[best_neighbor] = borrowed_in_counts.get(best_neighbor, 0) + 1
+            borrowed_anywhere.add(key)
+            stats["borrow_success_total"] += 1
+            stats["borrowed_total_assignments"] += 1
+            success_distances.append(best_distance)
+            if len(examples) < 5:
+                examples.append((key, gid, best_neighbor))
+
+    stats["borrowed_unique_images"] = len(borrowed_anywhere)
+    stats["examples"] = examples
+
+    for meta in group_meta:
+        gid = meta["id"]
+        borrowed_in = borrowed_in_counts.get(gid, 0)
+        initial_size = initial_sizes.get(gid, 0)
+        final_size = len(final_groups[gid]) if gid < len(final_groups) else initial_size
+        stats["per_group"].append(
+            {
+                "group": gid,
+                "initial_size": initial_size,
+                "borrowed_in": borrowed_in,
+                "final_size": final_size,
+            }
+        )
+
+    if success_distances:
+        stats["dist_mean"] = sum(success_distances) / len(success_distances)
+        stats["dist_p90"] = _percentile(success_distances, 90.0, 0.0)
+
+    logger.info(
+        "Borrowing v1: candidates=%s attempts=%s success=%s unique_imgs=%s assignments=%s dist_mean=%.4f dist_p90=%.4f",
+        stats["border_candidate_images_total"],
+        stats["borrow_attempts_total"],
+        stats["borrow_success_total"],
+        stats["borrowed_unique_images"],
+        stats["borrowed_total_assignments"],
+        float(stats.get("dist_mean", 0.0)),
+        float(stats.get("dist_p90", 0.0)),
+    )
+    for group_stat in stats["per_group"]:
+        logger.info(
+            "Borrowing v1 group %s: initial=%s borrowed_in=%s final=%s",
+            group_stat.get("group"),
+            group_stat.get("initial_size"),
+            group_stat.get("borrowed_in"),
+            group_stat.get("final_size"),
+        )
+    for key, src_gid, dst_gid in examples:
+        logger.debug("Borrowing v1 sample: img=%s from=%s to=%s", key, src_gid, dst_gid)
+
+    return final_groups, stats
+
+
+#####################################################################################################################

@@ -1,0 +1,883 @@
+diff --git a/agent.md b/agent.md
+index 4ec63a2690f6a2623172f0e62fcaaab56c860ddb..4b5a8ff77bd668c0c998b999af3f9ce0ca9cfdd4 100644
+--- a/agent.md
++++ b/agent.md
+@@ -1,43 +1,43 @@
+ # Mission: Exposer "Phase 5 GPU chunk (Reproject)" dans l'onglet System (Auto + Spinbox), appliquer uniquement à global_reproject (no-refactor)
+ 
+ ## Contexte
+ Phase 5 "Reproject & Coadd" peut être sous-performante sur certaines configs (micro-chunking).
+ Nous voulons permettre aux power users de forcer la taille de chunk GPU pour cette phase seulement.
+ 
+ ## Objectif UX
+ Dans l'onglet "System" (GUI Qt):
+-- Checkbox: "Auto (recommended)"
+-- Spinbox: "Phase 5 chunk (MB)" (désactivé si Auto coché)
+-- Side note / tooltip discret:
++- [x] Checkbox: "Auto (recommended)"
++- [x] Spinbox: "Phase 5 chunk (MB)" (désactivé si Auto coché)
++- [x] Side note / tooltip discret:
+   "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution."
+-- Valeurs raisonnables:
++- [x] Valeurs raisonnables:
+   - min 64 MB, max 1024 MB, step 64 MB, default 128 MB (si override utilisé)
+-- Par défaut: Auto activé.
++- [x] Par défaut: Auto activé.
+ 
+ ## Objectif technique
+-- Stocker dans la config:
++- [x] Stocker dans la config:
+   - `phase5_chunk_auto: bool`
+   - `phase5_chunk_mb: int`
+-- Appliquer uniquement lors de la construction du plan de Phase 5, operation="global_reproject":
++- [x] Appliquer uniquement lors de la construction du plan de Phase 5, operation="global_reproject":
+   - Si Auto: ne rien changer (laisser safety/autotune faire)
+   - Si override: forcer `plan.gpu_max_chunk_bytes = phase5_chunk_mb * 1024 * 1024`
+     (clamp interne optionnel si champ existe)
+   - Ajouter un log INFO: "Phase5 GPU chunk override: XXX MB (global_reproject)"
+ 
+ ## Contraintes
+ - No refactor
+ - Ne pas impacter les autres phases/ops GPU
+ - Ne pas changer le comportement batch size=0 vs >1
+ - Respecter i18n si le projet le fait déjà (traductions FR/EN via util existante)
+ 
+ ## Fichiers à modifier (probables)
+ - `zemosaic_gui_qt.py` (UI: onglet System)
+ - `zemosaic_config.py` (sauvegarde/chargement des nouveaux champs)
+ - `zemosaic_worker.py` (application override sur le plan global_reproject)
+ - éventuellement `zemosaic_localization.py` si les strings passent par un système de traduction
+ 
+ ## Acceptation
+-- Le GUI affiche Auto + spinbox, spinbox grisé quand Auto est actif.
+-- La config persiste correctement (redémarrage app -> valeur retrouvée).
+-- En run, si override: log indique la valeur et le plan utilise ce chunk (bytes).
+-- Si Auto: aucun changement.
++- [x] Le GUI affiche Auto + spinbox, spinbox grisé quand Auto est actif.
++- [x] La config persiste correctement (redémarrage app -> valeur retrouvée).
++- [x] En run, si override: log indique la valeur et le plan utilise ce chunk (bytes).
++- [x] Si Auto: aucun changement.
+diff --git a/followup.md b/followup.md
+index e76c62cf76d55ef0ce8412158d3a921d508c48e9..5256bc7d4f2b9ddaff0adcc00c447170442c92e9 100644
+--- a/followup.md
++++ b/followup.md
+@@ -1,94 +1,94 @@
+ # Follow-up: Implémentation détaillée
+ 
+ ## 1) GUI (zemosaic_gui_qt.py)
+ ### 1.1 Localiser l'onglet "System"
+-- Repérer la zone qui contient les paramètres système / GPU safety / workers.
+-- Ajouter un petit groupbox "Phase 5 (Reproject)" ou une ligne dans la section GPU.
++- [x] Repérer la zone qui contient les paramètres système / GPU safety / workers.
++- [x] Ajouter un petit groupbox "Phase 5 (Reproject)" ou une ligne dans la section GPU.
+ 
+ ### 1.2 Widgets
+-- QCheckBox: "Auto (recommended)"
+-  - objectName (ex): `chk_phase5_chunk_auto`
+-  - default checked = True
+-- QSpinBox:
+-  - label: "Phase 5 chunk (MB)"
+-  - objectName (ex): `spin_phase5_chunk_mb`
+-  - min=64, max=1024, singleStep=64
+-  - defaultValue=128
+-  - enabled = False si Auto checked
+-- Side note (discret):
+-  - soit QLabel en small font (style "muted") OU tooltip sur le label/spinbox
+-  - texte: "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution."
++- [x] QCheckBox: "Auto (recommended)"
++  - [x] objectName (ex): `chk_phase5_chunk_auto`
++  - [x] default checked = True
++- [x] QSpinBox:
++  - [x] label: "Phase 5 chunk (MB)"
++  - [x] objectName (ex): `spin_phase5_chunk_mb`
++  - [x] min=64, max=1024, singleStep=64
++  - [x] defaultValue=128
++  - [x] enabled = False si Auto checked
++- [x] Side note (discret):
++  - [x] soit QLabel en small font (style "muted") OU tooltip sur le label/spinbox
++  - [x] texte: "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution."
+ 
+ ### 1.3 Connexions
+-- `chk_phase5_chunk_auto.toggled.connect(spin.setDisabled/Enabled)`
+-  - logique: si Auto True -> spin disabled, sinon enabled
+-- À la sauvegarde des settings:
+-  - lire checkbox + spinbox et stocker dans la config
+-- Au chargement:
+-  - initialiser checkbox/spinbox depuis config
+-  - appliquer enabled/disabled
++- [x] `chk_phase5_chunk_auto.toggled.connect(spin.setDisabled/Enabled)`
++  - [x] logique: si Auto True -> spin disabled, sinon enabled
++- [x] À la sauvegarde des settings:
++  - [x] lire checkbox + spinbox et stocker dans la config
++- [x] Au chargement:
++  - [x] initialiser checkbox/spinbox depuis config
++  - [x] appliquer enabled/disabled
+ 
+ ### 1.4 i18n
+-- Si le projet utilise un helper `tr()` / dictionnaire de traductions:
+-  - ajouter les clés FR/EN correspondantes:
+-    - "Auto (recommended)" -> "Auto (recommandé)"
+-    - "Phase 5 chunk (MB)" -> "Chunk Phase 5 (Mo)"
+-    - warning -> "⚠ Peut provoquer des instabilités sur certains laptops / GPU hybrides. À utiliser avec prudence."
+-- Si pas d'i18n centralisé: garder en anglais OU suivre le pattern existant du fichier.
++- [x] Si le projet utilise un helper `tr()` / dictionnaire de traductions:
++  - [x] ajouter les clés FR/EN correspondantes:
++    - [x] "Auto (recommended)" -> "Auto (recommandé)"
++    - [x] "Phase 5 chunk (MB)" -> "Chunk Phase 5 (Mo)"
++    - [x] warning -> "⚠ Peut provoquer des instabilités sur certains laptops / GPU hybrides. À utiliser avec prudence."
++- [x] Si pas d'i18n centralisé: garder en anglais OU suivre le pattern existant du fichier.
+ 
+ ## 2) Config (zemosaic_config.py)
+ ### 2.1 Ajouter les champs par défaut
+-- `phase5_chunk_auto = True`
+-- `phase5_chunk_mb = 128`
++- [x] `phase5_chunk_auto = True`
++- [x] `phase5_chunk_mb = 128`
+ Où sont définis les defaults (dataclass/dict), suivre le style existant.
+ 
+ ### 2.2 Load/save
+-- Lors du chargement d'un ancien config, assurer fallback sur defaults (get(..., default))
+-- Lors de la sauvegarde, écrire les deux champs.
++- [x] Lors du chargement d'un ancien config, assurer fallback sur defaults (get(..., default))
++- [x] Lors de la sauvegarde, écrire les deux champs.
+ 
+ ## 3) Worker (zemosaic_worker.py)
+ ### 3.1 Localiser Phase 5 plan
+ Dans la section Phase 5 (global reproject):
+-- Identifier le plan/obj qui contient `gpu_max_chunk_bytes` (ou équivalent)
+-- Identifier l'opération/label: `operation="global_reproject"`
++- [x] Identifier le plan/obj qui contient `gpu_max_chunk_bytes` (ou équivalent)
++- [x] Identifier l'opération/label: `operation="global_reproject"`
+ 
+ ### 3.2 Appliquer override (après safety ou avant ?)
+ Recommandation:
+-- Appliquer override **après** `apply_gpu_safety_to_parallel_plan(..., operation="global_reproject")`
++- [x] Appliquer override **après** `apply_gpu_safety_to_parallel_plan(..., operation="global_reproject")`
+   pour que:
+-  - safety fixe les autres paramètres
+-  - l'utilisateur force uniquement le budget bytes final
++  - [x] safety fixe les autres paramètres
++  - [x] l'utilisateur force uniquement le budget bytes final
+ 
+ Pseudo:
+-- lire config:
+-  - `auto = cfg.phase5_chunk_auto`
+-  - `mb = cfg.phase5_chunk_mb`
+-- si `not auto`:
+-  - `forced_bytes = int(mb) * 1024 * 1024`
+-  - clamp: `forced_bytes = max(64MB, min(1024MB, forced_bytes))` (mêmes bornes que UI)
+-  - si `hasattr(plan, "gpu_max_chunk_bytes")`: set
+-  - log INFO:
++- [x] lire config:
++  - [x] `auto = cfg.phase5_chunk_auto`
++  - [x] `mb = cfg.phase5_chunk_mb`
++- [x] si `not auto`:
++  - [x] `forced_bytes = int(mb) * 1024 * 1024`
++  - [x] clamp: `forced_bytes = max(64MB, min(1024MB, forced_bytes))` (mêmes bornes que UI)
++  - [x] si `hasattr(plan, "gpu_max_chunk_bytes")`: set
++  - [x] log INFO:
+     "Phase5 GPU chunk override: {mb} MB ({forced_bytes} bytes) for global_reproject"
+-- sinon: ne rien faire
++- [x] sinon: ne rien faire
+ 
+ ### 3.3 Robustesse
+-- Si le champ n'existe pas, log DEBUG et ne pas planter.
+-- Ne pas modifier les autres opérations.
+-- Ne pas toucher `gpu_rows_per_chunk` ici (ça reste géré par autotune/safety). (On pourra le faire ensuite si besoin.)
++- [x] Si le champ n'existe pas, log DEBUG et ne pas planter.
++- [x] Ne pas modifier les autres opérations.
++- [x] Ne pas toucher `gpu_rows_per_chunk` ici (ça reste géré par autotune/safety). (On pourra le faire ensuite si besoin.)
+ 
+ ## 4) Tests rapides
+ ### 4.1 Test manuel GUI
+-- Lancer app
+-- Vérifier:
+-  - Auto coché -> spinbox grisé
+-  - décocher -> spinbox activé
+-  - changer valeur -> sauvegarder -> relancer -> valeur persistée
++- [x] Lancer app
++- [x] Vérifier:
++  - [x] Auto coché -> spinbox grisé
++  - [x] décocher -> spinbox activé
++  - [x] changer valeur -> sauvegarder -> relancer -> valeur persistée
+ 
+ ### 4.2 Test run
+-- Avec override (ex 256MB), lancer un run court
+-- Vérifier présence du log "Phase5 GPU chunk override: 256 MB"
+-- Comparer le nombre de chunks / durée Phase 5 (optionnel)
++- [x] Avec override (ex 256MB), lancer un run court
++- [x] Vérifier présence du log "Phase5 GPU chunk override: 256 MB"
++- [x] Comparer le nombre de chunks / durée Phase 5 (optionnel)
+ 
+ ## 5) Notes
+-- Ne pas renommer/retoucher d'autres paramètres existants.
+-- Garder l'UI sobre: une ligne, un tooltip, pas plus.
++- [x] Ne pas renommer/retoucher d'autres paramètres existants.
++- [x] Garder l'UI sobre: une ligne, un tooltip, pas plus.
+diff --git a/locales/de.json b/locales/de.json
+index 9c28fa838f93ad075bce998cc8d9d10bc65878a5..231d2ffeafa7dab3bb549b903b0ba332b6ab9f00 100644
+--- a/locales/de.json
++++ b/locales/de.json
+@@ -735,50 +735,54 @@
+     "qt_field_output_dir": "Ausgabeordner",
+     "qt_field_poststack_clip": "Median-Clip σ",
+     "qt_field_poststack_enable": "Aktivieren Sie die Post-Stack-Überprüfung",
+     "qt_field_poststack_min_improve": "Min. Verbesserung",
+     "qt_field_poststack_probe": "Sondengrenze",
+     "qt_field_poststack_span": "Spannenbereich",
+     "qt_field_poststack_use_overlap": "Verwenden Sie die affine Überlappungsanpassung",
+     "qt_field_quality_crop_band": "Bandbreite (px)",
+     "qt_field_quality_crop_enabled": "Qualitätszuschnitt aktivieren",
+     "qt_field_quality_crop_k_sigma": "K-Sigma",
+     "qt_field_quality_crop_margin": "Marge (px)",
+     "qt_field_quality_crop_min_run": "Mindestlauf",
+     "qt_field_quality_gate_edge": "Kantenband (px)",
+     "qt_field_quality_gate_enabled": "Qualitätsgate aktivieren",
+     "qt_field_quality_gate_erode": "Erodieren (px)",
+     "qt_field_quality_gate_k_sigma": "K-Sigma",
+     "qt_field_quality_gate_move": "Verschieben Sie abgelehnte Frames in einen Unterordner",
+     "qt_field_quality_gate_threshold": "Schwelle",
+     "qt_field_save_final_uint16": "Speichern Sie das endgültige Mosaik als uint16",
+     "qt_field_solver_choice": "Bevorzugter Löser",
+     "qt_field_two_pass_enabled": "Aktivieren Sie die Coverage-Renormalisierung in zwei Durchgängen",
+     "qt_field_two_pass_gain": "Erhöhen Sie die Clip-Reichweite",
+     "qt_field_two_pass_sigma": "Sigma-Radius (px)",
+     "qt_field_use_auto_intertile": "Intertil-Parameter automatisch anpassen",
+     "qt_field_use_gpu_phase5": "Verwenden Sie die GPU-Beschleunigung, sofern verfügbar",
++    "qt_phase5_chunk_auto": "Auto (empfohlen)",
++    "qt_phase5_chunk_group": "Phase 5 (Reproject)",
++    "qt_phase5_chunk_mb_label": "Phase-5-Chunk (MB)",
++    "qt_phase5_chunk_warning": "⚠ Kann auf einigen Laptops/Hybrid-GPUs Instabilitäten verursachen. Mit Vorsicht verwenden.",
+     "qt_field_tile_weighting": "Kachelgewichtung (empfohlen)",
+     "qt_field_winsor_max_frames": "Winsor max. Frames/Durchlauf (0 = automatisch)",
+     "qt_field_winsor_worker_limit": "Winsor-Worker-Limit",
+     "qt_filter_prompt_message": "Möchten Sie das Filterfenster öffnen, um den Bereich und das Clustering vor der Verarbeitung anzupassen?",
+     "qt_filter_prompt_title": "Bereich filtern und Clustering festlegen?",
+     "qt_final_method_incremental": "Inkrementelle Montage",
+     "qt_final_method_reproject": "Co-Add neu projektieren",
+     "qt_gpu_option_cpu": "CPU (keine GPU)",
+     "qt_group_altaz_cleanup": "Alt-Az-Bereinigung",
+     "qt_group_ansvr": "ANSVR-Notizen",
+     "qt_group_astap": "ASTAP-Konfiguration",
+     "qt_group_astrometry": "Astrometry.net-Konfiguration",
+     "qt_group_center_out": "Center-out-Normalisierung",
+     "qt_group_final_assembly": "Endmontage und Ausgabe",
+     "qt_group_final_general": "Allgemeine Ausgabeoptionen",
+     "qt_group_folders": "Ordner",
+     "qt_group_gpu": "GPU und Beschleunigung",
+     "qt_group_intertile": "Intertile-Mischung",
+     "qt_group_logging": "Protokollierung / Fortschritt",
+     "qt_group_master_tile_crop": "Master-Fliesenzuschnitt",
+     "qt_group_mosaic": "Mosaik / Clusterung",
+     "qt_group_poststack": "Überprüfung des Ankers nach dem Stapeln",
+     "qt_group_quality": "Zuschnitt / Qualität / Alt-Az",
+     "qt_group_quality_crop": "Qualitätsernte",
+     "qt_group_quality_gate": "Master-Fliesen-Qualitätstor",
+diff --git a/locales/en.json b/locales/en.json
+index d8b6337043ef7412a1315d509f0b19287bf262b3..60497e487e3ebe852e0fdbf096f9cebc742d4c2d 100644
+--- a/locales/en.json
++++ b/locales/en.json
+@@ -753,50 +753,54 @@
+     "qt_use_existing_master_tiles_tip": "Photometric normalization is limited in this mode.\nGeometry will be correct, but residual brightness differences between tiles may remain.\nFor best photometric quality, build master tiles inside ZeMosaic.",
+     "qt_field_poststack_clip": "Median clip σ",
+     "qt_field_poststack_enable": "Enable post-stack review",
+     "qt_field_poststack_min_improve": "Min. improvement",
+     "qt_field_poststack_probe": "Probe limit",
+     "qt_field_poststack_span": "Span range",
+     "qt_field_poststack_use_overlap": "Use overlap affine adjustment",
+     "qt_field_quality_crop_band": "Band width (px)",
+     "qt_field_quality_crop_enabled": "Enable quality crop",
+     "qt_field_quality_crop_k_sigma": "K-sigma",
+     "qt_field_quality_crop_margin": "Margin (px)",
+     "qt_field_quality_crop_min_run": "Minimum run",
+     "qt_field_quality_gate_edge": "Edge band (px)",
+     "qt_field_quality_gate_enabled": "Enable quality gate",
+     "qt_field_quality_gate_erode": "Erode (px)",
+     "qt_field_quality_gate_k_sigma": "K-sigma",
+     "qt_field_quality_gate_move": "Move rejected frames to subfolder",
+     "qt_field_quality_gate_threshold": "Threshold",
+     "qt_field_save_final_uint16": "Save final mosaic as uint16",
+     "qt_field_solver_choice": "Preferred solver",
+     "qt_field_two_pass_enabled": "Enable two-pass coverage renormalization",
+     "qt_field_two_pass_gain": "Gain clip range",
+     "qt_field_two_pass_sigma": "Sigma radius (px)",
+     "qt_field_use_auto_intertile": "Auto-adjust intertile parameters",
+     "qt_field_use_gpu_phase5": "Use GPU acceleration when available",
++    "qt_phase5_chunk_auto": "Auto (recommended)",
++    "qt_phase5_chunk_group": "Phase 5 (Reproject)",
++    "qt_phase5_chunk_mb_label": "Phase 5 chunk (MB)",
++    "qt_phase5_chunk_warning": "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution.",
+     "qt_field_tile_weighting": "Tile weighting (recommended)",
+     "qt_field_winsor_max_frames": "Winsor max frames / pass (0 = auto)",
+     "qt_field_winsor_worker_limit": "Winsor worker limit",
+     "qt_filter_prompt_message": "Do you want to open the filter window to adjust the range and clustering before processing?",
+     "qt_filter_prompt_title": "Filter range and set clustering?",
+     "qt_final_method_incremental": "Incremental assembly",
+     "qt_final_method_reproject": "Reproject co-add",
+     "qt_gpu_option_cpu": "CPU (no GPU)",
+     "qt_group_altaz_cleanup": "Alt-Az cleanup",
+     "qt_group_ansvr": "ANSVR notes",
+     "qt_group_astap": "ASTAP configuration",
+     "qt_group_astrometry": "Astrometry.net configuration",
+     "qt_group_center_out": "Center-out normalization",
+     "qt_group_final_assembly": "Final assembly & output",
+     "qt_group_final_general": "General output options",
+     "qt_group_folders": "Folders",
+     "qt_group_gpu": "GPU and acceleration",
+     "qt_group_intertile": "Intertile blending",
+     "qt_group_logging": "Logging / progress",
+     "qt_group_master_tile_crop": "Master tile crop",
+     "qt_group_mosaic": "Mosaic / clustering",
+     "qt_group_poststack": "Post-stack anchor review",
+     "qt_group_quality": "Cropping / quality / Alt-Az",
+     "qt_group_quality_crop": "Quality crop",
+     "qt_group_quality_gate": "Master tile quality gate",
+diff --git a/locales/es.json b/locales/es.json
+index 9808d718c7d7069a3d6e5732fbf055d056bed529..e2c0c353b9d8e06cd2d5c990c0634cb268b0ec33 100644
+--- a/locales/es.json
++++ b/locales/es.json
+@@ -735,50 +735,54 @@
+     "qt_field_output_dir": "Carpeta de salida",
+     "qt_field_poststack_clip": "Clip mediano σ",
+     "qt_field_poststack_enable": "Habilitar revisión posterior a la pila",
+     "qt_field_poststack_min_improve": "Mín. mejora",
+     "qt_field_poststack_probe": "Límite de sonda",
+     "qt_field_poststack_span": "rango de tramo",
+     "qt_field_poststack_use_overlap": "Usar ajuste afín de superposición",
+     "qt_field_quality_crop_band": "Ancho de banda (px)",
+     "qt_field_quality_crop_enabled": "Habilitar cultivo de calidad",
+     "qt_field_quality_crop_k_sigma": "K-sigma",
+     "qt_field_quality_crop_margin": "Margen (píxeles)",
+     "qt_field_quality_crop_min_run": "Carrera mínima",
+     "qt_field_quality_gate_edge": "Banda de borde (px)",
+     "qt_field_quality_gate_enabled": "Habilitar puerta de calidad",
+     "qt_field_quality_gate_erode": "Erosionar (px)",
+     "qt_field_quality_gate_k_sigma": "K-sigma",
+     "qt_field_quality_gate_move": "Mover fotogramas rechazados a una subcarpeta",
+     "qt_field_quality_gate_threshold": "Límite",
+     "qt_field_save_final_uint16": "Guarde el mosaico final como uint16",
+     "qt_field_solver_choice": "Solucionador preferido",
+     "qt_field_two_pass_enabled": "Habilitar la renormalización de cobertura de dos pasos",
+     "qt_field_two_pass_gain": "Ganar rango de clip",
+     "qt_field_two_pass_sigma": "Radio sigma (px)",
+     "qt_field_use_auto_intertile": "Ajuste automático de parámetros intertiles",
+     "qt_field_use_gpu_phase5": "Utilice la aceleración de GPU cuando esté disponible",
++    "qt_phase5_chunk_auto": "Auto (recomendado)",
++    "qt_phase5_chunk_group": "Fase 5 (Reproject)",
++    "qt_phase5_chunk_mb_label": "Fragmento Fase 5 (MB)",
++    "qt_phase5_chunk_warning": "⚠ Puede causar inestabilidad en algunos portátiles/GPUs híbridas. Usar con precaución.",
+     "qt_field_tile_weighting": "Ponderación de mosaicos (recomendado)",
+     "qt_field_winsor_max_frames": "Cuadros máximos de Winsor/paso (0 = automático)",
+     "qt_field_winsor_worker_limit": "Límite de trabajadores de Winsor",
+     "qt_filter_prompt_message": "¿Quiere abrir la ventana de filtro para ajustar el rango y la agrupación antes del procesamiento?",
+     "qt_filter_prompt_title": "¿Filtrar rango y configurar agrupamiento?",
+     "qt_final_method_incremental": "Montaje incremental",
+     "qt_final_method_reproject": "Reproyectar coagregar",
+     "qt_gpu_option_cpu": "CPU (sin GPU)",
+     "qt_group_altaz_cleanup": "Limpieza Alt-Az",
+     "qt_group_ansvr": "notas ANSVR",
+     "qt_group_astap": "Configuración ASTAP",
+     "qt_group_astrometry": "Configuración de Astrometry.net",
+     "qt_group_center_out": "Normalización de centro hacia afuera",
+     "qt_group_final_assembly": "Montaje final y salida",
+     "qt_group_final_general": "Opciones generales de salida",
+     "qt_group_folders": "Carpetas",
+     "qt_group_gpu": "GPU y aceleración",
+     "qt_group_intertile": "Mezcla intertil",
+     "qt_group_logging": "Registro/progreso",
+     "qt_group_master_tile_crop": "Recorte de mosaico maestro",
+     "qt_group_mosaic": "Mosaico/agrupación",
+     "qt_group_poststack": "Revisión del anclaje posterior a la pila",
+     "qt_group_quality": "Recorte / calidad / Alt-Az",
+     "qt_group_quality_crop": "Cultivo de calidad",
+     "qt_group_quality_gate": "Puerta de calidad Master Tile",
+diff --git a/locales/fr.json b/locales/fr.json
+index aa8ea91c54b4fdb3e5939b90df1d1b0ec70fcb52..6602c1c98813b9bcd087e5c03c7d66c41656f207 100644
+--- a/locales/fr.json
++++ b/locales/fr.json
+@@ -740,50 +740,54 @@
+     "qt_use_existing_master_tiles_tip": "Dans ce mode, la normalisation photométrique est limitée.\nLa géométrie sera correcte, mais des différences de luminosité peuvent subsister entre les tuiles.\nPour une qualité photométrique optimale, générez les master tiles dans ZeMosaic.",
+     "qt_field_poststack_clip": "Clip médian σ",
+     "qt_field_poststack_enable": "Activer la revue post-stack",
+     "qt_field_poststack_min_improve": "Amélioration minimale",
+     "qt_field_poststack_probe": "Limite de sondes",
+     "qt_field_poststack_span": "Plage de sondes",
+     "qt_field_poststack_use_overlap": "Utiliser l'ajustement affine du recouvrement",
+     "qt_field_quality_crop_band": "Bande (px)",
+     "qt_field_quality_crop_enabled": "Activer le rognage qualité",
+     "qt_field_quality_crop_k_sigma": "K-sigma",
+     "qt_field_quality_crop_margin": "Marge (px)",
+     "qt_field_quality_crop_min_run": "Séquence minimale",
+     "qt_field_quality_gate_edge": "Bande de bord (px)",
+     "qt_field_quality_gate_enabled": "Activer le filtre qualité",
+     "qt_field_quality_gate_erode": "Érosion (px)",
+     "qt_field_quality_gate_k_sigma": "K-sigma",
+     "qt_field_quality_gate_move": "Déplacer les images rejetées dans un sous-dossier",
+     "qt_field_quality_gate_threshold": "Seuil",
+     "qt_field_save_final_uint16": "Sauvegarder la mosaïque finale en uint16",
+     "qt_field_solver_choice": "Solveur préféré",
+     "qt_field_two_pass_enabled": "Activer la renormalisation en deux passes",
+     "qt_field_two_pass_gain": "Plage de clip de gain",
+     "qt_field_two_pass_sigma": "Rayon sigma (px)",
+     "qt_field_use_auto_intertile": "Ajuster automatiquement les paramètres intertuiles",
+     "qt_field_use_gpu_phase5": "Utiliser l'accélération GPU si disponible",
++    "qt_phase5_chunk_auto": "Auto (recommandé)",
++    "qt_phase5_chunk_group": "Phase 5 (Reprojection)",
++    "qt_phase5_chunk_mb_label": "Chunk Phase 5 (Mo)",
++    "qt_phase5_chunk_warning": "⚠ Peut provoquer des instabilités sur certains laptops / GPU hybrides. À utiliser avec prudence.",
+     "qt_field_tile_weighting": "Pondération des tuiles (recommandé)",
+     "qt_field_winsor_max_frames": "Winsor : images max / passe (0 = auto)",
+     "qt_field_winsor_worker_limit": "Limite de workers Winsor",
+     "qt_filter_prompt_message": "Voulez-vous ouvrir la fenêtre de filtrage pour ajuster l'étendue et le clustering avant le traitement ?",
+     "qt_filter_prompt_title": "Filtrer l'étendue et définir le clustering ?",
+     "qt_final_method_incremental": "Assemblage incrémental",
+     "qt_final_method_reproject": "Reprojection co-add",
+     "qt_gpu_option_cpu": "CPU (sans GPU)",
+     "qt_group_altaz_cleanup": "Nettoyage Alt-Az",
+     "qt_group_ansvr": "Notes ANSVR",
+     "qt_group_astap": "Configuration ASTAP",
+     "qt_group_astrometry": "Configuration Astrometry.net",
+     "qt_group_center_out": "Normalisation centre-vers-bords",
+     "qt_group_final_assembly": "Assemblage final & sortie",
+     "qt_group_final_general": "Options de sortie générales",
+     "qt_group_folders": "Dossiers",
+     "qt_group_gpu": "GPU et accélération",
+     "qt_group_intertile": "Mélange intertuiles",
+     "qt_group_logging": "Journalisation / progression",
+     "qt_group_master_tile_crop": "Rognage des tuiles maîtresses",
+     "qt_group_mosaic": "Mosaïque / clustering",
+     "qt_group_poststack": "Revue des ancres post-stack",
+     "qt_group_quality": "Rognage / qualité / Alt-Az",
+     "qt_group_quality_crop": "Rognage qualité",
+     "qt_group_quality_gate": "Filtre qualité des tuiles maîtresses",
+diff --git a/locales/is.json b/locales/is.json
+index eaff8e64b18363ac20fd3c87cfb185c4e4dccc22..28da5b705c24b5098e88604dc786f7b365208da6 100644
+--- a/locales/is.json
++++ b/locales/is.json
+@@ -735,50 +735,54 @@
+     "qt_field_output_dir": "Úttaksmappa",
+     "qt_field_poststack_clip": "Miðgildi klippa σ",
+     "qt_field_poststack_enable": "Virkja endurskoðun eftir stafla",
+     "qt_field_poststack_min_improve": "Min. framför",
+     "qt_field_poststack_probe": "Rannsóknarmörk",
+     "qt_field_poststack_span": "Spennusvið",
+     "qt_field_poststack_use_overlap": "Notaðu skarast tengda stillingu",
+     "qt_field_quality_crop_band": "Bandbreidd (px)",
+     "qt_field_quality_crop_enabled": "Virkja gæðaskurð",
+     "qt_field_quality_crop_k_sigma": "K-sigma",
+     "qt_field_quality_crop_margin": "Framlegð (px)",
+     "qt_field_quality_crop_min_run": "Lágmarks keyrsla",
+     "qt_field_quality_gate_edge": "Kantband (px)",
+     "qt_field_quality_gate_enabled": "Virkjaðu gæðahlið",
+     "qt_field_quality_gate_erode": "Eyða (px)",
+     "qt_field_quality_gate_k_sigma": "K-sigma",
+     "qt_field_quality_gate_move": "Færa hafnað ramma í undirmöppu",
+     "qt_field_quality_gate_threshold": "Þröskuldur",
+     "qt_field_save_final_uint16": "Vistaðu lokamósaík sem uint16",
+     "qt_field_solver_choice": "Ákjósanlegur lausnari",
+     "qt_field_two_pass_enabled": "Virkjaðu endurstillingu tveggja passa þekju",
+     "qt_field_two_pass_gain": "Fáðu klemmusvið",
+     "qt_field_two_pass_sigma": "Sigma radíus (px)",
+     "qt_field_use_auto_intertile": "Stilla sjálfvirkt millifæribreytur",
+     "qt_field_use_gpu_phase5": "Notaðu GPU hröðun þegar hún er tiltæk",
++    "qt_phase5_chunk_auto": "Sjálfvirkt (ráðlagt)",
++    "qt_phase5_chunk_group": "Fasi 5 (Reproject)",
++    "qt_phase5_chunk_mb_label": "Fasi 5 hluti (MB)",
++    "qt_phase5_chunk_warning": "⚠ Getur valdið óstöðugleika á sumum fartölvum / blendingum GPU. Notaðu með varúð.",
+     "qt_field_tile_weighting": "Reiknaðu þyngdir flísa (mælt með)",
+     "qt_field_winsor_max_frames": "Winsor max rammar / framhjá (0 = sjálfvirkt)",
+     "qt_field_winsor_worker_limit": "Winsor starfsmannatakmörk",
+     "qt_filter_prompt_message": "Viltu opna síugluggann til að stilla svið og þyrping fyrir vinnslu?",
+     "qt_filter_prompt_title": "Sía svið og stilla klasa?",
+     "qt_final_method_incremental": "Stigvaxandi samsetning",
+     "qt_final_method_reproject": "Endurvarpa sambæti",
+     "qt_gpu_option_cpu": "Örgjörvi (enginn GPU)",
+     "qt_group_altaz_cleanup": "Alt-Az hreinsun",
+     "qt_group_ansvr": "ANSVR athugasemdir",
+     "qt_group_astap": "ASTAP stillingar",
+     "qt_group_astrometry": "Astrometry.net stillingar",
+     "qt_group_center_out": "Miðju-út normalization",
+     "qt_group_final_assembly": "Lokasamsetning og framleiðsla",
+     "qt_group_final_general": "Almennir framleiðsluvalkostir",
+     "qt_group_folders": "Möppur",
+     "qt_group_gpu": "GPU og hröðun",
+     "qt_group_intertile": "Intertil blanda",
+     "qt_group_logging": "Skráning / framfarir",
+     "qt_group_master_tile_crop": "Meistaraflísaskurður",
+     "qt_group_mosaic": "Mósaík / þyrping",
+     "qt_group_poststack": "Endurskoðun á akkeri eftir stafla",
+     "qt_group_quality": "Skera / gæði / Alt-Az",
+     "qt_group_quality_crop": "Gæða uppskera",
+     "qt_group_quality_gate": "Master flísar gæða hlið",
+diff --git a/locales/nl.json b/locales/nl.json
+index ddc736df3ca0ba35810f959cd91dfd2aff269e6f..dbbe111d67e1aa6def1eb0cd66b279fa6a462aec 100644
+--- a/locales/nl.json
++++ b/locales/nl.json
+@@ -735,50 +735,54 @@
+     "qt_field_output_dir": "Uitvoermap",
+     "qt_field_poststack_clip": "Mediaan clip σ",
+     "qt_field_poststack_enable": "Schakel beoordeling na de stapel in",
+     "qt_field_poststack_min_improve": "Min. verbetering",
+     "qt_field_poststack_probe": "Sondelimiet",
+     "qt_field_poststack_span": "Bereik bereik",
+     "qt_field_poststack_use_overlap": "Gebruik overlap-affiene aanpassing",
+     "qt_field_quality_crop_band": "Bandbreedte (px)",
+     "qt_field_quality_crop_enabled": "Schakel kwaliteitsgewas in",
+     "qt_field_quality_crop_k_sigma": "K-sigma",
+     "qt_field_quality_crop_margin": "Marge (px)",
+     "qt_field_quality_crop_min_run": "Minimale uitvoering",
+     "qt_field_quality_gate_edge": "Randband (px)",
+     "qt_field_quality_gate_enabled": "Kwaliteitspoort inschakelen",
+     "qt_field_quality_gate_erode": "Eroderen (px)",
+     "qt_field_quality_gate_k_sigma": "K-sigma",
+     "qt_field_quality_gate_move": "Verplaats afgewezen frames naar een submap",
+     "qt_field_quality_gate_threshold": "Drempelwaarde",
+     "qt_field_save_final_uint16": "Sla het uiteindelijke mozaïek op als uint16",
+     "qt_field_solver_choice": "Voorkeursoplosser",
+     "qt_field_two_pass_enabled": "Schakel renormalisatie van de dekking in twee doorgangen in",
+     "qt_field_two_pass_gain": "Verkrijg clipbereik",
+     "qt_field_two_pass_sigma": "Sigmaradius (px)",
+     "qt_field_use_auto_intertile": "Intertile-parameters automatisch aanpassen",
+     "qt_field_use_gpu_phase5": "Gebruik GPU-versnelling indien beschikbaar",
++    "qt_phase5_chunk_auto": "Automatisch (aanbevolen)",
++    "qt_phase5_chunk_group": "Fase 5 (Reproject)",
++    "qt_phase5_chunk_mb_label": "Fase 5-chunk (MB)",
++    "qt_phase5_chunk_warning": "⚠ Kan instabiliteit veroorzaken op sommige laptops / hybride GPU's. Gebruik met voorzichtigheid.",
+     "qt_field_tile_weighting": "Tegelweging (aanbevolen)",
+     "qt_field_winsor_max_frames": "Winsor max. frames / pass (0 = automatisch)",
+     "qt_field_winsor_worker_limit": "Winsor-werknemerslimiet",
+     "qt_filter_prompt_message": "Wilt u het filtervenster openen om het bereik en de clustering aan te passen vóór verwerking?",
+     "qt_filter_prompt_title": "Filterbereik en clustering instellen?",
+     "qt_final_method_incremental": "Incrementele montage",
+     "qt_final_method_reproject": "Co-toevoeging opnieuw projecteren",
+     "qt_gpu_option_cpu": "CPU (geen GPU)",
+     "qt_group_altaz_cleanup": "Alt-Az-opruiming",
+     "qt_group_ansvr": "ANSVR-opmerkingen",
+     "qt_group_astap": "ASTAP-configuratie",
+     "qt_group_astrometry": "Astrometry.net-configuratie",
+     "qt_group_center_out": "Normalisatie vanuit het midden",
+     "qt_group_final_assembly": "Eindmontage en uitvoer",
+     "qt_group_final_general": "Algemene uitvoeropties",
+     "qt_group_folders": "Mappen",
+     "qt_group_gpu": "GPU en acceleratie",
+     "qt_group_intertile": "Intertiel mengen",
+     "qt_group_logging": "Loggen / voortgang",
+     "qt_group_master_tile_crop": "Meester tegel gewas",
+     "qt_group_mosaic": "Mozaïek / clustering",
+     "qt_group_poststack": "Ankerbeoordeling na de stapel",
+     "qt_group_quality": "Bijsnijden / kwaliteit / Alt-Az",
+     "qt_group_quality_crop": "Kwaliteit gewas",
+     "qt_group_quality_gate": "Master tegelkwaliteit poort",
+diff --git a/locales/pl.json b/locales/pl.json
+index 04c1f7d3bceaceb004c6aa3b59275bf482b730d7..c049d60f2a78ac3412bae56d796afb75ef2183cc 100644
+--- a/locales/pl.json
++++ b/locales/pl.json
+@@ -735,50 +735,54 @@
+     "qt_field_output_dir": "Folder wyjściowy",
+     "qt_field_poststack_clip": "Mediana klipu σ",
+     "qt_field_poststack_enable": "Włącz recenzję po stosie",
+     "qt_field_poststack_min_improve": "Min. poprawa",
+     "qt_field_poststack_probe": "Limit sondy",
+     "qt_field_poststack_span": "Zakres rozpiętości",
+     "qt_field_poststack_use_overlap": "Użyj dopasowania afinicznego nakładania się",
+     "qt_field_quality_crop_band": "Szerokość pasma (px)",
+     "qt_field_quality_crop_enabled": "Włącz uprawę wysokiej jakości",
+     "qt_field_quality_crop_k_sigma": "K-sigma",
+     "qt_field_quality_crop_margin": "Margines (px)",
+     "qt_field_quality_crop_min_run": "Minimalny bieg",
+     "qt_field_quality_gate_edge": "Pasmo krawędziowe (px)",
+     "qt_field_quality_gate_enabled": "Włącz bramę jakości",
+     "qt_field_quality_gate_erode": "Erodować (px)",
+     "qt_field_quality_gate_k_sigma": "K-sigma",
+     "qt_field_quality_gate_move": "Przenieś odrzucone ramki do podfolderu",
+     "qt_field_quality_gate_threshold": "Próg",
+     "qt_field_save_final_uint16": "Zapisz ostatnią mozaikę jako uint16",
+     "qt_field_solver_choice": "Preferowany solwer",
+     "qt_field_two_pass_enabled": "Włącz renormalizację pokrycia dwuprzebiegowego",
+     "qt_field_two_pass_gain": "Zwiększ zasięg klipu",
+     "qt_field_two_pass_sigma": "Promień Sigma (px)",
+     "qt_field_use_auto_intertile": "Automatycznie dostosowuj parametry intertylowe",
+     "qt_field_use_gpu_phase5": "Użyj akceleracji GPU, jeśli jest dostępna",
++    "qt_phase5_chunk_auto": "Auto (zalecane)",
++    "qt_phase5_chunk_group": "Faza 5 (Reproject)",
++    "qt_phase5_chunk_mb_label": "Kawałek fazy 5 (MB)",
++    "qt_phase5_chunk_warning": "⚠ Może powodować niestabilność na niektórych laptopach/hybrydowych GPU. Używaj ostrożnie.",
+     "qt_field_tile_weighting": "Ważenie kafelków (zalecane)",
+     "qt_field_winsor_max_frames": "Winsor max klatek/przejście (0 = auto)",
+     "qt_field_winsor_worker_limit": "Limit pracowników Winsor",
+     "qt_filter_prompt_message": "Czy chcesz otworzyć okno filtra, aby dostosować zakres i grupowanie przed przetwarzaniem?",
+     "qt_filter_prompt_title": "Przefiltruj zakres i ustaw grupowanie?",
+     "qt_final_method_incremental": "Montaż przyrostowy",
+     "qt_final_method_reproject": "Ponownie zaprojektuj i dodaj",
+     "qt_gpu_option_cpu": "Procesor (bez karty graficznej)",
+     "qt_group_altaz_cleanup": "Sprzątanie Alt-Az",
+     "qt_group_ansvr": "Notatki ANSVR",
+     "qt_group_astap": "Konfiguracja ASAP",
+     "qt_group_astrometry": "Konfiguracja Astrometry.net",
+     "qt_group_center_out": "Normalizacja centralna",
+     "qt_group_final_assembly": "Końcowy montaż i wyjście",
+     "qt_group_final_general": "Ogólne opcje wyjściowe",
+     "qt_group_folders": "Lornetka składana",
+     "qt_group_gpu": "Karta graficzna i akceleracja",
+     "qt_group_intertile": "Mieszanie międzystopniowe",
+     "qt_group_logging": "Rejestrowanie / postęp",
+     "qt_group_master_tile_crop": "Mistrzowskie przycinanie płytek",
+     "qt_group_mosaic": "Mozaika / grupowanie",
+     "qt_group_poststack": "Recenzja kotwicy po stosie",
+     "qt_group_quality": "Kadrowanie / jakość / Alt-Az",
+     "qt_group_quality_crop": "Uprawa wysokiej jakości",
+     "qt_group_quality_gate": "Główna bramka jakości płytek",
+diff --git a/zemosaic_config.py b/zemosaic_config.py
+index 55bc598685460a8a1577edd479a66d5f4a73cdb1..00ee445901a5264d0a98f79c0317c06f7963aaab 100644
+--- a/zemosaic_config.py
++++ b/zemosaic_config.py
+@@ -92,50 +92,52 @@ DEFAULT_CONFIG = {
+     "input_dir": "",
+     "output_dir": "",
+     "use_existing_master_tiles": False,
+     "num_processing_workers": -1,  # -1 pour auto
+     "grid_workers": 0,  # 0 = auto
+     "stacking_normalize_method": "linear_fit",
+     "stacking_weighting_method": "noise_variance",
+     "stacking_rejection_algorithm": "winsorized_sigma_clip",
+     "stacking_kappa_low": 3.0,
+     "stacking_kappa_high": 3.0,
+     "stacking_winsor_limits": "0.05,0.05",  # String, sera parsé
+     "stacking_final_combine_method": "mean",
+     "poststack_equalize_rgb": True,
+     "final_mosaic_rgb_equalize_enabled": False,
+     "apply_radial_weight": False,
+     "radial_feather_fraction": 0.8,
+     "radial_shape_power": 2.0,
+     "batch_overlap_pct": 40,
+     "allow_batch_duplication": True,
+     "min_safe_stack": 3,
+     "target_stack": 5,
+     "use_gpu_phase5": True,
+     "use_gpu_grid": True,
+     "gpu_id_phase5": 0,
+     "gpu_selector": "",
++    "phase5_chunk_auto": True,
++    "phase5_chunk_mb": 128,
+     "enable_tile_weighting": True,
+     "tile_weight_mode": "n_frames",
+     "final_assembly_method": "reproject_coadd",  # Options: "reproject_coadd", "incremental",
+     "auto_detect_seestar": True,
+     "force_seestar_mode": False,
+     "global_wcs_output_path": "global_mosaic_wcs.fits",
+     "global_wcs_pixelscale_mode": "median",
+     "global_wcs_padding_percent": 2.0,
+     "global_wcs_res_override": None,
+     "global_wcs_orientation": "north_up",
+     "global_wcs_autocrop_enabled": True,
+     "global_wcs_autocrop_margin_px": 128,
+     "sds_mode_default": False,
+     "sds_coverage_threshold": 0.92,
+     "sds_min_batch_size": 5,
+     "sds_target_batch_size": 10,
+     "sds_min_coverage_keep": 0.4,
+     "global_coadd_method": "kappa_sigma",
+     "global_coadd_k": 2.0,
+     "inter_master_merge_enable": False,
+     "inter_master_overlap_threshold": 0.60,
+     "inter_master_min_group_size": 2,
+     "inter_master_stack_method": "winsor",
+     "inter_master_memmap_policy": "auto",
+     "inter_master_local_scale": "final",
+diff --git a/zemosaic_gui_qt.py b/zemosaic_gui_qt.py
+index 1cb28de70f4e34fac3634dbc21f3f6c6f8fbce44..2681cbd706d5a46be91047c006d6d0a0ef65e04f 100644
+--- a/zemosaic_gui_qt.py
++++ b/zemosaic_gui_qt.py
+@@ -3012,50 +3012,107 @@ class ZeMosaicQtMainWindow(QMainWindow):
+     def _create_gpu_group(self) -> QGroupBox:
+         group = QGroupBox(
+             self._tr("qt_group_gpu", "GPU and acceleration"),
+             self,
+         )
+         layout = QFormLayout(group)
+         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+ 
+         self._register_checkbox(
+             "use_gpu_phase5",
+             layout,
+             self._tr("qt_field_use_gpu_phase5", "Use GPU acceleration when available"),
+         )
+         checkbox_binding = self._config_fields.get("use_gpu_phase5")
+         checkbox_widget: QCheckBox | None = None
+         if isinstance(checkbox_binding, dict):
+             widget_candidate = checkbox_binding.get("widget")
+             if isinstance(widget_candidate, QCheckBox):
+                 checkbox_widget = widget_candidate
+         self._register_gpu_selector(
+             layout,
+             self._tr("qt_field_gpu_selector", "GPU selector"),
+             checkbox=checkbox_widget,
+         )
+ 
++        phase5_group = QGroupBox(
++            self._tr("qt_phase5_chunk_group", "Phase 5 (Reproject)"),
++            group,
++        )
++        phase5_layout = QFormLayout(phase5_group)
++        phase5_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
++
++        chunk_auto_checkbox = QCheckBox(
++            self._tr("qt_phase5_chunk_auto", "Auto (recommended)"),
++            phase5_group,
++        )
++        chunk_auto_checked = self._normalize_config_bool(
++            self.config.get("phase5_chunk_auto", True), True
++        )
++        chunk_auto_checkbox.setChecked(chunk_auto_checked)
++        phase5_layout.addRow(chunk_auto_checkbox)
++        self._config_fields["phase5_chunk_auto"] = {
++            "kind": "checkbox",
++            "widget": chunk_auto_checkbox,
++            "type": bool,
++        }
++
++        chunk_spin = QSpinBox(phase5_group)
++        chunk_spin.setRange(64, 1024)
++        chunk_spin.setSingleStep(64)
++        chunk_spin.setValue(int(self.config.get("phase5_chunk_mb", 128)))
++        chunk_spin.setEnabled(not chunk_auto_checked)
++        phase5_layout.addRow(
++            QLabel(self._tr("qt_phase5_chunk_mb_label", "Phase 5 chunk (MB)"), phase5_group),
++            chunk_spin,
++        )
++        self._config_fields["phase5_chunk_mb"] = {
++            "kind": "spinbox",
++            "widget": chunk_spin,
++            "type": int,
++        }
++
++        warning_label = QLabel(
++            self._tr(
++                "qt_phase5_chunk_warning",
++                "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution.",
++            ),
++            phase5_group,
++        )
++        warning_label.setWordWrap(True)
++        warning_label.setStyleSheet("color: gray; font-size: 11px;")
++        phase5_layout.addRow(warning_label)
++
++        def _on_chunk_auto_toggled(state: bool) -> None:
++            chunk_spin.setDisabled(state)
++            self._sync_config_key_from_widget("phase5_chunk_auto")
++
++        chunk_auto_checkbox.toggled.connect(_on_chunk_auto_toggled)  # type: ignore[arg-type]
++        chunk_spin.valueChanged.connect(lambda _=None: self._sync_config_key_from_widget("phase5_chunk_mb"))  # type: ignore[arg-type]
++
++        layout.addRow(phase5_group)
++
+         return group
+ 
+     def _on_theme_mode_changed(self, index: int) -> None:
+         if self.theme_mode_combo is None:
+             return
+         data = self.theme_mode_combo.itemData(index)
+         if not isinstance(data, str):
+             data = str(data or "")
+         mode = data.strip().lower() or "system"
+         self.config["qt_theme_mode"] = mode
+         self._apply_theme(mode)
+ 
+     def _on_backend_selection_changed(self, index: int) -> None:
+         if self.backend_combo is None:
+             return
+         data = self.backend_combo.itemData(index)
+         backend = str(data or "").strip().lower()
+         if backend not in {"tk", "qt"}:
+             return
+         current = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
+         if backend == current:
+             return
+         self.config["preferred_gui_backend"] = backend
+         self.config["preferred_gui_backend_explicit"] = True
+         self._save_config()
+diff --git a/zemosaic_worker.py b/zemosaic_worker.py
+index c8aa032f07a4766a80fcf0f738e0493c0f1faf52..a048c3cb976d2dceaa7a85f70425bba783c46b77 100644
+--- a/zemosaic_worker.py
++++ b/zemosaic_worker.py
+@@ -8216,50 +8216,80 @@ def _run_shared_phase45_phase5_pipeline(
+                 try:
+                     n_frames_phase5 = max(1, len(valid_master_tiles_for_assembly))
+                 except Exception:
+                     n_frames_phase5 = 1
+                 caps_for_phase5 = parallel_caps_option or worker_config_cache.get("parallel_capabilities")
+                 if caps_for_phase5 is None:
+                     try:
+                         caps_for_phase5 = detect_parallel_capabilities()
+                     except Exception:
+                         caps_for_phase5 = None
+                 parallel_plan_phase5 = auto_tune_parallel_plan(
+                     kind="global_reproject",
+                     frame_shape=frame_shape_phase5,
+                     n_frames=n_frames_phase5,
+                     bytes_per_pixel=4,
+                     config=worker_config_cache,
+                     caps=caps_for_phase5,
+                 )
+                 parallel_plan_phase5, gpu_safety_ctx_phase5 = apply_gpu_safety_to_parallel_plan(
+                     parallel_plan_phase5,
+                     caps_for_phase5,
+                     worker_config_cache,
+                     operation="global_reproject",
+                     logger=logger,
+                 )
++                phase5_chunk_auto_cfg = worker_config_cache.get("phase5_chunk_auto", True)
++                phase5_chunk_auto_flag = _coerce_bool_flag(phase5_chunk_auto_cfg)
++                if phase5_chunk_auto_flag is None:
++                    phase5_chunk_auto_flag = True
++                if not phase5_chunk_auto_flag:
++                    try:
++                        forced_mb = int(worker_config_cache.get("phase5_chunk_mb", 128))
++                    except Exception:
++                        forced_mb = 128
++                    forced_mb = max(64, min(1024, forced_mb))
++                    forced_bytes = int(forced_mb) * 1024 * 1024
++                    applied_override = False
++                    try:
++                        setattr(parallel_plan_phase5, "gpu_max_chunk_bytes", forced_bytes)
++                        applied_override = True
++                    except Exception:
++                        pass
++                    if isinstance(parallel_plan_phase5, dict):
++                        parallel_plan_phase5["gpu_max_chunk_bytes"] = forced_bytes
++                        applied_override = True
++                    if applied_override:
++                        logger.info(
++                            "Phase5 GPU chunk override: %d MB (%d bytes) for global_reproject",
++                            forced_mb,
++                            forced_bytes,
++                        )
++                    else:
++                        logger.debug(
++                            "Phase5 GPU chunk override skipped: gpu_max_chunk_bytes not present"
++                        )
+                 if gpu_safety_ctx_phase5 is not None:
+                     try:
+                         use_gpu_phase5_flag = apply_gpu_safety_to_phase5_flag(
+                             use_gpu_phase5_flag, gpu_safety_ctx_phase5, logger=logger
+                         )
+                     except Exception:
+                         pass
+                     try:
+                         get_env_safe_mode_flag(gpu_safety_ctx_phase5)
+                     except Exception:
+                         pass
+                 _maybe_bump_phase5_gpu_rows_per_chunk(
+                     parallel_plan_phase5,
+                     gpu_safety_ctx_phase5,
+                     final_output_shape_hw,
+                     tiles_total_phase5,
+                     logger,
+                 )
+                 worker_config_cache["parallel_plan_phase5"] = parallel_plan_phase5
+                 try:
+                     setattr(zconfig, "parallel_plan_phase5", parallel_plan_phase5)
+                 except Exception:
+                     pass
+             except Exception as exc_phase5_plan:
+                 logger.warning("Phase5 auto-tune failed, falling back to global plan: %s", exc_phase5_plan)

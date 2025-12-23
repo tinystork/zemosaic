@@ -857,7 +857,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.3.0 grid_mode – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.3.0, Renāscentia – Superacervandi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -894,6 +894,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._splitter_states_restored = False
         self._intertile_group: QGroupBox | None = None
         self._poststack_group: QGroupBox | None = None
+        self._mosaic_group: QGroupBox | None = None
+        self._existing_master_tiles_checkbox: QCheckBox | None = None
 
         self._last_filter_overrides: Dict[str, Any] | None = None
         self._last_filtered_header_items: List[Any] | None = None
@@ -1056,6 +1058,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         outer_layout.addLayout(button_row)
 
         self._apply_saved_window_geometry()
+        self._apply_existing_master_tiles_mode()
 
     def _apply_saved_window_geometry(self) -> None:
         geometry_value = self.config.get(QT_MAIN_WINDOW_GEOMETRY_KEY)
@@ -1226,6 +1229,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         left_splitter.setChildrenCollapsible(False)
         folders_group = self._create_folders_group()
         mosaic_group = self._create_mosaic_group()
+        self._mosaic_group = mosaic_group
         instrument_group = self._create_instrument_group()
         intertile_group = self._intertile_group
         poststack_group = self._poststack_group
@@ -1375,12 +1379,48 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "qt_dialog_select_output_dir", "Select Output Folder"
             ),
         )
+        master_tiles_checkbox = self._register_checkbox(
+            "use_existing_master_tiles",
+            layout,
+            self._tr(
+                "qt_use_existing_master_tiles_label",
+                "I'm using master tiles (skip clustering & master tile creation)",
+            ),
+        )
+        master_tiles_checkbox.setToolTip(
+            self._tr(
+                "qt_use_existing_master_tiles_tip",
+                "Photometric normalization is limited in this mode.\n"
+                "Geometry will be correct, but residual brightness differences between tiles may remain.\n"
+                "For best photometric quality, build master tiles inside ZeMosaic.",
+            )
+        )
+        self._existing_master_tiles_checkbox = master_tiles_checkbox
+        master_tiles_checkbox.toggled.connect(self._on_existing_master_tiles_toggled)  # type: ignore[arg-type]
         self._register_line_edit(
             "global_wcs_output_path",
             layout,
             self._tr("qt_field_global_wcs_output", "Global WCS output path"),
         )
         return group
+
+    def _existing_master_tiles_enabled(self) -> bool:
+        enabled = self._normalize_config_bool(
+            self.config.get("use_existing_master_tiles", False), False
+        )
+        self.config["use_existing_master_tiles"] = enabled
+        return enabled
+
+    def _apply_existing_master_tiles_mode(self, enabled: bool | None = None) -> None:
+        if enabled is None:
+            enabled = self._existing_master_tiles_enabled()
+        if self._mosaic_group is not None:
+            self._mosaic_group.setEnabled(not enabled)
+        if hasattr(self, "filter_button") and self.filter_button is not None:
+            self.filter_button.setEnabled((not enabled) and not self.is_processing)
+
+    def _on_existing_master_tiles_toggled(self, checked: bool) -> None:
+        self._apply_existing_master_tiles_mode(bool(checked))
 
     def _create_instrument_group(self) -> QGroupBox:
         group = QGroupBox(
@@ -1513,6 +1553,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("qt_field_astap_max_instances", "Max ASTAP instances"),
             minimum=1,
             maximum=astap_cap,
+        )
+        self._register_checkbox(
+            "astap_drizzled_fallback_enabled",
+            astap_layout,
+            self._tr(
+                "qt_field_astap_drizzled_fallback",
+                "Stacked/drizzled datasets: retry with auto FOV on failure",
+            ),
         )
 
         outer_layout.addWidget(astap_box)
@@ -1903,6 +1951,23 @@ class ZeMosaicQtMainWindow(QMainWindow):
             altaz_layout,
             self._tr("qt_field_altaz_nanize", "Convert Alt-Az gaps to NaN"),
         )
+        self._register_double_spinbox(
+            "altaz_nanize_threshold",
+            altaz_layout,
+            self._tr("qt_field_altaz_nanize_threshold", "ALT-AZ nanize threshold"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.01,
+            decimals=3,
+        )
+        binding = self._config_fields.get("altaz_nanize_threshold")
+        if binding and binding.get("widget"):
+            binding["widget"].setToolTip(
+                self._tr(
+                    "qt_field_altaz_nanize_threshold_tooltip",
+                    "Pixels where the ALT-AZ mask opacity is <= this threshold are treated as invalid (NaN/0). Increase to remove more border ramps.",
+                )
+            )
         layout.addWidget(altaz_group)
 
         quality_gate_group = QGroupBox(
@@ -2482,7 +2547,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "winsor_worker_limit",
             general_layout,
             self._tr("qt_field_winsor_worker_limit", "Winsor worker limit"),
-            minimum=1,
+            minimum=0,
             maximum=64,
         )
         self._register_spinbox(
@@ -2969,6 +3034,63 @@ class ZeMosaicQtMainWindow(QMainWindow):
             checkbox=checkbox_widget,
         )
 
+        phase5_group = QGroupBox(
+            self._tr("qt_phase5_chunk_group", "Phase 5 (Reproject)"),
+            group,
+        )
+        phase5_layout = QFormLayout(phase5_group)
+        phase5_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        chunk_auto_checkbox = QCheckBox(
+            self._tr("qt_phase5_chunk_auto", "Auto (recommended)"),
+            phase5_group,
+        )
+        chunk_auto_checked = self._normalize_config_bool(
+            self.config.get("phase5_chunk_auto", True), True
+        )
+        chunk_auto_checkbox.setChecked(chunk_auto_checked)
+        phase5_layout.addRow(chunk_auto_checkbox)
+        self._config_fields["phase5_chunk_auto"] = {
+            "kind": "checkbox",
+            "widget": chunk_auto_checkbox,
+            "type": bool,
+        }
+
+        chunk_spin = QSpinBox(phase5_group)
+        chunk_spin.setRange(64, 1024)
+        chunk_spin.setSingleStep(64)
+        chunk_spin.setValue(int(self.config.get("phase5_chunk_mb", 128)))
+        chunk_spin.setEnabled(not chunk_auto_checked)
+        phase5_layout.addRow(
+            QLabel(self._tr("qt_phase5_chunk_mb_label", "Phase 5 chunk (MB)"), phase5_group),
+            chunk_spin,
+        )
+        self._config_fields["phase5_chunk_mb"] = {
+            "kind": "spinbox",
+            "widget": chunk_spin,
+            "type": int,
+        }
+
+        warning_label = QLabel(
+            self._tr(
+                "qt_phase5_chunk_warning",
+                "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution.",
+            ),
+            phase5_group,
+        )
+        warning_label.setWordWrap(True)
+        warning_label.setStyleSheet("color: gray; font-size: 11px;")
+        phase5_layout.addRow(warning_label)
+
+        def _on_chunk_auto_toggled(state: bool) -> None:
+            chunk_spin.setDisabled(state)
+            self._sync_config_key_from_widget("phase5_chunk_auto")
+
+        chunk_auto_checkbox.toggled.connect(_on_chunk_auto_toggled)  # type: ignore[arg-type]
+        chunk_spin.valueChanged.connect(lambda _=None: self._sync_config_key_from_widget("phase5_chunk_mb"))  # type: ignore[arg-type]
+
+        layout.addRow(phase5_group)
+
         return group
 
     def _on_theme_mode_changed(self, index: int) -> None:
@@ -3252,6 +3374,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": line_edit,
             "type": str,
         }
+        line_edit.editingFinished.connect(lambda k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_line_edit(
         self,
@@ -3295,6 +3418,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 if selected:
                     widget.setText(selected)
                     self.config[key] = selected
+                    self._sync_config_key_from_widget(key)
 
             browse_button.clicked.connect(_on_browse)  # type: ignore[arg-type]
             row_layout.addWidget(browse_button)
@@ -3312,16 +3436,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": widget,
             "type": value_type,
         }
+        widget.editingFinished.connect(lambda k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str) -> QCheckBox:
         checkbox = QCheckBox(label_text)
-        checkbox.setChecked(bool(self.config.get(key, False)))
+        checkbox.setChecked(self._normalize_config_bool(self.config.get(key, False), False))
         layout.addRow(checkbox)
         self._config_fields[key] = {
             "kind": "checkbox",
             "widget": checkbox,
             "type": bool,
         }
+        checkbox.toggled.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
         return checkbox
 
     def _register_spinbox(
@@ -3346,6 +3472,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": spinbox,
             "type": int,
         }
+        spinbox.valueChanged.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_double_spinbox(
         self,
@@ -3373,6 +3500,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": spinbox,
             "type": float,
         }
+        spinbox.valueChanged.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_double_pair(
         self,
@@ -3429,6 +3557,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 float(ss.value()),
             ],
         }
+        first_spin.valueChanged.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
+        second_spin.valueChanged.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_gpu_selector(
         self,
@@ -3523,6 +3653,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "type": int,
             "value_getter": _gpu_id_getter,
         }
+        combo.currentIndexChanged.connect(lambda _=None: self._sync_config_keys(["gpu_selector", "gpu_id_phase5"]))  # type: ignore[arg-type]
+        combo.editTextChanged.connect(lambda _=None: self._sync_config_keys(["gpu_selector", "gpu_id_phase5"]))  # type: ignore[arg-type]
 
         def _update_enabled(state: bool) -> None:
             combo.setEnabled(state)
@@ -3591,6 +3723,66 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
         target["inter_master_merge_enable"] = False
 
+    def _sync_config_key_from_widget(self, key: str) -> None:
+        binding = self._config_fields.get(key)
+        if not binding:
+            return
+        try:
+            kind = binding.get("kind")
+            widget = binding.get("widget")
+            expected_type = binding.get("type", str)
+            value_getter = binding.get("value_getter")
+            if callable(value_getter):
+                raw_value = value_getter()
+            elif kind == "checkbox":
+                raw_value = bool(widget.isChecked())
+            elif kind == "spinbox":
+                raw_value = int(widget.value())
+            elif kind == "double_spinbox":
+                raw_value = float(widget.value())
+            elif kind == "combobox":
+                data = widget.currentData()
+                raw_value = data if data is not None else widget.currentText()
+            else:
+                raw_text = ""
+                try:
+                    raw_text = widget.text().strip()
+                except Exception:
+                    raw_text = str(getattr(widget, "text", "") or "").strip()
+                if expected_type in {int, float}:
+                    try:
+                        raw_value = expected_type(raw_text)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        raw_value = self.config.get(key)
+                elif expected_type is bool:
+                    normalized = raw_text.lower()
+                    if normalized in {"1", "true", "yes", "on"}:
+                        raw_value = True
+                    elif normalized in {"0", "false", "no", "off"}:
+                        raw_value = False
+                    else:
+                        raw_value = self.config.get(key, False)
+                else:
+                    raw_value = raw_text
+
+            postprocess = binding.get("postprocess")
+            if callable(postprocess):
+                try:
+                    raw_value = postprocess(raw_value)
+                except Exception:
+                    raw_value = self.config.get(key, raw_value)
+
+            self.config[key] = raw_value
+        except Exception:
+            self.config[key] = self.config.get(key)
+
+    def _sync_config_keys(self, keys: Sequence[str]) -> None:
+        for key in keys:
+            try:
+                self._sync_config_key_from_widget(str(key))
+            except Exception:
+                continue
+
     def _collect_config_from_widgets(self) -> None:
         for key, binding in self._config_fields.items():
             kind = binding["kind"]
@@ -3647,6 +3839,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         fallback_defaults: Dict[str, Any] = {
             "input_dir": "",
             "output_dir": "",
+            "use_existing_master_tiles": False,
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
             "coadd_use_memmap": True,
@@ -3677,7 +3870,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "radial_feather_fraction": 0.8,
             "min_radial_weight_floor": 0.0,
             "radial_shape_power": 2.0,
-            "cluster_panel_threshold": 0.05,
+            "cluster_panel_threshold": 0.03,
             "cluster_target_groups": 0,
             "cluster_orientation_split_deg": 0.0,
             "inter_master_merge_enable": False,
@@ -3701,6 +3894,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "altaz_margin_percent": 5.0,
             "altaz_decay": 0.15,
             "altaz_nanize": True,
+            "altaz_nanize_threshold": 0.001,
             "quality_gate_enabled": False,
             "quality_gate_threshold": 0.48,
             "quality_gate_edge_band_px": 64,
@@ -3986,7 +4180,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.3.0 grid_mode – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.3.0, Renāscentia – Superacervandi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
@@ -4702,7 +4896,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._cpu_eta_override_deadline = None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        self.filter_button.setEnabled(not running)
+        self.filter_button.setEnabled((not running) and (not self._existing_master_tiles_enabled()))
         if running:
             self.progress_bar.setValue(0)
             self.phase_value_label.setText(self._tr("qt_progress_placeholder", "Idle"))
@@ -5315,7 +5509,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         cfg = self.config
         self._disable_phase45_config(cfg)
 
-        worker_kwargs = cfg.copy()
+        snapshot = self._serialize_config_for_save()
+        worker_kwargs = snapshot.copy()
 
         try:
             level_val = str(worker_kwargs.get("logging_level", "INFO") or "INFO").upper()
@@ -5340,6 +5535,43 @@ class ZeMosaicQtMainWindow(QMainWindow):
         
         return (), worker_kwargs
 
+    def _log_run_config_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        keys_of_interest = [
+            "quality_crop_enabled",
+            "apply_master_tile_crop",
+            "master_tile_crop_percent",
+            "altaz_cleanup_enabled",
+            "altaz_nanize",
+            "global_wcs_autocrop_enabled",
+            "final_assembly_method",
+            "sds_mode_default",
+        ]
+        summary_parts = [f"{key}={snapshot.get(key)}" for key in keys_of_interest]
+        message = f"RUN CONFIG SNAPSHOT: {', '.join(summary_parts)}"
+        try:
+            self._append_log(message, level="info")
+        except Exception:
+            pass
+
+        output_dir = snapshot.get("output_dir")
+        if not output_dir:
+            return
+        try:
+            target_dir = Path(str(output_dir)).expanduser()
+        except Exception:
+            return
+        if not safe_path_isdir(target_dir):
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                return
+        target_path = target_dir / "run_config_snapshot.json"
+        try:
+            with target_path.open("w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle, indent=2, ensure_ascii=False)
+        except Exception:
+            return
+
     def _build_solver_settings_dict(self) -> Dict[str, Any]:
         astap_exe = str(self.config.get("astap_executable_path", "") or "")
         astap_data = str(self.config.get("astap_data_directory_path", "") or "")
@@ -5347,6 +5579,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         astap_downsample = int(self.config.get("astap_default_downsample", 2) or 2)
         astap_sensitivity = int(self.config.get("astap_default_sensitivity", 100) or 100)
         astap_max_instances = self._resolve_astap_max_instances()
+        astap_drizzled_fallback_enabled = bool(
+            self.config.get("astap_drizzled_fallback_enabled", False)
+        )
         solver_choice = str(self.config.get("solver_method", "ASTAP") or "ASTAP")
         api_key = str(self.config.get("astrometry_api_key", "") or "")
 
@@ -5363,6 +5598,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "astap_downsample": astap_downsample,
                 "astap_sensitivity": astap_sensitivity,
                 "astap_max_instances": astap_max_instances,
+                "astap_drizzled_fallback_enabled": astap_drizzled_fallback_enabled,
             }
 
         try:
@@ -5389,6 +5625,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         settings.astap_search_radius_deg = search_radius
         settings.astap_downsample = astap_downsample
         settings.astap_sensitivity = astap_sensitivity
+        settings.astap_drizzled_fallback_enabled = astap_drizzled_fallback_enabled
         payload = asdict(settings)
         payload["astap_max_instances"] = astap_max_instances
         return payload
@@ -5440,6 +5677,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             except Exception as e:
                 print(f"[ZeMosaicQt] Error during GPU cleanup: {e}")
 
+        # Safely shut down matplotlib to prevent draw_idle calls on deleted canvases
+        try:
+            import matplotlib.pyplot as plt
+            plt.close("all")
+        except Exception:
+            pass
+
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
@@ -5474,10 +5718,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
 
         self._collect_config_from_widgets()
+        use_existing_master_tiles = self._existing_master_tiles_enabled()
 
         skip_filter_ui_for_run = bool(predecided_skip_filter_ui) if predecided_skip_filter_ui is not None else False
 
-        if not skip_filter_prompt and predecided_skip_filter_ui is None:
+        if use_existing_master_tiles:
+            skip_filter_ui_for_run = True
+            self._clear_filter_results()
+        elif not skip_filter_prompt and predecided_skip_filter_ui is None:
             answer = QMessageBox.question(
                 self,
                 self._tr("qt_filter_prompt_title", "Filter range and set clustering?"),
@@ -5501,6 +5749,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 else:
                     skip_filter_ui_for_run = True
 
+        run_snapshot = self._serialize_config_for_save()
+        self._log_run_config_snapshot(run_snapshot)
         self._save_config()
 
         try:
@@ -5587,7 +5837,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _handle_worker_start_failure(self, error_message: str | None) -> None:
         self.start_button.setEnabled(True)
-        self.filter_button.setEnabled(True)
+        self.filter_button.setEnabled(not self._existing_master_tiles_enabled())
         self.stop_button.setEnabled(False)
         self._eta_calc = None
         self._eta_seconds_smoothed = None
@@ -5735,13 +5985,20 @@ class ZeMosaicQtMainWindow(QMainWindow):
             )
             return None
 
+        import_error: Exception | None = None
         try:
             from zemosaic_filter_gui_qt import launch_filter_interface_qt
-        except ImportError as exc:
+        except Exception as exc:
+            import_error = exc
+            try:
+                from .zemosaic_filter_gui_qt import launch_filter_interface_qt  # type: ignore[import-not-found]
+            except Exception as nested_exc:
+                import_error = nested_exc
+        if import_error is not None:
             QMessageBox.warning(
                 self,
                 self._tr("qt_error_filter_unavailable", "Qt filter interface is not available."),
-                str(exc),
+                str(import_error),
             )
             return None
 
@@ -5798,6 +6055,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "altaz_margin_percent": float(self.config.get("altaz_margin_percent", 5.0) or 5.0),
             "altaz_decay": float(self.config.get("altaz_decay", 0.15) or 0.15),
             "altaz_nanize": bool(self.config.get("altaz_nanize", True)),
+            "altaz_nanize_threshold": float(self.config.get("altaz_nanize_threshold", 0.001) or 0.001),
             "quality_gate_enabled": bool(self.config.get("quality_gate_enabled", False)),
             "quality_gate_threshold": float(self.config.get("quality_gate_threshold", 0.48) or 0.48),
             "quality_gate_edge_band_px": int(self.config.get("quality_gate_edge_band_px", 64) or 64),

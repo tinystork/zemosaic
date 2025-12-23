@@ -71,6 +71,7 @@ from core.path_helpers import casefold_path, expand_to_path, safe_path_exists
 
 from zemosaic_utils import (
     EXCLUDED_DIRS,
+    apply_borrowing_v1,
     compute_global_wcs_descriptor,
     is_path_excluded,
     get_app_base_dir,
@@ -649,6 +650,7 @@ def launch_filter_interface(
             "astap_default_search_radius": 0.0,
             "astap_default_downsample": 0,
             "astap_default_sensitivity": 100,
+            "astap_drizzled_fallback_enabled": False,
             "astap_max_instances": 1,
             "auto_limit_frames_per_master_tile": True,
             "max_raw_per_master_tile": 0,
@@ -742,6 +744,7 @@ def launch_filter_interface(
                         "astap_default_search_radius": cfg.get("astap_default_search_radius", cfg_defaults["astap_default_search_radius"]),
                         "astap_default_downsample": cfg.get("astap_default_downsample", cfg_defaults["astap_default_downsample"]),
                         "astap_default_sensitivity": cfg.get("astap_default_sensitivity", cfg_defaults["astap_default_sensitivity"]),
+                        "astap_drizzled_fallback_enabled": cfg.get("astap_drizzled_fallback_enabled", cfg_defaults["astap_drizzled_fallback_enabled"]),
                         "astap_max_instances": inst_cfg,
                         "auto_limit_frames_per_master_tile": cfg.get("auto_limit_frames_per_master_tile", cfg_defaults["auto_limit_frames_per_master_tile"]),
                         "max_raw_per_master_tile": cfg.get("max_raw_per_master_tile", cfg_defaults["max_raw_per_master_tile"]),
@@ -810,6 +813,9 @@ def launch_filter_interface(
                 cfg_defaults["astap_default_downsample"] = downsample
             if sensitivity is not None:
                 cfg_defaults["astap_default_sensitivity"] = sensitivity
+            fallback_enabled = solver_settings_payload.get("astap_drizzled_fallback_enabled")
+            if fallback_enabled is not None:
+                cfg_defaults["astap_drizzled_fallback_enabled"] = bool(fallback_enabled)
 
         if localizer_cls is not None:
             try:
@@ -3967,6 +3973,15 @@ def launch_filter_interface(
             if timeout_astap is None or timeout_astap <= 0:
                 timeout_astap = max(180, timeout_base)
 
+            fallback_enabled = None
+            if isinstance(combined_solver_settings, dict):
+                fallback_enabled = combined_solver_settings.get(
+                    "astap_drizzled_fallback_enabled"
+                )
+            if fallback_enabled is None:
+                fallback_enabled = cfg_defaults.get("astap_drizzled_fallback_enabled", False)
+            astap_drizzled_fallback_enabled = bool(fallback_enabled)
+
             resolve_now_state["running"] = True
             resolve_now_state["total"] = len(targets)
             resolve_now_state["done"] = 0
@@ -4109,6 +4124,7 @@ def launch_filter_interface(
                             search_radius_deg=search_radius,
                             downsample_factor=downsample_val,
                             sensitivity=sensitivity_val,
+                            astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
                             timeout_sec=timeout_astap,
                             update_original_header_in_place=True,
                             progress_callback=_progress_cb,
@@ -5101,6 +5117,11 @@ def launch_filter_interface(
             # timing out. Mirror that behaviour here so the filter UI matches the
             # main pipeline resilience on slow solves.
             astap_timeout_sec = max(180, timeout_sec)
+            fallback_enabled = solver_settings_local.get(
+                "astap_drizzled_fallback_enabled",
+                cfg_defaults.get("astap_drizzled_fallback_enabled", False),
+            )
+            astap_drizzled_fallback_enabled = bool(fallback_enabled)
 
             astrometry_direct = getattr(astrometry_mod, "solve_with_astrometry_net", None) if astrometry_mod else None
             ansvr_direct = getattr(astrometry_mod, "solve_with_ansvr", None) if astrometry_mod else None
@@ -5266,6 +5287,7 @@ def launch_filter_interface(
                                         search_radius_deg=srch_radius,
                                         downsample_factor=downsample_val,
                                         sensitivity=sensitivity_val,
+                                        astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
                                         timeout_sec=astap_timeout_sec,
                                         update_original_header_in_place=write_inplace,
                                         progress_callback=_progress_callback,
@@ -5279,6 +5301,7 @@ def launch_filter_interface(
                                     search_radius_deg=srch_radius,
                                     downsample_factor=downsample_val,
                                     sensitivity=sensitivity_val,
+                                    astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
                                     timeout_sec=astap_timeout_sec,
                                     update_original_header_in_place=write_inplace,
                                     progress_callback=_progress_callback,
@@ -6066,6 +6089,13 @@ def launch_filter_interface(
                         for info in grp:
                             if info.pop("_fallback_wcs_used", False):
                                 info.pop("wcs", None)
+
+                    if coverage_enabled and final_groups:
+                        final_groups, _borrow_stats = apply_borrowing_v1(
+                            final_groups,
+                            None,
+                            logger=logger,
+                        )
 
                     result_payload = {
                         "final_groups": final_groups,

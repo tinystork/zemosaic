@@ -53,13 +53,17 @@ import csv
 import logging
 import math
 import os
+import platform
+import threading
 import time
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import psutil
 
 from zemosaic_resource_telemetry import ResourceTelemetryController
 from zemosaic_utils import (
@@ -68,6 +72,11 @@ from zemosaic_utils import (
     save_fits_image,
     write_final_fits_uint16_color_aware,
 )
+
+try:
+    from zemosaic_gpu_safety import probe_gpu_runtime_context  # type: ignore
+except Exception:  # pragma: no cover - optional safety layer
+    probe_gpu_runtime_context = None  # type: ignore
 
 try:  # Optional heavy deps – handled gracefully if missing
     from astropy.io import fits
@@ -438,6 +447,7 @@ class FrameInfo:
     filter_name: str | None = None
     batch_id: str | None = None
     order: int = 0
+    mount: str | None = None
     wcs: object | None = None
     shape_hw: tuple[int, int] | None = None
     footprint: tuple[float, float, float, float] | None = None  # (xmin, xmax, ymin, ymax) in global pixels
@@ -675,6 +685,24 @@ def _parse_int(value: object, default: int = 0) -> int:
         return default
 
 
+def _normalize_mount(value: object) -> str | None:
+    """Normalize mount descriptors to \"EQ\" or \"ALTZ\"."""
+
+    if value is None:
+        return None
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if not text:
+        return None
+    if text in {"EQ", "EQUATORIAL", "GEM", "GERMAN"}:
+        return "EQ"
+    if text in {"ALTZ", "ALT-AZ", "ALT/AZ", "ALT-AZM", "ALTAZ", "ALTITUDE-AZIMUTH"}:
+        return "ALTZ"
+    return None
+
+
 def _resolve_path(base_dir: Path, text: str | os.PathLike[str]) -> Path:
     try:
         candidate = Path(text)
@@ -768,6 +796,8 @@ def load_stack_plan(csv_path: str | os.PathLike[str], *, progress_callback: Prog
         batch_id = _field(row, ("batch_id", "batch", "session", "night"))
         order_val = _field(row, ("order", "seq", "sequence", "index"))
         order = _parse_int(order_val, default=idx)
+        mount_raw = _field(row, ("mount", "eqmode", "mount_mode"))
+        mount = _normalize_mount(mount_raw)
 
         frames.append(
             FrameInfo(
@@ -777,6 +807,7 @@ def load_stack_plan(csv_path: str | os.PathLike[str], *, progress_callback: Prog
                 filter_name=filter_name,
                 batch_id=batch_id,
                 order=order,
+                mount=mount,
             )
         )
 
@@ -1972,7 +2003,9 @@ def _stack_weighted_patches_gpu(
                     result = np.nanmedian(median_input, axis=0)
                     outputs = [cp.asarray(result, dtype=cp.float32)]
                 else:
-                    with cp.errstate(divide="ignore", invalid="ignore"):
+                    errstate = getattr(cp, "errstate", None)
+                    ctx = errstate(divide="ignore", invalid="ignore") if callable(errstate) else nullcontext()
+                    with ctx:
                         result = cp.sum(data_masked * weight_effective, axis=0) / cp.clip(weight_sum, 1e-6, None)
                     outputs = [result]
 
@@ -1988,7 +2021,14 @@ def _stack_weighted_patches_gpu(
         )
 
 
-def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, progress_callback: ProgressCallback = None) -> Path | None:
+def process_tile(
+    tile: GridTile,
+    output_dir: Path,
+    config: GridModeConfig,
+    *,
+    progress_callback: ProgressCallback = None,
+    gpu_stack_semaphore: threading.Semaphore | None = None,
+) -> Path | None:
     """Process a single tile and write it to disk."""
 
     if not tile.frames:
@@ -2037,6 +2077,18 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     reference_median: float | None = None
     chunk_failed = False
 
+    def _cleanup_gpu_memory() -> None:
+        if not (_CUPY_AVAILABLE and cp and config.use_gpu):
+            return
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        try:
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
     def flush_chunk() -> None:
         """Stack the current chunk and fold it into the running accumulator."""
 
@@ -2046,14 +2098,27 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             weight_maps.clear()
             return
         if config.use_gpu:
-            res = _stack_weighted_patches_gpu(
-                aligned_patches,
-                weight_maps,
-                config,
-                reference_median=reference_median,
-                return_weight_sum=True,
-                return_ref_median=True,
-            )
+            def _stack_gpu() -> np.ndarray | tuple | None:
+                return _stack_weighted_patches_gpu(
+                    aligned_patches,
+                    weight_maps,
+                    config,
+                    reference_median=reference_median,
+                    return_weight_sum=True,
+                    return_ref_median=True,
+                )
+
+            if gpu_stack_semaphore is not None:
+                with gpu_stack_semaphore:
+                    try:
+                        res = _stack_gpu()
+                    finally:
+                        _cleanup_gpu_memory()
+            else:
+                try:
+                    res = _stack_gpu()
+                finally:
+                    _cleanup_gpu_memory()
         else:
             res = _stack_weighted_patches(
                 aligned_patches,
@@ -3636,24 +3701,162 @@ def _load_config_from_disk() -> dict:
         return {}
 
 
-def _get_effective_grid_workers(config: dict) -> int:
-    """Determine the effective number of workers for grid tile processing.
+def _get_effective_grid_workers(
+    config: dict,
+    *,
+    use_gpu: bool,
+    stack_chunk_budget_mb: float,
+    gpu_concurrency: int = 1,
+) -> int:
+    """Determine the effective number of workers for grid tile processing."""
 
-    If grid_workers > 0, use that value. Otherwise, compute auto_workers = max(1, os.cpu_count() - 2).
-    Can be forced to 1 for debugging with ZEMOSAIC_GRID_FORCE_SINGLE_THREAD.
-    """
     if os.environ.get("ZEMOSAIC_GRID_FORCE_SINGLE_THREAD", "").lower() in ("1", "true", "yes"):
         effective = 1
         _emit("Forcing single-thread mode for debugging (ZEMOSAIC_GRID_FORCE_SINGLE_THREAD set)")
+        _emit(f"using {effective} workers for tile processing")
+        return effective
+
+    grid_workers = config.get("grid_workers", 0)
+    if grid_workers > 0:
+        effective = int(grid_workers)
+        if use_gpu and platform.system().lower().startswith("windows") and effective > 4:
+            _emit(
+                (
+                    "grid_workers forced by user to "
+                    f"{effective} on Windows+GPU; this may freeze the OS (WDDM)"
+                ),
+                lvl="WARN",
+            )
+        _emit(f"using {effective} workers for tile processing")
+        return effective
+
+    cpu_count = os.cpu_count() or 1
+    base = max(1, cpu_count - 2)
+
+    parallel_autotune_enabled = bool(config.get("parallel_autotune_enabled", True))
+    parallel_target_ram_fraction = float(config.get("parallel_target_ram_fraction", 0.9) or 0.9)
+    parallel_max_cpu_workers = int(config.get("parallel_max_cpu_workers", 0) or 0)
+
+    if not parallel_autotune_enabled:
+        effective = base
+        _emit(f"using {effective} workers for tile processing")
+        return effective
+
+    if platform.system().lower().startswith("windows"):
+        cap_os = 4 if use_gpu else 12
+    elif platform.system().lower() in ("darwin", "macos"):
+        cap_os = 6 if use_gpu else 12
     else:
-        grid_workers = config.get("grid_workers", 0)
-        if grid_workers > 0:
-            effective = int(grid_workers)
-        else:
-            cpu_count = os.cpu_count() or 1
-            effective = max(1, cpu_count - 2)
+        cap_os = 6 if use_gpu else 12
+
+    cap_gpu = max(2, gpu_concurrency * 4) if use_gpu else base
+
+    try:
+        available_mb = float(psutil.virtual_memory().available) / (1024.0 ** 2)
+    except Exception:
+        available_mb = 0.0
+
+    per_worker_mb = max(
+        2500.0 if use_gpu else 1800.0,
+        float(stack_chunk_budget_mb) * (3.0 if use_gpu else 2.0),
+    )
+    ram_budget_mb = available_mb * min(0.98, parallel_target_ram_fraction)
+    cap_ram = max(1, int(math.floor(ram_budget_mb / per_worker_mb))) if per_worker_mb > 0 else 1
+
+    cap_cfg = parallel_max_cpu_workers if parallel_max_cpu_workers > 0 else float("inf")
+
+    effective = int(min(base, cap_os, cap_gpu, cap_ram, cap_cfg))
+
+    _emit(
+        (
+            "Auto-tune grid_workers "
+            f"base={base} cap_os={cap_os} cap_gpu={cap_gpu} "
+            f"cap_ram={cap_ram} cap_cfg={cap_cfg} result={effective}; "
+            f"available_mb={available_mb:.1f} per_worker_mb={per_worker_mb:.1f} "
+            f"stack_chunk_budget_mb={float(stack_chunk_budget_mb):.1f} "
+            f"gpu_concurrency={int(gpu_concurrency)}"
+        ),
+        lvl="INFO",
+    )
     _emit(f"using {effective} workers for tile processing")
     return effective
+
+
+def _compute_gpu_concurrency(stack_chunk_budget_mb: float) -> tuple[int, dict[str, float] | None]:
+    """Return (concurrency, details) for GPU stacking based on current VRAM."""
+
+    ctx = None
+    safe_mode = False
+    vendor = None
+    hybrid = None
+    battery = None
+    chunk_budget_mb = float(stack_chunk_budget_mb)
+    if callable(probe_gpu_runtime_context):
+        try:
+            ctx = probe_gpu_runtime_context()
+            safe_mode = bool(getattr(ctx, "safe_mode", False))
+            vendor = getattr(ctx, "gpu_vendor", None)
+            hybrid = getattr(ctx, "is_hybrid_graphics", None)
+            battery = getattr(ctx, "has_battery", None)
+            if safe_mode:
+                chunk_budget_mb = chunk_budget_mb * 0.6
+        except Exception:
+            ctx = None
+
+    if safe_mode:
+        try:
+            _emit(
+                f"[GPU_SAFETY][GRID] safe_mode=1 vendor={vendor} hybrid={hybrid} battery={battery} "
+                f"-> chosen_concurrency=1 budget_mb={float(chunk_budget_mb):.1f}",
+                lvl="INFO",
+            )
+        except Exception:
+            pass
+        return 1, {
+            "reason": "safe_mode",
+            "vendor": vendor,
+            "hybrid": hybrid,
+            "battery": battery,
+            "stack_chunk_budget_mb": float(chunk_budget_mb),
+        }
+
+    env_override = os.environ.get("ZEMOSAIC_GRID_GPU_CONCURRENCY", "").strip()
+    if env_override:
+        try:
+            override_val = int(env_override)
+            if override_val > 0:
+                _emit(f"GPU concurrency forced by env to {override_val} (ZEMOSAIC_GRID_GPU_CONCURRENCY)", lvl="INFO")
+                return override_val, {"env_override": override_val}
+        except Exception:
+            _emit(f"Ignoring invalid ZEMOSAIC_GRID_GPU_CONCURRENCY={env_override!r}", lvl="WARN")
+
+    if platform.system().lower().startswith("windows"):
+        _emit("GPU concurrency on Windows forced to 1 (WDDM safety)", lvl="INFO")
+        return 1, {"reason": "windows_wddm"}
+
+    if not (_CUPY_AVAILABLE and cp):
+        return 1, None
+    try:
+        free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+        free_mb = float(free_bytes) / (1024.0 ** 2)
+        total_mb = float(total_bytes) / (1024.0 ** 2)
+        safety_mult = 2.5
+        fixed_overhead_mb = 512.0
+        per_worker_mb = max(1.0, float(chunk_budget_mb) * safety_mult + fixed_overhead_mb)
+        usable_mb = max(0.0, free_mb * 0.80)
+        auto_n = math.floor(usable_mb / per_worker_mb) if per_worker_mb > 0 else 1
+        concurrency = int(max(1, min(auto_n, 4)))
+        details = {
+            "free_mb": free_mb,
+            "total_mb": total_mb,
+            "per_worker_mb": per_worker_mb,
+            "usable_mb": usable_mb,
+            "auto_n": float(auto_n),
+            "stack_chunk_budget_mb": float(chunk_budget_mb),
+        }
+        return concurrency, details
+    except Exception:
+        return 1, None
 
 
 def run_grid_mode(
@@ -3692,268 +3895,360 @@ def run_grid_mode(
     log_to_csv = True if zconfig is None else bool(
         getattr(zconfig, "resource_telemetry_log_to_csv", True)
     )
-    csv_path = None
-    if log_to_csv and output_folder:
+
+    def _coerce_bool_flag(value: object) -> bool | None:
+        """Interpret truthy/falsy flags from config, UI, or defaults."""
+
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                return None
+            if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+                return False
         try:
-            csv_path = str((Path(output_folder).expanduser() / "resource_telemetry.csv"))
+            return bool(value)
         except Exception:
-            csv_path = None
+            return None
 
-    telemetry = ResourceTelemetryController(
-        enabled=enable_resource_telemetry,
-        interval_sec=telemetry_interval,
-        callback=progress_callback,
-        csv_path=csv_path,
-    )
-
-    reporter = _GridProgressReporter(progress_callback)
-
-    def _emit_telemetry(
-        phase_index: int,
-        phase_name: str,
-        *,
-        eta: float | None = None,
-        files_done: int | None = None,
-        files_total: int | None = None,
-        force: bool = False,
-        extra: dict | None = None,
-    ) -> None:
-        ctx = _grid_telemetry_context(
-            phase_index,
-            phase_name,
-            reporter.tile_done,
-            reporter.tile_total,
-            reporter.last_eta_seconds if eta is None else eta,
-            files_done,
-            files_total,
-            extra,
-        )
-        if force:
-            telemetry.emit_stats(ctx, force=True)
-        else:
-            telemetry.maybe_emit_stats(ctx)
-
-    current_phase_index = 0
-    current_phase_name = "Grid: Init"
-
+    _emit("Grid/Survey mode activated (stack_plan.csv detected)", callback=progress_callback)
+    cfg_disk = _load_config_from_disk()
+    use_gpu_cfg = cfg_disk.get("use_gpu_grid", False)
+    if use_gpu is None:
+        use_gpu_effective = use_gpu_cfg
+    else:
+        use_gpu_effective = use_gpu
+    _emit(f"GPU requested = {use_gpu_effective}")
+    rgb_source = "default" if grid_rgb_equalize is None else "param"
     try:
-        reporter.set_stage("GRID: setup")
-        reporter.set_overall_total(1)
-        reporter.emit_eta(force=True)
-        reporter.advance(0, force=True)
-    
-        def _coerce_bool_flag(value: object) -> bool | None:
-            """Interpret truthy/falsy flags from config, UI, or defaults."""
-    
-            if value is None:
-                return None
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return value != 0
-            if isinstance(value, str):
-                normalized = value.strip().lower()
-                if not normalized:
-                    return None
-                if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
-                    return True
-                if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
-                    return False
-            try:
-                return bool(value)
-            except Exception:
-                return None
-    
-        _emit_telemetry(current_phase_index, current_phase_name, force=True)
+        overlap_fraction = float(cfg_disk.get("batch_overlap_pct", 0.0)) / 100.0
+    except Exception:
+        overlap_fraction = 0.0
+    try:
+        grid_size_factor = float(cfg_disk.get("grid_size_factor", 1.0))
+    except Exception:
+        grid_size_factor = 1.0
+    try:
+        rgb_cfg = _coerce_bool_flag(cfg_disk.get("grid_rgb_equalize"))
+        if rgb_cfg is None:
+            rgb_cfg = _coerce_bool_flag(cfg_disk.get("poststack_equalize_rgb"))
+        if rgb_cfg is not None:
+            grid_rgb_equalize = rgb_cfg
+            rgb_source = "config"
+        if grid_rgb_equalize is None:
+            grid_rgb_equalize = True
+        else:
+            parsed_param = _coerce_bool_flag(grid_rgb_equalize)
+            if parsed_param is not None:
+                grid_rgb_equalize = parsed_param
+    except Exception:
+        grid_rgb_equalize = True if grid_rgb_equalize is None else bool(grid_rgb_equalize)
 
-        _emit("Grid/Survey mode activated (stack_plan.csv detected)", callback=progress_callback)
-        cfg_disk = _load_config_from_disk()
-        if use_gpu is None:
-            use_gpu = cfg_disk.get("use_gpu_grid", False)
-        _emit(f"GPU requested = {use_gpu}")
-        # Precedence: on-disk config (grid_rgb_equalize/poststack_equalize_rgb) →
-        # caller parameter → built-in default (True).
-        rgb_source = "default" if grid_rgb_equalize is None else "param"
-        try:
-            overlap_fraction = float(cfg_disk.get("batch_overlap_pct", 0.0)) / 100.0
-        except Exception:
-            overlap_fraction = 0.0
-        try:
-            grid_size_factor = float(cfg_disk.get("grid_size_factor", 1.0))
-        except Exception:
-            grid_size_factor = 1.0
-        try:
-            rgb_cfg = _coerce_bool_flag(cfg_disk.get("grid_rgb_equalize"))
-            if rgb_cfg is None:
-                rgb_cfg = _coerce_bool_flag(cfg_disk.get("poststack_equalize_rgb"))
-            if rgb_cfg is not None:
-                grid_rgb_equalize = rgb_cfg
-                rgb_source = "config"
-            if grid_rgb_equalize is None:
-                grid_rgb_equalize = True
-            else:
-                parsed_param = _coerce_bool_flag(grid_rgb_equalize)
-                if parsed_param is not None:
-                    grid_rgb_equalize = parsed_param
-        except Exception:
-            grid_rgb_equalize = True if grid_rgb_equalize is None else bool(grid_rgb_equalize)
-
-        grid_rgb_equalize = bool(grid_rgb_equalize)
-        _emit(
-            f"Grid mode RGB equalization: enabled={grid_rgb_equalize} (source={rgb_source})",
-            lvl="INFO",
-            callback=progress_callback,
-        )
-        chunk_budget_mb = 512.0
-        try:
-            gb_val = cfg_disk.get("grid_chunk_ram_gb")
-            if gb_val is not None:
-                chunk_budget_mb = float(gb_val) * 1024.0
-        except Exception:
-            pass
-        try:
-            mb_val = cfg_disk.get("grid_chunk_ram_mb", cfg_disk.get("grid_chunk_ram"))
-            if mb_val is not None:
-                chunk_budget_mb = float(mb_val)
-        except Exception:
-            pass
-        if chunk_budget_mb <= 0:
-            chunk_budget_mb = 512.0
-
-        config = GridModeConfig(
-            grid_size_factor=grid_size_factor,
-            overlap_fraction=overlap_fraction,
-            stack_norm_method=stack_norm_method,
-            stack_weight_method=stack_weight_method,
-            stack_reject_algo=stack_reject_algo,
-            stack_kappa_low=stack_kappa_low,
-            stack_kappa_high=stack_kappa_high,
-            winsor_limits=winsor_limits,
-            stack_final_combine=stack_final_combine,
-            stack_chunk_budget_mb=chunk_budget_mb,
-            apply_radial_weight=apply_radial_weight,
-            radial_feather_fraction=radial_feather_fraction,
-            radial_shape_power=radial_shape_power,
-            save_final_as_uint16=save_final_as_uint16,
-            legacy_rgb_cube=legacy_rgb_cube,
-            use_gpu=use_gpu,
-        )
-    
-        _emit(
-        (
-            "Stacking config: "
-            f"norm={config.stack_norm_method}, weight={config.stack_weight_method}, "
-            f"reject={config.stack_reject_algo}, winsor={config.winsor_limits}, "
-            f"combine={config.stack_final_combine}, "
-            f"radial={config.apply_radial_weight} "
-            f"(feather={config.radial_feather_fraction}, power={config.radial_shape_power}), "
-            f"rgb_equalize={grid_rgb_equalize}, use_gpu={config.use_gpu}"
-        ),
+    grid_rgb_equalize = bool(grid_rgb_equalize)
+    _emit(
+        f"Grid mode RGB equalization: enabled={grid_rgb_equalize} (source={rgb_source})",
         lvl="INFO",
         callback=progress_callback,
-        )
-    
-        csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
-        frames = load_stack_plan(csv_path, progress_callback=progress_callback)
-        if not frames:
-            _emit("Grid mode aborted: no frames loaded", lvl="ERROR", callback=progress_callback)
-            raise RuntimeError("Grid mode failed: no frames loaded")
-    
-        grid = build_global_grid(frames, grid_size_factor, overlap_fraction, progress_callback=progress_callback)
-        if grid is None:
-            _emit("Grid mode aborted: unable to build grid", lvl="ERROR", callback=progress_callback)
-            raise RuntimeError("Grid mode failed: unable to build grid")
-        if not grid.tiles:
-            _emit("Grid mode aborted: no grid tiles generated", lvl="ERROR", callback=progress_callback)
-            raise RuntimeError("Grid mode failed: no tiles to process")
+    )
+    chunk_budget_mb = 512.0
+    try:
+        gb_val = cfg_disk.get("grid_chunk_ram_gb")
+        if gb_val is not None:
+            chunk_budget_mb = float(gb_val) * 1024.0
+    except Exception:
+        pass
+    try:
+        mb_val = cfg_disk.get("grid_chunk_ram_mb", cfg_disk.get("grid_chunk_ram"))
+        if mb_val is not None:
+            chunk_budget_mb = float(mb_val)
+    except Exception:
+        pass
+    if chunk_budget_mb <= 0:
+        chunk_budget_mb = 512.0
 
-        reporter.set_tile_total(len(grid.tiles))
-        base_total_units = 1 + max(1, len(grid.tiles)) * 2 + 1
-        reporter.set_overall_total(base_total_units)
-        reporter.advance(1)
+    base_config = GridModeConfig(
+        grid_size_factor=grid_size_factor,
+        overlap_fraction=overlap_fraction,
+        stack_norm_method=stack_norm_method,
+        stack_weight_method=stack_weight_method,
+        stack_reject_algo=stack_reject_algo,
+        stack_kappa_low=stack_kappa_low,
+        stack_kappa_high=stack_kappa_high,
+        winsor_limits=winsor_limits,
+        stack_final_combine=stack_final_combine,
+        stack_chunk_budget_mb=chunk_budget_mb,
+        apply_radial_weight=apply_radial_weight,
+        radial_feather_fraction=radial_feather_fraction,
+        radial_shape_power=radial_shape_power,
+        save_final_as_uint16=save_final_as_uint16,
+        legacy_rgb_cube=legacy_rgb_cube,
+        use_gpu=use_gpu_effective,
+    )
 
-        current_phase_index = 1
-        current_phase_name = "Grid: Setup"
-        _emit_telemetry(current_phase_index, current_phase_name, force=True)
+    csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
+    frames = load_stack_plan(csv_path, progress_callback=progress_callback)
+    if not frames:
+        _emit("Grid mode aborted: no frames loaded", lvl="ERROR", callback=progress_callback)
+        raise RuntimeError("Grid mode failed: no frames loaded")
 
-        _emit(
-            f"[GRID] DEBUG: grid_def received with {len(grid.tiles)} tile(s)",
+    known_mount_frames = [f for f in frames if f.mount]
+    mount_values = {f.mount for f in known_mount_frames}
+
+    def _run_single_grid(frames_subset: list[FrameInfo], *, output_dir: Path, mount_label: str | None) -> None:
+        reporter = _GridProgressReporter(progress_callback)
+        csv_out = None
+        if log_to_csv and output_dir:
+            try:
+                csv_out = str(output_dir.expanduser() / "resource_telemetry.csv")
+            except Exception:
+                csv_out = None
+
+        telemetry = ResourceTelemetryController(
+            enabled=enable_resource_telemetry,
+            interval_sec=telemetry_interval,
             callback=progress_callback,
+            csv_path=csv_out,
         )
 
-        assign_frames_to_tiles(frames, grid.tiles, progress_callback=progress_callback)
-        out_dir = Path(output_folder).expanduser()
+        def _emit_telemetry(
+            phase_index: int,
+            phase_name: str,
+            *,
+            eta: float | None = None,
+            files_done: int | None = None,
+            files_total: int | None = None,
+            force: bool = False,
+            extra: dict | None = None,
+        ) -> None:
+            ctx = _grid_telemetry_context(
+                phase_index,
+                phase_name,
+                reporter.tile_done,
+                reporter.tile_total,
+                reporter.last_eta_seconds if eta is None else eta,
+                files_done,
+                files_total,
+                extra,
+            )
+            if force:
+                telemetry.emit_stats(ctx, force=True)
+            else:
+                telemetry.maybe_emit_stats(ctx)
+
+        current_phase_index = 0
+        current_phase_name = "Grid: Init"
+
         try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+            reporter.set_stage("GRID: setup")
+            reporter.set_overall_total(1)
+            reporter.emit_eta(force=True)
+            reporter.advance(0, force=True)
+            _emit_telemetry(current_phase_index, current_phase_name, force=True)
 
-        _emit(
-            f"[GRID] DEBUG: starting tile processing over {len(grid.tiles)} tile(s)",
+            if mount_label:
+                _emit(f"Grid mode run for mount={mount_label}", callback=progress_callback)
+            cfg_disk = _load_config_from_disk()
+            _emit(f"GPU requested = {base_config.use_gpu}")
+
+            config = copy.deepcopy(base_config)
+
+            gpu_stack_semaphore: threading.Semaphore | None = None
+            concurrency = 1
+            details = None
+            if config.use_gpu:
+                concurrency, details = _compute_gpu_concurrency(config.stack_chunk_budget_mb)
+                gpu_stack_semaphore = threading.Semaphore(max(1, concurrency))
+                if details is not None and {"free_mb", "total_mb", "per_worker_mb", "usable_mb", "auto_n"} <= set(details.keys()):
+                    _emit(
+                        (
+                            "GPU concurrency limiter: "
+                            f"free_vram_mb={details['free_mb']:.1f}/{details['total_mb']:.1f}, "
+                            f"stack_chunk_budget_mb={config.stack_chunk_budget_mb:.1f}, "
+                            f"per_worker_est_mb={details['per_worker_mb']:.1f}, "
+                            f"usable_mb={details['usable_mb']:.1f}, "
+                            f"chosen_concurrency={concurrency}"
+                        ),
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+                elif details and "env_override" in details:
+                    _emit(
+                        (
+                            "GPU concurrency limiter: forced by env "
+                            f"ZEMOSAIC_GRID_GPU_CONCURRENCY={details['env_override']} "
+                            f"stack_chunk_budget_mb={config.stack_chunk_budget_mb:.1f} "
+                            f"chosen_concurrency={concurrency}"
+                        ),
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+                elif details and details.get("reason") == "windows_wddm":
+                    _emit(
+                        (
+                            "GPU concurrency limiter: Windows WDDM safety -> concurrency=1; "
+                            f"stack_chunk_budget_mb={config.stack_chunk_budget_mb:.1f}"
+                        ),
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+                else:
+                    _emit(
+                        (
+                            "GPU concurrency limiter: defaulting to 1 (VRAM info unavailable); "
+                            f"stack_chunk_budget_mb={config.stack_chunk_budget_mb:.1f}"
+                        ),
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+
+            _emit(
+            (
+                "Stacking config: "
+                f"norm={config.stack_norm_method}, weight={config.stack_weight_method}, "
+                f"reject={config.stack_reject_algo}, winsor={config.winsor_limits}, "
+                f"combine={config.stack_final_combine}, "
+                f"radial={config.apply_radial_weight} "
+                f"(feather={config.radial_feather_fraction}, power={config.radial_shape_power}), "
+                f"rgb_equalize={grid_rgb_equalize}, use_gpu={config.use_gpu}"
+            ),
+            lvl="INFO",
             callback=progress_callback,
-        )
+            )
 
-        reporter.set_stage("GRID: tile stacking")
+            if not frames_subset:
+                _emit("Grid mode aborted: no frames loaded", lvl="ERROR", callback=progress_callback)
+                raise RuntimeError("Grid mode failed: no frames loaded")
 
-        current_phase_index = 2
-        current_phase_name = "Grid: tile stacking"
-        num_workers = _get_effective_grid_workers(cfg_disk)
-        _emit(
-            f"Memory telemetry: grid_workers={num_workers}, stack_chunk_budget_mb={config.stack_chunk_budget_mb}",
-            callback=progress_callback,
-        )
-        _emit_telemetry(
-            current_phase_index,
-            current_phase_name,
-            force=True,
-            extra={"cpu_workers": num_workers, "use_gpu": bool(config.use_gpu)},
-        )
+            grid = build_global_grid(frames_subset, config.grid_size_factor, config.overlap_fraction, progress_callback=progress_callback)
+            if grid is None:
+                _emit("Grid mode aborted: unable to build grid", lvl="ERROR", callback=progress_callback)
+                raise RuntimeError("Grid mode failed: unable to build grid")
+            if not grid.tiles:
+                _emit("Grid mode aborted: no grid tiles generated", lvl="ERROR", callback=progress_callback)
+                raise RuntimeError("Grid mode failed: no tiles to process")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(process_tile, tile, out_dir, config, progress_callback=progress_callback): tile for tile in grid.tiles}
-            for future in concurrent.futures.as_completed(futures):
-                tile = futures[future]
-                try:
-                    result = future.result()
-                    _emit(f"[GRID] Tile {tile.tile_id} completed", callback=progress_callback)
-                except Exception as exc:
-                    _emit(f"Tile {tile.tile_id} failed with error: {exc}", lvl="ERROR", callback=progress_callback)
-                reporter.tile_completed()
-                reporter.advance(1)
-                reporter.emit_eta()
-                _emit_telemetry(
-                    current_phase_index,
-                    current_phase_name,
-                    extra={"cpu_workers": num_workers, "use_gpu": bool(config.use_gpu)},
-                )
-            # Optional GC after each tile for memory safety (disabled by default)
-            if os.environ.get("ZEMOSAIC_GRID_SAFE_GC", "").lower() in ("1", "true", "yes"):
-                import gc
-                gc.collect()
+            reporter.set_tile_total(len(grid.tiles))
+            base_total_units = 1 + max(1, len(grid.tiles)) * 2 + 1
+            reporter.set_overall_total(base_total_units)
+            reporter.advance(1)
+
+            current_phase_index = 1
+            current_phase_name = "Grid: Setup"
+            _emit_telemetry(current_phase_index, current_phase_name, force=True)
+
+            _emit(
+                f"[GRID] DEBUG: grid_def received with {len(grid.tiles)} tile(s)",
+                callback=progress_callback,
+            )
+
+            assign_frames_to_tiles(frames_subset, grid.tiles, progress_callback=progress_callback)
+            out_dir = output_dir.expanduser()
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            _emit(
+                f"[GRID] DEBUG: starting tile processing over {len(grid.tiles)} tile(s)",
+                callback=progress_callback,
+            )
+
+            reporter.set_stage("GRID: tile stacking")
+
+            current_phase_index = 2
+            current_phase_name = "Grid: tile stacking"
+            num_workers = _get_effective_grid_workers(
+                cfg_disk,
+                use_gpu=bool(config.use_gpu),
+                stack_chunk_budget_mb=float(config.stack_chunk_budget_mb),
+                gpu_concurrency=int(concurrency),
+            )
+            _emit(
+                f"Memory telemetry: grid_workers={num_workers}, stack_chunk_budget_mb={config.stack_chunk_budget_mb}",
+                callback=progress_callback,
+            )
+            _emit_telemetry(
+                current_phase_index,
+                current_phase_name,
+                force=True,
+                extra={"cpu_workers": num_workers, "use_gpu": bool(config.use_gpu)},
+            )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(
+                        process_tile,
+                        tile,
+                        out_dir,
+                        config,
+                        progress_callback=progress_callback,
+                        gpu_stack_semaphore=gpu_stack_semaphore,
+                    ): tile
+                    for tile in grid.tiles
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    tile = futures[future]
+                    try:
+                        result = future.result()
+                        _emit(f"[GRID] Tile {tile.tile_id} completed", callback=progress_callback)
+                    except Exception as exc:
+                        _emit(f"Tile {tile.tile_id} failed with error: {exc}", lvl="ERROR", callback=progress_callback)
+                    reporter.tile_completed()
+                    reporter.advance(1)
+                    reporter.emit_eta()
+                    _emit_telemetry(
+                        current_phase_index,
+                        current_phase_name,
+                        extra={"cpu_workers": num_workers, "use_gpu": bool(config.use_gpu)},
+                    )
+                if os.environ.get("ZEMOSAIC_GRID_SAFE_GC", "").lower() in ("1", "true", "yes"):
+                    import gc
+                    gc.collect()
     
-        reporter.set_stage("GRID: photometry & blending")
-        current_phase_index = 3
-        current_phase_name = "Grid: photometry & blending"
-        _emit_telemetry(current_phase_index, current_phase_name, force=True)
-        mosaic_path = assemble_tiles(
-            grid,
-            grid.tiles,
-            out_dir / "mosaic_grid.fits",
-            save_final_as_uint16=save_final_as_uint16,
-            legacy_rgb_cube=legacy_rgb_cube,
-            grid_rgb_equalize=grid_rgb_equalize,
-            progress_callback=progress_callback,
-            progress_reporter=reporter,
-        )
+            reporter.set_stage("GRID: photometry & blending")
+            current_phase_index = 3
+            current_phase_name = "Grid: photometry & blending"
+            _emit_telemetry(current_phase_index, current_phase_name, force=True)
+            mosaic_path = assemble_tiles(
+                grid,
+                grid.tiles,
+                out_dir / "mosaic_grid.fits",
+                save_final_as_uint16=save_final_as_uint16,
+                legacy_rgb_cube=legacy_rgb_cube,
+                grid_rgb_equalize=grid_rgb_equalize,
+                progress_callback=progress_callback,
+                progress_reporter=reporter,
+            )
 
-        if mosaic_path is None:
-            _emit("Grid mode aborted: assembly failed", lvl="ERROR", callback=progress_callback)
-            raise RuntimeError("Grid mode failed during assembly")
+            if mosaic_path is None:
+                _emit("Grid mode aborted: assembly failed", lvl="ERROR", callback=progress_callback)
+                raise RuntimeError("Grid mode failed during assembly")
 
-        reporter.finish()
-        current_phase_index = 4
-        current_phase_name = "Grid: Completed"
-        _emit_telemetry(current_phase_index, current_phase_name, eta=0.0, force=True)
-        _emit("Grid/Survey mode completed", lvl="SUCCESS", callback=progress_callback)
-    finally:
-        telemetry.close()
+            reporter.finish()
+            current_phase_index = 4
+            current_phase_name = "Grid: Completed"
+            _emit_telemetry(current_phase_index, current_phase_name, eta=0.0, force=True)
+            _emit("Grid/Survey mode completed", lvl="SUCCESS", callback=progress_callback)
+        finally:
+            telemetry.close()
+
+    if len(known_mount_frames) == len(frames) and len(mount_values) >= 2:
+        eq_frames = [f for f in frames if f.mount == "EQ"]
+        altz_frames = [f for f in frames if f.mount == "ALTZ"]
+        _emit("Grid mode: detected mount-based segregation (EQ / ALTZ)", callback=progress_callback)
+        _emit(f"Grid mode: EQ frames = {len(eq_frames)}, ALTZ frames = {len(altz_frames)}", callback=progress_callback)
+        base_out = Path(output_folder).expanduser()
+        if eq_frames:
+            _run_single_grid(eq_frames, output_dir=base_out / "grid_EQ", mount_label="EQ")
+        if altz_frames:
+            _run_single_grid(altz_frames, output_dir=base_out / "grid_ALTZ", mount_label="ALTZ")
+    else:
+        _emit("Grid mode: mount info missing or homogeneous, skipping segregation", callback=progress_callback)
+        _run_single_grid(frames, output_dir=Path(output_folder).expanduser(), mount_label=None)
