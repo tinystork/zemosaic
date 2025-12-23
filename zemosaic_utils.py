@@ -4056,6 +4056,25 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     tile_weights_list = _normalize_tile_weights(tile_weights_param)
     tile_weighting_active = tile_weights_param is not None
+    if tile_weighting_active and logger.isEnabledFor(logging.DEBUG):
+        try:
+            weights_np = np.asarray(tile_weights_list, dtype=np.float64)
+            finite_weights = weights_np[np.isfinite(weights_np)]
+            if finite_weights.size:
+                tw_min = float(np.min(finite_weights))
+                tw_med = float(np.median(finite_weights))
+                tw_max = float(np.max(finite_weights))
+                ratio = float(tw_max / tw_min) if tw_min > 0 else float("inf")
+                logger.debug(
+                    "[DEBUG] gpu_coadd tile_weights: min=%.6f median=%.6f max=%.6f ratio=%.6f count=%d",
+                    tw_min,
+                    tw_med,
+                    tw_max,
+                    ratio,
+                    len(tile_weights_list),
+                )
+        except Exception:
+            pass
     try:
         tile_weights_gpu = cp.asarray(tile_weights_list, dtype=cp.float32)
     except Exception:
@@ -4611,7 +4630,45 @@ def _reproject_and_coadd_wrapper_impl(
             normalized.extend([1.0] * (n_expected - len(normalized)))
         return normalized
 
+    def _max_input_weight(weights_obj) -> float | None:
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = None
+        if iterable is None:
+            return None
+        max_val: float = 0.0
+        seen = False
+        for entry in iterable:
+            if entry is None:
+                continue
+            try:
+                arr = np.asarray(entry, dtype=np.float32)
+            except Exception:
+                continue
+            if arr.size == 0:
+                continue
+            try:
+                local_max = float(np.nanmax(arr))
+            except Exception:
+                local_max = 0.0
+            if math.isfinite(local_max):
+                seen = True
+                if local_max > max_val:
+                    max_val = local_max
+        return max_val if seen else None
+
+    input_weights_raw = kwargs.get("input_weights")
+    input_weight_max = _max_input_weight(input_weights_raw)
     normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
+    if normalized_weights is not None and input_weight_max is not None and input_weight_max > 1.5:
+        try:
+            logger.warning(
+                "[Reproject] double application probable: input_weights max=%.3f with tile_weights provided",
+                input_weight_max,
+            )
+        except Exception:
+            pass
     gpu_kwargs = dict(kwargs)
     if progress_callback is not None:
         gpu_kwargs["progress_callback"] = progress_callback

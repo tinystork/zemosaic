@@ -125,8 +125,8 @@ def test_gpu_collects_normalized_tiles_like_cpu(tmp_path, monkeypatch):
     final_wcs = _make_wcs()
 
     affine = [(1.0, 0.0), (0.1, 0.0)]  # Tile 2 must be scaled down to match tile 1.
-    cpu_cache: list[tuple[np.ndarray, object, np.ndarray | None]] = []
-    gpu_cache: list[tuple[np.ndarray, object, np.ndarray | None]] = []
+    cpu_cache: list[tuple[np.ndarray, object, np.ndarray | None, float]] = []
+    gpu_cache: list[tuple[np.ndarray, object, np.ndarray | None, float]] = []
 
     cpu_result = zw.assemble_final_mosaic_reproject_coadd(
         master_tile_fits_with_wcs_list=[(tile1, wcs1), (tile2, wcs2)],
@@ -161,7 +161,7 @@ def test_gpu_collects_normalized_tiles_like_cpu(tmp_path, monkeypatch):
     assert call_records[0][0] is False and call_records[-1][0] is True
     assert len(cpu_cache) == len(gpu_cache) == 2
     # Tile 2 should be normalized to the same scale as tile 1 in both caches.
-    for (arr_cpu, _, _), (arr_gpu, _, _) in zip(cpu_cache, gpu_cache):
+    for (arr_cpu, _, _, _), (arr_gpu, _, _, _) in zip(cpu_cache, gpu_cache):
         assert np.allclose(arr_cpu, arr_gpu)
     assert np.allclose(cpu_cache[1][0], np.full((4, 4, 3), 1.0, dtype=np.float32))
 
