@@ -54,6 +54,7 @@ import time
 import sys
 import platform
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from contextlib import nullcontext
 from pathlib import Path
@@ -2084,6 +2085,7 @@ def compute_intertile_affine_calibration(
     logger=None,
     progress_callback=None,
     tile_weights=None,
+    cpu_workers: int | None = None,
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
 
@@ -2162,6 +2164,13 @@ def compute_intertile_affine_calibration(
     except Exception:
         preview_size = 512
     preview_size = max(128, preview_size)
+
+    try:
+        cpu_workers = int(cpu_workers) if cpu_workers is not None else None
+    except Exception:
+        cpu_workers = None
+    if cpu_workers is not None and cpu_workers < 1:
+        cpu_workers = 1
 
     try:
         min_overlap_fraction = float(min_overlap_fraction)
@@ -2374,137 +2383,179 @@ def compute_intertile_affine_calibration(
             weight_scores = scores
             weights_for_anchor = weights_array
 
-    for idx, overlap in enumerate(overlaps, 1):
-        i = overlap["i"]
-        j = overlap["j"]
-        bbox = overlap["bbox"]
-        weight = float(overlap.get("weight", 1.0))
-        if luminance_tiles[i] is None or luminance_tiles[j] is None:
-            continue
-        x0, x1, y0, y1 = bbox
-        sub_w = max(1, x1 - x0)
-        sub_h = max(1, y1 - y0)
-        header = header_full.copy()
-        header["NAXIS1"] = sub_w
-        header["NAXIS2"] = sub_h
-        if "CRPIX1" in header:
-            header["CRPIX1"] = float(header["CRPIX1"]) - x0
-        if "CRPIX2" in header:
-            header["CRPIX2"] = float(header["CRPIX2"]) - y0
+    preview_size = max(128, int(preview_size))
+
+    def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
+        if mask_arr is None:
+            return None
+        mask_arr = np.asarray(mask_arr, dtype=np.float32)
+        if mask_arr.size == 0:
+            return None
+        finite_mask = np.isfinite(mask_arr)
         try:
-            target_wcs = _WCS(header)
+            max_val = float(np.nanmax(mask_arr))
         except Exception:
-            continue
+            max_val = 0.0
+        threshold = 0.5 if max_val > 0.5 else 0.0
+        return finite_mask & (mask_arr > threshold)
+
+    def _process_overlap_pair(idx_overlap: int, overlap_entry: dict) -> tuple[list[tuple[int, int, float, float, float]] | None, tuple[int, int, float] | None]:
         try:
-            reproj_i, _ = reproject_interp(
-                (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
-            )
-            reproj_j, _ = reproject_interp(
-                (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-            )
-        except Exception:
-            continue
-        if reproj_i is None or reproj_j is None:
-            continue
-        arr_i = np.asarray(reproj_i, dtype=np.float32)
-        arr_j = np.asarray(reproj_j, dtype=np.float32)
-        mask_i_reproj = None
-        mask_j_reproj = None
-        if mask_tiles[i] is not None:
+            i = overlap_entry["i"]
+            j = overlap_entry["j"]
+            bbox = overlap_entry["bbox"]
+            weight = float(overlap_entry.get("weight", 1.0))
+            if luminance_tiles[i] is None or luminance_tiles[j] is None:
+                return None, None
+            x0, x1, y0, y1 = bbox
+            sub_w = max(1, x1 - x0)
+            sub_h = max(1, y1 - y0)
+            header = header_full.copy()
+            header["NAXIS1"] = sub_w
+            header["NAXIS2"] = sub_h
+            if "CRPIX1" in header:
+                header["CRPIX1"] = float(header["CRPIX1"]) - x0
+            if "CRPIX2" in header:
+                header["CRPIX2"] = float(header["CRPIX2"]) - y0
             try:
-                mask_i_reproj, _ = reproject_interp(
-                    (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                target_wcs = _WCS(header)
+            except Exception:
+                return None, None
+            try:
+                reproj_i, _ = reproject_interp(
+                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                )
+                reproj_j, _ = reproject_interp(
+                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
                 )
             except Exception:
-                mask_i_reproj = None
-        if mask_tiles[j] is not None:
-            try:
-                mask_j_reproj, _ = reproject_interp(
-                    (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-                )
-            except Exception:
-                mask_j_reproj = None
-        if arr_i.size == 0 or arr_j.size == 0:
-            continue
-        max_dim = max(arr_i.shape[0], arr_i.shape[1])
-        if max_dim > preview_size:
-            scale = preview_size / max_dim
-            new_w = max(8, int(round(arr_i.shape[1] * scale)))
-            new_h = max(8, int(round(arr_i.shape[0] * scale)))
-            arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            if mask_i_reproj is not None:
-                mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            if mask_j_reproj is not None:
-                mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                return None, None
+            if reproj_i is None or reproj_j is None:
+                return None, None
+            arr_i = np.asarray(reproj_i, dtype=np.float32)
+            arr_j = np.asarray(reproj_j, dtype=np.float32)
+            mask_i_reproj = None
+            mask_j_reproj = None
+            if mask_tiles[i] is not None:
+                try:
+                    mask_i_reproj, _ = reproject_interp(
+                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                    )
+                except Exception:
+                    mask_i_reproj = None
+            if mask_tiles[j] is not None:
+                try:
+                    mask_j_reproj, _ = reproject_interp(
+                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+                    )
+                except Exception:
+                    mask_j_reproj = None
+            if arr_i.size == 0 or arr_j.size == 0:
+                return None, None
+            max_dim = max(arr_i.shape[0], arr_i.shape[1])
+            if max_dim > preview_size:
+                scale = preview_size / max_dim
+                new_w = max(8, int(round(arr_i.shape[1] * scale)))
+                new_h = max(8, int(round(arr_i.shape[0] * scale)))
+                arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                if mask_i_reproj is not None:
+                    mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                if mask_j_reproj is not None:
+                    mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
-            if mask_arr is None:
-                return None
-            mask_arr = np.asarray(mask_arr, dtype=np.float32)
-            if mask_arr.size == 0:
-                return None
-            finite_mask = np.isfinite(mask_arr)
+            valid = np.isfinite(arr_i) & np.isfinite(arr_j)
+            mask_i_valid = _mask_valid_pixels(mask_i_reproj)
+            mask_j_valid = _mask_valid_pixels(mask_j_reproj)
+            if mask_i_valid is not None:
+                valid &= mask_i_valid
+            if mask_j_valid is not None:
+                valid &= mask_j_valid
+            if not np.any(valid):
+                return None, None
+            sample_i = arr_i[valid]
+            sample_j = arr_j[valid]
+            if sample_i.size < 64:
+                return None, None
+            sky_proxy = 0.5 * (sample_i + sample_j)
             try:
-                max_val = float(np.nanmax(mask_arr))
+                p_low = np.percentile(sky_proxy, sky_low)
+                p_high = np.percentile(sky_proxy, sky_high)
             except Exception:
-                max_val = 0.0
-            threshold = 0.5 if max_val > 0.5 else 0.0
-            return finite_mask & (mask_arr > threshold)
-
-        valid = np.isfinite(arr_i) & np.isfinite(arr_j)
-        mask_i_valid = _mask_valid_pixels(mask_i_reproj)
-        mask_j_valid = _mask_valid_pixels(mask_j_reproj)
-        if mask_i_valid is not None:
-            valid &= mask_i_valid
-        if mask_j_valid is not None:
-            valid &= mask_j_valid
-        if not np.any(valid):
-            continue
-        sample_i = arr_i[valid]
-        sample_j = arr_j[valid]
-        if sample_i.size < 64:
-            continue
-        sky_proxy = 0.5 * (sample_i + sample_j)
-        try:
-            p_low = np.percentile(sky_proxy, sky_low)
-            p_high = np.percentile(sky_proxy, sky_high)
+                p_low = np.nanmin(sky_proxy)
+                p_high = np.nanmax(sky_proxy)
+            if not np.isfinite(p_low) or not np.isfinite(p_high):
+                return None, None
+            if p_high <= p_low:
+                p_low = np.nanmin(sky_proxy)
+                p_high = np.nanmax(sky_proxy)
+            mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
+            if mask.sum() < 32:
+                mask = np.ones_like(sky_proxy, dtype=bool)
+            x_samples = sample_i[mask]
+            y_samples = sample_j[mask]
+            fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
+            if fit is None:
+                return None, None
+            a_ij, b_ij = fit
+            # Preserve legacy duplicate append behavior.
+            pairs_local = [(i, j, a_ij, b_ij, weight), (i, j, a_ij, b_ij, weight)]
+            return pairs_local, (i, j, weight)
         except Exception:
-            p_low = np.nanmin(sky_proxy)
-            p_high = np.nanmax(sky_proxy)
-        if not np.isfinite(p_low) or not np.isfinite(p_high):
-            continue
-        if p_high <= p_low:
-            p_low = np.nanmin(sky_proxy)
-            p_high = np.nanmax(sky_proxy)
-        mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
-        if mask.sum() < 32:
-            mask = np.ones_like(sky_proxy, dtype=bool)
-        x_samples = sample_i[mask]
-        y_samples = sample_j[mask]
-        fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
-        if fit is None:
-            continue
-        a_ij, b_ij = fit
-        pair_entries.append((i, j, a_ij, b_ij, weight))
+            return None, None
 
-        a_ij, b_ij = fit
-        pair_entries.append((i, j, a_ij, b_ij, weight))
-        connectivity[i] += weight
-        connectivity[j] += weight
-
-        # [ETA] Tick fin de traitement de la paire idx
-        if progress_callback:
-            try:
-                progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
-            except Exception:
-                pass
-
-        if progress_callback and idx % 5 == 0:
-            try:
-                progress_callback("phase5_intertile", idx, len(overlaps))
-            except Exception:
-                pass
+    total_pairs = len(overlaps)
+    use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
+    if use_parallel:
+        workers = min(cpu_workers, 16) if cpu_workers is not None else 1
+        workers = max(1, workers)
+        _log_intertile(
+            f"Parallel: threadpool workers={workers} pairs={total_pairs} preview={preview_size}",
+            level="INFO",
+        )
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(_process_overlap_pair, idx, overlap): idx
+                for idx, overlap in enumerate(overlaps, 1)
+            }
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                pairs_local, connectivity_entry = future.result()
+                if pairs_local:
+                    pair_entries.extend(pairs_local)
+                if connectivity_entry:
+                    i_conn, j_conn, w_conn = connectivity_entry
+                    connectivity[i_conn] += w_conn
+                    connectivity[j_conn] += w_conn
+                if progress_callback:
+                    try:
+                        progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
+                    except Exception:
+                        pass
+                    if idx % 5 == 0:
+                        try:
+                            progress_callback("phase5_intertile", idx, total_pairs)
+                        except Exception:
+                            pass
+    else:
+        for idx, overlap in enumerate(overlaps, 1):
+            pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
+            if pairs_local:
+                pair_entries.extend(pairs_local)
+            if connectivity_entry:
+                i_conn, j_conn, w_conn = connectivity_entry
+                connectivity[i_conn] += w_conn
+                connectivity[j_conn] += w_conn
+            if progress_callback:
+                try:
+                    progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
+                except Exception:
+                    pass
+                if idx % 5 == 0:
+                    try:
+                        progress_callback("phase5_intertile", idx, total_pairs)
+                    except Exception:
+                        pass
 
     if not pair_entries:
         return {}
