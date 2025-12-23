@@ -2678,61 +2678,71 @@ class FilterQtDialog(QDialog):
         messages: list[str | tuple[str, str]] = []
         result_payload: dict[str, Any] | None = None
         start_time = time.perf_counter()
+        timings: dict[str, float] = {}
         try:
-            self._auto_group_stage_signal.emit("Clustering frames…")
-            self._async_log_signal.emit("Stage: clustering connected groups", "INFO")
-            result_payload = self._compute_auto_groups(
-                selected_indices,
-                overcap_pct,
-                coverage_enabled_flag,
-                messages,
-            )
-            if isinstance(result_payload, dict):
-                self._auto_group_stage_signal.emit("Post-processing groups…")
-                self._async_log_signal.emit("Stage: post-processing clusters", "INFO")
-                result_payload["mode"] = normalized_mode
-                result_payload["auto_optimised"] = bool(optimize_flag)
-                if optimize_flag:
-                    self._auto_group_stage_signal.emit("Auto-optimiser…")
-                    self._async_log_signal.emit("Stage: running auto-optimiser", "INFO")
-                    self._optimize_auto_group_result(
-                        result_payload,
-                        max_raw_cap=int(max_raw_cap),
-                        min_safe_stack=int(min_safe_stack),
-                        target_stack_size=int(target_stack_size),
-                        overlap_percent=int(overlap_percent),
-                        messages=messages,
-                    )
-        except Exception as exc:  # pragma: no cover - defensive guard
-            error_text = self._localizer.get(
-                "filter.cluster.failed",
-                "Auto-organisation failed: {error}",
-            )
             try:
-                formatted = error_text.format(error=exc)
-            except Exception:
-                formatted = f"Auto-organisation failed: {exc}"
-            messages.append((formatted, "ERROR"))
-        if result_payload and result_payload.get("coverage_first"):
-            groups_count = len(result_payload.get("final_groups") or [])
+                self._auto_group_stage_signal.emit("Clustering frames…")
+                self._async_log_signal.emit("Stage: clustering connected groups", "INFO")
+                result_payload = self._compute_auto_groups(
+                    selected_indices,
+                    overcap_pct,
+                    coverage_enabled_flag,
+                    messages,
+                )
+                if isinstance(result_payload, dict):
+                    timings = result_payload.get("timings") or {}
+                    self._auto_group_stage_signal.emit("Post-processing groups…")
+                    self._async_log_signal.emit("Stage: post-processing clusters", "INFO")
+                    result_payload["mode"] = normalized_mode
+                    result_payload["auto_optimised"] = bool(optimize_flag)
+                    if optimize_flag:
+                        self._auto_group_stage_signal.emit("Auto-optimiser…")
+                        self._async_log_signal.emit("Stage: running auto-optimiser", "INFO")
+                        t_start_optimiser = time.perf_counter()
+                        self._optimize_auto_group_result(
+                            result_payload,
+                            max_raw_cap=int(max_raw_cap),
+                            min_safe_stack=int(min_safe_stack),
+                            target_stack_size=int(target_stack_size),
+                            overlap_percent=int(overlap_percent),
+                            messages=messages,
+                        )
+                        timings["auto_optimiser"] = time.perf_counter() - t_start_optimiser
+            except Exception as exc:  # pragma: no cover - defensive guard
+                error_text = self._localizer.get(
+                    "filter.cluster.failed",
+                    "Auto-organisation failed: {error}",
+                )
+                try:
+                    formatted = error_text.format(error=exc)
+                except Exception:
+                    formatted = f"Auto-organisation failed: {exc}"
+                messages.append((formatted, "ERROR"))
+            if result_payload and result_payload.get("coverage_first"):
+                groups_count = len(result_payload.get("final_groups") or [])
+                messages.append(
+                    self._format_message(
+                        "log_covfirst_done",
+                        "Coverage-first preplan ready: {N} groups written to overrides_state.preplan_master_groups",
+                        N=groups_count,
+                    )
+                )
+            elapsed_total = time.perf_counter() - start_time
+            timings["total"] = elapsed_total
+            timing_summary = " ".join(f"{k}={v:.2f}s" for k, v in timings.items())
+            logger.info("[AutoGroupTiming] %s", timing_summary)
+            messages.append(f"Timings: {timing_summary}")
             messages.append(
                 self._format_message(
-                    "log_covfirst_done",
-                    "Coverage-first preplan ready: {N} groups written to overrides_state.preplan_master_groups",
-                    N=groups_count,
+                    "auto_group_total_time",
+                    "Auto-group completed in {DT:.1f}s",
+                    DT=elapsed_total,
                 )
             )
-        elapsed_total = time.perf_counter() - start_time
-        messages.append(
-            self._format_message(
-                "auto_group_total_time",
-                "Auto-group completed in {DT:.1f}s",
-                DT=elapsed_total,
-            )
-        )
-        self._auto_group_stage_signal.emit("Finalizing…")
-        self._async_log_signal.emit(f"Stage: finalize (elapsed {elapsed_total:.1f}s)", "INFO")
-        self._auto_group_finished_signal.emit(result_payload, list(messages))
+        finally:
+            self._auto_group_stage_signal.emit("Finalizing…")
+            self._async_log_signal.emit(f"Stage: finalize (elapsed {time.perf_counter() - start_time:.1f}s)", "INFO")
+            self._auto_group_finished_signal.emit(result_payload, list(messages))
 
     @Slot(object, object)
     def _handle_auto_group_finished(
@@ -3121,6 +3131,7 @@ class FilterQtDialog(QDialog):
         coverage_requested: bool,
         messages: list[str | tuple[str, str]],
     ) -> dict[str, Any]:
+        timings: dict[str, float] = {}
         sds_mode = bool(self._sds_checkbox.isChecked()) if self._sds_checkbox is not None else False
         coverage_enabled = bool(coverage_requested)
         if sds_mode and compute_global_wcs_descriptor is not None:
@@ -3173,6 +3184,7 @@ class FilterQtDialog(QDialog):
                         "coverage_first": True,
                         "threshold_used": 0.0,
                         "angle_split": 0.0,
+                        "timings": timings,
                     }
                 else:
                     messages.append(
@@ -3194,6 +3206,7 @@ class FilterQtDialog(QDialog):
                         "WARN",
                     )
                 )
+        t_start = time.perf_counter()
         candidate_infos: list[dict[str, Any]] = []
         coord_samples: list[tuple[float, float]] = []
         for idx in selected_indices:
@@ -3205,13 +3218,16 @@ class FilterQtDialog(QDialog):
             candidate_infos.append(payload)
             if coords and None not in coords:
                 coord_samples.append((float(coords[0]), float(coords[1])))
+        timings["build_candidates"] = time.perf_counter() - t_start
 
         if not candidate_infos:
             raise RuntimeError("No candidate entries were usable for grouping.")
         if WCS is None and SkyCoord is None:
             raise RuntimeError("Astropy is required to compute WCS-based clusters.")
 
+        t_start = time.perf_counter()
         self._prefetch_eqmode_for_candidates(candidate_infos, messages)
+        timings["prefetch_eqmode"] = time.perf_counter() - t_start
 
         threshold_override = self._resolve_cluster_threshold_override()
         threshold_heuristic = self._estimate_threshold_from_coords(coord_samples)
@@ -3237,12 +3253,14 @@ class FilterQtDialog(QDialog):
                 )
             )
 
+        t_start = time.perf_counter()
         groups_initial = _CLUSTER_CONNECTED(
             candidate_infos,
             float(threshold_initial),
             None,
             orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
         )
+        timings["clustering"] = time.perf_counter() - t_start
         if not groups_initial:
             raise RuntimeError("Worker clustering returned no groups.")
 
@@ -3277,12 +3295,14 @@ class FilterQtDialog(QDialog):
             if p90_value and math.isfinite(p90_value):
                 threshold_relaxed = max(threshold_used, float(p90_value) * 1.1)
                 if threshold_relaxed > threshold_used * 1.001:
+                    t_start = time.perf_counter()
                     relaxed_groups = _CLUSTER_CONNECTED(
                         candidate_infos,
                         float(threshold_relaxed),
                         None,
                         orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
                     )
+                    timings["clustering"] += time.perf_counter() - t_start
                     if relaxed_groups and len(relaxed_groups) < len(groups_used):
                         messages.append(
                             self._format_message(
@@ -3350,6 +3370,7 @@ class FilterQtDialog(QDialog):
         final_groups: list[list[dict[str, Any]]]
         overlap_pct = self._resolve_overlap_percent()
         overlap_fraction = max(0.0, min(0.7, float(overlap_pct) / 100.0))
+        t_start_autosplit = time.perf_counter()
         if cap_effective > 0:
             if overlap_fraction <= 0.0 and _AUTOSPLIT_GROUPS is not None:
                 groups_after_autosplit = _AUTOSPLIT_GROUPS(
@@ -3429,6 +3450,7 @@ class FilterQtDialog(QDialog):
                     )
                 )
             final_groups = groups_after_autosplit
+        timings["autosplit"] = time.perf_counter() - t_start_autosplit
 
         self._log_batching_summary(
             final_groups,
@@ -3441,7 +3463,8 @@ class FilterQtDialog(QDialog):
             for info in group:
                 if info.pop("_fallback_wcs_used", False):
                     info.pop("wcs", None)
-
+        
+        t_start_borrow = time.perf_counter()
         if coverage_enabled and apply_borrowing_v1 is not None:
             try:
                 self._auto_group_stage_signal.emit("Borrowing v1…")
@@ -3470,14 +3493,17 @@ class FilterQtDialog(QDialog):
                 borrowed_unique,
                 borrowed_total,
             )
+        timings["borrowing"] = time.perf_counter() - t_start_borrow
 
-        return {
+        result = {
             "final_groups": final_groups,
             "sizes": [len(group) for group in final_groups],
             "coverage_first": bool(coverage_enabled),
             "threshold_used": threshold_used,
             "angle_split": angle_split_effective,
         }
+        result["timings"] = timings
+        return result
 
     def _optimize_auto_group_result(
         self,
@@ -3582,7 +3608,7 @@ class FilterQtDialog(QDialog):
             if not group:
                 continue
             coords = self._gather_group_coordinates(group, path_map)
-            center = self._compute_center_from_coords(coords)
+            center, radius = self._compute_center_and_radius(coords)
             dispersion = self._compute_dispersion_for_coords(coords)
             eqmode_sig = self._group_eqmode_signature(group)
             records.append(
@@ -3590,6 +3616,7 @@ class FilterQtDialog(QDialog):
                     "entries": list(group),
                     "coords": coords,
                     "center": center,
+                    "radius": radius,
                     "size": len(group),
                     "dispersion": dispersion,
                     "eqmode_sig": eqmode_sig,
@@ -3644,6 +3671,22 @@ class FilterQtDialog(QDialog):
             return None
         return (sum_ra / count, sum_dec / count)
 
+    def _compute_center_and_radius(
+        self,
+        coords: list[tuple[float, float]],
+    ) -> tuple[tuple[float, float] | None, float]:
+        center = self._compute_center_from_coords(coords)
+        if center is None:
+            return None, 0.0
+        if not coords:
+            return center, 0.0
+        max_dist_sq = 0.0
+        for point in coords:
+            dist_sq = (point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2
+            if dist_sq > max_dist_sq:
+                max_dist_sq = dist_sq
+        return center, math.sqrt(max_dist_sq)
+
     def _compute_dispersion_for_coords(self, coords: list[tuple[float, float]]) -> float:
         if not coords or len(coords) < 2:
             return 0.0
@@ -3695,7 +3738,7 @@ class FilterQtDialog(QDialog):
                 )
                 if partner is None:
                     continue
-                partner_idx, coords, dispersion = partner
+                partner_idx, coords, dispersion_upper = partner
                 keep_idx = min(idx, partner_idx)
                 drop_idx = max(idx, partner_idx)
                 keep = records[keep_idx]
@@ -3705,11 +3748,14 @@ class FilterQtDialog(QDialog):
                     continue
                 if cap_limit is not None and len(combined_entries) > cap_limit:
                     continue
+
+                center, radius = self._compute_center_and_radius(coords or [])
                 keep["entries"] = combined_entries
                 keep["coords"] = coords or []
-                keep["center"] = self._compute_center_from_coords(coords or [])
+                keep["center"] = center
+                keep["radius"] = radius
                 keep["size"] = len(combined_entries)
-                keep["dispersion"] = dispersion
+                keep["dispersion"] = dispersion_upper
                 records.pop(drop_idx)
                 merges += 1
                 merged_this_round = True
@@ -3733,55 +3779,84 @@ class FilterQtDialog(QDialog):
         source_coords = list(source.get("coords") or [])
         source_center = source.get("center")
         source_sig = str(source.get("eqmode_sig") or "UNKNOWN")
+        source_radius = float(source.get("radius", 0.0))
+        source_dispersion = float(source.get("dispersion", 0.0))
+
         if not source_coords or source_center is None:
             return None
+
         source_size = int(source.get("size", len(source_coords)))
         neighbors: list[tuple[float, int, int]] = []
         for other_idx, other in enumerate(records):
             if other_idx == idx:
                 continue
             other_sig = str(other.get("eqmode_sig") or "UNKNOWN")
-            # Never merge across EQ/ALTZ boundaries (or any differing signature)
             if other_sig != source_sig:
                 continue
+
             other_coords = other.get("coords") or []
             other_center = other.get("center")
             if not other_coords or other_center is None:
                 continue
+
             other_size = int(other.get("size", len(other_coords)))
             combined_size = source_size + other_size
             if cap_limit is not None and combined_size > cap_limit:
                 continue
+
             distance = self._angular_distance(source_center, other_center)
             neighbors.append((distance, other_idx, combined_size))
+
         if not neighbors:
             return None
+
         neighbors.sort(key=lambda item: item[0])
+        neighbor_cap = self._config_value("auto_optimiser_neighbor_cap", 64)
+        if neighbor_cap > 0:
+            neighbors = neighbors[: int(neighbor_cap)]
+
         best_idx: int | None = None
         best_coords: list[tuple[float, float]] | None = None
-        best_dispersion = 0.0
+        best_dispersion_upper = 0.0
         best_score = float("inf")
         best_distance = float("inf")
+
         for distance, other_idx, combined_size in neighbors:
-            combined_coords = source_coords + list(records[other_idx].get("coords") or [])
-            if not combined_coords:
+            other = records[other_idx]
+            other_radius = float(other.get("radius", 0.0))
+            other_dispersion = float(other.get("dispersion", 0.0))
+
+            # Estimate dispersion upper bound without full computation
+            cross_upper = distance + source_radius + other_radius
+            disp_upper = max(source_dispersion, other_dispersion, cross_upper)
+
+            if dispersion_limit > 0 and disp_upper > dispersion_limit:
                 continue
-            dispersion = self._compute_dispersion_for_coords(combined_coords)
-            if dispersion_limit > 0 and dispersion > dispersion_limit:
-                continue
+
             size_score = abs(desired_target - combined_size)
             if (
                 size_score < best_score - 1e-6
-                or (abs(size_score - best_score) <= 1e-6 and distance < best_distance)
+                or (abs(size_score - best_score) <= 1e-6 and disp_upper < best_dispersion_upper - 1e-6)
+                or (
+                    abs(size_score - best_score) <= 1e-6
+                    and abs(disp_upper - best_dispersion_upper) <= 1e-6
+                    and distance < best_distance
+                )
             ):
+                combined_coords = source_coords + list(other.get("coords") or [])
+                if not combined_coords:
+                    continue
+
                 best_idx = other_idx
                 best_coords = combined_coords
-                best_dispersion = dispersion
+                best_dispersion_upper = disp_upper
                 best_score = size_score
                 best_distance = distance
+
         if best_idx is None or best_coords is None:
             return None
-        return best_idx, best_coords, best_dispersion
+
+        return best_idx, best_coords, best_dispersion_upper
 
     def _split_large_groups_for_auto(
         self,
