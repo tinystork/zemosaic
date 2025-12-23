@@ -5924,13 +5924,20 @@ class ZeMosaicQtMainWindow(QMainWindow):
             )
             return None
 
+        import_error: Exception | None = None
         try:
             from zemosaic_filter_gui_qt import launch_filter_interface_qt
-        except ImportError as exc:
+        except Exception as exc:
+            import_error = exc
+            try:
+                from .zemosaic_filter_gui_qt import launch_filter_interface_qt  # type: ignore[import-not-found]
+            except Exception as nested_exc:
+                import_error = nested_exc
+        if import_error is not None:
             QMessageBox.warning(
                 self,
                 self._tr("qt_error_filter_unavailable", "Qt filter interface is not available."),
-                str(exc),
+                str(import_error),
             )
             return None
 
