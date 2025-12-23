@@ -1,6 +1,6 @@
 # followup.md — Détails d’implémentation (patch chirurgical)
 
-## 1) Ajouter l’état & signaux (dans la classe du dialog)
+## [x] 1) Ajouter l’état & signaux (dans la classe du dialog)
 ### 1.1 Ajouter un signal stage
 À côté de :
 - `_async_log_signal = Signal(str, str)`
@@ -18,7 +18,7 @@ Initialiser :
 Connecter :
 - `self._auto_group_stage_signal.connect(self._handle_auto_group_stage_update)`
 
-## 2) Ajouter 3 petites méthodes utilitaires (no refactor)
+## [x] 2) Ajouter 3 petites méthodes utilitaires (no refactor)
 ### 2.1 `_start_auto_group_elapsed_timer(stage: str)`
 - Stocker `self._auto_group_started_at = time.perf_counter()`
 - Stocker `self._auto_group_stage_text = stage`
@@ -36,7 +36,7 @@ Connecter :
 - Mettre `self._auto_group_stage_text = stage`
 - Optionnel : forcer une mise à jour immédiate du status label (sans attendre 1s)
 
-## 3) Intégrer timer + stage dans le flux existant
+## [x] 3) Intégrer timer + stage dans le flux existant
 ### 3.1 Dans `_start_master_tile_organisation(...)`
 Juste après :
 - `self._auto_group_running = True`
@@ -56,7 +56,7 @@ Avant de quitter :
 Ajouter :
 - `self._stop_auto_group_elapsed_timer()` (en plus du hide overlay)
 
-## 4) Rendre le background thread “verbeux” et diagnostiquer la lenteur
+## [x] 4) Rendre le background thread “verbeux” et diagnostiquer la lenteur
 ### 4.1 Dans `_auto_group_background_task(...)`
 Ajouter des jalons **avant** les étapes lourdes, via signaux thread-safe :
 - `self._auto_group_stage_signal.emit("Clustering frames…")`
@@ -78,7 +78,7 @@ Option bonus (très utile) :
 - mesurer `t0 = perf_counter()` au début,
 - puis émettre `INFO: done in X.Ys` juste avant `_auto_group_finished_signal.emit(...)`.
 
-## 5) Corriger le cross-thread UI access (point critique)
+## [x] 5) Corriger le cross-thread UI access (point critique)
 ### 5.1 Dans `_compute_auto_groups(...)`
 Repérer la ligne :
 - `self._append_log(log_text)`
@@ -90,7 +90,7 @@ Repérer la ligne :
 
 Important : **ne plus appeler `_append_log`** depuis cette fonction (elle tourne dans le thread).
 
-## 6) Fiabiliser l’arrêt overlay (le “GIF infini”)
+## [x] 6) Fiabiliser l’arrêt overlay (le “GIF infini”)
 ### 6.1 Dans `_handle_auto_group_finished(...)`
 Actuel :
 - il fait des logs, puis `_apply_auto_group_result`, puis `_hide_processing_overlay()`
@@ -108,7 +108,7 @@ Dans `except` :
 - `self._append_log(f"Auto-group apply failed: {exc}", level="ERROR")`
 - `self._status_label.setText("Auto-organisation failed.")` (via localizer)
 
-## 7) Checklist de tests manuels (GUI)
+## [ ] 7) Checklist de tests manuels (GUI)
 1) Dataset petit : cliquer Auto-organize
    - overlay apparaît
    - status label devient “Preparing… (elapsed: Ns)”

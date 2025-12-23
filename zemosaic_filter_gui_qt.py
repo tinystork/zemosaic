@@ -1689,6 +1689,7 @@ class FilterQtDialog(QDialog):
 
     _async_log_signal = Signal(str, str)
     _auto_group_finished_signal = Signal(object, object)
+    _auto_group_stage_signal = Signal(str)
 
     def __init__(
         self,
@@ -1782,6 +1783,7 @@ class FilterQtDialog(QDialog):
         self._dialog_button_box: QDialogButtonBox | None = None
         self._async_log_signal.connect(self._append_log_from_signal)
         self._auto_group_finished_signal.connect(self._handle_auto_group_finished)
+        self._auto_group_stage_signal.connect(self._handle_auto_group_stage_update)
 
         if self._stream_scan:
             self._normalized_items = []
@@ -1842,6 +1844,9 @@ class FilterQtDialog(QDialog):
         self._solve_animation: QMovie | None = None
         self._auto_group_running = False
         self._auto_group_override_groups: list[list[dict[str, Any]]] | None = None
+        self._auto_group_stage_text = ""
+        self._auto_group_started_at: float | None = None
+        self._auto_group_elapsed_timer: QTimer | None = None
         self._header_cache: dict[str, Any] = {}
         self._global_wcs_state: dict[str, Any] = {
             "descriptor": None,
@@ -2550,6 +2555,9 @@ class FilterQtDialog(QDialog):
         self._status_label.setText(
             self._localizer.get("filter.cluster.running", "Preparing master-tile groups…")
         )
+        self._start_auto_group_elapsed_timer(
+            self._localizer.get("filter.cluster.running", "Preparing master-tile groups…")
+        )
 
         optimize_flag = normalized_mode == "auto"
         max_raw_snapshot = int(getattr(self, "_max_raw_per_tile_value", 0) or 0)
@@ -2576,6 +2584,7 @@ class FilterQtDialog(QDialog):
             self._show_processing_overlay()
         except Exception as exc:
             self._hide_processing_overlay()
+            self._stop_auto_group_elapsed_timer()
             self._auto_group_running = False
             self._set_group_buttons_enabled(True)
             message = self._localizer.get(
@@ -2598,6 +2607,49 @@ class FilterQtDialog(QDialog):
             except Exception:
                 pass
 
+    def _start_auto_group_elapsed_timer(self, stage: str) -> None:
+        self._auto_group_started_at = time.perf_counter()
+        self._auto_group_stage_text = stage
+        if self._auto_group_elapsed_timer is None:
+            timer = QTimer(self)
+            timer.setInterval(1000)
+            timer.timeout.connect(self._update_auto_group_elapsed_label)
+            self._auto_group_elapsed_timer = timer
+        if self._auto_group_elapsed_timer is not None and not self._auto_group_elapsed_timer.isActive():
+            self._auto_group_elapsed_timer.start()
+        self._update_auto_group_elapsed_label(force=True)
+
+    def _stop_auto_group_elapsed_timer(self) -> None:
+        self._auto_group_started_at = None
+        if self._auto_group_elapsed_timer is not None:
+            try:
+                self._auto_group_elapsed_timer.stop()
+            except Exception:
+                pass
+
+    def _update_auto_group_elapsed_label(self, *, force: bool = False) -> None:
+        if not getattr(self, "_auto_group_running", False):
+            self._stop_auto_group_elapsed_timer()
+            return
+        if self._auto_group_started_at is None:
+            if force:
+                self._status_label.setText(self._auto_group_stage_text)
+            return
+        elapsed = max(0, int(time.perf_counter() - self._auto_group_started_at))
+        stage_text = self._auto_group_stage_text or self._localizer.get(
+            "filter.cluster.running",
+            "Preparing master-tile groups…",
+        )
+        try:
+            self._status_label.setText(f"{stage_text} (elapsed: {elapsed}s)")
+        except Exception:
+            self._status_label.setText(stage_text)
+
+    @Slot(str)
+    def _handle_auto_group_stage_update(self, stage: str) -> None:
+        self._auto_group_stage_text = stage
+        self._update_auto_group_elapsed_label(force=True)
+
     def _handle_auto_group_empty_selection(self) -> None:
         self._auto_group_running = False
         self._group_outline_bounds = []
@@ -2606,6 +2658,7 @@ class FilterQtDialog(QDialog):
         self._append_log(summary_text)
         self._update_auto_group_summary_display(summary_text, summary_text)
         self._status_label.setText(summary_text)
+        self._stop_auto_group_elapsed_timer()
         self._set_group_buttons_enabled(True)
         self._hide_processing_overlay()
 
@@ -2624,7 +2677,10 @@ class FilterQtDialog(QDialog):
         normalized_mode = "manual" if str(mode).lower().startswith("manual") else "auto"
         messages: list[str | tuple[str, str]] = []
         result_payload: dict[str, Any] | None = None
+        start_time = time.perf_counter()
         try:
+            self._auto_group_stage_signal.emit("Clustering frames…")
+            self._async_log_signal.emit("Stage: clustering connected groups", "INFO")
             result_payload = self._compute_auto_groups(
                 selected_indices,
                 overcap_pct,
@@ -2632,9 +2688,13 @@ class FilterQtDialog(QDialog):
                 messages,
             )
             if isinstance(result_payload, dict):
+                self._auto_group_stage_signal.emit("Post-processing groups…")
+                self._async_log_signal.emit("Stage: post-processing clusters", "INFO")
                 result_payload["mode"] = normalized_mode
                 result_payload["auto_optimised"] = bool(optimize_flag)
                 if optimize_flag:
+                    self._auto_group_stage_signal.emit("Auto-optimiser…")
+                    self._async_log_signal.emit("Stage: running auto-optimiser", "INFO")
                     self._optimize_auto_group_result(
                         result_payload,
                         max_raw_cap=int(max_raw_cap),
@@ -2662,6 +2722,16 @@ class FilterQtDialog(QDialog):
                     N=groups_count,
                 )
             )
+        elapsed_total = time.perf_counter() - start_time
+        messages.append(
+            self._format_message(
+                "auto_group_total_time",
+                "Auto-group completed in {DT:.1f}s",
+                DT=elapsed_total,
+            )
+        )
+        self._auto_group_stage_signal.emit("Finalizing…")
+        self._async_log_signal.emit(f"Stage: finalize (elapsed {elapsed_total:.1f}s)", "INFO")
         self._auto_group_finished_signal.emit(result_payload, list(messages))
 
     @Slot(object, object)
@@ -2670,37 +2740,44 @@ class FilterQtDialog(QDialog):
         result_payload: object,
         messages_payload: object,
     ) -> None:
-        self._auto_group_running = False
-        self._set_group_buttons_enabled(True)
-        entries: list[Any] = []
-        if isinstance(messages_payload, list):
-            entries = list(messages_payload)
-        elif messages_payload:
-            entries = [messages_payload]
-        for entry in entries:
-            if isinstance(entry, tuple):
-                text = entry[0]
-                level = entry[1] if len(entry) > 1 else "INFO"
-                self._append_log(str(text), level=str(level))
-            else:
-                self._append_log(str(entry))
-        if not isinstance(result_payload, dict) or not result_payload:
-            if not entries:
-                fallback = self._localizer.get(
-                    "filter.cluster.failed_generic",
-                    "Unable to prepare master-tile groups.",
+        try:
+            entries: list[Any] = []
+            if isinstance(messages_payload, list):
+                entries = list(messages_payload)
+            elif messages_payload:
+                entries = [messages_payload]
+            for entry in entries:
+                if isinstance(entry, tuple):
+                    text = entry[0]
+                    level = entry[1] if len(entry) > 1 else "INFO"
+                    self._append_log(str(text), level=str(level))
+                else:
+                    self._append_log(str(entry))
+            if not isinstance(result_payload, dict) or not result_payload:
+                if not entries:
+                    fallback = self._localizer.get(
+                        "filter.cluster.failed_generic",
+                        "Unable to prepare master-tile groups.",
+                    )
+                    self._append_log(fallback, level="WARN")
+                self._status_label.setText(
+                    self._localizer.get(
+                        "filter.cluster.failed_short",
+                        "Auto-organisation failed.",
+                    )
                 )
-                self._append_log(fallback, level="WARN")
+                return
+            self._apply_auto_group_result(result_payload)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self._append_log(f"Auto-group apply failed: {exc}", level="ERROR")
             self._status_label.setText(
-                self._localizer.get(
-                    "filter.cluster.failed_short",
-                    "Auto-organisation failed.",
-                )
+                self._localizer.get("filter.cluster.failed_short", "Auto-organisation failed.")
             )
+        finally:
+            self._auto_group_running = False
+            self._set_group_buttons_enabled(True)
+            self._stop_auto_group_elapsed_timer()
             self._hide_processing_overlay()
-            return
-        self._apply_auto_group_result(result_payload)
-        self._hide_processing_overlay()
 
     def _coerce_eqmode_mode(self, raw_value: Any) -> tuple[str | None, int | None]:
         if raw_value is None:
@@ -3078,7 +3155,11 @@ class FilterQtDialog(QDialog):
                         count=len(sds_groups),
                         sizes=sizes,
                     )
-                    self._append_log(log_text)
+                    messages.append(log_text)
+                    try:
+                        self._async_log_signal.emit(log_text, "INFO")
+                    except Exception:
+                        pass
                     messages.append(
                         self._format_message(
                             "filter.cluster.sds_ready",
@@ -3362,6 +3443,11 @@ class FilterQtDialog(QDialog):
                     info.pop("wcs", None)
 
         if coverage_enabled and apply_borrowing_v1 is not None:
+            try:
+                self._auto_group_stage_signal.emit("Borrowing v1…")
+                self._async_log_signal.emit("Stage: borrowing coverage batches", "INFO")
+            except Exception:
+                pass
             final_groups, _borrow_stats = apply_borrowing_v1(
                 final_groups,
                 None,
