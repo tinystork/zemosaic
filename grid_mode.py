@@ -73,6 +73,11 @@ from zemosaic_utils import (
     write_final_fits_uint16_color_aware,
 )
 
+try:
+    from zemosaic_gpu_safety import probe_gpu_runtime_context  # type: ignore
+except Exception:  # pragma: no cover - optional safety layer
+    probe_gpu_runtime_context = None  # type: ignore
+
 try:  # Optional heavy deps – handled gracefully if missing
     from astropy.io import fits
     from astropy.wcs import WCS
@@ -3780,6 +3785,41 @@ def _get_effective_grid_workers(
 def _compute_gpu_concurrency(stack_chunk_budget_mb: float) -> tuple[int, dict[str, float] | None]:
     """Return (concurrency, details) for GPU stacking based on current VRAM."""
 
+    ctx = None
+    safe_mode = False
+    vendor = None
+    hybrid = None
+    battery = None
+    chunk_budget_mb = float(stack_chunk_budget_mb)
+    if callable(probe_gpu_runtime_context):
+        try:
+            ctx = probe_gpu_runtime_context()
+            safe_mode = bool(getattr(ctx, "safe_mode", False))
+            vendor = getattr(ctx, "gpu_vendor", None)
+            hybrid = getattr(ctx, "is_hybrid_graphics", None)
+            battery = getattr(ctx, "has_battery", None)
+            if safe_mode:
+                chunk_budget_mb = chunk_budget_mb * 0.6
+        except Exception:
+            ctx = None
+
+    if safe_mode:
+        try:
+            _emit(
+                f"[GPU_SAFETY][GRID] safe_mode=1 vendor={vendor} hybrid={hybrid} battery={battery} "
+                f"-> chosen_concurrency=1 budget_mb={float(chunk_budget_mb):.1f}",
+                lvl="INFO",
+            )
+        except Exception:
+            pass
+        return 1, {
+            "reason": "safe_mode",
+            "vendor": vendor,
+            "hybrid": hybrid,
+            "battery": battery,
+            "stack_chunk_budget_mb": float(chunk_budget_mb),
+        }
+
     env_override = os.environ.get("ZEMOSAIC_GRID_GPU_CONCURRENCY", "").strip()
     if env_override:
         try:
@@ -3802,7 +3842,7 @@ def _compute_gpu_concurrency(stack_chunk_budget_mb: float) -> tuple[int, dict[st
         total_mb = float(total_bytes) / (1024.0 ** 2)
         safety_mult = 2.5
         fixed_overhead_mb = 512.0
-        per_worker_mb = max(1.0, float(stack_chunk_budget_mb) * safety_mult + fixed_overhead_mb)
+        per_worker_mb = max(1.0, float(chunk_budget_mb) * safety_mult + fixed_overhead_mb)
         usable_mb = max(0.0, free_mb * 0.80)
         auto_n = math.floor(usable_mb / per_worker_mb) if per_worker_mb > 0 else 1
         concurrency = int(max(1, min(auto_n, 4)))
@@ -3812,6 +3852,7 @@ def _compute_gpu_concurrency(stack_chunk_budget_mb: float) -> tuple[int, dict[st
             "per_worker_mb": per_worker_mb,
             "usable_mb": usable_mb,
             "auto_n": float(auto_n),
+            "stack_chunk_budget_mb": float(chunk_budget_mb),
         }
         return concurrency, details
     except Exception:

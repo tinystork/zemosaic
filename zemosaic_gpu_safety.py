@@ -1,0 +1,359 @@
+"""
+Lightweight GPU safety heuristics for ZeMosaic.
+
+This module centralizes best-effort probes about the GPU/OS environment and
+applies conservative clamps to parallel plans on risky systems (e.g. Windows
+laptops with hybrid graphics). All optional dependencies are guarded so the
+module can be imported on machines without psutil/WMI/CuPy.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import platform
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+try:  # pragma: no cover - optional dependency
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - psutil may be missing
+    psutil = None
+
+try:  # pragma: no cover - optional dependency, Windows-only
+    import wmi  # type: ignore
+except Exception:  # pragma: no cover - wmi absent on most platforms
+    wmi = None
+
+try:
+    from parallel_utils import ParallelCapabilities, ParallelPlan, detect_parallel_capabilities  # type: ignore
+except Exception:  # pragma: no cover - keep imports optional
+    ParallelCapabilities = Any  # type: ignore
+    ParallelPlan = Any  # type: ignore
+
+    def detect_parallel_capabilities() -> Any:  # type: ignore
+        return None
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class GpuRuntimeContext:
+    os_name: str
+    platform_system: str
+    gpu_available: bool
+    gpu_name: str | None
+    gpu_vendor: str
+    vram_total_bytes: int | None
+    vram_free_bytes: int | None
+    has_battery: bool | None
+    is_windows: bool
+    is_hybrid_graphics: bool | None
+    safe_mode: bool
+    reasons: list[str] = field(default_factory=list)
+
+
+def _detect_vendor(name: str | None) -> str:
+    if not name:
+        return "unknown"
+    lowered = name.lower()
+    if "nvidia" in lowered or "geforce" in lowered or "quadro" in lowered or "rtx" in lowered:
+        return "nvidia"
+    if "intel" in lowered:
+        return "intel"
+    if "amd" in lowered or "radeon" in lowered or "advanced micro devices" in lowered:
+        return "amd"
+    if "apple" in lowered:
+        return "apple"
+    return "unknown"
+
+
+def _probe_battery() -> bool | None:
+    """Return True if a battery is present, False if explicitly absent, None if unknown."""
+
+    if psutil is not None:
+        try:
+            info = psutil.sensors_battery()
+            if info is not None:
+                return True
+        except Exception:
+            pass
+    if wmi is not None and platform.system().lower().startswith("windows"):
+        try:
+            conn = wmi.WMI()  # type: ignore
+            batteries = conn.Win32_Battery()  # type: ignore[attr-defined]
+            if batteries is not None:
+                return len(batteries) > 0
+        except Exception:
+            pass
+    return None
+
+
+def _probe_hybrid_graphics() -> bool | None:
+    """Best-effort Windows hybrid graphics detection via WMI."""
+
+    if wmi is None or not platform.system().lower().startswith("windows"):
+        return None
+    try:
+        conn = wmi.WMI()  # type: ignore
+        controllers = conn.Win32_VideoController()  # type: ignore[attr-defined]
+        names = [getattr(ctrl, "Name", None) for ctrl in controllers or []]
+        lowered = [str(n).lower() for n in names if n]
+        has_intel = any("intel" in n for n in lowered)
+        has_nvidia = any(("nvidia" in n) or ("geforce" in n) or ("quadro" in n) for n in lowered)
+        has_amd = any(("amd" in n) or ("radeon" in n) for n in lowered)
+        if has_intel and (has_nvidia or has_amd):
+            return True
+        if len(lowered) >= 2:
+            return True
+        if lowered:
+            return False
+    except Exception:
+        return None
+    return None
+
+
+def probe_gpu_runtime_context(
+    *,
+    preferred_gpu_id: int | None = None,
+    caps: ParallelCapabilities | None = None,
+) -> GpuRuntimeContext:
+    """
+    Gather a runtime GPU safety context with minimal dependencies.
+
+    ``preferred_gpu_id`` is informational only; it can be used in the future to
+    bias per-GPU queries. Today it just flows through the API for completeness.
+    """
+
+    del preferred_gpu_id  # reserved for future selection hints
+    platform_system = platform.system() or ""
+    os_name = platform_system.lower()
+    is_windows = os_name.startswith("windows")
+
+    capabilities = caps
+    if capabilities is None:
+        try:
+            capabilities = detect_parallel_capabilities()
+        except Exception:
+            capabilities = None
+
+    gpu_name = getattr(capabilities, "gpu_name", None) if capabilities is not None else None
+    vram_total = getattr(capabilities, "gpu_vram_total_bytes", None) if capabilities is not None else None
+    vram_free = getattr(capabilities, "gpu_vram_free_bytes", None) if capabilities is not None else None
+    gpu_available = bool(getattr(capabilities, "gpu_available", False)) if capabilities is not None else False
+
+    vendor = _detect_vendor(gpu_name)
+    has_battery = _probe_battery()
+    is_hybrid = _probe_hybrid_graphics()
+
+    reasons: list[str] = []
+    safe_mode = False
+    if is_windows and has_battery is True:
+        safe_mode = True
+        reasons.append("battery_detected")
+    if is_windows and is_hybrid is True:
+        safe_mode = True
+        reasons.append("hybrid_graphics")
+    if vendor == "intel" and (is_hybrid is False or is_hybrid is None):
+        reasons.append("intel_only_gpu")
+    if vendor == "unknown" and gpu_available:
+        reasons.append("unknown_gpu_vendor")
+
+    ctx = GpuRuntimeContext(
+        os_name=os_name,
+        platform_system=platform_system,
+        gpu_available=gpu_available,
+        gpu_name=gpu_name,
+        gpu_vendor=vendor,
+        vram_total_bytes=vram_total,
+        vram_free_bytes=vram_free,
+        has_battery=has_battery,
+        is_windows=is_windows,
+        is_hybrid_graphics=is_hybrid,
+        safe_mode=safe_mode,
+        reasons=reasons,
+    )
+    return ctx
+
+
+def _clamp_gpu_chunks(plan: ParallelPlan, ctx: GpuRuntimeContext) -> bool:
+    """Clamp GPU chunk sizing when in safe mode."""
+
+    try:
+        use_gpu = bool(getattr(plan, "use_gpu", False))
+    except Exception:
+        use_gpu = False
+    if not use_gpu or not ctx.safe_mode:
+        return False
+
+    cap_bytes = 256 * 1024 * 1024  # 256 MB default ceiling in safe mode
+    if ctx.vram_total_bytes:
+        try:
+            cap_bytes = min(cap_bytes, int(ctx.vram_total_bytes * 0.6))
+        except Exception:
+            pass
+    if ctx.vram_free_bytes:
+        try:
+            cap_bytes = min(cap_bytes, int(ctx.vram_free_bytes * 0.8))
+        except Exception:
+            pass
+    cap_bytes = max(cap_bytes, 32 * 1024 * 1024)
+
+    try:
+        current_bytes = getattr(plan, "gpu_max_chunk_bytes", None)
+    except Exception:
+        current_bytes = None
+    if current_bytes is None or current_bytes <= 0:
+        new_chunk_bytes = cap_bytes
+    else:
+        try:
+            new_chunk_bytes = int(min(current_bytes, cap_bytes))
+        except Exception:
+            new_chunk_bytes = cap_bytes
+    new_chunk_bytes = max(new_chunk_bytes, 32 * 1024 * 1024)
+
+    try:
+        setattr(plan, "gpu_max_chunk_bytes", new_chunk_bytes)
+    except Exception:
+        pass
+
+    try:
+        rows = getattr(plan, "gpu_rows_per_chunk", None)
+    except Exception:
+        rows = None
+    if rows is None or rows <= 0:
+        rows = 128
+    try:
+        rows = int(rows)
+    except Exception:
+        rows = 128
+    rows = max(32, min(128, rows))
+    try:
+        setattr(plan, "gpu_rows_per_chunk", rows)
+    except Exception:
+        pass
+
+    return True
+
+def apply_gpu_safety_to_parallel_plan(
+    plan: ParallelPlan | None,
+    caps: ParallelCapabilities | None,
+    config: Mapping[str, Any] | None,
+    *,
+    operation: str,
+    logger: logging.Logger | None = None,
+) -> tuple[ParallelPlan | None, GpuRuntimeContext]:
+    """Return a (possibly) clamped plan plus the runtime context."""
+
+    _ = config  # Reserved for future per-config overrides
+    log = logger or LOGGER
+    ctx = probe_gpu_runtime_context(caps=caps)
+    reasons = list(ctx.reasons)
+
+    if plan is None:
+        summary = (
+            "[GPU_SAFETY] operation=%s safe_mode=%d vendor=%s hybrid=%s battery=%s plan=None reasons=%s"
+            % (
+                operation,
+                1 if ctx.safe_mode else 0,
+                ctx.gpu_vendor,
+                ctx.is_hybrid_graphics,
+                ctx.has_battery,
+                ",".join(reasons),
+            )
+        )
+        try:
+            log.info(summary)
+        except Exception:
+            pass
+        return None, ctx
+
+    disable_gpu = False
+    if ctx.gpu_vendor == "intel" and not ctx.is_hybrid_graphics:
+        disable_gpu = True
+        reasons.append("disable_intel_only_gpu")
+    if not ctx.gpu_available:
+        disable_gpu = True
+        reasons.append("gpu_unavailable")
+
+    if disable_gpu:
+        try:
+            setattr(plan, "use_gpu", False)
+        except Exception:
+            pass
+
+    clamped = _clamp_gpu_chunks(plan, ctx)
+    if clamped:
+        reasons.append("safe_mode_clamp")
+
+    ctx.reasons = list(dict.fromkeys(reasons))
+    summary = (
+        "[GPU_SAFETY] operation=%s safe_mode=%d vendor=%s hybrid=%s battery=%s "
+        "plan_gpu=%d gpu_rows=%s gpu_chunk_mb=%.1f reasons=%s"
+    ) % (
+        operation,
+        1 if ctx.safe_mode else 0,
+        ctx.gpu_vendor,
+        ctx.is_hybrid_graphics,
+        ctx.has_battery,
+        1 if getattr(plan, "use_gpu", False) else 0,
+        getattr(plan, "gpu_rows_per_chunk", None),
+        float(getattr(plan, "gpu_max_chunk_bytes", 0) or 0) / (1024.0 ** 2),
+        ",".join(ctx.reasons),
+    )
+    try:
+        log.info(summary)
+    except Exception:
+        pass
+    return plan, ctx
+
+
+def apply_gpu_safety_to_phase5_flag(
+    use_gpu_phase5_flag: bool,
+    ctx: GpuRuntimeContext,
+    *,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Determine whether Phase 5 GPU should remain enabled under safety rules."""
+
+    log = logger or LOGGER
+    effective = bool(use_gpu_phase5_flag)
+    reason = None
+
+    intel_only = ctx.gpu_vendor == "intel" and not ctx.is_hybrid_graphics
+    vram_unknown = ctx.vram_total_bytes is None and ctx.vram_free_bytes is None
+
+    if intel_only:
+        effective = False
+        reason = "intel_only"
+    elif ctx.safe_mode and (ctx.gpu_vendor == "unknown" or vram_unknown):
+        effective = False
+        reason = "safe_mode_unknown_gpu"
+
+    if reason:
+        try:
+            log.info("[GPU_SAFETY] phase5_gpu=%d reason=%s", 1 if effective else 0, reason)
+        except Exception:
+            pass
+    return effective
+
+
+def get_env_safe_mode_flag(ctx: GpuRuntimeContext) -> bool:
+    """Set an opt-in environment flag when safe mode is active."""
+
+    if ctx.safe_mode:
+        try:
+            os.environ["ZEMOSAIC_GPU_SAFE_MODE"] = "1"
+            return True
+        except Exception:
+            return False
+    return False
+
+
+__all__ = [
+    "GpuRuntimeContext",
+    "apply_gpu_safety_to_parallel_plan",
+    "apply_gpu_safety_to_phase5_flag",
+    "get_env_safe_mode_flag",
+    "probe_gpu_runtime_context",
+]

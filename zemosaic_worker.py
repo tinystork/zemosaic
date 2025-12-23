@@ -130,6 +130,14 @@ except Exception:
 
     PARALLEL_HELPERS_AVAILABLE = False
 
+from zemosaic_gpu_safety import (
+    GpuRuntimeContext,
+    apply_gpu_safety_to_parallel_plan,
+    apply_gpu_safety_to_phase5_flag,
+    get_env_safe_mode_flag,
+    probe_gpu_runtime_context,
+)
+
 # ZeQualityMT (quality gate for Master Tiles)
 try:
     from zequalityMT import quality_metrics as _zq_quality_metrics
@@ -7886,6 +7894,23 @@ def _run_shared_phase45_phase5_pipeline(
     gain_clip_tuple = phase5_options.get("two_pass_gain_clip")
     two_pass_coverage_renorm_config = bool(phase5_options.get("two_pass_coverage_renorm"))
     use_gpu_phase5_flag = bool(phase5_options.get("use_gpu_phase5"))
+    gpu_safety_ctx_phase5 = phase5_options.get("gpu_safety_ctx")
+    if gpu_safety_ctx_phase5 is None:
+        try:
+            gpu_safety_ctx_phase5 = probe_gpu_runtime_context()
+        except Exception:
+            gpu_safety_ctx_phase5 = None
+    if gpu_safety_ctx_phase5 is not None:
+        try:
+            use_gpu_phase5_flag = apply_gpu_safety_to_phase5_flag(
+                use_gpu_phase5_flag, gpu_safety_ctx_phase5, logger=logger
+            )
+        except Exception:
+            pass
+        try:
+            get_env_safe_mode_flag(gpu_safety_ctx_phase5)
+        except Exception:
+            pass
     assembly_process_workers_config = int(phase5_options.get("assembly_process_workers") or 0)
     intertile_preview_size_config = phase5_options.get("intertile_preview_size") or 512
     intertile_overlap_min_config = phase5_options.get("intertile_overlap_min") or 0.05
@@ -8130,6 +8155,24 @@ def _run_shared_phase45_phase5_pipeline(
                     config=worker_config_cache,
                     caps=caps_for_phase5,
                 )
+                parallel_plan_phase5, gpu_safety_ctx_phase5 = apply_gpu_safety_to_parallel_plan(
+                    parallel_plan_phase5,
+                    caps_for_phase5,
+                    worker_config_cache,
+                    operation="global_reproject",
+                    logger=logger,
+                )
+                if gpu_safety_ctx_phase5 is not None:
+                    try:
+                        use_gpu_phase5_flag = apply_gpu_safety_to_phase5_flag(
+                            use_gpu_phase5_flag, gpu_safety_ctx_phase5, logger=logger
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        get_env_safe_mode_flag(gpu_safety_ctx_phase5)
+                    except Exception:
+                        pass
                 worker_config_cache["parallel_plan_phase5"] = parallel_plan_phase5
                 try:
                     setattr(zconfig, "parallel_plan_phase5", parallel_plan_phase5)
@@ -8146,6 +8189,32 @@ def _run_shared_phase45_phase5_pipeline(
             effective_use_gpu = bool(plan_gpu_allowed)
             if not effective_use_gpu and use_gpu_phase5_flag:
                 logger.info("[Phase5] GPU disabled by auto-tune (plan.use_gpu=False)")
+        try:
+            vram_free_mb = None
+            if gpu_safety_ctx_phase5 is not None and gpu_safety_ctx_phase5.vram_free_bytes is not None:
+                vram_free_mb = float(gpu_safety_ctx_phase5.vram_free_bytes) / (1024.0 ** 2)
+            reasons_str = ",".join(getattr(gpu_safety_ctx_phase5, "reasons", []) or [])
+            logger.info(
+                "[GPU_SAFETY] safe_mode=%d vendor=%s hybrid=%s battery=%s vram_free_mb=%s "
+                "-> phase5_gpu=%d plan.use_gpu=%d gpu_max_chunk_mb=%.1f gpu_rows=%s reason=\"%s\"",
+                1 if gpu_safety_ctx_phase5 and gpu_safety_ctx_phase5.safe_mode else 0,
+                getattr(gpu_safety_ctx_phase5, "gpu_vendor", "unknown") if gpu_safety_ctx_phase5 else "unknown",
+                getattr(gpu_safety_ctx_phase5, "is_hybrid_graphics", None) if gpu_safety_ctx_phase5 else None,
+                getattr(gpu_safety_ctx_phase5, "has_battery", None) if gpu_safety_ctx_phase5 else None,
+                f"{vram_free_mb:.1f}" if vram_free_mb is not None else "n/a",
+                1 if use_gpu_phase5_flag else 0,
+                1 if plan_gpu_allowed else 0,
+                float(getattr(parallel_plan_phase5, "gpu_max_chunk_bytes", 0) or 0) / (1024.0 ** 2),
+                getattr(parallel_plan_phase5, "gpu_rows_per_chunk", None),
+                reasons_str,
+            )
+            for handler in logger.handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         try:
             if effective_use_gpu:
@@ -15980,6 +16049,9 @@ def run_hierarchical_mosaic_classic_legacy(
     except Exception:
         zconfig = SimpleNamespace()
 
+    gpu_safety_ctx_global: GpuRuntimeContext | None = None
+    gpu_safety_ctx_phase5: GpuRuntimeContext | None = None
+
     final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(
         final_mosaic_black_point_equalize_enabled
     )
@@ -16349,7 +16421,6 @@ def run_hierarchical_mosaic_classic_legacy(
 
     DEFAULT_PHASE_WORKER_RATIO = 1.0
     ALIGNMENT_PHASE_WORKER_RATIO = 1.0  # Phase 3 targets ~90% of logical cores while keeping one free
-
     if use_gpu_phase5 and gpu_id_phase5 is not None and CUPY_AVAILABLE:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id_phase5)
@@ -16368,6 +16439,11 @@ def run_hierarchical_mosaic_classic_legacy(
         for v in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
             os.environ.pop(v, None)
 
+    try:
+        gpu_safety_ctx_phase5 = probe_gpu_runtime_context(preferred_gpu_id=gpu_id_phase5)
+    except Exception:
+        gpu_safety_ctx_phase5 = None
+
     # Determine final GPU usage flag only if a valid NVIDIA GPU is selected
     use_gpu_phase5_flag = (
         use_gpu_phase5
@@ -16375,6 +16451,17 @@ def run_hierarchical_mosaic_classic_legacy(
         and CUPY_AVAILABLE
         and gpu_is_available()
     )
+    if gpu_safety_ctx_phase5 is not None:
+        try:
+            use_gpu_phase5_flag = apply_gpu_safety_to_phase5_flag(
+                use_gpu_phase5_flag, gpu_safety_ctx_phase5, logger=logger
+            )
+        except Exception:
+            pass
+        try:
+            get_env_safe_mode_flag(gpu_safety_ctx_phase5)
+        except Exception:
+            pass
     if use_gpu_phase5_flag and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
         try:
             # Initialize CuPy memory pools on the selected device (index 0 under the mask)
@@ -16691,6 +16778,13 @@ def run_hierarchical_mosaic_classic_legacy(
                     bytes_per_pixel=4,
                     config=worker_config_cache,
                     caps=parallel_caps,
+                )
+                global_parallel_plan, gpu_safety_ctx_global = apply_gpu_safety_to_parallel_plan(
+                    global_parallel_plan,
+                    parallel_caps,
+                    worker_config_cache,
+                    operation="global",
+                    logger=logger,
                 )
                 worker_config_cache["parallel_plan"] = global_parallel_plan
                 setattr(zconfig, "parallel_plan", global_parallel_plan)
@@ -18034,6 +18128,7 @@ def run_hierarchical_mosaic_classic_legacy(
             "global_anchor_shift": global_anchor_shift,
             "parallel_plan": current_parallel_plan,
             "parallel_capabilities": caps_candidate,
+            "gpu_safety_ctx": gpu_safety_ctx_phase5,
             "telemetry": telemetry,
             "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,
@@ -19920,6 +20015,9 @@ def run_hierarchical_mosaic(
     except Exception:
         zconfig = SimpleNamespace()
 
+    gpu_safety_ctx_global: GpuRuntimeContext | None = None
+    gpu_safety_ctx_phase5: GpuRuntimeContext | None = None
+
     def _coerce_bool_flag(value) -> bool | None:
         """Interpret various truthy/falsy representations coming from configs/UI."""
 
@@ -20520,7 +20618,6 @@ def run_hierarchical_mosaic(
 
     DEFAULT_PHASE_WORKER_RATIO = 1.0
     ALIGNMENT_PHASE_WORKER_RATIO = 1.0  # Phase 3 targets ~90% of logical cores while keeping one free
-
     if use_gpu_phase5 and gpu_id_phase5 is not None and CUPY_AVAILABLE:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id_phase5)
@@ -20539,6 +20636,11 @@ def run_hierarchical_mosaic(
         for v in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
             os.environ.pop(v, None)
 
+    try:
+        gpu_safety_ctx_phase5 = probe_gpu_runtime_context(preferred_gpu_id=gpu_id_phase5)
+    except Exception:
+        gpu_safety_ctx_phase5 = None
+
     # Determine final GPU usage flag only if a valid NVIDIA GPU is selected
     use_gpu_phase5_flag = (
         use_gpu_phase5
@@ -20546,6 +20648,17 @@ def run_hierarchical_mosaic(
         and CUPY_AVAILABLE
         and gpu_is_available()
     )
+    if gpu_safety_ctx_phase5 is not None:
+        try:
+            use_gpu_phase5_flag = apply_gpu_safety_to_phase5_flag(
+                use_gpu_phase5_flag, gpu_safety_ctx_phase5, logger=logger
+            )
+        except Exception:
+            pass
+        try:
+            get_env_safe_mode_flag(gpu_safety_ctx_phase5)
+        except Exception:
+            pass
     if use_gpu_phase5_flag and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
         try:
             # Initialize CuPy memory pools on the selected device (index 0 under the mask)
@@ -20761,6 +20874,13 @@ def run_hierarchical_mosaic(
                 bytes_per_pixel=4,
                 config=worker_config_cache,
                 caps=parallel_caps,
+            )
+            global_parallel_plan, gpu_safety_ctx_global = apply_gpu_safety_to_parallel_plan(
+                global_parallel_plan,
+                parallel_caps,
+                worker_config_cache,
+                operation="global",
+                logger=logger,
             )
             worker_config_cache["parallel_plan"] = global_parallel_plan
             setattr(zconfig, "parallel_plan", global_parallel_plan)
@@ -22127,6 +22247,7 @@ def run_hierarchical_mosaic(
             "global_anchor_shift": global_anchor_shift,
             "parallel_plan": current_parallel_plan,
             "parallel_capabilities": caps_candidate,
+            "gpu_safety_ctx": gpu_safety_ctx_phase5,
             "telemetry": telemetry,
             "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,

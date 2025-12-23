@@ -51,6 +51,8 @@ except Exception:  # pragma: no cover - radial weighting optional
 DEFAULT_GPU_MAX_CHUNK_BYTES = 512 * 1024 * 1024  # 512 MB
 DEFAULT_GPU_ROWS_PER_CHUNK = 256
 MIN_GPU_ROWS_PER_CHUNK = 32
+SAFE_MODE_ROWS_CAP = 128
+SAFE_MODE_CHUNK_TIMEOUT_SEC = 3.0
 
 _GPU_HEALTH_CHECKED = False
 _GPU_HEALTHY = False
@@ -58,6 +60,12 @@ _GPU_HEALTHY = False
 
 class GPUStackingError(RuntimeError):
     """Raised when GPU-based stacking is unavailable or fails."""
+
+
+def _gpu_safe_mode_enabled() -> bool:
+    """Return True if the worker requested GPU safe mode via environment."""
+
+    return os.environ.get("ZEMOSAIC_GPU_SAFE_MODE", "").strip() == "1"
 
 
 def _gpu_is_usable(logger: logging.Logger | None = None) -> bool:
@@ -130,6 +138,8 @@ def _resolve_rows_per_chunk(
     if rows <= 0:
         rows = DEFAULT_GPU_ROWS_PER_CHUNK
     rows = max(MIN_GPU_ROWS_PER_CHUNK, rows)
+    if _gpu_safe_mode_enabled():
+        rows = min(rows, SAFE_MODE_ROWS_CAP)
     return min(height, rows)
 
 
@@ -613,6 +623,7 @@ def gpu_stack_from_arrays(
 
     height, width, channels = frames_for_stack[0].shape
     drop_channel = bool(expanded_channels and channels == 1)
+    gpu_safe_mode = _gpu_safe_mode_enabled()
 
     rows_per_chunk = _resolve_rows_per_chunk(height, width, channels, len(frames_for_stack), parallel_plan)
     rows_per_chunk = max(1, rows_per_chunk)
@@ -635,6 +646,7 @@ def gpu_stack_from_arrays(
             pass
 
     for row_start in range(0, height, rows_per_chunk):
+        chunk_start_time = time.perf_counter() if gpu_safe_mode else None
         row_end = min(height, row_start + rows_per_chunk)
         chunk_cpu = np.stack(
             [frame[row_start:row_end, :, :] for frame in frames_for_stack],
@@ -653,6 +665,17 @@ def gpu_stack_from_arrays(
             raise GPUStackingError("linear_fit_clip is not implemented for GPU stacking yet")
         chunk_result = _combine_weighted_chunk(data_gpu, weights_chunk_gpu, combine_method)
         stacked[row_start:row_end] = cp.asnumpy(chunk_result)
+        if gpu_safe_mode:
+            try:
+                cp.cuda.Stream.null.synchronize()
+            except Exception:
+                pass
+            if chunk_start_time is not None:
+                duration_chunk = time.perf_counter() - chunk_start_time
+                if duration_chunk > SAFE_MODE_CHUNK_TIMEOUT_SEC:
+                    raise GPUStackingError(
+                        f"GPU chunk exceeded safe timeout ({duration_chunk:.2f}s > {SAFE_MODE_CHUNK_TIMEOUT_SEC:.2f}s)"
+                    )
 
     duration = time.perf_counter() - start_time
     if pcb_tile:

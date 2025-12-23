@@ -26,13 +26,13 @@ so GPU usage becomes auto-adaptive and conservative on risky systems.
 - zemosaic_gui_qt.py: GPU selector stores gpu_selector and gpu_id_phase5 (do not change GUI unless absolutely needed)
 
 ## Deliverables
-1) Add ONE new module: zemosaic_gpu_safety.py (or gpu_safety.py if you prefer, but keep imports stable).
-2) Minimal integration changes in:
-   - parallel_utils.py (optional, if you integrate policy inside auto_tune_parallel_plan)
-   - zemosaic_worker.py (required)
-   - grid_mode.py (required)
-   - zemosaic_align_stack_gpu.py (recommended for “short-kernel” guardrails)
-3) Logging/observability: decisions must be logged via existing logger + progress_callback + telemetry context.
+- [x] Add ONE new module: zemosaic_gpu_safety.py (or gpu_safety.py if you prefer, but keep imports stable).
+- [x] Minimal integration changes in:
+  - [ ] parallel_utils.py (optional, if you integrate policy inside auto_tune_parallel_plan)
+  - [x] zemosaic_worker.py (required)
+  - [x] grid_mode.py (required)
+  - [x] zemosaic_align_stack_gpu.py (recommended for “short-kernel” guardrails)
+- [x] Logging/observability: decisions must be logged via existing logger + progress_callback + telemetry context.
 
 ## Constraints (STRICT)
 - Do NOT change scientific algorithms/results (only resource usage strategy).
@@ -45,7 +45,7 @@ so GPU usage becomes auto-adaptive and conservative on risky systems.
 
 # Implementation details
 
-## 1) Create zemosaic_gpu_safety.py
+## 1) Create zemosaic_gpu_safety.py [x]
 Implement a small, dependency-safe policy layer with best-effort probing (all guarded by try/except).
 
 Suggested API:
@@ -100,7 +100,7 @@ Also expose:
 - get_env_safe_mode_flag(ctx) -> bool
   - If safe_mode, set os.environ["ZEMOSAIC_GPU_SAFE_MODE"]="1" (debug-only internal env, not user-facing)
 
-## 2) Integrate in zemosaic_worker.py (REQUIRED)
+## 2) Integrate in zemosaic_worker.py (REQUIRED) [x]
 Goal: ensure BOTH global plan and phase5 plan go through the safety layer, and Phase 5 GPU flag is guarded.
 
 Integration points:
@@ -120,7 +120,7 @@ Integration points:
     "[GPU_SAFETY] safe_mode={0/1} vendor=... hybrid=... battery=... vram_free_mb=... -> phase5_gpu={0/1}, plan.use_gpu={0/1}, gpu_max_chunk_mb=..."
   - Flush logger handlers after this summary (best-effort) to survive OS-level crashes.
 
-## 3) Integrate in grid_mode.py (REQUIRED)
+## 3) Integrate in grid_mode.py (REQUIRED) [x]
 grid_mode currently computes GPU concurrency via _compute_gpu_concurrency(stack_chunk_budget_mb).
 
 Change minimally:
@@ -128,12 +128,12 @@ Change minimally:
 - If ctx.safe_mode:
   - force concurrency=1
   - optionally reduce stack_chunk_budget_mb effective value in concurrency calc (e.g. multiply by 0.6)
-- Log one line:
-  "[GPU_SAFETY][GRID] safe_mode=... -> chosen_concurrency=..."
+  - Log one line:
+    "[GPU_SAFETY][GRID] safe_mode=... -> chosen_concurrency=..."
 
 Do NOT refactor the whole grid_mode pipeline.
 
-## 4) Hardening in zemosaic_align_stack_gpu.py (RECOMMENDED)
+## 4) Hardening in zemosaic_align_stack_gpu.py (RECOMMENDED) [x]
 Without changing results:
 - When ZEMOSAIC_GPU_SAFE_MODE=1:
   - cap rows_per_chunk to a smaller value (e.g. min(current, 64 or 128))
@@ -154,4 +154,3 @@ This does not change math; it only reduces risk of long kernels / driver watchdo
 - python -m py_compile zemosaic_gpu_safety.py parallel_utils.py zemosaic_worker.py grid_mode.py zemosaic_align_stack_gpu.py
 - Run a CPU-only config (gpu_selector = CPU) to ensure no regressions.
 - Run GPU-enabled config on a safe machine; confirm plan.use_gpu still True when not in safe_mode.
-
