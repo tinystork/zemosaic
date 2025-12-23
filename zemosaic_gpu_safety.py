@@ -53,9 +53,16 @@ class GpuRuntimeContext:
     reasons: list[str] = field(default_factory=list)
 
 
-def _detect_vendor(name: str | None) -> str:
+def _detect_vendor(name: str | bytes | None) -> str:
     if not name:
         return "unknown"
+    
+    if isinstance(name, bytes):
+        try:
+            name = name.decode("utf-8")
+        except UnicodeDecodeError:
+            return "unknown"
+
     lowered = name.lower()
     if "nvidia" in lowered or "geforce" in lowered or "quadro" in lowered or "rtx" in lowered:
         return "nvidia"
