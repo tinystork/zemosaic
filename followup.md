@@ -1,72 +1,108 @@
-# Follow-up: Implémentation (Windows power status) + ajustement safe_mode/reasons
+# Follow-up: Détails implémentation (no refactor) + validation
 
-## [x] 1) Implémenter un probe Windows fiable (ctypes)
-Dans `zemosaic_gpu_safety.py`, ajouter (Windows only) un helper:
+## A) zemosaic_gpu_safety.py — corriger la condition batterie (chirurgical)
 
-- importer localement `ctypes` et `ctypes.wintypes` dans la fonction (pour éviter impact cross-platform).
-- définir la struct SYSTEM_POWER_STATUS:
-  - BYTE ACLineStatus
-  - BYTE BatteryFlag
-  - BYTE BatteryLifePercent
-  - BYTE SystemStatusFlag
-  - DWORD BatteryLifeTime
-  - DWORD BatteryFullLifeTime
+### A1) Probe Windows: on_battery / power_plugged
+- Si ce n'est pas déjà fait: utiliser GetSystemPowerStatus (ctypes) pour obtenir ACLineStatus.
+- Interprétation:
+  - ACLineStatus==0 -> on_battery=True
+  - ACLineStatus==1 -> power_plugged=True
+  - 255 -> unknown (fallback psutil/WMI)
 
-- appeler `kernel32.GetSystemPowerStatus(byref(status))`
-
-Interprétation:
-- ACLineStatus:
-  - 0 = sur batterie
-  - 1 = sur secteur
-  - 255 = unknown (dans ce cas fallback)
-- on_battery = (ACLineStatus == 0)
-- power_plugged = (ACLineStatus == 1)
-- battery_present (optionnel) :
-  - BatteryFlag == 128 => "No system battery" (donc has_battery=False)
-  - sinon has_battery=True (si BatteryFlag != 255 unknown)
-
-Retourner ces infos au format (has_battery, power_plugged, on_battery) quand fiable, sinon None pour fallback.
-
-## [x] 2) Modifier _probe_battery_status()
-Ordre de priorité recommandé:
-1) Windows + ctypes GetSystemPowerStatus (si ACLineStatus != 255)
-2) psutil.sensors_battery()
-3) WMI Win32_Battery() (déduire seulement has_battery)
-
+### A2) battery_present vs on_battery
+- battery_present = "une batterie existe" (pc portable)
+- on_battery = "ACLineStatus==0"
 Important:
-- Ne pas écraser une info déjà fiable par une info moins fiable.
-- Si power_plugged est connu mais has_battery ne l’est pas, garder power_plugged et compléter has_battery via WMI.
+- Ne JAMAIS utiliser battery_present comme substitut de on_battery.
 
-## [x] 3) Corriger la logique safe_mode + reasons (probe_gpu_runtime_context)
-Actuel:
-- safe_mode = True si Windows and has_battery True   (trop agressif)
-- reasons "battery_detected" ajouté juste car has_battery True (confus)
+### A3) Reasons / logs
+Avant (bug):
+- reasons inclut "battery_detected" même sur secteur
+- clamp agressif déclenché
 
-Nouveau:
-- if is_windows and has_battery is True: reasons.append("battery_present")
-- if is_windows and on_battery is True:
-    safe_mode = True
-    reasons.append("on_battery")
-- if is_windows and is_hybrid is True:
-    safe_mode = True
-    reasons.append("hybrid_graphics")
+Après (fix):
+- Si battery_present: éventuellement log info (battery_present=True) mais PAS une reason de clamp.
+- Ajouter reason "on_battery" UNIQUEMENT si on_battery=True.
+- Garder reason "hybrid_graphics" si applicable.
+- Ajouter reason "plugged_relax" si safe_mode était activé pour hybrid mais qu’on est sur secteur et qu’on relâche le clamp pour global_reproject.
 
-=> safe_mode dépend de (on_battery OR hybrid), pas de "battery_present".
+### A4) safe_mode
+- safe_mode peut rester True pour hybrid_graphics (protection anti-freeze),
+  MAIS le clamp "batterie" ne doit s'appliquer que si on_battery=True.
 
-## [x] 4) Logs
-Les logs existants affichent déjà power_plugged/on_battery/has_battery.
-S'assurer que le champ `battery=` continue à afficher `has_battery` (ok),
-mais que `reasons=` n’induise plus en erreur:
-- "battery_present" au lieu de "battery_detected"
-- "on_battery" seulement si on_battery True
+---
 
-## [ ] 5) Mini test manuel (sans framework)
-Sur Windows:
-- Lancer une exécution courte (ou un appel isolé à probe_gpu_runtime_context).
-- Vérifier log:
-  - Sur secteur: power_plugged=True, on_battery=False, reasons contient battery_present + hybrid_graphics (si hybride), PAS on_battery
-  - Débrancher: power_plugged=False, on_battery=True, reasons contient on_battery (+hybrid_graphics si hybride)
+## B) Phase 5 (global_reproject) — Auto "plugged-aware"
 
-## [x] 6) Ne pas toucher
-- Ne pas modifier la taille de chunk ici (c’est une autre mission).
-- Ne pas modifier le comportement batch size=0 vs >1.
+### B1) Où patcher
+- Dans le code où le plan est construit pour Phase 5:
+  - juste après apply_gpu_safety_to_parallel_plan(... operation="global_reproject")
+  - et juste avant l’exécution GPU.
+L’idée: safety configure, puis on ajuste uniquement le chunk en fonction (AUTO/USER, plugged/battery).
+
+### B2) Lecture du réglage UI/config
+- `phase5_chunk_auto` (bool)
+- `phase5_chunk_mb` (int) si override
+
+### B3) Algorithme minimal (proposé)
+Variables:
+- vram_free_bytes (ou estimation existante; sinon fallback: ne rien faire)
+- current_chunk = plan.gpu_max_chunk_bytes
+- safe_mode flag + reasons (si accessibles)
+- on_battery / power_plugged
+
+Règles:
+1) Si override utilisateur (phase5_chunk_auto=False):
+   - requested = mb * 1024*1024
+   - applied = requested
+   - Si on_battery=True: applied = min(applied, 128MB)  (clamp strict batterie)
+   - Sinon (secteur): applied = min(applied, hard_cap_from_vram_free)
+   - Set plan.gpu_max_chunk_bytes = applied
+   - Log: USER requested/applied + reason clamp si modifié.
+
+2) Si Auto (phase5_chunk_auto=True):
+   - Si on_battery=True:
+       applied = min(current_chunk, 128MB) (ou laisser safety si déjà <=128MB)
+       reason = "on_battery clamp"
+   - Sinon si power_plugged=True et hybrid_graphics=True:
+       # plugged-aware relax
+       target = max(current_chunk, 256MB) puis essayer 512MB si VRAM free le permet
+       applied = min(target, hard_cap_from_vram_free)
+       reason = "plugged_relax hybrid"
+   - Sinon (desktop ou non-hybrid):
+       laisser current_chunk (ou autoriser 512MB par défaut si vram_free très confortable)
+   - Log: AUTO target/applied + reason.
+
+### B4) Hard cap from VRAM free (très simple, safe)
+- hard_cap = min(1024MB, max(128MB, int(0.10 * vram_free_bytes)))
+  (10% de VRAM free, borné, évite les pics)
+- Si vram_free inconnue: hard_cap = 512MB en secteur, 128MB sur batterie.
+
+### B5) Logs (obligatoire)
+Ajouter un log unique et lisible au moment d’appliquer:
+- "Phase5 chunk AUTO: current=128MB target=512MB applied=512MB (plugged_relax, hybrid_graphics, vram_free=6200MB, hard_cap=620MB)"
+- "Phase5 chunk USER: requested=1024MB applied=512MB (hard_cap_vram, vram_free=5000MB)"
+- "Phase5 chunk AUTO: applied=128MB (on_battery clamp)"
+
+---
+
+## C) Validation rapide
+
+### C1) Cas secteur (ton cas)
+- battery_present=True
+- on_battery=False
+- power_plugged=True
+Attendu:
+- reasons ne doit plus contenir "battery_detected" / "on_battery"
+- Phase 5 Auto peut monter à 256/512MB selon VRAM free
+- log "plugged_relax" présent si hybrid
+
+### C2) Cas batterie (débrancher)
+Attendu:
+- reasons inclut "on_battery"
+- Phase 5 Auto et USER clamp à 128MB
+- log explicite "on_battery clamp"
+
+### C3) Non régression
+- Ne pas modifier intertiles autotune (preview guardrail)
+- Ne pas modifier les autres phases GPU
