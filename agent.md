@@ -1,38 +1,72 @@
-# Mission: GPU safety — chunk cap that scales with VRAM (safe_mode)
+# agent.md — ZeMosaic Patch: GPU safety smarter + intertile autotune guardrails (no refactor)
 
-## Context
-Currently, zemosaic_gpu_safety._clamp_gpu_chunks() forces a fixed safe_mode ceiling of 256 MB, and then applies min(...) with VRAM total/free. This means even "real" NVIDIA GPUs with large VRAM are hard-capped to 256 MB when safe_mode triggers (e.g., Windows laptop + hybrid + battery).
+## Contexte / Symptômes
+- Phase5 "Intertile Pairs" devenue anormalement lente car l’auto-tune peut choisir `preview=1024` et `min_overlap=0.0100`, augmentant fortement `pairs`.
+- Phase5 "Reproject" semble sous-utiliser le GPU car le GPU safety force `gpu_rows_per_chunk <= 128` dès que `safe_mode=1`, même sur de vrais GPU (ex: RTX 3070).
+- Objectif: conserver la sécurité anti-freeze, mais éviter de brider inutilement les configs robustes.
 
-We want to keep safety, but allow the cap to scale upward on large VRAM GPUs, while still honoring VRAM free and keeping a reasonable hard max.
+## Contraintes
+- **No refactor** : patch local, minimal, sans déplacer de grosses fonctions.
+- Ne pas modifier la logique "batch size = 0" / "batch size > 1".
+- Ne pas casser la compatibilité Windows/Linux/Mac (fallback gracieux si API non dispo).
+- Ajouter des logs clairs (niveau INFO/DEBUG) pour confirmer les décisions.
 
-## Scope / Constraints
-- **No refactor**
-- Touch **only**: `zemosaic_gpu_safety.py`
-- Keep existing behavior when VRAM is unknown.
-- Preserve minimum chunk bytes floor (32 MB).
-- Preserve existing logging format (can add more info but don’t break).
-- Do NOT change the meaning of safe_mode detection in this patch.
+## Fichiers ciblés
+- `zemosaic_gpu_safety.py`  (principal)
+- (optionnel et très léger) `zemosaic_worker.py` si besoin d’exposer 1-2 infos de debug (pas de restructuration)
 
-## Implementation plan
-1. [x] In `_clamp_gpu_chunks(plan, ctx)`:
-   - Replace fixed `cap_bytes = 256 MB` logic with:
-     - `base_cap = 256MB` by default
-     - if `ctx.vram_total_bytes` is known:
-       - `scaled = int(ctx.vram_total_bytes * 0.10)`  (10% of total VRAM)
-       - `base_cap = max(256MB, scaled)`
-       - `base_cap = min(base_cap, 2GB)` (hard cap)
-     - if `ctx.vram_free_bytes` is known:
-       - `base_cap = min(base_cap, int(ctx.vram_free_bytes * 0.80))`
-     - `cap_bytes = max(base_cap, 32MB)` (floor)
-   - Then clamp `plan.gpu_max_chunk_bytes` to `cap_bytes` (same semantics as today).
-2. [x] Keep the existing `gpu_rows_per_chunk` clamp behavior unchanged in this patch.
-3. [x] Ensure logging still prints `gpu_chunk_mb=...` and add optional debug comment lines only if needed (avoid noisy logs).
+## Tâches
+### T1 — Battery detection correcte (Windows surtout)
+Actuel: `battery=True` peut signifier "la machine a une batterie", pas "elle tourne sur batterie".
+- Utiliser `psutil.sensors_battery()` si dispo:
+  - si `battery is None` → `on_battery = False`
+  - sinon `on_battery = (battery.power_plugged is False)`
+- Conserver l’ancien comportement si `psutil` indisponible ou exception.
+- Loguer un message clair:
+  - `GPU_SAFETY: power_plugged=<bool|None> on_battery=<bool>`
 
-## Acceptance criteria
-- [x] In safe_mode on a GPU with >8 GB VRAM, `gpu_max_chunk_bytes` can be >256 MB (up to 2 GB), but never exceeds 80% of free VRAM.
-- [x] On systems with unknown VRAM: behavior remains essentially the same (defaults to 256 MB then floored to 32 MB).
-- [x] No other modules changed.
+### T2 — Clamp gpu_rows_per_chunk: remplacer le hard-cap 128 par un cap adaptatif
+But: garder safe-mode, mais permettre des chunks raisonnables sur GPU Nvidia dédiés.
+- Règle proposée (simple, robuste):
+  - Déterminer `rows_cap` en fonction de la VRAM libre (si GPU backend peut la fournir), sinon fallback.
+  - Cibler un budget "chunk_bytes" (par ex 256 MiB par défaut) mais **réduit** en safe-mode.
+- Politique:
+  - `base_chunk_bytes = 256 MiB`
+  - si `safe_mode` ET `on_battery` ou `hybrid` → `safe_chunk_bytes = 128 MiB` (au lieu de réduire à 128 rows)
+  - si GPU a >= ~6-8GB VRAM libre → autoriser 256MiB même en hybrid, sauf si on_battery=True
+- Convertir bytes -> rows avec estimation `bytes_per_row` (déjà calculée ou calculable dans le module).
+- Clamp final:
+  - `rows = clamp(rows, min_rows=32, max_rows=2048)` (valeurs conservatrices)
+- Loguer:
+  - `GPU_SAFETY: chosen gpu_rows_per_chunk=<n> (budget=<MiB>, bytes_per_row=<n>, vram_free=<MiB>, safe_mode=<...>)`
 
-## Quick test (manual)
-- [x] Run any pipeline that triggers apply_gpu_safety_to_parallel_plan() with safe_mode enabled.
-- [x] Confirm in logs: `[GPU_SAFETY] ... gpu_chunk_mb=` reflects a value >256 on large VRAM GPUs (if free VRAM allows).
+### T3 — Guardrails sur intertile auto-tune pour éviter l’explosion des paires
+But: empêcher l’auto-tune de choisir une combinaison "explosive" par défaut.
+- Si auto-tune propose:
+  - `preview >= 1024` ET `min_overlap <= 0.015` → appliquer un garde-fou:
+    - soit réduire `preview` à 512
+    - soit remonter `min_overlap` à 0.03 ou 0.05 (préférer 0.03 si on veut permissif)
+- Guardrail basé sur une heuristique simple:
+  - `estimated_pairs = n_tiles * avg_neighbors` (approx) ou directement après calcul des overlaps:
+    - si `pairs > max_pairs_guardrail` (ex: 2_000) → durcir paramètres
+  - Comme on veut patch minimal: faire au moins le guardrail "preview/min_overlap".
+- Loguer:
+  - `INTERTILE_AUTOTUNE_GUARDRAIL: adjusted preview=... min_overlap=... (reason=...)`
+
+### T4 — Tests / validation (smoke tests)
+- Lancer un run (ou simulation) sur un dataset connu:
+  - vérifier dans le log:
+    - `power_plugged` détecté correctement
+    - `gpu_rows_per_chunk` > 128 sur RTX 3070 quand branché
+    - auto-tune n’aboutit pas à `preview=1024` + `min_overlap=0.01` simultanément (sauf si utilisateur force manuellement)
+- Ne pas modifier l’UI. (Optionnel: si une constante ou tooltip existe déjà, ne pas toucher.)
+
+## Definition of Done
+- Sur machine hybride Nvidia **branchée**, `safe_mode` peut rester activé mais `gpu_rows_per_chunk` n’est plus systématiquement 128.
+- Sur machine **sur batterie** (power_plugged=False), le safety reste conservateur.
+- Intertile auto-tune ne choisit plus la combinaison explosive par défaut; logs explicites.
+- Aucun refactor large; diff limité aux fichiers ciblés.
+
+## Notes d’implémentation (aide)
+- Préférer des helpers internes dans `zemosaic_gpu_safety.py` (petites fonctions), pas de nouveaux modules.
+- Si `psutil` n’est pas une dépendance, importer en try/except.
