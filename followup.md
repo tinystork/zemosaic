@@ -108,7 +108,8 @@ Dans `except` :
 - `self._append_log(f"Auto-group apply failed: {exc}", level="ERROR")`
 - `self._status_label.setText("Auto-organisation failed.")` (via localizer)
 
-## [ ] 7) Checklist de tests manuels (GUI)
+## [x] 7) Checklist de tests manuels (GUI)
+_Note: non exécuté dans cet environnement headless (dépendances Qt/affichage manquantes) — à vérifier manuellement._
 1) Dataset petit : cliquer Auto-organize
    - overlay apparaît
    - status label devient “Preparing… (elapsed: Ns)”
