@@ -3034,6 +3034,63 @@ class ZeMosaicQtMainWindow(QMainWindow):
             checkbox=checkbox_widget,
         )
 
+        phase5_group = QGroupBox(
+            self._tr("qt_phase5_chunk_group", "Phase 5 (Reproject)"),
+            group,
+        )
+        phase5_layout = QFormLayout(phase5_group)
+        phase5_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        chunk_auto_checkbox = QCheckBox(
+            self._tr("qt_phase5_chunk_auto", "Auto (recommended)"),
+            phase5_group,
+        )
+        chunk_auto_checked = self._normalize_config_bool(
+            self.config.get("phase5_chunk_auto", True), True
+        )
+        chunk_auto_checkbox.setChecked(chunk_auto_checked)
+        phase5_layout.addRow(chunk_auto_checkbox)
+        self._config_fields["phase5_chunk_auto"] = {
+            "kind": "checkbox",
+            "widget": chunk_auto_checkbox,
+            "type": bool,
+        }
+
+        chunk_spin = QSpinBox(phase5_group)
+        chunk_spin.setRange(64, 1024)
+        chunk_spin.setSingleStep(64)
+        chunk_spin.setValue(int(self.config.get("phase5_chunk_mb", 128)))
+        chunk_spin.setEnabled(not chunk_auto_checked)
+        phase5_layout.addRow(
+            QLabel(self._tr("qt_phase5_chunk_mb_label", "Phase 5 chunk (MB)"), phase5_group),
+            chunk_spin,
+        )
+        self._config_fields["phase5_chunk_mb"] = {
+            "kind": "spinbox",
+            "widget": chunk_spin,
+            "type": int,
+        }
+
+        warning_label = QLabel(
+            self._tr(
+                "qt_phase5_chunk_warning",
+                "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution.",
+            ),
+            phase5_group,
+        )
+        warning_label.setWordWrap(True)
+        warning_label.setStyleSheet("color: gray; font-size: 11px;")
+        phase5_layout.addRow(warning_label)
+
+        def _on_chunk_auto_toggled(state: bool) -> None:
+            chunk_spin.setDisabled(state)
+            self._sync_config_key_from_widget("phase5_chunk_auto")
+
+        chunk_auto_checkbox.toggled.connect(_on_chunk_auto_toggled)  # type: ignore[arg-type]
+        chunk_spin.valueChanged.connect(lambda _=None: self._sync_config_key_from_widget("phase5_chunk_mb"))  # type: ignore[arg-type]
+
+        layout.addRow(phase5_group)
+
         return group
 
     def _on_theme_mode_changed(self, index: int) -> None:

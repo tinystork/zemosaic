@@ -6,19 +6,19 @@ Nous voulons permettre aux power users de forcer la taille de chunk GPU pour cet
 
 ## Objectif UX
 Dans l'onglet "System" (GUI Qt):
-- Checkbox: "Auto (recommended)"
-- Spinbox: "Phase 5 chunk (MB)" (désactivé si Auto coché)
-- Side note / tooltip discret:
+- [x] Checkbox: "Auto (recommended)"
+- [x] Spinbox: "Phase 5 chunk (MB)" (désactivé si Auto coché)
+- [x] Side note / tooltip discret:
   "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution."
-- Valeurs raisonnables:
+- [x] Valeurs raisonnables:
   - min 64 MB, max 1024 MB, step 64 MB, default 128 MB (si override utilisé)
-- Par défaut: Auto activé.
+- [x] Par défaut: Auto activé.
 
 ## Objectif technique
-- Stocker dans la config:
+- [x] Stocker dans la config:
   - `phase5_chunk_auto: bool`
   - `phase5_chunk_mb: int`
-- Appliquer uniquement lors de la construction du plan de Phase 5, operation="global_reproject":
+- [x] Appliquer uniquement lors de la construction du plan de Phase 5, operation="global_reproject":
   - Si Auto: ne rien changer (laisser safety/autotune faire)
   - Si override: forcer `plan.gpu_max_chunk_bytes = phase5_chunk_mb * 1024 * 1024`
     (clamp interne optionnel si champ existe)
@@ -37,7 +37,7 @@ Dans l'onglet "System" (GUI Qt):
 - éventuellement `zemosaic_localization.py` si les strings passent par un système de traduction
 
 ## Acceptation
-- Le GUI affiche Auto + spinbox, spinbox grisé quand Auto est actif.
-- La config persiste correctement (redémarrage app -> valeur retrouvée).
-- En run, si override: log indique la valeur et le plan utilise ce chunk (bytes).
-- Si Auto: aucun changement.
+- [x] Le GUI affiche Auto + spinbox, spinbox grisé quand Auto est actif.
+- [x] La config persiste correctement (redémarrage app -> valeur retrouvée).
+- [x] En run, si override: log indique la valeur et le plan utilise ce chunk (bytes).
+- [x] Si Auto: aucun changement.
