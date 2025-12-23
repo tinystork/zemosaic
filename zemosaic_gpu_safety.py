@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import importlib.util
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Tuple
 
@@ -84,13 +85,62 @@ def _probe_battery_status() -> Tuple[bool | None, bool | None, bool]:
     power_plugged: bool | None = None
     on_battery = False
 
+    def _probe_windows_power_status_ctypes() -> Tuple[bool | None, bool | None, bool] | None:
+        if not platform.system().lower().startswith("windows"):
+            return None
+
+        if importlib.util.find_spec("ctypes") is None:
+            return None
+
+        import ctypes
+        from ctypes import wintypes
+
+        class SYSTEM_POWER_STATUS(ctypes.Structure):
+            _fields_ = [
+                ("ACLineStatus", wintypes.BYTE),
+                ("BatteryFlag", wintypes.BYTE),
+                ("BatteryLifePercent", wintypes.BYTE),
+                ("SystemStatusFlag", wintypes.BYTE),
+                ("BatteryLifeTime", wintypes.DWORD),
+                ("BatteryFullLifeTime", wintypes.DWORD),
+            ]
+
+        status = SYSTEM_POWER_STATUS()
+        try:
+            ok = ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status))
+        except Exception:
+            return None
+        if not ok:
+            return None
+
+        ac_line_status = status.ACLineStatus
+        if ac_line_status == 255:
+            return None
+
+        power_plugged = ac_line_status == 1
+        on_battery = ac_line_status == 0
+
+        battery_present: bool | None = None
+        battery_flag = status.BatteryFlag
+        if battery_flag != 255:
+            battery_present = battery_flag != 128
+
+        return battery_present, power_plugged, on_battery
+
+    windows_probe = _probe_windows_power_status_ctypes()
+    if windows_probe is not None:
+        has_battery, power_plugged, on_battery = windows_probe
+
     if psutil is not None:
         try:
             info = psutil.sensors_battery()
             if info is not None:
-                has_battery = True
-                power_plugged = getattr(info, "power_plugged", None)
-                on_battery = power_plugged is False
+                if has_battery is None:
+                    has_battery = True
+                if power_plugged is None:
+                    power_plugged = getattr(info, "power_plugged", None)
+                    if power_plugged is not None:
+                        on_battery = power_plugged is False
         except Exception:
             pass
 
@@ -166,8 +216,10 @@ def probe_gpu_runtime_context(
     reasons: list[str] = []
     safe_mode = False
     if is_windows and has_battery is True:
+        reasons.append("battery_present")
+    if is_windows and on_battery is True:
         safe_mode = True
-        reasons.append("battery_detected")
+        reasons.append("on_battery")
     if is_windows and is_hybrid is True:
         safe_mode = True
         reasons.append("hybrid_graphics")
