@@ -1405,7 +1405,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         return group
 
     def _existing_master_tiles_enabled(self) -> bool:
-        return bool(self.config.get("use_existing_master_tiles", False))
+        enabled = self._normalize_config_bool(
+            self.config.get("use_existing_master_tiles", False), False
+        )
+        self.config["use_existing_master_tiles"] = enabled
+        return enabled
 
     def _apply_existing_master_tiles_mode(self, enabled: bool | None = None) -> None:
         if enabled is None:
@@ -3379,7 +3383,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str) -> QCheckBox:
         checkbox = QCheckBox(label_text)
-        checkbox.setChecked(bool(self.config.get(key, False)))
+        checkbox.setChecked(self._normalize_config_bool(self.config.get(key, False), False))
         layout.addRow(checkbox)
         self._config_fields[key] = {
             "kind": "checkbox",
