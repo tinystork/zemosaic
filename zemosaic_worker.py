@@ -1249,34 +1249,46 @@ def _apply_autocrop_to_global_plan(
 def _prepare_tiles_for_two_pass(
     collected_tiles: list[tuple] | None,
     fallback_loader: Callable[[], tuple] | None,
-) -> tuple[list[np.ndarray], list[Any], list[np.ndarray | None]]:
+) -> tuple[list[np.ndarray], list[Any], list[np.ndarray | None], list[float]]:
     """Build the tile, WCS, and coverage lists used during the second pass."""
 
     tiles: list[np.ndarray] = []
     wcs_list: list[Any] = []
     coverage_list: list[np.ndarray | None] = []
+    tile_weights: list[float] = []
 
     def _coerce_tile_payload(
         tile_entry,
-    ) -> tuple[np.ndarray | None, Any | None, np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, Any | None, np.ndarray | None, float]:
         try:
             if isinstance(tile_entry, (list, tuple)):
                 arr = tile_entry[0] if len(tile_entry) >= 1 else None
                 twcs = tile_entry[1] if len(tile_entry) >= 2 else None
                 cov = tile_entry[2] if len(tile_entry) >= 3 else None
-                return arr, twcs, cov
+                try:
+                    tw_val = float(tile_entry[3]) if len(tile_entry) >= 4 else 1.0
+                except Exception:
+                    tw_val = 1.0
+                return arr, twcs, cov, tw_val
         except Exception:
             pass
-        return None, None, None
+        return None, None, None, 1.0
 
     if collected_tiles:
         for entry in collected_tiles:
-            arr, twcs, cov = _coerce_tile_payload(entry)
+            arr, twcs, cov, tile_weight = _coerce_tile_payload(entry)
             if arr is None or twcs is None:
                 continue
             arr_np = np.asarray(arr, dtype=np.float32)
             tiles.append(arr_np)
             wcs_list.append(twcs)
+            try:
+                tw_val = float(tile_weight)
+            except Exception:
+                tw_val = 1.0
+            if not math.isfinite(tw_val) or tw_val <= 0.0:
+                tw_val = 1.0
+            tile_weights.append(tw_val)
             if cov is not None:
                 cov_np = np.asarray(cov, dtype=np.float32, copy=False)
                 if cov_np.ndim > 2:
@@ -1296,17 +1308,27 @@ def _prepare_tiles_for_two_pass(
         tiles_from_loader: list[np.ndarray] = []
         wcs_from_loader: list[Any] = []
         coverage_from_loader: list[np.ndarray | None] = []
+        tile_weights_from_loader: list[float] = []
         if isinstance(loader_payload, tuple) and len(loader_payload) >= 2:
             tiles_from_loader = list(loader_payload[0] or [])
             wcs_from_loader = list(loader_payload[1] or [])
             if len(loader_payload) >= 3:
                 coverage_from_loader = list(loader_payload[2] or [])
+            if len(loader_payload) >= 4:
+                tile_weights_from_loader = list(loader_payload[3] or [])
         for idx, arr in enumerate(tiles_from_loader):
             twcs = wcs_from_loader[idx] if idx < len(wcs_from_loader) else None
             if arr is None or twcs is None:
                 continue
             tiles.append(np.asarray(arr, dtype=np.float32))
             wcs_list.append(twcs)
+            try:
+                tw_val = float(tile_weights_from_loader[idx]) if idx < len(tile_weights_from_loader) else 1.0
+            except Exception:
+                tw_val = 1.0
+            if not math.isfinite(tw_val) or tw_val <= 0.0:
+                tw_val = 1.0
+            tile_weights.append(tw_val)
             cov = coverage_from_loader[idx] if idx < len(coverage_from_loader) else None
             if cov is None:
                 coverage_list.append(None)
@@ -1316,7 +1338,9 @@ def _prepare_tiles_for_two_pass(
                     cov_np = np.squeeze(cov_np)
                 coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
 
-    return tiles, wcs_list, coverage_list
+    if len(tile_weights) < len(tiles):
+        tile_weights.extend([1.0] * (len(tiles) - len(tile_weights)))
+    return tiles, wcs_list, coverage_list, tile_weights
 
 
 class _TwoPassDiagnostics:
@@ -1866,25 +1890,16 @@ def _apply_two_pass_coverage_renorm_if_requested(
             getattr(final_mosaic_coverage, "shape", None),
         )
 
-    prepare_output = _prepare_tiles_for_two_pass(
+    (
+        tiles_for_second_pass,
+        wcs_for_second_pass,
+        coverage_for_second_pass,
+        tile_weights_for_second_pass,
+    ) = _prepare_tiles_for_two_pass(
         collected_tiles,
         fallback_tile_loader,
     )
-    fallback_used: bool
-    if isinstance(prepare_output, tuple) and len(prepare_output) >= 4:
-        (
-            tiles_for_second_pass,
-            wcs_for_second_pass,
-            coverage_for_second_pass,
-            fallback_used,
-        ) = prepare_output[:4]
-    else:
-        (
-            tiles_for_second_pass,
-            wcs_for_second_pass,
-            coverage_for_second_pass,
-        ) = prepare_output
-        fallback_used = not bool(collected_tiles) and fallback_tile_loader is not None
+    fallback_used: bool = not bool(collected_tiles) and fallback_tile_loader is not None
 
     if logger:
         logger.debug(
@@ -1933,6 +1948,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
             logger=logger,
             use_gpu_two_pass=use_gpu_two_pass,
             tiles_coverage=coverage_for_second_pass,
+            tile_weights=tile_weights_for_second_pass,
             parallel_plan=parallel_plan,
             telemetry_ctrl=telemetry_ctrl,
             debug_diag=diag_state,
@@ -13904,6 +13920,14 @@ def assemble_final_mosaic_reproject_coadd(
             arr = entry.get("data") if isinstance(entry, dict) else None
             tile_wcs = entry.get("wcs") if isinstance(entry, dict) else None
             coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
+            tile_weight_val = 1.0
+            if isinstance(entry, dict):
+                try:
+                    tile_weight_val = float(entry.get("tile_weight", 1.0))
+                except Exception:
+                    tile_weight_val = 1.0
+                if not math.isfinite(tile_weight_val) or tile_weight_val <= 0.0:
+                    tile_weight_val = 1.0
             if arr is None or tile_wcs is None:
                 continue
             try:
@@ -13919,7 +13943,7 @@ def assemble_final_mosaic_reproject_coadd(
                     cov_copy = np.array(coverage_mask, copy=True)
                 except Exception:
                     cov_copy = np.asarray(coverage_mask, dtype=np.float32)
-            collect_tile_data.append((arr_copy, tile_wcs, cov_copy))
+            collect_tile_data.append((arr_copy, tile_wcs, cov_copy, tile_weight_val))
 
 
     # Build kwargs dynamically to remain compatible with different reproject versions
@@ -14046,9 +14070,7 @@ def assemble_final_mosaic_reproject_coadd(
                 )
             except Exception:
                 pass
-        weight_array_scaled_ids: set[int] = set()
-        tile_weight_log_ids: set[str] = set()
-        weights_embedded_with_tile = False
+        tile_weight_summary_logged = False
         for ch in range(n_channels):
             valid_entries: list[dict[str, Any]] = []
             for entry in effective_tiles:
@@ -14069,6 +14091,8 @@ def assemble_final_mosaic_reproject_coadd(
             wcs_list = []
             input_weights_list = []
             weight_debug_logged = False
+            tile_weights_for_entries: list[float] = []
+            input_weight_max = 0.0
             for idx_entry, entry in enumerate(valid_entries):
                 entry_data = entry.get("data")
                 data_plane = entry_data[..., ch]
@@ -14094,7 +14118,6 @@ def assemble_final_mosaic_reproject_coadd(
                             weight2d = None
                     if weight2d is None:
                         weight2d = np.ones_like(data_plane, dtype=np.float32)
-                weight_source = weight_source_base
                 if tile_weighting_applied:
                     try:
                         tw_raw = entry.get("tile_weight", 1.0) if isinstance(entry, dict) else 1.0
@@ -14103,30 +14126,7 @@ def assemble_final_mosaic_reproject_coadd(
                         tw_value = 1.0
                     if not math.isfinite(tw_value) or tw_value <= 0.0:
                         tw_value = 1.0
-                    weights_embedded_with_tile = True
-                    if isinstance(weight2d, np.ndarray):
-                        weight_arr = np.asarray(weight2d, dtype=np.float32, order="C", copy=False)
-                        weight_id = id(weight_arr)
-                        if weight_id not in weight_array_scaled_ids:
-                            weight_array_scaled_ids.add(weight_id)
-                            np.multiply(weight_arr, tw_value, out=weight_arr, casting="unsafe")
-                        weight2d = weight_arr
-                        if isinstance(entry, dict) and weight_source_base == "alpha_weight2d":
-                            entry["alpha_weight2d"] = weight_arr
-                    weight_source = f"{weight_source_base}*tile_weight"
-                    tile_label = (
-                        entry.get("tile_id")
-                        or entry.get("path")
-                        or f"tile_{idx_entry}"
-                    )
-                    if tile_label not in tile_weight_log_ids:
-                        logger.info(
-                            "[Phase5] tile_weight applied: tile=%s tw=%.3f weights_source=%s",
-                            tile_label,
-                            tw_value,
-                            weight_source,
-                        )
-                        tile_weight_log_ids.add(str(tile_label))
+                    tile_weights_for_entries.append(tw_value)
                 input_weights_list.append(weight2d)
                 if (
                     not weight_debug_logged
@@ -14140,7 +14140,7 @@ def assemble_final_mosaic_reproject_coadd(
                         logger.debug(
                             "[Phase5] input_weights sample: channel=%d source=%s shape=%s min=%.4f max=%.4f zero_frac=%.4f",
                             ch,
-                            weight_source,
+                            weight_source_base,
                             weight2d.shape,
                             weight_min,
                             weight_max,
@@ -14149,12 +14149,40 @@ def assemble_final_mosaic_reproject_coadd(
                         weight_debug_logged = True
                     except Exception:
                         pass
-            weights_for_entries = None
-            if tile_weighting_applied:
-                weights_for_entries = [
-                    float(entry.get("tile_weight", 1.0)) if isinstance(entry, dict) else 1.0
-                    for entry in valid_entries
-                ]
+                try:
+                    local_max = float(np.nanmax(weight2d)) if isinstance(weight2d, np.ndarray) and weight2d.size else 0.0
+                except Exception:
+                    local_max = 0.0
+                input_weight_max = max(input_weight_max, local_max)
+
+            tile_weights_arg: list[float] | None = None
+            if tile_weighting_applied and tile_weights_for_entries:
+                tile_weights_arg = tile_weights_for_entries
+                if not tile_weight_summary_logged:
+                    try:
+                        weights_arr = np.asarray(tile_weights_for_entries, dtype=np.float64)
+                        finite_weights = weights_arr[np.isfinite(weights_arr)]
+                        if finite_weights.size:
+                            tw_min = float(np.min(finite_weights))
+                            tw_med = float(np.median(finite_weights))
+                            tw_max = float(np.max(finite_weights))
+                            ratio = float(tw_max / tw_min) if tw_min > 0 else float("inf")
+                            logger.debug(
+                                "[Phase5] tile_weights summary: min=%.4f median=%.4f max=%.4f ratio=%.4f entries=%d",
+                                tw_min,
+                                tw_med,
+                                tw_max,
+                                ratio,
+                                len(tile_weights_for_entries),
+                            )
+                        tile_weight_summary_logged = True
+                    except Exception:
+                        pass
+            if tile_weights_arg is not None and input_weight_max > 1.5:
+                logger.warning(
+                    "[Phase5] possible double weighting: input_weights max=%.3f with tile_weights enabled",
+                    input_weight_max,
+                )
 
             reproj_call_kwargs = dict(reproj_kwargs)
             reproj_call_kwargs["input_weights"] = input_weights_list
@@ -14169,12 +14197,8 @@ def assemble_final_mosaic_reproject_coadd(
 
             def _invoke_reproject(local_kwargs: dict):
                 invoke_kwargs = dict(local_kwargs)
-                if (
-                    tile_weighting_applied
-                    and weights_for_entries is not None
-                    and not weights_embedded_with_tile
-                ):
-                    invoke_kwargs["tile_weights"] = weights_for_entries
+                if tile_weights_arg is not None:
+                    invoke_kwargs["tile_weights"] = tile_weights_arg
                 return zemosaic_utils.reproject_and_coadd_wrapper(
                     data_list=data_list,
                     wcs_list=wcs_list,
@@ -15138,6 +15162,7 @@ def run_second_pass_coverage_renorm(
     logger=None,
     use_gpu_two_pass: bool | None = None,
     tiles_coverage: list[np.ndarray | None] | None = None,
+    tile_weights: list[float] | None = None,
     parallel_plan: ParallelPlan | None = None,
     telemetry_ctrl: ResourceTelemetryController | None = None,
     debug_diag: _TwoPassDiagnostics | None = None,
@@ -15462,6 +15487,51 @@ def run_second_pass_coverage_renorm(
             if logger and logger.isEnabledFor(logging.DEBUG):
                 logger.debug("[TwoPass] failed to prepare tiles_coverage weights → skip", exc_info=True)
 
+    def _normalize_tile_weights(weights_obj: list[float] | None, expected: int) -> list[float] | None:
+        if weights_obj is None:
+            return None
+        normalized: list[float] = []
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = [weights_obj]
+        for idx in range(expected):
+            try:
+                raw = iterable[idx]
+            except Exception:
+                raw = 1.0
+            try:
+                val = float(raw)
+            except Exception:
+                val = 1.0
+            if not math.isfinite(val) or val <= 0.0:
+                val = 1.0
+            normalized.append(val)
+        if len(normalized) < expected:
+            normalized.extend([1.0] * (expected - len(normalized)))
+        return normalized
+
+    tile_weights_norm = _normalize_tile_weights(tile_weights, len(corrected_tiles))
+    if tile_weights_norm and logger and logger.isEnabledFor(logging.DEBUG):
+        try:
+            weights_arr = np.asarray(tile_weights_norm, dtype=np.float64)
+            finite_weights = weights_arr[np.isfinite(weights_arr)]
+            if finite_weights.size:
+                tw_min = float(np.min(finite_weights))
+                tw_med = float(np.median(finite_weights))
+                tw_max = float(np.max(finite_weights))
+                ratio = float(tw_max / tw_min) if tw_min > 0 else float("inf")
+                logger.debug(
+                    "[TwoPass] tile_weights summary: min=%.4f median=%.4f max=%.4f ratio=%.4f entries=%d",
+                    tw_min,
+                    tw_med,
+                    tw_max,
+                    ratio,
+                    len(tile_weights_norm),
+                )
+        except Exception:
+            pass
+
     def _process_channel(ch_idx: int, use_gpu_flag: bool) -> tuple[int, np.ndarray, np.ndarray]:
         if logger:
             logger.debug(
@@ -15474,6 +15544,7 @@ def run_second_pass_coverage_renorm(
             )
         data_list = [tile[..., ch_idx] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
         input_weights_list = None
+        input_weight_max = 0.0
         if weights_2d_list is not None:
             try:
                 iw: list[np.ndarray | None] = []
@@ -15503,6 +15574,16 @@ def run_second_pass_coverage_renorm(
                         ch_idx + 1,
                         exc_info=True,
                     )
+        if input_weights_list is not None:
+            try:
+                for weight_entry in input_weights_list:
+                    if weight_entry is None:
+                        continue
+                    weight_arr = np.asarray(weight_entry, dtype=np.float32)
+                    local_max = float(np.nanmax(weight_arr)) if weight_arr.size else 0.0
+                    input_weight_max = max(input_weight_max, local_max)
+            except Exception:
+                input_weight_max = 0.0
 
         def _invoke_reproj(use_gpu_local: bool, local_kwargs: dict[str, Any]):
             return zemosaic_utils.reproject_and_coadd_wrapper(
@@ -15517,6 +15598,13 @@ def run_second_pass_coverage_renorm(
         local_kwargs = dict(reproj_kwargs)
         if input_weights_list is not None:
             local_kwargs["input_weights"] = input_weights_list
+        if tile_weights_norm is not None:
+            local_kwargs["tile_weights"] = tile_weights_norm
+        if tile_weights_norm is not None and input_weight_max > 1.5 and logger:
+            logger.warning(
+                "[TwoPass] possible double weighting: input_weights max=%.3f with tile_weights enabled",
+                input_weight_max,
+            )
         try:
             chan_mosaic, chan_cov = _invoke_reproj(use_gpu_flag, local_kwargs)
             if logger and logger.isEnabledFor(logging.DEBUG):
