@@ -42,21 +42,21 @@ Si des infos plus précises existent déjà (ex: taille réelle des buffers ou e
 les utiliser à la place (mais sans refactor).
 
 ## Étapes
-1. Localiser dans le code le point Phase 5 où:
-   - le plan est créé
-   - `apply_gpu_safety_to_parallel_plan(... operation="global_reproject")` est appelé
-2. Ajouter juste après ce call un petit ajustement conditionnel:
-   - uniquement si `operation == "global_reproject"`
-   - uniquement si `safe_mode == 1`
-   - uniquement si `on_battery == False` (ou `power_plugged == True`)
-3. Recalculer `gpu_rows_per_chunk` selon une estimation simple basée sur:
-   - `plan.gpu_max_chunk_bytes` (ou param correspondant)
-   - `out_w` (largeur de sortie) accessible depuis le contexte Phase 5
-   - `n_tiles` (nombre de master tiles en input) accessible depuis la phase
-4. Ajouter un log INFO clair:
-   - "Phase5: reproject rows_per_chunk bumped from X to Y (not on battery), max_chunk_bytes=..."
-5. S'assurer que si des champs manquent (out_w/n_tiles), on n'échoue pas:
-   - fallback: ne rien changer
+- [x] Localiser dans le code le point Phase 5 où:
+  - le plan est créé
+  - `apply_gpu_safety_to_parallel_plan(... operation="global_reproject")` est appelé
+- [x] Ajouter juste après ce call un petit ajustement conditionnel:
+  - uniquement si `operation == "global_reproject"`
+  - uniquement si `safe_mode == 1`
+  - uniquement si `on_battery == False` (ou `power_plugged == True`)
+- [x] Recalculer `gpu_rows_per_chunk` selon une estimation simple basée sur:
+  - `plan.gpu_max_chunk_bytes` (ou param correspondant)
+  - `out_w` (largeur de sortie) accessible depuis le contexte Phase 5
+  - `n_tiles` (nombre de master tiles en input) accessible depuis la phase
+- [x] Ajouter un log INFO clair:
+  - "Phase5: reproject rows_per_chunk bumped from X to Y (not on battery), max_chunk_bytes=..."
+- [x] S'assurer que si des champs manquent (out_w/n_tiles), on n'échoue pas:
+  - fallback: ne rien changer
 
 ## Critères d'acceptation
 - Sur un run secteur (pas sur batterie), `gpu_rows_per_chunk` augmente (ex: 69 → ~200),
@@ -66,7 +66,7 @@ les utiliser à la place (mais sans refactor).
 - Aucune régression sur les autres phases.
 
 ## Tests (léger)
-- Ajouter un mini test unitaire si la suite existe:
+- [x] Ajouter un mini test unitaire si la suite existe:
   - Simuler un plan avec gpu_max_chunk_bytes=128MB, out_w=2282, n_tiles=30, current_rows=69
   - Vérifier que new_rows > current_rows et <= 256 quand on_battery=False
   - Vérifier new_rows == current_rows quand on_battery=True

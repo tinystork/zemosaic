@@ -1,3 +1,4 @@
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,37 @@ def test_should_use_gpu_helper_respects_plan(monkeypatch):
     config["use_gpu_phase5"] = False
     assert not zw.should_use_gpu_for_reproject("phase5_reproject_coadd", config, plan)
     zw.reset_phase5_gpu_runtime_state()
+
+
+def test_phase5_rows_per_chunk_bumps_when_plugged(caplog):
+    plan = SimpleNamespace(
+        gpu_rows_per_chunk=69,
+        gpu_max_chunk_bytes=128 * 1024 * 1024,
+        use_gpu=True,
+    )
+    ctx = SimpleNamespace(safe_mode=1, on_battery=False, power_plugged=True)
+
+    with caplog.at_level(logging.INFO):
+        zw._maybe_bump_phase5_gpu_rows_per_chunk(plan, ctx, (100, 2282), 30, logging.getLogger(__name__))
+
+    assert plan.gpu_rows_per_chunk > 69
+    assert plan.gpu_rows_per_chunk <= 256
+    assert any("Phase5 GPU: bump rows_per_chunk" in msg for msg in caplog.messages)
+
+
+def test_phase5_rows_per_chunk_skips_on_battery(caplog):
+    plan = SimpleNamespace(
+        gpu_rows_per_chunk=69,
+        gpu_max_chunk_bytes=128 * 1024 * 1024,
+        use_gpu=True,
+    )
+    ctx = SimpleNamespace(safe_mode=1, on_battery=True, power_plugged=False)
+
+    with caplog.at_level(logging.INFO):
+        zw._maybe_bump_phase5_gpu_rows_per_chunk(plan, ctx, (100, 2282), 30, logging.getLogger(__name__))
+
+    assert plan.gpu_rows_per_chunk == 69
+    assert not any("Phase5 GPU: bump rows_per_chunk" in msg for msg in caplog.messages)
 
 
 def test_two_pass_gpu_error_falls_back_to_cpu(monkeypatch):
