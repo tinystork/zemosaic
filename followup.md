@@ -1,41 +1,56 @@
-# followup.md — Validation & mesures (Auto-organize perf)
+# followup.md — Guidance & guardrails for implementation
 
-## 1) Repro perf [x]
-1. Ouvrir le Filter raw frames (Qt).
-2. Charger un dataset “lourd” (≈ 1000+ frames).
-3. (Optionnel) Faire “Analyse” si c’est ton flux habituel.
-4. Cliquer “Auto-organize Master Tiles”.
-5. Noter:
-   - durée totale (chronomètre)
-   - CPU global approx (gestionnaire tâches)
-   - si overlay disparaît bien à la fin
+## Step-by-step plan (keep commits small)
 
-## 2) Collecte logs [x]
-Récupérer:
-- `zemosaic_filter.log` (celui que tu fournis habituellement)
-- Optionnel: capture de l’Activity log dans la fenêtre Qt
+### Step 1 — Add zemosaic_gpu_safety.py
+- Implement GpuRuntimeContext + probe_gpu_runtime_context()
+- Implement apply_gpu_safety_to_parallel_plan() returning (plan, ctx)
+- Implement apply_gpu_safety_to_phase5_flag()
+- All imports must be optional:
+  - psutil might exist in worker; still guard sensors_battery()
+  - wmi is optional; Windows-only; guard import
+  - cupy is optional; DO NOT import cupy here unless you absolutely need it
 
-Attendu dans le log:
-- `[AutoGroupTiming] build_candidates=...s prefetch_eqmode=...s clustering=...s autosplit=...s borrowing=...s auto_optimiser=...s total=...s`
-- `[AutoOptimiser] start ...`
-- `[AutoOptimiser] final ...`
+### Step 2 — Wire into zemosaic_worker.py
+Touch only the narrow points:
+- Right after global auto_tune_parallel_plan(kind="global")
+- Right after phase5 auto_tune_parallel_plan(kind="global_reproject")
+- Right before computing/using use_gpu_phase5_flag
+- Ensure zconfig.parallel_plan / parallel_plan_phase5 updated with the “safe” plan so telemetry context keeps working
+- Add one log summary line + flush handlers
 
-## 3) Scénarios de non-régression [x]
-A) Dataset small (50–200 frames): auto-organize doit rester correct.
-B) Dataset mix EQ/ALTZ: les groupes ne doivent pas fusionner entre signatures.
-C) Dataset avec EQMODE manquant: doit fonctionner (cache json et fallback header).
-D) Erreur volontaire: sélectionner 0 frames / bbox vide:
-   - overlay ne doit pas rester bloqué
-   - message clair dans log/status
+### Step 3 — Wire into grid_mode.py
+- Keep existing _compute_gpu_concurrency but feed it a safer budget/concurrency when ctx.safe_mode
+- Log one summary line
 
-## 4) Comparaison qualité [x]
-Comparer “avant/après”:
-- nb de groupes final
-- distribution des sizes (min/median/max)
-- cohérence visuelle dans Sky Preview (pas de regroupements absurdes)
+### Step 4 — Optional hardening in zemosaic_align_stack_gpu.py
+- If env ZEMOSAIC_GPU_SAFE_MODE=1:
+  - reduce rows_per_chunk cap
+  - synchronize after each chunk
+  - add per-chunk timeout -> raise GPUStackingError (worker already falls back)
 
-## 5) Si encore lent [ ]
-Si `build_candidates` domine:
-- activer le préchargement headers en ThreadPool (étape 3 du plan).
-Si `clustering` domine:
-- on aura besoin d’optimiser côté worker (hors scope de ce patch).
+## What NOT to do
+- Do not change stacking math, weights, sigma-kappa, winsorization logic, or output formats.
+- Do not invent a new config schema.
+- Do not refactor Phase 3/Phase 5 architecture beyond inserting policy calls.
+
+## Logging format (keep it grep-friendly)
+Use consistent prefixes:
+- [GPU_SAFETY] ... (worker/global/phase5)
+- [GPU_SAFETY][GRID] ... (grid_mode)
+- [GPU_SAFETY][P3] ... (optional)
+
+Example:
+[GPU_SAFETY] safe_mode=1 vendor=nvidia hybrid=1 battery=1 vram_free_mb=5120 -> phase5_gpu=0 plan.use_gpu=0 gpu_max_chunk_mb=256 gpu_rows=128 reason="win+laptop/hybrid"
+
+## Verification hints
+- Confirm that in safe_mode, Phase 5 shows "phase5_using_cpu" even if GPU was selected (expected).
+- Confirm that Phase 3 GPU candidate respects plan.use_gpu=False and goes CPU without trying GPU.
+- Confirm that on non-Windows machines, ctx.safe_mode is false and nothing is clamped.
+
+## Rollback safety
+If something breaks, the safest temporary fallback is:
+- keep the new module
+- disable its integration calls (feature becomes inert)
+This should make revert easy.
+

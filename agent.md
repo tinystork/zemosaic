@@ -1,94 +1,157 @@
-# agent.md — ZeMosaic Filter Qt: accélérer Auto-organize + fiabiliser l’overlay
+# agent.md — Mission: GPU Safety Layer (ZeMosaic, repo-current)
 
-## Contexte
-Dans `zemosaic_filter_gui_qt.py`, le bouton **Auto-organize Master Tiles** peut prendre très longtemps.
-Observation utilisateur: CPU global ~10% (symptôme mono-thread) et l’overlay GIF reste affiché “une éternité”.
-On suspecte un coût algorithmique (auto-optimiser / merges) et/ou des lectures FITS séquentielles si des champs manquent.
+You are working on ZeMosaic (Windows/Linux/macOS). The codebase already contains:
+- ResourceTelemetryController in both zemosaic_worker.py and grid_mode.py.
+- Parallel auto-tuning via parallel_utils.ParallelPlan (auto_tune_parallel_plan, detect_parallel_capabilities).
+- Phase 5 GPU selection via gui config keys gpu_selector / gpu_id_phase5 and worker env masking (CUDA_VISIBLE_DEVICES).
+- Phase 3 GPU stacking has a GPU candidate gate + retry + shrink-parallel-plan fallback.
 
-## Objectifs
-- [x] 1) Réduire drastiquement le temps “Auto-organize” sur des datasets ~1000–1500 frames.
-- [x] 2) Garder un comportement utilisateur identique (pas de refactor, pas de changements UI visibles, pas de changement de logique EQ/ALTZ).
-- [x] 3) S’assurer que l’overlay GIF est **toujours** arrêté (succès, erreur, exception, early-return).
+This mission is to ADD a defensive “GPU Safety Layer” that reduces Windows TDR/OS freezes
+(especially hybrid Intel+NVIDIA laptops) WITHOUT changing scientific algorithms and WITHOUT adding user-facing options.
 
-## Portée / contraintes
-- Modifier **uniquement** `zemosaic_filter_gui_qt.py`.
-- Pas de refactor large (pas de déplacement de classes/fichiers).
-- Ne pas toucher au worker module / GPU / autres phases du pipeline.
-- Ne pas changer les règles de split EQ/ALTZ.
-- Ajouter du logging “timing” minimal et lisible.
+## Primary objective
+Create a centralized runtime GPU safety/policy module and route GPU decisions through it,
+so GPU usage becomes auto-adaptive and conservative on risky systems.
 
-## Hypothèses de goulots
-- [x] A) `_optimize_auto_group_result()` peut être coûteux car:
-   - `_merge_group_records_for_auto()` appelle `_find_auto_merge_partner()`
-   - `_find_auto_merge_partner()` construit des `combined_coords` et calcule une dispersion *pour beaucoup de candidats*
-   - Complexité potentiellement énorme (beaucoup de merges x beaucoup de voisins x dispersion coûteuse).
-- [ ] B) Construction de `candidate_infos` peut charger des headers FITS séquentiellement si pas déjà en cache.
+## Files you MUST consider (existing integration points)
+- parallel_utils.py: ParallelCapabilities + ParallelPlan + auto_tune_parallel_plan()
+- zemosaic_worker.py:
+  - global_parallel_plan creation (auto_tune_parallel_plan(kind="global"...))
+  - phase5 parallel_plan_phase5 (auto_tune_parallel_plan(kind="global_reproject"...))
+  - phase5 GPU init uses gpu_id_phase5 + CUDA_VISIBLE_DEVICES masking
+  - phase3 GPU candidate gate uses parallel_plan.use_gpu and retries with _shrink_parallel_plan_for_gpu
+  - ResourceTelemetryController context includes plan fields (use_gpu, gpu_rows_per_chunk, gpu_max_chunk_bytes, use_gpu_phase5)
+- grid_mode.py: has its own GPU concurrency limiter (_compute_gpu_concurrency) + telemetry
+- zemosaic_align_stack_gpu.py: GPU stacking chunk sizing (gpu_rows_per_chunk, gpu_max_chunk_bytes) but no explicit sync/timeout guard
+- zemosaic_gui_qt.py: GPU selector stores gpu_selector and gpu_id_phase5 (do not change GUI unless absolutely needed)
 
-## Plan d’implémentation (surgical)
-### 1) Instrumentation timing (sans spam) [x]
-Ajouter des timings `time.perf_counter()` dans le thread d’auto-group pour mesurer:
-- build candidate payloads
-- prefetch EQMODE (cache json déjà existant)
-- clustering (_CLUSTER_CONNECTED)
-- autosplit/merge worker side
-- borrowing v1
-- auto-optimiser (merge/split/merge)
-Log:
-- vers `logger.info(...)`
-- + ajouter 1–2 lignes synthèse dans `messages.append(...)` (pas une ligne par item)
+## Deliverables
+1) Add ONE new module: zemosaic_gpu_safety.py (or gpu_safety.py if you prefer, but keep imports stable).
+2) Minimal integration changes in:
+   - parallel_utils.py (optional, if you integrate policy inside auto_tune_parallel_plan)
+   - zemosaic_worker.py (required)
+   - grid_mode.py (required)
+   - zemosaic_align_stack_gpu.py (recommended for “short-kernel” guardrails)
+3) Logging/observability: decisions must be logged via existing logger + progress_callback + telemetry context.
 
-Critère: on doit pouvoir lire dans le log où part le temps.
+## Constraints (STRICT)
+- Do NOT change scientific algorithms/results (only resource usage strategy).
+- Do NOT add new user-facing GUI options or config fields.
+- Do NOT refactor unrelated parts of the worker.
+- Keep Linux/macOS behavior intact.
+- Always prefer safety over speed on Windows.
 
-### 2) Accélération AutoOptimiser: éviter la dispersion exacte à chaque candidat [x]
-But: **ne plus** faire `combined_coords = source + other` pour chaque voisin testé.
+---
 
-Approche “borne sûre” (triangle inequality) :
-- Pour chaque record, stocker:
-  - `center` (déjà)
-  - `radius` = max distance(center, point) (calcul O(n) à la création/merge)
-  - `dispersion` (peut rester l’exact initial si dispo, sinon approx)
-- Pour évaluer un merge candidat (source, other):
-  - `dist = angular_distance(source.center, other.center)`
-  - `cross_upper = dist + source.radius + other.radius`
-  - `disp_upper = max(source.dispersion, other.dispersion, cross_upper)`
-  - Si `disp_upper > dispersion_limit` => impossible (rejet)
-  - Sinon => merge “sûr” (la vraie dispersion ne peut pas dépasser cette borne)
+# Implementation details
 
-Ainsi:
-- `_find_auto_merge_partner()` ne calcule plus la dispersion exacte par candidat.
-- Il choisit le meilleur partenaire avec une métrique stable (size_score puis disp_upper puis dist).
+## 1) Create zemosaic_gpu_safety.py
+Implement a small, dependency-safe policy layer with best-effort probing (all guarded by try/except).
 
-Au moment du merge effectif:
-- Construire `combined_entries` (comme avant).
-- Pour `coords`:
-  - concaténer `keep.coords + drop.coords` **une seule fois**.
-  - recalculer `center` via moyenne (comme avant).
-  - recalculer `radius` en un seul passage O(n).
-  - mettre `dispersion` à `disp_upper` (borne conservative) ou `max(old, 2*radius)` si nécessaire.
-=> plus d’appel coûteux `compute_max_separation(combined_coords)` dans la boucle.
+Suggested API:
 
-Option bonus (safe):
-- Ajouter un cap sur le nombre de voisins testés (ex: 64 plus proches) pour éviter O(n²) inutile.
-  - Valeur par défaut conservative, configurable via `_config_value("auto_optimiser_neighbor_cap", 64)` si tu veux.
+- dataclass GpuRuntimeContext:
+  - os_name / platform_system
+  - gpu_available (bool)
+  - gpu_name (str|None)
+  - gpu_vendor (str: "nvidia"/"intel"/"amd"/"apple"/"unknown")
+  - vram_total_bytes, vram_free_bytes (int|None)
+  - has_battery (bool|None)
+  - is_windows (bool)
+  - is_hybrid_graphics (bool|None)  # best-effort: multiple controllers, or "intel"+"nvidia" heuristics
+  - safe_mode (bool)
+  - reasons (list[str])
 
-### 3) Option I/O: préchargement headers en parallèle si nécessaire (simple) [ ]
-Si l’instrumentation montre que la phase “build candidate payloads” est dominante:
-- Détecter les entrées sélectionnées dont `header`/`header_cache` sont absents.
-- Précharger via `ThreadPoolExecutor`:
-  - appeler `_load_header(path)` en threads
-  - protéger `_header_cache` via un `threading.Lock()` (ajouter un lock dans la classe).
-- Objectif: accélérer les lectures FITS sur disques rapides, sans casser la logique.
+- probe_gpu_runtime_context(*, preferred_gpu_id: int|None = None) -> GpuRuntimeContext
+  - Use parallel_utils.detect_parallel_capabilities() if available to get gpu_name + VRAM.
+  - has_battery: psutil.sensors_battery() if available, else Windows-only WMI Win32_Battery if wmi installed.
+  - hybrid: Windows-only WMI Win32_VideoController list (if wmi installed); detect both Intel and NVIDIA in names.
+  - vendor: parse from gpu_name lowercased.
 
-### 4) Overlay: stop garanti [x]
-- Vérifier que les early-returns de `_start_master_tile_organisation()` et `_handle_auto_group_empty_selection()` cachent l’overlay.
-- Dans `_handle_auto_group_finished()` : appeler `_hide_processing_overlay()` dans un `finally` (ou le mettre tout en bas mais garantir qu’aucun return ne l’évite).
-- Dans `_auto_group_background_task()` : entourer la totalité par try/except/finally si besoin, mais surtout garantir l’emit du signal.
+- apply_gpu_safety_to_parallel_plan(
+    plan: ParallelPlan | None,
+    caps: ParallelCapabilities | None,
+    config: Mapping[str, Any] | None,
+    *,
+    operation: str,
+    logger: logging.Logger | None = None,
+  ) -> tuple[ParallelPlan | None, GpuRuntimeContext]
+  - Decide safe_mode triggers:
+    - safe_mode = is_windows AND (has_battery is True OR is_hybrid_graphics is True)
+    - If vendor == "intel" and no discrete GPU detected => disable GPU (plan.use_gpu=False)
+  - Enforce conservative clamps (only in safe_mode):
+    - plan.use_gpu may remain True but clamp GPU chunking:
+      - gpu_max_chunk_bytes <= 256MB (or smaller if VRAM small)
+      - gpu_rows_per_chunk <= 128 (and >= 32)
+    - Additionally clamp effective VRAM fraction (internally) to <= 0.6 if safe_mode.
+  - Always append reasons and log them once (INFO).
 
-## Critères d’acceptation
-- [x] Sur dataset ~1200–1500 frames: Auto-organize passe de “minutes” à “quelques secondes / dizaines de secondes max”.
-- [x] Le log contient une ligne de timing par sous-phase + un résumé AutoOptimiser.
-- [x] L’overlay se ferme toujours (succès/erreur).
-- [x] Pas de modification du comportement utilisateur (mêmes boutons, mêmes options, mêmes séparations EQ/ALTZ).
+- apply_gpu_safety_to_phase5_flag(
+    use_gpu_phase5_flag: bool,
+    ctx: GpuRuntimeContext,
+    *,
+    logger: logging.Logger | None = None,
+  ) -> bool
+  - If safe_mode and vendor/VRAM unknown => force disable for Phase 5 (return False).
+  - If ctx indicates “intel-only” => force disable.
+  - Otherwise keep.
 
-## Fichiers
-- `zemosaic_filter_gui_qt.py` uniquement.
+Also expose:
+- get_env_safe_mode_flag(ctx) -> bool
+  - If safe_mode, set os.environ["ZEMOSAIC_GPU_SAFE_MODE"]="1" (debug-only internal env, not user-facing)
+
+## 2) Integrate in zemosaic_worker.py (REQUIRED)
+Goal: ensure BOTH global plan and phase5 plan go through the safety layer, and Phase 5 GPU flag is guarded.
+
+Integration points:
+- After global_parallel_plan = auto_tune_parallel_plan(kind="global"...):
+  - call apply_gpu_safety_to_parallel_plan(global_parallel_plan, parallel_caps, worker_config_cache, operation="global")
+  - store the returned plan back into worker_config_cache["parallel_plan"] and zconfig.parallel_plan
+  - keep telemetry context working (it already reads plan attributes).
+- After parallel_plan_phase5 = auto_tune_parallel_plan(kind="global_reproject"...):
+  - call apply_gpu_safety_to_parallel_plan(parallel_plan_phase5, caps_for_phase5, worker_config_cache, operation="global_reproject")
+  - store into worker_config_cache["parallel_plan_phase5"] and zconfig.parallel_plan_phase5
+- Before finalizing use_gpu_phase5_flag:
+  - create/probe ctx using preferred_gpu_id=gpu_id_phase5
+  - use use_gpu_phase5_flag = apply_gpu_safety_to_phase5_flag(use_gpu_phase5_flag, ctx)
+  - if ctx.safe_mode: set env var ZEMOSAIC_GPU_SAFE_MODE=1
+- Logging:
+  - Emit one concise summary line:
+    "[GPU_SAFETY] safe_mode={0/1} vendor=... hybrid=... battery=... vram_free_mb=... -> phase5_gpu={0/1}, plan.use_gpu={0/1}, gpu_max_chunk_mb=..."
+  - Flush logger handlers after this summary (best-effort) to survive OS-level crashes.
+
+## 3) Integrate in grid_mode.py (REQUIRED)
+grid_mode currently computes GPU concurrency via _compute_gpu_concurrency(stack_chunk_budget_mb).
+
+Change minimally:
+- Probe ctx via zemosaic_gpu_safety.probe_gpu_runtime_context()
+- If ctx.safe_mode:
+  - force concurrency=1
+  - optionally reduce stack_chunk_budget_mb effective value in concurrency calc (e.g. multiply by 0.6)
+- Log one line:
+  "[GPU_SAFETY][GRID] safe_mode=... -> chosen_concurrency=..."
+
+Do NOT refactor the whole grid_mode pipeline.
+
+## 4) Hardening in zemosaic_align_stack_gpu.py (RECOMMENDED)
+Without changing results:
+- When ZEMOSAIC_GPU_SAFE_MODE=1:
+  - cap rows_per_chunk to a smaller value (e.g. min(current, 64 or 128))
+  - after each chunk combine, call cp.cuda.Stream.null.synchronize()
+  - track per-chunk wall time; if a single chunk exceeds a conservative threshold (e.g. 2–3 seconds),
+    raise GPUStackingError to trigger the existing CPU fallback in zemosaic_worker.
+
+This does not change math; it only reduces risk of long kernels / driver watchdog triggers.
+
+## Acceptance criteria / Definition of done
+- No new GUI options.
+- On Windows hybrid laptops, the logs show safe_mode engaged and GPU usage reduced/disabled automatically.
+- Phase 3 and Phase 5 complete without OS freezes on the problematic dataset (or they auto-fallback to CPU).
+- On Linux desktop, behavior remains effectively unchanged (GPU still used when available).
+- All modified modules import cleanly on machines without CuPy/WMI.
+
+## Quick sanity checks you must run
+- python -m py_compile zemosaic_gpu_safety.py parallel_utils.py zemosaic_worker.py grid_mode.py zemosaic_align_stack_gpu.py
+- Run a CPU-only config (gpu_selector = CPU) to ensure no regressions.
+- Run GPU-enabled config on a safe machine; confirm plan.use_gpu still True when not in safe_mode.
+
