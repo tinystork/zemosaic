@@ -300,7 +300,18 @@ try:  # pragma: no cover - optional dependency guard
     from matplotlib.lines import Line2D
     from matplotlib.patches import Rectangle
     from matplotlib.widgets import RectangleSelector
-except Exception:  # pragma: no cover - matplotlib optional
+    # Monkey-patch matplotlib's _draw_idle to handle deleted canvases without error
+    if FigureCanvasQTAgg is not None:
+        original_draw_idle = FigureCanvasQTAgg._draw_idle
+        def patched_draw_idle(self):
+            try:
+                return original_draw_idle(self)
+            except RuntimeError as e:
+                if "already deleted" in str(e):
+                    return  # Silently ignore draw calls on deleted canvases
+                raise
+        FigureCanvasQTAgg._draw_idle = patched_draw_idle
+except Exception:  # pragma: no matplotlib optional
     FigureCanvasQTAgg = None  # type: ignore[assignment]
     LineCollection = None  # type: ignore[assignment]
     Figure = None  # type: ignore[assignment]
