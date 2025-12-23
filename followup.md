@@ -82,45 +82,16 @@ puis clamp [1..cpu_total].
 # Plan d’exécution (Codex)
 
 ## Étape 1 — Identifier les 3 endroits clés dans zemosaic_worker.py
-1) Phase 4.5 stack_kwargs:
-   Actuel: "winsor_max_workers": max(1, worker_limit_val)
-   -> À changer pour laisser passer 0:
-      if worker_limit_val <= 0: winsor_max_workers = 0
-      else: winsor_max_workers = max(1, worker_limit_val)
-
-2) Deux blocs “winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))”
-   (il y en a 2 occurrences dans le fichier)
-   -> Remplacer par une résolution AUTO effective:
-      - cpu_total = os.cpu_count() or 1
-      - cfg = int(winsor_worker_limit_config) (guard try/except)
-      - if cfg <= 0:
-          candidate = global_parallel_plan.cpu_workers si dispo (>0)
-          sinon candidate = effective_base_workers si dispo (>0)
-          sinon candidate = cpu_total
-        else:
-          candidate = cfg
-      - winsor_worker_limit = max(1, min(int(candidate), cpu_total))
-
-   Important: ici on STOCKE une valeur >=1 dans global_wcs_plan / sds_stack_params.
+- [x] Phase 4.5 stack_kwargs: laisser passer 0 → winsor_max_workers = 0, sinon clamp à >=1.
+- [x] Deux blocs “winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))” remplacés par une résolution AUTO effective (global_parallel_plan > effective_base_workers > cpu_total) et stockage clampé >=1.
 
 ## Étape 2 — Logging minimal
-- Au moment où winsor_worker_limit est fixé pour global_wcs_plan:
-  - Si cfg <= 0, loguer "AUTO cfg=0 -> resolved=N"
-  - Sinon conserver le message existant (ou ajouter "(manual)").
-
-- Pour Phase 4.5:
-  - Si worker_limit_val <= 0, loguer workers="AUTO(0)" au lieu de 0.
+- [x] cfg <= 0 dans global_wcs_plan: log INFO_DETAIL "AUTO cfg=0 -> resolved=N".
+- [x] Phase 4.5: workers loggué en "AUTO(0)" quand on laisse passer 0.
 
 ## Étape 3 — Vérifs rapides
-1) py_compile:
-   python -m py_compile zemosaic_worker.py
-
-2) Test fonctionnel simple:
-   - Mettre winsor_worker_limit=0 dans la config/GUI
-   - Vérifier dans les logs:
-     - une ligne "AUTO ... resolved=<N>"
-     - Phase 4.5 n’affiche pas un workers=0 ambigu
-   - Vérifier que le run n’active pas une explosion de workers: N doit rester borné par cpu_total et idéalement proche du parallel plan.
+- [x] py_compile: `python -m py_compile zemosaic_worker.py`
+- [ ] Test fonctionnel simple (config GUI winsor_worker_limit=0, vérifier logs et bornage workers)
 
 ## Notes importantes
 - Ne PAS propager 0 dans global_wcs_plan / sds_stack_params (risque de cap=0 ailleurs).
