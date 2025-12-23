@@ -1,94 +1,72 @@
-# Follow-up: Implémentation détaillée
+# Follow-up: Implémentation (Windows power status) + ajustement safe_mode/reasons
 
-## 1) GUI (zemosaic_gui_qt.py)
-### 1.1 Localiser l'onglet "System"
-- [x] Repérer la zone qui contient les paramètres système / GPU safety / workers.
-- [x] Ajouter un petit groupbox "Phase 5 (Reproject)" ou une ligne dans la section GPU.
+## 1) Implémenter un probe Windows fiable (ctypes)
+Dans `zemosaic_gpu_safety.py`, ajouter (Windows only) un helper:
 
-### 1.2 Widgets
-- [x] QCheckBox: "Auto (recommended)"
-  - [x] objectName (ex): `chk_phase5_chunk_auto`
-  - [x] default checked = True
-- [x] QSpinBox:
-  - [x] label: "Phase 5 chunk (MB)"
-  - [x] objectName (ex): `spin_phase5_chunk_mb`
-  - [x] min=64, max=1024, singleStep=64
-  - [x] defaultValue=128
-  - [x] enabled = False si Auto checked
-- [x] Side note (discret):
-  - [x] soit QLabel en small font (style "muted") OU tooltip sur le label/spinbox
-  - [x] texte: "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution."
+- importer localement `ctypes` et `ctypes.wintypes` dans la fonction (pour éviter impact cross-platform).
+- définir la struct SYSTEM_POWER_STATUS:
+  - BYTE ACLineStatus
+  - BYTE BatteryFlag
+  - BYTE BatteryLifePercent
+  - BYTE SystemStatusFlag
+  - DWORD BatteryLifeTime
+  - DWORD BatteryFullLifeTime
 
-### 1.3 Connexions
-- [x] `chk_phase5_chunk_auto.toggled.connect(spin.setDisabled/Enabled)`
-  - [x] logique: si Auto True -> spin disabled, sinon enabled
-- [x] À la sauvegarde des settings:
-  - [x] lire checkbox + spinbox et stocker dans la config
-- [x] Au chargement:
-  - [x] initialiser checkbox/spinbox depuis config
-  - [x] appliquer enabled/disabled
+- appeler `kernel32.GetSystemPowerStatus(byref(status))`
 
-### 1.4 i18n
-- [x] Si le projet utilise un helper `tr()` / dictionnaire de traductions:
-  - [x] ajouter les clés FR/EN correspondantes:
-    - [x] "Auto (recommended)" -> "Auto (recommandé)"
-    - [x] "Phase 5 chunk (MB)" -> "Chunk Phase 5 (Mo)"
-    - [x] warning -> "⚠ Peut provoquer des instabilités sur certains laptops / GPU hybrides. À utiliser avec prudence."
-- [x] Si pas d'i18n centralisé: garder en anglais OU suivre le pattern existant du fichier.
+Interprétation:
+- ACLineStatus:
+  - 0 = sur batterie
+  - 1 = sur secteur
+  - 255 = unknown (dans ce cas fallback)
+- on_battery = (ACLineStatus == 0)
+- power_plugged = (ACLineStatus == 1)
+- battery_present (optionnel) :
+  - BatteryFlag == 128 => "No system battery" (donc has_battery=False)
+  - sinon has_battery=True (si BatteryFlag != 255 unknown)
 
-## 2) Config (zemosaic_config.py)
-### 2.1 Ajouter les champs par défaut
-- [x] `phase5_chunk_auto = True`
-- [x] `phase5_chunk_mb = 128`
-Où sont définis les defaults (dataclass/dict), suivre le style existant.
+Retourner ces infos au format (has_battery, power_plugged, on_battery) quand fiable, sinon None pour fallback.
 
-### 2.2 Load/save
-- [x] Lors du chargement d'un ancien config, assurer fallback sur defaults (get(..., default))
-- [x] Lors de la sauvegarde, écrire les deux champs.
+## 2) Modifier _probe_battery_status()
+Ordre de priorité recommandé:
+1) Windows + ctypes GetSystemPowerStatus (si ACLineStatus != 255)
+2) psutil.sensors_battery()
+3) WMI Win32_Battery() (déduire seulement has_battery)
 
-## 3) Worker (zemosaic_worker.py)
-### 3.1 Localiser Phase 5 plan
-Dans la section Phase 5 (global reproject):
-- [x] Identifier le plan/obj qui contient `gpu_max_chunk_bytes` (ou équivalent)
-- [x] Identifier l'opération/label: `operation="global_reproject"`
+Important:
+- Ne pas écraser une info déjà fiable par une info moins fiable.
+- Si power_plugged est connu mais has_battery ne l’est pas, garder power_plugged et compléter has_battery via WMI.
 
-### 3.2 Appliquer override (après safety ou avant ?)
-Recommandation:
-- [x] Appliquer override **après** `apply_gpu_safety_to_parallel_plan(..., operation="global_reproject")`
-  pour que:
-  - [x] safety fixe les autres paramètres
-  - [x] l'utilisateur force uniquement le budget bytes final
+## 3) Corriger la logique safe_mode + reasons (probe_gpu_runtime_context)
+Actuel:
+- safe_mode = True si Windows and has_battery True   (trop agressif)
+- reasons "battery_detected" ajouté juste car has_battery True (confus)
 
-Pseudo:
-- [x] lire config:
-  - [x] `auto = cfg.phase5_chunk_auto`
-  - [x] `mb = cfg.phase5_chunk_mb`
-- [x] si `not auto`:
-  - [x] `forced_bytes = int(mb) * 1024 * 1024`
-  - [x] clamp: `forced_bytes = max(64MB, min(1024MB, forced_bytes))` (mêmes bornes que UI)
-  - [x] si `hasattr(plan, "gpu_max_chunk_bytes")`: set
-  - [x] log INFO:
-    "Phase5 GPU chunk override: {mb} MB ({forced_bytes} bytes) for global_reproject"
-- [x] sinon: ne rien faire
+Nouveau:
+- if is_windows and has_battery is True: reasons.append("battery_present")
+- if is_windows and on_battery is True:
+    safe_mode = True
+    reasons.append("on_battery")
+- if is_windows and is_hybrid is True:
+    safe_mode = True
+    reasons.append("hybrid_graphics")
 
-### 3.3 Robustesse
-- [x] Si le champ n'existe pas, log DEBUG et ne pas planter.
-- [x] Ne pas modifier les autres opérations.
-- [x] Ne pas toucher `gpu_rows_per_chunk` ici (ça reste géré par autotune/safety). (On pourra le faire ensuite si besoin.)
+=> safe_mode dépend de (on_battery OR hybrid), pas de "battery_present".
 
-## 4) Tests rapides
-### 4.1 Test manuel GUI
-- [x] Lancer app
-- [x] Vérifier:
-  - [x] Auto coché -> spinbox grisé
-  - [x] décocher -> spinbox activé
-  - [x] changer valeur -> sauvegarder -> relancer -> valeur persistée
+## 4) Logs
+Les logs existants affichent déjà power_plugged/on_battery/has_battery.
+S'assurer que le champ `battery=` continue à afficher `has_battery` (ok),
+mais que `reasons=` n’induise plus en erreur:
+- "battery_present" au lieu de "battery_detected"
+- "on_battery" seulement si on_battery True
 
-### 4.2 Test run
-- [x] Avec override (ex 256MB), lancer un run court
-- [x] Vérifier présence du log "Phase5 GPU chunk override: 256 MB"
-- [x] Comparer le nombre de chunks / durée Phase 5 (optionnel)
+## 5) Mini test manuel (sans framework)
+Sur Windows:
+- Lancer une exécution courte (ou un appel isolé à probe_gpu_runtime_context).
+- Vérifier log:
+  - Sur secteur: power_plugged=True, on_battery=False, reasons contient battery_present + hybrid_graphics (si hybride), PAS on_battery
+  - Débrancher: power_plugged=False, on_battery=True, reasons contient on_battery (+hybrid_graphics si hybride)
 
-## 5) Notes
-- [x] Ne pas renommer/retoucher d'autres paramètres existants.
-- [x] Garder l'UI sobre: une ligne, un tooltip, pas plus.
+## 6) Ne pas toucher
+- Ne pas modifier la taille de chunk ici (c’est une autre mission).
+- Ne pas modifier le comportement batch size=0 vs >1.

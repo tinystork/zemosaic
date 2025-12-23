@@ -1,43 +1,32 @@
-# Mission: Exposer "Phase 5 GPU chunk (Reproject)" dans l'onglet System (Auto + Spinbox), appliquer uniquement à global_reproject (no-refactor)
+# Mission: Corriger la détection secteur/batterie Windows + clarifier GPU safety (no-refactor)
 
-## Contexte
-Phase 5 "Reproject & Coadd" peut être sous-performante sur certaines configs (micro-chunking).
-Nous voulons permettre aux power users de forcer la taille de chunk GPU pour cette phase seulement.
+## Problème observé
+Dans les logs GPU_SAFETY, on voit `battery=True` alors que l'utilisateur est sur secteur (`power_plugged=True`, `on_battery=False`).
+Cela déclenche/affiche des raisons "battery_detected" et peut activer `safe_mode` même sur secteur, ce qui est confus.
 
-## Objectif UX
-Dans l'onglet "System" (GUI Qt):
-- [x] Checkbox: "Auto (recommended)"
-- [x] Spinbox: "Phase 5 chunk (MB)" (désactivé si Auto coché)
-- [x] Side note / tooltip discret:
-  "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution."
-- [x] Valeurs raisonnables:
-  - min 64 MB, max 1024 MB, step 64 MB, default 128 MB (si override utilisé)
-- [x] Par défaut: Auto activé.
+Cause probable:
+- `has_battery=True` signifie seulement "une batterie est présente" (PC portable), pas "en train de tourner sur batterie".
+- Sous Windows, psutil/WMI peuvent renvoyer des états ambigus; la source la plus fiable est GetSystemPowerStatus (ACLineStatus).
 
-## Objectif technique
-- [x] Stocker dans la config:
-  - `phase5_chunk_auto: bool`
-  - `phase5_chunk_mb: int`
-- [x] Appliquer uniquement lors de la construction du plan de Phase 5, operation="global_reproject":
-  - Si Auto: ne rien changer (laisser safety/autotune faire)
-  - Si override: forcer `plan.gpu_max_chunk_bytes = phase5_chunk_mb * 1024 * 1024`
-    (clamp interne optionnel si champ existe)
-  - Ajouter un log INFO: "Phase5 GPU chunk override: XXX MB (global_reproject)"
+## Objectifs
+1) Sous Windows, utiliser GetSystemPowerStatus pour déterminer:
+   - power_plugged (ACLineStatus==1)
+   - on_battery (ACLineStatus==0)
+   - (optionnel) battery_present depuis BatteryFlag si possible, sinon fallback WMI.
+2) Ne plus activer `safe_mode` uniquement parce que `has_battery` est True.
+   - `safe_mode` doit être True si:
+     - Windows ET (on_battery == True)  OU  (hybrid_graphics == True)
+3) Clarifier les raisons/logs:
+   - Remplacer "battery_detected" par "battery_present" (information) quand has_battery True.
+   - Ajouter "on_battery" uniquement quand on_battery True.
+   - Garder "hybrid_graphics" inchangé.
+4) Patch minimal, sans refactor, toucher uniquement zemosaic_gpu_safety.py (et éventuellement logs si nécessaire).
 
-## Contraintes
-- No refactor
-- Ne pas impacter les autres phases/ops GPU
-- Ne pas changer le comportement batch size=0 vs >1
-- Respecter i18n si le projet le fait déjà (traductions FR/EN via util existante)
+## Fichier principal
+- zemosaic_gpu_safety.py
 
-## Fichiers à modifier (probables)
-- `zemosaic_gui_qt.py` (UI: onglet System)
-- `zemosaic_config.py` (sauvegarde/chargement des nouveaux champs)
-- `zemosaic_worker.py` (application override sur le plan global_reproject)
-- éventuellement `zemosaic_localization.py` si les strings passent par un système de traduction
-
-## Acceptation
-- [x] Le GUI affiche Auto + spinbox, spinbox grisé quand Auto est actif.
-- [x] La config persiste correctement (redémarrage app -> valeur retrouvée).
-- [x] En run, si override: log indique la valeur et le plan utilise ce chunk (bytes).
-- [x] Si Auto: aucun changement.
+## Critères d'acceptation
+- Sur secteur: logs indiquent `battery_present=True`, `power_plugged=True`, `on_battery=False`
+  et `safe_mode` dépend du hybrid (pas de safe_mode uniquement parce qu'il y a une batterie).
+- Sur batterie: `on_battery=True` et raison "on_battery" apparaît, safe_mode activé.
+- Aucun crash si ctypes indisponible (fallback psutil/WMI comme avant).
