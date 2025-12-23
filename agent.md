@@ -9,18 +9,18 @@ Cause probable:
 - Sous Windows, psutil/WMI peuvent renvoyer des états ambigus; la source la plus fiable est GetSystemPowerStatus (ACLineStatus).
 
 ## Objectifs
-1) Sous Windows, utiliser GetSystemPowerStatus pour déterminer:
-   - power_plugged (ACLineStatus==1)
-   - on_battery (ACLineStatus==0)
-   - (optionnel) battery_present depuis BatteryFlag si possible, sinon fallback WMI.
-2) Ne plus activer `safe_mode` uniquement parce que `has_battery` est True.
-   - `safe_mode` doit être True si:
-     - Windows ET (on_battery == True)  OU  (hybrid_graphics == True)
-3) Clarifier les raisons/logs:
-   - Remplacer "battery_detected" par "battery_present" (information) quand has_battery True.
-   - Ajouter "on_battery" uniquement quand on_battery True.
-   - Garder "hybrid_graphics" inchangé.
-4) Patch minimal, sans refactor, toucher uniquement zemosaic_gpu_safety.py (et éventuellement logs si nécessaire).
+1) [x] Sous Windows, utiliser GetSystemPowerStatus pour déterminer:
+   - [x] power_plugged (ACLineStatus==1)
+   - [x] on_battery (ACLineStatus==0)
+   - [x] (optionnel) battery_present depuis BatteryFlag si possible, sinon fallback WMI.
+2) [x] Ne plus activer `safe_mode` uniquement parce que `has_battery` est True.
+   - [x] `safe_mode` doit être True si:
+     - [x] Windows ET (on_battery == True)  OU  (hybrid_graphics == True)
+3) [x] Clarifier les raisons/logs:
+   - [x] Remplacer "battery_detected" par "battery_present" (information) quand has_battery True.
+   - [x] Ajouter "on_battery" uniquement quand on_battery True.
+   - [x] Garder "hybrid_graphics" inchangé.
+4) [x] Patch minimal, sans refactor, toucher uniquement zemosaic_gpu_safety.py (et éventuellement logs si nécessaire).
 
 ## Fichier principal
 - zemosaic_gpu_safety.py
