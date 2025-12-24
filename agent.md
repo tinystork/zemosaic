@@ -97,3 +97,7 @@ Sans framework lourd, au minimum :
 ## Output attendu
 - Un patch git propre (diff) limité aux fichiers nécessaires.
 - Une note courte dans le commit message (ex: “Clamp Intertile threadpool workers to prevent Windows crashes on large pair counts”).
+
+## Suivi
+- [x] Localisation et clamp du ThreadPool Intertile effectués.
+- [x] Logs enrichis pour montrer workers demandés vs effectifs.

@@ -28,13 +28,13 @@ Attendu :
 - clamp à 2–4
 
 ## Checklist patch
-- [ ] Localiser exactement où est loggé `[Intertile] Parallel: threadpool workers=...`
-- [ ] Ajouter `compute_intertile_workers_limit(...)` (ou nom similaire)
-- [ ] Utiliser `effective_workers` dans `ThreadPoolExecutor`
-- [ ] Ajouter log “requested -> effective + reasons”
-- [ ] (Optionnel) `cv2.setNumThreads(1)` best-effort pendant Intertile
-- [ ] Vérifier lint/format, pas d’imports cassants
-- [ ] Run local rapide si possible
+- [x] Localiser exactement où est loggé `[Intertile] Parallel: threadpool workers=...`
+- [x] Ajouter `compute_intertile_workers_limit(...)` (ou nom similaire)
+- [x] Utiliser `effective_workers` dans `ThreadPoolExecutor`
+- [x] Ajouter log “requested -> effective + reasons”
+- [x] (Optionnel) `cv2.setNumThreads(1)` best-effort pendant Intertile
+- [x] Vérifier lint/format, pas d’imports cassants
+- [x] Run local rapide si possible
 
 ## Commit message suggéré
 `Clamp intertile ThreadPool workers automatically to prevent Windows crashes on large pair counts`
