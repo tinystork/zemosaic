@@ -54,7 +54,7 @@ import time
 import sys
 import platform
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from functools import lru_cache
 from contextlib import nullcontext
 from pathlib import Path
@@ -2615,25 +2615,58 @@ def compute_intertile_affine_calibration(
                 executor.submit(_process_overlap_pair, idx, overlap): idx
                 for idx, overlap in enumerate(overlaps, 1)
             }
-            for future in as_completed(future_map):
-                idx = future_map[future]
-                pairs_local, connectivity_entry = future.result()
-                if pairs_local:
-                    pair_entries.extend(pairs_local)
-                if connectivity_entry:
-                    i_conn, j_conn, w_conn = connectivity_entry
-                    connectivity[i_conn] += w_conn
-                    connectivity[j_conn] += w_conn
-                if progress_callback:
-                    try:
-                        progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
-                    except Exception:
-                        pass
-                    if idx % 5 == 0:
+            pending = set(future_map.keys())
+            done_count = 0
+            last_completed_idx: int | None = None
+            last_progress_ts = time.time()
+            last_heartbeat_ts = time.time()
+
+            while pending:
+                done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+                now = time.time()
+
+                if done:
+                    for future in done:
+                        idx = future_map[future]
                         try:
-                            progress_callback("phase5_intertile", idx, total_pairs)
-                        except Exception:
-                            pass
+                            pairs_local, connectivity_entry = future.result()
+                        except Exception as exc:
+                            _log_intertile(f"Pair future failed idx={idx}: {exc}", level="ERROR")
+                            continue
+
+                        if pairs_local:
+                            pair_entries.extend(pairs_local)
+                        if connectivity_entry:
+                            i_conn, j_conn, w_conn = connectivity_entry
+                            connectivity[i_conn] += w_conn
+                            connectivity[j_conn] += w_conn
+
+                        done_count += 1
+                        last_completed_idx = idx
+                        last_progress_ts = now
+
+                        if progress_callback:
+                            try:
+                                progress_callback("phase5_intertile_pairs", done_count, int(total_pairs))
+                            except Exception:
+                                pass
+                            if done_count % 5 == 0:
+                                try:
+                                    progress_callback("phase5_intertile", done_count, total_pairs)
+                                except Exception:
+                                    pass
+
+                elif now - last_progress_ts >= 10.0 and now - last_heartbeat_ts >= 10.0:
+                    sample_pending_idx = [future_map[fut] for fut in list(pending)[:5]]
+                    _log_intertile(
+                        (
+                            f"Heartbeat: done={done_count}/{total_pairs} "
+                            f"pending={len(pending)} last_completed_idx={last_completed_idx} "
+                            f"sample_pending_idx={sample_pending_idx}"
+                        ),
+                        level="INFO",
+                    )
+                    last_heartbeat_ts = now
     else:
         for idx, overlap in enumerate(overlaps, 1):
             pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)

@@ -4,8 +4,8 @@
 Instrumenter la phase **Phase5 Intertile Pairs** pour diagnostiquer les “plantages silencieux / freezes” sans lancer un gros refactor.
 
 Objectifs précis (patch minimal) :
-1) Corriger la progression en mode parallèle : actuellement on envoie `idx` (ID de paire renvoyé par `as_completed`), ce qui n’est **pas** un compteur monotone. Remplacer par un `done_count` qui s’incrémente à chaque future terminée.
-2) Ajouter un **heartbeat** : si aucune future ne termine pendant un certain délai (ex. 10s), logger l’état (done/pending) + un petit échantillon des indices de paires encore en cours.
+- [x] Corriger la progression en mode parallèle : actuellement on envoie `idx` (ID de paire renvoyé par `as_completed`), ce qui n’est **pas** un compteur monotone. Remplacer par un `done_count` qui s’incrémente à chaque future terminée.
+- [x] Ajouter un **heartbeat** : si aucune future ne termine pendant un certain délai (ex. 10s), logger l’état (done/pending) + un petit échantillon des indices de paires encore en cours.
 
 ## Contraintes
 - Patch **minimal**, **pas de refactor**, pas de changement d’algo intertile.
