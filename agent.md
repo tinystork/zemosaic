@@ -24,14 +24,14 @@ This is OS-agnostic:
 - Function: `compute_intertile_affine_calibration(...)`
 
 ## Patch plan
-1) Locate the section that currently does:
+1) [x] Locate the section that currently does:
    - compute `effective_workers` and logs:
      `Parallel: threadpool workers=... -> effective_workers ...`
    - then unconditionally executes:
      `with ThreadPoolExecutor(max_workers=effective_workers) as executor: ...`
    This is wrong when `effective_workers == 1`.
 
-2) Refactor ONLY this part:
+2) [x] Refactor ONLY this part:
    - After computing `effective_workers` and logging the clamp, branch:
 
    **If `effective_workers <= 1`:**
@@ -46,13 +46,13 @@ This is OS-agnostic:
    **Else (`effective_workers >= 2`):**
    - Keep current ThreadPoolExecutor + wait/heartbeat logic unchanged.
 
-3) Ensure the old `use_parallel` guard still works:
+3) [x] Ensure the old `use_parallel` guard still works:
    - The intention is:
      - “Parallel requested” when `cpu_workers > 1` and `total_pairs >= 4`
      - But *actual* use of a threadpool must require `effective_workers >= 2`
    - Easiest: keep `use_parallel` as-is, but inside the block branch by `effective_workers`.
 
-4) Keep faulthandler enable/disable logic intact.
+4) [x] Keep faulthandler enable/disable logic intact.
 
 ## Acceptance criteria
 - When logs show clamping to 1 worker (safe_mode or other clamp reasons), we must also see the new line:

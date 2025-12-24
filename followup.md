@@ -10,16 +10,16 @@
 - Sequential main-thread avoids thread-safety landmines in native libs (wcslib/reproject/opencv).
 
 ## Code review checklist
-- [ ] Only `zemosaic_utils.py` modified.
-- [ ] In the “use_parallel” block:
-  - [ ] there is a branch `if effective_workers <= 1:` that runs the sequential loop
-  - [ ] ThreadPoolExecutor is only used when `effective_workers >= 2`
-- [ ] Progress logging cadence unchanged:
-  - [ ] `pairs_done=...` every 25
-  - [ ] `progress_callback("phase5_intertile_pairs", ...)` kept
-  - [ ] `progress_callback("phase5_intertile", ...)` kept every 5
-- [ ] Heartbeat logic remains only in ThreadPool path.
-- [ ] No change to `_process_overlap_pair` math or pair generation.
+- [x] Only `zemosaic_utils.py` modified.
+- [x] In the “use_parallel” block:
+  - [x] there is a branch `if effective_workers <= 1:` that runs the sequential loop
+  - [x] ThreadPoolExecutor is only used when `effective_workers >= 2`
+- [x] Progress logging cadence unchanged:
+  - [x] `pairs_done=...` every 25
+  - [x] `progress_callback("phase5_intertile_pairs", ...)` kept
+  - [x] `progress_callback("phase5_intertile", ...)` kept every 5
+- [x] Heartbeat logic remains only in ThreadPool path.
+- [x] No change to `_process_overlap_pair` math or pair generation.
 
 ## Repro validation (Windows)
 1) Run the dataset that previously produced:
