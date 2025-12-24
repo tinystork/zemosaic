@@ -756,6 +756,32 @@ class ZeMosaicQtWorker(QObject):
         self.stage_progress.emit("phase4_grid", total_val, total_val)
 
     def _on_listener_finished(self) -> None:
+        exitcode = None
+        if self._process is not None:
+            try:
+                exitcode = self._process.exitcode
+            except Exception:
+                exitcode = None
+
+        if (
+            exitcode not in (None, 0)
+            and not self._stop_requested
+            and not self._cancelled
+            and not self._had_error
+        ):
+            # If the worker was killed (OOM/crash), the queue listener finishes quietly;
+            # mark the run as failed so the GUI cannot emit a false SUCCESS.
+            self._had_error = True
+            self._last_error = (
+                f"Worker process terminated unexpectedly (exitcode={exitcode}). "
+                "Likely OOM/crash."
+            )
+            self.log_message_emitted.emit(
+                "ERROR",
+                self._last_error,
+                {"exitcode": exitcode},
+            )
+
         success = not self._had_error and not self._stop_requested and not self._cancelled
         if success:
             message = ""

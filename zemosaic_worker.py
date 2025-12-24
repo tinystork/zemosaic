@@ -8436,20 +8436,25 @@ def _run_shared_phase45_phase5_pipeline(
                 stats_callback=_emit_phase5_stats,
                 existing_master_tiles_mode=existing_master_tiles_mode,
             )
+            if final_mosaic_data_HWC is None or final_mosaic_coverage_HW is None:
+                pcb(
+                    log_key_phase5_failed or "run_error_phase5_assembly_failed_unknown",
+                    prog=base_progress_phase5 + progress_weight_phase5,
+                    lvl="ERROR",
+                )
+                _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="failed")
+                raise RuntimeError("Phase 5 assembly returned no mosaic output")
         except Exception as exc:
             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
-            final_mosaic_data_HWC = None
+            pcb(
+                log_key_phase5_failed or "run_error_phase5_assembly_failed_unknown",
+                prog=base_progress_phase5 + progress_weight_phase5,
+                lvl="ERROR",
+            )
+            _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="failed")
+            raise
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
         log_key_phase5_finished = "run_info_phase5_finished_reproject_coadd"
-
-    if final_mosaic_data_HWC is None:
-        pcb(
-            log_key_phase5_failed or "run_error_phase5_assembly_failed_unknown",
-            prog=base_progress_phase5 + progress_weight_phase5,
-            lvl="ERROR",
-        )
-        _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="failed")
-        return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
 
     current_global_progress = base_progress_phase5 + progress_weight_phase5
 
@@ -14643,6 +14648,17 @@ def assemble_final_mosaic_reproject_coadd(
         logger.warning("phase6: alpha propagation failed: %s", e_alpha_norm)
 
     # Defer memmap cleanup to Phase 6 after final save
+
+    if mosaic_data is None or coverage is None:
+        raise RuntimeError(
+            "assemble_final_mosaic_reproject_coadd produced no mosaic or coverage output",
+        )
+    if not isinstance(mosaic_data, np.ndarray) or not isinstance(coverage, np.ndarray):
+        raise RuntimeError("assemble_final_mosaic_reproject_coadd returned invalid array types")
+    if mosaic_data.shape[:2] != coverage.shape[:2]:
+        raise RuntimeError(
+            f"assemble_final_mosaic_reproject_coadd output shape mismatch: mosaic={mosaic_data.shape}, coverage={coverage.shape}",
+        )
 
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_reproject_coadd")
     _pcb(
