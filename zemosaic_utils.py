@@ -1195,6 +1195,80 @@ def _force_cpu_intertile() -> bool:
     value = value.strip().lower()
     return value not in {"", "0", "false", "no", "off"}
 
+
+def compute_intertile_workers_limit(
+    requested_workers: int | None,
+    pairs_count: int,
+    preview_size: int,
+    cpu_total: int | None = None,
+    platform_system: str | None = None,
+    available_mb: int | None = None,
+) -> tuple[int, list[str]]:
+    """Clamp the intertile ThreadPool worker count to safer values.
+
+    Returns the effective worker count and the list of reasons that influenced the
+    decision.
+    """
+
+    reasons: list[str] = []
+    cpu_total = cpu_total if cpu_total and cpu_total > 0 else os.cpu_count() or 1
+    platform_name = (platform_system or platform.system() or "").lower()
+
+    requested_int = None
+    if requested_workers is not None and requested_workers > 0:
+        try:
+            requested_int = int(requested_workers)
+        except Exception:
+            requested_int = None
+    if requested_int is not None and requested_int > 16:
+        reasons.append("cap16")
+        requested_int = 16
+    base = max(1, min(cpu_total - 1, cpu_total))
+    if requested_int is not None:
+        if requested_int > cpu_total:
+            reasons.append("requested>cpu")
+        base = max(1, min(requested_int, cpu_total))
+    else:
+        reasons.append("auto_base")
+
+    hard_cap = 8
+    if "windows" in platform_name:
+        hard_cap = min(hard_cap, 6)
+        reasons.append("windows_cap")
+
+    if pairs_count >= 4000:
+        hard_cap = min(hard_cap, 4)
+        reasons.append("pairs>=4000")
+    elif pairs_count >= 2000:
+        hard_cap = min(hard_cap, 6)
+        reasons.append("pairs>=2000")
+
+    relaxed_cap = min(8, max(1, cpu_total - 1))
+    if pairs_count < 200 and relaxed_cap > hard_cap:
+        hard_cap = relaxed_cap
+        reasons.append("pairs<200")
+
+    available_mb_val = available_mb
+    if available_mb_val is None:
+        try:
+            import psutil  # type: ignore
+
+            available_mb_val = int(psutil.virtual_memory().available / (1024 * 1024))
+        except Exception:
+            available_mb_val = None
+    if available_mb_val is not None:
+        if available_mb_val < 3500:
+            hard_cap = min(hard_cap, 2)
+            reasons.append("ram<3500mb")
+        elif available_mb_val < 6000:
+            hard_cap = min(hard_cap, 4)
+            reasons.append("ram<6000mb")
+
+    effective = max(1, min(base, hard_cap))
+    if not reasons:
+        reasons.append("no_clamp")
+    return effective, reasons
+
 from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
 try:
     from reproject import reproject_interp
@@ -2507,13 +2581,36 @@ def compute_intertile_affine_calibration(
     total_pairs = len(overlaps)
     use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
     if use_parallel:
-        workers = min(cpu_workers, 16) if cpu_workers is not None else 1
-        workers = max(1, workers)
+        requested_workers = None
+        try:
+            requested_workers = int(cpu_workers) if cpu_workers is not None else None
+        except Exception:
+            requested_workers = None
+        if requested_workers is not None and requested_workers < 1:
+            requested_workers = 1
+
+        try:
+            cv2.setNumThreads(1)
+            _log_intertile(
+                "Parallel: forcing cv2.setNumThreads(1) to limit oversubscription.",
+                level="DEBUG_DETAIL",
+            )
+        except Exception:
+            pass
+
+        effective_workers, clamp_reasons = compute_intertile_workers_limit(
+            requested_workers,
+            total_pairs,
+            preview_size,
+        )
+        reason_label = ",".join(clamp_reasons) if clamp_reasons else "no_clamp"
+        display_requested = requested_workers if requested_workers is not None else "auto"
         _log_intertile(
-            f"Parallel: threadpool workers={workers} pairs={total_pairs} preview={preview_size}",
+            f"Parallel: threadpool workers={display_requested} -> {effective_workers} ({reason_label}) "
+            f"pairs={total_pairs} preview={preview_size}",
             level="INFO",
         )
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_map = {
                 executor.submit(_process_overlap_pair, idx, overlap): idx
                 for idx, overlap in enumerate(overlaps, 1)
