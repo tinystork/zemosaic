@@ -54,7 +54,8 @@ import time
 import sys
 import platform
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import faulthandler
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from functools import lru_cache
 from contextlib import nullcontext
 from pathlib import Path
@@ -1195,6 +1196,80 @@ def _force_cpu_intertile() -> bool:
     value = value.strip().lower()
     return value not in {"", "0", "false", "no", "off"}
 
+
+def compute_intertile_workers_limit(
+    requested_workers: int | None,
+    pairs_count: int,
+    preview_size: int,
+    cpu_total: int | None = None,
+    platform_system: str | None = None,
+    available_mb: int | None = None,
+) -> tuple[int, list[str]]:
+    """Clamp the intertile ThreadPool worker count to safer values.
+
+    Returns the effective worker count and the list of reasons that influenced the
+    decision.
+    """
+
+    reasons: list[str] = []
+    cpu_total = cpu_total if cpu_total and cpu_total > 0 else os.cpu_count() or 1
+    platform_name = (platform_system or platform.system() or "").lower()
+
+    requested_int = None
+    if requested_workers is not None and requested_workers > 0:
+        try:
+            requested_int = int(requested_workers)
+        except Exception:
+            requested_int = None
+    if requested_int is not None and requested_int > 16:
+        reasons.append("cap16")
+        requested_int = 16
+    base = max(1, min(cpu_total - 1, cpu_total))
+    if requested_int is not None:
+        if requested_int > cpu_total:
+            reasons.append("requested>cpu")
+        base = max(1, min(requested_int, cpu_total))
+    else:
+        reasons.append("auto_base")
+
+    hard_cap = 8
+    if "windows" in platform_name:
+        hard_cap = min(hard_cap, 6)
+        reasons.append("windows_cap")
+
+    if pairs_count >= 4000:
+        hard_cap = min(hard_cap, 4)
+        reasons.append("pairs>=4000")
+    elif pairs_count >= 2000:
+        hard_cap = min(hard_cap, 6)
+        reasons.append("pairs>=2000")
+
+    relaxed_cap = min(8, max(1, cpu_total - 1))
+    if pairs_count < 200 and relaxed_cap > hard_cap:
+        hard_cap = relaxed_cap
+        reasons.append("pairs<200")
+
+    available_mb_val = available_mb
+    if available_mb_val is None:
+        try:
+            import psutil  # type: ignore
+
+            available_mb_val = int(psutil.virtual_memory().available / (1024 * 1024))
+        except Exception:
+            available_mb_val = None
+    if available_mb_val is not None:
+        if available_mb_val < 3500:
+            hard_cap = min(hard_cap, 2)
+            reasons.append("ram<3500mb")
+        elif available_mb_val < 6000:
+            hard_cap = min(hard_cap, 4)
+            reasons.append("ram<6000mb")
+
+    effective = max(1, min(base, hard_cap))
+    if not reasons:
+        reasons.append("no_clamp")
+    return effective, reasons
+
 from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
 try:
     from reproject import reproject_interp
@@ -2072,6 +2147,51 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
         result[idx] = (g, o)
     return result
 
+# Constants for pruning
+MAX_NEIGHBORS_PER_TILE = 8
+
+
+# Helper for consistent edge key
+def _intertile_edge_key(entry: dict) -> tuple[int, int]:
+    i, j = entry["i"], entry["j"]
+    return (min(i, j), max(i, j))
+
+
+# Helper for degree stats
+def _intertile_degree_stats(degrees: list[int], active_mask: np.ndarray) -> str:
+    active_degrees = [d for i, d in enumerate(degrees) if active_mask[i]]
+    if not active_degrees:
+        return "N/A"
+
+    min_deg = int(np.min(active_degrees))
+    median_deg = int(np.median(active_degrees))
+    p95_deg = int(np.percentile(active_degrees, 95))
+    max_deg = int(np.max(active_degrees))
+    isolated_count = np.sum(active_mask & (np.asarray(degrees) == 0))
+    return f"min/med/p95/max={min_deg}/{median_deg}/{p95_deg}/{max_deg} iso={isolated_count}"
+
+
+# Union-Find (DSU) structure for connectivity
+class _UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.num_components = n
+
+    def find(self, i: int) -> int:
+        if self.parent[i] == i:
+            return i
+        self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+
+    def union(self, i: int, j: int) -> bool:
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_i] = root_j
+            self.num_components -= 1
+            return True
+        return False
+
 
 def compute_intertile_affine_calibration(
     tile_data_with_wcs,
@@ -2337,11 +2457,146 @@ def compute_intertile_affine_calibration(
 
         return {}
 
-    min_overlap_fraction = effective_min_overlap
-    _log_intertile(
-        f"Using: preview={preview_size}, min_overlap={effective_min_overlap:.4f}, sky=({sky_low:.1f},{sky_high:.1f}), clip={robust_clip_sigma:.2f}, pairs={len(overlaps)}",
-        level="INFO",
-    )
+    # --- START PRUNING LOGIC ---
+    raw_pairs_count = len(overlaps)
+    
+    # Pruning condition
+    if (raw_pairs_count > num_tiles * MAX_NEIGHBORS_PER_TILE * 2 and num_tiles >= 10):
+        _log_intertile(f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={MAX_NEIGHBORS_PER_TILE}", level="INFO")
+
+        overlaps_raw = list(overlaps)
+        
+        # Calculate initial degrees for logging
+        raw_degrees = [0] * num_tiles
+        for entry in overlaps_raw:
+            raw_degrees[entry["i"]] += 1
+            raw_degrees[entry["j"]] += 1
+        
+        # Build neighbors and prune
+        neighbors: dict[int, list[tuple[float, tuple[int, int]]]] = {i: [] for i in range(num_tiles)}
+        active_tiles = np.zeros(num_tiles, dtype=bool)
+
+        for entry in overlaps_raw:
+            key = _intertile_edge_key(entry)
+            weight = float(entry.get("weight", 0.0))
+            if weight <= 0.0: # Filter out zero/negative weight overlaps early
+                continue
+            
+            i, j = entry["i"], entry["j"]
+            neighbors[i].append((weight, key))
+            neighbors[j].append((weight, key))
+            active_tiles[i] = True
+            active_tiles[j] = True
+
+        kept_keys: set[tuple[int, int]] = set()
+        
+        # Store initial connectivity
+        initial_uf = _UnionFind(num_tiles)
+        for entry in overlaps_raw:
+            # Only consider edges between active tiles for initial connectivity check
+            if active_tiles[entry["i"]] and active_tiles[entry["j"]]:
+                 initial_uf.union(entry["i"], entry["j"])
+        
+        pruning_occurred = False
+        for tile_id in range(num_tiles):
+            if not active_tiles[tile_id]:
+                continue
+            
+            # Sort neighbors by weight descending
+            neighbors[tile_id].sort(key=lambda x: x[0], reverse=True)
+            
+            # Keep top K, ensuring at least one if it had neighbors
+            to_keep_for_tile = []
+            if neighbors[tile_id]:
+                # If the tile had more than one neighbor, guarantee it keeps at least one edge.
+                # If it only had one, it will naturally be kept as part of top-K if K>=1
+                if MAX_NEIGHBORS_PER_TILE == 0 and len(neighbors[tile_id]) >= 1: # special case: if K=0 but tile had neighbors
+                     to_keep_for_tile.append(neighbors[tile_id][0][1]) # ensure at least 1
+                else:
+                    for k_idx in range(min(MAX_NEIGHBORS_PER_TILE, len(neighbors[tile_id]))):
+                        to_keep_for_tile.append(neighbors[tile_id][k_idx][1])
+                        
+            kept_keys.update(to_keep_for_tile)
+            if len(to_keep_for_tile) < len(neighbors[tile_id]):
+                pruning_occurred = True
+
+        # Filter overlaps after top-K pruning
+        overlaps_after_topK = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
+        
+        # Calculate degrees after top-K for logging
+        after_topK_degrees = [0] * num_tiles
+        for entry in overlaps_after_topK:
+            after_topK_degrees[entry["i"]] += 1
+            after_topK_degrees[entry["j"]] += 1
+
+        _log_intertile(f"Pair pruning (topK): after_topK={len(overlaps_after_topK)}", level="INFO")
+        
+        # --- CONNECTIVITY GUARANTEE (BRIDGES) ---
+        uf = _UnionFind(num_tiles)
+        # Initialize UF with currently kept edges
+        for entry in overlaps_after_topK:
+            uf.union(entry["i"], entry["j"])
+
+        initial_components = uf.num_components
+        bridges_added = 0
+        
+        # Only attempt to add bridges if there are active tiles and more than one component among them
+        active_tile_count = np.sum(active_tiles)
+        if active_tile_count > 1 and initial_components > 1:
+            _log_intertile(f"Pair pruning (connectivity): components={initial_components} -> (attempting to connect)", level="INFO")
+            
+            # Sort raw overlaps by weight descending to find best bridges
+            # (overlaps_raw is already sorted from previous step or original order if no pruning occurred)
+            overlaps_raw.sort(key=lambda x: x.get("weight", 0.0), reverse=True) # Ensure it's sorted
+
+            for entry in overlaps_raw:
+                i, j = entry["i"], entry["j"]
+                # Only consider edges between active tiles for bridges
+                if not active_tiles[i] or not active_tiles[j]:
+                    continue
+                
+                # Check if adding this edge connects two different components among active tiles
+                if uf.find(i) != uf.find(j):
+                    uf.union(i, j)
+                    kept_keys.add(_intertile_edge_key(entry))
+                    bridges_added += 1
+                    if uf.num_components == 1:
+                        break # All active tiles connected
+
+            if uf.num_components > 1:
+                # Only warn if active tiles are still disconnected AND there are at least two active tiles
+                if active_tile_count > 1:
+                    _log_intertile(
+                        f"Pair pruning (connectivity): WARN - Could not connect all active components. "
+                        f"Remaining components: {uf.num_components}. Bridges added: {bridges_added}",
+                        level="WARN",
+                    )
+            else:
+                _log_intertile(f"Pair pruning (connectivity): components={initial_components} -> 1 bridges_added={bridges_added}", level="INFO")
+
+        # Final overlaps after all pruning and bridge adding
+        final_overlaps = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
+        overlaps = final_overlaps # Update the main 'overlaps' variable
+
+        final_pairs_count = len(overlaps)
+        _log_intertile(f"Pair pruning (connectivity): final_pairs={final_pairs_count}", level="INFO")
+
+        # Calculate final degrees for logging
+        final_degrees = [0] * num_tiles
+        for entry in overlaps:
+            final_degrees[entry["i"]] += 1
+            final_degrees[entry["j"]] += 1
+
+        raw_stats = _intertile_degree_stats(raw_degrees, active_tiles)
+        final_stats = _intertile_degree_stats(final_degrees, active_tiles)
+        _log_intertile(
+            f"Pair pruning degree stats: raw[{raw_stats}] | final[{final_stats}]",
+            level="DEBUG",
+        )
+    else:
+        _log_intertile("Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)" % (raw_pairs_count, num_tiles, MAX_NEIGHBORS_PER_TILE), level="INFO")
+
+    # --- END PRUNING LOGIC ---
 
     try:
         from astropy.wcs import WCS as _WCS
@@ -2504,29 +2759,39 @@ def compute_intertile_affine_calibration(
         except Exception:
             return None, None
 
-    total_pairs = len(overlaps)
-    use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
-    if use_parallel:
-        workers = min(cpu_workers, 16) if cpu_workers is not None else 1
-        workers = max(1, workers)
+    faulthandler_file = None
+    faulthandler_enabled = False
+    try:
+        fh_path = Path(tempfile.gettempdir()) / "faulthandler_intertile.log"
+        faulthandler_file = open(fh_path, "w")
+        faulthandler.enable(all_threads=True, file=faulthandler_file)
+        faulthandler.dump_traceback_later(600, repeat=True)
+        faulthandler_enabled = True
         _log_intertile(
-            f"Parallel: threadpool workers={workers} pairs={total_pairs} preview={preview_size}",
-            level="INFO",
+            f"faulthandler enabled for intertile -> {fh_path}",
+            level="INFO_DETAIL",
         )
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(_process_overlap_pair, idx, overlap): idx
-                for idx, overlap in enumerate(overlaps, 1)
-            }
-            for future in as_completed(future_map):
-                idx = future_map[future]
-                pairs_local, connectivity_entry = future.result()
+    except Exception as exc:
+        _log_intertile(f"faulthandler enable failed: {exc}", level="WARN")
+
+    try:
+        total_pairs = len(overlaps)
+        use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
+
+        def _run_overlaps_sequentially() -> None:
+            for idx, overlap in enumerate(overlaps, 1):
+                pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
                 if pairs_local:
                     pair_entries.extend(pairs_local)
                 if connectivity_entry:
                     i_conn, j_conn, w_conn = connectivity_entry
                     connectivity[i_conn] += w_conn
                     connectivity[j_conn] += w_conn
+                if idx % 25 == 0 or idx == total_pairs:
+                    _log_intertile(
+                        f"progress pairs_done={idx}/{total_pairs}",
+                        level="INFO",
+                    )
                 if progress_callback:
                     try:
                         progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
@@ -2537,28 +2802,141 @@ def compute_intertile_affine_calibration(
                             progress_callback("phase5_intertile", idx, total_pairs)
                         except Exception:
                             pass
-    else:
-        for idx, overlap in enumerate(overlaps, 1):
-            pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
-            if pairs_local:
-                pair_entries.extend(pairs_local)
-            if connectivity_entry:
-                i_conn, j_conn, w_conn = connectivity_entry
-                connectivity[i_conn] += w_conn
-                connectivity[j_conn] += w_conn
-            if progress_callback:
-                try:
-                    progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
-                except Exception:
-                    pass
-                if idx % 5 == 0:
-                    try:
-                        progress_callback("phase5_intertile", idx, total_pairs)
-                    except Exception:
-                        pass
 
-    if not pair_entries:
-        return {}
+        if use_parallel:
+            requested_workers = None
+            try:
+                requested_workers = int(cpu_workers) if cpu_workers is not None else None
+            except Exception:
+                requested_workers = None
+            if requested_workers is not None and requested_workers < 1:
+                requested_workers = 1
+
+            try:
+                cv2.setNumThreads(1)
+                _log_intertile(
+                    "Parallel: forcing cv2.setNumThreads(1) to limit oversubscription.",
+                    level="DEBUG_DETAIL",
+                )
+            except Exception:
+                pass
+
+            effective_workers, clamp_reasons = compute_intertile_workers_limit(
+                requested_workers,
+                total_pairs,
+                preview_size,
+            )
+
+            safe_mode = sys.platform == "win32" and preview_size >= 512 and total_pairs >= 2000
+            if safe_mode:
+                effective_workers = 1
+                clamp_reasons = ["safe_mode_windows"] + clamp_reasons
+                _log_intertile(
+                    (
+                        "SAFE_MODE: forcing single-worker on Windows to avoid native deadlocks "
+                        f"(pairs={total_pairs} preview={preview_size})"
+                    ),
+                    level="INFO",
+                )
+
+            reason_label = ",".join(clamp_reasons) if clamp_reasons else "no_clamp"
+            display_requested = requested_workers if requested_workers is not None else "auto"
+            _log_intertile(
+                f"Parallel: threadpool workers={display_requested} -> {effective_workers} ({reason_label}) "
+                f"pairs={total_pairs} preview={preview_size}",
+                level="INFO",
+            )
+
+            if effective_workers <= 1:
+                _log_intertile(
+                    "Parallel: effective_workers=1 -> running sequentially (no ThreadPoolExecutor) to avoid native thread issues",
+                    level="INFO",
+                )
+                _run_overlaps_sequentially()
+            else:
+                with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                    future_map = {
+                        executor.submit(_process_overlap_pair, idx, overlap): idx
+                        for idx, overlap in enumerate(overlaps, 1)
+                    }
+                    pending = set(future_map.keys())
+                    done_count = 0
+                    last_completed_idx: int | None = None
+                    last_progress_ts = time.time()
+                    last_heartbeat_ts = time.time()
+
+                    while pending:
+                        done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+                        now = time.time()
+
+                        if done:
+                            for future in done:
+                                idx = future_map[future]
+                                try:
+                                    pairs_local, connectivity_entry = future.result()
+                                except Exception as exc:
+                                    _log_intertile(f"Pair future failed idx={idx}: {exc}", level="ERROR")
+                                    continue
+
+                                if pairs_local:
+                                    pair_entries.extend(pairs_local)
+                                if connectivity_entry:
+                                    i_conn, j_conn, w_conn = connectivity_entry
+                                    connectivity[i_conn] += w_conn
+                                    connectivity[j_conn] += w_conn
+
+                                done_count += 1
+                                last_completed_idx = idx
+                                last_progress_ts = now
+
+                                if done_count % 25 == 0 or done_count == total_pairs:
+                                    _log_intertile(
+                                        f"progress pairs_done={done_count}/{total_pairs}",
+                                        level="INFO",
+                                    )
+
+                                if progress_callback:
+                                    try:
+                                        progress_callback("phase5_intertile_pairs", done_count, int(total_pairs))
+                                    except Exception:
+                                        pass
+                                    if done_count % 5 == 0:
+                                        try:
+                                            progress_callback("phase5_intertile", done_count, total_pairs)
+                                        except Exception:
+                                            pass
+
+                        elif now - last_progress_ts >= 10.0 and now - last_heartbeat_ts >= 10.0:
+                            sample_pending_idx = [future_map[fut] for fut in list(pending)[:5]]
+                            _log_intertile(
+                                (
+                                    f"Heartbeat: done={done_count}/{total_pairs} "
+                                    f"pending={len(pending)} last_completed_idx={last_completed_idx} "
+                                    f"sample_pending_idx={sample_pending_idx}"
+                                ),
+                                level="INFO",
+                            )
+                            last_heartbeat_ts = now
+        else:
+            _run_overlaps_sequentially()
+
+        if not pair_entries:
+            return {}
+    finally:
+        if faulthandler_enabled:
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except Exception:
+                pass
+            try:
+                faulthandler.disable()
+            except Exception:
+                pass
+        if faulthandler_file is not None:
+            try:
+                faulthandler_file.close()
+            except Exception:
+                pass
 
     if weight_scores is None:
         anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
