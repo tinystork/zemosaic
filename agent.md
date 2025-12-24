@@ -1,103 +1,83 @@
 # agent.md
 
 ## Mission
-Stabiliser la phase **Intertile** en **limitant automatiquement** le nombre de workers du ThreadPool interne (non exposé à l’utilisateur), afin d’éviter les crashs/kill externes Windows quand le log montre des valeurs agressives du type :
-`[Intertile] Parallel: threadpool workers=15 pairs=4344 preview=512`.
+Instrumenter la phase **Phase5 Intertile Pairs** pour diagnostiquer les “plantages silencieux / freezes” sans lancer un gros refactor.
 
-Objectif : préserver les perfs, mais éviter les pics de pression mémoire/CPU.
+Objectifs précis (patch minimal) :
+1) Corriger la progression en mode parallèle : actuellement on envoie `idx` (ID de paire renvoyé par `as_completed`), ce qui n’est **pas** un compteur monotone. Remplacer par un `done_count` qui s’incrémente à chaque future terminée.
+2) Ajouter un **heartbeat** : si aucune future ne termine pendant un certain délai (ex. 10s), logger l’état (done/pending) + un petit échantillon des indices de paires encore en cours.
 
 ## Contraintes
-- Ne pas ajouter de nouvelle option GUI / config utilisateur.
-- Patch minimal, pas de refactor massif.
-- Garder la compatibilité Windows/Linux/macOS.
-- Logging clair : afficher workers demandés vs workers effectifs + raisons du clamp.
+- Patch **minimal**, **pas de refactor**, pas de changement d’algo intertile.
+- Ne modifier que **zemosaic_utils.py** (sauf nécessité absolue).
+- Ne pas ajouter de nouvelle option GUI.
+- Ne pas toucher aux comportements existants ailleurs (notamment tout ce qui concerne batch size / stacking / GPU).
+- Logs : rester raisonnable (heartbeat toutes les ~10s max si stall).
 
-## Fichiers probables
-- `zemosaic_utils.py` (ou là où est l’Intertile / matching / photometric match)
-- éventuellement `zemosaic_worker.py` (appelant / instrumentation), mais éviter si pas nécessaire
-- éventuellement `zemosaic_gpu_safety.py` si on veut réutiliser un signal “safe_mode” (optionnel)
+## Fichiers
+- `zemosaic_utils.py`
+  - fonction : `compute_intertile_affine_calibration(...)`
+  - section : bloc `if use_parallel:` (ThreadPoolExecutor + futures)
 
-## Plan d’attaque (pas à pas)
+## Analyse (problème actuel)
+Le code fait :
+- `future_map = { executor.submit(...): idx }`
+- `for future in as_completed(future_map):`
+- `idx = future_map[future]`
+- `progress_callback("phase5_intertile_pairs", idx, total_pairs)`
 
-### 1) Localiser le point de création du ThreadPool Intertile
-- Chercher dans le repo les strings de log :
-  - `"[Intertile] Parallel:"`
-  - `"pairs="`
-  - `"preview="`
-  - `"ThreadPoolExecutor"`
-- Identifier la fonction qui :
-  - prépare la liste des paires (N~4000)
-  - exécute le calcul par paire
-  - crée `ThreadPoolExecutor(max_workers=...)`
+Comme `as_completed()` renvoie les futures dans un ordre arbitraire, `idx` n’est **pas** “nombre de paires traitées”. Le GUI peut rester “bloqué” à une valeur (ex. 348/4342) alors que ce n’est que le dernier `idx` terminé, pas un compteur.
 
-### 2) Introduire une fonction utilitaire interne de clamp
-Dans le même module que l’intertile (ou utilitaire local), ajouter un helper **petit et lisible** :
+## Implémentation demandée
 
-Pseudo-spéc :
-- Inputs :
-  - `requested_workers: int | None` (si existant)
-  - `cpu_total: int`
-  - `pairs_count: int`
-  - `preview_size: int | None`
-  - `platform_system: str` (via `platform.system()`)
-  - RAM dispo si `psutil` dispo (best effort, guarded)
-- Output :
-  - `effective_workers: int`
-  - `reasons: list[str]` (pour log)
+### 1) Progress monotone
+Dans le bloc parallèle, introduire :
+- `done_count = 0`
+- à chaque future terminée : `done_count += 1`
+- remplacer :
+  - `progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))`
+  - par :
+    - `progress_callback("phase5_intertile_pairs", done_count, total_pairs)`
+- et la seconde ligne (toutes les 5) :
+  - `progress_callback("phase5_intertile", done_count, total_pairs)`
 
-Règles recommandées (conservatrices, simples) :
-- Base auto (si requested invalide ou trop grand) :
-  - `base = max(1, min(cpu_total - 1, cpu_total))`
-- Hard cap “portable” :
-  - `hard_cap = 8` (valeur robuste)
-- Windows cap plus strict (car WDDM / scheduling) :
-  - si Windows : `hard_cap = 6` (ou 8 si tu préfères, mais 6 est plus safe)
-- Cap lié au volume de paires :
-  - si `pairs_count >= 2000`: `hard_cap = min(hard_cap, 6)`
-  - si `pairs_count >= 4000`: `hard_cap = min(hard_cap, 4)`
-- Cap RAM (best effort si psutil dispo) :
-  - si `available_mb < 6000`: `hard_cap = min(hard_cap, 4)`
-  - si `available_mb < 3500`: `hard_cap = min(hard_cap, 2)`
-- Toujours :
-  - `effective = max(1, min(base, hard_cap))`
-  - si `pairs_count` petit (<200), on peut autoriser `min(8, cpu_total-1)`.
+Optionnel (utile) : conserver `idx` seulement pour debug (ex. `last_completed_idx = idx`) mais ne pas l’utiliser comme progress principal.
 
-Important : ne pas sur-compliquer. Le but est de stopper les crashs.
+### 2) Heartbeat sur stall (timeout)
+Remplacer la boucle `as_completed` par une boucle basée sur `concurrent.futures.wait()` :
+- `pending = set(future_map.keys())`
+- `done_count = 0`
+- `last_progress_ts = time.time()`
+- `last_heartbeat_ts = time.time()`
 
-### 3) Appliquer le clamp au ThreadPool Intertile
-- Remplacer `ThreadPoolExecutor(max_workers=workers)` par `max_workers=effective_workers`
-- Juste avant de lancer, loguer :
-  - workers_requested, cpu_total, pairs_count, preview
-  - workers_effective et reasons
+Boucle :
+- `done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)`
+- Si `done` non vide :
+  - pour chaque future :
+    - récupérer `idx = future_map[future]`
+    - `pairs_local, connectivity_entry = future.result()` avec try/except
+    - appliquer le même traitement qu’actuellement
+    - `done_count += 1`
+    - envoyer progress monotone
+    - mettre à jour `last_progress_ts`
+- Si `done` vide (timeout) :
+  - si `time.time() - last_progress_ts >= 10.0` ET `time.time() - last_heartbeat_ts >= 10.0` :
+    - logger via `_log_intertile` un heartbeat, ex :
+      - `Heartbeat: done={done_count}/{total_pairs} pending={len(pending)} last_completed_idx={last_completed_idx} sample_pending_idx=[...]`
+    - `sample_pending_idx` : prendre 5 futures de `pending` et mapper via `future_map[future]`
+    - mettre `last_heartbeat_ts = now`
 
-Format de log attendu (ex) :
-`[Intertile] Parallel: threadpool workers=15 -> 4 (windows_cap,pairs>=4000) pairs=4344 preview=512`
+### 3) Gestion d’erreur future.result()
+Même si `_process_overlap_pair` attrape beaucoup, protéger `future.result()` :
+- si exception : `_log_intertile(f"Pair future failed idx={idx}: {e}", level="ERROR")` puis continuer.
 
-### 4) Optionnel (mais utile) : éviter la sur-souscription OpenCV
-Si Intertile utilise OpenCV et que c’est un facteur de surcharge CPU :
-- ajouter un best-effort au début de la phase Intertile :
-  - `cv2.setNumThreads(1)` (dans un try/except)
-- log debug si appliqué
-Ne pas casser si cv2 absent.
+## Critères d’acceptation
+- En mode parallèle, la progress bar “pairs” doit être **monotone** de 0 → total_pairs.
+- En cas de stall, on doit voir apparaître des logs heartbeat au bout d’environ 10s (sans spam).
+- Aucun changement de résultat attendu sur un run “normal” (hors instrumentation).
 
-### 5) Vérifications / tests
-Sans framework lourd, au minimum :
-- test manuel : run sur dataset qui déclenche `pairs~4000`, vérifier le log clamp et la stabilité.
-- test unitaire léger si déjà présent :
-  - tester le helper de clamp avec plusieurs scénarios (Windows vs Linux, RAM basse, pairs 500/2000/4500)
-- Vérifier que la valeur effective est toujours >=1.
+## Livrables
+- Patch dans `zemosaic_utils.py` uniquement
+- Pas de changement UI
+- Commentaires courts et clairs près de la nouvelle boucle (pourquoi `wait` et `done_count`)
 
-## Definition of Done
-- Intertile n’utilise plus “cpu_total-1” sans garde-fou.
-- Le log montre clairement le clamp quand applicable.
-- Pas d’option GUI ajoutée.
-- Aucun changement sur “batch size 0 / >1” behaviour.
-- Le run qui affichait `workers=15 pairs=4344` sort avec un workers effectif réduit (typiquement 4–6) et ne plante plus.
-
-## Output attendu
-- Un patch git propre (diff) limité aux fichiers nécessaires.
-- Une note courte dans le commit message (ex: “Clamp Intertile threadpool workers to prevent Windows crashes on large pair counts”).
-
-## Suivi
-- [x] Localisation et clamp du ThreadPool Intertile effectués.
-- [x] Logs enrichis pour montrer workers demandés vs effectifs.

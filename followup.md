@@ -1,44 +1,40 @@
 # followup.md
 
-## Notes d’implémentation (guidelines)
-- Garder le helper **local** au module intertile si possible.
-- Toutes les dépendances optionnelles (psutil, cv2) doivent être **guarded** :
-  - pas d’import global obligatoire si ça risque de casser sur certaines machines.
-- Ne pas modifier la logique générale de calcul des paires (pas besoin).
+## À faire (checklist)
+- [ ] Dans `zemosaic_utils.py`, ajouter les imports nécessaires :
+      - modifier `from concurrent.futures import ThreadPoolExecutor, as_completed`
+      - en `from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED`
+      (conserver `as_completed` si utilisé ailleurs dans le fichier)
+- [ ] Localiser `compute_intertile_affine_calibration(...)` puis le bloc `if use_parallel:`
+- [ ] Remplacer la boucle `for future in as_completed(future_map):` par une boucle `wait(...)` avec timeout
+- [ ] Introduire `done_count`, `last_completed_idx`, `last_progress_ts`, `last_heartbeat_ts`
+- [ ] Remplacer la progression `idx/total_pairs` par `done_count/total_pairs`
+- [ ] Ajouter un heartbeat (log) si aucune future ne termine pendant ~10s
+- [ ] Protéger `future.result()` par try/except et logger l’erreur si besoin
 
-## Scénarios de test (rapides)
-1) **Cas repro**
-- Dataset où le log indiquait :
-  - workers=15
-  - pairs≈4344
-  - preview=512
-Attendu :
-- log devient `workers=15 -> 4/6 ... pairs=4344 preview=512`
-- run termine sans crash.
+## Détails log heartbeat (recommandé)
+Format suggéré (via `_log_intertile`, level INFO ou WARN) :
+`Heartbeat: done=123/4342 pending=4219 last_completed_idx=348 sample_pending_idx=[12, 907, 1111, 2044, 3999]`
 
-2) **Petit dataset**
-- pairs < 200
-Attendu :
-- workers effectif reste “raisonnable” (jusqu’à 6–8)
-- pas de régression perf notable
+- `sample_pending_idx` : max 5
+- Heartbeat pas plus fréquent que 10s
 
-3) **RAM faible (simulation)**
-- Forcer le helper via test (available_mb=3000)
-Attendu :
-- clamp à 2–4
+## Tests manuels
+### Test 1 — Run normal (pas de stall)
+- Lancer un dataset où intertile a > 100 paires
+- Vérifier :
+  - `phase5_intertile_pairs` progresse de manière monotone jusqu’à total_pairs
+  - pas de heartbeat (ou très rare)
 
-## Checklist patch
-- [x] Localiser exactement où est loggé `[Intertile] Parallel: threadpool workers=...`
-- [x] Ajouter `compute_intertile_workers_limit(...)` (ou nom similaire)
-- [x] Utiliser `effective_workers` dans `ThreadPoolExecutor`
-- [x] Ajouter log “requested -> effective + reasons”
-- [x] (Optionnel) `cv2.setNumThreads(1)` best-effort pendant Intertile
-- [x] Vérifier lint/format, pas d’imports cassants
-- [x] Run local rapide si possible
+### Test 2 — Repro “stall”
+- Lancer le dataset qui fige “vers 348/4342”
+- Attendu :
+  - la progress bar affiche désormais “done_count/4342” (monotone)
+  - au bout de ~10s sans complétion : apparition heartbeat
+  - heartbeat donne `pending` et `sample_pending_idx` pour savoir si ça coince vraiment (hang) vs crash
 
-## Commit message suggéré
-`Clamp intertile ThreadPool workers automatically to prevent Windows crashes on large pair counts`
+## Notes
+- Cette mission est volontairement “instrumentation only”.
+- Ne pas modifier `_process_overlap_pair` ni la logique d’overlap/reproject.
+- Ne pas ajouter de nouveaux paramètres GUI.
 
-## Si tu hésites sur le cap (4/6/8)
-- Préférer la stabilité : 4–6 sur Windows quand pairs >= 4000.
-- Sur Linux/macOS : 6–8 max.
