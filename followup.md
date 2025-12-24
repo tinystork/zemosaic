@@ -1,16 +1,16 @@
 # followup.md
 
 ## À faire (checklist)
-- [ ] Dans `zemosaic_utils.py`, ajouter les imports nécessaires :
+- [x] Dans `zemosaic_utils.py`, ajouter les imports nécessaires :
       - modifier `from concurrent.futures import ThreadPoolExecutor, as_completed`
       - en `from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED`
       (conserver `as_completed` si utilisé ailleurs dans le fichier)
-- [ ] Localiser `compute_intertile_affine_calibration(...)` puis le bloc `if use_parallel:`
-- [ ] Remplacer la boucle `for future in as_completed(future_map):` par une boucle `wait(...)` avec timeout
-- [ ] Introduire `done_count`, `last_completed_idx`, `last_progress_ts`, `last_heartbeat_ts`
-- [ ] Remplacer la progression `idx/total_pairs` par `done_count/total_pairs`
-- [ ] Ajouter un heartbeat (log) si aucune future ne termine pendant ~10s
-- [ ] Protéger `future.result()` par try/except et logger l’erreur si besoin
+- [x] Localiser `compute_intertile_affine_calibration(...)` puis le bloc `if use_parallel:`
+- [x] Remplacer la boucle `for future in as_completed(future_map):` par une boucle `wait(...)` avec timeout
+- [x] Introduire `done_count`, `last_completed_idx`, `last_progress_ts`, `last_heartbeat_ts`
+- [x] Remplacer la progression `idx/total_pairs` par `done_count/total_pairs`
+- [x] Ajouter un heartbeat (log) si aucune future ne termine pendant ~10s
+- [x] Protéger `future.result()` par try/except et logger l’erreur si besoin
 
 ## Détails log heartbeat (recommandé)
 Format suggéré (via `_log_intertile`, level INFO ou WARN) :
