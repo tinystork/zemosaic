@@ -54,6 +54,7 @@ import time
 import sys
 import platform
 import tempfile
+import faulthandler
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from functools import lru_cache
 from contextlib import nullcontext
@@ -2578,117 +2579,172 @@ def compute_intertile_affine_calibration(
         except Exception:
             return None, None
 
-    total_pairs = len(overlaps)
-    use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
-    if use_parallel:
-        requested_workers = None
-        try:
-            requested_workers = int(cpu_workers) if cpu_workers is not None else None
-        except Exception:
-            requested_workers = None
-        if requested_workers is not None and requested_workers < 1:
-            requested_workers = 1
-
-        try:
-            cv2.setNumThreads(1)
-            _log_intertile(
-                "Parallel: forcing cv2.setNumThreads(1) to limit oversubscription.",
-                level="DEBUG_DETAIL",
-            )
-        except Exception:
-            pass
-
-        effective_workers, clamp_reasons = compute_intertile_workers_limit(
-            requested_workers,
-            total_pairs,
-            preview_size,
-        )
-        reason_label = ",".join(clamp_reasons) if clamp_reasons else "no_clamp"
-        display_requested = requested_workers if requested_workers is not None else "auto"
+    faulthandler_file = None
+    faulthandler_enabled = False
+    try:
+        fh_path = Path(tempfile.gettempdir()) / "faulthandler_intertile.log"
+        faulthandler_file = open(fh_path, "w")
+        faulthandler.enable(all_threads=True, file=faulthandler_file)
+        faulthandler.dump_traceback_later(600, repeat=True)
+        faulthandler_enabled = True
         _log_intertile(
-            f"Parallel: threadpool workers={display_requested} -> {effective_workers} ({reason_label}) "
-            f"pairs={total_pairs} preview={preview_size}",
-            level="INFO",
+            f"faulthandler enabled for intertile -> {fh_path}",
+            level="INFO_DETAIL",
         )
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            future_map = {
-                executor.submit(_process_overlap_pair, idx, overlap): idx
-                for idx, overlap in enumerate(overlaps, 1)
-            }
-            pending = set(future_map.keys())
-            done_count = 0
-            last_completed_idx: int | None = None
-            last_progress_ts = time.time()
-            last_heartbeat_ts = time.time()
+    except Exception as exc:
+        _log_intertile(f"faulthandler enable failed: {exc}", level="WARN")
 
-            while pending:
-                done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
-                now = time.time()
+    try:
+        total_pairs = len(overlaps)
+        use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
+        if use_parallel:
+            requested_workers = None
+            try:
+                requested_workers = int(cpu_workers) if cpu_workers is not None else None
+            except Exception:
+                requested_workers = None
+            if requested_workers is not None and requested_workers < 1:
+                requested_workers = 1
 
-                if done:
-                    for future in done:
-                        idx = future_map[future]
-                        try:
-                            pairs_local, connectivity_entry = future.result()
-                        except Exception as exc:
-                            _log_intertile(f"Pair future failed idx={idx}: {exc}", level="ERROR")
-                            continue
+            try:
+                cv2.setNumThreads(1)
+                _log_intertile(
+                    "Parallel: forcing cv2.setNumThreads(1) to limit oversubscription.",
+                    level="DEBUG_DETAIL",
+                )
+            except Exception:
+                pass
 
-                        if pairs_local:
-                            pair_entries.extend(pairs_local)
-                        if connectivity_entry:
-                            i_conn, j_conn, w_conn = connectivity_entry
-                            connectivity[i_conn] += w_conn
-                            connectivity[j_conn] += w_conn
+            effective_workers, clamp_reasons = compute_intertile_workers_limit(
+                requested_workers,
+                total_pairs,
+                preview_size,
+            )
 
-                        done_count += 1
-                        last_completed_idx = idx
-                        last_progress_ts = now
+            safe_mode = sys.platform == "win32" and preview_size >= 512 and total_pairs >= 2000
+            if safe_mode:
+                effective_workers = 1
+                clamp_reasons = ["safe_mode_windows"] + clamp_reasons
+                _log_intertile(
+                    (
+                        "SAFE_MODE: forcing single-worker on Windows to avoid native deadlocks "
+                        f"(pairs={total_pairs} preview={preview_size})"
+                    ),
+                    level="INFO",
+                )
 
-                        if progress_callback:
+            reason_label = ",".join(clamp_reasons) if clamp_reasons else "no_clamp"
+            display_requested = requested_workers if requested_workers is not None else "auto"
+            _log_intertile(
+                f"Parallel: threadpool workers={display_requested} -> {effective_workers} ({reason_label}) "
+                f"pairs={total_pairs} preview={preview_size}",
+                level="INFO",
+            )
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                future_map = {
+                    executor.submit(_process_overlap_pair, idx, overlap): idx
+                    for idx, overlap in enumerate(overlaps, 1)
+                }
+                pending = set(future_map.keys())
+                done_count = 0
+                last_completed_idx: int | None = None
+                last_progress_ts = time.time()
+                last_heartbeat_ts = time.time()
+
+                while pending:
+                    done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+                    now = time.time()
+
+                    if done:
+                        for future in done:
+                            idx = future_map[future]
                             try:
-                                progress_callback("phase5_intertile_pairs", done_count, int(total_pairs))
-                            except Exception:
-                                pass
-                            if done_count % 5 == 0:
+                                pairs_local, connectivity_entry = future.result()
+                            except Exception as exc:
+                                _log_intertile(f"Pair future failed idx={idx}: {exc}", level="ERROR")
+                                continue
+
+                            if pairs_local:
+                                pair_entries.extend(pairs_local)
+                            if connectivity_entry:
+                                i_conn, j_conn, w_conn = connectivity_entry
+                                connectivity[i_conn] += w_conn
+                                connectivity[j_conn] += w_conn
+
+                            done_count += 1
+                            last_completed_idx = idx
+                            last_progress_ts = now
+
+                            if done_count % 25 == 0 or done_count == total_pairs:
+                                _log_intertile(
+                                    f"progress pairs_done={done_count}/{total_pairs}",
+                                    level="INFO",
+                                )
+
+                            if progress_callback:
                                 try:
-                                    progress_callback("phase5_intertile", done_count, total_pairs)
+                                    progress_callback("phase5_intertile_pairs", done_count, int(total_pairs))
                                 except Exception:
                                     pass
+                                if done_count % 5 == 0:
+                                    try:
+                                        progress_callback("phase5_intertile", done_count, total_pairs)
+                                    except Exception:
+                                        pass
 
-                elif now - last_progress_ts >= 10.0 and now - last_heartbeat_ts >= 10.0:
-                    sample_pending_idx = [future_map[fut] for fut in list(pending)[:5]]
+                    elif now - last_progress_ts >= 10.0 and now - last_heartbeat_ts >= 10.0:
+                        sample_pending_idx = [future_map[fut] for fut in list(pending)[:5]]
+                        _log_intertile(
+                            (
+                                f"Heartbeat: done={done_count}/{total_pairs} "
+                                f"pending={len(pending)} last_completed_idx={last_completed_idx} "
+                                f"sample_pending_idx={sample_pending_idx}"
+                            ),
+                            level="INFO",
+                        )
+                        last_heartbeat_ts = now
+        else:
+            for idx, overlap in enumerate(overlaps, 1):
+                pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
+                if pairs_local:
+                    pair_entries.extend(pairs_local)
+                if connectivity_entry:
+                    i_conn, j_conn, w_conn = connectivity_entry
+                    connectivity[i_conn] += w_conn
+                    connectivity[j_conn] += w_conn
+                if idx % 25 == 0 or idx == total_pairs:
                     _log_intertile(
-                        (
-                            f"Heartbeat: done={done_count}/{total_pairs} "
-                            f"pending={len(pending)} last_completed_idx={last_completed_idx} "
-                            f"sample_pending_idx={sample_pending_idx}"
-                        ),
+                        f"progress pairs_done={idx}/{total_pairs}",
                         level="INFO",
                     )
-                    last_heartbeat_ts = now
-    else:
-        for idx, overlap in enumerate(overlaps, 1):
-            pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
-            if pairs_local:
-                pair_entries.extend(pairs_local)
-            if connectivity_entry:
-                i_conn, j_conn, w_conn = connectivity_entry
-                connectivity[i_conn] += w_conn
-                connectivity[j_conn] += w_conn
-            if progress_callback:
-                try:
-                    progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
-                except Exception:
-                    pass
-                if idx % 5 == 0:
+                if progress_callback:
                     try:
-                        progress_callback("phase5_intertile", idx, total_pairs)
+                        progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
                     except Exception:
                         pass
+                    if idx % 5 == 0:
+                        try:
+                            progress_callback("phase5_intertile", idx, total_pairs)
+                        except Exception:
+                            pass
 
-    if not pair_entries:
-        return {}
+        if not pair_entries:
+            return {}
+    finally:
+        if faulthandler_enabled:
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except Exception:
+                pass
+            try:
+                faulthandler.disable()
+            except Exception:
+                pass
+        if faulthandler_file is not None:
+            try:
+                faulthandler_file.close()
+            except Exception:
+                pass
 
     if weight_scores is None:
         anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
