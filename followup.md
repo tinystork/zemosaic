@@ -1,22 +1,46 @@
-# Follow-up — Validation & critères d’acceptation
+# followup.md — Review & verification checklist (Intertile threadless when workers==1)
 
-## Tests manuels
-- [ ] Windows, dataset qui hangait (pairs > 4000, preview=512)
-  - Lancer mosaïque avec photometric intertile ON
-  - Attendu:
-    - Le log montre "[Intertile] SAFE_MODE..." OU bien lock activé
-    - Le log affiche des "progress pairs_done=..." régulièrement
-    - Le traitement arrive à "Processing completed successfully." (ou au moins dépasse le point 348/4342)
+## What changed
+- `compute_intertile_affine_calibration` now executes **sequentially in the main thread** whenever `effective_workers <= 1`
+  instead of creating a `ThreadPoolExecutor(max_workers=1)`.
 
-- [ ] Dataset petit (pairs < 1000)
-  - Attendu: comportement inchangé, parallélisme conservé.
+## Why it matters
+- The crash signature shows `astropy.wcs` -> `reproject_interp` access violation inside a ThreadPool thread.
+- Windows SAFE_MODE clamps to 1 worker, but the code still ran inside a background thread → crash remained possible.
+- Sequential main-thread avoids thread-safety landmines in native libs (wcslib/reproject/opencv).
 
-## Critères d’acceptation
-- Plus de hang silencieux reproductible à ~348/4342 sur le dataset fourni.
-- En cas de nouveau hang/crash: présence d’un fichier faulthandler_intertile.log exploitable.
-- Aucun changement d’UI, aucune régression sur le reste du pipeline.
+## Code review checklist
+- [ ] Only `zemosaic_utils.py` modified.
+- [ ] In the “use_parallel” block:
+  - [ ] there is a branch `if effective_workers <= 1:` that runs the sequential loop
+  - [ ] ThreadPoolExecutor is only used when `effective_workers >= 2`
+- [ ] Progress logging cadence unchanged:
+  - [ ] `pairs_done=...` every 25
+  - [ ] `progress_callback("phase5_intertile_pairs", ...)` kept
+  - [ ] `progress_callback("phase5_intertile", ...)` kept every 5
+- [ ] Heartbeat logic remains only in ThreadPool path.
+- [ ] No change to `_process_overlap_pair` math or pair generation.
 
-## Notes d’implémentation
-- Si lock choisi: le lock doit entourer *uniquement* les appels reproject_interp (et éventuellement WCS build),
-  pas toute la fonction, pour limiter l’impact perf.
-- Si safe_mode mono-worker choisi: seuils conservateurs (pairs>=2000/4000) + seulement Windows.
+## Repro validation (Windows)
+1) Run the dataset that previously produced:
+   - `Windows fatal exception: access violation`
+   in `%TEMP%\\faulthandler_intertile.log`.
+
+2) Confirm logs now show:
+   - SAFE_MODE clamp to 1 worker (if applicable)
+   - `Parallel: ... -> 1 (...)`
+   - **NEW:** `effective_workers=1 -> running sequentially (no ThreadPoolExecutor)`
+
+3) Confirm:
+   - intertile progresses past the previous halt point
+   - processing completes and mosaic continues
+   - `%TEMP%\\faulthandler_intertile.log` does not contain `access violation`
+
+## Optional non-Windows check
+- On Linux/macOS with `cpu_workers=4` and a moderate number of overlaps:
+  - confirm ThreadPool path is used when `effective_workers >= 2` (no regression in speed).
+
+## Notes
+- This patch is intentionally minimal and risk-free:
+  - it changes execution strategy only in the single-worker case
+  - science/output remains identical
