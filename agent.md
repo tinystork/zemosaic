@@ -33,7 +33,7 @@ Avoid touching unrelated modules unless strictly required.
 
 ---
 
-## Task A — GUI: detect abnormal worker termination via exit code
+## Task A — GUI: detect abnormal worker termination via exit code [x]
 ### Where
 In `zemosaic_gui_qt.py`, class handling the process + listener, method similar to:
 - `ZeMosaicQtWorker._on_listener_finished()` (or equivalent finalization hook)
@@ -52,7 +52,7 @@ In `zemosaic_gui_qt.py`, class handling the process + listener, method similar t
 
 ---
 
-## Task B — Worker: Phase 5 must not "return None" on fatal errors
+## Task B — Worker: Phase 5 must not "return None" on fatal errors [x]
 ### Where
 In `zemosaic_worker.py`, function:
 - `assemble_final_mosaic_reproject_coadd(...)` (or same role)
@@ -68,7 +68,7 @@ Rationale: exceptions must propagate to the top-level worker run loop where `PRO
 
 ---
 
-## Task C — Ensure top-level worker emits PROCESS_ERROR on uncaught exceptions
+## Task C — Ensure top-level worker emits PROCESS_ERROR on uncaught exceptions [x]
 ### Where
 In the main worker entry/run method (often `run()` in the worker process).
 
@@ -81,7 +81,7 @@ If this mechanism already exists, do not change it.
 
 ---
 
-## Task D — Logging correctness
+## Task D — Logging correctness [x]
 - Ensure `[SUCCESS] Processing completed successfully.` is only emitted when `success=True`.
 - If run failed, show a single clear `[ERROR]` line in GUI log:
   - either from `PROCESS_ERROR` payload OR from `exitcode` detection.

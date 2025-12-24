@@ -1,15 +1,15 @@
 # followup.md — What to report back after implementation
 
 ## 1) Summary of changes (bullet list)
-- GUI: where exitcode is checked + how error is surfaced
-- Worker: where exceptions are re-raised + guard preventing "finished" log on invalid outputs
-- Any changes to PROCESS_ERROR emission (only if necessary)
+- [x] GUI: where exitcode is checked + how error is surfaced
+- [x] Worker: where exceptions are re-raised + guard preventing "finished" log on invalid outputs
+- [x] Any changes to PROCESS_ERROR emission (only if necessary)
 
 ## 2) Exact code locations
 Provide file + function names + short snippet around the key modifications:
-- `zemosaic_gui_qt.py`: `_on_listener_finished` (or equivalent)
-- `zemosaic_worker.py`: `assemble_final_mosaic_reproject_coadd` (or equivalent)
-- Top-level worker loop if modified
+- [x] `zemosaic_gui_qt.py`: `_on_listener_finished` (or equivalent)
+- [x] `zemosaic_worker.py`: `assemble_final_mosaic_reproject_coadd` (or equivalent)
+- [x] Top-level worker loop if modified
 
 ## 3) Logs from validation
 Paste three log excerpts:
