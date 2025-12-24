@@ -1,46 +1,39 @@
-# followup.md — Review & verification checklist (Intertile threadless when workers==1)
+# followup.md — What to report back after implementation
 
-## What changed
-- `compute_intertile_affine_calibration` now executes **sequentially in the main thread** whenever `effective_workers <= 1`
-  instead of creating a `ThreadPoolExecutor(max_workers=1)`.
+## 1) Summary of changes (bullet list)
+- GUI: where exitcode is checked + how error is surfaced
+- Worker: where exceptions are re-raised + guard preventing "finished" log on invalid outputs
+- Any changes to PROCESS_ERROR emission (only if necessary)
 
-## Why it matters
-- The crash signature shows `astropy.wcs` -> `reproject_interp` access violation inside a ThreadPool thread.
-- Windows SAFE_MODE clamps to 1 worker, but the code still ran inside a background thread → crash remained possible.
-- Sequential main-thread avoids thread-safety landmines in native libs (wcslib/reproject/opencv).
+## 2) Exact code locations
+Provide file + function names + short snippet around the key modifications:
+- `zemosaic_gui_qt.py`: `_on_listener_finished` (or equivalent)
+- `zemosaic_worker.py`: `assemble_final_mosaic_reproject_coadd` (or equivalent)
+- Top-level worker loop if modified
 
-## Code review checklist
-- [x] Only `zemosaic_utils.py` modified.
-- [x] In the “use_parallel” block:
-  - [x] there is a branch `if effective_workers <= 1:` that runs the sequential loop
-  - [x] ThreadPoolExecutor is only used when `effective_workers >= 2`
-- [x] Progress logging cadence unchanged:
-  - [x] `pairs_done=...` every 25
-  - [x] `progress_callback("phase5_intertile_pairs", ...)` kept
-  - [x] `progress_callback("phase5_intertile", ...)` kept every 5
-- [x] Heartbeat logic remains only in ThreadPool path.
-- [x] No change to `_process_overlap_pair` math or pair generation.
+## 3) Logs from validation
+Paste three log excerpts:
 
-## Repro validation (Windows)
-1) Run the dataset that previously produced:
-   - `Windows fatal exception: access violation`
-   in `%TEMP%\\faulthandler_intertile.log`.
+### A) Successful run (expected SUCCESS)
+- Show last ~20 lines including the final SUCCESS line.
 
-2) Confirm logs now show:
-   - SAFE_MODE clamp to 1 worker (if applicable)
-   - `Parallel: ... -> 1 (...)`
-   - **NEW:** `effective_workers=1 -> running sequentially (no ThreadPoolExecutor)`
+### B) Crash/kill simulation (expected ERROR)
+- Either simulated exit or manual termination.
+- Show GUI log line that indicates exitcode and that SUCCESS is absent.
 
-3) Confirm:
-   - intertile progresses past the previous halt point
-   - processing completes and mosaic continues
-   - `%TEMP%\\faulthandler_intertile.log` does not contain `access violation`
+### C) Phase 5 exception path (expected PROCESS_ERROR)
+- Show `PROCESS_ERROR` surfacing in GUI log.
+- Confirm no `assemble_info_finished_reproject_coadd` nor SUCCESS is printed.
 
-## Optional non-Windows check
-- On Linux/macOS with `cpu_workers=4` and a moderate number of overlaps:
-  - confirm ThreadPool path is used when `effective_workers >= 2` (no regression in speed).
+## 4) Behavior checks
+Answer yes/no:
+- Cancel/Stop still shows “cancelled/stopped” (not crash).
+- Nonzero exitcode now always yields error.
+- No false positives on normal run.
 
-## Notes
-- This patch is intentionally minimal and risk-free:
-  - it changes execution strategy only in the single-worker case
-  - science/output remains identical
+## 5) Final output artifacts (optional but useful)
+- If mosaic `.dat` / coverage `.dat` can remain partially created after crash, confirm GUI now reports failure anyway.
+- If you added any extra guard that checks for completeness, describe it.
+
+## 6) Provide the diff
+Attach `git diff` output for the touched files only.
