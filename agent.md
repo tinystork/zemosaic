@@ -22,28 +22,28 @@ Le code actuel exécute ces appels dans un ThreadPoolExecutor par paire.
 
 ## Plan
 ### A) Sécurité d’exécution (Windows)
-Implémenter un mode "safe" automatique sur Windows:
-- Si platform=win32 et pairs >= 2000 (ou >= 4000) et preview >= 512:
-  => FORCER effective_workers = 1 pour l’intertile
-  => logger clairement: "[Intertile] SAFE_MODE: forcing single-worker on Windows to avoid native deadlocks in reproject"
-Justification: stabilité > perf. Ne pas exposer ça à l’UI.
+- [x] Implémenter un mode "safe" automatique sur Windows:
+  - Si platform=win32 et pairs >= 2000 (ou >= 4000) et preview >= 512:
+    => FORCER effective_workers = 1 pour l’intertile
+    => logger clairement: "[Intertile] SAFE_MODE: forcing single-worker on Windows to avoid native deadlocks in reproject"
+  - Justification: stabilité > perf. Ne pas exposer ça à l’UI.
 
-Alternative si tu veux garder un peu de parallélisme:
-- Introduire un `threading.Lock()` global autour des appels reproject_interp (et éventuellement création WCS)
-  => laisse le pool, mais sérialise la partie dangereuse (souvent suffisant contre deadlocks wcslib).
-Choisir l’option la plus minimale/fiable.
+- [ ] Alternative si tu veux garder un peu de parallélisme:
+  - Introduire un `threading.Lock()` global autour des appels reproject_interp (et éventuellement création WCS)
+    => laisse le pool, mais sérialise la partie dangereuse (souvent suffisant contre deadlocks wcslib).
+  - Choisir l’option la plus minimale/fiable.
 
 ### B) Watchdog + trace en cas de hang
-Activer faulthandler dans ce module (ou juste dans la fonction):
-- `import faulthandler`
-- `faulthandler.enable(all_threads=True, file=open(<temp>/faulthandler_intertile.log,"w"))`
-- `faulthandler.dump_traceback_later(600, repeat=True)` pendant l’intertile
-But: si hang, on récupère des stacks Python (même si natif, parfois utile).
+- [x] Activer faulthandler dans ce module (ou juste dans la fonction):
+  - `import faulthandler`
+  - `faulthandler.enable(all_threads=True, file=open(<temp>/faulthandler_intertile.log,"w"))`
+  - `faulthandler.dump_traceback_later(600, repeat=True)` pendant l’intertile
+  - But: si hang, on récupère des stacks Python (même si natif, parfois utile).
 
 ### C) Heartbeat de progression dans les logs
-Dans la boucle as_completed:
-- toutes les N paires (ex: 25 ou 50), logger: "[Intertile] progress pairs_done=X/Y"
-Ça permet de voir dans le .log où ça s’arrête, sans se fier uniquement au GUI.
+- [x] Dans la boucle as_completed:
+  - toutes les N paires (ex: 25 ou 50), logger: "[Intertile] progress pairs_done=X/Y"
+  - Ça permet de voir dans le .log où ça s’arrête, sans se fier uniquement au GUI.
 
 ## Contraintes
 - Ne pas toucher aux comportements "batch size = 0" et "batch size > 1" ailleurs.
