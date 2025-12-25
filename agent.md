@@ -1,112 +1,109 @@
-# agent.md — Mission: Fix "silent success" when Phase 5 (Reproject) aborts (OOM/crash)
+# agent.md — Mission Codex: Rebrancher Two-Pass sur le **plan Phase 5** (fix bypass GPU-safety)
 
-## Context (symptom)
-On some runs (often Phase 5 Reproject), the worker process stops abruptly (likely OOM / OS kill / native crash).
-The GUI then prints:
-- `[INFO] assemble_info_finished_reproject_coadd`
-- `[SUCCESS] Processing completed successfully.`
-even though Phase 5 did NOT finish (tiles counter stops mid-way) and outputs may be partial.
+## Constat (root cause)
+On construit un `parallel_plan_phase5` (auto-tune + GPU-safety + “plugged-aware”), et on le passe bien à l’assembly Phase 5 (reproject/coadd).
+Mais Two-Pass (coverage renorm) est encore alimenté par un **plan différent** (souvent le plan global), ce qui bypass les budgets/chunks/safety.
+Conséquence : côté Two-Pass, `gpu_max_chunk_bytes` peut être absent ⇒ `chunk_bytes=-` ⇒ trop de workers ⇒ pression RAM ⇒ crash.
 
-Root causes:
-1) Qt GUI decides success based on `_had_error` only. If worker dies without emitting `PROCESS_ERROR`, GUI shows SUCCESS.
-2) Worker code may catch exceptions in Phase 5 and `return None` instead of raising, preventing `PROCESS_ERROR` propagation.
-
-## Goal
-Make the app **never claim SUCCESS** when the worker process terminated abnormally or when Phase 5 failed internally.
-
-### Acceptance Criteria
-- If worker exits with non-zero exit code (crash/kill/OOM), GUI must report an error (not SUCCESS), with a clear log line.
-- If Phase 5 errors inside Python (MemoryError, BrokenProcessPool, etc.), the worker must emit `PROCESS_ERROR` and GUI must report failure.
-- Success message must only be shown when the run truly completed and Phase 5 produced valid outputs.
-
-## Constraints
-- Minimal, surgical patch.
-- No behavioral changes to normal successful runs.
-- Do not redesign pipeline; only fix error reporting + propagation.
-- Preserve existing cancel/stop behavior: do not misreport user-cancel as crash.
-
-## Files in scope (expected)
-- `zemosaic_gui_qt.py`  (Qt worker finalization / listener finished)
-- `zemosaic_worker.py`  (Phase 5 exception handling + completion logging)
-
-Avoid touching unrelated modules unless strictly required.
+## Objectif (minimal, anti-usine à gaz)
+**Garantir que Two-Pass reçoit le même plan que l’assembly Phase 5** (`parallel_plan_phase5`) sur tous les chemins (normal + SDS).
+Aucun changement “science”, uniquement **wiring + logs de preuve + cohérence GPU effective**.
 
 ---
 
-## Task A — GUI: detect abnormal worker termination via exit code [x]
-### Where
-In `zemosaic_gui_qt.py`, class handling the process + listener, method similar to:
-- `ZeMosaicQtWorker._on_listener_finished()` (or equivalent finalization hook)
+## Périmètre STRICT (anti-régression)
+### Fichier autorisé (seul)
+- `zemosaic_worker.py`
 
-### What to implement
-- When listener finishes, read `self._process.exitcode`.
-- If `exitcode` is not `0` (and not `None`), and run was not cancelled/stopped:
-  - set `_had_error=True`
-  - set `_last_error` to something explicit: `"Worker process terminated unexpectedly (exitcode=X). Likely OOM/crash."`
-  - emit an ERROR log line into the GUI log (if there is a signal for that; keep minimal)
-  - final `success` must become False.
-
-### Important
-- Do NOT flag as error if user requested stop/cancel (check `_stop_requested`, `_cancelled` or equivalents).
-- On Windows, exitcode might be positive; on POSIX it could be negative (signal). Treat any nonzero as crash.
+### Interdits
+- Pas de refactor massif / reformat massif
+- Pas de nouvelle dépendance
+- Ne pas toucher au comportement “batch size = 0” et “batch size > 1”
+- Ne pas modifier l’algorithme Two-Pass (gains/blur/clip/merge)
 
 ---
 
-## Task B — Worker: Phase 5 must not "return None" on fatal errors [x]
-### Where
-In `zemosaic_worker.py`, function:
-- `assemble_final_mosaic_reproject_coadd(...)` (or same role)
+## Tâches
 
-### What to implement
-1) If the internal Phase 5 call fails, do NOT `return None, None, None`.
-   - Replace with `raise` after logging.
-2) Add a guard before printing / emitting:
-   - `"assemble_info_finished_reproject_coadd"`
-   If mosaic/coverage is missing (`None`) or clearly incomplete, raise a `RuntimeError`.
+### [x] 1) Ajouter un helper de sélection de plan Two-Pass
+Dans `zemosaic_worker.py` (près des helpers Phase 5), créer une fonction utilitaire :
 
-Rationale: exceptions must propagate to the top-level worker run loop where `PROCESS_ERROR` is emitted.
+```python
+def _select_two_pass_parallel_plan(*, phase5_plan, fallback_plan, zconfig=None):
+    # priorité: plan Phase5 (local) -> zconfig.parallel_plan_phase5 -> fallback_plan
+Règles :
 
----
+si phase5_plan non-None → retour phase5_plan
 
-## Task C — Ensure top-level worker emits PROCESS_ERROR on uncaught exceptions [x]
-### Where
-In the main worker entry/run method (often `run()` in the worker process).
+sinon si zconfig a parallel_plan_phase5 non-None → retour celui-là
 
-### What to implement (only if missing)
-- Ensure there is a `try/except Exception as e:` around the full processing pipeline that emits:
-  - `PROCESS_ERROR` (payload includes `error=str(e)` + maybe `traceback`)
-  - then exits with non-zero status (or just lets exception kill process; GUI will catch via exitcode anyway)
+sinon retour fallback_plan
 
-If this mechanism already exists, do not change it.
+⚠️ But: éviter que d’autres chemins repassent le plan global par erreur.
 
----
+### [x] 2) Rebrancher le callsite principal (Phase 5 post-pipeline)
+Dans le gros bloc Phase 5 (après l’assembly), là où on appelle :
 
-## Task D — Logging correctness [x]
-- Ensure `[SUCCESS] Processing completed successfully.` is only emitted when `success=True`.
-- If run failed, show a single clear `[ERROR]` line in GUI log:
-  - either from `PROCESS_ERROR` payload OR from `exitcode` detection.
+_apply_phase5_post_stack_pipeline(... parallel_plan=...)
 
----
+Remplacer l’argument actuel (plan global) par le helper :
 
-## Manual test plan (must be done)
-1) **Normal success run**: verify unchanged behavior; GUI shows SUCCESS.
-2) **Simulated crash** (lightweight):
-   - Add a temporary dev-only code path OR a tiny internal test hook (if one already exists) that forces the worker to `os._exit(137)` mid-way (DO NOT ship this hook enabled by default).
-   - Confirm GUI reports error and does not show SUCCESS.
-3) **Simulated Phase 5 exception**:
-   - Force a `MemoryError` / raise `RuntimeError("test")` inside Phase 5 code path (dev-only, disabled by default).
-   - Confirm `PROCESS_ERROR` is shown; GUI shows error.
+parallel_plan=_select_two_pass_parallel_plan(phase5_plan=parallel_plan_phase5, fallback_plan=parallel_plan, zconfig=zconfig)
 
-If adding test hooks is too invasive, skip code hooks and provide clear instructions how to simulate by manually killing the worker process while running; GUI must show error (exitcode != 0).
+✅ Two-Pass doit recevoir le même plan que celui utilisé pour l’assembly Phase 5.
 
----
+### [x] 3) Rebrancher les callsites SDS “Phase 5 polish”
+Dans tous les appels à _finalize_sds_global_mosaic(... parallel_plan=...) :
 
-## Deliverables
-- Patch in the two files above.
-- Brief note in code comments explaining why exitcode detection is required (silent kill cases).
-- Keep diff small and readable.
+remplacer parallel_plan=getattr(zconfig, "parallel_plan", ...)
 
-## Definition of Done
-- Abnormal termination never results in SUCCESS.
-- Internal Phase 5 failure never results in silent completion.
-- No regressions on normal runs / cancel runs.
+par :
+parallel_plan=_select_two_pass_parallel_plan(phase5_plan=getattr(zconfig, "parallel_plan_phase5", None), fallback_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")), zconfig=zconfig)
+
+✅ Même en SDS, Two-Pass récupère le plan Phase 5 si dispo.
+
+### [x] 4) Ajouter un log “preuve de rebranchement” (1 ligne, pas de spam)
+Dans _apply_two_pass_coverage_renorm_if_requested(...), juste après le logger.info("[TwoPass] Second pass requested ..."),
+ajouter UNE ligne INFO (ou DEBUG si tu préfères) qui résume le plan reçu :
+
+type/nom du plan
+
+cpu_workers, use_gpu
+
+max_chunk_bytes, gpu_max_chunk_bytes
+
+rows_per_chunk, gpu_rows_per_chunk
+
+Ex (format libre) :
+[TwoPass] plan=... cpu_workers=... use_gpu=... max_chunk_mb=... gpu_max_chunk_mb=... rows=... gpu_rows=...
+
+But : on veut vérifier en 5 secondes que Two-Pass utilise bien parallel_plan_phase5.
+
+### [x] 5) Cohérence GPU effective (micro-fix, sans “usine”)
+Dans run_second_pass_coverage_renorm(...) :
+
+Calculer use_gpu_effective = bool(use_gpu_two_pass) and bool(plan_use_gpu)
+
+plan_use_gpu doit fonctionner si parallel_plan est un objet ou un dict.
+
+Utiliser use_gpu_effective pour les appels internes (blur, etc.) au lieu de use_gpu_two_pass.
+
+Si use_gpu_two_pass=True mais plan_use_gpu=False, logger un INFO clair :
+[TwoPass] GPU requested but disabled by plan.use_gpu=False -> forcing CPU
+
+But : Two-Pass doit respecter la décision autotune/GPU-safety déjà prise pour Phase 5.
+
+Critères d’acceptation (observables)
+La ligne [TwoPass] plan=... gpu_max_chunk_mb=... apparaît et reflète le plan Phase 5.
+
+Sur un run où Phase 5 a gpu_max_chunk_bytes non nul, Two-Pass l’affiche aussi (plus de “plan global” muet).
+
+Si parallel_plan_phase5.use_gpu == False, Two-Pass force CPU et le loggue.
+
+Aucun autre comportement modifié.
+
+Tests
+- [x] python -m py_compile zemosaic_worker.py
+- [ ] Run petit dataset (Two-Pass ON) : vérifier la ligne plan.
+- [ ] Run dataset “crash” : vérifier que Two-Pass voit le plan Phase 5 (et donc gpu_max_chunk_bytes si présent).
+

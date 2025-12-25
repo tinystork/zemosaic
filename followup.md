@@ -1,39 +1,69 @@
-# followup.md — What to report back after implementation
+# followup.md — Validation: Two-Pass correctement rebranché sur le plan Phase 5
 
-## 1) Summary of changes (bullet list)
-- [x] GUI: where exitcode is checked + how error is surfaced
-- [x] Worker: where exceptions are re-raised + guard preventing "finished" log on invalid outputs
-- [x] Any changes to PROCESS_ERROR emission (only if necessary)
+## 0) Scope / anti-régression
+- [x] Seul fichier modifié : `zemosaic_worker.py`
+- [x] Pas de refactor massif / reformat massif
+- [x] Pas de nouvelle dépendance
+- [x] Aucun changement de l’algorithme Two-Pass (wiring + logs + use_gpu_effective uniquement)
 
-## 2) Exact code locations
-Provide file + function names + short snippet around the key modifications:
-- [x] `zemosaic_gui_qt.py`: `_on_listener_finished` (or equivalent)
-- [x] `zemosaic_worker.py`: `assemble_final_mosaic_reproject_coadd` (or equivalent)
-- [x] Top-level worker loop if modified
+---
 
-## 3) Logs from validation
-Paste three log excerpts:
+## 1) Helper de sélection de plan
+- [x] `_select_two_pass_parallel_plan(...)` existe
+- [x] Priorité appliquée :
+  1) `phase5_plan` (local) si présent
+  2) sinon `zconfig.parallel_plan_phase5` si présent
+  3) sinon `fallback_plan`
 
-### A) Successful run (expected SUCCESS)
-- Show last ~20 lines including the final SUCCESS line.
+---
 
-### B) Crash/kill simulation (expected ERROR)
-- Either simulated exit or manual termination.
-- Show GUI log line that indicates exitcode and that SUCCESS is absent.
+## 2) Call sites corrigés
 
-### C) Phase 5 exception path (expected PROCESS_ERROR)
-- Show `PROCESS_ERROR` surfacing in GUI log.
-- Confirm no `assemble_info_finished_reproject_coadd` nor SUCCESS is printed.
+### 2.1 Chemin principal Phase 5 post-pipeline
+- [x] `_apply_phase5_post_stack_pipeline(... parallel_plan=...)` reçoit le helper avec `phase5_plan=parallel_plan_phase5`
+- [x] On ne passe plus le plan global directement
 
-## 4) Behavior checks
-Answer yes/no:
-- Cancel/Stop still shows “cancelled/stopped” (not crash).
-- Nonzero exitcode now always yields error.
-- No false positives on normal run.
+### 2.2 Chemins SDS “Phase 5 polish”
+- [x] Tous les `_finalize_sds_global_mosaic(... parallel_plan=...)` utilisent le helper
+- [x] Fallback propre sur `zconfig.parallel_plan`/cache si `parallel_plan_phase5` absent
 
-## 5) Final output artifacts (optional but useful)
-- If mosaic `.dat` / coverage `.dat` can remain partially created after crash, confirm GUI now reports failure anyway.
-- If you added any extra guard that checks for completeness, describe it.
+---
 
-## 6) Provide the diff
-Attach `git diff` output for the touched files only.
+## 3) Log de preuve
+- [x] Une ligne unique par run Two-Pass résume le plan :
+  - [x] plan type/nom
+  - [x] cpu_workers / use_gpu
+  - [x] max_chunk_bytes / gpu_max_chunk_bytes
+  - [x] rows_per_chunk / gpu_rows_per_chunk
+
+---
+
+## 4) GPU effective (cohérence safety)
+- [x] `use_gpu_effective = use_gpu_two_pass AND plan.use_gpu` est calculé
+  - [x] support plan objet et dict
+- [x] Si GPU demandé mais plan.use_gpu=False :
+  - [x] log INFO clair
+  - [x] Two-Pass tourne en CPU
+
+---
+
+## 5) Sanity
+- [x] `python -m py_compile zemosaic_worker.py` OK
+
+---
+
+## 6) Validation terrain
+
+### Dataset petit (contrôle)
+- [ ] Two-Pass s’exécute
+- [ ] Log `[TwoPass] plan=... gpu_max_chunk_mb=...` présent
+
+### Dataset “crash Phase 5”
+- [ ] Le log Two-Pass affiche un plan cohérent avec Phase 5 (mêmes budgets GPU si présents)
+- [ ] Si `plan.use_gpu=False`, Two-Pass force CPU et le loggue
+
+---
+
+## Critère final
+- [ ] Two-Pass n’utilise plus un plan “global” par erreur.
+- [ ] Les décisions autotune/GPU-safety Phase 5 se reflètent dans Two-Pass.

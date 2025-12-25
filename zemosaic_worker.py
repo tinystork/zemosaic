@@ -1897,6 +1897,46 @@ def _apply_two_pass_coverage_renorm_if_requested(
             gain_clip_tuple,
             getattr(final_mosaic_coverage, "shape", None),
         )
+        try:
+            def _plan_field(plan_obj: Any, key: str):
+                try:
+                    return getattr(plan_obj, key)
+                except Exception:
+                    if isinstance(plan_obj, dict):
+                        return plan_obj.get(key)
+                return None
+
+            def _format_mb(value: Any) -> str:
+                try:
+                    numeric = float(value)
+                except Exception:
+                    return "-"
+                if numeric <= 0:
+                    return "-"
+                return f"{numeric / (1024.0 ** 2):.2f}"
+
+            def _safe_value(value: Any) -> Any:
+                return value if value not in (None, "") else "-"
+
+            plan_label = _plan_field(parallel_plan, "name") if parallel_plan is not None else None
+            if not plan_label:
+                if parallel_plan is None:
+                    plan_label = "none"
+                else:
+                    plan_label = parallel_plan.__class__.__name__
+
+            logger.info(
+                "[TwoPass] plan=%s cpu_workers=%s use_gpu=%s max_chunk_mb=%s gpu_max_chunk_mb=%s rows=%s gpu_rows=%s",
+                plan_label,
+                _safe_value(_plan_field(parallel_plan, "cpu_workers")),
+                _safe_value(_plan_field(parallel_plan, "use_gpu")),
+                _format_mb(_plan_field(parallel_plan, "max_chunk_bytes")),
+                _format_mb(_plan_field(parallel_plan, "gpu_max_chunk_bytes")),
+                _safe_value(_plan_field(parallel_plan, "rows_per_chunk")),
+                _safe_value(_plan_field(parallel_plan, "gpu_rows_per_chunk")),
+            )
+        except Exception:
+            pass
 
     (
         tiles_for_second_pass,
@@ -2447,6 +2487,22 @@ def _maybe_bump_phase5_gpu_rows_per_chunk(
             )
         except Exception:
             pass
+
+
+def _select_two_pass_parallel_plan(*, phase5_plan, fallback_plan, zconfig=None):
+    """Prefer the Phase 5 plan for Two-Pass, with zconfig override before fallback."""
+
+    if phase5_plan is not None:
+        return phase5_plan
+    plan_from_zconfig = None
+    if zconfig is not None:
+        try:
+            plan_from_zconfig = getattr(zconfig, "parallel_plan_phase5", None)
+        except Exception:
+            plan_from_zconfig = None
+    if plan_from_zconfig is not None:
+        return plan_from_zconfig
+    return fallback_plan
 
 
 def _apply_phase5_post_stack_pipeline(
@@ -8507,7 +8563,11 @@ def _run_shared_phase45_phase5_pipeline(
         logger=logger,
         collected_tiles=collected_tiles_for_second_pass,
         fallback_two_pass_loader=fallback_two_pass_loader,
-        parallel_plan=parallel_plan,
+        parallel_plan=_select_two_pass_parallel_plan(
+            phase5_plan=parallel_plan_phase5,
+            fallback_plan=parallel_plan,
+            zconfig=zconfig,
+        ),
         telemetry_ctrl=None if sds_mode_phase5 else telemetry_ctrl,
     )
 
@@ -15471,7 +15531,9 @@ def run_second_pass_coverage_renorm(
         if logger:
             logger.warning("[TwoPass] zemosaic_utils unavailable; skipping second pass")
         return None
-    use_gpu = bool(use_gpu_two_pass)
+    use_gpu_requested = bool(use_gpu_two_pass)
+    plan_use_gpu: bool | None = None
+    use_gpu = use_gpu_requested
     cpu_workers_hint: int | None = None
     plan_rows_cpu_hint: int | None = None
     plan_rows_gpu_hint: int | None = None
@@ -15487,6 +15549,15 @@ def run_second_pass_coverage_renorm(
                     return parallel_plan.get(key)
             return None
 
+        try:
+            plan_use_gpu_raw = _plan_value("use_gpu")
+        except Exception:
+            plan_use_gpu_raw = None
+        if plan_use_gpu_raw is not None:
+            try:
+                plan_use_gpu = bool(plan_use_gpu_raw)
+            except Exception:
+                plan_use_gpu = bool(plan_use_gpu_raw)
         try:
             cpu_workers_hint = int(_plan_value("cpu_workers") or 0)
         except Exception:
@@ -15522,6 +15593,11 @@ def run_second_pass_coverage_renorm(
         if plan_chunk_gpu_hint is not None and plan_chunk_gpu_hint <= 0:
             plan_chunk_gpu_hint = None
 
+    plan_use_gpu_flag = use_gpu_requested if plan_use_gpu is None else bool(plan_use_gpu)
+    use_gpu_effective = bool(use_gpu_requested) and bool(plan_use_gpu_flag)
+    if use_gpu_requested and plan_use_gpu is False and logger:
+        logger.info("[TwoPass] GPU requested but disabled by plan.use_gpu=False -> forcing CPU")
+    use_gpu = use_gpu_effective
     cov_shape = np.asarray(coverage_p1).shape if coverage_p1 is not None else tuple()
     cov_h = int(cov_shape[0]) if len(cov_shape) >= 1 and cov_shape[0] else (int(shape_out[0]) if shape_out else 0)
     cov_w = int(cov_shape[1]) if len(cov_shape) >= 2 and cov_shape[1] else (int(shape_out[1]) if shape_out else 0)
@@ -18509,7 +18585,11 @@ def run_hierarchical_mosaic_classic_legacy(
                     autocrop_margin_px=global_wcs_autocrop_margin_px_config,
                     global_plan=global_wcs_plan,
                     fallback_two_pass_loader=None,
-                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    parallel_plan=_select_two_pass_parallel_plan(
+                        phase5_plan=getattr(zconfig, "parallel_plan_phase5", None),
+                        fallback_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                        zconfig=zconfig,
+                    ),
                 )
                 final_alpha_map = alpha_final
                 if final_mosaic_data_HWC is not None:
@@ -18581,7 +18661,11 @@ def run_hierarchical_mosaic_classic_legacy(
                             autocrop_margin_px=global_wcs_autocrop_margin_px_config,
                             global_plan=global_wcs_plan,
                             fallback_two_pass_loader=None,
-                            parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                            parallel_plan=_select_two_pass_parallel_plan(
+                                phase5_plan=getattr(zconfig, "parallel_plan_phase5", None),
+                                fallback_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                                zconfig=zconfig,
+                            ),
                         )
                         final_alpha_map = alpha_final
                         if final_mosaic_data_HWC is not None:
@@ -22648,7 +22732,11 @@ def run_hierarchical_mosaic(
                     autocrop_margin_px=global_wcs_autocrop_margin_px_config,
                     global_plan=global_wcs_plan,
                     fallback_two_pass_loader=None,
-                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    parallel_plan=_select_two_pass_parallel_plan(
+                        phase5_plan=getattr(zconfig, "parallel_plan_phase5", None),
+                        fallback_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                        zconfig=zconfig,
+                    ),
                 )
                 final_alpha_map = alpha_final
                 if final_mosaic_data_HWC is not None:
@@ -22720,7 +22808,11 @@ def run_hierarchical_mosaic(
                             autocrop_margin_px=global_wcs_autocrop_margin_px_config,
                             global_plan=global_wcs_plan,
                             fallback_two_pass_loader=None,
-                            parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                            parallel_plan=_select_two_pass_parallel_plan(
+                                phase5_plan=getattr(zconfig, "parallel_plan_phase5", None),
+                                fallback_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                                zconfig=zconfig,
+                            ),
                         )
                         final_alpha_map = alpha_final
                         if final_mosaic_data_HWC is not None:
