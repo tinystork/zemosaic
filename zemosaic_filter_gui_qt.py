@@ -2069,6 +2069,8 @@ class FilterQtDialog(QDialog):
         self._auto_group_started_at: float | None = None
         self._auto_group_elapsed_timer: QTimer | None = None
         self._header_cache: dict[str, Any] = {}
+        self._last_eqmode_summary: dict[str, Any] | None = None
+        self._last_auto_group_result: dict[str, Any] | None = None
         self._global_wcs_state: dict[str, Any] = {
             "descriptor": None,
             "meta": None,
@@ -3118,9 +3120,9 @@ class FilterQtDialog(QDialog):
         self,
         candidate_infos: Sequence[dict[str, Any]],
         messages: list[str | tuple[str, str]],
-    ) -> None:
+    ) -> dict[str, Any] | None:
         if not candidate_infos:
-            return
+            return None
 
         start_time = time.perf_counter()
 
@@ -3337,15 +3339,29 @@ class FilterQtDialog(QDialog):
             else:
                 unknown_count += 1
 
+        total_count = eq_count + altaz_count + unknown_count
+        eqmode_summary = {
+            "eq_count": int(eq_count),
+            "altaz_count": int(altaz_count),
+            "unknown_count": int(unknown_count),
+            "total": int(total_count),
+            "cache_hits": int(cache_hits),
+            "cache_miss": int(cache_miss),
+            "reads_header": int(reads_header),
+            "source": "qt_prefetch_eqmode",
+        }
+        self._last_eqmode_summary = eqmode_summary
+
         duration = time.perf_counter() - start_time
         cache_label = cache_path or "none"
         summary = (
-            "eqmode_summary: EQ=%d ALT_AZ=%d UNKNOWN=%d "
-            "(cache_hit=%d cache_miss=%d read=%d workers=%d dt=%.2fs) cache=%s"
+            "FILTER_EQMODE_SUMMARY: eq=%d altaz=%d unknown=%d total=%d "
+            "(cache_hit=%d cache_miss=%d read=%d workers=%d dt=%.2fs cache=%s)"
             % (
                 eq_count,
                 altaz_count,
                 unknown_count,
+                total_count,
                 cache_hits,
                 cache_miss,
                 reads_header,
@@ -3357,6 +3373,7 @@ class FilterQtDialog(QDialog):
         logger.info(summary)
         if isinstance(messages, list):
             messages.append(summary)
+        return eqmode_summary
 
     def _read_eqmode_from_path(self, path: str) -> tuple[str | None, int | None]:
         if not path or fits is None:
@@ -3458,6 +3475,7 @@ class FilterQtDialog(QDialog):
                         "WARN",
                     )
                 )
+        eqmode_summary: dict[str, Any] | None = None
         t_start = time.perf_counter()
         candidate_infos: list[dict[str, Any]] = []
         coord_samples: list[tuple[float, float]] = []
@@ -3478,7 +3496,7 @@ class FilterQtDialog(QDialog):
             raise RuntimeError("Astropy is required to compute WCS-based clusters.")
 
         t_start = time.perf_counter()
-        self._prefetch_eqmode_for_candidates(candidate_infos, messages)
+        eqmode_summary = self._prefetch_eqmode_for_candidates(candidate_infos, messages)
         timings["prefetch_eqmode"] = time.perf_counter() - t_start
 
         threshold_override = self._resolve_cluster_threshold_override()
@@ -3775,6 +3793,8 @@ class FilterQtDialog(QDialog):
             "threshold_used": threshold_used,
             "angle_split": angle_split_effective,
         }
+        if isinstance(eqmode_summary, dict):
+            result["eqmode_summary"] = eqmode_summary
         result["timings"] = timings
         return result
 
@@ -4167,6 +4187,10 @@ class FilterQtDialog(QDialog):
         return split_groups, split_count
 
     def _apply_auto_group_result(self, payload: dict[str, Any]) -> None:
+        self._last_auto_group_result = payload if isinstance(payload, dict) else None
+        eqmode_summary_payload = payload.get("eqmode_summary") if isinstance(payload, dict) else None
+        if isinstance(eqmode_summary_payload, dict):
+            self._last_eqmode_summary = eqmode_summary_payload
         groups = payload.get("final_groups") or []
         if not isinstance(groups, list):
             groups = []
@@ -8293,6 +8317,22 @@ class FilterQtDialog(QDialog):
 
         metadata_update = self._build_metadata_overrides(overrides)
 
+        eqmode_summary: dict[str, Any] | None = None
+        if isinstance(self._last_auto_group_result, dict):
+            eqmode_summary = self._last_auto_group_result.get("eqmode_summary")
+        if not isinstance(eqmode_summary, dict):
+            eqmode_summary = self._last_eqmode_summary
+        if not isinstance(eqmode_summary, dict):
+            eqmode_summary = None
+        if eqmode_summary:
+            self._last_eqmode_summary = eqmode_summary
+            metadata_update["eqmode_summary"] = eqmode_summary
+            plan_override_payload = metadata_update.get("global_wcs_plan_override")
+            if not isinstance(plan_override_payload, dict):
+                plan_override_payload = {}
+            plan_override_payload["eqmode_summary"] = eqmode_summary
+            metadata_update["global_wcs_plan_override"] = plan_override_payload
+
         sds_flag = bool(metadata_update.get("sds_mode"))
         mode_value = str(metadata_update.get("mode") or "").strip().lower()
         require_global_plan = sds_flag or mode_value == "seestar"
@@ -8304,6 +8344,9 @@ class FilterQtDialog(QDialog):
             success, meta_payload, path_payload = self._ensure_global_wcs_for_selection(True, None)
 
         if success and meta_payload and path_payload:
+            if eqmode_summary:
+                meta_payload = dict(meta_payload)
+                meta_payload["eqmode_summary"] = eqmode_summary
             overrides["global_wcs_meta"] = meta_payload
             overrides["global_wcs_path"] = meta_payload.get("fits_path") or path_payload.get("fits_path")
             overrides["global_wcs_json"] = meta_payload.get("json_path") or path_payload.get("json_path")

@@ -68,6 +68,7 @@ import threading
 import itertools
 import platform
 import importlib.util
+import sys
 from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass, replace
@@ -819,6 +820,24 @@ def _apply_lecropper_pipeline(
                 else:
                     out = np.where(mask_zero, 0.0, target_for_mask)
                 altaz_mask2d_used = True
+                try:
+                    nz_frac = float(np.count_nonzero(alpha_mask_norm) / alpha_mask_norm.size) if alpha_mask_norm.size else 0.0
+                    alpha_min_val = float(np.nanmin(alpha_mask_norm)) if alpha_mask_norm.size else 0.0
+                    alpha_max_val = float(np.nanmax(alpha_mask_norm)) if alpha_mask_norm.size else 0.0
+                    logger.info(
+                        "ALPHA_STATS: level=master_tile nonzero_frac=%.3f min=%.3f max=%.3f shape=%s",
+                        nz_frac,
+                        alpha_min_val,
+                        alpha_max_val,
+                        getattr(alpha_mask_norm, "shape", None),
+                    )
+                    if az_enabled and nz_frac < 0.01:
+                        logger.warning(
+                            "ALPHA_STATS: alpha mask nearly empty after altaz cleanup (nonzero_frac=%.4f)",
+                            nz_frac,
+                        )
+                except Exception:
+                    pass
             try:
                 logger.info(
                     "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s threshold=%g",
@@ -6405,6 +6424,23 @@ def _compute_intertile_affine_corrections_from_sources(
         cpu_workers = None
     if cpu_workers is not None and cpu_workers < 1:
         cpu_workers = 1
+    force_single_worker = False
+    force_single_reason = None
+    if sys.platform == "win32":
+        force_single_worker = True
+        force_single_reason = "win32_hybrid_hotfix"
+    if force_single_worker:
+        requested_workers = cpu_workers if cpu_workers is not None else "auto"
+        cpu_workers = 1
+        if logger_obj:
+            try:
+                logger_obj.info(
+                    "[Intertile] Hotfix: forcing single worker on Windows/hybrid GPUs (requested=%s, reason=%s)",
+                    requested_workers,
+                    force_single_reason,
+                )
+            except Exception:
+                pass
 
     tile_pairs: list[tuple[np.ndarray, Any] | tuple[np.ndarray, Any, np.ndarray]] = []
     preview_arrays: list[np.ndarray | None] = []
@@ -16375,15 +16411,83 @@ def run_hierarchical_mosaic_classic_legacy(
         filter_overrides,
     )
 
+    plan_override_raw = filter_overrides.get("global_wcs_plan_override") if isinstance(filter_overrides, dict) else None
+    plan_override = plan_override_raw if isinstance(plan_override_raw, dict) else {}
+
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return default
+                return int(float(text))
+            return int(value)
+        except Exception:
+            return default
+
+    eqmode_summary_source = plan_override.get("eqmode_summary") if isinstance(plan_override, dict) else None
+    if not isinstance(eqmode_summary_source, dict):
+        meta_src = global_wcs_plan.get("meta")
+        if isinstance(meta_src, dict):
+            eqmode_summary_source = meta_src.get("eqmode_summary")
+    if not isinstance(eqmode_summary_source, dict) and isinstance(filter_overrides, dict):
+        eqmode_summary_source = filter_overrides.get("eqmode_summary")
+
+    summary_payload = eqmode_summary_source if isinstance(eqmode_summary_source, dict) else {}
+    eq_count = _safe_int(summary_payload.get("eq_count"), 0)
+    altaz_count = _safe_int(summary_payload.get("altaz_count"), 0)
+    unknown_count = _safe_int(summary_payload.get("unknown_count"), 0)
+    total_count = _safe_int(summary_payload.get("total"), eq_count + altaz_count + unknown_count)
+    contains_altaz = altaz_count > 0
+    try:
+        logger.info(
+            "WORKER_EQMODE_SUMMARY: eq=%d altaz=%d unknown=%d total=%d contains_altaz=%s",
+            eq_count,
+            altaz_count,
+            unknown_count,
+            total_count,
+            contains_altaz,
+        )
+    except Exception:
+        pass
+
+    meta = global_wcs_plan.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        global_wcs_plan["meta"] = meta
+    meta["eqmode_summary"] = {
+        "eq_count": eq_count,
+        "altaz_count": altaz_count,
+        "unknown_count": unknown_count,
+        "total": total_count,
+    }
+    global_wcs_plan["eqmode_summary"] = dict(meta["eqmode_summary"])
+
     quality_crop_requested_flag = bool(quality_crop_enabled_config)
     altaz_cleanup_requested_flag = bool(altaz_cleanup_enabled_config)
+    altaz_cleanup_effective_flag = bool(altaz_cleanup_requested_flag)
+    if contains_altaz:
+        if not altaz_cleanup_effective_flag:
+            try:
+                logger.info("AUTO_ALTaz_cleanup: enabled (contains_altaz=True, config_requested=False)")
+            except Exception:
+                pass
+        altaz_cleanup_effective_flag = True
     lecropper_pipeline_flag = (
-        bool(_LECROPPER_AVAILABLE) and (quality_crop_requested_flag or altaz_cleanup_requested_flag)
+        bool(_LECROPPER_AVAILABLE) and (quality_crop_requested_flag or altaz_cleanup_effective_flag)
     )
     pipeline_flags_msg = (
         f"MT_PIPELINE_FLAGS: lecropper_enabled={lecropper_pipeline_flag}, "
         f"quality_crop_enabled={quality_crop_requested_flag}, "
-        f"altaz_cleanup_enabled={altaz_cleanup_requested_flag}, "
+        f"altaz_cleanup_enabled={altaz_cleanup_effective_flag}, "
         f"lecropper_available={bool(_LECROPPER_AVAILABLE)}"
     )
     logger.info(pipeline_flags_msg)
@@ -16397,12 +16501,10 @@ def run_hierarchical_mosaic_classic_legacy(
     override_defined = False
     plan_override_flag = None
     plan_override_defined = False
-    plan_override = None
     if isinstance(filter_overrides, dict):
         if "sds_mode" in filter_overrides:
             override_flag = _coerce_bool_flag(filter_overrides.get("sds_mode"))
             override_defined = override_flag is not None
-        plan_override = filter_overrides.get("global_wcs_plan_override")
     if isinstance(plan_override, dict) and "sds_mode" in plan_override:
         plan_override_flag = _coerce_bool_flag(plan_override.get("sds_mode"))
         plan_override_defined = plan_override_flag is not None
@@ -18308,7 +18410,7 @@ def run_hierarchical_mosaic_classic_legacy(
         "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
         "quality_crop_margin_px": int(quality_crop_margin_px_config),
         "quality_crop_min_run": int(quality_crop_min_run_config),
-        "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
+        "altaz_cleanup_enabled": bool(altaz_cleanup_effective_flag),
         "altaz_margin_percent": float(altaz_margin_percent_config),
         "altaz_decay": float(altaz_decay_config),
         "altaz_nanize": bool(altaz_nanize_config),
@@ -18370,7 +18472,7 @@ def run_hierarchical_mosaic_classic_legacy(
             "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
             "quality_crop_margin_px": int(quality_crop_margin_px_config),
             "quality_crop_min_run": int(quality_crop_min_run_config),
-            "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
+            "altaz_cleanup_enabled": bool(altaz_cleanup_effective_flag),
             "altaz_margin_percent": float(altaz_margin_percent_config),
             "altaz_decay": float(altaz_decay_config),
             "altaz_nanize": bool(altaz_nanize_config),
@@ -19265,7 +19367,7 @@ def run_hierarchical_mosaic_classic_legacy(
                     quality_crop_enabled_config, quality_crop_band_px_config,
                     quality_crop_k_sigma_config, quality_crop_margin_px_config,
                     quality_crop_min_run_config,
-                    altaz_cleanup_enabled_config,
+                    altaz_cleanup_effective_flag,
                     altaz_margin_percent_config,
                     altaz_decay_config,
                     altaz_nanize_config,
@@ -19628,6 +19730,26 @@ def run_hierarchical_mosaic_classic_legacy(
         )
         if final_mosaic_data_HWC is None:
             return
+        if alpha_final is not None:
+            try:
+                alpha_arr = np.asarray(alpha_final, dtype=np.float32, copy=False)
+                nz_frac = float(np.count_nonzero(alpha_arr) / alpha_arr.size) if alpha_arr.size else 0.0
+                alpha_min_val = float(np.nanmin(alpha_arr)) if alpha_arr.size else 0.0
+                alpha_max_val = float(np.nanmax(alpha_arr)) if alpha_arr.size else 0.0
+                logger.info(
+                    "ALPHA_STATS: level=final_mosaic nonzero_frac=%.3f min=%.3f max=%.3f shape=%s",
+                    nz_frac,
+                    alpha_min_val,
+                    alpha_max_val,
+                    getattr(alpha_arr, "shape", None),
+                )
+                if altaz_cleanup_effective_flag and nz_frac < 0.01:
+                    logger.warning(
+                        "ALPHA_STATS: final alpha mask nearly empty (nonzero_frac=%.4f) with altaz_cleanup_effective=True",
+                        nz_frac,
+                    )
+            except Exception:
+                pass
 
     # --- Phase 6 (Sauvegarde) ---
     base_progress_phase6 = current_global_progress
@@ -19828,6 +19950,43 @@ def run_hierarchical_mosaic_classic_legacy(
 
     # --- MODIFIÉ : Génération de la Preview PNG avec stretch_auto_asifits_like ---
     if final_mosaic_data_HWC is not None and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
+        preview_alpha_present = False
+        preview_rgba_saved = False
+        preview_backend_label = "none"
+
+        def _save_preview_png(img_rgb: np.ndarray, alpha_channel: np.ndarray | None, path_obj: Path) -> tuple[bool, str, bool]:
+            backend_label = "cv2"
+            try:
+                import cv2  # type: ignore
+
+                if alpha_channel is not None:
+                    img_bgra = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGRA)
+                    img_bgra[..., 3] = alpha_channel
+                    ok = cv2.imwrite(str(path_obj), img_bgra)
+                    return ok, backend_label, bool(ok)
+                img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                ok = cv2.imwrite(str(path_obj), img_bgr)
+                return ok, backend_label, False
+            except ImportError:
+                backend_label = "pil"
+            except Exception as exc:
+                logger.warning("phase6: preview save via cv2 failed: %s", exc)
+                backend_label = "cv2_error"
+            try:
+                from PIL import Image  # type: ignore
+            except Exception:
+                return False, backend_label, False
+            try:
+                if alpha_channel is not None:
+                    rgba_stack = np.dstack([img_rgb, alpha_channel])
+                    Image.fromarray(rgba_stack, mode="RGBA").save(path_obj)
+                    return True, "pil", True
+                Image.fromarray(img_rgb, mode="RGB").save(path_obj)
+                return True, "pil", False
+            except Exception as exc:
+                logger.warning("phase6: preview save via PIL failed: %s", exc)
+                return False, backend_label, False
+
         pcb("run_info_preview_stretch_started_auto_asifits", prog=None, lvl="INFO_DETAIL") # Log mis à jour
         try:
             # Downscale extremely large mosaics for preview to avoid OOM
@@ -19908,7 +20067,7 @@ def run_hierarchical_mosaic_classic_legacy(
                                     getattr(alpha_preview, "shape", None),
                                 )
                     else:
-                        alpha_preview = None
+                            alpha_preview = None
                 except Exception as exc_alpha_prev:
                     logger.warning(
                         "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
@@ -19917,6 +20076,7 @@ def run_hierarchical_mosaic_classic_legacy(
                         getattr(alpha_final, "shape", None),
                     )
                     alpha_preview = None
+                preview_alpha_present = True
 
             # Vérifier si la fonction stretch_auto_asifits_like existe dans zemosaic_utils
             if hasattr(zemosaic_utils, 'stretch_auto_asifits_like') and callable(zemosaic_utils.stretch_auto_asifits_like):
@@ -19958,34 +20118,32 @@ def run_hierarchical_mosaic_classic_legacy(
                         * 255
                     ).astype(np.uint8)
                     png_path = output_folder_path / f"{output_base_name}_preview.png"
-                    try: 
-                        import cv2 # Importer cv2 seulement si nécessaire
-                        alpha_png = None
-                        if alpha_preview is not None:
-                            alpha_png = np.clip(alpha_preview, 0, 255).astype(np.uint8, copy=False)
-                            if alpha_png.shape[:2] != img_u8.shape[:2]:
+                    alpha_png = None
+                    if alpha_preview is not None:
+                        alpha_png = np.clip(alpha_preview, 0, 255).astype(np.uint8, copy=False)
+                        if alpha_png.shape[:2] != img_u8.shape[:2]:
+                            try:
+                                import cv2  # type: ignore
+
                                 alpha_png = cv2.resize(
                                     alpha_png,
                                     (img_u8.shape[1], img_u8.shape[0]),
                                     interpolation=cv2.INTER_NEAREST,
                                 )
-                        if alpha_png is not None:
-                            img_bgra = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGRA)
-                            img_bgra[..., 3] = alpha_png
-                            write_success = cv2.imwrite(str(png_path), img_bgra)
-                        else:
-                            img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
-                            write_success = cv2.imwrite(str(png_path), img_bgr)
-                        if write_success: 
-                            pcb("run_success_preview_saved_auto_asifits", prog=None, lvl="SUCCESS", filename=_safe_basename(png_path))
-                            if alpha_png is not None:
-                                logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
-                        else: 
-                            pcb("run_warn_preview_imwrite_failed_auto_asifits", prog=None, lvl="WARN", filename=_safe_basename(png_path))
-                    except ImportError: 
-                        pcb("run_warn_preview_opencv_missing_for_auto_asifits", prog=None, lvl="WARN")
-                    except Exception as e_cv2_prev: 
-                        pcb("run_error_preview_opencv_failed_auto_asifits", prog=None, lvl="ERROR", error=str(e_cv2_prev))
+                            except Exception:
+                                alpha_png = None
+                    save_ok, backend_used, saved_rgba = _save_preview_png(img_u8, alpha_png, png_path)
+                    if alpha_png is not None:
+                        preview_alpha_present = True
+                        preview_backend_label = backend_used or preview_backend_label
+                        if save_ok and saved_rgba:
+                            preview_rgba_saved = True
+                    if save_ok:
+                        pcb("run_success_preview_saved_auto_asifits", prog=None, lvl="SUCCESS", filename=_safe_basename(png_path))
+                        if saved_rgba:
+                            logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
+                    else:
+                        pcb("run_warn_preview_imwrite_failed_auto_asifits", prog=None, lvl="WARN", filename=_safe_basename(png_path))
                 else:
                     pcb("run_error_preview_stretch_auto_asifits_returned_none", prog=None, lvl="ERROR")
             else:
@@ -19999,31 +20157,53 @@ def run_hierarchical_mosaic_classic_legacy(
                         img_u8_fb = (np.clip(m_stretched_fallback.astype(np.float32), 0, 1) * 255).astype(np.uint8)
                         png_path_fb = output_folder_path / f"{output_base_name}_preview_fallback.png"
                         try:
-                            import cv2
                             alpha_png_fb = None
                             alpha_source_fb = alpha_final if alpha_final is not None else alpha_preview
                             if alpha_source_fb is not None:
                                 alpha_png_fb = np.clip(alpha_source_fb, 0, 255).astype(np.uint8, copy=False)
                                 if alpha_png_fb.shape[:2] != img_u8_fb.shape[:2]:
-                                    alpha_png_fb = cv2.resize(
-                                        alpha_png_fb,
-                                        (img_u8_fb.shape[1], img_u8_fb.shape[0]),
-                                        interpolation=cv2.INTER_NEAREST,
-                                    )
+                                    try:
+                                        import cv2  # type: ignore
+
+                                        alpha_png_fb = cv2.resize(
+                                            alpha_png_fb,
+                                            (img_u8_fb.shape[1], img_u8_fb.shape[0]),
+                                            interpolation=cv2.INTER_NEAREST,
+                                        )
+                                    except Exception:
+                                        alpha_png_fb = None
+                            save_ok_fb, backend_used_fb, saved_rgba_fb = _save_preview_png(
+                                img_u8_fb, alpha_png_fb, png_path_fb
+                            )
                             if alpha_png_fb is not None:
-                                img_bgra_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGRA)
-                                img_bgra_fb[..., 3] = alpha_png_fb
-                                cv2.imwrite(str(png_path_fb), img_bgra_fb)
-                                logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
-                            else:
-                                img_bgr_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGR)
-                                cv2.imwrite(str(png_path_fb), img_bgr_fb)
-                            pcb("run_success_preview_saved_fallback", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(png_path_fb))
-                        except: pass # Ignorer erreur fallback
+                                preview_alpha_present = True
+                                preview_backend_label = backend_used_fb or preview_backend_label
+                                if save_ok_fb and saved_rgba_fb:
+                                    preview_rgba_saved = True
+                            if save_ok_fb:
+                                pcb("run_success_preview_saved_fallback", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(png_path_fb))
+                                if saved_rgba_fb:
+                                    logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
+                        except Exception:
+                            pass # Ignorer erreur fallback
 
         except Exception as e_stretch_main: 
             pcb("run_error_preview_stretch_unexpected_main", prog=None, lvl="ERROR", error=str(e_stretch_main))
             logger.error("Erreur imprévue lors de la génération de la preview:", exc_info=True)
+        
+        if preview_alpha_present:
+            logger.info(
+                "PHASE6_PREVIEW_ALPHA: saved_rgba=%s (backend=%s)",
+                bool(preview_rgba_saved),
+                preview_backend_label,
+            )
+            if not preview_rgba_saved:
+                logger.warning(
+                    "PHASE6_PREVIEW_ALPHA: saved_rgba=False (backend=%s)",
+                    preview_backend_label,
+                )
+        else:
+            logger.info("PHASE6_PREVIEW_ALPHA: skipped (no_alpha_map)")
             
     if 'final_mosaic_data_HWC' in locals() and final_mosaic_data_HWC is not None: del final_mosaic_data_HWC
     if 'final_mosaic_coverage_HW' in locals() and final_mosaic_coverage_HW is not None: del final_mosaic_coverage_HW

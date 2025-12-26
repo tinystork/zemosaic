@@ -1,507 +1,347 @@
-# Mission Codex — Filter GUI mount/angle hardening (EQMODE + orientation)
+# agent.md — Mission: Remonter eqmode_summary au Worker + Alpha→Transparence (ALT/AZ)
 
-## 1. Scope & goals
+## Objectif
+1) **Faire remonter `eqmode_summary`** (résumé EQ vs ALT_AZ vs UNKNOWN) depuis le **Filter GUI Qt** vers le **worker**.
+2) **Auto-activer `altaz_cleanup`** (lecropper altZ) lorsque le dataset contient de l’ALT/AZ (détecté via `eqmode_summary`).
+3) **Garantir que l’alpha mask est propagé** jusqu’aux sorties (au minimum la preview PNG) afin d’avoir de la **transparence** et **pas de “gros trous noirs”**.
+4) **Ne pas inventer de fond** : pas de remplissage “sky”, pas de reconstruction artificielle — on préfère alpha=0 / NaN.
 
-**Goal:**  
-Harden clustering in `zemosaic_filter_gui.py` by:
+> **Important (datasets mixtes EQ+ALT/AZ)**  
+> Si `altaz_count > 0`, alors `altaz_cleanup` est **effectif pour tout le run** (toute la mosaïque).  
+> Codex ne doit **PAS** essayer d’introduire des heuristiques plus “malines” (par groupe, par master tile, etc.).  
+> Toute granularité plus fine (par cluster/tuile) sera l’objet d’une mission future, pas de celle-ci.
 
-1. Using the FITS header keyword `EQMODE` (e.g. Seestar S50: `EQ...uatorial mode`) to classify each source as **EQ / ALT_AZ / UNKNOWN**.
-2. Ensuring **clusters/master tiles do not mix EQ and ALT_AZ frames**:
-   - Split groups by mount mode before any orientation-based split.
-3. Keep the existing **orientation auto-split** (PA_DEG) logic, but now it runs on mode-homogeneous groups.
+## Contraintes (anti-régression)
+- **Ne pas modifier** la logique scientifique de coadd/reproject/weighting hors activation ALT/AZ (pas de refactor massif).
+- **Ne pas changer** le comportement EQ-only : si pas d’ALT/AZ → rien ne s’active automatiquement, résultats inchangés.
+- **Ne pas toucher** au worker “borrowing”, à la logique de clustering existante, ni aux mécanismes de safe-mode/mémoire.
+- **Ne pas toucher** à la GUI Tk (lecropper UI) : **Qt only** + Worker.
+- Pas de “fill background” (fond inventé). La sortie doit refléter la couverture réelle.
 
-This mission is **Filter GUIs only** (Tk + Qt):
+## Suivi d’avancement
+- [x] Étape A — Qt Filter: produire un `eqmode_summary` structuré
+- [x] Étape B — Qt Filter: injecter `eqmode_summary` dans les overrides envoyés au worker
+- [x] Étape C — Worker: lire `eqmode_summary`, normaliser et stocker la version canonique
+- [x] Étape D — Worker: auto-activer `altaz_cleanup` (ordre atomique, flag effectif au niveau run)
+- [x] Étape E — Alpha propagation: transparence jusqu’aux previews (pas de noircissement du RGB science)
+- [x] Hotfix — Intertile: forcer 1 worker sur Windows/hybride (crash natif)
 
-- ✅ `zemosaic_filter_gui.py`      (Tk Filter GUI)
-- ✅ `zemosaic_filter_gui_qt.py`   (Qt / PySide6 Filter GUI)
-- ❌ No changes to worker modules (`zemosaic_worker.py`, etc.)
-- ❌ No changes to Phase 5 / GPU / SDS logic
+### Amendement critique (anti “zones noires”)
+- **Interdit** d’appliquer l’alpha au RGB “scientifique” (pas de `rgb *= alpha`, pas de noircissement des pixels couverts).
+- L’alpha sert **uniquement** à la **transparence/masquage** (preview/export) et/ou à des couches séparées (coverage/weight),
+  mais ne doit pas altérer `mosaic_data` / `final_mosaic` (science).
 
-The aim is to make clustering more robust, especially for Seestar datasets mixing EQ + ALT/AZ, without changing the underlying worker logic, SDS mode, or GPU safety.
+## Fichiers autorisés à modifier (scope strict)
+- `zemosaic_filter_gui_qt.py`
+- `zemosaic_worker.py`
 
----
+(Optionnel uniquement si nécessaire pour sauvegarde RGBA sans OpenCV)
+- `zemosaic_utils.py` (uniquement si on ajoute une fonction utilitaire de save PNG RGBA fallback)
 
-## 2. Background
+## Plan d’implémentation
 
-### 2.1. Problem
+### Étape A — Qt Filter: produire un `eqmode_summary` structuré
+Dans `zemosaic_filter_gui_qt.py` :
 
-Currently, clustering and borrowing do not explicitly segregate:
+1) **Modifier** `_prefetch_eqmode_for_candidates(...)` :
+   - Aujourd’hui : calcule eq/altaz/unknown et log une string.
+   - À faire :
+     - Construire un dict `eqmode_summary` **stable** (pas de grosses datas) :
 
-- Equatorial mode (`EQMODE=1` on Seestar),
-- Alt-az mode (`EQMODE=0`),
-- “Unknown” / other instruments (no EQMODE present).
+       ```python
+       eqmode_summary = {
+         "eq_count": int(eq_count),
+         "altaz_count": int(altaz_count),
+         "unknown_count": int(unknown_count),
+         "total": int(total_count),
+         "cache_hits": int(cache_hits),
+         "cache_miss": int(cache_miss),
+         "reads_header": int(reads_header),
+         "source": "qt_prefetch_eqmode",
+       }
+       ```
 
-This can lead to:
+     - Stocker aussi sur l’instance : `self._last_eqmode_summary = eqmode_summary`
+     - Retourner `eqmode_summary` (return) **sans casser les appels existants**.
+       - Si tu veux rester ultra-safe : garder le même comportement côté callers (ils peuvent ignorer le retour).
 
-- Clusters (master tiles) mixing EQ and ALT/AZ frames,
-- Borrowing (border frame duplication) re-mixing modes even if clustering was split.
+2) Dans `_compute_auto_groups(...)` :
+   - Capturer le retour :
 
-Given:
+     ```python
+     eqmode_summary = self._prefetch_eqmode_for_candidates(candidate_infos, messages)
+     ```
 
-- ALT/AZ stacks have rotational artefacts and coverage “triangles/bands”,
-- EQ stacks are more stable and rectangular,
+   - Stocker dans `result_payload` (le dict renvoyé) :
+     - `result_payload["eqmode_summary"] = eqmode_summary` si dict.
 
-it is scientifically safer to avoid mixing them within the same master tile.
+> BUT: On veut que `overrides()` puisse récupérer `eqmode_summary` sans parsing de logs.
 
-### 2.2. Existing tools
+### Étape B — Qt Filter: injecter `eqmode_summary` dans les overrides envoyés au worker
+Toujours dans `zemosaic_filter_gui_qt.py`, dans `overrides()` (là où `global_wcs_meta` est rempli après `_ensure_global_wcs_for_selection`) :
 
-- FITS headers for Seestar S50 include `EQMODE` with documented meaning:
-  - `1` → equatorial mode,
-  - `0` → alt-az mode.
-- Filter GUIs already:
-  - Read headers,
-  - Build `candidate_infos` lists,
-  - Have an orientation-based split (`_split_group_by_orientation`) based on `PA_DEG`,
-  - Optionally run borrowing via `apply_borrowing_v1(...)`.
+1) Récupérer le résumé :
+   - Priorité : `result_payload.get("eqmode_summary")` si dispo.
+   - Sinon fallback : `getattr(self, "_last_eqmode_summary", None)`.
 
-We want to **use EQMODE** to derive a `MOUNT_MODE` tag and enforce:
-
-- “No EQ+ALT_AZ mixture per group”,
-- Borrowing that respects this segregation.
-
----
-
-## 3. Tasks
-
-### 3.1. New helper: classify mount mode from header [x]
-
-Add a small helper function to classify mount mode from a FITS header:
-
-```python
-def _classify_mount_mode_from_header(header: Any) -> str:
-    """Return 'EQ', 'ALT_AZ', 'EQMODE_<N>', or 'UNKNOWN' based on header['EQMODE'].
-
-    Rules:
-    - If header is falsy or has no EQMODE -> 'UNKNOWN'.
-    - Coerce EQMODE to int safely.
-        - 1          -> 'EQ'
-        - 0          -> 'ALT_AZ'
-        - other int  -> f"EQMODE_{N}"
-    - On any error -> 'UNKNOWN'.
-    """
-````
-
-Implementation requirements:
-
-* If `header` is falsy → return `"UNKNOWN"`.
-* Read `EQMODE = header.get("EQMODE")`.
-* Attempt to coerce to `int`:
-
-  * `1` → `"EQ"`
-  * `0` → `"ALT_AZ"`
-  * any other int `N` → `f"EQMODE_{N}"`.
-* If conversion fails → return `"UNKNOWN"`.
-* Be tolerant to types (`str`, `float`, etc.), and never raise.
-
-This function **must not** depend on any GUI or Tk/Qt object.
-It can be defined in each GUI file or in a small shared helper, as long as you avoid circular imports.
-
----
-
-### 3.2. Attach `MOUNT_MODE` to candidate_infos [x]
-
-In the Filter GUI clustering path (Tk + Qt), each selected item is converted to an `entry` dict (`candidate_infos` building).
-
-Current code looks like:
-
-```python
-entry = dict(item.src)
-if "path" not in entry:
-    entry["path"] = item.path
-...
-if "header" not in entry:
-    entry["header"] = item.header
-...
-candidate_infos.append(entry)
-```
-
-Extend this block so that each `entry` has a `MOUNT_MODE` field:
-
-* Retrieve a header object:
-
-  ```python
-  hdr = entry.get("header") or item.header
-  ```
-
-* Set `MOUNT_MODE` if not already present:
-
-  ```python
-  if "MOUNT_MODE" not in entry:
-      entry["MOUNT_MODE"] = _classify_mount_mode_from_header(hdr)
-  ```
-
-Constraints:
-
-* Do **not** overwrite any existing `entry["MOUNT_MODE"]` if present.
-* If `hdr` is `None` or the header has no usable `EQMODE`, `_classify_mount_mode_from_header` will return `"UNKNOWN"`.
-
-This ensures Seestar frames get `"EQ"` / `"ALT_AZ"` tags, while all other cameras remain `"UNKNOWN"` and behave as before.
-
-For the **Qt Filter GUI** (`zemosaic_filter_gui_qt.py`):
-
-* Locate the equivalent clustering path where `candidate_infos` (or an equivalent list of dicts) is built.
-* Apply the **same logic** (attach `header`, compute `MOUNT_MODE` via `_classify_mount_mode_from_header`) before appending the entry.
-* You may either:
-
-  * re-use the same helper implementation (by copy) in the Qt file, or
-  * factor these tiny helpers into a small shared section/module, **as long as** you do not introduce circular imports between Tk and Qt GUIs.
-
-The semantics of `MOUNT_MODE` MUST be identical in Tk and Qt paths.
-
----
-
-### 3.3. New helper: split a single group by mount mode [x]
-
-Add a helper at module level (near `_split_group_by_orientation`), to split **one**
-group by mount-mode homogeneity:
-
-```python
-def _split_group_by_mount_mode(group: list[dict]) -> list[list[dict]]:
-    """Split group into subgroups based on entry['MOUNT_MODE'].
-
-    Rules:
-    - Modes: 'EQ', 'ALT_AZ', 'UNKNOWN', and possibly 'EQMODE_<N>'.
-    - Unknowns join the majority mode when both EQ and ALT_AZ are present.
-    - If effectively single-mode (or only UNKNOWN), return [group].
-    """
-```
-
-Detailed behaviour:
-
-1. Extract modes from the group:
+2) **Injecter dans `global_wcs_meta`** (meilleur chemin car le worker met ça dans `global_wcs_plan["meta"]`) :
 
    ```python
-   modes = []
-   for entry in group:
-       mode = entry.get("MOUNT_MODE", "UNKNOWN")
-       if not isinstance(mode, str):
-           mode = str(mode)
-       modes.append(mode)
+   if eqmode_summary:
+       meta_payload["eqmode_summary"] = eqmode_summary
    ```
 
-2. Partition entries into three logical buckets:
-
-   * `eq_entries`      → mode `"EQ"` or `"EQMODE_1"` (to be conservative)
-   * `altaz_entries`   → `"ALT_AZ"`
-   * `unknown_entries` → `"UNKNOWN"` or anything else.
-
-   > Note: any `EQMODE_<N>` with `N != 1` is treated as UNKNOWN for the split (so they follow the majority).
-
-3. Decide:
-
-   * If only one of `eq_entries`, `altaz_entries`, `unknown_entries` is non-empty
-     **or**
-     if only UNKNOWN + a single other mode → return `[group]` (no split).
-   * If you have both EQ and ALT_AZ present:
-
-     * Determine majority among EQ vs ALT_AZ.
-     * Attach `unknown_entries` to the majority group.
-     * Return `[eq_like_group, altaz_like_group]`, keeping a stable order inside each.
-
-Implementation notes:
-
-* Do **not** crash if `group` is empty.
-* Prefer to preserve the original ordering of entries within each subgroup.
-* This helper is pure and does not access GUI components.
-
----
-
-### 3.4. Apply mount-mode split before orientation auto-split [x]
-
-In the clustering path where `cluster_func(...)` is called (both Tk and Qt Filter GUIs), we currently have:
-
-```python
-groups_initial = cluster_func(...)
-...
-groups_used = groups_initial
-# (optional relax on epsilon)
-...
-angle_split_effective = ...
-...
-if auto_angle_enabled ...:
-    # compute dispersion, use _split_group_by_orientation(...)
-...
-groups_after_autosplit = autosplit_func(...)
-```
-
-Insert a **mount-mode split stage** just after selecting `groups_used`
-(and after any epsilon relax) but before orientation auto-split:
-
-1. After `groups_used` is finally chosen:
+3) **Injecter aussi dans `global_wcs_plan_override`** (facultatif mais robuste) :
 
    ```python
-   groups_mode_guarded = []
-   mode_splits = 0
-   for grp in groups_used:
-       subgroups = _split_group_by_mount_mode(grp)
-       if len(subgroups) > 1:
-           mode_splits += 1
-       groups_mode_guarded.extend(subgroups)
-   groups_used = groups_mode_guarded
+   if eqmode_summary:
+       plan_override = metadata_update.get("global_wcs_plan_override")
+       if not isinstance(plan_override, dict):
+           plan_override = {}
+       plan_override["eqmode_summary"] = eqmode_summary
+       metadata_update["global_wcs_plan_override"] = plan_override
    ```
 
-2. Log once (INFO level) when `mode_splits > 0`:
+4) Log Qt clair (INFO) :
 
-   ```python
-   logger.info("Mount-mode guard: split %d group(s) by EQMODE / MOUNT_MODE.", mode_splits)
-   ```
+   * `FILTER_EQMODE_SUMMARY: eq=.. altaz=.. unknown=.. total=..`
 
-3. Orientation auto-split (`_split_group_by_orientation`) then runs on **the already mode-homogeneous `groups_used`** exactly as before.
+### Étape C — Worker: lire `eqmode_summary` et déterminer `contains_altaz` (avec parsing ultra défensif)
 
-Notes:
-
-* Do **not** change the semantics of `auto_angle_split_var`, `angle_split_deg_var`, `cluster_orientation_split_deg` settings.
-* Do **not** change `auto_angle_detect_threshold` logic or `ANGLE_SPLIT_DEFAULT_DEG` in this mission.
-* The only “hardening” is that groups that mix EQ + ALT_AZ are split before we look at PA_DEG dispersion.
-
----
-
-### 3.5. Borrowing guard: borrowing must NOT re-mix EQ and ALT_AZ [x]
-
-⚠️ Important: `apply_borrowing_v1(...)` can duplicate “border” frames across neighboring groups.
-If called on a mixed-mode population, it can **re-introduce ALT_AZ into EQ groups (and vice versa)**,
-which defeats the mount-mode guard.
-
-Therefore, when borrowing is enabled (coverage mode), and **in both Filter GUIs (Tk + Qt)**,
-apply borrowing **separately per mount-mode bucket**, but keep the external `borrow_stats`
-API identical to today.
-
-Objectif: empêcher STRICTEMENT tout mélange EQ + ALT_AZ après borrowing,
-sans changer le comportement historique quand ALT_AZ n’est pas présent.
-
-Règle de déclenchement (IMPORTANT):
-- Appliquer borrowing par bucket (partition) UNIQUEMENT si les modes effectifs contiennent à la fois "EQ" et "ALT_AZ".
-- Si on a seulement ("EQ" + "UNKNOWN") ou seulement ("ALT_AZ" + "UNKNOWN") ou seulement "UNKNOWN":
-  -> comportement strictement identique à aujourd’hui: appel unique à apply_borrowing_v1(final_groups, ...)
-
-Cas final_groups vide ou < 2:
-- Retourner exactement le résultat de apply_borrowing_v1(final_groups, ...) (groups ET stats),
-  pour rester bit-à-bit compatible avec l’existant.
-#### 3.5.1. Helper wrapper `_apply_borrowing_per_mount_mode(...)`
-
-Add a small helper in the Filter GUI layer (Tk side), e.g.:
+Dans `zemosaic_worker.py`, dans `run_hierarchical_mosaic_classic_legacy(...)` juste après :
 
 ```python
-def _apply_borrowing_per_mount_mode(
-    final_groups: list[list[dict]],
-    logger: logging.Logger,
-) -> tuple[list[list[dict]], dict[str, Any]]:
-    ...
+global_wcs_plan = _prepare_global_wcs_plan(...)
+plan_override_raw = filter_overrides.get("global_wcs_plan_override") if isinstance(filter_overrides, dict) else None
+plan_override = plan_override_raw if isinstance(plan_override_raw, dict) else {}
 ```
 
-You will use the **same semantics** for the Qt Filter GUI (either by reusing the helper
-or re-implementing it in the Qt file with identical behaviour).
+1. Résoudre `eqmode_summary` (ordre de priorité) :
 
-Rules for this helper:
+   * `plan_override.get("eqmode_summary")` (plan_override dict-safe, sinon `{}`)
+   * `global_wcs_plan.get("meta", {}).get("eqmode_summary")` si dict
+   * `filter_overrides.get("eqmode_summary")` si dict (fallback)
+   * sinon `None` / `{}`
 
-1. **Never modify** `zemosaic_utils.apply_borrowing_v1` itself.
+2. **Normalisation défensive** (amendement):
 
-   * Do not change its function signature.
-   * Do not change the internal layout of the `stats` dict it returns.
+   * Ne jamais supposer que c’est un int (peut être str "66", "66.0", float, etc.)
 
-2. If `final_groups` is empty or has fewer than 2 groups, simply return
-   `(final_groups, stats)` where `stats` is a *single* dict with the same keys as
-   `apply_borrowing_v1` would return (call `apply_borrowing_v1` once to get these stats).
+   * Ajouter un helper local minimal (dans la fonction, ou en haut de module si déjà une convention) :
 
-3. Determine a **group-level mode** for each group (it should already be homogeneous
-   after 3.4):
+     ```python
+     def _safe_int(v, default=0):
+         try:
+             if v is None:
+                 return default
+             if isinstance(v, bool):
+                 return int(v)
+             if isinstance(v, int):
+                 return v
+             if isinstance(v, float):
+                 return int(v)
+             if isinstance(v, str):
+                 s = v.strip()
+                 if not s:
+                     return default
+                 # autorise "66.0"
+                 return int(float(s))
+             return int(v)
+         except Exception:
+             return default
+     ```
 
-   * `group_mode = "EQ" | "ALT_AZ" | "UNKNOWN"`
-   * Use a safe majority vote on the entries’ `MOUNT_MODE` (but do not crash if empty).
+   * Puis normaliser :
 
-4. Compute the set of effective modes present among `group_mode`s.
+     ```python
+     summary = eqmode_summary or {}
+     eq_count = _safe_int(summary.get("eq_count"), 0)
+     altaz_count = _safe_int(summary.get("altaz_count"), 0)
+     unknown_count = _safe_int(summary.get("unknown_count"), 0)
+     total = _safe_int(summary.get("total"), eq_count + altaz_count + unknown_count)
 
-   * If the set has size **0 or 1** (all UNKNOWN, or all EQ, etc.), keep behaviour
-     **strictly identical** to the current code:
+     contains_altaz = altaz_count > 0
+     ```
 
-     * Call `apply_borrowing_v1(final_groups, None, logger=logger, ...)` once.
-     * Return its `(groups, stats)` unchanged (no partitioning).
+   * Log INFO unique :
 
-5. If there are **2 or more modes**:
+     * `WORKER_EQMODE_SUMMARY: eq=. altaz=. unknown=. total=. contains_altaz=.`
 
-   * Partition `final_groups` into buckets:
+3. Attacher à `global_wcs_plan` pour usage plus tard :
 
-     * EQ bucket:      `group_mode == "EQ"`
-     * ALT_AZ bucket:  `group_mode == "ALT_AZ"`
-     * UNKNOWN bucket: `group_mode == "UNKNOWN"`
-
-   * For each non-empty bucket:
-
-     * If the bucket has fewer than 2 groups, keep it as-is and simulate a stats dict
-       with `executed=False` and zeros ailleurs.
-     * Else, call `apply_borrowing_v1(bucket_groups, None, logger=logger, ...)`
-       and get `(bucket_groups_new, bucket_stats)`.
-
-   * Recombine les groupes dans un ordre déterministe, par exemple :
-     `final_groups_new = final_eq + final_alt + final_unk`
-
-6. Build a **single aggregated stats dict** qui garde la même structure *plate*
-   que `apply_borrowing_v1` aujourd’hui (pas de `{ "EQ": ..., "ALT_AZ": ... }` imbriqué) :
-
-   * Initialise `global_stats` comme un dict vide.
-   * Pour chaque `bucket_stats` :
-
-     * Si `global_stats` est vide, deep-copy `bucket_stats`.
-     * Sinon, pour toutes les clés présentes dans les deux :
-
-       * Si les deux valeurs sont `int` / `float`, les sommer.
-       * Si les deux valeurs sont `list`, étendre la liste.
-       * Pour les autres types (ex. `str`), garder la valeur originale ou la dernière ; c’est purement debug.
-   * S’assurer que `global_stats["executed"]` est le OR logique des `"executed"` de chaque bucket.
-
-   Résultat : `global_stats` ressemble à la sortie d’un unique `apply_borrowing_v1`,
-   et tout code existant qui attend un `borrow_stats` **plat** continue à fonctionner.
-
-7. Retourner `(final_groups_new, global_stats)` depuis `_apply_borrowing_per_mount_mode`.
-
-8. Ajouter un post-check (debug/info) après borrowing :
-
-   * Compter les groupes où `{entry["MOUNT_MODE"]}` a une taille > 1 ; ça doit être 0.
-   * Sinon, logger un warning mais **ne pas** crasher.
-
-#### 3.5.2. Using the helper in Tk and Qt GUIs
-
-Là où le Filter GUI appelle aujourd’hui :
+> **Note (EQMODE top-level vs meta)**
+> Pour cette mission, la version **canonique** est celle stockée dans `global_wcs_plan["meta"]["eqmode_summary"]`.
+> Le champ top-level `global_wcs_plan["eqmode_summary"]` (si présent) est **redondant / debug** :
+> le worker ne doit **pas** le relire plus tard, et Codex ne doit pas introduire de lecteur ailleurs dans le pipeline.
 
 ```python
-if coverage_enabled and final_groups:
-    final_groups, _borrow_stats = apply_borrowing_v1(final_groups, None, logger=logger)
+# Canonical location for this mission:
+meta = global_wcs_plan.get("meta")
+if not isinstance(meta, dict):
+    meta = {}
+    global_wcs_plan["meta"] = meta
+meta["eqmode_summary"] = {
+  "eq_count": eq_count,
+  "altaz_count": altaz_count,
+  "unknown_count": unknown_count,
+  "total": total,
+}
+
+# Optional (debug / backward compatibility):
+global_wcs_plan["eqmode_summary"] = dict(meta["eqmode_summary"])
 ```
 
-remplacer par :
+### Étape D — Worker: auto-activer `altaz_cleanup` (sans casser EQ-only) + ordre d’exécution “atomique”
+
+Toujours dans `run_hierarchical_mosaic_classic_legacy(...)` :
+
+#### D0 — Amendement critique (anti états incohérents)
+
+* Calculer `contains_altaz` + `altaz_cleanup_effective_flag` **AVANT** :
+
+  * `lecropper_pipeline_flag`
+  * `pipeline_flags_msg`
+  * `final_quality_pipeline_cfg`
+  * et tout log “MT_PIPELINE_FLAGS” qui reflète les flags.
+
+#### D1 — Définir requested vs effective
+
+1. Partir du flag de config :
 
 ```python
-if coverage_enabled and final_groups:
-    final_groups, _borrow_stats = _apply_borrowing_per_mount_mode(final_groups, logger=logger)
+altaz_cleanup_requested_flag = bool(altaz_cleanup_enabled_config)
+altaz_cleanup_effective_flag = altaz_cleanup_requested_flag
 ```
 
-Appliquer le **même pattern** dans `zemosaic_filter_gui_qt.py` partout où borrowing est appelé.
+2. Si `contains_altaz` est True → forcer ON pour **tout le run** :
 
-Résumé des garanties :
+```python
+if contains_altaz:
+    if not altaz_cleanup_effective_flag:
+        logger.info("AUTO_ALTaz_cleanup: enabled (contains_altaz=True, config_requested=False)")
+    altaz_cleanup_effective_flag = True
+```
 
-* S’il n’y a qu’un **seul mode effectif** (tout UNKNOWN, ou tout EQ, etc.),
-  le comportement de borrowing est bit-à-bit identique à la version actuelle.
-* Borrowing n’est jamais appliqué à des groupes de modes différents.
-* `borrow_stats` reste un dict plat (même structure qu’aujourd’hui), donc
-  **pas de changement d’API** pour les consommateurs existants.
+* **Important** : comportement **global au run**.
+* Interdiction d’introduire une logique par groupe/tile/cluster basée sur `eqmode_summary`.
 
----
-Post-check (debug/info) après borrowing:
-- Pour chaque groupe, calculer has_eq / has_altaz en normalisant:
-    EQ si entry["MOUNT_MODE"] == "EQ"
-    ALT_AZ si entry["MOUNT_MODE"] == "ALT_AZ"
-  (tout le reste est traité comme UNKNOWN)
-- Invariant: (has_eq and has_altaz) doit être False pour tous les groupes.
-- Si violation: logger WARNING (ne pas crasher).
+#### D2 — Consommer *uniquement* effective_flag
 
-## 4. Constraints / non-goals
+* `lecropper_pipeline_flag` dépend de `altaz_cleanup_effective_flag`
+* `pipeline_flags_msg` affiche **l’état effectif**
+* `final_quality_pipeline_cfg["altaz_cleanup_enabled"] = altaz_cleanup_effective_flag`
 
-* **No UI change**:
+#### D3 — Invariants
 
-  * La checkbox “Auto split by orientation” et le spinbox d’angle restent tels quels.
-  * Pas de nouveau bouton / label / option pour le mount mode.
+* Si `contains_altaz=False` → `altaz_cleanup_effective_flag == requested_flag` (comportement identique à avant)
+* Dataset EQ-only : pas de changement.
 
-* **No worker changes**:
+### Étape E — Alpha propagation: garantir transparence et éviter “trous noirs”
 
-  * Ne pas toucher `zemosaic_worker.py`, `zemosaic_align_stack_*`, la GPU safety ou la Phase 5.
+Objectif: si alpha existe, **preview PNG = RGBA** (alpha=0 → transparent), pas RGB noir.
 
-* **No SDS behavior change**:
+1. Ajouter des logs “sanity” low-cost au moment où `pipeline_alpha_mask` (ou équivalent) est disponible :
 
-  * Le path ZeSupaDupStack (`sds_mode`) qui construit les coverage batches via `_build_sds_batches_for_indices` doit rester intact.
+   * Calculer au moins :
 
-* **No change to borrowing core API**:
+     ```python
+     alpha_nonzero_frac = float(np.count_nonzero(alpha) / alpha.size)
+     alpha_min = float(alpha.min())
+     alpha_max = float(alpha.max())
+     ```
 
-  * Ne pas modifier `zemosaic_utils.apply_borrowing_v1`, `BORROW_ENABLE`, ni la structure du dict `stats` qu’il renvoie.
-  * Tous les garde-fous de borrowing par mount mode doivent vivre côté Filter GUI (Tk + Qt) via le wrapper `_apply_borrowing_per_mount_mode`.
+   * Log INFO :
 
-* **Backwards compatibility**:
+     * `ALPHA_STATS: nonzero_frac=.. min=.. max=.. shape=H×W`
 
-  * S’il n’y a pas de header ou pas de `EQMODE`, le comportement doit rester identique (tout `"UNKNOWN"` → pas de split par mode).
-  * Pas de nouvelle dépendance obligatoire.
+   * WARN si :
 
----
+     * `altaz_cleanup_effective_flag=True` **et** `alpha_nonzero_frac < 0.01` → suspect (alpha quasi vide)
 
-## 5. Logging expectations
+2. Côté Phase 6 / preview :
 
-Nouveau log (niveau INFO) quand le split par mode se déclenche :
+   * Si alpha dispo :
 
-* Clé de traduction : `filter_log_mount_mode_split`
-* Message par défaut :
-  `"Mount-mode guard: split {N} group(s) by EQMODE / MOUNT_MODE."`
+     * construire `alpha_preview` (downscale cohérent avec preview RGB)
+     * construire RGBA (ou BGRA pour cv2) :
 
-Le wrapper de borrowing peut aussi logger en DEBUG un résumé par mode si besoin, mais ce n’est pas obligatoire. L’important est :
+       ```python
+       rgba_view = np.dstack([rgb_view[..., 0], rgb_view[..., 1], rgb_view[..., 2], alpha_preview])
+       ```
 
-* Un log clair quand `mode_splits > 0`.
-* Aucune erreur fatale si `MOUNT_MODE` manque ou est incohérent.
+   * Log :
 
----
+     * `PHASE6_PREVIEW_ALPHA: saved_rgba=True (backend=cv2)`
 
-## 6. Tests to run (dev side)
+   * Sinon :
 
-1. **Test “unitaire” dans un REPL** :
+     * `PHASE6_PREVIEW_ALPHA: skipped (no_alpha_map)`
 
-   * Créer des groupes synthétiques avec différentes distributions de `MOUNT_MODE`.
-   * Vérifier `_split_group_by_mount_mode` :
+3. Fallback si OpenCV indisponible (anti “trou noir”) :
 
-     * all-EQ → 1 groupe
-     * EQ + ALT_AZ → 2 groupes
-     * EQ + UNKNOWN → 1 groupe
-     * ALT_AZ + UNKNOWN → 1 groupe
-     * EQ + ALT_AZ + UNKNOWN → 2 groupes, UNKNOWN attaché au mode majoritaire.
+   * Essayer PIL en RGBA si dispo.
+   * Sinon WARN clair :
 
-2. **Test manuel GUI – Seestar EQ only** :
+     * `PHASE6_PREVIEW_ALPHA: saved_rgba=False (no_opencv_no_pil_alpha_lost)`
+   * **Interdit** de “remplir le fond” :
 
-   * Dataset Seestar S50 en pur mode EQ (`EQMODE=1`).
-   * Lancer Filter GUI (Tk puis Qt) et comparer avec la version précédente :
+     * pas de fill des pixels alpha=0 (on garde NaN/0 et alpha=0).
 
-     * Nombre de groupes et taille des groupes identiques (à bruit près).
-     * Orientation auto-split inchangé.
-     * Pas de split par mode (ou `N=0` dans les logs).
+## Critères d’acceptation
 
-3. **Test manuel GUI – Seestar mix EQ + ALT/AZ** :
+* Dataset **EQ only** :
 
-   * Dataset mêlant `EQMODE=1` et `EQMODE=0`.
-   * Lancer clustering (Tk / Qt) :
+  * logs montrent `contains_altaz=False`, `altaz_cleanup_effective_flag=False` si config off.
+  * résultat scientifique inchangé (mêmes outputs principaux).
 
-     * Log “Mount-mode guard…” avec `N > 0`.
-     * Nombre de groupes plus élevé qu’avant.
-     * Orientation auto-split uniquement au sein d’un même mode.
-   * Activer coverage/borrowing :
+* Dataset **ALT/AZ** ou **mixte** :
 
-     * Vérifier qu’aucun groupe final ne contient de mix EQ + ALT_AZ.
-     * Vérifier que `borrow_stats` est bien un dict plat (pas de dict imbriqué par mode).
+  * logs montrent `altaz_count > 0`, `contains_altaz=True`.
+  * `AUTO_ALTaz_cleanup` loggué si la config ne le demandait pas explicitement.
+  * `altaz_cleanup_effective_flag=True` pour tout le run (pas de logique par groupe).
 
-4. **Test manuel GUI – Autres caméras (pas de EQMODE)** :
+* Quand un alpha map existe :
 
-   * Dataset sans `EQMODE`.
-   * Clustering avant / après :
+  * preview PNG écrite en **RGBA** (ou BGRA côté cv2) :
 
-     * Pas de log guard significatif,
-     * Nombre de groupes comparable,
-     * Auto-split par orientation identique.
+    * zones alpha=0 transparentes dans un viewer compatible,
+    * pas de grandes zones “noir plein” inventées.
 
-5. **Parité Tk / Qt** :
+* Pas de régression :
 
-   * Pour au moins un dataset EQ only et un dataset mix EQ+ALT/AZ :
+  * aucun changement de format/nommage du FITS principal,
+  * aucun impact sur borrowing / clustering / GPU safety.
 
-     * Faire le même run dans les deux GUIs.
-     * Vérifier que les résultats (groupes, logs, borrowing) sont cohérents ; seules de petites différences d’ordre interne sont acceptables.
+## Tests manuels (checklist)
 
-Si tu vois une régression (explosion de groupes, logs bizarres, crash), il faut d’abord revoir :
+1. Run court EQ-only (10–20 frames) :
 
-* `_classify_mount_mode_from_header`
-* `_split_group_by_mount_mode`
-* L’endroit où `MOUNT_MODE` est attaché à `candidate_infos`
-* Le wrapper `_apply_borrowing_per_mount_mode`
+   * vérifier logs `FILTER_EQMODE_SUMMARY` + `WORKER_EQMODE_SUMMARY` (`contains_altaz=False`)
+   * vérifier `MT_PIPELINE_FLAGS` (altaz_cleanup off si non demandé)
+   * vérifier preview (doit être comme avant)
 
-avant d’aller toucher les workers ou la Phase 5.
+2. Run ALT/AZ-only ou mixte (Seestar) :
 
-Additionally, for **Qt / PySide6**:
+   * vérifier logs :
 
-* Run at least one full manual test path using `zemosaic_filter_gui_qt.py` on the mêmes datasets.
-* Vérifier que :
+     * `FILTER_EQMODE_SUMMARY: eq=.. altaz>0 ...`
+     * `WORKER_EQMODE_SUMMARY: ... contains_altaz=True`
+     * `AUTO_ALTaz_cleanup: enabled ...` si config off
+   * vérifier preview RGBA (viewer qui affiche l’alpha : PS/GIMP/Affinity, etc.) :
 
-  * Les comptes et compositions de groupes matchent le Tk Filter GUI pour des réglages identiques.
-  * Les logs de mount-mode guard et le comportement de borrowing sont cohérents entre Tk et Qt.
+     * zones sans coverage → transparentes, pas noir
 
-````
+3. Vérifier logs alpha :
+
+   * `ALPHA_STATS: ...`
+   * `PHASE6_PREVIEW_ALPHA: saved_rgba=True (...)` ou WARN explicite si fallback
+
+4. Vérifier qu’aucun “fill sky” n’a été ajouté (inspection visuelle + aucun code de fill dans le diff)
+
+## Livraison attendue
+
+* PR/commit avec modifications **minimales** aux fichiers listés.
+* Logs d’exemple (3–6 lignes clés) collés dans `followup.md` :
+
+  * un run EQ-only,
+  * un run ALT/AZ ou mixte avec ALT/AZ présent.

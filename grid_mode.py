@@ -3932,7 +3932,7 @@ def run_grid_mode(
     except Exception:
         overlap_fraction = 0.0
     try:
-        grid_size_factor = float(cfg_disk.get("grid_size_factor", 1.0))
+        grid_size_factor = float(cfg_disk.get("grid_size_factor", 4.0)) #tentaive image /4 
     except Exception:
         grid_size_factor = 1.0
     try:
