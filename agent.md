@@ -1,119 +1,71 @@
-# agent.md — Mission Codex : VRAM dynamique Phase 5 (GPU reproject) — upscale + downscale
+# Mission: Fix intertile photometric pruning that breaks connectivity (causes patchwork seams)
 
-## Objectif
-Rendre la Phase 5 (assemble_final_mosaic_reproject_coadd) capable d’ajuster dynamiquement l’usage VRAM GPU :
-- **à la hausse** : augmenter les chunks quand la VRAM libre le permet (sans être bloqué par un rows_per_chunk trop petit),
-- **à la baisse** : en cas d’OOM GPU, **réessayer sur GPU** avec des chunks réduits (plusieurs tentatives) avant fallback CPU.
+## Context
+User reports strong inter-tile normalization discontinuities ("patchwork"/"plaques") on large runs (e.g., 4700+ raws).
+Worker log confirms TwoPass executed successfully with small gain range (~0.978–1.012), so TwoPass is NOT the root cause.
 
-## Contexte (relecture code)
-- Phase 5 appelle `zemosaic_utils.reproject_and_coadd_wrapper(... use_gpu=use_gpu ...)`.
-- La logique GPU est dans `zemosaic_utils.gpu_reproject_and_coadd_impl()`.
-- Le GPU reproject sonde déjà `memGetInfo()` et clamp `max_chunk_bytes` (ex: free*0.25 / free*0.4), puis calcule `rows_per_chunk`.
-- MAIS le `rows_per_chunk` fourni par le worker agit comme **cap** : `rows = min(rows_hint, rows_from_budget)`.
-- En cas d’erreur GPU, le wrapper fait surtout “fallback CPU” ; il n’y a pas de “réduction chunk + retry GPU” ciblée OOM.
+The same log shows intertile affine calibration pruning produces a disconnected overlap graph:
 
-## Scope strict (fichiers autorisés)
-- `zemosaic_worker.py` (Phase 5, uniquement : construction des kwargs / boucle channels)
-- `zemosaic_utils.py` (GPU reproject + wrapper : ajout retry OOM + budget helper)
-Optionnel si nécessaire (mais éviter si possible) :
-- `zemosaic_gpu_safety.py` (uniquement si besoin d’un helper VRAM refresh réutilisable)
+- raw_pairs=6537 (num_tiles=197)
+- after_topK=912 (MAX_NEIGHBORS_PER_TILE=8)
+- connectivity WARN: components=74, bridges_added=0
 
-## Non-objectifs (interdits)
-- Ne pas toucher au clustering / Phase 5 intertile pairs / safe_mode_windows single-worker.
-- Ne pas modifier les comportements “batch size = 0” et “batch size > 1”.
-- Ne pas changer la science (résultat) : uniquement perf/robustesse.
-- Ne pas refactor massif, pas de nouvelle dépendance obligatoire.
+This makes the global affine solve under-constrained across components, yielding inconsistent gains/offsets and visible seams.
 
-## Spécification fonctionnelle
-### A) Upscale (proactif)
-Avant chaque appel GPU par canal (dans la boucle `for ch in range(n_channels)` de Phase 5) :
-1. Sonder VRAM libre **au moment T** (best-effort, via `_probe_free_vram_bytes()`).
-   - Si `_probe_free_vram_bytes()` renvoie `None`, ne changer rien aux hints existants (`rows_per_chunk`, `max_chunk_bytes`) et ne logguer que “VRAM probe unavailable, keeping plan hints”. Le reste de la logique upscale est ignoré pour ce canal.
-2. Déterminer un **budget cible** (bytes) avec marge :
-   - `budget = free_bytes * fraction`, ex:
-     - fraction normal: 0.45 (ou 0.40 si tu veux ultra conservateur)
-     - fraction safe_mode: 0.25–0.30
-   - appliquer un **cap** si l’utilisateur/config a déjà fixé `plan_chunk_gpu_hint` (ne jamais dépasser ce cap).
+## Goal
+Guarantee that the overlap graph used by `compute_intertile_affine_calibration()` remains connected (for all active tiles),
+OR fallback safely (no pruning) when connectivity cannot be guaranteed.
 
-2.bis. **Règle de non-régression (CAP DUR Phase5)** :
-   - Le refresh VRAM “par canal” ne doit **JAMAIS** dépasser le chunk **déjà décidé** au début de Phase 5 par la logique AUTO/USER
-     (incluant `phase5_chunk_auto=False`, `phase5_chunk_mb`, `on_battery_clamp`, `hard_cap_vram`, etc.).
-   - Concrètement, définir `cap_bytes = plan_chunk_gpu_hint` (chunk effectif du plan Phase5) si disponible,
-     où cap_bytes = le chunk effectif déjà appliqué au plan Phase5 après toute la logique AUTO/USER + on_battery_clamp + hard_cap_vram (donc typiquement parallel_plan_phase5.gpu_max_chunk_bytes / ou reproj_call_kwargs['max_chunk_bytes'] initial). On le snapshot une fois, et il sert de plafond.
-     et imposer : `max_chunk_bytes_refresh = min(max_chunk_bytes_refresh, cap_bytes)`.
-   - Le refresh peut **descendre** sous le cap (OOM/pression VRAM), mais ne peut **pas monter** au-dessus,
-     même si la VRAM libre remonte entre canaux.
+This should eliminate the “patchwork” normalization artifact without changing TwoPass behavior.
 
-3. Calculer un `rows_hint` qui **n’empêche pas la montée** :
-   - Stratégie simple et robuste : `rows_hint = H` (où `H` est la hauteur de la mosaïque finale, `final_output_shape_hw[0]`), ou un grand max (ex: 4096), pour laisser le GPU calculer `rows_from_budget`.
-   - MAIS si safe-mode: capper `rows_hint` (ex 128/256) pour éviter les gros coups de bélier.
-4. Passer `max_chunk_bytes` + `rows_per_chunk` recalés dans `reproj_call_kwargs` **uniquement si `use_gpu`**.
-5. Log clair au niveau INFO_DETAIL :
-   - free_vram_mb, budget_mb, rows_hint, cap_utilisateur_mb, safe_mode flag (si env var active).
+## Strict Scope / Guardrails
+- Primary file: `zemosaic_utils.py` only (inside `compute_intertile_affine_calibration()` pruning block).
+- Optional: minimal extra logging in `zemosaic_worker.py` ONLY if needed to surface diagnostics (avoid functional changes).
+- Do NOT modify:
+  - TwoPass coverage renorm logic
+  - GPU safety / VRAM chunking logic
+  - stacking algorithms, WCS solve, cropping, borrowing, EQ/ALT-AZ logic
+  - existing default parameter values exposed to user
+- No “clever auto behavior” beyond connectivity guarantees.
 
-Note: Si max_chunk_bytes ou rows_per_chunk est None/0/non-int, ne pas crasher : fallback sur les hints existants (ou valeurs minimales), et log 'refresh skipped/normalized'.
+## Implementation Plan
+### A) Refactor pruning into a connectivity-safe step
+In `zemosaic_utils.compute_intertile_affine_calibration()`:
+1. Keep existing topK pruning idea, but enforce:
+   - compute connected components among ACTIVE tiles
+   - after pruning, if components_active > 1:
+     - attempt to add bridge edges from the full raw overlap list (sorted by weight desc)
+     - keep adding until components_active == 1 OR no progress
 
-### B) Downscale (réactif)
-Dans `zemosaic_utils._reproject_and_coadd_wrapper_impl()` :
-1. Si `use_gpu=True` et que l’appel GPU plante avec une erreur typée OOM :
-   - détecter OOM via :
-     - `cupy.cuda.memory.OutOfMemoryError` (si import possible),
-     - ou substring `"out of memory"` / `"CUDA_ERROR_OUT_OF_MEMORY"` dans le message.
-2. Avant fallback CPU, faire jusqu’à `N=3` tentatives GPU :
-   - à chaque tentative :
-     - réduire `max_chunk_bytes` (ex: *0.7)
-     - réduire `rows_per_chunk` (ex: *0.7, floor + clamp min 32)
-     - appeler `free_cupy_memory_pools()` + `gc.collect()`
-     - re-tenter `gpu_reproject_and_coadd_impl`
-3. Si après N tentatives ça échoue encore :
-   - si `allow_cpu_fallback=True`: fallback CPU (comportement existant),
-   - sinon: remonter l’exception.
-4. Log :
-   - `[GPU Reproject] OOM retry k/N: max_chunk_mb=..., rows=..., free_vram_mb=...`
+2. Fix ACTIVE tile detection robustness:
+   - Do not rely solely on `weight > 0` filtering to mark active tiles.
+   - Define active tiles as: any tile that appears in at least one overlap pair (raw graph degree > 0).
+   - If an overlap entry is missing `weight`, compute it from bbox area as fallback.
 
-### C) Safety / compat
-- Tous les ajouts CuPy doivent être “best-effort” (try/except import) : si CuPy absent → pas de changement CPU.
-- Ne pas casser la filtration kwargs CPU/GPU existante.
-- Ne pas modifier l’API publique : uniquement comportements internes.
+3. If bridging still fails (components_active > 1):
+   - Fallback to **NO PRUNING** (use the raw overlap list).
+   - Log an explicit warning:
+     - `"[Intertile] PRUNE_FALLBACK_NO_PRUNING: disconnected after prune+bridge (components_active=...)"`
 
-- **Gating recommandé (éviter effets de bord hors Phase 5)** :
-  - Le retry OOM dans `_reproject_and_coadd_wrapper_impl` doit être activé **uniquement** si un flag interne est présent,
-    ex: `kwargs.get("_phase5_oom_retry", False) is True` (flag injecté par Phase 5).
-  - Ajouter explicitement `_phase5_oom_retry` et `_phase5_oom_retry_max` à l’ensemble `gpu_only` dans le wrapper pour garantir que ces kwargs ne sont jamais transmis à `cpu_reproject_and_coadd`. Ceci verrouille le risque d’un TypeError côté CPU.
+### B) Diagnostics (must-have)
+Add a compact INFO log line after pruning decision:
+- raw_pairs, pruned_pairs, max_neighbors, active_tiles, components_active, bridges_added, fallback_used
 
-## Implémentation détaillée (guidée)
-### 1) zemosaic_utils.py
-Ajouter helpers internes :
-- `_probe_free_vram_bytes()` → int|None
-- `_is_gpu_oom_exception(exc)` → bool
-- `_shrink_chunk_hints(max_chunk_bytes, rows_per_chunk)` → tuple(new_bytes, new_rows)
-  - Dans cette fonction, après multiplication par 0.7, clamper les valeurs :
-    - `max_chunk_bytes = max(max_chunk_bytes, 16 * 1024 * 1024)`
-    - `rows_per_chunk = max(32, int(rows_per_chunk))`
+Example:
+`[Intertile] Pair pruning summary: raw=6537 pruned=912 K=8 active=197 components=1 bridges=73 fallback=no`
 
-Modifier `_reproject_and_coadd_wrapper_impl` :
-- entourer le `gpu_reproject_and_coadd_impl(...)` d’une boucle retry OOM.
-- ne retry QUE pour OOM (pas pour erreurs WCS, TypeError kwargs, etc.).
+If fallback happens:
+`[Intertile] PRUNE_FALLBACK_NO_PRUNING: raw=6537 components_active=...`
 
-### 2) zemosaic_worker.py (Phase 5)
-Dans `assemble_final_mosaic_reproject_coadd`, juste avant `chan_mosaic, chan_cov = _invoke_reproject(reproj_call_kwargs)` :
-- si `use_gpu` :
-  - recalculer `max_chunk_bytes` et `rows_per_chunk` via helper (nouveau helper dans worker ou appel helper zemosaic_utils).
-  - remplacer dans `reproj_call_kwargs` :
-    - `reproj_call_kwargs["max_chunk_bytes"] = ...`
-    - `reproj_call_kwargs["rows_per_chunk"] = ...`
-- ne rien changer si `use_gpu=False`.
+### C) Safety behavior
+- Never run `solve_global_affine()` on a graph with components_active > 1 unless fallback to raw overlaps was applied.
+- Ensure determinism: bridging should pick edges in a deterministic order (weight desc + stable tie-breaker on (i,j)).
 
-Important : conserver `reproj_kwargs` de base mais autoriser ces 2 champs à être rafraîchis **par canal**.
-
-## Critères d’acceptation
-1. En run GPU, les logs montrent (par canal) une ligne “Phase5 GPU VRAM refresh …” (INFO_DETAIL).
-2. Si VRAM libre augmente entre canaux, `max_chunk_bytes` peut monter (dans la limite du cap).
-3. Si un OOM GPU survient, on observe `OOM retry 1/3 ...` et idéalement le run continue sur GPU.
-4. Si CuPy absent, aucun changement de comportement (CPU identique).
-5. Aucun changement des autres phases / modes / batch-size semantics.
-
-## Test rapide (manuel)
-- Sur dataset réaliste Phase 5 GPU.
-- Forcer une situation OOM en configurant temporairement `max_chunk_bytes` très haut (ou en lançant une app GPU à côté),
-  et vérifier que le wrapper fait “shrink + retry” avant fallback CPU.
+## Acceptance Criteria
+1. On the same run pattern as the provided log (197 tiles, raw_pairs~6537):
+   - The log must NOT show `Remaining components: 74. Bridges added: 0`
+   - It must show either:
+     - components_active == 1 after bridging, OR
+     - fallback_no_pruning triggered
+2. Output: visible inter-tile “patchwork” seams significantly reduced on large mosaics.
+3. No regressions on small datasets (pruning may still occur, but connectivity must remain guaranteed).

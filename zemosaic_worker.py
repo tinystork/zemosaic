@@ -2442,6 +2442,196 @@ def _equalize_rgb_black_level_hwc(
     return rgb_hwc, info
 
 
+def _phase5_safe_mode_env_enabled() -> bool:
+    try:
+        raw = str(os.getenv("ZEMOSAIC_GPU_SAFE_MODE") or "").strip().lower()
+    except Exception:
+        return False
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _compute_phase5_vram_budget_bytes(
+    gpu_safety_ctx_phase5: Any,
+    worker_config_cache: dict | None,
+    phase5_safe_mode_env: bool,
+    *,
+    vram_free_bytes_override: int | None = None,
+    phase5_chunk_cap_bytes: int | None = None,
+) -> tuple[int, dict]:
+    cfg = worker_config_cache or {}
+
+    def _coerce_int(value: Any, default: int) -> int:
+        try:
+            if value is None or isinstance(value, bool):
+                return default
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            text = str(value).strip()
+            if not text:
+                return default
+            return int(float(text))
+        except Exception:
+            return default
+
+    def _coerce_float(value: Any, default: float) -> float:
+        try:
+            if value is None or isinstance(value, bool):
+                return default
+            if isinstance(value, (int, float)):
+                return float(value)
+            text = str(value).strip()
+            if not text:
+                return default
+            return float(text)
+        except Exception:
+            return default
+
+    def _clamp_fraction(value: Any, default: float) -> float:
+        frac = _coerce_float(value, default)
+        if not math.isfinite(frac):
+            frac = default
+        return max(0.05, min(0.90, float(frac)))
+
+    def _coerce_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        try:
+            return bool(value)
+        except Exception:
+            return default
+
+    reserve_mb = _coerce_int(cfg.get("phase5_vram_reserve_mb"), 1024)
+    reserve_mb = max(0, reserve_mb)
+    frac_battery = _clamp_fraction(cfg.get("phase5_vram_frac_battery"), 0.25)
+    frac_hybrid = _clamp_fraction(cfg.get("phase5_vram_frac_hybrid_ac"), 0.60)
+    frac_ac = _clamp_fraction(cfg.get("phase5_vram_frac_ac"), 0.80)
+    hard_cap_mb = _coerce_int(cfg.get("phase5_vram_hard_cap_mb"), 0)
+    hard_cap_bytes = hard_cap_mb * 1024 * 1024 if hard_cap_mb > 0 else None
+
+    power_plugged = False
+    on_battery = True
+    is_hybrid = False
+    if gpu_safety_ctx_phase5 is not None:
+        power_plugged = _coerce_bool(
+            getattr(gpu_safety_ctx_phase5, "power_plugged", None), False
+        )
+        on_battery = _coerce_bool(getattr(gpu_safety_ctx_phase5, "on_battery", None), True)
+        is_hybrid = bool(
+            getattr(
+                gpu_safety_ctx_phase5,
+                "is_hybrid_graphics",
+                getattr(gpu_safety_ctx_phase5, "is_hybrid", False),
+            )
+        )
+
+    if on_battery or phase5_safe_mode_env:
+        fraction = frac_battery
+    elif power_plugged:
+        fraction = frac_hybrid if is_hybrid else frac_ac
+    else:
+        fraction = frac_battery
+
+    vram_free_bytes = vram_free_bytes_override
+    if vram_free_bytes is None and gpu_safety_ctx_phase5 is not None:
+        vram_free_bytes = getattr(gpu_safety_ctx_phase5, "vram_free_bytes", None)
+    try:
+        if vram_free_bytes is not None:
+            vram_free_bytes = int(vram_free_bytes)
+    except Exception:
+        vram_free_bytes = None
+    if vram_free_bytes is not None and vram_free_bytes <= 0:
+        vram_free_bytes = None
+
+    min_chunk_bytes = 128 * 1024 * 1024
+    reserve_bytes = reserve_mb * 1024 * 1024
+    usable_bytes = None
+    budget_bytes = 0
+    fallback_mb = None
+    reasons = []
+
+    if vram_free_bytes is not None:
+        usable_bytes = max(min_chunk_bytes, vram_free_bytes - reserve_bytes)
+        budget_bytes = int(usable_bytes * float(fraction))
+        if budget_bytes <= 0:
+            budget_bytes = min_chunk_bytes
+        budget_bytes = min(int(usable_bytes), int(budget_bytes))
+    else:
+        reasons.append("probe_unknown")
+        if on_battery or phase5_safe_mode_env:
+            fallback_mb = 128
+        elif power_plugged and not on_battery and not is_hybrid:
+            fallback_mb = 1024
+        else:
+            fallback_mb = 512
+        budget_bytes = int(fallback_mb) * 1024 * 1024
+        fallback_chunk_mb = _coerce_int(cfg.get("phase5_chunk_mb"), 0)
+        if fallback_chunk_mb > 0:
+            fallback_chunk_bytes = int(fallback_chunk_mb) * 1024 * 1024
+            if budget_bytes > fallback_chunk_bytes:
+                budget_bytes = fallback_chunk_bytes
+                reasons.append("user_chunk_cap")
+
+    cap_bytes = None
+    try:
+        if phase5_chunk_cap_bytes is not None:
+            cap_bytes = int(phase5_chunk_cap_bytes)
+    except Exception:
+        cap_bytes = None
+    if cap_bytes is not None and cap_bytes <= 0:
+        cap_bytes = None
+
+    def _apply_cap(value: int, cap: int | None, reason: str) -> int:
+        if cap is None or cap <= 0:
+            return value
+        if value > cap:
+            reasons.append(reason)
+            return cap
+        return value
+
+    budget_bytes = max(0, int(budget_bytes))
+    budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
+    if budget_bytes > 0 and budget_bytes < min_chunk_bytes:
+        budget_bytes = min_chunk_bytes
+        reasons.append("min_clamp")
+    budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
+    if usable_bytes is not None:
+        budget_bytes = _apply_cap(budget_bytes, int(usable_bytes), "usable_cap")
+
+    if reasons:
+        reasons = list(dict.fromkeys(reasons))
+
+    vram_free_mb = (
+        float(vram_free_bytes) / (1024.0 ** 2) if vram_free_bytes is not None else None
+    )
+    usable_mb = float(usable_bytes) / (1024.0 ** 2) if usable_bytes is not None else None
+    budget_mb = float(budget_bytes) / (1024.0 ** 2) if budget_bytes else 0.0
+    cap_mb = float(cap_bytes) / (1024.0 ** 2) if cap_bytes else None
+
+    meta = {
+        "vram_free_bytes": vram_free_bytes,
+        "vram_free_mb": vram_free_mb,
+        "reserve_mb": reserve_mb,
+        "fraction": fraction,
+        "budget_bytes": budget_bytes,
+        "budget_mb": budget_mb,
+        "hard_cap_mb": float(hard_cap_mb) if hard_cap_bytes else None,
+        "phase5_chunk_cap_mb": cap_mb,
+        "power_plugged": power_plugged,
+        "on_battery": on_battery,
+        "is_hybrid_graphics": is_hybrid,
+        "safe_mode_env": bool(phase5_safe_mode_env),
+        "usable_mb": usable_mb,
+        "fallback_mb": fallback_mb,
+        "reasons": reasons,
+    }
+
+    return int(budget_bytes), meta
+
+
 def _maybe_bump_phase5_gpu_rows_per_chunk(
     plan: Any,
     gpu_ctx: Any,
@@ -8139,6 +8329,12 @@ def _run_shared_phase45_phase5_pipeline(
             get_env_safe_mode_flag(gpu_safety_ctx_phase5)
         except Exception:
             pass
+    phase5_safe_mode_env = _phase5_safe_mode_env_enabled()
+    if not phase5_safe_mode_env and gpu_safety_ctx_phase5 is not None:
+        try:
+            phase5_safe_mode_env = bool(getattr(gpu_safety_ctx_phase5, "safe_mode", False))
+        except Exception:
+            pass
     assembly_process_workers_config = int(phase5_options.get("assembly_process_workers") or 0)
     intertile_preview_size_config = phase5_options.get("intertile_preview_size") or 512
     intertile_overlap_min_config = phase5_options.get("intertile_overlap_min") or 0.05
@@ -8157,6 +8353,10 @@ def _run_shared_phase45_phase5_pipeline(
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
     existing_master_tiles_mode = bool(phase5_options.get("existing_master_tiles_mode"))
     worker_config_cache = phase45_options.get("worker_config") or {}
+    phase5_force_gpu_on_ac_cfg = worker_config_cache.get("phase5_force_gpu_on_ac")
+    phase5_force_gpu_on_ac_flag = _coerce_bool_flag(phase5_force_gpu_on_ac_cfg)
+    if phase5_force_gpu_on_ac_flag is None:
+        phase5_force_gpu_on_ac_flag = False
     parallel_caps_option = phase5_options.get("parallel_capabilities")
     telemetry_ctrl = phase5_options.get("telemetry")
     sds_mode_phase5 = bool(phase5_options.get("sds_mode"))
@@ -8398,25 +8598,56 @@ def _run_shared_phase45_phase5_pipeline(
                     phase5_chunk_auto_flag = True
 
                 # Start of plugged-aware logic for Phase 5 chunk sizing
-                if parallel_plan_phase5 is not None and gpu_safety_ctx_phase5 is not None:
-                    on_battery = getattr(gpu_safety_ctx_phase5, "on_battery", False)
-                    power_plugged = getattr(gpu_safety_ctx_phase5, "power_plugged", True)
-                    is_hybrid = getattr(gpu_safety_ctx_phase5, "is_hybrid_graphics", False)
-                    vram_free_bytes = getattr(gpu_safety_ctx_phase5, "vram_free_bytes", None)
-                    current_chunk_bytes = getattr(parallel_plan_phase5, "gpu_max_chunk_bytes", 0)
-                    
-                    # Define a simple VRAM-based hard cap
-                    hard_cap_bytes = 1024 * 1024 * 1024  # 1GB default
-                    if vram_free_bytes is not None and vram_free_bytes > 0:
-                        hard_cap_bytes = min(hard_cap_bytes, max(128 * 1024 * 1024, int(0.10 * vram_free_bytes)))
-                    elif on_battery:
-                        hard_cap_bytes = 128 * 1024 * 1024
-                    else:
-                        hard_cap_bytes = 512 * 1024 * 1024
+                if parallel_plan_phase5 is not None:
+                    try:
+                        current_chunk_bytes = int(
+                            getattr(parallel_plan_phase5, "gpu_max_chunk_bytes", 0) or 0
+                        )
+                    except Exception:
+                        current_chunk_bytes = 0
+                    phase5_chunk_cap_bytes = current_chunk_bytes if current_chunk_bytes > 0 else None
+
+                    if not phase5_safe_mode_env and gpu_safety_ctx_phase5 is not None:
+                        try:
+                            phase5_safe_mode_env = bool(
+                                getattr(gpu_safety_ctx_phase5, "safe_mode", False)
+                            )
+                        except Exception:
+                            phase5_safe_mode_env = False
+
+                    budget_bytes, budget_meta = _compute_phase5_vram_budget_bytes(
+                        gpu_safety_ctx_phase5,
+                        worker_config_cache,
+                        phase5_safe_mode_env,
+                        phase5_chunk_cap_bytes=phase5_chunk_cap_bytes,
+                    )
+                    vram_free_mb = budget_meta.get("vram_free_mb")
+                    vram_free_mb_str = f"{vram_free_mb:.0f}MB" if vram_free_mb is not None else "unknown"
+                    hard_cap_mb = budget_meta.get("hard_cap_mb")
+                    hard_cap_mb_str = f"{hard_cap_mb:.0f}" if hard_cap_mb else "n/a"
+                    budget_reasons = list(budget_meta.get("reasons") or [])
+                    logger.info(
+                        (
+                            "Phase5 VRAM budget: free_mb=%s reserve_mb=%s frac=%.2f "
+                            "budget_mb=%.0f hard_cap_mb=%s plugged=%s battery=%s hybrid=%s "
+                            "safe_mode_env=%s reasons=[%s]"
+                        ),
+                        vram_free_mb_str,
+                        int(budget_meta.get("reserve_mb") or 0),
+                        float(budget_meta.get("fraction") or 0.0),
+                        float(budget_meta.get("budget_mb") or 0.0),
+                        hard_cap_mb_str,
+                        bool(budget_meta.get("power_plugged")),
+                        bool(budget_meta.get("on_battery")),
+                        bool(budget_meta.get("is_hybrid_graphics")),
+                        1 if budget_meta.get("safe_mode_env") else 0,
+                        ",".join(budget_reasons),
+                    )
 
                     applied_chunk_bytes = current_chunk_bytes
                     log_reason = []
                     log_source = "AUTO"
+                    requested_mb = None
 
                     if not phase5_chunk_auto_flag:
                         # USER override mode
@@ -8425,68 +8656,66 @@ def _run_shared_phase45_phase5_pipeline(
                             requested_mb = int(worker_config_cache.get("phase5_chunk_mb", 128))
                         except Exception:
                             requested_mb = 128
-                        requested_mb = max(64, min(1024, requested_mb))
+                        requested_mb = max(64, min(16384, requested_mb))
                         requested_bytes = requested_mb * 1024 * 1024
                         applied_chunk_bytes = requested_bytes
                         log_reason.append(f"requested={requested_mb}MB")
-
-                        if on_battery:
-                            applied_chunk_bytes = min(applied_chunk_bytes, 128 * 1024 * 1024)
-                            log_reason.append("on_battery_clamp")
-                        else:
-                            if applied_chunk_bytes > hard_cap_bytes:
-                                applied_chunk_bytes = hard_cap_bytes
-                                log_reason.append("hard_cap_vram")
-
+                        if budget_bytes > 0 and applied_chunk_bytes > budget_bytes:
+                            applied_chunk_bytes = budget_bytes
+                            log_reason.append("budget_cap")
+                        elif budget_bytes <= 0:
+                            log_reason.append("budget_unknown")
                     else:
                         # AUTO mode
-                        if on_battery:
-                            applied_chunk_bytes = min(current_chunk_bytes, 128 * 1024 * 1024)
-                            log_reason.append("on_battery_clamp")
-                        elif power_plugged and is_hybrid:
-                            # "plugged-aware" relaxation for hybrid graphics on AC power
-                            target_bytes = max(current_chunk_bytes, 256 * 1024 * 1024)
-                            if vram_free_bytes is not None and vram_free_bytes > 2 * 1024 * 1024 * 1024:
-                                target_bytes = max(target_bytes, 512 * 1024 * 1024)
-                            
-                            applied_chunk_bytes = min(target_bytes, hard_cap_bytes)
-                            log_reason.append("plugged_relax_hybrid")
+                        if budget_bytes > 0:
+                            applied_chunk_bytes = budget_bytes
+                            log_reason.append("budget_policy")
                         else:
-                            # Desktop or other non-hybrid cases, trust autotune/safety defaults
-                            log_reason.append("default")
-                    
+                            log_reason.append("budget_unknown")
+
+                    if budget_reasons:
+                        log_reason.extend(budget_reasons)
+                    if log_reason:
+                        log_reason = list(dict.fromkeys(log_reason))
+
                     # Apply the final calculated chunk size
                     try:
                         setattr(parallel_plan_phase5, "gpu_max_chunk_bytes", int(applied_chunk_bytes))
                     except Exception:
-                        pass # Plan might be immutable
-                    
+                        pass  # Plan might be immutable
+
                     base_chunk_mb = float(current_chunk_bytes or 0) / (1024.0 * 1024.0)
                     applied_chunk_mb = float(applied_chunk_bytes or 0) / (1024.0 * 1024.0)
-                    vram_free_mb_str = (
-                        f"{vram_free_bytes / (1024.0 * 1024.0):.0f}MB" if vram_free_bytes else "unknown"
-                    )
+                    budget_mb = float(budget_bytes or 0) / (1024.0 * 1024.0)
                     reasons_str = ",".join(log_reason)
                     if log_source == "AUTO":
                         logger.info(
-                            "Phase5 chunk AUTO: applied=%.0fMB (base=%.0fMB, vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])",
+                            (
+                                "Phase5 chunk AUTO: applied=%.0fMB (base=%.0fMB, budget=%.0fMB, "
+                                "vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])"
+                            ),
                             applied_chunk_mb,
                             base_chunk_mb,
+                            budget_mb,
                             vram_free_mb_str,
-                            power_plugged,
-                            on_battery,
-                            is_hybrid,
+                            bool(budget_meta.get("power_plugged")),
+                            bool(budget_meta.get("on_battery")),
+                            bool(budget_meta.get("is_hybrid_graphics")),
                             reasons_str,
                         )
                     else:
                         logger.info(
-                            "Phase5 chunk USER: applied=%.0fMB (cap=%.0fMB, vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])",
+                            (
+                                "Phase5 chunk USER: applied=%.0fMB (requested=%.0fMB, budget=%.0fMB, "
+                                "vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])"
+                            ),
                             applied_chunk_mb,
-                            float(hard_cap_bytes or 0) / (1024.0 * 1024.0),
+                            float(requested_mb or 0),
+                            budget_mb,
                             vram_free_mb_str,
-                            power_plugged,
-                            on_battery,
-                            is_hybrid,
+                            bool(budget_meta.get("power_plugged")),
+                            bool(budget_meta.get("on_battery")),
+                            bool(budget_meta.get("is_hybrid_graphics")),
                             reasons_str,
                         )
                 # End of plugged-aware logic
@@ -8525,6 +8754,38 @@ def _run_shared_phase45_phase5_pipeline(
             effective_use_gpu = bool(plan_gpu_allowed)
             if not effective_use_gpu and use_gpu_phase5_flag:
                 logger.info("[Phase5] GPU disabled by auto-tune (plan.use_gpu=False)")
+        power_plugged = False
+        on_battery = True
+        ctx_safe_mode = False
+        if gpu_safety_ctx_phase5 is not None:
+            try:
+                power_plugged = bool(getattr(gpu_safety_ctx_phase5, "power_plugged", False))
+            except Exception:
+                power_plugged = False
+            try:
+                on_battery_value = getattr(gpu_safety_ctx_phase5, "on_battery", None)
+                on_battery = bool(on_battery_value) if on_battery_value is not None else True
+            except Exception:
+                on_battery = True
+            try:
+                ctx_safe_mode = bool(getattr(gpu_safety_ctx_phase5, "safe_mode", False))
+            except Exception:
+                ctx_safe_mode = False
+        phase5_safe_mode_env = _phase5_safe_mode_env_enabled()
+        if not phase5_safe_mode_env and ctx_safe_mode:
+            phase5_safe_mode_env = True
+        if (
+            phase5_force_gpu_on_ac_flag
+            and use_gpu_phase5_flag
+            and plan_gpu_allowed
+            and power_plugged
+            and not on_battery
+            and not phase5_safe_mode_env
+            and not ctx_safe_mode
+        ):
+            if not effective_use_gpu:
+                logger.info("Phase5: forcing GPU on AC (config)")
+            effective_use_gpu = True
         try:
             vram_free_mb = None
             if gpu_safety_ctx_phase5 is not None and gpu_safety_ctx_phase5.vram_free_bytes is not None:
@@ -8589,6 +8850,8 @@ def _run_shared_phase45_phase5_pipeline(
                 enable_tile_weighting=tile_weighting_enabled_flag,
                 tile_weight_mode=tile_weight_mode,
                 stats_callback=_emit_phase5_stats,
+                worker_config_cache=worker_config_cache,
+                gpu_safety_ctx_phase5=gpu_safety_ctx_phase5,
                 existing_master_tiles_mode=existing_master_tiles_mode,
             )
             if final_mosaic_data_HWC is None or final_mosaic_coverage_HW is None:
@@ -13317,11 +13580,14 @@ def assemble_final_mosaic_reproject_coadd(
     tile_weight_mode: str | None = None,
     stats_callback: Callable[[int, int, bool], None] | None = None,
     existing_master_tiles_mode: bool = False,
+    worker_config_cache: dict | None = None,
+    gpu_safety_ctx_phase5: GpuRuntimeContext | None = None,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
+    worker_config_cache = worker_config_cache or {}
 
     _log_memory_usage(progress_callback, "Début assemble_final_mosaic_reproject_coadd")
     _pcb(
@@ -14442,6 +14708,96 @@ def assemble_final_mosaic_reproject_coadd(
     if chunk_hint:
         reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint))
 
+    phase5_chunk_cap_bytes = None
+    if use_gpu:
+        try:
+            phase5_chunk_cap_bytes = int(plan_chunk_gpu_hint or 0) or None
+        except Exception:
+            phase5_chunk_cap_bytes = None
+        if phase5_chunk_cap_bytes is None:
+            try:
+                phase5_chunk_cap_bytes = int(reproj_kwargs.get("max_chunk_bytes") or 0) or None
+            except Exception:
+                phase5_chunk_cap_bytes = None
+
+    phase5_safe_mode_env = _phase5_safe_mode_env_enabled()
+    if not phase5_safe_mode_env and gpu_safety_ctx_phase5 is not None:
+        try:
+            phase5_safe_mode_env = bool(getattr(gpu_safety_ctx_phase5, "safe_mode", False))
+        except Exception:
+            phase5_safe_mode_env = False
+
+    def _refresh_phase5_gpu_hints(call_kwargs: dict) -> None:
+        if not use_gpu:
+            return
+        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
+            return
+        probe = getattr(zemosaic_utils, "_probe_free_vram_bytes", None)
+        if not callable(probe):
+            return
+        try:
+            free_bytes = probe()
+        except Exception:
+            free_bytes = None
+
+        budget_bytes, budget_meta = _compute_phase5_vram_budget_bytes(
+            gpu_safety_ctx_phase5,
+            worker_config_cache,
+            phase5_safe_mode_env,
+            vram_free_bytes_override=free_bytes,
+            phase5_chunk_cap_bytes=phase5_chunk_cap_bytes,
+        )
+        if budget_bytes <= 0:
+            _pcb(
+                "Phase5 GPU VRAM refresh skipped/normalized: invalid budget, keeping plan hints",
+                lvl="INFO_DETAIL",
+            )
+            return
+        rows_hint = None
+        try:
+            rows_hint = int(h)
+        except Exception:
+            rows_hint = None
+        if rows_hint is None or rows_hint <= 0:
+            try:
+                rows_hint = int(call_kwargs.get("rows_per_chunk") or 0)
+            except Exception:
+                rows_hint = None
+        if rows_hint is None or rows_hint <= 0:
+            _pcb(
+                "Phase5 GPU VRAM refresh skipped/normalized: invalid rows_hint, keeping plan hints",
+                lvl="INFO_DETAIL",
+            )
+            return
+        if phase5_safe_mode_env:
+            rows_hint = min(rows_hint, 256)
+        call_kwargs["rows_per_chunk"] = int(max(1, rows_hint))
+        call_kwargs["max_chunk_bytes"] = int(max(1, budget_bytes))
+        free_mb_val = budget_meta.get("vram_free_mb")
+        free_mb = f"{free_mb_val:.1f}" if free_mb_val is not None else "n/a"
+        budget_mb = float(budget_meta.get("budget_mb") or 0.0)
+        cap_mb = budget_meta.get("phase5_chunk_cap_mb")
+        cap_mb_text = f"{cap_mb:.1f}" if cap_mb else "n/a"
+        reserve_mb = int(budget_meta.get("reserve_mb") or 0)
+        fraction = float(budget_meta.get("fraction") or 0.0)
+        reasons_str = ",".join(budget_meta.get("reasons") or [])
+        _pcb(
+            (
+                "Phase5 GPU VRAM refresh free_vram_mb={} budget_mb={:.1f} frac={:.2f} "
+                "reserve_mb={} rows_hint={} cap_mb={} safe_mode={} reasons=[{}]"
+            ).format(
+                free_mb,
+                budget_mb,
+                fraction,
+                reserve_mb,
+                int(rows_hint),
+                cap_mb_text,
+                1 if phase5_safe_mode_env else 0,
+                reasons_str,
+            ),
+            lvl="INFO_DETAIL",
+        )
+
     # If we are going to use the GPU, pass the precomputed affine corrections down
     # so they are applied inside the GPU reprojection (parity with CPU path).
     if use_gpu and tile_affine_for_gpu is not None:
@@ -14623,6 +14979,9 @@ def assemble_final_mosaic_reproject_coadd(
                             "[GPU Reproject] Ignoring unsupported kwarg: %s",
                             unsupported_kw,
                         )
+                _refresh_phase5_gpu_hints(reproj_call_kwargs)
+                reproj_call_kwargs["_phase5_oom_retry"] = True
+                reproj_call_kwargs["_phase5_oom_retry_max"] = 3
 
             def _invoke_reproject(local_kwargs: dict):
                 invoke_kwargs = dict(local_kwargs)

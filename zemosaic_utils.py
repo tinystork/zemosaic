@@ -1154,6 +1154,63 @@ def _get_gpu_allowed_bytes(safety_fraction: float = 0.75) -> int | None:
         return None
 
 
+def _probe_free_vram_bytes() -> int | None:
+    """Best-effort probe for free GPU VRAM in bytes."""
+    if not gpu_is_available():
+        return None
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        return None
+    try:
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+    except Exception:
+        return None
+    try:
+        return int(free_bytes)
+    except Exception:
+        return None
+
+
+def _is_gpu_oom_exception(exc: BaseException) -> bool:
+    """Return True if the exception looks like a GPU OOM."""
+    try:
+        import cupy as cp  # type: ignore
+        if isinstance(exc, cp.cuda.memory.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    try:
+        message = str(exc).lower()
+    except Exception:
+        message = ""
+    if "out of memory" in message or "cuda_error_out_of_memory" in message:
+        return True
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if cause and cause is not exc:
+        return _is_gpu_oom_exception(cause)
+    return False
+
+
+def _shrink_chunk_hints(max_chunk_bytes, rows_per_chunk) -> tuple[int, int]:
+    """Shrink chunk hints after OOM with minimum safety clamps."""
+    try:
+        max_bytes = int(max_chunk_bytes)
+    except Exception:
+        max_bytes = 0
+    if max_bytes > 0:
+        max_bytes = int(max_bytes * 0.7)
+    max_bytes = max(max_bytes, 16 * 1024 * 1024)
+    try:
+        rows = int(rows_per_chunk)
+    except Exception:
+        rows = 0
+    if rows > 0:
+        rows = int(rows * 0.7)
+    rows = max(32, rows)
+    return max_bytes, rows
+
+
 def _format_mebibytes(byte_count: int | None) -> str:
     if not byte_count or byte_count <= 0:
         return "n/a"
@@ -5114,6 +5171,48 @@ def _reproject_and_coadd_wrapper_impl(
         gpu_kwargs["progress_callback"] = progress_callback
     if normalized_weights is not None:
         gpu_kwargs["tile_weights"] = normalized_weights
+    phase5_oom_retry = bool(kwargs.get("_phase5_oom_retry", False))
+    try:
+        phase5_oom_retry_max = int(kwargs.get("_phase5_oom_retry_max", 3) or 3)
+    except Exception:
+        phase5_oom_retry_max = 3
+    if phase5_oom_retry_max < 0:
+        phase5_oom_retry_max = 0
+
+    def _gpu_call_with_oom_retry():
+        if not phase5_oom_retry or phase5_oom_retry_max <= 0:
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+        max_retries = int(phase5_oom_retry_max)
+        retry_index = 0
+        local_kwargs = dict(gpu_kwargs)
+        while True:
+            try:
+                return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **local_kwargs)
+            except Exception as exc:
+                if not _is_gpu_oom_exception(exc) or retry_index >= max_retries:
+                    raise
+                retry_index += 1
+                new_max, new_rows = _shrink_chunk_hints(
+                    local_kwargs.get("max_chunk_bytes"),
+                    local_kwargs.get("rows_per_chunk"),
+                )
+                local_kwargs["max_chunk_bytes"] = new_max
+                local_kwargs["rows_per_chunk"] = new_rows
+                free_bytes = _probe_free_vram_bytes()
+                if free_bytes is not None and free_bytes > 0:
+                    free_mb = f"{(free_bytes / (1024 ** 2)):.1f}"
+                else:
+                    free_mb = "n/a"
+                logger.warning(
+                    "[GPU Reproject] OOM retry %d/%d: max_chunk_mb=%.1f rows=%s free_vram_mb=%s",
+                    retry_index,
+                    max_retries,
+                    float(new_max or 0) / (1024 ** 2),
+                    int(new_rows),
+                    free_mb,
+                )
+                free_cupy_memory_pools()
+                gc.collect()
     if use_gpu:
         if not gpu_is_available():
             _log_gpu_event(
@@ -5127,7 +5226,7 @@ def _reproject_and_coadd_wrapper_impl(
                 raise RuntimeError("gpu_unavailable")
         else:
             try:
-                return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+                return _gpu_call_with_oom_retry()
             except Exception as e:  # pragma: no cover - GPU failures
                 _log_gpu_event(
                     "gpu_fallback_runtime_error",
@@ -5149,6 +5248,8 @@ def _reproject_and_coadd_wrapper_impl(
         "max_chunk_bytes",
         # New GPU-only hints
         "tile_affine_corrections",
+        "_phase5_oom_retry",
+        "_phase5_oom_retry_max",
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
     input_weights_from_call = cpu_kwargs.get("input_weights")
