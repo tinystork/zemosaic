@@ -1,0 +1,293 @@
+diff --git a/zemosaic_worker.py b/zemosaic_worker.py
+index 9acb6aec0017c787fb529b479b021deda42f68b4..3e32a5cb6f56932d460bae068a44dc5525dabe0b 100644
+--- a/zemosaic_worker.py
++++ b/zemosaic_worker.py
+@@ -8176,91 +8176,109 @@ def _run_shared_phase45_phase5_pipeline(
+     collected_tiles_for_second_pass: list[tuple[np.ndarray, Any]] | None = (
+         [] if two_pass_enabled and not USE_INCREMENTAL_ASSEMBLY else None
+     )
+     log_key_phase5_failed = ""
+     log_key_phase5_finished = ""
+ 
+     if logger.isEnabledFor(logging.DEBUG):
+         try:
+             sample_tile_path = valid_master_tiles_for_assembly[0][0]
+             if sample_tile_path and _path_exists(sample_tile_path):
+                 with fits.open(sample_tile_path, memmap=True, do_not_scale_image_data=True) as hdul_sample:
+                     sample_data = np.asarray(hdul_sample[0].data)
+                 _dbg_rgb_stats("P4_pre_merge_rgb", sample_data, logger=logger)
+         except Exception:
+             pass
+ 
+     reproject_coadd_available = (
+         "assemble_final_mosaic_reproject_coadd" in globals()
+         and callable(assemble_final_mosaic_reproject_coadd)
+     )
+     incremental_available = (
+         "assemble_final_mosaic_incremental" in globals()
+         and callable(assemble_final_mosaic_incremental)
+     )
+     parallel_plan_phase5 = parallel_plan
++    caps_for_phase5: ParallelCapabilities | None = None
+ 
+     def _emit_phase5_stats(
+         tiles_done: int,
+         tiles_total_override: int | None = None,
+         force: bool = False,
+         stage: str | None = None,
+     ) -> None:
+         if sds_mode_phase5 or telemetry_ctrl is None:
+             return
+         try:
+             total = tiles_total_override if tiles_total_override is not None else tiles_total_phase5
+             ctx = {
+                 "phase_index": 5,
+                 "phase_name": "Phase 5: Reproject & Coadd",
+                 "tiles_done": int(max(0, tiles_done)),
+                 "tiles_total": int(max(0, total)),
+                 "use_gpu_phase5": bool(use_gpu_phase5_flag),
+             }
+             if stage:
+                 ctx["stage"] = stage
+             plan_ref = parallel_plan_phase5
+             for attr in (
+                 "cpu_workers",
+                 "rows_per_chunk",
+                 "gpu_rows_per_chunk",
+                 "max_chunk_bytes",
+                 "gpu_max_chunk_bytes",
+                 "use_gpu",
+             ):
+                 try:
+                     value = getattr(plan_ref, attr)
+                 except Exception:
+                     value = None
+                 if value is None and isinstance(plan_ref, dict):
+                     value = plan_ref.get(attr)
+                 if value is not None:
+                     ctx[attr] = value
+             telemetry_ctrl.emit_stats(ctx, force=force)
+         except Exception:
+             pass
+ 
++    def _refresh_phase5_vram_bytes() -> int | None:
++        refreshed_vram: int | None = None
++        try:
++            refreshed_ctx = probe_gpu_runtime_context(caps=caps_for_phase5)
++            refreshed_vram = getattr(refreshed_ctx, "vram_free_bytes", None)
++            if refreshed_vram is not None and gpu_safety_ctx_phase5 is not None:
++                try:
++                    gpu_safety_ctx_phase5.vram_free_bytes = refreshed_vram
++                except Exception:
++                    pass
++        except Exception:
++            try:
++                refreshed_vram = getattr(gpu_safety_ctx_phase5, "vram_free_bytes", None)
++            except Exception:
++                refreshed_vram = None
++        return refreshed_vram
++
+     if USE_INCREMENTAL_ASSEMBLY:
+         if not incremental_available:
+             pcb("run_error_phase5_inc_func_missing", prog=None, lvl="CRITICAL")
+             return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
+         pcb("run_info_phase5_started_incremental", prog=base_progress_phase5, lvl="INFO")
+         _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="start")
+         inc_memmap_dir = temp_master_tile_storage_dir or output_folder
+         try:
+             if use_gpu_phase5_flag:
+                 import cupy
+ 
+                 cupy.cuda.Device(0).use()
+         except Exception as e_gpu:
+             logger.warning("GPU incremental assembly init failed, falling back to CPU: %s", e_gpu)
+             use_gpu_phase5_flag = False
+         try:
+             final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_incremental(
+                 master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
+                 final_output_wcs=final_output_wcs,
+                 final_output_shape_hw=final_output_shape_hw,
+                 progress_callback=progress_callback,
+                 n_channels=3,
+                 apply_crop=apply_crop_for_assembly,
+                 crop_percent=master_tile_crop_percent_config,
+                 processing_threads=assembly_process_workers_config,
+@@ -8469,95 +8487,142 @@ def _run_shared_phase45_phase5_pipeline(
+                 vram_free_mb = float(gpu_safety_ctx_phase5.vram_free_bytes) / (1024.0 ** 2)
+             reasons_str = ",".join(getattr(gpu_safety_ctx_phase5, "reasons", []) or [])
+             logger.info(
+                 "[GPU_SAFETY] safe_mode=%d vendor=%s hybrid=%s battery=%s vram_free_mb=%s "
+                 "-> phase5_gpu=%d plan.use_gpu=%d gpu_max_chunk_mb=%.1f gpu_rows=%s reason=\"%s\"",
+                 1 if gpu_safety_ctx_phase5 and gpu_safety_ctx_phase5.safe_mode else 0,
+                 getattr(gpu_safety_ctx_phase5, "gpu_vendor", "unknown") if gpu_safety_ctx_phase5 else "unknown",
+                 getattr(gpu_safety_ctx_phase5, "is_hybrid_graphics", None) if gpu_safety_ctx_phase5 else None,
+                 getattr(gpu_safety_ctx_phase5, "has_battery", None) if gpu_safety_ctx_phase5 else None,
+                 f"{vram_free_mb:.1f}" if vram_free_mb is not None else "n/a",
+                 1 if use_gpu_phase5_flag else 0,
+                 1 if plan_gpu_allowed else 0,
+                 float(getattr(parallel_plan_phase5, "gpu_max_chunk_bytes", 0) or 0) / (1024.0 ** 2),
+                 getattr(parallel_plan_phase5, "gpu_rows_per_chunk", None),
+                 reasons_str,
+             )
+             for handler in logger.handlers:
+                 try:
+                     handler.flush()
+                 except Exception:
+                     pass
+         except Exception:
+             pass
+ 
+         try:
+-            if effective_use_gpu:
+-                import cupy
++            min_chunk_bytes = 32 * 1024 * 1024
++            current_chunk_bytes = getattr(parallel_plan_phase5, "gpu_max_chunk_bytes", None)
++            attempt_index = 0
++            while True:
++                attempt_index += 1
++                refreshed_vram_bytes = _refresh_phase5_vram_bytes()
++                vram_free_mb_str = (
++                    f"{refreshed_vram_bytes / (1024.0 ** 2):.1f}" if refreshed_vram_bytes is not None else "n/a"
++                )
++                chunk_mb = float(current_chunk_bytes or 0) / (1024.0 ** 2)
++                if attempt_index > 1:
++                    logger.info(
++                        "Phase5 assembly retry #%d with chunk=%.1fMB (vram_free_mb=%s)",
++                        attempt_index - 1,
++                        chunk_mb,
++                        vram_free_mb_str,
++                    )
++                try:
++                    if effective_use_gpu:
++                        import cupy
++
++                        cupy.cuda.Device(0).use()
++                    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
++                        master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
++                        final_output_wcs=final_output_wcs,
++                        final_output_shape_hw=final_output_shape_hw,
++                        progress_callback=progress_callback,
++                        n_channels=3,
++                        match_bg=True,
++                        apply_crop=apply_crop_for_assembly,
++                        crop_percent=master_tile_crop_percent_config,
++                        use_gpu=effective_use_gpu,
++                        use_memmap=bool(coadd_use_memmap_config),
++                        memmap_dir=(coadd_memmap_dir_config or output_folder),
++                        cleanup_memmap=False,
++                        base_progress_phase5=base_progress_phase5,
++                        progress_weight_phase5=progress_weight_phase5,
++                        start_time_total_run=start_time_total,
++                        intertile_photometric_match=intertile_match_flag,
++                        intertile_preview_size=int(intertile_preview_size_config),
++                        intertile_overlap_min=float(intertile_overlap_min_config),
++                        intertile_sky_percentile=intertile_sky_percentile_tuple,
++                        intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
++                        intertile_global_recenter=bool(intertile_global_recenter_config),
++                        intertile_recenter_clip=intertile_recenter_clip_tuple,
++                        use_auto_intertile=bool(use_auto_intertile_config),
++                        collect_tile_data=collected_tiles_for_second_pass,
++                        global_anchor_shift=global_anchor_shift,
++                        phase45_enabled=phase45_active_flag,
++                        parallel_plan=parallel_plan_phase5,
++                        enable_tile_weighting=tile_weighting_enabled_flag,
++                        tile_weight_mode=tile_weight_mode,
++                        stats_callback=_emit_phase5_stats,
++                        existing_master_tiles_mode=existing_master_tiles_mode,
++                    )
++                    break
++                except (MemoryError, BrokenProcessPool) as exc_retry:
++                    logger.warning(
++                        "Phase5 assembly %s at chunk=%.1fMB (vram_free_mb=%s)",
++                        exc_retry.__class__.__name__,
++                        chunk_mb,
++                        vram_free_mb_str,
++                    )
++                    if not current_chunk_bytes or current_chunk_bytes <= min_chunk_bytes:
++                        logger.error(
++                            "Phase5 assembly failed at minimal chunk=%.1fMB (vram_free_mb=%s)",
++                            chunk_mb,
++                            vram_free_mb_str,
++                        )
++                        _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="chunk_retry_failed")
++                        raise RuntimeError(
++                            f"Phase5 assembly failed even at minimal chunk {chunk_mb:.1f}MB (vram_free_mb={vram_free_mb_str})"
++                        ) from exc_retry
++
++                    current_chunk_bytes = max(min_chunk_bytes, int(current_chunk_bytes // 2))
++                    try:
++                        setattr(parallel_plan_phase5, "gpu_max_chunk_bytes", int(current_chunk_bytes))
++                    except Exception:
++                        pass
++                    _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="chunk_retry")
++                    continue
+ 
+-                cupy.cuda.Device(0).use()
+-            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
+-                master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
+-                final_output_wcs=final_output_wcs,
+-                final_output_shape_hw=final_output_shape_hw,
+-                progress_callback=progress_callback,
+-                n_channels=3,
+-                match_bg=True,
+-                apply_crop=apply_crop_for_assembly,
+-                crop_percent=master_tile_crop_percent_config,
+-                use_gpu=effective_use_gpu,
+-                use_memmap=bool(coadd_use_memmap_config),
+-                memmap_dir=(coadd_memmap_dir_config or output_folder),
+-                cleanup_memmap=False,
+-                base_progress_phase5=base_progress_phase5,
+-                progress_weight_phase5=progress_weight_phase5,
+-                start_time_total_run=start_time_total,
+-                intertile_photometric_match=intertile_match_flag,
+-                intertile_preview_size=int(intertile_preview_size_config),
+-                intertile_overlap_min=float(intertile_overlap_min_config),
+-                intertile_sky_percentile=intertile_sky_percentile_tuple,
+-                intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+-                intertile_global_recenter=bool(intertile_global_recenter_config),
+-                intertile_recenter_clip=intertile_recenter_clip_tuple,
+-                use_auto_intertile=bool(use_auto_intertile_config),
+-                collect_tile_data=collected_tiles_for_second_pass,
+-                global_anchor_shift=global_anchor_shift,
+-                phase45_enabled=phase45_active_flag,
+-                parallel_plan=parallel_plan_phase5,
+-                enable_tile_weighting=tile_weighting_enabled_flag,
+-                tile_weight_mode=tile_weight_mode,
+-                stats_callback=_emit_phase5_stats,
+-                existing_master_tiles_mode=existing_master_tiles_mode,
+-            )
+             if final_mosaic_data_HWC is None or final_mosaic_coverage_HW is None:
+                 pcb(
+                     log_key_phase5_failed or "run_error_phase5_assembly_failed_unknown",
+                     prog=base_progress_phase5 + progress_weight_phase5,
+                     lvl="ERROR",
+                 )
+                 _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="failed")
+                 raise RuntimeError("Phase 5 assembly returned no mosaic output")
++
++            _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="chunk_final")
+         except Exception as exc:
+             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
+             pcb(
+                 log_key_phase5_failed or "run_error_phase5_assembly_failed_unknown",
+                 prog=base_progress_phase5 + progress_weight_phase5,
+                 lvl="ERROR",
+             )
+             _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="failed")
+             raise
+         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
+         log_key_phase5_finished = "run_info_phase5_finished_reproject_coadd"
+ 
+     current_global_progress = base_progress_phase5 + progress_weight_phase5
+ 
+     if USE_INCREMENTAL_ASSEMBLY:
+         def _load_tiles_for_two_pass_phase5():
+             return _load_master_tiles_for_two_pass(
+                 valid_master_tiles_for_assembly,
+                 apply_crop=apply_crop_for_assembly,
+                 crop_percent=master_tile_crop_percent_config,
+                 logger=logger,
+             )
+ 
+         fallback_two_pass_loader = _load_tiles_for_two_pass_phase5
+ 

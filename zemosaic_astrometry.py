@@ -1135,6 +1135,7 @@ def solve_with_astap(
     search_radius_deg: float | None = None,    # Depuis GUI
     downsample_factor: int | None = None,      # Depuis GUI (pour -z)
     sensitivity: int | None = None,            # Depuis GUI (pour -sens)
+    astap_drizzled_fallback_enabled: bool = False,
     timeout_sec: int = 120,
     update_original_header_in_place: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
@@ -1234,10 +1235,26 @@ def solve_with_astap(
     if astap_data_dir and astap_data_dir.is_dir():
         cmd_list_astap.extend(["-d", str(astap_data_dir)])
 
+    def _make_fov0_cmd(cmd: list[str]) -> list[str]:
+        filtered: list[str] = []
+        skip_next = False
+        for item in cmd:
+            if skip_next:
+                skip_next = False
+                continue
+            if item in ("-pxscale", "-fov"):
+                skip_next = True
+                continue
+            filtered.append(item)
+        filtered.extend(["-fov", "0"])
+        return filtered
+
     # Rétablit l'indication d'échelle ou FOV pour aider ASTAP
+    used_pxscale = False
     calculated_px_scale = _calculate_pixel_scale_from_header(original_fits_header, progress_callback)
     if calculated_px_scale and 0.01 < float(calculated_px_scale) < 50.0:
         cmd_list_astap.extend(["-pxscale", f"{float(calculated_px_scale):.4f}"])
+        used_pxscale = True
         if progress_callback:
             progress_callback(
                 f"  ASTAP Solve: Utilisation -pxscale {float(calculated_px_scale):.4f} arcsec/pix (dérivé du header).",
@@ -1429,6 +1446,7 @@ def solve_with_astap(
         with _lock_for_image(image_fits_path, img_basename_log, progress_callback):
             attempt = 0
             last_error: Exception | None = None
+            tried_fallback = False
             while attempt < total_attempts:
                 attempt += 1
                 try:
@@ -1451,9 +1469,37 @@ def solve_with_astap(
                             )
                     if rc_astap == 0:
                         break
+                    if tried_fallback:
+                        break
+                    if (
+                        rc_astap == 1
+                        and astap_drizzled_fallback_enabled
+                        and used_pxscale
+                        and not tried_fallback
+                    ):
+                        tried_fallback = True
+                        cmd_list_astap = _make_fov0_cmd(cmd_list_astap)
+                        if progress_callback:
+                            progress_callback(
+                                "  ASTAP Solve: RC=1 avec -pxscale; nouvel essai unique avec -fov 0.",
+                                None,
+                                "WARN",
+                            )
+                            progress_callback(
+                                f"  ASTAP Solve: Commande fallback: {' '.join(cmd_list_astap)}",
+                                None,
+                                "DEBUG",
+                            )
+                        logger.warning("ASTAP rc=1 with -pxscale; retrying once with -fov 0.")
+                        logger.debug("ASTAP fallback command: %s", " ".join(cmd_list_astap))
+                        if attempt >= total_attempts:
+                            total_attempts += 1
+                        continue
                     raise RuntimeError(f"ASTAP return code {rc_astap}")
                 except subprocess.TimeoutExpired as exc_timeout:
                     last_error = exc_timeout
+                    if tried_fallback:
+                        raise
                     if attempt >= total_attempts:
                         raise
                     wait = base_backoff * attempt
@@ -1467,6 +1513,8 @@ def solve_with_astap(
                     time.sleep(wait)
                 except Exception as exc_generic:
                     last_error = exc_generic
+                    if tried_fallback:
+                        raise
                     if attempt >= total_attempts:
                         raise
                     wait = base_backoff * attempt

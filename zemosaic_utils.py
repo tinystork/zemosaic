@@ -54,6 +54,8 @@ import time
 import sys
 import platform
 import tempfile
+import faulthandler
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from functools import lru_cache
 from contextlib import nullcontext
 from pathlib import Path
@@ -1152,6 +1154,63 @@ def _get_gpu_allowed_bytes(safety_fraction: float = 0.75) -> int | None:
         return None
 
 
+def _probe_free_vram_bytes() -> int | None:
+    """Best-effort probe for free GPU VRAM in bytes."""
+    if not gpu_is_available():
+        return None
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        return None
+    try:
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+    except Exception:
+        return None
+    try:
+        return int(free_bytes)
+    except Exception:
+        return None
+
+
+def _is_gpu_oom_exception(exc: BaseException) -> bool:
+    """Return True if the exception looks like a GPU OOM."""
+    try:
+        import cupy as cp  # type: ignore
+        if isinstance(exc, cp.cuda.memory.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    try:
+        message = str(exc).lower()
+    except Exception:
+        message = ""
+    if "out of memory" in message or "cuda_error_out_of_memory" in message:
+        return True
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if cause and cause is not exc:
+        return _is_gpu_oom_exception(cause)
+    return False
+
+
+def _shrink_chunk_hints(max_chunk_bytes, rows_per_chunk) -> tuple[int, int]:
+    """Shrink chunk hints after OOM with minimum safety clamps."""
+    try:
+        max_bytes = int(max_chunk_bytes)
+    except Exception:
+        max_bytes = 0
+    if max_bytes > 0:
+        max_bytes = int(max_bytes * 0.7)
+    max_bytes = max(max_bytes, 16 * 1024 * 1024)
+    try:
+        rows = int(rows_per_chunk)
+    except Exception:
+        rows = 0
+    if rows > 0:
+        rows = int(rows * 0.7)
+    rows = max(32, rows)
+    return max_bytes, rows
+
+
 def _format_mebibytes(byte_count: int | None) -> str:
     if not byte_count or byte_count <= 0:
         return "n/a"
@@ -1193,6 +1252,80 @@ def _force_cpu_intertile() -> bool:
         return False
     value = value.strip().lower()
     return value not in {"", "0", "false", "no", "off"}
+
+
+def compute_intertile_workers_limit(
+    requested_workers: int | None,
+    pairs_count: int,
+    preview_size: int,
+    cpu_total: int | None = None,
+    platform_system: str | None = None,
+    available_mb: int | None = None,
+) -> tuple[int, list[str]]:
+    """Clamp the intertile ThreadPool worker count to safer values.
+
+    Returns the effective worker count and the list of reasons that influenced the
+    decision.
+    """
+
+    reasons: list[str] = []
+    cpu_total = cpu_total if cpu_total and cpu_total > 0 else os.cpu_count() or 1
+    platform_name = (platform_system or platform.system() or "").lower()
+
+    requested_int = None
+    if requested_workers is not None and requested_workers > 0:
+        try:
+            requested_int = int(requested_workers)
+        except Exception:
+            requested_int = None
+    if requested_int is not None and requested_int > 16:
+        reasons.append("cap16")
+        requested_int = 16
+    base = max(1, min(cpu_total - 1, cpu_total))
+    if requested_int is not None:
+        if requested_int > cpu_total:
+            reasons.append("requested>cpu")
+        base = max(1, min(requested_int, cpu_total))
+    else:
+        reasons.append("auto_base")
+
+    hard_cap = 8
+    if "windows" in platform_name:
+        hard_cap = min(hard_cap, 6)
+        reasons.append("windows_cap")
+
+    if pairs_count >= 4000:
+        hard_cap = min(hard_cap, 4)
+        reasons.append("pairs>=4000")
+    elif pairs_count >= 2000:
+        hard_cap = min(hard_cap, 6)
+        reasons.append("pairs>=2000")
+
+    relaxed_cap = min(8, max(1, cpu_total - 1))
+    if pairs_count < 200 and relaxed_cap > hard_cap:
+        hard_cap = relaxed_cap
+        reasons.append("pairs<200")
+
+    available_mb_val = available_mb
+    if available_mb_val is None:
+        try:
+            import psutil  # type: ignore
+
+            available_mb_val = int(psutil.virtual_memory().available / (1024 * 1024))
+        except Exception:
+            available_mb_val = None
+    if available_mb_val is not None:
+        if available_mb_val < 3500:
+            hard_cap = min(hard_cap, 2)
+            reasons.append("ram<3500mb")
+        elif available_mb_val < 6000:
+            hard_cap = min(hard_cap, 4)
+            reasons.append("ram<6000mb")
+
+    effective = max(1, min(base, hard_cap))
+    if not reasons:
+        reasons.append("no_clamp")
+    return effective, reasons
 
 from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
 try:
@@ -1819,7 +1952,8 @@ def estimate_sky_affine_to_ref(
     # fitted gain is non-positive, recompute a stable gain/offset from robust
     # statistics to avoid negative-flux master tiles on weak datasets.
     try:
-        corr = float(np.corrcoef(x_sel, y_sel)[0, 1])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            corr = float(np.corrcoef(x_sel, y_sel)[0, 1])
     except Exception:
         corr = float("nan")
 
@@ -2071,6 +2205,51 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
         result[idx] = (g, o)
     return result
 
+# Constants for pruning
+MAX_NEIGHBORS_PER_TILE = 8
+
+
+# Helper for consistent edge key
+def _intertile_edge_key(entry: dict) -> tuple[int, int]:
+    i, j = entry["i"], entry["j"]
+    return (min(i, j), max(i, j))
+
+
+# Helper for degree stats
+def _intertile_degree_stats(degrees: list[int], active_mask: np.ndarray) -> str:
+    active_degrees = [d for i, d in enumerate(degrees) if active_mask[i]]
+    if not active_degrees:
+        return "N/A"
+
+    min_deg = int(np.min(active_degrees))
+    median_deg = int(np.median(active_degrees))
+    p95_deg = int(np.percentile(active_degrees, 95))
+    max_deg = int(np.max(active_degrees))
+    isolated_count = np.sum(active_mask & (np.asarray(degrees) == 0))
+    return f"min/med/p95/max={min_deg}/{median_deg}/{p95_deg}/{max_deg} iso={isolated_count}"
+
+
+# Union-Find (DSU) structure for connectivity
+class _UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.num_components = n
+
+    def find(self, i: int) -> int:
+        if self.parent[i] == i:
+            return i
+        self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+
+    def union(self, i: int, j: int) -> bool:
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_i] = root_j
+            self.num_components -= 1
+            return True
+        return False
+
 
 def compute_intertile_affine_calibration(
     tile_data_with_wcs,
@@ -2083,8 +2262,15 @@ def compute_intertile_affine_calibration(
     use_auto_intertile: bool = False,
     logger=None,
     progress_callback=None,
+    tile_weights=None,
+    cpu_workers: int | None = None,
 ):
-    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection."""
+    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
+
+    ``tile_data_with_wcs`` peut contenir des tuples ``(data, wcs)`` ou
+    ``(data, wcs, mask2d)`` pour injecter un masque (0..1) optionnel sur la zone
+    d'overlap.
+    """
 
     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
         return {}
@@ -2093,6 +2279,18 @@ def compute_intertile_affine_calibration(
     try:
         header_full = final_output_wcs.to_header()
     except Exception:
+        return {}
+
+    parsed_entries: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
+    for entry in tile_data_with_wcs:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        data = entry[0]
+        wcs_obj = entry[1]
+        mask = entry[2] if len(entry) >= 3 else None
+        parsed_entries.append((data, wcs_obj, mask))
+
+    if len(parsed_entries) < 2:
         return {}
 
     try:
@@ -2111,26 +2309,46 @@ def compute_intertile_affine_calibration(
     except Exception:
         sky_low, sky_high = 30.0, 70.0
 
-    wcs_list = [wcs for _data, wcs in tile_data_with_wcs]
+    wcs_list = [wcs for _data, wcs, _mask in parsed_entries]
     shapes_hw = []
     luminance_tiles = []
-    for data, _wcs in tile_data_with_wcs:
+    mask_tiles: list[np.ndarray | None] = []
+    for data, _wcs, mask in parsed_entries:
         arr = np.asarray(data)
         if arr.ndim == 3 and arr.shape[-1] == 0:
             luminance_tiles.append(None)
             shapes_hw.append((0, 0))
+            mask_tiles.append(None)
             continue
         luminance = _extract_luminance_plane(arr)
         luminance_tiles.append(luminance)
         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
+        mask_arr = None
+        if mask is not None:
+            try:
+                mask_arr = np.asarray(mask, dtype=np.float32)
+                if mask_arr.ndim == 3:
+                    mask_arr = mask_arr[..., 0]
+                if mask_arr.shape != luminance.shape[:2]:
+                    mask_arr = None
+            except Exception:
+                mask_arr = None
+        mask_tiles.append(mask_arr)
 
-    num_tiles = len(tile_data_with_wcs)
+    num_tiles = len(parsed_entries)
 
     try:
         preview_size = int(preview_size)
     except Exception:
         preview_size = 512
     preview_size = max(128, preview_size)
+
+    try:
+        cpu_workers = int(cpu_workers) if cpu_workers is not None else None
+    except Exception:
+        cpu_workers = None
+    if cpu_workers is not None and cpu_workers < 1:
+        cpu_workers = 1
 
     try:
         min_overlap_fraction = float(min_overlap_fraction)
@@ -2169,6 +2387,17 @@ def compute_intertile_affine_calibration(
         min_overlap_fraction = float(tuned_overlap)
         _log_intertile(
             f"Auto-tune enabled for {num_tiles} tiles — using preview={preview_size}, min_overlap={min_overlap_fraction:.4f}",
+            level="INFO",
+        )
+
+    if preview_size >= 1024 and min_overlap_fraction <= 0.015:
+        prev_preview = preview_size
+        prev_overlap = min_overlap_fraction
+        preview_size = 512
+        min_overlap_fraction = max(min_overlap_fraction, 0.03)
+        _log_intertile(
+            f"INTERTILE_AUTOTUNE_GUARDRAIL: adjusted preview={preview_size} min_overlap={min_overlap_fraction:.4f} "
+            f"(was preview={prev_preview} min_overlap={prev_overlap:.4f})",
             level="INFO",
         )
 
@@ -2247,7 +2476,7 @@ def compute_intertile_affine_calibration(
                 use_gpu = False
 
             medians = []
-            for data, _ in tile_data_with_wcs:
+            for data, _wcs_obj, _mask in parsed_entries:
                 if data is None:
                     continue
                 arr = xp.asarray(data, dtype=xp.float32)
@@ -2266,7 +2495,7 @@ def compute_intertile_affine_calibration(
             )
 
             new_tile_data = []
-            for data, wcs_obj in tile_data_with_wcs:
+            for data, wcs_obj, mask in parsed_entries:
                 if data is None:
                     new_tile_data.append((data, wcs_obj))
                     continue
@@ -2276,7 +2505,7 @@ def compute_intertile_affine_calibration(
                 scaled = arr * scale
                 if use_gpu and cp is not None:
                     scaled = cp.asnumpy(scaled)  # type: ignore
-                new_tile_data.append((scaled, wcs_obj))
+                new_tile_data.append((scaled, wcs_obj, mask) if mask is not None else (scaled, wcs_obj))
             tile_data_with_wcs[:] = new_tile_data
 
             _log_intertile("Applied global normalization to all master tiles.", level="INFO")
@@ -2286,11 +2515,190 @@ def compute_intertile_affine_calibration(
 
         return {}
 
-    min_overlap_fraction = effective_min_overlap
+    # --- START PRUNING LOGIC ---
+    raw_pairs_count = len(overlaps)
+    overlaps_raw = list(overlaps)
+
+    raw_degrees = [0] * num_tiles
+    active_tiles = np.zeros(num_tiles, dtype=bool)
+
+    def _ensure_overlap_weight(entry: dict) -> float:
+        weight = entry.get("weight", None)
+        try:
+            weight_val = float(weight)
+        except Exception:
+            weight_val = float("nan")
+        if not math.isfinite(weight_val) or weight_val <= 0.0:
+            try:
+                bbox = entry.get("bbox")
+                if bbox is not None and len(bbox) == 4:
+                    x0, x1, y0, y1 = bbox
+                    weight_val = float((x1 - x0) * (y1 - y0))
+                else:
+                    weight_val = 0.0
+            except Exception:
+                weight_val = 0.0
+        if not math.isfinite(weight_val) or weight_val < 0.0:
+            weight_val = 0.0
+        entry["weight"] = weight_val
+        return weight_val
+
+    for entry in overlaps_raw:
+        i, j = entry["i"], entry["j"]
+        raw_degrees[i] += 1
+        raw_degrees[j] += 1
+        active_tiles[i] = True
+        active_tiles[j] = True
+        _ensure_overlap_weight(entry)
+
+    active_tile_count = int(np.sum(active_tiles))
+    bridges_added = 0
+    components_active = active_tile_count
+    fallback_used = False
+    pruned_pairs_count = raw_pairs_count
+
+    def _count_active_components(uf: _UnionFind) -> int:
+        if active_tile_count <= 1:
+            return active_tile_count
+        roots = set()
+        for idx, active in enumerate(active_tiles):
+            if active:
+                roots.add(uf.find(idx))
+        return len(roots)
+
+    # Pruning condition
+    if (raw_pairs_count > num_tiles * MAX_NEIGHBORS_PER_TILE * 2 and num_tiles >= 10):
+        _log_intertile(
+            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={MAX_NEIGHBORS_PER_TILE}",
+            level="INFO",
+        )
+
+        # Build neighbors and prune
+        neighbors: dict[int, list[tuple[float, tuple[int, int]]]] = {i: [] for i in range(num_tiles)}
+        for entry in overlaps_raw:
+            weight = entry["weight"]
+            key = _intertile_edge_key(entry)
+            i, j = entry["i"], entry["j"]
+            neighbors[i].append((weight, key))
+            neighbors[j].append((weight, key))
+
+        kept_keys: set[tuple[int, int]] = set()
+
+        for tile_id in range(num_tiles):
+            if not active_tiles[tile_id]:
+                continue
+
+            # Sort neighbors by weight descending with stable tie-break on (i,j).
+            neighbors[tile_id].sort(key=lambda x: (-x[0], x[1][0], x[1][1]))
+
+            # Keep top K, ensuring at least one if it had neighbors.
+            to_keep_for_tile = []
+            if neighbors[tile_id]:
+                if MAX_NEIGHBORS_PER_TILE == 0 and len(neighbors[tile_id]) >= 1:
+                    to_keep_for_tile.append(neighbors[tile_id][0][1])
+                else:
+                    for k_idx in range(min(MAX_NEIGHBORS_PER_TILE, len(neighbors[tile_id]))):
+                        to_keep_for_tile.append(neighbors[tile_id][k_idx][1])
+
+            kept_keys.update(to_keep_for_tile)
+
+        # Filter overlaps after top-K pruning
+        overlaps_after_topK = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
+
+        _log_intertile(f"Pair pruning (topK): after_topK={len(overlaps_after_topK)}", level="INFO")
+
+        # --- CONNECTIVITY GUARANTEE (BRIDGES) ---
+        uf = _UnionFind(num_tiles)
+        for entry in overlaps_after_topK:
+            uf.union(entry["i"], entry["j"])
+
+        components_active = _count_active_components(uf)
+
+        if active_tile_count > 1 and components_active > 1:
+            _log_intertile(
+                f"Pair pruning (connectivity): components_active={components_active} -> (attempting to connect)",
+                level="INFO",
+            )
+
+            overlaps_sorted = sorted(
+                overlaps_raw,
+                key=lambda entry: (-entry["weight"], *_intertile_edge_key(entry)),
+            )
+
+            for entry in overlaps_sorted:
+                i, j = entry["i"], entry["j"]
+                if not active_tiles[i] or not active_tiles[j]:
+                    continue
+                if uf.union(i, j):
+                    kept_keys.add(_intertile_edge_key(entry))
+                    bridges_added += 1
+                    components_active = _count_active_components(uf)
+                    if components_active <= 1:
+                        break
+
+            if components_active <= 1:
+                _log_intertile(
+                    f"Pair pruning (connectivity): components_active=1 bridges_added={bridges_added}",
+                    level="INFO",
+                )
+
+        if active_tile_count > 1 and components_active > 1:
+            fallback_used = True
+            overlaps = overlaps_raw
+            pruned_pairs_count = raw_pairs_count
+            _log_intertile(
+                (
+                    "PRUNE_FALLBACK_NO_PRUNING: disconnected after prune+bridge "
+                    f"(components_active={components_active})"
+                ),
+                level="WARN",
+            )
+        else:
+            overlaps = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
+            pruned_pairs_count = len(overlaps)
+
+        # Calculate final degrees for logging
+        final_degrees = [0] * num_tiles
+        for entry in overlaps:
+            final_degrees[entry["i"]] += 1
+            final_degrees[entry["j"]] += 1
+
+        raw_stats = _intertile_degree_stats(raw_degrees, active_tiles)
+        final_stats = _intertile_degree_stats(final_degrees, active_tiles)
+        _log_intertile(
+            f"Pair pruning degree stats: raw[{raw_stats}] | final[{final_stats}]",
+            level="DEBUG",
+        )
+    else:
+        _log_intertile(
+            "Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)"
+            % (raw_pairs_count, num_tiles, MAX_NEIGHBORS_PER_TILE),
+            level="INFO",
+        )
+        uf = _UnionFind(num_tiles)
+        for entry in overlaps_raw:
+            uf.union(entry["i"], entry["j"])
+        components_active = _count_active_components(uf)
+        overlaps = overlaps_raw
+        pruned_pairs_count = raw_pairs_count
+
+    if fallback_used:
+        uf = _UnionFind(num_tiles)
+        for entry in overlaps_raw:
+            uf.union(entry["i"], entry["j"])
+        components_active = _count_active_components(uf)
+
     _log_intertile(
-        f"Using: preview={preview_size}, min_overlap={effective_min_overlap:.4f}, sky=({sky_low:.1f},{sky_high:.1f}), clip={robust_clip_sigma:.2f}, pairs={len(overlaps)}",
+        (
+            "Pair pruning summary: "
+            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={MAX_NEIGHBORS_PER_TILE} "
+            f"active={active_tile_count} components={components_active} bridges={bridges_added} "
+            f"fallback={'yes' if fallback_used else 'no'}"
+        ),
         level="INFO",
     )
+
+    # --- END PRUNING LOGIC ---
 
     try:
         from astropy.wcs import WCS as _WCS
@@ -2298,105 +2706,377 @@ def compute_intertile_affine_calibration(
         return {}
 
     pair_entries = []
-    connectivity = np.zeros(len(tile_data_with_wcs), dtype=np.float64)
+    connectivity = np.zeros(num_tiles, dtype=np.float64)
+    preview_size = max(128, int(preview_size))
+    weight_scores = None
+    weights_for_anchor = None
+
+    if tile_weights is not None:
+        try:
+            weights_array = np.asarray(tile_weights, dtype=np.float64).reshape(-1)
+        except Exception:
+            weights_array = None
+        if weights_array is not None and len(weights_array) != num_tiles:
+            _log_intertile(
+                f"tile_weights ignored: expected {num_tiles}, got {len(weights_array)}",
+                level="WARN",
+            )
+            weights_array = None
+        if weights_array is not None:
+            with np.errstate(invalid="ignore"):
+                weights_array = np.where(np.isfinite(weights_array) & (weights_array > 0.0), weights_array, 1.0)
+            try:
+                positive = weights_array[weights_array > 0.0]
+                median_ref = float(np.median(positive)) if positive.size else 1.0
+            except Exception:
+                median_ref = 1.0
+            if not math.isfinite(median_ref) or median_ref <= 0.0:
+                median_ref = 1.0
+            with np.errstate(invalid="ignore", divide="ignore"):
+                normed = weights_array / median_ref
+                scores = np.sqrt(normed)
+            if scores is not None:
+                scores = np.where(np.isfinite(scores) & (scores > 0.0), scores, 1.0)
+            weight_scores = scores
+            weights_for_anchor = weights_array
+
     preview_size = max(128, int(preview_size))
 
-    for idx, overlap in enumerate(overlaps, 1):
-        i = overlap["i"]
-        j = overlap["j"]
-        bbox = overlap["bbox"]
-        weight = float(overlap.get("weight", 1.0))
-        if luminance_tiles[i] is None or luminance_tiles[j] is None:
-            continue
-        x0, x1, y0, y1 = bbox
-        sub_w = max(1, x1 - x0)
-        sub_h = max(1, y1 - y0)
-        header = header_full.copy()
-        header["NAXIS1"] = sub_w
-        header["NAXIS2"] = sub_h
-        if "CRPIX1" in header:
-            header["CRPIX1"] = float(header["CRPIX1"]) - x0
-        if "CRPIX2" in header:
-            header["CRPIX2"] = float(header["CRPIX2"]) - y0
+    def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
+        if mask_arr is None:
+            return None
+        mask_arr = np.asarray(mask_arr, dtype=np.float32)
+        if mask_arr.size == 0:
+            return None
+        finite_mask = np.isfinite(mask_arr)
+        if not np.any(finite_mask):
+            return None
         try:
-            target_wcs = _WCS(header)
+            max_val = float(np.nanmax(mask_arr[finite_mask]))
         except Exception:
-            continue
-        try:
-            reproj_i, _ = reproject_interp(
-                (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
-            )
-            reproj_j, _ = reproject_interp(
-                (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-            )
-        except Exception:
-            continue
-        if reproj_i is None or reproj_j is None:
-            continue
-        arr_i = np.asarray(reproj_i, dtype=np.float32)
-        arr_j = np.asarray(reproj_j, dtype=np.float32)
-        if arr_i.size == 0 or arr_j.size == 0:
-            continue
-        max_dim = max(arr_i.shape[0], arr_i.shape[1])
-        if max_dim > preview_size:
-            scale = preview_size / max_dim
-            new_w = max(8, int(round(arr_i.shape[1] * scale)))
-            new_h = max(8, int(round(arr_i.shape[0] * scale)))
-            arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        valid = np.isfinite(arr_i) & np.isfinite(arr_j)
-        if not np.any(valid):
-            continue
-        sample_i = arr_i[valid]
-        sample_j = arr_j[valid]
-        if sample_i.size < 64:
-            continue
-        sky_proxy = 0.5 * (sample_i + sample_j)
-        try:
-            p_low = np.percentile(sky_proxy, sky_low)
-            p_high = np.percentile(sky_proxy, sky_high)
-        except Exception:
-            p_low = np.nanmin(sky_proxy)
-            p_high = np.nanmax(sky_proxy)
-        if not np.isfinite(p_low) or not np.isfinite(p_high):
-            continue
-        if p_high <= p_low:
-            p_low = np.nanmin(sky_proxy)
-            p_high = np.nanmax(sky_proxy)
-        mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
-        if mask.sum() < 32:
-            mask = np.ones_like(sky_proxy, dtype=bool)
-        x_samples = sample_i[mask]
-        y_samples = sample_j[mask]
-        fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
-        if fit is None:
-            continue
-        a_ij, b_ij = fit
-        pair_entries.append((i, j, a_ij, b_ij, weight))
+            max_val = 0.0
+        threshold = 0.5 if max_val > 0.5 else 0.0
+        return finite_mask & (mask_arr > threshold)
 
-        a_ij, b_ij = fit
-        pair_entries.append((i, j, a_ij, b_ij, weight))
-        connectivity[i] += weight
-        connectivity[j] += weight
-
-        # [ETA] Tick fin de traitement de la paire idx
-        if progress_callback:
+    def _process_overlap_pair(idx_overlap: int, overlap_entry: dict) -> tuple[list[tuple[int, int, float, float, float]] | None, tuple[int, int, float] | None]:
+        try:
+            i = overlap_entry["i"]
+            j = overlap_entry["j"]
+            bbox = overlap_entry["bbox"]
+            weight = float(overlap_entry.get("weight", 1.0))
+            if luminance_tiles[i] is None or luminance_tiles[j] is None:
+                return None, None
+            x0, x1, y0, y1 = bbox
+            sub_w = max(1, x1 - x0)
+            sub_h = max(1, y1 - y0)
+            header = header_full.copy()
+            header["NAXIS1"] = sub_w
+            header["NAXIS2"] = sub_h
+            if "CRPIX1" in header:
+                header["CRPIX1"] = float(header["CRPIX1"]) - x0
+            if "CRPIX2" in header:
+                header["CRPIX2"] = float(header["CRPIX2"]) - y0
             try:
-                progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
+                target_wcs = _WCS(header)
+            except Exception:
+                return None, None
+            max_dim = max(sub_h, sub_w)
+            shape_out = (sub_h, sub_w)
+            reproject_scaled = False
+            if max_dim > preview_size:
+                scale = preview_size / max_dim
+                new_w = max(8, int(round(sub_w * scale)))
+                new_h = max(8, int(round(sub_h * scale)))
+                preview_wcs = _rescale_wcs_for_preview(target_wcs, (sub_h, sub_w), (new_h, new_w))
+                if preview_wcs is not None:
+                    target_wcs = preview_wcs
+                    shape_out = (new_h, new_w)
+                    reproject_scaled = True
+            try:
+                reproj_i, _ = reproject_interp(
+                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=shape_out
+                )
+                reproj_j, _ = reproject_interp(
+                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=shape_out
+                )
+            except Exception:
+                return None, None
+            if reproj_i is None or reproj_j is None:
+                return None, None
+            arr_i = np.asarray(reproj_i, dtype=np.float32)
+            arr_j = np.asarray(reproj_j, dtype=np.float32)
+            mask_i_reproj = None
+            mask_j_reproj = None
+            if mask_tiles[i] is not None:
+                try:
+                    mask_i_reproj, _ = reproject_interp(
+                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=shape_out
+                    )
+                except Exception:
+                    mask_i_reproj = None
+            if mask_tiles[j] is not None:
+                try:
+                    mask_j_reproj, _ = reproject_interp(
+                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=shape_out
+                    )
+                except Exception:
+                    mask_j_reproj = None
+            if arr_i.size == 0 or arr_j.size == 0:
+                return None, None
+            if not reproject_scaled:
+                max_dim = max(arr_i.shape[0], arr_i.shape[1])
+                if max_dim > preview_size:
+                    scale = preview_size / max_dim
+                    new_w = max(8, int(round(arr_i.shape[1] * scale)))
+                    new_h = max(8, int(round(arr_i.shape[0] * scale)))
+                    arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    if mask_i_reproj is not None:
+                        mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    if mask_j_reproj is not None:
+                        mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            valid = np.isfinite(arr_i) & np.isfinite(arr_j)
+            mask_i_valid = _mask_valid_pixels(mask_i_reproj)
+            mask_j_valid = _mask_valid_pixels(mask_j_reproj)
+            if mask_i_valid is not None:
+                valid &= mask_i_valid
+            if mask_j_valid is not None:
+                valid &= mask_j_valid
+            if not np.any(valid):
+                return None, None
+            sample_i = arr_i[valid]
+            sample_j = arr_j[valid]
+            if sample_i.size < 64:
+                return None, None
+            sky_proxy = 0.5 * (sample_i + sample_j)
+            try:
+                p_low = np.percentile(sky_proxy, sky_low)
+                p_high = np.percentile(sky_proxy, sky_high)
+            except Exception:
+                p_low = np.nanmin(sky_proxy)
+                p_high = np.nanmax(sky_proxy)
+            if not np.isfinite(p_low) or not np.isfinite(p_high):
+                return None, None
+            if p_high <= p_low:
+                p_low = np.nanmin(sky_proxy)
+                p_high = np.nanmax(sky_proxy)
+            mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
+            if mask.sum() < 32:
+                mask = np.ones_like(sky_proxy, dtype=bool)
+            x_samples = sample_i[mask]
+            y_samples = sample_j[mask]
+            fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
+            if fit is None:
+                return None, None
+            a_ij, b_ij = fit
+            # Preserve legacy duplicate append behavior.
+            pairs_local = [(i, j, a_ij, b_ij, weight), (i, j, a_ij, b_ij, weight)]
+            return pairs_local, (i, j, weight)
+        except Exception:
+            return None, None
+
+    faulthandler_file = None
+    faulthandler_enabled = False
+    try:
+        fh_path = Path(tempfile.gettempdir()) / "faulthandler_intertile.log"
+        faulthandler_file = open(fh_path, "w")
+        faulthandler.enable(all_threads=True, file=faulthandler_file)
+        faulthandler.dump_traceback_later(600, repeat=True)
+        faulthandler_enabled = True
+        _log_intertile(
+            f"faulthandler enabled for intertile -> {fh_path}",
+            level="INFO_DETAIL",
+        )
+    except Exception as exc:
+        _log_intertile(f"faulthandler enable failed: {exc}", level="WARN")
+
+    try:
+        total_pairs = len(overlaps)
+        use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
+
+        def _run_overlaps_sequentially() -> None:
+            for idx, overlap in enumerate(overlaps, 1):
+                pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
+                if pairs_local:
+                    pair_entries.extend(pairs_local)
+                if connectivity_entry:
+                    i_conn, j_conn, w_conn = connectivity_entry
+                    connectivity[i_conn] += w_conn
+                    connectivity[j_conn] += w_conn
+                if idx % 25 == 0 or idx == total_pairs:
+                    _log_intertile(
+                        f"progress pairs_done={idx}/{total_pairs}",
+                        level="INFO",
+                    )
+                if progress_callback:
+                    try:
+                        progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
+                    except Exception:
+                        pass
+                    if idx % 5 == 0:
+                        try:
+                            progress_callback("phase5_intertile", idx, total_pairs)
+                        except Exception:
+                            pass
+
+        if use_parallel:
+            requested_workers = None
+            try:
+                requested_workers = int(cpu_workers) if cpu_workers is not None else None
+            except Exception:
+                requested_workers = None
+            if requested_workers is not None and requested_workers < 1:
+                requested_workers = 1
+
+            try:
+                cv2.setNumThreads(1)
+                _log_intertile(
+                    "Parallel: forcing cv2.setNumThreads(1) to limit oversubscription.",
+                    level="DEBUG_DETAIL",
+                )
             except Exception:
                 pass
 
-        if progress_callback and idx % 5 == 0:
+            effective_workers, clamp_reasons = compute_intertile_workers_limit(
+                requested_workers,
+                total_pairs,
+                preview_size,
+            )
+
+            safe_mode = sys.platform == "win32" and preview_size >= 512 and total_pairs >= 2000
+            if safe_mode:
+                effective_workers = 1
+                clamp_reasons = ["safe_mode_windows"] + clamp_reasons
+                _log_intertile(
+                    (
+                        "SAFE_MODE: forcing single-worker on Windows to avoid native deadlocks "
+                        f"(pairs={total_pairs} preview={preview_size})"
+                    ),
+                    level="INFO",
+                )
+
+            reason_label = ",".join(clamp_reasons) if clamp_reasons else "no_clamp"
+            display_requested = requested_workers if requested_workers is not None else "auto"
+            _log_intertile(
+                f"Parallel: threadpool workers={display_requested} -> {effective_workers} ({reason_label}) "
+                f"pairs={total_pairs} preview={preview_size}",
+                level="INFO",
+            )
+
+            if effective_workers <= 1:
+                _log_intertile(
+                    "Parallel: effective_workers=1 -> running sequentially (no ThreadPoolExecutor) to avoid native thread issues",
+                    level="INFO",
+                )
+                _run_overlaps_sequentially()
+            else:
+                with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                    future_map = {
+                        executor.submit(_process_overlap_pair, idx, overlap): idx
+                        for idx, overlap in enumerate(overlaps, 1)
+                    }
+                    pending = set(future_map.keys())
+                    done_count = 0
+                    last_completed_idx: int | None = None
+                    last_progress_ts = time.time()
+                    last_heartbeat_ts = time.time()
+
+                    while pending:
+                        done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+                        now = time.time()
+
+                        if done:
+                            for future in done:
+                                idx = future_map[future]
+                                try:
+                                    pairs_local, connectivity_entry = future.result()
+                                except Exception as exc:
+                                    _log_intertile(f"Pair future failed idx={idx}: {exc}", level="ERROR")
+                                    continue
+
+                                if pairs_local:
+                                    pair_entries.extend(pairs_local)
+                                if connectivity_entry:
+                                    i_conn, j_conn, w_conn = connectivity_entry
+                                    connectivity[i_conn] += w_conn
+                                    connectivity[j_conn] += w_conn
+
+                                done_count += 1
+                                last_completed_idx = idx
+                                last_progress_ts = now
+
+                                if done_count % 25 == 0 or done_count == total_pairs:
+                                    _log_intertile(
+                                        f"progress pairs_done={done_count}/{total_pairs}",
+                                        level="INFO",
+                                    )
+
+                                if progress_callback:
+                                    try:
+                                        progress_callback("phase5_intertile_pairs", done_count, int(total_pairs))
+                                    except Exception:
+                                        pass
+                                    if done_count % 5 == 0:
+                                        try:
+                                            progress_callback("phase5_intertile", done_count, total_pairs)
+                                        except Exception:
+                                            pass
+
+                        elif now - last_progress_ts >= 10.0 and now - last_heartbeat_ts >= 10.0:
+                            sample_pending_idx = [future_map[fut] for fut in list(pending)[:5]]
+                            _log_intertile(
+                                (
+                                    f"Heartbeat: done={done_count}/{total_pairs} "
+                                    f"pending={len(pending)} last_completed_idx={last_completed_idx} "
+                                    f"sample_pending_idx={sample_pending_idx}"
+                                ),
+                                level="INFO",
+                            )
+                            last_heartbeat_ts = now
+        else:
+            _run_overlaps_sequentially()
+
+        if not pair_entries:
+            return {}
+    finally:
+        if faulthandler_enabled:
             try:
-                progress_callback("phase5_intertile", idx, len(overlaps))
+                faulthandler.cancel_dump_traceback_later()
+            except Exception:
+                pass
+            try:
+                faulthandler.disable()
+            except Exception:
+                pass
+        if faulthandler_file is not None:
+            try:
+                faulthandler_file.close()
             except Exception:
                 pass
 
-    if not pair_entries:
-        return {}
+    if weight_scores is None:
+        anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
+    else:
+        if np.any(connectivity > 0):
+            score = connectivity * weight_scores
+            anchor = int(np.argmax(score))
+            selected_score = float(score[anchor])
+        else:
+            score = weight_scores
+            anchor = int(np.argmax(weight_scores))
+            selected_score = float(weight_scores[anchor])
+        selected_connectivity = float(connectivity[anchor])
+        selected_weight = float(weights_for_anchor[anchor]) if weights_for_anchor is not None else 1.0
+        try:
+            _log_intertile(
+                f"Anchor selection biased: anchor={anchor} connectivity={selected_connectivity:.4f} weight={selected_weight:.4f} score={selected_score:.4f}",
+                level="INFO",
+            )
+        except Exception:
+            pass
 
-    anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
-    solution = solve_global_affine(len(tile_data_with_wcs), pair_entries, anchor_index=anchor)
+    solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
     if progress_callback:
         try:
             progress_callback(
@@ -2481,7 +3161,7 @@ def load_and_validate_fits(filepath,
                     alpha_mask = np.asarray(hdu_extra.data)
                     if alpha_mask.ndim > 2:
                         alpha_mask = alpha_mask[..., 0]
-                    alpha_mask = np.asarray(alpha_mask, dtype=np.uint8, copy=False)
+                    alpha_mask = np.asarray(alpha_mask, dtype=np.uint8)
                     break
             if alpha_mask is not None:
                 info["alpha_mask"] = alpha_mask
@@ -2934,8 +3614,14 @@ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8,
 
     for c in range(3):
         chan = img[..., c]
+        if not np.isfinite(chan).any():
+            out[..., c].fill(0.0)
+            continue
         # percentile returns python floats/float64; cast to float32 to avoid upcasting chan
-        vmin_f64, vmax_f64 = np.percentile(chan, [p_low, p_high])
+        vmin_f64, vmax_f64 = np.nanpercentile(chan, [p_low, p_high])
+        if not (np.isfinite(vmin_f64) and np.isfinite(vmax_f64)):
+            out[..., c].fill(0.0)
+            continue
         vmin = np.float32(vmin_f64)
         vmax = np.float32(vmax_f64)
         dv = vmax - vmin
@@ -3614,7 +4300,7 @@ def save_fits_image(image_data: np.ndarray,
 
     if alpha_mask is not None:
         try:
-            alpha_arr = np.asarray(alpha_mask, dtype=np.uint8, copy=False)
+            alpha_arr = np.asarray(alpha_mask, dtype=np.uint8)
             if alpha_arr.ndim > 2:
                 alpha_arr = alpha_arr[..., 0]
             alpha_hdu = current_fits_module.ImageHDU(alpha_arr, name="ALPHA")
@@ -3826,6 +4512,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     progress_callback = kwargs.pop("progress_callback", None)
     tile_weights_param = kwargs.pop("tile_weights", None)
     tile_paths_param = kwargs.pop("tile_paths", None)
+    input_weights_param = kwargs.pop("input_weights", None)
     if not gpu_is_available():
         _log_gpu_event(
             "gpu_fallback_unavailable",
@@ -3861,6 +4548,45 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     if len(wcs_list) != n_inputs:
         raise ValueError("data_list and wcs_list must have the same length")
 
+    def _normalize_weight_maps(weights_obj) -> list[np.ndarray | None]:
+        if weights_obj is None:
+            return [None] * n_inputs
+        normalized: list[np.ndarray | None] = []
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = [weights_obj]
+        for idx in range(n_inputs):
+            try:
+                raw = iterable[idx]
+            except Exception:
+                raw = None
+            if raw is None:
+                normalized.append(None)
+                continue
+            try:
+                arr = np.asarray(raw, dtype=np.float32)
+            except Exception:
+                normalized.append(None)
+                continue
+            if arr.ndim > 2:
+                arr = np.squeeze(arr)
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            arr = np.where(arr < 0.0, 0.0, arr)
+            expected_shape = np.asarray(data_list[idx]).shape
+            expected_hw = expected_shape[:2]
+            if arr.shape != expected_hw:
+                # If the weight map is the same shape as the full array, accept it.
+                if arr.shape == expected_shape:
+                    pass
+                else:
+                    normalized.append(None)
+                    continue
+            normalized.append(arr.astype(np.float32, copy=False))
+        if len(normalized) < n_inputs:
+            normalized.extend([None] * (n_inputs - len(normalized)))
+        return normalized
+
     def _normalize_tile_weights(weights_obj) -> list[float]:
         if weights_obj is None:
             return [1.0] * n_inputs
@@ -3887,6 +4613,25 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     tile_weights_list = _normalize_tile_weights(tile_weights_param)
     tile_weighting_active = tile_weights_param is not None
+    if tile_weighting_active and logger.isEnabledFor(logging.DEBUG):
+        try:
+            weights_np = np.asarray(tile_weights_list, dtype=np.float64)
+            finite_weights = weights_np[np.isfinite(weights_np)]
+            if finite_weights.size:
+                tw_min = float(np.min(finite_weights))
+                tw_med = float(np.median(finite_weights))
+                tw_max = float(np.max(finite_weights))
+                ratio = float(tw_max / tw_min) if tw_min > 0 else float("inf")
+                logger.debug(
+                    "[DEBUG] gpu_coadd tile_weights: min=%.6f median=%.6f max=%.6f ratio=%.6f count=%d",
+                    tw_min,
+                    tw_med,
+                    tw_max,
+                    ratio,
+                    len(tile_weights_list),
+                )
+        except Exception:
+            pass
     try:
         tile_weights_gpu = cp.asarray(tile_weights_list, dtype=cp.float32)
     except Exception:
@@ -3939,27 +4684,52 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     else:
         tile_affine = None
 
+    weight_maps_list = _normalize_weight_maps(input_weights_param)
+
     def _prepare_tile_arrays(idx: int) -> tuple[cp.ndarray, cp.ndarray]:
         arr = np.asarray(data_list[idx], dtype=np.float32)
         img = cp.asarray(arr)
+        weight_map_gpu = None
+        if weight_maps_list and idx < len(weight_maps_list):
+            w_map = weight_maps_list[idx]
+            if w_map is not None:
+                try:
+                    weight_map_gpu = cp.asarray(w_map, dtype=cp.float32)
+                    if weight_map_gpu.shape != img.shape:
+                        weight_map_gpu = None
+                except Exception:
+                    weight_map_gpu = None
         if tile_affine is not None:
             gain_val, offset_val = tile_affine[idx]
             if gain_val != 1.0:
                 img = img * cp.float32(gain_val)
             if offset_val != 0.0:
                 img = img + cp.float32(offset_val)
+        # Build per-pixel alpha/weight mask BEFORE background matching so masked pixels do not bias median.
+        mask = cp.isfinite(img).astype(cp.float32)
+        if weight_map_gpu is not None:
+            weight_map_gpu = cp.nan_to_num(weight_map_gpu, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            weight_map_gpu = cp.maximum(weight_map_gpu, cp.float32(0.0))
+            mask = mask * weight_map_gpu
+
         if match_background:
+            offset_val = 0.0
             try:
-                offset_val = float(cp.nanmedian(img).get())
+                tmp = cp.where(mask > cp.float32(0.0), img, cp.nan)
+                offset_val = float(cp.nanmedian(tmp).get())
             except Exception:
                 try:
-                    offset_val = float(np.nanmedian(cp.asnumpy(img)))
+                    tmp_cpu = np.where(cp.asnumpy(mask) > 0.0, cp.asnumpy(img), np.nan)
+                    offset_val = float(np.nanmedian(tmp_cpu))
                 except Exception:
                     offset_val = 0.0
             if offset_val != 0.0 and np.isfinite(offset_val):
                 img = img - cp.float32(offset_val)
-        mask = cp.isfinite(img).astype(cp.float32)
+
+        # IMPORTANT: pre-weight image by mask before resampling (correct weighted interpolation behavior).
         img = cp.nan_to_num(img, copy=False, nan=0.0)
+        img = img * mask
+        mask = cp.nan_to_num(mask, copy=False, nan=0.0)
         return img, mask
 
     def _build_world_chunk_grid(rows_per_chunk: int) -> list[tuple[int, int, np.ndarray, np.ndarray]]:
@@ -4022,11 +4792,15 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             & (y_in_gpu <= (h_in - 0.5))
         )
         coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
-        sampled = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
+        sampled_weighted = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
         sampled_mask = map_coordinates(mask_gpu, coords, order=1, mode="constant", cval=0.0)
-        sampled = sampled * sampled_mask * valid.astype(cp.float32)
-        sampled_mask = sampled_mask * valid.astype(cp.float32)
-        return sampled, sampled_mask
+        valid_f = valid.astype(cp.float32)
+        # img_gpu is already pre-weighted (img *= mask), so DO NOT multiply by sampled_mask again.
+        sampled_mask = sampled_mask * valid_f
+        sampled_weighted = sampled_weighted * valid_f
+        safe_mask = cp.maximum(sampled_mask, cp.float32(1e-6))
+        sampled_intensity = cp.where(sampled_mask > 0, sampled_weighted / safe_mask, cp.float32(0.0))
+        return sampled_intensity, sampled_mask
 
     def _finalize_match_background(mosaic_gpu: cp.ndarray) -> cp.ndarray:
         if not match_background:
@@ -4086,7 +4860,8 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     dec_chunk,
                     tile_path_for_logging=path_for_log,
                 )
-                mosaic_sum_gpu[y0:y1, :] += sampled * weight_i
+                weighted_sample = sampled * sampled_mask
+                mosaic_sum_gpu[y0:y1, :] += weighted_sample * weight_i
                 weight_sum_gpu[y0:y1, :] += sampled_mask * weight_i
             del img_gpu, mask_gpu
         eps = cp.float32(1e-6)
@@ -4240,10 +5015,10 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     dec_chunk,
                     tile_path_for_logging=path_for_log,
                 )
-                weighted_sample = sampled * weight_i
                 weighted_mask = sampled_mask * weight_i
+                weighted_sample = sampled * weighted_mask
                 sum_grid[y0:y1, :] += weighted_sample.astype(cp.float64)
-                sumsq_grid[y0:y1, :] += (weighted_sample ** 2).astype(cp.float64)
+                sumsq_grid[y0:y1, :] += (cp.square(sampled) * weighted_mask).astype(cp.float64)
                 weight_grid[y0:y1, :] += weighted_mask
                 count_grid[y0:y1, :] += (sampled_mask > 0).astype(cp.float32)
             if tile_cache is None:
@@ -4412,12 +5187,131 @@ def _reproject_and_coadd_wrapper_impl(
             normalized.extend([1.0] * (n_expected - len(normalized)))
         return normalized
 
+    def _max_input_weight(weights_obj) -> float | None:
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = None
+        if iterable is None:
+            return None
+        max_val: float = 0.0
+        seen = False
+        for entry in iterable:
+            if entry is None:
+                continue
+            try:
+                arr = np.asarray(entry, dtype=np.float32)
+            except Exception:
+                continue
+            if arr.size == 0:
+                continue
+            try:
+                local_max = float(np.nanmax(arr))
+            except Exception:
+                local_max = 0.0
+            if math.isfinite(local_max):
+                seen = True
+                if local_max > max_val:
+                    max_val = local_max
+        return max_val if seen else None
+
+    # Support per-tile (per-pixel) weight maps without forwarding unknown kwargs into
+    # astropy-reproject (it would pass them down to reproject_function and crash).
+    tile_weight_maps = kwargs.pop("tile_weight_maps", None)
+    if tile_weight_maps is not None:
+        try:
+            twm_list = list(tile_weight_maps)
+        except Exception:
+            twm_list = [tile_weight_maps]
+        if len(twm_list) < len(data_list):
+            twm_list = twm_list + [None] * (len(data_list) - len(twm_list))
+        if len(twm_list) > len(data_list):
+            twm_list = twm_list[: len(data_list)]
+        existing_weights = kwargs.get("input_weights")
+        if existing_weights is None:
+            kwargs["input_weights"] = twm_list
+        else:
+            try:
+                existing_list = list(existing_weights)
+            except Exception:
+                existing_list = [existing_weights]
+            if len(existing_list) < len(data_list):
+                existing_list = existing_list + [None] * (len(data_list) - len(existing_list))
+            combined_weights = []
+            for idx in range(len(data_list)):
+                base = existing_list[idx]
+                twm = twm_list[idx]
+                if base is None:
+                    combined_weights.append(twm)
+                elif twm is None:
+                    combined_weights.append(base)
+                else:
+                    try:
+                        base_arr = np.asarray(base, dtype=np.float32)
+                        twm_arr = np.asarray(twm, dtype=np.float32)
+                        combined_weights.append(base_arr * twm_arr)
+                    except Exception:
+                        combined_weights.append(base)
+            kwargs["input_weights"] = combined_weights
+
+    input_weights_raw = kwargs.get("input_weights")
+    input_weight_max = _max_input_weight(input_weights_raw)
     normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
+    if normalized_weights is not None and input_weight_max is not None and input_weight_max > 1.5:
+        try:
+            logger.warning(
+                "[Reproject] double application probable: input_weights max=%.3f with tile_weights provided",
+                input_weight_max,
+            )
+        except Exception:
+            pass
     gpu_kwargs = dict(kwargs)
     if progress_callback is not None:
         gpu_kwargs["progress_callback"] = progress_callback
     if normalized_weights is not None:
         gpu_kwargs["tile_weights"] = normalized_weights
+    phase5_oom_retry = bool(kwargs.get("_phase5_oom_retry", False))
+    try:
+        phase5_oom_retry_max = int(kwargs.get("_phase5_oom_retry_max", 3) or 3)
+    except Exception:
+        phase5_oom_retry_max = 3
+    if phase5_oom_retry_max < 0:
+        phase5_oom_retry_max = 0
+
+    def _gpu_call_with_oom_retry():
+        if not phase5_oom_retry or phase5_oom_retry_max <= 0:
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+        max_retries = int(phase5_oom_retry_max)
+        retry_index = 0
+        local_kwargs = dict(gpu_kwargs)
+        while True:
+            try:
+                return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **local_kwargs)
+            except Exception as exc:
+                if not _is_gpu_oom_exception(exc) or retry_index >= max_retries:
+                    raise
+                retry_index += 1
+                new_max, new_rows = _shrink_chunk_hints(
+                    local_kwargs.get("max_chunk_bytes"),
+                    local_kwargs.get("rows_per_chunk"),
+                )
+                local_kwargs["max_chunk_bytes"] = new_max
+                local_kwargs["rows_per_chunk"] = new_rows
+                free_bytes = _probe_free_vram_bytes()
+                if free_bytes is not None and free_bytes > 0:
+                    free_mb = f"{(free_bytes / (1024 ** 2)):.1f}"
+                else:
+                    free_mb = "n/a"
+                logger.warning(
+                    "[GPU Reproject] OOM retry %d/%d: max_chunk_mb=%.1f rows=%s free_vram_mb=%s",
+                    retry_index,
+                    max_retries,
+                    float(new_max or 0) / (1024 ** 2),
+                    int(new_rows),
+                    free_mb,
+                )
+                free_cupy_memory_pools()
+                gc.collect()
     if use_gpu:
         if not gpu_is_available():
             _log_gpu_event(
@@ -4431,7 +5325,7 @@ def _reproject_and_coadd_wrapper_impl(
                 raise RuntimeError("gpu_unavailable")
         else:
             try:
-                return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+                return _gpu_call_with_oom_retry()
             except Exception as e:  # pragma: no cover - GPU failures
                 _log_gpu_event(
                     "gpu_fallback_runtime_error",
@@ -4453,17 +5347,32 @@ def _reproject_and_coadd_wrapper_impl(
         "max_chunk_bytes",
         # New GPU-only hints
         "tile_affine_corrections",
+        "_phase5_oom_retry",
+        "_phase5_oom_retry_max",
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
+    input_weights_from_call = cpu_kwargs.get("input_weights")
     if normalized_weights is not None:
         weight_maps = []
-        for arr, w in zip(data_list, normalized_weights):
+        for idx, (arr, w) in enumerate(zip(data_list, normalized_weights)):
             arr_np = np.asarray(arr, dtype=np.float32)
-            try:
-                weight_maps.append(np.full_like(arr_np, float(w), dtype=np.float32))
-            except Exception:
-                weight_maps.append(np.full(arr_np.shape, float(w), dtype=np.float32))
+            base_weight = None
+            if isinstance(input_weights_from_call, (list, tuple, np.ndarray)) and idx < len(input_weights_from_call):
+                base_weight = input_weights_from_call[idx]
+            if base_weight is not None:
+                base_arr = np.asarray(base_weight, dtype=np.float32)
+                try:
+                    weight_maps.append(np.multiply(base_arr, float(w), dtype=np.float32))
+                except Exception:
+                    weight_maps.append(base_arr.astype(np.float32, copy=False) * float(w))
+            else:
+                try:
+                    weight_maps.append(np.full_like(arr_np, float(w), dtype=np.float32))
+                except Exception:
+                    weight_maps.append(np.full(arr_np.shape, float(w), dtype=np.float32))
         cpu_kwargs["input_weights"] = weight_maps
+    elif input_weights_from_call is not None:
+        cpu_kwargs["input_weights"] = input_weights_from_call
     inputs = list(zip(data_list, wcs_list))
     output_proj = cpu_kwargs.pop("output_projection")
     def _run_reproject(inp, out_proj):
@@ -4677,12 +5586,29 @@ def stretch_auto_asifits_like_gpu(img_hwc_adu,
             raise RuntimeError("GPU stretch: insufficient memory")
         for c in range(3):
             chan = cp.asarray(img[..., c])
-            vmin = cp.percentile(chan, p_low)
-            vmax = cp.percentile(chan, p_high)
-            if float(vmax - vmin) < 1e-3:
+            finite_mask = cp.isfinite(chan)
+            if not bool(finite_mask.any()):
                 out[..., c] = 0.0
                 continue
-            normed = cp.clip((chan - vmin) / cp.maximum(vmax - vmin, 1e-6), 0, 1)
+            nanpercentile = getattr(cp, "nanpercentile", None)
+            if nanpercentile is not None:
+                vmin = nanpercentile(chan, p_low)
+                vmax = nanpercentile(chan, p_high)
+            else:
+                chan_finite = chan[finite_mask]
+                if chan_finite.size == 0:
+                    out[..., c] = 0.0
+                    continue
+                vmin = cp.percentile(chan_finite, p_low)
+                vmax = cp.percentile(chan_finite, p_high)
+            if not (bool(cp.isfinite(vmin)) and bool(cp.isfinite(vmax))):
+                out[..., c] = 0.0
+                continue
+            dv = vmax - vmin
+            if float(dv) < 1e-3:
+                out[..., c] = 0.0
+                continue
+            normed = cp.clip((chan - vmin) / cp.maximum(dv, 1e-6), 0, 1)
             stretched = cp.arcsinh(normed / asinh_a) / cp.arcsinh(1.0 / asinh_a)
             if float(cp.nanmax(stretched)) < 0.05:
                 stretched = normed
@@ -5041,4 +5967,3 @@ def apply_borrowing_v1(
 
 
 #####################################################################################################################
-
