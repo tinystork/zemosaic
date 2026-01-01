@@ -31,35 +31,35 @@ This should eliminate the “patchwork” normalization artifact without changin
 ## Implementation Plan
 ### A) Refactor pruning into a connectivity-safe step
 In `zemosaic_utils.compute_intertile_affine_calibration()`:
-1. Keep existing topK pruning idea, but enforce:
+1. [x] Keep existing topK pruning idea, but enforce:
    - compute connected components among ACTIVE tiles
    - after pruning, if components_active > 1:
      - attempt to add bridge edges from the full raw overlap list (sorted by weight desc)
      - keep adding until components_active == 1 OR no progress
 
-2. Fix ACTIVE tile detection robustness:
+2. [x] Fix ACTIVE tile detection robustness:
    - Do not rely solely on `weight > 0` filtering to mark active tiles.
    - Define active tiles as: any tile that appears in at least one overlap pair (raw graph degree > 0).
    - If an overlap entry is missing `weight`, compute it from bbox area as fallback.
 
-3. If bridging still fails (components_active > 1):
+3. [x] If bridging still fails (components_active > 1):
    - Fallback to **NO PRUNING** (use the raw overlap list).
    - Log an explicit warning:
      - `"[Intertile] PRUNE_FALLBACK_NO_PRUNING: disconnected after prune+bridge (components_active=...)"`
 
 ### B) Diagnostics (must-have)
-Add a compact INFO log line after pruning decision:
-- raw_pairs, pruned_pairs, max_neighbors, active_tiles, components_active, bridges_added, fallback_used
+- [x] Add a compact INFO log line after pruning decision:
+  - raw_pairs, pruned_pairs, max_neighbors, active_tiles, components_active, bridges_added, fallback_used
 
 Example:
 `[Intertile] Pair pruning summary: raw=6537 pruned=912 K=8 active=197 components=1 bridges=73 fallback=no`
 
-If fallback happens:
-`[Intertile] PRUNE_FALLBACK_NO_PRUNING: raw=6537 components_active=...`
+- [x] If fallback happens:
+  - `[Intertile] PRUNE_FALLBACK_NO_PRUNING: raw=6537 components_active=...`
 
 ### C) Safety behavior
-- Never run `solve_global_affine()` on a graph with components_active > 1 unless fallback to raw overlaps was applied.
-- Ensure determinism: bridging should pick edges in a deterministic order (weight desc + stable tie-breaker on (i,j)).
+- [x] Never run `solve_global_affine()` on a graph with components_active > 1 unless fallback to raw overlaps was applied.
+- [x] Ensure determinism: bridging should pick edges in a deterministic order (weight desc + stable tie-breaker on (i,j)).
 
 ## Acceptance Criteria
 1. On the same run pattern as the provided log (197 tiles, raw_pairs~6537):

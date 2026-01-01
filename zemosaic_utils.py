@@ -2516,127 +2516,145 @@ def compute_intertile_affine_calibration(
 
     # --- START PRUNING LOGIC ---
     raw_pairs_count = len(overlaps)
-    
+    overlaps_raw = list(overlaps)
+
+    raw_degrees = [0] * num_tiles
+    active_tiles = np.zeros(num_tiles, dtype=bool)
+
+    def _ensure_overlap_weight(entry: dict) -> float:
+        weight = entry.get("weight", None)
+        try:
+            weight_val = float(weight)
+        except Exception:
+            weight_val = float("nan")
+        if not math.isfinite(weight_val) or weight_val <= 0.0:
+            try:
+                bbox = entry.get("bbox")
+                if bbox is not None and len(bbox) == 4:
+                    x0, x1, y0, y1 = bbox
+                    weight_val = float((x1 - x0) * (y1 - y0))
+                else:
+                    weight_val = 0.0
+            except Exception:
+                weight_val = 0.0
+        if not math.isfinite(weight_val) or weight_val < 0.0:
+            weight_val = 0.0
+        entry["weight"] = weight_val
+        return weight_val
+
+    for entry in overlaps_raw:
+        i, j = entry["i"], entry["j"]
+        raw_degrees[i] += 1
+        raw_degrees[j] += 1
+        active_tiles[i] = True
+        active_tiles[j] = True
+        _ensure_overlap_weight(entry)
+
+    active_tile_count = int(np.sum(active_tiles))
+    bridges_added = 0
+    components_active = active_tile_count
+    fallback_used = False
+    pruned_pairs_count = raw_pairs_count
+
+    def _count_active_components(uf: _UnionFind) -> int:
+        if active_tile_count <= 1:
+            return active_tile_count
+        roots = set()
+        for idx, active in enumerate(active_tiles):
+            if active:
+                roots.add(uf.find(idx))
+        return len(roots)
+
     # Pruning condition
     if (raw_pairs_count > num_tiles * MAX_NEIGHBORS_PER_TILE * 2 and num_tiles >= 10):
-        _log_intertile(f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={MAX_NEIGHBORS_PER_TILE}", level="INFO")
+        _log_intertile(
+            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={MAX_NEIGHBORS_PER_TILE}",
+            level="INFO",
+        )
 
-        overlaps_raw = list(overlaps)
-        
-        # Calculate initial degrees for logging
-        raw_degrees = [0] * num_tiles
-        for entry in overlaps_raw:
-            raw_degrees[entry["i"]] += 1
-            raw_degrees[entry["j"]] += 1
-        
         # Build neighbors and prune
         neighbors: dict[int, list[tuple[float, tuple[int, int]]]] = {i: [] for i in range(num_tiles)}
-        active_tiles = np.zeros(num_tiles, dtype=bool)
-
         for entry in overlaps_raw:
+            weight = entry["weight"]
             key = _intertile_edge_key(entry)
-            weight = float(entry.get("weight", 0.0))
-            if weight <= 0.0: # Filter out zero/negative weight overlaps early
-                continue
-            
             i, j = entry["i"], entry["j"]
             neighbors[i].append((weight, key))
             neighbors[j].append((weight, key))
-            active_tiles[i] = True
-            active_tiles[j] = True
 
         kept_keys: set[tuple[int, int]] = set()
-        
-        # Store initial connectivity
-        initial_uf = _UnionFind(num_tiles)
-        for entry in overlaps_raw:
-            # Only consider edges between active tiles for initial connectivity check
-            if active_tiles[entry["i"]] and active_tiles[entry["j"]]:
-                 initial_uf.union(entry["i"], entry["j"])
-        
-        pruning_occurred = False
+
         for tile_id in range(num_tiles):
             if not active_tiles[tile_id]:
                 continue
-            
-            # Sort neighbors by weight descending
-            neighbors[tile_id].sort(key=lambda x: x[0], reverse=True)
-            
-            # Keep top K, ensuring at least one if it had neighbors
+
+            # Sort neighbors by weight descending with stable tie-break on (i,j).
+            neighbors[tile_id].sort(key=lambda x: (-x[0], x[1][0], x[1][1]))
+
+            # Keep top K, ensuring at least one if it had neighbors.
             to_keep_for_tile = []
             if neighbors[tile_id]:
-                # If the tile had more than one neighbor, guarantee it keeps at least one edge.
-                # If it only had one, it will naturally be kept as part of top-K if K>=1
-                if MAX_NEIGHBORS_PER_TILE == 0 and len(neighbors[tile_id]) >= 1: # special case: if K=0 but tile had neighbors
-                     to_keep_for_tile.append(neighbors[tile_id][0][1]) # ensure at least 1
+                if MAX_NEIGHBORS_PER_TILE == 0 and len(neighbors[tile_id]) >= 1:
+                    to_keep_for_tile.append(neighbors[tile_id][0][1])
                 else:
                     for k_idx in range(min(MAX_NEIGHBORS_PER_TILE, len(neighbors[tile_id]))):
                         to_keep_for_tile.append(neighbors[tile_id][k_idx][1])
-                        
+
             kept_keys.update(to_keep_for_tile)
-            if len(to_keep_for_tile) < len(neighbors[tile_id]):
-                pruning_occurred = True
 
         # Filter overlaps after top-K pruning
         overlaps_after_topK = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
-        
-        # Calculate degrees after top-K for logging
-        after_topK_degrees = [0] * num_tiles
-        for entry in overlaps_after_topK:
-            after_topK_degrees[entry["i"]] += 1
-            after_topK_degrees[entry["j"]] += 1
 
         _log_intertile(f"Pair pruning (topK): after_topK={len(overlaps_after_topK)}", level="INFO")
-        
+
         # --- CONNECTIVITY GUARANTEE (BRIDGES) ---
         uf = _UnionFind(num_tiles)
-        # Initialize UF with currently kept edges
         for entry in overlaps_after_topK:
             uf.union(entry["i"], entry["j"])
 
-        initial_components = uf.num_components
-        bridges_added = 0
-        
-        # Only attempt to add bridges if there are active tiles and more than one component among them
-        active_tile_count = np.sum(active_tiles)
-        if active_tile_count > 1 and initial_components > 1:
-            _log_intertile(f"Pair pruning (connectivity): components={initial_components} -> (attempting to connect)", level="INFO")
-            
-            # Sort raw overlaps by weight descending to find best bridges
-            # (overlaps_raw is already sorted from previous step or original order if no pruning occurred)
-            overlaps_raw.sort(key=lambda x: x.get("weight", 0.0), reverse=True) # Ensure it's sorted
+        components_active = _count_active_components(uf)
 
-            for entry in overlaps_raw:
+        if active_tile_count > 1 and components_active > 1:
+            _log_intertile(
+                f"Pair pruning (connectivity): components_active={components_active} -> (attempting to connect)",
+                level="INFO",
+            )
+
+            overlaps_sorted = sorted(
+                overlaps_raw,
+                key=lambda entry: (-entry["weight"], *_intertile_edge_key(entry)),
+            )
+
+            for entry in overlaps_sorted:
                 i, j = entry["i"], entry["j"]
-                # Only consider edges between active tiles for bridges
                 if not active_tiles[i] or not active_tiles[j]:
                     continue
-                
-                # Check if adding this edge connects two different components among active tiles
-                if uf.find(i) != uf.find(j):
-                    uf.union(i, j)
+                if uf.union(i, j):
                     kept_keys.add(_intertile_edge_key(entry))
                     bridges_added += 1
-                    if uf.num_components == 1:
-                        break # All active tiles connected
+                    components_active = _count_active_components(uf)
+                    if components_active <= 1:
+                        break
 
-            if uf.num_components > 1:
-                # Only warn if active tiles are still disconnected AND there are at least two active tiles
-                if active_tile_count > 1:
-                    _log_intertile(
-                        f"Pair pruning (connectivity): WARN - Could not connect all active components. "
-                        f"Remaining components: {uf.num_components}. Bridges added: {bridges_added}",
-                        level="WARN",
-                    )
-            else:
-                _log_intertile(f"Pair pruning (connectivity): components={initial_components} -> 1 bridges_added={bridges_added}", level="INFO")
+            if components_active <= 1:
+                _log_intertile(
+                    f"Pair pruning (connectivity): components_active=1 bridges_added={bridges_added}",
+                    level="INFO",
+                )
 
-        # Final overlaps after all pruning and bridge adding
-        final_overlaps = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
-        overlaps = final_overlaps # Update the main 'overlaps' variable
-
-        final_pairs_count = len(overlaps)
-        _log_intertile(f"Pair pruning (connectivity): final_pairs={final_pairs_count}", level="INFO")
+        if active_tile_count > 1 and components_active > 1:
+            fallback_used = True
+            overlaps = overlaps_raw
+            pruned_pairs_count = raw_pairs_count
+            _log_intertile(
+                (
+                    "PRUNE_FALLBACK_NO_PRUNING: disconnected after prune+bridge "
+                    f"(components_active={components_active})"
+                ),
+                level="WARN",
+            )
+        else:
+            overlaps = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
+            pruned_pairs_count = len(overlaps)
 
         # Calculate final degrees for logging
         final_degrees = [0] * num_tiles
@@ -2651,7 +2669,33 @@ def compute_intertile_affine_calibration(
             level="DEBUG",
         )
     else:
-        _log_intertile("Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)" % (raw_pairs_count, num_tiles, MAX_NEIGHBORS_PER_TILE), level="INFO")
+        _log_intertile(
+            "Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)"
+            % (raw_pairs_count, num_tiles, MAX_NEIGHBORS_PER_TILE),
+            level="INFO",
+        )
+        uf = _UnionFind(num_tiles)
+        for entry in overlaps_raw:
+            uf.union(entry["i"], entry["j"])
+        components_active = _count_active_components(uf)
+        overlaps = overlaps_raw
+        pruned_pairs_count = raw_pairs_count
+
+    if fallback_used:
+        uf = _UnionFind(num_tiles)
+        for entry in overlaps_raw:
+            uf.union(entry["i"], entry["j"])
+        components_active = _count_active_components(uf)
+
+    _log_intertile(
+        (
+            "Pair pruning summary: "
+            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={MAX_NEIGHBORS_PER_TILE} "
+            f"active={active_tile_count} components={components_active} bridges={bridges_added} "
+            f"fallback={'yes' if fallback_used else 'no'}"
+        ),
+        level="INFO",
+    )
 
     # --- END PRUNING LOGIC ---
 
@@ -2704,8 +2748,10 @@ def compute_intertile_affine_calibration(
         if mask_arr.size == 0:
             return None
         finite_mask = np.isfinite(mask_arr)
+        if not np.any(finite_mask):
+            return None
         try:
-            max_val = float(np.nanmax(mask_arr))
+            max_val = float(np.nanmax(mask_arr[finite_mask]))
         except Exception:
             max_val = 0.0
         threshold = 0.5 if max_val > 0.5 else 0.0
@@ -2733,12 +2779,24 @@ def compute_intertile_affine_calibration(
                 target_wcs = _WCS(header)
             except Exception:
                 return None, None
+            max_dim = max(sub_h, sub_w)
+            shape_out = (sub_h, sub_w)
+            reproject_scaled = False
+            if max_dim > preview_size:
+                scale = preview_size / max_dim
+                new_w = max(8, int(round(sub_w * scale)))
+                new_h = max(8, int(round(sub_h * scale)))
+                preview_wcs = _rescale_wcs_for_preview(target_wcs, (sub_h, sub_w), (new_h, new_w))
+                if preview_wcs is not None:
+                    target_wcs = preview_wcs
+                    shape_out = (new_h, new_w)
+                    reproject_scaled = True
             try:
                 reproj_i, _ = reproject_interp(
-                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=shape_out
                 )
                 reproj_j, _ = reproject_interp(
-                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=shape_out
                 )
             except Exception:
                 return None, None
@@ -2751,30 +2809,31 @@ def compute_intertile_affine_calibration(
             if mask_tiles[i] is not None:
                 try:
                     mask_i_reproj, _ = reproject_interp(
-                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=shape_out
                     )
                 except Exception:
                     mask_i_reproj = None
             if mask_tiles[j] is not None:
                 try:
                     mask_j_reproj, _ = reproject_interp(
-                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=shape_out
                     )
                 except Exception:
                     mask_j_reproj = None
             if arr_i.size == 0 or arr_j.size == 0:
                 return None, None
-            max_dim = max(arr_i.shape[0], arr_i.shape[1])
-            if max_dim > preview_size:
-                scale = preview_size / max_dim
-                new_w = max(8, int(round(arr_i.shape[1] * scale)))
-                new_h = max(8, int(round(arr_i.shape[0] * scale)))
-                arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                if mask_i_reproj is not None:
-                    mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                if mask_j_reproj is not None:
-                    mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            if not reproject_scaled:
+                max_dim = max(arr_i.shape[0], arr_i.shape[1])
+                if max_dim > preview_size:
+                    scale = preview_size / max_dim
+                    new_w = max(8, int(round(arr_i.shape[1] * scale)))
+                    new_h = max(8, int(round(arr_i.shape[0] * scale)))
+                    arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    if mask_i_reproj is not None:
+                        mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    if mask_j_reproj is not None:
+                        mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
             valid = np.isfinite(arr_i) & np.isfinite(arr_j)
             mask_i_valid = _mask_valid_pixels(mask_i_reproj)
