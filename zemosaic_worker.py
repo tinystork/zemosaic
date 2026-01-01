@@ -139,6 +139,92 @@ from zemosaic_gpu_safety import (
     probe_gpu_runtime_context,
 )
 
+# Phase 5 GPU runtime state helpers (used by tests and optional GPU orchestration).
+# The first element returned by `phase5_gpu_runtime_state()` is a "GPU disabled" flag
+# to prevent repeated GPU attempts after a runtime failure.
+_PHASE5_GPU_RUNTIME_STATE: dict[str, Any] = {
+    "disabled": False,
+    "reason": None,
+    "exception": None,
+    "ctx": None,
+}
+
+
+def reset_phase5_gpu_runtime_state() -> None:
+    """Reset cached Phase 5 GPU runtime state."""
+
+    try:
+        _PHASE5_GPU_RUNTIME_STATE.clear()
+        _PHASE5_GPU_RUNTIME_STATE.update(
+            {"disabled": False, "reason": None, "exception": None, "ctx": None}
+        )
+    except Exception:
+        pass
+
+
+def phase5_gpu_runtime_state() -> tuple[bool, Any | None, GpuRuntimeContext | None]:
+    """Return (gpu_disabled, reason/exception, gpu_ctx) for Phase 5 orchestration."""
+
+    try:
+        disabled = bool(_PHASE5_GPU_RUNTIME_STATE.get("disabled", False))
+    except Exception:
+        disabled = False
+    try:
+        reason = _PHASE5_GPU_RUNTIME_STATE.get("reason", None)
+    except Exception:
+        reason = None
+    if reason is None:
+        try:
+            reason = _PHASE5_GPU_RUNTIME_STATE.get("exception", None)
+        except Exception:
+            reason = None
+    try:
+        ctx = _PHASE5_GPU_RUNTIME_STATE.get("ctx", None)
+    except Exception:
+        ctx = None
+    return disabled, reason, ctx
+
+
+def _disable_phase5_gpu_runtime_state(reason: str, exc: Exception | None = None) -> None:
+    try:
+        _PHASE5_GPU_RUNTIME_STATE["disabled"] = True
+        _PHASE5_GPU_RUNTIME_STATE["reason"] = str(reason)
+        _PHASE5_GPU_RUNTIME_STATE["exception"] = exc
+    except Exception:
+        pass
+
+
+def should_use_gpu_for_reproject(tag: str, config: Any, parallel_plan: Any | None = None) -> bool:
+    """Return True if Phase 5 should attempt the GPU path for reprojection."""
+
+    disabled, _, _ = phase5_gpu_runtime_state()
+    if disabled:
+        return False
+
+    use_gpu_cfg = False
+    try:
+        if isinstance(config, dict):
+            use_gpu_cfg = bool(config.get("use_gpu_phase5"))
+        else:
+            use_gpu_cfg = bool(getattr(config, "use_gpu_phase5", False))
+    except Exception:
+        use_gpu_cfg = False
+    if not use_gpu_cfg:
+        return False
+
+    if parallel_plan is not None:
+        try:
+            plan_flag = getattr(parallel_plan, "use_gpu", None)
+        except Exception:
+            plan_flag = parallel_plan.get("use_gpu") if isinstance(parallel_plan, dict) else None
+        if plan_flag is not None and not bool(plan_flag):
+            return False
+
+    try:
+        return bool(gpu_is_available())
+    except Exception:
+        return False
+
 # ZeQualityMT (quality gate for Master Tiles)
 try:
     from zequalityMT import quality_metrics as _zq_quality_metrics
@@ -663,7 +749,13 @@ def _combine_alpha_masks(primary: np.ndarray | None, secondary: np.ndarray | Non
 
 
 def _apply_lecropper_pipeline(
-    arr: np.ndarray | None, cfg: dict | None
+    arr: np.ndarray | None,
+    cfg: dict | None,
+    *,
+    coverage: np.ndarray | None = None,
+    altaz_min_coverage_abs: float | None = None,
+    altaz_min_coverage_frac: float | None = None,
+    altaz_morph_open_px: int | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Apply quality crop + Alt-Az cleanup if the new lecropper is available.
 
@@ -748,6 +840,14 @@ def _apply_lecropper_pipeline(
             mask_helper = getattr(lecropper, "mask_altaz_artifacts", None)
             base_for_mask = out
             if callable(mask_helper):
+                cov_kwargs = {}
+                if coverage is not None:
+                    cov_kwargs = {
+                        "coverage": coverage,
+                        "min_coverage_abs": altaz_min_coverage_abs,
+                        "min_coverage_frac": altaz_min_coverage_frac,
+                        "morph_open_px": altaz_morph_open_px,
+                    }
                 try:
                     masked, mask2d = mask_helper(
                         base_for_mask,
@@ -755,15 +855,26 @@ def _apply_lecropper_pipeline(
                         decay_ratio=az_decay,
                         fill_value=None,
                         return_mask=True,
+                        **cov_kwargs,
                     )
                 except TypeError:
-                    masked = mask_helper(
-                        base_for_mask,
-                        margin_percent=az_margin,
-                        decay_ratio=az_decay,
-                        fill_value=None,
-                    )
-                    mask2d = None
+                    # Compat: some versions don't support coverage kwargs and/or return_mask.
+                    try:
+                        masked, mask2d = mask_helper(
+                            base_for_mask,
+                            margin_percent=az_margin,
+                            decay_ratio=az_decay,
+                            fill_value=None,
+                            return_mask=True,
+                        )
+                    except TypeError:
+                        masked = mask_helper(
+                            base_for_mask,
+                            margin_percent=az_margin,
+                            decay_ratio=az_decay,
+                            fill_value=None,
+                        )
+                        mask2d = None
                 # IMPORTANT:
                 # Do NOT replace `out` with `masked` here. `masked` is already base_for_mask * mask2d,
                 # and we also propagate mask2d downstream as alpha/weights. Using `masked` would
@@ -787,12 +898,24 @@ def _apply_lecropper_pipeline(
                     out = cleaned
                     altaz_masked_used = out is not None
             elif hasattr(lecropper, "apply_altaz_cleanup"):
-                cleaned = lecropper.apply_altaz_cleanup(
-                    base_for_mask,
-                    margin_percent=az_margin,
-                    decay=az_decay,
-                    nanize=az_nanize,
-                )
+                try:
+                    cleaned = lecropper.apply_altaz_cleanup(
+                        base_for_mask,
+                        margin_percent=az_margin,
+                        decay=az_decay,
+                        nanize=az_nanize,
+                        coverage=coverage,
+                        min_coverage_abs=altaz_min_coverage_abs,
+                        min_coverage_frac=altaz_min_coverage_frac,
+                        morph_open_px=altaz_morph_open_px,
+                    )
+                except TypeError:
+                    cleaned = lecropper.apply_altaz_cleanup(
+                        base_for_mask,
+                        margin_percent=az_margin,
+                        decay=az_decay,
+                        nanize=az_nanize,
+                    )
                 if isinstance(cleaned, (tuple, list)) and len(cleaned) >= 2:
                     candidate, mask2d = cleaned[:2]
                     if candidate is not None:
@@ -808,7 +931,7 @@ def _apply_lecropper_pipeline(
                     logger.info("lecropper: altaz_nanize_threshold=%.3f", az_nanize_threshold)
                 except Exception:
                     pass
-                alpha_mask_norm = np.asarray(mask2d, dtype=np.float32, copy=False)
+                alpha_mask_norm = np.asarray(mask2d, dtype=np.float32)
                 mask_zero = alpha_mask_norm <= az_nanize_threshold
                 # Always apply nanize/zeroize on the unattenuated base_for_mask,
                 # not on `out` (which could have been attenuated elsewhere).
@@ -987,7 +1110,7 @@ def _compute_coverage_stats(
     if coverage_array is None:
         return None
     try:
-        arr = np.asarray(coverage_array, dtype=np.float32, copy=False)
+        arr = np.asarray(coverage_array, dtype=np.float32)
     except Exception:
         return None
     if arr.ndim != 2:
@@ -1104,8 +1227,8 @@ def _nanize_by_coverage(
     if final_hwc is None or coverage_hw is None:
         return final_hwc
     try:
-        mosaic = np.asarray(final_hwc, dtype=np.float32, copy=False)
-        coverage = np.asarray(coverage_hw, dtype=np.float32, copy=False)
+        mosaic = np.asarray(final_hwc, dtype=np.float32)
+        coverage = np.asarray(coverage_hw, dtype=np.float32)
     except Exception:
         return final_hwc
     if mosaic.ndim < 2 or coverage.shape[:2] != mosaic.shape[:2]:
@@ -1113,7 +1236,7 @@ def _nanize_by_coverage(
     invalid = coverage <= 0
     if alpha_u8 is not None:
         try:
-            alpha_arr = np.asarray(alpha_u8, copy=False)
+            alpha_arr = np.asarray(alpha_u8)
             if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
                 alpha_arr = alpha_arr[..., 0]
             alpha_arr = np.squeeze(alpha_arr)
@@ -1126,7 +1249,7 @@ def _nanize_by_coverage(
         mosaic = np.where(invalid_mask, np.nan, mosaic)
     except Exception:
         return mosaic
-    return np.asarray(mosaic, dtype=np.float32, copy=False)
+    return np.asarray(mosaic, dtype=np.float32)
 
 
 def _auto_crop_global_mosaic_if_requested(
@@ -1317,7 +1440,7 @@ def _prepare_tiles_for_two_pass(
                 tw_val = 1.0
             tile_weights.append(tw_val)
             if cov is not None:
-                cov_np = np.asarray(cov, dtype=np.float32, copy=False)
+                cov_np = np.asarray(cov, dtype=np.float32)
                 if cov_np.ndim > 2:
                     cov_np = np.squeeze(cov_np)
                 coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
@@ -1360,7 +1483,7 @@ def _prepare_tiles_for_two_pass(
             if cov is None:
                 coverage_list.append(None)
             else:
-                cov_np = np.asarray(cov, dtype=np.float32, copy=False)
+                cov_np = np.asarray(cov, dtype=np.float32)
                 if cov_np.ndim > 2:
                     cov_np = np.squeeze(cov_np)
                 coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
@@ -2036,10 +2159,10 @@ def _apply_two_pass_coverage_renorm_if_requested(
                         gain_clip_tuple[1],
                     )
             else:
-                base_data = np.asarray(base_data, dtype=np.float32, copy=False)
-                base_cov = np.asarray(base_cov, dtype=np.float32, copy=False)
-                mosaic2 = np.asarray(mosaic2, dtype=np.float32, copy=False)
-                coverage2 = np.asarray(coverage2, dtype=np.float32, copy=False)
+                base_data = np.asarray(base_data, dtype=np.float32)
+                base_cov = np.asarray(base_cov, dtype=np.float32)
+                mosaic2 = np.asarray(mosaic2, dtype=np.float32)
+                coverage2 = np.asarray(coverage2, dtype=np.float32)
 
                 if (
                     base_data.shape[:2] != mosaic2.shape[:2]
@@ -3169,7 +3292,7 @@ def _finalize_sds_global_mosaic(
     if coverage_arr is not None:
         coverage_arr = np.where(np.isfinite(coverage_arr), coverage_arr, 0.0).astype(np.float32, copy=False)
     if mosaic_arr is not None and coverage_arr is not None:
-        mosaic_arr = np.asarray(mosaic_arr, dtype=np.float32, copy=False)
+        mosaic_arr = np.asarray(mosaic_arr, dtype=np.float32)
         mosaic_arr[~np.isfinite(mosaic_arr)] = np.nan
         nanized_mask = coverage_arr <= 0
         if final_alpha_u8 is not None and final_alpha_u8.shape[:2] == coverage_arr.shape:
@@ -3412,7 +3535,7 @@ def load_image_with_optional_alpha(
 
     label = tile_label or _path_display_name(path)
     data = _ensure_hwc_master_tile(primary, label)
-    data = np.asarray(data, dtype=np.float32, order="C", copy=False)
+    data = np.asarray(data, dtype=np.float32, order="C")
 
     weights: np.ndarray | None = None
     if alpha is not None:
@@ -3449,7 +3572,7 @@ def load_image_with_optional_alpha(
                     data = np.where(invalid_mask, np.nan, data)
                 else:
                     data = np.where(invalid_mask[..., None], np.nan, data)
-    data = np.asarray(data, dtype=np.float32, order="C", copy=False)
+    data = np.asarray(data, dtype=np.float32, order="C")
 
     return data, weights, alpha
 
@@ -5046,7 +5169,7 @@ def _run_phase4_5_inter_master_merge(
                         continue
                     try:
                         arr, _, _ = load_image_with_optional_alpha(path, tile_label=_safe_basename(path))
-                        arr = np.asarray(arr, dtype=np.float32, copy=False)
+                        arr = np.asarray(arr, dtype=np.float32)
                         sources.append(_TileAffineSource(path=path, wcs=tile.wcs, data=arr))
                         valid_indices.append(idx_tile)
                     except Exception as exc:
@@ -5211,7 +5334,7 @@ def _run_phase4_5_inter_master_merge(
                             tile_label=_safe_basename(tile_obj.path),
                         )
                     if weight_map is not None:
-                        weight_map = np.asarray(weight_map, dtype=np.float32, copy=False)
+                        weight_map = np.asarray(weight_map, dtype=np.float32)
                     if arr.ndim == 2:
                         arr = arr[..., np.newaxis]
                     if arr.shape[-1] != channels:
@@ -5221,7 +5344,7 @@ def _run_phase4_5_inter_master_merge(
                             arr = arr[..., :1]
                         else:
                             arr = np.repeat(arr[..., :1], channels, axis=-1)
-                    arr = np.asarray(arr, dtype=np.float32, copy=False)
+                    arr = np.asarray(arr, dtype=np.float32)
                     corr = chunk_affine_corrections[idx_tile]
                     if corr:
                         try:
@@ -5507,7 +5630,7 @@ def _run_phase4_5_inter_master_merge(
 
             if norm_method in ("linear_fit", "sky_mean") and len(frames) >= 2:
                 try:
-                    ref_arr = np.asarray(frames[0], dtype=np.float32, copy=False)
+                    ref_arr = np.asarray(frames[0], dtype=np.float32)
                     if ref_arr.ndim == 2:
                         ref_arr = ref_arr[..., np.newaxis]
                     ref_channels = ref_arr.shape[-1]
@@ -5517,7 +5640,7 @@ def _run_phase4_5_inter_master_merge(
                         src_arr = frames[frame_idx]
                         if src_arr is None:
                             continue
-                        src_arr = np.asarray(src_arr, dtype=np.float32, copy=False)
+                        src_arr = np.asarray(src_arr, dtype=np.float32)
                         if src_arr.ndim == 2:
                             src_arr = src_arr[..., np.newaxis]
                         if src_arr.shape[-1] != ref_channels:
@@ -7125,7 +7248,7 @@ class CenterOutNormalizationContext:
     ) -> None:
         entry = _CenterPreviewEntry(
             tile_id=int(tile_id),
-            preview=None if preview is None else np.asarray(preview, dtype=np.float32, copy=True),
+            preview=None if preview is None else np.array(preview, dtype=np.float32, copy=True),
             wcs=preview_wcs,
             stats=stats.copy() if isinstance(stats, dict) else stats,
             mode=str(mode),
@@ -8849,6 +8972,10 @@ def _run_shared_phase45_phase5_pipeline(
                 parallel_plan=parallel_plan_phase5,
                 enable_tile_weighting=tile_weighting_enabled_flag,
                 tile_weight_mode=tile_weight_mode,
+                apply_radial_weight=bool(phase5_options.get("apply_radial_weight")),
+                radial_feather_fraction=float(phase5_options.get("radial_feather_fraction") or 0.8),
+                radial_shape_power=float(phase5_options.get("radial_shape_power") or 2.0),
+                min_radial_weight_floor=float(phase5_options.get("min_radial_weight_floor") or 0.0),
                 stats_callback=_emit_phase5_stats,
                 worker_config_cache=worker_config_cache,
                 gpu_safety_ctx_phase5=gpu_safety_ctx_phase5,
@@ -10525,7 +10652,7 @@ def reproject_tile_to_mosaic(
     if isinstance(weight_map, np.ndarray):
         try:
             alpha_weight_map = np.clip(
-                np.asarray(weight_map, dtype=np.float32, copy=False),
+                np.asarray(weight_map, dtype=np.float32),
                 0.0,
                 1.0,
             )
@@ -12105,9 +12232,18 @@ def create_master_tile(
         _PH3_CONCURRENCY_SEMAPHORE.acquire()
     except Exception:
         pass
+    propagate_mask_for_coverage = bool(altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE)
+    if debug_tile:
+        pcb_tile(
+            f"MT_COVERAGE: propagate_mask={propagate_mask_for_coverage}",
+            prog=None,
+            lvl="DEBUG_DETAIL",
+            tile_id=int(tile_id),
+        )
     aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
         image_data_list=tile_images_data_HWC_adu,
         reference_image_index=reference_image_index_in_group,
+        propagate_mask=propagate_mask_for_coverage,
         progress_callback=progress_callback
     )
     if failed_alignment_indices:
@@ -12160,6 +12296,69 @@ def create_master_tile(
                     str(tile_id),
                     n_used_for_stack,
                 )
+        except Exception:
+            pass
+
+    coverage_count_hw: np.ndarray | None = None
+    coverage_ignore_reason: str | None = None
+    if propagate_mask_for_coverage:
+        try:
+            first_img = valid_aligned_images[0]
+            if not (isinstance(first_img, np.ndarray) and first_img.ndim >= 2):
+                coverage_ignore_reason = "invalid_first_image"
+            else:
+                h0, w0 = first_img.shape[:2]
+                for img in valid_aligned_images:
+                    if not (isinstance(img, np.ndarray) and img.ndim >= 2 and img.shape[:2] == (h0, w0)):
+                        coverage_ignore_reason = f"shape_mismatch:{getattr(img, 'shape', None)}"
+                        break
+
+                if coverage_ignore_reason is None:
+                    cov = np.zeros((h0, w0), dtype=np.float32)
+                    for img in valid_aligned_images:
+                        if img.ndim == 3 and img.shape[-1] >= 3:
+                            valid2d = np.isfinite(img[..., 0]) & np.isfinite(img[..., 1]) & np.isfinite(img[..., 2])
+                        else:
+                            valid2d = np.isfinite(img)
+                        np.add(cov, valid2d, out=cov, casting="unsafe")
+
+                    cov_max = float(np.nanmax(cov)) if cov.size else 0.0
+                    if not math.isfinite(cov_max) or cov_max <= 0.0:
+                        coverage_ignore_reason = "max_coverage_nonpositive"
+                    else:
+                        coverage_count_hw = cov
+                        if debug_tile:
+                            cov_min = float(np.nanmin(cov)) if cov.size else 0.0
+                            nz_frac = float(np.count_nonzero(cov) / cov.size) if cov.size else 0.0
+                            pcb_tile(
+                                f"MT_COVERAGE_STATS: tile={tile_id} shape={cov.shape} "
+                                f"min={cov_min:.1f} max={cov_max:.1f} nonzero_frac={nz_frac:.3f} "
+                                f"n_used={n_used_for_stack}",
+                                prog=None,
+                                lvl="DEBUG_DETAIL",
+                            )
+        except Exception as exc:
+            coverage_ignore_reason = f"coverage_exception:{type(exc).__name__}"
+
+        if coverage_count_hw is None and debug_tile:
+            pcb_tile(
+                f"MT_COVERAGE_IGNORED: tile={tile_id} reason={coverage_ignore_reason or 'unknown'}",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+            )
+
+    # If we nanized aligned images for coverage, clean them before stacking to avoid stacker ERROR logs.
+    if propagate_mask_for_coverage:
+        try:
+            for idx_img, img in enumerate(valid_aligned_images):
+                if isinstance(img, np.ndarray):
+                    valid_aligned_images[idx_img] = np.nan_to_num(
+                        img,
+                        copy=False,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ).astype(np.float32, copy=False)
         except Exception:
             pass
 
@@ -12377,6 +12576,27 @@ def create_master_tile(
                 else:
                     master_tile_stacked_HWC = cropped
                 quality_crop_rect = (int(y0), int(x0), int(y1), int(x1))
+                if coverage_count_hw is not None:
+                    try:
+                        if coverage_count_hw.shape == (h_lum, w_lum):
+                            coverage_count_hw = coverage_count_hw[int(y0) : int(y1), int(x0) : int(x1)]
+                        else:
+                            if debug_tile:
+                                pcb_tile(
+                                    f"MT_COVERAGE_IGNORED: tile={tile_id} reason=shape_mismatch_after_quality_crop "
+                                    f"cov_shape={getattr(coverage_count_hw, 'shape', None)} expected={(h_lum, w_lum)}",
+                                    prog=None,
+                                    lvl="DEBUG_DETAIL",
+                                )
+                            coverage_count_hw = None
+                    except Exception as exc:
+                        if debug_tile:
+                            pcb_tile(
+                                f"MT_COVERAGE_IGNORED: tile={tile_id} reason=coverage_crop_exception:{type(exc).__name__}",
+                                prog=None,
+                                lvl="DEBUG_DETAIL",
+                            )
+                        coverage_count_hw = None
 
                 if wcs_for_master_tile is not None:
                     try:
@@ -12427,6 +12647,111 @@ def create_master_tile(
     lecropper_pipeline_requested = bool(quality_crop_enabled_effective or altaz_cleanup_enabled_effective)
     lecropper_applied = False
     if lecropper_pipeline_requested and _LECROPPER_AVAILABLE:
+        coverage_for_lecropper: np.ndarray | None = None
+        coverage_reject_reason: str | None = None
+        coverage_max_val: float | None = None
+        if altaz_cleanup_enabled_effective and coverage_count_hw is not None and isinstance(master_tile_stacked_HWC, np.ndarray):
+            try:
+                cov_arr = np.asarray(coverage_count_hw, dtype=np.float32)
+                if cov_arr.ndim != 2:
+                    coverage_reject_reason = f"coverage_not_2d:{cov_arr.ndim}"
+                elif cov_arr.shape != master_tile_stacked_HWC.shape[:2]:
+                    coverage_reject_reason = f"coverage_shape_mismatch:{cov_arr.shape} vs {master_tile_stacked_HWC.shape[:2]}"
+                else:
+                    coverage_max_val = float(np.nanmax(cov_arr)) if cov_arr.size else 0.0
+                    if not math.isfinite(coverage_max_val) or coverage_max_val <= 0.0:
+                        coverage_reject_reason = "coverage_max_nonpositive"
+                    else:
+                        coverage_for_lecropper = cov_arr
+            except Exception as exc:
+                coverage_reject_reason = f"coverage_exception:{type(exc).__name__}"
+
+        if coverage_for_lecropper is None and coverage_count_hw is not None and debug_tile:
+            pcb_tile(
+                f"MT_COVERAGE_IGNORED: tile={tile_id} reason={coverage_reject_reason or 'unknown'}",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+            )
+
+        # Coverage thresholds (defaults are conservative and limited to Master Tiles).
+        altaz_min_coverage_abs_effective = 3.0
+        altaz_min_coverage_frac_effective = 0.5
+        altaz_morph_open_px_effective = 3
+        altaz_alpha_soft_threshold_effective = 1e-3
+        altaz_nanize_threshold_effective = 1e-3
+        try:
+            altaz_min_coverage_abs_effective = float(
+                getattr(zconfig, "altaz_min_coverage_abs", altaz_min_coverage_abs_effective)
+            )
+        except Exception:
+            altaz_min_coverage_abs_effective = 3.0
+        if not math.isfinite(altaz_min_coverage_abs_effective):
+            altaz_min_coverage_abs_effective = 3.0
+        altaz_min_coverage_abs_effective = max(0.0, altaz_min_coverage_abs_effective)
+
+        try:
+            altaz_min_coverage_frac_effective = float(
+                getattr(zconfig, "altaz_min_coverage_frac", altaz_min_coverage_frac_effective)
+            )
+        except Exception:
+            altaz_min_coverage_frac_effective = 0.5
+        if not math.isfinite(altaz_min_coverage_frac_effective):
+            altaz_min_coverage_frac_effective = 0.5
+        altaz_min_coverage_frac_effective = float(np.clip(altaz_min_coverage_frac_effective, 0.0, 1.0))
+
+        try:
+            altaz_morph_open_px_effective = int(
+                getattr(zconfig, "altaz_morph_open_px", altaz_morph_open_px_effective)
+            )
+        except Exception:
+            altaz_morph_open_px_effective = 3
+        altaz_morph_open_px_effective = max(0, int(altaz_morph_open_px_effective))
+
+        # Keep alpha / nanize thresholds configurable and coherent.
+        try:
+            altaz_alpha_soft_threshold_effective = float(
+                getattr(zconfig, "altaz_alpha_soft_threshold", altaz_alpha_soft_threshold_effective)
+            )
+        except Exception:
+            altaz_alpha_soft_threshold_effective = 1e-3
+        if not math.isfinite(altaz_alpha_soft_threshold_effective):
+            altaz_alpha_soft_threshold_effective = 1e-3
+        else:
+            altaz_alpha_soft_threshold_effective = float(
+                np.clip(altaz_alpha_soft_threshold_effective, 0.0, 1.0)
+            )
+
+        try:
+            altaz_nanize_threshold_effective = float(
+                getattr(zconfig, "altaz_nanize_threshold", altaz_alpha_soft_threshold_effective)
+            )
+        except Exception:
+            altaz_nanize_threshold_effective = altaz_alpha_soft_threshold_effective
+        if not math.isfinite(altaz_nanize_threshold_effective):
+            altaz_nanize_threshold_effective = altaz_alpha_soft_threshold_effective
+        else:
+            altaz_nanize_threshold_effective = float(
+                np.clip(altaz_nanize_threshold_effective, 0.0, 1.0)
+            )
+
+        # Clamp abs threshold to the actual max coverage / frames used (prevents a fully empty mask).
+        if coverage_for_lecropper is not None and coverage_max_val is not None:
+            try:
+                cap = float(min(float(n_used_for_stack), float(coverage_max_val)))
+                if math.isfinite(cap) and cap > 0.0:
+                    altaz_min_coverage_abs_effective = float(min(altaz_min_coverage_abs_effective, cap))
+            except Exception:
+                pass
+
+        if debug_tile and coverage_for_lecropper is not None:
+            pcb_tile(
+                f"MT_COVERAGE_THRESH: tile={tile_id} cov_max={coverage_max_val:.1f} "
+                f"min_abs={altaz_min_coverage_abs_effective:.1f} min_frac={altaz_min_coverage_frac_effective:.3f} "
+                f"morph_open_px={altaz_morph_open_px_effective}",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+            )
+
         pipeline_cfg = {
             "quality_crop_enabled": quality_crop_enabled_effective,
             "quality_crop_band_px": quality_crop_band_px,
@@ -12437,8 +12762,20 @@ def create_master_tile(
             "altaz_margin_percent": altaz_margin_percent,
             "altaz_decay": altaz_decay,
             "altaz_nanize": altaz_nanize,
+            "altaz_alpha_soft_threshold": altaz_alpha_soft_threshold_effective,
+            "altaz_nanize_threshold": altaz_nanize_threshold_effective,
+            "altaz_min_coverage_abs": altaz_min_coverage_abs_effective,
+            "altaz_min_coverage_frac": altaz_min_coverage_frac_effective,
+            "altaz_morph_open_px": altaz_morph_open_px_effective,
         }
-        master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+        master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(
+            master_tile_stacked_HWC,
+            pipeline_cfg,
+            coverage=coverage_for_lecropper,
+            altaz_min_coverage_abs=altaz_min_coverage_abs_effective,
+            altaz_min_coverage_frac=altaz_min_coverage_frac_effective,
+            altaz_morph_open_px=altaz_morph_open_px_effective,
+        )
         lecropper_applied = True
 
     try:
@@ -13340,7 +13677,7 @@ def assemble_final_mosaic_incremental(
                     if alpha_tile is None or alpha_tile.shape != W_tile.shape:
                         alpha_tile = np.where(W_tile > 0, 1.0, 0.0).astype(np.float32, copy=False)
                     else:
-                        alpha_tile = np.clip(np.asarray(alpha_tile, dtype=np.float32, copy=False), 0.0, 1.0)
+                        alpha_tile = np.clip(np.asarray(alpha_tile, dtype=np.float32), 0.0, 1.0)
                     tgt_alpha = falpha[ymin:ymax, xmin:xmax]
                     np.maximum(tgt_alpha, alpha_tile, out=tgt_alpha)
                     tiles_since_flush += 1
@@ -13582,6 +13919,10 @@ def assemble_final_mosaic_reproject_coadd(
     existing_master_tiles_mode: bool = False,
     worker_config_cache: dict | None = None,
     gpu_safety_ctx_phase5: GpuRuntimeContext | None = None,
+    apply_radial_weight: bool = False,
+    radial_feather_fraction: float = 0.8,
+    radial_shape_power: float = 2.0,
+    min_radial_weight_floor: float = 0.0,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -13964,7 +14305,7 @@ def assemble_final_mosaic_reproject_coadd(
             else:
                 valid2d = alpha_mask_arr > ALPHA_OPACITY_THRESHOLD
                 alpha_weight2d = valid2d.astype(np.float32, copy=False)
-                data = np.asarray(data, dtype=np.float32, order="C", copy=True)
+                data = np.array(data, dtype=np.float32, order="C", copy=True)
                 if data.ndim == 3:
                     data[~valid2d, :] = 0.0
                 else:
@@ -14140,7 +14481,7 @@ def assemble_final_mosaic_reproject_coadd(
             if mask is None:
                 return None
             try:
-                mask_arr = np.asarray(mask, dtype=np.float32, order="C", copy=False)
+                mask_arr = np.asarray(mask, dtype=np.float32, order="C")
             except Exception:
                 return None
             if mask_arr.ndim > 2:
@@ -14152,7 +14493,7 @@ def assemble_final_mosaic_reproject_coadd(
             data = entry.get("data")
             if tile_wcs is None or data is None:
                 return None
-            data_arr = np.asarray(data, dtype=np.float32, order="C", copy=False)
+            data_arr = np.asarray(data, dtype=np.float32, order="C")
             if data_arr.ndim != 3:
                 return None
             mask_arr = _resolve_mask(entry)
@@ -14275,7 +14616,7 @@ def assemble_final_mosaic_reproject_coadd(
             gains = anchor_med / tile_med
             gains = np.clip(gains, gain_clip[0], gain_clip[1])
             try:
-                data_arr = np.asarray(entry["data"], dtype=np.float32, order="C", copy=False)
+                data_arr = np.asarray(entry["data"], dtype=np.float32, order="C")
             except Exception:
                 continue
             applied_channels = 0
@@ -14311,16 +14652,19 @@ def assemble_final_mosaic_reproject_coadd(
         )
 
     # Optional inter-tile photometric (gain/offset) calibration
+    affine_from_user = bool(tile_affine_corrections)
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
         tile_affine_corrections,
         len(effective_tiles),
     )
+    affine_from_user = bool(affine_from_user and pending_affine_list)
 
     if (
         pending_affine_list is None
         and intertile_photometric_match
         and len(effective_tiles) >= 2
     ):
+        affine_from_user = False
         tile_sources = []
         tile_weights_for_sources: list[float] = []
         for entry in effective_tiles:
@@ -14441,6 +14785,7 @@ def assemble_final_mosaic_reproject_coadd(
             anchor_shift_applied=anchor_shift_applied,
             global_anchor_shift=global_anchor_shift,
         )
+        clamp_affine = bool(match_bg and not affine_from_user)
         if use_gpu:
             # GPU path regression fix: apply computed affine gain/offset to tile data,
             # mirroring the CPU branch behavior (including clamping + callback).
@@ -14465,7 +14810,7 @@ def assemble_final_mosaic_reproject_coadd(
                     gain_to_apply = float(gain_val)
                     offset_to_apply = float(offset_val)
 
-                    if match_bg:
+                    if clamp_affine:
                         gain_before = gain_to_apply
                         offset_before = offset_to_apply
 
@@ -14475,15 +14820,12 @@ def assemble_final_mosaic_reproject_coadd(
                         elif gain_to_apply > gain_limit_max:
                             gain_to_apply = gain_limit_max
 
-                        # clamp / cancel offset
+                        # clamp offset
                         if affine_offset_limit_adu > 0.0:
-                            if abs(offset_to_apply) > affine_offset_limit_adu:
-                                offset_to_apply = 0.0
-                            else:
-                                if offset_to_apply < -affine_offset_limit_adu:
-                                    offset_to_apply = -affine_offset_limit_adu
-                                elif offset_to_apply > affine_offset_limit_adu:
-                                    offset_to_apply = affine_offset_limit_adu
+                            offset_to_apply = max(
+                                -affine_offset_limit_adu,
+                                min(offset_to_apply, affine_offset_limit_adu),
+                            )
 
                         # callback when clamped
                         if (gain_to_apply != gain_before) or (offset_to_apply != offset_before):
@@ -14547,7 +14889,7 @@ def assemble_final_mosaic_reproject_coadd(
                     arr_np = np.asarray(tile_entry["data"], dtype=np.float32, order="C")
                     gain_to_apply = float(gain_val)
                     offset_to_apply = float(offset_val)
-                    if match_bg:
+                    if clamp_affine:
                         gain_before = gain_to_apply
                         offset_before = offset_to_apply
                         if gain_to_apply < gain_limit_min:
@@ -14891,7 +15233,7 @@ def assemble_final_mosaic_reproject_coadd(
                     coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
                     if coverage_mask is not None:
                         try:
-                            weight_candidate = np.asarray(coverage_mask, dtype=np.float32, order="C", copy=False)
+                            weight_candidate = np.asarray(coverage_mask, dtype=np.float32, order="C")
                             if weight_candidate.shape == data_plane.shape:
                                 weight2d = np.clip(
                                     np.nan_to_num(weight_candidate, nan=0.0, posinf=0.0, neginf=0.0),
@@ -14903,6 +15245,36 @@ def assemble_final_mosaic_reproject_coadd(
                             weight2d = None
                     if weight2d is None:
                         weight2d = np.ones_like(data_plane, dtype=np.float32)
+
+                if (
+                    apply_radial_weight
+                    and ZEMOSAIC_UTILS_AVAILABLE
+                    and zemosaic_utils
+                    and hasattr(zemosaic_utils, "make_radial_weight_map")
+                ):
+                    radial2d = entry.get("radial_weight2d") if isinstance(entry, dict) else None
+                    if radial2d is None:
+                        try:
+                            radial2d = zemosaic_utils.make_radial_weight_map(
+                                int(data_plane.shape[0]),
+                                int(data_plane.shape[1]),
+                                feather_fraction=float(radial_feather_fraction),
+                                shape_power=float(radial_shape_power),
+                                min_weight_floor=float(min_radial_weight_floor),
+                                progress_callback=_pcb if progress_callback else None,
+                            )
+                            radial2d = np.asarray(radial2d, dtype=np.float32)
+                            if radial2d.shape != data_plane.shape:
+                                radial2d = None
+                        except Exception:
+                            radial2d = None
+                        if radial2d is not None and isinstance(entry, dict):
+                            entry["radial_weight2d"] = radial2d
+                    if isinstance(radial2d, np.ndarray) and radial2d.shape == weight2d.shape:
+                        weight2d = (weight2d.astype(np.float32, copy=False) * radial2d).astype(
+                            np.float32, copy=False
+                        )
+                        weight_source_base = f"{weight_source_base}*radial"
                 if tile_weighting_applied:
                     try:
                         tw_raw = entry.get("tile_weight", 1.0) if isinstance(entry, dict) else 1.0
@@ -15255,7 +15627,7 @@ def assemble_final_mosaic_reproject_coadd(
             logger.debug("alpha_from_coverage: override skipped due to error: %s", exc_alpha_cov)
     if existing_master_tiles_mode and mosaic_data is not None and isinstance(coverage, np.ndarray):
         try:
-            data_arr = np.asarray(mosaic_data, dtype=np.float32, copy=False)
+            data_arr = np.asarray(mosaic_data, dtype=np.float32)
             cov_mask_bool = np.asarray(coverage, dtype=np.float32, order="C")
             cov_mask_bool = np.nan_to_num(cov_mask_bool, nan=0.0, posinf=0.0, neginf=0.0) > 0.0
             if data_arr.ndim >= 2 and cov_mask_bool.shape == data_arr.shape[:2]:
@@ -15313,7 +15685,7 @@ def assemble_final_mosaic_reproject_coadd(
         except Exception:
             alpha_zero_mask = None
     if mosaic_data is not None and coverage is not None:
-        mosaic_data = np.asarray(mosaic_data, dtype=np.float32, copy=False)
+        mosaic_data = np.asarray(mosaic_data, dtype=np.float32)
         mosaic_data[~np.isfinite(mosaic_data)] = np.nan
         nanized_mask = coverage <= 0
         if alpha_zero_mask is not None:
@@ -15380,7 +15752,7 @@ def _load_master_tiles_for_two_pass(
                 alpha_arr = alpha_arr / max_alpha
             coverage_map = np.clip(alpha_arr, 0.0, 1.0).astype(np.float32, copy=False)
         else:
-            arr_np = np.asarray(data, dtype=np.float32, copy=False)
+            arr_np = np.asarray(data, dtype=np.float32)
             mask_valid = np.any(np.isfinite(arr_np), axis=-1) if arr_np.ndim == 3 else np.isfinite(arr_np)
             coverage_map = mask_valid.astype(np.float32)
         current_wcs = tile_wcs
@@ -15643,8 +16015,8 @@ def _compute_tile_gain_task(args: tuple) -> tuple[int, float]:
     if shape[0] <= 0 or shape[1] <= 0:
         return idx, 1.0
     try:
-        coverage_global = np.asarray(coverage_arr, dtype=np.float32, copy=False)
-        coverage_blur_global = np.asarray(coverage_blur, dtype=np.float32, copy=False)
+        coverage_global = np.asarray(coverage_arr, dtype=np.float32)
+        coverage_blur_global = np.asarray(coverage_blur, dtype=np.float32)
     except Exception:
         return idx, 1.0
     if coverage_global.shape != tuple(coverage_shape) or coverage_blur_global.shape != tuple(coverage_shape):
@@ -15655,7 +16027,7 @@ def _compute_tile_gain_task(args: tuple) -> tuple[int, float]:
             return idx, 1.0
     cov_arr = None
     if coverage_src is not None:
-        cov_arr = np.asarray(coverage_src, dtype=np.float32, copy=False)
+        cov_arr = np.asarray(coverage_src, dtype=np.float32)
         if cov_arr.ndim > 2:
             cov_arr = np.squeeze(cov_arr)
     if cov_arr is None:
@@ -15830,7 +16202,7 @@ def compute_per_tile_gains_from_coverage(
     )
     with np.errstate(divide="ignore", invalid="ignore"):
         cov_blur = np.where(cov_blur_den > 0, cov_blur_num / cov_blur_den, 0.0)
-    cov_blur = np.asarray(cov_blur, dtype=np.float32, copy=False)
+    cov_blur = np.asarray(cov_blur, dtype=np.float32)
     if logger:
         logger.debug(
             "[TwoPass] Normalized coverage blur applied with sigma=%d using %s/%s (rows_per_chunk=%d, chunk_bytes=%s)",
@@ -16573,8 +16945,9 @@ def run_second_pass_coverage_renorm(
             try:
                 mosaics, covs = _run_channels(use_gpu)
                 backend_used_gpu = bool(use_gpu)
-            except Exception:
+            except Exception as gpu_exc:
                 if use_gpu:
+                    _disable_phase5_gpu_runtime_state("two_pass_gpu_failure", gpu_exc)
                     mosaics, covs = _run_channels(False)
                     backend_used_gpu = False
                 else:
@@ -16585,6 +16958,7 @@ def run_second_pass_coverage_renorm(
                     mosaics, covs = _run_channels(True)
                     backend_used_gpu = True
                 except Exception as gpu_exc:
+                    _disable_phase5_gpu_runtime_state("two_pass_gpu_failure", gpu_exc)
                     if logger:
                         logger.warning(
                             "[TwoPass] GPU reprojection failed on one or more channels; rerunning all channels on CPU to avoid mixed backend (%s)",
@@ -16623,9 +16997,9 @@ def run_second_pass_coverage_renorm(
         force=True,
         stage="reproject_done",
     )
-    coverage_result = np.asarray(coverage_result, dtype=np.float32, copy=False)
+    coverage_result = np.asarray(coverage_result, dtype=np.float32)
     coverage_result = np.where(np.isfinite(coverage_result), coverage_result, 0.0).astype(np.float32, copy=False)
-    mosaic = np.asarray(mosaic, dtype=np.float32, copy=False)
+    mosaic = np.asarray(mosaic, dtype=np.float32)
     mosaic[~np.isfinite(mosaic)] = np.nan
     nanized_mask = coverage_result <= 0
     nanized_pixels = int(np.count_nonzero(nanized_mask))
@@ -20160,7 +20534,7 @@ def run_hierarchical_mosaic_classic_legacy(
             return
         if alpha_final is not None:
             try:
-                alpha_arr = np.asarray(alpha_final, dtype=np.float32, copy=False)
+                alpha_arr = np.asarray(alpha_final, dtype=np.float32)
                 nz_frac = float(np.count_nonzero(alpha_arr) / alpha_arr.size) if alpha_arr.size else 0.0
                 alpha_min_val = float(np.nanmin(alpha_arr)) if alpha_arr.size else 0.0
                 alpha_max_val = float(np.nanmax(alpha_arr)) if alpha_arr.size else 0.0
@@ -20437,7 +20811,7 @@ def run_hierarchical_mosaic_classic_legacy(
 
             if alpha_final is not None:
                 try:
-                    alpha_src = np.asarray(alpha_final, dtype=np.uint8, copy=False)
+                    alpha_src = np.asarray(alpha_final, dtype=np.uint8)
                     if alpha_src.ndim == 3 and alpha_src.shape[-1] == 1:
                         alpha_src = alpha_src[..., 0]
                     elif alpha_src.ndim > 2:
@@ -24599,7 +24973,7 @@ def run_hierarchical_mosaic(
 
             if alpha_final is not None:
                 try:
-                    alpha_src = np.asarray(alpha_final, dtype=np.uint8, copy=False)
+                    alpha_src = np.asarray(alpha_final, dtype=np.uint8)
                     if alpha_src.ndim == 3 and alpha_src.shape[-1] == 1:
                         alpha_src = alpha_src[..., 0]
                     elif alpha_src.ndim > 2:
@@ -25967,9 +26341,9 @@ def _assemble_global_mosaic_first_impl(
             if len(final_channels) == 1
             else np.stack(final_channels, axis=-1)
         )
-        final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+        final_image = np.asarray(final_image, dtype=np.float32)
         final_image[~np.isfinite(final_image)] = np.nan
-        coverage_map = np.asarray(coverage_map, dtype=np.float32, copy=False)
+        coverage_map = np.asarray(coverage_map, dtype=np.float32)
         coverage_map = np.where(np.isfinite(coverage_map), coverage_map, 0.0)
         alpha_map = None
         if np.any(coverage_map > 0):
@@ -26179,7 +26553,7 @@ def _assemble_global_mosaic_first_impl(
             weight_expanded = np.expand_dims(weight_grid, axis=-1)
             with np.errstate(invalid="ignore", divide="ignore"):
                 result = sum_grid / weight_expanded
-            result = np.asarray(result, dtype=np.float32, copy=False)
+            result = np.asarray(result, dtype=np.float32)
             result[~np.isfinite(result)] = np.nan
             result = np.where(weight_grid[..., None] > 0, result, np.nan)
             coverage = np.where(np.isfinite(weight_grid), weight_grid, 0.0).astype(np.float32, copy=False)
@@ -26190,8 +26564,8 @@ def _assemble_global_mosaic_first_impl(
             with np.errstate(invalid="ignore", divide="ignore"):
                 mean_map = sum_grid / weight_expanded
                 second_moment = sumsq_grid / weight_expanded
-            mean_map = np.asarray(mean_map, dtype=np.float32, copy=False)
-            second_moment = np.asarray(second_moment, dtype=np.float32, copy=False)
+            mean_map = np.asarray(mean_map, dtype=np.float32)
+            second_moment = np.asarray(second_moment, dtype=np.float32)
             mean_map[~np.isfinite(mean_map)] = np.nan
             second_moment[~np.isfinite(second_moment)] = np.nan
             variance = np.maximum(second_moment - (mean_map ** 2), 0.0)
@@ -26228,7 +26602,7 @@ def _assemble_global_mosaic_first_impl(
                 clipped,
                 mean_map,
             )
-            clipped = np.asarray(clipped, dtype=np.float32, copy=False)
+            clipped = np.asarray(clipped, dtype=np.float32)
             clipped[~np.isfinite(clipped)] = np.nan
             coverage_base = np.where(clip_weight > 0, clip_weight, weight_grid)
             coverage = np.where(np.isfinite(coverage_base), coverage_base, 0.0).astype(np.float32, copy=False)
@@ -26297,7 +26671,7 @@ def _assemble_global_mosaic_first_impl(
                     chunk_weight = np.nansum(weight_stack, axis=0)
                     with np.errstate(invalid="ignore", divide="ignore"):
                         chunk_result = np.nansum(weighted, axis=0) / np.expand_dims(chunk_weight, axis=-1)
-                chunk_result = np.asarray(chunk_result, dtype=np.float32, copy=False)
+                chunk_result = np.asarray(chunk_result, dtype=np.float32)
                 chunk_result[~np.isfinite(chunk_result)] = np.nan
                 chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0).astype(np.float32, copy=False)
                 invalid = chunk_weight <= 0
@@ -26317,9 +26691,9 @@ def _assemble_global_mosaic_first_impl(
         if final_image is None or coverage_map is None:
             return _fail("global_coadd_error_finalize_failed")
 
-        final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+        final_image = np.asarray(final_image, dtype=np.float32)
         final_image[~np.isfinite(final_image)] = np.nan
-        coverage_map = np.asarray(coverage_map, dtype=np.float32, copy=False)
+        coverage_map = np.asarray(coverage_map, dtype=np.float32)
         coverage_map = np.where(np.isfinite(coverage_map), coverage_map, 0.0)
         alpha_map = None
         if np.any(coverage_map > 0):
@@ -26537,7 +26911,7 @@ def assemble_global_mosaic_sds(
         if coverage_arr is None:
             return None
         try:
-            arr = np.asarray(coverage_arr, dtype=np.float32, copy=False)
+            arr = np.asarray(coverage_arr, dtype=np.float32)
             if arr.ndim != 2:
                 arr = np.squeeze(arr)
             if arr.ndim != 2:
@@ -26598,11 +26972,11 @@ def assemble_global_mosaic_sds(
         if not tile_dir:
             return None
         tile_path = Path(tile_dir) / f"sds_tile_{tile_index:04d}.fits"
-        tile_data = np.asarray(mosaic_arr[y0:y1, x0:x1], dtype=np.float32, copy=False)
+        tile_data = np.asarray(mosaic_arr[y0:y1, x0:x1], dtype=np.float32)
         alpha_tile = None
         if alpha_arr is not None:
             try:
-                alpha_tile = np.asarray(alpha_arr[y0:y1, x0:x1], dtype=np.uint8, copy=False)
+                alpha_tile = np.asarray(alpha_arr[y0:y1, x0:x1], dtype=np.uint8)
             except Exception:
                 alpha_tile = np.asarray(alpha_arr[y0:y1, x0:x1], dtype=np.uint8)
         header = None
@@ -26863,7 +27237,7 @@ def assemble_global_mosaic_sds(
     def _safe_asarray(payload, *, dtype=np.float32):
         try:
             return np.asarray(payload, dtype=dtype, copy=False)
-        except ValueError:
+        except (TypeError, ValueError):
             return np.asarray(payload, dtype=dtype)
 
     mosaics: list[np.ndarray] = []
@@ -27089,7 +27463,7 @@ def assemble_global_mosaic_sds(
             coverage_payload = None
             if idx < len(coverages):
                 cov_arr = coverages[idx]
-                coverage_payload = np.asarray(cov_arr, dtype=np.float32, copy=True) if cov_arr is not None else None
+                coverage_payload = np.array(cov_arr, dtype=np.float32, copy=True) if cov_arr is not None else None
             tile_pairs.append((mosaic, wcs_clone, coverage_payload))
         postprocess_context["two_pass_tile_pairs"] = tile_pairs
         if tile_records:
@@ -27101,7 +27475,7 @@ def assemble_global_mosaic_sds(
         if cov_arr is None:
             return float(max(1, batch_len))
         try:
-            arr = np.asarray(cov_arr, dtype=np.float32, copy=False)
+            arr = np.asarray(cov_arr, dtype=np.float32)
             if arr.ndim != 2:
                 arr = np.squeeze(arr)
             if arr.ndim != 2:
@@ -27160,7 +27534,7 @@ def assemble_global_mosaic_sds(
                 winsor_max_workers=winsor_workers,
                 parallel_plan=parallel_plan,
             )
-            return np.asarray(stacked, dtype=np.float32, copy=False)
+            return np.asarray(stacked, dtype=np.float32)
 
         if algo == "kappa_sigma" and hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
             stacked, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
@@ -27172,7 +27546,7 @@ def assemble_global_mosaic_sds(
                 sigma_high=kappa_high,
                 parallel_plan=parallel_plan,
             )
-            return np.asarray(stacked, dtype=np.float32, copy=False)
+            return np.asarray(stacked, dtype=np.float32)
 
         stack_cube = np.stack(mosaics, axis=0).astype(np.float32, copy=False)
         if len(mosaics) == 1:
@@ -27188,7 +27562,7 @@ def assemble_global_mosaic_sds(
         pcb("sds_error_final_stack_failed", prog=None, lvl="ERROR", error=str(exc))
         return None, None, None
 
-    final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+    final_image = np.asarray(final_image, dtype=np.float32)
 
     final_coverage = None
     for cov in coverages:

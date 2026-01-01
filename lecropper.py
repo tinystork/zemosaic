@@ -325,7 +325,7 @@ def _build_low_signal_border_mask(
     if H <= 0 or W <= 0:
         raise ValueError("spatial dimensions must be positive")
 
-    arr_f = np.asarray(arr, dtype=np.float32, copy=False)
+    arr_f = np.asarray(arr, dtype=np.float32)
     arr_f = np.nan_to_num(arr_f, nan=0.0, posinf=0.0, neginf=0.0)
 
     if arr_f.ndim == 2:
@@ -773,7 +773,7 @@ def mask_altaz_artifacts(
 
     mask2d = None
     if coverage_mask is not None:
-        mask2d = np.asarray(coverage_mask, dtype=np.float32, copy=False)
+        mask2d = np.asarray(coverage_mask, dtype=np.float32)
     else:
         try:
             mask2d = _build_low_signal_border_mask(
@@ -1246,7 +1246,7 @@ def save_cropped_fits(
             cropped, mask = masked_result, None
 
         if mask is not None:
-            mask = np.asarray(mask, dtype=np.float32, copy=False)
+            mask = np.asarray(mask, dtype=np.float32)
             if altaz_use_nan:
                 cropped = np.where(mask <= hard_threshold, np.nan, cropped)
             # NOTE [DO-NOT-REMOVE (alpha mask)]: this alpha map is consumed

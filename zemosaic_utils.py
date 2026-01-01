@@ -3160,7 +3160,7 @@ def load_and_validate_fits(filepath,
                     alpha_mask = np.asarray(hdu_extra.data)
                     if alpha_mask.ndim > 2:
                         alpha_mask = alpha_mask[..., 0]
-                    alpha_mask = np.asarray(alpha_mask, dtype=np.uint8, copy=False)
+                    alpha_mask = np.asarray(alpha_mask, dtype=np.uint8)
                     break
             if alpha_mask is not None:
                 info["alpha_mask"] = alpha_mask
@@ -4299,7 +4299,7 @@ def save_fits_image(image_data: np.ndarray,
 
     if alpha_mask is not None:
         try:
-            alpha_arr = np.asarray(alpha_mask, dtype=np.uint8, copy=False)
+            alpha_arr = np.asarray(alpha_mask, dtype=np.uint8)
             if alpha_arr.ndim > 2:
                 alpha_arr = alpha_arr[..., 0]
             alpha_hdu = current_fits_module.ImageHDU(alpha_arr, name="ALPHA")
@@ -5213,6 +5213,45 @@ def _reproject_and_coadd_wrapper_impl(
                 if local_max > max_val:
                     max_val = local_max
         return max_val if seen else None
+
+    # Support per-tile (per-pixel) weight maps without forwarding unknown kwargs into
+    # astropy-reproject (it would pass them down to reproject_function and crash).
+    tile_weight_maps = kwargs.pop("tile_weight_maps", None)
+    if tile_weight_maps is not None:
+        try:
+            twm_list = list(tile_weight_maps)
+        except Exception:
+            twm_list = [tile_weight_maps]
+        if len(twm_list) < len(data_list):
+            twm_list = twm_list + [None] * (len(data_list) - len(twm_list))
+        if len(twm_list) > len(data_list):
+            twm_list = twm_list[: len(data_list)]
+        existing_weights = kwargs.get("input_weights")
+        if existing_weights is None:
+            kwargs["input_weights"] = twm_list
+        else:
+            try:
+                existing_list = list(existing_weights)
+            except Exception:
+                existing_list = [existing_weights]
+            if len(existing_list) < len(data_list):
+                existing_list = existing_list + [None] * (len(data_list) - len(existing_list))
+            combined_weights = []
+            for idx in range(len(data_list)):
+                base = existing_list[idx]
+                twm = twm_list[idx]
+                if base is None:
+                    combined_weights.append(twm)
+                elif twm is None:
+                    combined_weights.append(base)
+                else:
+                    try:
+                        base_arr = np.asarray(base, dtype=np.float32)
+                        twm_arr = np.asarray(twm, dtype=np.float32)
+                        combined_weights.append(base_arr * twm_arr)
+                    except Exception:
+                        combined_weights.append(base)
+            kwargs["input_weights"] = combined_weights
 
     input_weights_raw = kwargs.get("input_weights")
     input_weight_max = _max_input_weight(input_weights_raw)

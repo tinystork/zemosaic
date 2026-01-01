@@ -230,7 +230,12 @@ DEFAULT_CONFIG = {
     "altaz_margin_percent": 5.0,  # UI: "AltAz margin %"
     "altaz_decay": 0.15,  # UI: "AltAz decay"
     "altaz_nanize": True,  # UI: "Alt-Az → NaN"
+    "altaz_alpha_soft_threshold": 0.001,
     "altaz_nanize_threshold": 0.001,
+    # --- Alt-Az coverage-based mask (Master Tiles) ---
+    "altaz_min_coverage_abs": 3.0,
+    "altaz_min_coverage_frac": 0.5,
+    "altaz_morph_open_px": 3,
     # --- Alt-Az Alpha export ---
     "altaz_export_alpha_fits": True,
     "altaz_export_alpha_sidecar": False,

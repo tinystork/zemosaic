@@ -258,7 +258,7 @@ def _broadcast_weight_template(weight_template: Any, target_shape: tuple[int, ..
 
     if weight_template is None:
         return None
-    w = np.asarray(weight_template, dtype=np.float32, copy=False)
+    w = np.asarray(weight_template, dtype=np.float32)
     if w.ndim == 0:
         w = w.reshape((1,))
     if w.ndim == 1 and target_shape[-1] == 3 and w.shape[0] == 3:
@@ -296,7 +296,7 @@ def _compute_radial_weight_map(
         shape_power = 2.0
     try:
         radial_2d = _make_radial_weight_map(height, width, feather_fraction=feather, shape_power=shape_power)
-        radial_2d = np.asarray(radial_2d, dtype=np.float32, copy=False)
+        radial_2d = np.asarray(radial_2d, dtype=np.float32)
         if channels == 1:
             return radial_2d[..., None]
         return np.repeat(radial_2d[..., None], channels, axis=2)
@@ -391,7 +391,7 @@ def _prepare_frames_and_weights(
     for frame in normalized_frames:
         if frame is None:
             continue
-        frame_f32 = np.asarray(frame, dtype=np.float32, copy=False)
+        frame_f32 = np.asarray(frame, dtype=np.float32)
         if not np.all(np.isfinite(frame_f32)):
             frame_f32 = np.nan_to_num(frame_f32, nan=0.0, posinf=0.0, neginf=0.0)
         filtered_frames.append(frame_f32 if frame_f32.flags.c_contiguous else np.ascontiguousarray(frame_f32))
@@ -449,7 +449,7 @@ def _prepare_frames_and_weights(
                 combined = radial_map
             else:
                 combined = radial_map * base
-            combined_weights.append(np.asarray(combined, dtype=np.float32, copy=False))
+            combined_weights.append(np.asarray(combined, dtype=np.float32))
 
         if combined_weights and all(w is not None for w in combined_weights):
             try:
