@@ -1952,7 +1952,8 @@ def estimate_sky_affine_to_ref(
     # fitted gain is non-positive, recompute a stable gain/offset from robust
     # statistics to avoid negative-flux master tiles on weak datasets.
     try:
-        corr = float(np.corrcoef(x_sel, y_sel)[0, 1])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            corr = float(np.corrcoef(x_sel, y_sel)[0, 1])
     except Exception:
         corr = float("nan")
 
