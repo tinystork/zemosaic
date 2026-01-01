@@ -269,6 +269,8 @@ _UNALIGNED_LOCK = Lock()
 
 ALPHA_OPACITY_THRESHOLD = 0.5  # Mask values >= threshold are treated as opaque
 QUALITY_GATE_ALPHA_SOFT_THRESHOLD = 0.85  # Partially transparent pixels are ignored during quality gate
+EMPTY_MASTER_TILE_EPS_SIGNAL = 1e-8
+EMPTY_MASTER_TILE_ALPHA_FRAC_THRESHOLD = 0.99
 
 GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
 GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
@@ -3513,6 +3515,152 @@ def _ensure_hwc_master_tile(
     return np.asarray(arr, dtype=np.float32, order="C")
 
 
+def _header_flag_is_set(header: Any | None, key: str) -> bool:
+    """Return True when *key* exists in *header* with a truthy value."""
+
+    if header is None:
+        return False
+    try:
+        value = header.get(key)
+    except Exception:
+        try:
+            value = header[key]
+        except Exception:
+            return False
+    flag = _coerce_bool_flag(value)
+    if flag is None:
+        return False
+    return bool(flag)
+
+
+def _is_master_tile_header(header: Any | None) -> bool:
+    """Return True when *header* identifies a Master Tile."""
+
+    if header is None:
+        return False
+    try:
+        zmt_type = header.get("ZMT_TYPE")
+    except Exception:
+        zmt_type = None
+    if zmt_type is not None:
+        try:
+            if str(zmt_type).strip().lower() == "master tile":
+                return True
+        except Exception:
+            pass
+    try:
+        if "ZMT_ID" in header:
+            return True
+    except Exception:
+        try:
+            return header.get("ZMT_ID") is not None
+        except Exception:
+            return False
+    return False
+
+
+def _detect_empty_master_tile(
+    rgb_hwc: np.ndarray | None,
+    alpha_u8: np.ndarray | None = None,
+    *,
+    sum_weights: np.ndarray | None = None,
+    eps_signal: float = EMPTY_MASTER_TILE_EPS_SIGNAL,
+    min_valid_frac: float = 0.0,
+    std_min: float | None = None,
+) -> tuple[bool, dict[str, float]]:
+    """Return (is_empty, stats) for a master tile based on actual signal."""
+
+    stats = {
+        "max_abs": 0.0,
+        "std": 0.0,
+        "valid_frac": 0.0,
+        "eps_signal": float(eps_signal),
+        "alpha_frac": float("nan"),
+    }
+    if rgb_hwc is None:
+        return True, stats
+    try:
+        arr = np.asarray(rgb_hwc, dtype=np.float32)
+    except Exception:
+        return True, stats
+    if arr.size == 0:
+        return True, stats
+
+    arr_hwc = arr
+    if arr.ndim == 2:
+        arr_hwc = arr[..., np.newaxis]
+    elif arr.ndim == 3:
+        if arr.shape[-1] in (1, 3):
+            pass
+        elif arr.shape[0] in (1, 3):
+            arr_hwc = np.moveaxis(arr, 0, -1)
+
+    max_abs = float(np.nanmax(np.abs(arr_hwc))) if arr_hwc.size else 0.0
+    if not math.isfinite(max_abs):
+        max_abs = 0.0 if math.isnan(max_abs) else max_abs
+    std_val = float(np.nanstd(arr_hwc)) if arr_hwc.size else 0.0
+    if not math.isfinite(std_val):
+        std_val = 0.0 if math.isnan(std_val) else std_val
+    stats["max_abs"] = max_abs
+    stats["std"] = std_val
+
+    valid_mask = None
+    used_weight_mask = False
+    if sum_weights is not None:
+        try:
+            weight_arr = np.asarray(sum_weights)
+            if weight_arr.ndim == 2 and weight_arr.shape == arr_hwc.shape[:2]:
+                valid_mask = weight_arr > 0
+                used_weight_mask = True
+        except Exception:
+            valid_mask = None
+            used_weight_mask = False
+
+    if valid_mask is None:
+        try:
+            signal = np.nansum(np.abs(arr_hwc), axis=-1)
+            valid_mask = np.isfinite(signal) & (signal > eps_signal)
+        except Exception:
+            valid_mask = None
+
+    if valid_mask is not None and valid_mask.size:
+        valid_frac = float(np.count_nonzero(valid_mask)) / float(valid_mask.size)
+    else:
+        valid_frac = 0.0
+    stats["valid_frac"] = valid_frac
+
+    if alpha_u8 is not None:
+        try:
+            alpha_arr = np.asarray(alpha_u8)
+            alpha_arr = np.squeeze(alpha_arr)
+            if alpha_arr.ndim == 3 and alpha_arr.shape[0] == 1:
+                alpha_arr = alpha_arr[0]
+            if alpha_arr.ndim == 2:
+                stats["alpha_frac"] = float(np.mean(alpha_arr > 0)) if alpha_arr.size else 0.0
+        except Exception:
+            stats["alpha_frac"] = float("nan")
+
+    if std_min is None:
+        std_min = eps_signal
+
+    is_empty = False
+    if used_weight_mask:
+        min_frac = 0.0 if min_valid_frac is None else float(min_valid_frac)
+        if valid_frac <= min_frac:
+            is_empty = True
+    else:
+        if max_abs <= eps_signal:
+            is_empty = True
+        else:
+            near_zero = math.isfinite(max_abs) and max_abs <= (eps_signal * 10.0)
+            if near_zero and std_min is not None and std_val <= std_min:
+                is_empty = True
+            elif near_zero and min_valid_frac is not None and valid_frac <= min_valid_frac:
+                is_empty = True
+
+    return is_empty, stats
+
+
 def load_image_with_optional_alpha(
     path: str,
     *,
@@ -3523,8 +3671,14 @@ def load_image_with_optional_alpha(
     if not (ASTROPY_AVAILABLE and fits):
         raise RuntimeError("Astropy FITS support unavailable while loading image")
 
+    header = None
     with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
-        primary = hdul[0].data
+        primary_hdu = hdul[0]
+        primary = primary_hdu.data
+        try:
+            header = primary_hdu.header.copy()
+        except Exception:
+            header = None
         alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
         alpha = None
         if alpha_hdu is not None and alpha_hdu.data is not None:
@@ -3536,6 +3690,15 @@ def load_image_with_optional_alpha(
     label = tile_label or _path_display_name(path)
     data = _ensure_hwc_master_tile(primary, label)
     data = np.asarray(data, dtype=np.float32, order="C")
+    is_master_tile = _is_master_tile_header(header)
+    empty_flag = _header_flag_is_set(header, "ZMT_EMPT")
+
+    def _force_empty_master_tile(data_hwc: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        shape_hw = data_hwc.shape[:2]
+        empty_data = np.full_like(data_hwc, np.nan, dtype=np.float32)
+        empty_alpha = np.zeros(shape_hw, dtype=np.uint8)
+        empty_weights = np.zeros(shape_hw, dtype=np.float32)
+        return empty_data, empty_weights, empty_alpha
 
     weights: np.ndarray | None = None
     if alpha is not None:
@@ -3573,6 +3736,31 @@ def load_image_with_optional_alpha(
                 else:
                     data = np.where(invalid_mask[..., None], np.nan, data)
     data = np.asarray(data, dtype=np.float32, order="C")
+
+    if is_master_tile and empty_flag:
+        return _force_empty_master_tile(data)
+
+    if is_master_tile and alpha is not None and alpha.shape == data.shape[:2]:
+        alpha_frac = None
+        try:
+            if alpha.dtype.kind in {"i", "u"}:
+                threshold_u8 = int(ALPHA_OPACITY_THRESHOLD * 255)
+                alpha_frac = float(np.mean(alpha > threshold_u8)) if alpha.size else 0.0
+            else:
+                alpha_frac = float(np.mean(alpha > ALPHA_OPACITY_THRESHOLD)) if alpha.size else 0.0
+        except Exception:
+            alpha_frac = None
+        if alpha_frac is not None and alpha_frac >= EMPTY_MASTER_TILE_ALPHA_FRAC_THRESHOLD:
+            _, empty_stats = _detect_empty_master_tile(
+                data,
+                alpha,
+                eps_signal=EMPTY_MASTER_TILE_EPS_SIGNAL,
+            )
+            max_abs = float(empty_stats.get("max_abs", 0.0) or 0.0)
+            std_val = float(empty_stats.get("std", 0.0) or 0.0)
+            near_zero = max_abs <= (EMPTY_MASTER_TILE_EPS_SIGNAL * 10.0)
+            if max_abs <= EMPTY_MASTER_TILE_EPS_SIGNAL or (std_val <= EMPTY_MASTER_TILE_EPS_SIGNAL and near_zero):
+                return _force_empty_master_tile(data)
 
     return data, weights, alpha
 
@@ -12957,6 +13145,76 @@ def create_master_tile(
     except Exception:
         alpha_mask_out = None
 
+    empty_tile_detected = False
+    empty_tile_stats: dict[str, float] | None = None
+    empty_tile_stats_sanitized: dict[str, float] | None = None
+    try:
+        empty_tile_detected, empty_tile_stats = _detect_empty_master_tile(
+            master_tile_stacked_HWC,
+            alpha_mask_out,
+            eps_signal=EMPTY_MASTER_TILE_EPS_SIGNAL,
+        )
+    except Exception:
+        empty_tile_detected = False
+        empty_tile_stats = None
+
+    if empty_tile_detected:
+        try:
+            if alpha_mask_out is None:
+                alpha_mask_out = np.zeros(master_tile_stacked_HWC.shape[:2], dtype=np.uint8)
+            else:
+                alpha_mask_out = np.zeros_like(alpha_mask_out, dtype=np.uint8)
+        except Exception:
+            alpha_mask_out = None
+
+        try:
+            max_abs = float(empty_tile_stats.get("max_abs", 0.0) or 0.0) if empty_tile_stats else 0.0
+            std_val = float(empty_tile_stats.get("std", 0.0) or 0.0) if empty_tile_stats else 0.0
+            valid_frac = float(empty_tile_stats.get("valid_frac", 0.0) or 0.0) if empty_tile_stats else 0.0
+            alpha_frac = float(empty_tile_stats.get("alpha_frac", float("nan"))) if empty_tile_stats else float("nan")
+            eps_val = float(empty_tile_stats.get("eps_signal", EMPTY_MASTER_TILE_EPS_SIGNAL)) if empty_tile_stats else EMPTY_MASTER_TILE_EPS_SIGNAL
+        except Exception:
+            max_abs = 0.0
+            std_val = 0.0
+            valid_frac = 0.0
+            alpha_frac = float("nan")
+            eps_val = EMPTY_MASTER_TILE_EPS_SIGNAL
+
+        empty_tile_stats_sanitized = {
+            "max_abs": max_abs,
+            "std": std_val,
+            "valid_frac": valid_frac,
+            "eps_signal": eps_val,
+        }
+
+        try:
+            logger.warning(
+                "MT_EMPTY_TILE tile=%s max_abs=%.3g std=%.3g valid_frac=%.6f alpha_frac=%.3f eps=%.1e forced transparent",
+                tile_id,
+                max_abs,
+                std_val,
+                valid_frac,
+                alpha_frac,
+                eps_val,
+            )
+        except Exception:
+            pass
+        try:
+            pcb_tile(
+                "MT_EMPTY_TILE",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                max_abs=f"{max_abs:.3g}",
+                std=f"{std_val:.3g}",
+                valid_frac=f"{valid_frac:.6f}",
+                alpha_frac=f"{alpha_frac:.3f}",
+                eps=f"{eps_val:.1e}",
+                forced="1",
+            )
+        except Exception:
+            pass
+
     alpha_mask_for_quality: np.ndarray | None = pipeline_alpha_mask
     if alpha_mask_for_quality is None and alpha_mask_out is not None:
         alpha_mask_for_quality = alpha_mask_out
@@ -13051,6 +13309,13 @@ def create_master_tile(
         header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa High for Winsorized')
         header_mt_save['ZMT_COMB'] = (str(stack_final_combine), 'Final combine method')
         header_mt_save['ALPHAEXT'] = (1 if alpha_mask_out is not None else 0, 'Alpha mask ext present')
+        if empty_tile_detected:
+            stats = empty_tile_stats_sanitized or {}
+            header_mt_save['ZMT_EMPT'] = (1, 'Empty master tile forced transparent')
+            header_mt_save['ZMT_EMAX'] = (float(stats.get("max_abs", 0.0)), 'Empty tile max abs')
+            header_mt_save['ZMT_ESTD'] = (float(stats.get("std", 0.0)), 'Empty tile std')
+            header_mt_save['ZMT_EVF'] = (float(stats.get("valid_frac", 0.0)), 'Empty tile valid fraction')
+            header_mt_save['ZMT_EPS'] = (float(stats.get("eps_signal", EMPTY_MASTER_TILE_EPS_SIGNAL)), 'Empty tile eps signal')
 
         if center_out_context and center_out_settings:
             header_mt_save['ZMT_ANCH'] = (
@@ -13117,6 +13382,13 @@ def create_master_tile(
             header_mt_save['ZMT_CER'] = (round(metrics.get("CER", 0.0), 3), 'Corner Emptiness Ratio')
         elif quality_gate_enabled:
             header_mt_save['ZMT_QBD'] = (0, '1 if auto-rejected')
+
+        if empty_tile_detected:
+            try:
+                master_tile_stacked_HWC = np.asarray(master_tile_stacked_HWC, dtype=np.float32, order="C")
+                master_tile_stacked_HWC = np.full_like(master_tile_stacked_HWC, np.nan, dtype=np.float32)
+            except Exception:
+                pass
 
         zemosaic_utils.save_fits_image(
             image_data=master_tile_stacked_HWC,

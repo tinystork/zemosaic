@@ -1,39 +1,76 @@
-# Suivi — Mission “coverage intra-cluster → alpha mask lecropper” (Master Tiles)
+# followup.md
 
-## Contexte
-Objectif : mitiger les aberrations / franges chromatiques sur master tiles en masquant (alpha) les zones à faible recouvrement intra-cluster, sans réécrire le stacker.
+## Résultat attendu
+- Les master tiles **vides / quasi-vides** ne contribuent plus à la mosaïque (poids=0 / alpha=0) → disparition des rectangles/bandes sombres.
+- Le garde-fou protège aussi `use_existing_master_tiles_mode` (tuiles déjà générées) sans changer le comportement des tuiles normales.
 
-## Préconditions (anti-régression)
-- Le comportement doit rester identique si la coverage est absente / invalide (fallback lecropper existant).
-- Limiter l’activation au chemin Master Tile (pas Phase 4.5 / final mosaic, sauf demande explicite).
-- Ne pas impacter le mode GUI “I'm using master tiles” (`use_existing_master_tiles_mode` / `existing_master_tiles_mode`) : skip clustering & master tile creation → pas de coverage intra-cluster possible, donc no-op.
-- Conserver `_apply_lecropper_pipeline(arr, cfg)` appelable avec 2 args (nouveaux params optionnels uniquement).
-- Ne payer le coût `propagate_mask=True` / coverage que si l’Alt-Az cleanup Master Tile est activé (et si `lecropper` est dispo).
-- N’injecter des NaN que sur des buffers float32 (sinon convertir en copie ou ignorer la nanisation).
-- Ne pas laisser de NaN partir vers le stacker : `stack_aligned_images` loggue en ERROR quand des non-finis sont présents → nettoyer (`np.nan_to_num`) avant `_stack_master_tile_auto` ou calculer la coverage via masque séparé.
-- Ne pas impacter les modes `GRID` et `SDS/SupadupStack` : `GRID` return tôt (`zemosaic_worker.py:21028`), `SDS` saute les Master Tiles (sauf fallback) (`zemosaic_worker.py:19050`, `zemosaic_worker.py:23554`).
+## Périmètre / anti-régression (SDS, GRID, master-tile-only)
+- Ne modifier que le pipeline **Master Tiles** dans `zemosaic_worker.py` (+ tests). Ne pas toucher `grid_mode.py`.
+- Ne pas modifier le pipeline **SDS** : le garde-fou “empty tile” doit être **gated** sur les master tiles (ex: `ZMT_TYPE="Master Tile"` ou `ZMT_ID` présent).
+- Le fallback heuristique (tiles anciennes sans flag) ne doit s’appliquer **que** sur des master tiles, jamais sur des images SDS/GRID génériques.
 
-## Check-list (à exécuter par Codex)
-- [x] `zemosaic_worker.py:12108` : appeler `align_images_in_group(..., propagate_mask=True)` **uniquement** sur le chemin Master Tile *et seulement si* l’Alt-Az cleanup Master Tile est actif (évite un changement global + un coût inutile).
-- [x] `zemosaic_align_stack.py:2075` : exploiter `footprint_mask` de `astroalign.register(...)` ; footprint 2D (gérer 2D/3D, bool/float) en s’alignant sur `aligned_image_output.shape` (HWC/CHW) et binariser (`>0`) si float ; si ambigu/mismatch → log + ignore coverage. Naniser hors-footprint sur **`aligned_image_output` uniquement** (ne pas polluer `src_for_aa`/pré-alignement FFT), et garantir float32 (sinon copier/convertir avant). Si `footprint_mask` est absent/invalide → ne pas naniser (fallback). En FFT-only (repli), naniser hors-overlap sur la **sortie retournée** (rectangle déduit de `dy/dx` + shape) si on veut un coverage fiable. **Compat** : si `astroalign.register` ne supporte pas `propagate_mask`, retry sans kwarg (no-op coverage).
-- [x] `zemosaic_worker.py:12133` : calculer `coverage_count_hw` (float32) sur `valid_aligned_images` **avant** `_stack_master_tile_auto` (avant les `nan_to_num` du stacker) ; pixel valide si RGB finites **ou** `footprint2d` si dispo, accumulation incrémentale ; shapes homogènes sinon log + coverage=None. Logger min/max/nonzero_frac, borner `min_coverage_abs` à `n_used_for_stack`, et si `max_coverage <= 0` ou non-fini → log + coverage=None.
-- [x] `zemosaic_worker.py:12133` : si nanisation utilisée pour la coverage, nettoyer les images (`np.nan_to_num`) **avant** le stack pour éviter les logs `STACK_IMG_PREP` en ERROR.
-- [x] `zemosaic_worker.py:12379` : si `quality_crop_rect` appliqué, cropper `coverage_count_hw` pareil ; juste avant lecropper, vérifier `coverage.shape == img.shape[:2]` **et** `coverage.max() > 0` sinon log + ignore.
-- [x] `zemosaic_worker.py:665` / `zemosaic_worker.py:752` : étendre `_apply_lecropper_pipeline` (coverage + seuils `altaz_min_coverage_abs/frac`, `altaz_morph_open_px`) en restant compatible 2 args ; appeler `mask_altaz_artifacts(..., coverage=..., min_coverage_*, morph_open_px=...)` et en cas de `TypeError` refaire l’appel sans ces kwargs (le `nanize` reste contrôlé via `altaz_nanize_threshold`).
-- [x] `zemosaic_worker.py:12441` : passer la coverage + seuils au call `_apply_lecropper_pipeline(...)` côté Master Tile (Phase 4.5/fin mosaïque inchangés grâce aux defaults).
-- [x] Ajuster paramètres (reco départ) : `min_coverage_frac=0.5`, `min_coverage_abs=3` (borne par `n_used_for_stack`), `morph_open_px=3`; garder `altaz_nanize_threshold` cohérent avec `altaz_alpha_soft_threshold` si utilisé (et **propager ces 2 seuils depuis la config**).
-- [x] Logs debug : footprint stats dans `align_images_in_group` (`_pcb(..., lvl="DEBUG_DETAIL")`), stats coverage (`pcb_tile`), log “coverage ignored” explicite, seuils coverage avant lecropper, + vérifier `ALPHA_STATS`/`MT_PIPELINE` et absence de trim excessif (`MT_EDGE_TRIM`).
-- [x] Lancer `pytest -q` (focus : `tests/test_create_master_tile_*.py`). Note WSL/Windows: si `pytest` crash sur `TemporaryFile.truncate()`, lancer avec `TMPDIR=/tmp`.
+## Artefacts / repro
+- `example/master_tile_021.fits` : `(3,32,32)` avec `RGB max≈9.313e-10` et `ALPHA=255` partout → doit être neutralisée.
+- `zemosaic_worker.log` : contient `WeightNoiseVar ... stddev invalide (9.313e-10) -> Variance Inf` (indice “stack effectif nul”) ; ajouter un log greppable `MT_EMPTY_TILE`.
 
-## Logs à vérifier (minimum)
-- Mode actif (Phase 3) : `MT_PIPELINE_FLAGS`, `MT_PIPELINE`, `ALPHA_STATS: level=master_tile`.
-- Coverage (debug_tile) : `MT_COVERAGE_STATS` / `MT_COVERAGE_IGNORED` + absence de `STACK_IMG_PREP` en ERROR.
-- Non-régression : `[GRID] Invoking grid_mode.run_grid_mode(...)`, `[SDS] Phase 5 ... (skipping master tiles)`, `run_info_existing_master_tiles_mode` / `existing_master_tiles_mode:`.
+## Checklist exécution (Codex)
+### 1) Patch ciblé
+- [x] Ajouter `_detect_empty_master_tile(...)` dans `zemosaic_worker.py` (helper local, pur, testé).
+- [x] Dans `create_master_tile(...)` :
+  - [x] Appeler `_detect_empty_master_tile` **après** calcul de `alpha_mask_out` (et après crop/trim éventuels).
+  - [x] Si empty :
+    - [x] Forcer `alpha_mask_out = zeros` (uint8).
+    - [x] Neutraliser `master_tile_stacked_HWC` (idéalement `NaN` si float32) **uniquement à la fin**, juste avant `save_fits_image`.
+    - [x] Ajouter un flag FITS (header primaire, mots-clés ≤ 8 chars) : `ZMT_EMPT=1` + stats (`ZMT_EMAX`, `ZMT_ESTD`, `ZMT_EVF`, `ZMT_EPS`).
+    - [x] Log WARN greppable : `MT_EMPTY_TILE tile=<id> ... forced transparent`.
+- [x] Dans `load_image_with_optional_alpha(...)` :
+  - [x] Lire le header primaire (`ZMT_TYPE`, `ZMT_ID`, `ZMT_EMPT`).
+  - [x] Définir “master tile” (gating) : `ZMT_TYPE="Master Tile"` **ou** `ZMT_ID` présent ; sinon ne rien heuristiquement neutraliser.
+  - [x] Si master tile et `ZMT_EMPT=1` : renvoyer `weights=0`, `alpha=0`, et data `NaN`.
+  - [x] Fallback heuristique (rétro-compat, **master tiles uniquement**) :
+    - [x] `alpha_frac` très élevé + `max_abs < eps_signal` (seuil conservateur, ex `1e-8`) → neutraliser.
+- [x] `reproject_tile_to_mosaic(...)` : aucun changement requis si `load_image_with_optional_alpha` renvoie `weights=0` pour une tuile empty (le `footprint_full` devient vide et la tuile est ignorée).
 
-## Etat
-- Mission complète ; tests: `TMPDIR=/tmp python3 -m pytest -q` → `27 passed, 3 skipped`.
+### 2) Tests
+- [x] Ajouter `tests/test_empty_master_tile_guard.py` (ou intégrer dans une suite existante) :
+  - [x] Cas `ZMT_EMPT=1` → neutralisé.
+  - [x] Cas sans flag mais data≈0 + alpha=255 → neutralisé par fallback (master tile).
+  - [x] Cas avec 1 pixel réellement bright (max_abs >> eps) → **pas** neutralisé.
+- [x] Tests Windows/Mac/Linux (astropy via `importorskip`).
 
-## Notes / Observations (à remplir)
-- Réduction des franges sur tiles : …
-- Champ perdu (si trop agressif) : …
-- Stat alpha (nonzero_frac / min/max) dans logs : …
+### 3) Validation manuelle rapide
+#### A) Scan offline des tuiles suspectes
+Seuil de sanity recommandé : `eps_signal=1e-8`.
+
+```powershell
+@'
+from pathlib import Path
+import numpy as np
+from astropy.io import fits
+
+eps = 1e-8
+for p in sorted(Path('example').glob('master_tile_*.fits')):
+    with fits.open(p, memmap=False) as hdul:
+        hdr = hdul[0].header if hasattr(hdul[0], 'header') else {}
+        rgb = np.asarray(hdul[0].data, dtype=np.float32)
+        alpha = np.asarray(hdul['ALPHA'].data, dtype=np.uint8) if 'ALPHA' in hdul else None
+    ztype = hdr.get('ZMT_TYPE', None) if hasattr(hdr, 'get') else None
+    max_abs = float(np.nanmax(np.abs(rgb))) if rgb.size else 0.0
+    alpha_frac = float((alpha > 0).mean()) if alpha is not None else float('nan')
+    if alpha is not None and alpha_frac > 0.99 and max_abs < eps:
+        print(f'{p.name}: ZMT_TYPE={ztype!r} alpha_frac={alpha_frac:.6f} max_abs={max_abs:g}')
+'@ | python -
+```
+
+#### B) Logs lors d’un run
+- Présence de `MT_EMPTY_TILE tile=<id> ... forced transparent`.
+- Les warnings `WeightNoiseVar ... Variance Inf` peuvent rester, mais ne doivent plus produire de tuiles opaques vides.
+
+#### C) Mosaïque finale
+- Rectangles/bandes “vides” disparus.
+- Pas de “trous noirs inventés” : si une zone n’a pas de signal, elle doit être transparente (les overlaps comblent).
+
+## Rollback
+- Revert uniquement les blocs `MT_EMPTY_TILE` + helper + tests.
+
+---
