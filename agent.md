@@ -49,7 +49,7 @@ Optionnel mais recommandé côté “group” (pré-sélection): exiger aussi qu
 
 ## Implémentation (pas à pas)
 
-### 1) Ajouter un helper local (dans zemosaic_worker.py)
+### 1) [x] Ajouter un helper local (dans zemosaic_worker.py)
 Ajouter une fonction utilitaire (près de `create_master_tile` ou en helpers) :
 
 `_pick_central_reference_index(infos: list[dict], require_cache_exists: bool) -> int | None`
@@ -67,7 +67,7 @@ Pseudo:
   - fallback: premier idx qui a wcs+header (et cache si require_cache_exists)
   - sinon `None`
 
-### 2) Dans create_master_tile: calculer un “preferred_group_idx”
+### 2) [x] Dans create_master_tile: calculer un “preferred_group_idx”
 Pour éviter de biaiser le choix en cas de duplication (`allow_batch_duplication`), le `preferred_group_idx` est calculé sur la liste originale (**avant** la duplication), puis l'index est mappé sur la première occurrence correspondante dans la liste dupliquée.
 
 L'opération se déroule donc ainsi :
@@ -77,7 +77,7 @@ L'opération se déroule donc ainsi :
 
 ⚠️ MUST NOT fix `wcs_for_master_tile` / `header_for_master_tile_base` at this stage (car la réf peut ne pas être chargée finalement).
 
-### 3) Pendant le chargement cache: conserver un mapping group→loaded
+### 3) [x] Pendant le chargement cache: conserver un mapping group→loaded
 Dans la boucle `for i, raw_file_info in enumerate(seestar_stack_group_info):`
 quand un cache est effectivement chargé et validé:
 - `tile_images_data_HWC_adu.append(img_data_adu)`
@@ -107,7 +107,7 @@ Ne pas déplacer le bloc existant qui abort quand aucune image n’a été charg
 - Conserver le `return (None, None), failed_groups_to_retry` sous le test `if not tile_images_data_HWC_adu:`.
 - Le calcul de `ref_loaded_idx` / `ref_group_idx` / `ref_info_for_tile` doit se faire après ce `if`, mais avant l’appel à `align_images_in_group`.
 
-### 4) Déterminer la référence finale “loaded”
+### 4) [x] Déterminer la référence finale “loaded”
 - Si `preferred_group_idx` est dans `group_to_loaded`:
   - `ref_loaded_idx = group_to_loaded[preferred_group_idx]`
 - Sinon:
@@ -119,7 +119,7 @@ Ensuite:
 - `ref_group_idx = loaded_group_indices[ref_loaded_idx]`
 - `ref_info_for_tile = loaded_infos[ref_loaded_idx]`
 
-### 5) Définir WCS/Header à partir de la référence finale
+### 5) [x] Définir WCS/Header à partir de la référence finale
 Remplacer la logique actuelle qui fait:
 - `ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]`
 par celle basée sur `ref_info_for_tile` (chargée).
@@ -131,16 +131,16 @@ Définir:
 et garder la validation existante:
 - si pas (wcs celestial + header), erreur propre + abort tuile
 
-### 6) Appel aligner avec l’index “loaded”
+### 6) [x] Appel aligner avec l’index “loaded”
 Appeler `align_images_in_group` en passant `reference_image_index=ref_loaded_idx`.
 ⚠️ plus jamais passer un index “group” à l’aligneur.
 
-### 7) Sauvegarde FITS: ZMT_REF doit correspondre à la même référence
+### 7) [x] Sauvegarde FITS: ZMT_REF doit correspondre à la même référence
 Dans la partie sauvegarde header, remplacer toute dérivation de `ZMT_REF` (et champs associés) à partir de `seestar_stack_group_info[reference_image_index_in_group]` par une dérivation à partir de `ref_info_for_tile` (chargée), par ex. via `ref_info_for_tile.get("path_raw")`.
 
 But: le FITS final doit annoncer comme référence exactement celle utilisée pour WCS/base.
 
-### 8) Logs (sans nouvelle clé locale obligatoire)
+### 8) [x] Logs (sans nouvelle clé locale obligatoire)
 Ne pas ajouter de nouvelles clés i18n.
 Tu peux enrichir le log existant `mastertile_info_reference_set` en passant:
 - `ref_index_group=ref_group_idx`

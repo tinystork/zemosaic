@@ -1,10 +1,10 @@
 # Follow-up — Validation & garde-fous (référence centrale master tiles)
 
 ## Checklist “ne pas casser”
-- [ ] Aucun changement sur le tri/ordering global des images (juste choix de référence).
-- [ ] Ne pas changer la logique `allow_batch_duplication` / `target_stack_size` / `min_safe_stack_size`.
-- [ ] `reference_image_index` envoyé à `align_images_in_group` est **toujours** un index dans `tile_images_data_HWC_adu`.
-- [ ] `ZMT_REF` (header) pointe vers le même raw que la référence (pas un autre index).
+- [x] Aucun changement sur le tri/ordering global des images (juste choix de référence).
+- [x] Ne pas changer la logique `allow_batch_duplication` / `target_stack_size` / `min_safe_stack_size`.
+- [x] `reference_image_index` envoyé à `align_images_in_group` est **toujours** un index dans `tile_images_data_HWC_adu`.
+- [x] `ZMT_REF` (header) pointe vers le même raw que la référence (pas un autre index).
 
 ## Tests manuels rapides
 ### 1) Cas nominal (cache OK)
@@ -45,7 +45,7 @@ Ne pas renommer ni supprimer les champs déjà présents dans mastertile_info_re
   - Attendu : le traitement doit se terminer sans exception et les outputs doivent être cohérents (mosaïque assemblée).
 
 ## Tests unitaires (si la suite existe dans le repo)
-Ajouter/adapter un test léger (sans IO) :
+Ajouter/adapter un test léger (sans IO) : [x]
 - Construire un faux groupe de 5 infos dict:
   - 1) ra/dec = (10, 0)
   - 2) ra/dec = (11, 0)

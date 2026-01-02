@@ -9561,6 +9561,74 @@ def _unit_vector_from_ra_dec(ra_deg: float, dec_deg: float) -> tuple[float, floa
     return x, y, z
 
 
+def _pick_central_reference_index(infos: list[dict], require_cache_exists: bool) -> int | None:
+    try:
+        if not infos:
+            return None
+        candidates: list[tuple[int, float, float]] = []
+        for idx, info in enumerate(infos):
+            if not isinstance(info, dict):
+                continue
+            wcs_obj = info.get("wcs")
+            if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+                continue
+            if not info.get("header"):
+                continue
+            if require_cache_exists:
+                cache_path = info.get("path_preprocessed_cache")
+                if not (cache_path and _path_exists(cache_path)):
+                    continue
+            coord = _extract_ra_dec_deg(info)
+            if coord is None:
+                continue
+            ra_deg, dec_deg = coord
+            if not (math.isfinite(ra_deg) and math.isfinite(dec_deg)):
+                return None
+            candidates.append((idx, float(ra_deg), float(dec_deg)))
+        if candidates:
+            vectors = np.array(
+                [_unit_vector_from_ra_dec(ra, dec) for _idx, ra, dec in candidates],
+                dtype=float,
+            )
+            if vectors.size == 0:
+                return None
+            center = vectors.mean(axis=0)
+            norm = float(np.linalg.norm(center))
+            if not math.isfinite(norm) or norm <= 0.0:
+                return None
+            center = center / norm
+            best_key = None
+            best_idx = None
+            for (idx, _ra, _dec), vec in zip(candidates, vectors):
+                dot = float(np.dot(vec, center))
+                if not math.isfinite(dot):
+                    return None
+                dot = min(1.0, max(-1.0, dot))
+                score = 1.0 - dot
+                key = (score, idx)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_idx = idx
+            if best_idx is not None:
+                return int(best_idx)
+        for idx, info in enumerate(infos):
+            if not isinstance(info, dict):
+                continue
+            wcs_obj = info.get("wcs")
+            if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+                continue
+            if not info.get("header"):
+                continue
+            if require_cache_exists:
+                cache_path = info.get("path_preprocessed_cache")
+                if not (cache_path and _path_exists(cache_path)):
+                    continue
+            return int(idx)
+        return None
+    except Exception:
+        return None
+
+
 def _compute_max_angular_separation_deg(coords: list[tuple[float, float]]) -> float:
     if not coords or len(coords) < 2:
         return 0.0
@@ -12318,6 +12386,12 @@ def create_master_tile(
     min_safe_stack_effective = max(1, int(min_safe_stack_size))
     target_stack_effective = max(min_safe_stack_effective, int(target_stack_size))
 
+    original_group_info = list(seestar_stack_group_info)
+    preferred_group_idx = _pick_central_reference_index(original_group_info, require_cache_exists=True)
+    if preferred_group_idx is None or not (0 <= preferred_group_idx < len(original_group_info)):
+        preferred_group_idx = 0
+    preferred_group_info = original_group_info[preferred_group_idx] if original_group_info else None
+
     original_batch_size = len(seestar_stack_group_info)
     if allow_batch_duplication and original_batch_size < target_stack_effective and original_batch_size > 0:
         repeat = math.ceil(target_stack_effective / original_batch_size)
@@ -12338,28 +12412,18 @@ def create_master_tile(
                 )
         except Exception:
             pass
-    
-    # Choix de l'image de référence (généralement la première du groupe après tri ou la plus centrale)
-    reference_image_index_in_group = 0 # Pourrait être plus sophistiqué à l'avenir
-    if not (0 <= reference_image_index_in_group < len(seestar_stack_group_info)): 
-        pcb_tile(f"{func_id_log_base}_error_invalid_ref_index", prog=None, lvl="ERROR", tile_id=tile_id, ref_idx=reference_image_index_in_group, group_size=len(seestar_stack_group_info))
-        return (None, None), failed_groups_to_retry
-    
-    ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]
-    wcs_for_master_tile = ref_info_for_tile.get('wcs')
-    # Le header est un dict venant du cache, il faut le convertir en objet fits.Header si besoin
-    header_dict_for_master_tile_base = ref_info_for_tile.get('header') 
 
-    if not (wcs_for_master_tile and wcs_for_master_tile.is_celestial and header_dict_for_master_tile_base):
-        pcb_tile(f"{func_id_log_base}_error_invalid_ref_wcs_header", prog=None, lvl="ERROR", tile_id=tile_id)
-        return (None, None), failed_groups_to_retry
+    if preferred_group_info is not None and len(seestar_stack_group_info) != len(original_group_info):
+        try:
+            mapped_idx = next(
+                (i for i, info in enumerate(seestar_stack_group_info) if info is preferred_group_info),
+                None,
+            )
+            if mapped_idx is not None:
+                preferred_group_idx = mapped_idx
+        except Exception:
+            pass
     
-    # Conversion du dict en objet astropy.io.fits.Header pour la sauvegarde
-    header_for_master_tile_base = fits.Header(header_dict_for_master_tile_base.cards if hasattr(header_dict_for_master_tile_base,'cards') else header_dict_for_master_tile_base)
-    
-    ref_path_raw = ref_info_for_tile.get('path_raw', 'UnknownRawRef')
-    pcb_tile(f"{func_id_log_base}_info_reference_set", prog=None, lvl="DEBUG_DETAIL", ref_index=reference_image_index_in_group, ref_filename=_safe_basename(ref_path_raw), tile_id=tile_id)
-
     # Acquire a dynamic Phase 3 I/O concurrency slot to avoid disk stalls
     # when the system is busy (e.g., another app reading video files).
     try:
@@ -12371,6 +12435,8 @@ def create_master_tile(
     
     tile_images_data_HWC_adu = []
     tile_original_raw_headers = [] # Liste des dictionnaires de header originaux
+    loaded_infos = []
+    loaded_group_indices = []
 
     for i, raw_file_info in enumerate(seestar_stack_group_info):
         cached_image_file_path = raw_file_info.get('path_preprocessed_cache')
@@ -12401,7 +12467,9 @@ def create_master_tile(
             
             tile_images_data_HWC_adu.append(img_data_adu)
             # Stocker le dict de header, pas l'objet fits.Header, car c'est ce qui est dans raw_file_info
-            tile_original_raw_headers.append(raw_file_info.get('header')) 
+            tile_original_raw_headers.append(raw_file_info.get('header'))
+            loaded_infos.append(raw_file_info)
+            loaded_group_indices.append(i)
         except MemoryError as e_mem_load_cache:
              pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
              # Release the concurrency slot before aborting
@@ -12426,6 +12494,40 @@ def create_master_tile(
         return (None, None), failed_groups_to_retry
     # pcb_tile(f"{func_id_log_base}_info_loading_from_cache_finished", prog=None, lvl="DEBUG_DETAIL", num_loaded=len(tile_images_data_HWC_adu), tile_id=tile_id)
 
+    group_to_loaded = {
+        group_i: loaded_i for loaded_i, group_i in enumerate(loaded_group_indices)
+    }
+    ref_loaded_idx = group_to_loaded.get(preferred_group_idx)
+    if ref_loaded_idx is None:
+        ref_loaded_idx = _pick_central_reference_index(loaded_infos, require_cache_exists=False)
+    if ref_loaded_idx is None or not (0 <= ref_loaded_idx < len(loaded_infos)):
+        ref_loaded_idx = 0
+    ref_group_idx = loaded_group_indices[ref_loaded_idx]
+    ref_info_for_tile = loaded_infos[ref_loaded_idx]
+    wcs_for_master_tile = ref_info_for_tile.get('wcs')
+    # Le header est un dict venant du cache, il faut le convertir en objet fits.Header si besoin
+    header_dict_for_master_tile_base = ref_info_for_tile.get('header')
+
+    if not (wcs_for_master_tile and wcs_for_master_tile.is_celestial and header_dict_for_master_tile_base):
+        pcb_tile(f"{func_id_log_base}_error_invalid_ref_wcs_header", prog=None, lvl="ERROR", tile_id=tile_id)
+        return (None, None), failed_groups_to_retry
+
+    # Conversion du dict en objet astropy.io.fits.Header pour la sauvegarde
+    header_for_master_tile_base = fits.Header(header_dict_for_master_tile_base.cards if hasattr(header_dict_for_master_tile_base,'cards') else header_dict_for_master_tile_base)
+
+    ref_path_raw = ref_info_for_tile.get('path_raw', 'UnknownRawRef')
+    pcb_tile(
+        f"{func_id_log_base}_info_reference_set",
+        prog=None,
+        lvl="DEBUG_DETAIL",
+        ref_index=ref_group_idx,
+        ref_filename=_safe_basename(ref_path_raw),
+        ref_index_group=ref_group_idx,
+        ref_index_loaded=ref_loaded_idx,
+        ref_mode="central",
+        tile_id=tile_id,
+    )
+
     pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
     # Limit concurrency during alignment/stacking as well to reduce peak RAM
     try:
@@ -12442,25 +12544,27 @@ def create_master_tile(
         )
     aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
         image_data_list=tile_images_data_HWC_adu,
-        reference_image_index=reference_image_index_in_group,
+        reference_image_index=ref_loaded_idx,
         propagate_mask=propagate_mask_for_coverage,
         progress_callback=progress_callback
     )
     if failed_alignment_indices:
         retry_group: list[dict] = []
         for idx_fail in failed_alignment_indices:
-            if 0 <= idx_fail < len(seestar_stack_group_info):
-                raw_info = seestar_stack_group_info[idx_fail]
-                if isinstance(raw_info, dict):
-                    info_copy = dict(raw_info)
-                    current_retry = int(info_copy.get('retry_attempt', 0))
-                    info_copy['retry_attempt'] = current_retry + 1
-                    origin_chain = list(info_copy.get('retry_origin_chain', []))
-                    origin_chain.append(int(tile_id))
-                    info_copy['retry_origin_chain'] = origin_chain
-                else:
-                    info_copy = raw_info
-                retry_group.append(info_copy)
+            if 0 <= idx_fail < len(loaded_group_indices):
+                group_idx = loaded_group_indices[idx_fail]
+                if 0 <= group_idx < len(seestar_stack_group_info):
+                    raw_info = seestar_stack_group_info[group_idx]
+                    if isinstance(raw_info, dict):
+                        info_copy = dict(raw_info)
+                        current_retry = int(info_copy.get('retry_attempt', 0))
+                        info_copy['retry_attempt'] = current_retry + 1
+                        origin_chain = list(info_copy.get('retry_origin_chain', []))
+                        origin_chain.append(int(tile_id))
+                        info_copy['retry_origin_chain'] = origin_chain
+                    else:
+                        info_copy = raw_info
+                    retry_group.append(info_copy)
         if retry_group:
             failed_groups_to_retry.append(retry_group)
 
@@ -13388,7 +13492,7 @@ def create_master_tile(
             header_mt_save['ZMT_ANCH'] = (-1, 'Anchor tile id (original index)')
 
         if header_for_master_tile_base: # C'est déjà un objet fits.Header
-            ref_path_raw_for_hdr = seestar_stack_group_info[reference_image_index_in_group].get('path_raw', 'UnknownRef')
+            ref_path_raw_for_hdr = ref_info_for_tile.get('path_raw', 'UnknownRef')
             header_mt_save['ZMT_REF'] = (_safe_basename(ref_path_raw_for_hdr), 'Reference raw frame for this tile WCS')
             keys_from_ref = ['OBJECT','DATE-AVG','FILTER','INSTRUME','FOCALLEN','XPIXSZ','YPIXSZ', 'GAIN', 'OFFSET'] # Ajout GAIN, OFFSET
             for key_h in keys_from_ref:
