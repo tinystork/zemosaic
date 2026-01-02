@@ -3559,6 +3559,18 @@ def _is_master_tile_header(header: Any | None) -> bool:
     return False
 
 
+def _coerce_finite_float(value: Any, default: float | None = None) -> float | None:
+    """Return a finite float or *default* when NaN/Inf/invalid."""
+
+    try:
+        coerced = float(value)
+    except Exception:
+        return default
+    if not math.isfinite(coerced):
+        return default
+    return coerced
+
+
 def _detect_empty_master_tile(
     rgb_hwc: np.ndarray | None,
     alpha_u8: np.ndarray | None = None,
@@ -13168,11 +13180,24 @@ def create_master_tile(
             alpha_mask_out = None
 
         try:
-            max_abs = float(empty_tile_stats.get("max_abs", 0.0) or 0.0) if empty_tile_stats else 0.0
-            std_val = float(empty_tile_stats.get("std", 0.0) or 0.0) if empty_tile_stats else 0.0
-            valid_frac = float(empty_tile_stats.get("valid_frac", 0.0) or 0.0) if empty_tile_stats else 0.0
-            alpha_frac = float(empty_tile_stats.get("alpha_frac", float("nan"))) if empty_tile_stats else float("nan")
-            eps_val = float(empty_tile_stats.get("eps_signal", EMPTY_MASTER_TILE_EPS_SIGNAL)) if empty_tile_stats else EMPTY_MASTER_TILE_EPS_SIGNAL
+            if empty_tile_stats:
+                max_abs = _coerce_finite_float(empty_tile_stats.get("max_abs", 0.0), 0.0)
+                std_val = _coerce_finite_float(empty_tile_stats.get("std", 0.0), 0.0)
+                valid_frac = _coerce_finite_float(empty_tile_stats.get("valid_frac", 0.0), 0.0)
+                alpha_frac = _coerce_finite_float(
+                    empty_tile_stats.get("alpha_frac", float("nan")),
+                    float("nan"),
+                )
+                eps_val = _coerce_finite_float(
+                    empty_tile_stats.get("eps_signal", EMPTY_MASTER_TILE_EPS_SIGNAL),
+                    float(EMPTY_MASTER_TILE_EPS_SIGNAL),
+                )
+            else:
+                max_abs = 0.0
+                std_val = 0.0
+                valid_frac = 0.0
+                alpha_frac = float("nan")
+                eps_val = float(EMPTY_MASTER_TILE_EPS_SIGNAL)
         except Exception:
             max_abs = 0.0
             std_val = 0.0
@@ -13283,15 +13308,23 @@ def create_master_tile(
         header_mt_save['ZMT_WGHT'] = (str(stack_weight_method), 'Weighting method')
         if apply_radial_weight: # Log des paramètres radiaux
             header_mt_save['ZMT_RADW'] = (True, 'Radial weighting applied')
-            header_mt_save['ZMT_RADF'] = (radial_feather_fraction, 'Radial feather fraction')
-            header_mt_save['ZMT_RADP'] = (radial_shape_power, 'Radial shape power')
+            header_mt_save['ZMT_RADF'] = (
+                _coerce_finite_float(radial_feather_fraction, 0.0),
+                'Radial feather fraction',
+            )
+            header_mt_save['ZMT_RADP'] = (
+                _coerce_finite_float(radial_shape_power, 0.0),
+                'Radial shape power',
+            )
         else:
             header_mt_save['ZMT_RADW'] = (False, 'Radial weighting applied')
 
-        header_mt_save['RGBGAINR'] = (gain_r, 'RGB equalization gain (red)')
-        header_mt_save['RGBGAING'] = (gain_g, 'RGB equalization gain (green)')
-        header_mt_save['RGBGAINB'] = (gain_b, 'RGB equalization gain (blue)')
-        header_mt_save['RGBEQMED'] = (target_median_val, 'RGB equalization target median')
+        header_mt_save['RGBGAINR'] = (_coerce_finite_float(gain_r, 1.0), 'RGB equalization gain (red)')
+        header_mt_save['RGBGAING'] = (_coerce_finite_float(gain_g, 1.0), 'RGB equalization gain (green)')
+        header_mt_save['RGBGAINB'] = (_coerce_finite_float(gain_b, 1.0), 'RGB equalization gain (blue)')
+        target_median_hdr = _coerce_finite_float(target_median_val, None)
+        if target_median_hdr is not None:
+            header_mt_save['RGBEQMED'] = (target_median_hdr, 'RGB equalization target median')
         try:
             header_mt_save.add_history(history_msg)
         except Exception:
@@ -13299,23 +13332,35 @@ def create_master_tile(
 
         header_mt_save['ZMT_REJ'] = (str(stack_reject_algo), 'Rejection algorithm')
         if stack_reject_algo == "kappa_sigma":
-            header_mt_save['ZMT_KAPLO'] = (stack_kappa_low, 'Kappa Sigma Low threshold')
-            header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa Sigma High threshold')
+            header_mt_save['ZMT_KAPLO'] = (_coerce_finite_float(stack_kappa_low, 0.0), 'Kappa Sigma Low threshold')
+            header_mt_save['ZMT_KAPHI'] = (_coerce_finite_float(stack_kappa_high, 0.0), 'Kappa Sigma High threshold')
         elif stack_reject_algo == "winsorized_sigma_clip":
-            header_mt_save['ZMT_WINLO'] = (parsed_winsor_limits[0], 'Winsor Lower limit %')
-            header_mt_save['ZMT_WINHI'] = (parsed_winsor_limits[1], 'Winsor Upper limit %')
+            header_mt_save['ZMT_WINLO'] = (
+                _coerce_finite_float(parsed_winsor_limits[0], 0.0),
+                'Winsor Lower limit %',
+            )
+            header_mt_save['ZMT_WINHI'] = (
+                _coerce_finite_float(parsed_winsor_limits[1], 0.0),
+                'Winsor Upper limit %',
+            )
             # Les paramètres Kappa sont aussi pertinents pour Winsorized
-        header_mt_save['ZMT_KAPLO'] = (stack_kappa_low, 'Kappa Low for Winsorized')
-        header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa High for Winsorized')
+        header_mt_save['ZMT_KAPLO'] = (_coerce_finite_float(stack_kappa_low, 0.0), 'Kappa Low for Winsorized')
+        header_mt_save['ZMT_KAPHI'] = (_coerce_finite_float(stack_kappa_high, 0.0), 'Kappa High for Winsorized')
         header_mt_save['ZMT_COMB'] = (str(stack_final_combine), 'Final combine method')
         header_mt_save['ALPHAEXT'] = (1 if alpha_mask_out is not None else 0, 'Alpha mask ext present')
         if empty_tile_detected:
             stats = empty_tile_stats_sanitized or {}
             header_mt_save['ZMT_EMPT'] = (1, 'Empty master tile forced transparent')
-            header_mt_save['ZMT_EMAX'] = (float(stats.get("max_abs", 0.0)), 'Empty tile max abs')
-            header_mt_save['ZMT_ESTD'] = (float(stats.get("std", 0.0)), 'Empty tile std')
-            header_mt_save['ZMT_EVF'] = (float(stats.get("valid_frac", 0.0)), 'Empty tile valid fraction')
-            header_mt_save['ZMT_EPS'] = (float(stats.get("eps_signal", EMPTY_MASTER_TILE_EPS_SIGNAL)), 'Empty tile eps signal')
+            header_mt_save['ZMT_EMAX'] = (_coerce_finite_float(stats.get("max_abs", 0.0), 0.0), 'Empty tile max abs')
+            header_mt_save['ZMT_ESTD'] = (_coerce_finite_float(stats.get("std", 0.0), 0.0), 'Empty tile std')
+            header_mt_save['ZMT_EVF'] = (
+                _coerce_finite_float(stats.get("valid_frac", 0.0), 0.0),
+                'Empty tile valid fraction',
+            )
+            header_mt_save['ZMT_EPS'] = (
+                _coerce_finite_float(stats.get("eps_signal", EMPTY_MASTER_TILE_EPS_SIGNAL), float(EMPTY_MASTER_TILE_EPS_SIGNAL)),
+                'Empty tile eps signal',
+            )
 
         if center_out_context and center_out_settings:
             header_mt_save['ZMT_ANCH'] = (
@@ -13324,8 +13369,14 @@ def create_master_tile(
             )
             if norm_result:
                 header_mt_save['ZMT_P3CO'] = (1, 'Phase 3 center-out normalization applied')
-                header_mt_save['ZMT_AGAIN'] = (float(norm_result[0]), 'Phase 3 center-out gain')
-                header_mt_save['ZMT_AOFF'] = (float(norm_result[1]), 'Phase 3 center-out offset')
+                header_mt_save['ZMT_AGAIN'] = (
+                    _coerce_finite_float(norm_result[0], 1.0),
+                    'Phase 3 center-out gain',
+                )
+                header_mt_save['ZMT_AOFF'] = (
+                    _coerce_finite_float(norm_result[1], 0.0),
+                    'Phase 3 center-out offset',
+                )
             else:
                 header_mt_save['ZMT_P3CO'] = (0, 'Phase 3 center-out normalization applied')
                 header_mt_save['ZMT_AGAIN'] = (1.0, 'Phase 3 center-out gain')
@@ -13353,12 +13404,14 @@ def create_master_tile(
             num_exposure_summed = 0
             for hdr_raw_item_dict in tile_original_raw_headers: # Ce sont des dicts
                 if hdr_raw_item_dict is None: continue
-                try: 
+                try:
                     exposure_val = hdr_raw_item_dict.get('EXPTIME', hdr_raw_item_dict.get('EXPOSURE', 0.0))
-                    total_exposure_tile += float(exposure_val if exposure_val is not None else 0.0)
-                    num_exposure_summed +=1
-                except (TypeError, ValueError) : pass
-            header_mt_save['EXPTOTAL']=(round(total_exposure_tile,2),'[s] Sum of EXPTIME for this tile')
+                    exposure_f = _coerce_finite_float(exposure_val if exposure_val is not None else 0.0, 0.0)
+                    total_exposure_tile += float(exposure_f or 0.0)
+                    num_exposure_summed += 1
+                except Exception:
+                    pass
+            header_mt_save['EXPTOTAL']=(round(_coerce_finite_float(total_exposure_tile, 0.0), 2),'[s] Sum of EXPTIME for this tile')
             header_mt_save['NEXP_SUM']=(num_exposure_summed,'Number of exposures summed for EXPTOTAL')
 
 
@@ -13373,13 +13426,22 @@ def create_master_tile(
 
         if quality_gate_eval and quality_gate_eval.get("metrics"):
             metrics = quality_gate_eval.get("metrics") or {}
-            score = float(quality_gate_eval.get("score", 0.0))
+            score = _coerce_finite_float(quality_gate_eval.get("score", 0.0), 0.0)
             accepted_flag = bool(quality_gate_eval.get("accepted", True))
             header_mt_save['ZMT_QS'] = (round(score, 3), 'ZeQuality score (0=good)')
             header_mt_save['ZMT_QBD'] = (0 if accepted_flag else 1, '1 if auto-rejected')
-            header_mt_save['ZMT_EOC'] = (round(metrics.get("EOC", 0.0), 3), 'Extended Object Coverage')
-            header_mt_save['ZMT_TRL'] = (round(metrics.get("TRL", 0.0), 3), 'Trailiness index')
-            header_mt_save['ZMT_CER'] = (round(metrics.get("CER", 0.0), 3), 'Corner Emptiness Ratio')
+            header_mt_save['ZMT_EOC'] = (
+                round(_coerce_finite_float(metrics.get("EOC", 0.0), 0.0), 3),
+                'Extended Object Coverage',
+            )
+            header_mt_save['ZMT_TRL'] = (
+                round(_coerce_finite_float(metrics.get("TRL", 0.0), 0.0), 3),
+                'Trailiness index',
+            )
+            header_mt_save['ZMT_CER'] = (
+                round(_coerce_finite_float(metrics.get("CER", 0.0), 0.0), 3),
+                'Corner Emptiness Ratio',
+            )
         elif quality_gate_enabled:
             header_mt_save['ZMT_QBD'] = (0, '1 if auto-rejected')
 
