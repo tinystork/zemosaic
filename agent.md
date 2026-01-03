@@ -1,52 +1,205 @@
-# agent.md
+# agent.md — ZeMosaic V1 Resume (après Phase 1)
 
-## Mission
-Empêcher les **master tiles vides / quasi-vides** d’être traitées comme **opaques** (ALPHA=255) et de **polluer la mosaïque finale** (rectangles/bandes sombres).
+## Contexte
+ZeMosaic (mode classic legacy) supprime actuellement systématiquement `.zemosaic_img_cache` au début de `run_hierarchical_mosaic_classic_legacy()`, ce qui empêche toute reprise.
+Objectif V1 : permettre de **reprendre un run après la Phase 1** si un cache valide existe, en gardant un comportement **strictement identique** quand la reprise est désactivée.
 
-## Périmètre (anti-régression “idiot-proof”)
-- Ne cibler que le pipeline **Master Tiles** (création + consommation des master tiles) dans `zemosaic_worker.py` (+ tests).
-- Ne pas toucher `grid_mode.py` (Grid Mode a son propre loader et sa logique dédiée).
-- Ne pas modifier le pipeline **SDS** (mega-tiles / coadd SDS) : la détection “empty tile” doit être **gated** sur les master tiles.
-- En mode `use_existing_master_tiles_mode` / `existing_master_tiles_mode`, le garde-fou doit fonctionner (lecture de tuiles existantes) sans changer le comportement des tuiles normales.
+## Objectif (V1)
+Ajouter une reprise **après Phase 1** via `.zemosaic_img_cache` :
+- Si `.zemosaic_img_cache` + un **manifest** + un **marker Phase 1** existent et sont valides → **skip Phase 1**, reprendre directement à la Phase 2.
+- Sinon → comportement actuel inchangé (run complet avec suppression/recréation du cache au début).
 
-## Diagnostic (confirmé sur les artefacts fournis)
-- `example/master_tile_021.fits` : `(3,32,32)` avec `RGB max≈9.313e-10` mais `ALPHA=255` partout → tuile “vide” mais “valide”.
-- `zemosaic_worker.log` : nombreuses lignes `WeightNoiseVar ... stddev invalide (9.313e-10) -> Variance Inf` → poids/variance qui dégénère, donc contribution réelle ≈ 0.
+## Périmètre (anti-régression)
+✅ CIBLE : `zemosaic_worker.py` → fonction `run_hierarchical_mosaic_classic_legacy()`
 
-## Cause probable
-- Certaines tuiles arrivent à un **stack effectif nul** (`sum(weights)==0` ou équivalent) → sortie ~0.
-- L’ALPHA est dérivée d’un critère trop faible (ex: “finite” / footprint attendu) → reste à 255 même si aucune contribution réelle.
+🚫 HORS PÉRIMÈTRE V1 :
+- Ne pas modifier SDS / grid mode / autres pipelines.
+- Ne pas implémenter la reprise Phase 2 ou Phase 3 (ce sera V2/V3).
+- Ne pas changer le comportement existant quand `resume=off`.
 
-## Stratégie de fix (à faire en double verrou)
-### A) À l’écriture d’une master tile (`create_master_tile(...)`)
-- [x] Ajouter un helper `_detect_empty_master_tile(rgb_hwc, alpha_u8, ...) -> (is_empty, stats)` basé sur le **contenu réel**:
-  - [x] `valid = isfinite & (abs(R)+abs(G)+abs(B) > eps_signal)` (pas `==0`).
-  - [x] Option prioritaire si disponible : `valid = (sum_weights > 0)` pour coller à “a réellement contribué”.
-- [x] Si `is_empty` (ou `valid_frac < seuil_min`):
-  - [x] Forcer `alpha_mask_out = 0` partout.
-  - [x] Neutraliser la donnée (idéalement `NaN` sur float32) **après** le stack, juste avant la sauvegarde, pour éviter toute pollution si l’alpha est ignorée plus tard.
-  - [x] Écrire un flag FITS (header primaire, mots-clés ≤ 8 chars) : `ZMT_EMPT=1` + stats (`ZMT_EMAX`, `ZMT_ESTD`, `ZMT_EVF`, `ZMT_EPS`).
-  - [x] Log clair et greppable : `MT_EMPTY_TILE tile=<id> ... forced transparent`.
+## Contraintes clés
+1) **Par défaut : aucune régression**
+- Nouveau paramètre config `resume` (string) ∈ `{ "off", "auto", "force" }`
+- Valeur par défaut : `"off"` si absent/invalid.
+- Si `resume == "off"` → laisser le code se comporter EXACTEMENT comme aujourd’hui (notamment suppression/recréation de `.zemosaic_img_cache` au début).
 
-### B) À la lecture (`load_image_with_optional_alpha(...)`)
-- [x] Si header `ZMT_EMPT=1` : retourner `weights=0` (et `alpha=0`) + data `NaN`.
-- [x] Fallback rétro-compatible (pour master tiles déjà générées, sans flag) :
-  - [x] **Uniquement si** le FITS est bien une master tile (ex: `ZMT_TYPE="Master Tile"` ou `ZMT_ID` présent).
-  - [x] Si `alpha_frac` très élevé **et** `max_abs < eps_signal` (ou `std < std_min`) → traiter comme vide, neutraliser.
-  - [x] Garder des seuils **très conservateurs** (ex: `eps_signal=1e-8`) pour éviter les faux positifs.
+2) **Garde-fous de mode**
+La reprise V1 doit être désactivée (comme si `resume=off`) si l’un de ces cas est vrai :
+- `sds_mode_flag` est actif
+- `use_existing_master_tiles_config` est actif (ou `use_existing_master_tiles_mode` est détecté)
+- tout autre mode non-classic legacy (si détecté)
 
-### C) Sécurité assemblage (`reproject_tile_to_mosaic(...)`)
-- [x] Vérifier qu’une tuile “empty” est naturellement ignorée (si `weights`/alpha est tout à 0, `combined_weight` ⇒ footprint vide ⇒ bbox vide ⇒ skip).
+3) **Pas de pickle**
+Le cache de reprise doit être écrit en JSON (manifest + data), pas de pickle.
 
-## Contraintes / anti-régression
-- Ne pas changer clustering / normalisation / lecropper (hors ajout de logs/flags/guard).
-- Le fix doit protéger aussi `use_existing_master_tiles_mode` (où on relit des tuiles existantes).
+## Nouveaux artefacts (dans `.zemosaic_img_cache/`)
+Créer uniquement si `resume != off` ET si la Phase 1 s’exécute (donc run “producteur de cache”).
 
-## Observations critiques (garde-fous supplémentaires)
-- Gating legacy : la neutralisation doit couvrir les master tiles déjà produites (sans flag `ZMT_EMPT`), y compris en `use_existing_master_tiles_mode` ; activer l’heuristique dès qu’un header master tile est présent (`ZMT_TYPE="Master Tile"` ou `ZMT_ID`), jamais sur SDS/GRID.
-- CHW/HWC + NaN-safe : `_detect_empty_master_tile` et les stats doivent supporter `(C,H,W)` comme `(H,W,C)` sans crash ; utiliser des ops `np.nan*` (nanmax/nanstd, masque NaN-safe) pour éviter ValueError ou faux positifs en présence de NaN/Inf.
+- `cache_manifest.json`
+- `phase1_processed_info.json`
+- `phase1.done`
+
+### `cache_manifest.json` (schema minimal V1)
+Contenu minimal recommandé :
+```json
+{
+  "schema_version": 1,
+  "pipeline": "classic_legacy",
+  "created_utc": "...",
+  "run_signature": "<sha256 hex>",
+  "input_folder_norm": "...",
+  "output_folder_norm": "...",
+  "phase1": {
+    "done": true,
+    "done_marker": "phase1.done",
+    "processed_info_file": "phase1_processed_info.json",
+    "num_entries": 1234
+  }
+}
+````
+
+### `phase1_processed_info.json`
+
+Liste JSON de dicts, un par image valide, contenant uniquement des champs sérialisables + de quoi reconstruire les objets nécessaires aux phases suivantes :
+Champs obligatoires par entrée :
+
+* `path_raw` (str, chemin absolu original)
+* `path_preprocessed_cache` (str, chemin absolu vers le `.npy` cache)
+* `path_hotpix_mask` (str ou null)
+* `preprocessed_shape` (liste d’int)
+* `header_str` (str) : header FITS complet **mis à jour** (celui qui permet de reconstruire le WCS)
+  Champs optionnels à conserver si présents dans `entry` actuel :
+* `phase0_index`, `phase0_center`, `phase0_shape`, `phase0_wcs` (si déjà injectés)
+
+IMPORTANT :
+
+* `header_str` doit permettre une reconstruction fiable via `astropy.io.fits.Header.fromstring(...)`
+* On ne stocke PAS les objets `wcs` ni `header` directement (non sérialisables).
+
+## Run signature (V1)
+
+Implémenter une fonction de hash déterministe (sha256) sur un JSON canonique (keys triées).
+Inclure au minimum :
+
+* pipeline: `"classic_legacy"`
+* input fingerprint: liste triée des fichiers FITS du `input_folder` (chemins relatifs) + (size, mtime)
+* paramètres ASTAP (radius/downsample/sensitivity) + solver timeout si utilisé en Phase 1
+* tout paramètre structurant de Phase 1 si facilement accessible
+* (optionnel) une version pipeline si dispo
+
+BUT : si l’utilisateur ajoute/retire des fichiers bruts ou change des options → signature ≠ → reprise refusée (sauf force).
+
+## Nouvelle logique de reprise (V1)
+
+### Ajouter un helper `try_resume_phase1(...)`
+
+Rôle :
+
+* détecter `.zemosaic_img_cache`
+* lire/valider `cache_manifest.json` + `phase1.done`
+* recalculer `run_signature_current` (via scan input_folder)
+* si `resume=="auto"` : exiger signature match
+* si `resume=="force"` : ignorer mismatch signature MAIS exiger présence des fichiers essentiels
+* vérifier que toutes les entrées dans `phase1_processed_info.json` pointent vers des fichiers existants (`path_preprocessed_cache` au minimum)
+* si OK : charger la liste et reconstruire en mémoire les champs requis par les phases suivantes :
+
+  * `header = fits.Header.fromstring(header_str, sep="\n")`
+  * `wcs = astropy.wcs.WCS(header)`
+  * injecter `entry["header"]=header`, `entry["wcs"]=wcs`
+  * supprimer `header_str` du dict en mémoire (optionnel)
+
+Retour :
+
+* `resume_ok: bool`
+* `loaded_all_raw_files_processed_info: list[dict] | None`
+* `reason: str` (pour log)
+
+### Placement dans `run_hierarchical_mosaic_classic_legacy()`
+
+À l’endroit où le code gère actuellement :
+
+```py
+cache_dir_name = ".zemosaic_img_cache"
+temp_image_cache_dir = ...
+if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
+os.makedirs(temp_image_cache_dir, exist_ok=True)
+```
+
+Modifier ainsi :
+
+* Calculer `resume_mode` (`off/auto/force`) depuis `worker_config_cache.get("resume")` (et éventuellement `filter_overrides["resume"]` si fourni).
+* Si `resume_mode == "off"` → garder EXACTEMENT le bloc actuel (rmtree + mkdir).
+* Sinon :
+
+  1. Tenter `try_resume_phase1(...)`
+  2. Si reprise acceptée :
+
+     * NE PAS supprimer `.zemosaic_img_cache`
+     * définir un flag local `resume_after_phase1 = True`
+     * définir `all_raw_files_processed_info = loaded_list`
+     * ajuster la progression pour être cohérente :
+
+       * logger un message INFO “Phase 1 skipped (resume)”
+       * avancer `current_global_progress` comme si Phase 1 était finie :
+         `current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN`
+  3. Si reprise refusée :
+
+     * renommer le cache en `.zemosaic_img_cache_<timestamp>.old` (préféré) OU supprimer, puis recréer
+     * continuer run normal
+
+Ensuite :
+
+* Le bloc “Phase 1” (`# --- Phase 1 ...`) doit être conditionné :
+
+  * Phase 1 s’exécute uniquement si `not use_existing_master_tiles_mode` ET `not resume_after_phase1`.
+
+### Écriture du cache de reprise (fin Phase 1)
+
+Juste après le log `run_info_phase1_finished_cache` :
+
+* si `resume_mode != "off"` :
+
+  * écrire `phase1_processed_info.json` (liste sérialisable avec `header_str`)
+  * écrire `cache_manifest.json`
+  * créer `phase1.done`
+
+Ne pas faire échouer le run si l’écriture du manifest échoue : log WARN, puis continuer.
+
+## Logs
+
+* Utiliser `pcb("...")` avec un message direct string (pas besoin d’ajouter des clés i18n).
+* Logs requis :
+
+  * resume demandé + mode (`auto/force`)
+  * resume accepté + nb d’entrées
+  * resume refusé + raison
+  * si force : avertissement clair quand signature mismatch ignorée
+
+## Tests / Validation minimale (sans framework)
+
+Ajouter au moins une petite fonction de validation interne (ou bloc test manuel) n’est pas requis, MAIS le code doit être structuré pour être testable.
+Pas de modifications des tests existants demandées en V1.
+
+## Fichiers à modifier
+
+* `zemosaic_worker.py` uniquement (V1)
+
+  * ajout helpers (signature, manifest read/write, try_resume_phase1)
+  * patch dans `run_hierarchical_mosaic_classic_legacy()`
 
 ## Critères d’acceptation
-- Charger `example/master_tile_021.fits` ne doit **plus** produire une tuile contributive (poids=0/skip effectif).
-- Plus de rectangles/bandes “vides” dans la mosaïque finale sur le dataset repro.
-- Tests unitaires ajoutés (petites matrices synthétiques; astropy optionnel via `importorskip`).
+
+1. Avec `resume` absent → comportement identique à avant (cache supprimé au début).
+2. Avec `resume="auto"` + cache valide :
+
+   * Phase 1 est sautée
+   * Phase 2 démarre avec `all_raw_files_processed_info` reconstruit (WCS OK)
+3. Avec `resume="auto"` + cache invalide/mismatch :
+
+   * reprise refusée
+   * pipeline normal continue (cache clean)
+4. Avec `resume="force"` + signature mismatch MAIS fichiers présents :
+
+   * reprise acceptée avec WARN
+5. Aucun changement SDS/grid/existing-master-tiles : reprise désactivée dans ces cas.
+
