@@ -1,5 +1,14 @@
 # followup.md
 
+## Checklist
+- [x] Hard rejects `small_dim` / `edge_blowup` (+ `no_finite_core_or_edge`, `abs_cap_exceeded`) sans changement UI.
+- [x] Override bloqué + `accepted=False` forcé côté CLI (`zequalityMT.py`) et worker (`zemosaic_worker.py`).
+- [x] Gate appliqué aussi en mode “existing master tiles” lors de la construction de `valid_master_tiles_for_assembly`.
+- [x] Log clair par tuile rejetée : `REJECT quality gate: reason=... metrics: ...`.
+- [x] Test unitaire “synthetic tile” (bande de bord à `1e12`) : `tests/test_quality_gate_hard_rejects.py`.
+- [x] Suite tests : `python3 -m pytest -q --capture=no` (38 passed, 3 skipped).
+- [ ] Test reproductible manuel sur un dataset à tuiles toxiques (vérifier disparition des cadres)
+
 ## Ce que tu dois livrer (Codex)
 - Un patch minimal centré sur le **Master tile quality gate** (ZeQualityMT) qui rejette :
   1) master tiles trop petites / dégénérées,
@@ -49,13 +58,13 @@
 
 ## Tests à exécuter
 ### Tests unitaires (si existants)
-- Lancer la suite existante : `pytest -q` (ou commande projet).
-- Ajouter (si possible) un test simple “synthetic tile” :
+- [x] Lancer la suite existante : `python3 -m pytest -q --capture=no`.
+- [x] Ajouter un test simple “synthetic tile” :
   - image noire + bande de bord à 1e12
   - vérifier que le gate la rejette.
 
 ### Test reproductible manuel
-- Activer “Master tile quality gate” (le log doit montrer `quality_gate=True`) avec des paramètres typiques (ceux de l’UI existante) :
+- [ ] Activer “Master tile quality gate” (le log doit montrer `quality_gate=True`) avec des paramètres typiques (ceux de l’UI existante) :
   - Edge band ~64
   - K-sigma ~2.5
   - Erode ~3–8 (max UI = 12)

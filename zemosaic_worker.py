@@ -4099,8 +4099,10 @@ def _runtime_build_global_wcs_plan(
     return True
 
 
-def _zequality_accept_override(metrics: dict[str, float], threshold: float) -> bool:
+def _zequality_accept_override(metrics: dict[str, Any], threshold: float) -> bool:
     """Replicates ZeQualityMT's lenient acceptance rules."""
+    if metrics.get("hard_reject"):
+        return False
     if (
         metrics.get("CC", 0.0) >= 0.70
         and metrics.get("CER", 0.0) < 0.35
@@ -4225,11 +4227,15 @@ def _evaluate_quality_gate_metrics(
             erode_px=max(0, int(erode_px)),
         )
         score = float(metrics.get("score", float("nan")))
-        accepted = (score <= float(threshold)) or _zequality_accept_override(metrics, float(threshold))
+        thr = float(threshold)
+        hard_reject = bool(metrics.get("hard_reject"))
+        accepted = (not hard_reject) and ((score <= thr) or _zequality_accept_override(metrics, thr))
+        shape_hw = (int(arr_for_metrics.shape[0]), int(arr_for_metrics.shape[1]))
         return {
             "metrics": metrics,
             "score": score,
             "accepted": bool(accepted),
+            "shape_hw": shape_hw,
         }
     except Exception as exc:
         if pcb:
@@ -8675,6 +8681,24 @@ def _run_shared_phase45_phase5_pipeline(
     tile_weighting_enabled_flag = bool(phase5_options.get("tile_weighting_enabled"))
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
     existing_master_tiles_mode = bool(phase5_options.get("existing_master_tiles_mode"))
+    quality_gate_enabled_existing = bool(phase5_options.get("quality_gate_enabled"))
+    try:
+        quality_gate_threshold_existing = float(phase5_options.get("quality_gate_threshold", 0.48) or 0.48)
+    except Exception:
+        quality_gate_threshold_existing = 0.48
+    try:
+        quality_gate_edge_band_px_existing = int(phase5_options.get("quality_gate_edge_band_px", 64) or 64)
+    except Exception:
+        quality_gate_edge_band_px_existing = 64
+    try:
+        quality_gate_k_sigma_existing = float(phase5_options.get("quality_gate_k_sigma", 2.5) or 2.5)
+    except Exception:
+        quality_gate_k_sigma_existing = 2.5
+    try:
+        quality_gate_erode_px_existing = int(phase5_options.get("quality_gate_erode_px", 3) or 3)
+    except Exception:
+        quality_gate_erode_px_existing = 3
+    quality_gate_move_rejects_existing = bool(phase5_options.get("quality_gate_move_rejects"))
     worker_config_cache = phase45_options.get("worker_config") or {}
     phase5_force_gpu_on_ac_cfg = worker_config_cache.get("phase5_force_gpu_on_ac")
     phase5_force_gpu_on_ac_flag = _coerce_bool_flag(phase5_force_gpu_on_ac_cfg)
@@ -8731,8 +8755,88 @@ def _run_shared_phase45_phase5_pipeline(
         pcb("run_info_incremental_two_pass_parity_disabled", prog=None, lvl="INFO_DETAIL")
 
     valid_master_tiles_for_assembly = []
-    for mt_p, mt_w in master_tiles:
+    for idx, (mt_p, mt_w) in enumerate(master_tiles):
         if mt_p and _path_exists(mt_p) and mt_w and mt_w.is_celestial:
+            if existing_master_tiles_mode and quality_gate_enabled_existing:
+                data_q = None
+                alpha_mask_q: np.ndarray | None = None
+                try:
+                    with fits.open(mt_p, memmap=True, do_not_scale_image_data=True) as hdul_q:
+                        data_q = np.asarray(hdul_q[0].data)
+                        for hdu_extra in hdul_q[1:]:
+                            name = getattr(hdu_extra, "name", None)
+                            if (
+                                isinstance(name, str)
+                                and name.upper() == "ALPHA"
+                                and getattr(hdu_extra, "data", None) is not None
+                            ):
+                                alpha_mask_q = np.asarray(hdu_extra.data)
+                                break
+                except Exception as exc:
+                    pcb(
+                        "run_warn_phase5_invalid_tile_skipped_for_assembly",
+                        prog=None,
+                        lvl="WARN",
+                        filename=_safe_basename(mt_p),
+                        error=str(exc),
+                    )
+                    master_tiles[idx] = (None, None)
+                    continue
+
+                quality_eval_existing = _evaluate_quality_gate_metrics(
+                    idx,
+                    data_q,
+                    enabled=True,
+                    threshold=quality_gate_threshold_existing,
+                    edge_band=quality_gate_edge_band_px_existing,
+                    k_sigma=quality_gate_k_sigma_existing,
+                    erode_px=quality_gate_erode_px_existing,
+                    pcb=pcb,
+                    alpha_mask=alpha_mask_q,
+                    alpha_soft_threshold=QUALITY_GATE_ALPHA_SOFT_THRESHOLD,
+                )
+                if quality_eval_existing and quality_eval_existing.get("metrics"):
+                    accepted_existing = bool(quality_eval_existing.get("accepted", True))
+                    if not accepted_existing:
+                        metrics = quality_eval_existing.get("metrics") or {}
+                        score = float(quality_eval_existing.get("score", 0.0))
+                        reason = str(metrics.get("hard_reject_reason") or "")
+                        if not reason:
+                            reason = "score"
+                        shape_hw = quality_eval_existing.get("shape_hw")
+                        try:
+                            h = int(shape_hw[0]) if shape_hw else 0
+                            w = int(shape_hw[1]) if shape_hw else 0
+                        except Exception:
+                            h, w = 0, 0
+                        b_val = metrics.get("edge_band", quality_gate_edge_band_px_existing)
+                        nbr = float(metrics.get("NBR", float("nan")))
+                        core_p99 = float(metrics.get("core_p99", float("nan")))
+                        edge_p99 = float(metrics.get("edge_p99", float("nan")))
+                        edge_ratio = float(metrics.get("edge_ratio", float("nan")))
+                        try:
+                            logger.warning(
+                                "REJECT quality gate: reason=%s shape=(%d,%d) b=%s score=%.3f thr=%.3f metrics: NBR=%.3f core_p99=%.3g edge_p99=%.3g edge_ratio=%.3g",
+                                reason,
+                                h,
+                                w,
+                                str(b_val),
+                                score,
+                                float(quality_gate_threshold_existing),
+                                nbr,
+                                core_p99,
+                                edge_p99,
+                                edge_ratio,
+                            )
+                        except Exception:
+                            pass
+                        if quality_gate_move_rejects_existing:
+                            moved_path, moved = _move_quality_reject_file(str(mt_p))
+                            if moved:
+                                logger.warning("[ZeQualityMT] moved rejected existing master tile to %s", moved_path)
+                        master_tiles[idx] = (None, None)
+                        continue
+
             valid_master_tiles_for_assembly.append((mt_p, mt_w))
         else:
             pcb(
@@ -12863,11 +12967,16 @@ def create_master_tile(
             if not (0 <= y0 < y1 <= h_lum and 0 <= x0 < x1 <= w_lum):
                 raise ValueError("invalid crop rectangle")
 
-            crop_area = (y1 - y0) * (x1 - x0)
+            crop_h = int(y1 - y0)
+            crop_w = int(x1 - x0)
+            crop_area = crop_h * crop_w
             full_area = h_lum * w_lum
-            if crop_area <= 0 or (crop_area / max(1, full_area)) >= 0.97:
+            area_ratio = crop_area / max(1, full_area)
+            min_crop_dim = min(crop_h, crop_w)
+            min_crop_dim_floor = 128
+            if crop_area <= 0 or area_ratio >= 0.97 or min_crop_dim < min_crop_dim_floor:
                 pcb_tile(
-                    f"MT_CROP: quality crop skipped (rect={y0,x0,y1,x1}, area_ratio={crop_area/max(1, full_area):.3f})",
+                    f"MT_CROP: quality crop skipped (rect={y0,x0,y1,x1}, area_ratio={area_ratio:.3f}, min_dim={min_crop_dim})",
                     prog=None,
                     lvl="WARN",
                 )
@@ -13593,6 +13702,42 @@ def create_master_tile(
                 status_label,
             )
             if not accepted_flag:
+                try:
+                    reason = str(metrics.get("hard_reject_reason") or "")
+                    if not reason:
+                        reason = "score"
+                    shape_hw = None
+                    try:
+                        shape_hw = quality_gate_eval.get("shape_hw") if isinstance(quality_gate_eval, dict) else None
+                    except Exception:
+                        shape_hw = None
+                    if not shape_hw:
+                        try:
+                            shape_hw = tuple(int(x) for x in master_tile_stacked_HWC.shape[:2])
+                        except Exception:
+                            shape_hw = (0, 0)
+                    h = int(shape_hw[0]) if shape_hw else 0
+                    w = int(shape_hw[1]) if shape_hw else 0
+                    b_val = metrics.get("edge_band", quality_gate_edge_band_px)
+                    nbr = float(metrics.get("NBR", float("nan")))
+                    core_p99 = float(metrics.get("core_p99", float("nan")))
+                    edge_p99 = float(metrics.get("edge_p99", float("nan")))
+                    edge_ratio = float(metrics.get("edge_ratio", float("nan")))
+                    logger.warning(
+                        "REJECT quality gate: reason=%s shape=(%d,%d) b=%s score=%.3f thr=%.3f metrics: NBR=%.3f core_p99=%.3g edge_p99=%.3g edge_ratio=%.3g",
+                        reason,
+                        h,
+                        w,
+                        str(b_val),
+                        score,
+                        float(quality_gate_threshold),
+                        nbr,
+                        core_p99,
+                        edge_p99,
+                        edge_ratio,
+                    )
+                except Exception:
+                    pass
                 if quality_gate_move_rejects:
                     moved_path, moved = _move_quality_reject_file(str(temp_fits_path))
                     if moved:
@@ -19781,6 +19926,12 @@ def run_hierarchical_mosaic_classic_legacy(
             "tile_weighting_enabled": tile_weighting_allowed,
             "tile_weight_mode": tile_weight_mode_config,
             "existing_master_tiles_mode": bool(use_existing_master_tiles_mode),
+            "quality_gate_enabled": bool(quality_gate_enabled_config),
+            "quality_gate_threshold": float(quality_gate_threshold_config),
+            "quality_gate_edge_band_px": int(quality_gate_edge_band_px_config),
+            "quality_gate_k_sigma": float(quality_gate_k_sigma_config),
+            "quality_gate_erode_px": int(quality_gate_erode_px_config),
+            "quality_gate_move_rejects": bool(quality_gate_move_rejects_config),
         }
 
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:

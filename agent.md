@@ -3,6 +3,15 @@
 ## Mission
 Éliminer les **master tiles pathologiques** qui polluent la mosaïque finale en créant des **cadres visibles** (bords brillants/parasites), **sans ajouter de nouvelle couche** de traitement : on **recycle** le mécanisme existant **“Master tile quality gate”** (ZeQualityMT).
 
+## Progress
+- [x] Implémenter les hard rejects `small_dim` / `edge_blowup` (+ `no_finite_core_or_edge`, `abs_cap_exceeded`) dans `zequalityMT.py:quality_metrics` + métriques (`core_p99`, `edge_p99`, `edge_ratio`, `hard_reject*`).
+- [x] Forcer `accepted=False` si `hard_reject=1` dans `zequalityMT.py:run_cli` et `zemosaic_worker.py:_evaluate_quality_gate_metrics`.
+- [x] Bloquer l’override d’acceptation si `hard_reject=1` dans `zequalityMT.py:_accept_override` et `zemosaic_worker.py:_zequality_accept_override`.
+- [x] Appliquer le gate aussi en mode “I’m using master tiles” lors de la construction de `valid_master_tiles_for_assembly` (sans toucher à reproject/coadd).
+- [x] Ajouter un log par tuile rejetée avec `reason=<...>` + métriques (`NBR`, `core_p99`, `edge_p99`, `edge_ratio`).
+- [x] Ajouter un test unitaire synthetic + exécuter `pytest` (38 passed, 3 skipped).
+- [ ] Test manuel sur dataset réel : vérifier disparition des cadres sur la mosaïque finale.
+
 ## Constat (symptômes)
 - Sur la mosaïque finale, on distingue clairement des rectangles/cadres correspondant à certaines master tiles (ex: 154/158/159/161/162/166/169/176/181/182/183/185…).
 - Plusieurs master tiles sont :

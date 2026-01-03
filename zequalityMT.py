@@ -376,8 +376,14 @@ def quality_metrics(arr, edge_band=64, k_sigma=2.5, erode_px=3, galaxy_protect=T
     """
     Retourne un dict de métriques + score (edge-friendly, object-agnostic):
       CC, ED, SC, NBR, BU, SDED, CEC, EOC, TRL, CER, score
+      hard_reject, hard_reject_reason, core_p99, edge_p99, edge_ratio
     """
     H, W, _ = arr.shape
+    min_dim = int(min(H, W))
+    hard_reject_reason = ""
+    core_p99 = float("nan")
+    edge_p99 = float("nan")
+    edge_ratio = float("nan")
     borrowed = []
     def borrow(shape, dtype):
         buf = _buffer_pool.borrow(shape, dtype)
@@ -406,6 +412,42 @@ def quality_metrics(arr, edge_band=64, k_sigma=2.5, erode_px=3, galaxy_protect=T
         edge_mask[:b, :] = edge_mask[-b:, :] = edge_mask[:, :b] = edge_mask[:, -b:] = True
         center_mask = borrow((H, W), bool)
         np.logical_not(edge_mask, out=center_mask)
+
+        # (0-bis) Hard reject : edge blow-up / tuile dégénérée
+        # Construire une intensité robuste (absmax) et comparer bord vs coeur.
+        plane = borrow((H, W), np.float32)
+        tmp = borrow((H, W), np.float32)
+        np.abs(rgb[..., 0], out=plane)
+        np.abs(rgb[..., 1], out=tmp)
+        np.fmax(plane, tmp, out=plane)
+        np.abs(rgb[..., 2], out=tmp)
+        np.fmax(plane, tmp, out=plane)
+
+        core_vals = plane[center_mask]
+        edge_vals = plane[edge_mask]
+        core_finite = core_vals[np.isfinite(core_vals)]
+        edge_finite = edge_vals[np.isfinite(edge_vals)]
+        eps = 1e-6
+        abs_floor = 1e-5
+        ratio_thr = 1e6
+        abs_cap = 1e25
+        if core_finite.size == 0 or edge_finite.size == 0:
+            hard_reject_reason = "no_finite_core_or_edge"
+        else:
+            core_p99 = float(np.nanpercentile(core_finite, 99))
+            edge_p99 = float(np.nanpercentile(edge_finite, 99))
+            edge_ratio = float(edge_p99 / max(core_p99, eps))
+            try:
+                plane_max = float(np.nanmax(plane))
+            except Exception:
+                plane_max = float("nan")
+            if np.isfinite(plane_max) and plane_max > abs_cap:
+                hard_reject_reason = "abs_cap_exceeded"
+            elif edge_ratio > ratio_thr and edge_p99 > abs_floor:
+                hard_reject_reason = "edge_blowup"
+        if not hard_reject_reason and min_dim < 128:
+            hard_reject_reason = "small_dim"
+        hard_reject = bool(hard_reject_reason)
 
         # (A) Masque ciel (sans objet), stats ancrées au centre
         g_med = float(np.nanmedian(lum[~obj_mask])) if np.any(~obj_mask) else float(np.nanmedian(lum))
@@ -440,8 +482,15 @@ def quality_metrics(arr, edge_band=64, k_sigma=2.5, erode_px=3, galaxy_protect=T
 
         # (4) NaN/zero border ratio
         thr_zero = m_ctr - 2.5*s_ctr
-        nan_or_zero = ~np.isfinite(lum) | (lum <= thr_zero)
-        NBR = float(np.count_nonzero(nan_or_zero & edge_mask)) / float(edge_mask.sum())
+        # Bad pixel = non-fini OR <= thr_zero OR absurdement haut vs coeur (cap adaptatif)
+        if np.isfinite(core_p99):
+            high_cap = max(core_p99, eps) * 1e8
+        else:
+            high_cap = float("inf")
+        nan_or_bad = ~np.isfinite(lum) | (lum <= thr_zero)
+        if np.isfinite(high_cap):
+            nan_or_bad |= (plane >= high_cap)
+        NBR = float(np.count_nonzero(nan_or_bad & edge_mask)) / float(edge_mask.sum())
 
         # (4-bis) Coins vides / diagonaux
         CER = _corner_emptiness(bg_mask=useful, edge_band=edge_band)
@@ -503,6 +552,11 @@ def quality_metrics(arr, edge_band=64, k_sigma=2.5, erode_px=3, galaxy_protect=T
             "CC": CC, "ED": ED, "SC": SC, "NBR": NBR, "BU": BU,
             "SDED": SDED, "CEC": CEC, "EOC": EOC, "TRL": TRL, "CER": CER,
             "score": float(score),
+            "hard_reject": int(hard_reject),
+            "hard_reject_reason": str(hard_reject_reason),
+            "core_p99": float(core_p99),
+            "edge_p99": float(edge_p99),
+            "edge_ratio": float(edge_ratio),
             "edge_band": b, "k_sigma": float(k_sigma), "erode_px": int(erode_px),
         }
         return out
@@ -515,6 +569,8 @@ def _accept_override(m, thr):
     """
     Règle “edge-friendly” : on sauve les bonnes tuiles même si le score est un poil > thr.
     """
+    if m.get("hard_reject"):
+        return False
     # bonne couverture, coins OK, bord pas trop décalé → on garde
     if m["CC"] >= 0.70 and m["CER"] < 0.35 and m["ED"] < 1.2:
         return True
@@ -547,7 +603,7 @@ def run_cli(paths, threshold=0.48, move_rejects=False, edge_band=64, k_sigma=2.5
             m = quality_metrics(arr, edge_band=edge_band, k_sigma=k_sigma, erode_px=erode_px)
             s = m["score"]
             scores[path_str] = s
-            keep = (s <= threshold) or _accept_override(m, threshold)
+            keep = (not bool(m.get("hard_reject"))) and ((s <= threshold) or _accept_override(m, threshold))
             if keep:
                 accepted.append(path_str)
             else:
