@@ -1,72 +1,81 @@
-# Follow-up — Validation & garde-fous (référence centrale master tiles)
+# followup.md
 
-## Checklist “ne pas casser”
-- [x] Aucun changement sur le tri/ordering global des images (juste choix de référence).
-- [x] Ne pas changer la logique `allow_batch_duplication` / `target_stack_size` / `min_safe_stack_size`.
-- [x] `reference_image_index` envoyé à `align_images_in_group` est **toujours** un index dans `tile_images_data_HWC_adu`.
-- [x] `ZMT_REF` (header) pointe vers le même raw que la référence (pas un autre index).
+## Ce que tu dois livrer (Codex)
+- Un patch minimal centré sur le **Master tile quality gate** (ZeQualityMT) qui rejette :
+  1) master tiles trop petites / dégénérées,
+  2) master tiles à “edge blow-up” (bords outliers extrêmes),
+  3) (si déjà dans la logique) tuiles trop “vides” selon métriques existantes,
+  sans changer l’UI.
+- Important : `NBR` seul ne suffit pas (poids faible dans le score). Les cas `small_dim` / `edge_blowup` doivent être des **hard rejects** (acceptation forcée à FALSE + override bloqué, sans dépendre du score).
 
-## Tests manuels rapides
-### 1) Cas nominal (cache OK)
-- Lancer une mosaïque standard (Seestar EQ ou alt-az).
-- Vérifier dans les logs `mastertile_info_reference_set`:
-  - `ref_index_loaded` varie (pas toujours 0)
-  - `ref_mode` = central (si loggé)
-- Vérifier visuellement: moins de zones “vides” ou crops agressifs intra tuile (tendance).
+## Détails d’implémentation recommandés
+### 1) Détection edge blow-up (robuste)
+- Construire `plane` (intensité):
+  - RGB → `np.nanmax(np.abs(data[..., :3]), axis=2)`
+  - mono → `np.abs(data)`
+- Réutiliser les masques déjà construits dans `quality_metrics` : `edge_mask` (ring) et `center_mask` (core) — `b` est déjà clampé.
+- Garde-fou “slice vide / all-NaN” :
+  - si `plane[center_mask]` ou `plane[edge_mask]` n’a **aucune** valeur finie → **hard reject** `reason=no_finite_core_or_edge`
+- Calcul :
+  - `core_p99 = np.nanpercentile(plane[center_mask], 99)`
+  - `edge_p99 = np.nanpercentile(plane[edge_mask], 99)`
+- Déclencheur conservateur (ne pas rejeter pour une simple étoile brillante au bord, viser les artefacts extrêmes) :
+  - `edge_p99 > max(core_p99, eps) * 1e6`
+- Coupe-circuit “cap absolu” (optionnel mais très utile) :
+  - si `np.nanmax(plane) > 1e25` → **hard reject** `reason=abs_cap_exceeded`
+- Si déclenché : **hard reject**
+  - exposer des métriques (`core_p99`, `edge_p99`, `edge_ratio`) et un flag (`hard_reject=1`, `reason=edge_blowup` via des clés **stables et non-renommables**),
+  - et dans la décision d’acceptation :
+    - `zequalityMT.py:run_cli`
+    - `zemosaic_worker.py:_evaluate_quality_gate_metrics`
+    `hard_reject=1` ⇒ `accepted=False` **quel que soit** le threshold (score éventuellement élevé uniquement pour debug).
 
-### 2) Cas “cache manquant” (robustesse index)
-- Simuler 1-2 caches absents (renommer temporairement quelques `.npy` dans le cache)
-- Relancer sur une tuile concernée
-Attendu:
-- pas de crash `invalid_ref_index`
-- si la réf préférée est absente: fallback sur une référence chargée (souvent centrale des chargées)
+### 2) Étendre NBR (“bad pixels on edges”)
+- Bad pixel = non-fini OR <= thr_zero OR >= high_cap
+- `high_cap = max(core_p99, eps) * 1e8`
+- NBR = fraction de bad dans ring/edges
+- Utiliser `k_sigma` si déjà dans le code (sinon rester simple avec p99 ratio).
 
-### 3) Cas “cache invalide”
-- Injecter un `.npy` invalide (shape/dtype incorrect) pour une frame non-référence
-Attendu:
-- frame skip loggée
-- pas de décalage d’index qui casse l’aligneur
+### 3) Rejet tuiles trop petites
+- Dans le gate, si `min(h, w) < 128` → **hard REJECT**. Le calcul doit être `min(arr.shape[0], arr.shape[1])` pour ignorer le channel.
+(seuil volontairement conservateur, mais **doit** au minimum attraper 32×32)
 
-### 4) Cas “aucune image chargée”
-Ne pas modifier la gestion actuelle du cas où tile_images_data_HWC_adu est vide (aucun cache chargé) : conserver exactement le même comportement (abort / log) qu’avant, sans essayer d’inventer un ref_loaded_idx
+### 4) Override d’acceptation
+- Si une fonction “accept_override” existe :
+  - empêcher l’acceptation d’une tuile si `hard_reject=1` (en particulier `edge_blowup` / `small_dim`),
+  - synchroniser la logique entre `zequalityMT.py` et `zemosaic_worker.py` (la règle est dupliquée côté worker).
+- Rendre la règle explicite :
+  - dans `zequalityMT.py:_accept_override` et `zemosaic_worker.py:_zequality_accept_override` : commencer par `if hard_reject: return False`
 
-### 5) Log et outils externes
-Ne pas renommer ni supprimer les champs déjà présents dans mastertile_info_reference_set (ajouts seulement), pour ne pas casser d’éventuels parsers de logs externes.
+## Tests à exécuter
+### Tests unitaires (si existants)
+- Lancer la suite existante : `pytest -q` (ou commande projet).
+- Ajouter (si possible) un test simple “synthetic tile” :
+  - image noire + bande de bord à 1e12
+  - vérifier que le gate la rejette.
 
-### 6) Tests de modes spécifiques (anti-régression)
-- **SDS success path** :
-  - Lancer un projet avec `SeeStar_Stack_Method = sds`.
-  - Attendu : vérifier dans les logs que la Phase 3 (`create_master_tile`) n'est **pas** appelée. La sortie doit être identique à la version précédente.
-- **Existing master tiles mode** :
-  - Lancer un projet qui réutilise des master tiles existants.
-  - Attendu : vérifier que le log `run_info_existing_master_tiles_mode` s'affiche et que la Phase 3 est bien sautée (skip).
-- **Grid mode run** :
-  - Lancer un petit projet en mode grille (`grid_mode`).
-  - Attendu : le traitement doit se terminer sans exception et les outputs doivent être cohérents (mosaïque assemblée).
+### Test reproductible manuel
+- Activer “Master tile quality gate” (le log doit montrer `quality_gate=True`) avec des paramètres typiques (ceux de l’UI existante) :
+  - Edge band ~64
+  - K-sigma ~2.5
+  - Erode ~3–8 (max UI = 12)
+- Rejouer le run sur un dataset contenant des tuiles toxiques.
+- Vérifier :
+  - fichiers déplacés dans sous-dossier “rejected”
+  - plus de rectangles/cadres sur mosaïque finale
+  - logs de rejet présents (inclure `shape=(H,W)` + `b=...` pour diagnostic immédiat)
 
-## Tests unitaires (si la suite existe dans le repo)
-Ajouter/adapter un test léger (sans IO) : [x]
-- Construire un faux groupe de 5 infos dict:
-  - 1) ra/dec = (10, 0)
-  - 2) ra/dec = (11, 0)
-  - 3) ra/dec = (12, 0)  <-- central attendu
-  - 4) ra/dec = (13, 0)
-  - 5) ra/dec = (14, 0)
-  + wcs fake: `is_celestial=True`
-  + header fake: contient `CRVAL1/CRVAL2`
-- Vérifier que `_pick_central_reference_index(infos, require_cache_exists=False)` renvoie index 2.
+## Garde-fous
+- Ne pas modifier l’assemblage final (reproject/coadd).
+- Ne pas ajouter de nouveaux paramètres UI.
+- Ne pas modifier les comportements “batch size” existants.
+- Toute modification doit être encapsulée dans le quality gate :
+  - si gate OFF → aucune différence.
+  - **Test manuel simple** : pour un même dataset, un run avec le code patché mais `quality_gate_enabled=False` doit produire exactement la même liste et le même nombre de master tiles qu'un run avec le code *avant* le patch. La vérification de la liste des tuiles suffit, pas besoin de comparer le FITS final.
 
-Test mapping:
-- Simuler `loaded_group_indices = [0,1,3,4]` (index 2 manquant)
-- Vérifier fallback central sur loaded ⇒ proche de 3 (selon distribution) mais surtout:
-  - `ref_loaded_idx` ∈ [0..len(loaded)-1]
+## Definition of Done
+- Les tuiles pathologiques (dégénérées ou bords explosés) sont rejetées par le gate.
+- Le rendu final ne montre plus les cadres.
+- Aucun impact visible sur les runs où ces cas n’apparaissent pas.
+- Log clair et actionnable.
 
-Test mapping "failed indices" :
-- Rappel: `failed_alignment_indices` sont des indices dans la liste chargée (`tile_images_data_HWC_adu` / `loaded_infos`), pas dans `seestar_stack_group_info`.
-- loaded_group_indices=[0,2,5]
-- failed_alignment_indices=[1]
-- attendu : retry_group contient seestar_stack_group_info[2] (pas [1])
-
-## Perf
-- Vérifier que le choix central n’ajoute pas de lecture FITS.
-- Complexité O(N) (N = taille du groupe), coût négligeable vs align+stack.

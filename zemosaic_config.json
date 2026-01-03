@@ -129,7 +129,7 @@
         1.07
     ],
     "use_auto_intertile": true,
-    "match_background_for_final": false,
+    "match_background_for_final": true,
     "incremental_feather_parity": false,
     "enable_early_filter": true,
     "apply_master_tile_crop": true,

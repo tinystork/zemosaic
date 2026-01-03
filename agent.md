@@ -1,158 +1,109 @@
-# Mission — Master Tiles: Référence centrale (safe, déterministe, sans surcoût)
+# agent.md
+
+## Mission
+Éliminer les **master tiles pathologiques** qui polluent la mosaïque finale en créant des **cadres visibles** (bords brillants/parasites), **sans ajouter de nouvelle couche** de traitement : on **recycle** le mécanisme existant **“Master tile quality gate”** (ZeQualityMT).
+
+## Constat (symptômes)
+- Sur la mosaïque finale, on distingue clairement des rectangles/cadres correspondant à certaines master tiles (ex: 154/158/159/161/162/166/169/176/181/182/183/185…).
+- Plusieurs master tiles sont :
+  - soit **dégénérées** (ex: 32×32×3, CRPIX aberrants),
+  - soit **quasi vides** avec **bords contenant des valeurs extrêmes** (ex: ~1e35), tout en étant **opaques/valides** (ALPHA ≈ 255 partout).  
+  => Même si “l’intérieur” est noir/0 ou NaN, les **bords** contribuent au coadd et deviennent des **cadres** très visibles.
+
+## Hypothèses validées
+- Dans `zemosaic_worker.log`, on voit des lignes `MT_PIPELINE: ... quality_gate=False` : sur ce run, le gate est **désactivé** (donc aucun rejet n’est possible tant qu’il reste OFF).
+- Le problème n’est **pas** principalement lié à un fallback incremental dans l’assemblage final (pas de trace claire dans le log du run).  
+- Un seuil “>40% NaN” seul n’est **pas** adapté, car ces tuiles peuvent être **finies** (pas NaN) et “valides” via ALPHA, mais **corrompues** par des outliers énormes sur les bords.
 
 ## Objectif
-Lors de `create_master_tile` (Phase 3), remplacer le choix implicite `reference_image_index_in_group = 0` par un choix **référence centrale** (meilleur compromis recouvrement / crop / interpolation),
-tout en restant:
-- **déterministe** (même dataset ⇒ même référence)
-- **O(N)** (pas de O(N²), pas d’IO additionnel lourd)
-- **sans régression** sur les cas où certaines entrées ne sont pas chargées (cache manquant / cache invalide).
+Faire en sorte que le **quality gate** rejette automatiquement ces tuiles toxiques **avant** l’assemblage final (reproject/coadd), en détectant :
+1) les tuiles **trop petites/dégénérées** (ex: 32×32),
+2) les tuiles dont les **bords explosent** (edge blow-up) par valeurs extrêmes par rapport au cœur,
+3) (optionnel) les tuiles trop peu “utiles” après masque (valid fraction très faible).
 
-## Contrainte critique (anti-bug)
-⚠️ `align_images_in_group` attend un `reference_image_index` qui est un index dans la **liste chargée** (`tile_images_data_HWC_adu`), pas dans `seestar_stack_group_info`.
-Or `tile_images_data_HWC_adu` peut être plus courte (cache manquant / data invalide / skip).
-Donc la mission DOIT:
-- calculer un **index de référence “group”** (dans `seestar_stack_group_info`)
-- puis le **mapper** vers un **index de référence “loaded”** (dans `tile_images_data_HWC_adu`)
-- et si la référence “group” n’a pas été chargée, choisir une référence centrale **parmi les chargées** (fallback).
+## Contraintes (anti-régression)
+- Ne pas modifier le pipeline d’assemblage final (reproject/coadd), ni ajouter un “post-mask” supplémentaire ailleurs.
+- Ne pas modifier l’UI (pas de nouveaux sliders/checkbox). On réutilise les réglages existants du gate :  
+  - Threshold, Edge band (px), K-sigma, Erode (px)
+- Ne pas casser les modes : **SDS**, **Grid mode**, **“I’m using master tiles”**. Pour ce dernier, si l’utilisateur charge des master tiles existantes et si `quality_gate_enabled=True`, le gate doit être appliqué au moment de constituer `valid_master_tiles_for_assembly` (pas seulement pendant la création des master tiles). Il faut appliquer exactement la même évaluation avant de construire la liste `valid_master_tiles_for_assembly` (sans toucher à reproject/coadd).
+- Comportement inchangé si **quality gate désactivé**.
+- Garder `zequalityMT.py` **standalone** (il est importé par ZeMosaic mais aussi exécutable seul).
 
-- Mapping explicite obligatoire pour `failed_alignment_indices` (voir Implémentation, section 3).
-- Ordre strict : si `tile_images_data_HWC_adu` est vide ⇒ abort comme aujourd’hui, avant tout calcul de `ref_loaded_idx` / `ref_group_idx` / `ref_info_for_tile`.
-- WCS/Header : validation uniquement à partir de ref_info_for_tile = loaded_infos[ref_loaded_idx].
-
-## Portée (scope)
-- Fichier principal: `zemosaic_worker.py`
-- Fonction: `create_master_tile`
-- Aucun changement GUI.
-- Aucun ajout de clés i18n/locales (pas de nouvelles strings obligatoires).
-- Ne pas modifier le comportement “batch size = 0” et “batch size > 1” (intouchable).
-
-## Stratégie de sélection “centrale”
-On choisit l’image dont le centre (RA/DEC) est le plus proche du centroïde du groupe.
-Implémentation recommandée (robuste RA wrap):
-- convertir RA/DEC → vecteurs unitaires (x,y,z)
-- moyenne des vecteurs → vecteur centroïde normalisé
-- score = 1 - dot(v, centroïde)
-- prendre le minimum (tie-break: plus petit index original)
-
-### Sources de RA/DEC
-Réutiliser les helpers existants:
-- `_extract_ra_dec_deg(info)` (déjà robuste: WCS pixel_to_world puis CRVAL fallback)
-- `_unit_vector_from_ra_dec(ra_deg, dec_deg)`
-
-### Candidats valides (pour éviter des crashs)
-Ne considérer “candidat” que si:
-- `info` est un `dict`
-- `info.get("wcs")` existe et `wcs.is_celestial == True`
-- `info.get("header")` non vide
-- et `_extract_ra_dec_deg(info)` retourne bien (ra, dec)
-Optionnel mais recommandé côté “group” (pré-sélection): exiger aussi que `path_preprocessed_cache` existe sur disque (évite de choisir une réf qui ne chargera jamais).
-
-## Implémentation (pas à pas)
-
-### 1) [x] Ajouter un helper local (dans zemosaic_worker.py)
-Ajouter une fonction utilitaire (près de `create_master_tile` ou en helpers) :
-
-`_pick_central_reference_index(infos: list[dict], require_cache_exists: bool) -> int | None`
-
-- **Garde-fou “jamais de crash”**: La fonction DOIT être encapsulée dans un `try/except` global. Si un calcul échoue (ex: `NaN`, données non-finies), elle doit immédiatement retourner un fallback sûr (`None` ou `0` selon le contexte d'appel) pour éviter tout crash.
-- Renvoie un index dans la liste `infos`
-- Retourne `None` si aucun candidat valide
-- Tie-break déterministe: (score, index)
-
-Pseudo:
-- construire `candidates = [(idx, ra, dec)]`
-- centroïde via somme des unit vectors
-- sélectionner meilleur idx
-- si aucun candidat:
-  - fallback: premier idx qui a wcs+header (et cache si require_cache_exists)
-  - sinon `None`
-
-### 2) [x] Dans create_master_tile: calculer un “preferred_group_idx”
-Pour éviter de biaiser le choix en cas de duplication (`allow_batch_duplication`), le `preferred_group_idx` est calculé sur la liste originale (**avant** la duplication), puis l'index est mappé sur la première occurrence correspondante dans la liste dupliquée.
-
-L'opération se déroule donc ainsi :
-- Calculer `preferred_group_idx` sur `seestar_stack_group_info` avant sa modification.
-- Si `None`, fallback `preferred_group_idx = 0`.
-- Après `allow_batch_duplication`, retrouver la nouvelle position de cet index.
-
-⚠️ MUST NOT fix `wcs_for_master_tile` / `header_for_master_tile_base` at this stage (car la réf peut ne pas être chargée finalement).
-
-### 3) [x] Pendant le chargement cache: conserver un mapping group→loaded
-Dans la boucle `for i, raw_file_info in enumerate(seestar_stack_group_info):`
-quand un cache est effectivement chargé et validé:
-- `tile_images_data_HWC_adu.append(img_data_adu)`
-- `tile_original_raw_headers.append(raw_file_info.get("header"))`
-- AJOUTER:
-  - `loaded_infos.append(raw_file_info)`
-  - `loaded_group_indices.append(i)`
-
-Puis construire après la boucle:
-- `group_to_loaded = {group_i: loaded_i for loaded_i, group_i in enumerate(loaded_group_indices)}`
-
-#### Mapping des `failed_alignment_indices` (obligatoire)
-Lors de la construction de `retry_group`, considérer chaque `idx_fail` comme un index dans la liste chargée (`tile_images_data_HWC_adu` / `loaded_infos`), pas comme un index dans `seestar_stack_group_info`.
+## Stratégie technique (recycler le gate existant)
+### A) Point critique : NBR/score ne suffisent pas → “hard reject” nécessaire
+Dans `zequalityMT.py`, le score est une somme pondérée “soft” (NBR pèse ~0.10–0.12). Même un NBR=1.0 reste souvent **sous** le seuil (0.48) si le reste est “bon”.  
+=> Pour éviter toute régression *et* garantir l’exclusion des cas catastrophiques, introduire un **hard reject** interne (sans UI) pour :
+- `small_dim` (tuile dégénérée),
+- `edge_blowup` (valeurs extrêmes concentrées sur le bord).
 
 Implémentation attendue :
-- Vérifier `0 <= idx_fail < len(loaded_group_indices)`.
-- Calculer `group_idx = loaded_group_indices[idx_fail]`.
-- Utiliser ensuite `group_idx` pour récupérer `seestar_stack_group_info[group_idx]` lors de la construction de `retry_group`.
+- Dans `zequalityMT.py:quality_metrics`, détecter ces cas et exposer des métriques explicites (ex: `core_p99`, `edge_p99`, `edge_ratio`, `hard_reject`).
+- Dans la décision d’acceptation :
+  - `zequalityMT.py:run_cli` (mode standalone)
+  - `zemosaic_worker.py:_evaluate_quality_gate_metrics` (pipeline ZeMosaic)
+  un `hard_reject=1` doit **forcer** `accepted=False` **quel que soit** le threshold.
+- Bloquer toute “accept override” sur ces cas (défense en profondeur) :
+  - `zequalityMT.py:_accept_override`
+  - `zemosaic_worker.py:_zequality_accept_override` (copie de la logique)
 
-Exemple :
-- `loaded_group_indices = [0, 2, 5]`
-- `failed_alignment_indices = [1]`
-- ⇒ `group_idx = loaded_group_indices[1] = 2` ⇒ on pousse bien `seestar_stack_group_info[2]` dans `retry_group`.
+### A-bis) Contrat des métriques (pour communication zequalityMT ↔ worker)
+Pour éviter tout mismatch, le dictionnaire de métriques retourné par `zequalityMT.py` doit formaliser les clés suivantes. **Ne pas renommer ces clés**, car elles forment un contrat strict entre `zequalityMT.py` (le CLI standalone) et `zemosaic_worker.py` (l'intégrateur) ; toute désynchronisation casserait le mécanisme de rejet.
+- `hard_reject`: `bool` (ou `int` 0/1) — Si `True`, le rejet est forcé.
+- `hard_reject_reason`: `str` — Raison textuelle du hard reject (ex: 'edge_blowup', 'small_dim').
+- `core_p99`, `edge_p99`, `edge_ratio`: `float` — Métriques d'analyse pour le logging.
 
-#### Ordre exact — cas “aucune image chargée”
-Ne pas déplacer le bloc existant qui abort quand aucune image n’a été chargée :
-- Conserver le `return (None, None), failed_groups_to_retry` sous le test `if not tile_images_data_HWC_adu:`.
-- Le calcul de `ref_loaded_idx` / `ref_group_idx` / `ref_info_for_tile` doit se faire après ce `if`, mais avant l’appel à `align_images_in_group`.
+### B) Détection edge blow-up (valeurs extrêmes sur les bords)
+Implémenter dans `zequalityMT.py:quality_metrics` (en restant robuste aux NaN via le masque alpha déjà appliqué par ZeMosaic) :
+- Construire une intensité robuste `absmax` :
+  - RGB → `absmax = np.nanmax(np.abs(arr[..., :3]), axis=2)`
+- Réutiliser les masques déjà présents : `edge_mask` et `center_mask` (core).
+- Garde-fou “slice vide / all-NaN” :
+  - avant tout `np.nanpercentile`, vérifier qu’il existe des pixels **finis** dans le core et le bord,
+  - si core ou edge n’a **aucun** pixel fini → `hard_reject=1` + `hard_reject_reason=no_finite_core_or_edge` (évite warnings/NaN silencieux et tuiles “fantômes”).
+- Calculer des quantiles robustes (p99) :
+  - `core_p99 = np.nanpercentile(absmax[center_mask], 99)`
+  - `edge_p99 = np.nanpercentile(absmax[edge_mask], 99)`
+  - `edge_ratio = edge_p99 / max(core_p99, eps)`
+- Déclencher `edge_blowup` de façon **très conservatrice**. Le but est d'attraper les artefacts de bord et non de pénaliser les objets astrophysiques légitimes. **Ne pas rejeter une tuile juste parce qu’elle a une étoile brillante sur un bord** ; les déclencheurs doivent rester “astronomiquement” extrêmes pour ne cibler que les vrais cas pathologiques.
+  - `edge_ratio > 1e6`
+  - **et** `edge_p99` > `seuil_plancher_absolu` (ex: 1e-5, pour ne pas déclencher sur du bruit numérique si `core_p99` est quasi nul).
+  - avec `eps` choisi pour éviter les faux positifs sur images quasi nulles (ex: `eps=1e-6` en float64).
+- Coupe-circuit “cap absolu” (optionnel mais utile) :
+  - si `np.nanmax(absmax) > 1e25` → `hard_reject=1` + `hard_reject_reason=abs_cap_exceeded`
+  - (c’est volontairement astronomiquement haut : ça attrape instantanément des valeurs type `~1e35` sans dépendre du ratio).
+- Marquer le hard reject :
+  - `hard_reject=1` et `hard_reject_reason=edge_blowup` (raison transportée via des clés numériques/flags si possible).
+  - (optionnel) forcer un `score` élevé uniquement pour observabilité, mais **ne pas** dépendre du score pour rejeter.
 
-### 4) [x] Déterminer la référence finale “loaded”
-- Si `preferred_group_idx` est dans `group_to_loaded`:
-  - `ref_loaded_idx = group_to_loaded[preferred_group_idx]`
-- Sinon:
-  - choisir une référence centrale parmi `loaded_infos`:
-    - `ref_loaded_idx = _pick_central_reference_index(loaded_infos, require_cache_exists=False)`
-  - si `None`, fallback `ref_loaded_idx = 0`
+### C) Rejet tuiles trop petites (dégénérées)
+Hard reject si `min_dim < 128`, où `min_dim = min(arr.shape[0], arr.shape[1])` pour ne cibler que les dimensions spatiales (H, W) et ignorer le channel. Ce seuil est volontairement conservateur et doit au minimum attraper les tuiles de 32×32.  
+Même traitement : flag/raison (`small_dim`) + pas d’override (et éventuellement `score` élevé seulement pour debug).
 
-Ensuite:
-- `ref_group_idx = loaded_group_indices[ref_loaded_idx]`
-- `ref_info_for_tile = loaded_infos[ref_loaded_idx]`
+### D) Gestion des rejets (move to rejected)
+La responsabilité du déplacement des tuiles rejetées incombe au worker (`zemosaic_worker.py`), qui orchestre le quality gate.
+- **Réutiliser la mécanique existante** : le déplacement des tuiles dans le sous-dossier `rejected` doit suivre la convention déjà en place.
+- **Assurer la cohérence** : si l'option de déplacement est activée, la tuile doit non seulement être déplacée, mais aussi **retirée de la liste des tuiles à assembler** pour ne pas laisser de chemin mort.
+- **Le déplacement est optionnel et non-bloquant** : si le `move` échoue (ex: permissions), la tuile doit **quand même être exclue de l’assemblage**. C’est une défense en profondeur pour garantir que la tuile rejetée ne polluera jamais la mosaïque.
 
-### 5) [x] Définir WCS/Header à partir de la référence finale
-Remplacer la logique actuelle qui fait:
-- `ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]`
-par celle basée sur `ref_info_for_tile` (chargée).
-Si reference_image_index_in_group existe encore dans la fonction, il ne doit plus être utilisé que pour du log ou de la compatibilité interne ; l’unique index passé à align_images_in_group est ref_loaded_idx.
-
-Définir:
-- `wcs_for_master_tile = ref_info_for_tile.get("wcs")`
-- `header_dict_for_master_tile_base = ref_info_for_tile.get("header")`
-et garder la validation existante:
-- si pas (wcs celestial + header), erreur propre + abort tuile
-
-### 6) [x] Appel aligner avec l’index “loaded”
-Appeler `align_images_in_group` en passant `reference_image_index=ref_loaded_idx`.
-⚠️ plus jamais passer un index “group” à l’aligneur.
-
-### 7) [x] Sauvegarde FITS: ZMT_REF doit correspondre à la même référence
-Dans la partie sauvegarde header, remplacer toute dérivation de `ZMT_REF` (et champs associés) à partir de `seestar_stack_group_info[reference_image_index_in_group]` par une dérivation à partir de `ref_info_for_tile` (chargée), par ex. via `ref_info_for_tile.get("path_raw")`.
-
-But: le FITS final doit annoncer comme référence exactement celle utilisée pour WCS/base.
-
-### 8) [x] Logs (sans nouvelle clé locale obligatoire)
-Ne pas ajouter de nouvelles clés i18n.
-Tu peux enrichir le log existant `mastertile_info_reference_set` en passant:
-- `ref_index_group=ref_group_idx`
-- `ref_index_loaded=ref_loaded_idx`
-- `ref_mode="central"`
-mais garder la clé existante pour éviter de toucher aux locales.
+## Fichiers à modifier (scope minimal)
+- `zequalityMT.py` : `quality_metrics` + `_accept_override` (hard reject + métriques edge blow-up + taille min).
+- `zemosaic_worker.py` : `_zequality_accept_override` (ne jamais “sauver” un hard reject) + logs de rejet plus explicites si possible.
 
 ## Critères d’acceptation
-- Sur un dataset normal: la référence n’est plus systématiquement 0 (souvent proche du centre).
-- Aucun crash quand certains caches sont manquants/invalides (ref index toujours valide dans liste chargée).
-- Le FITS master tile contient `ZMT_REF` cohérent avec la référence réellement utilisée.
-- Pas de changement de comportement ailleurs (Phase 4/5 inchangées, GPU/CPU inchangés, batch behavior inchangé).
+1) Avec **quality gate activé**, les master tiles de type :
+   - 32×32×3
+   - ou “noires + bords très brillants / valeurs énormes”
+   sont **rejetées** et déplacées en sous-dossier si l’option est activée.
+2) La mosaïque finale ne montre plus les **cadres** générés par ces tuiles.
+3) Avec **quality gate désactivé**, comportement strictement identique à avant.
+4) Pas de régression dans SDS / Grid / master tiles mode.
 
-## Fichiers à modifier
-- `zemosaic_worker.py` uniquement (mission minimale)
+## Logs / Observabilité (obligatoire)
+Ajouter un log clair par tuile rejetée :
+- `REJECT quality gate: reason=<small_dim|edge_blowup|no_finite_core_or_edge|abs_cap_exceeded> shape=(H,W) b=... score=... thr=... metrics: NBR=..., core_p99=..., edge_p99=..., edge_ratio=...`
+But : permettre un diagnostic simple en cas de faux positifs.
+
+## Notes
+- Le seuil “40% NaN” n’est pas retenu comme règle principale : le phénomène est souvent **finite-but-corrupt** (alpha opaque + outliers extrêmes).
+- Le ratio `edge_p99/core_p99` est privilégié car il évite les seuils absolus fragiles.
+
