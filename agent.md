@@ -1,205 +1,165 @@
-# agent.md — ZeMosaic V1 Resume (après Phase 1)
+# Mission — Master Tiles: Référence centrale (safe, déterministe, sans surcoût)
 
-## Contexte
-ZeMosaic (mode classic legacy) supprime actuellement systématiquement `.zemosaic_img_cache` au début de `run_hierarchical_mosaic_classic_legacy()`, ce qui empêche toute reprise.
-Objectif V1 : permettre de **reprendre un run après la Phase 1** si un cache valide existe, en gardant un comportement **strictement identique** quand la reprise est désactivée.
+## Objectif
+Lors de `create_master_tile` (Phase 3), remplacer le choix implicite `reference_image_index_in_group = 0` par un choix **référence centrale** (meilleur compromis recouvrement / crop / interpolation),
+tout en restant:
+- **déterministe** (même dataset ⇒ même référence)
+- **O(N)** (pas de O(N²), pas d’IO additionnel lourd)
+- **sans régression** sur les cas où certaines entrées ne sont pas chargées (cache manquant / cache invalide).
 
-## Objectif (V1)
-Ajouter une reprise **après Phase 1** via `.zemosaic_img_cache` :
-- [x] Si `.zemosaic_img_cache` + un **manifest** + un **marker Phase 1** existent et sont valides → **skip Phase 1**, reprendre directement à la Phase 2.
-- [x] Sinon → comportement actuel inchangé (run complet avec suppression/recréation du cache au début).
+## Contrainte critique (anti-bug)
+⚠️ **Sémaphore Phase 3**: `create_master_tile` utilise `_PH3_CONCURRENCY_SEMAPHORE` (acquire/release) pour protéger les I/O et l'alignement. Ne déplacez PAS les `return` ou la logique de `try/finally` qui gère le `release()`. Un `return` mal placé peut causer un **deadlock** et bloquer tout le worker.
 
-## Périmètre (anti-régression)
-✅ CIBLE : `zemosaic_worker.py` → fonction `run_hierarchical_mosaic_classic_legacy()`
+⚠️ `align_images_in_group` attend un `reference_image_index` qui est un index dans la **liste chargée** (`tile_images_data_HWC_adu`), pas dans `seestar_stack_group_info`.
+Or `tile_images_data_HWC_adu` peut être plus courte (cache manquant / data invalide / skip).
+Donc la mission DOIT:
+- calculer un **index de référence “group”** (dans `seestar_stack_group_info`)
+- puis le **mapper** vers un **index de référence “loaded”** (dans `tile_images_data_HWC_adu`)
+- et si la référence “group” n’a pas été chargée, choisir une référence centrale **parmi les chargées** (fallback).
 
-🚫 HORS PÉRIMÈTRE V1 :
-- Ne pas modifier SDS / grid mode / autres pipelines.
-- Ne pas implémenter la reprise Phase 2 ou Phase 3 (ce sera V2/V3).
-- Ne pas changer le comportement existant quand `resume=off`.
+- Mapping explicite obligatoire pour `failed_alignment_indices` (voir Implémentation, section 3).
+- Ordre strict : si `tile_images_data_HWC_adu` est vide ⇒ abort comme aujourd’hui, avant tout calcul de `ref_loaded_idx` / `ref_group_idx` / `ref_info_for_tile`.
+- WCS/Header : validation uniquement à partir de ref_info_for_tile = loaded_infos[ref_loaded_idx].
 
-## Contraintes clés
-1) **Par défaut : aucune régression**
-- Nouveau paramètre config `resume` (string) ∈ `{ "off", "auto", "force" }`
-- Valeur par défaut : `"off"` si absent/invalid.
-- Si `resume == "off"` → laisser le code se comporter EXACTEMENT comme aujourd’hui (notamment suppression/recréation de `.zemosaic_img_cache` au début).
+## Portée (scope)
+- Fichier principal: `zemosaic_worker.py`
+- Fonction: `create_master_tile`
+- Aucun changement GUI.
+- Aucun ajout de clés i18n/locales (pas de nouvelles strings obligatoires).
+- Ne pas modifier le comportement “batch size = 0” et “batch size > 1” (intouchable).
 
-2) **Garde-fous de mode**
-La reprise V1 doit être désactivée (comme si `resume=off`) si l’un de ces cas est vrai :
-- `sds_mode_flag` est actif
-- `use_existing_master_tiles_config` est actif (ou `use_existing_master_tiles_mode` est détecté)
-- tout autre mode non-classic legacy (si détecté)
+## Stratégie de sélection “centrale”
+On choisit l’image dont le centre (RA/DEC) est le plus proche du centroïde du groupe.
+Implémentation recommandée (robuste RA wrap):
+- convertir RA/DEC → vecteurs unitaires (x,y,z)
+- moyenne des vecteurs → vecteur centroïde normalisé
+- score = 1 - dot(v, centroïde)
+- prendre le minimum (tie-break: plus petit index original)
 
-3) **Pas de pickle**
-Le cache de reprise doit être écrit en JSON (manifest + data), pas de pickle.
+### Sources de RA/DEC
+Réutiliser les helpers existants:
+- `_extract_ra_dec_deg(info)` (déjà robuste: WCS pixel_to_world puis CRVAL fallback)
+- `_unit_vector_from_ra_dec(ra_deg, dec_deg)`
 
-## Nouveaux artefacts (dans `.zemosaic_img_cache/`)
-Créer uniquement si `resume != off` ET si la Phase 1 s’exécute (donc run “producteur de cache”).
+### Candidats valides (pour éviter des crashs)
+Ne considérer “candidat” que si:
+- `info` est un `dict`
+- `info.get("wcs")` existe et `wcs.is_celestial == True`
+- `info.get("header")` non vide
+- et `_extract_ra_dec_deg(info)` retourne bien (ra, dec)
 
-- [x] `cache_manifest.json`
-- [x] `phase1_processed_info.json`
-- [x] `phase1.done`
+**Règle unifiée `require_cache_exists`**: Par défaut, ce paramètre doit être `False` pour ne jamais causer d'I/O disque (`os.path.exists`). Ne l'utiliser que si l'information sur l'existence du cache est déjà disponible en mémoire sans coût.
 
-### `cache_manifest.json` (schema minimal V1)
-Contenu minimal recommandé :
-```json
-{
-  "schema_version": 1,
-  "pipeline": "classic_legacy",
-  "created_utc": "...",
-  "run_signature": "<sha256 hex>",
-  "input_folder_norm": "...",
-  "output_folder_norm": "...",
-  "phase1": {
-    "done": true,
-    "done_marker": "phase1.done",
-    "processed_info_file": "phase1_processed_info.json",
-    "num_entries": 1234
-  }
-}
-````
+## Implémentation (pas à pas)
 
-### `phase1_processed_info.json`
+### 1) [x] Ajouter un helper local (dans zemosaic_worker.py)
+Ajouter une fonction utilitaire (près de `create_master_tile` ou en helpers) :
 
-Liste JSON de dicts, un par image valide, contenant uniquement des champs sérialisables + de quoi reconstruire les objets nécessaires aux phases suivantes :
-Champs obligatoires par entrée :
+`_pick_central_reference_index(infos: list[dict], require_cache_exists: bool) -> int | None`
 
-* `path_raw` (str, chemin absolu original)
-* `path_preprocessed_cache` (str, chemin absolu vers le `.npy` cache)
-* `path_hotpix_mask` (str ou null)
-* `preprocessed_shape` (liste d’int)
-* `header_str` (str) : header FITS complet **mis à jour** (celui qui permet de reconstruire le WCS)
-  Champs optionnels à conserver si présents dans `entry` actuel :
-* `phase0_index`, `phase0_center`, `phase0_shape`, `phase0_wcs` (si déjà injectés)
+- **Contrat strict**: La fonction retourne soit un `int` (index valide), soit `None`. Le fallback à `0` en cas de `None` est géré exclusivement par l'appelant (`create_master_tile`). La fonction elle-même ne doit jamais retourner `0` comme fallback.
+- **Garde-fou “jamais de crash”**: La fonction DOIT être encapsulée dans un `try/except` global. Si un calcul échoue (ex: `NaN`, données non-finies), elle doit immédiatement retourner `None`.
+- Renvoie un index dans la liste `infos`
+- Retourne `None` si aucun candidat valide
+- Tie-break déterministe: (score, index)
 
-IMPORTANT :
+Pseudo:
+- construire `candidates = [(idx, ra, dec)]`
+- centroïde via somme des unit vectors
+- sélectionner meilleur idx
+- si aucun candidat:
+  - fallback: premier idx qui a wcs+header (et cache si require_cache_exists)
+  - sinon `None`
 
-* `header_str` doit permettre une reconstruction fiable via `astropy.io.fits.Header.fromstring(...)`
-* On ne stocke PAS les objets `wcs` ni `header` directement (non sérialisables).
+### 2) [x] Dans create_master_tile: calculer un “preferred_group_idx”
+Pour éviter de biaiser le choix en cas de duplication (`allow_batch_duplication`), le `preferred_group_idx` est calculé sur la liste originale (**avant** la duplication), puis l'index est mappé sur la première occurrence correspondante dans la liste dupliquée.
 
-## Run signature (V1)
+L'opération se déroule donc ainsi :
+- Calculer `preferred_group_idx` sur `seestar_stack_group_info` avant sa modification. Si `_pick_central_reference_index` retourne `None` (aucun candidat valide), utiliser `0` comme fallback.
+- Mémoriser un identifiant stable de cette référence. Idéalement: `ref_token = seestar_stack_group_info[preferred_group_idx].get("path_raw")`.
+  - **Fallback stable**: Si `path_raw` est `None` ou absent, utiliser `ref_token = seestar_stack_group_info[preferred_group_idx].get("path_preprocessed_cache")`.
+- Après la modification de `seestar_stack_group_info` par `allow_batch_duplication`, retrouver le **premier** index `i` tel que `info.get("path_raw") == ref_token` (ou `.get("path_preprocessed_cache")`).
+  - **Fallback ultime**: Si le token n'est pas retrouvé, utiliser l'index `preferred_group_idx` original, en s'assurant qu'il reste valide (`clamped` entre `0` et `len(new_list) - 1`).
+- Ce nouvel index devient le `preferred_group_idx` pour la suite.
 
-Implémenter une fonction de hash déterministe (sha256) sur un JSON canonique (keys triées).
-Inclure au minimum :
+⚠️ MUST NOT fix `wcs_for_master_tile` / `header_for_master_tile_base` at this stage (car la réf peut ne pas être chargée finalement).
 
-* [x] pipeline: `"classic_legacy"`
-* [x] input fingerprint: liste triée des fichiers FITS du `input_folder` (chemins relatifs) + (size, mtime)
-* [x] paramètres ASTAP (radius/downsample/sensitivity) + solver timeout si utilisé en Phase 1
-* [x] tout paramètre structurant de Phase 1 si facilement accessible
-* (optionnel) une version pipeline si dispo
+### 3) [x] Pendant le chargement cache: conserver un mapping group→loaded
+Dans la boucle `for i, raw_file_info in enumerate(seestar_stack_group_info):`
+quand un cache est effectivement chargé et validé:
+- `tile_images_data_HWC_adu.append(img_data_adu)`
+- `tile_original_raw_headers.append(raw_file_info.get("header"))`
+- AJOUTER:
+  - `loaded_infos.append(raw_file_info)`
+  - `loaded_group_indices.append(i)`
 
-BUT : si l’utilisateur ajoute/retire des fichiers bruts ou change des options → signature ≠ → reprise refusée (sauf force).
+Puis construire après la boucle:
+- `group_to_loaded = {group_i: loaded_i for loaded_i, group_i in enumerate(loaded_group_indices)}`
 
-## Nouvelle logique de reprise (V1)
+#### Mapping des `failed_alignment_indices` (obligatoire)
+Lors de la construction de `retry_group`, considérer chaque `idx_fail` comme un index dans la liste chargée (`tile_images_data_HWC_adu` / `loaded_infos`), pas comme un index dans `seestar_stack_group_info`.
 
-### Ajouter un helper `try_resume_phase1(...)`
+Implémentation attendue :
+- Vérifier `0 <= idx_fail < len(loaded_group_indices)`.
+- Calculer `group_idx = loaded_group_indices[idx_fail]`.
+- Utiliser ensuite `group_idx` pour récupérer `seestar_stack_group_info[group_idx]` lors de la construction de `retry_group`.
 
-Rôle :
+Exemple :
+- `loaded_group_indices = [0, 2, 5]`
+- `failed_alignment_indices = [1]`
+- ⇒ `group_idx = loaded_group_indices[1] = 2` ⇒ on pousse bien `seestar_stack_group_info[2]` dans `retry_group`.
 
-* [x] détecter `.zemosaic_img_cache`
-* [x] lire/valider `cache_manifest.json` + `phase1.done`
-* [x] recalculer `run_signature_current` (via scan input_folder)
-* [x] si `resume=="auto"` : exiger signature match
-* [x] si `resume=="force"` : ignorer mismatch signature MAIS exiger présence des fichiers essentiels
-* [x] vérifier que toutes les entrées dans `phase1_processed_info.json` pointent vers des fichiers existants (`path_preprocessed_cache` au minimum)
-* [x] si OK : charger la liste et reconstruire en mémoire les champs requis par les phases suivantes :
+#### Ordre exact — cas “aucune image chargée”
+Ne pas déplacer le bloc existant qui abort quand aucune image n’a été chargée :
+- Conserver le `return (None, None), failed_groups_to_retry` sous le test `if not tile_images_data_HWC_adu:`.
+- Le calcul de `ref_loaded_idx` / `ref_group_idx` / `ref_info_for_tile` doit se faire après ce `if`, mais avant l’appel à `align_images_in_group`.
 
-  * [x] `header = fits.Header.fromstring(header_str, sep="\n")`
-  * [x] `wcs = astropy.wcs.WCS(header)`
-  * [x] injecter `entry["header"]=header`, `entry["wcs"]=wcs`
-  * [x] supprimer `header_str` du dict en mémoire (optionnel)
+### 4) [x] Déterminer la référence finale “loaded”
+- Si `preferred_group_idx` est dans `group_to_loaded`:
+  - `ref_loaded_idx = group_to_loaded[preferred_group_idx]`
+- Sinon:
+  - choisir une référence centrale parmi `loaded_infos`:
+    - `ref_loaded_idx = _pick_central_reference_index(loaded_infos, require_cache_exists=False)`
+  - **Garde-fou**: Si `_pick_central_reference_index` retourne `None` (aucun candidat valide trouvé), utiliser `ref_loaded_idx = 0` comme fallback. C'est un cas sûr car la liste `loaded_infos` n'est jamais vide à ce stade.
 
-Retour :
+Ensuite:
+- `ref_group_idx = loaded_group_indices[ref_loaded_idx]`
+- `ref_info_for_tile = loaded_infos[ref_loaded_idx]`
 
-* [x] `resume_ok: bool`
-* [x] `loaded_all_raw_files_processed_info: list[dict] | None`
-* [x] `reason: str` (pour log)
+### 5) [x] Définir WCS/Header à partir de la référence finale
+Remplacer la logique actuelle qui fait:
+- `ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]`
+par celle basée sur `ref_info_for_tile` (chargée).
+Si reference_image_index_in_group existe encore dans la fonction, il ne doit plus être utilisé que pour du log ou de la compatibilité interne ; l’unique index passé à align_images_in_group est ref_loaded_idx.
 
-### Placement dans `run_hierarchical_mosaic_classic_legacy()`
+Définir:
+- `wcs_for_master_tile = ref_info_for_tile.get("wcs")`
+- `header_dict_for_master_tile_base = ref_info_for_tile.get("header")`
+et garder la validation existante:
+- si pas (wcs celestial + header), erreur propre + abort tuile
 
-À l’endroit où le code gère actuellement :
+### 6) [x] Appel aligner avec l’index “loaded”
+Appeler `align_images_in_group` en passant `reference_image_index=ref_loaded_idx`.
+⚠️ plus jamais passer un index “group” à l’aligneur.
 
-```py
-cache_dir_name = ".zemosaic_img_cache"
-temp_image_cache_dir = ...
-if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
-os.makedirs(temp_image_cache_dir, exist_ok=True)
-```
+### 7) [x] Sauvegarde FITS: ZMT_REF doit correspondre à la même référence
+Dans la partie sauvegarde header, remplacer toute dérivation de `ZMT_REF` (et champs associés) à partir de `seestar_stack_group_info[reference_image_index_in_group]` par une dérivation à partir de `ref_info_for_tile` (chargée), par ex. via `ref_info_for_tile.get("path_raw")`.
 
-Modifier ainsi :
+But: le FITS final doit annoncer comme référence exactement celle utilisée pour WCS/base.
 
-* [x] Calculer `resume_mode` (`off/auto/force`) depuis `worker_config_cache.get("resume")` (et éventuellement `filter_overrides["resume"]` si fourni).
-* [x] Si `resume_mode == "off"` → garder EXACTEMENT le bloc actuel (rmtree + mkdir).
-* [x] Sinon :
-
-  1. [x] Tenter `try_resume_phase1(...)`
-  2. [x] Si reprise acceptée :
-
-     * [x] NE PAS supprimer `.zemosaic_img_cache`
-     * [x] définir un flag local `resume_after_phase1 = True`
-     * [x] définir `all_raw_files_processed_info = loaded_list`
-     * [x] ajuster la progression pour être cohérente :
-
-       * [x] logger un message INFO “Phase 1 skipped (resume)”
-       * [x] avancer `current_global_progress` comme si Phase 1 était finie :
-         `current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN`
-  3. [x] Si reprise refusée :
-
-     * [x] renommer le cache en `.zemosaic_img_cache_<timestamp>.old` (préféré) OU supprimer, puis recréer
-     * [x] continuer run normal
-
-Ensuite :
-
-* [x] Le bloc “Phase 1” (`# --- Phase 1 ...`) doit être conditionné :
-
-  * [x] Phase 1 s’exécute uniquement si `not use_existing_master_tiles_mode` ET `not resume_after_phase1`.
-
-### Écriture du cache de reprise (fin Phase 1)
-
-Juste après le log `run_info_phase1_finished_cache` :
-
-* [x] si `resume_mode != "off"` :
-
-  * [x] écrire `phase1_processed_info.json` (liste sérialisable avec `header_str`)
-  * [x] écrire `cache_manifest.json`
-  * [x] créer `phase1.done`
-
-- [x] Ne pas faire échouer le run si l’écriture du manifest échoue : log WARN, puis continuer.
-
-## Logs
-
-* [x] Utiliser `pcb("...")` avec un message direct string (pas besoin d’ajouter des clés i18n).
-* [x] Logs requis :
-
-  * [x] resume demandé + mode (`auto/force`)
-  * [x] resume accepté + nb d’entrées
-  * [x] resume refusé + raison
-  * [x] si force : avertissement clair quand signature mismatch ignorée
-
-## Tests / Validation minimale (sans framework)
-
-Ajouter au moins une petite fonction de validation interne (ou bloc test manuel) n’est pas requis, MAIS le code doit être structuré pour être testable.
-Pas de modifications des tests existants demandées en V1.
-
-## Fichiers à modifier
-
-* [x] `zemosaic_worker.py` uniquement (V1)
-
-  * [x] ajout helpers (signature, manifest read/write, try_resume_phase1)
-  * [x] patch dans `run_hierarchical_mosaic_classic_legacy()`
+### 8) [x] Logs (sans nouvelle clé locale obligatoire)
+Ne pas ajouter de nouvelles clés i18n.
+Tu peux enrichir le log existant `mastertile_info_reference_set` en passant:
+- `ref_index_group=ref_group_idx`
+- `ref_index_loaded=ref_loaded_idx`
+- `ref_mode="central"`
+mais garder la clé existante pour éviter de toucher aux locales.
 
 ## Critères d’acceptation
+- Sur un dataset normal: la référence n’est plus systématiquement 0 (souvent proche du centre).
+- Aucun crash quand certains caches sont manquants/invalides (ref index toujours valide dans liste chargée).
+- Le FITS master tile contient `ZMT_REF` cohérent avec la référence réellement utilisée.
+- Pas de changement de comportement ailleurs (Phase 4/5 inchangées, GPU/CPU inchangés, batch behavior inchangé).
 
-1. Avec `resume` absent → comportement identique à avant (cache supprimé au début).
-2. Avec `resume="auto"` + cache valide :
-
-   * Phase 1 est sautée
-   * Phase 2 démarre avec `all_raw_files_processed_info` reconstruit (WCS OK)
-3. Avec `resume="auto"` + cache invalide/mismatch :
-
-   * reprise refusée
-   * pipeline normal continue (cache clean)
-4. Avec `resume="force"` + signature mismatch MAIS fichiers présents :
-
-   * reprise acceptée avec WARN
-5. Aucun changement SDS/grid/existing-master-tiles : reprise désactivée dans ces cas.
-
+## Fichiers à modifier
+- `zemosaic_worker.py` uniquement (mission minimale)

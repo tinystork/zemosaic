@@ -1,73 +1,76 @@
-# followup.md — Notes d’implémentation & plan de QA (V1 Resume)
+# Follow-up — Validation & garde-fous (référence centrale master tiles)
 
-## Rappels importants (anti-régression)
-- Default = `resume="off"` → **ne rien changer** au comportement actuel.
-- La reprise V1 ne doit s’activer que dans `run_hierarchical_mosaic_classic_legacy()` et uniquement si on est bien dans un contexte classic legacy.
-- Ne pas toucher SDS / grid / “I’m using master tiles”.
-- Ne pas ajouter de dépendances.
+## Checklist “ne pas casser”
+- [x] Aucun changement sur le tri/ordering global des images (juste choix de référence).
+- [x] Ne pas changer la logique `allow_batch_duplication` / `target_stack_size` / `min_safe_stack_size`.
+- [x] `reference_image_index` envoyé à `align_images_in_group` est **toujours** un index dans `tile_images_data_HWC_adu`.
+- [x] `ZMT_REF` (header) pointe vers le même raw que la référence (pas un autre index).
+- [x] Après `allow_batch_duplication`, vérifier que la référence est retrouvée via un identifiant stable (ex: path_raw) et non un index qui pourrait devenir invalide.
+- [x] Ne pas modifier la gestion du sémaphore `_PH3_CONCURRENCY_SEMAPHORE`. Tout `acquire` doit être suivi d'un `release` (généralement dans un `finally`), même en cas d'erreur ou de `return` prématuré.
 
-## Détails pratiques (sérialisation Astropy)
-### Écriture
-- [x] `header_str` : utiliser `header_obj_updated.tostring(sep="\n", endcard=False, padding=False)` (si padding non supporté, rester simple).
-- [x] Stocker `header_str` dans `phase1_processed_info.json`.
+## Tests manuels rapides
+### 1) Cas nominal (cache OK)
+- Lancer une mosaïque standard (Seestar EQ ou alt-az).
+- Vérifier dans les logs `mastertile_info_reference_set`:
+  - `ref_index_loaded` varie (pas toujours 0)
+  - `ref_mode` = central (si loggé)
+- Vérifier visuellement: moins de zones “vides” ou crops agressifs intra tuile (tendance).
 
-### Lecture
-- [x] `header = fits.Header.fromstring(header_str, sep="\n")`
-- [x] `wcs = astropy.wcs.WCS(header)`
-- [x] Injecter `entry["header"]`, `entry["wcs"]` dans la structure mémoire attendue par Phase 2.
+### 2) Cas “cache manquant” (robustesse index)
+- Simuler 1-2 caches absents (renommer temporairement quelques `.npy` dans le cache)
+- Relancer sur une tuile concernée
+Attendu:
+- pas de crash `invalid_ref_index`
+- si la réf préférée est absente: fallback sur une référence centrale parmi les images chargées. Si ce calcul de fallback échoue aussi, le choix final doit être l'index `0` de la liste chargée.
 
-## Validation cache (recommandation)
-Quand `resume=auto`, refuser si :
-- [x] `cache_manifest.json` absent/invalide
-- [x] `phase1.done` absent
-- [x] `schema_version != 1`
-- [x] `pipeline != "classic_legacy"`
-- [x] `run_signature` ne matche pas
-- [x] `phase1_processed_info.json` absent / illisible / liste vide
-- [x] Un `path_preprocessed_cache` référencé n’existe pas
+### 3) Cas “cache invalide”
+- Injecter un `.npy` invalide (shape/dtype incorrect) pour une frame non-référence
+Attendu:
+- frame skip loggée
+- pas de décalage d’index qui casse l’aligneur
 
-Quand `resume=force` :
-- [x] ignorer seulement le mismatch de signature
-- [x] MAIS refuser si fichiers essentiels manquants (manifest/marker/data/cache .npy)
+### 4) Cas “aucune image chargée”
+Ne pas modifier la gestion actuelle du cas où tile_images_data_HWC_adu est vide (aucun cache chargé) : conserver exactement le même comportement (abort / log) qu’avant, sans essayer d’inventer un ref_loaded_idx
 
-## Plan de QA manuel (à exécuter)
-### Cas A — comportement inchangé
-1) Retirer toute config `resume` (ou mettre `off`)
-2) Lancer un run
-3) Vérifier dans les logs que `.zemosaic_img_cache` est supprimé/recréé au début comme avant
+### 5) Log et outils externes
+- **Un seul log `*_info_reference_set` par tuile**: Le log `mastertile_info_reference_set` ne doit être émis qu'une seule fois par appel à `create_master_tile`, et il doit refléter les informations de la **référence finale** réellement utilisée (`ref_loaded_idx`, `ref_group_idx`). Éviter les logs multiples ou ambigus qui pourraient être générés avant que la référence finale ne soit choisie.
+- Ne pas renommer ni supprimer les champs déjà présents dans mastertile_info_reference_set (ajouts seulement), pour ne pas casser d’éventuels parsers de logs externes.
 
-### Cas B — reprise auto OK
-1) Mettre `resume="auto"`
-2) Mettre `cache_retention_mode="keep"` (sinon la reprise ne sert à rien)
-3) Lancer un run complet (Phase 1 s’exécute et produit manifest/marker)
-4) Relancer immédiatement
-5) Vérifier :
-   - log “Phase 1 skipped (resume)”
-   - Phase 2 démarre correctement
-   - pas d’erreur WCS (centres/coords OK)
+### 6) Tests de modes spécifiques (anti-régression)
+- **SDS success path** :
+  - Lancer un projet avec `SeeStar_Stack_Method = sds`.
+  - Attendu : vérifier dans les logs que la Phase 3 (`create_master_tile`) n'est **pas** appelée. La sortie doit être identique à la version précédente.
+- **Existing master tiles mode** :
+  - Lancer un projet qui réutilise des master tiles existants.
+  - Attendu : vérifier que le log `run_info_existing_master_tiles_mode` s'affiche et que la Phase 3 est bien sautée (skip).
+- **Grid mode run** :
+  - Lancer un petit projet en mode grille (`grid_mode`).
+  - Attendu : le traitement doit se terminer sans exception et les outputs doivent être cohérents (mosaïque assemblée).
 
-### Cas C — reprise auto refusée (input modifié)
-1) Après un run qui a produit le cache, ajouter un nouveau FITS dans `input_folder`
-2) Relancer avec `resume="auto"`
-3) Vérifier :
-   - reprise refusée + raison “signature mismatch / input changed”
-   - cache renommé/supprimé puis run complet normal
+## Tests unitaires (si la suite existe dans le repo)
+Ajouter/adapter un test léger (sans IO) : [ ]
+- Construire un faux groupe de 5 infos dict:
+  - 1) ra/dec = (10, 0)
+  - 2) ra/dec = (11, 0)
+  - 3) ra/dec = (12, 0)  <-- central attendu
+  - 4) ra/dec = (13, 0)
+  - 5) ra/dec = (14, 0)
+  + wcs fake: `is_celestial=True`
+  + header fake: contient `CRVAL1/CRVAL2`
+- Vérifier que `_pick_central_reference_index(infos, require_cache_exists=False)` renvoie index 2.
 
-### Cas D — force
-1) Reprendre Cas C, mais mettre `resume="force"`
-2) Vérifier :
-   - WARN “force: signature mismatch ignored”
-   - reprise acceptée SI et seulement SI les `.npy` référencés existent
+Test mapping:
+- Simuler `loaded_group_indices = [0,1,3,4]` (index 2 manquant)
+- Vérifier fallback central sur loaded ⇒ proche de 3 (selon distribution) mais surtout:
+  - `ref_loaded_idx` ∈ [0..len(loaded)-1]
 
-## Points à surveiller
-- [x] Progress / ETA : si Phase 1 est sautée, avancer `current_global_progress` pour éviter une barre bloquée au début.
-- [x] Ne pas crasher si l’écriture du manifest échoue : log WARN et continuer.
-- [x] Le manifest ne doit pas être écrit quand `resume="off"` (pour garder le comportement ultra inchangé par défaut).
+Test mapping "failed indices" :
+- Rappel: `failed_alignment_indices` sont des indices dans la liste chargée (`tile_images_data_HWC_adu` / `loaded_infos`), pas dans `seestar_stack_group_info`.
+- loaded_group_indices=[0,2,5]
+- failed_alignment_indices=[1]
+- attendu : retry_group contient seestar_stack_group_info[2] (pas [1])
 
-## Output attendu
-- [x] Patch unique sur `zemosaic_worker.py`
-- [x] Nouveaux fichiers générés seulement si `resume != off` :
-  - [x] `.zemosaic_img_cache/cache_manifest.json`
-  - [x] `.zemosaic_img_cache/phase1_processed_info.json`
-  - [x] `.zemosaic_img_cache/phase1.done`
-````
+## Perf
+- **Recommandation unifiée**: Toujours utiliser `require_cache_exists=False` pour ne pas causer d'I/O disque (`os.path.exists`). N'activer cette option que si l'information sur l'existence du cache est déjà disponible en mémoire “gratuitement”.
+- Vérifier que le choix central n’ajoute pas de lecture FITS.
+- Complexité O(N) (N = taille du groupe), coût négligeable vs align+stack.
