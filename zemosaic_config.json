@@ -157,5 +157,6 @@
     "quality_crop_min_run": 2,
     "crop_follow_signal": true,
     "stack_use_gpu": true,
-    "use_gpu_stack": true
+    "use_gpu_stack": true,
+    "resume": "auto"
 }

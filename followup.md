@@ -8,27 +8,27 @@
 
 ## Détails pratiques (sérialisation Astropy)
 ### Écriture
-- `header_str` : utiliser `header_obj_updated.tostring(sep="\n", endcard=False, padding=False)` (si padding non supporté, rester simple).
-- Stocker `header_str` dans `phase1_processed_info.json`.
+- [x] `header_str` : utiliser `header_obj_updated.tostring(sep="\n", endcard=False, padding=False)` (si padding non supporté, rester simple).
+- [x] Stocker `header_str` dans `phase1_processed_info.json`.
 
 ### Lecture
-- `header = fits.Header.fromstring(header_str, sep="\n")`
-- `wcs = astropy.wcs.WCS(header)`
-- Injecter `entry["header"]`, `entry["wcs"]` dans la structure mémoire attendue par Phase 2.
+- [x] `header = fits.Header.fromstring(header_str, sep="\n")`
+- [x] `wcs = astropy.wcs.WCS(header)`
+- [x] Injecter `entry["header"]`, `entry["wcs"]` dans la structure mémoire attendue par Phase 2.
 
 ## Validation cache (recommandation)
 Quand `resume=auto`, refuser si :
-- `cache_manifest.json` absent/invalide
-- `phase1.done` absent
-- `schema_version != 1`
-- `pipeline != "classic_legacy"`
-- `run_signature` ne matche pas
-- `phase1_processed_info.json` absent / illisible / liste vide
-- Un `path_preprocessed_cache` référencé n’existe pas
+- [x] `cache_manifest.json` absent/invalide
+- [x] `phase1.done` absent
+- [x] `schema_version != 1`
+- [x] `pipeline != "classic_legacy"`
+- [x] `run_signature` ne matche pas
+- [x] `phase1_processed_info.json` absent / illisible / liste vide
+- [x] Un `path_preprocessed_cache` référencé n’existe pas
 
 Quand `resume=force` :
-- ignorer seulement le mismatch de signature
-- MAIS refuser si fichiers essentiels manquants (manifest/marker/data/cache .npy)
+- [x] ignorer seulement le mismatch de signature
+- [x] MAIS refuser si fichiers essentiels manquants (manifest/marker/data/cache .npy)
 
 ## Plan de QA manuel (à exécuter)
 ### Cas A — comportement inchangé
@@ -60,14 +60,14 @@ Quand `resume=force` :
    - reprise acceptée SI et seulement SI les `.npy` référencés existent
 
 ## Points à surveiller
-- Progress / ETA : si Phase 1 est sautée, avancer `current_global_progress` pour éviter une barre bloquée au début.
-- Ne pas crasher si l’écriture du manifest échoue : log WARN et continuer.
-- Le manifest ne doit pas être écrit quand `resume="off"` (pour garder le comportement ultra inchangé par défaut).
+- [x] Progress / ETA : si Phase 1 est sautée, avancer `current_global_progress` pour éviter une barre bloquée au début.
+- [x] Ne pas crasher si l’écriture du manifest échoue : log WARN et continuer.
+- [x] Le manifest ne doit pas être écrit quand `resume="off"` (pour garder le comportement ultra inchangé par défaut).
 
 ## Output attendu
-- Patch unique sur `zemosaic_worker.py`
-- Nouveaux fichiers générés seulement si `resume != off` :
-  - `.zemosaic_img_cache/cache_manifest.json`
-  - `.zemosaic_img_cache/phase1_processed_info.json`
-  - `.zemosaic_img_cache/phase1.done`
+- [x] Patch unique sur `zemosaic_worker.py`
+- [x] Nouveaux fichiers générés seulement si `resume != off` :
+  - [x] `.zemosaic_img_cache/cache_manifest.json`
+  - [x] `.zemosaic_img_cache/phase1_processed_info.json`
+  - [x] `.zemosaic_img_cache/phase1.done`
 ````

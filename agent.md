@@ -6,8 +6,8 @@ Objectif V1 : permettre de **reprendre un run après la Phase 1** si un cache va
 
 ## Objectif (V1)
 Ajouter une reprise **après Phase 1** via `.zemosaic_img_cache` :
-- Si `.zemosaic_img_cache` + un **manifest** + un **marker Phase 1** existent et sont valides → **skip Phase 1**, reprendre directement à la Phase 2.
-- Sinon → comportement actuel inchangé (run complet avec suppression/recréation du cache au début).
+- [x] Si `.zemosaic_img_cache` + un **manifest** + un **marker Phase 1** existent et sont valides → **skip Phase 1**, reprendre directement à la Phase 2.
+- [x] Sinon → comportement actuel inchangé (run complet avec suppression/recréation du cache au début).
 
 ## Périmètre (anti-régression)
 ✅ CIBLE : `zemosaic_worker.py` → fonction `run_hierarchical_mosaic_classic_legacy()`
@@ -35,9 +35,9 @@ Le cache de reprise doit être écrit en JSON (manifest + data), pas de pickle.
 ## Nouveaux artefacts (dans `.zemosaic_img_cache/`)
 Créer uniquement si `resume != off` ET si la Phase 1 s’exécute (donc run “producteur de cache”).
 
-- `cache_manifest.json`
-- `phase1_processed_info.json`
-- `phase1.done`
+- [x] `cache_manifest.json`
+- [x] `phase1_processed_info.json`
+- [x] `phase1.done`
 
 ### `cache_manifest.json` (schema minimal V1)
 Contenu minimal recommandé :
@@ -81,10 +81,10 @@ IMPORTANT :
 Implémenter une fonction de hash déterministe (sha256) sur un JSON canonique (keys triées).
 Inclure au minimum :
 
-* pipeline: `"classic_legacy"`
-* input fingerprint: liste triée des fichiers FITS du `input_folder` (chemins relatifs) + (size, mtime)
-* paramètres ASTAP (radius/downsample/sensitivity) + solver timeout si utilisé en Phase 1
-* tout paramètre structurant de Phase 1 si facilement accessible
+* [x] pipeline: `"classic_legacy"`
+* [x] input fingerprint: liste triée des fichiers FITS du `input_folder` (chemins relatifs) + (size, mtime)
+* [x] paramètres ASTAP (radius/downsample/sensitivity) + solver timeout si utilisé en Phase 1
+* [x] tout paramètre structurant de Phase 1 si facilement accessible
 * (optionnel) une version pipeline si dispo
 
 BUT : si l’utilisateur ajoute/retire des fichiers bruts ou change des options → signature ≠ → reprise refusée (sauf force).
@@ -95,24 +95,24 @@ BUT : si l’utilisateur ajoute/retire des fichiers bruts ou change des options 
 
 Rôle :
 
-* détecter `.zemosaic_img_cache`
-* lire/valider `cache_manifest.json` + `phase1.done`
-* recalculer `run_signature_current` (via scan input_folder)
-* si `resume=="auto"` : exiger signature match
-* si `resume=="force"` : ignorer mismatch signature MAIS exiger présence des fichiers essentiels
-* vérifier que toutes les entrées dans `phase1_processed_info.json` pointent vers des fichiers existants (`path_preprocessed_cache` au minimum)
-* si OK : charger la liste et reconstruire en mémoire les champs requis par les phases suivantes :
+* [x] détecter `.zemosaic_img_cache`
+* [x] lire/valider `cache_manifest.json` + `phase1.done`
+* [x] recalculer `run_signature_current` (via scan input_folder)
+* [x] si `resume=="auto"` : exiger signature match
+* [x] si `resume=="force"` : ignorer mismatch signature MAIS exiger présence des fichiers essentiels
+* [x] vérifier que toutes les entrées dans `phase1_processed_info.json` pointent vers des fichiers existants (`path_preprocessed_cache` au minimum)
+* [x] si OK : charger la liste et reconstruire en mémoire les champs requis par les phases suivantes :
 
-  * `header = fits.Header.fromstring(header_str, sep="\n")`
-  * `wcs = astropy.wcs.WCS(header)`
-  * injecter `entry["header"]=header`, `entry["wcs"]=wcs`
-  * supprimer `header_str` du dict en mémoire (optionnel)
+  * [x] `header = fits.Header.fromstring(header_str, sep="\n")`
+  * [x] `wcs = astropy.wcs.WCS(header)`
+  * [x] injecter `entry["header"]=header`, `entry["wcs"]=wcs`
+  * [x] supprimer `header_str` du dict en mémoire (optionnel)
 
 Retour :
 
-* `resume_ok: bool`
-* `loaded_all_raw_files_processed_info: list[dict] | None`
-* `reason: str` (pour log)
+* [x] `resume_ok: bool`
+* [x] `loaded_all_raw_files_processed_info: list[dict] | None`
+* [x] `reason: str` (pour log)
 
 ### Placement dans `run_hierarchical_mosaic_classic_legacy()`
 
@@ -127,53 +127,53 @@ os.makedirs(temp_image_cache_dir, exist_ok=True)
 
 Modifier ainsi :
 
-* Calculer `resume_mode` (`off/auto/force`) depuis `worker_config_cache.get("resume")` (et éventuellement `filter_overrides["resume"]` si fourni).
-* Si `resume_mode == "off"` → garder EXACTEMENT le bloc actuel (rmtree + mkdir).
-* Sinon :
+* [x] Calculer `resume_mode` (`off/auto/force`) depuis `worker_config_cache.get("resume")` (et éventuellement `filter_overrides["resume"]` si fourni).
+* [x] Si `resume_mode == "off"` → garder EXACTEMENT le bloc actuel (rmtree + mkdir).
+* [x] Sinon :
 
-  1. Tenter `try_resume_phase1(...)`
-  2. Si reprise acceptée :
+  1. [x] Tenter `try_resume_phase1(...)`
+  2. [x] Si reprise acceptée :
 
-     * NE PAS supprimer `.zemosaic_img_cache`
-     * définir un flag local `resume_after_phase1 = True`
-     * définir `all_raw_files_processed_info = loaded_list`
-     * ajuster la progression pour être cohérente :
+     * [x] NE PAS supprimer `.zemosaic_img_cache`
+     * [x] définir un flag local `resume_after_phase1 = True`
+     * [x] définir `all_raw_files_processed_info = loaded_list`
+     * [x] ajuster la progression pour être cohérente :
 
-       * logger un message INFO “Phase 1 skipped (resume)”
-       * avancer `current_global_progress` comme si Phase 1 était finie :
+       * [x] logger un message INFO “Phase 1 skipped (resume)”
+       * [x] avancer `current_global_progress` comme si Phase 1 était finie :
          `current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN`
-  3. Si reprise refusée :
+  3. [x] Si reprise refusée :
 
-     * renommer le cache en `.zemosaic_img_cache_<timestamp>.old` (préféré) OU supprimer, puis recréer
-     * continuer run normal
+     * [x] renommer le cache en `.zemosaic_img_cache_<timestamp>.old` (préféré) OU supprimer, puis recréer
+     * [x] continuer run normal
 
 Ensuite :
 
-* Le bloc “Phase 1” (`# --- Phase 1 ...`) doit être conditionné :
+* [x] Le bloc “Phase 1” (`# --- Phase 1 ...`) doit être conditionné :
 
-  * Phase 1 s’exécute uniquement si `not use_existing_master_tiles_mode` ET `not resume_after_phase1`.
+  * [x] Phase 1 s’exécute uniquement si `not use_existing_master_tiles_mode` ET `not resume_after_phase1`.
 
 ### Écriture du cache de reprise (fin Phase 1)
 
 Juste après le log `run_info_phase1_finished_cache` :
 
-* si `resume_mode != "off"` :
+* [x] si `resume_mode != "off"` :
 
-  * écrire `phase1_processed_info.json` (liste sérialisable avec `header_str`)
-  * écrire `cache_manifest.json`
-  * créer `phase1.done`
+  * [x] écrire `phase1_processed_info.json` (liste sérialisable avec `header_str`)
+  * [x] écrire `cache_manifest.json`
+  * [x] créer `phase1.done`
 
-Ne pas faire échouer le run si l’écriture du manifest échoue : log WARN, puis continuer.
+- [x] Ne pas faire échouer le run si l’écriture du manifest échoue : log WARN, puis continuer.
 
 ## Logs
 
-* Utiliser `pcb("...")` avec un message direct string (pas besoin d’ajouter des clés i18n).
-* Logs requis :
+* [x] Utiliser `pcb("...")` avec un message direct string (pas besoin d’ajouter des clés i18n).
+* [x] Logs requis :
 
-  * resume demandé + mode (`auto/force`)
-  * resume accepté + nb d’entrées
-  * resume refusé + raison
-  * si force : avertissement clair quand signature mismatch ignorée
+  * [x] resume demandé + mode (`auto/force`)
+  * [x] resume accepté + nb d’entrées
+  * [x] resume refusé + raison
+  * [x] si force : avertissement clair quand signature mismatch ignorée
 
 ## Tests / Validation minimale (sans framework)
 
@@ -182,10 +182,10 @@ Pas de modifications des tests existants demandées en V1.
 
 ## Fichiers à modifier
 
-* `zemosaic_worker.py` uniquement (V1)
+* [x] `zemosaic_worker.py` uniquement (V1)
 
-  * ajout helpers (signature, manifest read/write, try_resume_phase1)
-  * patch dans `run_hierarchical_mosaic_classic_legacy()`
+  * [x] ajout helpers (signature, manifest read/write, try_resume_phase1)
+  * [x] patch dans `run_hierarchical_mosaic_classic_legacy()`
 
 ## Critères d’acceptation
 

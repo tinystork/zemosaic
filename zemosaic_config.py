@@ -47,8 +47,11 @@ import json
 import os
 import platform
 import shutil
+import logging
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     from zemosaic_utils import ensure_user_config_dir, get_user_config_dir
@@ -169,6 +172,8 @@ DEFAULT_CONFIG = {
     "parallel_target_ram_fraction": 0.9,
     "parallel_gpu_vram_fraction": 0.8,
     "parallel_max_cpu_workers": 0,  # 0 → no explicit cap beyond detected logical cores
+    # Resume policy for classic legacy runs: "off", "auto", "force".
+    "resume": "off",
     # Cache retention policy for Phase 1 preprocessed .npy files.
     # Allowed values: "run_end", "per_tile", "keep".
     "cache_retention": "run_end",
@@ -505,6 +510,10 @@ def get_config_path():
 
 def load_config():
     config_path = Path(get_config_path())
+    try:
+        logger.info("Loading ZeMosaic config from %s", config_path)
+    except Exception:
+        pass
     current_config = DEFAULT_CONFIG.copy()
     if config_path.exists():
         try:
@@ -588,6 +597,15 @@ def save_config(config_data):
     config_path = Path(get_config_path())
     config_path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        existing_resume = None
+        if config_path.exists():
+            try:
+                with config_path.open("r", encoding="utf-8") as existing_handle:
+                    loaded_existing = json.load(existing_handle)
+                if isinstance(loaded_existing, dict):
+                    existing_resume = loaded_existing.get("resume")
+            except Exception:
+                existing_resume = None
         # Avant de sauvegarder, s'assurer que config_data ne contient que les clés attendues
         # pour éviter d'écrire des clés temporaires ou obsolètes.
         # On ne garde que les clés qui sont dans DEFAULT_CONFIG.
@@ -597,6 +615,15 @@ def save_config(config_data):
                 config_to_save[key] = config_data[key]
             # else: # Optionnel: si une clé par défaut manque dans config_data, la remettre
             #     config_to_save[key] = DEFAULT_CONFIG[key]
+
+        default_resume = DEFAULT_CONFIG.get("resume")
+        if existing_resume is not None and isinstance(config_data, dict):
+            resume_in_config = config_data.get("resume")
+            if (
+                "resume" not in config_data
+                or (resume_in_config == default_resume and existing_resume != default_resume)
+            ):
+                config_to_save["resume"] = existing_resume
 
 
         # Si config_to_save est vide (si config_data n'avait aucune clé de DEFAULT_CONFIG),

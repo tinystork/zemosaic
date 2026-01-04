@@ -183,6 +183,41 @@ Ensemble, ils forment la colonne vertébrale du pipeline d'empilement moderne de
 
 ---
 
+Quality Crop (edge artifact removal)
+
+ZeMosaic includes an optional Quality Crop step designed to automatically remove low-quality borders that can appear after alignment/reprojection (dark rims, stretched edges, noisy bands, stacking seams, etc.). The idea is to analyze the image edges and crop away regions that statistically look “worse” than the interior.
+
+Parameters
+
+Enable quality crop (default: OFF)
+Turns the whole feature on/off.
+When OFF, ZeMosaic keeps the full tile image and does not run any edge quality analysis.
+
+Band width (px) (default: 32)
+Defines the thickness (in pixels) of the edge bands inspected for quality.
+ZeMosaic analyzes borders within this width (top/bottom/left/right) to decide where quality drops.
+
+K-sigma (default: 2.0)
+Controls the sigma threshold used to decide whether a pixel/run is considered “bad” compared to expected background statistics.
+Lower values = more aggressive cropping (more pixels flagged as outliers).
+Higher values = more conservative cropping.
+
+Minimum run (default: 2)
+Sets the minimum length (in pixels) of a continuous bad segment before it is considered meaningful.
+This helps ignore isolated bad pixels and prevents overreacting to tiny defects.
+
+Margin (px) (default: 8)
+Adds a safety margin (in pixels) when cropping.
+Once a low-quality edge region is detected, ZeMosaic crops slightly deeper by this amount to avoid leaving a thin residual artifact line.
+
+Practical guidance
+
+If you still see obvious borders/seams, try increasing Band width slightly (e.g. 48–64) and/or lowering K-sigma (e.g. 1.5–1.8).
+
+If you feel ZeMosaic crops too much, increase K-sigma or increase Minimum run.
+
+---
+
 ## 📷 Requirements
 
 ### Mandatory:

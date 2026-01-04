@@ -17817,6 +17817,9 @@ def run_hierarchical_mosaic_classic_legacy(
     phase0_header_items: list[dict] = []
     phase0_lookup: dict[str, dict] = {}
     preplan_groups_override_paths: list[list[str]] | None = None
+    seestar_stack_groups: list[list[dict]] = []
+    num_seestar_stacks_to_process = 0
+    phase2_completed = False
     intertile_match_flag = bool(intertile_photometric_match_config)
     match_background_flag = (
         True
@@ -17945,6 +17948,379 @@ def run_hierarchical_mosaic_classic_legacy(
         if num_tasks > 0:
             workers = min(workers, num_tasks)
         return max(1, workers)
+
+    def _normalize_resume_mode(value: Any) -> str:
+        try:
+            mode = str(value).strip().lower()
+        except Exception:
+            return "off"
+        return mode if mode in {"off", "auto", "force"} else "off"
+
+    def _header_to_string(header_obj: Any) -> str | None:
+        if header_obj is None:
+            return None
+        try:
+            return header_obj.tostring(sep="\n", endcard=False, padding=False)
+        except TypeError:
+            pass
+        except Exception:
+            return None
+        try:
+            return header_obj.tostring(sep="\n", endcard=False)
+        except Exception:
+            try:
+                return header_obj.tostring(sep="\n")
+            except Exception:
+                return None
+
+    def _serialize_shape(value: Any) -> list[int] | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            try:
+                return [int(v) for v in value]
+            except Exception:
+                return None
+        return None
+
+    def _serialize_center(value: Any) -> list[float] | None:
+        if value is None:
+            return None
+        if hasattr(value, "ra") and hasattr(value.ra, "deg"):
+            try:
+                return [float(value.ra.deg), float(value.dec.deg)]
+            except Exception:
+                return None
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                return [float(value[0]), float(value[1])]
+            except Exception:
+                return None
+        return None
+
+    def _serialize_phase1_entry(entry: dict) -> dict | None:
+        if not isinstance(entry, dict):
+            return None
+        path_raw = entry.get("path_raw")
+        path_cache = entry.get("path_preprocessed_cache")
+        header_str = _header_to_string(entry.get("header"))
+        if not (path_raw and path_cache and header_str):
+            return None
+        shape = _serialize_shape(entry.get("preprocessed_shape"))
+        if not shape:
+            return None
+        record = {
+            "path_raw": str(path_raw),
+            "path_preprocessed_cache": str(path_cache),
+            "path_hotpix_mask": str(entry["path_hotpix_mask"])
+            if entry.get("path_hotpix_mask") is not None
+            else None,
+            "preprocessed_shape": shape,
+            "header_str": header_str,
+        }
+        if "phase0_index" in entry:
+            try:
+                record["phase0_index"] = int(entry.get("phase0_index"))
+            except Exception:
+                pass
+        phase0_center = _serialize_center(entry.get("phase0_center"))
+        if phase0_center is not None:
+            record["phase0_center"] = phase0_center
+        phase0_shape = _serialize_shape(entry.get("phase0_shape"))
+        if phase0_shape is not None:
+            record["phase0_shape"] = phase0_shape
+        return record
+
+    def _scan_input_fits_paths(
+        input_root: str,
+        output_root: str,
+        config_cache: dict,
+    ) -> list[str]:
+        fits_paths: list[str] = []
+        try:
+            output_abs = Path(output_root).expanduser().resolve() if output_root else None
+            output_abs_norm = _normcase_path(output_abs) if output_abs else None
+        except Exception:
+            output_abs = None
+            output_abs_norm = None
+        try:
+            wcs_out_base = _safe_basename(
+                (config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")
+            ).strip().lower()
+        except Exception:
+            wcs_out_base = "global_mosaic_wcs.fits"
+        for root_dir_iter, dirnames_iter, files_in_dir_iter in os.walk(input_root):
+            root_path = Path(root_dir_iter)
+            try:
+                filtered_dirs = []
+                for d in dirnames_iter:
+                    child = root_path / d
+                    if is_path_excluded(child, EXCLUDED_DIRS):
+                        continue
+                    try:
+                        if output_abs_norm:
+                            try:
+                                child_norm = _normcase_path(child.resolve())
+                            except Exception:
+                                child_norm = _normcase_path(child)
+                            if child_norm.startswith(output_abs_norm):
+                                continue
+                    except Exception:
+                        pass
+                    filtered_dirs.append(d)
+                dirnames_iter[:] = filtered_dirs
+            except Exception:
+                dirnames_iter[:] = [
+                    d
+                    for d in dirnames_iter
+                    if UNALIGNED_DIRNAME not in (root_path / d).parts
+                ]
+            try:
+                files_in_dir_iter = sorted(files_in_dir_iter, key=lambda s: s.lower())
+            except Exception:
+                files_in_dir_iter = list(files_in_dir_iter)
+            for file_name_iter in files_in_dir_iter:
+                if not file_name_iter.lower().endswith((".fit", ".fits")):
+                    continue
+                full_path = root_path / file_name_iter
+                try:
+                    if is_path_excluded(full_path, EXCLUDED_DIRS):
+                        continue
+                except Exception:
+                    if UNALIGNED_DIRNAME in full_path.parts:
+                        continue
+                try:
+                    if wcs_out_base and file_name_iter.strip().lower() == wcs_out_base:
+                        continue
+                except Exception:
+                    pass
+                fits_paths.append(str(full_path))
+        try:
+            fits_paths.sort(key=lambda p: p.lower())
+        except Exception:
+            fits_paths.sort()
+        return fits_paths
+
+    def _build_input_fingerprint(fits_paths: list[str], base_folder: str) -> list[dict]:
+        fingerprint: list[dict] = []
+        base_path = Path(base_folder).expanduser()
+        for path_str in fits_paths:
+            try:
+                stat = os.stat(path_str)
+            except Exception:
+                continue
+            try:
+                rel_path = os.path.relpath(path_str, base_path)
+            except Exception:
+                rel_path = os.path.basename(path_str)
+            rel_path = rel_path.replace(os.sep, "/")
+            fingerprint.append(
+                {
+                    "path": rel_path,
+                    "size": int(stat.st_size),
+                    "mtime": int(stat.st_mtime),
+                }
+            )
+        fingerprint.sort(key=lambda item: item["path"])
+        return fingerprint
+
+    def _signature_payload_from_fingerprint(fingerprint: list[dict]) -> dict:
+        solver_subset: dict[str, Any] = {}
+        if isinstance(solver_settings, dict):
+            for key in (
+                "force_resolve_existing_wcs",
+                "astap_drizzled_fallback_enabled",
+                "intertile_offset_limit_adu",
+                "intertile_gain_limits",
+            ):
+                if key in solver_settings:
+                    value = solver_settings.get(key)
+                    if isinstance(value, (list, tuple)):
+                        try:
+                            solver_subset[key] = [float(v) for v in value]
+                        except Exception:
+                            solver_subset[key] = list(value)
+                    else:
+                        solver_subset[key] = value
+        preprocess_subset: dict[str, Any] = {}
+        for key in ("preprocess_remove_background_gpu", "preprocess_background_sigma", "force_resolve_existing_wcs"):
+            if key in (worker_config_cache or {}):
+                preprocess_subset[key] = (worker_config_cache or {}).get(key)
+        payload = {
+            "pipeline": "classic_legacy",
+            "input_fingerprint": fingerprint,
+            "astap": {
+                "search_radius": astap_search_radius_config,
+                "downsample": astap_downsample_config,
+                "sensitivity": astap_sensitivity_config,
+                "timeout_sec": 180,
+            },
+            "solver_settings": solver_subset,
+            "preprocess": preprocess_subset,
+        }
+        return payload
+
+    def _compute_run_signature(payload: dict) -> str:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _compute_current_signature() -> tuple[str | None, dict | None, list[str] | None]:
+        try:
+            fits_paths = _scan_input_fits_paths(
+                input_folder,
+                output_folder,
+                worker_config_cache,
+            )
+            fingerprint = _build_input_fingerprint(fits_paths, input_folder)
+            payload = _signature_payload_from_fingerprint(fingerprint)
+            signature = _compute_run_signature(payload)
+            return signature, payload, fits_paths
+        except Exception:
+            return None, None, None
+
+    def _normalize_manifest_path(path_value: str | None) -> str:
+        if not path_value:
+            return ""
+        try:
+            path_obj = Path(path_value).expanduser().resolve()
+        except Exception:
+            path_obj = Path(path_value).expanduser()
+        return _normcase_path(path_obj)
+
+    def _try_resume_phase1(
+        cache_dir: str,
+        resume_mode: str,
+        signature_current: str | None,
+    ) -> tuple[bool, list[dict] | None, str]:
+        if resume_mode not in {"auto", "force"}:
+            return False, None, "resume disabled"
+        manifest_path = os.path.join(cache_dir, "cache_manifest.json")
+        if not _path_exists(manifest_path):
+            return False, None, "manifest missing"
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh_manifest:
+                manifest = json.load(fh_manifest)
+        except Exception as exc:
+            return False, None, f"manifest invalid ({exc})"
+        if not isinstance(manifest, dict):
+            return False, None, "manifest invalid"
+        if int(manifest.get("schema_version", -1)) != 1:
+            return False, None, "schema_version mismatch"
+        if str(manifest.get("pipeline", "")).strip().lower() != "classic_legacy":
+            return False, None, "pipeline mismatch"
+        phase1_meta = manifest.get("phase1") if isinstance(manifest.get("phase1"), dict) else {}
+        done_marker_name = phase1_meta.get("done_marker") or "phase1.done"
+        processed_name = phase1_meta.get("processed_info_file") or "phase1_processed_info.json"
+        done_marker_path = os.path.join(cache_dir, done_marker_name)
+        processed_path = os.path.join(cache_dir, processed_name)
+        if not _path_exists(done_marker_path):
+            return False, None, "phase1.done missing"
+        if not _path_exists(processed_path):
+            return False, None, "phase1_processed_info.json missing"
+        manifest_signature = manifest.get("run_signature")
+        if resume_mode == "auto":
+            if not manifest_signature or not signature_current or manifest_signature != signature_current:
+                return False, None, "signature mismatch"
+        else:
+            if not manifest_signature or not signature_current:
+                pcb("Resume force: signature unavailable, proceeding.", prog=None, lvl="WARN")
+            elif manifest_signature != signature_current:
+                pcb("Resume force: signature mismatch ignored.", prog=None, lvl="WARN")
+        try:
+            with open(processed_path, "r", encoding="utf-8") as fh_info:
+                processed_info = json.load(fh_info)
+        except Exception as exc:
+            return False, None, f"processed info invalid ({exc})"
+        if not isinstance(processed_info, list) or not processed_info:
+            return False, None, "processed info empty"
+        if not (ASTROPY_AVAILABLE and fits is not None and WCS is not None):
+            return False, None, "astropy unavailable"
+        loaded_entries: list[dict] = []
+        for idx, item in enumerate(processed_info):
+            if not isinstance(item, dict):
+                return False, None, f"entry {idx} invalid"
+            path_raw = item.get("path_raw")
+            path_cache = item.get("path_preprocessed_cache")
+            header_str = item.get("header_str")
+            if not (path_raw and path_cache and header_str):
+                return False, None, f"entry {idx} missing required fields"
+            if not _path_exists(path_cache):
+                return False, None, f"entry {idx} cache missing"
+            try:
+                header = fits.Header.fromstring(header_str, sep="\n")
+            except Exception as exc:
+                return False, None, f"entry {idx} header invalid ({exc})"
+            try:
+                wcs_obj = WCS(header, naxis=2, relax=True)
+            except Exception:
+                try:
+                    wcs_obj = WCS(header, naxis=2)
+                except Exception:
+                    try:
+                        wcs_obj = WCS(header)
+                    except Exception as exc:
+                        return False, None, f"entry {idx} wcs invalid ({exc})"
+            entry = dict(item)
+            entry["path_raw"] = str(path_raw)
+            entry["path_preprocessed_cache"] = str(path_cache)
+            if entry.get("path_hotpix_mask") is not None:
+                entry["path_hotpix_mask"] = str(entry["path_hotpix_mask"])
+            if isinstance(entry.get("preprocessed_shape"), list):
+                try:
+                    entry["preprocessed_shape"] = tuple(
+                        int(v) for v in entry["preprocessed_shape"]
+                    )
+                except Exception:
+                    pass
+            entry["header"] = header
+            entry["wcs"] = wcs_obj
+            entry.pop("header_str", None)
+            loaded_entries.append(entry)
+        return True, loaded_entries, "ok"
+
+    def _write_phase1_resume_cache(
+        cache_dir: str,
+        entries: list[dict],
+        signature_payload: dict | None,
+        signature_current: str | None,
+    ) -> None:
+        if not entries:
+            raise ValueError("no entries to serialize")
+        serialized_entries: list[dict] = []
+        for entry in entries:
+            serialized = _serialize_phase1_entry(entry)
+            if not serialized:
+                raise ValueError("entry not serializable for resume cache")
+            serialized_entries.append(serialized)
+        if not signature_current or signature_payload is None:
+            signature_current, signature_payload, _ = _compute_current_signature()
+        if not signature_current or signature_payload is None:
+            raise ValueError("signature unavailable")
+        processed_name = "phase1_processed_info.json"
+        done_marker = "phase1.done"
+        manifest_path = os.path.join(cache_dir, "cache_manifest.json")
+        processed_path = os.path.join(cache_dir, processed_name)
+        done_marker_path = os.path.join(cache_dir, done_marker)
+        manifest = {
+            "schema_version": 1,
+            "pipeline": "classic_legacy",
+            "created_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "run_signature": signature_current,
+            "input_folder_norm": _normalize_manifest_path(input_folder),
+            "output_folder_norm": _normalize_manifest_path(output_folder),
+            "phase1": {
+                "done": True,
+                "done_marker": done_marker,
+                "processed_info_file": processed_name,
+                "num_entries": len(serialized_entries),
+            },
+        }
+        with open(processed_path, "w", encoding="utf-8") as fh_info:
+            json.dump(serialized_entries, fh_info, indent=2, sort_keys=True, ensure_ascii=True)
+        with open(manifest_path, "w", encoding="utf-8") as fh_manifest:
+            json.dump(manifest, fh_manifest, indent=2, sort_keys=True, ensure_ascii=True)
+        with open(done_marker_path, "w", encoding="utf-8") as fh_done:
+            fh_done.write("done\n")
     current_global_progress = 0
     
     error_messages_deps = []
@@ -17991,14 +18367,281 @@ def run_hierarchical_mosaic_classic_legacy(
     pcb(f"  Options Assemblage Final: Méthode='{final_assembly_method_config}'", prog=None, lvl="DEBUG_DETAIL")
 
     time_per_raw_file_wcs = None; time_per_master_tile_creation = None
+    resume_mode_raw = None
+    resume_mode_source = "default"
+    if isinstance(filter_overrides, dict) and "resume" in filter_overrides:
+        resume_mode_raw = filter_overrides.get("resume")
+        resume_mode_source = "filter_overrides"
+    if resume_mode_raw is None:
+        resume_mode_raw = worker_config_cache.get("resume")
+        if resume_mode_raw is not None:
+            resume_mode_source = "config"
+    resume_mode = _normalize_resume_mode(resume_mode_raw)
+    resume_after_phase1 = False
+    resume_signature_payload: dict | None = None
+    resume_signature_current: str | None = None
+    all_raw_files_processed_info: list[dict] = []
     cache_dir_name = ".zemosaic_img_cache"
     temp_image_cache_dir = str(Path(output_folder).expanduser() / cache_dir_name)
     temp_master_tile_storage_dir: str | None = None
-    try:
-        if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
-        os.makedirs(temp_image_cache_dir, exist_ok=True)
-    except OSError as e_mkdir_cache:
-        pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
+    pcb(
+        f"Resume mode resolved: {resume_mode} (source={resume_mode_source})",
+        prog=None,
+        lvl="INFO",
+    )
+    if resume_mode != "off":
+        pcb(f"Resume requested: mode={resume_mode}", prog=None, lvl="INFO")
+        if sds_mode_flag or use_existing_master_tiles_config:
+            pcb(
+                "Resume disabled (mode incompatible).",
+                prog=None,
+                lvl="INFO",
+                sds_mode=bool(sds_mode_flag),
+                use_existing_master_tiles_config=bool(use_existing_master_tiles_config),
+            )
+            resume_mode = "off"
+    else:
+        pcb("Resume skipped (mode=off).", prog=None, lvl="INFO")
+    if resume_mode == "off":
+        try:
+            if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
+            os.makedirs(temp_image_cache_dir, exist_ok=True)
+        except OSError as e_mkdir_cache:
+            pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
+    else:
+        resume_signature_current, resume_signature_payload, _ = _compute_current_signature()
+        resume_ok, loaded_info, resume_reason = _try_resume_phase1(
+            temp_image_cache_dir,
+            resume_mode,
+            resume_signature_current,
+        )
+        if resume_ok and loaded_info:
+            resume_after_phase1 = True
+            all_raw_files_processed_info = loaded_info
+            num_total_raw_files = len(all_raw_files_processed_info)
+            base_progress_phase1 = current_global_progress
+            current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+            pcb(
+                f"Resume accepted: Phase 1 skipped (resume), entries={num_total_raw_files}",
+                prog=current_global_progress,
+                lvl="INFO",
+                num_valid_raws=num_total_raw_files,
+            )
+            phase0_header_items = []
+            for info in all_raw_files_processed_info:
+                entry_path = info.get("path_raw")
+                shape = info.get("preprocessed_shape")
+                header = info.get("header")
+                item = {"path": entry_path}
+                if shape:
+                    item["shape"] = shape
+                elif header is not None:
+                    item["header"] = header
+                phase0_header_items.append(item)
+            phase0_lookup = {
+                item["path"]: item
+                for item in phase0_header_items
+                if isinstance(item, dict) and item.get("path")
+            }
+            if isinstance(filter_overrides, dict):
+                try:
+                    if "cluster_panel_threshold" in filter_overrides:
+                        cluster_threshold_config = filter_overrides["cluster_panel_threshold"]
+                        pcb(
+                            "clusterstacks_info_override_threshold",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_threshold_config,
+                        )
+                    if "cluster_target_groups" in filter_overrides:
+                        cluster_target_groups_config = filter_overrides["cluster_target_groups"]
+                        pcb(
+                            "clusterstacks_info_override_target_groups",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_target_groups_config,
+                        )
+                    if "cluster_orientation_split_deg" in filter_overrides:
+                        cluster_orientation_split_deg_config = filter_overrides["cluster_orientation_split_deg"]
+                        pcb(
+                            "clusterstacks_info_override_orientation_split",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_orientation_split_deg_config,
+                        )
+                except Exception:
+                    pass
+                try:
+                    raw_groups_override = filter_overrides.get("preplan_master_groups")
+                    if isinstance(raw_groups_override, list):
+                        mapped_groups: list[list[str]] = []
+                        for group in raw_groups_override:
+                            if not isinstance(group, (list, tuple)):
+                                continue
+                            normalized_group: list[str] = []
+                            for item in group:
+                                path_val = None
+                                if isinstance(item, dict):
+                                    path_val = item.get("path") or item.get("path_raw")
+                                elif isinstance(item, str):
+                                    path_val = item
+                                norm_path = _normalize_path_for_matching(path_val)
+                                if norm_path:
+                                    normalized_group.append(norm_path)
+                            if normalized_group:
+                                mapped_groups.append(normalized_group)
+                        if mapped_groups:
+                            preplan_groups_override_paths = mapped_groups
+                            pcb(
+                                f"Resume: using {len(mapped_groups)} preplanned group(s) from filter overrides.",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                            )
+                except Exception as e_preplan:
+                    pcb(
+                        f"Resume preplan override failed: {e_preplan}",
+                        prog=None,
+                        lvl="DEBUG_DETAIL",
+                    )
+            per_frame_info = _estimate_per_frame_cost_mb(phase0_header_items)
+            auto_caps_info = _compute_auto_tile_caps(
+                resource_probe_info,
+                per_frame_info,
+                policy_max=0,
+                policy_min=8,
+                user_max_override=int(max_raw_per_master_tile_config) if max_raw_per_master_tile_config else None,
+            )
+            try:
+                msg = (
+                    "AutoCaps: per_frame≈{pf:.1f} MB, RAM_free≈{rf:.0f} MB → "
+                    "frames_by_ram={fbr}, cap={cap}, memmap={mm}, GPUHint={gpu}, parallel={par}".format(
+                        pf=auto_caps_info.get("per_frame_mb", 0.0),
+                        rf=resource_probe_info.get("ram_available_mb", 0.0) or 0.0,
+                        fbr=auto_caps_info.get("frames_by_ram", 0),
+                        cap=auto_caps_info.get("cap"),
+                        mm="on" if auto_caps_info.get("memmap") else "off",
+                        gpu=auto_caps_info.get("gpu_batch_hint") or "n/a",
+                        par=auto_caps_info.get("parallel_groups", 1),
+                    )
+                )
+                _log_and_callback(msg, prog=None, lvl="INFO_DETAIL", callback=progress_callback)
+            except Exception:
+                pass
+            auto_resource_strategy = {
+                "cap": auto_caps_info.get("cap"),
+                "min_cap": auto_caps_info.get("min_cap"),
+                "memmap": auto_caps_info.get("memmap"),
+                "memmap_budget_mb": auto_caps_info.get("memmap_budget_mb"),
+                "gpu_batch_hint": auto_caps_info.get("gpu_batch_hint"),
+                "parallel_groups": auto_caps_info.get("parallel_groups"),
+                "per_frame_mb": auto_caps_info.get("per_frame_mb"),
+            }
+            parallel_caps: ParallelCapabilities | None = None  # type: ignore[assignment]
+            global_parallel_plan: ParallelPlan | None = None  # type: ignore[assignment]
+            if PARALLEL_HELPERS_AVAILABLE:
+                try:
+                    parallel_caps = detect_parallel_capabilities()
+                except Exception as exc_parallel_caps:
+                    parallel_caps = None
+                    logger.warning("Parallel capability detection failed: %s", exc_parallel_caps)
+                frame_h = 0
+                frame_w = 0
+                if isinstance(global_wcs_plan, dict):
+                    try:
+                        frame_h = int(global_wcs_plan.get("height") or 0)
+                    except Exception:
+                        frame_h = 0
+                    try:
+                        frame_w = int(global_wcs_plan.get("width") or 0)
+                    except Exception:
+                        frame_w = 0
+                frame_shape = (frame_h, frame_w) if (frame_h > 0 and frame_w > 0) else (frame_h, frame_w)
+                try:
+                    global_parallel_plan = auto_tune_parallel_plan(
+                        kind="global",
+                        frame_shape=frame_shape,
+                        n_frames=max(1, num_total_raw_files),
+                        bytes_per_pixel=4,
+                        config=worker_config_cache,
+                        caps=parallel_caps,
+                    )
+                    global_parallel_plan, gpu_safety_ctx_global = apply_gpu_safety_to_parallel_plan(
+                        global_parallel_plan,
+                        parallel_caps,
+                        worker_config_cache,
+                        operation="global",
+                        logger=logger,
+                    )
+                    worker_config_cache["parallel_plan"] = global_parallel_plan
+                    setattr(zconfig, "parallel_plan", global_parallel_plan)
+                    if parallel_caps is not None:
+                        worker_config_cache["parallel_capabilities"] = parallel_caps
+                        setattr(zconfig, "parallel_capabilities", parallel_caps)
+                    try:
+                        pcb(
+                            "parallel_plan_summary",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            cpu_workers=int(getattr(global_parallel_plan, "cpu_workers", 0)),
+                            use_gpu=bool(getattr(global_parallel_plan, "use_gpu", False)),
+                            rows=int(getattr(global_parallel_plan, "rows_per_chunk", 0) or 0),
+                            gpu_rows=int(getattr(global_parallel_plan, "gpu_rows_per_chunk", 0) or 0),
+                            memmap=bool(getattr(global_parallel_plan, "use_memmap", False)),
+                            chunk_mb=float(
+                                getattr(global_parallel_plan, "max_chunk_bytes", 0) / (1024 ** 2)
+                                if getattr(global_parallel_plan, "max_chunk_bytes", 0)
+                                else 0.0
+                            ),
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc_parallel_plan:
+                    logger.warning("Parallel auto-tune failed: %s", exc_parallel_plan)
+                    global_parallel_plan = None
+            effective_base_workers = 0
+            num_logical_processors = os.cpu_count() or 1
+            if num_base_workers_config <= 0:
+                desired_auto_ratio = 0.75
+                effective_base_workers = max(1, int(np.ceil(num_logical_processors * desired_auto_ratio)))
+                pcb(
+                    f"WORKERS_CONFIG: Mode Auto. Base de workers calculée: {effective_base_workers} "
+                    f"({desired_auto_ratio*100:.0f}% de {num_logical_processors} processeurs logiques)",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            else:
+                effective_base_workers = min(num_base_workers_config, num_logical_processors)
+                if effective_base_workers < num_base_workers_config:
+                    pcb(
+                        f"WORKERS_CONFIG: Demande GUI ({num_base_workers_config}) limitée à {effective_base_workers} "
+                        f"(total processeurs logiques: {num_logical_processors}).",
+                        prog=None,
+                        lvl="WARN",
+                    )
+                pcb(
+                    f"WORKERS_CONFIG: Mode Manuel. Base de workers: {effective_base_workers}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            if effective_base_workers <= 0:
+                effective_base_workers = 1
+                pcb("WORKERS_CONFIG: AVERT - effective_base_workers était <= 0, forcé à 1.", prog=None, lvl="WARN")
+        else:
+            pcb(f"Resume refused: {resume_reason}", prog=None, lvl="WARN")
+            if _path_exists(temp_image_cache_dir):
+                ts_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                archive_dir = f"{temp_image_cache_dir}_{ts_suffix}.old"
+                try:
+                    shutil.move(temp_image_cache_dir, archive_dir)
+                except Exception:
+                    try:
+                        shutil.rmtree(temp_image_cache_dir)
+                    except Exception:
+                        pass
+            try:
+                os.makedirs(temp_image_cache_dir, exist_ok=True)
+            except OSError as e_mkdir_cache:
+                pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
     try:
         cache_probe = _probe_system_resources(
             temp_image_cache_dir,
@@ -18112,7 +18755,7 @@ def run_hierarchical_mosaic_classic_legacy(
                 num_tiles=0,
             )
 
-    if not use_existing_master_tiles_mode:
+    if not use_existing_master_tiles_mode and not resume_after_phase1:
         # --- Phase 1 (Prétraitement et WCS) ---
         base_progress_phase1 = current_global_progress
         _log_memory_usage(progress_callback, "Début Phase 1 (Prétraitement)")
@@ -18829,6 +19472,16 @@ def run_hierarchical_mosaic_classic_legacy(
         current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN
         _log_memory_usage(progress_callback, "Fin Phase 1 (Prétraitement)")
         pcb("run_info_phase1_finished_cache", prog=current_global_progress, lvl="INFO", num_valid_raws=len(all_raw_files_processed_info))
+        if resume_mode != "off":
+            try:
+                _write_phase1_resume_cache(
+                    temp_image_cache_dir,
+                    all_raw_files_processed_info,
+                    resume_signature_payload,
+                    resume_signature_current,
+                )
+            except Exception as exc_resume_write:
+                pcb(f"Resume cache write failed: {exc_resume_write}", prog=None, lvl="WARN")
         # --- Optional interactive filtering between Phase 1 and Phase 2 ---
         try:
             raw_files_with_wcs = all_raw_files_processed_info
@@ -18846,7 +19499,8 @@ def run_hierarchical_mosaic_classic_legacy(
             logger.warning(f"Filtrage facultatif non appliqué: {e_hook}")
         if time_per_raw_file_wcs: 
             pcb(f"    Temps moyen/brute (P1): {time_per_raw_file_wcs:.2f}s", prog=None, lvl="DEBUG")
-    
+
+    if not use_existing_master_tiles_mode:
         # --- Phase 2 (Clustering) ---
         base_progress_phase2 = current_global_progress
         _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
@@ -19387,6 +20041,7 @@ def run_hierarchical_mosaic_classic_legacy(
                 pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
         current_global_progress = base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING
         num_seestar_stacks_to_process = len(seestar_stack_groups)
+        phase2_completed = True
         telemetry.maybe_emit_stats(
             _telemetry_context(
                 {
@@ -19978,6 +20633,13 @@ def run_hierarchical_mosaic_classic_legacy(
             )
             use_existing_master_tiles_mode = False
         if not use_existing_master_tiles_mode:
+            if not phase2_completed:
+                pcb(
+                    "Phase 2 skipped; cannot proceed to Phase 3.",
+                    prog=current_global_progress,
+                    lvl="ERROR",
+                )
+                return
             if sds_mode_flag and not sds_fallback_logged:
                 pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
                 sds_fallback_logged = True
