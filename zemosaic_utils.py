@@ -5446,16 +5446,30 @@ def reproject_and_coadd_wrapper(
 # --- GPU Percentiles, Hot-Pixels, and Background Map -------------------------
 def _percentiles_gpu(arr2d: np.ndarray, p_low: float, p_high: float) -> tuple[float, float]:
     """Compute two percentiles on GPU; fall back to CPU if CuPy unavailable."""
+    arr = np.asarray(arr2d)
+    has_nonfinite = not np.isfinite(arr).all()
     if not gpu_is_available():
-        lo, hi = np.percentile(arr2d, [p_low, p_high])
+        if has_nonfinite:
+            lo, hi = np.nanpercentile(arr, [p_low, p_high])
+        else:
+            lo, hi = np.percentile(arr, [p_low, p_high])
         return float(lo), float(hi)
     import cupy as cp  # type: ignore
     ensure_cupy_pool_initialized()
     arr_gpu = None
     try:
-        arr_gpu = cp.asarray(arr2d)
-        lo = cp.percentile(arr_gpu, p_low)
-        hi = cp.percentile(arr_gpu, p_high)
+        arr_gpu = cp.asarray(arr)
+        if has_nonfinite:
+            nanpercentile = getattr(cp, "nanpercentile", None)
+            if callable(nanpercentile):
+                lo = nanpercentile(arr_gpu, p_low)
+                hi = nanpercentile(arr_gpu, p_high)
+            else:
+                lo, hi = np.nanpercentile(arr, [p_low, p_high])
+                return float(lo), float(hi)
+        else:
+            lo = cp.percentile(arr_gpu, p_low)
+            hi = cp.percentile(arr_gpu, p_high)
         return float(lo), float(hi)
     finally:
         if arr_gpu is not None:

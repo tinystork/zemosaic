@@ -154,8 +154,21 @@ def _winsorize_chunk(
         high = float(low_high_limits[1])
     low_pct = max(0.0, min(100.0, low * 100.0))
     high_pct = max(0.0, min(100.0, 100.0 - high * 100.0))
-    lower = cp.percentile(data_gpu, low_pct, axis=0, keepdims=False)
-    upper = cp.percentile(data_gpu, high_pct, axis=0, keepdims=False)
+    has_nonfinite = bool(cp.any(~cp.isfinite(data_gpu)).item())
+    if has_nonfinite:
+        nanpercentile = getattr(cp, "nanpercentile", None)
+        if callable(nanpercentile):
+            lower = nanpercentile(data_gpu, low_pct, axis=0)
+            upper = nanpercentile(data_gpu, high_pct, axis=0)
+        else:
+            data_cpu = cp.asnumpy(data_gpu)
+            lower = np.nanpercentile(data_cpu, low_pct, axis=0)
+            upper = np.nanpercentile(data_cpu, high_pct, axis=0)
+            lower = cp.asarray(lower)
+            upper = cp.asarray(upper)
+    else:
+        lower = cp.percentile(data_gpu, low_pct, axis=0)
+        upper = cp.percentile(data_gpu, high_pct, axis=0)
     return cp.clip(data_gpu, lower, upper)
 
 
@@ -330,6 +343,8 @@ def _prepare_frames_and_weights(
     normalized_frames: list[np.ndarray] = []
     first_shape = None
     expanded_channels = False
+    reject_algo = (stacking_params.get("stack_reject_algo") or "").strip().lower()
+    winsorized_reject = reject_algo in {"winsorized_sigma_clip", "winsorized", "winsor"}
 
     # Basic normalization to float32 + shape enforcement
     for idx, frame in enumerate(aligned_images):
@@ -358,6 +373,8 @@ def _prepare_frames_and_weights(
 
     # Optional photometric normalization (linear_fit / sky_mean)
     norm_method = (stacking_params.get("stack_norm_method") or "none").strip().lower()
+    if winsorized_reject:
+        norm_method = "none"
     use_gpu_norm = False
     if zconfig is not None:
         use_gpu_norm = _coerce_config_bool(
@@ -393,7 +410,10 @@ def _prepare_frames_and_weights(
             continue
         frame_f32 = np.asarray(frame, dtype=np.float32)
         if not np.all(np.isfinite(frame_f32)):
-            frame_f32 = np.nan_to_num(frame_f32, nan=0.0, posinf=0.0, neginf=0.0)
+            if winsorized_reject:
+                frame_f32 = np.where(np.isfinite(frame_f32), frame_f32, np.nan).astype(np.float32, copy=False)
+            else:
+                frame_f32 = np.nan_to_num(frame_f32, nan=0.0, posinf=0.0, neginf=0.0)
         filtered_frames.append(frame_f32 if frame_f32.flags.c_contiguous else np.ascontiguousarray(frame_f32))
 
     if not filtered_frames:
@@ -711,7 +731,8 @@ def gpu_stack_from_arrays(
     if not np.any(np.isfinite(stacked)):
         raise GPUStackingError("GPU stack produced no finite pixels; falling back to CPU")
     if not np.all(np.isfinite(stacked)):
-        stacked = np.nan_to_num(stacked, nan=0.0, posinf=0.0, neginf=0.0)
+        if algo not in {"winsorized_sigma_clip", "winsorized", "winsor"}:
+            stacked = np.nan_to_num(stacked, nan=0.0, posinf=0.0, neginf=0.0)
     try:
         max_abs = float(np.nanmax(np.abs(stacked)))
     except Exception:

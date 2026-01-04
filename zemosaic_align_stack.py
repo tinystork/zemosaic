@@ -160,12 +160,30 @@ def _winsorize_block_numpy(arr_block: np.ndarray, limits: tuple[float, float]) -
     low, high = limits
     block = arr_block.astype(np.float32, copy=False)
     result = block.copy()
+    quantile_func = getattr(np, "nanquantile", None)
+    if quantile_func is None:
+        nanpercentile = getattr(np, "nanpercentile", None)
+        if nanpercentile is not None:
+            def quantile_func(data, q, axis=0):  # type: ignore[misc]
+                return nanpercentile(data, q * 100.0, axis=axis)
+        else:
+            def quantile_func(data, q, axis=0):  # type: ignore[misc]
+                flat = data.reshape(data.shape[0], -1)
+                out = np.empty(flat.shape[1], dtype=np.float32)
+                for idx in range(flat.shape[1]):
+                    col = flat[:, idx]
+                    finite = col[np.isfinite(col)]
+                    if finite.size == 0:
+                        out[idx] = np.nan
+                    else:
+                        out[idx] = np.quantile(finite, q)
+                return out.reshape(data.shape[1:])
     if low > 0:
-        lower = np.quantile(block, low, axis=0)
+        lower = quantile_func(block, low, axis=0)
         lower = lower.astype(np.float32, copy=False)
         np.maximum(result, lower, out=result)
     if high > 0:
-        upper = np.quantile(block, 1.0 - high, axis=0)
+        upper = quantile_func(block, 1.0 - high, axis=0)
         upper = upper.astype(np.float32, copy=False)
         np.minimum(result, upper, out=result)
     return result
@@ -1639,6 +1657,14 @@ def stack_winsorized_sigma_clip(
     cpu_kwargs = dict(kwargs)
     if weights_array_full is not None:
         cpu_kwargs["weights"] = weights_array_full
+    external_winsor = cpu_stack_winsorized is not _cpu_stack_winsorized_fallback
+    frames_have_nonfinite = False
+    if external_winsor:
+        for frame in frames_list:
+            frame_arr = _np.asarray(frame)
+            if not _np.isfinite(frame_arr).all():
+                frames_have_nonfinite = True
+                break
 
     fallback_sequence: list[tuple[str, Optional[int]]] = []
     if force_memmap_plan:
@@ -1649,30 +1675,42 @@ def stack_winsorized_sigma_clip(
     last_error: Exception | None = None
 
     if not force_memmap_plan:
-        try:
-            result_tuple = cpu_stack_winsorized(frames_list, **cpu_kwargs)
-        except TypeError:
-            if weights_array_full is not None:
-                _log_stack_message(
-                    "[Stack][Winsorized CPU] External implementation rejected weights; falling back to internal handler.",
-                    "WARN",
-                    progress_callback,
-                )
-                result_tuple = _cpu_stack_winsorized_fallback(
-                    frames_list,
-                    **cpu_kwargs,
-                    force_memmap=force_memmap_plan,
-                )
-            else:
-                raise
-        except (MemoryError, _NumpyArrayMemoryError) as mem_err:
-            last_error = mem_err
+        if external_winsor and frames_have_nonfinite:
             _log_stack_message(
-                "stack_mem_retry_after_error",
+                "[Stack][Winsorized CPU] Non-finite inputs detected; using internal NaN-safe fallback.",
                 "WARN",
                 progress_callback,
-                error=str(mem_err),
             )
+            result_tuple = _cpu_stack_winsorized_fallback(
+                frames_list,
+                **cpu_kwargs,
+                force_memmap=force_memmap_plan,
+            )
+        else:
+            try:
+                result_tuple = cpu_stack_winsorized(frames_list, **cpu_kwargs)
+            except TypeError:
+                if weights_array_full is not None:
+                    _log_stack_message(
+                        "[Stack][Winsorized CPU] External implementation rejected weights; falling back to internal handler.",
+                        "WARN",
+                        progress_callback,
+                    )
+                    result_tuple = _cpu_stack_winsorized_fallback(
+                        frames_list,
+                        **cpu_kwargs,
+                        force_memmap=force_memmap_plan,
+                    )
+                else:
+                    raise
+            except (MemoryError, _NumpyArrayMemoryError) as mem_err:
+                last_error = mem_err
+                _log_stack_message(
+                    "stack_mem_retry_after_error",
+                    "WARN",
+                    progress_callback,
+                    error=str(mem_err),
+                )
 
     if result_tuple is not None:
         stacked_cpu, rejected = _normalize_stack_output(result_tuple)

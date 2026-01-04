@@ -12547,7 +12547,10 @@ def create_master_tile(
         _PH3_CONCURRENCY_SEMAPHORE.acquire()
     except Exception:
         pass
-    propagate_mask_for_coverage = bool(altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE)
+    winsorized_reject = str(stack_reject_algo or "").lower() == "winsorized_sigma_clip"
+    propagate_mask_for_coverage = bool(
+        winsorized_reject or (altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE)
+    )
     if debug_tile:
         pcb_tile(
             f"MT_COVERAGE: propagate_mask={propagate_mask_for_coverage}",
@@ -12676,7 +12679,7 @@ def create_master_tile(
             )
 
     # If we nanized aligned images for coverage, clean them before stacking to avoid stacker ERROR logs.
-    if propagate_mask_for_coverage:
+    if propagate_mask_for_coverage and not winsorized_reject:
         try:
             for idx_img, img in enumerate(valid_aligned_images):
                 if isinstance(img, np.ndarray):

@@ -101,3 +101,68 @@ def test_gpu_stack_matches_cpu_noise_variance():
 
     assert max_diff < 1e-3
     assert np.all(med_diff < 1e-3)
+
+
+@pytest.mark.skipif(not _gpu_is_usable(), reason="CuPy/CUDA unavailable for GPU parity check")
+def test_gpu_stack_winsorized_nan_policy_matches_cpu():
+    frames = []
+    base_vals = [1000.0, 1001.0, 1002.0]
+    for idx, val in enumerate(base_vals):
+        frame = np.full((8, 8, 3), val, dtype=np.float32)
+        frame[:, :1, :] = np.nan
+        if idx == 1:
+            frame[:, -1:, :] = np.nan
+        frames.append(frame)
+
+    zconfig = SimpleNamespace(
+        stack_use_gpu=True,
+        use_gpu_stack=True,
+        use_gpu=True,
+        poststack_equalize_rgb=False,
+    )
+
+    cpu_stack, _ = zas.stack_winsorized_sigma_clip(
+        frames,
+        zconfig=zconfig,
+        stack_metadata={},
+        winsor_limits=(0.05, 0.05),
+        kappa=5.0,
+        apply_rewinsor=True,
+        progress_callback=None,
+    )
+
+    stacking_params = {
+        "stack_norm_method": "none",
+        "stack_weight_method": "none",
+        "stack_reject_algo": "winsorized_sigma_clip",
+        "stack_kappa_low": 5.0,
+        "stack_kappa_high": 5.0,
+        "parsed_winsor_limits": (0.05, 0.05),
+        "stack_final_combine": "mean",
+        "apply_radial_weight": False,
+        "poststack_equalize_rgb": False,
+    }
+
+    gpu_stack, _ = gpu_stack_from_arrays(
+        frames,
+        stacking_params,
+        parallel_plan=None,
+        logger=None,
+        pcb_tile=None,
+        tile_id=None,
+        zconfig=zconfig,
+    )
+
+    assert cpu_stack.shape == gpu_stack.shape
+
+    center_cpu = cpu_stack[:, 1:-1, :]
+    center_gpu = gpu_stack[:, 1:-1, :]
+    assert np.all(np.isfinite(center_cpu))
+    assert np.all(np.isfinite(center_gpu))
+    assert np.allclose(center_cpu, 1001.0, atol=1e-3)
+    assert np.allclose(center_cpu, center_gpu, atol=1e-3)
+
+    left_cpu = cpu_stack[:, :1, :]
+    left_gpu = gpu_stack[:, :1, :]
+    assert np.all(~np.isfinite(left_cpu) | (left_cpu == 0.0))
+    assert np.all(~np.isfinite(left_gpu) | (left_gpu == 0.0))

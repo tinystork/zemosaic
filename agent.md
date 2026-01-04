@@ -12,14 +12,17 @@ There is also code that explicitly converts NaNs to zeros before stacking:
 - `# If we nanized aligned images for coverage, clean them before stacking to avoid stacker ERROR logs.`
 This defeats NaN masking and re-injects border artifacts into the stack.
 
-Root cause: winsorized sigma clip CPU path uses `np.quantile` inside `_winsorize_block_numpy`, which is not NaN-safe. This likely forced `propagate_mask=False` upstream to avoid NaNs, creating the visible artifacts.
+Root cause: winsorized sigma clip uses non-NaN-safe quantiles on both CPU (`np.quantile`) and GPU (`cp.percentile`), which likely forced `propagate_mask=False` upstream to avoid NaNs, creating the visible artifacts. After enabling NaN footprints, GPU linear-fit normalization still used `cp.percentile` via `zemosaic_utils._percentiles_gpu`, producing NaN stats and collapsing signal (a=0). GPU winsorized stacking also ran normalization and `nan_to_num` on NaNs, diluting signal when many frames had NaN footprints.
 
 ## Goal
 Make master-tile stacking correctly ignore pixels outside alignment footprints:
-1) Make winsorized sigma clip NaN-safe on CPU (use nan-aware quantiles).
-2) Enable `propagate_mask=True` for Phase-3 master-tile alignment (at least when using winsorized_sigma_clip).
-3) Do NOT convert NaNs to zeros before stacking for the winsorized path.
-4) Ensure no regressions in SDS mode, grid mode, and “I’m using master tiles” paths.
+1) [x] Make winsorized sigma clip NaN-safe on CPU (use nan-aware quantiles).
+2) [x] Make winsorized sigma clip NaN-safe on GPU (use nan-aware percentiles when needed).
+3) [x] Enable `propagate_mask=True` for Phase-3 master-tile alignment (at least when using winsorized_sigma_clip).
+4) [x] Do NOT convert NaNs to zeros before stacking for the winsorized path.
+5) [x] Make GPU percentiles used by linear-fit normalization NaN-safe.
+6) [x] Skip linear-fit normalization and preserve NaNs in GPU winsorized stacking to avoid signal dilution.
+7) [ ] Ensure no regressions in SDS mode, grid mode, and “I’m using master tiles” paths.
 
 ## Non-goals
 - Do NOT change AltAz cleanup behavior or thresholds (ignore AltAz cleanup for now).
@@ -58,7 +61,16 @@ Important: Keep performance reasonable; only the quantile call needs to change.
 `stack_winsorized_sigma_clip` may call an external `cpu_stack_winsorized` implementation (seestar/core/stack_methods.py) when present.
 To avoid NaN regressions:
 - Detect if any input frame contains non-finite values (`~isfinite`) and, if so, force the internal fallback path (or confirm the external impl is NaN-safe).
-- The GPU winsor path already uses `nanquantile`; keep it as-is.
+
+### 4) zemosaic_align_stack_gpu.py — NaN-safe winsor percentiles
+In `_winsorize_chunk(data_gpu, low_high_limits)`:
+- Use `cp.nanpercentile` when non-finite values are present.
+- Keep `cp.percentile` for the common all-finite case to preserve performance.
+
+### 5) zemosaic_utils.py — NaN-safe GPU percentiles for normalization
+In `_percentiles_gpu(arr2d, p_low, p_high)`:
+- If non-finite values exist, use `cp.nanpercentile` (or CPU `np.nanpercentile` fallback) to avoid NaN stats.
+- Keep `cp.percentile`/`np.percentile` for all-finite data.
 
 ## Verification / Acceptance Criteria
 ### Visual / pipeline acceptance
@@ -80,13 +92,14 @@ To avoid NaN regressions:
 
 ## Suggested minimal test (add if tests folder exists)
 Add a small unit test for NaN-safe winsor:
-- Create 3 synthetic frames (H,W,3) where left/right borders are NaN in some frames (simulating footprint gaps).
-- Run `stack_winsorized_sigma_clip`.
-- Assert:
-  - central region output is finite and close to expected mean
-  - border region output remains 0 (or NaN depending on the stack’s final policy), but NOT colored / non-zero due to NaN mishandling
-  - function does not crash.
+- [x] Create 3 synthetic frames (H,W,3) where left/right borders are NaN in some frames (simulating footprint gaps).
+- [x] Run `stack_winsorized_sigma_clip`.
+- [x] Assert:
+  - [x] central region output is finite and close to expected mean
+  - [x] border region output remains 0 (or NaN depending on the stack’s final policy), but NOT colored / non-zero due to NaN mishandling
+  - [x] function does not crash.
+- [x] Add a GPU/CPU parity test (skips if GPU unavailable) to ensure NaN edges do not colorize and the center matches within tolerance.
 
 ## Deliverables
-- Patch implementing the changes above.
-- Short note in logs/stack_metadata indicating winsor quantile method is NaN-safe (optional).
+- [x] Patch implementing the changes above.
+- [ ] Short note in logs/stack_metadata indicating winsor quantile method is NaN-safe (optional).
