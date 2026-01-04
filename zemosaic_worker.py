@@ -12583,7 +12583,18 @@ def create_master_tile(
 
     del tile_images_data_HWC_adu; gc.collect()
 
-    valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
+    ref_aligned_img = None
+    if aligned_images_for_stack and 0 <= ref_loaded_idx < len(aligned_images_for_stack):
+        ref_aligned_img = aligned_images_for_stack[ref_loaded_idx]
+
+    if ref_aligned_img is not None:
+        valid_aligned_images = [ref_aligned_img]
+        for idx_img, img in enumerate(aligned_images_for_stack):
+            if idx_img == ref_loaded_idx or img is None:
+                continue
+            valid_aligned_images.append(img)
+    else:
+        valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
     if aligned_images_for_stack:
         del aligned_images_for_stack # Libérer la liste originale après filtrage
 
@@ -13420,7 +13431,8 @@ def create_master_tile(
         header_mt_save['RGBGAINR'] = (gain_r, 'RGB equalization gain (red)')
         header_mt_save['RGBGAING'] = (gain_g, 'RGB equalization gain (green)')
         header_mt_save['RGBGAINB'] = (gain_b, 'RGB equalization gain (blue)')
-        header_mt_save['RGBEQMED'] = (target_median_val, 'RGB equalization target median')
+        target_median_hdr_val = target_median_val if math.isfinite(target_median_val) else "nan"
+        header_mt_save['RGBEQMED'] = (target_median_hdr_val, 'RGB equalization target median')
         try:
             header_mt_save.add_history(history_msg)
         except Exception:
