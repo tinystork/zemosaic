@@ -1,221 +1,157 @@
-# Mission: Implement TRUE PixInsight-like Winsorized Sigma Clipping (WSC) with CPU/GPU parity (no regressions)
-(READ FIRST — NON-NEGOTIABLE)
+# Mission: Fix noise_fwhm weighting robustness (NaN-heavy frames) + ensure GPU applies quality weights
 
-### 0) Hard constraints (do not argue, do not “improve”)
-- **NO GUI CHANGES**: do not touch PySide/Tk code, do not touch locales, do not touch settings widgets.
-  Forbidden files (non-exhaustive): `zemosaic_gui_qt.py`, `zemosaic_filter_gui_qt.py`, any `*_gui*.py`, `locales/*.json`.
-- **NO BEHAVIOR CHANGE OUTSIDE WSC**: do not modify other rejection modes, weighting logic, crop logic, master-tile quality gate, SDS/grid mode behavior.
-- **DO NOT CHANGE batch-size semantics** (CRITICAL): the current behavior for “batch size = 0” and “batch size > 1” must remain EXACTLY as-is.
-- **NO “close enough” GPU/CPU**: for Winsorized Sigma Clip, CPU and GPU outputs must be **identical**, not “similar”.
-- **NO APPROXIMATION**: PixInsight-like WSC must NOT use frame-splitting (`frames_per_pass`) or any per-frame streaming approximation.
-  Spatial chunking is allowed, but **each pixel must see all N frames**.
+## Context
+We observe repeated warnings during MasterTile stacking when using `stack_weight_method = "noise_fwhm"`:
 
-### 1) Scope of allowed code changes (keep it surgical)
-Allowed files (expected):
-- `zemosaic_align_stack.py` (CPU wiring + shared core)
-- `zemosaic_align_stack_gpu.py` (GPU wiring, but must call the same shared core)
-- `zemosaic_config.py` / settings plumbing ONLY if needed for hidden defaults / env switches
-- `tests/` (new tests only; do not rewrite unrelated tests)
+- `weight_fwhm_bkg2d_error`: "All boxes contain <= N good pixels..."
+- `weight_fwhm_warn_all_fwhm_are_infinite`
+- Stack falls back to uniform weights → effectively no weighting.
 
-Forbidden changes:
-- No renaming public APIs used by worker/modes.
-- No refactor sweeping “cleanup”, “style changes”, or “performance refactors” outside WSC.
-- No new external dependencies.
+Root cause:
+Aligned/warped frames often contain large NaN/Inf regions (outside overlap). `photutils.Background2D` rejects all boxes when too many pixels are masked/non-finite, even with high exclude_percentile.
+Also: GPU stack path currently may discard quality weights when radial weighting is disabled, causing weight methods to be ignored on GPU even if computed.
 
-### 2) Single-source-of-truth algorithm (MANDATORY)
-- Implement **ONE** backend-agnostic core: `wsc_pixinsight_core(xp, X_block, ...)` where xp = numpy or cupy.
-- CPU path and GPU path MUST call this same function.
-- DO NOT implement separate CPU vs GPU versions that can drift.
+## Goals (must-have)
+1. Make `noise_fwhm` weighting robust on NaN/Inf-heavy aligned frames:
+   - Avoid Background2D fatal failures whenever reasonable.
+   - Compute finite, meaningful FWHM weights when there is usable data.
+   - If not possible, gracefully degrade to current behavior (infinite FWHM → uniform weights) WITHOUT crashing.
 
-### 3) Algorithm definition is locked (do not reinterpret)
-- Init: median + MAD, sigma0 = 1.4826 * MAD (sigma floor = 1e-10).
-- Iterate: compute bounds → clip (winsorize) → update winsorized mean → update winsorized sigma (Huber/winsorized RMS).
-- Output: winsorized mean (not masked sigma clip).
-- NaN/inf: treated as missing samples; do not poison medians/means.
+2. Ensure GPU stacking path actually applies quality weights (noise_variance / noise_fwhm) when selected:
+   - CPU and GPU must behave consistently for the same settings.
+   - No “silent ignore” of weights on GPU when radial weighting is off.
 
-### 4) Parity enforcement (STRICT)
-- Reference = CPU output after float32 cast.
-- GPU output after float32 cast must satisfy:
-  - `max_abs_diff == 0.0` on deterministic small tests (seeded RNG).
-- If GPU cannot guarantee parity for WSC (any reason: precision, nondeterminism, edge cases):
-  - **fallback to CPU for WSC only**, with a clear log line.
-  - Do NOT disable GPU globally; keep GPU for other operations intact.
-### Parity definition (do not reinterpret)
-We distinguish:
-- STRICT_PARITY (default): GPU may be used only if it matches CPU within 0 ULP on the parity test set.
-  Otherwise WSC falls back to CPU (WSC only) with a clear log line.
-- NUMERIC_PARITY (opt-in): GPU must match CPU within <= 1 ULP (float32) OR max_abs_diff <= 2e-7.
-  Enabled only via env var: ZEMOSAIC_WSC_PARITY=NUMERIC
-“Any GPU exception (OOM, kernel failure, unsupported op) must trigger CPU fallback for WSC only, with a single log line.”
+3. Preserve existing behavior for all other modes:
+   - No GUI changes.
+   - No changes to stacking algorithms (WSC / kappa-sigma / mean), except how weights are computed/propagated.
+   - Keep existing log keys where possible (do not break localization).
 
-### 5) Keep legacy behavior available (recommended safety hatch)
-- Add an env/config switch (no GUI):
-  - `ZEMOSAIC_WSC_IMPL=pixinsight|legacy_quantile`
-- Default: `pixinsight`
-- `legacy_quantile` must preserve the old behavior unchanged.
+## Non-goals (do NOT do)
+- Do not modify GUI (Qt/Tk).
+- Do not change default settings values.
+- Do not change WSC implementation, sigma clip math, or normalization algorithms (except weight calculation plumbing).
+- Do not add new dependencies.
 
-### 6) Required verification before marking done
-You must provide evidence in code/tests that:
-- Existing test suite still passes.
-- New tests added:
-  1) cosmic ray suppression
-  2) dead pixel suppression
-  3) faint diffuse preservation (IFN-like offset not crushed)
-  4) CPU vs GPU strict parity (`max_abs_diff == 0.0`) when GPU is available
+## Files to inspect / likely edit
+- `zemosaic_align_stack.py`:
+  - `_compute_quality_weights(...)` and the `noise_fwhm` / FWHM helper(s).
+  - The `photutils.Background2D` + `DAOStarFinder` part.
+- `zemosaic_align_stack_gpu.py`:
+  - `_prepare_frames_and_weights(...)` currently calls CPU helper `_compute_quality_weights`.
+  - Check for logic that drops `quality_weights` when `radial_map is None` and fix it (see below).
+- Optional: tests under `tests/`.
 
-### 7) Logging (minimal, no UI)
-- One log line per stack for WSC:
-  - impl used (pixinsight vs legacy)
-  - sigma_low/high, max_iters, iters_used
-  - huber enabled/disabled
-  - fraction clipped low/high
-- No noisy per-iteration spam unless debug flag enabled.
+IMPORTANT: There might be multiple copies of modules in the repo (root vs core). Ensure you patch the one actually imported by runtime:
+- Run: `python -c "import zemosaic_align_stack; print(zemosaic_align_stack.__file__)"`
 
-### 8) Don’t break current GPU success (regression guard)
-- Do not change GPU detection/selection logic that was recently fixed.
-- Do not alter the “GPU enabled” codepath outside WSC unless strictly necessary.
-- If you must touch it, isolate the change and explain why in the patch notes.
+## Required behavior changes (CPU side) — robust FWHM weighting
+In `noise_fwhm` weighting, before calling `Background2D`:
+1. Compute a finite mask on `target_data_for_fwhm`:
+   - `finite = np.isfinite(target_data_for_fwhm)`
+   - If no finite pixels: log existing key `weight_fwhm_no_finite_data` and set fwhm=inf for this image.
 
-### 9) Output expectations
-- Produce a small patch with minimal file changes.
-- Include a short summary of what changed + how to run the parity test locally.
+2. Define a “usable ROI” to avoid NaN borders:
+   - Compute bounding box of finite pixels (min/max rows/cols where finite==True).
+   - Optionally grow bbox by a small margin (e.g., 8 px) but clamp to image bounds.
+   - If bbox is too small (e.g., < 64x64 or finite fraction < 0.10), skip Background2D and go directly to fallback stats (sigma_clipped_stats on finite pixels only).
 
-## Goal (non-negotiable)
-Replace ZeMosaic’s current “winsorized_sigma_clip” (quantile-ish winsor + std-ish sigma) with a TRUE PixInsight-like
-Winsorized Sigma Clipping that preserves faint diffuse signal (IFN) and behaves robustly against outliers.
+3. Run Background2D on the ROI only:
+   - Feed `roi = target_data_for_fwhm[y0:y1, x0:x1]`
+   - Provide `mask=~np.isfinite(roi)` if supported by photutils Background2D.
+   - Keep `exclude_percentile` high (e.g., 90) but do not rely on it alone.
 
-**Critical constraints**
-1) **NO GUI changes** (PySide + Tk must remain untouched).
-2) **NO regressions** in any other rejection/stack mode (kappa-sigma, linear fit, none, grid mode, SDS, “I’m using master tiles”).
-3) **NO approximation differences between CPU and GPU**:
-   - Same math, same parameters, same defaults, same edge-case behavior.
-   - CPU is the reference; GPU must match CPU for defined tests (see Acceptance).
-4) **Batch size semantics must NOT change** (IMPORTANT: “batch size = 0” and “batch size > 1” behavior must remain EXACTLY as today).
-5) **PixInsight WSC must NOT be implemented as quantile/percentile winsorization.**
-   - No cp/np percentile, quantile, partition-based tail clipping as the core behavior (except if explicitly kept for legacy mode only).
+4. Compute `data_subtracted` correctly:
+   - `data_subtracted_roi = roi - bkg.background`
+   - Then sanitize: `np.nan_to_num(..., nan=0, posinf=0, neginf=0)` and float32.
 
-## Scope: where WSC is used (must be consistent everywhere)
-WSC can be executed through multiple codepaths. All must route to the same core algorithm:
-- Phase 4.5 / group stacking: `zemosaic_worker.py` → `zemosaic_align_stack.stack_winsorized_sigma_clip()`
-- Phase 3 GPU stacker: `zemosaic_align_stack_gpu.py` (reject algo = winsorized_sigma_clip)
-- CPU stack core fallback path: `zemosaic_align_stack.stack_aligned_images()` when rejection_algorithm is winsorized_sigma_clip
+5. Threshold scalarization:
+   - `threshold_daofind_val = 5.0 * background_rms`
+   - If `background_rms` is an array, use a scalar robust reducer (`nanmedian` preferred, else `nanmean`).
+   - Ensure threshold is finite; otherwise fallback stats.
 
-**Requirement:** No matter which phase/mode triggers WSC, the output must be consistent.
+6. Fallback stats must ignore NaNs:
+   - Use sigma_clipped_stats on finite pixels only.
+   - If the function requires full array, pass `roi_clean` where invalids are replaced by median of finite pixels.
+   - Create `data_subtracted_roi = roi_clean - median_glob`
+   - threshold = 5 * stddev_glob (finite guard).
 
-## PixInsight-like WSC: exact algorithm specification (lock this down)
-We implement a per-pixel iterative winsorization procedure:
+7. DAOStarFinder compatibility with photutils:
+   - Keep the existing fix: try with `sky=0.0`, if TypeError mentions sky, retry without `sky`.
+   - Do NOT swallow unrelated TypeErrors silently.
+   - If DAOStarFinder fails: keep current behavior (log `weight_fwhm_daofind_error`, fwhm=inf).
 
-Let X be a stack block shaped (N, H, W, C) in float32 (or float64 internally), N>=1.
+8. FWHM estimate must be stable:
+   - If no detected sources, treat as invalid (fwhm=inf) and log existing key if present (or reuse existing warn).
+   - If computed fwhm is non-finite or <=0, set inf.
 
-### A) Validity / NaN policy
-- Treat non-finite values (NaN/inf) as missing samples.
-- Missing samples do NOT contribute to median/MAD/mean/sigma.
-- If a pixel has <2 valid samples: output is that sample (or NaN if none).
+9. Convert FWHM list → weights:
+   - Keep EXACT current mapping formula (do not change weight law).
+   - Only improve the upstream robustness so FWHM is computable more often.
 
-### B) Initialization (robust)
-Compute per-pixel, per-channel:
-- `m0 = median(X)` over axis=0 (NumPy/CuPy median definition: for even N, average of the two middle values).
-- `mad0 = median(|X - m0|)`
-- `sigma0 = 1.4826 * mad0`
-- If sigma0 == 0 → set sigma0 = 1e-10 (avoid div/zero; do NOT explode thresholds)
+## Required behavior changes (GPU side) — apply quality weights consistently
+In `zemosaic_align_stack_gpu.py`, inside `_prepare_frames_and_weights`:
 
-### C) Iterative winsorization (Huber/Winsorized estimates)
-For i in 1..max_iters:
-1) bounds:
-   - `lo = m - sigma_low  * sigma`
-   - `hi = m + sigma_high * sigma`
-2) winsorize (clamp outliers):
-   - `Xw = clip(X, lo, hi)` (only for valid samples)
-3) update location (winsorized mean):
-   - unweighted: `m_new = mean(Xw)`
-   - weighted (if weights provided): `m_new = sum(w*Xw)/sum(w)`
-4) update scale (winsorized sigma = Huber scale estimate):
-   - residual: `r = Xw - m_new`
-   - unweighted: `sigma_new = sqrt(mean(r^2))`
-   - weighted: `sigma_new = sqrt(sum(w*r^2)/sum(w))`
-   - sigma_new floor at 1e-10
-   Huber scale update (exact):
-    u = r / sigma
-    w = 1                      if |u| <= c
-    w = c / |u|                if |u| >  c
-    sigma_new = sqrt( sum(w * r^2) / sum(w) )
-    (Weights w above are Huber IRLS weights; do not use alternative Huber formulas.)
+There is currently logic that effectively disables `quality_weights` when `radial_map is None`.
+This makes GPU ignore `noise_fwhm`/`noise_variance` unless radial weighting is enabled.
 
-Weights scope (locked):
-- WSC supports only per-frame weights shape (N,) or (N,1,1[,1]) broadcasting.
-- Median/MAD are always unweighted.
-- Weights apply only to the winsorized mean and winsorized sigma updates, and the final mean.
-- If weights are missing or invalid, treat as uniform weights (do not error).
+Fix:
+- Remove the unconditional drop.
+- Instead, only drop/skip weights that are not broadcastable to frame shape.
+- Keep parity with CPU:
+  - If CPU applies per-frame scalar/channel weights for mean/WSC, GPU must too.
+  - If CPU intentionally ignores weights for some combine methods, GPU should match that.
 
-5) convergence:
-   - stop if `max(|m_new-m|) <= eps_m` AND `max(|sigma_new-sigma|) <= eps_s`
-   - default eps: `eps_m = 5e-4 * max(1, |m|)` and `eps_s = 5e-4 * max(1, |sigma|)` (relative-ish)
-   - also stop if bounds no longer change (stable lo/hi), to avoid useless iterations.
+Implementation suggestion:
+- Keep `quality_weights` as returned by `_compute_quality_weights`.
+- During `combined_weights` building, use `_broadcast_weight_template(q_weight, frame.shape)` to validate.
+- If broadcast fails for a frame, set that frame's q_weight to None (or drop weighting entirely only if too many invalid).
+- Do not set `weight_method_used="none"` unless weights truly cannot be applied.
 
-### D) Final integration output
-Return the final **winsorized mean** (NOT masked sigma clip):
-- If weights: weighted mean of the last Xw
-- Else: mean of the last Xw
-Output dtype: float32.
+Also ensure WSC weights block (`wsc_weights_block`) remains consistent and is used when reject algo is winsorized sigma clip.
 
-### E) No frame-splitting approximation
-PixInsight WSC is per-pixel across the full N samples. Therefore:
-- **Do NOT implement WSC by “frames_per_pass” splitting** (streaming-by-frames is an approximation and changes results).
-- WSC may use **spatial chunking only** (rows/tiles), but each pixel must see all N frames.
+## Logging requirements
+- Keep existing GUI keys used by worker logs:
+  - `weight_fwhm_bkg2d_error`
+  - `weight_fwhm_no_finite_data`
+  - `weight_fwhm_global_stats_invalid`
+  - `weight_fwhm_warn_all_fwhm_are_infinite`
+  - `weight_fwhm_daofind_error`
+- Optionally add DEBUG-only logs (not GUI-keyed) for:
+  - finite fraction
+  - bbox size
+But do not spam warnings.
 
-## Implementation plan (idiot-proof)
-### 1) Single shared core (to prevent CPU/GPU drift)
-Create ONE backend-agnostic implementation:
-- `wsc_pixinsight_core(xp, X_block, sigma_low, sigma_high, max_iters, eps, weights_block=None, ...)`
-Where `xp` is `numpy` or `cupy`.
+## Acceptance criteria
+- On datasets with NaN borders (common aligned frames):
+  - `noise_fwhm` no longer collapses to all-infinite FWHM in typical cases with usable overlap.
+  - Weighting produces non-uniform weights (unless truly no stars / no finite pixels).
+- GPU + CPU runs with same settings:
+  - Both apply quality weights when selected (unless combine method doesn’t support weights).
+  - No regression in other modes (noise_variance, none, other reject algos).
 
-**Hard rule:** CPU WSC and GPU WSC must call this same function.
-No duplicated “similar” implementations.
+## Tests (must add at least 2)
+Add unit tests that do NOT require a GPU:
 
-### 2) Wiring: keep existing APIs stable
-- Keep signatures of:
-  - `zemosaic_align_stack.stack_winsorized_sigma_clip(...)`
-  - `zemosaic_align_stack_gpu.gpu_stack_from_arrays / gpu_stack_from_paths(...)`
-- Do not remove existing rejection algorithms or change their defaults.
-- Only change behavior when `reject_algo == winsorized_sigma_clip`.
+1) `test_noise_fwhm_nan_borders_produces_weights`
+- Build a small stack of synthetic frames (float32) with:
+  - Central region containing a few gaussian “stars”
+  - Borders set to NaN (simulate warp/outside overlap)
+- Call `_compute_quality_weights(frames, "noise_fwhm")`
+- Assert:
+  - returned weights are finite
+  - not all equal (non-uniform) when stars exist
 
-### 3) Legacy compatibility (optional but recommended)
-To avoid surprising users who relied on old quantile behavior:
-- Add hidden switch (config or env var):
-  - `ZEMOSAIC_WSC_IMPL=pixinsight|legacy_quantile`
-- Default: `pixinsight`
-- If `legacy_quantile`, keep old behavior intact.
+2) `test_prepare_frames_and_weights_keeps_quality_weights_without_radial`
+- Call GPU helper `_prepare_frames_and_weights` with:
+  - `stack_weight_method="noise_fwhm"`
+  - radial weighting disabled
+- Assert:
+  - `weight_method_used` remains `"noise_fwhm"` (or at least not forced to "none")
+  - and/or `wsc_weights_block` non-None when weights computed
 
-### 4) Determinism / parity requirements
-- Use the same dtype strategy in both CPU and GPU:
-  - Compute m/sigma in float64 (recommended) OR float32, but must match across backends.
-  - Final output must be float32.
-- Any GPU nondeterminism is unacceptable for this mode:
-  - If parity cannot be guaranteed, GPU must **auto-fallback to CPU** for WSC only (with a clear log line),
-    while leaving GPU enabled for other algorithms.
+Keep tests small and fast.
 
-## Tests (must prevent regressions)
-Add tests that codify “no approximation”:
-1) **Outlier suppression**: huge cosmic ray pixel → output near baseline.
-2) **Faint diffuse preservation**: add weak constant IFN-like signal to all frames → WSC must NOT suppress it vs kappa-sigma (SNR check).
-3) **CPU vs GPU parity (strict)**:
-   - On a small deterministic stack (seeded RNG), compare CPU and GPU WSC output AFTER float32 cast:
-     - require bitwise equality OR max_abs_diff == 0.0
-   - If GPU not available, test is skipped (but still runs in GPU-enabled CI/dev machines).
-4) **Callsite consistency**:
-   - Ensure Phase 4.5 WSC and Phase 3 GPU WSC route to the same core (smoke test / import check).
-
-## Acceptance criteria (strict)
-- WSC no longer crushes faint IFN compared to kappa-sigma on representative user data (visual + basic stats).
-- CPU and GPU outputs match exactly on defined parity tests (no “close enough”).
-- No change in outputs for other rejection modes.
-- No GUI changes, no batch-size behavior changes.
-
-NaN/Inf handling (exact):
-- Build valid mask V = isfinite(X)
-- For median/MAD: operate on compacted values per pixel if feasible; otherwise use masked large-value sentinel only if it cannot affect selection (documented).
-- For mean/sigma updates: compute sums over V only (Nvalid-aware).
-
-Core location (locked):
-Place wsc_pixinsight_core in `core/robust_rejection.py` (new file allowed), imported by both CPU and GPU stackers.
-Do not import GPU module from CPU module or vice versa.
+## Deliverables
+- PR-ready code changes.
+- Tests added/updated and passing.
+- Brief summary in followup.md including what was changed and why.

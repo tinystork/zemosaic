@@ -228,6 +228,7 @@ def _wsc_pixinsight_stack_cpu(
     sigma_high: float,
     max_iters: int,
     rows_per_chunk: int,
+    weights_block: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     if not frames:
         raise GPUStackingError("No frames provided for CPU fallback")
@@ -252,6 +253,7 @@ def _wsc_pixinsight_stack_cpu(
             sigma_low=sigma_low,
             sigma_high=sigma_high,
             max_iters=max_iters,
+            weights_block=weights_block,
             return_stats=True,
         )
         output[row_start:row_end] = chunk_out.astype(np.float32, copy=False)
@@ -464,6 +466,60 @@ def _compute_radial_weight_map(
         return None
 
 
+def _build_wsc_weights_block(
+    quality_weights: list[np.ndarray | None] | None,
+    frames_count: int,
+    channels: int,
+) -> np.ndarray | None:
+    if not quality_weights or frames_count <= 0:
+        return None
+    is_color = channels == 3
+    sanitized: list[np.ndarray] = []
+    for idx in range(frames_count):
+        w = quality_weights[idx] if idx < len(quality_weights) else None
+        if w is None:
+            if is_color:
+                sanitized.append(np.ones((1, 1, 3), dtype=np.float32))
+            else:
+                sanitized.append(np.ones((1,), dtype=np.float32))
+            continue
+        w_arr = np.asarray(w, dtype=np.float32)
+        if is_color:
+            if w_arr.ndim == 0:
+                w_arr = np.full((1, 1, 3), float(w_arr), dtype=np.float32)
+            elif w_arr.ndim == 1 and w_arr.shape[0] == 3:
+                w_arr = w_arr.reshape((1, 1, 3)).astype(np.float32, copy=False)
+            elif w_arr.ndim == 3 and w_arr.shape == (1, 1, 3):
+                w_arr = w_arr.astype(np.float32, copy=False)
+            else:
+                try:
+                    chv = np.nanmean(w_arr, axis=(0, 1)) if w_arr.ndim >= 2 else np.asarray(w_arr)
+                    chv = np.asarray(chv, dtype=np.float32).reshape((1, 1, -1))
+                    if chv.shape[-1] == 3:
+                        w_arr = chv
+                    else:
+                        w_arr = np.ones((1, 1, 3), dtype=np.float32)
+                except Exception:
+                    w_arr = np.ones((1, 1, 3), dtype=np.float32)
+            sanitized.append(w_arr)
+        else:
+            if w_arr.ndim == 0:
+                val = float(w_arr)
+            else:
+                try:
+                    val = float(np.nanmean(w_arr))
+                except Exception:
+                    val = 1.0
+            sanitized.append(np.asarray([val], dtype=np.float32))
+    try:
+        weights_block = np.stack(sanitized, axis=0)
+    except Exception:
+        return None
+    if weights_block.ndim == 1:
+        weights_block = weights_block.reshape((weights_block.shape[0], 1))
+    return weights_block
+
+
 def _prepare_frames_and_weights(
     aligned_images: Sequence[np.ndarray],
     stacking_params: Mapping[str, Any],
@@ -471,11 +527,21 @@ def _prepare_frames_and_weights(
     zconfig: Any | None,
     pcb_tile: Callable[..., Any] | None,
     logger: logging.Logger | None,
-) -> tuple[list[np.ndarray], np.ndarray | None, str, dict[str, float] | None, bool]:
+) -> tuple[
+    list[np.ndarray],
+    np.ndarray | None,
+    str,
+    dict[str, float] | None,
+    bool,
+    np.ndarray | None,
+    str,
+    dict[str, float] | None,
+]:
     """
     Mirror the CPU stacker's preprocessing: normalize frames and compute weights.
 
-    Returns (frames, weights_stack, weight_method_used, weight_stats, expanded_channels_flag).
+    Returns (frames, weights_stack, weight_method_used, weight_stats, expanded_channels_flag,
+    wsc_weights_block, wsc_weight_method, wsc_weight_stats).
     """
 
     if not aligned_images:
@@ -515,8 +581,6 @@ def _prepare_frames_and_weights(
 
     # Optional photometric normalization (linear_fit / sky_mean)
     norm_method = (stacking_params.get("stack_norm_method") or "none").strip().lower()
-    if winsorized_reject:
-        norm_method = "none"
     use_gpu_norm = False
     if zconfig is not None:
         use_gpu_norm = _coerce_config_bool(
@@ -583,6 +647,13 @@ def _prepare_frames_and_weights(
                 except Exception:
                     pass
 
+    wsc_weight_method = weight_method_used
+    wsc_weight_stats = weight_stats
+    wsc_weights_block = _build_wsc_weights_block(quality_weights, len(filtered_frames), channels)
+    if wsc_weights_block is None:
+        wsc_weight_method = "none"
+        wsc_weight_stats = None
+
     radial_map = _compute_radial_weight_map(height, width, channels, stacking_params, logger)
 
     # Align with CPU behavior: when no radial map is present, the CPU path drops
@@ -619,7 +690,16 @@ def _prepare_frames_and_weights(
             except Exception:
                 weights_stack = None
 
-    return filtered_frames, weights_stack, weight_method_used, weight_stats, expanded_channels
+    return (
+        filtered_frames,
+        weights_stack,
+        weight_method_used,
+        weight_stats,
+        expanded_channels,
+        wsc_weights_block,
+        wsc_weight_method,
+        wsc_weight_stats,
+    )
 
 
 def _combine_weighted_chunk(
@@ -772,7 +852,16 @@ def gpu_stack_from_arrays(
 
     _require_supported_features(stacking_params)
 
-    frames_for_stack, weights_stack, weight_method_used, weight_stats, expanded_channels = _prepare_frames_and_weights(
+    (
+        frames_for_stack,
+        weights_stack,
+        weight_method_used,
+        weight_stats,
+        expanded_channels,
+        wsc_weights_block,
+        wsc_weight_method,
+        wsc_weight_stats,
+    ) = _prepare_frames_and_weights(
         aligned_images,
         stacking_params,
         zconfig=zconfig,
@@ -798,7 +887,9 @@ def gpu_stack_from_arrays(
     kappa_high = float(stacking_params.get("stack_kappa_high", 3.0))
     winsor_limits = stacking_params.get("parsed_winsor_limits", (0.05, 0.05))
     wsc_impl = resolve_wsc_impl(zconfig)
+    wsc_pixinsight = algo in {"winsorized_sigma_clip", "winsorized", "winsor"} and wsc_impl == WSC_IMPL_PIXINSIGHT
     combine_method = stacking_params.get("stack_final_combine", "mean")
+    norm_method = (stacking_params.get("stack_norm_method") or "none").strip().lower()
     if weights_stack is not None and str(combine_method).strip().lower() != "mean":
         try:
             logger.warning(
@@ -807,20 +898,40 @@ def gpu_stack_from_arrays(
             )
         except Exception:
             pass
-    if algo in {"winsorized_sigma_clip", "winsorized", "winsor"} and wsc_impl == WSC_IMPL_PIXINSIGHT:
+    wsc_weights_block_gpu = None
+    if wsc_pixinsight:
         if weights_stack is not None:
+            weights_stack = None
+        if wsc_weights_block is not None:
             try:
-                logger.info("PixInsight WSC ignores per-pixel weights; proceeding unweighted.")
+                wsc_weights_block_gpu = cp.asarray(wsc_weights_block, dtype=cp.float32)
             except Exception:
-                pass
-        weights_stack = None
+                wsc_weights_block_gpu = None
+        weights_block_shape = None if wsc_weights_block is None else tuple(wsc_weights_block.shape)
+        applied_to_core = "yes" if wsc_weights_block is not None else "no"
+        try:
+            logger.info(
+                "[P3][WSC] norm=%s weight=%s weights_block=%s applied_to_core=%s",
+                norm_method,
+                wsc_weight_method or "none",
+                weights_block_shape if weights_block_shape is not None else "none",
+                applied_to_core,
+            )
+        except Exception:
+            pass
+    effective_weight_method = weight_method_used
+    effective_weight_stats = weight_stats
+    if wsc_pixinsight:
+        effective_weight_method = wsc_weight_method
+        effective_weight_stats = wsc_weight_stats
+
     # Chunk profiling (ms)
     prof_upload_ms = 0.0
     prof_reject_ms = 0.0
     prof_combine_ms = 0.0
     prof_download_ms = 0.0
 
-    if algo in {"winsorized_sigma_clip", "winsorized", "winsor"} and wsc_impl == WSC_IMPL_PIXINSIGHT:
+    if wsc_pixinsight:
         parity_ok, parity_max = _wsc_gpu_parity_check()
         if not parity_ok:
             try:
@@ -837,6 +948,7 @@ def gpu_stack_from_arrays(
                 sigma_high=kappa_high,
                 max_iters=WSC_PIXINSIGHT_MAX_ITERS,
                 rows_per_chunk=rows_per_chunk,
+                weights_block=wsc_weights_block,
             )
             _log_wsc_summary(
                 logger,
@@ -850,13 +962,12 @@ def gpu_stack_from_arrays(
                 cpu_out = cpu_out[..., 0]
             rgb_eq_info = _poststack_rgb_equalization(cpu_out, stacking_params, zconfig)
             stack_metadata = {
-                "weight_method": weight_method_used,
-                "weight_stats": weight_stats,
+                "weight_method": effective_weight_method,
+                "weight_stats": effective_weight_stats,
                 "rgb_equalization": rgb_eq_info,
             }
             return cpu_out.astype(np.float32, copy=False), stack_metadata
 
-    wsc_pixinsight = algo in {"winsorized_sigma_clip", "winsorized", "winsor"} and wsc_impl == WSC_IMPL_PIXINSIGHT
     wsc_stats_accum = None
     if wsc_pixinsight:
         wsc_stats_accum = {
@@ -893,6 +1004,7 @@ def gpu_stack_from_arrays(
                     sigma_low=kappa_low,
                     sigma_high=kappa_high,
                     max_iters=WSC_PIXINSIGHT_MAX_ITERS,
+                    weights_block=wsc_weights_block_gpu,
                     return_stats=True,
                 )
                 prof_reject_ms += (time.perf_counter() - t1) * 1000.0
@@ -952,6 +1064,7 @@ def gpu_stack_from_arrays(
                 sigma_high=kappa_high,
                 max_iters=WSC_PIXINSIGHT_MAX_ITERS,
                 rows_per_chunk=rows_per_chunk,
+                weights_block=wsc_weights_block,
             )
             _log_wsc_summary(
                 logger,
@@ -965,8 +1078,8 @@ def gpu_stack_from_arrays(
                 cpu_out = cpu_out[..., 0]
             rgb_eq_info = _poststack_rgb_equalization(cpu_out, stacking_params, zconfig)
             stack_metadata = {
-                "weight_method": weight_method_used,
-                "weight_stats": weight_stats,
+                "weight_method": effective_weight_method,
+                "weight_stats": effective_weight_stats,
                 "rgb_equalization": rgb_eq_info,
             }
             return cpu_out.astype(np.float32, copy=False), stack_metadata
@@ -1039,8 +1152,8 @@ def gpu_stack_from_arrays(
         raise GPUStackingError("GPU stack produced a zero-valued image; falling back to CPU")
 
     stack_metadata: dict[str, Any] = {
-        "weight_method": weight_method_used,
-        "weight_stats": weight_stats,
+        "weight_method": effective_weight_method,
+        "weight_stats": effective_weight_stats,
     }
     rgb_eq_info = _poststack_rgb_equalization(stacked, stacking_params, zconfig)
     stack_metadata["rgb_equalization"] = rgb_eq_info

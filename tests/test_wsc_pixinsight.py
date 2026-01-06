@@ -9,12 +9,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from core.robust_rejection import wsc_pixinsight_core
+
 zas = pytest.importorskip("zemosaic_align_stack", reason="CPU stacker module unavailable on sys.path")
 
 try:
     gpu_mod = pytest.importorskip("zemosaic_align_stack_gpu")
     _gpu_is_usable = getattr(gpu_mod, "_gpu_is_usable", lambda: False)
 except Exception:
+    gpu_mod = None
     _gpu_is_usable = lambda: False  # type: ignore[assignment]
 
 
@@ -123,6 +126,78 @@ def test_wsc_faint_diffuse_preserved_vs_kappa():
 
     assert diff_wsc <= diff_kappa + 0.05
     assert diff_wsc <= 0.3
+
+
+def test_p3_wsc_prep_applies_sky_mean_normalization():
+    if gpu_mod is None:
+        pytest.skip("GPU stacker module unavailable on sys.path")
+
+    frames = [
+        np.full((6, 6, 3), 100.0, dtype=np.float32),
+        np.full((6, 6, 3), 120.0, dtype=np.float32),
+        np.full((6, 6, 3), 80.0, dtype=np.float32),
+    ]
+    stacking_params = {
+        "stack_norm_method": "sky_mean",
+        "stack_reject_algo": "winsorized_sigma_clip",
+        "stack_weight_method": "none",
+    }
+
+    (
+        prepared_frames,
+        _weights_stack,
+        _weight_method_used,
+        _weight_stats,
+        _expanded_channels,
+        _wsc_weights_block,
+        _wsc_weight_method,
+        _wsc_weight_stats,
+    ) = gpu_mod._prepare_frames_and_weights(
+        frames,
+        stacking_params,
+        zconfig=_cpu_config(),
+        pcb_tile=None,
+        logger=None,
+    )
+
+    ref_mean = float(np.mean(prepared_frames[0]))
+    assert np.isclose(ref_mean, 100.0, atol=1e-5, rtol=0.0)
+    assert np.isclose(float(np.mean(prepared_frames[1])), ref_mean, atol=1e-5, rtol=0.0)
+    assert np.isclose(float(np.mean(prepared_frames[2])), ref_mean, atol=1e-5, rtol=0.0)
+    assert not np.allclose(prepared_frames[1], frames[1])
+
+
+def test_wsc_pixinsight_core_weights_block_changes_output():
+    stack = np.stack(
+        [
+            np.full((5, 5), 10.0, dtype=np.float32),
+            np.full((5, 5), 12.0, dtype=np.float32),
+            np.full((5, 5), 14.0, dtype=np.float32),
+        ],
+        axis=0,
+    )
+    weights_a = np.asarray([1.0, 1.0, 1.0], dtype=np.float32)
+    weights_b = np.asarray([1.0, 1.0, 10.0], dtype=np.float32)
+
+    out_a = wsc_pixinsight_core(
+        np,
+        stack,
+        sigma_low=5.0,
+        sigma_high=5.0,
+        max_iters=5,
+        weights_block=weights_a,
+    )
+    out_b = wsc_pixinsight_core(
+        np,
+        stack,
+        sigma_low=5.0,
+        sigma_high=5.0,
+        max_iters=5,
+        weights_block=weights_b,
+    )
+
+    diff = abs(float(np.mean(out_a)) - float(np.mean(out_b)))
+    assert diff > 0.5
 
 
 @pytest.mark.skipif(not _gpu_is_usable(), reason="CuPy/CUDA unavailable for WSC parity check")

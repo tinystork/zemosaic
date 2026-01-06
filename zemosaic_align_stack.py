@@ -3410,32 +3410,74 @@ def _calculate_image_weights_noise_fwhm(
 
             bkg_obj = None # Pour vérifier si bkg a été défini
             try:
-                bkg_obj = Background2D(target_data_for_fwhm, (box_size_bg, box_size_bg), 
-                                   filter_size=(3, 3), sigma_clip=sigma_clip_bg_obj, bkg_estimator=bkg_estimator_obj)
+                bkg_obj = Background2D(
+                    target_data_for_fwhm, (box_size_bg, box_size_bg),
+                    filter_size=(3, 3),
+                    sigma_clip=sigma_clip_bg_obj,
+                    bkg_estimator=bkg_estimator_obj,
+                    exclude_percentile=90,
+                )
+
                 data_subtracted = target_data_for_fwhm - bkg_obj.background
-                threshold_daofind_val = 5.0 * bkg_obj.background_rms 
-            except (ValueError, TypeError) as ve_bkg: 
+                data_subtracted = np.nan_to_num(
+                    data_subtracted, nan=0.0, posinf=0.0, neginf=0.0
+                ).astype(np.float32, copy=False)
+
+                threshold_daofind_val = 5.0 * bkg_obj.background_rms
+
+            except (ValueError, TypeError) as ve_bkg:
                 _pcb("weight_fwhm_bkg2d_error", lvl="WARN", img_idx=i, error=str(ve_bkg))
-                _, median_glob, stddev_glob = sigma_clipped_stats_func(target_data_for_fwhm, sigma=3.0, maxiters=5)
+
+                _, median_glob, stddev_glob = sigma_clipped_stats_func(
+                    target_data_for_fwhm, sigma=3.0, maxiters=5
+                )
+
                 if not (np.isfinite(median_glob) and np.isfinite(stddev_glob)):
                     _pcb("weight_fwhm_global_stats_invalid", lvl="WARN", img_idx=i)
-                    fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+                    fwhm_values_per_image.append(np.inf)
+                    valid_image_indices_fwhm.append(i)
+                    continue
+
                 data_subtracted = target_data_for_fwhm - median_glob
+                data_subtracted = np.nan_to_num(
+                    data_subtracted, nan=0.0, posinf=0.0, neginf=0.0
+                ).astype(np.float32, copy=False)
+
                 threshold_daofind_val = 5.0 * stddev_glob
 
             # S'assurer que threshold_daofind_val est un scalaire positif
-            if hasattr(threshold_daofind_val, 'mean'): threshold_daofind_val = np.abs(np.mean(threshold_daofind_val))
-            else: threshold_daofind_val = np.abs(threshold_daofind_val)
+            if hasattr(threshold_daofind_val, 'mean'):
+                threshold_daofind_val = np.abs(np.nanmean(threshold_daofind_val))
+            else:
+                threshold_daofind_val = np.abs(threshold_daofind_val)
+                
             if threshold_daofind_val < 1e-5 : threshold_daofind_val = 1e-5 # Minimum seuil
 
             sources_table = None
             try:
-                daofind_obj = DAOStarFinder(fwhm=estimated_initial_fwhm, threshold=threshold_daofind_val,
-                                        sharplo=0.2, sharphi=1.0, roundlo=-0.8, roundhi=0.8, sky=0.0)
-                sources_table = daofind_obj(data_subtracted)
+                try:
+                    daofind_obj = DAOStarFinder(
+                        fwhm=estimated_initial_fwhm,
+                        threshold=threshold_daofind_val,
+                        sharplo=0.2, sharphi=1.0, roundlo=-0.8, roundhi=0.8,
+                        sky=0.0
+                    )
+                except TypeError as e:
+                    # Photutils 2.0+ : 'sky' removed
+                    # (Optionnel mais mieux : ne fallback que si l’erreur parle de 'sky')
+                    if "sky" not in str(e):
+                        raise
+                    daofind_obj = DAOStarFinder(
+                        fwhm=estimated_initial_fwhm,
+                        threshold=threshold_daofind_val,
+                        sharplo=0.2, sharphi=1.0, roundlo=-0.8, roundhi=0.8
+                    )
+
             except Exception as e_daofind:
-                 _pcb("weight_fwhm_daofind_error", lvl="WARN", img_idx=i, error=str(e_daofind))
-                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+                _pcb("weight_fwhm_daofind_error", lvl="WARN", img_idx=i, error=str(e_daofind))
+                fwhm_values_per_image.append(np.inf)
+                valid_image_indices_fwhm.append(i)  # je laisse comme ton comportement actuel
+                continue
 
             if sources_table is None or len(sources_table) < 5:
                 _pcb("weight_fwhm_not_enough_sources_daofind", lvl="DEBUG_DETAIL", img_idx=i, count=len(sources_table) if sources_table is not None else 0)
