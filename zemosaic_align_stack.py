@@ -52,6 +52,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable, Any, Iterable, Sequence
 
+from core.robust_rejection import (
+    WSC_IMPL_LEGACY,
+    WSC_IMPL_PIXINSIGHT,
+    resolve_wsc_impl,
+    resolve_wsc_parity_mode,
+    wsc_parity_check,
+    wsc_pixinsight_core,
+)
+
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 import traceback
 import gc
@@ -809,6 +818,11 @@ def _free_gpu_pools():
             pass
 
 
+_WSC_GPU_PARITY_CHECKED = False
+_WSC_GPU_PARITY_OK = False
+_WSC_GPU_PARITY_MAX_ABS: float | None = None
+
+
 def _gpu_budget_check(estimated_bytes: int, *, safety_fraction: float = 0.75) -> tuple[bool, int | None]:
     """Return (is_allowed, allowed_bytes) for the requested allocation."""
 
@@ -834,6 +848,34 @@ def _gpu_budget_check(estimated_bytes: int, *, safety_fraction: float = 0.75) ->
         except Exception:
             allowed_bytes = None
     return False, allowed_bytes
+
+
+def _wsc_gpu_parity_check() -> tuple[bool, float | None]:
+    """Run (and cache) the WSC GPU parity check."""
+
+    global _WSC_GPU_PARITY_CHECKED, _WSC_GPU_PARITY_OK, _WSC_GPU_PARITY_MAX_ABS
+    if _WSC_GPU_PARITY_CHECKED:
+        return _WSC_GPU_PARITY_OK, _WSC_GPU_PARITY_MAX_ABS
+
+    if not GPU_AVAILABLE:
+        _WSC_GPU_PARITY_CHECKED = True
+        _WSC_GPU_PARITY_OK = False
+        _WSC_GPU_PARITY_MAX_ABS = None
+        return _WSC_GPU_PARITY_OK, _WSC_GPU_PARITY_MAX_ABS
+
+    try:
+        import cupy as cp  # type: ignore
+
+        ok, max_abs = wsc_parity_check(cp)
+        _WSC_GPU_PARITY_OK = bool(ok)
+        _WSC_GPU_PARITY_MAX_ABS = float(max_abs)
+    except Exception:
+        _WSC_GPU_PARITY_OK = False
+        _WSC_GPU_PARITY_MAX_ABS = None
+    finally:
+        _WSC_GPU_PARITY_CHECKED = True
+
+    return _WSC_GPU_PARITY_OK, _WSC_GPU_PARITY_MAX_ABS
 
 
 def _gpu_nanpercentile(values: np.ndarray, percentiles):
@@ -1045,6 +1087,152 @@ try:
         cpu_stack_linear = getattr(_sm, '_stack_linear_fit_clip', None)
 except Exception as e_import_stack:
     print(f"AVERT (zemosaic_align_stack): Optional import of external stack_methods failed: {e_import_stack}")
+
+
+_WSC_PIXINSIGHT_MAX_ITERS = 10
+
+
+def _iter_row_slices_for_rows(
+    height: int,
+    frames_count: int,
+    width: int,
+    rows_per_chunk: int | None,
+) -> list[slice]:
+    if rows_per_chunk and rows_per_chunk > 0:
+        return [slice(start, min(height, start + rows_per_chunk)) for start in range(0, height, rows_per_chunk)]
+    return list(_iter_row_chunks(height, frames_count, width, np.dtype(np.float32).itemsize))
+
+
+def _accumulate_wsc_stats(stats_accum: dict[str, float], stats: dict[str, Any]) -> None:
+    stats_accum["clip_low_count"] += float(stats.get("clip_low_count", 0))
+    stats_accum["clip_high_count"] += float(stats.get("clip_high_count", 0))
+    stats_accum["valid_count"] += float(stats.get("valid_count", 0))
+    stats_accum["iters_used"] = max(stats_accum["iters_used"], float(stats.get("iters_used", 0)))
+
+
+def _finalize_wsc_stats(stats_accum: dict[str, float]) -> dict[str, float]:
+    total = stats_accum.get("valid_count", 0.0) or 0.0
+    low_frac = (stats_accum.get("clip_low_count", 0.0) / total) if total > 0 else 0.0
+    high_frac = (stats_accum.get("clip_high_count", 0.0) / total) if total > 0 else 0.0
+    stats_accum["clip_low_frac"] = float(low_frac)
+    stats_accum["clip_high_frac"] = float(high_frac)
+    return stats_accum
+
+
+def _wsc_pixinsight_stack_numpy(
+    frames_list: Sequence[np.ndarray],
+    *,
+    sigma_low: float,
+    sigma_high: float,
+    max_iters: int = _WSC_PIXINSIGHT_MAX_ITERS,
+    weights_block: np.ndarray | None = None,
+    rows_per_chunk: int | None = None,
+    progress_callback: Callable | None = None,
+) -> tuple[np.ndarray, float, dict[str, float]]:
+    if not frames_list:
+        raise ValueError("frames is empty")
+    sample = np.asarray(frames_list[0], dtype=np.float32)
+    height = int(sample.shape[0])
+    width = int(sample.shape[1]) if sample.ndim >= 2 else 0
+    row_slices = _iter_row_slices_for_rows(height, len(frames_list), width, rows_per_chunk)
+    output = np.empty_like(sample, dtype=np.float32)
+    stats_accum = {
+        "clip_low_count": 0.0,
+        "clip_high_count": 0.0,
+        "valid_count": 0.0,
+        "iters_used": 0.0,
+        "max_iters": float(max_iters),
+        "huber": 1.0,
+    }
+
+    total_steps = len(row_slices) if row_slices else 1
+    for idx, rows_slice in enumerate(row_slices, start=1):
+        chunk = np.stack([np.asarray(f[rows_slice, ...], dtype=np.float32) for f in frames_list], axis=0)
+        chunk_out, stats = wsc_pixinsight_core(
+            np,
+            chunk,
+            sigma_low=sigma_low,
+            sigma_high=sigma_high,
+            max_iters=max_iters,
+            weights_block=weights_block,
+            return_stats=True,
+        )
+        output[rows_slice, ...] = chunk_out.astype(np.float32, copy=False)
+        _accumulate_wsc_stats(stats_accum, stats)
+        if progress_callback:
+            try:
+                progress_callback("stack_winsorized", idx, total_steps)
+            except Exception:
+                pass
+
+    stats_accum = _finalize_wsc_stats(stats_accum)
+    rejected_pct = 100.0 * (stats_accum["clip_low_frac"] + stats_accum["clip_high_frac"])
+    return output, float(rejected_pct), stats_accum
+
+
+def _wsc_pixinsight_stack_gpu(
+    frames_list: Sequence[np.ndarray],
+    *,
+    sigma_low: float,
+    sigma_high: float,
+    max_iters: int = _WSC_PIXINSIGHT_MAX_ITERS,
+    weights_block: np.ndarray | None = None,
+    rows_per_chunk: int | None = None,
+) -> tuple[np.ndarray, float, dict[str, float]]:
+    import cupy as cp
+
+    if not frames_list:
+        raise ValueError("frames is empty")
+
+    frames_np = [np.asarray(f, dtype=np.float32) for f in frames_list if f is not None]
+    if not frames_np:
+        raise ValueError("No frames provided")
+
+    sample = frames_np[0]
+    sample_shape = sample.shape
+    chunk_rows = _resolve_chunk_rows_for_gpu_helper(
+        rows_per_chunk,
+        frames_np,
+        sample_shape,
+        multiplier=4.0,
+        error_label="winsorized clip",
+    )
+
+    _ensure_gpu_pool()
+    stats_accum = {
+        "clip_low_count": 0.0,
+        "clip_high_count": 0.0,
+        "valid_count": 0.0,
+        "iters_used": 0.0,
+        "max_iters": float(max_iters),
+        "huber": 1.0,
+    }
+
+    try:
+        height = int(sample_shape[0])
+        output = np.empty_like(sample, dtype=np.float32)
+        for start in range(0, height, chunk_rows):
+            end = min(height, start + chunk_rows)
+            rows_slice = slice(start, end)
+            chunk_np = [np.asarray(f[rows_slice, ...], dtype=np.float32) for f in frames_np]
+            arr = cp.stack([cp.asarray(chunk, dtype=cp.float32) for chunk in chunk_np], axis=0)
+            chunk_out, stats = wsc_pixinsight_core(
+                cp,
+                arr,
+                sigma_low=sigma_low,
+                sigma_high=sigma_high,
+                max_iters=max_iters,
+                weights_block=weights_block,
+                return_stats=True,
+            )
+            output[rows_slice, ...] = cp.asnumpy(chunk_out.astype(cp.float32, copy=False))
+            _accumulate_wsc_stats(stats_accum, stats)
+        stats_accum = _finalize_wsc_stats(stats_accum)
+        rejected_pct = 100.0 * (stats_accum["clip_low_frac"] + stats_accum["clip_high_frac"])
+        return output, float(rejected_pct), stats_accum
+    finally:
+        _free_gpu_pools()
+
 
 # --- Implementations GPU simplifiées des méthodes de stack ---
 def gpu_stack_winsorized(
@@ -1276,8 +1464,8 @@ def stack_winsorized_sigma_clip(
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
 
-    - La voie GPU ignore les `weights` (non supportés).
-    - Si la voie GPU échoue ou produit une sortie suspecte, fallback CPU.
+    - En mode legacy, la voie GPU ignore les `weights`.
+    - Si la voie GPU échoue ou viole la parité WSC, fallback CPU (WSC uniquement).
     - La voie CPU accepte `weights` en mot-clé si fournis.
     """
     # --- validations légères d'entrée ---
@@ -1305,6 +1493,16 @@ def stack_winsorized_sigma_clip(
                                            getattr(zconfig, 'use_gpu', False))))
         else:
             use_gpu = False
+
+    wsc_impl = resolve_wsc_impl(zconfig)
+    sigma_low = float(kwargs.get("sigma_low", kwargs.get("kappa", 3.0)))
+    sigma_high = float(kwargs.get("sigma_high", kwargs.get("kappa", 3.0)))
+    try:
+        max_iters = int(kwargs.get("winsor_max_iters", _WSC_PIXINSIGHT_MAX_ITERS))
+    except Exception:
+        max_iters = _WSC_PIXINSIGHT_MAX_ITERS
+    if max_iters <= 0:
+        max_iters = _WSC_PIXINSIGHT_MAX_ITERS
 
     plan_hints = _extract_parallel_plan_hints(parallel_plan)
     plan_cpu_workers = plan_hints["cpu_workers"]
@@ -1408,6 +1606,10 @@ def stack_winsorized_sigma_clip(
         max_frames_per_pass = 0
     if max_frames_per_pass < 0:
         max_frames_per_pass = 0
+    requested_frames_per_pass = max_frames_per_pass
+    user_stream_requested = requested_frames_per_pass > 0
+    if wsc_impl == WSC_IMPL_PIXINSIGHT:
+        max_frames_per_pass = 0
 
     auto_fallback_flag = kwargs.pop(
         "winsor_auto_fallback_on_memory_error",
@@ -1457,6 +1659,23 @@ def stack_winsorized_sigma_clip(
         memmap_budget_mb=memmap_budget_mb,
     )
 
+    if wsc_impl == WSC_IMPL_PIXINSIGHT and memory_plan.mode in {"stream", "incremental"}:
+        allow_memmap = memmap_policy != "never" and (memmap_enabled_flag or memmap_policy == "always")
+        if allow_memmap:
+            memory_plan.mode = "memmap"
+            memory_plan.force_memmap = True
+        else:
+            memory_plan.mode = "in_memory"
+            memory_plan.force_memmap = False
+        memory_plan.frames_per_pass = None
+        memory_plan.fallback_chain = []
+        memory_plan.reason = "pixinsight_no_stream"
+        if user_stream_requested:
+            _internal_logger.info(
+                "PixInsight WSC disables frame streaming; ignoring winsor_max_frames_per_pass=%d",
+                int(requested_frames_per_pass),
+            )
+
     user_cap_stream = (
         max_frames_per_pass > 0 and len(frames_list) > max_frames_per_pass and memory_plan.mode == "in_memory"
     )
@@ -1470,6 +1689,22 @@ def stack_winsorized_sigma_clip(
         ]
         if memory_plan.details is not None:
             memory_plan.details["user_cap_limit"] = float(max_frames_per_pass)
+
+    def _log_wsc_summary(stats: dict[str, float] | None, impl: str) -> None:
+        if not stats:
+            return
+        huber_flag = stats.get("huber", 0.0)
+        _internal_logger.info(
+            "[WSC] impl=%s sigma_low=%.3f sigma_high=%.3f max_iters=%d iters_used=%d huber=%s clip_low=%.4g clip_high=%.4g",
+            impl,
+            float(sigma_low),
+            float(sigma_high),
+            int(max_iters),
+            int(stats.get("iters_used", 0)),
+            "on" if huber_flag else "off",
+            float(stats.get("clip_low_frac", 0.0)),
+            float(stats.get("clip_high_frac", 0.0)),
+        )
 
     def _stack_winsor_streaming(limit: int, *, split_strategy: str = "sequential") -> tuple[_np.ndarray, float]:
         nonlocal frames_list, weights_array_full
@@ -1503,6 +1738,7 @@ def stack_winsorized_sigma_clip(
                 apply_rewinsor=bool(apply_rewinsor),
                 weights_chunk=weights_chunk,
                 streaming_state=state,
+                wsc_impl=wsc_impl,
             )
 
             # Libérer les références intermédiaires au plus tôt
@@ -1515,7 +1751,7 @@ def stack_winsorized_sigma_clip(
 
     force_memmap_plan = bool(memory_plan.force_memmap)
 
-    if memory_plan.mode in {"stream", "incremental"}:
+    if wsc_impl == WSC_IMPL_LEGACY and memory_plan.mode in {"stream", "incremental"}:
         frames_limit = memory_plan.frames_per_pass or len(frames_list)
         frames_limit = max(1, int(frames_limit))
         if use_gpu:
@@ -1588,69 +1824,146 @@ def stack_winsorized_sigma_clip(
     sample_height = int(sample.shape[0]) if sample.ndim >= 1 else 0
     if plan_row_hint and sample_height > 0:
         rows_per_chunk = int(max(1, min(sample_height, plan_row_hint)))
+    rows_per_chunk_cpu = plan_hints["rows_cpu"]
 
-    # --- GPU path (poids ignorés) ---
+    # --- GPU path ---
     if can_attempt_gpu:
         _log_stack_message("stack_using_gpu", "INFO", progress_callback, helper=helper_label)
-        gpu_impl = globals().get("gpu_stack_winsorized")
-        if not callable(gpu_impl):
-            _log_stack_message(
-                "stack_gpu_fallback_unavailable",
-                "WARN",
-                progress_callback,
-                helper=helper_label,
-                reason="missing_implementation",
-            )
-        else:
-            try:
-                if weights_array_full is not None or weight_method_in_use not in ("", "none") or manual_weights:
-                    _log_stack_message(
-                        f"[Stack][GPU Winsorized] weight_method='{weight_label_for_log}' requested but not supported on this path -> ignoring weights.",
-                        "INFO",
-                        progress_callback,
-                    )
-                gpu_out = gpu_impl(frames_list, rows_per_chunk=rows_per_chunk, **kwargs)
-
-                # --- validations de sortie GPU ---
-                if gpu_out is None:
-                    raise RuntimeError("GPU returned None")
-                # Support both (image, rejected_pct) and image-only returns
-                if isinstance(gpu_out, (list, tuple)) and len(gpu_out) >= 1:
-                    _gpu_img = gpu_out[0]
-                    _gpu_rej = float(gpu_out[1]) if len(gpu_out) > 1 else 0.0
-                else:
-                    _gpu_img = gpu_out
-                    _gpu_rej = 0.0
-                gpu_out = _np.asarray(_gpu_img, dtype=_np.float32)
-                # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
-                exp_shape = sample.shape  # (H,W) ou (H,W,C)
-                if gpu_out.shape != exp_shape:
-                    raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
-                if not _np.any(_np.isfinite(gpu_out)):
-                    raise RuntimeError("GPU output has no finite values")
-                # tolérance: > 90% de pixels finis
-                finite_ratio = _np.isfinite(gpu_out).mean()
-                if finite_ratio < 0.9:
-                    raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
-
-                _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
-                return gpu_out, float(_gpu_rej)
-
-            except Exception as e:
+        if wsc_impl == WSC_IMPL_PIXINSIGHT:
+            parity_ok, parity_max = _wsc_gpu_parity_check()
+            if not parity_ok:
                 _internal_logger.warning(
-                    f"GPU winsorized clip failed or looked invalid → fallback CPU: {type(e).__name__}: {e}",
-                    exc_info=True
+                    "WSC GPU parity failed (mode=%s, max_abs=%s); falling back to CPU.",
+                    resolve_wsc_parity_mode(),
+                    "n/a" if parity_max is None else f"{parity_max:.3g}",
                 )
                 _log_stack_message(
                     "stack_gpu_fallback_runtime_error",
                     "WARN",
                     progress_callback,
                     helper=helper_label,
-                    error=str(e),
+                    error="wsc_parity_failed",
                 )
+            else:
+                try:
+                    gpu_out, gpu_rej, stats = _wsc_pixinsight_stack_gpu(
+                        frames_list,
+                        sigma_low=sigma_low,
+                        sigma_high=sigma_high,
+                        max_iters=max_iters,
+                        weights_block=weights_array_full,
+                        rows_per_chunk=rows_per_chunk,
+                    )
+                    gpu_out = _np.asarray(gpu_out, dtype=_np.float32)
+                    exp_shape = sample.shape
+                    if gpu_out.shape != exp_shape:
+                        raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
+                    if not _np.any(_np.isfinite(gpu_out)):
+                        raise RuntimeError("GPU output has no finite values")
+                    finite_ratio = _np.isfinite(gpu_out).mean()
+                    if finite_ratio < 0.9:
+                        raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
+                    _log_wsc_summary(stats, wsc_impl)
+                    _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
+                    return gpu_out, float(gpu_rej)
+                except Exception as e:
+                    _internal_logger.warning(
+                        "GPU PixInsight WSC failed → fallback CPU: %s: %s",
+                        type(e).__name__,
+                        e,
+                        exc_info=True,
+                    )
+                    _log_stack_message(
+                        "stack_gpu_fallback_runtime_error",
+                        "WARN",
+                        progress_callback,
+                        helper=helper_label,
+                        error=str(e),
+                    )
+        else:
+            gpu_impl = globals().get("gpu_stack_winsorized")
+            if not callable(gpu_impl):
+                _log_stack_message(
+                    "stack_gpu_fallback_unavailable",
+                    "WARN",
+                    progress_callback,
+                    helper=helper_label,
+                    reason="missing_implementation",
+                )
+            else:
+                try:
+                    if weights_array_full is not None or weight_method_in_use not in ("", "none") or manual_weights:
+                        _log_stack_message(
+                            f"[Stack][GPU Winsorized] weight_method='{weight_label_for_log}' requested but not supported on this path -> ignoring weights.",
+                            "INFO",
+                            progress_callback,
+                        )
+                    gpu_out = gpu_impl(frames_list, rows_per_chunk=rows_per_chunk, **kwargs)
+
+                    # --- validations de sortie GPU ---
+                    if gpu_out is None:
+                        raise RuntimeError("GPU returned None")
+                    # Support both (image, rejected_pct) and image-only returns
+                    if isinstance(gpu_out, (list, tuple)) and len(gpu_out) >= 1:
+                        _gpu_img = gpu_out[0]
+                        _gpu_rej = float(gpu_out[1]) if len(gpu_out) > 1 else 0.0
+                    else:
+                        _gpu_img = gpu_out
+                        _gpu_rej = 0.0
+                    gpu_out = _np.asarray(_gpu_img, dtype=_np.float32)
+                    # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
+                    exp_shape = sample.shape  # (H,W) ou (H,W,C)
+                    if gpu_out.shape != exp_shape:
+                        raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
+                    if not _np.any(_np.isfinite(gpu_out)):
+                        raise RuntimeError("GPU output has no finite values")
+                    # tolérance: > 90% de pixels finis
+                    finite_ratio = _np.isfinite(gpu_out).mean()
+                    if finite_ratio < 0.9:
+                        raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
+
+                    _log_wsc_summary(
+                        {"iters_used": 0.0, "clip_low_frac": 0.0, "clip_high_frac": 0.0, "huber": 0.0},
+                        wsc_impl,
+                    )
+                    _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
+                    return gpu_out, float(_gpu_rej)
+
+                except Exception as e:
+                    _internal_logger.warning(
+                        f"GPU winsorized clip failed or looked invalid → fallback CPU: {type(e).__name__}: {e}",
+                        exc_info=True
+                    )
+                    _log_stack_message(
+                        "stack_gpu_fallback_runtime_error",
+                        "WARN",
+                        progress_callback,
+                        helper=helper_label,
+                        error=str(e),
+                    )
 
     # --- CPU path ---
     _log_stack_message("stack_using_cpu", "INFO", progress_callback, helper=helper_label)
+    if wsc_impl == WSC_IMPL_PIXINSIGHT:
+        cpu_out, rejected, stats = _wsc_pixinsight_stack_numpy(
+            frames_list,
+            sigma_low=sigma_low,
+            sigma_high=sigma_high,
+            max_iters=max_iters,
+            weights_block=weights_array_full,
+            rows_per_chunk=rows_per_chunk_cpu,
+            progress_callback=progress_callback,
+        )
+        _log_wsc_summary(stats, wsc_impl)
+        if weights_array_full is not None and weight_stats:
+            _log_stack_message(
+                f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
+                "INFO",
+                progress_callback,
+            )
+        _poststack_rgb_equalization(cpu_out, zconfig, stack_metadata)
+        return cpu_out, float(rejected)
+
     if not callable(globals().get("cpu_stack_winsorized", None)):
         raise RuntimeError("CPU stack_winsorized function unavailable")
 
@@ -1685,6 +1998,7 @@ def stack_winsorized_sigma_clip(
                 frames_list,
                 **cpu_kwargs,
                 force_memmap=force_memmap_plan,
+                wsc_impl=wsc_impl,
             )
         else:
             try:
@@ -1700,6 +2014,7 @@ def stack_winsorized_sigma_clip(
                         frames_list,
                         **cpu_kwargs,
                         force_memmap=force_memmap_plan,
+                        wsc_impl=wsc_impl,
                     )
                 else:
                     raise
@@ -1720,6 +2035,11 @@ def stack_winsorized_sigma_clip(
                 "INFO",
                 progress_callback,
             )
+        if wsc_impl == WSC_IMPL_LEGACY:
+            _log_wsc_summary(
+                {"iters_used": 0.0, "clip_low_frac": 0.0, "clip_high_frac": 0.0, "huber": 0.0},
+                wsc_impl,
+            )
         _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
         return stacked_cpu, rejected
 
@@ -1737,6 +2057,7 @@ def stack_winsorized_sigma_clip(
                     frames_list,
                     **cpu_kwargs,
                     force_memmap=True,
+                    wsc_impl=wsc_impl,
                 )
             except (MemoryError, _NumpyArrayMemoryError) as mem_err:
                 last_error = mem_err
@@ -1760,6 +2081,11 @@ def stack_winsorized_sigma_clip(
                     f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
                     "INFO",
                     progress_callback,
+                )
+            if wsc_impl == WSC_IMPL_LEGACY:
+                _log_wsc_summary(
+                    {"iters_used": 0.0, "clip_low_frac": 0.0, "clip_high_frac": 0.0, "huber": 0.0},
+                    wsc_impl,
                 )
             _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
             return stacked_cpu, rejected
@@ -3503,6 +3829,7 @@ def _reject_outliers_winsorized_sigma_clip(
     apply_rewinsor: bool = True,
     weights_chunk: Optional[np.ndarray] = None,
     streaming_state: Optional[WinsorStreamingState] = None,
+    wsc_impl: str | None = None,
 ) -> tuple[np.ndarray | WinsorStreamingState, Optional[np.ndarray]]:
     """
     Rejette les outliers en utilisant un Winsorized Sigma Clip.
@@ -3533,6 +3860,35 @@ def _reject_outliers_winsorized_sigma_clip(
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
+
+    effective_impl = wsc_impl or resolve_wsc_impl()
+    if effective_impl == WSC_IMPL_PIXINSIGHT:
+        output, _stats = wsc_pixinsight_core(
+            np,
+            stacked_array_NHDWC,
+            sigma_low=float(sigma_low),
+            sigma_high=float(sigma_high),
+            max_iters=_WSC_PIXINSIGHT_MAX_ITERS,
+            weights_block=weights_chunk,
+            return_stats=True,
+        )
+        output = np.asarray(output, dtype=np.float32)
+        if _stats:
+            _internal_logger.info(
+                "[WSC] impl=%s sigma_low=%.3f sigma_high=%.3f max_iters=%d iters_used=%d huber=%s clip_low=%.4g clip_high=%.4g",
+                WSC_IMPL_PIXINSIGHT,
+                float(sigma_low),
+                float(sigma_high),
+                int(_stats.get("max_iters", _WSC_PIXINSIGHT_MAX_ITERS)),
+                int(_stats.get("iters_used", 0)),
+                "on" if _stats.get("huber", False) else "off",
+                float(_stats.get("clip_low_frac", 0.0)),
+                float(_stats.get("clip_high_frac", 0.0)),
+            )
+        if streaming_state is not None:
+            _internal_logger.warning("PixInsight WSC does not support streaming; ignoring streaming_state.")
+            return streaming_state, None
+        return np.broadcast_to(output, stacked_array_NHDWC.shape), None
 
     if not (SCIPY_AVAILABLE and winsorize_func and SIGMA_CLIP_AVAILABLE and sigma_clipped_stats_func):
         missing_deps = []
@@ -4009,6 +4365,7 @@ def stack_aligned_images(
             sigma_clip_high,
             progress_callback,
             winsor_max_workers,
+            wsc_impl=resolve_wsc_impl(zconfig),
         )
     # ... (autres algos de rejet) ...
     _pcb(f"STACK_IMG_REJECT: Fin rejet. data_for_combine shape: {data_for_combine.shape}, range: [{np.nanmin(data_for_combine):.2g}-{np.nanmax(data_for_combine):.2g}] (contient NaN)", lvl="ERROR")
@@ -4239,6 +4596,7 @@ def _cpu_stack_winsorized_fallback(
     winsor_max_workers: int = 1,
     progress_callback=None,
     force_memmap: bool = False,
+    wsc_impl: str | None = None,
 ):
     """
     CPU fallback for winsorized sigma-clip stacking.
@@ -4340,6 +4698,7 @@ def _cpu_stack_winsorized_fallback(
             progress_callback=progress_callback,
             max_workers=winsor_max_workers,
             apply_rewinsor=apply_rewinsor,
+            wsc_impl=wsc_impl,
         )
 
         # Compute rejection percentage

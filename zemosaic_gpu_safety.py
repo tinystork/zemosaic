@@ -434,13 +434,36 @@ def apply_gpu_safety_to_parallel_plan(
     except Exception:
         pass
     try:
+        gpu_max_chunk_bytes = int(getattr(plan, "gpu_max_chunk_bytes", 0) or 0)
+    except Exception:
+        gpu_max_chunk_bytes = 0
+    try:
+        gpu_rows_per_chunk = int(getattr(plan, "gpu_rows_per_chunk", 0) or 0)
+    except Exception:
+        gpu_rows_per_chunk = 0
+    try:
+        cpu_max_chunk_bytes = int(getattr(plan, "max_chunk_bytes", 0) or 0)
+    except Exception:
+        cpu_max_chunk_bytes = 0
+    try:
+        cpu_rows_per_chunk = int(getattr(plan, "rows_per_chunk", 0) or 0)
+    except Exception:
+        cpu_rows_per_chunk = 0
+
+    try:
+        # NOTE: gpu_max_chunk_bytes may be 0 here on purpose: some operations (e.g. Phase 5)
+        # compute the final budget later. We log raw plan hints + rows so the message is not misleading.
         log.info(
-            "[GPU_SAFETY] summary power_plugged=%s on_battery=%s has_battery=%s hybrid=%s budget_bytes=%s reasons=%s",
+            "[GPU_SAFETY] summary power_plugged=%s on_battery=%s has_battery=%s hybrid=%s "
+            "gpu_max_chunk_bytes=%s gpu_rows_per_chunk=%s cpu_max_chunk_bytes=%s cpu_rows_per_chunk=%s reasons=%s",
             ctx.power_plugged,
             ctx.on_battery,
             ctx.has_battery,
             ctx.is_hybrid_graphics,
-            int(getattr(plan, "gpu_max_chunk_bytes", 0) or 0),
+            gpu_max_chunk_bytes,
+            gpu_rows_per_chunk,
+            cpu_max_chunk_bytes,
+            cpu_rows_per_chunk,
             ",".join(ctx.reasons),
         )
     except Exception:

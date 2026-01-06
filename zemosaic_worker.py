@@ -2635,6 +2635,11 @@ def _compute_phase5_vram_budget_bytes(
     hard_cap_mb = _coerce_int(cfg.get("phase5_vram_hard_cap_mb"), 0)
     hard_cap_bytes = hard_cap_mb * 1024 * 1024 if hard_cap_mb > 0 else None
 
+    # UI chunk setting acts as a hard cap even in AUTO mode (see GUI: Phase 5 chunk (MB)).
+    ui_chunk_mb = _coerce_int(cfg.get("phase5_chunk_mb"), 0)
+    ui_chunk_mb = max(0, min(16384, ui_chunk_mb))
+    ui_cap_bytes = ui_chunk_mb * 1024 * 1024 if ui_chunk_mb > 0 else None
+
     power_plugged = False
     on_battery = True
     is_hybrid = False
@@ -2717,11 +2722,13 @@ def _compute_phase5_vram_budget_bytes(
 
     budget_bytes = max(0, int(budget_bytes))
     budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    budget_bytes = _apply_cap(budget_bytes, ui_cap_bytes, "ui_chunk_cap")
     budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
     if budget_bytes > 0 and budget_bytes < min_chunk_bytes:
         budget_bytes = min_chunk_bytes
         reasons.append("min_clamp")
     budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    budget_bytes = _apply_cap(budget_bytes, ui_cap_bytes, "ui_chunk_cap")
     budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
     if usable_bytes is not None:
         budget_bytes = _apply_cap(budget_bytes, int(usable_bytes), "usable_cap")
@@ -2745,6 +2752,7 @@ def _compute_phase5_vram_budget_bytes(
         "budget_mb": budget_mb,
         "hard_cap_mb": float(hard_cap_mb) if hard_cap_bytes else None,
         "phase5_chunk_cap_mb": cap_mb,
+        "ui_chunk_cap_mb": float(ui_chunk_mb) if ui_cap_bytes else None,
         "power_plugged": power_plugged,
         "on_battery": on_battery,
         "is_hybrid_graphics": is_hybrid,
@@ -8936,11 +8944,13 @@ def _run_shared_phase45_phase5_pipeline(
                     vram_free_mb_str = f"{vram_free_mb:.0f}MB" if vram_free_mb is not None else "unknown"
                     hard_cap_mb = budget_meta.get("hard_cap_mb")
                     hard_cap_mb_str = f"{hard_cap_mb:.0f}" if hard_cap_mb else "n/a"
+                    ui_cap_mb = budget_meta.get("ui_chunk_cap_mb")
+                    ui_cap_mb_str = f"{ui_cap_mb:.0f}" if ui_cap_mb else "n/a"
                     budget_reasons = list(budget_meta.get("reasons") or [])
                     logger.info(
                         (
                             "Phase5 VRAM budget: free_mb=%s reserve_mb=%s frac=%.2f "
-                            "budget_mb=%.0f hard_cap_mb=%s plugged=%s battery=%s hybrid=%s "
+                            "budget_mb=%.0f hard_cap_mb=%s ui_cap_mb=%s plugged=%s battery=%s hybrid=%s "
                             "safe_mode_env=%s reasons=[%s]"
                         ),
                         vram_free_mb_str,
@@ -8948,6 +8958,7 @@ def _run_shared_phase45_phase5_pipeline(
                         float(budget_meta.get("fraction") or 0.0),
                         float(budget_meta.get("budget_mb") or 0.0),
                         hard_cap_mb_str,
+                        ui_cap_mb_str,
                         bool(budget_meta.get("power_plugged")),
                         bool(budget_meta.get("on_battery")),
                         bool(budget_meta.get("is_hybrid_graphics")),

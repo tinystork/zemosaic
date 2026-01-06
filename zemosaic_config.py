@@ -103,6 +103,7 @@ DEFAULT_CONFIG = {
     "stacking_kappa_low": 3.0,
     "stacking_kappa_high": 3.0,
     "stacking_winsor_limits": "0.05,0.05",  # String, sera parsé
+    "wsc_impl": "pixinsight",
     "stacking_final_combine_method": "mean",
     "poststack_equalize_rgb": True,
     "final_mosaic_rgb_equalize_enabled": False,

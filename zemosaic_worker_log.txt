@@ -1,0 +1,320 @@
+2026-01-06 17:53:38,075 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10038 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: zemosaic_worker.log
+2026-01-06 17:53:38,188 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10139 - Bibliothèque Astropy importée.
+2026-01-06 17:53:38,188 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10152 - Bibliothèque 'reproject' importée.
+2026-01-06 17:53:38,188 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10182 - Module 'zemosaic_utils' importé.
+2026-01-06 17:53:38,188 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10184 - Module 'zemosaic_astrometry' importé.
+2026-01-06 17:53:38,188 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10186 - Module 'zemosaic_align_stack' importé.
+2026-01-06 17:53:38,202 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10038 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: zemosaic_worker.log
+2026-01-06 17:53:38,203 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10139 - Bibliothèque Astropy importée.
+2026-01-06 17:53:38,203 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10152 - Bibliothèque 'reproject' importée.
+2026-01-06 17:53:38,203 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10182 - Module 'zemosaic_utils' importé.
+2026-01-06 17:53:38,203 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10184 - Module 'zemosaic_astrometry' importé.
+2026-01-06 17:53:38,203 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:10186 - Module 'zemosaic_align_stack' importé.
+2026-01-06 17:53:42,045 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:22571 - [Classic] Using legacy classic pipeline from non grid worker
+2026-01-06 17:53:42,047 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic_classic_legacy:17683 - WORKER_EQMODE_SUMMARY: eq=516 altaz=0 unknown=1311 total=1827 contains_altaz=False
+2026-01-06 17:53:42,047 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic_classic_legacy:17725 - MT_PIPELINE_FLAGS: lecropper_enabled=False, quality_crop_enabled=False, altaz_cleanup_enabled=False, lecropper_available=True
+2026-01-06 17:53:42,047 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE_FLAGS: lecropper_enabled=False, quality_crop_enabled=False, altaz_cleanup_enabled=False, lecropper_available=True
+2026-01-06 17:53:42,047 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic_classic_legacy:17815 - Cache retention mode: keep
+2026-01-06 17:53:42,047 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - run_info_cache_retention_mode
+2026-01-06 17:53:42,047 - ZeMosaicWorker - INFO - zemosaic_worker._configure_worker_logging:10074 - [LOGCFG] effective_level=DEBUG source=qt_gui_dropdown
+2026-01-06 17:53:42,047 - ZeMosaicWorker - INFO - zemosaic_worker._configure_worker_logging:10075 - Worker logging level set to DEBUG
+2026-01-06 17:53:42,161 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'use_gpu_phase5': True, 'phase_name': 'Init', 'phase_index': 0, 'cpu_percent': 19.1, 'ram_used_mb': 23408.02734375, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 9061.46875, 'gpu_used_mb': 1073.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7118.0, 'timestamp_iso': '2026-01-06T16:53:42.161910Z'})
+2026-01-06 17:53:42,166 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: gpu_info_summary] (Args: {'name': 'GPU', 'total_mb': '8192', 'free_mb': '7118'})
+2026-01-06 17:53:42,242 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: phase5_using_gpu]
+2026-01-06 17:53:42,243 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - CHRONO_START_REQUEST
+2026-01-06 17:53:42,822 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - Memory Usage (Début Run Hierarchical Mosaic): Proc RSS: 355.6MB, VMS: 1405.0MB. Sys RAM: Avail 8977MB / Total 32469MB (72.4%% used). Sys Swap: Used 6656MB / Total 68681MB (9.7%% used).
+2026-01-06 17:53:42,822 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: run_info_processing_started]
+2026-01-06 17:53:42,822 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: Options Stacking (Master Tiles): Norm='sky_mean', Weight='noise_variance', Reject='winsorized_sigma_clip', Combine='mean']
+2026-01-06 17:53:42,822 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -   Config ASTAP: Exe='astap.exe', Data='astap', Radius=3.0deg, Downsample=2, Sens=100
+2026-01-06 17:53:42,822 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -   Config Workers (GUI): Base demandé='0' (0=auto)
+2026-01-06 17:53:42,822 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -   Options Stacking (Master Tuiles): Norm='sky_mean', Weight='noise_variance', Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True, RadialWeight=False (Feather=N/A, Power=N/A, Floor=N/A)
+2026-01-06 17:53:42,822 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -   Options Assemblage Final: Méthode='reproject_coadd'
+2026-01-06 17:53:42,823 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: Resume mode resolved: auto (source=config)]
+2026-01-06 17:53:42,823 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: Resume requested: mode=auto]
+2026-01-06 17:53:52,824 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: Resume accepted: Phase 1 skipped (resume), entries=1827] (Args: {'num_valid_raws': 1827})
+2026-01-06 17:53:52,825 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - clusterstacks_info_override_threshold
+2026-01-06 17:53:52,825 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - clusterstacks_info_override_target_groups
+2026-01-06 17:53:52,825 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - clusterstacks_info_override_orientation_split
+2026-01-06 17:53:52,840 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - Resume: using 134 preplanned group(s) from filter overrides.
+2026-01-06 17:53:52,840 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - AutoCaps: per_frame≈47.5 MB, RAM_free≈8978 MB → frames_by_ram=113, cap=113, memmap=off, GPUHint=104, parallel=1
+2026-01-06 17:53:52,912 - ZeMosaicWorker - INFO - zemosaic_gpu_safety.apply_gpu_safety_to_parallel_plan:433 - [GPU_SAFETY] op=global safe_mode=0 power_plugged=True on_battery=False hybrid=True plan_gpu=1 chunk_mb=0.0 reasons=hybrid_graphics,battery_present
+2026-01-06 17:53:52,912 - ZeMosaicWorker - INFO - zemosaic_gpu_safety.apply_gpu_safety_to_parallel_plan:456 - [GPU_SAFETY] summary power_plugged=True on_battery=False has_battery=True hybrid=True gpu_max_chunk_bytes=0 gpu_rows_per_chunk=0 cpu_max_chunk_bytes=607847585 cpu_rows_per_chunk=0 reasons=hybrid_graphics,battery_present
+2026-01-06 17:53:52,912 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - parallel_plan_summary
+2026-01-06 17:53:52,912 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WORKERS_CONFIG: Mode Auto. Base de workers calculée: 12 (75% de 16 processeurs logiques)
+2026-01-06 17:53:52,919 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - Memory Usage (Début Phase 2 (Clustering)): Proc RSS: 457.5MB, VMS: 1506.6MB. Sys RAM: Avail 8867MB / Total 32469MB (72.7%% used). Sys Swap: Used 6656MB / Total 68681MB (9.7%% used).
+2026-01-06 17:53:52,919 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: run_info_phase2_started]
+2026-01-06 17:53:52,919 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - PHASE_UPDATE:2
+2026-01-06 17:53:52,944 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - Phase 2: using 134 preplanned group(s) from filter UI.
+2026-01-06 17:53:54,134 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - Cluster NN stats (deg): P10=0.0000, P50=0.0000, P90=0.0000
+2026-01-06 17:53:54,134 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - Winsor worker limit: AUTO (cfg=0) -> resolved=15 (cpu_total=16)
+2026-01-06 17:53:54,134 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: Winsor worker limit set to 15 (ProcessPoolExecutor enabled)]
+2026-01-06 17:53:54,137 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 2: Clustering', 'phase_index': 2, 'files_total': 1827, 'tiles_total': 134, 'cpu_percent': 15.4, 'ram_used_mb': 23613.13671875, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 8856.359375, 'gpu_used_mb': 1073.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7118.0, 'timestamp_iso': '2026-01-06T16:53:54.137564Z'})
+2026-01-06 17:53:54,141 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - Memory Usage (Fin Phase 2): Proc RSS: 472.2MB, VMS: 1522.2MB. Sys RAM: Avail 8856MB / Total 32469MB (72.7%% used). Sys Swap: Used 6656MB / Total 68681MB (9.7%% used).
+2026-01-06 17:53:54,142 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: run_info_phase2_finished] (Args: {'num_groups': 134})
+2026-01-06 17:53:54,170 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_BENCH: read 1885.0 MB/s (fast), write 972.0 MB/s (fast)
+2026-01-06 17:53:54,170 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT: cache read slots set to 2
+2026-01-06 17:53:54,173 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - Memory Usage (Début Phase 3 (Master Tuiles)): Proc RSS: 472.2MB, VMS: 1522.2MB. Sys RAM: Avail 8851MB / Total 32469MB (72.7%% used). Sys Swap: Used 6656MB / Total 68681MB (9.7%% used).
+2026-01-06 17:53:54,174 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: run_info_phase3_started_from_cache]
+2026-01-06 17:53:54,174 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - PHASE_UPDATE:3
+2026-01-06 17:53:54,319 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: center_anchor_probe_start] (Args: {'probe_count': 12})
+2026-01-06 17:54:10,653 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_anchor_probe_candidate
+2026-01-06 17:54:10,654 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: center_anchor_soft_fallback]
+2026-01-06 17:54:10,654 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: center_anchor_selected] (Args: {'tile': 72, 'dist_deg': 0.07134000196791423, 'score': 0.00021040527937002504})
+2026-01-06 17:54:10,655 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_center_out_plan
+2026-01-06 17:54:10,655 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WORKERS_PHASE3: Boost 12 -> 15 (90% cores target, keeping one free)
+2026-01-06 17:54:10,655 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT: Phase 3 workers 15 -> 4 due to IO (fast)
+2026-01-06 17:54:10,658 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - RAM_CAP: Phase 3 workers 4 -> 1 (frames/pass=89, per-job~4224.0MB)
+2026-01-06 17:54:10,658 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WORKERS_PHASE3: Utilisation de 1 worker(s). (Base: 12, Ratio 100%, Groupes: 134)]
+2026-01-06 17:54:10,659 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:0/134
+2026-01-06 17:54:10,662 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 8, 'tile_id': 72})
+2026-01-06 17:54:10,662 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_72: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:54:10,667 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:54:10,886 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:54:10,886 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
+2026-01-06 17:54:10,887 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_COVERAGE: propagate_mask=True
+2026-01-06 17:54:11,910 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 1
+2026-01-06 17:54:13,163 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 2
+2026-01-06 17:54:18,367 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_finished
+2026-01-06 17:54:18,456 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_COVERAGE_STATS: tile=72 shape=(1920, 1080) min=1.0 max=8.0 nonzero_frac=1.000 n_used=8
+2026-01-06 17:54:18,597 - ZeMosaicWorker - DEBUG - zemosaic_worker._dbg_rgb_stats:472 - [DBG_RGB] P3_pre_stack_core shape=(1920, 1080, 3) dtype=float32 valid=1.000 min=[0,0,0] mean=[0.00982652,0.0104453,0.00954654] median=[0.00933042,0.00980621,0.00897278] ratio_G_R=1.05099 ratio_G_B=1.09288
+2026-01-06 17:54:18,598 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_started
+2026-01-06 17:54:18,598 - ZeMosaicWorker - INFO - zemosaic_worker._stack_master_tile_auto:12110 - [P3][GPU] Phase 3 GPU auto mode enabled (mode=C, candidate=True)
+2026-01-06 17:54:18,695 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Début calcul des poids (par canal si couleur) pour 8 images.
+2026-01-06 17:54:19,459 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Variance minimale globale trouvée: 2.38e-18
+2026-01-06 17:54:19,459 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. 8/8 tableaux de poids retournés.
+2026-01-06 17:54:20,697 - ZeMosaicWorker - INFO - zemosaic_align_stack_gpu._log_wsc_summary:209 - [WSC] impl=pixinsight sigma_low=3.000 sigma_high=3.000 max_iters=10 iters_used=6 huber=on clip_low=0.003976 clip_high=0.002166
+2026-01-06 17:54:20,698 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_gpu_chunk_summary
+2026-01-06 17:54:20,962 - ZeMosaicWorker - DEBUG - zemosaic_worker._dbg_rgb_stats:472 - [DBG_RGB] P3_post_stack_core shape=(1920, 1080, 3) dtype=float32 valid=1.000 min=[0,0,0] mean=[0.00983431,0.00997014,0.00992865] median=[0.00934506,0.00934506,0.00934506] ratio_G_R=1 ratio_G_B=1
+2026-01-06 17:54:21,187 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_finished
+2026-01-06 17:54:21,289 - ZeMosaicWorker - DEBUG - zemosaic_worker._dbg_rgb_stats:472 - [DBG_RGB] P3_pre_poststack_rgb_eq shape=(1920, 1080, 3) dtype=float32 valid=1.000 min=[0,0,0] mean=[0.00983431,0.00997014,0.00992865] median=[0.00934506,0.00934506,0.00934506] ratio_G_R=1 ratio_G_B=1
+2026-01-06 17:54:21,290 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.955427,1.037199), target=0.00934506]
+2026-01-06 17:54:21,406 - ZeMosaicWorker - DEBUG - zemosaic_worker._dbg_rgb_stats:472 - [DBG_RGB] P3_post_poststack_rgb_eq shape=(1920, 1080, 3) dtype=float32 valid=1.000 min=[0,0,0] mean=[0.00983431,0.00997014,0.00992865] median=[0.00934506,0.00934506,0.00934506] ratio_G_R=1 ratio_G_B=1
+2026-01-06 17:54:21,479 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_center_out_applied
+2026-01-06 17:54:21,492 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_EDGE_TRIM: tile=72 analysis complete. did_trim=False edge_valid=(L=1.000,R=1.000,T=1.000,B=1.000)
+2026-01-06 17:54:21,611 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE: lecropper_applied=False, quality_crop=False, altaz_cleanup=False, quality_gate=False, salvage_mode=False
+2026-01-06 17:54:21,994 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_saved
+2026-01-06 17:54:22,194 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:1/134
+2026-01-06 17:54:22,196 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 3: Master Tiles', 'phase_index': 3, 'tiles_done': 1, 'tiles_total': 134, 'cpu_percent': 15.9, 'ram_used_mb': 24038.6640625, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 8430.83203125, 'gpu_used_mb': 1099.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7092.0, 'timestamp_iso': '2026-01-06T16:54:22.196390Z'})
+2026-01-06 17:54:22,374 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - ETA_UPDATE:01:03:44
+2026-01-06 17:54:22,375 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 86})
+2026-01-06 17:54:22,375 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_86: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:54:22,380 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:54:22,641 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:54:22,641 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
+2026-01-06 17:54:23,436 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 1
+2026-01-06 17:54:24,718 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 2
+2026-01-06 17:54:31,865 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_finished
+2026-01-06 17:54:31,951 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_started
+2026-01-06 17:54:32,078 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Début calcul des poids (par canal si couleur) pour 10 images.
+2026-01-06 17:54:32,930 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 9, Canal 0, stddev invalide (1.8714398086761008e-11). Variance Inf.]
+2026-01-06 17:54:32,944 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 9, Canal 1, stddev invalide (9.315084259498008e-10). Variance Inf.]
+2026-01-06 17:54:32,959 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 9, Canal 2, stddev invalide (9.314099491675165e-10). Variance Inf.]
+2026-01-06 17:54:32,960 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Variance minimale globale trouvée: 1.31e-16
+2026-01-06 17:54:32,960 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. 10/10 tableaux de poids retournés.
+2026-01-06 17:54:34,622 - ZeMosaicWorker - INFO - zemosaic_align_stack_gpu._log_wsc_summary:209 - [WSC] impl=pixinsight sigma_low=3.000 sigma_high=3.000 max_iters=10 iters_used=10 huber=on clip_low=7.208e-06 clip_high=0.0006777
+2026-01-06 17:54:34,622 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_gpu_chunk_summary
+2026-01-06 17:54:34,960 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_finished
+2026-01-06 17:54:34,960 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.932835,1.003651), target=0.00988785]
+2026-01-06 17:54:35,106 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_out_debug
+2026-01-06 17:54:35,106 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_center_out_applied
+2026-01-06 17:54:35,120 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_EDGE_TRIM: tile=86 analysis complete. did_trim=False edge_valid=(L=1.000,R=1.000,T=1.000,B=1.000)
+2026-01-06 17:54:35,240 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE: lecropper_applied=False, quality_crop=False, altaz_cleanup=False, quality_gate=False, salvage_mode=False
+2026-01-06 17:54:35,626 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_saved
+2026-01-06 17:54:35,818 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:2/134
+2026-01-06 17:54:35,821 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 3: Master Tiles', 'phase_index': 3, 'tiles_done': 2, 'tiles_total': 134, 'cpu_percent': 14.3, 'ram_used_mb': 24004.26953125, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 8465.2265625, 'gpu_used_mb': 1099.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7092.0, 'timestamp_iso': '2026-01-06T16:54:35.820979Z'})
+2026-01-06 17:54:36,007 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - ETA_UPDATE:00:47:38
+2026-01-06 17:54:36,008 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 87})
+2026-01-06 17:54:36,008 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_87: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:54:36,013 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:54:36,211 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 1
+2026-01-06 17:54:36,263 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:54:36,263 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
+2026-01-06 17:54:37,462 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 2
+2026-01-06 17:54:44,972 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_finished
+2026-01-06 17:54:45,064 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_started
+2026-01-06 17:54:45,192 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Début calcul des poids (par canal si couleur) pour 10 images.
+2026-01-06 17:54:46,073 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Variance minimale globale trouvée: 1.17e-18
+2026-01-06 17:54:46,074 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. 10/10 tableaux de poids retournés.
+2026-01-06 17:54:47,626 - ZeMosaicWorker - INFO - zemosaic_align_stack_gpu._log_wsc_summary:209 - [WSC] impl=pixinsight sigma_low=3.000 sigma_high=3.000 max_iters=10 iters_used=10 huber=on clip_low=0.002702 clip_high=0.0008387
+2026-01-06 17:54:47,626 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_gpu_chunk_summary
+2026-01-06 17:54:47,968 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_finished
+2026-01-06 17:54:47,968 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.959055,1.013733), target=0.00929274]
+2026-01-06 17:54:48,168 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_out_debug
+2026-01-06 17:54:48,169 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_center_out_applied
+2026-01-06 17:54:48,182 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_EDGE_TRIM: tile=87 analysis complete. did_trim=False edge_valid=(L=1.000,R=1.000,T=1.000,B=1.000)
+2026-01-06 17:54:48,298 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE: lecropper_applied=False, quality_crop=False, altaz_cleanup=False, quality_gate=False, salvage_mode=False
+2026-01-06 17:54:48,691 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_saved
+2026-01-06 17:54:48,882 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:3/134
+2026-01-06 17:54:48,884 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 3: Master Tiles', 'phase_index': 3, 'tiles_done': 3, 'tiles_total': 134, 'cpu_percent': 19.2, 'ram_used_mb': 24058.7734375, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 8410.72265625, 'gpu_used_mb': 1099.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7092.0, 'timestamp_iso': '2026-01-06T16:54:48.884321Z'})
+2026-01-06 17:54:49,086 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - ETA_UPDATE:00:41:57
+2026-01-06 17:54:49,088 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 1})
+2026-01-06 17:54:49,088 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_1: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:54:49,089 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - [Batch] Duplicating frames: original=1 → final=5
+2026-01-06 17:54:49,089 - ZeMosaicWorker - INFO - zemosaic_worker.create_master_tile:12418 - [Batch] Duplicating frames: original=1 → final=5 for tile 1
+2026-01-06 17:54:49,089 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:54:49,181 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:54:49,181 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
+2026-01-06 17:54:52,764 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_finished
+2026-01-06 17:54:52,808 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_started
+2026-01-06 17:54:52,861 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Début calcul des poids (par canal si couleur) pour 5 images.
+2026-01-06 17:54:53,530 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 1, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,539 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 1, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,546 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 1, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,555 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 2, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,561 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 2, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,569 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 2, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,575 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 3, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,583 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 3, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,589 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 3, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,596 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,602 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,609 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:54:53,609 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Variance minimale globale trouvée: 3.43e-07
+2026-01-06 17:54:53,610 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. 5/5 tableaux de poids retournés.
+2026-01-06 17:54:54,095 - ZeMosaicWorker - INFO - zemosaic_align_stack_gpu._log_wsc_summary:209 - [WSC] impl=pixinsight sigma_low=3.000 sigma_high=3.000 max_iters=10 iters_used=1 huber=on clip_low=0 clip_high=0
+2026-01-06 17:54:54,096 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_gpu_chunk_summary
+2026-01-06 17:54:54,428 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_finished
+2026-01-06 17:54:54,429 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.988147,1.054801), target=0.00863979]
+2026-01-06 17:54:54,626 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_out_debug
+2026-01-06 17:54:54,626 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_center_out_applied
+2026-01-06 17:54:54,642 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_EDGE_TRIM: tile=1 analysis complete. did_trim=False edge_valid=(L=1.000,R=1.000,T=1.000,B=1.000)
+2026-01-06 17:54:54,766 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE: lecropper_applied=False, quality_crop=False, altaz_cleanup=False, quality_gate=False, salvage_mode=False
+2026-01-06 17:54:55,210 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_saved
+2026-01-06 17:54:55,423 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:4/134
+2026-01-06 17:54:55,426 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 3: Master Tiles', 'phase_index': 3, 'tiles_done': 4, 'tiles_total': 134, 'cpu_percent': 16.0, 'ram_used_mb': 24239.66796875, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 8229.828125, 'gpu_used_mb': 1099.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7092.0, 'timestamp_iso': '2026-01-06T16:54:55.426502Z'})
+2026-01-06 17:54:55,637 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - ETA_UPDATE:00:35:27
+2026-01-06 17:54:55,638 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 27})
+2026-01-06 17:54:55,638 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_27: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:54:55,640 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - [Batch] Duplicating frames: original=3 → final=5
+2026-01-06 17:54:55,640 - ZeMosaicWorker - INFO - zemosaic_worker.create_master_tile:12418 - [Batch] Duplicating frames: original=3 → final=5 for tile 27
+2026-01-06 17:54:55,640 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:54:55,735 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:54:55,735 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
+2026-01-06 17:54:59,761 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_finished
+2026-01-06 17:54:59,810 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_started
+2026-01-06 17:54:59,867 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Début calcul des poids (par canal si couleur) pour 5 images.
+2026-01-06 17:55:00,526 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 1, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,533 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 1, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,539 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 1, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,585 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 3, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,592 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 3, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,600 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 3, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,609 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,616 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,624 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:55:00,625 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Variance minimale globale trouvée: 2.35e-18
+2026-01-06 17:55:00,625 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. 5/5 tableaux de poids retournés.
+2026-01-06 17:55:01,201 - ZeMosaicWorker - INFO - zemosaic_align_stack_gpu._log_wsc_summary:209 - [WSC] impl=pixinsight sigma_low=3.000 sigma_high=3.000 max_iters=10 iters_used=2 huber=on clip_low=0 clip_high=0
+2026-01-06 17:55:01,201 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_gpu_chunk_summary
+2026-01-06 17:55:01,507 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_finished
+2026-01-06 17:55:01,507 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.949648,1.019531), target=0.00883752]
+2026-01-06 17:55:01,721 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_out_debug
+2026-01-06 17:55:01,721 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_center_out_applied
+2026-01-06 17:55:01,734 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_EDGE_TRIM: tile=27 analysis complete. did_trim=False edge_valid=(L=1.000,R=1.000,T=1.000,B=1.000)
+2026-01-06 17:55:01,842 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE: lecropper_applied=False, quality_crop=False, altaz_cleanup=False, quality_gate=False, salvage_mode=False
+2026-01-06 17:55:02,243 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_saved
+2026-01-06 17:55:02,428 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:5/134
+2026-01-06 17:55:02,431 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 3: Master Tiles', 'phase_index': 3, 'tiles_done': 5, 'tiles_total': 134, 'cpu_percent': 16.6, 'ram_used_mb': 24229.5234375, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 8239.97265625, 'gpu_used_mb': 1099.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7092.0, 'timestamp_iso': '2026-01-06T16:55:02.431589Z'})
+2026-01-06 17:55:02,611 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - ETA_UPDATE:00:31:46
+2026-01-06 17:55:02,612 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 89})
+2026-01-06 17:55:02,612 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_89: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:55:02,617 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:55:02,853 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:55:02,853 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
+2026-01-06 17:55:02,967 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 1
+2026-01-06 17:55:04,218 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 2
+2026-01-06 17:55:12,391 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_finished
+2026-01-06 17:55:12,483 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_started
+2026-01-06 17:55:12,594 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Début calcul des poids (par canal si couleur) pour 10 images.
+2026-01-06 17:55:13,485 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 7, Canal 0, stddev invalide (0.0). Variance Inf.]
+2026-01-06 17:55:13,496 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 7, Canal 1, stddev invalide (0.0). Variance Inf.]
+2026-01-06 17:55:13,507 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 7, Canal 2, stddev invalide (0.0). Variance Inf.]
+2026-01-06 17:55:13,604 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Variance minimale globale trouvée: 7.82e-18
+2026-01-06 17:55:13,604 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. 10/10 tableaux de poids retournés.
+2026-01-06 17:55:15,217 - ZeMosaicWorker - INFO - zemosaic_align_stack_gpu._log_wsc_summary:209 - [WSC] impl=pixinsight sigma_low=3.000 sigma_high=3.000 max_iters=10 iters_used=10 huber=on clip_low=0.02696 clip_high=0.02273
+2026-01-06 17:55:15,218 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_gpu_chunk_summary
+2026-01-06 17:55:15,567 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_finished
+2026-01-06 17:55:15,567 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.967632,1.007143), target=0.00932325]
+2026-01-06 17:55:15,870 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_out_debug
+2026-01-06 17:55:15,870 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_center_out_applied
+2026-01-06 17:55:15,884 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_EDGE_TRIM: tile=89 analysis complete. did_trim=False edge_valid=(L=1.000,R=1.000,T=1.000,B=1.000)
+2026-01-06 17:55:16,001 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE: lecropper_applied=False, quality_crop=False, altaz_cleanup=False, quality_gate=False, salvage_mode=False
+2026-01-06 17:55:16,411 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_saved
+2026-01-06 17:55:16,631 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:6/134
+2026-01-06 17:55:16,634 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 3: Master Tiles', 'phase_index': 3, 'tiles_done': 6, 'tiles_total': 134, 'cpu_percent': 14.4, 'ram_used_mb': 24213.578125, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 8255.91796875, 'gpu_used_mb': 1099.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7092.0, 'timestamp_iso': '2026-01-06T16:55:16.634509Z'})
+2026-01-06 17:55:16,826 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 1
+2026-01-06 17:55:16,827 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - ETA_UPDATE:00:32:07
+2026-01-06 17:55:16,827 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 50, 'tile_id': 121})
+2026-01-06 17:55:16,828 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_121: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:55:16,858 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:55:18,299 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:55:18,299 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
+2026-01-06 17:55:20,579 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 2
+2026-01-06 17:56:11,539 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_finished
+2026-01-06 17:56:12,004 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_started
+2026-01-06 17:56:12,723 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Début calcul des poids (par canal si couleur) pour 50 images.
+2026-01-06 17:56:14,041 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 19, Canal 0, stddev invalide (6.918820516510493e-10). Variance Inf.]
+2026-01-06 17:56:14,669 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 43, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:56:15,061 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 43, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:56:15,068 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 43, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:56:15,293 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Variance minimale globale trouvée: 1.34e-18
+2026-01-06 17:56:15,294 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. 50/50 tableaux de poids retournés.
+2026-01-06 17:56:29,931 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 1
+2026-01-06 17:56:31,183 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 2
+2026-01-06 17:58:30,547 - ZeMosaicWorker - INFO - zemosaic_align_stack_gpu._log_wsc_summary:209 - [WSC] impl=pixinsight sigma_low=3.000 sigma_high=3.000 max_iters=10 iters_used=10 huber=on clip_low=0.02042 clip_high=0.003212
+2026-01-06 17:58:30,547 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_gpu_chunk_summary
+2026-01-06 17:58:31,391 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_finished
+2026-01-06 17:58:31,391 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.954828,1.011566), target=0.00909152]
+2026-01-06 17:58:31,829 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_out_debug
+2026-01-06 17:58:31,829 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_center_out_applied
+2026-01-06 17:58:31,847 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_EDGE_TRIM: tile=121 analysis complete. did_trim=False edge_valid=(L=1.000,R=1.000,T=1.000,B=1.000)
+2026-01-06 17:58:32,005 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE: lecropper_applied=False, quality_crop=False, altaz_cleanup=False, quality_gate=False, salvage_mode=False
+2026-01-06 17:58:32,597 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_saved
+2026-01-06 17:58:32,839 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:7/134
+2026-01-06 17:58:32,842 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 3: Master Tiles', 'phase_index': 3, 'tiles_done': 7, 'tiles_total': 134, 'cpu_percent': 19.5, 'ram_used_mb': 25801.0859375, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 6668.41015625, 'gpu_used_mb': 8191.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 0.0, 'timestamp_iso': '2026-01-06T16:58:32.842151Z'})
+2026-01-06 17:58:32,843 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 7, 'tile_id': 66})
+2026-01-06 17:58:32,843 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_66: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:58:32,850 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:58:33,093 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:58:33,093 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
+2026-01-06 17:58:34,080 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 1
+2026-01-06 17:58:34,726 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - ETA_UPDATE:01:33:11
+2026-01-06 17:58:35,334 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - IO_ADAPT_RT: cache_read_slots -> 2
+2026-01-06 17:58:43,682 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_finished
+2026-01-06 17:58:43,851 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_started
+2026-01-06 17:58:44,114 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Début calcul des poids (par canal si couleur) pour 7 images.
+2026-01-06 17:58:45,733 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 0, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:58:45,743 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 1, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:58:45,754 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: WeightNoiseVar: Image 4, Canal 2, stddev invalide (nan). Variance Inf.]
+2026-01-06 17:58:45,862 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Variance minimale globale trouvée: 1.2e-18
+2026-01-06 17:58:45,862 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. 7/7 tableaux de poids retournés.
+2026-01-06 17:58:47,269 - ZeMosaicWorker - INFO - zemosaic_align_stack_gpu._log_wsc_summary:209 - [WSC] impl=pixinsight sigma_low=3.000 sigma_high=3.000 max_iters=10 iters_used=10 huber=on clip_low=0.01044 clip_high=0.01578
+2026-01-06 17:58:47,269 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - phase3_gpu_chunk_summary
+2026-01-06 17:58:47,727 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_stacking_finished
+2026-01-06 17:58:47,728 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.953216,1.025660), target=0.00911981]
+2026-01-06 17:58:48,315 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - center_out_debug
+2026-01-06 17:58:48,316 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_center_out_applied
+2026-01-06 17:58:48,342 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_EDGE_TRIM: tile=66 analysis complete. did_trim=False edge_valid=(L=1.000,R=1.000,T=1.000,B=1.000)
+2026-01-06 17:58:48,504 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MT_PIPELINE: lecropper_applied=False, quality_crop=False, altaz_cleanup=False, quality_gate=False, salvage_mode=False
+2026-01-06 17:58:49,051 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_saved
+2026-01-06 17:58:49,305 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - MASTER_TILE_COUNT_UPDATE:8/134
+2026-01-06 17:58:49,308 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: STATS_UPDATE] (Args: {'cpu_workers': 15, 'max_chunk_bytes': 607847585, 'use_gpu': True, 'use_gpu_phase5': True, 'phase_name': 'Phase 3: Master Tiles', 'phase_index': 3, 'tiles_done': 8, 'tiles_total': 134, 'cpu_percent': 34.1, 'ram_used_mb': 20999.04296875, 'ram_total_mb': 32469.49609375, 'ram_available_mb': 11470.453125, 'gpu_used_mb': 1099.5, 'gpu_total_mb': 8191.5, 'gpu_free_mb': 7092.0, 'timestamp_iso': '2026-01-06T16:58:49.308171Z'})
+2026-01-06 17:58:49,533 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - ETA_UPDATE:01:26:13
+2026-01-06 17:58:49,534 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:10413 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 38})
+2026-01-06 17:58:49,534 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 -     mastertile_38: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
+2026-01-06 17:58:49,536 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - [Batch] Duplicating frames: original=3 → final=5
+2026-01-06 17:58:49,536 - ZeMosaicWorker - INFO - zemosaic_worker.create_master_tile:12418 - [Batch] Duplicating frames: original=3 → final=5 for tile 38
+2026-01-06 17:58:49,537 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_loading_from_cache_started
+2026-01-06 17:58:49,674 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_reference_set
+2026-01-06 17:58:49,674 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:10413 - mastertile_info_intra_tile_alignment_started
