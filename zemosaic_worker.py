@@ -12560,7 +12560,7 @@ def create_master_tile(
         pass
     winsorized_reject = str(stack_reject_algo or "").lower() == "winsorized_sigma_clip"
     propagate_mask_for_coverage = bool(
-        winsorized_reject or (altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE)
+        altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE # commented for test purpose replace the above line to return to the previous state, winsorized_reject or (altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE)
     )
     if debug_tile:
         pcb_tile(

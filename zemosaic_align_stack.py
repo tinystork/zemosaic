@@ -86,6 +86,7 @@ except Exception:  # pragma: no cover - fallback for older numpy
 # dépendance Photutils
 PHOTOUTILS_AVAILABLE = False
 DAOStarFinder, FITSFixedWarning, CircularAperture, aperture_photometry, SigmaClip, Background2D, MedianBackground, SourceCatalog = [None]*8 # type: ignore
+SOURCECAT_SUPPORTS_SOURCES = False
 try:
     from astropy.stats import SigmaClip, gaussian_sigma_to_fwhm # gaussian_sigma_to_fwhm est utile
     from astropy.table import Table
@@ -101,6 +102,12 @@ try:
     warnings.filterwarnings('ignore', category=FITSFixedWarning)
     
     PHOTOUTILS_AVAILABLE = True
+    try:
+        import inspect
+        if SourceCatalog is not None and "sources" in inspect.signature(SourceCatalog).parameters:
+            SOURCECAT_SUPPORTS_SOURCES = True
+    except Exception:
+        SOURCECAT_SUPPORTS_SOURCES = False
     # print("INFO (zemosaic_align_stack): Photutils importé.")
 except ImportError:
     print("AVERT (zemosaic_align_stack): Photutils non disponible. FWHM weighting limité.")
@@ -3171,6 +3178,26 @@ def _calculate_image_weights_noise_variance(
                     _pcb(f"WeightNoiseVar: Erreur stats image {i}, canal {c_idx}: {e_stats_ch}", lvl="WARN")
                     current_image_channel_variances.append(np.inf)
             
+        elif img_for_stats.ndim == 3 and img_for_stats.shape[-1] == 1: # Mono HWC
+            num_channels_in_image = 1
+            channel_data = img_for_stats[..., 0]
+            if channel_data.size == 0:
+                _pcb(f"WeightNoiseVar: Image monochrome {i} vide.", lvl="WARN")
+                current_image_channel_variances.append(np.inf)
+            else:
+                try:
+                    _, _, stddev = sigma_clipped_stats_func(
+                        channel_data, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
+                    )
+                    if stddev is not None and np.isfinite(stddev) and stddev > 1e-9:
+                        current_image_channel_variances.append(stddev**2)
+                    else:
+                        _pcb(f"WeightNoiseVar: Image monochrome {i}, stddev invalide ({stddev}). Variance Inf.", lvl="WARN")
+                        current_image_channel_variances.append(np.inf)
+                except Exception as e_stats:
+                    _pcb(f"WeightNoiseVar: Erreur stats image {i}: {e_stats}", lvl="WARN")
+                    current_image_channel_variances.append(np.inf)
+
         elif img_for_stats.ndim == 2: # Image monochrome HW
             num_channels_in_image = 1 # Conceptuellement
             if img_for_stats.size == 0:
@@ -3299,9 +3326,16 @@ def _estimate_initial_fwhm(data_2d: np.ndarray, progress_callback: callable = No
                 # equivalent_fwhm est une bonne estimation si la source est ~gaussienne
                 # On filtre sur l'ellipticité pour ne garder que les sources rondes
                 if props.eccentricity is not None and props.eccentricity < 0.5 and \
-                   props.equivalent_fwhm is not None and np.isfinite(props.equivalent_fwhm) and \
-                   1.0 < props.equivalent_fwhm < 20.0: # FWHM doit être dans une plage plausible
-                    fwhms_from_cat.append(props.equivalent_fwhm.value)
+                   props.equivalent_fwhm is not None:
+                    fwhm_val = props.equivalent_fwhm
+                    if hasattr(fwhm_val, "value"):
+                        fwhm_val = fwhm_val.value
+                    try:
+                        fwhm_val = float(fwhm_val)
+                    except Exception:
+                        continue
+                    if np.isfinite(fwhm_val) and 1.0 < fwhm_val < 20.0: # FWHM doit être dans une plage plausible
+                        fwhms_from_cat.append(fwhm_val)
             except AttributeError: # Certaines propriétés peuvent manquer
                 continue
             if len(fwhms_from_cat) >= 100: # Limiter le nombre de sources pour l'estimation
@@ -3334,6 +3368,80 @@ def _calculate_image_weights_noise_fwhm(
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
+
+    def _coerce_float(val) -> float:
+        if hasattr(val, "value"):
+            val = val.value
+        try:
+            return float(val)
+        except Exception:
+            try:
+                return float(np.nanmedian(np.asarray(val)))
+            except Exception:
+                return float("nan")
+
+    def _collect_fwhm_from_catalog(cat_obj, fwhm_max, ecc_max=0.8):
+        fwhms = []
+        for source_props in cat_obj:
+            try:
+                ecc = getattr(source_props, "eccentricity", None)
+                if ecc is not None:
+                    ecc_val = _coerce_float(ecc)
+                    if np.isfinite(ecc_val) and ecc_val > ecc_max:
+                        continue
+                fwhm_val = getattr(source_props, "equivalent_fwhm", None)
+                if fwhm_val is None:
+                    continue
+                fwhm_val = _coerce_float(fwhm_val)
+                if np.isfinite(fwhm_val) and 0.8 < fwhm_val < fwhm_max:
+                    fwhms.append(fwhm_val)
+            except AttributeError:
+                continue
+            except Exception:
+                continue
+        return fwhms
+
+    def _estimate_fwhm_moment(data, threshold, est_fwhm):
+        if data is None:
+            return None
+        data_clean = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        data_pos = np.where(data_clean > 0, data_clean, 0.0)
+        if not np.any(np.isfinite(data_pos)):
+            return None
+        peak = float(np.nanmax(data_pos))
+        thresh_val = _coerce_float(threshold)
+        if not np.isfinite(peak) or peak <= max(thresh_val * 1.5, 1e-5):
+            return None
+        try:
+            y_peak, x_peak = np.unravel_index(np.nanargmax(data_pos), data_pos.shape)
+        except Exception:
+            return None
+        half = int(max(est_fwhm * 3.0, 8.0))
+        y0 = max(int(y_peak) - half, 0)
+        y1 = min(int(y_peak) + half + 1, data_pos.shape[0])
+        x0 = max(int(x_peak) - half, 0)
+        x1 = min(int(x_peak) + half + 1, data_pos.shape[1])
+        stamp = data_pos[y0:y1, x0:x1]
+        if stamp.size < 25:
+            return None
+        total = float(np.sum(stamp))
+        if not np.isfinite(total) or total <= 0:
+            return None
+        yy, xx = np.indices(stamp.shape)
+        cy = float(np.sum(yy * stamp) / total)
+        cx = float(np.sum(xx * stamp) / total)
+        var_y = float(np.sum(((yy - cy) ** 2) * stamp) / total)
+        var_x = float(np.sum(((xx - cx) ** 2) * stamp) / total)
+        if not (np.isfinite(var_y) and np.isfinite(var_x)):
+            return None
+        sigma = float(np.sqrt(0.5 * (var_x + var_y)))
+        if not np.isfinite(sigma) or sigma <= 0:
+            return None
+        fwhm_val = 2.3548 * sigma
+        max_allowed = max(est_fwhm * 4.0, 30.0)
+        if not np.isfinite(fwhm_val) or fwhm_val <= 0.5 or fwhm_val > max_allowed:
+            return None
+        return float(fwhm_val)
 
     if not image_list:
         _pcb("weight_fwhm_error_no_images", lvl="WARN")
@@ -3379,6 +3487,8 @@ def _calculate_image_weights_noise_fwhm(
                         0.587 * img_for_fwhm_calc[..., 1] + \
                         0.114 * img_for_fwhm_calc[..., 2]
             target_data_for_fwhm = luminance
+        elif img_for_fwhm_calc.ndim == 3 and img_for_fwhm_calc.shape[-1] == 1:
+            target_data_for_fwhm = img_for_fwhm_calc[..., 0]
         elif img_for_fwhm_calc.ndim == 2:
             target_data_for_fwhm = img_for_fwhm_calc
         else:
@@ -3390,68 +3500,134 @@ def _calculate_image_weights_noise_fwhm(
              continue
         
         try:
-            estimated_initial_fwhm = _estimate_initial_fwhm(target_data_for_fwhm, progress_callback)
-            _pcb(f"WeightFWHM: Image {i}, FWHM initiale estimée pour détection: {estimated_initial_fwhm:.2f} px", lvl="DEBUG_DETAIL")
-
-            box_size_bg = min(target_data_for_fwhm.shape[0] // 8, target_data_for_fwhm.shape[1] // 8, 50)
-            box_size_bg = max(box_size_bg, 16)
-            
-            sigma_clip_bg_obj = SigmaClip(sigma=3.0) # Renommé pour éviter conflit
-            bkg_estimator_obj = MedianBackground()   # Renommé pour éviter conflit
-            
             if not np.any(np.isfinite(target_data_for_fwhm)):
                 _pcb("weight_fwhm_no_finite_data", lvl="WARN", img_idx=i)
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-            
-            std_data_check = np.nanstd(target_data_for_fwhm)
-            if std_data_check < 1e-6 :
-                 _pcb("weight_fwhm_image_flat", lvl="DEBUG_DETAIL", img_idx=i, stddev=std_data_check)
-                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-            bkg_obj = None # Pour vérifier si bkg a été défini
-            try:
-                bkg_obj = Background2D(
-                    target_data_for_fwhm, (box_size_bg, box_size_bg),
-                    filter_size=(3, 3),
-                    sigma_clip=sigma_clip_bg_obj,
-                    bkg_estimator=bkg_estimator_obj,
-                    exclude_percentile=90,
-                )
+            finite_mask_full = np.isfinite(target_data_for_fwhm)
+            finite_coords = np.argwhere(finite_mask_full)
+            if finite_coords.size == 0:
+                _pcb("weight_fwhm_no_finite_data", lvl="WARN", img_idx=i)
+                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-                data_subtracted = target_data_for_fwhm - bkg_obj.background
-                data_subtracted = np.nan_to_num(
-                    data_subtracted, nan=0.0, posinf=0.0, neginf=0.0
-                ).astype(np.float32, copy=False)
+            h_full, w_full = target_data_for_fwhm.shape
+            roi_margin = 8
+            y0 = max(int(finite_coords[:, 0].min()) - roi_margin, 0)
+            y1 = min(int(finite_coords[:, 0].max()) + roi_margin + 1, h_full)
+            x0 = max(int(finite_coords[:, 1].min()) - roi_margin, 0)
+            x1 = min(int(finite_coords[:, 1].max()) + roi_margin + 1, w_full)
 
-                threshold_daofind_val = 5.0 * bkg_obj.background_rms
+            roi = target_data_for_fwhm[y0:y1, x0:x1]
+            roi_finite = np.isfinite(roi)
+            finite_count = int(np.count_nonzero(roi_finite))
+            if finite_count == 0:
+                _pcb("weight_fwhm_no_finite_data", lvl="WARN", img_idx=i)
+                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-            except (ValueError, TypeError) as ve_bkg:
-                _pcb("weight_fwhm_bkg2d_error", lvl="WARN", img_idx=i, error=str(ve_bkg))
+            finite_fraction = finite_count / float(roi.size)
+            use_background2d = not (roi.shape[0] < 64 or roi.shape[1] < 64 or finite_fraction < 0.10)
 
-                _, median_glob, stddev_glob = sigma_clipped_stats_func(
-                    target_data_for_fwhm, sigma=3.0, maxiters=5
-                )
+            finite_vals = roi[roi_finite]
+            std_data_check = np.nanstd(finite_vals)
+            if std_data_check < 1e-6:
+                _pcb("weight_fwhm_image_flat", lvl="DEBUG_DETAIL", img_idx=i, stddev=std_data_check)
+                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-                if not (np.isfinite(median_glob) and np.isfinite(stddev_glob)):
+            median_fill = np.nanmedian(finite_vals)
+            if not np.isfinite(median_fill):
+                _pcb("weight_fwhm_global_stats_invalid", lvl="WARN", img_idx=i)
+                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+
+            roi_clean_for_est = np.array(roi, dtype=np.float32, copy=True)
+            roi_clean_for_est[~roi_finite] = median_fill
+
+            estimated_initial_fwhm = _estimate_initial_fwhm(roi_clean_for_est, progress_callback)
+            _pcb(f"WeightFWHM: Image {i}, FWHM initiale estimée pour détection: {estimated_initial_fwhm:.2f} px", lvl="DEBUG_DETAIL")
+
+            box_size_bg = min(roi.shape[0] // 8, roi.shape[1] // 8, 50)
+            box_size_bg = max(box_size_bg, 16)
+
+            sigma_clip_bg_obj = SigmaClip(sigma=3.0)
+            bkg_estimator_obj = MedianBackground()
+
+            data_subtracted = None
+            threshold_daofind_val = None
+            bkg_obj = None
+            if use_background2d:
+                try:
+                    bkg_obj = Background2D(
+                        roi, (box_size_bg, box_size_bg),
+                        filter_size=(3, 3),
+                        sigma_clip=sigma_clip_bg_obj,
+                        bkg_estimator=bkg_estimator_obj,
+                        exclude_percentile=90,
+                        mask=~roi_finite,
+                    )
+
+                    data_subtracted = roi - bkg_obj.background
+                    data_subtracted = np.nan_to_num(
+                        data_subtracted, nan=0.0, posinf=0.0, neginf=0.0
+                    ).astype(np.float32, copy=False)
+
+                    bkg_rms = bkg_obj.background_rms
+                    if np.ndim(bkg_rms) > 0:
+                        bkg_rms_scalar = np.nanmedian(bkg_rms)
+                        if not np.isfinite(bkg_rms_scalar):
+                            bkg_rms_scalar = np.nanmean(bkg_rms)
+                    else:
+                        bkg_rms_scalar = bkg_rms
+                    bkg_rms_scalar = _coerce_float(bkg_rms_scalar)
+                    threshold_daofind_val = 5.0 * bkg_rms_scalar
+                    if not np.isfinite(threshold_daofind_val) or threshold_daofind_val <= 0:
+                        data_subtracted = None
+                        threshold_daofind_val = None
+
+                except (ValueError, TypeError) as ve_bkg:
+                    _pcb("weight_fwhm_bkg2d_error", lvl="WARN", img_idx=i, error=str(ve_bkg))
+
+            if data_subtracted is None or threshold_daofind_val is None or not np.isfinite(threshold_daofind_val):
+                try:
+                    _, median_glob, stddev_glob = sigma_clipped_stats_func(
+                        finite_vals, sigma=3.0, maxiters=5
+                    )
+                except TypeError:
+                    roi_tmp = np.array(roi, dtype=np.float32, copy=True)
+                    roi_tmp[~roi_finite] = median_fill
+                    _, median_glob, stddev_glob = sigma_clipped_stats_func(
+                        roi_tmp, sigma=3.0, maxiters=5
+                    )
+
+                if not (np.isfinite(median_glob) and np.isfinite(stddev_glob) and stddev_glob > 0):
                     _pcb("weight_fwhm_global_stats_invalid", lvl="WARN", img_idx=i)
                     fwhm_values_per_image.append(np.inf)
                     valid_image_indices_fwhm.append(i)
                     continue
 
-                data_subtracted = target_data_for_fwhm - median_glob
+                roi_clean = np.array(roi, dtype=np.float32, copy=True)
+                roi_clean[~roi_finite] = median_glob
+                data_subtracted = roi_clean - median_glob
                 data_subtracted = np.nan_to_num(
                     data_subtracted, nan=0.0, posinf=0.0, neginf=0.0
                 ).astype(np.float32, copy=False)
 
                 threshold_daofind_val = 5.0 * stddev_glob
 
-            # S'assurer que threshold_daofind_val est un scalaire positif
-            if hasattr(threshold_daofind_val, 'mean'):
-                threshold_daofind_val = np.abs(np.nanmean(threshold_daofind_val))
-            else:
-                threshold_daofind_val = np.abs(threshold_daofind_val)
-                
-            if threshold_daofind_val < 1e-5 : threshold_daofind_val = 1e-5 # Minimum seuil
+            if np.ndim(threshold_daofind_val) > 0:
+                thresh_scalar = np.nanmedian(threshold_daofind_val)
+                if not np.isfinite(thresh_scalar):
+                    thresh_scalar = np.nanmean(threshold_daofind_val)
+                threshold_daofind_val = thresh_scalar
+
+            threshold_daofind_val = _coerce_float(threshold_daofind_val)
+            if not np.isfinite(threshold_daofind_val):
+                _pcb("weight_fwhm_global_stats_invalid", lvl="WARN", img_idx=i)
+                fwhm_values_per_image.append(np.inf)
+                valid_image_indices_fwhm.append(i)
+                continue
+
+            threshold_daofind_val = abs(threshold_daofind_val)
+            if threshold_daofind_val < 1e-5:
+                threshold_daofind_val = 1e-5
 
             sources_table = None
             try:
@@ -3473,80 +3649,115 @@ def _calculate_image_weights_noise_fwhm(
                         sharplo=0.2, sharphi=1.0, roundlo=-0.8, roundhi=0.8
                     )
 
+                sources_table = daofind_obj(data_subtracted)
+
             except Exception as e_daofind:
                 _pcb("weight_fwhm_daofind_error", lvl="WARN", img_idx=i, error=str(e_daofind))
                 fwhm_values_per_image.append(np.inf)
                 valid_image_indices_fwhm.append(i)  # je laisse comme ton comportement actuel
                 continue
 
-            if sources_table is None or len(sources_table) < 5:
-                _pcb("weight_fwhm_not_enough_sources_daofind", lvl="DEBUG_DETAIL", img_idx=i, count=len(sources_table) if sources_table is not None else 0)
-                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-
             # Utilisation de SourceCatalog pour les propriétés morphologiques
-            threshold_seg_val = 1.5 * (bkg_obj.background_rms if bkg_obj and hasattr(bkg_obj, 'background_rms') else np.nanstd(data_subtracted))
-            if hasattr(threshold_seg_val, 'mean'): threshold_seg_val = np.abs(np.mean(threshold_seg_val))
-            else: threshold_seg_val = np.abs(threshold_seg_val)
-            if threshold_seg_val < 1e-5 : threshold_seg_val = 1e-5
+            seg_rms = bkg_obj.background_rms if bkg_obj and hasattr(bkg_obj, "background_rms") else np.nanstd(data_subtracted)
+            if np.ndim(seg_rms) > 0:
+                seg_rms_scalar = np.nanmedian(seg_rms)
+                if not np.isfinite(seg_rms_scalar):
+                    seg_rms_scalar = np.nanmean(seg_rms)
+            else:
+                seg_rms_scalar = seg_rms
+            seg_rms_scalar = _coerce_float(seg_rms_scalar)
+            threshold_seg_val = 1.5 * seg_rms_scalar
+            if not np.isfinite(threshold_seg_val):
+                threshold_seg_val = _coerce_float(np.nanstd(data_subtracted))
+            threshold_seg_val = abs(threshold_seg_val)
+            if threshold_seg_val < 1e-5:
+                threshold_seg_val = 1e-5
 
             segm_map_cat = detect_sources(data_subtracted, threshold_seg_val, npixels=7) # npixels un peu plus grand
             if segm_map_cat is None:
+                segm_map_cat = detect_sources(data_subtracted, threshold_seg_val * 0.6, npixels=5)
+            if segm_map_cat is None:
                 _pcb("weight_fwhm_segmentation_cat_failed", lvl="DEBUG_DETAIL", img_idx=i)
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-            
-            # Filtrer les sources de DAOStarFinder avant de les passer à SourceCatalog
-            h_img_cat, w_img_cat = data_subtracted.shape
-            border_margin_cat = int(estimated_initial_fwhm * 2) # Marge basée sur FWHM
-            
-            # Assurer que les colonnes existent avant de filtrer
-            cols_to_check = ['xcentroid', 'ycentroid', 'flux', 'sharpness', 'roundness1', 'roundness2']
-            if not all(col in sources_table.colnames for col in cols_to_check):
-                _pcb("weight_fwhm_missing_daofind_cols", lvl="WARN", img_idx=i, missing_cols=[c for c in cols_to_check if c not in sources_table.colnames])
-                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-
-            valid_sources_mask_cat = (
-                (sources_table['xcentroid'] > border_margin_cat) &
-                (sources_table['xcentroid'] < w_img_cat - border_margin_cat) &
-                (sources_table['ycentroid'] > border_margin_cat) &
-                (sources_table['ycentroid'] < h_img_cat - border_margin_cat) &
-                (sources_table['sharpness'] > 0.3) & (sources_table['sharpness'] < 0.95) & # Sources nettes mais pas trop
-                (np.abs(sources_table['roundness1']) < 0.3) & (np.abs(sources_table['roundness2']) < 0.3) # Assez rondes
-            )
-            filtered_sources_table = sources_table[valid_sources_mask_cat]
-            
-            if not filtered_sources_table or len(filtered_sources_table) < 3:
-                _pcb("weight_fwhm_not_enough_sources_after_filter_dao", lvl="DEBUG_DETAIL", img_idx=i)
-                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-
-            # Trier par flux et prendre les N plus brillantes
-            filtered_sources_table.sort('flux', reverse=True)
-            top_sources_table = filtered_sources_table[:100] # Limiter aux 100 plus brillantes
-            
-            # Passer les positions des sources détectées par DAOStarFinder à SourceCatalog
+            fallback_fwhms = []
             try:
-                cat_obj = SourceCatalog(data_subtracted, segm_map_cat, sources=top_sources_table)
-            except Exception as e_scat: # SourceCatalog peut échouer si segm_map_cat est incompatible avec sources
-                 _pcb("weight_fwhm_sourcecatalog_init_error", lvl="WARN", img_idx=i, error=str(e_scat))
-                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-
-
-            if not cat_obj or len(cat_obj) == 0:
-                _pcb("weight_fwhm_no_sources_in_final_catalog", lvl="DEBUG_DETAIL", img_idx=i)
-                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+                cat_full = SourceCatalog(data_subtracted, segm_map_cat)
+                fallback_fwhms = _collect_fwhm_from_catalog(
+                    cat_full, max(estimated_initial_fwhm * 3.0, 20.0), ecc_max=0.8
+                )
+            except Exception:
+                fallback_fwhms = []
+            if len(fallback_fwhms) < 1:
+                fallback_fwhms = []
 
             fwhms_this_image = []
-            for source_props in cat_obj:
-                try:
-                    # equivalent_fwhm est disponible et généralement fiable pour les sources bien segmentées.
-                    # On pourrait aussi utiliser (semimajor_axis_sigma + semiminor_axis_sigma) / 2 * gaussian_sigma_to_fwhm
-                    fwhm_val = source_props.equivalent_fwhm # C'est déjà une FWHM en pixels
-                    if fwhm_val is not None and np.isfinite(fwhm_val) and \
-                       0.8 < fwhm_val < (estimated_initial_fwhm * 2.5): # Doit être dans une plage raisonnable
-                        fwhms_this_image.append(fwhm_val)
-                except AttributeError: continue
-                except Exception: continue
-            
+            use_fallback = False
+
+            if sources_table is None or len(sources_table) < 5:
+                _pcb("weight_fwhm_not_enough_sources_daofind", lvl="DEBUG_DETAIL", img_idx=i, count=len(sources_table) if sources_table is not None else 0)
+                use_fallback = True
+            else:
+                # Filtrer les sources de DAOStarFinder avant de les passer à SourceCatalog
+                h_img_cat, w_img_cat = data_subtracted.shape
+                border_margin_cat = int(estimated_initial_fwhm * 2) # Marge basée sur FWHM
+
+                # Assurer que les colonnes existent avant de filtrer
+                cols_to_check = ['xcentroid', 'ycentroid', 'flux', 'sharpness', 'roundness1', 'roundness2']
+                if not all(col in sources_table.colnames for col in cols_to_check):
+                    _pcb("weight_fwhm_missing_daofind_cols", lvl="WARN", img_idx=i, missing_cols=[c for c in cols_to_check if c not in sources_table.colnames])
+                    use_fallback = True
+                else:
+                    valid_sources_mask_cat = (
+                        (sources_table['xcentroid'] > border_margin_cat) &
+                        (sources_table['xcentroid'] < w_img_cat - border_margin_cat) &
+                        (sources_table['ycentroid'] > border_margin_cat) &
+                        (sources_table['ycentroid'] < h_img_cat - border_margin_cat) &
+                        (sources_table['sharpness'] > 0.3) & (sources_table['sharpness'] < 0.95) & # Sources nettes mais pas trop
+                        (np.abs(sources_table['roundness1']) < 0.3) & (np.abs(sources_table['roundness2']) < 0.3) # Assez rondes
+                    )
+                    filtered_sources_table = sources_table[valid_sources_mask_cat]
+
+                    if not filtered_sources_table or len(filtered_sources_table) < 3:
+                        _pcb("weight_fwhm_not_enough_sources_after_filter_dao", lvl="DEBUG_DETAIL", img_idx=i)
+                        use_fallback = True
+                    else:
+                        # Trier par flux et prendre les N plus brillantes
+                        filtered_sources_table.sort('flux', reverse=True)
+                        top_sources_table = filtered_sources_table[:100] # Limiter aux 100 plus brillantes
+
+                        # Passer les positions des sources détectées par DAOStarFinder à SourceCatalog
+                        try:
+                            if SOURCECAT_SUPPORTS_SOURCES:
+                                cat_obj = SourceCatalog(data_subtracted, segm_map_cat, sources=top_sources_table)
+                            else:
+                                cat_obj = SourceCatalog(data_subtracted, segm_map_cat)
+                        except Exception as e_scat: # SourceCatalog peut échouer si segm_map_cat est incompatible avec sources
+                             _pcb("weight_fwhm_sourcecatalog_init_error", lvl="WARN", img_idx=i, error=str(e_scat))
+                             use_fallback = True
+                        else:
+                            if not cat_obj or len(cat_obj) == 0:
+                                _pcb("weight_fwhm_no_sources_in_final_catalog", lvl="DEBUG_DETAIL", img_idx=i)
+                                use_fallback = True
+                            else:
+                                fwhms_this_image = _collect_fwhm_from_catalog(
+                                    cat_obj, max(estimated_initial_fwhm * 2.5, 15.0), ecc_max=0.6
+                                )
+                                if not fwhms_this_image:
+                                    use_fallback = True
+
+            if use_fallback:
+                fwhms_this_image = fallback_fwhms
+
+            if not fwhms_this_image:
+                moment_fwhm = _estimate_fwhm_moment(
+                    data_subtracted,
+                    threshold_daofind_val,
+                    estimated_initial_fwhm,
+                )
+                if moment_fwhm is not None:
+                    fwhms_this_image = [moment_fwhm]
+
             if not fwhms_this_image:
                 _pcb("weight_fwhm_no_valid_fwhm_from_catalog_props", lvl="DEBUG_DETAIL", img_idx=i)
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue

@@ -656,39 +656,50 @@ def _prepare_frames_and_weights(
 
     radial_map = _compute_radial_weight_map(height, width, channels, stacking_params, logger)
 
-    # Align with CPU behavior: when no radial map is present, the CPU path drops
-    # compact (1x1xC) quality weights due to shape mismatch. Skip them here too
-    # to avoid GPU-only weighting that drifts from the CPU reference.
-    if radial_map is None:
-        quality_weights = None
-        weight_method_used = "none"
-        weight_stats = None
-
     weights_stack: np.ndarray | None = None
     if radial_map is not None or quality_weights is not None:
         combined_weights: list[np.ndarray | None] = []
+        applied_quality = 0
+        skipped_quality = 0
         for idx, frame in enumerate(filtered_frames):
             q_weight = quality_weights[idx] if quality_weights is not None and idx < len(quality_weights) else None
-            if q_weight is None and radial_map is None:
-                combined_weights.append(None)
-                continue
-            base = _broadcast_weight_template(q_weight, frame.shape)
-            if base is None and q_weight is not None:
-                combined_weights.append(None)
-                continue
+            base = _broadcast_weight_template(q_weight, frame.shape) if q_weight is not None else None
+            if q_weight is not None and base is None:
+                skipped_quality += 1
+            if base is not None:
+                applied_quality += 1
             if radial_map is None:
                 combined = base
             elif base is None:
                 combined = radial_map
             else:
                 combined = radial_map * base
-            combined_weights.append(np.asarray(combined, dtype=np.float32))
+            if combined is None:
+                combined_weights.append(None)
+            else:
+                combined_weights.append(np.asarray(combined, dtype=np.float32))
 
-        if combined_weights and all(w is not None for w in combined_weights):
+        if combined_weights and any(w is not None for w in combined_weights):
+            if radial_map is None and applied_quality > 0 and any(w is None for w in combined_weights):
+                for idx, combined in enumerate(combined_weights):
+                    if combined is None:
+                        combined_weights[idx] = np.ones(filtered_frames[idx].shape, dtype=np.float32)
+            if all(w is not None for w in combined_weights):
+                try:
+                    weights_stack = np.stack(combined_weights, axis=0)
+                except Exception:
+                    weights_stack = None
+
+        if skipped_quality and logger:
             try:
-                weights_stack = np.stack(combined_weights, axis=0)
+                logger.warning("GPU stack: skipped %d quality weights due to shape mismatch.", skipped_quality)
             except Exception:
-                weights_stack = None
+                pass
+
+    if weights_stack is None and radial_map is None:
+        if weight_method_used != "none":
+            weight_method_used = "none"
+            weight_stats = None
 
     return (
         filtered_frames,

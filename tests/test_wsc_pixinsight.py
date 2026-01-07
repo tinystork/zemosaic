@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -37,6 +36,29 @@ def _gpu_config():
         use_gpu=True,
         poststack_equalize_rgb=False,
     )
+
+
+def _make_star_frame(shape, sigma, rng, noise_sigma=2.0, border=0, grid=5, amplitude=800.0):
+    yy, xx = np.indices(shape)
+    frame = rng.normal(loc=1000.0, scale=noise_sigma, size=shape).astype(np.float32)
+    margin = max(border + 10, int(min(shape) * 0.1))
+    max_y = max(margin, shape[0] - margin - 1)
+    max_x = max(margin, shape[1] - margin - 1)
+    if grid < 2:
+        positions = [(shape[0] // 2, shape[1] // 2)]
+    else:
+        ys = np.linspace(margin, max_y, grid).astype(int)
+        xs = np.linspace(margin, max_x, grid).astype(int)
+        positions = [(int(y), int(x)) for y in ys for x in xs]
+    denom = 2.0 * float(sigma) ** 2
+    for y0, x0 in positions:
+        frame += amplitude * np.exp(-((xx - x0) ** 2 + (yy - y0) ** 2) / denom)
+    if border:
+        frame[:border, :] = np.nan
+        frame[-border:, :] = np.nan
+        frame[:, :border] = np.nan
+        frame[:, -border:] = np.nan
+    return frame
 
 
 def test_wsc_cosmic_ray_suppression():
@@ -126,6 +148,70 @@ def test_wsc_faint_diffuse_preserved_vs_kappa():
 
     assert diff_wsc <= diff_kappa + 0.05
     assert diff_wsc <= 0.3
+
+
+def test_noise_fwhm_nan_borders_produces_weights():
+    if not getattr(zas, "PHOTOUTILS_AVAILABLE", False) or not getattr(zas, "SIGMA_CLIP_AVAILABLE", False):
+        pytest.skip("Photutils/Astropy not available for noise_fwhm weighting")
+
+    rng = np.random.default_rng(123)
+    shape = (128, 128)
+    sigmas = [1.5, 2.5, 3.5]
+    frames = [
+        _make_star_frame(shape, sigma, rng, noise_sigma=0.8, border=16, grid=5, amplitude=800.0)
+        for sigma in sigmas
+    ]
+
+    weights, method_used, _stats = zas._compute_quality_weights(
+        frames, "noise_fwhm", progress_callback=None
+    )
+
+    assert method_used == "noise_fwhm"
+    assert weights is not None
+    values = [float(np.nanmean(w)) for w in weights if w is not None]
+    assert values
+    assert all(np.isfinite(v) for v in values)
+    assert len(set(np.round(values, 3))) > 1
+
+
+def test_prepare_frames_and_weights_keeps_quality_weights_without_radial():
+    if gpu_mod is None:
+        pytest.skip("GPU stacker module unavailable on sys.path")
+
+    rng = np.random.default_rng(321)
+    shape = (128, 128)
+    sigmas = [1.5, 2.5, 3.5]
+    noise_scales = [0.8, 1.2, 1.6]
+    frames = [
+        _make_star_frame(shape, sigma, rng, noise_sigma=noise, border=16, grid=5, amplitude=800.0)
+        for sigma, noise in zip(sigmas, noise_scales)
+    ]
+    stacking_params = {
+        "stack_norm_method": "none",
+        "stack_reject_algo": "winsorized_sigma_clip",
+        "stack_weight_method": "noise_fwhm",
+        "apply_radial_weight": False,
+    }
+
+    (
+        _prepared_frames,
+        _weights_stack,
+        weight_method_used,
+        _weight_stats,
+        _expanded_channels,
+        wsc_weights_block,
+        _wsc_weight_method,
+        _wsc_weight_stats,
+    ) = gpu_mod._prepare_frames_and_weights(
+        frames,
+        stacking_params,
+        zconfig=_cpu_config(),
+        pcb_tile=None,
+        logger=None,
+    )
+
+    assert weight_method_used != "none"
+    assert wsc_weights_block is not None
 
 
 def test_p3_wsc_prep_applies_sky_mean_normalization():
