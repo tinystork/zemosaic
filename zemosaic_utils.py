@@ -1154,6 +1154,63 @@ def _get_gpu_allowed_bytes(safety_fraction: float = 0.75) -> int | None:
         return None
 
 
+def _probe_free_vram_bytes() -> int | None:
+    """Best-effort probe for free GPU VRAM in bytes."""
+    if not gpu_is_available():
+        return None
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        return None
+    try:
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+    except Exception:
+        return None
+    try:
+        return int(free_bytes)
+    except Exception:
+        return None
+
+
+def _is_gpu_oom_exception(exc: BaseException) -> bool:
+    """Return True if the exception looks like a GPU OOM."""
+    try:
+        import cupy as cp  # type: ignore
+        if isinstance(exc, cp.cuda.memory.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    try:
+        message = str(exc).lower()
+    except Exception:
+        message = ""
+    if "out of memory" in message or "cuda_error_out_of_memory" in message:
+        return True
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if cause and cause is not exc:
+        return _is_gpu_oom_exception(cause)
+    return False
+
+
+def _shrink_chunk_hints(max_chunk_bytes, rows_per_chunk) -> tuple[int, int]:
+    """Shrink chunk hints after OOM with minimum safety clamps."""
+    try:
+        max_bytes = int(max_chunk_bytes)
+    except Exception:
+        max_bytes = 0
+    if max_bytes > 0:
+        max_bytes = int(max_bytes * 0.7)
+    max_bytes = max(max_bytes, 16 * 1024 * 1024)
+    try:
+        rows = int(rows_per_chunk)
+    except Exception:
+        rows = 0
+    if rows > 0:
+        rows = int(rows * 0.7)
+    rows = max(32, rows)
+    return max_bytes, rows
+
+
 def _format_mebibytes(byte_count: int | None) -> str:
     if not byte_count or byte_count <= 0:
         return "n/a"
@@ -1895,7 +1952,8 @@ def estimate_sky_affine_to_ref(
     # fitted gain is non-positive, recompute a stable gain/offset from robust
     # statistics to avoid negative-flux master tiles on weak datasets.
     try:
-        corr = float(np.corrcoef(x_sel, y_sel)[0, 1])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            corr = float(np.corrcoef(x_sel, y_sel)[0, 1])
     except Exception:
         corr = float("nan")
 
@@ -2459,127 +2517,145 @@ def compute_intertile_affine_calibration(
 
     # --- START PRUNING LOGIC ---
     raw_pairs_count = len(overlaps)
-    
+    overlaps_raw = list(overlaps)
+
+    raw_degrees = [0] * num_tiles
+    active_tiles = np.zeros(num_tiles, dtype=bool)
+
+    def _ensure_overlap_weight(entry: dict) -> float:
+        weight = entry.get("weight", None)
+        try:
+            weight_val = float(weight)
+        except Exception:
+            weight_val = float("nan")
+        if not math.isfinite(weight_val) or weight_val <= 0.0:
+            try:
+                bbox = entry.get("bbox")
+                if bbox is not None and len(bbox) == 4:
+                    x0, x1, y0, y1 = bbox
+                    weight_val = float((x1 - x0) * (y1 - y0))
+                else:
+                    weight_val = 0.0
+            except Exception:
+                weight_val = 0.0
+        if not math.isfinite(weight_val) or weight_val < 0.0:
+            weight_val = 0.0
+        entry["weight"] = weight_val
+        return weight_val
+
+    for entry in overlaps_raw:
+        i, j = entry["i"], entry["j"]
+        raw_degrees[i] += 1
+        raw_degrees[j] += 1
+        active_tiles[i] = True
+        active_tiles[j] = True
+        _ensure_overlap_weight(entry)
+
+    active_tile_count = int(np.sum(active_tiles))
+    bridges_added = 0
+    components_active = active_tile_count
+    fallback_used = False
+    pruned_pairs_count = raw_pairs_count
+
+    def _count_active_components(uf: _UnionFind) -> int:
+        if active_tile_count <= 1:
+            return active_tile_count
+        roots = set()
+        for idx, active in enumerate(active_tiles):
+            if active:
+                roots.add(uf.find(idx))
+        return len(roots)
+
     # Pruning condition
     if (raw_pairs_count > num_tiles * MAX_NEIGHBORS_PER_TILE * 2 and num_tiles >= 10):
-        _log_intertile(f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={MAX_NEIGHBORS_PER_TILE}", level="INFO")
+        _log_intertile(
+            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={MAX_NEIGHBORS_PER_TILE}",
+            level="INFO",
+        )
 
-        overlaps_raw = list(overlaps)
-        
-        # Calculate initial degrees for logging
-        raw_degrees = [0] * num_tiles
-        for entry in overlaps_raw:
-            raw_degrees[entry["i"]] += 1
-            raw_degrees[entry["j"]] += 1
-        
         # Build neighbors and prune
         neighbors: dict[int, list[tuple[float, tuple[int, int]]]] = {i: [] for i in range(num_tiles)}
-        active_tiles = np.zeros(num_tiles, dtype=bool)
-
         for entry in overlaps_raw:
+            weight = entry["weight"]
             key = _intertile_edge_key(entry)
-            weight = float(entry.get("weight", 0.0))
-            if weight <= 0.0: # Filter out zero/negative weight overlaps early
-                continue
-            
             i, j = entry["i"], entry["j"]
             neighbors[i].append((weight, key))
             neighbors[j].append((weight, key))
-            active_tiles[i] = True
-            active_tiles[j] = True
 
         kept_keys: set[tuple[int, int]] = set()
-        
-        # Store initial connectivity
-        initial_uf = _UnionFind(num_tiles)
-        for entry in overlaps_raw:
-            # Only consider edges between active tiles for initial connectivity check
-            if active_tiles[entry["i"]] and active_tiles[entry["j"]]:
-                 initial_uf.union(entry["i"], entry["j"])
-        
-        pruning_occurred = False
+
         for tile_id in range(num_tiles):
             if not active_tiles[tile_id]:
                 continue
-            
-            # Sort neighbors by weight descending
-            neighbors[tile_id].sort(key=lambda x: x[0], reverse=True)
-            
-            # Keep top K, ensuring at least one if it had neighbors
+
+            # Sort neighbors by weight descending with stable tie-break on (i,j).
+            neighbors[tile_id].sort(key=lambda x: (-x[0], x[1][0], x[1][1]))
+
+            # Keep top K, ensuring at least one if it had neighbors.
             to_keep_for_tile = []
             if neighbors[tile_id]:
-                # If the tile had more than one neighbor, guarantee it keeps at least one edge.
-                # If it only had one, it will naturally be kept as part of top-K if K>=1
-                if MAX_NEIGHBORS_PER_TILE == 0 and len(neighbors[tile_id]) >= 1: # special case: if K=0 but tile had neighbors
-                     to_keep_for_tile.append(neighbors[tile_id][0][1]) # ensure at least 1
+                if MAX_NEIGHBORS_PER_TILE == 0 and len(neighbors[tile_id]) >= 1:
+                    to_keep_for_tile.append(neighbors[tile_id][0][1])
                 else:
                     for k_idx in range(min(MAX_NEIGHBORS_PER_TILE, len(neighbors[tile_id]))):
                         to_keep_for_tile.append(neighbors[tile_id][k_idx][1])
-                        
+
             kept_keys.update(to_keep_for_tile)
-            if len(to_keep_for_tile) < len(neighbors[tile_id]):
-                pruning_occurred = True
 
         # Filter overlaps after top-K pruning
         overlaps_after_topK = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
-        
-        # Calculate degrees after top-K for logging
-        after_topK_degrees = [0] * num_tiles
-        for entry in overlaps_after_topK:
-            after_topK_degrees[entry["i"]] += 1
-            after_topK_degrees[entry["j"]] += 1
 
         _log_intertile(f"Pair pruning (topK): after_topK={len(overlaps_after_topK)}", level="INFO")
-        
+
         # --- CONNECTIVITY GUARANTEE (BRIDGES) ---
         uf = _UnionFind(num_tiles)
-        # Initialize UF with currently kept edges
         for entry in overlaps_after_topK:
             uf.union(entry["i"], entry["j"])
 
-        initial_components = uf.num_components
-        bridges_added = 0
-        
-        # Only attempt to add bridges if there are active tiles and more than one component among them
-        active_tile_count = np.sum(active_tiles)
-        if active_tile_count > 1 and initial_components > 1:
-            _log_intertile(f"Pair pruning (connectivity): components={initial_components} -> (attempting to connect)", level="INFO")
-            
-            # Sort raw overlaps by weight descending to find best bridges
-            # (overlaps_raw is already sorted from previous step or original order if no pruning occurred)
-            overlaps_raw.sort(key=lambda x: x.get("weight", 0.0), reverse=True) # Ensure it's sorted
+        components_active = _count_active_components(uf)
 
-            for entry in overlaps_raw:
+        if active_tile_count > 1 and components_active > 1:
+            _log_intertile(
+                f"Pair pruning (connectivity): components_active={components_active} -> (attempting to connect)",
+                level="INFO",
+            )
+
+            overlaps_sorted = sorted(
+                overlaps_raw,
+                key=lambda entry: (-entry["weight"], *_intertile_edge_key(entry)),
+            )
+
+            for entry in overlaps_sorted:
                 i, j = entry["i"], entry["j"]
-                # Only consider edges between active tiles for bridges
                 if not active_tiles[i] or not active_tiles[j]:
                     continue
-                
-                # Check if adding this edge connects two different components among active tiles
-                if uf.find(i) != uf.find(j):
-                    uf.union(i, j)
+                if uf.union(i, j):
                     kept_keys.add(_intertile_edge_key(entry))
                     bridges_added += 1
-                    if uf.num_components == 1:
-                        break # All active tiles connected
+                    components_active = _count_active_components(uf)
+                    if components_active <= 1:
+                        break
 
-            if uf.num_components > 1:
-                # Only warn if active tiles are still disconnected AND there are at least two active tiles
-                if active_tile_count > 1:
-                    _log_intertile(
-                        f"Pair pruning (connectivity): WARN - Could not connect all active components. "
-                        f"Remaining components: {uf.num_components}. Bridges added: {bridges_added}",
-                        level="WARN",
-                    )
-            else:
-                _log_intertile(f"Pair pruning (connectivity): components={initial_components} -> 1 bridges_added={bridges_added}", level="INFO")
+            if components_active <= 1:
+                _log_intertile(
+                    f"Pair pruning (connectivity): components_active=1 bridges_added={bridges_added}",
+                    level="INFO",
+                )
 
-        # Final overlaps after all pruning and bridge adding
-        final_overlaps = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
-        overlaps = final_overlaps # Update the main 'overlaps' variable
-
-        final_pairs_count = len(overlaps)
-        _log_intertile(f"Pair pruning (connectivity): final_pairs={final_pairs_count}", level="INFO")
+        if active_tile_count > 1 and components_active > 1:
+            fallback_used = True
+            overlaps = overlaps_raw
+            pruned_pairs_count = raw_pairs_count
+            _log_intertile(
+                (
+                    "PRUNE_FALLBACK_NO_PRUNING: disconnected after prune+bridge "
+                    f"(components_active={components_active})"
+                ),
+                level="WARN",
+            )
+        else:
+            overlaps = [entry for entry in overlaps_raw if _intertile_edge_key(entry) in kept_keys]
+            pruned_pairs_count = len(overlaps)
 
         # Calculate final degrees for logging
         final_degrees = [0] * num_tiles
@@ -2594,7 +2670,33 @@ def compute_intertile_affine_calibration(
             level="DEBUG",
         )
     else:
-        _log_intertile("Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)" % (raw_pairs_count, num_tiles, MAX_NEIGHBORS_PER_TILE), level="INFO")
+        _log_intertile(
+            "Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)"
+            % (raw_pairs_count, num_tiles, MAX_NEIGHBORS_PER_TILE),
+            level="INFO",
+        )
+        uf = _UnionFind(num_tiles)
+        for entry in overlaps_raw:
+            uf.union(entry["i"], entry["j"])
+        components_active = _count_active_components(uf)
+        overlaps = overlaps_raw
+        pruned_pairs_count = raw_pairs_count
+
+    if fallback_used:
+        uf = _UnionFind(num_tiles)
+        for entry in overlaps_raw:
+            uf.union(entry["i"], entry["j"])
+        components_active = _count_active_components(uf)
+
+    _log_intertile(
+        (
+            "Pair pruning summary: "
+            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={MAX_NEIGHBORS_PER_TILE} "
+            f"active={active_tile_count} components={components_active} bridges={bridges_added} "
+            f"fallback={'yes' if fallback_used else 'no'}"
+        ),
+        level="INFO",
+    )
 
     # --- END PRUNING LOGIC ---
 
@@ -2647,8 +2749,10 @@ def compute_intertile_affine_calibration(
         if mask_arr.size == 0:
             return None
         finite_mask = np.isfinite(mask_arr)
+        if not np.any(finite_mask):
+            return None
         try:
-            max_val = float(np.nanmax(mask_arr))
+            max_val = float(np.nanmax(mask_arr[finite_mask]))
         except Exception:
             max_val = 0.0
         threshold = 0.5 if max_val > 0.5 else 0.0
@@ -2676,12 +2780,24 @@ def compute_intertile_affine_calibration(
                 target_wcs = _WCS(header)
             except Exception:
                 return None, None
+            max_dim = max(sub_h, sub_w)
+            shape_out = (sub_h, sub_w)
+            reproject_scaled = False
+            if max_dim > preview_size:
+                scale = preview_size / max_dim
+                new_w = max(8, int(round(sub_w * scale)))
+                new_h = max(8, int(round(sub_h * scale)))
+                preview_wcs = _rescale_wcs_for_preview(target_wcs, (sub_h, sub_w), (new_h, new_w))
+                if preview_wcs is not None:
+                    target_wcs = preview_wcs
+                    shape_out = (new_h, new_w)
+                    reproject_scaled = True
             try:
                 reproj_i, _ = reproject_interp(
-                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=shape_out
                 )
                 reproj_j, _ = reproject_interp(
-                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=shape_out
                 )
             except Exception:
                 return None, None
@@ -2694,30 +2810,31 @@ def compute_intertile_affine_calibration(
             if mask_tiles[i] is not None:
                 try:
                     mask_i_reproj, _ = reproject_interp(
-                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=shape_out
                     )
                 except Exception:
                     mask_i_reproj = None
             if mask_tiles[j] is not None:
                 try:
                     mask_j_reproj, _ = reproject_interp(
-                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=shape_out
                     )
                 except Exception:
                     mask_j_reproj = None
             if arr_i.size == 0 or arr_j.size == 0:
                 return None, None
-            max_dim = max(arr_i.shape[0], arr_i.shape[1])
-            if max_dim > preview_size:
-                scale = preview_size / max_dim
-                new_w = max(8, int(round(arr_i.shape[1] * scale)))
-                new_h = max(8, int(round(arr_i.shape[0] * scale)))
-                arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                if mask_i_reproj is not None:
-                    mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                if mask_j_reproj is not None:
-                    mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            if not reproject_scaled:
+                max_dim = max(arr_i.shape[0], arr_i.shape[1])
+                if max_dim > preview_size:
+                    scale = preview_size / max_dim
+                    new_w = max(8, int(round(arr_i.shape[1] * scale)))
+                    new_h = max(8, int(round(arr_i.shape[0] * scale)))
+                    arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    if mask_i_reproj is not None:
+                        mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    if mask_j_reproj is not None:
+                        mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
             valid = np.isfinite(arr_i) & np.isfinite(arr_j)
             mask_i_valid = _mask_valid_pixels(mask_i_reproj)
@@ -3044,7 +3161,7 @@ def load_and_validate_fits(filepath,
                     alpha_mask = np.asarray(hdu_extra.data)
                     if alpha_mask.ndim > 2:
                         alpha_mask = alpha_mask[..., 0]
-                    alpha_mask = np.asarray(alpha_mask, dtype=np.uint8, copy=False)
+                    alpha_mask = np.asarray(alpha_mask, dtype=np.uint8)
                     break
             if alpha_mask is not None:
                 info["alpha_mask"] = alpha_mask
@@ -4183,7 +4300,7 @@ def save_fits_image(image_data: np.ndarray,
 
     if alpha_mask is not None:
         try:
-            alpha_arr = np.asarray(alpha_mask, dtype=np.uint8, copy=False)
+            alpha_arr = np.asarray(alpha_mask, dtype=np.uint8)
             if alpha_arr.ndim > 2:
                 alpha_arr = alpha_arr[..., 0]
             alpha_hdu = current_fits_module.ImageHDU(alpha_arr, name="ALPHA")
@@ -5098,6 +5215,45 @@ def _reproject_and_coadd_wrapper_impl(
                     max_val = local_max
         return max_val if seen else None
 
+    # Support per-tile (per-pixel) weight maps without forwarding unknown kwargs into
+    # astropy-reproject (it would pass them down to reproject_function and crash).
+    tile_weight_maps = kwargs.pop("tile_weight_maps", None)
+    if tile_weight_maps is not None:
+        try:
+            twm_list = list(tile_weight_maps)
+        except Exception:
+            twm_list = [tile_weight_maps]
+        if len(twm_list) < len(data_list):
+            twm_list = twm_list + [None] * (len(data_list) - len(twm_list))
+        if len(twm_list) > len(data_list):
+            twm_list = twm_list[: len(data_list)]
+        existing_weights = kwargs.get("input_weights")
+        if existing_weights is None:
+            kwargs["input_weights"] = twm_list
+        else:
+            try:
+                existing_list = list(existing_weights)
+            except Exception:
+                existing_list = [existing_weights]
+            if len(existing_list) < len(data_list):
+                existing_list = existing_list + [None] * (len(data_list) - len(existing_list))
+            combined_weights = []
+            for idx in range(len(data_list)):
+                base = existing_list[idx]
+                twm = twm_list[idx]
+                if base is None:
+                    combined_weights.append(twm)
+                elif twm is None:
+                    combined_weights.append(base)
+                else:
+                    try:
+                        base_arr = np.asarray(base, dtype=np.float32)
+                        twm_arr = np.asarray(twm, dtype=np.float32)
+                        combined_weights.append(base_arr * twm_arr)
+                    except Exception:
+                        combined_weights.append(base)
+            kwargs["input_weights"] = combined_weights
+
     input_weights_raw = kwargs.get("input_weights")
     input_weight_max = _max_input_weight(input_weights_raw)
     normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
@@ -5114,6 +5270,48 @@ def _reproject_and_coadd_wrapper_impl(
         gpu_kwargs["progress_callback"] = progress_callback
     if normalized_weights is not None:
         gpu_kwargs["tile_weights"] = normalized_weights
+    phase5_oom_retry = bool(kwargs.get("_phase5_oom_retry", False))
+    try:
+        phase5_oom_retry_max = int(kwargs.get("_phase5_oom_retry_max", 3) or 3)
+    except Exception:
+        phase5_oom_retry_max = 3
+    if phase5_oom_retry_max < 0:
+        phase5_oom_retry_max = 0
+
+    def _gpu_call_with_oom_retry():
+        if not phase5_oom_retry or phase5_oom_retry_max <= 0:
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+        max_retries = int(phase5_oom_retry_max)
+        retry_index = 0
+        local_kwargs = dict(gpu_kwargs)
+        while True:
+            try:
+                return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **local_kwargs)
+            except Exception as exc:
+                if not _is_gpu_oom_exception(exc) or retry_index >= max_retries:
+                    raise
+                retry_index += 1
+                new_max, new_rows = _shrink_chunk_hints(
+                    local_kwargs.get("max_chunk_bytes"),
+                    local_kwargs.get("rows_per_chunk"),
+                )
+                local_kwargs["max_chunk_bytes"] = new_max
+                local_kwargs["rows_per_chunk"] = new_rows
+                free_bytes = _probe_free_vram_bytes()
+                if free_bytes is not None and free_bytes > 0:
+                    free_mb = f"{(free_bytes / (1024 ** 2)):.1f}"
+                else:
+                    free_mb = "n/a"
+                logger.warning(
+                    "[GPU Reproject] OOM retry %d/%d: max_chunk_mb=%.1f rows=%s free_vram_mb=%s",
+                    retry_index,
+                    max_retries,
+                    float(new_max or 0) / (1024 ** 2),
+                    int(new_rows),
+                    free_mb,
+                )
+                free_cupy_memory_pools()
+                gc.collect()
     if use_gpu:
         if not gpu_is_available():
             _log_gpu_event(
@@ -5127,7 +5325,7 @@ def _reproject_and_coadd_wrapper_impl(
                 raise RuntimeError("gpu_unavailable")
         else:
             try:
-                return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+                return _gpu_call_with_oom_retry()
             except Exception as e:  # pragma: no cover - GPU failures
                 _log_gpu_event(
                     "gpu_fallback_runtime_error",
@@ -5149,6 +5347,8 @@ def _reproject_and_coadd_wrapper_impl(
         "max_chunk_bytes",
         # New GPU-only hints
         "tile_affine_corrections",
+        "_phase5_oom_retry",
+        "_phase5_oom_retry_max",
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
     input_weights_from_call = cpu_kwargs.get("input_weights")
@@ -5246,16 +5446,30 @@ def reproject_and_coadd_wrapper(
 # --- GPU Percentiles, Hot-Pixels, and Background Map -------------------------
 def _percentiles_gpu(arr2d: np.ndarray, p_low: float, p_high: float) -> tuple[float, float]:
     """Compute two percentiles on GPU; fall back to CPU if CuPy unavailable."""
+    arr = np.asarray(arr2d)
+    has_nonfinite = not np.isfinite(arr).all()
     if not gpu_is_available():
-        lo, hi = np.percentile(arr2d, [p_low, p_high])
+        if has_nonfinite:
+            lo, hi = np.nanpercentile(arr, [p_low, p_high])
+        else:
+            lo, hi = np.percentile(arr, [p_low, p_high])
         return float(lo), float(hi)
     import cupy as cp  # type: ignore
     ensure_cupy_pool_initialized()
     arr_gpu = None
     try:
-        arr_gpu = cp.asarray(arr2d)
-        lo = cp.percentile(arr_gpu, p_low)
-        hi = cp.percentile(arr_gpu, p_high)
+        arr_gpu = cp.asarray(arr)
+        if has_nonfinite:
+            nanpercentile = getattr(cp, "nanpercentile", None)
+            if callable(nanpercentile):
+                lo = nanpercentile(arr_gpu, p_low)
+                hi = nanpercentile(arr_gpu, p_high)
+            else:
+                lo, hi = np.nanpercentile(arr, [p_low, p_high])
+                return float(lo), float(hi)
+        else:
+            lo = cp.percentile(arr_gpu, p_low)
+            hi = cp.percentile(arr_gpu, p_high)
         return float(lo), float(hi)
     finally:
         if arr_gpu is not None:

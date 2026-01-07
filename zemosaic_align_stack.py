@@ -52,6 +52,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable, Any, Iterable, Sequence
 
+from core.robust_rejection import (
+    WSC_IMPL_LEGACY,
+    WSC_IMPL_PIXINSIGHT,
+    resolve_wsc_impl,
+    resolve_wsc_parity_mode,
+    wsc_parity_check,
+    wsc_pixinsight_core,
+)
+
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 import traceback
 import gc
@@ -77,6 +86,7 @@ except Exception:  # pragma: no cover - fallback for older numpy
 # dépendance Photutils
 PHOTOUTILS_AVAILABLE = False
 DAOStarFinder, FITSFixedWarning, CircularAperture, aperture_photometry, SigmaClip, Background2D, MedianBackground, SourceCatalog = [None]*8 # type: ignore
+SOURCECAT_SUPPORTS_SOURCES = False
 try:
     from astropy.stats import SigmaClip, gaussian_sigma_to_fwhm # gaussian_sigma_to_fwhm est utile
     from astropy.table import Table
@@ -92,6 +102,12 @@ try:
     warnings.filterwarnings('ignore', category=FITSFixedWarning)
     
     PHOTOUTILS_AVAILABLE = True
+    try:
+        import inspect
+        if SourceCatalog is not None and "sources" in inspect.signature(SourceCatalog).parameters:
+            SOURCECAT_SUPPORTS_SOURCES = True
+    except Exception:
+        SOURCECAT_SUPPORTS_SOURCES = False
     # print("INFO (zemosaic_align_stack): Photutils importé.")
 except ImportError:
     print("AVERT (zemosaic_align_stack): Photutils non disponible. FWHM weighting limité.")
@@ -160,12 +176,30 @@ def _winsorize_block_numpy(arr_block: np.ndarray, limits: tuple[float, float]) -
     low, high = limits
     block = arr_block.astype(np.float32, copy=False)
     result = block.copy()
+    quantile_func = getattr(np, "nanquantile", None)
+    if quantile_func is None:
+        nanpercentile = getattr(np, "nanpercentile", None)
+        if nanpercentile is not None:
+            def quantile_func(data, q, axis=0):  # type: ignore[misc]
+                return nanpercentile(data, q * 100.0, axis=axis)
+        else:
+            def quantile_func(data, q, axis=0):  # type: ignore[misc]
+                flat = data.reshape(data.shape[0], -1)
+                out = np.empty(flat.shape[1], dtype=np.float32)
+                for idx in range(flat.shape[1]):
+                    col = flat[:, idx]
+                    finite = col[np.isfinite(col)]
+                    if finite.size == 0:
+                        out[idx] = np.nan
+                    else:
+                        out[idx] = np.quantile(finite, q)
+                return out.reshape(data.shape[1:])
     if low > 0:
-        lower = np.quantile(block, low, axis=0)
+        lower = quantile_func(block, low, axis=0)
         lower = lower.astype(np.float32, copy=False)
         np.maximum(result, lower, out=result)
     if high > 0:
-        upper = np.quantile(block, 1.0 - high, axis=0)
+        upper = quantile_func(block, 1.0 - high, axis=0)
         upper = upper.astype(np.float32, copy=False)
         np.minimum(result, upper, out=result)
     return result
@@ -791,6 +825,11 @@ def _free_gpu_pools():
             pass
 
 
+_WSC_GPU_PARITY_CHECKED = False
+_WSC_GPU_PARITY_OK = False
+_WSC_GPU_PARITY_MAX_ABS: float | None = None
+
+
 def _gpu_budget_check(estimated_bytes: int, *, safety_fraction: float = 0.75) -> tuple[bool, int | None]:
     """Return (is_allowed, allowed_bytes) for the requested allocation."""
 
@@ -816,6 +855,34 @@ def _gpu_budget_check(estimated_bytes: int, *, safety_fraction: float = 0.75) ->
         except Exception:
             allowed_bytes = None
     return False, allowed_bytes
+
+
+def _wsc_gpu_parity_check() -> tuple[bool, float | None]:
+    """Run (and cache) the WSC GPU parity check."""
+
+    global _WSC_GPU_PARITY_CHECKED, _WSC_GPU_PARITY_OK, _WSC_GPU_PARITY_MAX_ABS
+    if _WSC_GPU_PARITY_CHECKED:
+        return _WSC_GPU_PARITY_OK, _WSC_GPU_PARITY_MAX_ABS
+
+    if not GPU_AVAILABLE:
+        _WSC_GPU_PARITY_CHECKED = True
+        _WSC_GPU_PARITY_OK = False
+        _WSC_GPU_PARITY_MAX_ABS = None
+        return _WSC_GPU_PARITY_OK, _WSC_GPU_PARITY_MAX_ABS
+
+    try:
+        import cupy as cp  # type: ignore
+
+        ok, max_abs = wsc_parity_check(cp)
+        _WSC_GPU_PARITY_OK = bool(ok)
+        _WSC_GPU_PARITY_MAX_ABS = float(max_abs)
+    except Exception:
+        _WSC_GPU_PARITY_OK = False
+        _WSC_GPU_PARITY_MAX_ABS = None
+    finally:
+        _WSC_GPU_PARITY_CHECKED = True
+
+    return _WSC_GPU_PARITY_OK, _WSC_GPU_PARITY_MAX_ABS
 
 
 def _gpu_nanpercentile(values: np.ndarray, percentiles):
@@ -1027,6 +1094,152 @@ try:
         cpu_stack_linear = getattr(_sm, '_stack_linear_fit_clip', None)
 except Exception as e_import_stack:
     print(f"AVERT (zemosaic_align_stack): Optional import of external stack_methods failed: {e_import_stack}")
+
+
+_WSC_PIXINSIGHT_MAX_ITERS = 10
+
+
+def _iter_row_slices_for_rows(
+    height: int,
+    frames_count: int,
+    width: int,
+    rows_per_chunk: int | None,
+) -> list[slice]:
+    if rows_per_chunk and rows_per_chunk > 0:
+        return [slice(start, min(height, start + rows_per_chunk)) for start in range(0, height, rows_per_chunk)]
+    return list(_iter_row_chunks(height, frames_count, width, np.dtype(np.float32).itemsize))
+
+
+def _accumulate_wsc_stats(stats_accum: dict[str, float], stats: dict[str, Any]) -> None:
+    stats_accum["clip_low_count"] += float(stats.get("clip_low_count", 0))
+    stats_accum["clip_high_count"] += float(stats.get("clip_high_count", 0))
+    stats_accum["valid_count"] += float(stats.get("valid_count", 0))
+    stats_accum["iters_used"] = max(stats_accum["iters_used"], float(stats.get("iters_used", 0)))
+
+
+def _finalize_wsc_stats(stats_accum: dict[str, float]) -> dict[str, float]:
+    total = stats_accum.get("valid_count", 0.0) or 0.0
+    low_frac = (stats_accum.get("clip_low_count", 0.0) / total) if total > 0 else 0.0
+    high_frac = (stats_accum.get("clip_high_count", 0.0) / total) if total > 0 else 0.0
+    stats_accum["clip_low_frac"] = float(low_frac)
+    stats_accum["clip_high_frac"] = float(high_frac)
+    return stats_accum
+
+
+def _wsc_pixinsight_stack_numpy(
+    frames_list: Sequence[np.ndarray],
+    *,
+    sigma_low: float,
+    sigma_high: float,
+    max_iters: int = _WSC_PIXINSIGHT_MAX_ITERS,
+    weights_block: np.ndarray | None = None,
+    rows_per_chunk: int | None = None,
+    progress_callback: Callable | None = None,
+) -> tuple[np.ndarray, float, dict[str, float]]:
+    if not frames_list:
+        raise ValueError("frames is empty")
+    sample = np.asarray(frames_list[0], dtype=np.float32)
+    height = int(sample.shape[0])
+    width = int(sample.shape[1]) if sample.ndim >= 2 else 0
+    row_slices = _iter_row_slices_for_rows(height, len(frames_list), width, rows_per_chunk)
+    output = np.empty_like(sample, dtype=np.float32)
+    stats_accum = {
+        "clip_low_count": 0.0,
+        "clip_high_count": 0.0,
+        "valid_count": 0.0,
+        "iters_used": 0.0,
+        "max_iters": float(max_iters),
+        "huber": 1.0,
+    }
+
+    total_steps = len(row_slices) if row_slices else 1
+    for idx, rows_slice in enumerate(row_slices, start=1):
+        chunk = np.stack([np.asarray(f[rows_slice, ...], dtype=np.float32) for f in frames_list], axis=0)
+        chunk_out, stats = wsc_pixinsight_core(
+            np,
+            chunk,
+            sigma_low=sigma_low,
+            sigma_high=sigma_high,
+            max_iters=max_iters,
+            weights_block=weights_block,
+            return_stats=True,
+        )
+        output[rows_slice, ...] = chunk_out.astype(np.float32, copy=False)
+        _accumulate_wsc_stats(stats_accum, stats)
+        if progress_callback:
+            try:
+                progress_callback("stack_winsorized", idx, total_steps)
+            except Exception:
+                pass
+
+    stats_accum = _finalize_wsc_stats(stats_accum)
+    rejected_pct = 100.0 * (stats_accum["clip_low_frac"] + stats_accum["clip_high_frac"])
+    return output, float(rejected_pct), stats_accum
+
+
+def _wsc_pixinsight_stack_gpu(
+    frames_list: Sequence[np.ndarray],
+    *,
+    sigma_low: float,
+    sigma_high: float,
+    max_iters: int = _WSC_PIXINSIGHT_MAX_ITERS,
+    weights_block: np.ndarray | None = None,
+    rows_per_chunk: int | None = None,
+) -> tuple[np.ndarray, float, dict[str, float]]:
+    import cupy as cp
+
+    if not frames_list:
+        raise ValueError("frames is empty")
+
+    frames_np = [np.asarray(f, dtype=np.float32) for f in frames_list if f is not None]
+    if not frames_np:
+        raise ValueError("No frames provided")
+
+    sample = frames_np[0]
+    sample_shape = sample.shape
+    chunk_rows = _resolve_chunk_rows_for_gpu_helper(
+        rows_per_chunk,
+        frames_np,
+        sample_shape,
+        multiplier=4.0,
+        error_label="winsorized clip",
+    )
+
+    _ensure_gpu_pool()
+    stats_accum = {
+        "clip_low_count": 0.0,
+        "clip_high_count": 0.0,
+        "valid_count": 0.0,
+        "iters_used": 0.0,
+        "max_iters": float(max_iters),
+        "huber": 1.0,
+    }
+
+    try:
+        height = int(sample_shape[0])
+        output = np.empty_like(sample, dtype=np.float32)
+        for start in range(0, height, chunk_rows):
+            end = min(height, start + chunk_rows)
+            rows_slice = slice(start, end)
+            chunk_np = [np.asarray(f[rows_slice, ...], dtype=np.float32) for f in frames_np]
+            arr = cp.stack([cp.asarray(chunk, dtype=cp.float32) for chunk in chunk_np], axis=0)
+            chunk_out, stats = wsc_pixinsight_core(
+                cp,
+                arr,
+                sigma_low=sigma_low,
+                sigma_high=sigma_high,
+                max_iters=max_iters,
+                weights_block=weights_block,
+                return_stats=True,
+            )
+            output[rows_slice, ...] = cp.asnumpy(chunk_out.astype(cp.float32, copy=False))
+            _accumulate_wsc_stats(stats_accum, stats)
+        stats_accum = _finalize_wsc_stats(stats_accum)
+        rejected_pct = 100.0 * (stats_accum["clip_low_frac"] + stats_accum["clip_high_frac"])
+        return output, float(rejected_pct), stats_accum
+    finally:
+        _free_gpu_pools()
+
 
 # --- Implementations GPU simplifiées des méthodes de stack ---
 def gpu_stack_winsorized(
@@ -1258,8 +1471,8 @@ def stack_winsorized_sigma_clip(
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
 
-    - La voie GPU ignore les `weights` (non supportés).
-    - Si la voie GPU échoue ou produit une sortie suspecte, fallback CPU.
+    - En mode legacy, la voie GPU ignore les `weights`.
+    - Si la voie GPU échoue ou viole la parité WSC, fallback CPU (WSC uniquement).
     - La voie CPU accepte `weights` en mot-clé si fournis.
     """
     # --- validations légères d'entrée ---
@@ -1287,6 +1500,16 @@ def stack_winsorized_sigma_clip(
                                            getattr(zconfig, 'use_gpu', False))))
         else:
             use_gpu = False
+
+    wsc_impl = resolve_wsc_impl(zconfig)
+    sigma_low = float(kwargs.get("sigma_low", kwargs.get("kappa", 3.0)))
+    sigma_high = float(kwargs.get("sigma_high", kwargs.get("kappa", 3.0)))
+    try:
+        max_iters = int(kwargs.get("winsor_max_iters", _WSC_PIXINSIGHT_MAX_ITERS))
+    except Exception:
+        max_iters = _WSC_PIXINSIGHT_MAX_ITERS
+    if max_iters <= 0:
+        max_iters = _WSC_PIXINSIGHT_MAX_ITERS
 
     plan_hints = _extract_parallel_plan_hints(parallel_plan)
     plan_cpu_workers = plan_hints["cpu_workers"]
@@ -1325,7 +1548,7 @@ def stack_winsorized_sigma_clip(
             for idx, arr in enumerate(derived_list):
                 frame_shape = _np.asarray(frames_np_for_weights[idx]).shape if idx < len(frames_np_for_weights) else None
                 if arr is not None:
-                    w_arr = _np.asarray(arr, dtype=_np.float32, copy=False)
+                    w_arr = _np.asarray(arr, dtype=_np.float32)
                     # Ensure compact per-frame weight: (1,1,C) for color or (1,) for mono/scalar
                     if frame_shape is not None and len(frame_shape) == 3 and frame_shape[-1] == 3:
                         if w_arr.ndim == 0:
@@ -1367,7 +1590,7 @@ def stack_winsorized_sigma_clip(
 
     if weights_array_full is not None:
         # Keep compact shape and defer broadcasting to the compute sites
-        weights_array_full = _np.asarray(weights_array_full, dtype=_np.float32, copy=False)
+        weights_array_full = _np.asarray(weights_array_full, dtype=_np.float32)
         if weights_array_full.ndim == 1:
             # (N,) -> (N,1)
             weights_array_full = weights_array_full.reshape((weights_array_full.shape[0], 1))
@@ -1389,6 +1612,10 @@ def stack_winsorized_sigma_clip(
     except (TypeError, ValueError):
         max_frames_per_pass = 0
     if max_frames_per_pass < 0:
+        max_frames_per_pass = 0
+    requested_frames_per_pass = max_frames_per_pass
+    user_stream_requested = requested_frames_per_pass > 0
+    if wsc_impl == WSC_IMPL_PIXINSIGHT:
         max_frames_per_pass = 0
 
     auto_fallback_flag = kwargs.pop(
@@ -1439,6 +1666,23 @@ def stack_winsorized_sigma_clip(
         memmap_budget_mb=memmap_budget_mb,
     )
 
+    if wsc_impl == WSC_IMPL_PIXINSIGHT and memory_plan.mode in {"stream", "incremental"}:
+        allow_memmap = memmap_policy != "never" and (memmap_enabled_flag or memmap_policy == "always")
+        if allow_memmap:
+            memory_plan.mode = "memmap"
+            memory_plan.force_memmap = True
+        else:
+            memory_plan.mode = "in_memory"
+            memory_plan.force_memmap = False
+        memory_plan.frames_per_pass = None
+        memory_plan.fallback_chain = []
+        memory_plan.reason = "pixinsight_no_stream"
+        if user_stream_requested:
+            _internal_logger.info(
+                "PixInsight WSC disables frame streaming; ignoring winsor_max_frames_per_pass=%d",
+                int(requested_frames_per_pass),
+            )
+
     user_cap_stream = (
         max_frames_per_pass > 0 and len(frames_list) > max_frames_per_pass and memory_plan.mode == "in_memory"
     )
@@ -1452,6 +1696,22 @@ def stack_winsorized_sigma_clip(
         ]
         if memory_plan.details is not None:
             memory_plan.details["user_cap_limit"] = float(max_frames_per_pass)
+
+    def _log_wsc_summary(stats: dict[str, float] | None, impl: str) -> None:
+        if not stats:
+            return
+        huber_flag = stats.get("huber", 0.0)
+        _internal_logger.info(
+            "[WSC] impl=%s sigma_low=%.3f sigma_high=%.3f max_iters=%d iters_used=%d huber=%s clip_low=%.4g clip_high=%.4g",
+            impl,
+            float(sigma_low),
+            float(sigma_high),
+            int(max_iters),
+            int(stats.get("iters_used", 0)),
+            "on" if huber_flag else "off",
+            float(stats.get("clip_low_frac", 0.0)),
+            float(stats.get("clip_high_frac", 0.0)),
+        )
 
     def _stack_winsor_streaming(limit: int, *, split_strategy: str = "sequential") -> tuple[_np.ndarray, float]:
         nonlocal frames_list, weights_array_full
@@ -1485,6 +1745,7 @@ def stack_winsorized_sigma_clip(
                 apply_rewinsor=bool(apply_rewinsor),
                 weights_chunk=weights_chunk,
                 streaming_state=state,
+                wsc_impl=wsc_impl,
             )
 
             # Libérer les références intermédiaires au plus tôt
@@ -1497,7 +1758,7 @@ def stack_winsorized_sigma_clip(
 
     force_memmap_plan = bool(memory_plan.force_memmap)
 
-    if memory_plan.mode in {"stream", "incremental"}:
+    if wsc_impl == WSC_IMPL_LEGACY and memory_plan.mode in {"stream", "incremental"}:
         frames_limit = memory_plan.frames_per_pass or len(frames_list)
         frames_limit = max(1, int(frames_limit))
         if use_gpu:
@@ -1570,75 +1831,160 @@ def stack_winsorized_sigma_clip(
     sample_height = int(sample.shape[0]) if sample.ndim >= 1 else 0
     if plan_row_hint and sample_height > 0:
         rows_per_chunk = int(max(1, min(sample_height, plan_row_hint)))
+    rows_per_chunk_cpu = plan_hints["rows_cpu"]
 
-    # --- GPU path (poids ignorés) ---
+    # --- GPU path ---
     if can_attempt_gpu:
         _log_stack_message("stack_using_gpu", "INFO", progress_callback, helper=helper_label)
-        gpu_impl = globals().get("gpu_stack_winsorized")
-        if not callable(gpu_impl):
-            _log_stack_message(
-                "stack_gpu_fallback_unavailable",
-                "WARN",
-                progress_callback,
-                helper=helper_label,
-                reason="missing_implementation",
-            )
-        else:
-            try:
-                if weights_array_full is not None or weight_method_in_use not in ("", "none") or manual_weights:
-                    _log_stack_message(
-                        f"[Stack][GPU Winsorized] weight_method='{weight_label_for_log}' requested but not supported on this path -> ignoring weights.",
-                        "INFO",
-                        progress_callback,
-                    )
-                gpu_out = gpu_impl(frames_list, rows_per_chunk=rows_per_chunk, **kwargs)
-
-                # --- validations de sortie GPU ---
-                if gpu_out is None:
-                    raise RuntimeError("GPU returned None")
-                # Support both (image, rejected_pct) and image-only returns
-                if isinstance(gpu_out, (list, tuple)) and len(gpu_out) >= 1:
-                    _gpu_img = gpu_out[0]
-                    _gpu_rej = float(gpu_out[1]) if len(gpu_out) > 1 else 0.0
-                else:
-                    _gpu_img = gpu_out
-                    _gpu_rej = 0.0
-                gpu_out = _np.asarray(_gpu_img, dtype=_np.float32)
-                # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
-                exp_shape = sample.shape  # (H,W) ou (H,W,C)
-                if gpu_out.shape != exp_shape:
-                    raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
-                if not _np.any(_np.isfinite(gpu_out)):
-                    raise RuntimeError("GPU output has no finite values")
-                # tolérance: > 90% de pixels finis
-                finite_ratio = _np.isfinite(gpu_out).mean()
-                if finite_ratio < 0.9:
-                    raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
-
-                _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
-                return gpu_out, float(_gpu_rej)
-
-            except Exception as e:
+        if wsc_impl == WSC_IMPL_PIXINSIGHT:
+            parity_ok, parity_max = _wsc_gpu_parity_check()
+            if not parity_ok:
                 _internal_logger.warning(
-                    f"GPU winsorized clip failed or looked invalid → fallback CPU: {type(e).__name__}: {e}",
-                    exc_info=True
+                    "WSC GPU parity failed (mode=%s, max_abs=%s); falling back to CPU.",
+                    resolve_wsc_parity_mode(),
+                    "n/a" if parity_max is None else f"{parity_max:.3g}",
                 )
                 _log_stack_message(
                     "stack_gpu_fallback_runtime_error",
                     "WARN",
                     progress_callback,
                     helper=helper_label,
-                    error=str(e),
+                    error="wsc_parity_failed",
                 )
+            else:
+                try:
+                    gpu_out, gpu_rej, stats = _wsc_pixinsight_stack_gpu(
+                        frames_list,
+                        sigma_low=sigma_low,
+                        sigma_high=sigma_high,
+                        max_iters=max_iters,
+                        weights_block=weights_array_full,
+                        rows_per_chunk=rows_per_chunk,
+                    )
+                    gpu_out = _np.asarray(gpu_out, dtype=_np.float32)
+                    exp_shape = sample.shape
+                    if gpu_out.shape != exp_shape:
+                        raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
+                    if not _np.any(_np.isfinite(gpu_out)):
+                        raise RuntimeError("GPU output has no finite values")
+                    finite_ratio = _np.isfinite(gpu_out).mean()
+                    if finite_ratio < 0.9:
+                        raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
+                    _log_wsc_summary(stats, wsc_impl)
+                    _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
+                    return gpu_out, float(gpu_rej)
+                except Exception as e:
+                    _internal_logger.warning(
+                        "GPU PixInsight WSC failed → fallback CPU: %s: %s",
+                        type(e).__name__,
+                        e,
+                        exc_info=True,
+                    )
+                    _log_stack_message(
+                        "stack_gpu_fallback_runtime_error",
+                        "WARN",
+                        progress_callback,
+                        helper=helper_label,
+                        error=str(e),
+                    )
+        else:
+            gpu_impl = globals().get("gpu_stack_winsorized")
+            if not callable(gpu_impl):
+                _log_stack_message(
+                    "stack_gpu_fallback_unavailable",
+                    "WARN",
+                    progress_callback,
+                    helper=helper_label,
+                    reason="missing_implementation",
+                )
+            else:
+                try:
+                    if weights_array_full is not None or weight_method_in_use not in ("", "none") or manual_weights:
+                        _log_stack_message(
+                            f"[Stack][GPU Winsorized] weight_method='{weight_label_for_log}' requested but not supported on this path -> ignoring weights.",
+                            "INFO",
+                            progress_callback,
+                        )
+                    gpu_out = gpu_impl(frames_list, rows_per_chunk=rows_per_chunk, **kwargs)
+
+                    # --- validations de sortie GPU ---
+                    if gpu_out is None:
+                        raise RuntimeError("GPU returned None")
+                    # Support both (image, rejected_pct) and image-only returns
+                    if isinstance(gpu_out, (list, tuple)) and len(gpu_out) >= 1:
+                        _gpu_img = gpu_out[0]
+                        _gpu_rej = float(gpu_out[1]) if len(gpu_out) > 1 else 0.0
+                    else:
+                        _gpu_img = gpu_out
+                        _gpu_rej = 0.0
+                    gpu_out = _np.asarray(_gpu_img, dtype=_np.float32)
+                    # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
+                    exp_shape = sample.shape  # (H,W) ou (H,W,C)
+                    if gpu_out.shape != exp_shape:
+                        raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
+                    if not _np.any(_np.isfinite(gpu_out)):
+                        raise RuntimeError("GPU output has no finite values")
+                    # tolérance: > 90% de pixels finis
+                    finite_ratio = _np.isfinite(gpu_out).mean()
+                    if finite_ratio < 0.9:
+                        raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
+
+                    _log_wsc_summary(
+                        {"iters_used": 0.0, "clip_low_frac": 0.0, "clip_high_frac": 0.0, "huber": 0.0},
+                        wsc_impl,
+                    )
+                    _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
+                    return gpu_out, float(_gpu_rej)
+
+                except Exception as e:
+                    _internal_logger.warning(
+                        f"GPU winsorized clip failed or looked invalid → fallback CPU: {type(e).__name__}: {e}",
+                        exc_info=True
+                    )
+                    _log_stack_message(
+                        "stack_gpu_fallback_runtime_error",
+                        "WARN",
+                        progress_callback,
+                        helper=helper_label,
+                        error=str(e),
+                    )
 
     # --- CPU path ---
     _log_stack_message("stack_using_cpu", "INFO", progress_callback, helper=helper_label)
+    if wsc_impl == WSC_IMPL_PIXINSIGHT:
+        cpu_out, rejected, stats = _wsc_pixinsight_stack_numpy(
+            frames_list,
+            sigma_low=sigma_low,
+            sigma_high=sigma_high,
+            max_iters=max_iters,
+            weights_block=weights_array_full,
+            rows_per_chunk=rows_per_chunk_cpu,
+            progress_callback=progress_callback,
+        )
+        _log_wsc_summary(stats, wsc_impl)
+        if weights_array_full is not None and weight_stats:
+            _log_stack_message(
+                f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
+                "INFO",
+                progress_callback,
+            )
+        _poststack_rgb_equalization(cpu_out, zconfig, stack_metadata)
+        return cpu_out, float(rejected)
+
     if not callable(globals().get("cpu_stack_winsorized", None)):
         raise RuntimeError("CPU stack_winsorized function unavailable")
 
     cpu_kwargs = dict(kwargs)
     if weights_array_full is not None:
         cpu_kwargs["weights"] = weights_array_full
+    external_winsor = cpu_stack_winsorized is not _cpu_stack_winsorized_fallback
+    frames_have_nonfinite = False
+    if external_winsor:
+        for frame in frames_list:
+            frame_arr = _np.asarray(frame)
+            if not _np.isfinite(frame_arr).all():
+                frames_have_nonfinite = True
+                break
 
     fallback_sequence: list[tuple[str, Optional[int]]] = []
     if force_memmap_plan:
@@ -1649,30 +1995,44 @@ def stack_winsorized_sigma_clip(
     last_error: Exception | None = None
 
     if not force_memmap_plan:
-        try:
-            result_tuple = cpu_stack_winsorized(frames_list, **cpu_kwargs)
-        except TypeError:
-            if weights_array_full is not None:
-                _log_stack_message(
-                    "[Stack][Winsorized CPU] External implementation rejected weights; falling back to internal handler.",
-                    "WARN",
-                    progress_callback,
-                )
-                result_tuple = _cpu_stack_winsorized_fallback(
-                    frames_list,
-                    **cpu_kwargs,
-                    force_memmap=force_memmap_plan,
-                )
-            else:
-                raise
-        except (MemoryError, _NumpyArrayMemoryError) as mem_err:
-            last_error = mem_err
+        if external_winsor and frames_have_nonfinite:
             _log_stack_message(
-                "stack_mem_retry_after_error",
+                "[Stack][Winsorized CPU] Non-finite inputs detected; using internal NaN-safe fallback.",
                 "WARN",
                 progress_callback,
-                error=str(mem_err),
             )
+            result_tuple = _cpu_stack_winsorized_fallback(
+                frames_list,
+                **cpu_kwargs,
+                force_memmap=force_memmap_plan,
+                wsc_impl=wsc_impl,
+            )
+        else:
+            try:
+                result_tuple = cpu_stack_winsorized(frames_list, **cpu_kwargs)
+            except TypeError:
+                if weights_array_full is not None:
+                    _log_stack_message(
+                        "[Stack][Winsorized CPU] External implementation rejected weights; falling back to internal handler.",
+                        "WARN",
+                        progress_callback,
+                    )
+                    result_tuple = _cpu_stack_winsorized_fallback(
+                        frames_list,
+                        **cpu_kwargs,
+                        force_memmap=force_memmap_plan,
+                        wsc_impl=wsc_impl,
+                    )
+                else:
+                    raise
+            except (MemoryError, _NumpyArrayMemoryError) as mem_err:
+                last_error = mem_err
+                _log_stack_message(
+                    "stack_mem_retry_after_error",
+                    "WARN",
+                    progress_callback,
+                    error=str(mem_err),
+                )
 
     if result_tuple is not None:
         stacked_cpu, rejected = _normalize_stack_output(result_tuple)
@@ -1681,6 +2041,11 @@ def stack_winsorized_sigma_clip(
                 f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
                 "INFO",
                 progress_callback,
+            )
+        if wsc_impl == WSC_IMPL_LEGACY:
+            _log_wsc_summary(
+                {"iters_used": 0.0, "clip_low_frac": 0.0, "clip_high_frac": 0.0, "huber": 0.0},
+                wsc_impl,
             )
         _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
         return stacked_cpu, rejected
@@ -1699,6 +2064,7 @@ def stack_winsorized_sigma_clip(
                     frames_list,
                     **cpu_kwargs,
                     force_memmap=True,
+                    wsc_impl=wsc_impl,
                 )
             except (MemoryError, _NumpyArrayMemoryError) as mem_err:
                 last_error = mem_err
@@ -1722,6 +2088,11 @@ def stack_winsorized_sigma_clip(
                     f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
                     "INFO",
                     progress_callback,
+                )
+            if wsc_impl == WSC_IMPL_LEGACY:
+                _log_wsc_summary(
+                    {"iters_used": 0.0, "clip_low_frac": 0.0, "clip_high_frac": 0.0, "huber": 0.0},
+                    wsc_impl,
                 )
             _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
             return stacked_cpu, rejected
@@ -2086,6 +2457,113 @@ def align_images_in_group(image_data_list: list,
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
 
+    def _coerce_footprint_to_hw_bool(
+        footprint_mask,
+        target_hw: tuple[int, int],
+        *,
+        img_idx: int,
+    ) -> tuple[np.ndarray | None, str | None]:
+        """Return (footprint2d_bool, ignore_reason)."""
+
+        if footprint_mask is None:
+            return None, "footprint_none"
+        try:
+            fp = np.asarray(footprint_mask)
+        except Exception as exc:
+            return None, f"footprint_to_array_failed:{type(exc).__name__}"
+        if fp.size <= 0:
+            return None, "footprint_empty"
+        if fp.ndim == 2:
+            if fp.shape != target_hw:
+                return None, f"footprint_shape_mismatch:{getattr(fp, 'shape', None)}"
+            fp2d = fp
+        elif fp.ndim == 3:
+            # HWC-style
+            if fp.shape[:2] == target_hw:
+                if fp.shape[2] == 1:
+                    fp2d = fp[..., 0]
+                else:
+                    fp2d = np.any(fp > 0, axis=2) if fp.dtype != bool else np.any(fp, axis=2)
+            # CHW-style
+            elif fp.shape[-2:] == target_hw:
+                if fp.shape[0] == 1:
+                    fp2d = fp[0, ...]
+                else:
+                    fp2d = np.any(fp > 0, axis=0) if fp.dtype != bool else np.any(fp, axis=0)
+            else:
+                return None, f"footprint_shape_mismatch:{getattr(fp, 'shape', None)}"
+        else:
+            return None, f"footprint_ndim_invalid:{fp.ndim}"
+
+        try:
+            fp2d_bool = (fp2d > 0) if fp2d.dtype != bool else fp2d
+            fp2d_bool = fp2d_bool.astype(bool, copy=False)
+        except Exception as exc:
+            return None, f"footprint_binarize_failed:{type(exc).__name__}"
+
+        try:
+            nonzero_frac = float(np.count_nonzero(fp2d_bool) / fp2d_bool.size) if fp2d_bool.size else 0.0
+            _pcb(
+                "AlignGroup: footprint stats",
+                lvl="DEBUG_DETAIL",
+                img_idx=int(img_idx),
+                propagate_mask=bool(propagate_mask),
+                footprint_shape=getattr(fp, "shape", None),
+                footprint_dtype=str(getattr(fp, "dtype", None)),
+                nonzero_frac=nonzero_frac,
+            )
+        except Exception:
+            pass
+
+        return fp2d_bool, None
+
+    def _nanize_outside_mask_hw(
+        aligned_image: np.ndarray,
+        valid_hw: np.ndarray,
+        *,
+        img_idx: int,
+        tag: str,
+    ) -> np.ndarray:
+        """Nanize pixels outside valid_hw on a float32, writable, C-contiguous buffer."""
+
+        if aligned_image is None:
+            return aligned_image
+        if not isinstance(aligned_image, np.ndarray):
+            aligned_image = np.asarray(aligned_image)
+        if aligned_image.dtype != np.float32 or not aligned_image.flags.writeable or not aligned_image.flags.c_contiguous:
+            aligned_image = np.array(aligned_image, dtype=np.float32, copy=True, order="C")
+        else:
+            aligned_image = aligned_image.astype(np.float32, copy=False)
+
+        if valid_hw is None or valid_hw.shape != aligned_image.shape[:2]:
+            return aligned_image
+
+        invalid = ~valid_hw
+        try:
+            if aligned_image.ndim == 2:
+                aligned_image[invalid] = np.nan
+            else:
+                # boolean mask on (H,W) selects all channels
+                aligned_image[invalid] = np.nan
+        except Exception as exc:
+            try:
+                _pcb(
+                    f"AlignGroup: nanize failed ({tag})",
+                    lvl="WARN",
+                    img_idx=int(img_idx),
+                    err_type=type(exc).__name__,
+                )
+            except Exception:
+                pass
+        return aligned_image
+
+    def _overlap_slices_from_shift(h: int, w: int, dy: int, dx: int) -> tuple[slice, slice]:
+        ys = slice(max(0, dy), min(h, h + dy))
+        xs = slice(max(0, dx), min(w, w + dx))
+        yt = slice(max(0, -dy), max(0, -dy) + (ys.stop - ys.start))
+        xt = slice(max(0, -dx), max(0, -dx) + (xs.stop - xs.start))
+        return yt, xt
+
     # Internal GPU FFT phase-correlation aligner (translation only)
     def _fft_phase_shift(src2d: np.ndarray, ref2d: np.ndarray) -> tuple[int, int, float]:
         """Return (dy, dx, confidence_ratio). Uses CuPy if available, else NumPy."""
@@ -2174,7 +2652,28 @@ def align_images_in_group(image_data_list: list,
             src_lum = (0.299 * src[..., 0] + 0.587 * src[..., 1] + 0.114 * src[..., 2]).astype(np.float32) if (src.ndim == 3 and src.shape[-1] == 3) else src.astype(np.float32)
             dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
             if abs(dy) > 0 or abs(dx) > 0:
-                aligned[i] = _apply_integer_shift_hw_or_hwc(src.astype(np.float32, copy=False), dy, dx)
+                fft_aligned = _apply_integer_shift_hw_or_hwc(src.astype(np.float32, copy=False), dy, dx)
+                if propagate_mask and isinstance(fft_aligned, np.ndarray) and fft_aligned.ndim >= 2:
+                    h, w = fft_aligned.shape[:2]
+                    yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
+                    valid_hw = np.zeros((h, w), dtype=bool)
+                    if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
+                        valid_hw[yt, xt] = True
+                        try:
+                            overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
+                            _pcb(
+                                "AlignGroup: FFT-only footprint derived",
+                                lvl="DEBUG_DETAIL",
+                                img_idx=int(i),
+                                dy=int(dy),
+                                dx=int(dx),
+                                overlap_rect=(int(yt.start), int(xt.start), int(yt.stop), int(xt.stop)),
+                                overlap_frac=overlap_frac,
+                            )
+                        except Exception:
+                            pass
+                        fft_aligned = _nanize_outside_mask_hw(fft_aligned, valid_hw, img_idx=i, tag="fft_only")
+                aligned[i] = fft_aligned
             else:
                 aligned[i] = src.astype(np.float32, copy=True)
         failed_idx = [idx for idx, img in enumerate(aligned) if img is None]
@@ -2241,28 +2740,126 @@ def align_images_in_group(image_data_list: list,
                                         and reference_image_adu.flags.c_contiguous)
                 else np.array(reference_image_adu, dtype=np.float32, copy=True, order='C')
             )
-            aligned_image_output, footprint_mask = astroalign_module.register(
-                source=src_for_aa, target=ref_for_aa,
-                detection_sigma=detection_sigma, min_area=min_area,
-                propagate_mask=propagate_mask
-            )
+            try:
+                result = astroalign_module.register(
+                    source=src_for_aa,
+                    target=ref_for_aa,
+                    detection_sigma=detection_sigma,
+                    min_area=min_area,
+                    propagate_mask=propagate_mask,
+                )
+            except TypeError as exc:
+                # Compat: older astroalign versions may not accept propagate_mask.
+                if "propagate_mask" not in str(exc):
+                    raise
+                result = astroalign_module.register(
+                    source=src_for_aa,
+                    target=ref_for_aa,
+                    detection_sigma=detection_sigma,
+                    min_area=min_area,
+                )
+                if propagate_mask:
+                    try:
+                        _pcb(
+                            "AlignGroup: astroalign.register propagate_mask unsupported",
+                            lvl="DEBUG_DETAIL",
+                            img_idx=int(i),
+                        )
+                    except Exception:
+                        pass
+            aligned_image_output = None
+            footprint_mask = None
+            if isinstance(result, (tuple, list)):
+                if len(result) >= 1:
+                    aligned_image_output = result[0]
+                if len(result) >= 2:
+                    footprint_mask = result[1]
+            else:
+                aligned_image_output = result
             if aligned_image_output is not None:
                 if aligned_image_output.shape != reference_image_adu.shape:
                     _pcb("aligngroup_warn_shape_mismatch_after_align", lvl="WARN", img_idx=i, 
                               aligned_shape=aligned_image_output.shape, ref_shape=reference_image_adu.shape)
                     # Si astroalign retourne une forme non conforme mais FFT a fonctionné, utiliser FFT
                     if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
-                        aligned_images[i] = prealign_fft_img.astype(np.float32)
+                        fft_out = prealign_fft_img.astype(np.float32, copy=True)
+                        if propagate_mask and isinstance(fft_out, np.ndarray) and fft_out.ndim >= 2:
+                            h, w = fft_out.shape[:2]
+                            yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
+                            valid_hw = np.zeros((h, w), dtype=bool)
+                            if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
+                                valid_hw[yt, xt] = True
+                                try:
+                                    overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
+                                    _pcb(
+                                        "AlignGroup: FFT-only fallback footprint derived",
+                                        lvl="DEBUG_DETAIL",
+                                        img_idx=int(i),
+                                        dy=int(dy),
+                                        dx=int(dx),
+                                        overlap_rect=(int(yt.start), int(xt.start), int(yt.stop), int(xt.stop)),
+                                        overlap_frac=overlap_frac,
+                                    )
+                                except Exception:
+                                    pass
+                                fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
+                        aligned_images[i] = fft_out
                         _pcb("AlignGroup: Fallback FFT-only après mismatch de forme.", lvl="WARN")
                     else:
                         aligned_images[i] = None
                 else:
-                    aligned_images[i] = aligned_image_output.astype(np.float32)
+                    aligned_out = aligned_image_output.astype(np.float32, copy=False)
+                    if propagate_mask:
+                        fp2d, ignore_reason = _coerce_footprint_to_hw_bool(
+                            footprint_mask,
+                            aligned_out.shape[:2],
+                            img_idx=i,
+                        )
+                        if fp2d is None:
+                            try:
+                                _pcb(
+                                    "AlignGroup: footprint ignored",
+                                    lvl="DEBUG_DETAIL",
+                                    img_idx=int(i),
+                                    reason=str(ignore_reason),
+                                    footprint_shape=getattr(footprint_mask, "shape", None),
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            aligned_out = _nanize_outside_mask_hw(
+                                aligned_out,
+                                fp2d,
+                                img_idx=i,
+                                tag="astroalign",
+                            )
+                    aligned_images[i] = aligned_out
                     _pcb(f"AlignGroup: Image {i} alignée (affine).", lvl="DEBUG_DETAIL")
             else:
                 _pcb("aligngroup_warn_register_returned_none", lvl="WARN", img_idx=i)
                 if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
-                    aligned_images[i] = prealign_fft_img.astype(np.float32)
+                    fft_out = prealign_fft_img.astype(np.float32, copy=True)
+                    if propagate_mask and isinstance(fft_out, np.ndarray) and fft_out.ndim >= 2:
+                        h, w = fft_out.shape[:2]
+                        yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
+                        valid_hw = np.zeros((h, w), dtype=bool)
+                        if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
+                            valid_hw[yt, xt] = True
+                            try:
+                                overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
+                                _pcb(
+                                    "AlignGroup: FFT-only fallback footprint derived",
+                                    lvl="DEBUG_DETAIL",
+                                    img_idx=int(i),
+                                    dy=int(dy),
+                                    dx=int(dx),
+                                    overlap_rect=(int(yt.start), int(xt.start), int(yt.stop), int(xt.stop)),
+                                    overlap_frac=overlap_frac,
+                                )
+                            except Exception:
+                                pass
+                            fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
+                    aligned_images[i] = fft_out
                     _pcb("AlignGroup: Fallback FFT-only (astroalign None).", lvl="WARN")
                 else:
                     aligned_images[i] = None
@@ -2271,7 +2868,28 @@ def align_images_in_group(image_data_list: list,
             # En cas d'échec astroalign, repli sur FFT si disponible
             try:
                 if 'prealign_fft_img' in locals() and prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
-                    aligned_images[i] = prealign_fft_img.astype(np.float32)
+                    fft_out = prealign_fft_img.astype(np.float32, copy=True)
+                    if propagate_mask and isinstance(fft_out, np.ndarray) and fft_out.ndim >= 2:
+                        h, w = fft_out.shape[:2]
+                        yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
+                        valid_hw = np.zeros((h, w), dtype=bool)
+                        if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
+                            valid_hw[yt, xt] = True
+                            try:
+                                overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
+                                _pcb(
+                                    "AlignGroup: FFT-only fallback footprint derived",
+                                    lvl="DEBUG_DETAIL",
+                                    img_idx=int(i),
+                                    dy=int(dy),
+                                    dx=int(dx),
+                                    overlap_rect=(int(yt.start), int(xt.start), int(yt.stop), int(xt.stop)),
+                                    overlap_frac=overlap_frac,
+                                )
+                            except Exception:
+                                pass
+                            fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
+                    aligned_images[i] = fft_out
                     _pcb("AlignGroup: Fallback FFT-only (MaxIterError).", lvl="WARN")
                 else:
                     aligned_images[i] = None
@@ -2560,6 +3178,26 @@ def _calculate_image_weights_noise_variance(
                     _pcb(f"WeightNoiseVar: Erreur stats image {i}, canal {c_idx}: {e_stats_ch}", lvl="WARN")
                     current_image_channel_variances.append(np.inf)
             
+        elif img_for_stats.ndim == 3 and img_for_stats.shape[-1] == 1: # Mono HWC
+            num_channels_in_image = 1
+            channel_data = img_for_stats[..., 0]
+            if channel_data.size == 0:
+                _pcb(f"WeightNoiseVar: Image monochrome {i} vide.", lvl="WARN")
+                current_image_channel_variances.append(np.inf)
+            else:
+                try:
+                    _, _, stddev = sigma_clipped_stats_func(
+                        channel_data, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
+                    )
+                    if stddev is not None and np.isfinite(stddev) and stddev > 1e-9:
+                        current_image_channel_variances.append(stddev**2)
+                    else:
+                        _pcb(f"WeightNoiseVar: Image monochrome {i}, stddev invalide ({stddev}). Variance Inf.", lvl="WARN")
+                        current_image_channel_variances.append(np.inf)
+                except Exception as e_stats:
+                    _pcb(f"WeightNoiseVar: Erreur stats image {i}: {e_stats}", lvl="WARN")
+                    current_image_channel_variances.append(np.inf)
+
         elif img_for_stats.ndim == 2: # Image monochrome HW
             num_channels_in_image = 1 # Conceptuellement
             if img_for_stats.size == 0:
@@ -2688,9 +3326,16 @@ def _estimate_initial_fwhm(data_2d: np.ndarray, progress_callback: callable = No
                 # equivalent_fwhm est une bonne estimation si la source est ~gaussienne
                 # On filtre sur l'ellipticité pour ne garder que les sources rondes
                 if props.eccentricity is not None and props.eccentricity < 0.5 and \
-                   props.equivalent_fwhm is not None and np.isfinite(props.equivalent_fwhm) and \
-                   1.0 < props.equivalent_fwhm < 20.0: # FWHM doit être dans une plage plausible
-                    fwhms_from_cat.append(props.equivalent_fwhm.value)
+                   props.equivalent_fwhm is not None:
+                    fwhm_val = props.equivalent_fwhm
+                    if hasattr(fwhm_val, "value"):
+                        fwhm_val = fwhm_val.value
+                    try:
+                        fwhm_val = float(fwhm_val)
+                    except Exception:
+                        continue
+                    if np.isfinite(fwhm_val) and 1.0 < fwhm_val < 20.0: # FWHM doit être dans une plage plausible
+                        fwhms_from_cat.append(fwhm_val)
             except AttributeError: # Certaines propriétés peuvent manquer
                 continue
             if len(fwhms_from_cat) >= 100: # Limiter le nombre de sources pour l'estimation
@@ -2723,6 +3368,80 @@ def _calculate_image_weights_noise_fwhm(
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
+
+    def _coerce_float(val) -> float:
+        if hasattr(val, "value"):
+            val = val.value
+        try:
+            return float(val)
+        except Exception:
+            try:
+                return float(np.nanmedian(np.asarray(val)))
+            except Exception:
+                return float("nan")
+
+    def _collect_fwhm_from_catalog(cat_obj, fwhm_max, ecc_max=0.8):
+        fwhms = []
+        for source_props in cat_obj:
+            try:
+                ecc = getattr(source_props, "eccentricity", None)
+                if ecc is not None:
+                    ecc_val = _coerce_float(ecc)
+                    if np.isfinite(ecc_val) and ecc_val > ecc_max:
+                        continue
+                fwhm_val = getattr(source_props, "equivalent_fwhm", None)
+                if fwhm_val is None:
+                    continue
+                fwhm_val = _coerce_float(fwhm_val)
+                if np.isfinite(fwhm_val) and 0.8 < fwhm_val < fwhm_max:
+                    fwhms.append(fwhm_val)
+            except AttributeError:
+                continue
+            except Exception:
+                continue
+        return fwhms
+
+    def _estimate_fwhm_moment(data, threshold, est_fwhm):
+        if data is None:
+            return None
+        data_clean = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        data_pos = np.where(data_clean > 0, data_clean, 0.0)
+        if not np.any(np.isfinite(data_pos)):
+            return None
+        peak = float(np.nanmax(data_pos))
+        thresh_val = _coerce_float(threshold)
+        if not np.isfinite(peak) or peak <= max(thresh_val * 1.5, 1e-5):
+            return None
+        try:
+            y_peak, x_peak = np.unravel_index(np.nanargmax(data_pos), data_pos.shape)
+        except Exception:
+            return None
+        half = int(max(est_fwhm * 3.0, 8.0))
+        y0 = max(int(y_peak) - half, 0)
+        y1 = min(int(y_peak) + half + 1, data_pos.shape[0])
+        x0 = max(int(x_peak) - half, 0)
+        x1 = min(int(x_peak) + half + 1, data_pos.shape[1])
+        stamp = data_pos[y0:y1, x0:x1]
+        if stamp.size < 25:
+            return None
+        total = float(np.sum(stamp))
+        if not np.isfinite(total) or total <= 0:
+            return None
+        yy, xx = np.indices(stamp.shape)
+        cy = float(np.sum(yy * stamp) / total)
+        cx = float(np.sum(xx * stamp) / total)
+        var_y = float(np.sum(((yy - cy) ** 2) * stamp) / total)
+        var_x = float(np.sum(((xx - cx) ** 2) * stamp) / total)
+        if not (np.isfinite(var_y) and np.isfinite(var_x)):
+            return None
+        sigma = float(np.sqrt(0.5 * (var_x + var_y)))
+        if not np.isfinite(sigma) or sigma <= 0:
+            return None
+        fwhm_val = 2.3548 * sigma
+        max_allowed = max(est_fwhm * 4.0, 30.0)
+        if not np.isfinite(fwhm_val) or fwhm_val <= 0.5 or fwhm_val > max_allowed:
+            return None
+        return float(fwhm_val)
 
     if not image_list:
         _pcb("weight_fwhm_error_no_images", lvl="WARN")
@@ -2768,6 +3487,8 @@ def _calculate_image_weights_noise_fwhm(
                         0.587 * img_for_fwhm_calc[..., 1] + \
                         0.114 * img_for_fwhm_calc[..., 2]
             target_data_for_fwhm = luminance
+        elif img_for_fwhm_calc.ndim == 3 and img_for_fwhm_calc.shape[-1] == 1:
+            target_data_for_fwhm = img_for_fwhm_calc[..., 0]
         elif img_for_fwhm_calc.ndim == 2:
             target_data_for_fwhm = img_for_fwhm_calc
         else:
@@ -2779,121 +3500,264 @@ def _calculate_image_weights_noise_fwhm(
              continue
         
         try:
-            estimated_initial_fwhm = _estimate_initial_fwhm(target_data_for_fwhm, progress_callback)
-            _pcb(f"WeightFWHM: Image {i}, FWHM initiale estimée pour détection: {estimated_initial_fwhm:.2f} px", lvl="DEBUG_DETAIL")
-
-            box_size_bg = min(target_data_for_fwhm.shape[0] // 8, target_data_for_fwhm.shape[1] // 8, 50)
-            box_size_bg = max(box_size_bg, 16)
-            
-            sigma_clip_bg_obj = SigmaClip(sigma=3.0) # Renommé pour éviter conflit
-            bkg_estimator_obj = MedianBackground()   # Renommé pour éviter conflit
-            
             if not np.any(np.isfinite(target_data_for_fwhm)):
                 _pcb("weight_fwhm_no_finite_data", lvl="WARN", img_idx=i)
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-            
-            std_data_check = np.nanstd(target_data_for_fwhm)
-            if std_data_check < 1e-6 :
-                 _pcb("weight_fwhm_image_flat", lvl="DEBUG_DETAIL", img_idx=i, stddev=std_data_check)
-                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-            bkg_obj = None # Pour vérifier si bkg a été défini
-            try:
-                bkg_obj = Background2D(target_data_for_fwhm, (box_size_bg, box_size_bg), 
-                                   filter_size=(3, 3), sigma_clip=sigma_clip_bg_obj, bkg_estimator=bkg_estimator_obj)
-                data_subtracted = target_data_for_fwhm - bkg_obj.background
-                threshold_daofind_val = 5.0 * bkg_obj.background_rms 
-            except (ValueError, TypeError) as ve_bkg: 
-                _pcb("weight_fwhm_bkg2d_error", lvl="WARN", img_idx=i, error=str(ve_bkg))
-                _, median_glob, stddev_glob = sigma_clipped_stats_func(target_data_for_fwhm, sigma=3.0, maxiters=5)
-                if not (np.isfinite(median_glob) and np.isfinite(stddev_glob)):
+            finite_mask_full = np.isfinite(target_data_for_fwhm)
+            finite_coords = np.argwhere(finite_mask_full)
+            if finite_coords.size == 0:
+                _pcb("weight_fwhm_no_finite_data", lvl="WARN", img_idx=i)
+                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+
+            h_full, w_full = target_data_for_fwhm.shape
+            roi_margin = 8
+            y0 = max(int(finite_coords[:, 0].min()) - roi_margin, 0)
+            y1 = min(int(finite_coords[:, 0].max()) + roi_margin + 1, h_full)
+            x0 = max(int(finite_coords[:, 1].min()) - roi_margin, 0)
+            x1 = min(int(finite_coords[:, 1].max()) + roi_margin + 1, w_full)
+
+            roi = target_data_for_fwhm[y0:y1, x0:x1]
+            roi_finite = np.isfinite(roi)
+            finite_count = int(np.count_nonzero(roi_finite))
+            if finite_count == 0:
+                _pcb("weight_fwhm_no_finite_data", lvl="WARN", img_idx=i)
+                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+
+            finite_fraction = finite_count / float(roi.size)
+            use_background2d = not (roi.shape[0] < 64 or roi.shape[1] < 64 or finite_fraction < 0.10)
+
+            finite_vals = roi[roi_finite]
+            std_data_check = np.nanstd(finite_vals)
+            if std_data_check < 1e-6:
+                _pcb("weight_fwhm_image_flat", lvl="DEBUG_DETAIL", img_idx=i, stddev=std_data_check)
+                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+
+            median_fill = np.nanmedian(finite_vals)
+            if not np.isfinite(median_fill):
+                _pcb("weight_fwhm_global_stats_invalid", lvl="WARN", img_idx=i)
+                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+
+            roi_clean_for_est = np.array(roi, dtype=np.float32, copy=True)
+            roi_clean_for_est[~roi_finite] = median_fill
+
+            estimated_initial_fwhm = _estimate_initial_fwhm(roi_clean_for_est, progress_callback)
+            _pcb(f"WeightFWHM: Image {i}, FWHM initiale estimée pour détection: {estimated_initial_fwhm:.2f} px", lvl="DEBUG_DETAIL")
+
+            box_size_bg = min(roi.shape[0] // 8, roi.shape[1] // 8, 50)
+            box_size_bg = max(box_size_bg, 16)
+
+            sigma_clip_bg_obj = SigmaClip(sigma=3.0)
+            bkg_estimator_obj = MedianBackground()
+
+            data_subtracted = None
+            threshold_daofind_val = None
+            bkg_obj = None
+            if use_background2d:
+                try:
+                    bkg_obj = Background2D(
+                        roi, (box_size_bg, box_size_bg),
+                        filter_size=(3, 3),
+                        sigma_clip=sigma_clip_bg_obj,
+                        bkg_estimator=bkg_estimator_obj,
+                        exclude_percentile=90,
+                        mask=~roi_finite,
+                    )
+
+                    data_subtracted = roi - bkg_obj.background
+                    data_subtracted = np.nan_to_num(
+                        data_subtracted, nan=0.0, posinf=0.0, neginf=0.0
+                    ).astype(np.float32, copy=False)
+
+                    bkg_rms = bkg_obj.background_rms
+                    if np.ndim(bkg_rms) > 0:
+                        bkg_rms_scalar = np.nanmedian(bkg_rms)
+                        if not np.isfinite(bkg_rms_scalar):
+                            bkg_rms_scalar = np.nanmean(bkg_rms)
+                    else:
+                        bkg_rms_scalar = bkg_rms
+                    bkg_rms_scalar = _coerce_float(bkg_rms_scalar)
+                    threshold_daofind_val = 5.0 * bkg_rms_scalar
+                    if not np.isfinite(threshold_daofind_val) or threshold_daofind_val <= 0:
+                        data_subtracted = None
+                        threshold_daofind_val = None
+
+                except (ValueError, TypeError) as ve_bkg:
+                    _pcb("weight_fwhm_bkg2d_error", lvl="WARN", img_idx=i, error=str(ve_bkg))
+
+            if data_subtracted is None or threshold_daofind_val is None or not np.isfinite(threshold_daofind_val):
+                try:
+                    _, median_glob, stddev_glob = sigma_clipped_stats_func(
+                        finite_vals, sigma=3.0, maxiters=5
+                    )
+                except TypeError:
+                    roi_tmp = np.array(roi, dtype=np.float32, copy=True)
+                    roi_tmp[~roi_finite] = median_fill
+                    _, median_glob, stddev_glob = sigma_clipped_stats_func(
+                        roi_tmp, sigma=3.0, maxiters=5
+                    )
+
+                if not (np.isfinite(median_glob) and np.isfinite(stddev_glob) and stddev_glob > 0):
                     _pcb("weight_fwhm_global_stats_invalid", lvl="WARN", img_idx=i)
-                    fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-                data_subtracted = target_data_for_fwhm - median_glob
+                    fwhm_values_per_image.append(np.inf)
+                    valid_image_indices_fwhm.append(i)
+                    continue
+
+                roi_clean = np.array(roi, dtype=np.float32, copy=True)
+                roi_clean[~roi_finite] = median_glob
+                data_subtracted = roi_clean - median_glob
+                data_subtracted = np.nan_to_num(
+                    data_subtracted, nan=0.0, posinf=0.0, neginf=0.0
+                ).astype(np.float32, copy=False)
+
                 threshold_daofind_val = 5.0 * stddev_glob
 
-            # S'assurer que threshold_daofind_val est un scalaire positif
-            if hasattr(threshold_daofind_val, 'mean'): threshold_daofind_val = np.abs(np.mean(threshold_daofind_val))
-            else: threshold_daofind_val = np.abs(threshold_daofind_val)
-            if threshold_daofind_val < 1e-5 : threshold_daofind_val = 1e-5 # Minimum seuil
+            if np.ndim(threshold_daofind_val) > 0:
+                thresh_scalar = np.nanmedian(threshold_daofind_val)
+                if not np.isfinite(thresh_scalar):
+                    thresh_scalar = np.nanmean(threshold_daofind_val)
+                threshold_daofind_val = thresh_scalar
+
+            threshold_daofind_val = _coerce_float(threshold_daofind_val)
+            if not np.isfinite(threshold_daofind_val):
+                _pcb("weight_fwhm_global_stats_invalid", lvl="WARN", img_idx=i)
+                fwhm_values_per_image.append(np.inf)
+                valid_image_indices_fwhm.append(i)
+                continue
+
+            threshold_daofind_val = abs(threshold_daofind_val)
+            if threshold_daofind_val < 1e-5:
+                threshold_daofind_val = 1e-5
 
             sources_table = None
             try:
-                daofind_obj = DAOStarFinder(fwhm=estimated_initial_fwhm, threshold=threshold_daofind_val,
-                                        sharplo=0.2, sharphi=1.0, roundlo=-0.8, roundhi=0.8, sky=0.0)
-                sources_table = daofind_obj(data_subtracted)
-            except Exception as e_daofind:
-                 _pcb("weight_fwhm_daofind_error", lvl="WARN", img_idx=i, error=str(e_daofind))
-                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+                try:
+                    daofind_obj = DAOStarFinder(
+                        fwhm=estimated_initial_fwhm,
+                        threshold=threshold_daofind_val,
+                        sharplo=0.2, sharphi=1.0, roundlo=-0.8, roundhi=0.8,
+                        sky=0.0
+                    )
+                except TypeError as e:
+                    # Photutils 2.0+ : 'sky' removed
+                    # (Optionnel mais mieux : ne fallback que si l’erreur parle de 'sky')
+                    if "sky" not in str(e):
+                        raise
+                    daofind_obj = DAOStarFinder(
+                        fwhm=estimated_initial_fwhm,
+                        threshold=threshold_daofind_val,
+                        sharplo=0.2, sharphi=1.0, roundlo=-0.8, roundhi=0.8
+                    )
 
-            if sources_table is None or len(sources_table) < 5:
-                _pcb("weight_fwhm_not_enough_sources_daofind", lvl="DEBUG_DETAIL", img_idx=i, count=len(sources_table) if sources_table is not None else 0)
-                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+                sources_table = daofind_obj(data_subtracted)
+
+            except Exception as e_daofind:
+                _pcb("weight_fwhm_daofind_error", lvl="WARN", img_idx=i, error=str(e_daofind))
+                fwhm_values_per_image.append(np.inf)
+                valid_image_indices_fwhm.append(i)  # je laisse comme ton comportement actuel
+                continue
 
             # Utilisation de SourceCatalog pour les propriétés morphologiques
-            threshold_seg_val = 1.5 * (bkg_obj.background_rms if bkg_obj and hasattr(bkg_obj, 'background_rms') else np.nanstd(data_subtracted))
-            if hasattr(threshold_seg_val, 'mean'): threshold_seg_val = np.abs(np.mean(threshold_seg_val))
-            else: threshold_seg_val = np.abs(threshold_seg_val)
-            if threshold_seg_val < 1e-5 : threshold_seg_val = 1e-5
+            seg_rms = bkg_obj.background_rms if bkg_obj and hasattr(bkg_obj, "background_rms") else np.nanstd(data_subtracted)
+            if np.ndim(seg_rms) > 0:
+                seg_rms_scalar = np.nanmedian(seg_rms)
+                if not np.isfinite(seg_rms_scalar):
+                    seg_rms_scalar = np.nanmean(seg_rms)
+            else:
+                seg_rms_scalar = seg_rms
+            seg_rms_scalar = _coerce_float(seg_rms_scalar)
+            threshold_seg_val = 1.5 * seg_rms_scalar
+            if not np.isfinite(threshold_seg_val):
+                threshold_seg_val = _coerce_float(np.nanstd(data_subtracted))
+            threshold_seg_val = abs(threshold_seg_val)
+            if threshold_seg_val < 1e-5:
+                threshold_seg_val = 1e-5
 
             segm_map_cat = detect_sources(data_subtracted, threshold_seg_val, npixels=7) # npixels un peu plus grand
             if segm_map_cat is None:
+                segm_map_cat = detect_sources(data_subtracted, threshold_seg_val * 0.6, npixels=5)
+            if segm_map_cat is None:
                 _pcb("weight_fwhm_segmentation_cat_failed", lvl="DEBUG_DETAIL", img_idx=i)
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-            
-            # Filtrer les sources de DAOStarFinder avant de les passer à SourceCatalog
-            h_img_cat, w_img_cat = data_subtracted.shape
-            border_margin_cat = int(estimated_initial_fwhm * 2) # Marge basée sur FWHM
-            
-            # Assurer que les colonnes existent avant de filtrer
-            cols_to_check = ['xcentroid', 'ycentroid', 'flux', 'sharpness', 'roundness1', 'roundness2']
-            if not all(col in sources_table.colnames for col in cols_to_check):
-                _pcb("weight_fwhm_missing_daofind_cols", lvl="WARN", img_idx=i, missing_cols=[c for c in cols_to_check if c not in sources_table.colnames])
-                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-
-            valid_sources_mask_cat = (
-                (sources_table['xcentroid'] > border_margin_cat) &
-                (sources_table['xcentroid'] < w_img_cat - border_margin_cat) &
-                (sources_table['ycentroid'] > border_margin_cat) &
-                (sources_table['ycentroid'] < h_img_cat - border_margin_cat) &
-                (sources_table['sharpness'] > 0.3) & (sources_table['sharpness'] < 0.95) & # Sources nettes mais pas trop
-                (np.abs(sources_table['roundness1']) < 0.3) & (np.abs(sources_table['roundness2']) < 0.3) # Assez rondes
-            )
-            filtered_sources_table = sources_table[valid_sources_mask_cat]
-            
-            if not filtered_sources_table or len(filtered_sources_table) < 3:
-                _pcb("weight_fwhm_not_enough_sources_after_filter_dao", lvl="DEBUG_DETAIL", img_idx=i)
-                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-
-            # Trier par flux et prendre les N plus brillantes
-            filtered_sources_table.sort('flux', reverse=True)
-            top_sources_table = filtered_sources_table[:100] # Limiter aux 100 plus brillantes
-            
-            # Passer les positions des sources détectées par DAOStarFinder à SourceCatalog
+            fallback_fwhms = []
             try:
-                cat_obj = SourceCatalog(data_subtracted, segm_map_cat, sources=top_sources_table)
-            except Exception as e_scat: # SourceCatalog peut échouer si segm_map_cat est incompatible avec sources
-                 _pcb("weight_fwhm_sourcecatalog_init_error", lvl="WARN", img_idx=i, error=str(e_scat))
-                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-
-
-            if not cat_obj or len(cat_obj) == 0:
-                _pcb("weight_fwhm_no_sources_in_final_catalog", lvl="DEBUG_DETAIL", img_idx=i)
-                fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+                cat_full = SourceCatalog(data_subtracted, segm_map_cat)
+                fallback_fwhms = _collect_fwhm_from_catalog(
+                    cat_full, max(estimated_initial_fwhm * 3.0, 20.0), ecc_max=0.8
+                )
+            except Exception:
+                fallback_fwhms = []
+            if len(fallback_fwhms) < 1:
+                fallback_fwhms = []
 
             fwhms_this_image = []
-            for source_props in cat_obj:
-                try:
-                    # equivalent_fwhm est disponible et généralement fiable pour les sources bien segmentées.
-                    # On pourrait aussi utiliser (semimajor_axis_sigma + semiminor_axis_sigma) / 2 * gaussian_sigma_to_fwhm
-                    fwhm_val = source_props.equivalent_fwhm # C'est déjà une FWHM en pixels
-                    if fwhm_val is not None and np.isfinite(fwhm_val) and \
-                       0.8 < fwhm_val < (estimated_initial_fwhm * 2.5): # Doit être dans une plage raisonnable
-                        fwhms_this_image.append(fwhm_val)
-                except AttributeError: continue
-                except Exception: continue
-            
+            use_fallback = False
+
+            if sources_table is None or len(sources_table) < 5:
+                _pcb("weight_fwhm_not_enough_sources_daofind", lvl="DEBUG_DETAIL", img_idx=i, count=len(sources_table) if sources_table is not None else 0)
+                use_fallback = True
+            else:
+                # Filtrer les sources de DAOStarFinder avant de les passer à SourceCatalog
+                h_img_cat, w_img_cat = data_subtracted.shape
+                border_margin_cat = int(estimated_initial_fwhm * 2) # Marge basée sur FWHM
+
+                # Assurer que les colonnes existent avant de filtrer
+                cols_to_check = ['xcentroid', 'ycentroid', 'flux', 'sharpness', 'roundness1', 'roundness2']
+                if not all(col in sources_table.colnames for col in cols_to_check):
+                    _pcb("weight_fwhm_missing_daofind_cols", lvl="WARN", img_idx=i, missing_cols=[c for c in cols_to_check if c not in sources_table.colnames])
+                    use_fallback = True
+                else:
+                    valid_sources_mask_cat = (
+                        (sources_table['xcentroid'] > border_margin_cat) &
+                        (sources_table['xcentroid'] < w_img_cat - border_margin_cat) &
+                        (sources_table['ycentroid'] > border_margin_cat) &
+                        (sources_table['ycentroid'] < h_img_cat - border_margin_cat) &
+                        (sources_table['sharpness'] > 0.3) & (sources_table['sharpness'] < 0.95) & # Sources nettes mais pas trop
+                        (np.abs(sources_table['roundness1']) < 0.3) & (np.abs(sources_table['roundness2']) < 0.3) # Assez rondes
+                    )
+                    filtered_sources_table = sources_table[valid_sources_mask_cat]
+
+                    if not filtered_sources_table or len(filtered_sources_table) < 3:
+                        _pcb("weight_fwhm_not_enough_sources_after_filter_dao", lvl="DEBUG_DETAIL", img_idx=i)
+                        use_fallback = True
+                    else:
+                        # Trier par flux et prendre les N plus brillantes
+                        filtered_sources_table.sort('flux', reverse=True)
+                        top_sources_table = filtered_sources_table[:100] # Limiter aux 100 plus brillantes
+
+                        # Passer les positions des sources détectées par DAOStarFinder à SourceCatalog
+                        try:
+                            if SOURCECAT_SUPPORTS_SOURCES:
+                                cat_obj = SourceCatalog(data_subtracted, segm_map_cat, sources=top_sources_table)
+                            else:
+                                cat_obj = SourceCatalog(data_subtracted, segm_map_cat)
+                        except Exception as e_scat: # SourceCatalog peut échouer si segm_map_cat est incompatible avec sources
+                             _pcb("weight_fwhm_sourcecatalog_init_error", lvl="WARN", img_idx=i, error=str(e_scat))
+                             use_fallback = True
+                        else:
+                            if not cat_obj or len(cat_obj) == 0:
+                                _pcb("weight_fwhm_no_sources_in_final_catalog", lvl="DEBUG_DETAIL", img_idx=i)
+                                use_fallback = True
+                            else:
+                                fwhms_this_image = _collect_fwhm_from_catalog(
+                                    cat_obj, max(estimated_initial_fwhm * 2.5, 15.0), ecc_max=0.6
+                                )
+                                if not fwhms_this_image:
+                                    use_fallback = True
+
+            if use_fallback:
+                fwhms_this_image = fallback_fwhms
+
+            if not fwhms_this_image:
+                moment_fwhm = _estimate_fwhm_moment(
+                    data_subtracted,
+                    threshold_daofind_val,
+                    estimated_initial_fwhm,
+                )
+                if moment_fwhm is not None:
+                    fwhms_this_image = [moment_fwhm]
+
             if not fwhms_this_image:
                 _pcb("weight_fwhm_no_valid_fwhm_from_catalog_props", lvl="DEBUG_DETAIL", img_idx=i)
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
@@ -3037,7 +3901,7 @@ def _compute_quality_weights(
         base_weight = weights_source[idx] if idx < len(weights_source) else None
         if base_weight is None:
             continue
-        w = np.asarray(base_weight, dtype=np.float32, copy=False)
+        w = np.asarray(base_weight, dtype=np.float32)
         # Compactify weight to scalar or per-channel 3-vector
         if frame_arr.ndim == 3 and frame_arr.shape[-1] == 3:
             # Color: expect per-channel weight
@@ -3218,6 +4082,7 @@ def _reject_outliers_winsorized_sigma_clip(
     apply_rewinsor: bool = True,
     weights_chunk: Optional[np.ndarray] = None,
     streaming_state: Optional[WinsorStreamingState] = None,
+    wsc_impl: str | None = None,
 ) -> tuple[np.ndarray | WinsorStreamingState, Optional[np.ndarray]]:
     """
     Rejette les outliers en utilisant un Winsorized Sigma Clip.
@@ -3248,6 +4113,35 @@ def _reject_outliers_winsorized_sigma_clip(
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
+
+    effective_impl = wsc_impl or resolve_wsc_impl()
+    if effective_impl == WSC_IMPL_PIXINSIGHT:
+        output, _stats = wsc_pixinsight_core(
+            np,
+            stacked_array_NHDWC,
+            sigma_low=float(sigma_low),
+            sigma_high=float(sigma_high),
+            max_iters=_WSC_PIXINSIGHT_MAX_ITERS,
+            weights_block=weights_chunk,
+            return_stats=True,
+        )
+        output = np.asarray(output, dtype=np.float32)
+        if _stats:
+            _internal_logger.info(
+                "[WSC] impl=%s sigma_low=%.3f sigma_high=%.3f max_iters=%d iters_used=%d huber=%s clip_low=%.4g clip_high=%.4g",
+                WSC_IMPL_PIXINSIGHT,
+                float(sigma_low),
+                float(sigma_high),
+                int(_stats.get("max_iters", _WSC_PIXINSIGHT_MAX_ITERS)),
+                int(_stats.get("iters_used", 0)),
+                "on" if _stats.get("huber", False) else "off",
+                float(_stats.get("clip_low_frac", 0.0)),
+                float(_stats.get("clip_high_frac", 0.0)),
+            )
+        if streaming_state is not None:
+            _internal_logger.warning("PixInsight WSC does not support streaming; ignoring streaming_state.")
+            return streaming_state, None
+        return np.broadcast_to(output, stacked_array_NHDWC.shape), None
 
     if not (SCIPY_AVAILABLE and winsorize_func and SIGMA_CLIP_AVAILABLE and sigma_clipped_stats_func):
         missing_deps = []
@@ -3724,6 +4618,7 @@ def stack_aligned_images(
             sigma_clip_high,
             progress_callback,
             winsor_max_workers,
+            wsc_impl=resolve_wsc_impl(zconfig),
         )
     # ... (autres algos de rejet) ...
     _pcb(f"STACK_IMG_REJECT: Fin rejet. data_for_combine shape: {data_for_combine.shape}, range: [{np.nanmin(data_for_combine):.2g}-{np.nanmax(data_for_combine):.2g}] (contient NaN)", lvl="ERROR")
@@ -3954,6 +4849,7 @@ def _cpu_stack_winsorized_fallback(
     winsor_max_workers: int = 1,
     progress_callback=None,
     force_memmap: bool = False,
+    wsc_impl: str | None = None,
 ):
     """
     CPU fallback for winsorized sigma-clip stacking.
@@ -4055,6 +4951,7 @@ def _cpu_stack_winsorized_fallback(
             progress_callback=progress_callback,
             max_workers=winsor_max_workers,
             apply_rewinsor=apply_rewinsor,
+            wsc_impl=wsc_impl,
         )
 
         # Compute rejection percentage

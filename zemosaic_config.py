@@ -47,8 +47,11 @@ import json
 import os
 import platform
 import shutil
+import logging
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     from zemosaic_utils import ensure_user_config_dir, get_user_config_dir
@@ -100,6 +103,7 @@ DEFAULT_CONFIG = {
     "stacking_kappa_low": 3.0,
     "stacking_kappa_high": 3.0,
     "stacking_winsor_limits": "0.05,0.05",  # String, sera parsé
+    "wsc_impl": "pixinsight",
     "stacking_final_combine_method": "mean",
     "poststack_equalize_rgb": True,
     "final_mosaic_rgb_equalize_enabled": False,
@@ -169,6 +173,8 @@ DEFAULT_CONFIG = {
     "parallel_target_ram_fraction": 0.9,
     "parallel_gpu_vram_fraction": 0.8,
     "parallel_max_cpu_workers": 0,  # 0 → no explicit cap beyond detected logical cores
+    # Resume policy for classic legacy runs: "off", "auto", "force".
+    "resume": "off",
     # Cache retention policy for Phase 1 preprocessed .npy files.
     # Allowed values: "run_end", "per_tile", "keep".
     "cache_retention": "run_end",
@@ -230,7 +236,12 @@ DEFAULT_CONFIG = {
     "altaz_margin_percent": 5.0,  # UI: "AltAz margin %"
     "altaz_decay": 0.15,  # UI: "AltAz decay"
     "altaz_nanize": True,  # UI: "Alt-Az → NaN"
+    "altaz_alpha_soft_threshold": 0.001,
     "altaz_nanize_threshold": 0.001,
+    # --- Alt-Az coverage-based mask (Master Tiles) ---
+    "altaz_min_coverage_abs": 3.0,
+    "altaz_min_coverage_frac": 0.5,
+    "altaz_morph_open_px": 3,
     # --- Alt-Az Alpha export ---
     "altaz_export_alpha_fits": True,
     "altaz_export_alpha_sidecar": False,
@@ -500,6 +511,10 @@ def get_config_path():
 
 def load_config():
     config_path = Path(get_config_path())
+    try:
+        logger.info("Loading ZeMosaic config from %s", config_path)
+    except Exception:
+        pass
     current_config = DEFAULT_CONFIG.copy()
     if config_path.exists():
         try:
@@ -583,6 +598,15 @@ def save_config(config_data):
     config_path = Path(get_config_path())
     config_path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        existing_resume = None
+        if config_path.exists():
+            try:
+                with config_path.open("r", encoding="utf-8") as existing_handle:
+                    loaded_existing = json.load(existing_handle)
+                if isinstance(loaded_existing, dict):
+                    existing_resume = loaded_existing.get("resume")
+            except Exception:
+                existing_resume = None
         # Avant de sauvegarder, s'assurer que config_data ne contient que les clés attendues
         # pour éviter d'écrire des clés temporaires ou obsolètes.
         # On ne garde que les clés qui sont dans DEFAULT_CONFIG.
@@ -592,6 +616,15 @@ def save_config(config_data):
                 config_to_save[key] = config_data[key]
             # else: # Optionnel: si une clé par défaut manque dans config_data, la remettre
             #     config_to_save[key] = DEFAULT_CONFIG[key]
+
+        default_resume = DEFAULT_CONFIG.get("resume")
+        if existing_resume is not None and isinstance(config_data, dict):
+            resume_in_config = config_data.get("resume")
+            if (
+                "resume" not in config_data
+                or (resume_in_config == default_resume and existing_resume != default_resume)
+            ):
+                config_to_save["resume"] = existing_resume
 
 
         # Si config_to_save est vide (si config_data n'avait aucune clé de DEFAULT_CONFIG),

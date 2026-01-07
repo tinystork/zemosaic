@@ -49,6 +49,7 @@ from typing import List, Dict, Any, Optional, Callable, Sequence
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict
+import copy
 import os
 os.environ.setdefault("ZEMOSAIC_GUI_MODE", "1")
 import sys
@@ -146,6 +147,29 @@ def _detect_instrument_from_header(header: dict | None) -> str:
         # Fall back to the raw INSTRUME label for other devices
         return instrume_raw
     return "Unknown"
+
+
+def _classify_mount_mode_from_header(header: Any) -> str:
+    """Return a normalized mount mode string from a FITS-like header."""
+
+    if not header:
+        return "UNKNOWN"
+    try:
+        raw_value = header.get("EQMODE")  # type: ignore[attr-defined]
+    except Exception:
+        raw_value = None
+    try:
+        value_int = int(raw_value)
+    except Exception:
+        try:
+            value_int = int(float(str(raw_value).strip()))
+        except Exception:
+            return "UNKNOWN"
+    if value_int == 1:
+        return "EQ"
+    if value_int == 0:
+        return "ALT_AZ"
+    return f"EQMODE_{value_int}"
 
 
 def _group_center_deg(group: list[dict]) -> Optional[tuple[float, float]]:
@@ -344,6 +368,55 @@ def _circular_dispersion_deg(values: Iterable[float]) -> float:
     return dispersion
 
 
+def _split_group_by_mount_mode(group: list[dict]) -> list[list[dict]]:
+    """Split ``group`` into EQ / ALT_AZ buckets; UNKNOWN follows the majority."""
+
+    if not group:
+        return [group]
+
+    def _normalize_mode(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return "UNKNOWN"
+
+    modes = [_normalize_mode(entry.get("MOUNT_MODE", "UNKNOWN")) for entry in group]
+
+    def _is_eq(mode: str) -> bool:
+        return mode == "EQ" or mode == "EQMODE_1"
+
+    def _is_altaz(mode: str) -> bool:
+        return mode == "ALT_AZ"
+
+    eq_count = sum(1 for mode in modes if _is_eq(mode))
+    altaz_count = sum(1 for mode in modes if _is_altaz(mode))
+
+    if eq_count == 0 and altaz_count == 0:
+        return [group]
+    if eq_count == 0 or altaz_count == 0:
+        return [group]
+
+    majority = "EQ" if eq_count >= altaz_count else "ALT_AZ"
+    eq_entries: list[dict] = []
+    altaz_entries: list[dict] = []
+    for entry, mode in zip(group, modes):
+        target = None
+        if _is_eq(mode):
+            target = "EQ"
+        elif _is_altaz(mode):
+            target = "ALT_AZ"
+        else:
+            target = majority
+        if target == "EQ":
+            eq_entries.append(entry)
+        elif target == "ALT_AZ":
+            altaz_entries.append(entry)
+
+    return [eq_entries, altaz_entries]
+
+
 def _split_group_by_orientation(group: list[dict], threshold_deg: float) -> list[list[dict]]:
     """Split ``group`` using circular proximity of ``PA_DEG`` values."""
 
@@ -427,6 +500,123 @@ def _format_sizes_histogram(sizes: list[int], max_buckets: int = 6) -> str:
     head = ", ".join(f"{size}×{count}" for size, count in pairs[:max_buckets])
     tail = len(pairs) - max_buckets
     return head + (f", +{tail} more" if tail > 0 else "")
+
+
+def _apply_borrowing_per_mount_mode(
+    final_groups: list[list[dict]],
+    logger: logging.Logger,
+) -> tuple[list[list[dict]], dict[str, Any]]:
+    """Apply borrowing separately per mount mode to avoid EQ/ALT_AZ mixing."""
+
+    groups = final_groups or []
+    if not isinstance(groups, list):
+        groups = []
+
+    groups = list(groups)
+
+    if len(groups) < 2:
+        return apply_borrowing_v1(groups, None, logger=logger)
+
+    def _normalize_mode(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return "UNKNOWN"
+
+    def _group_mode(group: list[dict]) -> str:
+        eq_count = 0
+        altaz_count = 0
+        for entry in group or []:
+            try:
+                mode_raw = entry.get("MOUNT_MODE", "UNKNOWN")
+            except Exception:
+                mode_raw = "UNKNOWN"
+            mode_norm = _normalize_mode(mode_raw)
+            if mode_norm == "EQ" or mode_norm == "EQMODE_1":
+                eq_count += 1
+            elif mode_norm == "ALT_AZ":
+                altaz_count += 1
+        if eq_count == 0 and altaz_count == 0:
+            return "UNKNOWN"
+        if eq_count > 0 and altaz_count == 0:
+            return "EQ"
+        if altaz_count > 0 and eq_count == 0:
+            return "ALT_AZ"
+        return "EQ" if eq_count >= altaz_count else "ALT_AZ"
+
+    modes_by_group = [_group_mode(group) for group in groups]
+    has_eq_mode = any(mode == "EQ" for mode in modes_by_group)
+    has_altaz_mode = any(mode == "ALT_AZ" for mode in modes_by_group)
+    if not (has_eq_mode and has_altaz_mode):
+        return apply_borrowing_v1(groups, None, logger=logger)
+
+    buckets: dict[str, list[list[dict]]] = {
+        "EQ": [],
+        "ALT_AZ": [],
+        "UNKNOWN": [],
+    }
+    for group, mode in zip(groups, modes_by_group):
+        if mode == "EQ":
+            buckets["EQ"].append(group)
+        elif mode == "ALT_AZ":
+            buckets["ALT_AZ"].append(group)
+        else:
+            buckets["UNKNOWN"].append(group)
+
+    def _merge_stats(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        if not incoming:
+            return base
+        if not base:
+            return copy.deepcopy(incoming)
+        for key, value in incoming.items():
+            if key not in base:
+                base[key] = copy.deepcopy(value)
+                continue
+            existing = base.get(key)
+            if key == "executed":
+                base[key] = bool(existing) or bool(value)
+            elif isinstance(existing, (int, float)) and isinstance(value, (int, float)):
+                base[key] = existing + value
+            elif isinstance(existing, list) and isinstance(value, list):
+                base[key].extend(value)
+            else:
+                base[key] = value
+        return base
+
+    aggregated_stats: dict[str, Any] = {}
+    combined_groups: list[list[dict]] = []
+    for label in ("EQ", "ALT_AZ", "UNKNOWN"):
+        bucket_groups = buckets.get(label) or []
+        if not bucket_groups:
+            continue
+        bucket_result, bucket_stats = apply_borrowing_v1(bucket_groups, None, logger=logger)
+        combined_groups.extend(bucket_result or [])
+        aggregated_stats = _merge_stats(aggregated_stats, bucket_stats or {})
+
+    if "executed" in aggregated_stats:
+        aggregated_stats["executed"] = bool(aggregated_stats.get("executed"))
+
+    mixed_groups = 0
+    for group in combined_groups:
+        has_eq = False
+        has_altaz = False
+        for entry in group or []:
+            mode_value = _normalize_mode(entry.get("MOUNT_MODE", "UNKNOWN"))
+            if mode_value == "EQ" or mode_value == "EQMODE_1":
+                has_eq = True
+            elif mode_value == "ALT_AZ":
+                has_altaz = True
+        if has_eq and has_altaz:
+            mixed_groups += 1
+    if mixed_groups > 0:
+        logger.warning(
+            "Mount-mode guard violation: %d group(s) contain EQ and ALT_AZ after borrowing.",
+            mixed_groups,
+        )
+
+    return combined_groups, aggregated_stats
 
 
 def _compute_dynamic_footprint_budget(
@@ -5807,6 +5997,9 @@ def launch_filter_interface(
                             entry["path_raw"] = item.src.get("path_raw")
                         if "header" not in entry:
                             entry["header"] = item.header
+                        if "MOUNT_MODE" not in entry:
+                            hdr = entry.get("header") or item.header
+                            entry["MOUNT_MODE"] = _classify_mount_mode_from_header(hdr)
                         if item.shape and "shape" not in entry:
                             entry["shape"] = item.shape
                         center_obj = item.center or item.phase0_center
@@ -5997,6 +6190,29 @@ def launch_filter_interface(
                                     groups_used = groups_relaxed
                                     threshold_used = threshold_relaxed
 
+                    groups_mode_guarded: list[list[dict]] = []
+                    mode_splits = 0
+                    for grp in groups_used:
+                        subgroups = _split_group_by_mount_mode(grp)
+                        if len(subgroups) > 1:
+                            mode_splits += 1
+                        groups_mode_guarded.extend(subgroups)
+                    if mode_splits > 0:
+                        mode_msg = _tr_safe(
+                            "filter_log_mount_mode_split",
+                            "Mount-mode guard: split {N} group(s) by EQMODE / MOUNT_MODE.",
+                            N=int(mode_splits),
+                        )
+                        _log_async(mode_msg, "INFO")
+                        try:
+                            logger.info(
+                                "Mount-mode guard: split %d group(s) by EQMODE / MOUNT_MODE.",
+                                mode_splits,
+                            )
+                        except Exception:
+                            pass
+                    groups_used = groups_mode_guarded
+
                     angle_split_effective = float(orientation_threshold if orientation_threshold > 0 else 0.0)
                     if manual_angle_mode:
                         angle_split_effective = angle_split_candidate
@@ -6091,9 +6307,8 @@ def launch_filter_interface(
                                 info.pop("wcs", None)
 
                     if coverage_enabled and final_groups:
-                        final_groups, _borrow_stats = apply_borrowing_v1(
+                        final_groups, _borrow_stats = _apply_borrowing_per_mount_mode(
                             final_groups,
-                            None,
                             logger=logger,
                         )
 

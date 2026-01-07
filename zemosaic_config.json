@@ -148,11 +148,15 @@
     "altaz_margin_percent": 5.0,
     "altaz_decay": 0.15,
     "altaz_nanize": true,
+    "altaz_min_coverage_abs": 1.0,
+    "altaz_min_coverage_frac": 0.25,
+    "altaz_morph_open_px": 3,
     "altaz_export_alpha_fits": true,
     "altaz_export_alpha_sidecar": false,
     "altaz_alpha_sidecar_format": "png",
     "quality_crop_min_run": 2,
     "crop_follow_signal": true,
     "stack_use_gpu": true,
-    "use_gpu_stack": true
+    "use_gpu_stack": true,
+    "resume": "auto"
 }

@@ -62,6 +62,7 @@ import csv
 import threading
 import time
 import json
+import copy
 from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -510,6 +511,78 @@ class _FallbackWCS:
         return self._center
 
 
+def _classify_mount_mode_from_header(header: Any) -> str:
+    """Return 'EQ', 'ALT_AZ', 'EQMODE_<N>', or 'UNKNOWN' from header['EQMODE']."""  # noqa: E501
+
+    if not header:
+        return "UNKNOWN"
+    try:
+        raw_value = header.get("EQMODE")  # type: ignore[attr-defined]
+    except Exception:
+        raw_value = None
+    try:
+        value_int = int(raw_value)
+    except Exception:
+        try:
+            value_int = int(float(str(raw_value).strip()))
+        except Exception:
+            return "UNKNOWN"
+    if value_int == 1:
+        return "EQ"
+    if value_int == 0:
+        return "ALT_AZ"
+    return f"EQMODE_{value_int}"
+
+
+def _split_group_by_mount_mode(group: list[dict]) -> list[list[dict]]:
+    """Split group into EQ / ALT_AZ buckets; UNKNOWN entries follow the majority."""
+
+    if not group:
+        return [group]
+
+    def _normalize_mode(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return "UNKNOWN"
+
+    modes = [_normalize_mode(entry.get("MOUNT_MODE", "UNKNOWN")) for entry in group]
+
+    def _is_eq(mode: str) -> bool:
+        return mode == "EQ" or mode == "EQMODE_1"
+
+    def _is_altaz(mode: str) -> bool:
+        return mode == "ALT_AZ"
+
+    eq_count = sum(1 for mode in modes if _is_eq(mode))
+    altaz_count = sum(1 for mode in modes if _is_altaz(mode))
+
+    if eq_count == 0 and altaz_count == 0:
+        return [group]
+    if eq_count == 0 or altaz_count == 0:
+        return [group]
+
+    majority = "EQ" if eq_count >= altaz_count else "ALT_AZ"
+    eq_entries: list[dict] = []
+    altaz_entries: list[dict] = []
+    for entry, mode in zip(group, modes):
+        target = None
+        if _is_eq(mode):
+            target = "EQ"
+        elif _is_altaz(mode):
+            target = "ALT_AZ"
+        else:
+            target = majority
+        if target == "EQ":
+            eq_entries.append(entry)
+        elif target == "ALT_AZ":
+            altaz_entries.append(entry)
+
+    return [eq_entries, altaz_entries]
+
+
 ANGLE_SPLIT_DEFAULT_DEG = 5.0
 AUTO_ANGLE_DETECT_DEFAULT_DEG = 10.0
 
@@ -526,6 +599,142 @@ def _sanitize_angle_value(value: Any, default: float) -> float:
     if val > 180.0:
         return 180.0
     return val
+
+
+def _apply_borrowing_per_mount_mode(
+    final_groups: list[list[dict]],
+    logger: logging.Logger,
+) -> tuple[list[list[dict]], dict[str, Any]]:
+    """Apply borrowing per mount-mode bucket to avoid EQ/ALT_AZ mixing."""
+
+    groups = final_groups or []
+    if not isinstance(groups, list):
+        groups = []
+    groups = list(groups)
+
+    def _empty_stats() -> dict[str, Any]:
+        return {
+            "executed": False,
+            "borrowed_total_assignments": 0,
+            "borrowed_unique_images": 0,
+            "borrow_attempts_total": 0,
+            "borrow_success_total": 0,
+            "border_candidate_images_total": 0,
+            "per_group": [],
+            "examples": [],
+            "valid_image_centers": 0,
+            "valid_group_centers": 0,
+        }
+
+    borrow_func = apply_borrowing_v1
+    if borrow_func is None:
+        return groups, _empty_stats()
+
+    if len(groups) < 2:
+        return borrow_func(groups, None, logger=logger)
+
+    def _normalize_mode(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return "UNKNOWN"
+
+    def _group_mode(group: list[dict]) -> str:
+        eq_count = 0
+        altaz_count = 0
+        for entry in group or []:
+            try:
+                mode_raw = entry.get("MOUNT_MODE", "UNKNOWN")
+            except Exception:
+                mode_raw = "UNKNOWN"
+            mode_norm = _normalize_mode(mode_raw)
+            if mode_norm == "EQ" or mode_norm == "EQMODE_1":
+                eq_count += 1
+            elif mode_norm == "ALT_AZ":
+                altaz_count += 1
+        if eq_count == 0 and altaz_count == 0:
+            return "UNKNOWN"
+        if eq_count > 0 and altaz_count == 0:
+            return "EQ"
+        if altaz_count > 0 and eq_count == 0:
+            return "ALT_AZ"
+        return "EQ" if eq_count >= altaz_count else "ALT_AZ"
+
+    modes_by_group = [_group_mode(group) for group in groups]
+    has_eq_mode = any(mode == "EQ" for mode in modes_by_group)
+    has_altaz_mode = any(mode == "ALT_AZ" for mode in modes_by_group)
+    if not (has_eq_mode and has_altaz_mode):
+        return borrow_func(groups, None, logger=logger)
+
+    buckets: dict[str, list[list[dict]]] = {
+        "EQ": [],
+        "ALT_AZ": [],
+        "UNKNOWN": [],
+    }
+    for group, mode in zip(groups, modes_by_group):
+        if mode == "EQ":
+            buckets["EQ"].append(group)
+        elif mode == "ALT_AZ":
+            buckets["ALT_AZ"].append(group)
+        else:
+            buckets["UNKNOWN"].append(group)
+
+    def _merge_stats(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        if not incoming:
+            return base
+        if not base:
+            return copy.deepcopy(incoming)
+        for key, value in incoming.items():
+            if key not in base:
+                base[key] = copy.deepcopy(value)
+                continue
+            existing = base.get(key)
+            if key == "executed":
+                base[key] = bool(existing) or bool(value)
+            elif isinstance(existing, (int, float)) and isinstance(value, (int, float)):
+                base[key] = existing + value
+            elif isinstance(existing, list) and isinstance(value, list):
+                base[key].extend(value)
+            else:
+                base[key] = value
+        return base
+
+    aggregated_stats: dict[str, Any] = {}
+    combined_groups: list[list[dict]] = []
+    for label in ("EQ", "ALT_AZ", "UNKNOWN"):
+        bucket_groups = buckets.get(label) or []
+        if not bucket_groups:
+            continue
+        bucket_result, bucket_stats = borrow_func(bucket_groups, None, logger=logger)
+        combined_groups.extend(bucket_result or [])
+        aggregated_stats = _merge_stats(aggregated_stats, bucket_stats or {})
+
+    if "executed" in aggregated_stats:
+        aggregated_stats["executed"] = bool(aggregated_stats.get("executed"))
+    else:
+        aggregated_stats["executed"] = False
+
+    mixed_groups = 0
+    for group in combined_groups:
+        has_eq = False
+        has_altaz = False
+        for entry in group or []:
+            mode_value = _normalize_mode(entry.get("MOUNT_MODE", "UNKNOWN"))
+            if mode_value == "EQ" or mode_value == "EQMODE_1":
+                has_eq = True
+            elif mode_value == "ALT_AZ":
+                has_altaz = True
+        if has_eq and has_altaz:
+            mixed_groups += 1
+    if mixed_groups > 0:
+        logger.warning(
+            "Mount-mode guard violation: %d group(s) contain EQ and ALT_AZ after borrowing.",
+            mixed_groups,
+        )
+
+    return combined_groups, aggregated_stats
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_config import DEFAULT_CONFIG as _DEFAULT_GUI_CONFIG  # type: ignore
@@ -690,6 +899,7 @@ def _sanitize_footprint_radec(payload: Any) -> List[Tuple[float, float]] | None:
 _HEADER_CACHE_KEYS: tuple[str, ...] = (
     "NAXIS1",
     "NAXIS2",
+    "EQMODE",
     "CRVAL1",
     "CRVAL2",
     "CRPIX1",
@@ -1859,6 +2069,8 @@ class FilterQtDialog(QDialog):
         self._auto_group_started_at: float | None = None
         self._auto_group_elapsed_timer: QTimer | None = None
         self._header_cache: dict[str, Any] = {}
+        self._last_eqmode_summary: dict[str, Any] | None = None
+        self._last_auto_group_result: dict[str, Any] | None = None
         self._global_wcs_state: dict[str, Any] = {
             "descriptor": None,
             "meta": None,
@@ -2808,20 +3020,26 @@ class FilterQtDialog(QDialog):
             value_int = int(raw_value)
         except Exception:
             try:
-                value_int = int(str(raw_value).strip())
+                value_int = int(float(str(raw_value).strip()))
             except Exception:
                 value_int = None
         if value_int == 1:
             return "EQ", 1
         if value_int == 0:
-            return "ALTZ", 0
+            return "ALT_AZ", 0
+        if value_int is not None:
+            return f"EQMODE_{value_int}", value_int
         return None, None
 
     def _extract_eqmode_from_entry(self, entry: dict[str, Any]) -> str | None:
         if not isinstance(entry, dict):
             return None
+        existing_mount = entry.get("MOUNT_MODE")
+        if isinstance(existing_mount, str):
+            return existing_mount
         cached = entry.get("_eqmode_mode")
         if isinstance(cached, str):
+            entry.setdefault("MOUNT_MODE", cached)
             return cached
         raw_value = entry.get("EQMODE")
         header = entry.get("header") or entry.get("header_subset")
@@ -2842,9 +3060,14 @@ class FilterQtDialog(QDialog):
                 except Exception:
                     raw_value = None
         mode, _value_int = self._coerce_eqmode_mode(raw_value)
+        mount_mode = mode
+        if (not mount_mode or mount_mode == "UNKNOWN") and header is not None:
+            mount_mode = _classify_mount_mode_from_header(header)
+        if isinstance(mount_mode, str) and mount_mode:
+            entry["MOUNT_MODE"] = mount_mode
         if mode:
             entry["_eqmode_mode"] = mode
-        return mode
+        return entry.get("MOUNT_MODE")
 
     def _split_group_by_eqmode(
         self,
@@ -2853,26 +3076,27 @@ class FilterQtDialog(QDialog):
     ) -> list[list[dict[str, Any]]]:
         if not group:
             return [group]
-        eq_bucket: list[dict[str, Any]] = []
-        altz_bucket: list[dict[str, Any]] = []
-        unknown_bucket: list[dict[str, Any]] = []
+        eq_count = 0
+        altaz_count = 0
+        unknown_count = 0
         for entry in group:
             mode = self._extract_eqmode_from_entry(entry)
-            if mode == "EQ":
-                eq_bucket.append(entry)
-            elif mode == "ALTZ":
-                altz_bucket.append(entry)
+            if mode == "EQ" or mode == "EQMODE_1":
+                eq_count += 1
+            elif mode == "ALT_AZ":
+                altaz_count += 1
             else:
-                unknown_bucket.append(entry)
-        if eq_bucket and altz_bucket:
+                unknown_count += 1
+        subgroups = _split_group_by_mount_mode(group)
+        if len(subgroups) > 1:
             message = (
-                "eqmode_split: group mixed (EQ=%d ALTZ=%d UNKNOWN=%d) -> split"
-                % (len(eq_bucket), len(altz_bucket), len(unknown_bucket))
+                "eqmode_split: group mixed (EQ=%d ALT_AZ=%d UNKNOWN=%d) -> split"
+                % (eq_count, altaz_count, unknown_count)
             )
             logger.info(message)
             if log_fn is not None:
                 log_fn(message)
-            return [bucket for bucket in (eq_bucket, altz_bucket, unknown_bucket) if bucket]
+            return subgroups
         return [group]
 
     def _group_eqmode_signature(self, group: Sequence[dict[str, Any]]) -> str:
@@ -2880,25 +3104,25 @@ class FilterQtDialog(QDialog):
         has_altz = False
         for entry in group or []:
             mode = self._extract_eqmode_from_entry(entry)
-            if mode == "EQ":
+            if mode == "EQ" or mode == "EQMODE_1":
                 has_eq = True
-            elif mode == "ALTZ":
+            elif mode == "ALT_AZ":
                 has_altz = True
         if has_eq and has_altz:
             return "MIXED"
         if has_eq:
             return "EQ"
         if has_altz:
-            return "ALTZ"
+            return "ALT_AZ"
         return "UNKNOWN"
 
     def _prefetch_eqmode_for_candidates(
         self,
         candidate_infos: Sequence[dict[str, Any]],
         messages: list[str | tuple[str, str]],
-    ) -> None:
+    ) -> dict[str, Any] | None:
         if not candidate_infos:
-            return
+            return None
 
         start_time = time.perf_counter()
 
@@ -2925,10 +3149,22 @@ class FilterQtDialog(QDialog):
         def _prime_entry_mode(entry_obj: dict[str, Any]) -> bool:
             cached_mode = entry_obj.get("_eqmode_mode")
             if isinstance(cached_mode, str):
+                entry_obj.setdefault("MOUNT_MODE", cached_mode)
                 return True
+            existing_mount = entry_obj.get("MOUNT_MODE")
+            if isinstance(existing_mount, str):
+                mount_norm = existing_mount.strip().upper()
+                if mount_norm and mount_norm != "UNKNOWN":
+                    if mount_norm == "EQMODE_1":
+                        entry_obj.setdefault("_eqmode_mode", "EQ")
+                    elif mount_norm in ("EQ", "ALT_AZ"):
+                        entry_obj.setdefault("_eqmode_mode", mount_norm)
+                    entry_obj["MOUNT_MODE"] = mount_norm
+                    return True
             mode_from_value, _mode_int = self._coerce_eqmode_mode(entry_obj.get("EQMODE"))
             if mode_from_value:
                 entry_obj["_eqmode_mode"] = mode_from_value
+                entry_obj.setdefault("MOUNT_MODE", mode_from_value)
                 return True
             header_obj = entry_obj.get("header_subset") or entry_obj.get("header")
             if header_obj is not None:
@@ -2939,6 +3175,11 @@ class FilterQtDialog(QDialog):
                 mode_from_header, _ = self._coerce_eqmode_mode(header_value)
                 if mode_from_header:
                     entry_obj["_eqmode_mode"] = mode_from_header
+                    entry_obj.setdefault("MOUNT_MODE", mode_from_header)
+                    return True
+                mount_mode_header = _classify_mount_mode_from_header(header_obj)
+                if mount_mode_header and mount_mode_header != "UNKNOWN":
+                    entry_obj["MOUNT_MODE"] = mount_mode_header
                     return True
             return False
 
@@ -3019,13 +3260,14 @@ class FilterQtDialog(QDialog):
                     if eq_int == 1:
                         mode_from_cache = "EQ"
                     elif eq_int == 0:
-                        mode_from_cache = "ALTZ"
+                        mode_from_cache = "ALT_AZ"
                 else:
                     cache_valid = False
             if cache_valid:
                 cache_hits += 1
                 if mode_from_cache:
                     entry["_eqmode_mode"] = mode_from_cache
+                    entry.setdefault("MOUNT_MODE", mode_from_cache)
                 continue
             cache_miss += 1
             if cache_entry and cache_path:
@@ -3062,6 +3304,7 @@ class FilterQtDialog(QDialog):
                         mode_int = None
                     if mode_value:
                         payload["entry"]["_eqmode_mode"] = mode_value
+                        payload["entry"].setdefault("MOUNT_MODE", mode_value)
                     if (payload["size"] is None or payload["mtime"] is None) and payload["path"]:
                         payload["size"], payload["mtime"] = _stat_file(payload["path"])
                     if cache_path and payload["size"] is not None and payload["mtime"] is not None:
@@ -3083,28 +3326,42 @@ class FilterQtDialog(QDialog):
                 pass
 
         eq_count = 0
-        altz_count = 0
+        altaz_count = 0
         unknown_count = 0
         for entry in candidate_infos:
             if not isinstance(entry, dict):
                 continue
-            mode = entry.get("_eqmode_mode")
-            if mode == "EQ":
+            mode = entry.get("MOUNT_MODE") or entry.get("_eqmode_mode")
+            if mode == "EQ" or mode == "EQMODE_1":
                 eq_count += 1
-            elif mode == "ALTZ":
-                altz_count += 1
+            elif mode == "ALT_AZ":
+                altaz_count += 1
             else:
                 unknown_count += 1
+
+        total_count = eq_count + altaz_count + unknown_count
+        eqmode_summary = {
+            "eq_count": int(eq_count),
+            "altaz_count": int(altaz_count),
+            "unknown_count": int(unknown_count),
+            "total": int(total_count),
+            "cache_hits": int(cache_hits),
+            "cache_miss": int(cache_miss),
+            "reads_header": int(reads_header),
+            "source": "qt_prefetch_eqmode",
+        }
+        self._last_eqmode_summary = eqmode_summary
 
         duration = time.perf_counter() - start_time
         cache_label = cache_path or "none"
         summary = (
-            "eqmode_summary: EQ=%d ALTZ=%d UNKNOWN=%d "
-            "(cache_hit=%d cache_miss=%d read=%d workers=%d dt=%.2fs) cache=%s"
+            "FILTER_EQMODE_SUMMARY: eq=%d altaz=%d unknown=%d total=%d "
+            "(cache_hit=%d cache_miss=%d read=%d workers=%d dt=%.2fs cache=%s)"
             % (
                 eq_count,
-                altz_count,
+                altaz_count,
                 unknown_count,
+                total_count,
                 cache_hits,
                 cache_miss,
                 reads_header,
@@ -3116,6 +3373,7 @@ class FilterQtDialog(QDialog):
         logger.info(summary)
         if isinstance(messages, list):
             messages.append(summary)
+        return eqmode_summary
 
     def _read_eqmode_from_path(self, path: str) -> tuple[str | None, int | None]:
         if not path or fits is None:
@@ -3217,6 +3475,7 @@ class FilterQtDialog(QDialog):
                         "WARN",
                     )
                 )
+        eqmode_summary: dict[str, Any] | None = None
         t_start = time.perf_counter()
         candidate_infos: list[dict[str, Any]] = []
         coord_samples: list[tuple[float, float]] = []
@@ -3237,7 +3496,7 @@ class FilterQtDialog(QDialog):
             raise RuntimeError("Astropy is required to compute WCS-based clusters.")
 
         t_start = time.perf_counter()
-        self._prefetch_eqmode_for_candidates(candidate_infos, messages)
+        eqmode_summary = self._prefetch_eqmode_for_candidates(candidate_infos, messages)
         timings["prefetch_eqmode"] = time.perf_counter() - t_start
 
         threshold_override = self._resolve_cluster_threshold_override()
@@ -3276,9 +3535,7 @@ class FilterQtDialog(QDialog):
             raise RuntimeError("Worker clustering returned no groups.")
 
         threshold_used = float(threshold_initial)
-        groups_used: list[list[dict[str, Any]]] = []
-        for group in groups_initial:
-            groups_used.extend(self._split_group_by_eqmode(group, log_fn=messages.append))
+        groups_used: list[list[dict[str, Any]]] = list(groups_initial)
         candidate_count = len(candidate_infos)
         ratio = (len(groups_initial) / float(candidate_count)) if candidate_count else 0.0
         pathological = candidate_count > 0 and (
@@ -3314,7 +3571,7 @@ class FilterQtDialog(QDialog):
                         orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
                     )
                     timings["clustering"] += time.perf_counter() - t_start
-                    if relaxed_groups and len(relaxed_groups) < len(groups_used):
+                    if relaxed_groups and len(relaxed_groups) < len(groups_initial):
                         messages.append(
                             self._format_message(
                                 "log_covfirst_relax",
@@ -3325,6 +3582,30 @@ class FilterQtDialog(QDialog):
                         )
                         groups_used = relaxed_groups
                         threshold_used = threshold_relaxed
+
+        mode_splits = 0
+        mode_guarded: list[list[dict[str, Any]]] = []
+        for group in groups_used:
+            subgroups = _split_group_by_mount_mode(group)
+            if len(subgroups) > 1:
+                mode_splits += 1
+            mode_guarded.extend(subgroups)
+        if mode_splits > 0:
+            msg_text = self._format_message(
+                "filter_log_mount_mode_split",
+                "Mount-mode guard: split {N} group(s) by EQMODE / MOUNT_MODE.",
+                N=int(mode_splits),
+            )
+            messages.append(msg_text)
+            try:
+                self._async_log_signal.emit(msg_text, "INFO")
+            except Exception:
+                pass
+            logger.info(
+                "Mount-mode guard: split %d group(s) by EQMODE / MOUNT_MODE.",
+                mode_splits,
+            )
+        groups_used = mode_guarded
 
         angle_split_effective = float(orientation_threshold if orientation_threshold > 0 else 0.0)
         if manual_angle_mode:
@@ -3476,15 +3757,14 @@ class FilterQtDialog(QDialog):
                     info.pop("wcs", None)
         
         t_start_borrow = time.perf_counter()
-        if coverage_enabled and apply_borrowing_v1 is not None:
+        if coverage_enabled:
             try:
                 self._auto_group_stage_signal.emit("Borrowing v1…")
                 self._async_log_signal.emit("Stage: borrowing coverage batches", "INFO")
             except Exception:
                 pass
-            final_groups, _borrow_stats = apply_borrowing_v1(
+            final_groups, _borrow_stats = _apply_borrowing_per_mount_mode(
                 final_groups,
-                None,
                 logger=logger,
             )
             borrowed_unique = 0
@@ -3513,6 +3793,8 @@ class FilterQtDialog(QDialog):
             "threshold_used": threshold_used,
             "angle_split": angle_split_effective,
         }
+        if isinstance(eqmode_summary, dict):
+            result["eqmode_summary"] = eqmode_summary
         result["timings"] = timings
         return result
 
@@ -3905,6 +4187,10 @@ class FilterQtDialog(QDialog):
         return split_groups, split_count
 
     def _apply_auto_group_result(self, payload: dict[str, Any]) -> None:
+        self._last_auto_group_result = payload if isinstance(payload, dict) else None
+        eqmode_summary_payload = payload.get("eqmode_summary") if isinstance(payload, dict) else None
+        if isinstance(eqmode_summary_payload, dict):
+            self._last_eqmode_summary = eqmode_summary_payload
         groups = payload.get("final_groups") or []
         if not isinstance(groups, list):
             groups = []
@@ -4022,6 +4308,8 @@ class FilterQtDialog(QDialog):
             header = self._load_header(path)
             if header is not None:
                 payload["header"] = header
+        if "MOUNT_MODE" not in payload:
+            payload["MOUNT_MODE"] = _classify_mount_mode_from_header(header)
         wcs_obj = payload.get("wcs")
         if wcs_obj is None:
             wcs_cache = getattr(entry, "wcs_cache", None)
@@ -8029,6 +8317,22 @@ class FilterQtDialog(QDialog):
 
         metadata_update = self._build_metadata_overrides(overrides)
 
+        eqmode_summary: dict[str, Any] | None = None
+        if isinstance(self._last_auto_group_result, dict):
+            eqmode_summary = self._last_auto_group_result.get("eqmode_summary")
+        if not isinstance(eqmode_summary, dict):
+            eqmode_summary = self._last_eqmode_summary
+        if not isinstance(eqmode_summary, dict):
+            eqmode_summary = None
+        if eqmode_summary:
+            self._last_eqmode_summary = eqmode_summary
+            metadata_update["eqmode_summary"] = eqmode_summary
+            plan_override_payload = metadata_update.get("global_wcs_plan_override")
+            if not isinstance(plan_override_payload, dict):
+                plan_override_payload = {}
+            plan_override_payload["eqmode_summary"] = eqmode_summary
+            metadata_update["global_wcs_plan_override"] = plan_override_payload
+
         sds_flag = bool(metadata_update.get("sds_mode"))
         mode_value = str(metadata_update.get("mode") or "").strip().lower()
         require_global_plan = sds_flag or mode_value == "seestar"
@@ -8040,6 +8344,9 @@ class FilterQtDialog(QDialog):
             success, meta_payload, path_payload = self._ensure_global_wcs_for_selection(True, None)
 
         if success and meta_payload and path_payload:
+            if eqmode_summary:
+                meta_payload = dict(meta_payload)
+                meta_payload["eqmode_summary"] = eqmode_summary
             overrides["global_wcs_meta"] = meta_payload
             overrides["global_wcs_path"] = meta_payload.get("fits_path") or path_payload.get("fits_path")
             overrides["global_wcs_json"] = meta_payload.get("json_path") or path_payload.get("json_path")

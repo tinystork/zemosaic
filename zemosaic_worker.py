@@ -68,6 +68,7 @@ import threading
 import itertools
 import platform
 import importlib.util
+import sys
 from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass, replace
@@ -138,6 +139,92 @@ from zemosaic_gpu_safety import (
     probe_gpu_runtime_context,
 )
 
+# Phase 5 GPU runtime state helpers (used by tests and optional GPU orchestration).
+# The first element returned by `phase5_gpu_runtime_state()` is a "GPU disabled" flag
+# to prevent repeated GPU attempts after a runtime failure.
+_PHASE5_GPU_RUNTIME_STATE: dict[str, Any] = {
+    "disabled": False,
+    "reason": None,
+    "exception": None,
+    "ctx": None,
+}
+
+
+def reset_phase5_gpu_runtime_state() -> None:
+    """Reset cached Phase 5 GPU runtime state."""
+
+    try:
+        _PHASE5_GPU_RUNTIME_STATE.clear()
+        _PHASE5_GPU_RUNTIME_STATE.update(
+            {"disabled": False, "reason": None, "exception": None, "ctx": None}
+        )
+    except Exception:
+        pass
+
+
+def phase5_gpu_runtime_state() -> tuple[bool, Any | None, GpuRuntimeContext | None]:
+    """Return (gpu_disabled, reason/exception, gpu_ctx) for Phase 5 orchestration."""
+
+    try:
+        disabled = bool(_PHASE5_GPU_RUNTIME_STATE.get("disabled", False))
+    except Exception:
+        disabled = False
+    try:
+        reason = _PHASE5_GPU_RUNTIME_STATE.get("reason", None)
+    except Exception:
+        reason = None
+    if reason is None:
+        try:
+            reason = _PHASE5_GPU_RUNTIME_STATE.get("exception", None)
+        except Exception:
+            reason = None
+    try:
+        ctx = _PHASE5_GPU_RUNTIME_STATE.get("ctx", None)
+    except Exception:
+        ctx = None
+    return disabled, reason, ctx
+
+
+def _disable_phase5_gpu_runtime_state(reason: str, exc: Exception | None = None) -> None:
+    try:
+        _PHASE5_GPU_RUNTIME_STATE["disabled"] = True
+        _PHASE5_GPU_RUNTIME_STATE["reason"] = str(reason)
+        _PHASE5_GPU_RUNTIME_STATE["exception"] = exc
+    except Exception:
+        pass
+
+
+def should_use_gpu_for_reproject(tag: str, config: Any, parallel_plan: Any | None = None) -> bool:
+    """Return True if Phase 5 should attempt the GPU path for reprojection."""
+
+    disabled, _, _ = phase5_gpu_runtime_state()
+    if disabled:
+        return False
+
+    use_gpu_cfg = False
+    try:
+        if isinstance(config, dict):
+            use_gpu_cfg = bool(config.get("use_gpu_phase5"))
+        else:
+            use_gpu_cfg = bool(getattr(config, "use_gpu_phase5", False))
+    except Exception:
+        use_gpu_cfg = False
+    if not use_gpu_cfg:
+        return False
+
+    if parallel_plan is not None:
+        try:
+            plan_flag = getattr(parallel_plan, "use_gpu", None)
+        except Exception:
+            plan_flag = parallel_plan.get("use_gpu") if isinstance(parallel_plan, dict) else None
+        if plan_flag is not None and not bool(plan_flag):
+            return False
+
+    try:
+        return bool(gpu_is_available())
+    except Exception:
+        return False
+
 # ZeQualityMT (quality gate for Master Tiles)
 try:
     from zequalityMT import quality_metrics as _zq_quality_metrics
@@ -182,6 +269,8 @@ _UNALIGNED_LOCK = Lock()
 
 ALPHA_OPACITY_THRESHOLD = 0.5  # Mask values >= threshold are treated as opaque
 QUALITY_GATE_ALPHA_SOFT_THRESHOLD = 0.85  # Partially transparent pixels are ignored during quality gate
+EMPTY_MASTER_TILE_EPS_SIGNAL = 1e-8
+EMPTY_MASTER_TILE_ALPHA_FRAC_THRESHOLD = 0.99
 
 GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
 GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
@@ -662,7 +751,13 @@ def _combine_alpha_masks(primary: np.ndarray | None, secondary: np.ndarray | Non
 
 
 def _apply_lecropper_pipeline(
-    arr: np.ndarray | None, cfg: dict | None
+    arr: np.ndarray | None,
+    cfg: dict | None,
+    *,
+    coverage: np.ndarray | None = None,
+    altaz_min_coverage_abs: float | None = None,
+    altaz_min_coverage_frac: float | None = None,
+    altaz_morph_open_px: int | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Apply quality crop + Alt-Az cleanup if the new lecropper is available.
 
@@ -747,6 +842,14 @@ def _apply_lecropper_pipeline(
             mask_helper = getattr(lecropper, "mask_altaz_artifacts", None)
             base_for_mask = out
             if callable(mask_helper):
+                cov_kwargs = {}
+                if coverage is not None:
+                    cov_kwargs = {
+                        "coverage": coverage,
+                        "min_coverage_abs": altaz_min_coverage_abs,
+                        "min_coverage_frac": altaz_min_coverage_frac,
+                        "morph_open_px": altaz_morph_open_px,
+                    }
                 try:
                     masked, mask2d = mask_helper(
                         base_for_mask,
@@ -754,15 +857,26 @@ def _apply_lecropper_pipeline(
                         decay_ratio=az_decay,
                         fill_value=None,
                         return_mask=True,
+                        **cov_kwargs,
                     )
                 except TypeError:
-                    masked = mask_helper(
-                        base_for_mask,
-                        margin_percent=az_margin,
-                        decay_ratio=az_decay,
-                        fill_value=None,
-                    )
-                    mask2d = None
+                    # Compat: some versions don't support coverage kwargs and/or return_mask.
+                    try:
+                        masked, mask2d = mask_helper(
+                            base_for_mask,
+                            margin_percent=az_margin,
+                            decay_ratio=az_decay,
+                            fill_value=None,
+                            return_mask=True,
+                        )
+                    except TypeError:
+                        masked = mask_helper(
+                            base_for_mask,
+                            margin_percent=az_margin,
+                            decay_ratio=az_decay,
+                            fill_value=None,
+                        )
+                        mask2d = None
                 # IMPORTANT:
                 # Do NOT replace `out` with `masked` here. `masked` is already base_for_mask * mask2d,
                 # and we also propagate mask2d downstream as alpha/weights. Using `masked` would
@@ -786,12 +900,24 @@ def _apply_lecropper_pipeline(
                     out = cleaned
                     altaz_masked_used = out is not None
             elif hasattr(lecropper, "apply_altaz_cleanup"):
-                cleaned = lecropper.apply_altaz_cleanup(
-                    base_for_mask,
-                    margin_percent=az_margin,
-                    decay=az_decay,
-                    nanize=az_nanize,
-                )
+                try:
+                    cleaned = lecropper.apply_altaz_cleanup(
+                        base_for_mask,
+                        margin_percent=az_margin,
+                        decay=az_decay,
+                        nanize=az_nanize,
+                        coverage=coverage,
+                        min_coverage_abs=altaz_min_coverage_abs,
+                        min_coverage_frac=altaz_min_coverage_frac,
+                        morph_open_px=altaz_morph_open_px,
+                    )
+                except TypeError:
+                    cleaned = lecropper.apply_altaz_cleanup(
+                        base_for_mask,
+                        margin_percent=az_margin,
+                        decay=az_decay,
+                        nanize=az_nanize,
+                    )
                 if isinstance(cleaned, (tuple, list)) and len(cleaned) >= 2:
                     candidate, mask2d = cleaned[:2]
                     if candidate is not None:
@@ -807,7 +933,7 @@ def _apply_lecropper_pipeline(
                     logger.info("lecropper: altaz_nanize_threshold=%.3f", az_nanize_threshold)
                 except Exception:
                     pass
-                alpha_mask_norm = np.asarray(mask2d, dtype=np.float32, copy=False)
+                alpha_mask_norm = np.asarray(mask2d, dtype=np.float32)
                 mask_zero = alpha_mask_norm <= az_nanize_threshold
                 # Always apply nanize/zeroize on the unattenuated base_for_mask,
                 # not on `out` (which could have been attenuated elsewhere).
@@ -819,6 +945,24 @@ def _apply_lecropper_pipeline(
                 else:
                     out = np.where(mask_zero, 0.0, target_for_mask)
                 altaz_mask2d_used = True
+                try:
+                    nz_frac = float(np.count_nonzero(alpha_mask_norm) / alpha_mask_norm.size) if alpha_mask_norm.size else 0.0
+                    alpha_min_val = float(np.nanmin(alpha_mask_norm)) if alpha_mask_norm.size else 0.0
+                    alpha_max_val = float(np.nanmax(alpha_mask_norm)) if alpha_mask_norm.size else 0.0
+                    logger.info(
+                        "ALPHA_STATS: level=master_tile nonzero_frac=%.3f min=%.3f max=%.3f shape=%s",
+                        nz_frac,
+                        alpha_min_val,
+                        alpha_max_val,
+                        getattr(alpha_mask_norm, "shape", None),
+                    )
+                    if az_enabled and nz_frac < 0.01:
+                        logger.warning(
+                            "ALPHA_STATS: alpha mask nearly empty after altaz cleanup (nonzero_frac=%.4f)",
+                            nz_frac,
+                        )
+                except Exception:
+                    pass
             try:
                 logger.info(
                     "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s threshold=%g",
@@ -968,7 +1112,7 @@ def _compute_coverage_stats(
     if coverage_array is None:
         return None
     try:
-        arr = np.asarray(coverage_array, dtype=np.float32, copy=False)
+        arr = np.asarray(coverage_array, dtype=np.float32)
     except Exception:
         return None
     if arr.ndim != 2:
@@ -1085,8 +1229,8 @@ def _nanize_by_coverage(
     if final_hwc is None or coverage_hw is None:
         return final_hwc
     try:
-        mosaic = np.asarray(final_hwc, dtype=np.float32, copy=False)
-        coverage = np.asarray(coverage_hw, dtype=np.float32, copy=False)
+        mosaic = np.asarray(final_hwc, dtype=np.float32)
+        coverage = np.asarray(coverage_hw, dtype=np.float32)
     except Exception:
         return final_hwc
     if mosaic.ndim < 2 or coverage.shape[:2] != mosaic.shape[:2]:
@@ -1094,7 +1238,7 @@ def _nanize_by_coverage(
     invalid = coverage <= 0
     if alpha_u8 is not None:
         try:
-            alpha_arr = np.asarray(alpha_u8, copy=False)
+            alpha_arr = np.asarray(alpha_u8)
             if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
                 alpha_arr = alpha_arr[..., 0]
             alpha_arr = np.squeeze(alpha_arr)
@@ -1107,7 +1251,7 @@ def _nanize_by_coverage(
         mosaic = np.where(invalid_mask, np.nan, mosaic)
     except Exception:
         return mosaic
-    return np.asarray(mosaic, dtype=np.float32, copy=False)
+    return np.asarray(mosaic, dtype=np.float32)
 
 
 def _auto_crop_global_mosaic_if_requested(
@@ -1298,7 +1442,7 @@ def _prepare_tiles_for_two_pass(
                 tw_val = 1.0
             tile_weights.append(tw_val)
             if cov is not None:
-                cov_np = np.asarray(cov, dtype=np.float32, copy=False)
+                cov_np = np.asarray(cov, dtype=np.float32)
                 if cov_np.ndim > 2:
                     cov_np = np.squeeze(cov_np)
                 coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
@@ -1341,7 +1485,7 @@ def _prepare_tiles_for_two_pass(
             if cov is None:
                 coverage_list.append(None)
             else:
-                cov_np = np.asarray(cov, dtype=np.float32, copy=False)
+                cov_np = np.asarray(cov, dtype=np.float32)
                 if cov_np.ndim > 2:
                     cov_np = np.squeeze(cov_np)
                 coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
@@ -2017,10 +2161,10 @@ def _apply_two_pass_coverage_renorm_if_requested(
                         gain_clip_tuple[1],
                     )
             else:
-                base_data = np.asarray(base_data, dtype=np.float32, copy=False)
-                base_cov = np.asarray(base_cov, dtype=np.float32, copy=False)
-                mosaic2 = np.asarray(mosaic2, dtype=np.float32, copy=False)
-                coverage2 = np.asarray(coverage2, dtype=np.float32, copy=False)
+                base_data = np.asarray(base_data, dtype=np.float32)
+                base_cov = np.asarray(base_cov, dtype=np.float32)
+                mosaic2 = np.asarray(mosaic2, dtype=np.float32)
+                coverage2 = np.asarray(coverage2, dtype=np.float32)
 
                 if (
                     base_data.shape[:2] != mosaic2.shape[:2]
@@ -2421,6 +2565,204 @@ def _equalize_rgb_black_level_hwc(
         return out, info
 
     return rgb_hwc, info
+
+
+def _phase5_safe_mode_env_enabled() -> bool:
+    try:
+        raw = str(os.getenv("ZEMOSAIC_GPU_SAFE_MODE") or "").strip().lower()
+    except Exception:
+        return False
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _compute_phase5_vram_budget_bytes(
+    gpu_safety_ctx_phase5: Any,
+    worker_config_cache: dict | None,
+    phase5_safe_mode_env: bool,
+    *,
+    vram_free_bytes_override: int | None = None,
+    phase5_chunk_cap_bytes: int | None = None,
+) -> tuple[int, dict]:
+    cfg = worker_config_cache or {}
+
+    def _coerce_int(value: Any, default: int) -> int:
+        try:
+            if value is None or isinstance(value, bool):
+                return default
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            text = str(value).strip()
+            if not text:
+                return default
+            return int(float(text))
+        except Exception:
+            return default
+
+    def _coerce_float(value: Any, default: float) -> float:
+        try:
+            if value is None or isinstance(value, bool):
+                return default
+            if isinstance(value, (int, float)):
+                return float(value)
+            text = str(value).strip()
+            if not text:
+                return default
+            return float(text)
+        except Exception:
+            return default
+
+    def _clamp_fraction(value: Any, default: float) -> float:
+        frac = _coerce_float(value, default)
+        if not math.isfinite(frac):
+            frac = default
+        return max(0.05, min(0.90, float(frac)))
+
+    def _coerce_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        try:
+            return bool(value)
+        except Exception:
+            return default
+
+    reserve_mb = _coerce_int(cfg.get("phase5_vram_reserve_mb"), 1024)
+    reserve_mb = max(0, reserve_mb)
+    frac_battery = _clamp_fraction(cfg.get("phase5_vram_frac_battery"), 0.25)
+    frac_hybrid = _clamp_fraction(cfg.get("phase5_vram_frac_hybrid_ac"), 0.60)
+    frac_ac = _clamp_fraction(cfg.get("phase5_vram_frac_ac"), 0.80)
+    hard_cap_mb = _coerce_int(cfg.get("phase5_vram_hard_cap_mb"), 0)
+    hard_cap_bytes = hard_cap_mb * 1024 * 1024 if hard_cap_mb > 0 else None
+
+    # UI chunk setting acts as a hard cap even in AUTO mode (see GUI: Phase 5 chunk (MB)).
+    ui_chunk_mb = _coerce_int(cfg.get("phase5_chunk_mb"), 0)
+    ui_chunk_mb = max(0, min(16384, ui_chunk_mb))
+    ui_cap_bytes = ui_chunk_mb * 1024 * 1024 if ui_chunk_mb > 0 else None
+
+    power_plugged = False
+    on_battery = True
+    is_hybrid = False
+    if gpu_safety_ctx_phase5 is not None:
+        power_plugged = _coerce_bool(
+            getattr(gpu_safety_ctx_phase5, "power_plugged", None), False
+        )
+        on_battery = _coerce_bool(getattr(gpu_safety_ctx_phase5, "on_battery", None), True)
+        is_hybrid = bool(
+            getattr(
+                gpu_safety_ctx_phase5,
+                "is_hybrid_graphics",
+                getattr(gpu_safety_ctx_phase5, "is_hybrid", False),
+            )
+        )
+
+    if on_battery or phase5_safe_mode_env:
+        fraction = frac_battery
+    elif power_plugged:
+        fraction = frac_hybrid if is_hybrid else frac_ac
+    else:
+        fraction = frac_battery
+
+    vram_free_bytes = vram_free_bytes_override
+    if vram_free_bytes is None and gpu_safety_ctx_phase5 is not None:
+        vram_free_bytes = getattr(gpu_safety_ctx_phase5, "vram_free_bytes", None)
+    try:
+        if vram_free_bytes is not None:
+            vram_free_bytes = int(vram_free_bytes)
+    except Exception:
+        vram_free_bytes = None
+    if vram_free_bytes is not None and vram_free_bytes <= 0:
+        vram_free_bytes = None
+
+    min_chunk_bytes = 128 * 1024 * 1024
+    reserve_bytes = reserve_mb * 1024 * 1024
+    usable_bytes = None
+    budget_bytes = 0
+    fallback_mb = None
+    reasons = []
+
+    if vram_free_bytes is not None:
+        usable_bytes = max(min_chunk_bytes, vram_free_bytes - reserve_bytes)
+        budget_bytes = int(usable_bytes * float(fraction))
+        if budget_bytes <= 0:
+            budget_bytes = min_chunk_bytes
+        budget_bytes = min(int(usable_bytes), int(budget_bytes))
+    else:
+        reasons.append("probe_unknown")
+        if on_battery or phase5_safe_mode_env:
+            fallback_mb = 128
+        elif power_plugged and not on_battery and not is_hybrid:
+            fallback_mb = 1024
+        else:
+            fallback_mb = 512
+        budget_bytes = int(fallback_mb) * 1024 * 1024
+        fallback_chunk_mb = _coerce_int(cfg.get("phase5_chunk_mb"), 0)
+        if fallback_chunk_mb > 0:
+            fallback_chunk_bytes = int(fallback_chunk_mb) * 1024 * 1024
+            if budget_bytes > fallback_chunk_bytes:
+                budget_bytes = fallback_chunk_bytes
+                reasons.append("user_chunk_cap")
+
+    cap_bytes = None
+    try:
+        if phase5_chunk_cap_bytes is not None:
+            cap_bytes = int(phase5_chunk_cap_bytes)
+    except Exception:
+        cap_bytes = None
+    if cap_bytes is not None and cap_bytes <= 0:
+        cap_bytes = None
+
+    def _apply_cap(value: int, cap: int | None, reason: str) -> int:
+        if cap is None or cap <= 0:
+            return value
+        if value > cap:
+            reasons.append(reason)
+            return cap
+        return value
+
+    budget_bytes = max(0, int(budget_bytes))
+    budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    budget_bytes = _apply_cap(budget_bytes, ui_cap_bytes, "ui_chunk_cap")
+    budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
+    if budget_bytes > 0 and budget_bytes < min_chunk_bytes:
+        budget_bytes = min_chunk_bytes
+        reasons.append("min_clamp")
+    budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    budget_bytes = _apply_cap(budget_bytes, ui_cap_bytes, "ui_chunk_cap")
+    budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
+    if usable_bytes is not None:
+        budget_bytes = _apply_cap(budget_bytes, int(usable_bytes), "usable_cap")
+
+    if reasons:
+        reasons = list(dict.fromkeys(reasons))
+
+    vram_free_mb = (
+        float(vram_free_bytes) / (1024.0 ** 2) if vram_free_bytes is not None else None
+    )
+    usable_mb = float(usable_bytes) / (1024.0 ** 2) if usable_bytes is not None else None
+    budget_mb = float(budget_bytes) / (1024.0 ** 2) if budget_bytes else 0.0
+    cap_mb = float(cap_bytes) / (1024.0 ** 2) if cap_bytes else None
+
+    meta = {
+        "vram_free_bytes": vram_free_bytes,
+        "vram_free_mb": vram_free_mb,
+        "reserve_mb": reserve_mb,
+        "fraction": fraction,
+        "budget_bytes": budget_bytes,
+        "budget_mb": budget_mb,
+        "hard_cap_mb": float(hard_cap_mb) if hard_cap_bytes else None,
+        "phase5_chunk_cap_mb": cap_mb,
+        "ui_chunk_cap_mb": float(ui_chunk_mb) if ui_cap_bytes else None,
+        "power_plugged": power_plugged,
+        "on_battery": on_battery,
+        "is_hybrid_graphics": is_hybrid,
+        "safe_mode_env": bool(phase5_safe_mode_env),
+        "usable_mb": usable_mb,
+        "fallback_mb": fallback_mb,
+        "reasons": reasons,
+    }
+
+    return int(budget_bytes), meta
 
 
 def _maybe_bump_phase5_gpu_rows_per_chunk(
@@ -2960,7 +3302,7 @@ def _finalize_sds_global_mosaic(
     if coverage_arr is not None:
         coverage_arr = np.where(np.isfinite(coverage_arr), coverage_arr, 0.0).astype(np.float32, copy=False)
     if mosaic_arr is not None and coverage_arr is not None:
-        mosaic_arr = np.asarray(mosaic_arr, dtype=np.float32, copy=False)
+        mosaic_arr = np.asarray(mosaic_arr, dtype=np.float32)
         mosaic_arr[~np.isfinite(mosaic_arr)] = np.nan
         nanized_mask = coverage_arr <= 0
         if final_alpha_u8 is not None and final_alpha_u8.shape[:2] == coverage_arr.shape:
@@ -3181,6 +3523,152 @@ def _ensure_hwc_master_tile(
     return np.asarray(arr, dtype=np.float32, order="C")
 
 
+def _header_flag_is_set(header: Any | None, key: str) -> bool:
+    """Return True when *key* exists in *header* with a truthy value."""
+
+    if header is None:
+        return False
+    try:
+        value = header.get(key)
+    except Exception:
+        try:
+            value = header[key]
+        except Exception:
+            return False
+    flag = _coerce_bool_flag(value)
+    if flag is None:
+        return False
+    return bool(flag)
+
+
+def _is_master_tile_header(header: Any | None) -> bool:
+    """Return True when *header* identifies a Master Tile."""
+
+    if header is None:
+        return False
+    try:
+        zmt_type = header.get("ZMT_TYPE")
+    except Exception:
+        zmt_type = None
+    if zmt_type is not None:
+        try:
+            if str(zmt_type).strip().lower() == "master tile":
+                return True
+        except Exception:
+            pass
+    try:
+        if "ZMT_ID" in header:
+            return True
+    except Exception:
+        try:
+            return header.get("ZMT_ID") is not None
+        except Exception:
+            return False
+    return False
+
+
+def _detect_empty_master_tile(
+    rgb_hwc: np.ndarray | None,
+    alpha_u8: np.ndarray | None = None,
+    *,
+    sum_weights: np.ndarray | None = None,
+    eps_signal: float = EMPTY_MASTER_TILE_EPS_SIGNAL,
+    min_valid_frac: float = 0.0,
+    std_min: float | None = None,
+) -> tuple[bool, dict[str, float]]:
+    """Return (is_empty, stats) for a master tile based on actual signal."""
+
+    stats = {
+        "max_abs": 0.0,
+        "std": 0.0,
+        "valid_frac": 0.0,
+        "eps_signal": float(eps_signal),
+        "alpha_frac": float("nan"),
+    }
+    if rgb_hwc is None:
+        return True, stats
+    try:
+        arr = np.asarray(rgb_hwc, dtype=np.float32)
+    except Exception:
+        return True, stats
+    if arr.size == 0:
+        return True, stats
+
+    arr_hwc = arr
+    if arr.ndim == 2:
+        arr_hwc = arr[..., np.newaxis]
+    elif arr.ndim == 3:
+        if arr.shape[-1] in (1, 3):
+            pass
+        elif arr.shape[0] in (1, 3):
+            arr_hwc = np.moveaxis(arr, 0, -1)
+
+    max_abs = float(np.nanmax(np.abs(arr_hwc))) if arr_hwc.size else 0.0
+    if not math.isfinite(max_abs):
+        max_abs = 0.0 if math.isnan(max_abs) else max_abs
+    std_val = float(np.nanstd(arr_hwc)) if arr_hwc.size else 0.0
+    if not math.isfinite(std_val):
+        std_val = 0.0 if math.isnan(std_val) else std_val
+    stats["max_abs"] = max_abs
+    stats["std"] = std_val
+
+    valid_mask = None
+    used_weight_mask = False
+    if sum_weights is not None:
+        try:
+            weight_arr = np.asarray(sum_weights)
+            if weight_arr.ndim == 2 and weight_arr.shape == arr_hwc.shape[:2]:
+                valid_mask = weight_arr > 0
+                used_weight_mask = True
+        except Exception:
+            valid_mask = None
+            used_weight_mask = False
+
+    if valid_mask is None:
+        try:
+            signal = np.nansum(np.abs(arr_hwc), axis=-1)
+            valid_mask = np.isfinite(signal) & (signal > eps_signal)
+        except Exception:
+            valid_mask = None
+
+    if valid_mask is not None and valid_mask.size:
+        valid_frac = float(np.count_nonzero(valid_mask)) / float(valid_mask.size)
+    else:
+        valid_frac = 0.0
+    stats["valid_frac"] = valid_frac
+
+    if alpha_u8 is not None:
+        try:
+            alpha_arr = np.asarray(alpha_u8)
+            alpha_arr = np.squeeze(alpha_arr)
+            if alpha_arr.ndim == 3 and alpha_arr.shape[0] == 1:
+                alpha_arr = alpha_arr[0]
+            if alpha_arr.ndim == 2:
+                stats["alpha_frac"] = float(np.mean(alpha_arr > 0)) if alpha_arr.size else 0.0
+        except Exception:
+            stats["alpha_frac"] = float("nan")
+
+    if std_min is None:
+        std_min = eps_signal
+
+    is_empty = False
+    if used_weight_mask:
+        min_frac = 0.0 if min_valid_frac is None else float(min_valid_frac)
+        if valid_frac <= min_frac:
+            is_empty = True
+    else:
+        if max_abs <= eps_signal:
+            is_empty = True
+        else:
+            near_zero = math.isfinite(max_abs) and max_abs <= (eps_signal * 10.0)
+            if near_zero and std_min is not None and std_val <= std_min:
+                is_empty = True
+            elif near_zero and min_valid_frac is not None and valid_frac <= min_valid_frac:
+                is_empty = True
+
+    return is_empty, stats
+
+
 def load_image_with_optional_alpha(
     path: str,
     *,
@@ -3191,8 +3679,14 @@ def load_image_with_optional_alpha(
     if not (ASTROPY_AVAILABLE and fits):
         raise RuntimeError("Astropy FITS support unavailable while loading image")
 
+    header = None
     with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
-        primary = hdul[0].data
+        primary_hdu = hdul[0]
+        primary = primary_hdu.data
+        try:
+            header = primary_hdu.header.copy()
+        except Exception:
+            header = None
         alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
         alpha = None
         if alpha_hdu is not None and alpha_hdu.data is not None:
@@ -3203,7 +3697,16 @@ def load_image_with_optional_alpha(
 
     label = tile_label or _path_display_name(path)
     data = _ensure_hwc_master_tile(primary, label)
-    data = np.asarray(data, dtype=np.float32, order="C", copy=False)
+    data = np.asarray(data, dtype=np.float32, order="C")
+    is_master_tile = _is_master_tile_header(header)
+    empty_flag = _header_flag_is_set(header, "ZMT_EMPT")
+
+    def _force_empty_master_tile(data_hwc: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        shape_hw = data_hwc.shape[:2]
+        empty_data = np.full_like(data_hwc, np.nan, dtype=np.float32)
+        empty_alpha = np.zeros(shape_hw, dtype=np.uint8)
+        empty_weights = np.zeros(shape_hw, dtype=np.float32)
+        return empty_data, empty_weights, empty_alpha
 
     weights: np.ndarray | None = None
     if alpha is not None:
@@ -3240,7 +3743,32 @@ def load_image_with_optional_alpha(
                     data = np.where(invalid_mask, np.nan, data)
                 else:
                     data = np.where(invalid_mask[..., None], np.nan, data)
-    data = np.asarray(data, dtype=np.float32, order="C", copy=False)
+    data = np.asarray(data, dtype=np.float32, order="C")
+
+    if is_master_tile and empty_flag:
+        return _force_empty_master_tile(data)
+
+    if is_master_tile and alpha is not None and alpha.shape == data.shape[:2]:
+        alpha_frac = None
+        try:
+            if alpha.dtype.kind in {"i", "u"}:
+                threshold_u8 = int(ALPHA_OPACITY_THRESHOLD * 255)
+                alpha_frac = float(np.mean(alpha > threshold_u8)) if alpha.size else 0.0
+            else:
+                alpha_frac = float(np.mean(alpha > ALPHA_OPACITY_THRESHOLD)) if alpha.size else 0.0
+        except Exception:
+            alpha_frac = None
+        if alpha_frac is not None and alpha_frac >= EMPTY_MASTER_TILE_ALPHA_FRAC_THRESHOLD:
+            _, empty_stats = _detect_empty_master_tile(
+                data,
+                alpha,
+                eps_signal=EMPTY_MASTER_TILE_EPS_SIGNAL,
+            )
+            max_abs = float(empty_stats.get("max_abs", 0.0) or 0.0)
+            std_val = float(empty_stats.get("std", 0.0) or 0.0)
+            near_zero = max_abs <= (EMPTY_MASTER_TILE_EPS_SIGNAL * 10.0)
+            if max_abs <= EMPTY_MASTER_TILE_EPS_SIGNAL or (std_val <= EMPTY_MASTER_TILE_EPS_SIGNAL and near_zero):
+                return _force_empty_master_tile(data)
 
     return data, weights, alpha
 
@@ -4837,7 +5365,7 @@ def _run_phase4_5_inter_master_merge(
                         continue
                     try:
                         arr, _, _ = load_image_with_optional_alpha(path, tile_label=_safe_basename(path))
-                        arr = np.asarray(arr, dtype=np.float32, copy=False)
+                        arr = np.asarray(arr, dtype=np.float32)
                         sources.append(_TileAffineSource(path=path, wcs=tile.wcs, data=arr))
                         valid_indices.append(idx_tile)
                     except Exception as exc:
@@ -5002,7 +5530,7 @@ def _run_phase4_5_inter_master_merge(
                             tile_label=_safe_basename(tile_obj.path),
                         )
                     if weight_map is not None:
-                        weight_map = np.asarray(weight_map, dtype=np.float32, copy=False)
+                        weight_map = np.asarray(weight_map, dtype=np.float32)
                     if arr.ndim == 2:
                         arr = arr[..., np.newaxis]
                     if arr.shape[-1] != channels:
@@ -5012,7 +5540,7 @@ def _run_phase4_5_inter_master_merge(
                             arr = arr[..., :1]
                         else:
                             arr = np.repeat(arr[..., :1], channels, axis=-1)
-                    arr = np.asarray(arr, dtype=np.float32, copy=False)
+                    arr = np.asarray(arr, dtype=np.float32)
                     corr = chunk_affine_corrections[idx_tile]
                     if corr:
                         try:
@@ -5298,7 +5826,7 @@ def _run_phase4_5_inter_master_merge(
 
             if norm_method in ("linear_fit", "sky_mean") and len(frames) >= 2:
                 try:
-                    ref_arr = np.asarray(frames[0], dtype=np.float32, copy=False)
+                    ref_arr = np.asarray(frames[0], dtype=np.float32)
                     if ref_arr.ndim == 2:
                         ref_arr = ref_arr[..., np.newaxis]
                     ref_channels = ref_arr.shape[-1]
@@ -5308,7 +5836,7 @@ def _run_phase4_5_inter_master_merge(
                         src_arr = frames[frame_idx]
                         if src_arr is None:
                             continue
-                        src_arr = np.asarray(src_arr, dtype=np.float32, copy=False)
+                        src_arr = np.asarray(src_arr, dtype=np.float32)
                         if src_arr.ndim == 2:
                             src_arr = src_arr[..., np.newaxis]
                         if src_arr.shape[-1] != ref_channels:
@@ -6378,6 +6906,7 @@ def _compute_intertile_affine_corrections_from_sources(
     intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
     tile_weights: list[float] | None = None,
     cpu_workers: int | None = None,
+    force_safe_mode: bool | None = None,
 ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
     """Common implementation for intertile gain/offset computation.
 
@@ -6405,6 +6934,45 @@ def _compute_intertile_affine_corrections_from_sources(
         cpu_workers = None
     if cpu_workers is not None and cpu_workers < 1:
         cpu_workers = 1
+    force_single_worker = False
+    force_single_reason = None
+    requested_workers = cpu_workers if cpu_workers is not None else "auto"
+
+    if force_safe_mode:
+        force_single_worker = True
+        force_single_reason = "config_safe_mode"
+
+    probe_reason = None
+    if not force_single_worker and cpu_workers and cpu_workers > 1:
+        try:
+            ctx = multiprocessing.get_context("spawn" if sys.platform == "win32" else None)
+            with ctx.Pool(processes=min(cpu_workers, max(1, cpu_workers))) as pool:
+                pool.map(int, range(min(cpu_workers, 2)))
+        except Exception as exc_probe:
+            force_single_worker = True
+            probe_reason = f"probe_failed_{exc_probe.__class__.__name__}"
+            force_single_reason = probe_reason
+            if logger_obj:
+                try:
+                    logger_obj.warning(
+                        "[Intertile] Multiprocessing probe failed (requested=%s): %s — falling back to single worker",
+                        requested_workers,
+                        exc_probe,
+                    )
+                except Exception:
+                    pass
+
+    if force_single_worker:
+        cpu_workers = 1
+        if logger_obj:
+            try:
+                logger_obj.info(
+                    "[Intertile] Safe-mode: forcing single worker (requested=%s, reason=%s)",
+                    requested_workers,
+                    force_single_reason or probe_reason or "unspecified",
+                )
+            except Exception:
+                pass
 
     tile_pairs: list[tuple[np.ndarray, Any] | tuple[np.ndarray, Any, np.ndarray]] = []
     preview_arrays: list[np.ndarray | None] = []
@@ -6567,13 +7135,50 @@ def _compute_intertile_affine_corrections_from_sources(
             cpu_workers=cpu_workers,
         )
     except Exception as exc:
-        if logger_obj:
-            logger_obj.warning(
-                "Intertile photometric calibration failed: %s",
-                exc,
-            )
-            logger_obj.debug("Traceback (intertile failure):", exc_info=True)
-        return None, False, "compute_failed", str(exc)
+        if cpu_workers and cpu_workers > 1 and not force_safe_mode:
+            if logger_obj:
+                try:
+                    logger_obj.warning(
+                        "[Intertile] Calibration failed with multiple workers (%s): %s — retrying with single worker",
+                        cpu_workers,
+                        exc,
+                    )
+                    logger_obj.debug("Traceback (intertile failure multi-worker):", exc_info=True)
+                except Exception:
+                    pass
+            cpu_workers = 1
+            try:
+                corrections = zemosaic_utils.compute_intertile_affine_calibration(
+
+                    tile_pairs,
+                    final_output_wcs,
+                    final_output_shape_hw,
+                    preview_size=preview_size,
+                    min_overlap_fraction=min_overlap_fraction,
+                    sky_percentile=sky_percentile,
+                    robust_clip_sigma=robust_clip_sigma,
+                    use_auto_intertile=use_auto_intertile,
+                    logger=logger_obj,
+                    progress_callback=_intertile_progress_bridge,
+                    tile_weights=tile_weights,
+                    cpu_workers=cpu_workers,
+                )
+            except Exception as exc_single:
+                if logger_obj:
+                    logger_obj.warning(
+                        "Intertile photometric calibration failed after fallback to single worker: %s",
+                        exc_single,
+                    )
+                    logger_obj.debug("Traceback (intertile failure single-worker):", exc_info=True)
+                return None, False, "compute_failed", str(exc_single)
+        else:
+            if logger_obj:
+                logger_obj.warning(
+                    "Intertile photometric calibration failed: %s",
+                    exc,
+                )
+                logger_obj.debug("Traceback (intertile failure):", exc_info=True)
+            return None, False, "compute_failed", str(exc)
     finally:
         tile_pairs.clear()
 
@@ -6839,7 +7444,7 @@ class CenterOutNormalizationContext:
     ) -> None:
         entry = _CenterPreviewEntry(
             tile_id=int(tile_id),
-            preview=None if preview is None else np.asarray(preview, dtype=np.float32, copy=True),
+            preview=None if preview is None else np.array(preview, dtype=np.float32, copy=True),
             wcs=preview_wcs,
             stats=stats.copy() if isinstance(stats, dict) else stats,
             mode=str(mode),
@@ -8043,6 +8648,12 @@ def _run_shared_phase45_phase5_pipeline(
             get_env_safe_mode_flag(gpu_safety_ctx_phase5)
         except Exception:
             pass
+    phase5_safe_mode_env = _phase5_safe_mode_env_enabled()
+    if not phase5_safe_mode_env and gpu_safety_ctx_phase5 is not None:
+        try:
+            phase5_safe_mode_env = bool(getattr(gpu_safety_ctx_phase5, "safe_mode", False))
+        except Exception:
+            pass
     assembly_process_workers_config = int(phase5_options.get("assembly_process_workers") or 0)
     intertile_preview_size_config = phase5_options.get("intertile_preview_size") or 512
     intertile_overlap_min_config = phase5_options.get("intertile_overlap_min") or 0.05
@@ -8051,6 +8662,7 @@ def _run_shared_phase45_phase5_pipeline(
     intertile_global_recenter_config = phase5_options.get("intertile_global_recenter")
     intertile_recenter_clip_tuple = phase5_options.get("intertile_recenter_clip") or (0.85, 1.18)
     use_auto_intertile_config = phase5_options.get("use_auto_intertile")
+    intertile_force_safe_mode_config = bool(phase5_options.get("intertile_force_safe_mode"))
     coadd_use_memmap_config = bool(phase5_options.get("coadd_use_memmap"))
     coadd_memmap_dir_config = phase5_options.get("coadd_memmap_dir")
     start_time_total = start_time_total_run
@@ -8060,6 +8672,10 @@ def _run_shared_phase45_phase5_pipeline(
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
     existing_master_tiles_mode = bool(phase5_options.get("existing_master_tiles_mode"))
     worker_config_cache = phase45_options.get("worker_config") or {}
+    phase5_force_gpu_on_ac_cfg = worker_config_cache.get("phase5_force_gpu_on_ac")
+    phase5_force_gpu_on_ac_flag = _coerce_bool_flag(phase5_force_gpu_on_ac_cfg)
+    if phase5_force_gpu_on_ac_flag is None:
+        phase5_force_gpu_on_ac_flag = False
     parallel_caps_option = phase5_options.get("parallel_capabilities")
     telemetry_ctrl = phase5_options.get("telemetry")
     sds_mode_phase5 = bool(phase5_options.get("sds_mode"))
@@ -8238,6 +8854,7 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_global_recenter=bool(intertile_global_recenter_config),
                 intertile_recenter_clip=intertile_recenter_clip_tuple,
                 use_auto_intertile=bool(use_auto_intertile_config),
+                intertile_force_safe_mode=intertile_force_safe_mode_config,
                 match_background=match_background_flag,
                 feather_parity=feather_parity_flag,
                 two_pass_coverage_renorm=two_pass_coverage_renorm_config,
@@ -8300,25 +8917,59 @@ def _run_shared_phase45_phase5_pipeline(
                     phase5_chunk_auto_flag = True
 
                 # Start of plugged-aware logic for Phase 5 chunk sizing
-                if parallel_plan_phase5 is not None and gpu_safety_ctx_phase5 is not None:
-                    on_battery = getattr(gpu_safety_ctx_phase5, "on_battery", False)
-                    power_plugged = getattr(gpu_safety_ctx_phase5, "power_plugged", True)
-                    is_hybrid = getattr(gpu_safety_ctx_phase5, "is_hybrid_graphics", False)
-                    vram_free_bytes = getattr(gpu_safety_ctx_phase5, "vram_free_bytes", None)
-                    current_chunk_bytes = getattr(parallel_plan_phase5, "gpu_max_chunk_bytes", 0)
-                    
-                    # Define a simple VRAM-based hard cap
-                    hard_cap_bytes = 1024 * 1024 * 1024  # 1GB default
-                    if vram_free_bytes is not None and vram_free_bytes > 0:
-                        hard_cap_bytes = min(hard_cap_bytes, max(128 * 1024 * 1024, int(0.10 * vram_free_bytes)))
-                    elif on_battery:
-                        hard_cap_bytes = 128 * 1024 * 1024
-                    else:
-                        hard_cap_bytes = 512 * 1024 * 1024
+                if parallel_plan_phase5 is not None:
+                    try:
+                        current_chunk_bytes = int(
+                            getattr(parallel_plan_phase5, "gpu_max_chunk_bytes", 0) or 0
+                        )
+                    except Exception:
+                        current_chunk_bytes = 0
+                    phase5_chunk_cap_bytes = current_chunk_bytes if current_chunk_bytes > 0 else None
+
+                    if not phase5_safe_mode_env and gpu_safety_ctx_phase5 is not None:
+                        try:
+                            phase5_safe_mode_env = bool(
+                                getattr(gpu_safety_ctx_phase5, "safe_mode", False)
+                            )
+                        except Exception:
+                            phase5_safe_mode_env = False
+
+                    budget_bytes, budget_meta = _compute_phase5_vram_budget_bytes(
+                        gpu_safety_ctx_phase5,
+                        worker_config_cache,
+                        phase5_safe_mode_env,
+                        phase5_chunk_cap_bytes=phase5_chunk_cap_bytes,
+                    )
+                    vram_free_mb = budget_meta.get("vram_free_mb")
+                    vram_free_mb_str = f"{vram_free_mb:.0f}MB" if vram_free_mb is not None else "unknown"
+                    hard_cap_mb = budget_meta.get("hard_cap_mb")
+                    hard_cap_mb_str = f"{hard_cap_mb:.0f}" if hard_cap_mb else "n/a"
+                    ui_cap_mb = budget_meta.get("ui_chunk_cap_mb")
+                    ui_cap_mb_str = f"{ui_cap_mb:.0f}" if ui_cap_mb else "n/a"
+                    budget_reasons = list(budget_meta.get("reasons") or [])
+                    logger.info(
+                        (
+                            "Phase5 VRAM budget: free_mb=%s reserve_mb=%s frac=%.2f "
+                            "budget_mb=%.0f hard_cap_mb=%s ui_cap_mb=%s plugged=%s battery=%s hybrid=%s "
+                            "safe_mode_env=%s reasons=[%s]"
+                        ),
+                        vram_free_mb_str,
+                        int(budget_meta.get("reserve_mb") or 0),
+                        float(budget_meta.get("fraction") or 0.0),
+                        float(budget_meta.get("budget_mb") or 0.0),
+                        hard_cap_mb_str,
+                        ui_cap_mb_str,
+                        bool(budget_meta.get("power_plugged")),
+                        bool(budget_meta.get("on_battery")),
+                        bool(budget_meta.get("is_hybrid_graphics")),
+                        1 if budget_meta.get("safe_mode_env") else 0,
+                        ",".join(budget_reasons),
+                    )
 
                     applied_chunk_bytes = current_chunk_bytes
                     log_reason = []
                     log_source = "AUTO"
+                    requested_mb = None
 
                     if not phase5_chunk_auto_flag:
                         # USER override mode
@@ -8327,68 +8978,66 @@ def _run_shared_phase45_phase5_pipeline(
                             requested_mb = int(worker_config_cache.get("phase5_chunk_mb", 128))
                         except Exception:
                             requested_mb = 128
-                        requested_mb = max(64, min(1024, requested_mb))
+                        requested_mb = max(64, min(16384, requested_mb))
                         requested_bytes = requested_mb * 1024 * 1024
                         applied_chunk_bytes = requested_bytes
                         log_reason.append(f"requested={requested_mb}MB")
-
-                        if on_battery:
-                            applied_chunk_bytes = min(applied_chunk_bytes, 128 * 1024 * 1024)
-                            log_reason.append("on_battery_clamp")
-                        else:
-                            if applied_chunk_bytes > hard_cap_bytes:
-                                applied_chunk_bytes = hard_cap_bytes
-                                log_reason.append("hard_cap_vram")
-
+                        if budget_bytes > 0 and applied_chunk_bytes > budget_bytes:
+                            applied_chunk_bytes = budget_bytes
+                            log_reason.append("budget_cap")
+                        elif budget_bytes <= 0:
+                            log_reason.append("budget_unknown")
                     else:
                         # AUTO mode
-                        if on_battery:
-                            applied_chunk_bytes = min(current_chunk_bytes, 128 * 1024 * 1024)
-                            log_reason.append("on_battery_clamp")
-                        elif power_plugged and is_hybrid:
-                            # "plugged-aware" relaxation for hybrid graphics on AC power
-                            target_bytes = max(current_chunk_bytes, 256 * 1024 * 1024)
-                            if vram_free_bytes is not None and vram_free_bytes > 2 * 1024 * 1024 * 1024:
-                                target_bytes = max(target_bytes, 512 * 1024 * 1024)
-                            
-                            applied_chunk_bytes = min(target_bytes, hard_cap_bytes)
-                            log_reason.append("plugged_relax_hybrid")
+                        if budget_bytes > 0:
+                            applied_chunk_bytes = budget_bytes
+                            log_reason.append("budget_policy")
                         else:
-                            # Desktop or other non-hybrid cases, trust autotune/safety defaults
-                            log_reason.append("default")
-                    
+                            log_reason.append("budget_unknown")
+
+                    if budget_reasons:
+                        log_reason.extend(budget_reasons)
+                    if log_reason:
+                        log_reason = list(dict.fromkeys(log_reason))
+
                     # Apply the final calculated chunk size
                     try:
                         setattr(parallel_plan_phase5, "gpu_max_chunk_bytes", int(applied_chunk_bytes))
                     except Exception:
-                        pass # Plan might be immutable
-                    
+                        pass  # Plan might be immutable
+
                     base_chunk_mb = float(current_chunk_bytes or 0) / (1024.0 * 1024.0)
                     applied_chunk_mb = float(applied_chunk_bytes or 0) / (1024.0 * 1024.0)
-                    vram_free_mb_str = (
-                        f"{vram_free_bytes / (1024.0 * 1024.0):.0f}MB" if vram_free_bytes else "unknown"
-                    )
+                    budget_mb = float(budget_bytes or 0) / (1024.0 * 1024.0)
                     reasons_str = ",".join(log_reason)
                     if log_source == "AUTO":
                         logger.info(
-                            "Phase5 chunk AUTO: applied=%.0fMB (base=%.0fMB, vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])",
+                            (
+                                "Phase5 chunk AUTO: applied=%.0fMB (base=%.0fMB, budget=%.0fMB, "
+                                "vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])"
+                            ),
                             applied_chunk_mb,
                             base_chunk_mb,
+                            budget_mb,
                             vram_free_mb_str,
-                            power_plugged,
-                            on_battery,
-                            is_hybrid,
+                            bool(budget_meta.get("power_plugged")),
+                            bool(budget_meta.get("on_battery")),
+                            bool(budget_meta.get("is_hybrid_graphics")),
                             reasons_str,
                         )
                     else:
                         logger.info(
-                            "Phase5 chunk USER: applied=%.0fMB (cap=%.0fMB, vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])",
+                            (
+                                "Phase5 chunk USER: applied=%.0fMB (requested=%.0fMB, budget=%.0fMB, "
+                                "vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])"
+                            ),
                             applied_chunk_mb,
-                            float(hard_cap_bytes or 0) / (1024.0 * 1024.0),
+                            float(requested_mb or 0),
+                            budget_mb,
                             vram_free_mb_str,
-                            power_plugged,
-                            on_battery,
-                            is_hybrid,
+                            bool(budget_meta.get("power_plugged")),
+                            bool(budget_meta.get("on_battery")),
+                            bool(budget_meta.get("is_hybrid_graphics")),
                             reasons_str,
                         )
                 # End of plugged-aware logic
@@ -8427,6 +9076,38 @@ def _run_shared_phase45_phase5_pipeline(
             effective_use_gpu = bool(plan_gpu_allowed)
             if not effective_use_gpu and use_gpu_phase5_flag:
                 logger.info("[Phase5] GPU disabled by auto-tune (plan.use_gpu=False)")
+        power_plugged = False
+        on_battery = True
+        ctx_safe_mode = False
+        if gpu_safety_ctx_phase5 is not None:
+            try:
+                power_plugged = bool(getattr(gpu_safety_ctx_phase5, "power_plugged", False))
+            except Exception:
+                power_plugged = False
+            try:
+                on_battery_value = getattr(gpu_safety_ctx_phase5, "on_battery", None)
+                on_battery = bool(on_battery_value) if on_battery_value is not None else True
+            except Exception:
+                on_battery = True
+            try:
+                ctx_safe_mode = bool(getattr(gpu_safety_ctx_phase5, "safe_mode", False))
+            except Exception:
+                ctx_safe_mode = False
+        phase5_safe_mode_env = _phase5_safe_mode_env_enabled()
+        if not phase5_safe_mode_env and ctx_safe_mode:
+            phase5_safe_mode_env = True
+        if (
+            phase5_force_gpu_on_ac_flag
+            and use_gpu_phase5_flag
+            and plan_gpu_allowed
+            and power_plugged
+            and not on_battery
+            and not phase5_safe_mode_env
+            and not ctx_safe_mode
+        ):
+            if not effective_use_gpu:
+                logger.info("Phase5: forcing GPU on AC (config)")
+            effective_use_gpu = True
         try:
             vram_free_mb = None
             if gpu_safety_ctx_phase5 is not None and gpu_safety_ctx_phase5.vram_free_bytes is not None:
@@ -8483,13 +9164,20 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_global_recenter=bool(intertile_global_recenter_config),
                 intertile_recenter_clip=intertile_recenter_clip_tuple,
                 use_auto_intertile=bool(use_auto_intertile_config),
+                intertile_force_safe_mode=intertile_force_safe_mode_config,
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
                 phase45_enabled=phase45_active_flag,
                 parallel_plan=parallel_plan_phase5,
                 enable_tile_weighting=tile_weighting_enabled_flag,
                 tile_weight_mode=tile_weight_mode,
+                apply_radial_weight=bool(phase5_options.get("apply_radial_weight")),
+                radial_feather_fraction=float(phase5_options.get("radial_feather_fraction") or 0.8),
+                radial_shape_power=float(phase5_options.get("radial_shape_power") or 2.0),
+                min_radial_weight_floor=float(phase5_options.get("min_radial_weight_floor") or 0.0),
                 stats_callback=_emit_phase5_stats,
+                worker_config_cache=worker_config_cache,
+                gpu_safety_ctx_phase5=gpu_safety_ctx_phase5,
                 existing_master_tiles_mode=existing_master_tiles_mode,
             )
             if final_mosaic_data_HWC is None or final_mosaic_coverage_HW is None:
@@ -8870,6 +9558,78 @@ def _unit_vector_from_ra_dec(ra_deg: float, dec_deg: float) -> tuple[float, floa
     y = math.cos(dec_rad) * math.sin(ra_rad)
     z = math.sin(dec_rad)
     return x, y, z
+
+
+def _pick_central_reference_index(
+    infos: list[dict],
+    require_cache_exists: bool,
+) -> int | None:
+    try:
+        if not infos:
+            return None
+
+        def _cache_allowed(info: dict) -> bool:
+            if not require_cache_exists:
+                return True
+            for key in ("cache_exists", "cache_ok", "cache_valid", "preprocessed_cache_exists"):
+                if key in info:
+                    return bool(info.get(key))
+            return False
+
+        candidates: list[int] = []
+        vectors: list[tuple[float, float, float]] = []
+        for idx, info in enumerate(infos):
+            if not isinstance(info, dict):
+                continue
+            if not _cache_allowed(info):
+                continue
+            wcs_obj = info.get("wcs")
+            header_obj = info.get("header")
+            if not (wcs_obj and getattr(wcs_obj, "is_celestial", False) and header_obj):
+                continue
+            coord = _extract_ra_dec_deg(info)
+            if coord is None:
+                continue
+            ra_deg, dec_deg = coord
+            if not (math.isfinite(ra_deg) and math.isfinite(dec_deg)):
+                return None
+            vec = _unit_vector_from_ra_dec(ra_deg, dec_deg)
+            if not all(math.isfinite(v) for v in vec):
+                return None
+            candidates.append(idx)
+            vectors.append(vec)
+
+        if vectors:
+            centroid = np.sum(np.array(vectors, dtype=float), axis=0)
+            norm = float(np.linalg.norm(centroid))
+            if not math.isfinite(norm) or norm <= 0.0:
+                return None
+            centroid /= norm
+            best_idx = None
+            best_score = None
+            for idx, vec in zip(candidates, vectors):
+                dot = float(np.dot(vec, centroid))
+                if not math.isfinite(dot):
+                    return None
+                dot = min(1.0, max(-1.0, dot))
+                score = 1.0 - dot
+                if best_score is None or (score, idx) < (best_score, best_idx):
+                    best_score = score
+                    best_idx = idx
+            return best_idx
+
+        for idx, info in enumerate(infos):
+            if not isinstance(info, dict):
+                continue
+            if not _cache_allowed(info):
+                continue
+            wcs_obj = info.get("wcs")
+            header_obj = info.get("header")
+            if wcs_obj and getattr(wcs_obj, "is_celestial", False) and header_obj:
+                return idx
+        return None
+    except Exception:
+        return None
 
 
 def _compute_max_angular_separation_deg(coords: list[tuple[float, float]]) -> float:
@@ -10163,7 +10923,7 @@ def reproject_tile_to_mosaic(
     if isinstance(weight_map, np.ndarray):
         try:
             alpha_weight_map = np.clip(
-                np.asarray(weight_map, dtype=np.float32, copy=False),
+                np.asarray(weight_map, dtype=np.float32),
                 0.0,
                 1.0,
             )
@@ -11630,6 +12390,20 @@ def create_master_tile(
     target_stack_effective = max(min_safe_stack_effective, int(target_stack_size))
 
     original_batch_size = len(seestar_stack_group_info)
+    preferred_group_idx = _pick_central_reference_index(
+        seestar_stack_group_info,
+        require_cache_exists=False,
+    )
+    if preferred_group_idx is None:
+        preferred_group_idx = 0
+    ref_token = None
+    try:
+        preferred_info = seestar_stack_group_info[preferred_group_idx]
+    except Exception:
+        preferred_info = None
+    if isinstance(preferred_info, dict):
+        ref_token = preferred_info.get("path_raw") or preferred_info.get("path_preprocessed_cache")
+
     if allow_batch_duplication and original_batch_size < target_stack_effective and original_batch_size > 0:
         repeat = math.ceil(target_stack_effective / original_batch_size)
         seestar_stack_group_info = (seestar_stack_group_info * repeat)[:target_stack_effective]
@@ -11649,27 +12423,16 @@ def create_master_tile(
                 )
         except Exception:
             pass
-    
-    # Choix de l'image de référence (généralement la première du groupe après tri ou la plus centrale)
-    reference_image_index_in_group = 0 # Pourrait être plus sophistiqué à l'avenir
-    if not (0 <= reference_image_index_in_group < len(seestar_stack_group_info)): 
-        pcb_tile(f"{func_id_log_base}_error_invalid_ref_index", prog=None, lvl="ERROR", tile_id=tile_id, ref_idx=reference_image_index_in_group, group_size=len(seestar_stack_group_info))
-        return (None, None), failed_groups_to_retry
-    
-    ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]
-    wcs_for_master_tile = ref_info_for_tile.get('wcs')
-    # Le header est un dict venant du cache, il faut le convertir en objet fits.Header si besoin
-    header_dict_for_master_tile_base = ref_info_for_tile.get('header') 
-
-    if not (wcs_for_master_tile and wcs_for_master_tile.is_celestial and header_dict_for_master_tile_base):
-        pcb_tile(f"{func_id_log_base}_error_invalid_ref_wcs_header", prog=None, lvl="ERROR", tile_id=tile_id)
-        return (None, None), failed_groups_to_retry
-    
-    # Conversion du dict en objet astropy.io.fits.Header pour la sauvegarde
-    header_for_master_tile_base = fits.Header(header_dict_for_master_tile_base.cards if hasattr(header_dict_for_master_tile_base,'cards') else header_dict_for_master_tile_base)
-    
-    ref_path_raw = ref_info_for_tile.get('path_raw', 'UnknownRawRef')
-    pcb_tile(f"{func_id_log_base}_info_reference_set", prog=None, lvl="DEBUG_DETAIL", ref_index=reference_image_index_in_group, ref_filename=_safe_basename(ref_path_raw), tile_id=tile_id)
+    if seestar_stack_group_info:
+        preferred_group_idx = max(0, min(preferred_group_idx, len(seestar_stack_group_info) - 1))
+        if ref_token:
+            for idx, info in enumerate(seestar_stack_group_info):
+                if isinstance(info, dict) and (
+                    info.get("path_raw") == ref_token
+                    or info.get("path_preprocessed_cache") == ref_token
+                ):
+                    preferred_group_idx = idx
+                    break
 
     # Acquire a dynamic Phase 3 I/O concurrency slot to avoid disk stalls
     # when the system is busy (e.g., another app reading video files).
@@ -11682,6 +12445,8 @@ def create_master_tile(
     
     tile_images_data_HWC_adu = []
     tile_original_raw_headers = [] # Liste des dictionnaires de header originaux
+    loaded_infos = []
+    loaded_group_indices = []
 
     for i, raw_file_info in enumerate(seestar_stack_group_info):
         cached_image_file_path = raw_file_info.get('path_preprocessed_cache')
@@ -11712,7 +12477,9 @@ def create_master_tile(
             
             tile_images_data_HWC_adu.append(img_data_adu)
             # Stocker le dict de header, pas l'objet fits.Header, car c'est ce qui est dans raw_file_info
-            tile_original_raw_headers.append(raw_file_info.get('header')) 
+            tile_original_raw_headers.append(raw_file_info.get('header'))
+            loaded_infos.append(raw_file_info)
+            loaded_group_indices.append(i)
         except MemoryError as e_mem_load_cache:
              pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
              # Release the concurrency slot before aborting
@@ -11720,7 +12487,7 @@ def create_master_tile(
                  _PH3_CONCURRENCY_SEMAPHORE.release()
              except Exception:
                  pass
-             del tile_images_data_HWC_adu, tile_original_raw_headers; gc.collect(); return (None, None), failed_groups_to_retry
+             del tile_images_data_HWC_adu, tile_original_raw_headers, loaded_infos, loaded_group_indices; gc.collect(); return (None, None), failed_groups_to_retry
         except Exception as e_load_cache:
             pcb_tile(f"{func_id_log_base}_error_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_load_cache), tile_id=tile_id)
             logger.error(f"Erreur chargement cache {cached_image_file_path} pour tuile {tile_id}", exc_info=True)
@@ -11737,38 +12504,111 @@ def create_master_tile(
         return (None, None), failed_groups_to_retry
     # pcb_tile(f"{func_id_log_base}_info_loading_from_cache_finished", prog=None, lvl="DEBUG_DETAIL", num_loaded=len(tile_images_data_HWC_adu), tile_id=tile_id)
 
+    group_to_loaded = {group_i: loaded_i for loaded_i, group_i in enumerate(loaded_group_indices)}
+    if preferred_group_idx in group_to_loaded:
+        ref_loaded_idx = group_to_loaded[preferred_group_idx]
+    else:
+        ref_loaded_idx = _pick_central_reference_index(
+            loaded_infos,
+            require_cache_exists=False,
+        )
+        if ref_loaded_idx is None:
+            ref_loaded_idx = 0
+
+    if not (0 <= ref_loaded_idx < len(loaded_infos)):
+        ref_loaded_idx = 0
+
+    ref_group_idx = loaded_group_indices[ref_loaded_idx]
+    ref_info_for_tile = loaded_infos[ref_loaded_idx]
+    wcs_for_master_tile = ref_info_for_tile.get('wcs')
+    # Le header est un dict venant du cache, il faut le convertir en objet fits.Header si besoin
+    header_dict_for_master_tile_base = ref_info_for_tile.get('header')
+
+    if not (wcs_for_master_tile and wcs_for_master_tile.is_celestial and header_dict_for_master_tile_base):
+        pcb_tile(f"{func_id_log_base}_error_invalid_ref_wcs_header", prog=None, lvl="ERROR", tile_id=tile_id)
+        return (None, None), failed_groups_to_retry
+
+    # Conversion du dict en objet astropy.io.fits.Header pour la sauvegarde
+    header_for_master_tile_base = fits.Header(
+        header_dict_for_master_tile_base.cards
+        if hasattr(header_dict_for_master_tile_base, 'cards')
+        else header_dict_for_master_tile_base
+    )
+
+    ref_path_raw = (
+        ref_info_for_tile.get('path_raw')
+        or ref_info_for_tile.get('path_preprocessed_cache')
+        or 'UnknownRawRef'
+    )
+    pcb_tile(
+        f"{func_id_log_base}_info_reference_set",
+        prog=None,
+        lvl="DEBUG_DETAIL",
+        ref_index=ref_group_idx,
+        ref_index_group=ref_group_idx,
+        ref_index_loaded=ref_loaded_idx,
+        ref_mode="central",
+        ref_filename=_safe_basename(ref_path_raw),
+        tile_id=tile_id,
+    )
+
     pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
     # Limit concurrency during alignment/stacking as well to reduce peak RAM
     try:
         _PH3_CONCURRENCY_SEMAPHORE.acquire()
     except Exception:
         pass
+    winsorized_reject = str(stack_reject_algo or "").lower() == "winsorized_sigma_clip"
+    propagate_mask_for_coverage = bool(
+        altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE # commented for test purpose replace the above line to return to the previous state, winsorized_reject or (altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE)
+    )
+    if debug_tile:
+        pcb_tile(
+            f"MT_COVERAGE: propagate_mask={propagate_mask_for_coverage}",
+            prog=None,
+            lvl="DEBUG_DETAIL",
+            tile_id=int(tile_id),
+        )
     aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
         image_data_list=tile_images_data_HWC_adu,
-        reference_image_index=reference_image_index_in_group,
+        reference_image_index=ref_loaded_idx,
+        propagate_mask=propagate_mask_for_coverage,
         progress_callback=progress_callback
     )
     if failed_alignment_indices:
         retry_group: list[dict] = []
         for idx_fail in failed_alignment_indices:
-            if 0 <= idx_fail < len(seestar_stack_group_info):
-                raw_info = seestar_stack_group_info[idx_fail]
-                if isinstance(raw_info, dict):
-                    info_copy = dict(raw_info)
-                    current_retry = int(info_copy.get('retry_attempt', 0))
-                    info_copy['retry_attempt'] = current_retry + 1
-                    origin_chain = list(info_copy.get('retry_origin_chain', []))
-                    origin_chain.append(int(tile_id))
-                    info_copy['retry_origin_chain'] = origin_chain
-                else:
-                    info_copy = raw_info
-                retry_group.append(info_copy)
+            if 0 <= idx_fail < len(loaded_group_indices):
+                group_idx = loaded_group_indices[idx_fail]
+                if 0 <= group_idx < len(seestar_stack_group_info):
+                    raw_info = seestar_stack_group_info[group_idx]
+                    if isinstance(raw_info, dict):
+                        info_copy = dict(raw_info)
+                        current_retry = int(info_copy.get('retry_attempt', 0))
+                        info_copy['retry_attempt'] = current_retry + 1
+                        origin_chain = list(info_copy.get('retry_origin_chain', []))
+                        origin_chain.append(int(tile_id))
+                        info_copy['retry_origin_chain'] = origin_chain
+                    else:
+                        info_copy = raw_info
+                    retry_group.append(info_copy)
         if retry_group:
             failed_groups_to_retry.append(retry_group)
 
     del tile_images_data_HWC_adu; gc.collect()
 
-    valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
+    ref_aligned_img = None
+    if aligned_images_for_stack and 0 <= ref_loaded_idx < len(aligned_images_for_stack):
+        ref_aligned_img = aligned_images_for_stack[ref_loaded_idx]
+
+    if ref_aligned_img is not None:
+        valid_aligned_images = [ref_aligned_img]
+        for idx_img, img in enumerate(aligned_images_for_stack):
+            if idx_img == ref_loaded_idx or img is None:
+                continue
+            valid_aligned_images.append(img)
+    else:
+        valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
     if aligned_images_for_stack:
         del aligned_images_for_stack # Libérer la liste originale après filtrage
 
@@ -11798,6 +12638,69 @@ def create_master_tile(
                     str(tile_id),
                     n_used_for_stack,
                 )
+        except Exception:
+            pass
+
+    coverage_count_hw: np.ndarray | None = None
+    coverage_ignore_reason: str | None = None
+    if propagate_mask_for_coverage:
+        try:
+            first_img = valid_aligned_images[0]
+            if not (isinstance(first_img, np.ndarray) and first_img.ndim >= 2):
+                coverage_ignore_reason = "invalid_first_image"
+            else:
+                h0, w0 = first_img.shape[:2]
+                for img in valid_aligned_images:
+                    if not (isinstance(img, np.ndarray) and img.ndim >= 2 and img.shape[:2] == (h0, w0)):
+                        coverage_ignore_reason = f"shape_mismatch:{getattr(img, 'shape', None)}"
+                        break
+
+                if coverage_ignore_reason is None:
+                    cov = np.zeros((h0, w0), dtype=np.float32)
+                    for img in valid_aligned_images:
+                        if img.ndim == 3 and img.shape[-1] >= 3:
+                            valid2d = np.isfinite(img[..., 0]) & np.isfinite(img[..., 1]) & np.isfinite(img[..., 2])
+                        else:
+                            valid2d = np.isfinite(img)
+                        np.add(cov, valid2d, out=cov, casting="unsafe")
+
+                    cov_max = float(np.nanmax(cov)) if cov.size else 0.0
+                    if not math.isfinite(cov_max) or cov_max <= 0.0:
+                        coverage_ignore_reason = "max_coverage_nonpositive"
+                    else:
+                        coverage_count_hw = cov
+                        if debug_tile:
+                            cov_min = float(np.nanmin(cov)) if cov.size else 0.0
+                            nz_frac = float(np.count_nonzero(cov) / cov.size) if cov.size else 0.0
+                            pcb_tile(
+                                f"MT_COVERAGE_STATS: tile={tile_id} shape={cov.shape} "
+                                f"min={cov_min:.1f} max={cov_max:.1f} nonzero_frac={nz_frac:.3f} "
+                                f"n_used={n_used_for_stack}",
+                                prog=None,
+                                lvl="DEBUG_DETAIL",
+                            )
+        except Exception as exc:
+            coverage_ignore_reason = f"coverage_exception:{type(exc).__name__}"
+
+        if coverage_count_hw is None and debug_tile:
+            pcb_tile(
+                f"MT_COVERAGE_IGNORED: tile={tile_id} reason={coverage_ignore_reason or 'unknown'}",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+            )
+
+    # If we nanized aligned images for coverage, clean them before stacking to avoid stacker ERROR logs.
+    if propagate_mask_for_coverage and not winsorized_reject:
+        try:
+            for idx_img, img in enumerate(valid_aligned_images):
+                if isinstance(img, np.ndarray):
+                    valid_aligned_images[idx_img] = np.nan_to_num(
+                        img,
+                        copy=False,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ).astype(np.float32, copy=False)
         except Exception:
             pass
 
@@ -12015,6 +12918,27 @@ def create_master_tile(
                 else:
                     master_tile_stacked_HWC = cropped
                 quality_crop_rect = (int(y0), int(x0), int(y1), int(x1))
+                if coverage_count_hw is not None:
+                    try:
+                        if coverage_count_hw.shape == (h_lum, w_lum):
+                            coverage_count_hw = coverage_count_hw[int(y0) : int(y1), int(x0) : int(x1)]
+                        else:
+                            if debug_tile:
+                                pcb_tile(
+                                    f"MT_COVERAGE_IGNORED: tile={tile_id} reason=shape_mismatch_after_quality_crop "
+                                    f"cov_shape={getattr(coverage_count_hw, 'shape', None)} expected={(h_lum, w_lum)}",
+                                    prog=None,
+                                    lvl="DEBUG_DETAIL",
+                                )
+                            coverage_count_hw = None
+                    except Exception as exc:
+                        if debug_tile:
+                            pcb_tile(
+                                f"MT_COVERAGE_IGNORED: tile={tile_id} reason=coverage_crop_exception:{type(exc).__name__}",
+                                prog=None,
+                                lvl="DEBUG_DETAIL",
+                            )
+                        coverage_count_hw = None
 
                 if wcs_for_master_tile is not None:
                     try:
@@ -12065,6 +12989,111 @@ def create_master_tile(
     lecropper_pipeline_requested = bool(quality_crop_enabled_effective or altaz_cleanup_enabled_effective)
     lecropper_applied = False
     if lecropper_pipeline_requested and _LECROPPER_AVAILABLE:
+        coverage_for_lecropper: np.ndarray | None = None
+        coverage_reject_reason: str | None = None
+        coverage_max_val: float | None = None
+        if altaz_cleanup_enabled_effective and coverage_count_hw is not None and isinstance(master_tile_stacked_HWC, np.ndarray):
+            try:
+                cov_arr = np.asarray(coverage_count_hw, dtype=np.float32)
+                if cov_arr.ndim != 2:
+                    coverage_reject_reason = f"coverage_not_2d:{cov_arr.ndim}"
+                elif cov_arr.shape != master_tile_stacked_HWC.shape[:2]:
+                    coverage_reject_reason = f"coverage_shape_mismatch:{cov_arr.shape} vs {master_tile_stacked_HWC.shape[:2]}"
+                else:
+                    coverage_max_val = float(np.nanmax(cov_arr)) if cov_arr.size else 0.0
+                    if not math.isfinite(coverage_max_val) or coverage_max_val <= 0.0:
+                        coverage_reject_reason = "coverage_max_nonpositive"
+                    else:
+                        coverage_for_lecropper = cov_arr
+            except Exception as exc:
+                coverage_reject_reason = f"coverage_exception:{type(exc).__name__}"
+
+        if coverage_for_lecropper is None and coverage_count_hw is not None and debug_tile:
+            pcb_tile(
+                f"MT_COVERAGE_IGNORED: tile={tile_id} reason={coverage_reject_reason or 'unknown'}",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+            )
+
+        # Coverage thresholds (defaults are conservative and limited to Master Tiles).
+        altaz_min_coverage_abs_effective = 3.0
+        altaz_min_coverage_frac_effective = 0.5
+        altaz_morph_open_px_effective = 3
+        altaz_alpha_soft_threshold_effective = 1e-3
+        altaz_nanize_threshold_effective = 1e-3
+        try:
+            altaz_min_coverage_abs_effective = float(
+                getattr(zconfig, "altaz_min_coverage_abs", altaz_min_coverage_abs_effective)
+            )
+        except Exception:
+            altaz_min_coverage_abs_effective = 3.0
+        if not math.isfinite(altaz_min_coverage_abs_effective):
+            altaz_min_coverage_abs_effective = 3.0
+        altaz_min_coverage_abs_effective = max(0.0, altaz_min_coverage_abs_effective)
+
+        try:
+            altaz_min_coverage_frac_effective = float(
+                getattr(zconfig, "altaz_min_coverage_frac", altaz_min_coverage_frac_effective)
+            )
+        except Exception:
+            altaz_min_coverage_frac_effective = 0.5
+        if not math.isfinite(altaz_min_coverage_frac_effective):
+            altaz_min_coverage_frac_effective = 0.5
+        altaz_min_coverage_frac_effective = float(np.clip(altaz_min_coverage_frac_effective, 0.0, 1.0))
+
+        try:
+            altaz_morph_open_px_effective = int(
+                getattr(zconfig, "altaz_morph_open_px", altaz_morph_open_px_effective)
+            )
+        except Exception:
+            altaz_morph_open_px_effective = 3
+        altaz_morph_open_px_effective = max(0, int(altaz_morph_open_px_effective))
+
+        # Keep alpha / nanize thresholds configurable and coherent.
+        try:
+            altaz_alpha_soft_threshold_effective = float(
+                getattr(zconfig, "altaz_alpha_soft_threshold", altaz_alpha_soft_threshold_effective)
+            )
+        except Exception:
+            altaz_alpha_soft_threshold_effective = 1e-3
+        if not math.isfinite(altaz_alpha_soft_threshold_effective):
+            altaz_alpha_soft_threshold_effective = 1e-3
+        else:
+            altaz_alpha_soft_threshold_effective = float(
+                np.clip(altaz_alpha_soft_threshold_effective, 0.0, 1.0)
+            )
+
+        try:
+            altaz_nanize_threshold_effective = float(
+                getattr(zconfig, "altaz_nanize_threshold", altaz_alpha_soft_threshold_effective)
+            )
+        except Exception:
+            altaz_nanize_threshold_effective = altaz_alpha_soft_threshold_effective
+        if not math.isfinite(altaz_nanize_threshold_effective):
+            altaz_nanize_threshold_effective = altaz_alpha_soft_threshold_effective
+        else:
+            altaz_nanize_threshold_effective = float(
+                np.clip(altaz_nanize_threshold_effective, 0.0, 1.0)
+            )
+
+        # Clamp abs threshold to the actual max coverage / frames used (prevents a fully empty mask).
+        if coverage_for_lecropper is not None and coverage_max_val is not None:
+            try:
+                cap = float(min(float(n_used_for_stack), float(coverage_max_val)))
+                if math.isfinite(cap) and cap > 0.0:
+                    altaz_min_coverage_abs_effective = float(min(altaz_min_coverage_abs_effective, cap))
+            except Exception:
+                pass
+
+        if debug_tile and coverage_for_lecropper is not None:
+            pcb_tile(
+                f"MT_COVERAGE_THRESH: tile={tile_id} cov_max={coverage_max_val:.1f} "
+                f"min_abs={altaz_min_coverage_abs_effective:.1f} min_frac={altaz_min_coverage_frac_effective:.3f} "
+                f"morph_open_px={altaz_morph_open_px_effective}",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+            )
+
         pipeline_cfg = {
             "quality_crop_enabled": quality_crop_enabled_effective,
             "quality_crop_band_px": quality_crop_band_px,
@@ -12075,8 +13104,20 @@ def create_master_tile(
             "altaz_margin_percent": altaz_margin_percent,
             "altaz_decay": altaz_decay,
             "altaz_nanize": altaz_nanize,
+            "altaz_alpha_soft_threshold": altaz_alpha_soft_threshold_effective,
+            "altaz_nanize_threshold": altaz_nanize_threshold_effective,
+            "altaz_min_coverage_abs": altaz_min_coverage_abs_effective,
+            "altaz_min_coverage_frac": altaz_min_coverage_frac_effective,
+            "altaz_morph_open_px": altaz_morph_open_px_effective,
         }
-        master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+        master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(
+            master_tile_stacked_HWC,
+            pipeline_cfg,
+            coverage=coverage_for_lecropper,
+            altaz_min_coverage_abs=altaz_min_coverage_abs_effective,
+            altaz_min_coverage_frac=altaz_min_coverage_frac_effective,
+            altaz_morph_open_px=altaz_morph_open_px_effective,
+        )
         lecropper_applied = True
 
     try:
@@ -12258,6 +13299,76 @@ def create_master_tile(
     except Exception:
         alpha_mask_out = None
 
+    empty_tile_detected = False
+    empty_tile_stats: dict[str, float] | None = None
+    empty_tile_stats_sanitized: dict[str, float] | None = None
+    try:
+        empty_tile_detected, empty_tile_stats = _detect_empty_master_tile(
+            master_tile_stacked_HWC,
+            alpha_mask_out,
+            eps_signal=EMPTY_MASTER_TILE_EPS_SIGNAL,
+        )
+    except Exception:
+        empty_tile_detected = False
+        empty_tile_stats = None
+
+    if empty_tile_detected:
+        try:
+            if alpha_mask_out is None:
+                alpha_mask_out = np.zeros(master_tile_stacked_HWC.shape[:2], dtype=np.uint8)
+            else:
+                alpha_mask_out = np.zeros_like(alpha_mask_out, dtype=np.uint8)
+        except Exception:
+            alpha_mask_out = None
+
+        try:
+            max_abs = float(empty_tile_stats.get("max_abs", 0.0) or 0.0) if empty_tile_stats else 0.0
+            std_val = float(empty_tile_stats.get("std", 0.0) or 0.0) if empty_tile_stats else 0.0
+            valid_frac = float(empty_tile_stats.get("valid_frac", 0.0) or 0.0) if empty_tile_stats else 0.0
+            alpha_frac = float(empty_tile_stats.get("alpha_frac", float("nan"))) if empty_tile_stats else float("nan")
+            eps_val = float(empty_tile_stats.get("eps_signal", EMPTY_MASTER_TILE_EPS_SIGNAL)) if empty_tile_stats else EMPTY_MASTER_TILE_EPS_SIGNAL
+        except Exception:
+            max_abs = 0.0
+            std_val = 0.0
+            valid_frac = 0.0
+            alpha_frac = float("nan")
+            eps_val = EMPTY_MASTER_TILE_EPS_SIGNAL
+
+        empty_tile_stats_sanitized = {
+            "max_abs": max_abs,
+            "std": std_val,
+            "valid_frac": valid_frac,
+            "eps_signal": eps_val,
+        }
+
+        try:
+            logger.warning(
+                "MT_EMPTY_TILE tile=%s max_abs=%.3g std=%.3g valid_frac=%.6f alpha_frac=%.3f eps=%.1e forced transparent",
+                tile_id,
+                max_abs,
+                std_val,
+                valid_frac,
+                alpha_frac,
+                eps_val,
+            )
+        except Exception:
+            pass
+        try:
+            pcb_tile(
+                "MT_EMPTY_TILE",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                max_abs=f"{max_abs:.3g}",
+                std=f"{std_val:.3g}",
+                valid_frac=f"{valid_frac:.6f}",
+                alpha_frac=f"{alpha_frac:.3f}",
+                eps=f"{eps_val:.1e}",
+                forced="1",
+            )
+        except Exception:
+            pass
+
     alpha_mask_for_quality: np.ndarray | None = pipeline_alpha_mask
     if alpha_mask_for_quality is None and alpha_mask_out is not None:
         alpha_mask_for_quality = alpha_mask_out
@@ -12334,7 +13445,8 @@ def create_master_tile(
         header_mt_save['RGBGAINR'] = (gain_r, 'RGB equalization gain (red)')
         header_mt_save['RGBGAING'] = (gain_g, 'RGB equalization gain (green)')
         header_mt_save['RGBGAINB'] = (gain_b, 'RGB equalization gain (blue)')
-        header_mt_save['RGBEQMED'] = (target_median_val, 'RGB equalization target median')
+        target_median_hdr_val = target_median_val if math.isfinite(target_median_val) else "nan"
+        header_mt_save['RGBEQMED'] = (target_median_hdr_val, 'RGB equalization target median')
         try:
             header_mt_save.add_history(history_msg)
         except Exception:
@@ -12352,6 +13464,13 @@ def create_master_tile(
         header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa High for Winsorized')
         header_mt_save['ZMT_COMB'] = (str(stack_final_combine), 'Final combine method')
         header_mt_save['ALPHAEXT'] = (1 if alpha_mask_out is not None else 0, 'Alpha mask ext present')
+        if empty_tile_detected:
+            stats = empty_tile_stats_sanitized or {}
+            header_mt_save['ZMT_EMPT'] = (1, 'Empty master tile forced transparent')
+            header_mt_save['ZMT_EMAX'] = (float(stats.get("max_abs", 0.0)), 'Empty tile max abs')
+            header_mt_save['ZMT_ESTD'] = (float(stats.get("std", 0.0)), 'Empty tile std')
+            header_mt_save['ZMT_EVF'] = (float(stats.get("valid_frac", 0.0)), 'Empty tile valid fraction')
+            header_mt_save['ZMT_EPS'] = (float(stats.get("eps_signal", EMPTY_MASTER_TILE_EPS_SIGNAL)), 'Empty tile eps signal')
 
         if center_out_context and center_out_settings:
             header_mt_save['ZMT_ANCH'] = (
@@ -12373,7 +13492,11 @@ def create_master_tile(
             header_mt_save['ZMT_ANCH'] = (-1, 'Anchor tile id (original index)')
 
         if header_for_master_tile_base: # C'est déjà un objet fits.Header
-            ref_path_raw_for_hdr = seestar_stack_group_info[reference_image_index_in_group].get('path_raw', 'UnknownRef')
+            ref_path_raw_for_hdr = (
+                ref_info_for_tile.get('path_raw')
+                or ref_info_for_tile.get('path_preprocessed_cache')
+                or 'UnknownRef'
+            )
             header_mt_save['ZMT_REF'] = (_safe_basename(ref_path_raw_for_hdr), 'Reference raw frame for this tile WCS')
             keys_from_ref = ['OBJECT','DATE-AVG','FILTER','INSTRUME','FOCALLEN','XPIXSZ','YPIXSZ', 'GAIN', 'OFFSET'] # Ajout GAIN, OFFSET
             for key_h in keys_from_ref:
@@ -12418,6 +13541,13 @@ def create_master_tile(
             header_mt_save['ZMT_CER'] = (round(metrics.get("CER", 0.0), 3), 'Corner Emptiness Ratio')
         elif quality_gate_enabled:
             header_mt_save['ZMT_QBD'] = (0, '1 if auto-rejected')
+
+        if empty_tile_detected:
+            try:
+                master_tile_stacked_HWC = np.asarray(master_tile_stacked_HWC, dtype=np.float32, order="C")
+                master_tile_stacked_HWC = np.full_like(master_tile_stacked_HWC, np.nan, dtype=np.float32)
+            except Exception:
+                pass
 
         zemosaic_utils.save_fits_image(
             image_data=master_tile_stacked_HWC,
@@ -12585,6 +13715,7 @@ def assemble_final_mosaic_incremental(
     intertile_global_recenter: bool = True,
     intertile_recenter_clip: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile: bool = False,
+    intertile_force_safe_mode: bool | None = None,
     match_background: bool = True,
     feather_parity: bool = False,
     use_radial_feather: bool | None = None,
@@ -12736,6 +13867,7 @@ def assemble_final_mosaic_incremental(
                 progress_callback=progress_callback,
                 intertile_global_recenter=bool(intertile_global_recenter),
                 intertile_recenter_clip=intertile_recenter_clip,
+                force_safe_mode=intertile_force_safe_mode,
                 cpu_workers=(
                     int(processing_threads)
                     if processing_threads and int(processing_threads) > 0
@@ -12976,7 +14108,7 @@ def assemble_final_mosaic_incremental(
                     if alpha_tile is None or alpha_tile.shape != W_tile.shape:
                         alpha_tile = np.where(W_tile > 0, 1.0, 0.0).astype(np.float32, copy=False)
                     else:
-                        alpha_tile = np.clip(np.asarray(alpha_tile, dtype=np.float32, copy=False), 0.0, 1.0)
+                        alpha_tile = np.clip(np.asarray(alpha_tile, dtype=np.float32), 0.0, 1.0)
                     tgt_alpha = falpha[ymin:ymax, xmin:xmax]
                     np.maximum(tgt_alpha, alpha_tile, out=tgt_alpha)
                     tiles_since_flush += 1
@@ -13206,6 +14338,7 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_global_recenter: bool = True,
     intertile_recenter_clip: tuple[float, float] | list[float] | None = (0.85, 1.18),
     use_auto_intertile: bool = False,
+    intertile_force_safe_mode: bool | None = None,
     collect_tile_data: list | None = None,
     tile_affine_corrections: list[tuple[float, float]] | None = None,
     global_anchor_shift: tuple[float, float] | None = None,
@@ -13215,11 +14348,18 @@ def assemble_final_mosaic_reproject_coadd(
     tile_weight_mode: str | None = None,
     stats_callback: Callable[[int, int, bool], None] | None = None,
     existing_master_tiles_mode: bool = False,
+    worker_config_cache: dict | None = None,
+    gpu_safety_ctx_phase5: GpuRuntimeContext | None = None,
+    apply_radial_weight: bool = False,
+    radial_feather_fraction: float = 0.8,
+    radial_shape_power: float = 2.0,
+    min_radial_weight_floor: float = 0.0,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
+    worker_config_cache = worker_config_cache or {}
 
     _log_memory_usage(progress_callback, "Début assemble_final_mosaic_reproject_coadd")
     _pcb(
@@ -13596,7 +14736,7 @@ def assemble_final_mosaic_reproject_coadd(
             else:
                 valid2d = alpha_mask_arr > ALPHA_OPACITY_THRESHOLD
                 alpha_weight2d = valid2d.astype(np.float32, copy=False)
-                data = np.asarray(data, dtype=np.float32, order="C", copy=True)
+                data = np.array(data, dtype=np.float32, order="C", copy=True)
                 if data.ndim == 3:
                     data[~valid2d, :] = 0.0
                 else:
@@ -13772,7 +14912,7 @@ def assemble_final_mosaic_reproject_coadd(
             if mask is None:
                 return None
             try:
-                mask_arr = np.asarray(mask, dtype=np.float32, order="C", copy=False)
+                mask_arr = np.asarray(mask, dtype=np.float32, order="C")
             except Exception:
                 return None
             if mask_arr.ndim > 2:
@@ -13784,7 +14924,7 @@ def assemble_final_mosaic_reproject_coadd(
             data = entry.get("data")
             if tile_wcs is None or data is None:
                 return None
-            data_arr = np.asarray(data, dtype=np.float32, order="C", copy=False)
+            data_arr = np.asarray(data, dtype=np.float32, order="C")
             if data_arr.ndim != 3:
                 return None
             mask_arr = _resolve_mask(entry)
@@ -13907,7 +15047,7 @@ def assemble_final_mosaic_reproject_coadd(
             gains = anchor_med / tile_med
             gains = np.clip(gains, gain_clip[0], gain_clip[1])
             try:
-                data_arr = np.asarray(entry["data"], dtype=np.float32, order="C", copy=False)
+                data_arr = np.asarray(entry["data"], dtype=np.float32, order="C")
             except Exception:
                 continue
             applied_channels = 0
@@ -13943,16 +15083,19 @@ def assemble_final_mosaic_reproject_coadd(
         )
 
     # Optional inter-tile photometric (gain/offset) calibration
+    affine_from_user = bool(tile_affine_corrections)
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
         tile_affine_corrections,
         len(effective_tiles),
     )
+    affine_from_user = bool(affine_from_user and pending_affine_list)
 
     if (
         pending_affine_list is None
         and intertile_photometric_match
         and len(effective_tiles) >= 2
     ):
+        affine_from_user = False
         tile_sources = []
         tile_weights_for_sources: list[float] = []
         for entry in effective_tiles:
@@ -13993,6 +15136,7 @@ def assemble_final_mosaic_reproject_coadd(
                 intertile_global_recenter=bool(intertile_global_recenter),
                 intertile_recenter_clip=intertile_recenter_clip,
                 tile_weights=tile_weights_for_sources,
+                force_safe_mode=intertile_force_safe_mode,
                 cpu_workers=(
                     int(assembly_process_workers)
                     if assembly_process_workers and int(assembly_process_workers) > 0
@@ -14072,6 +15216,7 @@ def assemble_final_mosaic_reproject_coadd(
             anchor_shift_applied=anchor_shift_applied,
             global_anchor_shift=global_anchor_shift,
         )
+        clamp_affine = bool(match_bg and not affine_from_user)
         if use_gpu:
             # GPU path regression fix: apply computed affine gain/offset to tile data,
             # mirroring the CPU branch behavior (including clamping + callback).
@@ -14096,7 +15241,7 @@ def assemble_final_mosaic_reproject_coadd(
                     gain_to_apply = float(gain_val)
                     offset_to_apply = float(offset_val)
 
-                    if match_bg:
+                    if clamp_affine:
                         gain_before = gain_to_apply
                         offset_before = offset_to_apply
 
@@ -14106,15 +15251,12 @@ def assemble_final_mosaic_reproject_coadd(
                         elif gain_to_apply > gain_limit_max:
                             gain_to_apply = gain_limit_max
 
-                        # clamp / cancel offset
+                        # clamp offset
                         if affine_offset_limit_adu > 0.0:
-                            if abs(offset_to_apply) > affine_offset_limit_adu:
-                                offset_to_apply = 0.0
-                            else:
-                                if offset_to_apply < -affine_offset_limit_adu:
-                                    offset_to_apply = -affine_offset_limit_adu
-                                elif offset_to_apply > affine_offset_limit_adu:
-                                    offset_to_apply = affine_offset_limit_adu
+                            offset_to_apply = max(
+                                -affine_offset_limit_adu,
+                                min(offset_to_apply, affine_offset_limit_adu),
+                            )
 
                         # callback when clamped
                         if (gain_to_apply != gain_before) or (offset_to_apply != offset_before):
@@ -14178,7 +15320,7 @@ def assemble_final_mosaic_reproject_coadd(
                     arr_np = np.asarray(tile_entry["data"], dtype=np.float32, order="C")
                     gain_to_apply = float(gain_val)
                     offset_to_apply = float(offset_val)
-                    if match_bg:
+                    if clamp_affine:
                         gain_before = gain_to_apply
                         offset_before = offset_to_apply
                         if gain_to_apply < gain_limit_min:
@@ -14339,6 +15481,96 @@ def assemble_final_mosaic_reproject_coadd(
     if chunk_hint:
         reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint))
 
+    phase5_chunk_cap_bytes = None
+    if use_gpu:
+        try:
+            phase5_chunk_cap_bytes = int(plan_chunk_gpu_hint or 0) or None
+        except Exception:
+            phase5_chunk_cap_bytes = None
+        if phase5_chunk_cap_bytes is None:
+            try:
+                phase5_chunk_cap_bytes = int(reproj_kwargs.get("max_chunk_bytes") or 0) or None
+            except Exception:
+                phase5_chunk_cap_bytes = None
+
+    phase5_safe_mode_env = _phase5_safe_mode_env_enabled()
+    if not phase5_safe_mode_env and gpu_safety_ctx_phase5 is not None:
+        try:
+            phase5_safe_mode_env = bool(getattr(gpu_safety_ctx_phase5, "safe_mode", False))
+        except Exception:
+            phase5_safe_mode_env = False
+
+    def _refresh_phase5_gpu_hints(call_kwargs: dict) -> None:
+        if not use_gpu:
+            return
+        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
+            return
+        probe = getattr(zemosaic_utils, "_probe_free_vram_bytes", None)
+        if not callable(probe):
+            return
+        try:
+            free_bytes = probe()
+        except Exception:
+            free_bytes = None
+
+        budget_bytes, budget_meta = _compute_phase5_vram_budget_bytes(
+            gpu_safety_ctx_phase5,
+            worker_config_cache,
+            phase5_safe_mode_env,
+            vram_free_bytes_override=free_bytes,
+            phase5_chunk_cap_bytes=phase5_chunk_cap_bytes,
+        )
+        if budget_bytes <= 0:
+            _pcb(
+                "Phase5 GPU VRAM refresh skipped/normalized: invalid budget, keeping plan hints",
+                lvl="INFO_DETAIL",
+            )
+            return
+        rows_hint = None
+        try:
+            rows_hint = int(h)
+        except Exception:
+            rows_hint = None
+        if rows_hint is None or rows_hint <= 0:
+            try:
+                rows_hint = int(call_kwargs.get("rows_per_chunk") or 0)
+            except Exception:
+                rows_hint = None
+        if rows_hint is None or rows_hint <= 0:
+            _pcb(
+                "Phase5 GPU VRAM refresh skipped/normalized: invalid rows_hint, keeping plan hints",
+                lvl="INFO_DETAIL",
+            )
+            return
+        if phase5_safe_mode_env:
+            rows_hint = min(rows_hint, 256)
+        call_kwargs["rows_per_chunk"] = int(max(1, rows_hint))
+        call_kwargs["max_chunk_bytes"] = int(max(1, budget_bytes))
+        free_mb_val = budget_meta.get("vram_free_mb")
+        free_mb = f"{free_mb_val:.1f}" if free_mb_val is not None else "n/a"
+        budget_mb = float(budget_meta.get("budget_mb") or 0.0)
+        cap_mb = budget_meta.get("phase5_chunk_cap_mb")
+        cap_mb_text = f"{cap_mb:.1f}" if cap_mb else "n/a"
+        reserve_mb = int(budget_meta.get("reserve_mb") or 0)
+        fraction = float(budget_meta.get("fraction") or 0.0)
+        reasons_str = ",".join(budget_meta.get("reasons") or [])
+        _pcb(
+            (
+                "Phase5 GPU VRAM refresh free_vram_mb={} budget_mb={:.1f} frac={:.2f} "
+                "reserve_mb={} rows_hint={} cap_mb={} safe_mode={} reasons=[{}]"
+            ).format(
+                free_mb,
+                budget_mb,
+                fraction,
+                reserve_mb,
+                int(rows_hint),
+                cap_mb_text,
+                1 if phase5_safe_mode_env else 0,
+                reasons_str,
+            ),
+            lvl="INFO_DETAIL",
+        )
+
     # If we are going to use the GPU, pass the precomputed affine corrections down
     # so they are applied inside the GPU reprojection (parity with CPU path).
     if use_gpu and tile_affine_for_gpu is not None:
@@ -14432,7 +15664,7 @@ def assemble_final_mosaic_reproject_coadd(
                     coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
                     if coverage_mask is not None:
                         try:
-                            weight_candidate = np.asarray(coverage_mask, dtype=np.float32, order="C", copy=False)
+                            weight_candidate = np.asarray(coverage_mask, dtype=np.float32, order="C")
                             if weight_candidate.shape == data_plane.shape:
                                 weight2d = np.clip(
                                     np.nan_to_num(weight_candidate, nan=0.0, posinf=0.0, neginf=0.0),
@@ -14444,6 +15676,36 @@ def assemble_final_mosaic_reproject_coadd(
                             weight2d = None
                     if weight2d is None:
                         weight2d = np.ones_like(data_plane, dtype=np.float32)
+
+                if (
+                    apply_radial_weight
+                    and ZEMOSAIC_UTILS_AVAILABLE
+                    and zemosaic_utils
+                    and hasattr(zemosaic_utils, "make_radial_weight_map")
+                ):
+                    radial2d = entry.get("radial_weight2d") if isinstance(entry, dict) else None
+                    if radial2d is None:
+                        try:
+                            radial2d = zemosaic_utils.make_radial_weight_map(
+                                int(data_plane.shape[0]),
+                                int(data_plane.shape[1]),
+                                feather_fraction=float(radial_feather_fraction),
+                                shape_power=float(radial_shape_power),
+                                min_weight_floor=float(min_radial_weight_floor),
+                                progress_callback=_pcb if progress_callback else None,
+                            )
+                            radial2d = np.asarray(radial2d, dtype=np.float32)
+                            if radial2d.shape != data_plane.shape:
+                                radial2d = None
+                        except Exception:
+                            radial2d = None
+                        if radial2d is not None and isinstance(entry, dict):
+                            entry["radial_weight2d"] = radial2d
+                    if isinstance(radial2d, np.ndarray) and radial2d.shape == weight2d.shape:
+                        weight2d = (weight2d.astype(np.float32, copy=False) * radial2d).astype(
+                            np.float32, copy=False
+                        )
+                        weight_source_base = f"{weight_source_base}*radial"
                 if tile_weighting_applied:
                     try:
                         tw_raw = entry.get("tile_weight", 1.0) if isinstance(entry, dict) else 1.0
@@ -14520,6 +15782,9 @@ def assemble_final_mosaic_reproject_coadd(
                             "[GPU Reproject] Ignoring unsupported kwarg: %s",
                             unsupported_kw,
                         )
+                _refresh_phase5_gpu_hints(reproj_call_kwargs)
+                reproj_call_kwargs["_phase5_oom_retry"] = True
+                reproj_call_kwargs["_phase5_oom_retry_max"] = 3
 
             def _invoke_reproject(local_kwargs: dict):
                 invoke_kwargs = dict(local_kwargs)
@@ -14793,7 +16058,7 @@ def assemble_final_mosaic_reproject_coadd(
             logger.debug("alpha_from_coverage: override skipped due to error: %s", exc_alpha_cov)
     if existing_master_tiles_mode and mosaic_data is not None and isinstance(coverage, np.ndarray):
         try:
-            data_arr = np.asarray(mosaic_data, dtype=np.float32, copy=False)
+            data_arr = np.asarray(mosaic_data, dtype=np.float32)
             cov_mask_bool = np.asarray(coverage, dtype=np.float32, order="C")
             cov_mask_bool = np.nan_to_num(cov_mask_bool, nan=0.0, posinf=0.0, neginf=0.0) > 0.0
             if data_arr.ndim >= 2 and cov_mask_bool.shape == data_arr.shape[:2]:
@@ -14851,7 +16116,7 @@ def assemble_final_mosaic_reproject_coadd(
         except Exception:
             alpha_zero_mask = None
     if mosaic_data is not None and coverage is not None:
-        mosaic_data = np.asarray(mosaic_data, dtype=np.float32, copy=False)
+        mosaic_data = np.asarray(mosaic_data, dtype=np.float32)
         mosaic_data[~np.isfinite(mosaic_data)] = np.nan
         nanized_mask = coverage <= 0
         if alpha_zero_mask is not None:
@@ -14918,7 +16183,7 @@ def _load_master_tiles_for_two_pass(
                 alpha_arr = alpha_arr / max_alpha
             coverage_map = np.clip(alpha_arr, 0.0, 1.0).astype(np.float32, copy=False)
         else:
-            arr_np = np.asarray(data, dtype=np.float32, copy=False)
+            arr_np = np.asarray(data, dtype=np.float32)
             mask_valid = np.any(np.isfinite(arr_np), axis=-1) if arr_np.ndim == 3 else np.isfinite(arr_np)
             coverage_map = mask_valid.astype(np.float32)
         current_wcs = tile_wcs
@@ -15181,8 +16446,8 @@ def _compute_tile_gain_task(args: tuple) -> tuple[int, float]:
     if shape[0] <= 0 or shape[1] <= 0:
         return idx, 1.0
     try:
-        coverage_global = np.asarray(coverage_arr, dtype=np.float32, copy=False)
-        coverage_blur_global = np.asarray(coverage_blur, dtype=np.float32, copy=False)
+        coverage_global = np.asarray(coverage_arr, dtype=np.float32)
+        coverage_blur_global = np.asarray(coverage_blur, dtype=np.float32)
     except Exception:
         return idx, 1.0
     if coverage_global.shape != tuple(coverage_shape) or coverage_blur_global.shape != tuple(coverage_shape):
@@ -15193,7 +16458,7 @@ def _compute_tile_gain_task(args: tuple) -> tuple[int, float]:
             return idx, 1.0
     cov_arr = None
     if coverage_src is not None:
-        cov_arr = np.asarray(coverage_src, dtype=np.float32, copy=False)
+        cov_arr = np.asarray(coverage_src, dtype=np.float32)
         if cov_arr.ndim > 2:
             cov_arr = np.squeeze(cov_arr)
     if cov_arr is None:
@@ -15368,7 +16633,7 @@ def compute_per_tile_gains_from_coverage(
     )
     with np.errstate(divide="ignore", invalid="ignore"):
         cov_blur = np.where(cov_blur_den > 0, cov_blur_num / cov_blur_den, 0.0)
-    cov_blur = np.asarray(cov_blur, dtype=np.float32, copy=False)
+    cov_blur = np.asarray(cov_blur, dtype=np.float32)
     if logger:
         logger.debug(
             "[TwoPass] Normalized coverage blur applied with sigma=%d using %s/%s (rows_per_chunk=%d, chunk_bytes=%s)",
@@ -16111,8 +17376,9 @@ def run_second_pass_coverage_renorm(
             try:
                 mosaics, covs = _run_channels(use_gpu)
                 backend_used_gpu = bool(use_gpu)
-            except Exception:
+            except Exception as gpu_exc:
                 if use_gpu:
+                    _disable_phase5_gpu_runtime_state("two_pass_gpu_failure", gpu_exc)
                     mosaics, covs = _run_channels(False)
                     backend_used_gpu = False
                 else:
@@ -16123,6 +17389,7 @@ def run_second_pass_coverage_renorm(
                     mosaics, covs = _run_channels(True)
                     backend_used_gpu = True
                 except Exception as gpu_exc:
+                    _disable_phase5_gpu_runtime_state("two_pass_gpu_failure", gpu_exc)
                     if logger:
                         logger.warning(
                             "[TwoPass] GPU reprojection failed on one or more channels; rerunning all channels on CPU to avoid mixed backend (%s)",
@@ -16161,9 +17428,9 @@ def run_second_pass_coverage_renorm(
         force=True,
         stage="reproject_done",
     )
-    coverage_result = np.asarray(coverage_result, dtype=np.float32, copy=False)
+    coverage_result = np.asarray(coverage_result, dtype=np.float32)
     coverage_result = np.where(np.isfinite(coverage_result), coverage_result, 0.0).astype(np.float32, copy=False)
-    mosaic = np.asarray(mosaic, dtype=np.float32, copy=False)
+    mosaic = np.asarray(mosaic, dtype=np.float32)
     mosaic[~np.isfinite(mosaic)] = np.nan
     nanized_mask = coverage_result <= 0
     nanized_pixels = int(np.count_nonzero(nanized_mask))
@@ -16278,6 +17545,7 @@ def run_hierarchical_mosaic_classic_legacy(
     intertile_global_recenter_config: bool = True,
     intertile_recenter_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile_config: bool = False,
+    intertile_force_safe_mode_config: bool = False,
     match_background_for_final_config: bool = True,
     incremental_feather_parity_config: bool = False,
     two_pass_coverage_renorm_config: bool = False,
@@ -16375,15 +17643,83 @@ def run_hierarchical_mosaic_classic_legacy(
         filter_overrides,
     )
 
+    plan_override_raw = filter_overrides.get("global_wcs_plan_override") if isinstance(filter_overrides, dict) else None
+    plan_override = plan_override_raw if isinstance(plan_override_raw, dict) else {}
+
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return default
+                return int(float(text))
+            return int(value)
+        except Exception:
+            return default
+
+    eqmode_summary_source = plan_override.get("eqmode_summary") if isinstance(plan_override, dict) else None
+    if not isinstance(eqmode_summary_source, dict):
+        meta_src = global_wcs_plan.get("meta")
+        if isinstance(meta_src, dict):
+            eqmode_summary_source = meta_src.get("eqmode_summary")
+    if not isinstance(eqmode_summary_source, dict) and isinstance(filter_overrides, dict):
+        eqmode_summary_source = filter_overrides.get("eqmode_summary")
+
+    summary_payload = eqmode_summary_source if isinstance(eqmode_summary_source, dict) else {}
+    eq_count = _safe_int(summary_payload.get("eq_count"), 0)
+    altaz_count = _safe_int(summary_payload.get("altaz_count"), 0)
+    unknown_count = _safe_int(summary_payload.get("unknown_count"), 0)
+    total_count = _safe_int(summary_payload.get("total"), eq_count + altaz_count + unknown_count)
+    contains_altaz = altaz_count > 0
+    try:
+        logger.info(
+            "WORKER_EQMODE_SUMMARY: eq=%d altaz=%d unknown=%d total=%d contains_altaz=%s",
+            eq_count,
+            altaz_count,
+            unknown_count,
+            total_count,
+            contains_altaz,
+        )
+    except Exception:
+        pass
+
+    meta = global_wcs_plan.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        global_wcs_plan["meta"] = meta
+    meta["eqmode_summary"] = {
+        "eq_count": eq_count,
+        "altaz_count": altaz_count,
+        "unknown_count": unknown_count,
+        "total": total_count,
+    }
+    global_wcs_plan["eqmode_summary"] = dict(meta["eqmode_summary"])
+
     quality_crop_requested_flag = bool(quality_crop_enabled_config)
     altaz_cleanup_requested_flag = bool(altaz_cleanup_enabled_config)
+    altaz_cleanup_effective_flag = bool(altaz_cleanup_requested_flag)
+    if contains_altaz:
+        if not altaz_cleanup_effective_flag:
+            try:
+                logger.info("AUTO_ALTaz_cleanup: enabled (contains_altaz=True, config_requested=False)")
+            except Exception:
+                pass
+        altaz_cleanup_effective_flag = True
     lecropper_pipeline_flag = (
-        bool(_LECROPPER_AVAILABLE) and (quality_crop_requested_flag or altaz_cleanup_requested_flag)
+        bool(_LECROPPER_AVAILABLE) and (quality_crop_requested_flag or altaz_cleanup_effective_flag)
     )
     pipeline_flags_msg = (
         f"MT_PIPELINE_FLAGS: lecropper_enabled={lecropper_pipeline_flag}, "
         f"quality_crop_enabled={quality_crop_requested_flag}, "
-        f"altaz_cleanup_enabled={altaz_cleanup_requested_flag}, "
+        f"altaz_cleanup_enabled={altaz_cleanup_effective_flag}, "
         f"lecropper_available={bool(_LECROPPER_AVAILABLE)}"
     )
     logger.info(pipeline_flags_msg)
@@ -16397,12 +17733,10 @@ def run_hierarchical_mosaic_classic_legacy(
     override_defined = False
     plan_override_flag = None
     plan_override_defined = False
-    plan_override = None
     if isinstance(filter_overrides, dict):
         if "sds_mode" in filter_overrides:
             override_flag = _coerce_bool_flag(filter_overrides.get("sds_mode"))
             override_defined = override_flag is not None
-        plan_override = filter_overrides.get("global_wcs_plan_override")
     if isinstance(plan_override, dict) and "sds_mode" in plan_override:
         plan_override_flag = _coerce_bool_flag(plan_override.get("sds_mode"))
         plan_override_defined = plan_override_flag is not None
@@ -16642,6 +17976,9 @@ def run_hierarchical_mosaic_classic_legacy(
     phase0_header_items: list[dict] = []
     phase0_lookup: dict[str, dict] = {}
     preplan_groups_override_paths: list[list[str]] | None = None
+    seestar_stack_groups: list[list[dict]] = []
+    num_seestar_stacks_to_process = 0
+    phase2_completed = False
     intertile_match_flag = bool(intertile_photometric_match_config)
     match_background_flag = (
         True
@@ -16770,6 +18107,379 @@ def run_hierarchical_mosaic_classic_legacy(
         if num_tasks > 0:
             workers = min(workers, num_tasks)
         return max(1, workers)
+
+    def _normalize_resume_mode(value: Any) -> str:
+        try:
+            mode = str(value).strip().lower()
+        except Exception:
+            return "off"
+        return mode if mode in {"off", "auto", "force"} else "off"
+
+    def _header_to_string(header_obj: Any) -> str | None:
+        if header_obj is None:
+            return None
+        try:
+            return header_obj.tostring(sep="\n", endcard=False, padding=False)
+        except TypeError:
+            pass
+        except Exception:
+            return None
+        try:
+            return header_obj.tostring(sep="\n", endcard=False)
+        except Exception:
+            try:
+                return header_obj.tostring(sep="\n")
+            except Exception:
+                return None
+
+    def _serialize_shape(value: Any) -> list[int] | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            try:
+                return [int(v) for v in value]
+            except Exception:
+                return None
+        return None
+
+    def _serialize_center(value: Any) -> list[float] | None:
+        if value is None:
+            return None
+        if hasattr(value, "ra") and hasattr(value.ra, "deg"):
+            try:
+                return [float(value.ra.deg), float(value.dec.deg)]
+            except Exception:
+                return None
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                return [float(value[0]), float(value[1])]
+            except Exception:
+                return None
+        return None
+
+    def _serialize_phase1_entry(entry: dict) -> dict | None:
+        if not isinstance(entry, dict):
+            return None
+        path_raw = entry.get("path_raw")
+        path_cache = entry.get("path_preprocessed_cache")
+        header_str = _header_to_string(entry.get("header"))
+        if not (path_raw and path_cache and header_str):
+            return None
+        shape = _serialize_shape(entry.get("preprocessed_shape"))
+        if not shape:
+            return None
+        record = {
+            "path_raw": str(path_raw),
+            "path_preprocessed_cache": str(path_cache),
+            "path_hotpix_mask": str(entry["path_hotpix_mask"])
+            if entry.get("path_hotpix_mask") is not None
+            else None,
+            "preprocessed_shape": shape,
+            "header_str": header_str,
+        }
+        if "phase0_index" in entry:
+            try:
+                record["phase0_index"] = int(entry.get("phase0_index"))
+            except Exception:
+                pass
+        phase0_center = _serialize_center(entry.get("phase0_center"))
+        if phase0_center is not None:
+            record["phase0_center"] = phase0_center
+        phase0_shape = _serialize_shape(entry.get("phase0_shape"))
+        if phase0_shape is not None:
+            record["phase0_shape"] = phase0_shape
+        return record
+
+    def _scan_input_fits_paths(
+        input_root: str,
+        output_root: str,
+        config_cache: dict,
+    ) -> list[str]:
+        fits_paths: list[str] = []
+        try:
+            output_abs = Path(output_root).expanduser().resolve() if output_root else None
+            output_abs_norm = _normcase_path(output_abs) if output_abs else None
+        except Exception:
+            output_abs = None
+            output_abs_norm = None
+        try:
+            wcs_out_base = _safe_basename(
+                (config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")
+            ).strip().lower()
+        except Exception:
+            wcs_out_base = "global_mosaic_wcs.fits"
+        for root_dir_iter, dirnames_iter, files_in_dir_iter in os.walk(input_root):
+            root_path = Path(root_dir_iter)
+            try:
+                filtered_dirs = []
+                for d in dirnames_iter:
+                    child = root_path / d
+                    if is_path_excluded(child, EXCLUDED_DIRS):
+                        continue
+                    try:
+                        if output_abs_norm:
+                            try:
+                                child_norm = _normcase_path(child.resolve())
+                            except Exception:
+                                child_norm = _normcase_path(child)
+                            if child_norm.startswith(output_abs_norm):
+                                continue
+                    except Exception:
+                        pass
+                    filtered_dirs.append(d)
+                dirnames_iter[:] = filtered_dirs
+            except Exception:
+                dirnames_iter[:] = [
+                    d
+                    for d in dirnames_iter
+                    if UNALIGNED_DIRNAME not in (root_path / d).parts
+                ]
+            try:
+                files_in_dir_iter = sorted(files_in_dir_iter, key=lambda s: s.lower())
+            except Exception:
+                files_in_dir_iter = list(files_in_dir_iter)
+            for file_name_iter in files_in_dir_iter:
+                if not file_name_iter.lower().endswith((".fit", ".fits")):
+                    continue
+                full_path = root_path / file_name_iter
+                try:
+                    if is_path_excluded(full_path, EXCLUDED_DIRS):
+                        continue
+                except Exception:
+                    if UNALIGNED_DIRNAME in full_path.parts:
+                        continue
+                try:
+                    if wcs_out_base and file_name_iter.strip().lower() == wcs_out_base:
+                        continue
+                except Exception:
+                    pass
+                fits_paths.append(str(full_path))
+        try:
+            fits_paths.sort(key=lambda p: p.lower())
+        except Exception:
+            fits_paths.sort()
+        return fits_paths
+
+    def _build_input_fingerprint(fits_paths: list[str], base_folder: str) -> list[dict]:
+        fingerprint: list[dict] = []
+        base_path = Path(base_folder).expanduser()
+        for path_str in fits_paths:
+            try:
+                stat = os.stat(path_str)
+            except Exception:
+                continue
+            try:
+                rel_path = os.path.relpath(path_str, base_path)
+            except Exception:
+                rel_path = os.path.basename(path_str)
+            rel_path = rel_path.replace(os.sep, "/")
+            fingerprint.append(
+                {
+                    "path": rel_path,
+                    "size": int(stat.st_size),
+                    "mtime": int(stat.st_mtime),
+                }
+            )
+        fingerprint.sort(key=lambda item: item["path"])
+        return fingerprint
+
+    def _signature_payload_from_fingerprint(fingerprint: list[dict]) -> dict:
+        solver_subset: dict[str, Any] = {}
+        if isinstance(solver_settings, dict):
+            for key in (
+                "force_resolve_existing_wcs",
+                "astap_drizzled_fallback_enabled",
+                "intertile_offset_limit_adu",
+                "intertile_gain_limits",
+            ):
+                if key in solver_settings:
+                    value = solver_settings.get(key)
+                    if isinstance(value, (list, tuple)):
+                        try:
+                            solver_subset[key] = [float(v) for v in value]
+                        except Exception:
+                            solver_subset[key] = list(value)
+                    else:
+                        solver_subset[key] = value
+        preprocess_subset: dict[str, Any] = {}
+        for key in ("preprocess_remove_background_gpu", "preprocess_background_sigma", "force_resolve_existing_wcs"):
+            if key in (worker_config_cache or {}):
+                preprocess_subset[key] = (worker_config_cache or {}).get(key)
+        payload = {
+            "pipeline": "classic_legacy",
+            "input_fingerprint": fingerprint,
+            "astap": {
+                "search_radius": astap_search_radius_config,
+                "downsample": astap_downsample_config,
+                "sensitivity": astap_sensitivity_config,
+                "timeout_sec": 180,
+            },
+            "solver_settings": solver_subset,
+            "preprocess": preprocess_subset,
+        }
+        return payload
+
+    def _compute_run_signature(payload: dict) -> str:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _compute_current_signature() -> tuple[str | None, dict | None, list[str] | None]:
+        try:
+            fits_paths = _scan_input_fits_paths(
+                input_folder,
+                output_folder,
+                worker_config_cache,
+            )
+            fingerprint = _build_input_fingerprint(fits_paths, input_folder)
+            payload = _signature_payload_from_fingerprint(fingerprint)
+            signature = _compute_run_signature(payload)
+            return signature, payload, fits_paths
+        except Exception:
+            return None, None, None
+
+    def _normalize_manifest_path(path_value: str | None) -> str:
+        if not path_value:
+            return ""
+        try:
+            path_obj = Path(path_value).expanduser().resolve()
+        except Exception:
+            path_obj = Path(path_value).expanduser()
+        return _normcase_path(path_obj)
+
+    def _try_resume_phase1(
+        cache_dir: str,
+        resume_mode: str,
+        signature_current: str | None,
+    ) -> tuple[bool, list[dict] | None, str]:
+        if resume_mode not in {"auto", "force"}:
+            return False, None, "resume disabled"
+        manifest_path = os.path.join(cache_dir, "cache_manifest.json")
+        if not _path_exists(manifest_path):
+            return False, None, "manifest missing"
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh_manifest:
+                manifest = json.load(fh_manifest)
+        except Exception as exc:
+            return False, None, f"manifest invalid ({exc})"
+        if not isinstance(manifest, dict):
+            return False, None, "manifest invalid"
+        if int(manifest.get("schema_version", -1)) != 1:
+            return False, None, "schema_version mismatch"
+        if str(manifest.get("pipeline", "")).strip().lower() != "classic_legacy":
+            return False, None, "pipeline mismatch"
+        phase1_meta = manifest.get("phase1") if isinstance(manifest.get("phase1"), dict) else {}
+        done_marker_name = phase1_meta.get("done_marker") or "phase1.done"
+        processed_name = phase1_meta.get("processed_info_file") or "phase1_processed_info.json"
+        done_marker_path = os.path.join(cache_dir, done_marker_name)
+        processed_path = os.path.join(cache_dir, processed_name)
+        if not _path_exists(done_marker_path):
+            return False, None, "phase1.done missing"
+        if not _path_exists(processed_path):
+            return False, None, "phase1_processed_info.json missing"
+        manifest_signature = manifest.get("run_signature")
+        if resume_mode == "auto":
+            if not manifest_signature or not signature_current or manifest_signature != signature_current:
+                return False, None, "signature mismatch"
+        else:
+            if not manifest_signature or not signature_current:
+                pcb("Resume force: signature unavailable, proceeding.", prog=None, lvl="WARN")
+            elif manifest_signature != signature_current:
+                pcb("Resume force: signature mismatch ignored.", prog=None, lvl="WARN")
+        try:
+            with open(processed_path, "r", encoding="utf-8") as fh_info:
+                processed_info = json.load(fh_info)
+        except Exception as exc:
+            return False, None, f"processed info invalid ({exc})"
+        if not isinstance(processed_info, list) or not processed_info:
+            return False, None, "processed info empty"
+        if not (ASTROPY_AVAILABLE and fits is not None and WCS is not None):
+            return False, None, "astropy unavailable"
+        loaded_entries: list[dict] = []
+        for idx, item in enumerate(processed_info):
+            if not isinstance(item, dict):
+                return False, None, f"entry {idx} invalid"
+            path_raw = item.get("path_raw")
+            path_cache = item.get("path_preprocessed_cache")
+            header_str = item.get("header_str")
+            if not (path_raw and path_cache and header_str):
+                return False, None, f"entry {idx} missing required fields"
+            if not _path_exists(path_cache):
+                return False, None, f"entry {idx} cache missing"
+            try:
+                header = fits.Header.fromstring(header_str, sep="\n")
+            except Exception as exc:
+                return False, None, f"entry {idx} header invalid ({exc})"
+            try:
+                wcs_obj = WCS(header, naxis=2, relax=True)
+            except Exception:
+                try:
+                    wcs_obj = WCS(header, naxis=2)
+                except Exception:
+                    try:
+                        wcs_obj = WCS(header)
+                    except Exception as exc:
+                        return False, None, f"entry {idx} wcs invalid ({exc})"
+            entry = dict(item)
+            entry["path_raw"] = str(path_raw)
+            entry["path_preprocessed_cache"] = str(path_cache)
+            if entry.get("path_hotpix_mask") is not None:
+                entry["path_hotpix_mask"] = str(entry["path_hotpix_mask"])
+            if isinstance(entry.get("preprocessed_shape"), list):
+                try:
+                    entry["preprocessed_shape"] = tuple(
+                        int(v) for v in entry["preprocessed_shape"]
+                    )
+                except Exception:
+                    pass
+            entry["header"] = header
+            entry["wcs"] = wcs_obj
+            entry.pop("header_str", None)
+            loaded_entries.append(entry)
+        return True, loaded_entries, "ok"
+
+    def _write_phase1_resume_cache(
+        cache_dir: str,
+        entries: list[dict],
+        signature_payload: dict | None,
+        signature_current: str | None,
+    ) -> None:
+        if not entries:
+            raise ValueError("no entries to serialize")
+        serialized_entries: list[dict] = []
+        for entry in entries:
+            serialized = _serialize_phase1_entry(entry)
+            if not serialized:
+                raise ValueError("entry not serializable for resume cache")
+            serialized_entries.append(serialized)
+        if not signature_current or signature_payload is None:
+            signature_current, signature_payload, _ = _compute_current_signature()
+        if not signature_current or signature_payload is None:
+            raise ValueError("signature unavailable")
+        processed_name = "phase1_processed_info.json"
+        done_marker = "phase1.done"
+        manifest_path = os.path.join(cache_dir, "cache_manifest.json")
+        processed_path = os.path.join(cache_dir, processed_name)
+        done_marker_path = os.path.join(cache_dir, done_marker)
+        manifest = {
+            "schema_version": 1,
+            "pipeline": "classic_legacy",
+            "created_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "run_signature": signature_current,
+            "input_folder_norm": _normalize_manifest_path(input_folder),
+            "output_folder_norm": _normalize_manifest_path(output_folder),
+            "phase1": {
+                "done": True,
+                "done_marker": done_marker,
+                "processed_info_file": processed_name,
+                "num_entries": len(serialized_entries),
+            },
+        }
+        with open(processed_path, "w", encoding="utf-8") as fh_info:
+            json.dump(serialized_entries, fh_info, indent=2, sort_keys=True, ensure_ascii=True)
+        with open(manifest_path, "w", encoding="utf-8") as fh_manifest:
+            json.dump(manifest, fh_manifest, indent=2, sort_keys=True, ensure_ascii=True)
+        with open(done_marker_path, "w", encoding="utf-8") as fh_done:
+            fh_done.write("done\n")
     current_global_progress = 0
     
     error_messages_deps = []
@@ -16816,14 +18526,281 @@ def run_hierarchical_mosaic_classic_legacy(
     pcb(f"  Options Assemblage Final: Méthode='{final_assembly_method_config}'", prog=None, lvl="DEBUG_DETAIL")
 
     time_per_raw_file_wcs = None; time_per_master_tile_creation = None
+    resume_mode_raw = None
+    resume_mode_source = "default"
+    if isinstance(filter_overrides, dict) and "resume" in filter_overrides:
+        resume_mode_raw = filter_overrides.get("resume")
+        resume_mode_source = "filter_overrides"
+    if resume_mode_raw is None:
+        resume_mode_raw = worker_config_cache.get("resume")
+        if resume_mode_raw is not None:
+            resume_mode_source = "config"
+    resume_mode = _normalize_resume_mode(resume_mode_raw)
+    resume_after_phase1 = False
+    resume_signature_payload: dict | None = None
+    resume_signature_current: str | None = None
+    all_raw_files_processed_info: list[dict] = []
     cache_dir_name = ".zemosaic_img_cache"
     temp_image_cache_dir = str(Path(output_folder).expanduser() / cache_dir_name)
     temp_master_tile_storage_dir: str | None = None
-    try:
-        if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
-        os.makedirs(temp_image_cache_dir, exist_ok=True)
-    except OSError as e_mkdir_cache:
-        pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
+    pcb(
+        f"Resume mode resolved: {resume_mode} (source={resume_mode_source})",
+        prog=None,
+        lvl="INFO",
+    )
+    if resume_mode != "off":
+        pcb(f"Resume requested: mode={resume_mode}", prog=None, lvl="INFO")
+        if sds_mode_flag or use_existing_master_tiles_config:
+            pcb(
+                "Resume disabled (mode incompatible).",
+                prog=None,
+                lvl="INFO",
+                sds_mode=bool(sds_mode_flag),
+                use_existing_master_tiles_config=bool(use_existing_master_tiles_config),
+            )
+            resume_mode = "off"
+    else:
+        pcb("Resume skipped (mode=off).", prog=None, lvl="INFO")
+    if resume_mode == "off":
+        try:
+            if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
+            os.makedirs(temp_image_cache_dir, exist_ok=True)
+        except OSError as e_mkdir_cache:
+            pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
+    else:
+        resume_signature_current, resume_signature_payload, _ = _compute_current_signature()
+        resume_ok, loaded_info, resume_reason = _try_resume_phase1(
+            temp_image_cache_dir,
+            resume_mode,
+            resume_signature_current,
+        )
+        if resume_ok and loaded_info:
+            resume_after_phase1 = True
+            all_raw_files_processed_info = loaded_info
+            num_total_raw_files = len(all_raw_files_processed_info)
+            base_progress_phase1 = current_global_progress
+            current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+            pcb(
+                f"Resume accepted: Phase 1 skipped (resume), entries={num_total_raw_files}",
+                prog=current_global_progress,
+                lvl="INFO",
+                num_valid_raws=num_total_raw_files,
+            )
+            phase0_header_items = []
+            for info in all_raw_files_processed_info:
+                entry_path = info.get("path_raw")
+                shape = info.get("preprocessed_shape")
+                header = info.get("header")
+                item = {"path": entry_path}
+                if shape:
+                    item["shape"] = shape
+                elif header is not None:
+                    item["header"] = header
+                phase0_header_items.append(item)
+            phase0_lookup = {
+                item["path"]: item
+                for item in phase0_header_items
+                if isinstance(item, dict) and item.get("path")
+            }
+            if isinstance(filter_overrides, dict):
+                try:
+                    if "cluster_panel_threshold" in filter_overrides:
+                        cluster_threshold_config = filter_overrides["cluster_panel_threshold"]
+                        pcb(
+                            "clusterstacks_info_override_threshold",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_threshold_config,
+                        )
+                    if "cluster_target_groups" in filter_overrides:
+                        cluster_target_groups_config = filter_overrides["cluster_target_groups"]
+                        pcb(
+                            "clusterstacks_info_override_target_groups",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_target_groups_config,
+                        )
+                    if "cluster_orientation_split_deg" in filter_overrides:
+                        cluster_orientation_split_deg_config = filter_overrides["cluster_orientation_split_deg"]
+                        pcb(
+                            "clusterstacks_info_override_orientation_split",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_orientation_split_deg_config,
+                        )
+                except Exception:
+                    pass
+                try:
+                    raw_groups_override = filter_overrides.get("preplan_master_groups")
+                    if isinstance(raw_groups_override, list):
+                        mapped_groups: list[list[str]] = []
+                        for group in raw_groups_override:
+                            if not isinstance(group, (list, tuple)):
+                                continue
+                            normalized_group: list[str] = []
+                            for item in group:
+                                path_val = None
+                                if isinstance(item, dict):
+                                    path_val = item.get("path") or item.get("path_raw")
+                                elif isinstance(item, str):
+                                    path_val = item
+                                norm_path = _normalize_path_for_matching(path_val)
+                                if norm_path:
+                                    normalized_group.append(norm_path)
+                            if normalized_group:
+                                mapped_groups.append(normalized_group)
+                        if mapped_groups:
+                            preplan_groups_override_paths = mapped_groups
+                            pcb(
+                                f"Resume: using {len(mapped_groups)} preplanned group(s) from filter overrides.",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                            )
+                except Exception as e_preplan:
+                    pcb(
+                        f"Resume preplan override failed: {e_preplan}",
+                        prog=None,
+                        lvl="DEBUG_DETAIL",
+                    )
+            per_frame_info = _estimate_per_frame_cost_mb(phase0_header_items)
+            auto_caps_info = _compute_auto_tile_caps(
+                resource_probe_info,
+                per_frame_info,
+                policy_max=0,
+                policy_min=8,
+                user_max_override=int(max_raw_per_master_tile_config) if max_raw_per_master_tile_config else None,
+            )
+            try:
+                msg = (
+                    "AutoCaps: per_frame≈{pf:.1f} MB, RAM_free≈{rf:.0f} MB → "
+                    "frames_by_ram={fbr}, cap={cap}, memmap={mm}, GPUHint={gpu}, parallel={par}".format(
+                        pf=auto_caps_info.get("per_frame_mb", 0.0),
+                        rf=resource_probe_info.get("ram_available_mb", 0.0) or 0.0,
+                        fbr=auto_caps_info.get("frames_by_ram", 0),
+                        cap=auto_caps_info.get("cap"),
+                        mm="on" if auto_caps_info.get("memmap") else "off",
+                        gpu=auto_caps_info.get("gpu_batch_hint") or "n/a",
+                        par=auto_caps_info.get("parallel_groups", 1),
+                    )
+                )
+                _log_and_callback(msg, prog=None, lvl="INFO_DETAIL", callback=progress_callback)
+            except Exception:
+                pass
+            auto_resource_strategy = {
+                "cap": auto_caps_info.get("cap"),
+                "min_cap": auto_caps_info.get("min_cap"),
+                "memmap": auto_caps_info.get("memmap"),
+                "memmap_budget_mb": auto_caps_info.get("memmap_budget_mb"),
+                "gpu_batch_hint": auto_caps_info.get("gpu_batch_hint"),
+                "parallel_groups": auto_caps_info.get("parallel_groups"),
+                "per_frame_mb": auto_caps_info.get("per_frame_mb"),
+            }
+            parallel_caps: ParallelCapabilities | None = None  # type: ignore[assignment]
+            global_parallel_plan: ParallelPlan | None = None  # type: ignore[assignment]
+            if PARALLEL_HELPERS_AVAILABLE:
+                try:
+                    parallel_caps = detect_parallel_capabilities()
+                except Exception as exc_parallel_caps:
+                    parallel_caps = None
+                    logger.warning("Parallel capability detection failed: %s", exc_parallel_caps)
+                frame_h = 0
+                frame_w = 0
+                if isinstance(global_wcs_plan, dict):
+                    try:
+                        frame_h = int(global_wcs_plan.get("height") or 0)
+                    except Exception:
+                        frame_h = 0
+                    try:
+                        frame_w = int(global_wcs_plan.get("width") or 0)
+                    except Exception:
+                        frame_w = 0
+                frame_shape = (frame_h, frame_w) if (frame_h > 0 and frame_w > 0) else (frame_h, frame_w)
+                try:
+                    global_parallel_plan = auto_tune_parallel_plan(
+                        kind="global",
+                        frame_shape=frame_shape,
+                        n_frames=max(1, num_total_raw_files),
+                        bytes_per_pixel=4,
+                        config=worker_config_cache,
+                        caps=parallel_caps,
+                    )
+                    global_parallel_plan, gpu_safety_ctx_global = apply_gpu_safety_to_parallel_plan(
+                        global_parallel_plan,
+                        parallel_caps,
+                        worker_config_cache,
+                        operation="global",
+                        logger=logger,
+                    )
+                    worker_config_cache["parallel_plan"] = global_parallel_plan
+                    setattr(zconfig, "parallel_plan", global_parallel_plan)
+                    if parallel_caps is not None:
+                        worker_config_cache["parallel_capabilities"] = parallel_caps
+                        setattr(zconfig, "parallel_capabilities", parallel_caps)
+                    try:
+                        pcb(
+                            "parallel_plan_summary",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            cpu_workers=int(getattr(global_parallel_plan, "cpu_workers", 0)),
+                            use_gpu=bool(getattr(global_parallel_plan, "use_gpu", False)),
+                            rows=int(getattr(global_parallel_plan, "rows_per_chunk", 0) or 0),
+                            gpu_rows=int(getattr(global_parallel_plan, "gpu_rows_per_chunk", 0) or 0),
+                            memmap=bool(getattr(global_parallel_plan, "use_memmap", False)),
+                            chunk_mb=float(
+                                getattr(global_parallel_plan, "max_chunk_bytes", 0) / (1024 ** 2)
+                                if getattr(global_parallel_plan, "max_chunk_bytes", 0)
+                                else 0.0
+                            ),
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc_parallel_plan:
+                    logger.warning("Parallel auto-tune failed: %s", exc_parallel_plan)
+                    global_parallel_plan = None
+            effective_base_workers = 0
+            num_logical_processors = os.cpu_count() or 1
+            if num_base_workers_config <= 0:
+                desired_auto_ratio = 0.75
+                effective_base_workers = max(1, int(np.ceil(num_logical_processors * desired_auto_ratio)))
+                pcb(
+                    f"WORKERS_CONFIG: Mode Auto. Base de workers calculée: {effective_base_workers} "
+                    f"({desired_auto_ratio*100:.0f}% de {num_logical_processors} processeurs logiques)",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            else:
+                effective_base_workers = min(num_base_workers_config, num_logical_processors)
+                if effective_base_workers < num_base_workers_config:
+                    pcb(
+                        f"WORKERS_CONFIG: Demande GUI ({num_base_workers_config}) limitée à {effective_base_workers} "
+                        f"(total processeurs logiques: {num_logical_processors}).",
+                        prog=None,
+                        lvl="WARN",
+                    )
+                pcb(
+                    f"WORKERS_CONFIG: Mode Manuel. Base de workers: {effective_base_workers}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            if effective_base_workers <= 0:
+                effective_base_workers = 1
+                pcb("WORKERS_CONFIG: AVERT - effective_base_workers était <= 0, forcé à 1.", prog=None, lvl="WARN")
+        else:
+            pcb(f"Resume refused: {resume_reason}", prog=None, lvl="WARN")
+            if _path_exists(temp_image_cache_dir):
+                ts_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                archive_dir = f"{temp_image_cache_dir}_{ts_suffix}.old"
+                try:
+                    shutil.move(temp_image_cache_dir, archive_dir)
+                except Exception:
+                    try:
+                        shutil.rmtree(temp_image_cache_dir)
+                    except Exception:
+                        pass
+            try:
+                os.makedirs(temp_image_cache_dir, exist_ok=True)
+            except OSError as e_mkdir_cache:
+                pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
     try:
         cache_probe = _probe_system_resources(
             temp_image_cache_dir,
@@ -16937,7 +18914,7 @@ def run_hierarchical_mosaic_classic_legacy(
                 num_tiles=0,
             )
 
-    if not use_existing_master_tiles_mode:
+    if not use_existing_master_tiles_mode and not resume_after_phase1:
         # --- Phase 1 (Prétraitement et WCS) ---
         base_progress_phase1 = current_global_progress
         _log_memory_usage(progress_callback, "Début Phase 1 (Prétraitement)")
@@ -17654,6 +19631,16 @@ def run_hierarchical_mosaic_classic_legacy(
         current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN
         _log_memory_usage(progress_callback, "Fin Phase 1 (Prétraitement)")
         pcb("run_info_phase1_finished_cache", prog=current_global_progress, lvl="INFO", num_valid_raws=len(all_raw_files_processed_info))
+        if resume_mode != "off":
+            try:
+                _write_phase1_resume_cache(
+                    temp_image_cache_dir,
+                    all_raw_files_processed_info,
+                    resume_signature_payload,
+                    resume_signature_current,
+                )
+            except Exception as exc_resume_write:
+                pcb(f"Resume cache write failed: {exc_resume_write}", prog=None, lvl="WARN")
         # --- Optional interactive filtering between Phase 1 and Phase 2 ---
         try:
             raw_files_with_wcs = all_raw_files_processed_info
@@ -17671,7 +19658,8 @@ def run_hierarchical_mosaic_classic_legacy(
             logger.warning(f"Filtrage facultatif non appliqué: {e_hook}")
         if time_per_raw_file_wcs: 
             pcb(f"    Temps moyen/brute (P1): {time_per_raw_file_wcs:.2f}s", prog=None, lvl="DEBUG")
-    
+
+    if not use_existing_master_tiles_mode:
         # --- Phase 2 (Clustering) ---
         base_progress_phase2 = current_global_progress
         _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
@@ -18212,6 +20200,7 @@ def run_hierarchical_mosaic_classic_legacy(
                 pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
         current_global_progress = base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING
         num_seestar_stacks_to_process = len(seestar_stack_groups)
+        phase2_completed = True
         telemetry.maybe_emit_stats(
             _telemetry_context(
                 {
@@ -18308,7 +20297,7 @@ def run_hierarchical_mosaic_classic_legacy(
         "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
         "quality_crop_margin_px": int(quality_crop_margin_px_config),
         "quality_crop_min_run": int(quality_crop_min_run_config),
-        "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
+        "altaz_cleanup_enabled": bool(altaz_cleanup_effective_flag),
         "altaz_margin_percent": float(altaz_margin_percent_config),
         "altaz_decay": float(altaz_decay_config),
         "altaz_nanize": bool(altaz_nanize_config),
@@ -18370,7 +20359,7 @@ def run_hierarchical_mosaic_classic_legacy(
             "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
             "quality_crop_margin_px": int(quality_crop_margin_px_config),
             "quality_crop_min_run": int(quality_crop_min_run_config),
-            "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
+            "altaz_cleanup_enabled": bool(altaz_cleanup_effective_flag),
             "altaz_margin_percent": float(altaz_margin_percent_config),
             "altaz_decay": float(altaz_decay_config),
             "altaz_nanize": bool(altaz_nanize_config),
@@ -18428,6 +20417,7 @@ def run_hierarchical_mosaic_classic_legacy(
             "intertile_global_recenter": intertile_global_recenter_config,
             "intertile_recenter_clip": intertile_recenter_clip_tuple,
             "use_auto_intertile": use_auto_intertile_config,
+            "intertile_force_safe_mode": intertile_force_safe_mode_config,
             "coadd_use_memmap": coadd_use_memmap_config,
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
@@ -18802,6 +20792,13 @@ def run_hierarchical_mosaic_classic_legacy(
             )
             use_existing_master_tiles_mode = False
         if not use_existing_master_tiles_mode:
+            if not phase2_completed:
+                pcb(
+                    "Phase 2 skipped; cannot proceed to Phase 3.",
+                    prog=current_global_progress,
+                    lvl="ERROR",
+                )
+                return
             if sds_mode_flag and not sds_fallback_logged:
                 pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
                 sds_fallback_logged = True
@@ -19265,7 +21262,7 @@ def run_hierarchical_mosaic_classic_legacy(
                     quality_crop_enabled_config, quality_crop_band_px_config,
                     quality_crop_k_sigma_config, quality_crop_margin_px_config,
                     quality_crop_min_run_config,
-                    altaz_cleanup_enabled_config,
+                    altaz_cleanup_effective_flag,
                     altaz_margin_percent_config,
                     altaz_decay_config,
                     altaz_nanize_config,
@@ -19628,6 +21625,26 @@ def run_hierarchical_mosaic_classic_legacy(
         )
         if final_mosaic_data_HWC is None:
             return
+        if alpha_final is not None:
+            try:
+                alpha_arr = np.asarray(alpha_final, dtype=np.float32)
+                nz_frac = float(np.count_nonzero(alpha_arr) / alpha_arr.size) if alpha_arr.size else 0.0
+                alpha_min_val = float(np.nanmin(alpha_arr)) if alpha_arr.size else 0.0
+                alpha_max_val = float(np.nanmax(alpha_arr)) if alpha_arr.size else 0.0
+                logger.info(
+                    "ALPHA_STATS: level=final_mosaic nonzero_frac=%.3f min=%.3f max=%.3f shape=%s",
+                    nz_frac,
+                    alpha_min_val,
+                    alpha_max_val,
+                    getattr(alpha_arr, "shape", None),
+                )
+                if altaz_cleanup_effective_flag and nz_frac < 0.01:
+                    logger.warning(
+                        "ALPHA_STATS: final alpha mask nearly empty (nonzero_frac=%.4f) with altaz_cleanup_effective=True",
+                        nz_frac,
+                    )
+            except Exception:
+                pass
 
     # --- Phase 6 (Sauvegarde) ---
     base_progress_phase6 = current_global_progress
@@ -19828,6 +21845,43 @@ def run_hierarchical_mosaic_classic_legacy(
 
     # --- MODIFIÉ : Génération de la Preview PNG avec stretch_auto_asifits_like ---
     if final_mosaic_data_HWC is not None and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
+        preview_alpha_present = False
+        preview_rgba_saved = False
+        preview_backend_label = "none"
+
+        def _save_preview_png(img_rgb: np.ndarray, alpha_channel: np.ndarray | None, path_obj: Path) -> tuple[bool, str, bool]:
+            backend_label = "cv2"
+            try:
+                import cv2  # type: ignore
+
+                if alpha_channel is not None:
+                    img_bgra = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGRA)
+                    img_bgra[..., 3] = alpha_channel
+                    ok = cv2.imwrite(str(path_obj), img_bgra)
+                    return ok, backend_label, bool(ok)
+                img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                ok = cv2.imwrite(str(path_obj), img_bgr)
+                return ok, backend_label, False
+            except ImportError:
+                backend_label = "pil"
+            except Exception as exc:
+                logger.warning("phase6: preview save via cv2 failed: %s", exc)
+                backend_label = "cv2_error"
+            try:
+                from PIL import Image  # type: ignore
+            except Exception:
+                return False, backend_label, False
+            try:
+                if alpha_channel is not None:
+                    rgba_stack = np.dstack([img_rgb, alpha_channel])
+                    Image.fromarray(rgba_stack, mode="RGBA").save(path_obj)
+                    return True, "pil", True
+                Image.fromarray(img_rgb, mode="RGB").save(path_obj)
+                return True, "pil", False
+            except Exception as exc:
+                logger.warning("phase6: preview save via PIL failed: %s", exc)
+                return False, backend_label, False
+
         pcb("run_info_preview_stretch_started_auto_asifits", prog=None, lvl="INFO_DETAIL") # Log mis à jour
         try:
             # Downscale extremely large mosaics for preview to avoid OOM
@@ -19850,7 +21904,7 @@ def run_hierarchical_mosaic_classic_legacy(
 
             if alpha_final is not None:
                 try:
-                    alpha_src = np.asarray(alpha_final, dtype=np.uint8, copy=False)
+                    alpha_src = np.asarray(alpha_final, dtype=np.uint8)
                     if alpha_src.ndim == 3 and alpha_src.shape[-1] == 1:
                         alpha_src = alpha_src[..., 0]
                     elif alpha_src.ndim > 2:
@@ -19908,7 +21962,7 @@ def run_hierarchical_mosaic_classic_legacy(
                                     getattr(alpha_preview, "shape", None),
                                 )
                     else:
-                        alpha_preview = None
+                            alpha_preview = None
                 except Exception as exc_alpha_prev:
                     logger.warning(
                         "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
@@ -19917,6 +21971,7 @@ def run_hierarchical_mosaic_classic_legacy(
                         getattr(alpha_final, "shape", None),
                     )
                     alpha_preview = None
+                preview_alpha_present = True
 
             # Vérifier si la fonction stretch_auto_asifits_like existe dans zemosaic_utils
             if hasattr(zemosaic_utils, 'stretch_auto_asifits_like') and callable(zemosaic_utils.stretch_auto_asifits_like):
@@ -19958,34 +22013,32 @@ def run_hierarchical_mosaic_classic_legacy(
                         * 255
                     ).astype(np.uint8)
                     png_path = output_folder_path / f"{output_base_name}_preview.png"
-                    try: 
-                        import cv2 # Importer cv2 seulement si nécessaire
-                        alpha_png = None
-                        if alpha_preview is not None:
-                            alpha_png = np.clip(alpha_preview, 0, 255).astype(np.uint8, copy=False)
-                            if alpha_png.shape[:2] != img_u8.shape[:2]:
+                    alpha_png = None
+                    if alpha_preview is not None:
+                        alpha_png = np.clip(alpha_preview, 0, 255).astype(np.uint8, copy=False)
+                        if alpha_png.shape[:2] != img_u8.shape[:2]:
+                            try:
+                                import cv2  # type: ignore
+
                                 alpha_png = cv2.resize(
                                     alpha_png,
                                     (img_u8.shape[1], img_u8.shape[0]),
                                     interpolation=cv2.INTER_NEAREST,
                                 )
-                        if alpha_png is not None:
-                            img_bgra = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGRA)
-                            img_bgra[..., 3] = alpha_png
-                            write_success = cv2.imwrite(str(png_path), img_bgra)
-                        else:
-                            img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
-                            write_success = cv2.imwrite(str(png_path), img_bgr)
-                        if write_success: 
-                            pcb("run_success_preview_saved_auto_asifits", prog=None, lvl="SUCCESS", filename=_safe_basename(png_path))
-                            if alpha_png is not None:
-                                logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
-                        else: 
-                            pcb("run_warn_preview_imwrite_failed_auto_asifits", prog=None, lvl="WARN", filename=_safe_basename(png_path))
-                    except ImportError: 
-                        pcb("run_warn_preview_opencv_missing_for_auto_asifits", prog=None, lvl="WARN")
-                    except Exception as e_cv2_prev: 
-                        pcb("run_error_preview_opencv_failed_auto_asifits", prog=None, lvl="ERROR", error=str(e_cv2_prev))
+                            except Exception:
+                                alpha_png = None
+                    save_ok, backend_used, saved_rgba = _save_preview_png(img_u8, alpha_png, png_path)
+                    if alpha_png is not None:
+                        preview_alpha_present = True
+                        preview_backend_label = backend_used or preview_backend_label
+                        if save_ok and saved_rgba:
+                            preview_rgba_saved = True
+                    if save_ok:
+                        pcb("run_success_preview_saved_auto_asifits", prog=None, lvl="SUCCESS", filename=_safe_basename(png_path))
+                        if saved_rgba:
+                            logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
+                    else:
+                        pcb("run_warn_preview_imwrite_failed_auto_asifits", prog=None, lvl="WARN", filename=_safe_basename(png_path))
                 else:
                     pcb("run_error_preview_stretch_auto_asifits_returned_none", prog=None, lvl="ERROR")
             else:
@@ -19999,31 +22052,53 @@ def run_hierarchical_mosaic_classic_legacy(
                         img_u8_fb = (np.clip(m_stretched_fallback.astype(np.float32), 0, 1) * 255).astype(np.uint8)
                         png_path_fb = output_folder_path / f"{output_base_name}_preview_fallback.png"
                         try:
-                            import cv2
                             alpha_png_fb = None
                             alpha_source_fb = alpha_final if alpha_final is not None else alpha_preview
                             if alpha_source_fb is not None:
                                 alpha_png_fb = np.clip(alpha_source_fb, 0, 255).astype(np.uint8, copy=False)
                                 if alpha_png_fb.shape[:2] != img_u8_fb.shape[:2]:
-                                    alpha_png_fb = cv2.resize(
-                                        alpha_png_fb,
-                                        (img_u8_fb.shape[1], img_u8_fb.shape[0]),
-                                        interpolation=cv2.INTER_NEAREST,
-                                    )
+                                    try:
+                                        import cv2  # type: ignore
+
+                                        alpha_png_fb = cv2.resize(
+                                            alpha_png_fb,
+                                            (img_u8_fb.shape[1], img_u8_fb.shape[0]),
+                                            interpolation=cv2.INTER_NEAREST,
+                                        )
+                                    except Exception:
+                                        alpha_png_fb = None
+                            save_ok_fb, backend_used_fb, saved_rgba_fb = _save_preview_png(
+                                img_u8_fb, alpha_png_fb, png_path_fb
+                            )
                             if alpha_png_fb is not None:
-                                img_bgra_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGRA)
-                                img_bgra_fb[..., 3] = alpha_png_fb
-                                cv2.imwrite(str(png_path_fb), img_bgra_fb)
-                                logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
-                            else:
-                                img_bgr_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGR)
-                                cv2.imwrite(str(png_path_fb), img_bgr_fb)
-                            pcb("run_success_preview_saved_fallback", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(png_path_fb))
-                        except: pass # Ignorer erreur fallback
+                                preview_alpha_present = True
+                                preview_backend_label = backend_used_fb or preview_backend_label
+                                if save_ok_fb and saved_rgba_fb:
+                                    preview_rgba_saved = True
+                            if save_ok_fb:
+                                pcb("run_success_preview_saved_fallback", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(png_path_fb))
+                                if saved_rgba_fb:
+                                    logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
+                        except Exception:
+                            pass # Ignorer erreur fallback
 
         except Exception as e_stretch_main: 
             pcb("run_error_preview_stretch_unexpected_main", prog=None, lvl="ERROR", error=str(e_stretch_main))
             logger.error("Erreur imprévue lors de la génération de la preview:", exc_info=True)
+        
+        if preview_alpha_present:
+            logger.info(
+                "PHASE6_PREVIEW_ALPHA: saved_rgba=%s (backend=%s)",
+                bool(preview_rgba_saved),
+                preview_backend_label,
+            )
+            if not preview_rgba_saved:
+                logger.warning(
+                    "PHASE6_PREVIEW_ALPHA: saved_rgba=False (backend=%s)",
+                    preview_backend_label,
+                )
+        else:
+            logger.info("PHASE6_PREVIEW_ALPHA: skipped (no_alpha_map)")
             
     if 'final_mosaic_data_HWC' in locals() and final_mosaic_data_HWC is not None: del final_mosaic_data_HWC
     if 'final_mosaic_coverage_HW' in locals() and final_mosaic_coverage_HW is not None: del final_mosaic_coverage_HW
@@ -20267,6 +22342,7 @@ def run_hierarchical_mosaic(
     intertile_global_recenter_config: bool = True,
     intertile_recenter_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile_config: bool = False,
+    intertile_force_safe_mode_config: bool = False,
     match_background_for_final_config: bool = True,
     incremental_feather_parity_config: bool = False,
     two_pass_coverage_renorm_config: bool = False,
@@ -22576,6 +24652,7 @@ def run_hierarchical_mosaic(
             "intertile_global_recenter": intertile_global_recenter_config,
             "intertile_recenter_clip": intertile_recenter_clip_tuple,
             "use_auto_intertile": use_auto_intertile_config,
+            "intertile_force_safe_mode": intertile_force_safe_mode_config,
             "coadd_use_memmap": coadd_use_memmap_config,
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
@@ -23989,7 +26066,7 @@ def run_hierarchical_mosaic(
 
             if alpha_final is not None:
                 try:
-                    alpha_src = np.asarray(alpha_final, dtype=np.uint8, copy=False)
+                    alpha_src = np.asarray(alpha_final, dtype=np.uint8)
                     if alpha_src.ndim == 3 and alpha_src.shape[-1] == 1:
                         alpha_src = alpha_src[..., 0]
                     elif alpha_src.ndim > 2:
@@ -25357,9 +27434,9 @@ def _assemble_global_mosaic_first_impl(
             if len(final_channels) == 1
             else np.stack(final_channels, axis=-1)
         )
-        final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+        final_image = np.asarray(final_image, dtype=np.float32)
         final_image[~np.isfinite(final_image)] = np.nan
-        coverage_map = np.asarray(coverage_map, dtype=np.float32, copy=False)
+        coverage_map = np.asarray(coverage_map, dtype=np.float32)
         coverage_map = np.where(np.isfinite(coverage_map), coverage_map, 0.0)
         alpha_map = None
         if np.any(coverage_map > 0):
@@ -25569,7 +27646,7 @@ def _assemble_global_mosaic_first_impl(
             weight_expanded = np.expand_dims(weight_grid, axis=-1)
             with np.errstate(invalid="ignore", divide="ignore"):
                 result = sum_grid / weight_expanded
-            result = np.asarray(result, dtype=np.float32, copy=False)
+            result = np.asarray(result, dtype=np.float32)
             result[~np.isfinite(result)] = np.nan
             result = np.where(weight_grid[..., None] > 0, result, np.nan)
             coverage = np.where(np.isfinite(weight_grid), weight_grid, 0.0).astype(np.float32, copy=False)
@@ -25580,8 +27657,8 @@ def _assemble_global_mosaic_first_impl(
             with np.errstate(invalid="ignore", divide="ignore"):
                 mean_map = sum_grid / weight_expanded
                 second_moment = sumsq_grid / weight_expanded
-            mean_map = np.asarray(mean_map, dtype=np.float32, copy=False)
-            second_moment = np.asarray(second_moment, dtype=np.float32, copy=False)
+            mean_map = np.asarray(mean_map, dtype=np.float32)
+            second_moment = np.asarray(second_moment, dtype=np.float32)
             mean_map[~np.isfinite(mean_map)] = np.nan
             second_moment[~np.isfinite(second_moment)] = np.nan
             variance = np.maximum(second_moment - (mean_map ** 2), 0.0)
@@ -25618,7 +27695,7 @@ def _assemble_global_mosaic_first_impl(
                 clipped,
                 mean_map,
             )
-            clipped = np.asarray(clipped, dtype=np.float32, copy=False)
+            clipped = np.asarray(clipped, dtype=np.float32)
             clipped[~np.isfinite(clipped)] = np.nan
             coverage_base = np.where(clip_weight > 0, clip_weight, weight_grid)
             coverage = np.where(np.isfinite(coverage_base), coverage_base, 0.0).astype(np.float32, copy=False)
@@ -25687,7 +27764,7 @@ def _assemble_global_mosaic_first_impl(
                     chunk_weight = np.nansum(weight_stack, axis=0)
                     with np.errstate(invalid="ignore", divide="ignore"):
                         chunk_result = np.nansum(weighted, axis=0) / np.expand_dims(chunk_weight, axis=-1)
-                chunk_result = np.asarray(chunk_result, dtype=np.float32, copy=False)
+                chunk_result = np.asarray(chunk_result, dtype=np.float32)
                 chunk_result[~np.isfinite(chunk_result)] = np.nan
                 chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0).astype(np.float32, copy=False)
                 invalid = chunk_weight <= 0
@@ -25707,9 +27784,9 @@ def _assemble_global_mosaic_first_impl(
         if final_image is None or coverage_map is None:
             return _fail("global_coadd_error_finalize_failed")
 
-        final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+        final_image = np.asarray(final_image, dtype=np.float32)
         final_image[~np.isfinite(final_image)] = np.nan
-        coverage_map = np.asarray(coverage_map, dtype=np.float32, copy=False)
+        coverage_map = np.asarray(coverage_map, dtype=np.float32)
         coverage_map = np.where(np.isfinite(coverage_map), coverage_map, 0.0)
         alpha_map = None
         if np.any(coverage_map > 0):
@@ -25927,7 +28004,7 @@ def assemble_global_mosaic_sds(
         if coverage_arr is None:
             return None
         try:
-            arr = np.asarray(coverage_arr, dtype=np.float32, copy=False)
+            arr = np.asarray(coverage_arr, dtype=np.float32)
             if arr.ndim != 2:
                 arr = np.squeeze(arr)
             if arr.ndim != 2:
@@ -25988,11 +28065,11 @@ def assemble_global_mosaic_sds(
         if not tile_dir:
             return None
         tile_path = Path(tile_dir) / f"sds_tile_{tile_index:04d}.fits"
-        tile_data = np.asarray(mosaic_arr[y0:y1, x0:x1], dtype=np.float32, copy=False)
+        tile_data = np.asarray(mosaic_arr[y0:y1, x0:x1], dtype=np.float32)
         alpha_tile = None
         if alpha_arr is not None:
             try:
-                alpha_tile = np.asarray(alpha_arr[y0:y1, x0:x1], dtype=np.uint8, copy=False)
+                alpha_tile = np.asarray(alpha_arr[y0:y1, x0:x1], dtype=np.uint8)
             except Exception:
                 alpha_tile = np.asarray(alpha_arr[y0:y1, x0:x1], dtype=np.uint8)
         header = None
@@ -26253,7 +28330,7 @@ def assemble_global_mosaic_sds(
     def _safe_asarray(payload, *, dtype=np.float32):
         try:
             return np.asarray(payload, dtype=dtype, copy=False)
-        except ValueError:
+        except (TypeError, ValueError):
             return np.asarray(payload, dtype=dtype)
 
     mosaics: list[np.ndarray] = []
@@ -26479,7 +28556,7 @@ def assemble_global_mosaic_sds(
             coverage_payload = None
             if idx < len(coverages):
                 cov_arr = coverages[idx]
-                coverage_payload = np.asarray(cov_arr, dtype=np.float32, copy=True) if cov_arr is not None else None
+                coverage_payload = np.array(cov_arr, dtype=np.float32, copy=True) if cov_arr is not None else None
             tile_pairs.append((mosaic, wcs_clone, coverage_payload))
         postprocess_context["two_pass_tile_pairs"] = tile_pairs
         if tile_records:
@@ -26491,7 +28568,7 @@ def assemble_global_mosaic_sds(
         if cov_arr is None:
             return float(max(1, batch_len))
         try:
-            arr = np.asarray(cov_arr, dtype=np.float32, copy=False)
+            arr = np.asarray(cov_arr, dtype=np.float32)
             if arr.ndim != 2:
                 arr = np.squeeze(arr)
             if arr.ndim != 2:
@@ -26550,7 +28627,7 @@ def assemble_global_mosaic_sds(
                 winsor_max_workers=winsor_workers,
                 parallel_plan=parallel_plan,
             )
-            return np.asarray(stacked, dtype=np.float32, copy=False)
+            return np.asarray(stacked, dtype=np.float32)
 
         if algo == "kappa_sigma" and hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
             stacked, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
@@ -26562,7 +28639,7 @@ def assemble_global_mosaic_sds(
                 sigma_high=kappa_high,
                 parallel_plan=parallel_plan,
             )
-            return np.asarray(stacked, dtype=np.float32, copy=False)
+            return np.asarray(stacked, dtype=np.float32)
 
         stack_cube = np.stack(mosaics, axis=0).astype(np.float32, copy=False)
         if len(mosaics) == 1:
@@ -26578,7 +28655,7 @@ def assemble_global_mosaic_sds(
         pcb("sds_error_final_stack_failed", prog=None, lvl="ERROR", error=str(exc))
         return None, None, None
 
-    final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+    final_image = np.asarray(final_image, dtype=np.float32)
 
     final_coverage = None
     for cov in coverages:

@@ -487,6 +487,7 @@ class GridModeConfig:
     apply_radial_weight: bool = False
     radial_feather_fraction: float = 0.8
     radial_shape_power: float = 2.0
+    tile_rgb_equalize: bool = False
     save_final_as_uint16: bool = False
     legacy_rgb_cube: bool = False
     use_gpu: bool = False
@@ -1161,6 +1162,20 @@ def build_global_grid(
         global_shape_hw = None
 
 
+    if global_wcs is None or global_shape_hw is None:
+        try:
+            global_wcs, global_shape_hw, fallback_bounds, fallback_offset = _build_fallback_global_wcs(
+                usable_frames, progress_callback=progress_callback
+            )
+            _emit(
+                f"[GRID] Fallback global WCS: shape_hw={global_shape_hw} (bounds from {len(fallback_bounds)} frame(s))",
+                callback=progress_callback,
+            )
+        except Exception as exc:
+            fallback_bounds = None
+            fallback_offset = (0, 0)
+            _emit(f"[GRID] Fallback global WCS construction failed ({exc})", lvl="WARN", callback=progress_callback)
+
 
     if global_wcs is not None and global_shape_hw is not None:
         if _is_degenerate_global_wcs(usable_frames, global_wcs, global_shape_hw):
@@ -1196,7 +1211,8 @@ def build_global_grid(
         pixel_scale_global = 2.0 / 3600.0  # default 2 arcsec/pix
 
     median_fov_deg = np.median(fov_candidates_deg) if fov_candidates_deg else (pixel_scale_global * max(global_shape_hw))
-    tile_size_deg = max(pixel_scale_global, median_fov_deg) / max(grid_size_factor, 1e-3)
+    # grid_size_factor scales the nominal tile size: higher => larger tiles (fewer tiles).
+    tile_size_deg = max(pixel_scale_global, median_fov_deg) * max(grid_size_factor, 1e-3)
     tile_size_px = int(max(32, round(tile_size_deg / pixel_scale_global)))
     overlap_fraction = max(0.0, min(0.9, float(overlap_fraction)))
     step_px = max(1, int(round(tile_size_px * (1.0 - overlap_fraction))))
@@ -2069,7 +2085,8 @@ def process_tile(
         budget_mb = 512.0
     if budget_mb <= 0:
         budget_mb = 512.0
-    target_chunk_bytes = max(64.0, budget_mb) * 1024 * 1024
+    # Honor small budgets for tests/low-RAM environments (min 1 MB).
+    target_chunk_bytes = max(1.0, budget_mb) * 1024 * 1024
     per_frame_bytes: float | None = None
     chunk_limit = len(tile.frames)
     running_sum: np.ndarray | None = None
@@ -2248,7 +2265,8 @@ def process_tile(
     )
 
     if (
-        stacked.ndim == 3
+        bool(getattr(config, "tile_rgb_equalize", False))
+        and stacked.ndim == 3
         and stacked.shape[-1] == 3
         and equalize_rgb_medians_inplace is not None
     ):
@@ -3932,7 +3950,7 @@ def run_grid_mode(
     except Exception:
         overlap_fraction = 0.0
     try:
-        grid_size_factor = float(cfg_disk.get("grid_size_factor", 1.0))
+        grid_size_factor = float(cfg_disk.get("grid_size_factor", 4.0)) #tentaive image /4 
     except Exception:
         grid_size_factor = 1.0
     try:
