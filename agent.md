@@ -1,117 +1,148 @@
-# Mission — Alt-Az cleanup : master tiles “vides” à cause du baseline shift float (ALPHA ignoré)
+# Mission: Phase 3 GPU WSC — Dynamic VRAM preflight + channel-wise execution (critical)
 
-## Contexte
-Quand `altaz_cleanup_enabled=True` (option GUI “Alt-Az cleanup”), certaines master tiles (ex: 10 et 21) semblent “vides/noires/plates” dans des viewers FITS.
+## Context
+On large master tiles (e.g. N≈151 frames, RGB, weights_block=(N,1,1,3)), the GPU PixInsight-like WSC path can trigger CuPy OOM:
+- Example symptom: "Out of memory allocating ~2GB ...; falling back to CPU for WSC."
+- On Windows/WDDM this may also cause paging/freezes before OOM.
 
-Le repo contient :
-- `zemosaic_worker.log` (run concerné)
-- `example/master_tile_010.fits` et `example/master_tile_021.fits` (tiles problématiques)
+The current Phase 3 GPU stacker:
+- computes rows_per_chunk using a float32-only estimate (bytes_per_row = width*channels*4*N),
+- enforces MIN_GPU_ROWS_PER_CHUNK = 32,
+- calls wsc_pixinsight_core() on the full (N, rows, W, C) block, where internals use float64 and allocate several large temporaries.
 
-## Ce que montrent le log + les FITS (faits)
-### 1) Ce n’est pas un “skip”
-Dans `zemosaic_worker.log`, les deux tiles :
-- passent dans le pipeline (`_apply_lecropper_pipeline()` appelé),
-- ont `MT_PIPELINE: altaz_cleanup applied ... mask2d_applied=True threshold=0.01`,
-- subissent un `MT_EDGE_TRIM` normal,
-- passent le quality gate (`[ZeQualityMT] ... -> ACCEPT`).
+This massively underestimates VRAM usage for WSC, and RGB multiplies memory further.
 
-### 2) Les tiles ne sont pas “désactivées” par ALPHA
-Dans les FITS fournis :
-- il y a un cube `RGB` + une extension `ALPHA`.
-- `ALPHA` est majoritairement à 255 (≈ 82–85% de pixels), donc la zone utile existe.
+## Goals (must)
+1. [x] Prevent VRAM explosions on GPU PixInsight WSC in Phase 3.
+2. [x] Add a **dynamic VRAM preflight** for WSC:
+   - Use cp.cuda.runtime.memGetInfo() to get free VRAM at runtime.
+   - Convert that into a safe rows_per_chunk for WSC (conservative headroom).
+   - Allow rows_per_chunk to go below 32 for WSC (down to 1).
+3. [x] Implement **channel-wise WSC execution** for RGB:
+   - Process R, then G, then B independently on the GPU.
+   - This reduces peak VRAM by ~3x and is functionally equivalent (WSC does not mix channels).
+   - Maintain CPU/GPU parity (float64 internal math stays inside wsc_pixinsight_core).
+4. [x] Add an **OOM backoff loop** for WSC chunks:
+   - If an OOM happens despite preflight, halve rows_per_chunk, free CuPy pools, and retry the same row_start.
+   - Only fallback to CPU if rows_per_chunk == 1 still OOMs (or after a bounded number of retries).
+5. [x] Add clear logging so end-users and devs understand what happened:
+   - Preflight chosen rows_per_chunk, N/W/C, free VRAM, budget, estimated bytes/row, channel-wise enabled.
+   - On backoff: log the new rows_per_chunk and retry count.
+   - On CPU fallback: log that GPU is not possible even at rows=1.
 
-### 3) La vraie cause (phase 1) : baseline shift *énorme* à l’export float basé sur le min global
-Les deux FITS contiennent dans le header une ligne :
-- `HISTORY Baseline shift applied for FITS float export: +339699840.000000 ADU` (tile 010)
-- `HISTORY Baseline shift applied for FITS float export: +153565872.000000 ADU` (tile 021)
+## Non-goals / Guardrails (do NOT do these)
+- Do NOT change the WSC math in robust_rejection.py (no algorithm changes).
+- Do NOT change other rejection paths (kappa, legacy winsor, etc.).
+- Do NOT modify GUI, config, or add new user-facing options.
+- Do NOT refactor unrelated code.
+- Do NOT alter existing behavior for batch size logic (batch size = 0 and batch size > 1 behavior must remain untouched).
+- Keep output dtype/shape identical to the current GPU stacker contract.
 
-Ce shift vient de `zemosaic_utils.save_fits_image(..., save_as_float=True)` qui :
-- calcule `finite_min = np.nanmin(data)` sur **tous** les pixels,
-- si `finite_min < 0`, ajoute `-finite_min` à **toute** l’image.
+## Files (allowed edits)
+- ✅ zemosaic_align_stack_gpu.py ONLY
 
-Or, en “dé-shiftant” les FITS (soustraction du shift), on observe :
-- **zone valide (ALPHA>0)** : valeurs “normales” (~0–50k, percentiles ~640–1100 ADU),
-- **zone invalide (ALPHA==0)** : quelques valeurs **très négatives** (jusqu’à `-shift`), qui forcent le `finite_min` global.
+## Implementation Plan (exact, surgical)
 
-Résultat : on ajoute un offset énorme à toute la tile, ce qui écrase la dynamique en auto-stretch naïf → impression de tile vide/plate.
+### A) [x] Add WSC VRAM preflight helper (new small functions)
+In zemosaic_align_stack_gpu.py, add a helper near _resolve_rows_per_chunk:
 
-### 4) Nouveau constat : outliers positifs énormes hors ALPHA
-`master_tile_021.fits` a un shift modeste (~+517 ADU) **mais** un `max` global ~2.38e8,
-quasi entièrement dans `ALPHA==0`. Cela écrase encore la dynamique en viewer.
-Le log montre des `linear_fit` avec `a`/`b` extrêmes (ex: `a=3.21e6`, `b=-2.84e9`).
+1) `_wsc_estimate_bytes_per_row(n_frames, width, dtype_bytes=8, overhead=12) -> int`
+- For channel-wise WSC, treat channels as 1.
+- dtype_bytes must assume float64 internals (8 bytes).
+- overhead is conservative to cover Xf, Xw, r, masks, huber weights, optional weights broadcast, etc.
+- Start with overhead=12 (conservative but not insane).
 
-## Objectif
-Quand une `alpha_mask` est fournie, empêcher les pixels invalides (ALPHA=0) de piloter le baseline shift float, et éviter d’embarquer des valeurs extrêmes hors footprint.
+2) `_resolve_rows_per_chunk_wsc(cp, height, width, channels, n_frames, plan, logger) -> int`
+- Read existing rows hint / max bytes as an upper bound (don’t ignore plan), but WSC can further clamp down.
+- Query VRAM: `free_b, total_b = cp.cuda.runtime.memGetInfo()`
+- Choose budget: `budget = min(max_bytes if max_bytes>0 else free_b, int(free_b * 0.55))`
+  (headroom ~45% to avoid WDDM paging)
+- Compute rows_budget = budget // bytes_per_row_est
+- rows_final = clamp(rows_budget, min=1, max=height)
+- IMPORTANT: do not apply MIN_GPU_ROWS_PER_CHUNK=32 for WSC. min must be 1.
+- If GPU safe mode is enabled, you may still cap rows_final, but do not increase it.
 
-Objectif “safe” : corriger le symptôme via l’export.
-Objectif “complet” : neutraliser les coefficients extrêmes en amont (normalisation `linear_fit`).
+- Log once per tile (or once per call):
+  `[P3][WSC][VRAM_PREFLIGHT] N=.. W=.. C=.. free=..MiB budget=..MiB est_row=..MiB rows=.. channelwise=yes`
 
-## Scope / fichiers
-- ✅ `zemosaic_utils.py` (`save_fits_image`) — correctif export.
-- ✅ `zemosaic_align_stack.py` (`_normalize_images_linear_fit`) — garde-fous contre coefficients extrêmes.
-- ❌ Ne pas modifier : algos GPU / reproject (sauf si le correctif export + linear_fit ne suffit pas)
+### B) [x] Use WSC-aware rows_per_chunk
+Currently rows_per_chunk is computed before algo/wsc_pixinsight is known.
+Do NOT refactor heavily. Do one of these minimal approaches:
 
-## Exigences fonctionnelles
-### A0) Définition “pixel valide” + compatibilité `alpha_mask`
-- `alpha_mask` attendu : array 2D `(H, W)` (dtype quelconque), avec 0 = invalide, >0 = valide.
-  - La règle de validité MUST être : `valid_hw = np.isfinite(alpha_mask) & (alpha_mask > 0)`.
-  - (Compatible à la fois avec un ALPHA en 0..1 ou 0..255.)
-- Compatibilité shapes :
-  - Si `image_data.ndim == 2`: `image_data.shape == (H, W)` requis.
-  - Si `image_data.ndim == 3`:
-    - HWC si `image_data.shape == (H, W, C)` (C=3 typiquement),
-    - CHW si `image_data.shape == (C, H, W)` (C=3 typiquement).
-  - Si la compatibilité ne peut pas être prouvée (shape mismatch / ndim inattendu / H,W indéterminables) :
-    => considérer `alpha_mask` comme **incompatible** et appliquer le comportement actuel inchangé (global min).
+Option 1 (preferred): keep existing `_resolve_rows_per_chunk(...)` call, then if wsc_pixinsight:
+- override: `rows_per_chunk = min(rows_per_chunk, _resolve_rows_per_chunk_wsc(...))`
+- ensure `rows_per_chunk = max(1, rows_per_chunk)`
 
-### A) Baseline shift basé sur les pixels valides quand ALPHA est présent
-Dans `save_fits_image(..., save_as_float=True, alpha_mask=...)` :
-- Si `alpha_mask` est fourni **et** compatible avec les dimensions spatiales de l’image :
-  - calculer `finite_min` (et éventuellement `finite_max`) **uniquement** sur les pixels `ALPHA>0`.
-  - appliquer le shift (si nécessaire) sur l’image complète, mais avec un `shift_value` déterminé sur la zone valide.
-- Si `alpha_mask` est absent ou incompatible : comportement actuel inchangé.
+This preserves existing behavior for non-WSC.
 
-### B)  Neutralisation hors-footprint UNIQUEMENT pour les stats (sans modifier les pixels écrits)
-But : empêcher un outlier hors-footprint de piloter les *statistiques* (min/max/percentiles) utilisées pour décider du baseline shift.
+### C) [x] Implement channel-wise WSC in the chunk loop
+Inside the `if wsc_pixinsight:` branch in the for-loop:
 
-Règles MUST :
-- La neutralisation `ALPHA==0` (ex: mise à NaN) doit se faire **dans une vue/buffer dédié aux stats**,
-  pas sur `data_to_write_temp` qui sera écrit dans le FITS.
-- En clair : `stats_view` peut contenir des NaN hors-footprint, mais `data_to_write_temp` (écrit) ne doit pas être “nanisé” par cette option.
-- La seule modification “pixel data” autorisée dans `save_as_float=True` est la logique existante de baseline shift (et son clamp à 0),
-  mais le **shift_value** doit être déterminé à partir des pixels valides (A0/A).
-- Interdit : multiplier les pixels par le masque / double pondération / changer les valeurs écrites en fonction d’ALPHA, hors baseline-shift.
+Replace the single call:
+- `data_gpu = cp.asarray(chunk_cpu, dtype=cp.float32)`
+- `chunk_out, stats = wsc_pixinsight_core(cp, data_gpu, ..., weights_block=wsc_weights_block_gpu, return_stats=True)`
+- `stacked[row_start:row_end] = cp.asnumpy(chunk_out)`
 
-### C) Logs de diagnostic (à garder en DEBUG/INFO_DETAIL)
-Ajouter un log explicite quand `alpha_mask` est utilisée, par exemple :
-- `SAVE_DEBUG: baseline_shift using ALPHA>0: valid_min=... valid_max=... global_min=... global_max=... shift=...`
+With channel-wise logic:
 
-### D) Cas dégénérés (masque vide / aucun pixel valide fini) — fallback obligatoire
-- Si `alpha_mask` est fourni mais que `valid_hw` ne contient aucun pixel (`valid_hw.any() == False`)
-  OU qu’il n’existe aucun pixel fini dans l’intersection (ex: `np.isfinite(image_data)` ∩ `valid_hw`) :
-  => comportement actuel inchangé (global `np.nanmin`), + log WARN explicite :
-     `SAVE_DEBUG: alpha_mask provided but no finite valid pixels; falling back to global-min baseline shift.`
-- Objectif : éviter les erreurs “min of empty slice” et toute dérive silencieuse.
+Pseudo:
+- Determine `C = channels`
+- For c in range(C):
+  - Create CPU view: `cpu_c = chunk_cpu[..., c]` if C>1 else `chunk_cpu[..., 0]` or `chunk_cpu[:, :, :, 0]` accordingly.
+    (Target shape must be (N, rows, W) for wsc_pixinsight_core.)
+  - Upload: `data_gpu_c = cp.asarray(cpu_c, dtype=cp.float32)`
+  - Slice weights_block for this channel:
+    - If weights_block_gpu is None: pass None
+    - Else if weights_block_gpu.ndim==4 and weights_block_gpu.shape[-1]==C:
+        use `wb_c = weights_block_gpu[..., c]`  # shape (N,1,1)
+      else:
+        use `wb_c = weights_block_gpu` (already broadcastable, e.g. (N,), (N,1,1))
+  - Call WSC core on 3D stack:
+    `out_c, stats_c = wsc_pixinsight_core(cp, data_gpu_c, ..., weights_block=wb_c, return_stats=True)`
+  - Download and store:
+    `stacked[row_start:row_end, :, c] = cp.asnumpy(out_c)`
 
-## Critères d’acceptation
-- En régénérant `master_tile_010.fits` et `master_tile_021.fits` :
-  - la ligne `Baseline shift ...` devient petite (ordre 1e2–1e4 ADU), pas 1e8.
-  - le cube `RGB` a une gamme compatible viewer (pas un offset ~1e8 avec une dynamique relative minuscule).
-  - l’extension `ALPHA` reste cohérente (majoritairement 255, bordures à 0).
-- Aucun changement de comportement pour les écritures float **sans** `alpha_mask`.
+Stats accumulation:
+- Sum clip_low_count/clip_high_count/valid_count across channels.
+- Keep iters_used = max(iters_used across channels).
+- (Fractions computed later from totals will remain meaningful.)
 
-## Plan d’implémentation (proposé)
-- [x] 1) Dans `zemosaic_utils.py:save_fits_image` (branche `save_as_float`), construire `valid_hw = (alpha_mask > 0)` si possible.
-- [x] 2) Adapter le broadcast du masque selon `axis_order` et `image_data.ndim` (HWC vs CHW).
-- [x] 3) Calculer `finite_min` sur `data_to_write_temp[valid]` (en tenant compte des NaN).
-- [x] 4) Appliquer la logique de shift (min>0 => soustraction, min<0 => addition) basée sur `valid_min`.
-- [ ] 5) (Optionnel) Forcer `data_to_write_temp[~valid] = np.nan` avant d’écrire.
-- [x] 6) Durcir `_normalize_images_linear_fit` quand `src_high-src_low` est trop petit ou quand `a` devient extrême (skip normalization).
-- [ ] 7) Régénérer les FITS et vérifier :
-   - pas d’outliers ~1e8 dans `ALPHA==0`,
-   - `baseline shift` raisonnable,
-   - dynamique viewer normale.
+### D) [x] Add OOM backoff retry (WSC only)
+Wrap the WSC chunk processing (per row_start) in a retry loop:
 
-## Notes (suspect amont, confirmé)
-Les coefficients `linear_fit` peuvent exploser quand `src_high-src_low` est quasi nul.
-Cela crée des outliers hors footprint (positifs/négatifs) qui écrasent la dynamique en viewer.
+- `current_rows = rows_per_chunk` initially
+- Attempt to process [row_start:row_end] with current_rows
+- Catch `cp.cuda.memory.OutOfMemoryError` (and also generic Exception where str contains "Out of memory" as fallback)
+  - Free CuPy pools:
+    - `cp.get_default_memory_pool().free_all_blocks()`
+    - `cp.get_default_pinned_memory_pool().free_all_blocks()` (safe optional)
+  - Reduce: `current_rows = max(1, current_rows // 2)`
+  - Log:
+    `[P3][WSC][VRAM_BACKOFF] oom retry=k rows->current_rows row_start=...`
+  - If current_rows == 1 and still OOM after retry => break and trigger CPU fallback (see below).
+- IMPORTANT: ensure you retry the same row_start (do not skip rows, do not corrupt output).
+- Bound retries (e.g. max 6-8 retries) to avoid infinite loops.
+
+When backoff reduces rows, update the loop behavior safely:
+- Easiest: convert the outer `for row_start in range(...)` into a `while row_start < height` only in the WSC branch,
+  OR keep the for-loop but if you change current_rows you must re-run the same row_start and not advance.
+Minimal approach:
+- For WSC path only, replace the for-loop with a manual while-loop (local to this function), keeping non-WSC loop unchanged.
+
+### E) [x] CPU fallback only when truly necessary
+Current code falls back to CPU on any exception in the big try/except.
+Keep that, but make it more specific for WSC:
+- If after preflight + backoff you still cannot process even a 1-row chunk, THEN fallback CPU.
+- Log a final reason:
+  `[P3][WSC][CPU_FALLBACK] reason=vram_exhausted rows=1 ...`
+
+## Acceptance Criteria
+- Large RGB WSC stacks no longer crash GPU with OOM in normal cases; instead rows_per_chunk is reduced and processing completes on GPU.
+- Peak VRAM is significantly reduced for RGB (channel-wise enabled).
+- CPU fallback for WSC happens only if GPU cannot even process rows_per_chunk=1 after freeing pools.
+- Non-WSC algorithms are unaffected (identical behavior).
+- Logging clearly shows preflight, channel-wise mode, and any backoff.
+
+## Notes
+- Channel-wise WSC should be numerically identical to 4D WSC because all operations reduce along axis=0 (frames) and never mix channels.
+- Keep output float32 as currently returned by wsc_pixinsight_core.

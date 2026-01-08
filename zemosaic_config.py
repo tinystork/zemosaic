@@ -118,6 +118,7 @@ DEFAULT_CONFIG = {
     "use_gpu_grid": True,
     "gpu_id_phase5": 0,
     "gpu_selector": "",
+    "gpu_hybrid_vram_guard": True,
     "phase5_chunk_auto": True,
     "phase5_chunk_mb": 128,
     "enable_tile_weighting": True,

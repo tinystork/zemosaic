@@ -12652,6 +12652,38 @@ def create_master_tile(
         propagate_mask=propagate_mask_for_coverage,
         progress_callback=progress_callback
     )
+    auto_pad_used = False
+    orig_hw = None
+    try:
+        if 0 <= ref_loaded_idx < len(tile_images_data_HWC_adu):
+            ref_img = tile_images_data_HWC_adu[ref_loaded_idx]
+            if isinstance(ref_img, np.ndarray) and ref_img.ndim >= 2:
+                orig_hw = ref_img.shape[:2]
+                if aligned_images_for_stack:
+                    for aligned_img in aligned_images_for_stack:
+                        if isinstance(aligned_img, np.ndarray) and aligned_img.ndim >= 2:
+                            if aligned_img.shape[0] > orig_hw[0] or aligned_img.shape[1] > orig_hw[1]:
+                                auto_pad_used = True
+                                break
+    except Exception:
+        auto_pad_used = False
+    if auto_pad_used:
+        aligned_hw = None
+        try:
+            for aligned_img in aligned_images_for_stack:
+                if isinstance(aligned_img, np.ndarray) and aligned_img.ndim >= 2:
+                    aligned_hw = aligned_img.shape[:2]
+                    break
+        except Exception:
+            aligned_hw = None
+        pcb_tile(
+            "MT_AUTO_PAD: detected -> will skip MT_EDGE_TRIM",
+            prog=None,
+            lvl="DEBUG_DETAIL",
+            tile_id=tile_id,
+            orig_hw=orig_hw,
+            aligned_hw=aligned_hw,
+        )
     if failed_alignment_indices:
         retry_group: list[dict] = []
         for idx_fail in failed_alignment_indices:
@@ -13198,7 +13230,13 @@ def create_master_tile(
         lecropper_applied = True
 
     try:
-        if master_tile_stacked_HWC is not None:
+        if master_tile_stacked_HWC is not None and auto_pad_used:
+            pcb_tile(
+                f"MT_EDGE_TRIM: tile={tile_id} skipped (auto-pad used)",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+            )
+        if master_tile_stacked_HWC is not None and not auto_pad_used:
             # MT_EDGE_TRIM: Deterministic edge trim based on valid data fraction.
             # This is a post-lecropper step to clean up thin invalid strips at the edges.
             MIN_VALID_FRAC_EDGE = 0.90
@@ -21210,7 +21248,17 @@ def run_hierarchical_mosaic_classic_legacy(
                             try:
                                 global _PH3_CONCURRENCY_SEMAPHORE
                                 _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
-                                pcb(f"IO_ADAPT_RT: ph3_workers -> {current_ph3_limit}", prog=None, lvl="INFO_DETAIL")
+                                                                _io_dbg = []
+                                if read_mbps is not None:
+                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: runtime throttle: ph3_workers -> {current_ph3_limit}"
+                                    f" (limits Phase 3 concurrency){_io_dbg_s}",
+                                    prog=None, lvl="INFO_DETAIL"
+                                )
                             except Exception:
                                 pass
                         if (current_cache_slots is None) or (new_cache_slots != current_cache_slots):
@@ -21218,7 +21266,17 @@ def run_hierarchical_mosaic_classic_legacy(
                             try:
                                 global _CACHE_IO_SEMAPHORE
                                 _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
-                                pcb(f"IO_ADAPT_RT: cache_read_slots -> {current_cache_slots}", prog=None, lvl="INFO_DETAIL")
+                                                                _io_dbg = []
+                                if read_mbps is not None:
+                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: runtime throttle: cache_read_slots -> {current_cache_slots}"
+                                    f" (limits concurrent cache reads){_io_dbg_s}",
+                                    prog=None, lvl="INFO_DETAIL"
+                                )
                             except Exception:
                                 pass
                     except Exception:
@@ -25429,7 +25487,17 @@ def run_hierarchical_mosaic(
                             try:
                                 global _PH3_CONCURRENCY_SEMAPHORE
                                 _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
-                                pcb(f"IO_ADAPT_RT: ph3_workers -> {current_ph3_limit}", prog=None, lvl="INFO_DETAIL")
+                                                                _io_dbg = []
+                                if read_mbps is not None:
+                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: runtime throttle: ph3_workers -> {current_ph3_limit}"
+                                    f" (limits Phase 3 concurrency){_io_dbg_s}",
+                                    prog=None, lvl="INFO_DETAIL"
+                                )
                             except Exception:
                                 pass
                         if (current_cache_slots is None) or (new_cache_slots != current_cache_slots):
@@ -25437,7 +25505,17 @@ def run_hierarchical_mosaic(
                             try:
                                 global _CACHE_IO_SEMAPHORE
                                 _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
-                                pcb(f"IO_ADAPT_RT: cache_read_slots -> {current_cache_slots}", prog=None, lvl="INFO_DETAIL")
+                                                                _io_dbg = []
+                                if read_mbps is not None:
+                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: runtime throttle: cache_read_slots -> {current_cache_slots}"
+                                    f" (limits concurrent cache reads){_io_dbg_s}",
+                                    prog=None, lvl="INFO_DETAIL"
+                                )
                             except Exception:
                                 pass
                     except Exception:
