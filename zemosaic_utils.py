@@ -4121,9 +4121,89 @@ def save_fits_image(image_data: np.ndarray,
         # Some viewers expect the black level to be at 0. If our mosaic carries a
         # positive offset (e.g. min ~ 300-500 ADU), auto-stretch may miss the true
         # background. Shift the baseline so the global finite minimum maps to 0.
+        axis_order_upper = str(axis_order).upper()
         baseline_shift_applied = 0.0
         try:
-            finite_min = float(np.nanmin(data_to_write_temp))
+            global_min = float(np.nanmin(data_to_write_temp))
+            global_max = float(np.nanmax(data_to_write_temp))
+            stats_min = global_min
+            stats_max = global_max
+            use_alpha_stats = False
+            valid_hw = None
+
+            if alpha_mask is not None:
+                try:
+                    alpha_arr = np.asarray(alpha_mask)
+                    if alpha_arr.ndim > 2:
+                        alpha_arr = alpha_arr[..., 0]
+                    if alpha_arr.ndim == 2:
+                        if image_data.ndim == 2:
+                            if image_data.shape == alpha_arr.shape:
+                                valid_hw = np.isfinite(alpha_arr) & (alpha_arr > 0)
+                        elif image_data.ndim == 3:
+                            if axis_order_upper == "HWC":
+                                if image_data.shape[0] == alpha_arr.shape[0] and image_data.shape[1] == alpha_arr.shape[1]:
+                                    valid_hw = np.isfinite(alpha_arr) & (alpha_arr > 0)
+                            elif axis_order_upper == "CHW":
+                                if image_data.shape[1] == alpha_arr.shape[0] and image_data.shape[2] == alpha_arr.shape[1]:
+                                    valid_hw = np.isfinite(alpha_arr) & (alpha_arr > 0)
+                except Exception:
+                    valid_hw = None
+
+                if valid_hw is not None:
+                    if np.any(valid_hw):
+                        valid_vals = None
+                        if data_to_write_temp.ndim == 2:
+                            valid_vals = data_to_write_temp[valid_hw]
+                        elif data_to_write_temp.ndim == 3:
+                            if axis_order_upper == "HWC":
+                                valid_vals = data_to_write_temp[valid_hw]
+                            elif axis_order_upper == "CHW":
+                                valid_vals = data_to_write_temp[:, valid_hw]
+                        if valid_vals is not None:
+                            finite_vals = valid_vals[np.isfinite(valid_vals)]
+                            if finite_vals.size > 0:
+                                stats_min = float(np.min(finite_vals))
+                                stats_max = float(np.max(finite_vals))
+                                use_alpha_stats = True
+                            else:
+                                _log_util_save(
+                                    "SAVE_DEBUG: alpha_mask provided but no finite valid pixels; "
+                                    "falling back to global-min baseline shift.",
+                                    "WARN",
+                                )
+                        else:
+                            _log_util_save(
+                                "SAVE_DEBUG: alpha_mask incompatible with image_data; "
+                                "falling back to global-min baseline shift.",
+                                "INFO_DETAIL",
+                            )
+                    else:
+                        _log_util_save(
+                            "SAVE_DEBUG: alpha_mask provided but no finite valid pixels; "
+                            "falling back to global-min baseline shift.",
+                            "WARN",
+                        )
+                else:
+                    _log_util_save(
+                        "SAVE_DEBUG: alpha_mask incompatible with image_data; "
+                        "falling back to global-min baseline shift.",
+                        "INFO_DETAIL",
+                    )
+
+            if use_alpha_stats:
+                shift_preview = 0.0
+                if np.isfinite(stats_min):
+                    shift_preview = -float(stats_min)
+                _log_util_save(
+                    "SAVE_DEBUG: baseline_shift using ALPHA>0: "
+                    f"valid_min={stats_min:.3f} valid_max={stats_max:.3f} "
+                    f"global_min={global_min:.3f} global_max={global_max:.3f} "
+                    f"shift={shift_preview:.3f}",
+                    "INFO_DETAIL",
+                )
+
+            finite_min = stats_min
             if np.isfinite(finite_min) and finite_min > 0.0:
                 _log_util_save(
                     f"  SAVE_DEBUG: Positive baseline detected (min={finite_min:.3f}). Shifting to zero.",
@@ -4162,7 +4242,6 @@ def save_fits_image(image_data: np.ndarray,
         if 'DATAMAX' in final_header_to_write: del final_header_to_write['DATAMAX']
         _log_util_save(f"  SAVE_DEBUG: (Float) data_to_write_temp: Range [{np.nanmin(data_to_write_temp):.3g}, {np.nanmax(data_to_write_temp):.3g}], IsFinite: {np.all(np.isfinite(data_to_write_temp))}", "WARN")
 
-        axis_order_upper = str(axis_order).upper()
         if data_to_write_temp.ndim == 3:
             if axis_order_upper == 'HWC':
                 data_for_primary = np.moveaxis(data_to_write_temp, -1, 0)

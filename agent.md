@@ -1,157 +1,117 @@
-# Mission: Fix noise_fwhm weighting robustness (NaN-heavy frames) + ensure GPU applies quality weights
+# Mission — Alt-Az cleanup : master tiles “vides” à cause du baseline shift float (ALPHA ignoré)
 
-## Context
-We observe repeated warnings during MasterTile stacking when using `stack_weight_method = "noise_fwhm"`:
+## Contexte
+Quand `altaz_cleanup_enabled=True` (option GUI “Alt-Az cleanup”), certaines master tiles (ex: 10 et 21) semblent “vides/noires/plates” dans des viewers FITS.
 
-- `weight_fwhm_bkg2d_error`: "All boxes contain <= N good pixels..."
-- `weight_fwhm_warn_all_fwhm_are_infinite`
-- Stack falls back to uniform weights → effectively no weighting.
+Le repo contient :
+- `zemosaic_worker.log` (run concerné)
+- `example/master_tile_010.fits` et `example/master_tile_021.fits` (tiles problématiques)
 
-Root cause:
-Aligned/warped frames often contain large NaN/Inf regions (outside overlap). `photutils.Background2D` rejects all boxes when too many pixels are masked/non-finite, even with high exclude_percentile.
-Also: GPU stack path currently may discard quality weights when radial weighting is disabled, causing weight methods to be ignored on GPU even if computed.
+## Ce que montrent le log + les FITS (faits)
+### 1) Ce n’est pas un “skip”
+Dans `zemosaic_worker.log`, les deux tiles :
+- passent dans le pipeline (`_apply_lecropper_pipeline()` appelé),
+- ont `MT_PIPELINE: altaz_cleanup applied ... mask2d_applied=True threshold=0.01`,
+- subissent un `MT_EDGE_TRIM` normal,
+- passent le quality gate (`[ZeQualityMT] ... -> ACCEPT`).
 
-## Goals (must-have)
-1. Make `noise_fwhm` weighting robust on NaN/Inf-heavy aligned frames:
-   - Avoid Background2D fatal failures whenever reasonable.
-   - Compute finite, meaningful FWHM weights when there is usable data.
-   - If not possible, gracefully degrade to current behavior (infinite FWHM → uniform weights) WITHOUT crashing.
+### 2) Les tiles ne sont pas “désactivées” par ALPHA
+Dans les FITS fournis :
+- il y a un cube `RGB` + une extension `ALPHA`.
+- `ALPHA` est majoritairement à 255 (≈ 82–85% de pixels), donc la zone utile existe.
 
-2. Ensure GPU stacking path actually applies quality weights (noise_variance / noise_fwhm) when selected:
-   - CPU and GPU must behave consistently for the same settings.
-   - No “silent ignore” of weights on GPU when radial weighting is off.
+### 3) La vraie cause (phase 1) : baseline shift *énorme* à l’export float basé sur le min global
+Les deux FITS contiennent dans le header une ligne :
+- `HISTORY Baseline shift applied for FITS float export: +339699840.000000 ADU` (tile 010)
+- `HISTORY Baseline shift applied for FITS float export: +153565872.000000 ADU` (tile 021)
 
-3. Preserve existing behavior for all other modes:
-   - No GUI changes.
-   - No changes to stacking algorithms (WSC / kappa-sigma / mean), except how weights are computed/propagated.
-   - Keep existing log keys where possible (do not break localization).
+Ce shift vient de `zemosaic_utils.save_fits_image(..., save_as_float=True)` qui :
+- calcule `finite_min = np.nanmin(data)` sur **tous** les pixels,
+- si `finite_min < 0`, ajoute `-finite_min` à **toute** l’image.
 
-## Non-goals (do NOT do)
-- Do not modify GUI (Qt/Tk).
-- Do not change default settings values.
-- Do not change WSC implementation, sigma clip math, or normalization algorithms (except weight calculation plumbing).
-- Do not add new dependencies.
+Or, en “dé-shiftant” les FITS (soustraction du shift), on observe :
+- **zone valide (ALPHA>0)** : valeurs “normales” (~0–50k, percentiles ~640–1100 ADU),
+- **zone invalide (ALPHA==0)** : quelques valeurs **très négatives** (jusqu’à `-shift`), qui forcent le `finite_min` global.
 
-## Files to inspect / likely edit
-- `zemosaic_align_stack.py`:
-  - `_compute_quality_weights(...)` and the `noise_fwhm` / FWHM helper(s).
-  - The `photutils.Background2D` + `DAOStarFinder` part.
-- `zemosaic_align_stack_gpu.py`:
-  - `_prepare_frames_and_weights(...)` currently calls CPU helper `_compute_quality_weights`.
-  - Check for logic that drops `quality_weights` when `radial_map is None` and fix it (see below).
-- Optional: tests under `tests/`.
+Résultat : on ajoute un offset énorme à toute la tile, ce qui écrase la dynamique en auto-stretch naïf → impression de tile vide/plate.
 
-IMPORTANT: There might be multiple copies of modules in the repo (root vs core). Ensure you patch the one actually imported by runtime:
-- [x] Run: `python -c "import zemosaic_align_stack; print(zemosaic_align_stack.__file__)"`
+### 4) Nouveau constat : outliers positifs énormes hors ALPHA
+`master_tile_021.fits` a un shift modeste (~+517 ADU) **mais** un `max` global ~2.38e8,
+quasi entièrement dans `ALPHA==0`. Cela écrase encore la dynamique en viewer.
+Le log montre des `linear_fit` avec `a`/`b` extrêmes (ex: `a=3.21e6`, `b=-2.84e9`).
 
-## Required behavior changes (CPU side) — robust FWHM weighting
-In `noise_fwhm` weighting, before calling `Background2D`:
-1. [x] Compute a finite mask on `target_data_for_fwhm`:
-   - `finite = np.isfinite(target_data_for_fwhm)`
-   - If no finite pixels: log existing key `weight_fwhm_no_finite_data` and set fwhm=inf for this image.
+## Objectif
+Quand une `alpha_mask` est fournie, empêcher les pixels invalides (ALPHA=0) de piloter le baseline shift float, et éviter d’embarquer des valeurs extrêmes hors footprint.
 
-2. [x] Define a “usable ROI” to avoid NaN borders:
-   - Compute bounding box of finite pixels (min/max rows/cols where finite==True).
-   - Optionally grow bbox by a small margin (e.g., 8 px) but clamp to image bounds.
-   - If bbox is too small (e.g., < 64x64 or finite fraction < 0.10), skip Background2D and go directly to fallback stats (sigma_clipped_stats on finite pixels only).
+Objectif “safe” : corriger le symptôme via l’export.
+Objectif “complet” : neutraliser les coefficients extrêmes en amont (normalisation `linear_fit`).
 
-3. [x] Run Background2D on the ROI only:
-   - Feed `roi = target_data_for_fwhm[y0:y1, x0:x1]`
-   - Provide `mask=~np.isfinite(roi)` if supported by photutils Background2D.
-   - Keep `exclude_percentile` high (e.g., 90) but do not rely on it alone.
+## Scope / fichiers
+- ✅ `zemosaic_utils.py` (`save_fits_image`) — correctif export.
+- ✅ `zemosaic_align_stack.py` (`_normalize_images_linear_fit`) — garde-fous contre coefficients extrêmes.
+- ❌ Ne pas modifier : algos GPU / reproject (sauf si le correctif export + linear_fit ne suffit pas)
 
-4. [x] Compute `data_subtracted` correctly:
-   - `data_subtracted_roi = roi - bkg.background`
-   - Then sanitize: `np.nan_to_num(..., nan=0, posinf=0, neginf=0)` and float32.
+## Exigences fonctionnelles
+### A0) Définition “pixel valide” + compatibilité `alpha_mask`
+- `alpha_mask` attendu : array 2D `(H, W)` (dtype quelconque), avec 0 = invalide, >0 = valide.
+  - La règle de validité MUST être : `valid_hw = np.isfinite(alpha_mask) & (alpha_mask > 0)`.
+  - (Compatible à la fois avec un ALPHA en 0..1 ou 0..255.)
+- Compatibilité shapes :
+  - Si `image_data.ndim == 2`: `image_data.shape == (H, W)` requis.
+  - Si `image_data.ndim == 3`:
+    - HWC si `image_data.shape == (H, W, C)` (C=3 typiquement),
+    - CHW si `image_data.shape == (C, H, W)` (C=3 typiquement).
+  - Si la compatibilité ne peut pas être prouvée (shape mismatch / ndim inattendu / H,W indéterminables) :
+    => considérer `alpha_mask` comme **incompatible** et appliquer le comportement actuel inchangé (global min).
 
-5. [x] Threshold scalarization:
-   - `threshold_daofind_val = 5.0 * background_rms`
-   - If `background_rms` is an array, use a scalar robust reducer (`nanmedian` preferred, else `nanmean`).
-   - Ensure threshold is finite; otherwise fallback stats.
+### A) Baseline shift basé sur les pixels valides quand ALPHA est présent
+Dans `save_fits_image(..., save_as_float=True, alpha_mask=...)` :
+- Si `alpha_mask` est fourni **et** compatible avec les dimensions spatiales de l’image :
+  - calculer `finite_min` (et éventuellement `finite_max`) **uniquement** sur les pixels `ALPHA>0`.
+  - appliquer le shift (si nécessaire) sur l’image complète, mais avec un `shift_value` déterminé sur la zone valide.
+- Si `alpha_mask` est absent ou incompatible : comportement actuel inchangé.
 
-6. [x] Fallback stats must ignore NaNs:
-   - Use sigma_clipped_stats on finite pixels only.
-   - If the function requires full array, pass `roi_clean` where invalids are replaced by median of finite pixels.
-   - Create `data_subtracted_roi = roi_clean - median_glob`
-   - threshold = 5 * stddev_glob (finite guard).
+### B)  Neutralisation hors-footprint UNIQUEMENT pour les stats (sans modifier les pixels écrits)
+But : empêcher un outlier hors-footprint de piloter les *statistiques* (min/max/percentiles) utilisées pour décider du baseline shift.
 
-7. [x] DAOStarFinder compatibility with photutils:
-   - Keep the existing fix: try with `sky=0.0`, if TypeError mentions sky, retry without `sky`.
-   - Do NOT swallow unrelated TypeErrors silently.
-   - If DAOStarFinder fails: keep current behavior (log `weight_fwhm_daofind_error`, fwhm=inf).
+Règles MUST :
+- La neutralisation `ALPHA==0` (ex: mise à NaN) doit se faire **dans une vue/buffer dédié aux stats**,
+  pas sur `data_to_write_temp` qui sera écrit dans le FITS.
+- En clair : `stats_view` peut contenir des NaN hors-footprint, mais `data_to_write_temp` (écrit) ne doit pas être “nanisé” par cette option.
+- La seule modification “pixel data” autorisée dans `save_as_float=True` est la logique existante de baseline shift (et son clamp à 0),
+  mais le **shift_value** doit être déterminé à partir des pixels valides (A0/A).
+- Interdit : multiplier les pixels par le masque / double pondération / changer les valeurs écrites en fonction d’ALPHA, hors baseline-shift.
 
-8. [x] FWHM estimate must be stable:
-   - If no detected sources, treat as invalid (fwhm=inf) and log existing key if present (or reuse existing warn).
-   - If computed fwhm is non-finite or <=0, set inf.
+### C) Logs de diagnostic (à garder en DEBUG/INFO_DETAIL)
+Ajouter un log explicite quand `alpha_mask` est utilisée, par exemple :
+- `SAVE_DEBUG: baseline_shift using ALPHA>0: valid_min=... valid_max=... global_min=... global_max=... shift=...`
 
-9. [x] Convert FWHM list → weights:
-   - Keep EXACT current mapping formula (do not change weight law).
-   - Only improve the upstream robustness so FWHM is computable more often.
+### D) Cas dégénérés (masque vide / aucun pixel valide fini) — fallback obligatoire
+- Si `alpha_mask` est fourni mais que `valid_hw` ne contient aucun pixel (`valid_hw.any() == False`)
+  OU qu’il n’existe aucun pixel fini dans l’intersection (ex: `np.isfinite(image_data)` ∩ `valid_hw`) :
+  => comportement actuel inchangé (global `np.nanmin`), + log WARN explicite :
+     `SAVE_DEBUG: alpha_mask provided but no finite valid pixels; falling back to global-min baseline shift.`
+- Objectif : éviter les erreurs “min of empty slice” et toute dérive silencieuse.
 
-## Required behavior changes (GPU side) — apply quality weights consistently
-In `zemosaic_align_stack_gpu.py`, inside `_prepare_frames_and_weights`:
+## Critères d’acceptation
+- En régénérant `master_tile_010.fits` et `master_tile_021.fits` :
+  - la ligne `Baseline shift ...` devient petite (ordre 1e2–1e4 ADU), pas 1e8.
+  - le cube `RGB` a une gamme compatible viewer (pas un offset ~1e8 avec une dynamique relative minuscule).
+  - l’extension `ALPHA` reste cohérente (majoritairement 255, bordures à 0).
+- Aucun changement de comportement pour les écritures float **sans** `alpha_mask`.
 
-There is currently logic that effectively disables `quality_weights` when `radial_map is None`.
-This makes GPU ignore `noise_fwhm`/`noise_variance` unless radial weighting is enabled.
+## Plan d’implémentation (proposé)
+- [x] 1) Dans `zemosaic_utils.py:save_fits_image` (branche `save_as_float`), construire `valid_hw = (alpha_mask > 0)` si possible.
+- [x] 2) Adapter le broadcast du masque selon `axis_order` et `image_data.ndim` (HWC vs CHW).
+- [x] 3) Calculer `finite_min` sur `data_to_write_temp[valid]` (en tenant compte des NaN).
+- [x] 4) Appliquer la logique de shift (min>0 => soustraction, min<0 => addition) basée sur `valid_min`.
+- [ ] 5) (Optionnel) Forcer `data_to_write_temp[~valid] = np.nan` avant d’écrire.
+- [x] 6) Durcir `_normalize_images_linear_fit` quand `src_high-src_low` est trop petit ou quand `a` devient extrême (skip normalization).
+- [ ] 7) Régénérer les FITS et vérifier :
+   - pas d’outliers ~1e8 dans `ALPHA==0`,
+   - `baseline shift` raisonnable,
+   - dynamique viewer normale.
 
-Fix:
-- [x] Remove the unconditional drop.
-- [x] Instead, only drop/skip weights that are not broadcastable to frame shape.
-- [x] Keep parity with CPU:
-  - [x] If CPU applies per-frame scalar/channel weights for mean/WSC, GPU must too.
-  - [x] If CPU intentionally ignores weights for some combine methods, GPU should match that.
-
-Implementation suggestion:
-- [x] Keep `quality_weights` as returned by `_compute_quality_weights`.
-- [x] During `combined_weights` building, use `_broadcast_weight_template(q_weight, frame.shape)` to validate.
-- [x] If broadcast fails for a frame, set that frame's q_weight to None (or drop weighting entirely only if too many invalid).
-- [x] Do not set `weight_method_used="none"` unless weights truly cannot be applied.
-
-- [x] Also ensure WSC weights block (`wsc_weights_block`) remains consistent and is used when reject algo is winsorized sigma clip.
-
-## Logging requirements
-- Keep existing GUI keys used by worker logs:
-  - `weight_fwhm_bkg2d_error`
-  - `weight_fwhm_no_finite_data`
-  - `weight_fwhm_global_stats_invalid`
-  - `weight_fwhm_warn_all_fwhm_are_infinite`
-  - `weight_fwhm_daofind_error`
-- Optionally add DEBUG-only logs (not GUI-keyed) for:
-  - finite fraction
-  - bbox size
-But do not spam warnings.
-
-## Acceptance criteria
-- On datasets with NaN borders (common aligned frames):
-  - `noise_fwhm` no longer collapses to all-infinite FWHM in typical cases with usable overlap.
-  - Weighting produces non-uniform weights (unless truly no stars / no finite pixels).
-- GPU + CPU runs with same settings:
-  - Both apply quality weights when selected (unless combine method doesn’t support weights).
-  - No regression in other modes (noise_variance, none, other reject algos).
-
-## Tests (must add at least 2)
-Add unit tests that do NOT require a GPU:
-
-1) [x] `test_noise_fwhm_nan_borders_produces_weights`
-- Build a small stack of synthetic frames (float32) with:
-  - Central region containing a few gaussian “stars”
-  - Borders set to NaN (simulate warp/outside overlap)
-- Call `_compute_quality_weights(frames, "noise_fwhm")`
-- Assert:
-  - returned weights are finite
-  - not all equal (non-uniform) when stars exist
-
-2) [x] `test_prepare_frames_and_weights_keeps_quality_weights_without_radial`
-- Call GPU helper `_prepare_frames_and_weights` with:
-  - `stack_weight_method="noise_fwhm"`
-  - radial weighting disabled
-- Assert:
-  - `weight_method_used` remains `"noise_fwhm"` (or at least not forced to "none")
-  - and/or `wsc_weights_block` non-None when weights computed
-
-Keep tests small and fast.
-
-## Deliverables
-- PR-ready code changes.
-- Tests added/updated and passing.
-- Brief summary in followup.md including what was changed and why.
+## Notes (suspect amont, confirmé)
+Les coefficients `linear_fit` peuvent exploser quand `src_high-src_low` est quasi nul.
+Cela crée des outliers hors footprint (positifs/négatifs) qui écrasent la dynamique en viewer.

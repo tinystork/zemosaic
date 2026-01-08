@@ -2928,6 +2928,9 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
     is_color = ref_image_hwc_float32.ndim == 3 and ref_image_hwc_float32.shape[-1] == 3
     num_channels = 3 if is_color else 1
     normalized_image_list = [None] * len(image_list_hwc_float32)
+    min_delta_rel = 1e-3
+    min_delta_abs = 1e-3
+    max_gain = 20.0
     ref_stats_per_channel = []
     for c_idx_ref in range(num_channels):
         ref_channel_2d = ref_image_hwc_float32[..., c_idx_ref] if is_color else ref_image_hwc_float32
@@ -2956,12 +2959,34 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
             src_low, src_high = _calculate_robust_stats_for_linear_fit(src_channel_2d, low_percentile, high_percentile, progress_callback, use_gpu=use_gpu)
             a = 1.0; b = 0.0
             delta_src = src_high - src_low; delta_ref = ref_high - ref_low
-            if abs(delta_src) > 1e-5:
-                if abs(delta_ref) > 1e-5: a = delta_ref / delta_src; b = ref_low - a * src_low
-                else: b = ref_low - src_low # a=1
+            if not (math.isfinite(src_low) and math.isfinite(src_high) and math.isfinite(ref_low) and math.isfinite(ref_high)):
+                _pcb(
+                    f"NormLinFit: AVERT Img {i} C{c_idx_src} stats non-finies; normalisation ignorée.",
+                    lvl="WARN",
+                )
             else:
-                if abs(delta_ref) > 1e-5: a = 0.0; b = ref_low
-                else: b = ref_low - src_low # a=1
+                scale_src = max(abs(src_low), abs(src_high), 1.0)
+                min_delta_src = max(min_delta_abs, min_delta_rel * scale_src)
+                if abs(delta_src) < min_delta_src:
+                    _pcb(
+                        f"NormLinFit: AVERT Img {i} C{c_idx_src} Src(L/H)=({src_low:.3g}/{src_high:.3g}) "
+                        f"delta_src={delta_src:.3g} < {min_delta_src:.3g} -> normalisation ignorée.",
+                        lvl="WARN",
+                    )
+                else:
+                    if abs(delta_ref) > 1e-5:
+                        a = delta_ref / delta_src
+                        b = ref_low - a * src_low
+                    else:
+                        b = ref_low - src_low # a=1
+                    if not (math.isfinite(a) and math.isfinite(b)) or abs(a) > max_gain:
+                        _pcb(
+                            f"NormLinFit: AVERT Img {i} C{c_idx_src} coeffs extrêmes "
+                            f"(a={a:.3g}, b={b:.3g}); normalisation ignorée.",
+                            lvl="WARN",
+                        )
+                        a = 1.0
+                        b = 0.0
             if abs(a - 1.0) > 1e-3 or abs(b) > 1e-3 * max(abs(ref_low), abs(src_low), 1.0):
                  _pcb(f"NormLinFit: Img {i} C{c_idx_src}: Src(L/H)=({src_low:.3g}/{src_high:.3g}) -> Coeffs a={a:.3f}, b={b:.3f}", lvl="DEBUG_DETAIL")
             transformed_channel = a * src_channel_2d + b
