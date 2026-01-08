@@ -883,7 +883,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.3.1, Renāscentia – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.3.2, Renāscentia ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -4233,7 +4233,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.3.1, Renāscentia – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.3.2, Renāscentia ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
