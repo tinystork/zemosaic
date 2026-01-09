@@ -202,6 +202,7 @@ def test_prepare_frames_and_weights_keeps_quality_weights_without_radial():
         wsc_weights_block,
         _wsc_weight_method,
         _wsc_weight_stats,
+        _sky_offsets,
     ) = gpu_mod._prepare_frames_and_weights(
         frames,
         stacking_params,
@@ -238,6 +239,7 @@ def test_p3_wsc_prep_applies_sky_mean_normalization():
         _wsc_weights_block,
         _wsc_weight_method,
         _wsc_weight_stats,
+        sky_offsets,
     ) = gpu_mod._prepare_frames_and_weights(
         frames,
         stacking_params,
@@ -246,11 +248,54 @@ def test_p3_wsc_prep_applies_sky_mean_normalization():
         logger=None,
     )
 
+    assert sky_offsets is None
     ref_mean = float(np.mean(prepared_frames[0]))
     assert np.isclose(ref_mean, 100.0, atol=1e-5, rtol=0.0)
     assert np.isclose(float(np.mean(prepared_frames[1])), ref_mean, atol=1e-5, rtol=0.0)
     assert np.isclose(float(np.mean(prepared_frames[2])), ref_mean, atol=1e-5, rtol=0.0)
     assert not np.allclose(prepared_frames[1], frames[1])
+
+
+def test_p3_wsc_prep_sky_mean_low_mem_returns_offsets(monkeypatch):
+    if gpu_mod is None:
+        pytest.skip("GPU stacker module unavailable on sys.path")
+
+    # Force low-memory normalization mode without allocating massive frames.
+    monkeypatch.setattr(gpu_mod, "_available_ram_bytes", lambda: 1)
+
+    frames = [
+        np.full((6, 6, 3), 100.0, dtype=np.float32),
+        np.full((6, 6, 3), 120.0, dtype=np.float32),
+        np.full((6, 6, 3), 80.0, dtype=np.float32),
+    ]
+    stacking_params = {
+        "stack_norm_method": "sky_mean",
+        "stack_reject_algo": "winsorized_sigma_clip",
+        "stack_weight_method": "none",
+    }
+
+    (
+        prepared_frames,
+        _weights_stack,
+        _weight_method_used,
+        _weight_stats,
+        _expanded_channels,
+        _wsc_weights_block,
+        _wsc_weight_method,
+        _wsc_weight_stats,
+        sky_offsets,
+    ) = gpu_mod._prepare_frames_and_weights(
+        frames,
+        stacking_params,
+        zconfig=_cpu_config(),
+        pcb_tile=None,
+        logger=None,
+    )
+
+    assert sky_offsets is not None
+    assert np.allclose(np.asarray(sky_offsets, dtype=np.float32), np.asarray([0.0, -20.0, 20.0], dtype=np.float32))
+    # In low-mem mode, frames are left untouched and offsets are applied per chunk during stacking.
+    assert np.isclose(float(np.mean(prepared_frames[1])), 120.0, atol=1e-5, rtol=0.0)
 
 
 def test_wsc_pixinsight_core_weights_block_changes_output():

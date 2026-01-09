@@ -76,6 +76,160 @@ class GPUStackingError(RuntimeError):
     """Raised when GPU-based stacking is unavailable or fails."""
 
 
+def _available_ram_bytes() -> int | None:
+    """Best-effort available RAM query (returns None if unavailable)."""
+
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _should_use_low_mem_norm(*, n_frames: int, per_frame_bytes: int, logger: logging.Logger | None) -> bool:
+    """Decide whether to avoid full-frame normalization copies (sky_mean/linear_fit)."""
+
+    try:
+        n = max(0, int(n_frames))
+        bpf = max(0, int(per_frame_bytes))
+    except Exception:
+        return False
+    if n <= 0 or bpf <= 0:
+        return False
+
+    est_copy_bytes = int(n * bpf)
+    avail = _available_ram_bytes()
+    # If we cannot read RAM availability, use a conservative absolute threshold.
+    threshold = int(2 * 1024 * 1024 * 1024)  # 2 GiB
+    if avail is not None and avail > 0:
+        # Require a healthy margin because stacking allocates additional working buffers.
+        threshold = int(avail * 0.55)
+
+    low_mem = est_copy_bytes >= threshold
+    if low_mem and logger is not None:
+        try:
+            gib = 1024.0 * 1024.0 * 1024.0
+            msg_avail = "n/a" if avail is None else f"{float(avail) / gib:.2f}GiB"
+            logger.info(
+                "[P3][GPU] Low-mem normalization: avoiding full-frame copies (N=%d, per_frame=%.2fMiB, est_copy=%.2fGiB, avail=%s)",
+                int(n),
+                float(bpf) / (1024.0 * 1024.0),
+                float(est_copy_bytes) / gib,
+                msg_avail,
+            )
+        except Exception:
+            pass
+    return low_mem
+
+
+def _compute_sky_mean_offsets(
+    frames: Sequence[np.ndarray],
+    *,
+    progress_cb: Callable[..., Any] | None,
+    use_gpu: bool,
+    reference_index: int = 0,
+    sky_percentile: float = 25.0,
+) -> np.ndarray:
+    """Compute per-frame additive offsets matching _normalize_images_sky_mean, without copying frames."""
+
+    def _pcb(msg_key, lvl="INFO_DETAIL", **kwargs):
+        if progress_cb:
+            try:
+                progress_cb(msg_key, None, lvl, **kwargs)
+            except Exception:
+                pass
+
+    if not frames:
+        return np.zeros((0,), dtype=np.float32)
+
+    ref_idx = int(reference_index)
+    if ref_idx < 0 or ref_idx >= len(frames) or frames[ref_idx] is None:
+        return np.zeros((len(frames),), dtype=np.float32)
+
+    _pcb(
+        f"NormSkyMean: Début normalisation par fond de ciel (percentile {float(sky_percentile)}%) sur réf. idx {ref_idx}.",
+        lvl="DEBUG",
+    )
+
+    def _luminance(img: np.ndarray) -> np.ndarray | None:
+        if img is None:
+            return None
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.ndim == 3 and arr.shape[-1] == 3:
+            return 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            return arr[..., 0]
+        if arr.ndim == 2:
+            return arr
+        return None
+
+    gpu_nanpercentile = None
+    if use_gpu and _CPU_STACK_HELPERS_AVAILABLE and _zas is not None:
+        gpu_nanpercentile = getattr(_zas, "_gpu_nanpercentile", None)
+
+    ref_lum = _luminance(frames[ref_idx])
+    if ref_lum is None or ref_lum.size <= 0:
+        return np.zeros((len(frames),), dtype=np.float32)
+
+    ref_sky = None
+    try:
+        if callable(gpu_nanpercentile):
+            ref_sky = float(gpu_nanpercentile(ref_lum, float(sky_percentile)))
+        else:
+            ref_sky = float(np.nanpercentile(ref_lum, float(sky_percentile)))
+    except Exception:
+        try:
+            ref_sky = float(np.nanpercentile(ref_lum, float(sky_percentile)))
+        except Exception:
+            ref_sky = None
+
+    if ref_sky is None or not np.isfinite(ref_sky):
+        _pcb(f"NormSkyMean: Fond de ciel de référence invalide ({ref_sky}). Normalisation annulée.", lvl="ERROR")
+        return np.zeros((len(frames),), dtype=np.float32)
+
+    _pcb(
+        f"NormSkyMean: Fond de ciel de référence (img idx {ref_idx}) estimé à {ref_sky:.3g}",
+        lvl="DEBUG_DETAIL",
+    )
+
+    offsets = np.zeros((len(frames),), dtype=np.float32)
+    for i, img in enumerate(frames):
+        if img is None:
+            continue
+        if i == ref_idx:
+            _pcb(f"NormSkyMean: Image {i} est la référence, copiée.", lvl="DEBUG_VERY_DETAIL")
+            continue
+
+        lum = _luminance(img)
+        if lum is None or lum.size <= 0:
+            continue
+
+        try:
+            if callable(gpu_nanpercentile):
+                cur_sky = float(gpu_nanpercentile(lum, float(sky_percentile)))
+            else:
+                cur_sky = float(np.nanpercentile(lum, float(sky_percentile)))
+        except Exception:
+            try:
+                cur_sky = float(np.nanpercentile(lum, float(sky_percentile)))
+            except Exception:
+                cur_sky = float("nan")
+
+        if np.isfinite(cur_sky):
+            off = float(ref_sky - cur_sky)
+            offsets[i] = np.float32(off)
+            _pcb(
+                f"NormSkyMean: Image {i}, fond_ciel={cur_sky:.3g}, offset_appliqué={off:.3g}",
+                lvl="DEBUG_VERY_DETAIL",
+            )
+        else:
+            _pcb(f"NormSkyMean: Fond de ciel invalide pour image {i} ({cur_sky}). Image non normalisée.", lvl="WARN")
+
+    _pcb("NormSkyMean: Normalisation par fond de ciel terminée.", lvl="DEBUG")
+    return offsets
+
+
 def _gpu_safe_mode_enabled() -> bool:
     """Return True if the worker requested GPU safe mode via environment."""
 
@@ -321,6 +475,7 @@ def _wsc_pixinsight_stack_cpu(
     max_iters: int,
     rows_per_chunk: int,
     weights_block: np.ndarray | None = None,
+    sky_offsets: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     if not frames:
         raise GPUStackingError("No frames provided for CPU fallback")
@@ -339,6 +494,17 @@ def _wsc_pixinsight_stack_cpu(
     for row_start in range(0, height, chunk_rows):
         row_end = min(height, row_start + chunk_rows)
         chunk = np.stack([frame[row_start:row_end, :, :] for frame in frames], axis=0)
+        if sky_offsets is not None:
+            try:
+                off = np.asarray(sky_offsets, dtype=np.float32).reshape((chunk.shape[0], 1, 1, 1))
+                chunk += off
+            except Exception:
+                pass
+        try:
+            # Keep NaNs (mask) but convert +/-inf to NaN.
+            np.nan_to_num(chunk, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+        except Exception:
+            pass
         chunk_out, stats = wsc_pixinsight_core(
             np,
             chunk,
@@ -573,7 +739,7 @@ def _build_wsc_weights_block(
             if is_color:
                 sanitized.append(np.ones((1, 1, 3), dtype=np.float32))
             else:
-                sanitized.append(np.ones((1,), dtype=np.float32))
+                sanitized.append(np.ones((1, 1, 1), dtype=np.float32))
             continue
         w_arr = np.asarray(w, dtype=np.float32)
         if is_color:
@@ -602,7 +768,7 @@ def _build_wsc_weights_block(
                     val = float(np.nanmean(w_arr))
                 except Exception:
                     val = 1.0
-            sanitized.append(np.asarray([val], dtype=np.float32))
+            sanitized.append(np.asarray([[[val]]], dtype=np.float32))
     try:
         weights_block = np.stack(sanitized, axis=0)
     except Exception:
@@ -628,6 +794,7 @@ def _prepare_frames_and_weights(
     np.ndarray | None,
     str,
     dict[str, float] | None,
+    np.ndarray | None,
 ]:
     """
     Mirror the CPU stacker's preprocessing: normalize frames and compute weights.
@@ -645,6 +812,9 @@ def _prepare_frames_and_weights(
     expanded_channels = False
     reject_algo = (stacking_params.get("stack_reject_algo") or "").strip().lower()
     winsorized_reject = reject_algo in {"winsorized_sigma_clip", "winsorized", "winsor"}
+    wsc_impl = resolve_wsc_impl(zconfig)
+    wsc_pixinsight = winsorized_reject and wsc_impl == WSC_IMPL_PIXINSIGHT
+    sky_offsets: np.ndarray | None = None
 
     # Basic normalization to float32 + shape enforcement
     for idx, frame in enumerate(aligned_images):
@@ -689,11 +859,26 @@ def _prepare_frames_and_weights(
                     use_gpu=use_gpu_norm,
                 )
             elif norm_method in {"sky_mean", "skymean"} and hasattr(_zas, "_normalize_images_sky_mean"):
-                normalized_frames = _zas._normalize_images_sky_mean(
-                    normalized_frames,
-                    progress_callback=progress_cb,
-                    use_gpu=use_gpu_norm,
+                # For massive stacks, avoid creating a full copy of every frame (which can exceed RAM).
+                # Instead compute per-frame offsets and apply them per chunk during stacking.
+                sample_bytes = int(np.asarray(normalized_frames[0]).nbytes) if normalized_frames else 0
+                use_low_mem = _should_use_low_mem_norm(
+                    n_frames=len(normalized_frames),
+                    per_frame_bytes=sample_bytes,
+                    logger=logger,
                 )
+                if use_low_mem:
+                    sky_offsets = _compute_sky_mean_offsets(
+                        normalized_frames,
+                        progress_cb=progress_cb,
+                        use_gpu=use_gpu_norm,
+                    )
+                else:
+                    normalized_frames = _zas._normalize_images_sky_mean(
+                        normalized_frames,
+                        progress_callback=progress_cb,
+                        use_gpu=use_gpu_norm,
+                    )
         except Exception as exc:
             if logger:
                 try:
@@ -701,18 +886,16 @@ def _prepare_frames_and_weights(
                 except Exception:
                     pass
 
-    # Filter out None entries post-normalization and ensure numeric data
+    # Filter out None entries post-normalization.
+    # IMPORTANT: do not materialize per-frame finite-cleaned copies here; that can explode RAM on large stacks.
+    # Non-finite handling is done on the per-chunk buffer during stacking (or in the WSC CPU fallback),
+    # which preserves behavior without duplicating full frames.
     filtered_frames: list[np.ndarray] = []
     for frame in normalized_frames:
         if frame is None:
             continue
         frame_f32 = np.asarray(frame, dtype=np.float32)
-        if not np.all(np.isfinite(frame_f32)):
-            if winsorized_reject:
-                frame_f32 = np.where(np.isfinite(frame_f32), frame_f32, np.nan).astype(np.float32, copy=False)
-            else:
-                frame_f32 = np.nan_to_num(frame_f32, nan=0.0, posinf=0.0, neginf=0.0)
-        filtered_frames.append(frame_f32 if frame_f32.flags.c_contiguous else np.ascontiguousarray(frame_f32))
+        filtered_frames.append(frame_f32)
 
     if not filtered_frames:
         raise GPUStackingError("All frames were invalid after preprocessing")
@@ -746,10 +929,12 @@ def _prepare_frames_and_weights(
         wsc_weight_method = "none"
         wsc_weight_stats = None
 
-    radial_map = _compute_radial_weight_map(height, width, channels, stacking_params, logger)
+    # Full per-pixel weights stacks are extremely large (N*H*W*C) and are not required for WSC PixInsight,
+    # which consumes compact per-frame weights. For non-WSC paths, compact weights are broadcast on-GPU.
+    radial_map = None if wsc_pixinsight else _compute_radial_weight_map(height, width, channels, stacking_params, logger)
 
     weights_stack: np.ndarray | None = None
-    if radial_map is not None or quality_weights is not None:
+    if (not wsc_pixinsight) and (radial_map is not None or quality_weights is not None):
         combined_weights: list[np.ndarray | None] = []
         applied_quality = 0
         skipped_quality = 0
@@ -788,7 +973,7 @@ def _prepare_frames_and_weights(
             except Exception:
                 pass
 
-    if weights_stack is None and radial_map is None:
+    if weights_stack is None and wsc_weights_block is None and radial_map is None:
         if weight_method_used != "none":
             weight_method_used = "none"
             weight_stats = None
@@ -802,6 +987,7 @@ def _prepare_frames_and_weights(
         wsc_weights_block,
         wsc_weight_method,
         wsc_weight_stats,
+        sky_offsets,
     )
 
 
@@ -964,6 +1150,7 @@ def gpu_stack_from_arrays(
         wsc_weights_block,
         wsc_weight_method,
         wsc_weight_stats,
+        sky_offsets,
     ) = _prepare_frames_and_weights(
         aligned_images,
         stacking_params,
@@ -1071,6 +1258,7 @@ def gpu_stack_from_arrays(
                 max_iters=WSC_PIXINSIGHT_MAX_ITERS,
                 rows_per_chunk=rows_per_chunk,
                 weights_block=wsc_weights_block,
+                sky_offsets=sky_offsets,
             )
             _log_wsc_summary(
                 logger,
@@ -1116,6 +1304,17 @@ def gpu_stack_from_arrays(
                         [frame[row_start:row_end, :, :] for frame in frames_for_stack],
                         axis=0,
                     )
+                    if sky_offsets is not None:
+                        try:
+                            off = np.asarray(sky_offsets, dtype=np.float32).reshape((chunk_cpu.shape[0], 1, 1, 1))
+                            chunk_cpu += off
+                        except Exception:
+                            pass
+                    try:
+                        # Keep NaNs (mask) but convert +/-inf to NaN.
+                        np.nan_to_num(chunk_cpu, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+                    except Exception:
+                        pass
                     try:
                         for c in range(channels):
                             cpu_c = chunk_cpu[..., c] if channels > 1 else chunk_cpu[..., 0]
@@ -1201,10 +1400,33 @@ def gpu_stack_from_arrays(
                     [frame[row_start:row_end, :, :] for frame in frames_for_stack],
                     axis=0,
                 )
+                if sky_offsets is not None:
+                    try:
+                        off = np.asarray(sky_offsets, dtype=np.float32).reshape((chunk_cpu.shape[0], 1, 1, 1))
+                        chunk_cpu += off
+                    except Exception:
+                        pass
+                try:
+                    if algo in {"winsorized_sigma_clip", "winsorized", "winsor"}:
+                        # Preserve NaNs (mask) but convert +/-inf to NaN.
+                        np.nan_to_num(chunk_cpu, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+                    else:
+                        # Avoid NaNs poisoning mean/std in non-winsor rejection.
+                        np.nan_to_num(chunk_cpu, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                except Exception:
+                    pass
+
                 weights_chunk_gpu = None
+                # Prefer compact per-frame weights for large stacks (broadcast on GPU),
+                # but preserve the legacy full-stack path when available.
                 if weights_stack is not None:
                     weights_chunk_cpu = weights_stack[:, row_start:row_end, :, :]
                     weights_chunk_gpu = cp.asarray(weights_chunk_cpu, dtype=cp.float32)
+                elif wsc_weights_block is not None:
+                    try:
+                        weights_chunk_gpu = cp.asarray(wsc_weights_block, dtype=cp.float32)
+                    except Exception:
+                        weights_chunk_gpu = None
 
                 t0 = time.perf_counter()
                 data_gpu = cp.asarray(chunk_cpu, dtype=cp.float32)
@@ -1261,6 +1483,7 @@ def gpu_stack_from_arrays(
                 max_iters=WSC_PIXINSIGHT_MAX_ITERS,
                 rows_per_chunk=rows_per_chunk,
                 weights_block=wsc_weights_block,
+                sky_offsets=sky_offsets,
             )
             _log_wsc_summary(
                 logger,
