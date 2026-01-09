@@ -27859,16 +27859,38 @@ def _assemble_global_mosaic_first_impl(
         def _compute_chunk_height() -> int:
             if height <= 0:
                 return 0
+            # NOTE: `winsor_worker_limit` is a concurrency hint, not the number of frames stacked here.
+            # Using it to estimate memory can badly under-estimate allocations when many patch entries
+            # overlap the same output rows. Use the *actual* worst-case frame count instead.
             entries = max(1, len(patch_entries))
-            if winsor_max_frames_per_pass > 0:
-                entries = min(entries, winsor_max_frames_per_pass)
-            entries = min(entries, winsor_worker_limit)
-            bytes_per_row = width * max(1, channel_count or 1) * 4 * entries
+            channels = max(1, int(channel_count or 1))
+            # Stack (N, rows, W, C) + weights (N, rows, W) in float32.
+            bytes_per_row = width * 4 * entries * (channels + 1)
             target_bytes = 256 * 1024 * 1024
+            try:
+                # Be more conservative when RAM is already tight (Windows can hard-fail allocations).
+                avail_bytes = int(psutil.virtual_memory().available)
+                if avail_bytes > 0:
+                    target_bytes = min(target_bytes, int(avail_bytes * 0.25))
+                    target_bytes = max(32 * 1024 * 1024, target_bytes)
+            except Exception:
+                pass
             if bytes_per_row <= 0:
                 return min(height, 128)
             chunk = target_bytes // bytes_per_row
-            chunk = max(8, min(height, int(chunk)))
+            chunk = max(1, min(height, int(chunk)))
+            if logger:
+                try:
+                    logger.debug(
+                        "[Worker] Global coadd chunk plan: frames=%d channels=%d bytes/row=%.1f MiB target=%.1f MiB -> chunk_h=%d",
+                        int(entries),
+                        int(channels),
+                        float(bytes_per_row) / (1024.0**2),
+                        float(target_bytes) / (1024.0**2),
+                        int(chunk),
+                    )
+                except Exception:
+                    pass
             return chunk or min(height, 64)
 
         def _finalize_chunked(method: str) -> tuple[np.ndarray, np.ndarray]:
@@ -27877,7 +27899,8 @@ def _assemble_global_mosaic_first_impl(
                 chunk_h = min(height, 128)
             final = np.zeros((height, width, channel_count), dtype=np.float32)
             coverage = np.zeros((height, width), dtype=np.float32)
-            for y0 in range(0, height, chunk_h):
+            y0 = 0
+            while y0 < height:
                 y1 = min(height, y0 + chunk_h)
                 overlaps = [
                     entry
@@ -27885,48 +27908,88 @@ def _assemble_global_mosaic_first_impl(
                     if not (entry["bbox"][1] <= y0 or entry["bbox"][0] >= y1)
                 ]
                 if not overlaps:
+                    y0 = y1
                     continue
-                stack = np.full(
-                    (len(overlaps), y1 - y0, width, channel_count),
-                    np.nan,
-                    dtype=np.float32,
-                )
-                weight_stack = np.zeros((len(overlaps), y1 - y0, width), dtype=np.float32)
-                for idx, entry in enumerate(overlaps):
-                    data_mm = np.load(entry["data_path"], mmap_mode='r')
-                    weight_mm = np.load(entry["weight_path"], mmap_mode='r')
-                    y_start, y_end, x_start, x_end = entry["bbox"]
-                    sub_y0 = max(y0, y_start)
-                    sub_y1 = min(y1, y_end)
-                    if sub_y0 >= sub_y1:
-                        continue
-                    local_y0 = sub_y0 - y_start
-                    local_y1 = sub_y1 - y_start
-                    global_y0 = sub_y0 - y0
-                    global_y1 = sub_y1 - y0
-                    stack[idx, global_y0:global_y1, x_start:x_end, :] = data_mm[local_y0:local_y1, :, :]
-                    weight_stack[idx, global_y0:global_y1, x_start:x_end] = weight_mm[local_y0:local_y1, :]
-                if method == "median":
-                    chunk_result = np.nanmedian(stack, axis=0)
-                    chunk_weight = np.nansum(weight_stack, axis=0)
-                else:
-                    low_pct = max(0.0, min(100.0, winsor_limits[0] * 100.0))
-                    high_pct = max(0.0, min(100.0, 100.0 - winsor_limits[1] * 100.0))
-                    lower = np.nanpercentile(stack, low_pct, axis=0)
-                    upper = np.nanpercentile(stack, high_pct, axis=0)
-                    clipped = np.clip(stack, lower, upper)
-                    weighted = clipped * weight_stack[..., None]
-                    chunk_weight = np.nansum(weight_stack, axis=0)
-                    with np.errstate(invalid="ignore", divide="ignore"):
-                        chunk_result = np.nansum(weighted, axis=0) / np.expand_dims(chunk_weight, axis=-1)
-                chunk_result = np.asarray(chunk_result, dtype=np.float32)
-                chunk_result[~np.isfinite(chunk_result)] = np.nan
-                chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0).astype(np.float32, copy=False)
-                invalid = chunk_weight <= 0
-                if np.any(invalid):
-                    chunk_result = np.where(invalid[..., None], np.nan, chunk_result)
-                final[y0:y1, :, :] = chunk_result
-                coverage[y0:y1, :] = chunk_weight
+
+                stack = None
+                weight_stack = None
+                try:
+                    stack = np.full(
+                        (len(overlaps), y1 - y0, width, channel_count),
+                        np.nan,
+                        dtype=np.float32,
+                    )
+                    weight_stack = np.zeros((len(overlaps), y1 - y0, width), dtype=np.float32)
+                    for idx, entry in enumerate(overlaps):
+                        data_mm = np.load(entry["data_path"], mmap_mode="r")
+                        weight_mm = np.load(entry["weight_path"], mmap_mode="r")
+                        y_start, y_end, x_start, x_end = entry["bbox"]
+                        sub_y0 = max(y0, y_start)
+                        sub_y1 = min(y1, y_end)
+                        if sub_y0 >= sub_y1:
+                            continue
+                        local_y0 = sub_y0 - y_start
+                        local_y1 = sub_y1 - y_start
+                        global_y0 = sub_y0 - y0
+                        global_y1 = sub_y1 - y0
+                        stack[idx, global_y0:global_y1, x_start:x_end, :] = data_mm[
+                            local_y0:local_y1, :, :
+                        ]
+                        weight_stack[idx, global_y0:global_y1, x_start:x_end] = weight_mm[
+                            local_y0:local_y1, :
+                        ]
+                    if method == "median":
+                        chunk_result = np.nanmedian(stack, axis=0)
+                        chunk_weight = np.nansum(weight_stack, axis=0)
+                    else:
+                        low_pct = max(0.0, min(100.0, winsor_limits[0] * 100.0))
+                        high_pct = max(0.0, min(100.0, 100.0 - winsor_limits[1] * 100.0))
+                        lower = np.nanpercentile(stack, low_pct, axis=0).astype(np.float32, copy=False)
+                        upper = np.nanpercentile(stack, high_pct, axis=0).astype(np.float32, copy=False)
+                        # Keep processing in float32 and reuse the large stack buffer in-place to avoid
+                        # allocating huge float64 intermediates (which can hard-crash Windows).
+                        np.clip(stack, lower, upper, out=stack)
+                        stack *= weight_stack[..., None]
+                        chunk_weight = np.nansum(weight_stack, axis=0)
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            chunk_result = np.nansum(stack, axis=0) / np.expand_dims(
+                                chunk_weight, axis=-1
+                            )
+                    chunk_result = np.asarray(chunk_result, dtype=np.float32)
+                    chunk_result[~np.isfinite(chunk_result)] = np.nan
+                    chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0).astype(
+                        np.float32, copy=False
+                    )
+                    invalid = chunk_weight <= 0
+                    if np.any(invalid):
+                        chunk_result = np.where(invalid[..., None], np.nan, chunk_result)
+                    final[y0:y1, :, :] = chunk_result
+                    coverage[y0:y1, :] = chunk_weight
+                    y0 = y1
+                except MemoryError as exc:
+                    if logger:
+                        try:
+                            logger.warning(
+                                "[Worker] Global coadd finalize MemoryError rows=%d-%d frames=%d; reducing chunk_h (%d -> %d): %s",
+                                int(y0),
+                                int(y1),
+                                int(len(overlaps)),
+                                int(chunk_h),
+                                int(max(1, chunk_h // 2)),
+                                str(exc),
+                            )
+                        except Exception:
+                            pass
+                    # Free large buffers before retrying with a smaller chunk.
+                    try:
+                        stack = None
+                        weight_stack = None
+                    except Exception:
+                        pass
+                    gc.collect()
+                    if chunk_h <= 1:
+                        raise
+                    chunk_h = max(1, chunk_h // 2)
             return final, coverage
 
         if coadd_method == "mean":
