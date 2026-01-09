@@ -2457,6 +2457,9 @@ def align_images_in_group(image_data_list: list,
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
 
+    AUTO_PAD_CANVAS = True
+    FOOTPRINT_MIN_FRAC = 0.95
+
     def _coerce_footprint_to_hw_bool(
         footprint_mask,
         target_hw: tuple[int, int],
@@ -2556,6 +2559,27 @@ def align_images_in_group(image_data_list: list,
             except Exception:
                 pass
         return aligned_image
+
+    def _pad_center_nan(img: np.ndarray, diag: int) -> np.ndarray:
+        if img is None:
+            return img
+        if not isinstance(img, np.ndarray):
+            img = np.asarray(img)
+        if img.ndim == 2:
+            h, w = img.shape
+            out = np.full((diag, diag), np.nan, dtype=np.float32)
+            y0 = max(0, (diag - h) // 2)
+            x0 = max(0, (diag - w) // 2)
+            out[y0:y0 + h, x0:x0 + w] = img.astype(np.float32, copy=False)
+            return out
+        if img.ndim == 3:
+            h, w, c = img.shape
+            out = np.full((diag, diag, c), np.nan, dtype=np.float32)
+            y0 = max(0, (diag - h) // 2)
+            x0 = max(0, (diag - w) // 2)
+            out[y0:y0 + h, x0:x0 + w, :] = img.astype(np.float32, copy=False)
+            return out
+        raise ValueError(f"pad_center_nan: unsupported ndim {img.ndim}")
 
     def _overlap_slices_from_shift(h: int, w: int, dy: int, dx: int) -> tuple[slice, slice]:
         ys = slice(max(0, dy), min(h, h + dy))
@@ -2684,103 +2708,173 @@ def align_images_in_group(image_data_list: list,
         empty = [None] * len(image_data_list)
         return empty, list(range(len(empty)))
 
-    reference_image_adu = image_data_list[reference_image_index]
-    if reference_image_adu is None:
-        _pcb("aligngroup_error_ref_image_none", lvl="ERROR", ref_idx=reference_image_index)
-        empty = [None] * len(image_data_list)
-        return empty, list(range(len(empty)))
-    
-    if reference_image_adu.dtype != np.float32:
-        _pcb(f"AlignGroup: Image de référence (index {reference_image_index}) convertie en float32.", lvl="DEBUG_DETAIL")
-        reference_image_adu = reference_image_adu.astype(np.float32)
+    pad_applied = False
+    for attempt in range(2):
+        worst_fp_frac = 1.0
+        reference_image_adu = image_data_list[reference_image_index]
+        if reference_image_adu is None:
+            _pcb("aligngroup_error_ref_image_none", lvl="ERROR", ref_idx=reference_image_index)
+            empty = [None] * len(image_data_list)
+            return empty, list(range(len(empty)))
 
-    _pcb(f"AlignGroup: Alignement intra-tuile sur réf. idx {reference_image_index} (shape {reference_image_adu.shape}).", lvl="DEBUG")
-    aligned_images = [None] * len(image_data_list)
+        if reference_image_adu.dtype != np.float32:
+            _pcb(f"AlignGroup: Image de référence (index {reference_image_index}) convertie en float32.", lvl="DEBUG_DETAIL")
+            reference_image_adu = reference_image_adu.astype(np.float32)
 
-    for i, source_image_adu_orig in enumerate(image_data_list):
-        if source_image_adu_orig is None:
-            _pcb(f"AlignGroup: Image source {i} est None, ignorée.", lvl="WARN")
-            continue
+        _pcb(f"AlignGroup: Alignement intra-tuile sur réf. idx {reference_image_index} (shape {reference_image_adu.shape}).", lvl="DEBUG")
+        aligned_images = [None] * len(image_data_list)
 
-        source_image_adu = source_image_adu_orig.astype(np.float32, copy=False) 
+        for i, source_image_adu_orig in enumerate(image_data_list):
+            if source_image_adu_orig is None:
+                _pcb(f"AlignGroup: Image source {i} est None, ignorée.", lvl="WARN")
+                continue
 
-        if i == reference_image_index:
-            aligned_images[i] = reference_image_adu.copy() 
-            _pcb(f"AlignGroup: Image {i} est la référence, copiée.", lvl="DEBUG_DETAIL")
-            continue
+            source_image_adu = source_image_adu_orig.astype(np.float32, copy=False)
 
-        _pcb(f"AlignGroup: Alignement image {i} (shape {source_image_adu.shape}) sur référence...", lvl="DEBUG_DETAIL")
-        try:
-            # 1) Pré-alignement robuste par corrélation de phase (translation entière)
-            prealign_fft_img = None
-            try_fft = True
-            if try_fft:
-                src_lum = (0.299 * source_image_adu[..., 0] + 0.587 * source_image_adu[..., 1] + 0.114 * source_image_adu[..., 2]).astype(np.float32) if (source_image_adu.ndim == 3 and source_image_adu.shape[-1] == 3) else source_image_adu
-                ref_lum = (0.299 * reference_image_adu[..., 0] + 0.587 * reference_image_adu[..., 1] + 0.114 * reference_image_adu[..., 2]).astype(np.float32) if (reference_image_adu.ndim == 3 and reference_image_adu.shape[-1] == 3) else reference_image_adu
-                dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
-                if abs(dy) + abs(dx) > 0 and conf >= 3.0:  # heuristique de confiance
-                    prealign_fft_img = _apply_integer_shift_hw_or_hwc(source_image_adu, dy, dx)
-                    _pcb(f"AlignGroup: FFT shift appliqué (dy={dy}, dx={dx}, conf={conf:.2f}).", lvl="DEBUG_DETAIL")
+            if i == reference_image_index:
+                aligned_images[i] = reference_image_adu.copy()
+                _pcb(f"AlignGroup: Image {i} est la référence, copiée.", lvl="DEBUG_DETAIL")
+                continue
 
-            # 2) Affinage par astroalign (rotation/affine). Toujours tenter pour corriger la rotation.
-            # Choisir la source pour astroalign: pré-alignée si dispo, sinon brute
-            src_for_aa_base = prealign_fft_img if prealign_fft_img is not None else source_image_adu
-
-            # Garantir des buffers writables/contigus pour astroalign afin d'éviter
-            # "ValueError: buffer source array is read-only" avec des memmaps read-only
-            src_for_aa = (
-                src_for_aa_base if (getattr(src_for_aa_base, 'flags', None)
-                                     and src_for_aa_base.flags.writeable
-                                     and src_for_aa_base.flags.c_contiguous)
-                else np.array(src_for_aa_base, dtype=np.float32, copy=True, order='C')
-            )
-            ref_for_aa = (
-                reference_image_adu if (getattr(reference_image_adu, 'flags', None)
-                                        and reference_image_adu.flags.writeable
-                                        and reference_image_adu.flags.c_contiguous)
-                else np.array(reference_image_adu, dtype=np.float32, copy=True, order='C')
-            )
+            _pcb(f"AlignGroup: Alignement image {i} (shape {source_image_adu.shape}) sur référence...", lvl="DEBUG_DETAIL")
             try:
-                result = astroalign_module.register(
-                    source=src_for_aa,
-                    target=ref_for_aa,
-                    detection_sigma=detection_sigma,
-                    min_area=min_area,
-                    propagate_mask=propagate_mask,
+                # 1) Pré-alignement robuste par corrélation de phase (translation entière)
+                prealign_fft_img = None
+                try_fft = True
+                if try_fft:
+                    src_lum = (0.299 * source_image_adu[..., 0] + 0.587 * source_image_adu[..., 1] + 0.114 * source_image_adu[..., 2]).astype(np.float32) if (source_image_adu.ndim == 3 and source_image_adu.shape[-1] == 3) else source_image_adu
+                    ref_lum = (0.299 * reference_image_adu[..., 0] + 0.587 * reference_image_adu[..., 1] + 0.114 * reference_image_adu[..., 2]).astype(np.float32) if (reference_image_adu.ndim == 3 and reference_image_adu.shape[-1] == 3) else reference_image_adu
+                    dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
+                    if abs(dy) + abs(dx) > 0 and conf >= 3.0:  # heuristique de confiance
+                        prealign_fft_img = _apply_integer_shift_hw_or_hwc(source_image_adu, dy, dx)
+                        _pcb(f"AlignGroup: FFT shift appliqué (dy={dy}, dx={dx}, conf={conf:.2f}).", lvl="DEBUG_DETAIL")
+
+                # 2) Affinage par astroalign (rotation/affine). Toujours tenter pour corriger la rotation.
+                # Choisir la source pour astroalign: pré-alignée si dispo, sinon brute
+                src_for_aa_base = prealign_fft_img if prealign_fft_img is not None else source_image_adu
+
+                # Garantir des buffers writables/contigus pour astroalign afin d'éviter
+                # "ValueError: buffer source array is read-only" avec des memmaps read-only
+                src_for_aa = (
+                    src_for_aa_base if (getattr(src_for_aa_base, 'flags', None)
+                                         and src_for_aa_base.flags.writeable
+                                         and src_for_aa_base.flags.c_contiguous)
+                    else np.array(src_for_aa_base, dtype=np.float32, copy=True, order='C')
                 )
-            except TypeError as exc:
-                # Compat: older astroalign versions may not accept propagate_mask.
-                if "propagate_mask" not in str(exc):
-                    raise
-                result = astroalign_module.register(
-                    source=src_for_aa,
-                    target=ref_for_aa,
-                    detection_sigma=detection_sigma,
-                    min_area=min_area,
+                ref_for_aa = (
+                    reference_image_adu if (getattr(reference_image_adu, 'flags', None)
+                                            and reference_image_adu.flags.writeable
+                                            and reference_image_adu.flags.c_contiguous)
+                    else np.array(reference_image_adu, dtype=np.float32, copy=True, order='C')
                 )
-                if propagate_mask:
-                    try:
-                        _pcb(
-                            "AlignGroup: astroalign.register propagate_mask unsupported",
-                            lvl="DEBUG_DETAIL",
-                            img_idx=int(i),
-                        )
-                    except Exception:
-                        pass
-            aligned_image_output = None
-            footprint_mask = None
-            if isinstance(result, (tuple, list)):
-                if len(result) >= 1:
-                    aligned_image_output = result[0]
-                if len(result) >= 2:
-                    footprint_mask = result[1]
-            else:
-                aligned_image_output = result
-            if aligned_image_output is not None:
-                if aligned_image_output.shape != reference_image_adu.shape:
-                    _pcb("aligngroup_warn_shape_mismatch_after_align", lvl="WARN", img_idx=i, 
-                              aligned_shape=aligned_image_output.shape, ref_shape=reference_image_adu.shape)
-                    # Si astroalign retourne une forme non conforme mais FFT a fonctionné, utiliser FFT
+                try:
+                    result = astroalign_module.register(
+                        source=src_for_aa,
+                        target=ref_for_aa,
+                        detection_sigma=detection_sigma,
+                        min_area=min_area,
+                        propagate_mask=propagate_mask,
+                    )
+                except TypeError as exc:
+                    # Compat: older astroalign versions may not accept propagate_mask.
+                    if "propagate_mask" not in str(exc):
+                        raise
+                    result = astroalign_module.register(
+                        source=src_for_aa,
+                        target=ref_for_aa,
+                        detection_sigma=detection_sigma,
+                        min_area=min_area,
+                    )
+                    if propagate_mask:
+                        try:
+                            _pcb(
+                                "AlignGroup: astroalign.register propagate_mask unsupported",
+                                lvl="DEBUG_DETAIL",
+                                img_idx=int(i),
+                            )
+                        except Exception:
+                            pass
+                aligned_image_output = None
+                footprint_mask = None
+                if isinstance(result, (tuple, list)):
+                    if len(result) >= 1:
+                        aligned_image_output = result[0]
+                    if len(result) >= 2:
+                        footprint_mask = result[1]
+                else:
+                    aligned_image_output = result
+                if aligned_image_output is not None:
+                    if aligned_image_output.shape != reference_image_adu.shape:
+                        _pcb("aligngroup_warn_shape_mismatch_after_align", lvl="WARN", img_idx=i,
+                                  aligned_shape=aligned_image_output.shape, ref_shape=reference_image_adu.shape)
+                        # Si astroalign retourne une forme non conforme mais FFT a fonctionné, utiliser FFT
+                        if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
+                            fft_out = prealign_fft_img.astype(np.float32, copy=True)
+                            if propagate_mask and isinstance(fft_out, np.ndarray) and fft_out.ndim >= 2:
+                                h, w = fft_out.shape[:2]
+                                yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
+                                valid_hw = np.zeros((h, w), dtype=bool)
+                                if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
+                                    valid_hw[yt, xt] = True
+                                    try:
+                                        overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
+                                        if np.isfinite(overlap_frac):
+                                            worst_fp_frac = min(worst_fp_frac, overlap_frac)
+                                        _pcb(
+                                            "AlignGroup: FFT-only fallback footprint derived",
+                                            lvl="DEBUG_DETAIL",
+                                            img_idx=int(i),
+                                            dy=int(dy),
+                                            dx=int(dx),
+                                            overlap_rect=(int(yt.start), int(xt.start), int(yt.stop), int(xt.stop)),
+                                            overlap_frac=overlap_frac,
+                                        )
+                                    except Exception:
+                                        pass
+                                    fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
+                            aligned_images[i] = fft_out
+                            _pcb("AlignGroup: Fallback FFT-only après mismatch de forme.", lvl="WARN")
+                        else:
+                            aligned_images[i] = None
+                    else:
+                        aligned_out = aligned_image_output.astype(np.float32, copy=False)
+                        fp2d = None
+                        ignore_reason = "footprint_none"
+                        if footprint_mask is not None:
+                            fp2d, ignore_reason = _coerce_footprint_to_hw_bool(
+                                footprint_mask,
+                                aligned_out.shape[:2],
+                                img_idx=i,
+                            )
+                            if fp2d is not None:
+                                try:
+                                    nonzero_frac = float(np.count_nonzero(fp2d) / fp2d.size) if fp2d.size else 0.0
+                                    worst_fp_frac = min(worst_fp_frac, nonzero_frac)
+                                except Exception:
+                                    pass
+                        if propagate_mask:
+                            if fp2d is None:
+                                try:
+                                    _pcb(
+                                        "AlignGroup: footprint ignored",
+                                        lvl="DEBUG_DETAIL",
+                                        img_idx=int(i),
+                                        reason=str(ignore_reason),
+                                        footprint_shape=getattr(footprint_mask, "shape", None),
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                aligned_out = _nanize_outside_mask_hw(
+                                    aligned_out,
+                                    fp2d,
+                                    img_idx=i,
+                                    tag="astroalign",
+                                )
+                        aligned_images[i] = aligned_out
+                        _pcb(f"AlignGroup: Image {i} alignée (affine).", lvl="DEBUG_DETAIL")
+                else:
+                    _pcb("aligngroup_warn_register_returned_none", lvl="WARN", img_idx=i)
                     if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
                         fft_out = prealign_fft_img.astype(np.float32, copy=True)
                         if propagate_mask and isinstance(fft_out, np.ndarray) and fft_out.ndim >= 2:
@@ -2791,6 +2885,8 @@ def align_images_in_group(image_data_list: list,
                                 valid_hw[yt, xt] = True
                                 try:
                                     overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
+                                    if np.isfinite(overlap_frac):
+                                        worst_fp_frac = min(worst_fp_frac, overlap_frac)
                                     _pcb(
                                         "AlignGroup: FFT-only fallback footprint derived",
                                         lvl="DEBUG_DETAIL",
@@ -2804,106 +2900,81 @@ def align_images_in_group(image_data_list: list,
                                     pass
                                 fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
                         aligned_images[i] = fft_out
-                        _pcb("AlignGroup: Fallback FFT-only après mismatch de forme.", lvl="WARN")
+                        _pcb("AlignGroup: Fallback FFT-only (astroalign None).", lvl="WARN")
                     else:
                         aligned_images[i] = None
-                else:
-                    aligned_out = aligned_image_output.astype(np.float32, copy=False)
-                    if propagate_mask:
-                        fp2d, ignore_reason = _coerce_footprint_to_hw_bool(
-                            footprint_mask,
-                            aligned_out.shape[:2],
-                            img_idx=i,
-                        )
-                        if fp2d is None:
-                            try:
-                                _pcb(
-                                    "AlignGroup: footprint ignored",
-                                    lvl="DEBUG_DETAIL",
-                                    img_idx=int(i),
-                                    reason=str(ignore_reason),
-                                    footprint_shape=getattr(footprint_mask, "shape", None),
-                                )
-                            except Exception:
-                                pass
-                        else:
-                            aligned_out = _nanize_outside_mask_hw(
-                                aligned_out,
-                                fp2d,
-                                img_idx=i,
-                                tag="astroalign",
-                            )
-                    aligned_images[i] = aligned_out
-                    _pcb(f"AlignGroup: Image {i} alignée (affine).", lvl="DEBUG_DETAIL")
-            else:
-                _pcb("aligngroup_warn_register_returned_none", lvl="WARN", img_idx=i)
-                if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
-                    fft_out = prealign_fft_img.astype(np.float32, copy=True)
-                    if propagate_mask and isinstance(fft_out, np.ndarray) and fft_out.ndim >= 2:
-                        h, w = fft_out.shape[:2]
-                        yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
-                        valid_hw = np.zeros((h, w), dtype=bool)
-                        if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
-                            valid_hw[yt, xt] = True
-                            try:
-                                overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
-                                _pcb(
-                                    "AlignGroup: FFT-only fallback footprint derived",
-                                    lvl="DEBUG_DETAIL",
-                                    img_idx=int(i),
-                                    dy=int(dy),
-                                    dx=int(dx),
-                                    overlap_rect=(int(yt.start), int(xt.start), int(yt.stop), int(xt.stop)),
-                                    overlap_frac=overlap_frac,
-                                )
-                            except Exception:
-                                pass
-                            fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
-                    aligned_images[i] = fft_out
-                    _pcb("AlignGroup: Fallback FFT-only (astroalign None).", lvl="WARN")
-                else:
+            except astroalign_module.MaxIterError:
+                _pcb("aligngroup_warn_max_iter_error", lvl="WARN", img_idx=i)
+                # En cas d'échec astroalign, repli sur FFT si disponible
+                try:
+                    if 'prealign_fft_img' in locals() and prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
+                        fft_out = prealign_fft_img.astype(np.float32, copy=True)
+                        if propagate_mask and isinstance(fft_out, np.ndarray) and fft_out.ndim >= 2:
+                            h, w = fft_out.shape[:2]
+                            yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
+                            valid_hw = np.zeros((h, w), dtype=bool)
+                            if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
+                                valid_hw[yt, xt] = True
+                                try:
+                                    overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
+                                    if np.isfinite(overlap_frac):
+                                        worst_fp_frac = min(worst_fp_frac, overlap_frac)
+                                    _pcb(
+                                        "AlignGroup: FFT-only fallback footprint derived",
+                                        lvl="DEBUG_DETAIL",
+                                        img_idx=int(i),
+                                        dy=int(dy),
+                                        dx=int(dx),
+                                        overlap_rect=(int(yt.start), int(xt.start), int(yt.stop), int(xt.stop)),
+                                        overlap_frac=overlap_frac,
+                                    )
+                                except Exception:
+                                    pass
+                                fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
+                        aligned_images[i] = fft_out
+                        _pcb("AlignGroup: Fallback FFT-only (MaxIterError).", lvl="WARN")
+                    else:
+                        aligned_images[i] = None
+                except Exception:
                     aligned_images[i] = None
-        except astroalign_module.MaxIterError:
-            _pcb("aligngroup_warn_max_iter_error", lvl="WARN", img_idx=i)
-            # En cas d'échec astroalign, repli sur FFT si disponible
-            try:
-                if 'prealign_fft_img' in locals() and prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
-                    fft_out = prealign_fft_img.astype(np.float32, copy=True)
-                    if propagate_mask and isinstance(fft_out, np.ndarray) and fft_out.ndim >= 2:
-                        h, w = fft_out.shape[:2]
-                        yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
-                        valid_hw = np.zeros((h, w), dtype=bool)
-                        if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
-                            valid_hw[yt, xt] = True
-                            try:
-                                overlap_frac = float(((yt.stop - yt.start) * (xt.stop - xt.start)) / max(1, h * w))
-                                _pcb(
-                                    "AlignGroup: FFT-only fallback footprint derived",
-                                    lvl="DEBUG_DETAIL",
-                                    img_idx=int(i),
-                                    dy=int(dy),
-                                    dx=int(dx),
-                                    overlap_rect=(int(yt.start), int(xt.start), int(yt.stop), int(xt.stop)),
-                                    overlap_frac=overlap_frac,
-                                )
-                            except Exception:
-                                pass
-                            fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
-                    aligned_images[i] = fft_out
-                    _pcb("AlignGroup: Fallback FFT-only (MaxIterError).", lvl="WARN")
-                else:
-                    aligned_images[i] = None
-            except Exception:
+            except ValueError as ve:
+                _pcb("aligngroup_warn_value_error", lvl="WARN", img_idx=i, error=str(ve))
                 aligned_images[i] = None
-        except ValueError as ve:
-            _pcb("aligngroup_warn_value_error", lvl="WARN", img_idx=i, error=str(ve))
-            aligned_images[i] = None
-        except Exception as e_align:
-            _pcb("aligngroup_error_exception_aligning", lvl="ERROR", img_idx=i, error_type=type(e_align).__name__, error_msg=str(e_align))
-            _pcb(f"AlignGroup Traceback: {traceback.format_exc()}", lvl="DEBUG_DETAIL")
-            aligned_images[i] = None
-    failed_indices = [idx for idx, img in enumerate(aligned_images) if img is None]
-    return aligned_images, failed_indices
+            except Exception as e_align:
+                _pcb("aligngroup_error_exception_aligning", lvl="ERROR", img_idx=i, error_type=type(e_align).__name__, error_msg=str(e_align))
+                _pcb(f"AlignGroup Traceback: {traceback.format_exc()}", lvl="DEBUG_DETAIL")
+                aligned_images[i] = None
+        failed_indices = [idx for idx, img in enumerate(aligned_images) if img is None]
+        if AUTO_PAD_CANVAS and (not pad_applied) and (worst_fp_frac < FOOTPRINT_MIN_FRAC):
+            diag = None
+            try:
+                H_ref, W_ref = reference_image_adu.shape[:2]
+                diag = int(np.ceil(np.hypot(H_ref, W_ref)))
+                _pcb(
+                    "AlignGroup: auto-pad triggered",
+                    lvl="INFO_DETAIL",
+                    worst_frac=float(worst_fp_frac),
+                    threshold=float(FOOTPRINT_MIN_FRAC),
+                    diag=int(diag),
+                    orig_hw=(int(H_ref), int(W_ref)),
+                )
+                padded_list = []
+                for img in image_data_list:
+                    if img is None:
+                        padded_list.append(None)
+                    else:
+                        padded_list.append(_pad_center_nan(img, diag))
+                image_data_list = padded_list
+                pad_applied = True
+                continue
+            except (MemoryError, ValueError) as exc:
+                _pcb(
+                    "AlignGroup: auto-pad failed; keeping pass1 results",
+                    lvl="WARN",
+                    err_type=type(exc).__name__,
+                    diag=diag,
+                )
+        return aligned_images, failed_indices
 
 
 
@@ -2928,6 +2999,9 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
     is_color = ref_image_hwc_float32.ndim == 3 and ref_image_hwc_float32.shape[-1] == 3
     num_channels = 3 if is_color else 1
     normalized_image_list = [None] * len(image_list_hwc_float32)
+    min_delta_rel = 1e-3
+    min_delta_abs = 1e-3
+    max_gain = 20.0
     ref_stats_per_channel = []
     for c_idx_ref in range(num_channels):
         ref_channel_2d = ref_image_hwc_float32[..., c_idx_ref] if is_color else ref_image_hwc_float32
@@ -2956,12 +3030,34 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
             src_low, src_high = _calculate_robust_stats_for_linear_fit(src_channel_2d, low_percentile, high_percentile, progress_callback, use_gpu=use_gpu)
             a = 1.0; b = 0.0
             delta_src = src_high - src_low; delta_ref = ref_high - ref_low
-            if abs(delta_src) > 1e-5:
-                if abs(delta_ref) > 1e-5: a = delta_ref / delta_src; b = ref_low - a * src_low
-                else: b = ref_low - src_low # a=1
+            if not (math.isfinite(src_low) and math.isfinite(src_high) and math.isfinite(ref_low) and math.isfinite(ref_high)):
+                _pcb(
+                    f"NormLinFit: AVERT Img {i} C{c_idx_src} stats non-finies; normalisation ignorée.",
+                    lvl="WARN",
+                )
             else:
-                if abs(delta_ref) > 1e-5: a = 0.0; b = ref_low
-                else: b = ref_low - src_low # a=1
+                scale_src = max(abs(src_low), abs(src_high), 1.0)
+                min_delta_src = max(min_delta_abs, min_delta_rel * scale_src)
+                if abs(delta_src) < min_delta_src:
+                    _pcb(
+                        f"NormLinFit: AVERT Img {i} C{c_idx_src} Src(L/H)=({src_low:.3g}/{src_high:.3g}) "
+                        f"delta_src={delta_src:.3g} < {min_delta_src:.3g} -> normalisation ignorée.",
+                        lvl="WARN",
+                    )
+                else:
+                    if abs(delta_ref) > 1e-5:
+                        a = delta_ref / delta_src
+                        b = ref_low - a * src_low
+                    else:
+                        b = ref_low - src_low # a=1
+                    if not (math.isfinite(a) and math.isfinite(b)) or abs(a) > max_gain:
+                        _pcb(
+                            f"NormLinFit: AVERT Img {i} C{c_idx_src} coeffs extrêmes "
+                            f"(a={a:.3g}, b={b:.3g}); normalisation ignorée.",
+                            lvl="WARN",
+                        )
+                        a = 1.0
+                        b = 0.0
             if abs(a - 1.0) > 1e-3 or abs(b) > 1e-3 * max(abs(ref_low), abs(src_low), 1.0):
                  _pcb(f"NormLinFit: Img {i} C{c_idx_src}: Src(L/H)=({src_low:.3g}/{src_high:.3g}) -> Coeffs a={a:.3f}, b={b:.3f}", lvl="DEBUG_DETAIL")
             transformed_channel = a * src_channel_2d + b

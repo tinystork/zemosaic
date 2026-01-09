@@ -827,6 +827,7 @@ def _apply_lecropper_pipeline(
     alpha_mask_norm: np.ndarray | None = None
     altaz_masked_used = False
     altaz_mask2d_used = False
+    altaz_mask2d_applied = False
     try:
         if q_enabled and hasattr(lecropper, "quality_crop"):
             out = lecropper.quality_crop(
@@ -850,6 +851,64 @@ def _apply_lecropper_pipeline(
                         "min_coverage_frac": altaz_min_coverage_frac,
                         "morph_open_px": altaz_morph_open_px,
                     }
+
+                # SAFETY: avoid overly strict coverage thresholds on low-coverage tiles.
+                # When cov_max is small (e.g. 1–3), requiring min_abs == cov_max effectively
+                # takes a full intersection, which can annihilate edge tiles after reprojection.
+                try:
+                    cov_max = float(np.nanmax(coverage)) if isinstance(coverage, np.ndarray) and coverage.size else 0.0
+                    if math.isfinite(cov_max) and cov_max > 0.0:
+                        min_abs = cov_kwargs.get("min_coverage_abs")
+                        min_frac = cov_kwargs.get("min_coverage_frac")
+                        morph_px = cov_kwargs.get("morph_open_px")
+
+                        # Relax min_abs if it would force a full intersection on small cov_max.
+                        if min_abs is not None:
+                            try:
+                                min_abs_f = float(min_abs)
+                            except Exception:
+                                min_abs_f = None
+                            if min_abs_f is not None and math.isfinite(min_abs_f) and cov_max <= 6.0 and min_abs_f >= cov_max:
+                                try:
+                                    min_frac_f = float(min_frac) if min_frac is not None else 0.0
+                                except Exception:
+                                    min_frac_f = 0.0
+                                frac_req = float(math.ceil(min_frac_f * cov_max))
+                                relaxed = max(1.0, frac_req)
+                                # Never require cov_max on low cov_max (avoid full intersection)
+                                relaxed = min(relaxed, max(1.0, cov_max - 1.0))
+                                cov_kwargs["min_coverage_abs"] = float(relaxed)
+                                try:
+                                    logger.info(
+                                        "ALTaz coverage guard: min_coverage_abs %.1f->%.1f (cov_max=%.1f, min_frac=%.3f)",
+                                        float(min_abs_f),
+                                        float(relaxed),
+                                        float(cov_max),
+                                        float(min_frac_f),
+                                    )
+                                except Exception:
+                                    pass
+
+                        # Morphological open can wipe small masks; be gentler on very low cov_max.
+                        if morph_px is not None and cov_max <= 3.0:
+                            try:
+                                morph_i = int(morph_px)
+                            except Exception:
+                                morph_i = 0
+                            if morph_i > 1:
+                                cov_kwargs["morph_open_px"] = 1
+                                try:
+                                    logger.info(
+                                        "ALTaz coverage guard: morph_open_px %d->%d (cov_max=%.1f)",
+                                        int(morph_i),
+                                        1,
+                                        float(cov_max),
+                                    )
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
                 try:
                     masked, mask2d = mask_helper(
                         base_for_mask,
@@ -929,45 +988,63 @@ def _apply_lecropper_pipeline(
                     altaz_masked_used = out is not None
 
             if mask2d is not None:
-                try:
-                    logger.info("lecropper: altaz_nanize_threshold=%.3f", az_nanize_threshold)
-                except Exception:
-                    pass
                 alpha_mask_norm = np.asarray(mask2d, dtype=np.float32)
-                mask_zero = alpha_mask_norm <= az_nanize_threshold
-                # Always apply nanize/zeroize on the unattenuated base_for_mask,
-                # not on `out` (which could have been attenuated elsewhere).
-                target_for_mask = base_for_mask
-                if isinstance(target_for_mask, np.ndarray) and target_for_mask.ndim == 3:
-                    mask_zero = mask_zero[..., None]
-                if az_nanize:
-                    out = np.where(mask_zero, np.nan, target_for_mask)
-                else:
-                    out = np.where(mask_zero, 0.0, target_for_mask)
-                altaz_mask2d_used = True
+                nz_frac = None
+                alpha_min_val = None
+                alpha_max_val = None
                 try:
                     nz_frac = float(np.count_nonzero(alpha_mask_norm) / alpha_mask_norm.size) if alpha_mask_norm.size else 0.0
                     alpha_min_val = float(np.nanmin(alpha_mask_norm)) if alpha_mask_norm.size else 0.0
                     alpha_max_val = float(np.nanmax(alpha_mask_norm)) if alpha_mask_norm.size else 0.0
+                except Exception:
+                    nz_frac = None
+
+                try:
                     logger.info(
                         "ALPHA_STATS: level=master_tile nonzero_frac=%.3f min=%.3f max=%.3f shape=%s",
-                        nz_frac,
-                        alpha_min_val,
-                        alpha_max_val,
+                        float(nz_frac) if nz_frac is not None else -1.0,
+                        float(alpha_min_val) if alpha_min_val is not None else 0.0,
+                        float(alpha_max_val) if alpha_max_val is not None else 0.0,
                         getattr(alpha_mask_norm, "shape", None),
                     )
-                    if az_enabled and nz_frac < 0.01:
-                        logger.warning(
-                            "ALPHA_STATS: alpha mask nearly empty after altaz cleanup (nonzero_frac=%.4f)",
-                            nz_frac,
-                        )
                 except Exception:
                     pass
+
+                # SAFETY GUARD: if the alpha mask is nearly empty, applying nanize/zeroize would
+                # destroy the Master Tile. In that case, keep the tile unchanged and drop the mask.
+                try:
+                    min_nz_guard = float(cfg.get("altaz_min_nonzero_frac_guard", 0.10))
+                except Exception:
+                    min_nz_guard = 0.10
+
+                if nz_frac is not None and az_enabled and float(nz_frac) < float(min_nz_guard):
+                    try:
+                        logger.warning(
+                            "ALTaz guard: skipping nanize/zeroize (nonzero_frac=%.4f < %.3f). "
+                            "Mask too small would black out the tile; consider lowering altaz_min_coverage_abs or morph_open_px.",
+                            float(nz_frac),
+                            float(min_nz_guard),
+                        )
+                    except Exception:
+                        pass
+                    alpha_mask_norm = None
+                    out = base_for_mask
+                else:
+                    mask_zero = alpha_mask_norm <= az_nanize_threshold
+                    target_for_mask = base_for_mask
+                    if isinstance(target_for_mask, np.ndarray) and target_for_mask.ndim == 3:
+                        mask_zero = mask_zero[..., None]
+                    if az_nanize:
+                        out = np.where(mask_zero, np.nan, target_for_mask)
+                    else:
+                        out = np.where(mask_zero, 0.0, target_for_mask)
+                    altaz_mask2d_applied = True
             try:
                 logger.info(
-                    "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s threshold=%g",
+                    "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s mask2d_applied=%s threshold=%g",
                     bool(altaz_masked_used),
                     bool(altaz_mask2d_used),
+                    bool(altaz_mask2d_applied),
                     az_nanize_threshold,
                 )
             except Exception:
@@ -12575,6 +12652,38 @@ def create_master_tile(
         propagate_mask=propagate_mask_for_coverage,
         progress_callback=progress_callback
     )
+    auto_pad_used = False
+    orig_hw = None
+    try:
+        if 0 <= ref_loaded_idx < len(tile_images_data_HWC_adu):
+            ref_img = tile_images_data_HWC_adu[ref_loaded_idx]
+            if isinstance(ref_img, np.ndarray) and ref_img.ndim >= 2:
+                orig_hw = ref_img.shape[:2]
+                if aligned_images_for_stack:
+                    for aligned_img in aligned_images_for_stack:
+                        if isinstance(aligned_img, np.ndarray) and aligned_img.ndim >= 2:
+                            if aligned_img.shape[0] > orig_hw[0] or aligned_img.shape[1] > orig_hw[1]:
+                                auto_pad_used = True
+                                break
+    except Exception:
+        auto_pad_used = False
+    if auto_pad_used:
+        aligned_hw = None
+        try:
+            for aligned_img in aligned_images_for_stack:
+                if isinstance(aligned_img, np.ndarray) and aligned_img.ndim >= 2:
+                    aligned_hw = aligned_img.shape[:2]
+                    break
+        except Exception:
+            aligned_hw = None
+        pcb_tile(
+            "MT_AUTO_PAD: detected -> will skip MT_EDGE_TRIM",
+            prog=None,
+            lvl="DEBUG_DETAIL",
+            tile_id=tile_id,
+            orig_hw=orig_hw,
+            aligned_hw=aligned_hw,
+        )
     if failed_alignment_indices:
         retry_group: list[dict] = []
         for idx_fail in failed_alignment_indices:
@@ -13121,7 +13230,13 @@ def create_master_tile(
         lecropper_applied = True
 
     try:
-        if master_tile_stacked_HWC is not None:
+        if master_tile_stacked_HWC is not None and auto_pad_used:
+            pcb_tile(
+                f"MT_EDGE_TRIM: tile={tile_id} skipped (auto-pad used)",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+            )
+        if master_tile_stacked_HWC is not None and not auto_pad_used:
             # MT_EDGE_TRIM: Deterministic edge trim based on valid data fraction.
             # This is a post-lecropper step to clean up thin invalid strips at the edges.
             MIN_VALID_FRAC_EDGE = 0.90
@@ -21133,7 +21248,17 @@ def run_hierarchical_mosaic_classic_legacy(
                             try:
                                 global _PH3_CONCURRENCY_SEMAPHORE
                                 _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
-                                pcb(f"IO_ADAPT_RT: ph3_workers -> {current_ph3_limit}", prog=None, lvl="INFO_DETAIL")
+                                _io_dbg = []
+                                if read_mbps is not None:
+                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: runtime throttle: ph3_workers -> {current_ph3_limit}"
+                                    f" (limits Phase 3 concurrency){_io_dbg_s}",
+                                    prog=None, lvl="INFO_DETAIL"
+                                )
                             except Exception:
                                 pass
                         if (current_cache_slots is None) or (new_cache_slots != current_cache_slots):
@@ -21141,7 +21266,17 @@ def run_hierarchical_mosaic_classic_legacy(
                             try:
                                 global _CACHE_IO_SEMAPHORE
                                 _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
-                                pcb(f"IO_ADAPT_RT: cache_read_slots -> {current_cache_slots}", prog=None, lvl="INFO_DETAIL")
+                                _io_dbg = []
+                                if read_mbps is not None:
+                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: runtime throttle: cache_read_slots -> {current_cache_slots}"
+                                    f" (limits concurrent cache reads){_io_dbg_s}",
+                                    prog=None, lvl="INFO_DETAIL"
+                                )
                             except Exception:
                                 pass
                     except Exception:
@@ -25352,7 +25487,17 @@ def run_hierarchical_mosaic(
                             try:
                                 global _PH3_CONCURRENCY_SEMAPHORE
                                 _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
-                                pcb(f"IO_ADAPT_RT: ph3_workers -> {current_ph3_limit}", prog=None, lvl="INFO_DETAIL")
+                                _io_dbg = []
+                                if read_mbps is not None:
+                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: runtime throttle: ph3_workers -> {current_ph3_limit}"
+                                    f" (limits Phase 3 concurrency){_io_dbg_s}",
+                                    prog=None, lvl="INFO_DETAIL"
+                                )
                             except Exception:
                                 pass
                         if (current_cache_slots is None) or (new_cache_slots != current_cache_slots):
@@ -25360,7 +25505,17 @@ def run_hierarchical_mosaic(
                             try:
                                 global _CACHE_IO_SEMAPHORE
                                 _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
-                                pcb(f"IO_ADAPT_RT: cache_read_slots -> {current_cache_slots}", prog=None, lvl="INFO_DETAIL")
+                                _io_dbg = []
+                                if read_mbps is not None:
+                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: runtime throttle: cache_read_slots -> {current_cache_slots}"
+                                    f" (limits concurrent cache reads){_io_dbg_s}",
+                                    prog=None, lvl="INFO_DETAIL"
+                                )
                             except Exception:
                                 pass
                     except Exception:

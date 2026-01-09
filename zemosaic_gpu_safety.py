@@ -255,21 +255,32 @@ def probe_gpu_runtime_context(
     return ctx
 
 
-def _clamp_gpu_chunks(plan: ParallelPlan, ctx: GpuRuntimeContext) -> bool:
-    """Clamp GPU chunk sizing when in safe mode."""
+def _clamp_gpu_chunks(
+    plan: ParallelPlan,
+    ctx: GpuRuntimeContext,
+    *,
+    hybrid_guard_enabled: bool = True,
+) -> str | None:
+    """Clamp GPU chunk sizing when in safe mode or hybrid guard."""
 
     try:
         use_gpu = bool(getattr(plan, "use_gpu", False))
     except Exception:
         use_gpu = False
     if not use_gpu:
-        return False
+        return None
 
-    # This function is now only for applying an aggressive clamp.
-    # The worker can decide to apply a more generous budget for non-safe-mode
-    # cases like plugged-in hybrid graphics.
-    if not ctx.safe_mode:
-        return False
+    hybrid_guard_active = False
+    if hybrid_guard_enabled and ctx.is_windows and ctx.is_hybrid_graphics:
+        vram_baseline = ctx.vram_total_bytes or ctx.vram_free_bytes
+        if vram_baseline is None or vram_baseline <= 9 * 1024 * 1024 * 1024:
+            hybrid_guard_active = True
+
+    # Apply aggressive clamps only for safe-mode or hybrid guard cases.
+    if not ctx.safe_mode and not hybrid_guard_active:
+        return None
+
+    clamp_reason = "safe_mode_clamp" if ctx.safe_mode else "hybrid_vram_guard"
 
     budget_bytes = 128 * 1024 * 1024
     
@@ -349,18 +360,20 @@ def _clamp_gpu_chunks(plan: ParallelPlan, ctx: GpuRuntimeContext) -> bool:
     vram_free_mib = (float(ctx.vram_free_bytes) / (1024.0 ** 2)) if ctx.vram_free_bytes else None
     try:
         LOGGER.debug(
-            "GPU_SAFETY: chosen gpu_rows_per_chunk=%s (budget=%.1f MiB, bytes_per_row=%s, vram_free=%s MiB, safe_mode=%s, on_battery=%s)",
+            "GPU_SAFETY: chosen gpu_rows_per_chunk=%s (budget=%.1f MiB, bytes_per_row=%s, vram_free=%s MiB, safe_mode=%s, on_battery=%s, clamp_reason=%s)",
             rows,
             budget_mib,
             bytes_per_row if bytes_per_row is not None else "unknown",
             f"{vram_free_mib:.1f}" if vram_free_mib is not None else "unknown",
             ctx.safe_mode,
             ctx.on_battery,
+            clamp_reason,
         )
     except Exception:
         pass
 
-    return True
+    return clamp_reason
+
 
 def apply_gpu_safety_to_parallel_plan(
     plan: ParallelPlan | None,
@@ -372,7 +385,15 @@ def apply_gpu_safety_to_parallel_plan(
 ) -> tuple[ParallelPlan | None, GpuRuntimeContext]:
     """Return a (possibly) clamped plan plus the runtime context."""
 
-    _ = config  # Reserved for future per-config overrides
+    hybrid_guard_enabled = True
+    if config is not None:
+        try:
+            if isinstance(config, Mapping):
+                hybrid_guard_enabled = bool(config.get("gpu_hybrid_vram_guard", True))
+            else:
+                hybrid_guard_enabled = bool(getattr(config, "gpu_hybrid_vram_guard", True))
+        except Exception:
+            hybrid_guard_enabled = True
     log = logger or LOGGER
     ctx = probe_gpu_runtime_context(caps=caps)
     
@@ -411,10 +432,13 @@ def apply_gpu_safety_to_parallel_plan(
         except Exception:
             pass
 
-    clamped = _clamp_gpu_chunks(plan, ctx)
-    if clamped:
-        if "safe_mode_clamp" not in ctx.reasons:
-             ctx.reasons.append("safe_mode_clamp")
+    if not hybrid_guard_enabled and ctx.is_hybrid_graphics and not ctx.safe_mode:
+        if "hybrid_vram_guard_disabled_by_user" not in ctx.reasons:
+            ctx.reasons.append("hybrid_vram_guard_disabled_by_user")
+
+    clamp_reason = _clamp_gpu_chunks(plan, ctx, hybrid_guard_enabled=hybrid_guard_enabled)
+    if clamp_reason and clamp_reason not in ctx.reasons:
+        ctx.reasons.append(clamp_reason)
     
     ctx.reasons = list(dict.fromkeys(ctx.reasons))
     summary = (

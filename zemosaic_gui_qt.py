@@ -883,7 +883,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.3.1, Renāscentia – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.3.2, Renāscentia ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -3108,6 +3108,33 @@ class ZeMosaicQtMainWindow(QMainWindow):
         warning_label.setStyleSheet("color: gray; font-size: 11px;")
         phase5_layout.addRow(warning_label)
 
+        hybrid_guard_checkbox = QCheckBox(
+            self._tr(
+                "qt_phase5_hybrid_guard",
+                "Hybrid GPU stability guard (recommended)",
+            ),
+            phase5_group,
+        )
+        hybrid_guard_checked = self._normalize_config_bool(
+            self.config.get("gpu_hybrid_vram_guard", True), True
+        )
+        hybrid_guard_checkbox.setChecked(hybrid_guard_checked)
+        hybrid_guard_checkbox.setToolTip(
+            self._tr(
+                "qt_phase5_hybrid_guard_tooltip",
+                "May reduce effective chunk size to keep VRAM headroom and prevent freezes on hybrid laptops.",
+            )
+        )
+        phase5_layout.addRow(hybrid_guard_checkbox)
+        self._config_fields["gpu_hybrid_vram_guard"] = {
+            "kind": "checkbox",
+            "widget": hybrid_guard_checkbox,
+            "type": bool,
+        }
+        hybrid_guard_checkbox.toggled.connect(
+            lambda _=None: self._sync_config_key_from_widget("gpu_hybrid_vram_guard")
+        )  # type: ignore[arg-type]
+
         def _on_chunk_auto_toggled(state: bool) -> None:
             chunk_spin.setDisabled(state)
             self._sync_config_key_from_widget("phase5_chunk_auto")
@@ -4206,7 +4233,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.3.1, Renāscentia – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.3.2, Renāscentia ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):

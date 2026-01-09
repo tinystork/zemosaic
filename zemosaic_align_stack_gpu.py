@@ -157,6 +157,98 @@ def _resolve_rows_per_chunk(
     return min(height, rows)
 
 
+def _wsc_estimate_bytes_per_row(
+    n_frames: int,
+    width: int,
+    dtype_bytes: int = 8,
+    overhead: float = 12.0,
+) -> int:
+    frames = max(1, int(n_frames))
+    w = max(1, int(width))
+    dbytes = max(1, int(dtype_bytes))
+    ovh = max(1.0, float(overhead))
+    return int(frames * w * dbytes * ovh)
+
+
+def _resolve_rows_per_chunk_wsc(
+    cp_mod: Any,
+    height: int,
+    width: int,
+    channels: int,
+    n_frames: int,
+    plan: ParallelPlan | None,
+    logger: logging.Logger | None,
+) -> int:
+    max_bytes = DEFAULT_GPU_MAX_CHUNK_BYTES
+    if plan is not None:
+        try:
+            plan_bytes = getattr(plan, "gpu_max_chunk_bytes", None)
+            if plan_bytes:
+                max_bytes = int(plan_bytes)
+        except Exception:
+            pass
+    rows_hint = None
+    if plan is not None:
+        try:
+            rows_hint = getattr(plan, "gpu_rows_per_chunk", None)
+        except Exception:
+            rows_hint = None
+
+    bytes_per_row = _wsc_estimate_bytes_per_row(n_frames, width)
+    rows_cap = None
+    if rows_hint:
+        rows_cap = int(rows_hint)
+    elif max_bytes > 0 and bytes_per_row > 0:
+        rows_cap = max_bytes // bytes_per_row
+
+    free_b = None
+    if cp_mod is not None:
+        try:
+            free_b, _total_b = cp_mod.cuda.runtime.memGetInfo()
+        except Exception:
+            free_b = None
+    if free_b is None:
+        free_b = max_bytes if max_bytes > 0 else 0
+
+    budget = min(max_bytes if max_bytes > 0 else free_b, int(free_b * 0.55))
+    rows_budget = budget // bytes_per_row if budget > 0 and bytes_per_row > 0 else 0
+    rows_final = rows_budget if rows_budget > 0 else 0
+    if rows_cap and rows_cap > 0:
+        rows_final = min(rows_final, rows_cap) if rows_final > 0 else rows_cap
+    if rows_final <= 0:
+        rows_final = 1
+    rows_final = min(height, rows_final)
+    if _gpu_safe_mode_enabled():
+        rows_final = min(rows_final, SAFE_MODE_ROWS_CAP, height)
+
+    if logger is not None:
+        try:
+            mib = 1024.0 * 1024.0
+            logger.info(
+                "[P3][WSC][VRAM_PREFLIGHT] N=%d W=%d C=%d free=%.1fMiB budget=%.1fMiB est_row=%.3fMiB rows=%d channelwise=yes",
+                int(n_frames),
+                int(width),
+                int(channels),
+                float(free_b) / mib if mib else 0.0,
+                float(budget) / mib if mib else 0.0,
+                float(bytes_per_row) / mib if mib else 0.0,
+                int(rows_final),
+            )
+        except Exception:
+            pass
+
+    return rows_final
+
+
+def _wsc_is_oom_error(exc: Exception) -> bool:
+    if cp is not None:
+        oom_type = getattr(cp.cuda.memory, "OutOfMemoryError", None)
+        if oom_type is not None and isinstance(exc, oom_type):
+            return True
+    msg = str(exc) or repr(exc)
+    return "out of memory" in msg.lower()
+
+
 def _wsc_gpu_parity_check() -> tuple[bool, float | None]:
     """Run (and cache) the WSC GPU parity check."""
 
@@ -901,6 +993,17 @@ def gpu_stack_from_arrays(
     wsc_pixinsight = algo in {"winsorized_sigma_clip", "winsorized", "winsor"} and wsc_impl == WSC_IMPL_PIXINSIGHT
     combine_method = stacking_params.get("stack_final_combine", "mean")
     norm_method = (stacking_params.get("stack_norm_method") or "none").strip().lower()
+    if wsc_pixinsight:
+        wsc_rows = _resolve_rows_per_chunk_wsc(
+            cp,
+            height,
+            width,
+            channels,
+            len(frames_for_stack),
+            parallel_plan,
+            logger,
+        )
+        rows_per_chunk = max(1, min(rows_per_chunk, wsc_rows))
     if weights_stack is not None and str(combine_method).strip().lower() != "mean":
         try:
             logger.warning(
@@ -910,6 +1013,7 @@ def gpu_stack_from_arrays(
         except Exception:
             pass
     wsc_weights_block_gpu = None
+    wsc_weights_block_channelwise = False
     if wsc_pixinsight:
         if weights_stack is not None:
             weights_stack = None
@@ -918,6 +1022,13 @@ def gpu_stack_from_arrays(
                 wsc_weights_block_gpu = cp.asarray(wsc_weights_block, dtype=cp.float32)
             except Exception:
                 wsc_weights_block_gpu = None
+        if wsc_weights_block_gpu is not None:
+            try:
+                wsc_weights_block_channelwise = (
+                    wsc_weights_block_gpu.ndim == 4 and wsc_weights_block_gpu.shape[-1] == channels
+                )
+            except Exception:
+                wsc_weights_block_channelwise = False
         weights_block_shape = None if wsc_weights_block is None else tuple(wsc_weights_block.shape)
         applied_to_core = "yes" if wsc_weights_block is not None else "no"
         try:
@@ -990,48 +1101,116 @@ def gpu_stack_from_arrays(
             "huber": 1.0,
         }
 
+    wsc_fallback_reason = None
     try:
-        for row_start in range(0, height, rows_per_chunk):
-            chunk_start_time = time.perf_counter() if gpu_safe_mode else None
-            row_end = min(height, row_start + rows_per_chunk)
-            chunk_cpu = np.stack(
-                [frame[row_start:row_end, :, :] for frame in frames_for_stack],
-                axis=0,
-            )
-            weights_chunk_gpu = None
-            if weights_stack is not None:
-                weights_chunk_cpu = weights_stack[:, row_start:row_end, :, :]
-                weights_chunk_gpu = cp.asarray(weights_chunk_cpu, dtype=cp.float32)
-
-            t0 = time.perf_counter()
-            data_gpu = cp.asarray(chunk_cpu, dtype=cp.float32)
-            prof_upload_ms += (time.perf_counter() - t0) * 1000.0
-
-            t1 = time.perf_counter()
-            if wsc_pixinsight:
-                chunk_out, stats = wsc_pixinsight_core(
-                    cp,
-                    data_gpu,
-                    sigma_low=kappa_low,
-                    sigma_high=kappa_high,
-                    max_iters=WSC_PIXINSIGHT_MAX_ITERS,
-                    weights_block=wsc_weights_block_gpu,
-                    return_stats=True,
-                )
-                prof_reject_ms += (time.perf_counter() - t1) * 1000.0
-
-                t3 = time.perf_counter()
-                stacked[row_start:row_end] = cp.asnumpy(chunk_out)
-                prof_download_ms += (time.perf_counter() - t3) * 1000.0
-
-                if wsc_stats_accum is not None:
-                    wsc_stats_accum["clip_low_count"] += float(stats.get("clip_low_count", 0))
-                    wsc_stats_accum["clip_high_count"] += float(stats.get("clip_high_count", 0))
-                    wsc_stats_accum["valid_count"] += float(stats.get("valid_count", 0))
-                    wsc_stats_accum["iters_used"] = max(
-                        wsc_stats_accum["iters_used"], float(stats.get("iters_used", 0))
+        if wsc_pixinsight:
+            row_start = 0
+            current_rows = rows_per_chunk
+            max_retries = max(8, int(max(1, rows_per_chunk)).bit_length())
+            while row_start < height:
+                chunk_start_time = time.perf_counter() if gpu_safe_mode else None
+                retry_count = 0
+                while True:
+                    row_end = min(height, row_start + current_rows)
+                    chunk_cpu = np.stack(
+                        [frame[row_start:row_end, :, :] for frame in frames_for_stack],
+                        axis=0,
                     )
-            else:
+                    try:
+                        for c in range(channels):
+                            cpu_c = chunk_cpu[..., c] if channels > 1 else chunk_cpu[..., 0]
+
+                            t0 = time.perf_counter()
+                            data_gpu_c = cp.asarray(cpu_c, dtype=cp.float32)
+                            prof_upload_ms += (time.perf_counter() - t0) * 1000.0
+
+                            t1 = time.perf_counter()
+                            weights_block_c = None
+                            if wsc_weights_block_gpu is not None:
+                                weights_block_c = (
+                                    wsc_weights_block_gpu[..., c]
+                                    if wsc_weights_block_channelwise
+                                    else wsc_weights_block_gpu
+                                )
+                            out_c, stats = wsc_pixinsight_core(
+                                cp,
+                                data_gpu_c,
+                                sigma_low=kappa_low,
+                                sigma_high=kappa_high,
+                                max_iters=WSC_PIXINSIGHT_MAX_ITERS,
+                                weights_block=weights_block_c,
+                                return_stats=True,
+                            )
+                            prof_reject_ms += (time.perf_counter() - t1) * 1000.0
+
+                            t3 = time.perf_counter()
+                            stacked[row_start:row_end, :, c] = cp.asnumpy(out_c)
+                            prof_download_ms += (time.perf_counter() - t3) * 1000.0
+
+                            if wsc_stats_accum is not None:
+                                wsc_stats_accum["clip_low_count"] += float(stats.get("clip_low_count", 0))
+                                wsc_stats_accum["clip_high_count"] += float(stats.get("clip_high_count", 0))
+                                wsc_stats_accum["valid_count"] += float(stats.get("valid_count", 0))
+                                wsc_stats_accum["iters_used"] = max(
+                                    wsc_stats_accum["iters_used"], float(stats.get("iters_used", 0))
+                                )
+                        break
+                    except Exception as exc:
+                        if _wsc_is_oom_error(exc):
+                            try:
+                                cp.get_default_memory_pool().free_all_blocks()
+                                cp.get_default_pinned_memory_pool().free_all_blocks()
+                            except Exception:
+                                pass
+                            retry_count += 1
+                            if current_rows <= 1 or retry_count >= max_retries:
+                                wsc_fallback_reason = "vram_exhausted"
+                                raise GPUStackingError("WSC GPU VRAM exhausted") from exc
+                            current_rows = max(1, current_rows // 2)
+                            rows_per_chunk = current_rows
+                            if logger:
+                                try:
+                                    logger.warning(
+                                        "[P3][WSC][VRAM_BACKOFF] oom retry=%d rows->%d row_start=%d",
+                                        retry_count,
+                                        current_rows,
+                                        row_start,
+                                    )
+                                except Exception:
+                                    pass
+                            continue
+                        raise
+
+                if gpu_safe_mode:
+                    try:
+                        cp.cuda.Stream.null.synchronize()
+                    except Exception:
+                        pass
+                    if chunk_start_time is not None:
+                        duration_chunk = time.perf_counter() - chunk_start_time
+                        if duration_chunk > SAFE_MODE_CHUNK_TIMEOUT_SEC:
+                            raise GPUStackingError(
+                                f"GPU chunk exceeded safe timeout ({duration_chunk:.2f}s > {SAFE_MODE_CHUNK_TIMEOUT_SEC:.2f}s)"
+                            )
+                row_start = row_end
+        else:
+            for row_start in range(0, height, rows_per_chunk):
+                chunk_start_time = time.perf_counter() if gpu_safe_mode else None
+                row_end = min(height, row_start + rows_per_chunk)
+                chunk_cpu = np.stack(
+                    [frame[row_start:row_end, :, :] for frame in frames_for_stack],
+                    axis=0,
+                )
+                weights_chunk_gpu = None
+                if weights_stack is not None:
+                    weights_chunk_cpu = weights_stack[:, row_start:row_end, :, :]
+                    weights_chunk_gpu = cp.asarray(weights_chunk_cpu, dtype=cp.float32)
+
+                t0 = time.perf_counter()
+                data_gpu = cp.asarray(chunk_cpu, dtype=cp.float32)
+                prof_upload_ms += (time.perf_counter() - t0) * 1000.0
+
+                t1 = time.perf_counter()
                 if algo in {"winsorized_sigma_clip", "winsorized", "winsor"}:
                     data_gpu = _winsorize_chunk(data_gpu, winsor_limits)
                 elif algo in {"kappa_sigma", "sigma_clip"}:
@@ -1048,25 +1227,31 @@ def gpu_stack_from_arrays(
                 stacked[row_start:row_end] = cp.asnumpy(chunk_result)
                 prof_download_ms += (time.perf_counter() - t3) * 1000.0
 
-            if gpu_safe_mode:
-                try:
-                    cp.cuda.Stream.null.synchronize()
-                except Exception:
-                    pass
-                if chunk_start_time is not None:
-                    duration_chunk = time.perf_counter() - chunk_start_time
-                    if duration_chunk > SAFE_MODE_CHUNK_TIMEOUT_SEC:
-                        raise GPUStackingError(
-                            f"GPU chunk exceeded safe timeout ({duration_chunk:.2f}s > {SAFE_MODE_CHUNK_TIMEOUT_SEC:.2f}s)"
-                        )
+                if gpu_safe_mode:
+                    try:
+                        cp.cuda.Stream.null.synchronize()
+                    except Exception:
+                        pass
+                    if chunk_start_time is not None:
+                        duration_chunk = time.perf_counter() - chunk_start_time
+                        if duration_chunk > SAFE_MODE_CHUNK_TIMEOUT_SEC:
+                            raise GPUStackingError(
+                                f"GPU chunk exceeded safe timeout ({duration_chunk:.2f}s > {SAFE_MODE_CHUNK_TIMEOUT_SEC:.2f}s)"
+                            )
     except Exception as exc:
         if wsc_pixinsight:
             if logger:
                 try:
-                    logger.warning(
-                        "GPU PixInsight WSC failed (%s); falling back to CPU for WSC.",
-                        exc,
-                    )
+                    if wsc_fallback_reason == "vram_exhausted":
+                        logger.warning(
+                            "[P3][WSC][CPU_FALLBACK] reason=vram_exhausted rows=1 row_start=%d",
+                            row_start if "row_start" in locals() else -1,
+                        )
+                    else:
+                        logger.warning(
+                            "GPU PixInsight WSC failed (%s); falling back to CPU for WSC.",
+                            exc,
+                        )
                 except Exception:
                     pass
             cpu_out, stats = _wsc_pixinsight_stack_cpu(
