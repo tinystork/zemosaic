@@ -21248,7 +21248,7 @@ def run_hierarchical_mosaic_classic_legacy(
                             try:
                                 global _PH3_CONCURRENCY_SEMAPHORE
                                 _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
-                                                                _io_dbg = []
+                                _io_dbg = []
                                 if read_mbps is not None:
                                     _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
                                 if cpu_pct is not None:
@@ -21266,7 +21266,7 @@ def run_hierarchical_mosaic_classic_legacy(
                             try:
                                 global _CACHE_IO_SEMAPHORE
                                 _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
-                                                                _io_dbg = []
+                                _io_dbg = []
                                 if read_mbps is not None:
                                     _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
                                 if cpu_pct is not None:
@@ -25487,7 +25487,7 @@ def run_hierarchical_mosaic(
                             try:
                                 global _PH3_CONCURRENCY_SEMAPHORE
                                 _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
-                                                                _io_dbg = []
+                                _io_dbg = []
                                 if read_mbps is not None:
                                     _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
                                 if cpu_pct is not None:
@@ -25505,7 +25505,7 @@ def run_hierarchical_mosaic(
                             try:
                                 global _CACHE_IO_SEMAPHORE
                                 _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
-                                                                _io_dbg = []
+                                _io_dbg = []
                                 if read_mbps is not None:
                                     _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
                                 if cpu_pct is not None:
