@@ -404,6 +404,85 @@ if _tk_split_group_by_orientation is None:  # pragma: no cover - fallback copy
                 buckets.append([entry])
         return buckets
 
+def _split_group_by_orientation_key(
+    group: list[dict[str, Any]],
+    threshold_deg: float,
+    pa_key: str,
+) -> list[list[dict[str, Any]]]:
+    if threshold_deg <= 0.0 or not group:
+        return [group]
+    buckets: list[list[dict[str, Any]]] = []
+    for entry in group:
+        pa = entry.get(pa_key)
+        try:
+            pa_value = float(pa)
+        except Exception:
+            pa_value = None
+        if pa_value is None:
+            buckets.append([entry])
+            continue
+        matched = False
+        for bucket in buckets:
+            if not bucket:
+                continue
+            ref = bucket[0].get(pa_key)
+            try:
+                ref_value = float(ref)
+            except Exception:
+                ref_value = None
+            if ref_value is None:
+                continue
+            delta = abs(pa_value - ref_value) % 360.0
+            delta = min(delta, 360.0 - delta)
+            if delta <= threshold_deg:
+                bucket.append(entry)
+                matched = True
+                break
+        if not matched:
+            buckets.append([entry])
+    return buckets
+
+
+def split_clusters_by_orientation(
+    groups: list[list[dict[str, Any]]],
+    orientation_split_deg: float,
+    pa_key: str = "PA_DEG",
+) -> list[list[dict[str, Any]]]:
+    threshold = _sanitize_angle_value(orientation_split_deg, 0.0)
+    if threshold <= 0.0 or not groups:
+        return groups
+    result: list[list[dict[str, Any]]] = []
+    for group in groups:
+        if not group:
+            result.append(group)
+            continue
+        has_valid_pa = False
+        for entry in group:
+            pa = entry.get(pa_key)
+            if pa is None:
+                continue
+            try:
+                float(pa)
+            except Exception:
+                continue
+            has_valid_pa = True
+            break
+        if not has_valid_pa:
+            result.append(group)
+            continue
+        if pa_key == "PA_DEG" and _tk_split_group_by_orientation is not None:
+            try:
+                subgroups = _tk_split_group_by_orientation(group, threshold)
+            except Exception:
+                subgroups = [group]
+        else:
+            subgroups = _split_group_by_orientation_key(group, threshold, pa_key)
+        if subgroups:
+            result.extend(subgroups)
+        else:
+            result.append(group)
+    return result
+
 if _tk_merge_small_groups is None:  # pragma: no cover - fallback copy
     def _tk_merge_small_groups(
         groups: list[list[dict]],
@@ -3510,6 +3589,9 @@ class FilterQtDialog(QDialog):
         orientation_threshold = self._resolve_orientation_split_threshold()
         angle_split_candidate = self._resolve_angle_split_candidate()
         auto_angle_detect = self._resolve_auto_angle_detect_threshold()
+        orientation_threshold_worker = float(
+            max(0.0, orientation_threshold if manual_angle_mode else 0.0)
+        )
         cap_effective, min_cap = self._resolve_autosplit_caps()
         overcap_pct = max(0, min(50, int(overcap_pct)))
         if coverage_enabled:
@@ -3528,7 +3610,7 @@ class FilterQtDialog(QDialog):
             candidate_infos,
             float(threshold_initial),
             None,
-            orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
+            orientation_split_threshold_deg=orientation_threshold_worker,
         )
         timings["clustering"] = time.perf_counter() - t_start
         if not groups_initial:
@@ -3568,7 +3650,7 @@ class FilterQtDialog(QDialog):
                         candidate_infos,
                         float(threshold_relaxed),
                         None,
-                        orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
+                        orientation_split_threshold_deg=orientation_threshold_worker,
                     )
                     timings["clustering"] += time.perf_counter() - t_start
                     if relaxed_groups and len(relaxed_groups) < len(groups_initial):
@@ -3607,6 +3689,54 @@ class FilterQtDialog(QDialog):
             )
         groups_used = mode_guarded
 
+        altaz_ori_split_enabled = (
+            auto_angle_enabled
+            and not manual_angle_mode
+            and angle_split_candidate > 0.0
+        )
+        if altaz_ori_split_enabled:
+            altaz_in = 0
+            altaz_out = 0
+            split_groups: list[list[dict[str, Any]]] = []
+            for group in groups_used:
+                mode_norm = "UNKNOWN"
+                if group:
+                    try:
+                        mode_raw = group[0].get("MOUNT_MODE", "UNKNOWN")
+                    except Exception:
+                        mode_raw = "UNKNOWN"
+                    try:
+                        mode_norm = str(mode_raw).strip().upper()
+                    except Exception:
+                        mode_norm = "UNKNOWN"
+                if mode_norm == "EQMODE_1":
+                    mode_norm = "EQ"
+                if mode_norm == "ALT_AZ":
+                    altaz_in += 1
+                    subgroups = split_clusters_by_orientation(
+                        [group],
+                        float(angle_split_candidate),
+                        pa_key="PA_DEG",
+                    )
+                    if not subgroups:
+                        subgroups = [group]
+                    altaz_out += len(subgroups)
+                    split_groups.extend(subgroups)
+                else:
+                    split_groups.append(group)
+            groups_used = split_groups
+            if altaz_in > 0 and altaz_out > altaz_in:
+                msg = (
+                    f"[ALT-AZ ORI_SPLIT] {altaz_in} clusters → {altaz_out} subclusters "
+                    f"(threshold={float(angle_split_candidate):.1f}°)"
+                )
+                messages.append(msg)
+                try:
+                    self._async_log_signal.emit(msg, "INFO")
+                except Exception:
+                    pass
+                logger.info("%s", msg)
+
         angle_split_effective = float(orientation_threshold if orientation_threshold > 0 else 0.0)
         if manual_angle_mode:
             angle_split_effective = angle_split_candidate
@@ -3615,6 +3745,7 @@ class FilterQtDialog(QDialog):
         if (
             auto_angle_enabled
             and not manual_angle_mode
+            and not altaz_ori_split_enabled
             and angle_split_effective <= 0.0
             and angle_split_candidate > 0.0
             and _tk_split_group_by_orientation is not None
@@ -4323,6 +4454,96 @@ class FilterQtDialog(QDialog):
                 wcs_obj = None
             if wcs_obj is not None:
                 payload["wcs"] = wcs_obj
+
+        pa_value: float | None = None
+        try:
+            existing_pa = payload.get("PA_DEG")
+            if existing_pa is not None and existing_pa != "":
+                pa_value = float(existing_pa)
+                if not math.isfinite(pa_value):
+                    pa_value = None
+        except Exception:
+            pa_value = None
+
+        if pa_value is None:
+            try:
+                def _pa_from_components(cd11: float | None, cd21: float | None) -> float | None:
+                    if cd11 is None or cd21 is None:
+                        return None
+                    if not (math.isfinite(cd11) and math.isfinite(cd21)):
+                        return None
+                    if cd11 == 0.0 and cd21 == 0.0:
+                        return None
+                    pa = (math.degrees(math.atan2(cd21, cd11)) % 360.0)
+                    return float(pa) if math.isfinite(pa) else None
+
+                def _coerce_float(val: Any) -> float | None:
+                    try:
+                        parsed = float(val)
+                    except Exception:
+                        return None
+                    return parsed if math.isfinite(parsed) else None
+
+                wcs_inner = getattr(wcs_obj, "wcs", None) if wcs_obj is not None else None
+                if wcs_inner is not None:
+                    cd_mat = getattr(wcs_inner, "cd", None)
+                    if cd_mat is not None:
+                        try:
+                            pa_value = _pa_from_components(
+                                _coerce_float(cd_mat[0][0]),
+                                _coerce_float(cd_mat[1][0]),
+                            )
+                        except Exception:
+                            pa_value = None
+                    if pa_value is None:
+                        pc_mat = getattr(wcs_inner, "pc", None)
+                        cdelt_vec = getattr(wcs_inner, "cdelt", None)
+                        if pc_mat is not None:
+                            try:
+                                cdelt1 = _coerce_float(cdelt_vec[0]) if cdelt_vec is not None else None
+                                cdelt2 = _coerce_float(cdelt_vec[1]) if cdelt_vec is not None else None
+                                if cdelt1 is None:
+                                    cdelt1 = 1.0
+                                if cdelt2 is None:
+                                    cdelt2 = 1.0
+                                pa_value = _pa_from_components(
+                                    _coerce_float(pc_mat[0][0]) * cdelt1,
+                                    _coerce_float(pc_mat[1][0]) * cdelt2,
+                                )
+                            except Exception:
+                                pa_value = None
+
+                if pa_value is None and header is not None:
+                    def _header_get(key: str) -> Any:
+                        if isinstance(header, dict):
+                            return header.get(key)
+                        try:
+                            return header[key]
+                        except Exception:
+                            try:
+                                return header.get(key)  # type: ignore[call-arg]
+                            except Exception:
+                                return None
+
+                    pa_value = _pa_from_components(
+                        _coerce_float(_header_get("CD1_1")),
+                        _coerce_float(_header_get("CD2_1")),
+                    )
+                    if pa_value is None:
+                        cdelt1 = _coerce_float(_header_get("CDELT1"))
+                        cdelt2 = _coerce_float(_header_get("CDELT2"))
+                        if cdelt1 is None:
+                            cdelt1 = 1.0
+                        if cdelt2 is None:
+                            cdelt2 = 1.0
+                        pa_value = _pa_from_components(
+                            _coerce_float(_header_get("PC1_1")) * cdelt1,
+                            _coerce_float(_header_get("PC2_1")) * cdelt2,
+                        )
+            except Exception:
+                pa_value = None
+
+        payload["PA_DEG"] = pa_value
         ra_deg = entry.center_ra_deg
         dec_deg = entry.center_dec_deg
         if (ra_deg is None or dec_deg is None) and header is not None:
