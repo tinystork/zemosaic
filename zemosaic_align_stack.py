@@ -59,6 +59,7 @@ from core.robust_rejection import (
     resolve_wsc_parity_mode,
     wsc_parity_check,
     wsc_pixinsight_core,
+    wsc_pixinsight_core_streaming_numpy,
 )
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
@@ -1097,6 +1098,40 @@ except Exception as e_import_stack:
 
 
 _WSC_PIXINSIGHT_MAX_ITERS = 10
+WSC_STREAM_N_THRESHOLD = int(os.environ.get("ZEMOSAIC_WSC_STREAM_N_THRESHOLD", 512))
+WSC_STREAM_RAM_FRAC = float(os.environ.get("ZEMOSAIC_WSC_STREAM_RAM_FRAC", 0.35))
+WSC_STREAM_BLOCK_FRAMES = int(os.environ.get("ZEMOSAIC_WSC_STREAM_BLOCK_FRAMES", 128))
+WSC_STREAM_SAMPLE_FRAMES = int(os.environ.get("ZEMOSAIC_WSC_STREAM_SAMPLE_FRAMES", 256))
+WSC_STREAM_OVERHEAD = float(os.environ.get("ZEMOSAIC_WSC_STREAM_OVERHEAD", 12.0))
+
+
+def _estimate_wsc_chunk_bytes(
+    frames_count: int,
+    rows: int,
+    width: int,
+    *,
+    dtype_bytes: int = 8,
+    overhead: float = WSC_STREAM_OVERHEAD,
+) -> int:
+    if frames_count <= 0 or rows <= 0 or width <= 0:
+        return 0
+    return int(max(1, frames_count) * max(1, rows) * max(1, width) * max(1, int(dtype_bytes)) * float(overhead))
+
+
+def _should_use_wsc_streaming(
+    *,
+    frames_count: int,
+    rows: int,
+    width: int,
+) -> tuple[bool, str | None, int, int]:
+    reason = None
+    est_bytes = _estimate_wsc_chunk_bytes(frames_count, rows, width)
+    avail, _swap = _query_system_memory()
+    if frames_count > WSC_STREAM_N_THRESHOLD:
+        reason = "N>threshold"
+    elif avail > 0 and est_bytes > int(avail * WSC_STREAM_RAM_FRAC):
+        reason = "chunk_bytes>budget"
+    return reason is not None, reason, est_bytes, int(avail)
 
 
 def _iter_row_slices_for_rows(
@@ -1141,6 +1176,8 @@ def _wsc_pixinsight_stack_numpy(
     sample = np.asarray(frames_list[0], dtype=np.float32)
     height = int(sample.shape[0])
     width = int(sample.shape[1]) if sample.ndim >= 2 else 0
+    channels = int(sample.shape[2]) if sample.ndim == 3 else 1
+    is_color = sample.ndim == 3 and channels > 1
     row_slices = _iter_row_slices_for_rows(height, len(frames_list), width, rows_per_chunk)
     output = np.empty_like(sample, dtype=np.float32)
     stats_accum = {
@@ -1151,21 +1188,105 @@ def _wsc_pixinsight_stack_numpy(
         "max_iters": float(max_iters),
         "huber": 1.0,
     }
+    weights_block_channelwise = False
+    if weights_block is not None:
+        try:
+            weights_block_channelwise = weights_block.ndim == 4 and weights_block.shape[-1] == channels
+        except Exception:
+            weights_block_channelwise = False
+
+    rows_for_log = height
+    if row_slices:
+        rows_for_log = int(row_slices[0].stop - row_slices[0].start)
+    use_stream, reason, _est_bytes, _avail = _should_use_wsc_streaming(
+        frames_count=len(frames_list),
+        rows=rows_for_log,
+        width=width,
+    )
+    if use_stream:
+        _internal_logger.info(
+            "[P3][WSC][STREAM] enabled=1 reason=%s N=%d block=%d rows=%d",
+            reason or "unknown",
+            int(len(frames_list)),
+            int(min(WSC_STREAM_BLOCK_FRAMES, len(frames_list))),
+            int(rows_for_log),
+        )
 
     total_steps = len(row_slices) if row_slices else 1
     for idx, rows_slice in enumerate(row_slices, start=1):
-        chunk = np.stack([np.asarray(f[rows_slice, ...], dtype=np.float32) for f in frames_list], axis=0)
-        chunk_out, stats = wsc_pixinsight_core(
-            np,
-            chunk,
-            sigma_low=sigma_low,
-            sigma_high=sigma_high,
-            max_iters=max_iters,
-            weights_block=weights_block,
-            return_stats=True,
-        )
-        output[rows_slice, ...] = chunk_out.astype(np.float32, copy=False)
-        _accumulate_wsc_stats(stats_accum, stats)
+        if is_color:
+            for c in range(channels):
+                weights_block_c = weights_block[..., c] if weights_block_channelwise else weights_block
+                if use_stream:
+                    chunk_out, stats = wsc_pixinsight_core_streaming_numpy(
+                        frames_list,
+                        rows_slice=rows_slice,
+                        channel=c,
+                        sigma_low=sigma_low,
+                        sigma_high=sigma_high,
+                        max_iters=max_iters,
+                        weights_block=weights_block_c,
+                        sample_limit=WSC_STREAM_SAMPLE_FRAMES,
+                        block_size=WSC_STREAM_BLOCK_FRAMES,
+                        return_stats=True,
+                    )
+                else:
+                    chunk = np.stack(
+                        [np.asarray(f[rows_slice, :, c], dtype=np.float32) for f in frames_list],
+                        axis=0,
+                    )
+                    chunk_out, stats = wsc_pixinsight_core(
+                        np,
+                        chunk,
+                        sigma_low=sigma_low,
+                        sigma_high=sigma_high,
+                        max_iters=max_iters,
+                        weights_block=weights_block_c,
+                        return_stats=True,
+                    )
+                output[rows_slice, :, c] = chunk_out.astype(np.float32, copy=False)
+                _accumulate_wsc_stats(stats_accum, stats)
+        else:
+            weights_block_c = weights_block[..., 0] if weights_block_channelwise else weights_block
+            channel_idx = 0 if sample.ndim == 3 else None
+            if use_stream:
+                chunk_out, stats = wsc_pixinsight_core_streaming_numpy(
+                    frames_list,
+                    rows_slice=rows_slice,
+                    channel=channel_idx,
+                    sigma_low=sigma_low,
+                    sigma_high=sigma_high,
+                    max_iters=max_iters,
+                    weights_block=weights_block_c,
+                    sample_limit=WSC_STREAM_SAMPLE_FRAMES,
+                    block_size=WSC_STREAM_BLOCK_FRAMES,
+                    return_stats=True,
+                )
+            else:
+                if sample.ndim == 3:
+                    chunk = np.stack(
+                        [np.asarray(f[rows_slice, :, 0], dtype=np.float32) for f in frames_list],
+                        axis=0,
+                    )
+                else:
+                    chunk = np.stack(
+                        [np.asarray(f[rows_slice, :], dtype=np.float32) for f in frames_list],
+                        axis=0,
+                    )
+                chunk_out, stats = wsc_pixinsight_core(
+                    np,
+                    chunk,
+                    sigma_low=sigma_low,
+                    sigma_high=sigma_high,
+                    max_iters=max_iters,
+                    weights_block=weights_block_c,
+                    return_stats=True,
+                )
+            if sample.ndim == 3:
+                output[rows_slice, :, 0] = chunk_out.astype(np.float32, copy=False)
+            else:
+                output[rows_slice, ...] = chunk_out.astype(np.float32, copy=False)
+            _accumulate_wsc_stats(stats_accum, stats)
         if progress_callback:
             try:
                 progress_callback("stack_winsorized", idx, total_steps)
@@ -4829,7 +4950,7 @@ def stack_aligned_images(
 
 
 # --- CPU fallback implementation appended (in case Seestar stack methods are unavailable) ---
-def _cpu_stack_kappa_fallback(
+def _cpu_stack_kappa_fallback_fullframe(
     frames,
     *,
     sigma_low: float = 3.0,
@@ -4837,10 +4958,8 @@ def _cpu_stack_kappa_fallback(
     weights=None,
     progress_callback=None,
 ):
-    """CPU kappa-sigma clip fallback.
+    """Full-frame CPU kappa-sigma clip fallback (original behavior)."""
 
-    Accepts frames of shape (N,H,W) or (N,H,W,C). Returns (stacked, rejected_pct).
-    """
     _pcb = lambda m, lvl="DEBUG_DETAIL", **kw: (
         progress_callback(m, None, lvl, **kw) if progress_callback else _internal_logger.debug(m)
     )
@@ -4881,6 +5000,206 @@ def _cpu_stack_kappa_fallback(
     rejected_pct = 100.0 * float(mask.size - np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
     _pcb("cpu_kappa_fallback_done", lvl="DEBUG_DETAIL")
     return stacked, rejected_pct
+
+
+def _cpu_stack_kappa_fallback_chunked(
+    frames_list,
+    *,
+    sigma_low: float = 3.0,
+    sigma_high: float = 3.0,
+    weights=None,
+    progress_callback=None,
+    chunk_rows: int = 64,
+):
+    """Chunked CPU kappa-sigma fallback to limit peak RAM."""
+
+    _pcb = lambda m, lvl="DEBUG_DETAIL", **kw: (
+        progress_callback(m, None, lvl, **kw) if progress_callback else _internal_logger.debug(m)
+    )
+    if not frames_list:
+        raise ValueError("frames is empty")
+    first = np.asarray(frames_list[0], dtype=np.float32)
+    if first.ndim not in (2, 3):
+        raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got {first.shape}")
+    frames_list = [np.asarray(f, dtype=np.float32) for f in frames_list]
+    n = len(frames_list)
+    h = int(first.shape[0])
+    w = int(first.shape[1])
+    c = int(first.shape[2]) if first.ndim == 3 else 1
+    arr_shape = (n,) + tuple(first.shape)
+
+    w_arr = None
+    if weights is not None:
+        w_arr = np.asarray(weights, dtype=np.float32)
+        if w_arr.ndim == 1 and w_arr.shape[0] == n:
+            extra_dims = (1,) * (len(arr_shape) - 1)
+            w_arr = w_arr.reshape((n,) + extra_dims)
+        try:
+            np.broadcast_to(w_arr, arr_shape)
+        except ValueError as exc:
+            raise ValueError(
+                f"weights shape {w_arr.shape} not compatible with frames shape {arr_shape}"
+            ) from exc
+
+    chunk_rows = int(chunk_rows) if chunk_rows else h
+    if chunk_rows <= 0:
+        chunk_rows = h
+    chunk_rows = max(1, min(h, chunk_rows))
+
+    out = np.empty(first.shape, dtype=np.float32)
+    total_mask_elems = 0
+    total_kept = 0
+
+    for y0 in range(0, h, chunk_rows):
+        y1 = min(h, y0 + chunk_rows)
+        arr_chunk = np.stack([frame[y0:y1, ...] for frame in frames_list], axis=0)
+        if arr_chunk.ndim not in (3, 4):
+            raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got {arr_chunk.shape}")
+        med = np.nanmedian(arr_chunk, axis=0)
+        std = np.nanstd(arr_chunk, axis=0)
+        low = med - float(sigma_low) * std
+        high = med + float(sigma_high) * std
+        mask = (arr_chunk >= low) & (arr_chunk <= high)
+        total_mask_elems += int(mask.size)
+        total_kept += int(np.count_nonzero(mask))
+        arr_clip = np.where(mask, arr_chunk, np.nan)
+        if w_arr is None:
+            stacked_chunk = np.nanmean(arr_clip, axis=0)
+            out[y0:y1, ...] = stacked_chunk.astype(np.float32, copy=False)
+        else:
+            bw = np.broadcast_to(w_arr, arr_chunk.shape).astype(np.float32, copy=False)
+            bw = np.where(mask, bw, 0.0)
+            num = np.nansum(arr_clip * bw, axis=0)
+            den = np.sum(bw, axis=0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                stacked_chunk = np.where(den > 0, num / den, np.nan)
+            if np.any(~np.isfinite(stacked_chunk)):
+                stacked_fallback = np.nanmean(arr_chunk, axis=0)
+                stacked_chunk = np.where(np.isfinite(stacked_chunk), stacked_chunk, stacked_fallback)
+            out[y0:y1, ...] = stacked_chunk.astype(np.float32, copy=False)
+
+    rejected_pct = (
+        100.0 * float(total_mask_elems - total_kept) / float(total_mask_elems)
+        if total_mask_elems
+        else 0.0
+    )
+    _pcb("cpu_kappa_fallback_done", lvl="DEBUG_DETAIL")
+    return out, rejected_pct
+
+
+def _cpu_stack_kappa_fallback(
+    frames,
+    *,
+    sigma_low: float = 3.0,
+    sigma_high: float = 3.0,
+    weights=None,
+    progress_callback=None,
+):
+    """CPU kappa-sigma clip fallback.
+
+    Accepts frames of shape (N,H,W) or (N,H,W,C). Returns (stacked, rejected_pct).
+    """
+    _pcb = lambda m, lvl="DEBUG_DETAIL", **kw: (
+        progress_callback(m, None, lvl, **kw) if progress_callback else _internal_logger.debug(m)
+    )
+    frames_list = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_list:
+        raise ValueError("frames is empty")
+    first = frames_list[0]
+    if first.ndim not in (2, 3):
+        raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got {first.shape}")
+    n = len(frames_list)
+    h = int(first.shape[0])
+    w = int(first.shape[1])
+    c = int(first.shape[2]) if first.ndim == 3 else 1
+    full_stack_bytes = int(n * h * w * c * 4)
+    available_bytes, _ = _query_system_memory()
+    fullframe_threshold = 512 * 1024**2
+    if available_bytes > 0:
+        fullframe_threshold = min(fullframe_threshold, int(available_bytes * 0.25))
+    if full_stack_bytes <= fullframe_threshold:
+        return _cpu_stack_kappa_fallback_fullframe(
+            frames_list,
+            sigma_low=sigma_low,
+            sigma_high=sigma_high,
+            weights=weights,
+            progress_callback=progress_callback,
+        )
+    chunk_target = 128 * 1024**2
+    if available_bytes > 0:
+        chunk_target = min(chunk_target, int(available_bytes * 0.1))
+        chunk_target = max(16 * 1024**2, chunk_target)
+    bytes_per_row = int(n * w * c * 4)
+    if bytes_per_row <= 0:
+        chunk_rows = h
+    else:
+        chunk_rows = max(1, int(chunk_target / bytes_per_row))
+        chunk_rows = max(1, min(h, chunk_rows))
+    _pcb(
+        f"cpu_kappa_fallback_chunked: rows={chunk_rows} full_stack_mb={full_stack_bytes / (1024**2):.1f}",
+        lvl="DEBUG_DETAIL",
+    )
+    return _cpu_stack_kappa_fallback_chunked(
+        frames_list,
+        sigma_low=sigma_low,
+        sigma_high=sigma_high,
+        weights=weights,
+        progress_callback=progress_callback,
+        chunk_rows=chunk_rows,
+    )
+
+
+def _selftest_cpu_kappa_chunk_equivalence() -> bool:
+    """Self-test comparing full-frame vs chunked kappa fallback; not called by default."""
+
+    rng = np.random.default_rng(42)
+    n, h, w, c = 8, 64, 64, 3
+    frames = rng.normal(size=(n, h, w, c)).astype(np.float32)
+    nan_mask = rng.random(size=frames.shape) < 0.05
+    frames[nan_mask] = np.nan
+    frames_list = [frames[i] for i in range(n)]
+    weights = rng.random(size=(n,)).astype(np.float32) + 0.1
+
+    full, _ = _cpu_stack_kappa_fallback_fullframe(
+        frames_list,
+        sigma_low=2.5,
+        sigma_high=2.5,
+        weights=weights,
+        progress_callback=None,
+    )
+    chunk, _ = _cpu_stack_kappa_fallback_chunked(
+        frames_list,
+        sigma_low=2.5,
+        sigma_high=2.5,
+        weights=weights,
+        progress_callback=None,
+        chunk_rows=8,
+    )
+    with np.errstate(invalid="ignore"):
+        max_diff = float(np.nanmax(np.abs(full - chunk)))
+    if not (max_diff <= 1e-4):
+        raise AssertionError(f"kappa chunk equivalence failed (max diff {max_diff:.6g})")
+
+    full_unw, _ = _cpu_stack_kappa_fallback_fullframe(
+        frames_list,
+        sigma_low=2.5,
+        sigma_high=2.5,
+        weights=None,
+        progress_callback=None,
+    )
+    chunk_unw, _ = _cpu_stack_kappa_fallback_chunked(
+        frames_list,
+        sigma_low=2.5,
+        sigma_high=2.5,
+        weights=None,
+        progress_callback=None,
+        chunk_rows=8,
+    )
+    with np.errstate(invalid="ignore"):
+        max_diff_unw = float(np.nanmax(np.abs(full_unw - chunk_unw)))
+    if not (max_diff_unw <= 1e-4):
+        raise AssertionError(f"kappa chunk equivalence failed (unweighted max diff {max_diff_unw:.6g})")
+    return True
 
 
 def _cpu_stack_linear_fallback(

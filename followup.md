@@ -1,63 +1,48 @@
-# followup.md
+# Follow-up checklist: Validate WSC memory fixes (no regressions)
 
-## Ce que tu dois livrer
-- Un patch Git prêt à merger, limité à :
-  - `zemosaic_worker.py`
-  - `zemosaic_align_stack.py`
+## [ ] 1) Quick sanity: rows preflight cannot be overridden by hint
+- Create/force a ParallelPlan with `gpu_rows_per_chunk=256`.
+- Run a WSC stack with large N (or simulate with small images but big N).
+Expected log (example):
+- `[P3][WSC][VRAM_PREFLIGHT] ... N=649 ... rows=1 ...`
+NOT rows=256.
 
-- Des logs plus explicites (niveau DEBUG_DETAIL) montrant :
-  - le mode (EQ / ALT_AZ) détecté par groupe en Phase 3
-  - la décision “global_enabled vs tile_enabled” pour ALT-AZ cleanup
+## [ ] 2) Validate CPU fallback is channelwise
+Trigger GPU failure intentionally (e.g. set very low VRAM budget / safe mode) then check logs:
+- Should see per-channel processing in CPU fallback (or streaming log).
+- Must NOT attempt to allocate shape (N, rows, W, 3) float64.
 
-## Checklist de review (avant de rendre)
-### 1) Vérification “pas de régression SDS / Grid”
-- [ ] `grid_mode.py` : inchangé
-- [ ] Aucune modification de logique SDS (chercher `sds_` dans diff : uniquement des impacts indirects acceptables)
-- [ ] Le comportement global hors Phase 3 n’est pas altéré inutilement
+## [ ] 3) Validate streaming WSC activates for huge N
+Use synthetic test (small images, huge N like 20000):
+- Build frames of shape (H=2, W=64, C=3) float32, add some NaNs.
+- Call the WSC stack path.
+Expected:
+- streaming enabled log appears
+- process completes without MemoryError
+- output has correct shape and finite values where expected.
 
-### 2) Worker : gating ALT-AZ cleanup par groupe
-- [ ] Ajout d’un helper `_infer_group_eqmode(...)` (aucune lecture disque)
-- [ ] Si `contains_altaz=False` alors `altaz_cleanup_effective_flag` forcé à False (WARN si l’option était demandée)
-- [ ] En Phase 3, `create_master_tile(... altaz_cleanup_enabled=altaz_cleanup_for_tile ...)` :
-  - [ ] ALT_AZ => True
-  - [ ] EQ => False
-- [ ] Logs DEBUG_DETAIL clairs (1 ligne / tile max, pas de spam)
+## [ ] 4) Regression check on small stacks (parity)
+- Run existing WSC parity check (cpu vs gpu) on small stacks.
+Expected:
+- parity still OK within existing mode thresholds.
+- streaming should NOT activate.
 
-### 3) Align stack : CPU kappa fallback chunké
-- [ ] `_cpu_stack_kappa_fallback` ne fait plus `np.stack(all_frames)` sur tout H
-- [ ] Chemin “fast” conservé si petite taille (pas de ralentissement sur petits stacks)
-- [ ] Mode chunk :
-  - [ ] mémoire bornée (pas de temp géant)
-  - [ ] support RGB (N,H,W,3) et mono (N,H,W)
-  - [ ] support weights 1D au minimum (le plus courant)
-- [ ] `rejected_pct` cohérent avec l’ancien fallback
+## [ ] 5) Integration smoke tests (critical)
+- Run one SDS mosaic (small dataset) end-to-end.
+- Run one Grid mode mosaic end-to-end.
+Expected:
+- identical outputs (or same failure/success behavior as before), no code-path changes.
 
-### 4) Self-tests
-- [ ] `_selftest_cpu_kappa_chunk_equivalence()` existe, non exécuté par défaut
-- [ ] `_selftest_infer_group_eqmode()` existe, non exécuté par défaut
+## [ ] 6) Confirm pinned-memory hardening
+On a GPU machine, try to reproduce the old pinned error path:
+- If `cudaErrorAlreadyMapped` occurs, it must be handled like OOM:
+  - pools freed
+  - either backoff rows or clean fallback to CPU streaming
+  - no infinite retry loop
 
-## Scénarios de validation manuelle (rapides)
-### A) “EQ-only”
-- Simuler `contains_altaz=False`, option ALT-AZ cleanup cochée
-- Attendu :
-  - WARN “requested but no ALT_AZ frames detected -> disabled”
-  - Phase 3 : `tile_enabled=False` partout
-  - pas de master tiles vides
-
-### B) “Mix EQ + ALT_AZ”
-- Groupe EQ (entry["_eqmode_mode"]="EQ") + groupe ALT_AZ (entry["_eqmode_mode"]="ALT_AZ")
-- Attendu :
-  - EQ : `tile_enabled=False`
-  - ALT_AZ : `tile_enabled=True`
-
-### C) “Big group fallback CPU”
-- Forcer un cas (N élevé) qui déclenche chunking (ou baisser le seuil pour test)
-- Attendu :
-  - pas d’alloc > quelques centaines de MB
-  - pas de crash nanmedian
-  - sortie float32 OK
-
-## Format de sortie
-- Donne le diff/patch final
-- Donne un court résumé (5-10 lignes) des changements
-- Donne les points de risque éventuels (s’il y en a) + pourquoi tu estimes que SDS/Grid sont safe
+## Deliverables to include in PR
+- Short commit message summary:
+  - "Fix WSC rows hint override + channelwise CPU fallback"
+  - "Add streaming WSC for large N to cap memory"
+  - "Harden GPU pinned-memory errors (AlreadyMapped treated as OOM-like)"
+- Mention explicitly: "No changes to SDS or Grid code paths."

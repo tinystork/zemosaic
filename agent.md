@@ -1,162 +1,83 @@
-# agent.md
+# Mission: Fix WSC (PixInsight-like) memory blowups on large clusters (Phase 3 master tiles)
 
-## Mission
-Corriger deux problèmes en Phase 3 (Master Tiles) de ZeMosaic, introduits/renforcés par les mécanismes de protection mémoire :
+## Context
+On large clusters, Phase 3 stacking fails with:
+- GPU pinned-memory OOM then `cudaErrorAlreadyMapped`
+- CPU fallback OOM in `wsc_pixinsight_core()` trying to allocate ~8.18 GiB for shape (N, rows, W, 3) float64.
 
-1) **Master tiles entièrement vides** (noires / NaNisées) “quelque soit la normalisation” alors qu’avant ce n’était pas le cas.
-   - Suspect principal : **ALT-AZ cleanup / mask propagation** appliqué à des groupes **EQ** (ou appliqué globalement au lieu d’être appliqué *par groupe*).
-   - Contexte : l’UI Qt (zemosaic_filter_gui_qt.py) construit déjà des clusters séparés **EQ vs ALT_AZ** (pas de mélange), donc le worker doit respecter cette séparation.
+Example failure:
+shape (649, 256, 2203, 3) float64 => ~8.18 GiB (before extra masks/buffers).
 
-2) **Crash mémoire CPU kappa-sigma** :
-   - Trace typique :
-     `_cpu_stack_kappa_fallback -> np.nanmedian(arr, axis=0)` puis
-     `Unable to allocate 32.4 GiB for an array with shape (N,H,W,3) float32`.
-   - Ici, le fallback CPU fait un `np.stack` de *toutes* les frames en RAM (N,H,W,C), ce qui explose sur gros groupes.
+## Root causes (must address)
+1. WSC CPU fallback builds a full RGB 4D chunk: (N, rows, W, 3) then converts to float64 and uses xp.where -> massive allocations.
+2. WSC rows preflight `_resolve_rows_per_chunk_wsc()` allows `rows_hint` to override safety when `rows_budget <= 0` (falls back to rows_cap instead of 1).
+3. Current chunking is "rows only": memory still scales with N. For N up to 20000, even rows=1 is too big if we stack all frames at once.
+4. GPU errors `cudaErrorAlreadyMapped` after hostAlloc OOM should be treated as OOM-like and trigger pool purge + fallback, not a repeated failure loop.
 
-Objectif : corriger ces deux points **sans changer le comportement scientifique** (résultat du stack) pour les cas qui ne crashaient pas, et **sans régression** pour **SDS mode** et **Grid/Survey mode**.
+## Scope / files
+- `zemosaic_align_stack_gpu.py`
+  - [x] Fix `_resolve_rows_per_chunk_wsc()` hint logic (hint is a cap, never a fallback when budget <= 0).
+  - [x] Ensure GPU WSC builds per-channel chunks without creating full RGB 4D `chunk_cpu` when possible.
+  - [x] Update CPU fallback `_wsc_pixinsight_stack_cpu()` to be channelwise and to use the new streaming WSC for large N.
+  - [x] Treat `cudaErrorAlreadyMapped` (and similar pinned-memory errors) as OOM-like: purge memory pools and fallback cleanly.
 
-## Contraintes critiques
-- **Zéro régression SDS** : ne pas modifier le pipeline SDS (ni sa logique d’assemblage). Toute modification doit être neutre pour SDS.
-- **Zéro régression Grid mode** : grid mode est géré par `grid_mode.run_grid_mode(...)`. Ne pas modifier grid_mode.
-- Ne pas changer l’API publique ni les noms d’options de GUI.
-- Patch minimal, ciblé.
-- Préserver la parité CPU/GPU (là où applicable) : la correction doit être “même résultat, moins de RAM”.
-- Le dataset peut contenir un mix EQ + ALT_AZ : il faut appliquer ALT-AZ cleanup **uniquement** aux groupes ALT_AZ (et jamais aux groupes EQ).
+- `core/robust_rejection.py` (or wherever `wsc_pixinsight_core` lives in repo)
+  - [x] Reduce allocations: replace `Xf = xp.where(valid, Xf, xp.nan)` with in-place masking when backend supports it.
+  - [x] Add a new streaming implementation that does NOT require materializing (N, rows, W[,C]) for large N:
+    - [x] `wsc_pixinsight_core_streaming_numpy(frames, rows_slice, channel, ...)` or equivalent.
+    - [x] Must support optional frame weights (broadcast forms currently accepted) and sky_offsets.
+    - [x] Must preserve NaNs as invalid mask.
 
-## Périmètre fichiers (autorisé)
-- `zemosaic_worker.py`
 - `zemosaic_align_stack.py`
+  - [x] Update `_wsc_pixinsight_stack_numpy()` to use channelwise and optionally the streaming WSC for large N.
 
-(Pas d’autres fichiers, sauf si absolument indispensable pour un bug bloquant — et dans ce cas, justifier dans le PR.)
+## Hard constraints
+- NO regression on SDS mode and Grid mode (do not change their algorithms/paths).
+- Keep existing behavior for batch size = 0 and batch size > 1 (do not modify that logic).
+- Keep existing WSC small-stack behavior and parity tests intact for small N (streaming activates only when needed).
 
-## Diagnostic attendu (root causes)
-### A) Master tiles vides
-Dans `zemosaic_worker.py`, Phase 3 appelle `create_master_tile(...)` en passant `altaz_cleanup_effective_flag` **global** à *tous* les groupes.
-Or :
-- `create_master_tile()` active `propagate_mask_for_coverage` dès que `altaz_cleanup_enabled_effective` est vrai,
-- et la pipeline lecropper peut “nanize/zeroize” selon un masque,
-- donc si tu appliques ça à un stack EQ (ou à un groupe dont la couverture/masque est “mauvais”), tu peux **détruire** la master tile.
+## Implementation plan (suggested)
+### [x] A) Fix rows preflight (critical, small patch)
+In `_resolve_rows_per_chunk_wsc()`:
+- Compute `rows_budget = floor(budget / bytes_per_row)`.
+- If `rows_budget <= 0`, set `rows_final = 1`.
+- If `rows_hint` exists, apply `rows_final = min(rows_final, rows_hint)` (hint is cap).
+- Ensure logs reflect actual `rows_final`.
 
-On doit donc :
-- Calculer un **flag ALT-AZ cleanup par groupe** (par tile) en inférant le mount mode depuis les métadonnées déjà présentes dans les entries (ex: `_eqmode_mode`, `MOUNT_MODE`, `EQMODE`, `header["EQMODE"]`).
-- Appliquer le cleanup **uniquement** aux groupes ALT_AZ.
+### [x] B) Make CPU fallback channelwise
+In `_wsc_pixinsight_stack_cpu()`:
+- If frames are RGB, loop over channels:
+  - Build per-channel chunk `(N, rows, W)` not `(N, rows, W, 3)`.
+  - Pass `weights_block[..., c]` if weights are channelwise.
+- This must work with `sky_offsets`.
 
-### B) Crash mémoire `_cpu_stack_kappa_fallback`
-Dans `zemosaic_align_stack.py`, `_cpu_stack_kappa_fallback()` fait :
-- `frames_list = [...]`
-- `arr = np.stack(frames_list, axis=0)`  => RAM énorme
-- `np.nanmedian(arr, axis=0)` => allocations internes supplémentaires
+### [x] C) Add streaming WSC for large N
+Add a streaming code path used when:
+- N is large (e.g. > 512), OR
+- estimated chunk bytes exceed a configurable fraction of available RAM.
 
-Il faut un fallback CPU “low-mem” :
-- qui traite **par bandes de lignes (row-chunks)** (et idéalement compatible RGB),
-- sans empiler tout (N,H,W,C) d’un coup,
-- tout en conservant le même algorithme (kappa-sigma basé sur median/std) et le même résultat (à tolérance float32).
+Streaming algorithm requirements:
+- Must not stack all frames at once.
+- Use sample-based init for (m, sigma) to avoid full-stack median/MAD:
+  - sample frames deterministically via linspace indices capped at e.g. 256.
+- For each iteration:
+  - Pass1: compute winsorized mean (weighted/unweighted) -> m_new (accumulate sums over frame blocks).
+  - Pass2: compute sigma_new (Huber IRLS style) -> sigma_new (accumulate numer/denom over frame blocks).
+- Stop on convergence similar to existing tolerances.
+- Output: for pixels with <2 valid samples use fallback_mean (computed via streaming count/sum).
+- Return stats (clip counts can be approximated or computed in a final pass; keep existing stats fields).
 
-## Implémentation — étapes détaillées
+### [x] D) GPU pinned-memory error hardening
+- Extend `_wsc_is_oom_error()` to treat `cudaErrorAlreadyMapped` / pinned hostAlloc failures as OOM-like.
+- On such errors: purge `cp.get_default_memory_pool().free_all_blocks()` and `cp.get_default_pinned_memory_pool().free_all_blocks()`, synchronize, then either backoff rows or fallback to CPU streaming.
 
-### Étape 1 — Helper “infer mount mode” (worker)
-Dans `zemosaic_worker.py`, ajouter une petite fonction pure, locale au worker (ou module-level privé) :
-
-`_infer_group_eqmode(group: list[dict]) -> str`
-
-Règles :
-- Lire en priorité sur la **première entry** (puis fallback sur scan de quelques entries si nécessaire) :
-  - `entry.get("MOUNT_MODE")` si str,
-  - sinon `entry.get("_eqmode_mode")` si str,
-  - sinon `entry.get("EQMODE")` (int/str) : **même mapping que Qt** :
-    - 1 => "EQ"
-    - 0 => "ALT_AZ"
-  - sinon `entry.get("header")` ou `entry.get("header_subset")` et tenter `header.get("EQMODE")`.
-- Si impossible : retourner `"UNKNOWN"`.
-
-Important : on **ne doit pas ouvrir** de FITS sur disque ici (pas de lecture fichier). On s’appuie uniquement sur ce qui est déjà en mémoire.
-
-### Étape 2 — Calculer un flag global “contains_altaz”
-`WORKER_EQMODE_SUMMARY` existe déjà (cf. log). On a donc `contains_altaz`.
-
-Modifier la logique globale de `altaz_cleanup_effective_flag` :
-- Si `contains_altaz == False` : **forcer** `altaz_cleanup_effective_flag = False`.
-  - Si l’utilisateur a explicitement demandé le cleanup : log WARN clair du style :
-    `ALTaz cleanup requested but no ALT_AZ frames detected -> disabled (EQ-only run).`
-- Si `contains_altaz == True` :
-  - conserver la logique existante : requested => true, sinon auto-enable => true (ou garder la logique actuelle).
-
-⚠️ But : empêcher *définitivement* un run EQ-only de se faire “nanizer” par un cleanup alt-az.
-
-### Étape 3 — Passer un flag ALT-AZ cleanup **par groupe** en Phase 3
-Dans la boucle Phase 3, au moment de `executor_ph3.submit(create_master_tile, ...)`, aujourd’hui on passe `altaz_cleanup_effective_flag`.
-
-Remplacer par :
-- `group_eqmode = _infer_group_eqmode(group_info_list)`
-- `altaz_cleanup_for_tile = bool(altaz_cleanup_effective_flag) and (group_eqmode == "ALT_AZ")`
-
-Puis passer `altaz_cleanup_for_tile` à `create_master_tile(...)`.
-
-Important :
-- Ne pas casser le retry path : quand un sous-groupe est re-soumis (`retry_groups`), il doit garder ses keys (`_eqmode_mode`, etc.) → l’inférence doit marcher pareil.
-
-Ajouter un log DEBUG_DETAIL par tile :
-`P3_ALTaz_GATING: tile_id=X eqmode=ALT_AZ global_enabled=True => tile_enabled=True`
-et pour EQ :
-`P3_ALTaz_GATING: tile_id=Y eqmode=EQ global_enabled=True => tile_enabled=False`
-
-### Étape 4 — Fallback CPU kappa-sigma “low-mem” (align_stack)
-Dans `zemosaic_align_stack.py`, remplacer `_cpu_stack_kappa_fallback()` par une implémentation chunkée :
-
-- Conserver le comportement pour petits N/H/W (chemin “fast” = ancien algo) :
-  - Estimer bytes du stack complet : `N*H*W*C*4` et comparer à un seuil (ex: 512MB) ou un % RAM (si psutil dispo, optionnel).
-- Si au-delà : exécuter un mode `chunk_rows` :
-  - allouer `out = np.empty((H,W,C), float32)`
-  - pour y0:y1 :
-    - construire `arr_chunk = np.stack([f[y0:y1,...] for f in frames_list], axis=0)`
-    - calculer `med/std/low/high` sur chunk
-    - calculer mask
-    - combiner (mean ou weighted mean) **sans créer un arr_clip énorme si possible** :
-      - unweighted : in-place set invalid to 0 + sum/count
-      - weighted (poids 1D typique) : accumuler `sum += w_i * frame_i` et `den += w_i * mask_i`
-    - écrire dans `out[y0:y1,...]`
-  - calculer `rejected_pct` global via compteur cumulatif.
-  - retourner `(out, rejected_pct)`.
-
-Contraintes :
-- dtype final : float32 (comme actuellement).
-- Résultat doit matcher l’ancien fallback (sur petits tableaux) à une tolérance float32.
-- Ne pas dépendre “fortement” de psutil : si dispo, ok; sinon fallback sur seuil fixe.
-
-### Étape 5 — Micro-tests intégrés (sans framework)
-Il n’y a pas de dossier tests dans ce snapshot, donc ajouter des **self-tests optionnels** (sans exécution par défaut) :
-
-- Dans `zemosaic_align_stack.py` :
-  - une fonction `_selftest_cpu_kappa_chunk_equivalence()` qui :
-    - génère un petit set random (N=8,H=64,W=64,C=3) + quelques NaN,
-    - calcule “ancienne version” (garder un helper privé `_cpu_stack_kappa_fallback_fullframe` ou reconstruire localement),
-    - calcule “nouvelle version chunk” (forcer chunk_rows petit),
-    - compare max abs diff < ~1e-4 (float32).
-- Dans `zemosaic_worker.py` :
-  - une fonction `_selftest_infer_group_eqmode()` avec 3 cas : EQ, ALT_AZ, UNKNOWN.
-
-Ces fonctions doivent **ne rien impacter** en production et n’être appelées nulle part sauf debug manuel.
-
-## Critères d’acceptation
-1) Run **EQ-only** :
-   - `contains_altaz=False`
-   - ALT-AZ cleanup **désactivé** même si coché (avec WARN clair).
-   - Plus de master tiles vides causées par ALT-AZ cleanup.
-
-2) Run **mixte EQ + ALT_AZ** :
-   - En Phase 3 :
-     - tiles EQ : `tile_enabled=False` (pas de lecropper altaz nanize)
-     - tiles ALT_AZ : `tile_enabled=True`
-   - Les masters ne sont plus détruites pour les groupes EQ.
-
-3) Plus de crash RAM du type “Unable to allocate XX GiB … (N,H,W,3)” en fallback CPU kappa-sigma :
-   - le fallback doit passer sur gros groupes via chunking.
-
-4) SDS et Grid :
-   - Aucun changement de code sur `grid_mode.py`
-   - SDS pipeline inchangé
-   - Pas de modifications de paramètres / options SDS/Grid
+## Acceptance criteria
+1. Large cluster case no longer allocates multi-GB arrays on CPU fallback; must complete without MemoryError.
+2. `_resolve_rows_per_chunk_wsc()` returns 1 (or small) for big N even if `gpu_rows_per_chunk` hint is 256.
+3. For small N (<= ~64), outputs remain unchanged vs current implementation (within existing parity thresholds).
+4. No changes in SDS and Grid mode results or code paths.
+5. Logs clearly indicate when streaming WSC is used:
+   - `[P3][WSC][STREAM] enabled=1 reason=N>threshold N=... block=... rows=...`
 
 ## Notes
-- Ne pas toucher à `zemosaic_filter_gui_qt.py` : il fait déjà la séparation.
-- La correction doit être robuste même si certaines entrées n’ont pas `_eqmode_mode` (fallbacks).
+Prefer surgical changes. Add small unit tests if repo has a tests folder; otherwise add a lightweight self-test function guarded by `if __name__ == "__main__":` only if acceptable.

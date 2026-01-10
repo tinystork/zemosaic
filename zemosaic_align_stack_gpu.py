@@ -24,6 +24,7 @@ from core.robust_rejection import (
     resolve_wsc_parity_mode,
     wsc_parity_check,
     wsc_pixinsight_core,
+    wsc_pixinsight_core_streaming_numpy,
 )
 
 try:  # pragma: no cover - exercised only when CuPy is available
@@ -67,6 +68,11 @@ _GPU_HEALTH_CHECKED = False
 _GPU_HEALTHY = False
 
 WSC_PIXINSIGHT_MAX_ITERS = 10
+WSC_STREAM_N_THRESHOLD = int(os.environ.get("ZEMOSAIC_WSC_STREAM_N_THRESHOLD", 512))
+WSC_STREAM_RAM_FRAC = float(os.environ.get("ZEMOSAIC_WSC_STREAM_RAM_FRAC", 0.35))
+WSC_STREAM_BLOCK_FRAMES = int(os.environ.get("ZEMOSAIC_WSC_STREAM_BLOCK_FRAMES", 128))
+WSC_STREAM_SAMPLE_FRAMES = int(os.environ.get("ZEMOSAIC_WSC_STREAM_SAMPLE_FRAMES", 256))
+WSC_STREAM_OVERHEAD = float(os.environ.get("ZEMOSAIC_WSC_STREAM_OVERHEAD", 12.0))
 _WSC_GPU_PARITY_CHECKED = False
 _WSC_GPU_PARITY_OK = False
 _WSC_GPU_PARITY_MAX_ABS: float | None = None
@@ -324,6 +330,24 @@ def _wsc_estimate_bytes_per_row(
     return int(frames * w * dbytes * ovh)
 
 
+def _should_use_wsc_streaming_cpu(
+    *,
+    frames_count: int,
+    rows: int,
+    width: int,
+) -> tuple[bool, str | None, int, int]:
+    reason = None
+    est_bytes = int(
+        max(1, int(frames_count)) * max(1, int(rows)) * max(1, int(width)) * 8 * float(WSC_STREAM_OVERHEAD)
+    )
+    avail = _available_ram_bytes() or 0
+    if frames_count > WSC_STREAM_N_THRESHOLD:
+        reason = "N>threshold"
+    elif avail > 0 and est_bytes > int(avail * WSC_STREAM_RAM_FRAC):
+        reason = "chunk_bytes>budget"
+    return reason is not None, reason, est_bytes, int(avail)
+
+
 def _resolve_rows_per_chunk_wsc(
     cp_mod: Any,
     height: int,
@@ -349,12 +373,6 @@ def _resolve_rows_per_chunk_wsc(
             rows_hint = None
 
     bytes_per_row = _wsc_estimate_bytes_per_row(n_frames, width)
-    rows_cap = None
-    if rows_hint:
-        rows_cap = int(rows_hint)
-    elif max_bytes > 0 and bytes_per_row > 0:
-        rows_cap = max_bytes // bytes_per_row
-
     free_b = None
     if cp_mod is not None:
         try:
@@ -366,11 +384,9 @@ def _resolve_rows_per_chunk_wsc(
 
     budget = min(max_bytes if max_bytes > 0 else free_b, int(free_b * 0.55))
     rows_budget = budget // bytes_per_row if budget > 0 and bytes_per_row > 0 else 0
-    rows_final = rows_budget if rows_budget > 0 else 0
-    if rows_cap and rows_cap > 0:
-        rows_final = min(rows_final, rows_cap) if rows_final > 0 else rows_cap
-    if rows_final <= 0:
-        rows_final = 1
+    rows_final = rows_budget if rows_budget > 0 else 1
+    if rows_hint and rows_hint > 0:
+        rows_final = min(rows_final, int(rows_hint))
     rows_final = min(height, rows_final)
     if _gpu_safe_mode_enabled():
         rows_final = min(rows_final, SAFE_MODE_ROWS_CAP, height)
@@ -399,8 +415,16 @@ def _wsc_is_oom_error(exc: Exception) -> bool:
         oom_type = getattr(cp.cuda.memory, "OutOfMemoryError", None)
         if oom_type is not None and isinstance(exc, oom_type):
             return True
-    msg = str(exc) or repr(exc)
-    return "out of memory" in msg.lower()
+    msg = (str(exc) or repr(exc)).lower()
+    if "out of memory" in msg:
+        return True
+    if "cudaerroralreadymapped" in msg or "already mapped" in msg:
+        return True
+    if "hostalloc" in msg and "cudaerror" in msg:
+        return True
+    if "pinned" in msg and "memory" in msg:
+        return True
+    return False
 
 
 def _wsc_gpu_parity_check() -> tuple[bool, float | None]:
@@ -481,6 +505,8 @@ def _wsc_pixinsight_stack_cpu(
         raise GPUStackingError("No frames provided for CPU fallback")
     sample = np.asarray(frames[0], dtype=np.float32)
     height = int(sample.shape[0])
+    channels = int(sample.shape[2]) if sample.ndim == 3 else 1
+    is_color = sample.ndim == 3 and channels > 1
     output = np.empty_like(sample, dtype=np.float32)
     stats_accum = {
         "clip_low_count": 0.0,
@@ -491,34 +517,134 @@ def _wsc_pixinsight_stack_cpu(
         "huber": 1.0,
     }
     chunk_rows = max(1, int(rows_per_chunk or height))
-    for row_start in range(0, height, chunk_rows):
-        row_end = min(height, row_start + chunk_rows)
-        chunk = np.stack([frame[row_start:row_end, :, :] for frame in frames], axis=0)
-        if sky_offsets is not None:
-            try:
-                off = np.asarray(sky_offsets, dtype=np.float32).reshape((chunk.shape[0], 1, 1, 1))
-                chunk += off
-            except Exception:
-                pass
+    weights_block_channelwise = False
+    if weights_block is not None:
         try:
-            # Keep NaNs (mask) but convert +/-inf to NaN.
-            np.nan_to_num(chunk, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+            weights_block_channelwise = weights_block.ndim == 4 and weights_block.shape[-1] == channels
+        except Exception:
+            weights_block_channelwise = False
+    width = int(sample.shape[1]) if sample.ndim >= 2 else 0
+    rows_for_log = min(chunk_rows, height)
+    use_stream, reason, _est_bytes, _avail = _should_use_wsc_streaming_cpu(
+        frames_count=len(frames),
+        rows=rows_for_log,
+        width=width,
+    )
+    if use_stream:
+        try:
+            LOGGER.info(
+                "[P3][WSC][STREAM] enabled=1 reason=%s N=%d block=%d rows=%d",
+                reason or "unknown",
+                int(len(frames)),
+                int(min(WSC_STREAM_BLOCK_FRAMES, len(frames))),
+                int(rows_for_log),
+            )
         except Exception:
             pass
-        chunk_out, stats = wsc_pixinsight_core(
-            np,
-            chunk,
-            sigma_low=sigma_low,
-            sigma_high=sigma_high,
-            max_iters=max_iters,
-            weights_block=weights_block,
-            return_stats=True,
-        )
-        output[row_start:row_end] = chunk_out.astype(np.float32, copy=False)
-        stats_accum["clip_low_count"] += float(stats.get("clip_low_count", 0))
-        stats_accum["clip_high_count"] += float(stats.get("clip_high_count", 0))
-        stats_accum["valid_count"] += float(stats.get("valid_count", 0))
-        stats_accum["iters_used"] = max(stats_accum["iters_used"], float(stats.get("iters_used", 0)))
+    for row_start in range(0, height, chunk_rows):
+        row_end = min(height, row_start + chunk_rows)
+        rows_slice = slice(row_start, row_end)
+        if is_color:
+            for c in range(channels):
+                weights_block_c = (
+                    weights_block[..., c] if weights_block_channelwise else weights_block
+                )
+                if use_stream:
+                    chunk_out, stats = wsc_pixinsight_core_streaming_numpy(
+                        frames,
+                        rows_slice=rows_slice,
+                        channel=c,
+                        sigma_low=sigma_low,
+                        sigma_high=sigma_high,
+                        max_iters=max_iters,
+                        weights_block=weights_block_c,
+                        sky_offsets=sky_offsets,
+                        sample_limit=WSC_STREAM_SAMPLE_FRAMES,
+                        block_size=WSC_STREAM_BLOCK_FRAMES,
+                        return_stats=True,
+                    )
+                else:
+                    chunk = np.stack(
+                        [frame[row_start:row_end, :, c] for frame in frames],
+                        axis=0,
+                    )
+                    if sky_offsets is not None:
+                        try:
+                            off = np.asarray(sky_offsets, dtype=np.float32).reshape((chunk.shape[0], 1, 1))
+                            chunk += off
+                        except Exception:
+                            pass
+                    try:
+                        # Keep NaNs (mask) but convert +/-inf to NaN.
+                        np.nan_to_num(chunk, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+                    except Exception:
+                        pass
+                    chunk_out, stats = wsc_pixinsight_core(
+                        np,
+                        chunk,
+                        sigma_low=sigma_low,
+                        sigma_high=sigma_high,
+                        max_iters=max_iters,
+                        weights_block=weights_block_c,
+                        return_stats=True,
+                    )
+                output[row_start:row_end, :, c] = chunk_out.astype(np.float32, copy=False)
+                stats_accum["clip_low_count"] += float(stats.get("clip_low_count", 0))
+                stats_accum["clip_high_count"] += float(stats.get("clip_high_count", 0))
+                stats_accum["valid_count"] += float(stats.get("valid_count", 0))
+                stats_accum["iters_used"] = max(stats_accum["iters_used"], float(stats.get("iters_used", 0)))
+        else:
+            weights_block_c = (
+                weights_block[..., 0] if weights_block_channelwise else weights_block
+            )
+            channel_idx = 0 if sample.ndim == 3 else None
+            if use_stream:
+                chunk_out, stats = wsc_pixinsight_core_streaming_numpy(
+                    frames,
+                    rows_slice=rows_slice,
+                    channel=channel_idx,
+                    sigma_low=sigma_low,
+                    sigma_high=sigma_high,
+                    max_iters=max_iters,
+                    weights_block=weights_block_c,
+                    sky_offsets=sky_offsets,
+                    sample_limit=WSC_STREAM_SAMPLE_FRAMES,
+                    block_size=WSC_STREAM_BLOCK_FRAMES,
+                    return_stats=True,
+                )
+            else:
+                if sample.ndim == 3:
+                    chunk = np.stack([frame[row_start:row_end, :, 0] for frame in frames], axis=0)
+                else:
+                    chunk = np.stack([frame[row_start:row_end, :] for frame in frames], axis=0)
+                if sky_offsets is not None:
+                    try:
+                        off = np.asarray(sky_offsets, dtype=np.float32).reshape((chunk.shape[0], 1, 1))
+                        chunk += off
+                    except Exception:
+                        pass
+                try:
+                    # Keep NaNs (mask) but convert +/-inf to NaN.
+                    np.nan_to_num(chunk, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+                except Exception:
+                    pass
+                chunk_out, stats = wsc_pixinsight_core(
+                    np,
+                    chunk,
+                    sigma_low=sigma_low,
+                    sigma_high=sigma_high,
+                    max_iters=max_iters,
+                    weights_block=weights_block_c,
+                    return_stats=True,
+                )
+            if sample.ndim == 3:
+                output[row_start:row_end, :, 0] = chunk_out.astype(np.float32, copy=False)
+            else:
+                output[row_start:row_end] = chunk_out.astype(np.float32, copy=False)
+            stats_accum["clip_low_count"] += float(stats.get("clip_low_count", 0))
+            stats_accum["clip_high_count"] += float(stats.get("clip_high_count", 0))
+            stats_accum["valid_count"] += float(stats.get("valid_count", 0))
+            stats_accum["iters_used"] = max(stats_accum["iters_used"], float(stats.get("iters_used", 0)))
     total = stats_accum.get("valid_count", 0.0) or 0.0
     stats_accum["clip_low_frac"] = (
         stats_accum["clip_low_count"] / total if total > 0 else 0.0
@@ -1300,27 +1426,38 @@ def gpu_stack_from_arrays(
                 retry_count = 0
                 while True:
                     row_end = min(height, row_start + current_rows)
-                    chunk_cpu = np.stack(
-                        [frame[row_start:row_end, :, :] for frame in frames_for_stack],
-                        axis=0,
-                    )
+                    off_block = None
                     if sky_offsets is not None:
                         try:
-                            off = np.asarray(sky_offsets, dtype=np.float32).reshape((chunk_cpu.shape[0], 1, 1, 1))
-                            chunk_cpu += off
+                            off_block = np.asarray(sky_offsets, dtype=np.float32).reshape(
+                                (len(frames_for_stack), 1, 1)
+                            )
                         except Exception:
-                            pass
-                    try:
-                        # Keep NaNs (mask) but convert +/-inf to NaN.
-                        np.nan_to_num(chunk_cpu, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
-                    except Exception:
-                        pass
+                            off_block = None
                     try:
                         for c in range(channels):
-                            cpu_c = chunk_cpu[..., c] if channels > 1 else chunk_cpu[..., 0]
-
+                            if channels > 1:
+                                chunk_cpu = np.stack(
+                                    [frame[row_start:row_end, :, c] for frame in frames_for_stack],
+                                    axis=0,
+                                )
+                            else:
+                                chunk_cpu = np.stack(
+                                    [frame[row_start:row_end, :, 0] for frame in frames_for_stack],
+                                    axis=0,
+                                )
+                            if off_block is not None:
+                                try:
+                                    chunk_cpu += off_block
+                                except Exception:
+                                    pass
+                            try:
+                                # Keep NaNs (mask) but convert +/-inf to NaN.
+                                np.nan_to_num(chunk_cpu, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+                            except Exception:
+                                pass
                             t0 = time.perf_counter()
-                            data_gpu_c = cp.asarray(cpu_c, dtype=cp.float32)
+                            data_gpu_c = cp.asarray(chunk_cpu, dtype=cp.float32)
                             prof_upload_ms += (time.perf_counter() - t0) * 1000.0
 
                             t1 = time.perf_counter()

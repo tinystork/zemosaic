@@ -530,6 +530,92 @@ def _safe_basename(path: str | os.PathLike | None) -> str:
         return str(path)
 
 
+def _infer_group_eqmode(group: list[dict] | None) -> str:
+    """Infer EQ/ALT_AZ mount mode from in-memory group entries."""
+
+    if not group:
+        return "UNKNOWN"
+
+    def _map_eqmode_value(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            upper = text.upper()
+            if upper in {"EQ", "EQUATORIAL"}:
+                return "EQ"
+            if upper in {"ALT_AZ", "ALT-AZ", "ALT AZ", "ALTAZ"}:
+                return "ALT_AZ"
+            try:
+                num = int(float(text))
+            except Exception:
+                return None
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                num = int(value)
+            except Exception:
+                return None
+        elif isinstance(value, bool):
+            num = int(value)
+        else:
+            return None
+        if num == 1:
+            return "EQ"
+        if num == 0:
+            return "ALT_AZ"
+        return None
+
+    def _extract_eqmode(entry: dict) -> str | None:
+        for key in ("MOUNT_MODE", "_eqmode_mode", "EQMODE"):
+            if key in entry:
+                mapped = _map_eqmode_value(entry.get(key))
+                if mapped:
+                    return mapped
+        header = entry.get("header")
+        if isinstance(header, dict):
+            mapped = _map_eqmode_value(header.get("EQMODE"))
+            if mapped:
+                return mapped
+        header_subset = entry.get("header_subset")
+        if isinstance(header_subset, dict):
+            mapped = _map_eqmode_value(header_subset.get("EQMODE"))
+            if mapped:
+                return mapped
+        return None
+
+    first = group[0]
+    if isinstance(first, dict):
+        mapped = _extract_eqmode(first)
+        if mapped:
+            return mapped
+    for entry in group[1:6]:
+        if not isinstance(entry, dict):
+            continue
+        mapped = _extract_eqmode(entry)
+        if mapped:
+            return mapped
+    return "UNKNOWN"
+
+
+def _selftest_infer_group_eqmode() -> bool:
+    """Basic self-test for _infer_group_eqmode; not called in production."""
+
+    cases = [
+        ([{"_eqmode_mode": "EQ"}], "EQ"),
+        ([{"MOUNT_MODE": "ALT_AZ"}], "ALT_AZ"),
+        ([{"header": {"EQMODE": 1}}], "EQ"),
+        ([{"header_subset": {"EQMODE": 0}}], "ALT_AZ"),
+        ([{"foo": "bar"}], "UNKNOWN"),
+    ]
+    for group, expected in cases:
+        got = _infer_group_eqmode(group)
+        if got != expected:
+            raise AssertionError(f"_infer_group_eqmode expected {expected}, got {got}")
+    return True
+
+
 def _path_exists(path: str | os.PathLike | None) -> bool:
     return safe_path_exists(path)
 
@@ -17828,6 +17914,18 @@ def run_hierarchical_mosaic_classic_legacy(
             except Exception:
                 pass
         altaz_cleanup_effective_flag = True
+    else:
+        if altaz_cleanup_effective_flag:
+            warn_msg = "ALTaz cleanup requested but no ALT_AZ frames detected -> disabled (EQ-only run)."
+            try:
+                logger.warning(warn_msg)
+            except Exception:
+                pass
+            try:
+                pcb(warn_msg, prog=None, lvl="WARN")
+            except Exception:
+                pass
+        altaz_cleanup_effective_flag = False
     lecropper_pipeline_flag = (
         bool(_LECROPPER_AVAILABLE) and (quality_crop_requested_flag or altaz_cleanup_effective_flag)
     )
@@ -21383,6 +21481,18 @@ def run_hierarchical_mosaic_classic_legacy(
             def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int, processing_rank: int | None = None) -> None:
                 if cache_retention_mode == "per_tile" and assigned_tile_id not in tile_cache_paths_unique:
                     _register_tile_cache_paths(assigned_tile_id, group_info_list)
+                group_eqmode = _infer_group_eqmode(group_info_list)
+                altaz_cleanup_for_tile = bool(altaz_cleanup_effective_flag) and (group_eqmode == "ALT_AZ")
+                try:
+                    pcb(
+                        f"P3_ALTaz_GATING: tile_id={assigned_tile_id} "
+                        f"eqmode={group_eqmode} global_enabled={bool(altaz_cleanup_effective_flag)} "
+                        f"=> tile_enabled={altaz_cleanup_for_tile}",
+                        prog=None,
+                        lvl="DEBUG_DETAIL",
+                    )
+                except Exception:
+                    pass
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -21397,7 +21507,7 @@ def run_hierarchical_mosaic_classic_legacy(
                     quality_crop_enabled_config, quality_crop_band_px_config,
                     quality_crop_k_sigma_config, quality_crop_margin_px_config,
                     quality_crop_min_run_config,
-                    altaz_cleanup_effective_flag,
+                    altaz_cleanup_for_tile,
                     altaz_margin_percent_config,
                     altaz_decay_config,
                     altaz_nanize_config,
@@ -25618,6 +25728,18 @@ def run_hierarchical_mosaic(
             def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int, processing_rank: int | None = None) -> None:
                 if cache_retention_mode == "per_tile" and assigned_tile_id not in tile_cache_paths_unique:
                     _register_tile_cache_paths(assigned_tile_id, group_info_list)
+                group_eqmode = _infer_group_eqmode(group_info_list)
+                altaz_cleanup_for_tile = bool(altaz_cleanup_enabled_config) and (group_eqmode == "ALT_AZ")
+                try:
+                    pcb(
+                        f"P3_ALTaz_GATING: tile_id={assigned_tile_id} "
+                        f"eqmode={group_eqmode} global_enabled={bool(altaz_cleanup_enabled_config)} "
+                        f"=> tile_enabled={altaz_cleanup_for_tile}",
+                        prog=None,
+                        lvl="DEBUG_DETAIL",
+                    )
+                except Exception:
+                    pass
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -25632,7 +25754,7 @@ def run_hierarchical_mosaic(
                     quality_crop_enabled_config, quality_crop_band_px_config,
                     quality_crop_k_sigma_config, quality_crop_margin_px_config,
                     quality_crop_min_run_config,
-                    altaz_cleanup_enabled_config,
+                    altaz_cleanup_for_tile,
                     altaz_margin_percent_config,
                     altaz_decay_config,
                     altaz_nanize_config,
