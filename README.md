@@ -514,52 +514,121 @@ an inter-process lock:
   (`ZEMOSAIC_ASTAP_RATE_SEC` / `ZEMOSAIC_ASTAP_RATE_BURST`), and automatic retries with back-off
   (`ZEMOSAIC_ASTAP_RETRIES`, `ZEMOSAIC_ASTAP_BACKOFF_SEC`).
 
-🔧 Build & Compilation (Windows) / Compilation (Windows)
+🔧 Build & Compilation (Windows)
+
 🇬🇧 Instructions (English)
-To build the standalone executable version of ZeMosaic, follow these steps:
+1. Install Python 3.13 (x64) from python.org.
+2. From the project root:
 
-Install Python 3.13 from python.org
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   python -m pip install --upgrade pyinstaller
+   pyinstaller --noconfirm --clean ZeMosaic.spec
+   ```
 
-Create and activate a virtual environment (if not already done):
+   The default output is `dist/ZeMosaic/ZeMosaic.exe` (onedir).
 
-powershell
-Copier
-Modifier
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Build the .exe by running:
+3. Optional onefile build:
 
-powershell
-Copier
-Modifier
-compile\build_zemosaic.bat
-The final executable will be created in dist/zemosaic.exe.
+   ```powershell
+   set ZEMOSAIC_BUILD_MODE=onefile
+   set ZEMOSAIC_RUNTIME_TMPDIR=C:\Temp
+   pyinstaller --noconfirm --clean ZeMosaic.spec
+   ```
 
-✅ Translations (locales/*.json) and application icons (icon/zemosaic.ico) are automatically included.
+   Output becomes `dist/ZeMosaic.exe` (onefile).
 
-🇫🇷 Instructions (Français)
-Pour créer l'exécutable autonome de ZeMosaic, suivez ces étapes :
+4. Optional debug build (console ON) for diagnostics:
 
-Installez Python 3.13 depuis python.org
+   ```powershell
+   set ZEMOSAIC_DEBUG_BUILD=1
+   pyinstaller --noconfirm --clean ZeMosaic.spec
+   ```
 
-Créez et activez un environnement virtuel (si ce n’est pas déjà fait) :
+   Clear the env var for release builds (console OFF):
 
-powershell
-Copier
-Modifier
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Lancez la compilation de l’exécutable avec :
+   ```powershell
+   set ZEMOSAIC_DEBUG_BUILD=
+   ```
 
-powershell
-Copier
-Modifier
-compile\build_zemosaic.bat
-L’exécutable final se trouvera dans dist/zemosaic.exe.
+5. Helper script (uses the same spec):
 
-✅ Les fichiers de traduction (locales/*.json) et les icônes (icon/zemosaic.ico) sont inclus automatiquement.
+   ```powershell
+   compile\compile_zemosaic._win.bat
+   ```
+
+Notes:
+- Resources `locales/`, `icon/`, and `gif/` are bundled via `ZeMosaic.spec`.
+- Keep `PySide6` installed if you want the Qt GUI in the packaged build; otherwise the Tk GUI is used.
+- `matplotlib` is optional: if missing, the Qt filter preview is disabled.
+- `cupy-cuda12x` is optional: if missing (or if NVIDIA drivers are missing/incompatible, or if required CUDA DLLs are not present on the target machine), ZeMosaic falls back to CPU. On Windows this often means having CUDA Toolkit (or at least its runtime DLLs) available via `%CUDA_PATH%\\bin`/`PATH`.
+- Prefer onedir for reliability; onefile can hit Windows path length issues (example: Shapely `WinError 206`), mitigated by using a short `ZEMOSAIC_RUNTIME_TMPDIR` like `C:\Temp` and/or enabling long paths in Windows.
+
+Mini smoke-test (packaged build):
+- Launch `dist/ZeMosaic/ZeMosaic.exe` (or `dist/ZeMosaic.exe` in onefile mode).
+- Confirm the UI starts without crash and icons load (window icon / toolbar icons).
+- Switch language (if available) to confirm `locales/` loads.
+- Pick an input folder and start a small run to confirm the worker starts and writes output.
+
+🇫🇷 Instructions (Francais)
+1. Installez Python 3.13 (x64) depuis python.org.
+2. Depuis la racine du projet :
+
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   python -m pip install --upgrade pyinstaller
+   pyinstaller --noconfirm --clean ZeMosaic.spec
+   ```
+
+   La sortie par défaut est `dist/ZeMosaic/ZeMosaic.exe` (onedir).
+
+3. Build onefile optionnel :
+
+   ```powershell
+   set ZEMOSAIC_BUILD_MODE=onefile
+   set ZEMOSAIC_RUNTIME_TMPDIR=C:\Temp
+   pyinstaller --noconfirm --clean ZeMosaic.spec
+   ```
+
+   La sortie devient `dist/ZeMosaic.exe` (onefile).
+
+4. Build debug optionnel (console ON) pour diagnostiquer :
+
+   ```powershell
+   set ZEMOSAIC_DEBUG_BUILD=1
+   pyinstaller --noconfirm --clean ZeMosaic.spec
+   ```
+
+   Remettez l'env var a vide pour la release (console OFF) :
+
+   ```powershell
+   set ZEMOSAIC_DEBUG_BUILD=
+   ```
+
+5. Script helper (meme spec) :
+
+   ```powershell
+   compile\compile_zemosaic._win.bat
+   ```
+
+Notes :
+- Les ressources `locales/`, `icon/`, et `gif/` sont embarquees via `ZeMosaic.spec`.
+- Gardez `PySide6` installe si vous voulez l'interface Qt ; sinon l'interface Tk est utilisee.
+- `matplotlib` est optionnel : s'il manque, l'aperçu (Qt filter preview) est désactivé.
+- `cupy-cuda12x` est optionnel : s'il manque (ou si les drivers NVIDIA sont absents/incompatibles, ou si les DLL CUDA nécessaires ne sont pas présentes sur la machine cible), ZeMosaic retombe en CPU. Sous Windows cela implique souvent CUDA Toolkit (ou au minimum ses DLL runtime) accessibles via `%CUDA_PATH%\\bin`/`PATH`.
+- Préférez onedir pour la fiabilité ; onefile peut déclencher des soucis de longueur de chemin Windows (ex: Shapely `WinError 206`), atténués via un `ZEMOSAIC_RUNTIME_TMPDIR` court comme `C:\Temp` et/ou l'activation des long paths dans Windows.
+
+Mini smoke-test (build packagé) :
+- Lancez `dist/ZeMosaic/ZeMosaic.exe` (ou `dist/ZeMosaic.exe` en onefile).
+- Vérifiez que l'UI démarre sans crash et que les icônes se chargent (icône fenêtre / toolbar).
+- Changez la langue (si dispo) pour confirmer le chargement de `locales/`.
+- Choisissez un dossier d'entrée et lancez un petit run pour valider le démarrage du worker et l'écriture de sortie.
 
 🛠️ Build & Compilation (macOS/Linux)
 🇬🇧 Instructions (English)

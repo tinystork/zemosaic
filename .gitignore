@@ -39,6 +39,7 @@ compile/installnotes.txt   # note d’installation produite par le script
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!ZeMosaic.spec
 
 # Installer logs
 pip-log.txt
@@ -196,4 +197,3 @@ example/
 # === ZeMosaic: outils locaux non versionnés ===
 tools/
 agents/
-
