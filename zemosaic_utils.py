@@ -3371,11 +3371,30 @@ def crop_image_and_wcs(
             # CRPIX est 1-based dans le header FITS, mais l'attribut .wcs.crpix d'un objet WCS Astropy
             # est généralement interprété comme 1-based pour la manipulation via l'API haut niveau.
             # Lorsqu'on soustrait, on soustrait le nombre de pixels rognés du côté "origine" (gauche/bas).
-            new_crpix1 = cropped_wcs_obj.wcs.crpix[0] - dw
-            new_crpix2 = cropped_wcs_obj.wcs.crpix[1] - dh
+            old_crpix1 = cropped_wcs_obj.wcs.crpix[0]
+            old_crpix2 = cropped_wcs_obj.wcs.crpix[1]
+            new_crpix1 = old_crpix1 - dw
+            new_crpix2 = old_crpix2 - dh
             # Clamp to positive values to avoid invalid WCS after heavy cropping
-            new_crpix1 = max(new_crpix1, 1.0)
-            new_crpix2 = max(new_crpix2, 1.0)
+            clamped_crpix1 = max(new_crpix1, 1.0)
+            clamped_crpix2 = max(new_crpix2, 1.0)
+            if clamped_crpix1 != new_crpix1 or clamped_crpix2 != new_crpix2:
+                _pcb_crop(
+                    (
+                        "CropUtil: CRPIX clamped (old=({old1},{old2}), "
+                        "raw_new=({raw1},{raw2}), clamped=({new1},{new2}))"
+                    ).format(
+                        old1=old_crpix1,
+                        old2=old_crpix2,
+                        raw1=new_crpix1,
+                        raw2=new_crpix2,
+                        new1=clamped_crpix1,
+                        new2=clamped_crpix2,
+                    ),
+                    level="WARN",
+                )
+            new_crpix1 = clamped_crpix1
+            new_crpix2 = clamped_crpix2
             cropped_wcs_obj.wcs.crpix = [new_crpix1, new_crpix2]
         else:
             # Ce cas est peu probable si c'est un WCS valide, mais par sécurité.

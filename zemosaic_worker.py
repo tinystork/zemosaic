@@ -12740,6 +12740,10 @@ def create_master_tile(
     )
     auto_pad_used = False
     orig_hw = None
+    aligned_hw = None
+    pad_left = 0
+    pad_top = 0
+    pad_hw_note = None
     try:
         if 0 <= ref_loaded_idx < len(tile_images_data_HWC_adu):
             ref_img = tile_images_data_HWC_adu[ref_loaded_idx]
@@ -12754,7 +12758,6 @@ def create_master_tile(
     except Exception:
         auto_pad_used = False
     if auto_pad_used:
-        aligned_hw = None
         try:
             for aligned_img in aligned_images_for_stack:
                 if isinstance(aligned_img, np.ndarray) and aligned_img.ndim >= 2:
@@ -12770,6 +12773,70 @@ def create_master_tile(
             orig_hw=orig_hw,
             aligned_hw=aligned_hw,
         )
+        if orig_hw and aligned_hw:
+            try:
+                pad_top = max(0, (aligned_hw[0] - orig_hw[0]) // 2)
+                pad_left = max(0, (aligned_hw[1] - orig_hw[1]) // 2)
+            except Exception:
+                pad_top = 0
+                pad_left = 0
+            if pad_left or pad_top:
+                pad_hw_note = f"{orig_hw[0]},{orig_hw[1]}->{aligned_hw[0]},{aligned_hw[1]}"
+                wcs_copy = None
+                try:
+                    if wcs_for_master_tile is not None:
+                        if hasattr(wcs_for_master_tile, "deepcopy"):
+                            wcs_copy = wcs_for_master_tile.deepcopy()
+                        else:
+                            wcs_copy = copy.deepcopy(wcs_for_master_tile)
+                except Exception:
+                    wcs_copy = None
+                if wcs_copy is not None and hasattr(wcs_copy, "wcs") and hasattr(wcs_copy.wcs, "crpix"):
+                    crpix_old = None
+                    crpix_new = None
+                    try:
+                        crpix_old = (float(wcs_copy.wcs.crpix[0]), float(wcs_copy.wcs.crpix[1]))
+                    except Exception:
+                        crpix_old = None
+                    try:
+                        wcs_copy.wcs.crpix[0] += pad_left
+                        wcs_copy.wcs.crpix[1] += pad_top
+                        crpix_new = (float(wcs_copy.wcs.crpix[0]), float(wcs_copy.wcs.crpix[1]))
+                    except Exception:
+                        crpix_new = None
+                    else:
+                        try:
+                            aligned_h, aligned_w = aligned_hw
+                            if hasattr(wcs_copy, "pixel_shape"):
+                                wcs_copy.pixel_shape = (aligned_w, aligned_h)
+                            if hasattr(wcs_copy, "array_shape"):
+                                wcs_copy.array_shape = (aligned_h, aligned_w)
+                        except Exception:
+                            pass
+                        wcs_for_master_tile = wcs_copy
+                        pcb_tile(
+                            (
+                                "MT_WCS_PAD: applied dx={dx}, dy={dy}, "
+                                "orig_hw={orig_hw}, padded_hw={padded_hw}, "
+                                "crpix_old={crpix_old}, crpix_new={crpix_new}"
+                            ).format(
+                                dx=pad_left,
+                                dy=pad_top,
+                                orig_hw=orig_hw,
+                                padded_hw=aligned_hw,
+                                crpix_old=crpix_old,
+                                crpix_new=crpix_new,
+                            ),
+                            prog=None,
+                            lvl="INFO",
+                            tile_id=tile_id,
+                            pad_left=pad_left,
+                            pad_top=pad_top,
+                            orig_hw=orig_hw,
+                            aligned_hw=aligned_hw,
+                            crpix_old=crpix_old,
+                            crpix_new=crpix_new,
+                        )
     if failed_alignment_indices:
         retry_group: list[dict] = []
         for idx_fail in failed_alignment_indices:
@@ -13634,6 +13701,12 @@ def create_master_tile(
         header_mt_save['ZMT_NRAW']=(len(seestar_stack_group_info),'Raw frames in this tile group')
         header_mt_save['ZMT_NALGN']=(num_actually_aligned_for_header,'Successfully aligned frames for stack')
         header_mt_save['MT_NFRAMES'] = (int(num_actually_aligned_for_header), 'Frames stacked into this master tile')
+        if pad_left or pad_top:
+            header_mt_save['ZMT_PAD'] = (True, 'Auto-pad applied during alignment')
+            header_mt_save['ZMT_PADX'] = (int(pad_left), 'Auto-pad left offset (px)')
+            header_mt_save['ZMT_PADY'] = (int(pad_top), 'Auto-pad top offset (px)')
+            if pad_hw_note:
+                header_mt_save['ZMT_PADHW'] = (pad_hw_note, 'Auto-pad H,W -> H,W')
         header_mt_save['ZMT_NORM'] = (str(stack_norm_method), 'Normalization method')
         header_mt_save['ZMT_WGHT'] = (str(stack_weight_method), 'Weighting method')
         if apply_radial_weight: # Log des paramètres radiaux

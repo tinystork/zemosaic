@@ -1,48 +1,68 @@
-zemosaic/
-│
-├── CHANGELOG.md                  # Historique des évolutions utilisateur
-├── README.md                     # Présentation et instructions générales
-├── agent.md                      # Consignes opérationnelles pour l'agent
-├── followup.md                   # Journal de progression du portage Qt
-├── requirements.txt              # Dépendances principales et optionnelles
-├── run_zemosaic.py               # Point d'entrée sélectionnant Tk ou Qt
-├── structure.txt                 # Ce fichier : cartographie du dépôt
-├── astap_docs.html               # Documentation intégrée sur ASTAP
-├── quality_manifest.json         # Indicateurs de qualité regroupés
-├── solver_settings.py            # Objet de configuration ASTAP haut-niveau
-├── solver_settings.json          # Paramètres ASTAP sérialisés
-├── __init__.py                   # Initialise le package racine
-├── cuda_utils.py                 # Utilitaires CUDA partagés (compatibilité)
-├── diagnose.py                   # Script de diagnostic d'installation
-├── lecropper.py                  # Logique de recadrage/Alt-Az existante
-├── zemosaic_align_stack.py       # Fonctions d'alignement et d'empilement
-├── zemosaic_astrometry.py        # Intégration ASTAP / résolution WCS
-├── zemosaic_config.py            # Chargement et persistance de la config
-├── zemosaic_filter_gui.py        # Interface filtre (implémentation Tk)
-├── zemosaic_filter_gui_qt.py     # Interface filtre PySide6
-├── zemosaic_gui.py               # Interface graphique principale Tk
-├── zemosaic_gui_qt.py            # Interface graphique principale PySide6
-├── zemosaic_utils.py             # Fonctions utilitaires communes
-├── zemosaic_worker.py            # Orchestrateur de traitement mosaïque
-├── zequalityMT.py                # Outils qualité multi-thread
-├── zewcscleaner.py               # Nettoyage des métadonnées WCS
-│
-├── compile/                      # Scripts de packaging multiplateformes
-│   ├── build_zemosaic_posix.sh   # Construction pour Linux/macOS
-│   └── compile_zemosaic._win.bat # Construction pour Windows
-│
-├── core/                         # Modules partagés par les interfaces
-│   ├── __init__.py
-│   ├── cuda_utils.py             # Détection GPU pour interfaces
-│   └── tk_safe.py                # Aides Tk thread-safe
-│
-├── icon/                         # Ressources graphiques embarquées
-│   ├── zemosaic.ico
-│   ├── zemosaic_64x64.png
-│   └── zemosaic_icon.png
-│
-└── locales/                      # Internationalisation
-    ├── __init__.py
-    ├── en.json                   # Traductions anglaises
-    ├── fr.json                   # Traductions françaises
-    └── zemosaic_localization.py  # Utilitaire de localisation
+f:\\seescan\\env\\zemosaic\\
+├───__init__.py
+├───.gitignore
+├───agent.md
+├───astap_docs.html
+├───CHANGELOG.md
+├───compare_cpu_gpu_stack.py
+├───cuda_utils.py
+├───detect_pyside.py
+├───diagnose.py
+├───followup.md
+├───grid_mode.py
+├───lecropper.py
+├───parallel_utils.py
+├───quality_manifest.json
+├───README.md
+├───requirements.txt
+├───run_zemosaic.py
+├───solver_settings.json
+├───solver_settings.py
+├───structure.txt
+├───zemosaic_align_stack_gpu.py
+├───zemosaic_align_stack.py
+├───zemosaic_astrometry.py
+├───zemosaic_config.py
+├───zemosaic_filter_gui_qt.py
+├───zemosaic_filter_gui.py
+├───zemosaic_gpu_safety.py
+├───zemosaic_gui_qt.py
+├───zemosaic_gui.py
+├───zemosaic_resource_telemetry.py
+├───zemosaic_stack_core.py
+├───zemosaic_time_utils.py
+├───zemosaic_utils.py
+├───zemosaic_worker.py
+├───zequalityMT.py
+├───zewcscleaner.py
+├───compile\
+│   ├───build_zemosaic_posix.sh
+│   └───compile_zemosaic._win.bat
+├───core\
+│   ├───__init__.py
+│   ├───cuda_utils.py
+│   ├───path_helpers.py
+│   ├───robust_rejection.py
+│   └───tk_safe.py
+├───gif\
+│   ├───opening.gif
+│   └───wait_animation.gif.gif
+├───icon\
+│   ├───zemosaic_64x64.png
+│   ├───zemosaic_icon.png
+│   └───zemosaic.ico
+├───locales\
+│   ├───__init__.py
+│   ├───de.json
+│   ├───en.json
+│   ├───es.json
+│   ├───fr.json
+│   ├───is.json
+│   ├───nl.json
+│   ├───pl.json
+│   └───zemosaic_localization.py
+└───tests\
+    ├───test_empty_master_tile_guard.py
+    ├───test_gpu_safety_hybrid_guard.py
+    ├───test_winsor_nan_safe.py
+    └───test_wsc_pixinsight.py
