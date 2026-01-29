@@ -15,6 +15,7 @@ import logging
 import math
 import multiprocessing
 import os
+import traceback
 
 try:
     import psutil  # type: ignore
@@ -25,11 +26,22 @@ try:
     import cupy as cp  # type: ignore
 
     _CUPY_AVAILABLE = True
-except Exception:  # pragma: no cover - GPU libraries missing
+    _CUPY_IMPORT_ERROR: str | None = None
+    _CUPY_IMPORT_CAUSE: str | None = None
+    _CUPY_IMPORT_CONTEXT: str | None = None
+    _CUPY_IMPORT_TRACE: str | None = None
+except Exception as exc:  # pragma: no cover - GPU libraries missing
     cp = None
     _CUPY_AVAILABLE = False
+    _CUPY_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+    _CUPY_IMPORT_CAUSE = repr(exc.__cause__) if exc.__cause__ else None
+    _CUPY_IMPORT_CONTEXT = repr(exc.__context__) if exc.__context__ else None
+    _CUPY_IMPORT_TRACE = traceback.format_exc()
+
+_CUPY_LOGGED = False
 
 LOGGER = logging.getLogger(__name__)
+WORKER_LOGGER_NAME = "ZeMosaicWorker"
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -47,6 +59,36 @@ def _clamp(value: float, low: float, high: float, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return float(min(high, max(low, numeric)))
+
+
+def _log_gpu_probe_info(message: str, *args: Any) -> None:
+    """Log GPU probe diagnostics to both module logger and worker logger."""
+
+    try:
+        LOGGER.info(message, *args)
+    except Exception:
+        pass
+    try:
+        worker_logger = logging.getLogger(WORKER_LOGGER_NAME)
+        if worker_logger is not LOGGER:
+            worker_logger.info(message, *args)
+    except Exception:
+        pass
+
+
+def _log_cuda_env_info() -> None:
+    cuda_path = os.environ.get("CUDA_PATH")
+    cuda_bin = os.path.join(cuda_path, "bin") if cuda_path else None
+    cuda_bin_exists = bool(cuda_bin and os.path.isdir(cuda_bin))
+    path_env = os.environ.get("PATH", "")
+    cuda_bin_in_path = bool(cuda_bin and path_env and cuda_bin.lower() in path_env.lower())
+    _log_gpu_probe_info(
+        "GPU probe: CUDA_PATH=%s CUDA_BIN=%s (exists=%s in_PATH=%s)",
+        cuda_path,
+        cuda_bin,
+        cuda_bin_exists,
+        cuda_bin_in_path,
+    )
 
 
 def _extract_config(config: Mapping[str, Any] | None, key: str, default: Any) -> Any:
@@ -108,10 +150,32 @@ def _probe_gpu() -> Tuple[bool, str | None, int | None, int | None]:
     """Return ``(available, name, total_bytes, free_bytes)``."""
 
     if not _CUPY_AVAILABLE:
+        global _CUPY_LOGGED
+        if not _CUPY_LOGGED:
+            _CUPY_LOGGED = True
+            if _CUPY_IMPORT_ERROR:
+                _log_gpu_probe_info("GPU probe: CuPy unavailable (%s).", _CUPY_IMPORT_ERROR)
+            else:
+                _log_gpu_probe_info("GPU probe: CuPy unavailable.")
+            if _CUPY_IMPORT_CAUSE:
+                _log_gpu_probe_info("GPU probe: CuPy import cause: %s", _CUPY_IMPORT_CAUSE)
+            if _CUPY_IMPORT_CONTEXT:
+                _log_gpu_probe_info("GPU probe: CuPy import context: %s", _CUPY_IMPORT_CONTEXT)
+            if _CUPY_IMPORT_TRACE:
+                _log_gpu_probe_info("GPU probe: CuPy import traceback:\n%s", _CUPY_IMPORT_TRACE)
+            _log_cuda_env_info()
         return False, None, None, None
     try:
-        cp.cuda.runtime.getDeviceCount()
-    except Exception:
+        device_count = cp.cuda.runtime.getDeviceCount()
+    except Exception as exc:
+        _log_gpu_probe_info(
+            "GPU probe: CuPy runtime getDeviceCount failed (%s: %s).",
+            type(exc).__name__,
+            exc,
+        )
+        return False, None, None, None
+    if device_count <= 0:
+        _log_gpu_probe_info("GPU probe: CuPy reports 0 CUDA devices.")
         return False, None, None, None
 
     try:
@@ -124,6 +188,7 @@ def _probe_gpu() -> Tuple[bool, str | None, int | None, int | None]:
         gpu_name = props.get("name", "").strip() or None
         total_bytes = _safe_int(props.get("totalGlobalMem"), None)
     except Exception:
+        _log_gpu_probe_info("GPU probe: failed to read CUDA device properties.")
         gpu_name = None
         total_bytes = None
 
@@ -132,6 +197,7 @@ def _probe_gpu() -> Tuple[bool, str | None, int | None, int | None]:
         free_bytes, _ = cp.cuda.runtime.memGetInfo()
         free_bytes = int(free_bytes)
     except Exception:
+        _log_gpu_probe_info("GPU probe: failed to read CUDA memory info.")
         free_bytes = None
 
     available = True if gpu_name or total_bytes else True

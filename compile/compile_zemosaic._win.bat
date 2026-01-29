@@ -45,6 +45,15 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install --upgrade pyinstaller pyinstaller-hooks-contrib
 
+REM Optional: install CuPy package for GPU-enabled builds.
+REM Example: set ZEMOSAIC_CUPY_PKG=cupy-cuda12x before running this script.
+if not "%ZEMOSAIC_CUPY_PKG%"=="" (
+  echo [INFO] Installing CuPy package: %ZEMOSAIC_CUPY_PKG%
+  python -m pip install "%ZEMOSAIC_CUPY_PKG%"
+) else (
+  echo [INFO] CuPy package not specified; GPU support will be disabled in the build.
+)
+
 REM Clean build outputs
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist

@@ -14,8 +14,14 @@ delvewheel patch becomes a no-op because `shapely.libs` is absent.
 
 from __future__ import annotations
 
+from importlib.util import find_spec
+
 from PyInstaller.utils.hooks import collect_dynamic_libs
 
 # Place all collected DLLs under `shapely/` instead of `shapely.libs/`.
 binaries = [(src, "shapely") for (src, _dest) in collect_dynamic_libs("shapely")]
 
+hiddenimports = []
+for name in ("shapely._geos", "shapely._geos_c", "shapely._geos_c_api"):
+    if find_spec(name) is not None:
+        hiddenimports.append(name)
