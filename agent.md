@@ -1,95 +1,204 @@
-# Mission: Add final-mosaic DBE (Dynamic Background Extraction) option (default ON)
+# agent.md — ZeMosaic DBE v2 (Presets + Surface Fit)
 
-## Meta (MANDATORY for Codex)
-- You MUST update `memory.md` at the end of EACH iteration/PR.
-- `memory.md` must include:
-  - What changed (files + functions)
-  - Why (intent / bug avoided)
-  - How tested (manual runs + what to look for)
-  - Any known limitations / TODOs
-  - Next step (if unfinished)
+## Objectif
+Finaliser le mode **DBE (Dynamic Background Extraction)** appliqué sur la **mosaïque finale** (Phase 6), en ajoutant :
+1) Un sélecteur de force **Weak / Normal / Strong** dans le **GUI Qt** (simple, visible).
+2) La persistance en config de 4 paramètres avancés :
+   - `obj_k` (seuil objets)
+   - `obj_dilate_px` (dilatation masque)
+   - `sample_step` (pas de la grille d’échantillonnage)
+   - `smoothing` (rigidité du modèle de fond)
 
-## Goal
-Add a checkbox in the GUI under "Final assembly & output" (enabled by default) that enables a global DBE-like background extraction on the FINAL mosaic right before export.
+3) Une implémentation DBE plus qualitative : au lieu d’un simple flou gaussien low-res, construire un **modèle de fond par surface** à partir d’**échantillons de fond** (masque d’objets) sur l’image sous-échantillonnée, via une interpolation/approximation **RBF (thin-plate) lissée** ou spline (RBF recommandé pour démarrer).
 
-DBE must reduce large-scale gradients for multi-instrument / mixed Bortle datasets **without introducing seams**.
+Le DBE doit rester **safe**, **robuste** et **sans régression** (SDS, grid mode, pipeline global).
 
-## Scope (files)
-- zemosaic_gui.py
-- zemosaic_worker.py
-- (optional helper) zemosaic_utils.py
-- (optional) locales/*.json for UI translation key
-- NOTE: Grid mode may require a small hook in grid_mode.py IF it bypasses zemosaic_worker Phase 6 saving.
+---
 
-## Constraints / Guardrails
-- NO regression for:
-  - SDS mode
-  - grid mode
-  - classic mode
-- Do NOT touch/alter batch-size behaviors
-- Must be safe for large mosaics (memory-aware). Prefer downsampled model + per-channel application.
-- Must preserve existing export behavior (FITS, ALPHA extension).
-- Fail-open: if DBE fails for any reason, log WARN and continue without DBE.
-- When DBE is OFF: output should be identical to baseline (avoid accidental dtype conversions/copies).
+## Contraintes non négociables
+- **Aucune régression** sur : SDS mode, grid mode, classic mode.
+- `final_mosaic_dbe_enabled` est considéré comme **déjà implémenté** ; vérifier en code qu’il est bien présent/utilisé avant toute suite.
+- En cas de doute sur un item, **vérifier d'abord s'il est déjà fait** dans le code, puis cocher la checklist au lieu de réimplémenter.
+- DBE ne doit pas exploser la mémoire : conserver l’approche **par canal** (pas de buffer H×W×3 pour le modèle).
+- DBE doit être **fail-safe** :
+  - ordre obligatoire: `RBF` -> `gaussien` -> `skip DBE` (sans crash).
+  - si SciPy indisponible / fit RBF échoue / trop peu d’échantillons: tenter gaussien.
+  - si le fallback gaussien échoue aussi: skip DBE.
+  - le mode `DEBUG` doit expliciter la raison et l’étape de fallback.
+- Garder les logs DBE existants et les enrichir (sans spam INFO inutile).
+- **IMPORTANT : mettre à jour `memory.md` à CHAQUE itération**, en notant :
+  - ce qui est fait, fichiers modifiés,
+  - décisions (valeurs presets, limites),
+  - ce qui reste à faire,
+  - comment reproduire/tester.
 
-## Implementation Plan
+---
 
-### 0) Decide WHERE to apply DBE (important)
-- Classic + SDS paths: apply DBE **in zemosaic_worker.py Phase 6**, immediately after the `P6_PRE_EXPORT` debug stats block (search `_dbg_rgb_stats("P6_PRE_EXPORT", ...)`), and right before any disk writing (FITS/PNG).
-- Grid mode: confirm whether grid mode uses the same Phase 6 save path. If grid mode saves inside `grid_mode.py`, add a small hook there right before saving the final mosaic (same helper, same config flag). If unsure, log an INFO once: `[DBE] grid_mode: bypassing worker Phase 6, applying in grid_mode`.
+## État actuel (à respecter)
+- DBE actuel : `_apply_final_mosaic_dbe_per_channel()` dans `zemosaic_worker.py` (flou gaussien low-res).
+- Appel DBE en phase 6 dans `zemosaic_worker.py` (il y a 2 blocs quasi identiques → il faudra patcher les deux).
+- GUI Qt : checkbox déjà présente : `final_mosaic_dbe_enabled` dans `zemosaic_gui_qt.py`.
+- Scope GUI: **Qt uniquement** (`zemosaic_gui_qt.py`). Ne pas considérer `zemosaic_gui.py` pour cette mission.
 
-### 1) GUI (zemosaic_gui.py)
-- Add Tk var:
-  - `self.final_mosaic_dbe_var = tk.BooleanVar(default=self.config.get("final_mosaic_dbe_enabled", True))`
-- Add Checkbutton inside `final_assembly_options_frame`:
-  - label: "Dynamic Background Extraction (DBE) on final mosaic"
-  - default ON
-  - store in translatable_widgets with key `final_mosaic_dbe_label` (optional)
-- When starting processing (where config keys are persisted), save:
-  - `self.config["final_mosaic_dbe_enabled"] = bool(self.final_mosaic_dbe_var.get())`
-  - `zemosaic_config.save_config(self.config)`
+---
 
-### 2) Worker integration (zemosaic_worker.py)
-- In Phase 6, after `P6_PRE_EXPORT` stats and BEFORE writing files:
-  - read config:
-    - `enabled = bool(getattr(zconfig, "final_mosaic_dbe_enabled", True))`
-  - guard: only apply if `final_mosaic_data_HWC` is numpy HWC RGB (`ndim==3` and `shape[-1]==3`)
-  - validity mask priority:
-    1) `alpha_final > 0` if available (uint8)
-    2) `final_mosaic_coverage_HW > 0` if available
-    3) fallback: `np.isfinite(final_mosaic_data_HWC[...,0])` (or any-channel finite)
-  - log (INFO):
-    - `[DBE] enabled=True ds_factor=<int> obj_k=<float> blur_sigma=<float> masked_frac=<float> valid_frac=<float> time_ms=<int>`
-  - write FITS header flags (only if applied):
-    - `ZMDBE = T`
-    - `ZMDBE_DS = <int>`
-    - `ZMDBE_K = <float>`
-    - `ZMDBE_SIG = <float>`
+## Spécification UI (Qt)
+### 1) Ajout d’un preset “DBE Strength”
+Dans `zemosaic_gui_qt.py`, section “Final assembly and output” (près de la checkbox DBE) :
+- Ajouter un **QComboBox** “DBE strength” avec :
+  - Weak
+  - Normal
+  - Strong
+- Le preset doit être **désactivé** si `final_mosaic_dbe_enabled` est décoché.
+- Valeur par défaut : **Normal**.
+- `Custom` est réservé aux **power users** via édition JSON (pas d’exposition GUI).
 
-### 3) DBE algorithm (robust, cheap, memory-aware)
-Implement as a helper (recommended in zemosaic_utils.py): `apply_final_mosaic_dbe(...)`
+### 2) Paramètres avancés (config uniquement)
+Conserver en config les 4 paramètres :
+- `final_mosaic_dbe_obj_k` (float)
+- `final_mosaic_dbe_obj_dilate_px` (int)
+- `final_mosaic_dbe_sample_step` (int)
+- `final_mosaic_dbe_smoothing` (float)
 
-Requirements:
-- Work in float32 internally. Do not blow RAM by allocating a full HWC background buffer.
-- Compute a downsample factor so the working image longest side <= 1024 px.
-- Build object mask on downsampled luminance:
-  - sigma via MAD: `sigma = 1.4826 * MAD`
-  - threshold: `median + k*sigma` with default `k = 3.0`
-  - dilate mask lightly (kernel 3–7) to include star halos
-- Fill masked pixels with background median (so blur does not “eat” stars/galaxies).
-- Estimate smooth background on downsampled image:
-  - use `cv2.GaussianBlur` with large `sigma` (default ~32 at downsampled scale)
-- Upsample background to full resolution and subtract **per-channel**:
-  - For c in (R,G,B):
-    - downsample channel -> mask -> blur -> upsample -> subtract into mosaic[...,c] only on valid pixels
-- Preserve invalid regions:
-  - Do not alter pixels where validity mask is False (keep NaN / untouched).
-- If cv2 is missing or any step fails: warn + skip (fail-open).
+Le GUI ne montre que les options Weak/Normal/Strong.  
+Le mode `custom` reste supporté côté worker/config si `final_mosaic_dbe_strength="custom"` est défini dans le JSON.
 
-## Acceptance criteria
-- Checkbox appears in GUI, default ON.
-- With DBE ON: gradients reduced on a test mosaic (no obvious seams introduced).
-- With DBE OFF: output should be identical to baseline (no unintended conversions).
-- No crashes in SDS/grid/classic, and ALPHA extension still written.
-- If DBE errors occur: a WARN log is emitted and export still completes.
-- `memory.md` updated every iteration.
+---
+
+## Mapping des presets (valeurs initiales proposées)
+Ces valeurs sont sur l’image **low-res** (après downsample).
+
+- Weak:
+  - obj_k = 4.0
+  - obj_dilate_px = 2
+  - sample_step = 32
+  - smoothing = 1.0
+
+- Normal (default):
+  - obj_k = 3.0
+  - obj_dilate_px = 3
+  - sample_step = 24
+  - smoothing = 0.6
+
+- Strong:
+  - obj_k = 2.2
+  - obj_dilate_px = 4
+  - sample_step = 16
+  - smoothing = 0.25
+
+- Custom:
+  - utilise strictement les valeurs en config.
+
+Note : `obj_k` plus bas = masque d’objets plus agressif.
+`smoothing` plus bas = surface plus flexible (plus proche des points).
+
+---
+
+## Implémentation DBE v2 (Worker)
+### Objectif
+Remplacer/améliorer le modèle de fond gaussien par un modèle “surface-fit” :
+1) Downsample (déjà fait via ds_factor).
+2) Construire un masque “background only” en low-res :
+   - stats robustes sur pixels valides : median + MAD
+   - seuil objets : `thr = median + obj_k * (1.4826 * MAD)`
+   - `object_mask = channel_lr > thr`
+   - dilatation : `obj_dilate_px` (cv2.dilate ou équivalent)
+   - `bg_mask = valid_lr & ~object_mask_dilated`
+
+3) Échantillonnage du fond sur une grille régulière :
+   - pas `sample_step`
+   - pour chaque point de grille, prendre la **médiane** des pixels dans une petite fenêtre locale (p.ex. rayon = sample_step//2), uniquement où `bg_mask` est True
+   - collecter (x, y, value)
+
+4) Fit d’une surface lissée :
+   - SciPy recommandé : `scipy.interpolate.Rbf(xs, ys, zs, function="thin_plate", smooth=smoothing)`
+   - évaluer sur la grille low-res complète → `bg_lr`
+   - upsample `bg_lr` vers full-res
+   - soustraire sur les pixels valides
+
+### Performance / garde-fous obligatoires
+- Limiter le nombre de points : `max_samples = 2000` (ou 3000 max).
+  - si dépasse : augmenter automatiquement `sample_step` OU sous-échantillonner les points (random stable).
+- Si `n_samples < 30` (ou < 50) : fallback gaussien (méthode actuelle).
+- Si SciPy absent ou fit échoue : fallback gaussien.
+- Si fallback gaussien échoue : skip DBE (fail-open), sans crash.
+- Conserver traitement **par canal**.
+
+### API / signatures
+Dans `zemosaic_worker.py` :
+- Étendre `_apply_final_mosaic_dbe_per_channel(... )` avec :
+  - `obj_dilate_px: int`
+  - `sample_step: int`
+  - `smoothing: float`
+  - `strength: str` (ou `preset`)
+  - (optionnel) `method: str = "surface_rbf"` et fallback `"gaussian"`
+
+Ou créer une nouvelle fonction `_apply_final_mosaic_dbe_surface_per_channel()` et garder l’ancienne pour fallback.
+
+### Lecture config au hook Phase 6
+Dans les 2 blocs Phase 6 (les 2 occurrences) :
+- Lire :
+  - `final_mosaic_dbe_strength` (default "normal")
+  - si "custom" → lire les 4 paramètres en config
+  - sinon → utiliser mapping preset
+- Passer ces paramètres à la fonction DBE.
+
+---
+
+## Logs + FITS header
+### Logs
+Enrichir le log “[DBE] applied=True …” pour inclure :
+- preset/strength
+- obj_k, obj_dilate_px, sample_step, smoothing
+- n_samples (par canal ou total)
+- model utilisé : `rbf_thin_plate` ou `gaussian_fallback`
+- En `DEBUG`, tracer explicitement les transitions de fallback:
+  - `rbf_failed -> gaussian_fallback`
+  - `gaussian_failed -> dbe_skipped`
+
+### Header FITS (optionnel mais utile)
+Garder existants : `ZMDBE`, `ZMDBE_DS`, `ZMDBE_K` (+ éventuellement `ZMDBE_SIG` si fallback gaussien).
+Ajouter (si appliqué) :
+- `ZMDBE_STR` (weak/normal/strong/custom)
+- `ZMDBE_DIL` (int)
+- `ZMDBE_STP` (int)
+- `ZMDBE_SMO` (float)
+- `ZMDBE_MDL` ("rbf_thin_plate" / "gaussian")
+
+---
+
+## Fichiers à modifier (scope)
+- `zemosaic_worker.py` (DBE algo + hook phase6 x2)
+- `zemosaic_gui_qt.py` (UI presets Weak/Normal/Strong uniquement)
+- `zemosaic_config.py` (defaults)
+- `memory.md` (OBLIGATOIRE à chaque itération)
+- Ne pas modifier `zemosaic_gui.py` dans ce scope.
+
+---
+
+## Tests / validation (smoke tests)
+Tests exécutés manuellement par l’utilisateur sur dataset réduit.
+
+1) DBE ON :
+   - pas de crash
+   - logs DBE présents avec les nouveaux champs
+2) DBE OFF :
+   - pas de logs “applied=True”
+3) Basculer preset Weak/Normal/Strong :
+   - vérifier que la config persiste
+   - vérifier que le worker reçoit bien des valeurs différentes (logs)
+4) Forcer SciPy indisponible (si possible) ou simuler exception :
+   - vérifier fallback gaussien sans crash
+   - si gaussien échoue aussi, vérifier skip DBE + trace `DEBUG`
+
+---
+
+## Mise à jour memory.md (impératif)
+À chaque itération, ajouter une section datée :
+- ✅ Faits (liste)
+- 🔧 Fichiers modifiés
+- 🧪 Tests effectués + résultats
+- ⚠️ Limitations connues
+- ⏭️ Next steps
+
+Fin.

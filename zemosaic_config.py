@@ -217,6 +217,11 @@ DEFAULT_CONFIG = {
     "match_background_for_final": True,
     "incremental_feather_parity": False,
     "final_mosaic_dbe_enabled": True,
+    "final_mosaic_dbe_strength": "normal",
+    "final_mosaic_dbe_obj_k": 3.0,
+    "final_mosaic_dbe_obj_dilate_px": 3,
+    "final_mosaic_dbe_sample_step": 24,
+    "final_mosaic_dbe_smoothing": 0.6,
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---

@@ -883,7 +883,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.3.2, Renāscentia ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.4.0, Extractio Fundi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -2501,7 +2501,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             general_layout,
             self._tr("qt_field_legacy_rgb_cube", "Legacy RGB cube layout"),
         )
-        self._register_checkbox(
+        dbe_checkbox = self._register_checkbox(
             "final_mosaic_dbe_enabled",
             general_layout,
             self._tr(
@@ -2509,6 +2509,67 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "Dynamic Background Extraction (DBE) on final mosaic",
             ),
         )
+        dbe_strength_label = QLabel(
+            self._tr("qt_field_final_mosaic_dbe_strength", "DBE strength"),
+            general_box,
+        )
+        dbe_strength_combo = QComboBox(general_box)
+        dbe_strength_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        dbe_strength_options = [
+            ("weak", self._tr("qt_dbe_strength_weak", "Weak")),
+            ("normal", self._tr("qt_dbe_strength_normal", "Normal")),
+            ("strong", self._tr("qt_dbe_strength_strong", "Strong")),
+        ]
+        for value, label in dbe_strength_options:
+            dbe_strength_combo.addItem(label, value)
+
+        stored_strength = str(self.config.get("final_mosaic_dbe_strength", "normal") or "normal").strip().lower()
+        known_strength_values = {value for value, _ in dbe_strength_options}
+        initial_custom_strength = stored_strength == "custom"
+        if stored_strength in known_strength_values:
+            strength_index = next(
+                (idx for idx, (value, _label) in enumerate(dbe_strength_options) if value == stored_strength),
+                1,
+            )
+        else:
+            strength_index = 1
+        dbe_strength_combo.setCurrentIndex(strength_index)
+        general_layout.addRow(dbe_strength_label, dbe_strength_combo)
+
+        dbe_strength_state = {"user_changed": False}
+
+        def _dbe_strength_getter(
+            combo_ref: QComboBox = dbe_strength_combo,
+            state_ref: Dict[str, bool] = dbe_strength_state,
+            preserve_custom: bool = initial_custom_strength,
+        ) -> str:
+            if preserve_custom and not state_ref.get("user_changed", False):
+                return "custom"
+            data = combo_ref.currentData()
+            if isinstance(data, str) and data:
+                return data
+            return "normal"
+
+        self._config_fields["final_mosaic_dbe_strength"] = {
+            "kind": "combobox",
+            "widget": dbe_strength_combo,
+            "type": str,
+            "value_getter": _dbe_strength_getter,
+        }
+
+        def _on_dbe_strength_changed(_index: int) -> None:
+            dbe_strength_state["user_changed"] = True
+            self._sync_config_key_from_widget("final_mosaic_dbe_strength")
+
+        dbe_strength_combo.currentIndexChanged.connect(_on_dbe_strength_changed)  # type: ignore[arg-type]
+
+        def _update_dbe_strength_enabled(enabled: bool) -> None:
+            dbe_strength_combo.setEnabled(enabled)
+            dbe_strength_label.setEnabled(enabled)
+
+        _update_dbe_strength_enabled(bool(dbe_checkbox.isChecked()))
+        dbe_checkbox.toggled.connect(_update_dbe_strength_enabled)  # type: ignore[arg-type]
+
         self._register_checkbox(
             "incremental_feather_parity",
             general_layout,
@@ -3974,6 +4035,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "enable_tile_weighting": True,
             "tile_weight_mode": "n_frames",
             "final_mosaic_dbe_enabled": True,
+            "final_mosaic_dbe_strength": "normal",
+            "final_mosaic_dbe_obj_k": 3.0,
+            "final_mosaic_dbe_obj_dilate_px": 3,
+            "final_mosaic_dbe_sample_step": 24,
+            "final_mosaic_dbe_smoothing": 0.6,
             "incremental_feather_parity": False,
             "intertile_photometric_match": True,
             "intertile_preview_size": 512,
@@ -4242,7 +4308,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.3.2, Renāscentia ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.4.0, Extractio Fundi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
