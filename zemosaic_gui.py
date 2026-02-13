@@ -724,6 +724,10 @@ class ZeMosaicGUI:
             master=self.root,
             value=self.config.get("two_pass_coverage_renorm", False),
         )
+        self.final_mosaic_dbe_var = tk.BooleanVar(
+            master=self.root,
+            value=bool(self.config.get("final_mosaic_dbe_enabled", True)),
+        )
         self.two_pass_sigma_var = tk.IntVar(
             master=self.root,
             value=int(self.config.get("two_pass_cov_sigma_px", 50)),
@@ -1937,6 +1941,16 @@ class ZeMosaicGUI:
             width=6,
             format="%.2f",
         ).pack(side=tk.LEFT, padx=(4, 0))
+
+        asm_opt_row += 1
+        self.final_mosaic_dbe_check = ttk.Checkbutton(
+            final_assembly_options_frame,
+            variable=self.final_mosaic_dbe_var,
+            text="Dynamic Background Extraction (DBE) on final mosaic",
+        )
+        self.final_mosaic_dbe_check.grid(
+            row=asm_opt_row, column=0, columnspan=2, padx=5, pady=(4, 3), sticky="w"
+        )
 
         asm_opt_row += 1
         center_out_label = ttk.Label(final_assembly_options_frame, text="")
@@ -4537,6 +4551,7 @@ class ZeMosaicGUI:
         self.config["intertile_robust_clip_sigma"] = float(self.intertile_clip_sigma_var.get())
         self.config["use_auto_intertile"] = bool(self.use_auto_intertile_var.get())
         self.config["two_pass_coverage_renorm"] = bool(self.two_pass_cov_var.get())
+        self.config["final_mosaic_dbe_enabled"] = bool(self.final_mosaic_dbe_var.get())
         self.config["two_pass_cov_sigma_px"] = int(self.two_pass_sigma_var.get())
         self.config["two_pass_cov_gain_clip"] = [
             float(self.two_pass_gain_min_var.get()),

@@ -216,6 +216,7 @@ DEFAULT_CONFIG = {
     "use_auto_intertile": False,
     "match_background_for_final": True,
     "incremental_feather_parity": False,
+    "final_mosaic_dbe_enabled": True,
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---

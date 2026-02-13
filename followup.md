@@ -1,61 +1,36 @@
-# Follow-up: checklist de debug/build (Windows PyInstaller)
+# Follow-up checklist (DBE final mosaic)
 
-## 1) [X] Vérifier le symptôme dans les logs
-- App compilée : `dist/ZeMosaic/zemosaic_worker.log`
-  - Chercher :
-    - `phase5_using_cpu`
-    - `[GPU_SAFETY] ... gpu_unavailable`
-    - `WinError 206` + `shapely.libs`
-- Run Python : `zemosaic_worker.log`
-  - Chercher :
-    - `phase5_using_gpu`
-    - `gpu_info_summary`
+## Meta / Process (MANDATORY)
+- [x] `memory.md` updated with: changes, why, tests, limitations, next step
 
-## 2) [X] Pourquoi “GPU indisponible” arrive en build
-Rappel : `parallel_utils._probe_gpu()` dépend de CuPy.
-Si CuPy n’arrive pas à importer/charger ses DLL (CUDA), `gpu_available=False` et le safety clamp coupe le GPU.
+## Code review
+- [x] GUI: checkbox stored in config key `final_mosaic_dbe_enabled` :contentReference[oaicite:3]{index=3}
+- [x] Worker: reads `zconfig.final_mosaic_dbe_enabled` with default True :contentReference[oaicite:4]{index=4}
+- [x] DBE hook placement is unambiguous:
+  - [x] zemosaic_worker.py: Phase 6, immediately after `_dbg_rgb_stats("P6_PRE_EXPORT", ...)` :contentReference[oaicite:5]{index=5}
+  - [x] Grid mode: either confirmed to pass through same save path OR explicit hook in grid_mode.py (no silent omission) :contentReference[oaicite:6]{index=6}
+- [x] Per-channel application (no full HWC background buffer)
+- [x] Uses `alpha_final` / coverage to avoid touching invalid mosaic areas :contentReference[oaicite:7]{index=7}
+- [x] Header keywords written only if applied (ZMDBE, ZMDBE_DS, ZMDBE_K, ZMDBE_SIG)
 
-À vérifier après correctif :
-- que le runtime hook ajoute bien `sys._MEIPASS` au DLL search path.
-- que les DLL CUDA effectivement bundlées dans `_internal` sont trouvables.
+## Manual tests
+1) Classic small dataset (fast)
+- [ ] Run with DBE ON/OFF, confirm only background changes.
+- [ ] Confirm FITS saved + viewer FITS (if enabled) + ALPHA ext exists.
 
-## 3) [X] Pourquoi Shapely crash en build
-Le crash est déclenché par Shapely au moment où il exécute le patch delvewheel :
-- `os.add_dll_directory(<...>\\shapely.libs)` → `WinError 206`
+2) SDS mode
+- [ ] Run SDS with DBE ON, ensure no crash and output looks sane.
 
-Stratégies de correction (préférence dans cet ordre) :
-1) wrapper `os.add_dll_directory()` pour retenter en “extended-length path”.
-2) relocaliser les DLL GEOS vers `shapely/` dans `ZeMosaic.spec` (post-`Analysis`).
+3) Grid mode
+- [ ] Run a small grid mode case:
+  - [ ] either DBE executes (and logs) OR logs a clear “not applicable/bypassed” message
+  - [ ] no regression in grid exports
 
-## 4) [X] Commandes de build Windows (onedir recommandé)
-Dans PowerShell, depuis la racine du projet :
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install --upgrade pyinstaller pyinstaller-hooks-contrib
-pyinstaller --noconfirm --clean ZeMosaic.spec
-```
+## Logs to verify
+- [ ] `P6_PRE_EXPORT` present :contentReference[oaicite:8]{index=8}
+- [ ] `[DBE] ...` line present when enabled
+- [ ] No ERROR; only WARN if DBE fails and run completes
 
-Ou via :
-```powershell
-compile\compile_zemosaic._win.bat
-```
-
-## 5) [X] Smoke-test minimal (packagé)
-1) Lancer `dist\ZeMosaic\ZeMosaic.exe`
-2) Lancer un run qui atteint Phase 4 puis Phase 5.
-3) Vérifier `dist\ZeMosaic\zemosaic_worker.log` :
-   - pas de `WinError 206`
-   - GPU : `phase5_using_gpu` + `gpu_info_summary` non-None (si GPU dispo)
-
-## 6) [X] Si ça échoue encore
-Actions “diagnostic” à faire dans le code (petites, ciblées) :
-- Ajouter un log INFO dans `parallel_utils` quand CuPy est indisponible (capturer l’exception d’import).
-- Ajouter un log INFO dans le runtime hook indiquant :
-  - `sys._MEIPASS`
-  - les dossiers ajoutés via `os.add_dll_directory`
-
-## 7) [X] Mémo obligatoire
-À la fin, créer `memory.md` (résumé humain des changements et de la validation).
+## Performance sanity
+- [ ] Downsample factor computed and reasonable (longest side <= 1024 in model space)
+- [ ] No massive RAM spikes (check memory logs around Phase 6)

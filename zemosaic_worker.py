@@ -2730,6 +2730,146 @@ def _equalize_rgb_black_level_hwc(
     return rgb_hwc, info
 
 
+def _apply_final_mosaic_dbe_per_channel(
+    mosaic_hwc: np.ndarray | None,
+    *,
+    valid_mask_hw: np.ndarray | None = None,
+    max_model_side: int = 1024,
+    blur_sigma: float = 32.0,
+    obj_k: float = 3.0,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Apply a coarse DBE-like background subtraction channel-by-channel.
+
+    The background model is computed and applied per channel to avoid allocating
+    a full HWC background buffer.
+    """
+
+    info: dict[str, Any] = {
+        "applied": False,
+        "reason": "",
+        "ds_factor": 1,
+        "blur_sigma": float(blur_sigma),
+        "obj_k": float(obj_k),
+        "applied_channels": 0,
+        "valid_frac": 0.0,
+        "valid_pixels": 0,
+        "total_pixels": 0,
+        "model_shape": None,
+        "mean_abs_bg_sub": 0.0,
+    }
+
+    if mosaic_hwc is None or not isinstance(mosaic_hwc, np.ndarray):
+        info["reason"] = "invalid_input"
+        return mosaic_hwc, info
+    if mosaic_hwc.ndim != 3 or mosaic_hwc.shape[-1] != 3:
+        info["reason"] = "non_rgb"
+        return mosaic_hwc, info
+
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        info["reason"] = "cv2_unavailable"
+        return mosaic_hwc, info
+
+    mosaic = np.asarray(mosaic_hwc, dtype=np.float32, order="C")
+    if not mosaic.flags.writeable:
+        mosaic = mosaic.copy()
+
+    height, width = mosaic.shape[:2]
+    if height <= 0 or width <= 0:
+        info["reason"] = "empty"
+        return mosaic, info
+
+    longest_side = max(height, width)
+    model_side = max(64, int(max_model_side))
+    ds_factor = max(1, int(math.ceil(float(longest_side) / float(model_side))))
+    info["ds_factor"] = ds_factor
+    model_h = max(1, int(math.ceil(float(height) / float(ds_factor))))
+    model_w = max(1, int(math.ceil(float(width) / float(ds_factor))))
+    info["model_shape"] = (int(model_h), int(model_w))
+
+    finite_any = np.any(np.isfinite(mosaic), axis=-1)
+    valid_hw = finite_any
+    if isinstance(valid_mask_hw, np.ndarray) and valid_mask_hw.shape[:2] == (height, width):
+        try:
+            valid_hw = valid_hw & np.asarray(valid_mask_hw, dtype=bool)
+        except Exception:
+            valid_hw = finite_any
+
+    valid_pixels = int(np.count_nonzero(valid_hw))
+    total_pixels = int(valid_hw.size)
+    info["valid_pixels"] = valid_pixels
+    info["total_pixels"] = total_pixels
+    info["valid_frac"] = float(valid_pixels / total_pixels) if total_pixels > 0 else 0.0
+    if valid_pixels <= 0:
+        info["reason"] = "no_valid"
+        return mosaic, info
+
+    valid_lr = cv2.resize(
+        valid_hw.astype(np.uint8),
+        (model_w, model_h),
+        interpolation=cv2.INTER_NEAREST,
+    ) > 0
+    if not np.any(valid_lr):
+        info["reason"] = "no_valid_lr"
+        return mosaic, info
+
+    applied_channels = 0
+    mean_abs_sub_samples: list[float] = []
+    for chan_idx in range(3):
+        channel = mosaic[..., chan_idx]
+        channel_filled = np.nan_to_num(channel, nan=0.0, posinf=0.0, neginf=0.0).astype(
+            np.float32, copy=False
+        )
+        channel_lr = cv2.resize(
+            channel_filled,
+            (model_w, model_h),
+            interpolation=cv2.INTER_AREA,
+        ).astype(np.float32, copy=False)
+        channel_lr_valid = valid_lr & np.isfinite(channel_lr)
+        if not np.any(channel_lr_valid):
+            continue
+        try:
+            lr_median = float(np.nanmedian(channel_lr[channel_lr_valid]))
+        except Exception:
+            lr_median = 0.0
+        work_lr = channel_lr.copy()
+        work_lr[~channel_lr_valid] = lr_median
+        bg_lr = cv2.GaussianBlur(
+            work_lr,
+            (0, 0),
+            sigmaX=float(blur_sigma),
+            sigmaY=float(blur_sigma),
+        )
+        bg_full = cv2.resize(
+            bg_lr,
+            (width, height),
+            interpolation=cv2.INTER_LINEAR,
+        ).astype(np.float32, copy=False)
+        use_mask = valid_hw & np.isfinite(channel) & np.isfinite(bg_full)
+        if not np.any(use_mask):
+            continue
+        try:
+            mean_abs_sub_samples.append(
+                float(np.mean(np.abs(bg_full[use_mask]), dtype=np.float64))
+            )
+        except Exception:
+            pass
+        channel[use_mask] = channel[use_mask] - bg_full[use_mask]
+        applied_channels += 1
+
+    info["applied_channels"] = int(applied_channels)
+    if mean_abs_sub_samples:
+        try:
+            info["mean_abs_bg_sub"] = float(np.nanmean(np.asarray(mean_abs_sub_samples, dtype=np.float64)))
+        except Exception:
+            info["mean_abs_bg_sub"] = float(mean_abs_sub_samples[0])
+    info["applied"] = bool(applied_channels > 0)
+    if not info["applied"]:
+        info["reason"] = "no_channel_applied"
+    return mosaic, info
+
+
 def _phase5_safe_mode_env_enabled() -> bool:
     try:
         raw = str(os.getenv("ZEMOSAIC_GPU_SAFE_MODE") or "").strip().lower()
@@ -22025,6 +22165,123 @@ def run_hierarchical_mosaic_classic_legacy(
             logger=logger,
         )
 
+    dbe_raw_flag = getattr(zconfig, "final_mosaic_dbe_enabled", None)
+    dbe_has_explicit_flag = hasattr(zconfig, "final_mosaic_dbe_enabled")
+    final_mosaic_dbe_enabled = True if dbe_raw_flag is None else bool(dbe_raw_flag)
+    logger.info(
+        "[DBE] phase6 gate enabled=%s explicit_cfg=%s raw_value=%r",
+        final_mosaic_dbe_enabled,
+        dbe_has_explicit_flag,
+        dbe_raw_flag,
+    )
+    # DBE hook placement: post-P6_PRE_EXPORT stats, pre-export processing/writes.
+    if final_mosaic_dbe_enabled:
+        dbe_t0 = time.perf_counter()
+        try:
+            dbe_valid_mask_hw = None
+            dbe_mask_source = "none"
+            if isinstance(final_mosaic_data_HWC, np.ndarray) and final_mosaic_data_HWC.ndim >= 2:
+                h, w = final_mosaic_data_HWC.shape[:2]
+                if alpha_final is not None:
+                    try:
+                        alpha_arr = np.asarray(alpha_final)
+                        if alpha_arr.ndim == 3:
+                            alpha_arr = np.any(alpha_arr > 0, axis=-1)
+                        elif alpha_arr.ndim > 3:
+                            alpha_arr = np.squeeze(alpha_arr)
+                        if alpha_arr.shape[:2] == (h, w):
+                            dbe_valid_mask_hw = np.asarray(alpha_arr > 0, dtype=bool)
+                            dbe_mask_source = "alpha_final"
+                    except Exception:
+                        dbe_valid_mask_hw = None
+                        dbe_mask_source = "none"
+                if dbe_valid_mask_hw is None and final_mosaic_coverage_HW is not None:
+                    try:
+                        cov_arr = np.asarray(final_mosaic_coverage_HW)
+                        if cov_arr.ndim == 3:
+                            cov_mask = np.any(np.isfinite(cov_arr) & (cov_arr > 0), axis=-1)
+                        else:
+                            cov_arr = np.squeeze(cov_arr)
+                            cov_mask = np.isfinite(cov_arr) & (cov_arr > 0) if cov_arr.ndim == 2 else None
+                        if cov_mask is not None and cov_mask.shape[:2] == (h, w):
+                            dbe_valid_mask_hw = np.asarray(cov_mask, dtype=bool)
+                            dbe_mask_source = "coverage"
+                    except Exception:
+                        dbe_valid_mask_hw = None
+                        dbe_mask_source = "none"
+                if dbe_valid_mask_hw is None:
+                    arr = np.asarray(final_mosaic_data_HWC)
+                    if arr.ndim == 3:
+                        dbe_valid_mask_hw = np.any(np.isfinite(arr), axis=-1)
+                    else:
+                        dbe_valid_mask_hw = np.isfinite(arr)
+                    dbe_mask_source = "finite_fallback"
+            mask_valid_px = 0
+            mask_total_px = 0
+            mask_valid_frac = 0.0
+            if isinstance(dbe_valid_mask_hw, np.ndarray):
+                try:
+                    mask_total_px = int(dbe_valid_mask_hw.size)
+                    mask_valid_px = int(np.count_nonzero(dbe_valid_mask_hw))
+                    if mask_total_px > 0:
+                        mask_valid_frac = float(mask_valid_px / mask_total_px)
+                except Exception:
+                    mask_valid_px = 0
+                    mask_total_px = 0
+                    mask_valid_frac = 0.0
+            logger.info(
+                "[DBE] phase6 preflight mask_source=%s valid_px=%d total_px=%d valid_frac=%.4f mosaic_shape=%s",
+                dbe_mask_source,
+                mask_valid_px,
+                mask_total_px,
+                mask_valid_frac,
+                getattr(final_mosaic_data_HWC, "shape", None),
+            )
+            final_mosaic_data_HWC, dbe_info = _apply_final_mosaic_dbe_per_channel(
+                final_mosaic_data_HWC,
+                valid_mask_hw=dbe_valid_mask_hw,
+            )
+            dbe_elapsed_ms = int((time.perf_counter() - dbe_t0) * 1000.0)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("[DBE] phase6 hook point reached (worker path)")
+            if isinstance(dbe_info, dict) and dbe_info.get("applied"):
+                logger.info(
+                    "[DBE] applied=True mode=per_channel ds_factor=%s obj_k=%.2f blur_sigma=%.1f valid_frac=%.4f valid_px=%s total_px=%s mean_abs_bg_sub=%.6f model=%s channels=%s time_ms=%d",
+                    dbe_info.get("ds_factor"),
+                    float(dbe_info.get("obj_k", 3.0)),
+                    float(dbe_info.get("blur_sigma", 32.0)),
+                    float(dbe_info.get("valid_frac", 0.0)),
+                    dbe_info.get("valid_pixels"),
+                    dbe_info.get("total_pixels"),
+                    float(dbe_info.get("mean_abs_bg_sub", 0.0)),
+                    dbe_info.get("model_shape"),
+                    dbe_info.get("applied_channels"),
+                    dbe_elapsed_ms,
+                )
+                final_header["ZMDBE"] = (True, "Final mosaic DBE applied")
+                final_header["ZMDBE_DS"] = (
+                    int(max(1, int(dbe_info.get("ds_factor", 1)))),
+                    "DBE model downsample factor",
+                )
+                final_header["ZMDBE_K"] = (
+                    float(dbe_info.get("obj_k", 3.0)),
+                    "DBE object threshold k",
+                )
+                final_header["ZMDBE_SIG"] = (
+                    float(dbe_info.get("blur_sigma", 32.0)),
+                    "DBE blur sigma",
+                )
+            else:
+                logger.info(
+                    "[DBE] applied=False mode=per_channel reason=%s time_ms=%d",
+                    (dbe_info or {}).get("reason"),
+                    dbe_elapsed_ms,
+                )
+        except Exception as exc_dbe:
+            logger.warning("[DBE] phase6 DBE failed; continuing without DBE: %s", exc_dbe)
+    else:
+        logger.info("[DBE] skipped: disabled by config (final_mosaic_dbe_enabled=False)")
+
     rgb_black_level_info: dict[str, Any] | None = None
     if (
         final_mosaic_black_point_equalize_enabled
@@ -26255,6 +26512,123 @@ def run_hierarchical_mosaic(
             alpha=alpha_final,
             logger=logger,
         )
+
+    dbe_raw_flag = getattr(zconfig, "final_mosaic_dbe_enabled", None)
+    dbe_has_explicit_flag = hasattr(zconfig, "final_mosaic_dbe_enabled")
+    final_mosaic_dbe_enabled = True if dbe_raw_flag is None else bool(dbe_raw_flag)
+    logger.info(
+        "[DBE] phase6 gate enabled=%s explicit_cfg=%s raw_value=%r",
+        final_mosaic_dbe_enabled,
+        dbe_has_explicit_flag,
+        dbe_raw_flag,
+    )
+    # DBE hook placement: post-P6_PRE_EXPORT stats, pre-export processing/writes.
+    if final_mosaic_dbe_enabled:
+        dbe_t0 = time.perf_counter()
+        try:
+            dbe_valid_mask_hw = None
+            dbe_mask_source = "none"
+            if isinstance(final_mosaic_data_HWC, np.ndarray) and final_mosaic_data_HWC.ndim >= 2:
+                h, w = final_mosaic_data_HWC.shape[:2]
+                if alpha_final is not None:
+                    try:
+                        alpha_arr = np.asarray(alpha_final)
+                        if alpha_arr.ndim == 3:
+                            alpha_arr = np.any(alpha_arr > 0, axis=-1)
+                        elif alpha_arr.ndim > 3:
+                            alpha_arr = np.squeeze(alpha_arr)
+                        if alpha_arr.shape[:2] == (h, w):
+                            dbe_valid_mask_hw = np.asarray(alpha_arr > 0, dtype=bool)
+                            dbe_mask_source = "alpha_final"
+                    except Exception:
+                        dbe_valid_mask_hw = None
+                        dbe_mask_source = "none"
+                if dbe_valid_mask_hw is None and final_mosaic_coverage_HW is not None:
+                    try:
+                        cov_arr = np.asarray(final_mosaic_coverage_HW)
+                        if cov_arr.ndim == 3:
+                            cov_mask = np.any(np.isfinite(cov_arr) & (cov_arr > 0), axis=-1)
+                        else:
+                            cov_arr = np.squeeze(cov_arr)
+                            cov_mask = np.isfinite(cov_arr) & (cov_arr > 0) if cov_arr.ndim == 2 else None
+                        if cov_mask is not None and cov_mask.shape[:2] == (h, w):
+                            dbe_valid_mask_hw = np.asarray(cov_mask, dtype=bool)
+                            dbe_mask_source = "coverage"
+                    except Exception:
+                        dbe_valid_mask_hw = None
+                        dbe_mask_source = "none"
+                if dbe_valid_mask_hw is None:
+                    arr = np.asarray(final_mosaic_data_HWC)
+                    if arr.ndim == 3:
+                        dbe_valid_mask_hw = np.any(np.isfinite(arr), axis=-1)
+                    else:
+                        dbe_valid_mask_hw = np.isfinite(arr)
+                    dbe_mask_source = "finite_fallback"
+            mask_valid_px = 0
+            mask_total_px = 0
+            mask_valid_frac = 0.0
+            if isinstance(dbe_valid_mask_hw, np.ndarray):
+                try:
+                    mask_total_px = int(dbe_valid_mask_hw.size)
+                    mask_valid_px = int(np.count_nonzero(dbe_valid_mask_hw))
+                    if mask_total_px > 0:
+                        mask_valid_frac = float(mask_valid_px / mask_total_px)
+                except Exception:
+                    mask_valid_px = 0
+                    mask_total_px = 0
+                    mask_valid_frac = 0.0
+            logger.info(
+                "[DBE] phase6 preflight mask_source=%s valid_px=%d total_px=%d valid_frac=%.4f mosaic_shape=%s",
+                dbe_mask_source,
+                mask_valid_px,
+                mask_total_px,
+                mask_valid_frac,
+                getattr(final_mosaic_data_HWC, "shape", None),
+            )
+            final_mosaic_data_HWC, dbe_info = _apply_final_mosaic_dbe_per_channel(
+                final_mosaic_data_HWC,
+                valid_mask_hw=dbe_valid_mask_hw,
+            )
+            dbe_elapsed_ms = int((time.perf_counter() - dbe_t0) * 1000.0)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("[DBE] phase6 hook point reached (worker path)")
+            if isinstance(dbe_info, dict) and dbe_info.get("applied"):
+                logger.info(
+                    "[DBE] applied=True mode=per_channel ds_factor=%s obj_k=%.2f blur_sigma=%.1f valid_frac=%.4f valid_px=%s total_px=%s mean_abs_bg_sub=%.6f model=%s channels=%s time_ms=%d",
+                    dbe_info.get("ds_factor"),
+                    float(dbe_info.get("obj_k", 3.0)),
+                    float(dbe_info.get("blur_sigma", 32.0)),
+                    float(dbe_info.get("valid_frac", 0.0)),
+                    dbe_info.get("valid_pixels"),
+                    dbe_info.get("total_pixels"),
+                    float(dbe_info.get("mean_abs_bg_sub", 0.0)),
+                    dbe_info.get("model_shape"),
+                    dbe_info.get("applied_channels"),
+                    dbe_elapsed_ms,
+                )
+                final_header["ZMDBE"] = (True, "Final mosaic DBE applied")
+                final_header["ZMDBE_DS"] = (
+                    int(max(1, int(dbe_info.get("ds_factor", 1)))),
+                    "DBE model downsample factor",
+                )
+                final_header["ZMDBE_K"] = (
+                    float(dbe_info.get("obj_k", 3.0)),
+                    "DBE object threshold k",
+                )
+                final_header["ZMDBE_SIG"] = (
+                    float(dbe_info.get("blur_sigma", 32.0)),
+                    "DBE blur sigma",
+                )
+            else:
+                logger.info(
+                    "[DBE] applied=False mode=per_channel reason=%s time_ms=%d",
+                    (dbe_info or {}).get("reason"),
+                    dbe_elapsed_ms,
+                )
+        except Exception as exc_dbe:
+            logger.warning("[DBE] phase6 DBE failed; continuing without DBE: %s", exc_dbe)
+    else:
+        logger.info("[DBE] skipped: disabled by config (final_mosaic_dbe_enabled=False)")
 
     rgb_black_level_info: dict[str, Any] | None = None
     if (

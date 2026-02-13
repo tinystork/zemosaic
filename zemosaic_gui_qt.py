@@ -2502,6 +2502,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("qt_field_legacy_rgb_cube", "Legacy RGB cube layout"),
         )
         self._register_checkbox(
+            "final_mosaic_dbe_enabled",
+            general_layout,
+            self._tr(
+                "qt_field_final_mosaic_dbe",
+                "Dynamic Background Extraction (DBE) on final mosaic",
+            ),
+        )
+        self._register_checkbox(
             "incremental_feather_parity",
             general_layout,
             self._tr("qt_field_incremental_parity", "Force incremental feather parity"),
@@ -3965,6 +3973,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "match_background_for_final": True,
             "enable_tile_weighting": True,
             "tile_weight_mode": "n_frames",
+            "final_mosaic_dbe_enabled": True,
             "incremental_feather_parity": False,
             "intertile_photometric_match": True,
             "intertile_preview_size": 512,

@@ -1,66 +1,95 @@
-# Mission: Corriger le build Windows PyInstaller (GPU indisponible + crash Shapely)
+# Mission: Add final-mosaic DBE (Dynamic Background Extraction) option (default ON)
 
-## Constat (logs)
-Comparer 2 logs :
-- `dist/ZeMosaic/zemosaic_worker.log` (app compilée) :
-  - `phase5_using_cpu`
-  - `[GPU_SAFETY] ... reasons=...gpu_unavailable`
-  - crash en Phase 4 (Final Grid) : `WinError 206` sur `...\\_internal\\shapely.libs` pendant `import shapely` (via `reproject`).
-- `zemosaic_worker.log` (run Python non compilé) :
-  - `phase5_using_gpu`
-  - `gpu_info_summary` avec des valeurs non-None
-  - pas de crash shapely en Phase 4.
+## Meta (MANDATORY for Codex)
+- You MUST update `memory.md` at the end of EACH iteration/PR.
+- `memory.md` must include:
+  - What changed (files + functions)
+  - Why (intent / bug avoided)
+  - How tested (manual runs + what to look for)
+  - Any known limitations / TODOs
+  - Next step (if unfinished)
 
-## Diagnostic
-1) **GPU**
-- La détection GPU passe par `parallel_utils.detect_parallel_capabilities()` → `_probe_gpu()` (CuPy).
-- Dans le build PyInstaller, CuPy n’arrive pas à s’initialiser (ou ne voit pas ses DLL) → `gpu_available=False`.
-- Ensuite `zemosaic_gpu_safety.apply_gpu_safety_to_parallel_plan()` force `plan.use_gpu=False` et Phase 5 tombe en CPU.
+## Goal
+Add a checkbox in the GUI under "Final assembly & output" (enabled by default) that enables a global DBE-like background extraction on the FINAL mosaic right before export.
 
-2) **Shapely**
-- `reproject.mosaicking.wcs_helpers.find_optimal_celestial_wcs()` importe Shapely.
-- Shapely (delvewheel) appelle `os.add_dll_directory(<...>\\shapely.libs)` et ça échoue avec `WinError 206`.
-- Résultat : `import shapely` échoue → Phase 4 échoue → run stoppé.
+DBE must reduce large-scale gradients for multi-instrument / mixed Bortle datasets **without introducing seams**.
 
-## Objectif
-- Le build compilé doit :
-  - ne plus crasher sur Shapely en Phase 4.
-  - détecter/utiliser le GPU quand disponible (et rester robuste en fallback CPU).
+## Scope (files)
+- zemosaic_gui.py
+- zemosaic_worker.py
+- (optional helper) zemosaic_utils.py
+- (optional) locales/*.json for UI translation key
+- NOTE: Grid mode may require a small hook in grid_mode.py IF it bypasses zemosaic_worker Phase 6 saving.
 
-## Plan d’action (à exécuter dans ce repo)
-1) [X] **Rendre les DLL “bundlées” discoverables**
-   - Modifier `pyinstaller_hooks/rthook_zemosaic_sys_path.py` :
-     - ajouter `sys._MEIPASS` (onedir: `dist/ZeMosaic/_internal`) au DLL search path via `os.add_dll_directory()`.
-     - ajouter aussi chaque dossier `*.libs` sous `sys._MEIPASS`.
-     - répercuter ces chemins dans `PATH` (pour les sous-process).
+## Constraints / Guardrails
+- NO regression for:
+  - SDS mode
+  - grid mode
+  - classic mode
+- Do NOT touch/alter batch-size behaviors
+- Must be safe for large mosaics (memory-aware). Prefer downsampled model + per-channel application.
+- Must preserve existing export behavior (FITS, ALPHA extension).
+- Fail-open: if DBE fails for any reason, log WARN and continue without DBE.
+- When DBE is OFF: output should be identical to baseline (avoid accidental dtype conversions/copies).
 
-2) [X] **Durcir `os.add_dll_directory()` pour WinError 206**
-   - Dans `pyinstaller_hooks/rthook_zemosaic_sys_path.py` :
-     - wrapper `os.add_dll_directory()` pour retenter avec un chemin “extended-length” (`\\\\?\\...`) sur `WinError 206`.
-     - optionnel: éviter un crash si Shapely tente d’ajouter `shapely.libs` alors qu’on a relocalisé ses DLL (voir étape 3).
+## Implementation Plan
 
-3) [X] **Stopper la dépendance à `shapely.libs`**
-   - Modifier `ZeMosaic.spec` :
-     - après `a = Analysis(...)`, relocaliser les binaires dont la destination commence par `shapely.libs\\` vers `shapely\\`.
-     - but : les DLL GEOS se retrouvent à côté des `.pyd` de Shapely, et Shapely n’a plus besoin d’ajouter `shapely.libs`.
+### 0) Decide WHERE to apply DBE (important)
+- Classic + SDS paths: apply DBE **in zemosaic_worker.py Phase 6**, immediately after the `P6_PRE_EXPORT` debug stats block (search `_dbg_rgb_stats("P6_PRE_EXPORT", ...)`), and right before any disk writing (FITS/PNG).
+- Grid mode: confirm whether grid mode uses the same Phase 6 save path. If grid mode saves inside `grid_mode.py`, add a small hook there right before saving the final mosaic (same helper, same config flag). If unsure, log an INFO once: `[DBE] grid_mode: bypassing worker Phase 6, applying in grid_mode`.
 
-4) [X] **Rebuild Windows**
-   - Lancer `compile\\compile_zemosaic._win.bat` (mode onedir recommandé) ou :
-     - `pyinstaller --noconfirm --clean ZeMosaic.spec`
+### 1) GUI (zemosaic_gui.py)
+- Add Tk var:
+  - `self.final_mosaic_dbe_var = tk.BooleanVar(default=self.config.get("final_mosaic_dbe_enabled", True))`
+- Add Checkbutton inside `final_assembly_options_frame`:
+  - label: "Dynamic Background Extraction (DBE) on final mosaic"
+  - default ON
+  - store in translatable_widgets with key `final_mosaic_dbe_label` (optional)
+- When starting processing (where config keys are persisted), save:
+  - `self.config["final_mosaic_dbe_enabled"] = bool(self.final_mosaic_dbe_var.get())`
+  - `zemosaic_config.save_config(self.config)`
 
-5) [X] **Validation (smoke test)**
-   - Relancer un dataset minimal qui passe par Phase 4 + 5.
-   - Vérifier dans `dist/ZeMosaic/zemosaic_worker.log` :
-     - plus de `WinError 206` sur `shapely.libs`.
-     - `gpu_info_summary` a des valeurs et `phase5_using_gpu` apparaît (si GPU dispo).
+### 2) Worker integration (zemosaic_worker.py)
+- In Phase 6, after `P6_PRE_EXPORT` stats and BEFORE writing files:
+  - read config:
+    - `enabled = bool(getattr(zconfig, "final_mosaic_dbe_enabled", True))`
+  - guard: only apply if `final_mosaic_data_HWC` is numpy HWC RGB (`ndim==3` and `shape[-1]==3`)
+  - validity mask priority:
+    1) `alpha_final > 0` if available (uint8)
+    2) `final_mosaic_coverage_HW > 0` if available
+    3) fallback: `np.isfinite(final_mosaic_data_HWC[...,0])` (or any-channel finite)
+  - log (INFO):
+    - `[DBE] enabled=True ds_factor=<int> obj_k=<float> blur_sigma=<float> masked_frac=<float> valid_frac=<float> time_ms=<int>`
+  - write FITS header flags (only if applied):
+    - `ZMDBE = T`
+    - `ZMDBE_DS = <int>`
+    - `ZMDBE_K = <float>`
+    - `ZMDBE_SIG = <float>`
 
-6) [X] **Écrire un `memory.md` à la fin**
-   - Créer `memory.md` à la racine du repo avec :
-     - résumé des changements (fichiers touchés + pourquoi),
-     - commande de build Windows utilisée,
-     - comment valider (quoi chercher dans les logs),
-     - points de vigilance (onefile vs onedir, CUDA_PATH, etc.).
+### 3) DBE algorithm (robust, cheap, memory-aware)
+Implement as a helper (recommended in zemosaic_utils.py): `apply_final_mosaic_dbe(...)`
 
-## Contraintes
-- Ne pas rendre le GPU obligatoire : fallback CPU doit rester OK.
-- Ne pas toucher aux algorithmes (stacking, WCS, reprojection) : uniquement build/runtime hooks.
+Requirements:
+- Work in float32 internally. Do not blow RAM by allocating a full HWC background buffer.
+- Compute a downsample factor so the working image longest side <= 1024 px.
+- Build object mask on downsampled luminance:
+  - sigma via MAD: `sigma = 1.4826 * MAD`
+  - threshold: `median + k*sigma` with default `k = 3.0`
+  - dilate mask lightly (kernel 3–7) to include star halos
+- Fill masked pixels with background median (so blur does not “eat” stars/galaxies).
+- Estimate smooth background on downsampled image:
+  - use `cv2.GaussianBlur` with large `sigma` (default ~32 at downsampled scale)
+- Upsample background to full resolution and subtract **per-channel**:
+  - For c in (R,G,B):
+    - downsample channel -> mask -> blur -> upsample -> subtract into mosaic[...,c] only on valid pixels
+- Preserve invalid regions:
+  - Do not alter pixels where validity mask is False (keep NaN / untouched).
+- If cv2 is missing or any step fails: warn + skip (fail-open).
+
+## Acceptance criteria
+- Checkbox appears in GUI, default ON.
+- With DBE ON: gradients reduced on a test mosaic (no obvious seams introduced).
+- With DBE OFF: output should be identical to baseline (no unintended conversions).
+- No crashes in SDS/grid/classic, and ALPHA extension still written.
+- If DBE errors occur: a WARN log is emitted and export still completes.
+- `memory.md` updated every iteration.
