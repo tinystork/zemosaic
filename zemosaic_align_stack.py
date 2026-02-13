@@ -3063,6 +3063,26 @@ def align_images_in_group(image_data_list: list,
                 aligned_images[i] = None
             except Exception as e_align:
                 _pcb("aligngroup_error_exception_aligning", lvl="ERROR", img_idx=i, error_type=type(e_align).__name__, error_msg=str(e_align))
+                # Ensure traceback and input diagnostics are visible in worker logs.
+                try:
+                    wlog = logging.getLogger("ZeMosaicWorker")
+                    wlog.error(
+                        "AlignGroup input debug img_idx=%s src_type=%s src_dtype=%s src_shape=%s ref_type=%s ref_dtype=%s ref_shape=%s",
+                        i,
+                        type(source_image_adu).__name__,
+                        getattr(source_image_adu, "dtype", None),
+                        getattr(source_image_adu, "shape", None),
+                        type(reference_image_adu).__name__,
+                        getattr(reference_image_adu, "dtype", None),
+                        getattr(reference_image_adu, "shape", None),
+                    )
+                    wlog.error(
+                        "AlignGroup Traceback (img_idx=%s):\n%s",
+                        i,
+                        traceback.format_exc(),
+                    )
+                except Exception:
+                    pass
                 _pcb(f"AlignGroup Traceback: {traceback.format_exc()}", lvl="DEBUG_DETAIL")
                 aligned_images[i] = None
         failed_indices = [idx for idx, img in enumerate(aligned_images) if img is None]

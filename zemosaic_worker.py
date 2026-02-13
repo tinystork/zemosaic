@@ -11454,7 +11454,15 @@ def _calculate_final_mosaic_grid(panel_wcs_list: list, panel_shapes_hw_list: lis
         
         _log_and_callback("calcgrid_info_optimal_grid_calculated", shape=optimal_shape_hw_out, crval=optimal_wcs_out.wcs.crval if optimal_wcs_out and optimal_wcs_out.wcs else 'N/A', level="INFO", callback=progress_callback)
         return optimal_wcs_out, optimal_shape_hw_out
-    except ImportError: _log_and_callback("calcgrid_error_find_optimal_wcs_unavailable", level="ERROR", callback=progress_callback); return None, None
+    except ImportError as e_optimal_wcs_import:
+        _log_and_callback(
+            "calcgrid_error_find_optimal_wcs_unavailable",
+            error=str(e_optimal_wcs_import),
+            level="ERROR",
+            callback=progress_callback,
+        )
+        logger.error("Traceback find_optimal_celestial_wcs (ImportError):", exc_info=True)
+        return None, None
     except Exception as e_optimal_wcs_call: 
         _log_and_callback("calcgrid_error_find_optimal_wcs_call", error=str(e_optimal_wcs_call), level="ERROR", callback=progress_callback)
         logger.error("Traceback find_optimal_celestial_wcs:", exc_info=True)
