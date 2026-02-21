@@ -50,8 +50,6 @@ import platform
 from pathlib import Path
 from typing import Optional
 # import reproject # L'import direct ici n'est pas crucial, mais ne fait pas de mal
-import tkinter as tk
-from tkinter import messagebox  # Nécessaire pour la messagebox d'erreur critique
 try:
     import zemosaic_config
 except ImportError:
@@ -85,9 +83,37 @@ if _parent_dir_str not in sys.path:
     sys.path.insert(0, _parent_dir_str)
 
 # Essayer d'importer la classe GUI et la variable de disponibilité du worker
-try:
-    from zemosaic.zemosaic_gui import ZeMosaicGUI, ZEMOSAIC_WORKER_AVAILABLE
-    print("--- run_zemosaic.py: Import de zemosaic_gui RÉUSSI ---")
+ZeMosaicGUI = None
+ZEMOSAIC_WORKER_AVAILABLE = False
+_TKINTER_IMPORT_ERROR = None
+
+
+def _load_tkinter():
+    """Import tkinter lazily so Qt-only environments can still start."""
+    global _TKINTER_IMPORT_ERROR
+    try:
+        import tkinter as tk  # type: ignore
+        from tkinter import messagebox  # type: ignore
+        return tk, messagebox
+    except Exception as tk_import_error:
+        _TKINTER_IMPORT_ERROR = tk_import_error
+        return None, None
+
+
+def _load_tk_backend_components():
+    """Load Tk GUI components only when the Tk backend is selected."""
+    global ZeMosaicGUI, ZEMOSAIC_WORKER_AVAILABLE
+    try:
+        from zemosaic.zemosaic_gui import ZeMosaicGUI as _ZeMosaicGUI, ZEMOSAIC_WORKER_AVAILABLE as _WORKER_OK
+        ZeMosaicGUI = _ZeMosaicGUI
+        ZEMOSAIC_WORKER_AVAILABLE = _WORKER_OK
+        print("--- run_zemosaic.py: Import de zemosaic_gui RÉUSSI ---")
+    except ImportError as e:
+        print(f"ERREUR CRITIQUE (run_zemosaic): Impossible d'importer ZeMosaicGUI depuis zemosaic_gui.py: {e}")
+        print("  Veuillez vérifier que zemosaic_gui.py est présent et que toutes ses dépendances Python sont installées.")
+        ZEMOSAIC_WORKER_AVAILABLE = False
+        ZeMosaicGUI = None
+        return e
 
     # Vérifier le module zemosaic_worker si la GUI dit qu'il est disponible
     if ZEMOSAIC_WORKER_AVAILABLE:
@@ -120,24 +146,7 @@ try:
             print(
                 "ERREUR (run_zemosaic): zemosaic_worker importé mais n'a pas d'attribut __file__ (très étrange)."
             )
-
-except ImportError as e:
-    print(f"ERREUR CRITIQUE (run_zemosaic): Impossible d'importer ZeMosaicGUI depuis zemosaic_gui.py: {e}")
-    print("  Veuillez vérifier que zemosaic_gui.py est présent et que toutes ses dépendances Python sont installées.")
-    
-    try:
-        root_err = tk.Tk()
-        root_err.withdraw()
-        messagebox.showerror("Erreur de Lancement Fatale",
-                             f"Impossible d'importer le module GUI principal (zemosaic_gui.py).\n"
-                             f"Erreur: {e}\n\n"
-                             "Veuillez vérifier les logs console pour plus de détails.")
-        root_err.destroy()
-    except Exception as tk_err:
-        print(f"  Erreur Tkinter lors de la tentative d'affichage de la messagebox: {tk_err}")
-    
-    ZEMOSAIC_WORKER_AVAILABLE = False 
-    ZeMosaicGUI = None
+    return None
 
 print("--- run_zemosaic.py: FIN DES IMPORTS ---")
 print("DEBUG (run_zemosaic): sys.path complet:\n" + "\n".join(sys.path))
@@ -223,6 +232,9 @@ def _notify_qt_backend_unavailable(error: Exception) -> None:
     print(f"[run_zemosaic] Original import error: {error}")
     print("[run_zemosaic] Falling back to the classic Tk interface.")
 
+    tk, messagebox = _load_tkinter()
+    if tk is None or messagebox is None:
+        return
     try:
         root_warning = tk.Tk()
         root_warning.withdraw()
@@ -559,6 +571,35 @@ def main(argv=None):
                 _play_opening_gif_animation_once()
                 exit_code = run_qt_main()
                 return exit_code
+
+        tk, messagebox = _load_tkinter()
+        if tk is None or messagebox is None:
+            print(
+                "[run_zemosaic] Tkinter est indisponible dans cet environnement Python.\n"
+                "Sous Debian/Ubuntu installez le paquet système: sudo apt install python3-tk\n"
+                "Sous Fedora/RHEL: sudo dnf install python3-tkinter\n"
+                "Puis recréez votre venv avec ce Python (ou lancez avec --qt-gui si PySide6 est installé).\n"
+                f"Détail de l'erreur: {_TKINTER_IMPORT_ERROR}"
+            )
+            return 1
+
+        gui_import_error = _load_tk_backend_components()
+        if gui_import_error is not None:
+            try:
+                root_err = tk.Tk()
+                root_err.withdraw()
+                messagebox.showerror(
+                    "Erreur de Lancement Fatale",
+                    (
+                        "Impossible d'importer le module GUI principal (zemosaic_gui.py).\n"
+                        f"Erreur: {gui_import_error}\n\n"
+                        "Veuillez vérifier les logs console pour plus de détails."
+                    ),
+                )
+                root_err.destroy()
+            except Exception as tk_err:
+                print(f"  Erreur Tkinter lors de la tentative d'affichage de la messagebox: {tk_err}")
+            return 1
 
         # Vérification de sys.modules au début de main
         if 'zemosaic_worker' in sys.modules:
