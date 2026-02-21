@@ -1104,3 +1104,39 @@
 
 ## Next item
 - `Worker: reads zconfig.final_mosaic_dbe_enabled with default True`
+# Iteration note (2026-02-21, startup backend policy: Qt default, Tk fallback-only)
+
+## What changed
+- Updated `run_zemosaic.py` backend selection policy:
+  - Removed config-driven startup backend selection from launcher path.
+  - Kept only explicit overrides for startup backend:
+    - CLI flags: `--qt-gui` / `--tk-gui`
+    - env var: `ZEMOSAIC_GUI_BACKEND=qt|tk`
+  - Enforced default startup backend to Qt (`zemosaic_gui_qt.py`) when no explicit override is present.
+- Improved startup logging clarity:
+  - Explicit Tk override logs now state source (`cli` or `env`).
+  - Automatic fallback to Tk keeps an explicit fallback log path when Qt import fails.
+- Removed now-unused launcher imports/helpers tied to startup config backend preference parsing.
+
+## Why
+- Requested behavior is: start on PySide6/Qt by default, and use Tkinter only as fallback when Qt is unavailable (or when explicitly forced for diagnostics).
+- Previous logic could select Tk from stored config preference, which conflicted with this policy.
+
+## How tested
+- Syntax check:
+  - `python3 -m py_compile run_zemosaic.py`
+  - Result: pass.
+- Static verification:
+  - Confirmed `_determine_backend(...)` now returns Qt by default unless CLI/env explicitly requests otherwise.
+  - Confirmed fallback message path still logs:
+    - `[run_zemosaic] Falling back to the classic Tk interface.`
+  - Confirmed Tk launch log distinguishes:
+    - explicit override (`cli`/`env`) vs automatic fallback.
+
+## Known limitations / risks
+- Any stored `preferred_gui_backend` value in config is now intentionally ignored at launcher startup.
+- If users relied on persistent Tk startup via config, they must now use `--tk-gui` or `ZEMOSAIC_GUI_BACKEND=tk`.
+
+## Next item
+- Optional: align README startup-backend wording to explicitly document the new startup precedence:
+  - `CLI/env override > Qt default > Tk fallback on Qt import failure`.
