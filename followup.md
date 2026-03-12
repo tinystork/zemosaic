@@ -1,61 +1,41 @@
-# Follow-up: checklist de debug/build (Windows PyInstaller)
+# Follow-up checklist — Qt filter dialog scroll fix
 
-## 1) [X] Vérifier le symptôme dans les logs
-- App compilée : `dist/ZeMosaic/zemosaic_worker.log`
-  - Chercher :
-    - `phase5_using_cpu`
-    - `[GPU_SAFETY] ... gpu_unavailable`
-    - `WinError 206` + `shapely.libs`
-- Run Python : `zemosaic_worker.log`
-  - Chercher :
-    - `phase5_using_gpu`
-    - `gpu_info_summary`
+## Objective
+Make the filter dialog in `zemosaic_filter_gui_qt.py` usable on smaller screens / high-DPI displays by ensuring the controls area can scroll and the bottom action buttons remain reachable.
 
-## 2) [X] Pourquoi “GPU indisponible” arrive en build
-Rappel : `parallel_utils._probe_gpu()` dépend de CuPy.
-Si CuPy n’arrive pas à importer/charger ses DLL (CUDA), `gpu_available=False` et le safety clamp coupe le GPU.
+## Constraints
+- Surgical diff only
+- No broad refactor
+- No regression in preview / stream mode / selection workflow
+- Keep splitter behavior intact
+- Update `memory.md` before stopping
 
-À vérifier après correctif :
-- que le runtime hook ajoute bien `sys._MEIPASS` au DLL search path.
-- que les DLL CUDA effectivement bundlées dans `_internal` sont trouvables.
+## Tasks
+- [x] Review `_build_ui()` layout structure and confirm why the button box can fall outside the visible window.
+- [x] Wrap the **right-side controls column** in a `QScrollArea` with a dedicated inner container.
+- [x] Keep the preview group on the left side of the splitter.
+- [x] Move `QDialogButtonBox` out of the scrollable area and anchor it at the bottom of the main dialog layout.
+- [x] Preserve existing controls wiring and layout proportions as much as possible.
+- [x] Update `_apply_saved_window_geometry()` to clamp restored geometry to the current screen available area.
+- [x] Sanity-check that OK / Cancel still work and that no obvious regression was introduced.
+- [ ] If feasible, verify behavior on a constrained-height window or equivalent scenario.
+- [x] Update `memory.md` with a compact summary of the issue, root cause, fix, and validation.
+- [x] Compact older `memory.md` entries where possible without losing important conclusions.
 
-## 3) [X] Pourquoi Shapely crash en build
-Le crash est déclenché par Shapely au moment où il exécute le patch delvewheel :
-- `os.add_dll_directory(<...>\\shapely.libs)` → `WinError 206`
+## Done definition
+The task is complete only when all of the following are true:
+- The right panel can scroll when the dialog is too short.
+- The OK/Cancel row stays visible.
+- Restored geometry is clamped to screen bounds.
+- `followup.md` is updated with `[x]` for completed work.
+- `memory.md` has been updated and compacted.
 
-Stratégies de correction (préférence dans cet ordre) :
-1) wrapper `os.add_dll_directory()` pour retenter en “extended-length path”.
-2) relocaliser les DLL GEOS vers `shapely/` dans `ZeMosaic.spec` (post-`Analysis`).
+## Notes for the next iteration
+If anything blocks completion, record exactly:
+- what remains unfinished,
+- why it is unfinished,
+- the smallest safe next step.
 
-## 4) [X] Commandes de build Windows (onedir recommandé)
-Dans PowerShell, depuis la racine du projet :
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install --upgrade pyinstaller pyinstaller-hooks-contrib
-pyinstaller --noconfirm --clean ZeMosaic.spec
-```
-
-Ou via :
-```powershell
-compile\compile_zemosaic._win.bat
-```
-
-## 5) [X] Smoke-test minimal (packagé)
-1) Lancer `dist\ZeMosaic\ZeMosaic.exe`
-2) Lancer un run qui atteint Phase 4 puis Phase 5.
-3) Vérifier `dist\ZeMosaic\zemosaic_worker.log` :
-   - pas de `WinError 206`
-   - GPU : `phase5_using_gpu` + `gpu_info_summary` non-None (si GPU dispo)
-
-## 6) [X] Si ça échoue encore
-Actions “diagnostic” à faire dans le code (petites, ciblées) :
-- Ajouter un log INFO dans `parallel_utils` quand CuPy est indisponible (capturer l’exception d’import).
-- Ajouter un log INFO dans le runtime hook indiquant :
-  - `sys._MEIPASS`
-  - les dossiers ajoutés via `os.add_dll_directory`
-
-## 7) [X] Mémo obligatoire
-À la fin, créer `memory.md` (résumé humain des changements et de la validation).
+Current remaining item:
+- Manual constrained-height verification remains unfinished because this session is headless (no interactive Qt display to exercise the dialog UI directly).
+- Smallest safe next step: run the Qt filter dialog once on a constrained-height display (or high-DPI scaling scenario), confirm right-side scrolling and always-visible OK/Cancel, then mark the last checkbox.

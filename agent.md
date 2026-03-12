@@ -1,66 +1,102 @@
-# Mission: Corriger le build Windows PyInstaller (GPU indisponible + crash Shapely)
+# Mission: fix inaccessible Start/OK button in Qt filter dialog
 
-## Constat (logs)
-Comparer 2 logs :
-- `dist/ZeMosaic/zemosaic_worker.log` (app compilée) :
-  - `phase5_using_cpu`
-  - `[GPU_SAFETY] ... reasons=...gpu_unavailable`
-  - crash en Phase 4 (Final Grid) : `WinError 206` sur `...\\_internal\\shapely.libs` pendant `import shapely` (via `reproject`).
-- `zemosaic_worker.log` (run Python non compilé) :
-  - `phase5_using_gpu`
-  - `gpu_info_summary` avec des valeurs non-None
-  - pas de crash shapely en Phase 4.
+## Context
+A user reported that in `zemosaic_filter_gui_qt.py`, the **Start / OK** button can become unreachable on some screens or DPI scaling settings because it ends up below the visible area of the dialog.
 
-## Diagnostic
-1) **GPU**
-- La détection GPU passe par `parallel_utils.detect_parallel_capabilities()` → `_probe_gpu()` (CuPy).
-- Dans le build PyInstaller, CuPy n’arrive pas à s’initialiser (ou ne voit pas ses DLL) → `gpu_available=False`.
-- Ensuite `zemosaic_gpu_safety.apply_gpu_safety_to_parallel_plan()` force `plan.use_gpu=False` et Phase 5 tombe en CPU.
+Initial code review indicates two likely causes:
+1. The filter dialog builds its controls column directly in a `QVBoxLayout` with no `QScrollArea`, so when vertical space is insufficient the bottom action area simply falls outside the window.
+2. `_apply_saved_window_geometry()` restores the saved geometry as-is, without clamping it to the current screen's available geometry. A geometry saved on a larger display can therefore reopen too large or partly off-screen on a smaller one.
 
-2) **Shapely**
-- `reproject.mosaicking.wcs_helpers.find_optimal_celestial_wcs()` importe Shapely.
-- Shapely (delvewheel) appelle `os.add_dll_directory(<...>\\shapely.libs)` et ça échoue avec `WinError 206`.
-- Résultat : `import shapely` échoue → Phase 4 échoue → run stoppé.
+## Goal
+Make the filter dialog reliably usable on smaller screens and high-DPI setups, with **no regression** to preview behavior, layout balance, or dialog actions.
 
-## Objectif
-- Le build compilé doit :
-  - ne plus crasher sur Shapely en Phase 4.
-  - détecter/utiliser le GPU quand disponible (et rester robuste en fallback CPU).
+## Scope
+Primary target:
+- `zemosaic_filter_gui_qt.py`
 
-## Plan d’action (à exécuter dans ce repo)
-1) [X] **Rendre les DLL “bundlées” discoverables**
-   - Modifier `pyinstaller_hooks/rthook_zemosaic_sys_path.py` :
-     - ajouter `sys._MEIPASS` (onedir: `dist/ZeMosaic/_internal`) au DLL search path via `os.add_dll_directory()`.
-     - ajouter aussi chaque dossier `*.libs` sous `sys._MEIPASS`.
-     - répercuter ces chemins dans `PATH` (pour les sous-process).
+Allowed if strictly needed:
+- tiny helper methods in the same file only
 
-2) [X] **Durcir `os.add_dll_directory()` pour WinError 206**
-   - Dans `pyinstaller_hooks/rthook_zemosaic_sys_path.py` :
-     - wrapper `os.add_dll_directory()` pour retenter avec un chemin “extended-length” (`\\\\?\\...`) sur `WinError 206`.
-     - optionnel: éviter un crash si Shapely tente d’ajouter `shapely.libs` alors qu’on a relocalisé ses DLL (voir étape 3).
+Avoid touching unrelated files unless absolutely necessary.
 
-3) [X] **Stopper la dépendance à `shapely.libs`**
-   - Modifier `ZeMosaic.spec` :
-     - après `a = Analysis(...)`, relocaliser les binaires dont la destination commence par `shapely.libs\\` vers `shapely\\`.
-     - but : les DLL GEOS se retrouvent à côté des `.pyd` de Shapely, et Shapely n’a plus besoin d’ajouter `shapely.libs`.
+## Required outcome
+Implement the safest low-regression fix:
 
-4) [X] **Rebuild Windows**
-   - Lancer `compile\\compile_zemosaic._win.bat` (mode onedir recommandé) ou :
-     - `pyinstaller --noconfirm --clean ZeMosaic.spec`
+1. Keep the overall dialog structure and existing widgets.
+2. Put the **right-hand controls column** inside a `QScrollArea`.
+3. Keep the **OK/Cancel button box fixed outside the scroll area**, at the bottom of the dialog, so it remains visible.
+4. Clamp restored window geometry to the current screen's `availableGeometry()` before applying it.
+5. Preserve the existing preview pane, splitter, labels, activity log, tree, options, and dialog behavior.
 
-5) [X] **Validation (smoke test)**
-   - Relancer un dataset minimal qui passe par Phase 4 + 5.
-   - Vérifier dans `dist/ZeMosaic/zemosaic_worker.log` :
-     - plus de `WinError 206` sur `shapely.libs`.
-     - `gpu_info_summary` a des valeurs et `phase5_using_gpu` apparaît (si GPU dispo).
+## Important constraints
+- **No broad refactor.** Use a surgical diff.
+- Do **not** change the meaning or wiring of existing controls.
+- Do **not** break preview tabs, coverage preview, activity log, image tree, or options persistence.
+- Do **not** introduce regressions for stream mode, selection actions, or accept/reject behavior.
+- Keep the splitter behavior intact.
+- Prefer readability over cleverness.
 
-6) [X] **Écrire un `memory.md` à la fin**
-   - Créer `memory.md` à la racine du repo avec :
-     - résumé des changements (fichiers touchés + pourquoi),
-     - commande de build Windows utilisée,
-     - comment valider (quoi chercher dans les logs),
-     - points de vigilance (onefile vs onedir, CUDA_PATH, etc.).
+## Implementation guidance
+### A. `_build_ui()`
+Refactor the right-side controls assembly like this:
+- Create a `QScrollArea` for the controls side.
+- Create a dedicated inner `controls_container` widget and its `QVBoxLayout`.
+- Set `setWidgetResizable(True)` on the scroll area.
+- Add the scroll area to the splitter instead of adding the raw controls container directly.
+- Keep the preview group as the left widget of the splitter.
+- Move the `QDialogButtonBox` out of the scrollable controls layout and add it directly to the main dialog layout after the splitter.
+- Keep a stretch inside the scrollable controls layout so the controls pack naturally.
 
-## Contraintes
-- Ne pas rendre le GPU obligatoire : fallback CPU doit rester OK.
-- Ne pas toucher aux algorithmes (stacking, WCS, reprojection) : uniquement build/runtime hooks.
+Desired UX:
+- On tall screens, the dialog should look essentially unchanged.
+- On short screens, the right-side controls should scroll while the bottom OK/Cancel row remains reachable.
+
+### B. `_apply_saved_window_geometry()`
+Before calling `setGeometry(...)`:
+- Obtain the saved `(x, y, width, height)`.
+- Determine the current screen's available geometry.
+- Clamp width/height so they do not exceed the available area.
+- Clamp x/y so the window remains fully reachable on screen.
+- Fail safely if screen lookup is unavailable.
+
+### C. Keep the patch small
+Do not redesign the dialog. This is a usability fix, not a UI rewrite.
+
+## Validation checklist
+Please validate as much as possible directly in code and, if runnable, manually:
+
+1. Dialog opens normally on standard resolution.
+2. Preview panel still appears and splitter still resizes.
+3. Right-side content scrolls when vertical height is constrained.
+4. OK/Cancel remain visible and clickable.
+5. Accept / reject still work.
+6. Restored geometry no longer places the dialog partly off-screen or too tall for the current display.
+7. No obvious regression in stream mode or image filtering workflow.
+
+## Deliverables
+Update:
+- `zemosaic_filter_gui_qt.py`
+- `followup.md`
+- `memory.md`
+
+## Mandatory project tracking updates
+Before finishing:
+1. Mark completed items in `followup.md` with `[x]`.
+2. Add a concise entry to `memory.md` describing:
+   - the root cause,
+   - what was changed,
+   - what was validated,
+   - any remaining risk or follow-up.
+3. **Compact `memory.md` if it has become too verbose.** Keep the historical trace, but rewrite long step-by-step logs into short status summaries so future reads consume fewer tokens.
+
+## Suggested memory style
+Prefer this compact structure:
+- Date
+- Topic
+- Problem
+- Root cause
+- Changes made
+- Validation
+- Remaining items
+
+Avoid dumping repeated intermediate attempts once the conclusion is known.

@@ -95,6 +95,7 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QScrollArea,
     QGridLayout,
     QHBoxLayout,
     QGroupBox,
@@ -5827,11 +5828,15 @@ class FilterQtDialog(QDialog):
         preview_layout.addWidget(self._preview_hint_label)
         content_splitter.addWidget(preview_group)
 
-        controls_container = QWidget(self)
+        controls_scroll_area = QScrollArea(self)
+        controls_scroll_area.setWidgetResizable(True)
+        content_splitter.addWidget(controls_scroll_area)
+
+        controls_container = QWidget(controls_scroll_area)
         controls_layout = QVBoxLayout(controls_container)
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(8)
-        content_splitter.addWidget(controls_container)
+        controls_scroll_area.setWidget(controls_container)
         content_splitter.setStretchFactor(0, 3)
         content_splitter.setStretchFactor(1, 2)
 
@@ -5930,11 +5935,12 @@ class FilterQtDialog(QDialog):
         select_none_btn.clicked.connect(self._select_none)  # type: ignore[arg-type]
         actions_layout.addWidget(select_none_btn, 0)
         controls_layout.addWidget(actions_widget)
+        controls_layout.addStretch(1)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
-        controls_layout.addWidget(button_box)
+        main_layout.addWidget(button_box, 0)
         self._dialog_button_box = button_box
 
         self._apply_saved_window_geometry()
@@ -6091,6 +6097,33 @@ class FilterQtDialog(QDialog):
         if geometry is None:
             return
         x, y, width, height = geometry
+        try:
+            available_rect = None
+            app = QApplication.instance()
+            screen = None
+            if app is not None:
+                center = QPoint(x + (width // 2), y + (height // 2))
+                screen = app.screenAt(center)
+                if screen is None:
+                    screen = self.screen()
+                if screen is None:
+                    screen = app.primaryScreen()
+            if screen is not None:
+                available_rect = screen.availableGeometry()
+            if available_rect is not None:
+                available_width = max(1, int(available_rect.width()))
+                available_height = max(1, int(available_rect.height()))
+                width = min(width, available_width)
+                height = min(height, available_height)
+
+                min_x = int(available_rect.x())
+                min_y = int(available_rect.y())
+                max_x = min_x + available_width - width
+                max_y = min_y + available_height - height
+                x = max(min_x, min(x, max_x))
+                y = max(min_y, min(y, max_y))
+        except Exception:
+            pass
         try:
             self.setGeometry(x, y, width, height)
         except Exception:
