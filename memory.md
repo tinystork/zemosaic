@@ -73,3 +73,94 @@ In the Qt filter dialog, the right-side controls and button box were in the same
 ### Remaining risk / follow-up
 - Manual GUI verification on constrained-height/high-DPI display was not run in this headless session.
 - Smallest safe next step: launch the dialog in a constrained-height scenario and confirm right-panel scrolling + always-visible OK/Cancel.
+
+---
+
+## 2026-03-12 — Packaging/docs alignment for GPU vs CPU-only builds
+
+### Topic
+Clarified how Windows/macOS/Linux packaged builds decide whether CuPy/CUDA support is included, and aligned the helper scripts / installer documentation with the current build layout.
+
+### Problem
+- Build/release docs did not clearly distinguish:
+  - `requirements.txt` (current working GPU-enabled dependency set, including `cupy-cuda12x`)
+  - `requirements_no_gpu.txt` (new CPU-only dependency set for smaller artifacts)
+- Build helpers and installer assumptions needed to match the real packaging flow.
+- `zemosaic_installer.iss` previously targeted obsolete `compile\...` paths instead of the current `dist\ZeMosaic\...` output layout.
+
+### Changes made
+- Added `requirements_no_gpu.txt`
+  - mirrors the base dependency set
+  - intentionally excludes CuPy so a smaller CPU-only packaged build can be produced
+- Updated `compile/compile_zemosaic._win.bat`
+  - default requirements file is again `requirements.txt`
+  - supports overriding via `ZEMOSAIC_REQUIREMENTS_FILE`
+  - message now states GPU support depends on the chosen requirements file
+- Updated `compile/build_zemosaic_posix.sh`
+  - default requirements file is again `requirements.txt`
+  - supports overriding via `ZEMOSAIC_REQUIREMENTS_FILE`
+  - installs `pyinstaller-hooks-contrib`
+  - cleans `build/` and `dist/`
+  - message now states GPU support depends on the chosen requirements file
+- Updated `zemosaic_installer.iss`
+  - installer now packages `dist\ZeMosaic\*`
+  - `Icons` / `Run` point to `{app}\ZeMosaic.exe`
+  - comments explicitly state that Inno Setup does not choose the CUDA package; it only packages whatever build already exists in `dist\ZeMosaic`
+- Updated `README.md`
+  - documents the default GPU-enabled path using `requirements.txt`
+  - documents CPU-only builds using `requirements_no_gpu.txt`
+  - explains that `.iss` does not select CUDA/CuPy version
+  - adds Windows GitHub release guidance (publish zipped `dist\ZeMosaic` as a release asset, do not commit `dist/`)
+
+### Validation performed
+- `bash -n compile/build_zemosaic_posix.sh` passed.
+- Static review confirmed Windows helper / POSIX helper / README are now consistent on:
+  - default = `requirements.txt`
+  - smaller package option = `requirements_no_gpu.txt`
+  - installer packages the already-built output
+
+### Important packaging note
+- Current intended behavior remains:
+  - use `requirements.txt` for the existing GPU-enabled build path (`cupy-cuda12x`)
+  - use `requirements_no_gpu.txt` only when a smaller CPU-only package is wanted
+- `zemosaic_installer.iss` is ignored by Git in this repo (`.gitignore` has `*.iss`), so versioning it requires `git add -f zemosaic_installer.iss` or changing ignore rules.
+
+---
+
+## 2026-03-12 — Future idea: installer with GPU/CuPy auto-detection
+
+### Topic
+Exploration only, no mission started yet.
+
+### User intent
+- Keep the current working GPU path based on `requirements.txt` / `cupy-cuda12x`.
+- Consider a future Windows installer able to detect the target machine and install/download the appropriate GPU support automatically.
+- Defer implementation for now.
+
+### Assessment given
+- This is considered viable, but not a small change.
+- Estimated scope:
+  - minimal viable approach: high complexity
+  - robust/maintainable approach: very high complexity
+
+### Recommended architecture discussed
+- Prefer a CPU-only base installer plus an optional GPU enablement step.
+- Detect:
+  - Windows x64 environment
+  - NVIDIA GPU presence
+  - driver / CUDA compatibility level
+- Then either:
+  - download a prebuilt GPU add-on from GitHub Releases, or
+  - install the matching CuPy package dynamically
+- Recommended direction was to avoid a fully dynamic Inno Setup-only solution at first, and instead use:
+  - a simple installer
+  - plus a post-install/bootstrap GPU activation step with clear fallbacks
+
+### Why this was deferred
+- Requires coordinated changes across:
+  - installer/bootstrap flow
+  - release packaging strategy
+  - GPU compatibility detection logic
+  - runtime fallback behavior
+  - documentation and testing matrix
+- User asked to postpone this work and possibly revisit it later.

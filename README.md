@@ -530,6 +530,21 @@ an inter-process lock:
    ```
 
    The default output is `dist/ZeMosaic/ZeMosaic.exe` (onedir).
+   This path keeps the current GPU-enabled setup because `requirements.txt` currently includes `cupy-cuda12x`.
+
+   If you want a CPU-only package with a much smaller payload:
+
+   ```powershell
+   set ZEMOSAIC_REQUIREMENTS_FILE=requirements_no_gpu.txt
+   compile\compile_zemosaic._win.bat
+   ```
+
+   Or manually:
+
+   ```powershell
+   python -m pip install -r requirements_no_gpu.txt
+   pyinstaller --noconfirm --clean ZeMosaic.spec
+   ```
 
 3. Optional onefile build:
 
@@ -565,7 +580,10 @@ Notes:
 - Keep `PySide6` installed if you want the Qt GUI in the packaged build; otherwise the Tk GUI is used.
 - `matplotlib` is optional: if missing, the Qt filter preview is disabled.
 - `cupy-cuda12x` is optional: if missing (or if NVIDIA drivers are missing/incompatible, or if required CUDA DLLs are not present on the target machine), ZeMosaic falls back to CPU. On Windows this often means having CUDA Toolkit (or at least its runtime DLLs) available via `%CUDA_PATH%\\bin`/`PATH`.
+- `requirements.txt` keeps the current working GPU setup (`cupy-cuda12x`). `requirements_no_gpu.txt` is available for CPU-only builds when you want a smaller artifact.
 - Prefer onedir for reliability; onefile can hit Windows path length issues (example: Shapely `WinError 206`), mitigated by using a short `ZEMOSAIC_RUNTIME_TMPDIR` like `C:\Temp` and/or enabling long paths in Windows.
+- `zemosaic_installer.iss` does not choose the CUDA package. It simply packages `dist\\ZeMosaic\\*`. If you built with `requirements.txt`, the installer packages the GPU-enabled build. If you built with `requirements_no_gpu.txt`, it packages the CPU-only build.
+- The relevant `.iss` lines are the `[Files]` entry pointing to `dist\\ZeMosaic\\*`, plus `[Icons]` / `[Run]` pointing to `{app}\\ZeMosaic.exe`. You normally do not need to change them for a different CUDA version.
 
 Mini smoke-test (packaged build):
 - Launch `dist/ZeMosaic/ZeMosaic.exe` (or `dist/ZeMosaic.exe` in onefile mode).
@@ -587,6 +605,21 @@ Mini smoke-test (packaged build):
    ```
 
    La sortie par défaut est `dist/ZeMosaic/ZeMosaic.exe` (onedir).
+   Ce chemin conserve le build GPU actuel car `requirements.txt` contient actuellement `cupy-cuda12x`.
+
+   Si vous voulez un paquet CPU-only beaucoup plus léger :
+
+   ```powershell
+   set ZEMOSAIC_REQUIREMENTS_FILE=requirements_no_gpu.txt
+   compile\compile_zemosaic._win.bat
+   ```
+
+   Ou en manuel :
+
+   ```powershell
+   python -m pip install -r requirements_no_gpu.txt
+   pyinstaller --noconfirm --clean ZeMosaic.spec
+   ```
 
 3. Build onefile optionnel :
 
@@ -622,7 +655,10 @@ Notes :
 - Gardez `PySide6` installe si vous voulez l'interface Qt ; sinon l'interface Tk est utilisee.
 - `matplotlib` est optionnel : s'il manque, l'aperçu (Qt filter preview) est désactivé.
 - `cupy-cuda12x` est optionnel : s'il manque (ou si les drivers NVIDIA sont absents/incompatibles, ou si les DLL CUDA nécessaires ne sont pas présentes sur la machine cible), ZeMosaic retombe en CPU. Sous Windows cela implique souvent CUDA Toolkit (ou au minimum ses DLL runtime) accessibles via `%CUDA_PATH%\\bin`/`PATH`.
+- `requirements.txt` conserve le setup GPU actuel qui fonctionne (`cupy-cuda12x`). `requirements_no_gpu.txt` est disponible pour produire des builds CPU-only plus petits.
 - Préférez onedir pour la fiabilité ; onefile peut déclencher des soucis de longueur de chemin Windows (ex: Shapely `WinError 206`), atténués via un `ZEMOSAIC_RUNTIME_TMPDIR` court comme `C:\Temp` et/ou l'activation des long paths dans Windows.
+- `zemosaic_installer.iss` ne choisit pas le paquet CUDA. Il empaquette simplement `dist\\ZeMosaic\\*`. Si vous avez buildé avec `requirements.txt`, l'installateur emballera la version GPU. Si vous avez buildé avec `requirements_no_gpu.txt`, il emballera la version CPU-only.
+- Les lignes `.iss` pertinentes sont l'entrée `[Files]` qui pointe sur `dist\\ZeMosaic\\*`, ainsi que `[Icons]` / `[Run]` qui pointent sur `{app}\\ZeMosaic.exe`. En pratique vous n'avez pas à les changer pour une autre version de CUDA.
 
 Mini smoke-test (build packagé) :
 - Lancez `dist/ZeMosaic/ZeMosaic.exe` (ou `dist/ZeMosaic.exe` en onefile).
@@ -643,6 +679,13 @@ Mini smoke-test (build packagé) :
    ```
 
    The script installs/updates PyInstaller inside `.venv` and produces `dist/zemosaic`.
+   By default it uses `requirements.txt`, which preserves the current GPU-enabled setup when `cupy-cuda12x` is available for the platform.
+
+   For a CPU-only build:
+
+   ```bash
+   ZEMOSAIC_REQUIREMENTS_FILE=requirements_no_gpu.txt ./compile/build_zemosaic_posix.sh
+   ```
 
 🇫🇷 Instructions (Français)
 
@@ -656,6 +699,59 @@ Mini smoke-test (build packagé) :
    ```
 
    L'exécutable macOS/Linux sera généré dans `dist/zemosaic`.
+   Par défaut le script utilise `requirements.txt`, ce qui conserve le setup GPU actuel quand `cupy-cuda12x` existe pour la plateforme.
+
+   Pour un build CPU-only :
+
+   ```bash
+   ZEMOSAIC_REQUIREMENTS_FILE=requirements_no_gpu.txt ./compile/build_zemosaic_posix.sh
+   ```
+
+### Windows GitHub release
+
+1. Build the Windows onedir package:
+
+   ```powershell
+   compile\compile_zemosaic._win.bat
+   ```
+
+2. Optionally build a CPU-only variant if the GPU bundle is too large:
+
+   ```powershell
+   set ZEMOSAIC_REQUIREMENTS_FILE=requirements_no_gpu.txt
+   compile\compile_zemosaic._win.bat
+   ```
+
+3. Create a zip from `dist\ZeMosaic`.
+4. Publish that zip as a GitHub Release asset rather than committing `dist/` to the repository.
+
+Notes:
+- GitHub blocks regular Git files above 100 MiB, so `dist/` should not be committed.
+- GitHub Release assets are the right place for Windows binaries.
+- The installer script `zemosaic_installer.iss` packages `dist\ZeMosaic\*` exactly as built.
+
+### Release Windows sur GitHub
+
+1. Générez le build Windows onedir :
+
+   ```powershell
+   compile\compile_zemosaic._win.bat
+   ```
+
+2. En option, générez une variante CPU-only si le bundle GPU est trop gros :
+
+   ```powershell
+   set ZEMOSAIC_REQUIREMENTS_FILE=requirements_no_gpu.txt
+   compile\compile_zemosaic._win.bat
+   ```
+
+3. Créez une archive zip à partir de `dist\ZeMosaic`.
+4. Publiez ce zip dans une GitHub Release au lieu de versionner `dist/` dans le dépôt.
+
+Notes :
+- GitHub bloque les fichiers Git classiques au-delà de 100 MiB, donc `dist/` ne doit pas être commit.
+- Les GitHub Releases sont le bon endroit pour publier les binaires Windows.
+- `zemosaic_installer.iss` empaquette exactement `dist\ZeMosaic\*` tel qu'il a été construit.
 
 ### Memory-mapped coadd (enabled by default)
 

@@ -10708,19 +10708,73 @@ def _apply_ram_budget_to_groups(
 
 
 # --- Configuration du Logging ---
-try:
-    log_file_path = ensure_user_config_dir() / "zemosaic_worker.log"
-except Exception:
-    log_file_path = Path("zemosaic_worker.log")
+def _early_worker_log_dir() -> Path:
+    """Return a writable per-user directory before optional helpers are imported."""
+
+    try:
+        home = Path.home()
+    except Exception:
+        home = Path(tempfile.gettempdir())
+
+    system = platform.system().lower()
+    candidates: list[Path] = []
+
+    if system == "windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "ZeMosaic")
+        candidates.append(home / "AppData" / "Roaming" / "ZeMosaic")
+    elif system == "darwin":
+        candidates.append(home / "Library" / "Application Support" / "ZeMosaic")
+    else:
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        if xdg_config:
+            candidates.append(Path(xdg_config) / "ZeMosaic")
+        candidates.append(home / ".config" / "ZeMosaic")
+
+    candidates.append(home / "ZeMosaic")
+    candidates.append(Path(tempfile.gettempdir()) / "ZeMosaic")
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+
+    return Path(tempfile.gettempdir())
+
+
+def _resolve_worker_log_file_path() -> Path:
+    try:
+        config_dir_provider = globals().get("ensure_user_config_dir")
+        if callable(config_dir_provider):
+            return Path(config_dir_provider()) / "zemosaic_worker.log"
+    except Exception:
+        pass
+    return _early_worker_log_dir() / "zemosaic_worker.log"
+
+
+log_file_path = _resolve_worker_log_file_path()
 
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(str(log_file_path), mode='w', encoding='utf-8')
-    fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    file_handler_added = False
+    for candidate_path in (log_file_path, Path(tempfile.gettempdir()) / "zemosaic_worker.log"):
+        try:
+            fh = logging.FileHandler(str(candidate_path), mode='w', encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(formatter)
+            logger.addHandler(fh)
+            log_file_path = candidate_path
+            file_handler_added = True
+            break
+        except Exception:
+            continue
+    if not file_handler_added:
+        logger.addHandler(logging.NullHandler())
 logger.info("Logging pour ZeMosaicWorker initialisé. Logs écrits dans: %s", log_file_path)
 
 
