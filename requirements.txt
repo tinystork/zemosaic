@@ -14,6 +14,11 @@ zarr>=2
 packaging
 shapely                     # Geometry operations (used by ccdproc)
 
+# Tkinter note:
+# - tkinter is part of Python stdlib (not a pip package).
+# - On Linux, install the system package first (e.g. `python3-tk` on Debian/Ubuntu
+#   or `python3-tkinter` on Fedora/RHEL) before creating the virtualenv.
+
 # --- Optional GUI & tooling dependencies ---
 PySide6>=6.6                # Qt interface (PySide6 GUI backend)
 PyQt5                       # Standalone visu.py FITS viewer

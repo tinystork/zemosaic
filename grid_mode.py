@@ -2748,6 +2748,7 @@ def assemble_tiles(
     save_final_as_uint16: bool = False,
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool = True,
+    final_mosaic_dbe_enabled: bool = True,
     progress_callback: ProgressCallback = None,
     progress_reporter: _GridProgressReporter | None = None,
 ) -> Path | None:
@@ -3598,6 +3599,19 @@ def assemble_tiles(
         reporter.set_stage("GRID: final save")
         reporter.emit_eta()
 
+    if final_mosaic_dbe_enabled:
+        _emit(
+            "[DBE] grid_mode: bypassing worker Phase 6, DBE hook point is in grid_mode final save path",
+            lvl="INFO",
+            callback=progress_callback,
+        )
+    else:
+        _emit(
+            "[DBE] grid_mode: disabled by config (final_mosaic_dbe_enabled=False)",
+            lvl="INFO",
+            callback=progress_callback,
+        )
+
     header = None
     if _ASTROPY_AVAILABLE and fits:
         try:
@@ -4234,6 +4248,15 @@ def run_grid_mode(
             current_phase_index = 3
             current_phase_name = "Grid: photometry & blending"
             _emit_telemetry(current_phase_index, current_phase_name, force=True)
+            grid_dbe_flag = _coerce_bool_flag(
+                getattr(
+                    zconfig,
+                    "final_mosaic_dbe_enabled",
+                    cfg_disk.get("final_mosaic_dbe_enabled", True),
+                )
+            )
+            if grid_dbe_flag is None:
+                grid_dbe_flag = True
             mosaic_path = assemble_tiles(
                 grid,
                 grid.tiles,
@@ -4241,6 +4264,7 @@ def run_grid_mode(
                 save_final_as_uint16=save_final_as_uint16,
                 legacy_rgb_cube=legacy_rgb_cube,
                 grid_rgb_equalize=grid_rgb_equalize,
+                final_mosaic_dbe_enabled=bool(grid_dbe_flag),
                 progress_callback=progress_callback,
                 progress_reporter=reporter,
             )

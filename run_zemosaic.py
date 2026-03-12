@@ -44,18 +44,11 @@
 import sys  # Ajout pour sys.path et sys.modules
 import multiprocessing
 import os
-import json
 import importlib.util
 import platform
 from pathlib import Path
 from typing import Optional
 # import reproject # L'import direct ici n'est pas crucial, mais ne fait pas de mal
-import tkinter as tk
-from tkinter import messagebox  # Nécessaire pour la messagebox d'erreur critique
-try:
-    import zemosaic_config
-except ImportError:
-    zemosaic_config = None
 
 # Tenter d'importer CUPY_AVAILABLE pour le nettoyage des ressources GPU
 try:
@@ -85,9 +78,37 @@ if _parent_dir_str not in sys.path:
     sys.path.insert(0, _parent_dir_str)
 
 # Essayer d'importer la classe GUI et la variable de disponibilité du worker
-try:
-    from zemosaic.zemosaic_gui import ZeMosaicGUI, ZEMOSAIC_WORKER_AVAILABLE
-    print("--- run_zemosaic.py: Import de zemosaic_gui RÉUSSI ---")
+ZeMosaicGUI = None
+ZEMOSAIC_WORKER_AVAILABLE = False
+_TKINTER_IMPORT_ERROR = None
+
+
+def _load_tkinter():
+    """Import tkinter lazily so Qt-only environments can still start."""
+    global _TKINTER_IMPORT_ERROR
+    try:
+        import tkinter as tk  # type: ignore
+        from tkinter import messagebox  # type: ignore
+        return tk, messagebox
+    except Exception as tk_import_error:
+        _TKINTER_IMPORT_ERROR = tk_import_error
+        return None, None
+
+
+def _load_tk_backend_components():
+    """Load Tk GUI components only when the Tk backend is selected."""
+    global ZeMosaicGUI, ZEMOSAIC_WORKER_AVAILABLE
+    try:
+        from zemosaic.zemosaic_gui import ZeMosaicGUI as _ZeMosaicGUI, ZEMOSAIC_WORKER_AVAILABLE as _WORKER_OK
+        ZeMosaicGUI = _ZeMosaicGUI
+        ZEMOSAIC_WORKER_AVAILABLE = _WORKER_OK
+        print("--- run_zemosaic.py: Import de zemosaic_gui RÉUSSI ---")
+    except ImportError as e:
+        print(f"ERREUR CRITIQUE (run_zemosaic): Impossible d'importer ZeMosaicGUI depuis zemosaic_gui.py: {e}")
+        print("  Veuillez vérifier que zemosaic_gui.py est présent et que toutes ses dépendances Python sont installées.")
+        ZEMOSAIC_WORKER_AVAILABLE = False
+        ZeMosaicGUI = None
+        return e
 
     # Vérifier le module zemosaic_worker si la GUI dit qu'il est disponible
     if ZEMOSAIC_WORKER_AVAILABLE:
@@ -120,24 +141,7 @@ try:
             print(
                 "ERREUR (run_zemosaic): zemosaic_worker importé mais n'a pas d'attribut __file__ (très étrange)."
             )
-
-except ImportError as e:
-    print(f"ERREUR CRITIQUE (run_zemosaic): Impossible d'importer ZeMosaicGUI depuis zemosaic_gui.py: {e}")
-    print("  Veuillez vérifier que zemosaic_gui.py est présent et que toutes ses dépendances Python sont installées.")
-    
-    try:
-        root_err = tk.Tk()
-        root_err.withdraw()
-        messagebox.showerror("Erreur de Lancement Fatale",
-                             f"Impossible d'importer le module GUI principal (zemosaic_gui.py).\n"
-                             f"Erreur: {e}\n\n"
-                             "Veuillez vérifier les logs console pour plus de détails.")
-        root_err.destroy()
-    except Exception as tk_err:
-        print(f"  Erreur Tkinter lors de la tentative d'affichage de la messagebox: {tk_err}")
-    
-    ZEMOSAIC_WORKER_AVAILABLE = False 
-    ZeMosaicGUI = None
+    return None
 
 print("--- run_zemosaic.py: FIN DES IMPORTS ---")
 print("DEBUG (run_zemosaic): sys.path complet:\n" + "\n".join(sys.path))
@@ -177,41 +181,6 @@ def _normalize_backend_value(candidate):
     return normalized if normalized in {"tk", "qt"} else None
 
 
-def _load_preferred_backend_from_config():
-    if zemosaic_config is None:
-        return None, False
-    get_path = getattr(zemosaic_config, "get_config_path", None)
-    if not callable(get_path):
-        return None, False
-    config_path = get_path()
-    if not isinstance(config_path, str) or not config_path:
-        return None, False
-    config_path = Path(config_path)
-    if not config_path.exists():
-        return None, False
-    try:
-        with config_path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except Exception:
-        return None, False
-    if not isinstance(data, dict):
-        return None, False
-    raw_value = data.get("preferred_gui_backend")
-    normalized = _normalize_backend_value(raw_value)
-    explicit_marker = data.get("preferred_gui_backend_explicit")
-    if isinstance(explicit_marker, bool):
-        explicit_flag = explicit_marker
-    elif isinstance(explicit_marker, str):
-        explicit_flag = explicit_marker.strip().lower() in {"1", "true", "yes", "on"}
-    elif isinstance(explicit_marker, (int, float)):
-        explicit_flag = explicit_marker != 0
-    else:
-        explicit_flag = False
-    if not explicit_flag and normalized == "qt":
-        explicit_flag = True
-    return normalized, explicit_flag
-
-
 def _notify_qt_backend_unavailable(error: Exception) -> None:
     """Inform the user that the Qt backend cannot be used."""
 
@@ -223,6 +192,9 @@ def _notify_qt_backend_unavailable(error: Exception) -> None:
     print(f"[run_zemosaic] Original import error: {error}")
     print("[run_zemosaic] Falling back to the classic Tk interface.")
 
+    tk, messagebox = _load_tkinter()
+    if tk is None or messagebox is None:
+        return
     try:
         root_warning = tk.Tk()
         root_warning.withdraw()
@@ -243,7 +215,7 @@ def _determine_backend(argv):
     """Determine which GUI backend should be used.
 
     The selection prioritises explicit command-line flags, then the environment
-    variable, and finally the saved preference from the user configuration.
+    variable. If nothing explicit is provided, Qt is always the default.
 
     Returns
     -------
@@ -251,35 +223,30 @@ def _determine_backend(argv):
         "tk" or "qt".
     cleaned_args : list[str]
         argv without the backend flags.
-    explicit_choice : bool
-        True if the user explicitly selected a backend (CLI, env, or stored).
+    source : str
+        One of: "cli", "env", or "default".
     """
 
-    config_backend, config_has_preference = _load_preferred_backend_from_config()
-
     requested_backend = None
-    explicit_choice = False
+    source = "default"
     cleaned_args = []
     for arg in argv:
         if arg == "--qt-gui":
             requested_backend = "qt"
-            explicit_choice = True
+            source = "cli"
             continue
         if arg == "--tk-gui":
             requested_backend = "tk"
-            explicit_choice = True
+            source = "cli"
             continue
         cleaned_args.append(arg)
 
     env_raw = os.environ.get("ZEMOSAIC_GUI_BACKEND")
     env_backend = _normalize_backend_value(env_raw)
-    env_specified = bool(env_raw)
 
-    if requested_backend is None:
-        if env_backend:
-            requested_backend = env_backend
-        elif config_backend:
-            requested_backend = config_backend
+    if requested_backend is None and env_backend:
+        requested_backend = env_backend
+        source = "env"
 
     backend = (requested_backend or "qt").strip().lower()
     if backend not in {"tk", "qt"}:
@@ -289,9 +256,7 @@ def _determine_backend(argv):
         )
         backend = "tk"
 
-    explicit_choice = explicit_choice or env_specified or config_has_preference
-
-    return backend, cleaned_args, explicit_choice
+    return backend, cleaned_args, source
 
 
 _OPENING_GIF_CANDIDATES = (
@@ -543,7 +508,7 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
 
-    backend, cleaned_args, explicit_choice = _determine_backend(argv)
+    backend, cleaned_args, backend_source = _determine_backend(argv)
     if cleaned_args != argv:
         sys.argv = [sys.argv[0], *cleaned_args]
 
@@ -559,6 +524,35 @@ def main(argv=None):
                 _play_opening_gif_animation_once()
                 exit_code = run_qt_main()
                 return exit_code
+
+        tk, messagebox = _load_tkinter()
+        if tk is None or messagebox is None:
+            print(
+                "[run_zemosaic] Tkinter est indisponible dans cet environnement Python.\n"
+                "Sous Debian/Ubuntu installez le paquet système: sudo apt install python3-tk\n"
+                "Sous Fedora/RHEL: sudo dnf install python3-tkinter\n"
+                "Puis recréez votre venv avec ce Python (ou lancez avec --qt-gui si PySide6 est installé).\n"
+                f"Détail de l'erreur: {_TKINTER_IMPORT_ERROR}"
+            )
+            return 1
+
+        gui_import_error = _load_tk_backend_components()
+        if gui_import_error is not None:
+            try:
+                root_err = tk.Tk()
+                root_err.withdraw()
+                messagebox.showerror(
+                    "Erreur de Lancement Fatale",
+                    (
+                        "Impossible d'importer le module GUI principal (zemosaic_gui.py).\n"
+                        f"Erreur: {gui_import_error}\n\n"
+                        "Veuillez vérifier les logs console pour plus de détails."
+                    ),
+                )
+                root_err.destroy()
+            except Exception as tk_err:
+                print(f"  Erreur Tkinter lors de la tentative d'affichage de la messagebox: {tk_err}")
+            return 1
 
         # Vérification de sys.modules au début de main
         if 'zemosaic_worker' in sys.modules:
@@ -585,7 +579,10 @@ def main(argv=None):
 
         print("DEBUG (main): ZEMOSAIC_WORKER_AVAILABLE est True. Tentative de création de l'interface graphique.")
         if backend != "qt":
-            print("[run_zemosaic] Launching ZeMosaic with the Tk backend.")
+            if backend_source in {"cli", "env"}:
+                print(f"[run_zemosaic] Launching ZeMosaic with the Tk backend (explicit {backend_source} override).")
+            else:
+                print("[run_zemosaic] Launching ZeMosaic with the Tk backend (automatic fallback from Qt).")
 
         root = tk.Tk()
         app = ZeMosaicGUI(root)
