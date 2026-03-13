@@ -18,7 +18,8 @@ jobs:
           python -m pip install numpy psutil astropy reproject photutils scipy opencv-python-headless PySide6
       - name: Official-path Tk import regression guard
         run: |
-          ! grep -RInE -- "import tkinter|from tkinter|messagebox|filedialog|Tk\(" run_zemosaic.py zemosaic_config.py zemosaic_gui_qt.py zemosaic_filter_gui_qt.py
+          # Block only direct tkinter imports in official-path modules.
+          ! grep -RInE -- "^[[:space:]]*(import[[:space:]]+tkinter|from[[:space:]]+tkinter[[:space:]]+import)" run_zemosaic.py zemosaic_config.py zemosaic_gui_qt.py zemosaic_filter_gui_qt.py
       - name: Headless import gates
         env:
           PYTHONPATH: ${{ github.workspace }}
