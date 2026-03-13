@@ -76,7 +76,7 @@ _pyside_spec = importlib.util.find_spec("PySide6")
 if _pyside_spec is None:  # pragma: no cover - import guard
     raise ImportError(
         "PySide6 is required to use the ZeMosaic Qt filter interface. "
-        "Install PySide6 or use the Tk interface instead."
+        "Install PySide6 to use the official ZeMosaic frontend."
     )
 
 from PySide6.QtCore import (

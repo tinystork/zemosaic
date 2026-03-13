@@ -97,13 +97,9 @@ from core.path_helpers import (
     safe_path_isfile,
 )
 
-try:
-    import lecropper  # noqa: F401
-
-    _LECROPPER_AVAILABLE = True
-except Exception:
-    lecropper = None
-    _LECROPPER_AVAILABLE = False
+# Annex tool: keep optional and lazy; official runtime must not depend on it.
+lecropper = None
+_LECROPPER_AVAILABLE = False
 
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
@@ -10930,15 +10926,8 @@ try:
 except ImportError:
     from solver_settings import SolverSettings  # type: ignore
 
-try:
-    from .lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
-except ImportError:
-    try:
-        from lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
-    except Exception:
-        _anchor_detect_autocrop = None
-
-ANCHOR_AUTOCROP_AVAILABLE = callable(_anchor_detect_autocrop)
+_anchor_detect_autocrop = None
+ANCHOR_AUTOCROP_AVAILABLE = False
 
 # Optional configuration import for GPU toggle
 try:
@@ -22572,7 +22561,7 @@ def run_hierarchical_mosaic_classic_legacy(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic V4.4.1','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic V4.5.0','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
@@ -26967,7 +26956,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic V4.4.1','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic V4.5.0','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")

@@ -1,0 +1,36 @@
+name: no-tk-on-official-path
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install minimal deps for import gates
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy psutil astropy reproject photutils scipy opencv-python-headless PySide6
+      - name: Official-path Tk import regression guard
+        run: |
+          ! grep -RInE -- "import tkinter|from tkinter|messagebox|filedialog|Tk\(" run_zemosaic.py zemosaic_config.py zemosaic_gui_qt.py zemosaic_filter_gui_qt.py
+      - name: Headless import gates
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -c "import zemosaic_config"
+          python -c "import zemosaic_worker"
+      - name: Ensure --tk-gui does not fallback
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import run_zemosaic
+          code = run_zemosaic.main(['--tk-gui'])
+          assert code in (0,1)
+          PY

@@ -1,0 +1,6 @@
+{
+  "language": "fr",
+  "preferred_gui_backend": "legacy_backend_name",
+  "preferred_gui_backend_explicit": true,
+  "input_dir": "./in"
+}

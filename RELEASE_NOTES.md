@@ -1,13 +1,13 @@
 # ZeMosaic 4.4.1
 
-- Platform: Windows x64
-- Package: Inno Setup installer
-- GPU: bundled CuPy CUDA 12.x build
-- Fallback: automatic CPU fallback when CUDA/CuPy is unavailable or incompatible
+## Qt-only / Tk retirement update
 
-## Notes
+- Qt (PySide6) is now the only official frontend runtime path.
+- Official startup no longer falls back to Tk (`--tk-gui` unsupported on official path).
+- `zemosaic_config` migration normalizes legacy `preferred_gui_backend=tk` to `qt` and neutralizes obsolete backend-selection state.
+- `lecropper` remains an annex/standalone legacy tool and is decoupled from official runtime/headless validated paths.
 
-- This release is intended for Windows x64 systems.
-- NVIDIA GPU acceleration is optional.
-- If the GPU runtime cannot be initialized, ZeMosaic falls back to CPU mode automatically.
-- The packaged installer should be published as a GitHub Release asset, not committed into Git history.
+## Compatibility / unsupported legacy
+
+- Legacy Tk frontend is not an official runtime path.
+- Full repo-wide removal of all Tk annex tools is out-of-scope for this release line.

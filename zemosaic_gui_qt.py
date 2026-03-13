@@ -136,8 +136,7 @@ try:
 except ImportError as exc:  # pragma: no cover - import guard
     raise ImportError(
         "Unable to import PySide6 which is required for the ZeMosaic Qt interface. "
-        "Install the optional dependency with `pip install PySide6` or continue "
-        "using the Tk interface."
+        "Install the optional dependency with `pip install PySide6`."
     ) from exc
 
 SYSTEM_NAME = platform.system().lower()
@@ -883,7 +882,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.4.1, Extractio Fundi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.5.0, Extractio Fundi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -1329,7 +1328,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _populate_skin_tab(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._create_skin_group())
-        layout.addWidget(self._create_backend_group())
         layout.addStretch(1)
 
     def _populate_language_tab(self, layout: QVBoxLayout) -> None:
@@ -3008,51 +3006,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         return group
 
-    def _create_backend_group(self) -> QGroupBox:
-        group = QGroupBox(
-            self._tr("qt_group_backend_title", "Preferred GUI backend"),
-            self,
-        )
-        layout = QFormLayout(group)
-        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-
-        backend_options = [
-            ("tk", self._tr("backend_option_tk", "Classic Tk GUI (stable)")),
-            ("qt", self._tr("backend_option_qt", "Qt GUI (preview)")),
-        ]
-        combo = QComboBox(group)
-        for value, label in backend_options:
-            combo.addItem(label, value)
-
-        current_backend = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
-        index = next(
-            (idx for idx, (value, _label) in enumerate(backend_options) if value == current_backend),
-            0,
-        )
-        combo.blockSignals(True)
-        combo.setCurrentIndex(index)
-        combo.blockSignals(False)
-
-        layout.addRow(
-            QLabel(self._tr("qt_field_preferred_backend", "Preferred backend"), group),
-            combo,
-        )
-
-        notice_label = QLabel(
-            self._tr(
-                "backend_change_notice",
-                "Backend change will take effect next time you launch ZeMosaic.",
-            ),
-            group,
-        )
-        notice_label.setWordWrap(True)
-        layout.addRow(notice_label)
-
-        combo.currentIndexChanged.connect(self._on_backend_selection_changed)  # type: ignore[arg-type]
-        self.backend_combo = combo
-
-        return group
-
     def _create_language_group(self) -> QGroupBox:
         group = QGroupBox(
             self._tr("qt_group_language_title", "Language"),
@@ -3224,20 +3177,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
         mode = data.strip().lower() or "system"
         self.config["qt_theme_mode"] = mode
         self._apply_theme(mode)
-
-    def _on_backend_selection_changed(self, index: int) -> None:
-        if self.backend_combo is None:
-            return
-        data = self.backend_combo.itemData(index)
-        backend = str(data or "").strip().lower()
-        if backend not in {"tk", "qt"}:
-            return
-        current = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
-        if backend == current:
-            return
-        self.config["preferred_gui_backend"] = backend
-        self.config["preferred_gui_backend_explicit"] = True
-        self._save_config()
 
     def _on_language_combo_changed(self, index: int) -> None:
         if self.language_combo is None:
@@ -4308,7 +4247,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.4.1, Extractio Fundi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.5.0, Extractio Fundi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):

@@ -64,12 +64,25 @@ except Exception:  # pragma: no cover - fallback when utils unavailable
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-try:  # Tkinter is optional for headless/CLI usage
-    import tkinter.filedialog as fd
-    import tkinter.messagebox as mb
-except Exception:  # pragma: no cover - depends on OS packages
-    fd = None
-    mb = None
+fd = None
+mb = None
+
+
+def _ensure_tk_dialogs_loaded() -> tuple[object | None, object | None]:
+    """Load tkinter dialog helpers lazily for legacy interactive prompts only."""
+    global fd, mb
+    if fd is not None or mb is not None:
+        return fd, mb
+    try:  # pragma: no cover - optional dependency
+        import tkinter.filedialog as _fd
+        import tkinter.messagebox as _mb
+    except Exception:
+        fd = None
+        mb = None
+        return fd, mb
+    fd = _fd
+    mb = _mb
+    return fd, mb
 
 CONFIG_FILE_NAME = "zemosaic_config.json"
 SYSTEM_NAME = platform.system().lower()
@@ -85,7 +98,7 @@ DEFAULT_CONFIG = {
     "astap_max_instances": 1,
     "astap_drizzled_fallback_enabled": False,
     "language": "en",
-    "preferred_gui_backend": "tk",  # "tk" or "qt"
+    "preferred_gui_backend": "qt",  # official runtime is Qt-only
     "preferred_gui_backend_explicit": False,
     "qt_theme_mode": "system",
     "qt_main_window_geometry": None,
@@ -538,17 +551,11 @@ def load_config():
             # Utiliser mb (messagebox) si disponible, sinon print
             msg_title = "Config Error"
             msg_text = f"Error reading {config_path}. Using default configuration."
-            try:
-                if mb: mb.showwarning(msg_title, msg_text)
-                else: print(f"WARNING: {msg_title} - {msg_text}")
-            except Exception: print(f"WARNING: {msg_title} - {msg_text} (messagebox error)")
+            print(f"WARNING: {msg_title} - {msg_text}")
         except Exception as e:
             msg_title = "Config Error"
             msg_text = f"Unexpected error reading {config_path}: {e}. Using defaults."
-            try:
-                if mb: mb.showerror(msg_title, msg_text)
-                else: print(f"ERROR: {msg_title} - {msg_text}")
-            except Exception: print(f"ERROR: {msg_title} - {msg_text} (messagebox error)")
+            print(f"ERROR: {msg_title} - {msg_text}")
     # else:
         # print(f"Config file not found at {config_path}. Using default configuration.")
     current_config.setdefault("crop_follow_signal", False)
@@ -568,6 +575,15 @@ def load_config():
                 current_config[key] = str(expanded)
     _apply_astap_platform_defaults(current_config)
     _normalize_gpu_flags(current_config)
+
+    # Qt-only migration: backend selection is obsolete in official runtime.
+    # Keep backward readability for legacy config files, but neutralize runtime state.
+    legacy_backend = str(current_config.get("preferred_gui_backend", "") or "").strip().lower()
+    if legacy_backend == "tk":
+        current_config["preferred_gui_backend"] = "qt"
+    elif legacy_backend != "qt":
+        current_config["preferred_gui_backend"] = "qt"
+    current_config["preferred_gui_backend_explicit"] = False
 
     def _env_flag(env_key: str, default: bool) -> bool:
         val = os.environ.get(env_key)
@@ -602,6 +618,10 @@ def load_config():
 
 def save_config(config_data):
     _normalize_gpu_flags(config_data)
+    # Qt-only official runtime: always persist neutral backend selection state.
+    if isinstance(config_data, dict):
+        config_data["preferred_gui_backend"] = "qt"
+        config_data["preferred_gui_backend_explicit"] = False
     config_path = Path(get_config_path())
     config_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -653,10 +673,7 @@ def save_config(config_data):
     except IOError as e:
         msg_title = "Config Error"
         msg_text = f"Unable to save configuration to {config_path}:\n{e}"
-        try:
-            if mb: mb.showerror(msg_title, msg_text)
-            else: print(f"ERROR: {msg_title} - {msg_text}")
-        except Exception: print(f"ERROR: {msg_title} - {msg_text} (messagebox error)")
+        print(f"ERROR: {msg_title} - {msg_text}")
         return False
 
 # Les fonctions ask_and_set_... et get_... restent les mêmes,
@@ -668,7 +685,8 @@ def save_config(config_data):
 
 def ask_and_set_astap_path(current_config):
     """Prompt the user for the ASTAP executable in a cross-platform friendly way."""
-    if fd is None:
+    dialog_fd, dialog_mb = _ensure_tk_dialogs_loaded()
+    if dialog_fd is None:
         print("ASTAP path prompt unavailable (tkinter non installé).")
         return current_config.get("astap_executable_path", "")
 
@@ -683,20 +701,20 @@ def ask_and_set_astap_path(current_config):
     else:
         filetypes = (("Binaires", "astap"), ("Tous les fichiers", "*"))
 
-    astap_path = fd.askopenfilename(
+    astap_path = dialog_fd.askopenfilename(
         title="Sélectionner l'exécutable ASTAP",
         filetypes=filetypes,
     )
     if IS_MAC and not astap_path:
         # Allow selecting the .app bundle if the binary is hidden.
-        astap_path = fd.askdirectory(title="Sélectionner l'application ASTAP (.app)")
+        astap_path = dialog_fd.askdirectory(title="Sélectionner l'application ASTAP (.app)")
 
     resolved_path = _resolve_astap_executable(astap_path)
     if not resolved_path:
         if astap_path:
             message = f"Le chemin sélectionné ne semble pas contenir l'exécutable ASTAP: {astap_path}"
-            if mb:
-                mb.showwarning("Chemin ASTAP invalide", message, parent=None)
+            if dialog_mb:
+                dialog_mb.showwarning("Chemin ASTAP invalide", message, parent=None)
             else:
                 print(f"WARNING: {message}")
         return current_config.get("astap_executable_path", "")
@@ -704,8 +722,8 @@ def ask_and_set_astap_path(current_config):
     current_config["astap_executable_path"] = resolved_path
     if save_config(current_config):
         msg = f"Chemin ASTAP défini à : {resolved_path}"
-        if mb:
-            mb.showinfo("Chemin ASTAP Défini", msg, parent=None)
+        if dialog_mb:
+            dialog_mb.showinfo("Chemin ASTAP Défini", msg, parent=None)
         else:
             print(msg)
     return resolved_path
@@ -713,19 +731,20 @@ def ask_and_set_astap_path(current_config):
 
 def ask_and_set_astap_data_dir_path(current_config):
     """Prompt for the ASTAP star database directory."""
-    if fd is None:
+    dialog_fd, dialog_mb = _ensure_tk_dialogs_loaded()
+    if dialog_fd is None:
         print("ASTAP data directory prompt indisponible (tkinter non installé).")
         return current_config.get("astap_data_directory_path", "")
 
-    astap_data_dir = fd.askdirectory(
+    astap_data_dir = dialog_fd.askdirectory(
         title="Sélectionner le dossier de données ASTAP (contenant G17, H17, etc.)"
     )
     resolved_dir = _resolve_astap_data_dir(astap_data_dir)
     if not resolved_dir:
         if astap_data_dir:
             message = f"Le dossier sélectionné n'existe pas ou ne contient pas les catalogues ASTAP: {astap_data_dir}"
-            if mb:
-                mb.showwarning("Dossier ASTAP invalide", message, parent=None)
+            if dialog_mb:
+                dialog_mb.showwarning("Dossier ASTAP invalide", message, parent=None)
             else:
                 print(f"WARNING: {message}")
         return current_config.get("astap_data_directory_path", "")
@@ -733,8 +752,8 @@ def ask_and_set_astap_data_dir_path(current_config):
     current_config["astap_data_directory_path"] = resolved_dir
     if save_config(current_config):
         msg = f"Dossier de données ASTAP défini à : {resolved_dir}"
-        if mb:
-            mb.showinfo("Dossier Données ASTAP Défini", msg, parent=None)
+        if dialog_mb:
+            dialog_mb.showinfo("Dossier Données ASTAP Défini", msg, parent=None)
         else:
             print(msg)
     return resolved_dir

@@ -42,7 +42,6 @@ hiddenimports = [
     'locales.zemosaic_localization',
     'solver_settings',
     'zemosaic_config',
-    'lecropper',
     'zemosaic_worker',
     'zemosaic_astrometry',
     'zemosaic_filter_gui',
@@ -61,9 +60,6 @@ if importlib.util.find_spec("matplotlib") is not None:
             "matplotlib.backends.backend_qtagg",
             "matplotlib.backends.backend_qt",
             "matplotlib.backends.qt_compat",
-            "matplotlib.backends.backend_tkagg",
-            "matplotlib.backends._backend_tk",
-            "matplotlib.backends._tkagg",
         ]
     )
     try:

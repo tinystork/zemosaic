@@ -8,6 +8,8 @@ It was born out of a need from an astrophotography Discord community called the 
 
 ## 🚀 Key Features
 
+> Note: `lecropper` remains an annex/standalone legacy tool and is not part of the official runtime path.
+
 - Astrometric alignment using **ASTAP**
 - Smart tile grouping and automatic clustering
 - Configurable stacking with:
@@ -18,7 +20,7 @@ It was born out of a need from an astrophotography Discord community called the 
   - `Reproject & Coadd` (high quality, RAM-intensive)
   - `Incremental` (low memory, scalable)
 - Stretch preview generation (ASIFits-style)
-- GUI built with **Tkinter**, fully translatable (EN/FR)
+- Official GUI built with **PySide6 (Qt)**, fully translatable (EN/FR)
 - Flexible FITS export with configurable `axis_order` (default `HWC`) and
   proper `BSCALE`/`BZERO` for float images
 - Option to save the final mosaic as 16-bit integer FITS
@@ -269,12 +271,9 @@ photutils for source detection and background estimation
 
 psutil for memory monitoring
 
-tkinter for the graphical user interface
+PySide6 (Qt) for the official graphical user interface
 
-> **Note (Linux/macOS):** Tkinter is bundled with the official Python installers.
-> On minimal Linux distributions you must install it via your package manager
-> (e.g. `sudo apt install python3-tk` or `sudo dnf install python3-tkinter`).
-> It is not published as a pip package named `tk`.
+> **Note (Linux/macOS):** The official ZeMosaic frontend is Qt-only and requires `PySide6`.
 
 📦 Installation & Usage
 1. 🔧 Install Python dependencies
@@ -331,13 +330,11 @@ Select stacking and assembly options
 
 Click Start Hierarchical Mosaic
 
-### Optional Qt interface (preview)
+### Official Qt interface
 
-ZeMosaic now ships with an experimental PySide6/Qt interface in addition to the
-classic Tk GUI. Tk remains the default and continues to work even when PySide6
-is not installed.
+ZeMosaic now uses a PySide6/Qt interface as the only official frontend.
 
-To try the Qt frontend:
+To run the official frontend:
 
 1. Install the optional dependency:
 
@@ -348,15 +345,10 @@ To try the Qt frontend:
 2. Launch ZeMosaic with either of the following options:
 
    ```bash
-   # Via command-line flag
-   python run_zemosaic.py --qt-gui
-
-   # Or via environment variable
-   ZEMOSAIC_GUI_BACKEND=qt python run_zemosaic.py
+   python run_zemosaic.py
    ```
 
-If PySide6 is unavailable or an import error occurs, ZeMosaic automatically
-falls back to the Tk interface without interrupting your workflow.
+If PySide6 is unavailable, ZeMosaic reports a clear startup error. No Tk fallback is used on the official path.
 
 #### Automatic ZeAnalyser / Beforehand Tool Discovery (Qt GUI)
 To enable the `Analyse` button, install a compatible analysis tool in the parent directory of `zemosaic/`. ZeMosaic auto-detects them at startup.
@@ -423,8 +415,7 @@ reference implementation.
 
 ### macOS quickstart
 
-1. Install Python 3.11+ from [python.org](https://www.python.org/downloads/) (includes Tk).  
-   Homebrew users should also `brew install tcl-tk` and follow the caveats so Tk can be located.
+1. Install Python 3.11+ from [python.org](https://www.python.org/downloads/).
 2. Download the macOS ASTAP `.dmg`, drag `ASTAP.app` into `/Applications`, then install the star catalogs
    (D50/H17) under `/Library/Application Support/ASTAP` or `~/Library/Application Support/ASTAP`.
 3. Inside the project folder run:
@@ -447,14 +438,14 @@ reference implementation.
 
 ### Linux quickstart
 
-1. Install Python, pip, Tk, and build tooling via your package manager. Example for Debian/Ubuntu:
+1. Install Python, pip, and build tooling via your package manager. Example for Debian/Ubuntu:
 
    ```bash
    sudo apt update
-   sudo apt install python3 python3-venv python3-pip python3-tk python3-dev build-essential
+   sudo apt install python3 python3-venv python3-pip python3-dev build-essential
    ```
 
-   Fedora/RHEL users can run `sudo dnf install python3 python3-venv python3-pip python3-tkinter`.
+   Fedora/RHEL users can run `sudo dnf install python3 python3-venv python3-pip`.
 
 2. Install the ASTAP Linux package (from https://www.hnsky.org/astap.htm) and the desired star catalogs.
    The default installer places binaries under `/usr/bin/astap` and data under `/opt/astap`.
@@ -577,7 +568,7 @@ an inter-process lock:
 
 Notes:
 - Resources `locales/`, `icon/`, and `gif/` are bundled via `ZeMosaic.spec`.
-- Keep `PySide6` installed if you want the Qt GUI in the packaged build; otherwise the Tk GUI is used.
+- `PySide6` is required for the official packaged frontend (Qt-only).
 - `matplotlib` is optional: if missing, the Qt filter preview is disabled.
 - `cupy-cuda12x` is optional: if missing (or if NVIDIA drivers are missing/incompatible, or if required CUDA DLLs are not present on the target machine), ZeMosaic falls back to CPU. On Windows this often means having CUDA Toolkit (or at least its runtime DLLs) available via `%CUDA_PATH%\\bin`/`PATH`.
 - `requirements.txt` keeps the current working GPU setup (`cupy-cuda12x`). `requirements_no_gpu.txt` is available for CPU-only builds when you want a smaller artifact.
@@ -652,7 +643,7 @@ Mini smoke-test (packaged build):
 
 Notes :
 - Les ressources `locales/`, `icon/`, et `gif/` sont embarquees via `ZeMosaic.spec`.
-- Gardez `PySide6` installe si vous voulez l'interface Qt ; sinon l'interface Tk est utilisee.
+- `PySide6` est requis pour l'interface officielle packagée (Qt-only).
 - `matplotlib` est optionnel : s'il manque, l'aperçu (Qt filter preview) est désactivé.
 - `cupy-cuda12x` est optionnel : s'il manque (ou si les drivers NVIDIA sont absents/incompatibles, ou si les DLL CUDA nécessaires ne sont pas présentes sur la machine cible), ZeMosaic retombe en CPU. Sous Windows cela implique souvent CUDA Toolkit (ou au minimum ses DLL runtime) accessibles via `%CUDA_PATH%\\bin`/`PATH`.
 - `requirements.txt` conserve le setup GPU actuel qui fonctionne (`cupy-cuda12x`). `requirements_no_gpu.txt` est disponible pour produire des builds CPU-only plus petits.
