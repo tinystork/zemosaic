@@ -10942,6 +10942,8 @@ try:
         gpu_stack_from_paths as _p3_gpu_stack_from_paths,
         GPUStackingError as _P3GPUStackingError,
         _gpu_is_usable as _p3_gpu_is_usable,
+        get_phase3_gpu_runtime_stats as _get_p3_gpu_runtime_stats,
+        reset_phase3_gpu_runtime_stats as _reset_p3_gpu_runtime_stats,
     )
     _P3_GPU_HELPERS_AVAILABLE = True
 except Exception:
@@ -10952,6 +10954,12 @@ except Exception:
 
     def _p3_gpu_is_usable(logger=None):
         return False
+
+    def _get_p3_gpu_runtime_stats():
+        return {}
+
+    def _reset_p3_gpu_runtime_stats():
+        return None
 
     _P3_GPU_HELPERS_AVAILABLE = False
 
@@ -18785,10 +18793,20 @@ def run_hierarchical_mosaic_classic_legacy(
             ctx.setdefault("use_gpu_phase5", bool(use_gpu_phase5))
         except Exception:
             pass
+        try:
+            p3_runtime = _get_p3_gpu_runtime_stats()
+            if isinstance(p3_runtime, dict) and p3_runtime:
+                ctx.update(p3_runtime)
+        except Exception:
+            pass
         if extra:
             ctx.update(extra)
         return ctx
 
+    try:
+        _reset_p3_gpu_runtime_stats()
+    except Exception:
+        pass
     telemetry.maybe_emit_stats(_telemetry_context({"phase_name": "Init", "phase_index": 0}))
 
 
@@ -23949,10 +23967,20 @@ def run_hierarchical_mosaic(
             ctx.setdefault("use_gpu_phase5", bool(use_gpu_phase5))
         except Exception:
             pass
+        try:
+            p3_runtime = _get_p3_gpu_runtime_stats()
+            if isinstance(p3_runtime, dict) and p3_runtime:
+                ctx.update(p3_runtime)
+        except Exception:
+            pass
         if extra:
             ctx.update(extra)
         return ctx
 
+    try:
+        _reset_p3_gpu_runtime_stats()
+    except Exception:
+        pass
     telemetry.maybe_emit_stats(_telemetry_context({"phase_name": "Init", "phase_index": 0}))
 
 

@@ -5319,6 +5319,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         ram_total_mb = payload.get("ram_total_mb")
         gpu_used_mb = payload.get("gpu_used_mb")
         gpu_total_mb = payload.get("gpu_total_mb")
+        gpu_util_percent = payload.get("gpu_util_percent")
         parts: List[str] = []
         if isinstance(cpu_percent, (int, float)):
             parts.append(f"CPU {cpu_percent:4.1f}%")
@@ -5329,8 +5330,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if isinstance(gpu_used_mb, (int, float)) and isinstance(gpu_total_mb, (int, float)) and gpu_total_mb > 0:
             used_gib = gpu_used_mb / 1024.0
             total_gib = gpu_total_mb / 1024.0
-            gpu_percent = 100.0 * (gpu_used_mb / gpu_total_mb)
-            parts.append(f"GPU {gpu_percent:4.1f}% ({used_gib:4.1f} / {total_gib:4.1f} GiB)")
+            if isinstance(gpu_util_percent, (int, float)):
+                parts.append(
+                    f"GPU {float(gpu_util_percent):4.1f}% ({used_gib:4.1f} / {total_gib:4.1f} GiB)"
+                )
+            else:
+                gpu_percent = 100.0 * (gpu_used_mb / gpu_total_mb)
+                parts.append(f"GPU {gpu_percent:4.1f}% ({used_gib:4.1f} / {total_gib:4.1f} GiB)")
         if self.resource_monitor_label is not None:
             self.resource_monitor_label.setText(" | ".join(parts) if parts else "")
 

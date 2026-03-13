@@ -76,10 +76,30 @@ WSC_STREAM_OVERHEAD = float(os.environ.get("ZEMOSAIC_WSC_STREAM_OVERHEAD", 12.0)
 _WSC_GPU_PARITY_CHECKED = False
 _WSC_GPU_PARITY_OK = False
 _WSC_GPU_PARITY_MAX_ABS: float | None = None
+_P3_GPU_RUNTIME_STATS: dict[str, Any] = {}
 
 
 class GPUStackingError(RuntimeError):
     """Raised when GPU-based stacking is unavailable or fails."""
+
+
+def reset_phase3_gpu_runtime_stats() -> None:
+    """Clear last-known Phase 3 GPU runtime metrics."""
+
+    _P3_GPU_RUNTIME_STATS.clear()
+
+
+def get_phase3_gpu_runtime_stats() -> dict[str, Any]:
+    """Return a shallow copy of the latest Phase 3 GPU runtime metrics."""
+
+    return dict(_P3_GPU_RUNTIME_STATS)
+
+
+def _update_phase3_gpu_runtime_stats(**kwargs: Any) -> None:
+    try:
+        _P3_GPU_RUNTIME_STATS.update(kwargs)
+    except Exception:
+        pass
 
 
 def _available_ram_bytes() -> int | None:
@@ -242,9 +262,31 @@ def _gpu_safe_mode_enabled() -> bool:
     return os.environ.get("ZEMOSAIC_GPU_SAFE_MODE", "").strip() == "1"
 
 
+def _is_cupy_runtime_unavailable_error(exc: Exception) -> bool:
+    """Return True when CuPy is present but required CUDA runtime/compiler libs are missing."""
+
+    try:
+        msg = str(exc).lower()
+    except Exception:
+        msg = repr(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "libnvrtc",
+            "nvrtc64",
+            "dynamiclibnotfounderror",
+            "failure finding \"libnvrtc",
+            "failure finding 'libnvrtc",
+            "cuda runtime",
+            "cudart",
+            "nvrtc",
+        )
+    )
+
+
 def _gpu_is_usable(logger: logging.Logger | None = None) -> bool:
     """
-    Return True if a CUDA device is available and a tiny CuPy allocation works.
+    Return True if a CUDA device is available and core CuPy ops work.
 
     The result is cached because devices rarely change between calls.
     """
@@ -258,12 +300,22 @@ def _gpu_is_usable(logger: logging.Logger | None = None) -> bool:
         return False
     try:
         cp.cuda.runtime.getDeviceCount()
-        cp.zeros((4, 4), dtype=cp.float32)
+        probe = cp.zeros((4, 4), dtype=cp.float32)
+        # Force a tiny reduction kernel compilation so missing NVRTC/libcudart
+        # is detected here instead of later during Phase 3 chunk processing.
+        _ = float(cp.sum(probe).item())
         _GPU_HEALTHY = True
     except Exception as exc:  # pragma: no cover - GPU failure path
         if logger:
             try:
-                logger.debug("CuPy GPU smoke test failed: %s", exc)
+                if _is_cupy_runtime_unavailable_error(exc):
+                    logger.warning(
+                        "CuPy detected but CUDA runtime/compiler support is incomplete (%s). "
+                        "Disabling GPU path and falling back to CPU.",
+                        exc,
+                    )
+                else:
+                    logger.debug("CuPy GPU smoke test failed: %s", exc)
             except Exception:
                 pass
         _GPU_HEALTHY = False
@@ -1659,6 +1711,27 @@ def gpu_stack_from_arrays(
         )
 
     duration = time.perf_counter() - start_time
+    total_profile_ms = prof_upload_ms + prof_reject_ms + prof_combine_ms + prof_download_ms
+    upload_share = (100.0 * prof_upload_ms / total_profile_ms) if total_profile_ms > 0.0 else None
+    compute_share = (
+        100.0 * (prof_reject_ms + prof_combine_ms) / total_profile_ms
+    ) if total_profile_ms > 0.0 else None
+    download_share = (100.0 * prof_download_ms / total_profile_ms) if total_profile_ms > 0.0 else None
+    _update_phase3_gpu_runtime_stats(
+        p3_gpu_last_rows_per_chunk=int(rows_per_chunk),
+        p3_gpu_last_total_rows=int(height),
+        p3_gpu_last_frames=int(len(frames_for_stack)),
+        p3_gpu_last_duration_s=float(duration),
+        p3_gpu_last_upload_ms=float(prof_upload_ms),
+        p3_gpu_last_reject_ms=float(prof_reject_ms),
+        p3_gpu_last_combine_ms=float(prof_combine_ms),
+        p3_gpu_last_download_ms=float(prof_download_ms),
+        p3_gpu_last_upload_share_pct=float(upload_share) if upload_share is not None else None,
+        p3_gpu_last_compute_share_pct=float(compute_share) if compute_share is not None else None,
+        p3_gpu_last_download_share_pct=float(download_share) if download_share is not None else None,
+        p3_gpu_last_algo=str(algo),
+        p3_gpu_last_used=True,
+    )
     if pcb_tile:
         try:
             pcb_tile(
