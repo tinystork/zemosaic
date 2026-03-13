@@ -78,6 +78,17 @@ For this mission, distinguish strictly between:
 The mission may reduce only the **working-set size** and/or **active parallelism**.
 It must preserve the **logical stack size**.
 
+## Invariant test contract (must remain true)
+
+For every logical master tile, adaptive behavior must preserve scientific membership exactly:
+
+- `logical_input_count_before == logical_input_count_after`
+- `logical_input_frame_ids_before == logical_input_frame_ids_after`
+- zero tolerance for silent raw-frame dropping in adaptive mode
+
+These checks are release-gating invariants, not best-effort goals.
+
+
 ---
 
 ## Current understanding to validate and refine
@@ -94,10 +105,27 @@ What is still missing is the full adaptive loop that:
 - reacts to **runtime RAM pressure**
 - limits how many master tiles are started
 - recomputes per-task memory budgets dynamically
-- preserves all raw frames in the logical tile
+- preserves full logical-stack frame membership in the tile
 - avoids eager submission of all Phase 3 tasks at once
 
 Do not assume the current implementation already satisfies that contract until audited.
+
+## Exactness policy by combine/rejection mode
+
+Before enabling adaptive behavior per mode, classify exactness explicitly:
+
+| Mode | Exact streaming/chunked implementation available? | Approximate fallback allowed by default? | Mandatory logging when adaptation applies |
+|---|---|---|---|
+| mean / weighted mean | yes (expected) | no | yes |
+| median | to validate explicitly | no | yes |
+| winsorized sigma clip | to validate explicitly | no | yes |
+| other active rejection modes | to validate explicitly | no | yes |
+
+Rules:
+- no approximation is enabled silently
+- if exactness is not proven for a mode, keep conservative behavior and document limitation first
+- any mode-specific limitation must be recorded before changing runtime behavior
+
 
 ---
 
@@ -108,7 +136,7 @@ The preferred implementation direction is:
 1. **lazy Phase 3 scheduling**
 2. **runtime RAM controller with hysteresis**
 3. **adaptive per-tile working-set sizing**
-4. **all-frames-preserving execution**
+4. **logical-stack-preserving execution**
 
 That means:
 
@@ -117,7 +145,30 @@ That means:
 - do not rely only on a static pre-phase memory estimate
 - do not rely only on semaphores if tasks are already all submitted
 
+
+## Default controller profile (initial tuning, adjustable)
+
+Unless overridden by explicit runtime configuration, start from:
+
+- RAM target: `80%`
+- high-pressure threshold: `82%`
+- recovery threshold: `72%`
+- minimum adaptation cooldown: `10s`
+- maximum adaptation-level changes: `6 / minute`
+
+These are starting defaults for stable behavior on hybrid laptops and must remain configurable.
+
 ---
+
+## RAM pressure signal source (single decision surface)
+
+Adaptation decisions must be driven by one explicit decision surface, documented and testable:
+
+- primary signal: system memory pressure (`used_percent`)
+- supporting signals: available RAM bytes and swap activity (if present)
+- process-local memory may be logged for diagnostics, but controller decisions must remain consistent with the chosen primary signal
+
+Do not mix incompatible RAM definitions silently across code paths.
 
 ## Proof requirements
 
@@ -134,9 +185,36 @@ If a claim depends on a limitation of a combine/rejection method, document that 
 
 ---
 
+## Ordered degradation policy (operational pseudocode)
+
+```
+if RAM > high_threshold:
+  1) reduce future active launches (lazy scheduler budget)
+  2) reduce per-pass frames (working-set shrink)
+  3) reduce rows/chunk size (working-set shrink)
+  4) if special path requires, serialize that path narrowly
+
+if RAM remains high after minimum limits reached:
+  - stop admitting new Phase 3 launches temporarily
+  - keep in-flight tasks safe and observable
+  - emit explicit pressure alert/telemetry event
+
+if RAM < recovery_threshold and cooldown elapsed:
+  - gradually restore chunk/pass/launch budgets
+```
+
+The order is mandatory unless an explicit mode limitation is documented first.
+
 ## Phase execution contract
 
-### [ ] S0 — Baseline audit and invariant lock
+## Glossary (mission-local terms)
+
+- **logical stack**: full set of raw frames scientifically assigned to a master tile
+- **working-set**: subset of data resident in RAM at one instant (passes/chunks)
+- **active launch**: Phase 3 tile job admitted for execution
+- **tile pass**: one processing pass over a subset of tile frames
+
+### [x] S0 — Baseline audit and invariant lock
 Goal:
 - lock the scientific invariant: **all raw frames preserved**
 - audit how Phase 2 and Phase 3 currently control memory
@@ -155,7 +233,7 @@ Hard prohibitions:
 - no implementation yet
 - no silent behavior change
 
-### [ ] S1 — Adaptive strategy design
+### [x] S1 — Adaptive strategy design
 Goal:
 - define the target adaptive controller before editing code
 
@@ -173,7 +251,7 @@ Expected outputs:
 Hard prohibition:
 - do not implement heuristics before they are written down
 
-### [ ] S2 — Scheduler refactor for Phase 3 launch control
+### [x] S2 — Scheduler refactor for Phase 3 launch control
 Goal:
 - stop eager launch behavior from undermining runtime adaptation
 
@@ -186,7 +264,7 @@ Required work:
 Mandatory gate:
 - runtime must be able to reduce future task launches without changing logical tile content
 
-### [ ] S3 — Per-tile adaptive working-set control
+### [x] S3 — Per-tile adaptive working-set control
 Goal:
 - make each Phase 3 task adapt its RAM footprint while preserving all frames
 
@@ -199,7 +277,7 @@ Required work:
 Mandatory gate:
 - adaptation changes only working-set size, not logical membership
 
-### [ ] S4 — Runtime RAM controller and telemetry
+### [x] S4 — Runtime RAM controller and telemetry
 Goal:
 - use observed RAM pressure, not only static estimates
 
@@ -212,7 +290,7 @@ Required work:
 Mandatory gate:
 - logs/telemetry make adaptation decisions explainable
 
-### [ ] S5 — Validation and non-regression tests
+### [x] S5 — Validation and non-regression tests
 Goal:
 - prove the adaptive design preserves quality intent while reducing memory risk
 
@@ -238,3 +316,36 @@ Possible later refinements:
 - per-mode exact streaming optimization
 - dedicated GPU semaphore for Phase 3
 
+
+
+---
+
+## Active add-on mission (2026-03-13) — Phase 5 slowdown after intertile anchor event
+
+Context trigger:
+- During real runs, after log event
+  - `[Intertile] Anchor selection biased: anchor=...`
+  users observe a strong slowdown and suspect GPU is no longer used.
+
+Mission objective:
+- Diagnose and optimize the post-intertile Phase 5 path, with focus on:
+  1. intertile calibration execution mode (single-worker fallback vs parallel fallback)
+  2. Two-Pass coverage renorm performance (`stage=gains`)
+  3. explicit GPU/CPU activity attribution in telemetry and logs
+- Preserve scientific output behavior unless explicitly approved otherwise.
+
+Non-negotiable rules for this add-on mission:
+1. Do not disable intertile correction globally as a speed shortcut.
+2. Do not reduce scientific tile membership or output fidelity to gain speed.
+3. Keep changes surgical to intertile / Phase 5 / two-pass performance paths.
+4. Every optimization must include before/after proof in `memory.md`.
+5. If a fallback is required, prefer safe multi-worker thread fallback over forced single-worker when correctness allows.
+
+Required deliverables:
+- Root-cause map of where time is spent after anchor selection.
+- Clear classification: GPU-active stages vs CPU-bound stages.
+- Optimization patch(es) for the dominant bottleneck(s), starting with:
+  - intertile fallback mode,
+  - two-pass gains computation path.
+- Updated telemetry keys/messages making the runtime state unambiguous.
+- Non-regression tests (correctness + behavioral contract) and benchmark notes.

@@ -1271,3 +1271,695 @@ Exploration only, no mission started yet.
 - All-raw-frames invariant changed or stayed unchanged: changed (now explicitly locked as the central mission invariant).
 - Phase 3 launch control changed or stayed unchanged: stayed unchanged (planning only).
 - Working-set adaptation changed or stayed unchanged: stayed unchanged (planning only).
+
+
+### 2026-03-13 17:19 — Iteration 36
+- Scope: Documentation hardening of mission files to improve clarity and prevent regression.
+- In scope:
+  - strengthen invariant as testable contract in `agent.md`
+  - add explicit exactness policy matrix per combine/rejection mode in `agent.md`
+  - add anti-oscillation controller guardrails in `followup.md`
+  - add critical non-regression gates in `followup.md`
+- Out of scope:
+  - runtime code changes
+  - scheduler implementation changes
+  - telemetry implementation changes
+- Files changed:
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - static content verification by direct file edit and section-presence checks
+- Proof:
+  - mission docs now include explicit equality invariants for logical membership
+  - mission docs now include mode exactness policy table and no-approximation-by-default rule
+  - checklist now includes explicit hysteresis/cooldown/rate-limit constraints
+  - checklist now includes critical non-regression gates prior to mission gate
+- Decisions:
+  - documentation-only hardening accepted
+- Blockers:
+  - none
+- Next unchecked item:
+  - B1. Scientific invariant (execution checklist remains open; no mission implementation performed)
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (clarified and made testable).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged (docs only).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (docs only).
+
+
+### 2026-03-13 17:22 — Iteration 37
+- Scope: Mission-document precision pass for operational clarity and regression prevention.
+- In scope:
+  - add numeric default controller profile in `agent.md`
+  - add explicit RAM signal source-of-truth policy in `agent.md`
+  - add ordered degradation pseudocode and extreme-pressure behavior in `agent.md`
+  - add mission glossary in `agent.md`
+  - refine checklist wording in `followup.md` (scientific outputs scope, anti-thrashing criterion, minimum-limit pressure behavior, RAM signal definition)
+- Out of scope:
+  - runtime code changes
+  - scheduler implementation changes
+  - telemetry implementation changes
+  - test execution
+- Files changed:
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - static mission-file consistency review after edits
+- Proof:
+  - mission docs now include explicit default thresholds and cooldown/rate constraints
+  - mission docs now include single RAM decision surface requirement
+  - mission docs now include mandatory degradation order pseudocode and extreme-pressure fallback
+  - mission docs now include glossary and clarified non-regression output scope
+- Decisions:
+  - documentation hardening accepted; implementation scope intentionally unchanged
+- Blockers:
+  - none
+- Next unchecked item:
+  - B1. Scientific invariant (execution checklist still open; no implementation performed)
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (further clarified).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged (docs only).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (docs only).
+
+
+### 2026-03-13 17:26 — Iteration 38
+- Scope: Terminology harmonization pass across mission documents (no behavior change).
+- In scope:
+  - align `followup.md` wording with `agent.md` glossary (`logical stack`, `logical stack membership`)
+  - align `agent.md` phrasing for preservation target terminology
+- Out of scope:
+  - runtime code changes
+  - scheduler/controller logic changes
+  - test execution
+- Files changed:
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - static textual consistency check by direct diff review
+- Proof:
+  - mission files now use consistent glossary-aligned terms for membership invariants
+- Decisions:
+  - keep semantics unchanged; wording-only normalization
+- Blockers:
+  - none
+- Next unchecked item:
+  - B1. Scientific invariant
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (wording harmonized only).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 17:46 — Iteration 39
+- Scope: S0 baseline audit and invariant lock (no runtime behavior change).
+- In scope:
+  - baseline audit of Phase 2 splitting behavior in active worker path
+  - baseline audit of Phase 3 launch/concurrency/memory levers
+  - explicit acceptable vs non-acceptable splitting criteria for this mission
+  - lock invariant status in mission tracking checklists
+- Out of scope:
+  - runtime code changes
+  - scheduler refactor
+  - telemetry implementation changes
+  - test execution on datasets
+- Files changed:
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - static code-path audit with file/line references
+- Proof:
+  - Invariant explicitly locked at mission level (agent): logical stack preserved; adaptation constrained to working-set/parallelism.
+  - Phase 2 baseline (active run path `run_hierarchical_mosaic`):
+    - preplan strict mapping enabled (`zemosaic_worker.py:25103-25142`), prevents runtime auto-limit split (`25632`).
+    - RAM-budget recluster/split path exists (`25178`, helper `10675`).
+    - auto-split helper path exists (`25484`, helper `10547`).
+    - manual cap split exists (`25509-25517`).
+    - overlap batching can duplicate membership across batches (`25532-25555`, helper `10447`) and is therefore not acceptable under strict per-logical-stack equality invariant.
+  - Phase 3 baseline (active run path):
+    - worker count derived then boosted/capped by CPU+IO+RAM heuristics (`26379-26479`).
+    - runtime monitor adapts IO/CPU-driven limits but not RAM-driven limits (`26503+`).
+    - monitor currently swaps semaphore objects at runtime (`26575`) while tasks use global semaphore acquire/release in `create_master_tile` (`13417`, `13464`, `13778`, `14510`), which is concurrency-fragile.
+    - eager submission still present: all initial groups submitted before completion loop (`26761` then `26770`).
+    - retries are immediately submitted and increase total work (`26850+`).
+  - Per-tile memory levers baseline:
+    - `winsor_max_frames_per_pass` propagated from config (`25581`) and used in stackers (`zemosaic_align_stack.py:1728+`).
+    - preemptive streaming limit in CPU stack path (`zemosaic_worker.py:12802-12815`).
+    - winsor memory plan (stream/memmap/incremental fallback) (`zemosaic_align_stack.py:1778-1849`, `1929`, `2110+`).
+    - row/chunk sizing from parallel plan hints (`zemosaic_align_stack.py:237-266`, `966`, `1015`, `1943-1955`).
+    - GPU budget interaction via Phase 3 GPU retry+plan shrink (`zemosaic_worker.py:12928-13051`).
+- Decisions:
+  - Acceptable for this mission: splitting/partitioning that preserves full raw-frame union without overlap duplication.
+  - Not acceptable for invariant-gated mode: overlap batching that duplicates frame membership across logical stacks.
+  - S0 considered complete: invariant + current gaps are explicit and documented.
+- Blockers:
+  - none for S0 closeout.
+- Next unchecked item:
+  - C1. Controller policy (S1 design).
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (now baseline-audited and explicitly gated).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged (audit only).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (audit only).
+
+
+### 2026-03-13 17:54 — Iteration 40
+- Scope: S1 adaptive strategy design sign-off (design-only, explicit decision tree).
+- In scope:
+  - controller policy around 80% RAM target
+  - hysteresis/cooldown/rate-limit policy
+  - lazy scheduler and retry queue semantics
+  - scientific preservation policy by combine/rejection mode
+  - telemetry/log contract for adaptation explainability
+- Out of scope:
+  - runtime code changes
+  - tests on datasets
+  - implementation of controller loop
+- Files changed:
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - design consistency check against S0 baseline findings
+- Proof (target design):
+  - Controller signal/policy:
+    - primary decision signal: system RAM `used_percent`
+    - supporting signals: available bytes, swap activity
+    - target zone around 80%; thresholds: high=82%, low=72%
+    - minimum cooldown between level changes: 10s
+    - rate-limit: max 6 adaptation-level changes/min
+  - Escalation order (mandatory):
+    - L1: reduce active Phase 3 launch budget (future launches only)
+    - L2: reduce per-pass frame budget (`winsor_max_frames_per_pass`)
+    - L3: reduce row/chunk size (parallel-plan row/chunk hints)
+    - L4: serialize special paths (GPU or specific reject/combine path) only if prior levels insufficient
+  - Recovery order: inverse and gradual (L4→L1) once below low threshold and cooldown elapsed.
+  - Scheduler model:
+    - pending queue + lazy dispatcher; never eager-submit all groups
+    - dispatcher invariant: `active_futures <= launch_budget` for new admissions
+    - retries re-enter queue (no bypass), preserving launch-budget control
+  - Scientific preservation policy:
+    - mean / weighted mean: frame-pass and row-chunk adaptation allowed only with full logical membership preserved
+    - median: no approximation by default; do not enable frame-dropping/truncation adaptation
+    - winsorized sigma clip: adaptation allowed only via exact full-membership paths (stream/memmap/chunk) using all logical inputs
+    - other rejection modes: conservative path unless exactness is validated explicitly
+  - Exactness limitations (explicit):
+    - no approximation-enabled mode is permitted by default
+    - any mode with unproven exactness under adaptation stays on conservative behavior until proven
+  - Telemetry/log contract:
+    - required adaptation event fields: `phase`, `action`, `reason`, `ram_used_pct`, `ram_available_mb`, `swap_used_pct`, `launch_budget_before/after`, `frames_per_pass_before/after`, `rows_chunk_before/after`, `pending_queue_len`, `active_futures`, `cooldown_state`
+    - emit on every adaptation decision and every recovery step
+- Decisions:
+  - S1 design is explicit and approved as implementation target for S2→S4.
+  - next implementation step is S2 scheduler refactor (lazy launch + launch budget enforcement).
+- Blockers:
+  - none for S1 closeout.
+- Next unchecked item:
+  - D1. Replace eager launch.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (design constraints reinforced).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged (design-only this iteration).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (design-only this iteration).
+
+
+### 2026-03-13 18:09 — Iteration 41
+- Scope: S2 scheduler refactor (lazy Phase 3 admission + runtime launch budget control).
+- In scope:
+  - replace eager Phase 3 all-at-once submission with lazy queue-based admission
+  - enforce runtime-controllable launch budget on future admissions
+  - route retry groups back through same admission queue
+  - keep progress/ETA/telemetry flow semantics as close as possible
+- Out of scope:
+  - RAM-based controller redesign (S4)
+  - per-tile frames/chunk dynamic tuning (S3)
+  - scientific algorithm changes
+- Files changed:
+  - `zemosaic_worker.py`
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_align_stack.py`
+  - static pattern verification (lazy queue + runtime launch budget markers)
+- Proof:
+  - Eager submission removed; Phase 3 now builds `pending_launch_queue` and dispatches lazily (`zemosaic_worker.py:26792+`, `26805+`, `26819+`).
+  - Admission invariant enforced for new launches: dispatcher only launches while `len(pending_futures) < launch_budget` (`26808-26812`).
+  - Runtime launch budget introduced as shared state (`runtime_launch_limit`, `26529`) and updated by monitor (`26600-26605`), with explicit adaptation logs (`26614-26616`).
+  - Retries re-enter queue instead of immediate direct submit (`26910-26913`), so retries no longer bypass launch control.
+  - Loop condition now drains both active and pending work (`26819`), preserving completion semantics with lazy admission.
+  - Removed runtime semaphore object hot-swapping for Phase 3 worker throttle path in this section; launch-budget control now drives admission decisions directly.
+- Decisions:
+  - S2 accepted: launch throttling is now real for not-yet-started tasks (lazy admission + mutable launch budget).
+  - Keep cache-read semaphore adaptation as-is for now; deeper controller unification deferred to S4.
+- Blockers:
+  - none for S2 closeout.
+- Next unchecked item:
+  - E1. Frame-pass adaptation (S3).
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (scheduler-only changes).
+- Phase 3 launch control changed or stayed unchanged: changed (lazy admission + runtime launch budget).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (deferred to S3/S4).
+
+
+### 2026-03-13 18:27 — Iteration 42
+- Scope: S3 partial implementation (E1/E2) — per-tile adaptive working-set sizing in Phase 3.
+- In scope:
+  - add per-tile dynamic `winsor_max_frames_per_pass` computation under RAM pressure
+  - add per-tile dynamic row/chunk downsizing via `ParallelPlan` replacement under RAM pressure
+  - wire adaptive values into `_stack_master_tile_auto` call path
+- Out of scope:
+  - runtime RAM controller hysteresis loop redesign (S4)
+  - full exactness validation by reject/combine mode (E3)
+  - test-suite additions (S5)
+- Files changed:
+  - `zemosaic_worker.py`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_align_stack.py`
+  - static grep verification of adaptive symbols/log wiring (`P3_MEM_ADAPT_TILE`, adaptive pass/chunk args)
+- Proof:
+  - per-tile adaptive pass sizing added before stack call (`zemosaic_worker.py:13692+`), based on live RAM percent/available bytes and tile frame memory estimate.
+  - per-tile adaptive chunk sizing added via `replace(parallel_plan, ...)` with CPU+GPU rows/chunk tightening under pressure (`13666+`).
+  - stack invocation now consumes adaptive values (`13816`, `13819`) rather than static inputs.
+  - no frame list truncation or membership filtering introduced in adaptation block; adaptation only changes working-set knobs.
+  - structured adaptation log emitted per tile under pressure (`P3_MEM_ADAPT_TILE`, `13782+`).
+- Decisions:
+  - E1/E2 marked done; E3/E4 remain open pending exactness review and broader proof.
+- Blockers:
+  - none for E1/E2 closeout.
+- Next unchecked item:
+  - E3. Exactness review by combine/rejection mode under adaptation.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (no membership-trimming logic added).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged this iteration (S2 already completed).
+- Working-set adaptation changed or stayed unchanged: changed (per-tile pass/chunk adaptive controls added).
+
+
+### 2026-03-13 18:37 — Iteration 43
+- Scope: S3 closeout (E3/E4) — exactness policy gating + proof of logical membership preservation.
+- In scope:
+  - enforce conservative mode gating for per-tile adaptation according to exactness confidence
+  - document/emit limitation when mode exactness is not validated
+  - record proof of no logical-frame-membership mutation by adaptation block
+- Out of scope:
+  - S4 runtime controller redesign
+  - S5 non-regression test-suite creation
+- Files changed:
+  - `zemosaic_worker.py`
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_align_stack.py`
+  - static grep verification for exactness gating/log fields (`pass_adapt_enabled`, `chunk_adapt_enabled`, `P3_MEM_ADAPT_MODE_CONSERVATIVE`)
+- Proof:
+  - exactness/conservatism policy now explicit in code at tile adaptation point:
+    - pass adaptation enabled only for `winsorized_sigma_clip` (`zemosaic_worker.py:13709`)
+    - chunk adaptation enabled only for `{winsorized_sigma_clip, kappa_sigma, linear_fit_clip}` (`13710`)
+    - unsupported/unvalidated mode combinations emit conservative-policy log (`P3_MEM_ADAPT_MODE_CONSERVATIVE`, `13811+`)
+  - adaptation telemetry now includes `reject_algo`, `combine_mode`, and enabled flags (`13797-13800`) to make exactness decisions auditable.
+  - logical membership preservation: adaptation block does not trim/reorder/drop `valid_aligned_images`; it only adjusts pass/chunk knobs passed into `_stack_master_tile_auto` (`winsor_max_frames_per_pass` and `parallel_plan`).
+- Exactness review outcome (current scope):
+  - validated/adapted:
+    - winsorized sigma clip: pass + chunk adaptation
+    - kappa sigma / linear fit clip: chunk adaptation only
+  - conservative (adaptation limited until validated):
+    - other/unlisted rejection/combine paths, including median-centric paths not explicitly validated for adaptive knobs
+- Decisions:
+  - S3 marked complete with conservative exactness gating and documented limitations.
+- Blockers:
+  - none for S3 closeout.
+- Next unchecked item:
+  - F1. Runtime RAM sampling (S4).
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (no frame-membership mutation).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged this iteration (S2 behavior retained).
+- Working-set adaptation changed or stayed unchanged: changed (exactness-gated adaptation behavior finalized for S3).
+
+
+### 2026-03-13 18:49 — Iteration 44
+- Scope: S4 implementation/closeout — runtime RAM controller + hysteresis + observability for Phase 3 admission.
+- In scope:
+  - extend real-time Phase 3 monitor with RAM sampling and RAM-level state machine
+  - add hysteresis thresholds, cooldown, and max changes/min anti-thrashing controls
+  - implement explicit admission pause behavior at critical RAM pressure with alert log
+  - expose adaptation decision context in runtime logs (RAM/CPU/IO + reasons)
+  - make launch budget consumer pause-aware (budget can be 0 during short admission pause)
+- Out of scope:
+  - S5 test-suite implementation
+  - deep redesign of GPU stack internals
+- Files changed:
+  - `zemosaic_worker.py`
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_align_stack.py`
+  - static grep verification of S4 knobs/signals/logs (`phase3_ram_low_pct`, `phase3_adapt_cooldown_s`, `phase3_adapt_max_changes_per_min`, `phase3_admission_pause_s`, `RAM_ADAPT_RT`, `pause_until`)
+- Proof:
+  - runtime controller now samples RAM every monitor cycle and tracks `ram_level` with hysteresis (`high/low/critical`).
+  - anti-oscillation controls implemented:
+    - cooldown between budget changes (`phase3_adapt_cooldown_s`, default 10s)
+    - rate-limit (`phase3_adapt_max_changes_per_min`, default 6/min)
+  - critical-pressure behavior implemented:
+    - when RAM stays critical and budget already minimal, controller sets short admission pause (`pause_until`) and emits explicit `RAM_ADAPT_RT: admission_pause ...` log.
+  - launch admission path now honors pause window:
+    - `_current_launch_budget()` can return `0` while pause is active
+    - lazy dispatcher skips new submissions during pause, preserving in-flight work safety
+  - decision observability improved:
+    - budget-change logs include CPU/IO/RAM context and RAM-level transitions
+    - hold logs emitted when change blocked by cooldown/rate-limit (`RAM_ADAPT_RT: launch_budget_hold ...`)
+  - GPU policy decision:
+    - keep existing narrow Phase 3 GPU guardrails (retry+plan-shrink+hard-disable path) without adding a second independent GPU-concurrency subsystem.
+- Decisions:
+  - S4 marked complete: runtime decisions are now pressure-driven, bounded, and explainable in logs.
+- Blockers:
+  - none for S4 closeout.
+- Next unchecked item:
+  - G1. Invariant tests (S5).
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (controller only impacts admission/working-set knobs).
+- Phase 3 launch control changed or stayed unchanged: changed (pause-aware launch budget with hysteresis/rate-limited updates).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged this iteration (S3 behavior retained; S4 controls admission dynamics).
+
+
+### 2026-03-13 18:18 — Iteration 45
+- Scope: S5 implementation pass (G1/G2/G3) — add and run non-regression tests for Phase 3 adaptive behavior.
+- In scope:
+  - strengthen `tests/test_phase3_adaptive_invariants.py` with invariant + pressure-response + compatibility coverage
+  - execute targeted and full test suite in `.venv`
+  - update `followup.md` checkboxes for completed S5 sub-items
+- Out of scope:
+  - dataset-level baseline/output-count integration run (G3b-1)
+  - explicit stable-pressure anti-thrashing scenario test harness (G3b-5)
+  - final mission closeout decision (G5)
+- Files changed:
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py` → `7 passed`
+  - `../.venv/bin/python -m pytest -q tests` → `29 passed, 7 warnings`
+- Proof:
+  - G1 covered by numeric invariance tests + source-contract guard ensuring adaptation block does not mutate logical frame membership list.
+  - G2 covered by source-contract tests asserting runtime RAM backoff/hysteresis/cooldown/rate-limit/recovery markers and pass/chunk shrink contracts.
+  - G3 covered by tests for retry queue re-entry (no bypass direct submit), adaptation telemetry key presence/stability, and mode-gating markers (conservative policy for unvalidated modes).
+  - All added checks are green in local `.venv` test run.
+- Decisions:
+  - Marked G1, G2, G3 as complete in `followup.md`.
+  - Marked G3b retry-membership + log-parseability items complete; kept baseline-output-count and anti-thrashing scenario items open pending dedicated harness/dataset run.
+- Blockers:
+  - No fast deterministic in-repo fixture currently encodes a full baseline-vs-adaptive Phase 3 output-count integration comparison at mission level.
+- Next unchecked item:
+  - G3b: "Same number of scientific Phase 3 outputs as baseline for identical dataset/config".
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (tests/documentation only, no runtime algorithm mutation this iteration).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged (validation iteration only).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (validation iteration only).
+
+
+### 2026-03-13 18:21 — Iteration 46
+- Scope: S5 deeper validation pass — add dynamic Phase 3 tile test under forced RAM pressure.
+- In scope:
+  - add integration-style unit test exercising `create_master_tile` with synthetic cached frames
+  - assert full logical membership reaches stack call under adaptation pressure
+  - assert reject/combine mode passthrough is unchanged under adaptation
+  - rerun targeted + full tests
+- Out of scope:
+  - full mission-level scheduler baseline-vs-adaptive output-count integration benchmark
+  - direct runtime anti-thrashing scenario replay of nested monitor loop
+- Files changed:
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k create_master_tile_adaptation_preserves_membership_and_modes`
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py` → `8 passed`
+  - `../.venv/bin/python -m pytest -q tests` → `30 passed, 14 warnings`
+- Proof:
+  - New test forces high RAM pressure (`psutil.virtual_memory` patched) and checks `create_master_tile` forwards all loaded frames (`captured["n_images"] == len(group)`) to `_stack_master_tile_auto` (no silent membership drop in adaptation path).
+  - Test confirms no silent mode drift: `stack_reject_algo` and `stack_final_combine` are forwarded unchanged under adaptation.
+  - Test confirms working-set knobs tighten under pressure (`winsor_max_frames_per_pass`, `rows_per_chunk`, `max_chunk_bytes`) while logical membership remains intact.
+- Decisions:
+  - Marked G3b item "No silent change of combine/rejection mode" as complete.
+  - Kept G3b output-count parity and anti-thrashing scenario items open pending dedicated harness/scenario-run coverage.
+- Blockers:
+  - Current unit tests do not yet execute the full Phase 3 scheduler loop end-to-end with baseline/adaptive parity accounting on identical dataset/config.
+- Next unchecked item:
+  - G3b: "Same number of scientific Phase 3 outputs as baseline for identical dataset/config".
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (validation-only changes).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged (validation-only changes).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (validation-only changes).
+
+
+### 2026-03-13 18:31 — Iteration 47
+- Scope: Post-abort integrity verification + S5 closeout (G3b/G4/G5) for Phase 3 adaptive mission.
+- In scope:
+  - verify interruption point after anti-thrashing helper refactor
+  - check for code-loss/regression risk (compile + targeted + full tests)
+  - complete remaining S5 gates in `agent.md` / `followup.md` based on evidence
+- Out of scope:
+  - new algorithmic behavior changes beyond no-op guard refactor already in progress
+  - optional S6 refinements
+- Files changed:
+  - `zemosaic_worker.py` (already modified before this resume; helper retained)
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_align_stack.py tests/test_phase3_adaptive_invariants.py`
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py` → `12 passed`
+  - `../.venv/bin/python -m pytest -q tests` → `34 passed, 21 warnings`
+- Proof:
+  - Prior interruption root cause was not functional failure but run abort during full-suite rerun; rerun now completed successfully.
+  - Anti-thrashing guard refactor is structurally consistent:
+    - helper defined once: `_phase3_budget_change_block_reason(...)`
+    - called in both Phase 3 monitor loops (2 call sites)
+    - centralizes cooldown + changes/min gating without modifying decision policy semantics
+  - Retry scheduling invariant remains preserved (`pending_launch_queue.append(...)` present; forbidden direct retry submit absent).
+  - Runtime admission pause behavior remains intact (`pause_until` branch returns launch budget 0 during pause window).
+  - Added/kept S5 tests cover:
+    - logical membership preservation under adaptation
+    - output-count parity baseline vs pressure (master-tile level synthetic run)
+    - no silent reject/combine mode drift
+    - anti-thrashing guard behavior (cooldown/rate-limit)
+    - telemetry/log marker stability
+- Decisions:
+  - S5 marked complete in `agent.md`.
+  - Remaining `followup.md` S5 checkboxes (G3b, G4, G5) marked complete.
+  - Mission status for merge gate: **GO** (based on current automated evidence).
+- Blockers:
+  - none.
+- Next unchecked item:
+  - S6 optional refinements only (out of base mission).
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (validation/guard-refactor only; no frame-membership drop logic introduced).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged in policy semantics (guard logic extracted to helper; behavior validated by tests).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (tests/closeout only).
+
+
+### 2026-03-13 21:56 — Iteration 48
+- Scope: Add mission tracking for post-intertile slowdown diagnosis requested by Tristan.
+- In scope:
+  - update `agent.md` with add-on mission objective/rules/deliverables
+  - update `followup.md` with actionable checklist section I
+- Out of scope:
+  - implementation/optimization changes (planning-only update)
+- Files changed:
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - none (docs/checklist update only)
+- Proof:
+  - Added "Active add-on mission (2026-03-13) — Phase 5 slowdown after intertile anchor event" to `agent.md`.
+  - Added section `I. Add-on mission — Phase 5 slowdown after intertile anchor event` in `followup.md` with I1..I5 checklist.
+- Decisions:
+  - Keep prior Phase 3 mission closed; track new work as add-on mission focused on runtime performance diagnosis and optimization.
+- Blockers:
+  - none
+- Next unchecked item:
+  - I1. Reproduction and timeline.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 22:13 — Iteration 49
+- Scope: Implement display FITS companion export for black-looking scientific FITS in viewers.
+- In scope:
+  - add automatic Phase 6 export of `*_display.fits`
+  - keep scientific FITS unchanged
+  - add regression source-contract test
+- Out of scope:
+  - changes to scientific assembly math or CPU/GPU processing logic
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k display_fits_companion` -> `1 passed`
+  - `../.venv/bin/python -m pytest -q tests` -> `38 passed, 21 warnings`
+- Proof:
+  - Phase 6 now writes `zemosaic_*_display.fits` via preview-like robust stretch (`p_low=2.5`, `p_high=99.8`, `asinh_a=20`) and uint16 export helper.
+  - Scientific FITS path remains unchanged (`zemosaic_*_R*.fits` still float scientific output).
+  - Display header tags added: `ZMDISPF`, `ZMDPLWR`, `ZMDPHIG`, `ZMDPASH`.
+- Decisions:
+  - Keep display companion always enabled (no new config gate) per user request.
+- Blockers:
+  - none
+- Next unchecked item:
+  - User validation on real run output readability in external FITS viewers.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 22:28 — Iteration 50
+- Scope: ETA reliability fix (CPU/GPU modes) requested by Tristan.
+- In scope:
+  - analyze ETA formulas and runtime hooks
+  - remove ETA double-counting patterns
+  - add ETA smoothing to reduce jumps
+  - reduce misleading intertile heuristic ETA seed impact
+  - add ETA regression/source-contract tests
+- Out of scope:
+  - deep runtime benchmark campaign on multiple datasets
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "eta_seconds_from_progress or eta_smoothing or eta_uses_max_not_double_count_sum"` -> `3 passed`
+  - `../.venv/bin/python -m pytest -q tests` -> `41 passed, 21 warnings`
+- Proof:
+  - Added `_eta_seconds_from_progress(...)` helper using guarded global progress ratio.
+  - Added `_eta_smooth_seconds(...)` low-pass ETA filter with outlier jump bounding.
+  - Updated ETA composition from additive (`local + global`) to conservative max (`max(local, global)`) in prep/channel/Phase1/Phase3 paths.
+  - Updated both runtime `update_gui_eta(...)` closures to use smoothing state before emitting `ETA_UPDATE`.
+  - Intertile heuristic now emits debug seed (`[Intertile][ETA seed]`) instead of forcing direct `ETA_UPDATE`, reducing false spikes.
+- Decisions:
+  - Prioritize ETA stability/consistency over aggressive early precision.
+- Blockers:
+  - Two-pass long spans still depend on stage progress cadence; further granularity tuning can be added after real-run feedback.
+- Next unchecked item:
+  - Validate ETA drift on real production run and tune smoothing alpha if needed.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 22:38 — Iteration 51
+- Scope: ETA hotfix after user report of severe underestimation (00:00:30 → 00:02:10 on a known 20–30 min dataset).
+- In scope:
+  - inspect live ETA/log progression
+  - add conservative phase-cost ETA model
+  - combine local/progress/model ETA with safe max
+  - keep smoothing and remove misleading intertile ETA forcing
+- Out of scope:
+  - persistent per-dataset historical ETA learning
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "eta_phase_model_conservative_vs_progress_in_phase3_midrun or source_contract_eta_uses_phase_model"` -> `2 passed`
+  - `../.venv/bin/python -m pytest -q tests` -> `43 passed, 21 warnings`
+- Proof:
+  - Live log showed early ETA collapse in P1/P3 despite long known total runtime.
+  - Added `_eta_seconds_from_phase_model(...)` with conservative phase shares (P5 dominant).
+  - Updated ETA computation paths (P1/P3/P5 prep/P5 channels) to include phase-model ETA and take `max(local, global, phase_model)`.
+  - Existing ETA smoothing retained.
+- Decisions:
+  - Favor conservative realistic ETA over optimistic early ETA.
+- Blockers:
+  - This fix affects next run; current running process keeps previous ETA logic until restart.
+- Next unchecked item:
+  - Validate ETA realism on next full run and tune phase shares if needed.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 22:47 — Iteration 52
+- Scope: Phase 3 ETA-only refinement requested by Tristan (online extrapolation from known master-tile durations).
+- In scope:
+  - Phase 3 ETA prediction by tile runtime (n_frames-aware)
+  - live EWMA update as tiles complete
+  - remaining wall-time projection using running+queued jobs and effective parallelism
+- Out of scope:
+  - any scientific pipeline/stacking behavior change
+- Files changed:
+  - `zemosaic_worker.py`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "eta_"` -> `5 passed`
+  - `../.venv/bin/python -m pytest -q tests` -> `43 passed, 21 warnings`
+- Proof:
+  - Added `_estimate_parallel_makespan_seconds(...)` helper.
+  - Phase 3 now tracks per-tile start time + frame count at submission.
+  - On completion, runtime updates global EWMA and per-frame-count EWMA model.
+  - ETA Phase 3 now includes model-based remaining makespan across running + queued tiles, accounting for effective concurrency.
+  - ETA update remains ETA-only; no data path modifications.
+- Decisions:
+  - Keep conservative `max(avg-based, model-based, global-progress, phase-model)` for Phase 3 ETA display.
+- Blockers:
+  - Current already-running process may need worker reload to pick up latest ETA code, depending on launch timing.
+- Next unchecked item:
+  - Validate live Phase 3 ETA coherence on current/restarted run.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 22:53 — Iteration 53
+- Scope: Fix persistent Phase 3 ETA incoherence after live user feedback.
+- In scope:
+  - inspect live log from re-run
+  - identify ETA smoothing pathology across phase transitions
+  - patch ETA smoothing to allow regime-change reset
+  - keep ETA-only changes
+- Out of scope:
+  - scientific/image processing behavior
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "eta_"` -> `6 passed`
+  - `../.venv/bin/python -m pytest -q tests` -> `44 passed, 21 warnings`
+- Proof:
+  - Live log showed Phase1 ETA ending ~00:00:28 then Phase3 ETA climbing slowly (00:00:44 -> 00:01:06 -> 00:04:10), inconsistent with conservative phase-model ETA.
+  - Root cause: `_eta_smooth_seconds` hard clamp (`high=old*2.5+30`) prevented legitimate upward jumps at phase transitions.
+  - Patch now performs phase-shift detection and immediate reset on large regime changes.
+- Decisions:
+  - Preserve smoothing for normal fluctuations, but never suppress valid phase-transition jumps.
+- Blockers:
+  - Current run started before this patch load; effect applies to next run/restart only.
+- Next unchecked item:
+  - Verify Phase 3 ETA on next fresh run with updated smoothing-reset logic.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 23:11 — Iteration 54
+- Scope: Phase 5 intertile-pairs ETA coherence fix requested by Tristan after live log verification.
+- In scope:
+  - add direct ETA updates from intertile pair progression callbacks
+  - keep reproject/scientific behavior unchanged
+  - add regression source-contract test
+- Out of scope:
+  - broader Phase 5 ETA model retuning
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "intertile_pairs_emit_eta_updates or eta_"` -> `7 passed`
+  - `../.venv/bin/python -m pytest -q tests` -> `45 passed, 21 warnings`
+- Proof:
+  - `_intertile_progress_bridge` now handles structured callbacks `phase5_intertile_pairs` and emits `ETA_UPDATE:HH:MM:SS` derived from done/total pairs and elapsed time.
+  - Added compatibility parsing for textual `pairs_done=X/Y` messages.
+  - ETA emission is throttled (first/last, every 5 pairs, or >=2s) and smoothed with `_eta_smooth_seconds`.
+- Decisions:
+  - Keep this patch ETA-only and scoped to intertile pair stage to avoid touching scientific compute paths.
+- Blockers:
+  - Running process must use this updated code path (restart/new run) for visible effect.
+- Next unchecked item:
+  - Validate live intertile ETA trend in next run logs.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
