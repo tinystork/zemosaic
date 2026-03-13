@@ -238,6 +238,83 @@ Exploration only, no mission started yet.
   - Roadmap canon A confirme `lecropper` = outil annexe standalone; port Qt en phase séparée (post-release).
   - `agent.md` confirme explicitement: annexe, hors-scope pour port Qt maintenant, découplage requis du runtime officiel/headless validé.
   - `zemosaic_worker.py` prouve dépendance actuelle (`import lecropper`, `from lecropper import detect_autocrop_rgb`).
+
+---
+
+## 2026-03-13 — GPU memory management follow-up (Phase 3 focus)
+
+### Context
+- Initial investigation started from low apparent GPU usage in Phase 5 (`resource_telemetry.csv` + worker logs).
+- Phase 5 on AC was updated so its dynamic VRAM budget no longer stays clamped by the inherited global `plan_cap` when the machine is plugged in and not in safe mode.
+- Follow-up discussion then focused on whether Phase 3 suffers from the same issue and whether it should be relaxed too.
+
+### Confirmed findings
+- Phase 3 shares the same root safety clamp as Phase 5 on hybrid/battery-capable laptops:
+  - global GPU safety commonly clamps `gpu_max_chunk_bytes` to `128 MB`,
+  - logs showed Phase 3 running with `gpu_max_chunk_bytes=134217728` and `gpu_rows_per_chunk=256`,
+  - older Phase 5 runs under the same guard showed much smaller effective row chunks there, so the symptom is more severe in Phase 5 than in Phase 3.
+- Phase 3 is not structurally identical to Phase 5:
+  - Phase 3 builds many master tiles and can process several tile tasks concurrently,
+  - Phase 5 is much more serial and therefore benefits more directly from “bigger VRAM per task”.
+
+### Important risk assessment for Phase 3
+- Relaxing Phase 3 VRAM policy is riskier than Phase 5 because Phase 3 can run multiple master-tile tasks in parallel.
+- One overly aggressive GPU budget can trigger:
+  - intermittent GPU OOM,
+  - repeated chunk backoff,
+  - GPU disablement for the remainder of Phase 3 after repeated failures.
+- Therefore, “same AC relaxation as Phase 5” should **not** be applied blindly to Phase 3.
+
+### What seems realistic vs illusory
+- Dynamic evaluation **per master tile start** is realistic and useful:
+  - current free VRAM,
+  - available RAM,
+  - tile dimensions,
+  - number of frames in the tile,
+  - current GPU task concurrency.
+- Dynamic evaluation per raw file is not worth it.
+- Dynamic throttling of effective Phase 3 concurrency already exists via runtime-updated semaphores; growing the executor beyond its initial max without rebuilding it is not currently how Phase 3 works.
+
+### Best direction discussed for Phase 3
+- If the goal is to maximize throughput for very large datasets, Phase 3 should likely prefer:
+  - **low GPU concurrency + larger per-task chunks**
+  - rather than many simultaneous GPU-backed master tiles.
+- Safer design direction:
+  1. reevaluate GPU budget at the start of each master tile,
+  2. decide CPU vs GPU for that tile dynamically,
+  3. recompute `gpu_rows_per_chunk` for that tile,
+  4. add a dedicated Phase 3 GPU semaphore (likely `1` on hybrid laptops).
+- In short:
+  - Phase 5: aggressive AC VRAM usage is a good lever.
+  - Phase 3: use a more conservative/dynamic policy unless GPU concurrency is explicitly serialized.
+
+### Throughput intuition: VRAM vs parallelization
+- For Phase 3, simply maximizing VRAM per task is not automatically better than parallelization.
+- The main gain from more VRAM comes from reducing chunking overhead.
+- Once chunking overhead is low enough, pushing many GPU tasks in parallel often hurts more than it helps on an 8 GB laptop GPU.
+- Practical conclusion from the discussion:
+  - prefer one “fat” GPU stack at a time over several competing GPU stacks.
+
+### Order-of-magnitude estimate discussed
+- For a hypothetical master tile with `3000` inputs at `5 MiB` each, with Phase 3 chunking by rows:
+  - the relevant simple-path estimate is:
+    - `chunk_gpu_bytes ~= n_frames * frame_bytes * (rows_per_chunk / frame_height)`
+  - with `rows_per_chunk=256`, `3000 x 5 MiB` gives roughly:
+    - about `7.3 GiB` if frame height is `512`,
+    - about `4.9 GiB` if frame height is `768`,
+    - about `3.7 GiB` if frame height is `1024`,
+    - about `2.5 GiB` if frame height is `1500`.
+- This estimate is already large for a single GPU task on an 8 GB card and does **not** include all temporary allocations.
+- For the WSC/PixInsight-style GPU path, the memory pressure is much worse; `3000` frames with `256` rows would be far beyond what an 8 GB GPU can tolerate without strong chunk reduction or CPU/streaming fallback.
+- Conclusion from that example:
+  - `256` rows can be borderline even for one task,
+  - parallel GPU handling of several such master tiles would very likely saturate VRAM.
+
+### Current status
+- Phase 5 AC budget behavior was changed.
+- No Phase 3 VRAM policy change has been implemented yet.
+- If Phase 3 work resumes in a later session, the recommended next step is:
+  - design a per-master-tile dynamic GPU budget with explicit GPU concurrency control, instead of copying the Phase 5 policy directly.
 - Decisions:
   - Classification confirmée: **`lecropper` = annex / standalone tool**.
   - Port Qt `lecropper` confirmée **out-of-scope** pour cette mission S0→S5.
@@ -1158,3 +1235,39 @@ Exploration only, no mission started yet.
 - Lecropper status changed or not: unchanged (annex), decoupled from official runtime/headless validated paths.
 - Official-path Tk imports decreased or stayed unchanged: stayed unchanged this iteration.
 - Validated headless scope changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 12:00 — Iteration 35
+- Scope: mission handoff and plan reset only.
+- In scope:
+  - explicitly close the previous active mission as completed
+  - replace `agent.md` and `followup.md` with a new mission plan for Phase 3 adaptive RAM control
+  - lock the new scientific invariant for the next mission direction
+- Out of scope:
+  - Phase 3 code changes
+  - scheduler changes
+  - telemetry changes
+  - tests beyond document review
+- Files changed:
+  - `agent.md`
+  - `followup.md`
+  - `memory.md`
+- Tests run:
+  - `sed -n '1,260p' agent.md`
+  - `sed -n '1,320p' followup.md`
+  - `tail -n 80 memory.md`
+- Proof:
+  - Previous mission status was already recorded as **GO** in Iteration 34.
+  - `agent.md` was replaced with a new mission focused on Phase 3 adaptive RAM control without dropping raw frames.
+  - `followup.md` was replaced with a new checklist aligned to that mission.
+- Decisions:
+  - Previous Qt-only/Tk-retirement mission is considered completed for this checkpoint.
+  - New active mission is: **Phase 3 adaptive RAM control without dropping raw frames**.
+  - The new mission invariant is locked at plan level: adapt memory via launch control and working-set reduction, not by silently discarding raw inputs.
+- Blockers:
+  - none at planning stage.
+- Next unchecked item:
+  - B1 — Write the invariant explicitly and audit the current Phase 2/3 behavior against it.
+- All-raw-frames invariant changed or stayed unchanged: changed (now explicitly locked as the central mission invariant).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged (planning only).
+- Working-set adaptation changed or stayed unchanged: stayed unchanged (planning only).

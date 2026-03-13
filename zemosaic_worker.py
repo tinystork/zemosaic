@@ -67,6 +67,7 @@ import multiprocessing
 import threading
 import itertools
 import platform
+import importlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -100,6 +101,9 @@ from core.path_helpers import (
 # Annex tool: keep optional and lazy; official runtime must not depend on it.
 lecropper = None
 _LECROPPER_AVAILABLE = False
+_LECROPPER_LOAD_ATTEMPTED = False
+_LECROPPER_LOAD_LOCK = threading.Lock()
+_LECROPPER_IMPORT_ERROR: Exception | None = None
 
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
@@ -846,7 +850,9 @@ def _apply_lecropper_pipeline(
     Returns (processed_array, optional_alpha_mask_float).
     """
 
-    if not (_LECROPPER_AVAILABLE and isinstance(arr, np.ndarray) and arr.size):
+    if not isinstance(arr, np.ndarray) or not arr.size:
+        return arr, None
+    if not _LECROPPER_AVAILABLE and not _ensure_lecropper_loaded():
         return arr, None
 
     cfg = cfg or {}
@@ -911,14 +917,60 @@ def _apply_lecropper_pipeline(
     altaz_mask2d_used = False
     altaz_mask2d_applied = False
     try:
-        if q_enabled and hasattr(lecropper, "quality_crop"):
-            out = lecropper.quality_crop(
-                out,
-                band_px=band_px,
-                k_sigma=k_sigma,
-                margin_px=margin_px,
-                min_run=min_run,
-            )
+        if q_enabled:
+            detect_autocrop = getattr(lecropper, "detect_autocrop_rgb", None)
+            if callable(detect_autocrop):
+                crop_src = np.asarray(out, dtype=np.float32)
+                axis_mode = "HWC"
+                if crop_src.ndim == 3 and crop_src.shape[0] == 3 and crop_src.shape[-1] != 3:
+                    crop_src = np.moveaxis(crop_src, 0, -1)
+                    axis_mode = "CHW"
+                elif crop_src.ndim == 2:
+                    crop_src = crop_src[..., np.newaxis]
+                    axis_mode = "HW"
+
+                if crop_src.ndim >= 3:
+                    if crop_src.shape[-1] >= 3:
+                        R = crop_src[..., 0]
+                        G = crop_src[..., 1]
+                        B = crop_src[..., 2]
+                    else:
+                        mono = crop_src[..., 0]
+                        R = G = B = mono
+
+                    lum2d = np.nanmean(np.stack([R, G, B], axis=0), axis=0).astype(np.float32)
+                    R = np.nan_to_num(np.asarray(R, dtype=np.float32), nan=0.0)
+                    G = np.nan_to_num(np.asarray(G, dtype=np.float32), nan=0.0)
+                    B = np.nan_to_num(np.asarray(B, dtype=np.float32), nan=0.0)
+                    lum2d = np.nan_to_num(lum2d, nan=0.0)
+
+                    y0, x0, y1, x1 = detect_autocrop(
+                        lum2d,
+                        R,
+                        G,
+                        B,
+                        band_px=band_px,
+                        k_sigma=k_sigma,
+                        margin_px=margin_px,
+                    )
+                    h_lum, w_lum = lum2d.shape
+                    crop_area = (y1 - y0) * (x1 - x0)
+                    full_area = h_lum * w_lum
+                    if (
+                        0 <= y0 < y1 <= h_lum
+                        and 0 <= x0 < x1 <= w_lum
+                        and crop_area > 0
+                        and (crop_area / max(1, full_area)) < 0.97
+                    ):
+                        cropped = crop_src[y0:y1, x0:x1, ...]
+                        if axis_mode == "CHW":
+                            out = np.moveaxis(cropped, -1, 0)
+                        elif axis_mode == "HW":
+                            out = cropped[..., 0]
+                        else:
+                            out = cropped
+                        if coverage is not None and getattr(coverage, "shape", None) == (h_lum, w_lum):
+                            coverage = np.asarray(coverage, dtype=np.float32)[y0:y1, x0:x1]
 
         if az_enabled:
             mask2d = None
@@ -3394,6 +3446,10 @@ def _compute_phase5_vram_budget_bytes(
     if cap_bytes is not None and cap_bytes <= 0:
         cap_bytes = None
 
+    allow_plan_cap = bool(on_battery or phase5_safe_mode_env or not power_plugged)
+    if cap_bytes is not None and not allow_plan_cap:
+        reasons.append("plan_cap_ignored_on_ac")
+
     def _apply_cap(value: int, cap: int | None, reason: str) -> int:
         if cap is None or cap <= 0:
             return value
@@ -3403,13 +3459,15 @@ def _compute_phase5_vram_budget_bytes(
         return value
 
     budget_bytes = max(0, int(budget_bytes))
-    budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    if allow_plan_cap:
+        budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
     budget_bytes = _apply_cap(budget_bytes, ui_cap_bytes, "ui_chunk_cap")
     budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
     if budget_bytes > 0 and budget_bytes < min_chunk_bytes:
         budget_bytes = min_chunk_bytes
         reasons.append("min_clamp")
-    budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    if allow_plan_cap:
+        budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
     budget_bytes = _apply_cap(budget_bytes, ui_cap_bytes, "ui_chunk_cap")
     budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
     if usable_bytes is not None:
@@ -4955,7 +5013,9 @@ def _apply_preview_quality_crop(
 
     if tile_array is None or not crop_settings:
         return tile_array
-    if not crop_settings.get("enabled", False) or not ANCHOR_AUTOCROP_AVAILABLE:
+    if not crop_settings.get("enabled", False):
+        return tile_array
+    if not ANCHOR_AUTOCROP_AVAILABLE and not _ensure_lecropper_loaded():
         return tile_array
 
     arr = np.asarray(tile_array, dtype=np.float32)
@@ -10929,6 +10989,52 @@ except ImportError:
 _anchor_detect_autocrop = None
 ANCHOR_AUTOCROP_AVAILABLE = False
 
+
+def _ensure_lecropper_loaded() -> bool:
+    """Load the optional lecropper module on demand and cache the outcome."""
+
+    global lecropper, _LECROPPER_AVAILABLE, _LECROPPER_LOAD_ATTEMPTED, _LECROPPER_IMPORT_ERROR
+    global _anchor_detect_autocrop, ANCHOR_AUTOCROP_AVAILABLE
+
+    if _LECROPPER_AVAILABLE and lecropper is not None:
+        return True
+
+    with _LECROPPER_LOAD_LOCK:
+        if _LECROPPER_AVAILABLE and lecropper is not None:
+            return True
+        if _LECROPPER_LOAD_ATTEMPTED and lecropper is None:
+            return False
+
+        _LECROPPER_LOAD_ATTEMPTED = True
+        try:
+            module = importlib.import_module("lecropper")
+        except Exception as exc:
+            lecropper = None
+            _LECROPPER_AVAILABLE = False
+            _LECROPPER_IMPORT_ERROR = exc
+            _anchor_detect_autocrop = None
+            ANCHOR_AUTOCROP_AVAILABLE = False
+            try:
+                logger.warning("Optional lecropper import failed: %s", exc)
+            except Exception:
+                pass
+            return False
+
+        lecropper = module
+        _LECROPPER_AVAILABLE = True
+        _LECROPPER_IMPORT_ERROR = None
+        detect_autocrop = getattr(module, "detect_autocrop_rgb", None)
+        _anchor_detect_autocrop = detect_autocrop if callable(detect_autocrop) else None
+        ANCHOR_AUTOCROP_AVAILABLE = callable(_anchor_detect_autocrop)
+        try:
+            logger.info(
+                "Optional lecropper module loaded (detect_autocrop=%s).",
+                bool(ANCHOR_AUTOCROP_AVAILABLE),
+            )
+        except Exception:
+            pass
+        return True
+
 # Optional configuration import for GPU toggle
 try:
     import zemosaic_config
@@ -12660,96 +12766,124 @@ def _stack_master_tile_cpu(
     """
 
     stack_metadata: dict[str, Any] = {}
-
     current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
+    saved_gpu_flags: dict[str, Any] = {}
+    missing = object()
+    for attr_name in ("stack_use_gpu", "use_gpu_stack", "use_gpu"):
+        try:
+            saved_gpu_flags[attr_name] = getattr(zconfig, attr_name)
+        except AttributeError:
+            saved_gpu_flags[attr_name] = missing
+        except Exception:
+            saved_gpu_flags[attr_name] = missing
+        try:
+            setattr(zconfig, attr_name, False)
+        except Exception:
+            pass
+    if current_parallel_plan is not None:
+        try:
+            if hasattr(current_parallel_plan, "use_gpu") and bool(getattr(current_parallel_plan, "use_gpu")):
+                current_parallel_plan = replace(current_parallel_plan, use_gpu=False)
+        except Exception:
+            pass
     effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
-    if effective_winsor_frames_per_pass < 0:
-        effective_winsor_frames_per_pass = 0
     try:
-        sample_frame = aligned_images_for_stack[0] if aligned_images_for_stack else None
-        if sample_frame is not None:
-            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
-            available_bytes = int(psutil.virtual_memory().available)
-            overhead = 3.2
-            target_fraction = 0.55
-            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
-            if per_frame_bytes > 0:
-                preemptive_limit = max(
-                    min_pass,
-                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
-                )
-                if preemptive_limit < len(aligned_images_for_stack):
-                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
-                        effective_winsor_frames_per_pass = preemptive_limit
-                    try:
-                        setattr(zconfig, "stack_memmap_enabled", True)
-                    except Exception:
-                        pass
-                    try:
-                        pcb_tile(
-                            "stack_mem_preemptive_stream",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            frames_per_pass=effective_winsor_frames_per_pass,
-                            tile_id=tile_id,
-                        )
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+        if effective_winsor_frames_per_pass < 0:
+            effective_winsor_frames_per_pass = 0
+        try:
+            sample_frame = aligned_images_for_stack[0] if aligned_images_for_stack else None
+            if sample_frame is not None:
+                per_frame_bytes = int(np.asarray(sample_frame).nbytes)
+                available_bytes = int(psutil.virtual_memory().available)
+                overhead = 3.2
+                target_fraction = 0.55
+                min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
+                if per_frame_bytes > 0:
+                    preemptive_limit = max(
+                        min_pass,
+                        int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
+                    )
+                    if preemptive_limit < len(aligned_images_for_stack):
+                        if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
+                            effective_winsor_frames_per_pass = preemptive_limit
+                        try:
+                            setattr(zconfig, "stack_memmap_enabled", True)
+                        except Exception:
+                            pass
+                        try:
+                            pcb_tile(
+                                "stack_mem_preemptive_stream",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                frames_per_pass=effective_winsor_frames_per_pass,
+                                tile_id=tile_id,
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
-    if stack_reject_algo == "winsorized_sigma_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            kappa=stack_kappa_low,
-            winsor_limits=parsed_winsor_limits,
-            apply_rewinsor=True,
-            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
-            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "kappa_sigma":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma_low=stack_kappa_low,
-            sigma_high=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "linear_fit_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    else:
-        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
-            aligned_image_data_list=aligned_images_for_stack,
-            normalize_method=stack_norm_method,
-            weighting_method=stack_weight_method,
-            rejection_algorithm=stack_reject_algo,
-            final_combine_method=stack_final_combine,
-            sigma_clip_low=stack_kappa_low,
-            sigma_clip_high=stack_kappa_high,
-            winsor_limits=parsed_winsor_limits,
-            minimum_signal_adu_target=0.0,
-            apply_radial_weight=apply_radial_weight,
-            radial_feather_fraction=radial_feather_fraction,
-            radial_shape_power=radial_shape_power,
-            winsor_max_workers=winsor_pool_workers,
-            progress_callback=progress_callback,
-            zconfig=zconfig,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
+        if stack_reject_algo == "winsorized_sigma_clip":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                aligned_images_for_stack,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                kappa=stack_kappa_low,
+                winsor_limits=parsed_winsor_limits,
+                apply_rewinsor=True,
+                winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
+                winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        elif stack_reject_algo == "kappa_sigma":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
+                aligned_images_for_stack,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                sigma_low=stack_kappa_low,
+                sigma_high=stack_kappa_high,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        elif stack_reject_algo == "linear_fit_clip":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
+                aligned_images_for_stack,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                sigma=stack_kappa_high,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        else:
+            master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
+                aligned_image_data_list=aligned_images_for_stack,
+                normalize_method=stack_norm_method,
+                weighting_method=stack_weight_method,
+                rejection_algorithm=stack_reject_algo,
+                final_combine_method=stack_final_combine,
+                sigma_clip_low=stack_kappa_low,
+                sigma_clip_high=stack_kappa_high,
+                winsor_limits=parsed_winsor_limits,
+                minimum_signal_adu_target=0.0,
+                apply_radial_weight=apply_radial_weight,
+                radial_feather_fraction=radial_feather_fraction,
+                radial_shape_power=radial_shape_power,
+                winsor_max_workers=winsor_pool_workers,
+                progress_callback=progress_callback,
+                zconfig=zconfig,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+    finally:
+        for attr_name, old_value in saved_gpu_flags.items():
+            try:
+                if old_value is missing:
+                    delattr(zconfig, attr_name)
+                else:
+                    setattr(zconfig, attr_name, old_value)
+            except Exception:
+                pass
 
     del aligned_images_for_stack
     gc.collect()
@@ -13131,6 +13265,8 @@ def create_master_tile(
     quality_crop_enabled_effective = bool(quality_crop_enabled)
     altaz_cleanup_enabled_effective = bool(altaz_cleanup_enabled)
     quality_gate_enabled_effective = bool(quality_gate_enabled)
+    if quality_crop_enabled_effective or altaz_cleanup_enabled_effective:
+        _ensure_lecropper_loaded()
     min_safe_stack_effective = max(1, int(min_safe_stack_size))
     target_stack_effective = max(min_safe_stack_effective, int(target_stack_size))
 
@@ -13830,8 +13966,9 @@ def create_master_tile(
             )
 
     pipeline_alpha_mask: np.ndarray | None = None
-    lecropper_pipeline_requested = bool(quality_crop_enabled_effective or altaz_cleanup_enabled_effective)
-    lecropper_applied = False
+    quality_crop_enabled_for_pipeline = bool(quality_crop_enabled_effective and quality_crop_rect is None)
+    lecropper_pipeline_requested = bool(quality_crop_enabled_for_pipeline or altaz_cleanup_enabled_effective)
+    lecropper_applied = bool(quality_crop_rect is not None)
     if lecropper_pipeline_requested and _LECROPPER_AVAILABLE:
         coverage_for_lecropper: np.ndarray | None = None
         coverage_reject_reason: str | None = None
@@ -13939,7 +14076,7 @@ def create_master_tile(
             )
 
         pipeline_cfg = {
-            "quality_crop_enabled": quality_crop_enabled_effective,
+            "quality_crop_enabled": quality_crop_enabled_for_pipeline,
             "quality_crop_band_px": quality_crop_band_px,
             "quality_crop_k_sigma": quality_crop_k_sigma,
             "quality_crop_margin_px": quality_crop_margin_px,
