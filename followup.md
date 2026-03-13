@@ -217,11 +217,11 @@ Legend:
 - [x] `lecropper` is no longer an official runtime dependency
 - [x] config migration is idempotent
 - [x] docs and release notes are aligned
-- [ ] CI is green
+- [x] CI is green
 
 ### G6. S5 closeout
-- [ ] Record final QA proof in `memory.md`
-- [ ] Mark release status as GO or NO-GO
+- [x] Record final QA proof in `memory.md`
+- [x] Mark release status as GO or NO-GO
 
 ---
 

@@ -1131,3 +1131,30 @@ Exploration only, no mission started yet.
 - Lecropper status changed or not: unchanged (annex), no official runtime dependency.
 - Official-path Tk imports decreased or stayed unchanged: stayed unchanged this iteration (validation + CI guard addition).
 - Validated headless scope changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-13 11:11 — Iteration 34
+- Scope: close remaining S5 blocker after user CI feedback.
+- In scope:
+  - validate G5 `CI is green` from user-provided workflow result
+  - close G6 (GO/NO-GO)
+- Out of scope:
+  - Node 20 deprecation remediation (non-blocking infra warning)
+- Files changed:
+  - `followup.md`
+  - `agent.md`
+  - `memory.md`
+- Proof collected:
+  - User confirms `guard` workflow is GREEN.
+  - Warning is non-blocking deprecation notice for Node 20 actions (`actions/checkout@v4`, `actions/setup-python@v5`).
+- Decisions:
+  - Release status for this migration checkpoint: **GO**.
+  - Node 20 warning tracked as follow-up infra task; does not block Qt-only/Tk-retirement acceptance.
+- Remaining blockers:
+  - none for S5 closeout.
+  - Windows/macOS smoke tests remain on hold by user decision.
+- Next unchecked item:
+  - S6 (later mission only; do not start unless requested).
+- Lecropper status changed or not: unchanged (annex), decoupled from official runtime/headless validated paths.
+- Official-path Tk imports decreased or stayed unchanged: stayed unchanged this iteration.
+- Validated headless scope changed or stayed unchanged: stayed unchanged.
