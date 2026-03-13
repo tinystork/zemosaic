@@ -89,6 +89,7 @@ map_coordinates = None  # Lazily imported when needed
 
 logger = logging.getLogger(__name__)
 _PREVIEW_WCS_LINEARIZED_LOGGED = False
+_PHASE5_GPU_OOM_HINT: dict[str, int | None] = {"max_chunk_bytes": None, "rows_per_chunk": None, "oom_events": 0}
 
 
 EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
@@ -5377,11 +5378,69 @@ def _reproject_and_coadd_wrapper_impl(
         phase5_oom_retry_max = 0
 
     def _gpu_call_with_oom_retry():
+        local_kwargs = dict(gpu_kwargs)
+
+        # Platform-adaptive pre-clamp: keep low-VRAM GPUs conservative while
+        # leaving higher-end desktops mostly unconstrained.
+        try:
+            if gpu_is_available():
+                import cupy as cp  # type: ignore
+
+                free_b, total_b = cp.cuda.runtime.memGetInfo()
+                gib = 1024 ** 3
+                tier_frac = None
+                tier_rows_cap = None
+                if total_b and total_b <= 3 * gib:
+                    tier_frac = 0.35
+                    tier_rows_cap = 1024
+                elif total_b and total_b <= 4 * gib:
+                    tier_frac = 0.42
+                    tier_rows_cap = 1536
+                elif total_b and total_b <= 6 * gib:
+                    tier_frac = 0.50
+                    tier_rows_cap = 2048
+
+                if tier_frac is not None and free_b and free_b > 0:
+                    tier_max = max(32 * 1024 * 1024, int(free_b * float(tier_frac)))
+                    try:
+                        current_max = int(local_kwargs.get("max_chunk_bytes") or 0)
+                    except Exception:
+                        current_max = 0
+                    if current_max <= 0 or tier_max < current_max:
+                        local_kwargs["max_chunk_bytes"] = int(tier_max)
+
+                    try:
+                        current_rows = int(local_kwargs.get("rows_per_chunk") or 0)
+                    except Exception:
+                        current_rows = 0
+                    if tier_rows_cap is not None:
+                        if current_rows <= 0:
+                            local_kwargs["rows_per_chunk"] = int(tier_rows_cap)
+                        else:
+                            local_kwargs["rows_per_chunk"] = int(min(current_rows, int(tier_rows_cap)))
+        except Exception:
+            pass
+
+        # Persisted per-process OOM hint from previous retries in this run.
+        try:
+            hint_max = _PHASE5_GPU_OOM_HINT.get("max_chunk_bytes")
+            if hint_max:
+                cur_max = local_kwargs.get("max_chunk_bytes")
+                if not cur_max or int(hint_max) < int(cur_max):
+                    local_kwargs["max_chunk_bytes"] = int(hint_max)
+            hint_rows = _PHASE5_GPU_OOM_HINT.get("rows_per_chunk")
+            if hint_rows:
+                cur_rows = local_kwargs.get("rows_per_chunk")
+                if not cur_rows or int(hint_rows) < int(cur_rows):
+                    local_kwargs["rows_per_chunk"] = int(hint_rows)
+        except Exception:
+            pass
+
         if not phase5_oom_retry or phase5_oom_retry_max <= 0:
-            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **local_kwargs)
+
         max_retries = int(phase5_oom_retry_max)
         retry_index = 0
-        local_kwargs = dict(gpu_kwargs)
         while True:
             try:
                 return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **local_kwargs)
@@ -5395,18 +5454,32 @@ def _reproject_and_coadd_wrapper_impl(
                 )
                 local_kwargs["max_chunk_bytes"] = new_max
                 local_kwargs["rows_per_chunk"] = new_rows
+
+                # Persist tighter hints for subsequent channels/tiles in this process.
+                try:
+                    prev_max = _PHASE5_GPU_OOM_HINT.get("max_chunk_bytes")
+                    _PHASE5_GPU_OOM_HINT["max_chunk_bytes"] = int(new_max) if not prev_max else int(min(int(prev_max), int(new_max)))
+                    prev_rows = _PHASE5_GPU_OOM_HINT.get("rows_per_chunk")
+                    _PHASE5_GPU_OOM_HINT["rows_per_chunk"] = int(new_rows) if not prev_rows else int(min(int(prev_rows), int(new_rows)))
+                    _PHASE5_GPU_OOM_HINT["oom_events"] = int(_PHASE5_GPU_OOM_HINT.get("oom_events") or 0) + 1
+                except Exception:
+                    pass
+
                 free_bytes = _probe_free_vram_bytes()
                 if free_bytes is not None and free_bytes > 0:
                     free_mb = f"{(free_bytes / (1024 ** 2)):.1f}"
                 else:
                     free_mb = "n/a"
                 logger.warning(
-                    "[GPU Reproject] OOM retry %d/%d: max_chunk_mb=%.1f rows=%s free_vram_mb=%s",
+                    "[GPU Reproject] OOM retry %d/%d: max_chunk_mb=%.1f rows=%s free_vram_mb=%s hint_max_mb=%.1f hint_rows=%s oom_events=%s",
                     retry_index,
                     max_retries,
                     float(new_max or 0) / (1024 ** 2),
                     int(new_rows),
                     free_mb,
+                    float((_PHASE5_GPU_OOM_HINT.get("max_chunk_bytes") or 0)) / (1024 ** 2),
+                    str(_PHASE5_GPU_OOM_HINT.get("rows_per_chunk")),
+                    str(_PHASE5_GPU_OOM_HINT.get("oom_events")),
                 )
                 free_cupy_memory_pools()
                 gc.collect()

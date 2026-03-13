@@ -25,6 +25,14 @@ def _worker_source() -> str:
     return (REPO_ROOT / "zemosaic_worker.py").read_text(encoding="utf-8", errors="ignore")
 
 
+def _align_gpu_source() -> str:
+    return (REPO_ROOT / "zemosaic_align_stack_gpu.py").read_text(encoding="utf-8", errors="ignore")
+
+
+def _utils_source() -> str:
+    return (REPO_ROOT / "zemosaic_utils.py").read_text(encoding="utf-8", errors="ignore")
+
+
 def _adaptation_block() -> str:
     src = _worker_source()
     start = src.find("# Per-tile adaptive working-set control (S3): adjust pass/chunk sizing only.")
@@ -529,6 +537,8 @@ def test_source_contract_skips_non_user_degenerate_affine_application():
 
 def test_source_contract_phase6_writes_display_fits_companion():
     src = _worker_source()
+    assert 'save_display_fits_config = bool(getattr(zconfig, "save_display_fits", False))' in src
+    assert 'bool(save_display_fits_config)' in src
     assert 'display_fits_path = output_folder_path / f"{output_base_name}_display.fits"' in src
     assert 'run_info_phase6_display_fits_saved' in src
     assert 'ZMDISPF' in src
@@ -591,3 +601,20 @@ def test_source_contract_intertile_pairs_emit_eta_updates():
     assert 'if message_or_stage == "phase5_intertile_pairs":' in src
     assert 'def _emit_intertile_eta(done_pairs: int, total_pairs: int) -> None:' in src
     assert 'f"ETA_UPDATE:{h:02d}:{m:02d}:{s:02d}"' in src
+
+
+
+def test_source_contract_phase3_wsc_oom_backoff_persists_rows_cap():
+    src = _align_gpu_source()
+    assert '_WSC_DYNAMIC_ROWS_CAP: int | None = None' in src
+    assert '_WSC_OOM_EVENTS: int = 0' in src
+    assert '_wsc_budget_fraction_by_vram' in src
+    assert 'rows_cap=%s oom_events=%d' in src
+
+
+def test_source_contract_phase5_gpu_oom_hint_persists_across_retries():
+    src = _utils_source()
+    assert '_PHASE5_GPU_OOM_HINT' in src
+    assert 'hint_max_mb=' in src
+    assert '_PHASE5_GPU_OOM_HINT["max_chunk_bytes"]' in src
+    assert '_PHASE5_GPU_OOM_HINT["rows_per_chunk"]' in src

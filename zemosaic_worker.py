@@ -23551,6 +23551,7 @@ def run_hierarchical_mosaic_classic_legacy(
         if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         legacy_rgb_flag = bool(legacy_rgb_cube_config)
+        save_display_fits_config = bool(getattr(zconfig, "save_display_fits", False))
         # Ensure the final mosaic buffer is a contiguous, writeable ndarray for I/O
         save_array = None
         try:
@@ -23604,7 +23605,8 @@ def run_hierarchical_mosaic_classic_legacy(
         # Always generate a display-oriented FITS companion (non-scientific stretch)
         # to improve compatibility with viewers that do not auto-stretch float mosaics.
         if (
-            not legacy_rgb_flag
+            bool(save_display_fits_config)
+            and not legacy_rgb_flag
             and ZEMOSAIC_UTILS_AVAILABLE
             and hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware")
         ):

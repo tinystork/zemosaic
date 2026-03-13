@@ -77,6 +77,8 @@ _WSC_GPU_PARITY_CHECKED = False
 _WSC_GPU_PARITY_OK = False
 _WSC_GPU_PARITY_MAX_ABS: float | None = None
 _P3_GPU_RUNTIME_STATS: dict[str, Any] = {}
+_WSC_DYNAMIC_ROWS_CAP: int | None = None
+_WSC_OOM_EVENTS: int = 0
 
 
 class GPUStackingError(RuntimeError):
@@ -382,6 +384,43 @@ def _wsc_estimate_bytes_per_row(
     return int(frames * w * dbytes * ovh)
 
 
+
+
+def _wsc_budget_fraction_by_vram(total_vram_bytes: int | None, n_frames: int) -> float:
+    """Return a conservative VRAM budget fraction for WSC chunks.
+
+    Low-VRAM GPUs are clamped more aggressively to avoid recurrent CuPy OOMs,
+    while larger GPUs keep higher utilization.
+    """
+
+    total = int(total_vram_bytes or 0)
+    gib = 1024 * 1024 * 1024
+
+    if total and total <= 3 * gib:
+        frac = 0.35
+    elif total and total <= 4 * gib:
+        frac = 0.40
+    elif total and total <= 6 * gib:
+        frac = 0.48
+    elif total and total <= 8 * gib:
+        frac = 0.52
+    else:
+        frac = 0.55
+
+    # More source frames increase temporary buffers and allocator pressure.
+    try:
+        n = max(1, int(n_frames))
+    except Exception:
+        n = 1
+    if n >= 8:
+        frac -= 0.08
+    elif n >= 6:
+        frac -= 0.05
+    elif n >= 4:
+        frac -= 0.03
+
+    return float(min(0.60, max(0.22, frac)))
+
 def _should_use_wsc_streaming_cpu(
     *,
     frames_count: int,
@@ -426,19 +465,28 @@ def _resolve_rows_per_chunk_wsc(
 
     bytes_per_row = _wsc_estimate_bytes_per_row(n_frames, width)
     free_b = None
+    total_b = None
     if cp_mod is not None:
         try:
-            free_b, _total_b = cp_mod.cuda.runtime.memGetInfo()
+            free_b, total_b = cp_mod.cuda.runtime.memGetInfo()
         except Exception:
             free_b = None
+            total_b = None
     if free_b is None:
         free_b = max_bytes if max_bytes > 0 else 0
 
-    budget = min(max_bytes if max_bytes > 0 else free_b, int(free_b * 0.55))
+    budget_fraction = _wsc_budget_fraction_by_vram(total_b, n_frames)
+    if _WSC_OOM_EVENTS > 0:
+        # Tighten progressively after observed OOMs during the current run.
+        budget_fraction = max(0.20, budget_fraction * (0.92 ** min(4, int(_WSC_OOM_EVENTS))))
+
+    budget = min(max_bytes if max_bytes > 0 else free_b, int(free_b * budget_fraction))
     rows_budget = budget // bytes_per_row if budget > 0 and bytes_per_row > 0 else 0
     rows_final = rows_budget if rows_budget > 0 else 1
     if rows_hint and rows_hint > 0:
         rows_final = min(rows_final, int(rows_hint))
+    if _WSC_DYNAMIC_ROWS_CAP and int(_WSC_DYNAMIC_ROWS_CAP) > 0:
+        rows_final = min(rows_final, int(_WSC_DYNAMIC_ROWS_CAP))
     rows_final = min(height, rows_final)
     if _gpu_safe_mode_enabled():
         rows_final = min(rows_final, SAFE_MODE_ROWS_CAP, height)
@@ -447,14 +495,18 @@ def _resolve_rows_per_chunk_wsc(
         try:
             mib = 1024.0 * 1024.0
             logger.info(
-                "[P3][WSC][VRAM_PREFLIGHT] N=%d W=%d C=%d free=%.1fMiB budget=%.1fMiB est_row=%.3fMiB rows=%d channelwise=yes",
+                "[P3][WSC][VRAM_PREFLIGHT] N=%d W=%d C=%d free=%.1fMiB total=%.1fMiB budget=%.1fMiB frac=%.3f est_row=%.3fMiB rows=%d rows_cap=%s oom_events=%d channelwise=yes",
                 int(n_frames),
                 int(width),
                 int(channels),
                 float(free_b) / mib if mib else 0.0,
+                float(total_b) / mib if (mib and total_b) else 0.0,
                 float(budget) / mib if mib else 0.0,
+                float(budget_fraction),
                 float(bytes_per_row) / mib if mib else 0.0,
                 int(rows_final),
+                str(int(_WSC_DYNAMIC_ROWS_CAP)) if _WSC_DYNAMIC_ROWS_CAP else "none",
+                int(_WSC_OOM_EVENTS),
             )
         except Exception:
             pass
@@ -1308,6 +1360,8 @@ def gpu_stack_from_arrays(
         Optional configuration namespace mirroring the CPU stacker options.
     """
 
+    global _WSC_DYNAMIC_ROWS_CAP, _WSC_OOM_EVENTS
+
     if logger is None:
         logger = LOGGER
     if not aligned_images:
@@ -1556,13 +1610,25 @@ def gpu_stack_from_arrays(
                                 raise GPUStackingError("WSC GPU VRAM exhausted") from exc
                             current_rows = max(1, current_rows // 2)
                             rows_per_chunk = current_rows
+
+                            # Persist a conservative cap for subsequent chunks/tiles in this run.
+                            try:
+                                _WSC_OOM_EVENTS = int(_WSC_OOM_EVENTS) + 1
+                            except Exception:
+                                _WSC_OOM_EVENTS = 1
+                            tightened_cap = max(1, int(current_rows * 0.85))
+                            if _WSC_DYNAMIC_ROWS_CAP is None or tightened_cap < int(_WSC_DYNAMIC_ROWS_CAP):
+                                _WSC_DYNAMIC_ROWS_CAP = int(tightened_cap)
+
                             if logger:
                                 try:
                                     logger.warning(
-                                        "[P3][WSC][VRAM_BACKOFF] oom retry=%d rows->%d row_start=%d",
+                                        "[P3][WSC][VRAM_BACKOFF] oom retry=%d rows->%d rows_cap=%s row_start=%d oom_events=%d",
                                         retry_count,
                                         current_rows,
+                                        str(int(_WSC_DYNAMIC_ROWS_CAP)) if _WSC_DYNAMIC_ROWS_CAP else "none",
                                         row_start,
+                                        int(_WSC_OOM_EVENTS),
                                     )
                                 except Exception:
                                     pass

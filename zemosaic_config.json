@@ -77,6 +77,7 @@
     "astrometry_api_key": "",
     "save_final_as_uint16": true,
     "legacy_rgb_cube": true,
+    "save_display_fits": false,
     "coadd_use_memmap": true,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": true,

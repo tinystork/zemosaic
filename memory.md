@@ -1963,3 +1963,70 @@ Exploration only, no mission started yet.
 - All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
 - Phase 3 launch control changed or stayed unchanged: stayed unchanged.
 - Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-14 00:03 — Iteration 55
+- Scope: Gate display FITS companion behind config flag to restore previous default output behavior.
+- In scope:
+  - add `save_display_fits` config flag (default disabled)
+  - condition Phase 6 `*_display.fits` export on that flag
+  - keep scientific FITS export unchanged
+  - update tests for source contract
+- Out of scope:
+  - GUI toggle wiring for the new flag (manual config/default behavior only)
+- Files changed:
+  - `zemosaic_worker.py`
+  - `zemosaic_config.py`
+  - `zemosaic_config.json`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "display_fits_companion or intertile_pairs_emit_eta_updates or eta_"` -> `8 passed`
+  - `../.venv/bin/python -m pytest -q tests` -> `45 passed, 21 warnings`
+- Proof:
+  - Phase 6 now reads `save_display_fits_config = bool(getattr(zconfig, "save_display_fits", False))`.
+  - `*_display.fits` is generated only when `save_display_fits` is enabled.
+  - Default config now includes `"save_display_fits": false`.
+- Decisions:
+  - Keep legacy/default behavior (no display companion) unless explicitly enabled by config.
+- Blockers:
+  - none
+- Next unchecked item:
+  - optional: expose `save_display_fits` in GUI settings if desired.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+
+### 2026-03-14 00:26 — Iteration 56
+- Scope: Reduce GPU OOM frequency on low-VRAM hosts (TinyDebian MX150) while preserving full GPU usage on stronger desktops.
+- In scope:
+  - Phase 3 WSC GPU preflight made VRAM-tier adaptive
+  - Phase 3 OOM backoff persists conservative row-cap across subsequent chunks/tiles
+  - Phase 5 GPU reproject OOM retry persists tightened chunk hints across retries/channels
+  - add source-contract tests for new OOM-adaptive logic
+- Out of scope:
+  - disabling GPU globally
+  - scientific algorithm changes
+- Files changed:
+  - `zemosaic_align_stack_gpu.py`
+  - `zemosaic_utils.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `memory.md`
+- Tests run:
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "phase3_wsc_oom_backoff_persists_rows_cap or phase5_gpu_oom_hint_persists_across_retries"` -> `2 passed`
+  - `../.venv/bin/python -m pytest -q tests` -> `47 passed, 21 warnings`
+- Proof:
+  - Added `_wsc_budget_fraction_by_vram(total_vram_bytes, n_frames)` with tiered fractions (low VRAM => lower budget fraction).
+  - Added run-scoped WSC OOM memory (`_WSC_DYNAMIC_ROWS_CAP`, `_WSC_OOM_EVENTS`) so one OOM tightens future Phase 3 chunking automatically.
+  - Phase 5 reproject now has persistent OOM hints (`_PHASE5_GPU_OOM_HINT`) applied before calls and tightened on each OOM retry.
+  - High-VRAM machines remain effectively unconstrained unless OOM actually occurs.
+- Decisions:
+  - Keep fallback architecture unchanged (GPU retry/backoff first, CPU fallback still available) and improve proactive sizing + persistence.
+- Blockers:
+  - Patch applies on next run (current run process may still be on old code if not restarted after edit).
+- Next unchecked item:
+  - Validate OOM incidence drop on TinyDebian with same reference dataset; compare wall-time impact.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
