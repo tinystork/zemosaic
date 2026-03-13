@@ -74,8 +74,9 @@ def _ensure_tk_dialogs_loaded() -> tuple[object | None, object | None]:
     if fd is not None or mb is not None:
         return fd, mb
     try:  # pragma: no cover - optional dependency
-        import tkinter.filedialog as _fd
-        import tkinter.messagebox as _mb
+        import importlib
+        _fd = importlib.import_module("tkinter.filedialog")
+        _mb = importlib.import_module("tkinter.messagebox")
     except Exception:
         fd = None
         mb = None
@@ -548,7 +549,6 @@ def load_config():
                 # Pour l'instant, la boucle ci-dessus s'assure que toutes les clés de DEFAULT_CONFIG
                 # sont présentes dans current_config, en prenant la valeur chargée si elle existe.
         except json.JSONDecodeError:
-            # Utiliser mb (messagebox) si disponible, sinon print
             msg_title = "Config Error"
             msg_text = f"Error reading {config_path}. Using default configuration."
             print(f"WARNING: {msg_title} - {msg_text}")
@@ -675,13 +675,6 @@ def save_config(config_data):
         msg_text = f"Unable to save configuration to {config_path}:\n{e}"
         print(f"ERROR: {msg_title} - {msg_text}")
         return False
-
-# Les fonctions ask_and_set_... et get_... restent les mêmes,
-# elles utiliseront le nouveau chemin via get_config_path().
-# Assurez-vous que tkinter.filedialog (fd) est importé si vous l'utilisez dans ces fonctions.
-# Par exemple :
-# import tkinter.filedialog as fd # Au début du fichier si ce n'est pas déjà fait globalement
-# ... (vos fonctions ask_and_set_astap_path, etc.)
 
 def ask_and_set_astap_path(current_config):
     """Prompt the user for the ASTAP executable in a cross-platform friendly way."""
