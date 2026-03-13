@@ -4097,7 +4097,7 @@ MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
-CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None and IS_WINDOWS
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
 
 GLOBAL_SEESTAR_TOKENS = ("seestar", "s30", "s50")
 

@@ -443,8 +443,17 @@ class ZeMosaicQtWorker(QObject):
         queue_obj: multiprocessing.Queue | None = None
         process: multiprocessing.Process | None = None
         try:
-            queue_obj = multiprocessing.Queue()
-            process = multiprocessing.Process(
+            # On POSIX, prefer "spawn" so the worker does not inherit a live
+            # CUDA/CuPy state from the Qt process after GPU probing.
+            mp_ctx: Any = multiprocessing
+            if platform.system().lower() != "windows":
+                try:
+                    mp_ctx = multiprocessing.get_context("spawn")
+                except Exception:
+                    mp_ctx = multiprocessing
+
+            queue_obj = mp_ctx.Queue()
+            process = mp_ctx.Process(
                 target=run_hierarchical_mosaic_process,
                 args=(queue_obj, *worker_args),
                 kwargs=worker_kwargs,

@@ -12,7 +12,7 @@ logger.propagate = True
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
-CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None and IS_WINDOWS
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
 
 
 def _default_log_and_callback(
