@@ -705,13 +705,64 @@ def _normalize_mount(value: object) -> str | None:
 
 
 def _resolve_path(base_dir: Path, text: str | os.PathLike[str]) -> Path:
+    """Resolve frame paths from stack_plan entries.
+
+    Supports native absolute/relative paths and Windows-exported paths reused on
+    POSIX hosts (e.g. ``D:\\...\\file.fit``). In cross-platform cases we try
+    sane fallbacks under ``base_dir`` before returning a non-existing candidate.
+    """
+    raw = str(text).strip().strip('"').strip("'")
+    candidates: list[Path] = []
+
     try:
-        candidate = Path(text)
+        candidate = Path(raw)
     except Exception:
-        candidate = Path(str(text))
-    if not candidate.is_absolute():
-        candidate = base_dir / candidate
-    return candidate.expanduser().resolve(strict=False)
+        candidate = Path(str(raw))
+
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        candidates.append(base_dir / candidate)
+
+    # Windows absolute path serialized into CSV and reused on Linux/macOS.
+    windows_drive_like = len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha()
+    windows_unc_like = raw.startswith("\\")
+    if windows_drive_like or windows_unc_like or "\\" in raw:
+        posixish = raw.replace("\\", "/")
+        # Keep only path tail after drive if present: D:/a/b/file.fit -> a/b/file.fit
+        if windows_drive_like and ":" in posixish:
+            posixish = posixish.split(":", 1)[1].lstrip("/")
+        if posixish:
+            candidates.append(base_dir / Path(posixish))
+        # Last-resort: basename in current input folder
+        try:
+            basename = Path(posixish).name if posixish else Path(raw).name
+        except Exception:
+            basename = ""
+        if basename:
+            candidates.append(base_dir / basename)
+
+    # Return first existing candidate.
+    seen: set[str] = set()
+    first_resolved: Path | None = None
+    for cand in candidates:
+        try:
+            resolved = cand.expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if first_resolved is None:
+            first_resolved = resolved
+        try:
+            if resolved.is_file():
+                return resolved
+        except Exception:
+            pass
+
+    return first_resolved if first_resolved is not None else (base_dir / Path(raw)).expanduser().resolve(strict=False)
 
 
 def _dialect_from_sample(sample: str) -> csv.Dialect | None:

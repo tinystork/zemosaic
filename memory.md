@@ -2195,3 +2195,67 @@ Exploration only, no mission started yet.
   - defer color pipeline change until post-rerun evidence confirms persistent visual desaturation issue
 - Next unchecked item:
   - rerun SDS and verify reduced CPU fallbacks + inspect visual rendering path if user still perceives grayscale
+
+### 2026-03-14 11:04 — Iteration 62
+- Scope: read latest SDS log, declare operational status, add qualitative next-step, and audit ZeGrid health.
+- SDS log verdict:
+  - latest run completed end-to-end (`run_success_mosaic_saved`, preview saved, processing completed, final COMPLETED banner)
+  - no reappearance of previous blocking regressions (`existing_master_tiles_results` NameError / broadcast mismatch)
+- Decision:
+  - mark SDS as functionally repaired for current dataset/workflow.
+- Added mission next-step:
+  - investigate qualitative inter-frame harmonization inside each super-tile (normalization/photometric consistency) as follow-up improvement.
+- ZeGrid audit performed:
+  - static compile checks OK (`grid_mode.py`, `zemosaic_gui_qt.py`, `zemosaic_filter_gui_qt.py`)
+  - runtime signature compatibility confirmed between worker call site and `grid_mode.run_grid_mode`
+  - import works in project venv
+  - smoke on empty folder yields controlled expected error (`Grid mode failed: no frames loaded`), no unexpected crash
+- Limitation:
+  - no recent real ZeGrid run in worker log, so production health remains to validate on a true grid dataset.
+- Files changed:
+  - `fix_regression.md`
+  - `memory.md`
+- Next unchecked item:
+  - execute one real ZeGrid run and validate completion + output artifacts.
+
+### 2026-03-14 11:11 — Iteration 63
+- Scope: fix ZeGrid failure `Grid mode failed: no frames loaded` with `stack_plan.csv` present.
+- Root cause from worker log:
+  - CSV rows used Windows absolute paths (`D:\...`) while run host is Linux.
+  - grid parser resolved paths as `base_dir / "D:\..."`, so every row became `file not found`.
+- Code change:
+  - hardened `grid_mode._resolve_path` with cross-platform fallbacks for Windows-style paths:
+    - detect drive/UNC/backslash formats,
+    - try tail-relative and basename resolution under CSV folder,
+    - keep existing native absolute/relative behavior.
+- Evidence:
+  - real problematic CSV re-check:
+    - before: `frames=0`
+    - after: `frames=24`, all files resolved and existing.
+- Tests:
+  - added `tests/test_grid_mode_stack_plan_paths.py`
+  - `pytest -q tests/test_grid_mode_stack_plan_paths.py` -> `1 passed`
+  - SDS non-regression guard tests rerun -> `3 passed`
+- Files changed:
+  - `grid_mode.py`
+  - `tests/test_grid_mode_stack_plan_paths.py`
+  - `fix_regression.md`
+  - `memory.md`
+- Next unchecked item:
+  - run full ZeGrid from GUI on real dataset and verify end-to-end completion artifacts.
+
+### 2026-03-14 14:18 — Iteration 64
+- Scope: verify real GPU activity for Phase 5 reproject in existing_master_tiles mode.
+- Findings from worker log:
+  - GPU mode was requested and accepted (`phase5_using_gpu`, phase5 plan.use_gpu=1).
+  - no `gpu_fallback_runtime_error` seen during run.
+  - two-pass renorm explicitly reports GPU backend (`cupy_chunk/cupy_chunk`, `gpu_all=True`).
+  - GPU memory telemetry changed (38→42MB reprojection, ~132MB blur/gains), indicating GPU allocations.
+  - `gpu_util_percent` remains unavailable (`None`) because telemetry source is `cupy_meminfo` (memory-only).
+- Conclusion:
+  - GPU path is active in this run; apparent "no activity" likely due to limited util telemetry, not CPU-only fallback.
+- Next optional improvement:
+  - add explicit success logs/counters for GPU reproject chunks + NVML utilization probe when available.
+- Files changed:
+  - `fix_regression.md`
+  - `memory.md`
