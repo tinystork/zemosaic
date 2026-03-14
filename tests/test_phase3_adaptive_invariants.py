@@ -40,6 +40,13 @@ def _adaptation_block() -> str:
     assert start >= 0 and end > start
     return src[start:end]
 
+def _run_hierarchical_source() -> str:
+    src = _worker_source()
+    start = src.find("def run_hierarchical_mosaic(")
+    end = src.find("def run_hierarchical_mosaic_process(", start)
+    assert start >= 0 and end > start
+    return src[start:end]
+
 
 def test_winsor_pass_split_matches_full_membership_output():
     rng = np.random.default_rng(123)
@@ -132,6 +139,29 @@ def test_adaptation_block_keeps_logical_membership_contract():
     ]
     for pattern in forbidden_patterns:
         assert pattern not in block
+
+
+def test_run_hierarchical_master_tiles_bootstrap_avoids_undefined_existing_tiles_symbol():
+    src = _run_hierarchical_source()
+
+    assert "master_tiles_results_list: list[tuple[str, Any]] = []" in src
+    assert "master_tiles_results_list: list[tuple[str, Any]] = list(existing_master_tiles_results)" not in src
+
+
+def test_sds_finalize_disables_geometry_changing_quality_crop_in_phase5_polish():
+    src = _worker_source()
+
+    assert "phase5_sds_quality_crop_disabled" in src
+    assert 'sds_pipeline_cfg["quality_crop_enabled"] = False' in src
+
+
+def test_sds_global_gpu_helper_has_oom_retry_with_chunk_tightening():
+    src = _worker_source()
+
+    assert "global_coadd_gpu_oom_retry" in src
+    assert "max_gpu_helper_retries = 3" in src
+    assert "plan_rows_gpu_hint = int(next_rows)" in src
+    assert "plan_chunk_gpu_hint = int(next_chunk)" in src
 
 
 def test_phase3_runtime_controller_backoff_hysteresis_and_recovery_markers_present():

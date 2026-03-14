@@ -2030,3 +2030,168 @@ Exploration only, no mission started yet.
 - All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
 - Phase 3 launch control changed or stayed unchanged: stayed unchanged.
 - Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+### 2026-03-14 08:32 — Iteration 57
+- Scope: surgical FITS compliance fix for RGB 3D exports (master tiles + final mosaic paths) to remove `CTYPE3/WCSAXES` inconsistency.
+- In scope:
+  - map exact write sites for Primary header/WCSAXES/CTYPE3/EXTNAME/ALPHA
+  - patch shared FITS writer behavior with minimal diff
+  - validate with `fitsverify` on representative master tile + final mosaic outputs
+- Out of scope:
+  - pipeline refactor
+  - scientific data-path changes
+- Files changed:
+  - `zemosaic_utils.py`
+- Tests run:
+  - synthetic bad-file baseline showing original error class:
+    - `fitsverify /tmp/zem_fitsverify/before_bug_equivalent.fits` -> `Keyword CTYPE3: index 3 is not in range 1-2 (WCSAXES)`
+  - representative exports through real helper (`save_fits_image`, float RGB cube, WCSAXES=2):
+    - `fitsverify /tmp/zem_fitsverify/master_tile_repr.fits` -> 0 warnings / 0 errors
+    - `fitsverify /tmp/zem_fitsverify/final_mosaic_repr.fits` -> 0 warnings / 0 errors
+- Proof / mapping:
+  - common writer confirmed: `zemosaic_worker.py` master tiles + final mosaic both call `zemosaic_utils.save_fits_image(..., save_as_float=True, axis_order="HWC", alpha_mask=...)`.
+  - responsible sites in shared writer:
+    - float RGB path added `CTYPE3='RGB'` and `EXTNAME='RGB'` in Primary when 3D
+    - legacy RGB cube helper also added `CTYPE3='RGB'` and `EXTNAME='RGB'`
+    - ALPHA extension writing remains separate (`ImageHDU(..., name='ALPHA')`)
+- Patch summary:
+  - added `_header_declares_2d_wcs(header)`
+  - when header declares `WCSAXES=2`, Primary RGB 3D path now removes `CTYPE3` instead of setting it
+  - removed `EXTNAME` from Primary in those RGB Primary paths (keeps ALPHA extension naming untouched)
+  - preserved `WCSAXES=2`, `CTYPE1/2`, `CRPIX*`, `CRVAL*`, `PC*`, `CUNIT*` etc.
+- Result:
+  - `CTYPE3/WCSAXES` error class corrected on representative master/final outputs.
+- Risks:
+  - low/contained: header hygiene change in shared writer affects all RGB 3D Primary exports using this helper; Windows compatibility expected to improve (no intentional data-layout change).
+- Next unchecked item:
+  - optional real-dataset A/B check in ASIFitsViewer Windows/Linux after this patch.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+### 2026-03-14 09:25 — Iteration 58
+- Scope: Regression SDS/grid_mode audit and remediation planning only (no code fix yet).
+- In scope:
+  - read mission continuity docs (`agent.md`, `followup.md`, `memory.md`)
+  - inspect latest SDS failure logs
+  - map probable refactor regression point
+  - create persistent tracking file for this new regression mission
+- Out of scope:
+  - applying code patches
+  - running post-fix validation matrix
+- Files changed:
+  - `fix_regression.md` (new)
+  - `memory.md`
+- Tests run:
+  - log inspection: `/home/tristan/.config/ZeMosaic/zemosaic_worker.log`
+  - static code inspection around failing lines in `zemosaic_worker.py`
+  - occurrence scan for `existing_master_tiles_results`
+- Proof:
+  - crash reproduced in logs at `run_hierarchical_mosaic` after Phase 2 with:
+    - `NameError: name 'existing_master_tiles_results' is not defined`
+  - in `run_hierarchical_mosaic` the variable is referenced but not initialized in-function.
+  - same symbol is properly initialized in `run_hierarchical_mosaic_classic_legacy`, indicating a likely refactor scope regression.
+- Decisions:
+  - keep fix surgical and scope-limited to variable initialization/guarding in the new path.
+  - add a dedicated mission tracker `fix_regression.md` with iteration log + TODO list.
+- Blockers:
+  - none for starting the patch phase.
+- Next unchecked item:
+  - Apply minimal fix in `run_hierarchical_mosaic`, then run SDS/grid + non-SDS smoke validation matrix.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged (analysis-only iteration).
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+### 2026-03-14 09:33 — Iteration 59
+- Scope: SDS restoration only (priority user), fix NameError regression in new `run_hierarchical_mosaic` path.
+- In scope:
+  - patch `existing_master_tiles_results` undefined-symbol regression
+  - keep mode architecture constraint explicit (classic/grid/SDS are mutually exclusive)
+  - add non-regression test guard for this exact failure class
+- Out of scope:
+  - broad refactor
+  - algorithmic changes
+  - full end-to-end GUI run validation matrix (pending next step)
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `fix_regression.md`
+  - `memory.md`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py tests/test_phase3_adaptive_invariants.py`
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "run_hierarchical_master_tiles_bootstrap_avoids_undefined_existing_tiles_symbol"` -> `1 passed`
+- Proof:
+  - In `run_hierarchical_mosaic`, bootstrap now uses `master_tiles_results_list = []`, removing dependency on undefined `existing_master_tiles_results`.
+  - Legacy path occurrence remains unchanged to avoid collateral behavior drift.
+  - Dedicated source-contract test now enforces this invariant in CI/local runs.
+- Decisions:
+  - Keep fix surgical and SDS-focused.
+  - Validate via real SDS GUI toggle run next, then smoke classic/grid separately.
+- Blockers:
+  - none for running post-fix SDS reproduction.
+- Next unchecked item:
+  - Re-run SDS mode from GUI and confirm no `NameError` at Phase2->Phase3 handoff.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+### 2026-03-14 10:11 — Iteration 60
+- Scope: SDS-only regression fix for broadcast shape mismatch in Phase 5 global polish.
+- In scope:
+  - analyze new SDS crash reported in latest worker log
+  - patch SDS finalization path to preserve geometry consistency
+  - add non-regression marker test
+- Out of scope:
+  - CPU fallback behavior analysis (explicitly ignored per user request)
+  - non-SDS algorithm changes
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `fix_regression.md`
+  - `memory.md`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py tests/test_phase3_adaptive_invariants.py`
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "run_hierarchical_master_tiles_bootstrap_avoids_undefined_existing_tiles_symbol or sds_finalize_disables_geometry_changing_quality_crop_in_phase5_polish"` -> `2 passed`
+- Proof:
+  - traceback pointed to `np.where(keep_mask > 0, final_mosaic_coverage, 0.0)` with shape mismatch `(1099,32)` vs `(3330,3748)`.
+  - root cause: SDS global polish allowed lecropper quality crop (geometry-changing) on mosaic while coverage stayed at global descriptor size.
+  - fix: in `_finalize_sds_global_mosaic`, force `quality_crop_enabled=False` in local SDS pipeline config and log marker `phase5_sds_quality_crop_disabled`.
+- Decisions:
+  - keep SDS geometry stable in global polish; preserve non-cropping parts of lecropper pipeline (alt-az cleanup path).
+- Blockers:
+  - none for runtime validation.
+- Next unchecked item:
+  - rerun real SDS GUI flow and confirm no broadcast error + successful output completion.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+### 2026-03-14 10:38 — Iteration 61
+- Scope: SDS priority fix on VRAM/OOM behavior in global coadd helper path; color check secondary.
+- In scope:
+  - inspect latest SDS log OOM pattern
+  - port adaptive GPU OOM handling concept to SDS helper route
+  - add non-regression source-contract test
+  - quick objective color sanity check on outputs
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `fix_regression.md`
+  - `memory.md`
+- Technical changes:
+  - `_attempt_gpu_helper_route` now declares `nonlocal plan_rows_gpu_hint, plan_chunk_gpu_hint`
+  - added per-channel GPU retry loop (`max_gpu_helper_retries=3`)
+  - on OOM: free CuPy pools when available, halve rows/chunk hints, log `global_coadd_gpu_oom_retry`, retry GPU before CPU fallback
+  - tightened hints persist during the same run/batch for next channels
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py`
+  - `python3 -m py_compile tests/test_phase3_adaptive_invariants.py`
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "sds_global_gpu_helper_has_oom_retry_with_chunk_tightening or sds_finalize_disables_geometry_changing_quality_crop_in_phase5_polish or run_hierarchical_master_tiles_bootstrap_avoids_undefined_existing_tiles_symbol"` -> `3 passed`
+- Color sanity check:
+  - PNG preview stats (RGBA) confirm RGB channels are not identical (non-zero inter-channel diffs)
+  - FITS final stats also confirm 3-channel data present; no strict grayscale conversion detected
+- Decisions:
+  - classify current issue as GPU OOM pressure handling first; not proven VRAM leak from logs
+  - defer color pipeline change until post-rerun evidence confirms persistent visual desaturation issue
+- Next unchecked item:
+  - rerun SDS and verify reduced CPU fallbacks + inspect visual rendering path if user still perceives grayscale

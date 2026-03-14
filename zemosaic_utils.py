@@ -3941,6 +3941,21 @@ def _prepare_int16_header(base_header, width: int, height: int, *, extname: str 
     return header
 
 
+
+
+def _header_declares_2d_wcs(header) -> bool:
+    """Return True when header explicitly declares a 2-D WCS."""
+
+    try:
+        wcs_axes = header.get("WCSAXES")
+    except Exception:
+        return False
+    try:
+        return int(wcs_axes) == 2
+    except Exception:
+        return False
+
+
 def _update_dataminmax(header, data: np.ndarray) -> None:
     """Set ``DATAMIN``/``DATAMAX`` cards to match the stored integer range."""
 
@@ -4025,8 +4040,11 @@ def _build_legacy_rgb_cube_hdu(
     header = _prepare_int16_header(base_header, width, height)
     header["NAXIS"] = 3
     header["NAXIS3"] = int(channels)
-    header["CTYPE3"] = ("RGB", "Color Format")
-    header["EXTNAME"] = "RGB"
+    if _header_declares_2d_wcs(header):
+        header.pop("CTYPE3", None)
+    else:
+        header["CTYPE3"] = ("RGB", "Color Format")
+    header.pop("EXTNAME", None)
     _update_dataminmax(header, cube_i16)
     log_fn(
         f"  SAVE_DEBUG: Legacy cube range [{np.min(cube_i16)}, {np.max(cube_i16)}]",
@@ -4311,10 +4329,11 @@ def save_fits_image(image_data: np.ndarray,
             header_float['NAXIS1'] = int(w)
             header_float['NAXIS2'] = int(h)
             header_float['NAXIS3'] = int(c)
-            if 'CTYPE3' not in header_float:
+            if _header_declares_2d_wcs(header_float):
+                header_float.pop('CTYPE3', None)
+            elif 'CTYPE3' not in header_float:
                 header_float['CTYPE3'] = ('RGB', 'Color Format')
-            if 'EXTNAME' not in header_float:
-                header_float['EXTNAME'] = 'RGB'
+            header_float.pop('EXTNAME', None)
         else:
             header_float['NAXIS'] = 2
             header_float['NAXIS1'] = int(data_for_primary.shape[1])

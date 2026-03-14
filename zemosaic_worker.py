@@ -4122,12 +4122,24 @@ def _finalize_sds_global_mosaic(
 
     final_output_shape = final_output_shape_hw or mosaic_arr.shape[:2]
     final_alpha_map = None
+
+    # SDS global polish must preserve global descriptor geometry (H,W).
+    # Quality crop may change array dimensions, which can desynchronize
+    # mosaic/coverage maps and break later broadcast operations.
+    sds_pipeline_cfg = dict(pipeline_cfg or {})
+    if sds_pipeline_cfg.get("quality_crop_enabled"):
+        try:
+            pcb("phase5_sds_quality_crop_disabled", prog=None, lvl="INFO_DETAIL")
+        except Exception:
+            pass
+        sds_pipeline_cfg["quality_crop_enabled"] = False
+
     mosaic_arr, coverage_arr, final_alpha_map = _apply_phase5_post_stack_pipeline(
         mosaic_arr,
         coverage_arr,
         final_alpha_map,
         enable_lecropper_pipeline=enable_lecropper_pipeline,
-        pipeline_cfg=pipeline_cfg or {},
+        pipeline_cfg=sds_pipeline_cfg,
         enable_master_tile_crop=enable_master_tile_crop,
         master_tile_crop_percent=master_tile_crop_percent,
         two_pass_enabled=two_pass_enabled,
@@ -26485,7 +26497,8 @@ def run_hierarchical_mosaic(
     final_alpha_map = None
     sds_fallback_logged = False
     alpha_final: np.ndarray | None = None
-    master_tiles_results_list: list[tuple[str, Any]] = list(existing_master_tiles_results)
+    # SDS/grid pipeline does not build existing-master-tiles preload in this function.
+    master_tiles_results_list: list[tuple[str, Any]] = []
     final_quality_pipeline_cfg = {
         "quality_crop_enabled": bool(quality_crop_enabled_config),
         "quality_crop_band_px": int(quality_crop_band_px_config),
@@ -29606,7 +29619,7 @@ def _assemble_global_mosaic_first_impl(
         _maybe_emit_cpu_eta(int(done_count))
 
     def _attempt_gpu_helper_route() -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, int]] | None:
-        nonlocal helper_partial_gpu_artifacts
+        nonlocal helper_partial_gpu_artifacts, plan_rows_gpu_hint, plan_chunk_gpu_hint
         helper_entries: list[tuple[dict, Any]] = []
         helper_seen = 0
         helper_valid = 0
@@ -29699,40 +29712,79 @@ def _assemble_global_mosaic_first_impl(
                 if final_channels:
                     helper_partial_gpu_artifacts = True
                 return None
-            gpu_reproj_kwargs: dict[str, Any] = {}
-            row_hint_gpu = plan_rows_gpu_hint or plan_rows_cpu_hint
-            if row_hint_gpu:
-                gpu_reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint_gpu))
-            chunk_hint_gpu = plan_chunk_gpu_hint or plan_chunk_cpu_hint
-            if chunk_hint_gpu:
-                gpu_reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint_gpu))
-            try:
-                chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
-                    data_list=data_list,
-                    wcs_list=wcs_list_local,
-                    shape_out=(height, width),
-                    output_projection=global_wcs_obj,
-                    reproject_function=reproject_interp,
-                    combine_function=coadd_method,
-                    stack_reject_algo=stack_reject_algo,
-                    winsor_limits=winsor_limits,
-                    coadd_k=kappa_sigma_k,
-                    cpu_func=reproject_and_coadd,
-                    use_gpu=True,
-                    allow_cpu_fallback=False,
-                    match_background=match_background,
-                    progress_callback=pcb,
-                    **gpu_reproj_kwargs,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[Worker] Global GPU helper path failed on channel %d: %s",
-                    channel_idx,
-                    exc,
-                )
-                if final_channels:
-                    helper_partial_gpu_artifacts = True
-                return None
+            max_gpu_helper_retries = 3
+            attempt = 0
+            while True:
+                attempt += 1
+                gpu_reproj_kwargs: dict[str, Any] = {}
+                row_hint_gpu = plan_rows_gpu_hint or plan_rows_cpu_hint
+                if row_hint_gpu:
+                    gpu_reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint_gpu))
+                chunk_hint_gpu = plan_chunk_gpu_hint or plan_chunk_cpu_hint
+                if chunk_hint_gpu:
+                    gpu_reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint_gpu))
+                try:
+                    chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
+                        data_list=data_list,
+                        wcs_list=wcs_list_local,
+                        shape_out=(height, width),
+                        output_projection=global_wcs_obj,
+                        reproject_function=reproject_interp,
+                        combine_function=coadd_method,
+                        stack_reject_algo=stack_reject_algo,
+                        winsor_limits=winsor_limits,
+                        coadd_k=kappa_sigma_k,
+                        cpu_func=reproject_and_coadd,
+                        use_gpu=True,
+                        allow_cpu_fallback=False,
+                        match_background=match_background,
+                        progress_callback=pcb,
+                        **gpu_reproj_kwargs,
+                    )
+                    break
+                except Exception as exc:
+                    is_oom = _is_gpu_oom_error(exc)
+                    if is_oom and attempt < max_gpu_helper_retries:
+                        try:
+                            if ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(
+                                zemosaic_utils, "free_cupy_memory_pools"
+                            ):
+                                zemosaic_utils.free_cupy_memory_pools()
+                        except Exception:
+                            pass
+                        prev_rows = int(row_hint_gpu) if row_hint_gpu else 0
+                        prev_chunk = int(chunk_hint_gpu) if chunk_hint_gpu else 0
+                        next_rows = max(32, int(math.ceil(prev_rows / 2.0))) if prev_rows > 0 else 256
+                        if prev_chunk > 0:
+                            next_chunk = max(32 * 1024 * 1024, int(prev_chunk * 0.5))
+                        else:
+                            next_chunk = 256 * 1024 * 1024
+                        plan_rows_gpu_hint = int(next_rows)
+                        plan_chunk_gpu_hint = int(next_chunk)
+                        pcb(
+                            "global_coadd_gpu_oom_retry",
+                            prog=None,
+                            lvl="WARN",
+                            **_payload(
+                                helper="gpu_reproject",
+                                channel=int(channel_idx + 1),
+                                attempt=int(attempt),
+                                rows_before=int(prev_rows),
+                                rows_after=int(next_rows),
+                                chunk_mb_before=float(prev_chunk / (1024 ** 2)) if prev_chunk > 0 else None,
+                                chunk_mb_after=float(next_chunk / (1024 ** 2)),
+                                error=str(exc),
+                            ),
+                        )
+                        continue
+                    logger.warning(
+                        "[Worker] Global GPU helper path failed on channel %d: %s",
+                        channel_idx,
+                        exc,
+                    )
+                    if final_channels:
+                        helper_partial_gpu_artifacts = True
+                    return None
             if gpu_verify_tolerance is not None:
                 cpu_reproj_kwargs: dict[str, Any] = {}
                 cpu_rows_hint = plan_rows_cpu_hint or plan_rows_gpu_hint
