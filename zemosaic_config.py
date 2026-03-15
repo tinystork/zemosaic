@@ -123,9 +123,18 @@ DEFAULT_CONFIG = {
     "final_mosaic_rgb_equalize_enabled": False,
     "final_mosaic_rgb_equalize_clip_enabled": True,
     "final_mosaic_rgb_equalize_gain_clip": [0.80, 1.25],
+    # Power-user only (JSON): preview PNG stretch controls (no dedicated GUI fields)
+    "preview_png_p_low": 1.0,
+    "preview_png_p_high": 99.9,
+    "preview_png_asinh_a": 12.0,
+    "preview_png_max_dim": 3200,
+    "preview_png_apply_wb": False,
     "existing_master_tiles_rgb_balance_prephase5": True,
     "existing_master_tiles_rgb_balance_gain_clip": [0.90, 1.10],
     "existing_master_tiles_rgb_balance_min_pixels": 5000,
+    # Existing-master anchor photometry (post-refactor safeguard)
+    "existing_master_tiles_anchor_photometry_enabled": True,
+    "existing_master_tiles_anchor_gain_clip": [0.90, 1.10],
     "existing_master_tiles_final_rgb_equalize_gain_clip": [0.90, 1.10],
     "sds_enable_final_rgb_equalize": False,
     "sds_final_rgb_equalize_gain_clip": [0.95, 1.05],
@@ -237,11 +246,16 @@ DEFAULT_CONFIG = {
     "intertile_global_recenter": True,
     "force_resolve_existing_wcs": False,
     "intertile_recenter_clip": [0.85, 1.18],
+    # Power-user only (JSON): blend affine corrections toward neutral to reduce seam visibility
+    "intertile_affine_blend": 1.0,
     "use_auto_intertile": False,
     "match_background_for_final": True,
     "incremental_feather_parity": False,
     "final_mosaic_dbe_enabled": True,
     "final_mosaic_dbe_strength": "normal",
+    # Final black-point equalization (power-user; can alter low/mid ADU chroma balance)
+    "final_mosaic_black_point_equalize_enabled": False,
+    "final_mosaic_black_point_percentile": 0.1,
     "final_mosaic_dbe_obj_k": 3.0,
     "final_mosaic_dbe_obj_dilate_px": 3,
     "final_mosaic_dbe_sample_step": 24,
@@ -536,9 +550,9 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 def get_config_path():
     """
     Retourne le chemin du fichier de configuration.
-    Le fichier est stocké dans le répertoire utilisateur ZeMosaic.
+    Le fichier est stocké dans le répertoire du repo ZeMosaic.
     """
-    return str(ensure_user_config_dir() / CONFIG_FILE_NAME)
+    return str(_SCRIPT_DIR / CONFIG_FILE_NAME)
 
 def load_config():
     config_path = Path(get_config_path())

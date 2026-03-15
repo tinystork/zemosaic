@@ -5384,6 +5384,71 @@ def _sanitize_affine_corrections(
     return sanitized, True
 
 
+def _blend_affine_corrections(
+    affine_list: list[tuple[float, float]] | None,
+    blend_factor: float | int | None,
+) -> tuple[list[tuple[float, float]] | None, bool, dict[str, float | bool]]:
+    """Blend intertile affine corrections towards neutral to reduce seam visibility.
+
+    gain' = 1 + (gain - 1) * blend
+    offset' = offset * blend
+    """
+
+    stats: dict[str, float | bool] = {
+        "applied": False,
+        "blend": 1.0,
+        "median_abs_gain_delta_before": 0.0,
+        "median_abs_gain_delta_after": 0.0,
+        "median_abs_offset_before": 0.0,
+        "median_abs_offset_after": 0.0,
+    }
+    if not affine_list:
+        return None, False, stats
+
+    try:
+        blend = float(blend_factor) if blend_factor is not None else 1.0
+    except Exception:
+        blend = 1.0
+    blend = float(max(0.0, min(1.0, blend)))
+    stats["blend"] = blend
+
+    before_gain = np.asarray([abs(float(g) - 1.0) for g, _ in affine_list], dtype=np.float64)
+    before_off = np.asarray([abs(float(o)) for _, o in affine_list], dtype=np.float64)
+    if before_gain.size:
+        stats["median_abs_gain_delta_before"] = float(np.nanmedian(before_gain))
+    if before_off.size:
+        stats["median_abs_offset_before"] = float(np.nanmedian(before_off))
+
+    if blend >= 0.999999:
+        nontrivial = any(abs(g - 1.0) > 1e-6 or abs(o) > 1e-6 for g, o in affine_list)
+        stats["median_abs_gain_delta_after"] = float(stats["median_abs_gain_delta_before"])
+        stats["median_abs_offset_after"] = float(stats["median_abs_offset_before"])
+        return (affine_list if nontrivial else None), bool(nontrivial), stats
+
+    blended: list[tuple[float, float]] = []
+    nontrivial_after = False
+    for gain_val, offset_val in affine_list:
+        g = float(gain_val) if np.isfinite(gain_val) else 1.0
+        o = float(offset_val) if np.isfinite(offset_val) else 0.0
+        g2 = 1.0 + (g - 1.0) * blend
+        o2 = o * blend
+        if abs(g2 - 1.0) > 1e-6 or abs(o2) > 1e-6:
+            nontrivial_after = True
+        blended.append((float(g2), float(o2)))
+
+    after_gain = np.asarray([abs(g - 1.0) for g, _ in blended], dtype=np.float64)
+    after_off = np.asarray([abs(o) for _, o in blended], dtype=np.float64)
+    if after_gain.size:
+        stats["median_abs_gain_delta_after"] = float(np.nanmedian(after_gain))
+    if after_off.size:
+        stats["median_abs_offset_after"] = float(np.nanmedian(after_off))
+    stats["applied"] = True
+
+    if not nontrivial_after:
+        return None, False, stats
+    return blended, True, stats
+
+
 def _select_affine_log_indices(
     affine_list: list[tuple[float, float]] | None,
 ) -> set[int]:
@@ -9684,6 +9749,7 @@ def _run_shared_phase45_phase5_pipeline(
     intertile_robust_clip_sigma_config = phase5_options.get("intertile_robust_clip_sigma") or 2.5
     intertile_global_recenter_config = phase5_options.get("intertile_global_recenter")
     intertile_recenter_clip_tuple = phase5_options.get("intertile_recenter_clip") or (0.85, 1.18)
+    intertile_affine_blend_config = phase5_options.get("intertile_affine_blend", 1.0)
     use_auto_intertile_config = phase5_options.get("use_auto_intertile")
     intertile_force_safe_mode_config = bool(phase5_options.get("intertile_force_safe_mode"))
     coadd_use_memmap_config = bool(phase5_options.get("coadd_use_memmap"))
@@ -9710,11 +9776,11 @@ def _run_shared_phase45_phase5_pipeline(
     )
     final_mosaic_black_point_equalize_enabled = phase5_options.get(
         "final_mosaic_black_point_equalize_enabled",
-        getattr(zconfig, "final_mosaic_black_point_equalize_enabled", True),
+        getattr(zconfig, "final_mosaic_black_point_equalize_enabled", False),
     )
     final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(final_mosaic_black_point_equalize_enabled)
     if final_mosaic_black_point_equalize_enabled is None:
-        final_mosaic_black_point_equalize_enabled = True
+        final_mosaic_black_point_equalize_enabled = False
     final_mosaic_black_point_equalize_enabled = bool(final_mosaic_black_point_equalize_enabled)
     try:
         final_mosaic_black_point_percentile = float(
@@ -9722,7 +9788,6 @@ def _run_shared_phase45_phase5_pipeline(
                 "final_mosaic_black_point_percentile",
                 getattr(zconfig, "final_mosaic_black_point_percentile", 0.1),
             )
-            or 0.1
         )
     except Exception:
         final_mosaic_black_point_percentile = 0.1
@@ -9930,6 +9995,7 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                 intertile_global_recenter=bool(intertile_global_recenter_config),
                 intertile_recenter_clip=intertile_recenter_clip_tuple,
+                intertile_affine_blend=float(intertile_affine_blend_config),
                 use_auto_intertile=bool(use_auto_intertile_config),
                 intertile_force_safe_mode=intertile_force_safe_mode_config,
                 match_background=match_background_flag,
@@ -10240,6 +10306,7 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                 intertile_global_recenter=bool(intertile_global_recenter_config),
                 intertile_recenter_clip=intertile_recenter_clip_tuple,
+                intertile_affine_blend=float(intertile_affine_blend_config),
                 use_auto_intertile=bool(use_auto_intertile_config),
                 intertile_force_safe_mode=intertile_force_safe_mode_config,
                 collect_tile_data=collected_tiles_for_second_pass,
@@ -10440,6 +10507,7 @@ def _run_shared_phase45_phase5_pipeline(
 
     if (
         final_mosaic_black_point_equalize_enabled
+        and float(final_mosaic_black_point_percentile) > 0.0
         and final_mosaic_data_HWC is not None
         and isinstance(final_mosaic_data_HWC, np.ndarray)
         and final_mosaic_data_HWC.ndim == 3
@@ -11185,13 +11253,11 @@ def _early_worker_log_dir() -> Path:
 
 
 def _resolve_worker_log_file_path() -> Path:
+    """Resolve worker log path in repository directory (git-visible)."""
     try:
-        config_dir_provider = globals().get("ensure_user_config_dir")
-        if callable(config_dir_provider):
-            return Path(config_dir_provider()) / "zemosaic_worker.log"
+        return Path(__file__).resolve().parent / "zemosaic_worker.log"
     except Exception:
-        pass
-    return _early_worker_log_dir() / "zemosaic_worker.log"
+        return _early_worker_log_dir() / "zemosaic_worker.log"
 
 
 log_file_path = _resolve_worker_log_file_path()
@@ -15267,6 +15333,7 @@ def assemble_final_mosaic_incremental(
     intertile_robust_clip_sigma: float = 2.5,
     intertile_global_recenter: bool = True,
     intertile_recenter_clip: tuple[float, float] | list[float] = (0.85, 1.18),
+    intertile_affine_blend: float = 1.0,
     use_auto_intertile: bool = False,
     intertile_force_safe_mode: bool | None = None,
     match_background: bool = True,
@@ -15479,6 +15546,25 @@ def assemble_final_mosaic_incremental(
         logger.info(
             "anchor_shift present but intertile affine_list is None => skipping anchor-only application"
         )
+
+    pending_affine_list, nontrivial_detected, affine_blend_stats = _blend_affine_corrections(
+        pending_affine_list,
+        intertile_affine_blend,
+    )
+    if bool(affine_blend_stats.get("applied", False)):
+        try:
+            pcb_asm(
+                "run_info_incremental_affine_blend",
+                prog=None,
+                lvl="INFO_DETAIL",
+                blend=float(affine_blend_stats.get("blend", 1.0)),
+                gain_med_before=float(affine_blend_stats.get("median_abs_gain_delta_before", 0.0)),
+                gain_med_after=float(affine_blend_stats.get("median_abs_gain_delta_after", 0.0)),
+                off_med_before=float(affine_blend_stats.get("median_abs_offset_before", 0.0)),
+                off_med_after=float(affine_blend_stats.get("median_abs_offset_after", 0.0)),
+            )
+        except Exception:
+            pass
 
     affine_log_indices = _select_affine_log_indices(pending_affine_list)
 
@@ -15890,6 +15976,7 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_robust_clip_sigma: float = 2.5,
     intertile_global_recenter: bool = True,
     intertile_recenter_clip: tuple[float, float] | list[float] | None = (0.85, 1.18),
+    intertile_affine_blend: float = 1.0,
     use_auto_intertile: bool = False,
     intertile_force_safe_mode: bool | None = None,
     collect_tile_data: list | None = None,
@@ -16581,8 +16668,42 @@ def assemble_final_mosaic_reproject_coadd(
             exc_info=logger.isEnabledFor(logging.DEBUG),
         )
 
+    existing_mt_anchor_enabled_raw = worker_config_cache.get(
+        "existing_master_tiles_anchor_photometry_enabled",
+        True,
+    )
+    existing_mt_anchor_enabled = _coerce_bool_flag(existing_mt_anchor_enabled_raw)
+    if existing_mt_anchor_enabled is None:
+        existing_mt_anchor_enabled = True
+    existing_mt_anchor_enabled = bool(existing_mt_anchor_enabled)
+
+    existing_mt_anchor_gain_clip_raw = worker_config_cache.get(
+        "existing_master_tiles_anchor_gain_clip",
+        (0.90, 1.10),
+    )
+    try:
+        if isinstance(existing_mt_anchor_gain_clip_raw, str):
+            parts = [float(x.strip()) for x in existing_mt_anchor_gain_clip_raw.split(",")]
+        else:
+            parts = [
+                float(existing_mt_anchor_gain_clip_raw[0]),
+                float(existing_mt_anchor_gain_clip_raw[1]),
+            ]
+        if len(parts) >= 2:
+            low_clip, high_clip = float(parts[0]), float(parts[1])
+        else:
+            low_clip, high_clip = 0.90, 1.10
+    except Exception:
+        low_clip, high_clip = 0.90, 1.10
+    low_clip = float(max(0.50, min(1.50, low_clip)))
+    high_clip = float(max(low_clip + 1e-3, min(2.00, high_clip)))
+    existing_mt_anchor_gain_clip = (low_clip, high_clip)
+
     def _best_effort_anchor_photometry() -> None:
         if not existing_master_tiles_mode:
+            return
+        if not existing_mt_anchor_enabled:
+            logger.info("existing_master_tiles_mode: best-effort anchor skipped (disabled by config)")
             return
         if len(effective_tiles) < 2:
             return
@@ -16601,7 +16722,7 @@ def assemble_final_mosaic_reproject_coadd(
         scale = min(1.0, max_preview / max(preview_h, preview_w)) if max(preview_h, preview_w) > 0 else 1.0
         preview_shape = (max(32, int(preview_h * scale)), max(32, int(preview_w * scale)))
         min_overlap_pixels = 256
-        gain_clip = (0.5, 2.0)
+        gain_clip = existing_mt_anchor_gain_clip
 
         def _resolve_mask(entry: dict[str, Any]) -> np.ndarray | None:
             mask = None
@@ -16876,6 +16997,25 @@ def assemble_final_mosaic_reproject_coadd(
         logger.info(
             "anchor_shift present but intertile affine_list is None => skipping anchor-only application"
         )
+
+    pending_affine_list, nontrivial_affine, affine_blend_stats = _blend_affine_corrections(
+        pending_affine_list,
+        intertile_affine_blend,
+    )
+    if bool(affine_blend_stats.get("applied", False)):
+        try:
+            _pcb(
+                "assemble_info_intertile_affine_blend",
+                prog=None,
+                lvl="INFO_DETAIL",
+                blend=float(affine_blend_stats.get("blend", 1.0)),
+                gain_med_before=float(affine_blend_stats.get("median_abs_gain_delta_before", 0.0)),
+                gain_med_after=float(affine_blend_stats.get("median_abs_gain_delta_after", 0.0)),
+                off_med_before=float(affine_blend_stats.get("median_abs_offset_before", 0.0)),
+                off_med_after=float(affine_blend_stats.get("median_abs_offset_after", 0.0)),
+            )
+        except Exception:
+            pass
 
     affine_by_id: dict[str, tuple[float, float]] | None = None
     if pending_affine_list:
@@ -22160,6 +22300,7 @@ def run_hierarchical_mosaic_classic_legacy(
             "intertile_robust_clip_sigma": intertile_robust_clip_sigma_config,
             "intertile_global_recenter": intertile_global_recenter_config,
             "intertile_recenter_clip": intertile_recenter_clip_tuple,
+            "intertile_affine_blend": float((worker_config_cache or {}).get("intertile_affine_blend", 1.0) or 1.0),
             "use_auto_intertile": use_auto_intertile_config,
             "intertile_force_safe_mode": intertile_force_safe_mode_config,
             "coadd_use_memmap": coadd_use_memmap_config,
@@ -23965,6 +24106,7 @@ def run_hierarchical_mosaic_classic_legacy(
     rgb_black_level_info: dict[str, Any] | None = None
     if (
         final_mosaic_black_point_equalize_enabled
+        and float(final_mosaic_black_point_percentile) > 0.0
         and final_mosaic_data_HWC is not None
         and not sds_mode_phase5
     ):
@@ -24061,7 +24203,7 @@ def run_hierarchical_mosaic_classic_legacy(
                         p_low=disp_p_low,
                         p_high=disp_p_high,
                         asinh_a=disp_asinh_a,
-                        apply_wb=True,
+                        apply_wb=preview_apply_wb,
                     )
                 elif hasattr(zemosaic_utils, "stretch_auto_asifits_like") and callable(zemosaic_utils.stretch_auto_asifits_like):
                     display_stretched = zemosaic_utils.stretch_auto_asifits_like(
@@ -24234,7 +24376,24 @@ def run_hierarchical_mosaic_classic_legacy(
             alpha_preview: np.ndarray | None = None
             try:
                 h_prev, w_prev = int(final_mosaic_data_HWC.shape[0]), int(final_mosaic_data_HWC.shape[1])
-                max_preview_dim = 4000  # cap the longest side for preview
+                _cfg_obj = locals().get("zconfig", None)
+                _cfg_cache = locals().get("worker_config_cache", {})
+                try:
+                    _cfg_cache = _cfg_cache if isinstance(_cfg_cache, dict) else {}
+                except Exception:
+                    _cfg_cache = {}
+                raw_preview_max_dim = (
+                    getattr(_cfg_obj, "preview_png_max_dim", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_max_dim is None:
+                    raw_preview_max_dim = _cfg_cache.get("preview_png_max_dim", 3200)
+                try:
+                    max_preview_dim = int(raw_preview_max_dim)
+                except Exception:
+                    max_preview_dim = 3200
+                max_preview_dim = int(max(1024, min(8000, max_preview_dim)))
                 step_h = max(1, h_prev // max_preview_dim)
                 step_w = max(1, w_prev // max_preview_dim)
                 step = max(step_h, step_w)
@@ -24324,13 +24483,66 @@ def run_hierarchical_mosaic_classic_legacy(
                 # Paramètres pour stretch_auto_asifits_like (à ajuster si besoin)
                 # Ces valeurs sont des exemples, tu devras peut-être les affiner
                 # ou les rendre configurables plus tard.
-                preview_p_low = 2.5  # Percentile pour le point noir (plus élevé que pour asinh seul)
-                preview_p_high = 99.8 # Percentile pour le point blanc initial
-                                      # Facteur 'a' pour le stretch asinh après la normalisation initiale
-                                      # Pour un stretch plus "doux" similaire à ASIFitsView, 'a' peut être plus grand.
-                                      # ASIFitsView utilise souvent un 'midtones balance' (gamma-like) aussi.
-                                      # Un 'a' de 10 comme dans ton code de test est très doux. Essayons 0.5 ou 1.0.
-                preview_asinh_a = 20.0 # Test avec une valeur plus douce pour le 'a' de asinh
+                raw_preview_p_low = (
+                    getattr(_cfg_obj, "preview_png_p_low", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_p_low is None:
+                    raw_preview_p_low = _cfg_cache.get("preview_png_p_low", 1.0)
+                raw_preview_p_high = (
+                    getattr(_cfg_obj, "preview_png_p_high", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_p_high is None:
+                    raw_preview_p_high = _cfg_cache.get("preview_png_p_high", 99.9)
+                raw_preview_asinh_a = (
+                    getattr(_cfg_obj, "preview_png_asinh_a", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_asinh_a is None:
+                    raw_preview_asinh_a = _cfg_cache.get("preview_png_asinh_a", 12.0)
+
+                try:
+                    preview_p_low = float(raw_preview_p_low)
+                except Exception:
+                    preview_p_low = 1.0
+                try:
+                    preview_p_high = float(raw_preview_p_high)
+                except Exception:
+                    preview_p_high = 99.9
+                try:
+                    preview_asinh_a = float(raw_preview_asinh_a)
+                except Exception:
+                    preview_asinh_a = 12.0
+
+                raw_preview_apply_wb = (
+                    getattr(_cfg_obj, "preview_png_apply_wb", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_apply_wb is None:
+                    raw_preview_apply_wb = _cfg_cache.get("preview_png_apply_wb", False)
+                preview_apply_wb = _coerce_bool_flag(raw_preview_apply_wb)
+                if preview_apply_wb is None:
+                    preview_apply_wb = False
+                preview_apply_wb = bool(preview_apply_wb)
+
+                preview_p_low = float(max(0.0, min(20.0, preview_p_low)))
+                preview_p_high = float(max(preview_p_low + 0.1, min(100.0, preview_p_high)))
+                preview_asinh_a = float(max(0.001, min(200.0, preview_asinh_a)))
+                pcb(
+                    "run_info_preview_png_params",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    p_low=preview_p_low,
+                    p_high=preview_p_high,
+                    asinh_a=preview_asinh_a,
+                    max_dim=max_preview_dim,
+                    apply_wb=preview_apply_wb,
+                )
 
                 # Prefer GPU stretch when GPU is enabled/available
                 if use_gpu_phase5_flag and hasattr(zemosaic_utils, 'stretch_auto_asifits_like_gpu'):
@@ -24347,7 +24559,7 @@ def run_hierarchical_mosaic_classic_legacy(
                         p_low=preview_p_low,
                         p_high=preview_p_high,
                         asinh_a=preview_asinh_a,
-                        apply_wb=True  # Applique une balance des blancs automatique
+                        apply_wb=preview_apply_wb
                     )
 
                 if m_stretched is not None:
@@ -28706,6 +28918,7 @@ def run_hierarchical_mosaic(
     rgb_black_level_info: dict[str, Any] | None = None
     if (
         final_mosaic_black_point_equalize_enabled
+        and float(final_mosaic_black_point_percentile) > 0.0
         and final_mosaic_data_HWC is not None
         and not sds_mode_phase5
     ):
@@ -29392,6 +29605,87 @@ if __name__ == "__main__":
         except Exception:
             solver_cfg = SolverSettings().__dict__
 
+    def _cli_progress_callback(message_key_or_raw, progress_value=None, level="INFO", **kwargs):
+        try:
+            lvl = str(level).upper()
+        except Exception:
+            lvl = "INFO"
+        if lvl in {"ERROR", "WARN", "SUCCESS", "INFO"}:
+            txt = str(message_key_or_raw)
+            if kwargs:
+                txt = f"{txt} {kwargs}"
+            print(f"[{lvl}] {txt}")
+
+    cli_cfg = dict(cfg)
+    cli_cfg["input_dir"] = args.input_folder
+    cli_cfg["output_dir"] = args.output_folder
+    if args.coadd_use_memmap:
+        cli_cfg["coadd_use_memmap"] = True
+    if args.coadd_memmap_dir:
+        cli_cfg["coadd_memmap_dir"] = args.coadd_memmap_dir
+    if args.coadd_cleanup_memmap:
+        cli_cfg["coadd_cleanup_memmap"] = True
+    if args.no_auto_limit_frames:
+        cli_cfg["auto_limit_frames_per_master_tile"] = False
+    if args.assembly_process_workers is not None:
+        cli_cfg["assembly_process_workers"] = int(args.assembly_process_workers)
+    if args.winsor_workers is not None:
+        cli_cfg["winsor_worker_limit"] = int(args.winsor_workers)
+    if args.max_raw_per_master_tile is not None:
+        cli_cfg["max_raw_per_master_tile"] = int(args.max_raw_per_master_tile)
+
+    final_kwargs = dict(cli_cfg)
+    final_kwargs["progress_callback"] = _cli_progress_callback
+    final_kwargs["solver_settings"] = solver_cfg
+
+    rename_map = {
+        "input_dir": "input_folder",
+        "output_dir": "output_folder",
+        "astap_executable_path": "astap_exe_path",
+        "astap_data_directory_path": "astap_data_dir_param",
+        "astap_default_search_radius": "astap_search_radius_config",
+        "astap_default_downsample": "astap_downsample_config",
+        "astap_default_sensitivity": "astap_sensitivity_config",
+        "stacking_normalize_method": "stack_norm_method",
+        "stacking_weighting_method": "stack_weight_method",
+        "stacking_rejection_algorithm": "stack_reject_algo",
+        "stacking_final_combine_method": "stack_final_combine",
+        "stacking_kappa_low": "stack_kappa_low",
+        "stacking_kappa_high": "stack_kappa_high",
+        "cluster_panel_threshold": "cluster_threshold_config",
+        "cluster_target_groups": "cluster_target_groups_config",
+        "cluster_orientation_split_deg": "cluster_orientation_split_deg_config",
+    }
+    for old_key, new_key in rename_map.items():
+        if old_key in final_kwargs:
+            final_kwargs[new_key] = final_kwargs.pop(old_key)
+
+    if "stacking_winsor_limits" in final_kwargs:
+        limits_str = final_kwargs.pop("stacking_winsor_limits")
+        try:
+            parts = [float(p.strip()) for p in str(limits_str).split(",")]
+            final_kwargs["parsed_winsor_limits"] = tuple(parts) if len(parts) == 2 else (0.05, 0.05)
+        except Exception:
+            final_kwargs["parsed_winsor_limits"] = (0.05, 0.05)
+
+    sig_params = inspect.signature(run_hierarchical_mosaic).parameters
+    for key in list(final_kwargs.keys()):
+        config_key = f"{key}_config"
+        if config_key in sig_params and key not in sig_params:
+            final_kwargs[config_key] = final_kwargs.pop(key)
+
+    final_kwargs = {k: v for k, v in final_kwargs.items() if k in sig_params}
+    if "stack_ram_budget_gb_config" not in final_kwargs:
+        final_kwargs["stack_ram_budget_gb_config"] = 0.0
+    if "num_base_workers_config" not in final_kwargs:
+        final_kwargs["num_base_workers_config"] = 0
+    # CLI safety defaults for required args that may be absent in sparse JSON configs
+    final_kwargs.setdefault("cluster_threshold_config", 0.03)
+    final_kwargs.setdefault("cluster_target_groups_config", 0)
+    final_kwargs.setdefault("cluster_orientation_split_deg_config", 0.0)
+    final_kwargs.setdefault("min_radial_weight_floor_config", 0.0)
+
+    run_hierarchical_mosaic(**final_kwargs)
 
 
 def _assemble_global_mosaic_first_impl(

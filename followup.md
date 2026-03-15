@@ -1,7 +1,7 @@
 # followup.md
 
 # ZeMosaic — Follow-up checklist
-## Mission qualité multi-modes (normalisation / RGB / DBE)
+## Mission seamless mosaic + viewer preview quality
 
 Legend:
 - `[ ]` not done
@@ -9,112 +9,146 @@ Legend:
 - `[~]` partial
 - `BLOCKED:` reason
 
+Reference dataset:
+- `/home/tristan/zemosaic/zemosaic/example/out/ref/`
+
 ---
 
 ## A. Discipline mission
 
-- [x] Lire `agent.md`, `followup.md`, `memory.md` avant toute modif
-- [x] Travailler uniquement sur le prochain item non coché
-- [x] Maintenir patchs chirurgicaux
+- [x] Lire `agent.md`, `followup.md`, `memory.md` avant chaque itération
+- [x] Travailler sur le prochain item non coché (patchs chirurgicaux)
+- [x] Prouver chaque claim (logs + outputs + diff visuel)
 - [x] Mettre à jour `memory.md` à chaque itération significative
-- [x] Prouver chaque claim (logs/tests/sorties)
 
 ---
 
-## B. Baseline / preuves existantes
+## B. Audit initial (code reality check)
 
-### B1. Garde-fou RGB final actuel
-- [x] Confirmer dans le code la désactivation temporaire de la final RGB equalization
-- [x] Documenter le contexte historique (dominante verte) dans `memory.md`
+### B1. Viewer PNG stretch — état actuel confirmé
+- [x] Identifier le point d’entrée preview final dans `zemosaic_worker.py` (Phase 6)
+- [x] Confirmer paramètres hardcodés actuels preview:
+  - `preview_p_low = 2.5`
+  - `preview_p_high = 99.8`
+  - `preview_asinh_a = 20.0`
+- [x] Confirmer downscale preview cap (`max_preview_dim = 4000`) et masquage alpha/NaN
+- [x] Confirmer dépendance à `stretch_auto_asifits_like(_gpu)` dans `zemosaic_utils.py`
 
-### B2. Artefacts de référence
-- [x] Vérifier présence/intégrité des artefacts de référence listés dans `agent.md`
-- [x] Établir ces artefacts comme baseline de comparaison qualité
+### B2. Seams inter-tuiles — mécanismes existants confirmés
+- [x] `zemosaic_worker.py` (classic/incremental/reproject):
+  - intertile affine calibration (`intertile_*`),
+  - background matching,
+  - recenter global,
+  - radial feather parity.
+- [x] `grid_mode.py`:
+  - overlap graph + régressions d’overlap,
+  - solve gain/offset global,
+  - blending overlap (laplacian pyramid + fallback weighted blend),
+  - fusion unique vs overlap regions.
+- [x] Lister les leviers de config existants à réutiliser avant d’en créer de nouveaux
 
-### B3. Cartographie inter-modes
-- [x] Tableau par mode: normalisation photométrique (Y/N/partiel)
-- [x] Tableau par mode: RGB equalization (Y/N/partiel)
-- [x] Tableau par mode: DBE final (Y/N/partiel)
-- [x] Tableau par mode: preview/stretch (Y/N/partiel)
-
----
-
-## C. Q1 — Essai réactivation final RGB equalization
-
-### C1. Implémentation contrôlée
-- [x] Réactiver derrière flag explicite (pas en dur)
-- [x] Valeur par défaut conservatrice (éviter surprise utilisateur)
-- [x] Log clair quand activé/désactivé
-
-### C2. Validation run réel
-- [x] Run A (flag off) baseline
-- [x] Run B (flag on) comparaison
-- [x] Comparer dominante/couleur/histogrammes et rendu preview
-- [x] Décision explicite: keep / tune / revert (tune)
-
----
-
-## D. Q2 — Mode “I’m using master tiles”
-
-### D1. Gap analysis
-- [x] Identifier précisément ce qui manque vs classique
-- [x] Isoler ce qui est déjà couvert par two-pass/affine
-
-### D2. Harmonisation
-- [x] Ajouter mécanisme(s) manquant(s) sans perturber two-pass/affine
-- [x] Garder compatibilité sortie FITS/coverage/preview
-
-### D3. Validation
-- [x] Run comparatif avant/après
-- [x] Vérifier absence de régression fonctionnelle
+### B3. Baseline de référence (avant patch)
+- Preuves exportées:
+  - `example/out/ref/preview_baseline_metrics_2026-03-15.md`
+  - `example/out/ref/preview_baseline_metrics_2026-03-15.json`
+- [x] Capturer comparaison visuelle/metrics sur `example/out/ref`:
+  - visibilité des seams,
+  - clipping hautes lumières PNG,
+  - rendu du fond (propreté/perception)
+- [x] Établir un mini tableau baseline par mode (au moins classic + ZeGrid)
 
 ---
 
-## E. Q3 — Mode SDS
+## C. Sprint 1 prioritaire — PNG viewer (quick win)
 
-### E1. Gap analysis
-- [x] Cartographier différences qualitatives vs classique
-- [x] Isoler ce qui relève de contraintes SDS (géométrie globale)
+> Ordre validé avec Tristan: traiter d’abord le viewer PNG (plus simple/rapide), puis enclencher la 1ère tentative seams.
 
-### E2. Harmonisation
-- [x] Ajouter normalisation/équilibrage manquants compatibles SDS
-- [x] Conserver les correctifs SDS déjà stabilisés (NameError, broadcast, OOM handling)
+### C1. Plan de correction viewer
+- [x] Remplacer les constantes preview hardcodées par paramètres config-gated:
+  - `preview_png_p_low`
+  - `preview_png_p_high`
+  - `preview_png_asinh_a`
+  - `preview_png_max_dim`
+- [x] Définir defaults conservateurs orientés rendu naturel (moins brûlé)
+- [x] Ajouter logs explicites des paramètres réellement appliqués au run
 
-### E3. Validation
-- [x] Run SDS complet sans crash
-- [x] Contrôle qualité couleur/fond/cohérence
+### C2. Implémentation viewer
+- [x] Implémenter lecture config + fallback propre
+- [x] Préserver compat GPU/CPU stretch
+- [x] Préserver alpha-masking/NaN behavior
 
----
-
-## F. Q4 — Mode ZeGrid (DBE prioritaire)
-
-### F1. Confirmation du gap DBE
-- [x] Prouver si DBE final est réellement absent/incomplet
-- [x] Tracer le hook réel de fin de pipeline grid
-
-### F2. Implémentation
-- [x] Intégrer DBE final ZeGrid (équivalent-intention worker)
-- [x] Ajouter logs explicites DBE appliqué/skippé + raison
-
-### F3. Validation
-- [x] Run ZeGrid réel complet
-- [x] Vérifier sorties et absence de régression côté grid_mode
-
----
-
-## G. Non-régression transversale
-
-- [ ] Classique inchangé (smoke)
-- [ ] SDS inchangé fonctionnellement (smoke)
-- [ ] ZeGrid inchangé hors améliorations visées (smoke)
-- [ ] Existing-master-tiles inchangé hors améliorations visées
-- [ ] Tests ciblés passants
+### C3. Validation viewer
+- Retour run utilisateur: amélioration preview confirmée mais coeurs étoiles/galaxies encore brûlés.
+- Retune v2 préparé (JSON-only): `preview_png_p_low=0.3`, `preview_png_p_high=99.97`, `preview_png_asinh_a=0.1`.
+- [x] Run A (baseline actuel)
+- [~] Run B (nouveau preset conservateur)
+- [ ] Vérifier:
+  - moins de blancs brûlés,
+  - fond moins agressif,
+  - pas de régression FITS (science inchangée)
+- [ ] Décision rapide: keep / tune / revert
 
 ---
 
-## H. Clôture mission
+## D. Sprint 2 — Seams (première tentative contrôlée)
 
-- [ ] Rapport final (gains/risques/décisions)
-- [ ] Décision finale sur le garde-fou RGB equalization
-- [ ] Statut final GO / NO-GO
-- [ ] Synthèse durable ajoutée à `memory.md`
+### D1. Priorisation du chemin le plus impactant
+- Cible seams #1 retenue: chaîne **classic/reproject-like MT14 preview outputs** (seam proxy le plus élevé sur baseline ref).
+- Hypothèse dominante (en cours de preuve): compensation photométrique inter-tuiles insuffisante localement + transition overlap/weight trop lisible sur zones à gradient de fond.
+- [x] Choisir cible #1 seams (ZeGrid ou reproject classic) selon baseline visuelle
+- [~] Isoler la cause dominante:
+  - mismatch local de fond,
+  - transition de poids,
+  - limite overlap regression,
+  - feather inadapté
+
+### D2. Correctif seams v1 (minimal risk)
+- Retour run utilisateur: seams toujours très visibles, composante bleue sur-corrigée.
+- Retune seams v2 préparé (JSON-only): `poststack_equalize_rgb=false`, `intertile_affine_blend=0.65`, `intertile_recenter_clip=[0.92,1.08]`, `apply_radial_weight=true`, `radial_feather_fraction=0.90`.
+- Levier D2 v1 implémenté (JSON only, no UI): `intertile_affine_blend` (0..1), appliqué sur corrections gain/offset inter-tuiles avant assemblage.
+- Valeur posée pour validation terrain: `intertile_affine_blend=0.8`.
+- [x] Implémenter un seul levier principal à la fois (config-gated)
+- [x] Conserver garde-fous anti-surcorrection
+- [~] Ajouter logs comparables avant/après (seam delta local)
+
+### D3. Validation seams v1
+- Diagnostic-safe profile préparé pour isolation color drift post-refactor:
+  - `poststack_equalize_rgb=false`
+  - `final_mosaic_rgb_equalize_enabled=false`
+  - `final_mosaic_black_point_equalize_enabled=false`
+  - `final_mosaic_dbe_enabled=false`
+  - seams retune: `intertile_affine_blend=0.50`, `intertile_recenter_clip=[0.95,1.05]`, `intertile_overlap_min=0.10`, `intertile_robust_clip_sigma=2.0`, `radial_feather_fraction=0.92`
+- [ ] Run comparatif avant/après sur dataset ref
+- [ ] Évaluer réduction visible des coutures
+- [ ] Vérifier absence de nouveaux artefacts (banding, halos de transition)
+
+---
+
+## E. Extension inter-modes (après v1 validée)
+
+- [ ] Reporter la correction seams (si pertinente) vers autres modes sans copier brutalement
+- [ ] Vérifier comportement sur:
+  - Classique
+  - Existing master tiles
+  - SDS
+  - ZeGrid
+- [ ] Ajuster par-mode uniquement si nécessaire
+
+---
+
+## F. Non-régression transversale
+
+- [ ] FITS science inchangés dans leur logique (pas de stretch destructif)
+- [ ] Coverage/alpha cohérents
+- [ ] Preview PNG généré sans erreur sur tous modes testés
+- [ ] Aucun crash worker/GUI introduit
+- [ ] Tests ciblés passants (unit/smoke)
+
+---
+
+## G. Clôture mission
+
+- [ ] Rapport final seamless + preview
+- [ ] Paramètres finaux recommandés (defaults + cas marginaux)
+- [ ] GO / NO-GO production
+- [ ] Mise à jour durable `memory.md` (synthèse exploitable debug prod)

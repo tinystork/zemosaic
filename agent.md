@@ -1,154 +1,132 @@
 # agent.md
 
 # ZeMosaic — Mission Codex
-## Harmonisation qualitative multi-modes (post-refactor)
+## Seamless Mosaic & Viewer Preview Quality (all modes)
 
-Date: 2026-03-14
+Date: 2026-03-15
 Owner: Tristan / ZeMosaic core
-Mission mode: quality-first / incremental / non-régression stricte
+Mission mode: quality-first / surgical / strict non-regression
 
 ---
 
 ## Mission objective
 
-Élever la qualité de normalisation photométrique/couleur de tous les modes non-classiques, sans casser les flux réparés.
+Atteindre un rendu final visuellement homogène et propre dans tous les modes en ciblant 2 défauts majeurs encore présents:
+
+1. **Lignes de couture inter-tuiles visibles** (parfois très visibles)
+2. **PNG viewer final trop stretché** (hautes lumières brûlées, fond dégradé, rendu “moche”)
 
 Objectif final:
-- rapprocher **I’m using master tiles**, **SDS**, et **ZeGrid** du niveau qualitatif de la voie classique,
-- en harmonisant (ou en réutilisant) les mécanismes robustes de la voie classique:
-  - normalisation photométrique,
-  - équilibrage RGB,
-  - DBE final (quand pertinent au mode),
-  - cohérence de rendu preview.
+- produire un rendu **seamless** (ou quasi seamless) inter-tuiles,
+- conserver la fidélité scientifique des FITS,
+- améliorer le rendu PNG viewer sans sur-stretch,
+- garantir la cohérence inter-modes: **Classique / Existing master tiles / SDS / ZeGrid**.
 
 ---
 
-## Contexte à conserver explicitement
+## Context to preserve
 
-### 1) Garde-fou actuel (important)
-Un garde-fou a été introduit pendant le refactor:
-- dans `zemosaic_worker.py`, la **final mosaic RGB equalization** est temporairement désactivée/commentée,
-- raison documentée dans le code: éviter une dominante verte quand la normalisation est déjà appliquée en amont.
-
-Mission actuelle:
-- **réactiver cette normalisation à titre d’essai contrôlé**,
-- valider sur run réel,
-- puis prendre une décision finale explicite (garder, ajuster, ou désactiver durablement).
-
-### 2) Artefacts de référence produits (preuve exécution)
-Ces sorties doivent rester des références de validation (existence + qualité):
-- `/home/tristan/zemosaic/zemosaic/example/out/global_mosaic_wcs.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/global_mosaic_wcs.json`
-- `/home/tristan/zemosaic/zemosaic/example/out/mosaic_grid.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/mosaic_grid_coverage.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/resource_telemetry.csv`
-- `/home/tristan/zemosaic/zemosaic/example/out/run_config_snapshot.json`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT0_R30.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT0_R30_coverage.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT0_R30_preview.png`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT14_R0.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT14_R0_coverage.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT14_R0_preview.png`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT14_R30.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT14_R30_coverage.fits`
-- `/home/tristan/zemosaic/zemosaic/example/out/zemosaic_MT14_R30_preview.png`
-
----
-
-## Réalité actuelle des modes (baseline à respecter)
-
-## 2) Mode “I’m using master tiles”
-- Pas la même normalisation "brute unitaire" que le classique (normal, on part de master tiles).
-- Harmonisation surtout inter-tiles (two-pass gains / affine).
-- DBE présent côté worker (hook Phase 6).
-
-## 3) Mode SDS
-- Mécanismes d’harmonisation existants (inter-tiles / two-pass).
-- Pipeline non équivalent au classique sur normalisation "brute unitaire".
-- Ressenti qualitatif "pas normalisé pareil" plausible.
-- DBE câblé côté worker.
-
-## 4) Mode ZeGrid
-- Pipeline photométrique propre au mode grid.
-- Point faible probable: DBE (hook loggé mais absence d’application équivalente claire au worker classique/SDS dans `grid_mode.py`).
+- Les pipelines sont maintenant fonctionnels dans tous les modes (outputs générés correctement).
+- La priorité passe de la stabilité fonctionnelle à la **qualité visuelle finale**.
+- Les précédentes améliorations DBE/RGB/normalisation doivent être conservées (pas de rollback implicite).
+- Le PNG viewer est un produit de visualisation: son amélioration ne doit pas altérer les sorties FITS scientifiques.
 
 ---
 
 ## Non-negotiable execution rules
 
-1. **Ne pas casser les 3 voies exclusives**: classique, SDS, ZeGrid.
-2. **Patchs incrémentaux, mode par mode**, jamais transversal massif en un seul lot.
-3. **Aucune régression silencieuse** sur sorties FITS/coverage/preview.
-4. **Toujours prouver** (logs + outputs + tests ciblés) avant de cocher.
-5. **Réactivation RGB finaleq = essai contrôlé**, pas décision définitive sans run validé.
-6. **DBE ZeGrid**: corriger proprement sans détourner/classiciser brutalement tout le mode.
+1. **Ne pas casser les voies exclusives**: Classique, SDS, ZeGrid, Existing-master-tiles.
+2. **Patchs incrémentaux, un problème à la fois** (coutures puis stretch viewer).
+3. **Aucune régression silencieuse** sur FITS/coverage/output structure.
+4. **Toujours prouver** les claims (logs, captures, stats, comparaison avant/après).
+5. **Ne pas forcer une recette unique brute** si un mode nécessite un tuning dédié.
+6. **Séparer science vs esthétique**: FITS intacts, viewer PNG optimisé à part.
 7. **Traçabilité obligatoire** dans `memory.md` à chaque itération significative.
-8. **Ne pas supprimer de garde-fou sans remplacement/justification.**
+8. **Garder des switches config** pour les nouveaux leviers sensibles (defaults conservateurs).
 
 ---
 
 ## Scope
 
 ### In scope
-- Audit comparatif normalisation/DBE entre classique vs (master-tiles, SDS, ZeGrid)
-- Réintégration contrôlée de `final mosaic RGB equalization`
-- Harmonisation des pipelines non-classiques (duplication maîtrisée ou factorisation partielle)
-- Traitement DBE ZeGrid si manque confirmé
-- Tests et critères qualité inter-modes
+- Audit des mécanismes de fusion inter-tuiles (weights, feather, overlap normalization, blending)
+- Audit des causes visuelles de seams par mode
+- Ajustements du blending/normalisation locale pour réduire les coutures
+- Audit du pipeline de génération preview PNG (stretch, clip, black/white points, saturation)
+- Nouvelle stratégie de stretch viewer plus robuste (moins brûlée, fond plus propre)
+- Validation comparative inter-modes
 
 ### Out of scope
-- Refactor architecture globale du worker
-- Changements non liés à la qualité photométrique/couleur/DBE
-- Altération des invariants scientifiques des stacks
+- Réécriture globale de l’architecture worker
+- Changement des invariants scientifiques des FITS
+- “Beautification” extrême destructrice de signal
 
 ---
 
 ## Mission phases
 
-### [ ] Q0 — Baseline qualité inter-modes
-- Cartographier ce qui est appliqué réellement par mode:
-  - normalisation photométrique
-  - équilibrage RGB
-  - DBE
-  - hooks preview/stretch
-- Produire un tableau "appliqué / non-appliqué / partiel".
+### [ ] S0 — Baseline visuelle & métriques
+- Constituer un jeu de référence avant/après (au moins 1 run par mode si possible, sinon priorité ZeGrid + mode classique).
+- Définir des métriques simples et traçables:
+  - contraste des seams en zone overlap (delta médiane/gradient de frontière),
+  - clipping hautes lumières sur PNG,
+  - niveau de fond (stabilité + propreté perceptuelle).
+- Capturer baseline (images + logs + config snapshot).
 
-### [ ] Q1 — Réactivation contrôlée RGB finaleq (essai)
-- Réactiver la final mosaic RGB equalization derrière un switch explicite.
-- Lancer un run de validation contrôlé.
-- Comparer avant/après (dominante, histogrammes RGB, rendu preview, stats).
-- Décision explicite: conserver / retuner / revert.
+### [ ] S1 — Audit couture inter-tuiles
+- Cartographier les mécanismes existants par mode:
+  - pondération, feather, overlap blending, recenter photométrique, normalisation locale.
+- Identifier où les seams naissent réellement:
+  - mismatch photométrique local,
+  - transitions de poids trop abruptes,
+  - manque de compensation locale de fond,
+  - différences de stack tile-à-tile.
+- Produire une table "cause probable / preuve / mode impacté".
 
-### [ ] Q2 — Mode “I’m using master tiles”
-- Définir l’écart exact vs classique.
-- Ajouter ce qui manque (si pertinent) sans casser two-pass/affine.
-- Valider sortie scientifique + rendu.
+### [ ] S2 — Correctifs seamless (priorité couture)
+- Implémenter des corrections progressives et config-gated:
+  - adoucir transitions overlap (feather/weight profile),
+  - harmonisation locale inter-tuiles (offset/gain robuste),
+  - garde-fous anti-surcorrection.
+- Commencer par le mode le plus touché, puis généraliser prudemment.
+- Journaliser précisément les nouveaux paramètres.
 
-### [ ] Q3 — Mode SDS
-- Identifier les manques qualitatifs vs classique.
-- Introduire harmonisation additionnelle compatible SDS.
-- Vérifier stabilité mémoire/perf déjà restaurée.
+### [ ] S3 — Audit stretch PNG viewer
+- Tracer le pipeline exact de génération preview PNG (où et comment le stretch est appliqué).
+- Confirmer les causes du rendu trop agressif:
+  - percentiles trop extrêmes,
+  - black-point/white-point mal bornés,
+  - gamma/saturation inadaptés,
+  - masquage NaN/alpha influençant le rendu.
 
-### [ ] Q4 — Mode ZeGrid (priorité DBE)
-- Confirmer techniquement le gap DBE.
-- Implémenter un DBE final équivalent-intention (pas forcément copie brute).
-- Valider non-régression ZeGrid + compat sorties.
+### [ ] S4 — Correctifs viewer (esthétique contrôlée)
+- Introduire un stretch viewer plus équilibré (moins de blancs brûlés, fond mieux tenu).
+- Prévoir presets/toggles si nécessaire (conservateur par défaut).
+- Garantir: pas d’impact sur FITS scientifiques.
 
-### [ ] Q5 — Validation finale et décision
-- Campagne de runs comparatifs multi-modes.
+### [ ] S5 — Validation inter-modes & non-régression
+- Runs comparatifs avant/après sur modes clés.
+- Vérifier:
+  - réduction visible des coutures,
+  - PNG viewer plus naturel,
+  - absence de régression fonctionnelle/scientifique.
+- Documenter limites résiduelles (si certaines coutures restent sur cas extrêmes).
+
+### [ ] S6 — Clôture mission
 - Rapport final:
-  - gains qualitatifs
-  - impacts perf
-  - risques résiduels
-  - décisions finales sur garde-fous (dont RGB finaleq)
+  - gains visuels mesurés + ressenti,
+  - impacts perf/mémoire,
+  - nouveaux paramètres et defaults,
+  - recommandations d’usage terrain.
+- Décision finale GO / NO-GO production.
 
 ---
 
 ## Release gate (mission)
 
 Mission close only if:
-1. Régression fonctionnelle = 0 sur classique/SDS/ZeGrid/master-tiles.
-2. Pipeline qualité harmonisé documenté par mode.
-3. Position finale actée sur final RGB equalization.
-4. DBE ZeGrid clarifié (appliqué ou limitation assumée et documentée).
-5. Preuves complètes archivées dans `memory.md`.
+1. Les coutures inter-tuiles sont significativement atténuées sur les cas de référence.
+2. Le PNG viewer n’est plus sur-stretché (moins de blancs brûlés, fond plus propre).
+3. Aucun mode n’a subi de régression fonctionnelle majeure.
+4. Les nouveaux réglages sensibles sont documentés et pilotables par config/GUI si pertinent.
+5. `memory.md` conserve un historique clair des corrections et variables branchées.
