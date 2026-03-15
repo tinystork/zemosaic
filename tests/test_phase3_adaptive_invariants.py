@@ -48,6 +48,14 @@ def _run_hierarchical_source() -> str:
     return src[start:end]
 
 
+def _classic_legacy_source() -> str:
+    src = _worker_source()
+    start = src.find("def run_hierarchical_mosaic_classic_legacy(")
+    end = src.find("def run_hierarchical_mosaic(", start)
+    assert start >= 0 and end > start
+    return src[start:end]
+
+
 def test_winsor_pass_split_matches_full_membership_output():
     rng = np.random.default_rng(123)
     frames = []
@@ -148,6 +156,15 @@ def test_run_hierarchical_master_tiles_bootstrap_avoids_undefined_existing_tiles
     assert "master_tiles_results_list: list[tuple[str, Any]] = list(existing_master_tiles_results)" not in src
 
 
+def test_classic_legacy_initializes_final_rgb_equalize_flag_before_use():
+    src = _classic_legacy_source()
+
+    assert "final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(" in src
+    assert "if final_mosaic_rgb_equalize_enabled:" in src
+    assert "sds_mode_phase5 = bool(sds_mode_flag)" in src
+    assert "if sds_mode_phase5:" in src
+
+
 def test_sds_finalize_disables_geometry_changing_quality_crop_in_phase5_polish():
     src = _worker_source()
 
@@ -232,6 +249,42 @@ def test_phase3_adaptation_telemetry_fields_markers_present():
         assert marker in src
 
     assert "P3_MEM_ADAPT_MODE_CONSERVATIVE" in src
+
+
+def test_final_mosaic_rgb_equalization_gate_and_logging_markers_present():
+    src = _worker_source()
+
+    assert src.count("if final_mosaic_rgb_equalize_enabled:") >= 2
+    assert src.count("_apply_final_mosaic_rgb_equalization(") >= 2
+    assert "[RGB-EQ] final mosaic skipped: disabled by config (final_mosaic_rgb_equalize_enabled=False)" in src
+    assert "[RGB-EQ] final mosaic skipped: enabled=True but sds_mode_phase5=True" in src
+    assert "[RGB-EQ] final mosaic gate: enabled=True applied=%s gains=(%.6f, %.6f, %.6f) target_median=%s" in src
+    assert "final_mosaic_rgb_equalize_clip_enabled" in src
+    assert "final_mosaic_rgb_equalize_gain_clip" in src
+    assert "[RGB-EQ][TUNE] gain clip applied" in src
+    assert "sds_enable_final_rgb_equalize" in src
+    assert "sds_final_rgb_equalize_gain_clip" in src
+    assert "[SDS][RGB-EQ] enabling final rgb-eq in phase5 with clip" in src
+    assert "sds_enable_final_black_point_equalize" in src
+
+
+def test_existing_master_tiles_prephase5_rgb_balance_markers_present():
+    src = _worker_source()
+
+    assert "def _apply_existing_mt_rgb_balance_prephase5()" in src
+    assert "existing_master_tiles_rgb_balance_prephase5" in src
+    assert "existing_master_tiles_rgb_balance_gain_clip" in src
+    assert "existing_master_tiles_rgb_balance_min_pixels" in src
+    assert "existing_master_tiles_mode: pre-phase5 rgb balance summary" in src
+
+
+def test_existing_master_tiles_overrides_final_rgb_clip_markers_present():
+    src = _worker_source()
+
+    assert "existing_master_tiles_final_rgb_equalize_gain_clip" in src
+    assert "existing_master_tiles_mode: overriding final RGB-eq gain clip" in src
+    assert "setattr(" in src and "final_mosaic_rgb_equalize_gain_clip" in src
+
 
 
 

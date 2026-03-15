@@ -2259,3 +2259,421 @@ Exploration only, no mission started yet.
 - Files changed:
   - `fix_regression.md`
   - `memory.md`
+
+### 2026-03-14 15:28 — Post-mortem refactor (garde-fou architecture modes)
+- Constat durable: l’architecture ZeMosaic repose sur **3 modes distincts et exclusifs**:
+  1. **Classique**
+  2. **ZeGrid** (déclenché par `stack_plan.csv`)
+  3. **SDS / ZeSupaDupStack**
+- Ces modes partagent une partie d’infrastructure, mais leurs chemins d’exécution divergent rapidement (préparation, phases intermédiaires, assemblage/finalisation, contraintes de géométrie, gestion GPU/CPU).
+- Le refactor précédent a montré que de petites modifications “transverses” (variables partagées, initialisations, pipeline Phase 5, résolution de chemins) peuvent casser un mode sans casser les autres.
+- Règle à conserver pour toute refactorisation future:
+  - **penser mode-par-mode** (Classique, ZeGrid, SDS),
+  - valider explicitement chaque mode,
+  - éviter les hypothèses implicites de compatibilité entre modes,
+  - maintenir des garde-fous/tests de non-régression dédiés par mode,
+  - traiter les spécificités cross-plateforme (ex. chemins Windows dans ZeGrid sur hôte Linux).
+- Objectif: faire évoluer le code sans réintroduire de régressions silencieuses sur ces trois voies.
+
+### 2026-03-14 15:49 — Iteration 1 (nouvelle mission qualité, audit-only)
+- Scope: lancement mission harmonisation qualitative multi-modes (sans changement code pipeline).
+- In scope:
+  - vérifier le garde-fou RGB finaleq actuellement désactivé
+  - vérifier présence des artefacts de référence de baseline
+  - initialiser la checklist mission (`followup.md`) avec preuves
+- Out of scope:
+  - modification de comportement runtime
+  - réactivation effective de la final RGB equalization
+  - implémentation DBE ZeGrid
+- Files changed:
+  - `agent.md` (nouvelle mission)
+  - `followup.md` (checklist initiale + items audit cochés)
+  - `memory.md`
+- Tests run / preuves:
+  - scan code `zemosaic_worker.py`: garde-fou confirmé
+    - commentaire explicite: "We temporarily disable final mosaic RGB equalization"
+    - mention explicite de "strong green cast"
+  - vérification artefacts baseline: 15/15 présents dans `example/out/`:
+    - global_mosaic_wcs.{fits,json}
+    - mosaic_grid.{fits,coverage.fits}
+    - resource_telemetry.csv
+    - run_config_snapshot.json
+    - zemosaic_MT0_R30 (+ coverage + preview)
+    - zemosaic_MT14_R0 (+ coverage + preview)
+    - zemosaic_MT14_R30 (+ coverage + preview)
+- Decisions:
+  - mission démarre en audit-first, sans patch code, pour réduire le risque de régression.
+  - baseline d’artefacts gelée comme référence de comparaison qualitative.
+- Blockers:
+  - aucun.
+- Next unchecked item:
+  - `B3` cartographie inter-modes détaillée (normalisation / RGB / DBE / preview).
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+### 2026-03-14 15:52 — Iteration 2 (mission qualité multi-modes, B3 cartographie)
+- Scope: B3 uniquement (audit inter-modes), sans modification du pipeline runtime.
+- In scope:
+  - cartographier par mode: normalisation photométrique, RGB equalization, DBE final, preview/stretch
+  - produire preuves code (lignes/fonctions)
+  - cocher B3 dans `followup.md`
+- Out of scope:
+  - réactiver la final RGB equalization
+  - implémenter DBE ZeGrid
+  - lancer des runs de validation visuelle
+- Files changed:
+  - `followup.md` (B3.1→B3.4 cochés)
+  - `memory.md`
+- Tests run / commandes:
+  - `grep -n "run_grid_mode\|sds_mode\|use_existing_master_tiles_mode" zemosaic_worker.py`
+  - `nl -ba zemosaic_worker.py | sed -n '22220,22345p'`
+  - `nl -ba zemosaic_worker.py | sed -n '22770,22875p'`
+  - `nl -ba zemosaic_worker.py | sed -n '10070,10118p'`
+  - `nl -ba zemosaic_worker.py | sed -n '10190,10270p'`
+  - `nl -ba zemosaic_worker.py | sed -n '23320,23425p'`
+  - `nl -ba zemosaic_worker.py | sed -n '23795,24010p'`
+  - `nl -ba zemosaic_worker.py | sed -n '26590,26870p'`
+  - `nl -ba zemosaic_worker.py | sed -n '28096,28215p'`
+  - `nl -ba zemosaic_worker.py | sed -n '28405,28640p'`
+  - `nl -ba grid_mode.py | sed -n '2295,2340p'`
+  - `nl -ba grid_mode.py | sed -n '3060,3245p'`
+  - `nl -ba grid_mode.py | sed -n '3580,3670p'`
+  - `nl -ba grid_mode.py | sed -n '3668,3715p'`
+  - `grep -n "stretch_auto_asifits_like" grid_mode.py`
+- Cartographie B3 (résultat):
+
+  | Mode | Normalisation photométrique | RGB equalization | DBE final | Preview/stretch |
+  |---|---|---|---|---|
+  | Classique | **Y** | **Partiel** | **Y** | **Y** |
+  | Existing master tiles | **Partiel** | **Partiel** | **Y** | **Y** |
+  | SDS | **Partiel** | **Partiel** | **Y** | **Y** |
+  | ZeGrid | **Y** | **Y** | **N (hook only)** | **Partiel/N** |
+
+- Preuves détaillées:
+  - Routage des modes:
+    - ZeGrid est routé séparément via `run_grid_mode` (`zemosaic_worker.py:24431-24484`).
+    - Classique passe par `run_hierarchical_mosaic_classic_legacy` si `not grid and not sds` (`24497-24514`).
+    - SDS suit un chemin dédié (`26590+`, `26687-26732`).
+  - Normalisation photométrique:
+    - Classique: center-out P3 préparé (`22231-22335`) + intertile photometric match P5 (`10092`, `10114`).
+    - Existing master tiles: pas de Phase 3 locale (préchargement tuiles existantes, `21710+`, puis branche `if not use_existing_master_tiles_mode` évitée), mais P5 intertile reste actif (`23292+`, `10092`).
+    - SDS: normalisation photométrique des méga-tiles (`_normalize_sds_megatiles_photometry`, `31017-31024`) + finition SDS dédiée (`26687+`).
+    - ZeGrid: scaling photométrique inter-tiles explicite (`grid_mode.py:3083-3206`).
+  - RGB equalization:
+    - Classique: equalization post-stack au niveau master-tile (`poststack_equalize_rgb` au submit `22727`; trace/effects `14129-14144`).
+    - Existing master tiles: Phase 3 locale sautée => pas de poststack RGB local; final RGB equalization mosaïque explicitement désactivée (`10199-10217`).
+    - SDS: final RGB equalization mosaïque aussi désactivée (`10199-10217`), et chemin SDS nominal contourne la logique P3 classique.
+    - ZeGrid: equalization post-stack tile optionnelle (`grid_mode.py:2318-2326`) + equalization mosaïque ZeGrid (`3621-3643`).
+  - DBE final:
+    - Classique/Existing: DBE Phase 6 active (gate + appel `_apply_final_mosaic_dbe_per_channel`) (`23383-23407`, `23406+`).
+    - SDS: même DBE Phase 6 sur le chemin SDS (`28124-28207`).
+    - ZeGrid: flag DBE transmis (`4302-4319`) mais hook seulement loggé (`"bypassing worker Phase 6"`, `3653-3661`) sans appel DBE effectif dans `grid_mode.py`.
+  - Preview/stretch:
+    - Classique/Existing: preview Phase 6 + `stretch_auto_asifits_like` + export PNG (`23812`, `23927-23964`).
+    - SDS: preview/stretch identique sur chemin SDS (`28434`, `28548-28584`).
+    - ZeGrid: sauvegarde FITS/science/viewer (`3668-3712`) mais pas d’appel `stretch_auto_asifits_like` ni pipeline preview PNG dans `grid_mode.py`.
+- Decisions:
+  - B3 considéré terminé (audit cartographié + preuves traçables).
+  - Prochaine étape mission: C1 (essai contrôlé de réactivation final RGB equalization derrière flag).
+- Blockers:
+  - aucun pour passer à C1.
+- Next unchecked item:
+  - C1 — Implémentation contrôlée de la réactivation (flag explicite, default conservateur, logs clairs).
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+### 2026-03-14 20:56 — Iteration 3 (Q1 C1 impl + C2 Run A baseline log)
+- Scope: traiter la demande utilisateur (audit du dernier log RGB-final OFF) puis exécuter le prochain item non coché (C1), sans lancer de run.
+- In scope:
+  - analyser le dernier run OFF dans `~/.config/ZeMosaic/zemosaic_worker.log`
+  - implémenter C1 (réactivation contrôlée final RGB equalization)
+  - conserver default conservateur
+  - ajouter logs explicites ON/OFF
+  - poser la base pour Run B (flag on)
+- Out of scope:
+  - run de validation flag ON
+  - tuning color final après comparaison
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `followup.md`
+  - `memory.md`
+- Log audit (Run A OFF, baseline):
+  - run confirmé terminé: `run_success_processing_completed`, durée ~582.73s.
+  - mode: `existing_master_tiles_mode` + pipeline classique legacy.
+  - aucun marqueur d’application final RGB equalization (normal car bloc désactivé), black-point égalisation active:
+    - `[BlackPoint] Final mosaic RGB pedestal subtracted ...`
+  - DBE final actif en phase 6 (`[DBE] applied=True ...`).
+- Code changes C1 (réactivation contrôlée):
+  - réactivation du hook final RGB eq derrière `final_mosaic_rgb_equalize_enabled` dans le chemin partagé phase 5 (`zemosaic_worker.py:10207-10243`).
+  - parité ajoutée dans l’autre chemin finalisation (`zemosaic_worker.py:23558-23594`).
+  - logs explicites ajoutés:
+    - OFF: `final mosaic skipped: disabled by config ...`
+    - ON+SDS: `enabled=True but sds_mode_phase5=True`
+    - ON: `final mosaic gate: enabled=True applied=... gains=... target_median=...`
+- Valeur par défaut conservatrice:
+  - inchangée et explicite dans config: `final_mosaic_rgb_equalize_enabled = False` (`zemosaic_config.py`).
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py`
+  - `python3 -m py_compile tests/test_phase3_adaptive_invariants.py`
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "final_mosaic_rgb_equalization_gate_and_logging_markers_present or run_hierarchical_master_tiles_bootstrap_avoids_undefined_existing_tiles_symbol or sds_finalize_disables_geometry_changing_quality_crop_in_phase5_polish"` -> `3 passed`
+- followup status update:
+  - C1.1 ✅
+  - C1.2 ✅
+  - C1.3 ✅
+  - C2 Run A (flag off baseline) ✅
+- Next unchecked item:
+  - C2 Run B (flag on) comparaison.
+- All-raw-frames invariant changed or stayed unchanged: stayed unchanged.
+- Phase 3 launch control changed or stayed unchanged: stayed unchanged.
+- Working-set adaptation changed or stayed unchanged: stayed unchanged.
+
+### 2026-03-14 21:03 — Iteration 4 (préparation Run B Q1)
+- Scope: bascule opératoire demandée par Tristan pour exécuter Run B avec final RGB equalization ON.
+- In scope:
+  - activer le flag runtime sans changer le défaut code/config global conservateur
+- Files changed:
+  - `/home/tristan/.config/ZeMosaic/zemosaic_config.json`
+- Action:
+  - `final_mosaic_rgb_equalize_enabled` passé de `false` à `true` dans la config utilisateur active.
+- Proof:
+  - relecture JSON immédiate -> valeur `True` confirmée.
+- Notes:
+  - aucun autre paramètre modifié.
+  - après Run B, prévoir remise à `false` si on reste en posture conservatrice.
+
+### 2026-03-14 21:20 — Iteration 5 (hotfix NameError Run B)
+- Scope: corriger crash runtime remonté pendant Run B: `name 'final_mosaic_rgb_equalize_enabled' is not defined`.
+- Root cause:
+  - dans `run_hierarchical_mosaic_classic_legacy`, le hook final RGB-eq utilisait `final_mosaic_rgb_equalize_enabled` sans initialisation locale.
+  - le bloc avait été ajouté en C1 mais sans normaliser le flag dans ce scope.
+- Fix applied (surgical):
+  - initialisation locale ajoutée en entrée de fonction:
+    - coercion depuis `final_mosaic_rgb_equalize_enabled_config`
+    - fallback `zconfig.final_mosaic_rgb_equalize_enabled`
+    - défaut conservateur `False`
+  - aucun autre comportement pipeline modifié.
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py`
+  - `python3 -m py_compile tests/test_phase3_adaptive_invariants.py`
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "classic_legacy_initializes_final_rgb_equalize_flag_before_use or final_mosaic_rgb_equalization_gate_and_logging_markers_present"` -> `2 passed`
+- Status:
+  - hotfix prêt; relancer Run B requis (même config).
+
+### 2026-03-14 21:38 — Iteration 6 (hotfix NameError sds_mode_phase5)
+- Scope: corriger crash runtime remonté pendant Run B: `name 'sds_mode_phase5' is not defined`.
+- Root cause:
+  - le hook final RGB-eq/black-point en phase finale du chemin classique référençait `sds_mode_phase5` sans initialisation locale.
+- Fix applied (surgical):
+  - ajout de `sds_mode_phase5 = bool(sds_mode_flag)` juste après la résolution de `sds_mode_flag` dans `run_hierarchical_mosaic_classic_legacy`.
+  - pas de changement d’algorithme; uniquement robustesse d’état local.
+- Files changed:
+  - `zemosaic_worker.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py tests/test_phase3_adaptive_invariants.py`
+  - `../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "classic_legacy_initializes_final_rgb_equalize_flag_before_use or final_mosaic_rgb_equalization_gate_and_logging_markers_present"` -> `2 passed`
+- Status:
+  - hotfix prêt, relance du run possible immédiatement.
+
+### 2026-03-14 21:40 — Iteration 7 (vérif Grid mode + hotfix variable SDS)
+- Scope: sécuriser aussi le chemin grid suite aux NameError signalés.
+- Actions:
+  - hotfix local dans `run_hierarchical_mosaic_classic_legacy`: `sds_mode_phase5 = bool(sds_mode_flag)`.
+  - vérification du chemin Grid:
+    - `run_hierarchical_mosaic` route `grid_mode.run_grid_mode(...)` avec variables définies.
+    - `grid_mode.py` ne dépend pas de `sds_mode_phase5`.
+- Validation:
+  - `python3 -m py_compile zemosaic_worker.py grid_mode.py`
+  - `PYTHONPATH=/home/tristan/zemosaic/zemosaic ../.venv/bin/python -m pytest -q tests/test_grid_mode_stack_plan_paths.py tests/test_phase3_adaptive_invariants.py -k "classic_legacy_initializes_final_rgb_equalize_flag_before_use or final_mosaic_rgb_equalization_gate_and_logging_markers_present or grid_mode"`
+  - résultat: `3 passed`.
+- Note:
+  - premier essai de tests grid a échoué en collecte (PYTHONPATH manquant), corrigé sans changement code.
+
+### 2026-03-14 22:06 — Iteration 8 (Q1 decision=tune + D1 démarré)
+- Trigger: Tristan valide l’analyse visuelle (bleu trop présent) et demande passage en mode tune puis étape suivante.
+- Run B status/logs:
+  - run completed (`run_success_processing_completed`, ~771.66s)
+  - final RGB-eq applied on final mosaic with aggressive gains: `(R=0.634967, G=1.000000, B=2.352305)`
+  - impact observé: réduction du vert mais dominante bleue/magenta excessive.
+- Decision C2:
+  - keep/tune/revert => **tune**.
+- Tune implementation (surgical):
+  - updated `_apply_final_mosaic_rgb_equalization` to apply conservative gain clipping after helper output.
+  - defaults:
+    - `final_mosaic_rgb_equalize_clip_enabled = True`
+    - `final_mosaic_rgb_equalize_gain_clip = [0.80, 1.25]`
+  - logs added: `[RGB-EQ][TUNE] gain clip applied ... raw=(...) clipped=(...)`.
+  - preserved behavior when no over-gain: no change.
+- Files changed:
+  - `zemosaic_worker.py`
+  - `zemosaic_config.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `followup.md`
+- Tests run:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_config.py grid_mode.py tests/test_phase3_adaptive_invariants.py`
+  - `PYTHONPATH=/home/tristan/zemosaic/zemosaic ../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py tests/test_grid_mode_stack_plan_paths.py -k "final_mosaic_rgb_equalization_gate_and_logging_markers_present or classic_legacy_initializes_final_rgb_equalize_flag_before_use or grid_mode"`
+  - result: `3 passed`.
+- D1 (mode existing master tiles) — gap analysis summary:
+  - missing vs classic: Phase3 local poststack RGB-eq is absent when reusing MT; final RGB-eq on mosaic was disabled historically (now tunable/re-enabled).
+  - already covered by two-pass/affine: phase5 intertile matching (including affine/two-pass coverage renorm), DBE phase6, black-point equalization, preview/stretch exports.
+- Next unchecked item:
+  - D2.1 ajouter mécanisme(s) manquant(s) sans perturber two-pass/affine.
+- Runtime config aligned for next run (`~/.config/ZeMosaic/zemosaic_config.json`):
+  - `final_mosaic_rgb_equalize_enabled=true`
+  - `final_mosaic_rgb_equalize_clip_enabled=true`
+  - `final_mosaic_rgb_equalize_gain_clip=[0.8, 1.25]`
+
+### 2026-03-14 23:05 — Iteration 9 (Q2 D2.1 existing-master harmonisation)
+- Trigger: Tristan valide visuellement le mode tune (léger rouge perçu) et autorise poursuite mission autonome.
+- Scientific reading (run tune latest):
+  - final RGB-eq gains now moderate (`R=1.0427, G=1.0, B=0.9607`), no extreme blue boost.
+  - residual warm bias mild (~1%) plausible on low-coverage testset.
+- D2.1 implementation (existing master tiles mode):
+  - Added conservative **pre-phase5 per-tile RGB balance** in `assemble_final_mosaic_reproject_coadd`, executed only when `existing_master_tiles_mode=True`.
+  - Purpose: emulate missing classic Phase3 poststack RGB harmonization when reusing prebuilt master tiles.
+  - Defaults (new config keys):
+    - `existing_master_tiles_rgb_balance_prephase5 = True`
+    - `existing_master_tiles_rgb_balance_gain_clip = [0.90, 1.10]`
+    - `existing_master_tiles_rgb_balance_min_pixels = 5000`
+  - Behavior:
+    - derive valid-pixel mask from alpha/coverage,
+    - compute per-tile RGB medians,
+    - apply clipped gains toward tile-internal neutral target,
+    - log per-tile gains + summary,
+    - fail-safe: continue unchanged on errors.
+- Files changed:
+  - `zemosaic_worker.py`
+  - `zemosaic_config.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `followup.md` (D2.1 checked)
+- Tests:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_config.py grid_mode.py tests/test_phase3_adaptive_invariants.py`
+  - `PYTHONPATH=/home/tristan/zemosaic/zemosaic ../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py tests/test_grid_mode_stack_plan_paths.py -k "existing_master_tiles_prephase5_rgb_balance_markers_present or final_mosaic_rgb_equalization_gate_and_logging_markers_present or classic_legacy_initializes_final_rgb_equalize_flag_before_use or grid_mode"`
+  - result: `4 passed`
+- Next step requested from user:
+  - Run validation for D2.2/D3 (compat outputs FITS/coverage/preview + before/after qualitative check).
+
+### 2026-03-14 23:25 — Iteration 10 (blue bias mitigation for existing-master run)
+- Trigger: user reports residual blue dominance on latest existing-master run.
+- Diagnosis from logs/science:
+  - pre-phase5 existing-master rgb balance is very mild (gains ~1.00±0.01), not main culprit.
+  - final RGB-eq remained the dominant lever with clip-edge behavior on prior run (`raw=(0.741,1.000,1.537) -> clipped=(0.800,1.000,1.250)`).
+- Fix/tune applied (targeted to existing-master mode only):
+  - added override of final RGB-eq gain clip in classic legacy path when `use_existing_master_tiles_mode=True`:
+    - config key: `existing_master_tiles_final_rgb_equalize_gain_clip`
+    - default: `[0.90, 1.10]`
+  - worker logs explicit marker:
+    - `existing_master_tiles_mode: overriding final RGB-eq gain clip to (...)`
+- Files changed:
+  - `zemosaic_worker.py`
+  - `zemosaic_config.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - runtime config `~/.config/ZeMosaic/zemosaic_config.json` updated with `existing_master_tiles_final_rgb_equalize_gain_clip=[0.9,1.1]`.
+- Validation:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_config.py tests/test_phase3_adaptive_invariants.py grid_mode.py`
+  - `PYTHONPATH=/home/tristan/zemosaic/zemosaic ../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py tests/test_grid_mode_stack_plan_paths.py -k "existing_master_tiles_overrides_final_rgb_clip_markers_present or existing_master_tiles_prephase5_rgb_balance_markers_present or final_mosaic_rgb_equalization_gate_and_logging_markers_present or grid_mode"`
+  - result: `4 passed`.
+- Next action:
+  - request new validation run to confirm reduced blue in highlights while keeping global neutrality.
+- 2026-03-15 01:30: existing-master final RGB-eq clip tightened on runtime config to `[0.95, 1.05]` (from `[0.90, 1.10]`) for next validation run.
+
+### 2026-03-15 01:54 — Iteration 11 (D2.2 + D3 + E1 analysis)
+- Scope: continue mission autonomously on next unchecked items.
+- Completed checklist items:
+  - D2.2 compatibility FITS/coverage/preview ✅
+  - D3 run before/after + non-regression check ✅
+  - E1 SDS gap analysis + geometry constraints isolation ✅
+- D2.2/D3 evidence:
+  - latest run completed successfully with no ERROR/Traceback in current log slice.
+  - run markers present: `run_success_mosaic_saved` + `run_success_processing_completed`.
+  - output artifacts present and valid:
+    - `zemosaic_MT14_R0.fits` (HDU0 shape `(3,3035,2205)`, ALPHA ext present)
+    - `zemosaic_MT14_R0_coverage.fits` (shape `(3035,2205)`)
+    - `zemosaic_MT14_R0_preview.png`
+  - comparative runs before/after tune available (`R30` vs `R0`) and analyzed for color drift/highlights.
+- SDS E1 (qualitative differences vs classic):
+  - SDS has dedicated photometric normalization stage on mega-tiles (`_normalize_sds_megatiles_photometry`).
+  - SDS finalize path uses `_finalize_sds_global_mosaic` with SDS-specific masking/polish logic.
+  - final RGB equalization is explicitly skipped when `sds_mode_phase5=True` in shared phase5 gate and phase6 gate.
+  - black-point equalization is also gated off for SDS (`and not sds_mode_phase5`).
+  - DBE final remains available in phase6 worker path.
+- SDS geometry/global constraints isolated:
+  - SDS polish must preserve global descriptor geometry `(H,W)`.
+  - quality-crop is explicitly disabled in SDS finalize (`phase5_sds_quality_crop_disabled`) to prevent shape/broadcast breakage.
+  - SDS low-coverage masking + nanization depends on coverage/alpha consistency.
+- Next unchecked item now:
+  - E2.1 — add missing normalization/equalization for SDS in a compatible, non-regressive way.
+
+### 2026-03-15 01:54 — Iteration 12 (Q3 E2 implementation, SDS-compatible equalization controls)
+- Scope: continue mission autonomously on next unchecked item (E2) after E1 completion.
+- Changes implemented (surgical, opt-in for SDS):
+  - Added SDS-specific final equalization controls inside `_run_shared_phase45_phase5_pipeline`:
+    - `sds_enable_final_rgb_equalize` (default `False`)
+    - `sds_final_rgb_equalize_gain_clip` (default `[0.95, 1.05]`)
+    - `sds_enable_final_black_point_equalize` (default `False`)
+  - Behavior:
+    - when `sds_mode_phase5=True` and SDS RGB flag is OFF -> preserved legacy skip behavior.
+    - when SDS RGB flag is ON -> final RGB-eq is allowed in phase5 with SDS-specific clip override (logged).
+    - black-point gate now allows SDS only when SDS black-point flag is ON.
+  - No default behavior change for SDS runs (all new flags default to False).
+- Files changed:
+  - `zemosaic_worker.py`
+  - `zemosaic_config.py`
+  - `tests/test_phase3_adaptive_invariants.py`
+  - `followup.md`
+- Tests/validation:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_config.py tests/test_phase3_adaptive_invariants.py grid_mode.py`
+  - `PYTHONPATH=/home/tristan/zemosaic/zemosaic ../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py tests/test_grid_mode_stack_plan_paths.py -k "final_mosaic_rgb_equalization_gate_and_logging_markers_present or existing_master_tiles_prephase5_rgb_balance_markers_present or existing_master_tiles_overrides_final_rgb_clip_markers_present or grid_mode or sds_finalize_disables_geometry_changing_quality_crop_in_phase5_polish"` -> `5 passed`
+  - `PYTHONPATH=/home/tristan/zemosaic/zemosaic ../.venv/bin/python -m pytest -q tests/test_phase3_adaptive_invariants.py -k "sds_global_gpu_helper_has_oom_retry_with_chunk_tightening or sds_finalize_disables_geometry_changing_quality_crop_in_phase5_polish or classic_legacy_initializes_final_rgb_equalize_flag_before_use or run_hierarchical_master_tiles_bootstrap_avoids_undefined_existing_tiles_symbol"` -> `4 passed`
+- Checklist advanced:
+  - E2.1 ✅
+  - E2.2 ✅
+- Next required user action for mission progression:
+  - E3 validation run in SDS mode (full run + color/background coherence check).
+- Note runtime: `existing_master_tiles_final_rgb_equalize_gain_clip` was observed back to `[0.9, 1.1]` after run snapshot; re-applied to `[0.95, 1.05]` in `~/.config/ZeMosaic/zemosaic_config.json`.
+
+### 2026-03-15 07:51 — Iteration 13 (pilotage: clôture E + démarrage F1 ZeGrid DBE)
+- Demande explicite Tristan: section E (SDS) peut être clôturée.
+- `followup.md` mis à jour: E3.1 ✅, E3.2 ✅.
+- Démarrage F1 (ZeGrid DBE):
+  - `zemosaic_worker.py` route ZeGrid via `grid_mode.run_grid_mode(...)` puis `return` immédiat (Phase 6 worker non exécutée pour ZeGrid).
+  - `grid_mode.py` lit bien `final_mosaic_dbe_enabled` et logge un hook DBE, mais n'applique pas de DBE effectif à la mosaïque avant `save_fits_image(...)`.
+- Verdict F1 provisoire: gap DBE ZeGrid confirmé (hook informatif sans traitement DBE).
+
+### 2026-03-15 07:54 — Iteration 14 (F2 ZeGrid DBE implémenté, logs explicites)
+- Scope: Q4/F2 ZeGrid DBE (implémentation chirurgicale dans `grid_mode.py`).
+- Implémentation:
+  - ajout helper `_apply_grid_final_dbe(...)` (correction finale fond par canal RGB via modèle gaussien large, intention équivalente DBE).
+  - `assemble_tiles(...)` applique désormais DBE ZeGrid quand `final_mosaic_dbe_enabled=True` avant sauvegarde FITS.
+  - force valid-mask via `weight_sum>0` pour ne pas corriger hors zones couvertes.
+  - ajout paramètre `final_mosaic_dbe_strength` (repris depuis config `final_mosaic_dbe_strength`, défaut `normal`).
+- Logs ajoutés:
+  - `[DBE] grid_mode: applied=<bool> strength=<...> sigma=<...> channels=<...> reason=<...>`
+  - `[DBE] grid_mode: skipped (final_mosaic_dbe_enabled=False)`
+- Tests/preuves:
+  - `python3 -m py_compile grid_mode.py tests/test_grid_mode_dbe.py`
+  - `PYTHONPATH=/home/tristan/zemosaic/zemosaic ../.venv/bin/python -m pytest -q tests/test_grid_mode_dbe.py tests/test_grid_mode_stack_plan_paths.py` -> `3 passed`
+- Checklist `followup.md` mise à jour:
+  - F1.1 ✅, F1.2 ✅
+  - F2.1 ✅, F2.2 ✅
+- Next: F3 run ZeGrid réel complet + vérif sorties/non-régression.
+
+### 2026-03-15 09:10 — Iteration 15 (ZeGrid DBE tuning anti-halos + mapping GUI)
+- Trigger: halos noirs observés autour des étoiles brillantes uniquement en mode ZeGrid.
+- Root cause confirmé:
+  - ZeGrid DBE path plus simple que worker DBE classique/SDS (plus sensible à la sur-soustraction autour des objets brillants).
+  - mapping force DBE GUI non aligné (`weak/strong` GUI vs `low/high` grid).
+- Correctifs implémentés (chirurgicaux, grid only):
+  - alias force DBE: `weak->24`, `normal->36`, `strong->52` (avec compat `low/high/aggressive`).
+  - protection objets brillants avant modèle fond: détection robuste (median+MAD), dilation, exclusion du masque objets du modèle.
+  - application de correction fond limitée au fond; zones objets protégées laissées inchangées pour éviter halos noirs.
+- Validation:
+  - `python3 -m py_compile grid_mode.py tests/test_grid_mode_dbe.py`
+  - `PYTHONPATH=/home/tristan/zemosaic/zemosaic ../.venv/bin/python -m pytest -q tests/test_grid_mode_dbe.py tests/test_grid_mode_stack_plan_paths.py` -> `5 passed`
+- Next step: run ZeGrid réel (F3) pour vérifier disparition des halos en dataset terrain.

@@ -2602,7 +2602,11 @@ def _apply_final_mosaic_rgb_equalization(
     zconfig=None,
     logger: logging.Logger | None = None,
 ):
-    """Apply final RGB equalization to the mosaic using the poststack helper."""
+    """Apply final RGB equalization to the mosaic using the poststack helper.
+
+    Tune mode: when enabled, channel gains are clipped to a conservative range
+    to avoid over-corrections (e.g. strong blue boosts).
+    """
 
     default_info = {
         "enabled": False,
@@ -2611,6 +2615,7 @@ def _apply_final_mosaic_rgb_equalization(
         "gain_g": 1.0,
         "gain_b": 1.0,
         "target_median": float("nan"),
+        "tuned": False,
     }
 
     if final_mosaic_data is None or not isinstance(final_mosaic_data, np.ndarray):
@@ -2621,6 +2626,46 @@ def _apply_final_mosaic_rgb_equalization(
             logger.debug("[RGB-EQ] final mosaic equalization skipped: helper unavailable")
         return final_mosaic_data, default_info
 
+    def _cfg_get(name: str, default: Any = None) -> Any:
+        try:
+            if isinstance(zconfig, dict):
+                return zconfig.get(name, default)
+            return getattr(zconfig, name, default)
+        except Exception:
+            return default
+
+    def _parse_gain_clip(raw: Any, default_clip: tuple[float, float]) -> tuple[float, float]:
+        lo, hi = default_clip
+        try:
+            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                lo = float(raw[0])
+                hi = float(raw[1])
+            elif isinstance(raw, str):
+                parts = [p.strip() for p in raw.replace(';', ',').split(',') if p.strip()]
+                if len(parts) >= 2:
+                    lo = float(parts[0])
+                    hi = float(parts[1])
+        except Exception:
+            lo, hi = default_clip
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            lo, hi = default_clip
+        if lo <= 0:
+            lo = default_clip[0]
+        if hi <= 0:
+            hi = default_clip[1]
+        if lo > hi:
+            lo, hi = hi, lo
+        return float(lo), float(hi)
+
+    tune_enabled = _coerce_bool_flag(_cfg_get("final_mosaic_rgb_equalize_clip_enabled", True))
+    if tune_enabled is None:
+        tune_enabled = True
+    tune_enabled = bool(tune_enabled)
+    gain_clip = _parse_gain_clip(
+        _cfg_get("final_mosaic_rgb_equalize_gain_clip", (0.80, 1.25)),
+        default_clip=(0.80, 1.25),
+    )
+
     try:
         info = _poststack_rgb_equalization(final_mosaic_data, zconfig=zconfig, stack_metadata=None)
     except Exception as exc:
@@ -2629,10 +2674,56 @@ def _apply_final_mosaic_rgb_equalization(
         return final_mosaic_data, default_info
 
     if not isinstance(info, dict):
-        info = default_info
+        info = default_info.copy()
     else:
         for key, value in default_info.items():
             info.setdefault(key, value)
+
+    if tune_enabled and bool(info.get("applied", False)):
+        try:
+            raw_gains = np.array(
+                [
+                    float(info.get("gain_r", 1.0)),
+                    float(info.get("gain_g", 1.0)),
+                    float(info.get("gain_b", 1.0)),
+                ],
+                dtype=np.float32,
+            )
+            clipped_gains = np.clip(raw_gains, gain_clip[0], gain_clip[1]).astype(np.float32)
+            if np.any(np.abs(clipped_gains - raw_gains) > 1e-7):
+                safe_raw = np.where(raw_gains == 0, 1.0, raw_gains).astype(np.float32)
+                correction = (clipped_gains / safe_raw).astype(np.float32)
+                np.multiply(
+                    final_mosaic_data,
+                    correction[None, None, :],
+                    out=final_mosaic_data,
+                    casting="unsafe",
+                )
+                info["gain_r_raw"] = float(raw_gains[0])
+                info["gain_g_raw"] = float(raw_gains[1])
+                info["gain_b_raw"] = float(raw_gains[2])
+                info["gain_r"] = float(clipped_gains[0])
+                info["gain_g"] = float(clipped_gains[1])
+                info["gain_b"] = float(clipped_gains[2])
+                info["tuned"] = True
+                if logger is not None:
+                    logger.info(
+                        "[RGB-EQ][TUNE] gain clip applied: raw=(%.6f, %.6f, %.6f) clipped=(%.6f, %.6f, %.6f) clip=(%.3f, %.3f)",
+                        float(raw_gains[0]),
+                        float(raw_gains[1]),
+                        float(raw_gains[2]),
+                        float(clipped_gains[0]),
+                        float(clipped_gains[1]),
+                        float(clipped_gains[2]),
+                        float(gain_clip[0]),
+                        float(gain_clip[1]),
+                    )
+            else:
+                info["tuned"] = False
+        except Exception as exc:
+            info["tuned"] = False
+            if logger is not None:
+                logger.warning("[RGB-EQ][TUNE] gain clip skipped due to error: %s", exc)
 
     if logger is not None and info.get("applied"):
         logger.info(
@@ -2644,7 +2735,6 @@ def _apply_final_mosaic_rgb_equalization(
         )
 
     return final_mosaic_data, info
-
 
 def equalize_black_point_rgb(
     mosaic_hwc: np.ndarray | None,
@@ -9637,6 +9727,60 @@ def _run_shared_phase45_phase5_pipeline(
     except Exception:
         final_mosaic_black_point_percentile = 0.1
 
+    sds_enable_final_rgb_equalize = _coerce_bool_flag(
+        phase5_options.get(
+            "sds_enable_final_rgb_equalize",
+            getattr(zconfig, "sds_enable_final_rgb_equalize", False),
+        )
+    )
+    if sds_enable_final_rgb_equalize is None:
+        sds_enable_final_rgb_equalize = False
+    sds_enable_final_rgb_equalize = bool(sds_enable_final_rgb_equalize)
+
+    sds_enable_final_black_point_equalize = _coerce_bool_flag(
+        phase5_options.get(
+            "sds_enable_final_black_point_equalize",
+            getattr(zconfig, "sds_enable_final_black_point_equalize", False),
+        )
+    )
+    if sds_enable_final_black_point_equalize is None:
+        sds_enable_final_black_point_equalize = False
+    sds_enable_final_black_point_equalize = bool(sds_enable_final_black_point_equalize)
+
+    sds_final_rgb_eq_active = bool(sds_mode_phase5 and sds_enable_final_rgb_equalize)
+    sds_final_blackpoint_active = bool(sds_mode_phase5 and sds_enable_final_black_point_equalize)
+
+    sds_final_rgb_equalize_gain_clip = phase5_options.get(
+        "sds_final_rgb_equalize_gain_clip",
+        getattr(zconfig, "sds_final_rgb_equalize_gain_clip", (0.95, 1.05)),
+    )
+
+    def _parse_gain_clip_pair(value: Any, default_pair: tuple[float, float]) -> tuple[float, float]:
+        lo, hi = default_pair
+        try:
+            if isinstance(value, str):
+                parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+                if len(parts) >= 2:
+                    lo = float(parts[0])
+                    hi = float(parts[1])
+            elif isinstance(value, (list, tuple)) and len(value) >= 2:
+                lo = float(value[0])
+                hi = float(value[1])
+        except Exception:
+            lo, hi = default_pair
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            lo, hi = default_pair
+        if lo <= 0 or hi <= 0:
+            lo, hi = default_pair
+        if lo > hi:
+            lo, hi = hi, lo
+        return float(lo), float(hi)
+
+    sds_final_rgb_equalize_gain_clip = _parse_gain_clip_pair(
+        sds_final_rgb_equalize_gain_clip,
+        (0.95, 1.05),
+    )
+
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(
         progress_callback,
@@ -10205,30 +10349,78 @@ def _run_shared_phase45_phase5_pipeline(
         collected_tiles_for_second_pass.clear()
 
     final_rgb_eq_info = None
-
-# NOTE:
-# We temporarily disable final mosaic RGB equalization.
-# Master tiles are already RGB-normalized individually, and
-# applying the same algorithm again on the assembled mosaic
-# has been shown to produce a strong green cast.
-#
-# if (
-#     final_mosaic_rgb_equalize_enabled
-#     and final_mosaic_data_HWC is not None
-#     and not sds_mode_phase5
-# ):
-#     try:
-#         final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
-#             final_mosaic_data_HWC,
-#             zconfig=zconfig,
-#             logger=logger,
-#         )
-#     except Exception as exc:
-#         if logger:
-#             logger.warning(
-#                 "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
-#                 exc,
-#             )
+    if final_mosaic_rgb_equalize_enabled:
+        if sds_mode_phase5 and not sds_final_rgb_eq_active:
+            logger.info("[RGB-EQ] final mosaic skipped: enabled=True but sds_mode_phase5=True")
+        elif final_mosaic_data_HWC is None:
+            logger.info("[RGB-EQ] final mosaic skipped: enabled=True but mosaic buffer is None")
+        else:
+            try:
+                restore_clip = False
+                previous_clip = None
+                if sds_final_rgb_eq_active:
+                    logger.info(
+                        "[SDS][RGB-EQ] enabling final rgb-eq in phase5 with clip=(%.3f, %.3f)",
+                        float(sds_final_rgb_equalize_gain_clip[0]),
+                        float(sds_final_rgb_equalize_gain_clip[1]),
+                    )
+                    try:
+                        if isinstance(zconfig, dict):
+                            previous_clip = zconfig.get("final_mosaic_rgb_equalize_gain_clip")
+                            zconfig["final_mosaic_rgb_equalize_gain_clip"] = [
+                                float(sds_final_rgb_equalize_gain_clip[0]),
+                                float(sds_final_rgb_equalize_gain_clip[1]),
+                            ]
+                            restore_clip = True
+                        else:
+                            previous_clip = getattr(zconfig, "final_mosaic_rgb_equalize_gain_clip", None)
+                            setattr(
+                                zconfig,
+                                "final_mosaic_rgb_equalize_gain_clip",
+                                [
+                                    float(sds_final_rgb_equalize_gain_clip[0]),
+                                    float(sds_final_rgb_equalize_gain_clip[1]),
+                                ],
+                            )
+                            restore_clip = True
+                    except Exception:
+                        restore_clip = False
+                final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
+                    final_mosaic_data_HWC,
+                    zconfig=zconfig,
+                    logger=logger,
+                )
+                if restore_clip:
+                    try:
+                        if isinstance(zconfig, dict):
+                            zconfig["final_mosaic_rgb_equalize_gain_clip"] = previous_clip
+                        else:
+                            setattr(zconfig, "final_mosaic_rgb_equalize_gain_clip", previous_clip)
+                    except Exception:
+                        pass
+                if isinstance(final_rgb_eq_info, dict):
+                    try:
+                        _target = float(final_rgb_eq_info.get("target_median", float("nan")))
+                    except Exception:
+                        _target = float("nan")
+                    target_str = f"{_target:.6g}" if math.isfinite(_target) else "nan"
+                    logger.info(
+                        "[RGB-EQ] final mosaic gate: enabled=True applied=%s gains=(%.6f, %.6f, %.6f) target_median=%s",
+                        bool(final_rgb_eq_info.get("applied", False)),
+                        float(final_rgb_eq_info.get("gain_r", 1.0)),
+                        float(final_rgb_eq_info.get("gain_g", 1.0)),
+                        float(final_rgb_eq_info.get("gain_b", 1.0)),
+                        target_str,
+                    )
+                else:
+                    logger.info("[RGB-EQ] final mosaic gate: enabled=True applied=unknown")
+            except Exception as exc:
+                logger.warning(
+                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
+                    exc,
+                )
+    else:
+        logger.info("[RGB-EQ] final mosaic skipped: disabled by config (final_mosaic_rgb_equalize_enabled=False)")
 
     alpha_final = _derive_final_alpha_mask(
         final_alpha_map,
@@ -10252,7 +10444,7 @@ def _run_shared_phase45_phase5_pipeline(
         and isinstance(final_mosaic_data_HWC, np.ndarray)
         and final_mosaic_data_HWC.ndim == 3
         and final_mosaic_data_HWC.shape[-1] == 3
-        and not sds_mode_phase5
+        and (not sds_mode_phase5 or sds_final_blackpoint_active)
     ):
         try:
             final_mosaic_data_HWC, rgb_black_eq_info = equalize_black_point_rgb(
@@ -16250,6 +16442,145 @@ def assemble_final_mosaic_reproject_coadd(
             zero_masked_tiles,
         )
 
+    def _apply_existing_mt_rgb_balance_prephase5() -> None:
+        if not existing_master_tiles_mode:
+            return
+        if len(effective_tiles) < 1:
+            return
+
+        enabled_flag = _coerce_bool_flag(
+            worker_config_cache.get("existing_master_tiles_rgb_balance_prephase5", True)
+        )
+        if enabled_flag is None:
+            enabled_flag = True
+        if not bool(enabled_flag):
+            logger.info(
+                "existing_master_tiles_mode: pre-phase5 rgb balance skipped (disabled by config)"
+            )
+            return
+
+        clip_cfg = worker_config_cache.get("existing_master_tiles_rgb_balance_gain_clip", (0.90, 1.10))
+        try:
+            if isinstance(clip_cfg, str):
+                parts = [p.strip() for p in clip_cfg.replace(";", ",").split(",") if p.strip()]
+                if len(parts) >= 2:
+                    gain_clip = (float(parts[0]), float(parts[1]))
+                else:
+                    gain_clip = (0.90, 1.10)
+            elif isinstance(clip_cfg, (list, tuple)) and len(clip_cfg) >= 2:
+                gain_clip = (float(clip_cfg[0]), float(clip_cfg[1]))
+            else:
+                gain_clip = (0.90, 1.10)
+        except Exception:
+            gain_clip = (0.90, 1.10)
+        if not (math.isfinite(gain_clip[0]) and math.isfinite(gain_clip[1])):
+            gain_clip = (0.90, 1.10)
+        if gain_clip[0] <= 0 or gain_clip[1] <= 0:
+            gain_clip = (0.90, 1.10)
+        if gain_clip[0] > gain_clip[1]:
+            gain_clip = (gain_clip[1], gain_clip[0])
+
+        try:
+            min_pixels = int(worker_config_cache.get("existing_master_tiles_rgb_balance_min_pixels", 5000) or 5000)
+        except Exception:
+            min_pixels = 5000
+        min_pixels = max(256, min_pixels)
+
+        applied_tiles = 0
+        skipped_tiles = 0
+        for entry in effective_tiles:
+            try:
+                data_arr = np.asarray(entry.get("data"), dtype=np.float32, order="C")
+            except Exception:
+                skipped_tiles += 1
+                continue
+            if data_arr.ndim != 3 or data_arr.shape[-1] < 3:
+                skipped_tiles += 1
+                continue
+
+            mask_arr = entry.get("alpha_weight2d")
+            if mask_arr is None:
+                mask_arr = entry.get("coverage_mask")
+            if mask_arr is not None:
+                try:
+                    mask2d = np.asarray(mask_arr)
+                    if mask2d.ndim > 2:
+                        mask2d = np.squeeze(mask2d)
+                    valid_mask = (mask2d > 0)
+                except Exception:
+                    valid_mask = np.ones(data_arr.shape[:2], dtype=bool)
+            else:
+                valid_mask = np.ones(data_arr.shape[:2], dtype=bool)
+
+            try:
+                finite_mask = np.all(np.isfinite(data_arr[..., :3]), axis=-1)
+                valid_mask = valid_mask & finite_mask
+            except Exception:
+                skipped_tiles += 1
+                continue
+
+            valid_count = int(np.count_nonzero(valid_mask))
+            if valid_count < min_pixels:
+                skipped_tiles += 1
+                continue
+
+            try:
+                channel_vals = data_arr[..., :3][valid_mask]
+                channel_medians = np.nanmedian(channel_vals, axis=0).astype(np.float32)
+            except Exception:
+                skipped_tiles += 1
+                continue
+
+            finite = np.isfinite(channel_medians) & (np.abs(channel_medians) > 1e-6)
+            if not np.any(finite):
+                skipped_tiles += 1
+                continue
+
+            target = float(np.nanmedian(channel_medians[finite]))
+            if not math.isfinite(target) or abs(target) <= 1e-6:
+                skipped_tiles += 1
+                continue
+
+            gains = np.ones(3, dtype=np.float32)
+            gains[finite] = target / channel_medians[finite]
+            gains = np.clip(gains, gain_clip[0], gain_clip[1]).astype(np.float32)
+
+            if not np.any(np.abs(gains - 1.0) > 1e-6):
+                skipped_tiles += 1
+                continue
+
+            for c in range(3):
+                np.multiply(data_arr[..., c], float(gains[c]), out=data_arr[..., c], casting="unsafe")
+            entry["data"] = data_arr
+            applied_tiles += 1
+            logger.info(
+                "existing_master_tiles_mode: pre-phase5 rgb balance tile=%s valid=%d gains=(%.6f, %.6f, %.6f) clip=(%.3f, %.3f)",
+                entry.get("tile_id"),
+                valid_count,
+                float(gains[0]),
+                float(gains[1]),
+                float(gains[2]),
+                float(gain_clip[0]),
+                float(gain_clip[1]),
+            )
+
+        logger.info(
+            "existing_master_tiles_mode: pre-phase5 rgb balance summary applied=%d skipped=%d clip=(%.3f, %.3f) min_pixels=%d",
+            applied_tiles,
+            skipped_tiles,
+            float(gain_clip[0]),
+            float(gain_clip[1]),
+            int(min_pixels),
+        )
+
+    try:
+        _apply_existing_mt_rgb_balance_prephase5()
+    except Exception:
+        logger.info(
+            "existing_master_tiles_mode: pre-phase5 rgb balance failed; continuing without it",
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
+
     def _best_effort_anchor_photometry() -> None:
         if not existing_master_tiles_mode:
             return
@@ -18980,6 +19311,17 @@ def run_hierarchical_mosaic_classic_legacy(
     gpu_safety_ctx_global: GpuRuntimeContext | None = None
     gpu_safety_ctx_phase5: GpuRuntimeContext | None = None
 
+    final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(
+        final_mosaic_rgb_equalize_enabled_config
+    )
+    if final_mosaic_rgb_equalize_enabled is None:
+        final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(
+            getattr(zconfig, "final_mosaic_rgb_equalize_enabled", None)
+        )
+    if final_mosaic_rgb_equalize_enabled is None:
+        final_mosaic_rgb_equalize_enabled = False
+    final_mosaic_rgb_equalize_enabled = bool(final_mosaic_rgb_equalize_enabled)
+
     final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(
         final_mosaic_black_point_equalize_enabled
     )
@@ -19137,6 +19479,7 @@ def run_hierarchical_mosaic_classic_legacy(
     else:
         sds_mode_flag = False
     global_wcs_plan["sds_mode"] = bool(sds_mode_flag)
+    sds_mode_phase5 = bool(sds_mode_flag)
 
     try:
         sds_coverage_threshold_config = float(worker_config_cache.get("sds_coverage_threshold", 0.92))
@@ -23268,6 +23611,44 @@ def run_hierarchical_mosaic_classic_legacy(
             )
         pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
 
+        if use_existing_master_tiles_mode and final_mosaic_rgb_equalize_enabled:
+            existing_clip_cfg = worker_config_cache.get(
+                "existing_master_tiles_final_rgb_equalize_gain_clip",
+                (0.90, 1.10),
+            )
+            try:
+                if isinstance(existing_clip_cfg, str):
+                    parts = [p.strip() for p in existing_clip_cfg.replace(";", ",").split(",") if p.strip()]
+                    if len(parts) >= 2:
+                        existing_clip = (float(parts[0]), float(parts[1]))
+                    else:
+                        existing_clip = (0.90, 1.10)
+                elif isinstance(existing_clip_cfg, (list, tuple)) and len(existing_clip_cfg) >= 2:
+                    existing_clip = (float(existing_clip_cfg[0]), float(existing_clip_cfg[1]))
+                else:
+                    existing_clip = (0.90, 1.10)
+            except Exception:
+                existing_clip = (0.90, 1.10)
+            if not (math.isfinite(existing_clip[0]) and math.isfinite(existing_clip[1])):
+                existing_clip = (0.90, 1.10)
+            if existing_clip[0] <= 0 or existing_clip[1] <= 0:
+                existing_clip = (0.90, 1.10)
+            if existing_clip[0] > existing_clip[1]:
+                existing_clip = (existing_clip[1], existing_clip[0])
+            try:
+                setattr(
+                    zconfig,
+                    "final_mosaic_rgb_equalize_gain_clip",
+                    [float(existing_clip[0]), float(existing_clip[1])],
+                )
+                logger.info(
+                    "existing_master_tiles_mode: overriding final RGB-eq gain clip to (%.3f, %.3f)",
+                    float(existing_clip[0]),
+                    float(existing_clip[1]),
+                )
+            except Exception:
+                pass
+
         base_progress_phase4_5 = current_global_progress
         phase45_options = _build_phase45_options_dict(base_progress_phase4_5)
         base_progress_phase5 = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
@@ -23543,6 +23924,43 @@ def run_hierarchical_mosaic_classic_legacy(
             logger.warning("[DBE] phase6 DBE failed; continuing without DBE: %s", exc_dbe)
     else:
         logger.info("[DBE] skipped: disabled by config (final_mosaic_dbe_enabled=False)")
+
+    final_rgb_eq_info: dict[str, Any] | None = None
+    if final_mosaic_rgb_equalize_enabled:
+        if sds_mode_phase5:
+            logger.info("[RGB-EQ] final mosaic skipped: enabled=True but sds_mode_phase5=True")
+        elif final_mosaic_data_HWC is None:
+            logger.info("[RGB-EQ] final mosaic skipped: enabled=True but mosaic buffer is None")
+        else:
+            try:
+                final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
+                    final_mosaic_data_HWC,
+                    zconfig=zconfig,
+                    logger=logger,
+                )
+                if isinstance(final_rgb_eq_info, dict):
+                    try:
+                        _target = float(final_rgb_eq_info.get("target_median", float("nan")))
+                    except Exception:
+                        _target = float("nan")
+                    target_str = f"{_target:.6g}" if math.isfinite(_target) else "nan"
+                    logger.info(
+                        "[RGB-EQ] final mosaic gate: enabled=True applied=%s gains=(%.6f, %.6f, %.6f) target_median=%s",
+                        bool(final_rgb_eq_info.get("applied", False)),
+                        float(final_rgb_eq_info.get("gain_r", 1.0)),
+                        float(final_rgb_eq_info.get("gain_g", 1.0)),
+                        float(final_rgb_eq_info.get("gain_b", 1.0)),
+                        target_str,
+                    )
+                else:
+                    logger.info("[RGB-EQ] final mosaic gate: enabled=True applied=unknown")
+            except Exception as exc:
+                logger.warning(
+                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
+                    exc,
+                )
+    else:
+        logger.info("[RGB-EQ] final mosaic skipped: disabled by config (final_mosaic_rgb_equalize_enabled=False)")
 
     rgb_black_level_info: dict[str, Any] | None = None
     if (

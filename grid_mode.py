@@ -2791,6 +2791,131 @@ def _blend_overlap_region(
     return blended.astype(np.float32), weight_out, used_pyramid
 
 
+
+def _apply_grid_final_dbe(
+    mosaic: np.ndarray,
+    *,
+    valid_mask_hw: np.ndarray | None = None,
+    strength: str = "normal",
+    progress_callback: ProgressCallback = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Apply a light final DBE-style correction for Grid mode (RGB, per-channel)."""
+
+    info: dict[str, object] = {
+        "applied": False,
+        "reason": "",
+        "strength": str(strength).strip().lower() if str(strength).strip() else "normal",
+        "sigma": 0.0,
+        "applied_channels": 0,
+    }
+
+    if not isinstance(mosaic, np.ndarray):
+        info["reason"] = "invalid_input"
+        return mosaic, info
+
+    if mosaic.ndim != 3 or mosaic.shape[-1] != 3:
+        info["reason"] = "non_rgb"
+        return mosaic, info
+
+    if not _NDIMAGE_AVAILABLE or ndimage is None:
+        info["reason"] = "scipy_ndimage_unavailable"
+        return mosaic, info
+
+    strength_map = {
+        "weak": 24.0,
+        "low": 24.0,
+        "normal": 36.0,
+        "strong": 52.0,
+        "high": 52.0,
+        "aggressive": 68.0,
+    }
+    sigma = float(strength_map.get(str(info["strength"]), strength_map["normal"]))
+    info["sigma"] = sigma
+
+    out = np.asarray(mosaic, dtype=np.float32, order="C")
+    if not out.flags.writeable:
+        out = out.copy()
+
+    h, w = out.shape[:2]
+    finite_any = np.any(np.isfinite(out), axis=-1)
+    valid_hw = finite_any
+    if isinstance(valid_mask_hw, np.ndarray) and valid_mask_hw.shape[:2] == (h, w):
+        try:
+            valid_hw = valid_hw & np.asarray(valid_mask_hw, dtype=bool)
+        except Exception:
+            valid_hw = finite_any
+
+    if not np.any(valid_hw):
+        info["reason"] = "no_valid"
+        return out, info
+
+    for c in range(3):
+        ch = out[..., c]
+        ch_finite = np.isfinite(ch)
+        ch_valid = valid_hw & ch_finite
+        if not np.any(ch_valid):
+            continue
+
+        median = float(np.nanmedian(ch[ch_valid]))
+        mad = float(np.nanmedian(np.abs(ch[ch_valid] - median))) if np.any(ch_valid) else 0.0
+        robust_sigma = float(1.4826 * mad)
+        obj_k_map = {
+            "weak": 3.0,
+            "low": 3.0,
+            "normal": 2.8,
+            "strong": 2.5,
+            "high": 2.5,
+            "aggressive": 2.2,
+        }
+        obj_k = float(obj_k_map.get(str(info["strength"]), 2.8))
+        obj_thr = float(median + (obj_k * robust_sigma))
+
+        obj_mask = ch_valid & (ch > obj_thr)
+        dil_iter_map = {
+            "weak": 2,
+            "low": 2,
+            "normal": 3,
+            "strong": 4,
+            "high": 4,
+            "aggressive": 5,
+        }
+        dil_iters = int(dil_iter_map.get(str(info["strength"]), 3))
+        try:
+            obj_mask = ndimage.binary_dilation(obj_mask, iterations=max(1, dil_iters))
+        except Exception:
+            pass
+
+        bg_valid = ch_valid & (~obj_mask)
+        if not np.any(bg_valid):
+            bg_valid = ch_valid
+
+        fill_ref = float(np.nanmedian(ch[bg_valid])) if np.any(bg_valid) else median
+        ch_filled = np.where(ch_valid, ch, fill_ref).astype(np.float32, copy=False)
+        # Protect bright structures before background model estimation
+        ch_model = np.where(obj_mask, fill_ref, ch_filled).astype(np.float32, copy=False)
+
+        try:
+            bg = ndimage.gaussian_filter(ch_model, sigma=sigma, mode="nearest")
+        except Exception:
+            continue
+
+        bg_med = float(np.nanmedian(bg[bg_valid])) if np.any(bg_valid) else fill_ref
+        corrected = ch_filled - (bg - bg_med)
+        # Keep protected object regions untouched to avoid dark halos
+        corrected = np.where(obj_mask, ch_filled, corrected)
+
+        ch_out = np.where(ch_valid, corrected, np.nan).astype(np.float32, copy=False)
+        out[..., c] = ch_out
+        info["applied_channels"] = int(info.get("applied_channels", 0)) + 1
+
+    if int(info.get("applied_channels", 0)) > 0:
+        info["applied"] = True
+    else:
+        info["reason"] = "no_channel_processed"
+
+    return out, info
+
+
 def assemble_tiles(
     grid: GridDefinition,
     tiles: Iterable[GridTile],
@@ -2800,6 +2925,7 @@ def assemble_tiles(
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool = True,
     final_mosaic_dbe_enabled: bool = True,
+    final_mosaic_dbe_strength: str = "normal",
     progress_callback: ProgressCallback = None,
     progress_reporter: _GridProgressReporter | None = None,
 ) -> Path | None:
@@ -3651,14 +3777,27 @@ def assemble_tiles(
         reporter.emit_eta()
 
     if final_mosaic_dbe_enabled:
+        valid_mask_hw = np.asarray(np.any(weight_sum > 0, axis=-1) if getattr(weight_sum, "ndim", 0) == 3 else (weight_sum > 0), dtype=bool)
+        mosaic, dbe_info = _apply_grid_final_dbe(
+            mosaic,
+            valid_mask_hw=valid_mask_hw,
+            strength=final_mosaic_dbe_strength,
+            progress_callback=progress_callback,
+        )
         _emit(
-            "[DBE] grid_mode: bypassing worker Phase 6, DBE hook point is in grid_mode final save path",
+            "[DBE] grid_mode: applied=%s strength=%s sigma=%s channels=%s reason=%s" % (
+                bool(dbe_info.get("applied", False)),
+                str(dbe_info.get("strength", final_mosaic_dbe_strength)),
+                str(dbe_info.get("sigma", "n/a")),
+                str(dbe_info.get("applied_channels", 0)),
+                str(dbe_info.get("reason", "")),
+            ),
             lvl="INFO",
             callback=progress_callback,
         )
     else:
         _emit(
-            "[DBE] grid_mode: disabled by config (final_mosaic_dbe_enabled=False)",
+            "[DBE] grid_mode: skipped (final_mosaic_dbe_enabled=False)",
             lvl="INFO",
             callback=progress_callback,
         )
@@ -4308,6 +4447,7 @@ def run_grid_mode(
             )
             if grid_dbe_flag is None:
                 grid_dbe_flag = True
+            grid_dbe_strength = str(getattr(zconfig, "final_mosaic_dbe_strength", cfg_disk.get("final_mosaic_dbe_strength", "normal")))
             mosaic_path = assemble_tiles(
                 grid,
                 grid.tiles,
@@ -4316,6 +4456,7 @@ def run_grid_mode(
                 legacy_rgb_cube=legacy_rgb_cube,
                 grid_rgb_equalize=grid_rgb_equalize,
                 final_mosaic_dbe_enabled=bool(grid_dbe_flag),
+                final_mosaic_dbe_strength=grid_dbe_strength,
                 progress_callback=progress_callback,
                 progress_reporter=reporter,
             )
