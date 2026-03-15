@@ -807,3 +807,27 @@ Feature requests, bug reports, and pull requests are welcome!
 Please include log files and test data if possible when reporting issues.
 
 🌠 Happy mosaicking!
+
+
+## Advanced color option: Final Mosaic RGB Equalization
+
+ZeMosaic includes an optional final color balancing step on the assembled mosaic:
+
+- Config key: `final_mosaic_rgb_equalize_enabled`
+- Recommended default: `false` (conservative)
+- Activation: GUI toggle or direct JSON edit
+
+When enabled, this step can help recover global RGB neutrality on some difficult/marginal datasets.
+On already well-balanced datasets, it may bring little or no visible benefit.
+
+Related keys:
+- `final_mosaic_rgb_equalize_clip_enabled`
+- `final_mosaic_rgb_equalize_gain_clip`
+- `existing_master_tiles_final_rgb_equalize_gain_clip`
+- `sds_enable_final_rgb_equalize`
+- `sds_final_rgb_equalize_gain_clip`
+
+Practical note:
+Keep it OFF by default for stable production behavior, and enable it as a targeted tool when color drift appears on specific datasets.
+
+---

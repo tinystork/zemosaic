@@ -97,8 +97,8 @@ Legend:
 - [x] Ajouter logs explicites DBE appliqué/skippé + raison
 
 ### F3. Validation
-- [ ] Run ZeGrid réel complet
-- [ ] Vérifier sorties et absence de régression côté grid_mode
+- [x] Run ZeGrid réel complet
+- [x] Vérifier sorties et absence de régression côté grid_mode
 
 ---
 
