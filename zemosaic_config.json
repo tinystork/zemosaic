@@ -92,7 +92,7 @@
     "enable_tile_weighting": true,
     "tile_weight_mode": "n_frames",
     "final_assembly_method": "reproject_coadd",
-    "auto_detect_seestar": true,
+    "auto_detect_seestar": false,
     "force_seestar_mode": false,
     "global_wcs_output_path": "global_mosaic_wcs.fits",
     "global_wcs_pixelscale_mode": "median",
@@ -178,7 +178,7 @@
     "p3_center_preview_size": 256,
     "p3_center_min_overlap_fraction": 0.03,
     "intertile_photometric_match": true,
-    "intertile_preview_size": 1024,
+    "intertile_preview_size": 512,
     "intertile_overlap_min": 0.05,
     "intertile_sky_percentile": [
         30.0,
