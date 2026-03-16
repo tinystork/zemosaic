@@ -19,9 +19,9 @@
     "qt_filter_window_geometry": null,
     "qt_main_columns_state": "AAAA/wAAAAEAAAACAAABeQAAAeUA/////wEAAAABAA==",
     "qt_main_left_state": "AAAA/wAAAAEAAAADAAAB3QAAAQwAAAE0AP////8BAAAAAgA=",
-    "input_dir": "/home/tristan/zemosaic/zemosaic/example/out/zemosaic_temp_master_tiles",
+    "input_dir": "/home/tristan/zemosaic/zemosaic/example/lights",
     "output_dir": "/home/tristan/zemosaic/zemosaic/example/out",
-    "use_existing_master_tiles": true,
+    "use_existing_master_tiles": false,
     "num_processing_workers": 0,
     "grid_workers": 0,
     "stacking_normalize_method": "sky_mean",
@@ -32,7 +32,17 @@
     "stacking_winsor_limits": "0.05,0.05",
     "wsc_impl": "pixinsight",
     "stacking_final_combine_method": "mean",
-    "poststack_equalize_rgb": false,
+    "poststack_equalize_rgb": true,
+    "poststack_rgb_equalize_gain_clip": [
+        0.95,
+        1.05
+    ],
+    "poststack_rgb_equalize_bg_percentile": [
+        5.0,
+        85.0
+    ],
+    "poststack_rgb_equalize_min_samples": 5000,
+    "poststack_rgb_equalize_min_coverage": 0.01,
     "final_mosaic_rgb_equalize_enabled": false,
     "final_mosaic_rgb_equalize_clip_enabled": true,
     "final_mosaic_rgb_equalize_gain_clip": [

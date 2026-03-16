@@ -329,7 +329,7 @@ class ZeMosaicGUI:
                 "stacking_kappa_high": 3.0,
                 "stacking_winsor_limits": "0.05,0.05",
                 "stacking_final_combine_method": "mean",
-                "poststack_equalize_rgb": True,
+                "poststack_equalize_rgb": False,
                 # Logging
                 "logging_level": "INFO",
                 "apply_radial_weight": False,

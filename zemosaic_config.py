@@ -119,7 +119,11 @@ DEFAULT_CONFIG = {
     "stacking_winsor_limits": "0.05,0.05",  # String, sera parsé
     "wsc_impl": "pixinsight",
     "stacking_final_combine_method": "mean",
-    "poststack_equalize_rgb": True,
+    "poststack_equalize_rgb": False,
+    "poststack_rgb_equalize_gain_clip": [0.95, 1.05],
+    "poststack_rgb_equalize_bg_percentile": [5.0, 85.0],
+    "poststack_rgb_equalize_min_samples": 5000,
+    "poststack_rgb_equalize_min_coverage": 0.01,
     "final_mosaic_rgb_equalize_enabled": False,
     "final_mosaic_rgb_equalize_clip_enabled": True,
     "final_mosaic_rgb_equalize_gain_clip": [0.80, 1.25],

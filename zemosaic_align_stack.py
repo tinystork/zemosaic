@@ -267,35 +267,157 @@ def _extract_parallel_plan_hints(parallel_plan: Any | None) -> dict[str, int | N
     return hints
 
 
-def equalize_rgb_medians_inplace(img: np.ndarray) -> tuple[float, float, float, float]:
-    """In-place per-channel median equalization so that median(R)==median(G)==median(B)."""
+def _parse_percentile_pair(raw: Any, default: tuple[float, float]) -> tuple[float, float]:
+    lo, hi = default
+    try:
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            lo = float(raw[0])
+            hi = float(raw[1])
+        elif isinstance(raw, str):
+            parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+            if len(parts) >= 2:
+                lo = float(parts[0])
+                hi = float(parts[1])
+    except Exception:
+        lo, hi = default
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        lo, hi = default
+    lo = float(np.clip(lo, 0.0, 100.0))
+    hi = float(np.clip(hi, 0.0, 100.0))
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _parse_gain_clip_pair(raw: Any, default: tuple[float, float]) -> tuple[float, float]:
+    lo, hi = _parse_percentile_pair(raw, default)
+    if lo <= 0.0:
+        lo = default[0]
+    if hi <= 0.0:
+        hi = default[1]
+    if lo > hi:
+        lo, hi = hi, lo
+    return float(lo), float(hi)
+
+
+def equalize_rgb_medians_inplace(
+    img: np.ndarray,
+    *,
+    gain_clip: tuple[float, float] = (0.95, 1.05),
+    bg_percentile: tuple[float, float] = (5.0, 85.0),
+    min_samples: int = 5000,
+    min_coverage: float = 0.01,
+    return_info: bool = False,
+) -> tuple[float, float, float, float] | dict[str, Any]:
+    """Conservative in-place RGB equalization using a robust background mask."""
+
+    neutral_info: dict[str, Any] = {
+        "applied": False,
+        "decision": "invalid_input",
+        "samples": 0,
+        "mask_coverage": 0.0,
+        "target_median": float("nan"),
+        "raw_gains": [1.0, 1.0, 1.0],
+        "clipped_gains": [1.0, 1.0, 1.0],
+        "gain_r": 1.0,
+        "gain_g": 1.0,
+        "gain_b": 1.0,
+    }
 
     if img is None or img.ndim != 3 or img.shape[2] != 3:
-        return (1.0, 1.0, 1.0, float("nan"))
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
 
-    med = np.nanmedian(img, axis=(0, 1)).astype(np.float32)
-    finite = np.isfinite(med) & (med > 0)
-    if not np.any(finite):
-        return (1.0, 1.0, 1.0, float("nan"))
+    arr = np.asarray(img, dtype=np.float32)
+    finite = np.isfinite(arr)
+    positive = arr > 0
+    valid_rgb = np.all(finite & positive, axis=2)
+    valid_count = int(np.count_nonzero(valid_rgb))
+    if valid_count <= 0:
+        neutral_info["decision"] = "no_valid_pixels"
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
 
-    target = float(np.nanmedian(med[finite]))
-    gains = np.ones(3, dtype=np.float32)
-    gains[finite] = target / med[finite]
-    # Perform in-place multiply but tolerate read-only buffers by skipping
-    # the write and just returning computed gains.
+    lo_p, hi_p = _parse_percentile_pair(bg_percentile, (5.0, 85.0))
+    clip_lo, clip_hi = _parse_gain_clip_pair(gain_clip, (0.95, 1.05))
+
+    lum = np.nanmedian(arr, axis=2)
+    lum_vals = lum[valid_rgb & np.isfinite(lum)]
+    if lum_vals.size == 0:
+        neutral_info["decision"] = "invalid_luminance"
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
     try:
-        if not img.flags.writeable:
+        p_lo, p_hi = np.nanpercentile(lum_vals, [lo_p, hi_p])
+    except Exception:
+        neutral_info["decision"] = "percentile_error"
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
+    mask = valid_rgb & np.isfinite(lum) & (lum >= p_lo) & (lum <= p_hi)
+    samples = int(np.count_nonzero(mask))
+    coverage = float(samples / valid_count) if valid_count > 0 else 0.0
+
+    try:
+        min_samples_i = max(1, int(min_samples))
+    except Exception:
+        min_samples_i = 5000
+    try:
+        min_coverage_f = float(min_coverage)
+    except Exception:
+        min_coverage_f = 0.01
+    if not np.isfinite(min_coverage_f):
+        min_coverage_f = 0.01
+    min_coverage_f = float(np.clip(min_coverage_f, 0.0, 1.0))
+
+    if samples < min_samples_i:
+        neutral_info.update(samples=samples, mask_coverage=coverage, decision="insufficient_samples")
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+    if coverage < min_coverage_f:
+        neutral_info.update(samples=samples, mask_coverage=coverage, decision="insufficient_coverage")
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
+    med = np.array([np.nanmedian(arr[..., c][mask]) for c in range(3)], dtype=np.float32)
+    finite_chan = np.isfinite(med) & (med > 0)
+    if not np.any(finite_chan):
+        neutral_info.update(samples=samples, mask_coverage=coverage, decision="invalid_channel_medians")
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
+    target = float(np.nanmedian(med[finite_chan]))
+    if not np.isfinite(target) or target <= 0:
+        neutral_info.update(samples=samples, mask_coverage=coverage, decision="invalid_target")
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
+    raw_gains = np.ones(3, dtype=np.float32)
+    raw_gains[finite_chan] = target / med[finite_chan]
+    clipped = np.clip(raw_gains, clip_lo, clip_hi).astype(np.float32)
+
+    applied = False
+    decision = "applied"
+    try:
+        if not arr.flags.writeable:
             try:
-                img.setflags(write=True)
+                arr.setflags(write=True)
             except Exception:
                 pass
-        np.multiply(img, gains[None, None, :], out=img, casting="unsafe")
+        np.multiply(arr, clipped[None, None, :], out=arr, casting="unsafe")
+        applied = True
     except Exception:
-        # If we can't apply in place (e.g., read-only memmap), skip silently.
-        # Caller records gains in metadata; visual effect may differ slightly
-        # but the pipeline should continue.
-        return (float(gains[0]), float(gains[1]), float(gains[2]), target)
-    return (float(gains[0]), float(gains[1]), float(gains[2]), target)
+        decision = "write_failed"
+        applied = False
+
+    info = {
+        "applied": bool(applied),
+        "decision": decision if applied else decision,
+        "samples": samples,
+        "mask_coverage": coverage,
+        "target_median": float(target),
+        "raw_gains": [float(raw_gains[0]), float(raw_gains[1]), float(raw_gains[2])],
+        "clipped_gains": [float(clipped[0]), float(clipped[1]), float(clipped[2])],
+        "gain_r": float(clipped[0]),
+        "gain_g": float(clipped[1]),
+        "gain_b": float(clipped[2]),
+    }
+    if return_info:
+        return info
+    return (float(clipped[0]), float(clipped[1]), float(clipped[2]), float(target))
 
 
 def _coerce_config_bool(value: Any, default: bool = True) -> bool:
@@ -325,9 +447,9 @@ def _poststack_rgb_equalization(
     zconfig=None,
     stack_metadata: dict | None = None,
 ) -> dict:
-    """Apply optional RGB equalization and record metadata."""
+    """Apply optional conservative RGB equalization and record telemetry."""
 
-    default_enabled = True
+    default_enabled = False
     try:
         if isinstance(zconfig, dict):
             enabled = _coerce_config_bool(zconfig.get("poststack_equalize_rgb", default_enabled), default_enabled)
@@ -336,6 +458,25 @@ def _poststack_rgb_equalization(
     except Exception:
         enabled = default_enabled
 
+    def _cfg_get(name: str, default: Any) -> Any:
+        try:
+            if isinstance(zconfig, dict):
+                return zconfig.get(name, default)
+            return getattr(zconfig, name, default)
+        except Exception:
+            return default
+
+    gain_clip = _parse_gain_clip_pair(_cfg_get("poststack_rgb_equalize_gain_clip", (0.95, 1.05)), (0.95, 1.05))
+    bg_percentile = _parse_percentile_pair(_cfg_get("poststack_rgb_equalize_bg_percentile", (5.0, 85.0)), (5.0, 85.0))
+    try:
+        min_samples = int(_cfg_get("poststack_rgb_equalize_min_samples", 5000))
+    except Exception:
+        min_samples = 5000
+    try:
+        min_coverage = float(_cfg_get("poststack_rgb_equalize_min_coverage", 0.01))
+    except Exception:
+        min_coverage = 0.01
+
     info = {
         "enabled": enabled,
         "applied": False,
@@ -343,6 +484,11 @@ def _poststack_rgb_equalization(
         "gain_g": 1.0,
         "gain_b": 1.0,
         "target_median": float("nan"),
+        "samples": 0,
+        "mask_coverage": 0.0,
+        "raw_gains": [1.0, 1.0, 1.0],
+        "clipped_gains": [1.0, 1.0, 1.0],
+        "decision": "disabled",
     }
 
     if not enabled or stacked is None or not isinstance(stacked, np.ndarray):
@@ -351,29 +497,56 @@ def _poststack_rgb_equalization(
         return info
 
     if stacked.ndim != 3 or stacked.shape[2] != 3:
+        info["decision"] = "non_rgb"
         if stack_metadata is not None:
             stack_metadata["rgb_equalization"] = info
         return info
 
     try:
-        gain_r, gain_g, gain_b, target = equalize_rgb_medians_inplace(stacked)
-        info.update(
-            gain_r=float(gain_r),
-            gain_g=float(gain_g),
-            gain_b=float(gain_b),
-            target_median=float(target),
+        eq_info = equalize_rgb_medians_inplace(
+            stacked,
+            gain_clip=gain_clip,
+            bg_percentile=bg_percentile,
+            min_samples=min_samples,
+            min_coverage=min_coverage,
+            return_info=True,
         )
-        if np.isfinite(target):
-            info["applied"] = True
+        if isinstance(eq_info, dict):
+            info.update(
+                applied=bool(eq_info.get("applied", False)),
+                gain_r=float(eq_info.get("gain_r", 1.0)),
+                gain_g=float(eq_info.get("gain_g", 1.0)),
+                gain_b=float(eq_info.get("gain_b", 1.0)),
+                target_median=float(eq_info.get("target_median", float("nan"))),
+                samples=int(eq_info.get("samples", 0) or 0),
+                mask_coverage=float(eq_info.get("mask_coverage", 0.0) or 0.0),
+                raw_gains=list(eq_info.get("raw_gains", [1.0, 1.0, 1.0])),
+                clipped_gains=list(eq_info.get("clipped_gains", [1.0, 1.0, 1.0])),
+                decision=str(eq_info.get("decision", "no-op")),
+            )
+        if info["applied"]:
             _internal_logger.info(
-                "[RGB-EQ] Applied per-substack RGB median equalization: "
-                f"gains (R,G,B)=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target_median={target:.6g}"
+                "[RGB-EQ] poststack robust eq applied: samples=%d, mask_coverage=%.4f, "
+                "raw_gains=(%.6f,%.6f,%.6f), clipped_gains=(%.6f,%.6f,%.6f), target=%.6g",
+                info["samples"],
+                info["mask_coverage"],
+                float(info["raw_gains"][0]),
+                float(info["raw_gains"][1]),
+                float(info["raw_gains"][2]),
+                float(info["clipped_gains"][0]),
+                float(info["clipped_gains"][1]),
+                float(info["clipped_gains"][2]),
+                info["target_median"],
             )
         else:
             _internal_logger.info(
-                "[RGB-EQ] Skipped RGB equalization due to non-finite channel medians."
+                "[RGB-EQ] poststack robust eq no-op: decision=%s, samples=%d, mask_coverage=%.4f",
+                info.get("decision", "no-op"),
+                info["samples"],
+                info["mask_coverage"],
             )
     except Exception as exc:
+        info["decision"] = "error"
         _internal_logger.warning(f"[RGB-EQ] Skipped RGB equalization due to error: {exc}")
     finally:
         if stack_metadata is not None:

@@ -11,10 +11,11 @@ Mission mode: quality-first / surgical / strict non-regression
 
 ## Mission objective
 
-Atteindre un rendu final visuellement homogène et propre dans tous les modes en ciblant 2 défauts majeurs encore présents:
+Atteindre un rendu final visuellement homogène et propre dans tous les modes en ciblant 3 défauts majeurs encore présents:
 
 1. **Lignes de couture inter-tuiles visibles** (parfois très visibles)
-2. **PNG viewer final trop stretché** (hautes lumières brûlées, fond dégradé, rendu “moche”)
+2. **PNG viewer final trop stretché / mal tonemappé** (coeurs brûlés ou rendu trop sombre selon preset)
+3. **`poststack_equalize_rgb` instable** (sur-correction chromatique sur certains datasets, drift R/B)
 
 Objectif final:
 - produire un rendu **seamless** (ou quasi seamless) inter-tuiles,
@@ -112,6 +113,16 @@ Objectif final:
   - absence de régression fonctionnelle/scientifique.
 - Documenter limites résiduelles (si certaines coutures restent sur cas extrêmes).
 
+### [ ] S5bis — Assainissement conceptuel `poststack_equalize_rgb`
+- Prouver et documenter la cause de drift:
+  - égalisation par médianes globales par sous-stack sans masque “fond/objets”,
+  - sensibilité aux couvertures partielles et gradients non homogènes.
+- Redéfinir l’algorithme pour un comportement conservateur:
+  - estimation des gains sur masque robuste (fond valide, exclusion objets brillants),
+  - clip gains serré (ex. `[0.95, 1.05]` par défaut),
+  - seuil minimum de fiabilité (samples/overlap), sinon no-op.
+- Règle produit: **OFF par défaut** tant que la version robuste n’est pas validée terrain.
+
 ### [ ] S6 — Clôture mission
 - Rapport final:
   - gains visuels mesurés + ressenti,
@@ -129,4 +140,5 @@ Mission close only if:
 2. Le PNG viewer n’est plus sur-stretché (moins de blancs brûlés, fond plus propre).
 3. Aucun mode n’a subi de régression fonctionnelle majeure.
 4. Les nouveaux réglages sensibles sont documentés et pilotables par config/GUI si pertinent.
-5. `memory.md` conserve un historique clair des corrections et variables branchées.
+5. `poststack_equalize_rgb` est soit robustifié et validé, soit maintenu OFF par défaut avec justification documentée.
+6. `memory.md` conserve un historique clair des corrections et variables branchées.

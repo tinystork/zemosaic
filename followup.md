@@ -78,6 +78,8 @@ Reference dataset:
 - [x] Préserver alpha-masking/NaN behavior
 
 ### C3. Validation viewer
+- Retour run utilisateur (latest): preview passé de “brûlé” à “trop sombre”, puis “un peu trop lumineux” après retunes successives.
+- Cible actuelle: compromis intermédiaire stable (lisible sans brûler les coeurs).
 - Retour run utilisateur: amélioration preview confirmée mais coeurs étoiles/galaxies encore brûlés.
 - Retune v2 préparé (JSON-only): `preview_png_p_low=0.3`, `preview_png_p_high=99.97`, `preview_png_asinh_a=0.1`.
 - [x] Run A (baseline actuel)
@@ -86,7 +88,7 @@ Reference dataset:
   - moins de blancs brûlés,
   - fond moins agressif,
   - pas de régression FITS (science inchangée)
-- [ ] Décision rapide: keep / tune / revert
+- [~] Décision rapide: keep / tune / revert
 
 ---
 
@@ -152,3 +154,20 @@ Reference dataset:
 - [ ] Paramètres finaux recommandés (defaults + cas marginaux)
 - [ ] GO / NO-GO production
 - [ ] Mise à jour durable `memory.md` (synthèse exploitable debug prod)
+
+
+## H. Dossier `poststack_equalize_rgb` (drift chromatique)
+
+- [x] Confirmer corrélation terrain: `poststack_equalize_rgb=false` supprime les aberrations de courbe RGB sur dataset test
+- [x] Isoler cause algorithmique actuelle:
+  - médianes globales par canal sur sous-stack
+  - absence de masque robuste fond/objets
+  - gains non bornés assez strictement pour dataset pauvre
+- [x] Proposer/implémenter version robuste v2:
+  - masque fond valide + exclusion objets brillants
+  - clip gain conservateur (`[0.95,1.05]` par défaut)
+  - no-op si fiabilité insuffisante (samples/overlap)
+- [x] Ajouter télémétrie explicite: `samples`, `mask_coverage`, `raw_gains`, `clipped_gains`, `applied/no-op`
+- [x] Politique produit jusqu’à validation:
+  - `poststack_equalize_rgb=false` par défaut
+  - documentation claire du risque “drift chromatique”
