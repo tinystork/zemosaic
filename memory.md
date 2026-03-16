@@ -476,3 +476,33 @@ Suivi mission:
   - OFF: comportement stable (pas de drift induit)
   - ON: algorithme robuste v2 + garde-fous/no-op automatique si fiabilité insuffisante.
 
+
+## 2026-03-16 13:28 — Réévaluation seams (dataset plus lourd) + nouvelle proposition
+
+Demande utilisateur: réévaluer la proposition anti-patchwork puis mettre à jour `agent.md`, `followup.md`, `memory.md`.
+
+Décision réévaluée:
+- Amélioration visuelle des seams jugée **possible et réaliste**.
+- Correction de la proposition initiale: **ne pas** monter `intertile_overlap_min` à `0.10` sur ce dataset; garder `0.05` pour conserver assez d'information d'overlap.
+
+Profil documenté "VISUAL_SEAMLESS_v1":
+- `poststack_equalize_rgb=false`
+- `intertile_affine_blend=0.40`
+- `intertile_recenter_clip=[0.96,1.04]`
+- `intertile_overlap_min=0.05`
+- `intertile_robust_clip_sigma=2.0`
+- `apply_radial_weight=true`
+- `radial_feather_fraction=0.94`
+- `radial_shape_power=2.6`
+- `final_mosaic_dbe_enabled=true`
+- `final_mosaic_dbe_strength=normal`
+- `final_mosaic_dbe_smoothing=0.75`
+- `final_mosaic_dbe_sample_step=20`
+- `final_mosaic_dbe_obj_dilate_px=4`
+- `preview_png_apply_wb=false`
+- `preview_png_p_low=0.40`
+- `preview_png_p_high=99.93`
+- `preview_png_asinh_a=0.14`
+
+Nouvelle proposition (reportée pour itération ultérieure):
+- pass optionnel "seam-heal low-frequency" dédié au rendu visuel (non-science), activable par preset.

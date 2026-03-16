@@ -171,3 +171,37 @@ Reference dataset:
 - [x] Politique produit jusqu’à validation:
   - `poststack_equalize_rgb=false` par défaut
   - documentation claire du risque “drift chromatique”
+
+
+---
+
+## I. Réévaluation 2026-03-16 (dataset plus lourd, focus seams)
+
+### I1. Ajustement de proposition
+- [x] Réévaluer la proposition précédente à la lumière du log lourd (`zemosaic_worker.log`)
+- [x] Corriger le point de design: conserver `intertile_overlap_min=0.05` (ne pas monter à 0.10 sur ce dataset)
+- [x] Formaliser un profil unique "VISUAL_SEAMLESS_v1" documenté (voir agent.md addendum)
+
+### I2. Paramètres du profil VISUAL_SEAMLESS_v1
+- [x] `poststack_equalize_rgb=false`
+- [x] `intertile_affine_blend=0.40`
+- [x] `intertile_recenter_clip=[0.96,1.04]`
+- [x] `intertile_overlap_min=0.05`
+- [x] `intertile_robust_clip_sigma=2.0`
+- [x] `apply_radial_weight=true`
+- [x] `radial_feather_fraction=0.94`
+- [x] `radial_shape_power=2.6`
+- [x] `final_mosaic_dbe_enabled=true`
+- [x] `final_mosaic_dbe_strength=normal`
+- [x] `final_mosaic_dbe_smoothing=0.75`
+- [x] `final_mosaic_dbe_sample_step=20`
+- [x] `final_mosaic_dbe_obj_dilate_px=4`
+- [x] `preview_png_apply_wb=false`
+- [x] `preview_png_p_low=0.40`
+- [x] `preview_png_p_high=99.93`
+- [x] `preview_png_asinh_a=0.14`
+
+### I3. Suite planifiée (reportée)
+- [ ] Implémenter un pass optionnel "seam-heal low-frequency" (rendu visuel)
+- [ ] Valider A/B: science conservatrice vs rendu visuel (2 runs max)
+- [ ] Décider si preset "VISUAL_SEAMLESS_v1" devient preset GUI explicite

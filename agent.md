@@ -142,3 +142,48 @@ Mission close only if:
 4. Les nouveaux réglages sensibles sont documentés et pilotables par config/GUI si pertinent.
 5. `poststack_equalize_rgb` est soit robustifié et validé, soit maintenu OFF par défaut avec justification documentée.
 6. `memory.md` conserve un historique clair des corrections et variables branchées.
+
+
+---
+
+## Addendum mission — 2026-03-16 (réévaluation visuelle seams)
+
+### Constat consolidé (log lourd, machine plus puissante)
+- Les seams restent pilotés par des deltas de fond locaux élevés sur certaines jonctions (preuve: `TwoPassWorst abs_delta_med` très élevés), malgré des gains globaux proches de 1.
+- Les overlaps observés sont souvent modestes (~3–8%), ce qui limite la robustesse de la correction locale.
+- Le patchwork perçu provient davantage d'un résidu basse fréquence inter-tuiles que d'un simple problème de stretch preview.
+
+### Décision produit (priorité visuelle assumée)
+- **Oui, amélioration visuelle nette possible** au prix d'une baisse de pureté scientifique sur la sortie de visualisation.
+- Conserver la séparation stricte:
+  - FITS: voie conservatrice/scientifique.
+  - PNG/rendu visuel: voie "visual-first" plus tolérante et plus lissante.
+
+### Profil recommandé "VISUAL_SEAMLESS_v1" (proposition réévaluée)
+> Ajustement de la proposition précédente: `intertile_overlap_min` est maintenu à `0.05` (au lieu de 0.10) pour éviter de perdre trop de contraintes utiles sur ce dataset.
+
+Paramètres cibles:
+- `poststack_equalize_rgb = false`
+- `intertile_affine_blend = 0.40`
+- `intertile_recenter_clip = [0.96, 1.04]`
+- `intertile_overlap_min = 0.05`
+- `intertile_robust_clip_sigma = 2.0`
+- `apply_radial_weight = true`
+- `radial_feather_fraction = 0.94`
+- `radial_shape_power = 2.6`
+- `final_mosaic_dbe_enabled = true`
+- `final_mosaic_dbe_strength = "normal"`
+- `final_mosaic_dbe_smoothing = 0.75`
+- `final_mosaic_dbe_sample_step = 20`
+- `final_mosaic_dbe_obj_dilate_px = 4`
+- `preview_png_apply_wb = false`
+- `preview_png_p_low = 0.40`
+- `preview_png_p_high = 99.93`
+- `preview_png_asinh_a = 0.14`
+
+### Nouvelle proposition d'architecture (à traiter plus tard)
+- Ajouter un **pass optionnel "seam-heal low-frequency"** (preview/rendu visuel):
+  - détection des zones de couture,
+  - correction locale du fond à basse fréquence uniquement,
+  - diffusion douce de la correction pour éviter halos/banding.
+- Garder ce pass **désactivé par défaut** côté science, activable dans un preset visuel.
