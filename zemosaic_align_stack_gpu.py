@@ -1252,14 +1252,9 @@ def _poststack_rgb_equalization(
     stacking_params: Mapping[str, Any] | None = None,
     zconfig: Any | None = None,
 ) -> dict[str, Any]:
-    """
-    Apply optional RGB median equalization and return metadata.
+    """Apply optional poststack RGB equalization and return telemetry."""
 
-    Keeps GPU-only or mixed GPU/CPU runs consistent with the CPU stacker's
-    per-stack equalization behavior.
-    """
-
-    default_enabled = True
+    default_enabled = False
     enabled = default_enabled
     try:
         if stacking_params is not None and hasattr(stacking_params, "get"):
@@ -1280,54 +1275,109 @@ def _poststack_rgb_equalization(
             pass
 
     info = {
-        "enabled": enabled,
+        "enabled": bool(enabled),
         "applied": False,
         "gain_r": 1.0,
         "gain_g": 1.0,
         "gain_b": 1.0,
         "target_median": float("nan"),
+        "samples": 0,
+        "mask_coverage": 0.0,
+        "raw_gains": [1.0, 1.0, 1.0],
+        "clipped_gains": [1.0, 1.0, 1.0],
+        "decision": "disabled",
     }
 
     if not enabled or stacked is None or not isinstance(stacked, np.ndarray):
         return info
     if stacked.ndim != 3 or stacked.shape[2] != 3:
+        info["decision"] = "non_rgb"
         return info
 
-    try:
-        med = np.nanmedian(stacked, axis=(0, 1)).astype(np.float32)
-        finite = np.isfinite(med) & (med > 0)
-        if not np.any(finite):
-            return info
-
-        target = float(np.nanmedian(med[finite]))
-        gains = np.ones(3, dtype=np.float32)
-        gains[finite] = target / med[finite]
+    def _cfg_get(name: str, default: Any) -> Any:
         try:
-            if not stacked.flags.writeable:
-                try:
-                    stacked.setflags(write=True)
-                except Exception:
-                    pass
-            np.multiply(stacked, gains[None, None, :], out=stacked, casting="unsafe")
+            if stacking_params is not None and hasattr(stacking_params, "get") and name in stacking_params:
+                return stacking_params.get(name)
         except Exception:
-            np.multiply(stacked, gains[None, None, :], out=None, casting="unsafe")
+            pass
+        try:
+            if zconfig is not None:
+                return getattr(zconfig, name, default)
+        except Exception:
+            pass
+        return default
 
-        info.update(
-            gain_r=float(gains[0]),
-            gain_g=float(gains[1]),
-            gain_b=float(gains[2]),
-            target_median=float(target),
-        )
-        if np.isfinite(target):
-            info["applied"] = True
+    gain_clip = _cfg_get("poststack_rgb_equalize_gain_clip", (0.95, 1.05))
+    bg_percentile = _cfg_get("poststack_rgb_equalize_bg_percentile", (5.0, 85.0))
+    min_samples = _cfg_get("poststack_rgb_equalize_min_samples", 5000)
+    min_coverage = _cfg_get("poststack_rgb_equalize_min_coverage", 0.01)
+
+    try:
+        if _CPU_STACK_HELPERS_AVAILABLE and _zas is not None and hasattr(_zas, "equalize_rgb_medians_inplace"):
+            eq_info = _zas.equalize_rgb_medians_inplace(
+                stacked,
+                gain_clip=gain_clip,
+                bg_percentile=bg_percentile,
+                min_samples=min_samples,
+                min_coverage=min_coverage,
+                return_info=True,
+            )
+            if isinstance(eq_info, dict):
+                info.update(
+                    applied=bool(eq_info.get("applied", False)),
+                    gain_r=float(eq_info.get("gain_r", 1.0)),
+                    gain_g=float(eq_info.get("gain_g", 1.0)),
+                    gain_b=float(eq_info.get("gain_b", 1.0)),
+                    target_median=float(eq_info.get("target_median", float("nan"))),
+                    samples=int(eq_info.get("samples", 0) or 0),
+                    mask_coverage=float(eq_info.get("mask_coverage", 0.0) or 0.0),
+                    raw_gains=list(eq_info.get("raw_gains", [1.0, 1.0, 1.0])),
+                    clipped_gains=list(eq_info.get("clipped_gains", [1.0, 1.0, 1.0])),
+                    decision=str(eq_info.get("decision", "no-op")),
+                )
+        else:
+            med = np.nanmedian(stacked, axis=(0, 1)).astype(np.float32)
+            finite = np.isfinite(med) & (med > 0)
+            if not np.any(finite):
+                info["decision"] = "invalid_channel_medians"
+                return info
+            target = float(np.nanmedian(med[finite]))
+            gains = np.ones(3, dtype=np.float32)
+            gains[finite] = target / med[finite]
+            np.multiply(stacked, gains[None, None, :], out=stacked, casting="unsafe")
+            info.update(
+                applied=np.isfinite(target),
+                gain_r=float(gains[0]),
+                gain_g=float(gains[1]),
+                gain_b=float(gains[2]),
+                target_median=float(target),
+                decision="applied" if np.isfinite(target) else "invalid_target",
+                raw_gains=[float(gains[0]), float(gains[1]), float(gains[2])],
+                clipped_gains=[float(gains[0]), float(gains[1]), float(gains[2])],
+            )
+
+        if info.get("applied"):
             LOGGER.info(
-                "[RGB-EQ][GPU] Applied per-substack RGB equalization: gains=(%.6f,%.6f,%.6f) target=%.6g",
-                gains[0],
-                gains[1],
-                gains[2],
-                target,
+                "[RGB-EQ][GPU] poststack robust eq applied: samples=%d, mask_coverage=%.4f, raw=(%.6f,%.6f,%.6f), clipped=(%.6f,%.6f,%.6f), target=%.6g",
+                int(info.get("samples", 0) or 0),
+                float(info.get("mask_coverage", 0.0) or 0.0),
+                float(info.get("raw_gains", [1.0,1.0,1.0])[0]),
+                float(info.get("raw_gains", [1.0,1.0,1.0])[1]),
+                float(info.get("raw_gains", [1.0,1.0,1.0])[2]),
+                float(info.get("clipped_gains", [1.0,1.0,1.0])[0]),
+                float(info.get("clipped_gains", [1.0,1.0,1.0])[1]),
+                float(info.get("clipped_gains", [1.0,1.0,1.0])[2]),
+                float(info.get("target_median", float("nan"))),
+            )
+        else:
+            LOGGER.info(
+                "[RGB-EQ][GPU] poststack robust eq no-op: decision=%s, samples=%d, mask_coverage=%.4f",
+                str(info.get("decision", "no-op")),
+                int(info.get("samples", 0) or 0),
+                float(info.get("mask_coverage", 0.0) or 0.0),
             )
     except Exception as exc:
+        info["decision"] = "error"
         LOGGER.warning("[RGB-EQ][GPU] Skipped RGB equalization due to error: %s", exc)
 
     return info

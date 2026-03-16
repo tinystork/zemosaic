@@ -3935,7 +3935,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "stacking_kappa_high": 3.0,
             "stacking_winsor_limits": "0.05,0.05",
             "stacking_final_combine_method": "mean",
-            "poststack_equalize_rgb": True,
+            "poststack_equalize_rgb": False,
             "apply_radial_weight": False,
             "radial_feather_fraction": 0.8,
             "min_radial_weight_floor": 0.0,

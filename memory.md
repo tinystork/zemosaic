@@ -407,3 +407,72 @@ Files updated:
 - `zemosaic_config.py`: `get_config_path()` now points to repo-local `.../zemosaic/zemosaic/zemosaic_config.json`.
 - `zemosaic_worker.py`: worker log path now points to repo-local `.../zemosaic/zemosaic/zemosaic_worker.log`.
 - One-time sync performed from `~/.config/ZeMosaic/zemosaic_config.json` to repo config file to preserve current runtime settings.
+
+## 2026-03-16 00:42 — Constat consolidé + plan mission (session handoff)
+
+Constats validés terrain:
+- Seams classiques toujours visibles (dataset pauvre + confirmé aussi sur set plus complet).
+- `poststack_equalize_rgb` est le principal suspect de drift chromatique:
+  - quand `poststack_equalize_rgb=False`, courbe RGB redevient cohérente et FITS visuellement acceptable.
+- Preview PNG: problème de compromis tonemap (tour à tour brûlé / trop sombre / un peu trop lumineux selon preset).
+
+Analyse technique (code):
+- `poststack_equalize_rgb` actuel repose sur `equalize_rgb_medians_inplace` (médiane globale par canal, gains appliqués au sous-stack entier).
+- Cette logique est conceptuellement fragile sur mosaïques hétérogènes (fond non uniforme, couverture partielle, objets brillants), ce qui explique la sur-correction R/B observée.
+
+Décision de mission:
+- Traiter `poststack_equalize_rgb` comme chantier dédié (robustification v2) et non simple tuning de coefficient.
+- Maintenir par défaut `poststack_equalize_rgb=False` jusqu’à validation robuste.
+- Agent/followup amendés pour inclure ce dossier explicitement + critères de release gate.
+
+Contexte config/log:
+- Chemins rétablis sur repo (à la demande user):
+  - config active: `/home/tristan/zemosaic/zemosaic/zemosaic_config.json`
+  - worker log: `/home/tristan/zemosaic/zemosaic/zemosaic_worker.log`
+
+## 2026-03-16 00:55 — Implémentation H validée: `poststack_equalize_rgb` robust v2 + télémétrie
+
+Implémentation réalisée (CPU+GPU+defaults):
+
+- `zemosaic_align_stack.py`
+  - `equalize_rgb_medians_inplace` refactoré en mode robuste/conservateur:
+    - masque de fond robuste basé sur luminance percentiles (`poststack_rgb_equalize_bg_percentile`, défaut `[5,85]`),
+    - exclusion implicite des objets brillants/hot pixels via masque percentile + validité RGB,
+    - clip gain conservateur (`poststack_rgb_equalize_gain_clip`, défaut `[0.95,1.05]`),
+    - garde-fous fiabilité (`poststack_rgb_equalize_min_samples`, défaut `5000`; `poststack_rgb_equalize_min_coverage`, défaut `0.01`),
+    - no-op explicite si fiabilité insuffisante.
+  - `_poststack_rgb_equalization` mis à jour:
+    - défaut `poststack_equalize_rgb=False`,
+    - télémétrie enrichie: `samples`, `mask_coverage`, `raw_gains`, `clipped_gains`, `decision`, `applied`.
+
+- `zemosaic_align_stack_gpu.py`
+  - chemin GPU aligné sur la logique robuste CPU (appel helper CPU quand dispo),
+  - mêmes champs de télémétrie / décisions no-op, logs homogènes.
+
+- Politique produit par défaut (jusqu’à validation terrain):
+  - `poststack_equalize_rgb=False` par défaut dans `zemosaic_config.py`,
+  - fallback defaults GUI alignés à `False` (`zemosaic_gui_qt.py`, `zemosaic_gui.py`).
+
+- Nouvelles clés JSON power-user documentées dans `DEFAULT_CONFIG`:
+  - `poststack_rgb_equalize_gain_clip`
+  - `poststack_rgb_equalize_bg_percentile`
+  - `poststack_rgb_equalize_min_samples`
+  - `poststack_rgb_equalize_min_coverage`
+
+Suivi mission:
+- `followup.md` section H cochée sur implémentation v2 + télémétrie + politique default OFF.
+
+
+## 2026-03-16 00:58 — Preset terrain appliqué (UX case unique GUI)
+
+- Contexte: l’utilisateur final n’a qu’une case à cocher (`poststack_equalize_rgb`) dans la GUI.
+- Action: preset JSON "safe" fixé dans `zemosaic_config.json` pour rendre la case auto-portée sans réglages cachés:
+  - `poststack_equalize_rgb=false` (par défaut)
+  - `poststack_rgb_equalize_gain_clip=[0.95,1.05]`
+  - `poststack_rgb_equalize_bg_percentile=[5.0,85.0]`
+  - `poststack_rgb_equalize_min_samples=5000`
+  - `poststack_rgb_equalize_min_coverage=0.01`
+- Effet produit attendu:
+  - OFF: comportement stable (pas de drift induit)
+  - ON: algorithme robuste v2 + garde-fous/no-op automatique si fiabilité insuffisante.
+
