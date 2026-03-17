@@ -205,3 +205,14 @@ Reference dataset:
 - [ ] Implémenter un pass optionnel "seam-heal low-frequency" (rendu visuel)
 - [ ] Valider A/B: science conservatrice vs rendu visuel (2 runs max)
 - [ ] Décider si preset "VISUAL_SEAMLESS_v1" devient preset GUI explicite
+
+### I4. Guardrails — future Visual Seam Heal (do not lose sight of this)
+- [ ] Prepare a GUI option before `Save final mosaic as uint16`
+- [ ] Keep this feature explicitly visual-only (not a science/FITS correction)
+- [ ] Preserve strict separation between Classic / Existing master tiles / SDS / ZeGrid
+- [ ] Implement as config-gated, conservative, OFF by default
+- [ ] Prefer Phase 6 / final visual output integration, not upstream stack math
+- [ ] Be extremely careful with RGB drift; luma-first approach preferred for V1
+- [ ] Avoid halos, banding, and hard local corrections
+- [ ] Add every persisted key to `DEFAULT_CONFIG`
+- [ ] Update `memory.md` after each significant iteration
