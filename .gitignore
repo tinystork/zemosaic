@@ -193,5 +193,5 @@ compile/
 example/
 
 # === ZeMosaic: outils locaux non versionnés ===
-tools/
+#tools/
 agents/

@@ -506,3 +506,26 @@ Profil documenté "VISUAL_SEAMLESS_v1":
 
 Nouvelle proposition (reportée pour itération ultérieure):
 - pass optionnel "seam-heal low-frequency" dédié au rendu visuel (non-science), activable par preset.
+
+## 2026-03-17 — Mission pivot: seams root-cause reorientation
+
+Pivot stratégique de la mission seams.
+
+Constat consolidé:
+- le problème principal ne semble pas être un manque global de recouvrement géométrique entre master tiles;
+- le graphe brut est dense, mais le graphe réellement exploité après pruning est nettement plus maigre;
+- les master tiles sont hétérogènes (coverage / sessions / qualité locale / résidus);
+- le master-tile weighting actuel peut imprimer la géométrie des tuiles dans le rendu final au lieu de dissoudre les disparités.
+
+Décision:
+- rétrograder le tuning purement visuel et le futur seam-heal low-frequency en finition seulement;
+- réorienter la mission principale vers:
+  1. instrumentation du pipeline réel,
+  2. rework du graphe photométrique,
+  3. weighting V4 plus conservateur et moins dominateur.
+
+Consigne durable:
+- Classic d’abord;
+- patchs chirurgicaux;
+- tout nouveau levier sensible config-gated;
+- `memory.md` à jour à chaque itération significative.
