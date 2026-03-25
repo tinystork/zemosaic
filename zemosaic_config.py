@@ -159,6 +159,11 @@ DEFAULT_CONFIG = {
     "phase5_chunk_mb": 128,
     "enable_tile_weighting": True,
     "tile_weight_mode": "n_frames",
+    "tile_weight_v4_enabled": False,
+    "tile_weight_v4_curve": "sqrt",
+    "tile_weight_v4_strength": 1.0,
+    "tile_weight_v4_min": 0.75,
+    "tile_weight_v4_max": 1.35,
     "final_assembly_method": "reproject_coadd",  # Options: "reproject_coadd", "incremental",
     "auto_detect_seestar": True,
     "force_seestar_mode": False,
@@ -247,6 +252,8 @@ DEFAULT_CONFIG = {
     "intertile_overlap_min": 0.05,
     "intertile_sky_percentile": [30.0, 70.0],
     "intertile_robust_clip_sigma": 2.5,
+    "intertile_prune_k": 8,
+    "intertile_prune_weight_mode": "area",
     "intertile_global_recenter": True,
     "force_resolve_existing_wcs": False,
     "intertile_recenter_clip": [0.85, 1.18],
@@ -280,6 +287,12 @@ DEFAULT_CONFIG = {
     "quality_gate_k_sigma": 2.5,
     "quality_gate_erode_px": 3,
     "quality_gate_move_rejects": True,
+    # Existing-master-tiles pre-check gate (protect Phase 5 from catastrophic outliers)
+    "existing_master_tiles_quality_gate_enabled": True,
+    "existing_master_tiles_quality_gate_mode": "warn",  # warn|fail
+    "existing_master_tiles_quality_gate_sigma_threshold": 8.0,
+    "existing_master_tiles_quality_gate_ratio_threshold": 5000.0,
+    "existing_master_tiles_quality_gate_min_valid_frac": 0.05,
     # --- Alt-Az cleanup (lecropper altZ) ---
     "altaz_cleanup_enabled": False,
     "altaz_margin_percent": 5.0,  # UI: "AltAz margin %"
@@ -571,11 +584,12 @@ def load_config():
                 loaded_config = json.load(f)
                 for key, default_value in DEFAULT_CONFIG.items():
                     current_config[key] = loaded_config.get(key, default_value)
-                # Gérer les clés obsolètes ou nouvelles non présentes dans DEFAULT_CONFIG
-                # Par exemple, on pourrait choisir de ne garder que les clés de DEFAULT_CONFIG
-                # ou d'ajouter les nouvelles clés de loaded_config qui ne sont pas dans DEFAULT_CONFIG.
-                # Pour l'instant, la boucle ci-dessus s'assure que toutes les clés de DEFAULT_CONFIG
-                # sont présentes dans current_config, en prenant la valeur chargée si elle existe.
+                # Preserve power-user / hidden keys that are present in JSON but not
+                # declared in DEFAULT_CONFIG so GUI round-trips never erase them.
+                if isinstance(loaded_config, dict):
+                    for key, value in loaded_config.items():
+                        if key not in current_config:
+                            current_config[key] = value
         except json.JSONDecodeError:
             msg_title = "Config Error"
             msg_text = f"Error reading {config_path}. Using default configuration."
@@ -662,15 +676,26 @@ def save_config(config_data):
                     existing_resume = loaded_existing.get("resume")
             except Exception:
                 existing_resume = None
-        # Avant de sauvegarder, s'assurer que config_data ne contient que les clés attendues
-        # pour éviter d'écrire des clés temporaires ou obsolètes.
-        # On ne garde que les clés qui sont dans DEFAULT_CONFIG.
+        # Preserve unknown/power-user keys already present in JSON, then overlay
+        # current config values. This guarantees GUI saves are non-destructive.
         config_to_save = {}
-        for key in DEFAULT_CONFIG.keys():
-            if key in config_data:
-                config_to_save[key] = config_data[key]
-            # else: # Optionnel: si une clé par défaut manque dans config_data, la remettre
-            #     config_to_save[key] = DEFAULT_CONFIG[key]
+        existing_payload = None
+        if config_path.exists():
+            try:
+                with config_path.open("r", encoding="utf-8") as existing_handle:
+                    existing_payload = json.load(existing_handle)
+            except Exception:
+                existing_payload = None
+        if isinstance(existing_payload, dict):
+            config_to_save.update(existing_payload)
+
+        if isinstance(config_data, dict):
+            config_to_save.update(config_data)
+
+        # Ensure known defaults always exist for forward compatibility.
+        for key, default_value in DEFAULT_CONFIG.items():
+            if key not in config_to_save:
+                config_to_save[key] = default_value
 
         default_resume = DEFAULT_CONFIG.get("resume")
         if existing_resume is not None and isinstance(config_data, dict):

@@ -214,3 +214,27 @@ Tant que le pipeline réel n’est pas suffisamment instrumenté et que le weigh
   - un meilleur graphe photométrique,
   - une meilleure homogénéisation,
   - un weighting final moins dominateur.
+
+---
+
+## Addendum 2026-03-20 — Proto V4 + prudence régression Classic
+
+### Avancement concret
+- Un proto **Weighting V4 config-gated** a été branché (compression + bornes), sans activation par défaut.
+- Le pruning intertile est désormais **pilotable par config** (`intertile_prune_k`, `intertile_prune_weight_mode`) au lieu d'un seul K figé.
+- Objectif maintenu: comparer OFF / ON actuel / ON V4 sur même mini-dataset avant toute décision de défaut produit.
+
+### Guardrail majeur (hérité des incidents de régression)
+Le code de la voie Classic est **fortement intriqué** avec d'autres branches de pipeline.
+Toute modification en Classic doit être considérée à risque de casse collatérale si non isolée.
+
+Règles opératoires renforcées:
+1. Avant patch: identifier explicitement la/les fonctions partagées touchées.
+2. Pendant patch: privilégier les flags config-gated et les defaults conservateurs.
+3. Après patch: vérifier au minimum non-régression rapide sur Classic / ZeGrid / SDS.
+4. Traçabilité: documenter systématiquement dans `memory.md` la zone touchée + risque + preuve compile/test/run.
+
+### Position mission
+- Continuer le pivot root-cause (graph + weighting réel),
+- mais avec discipline stricte de non-régression multi-voies,
+- et sans multiplier les sources d'info hors `memory.md` (source de vérité opérationnelle).

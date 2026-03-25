@@ -2207,7 +2207,7 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
     return result
 
 # Constants for pruning
-MAX_NEIGHBORS_PER_TILE = 8
+max_neighbors_per_tile = 8
 
 
 # Helper for consistent edge key
@@ -2265,6 +2265,8 @@ def compute_intertile_affine_calibration(
     progress_callback=None,
     tile_weights=None,
     cpu_workers: int | None = None,
+    max_neighbors_per_tile: int = 8,
+    prune_weight_mode: str = "area",
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
 
@@ -2516,6 +2518,16 @@ def compute_intertile_affine_calibration(
 
         return {}
 
+    try:
+        max_neighbors_per_tile = int(max_neighbors_per_tile)
+    except Exception:
+        max_neighbors_per_tile = 8
+    max_neighbors_per_tile = max(0, max_neighbors_per_tile)
+
+    prune_weight_mode_norm = str(prune_weight_mode or "area").strip().lower()
+    if prune_weight_mode_norm not in {"area", "strength", "hybrid"}:
+        prune_weight_mode_norm = "area"
+
     # --- START PRUNING LOGIC ---
     raw_pairs_count = len(overlaps)
     overlaps_raw = list(overlaps)
@@ -2524,24 +2536,48 @@ def compute_intertile_affine_calibration(
     active_tiles = np.zeros(num_tiles, dtype=bool)
 
     def _ensure_overlap_weight(entry: dict) -> float:
-        weight = entry.get("weight", None)
-        try:
-            weight_val = float(weight)
-        except Exception:
-            weight_val = float("nan")
-        if not math.isfinite(weight_val) or weight_val <= 0.0:
+        def _safe_f(v, default=0.0):
+            try:
+                fv = float(v)
+                return fv if math.isfinite(fv) else default
+            except Exception:
+                return default
+
+        area_weight = _safe_f(entry.get("weight"), default=float("nan"))
+        if not math.isfinite(area_weight) or area_weight <= 0.0:
             try:
                 bbox = entry.get("bbox")
                 if bbox is not None and len(bbox) == 4:
                     x0, x1, y0, y1 = bbox
-                    weight_val = float((x1 - x0) * (y1 - y0))
+                    area_weight = float((x1 - x0) * (y1 - y0))
                 else:
-                    weight_val = 0.0
+                    area_weight = 0.0
             except Exception:
-                weight_val = 0.0
+                area_weight = 0.0
+        area_weight = area_weight if (math.isfinite(area_weight) and area_weight > 0.0) else 0.0
+
+        strength = _safe_f(entry.get("pair_strength_avg"), default=float("nan"))
+        if not math.isfinite(strength) or strength <= 0.0:
+            fi = _safe_f(entry.get("frac_i"), default=float("nan"))
+            fj = _safe_f(entry.get("frac_j"), default=float("nan"))
+            if math.isfinite(fi) and math.isfinite(fj) and fi > 0.0 and fj > 0.0:
+                strength = 0.5 * (fi + fj)
+            else:
+                strength = max(fi if math.isfinite(fi) else 0.0, fj if math.isfinite(fj) else 0.0, 0.0)
+        strength = strength if (math.isfinite(strength) and strength > 0.0) else 0.0
+
+        if prune_weight_mode_norm == "strength":
+            weight_val = strength if strength > 0.0 else area_weight
+        elif prune_weight_mode_norm == "hybrid":
+            weight_val = math.sqrt(max(area_weight, 0.0)) * max(strength, 1e-6)
+        else:
+            weight_val = area_weight if area_weight > 0.0 else strength
+
         if not math.isfinite(weight_val) or weight_val < 0.0:
             weight_val = 0.0
         entry["weight"] = weight_val
+        entry["weight_area"] = area_weight
+        entry["weight_strength"] = strength
         return weight_val
 
     for entry in overlaps_raw:
@@ -2568,9 +2604,9 @@ def compute_intertile_affine_calibration(
         return len(roots)
 
     # Pruning condition
-    if (raw_pairs_count > num_tiles * MAX_NEIGHBORS_PER_TILE * 2 and num_tiles >= 10):
+    if (raw_pairs_count > num_tiles * max_neighbors_per_tile * 2 and num_tiles >= 10):
         _log_intertile(
-            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={MAX_NEIGHBORS_PER_TILE}",
+            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={max_neighbors_per_tile}",
             level="INFO",
         )
 
@@ -2595,10 +2631,10 @@ def compute_intertile_affine_calibration(
             # Keep top K, ensuring at least one if it had neighbors.
             to_keep_for_tile = []
             if neighbors[tile_id]:
-                if MAX_NEIGHBORS_PER_TILE == 0 and len(neighbors[tile_id]) >= 1:
+                if max_neighbors_per_tile == 0 and len(neighbors[tile_id]) >= 1:
                     to_keep_for_tile.append(neighbors[tile_id][0][1])
                 else:
-                    for k_idx in range(min(MAX_NEIGHBORS_PER_TILE, len(neighbors[tile_id]))):
+                    for k_idx in range(min(max_neighbors_per_tile, len(neighbors[tile_id]))):
                         to_keep_for_tile.append(neighbors[tile_id][k_idx][1])
 
             kept_keys.update(to_keep_for_tile)
@@ -2673,7 +2709,7 @@ def compute_intertile_affine_calibration(
     else:
         _log_intertile(
             "Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)"
-            % (raw_pairs_count, num_tiles, MAX_NEIGHBORS_PER_TILE),
+            % (raw_pairs_count, num_tiles, max_neighbors_per_tile),
             level="INFO",
         )
         uf = _UnionFind(num_tiles)
@@ -2692,9 +2728,9 @@ def compute_intertile_affine_calibration(
     _log_intertile(
         (
             "Pair pruning summary: "
-            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={MAX_NEIGHBORS_PER_TILE} "
+            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={max_neighbors_per_tile} "
             f"active={active_tile_count} components={components_active} bridges={bridges_added} "
-            f"fallback={'yes' if fallback_used else 'no'}"
+            f"fallback={'yes' if fallback_used else 'no'} mode={prune_weight_mode_norm}"
         ),
         level="INFO",
     )

@@ -58,6 +58,7 @@ import inspect  # Pas utilisé directement ici, mais peut être utile pour des i
 import math
 import hashlib
 import json
+import csv
 from datetime import datetime
 import psutil
 import tempfile
@@ -5214,6 +5215,155 @@ def _move_quality_reject_file(src_path: str) -> tuple[str, bool]:
         return src_path, False
 
 
+def _existing_master_tile_robust_stats(path: str) -> dict[str, float] | None:
+    """Compute lightweight robust photometric stats for an existing master tile."""
+    try:
+        arr = fits.getdata(path, 0)
+    except Exception:
+        return None
+    try:
+        data = _prepare_quality_gate_array(np.asarray(arr, dtype=np.float32))
+    except Exception:
+        return None
+
+    finite = np.isfinite(data)
+    finite3 = np.all(finite, axis=-1)
+    total_px = int(finite3.size)
+    valid_px = int(np.count_nonzero(finite3))
+    valid_frac = float(valid_px / total_px) if total_px > 0 else 0.0
+    if valid_px <= 0:
+        return {
+            "valid_frac": valid_frac,
+            "med": 0.0,
+            "max_abs": 0.0,
+            "mad": 0.0,
+            "log_med": -12.0,
+            "ratio_max_med": float('inf'),
+        }
+
+    vals = data[finite3]
+    if vals.ndim == 1:
+        vals = vals[:, np.newaxis]
+    med_ch = np.nanmedian(vals, axis=0)
+    med = float(np.nanmedian(med_ch))
+    abs_vals = np.abs(vals)
+    max_abs = float(np.nanmax(abs_vals)) if abs_vals.size else 0.0
+    mad = float(np.nanmedian(np.abs(vals - np.nanmedian(vals, axis=0, keepdims=True))))
+    med_abs_floor = max(abs(med), 1e-6)
+    ratio = float(max_abs / med_abs_floor)
+    log_med = float(np.log10(max(med_abs_floor, 1e-12)))
+    return {
+        "valid_frac": valid_frac,
+        "med": med,
+        "max_abs": max_abs,
+        "mad": mad,
+        "log_med": log_med,
+        "ratio_max_med": ratio,
+    }
+
+
+def _scan_existing_master_tiles_quality(
+    records: list[tuple[str, Any]],
+    *,
+    enabled: bool,
+    mode: str,
+    sigma_threshold: float,
+    ratio_threshold: float,
+    min_valid_frac: float,
+    pcb: Optional[Callable] = None,
+) -> dict[str, Any]:
+    """Pre-check existing master tiles to catch catastrophic photometric outliers."""
+    summary: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "mode": str(mode or "warn").strip().lower(),
+        "total": int(len(records or [])),
+        "ok": 0,
+        "suspect": 0,
+        "failed_reads": 0,
+        "suspects": [],
+        "z_center": 0.0,
+        "z_scale": 1.0,
+    }
+    if not enabled or not records:
+        return summary
+
+    sigma_thr = max(2.0, float(sigma_threshold))
+    ratio_thr = max(10.0, float(ratio_threshold))
+    min_valid = float(np.clip(min_valid_frac, 0.0, 1.0))
+
+    per_tile: list[dict[str, Any]] = []
+    for path, _wcs in records:
+        st = _existing_master_tile_robust_stats(path)
+        if st is None:
+            summary["failed_reads"] += 1
+            continue
+        item = {"path": str(path), **st}
+        per_tile.append(item)
+
+    if not per_tile:
+        return summary
+
+    log_meds = np.array([float(t.get("log_med", 0.0)) for t in per_tile], dtype=np.float64)
+    center = float(np.nanmedian(log_meds))
+    mad = float(np.nanmedian(np.abs(log_meds - center)))
+    scale = max(1.4826 * mad, 1e-6)
+    summary["z_center"] = center
+    summary["z_scale"] = scale
+
+    for t in per_tile:
+        z = abs((float(t.get("log_med", center)) - center) / scale)
+        t["z_log_med"] = float(z)
+        fail_valid = float(t.get("valid_frac", 0.0)) < min_valid
+        fail_ratio = float(t.get("ratio_max_med", 0.0)) > ratio_thr
+        fail_z = float(z) > sigma_thr
+        suspect = bool(fail_valid or fail_ratio or fail_z)
+        t["suspect"] = suspect
+        if suspect:
+            reasons = []
+            if fail_valid:
+                reasons.append("valid_frac")
+            if fail_ratio:
+                reasons.append("ratio_max_med")
+            if fail_z:
+                reasons.append("z_log_med")
+            t["reasons"] = reasons
+            summary["suspects"].append(t)
+        else:
+            summary["ok"] += 1
+
+    summary["suspect"] = len(summary["suspects"])
+    if pcb:
+        try:
+            pcb(
+                "run_info_existing_master_tiles_quality_precheck",
+                prog=None,
+                lvl="INFO",
+                total=int(summary["total"]),
+                ok=int(summary["ok"]),
+                suspect=int(summary["suspect"]),
+                failed_reads=int(summary["failed_reads"]),
+                mode=summary["mode"],
+            )
+        except Exception:
+            pass
+        for sitem in summary["suspects"][:12]:
+            try:
+                pcb(
+                    "run_warn_existing_master_tile_suspect",
+                    prog=None,
+                    lvl="WARN",
+                    path=_safe_basename(sitem.get("path", "")),
+                    z=f"{float(sitem.get('z_log_med', 0.0)):.2f}",
+                    ratio=f"{float(sitem.get('ratio_max_med', 0.0)):.2e}",
+                    valid=f"{float(sitem.get('valid_frac', 0.0)):.3f}",
+                    reasons=",".join(sitem.get("reasons") or []),
+                )
+            except Exception:
+                pass
+
+    return summary
+
+
 @dataclass
 class _TileAffineSource:
     """Container for intertile photometric calibration inputs."""
@@ -7943,6 +8093,8 @@ def _compute_intertile_affine_corrections_from_sources(
     tile_weights: list[float] | None = None,
     cpu_workers: int | None = None,
     force_safe_mode: bool | None = None,
+    intertile_prune_k: int = 8,
+    intertile_prune_weight_mode: str = "area",
 ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
     """Common implementation for intertile gain/offset computation.
 
@@ -8221,6 +8373,8 @@ def _compute_intertile_affine_corrections_from_sources(
             progress_callback=_intertile_progress_bridge,
             tile_weights=tile_weights,
             cpu_workers=cpu_workers,
+            max_neighbors_per_tile=int(intertile_prune_k),
+            prune_weight_mode=str(intertile_prune_weight_mode),
         )
     except Exception as exc:
         if cpu_workers and cpu_workers > 1 and not force_safe_mode:
@@ -8250,6 +8404,8 @@ def _compute_intertile_affine_corrections_from_sources(
                     progress_callback=_intertile_progress_bridge,
                     tile_weights=tile_weights,
                     cpu_workers=cpu_workers,
+                    max_neighbors_per_tile=int(intertile_prune_k),
+                    prune_weight_mode=str(intertile_prune_weight_mode),
                 )
             except Exception as exc_single:
                 if logger_obj:
@@ -9752,6 +9908,8 @@ def _run_shared_phase45_phase5_pipeline(
     intertile_affine_blend_config = phase5_options.get("intertile_affine_blend", 1.0)
     use_auto_intertile_config = phase5_options.get("use_auto_intertile")
     intertile_force_safe_mode_config = bool(phase5_options.get("intertile_force_safe_mode"))
+    intertile_prune_k_config = int(phase5_options.get("intertile_prune_k") or 8)
+    intertile_prune_weight_mode_config = str(phase5_options.get("intertile_prune_weight_mode") or "area")
     coadd_use_memmap_config = bool(phase5_options.get("coadd_use_memmap"))
     coadd_memmap_dir_config = phase5_options.get("coadd_memmap_dir")
     start_time_total = start_time_total_run
@@ -9759,6 +9917,23 @@ def _run_shared_phase45_phase5_pipeline(
     parallel_plan = phase5_options.get("parallel_plan")
     tile_weighting_enabled_flag = bool(phase5_options.get("tile_weighting_enabled"))
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
+    tile_weight_v4_enabled_config = bool(phase5_options.get("tile_weight_v4_enabled"))
+    tile_weight_v4_curve_config = str(phase5_options.get("tile_weight_v4_curve") or "sqrt")
+    tile_weight_v4_strength_config = float(phase5_options.get("tile_weight_v4_strength") or 1.0)
+    tile_weight_v4_min_config = float(phase5_options.get("tile_weight_v4_min") or 0.75)
+    tile_weight_v4_max_config = float(phase5_options.get("tile_weight_v4_max") or 1.35)
+    pcb(
+        (
+            "[Phase5] tile_weight_v4 "
+            f"enabled={tile_weight_v4_enabled_config} "
+            f"curve={tile_weight_v4_curve_config} "
+            f"strength={tile_weight_v4_strength_config:.4g} "
+            f"min={tile_weight_v4_min_config:.4g} "
+            f"max={tile_weight_v4_max_config:.4g}"
+        ),
+        prog=None,
+        lvl="INFO",
+    )
     existing_master_tiles_mode = bool(phase5_options.get("existing_master_tiles_mode"))
     worker_config_cache = phase45_options.get("worker_config") or {}
     phase5_force_gpu_on_ac_cfg = worker_config_cache.get("phase5_force_gpu_on_ac")
@@ -9998,6 +10173,8 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_affine_blend=float(intertile_affine_blend_config),
                 use_auto_intertile=bool(use_auto_intertile_config),
                 intertile_force_safe_mode=intertile_force_safe_mode_config,
+                intertile_prune_k=int(intertile_prune_k_config),
+                intertile_prune_weight_mode=str(intertile_prune_weight_mode_config),
                 match_background=match_background_flag,
                 feather_parity=feather_parity_flag,
                 two_pass_coverage_renorm=two_pass_coverage_renorm_config,
@@ -10309,6 +10486,8 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_affine_blend=float(intertile_affine_blend_config),
                 use_auto_intertile=bool(use_auto_intertile_config),
                 intertile_force_safe_mode=intertile_force_safe_mode_config,
+                intertile_prune_k=int(intertile_prune_k_config),
+                intertile_prune_weight_mode=str(intertile_prune_weight_mode_config),
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
                 phase45_enabled=phase45_active_flag,
@@ -10319,6 +10498,11 @@ def _run_shared_phase45_phase5_pipeline(
                 radial_feather_fraction=float(phase5_options.get("radial_feather_fraction") or 0.8),
                 radial_shape_power=float(phase5_options.get("radial_shape_power") or 2.0),
                 min_radial_weight_floor=float(phase5_options.get("min_radial_weight_floor") or 0.0),
+                tile_weight_v4_enabled=tile_weight_v4_enabled_config,
+                tile_weight_v4_curve=tile_weight_v4_curve_config,
+                tile_weight_v4_strength=tile_weight_v4_strength_config,
+                tile_weight_v4_min=tile_weight_v4_min_config,
+                tile_weight_v4_max=tile_weight_v4_max_config,
                 stats_callback=_emit_phase5_stats,
                 worker_config_cache=worker_config_cache,
                 gpu_safety_ctx_phase5=gpu_safety_ctx_phase5,
@@ -11320,6 +11504,79 @@ def _configure_worker_logging(logging_level_config: str | None, *, source_hint: 
         logger.info("Worker logging level set to %s", level_name)
     except Exception:
         pass
+
+
+def _attach_run_output_log_handler(output_folder: str | None) -> None:
+    """Mirror worker logs into the run output directory when available."""
+
+    if not output_folder:
+        return
+
+    try:
+        target_dir = Path(str(output_folder)).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / "zemosaic_worker.log"
+    except Exception:
+        return
+
+    try:
+        target_resolved = target_path.resolve()
+    except Exception:
+        target_resolved = target_path
+
+    # Avoid duplicate handlers on the same file path.
+    for handler in list(logger.handlers):
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        try:
+            existing_path = Path(getattr(handler, "baseFilename", "")).resolve()
+        except Exception:
+            continue
+        if existing_path == target_resolved:
+            return
+
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s'
+    )
+    try:
+        fh = logging.FileHandler(str(target_path), mode='w', encoding='utf-8')
+        fh.setLevel(logger.level)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+        logger.info("[LOGCFG] run_output_log_attached path=%s", target_path)
+    except Exception as e:
+        logger.warning("[LOGCFG] run_output_log_attach_failed path=%s reason=%s", target_path, e)
+
+
+def _diagnostics_output_dir_from_cache(worker_config_cache: dict | None) -> Path | None:
+    try:
+        cfg = worker_config_cache or {}
+        output_dir = str(cfg.get("output_dir") or "").strip()
+        if not output_dir:
+            return None
+        out = Path(output_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+    except Exception:
+        return None
+
+
+def _write_json_diagnostic(path: Path, payload: dict) -> None:
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        logger.debug("diagnostic write failed (json): %s", path, exc_info=logger.isEnabledFor(logging.DEBUG))
+
+
+def _write_csv_diagnostic(path: Path, header: list[str], rows: list[list[Any]]) -> None:
+    try:
+        with path.open('w', encoding='utf-8', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for r in rows:
+                w.writerow(r)
+    except Exception:
+        logger.debug("diagnostic write failed (csv): %s", path, exc_info=logger.isEnabledFor(logging.DEBUG))
 
 # --- Alignment Warning Tracking ---
 # These warnings come from zemosaic_align_stack when an image fails to align.
@@ -15336,6 +15593,8 @@ def assemble_final_mosaic_incremental(
     intertile_affine_blend: float = 1.0,
     use_auto_intertile: bool = False,
     intertile_force_safe_mode: bool | None = None,
+    intertile_prune_k: int = 8,
+    intertile_prune_weight_mode: str = "area",
     match_background: bool = True,
     feather_parity: bool = False,
     use_radial_feather: bool | None = None,
@@ -15488,6 +15747,8 @@ def assemble_final_mosaic_incremental(
                 intertile_global_recenter=bool(intertile_global_recenter),
                 intertile_recenter_clip=intertile_recenter_clip,
                 force_safe_mode=intertile_force_safe_mode,
+                intertile_prune_k=int(intertile_prune_k),
+                intertile_prune_weight_mode=str(intertile_prune_weight_mode),
                 cpu_workers=(
                     int(processing_threads)
                     if processing_threads and int(processing_threads) > 0
@@ -15979,6 +16240,8 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_affine_blend: float = 1.0,
     use_auto_intertile: bool = False,
     intertile_force_safe_mode: bool | None = None,
+    intertile_prune_k: int = 8,
+    intertile_prune_weight_mode: str = "area",
     collect_tile_data: list | None = None,
     tile_affine_corrections: list[tuple[float, float]] | None = None,
     global_anchor_shift: tuple[float, float] | None = None,
@@ -15994,12 +16257,18 @@ def assemble_final_mosaic_reproject_coadd(
     radial_feather_fraction: float = 0.8,
     radial_shape_power: float = 2.0,
     min_radial_weight_floor: float = 0.0,
+    tile_weight_v4_enabled: bool = False,
+    tile_weight_v4_curve: str = "sqrt",
+    tile_weight_v4_strength: float = 1.0,
+    tile_weight_v4_min: float = 0.75,
+    tile_weight_v4_max: float = 1.35,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
     worker_config_cache = worker_config_cache or {}
+    diagnostics_output_dir = _diagnostics_output_dir_from_cache(worker_config_cache)
 
     _log_memory_usage(progress_callback, "Début assemble_final_mosaic_reproject_coadd")
     _pcb(
@@ -16263,6 +16532,36 @@ def assemble_final_mosaic_reproject_coadd(
                 return value_f
         return None
 
+    def _apply_tile_weight_v4(weights: list[float]) -> list[float]:
+        if not tile_weight_v4_enabled or not weights:
+            return weights
+        arr = np.asarray(weights, dtype=np.float64)
+        with np.errstate(invalid="ignore"):
+            arr = np.where(np.isfinite(arr) & (arr > 0.0), arr, 1.0)
+        med = float(np.median(arr)) if arr.size else 1.0
+        if not math.isfinite(med) or med <= 0.0:
+            med = 1.0
+        norm = arr / med
+        curve = str(tile_weight_v4_curve or "sqrt").strip().lower()
+        try:
+            strength = float(tile_weight_v4_strength)
+        except Exception:
+            strength = 1.0
+        strength = min(max(strength, 0.0), 2.0)
+        if curve == "log":
+            transformed = 1.0 + np.log1p(np.maximum(0.0, norm - 1.0))
+        elif curve == "softcap":
+            transformed = 1.0 + (norm - 1.0) / (1.0 + np.abs(norm - 1.0))
+        else:
+            transformed = np.sqrt(np.maximum(norm, 1e-6))
+        transformed = 1.0 + strength * (transformed - 1.0)
+        lo = float(tile_weight_v4_min) if math.isfinite(float(tile_weight_v4_min)) else 0.75
+        hi = float(tile_weight_v4_max) if math.isfinite(float(tile_weight_v4_max)) else 1.35
+        if lo > hi:
+            lo, hi = hi, lo
+        transformed = np.clip(transformed, lo, hi)
+        return transformed.astype(np.float64).tolist()
+
 
     effective_tiles: list[dict[str, Any]] = []
     hdr_for_output = None
@@ -16480,6 +16779,42 @@ def assemble_final_mosaic_reproject_coadd(
         if idx == 1 or (idx % 5 == 0) or (idx == total_tiles_for_prep):
             _update_eta_prepare(idx, total_tiles_for_prep)
 
+
+    if tile_weighting_active and tile_weight_values:
+        tile_weight_values = _apply_tile_weight_v4(tile_weight_values)
+
+    if tile_weight_values and len(tile_weight_values) == len(effective_tiles):
+        for _idx, _tw_eff in enumerate(tile_weight_values):
+            try:
+                effective_tiles[_idx]["tile_weight_effective"] = float(_tw_eff)
+            except Exception:
+                effective_tiles[_idx]["tile_weight_effective"] = 1.0
+
+    if diagnostics_output_dir is not None and effective_tiles:
+        rows = []
+        for _entry in effective_tiles:
+            _raw = _entry.get("tile_weight", 1.0) if isinstance(_entry, dict) else 1.0
+            _eff = _entry.get("tile_weight_effective", _raw) if isinstance(_entry, dict) else _raw
+            try:
+                _raw = float(_raw)
+            except Exception:
+                _raw = 1.0
+            try:
+                _eff = float(_eff)
+            except Exception:
+                _eff = _raw
+            rows.append([
+                str(_entry.get("tile_id", "")),
+                str(_entry.get("path", "")),
+                _raw,
+                _eff,
+                bool(_entry.get("alpha_weight2d") is not None),
+            ])
+        _write_csv_diagnostic(
+            diagnostics_output_dir / "tile_weights_final.csv",
+            ["tile_id", "path", "tile_weight_raw", "tile_weight_effective", "has_alpha_weight2d"],
+            rows,
+        )
 
     tile_weighting_applied = tile_weighting_active and bool(tile_weight_values)
     if tile_weighting_applied:
@@ -16958,6 +17293,8 @@ def assemble_final_mosaic_reproject_coadd(
                 intertile_recenter_clip=intertile_recenter_clip,
                 tile_weights=tile_weights_for_sources,
                 force_safe_mode=intertile_force_safe_mode,
+                intertile_prune_k=int(intertile_prune_k),
+                intertile_prune_weight_mode=str(intertile_prune_weight_mode),
                 cpu_workers=(
                     int(assembly_process_workers)
                     if assembly_process_workers and int(assembly_process_workers) > 0
@@ -17049,6 +17386,18 @@ def assemble_final_mosaic_reproject_coadd(
         pending_affine_list = None
 
     if pending_affine_list and affine_by_id:
+        if diagnostics_output_dir is not None:
+            _rows_aff = []
+            for _entry in effective_tiles:
+                _tid = str(_entry.get("tile_id", ""))
+                _gain, _off = affine_by_id.get(_tid, (1.0, 0.0))
+                _rows_aff.append([_tid, float(_gain), float(_off)])
+            _write_csv_diagnostic(
+                diagnostics_output_dir / "intertile_affine_corrections.csv",
+                ["tile_id", "gain", "offset"],
+                _rows_aff,
+            )
+
         tile_affine_for_gpu = pending_affine_list
         affine_summary = _log_affine_photometric_summary(
             affine_by_id,
@@ -19393,6 +19742,8 @@ def run_hierarchical_mosaic_classic_legacy(
     intertile_recenter_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile_config: bool = False,
     intertile_force_safe_mode_config: bool = False,
+    intertile_prune_k_config: int = 8,
+    intertile_prune_weight_mode_config: str = "area",
     match_background_for_final_config: bool = True,
     incremental_feather_parity_config: bool = False,
     two_pass_coverage_renorm_config: bool = False,
@@ -19695,6 +20046,7 @@ def run_hierarchical_mosaic_classic_legacy(
         cleanup_temp_artifacts_config = True
 
     _configure_worker_logging(logging_level_config, source_hint="qt_gui_dropdown")
+    _attach_run_output_log_handler(output_folder)
 
     # --- Harmoniser les méthodes de pondération issues du GUI / CLI / fallback config ---
     requested_stack_weight_method = stack_weight_method
@@ -20775,6 +21127,40 @@ def run_hierarchical_mosaic_classic_legacy(
                         existing_master_tiles_results.append((str(candidate), wcs_obj))
 
                 if len(existing_master_tiles_results) >= 2:
+                    existing_mt_qg_enabled = bool((worker_config_cache or {}).get("existing_master_tiles_quality_gate_enabled", True))
+                    existing_mt_qg_mode = str((worker_config_cache or {}).get("existing_master_tiles_quality_gate_mode", "warn") or "warn").strip().lower()
+                    if existing_mt_qg_mode not in {"warn", "fail"}:
+                        existing_mt_qg_mode = "warn"
+                    existing_mt_qg_sigma = float((worker_config_cache or {}).get("existing_master_tiles_quality_gate_sigma_threshold", 8.0) or 8.0)
+                    existing_mt_qg_ratio = float((worker_config_cache or {}).get("existing_master_tiles_quality_gate_ratio_threshold", 5000.0) or 5000.0)
+                    existing_mt_qg_min_valid = float((worker_config_cache or {}).get("existing_master_tiles_quality_gate_min_valid_frac", 0.05) or 0.05)
+
+                    precheck = _scan_existing_master_tiles_quality(
+                        existing_master_tiles_results,
+                        enabled=existing_mt_qg_enabled,
+                        mode=existing_mt_qg_mode,
+                        sigma_threshold=existing_mt_qg_sigma,
+                        ratio_threshold=existing_mt_qg_ratio,
+                        min_valid_frac=existing_mt_qg_min_valid,
+                        pcb=pcb,
+                    )
+                    if precheck.get("suspect", 0) > 0:
+                        logger.warning(
+                            "[ExistingMasterQG] suspect=%d/%d mode=%s",
+                            int(precheck.get("suspect", 0)),
+                            int(precheck.get("total", 0)),
+                            existing_mt_qg_mode,
+                        )
+                    if existing_mt_qg_enabled and existing_mt_qg_mode == "fail" and int(precheck.get("suspect", 0)) > 0:
+                        pcb(
+                            "run_error_existing_master_tiles_quality_gate_failed",
+                            prog=None,
+                            lvl="ERROR",
+                            suspect=int(precheck.get("suspect", 0)),
+                            total=int(precheck.get("total", 0)),
+                        )
+                        return
+
                     use_existing_master_tiles_mode = True
                     pcb(
                         "run_info_existing_master_tiles_mode",
@@ -22303,6 +22689,8 @@ def run_hierarchical_mosaic_classic_legacy(
             "intertile_affine_blend": float((worker_config_cache or {}).get("intertile_affine_blend", 1.0) or 1.0),
             "use_auto_intertile": use_auto_intertile_config,
             "intertile_force_safe_mode": intertile_force_safe_mode_config,
+            "intertile_prune_k": intertile_prune_k_config,
+            "intertile_prune_weight_mode": intertile_prune_weight_mode_config,
             "coadd_use_memmap": coadd_use_memmap_config,
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
@@ -25306,6 +25694,7 @@ def run_hierarchical_mosaic(
         cleanup_temp_artifacts_config = True
 
     _configure_worker_logging(logging_level_config, source_hint="qt_gui_dropdown")
+    _attach_run_output_log_handler(output_folder)
 
     try:
         batch_overlap_pct_config = float(worker_config_cache.get("batch_overlap_pct", 0.0))
@@ -27226,6 +27615,8 @@ def run_hierarchical_mosaic(
             "intertile_recenter_clip": intertile_recenter_clip_tuple,
             "use_auto_intertile": use_auto_intertile_config,
             "intertile_force_safe_mode": intertile_force_safe_mode_config,
+            "intertile_prune_k": intertile_prune_k_config,
+            "intertile_prune_weight_mode": intertile_prune_weight_mode_config,
             "coadd_use_memmap": coadd_use_memmap_config,
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
@@ -31927,6 +32318,20 @@ def assemble_global_mosaic_sds(
         )
     except Exception:
         pass
+
+    if diagnostics_output_dir is not None:
+        _payload = {
+            "tile_count": int(len(effective_tiles)) if 'effective_tiles' in locals() else 0,
+            "tile_weighting_active": bool(tile_weighting_active) if 'tile_weighting_active' in locals() else False,
+            "tile_weighting_applied": bool(tile_weighting_applied) if 'tile_weighting_applied' in locals() else False,
+            "tile_weight_mode": str(weight_mode_normalized) if 'weight_mode_normalized' in locals() else "n_frames",
+            "intertile_photometric_match": bool(intertile_photometric_match) if 'intertile_photometric_match' in locals() else False,
+            "intertile_prune_k": int(intertile_prune_k) if 'intertile_prune_k' in locals() else 0,
+            "intertile_prune_weight_mode": str(intertile_prune_weight_mode) if 'intertile_prune_weight_mode' in locals() else "",
+            "affine_solution_present": bool(pending_affine_list) if 'pending_affine_list' in locals() else False,
+            "affine_nontrivial": bool(nontrivial_affine) if 'nontrivial_affine' in locals() else False,
+        }
+        _write_json_diagnostic(diagnostics_output_dir / "intertile_residuals_summary.json", _payload)
 
     return final_image, final_coverage, final_alpha
 

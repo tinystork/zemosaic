@@ -1,0 +1,54 @@
+{
+  "output_dir": "/media/tristan/X10 Pro/mosaic/andromeda/out/V4 RUN C SEAMS INSTRUMENTED",
+  "logging_level": "DEBUG",
+
+  "use_existing_master_tiles": true,
+  "enable_resource_telemetry": true,
+  "resource_telemetry_interval_sec": 1.5,
+  "resource_telemetry_log_to_csv": true,
+  "cache_retention": "keep",
+  "cleanup_temp_artifacts": false,
+  "coadd_cleanup_memmap": false,
+
+  "two_pass_coverage_renorm": true,
+  "two_pass_cov_sigma_px": 50,
+  "two_pass_cov_gain_clip": [0.85, 1.18],
+
+  "intertile_photometric_match": true,
+  "use_auto_intertile": true,
+  "intertile_preview_size": 512,
+  "intertile_overlap_min": 0.05,
+  "intertile_prune_k": 8,
+  "intertile_prune_weight_mode": "area",
+  "intertile_sky_percentile": [30.0, 70.0],
+  "intertile_robust_clip_sigma": 2.0,
+  "intertile_global_recenter": true,
+  "intertile_recenter_clip": [0.96, 1.04],
+  "intertile_affine_blend": 0.4,
+
+  "enable_tile_weighting": true,
+  "tile_weight_mode": "n_frames",
+  "tile_weight_v4_enabled": false,
+  "tile_weight_v4_curve": "sqrt",
+  "tile_weight_v4_strength": 1.0,
+  "tile_weight_v4_min": 0.75,
+  "tile_weight_v4_max": 1.35,
+
+  "match_background_for_final": true,
+  "apply_radial_weight": true,
+  "radial_feather_fraction": 0.94,
+  "radial_shape_power": 2.6,
+
+  "poststack_equalize_rgb": false,
+  "final_mosaic_rgb_equalize_enabled": false,
+  "final_mosaic_black_point_equalize_enabled": false,
+  "final_mosaic_black_point_percentile": 0.0,
+
+  "phase5_chunk_auto": true,
+  "phase5_chunk_mb": 1024,
+  "parallel_autotune_enabled": true,
+  "parallel_target_ram_fraction": 0.9,
+  "parallel_gpu_vram_fraction": 0.8,
+  "use_gpu_phase5": true,
+  "use_gpu_grid": true
+}

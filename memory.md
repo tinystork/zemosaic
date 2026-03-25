@@ -529,3 +529,99 @@ Consigne durable:
 - patchs chirurgicaux;
 - tout nouveau levier sensible config-gated;
 - `memory.md` à jour à chaque itération significative.
+
+## 2026-03-20 — Proto V4 + centralisation de la connaissance de régression
+
+Décision utilisateur: centraliser les rappels critiques dans `memory.md` pour éviter l'éparpillement (au lieu de dépendre de notes isolées).
+
+### Ce qui a été fait aujourd'hui
+- Ajout d'un proto **Weighting V4** config-gated (OFF par défaut):
+  - `tile_weight_v4_enabled`
+  - `tile_weight_v4_curve`
+  - `tile_weight_v4_strength`
+  - `tile_weight_v4_min`
+  - `tile_weight_v4_max`
+- Pruning intertile rendu configurable en runtime:
+  - `intertile_prune_k`
+  - `intertile_prune_weight_mode` (`area|strength|hybrid`)
+- RUN A préparé dans `zemosaic_config.json` (V4 OFF + prune explicite).
+- Bug de régression corrigé juste après patch: `NameError: intertile_prune_k_config is not defined` (signature `run_hierarchical_mosaic` complétée).
+
+### Leçon durable (issue de `fix_regression.md`)
+Le pipeline est **intriqué**: un patch local sur la voie Classic peut casser SDS/ZeGrid ou des wrappers partagés.
+
+Règle durable à garder en tête avant chaque modif Classic:
+1. Repérer les fonctions partagées touchées (surtout `zemosaic_worker.py` / utilitaires communs).
+2. Préférer les changements config-gated et réversibles.
+3. Exiger preuve minimale multi-voies (Classic + ZeGrid + SDS) après patch.
+4. Documenter immédiatement dans `memory.md` le diff, le risque, et la preuve.
+
+### Source de vérité opérationnelle
+- `memory.md` devient la référence centrale pour:
+  - décisions techniques durables,
+  - alertes de régression connues,
+  - discipline de validation après patch.
+
+
+## 2026-03-23 — Incident NGC6888 (existing master tiles) + clarification quality gate
+
+### Résultat terrain validé
+- Run `NGC6888_3` produit une image correcte (seams absents) après exclusion des tuiles master aberrantes.
+- Sortie validée: `zemosaic_MT124_R0.fits` + preview associée.
+
+### Root cause opérationnelle observée
+- Le run dégradé ("bouillie grise") provenait d'une master tile extrême dans les masters existants:
+  - `master_tile_125.fits` avec médianes ~`1.44e8` (ordre de grandeur anormal vs autres tuiles ~`1e2..1e3`).
+- Corrélation log confirmée côté worker:
+  - outlier massif sur la tuile finale chargée (`idx=124` dans le run à 125 tuiles),
+  - deltas photométriques TwoPass extrêmes (`TwoPassWorst`),
+  - contamination du coadd final.
+
+### Quality gate — état réel du câblage
+Constat important pour la mission principale:
+1. Le quality gate ZeQualityMT est bien présent et câblé (GUI -> config -> worker -> décision accept/reject).
+2. Mais il s'applique au moment de la création de master tiles (Phase 3), pas à la validation des masters déjà existantes chargées depuis disque.
+3. Sur les runs `NGC6888_2` / `NGC6888_3`, il était de toute façon désactivé (`quality_gate_enabled=false` dans `run_config_snapshot.json`).
+4. Si le module `zequalityMT` est indisponible, le worker continue en mode dégradé (warning + pas de gate bloquant).
+
+### Conséquence mission
+- Le quality gate actuel ne protège pas le flux `use_existing_master_tiles=true` contre une tuile master photométriquement aberrante.
+- Priorité mission: fiabiliser ce maillon sans dévier du pivot principal (instrumentation réelle + graph/weighting), via un garde-fou spécifique au chargement des existing master tiles avant Phase 5.
+
+## 2026-03-23 12:28+ — Implémentation one-pass: quality gate pour existing master tiles
+
+Livraison réalisée en une passe (scope chirurgical, mission principale):
+
+### Changements code
+- `zemosaic_worker.py`
+  - Ajout d'un pré-check qualité dédié aux **existing master tiles** avant activation du mode existing:
+    - `_existing_master_tile_robust_stats(...)`
+    - `_scan_existing_master_tiles_quality(...)`
+  - Le pré-check calcule des stats robustes par tuile (valid_frac, median, max_abs, ratio max/median, z-score robuste sur log-médiane inter-tiles).
+  - Ajout d'une politique de décision configurable:
+    - `existing_master_tiles_quality_gate_mode = warn|fail`
+    - en `warn`: run continue avec alertes explicites
+    - en `fail`: arrêt propre avant coadd (`run_error_existing_master_tiles_quality_gate_failed`)
+  - Logs ajoutés:
+    - `run_info_existing_master_tiles_quality_precheck`
+    - `run_warn_existing_master_tile_suspect`
+
+- `zemosaic_config.py`
+  - Ajout des defaults persistés:
+    - `existing_master_tiles_quality_gate_enabled` (default `True`)
+    - `existing_master_tiles_quality_gate_mode` (default `"warn"`)
+    - `existing_master_tiles_quality_gate_sigma_threshold` (default `8.0`)
+    - `existing_master_tiles_quality_gate_ratio_threshold` (default `5000.0`)
+    - `existing_master_tiles_quality_gate_min_valid_frac` (default `0.05`)
+
+- `zemosaic_config.json`
+  - clés ajoutées pour activer le nouveau pré-check en runtime sans UI additionnelle.
+
+### Validation technique
+- Compilation statique OK:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_config.py`
+- Vérification présence câblage/logs par grep: OK (`run_info_existing_master_tiles_quality_precheck`, `run_warn_existing_master_tile_suspect`, mode `warn|fail`).
+
+### Impact mission
+- Le flux `use_existing_master_tiles=true` n'est plus aveugle aux outliers photométriques massifs.
+- Le risque "bouillie grise" due à une master tile catastrophique est désormais détecté explicitement avant Phase 5 (warn/fail selon politique).
