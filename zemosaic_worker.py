@@ -22701,6 +22701,11 @@ def run_hierarchical_mosaic_classic_legacy(
             "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,
             "tile_weight_mode": tile_weight_mode_config,
+            "tile_weight_v4_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_enabled", False)),
+            "tile_weight_v4_curve": str((worker_config_cache or {}).get("tile_weight_v4_curve", "sqrt") or "sqrt"),
+            "tile_weight_v4_strength": float((worker_config_cache or {}).get("tile_weight_v4_strength", 1.0) or 1.0),
+            "tile_weight_v4_min": float((worker_config_cache or {}).get("tile_weight_v4_min", 0.75) or 0.75),
+            "tile_weight_v4_max": float((worker_config_cache or {}).get("tile_weight_v4_max", 1.35) or 1.35),
             "existing_master_tiles_mode": bool(use_existing_master_tiles_mode),
         }
 
@@ -27627,6 +27632,11 @@ def run_hierarchical_mosaic(
             "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,
             "tile_weight_mode": tile_weight_mode_config,
+            "tile_weight_v4_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_enabled", False)),
+            "tile_weight_v4_curve": str((worker_config_cache or {}).get("tile_weight_v4_curve", "sqrt") or "sqrt"),
+            "tile_weight_v4_strength": float((worker_config_cache or {}).get("tile_weight_v4_strength", 1.0) or 1.0),
+            "tile_weight_v4_min": float((worker_config_cache or {}).get("tile_weight_v4_min", 0.75) or 0.75),
+            "tile_weight_v4_max": float((worker_config_cache or {}).get("tile_weight_v4_max", 1.35) or 1.35),
         }
 
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:
