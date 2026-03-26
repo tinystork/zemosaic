@@ -11,8 +11,8 @@
     "preferred_gui_backend_explicit": false,
     "qt_theme_mode": "dark",
     "qt_main_window_geometry": [
-        7,
-        30,
+        0,
+        0,
         899,
         931
     ],
