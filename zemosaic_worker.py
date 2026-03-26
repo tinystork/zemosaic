@@ -8103,6 +8103,7 @@ def _compute_intertile_affine_corrections_from_sources(
     intertile_pair_gain_clip: tuple[float, float] | list[float] = (0.5, 2.0),
     intertile_pair_offset_abs_max: float = 5000.0,
     intertile_max_irls_iters: int = 3,
+    intertile_enforce_requested_solver: bool = False,
 ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
     """Common implementation for intertile gain/offset computation.
 
@@ -8391,6 +8392,7 @@ def _compute_intertile_affine_corrections_from_sources(
             pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
             pair_offset_abs_max=float(intertile_pair_offset_abs_max),
             max_irls_iters=int(intertile_max_irls_iters),
+            enforce_requested_solver=bool(intertile_enforce_requested_solver),
         )
     except Exception as exc:
         if cpu_workers and cpu_workers > 1 and not force_safe_mode:
@@ -8423,6 +8425,14 @@ def _compute_intertile_affine_corrections_from_sources(
                     max_neighbors_per_tile=int(intertile_prune_k),
                     prune_weight_mode=str(intertile_prune_weight_mode),
                     offset_only_v1=bool(intertile_offset_only_v1),
+                    gain_offset_v2=bool(intertile_gain_offset_v2),
+                    gain_prior_lambda=float(intertile_gain_prior_lambda),
+                    gain_clip=tuple(intertile_gain_clip) if isinstance(intertile_gain_clip, (list, tuple)) and len(intertile_gain_clip) >= 2 else (0.90, 1.10),
+                    offset_clip=tuple(intertile_offset_clip) if isinstance(intertile_offset_clip, (list, tuple)) and len(intertile_offset_clip) >= 2 else (-2000.0, 2000.0),
+                    pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
+                    pair_offset_abs_max=float(intertile_pair_offset_abs_max),
+                    max_irls_iters=int(intertile_max_irls_iters),
+                    enforce_requested_solver=bool(intertile_enforce_requested_solver),
                 )
             except Exception as exc_single:
                 if logger_obj:
@@ -9935,6 +9945,14 @@ def _run_shared_phase45_phase5_pipeline(
     intertile_pair_gain_clip_config = phase5_options.get("intertile_pair_gain_clip") or (0.5, 2.0)
     intertile_pair_offset_abs_max_config = float(phase5_options.get("intertile_pair_offset_abs_max") or 5000.0)
     intertile_max_irls_iters_config = int(phase5_options.get("intertile_max_irls_iters") or 3)
+    intertile_enforce_requested_solver_config = bool(phase5_options.get("intertile_enforce_requested_solver"))
+    intertile_gain_offset_v2_config = bool(phase5_options.get("intertile_gain_offset_v2"))
+    intertile_gain_prior_lambda_config = float(phase5_options.get("intertile_gain_prior_lambda") or 0.02)
+    intertile_gain_clip_config = phase5_options.get("intertile_gain_clip") or (0.90, 1.10)
+    intertile_offset_clip_config = phase5_options.get("intertile_offset_clip") or (-2000.0, 2000.0)
+    intertile_pair_gain_clip_config = phase5_options.get("intertile_pair_gain_clip") or (0.5, 2.0)
+    intertile_pair_offset_abs_max_config = float(phase5_options.get("intertile_pair_offset_abs_max") or 5000.0)
+    intertile_max_irls_iters_config = int(phase5_options.get("intertile_max_irls_iters") or 3)
     coadd_use_memmap_config = bool(phase5_options.get("coadd_use_memmap"))
     coadd_memmap_dir_config = phase5_options.get("coadd_memmap_dir")
     start_time_total = start_time_total_run
@@ -10208,6 +10226,7 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_pair_gain_clip=tuple(intertile_pair_gain_clip_config) if isinstance(intertile_pair_gain_clip_config, (list, tuple)) and len(intertile_pair_gain_clip_config) >= 2 else (0.5, 2.0),
                 intertile_pair_offset_abs_max=float(intertile_pair_offset_abs_max_config),
                 intertile_max_irls_iters=int(intertile_max_irls_iters_config),
+                intertile_enforce_requested_solver=bool(intertile_enforce_requested_solver_config),
                 match_background=match_background_flag,
                 feather_parity=feather_parity_flag,
                 two_pass_coverage_renorm=two_pass_coverage_renorm_config,
@@ -10529,6 +10548,7 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_pair_gain_clip=tuple(intertile_pair_gain_clip_config) if isinstance(intertile_pair_gain_clip_config, (list, tuple)) and len(intertile_pair_gain_clip_config) >= 2 else (0.5, 2.0),
                 intertile_pair_offset_abs_max=float(intertile_pair_offset_abs_max_config),
                 intertile_max_irls_iters=int(intertile_max_irls_iters_config),
+                intertile_enforce_requested_solver=bool(intertile_enforce_requested_solver_config),
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
                 phase45_enabled=phase45_active_flag,
@@ -15806,6 +15826,7 @@ def assemble_final_mosaic_incremental(
                 intertile_pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
                 intertile_pair_offset_abs_max=float(intertile_pair_offset_abs_max),
                 intertile_max_irls_iters=int(intertile_max_irls_iters),
+                intertile_enforce_requested_solver=bool(intertile_enforce_requested_solver),
                 cpu_workers=(
                     int(processing_threads)
                     if processing_threads and int(processing_threads) > 0
@@ -17368,6 +17389,7 @@ def assemble_final_mosaic_reproject_coadd(
                 intertile_pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
                 intertile_pair_offset_abs_max=float(intertile_pair_offset_abs_max),
                 intertile_max_irls_iters=int(intertile_max_irls_iters),
+                intertile_enforce_requested_solver=bool(intertile_enforce_requested_solver),
                 cpu_workers=(
                     int(assembly_process_workers)
                     if assembly_process_workers and int(assembly_process_workers) > 0

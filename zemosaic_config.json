@@ -273,5 +273,6 @@
         1.8
     ],
     "intertile_pair_offset_abs_max": 5000.0,
-    "intertile_max_irls_iters": 4
+    "intertile_max_irls_iters": 4,
+    "intertile_enforce_requested_solver": true
 }

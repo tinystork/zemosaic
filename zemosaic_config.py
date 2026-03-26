@@ -262,6 +262,7 @@ DEFAULT_CONFIG = {
     "intertile_pair_gain_clip": [0.5, 2.0],
     "intertile_pair_offset_abs_max": 5000.0,
     "intertile_max_irls_iters": 3,
+    "intertile_enforce_requested_solver": False,
     "intertile_global_recenter": True,
     "force_resolve_existing_wcs": False,
     "intertile_recenter_clip": [0.85, 1.18],

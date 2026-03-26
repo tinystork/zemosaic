@@ -2293,6 +2293,7 @@ def solve_global_affine_v2(
     pair_gain_clip: tuple[float, float] = (0.5, 2.0),
     pair_offset_abs_max: float = 5000.0,
     max_irls_iters: int = 3,
+    enforce_requested_solver: bool = False,
 ):
     """Robust global solve for per-tile gain+offset with conservative guards (M2)."""
 
@@ -2539,6 +2540,7 @@ def compute_intertile_affine_calibration(
     pair_gain_clip: tuple[float, float] = (0.5, 2.0),
     pair_offset_abs_max: float = 5000.0,
     max_irls_iters: int = 3,
+    enforce_requested_solver: bool = False,
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
 
@@ -3385,6 +3387,11 @@ def compute_intertile_affine_calibration(
         except Exception:
             pass
 
+    if bool(gain_offset_v2):
+        _log_intertile(
+            f"M2 request: pair_entries={len(pair_entries)} enforce={bool(enforce_requested_solver)}",
+            level="INFO",
+        )
     if bool(gain_offset_v2) and pair_entries:
         sol_m2, diag_m2 = solve_global_affine_v2(
             num_tiles,
@@ -3462,6 +3469,13 @@ def compute_intertile_affine_calibration(
 
         if offsets_sol:
             return {idx: (1.0, float(offsets_sol.get(idx, 0.0))) for idx in range(num_tiles)}
+
+    if bool(gain_offset_v2) and bool(enforce_requested_solver):
+        _log_intertile(
+            "M2 requested but not applied (no usable pair entries or empty solution) — aborting by policy",
+            level="ERROR",
+        )
+        raise RuntimeError("M2 requested but not applied")
 
     solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
     if progress_callback:
