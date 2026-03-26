@@ -1,6 +1,6 @@
 {
-    "astap_executable_path": "C:\\Program Files\\astap\\astap.exe",
-    "astap_data_directory_path": "C:\\Program Files\\astap",
+    "astap_executable_path": "/usr/local/bin/astap",
+    "astap_data_directory_path": "/usr/local/bin",
     "astap_default_search_radius": 3.0,
     "astap_default_downsample": 2,
     "astap_default_sensitivity": 100,
@@ -24,9 +24,9 @@
     ],
     "qt_main_columns_state": "AAAA/wAAAAEAAAACAAABeQAAAeUA/////wEAAAABAA==",
     "qt_main_left_state": "AAAA/wAAAAEAAAADAAAB3QAAAQwAAAE0AP////8BAAAAAgA=",
-    "input_dir": "C:/Users/TRISTAN/Desktop/astrophoto/andromeda/alllights/Seestar S50/EQ",
-    "output_dir": "C:/Users/TRISTAN/Desktop/astrophoto/andromeda/out/test run D",
-    "use_existing_master_tiles": false,
+    "input_dir": "/media/tristan/X10 Pro/mosaic/test/test run D/zemosaic_temp_master_tiles",
+    "output_dir": "/media/tristan/X10 Pro/mosaic/test/test run E",
+    "use_existing_master_tiles": true,
     "num_processing_workers": 0,
     "grid_workers": 0,
     "stacking_normalize_method": "linear_fit",
@@ -90,7 +90,7 @@
     "use_gpu_phase5": true,
     "use_gpu_grid": true,
     "gpu_id_phase5": 0,
-    "gpu_selector": "NVIDIA GeForce RTX 3070 Laptop GPU",
+    "gpu_selector": "NVIDIA GeForce MX150",
     "gpu_hybrid_vram_guard": true,
     "phase5_chunk_auto": true,
     "phase5_chunk_mb": 1024,
@@ -197,13 +197,13 @@
     "intertile_robust_clip_sigma": 2.0,
     "intertile_prune_k": 8,
     "intertile_prune_weight_mode": "area",
-    "intertile_global_recenter": true,
+    "intertile_global_recenter": false,
     "force_resolve_existing_wcs": false,
     "intertile_recenter_clip": [
         0.96,
         1.04
     ],
-    "intertile_affine_blend": 0.4,
+    "intertile_affine_blend": 1.0,
     "use_auto_intertile": true,
     "match_background_for_final": true,
     "incremental_feather_parity": true,
@@ -256,5 +256,6 @@
     "astrometry_downsample": 2,
     "cluster_target_groups": 0,
     "cluster_orientation_split_deg": 0.0,
-    "gpu_eta_profiles": {}
+    "gpu_eta_profiles": {},
+    "intertile_offset_only_v1": true
 }
