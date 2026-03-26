@@ -3396,3 +3396,20 @@ Exploration only, no mission started yet.
   - snapshot config confirme DBE actif via GUI: `final_mosaic_dbe_enabled=true`, `final_mosaic_dbe_strength="normal"`.
 - Checklist: F3.1 ✅, F3.2 ✅.
 - Statut: Q4 (ZeGrid DBE) opérationnel et validé en run réel + validation visuelle utilisateur.
+
+### 2026-03-26 — Pivot intertile: impasse M1 confirmée, M2 implémenté
+
+- Analyse runs D/E: M1 offset-only n'a pas réduit les seams de façon utile sur le dataset hétérogène (variation surtout en offset global, pas en continuité locale visible).
+- Décision: M1 rétrogradé en baseline diagnostic; passage en priorité à M2 (gain+offset robuste).
+- Implémentation M2 livrée:
+  - nouveau solveur robuste `solve_global_affine_v2` dans `zemosaic_utils.py` (ancre, IRLS, rejet paires hors bornes, régularisation gain, clamps gain/offset),
+  - nouveau mode intertile config-gated: `intertile_gain_offset_v2` + paramètres (`intertile_gain_prior_lambda`, `intertile_gain_clip`, `intertile_offset_clip`, `intertile_pair_gain_clip`, `intertile_pair_offset_abs_max`, `intertile_max_irls_iters`),
+  - logs dédiés: `M2 gain+offset solve ...` + `M2 worst[...]`.
+- Config de test préparée dans `zemosaic_config.json` pour run M2 direct:
+  - `intertile_gain_offset_v2=true`,
+  - `intertile_offset_only_v1=false`,
+  - `intertile_photometric_match=true`,
+  - `intertile_global_recenter=false`,
+  - clips/garde-fous conservateurs activés.
+- Prochaine étape: lancer run M2 (C) et comparer métriques/logs vs run E.
+

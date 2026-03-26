@@ -2281,6 +2281,195 @@ def solve_global_offsets_v1(num_tiles: int, offset_entries, anchor_index: int = 
         "worst": worst[:5],
     }
 
+
+
+def solve_global_affine_v2(
+    num_tiles: int,
+    pair_entries,
+    anchor_index: int = 0,
+    gain_prior_lambda: float = 0.02,
+    gain_clip: tuple[float, float] = (0.90, 1.10),
+    offset_clip: tuple[float, float] = (-2000.0, 2000.0),
+    pair_gain_clip: tuple[float, float] = (0.5, 2.0),
+    pair_offset_abs_max: float = 5000.0,
+    max_irls_iters: int = 3,
+):
+    """Robust global solve for per-tile gain+offset with conservative guards (M2)."""
+
+    defaults = {i: (1.0, 0.0) for i in range(max(0, int(num_tiles)))}
+    if num_tiles <= 0:
+        return {}, {"constraints": 0, "kept": 0, "rejected": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+    if not pair_entries:
+        return defaults, {"constraints": 0, "kept": 0, "rejected": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+    try:
+        gmin, gmax = float(gain_clip[0]), float(gain_clip[1])
+    except Exception:
+        gmin, gmax = 0.90, 1.10
+    if gmin > gmax:
+        gmin, gmax = gmax, gmin
+
+    try:
+        bmin, bmax = float(offset_clip[0]), float(offset_clip[1])
+    except Exception:
+        bmin, bmax = -2000.0, 2000.0
+    if bmin > bmax:
+        bmin, bmax = bmax, bmin
+
+    try:
+        agmin, agmax = float(pair_gain_clip[0]), float(pair_gain_clip[1])
+    except Exception:
+        agmin, agmax = 0.5, 2.0
+    if agmin > agmax:
+        agmin, agmax = agmax, agmin
+
+    try:
+        b_abs_max = abs(float(pair_offset_abs_max))
+    except Exception:
+        b_abs_max = 5000.0
+    if not np.isfinite(b_abs_max) or b_abs_max <= 0.0:
+        b_abs_max = 5000.0
+
+    anchor = int(max(0, min(int(anchor_index), num_tiles - 1)))
+    total_constraints = 0
+    valid_entries = []
+    for e in pair_entries:
+        total_constraints += 1
+        try:
+            i = int(e[0]); j = int(e[1]); a_ij = float(e[2]); b_ij = float(e[3]); w = float(e[4])
+        except Exception:
+            continue
+        if i < 0 or j < 0 or i >= num_tiles or j >= num_tiles or i == j:
+            continue
+        if not np.isfinite(a_ij) or not np.isfinite(b_ij):
+            continue
+        if a_ij < agmin or a_ij > agmax:
+            continue
+        if abs(b_ij) > b_abs_max:
+            continue
+        if not np.isfinite(w) or w <= 0.0:
+            w = 1.0
+        valid_entries.append((i, j, a_ij, b_ij, max(1e-6, w)))
+
+    if not valid_entries:
+        return defaults, {"constraints": total_constraints, "kept": 0, "rejected": total_constraints, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+    nvars = 2 * num_tiles
+    lam = float(gain_prior_lambda) if np.isfinite(gain_prior_lambda) else 0.02
+    lam = max(0.0, lam)
+    n_iter = max(1, int(max_irls_iters))
+    robust_weights = np.ones(len(valid_entries), dtype=np.float64)
+    sol = np.zeros(nvars, dtype=np.float64)
+
+    for _ in range(n_iter):
+        rows = []
+        rhs = []
+        for k, (i, j, a_ij, b_ij, w) in enumerate(valid_entries):
+            sqrt_w = math.sqrt(max(1e-9, w * float(robust_weights[k])))
+
+            row_gain = np.zeros(nvars, dtype=np.float64)
+            row_gain[i] = -sqrt_w
+            row_gain[j] = a_ij * sqrt_w
+            rows.append(row_gain)
+            rhs.append(0.0)
+
+            row_off = np.zeros(nvars, dtype=np.float64)
+            row_off[num_tiles + i] = sqrt_w
+            row_off[num_tiles + j] = -sqrt_w
+            row_off[j] = -b_ij * sqrt_w
+            rows.append(row_off)
+            rhs.append(0.0)
+
+        row_anchor_gain = np.zeros(nvars, dtype=np.float64)
+        row_anchor_gain[anchor] = 1.0
+        rows.append(row_anchor_gain)
+        rhs.append(1.0)
+
+        row_anchor_off = np.zeros(nvars, dtype=np.float64)
+        row_anchor_off[num_tiles + anchor] = 1.0
+        rows.append(row_anchor_off)
+        rhs.append(0.0)
+
+        if lam > 0.0:
+            reg = math.sqrt(lam)
+            for t in range(num_tiles):
+                if t == anchor:
+                    continue
+                row_reg = np.zeros(nvars, dtype=np.float64)
+                row_reg[t] = reg
+                rows.append(row_reg)
+                rhs.append(reg)
+
+        try:
+            A = np.vstack(rows)
+            b = np.asarray(rhs, dtype=np.float64)
+            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+        except Exception:
+            return defaults, {"constraints": total_constraints, "kept": len(valid_entries), "rejected": total_constraints - len(valid_entries), "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+        gains = np.asarray(sol[:num_tiles], dtype=np.float64)
+        offsets = np.asarray(sol[num_tiles:], dtype=np.float64)
+        if gains.size < num_tiles:
+            gains = np.pad(gains, (0, num_tiles - gains.size), constant_values=1.0)
+        if offsets.size < num_tiles:
+            offsets = np.pad(offsets, (0, num_tiles - offsets.size), constant_values=0.0)
+
+        residual_mag = np.zeros(len(valid_entries), dtype=np.float64)
+        for k, (i, j, a_ij, b_ij, _w) in enumerate(valid_entries):
+            rg = (-gains[i] + a_ij * gains[j])
+            ro = (offsets[i] - offsets[j] - b_ij * gains[j])
+            residual_mag[k] = math.sqrt(float(rg * rg + ro * ro))
+
+        scale = 1.4826 * float(np.nanmedian(np.abs(residual_mag - np.nanmedian(residual_mag)))) if residual_mag.size else 0.0
+        if not np.isfinite(scale) or scale <= 1e-9:
+            break
+        c = 4.685 * scale
+        if c <= 1e-9:
+            break
+        u = residual_mag / c
+        new_w = np.where(u < 1.0, (1.0 - u * u) ** 2, 0.02)
+        robust_weights = np.clip(new_w, 0.02, 1.0)
+
+    gains = np.asarray(sol[:num_tiles], dtype=np.float64)
+    offsets = np.asarray(sol[num_tiles:], dtype=np.float64)
+    if gains.size < num_tiles:
+        gains = np.pad(gains, (0, num_tiles - gains.size), constant_values=1.0)
+    if offsets.size < num_tiles:
+        offsets = np.pad(offsets, (0, num_tiles - offsets.size), constant_values=0.0)
+
+    result = {}
+    for t in range(num_tiles):
+        g = float(gains[t]) if np.isfinite(gains[t]) else 1.0
+        o = float(offsets[t]) if np.isfinite(offsets[t]) else 0.0
+        g = float(np.clip(g, gmin, gmax))
+        o = float(np.clip(o, bmin, bmax))
+        result[t] = (g, o)
+
+    result[anchor] = (1.0, 0.0)
+
+    residual_abs = []
+    worst = []
+    for (i, j, a_ij, b_ij, w) in valid_entries:
+        gi, oi = result.get(i, (1.0, 0.0))
+        gj, oj = result.get(j, (1.0, 0.0))
+        rg = (-gi + a_ij * gj)
+        ro = (oi - oj - b_ij * gj)
+        r = math.sqrt(float(rg * rg + ro * ro))
+        if not np.isfinite(r):
+            continue
+        residual_abs.append(abs(r))
+        worst.append((abs(r), i, j, float(rg), float(ro), float(a_ij), float(b_ij), float(w)))
+
+    worst.sort(key=lambda x: x[0], reverse=True)
+    diag = {
+        "constraints": int(total_constraints),
+        "kept": int(len(valid_entries)),
+        "rejected": int(max(0, total_constraints - len(valid_entries))),
+        "residual_abs": np.asarray(residual_abs, dtype=np.float64),
+        "worst": worst[:5],
+    }
+    return result, diag
+
 # Constants for pruning
 max_neighbors_per_tile = 8
 
@@ -2343,6 +2532,13 @@ def compute_intertile_affine_calibration(
     max_neighbors_per_tile: int = 8,
     prune_weight_mode: str = "area",
     offset_only_v1: bool = False,
+    gain_offset_v2: bool = False,
+    gain_prior_lambda: float = 0.02,
+    gain_clip: tuple[float, float] = (0.90, 1.10),
+    offset_clip: tuple[float, float] = (-2000.0, 2000.0),
+    pair_gain_clip: tuple[float, float] = (0.5, 2.0),
+    pair_offset_abs_max: float = 5000.0,
+    max_irls_iters: int = 3,
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
 
@@ -3188,6 +3384,44 @@ def compute_intertile_affine_calibration(
             )
         except Exception:
             pass
+
+    if bool(gain_offset_v2) and pair_entries:
+        sol_m2, diag_m2 = solve_global_affine_v2(
+            num_tiles,
+            pair_entries,
+            anchor_index=anchor,
+            gain_prior_lambda=float(gain_prior_lambda),
+            gain_clip=tuple(gain_clip) if isinstance(gain_clip, (list, tuple)) and len(gain_clip) >= 2 else (0.90, 1.10),
+            offset_clip=tuple(offset_clip) if isinstance(offset_clip, (list, tuple)) and len(offset_clip) >= 2 else (-2000.0, 2000.0),
+            pair_gain_clip=tuple(pair_gain_clip) if isinstance(pair_gain_clip, (list, tuple)) and len(pair_gain_clip) >= 2 else (0.5, 2.0),
+            pair_offset_abs_max=float(pair_offset_abs_max),
+            max_irls_iters=int(max_irls_iters),
+        )
+        residual_abs = np.asarray(diag_m2.get("residual_abs", []), dtype=np.float64)
+        c_all = int(diag_m2.get("constraints", 0))
+        c_kept = int(diag_m2.get("kept", 0))
+        c_rej = int(diag_m2.get("rejected", 0))
+        if residual_abs.size:
+            res_med = float(np.nanmedian(residual_abs))
+            res_p95 = float(np.nanpercentile(residual_abs, 95))
+        else:
+            res_med = 0.0
+            res_p95 = 0.0
+        _log_intertile(
+            f"M2 gain+offset solve: constraints={c_all} kept={c_kept} rejected={c_rej} residual_abs_med={res_med:.5f} residual_abs_p95={res_p95:.5f}",
+            level="INFO",
+        )
+        for rank, worst in enumerate((diag_m2.get("worst") or [])[:3], 1):
+            try:
+                abs_res, wi, wj, wrg, wro, wa, wb, ww = worst
+                _log_intertile(
+                    f"M2 worst[{rank}] pair={wi}-{wj} abs_res={float(abs_res):.5f} rg={float(wrg):.5f} ro={float(wro):.5f} a={float(wa):.5f} b={float(wb):.5f} w={float(ww):.3f}",
+                    level="INFO",
+                )
+            except Exception:
+                pass
+        if sol_m2:
+            return sol_m2
 
     if bool(offset_only_v1) and pair_entries:
         offset_entries = []

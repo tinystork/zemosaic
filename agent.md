@@ -486,3 +486,22 @@ Pour chaque tuile `t`:
 - stabilité photométrique des étoiles communes,
 - pas de régression géométrique / couleur / modes.
 
+## Addendum 2026-03-26 (après runs D/E) — Impasse M1 et bascule M2
+
+### Constat terrain
+- Le mode **M1 offset-only** (normalisation additive seule) n'apporte pas de réduction visuelle significative des seams sur le dataset hétérogène courant.
+- Les comparatifs D/E montrent surtout un shift photométrique global, pas une amélioration structurelle des discontinuités inter‑tuiles.
+
+### Décision mission
+- M1 reste utile comme baseline de diagnostic, mais n'est plus la cible principale.
+- La trajectoire active devient **M2 gain+offset robuste** avec garde-fous:
+  - solve global ancré (`a_ref=1`, `b_ref=0`),
+  - régularisation légère des gains vers 1,
+  - rejet des paires aberrantes,
+  - clamps conservateurs des corrections finales.
+
+### Critère d'acceptation immédiat
+- Ne pas juger M2 à l'œil uniquement:
+  - exiger logs `constraints/kept/rejected`, `residual_abs_med/p95`, `worst pairs`,
+  - puis comparer seams et métriques sur run dédié (M2 ON / M1 OFF).
+

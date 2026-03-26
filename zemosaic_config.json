@@ -257,5 +257,21 @@
     "cluster_target_groups": 0,
     "cluster_orientation_split_deg": 0.0,
     "gpu_eta_profiles": {},
-    "intertile_offset_only_v1": true
+    "intertile_offset_only_v1": false,
+    "intertile_gain_offset_v2": true,
+    "intertile_gain_prior_lambda": 0.03,
+    "intertile_gain_clip": [
+        0.92,
+        1.08
+    ],
+    "intertile_offset_clip": [
+        -2500.0,
+        2500.0
+    ],
+    "intertile_pair_gain_clip": [
+        0.55,
+        1.8
+    ],
+    "intertile_pair_offset_abs_max": 5000.0,
+    "intertile_max_irls_iters": 4
 }

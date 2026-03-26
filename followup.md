@@ -1714,20 +1714,22 @@ Ces 3 modes sont distincts et exclusifs:
 ## M. 2026-03-26 — Plan opérationnel « normalisation globale inter‑tuiles »
 
 ### M1. Implémentation V1 (offset-only)
-- [ ] Ajouter extraction robuste des contraintes overlap pour `b_t` (offset)
-- [ ] Construire système global des contraintes (toutes arêtes actives)
-- [ ] Fixer une tuile de référence (`b_ref=0`)
-- [ ] Résoudre et appliquer `b_t` **avant reprojection**
-- [ ] Logger diagnostics:
+- [x] Ajouter extraction robuste des contraintes overlap pour `b_t` (offset)
+- [x] Construire système global des contraintes (toutes arêtes actives)
+- [x] Fixer une tuile de référence (`b_ref=0`)
+- [x] Résoudre et appliquer `b_t` **avant reprojection**
+- [x] Logger diagnostics:
   - nb contraintes retenues/rejetées
   - residual median / p95 post-correction
   - worst overlaps
+- [x] Constat terrain: **impasse M1** sur dataset hétérogène (seams quasi inchangées D/E)
 
 ### M2. Implémentation V2 (gain+offset)
-- [ ] Étendre solve à `a_t + b_t` avec ancre (`a_ref=1`, `b_ref=0`)
-- [ ] Ajouter clamps conservateurs (`a_min/a_max`, `b_min/b_max`)
-- [ ] Ajouter régularisation légère sur `a_t` autour de 1.0
-- [ ] Rejeter outliers robustement (pixels saturés, zones instables)
+- [x] Étendre solve à `a_t + b_t` avec ancre (`a_ref=1`, `b_ref=0`)
+- [x] Ajouter clamps conservateurs (`a_min/a_max`, `b_min/b_max`)
+- [x] Ajouter régularisation légère sur `a_t` autour de 1.0
+- [x] Rejeter outliers robustement (pairs hors bornes + IRLS robuste)
+- [ ] Lancer run C (M2 ON, M1 OFF) et comparer métriques seams vs run E
 
 ### M3. Intégration pipeline
 - [ ] Vérifier ordre strict:
