@@ -197,13 +197,13 @@
     "intertile_robust_clip_sigma": 2.0,
     "intertile_prune_k": 8,
     "intertile_prune_weight_mode": "area",
-    "intertile_global_recenter": true,
+    "intertile_global_recenter": false,
     "force_resolve_existing_wcs": false,
     "intertile_recenter_clip": [
         0.96,
         1.04
     ],
-    "intertile_affine_blend": 0.4,
+    "intertile_affine_blend": 1.0,
     "use_auto_intertile": true,
     "match_background_for_final": true,
     "incremental_feather_parity": true,
@@ -256,5 +256,6 @@
     "astrometry_downsample": 2,
     "cluster_target_groups": 0,
     "cluster_orientation_split_deg": 0.0,
-    "gpu_eta_profiles": {}
+    "gpu_eta_profiles": {},
+    "intertile_offset_only_v1": true
 }

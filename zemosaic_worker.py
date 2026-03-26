@@ -8095,6 +8095,7 @@ def _compute_intertile_affine_corrections_from_sources(
     force_safe_mode: bool | None = None,
     intertile_prune_k: int = 8,
     intertile_prune_weight_mode: str = "area",
+    intertile_offset_only_v1: bool = False,
 ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
     """Common implementation for intertile gain/offset computation.
 
@@ -8375,6 +8376,7 @@ def _compute_intertile_affine_corrections_from_sources(
             cpu_workers=cpu_workers,
             max_neighbors_per_tile=int(intertile_prune_k),
             prune_weight_mode=str(intertile_prune_weight_mode),
+            offset_only_v1=bool(intertile_offset_only_v1),
         )
     except Exception as exc:
         if cpu_workers and cpu_workers > 1 and not force_safe_mode:
@@ -8406,6 +8408,7 @@ def _compute_intertile_affine_corrections_from_sources(
                     cpu_workers=cpu_workers,
                     max_neighbors_per_tile=int(intertile_prune_k),
                     prune_weight_mode=str(intertile_prune_weight_mode),
+                    offset_only_v1=bool(intertile_offset_only_v1),
                 )
             except Exception as exc_single:
                 if logger_obj:
@@ -9910,6 +9913,7 @@ def _run_shared_phase45_phase5_pipeline(
     intertile_force_safe_mode_config = bool(phase5_options.get("intertile_force_safe_mode"))
     intertile_prune_k_config = int(phase5_options.get("intertile_prune_k") or 8)
     intertile_prune_weight_mode_config = str(phase5_options.get("intertile_prune_weight_mode") or "area")
+    intertile_offset_only_v1_config = bool(phase5_options.get("intertile_offset_only_v1"))
     coadd_use_memmap_config = bool(phase5_options.get("coadd_use_memmap"))
     coadd_memmap_dir_config = phase5_options.get("coadd_memmap_dir")
     start_time_total = start_time_total_run
@@ -10175,6 +10179,7 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_force_safe_mode=intertile_force_safe_mode_config,
                 intertile_prune_k=int(intertile_prune_k_config),
                 intertile_prune_weight_mode=str(intertile_prune_weight_mode_config),
+                intertile_offset_only_v1=bool(intertile_offset_only_v1_config),
                 match_background=match_background_flag,
                 feather_parity=feather_parity_flag,
                 two_pass_coverage_renorm=two_pass_coverage_renorm_config,
@@ -10488,6 +10493,7 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_force_safe_mode=intertile_force_safe_mode_config,
                 intertile_prune_k=int(intertile_prune_k_config),
                 intertile_prune_weight_mode=str(intertile_prune_weight_mode_config),
+                intertile_offset_only_v1=bool(intertile_offset_only_v1_config),
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
                 phase45_enabled=phase45_active_flag,
@@ -15595,6 +15601,7 @@ def assemble_final_mosaic_incremental(
     intertile_force_safe_mode: bool | None = None,
     intertile_prune_k: int = 8,
     intertile_prune_weight_mode: str = "area",
+    intertile_offset_only_v1: bool = False,
     match_background: bool = True,
     feather_parity: bool = False,
     use_radial_feather: bool | None = None,
@@ -15749,6 +15756,7 @@ def assemble_final_mosaic_incremental(
                 force_safe_mode=intertile_force_safe_mode,
                 intertile_prune_k=int(intertile_prune_k),
                 intertile_prune_weight_mode=str(intertile_prune_weight_mode),
+                intertile_offset_only_v1=bool(intertile_offset_only_v1),
                 cpu_workers=(
                     int(processing_threads)
                     if processing_threads and int(processing_threads) > 0
@@ -16242,6 +16250,7 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_force_safe_mode: bool | None = None,
     intertile_prune_k: int = 8,
     intertile_prune_weight_mode: str = "area",
+    intertile_offset_only_v1: bool = False,
     collect_tile_data: list | None = None,
     tile_affine_corrections: list[tuple[float, float]] | None = None,
     global_anchor_shift: tuple[float, float] | None = None,
@@ -17295,6 +17304,7 @@ def assemble_final_mosaic_reproject_coadd(
                 force_safe_mode=intertile_force_safe_mode,
                 intertile_prune_k=int(intertile_prune_k),
                 intertile_prune_weight_mode=str(intertile_prune_weight_mode),
+                intertile_offset_only_v1=bool(intertile_offset_only_v1),
                 cpu_workers=(
                     int(assembly_process_workers)
                     if assembly_process_workers and int(assembly_process_workers) > 0

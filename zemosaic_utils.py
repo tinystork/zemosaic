@@ -2206,6 +2206,81 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
         result[idx] = (g, o)
     return result
 
+
+def solve_global_offsets_v1(num_tiles: int, offset_entries, anchor_index: int = 0):
+    """Solve global per-tile additive offsets from pairwise delta constraints."""
+
+    if num_tiles <= 0:
+        return {}, {"constraints": 0, "residual_abs": np.asarray([], dtype=np.float64)}
+    if not offset_entries:
+        zeros = {i: 0.0 for i in range(num_tiles)}
+        return zeros, {"constraints": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+    anchor = int(max(0, min(anchor_index, num_tiles - 1)))
+    rows = []
+    rhs = []
+    valid_entries = []
+
+    for entry in offset_entries:
+        try:
+            i = int(entry[0]); j = int(entry[1]); delta_ij = float(entry[2])
+            weight = float(entry[3]) if len(entry) > 3 else 1.0
+        except Exception:
+            continue
+        if i < 0 or j < 0 or i >= num_tiles or j >= num_tiles or i == j:
+            continue
+        if not np.isfinite(delta_ij):
+            continue
+        if not np.isfinite(weight) or weight <= 0.0:
+            weight = 1.0
+
+        sqrt_w = math.sqrt(max(1e-9, weight))
+        row = np.zeros(num_tiles, dtype=np.float64)
+        row[i] = -sqrt_w
+        row[j] = +sqrt_w
+        rows.append(row)
+        rhs.append((-delta_ij) * sqrt_w)
+        valid_entries.append((i, j, delta_ij, weight))
+
+    row_anchor = np.zeros(num_tiles, dtype=np.float64)
+    row_anchor[anchor] = 1.0
+    rows.append(row_anchor)
+    rhs.append(0.0)
+
+    if len(rows) <= 1:
+        zeros = {i: 0.0 for i in range(num_tiles)}
+        return zeros, {"constraints": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+    try:
+        A = np.vstack(rows)
+        b = np.asarray(rhs, dtype=np.float64)
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except Exception:
+        zeros = {i: 0.0 for i in range(num_tiles)}
+        return zeros, {"constraints": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+    offsets = {}
+    for t in range(num_tiles):
+        v = float(sol[t]) if t < len(sol) else 0.0
+        offsets[t] = v if np.isfinite(v) else 0.0
+
+    residual_abs = []
+    worst = []
+    for i, j, delta_ij, weight in valid_entries:
+        res = (offsets[j] - offsets[i]) + delta_ij
+        if not np.isfinite(res):
+            continue
+        abs_res = abs(float(res))
+        residual_abs.append(abs_res)
+        worst.append((abs_res, i, j, float(res), float(delta_ij), float(weight)))
+
+    worst.sort(key=lambda x: x[0], reverse=True)
+    return offsets, {
+        "constraints": int(len(valid_entries)),
+        "residual_abs": np.asarray(residual_abs, dtype=np.float64),
+        "worst": worst[:5],
+    }
+
 # Constants for pruning
 max_neighbors_per_tile = 8
 
@@ -2267,6 +2342,7 @@ def compute_intertile_affine_calibration(
     cpu_workers: int | None = None,
     max_neighbors_per_tile: int = 8,
     prune_weight_mode: str = "area",
+    offset_only_v1: bool = False,
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
 
@@ -3112,6 +3188,46 @@ def compute_intertile_affine_calibration(
             )
         except Exception:
             pass
+
+    if bool(offset_only_v1) and pair_entries:
+        offset_entries = []
+        for p in pair_entries:
+            try:
+                i = int(p[0]); j = int(p[1]); b_ij = float(p[3]); w_ij = float(p[4])
+            except Exception:
+                continue
+            if not np.isfinite(b_ij):
+                continue
+            if not np.isfinite(w_ij) or w_ij <= 0:
+                w_ij = 1.0
+            # Approximate additive delta from fitted intercept (V1 offset-only)
+            offset_entries.append((i, j, b_ij, w_ij))
+
+        offsets_sol, offset_diag = solve_global_offsets_v1(num_tiles, offset_entries, anchor_index=anchor)
+        residual_abs = np.asarray(offset_diag.get("residual_abs", []), dtype=np.float64)
+        constraints_count = int(offset_diag.get("constraints", 0))
+        if residual_abs.size:
+            res_med = float(np.nanmedian(residual_abs))
+            res_p95 = float(np.nanpercentile(residual_abs, 95))
+        else:
+            res_med = 0.0
+            res_p95 = 0.0
+        _log_intertile(
+            f"M1 offset-only solve: constraints={constraints_count} residual_abs_med={res_med:.5f} residual_abs_p95={res_p95:.5f}",
+            level="INFO",
+        )
+        for rank, worst in enumerate((offset_diag.get("worst") or [])[:3], 1):
+            try:
+                abs_res, wi, wj, wres, wdelta, wweight = worst
+                _log_intertile(
+                    f"M1 worst[{rank}] pair={wi}-{wj} abs_res={float(abs_res):.5f} res={float(wres):.5f} delta={float(wdelta):.5f} weight={float(wweight):.3f}",
+                    level="INFO",
+                )
+            except Exception:
+                pass
+
+        if offsets_sol:
+            return {idx: (1.0, float(offsets_sol.get(idx, 0.0))) for idx in range(num_tiles)}
 
     solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
     if progress_callback:

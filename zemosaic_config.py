@@ -254,6 +254,7 @@ DEFAULT_CONFIG = {
     "intertile_robust_clip_sigma": 2.5,
     "intertile_prune_k": 8,
     "intertile_prune_weight_mode": "area",
+    "intertile_offset_only_v1": False,
     "intertile_global_recenter": True,
     "force_resolve_existing_wcs": False,
     "intertile_recenter_clip": [0.85, 1.18],
