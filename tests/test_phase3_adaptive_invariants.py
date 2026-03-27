@@ -181,6 +181,16 @@ def test_sds_global_gpu_helper_has_oom_retry_with_chunk_tightening():
     assert "plan_chunk_gpu_hint = int(next_chunk)" in src
 
 
+def test_phase5_tile_weighting_prefers_effective_weights_when_available():
+    src = _worker_source()
+
+    assert "def _resolve_runtime_tile_weight(entry_obj: Any) -> float:" in src
+    assert 'entry_obj.get("tile_weight_effective")' in src
+    assert "weight_val = _resolve_runtime_tile_weight(entry)" in src
+    assert "tile_weight_val = _resolve_runtime_tile_weight(entry)" in src
+    assert "tw_value = _resolve_runtime_tile_weight(entry)" in src
+
+
 def test_phase3_runtime_controller_backoff_hysteresis_and_recovery_markers_present():
     src = _worker_source()
 

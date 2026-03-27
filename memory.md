@@ -3413,3 +3413,29 @@ Exploration only, no mission started yet.
   - clips/garde-fous conservateurs activés.
 - Prochaine étape: lancer run M2 (C) et comparer métriques/logs vs run E.
 
+
+## 2026-03-27 13:05 — Smoking-gun confirmé et patch appliqué (weighting Phase 5)
+
+Contexte run G/H (existing master tiles):
+- G (weighting ON) montrait des seams amplifiées.
+- `tile_weights_final.csv` exposait un écart massif entre `tile_weight_raw` (jusqu'à ~602) et `tile_weight_effective` (~0.91..1.35 avec V4).
+
+Root cause code confirmé dans `assemble_final_mosaic_reproject_coadd`:
+- Le pipeline calculait bien `tile_weight_effective` (V4),
+- mais au moment d'appeler `reproject_and_coadd_wrapper`, il réinjectait `entry["tile_weight"]` (raw) au lieu de l'effectif.
+- Conséquence: V4 était loggé/exporté mais non réellement appliqué au coadd final (domination locale + seams renforcées).
+
+Patch chirurgical appliqué:
+- ajout helper local `_resolve_runtime_tile_weight(entry_obj)` qui préfère `tile_weight_effective`, fallback `tile_weight`.
+- remplacement des trois points de consommation runtime des poids:
+  1) `tile_weights_for_sources` (intertile affine source weighting)
+  2) `collect_tile_data` (payload utilisé pour passes suivantes)
+  3) `tile_weights_for_entries` (appel principal `reproject_and_coadd_wrapper`)
+
+Validation rapide:
+- `python3 -m py_compile zemosaic_worker.py tests/test_phase3_adaptive_invariants.py` ✅
+- test source-contract ajouté: `test_phase5_tile_weighting_prefers_effective_weights_when_available`
+- `pytest -q tests/test_phase3_adaptive_invariants.py -k "tile_weighting_prefers_effective_weights_when_available or sds_global_gpu_helper_has_oom_retry_with_chunk_tightening or run_hierarchical_master_tiles_bootstrap_avoids_undefined_existing_tiles_symbol"` ✅ (3 passed)
+
+Risque résiduel:
+- patch ciblé Classic/Phase5, mais zone partagée large; garder smoke check Classic/ZeGrid/SDS minimal après prochain run terrain.

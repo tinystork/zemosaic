@@ -16650,6 +16650,21 @@ def assemble_final_mosaic_reproject_coadd(
         transformed = np.clip(transformed, lo, hi)
         return transformed.astype(np.float64).tolist()
 
+    def _resolve_runtime_tile_weight(entry_obj: Any) -> float:
+        if not isinstance(entry_obj, dict):
+            return 1.0
+        for candidate in (
+            entry_obj.get("tile_weight_effective"),
+            entry_obj.get("tile_weight"),
+        ):
+            try:
+                value = float(candidate)
+            except Exception:
+                continue
+            if math.isfinite(value) and value > 0.0:
+                return value
+        return 1.0
+
 
     effective_tiles: list[dict[str, Any]] = []
     hdr_for_output = None
@@ -17349,12 +17364,7 @@ def assemble_final_mosaic_reproject_coadd(
                 mask = entry.get("alpha_weight2d")
                 if mask is None:
                     mask = entry.get("coverage_mask")
-                try:
-                    weight_val = float(entry.get("tile_weight", 1.0))
-                except Exception:
-                    weight_val = 1.0
-                if not math.isfinite(weight_val) or weight_val <= 0:
-                    weight_val = 1.0
+                weight_val = _resolve_runtime_tile_weight(entry)
             tile_weights_for_sources.append(weight_val)
             tile_sources.append(
                 _TileAffineSource(
@@ -17683,12 +17693,7 @@ def assemble_final_mosaic_reproject_coadd(
             coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
             tile_weight_val = 1.0
             if isinstance(entry, dict):
-                try:
-                    tile_weight_val = float(entry.get("tile_weight", 1.0))
-                except Exception:
-                    tile_weight_val = 1.0
-                if not math.isfinite(tile_weight_val) or tile_weight_val <= 0.0:
-                    tile_weight_val = 1.0
+                tile_weight_val = _resolve_runtime_tile_weight(entry)
             if arr is None or tile_wcs is None:
                 continue
             try:
@@ -18000,13 +18005,7 @@ def assemble_final_mosaic_reproject_coadd(
                         )
                         weight_source_base = f"{weight_source_base}*radial"
                 if tile_weighting_applied:
-                    try:
-                        tw_raw = entry.get("tile_weight", 1.0) if isinstance(entry, dict) else 1.0
-                        tw_value = float(tw_raw)
-                    except Exception:
-                        tw_value = 1.0
-                    if not math.isfinite(tw_value) or tw_value <= 0.0:
-                        tw_value = 1.0
+                    tw_value = _resolve_runtime_tile_weight(entry)
                     tile_weights_for_entries.append(tw_value)
                 input_weights_list.append(weight2d)
                 if (
