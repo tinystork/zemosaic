@@ -11,8 +11,8 @@
     "preferred_gui_backend_explicit": false,
     "qt_theme_mode": "dark",
     "qt_main_window_geometry": [
-        0,
-        0,
+        7,
+        30,
         899,
         931
     ],
@@ -25,7 +25,7 @@
     "qt_main_columns_state": "AAAA/wAAAAEAAAACAAABeQAAAeUA/////wEAAAABAA==",
     "qt_main_left_state": "AAAA/wAAAAEAAAADAAAB3QAAAQwAAAE0AP////8BAAAAAgA=",
     "input_dir": "D:/mosaic/test/test run D/zemosaic_temp_master_tiles",
-    "output_dir": "D:/mosaic/test/test run G",
+    "output_dir": "D:/mosaic/test/test run H",
     "use_existing_master_tiles": true,
     "num_processing_workers": 0,
     "grid_workers": 0,
@@ -94,7 +94,7 @@
     "gpu_hybrid_vram_guard": true,
     "phase5_chunk_auto": true,
     "phase5_chunk_mb": 1024,
-    "enable_tile_weighting": true,
+    "enable_tile_weighting": false,
     "tile_weight_mode": "n_frames",
     "tile_weight_v4_enabled": true,
     "tile_weight_v4_curve": "sqrt",
