@@ -3439,3 +3439,27 @@ Validation rapide:
 
 Risque résiduel:
 - patch ciblé Classic/Phase5, mais zone partagée large; garder smoke check Classic/ZeGrid/SDS minimal après prochain run terrain.
+
+## 2026-03-27 19:3x — Mise en œuvre preset Run J (post-fix weighting)
+
+But: garder le weighting actif mais plus neutre (anti-empreinte de tuiles), et renforcer légèrement le graphe intertile.
+
+Preset appliqué dans les configs runtime:
+- `/home/tristan/zemosaic/zemosaic/zemosaic_config.json`
+- `/home/tristan/.config/ZeMosaic/zemosaic_config.json`
+
+Valeurs appliquées:
+- `intertile_prune_k = 12` (au lieu de 8)
+- `intertile_prune_weight_mode = "hybrid"` (au lieu de `area`)
+- `enable_tile_weighting = true`
+- `tile_weight_mode = "n_frames"`
+- `tile_weight_v4_enabled = true`
+- `tile_weight_v4_curve = "log"` (au lieu de `sqrt`)
+- `tile_weight_v4_strength = 0.5` (au lieu de 1.0)
+- `tile_weight_v4_min = 0.95` (au lieu de 0.75)
+- `tile_weight_v4_max = 1.10` (au lieu de 1.35)
+
+Intention produit:
+- réduire la domination locale des tuiles fortes,
+- conserver un léger levier de blend,
+- laisser la correction des seams se jouer principalement côté harmonisation intertile.
