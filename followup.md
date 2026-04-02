@@ -49,14 +49,14 @@ Reference principle:
 ## C. Instrumentation — real pipeline first
 
 ### C1. Graphe réellement retenu
-- [ ] Exporter le graphe final réellement retenu par le pipeline worker
+- [x] Exporter le graphe final réellement retenu par le pipeline worker
 - [ ] Exporter pour chaque arête retenue:
   - tile_i
   - tile_j
   - score / strength
   - overlap
   - métriques photométriques utiles
-- [ ] Exporter les arêtes rejetées mais fortes
+- [x] Exporter les arêtes rejetées mais fortes
 - [ ] Logger explicitement les raisons principales de rejet si disponible
 
 ### C2. Solve photométrique
@@ -78,8 +78,8 @@ Reference principle:
 - [ ] En mode “existing master tiles”, logger:
   - nombre de tuiles avec poids valide
   - nombre de tuiles fallback=1.0
-- [ ] Produire une `weighted_coverage_map`
-- [ ] Produire une `winner_map` / `dominant_tile_map`
+- [x] Produire une `weighted_coverage_map`
+- [x] Produire une `winner_map` / `dominant_tile_map`
 
 ### C4. Corrélation visuelle
 - [ ] Vérifier si les seams visibles suivent:
@@ -178,18 +178,17 @@ Reference principle:
 
 ---
 
-## H. Visual seam-heal — postponed, not mainline
+## H. Visual seam-heal — controlled visual finisher
 
-- [ ] Ne pas implémenter le seam-heal low-frequency avant d’avoir traité C/D/F
-- [ ] Garder l’idée vivante uniquement comme finition visuelle
-- [ ] Si réactivé plus tard:
-  - luma-first
+- [x] Réactivation autorisée après constat terrain stable: weighting OFF > weighting ON
+- [x] Implémenter un pass optionnel **luma-first** (preview/output visuel uniquement)
+- [x] Garde-fous appliqués:
   - visual-only
-  - OFF par défaut
-  - Phase 6 / output final
-  - pas de modification science/FITS
-
----
+  - OFF par défaut (`visual_seam_heal_enabled=false`)
+  - Phase 6 (preview path)
+  - pas de modification du FITS science principal
+- [ ] Valider A/B OFF vs seam-heal ON sur mêmes master tiles
+- [ ] Documenter limites (halos / adoucissement / dérive locale) + réglages recommandés
 
 ## I. Non-regression
 
@@ -1756,3 +1755,120 @@ Ces 3 modes sont distincts et exclusifs:
   - stabilité flux étoiles communes
 - [ ] Décider GO/NO-GO pour activation par défaut
 
+
+
+## Addendum 2026-03-30 — Comparatif L/M et suite
+
+### L/M (fait)
+- [x] Comparaison logs L vs M documentée (`/media/tristan/X10 Pro/mosaic/test/analysis_L_M_2026-03-30.md`)
+- [x] Verdict: M légèrement meilleur que L (incrémental)
+- [x] Validation: sorties différentes (hash preview/FITS différents)
+
+### Run N (préparé, lancement via GUI par Tristan)
+- [x] `output_dir = /media/tristan/X10 Pro/mosaic/test/test run N`
+- [x] Changement unique vs M: `visual_seam_heal_strength = 0.5` (M=0.4)
+- [x] Conservé: `enable_tile_weighting=true`, `tile_weight_v4_enabled=true`, `resume=auto`, `use_existing_master_tiles=true`
+- [x] Backup config: `/home/tristan/zemosaic/zemosaic/zemosaic_config.bak-20260330-151904.json`
+
+### Critère de fin de phase
+- [ ] 1 run N + 1 run O max si besoin (2 runs restants), puis décision GO/NO-GO sur ce bloc de tuning.
+
+
+## Addendum 2026-03-30 — Passage étape suivante (post N)
+
+### Décision
+- [x] Abandon fine-tuning v1 (`strength/max_rel`): rendement insuffisant visuellement.
+- [x] Passage à la nouvelle brique "seam-heal multiscale".
+
+### Implémentation
+- [x] Brique multiscale installée dans `zemosaic_worker.py` (preview path, Phase 6)
+- [x] Nouvelles clés config ajoutées dans `zemosaic_config.py`
+- [x] Sanity check: `python -m py_compile zemosaic_worker.py zemosaic_config.py`
+
+### Run P (préparé, lancement GUI)
+- [x] `output_dir = /media/tristan/X10 Pro/mosaic/test/test run P`
+- [x] `visual_seam_heal_multiscale_enabled = true`
+- [x] `visual_seam_heal_multiscale_mid_gain = 0.35`
+- [x] `visual_seam_heal_multiscale_mid_sigma_scale = 0.60`
+- [x] `visual_seam_heal_multiscale_mid_rel_scale = 0.70`
+- [x] Baseline conservée: `visual_seam_heal_strength=0.5`, `max_rel_delta=0.08`, tile weighting ON
+- [x] Backup config: `/home/tristan/zemosaic/zemosaic/zemosaic_config.bak-20260330-235821.json`
+
+### Critère d'évaluation P
+- [x] Chercher gain net visuel seams + logs `[SeamHealMS]` (applied pass1/pass2 + métriques)
+- [ ] Si gain faible: bascule piste suivante = recalibration géométrique dédiée dataset.
+
+
+## Addendum 2026-03-31 — Point d'étape + protocole datasets témoins
+
+Décision validée avec Tristan:
+- Avant la piste recalibration géométrique, exécuter 2 runs témoins pour isoler l'effet dataset vs algorithme.
+
+Constat phase P:
+- Gain visuel **subtil** confirmé (pas de saut massif).
+- Logs multiscale OK (`SeamHealMS applied=True`, `pass1=True`, `pass2=True`, preview gate multiscale appliqué).
+
+### Run témoin 1 (complet lights)
+- [x] Nom run: `M106_2`
+- [x] Source: `/home/tristan/zemosaic/zemosaic/example/lights/`
+- [x] Mode: run complet (pas existing-master), dataset faible mais révélateur
+- [x] Objectif: mesurer le niveau de seams sur jeu plus homogène
+
+### Run témoin 2 (existing master tiles)
+- [x] Nom run: `NGC6888_6`
+- [x] Source masters: `/media/tristan/X10 Pro/mosaic/test/NGC6888_4/zemosaic_temp_master_tiles/`
+- [x] Mode: `use_existing_master_tiles=true`
+- [x] Objectif: benchmark sur jeu plus consistant que le cas mixte Alt-Az/EQ difficile
+
+### Discipline (attribution causale)
+- [x] Conserver les mêmes réglages seam/blend entre les 2 runs (hors source dataset)
+- [x] Nouveau dossier de sortie dédié par run
+- [x] Capturer logs + preview + métriques comparables (`TwoPassScore`, `SeamHeal`, `SeamHealMS`)
+
+### Décision après ces 2 runs
+- [x] Si seams restent fortes même sur jeux plus homogènes: ouvrir la piste **recalibration géométrique dédiée dataset**
+- [ ] Sinon: stabiliser preset visuel et clore GO/NO-GO phase multiscale
+
+### Statut terrain (2026-04-01)
+- [x] `M106_2` et `NGC6888_6` existent et sont terminés (`run_success_processing_completed` + `Run Hierarchical Mosaic COMPLETED`).
+- [x] Verdict opérationnel: runs témoins **non concluants** (pas de gain décisif permettant de clore la phase multiscale).
+- [x] Conséquence mission: prioriser l'investigation structurelle (pondération/masque/reprojection) plutôt que continuer les micro-retunes visuelles.
+
+
+## Addendum 2026-04-01 — Instrumentation root-cause ajoutée (winner/coverage/graph)
+
+Implémenté dans le code:
+- export `weighted_coverage_map.fits` (somme des poids projetés par pixel)
+- export `winner_map.fits` (index de la tuile dominante par pixel)
+- export `winner_index.csv` (pixels gagnés par tuile)
+- export graphe intertile:
+  - `intertile_graph_summary.json`
+  - `intertile_graph_edges_raw.csv`
+  - `intertile_graph_edges_kept.csv`
+  - `intertile_graph_edges_rejected.csv`
+
+Drapeaux config (ON par défaut):
+- `phase5_export_weight_maps`
+- `phase5_export_graph_debug`
+
+Objectif:
+- rendre visible la cause des trous/seams (dominance locale, sous-couverture pondérée, arêtes rejetées).
+
+
+## Addendum 2026-04-01 — Fix propagation intertile (classic wrapper) + incident NGC6888_12
+
+Constat:
+- En mode classic legacy, certains paramètres intertile retombaient sur des defaults (observé via instrumentation: `prune_k=8`, `mode=area`) malgré un snapshot config différent.
+
+Correction appliquée:
+- `zemosaic_worker.py` patché pour forcer la récupération explicite de:
+  - `intertile_prune_k`
+  - `intertile_prune_weight_mode`
+  depuis le cache config avant l'appel `run_hierarchical_mosaic_classic_legacy(...)`.
+- Objectif: éviter tout fallback implicite aux defaults legacy sur la branche classic non-grid.
+
+Incident:
+- Premier lancement `NGC6888_12` a crashé très tôt sur `NameError` (variable prune non définie dans le wrapper classic), puis fix appliqué et compilation OK.
+
+Action attendue:
+- relancer `NGC6888_12` après patch et vérifier dans `intertile_graph_summary.json` que les valeurs effectives correspondent au snapshot config.

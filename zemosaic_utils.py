@@ -91,6 +91,18 @@ logger = logging.getLogger(__name__)
 _PREVIEW_WCS_LINEARIZED_LOGGED = False
 _PHASE5_GPU_OOM_HINT: dict[str, int | None] = {"max_chunk_bytes": None, "rows_per_chunk": None, "oom_events": 0}
 
+# Latest intertile diagnostics payload (debug/export helper for worker instrumentation)
+LAST_INTERTILE_DIAGNOSTICS: dict[str, Any] = {}
+
+
+def get_last_intertile_diagnostics() -> dict[str, Any]:
+    """Return a shallow copy of the latest intertile diagnostic payload."""
+
+    try:
+        return dict(LAST_INTERTILE_DIAGNOSTICS)
+    except Exception:
+        return {}
+
 
 EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
 
@@ -2549,7 +2561,16 @@ def compute_intertile_affine_calibration(
     d'overlap.
     """
 
+    LAST_INTERTILE_DIAGNOSTICS.clear()
+    LAST_INTERTILE_DIAGNOSTICS.update({
+        "status": "init",
+        "raw_pairs_count": 0,
+        "pruned_pairs_count": 0,
+        "anchor": None,
+    })
+
     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
+        LAST_INTERTILE_DIAGNOSTICS["status"] = "skipped_not_enough_tiles"
         return {}
     if reproject_interp is None or not ASTROPY_AVAILABLE_IN_UTILS:
         return {}
@@ -3009,6 +3030,46 @@ def compute_intertile_affine_calibration(
         level="INFO",
     )
 
+    try:
+        kept_keys_final = {_intertile_edge_key(e) for e in overlaps}
+        graph_raw_edges = []
+        graph_kept_edges = []
+        graph_rejected_edges = []
+        for _e in overlaps_raw:
+            _ek = _intertile_edge_key(_e)
+            _row = {
+                "i": int(_e.get("i", -1)),
+                "j": int(_e.get("j", -1)),
+                "weight": float(_e.get("weight", 0.0) or 0.0),
+                "weight_area": float(_e.get("weight_area", 0.0) or 0.0),
+                "weight_strength": float(_e.get("weight_strength", 0.0) or 0.0),
+                "frac_i": float(_e.get("frac_i", 0.0) or 0.0),
+                "frac_j": float(_e.get("frac_j", 0.0) or 0.0),
+                "bbox": list(_e.get("bbox", [])) if isinstance(_e.get("bbox"), (list, tuple)) else [],
+                "kept": bool(_ek in kept_keys_final),
+            }
+            graph_raw_edges.append(_row)
+            if _row["kept"]:
+                graph_kept_edges.append(_row)
+            else:
+                graph_rejected_edges.append(_row)
+        LAST_INTERTILE_DIAGNOSTICS.update({
+            "status": "pairs_ready",
+            "raw_pairs_count": int(raw_pairs_count),
+            "pruned_pairs_count": int(pruned_pairs_count),
+            "active_tile_count": int(active_tile_count),
+            "components_active": int(components_active),
+            "bridges_added": int(bridges_added),
+            "fallback_used": bool(fallback_used),
+            "prune_k": int(max_neighbors_per_tile),
+            "prune_weight_mode": str(prune_weight_mode_norm),
+            "graph_raw_edges": graph_raw_edges,
+            "graph_kept_edges": graph_kept_edges,
+            "graph_rejected_edges": graph_rejected_edges,
+        })
+    except Exception:
+        pass
+
     # --- END PRUNING LOGIC ---
 
     try:
@@ -3387,6 +3448,13 @@ def compute_intertile_affine_calibration(
         except Exception:
             pass
 
+    try:
+        LAST_INTERTILE_DIAGNOSTICS["anchor"] = int(anchor)
+        LAST_INTERTILE_DIAGNOSTICS["pair_entries_count"] = int(len(pair_entries))
+        LAST_INTERTILE_DIAGNOSTICS["connectivity"] = [float(x) for x in np.asarray(connectivity, dtype=np.float64).tolist()]
+    except Exception:
+        pass
+
     if bool(gain_offset_v2):
         _log_intertile(
             f"M2 request: pair_entries={len(pair_entries)} enforce={bool(enforce_requested_solver)}",
@@ -3428,6 +3496,7 @@ def compute_intertile_affine_calibration(
             except Exception:
                 pass
         if sol_m2:
+            LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m2"
             return sol_m2
 
     if bool(offset_only_v1) and pair_entries:
@@ -3468,6 +3537,7 @@ def compute_intertile_affine_calibration(
                 pass
 
         if offsets_sol:
+            LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m1"
             return {idx: (1.0, float(offsets_sol.get(idx, 0.0))) for idx in range(num_tiles)}
 
     if bool(gain_offset_v2) and bool(enforce_requested_solver):
@@ -3478,6 +3548,10 @@ def compute_intertile_affine_calibration(
         raise RuntimeError("M2 requested but not applied")
 
     solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
+    try:
+        LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_legacy"
+    except Exception:
+        pass
     if progress_callback:
         try:
             progress_callback(

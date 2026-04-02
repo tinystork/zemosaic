@@ -2986,6 +2986,363 @@ def _equalize_rgb_black_level_hwc(
     return rgb_hwc, info
 
 
+
+
+def _gaussian_blur_2d_float32(arr: np.ndarray, sigma_px: float) -> np.ndarray:
+    """Small utility blur for preview-time visual filtering (best-effort)."""
+
+    try:
+        sigma = float(sigma_px)
+    except Exception:
+        sigma = 0.0
+    if sigma <= 1e-6:
+        return np.asarray(arr, dtype=np.float32)
+
+    src = np.asarray(arr, dtype=np.float32)
+
+    try:
+        import cv2  # type: ignore
+
+        k = max(3, int(2 * round(sigma * 1.5) + 1))
+        return cv2.GaussianBlur(src, (k, k), sigmaX=sigma).astype(np.float32, copy=False)
+    except Exception:
+        pass
+
+    try:
+        from scipy.ndimage import gaussian_filter  # type: ignore
+
+        return gaussian_filter(src, sigma=float(sigma), truncate=4.0).astype(np.float32, copy=False)
+    except Exception:
+        return src
+
+
+def _apply_visual_seam_heal_low_frequency(
+    mosaic_hwc: np.ndarray | None,
+    *,
+    alpha_mask: np.ndarray | None = None,
+    coverage_hw: np.ndarray | None = None,
+    strength: float = 0.45,
+    sigma_small: float = 24.0,
+    sigma_large: float = 96.0,
+    seam_sigma: float = 2.5,
+    max_rel_delta: float = 0.08,
+    logger: logging.Logger | None = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Optional visual-only seam heal for preview/export rendering.
+
+    Luma-first, low-frequency correction modulated by seam likelihood from
+    coverage/alpha gradients. Intended for Phase 6 visual outputs only.
+    """
+
+    info: dict[str, Any] = {
+        'enabled': True,
+        'applied': False,
+        'reason': '',
+        'strength': float(strength),
+        'sigma_small': float(sigma_small),
+        'sigma_large': float(sigma_large),
+        'seam_sigma': float(seam_sigma),
+        'max_rel_delta': float(max_rel_delta),
+        'seam_weight_mean': 0.0,
+        'seam_weight_p95': 0.0,
+        'delta_abs_p95': 0.0,
+        'valid_frac': 0.0,
+    }
+
+    if mosaic_hwc is None or not isinstance(mosaic_hwc, np.ndarray):
+        info['reason'] = 'invalid_input'
+        return mosaic_hwc, info
+    if mosaic_hwc.ndim != 3 or mosaic_hwc.shape[-1] != 3:
+        info['reason'] = 'non_rgb'
+        return mosaic_hwc, info
+
+    try:
+        strength = float(max(0.0, min(1.0, float(strength))))
+    except Exception:
+        strength = 0.45
+    try:
+        sigma_small = float(max(1.0, min(512.0, float(sigma_small))))
+    except Exception:
+        sigma_small = 24.0
+    try:
+        sigma_large = float(max(sigma_small + 1.0, min(1024.0, float(sigma_large))))
+    except Exception:
+        sigma_large = max(48.0, sigma_small * 3.0)
+    try:
+        seam_sigma = float(max(0.5, min(64.0, float(seam_sigma))))
+    except Exception:
+        seam_sigma = 2.5
+    try:
+        max_rel_delta = float(max(0.01, min(0.30, float(max_rel_delta))))
+    except Exception:
+        max_rel_delta = 0.08
+
+    rgb = np.asarray(mosaic_hwc, dtype=np.float32)
+    if not rgb.flags.writeable:
+        rgb = rgb.copy()
+
+    finite = np.isfinite(rgb).all(axis=-1)
+    valid = finite.copy()
+
+    alpha_arr = None
+    if isinstance(alpha_mask, np.ndarray):
+        try:
+            alpha_arr = np.asarray(alpha_mask)
+            if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
+                alpha_arr = alpha_arr[..., 0]
+            elif alpha_arr.ndim > 2:
+                alpha_arr = np.squeeze(alpha_arr)
+            if alpha_arr.shape[:2] == rgb.shape[:2]:
+                valid &= alpha_arr > 0
+            else:
+                alpha_arr = None
+        except Exception:
+            alpha_arr = None
+
+    cov_arr = None
+    if isinstance(coverage_hw, np.ndarray):
+        try:
+            cov_arr = np.asarray(coverage_hw, dtype=np.float32)
+            if cov_arr.ndim > 2:
+                cov_arr = np.squeeze(cov_arr)
+            if cov_arr.shape[:2] == rgb.shape[:2]:
+                valid &= np.isfinite(cov_arr) & (cov_arr > 0)
+            else:
+                cov_arr = None
+        except Exception:
+            cov_arr = None
+
+    valid_px = int(np.count_nonzero(valid))
+    total_px = int(valid.size)
+    info['valid_frac'] = float(valid_px / total_px) if total_px > 0 else 0.0
+    if valid_px <= 0:
+        info['reason'] = 'no_valid'
+        return rgb, info
+
+    luma = (
+        (0.2126 * rgb[..., 0])
+        + (0.7152 * rgb[..., 1])
+        + (0.0722 * rgb[..., 2])
+    ).astype(np.float32, copy=False)
+
+    luma_fill = luma.copy()
+    if not np.all(valid):
+        try:
+            med = float(np.nanmedian(luma[valid]))
+        except Exception:
+            med = 0.0
+        luma_fill[~valid] = np.float32(med)
+
+    seam_source = None
+    if cov_arr is not None:
+        try:
+            src = np.nan_to_num(cov_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            vmax = float(np.nanmax(src)) if src.size else 0.0
+            if vmax > 0:
+                seam_source = np.clip(src / vmax, 0.0, 1.0)
+        except Exception:
+            seam_source = None
+    if seam_source is None and alpha_arr is not None:
+        try:
+            a = np.asarray(alpha_arr, dtype=np.float32)
+            if a.size:
+                vmax = float(np.nanmax(a))
+                if vmax > 1.0:
+                    a = np.clip(a / 255.0, 0.0, 1.0)
+                else:
+                    a = np.clip(a, 0.0, 1.0)
+                seam_source = a.astype(np.float32, copy=False)
+        except Exception:
+            seam_source = None
+    if seam_source is None:
+        seam_source = valid.astype(np.float32)
+
+    try:
+        gy, gx = np.gradient(np.nan_to_num(seam_source, nan=0.0, posinf=0.0, neginf=0.0))
+        grad = np.sqrt((gx * gx) + (gy * gy)).astype(np.float32, copy=False)
+    except Exception:
+        info['reason'] = 'gradient_failed'
+        return rgb, info
+
+    try:
+        grad_ref = float(np.nanpercentile(grad[valid], 99.0)) if np.any(valid) else float(np.nanmax(grad))
+    except Exception:
+        grad_ref = float(np.nanmax(grad)) if grad.size else 0.0
+    if not math.isfinite(grad_ref) or grad_ref <= 1e-9:
+        info['reason'] = 'no_seam_signal'
+        return rgb, info
+
+    seam_weight = np.clip(grad / grad_ref, 0.0, 1.0).astype(np.float32, copy=False)
+    seam_weight = _gaussian_blur_2d_float32(seam_weight, seam_sigma)
+    seam_weight = np.clip(seam_weight, 0.0, 1.0)
+    seam_weight *= valid.astype(np.float32)
+
+    if float(np.nanmax(seam_weight)) <= 1e-6:
+        info['reason'] = 'seam_weight_zero'
+        return rgb, info
+
+    low_small = _gaussian_blur_2d_float32(luma_fill, sigma_small)
+    low_large = _gaussian_blur_2d_float32(luma_fill, sigma_large)
+    delta = (low_small - low_large).astype(np.float32, copy=False)
+
+    try:
+        abs_cap = float(np.nanpercentile(np.abs(delta[valid]), 99.5))
+    except Exception:
+        abs_cap = float(np.nanmax(np.abs(delta))) if delta.size else 0.0
+    if not math.isfinite(abs_cap) or abs_cap <= 1e-9:
+        info['reason'] = 'delta_too_small'
+        return rgb, info
+
+    delta = np.clip(delta, -abs_cap, abs_cap)
+    correction = (strength * seam_weight * delta).astype(np.float32, copy=False)
+
+    eps = max(1e-6, float(np.nanpercentile(np.abs(luma_fill[valid]), 5.0)) * 0.05)
+    luma_corr = luma_fill - correction
+    ratio = np.ones_like(luma_fill, dtype=np.float32)
+    ratio[valid] = luma_corr[valid] / np.maximum(luma_fill[valid], eps)
+    ratio = np.clip(ratio, 1.0 - max_rel_delta, 1.0 + max_rel_delta)
+
+    out = np.where(valid[..., None], rgb * ratio[..., None], rgb).astype(np.float32, copy=False)
+
+    info['applied'] = True
+    info['reason'] = 'ok'
+    try:
+        info['seam_weight_mean'] = float(np.nanmean(seam_weight[valid]))
+        info['seam_weight_p95'] = float(np.nanpercentile(seam_weight[valid], 95.0))
+        info['delta_abs_p95'] = float(np.nanpercentile(np.abs(delta[valid]), 95.0))
+    except Exception:
+        pass
+
+    if logger is not None:
+        logger.info(
+            "[SeamHeal] applied=True strength=%.3f sigma_small=%.1f sigma_large=%.1f seam_sigma=%.2f max_rel=%.3f seam_w_mean=%.5f seam_w_p95=%.5f delta_abs_p95=%.5f",
+            float(strength),
+            float(sigma_small),
+            float(sigma_large),
+            float(seam_sigma),
+            float(max_rel_delta),
+            float(info.get('seam_weight_mean', 0.0)),
+            float(info.get('seam_weight_p95', 0.0)),
+            float(info.get('delta_abs_p95', 0.0)),
+        )
+
+    return out, info
+
+
+def _apply_visual_seam_heal_multiscale(
+    mosaic_hwc: np.ndarray | None,
+    *,
+    alpha_mask: np.ndarray | None = None,
+    coverage_hw: np.ndarray | None = None,
+    strength: float = 0.45,
+    sigma_small: float = 24.0,
+    sigma_large: float = 96.0,
+    seam_sigma: float = 2.5,
+    max_rel_delta: float = 0.08,
+    mid_gain: float = 0.35,
+    mid_sigma_scale: float = 0.60,
+    mid_rel_scale: float = 0.70,
+    logger: logging.Logger | None = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Preview-only multiscale seam heal.
+
+    Pass 1 = existing low-frequency seam heal.
+    Pass 2 = mid-scale seam heal with reduced amplitude.
+    """
+
+    info: dict[str, Any] = {
+        'enabled': True,
+        'applied': False,
+        'reason': '',
+        'multiscale': True,
+        'base_strength': float(strength),
+        'mid_gain': float(mid_gain),
+        'mid_sigma_scale': float(mid_sigma_scale),
+        'mid_rel_scale': float(mid_rel_scale),
+        'pass1': {},
+        'pass2': {},
+        'seam_weight_mean': 0.0,
+        'seam_weight_p95': 0.0,
+        'delta_abs_p95': 0.0,
+    }
+
+    try:
+        mid_gain = float(max(0.0, min(1.0, float(mid_gain))))
+    except Exception:
+        mid_gain = 0.35
+    try:
+        mid_sigma_scale = float(max(0.30, min(1.20, float(mid_sigma_scale))))
+    except Exception:
+        mid_sigma_scale = 0.60
+    try:
+        mid_rel_scale = float(max(0.30, min(1.50, float(mid_rel_scale))))
+    except Exception:
+        mid_rel_scale = 0.70
+
+    out1, info1 = _apply_visual_seam_heal_low_frequency(
+        mosaic_hwc,
+        alpha_mask=alpha_mask,
+        coverage_hw=coverage_hw,
+        strength=strength,
+        sigma_small=sigma_small,
+        sigma_large=sigma_large,
+        seam_sigma=seam_sigma,
+        max_rel_delta=max_rel_delta,
+        logger=logger,
+    )
+    info['pass1'] = info1 or {}
+
+    if out1 is None or not bool((info1 or {}).get('applied', False)):
+        info['reason'] = f"pass1_{(info1 or {}).get('reason', 'failed')}"
+        return out1, info
+
+    mid_strength = float(max(0.0, min(1.0, float(strength) * mid_gain)))
+    mid_small = float(max(1.0, float(sigma_small) * mid_sigma_scale))
+    mid_large = float(max(mid_small + 1.0, float(sigma_large) * mid_sigma_scale))
+    mid_seam_sigma = float(max(0.5, float(seam_sigma) * 0.85))
+    mid_rel = float(max(0.01, min(0.30, float(max_rel_delta) * mid_rel_scale)))
+
+    out2, info2 = _apply_visual_seam_heal_low_frequency(
+        out1,
+        alpha_mask=alpha_mask,
+        coverage_hw=coverage_hw,
+        strength=mid_strength,
+        sigma_small=mid_small,
+        sigma_large=mid_large,
+        seam_sigma=mid_seam_sigma,
+        max_rel_delta=mid_rel,
+        logger=logger,
+    )
+    info['pass2'] = info2 or {}
+
+    applied1 = bool((info1 or {}).get('applied', False))
+    applied2 = bool((info2 or {}).get('applied', False))
+    info['applied'] = bool(applied1 or applied2)
+    info['reason'] = 'ok' if info['applied'] else f"pass2_{(info2 or {}).get('reason', 'failed')}"
+
+    src = info2 if applied2 else info1
+    if isinstance(src, dict):
+        info['seam_weight_mean'] = float(src.get('seam_weight_mean', 0.0) or 0.0)
+        info['seam_weight_p95'] = float(src.get('seam_weight_p95', 0.0) or 0.0)
+        info['delta_abs_p95'] = float(src.get('delta_abs_p95', 0.0) or 0.0)
+
+    if logger is not None:
+        logger.info(
+            "[SeamHealMS] applied=%s pass1=%s pass2=%s mid_gain=%.3f mid_sigma_scale=%.3f mid_rel_scale=%.3f final_seam_w_mean=%.5f final_seam_w_p95=%.5f final_delta_abs_p95=%.5f",
+            bool(info.get('applied', False)),
+            bool((info1 or {}).get('applied', False)),
+            bool((info2 or {}).get('applied', False)),
+            float(mid_gain),
+            float(mid_sigma_scale),
+            float(mid_rel_scale),
+            float(info.get('seam_weight_mean', 0.0)),
+            float(info.get('seam_weight_p95', 0.0)),
+            float(info.get('delta_abs_p95', 0.0)),
+        )
+
+    return out2 if out2 is not None else out1, info
+
+
 def _apply_final_mosaic_dbe_per_channel(
     mosaic_hwc: np.ndarray | None,
     *,
@@ -11639,6 +11996,88 @@ def _write_csv_diagnostic(path: Path, header: list[str], rows: list[list[Any]]) 
     except Exception:
         logger.debug("diagnostic write failed (csv): %s", path, exc_info=logger.isEnabledFor(logging.DEBUG))
 
+
+def _export_intertile_graph_diagnostics(diagnostics_output_dir: Path | None, effective_tiles: list[dict[str, Any]] | None) -> None:
+    if diagnostics_output_dir is None or not effective_tiles:
+        return
+    if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(zemosaic_utils, "get_last_intertile_diagnostics")):
+        return
+    diag = zemosaic_utils.get_last_intertile_diagnostics() or {}
+    if not isinstance(diag, dict) or not diag:
+        return
+    ids = [str((e or {}).get("tile_id", i)) for i, e in enumerate(effective_tiles)]
+    paths = [str((e or {}).get("path", "")) for e in effective_tiles]
+    def rows(edges):
+        out=[]
+        for e in (edges or []):
+            i,j=int(e.get("i",-1)),int(e.get("j",-1))
+            out.append([i,j, ids[i] if 0<=i<len(ids) else "", ids[j] if 0<=j<len(ids) else "", paths[i] if 0<=i<len(paths) else "", paths[j] if 0<=j<len(paths) else "", float(e.get("weight",0.0) or 0.0), float(e.get("weight_area",0.0) or 0.0), float(e.get("weight_strength",0.0) or 0.0), bool(e.get("kept",False))])
+        return out
+    _write_json_diagnostic(diagnostics_output_dir / "intertile_graph_summary.json", {
+        "status": diag.get("status"), "raw_pairs_count": int(diag.get("raw_pairs_count",0) or 0),
+        "pruned_pairs_count": int(diag.get("pruned_pairs_count",0) or 0), "active_tile_count": int(diag.get("active_tile_count",0) or 0),
+        "components_active": int(diag.get("components_active",0) or 0), "bridges_added": int(diag.get("bridges_added",0) or 0),
+        "fallback_used": bool(diag.get("fallback_used",False)), "prune_k": int(diag.get("prune_k",0) or 0),
+        "prune_weight_mode": str(diag.get("prune_weight_mode","")), "anchor": diag.get("anchor"),
+        "pair_entries_count": int(diag.get("pair_entries_count",0) or 0), "n_tiles": len(ids),
+    })
+    hdr=["i","j","tile_id_i","tile_id_j","path_i","path_j","weight","weight_area","weight_strength","kept"]
+    _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_raw.csv", hdr, rows(diag.get("graph_raw_edges")))
+    _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_kept.csv", hdr, rows(diag.get("graph_kept_edges")))
+    _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_rejected.csv", hdr, rows(diag.get("graph_rejected_edges")))
+
+
+def _export_weighted_coverage_and_winner_maps(diagnostics_output_dir: Path | None, effective_tiles: list[dict[str, Any]] | None, final_output_wcs, shape_hw: tuple[int, int]) -> None:
+    if diagnostics_output_dir is None or not effective_tiles:
+        return
+    if not (REPROJECT_AVAILABLE and reproject_interp is not None and ASTROPY_AVAILABLE and fits):
+        return
+    h,w=int(shape_hw[0]),int(shape_hw[1])
+    wcov=np.zeros((h,w),dtype=np.float32)
+    winw=np.full((h,w),-np.inf,dtype=np.float32)
+    wini=np.zeros((h,w),dtype=np.int32)
+    for idx,e in enumerate(effective_tiles,1):
+        try:
+            tw_candidate = e.get("tile_weight_effective")
+            if tw_candidate is None:
+                tw_candidate = e.get("tile_weight")
+            try:
+                tw=float(tw_candidate if tw_candidate is not None else 1.0)
+            except Exception:
+                tw=1.0
+            if not math.isfinite(tw) or tw<=0: tw=1.0
+
+            m = e.get("alpha_weight2d")
+            if m is None:
+                m = e.get("coverage_mask")
+            if m is None:
+                a=np.asarray(e.get("data")); m=(np.any(np.isfinite(a),axis=-1) if a.ndim==3 else np.isfinite(a)).astype(np.float32)
+            m=np.clip(np.nan_to_num(np.asarray(m,dtype=np.float32),nan=0.0,posinf=0.0,neginf=0.0),0.0,None)
+            proj,fp=reproject_interp((m*tw,e.get("wcs")), final_output_wcs, shape_out=(h,w), return_footprint=True)
+            if proj is None: continue
+            p=np.asarray(proj,dtype=np.float32); valid=np.isfinite(p)
+            if fp is not None: valid &= (np.asarray(fp,dtype=np.float32)>0)
+            c=np.where(valid,np.maximum(p,0.0),0.0).astype(np.float32)
+            wcov += c
+            better=valid & (c>winw); winw[better]=c[better]; wini[better]=idx
+        except Exception:
+            continue
+    hdr=fits.Header();
+    try: hdr.update(final_output_wcs.to_header(relax=True))
+    except Exception: pass
+    hdr['EXTNAME']=("WEIGHTCOV","Weighted coverage map")
+    zemosaic_utils.save_fits_image(wcov, str(diagnostics_output_dir / "weighted_coverage_map.fits"), header=hdr, overwrite=True, save_as_float=True, axis_order="HWC")
+    hdr2=fits.Header();
+    try: hdr2.update(final_output_wcs.to_header(relax=True))
+    except Exception: pass
+    hdr2['EXTNAME']=("WINNERMAP","Dominant tile index map")
+    zemosaic_utils.save_fits_image(wini.astype(np.int32), str(diagnostics_output_dir / "winner_map.fits"), header=hdr2, overwrite=True, save_as_float=False, axis_order="HWC")
+    tot=int(np.prod(wini.shape)) if wini.size else 0
+    rows=[]
+    for idx,e in enumerate(effective_tiles,1):
+        px=int(np.count_nonzero(wini==idx)); rows.append([idx,str(e.get("tile_id",idx)),str(e.get("path","")),px,(float(px)/float(tot) if tot>0 else 0.0)])
+    _write_csv_diagnostic(diagnostics_output_dir / "winner_index.csv", ["winner_index","tile_id","path","pixels_won","fraction_of_frame"], rows)
+
 # --- Alignment Warning Tracking ---
 # These warnings come from zemosaic_align_stack when an image fails to align.
 # We count them here so a summary can be written at the end of a run.
@@ -16784,18 +17223,51 @@ def assemble_final_mosaic_reproject_coadd(
                 )
                 alpha_mask_arr = None
             else:
-                valid2d = alpha_mask_arr > ALPHA_OPACITY_THRESHOLD
-                alpha_weight2d = valid2d.astype(np.float32, copy=False)
+                # NEW (MVP): allow soft per-pixel alpha weights instead of hard binarization.
+                # This preserves edge contributions and reduces risk of hard holes/seams.
+                alpha_soft_weights_enabled = bool(
+                    worker_config_cache.get("phase5_alpha_soft_weights", True)
+                )
+                try:
+                    alpha_weight_floor = float(
+                        worker_config_cache.get("phase5_alpha_weight_floor", 0.0)
+                    )
+                except Exception:
+                    alpha_weight_floor = 0.0
+                if not math.isfinite(alpha_weight_floor):
+                    alpha_weight_floor = 0.0
+                alpha_weight_floor = float(np.clip(alpha_weight_floor, 0.0, 1.0))
+
+                alpha_arr = np.asarray(alpha_mask_arr, dtype=np.float32, order="C")
+                alpha_arr = np.nan_to_num(alpha_arr, nan=0.0, posinf=0.0, neginf=0.0)
+                alpha_arr = np.clip(alpha_arr, 0.0, 1.0)
+
+                if alpha_soft_weights_enabled:
+                    alpha_weight2d = alpha_arr
+                    if alpha_weight_floor > 0.0:
+                        alpha_weight2d = np.where(
+                            alpha_weight2d > 0.0,
+                            np.maximum(alpha_weight2d, alpha_weight_floor),
+                            0.0,
+                        ).astype(np.float32, copy=False)
+                    valid2d = alpha_weight2d > 0.0
+                else:
+                    valid2d = alpha_arr > ALPHA_OPACITY_THRESHOLD
+                    alpha_weight2d = valid2d.astype(np.float32, copy=False)
+
                 data = np.array(data, dtype=np.float32, order="C", copy=True)
                 if data.ndim == 3:
                     data[~valid2d, :] = 0.0
                 else:
                     data[~valid2d] = 0.0
+
                 if not alpha_debug_logged:
                     try:
-                        alpha_min = float(np.nanmin(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
-                        alpha_max = float(np.nanmax(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
+                        alpha_min = float(np.nanmin(alpha_arr)) if alpha_arr.size else 0.0
+                        alpha_max = float(np.nanmax(alpha_arr)) if alpha_arr.size else 0.0
                         valid_frac = float(np.mean(valid2d)) if valid2d.size else 0.0
+                        w_min = float(np.nanmin(alpha_weight2d)) if alpha_weight2d is not None and alpha_weight2d.size else 0.0
+                        w_max = float(np.nanmax(alpha_weight2d)) if alpha_weight2d is not None and alpha_weight2d.size else 0.0
                         _pcb(
                             "[Alpha] mask stats",
                             prog=None,
@@ -16803,6 +17275,10 @@ def assemble_final_mosaic_reproject_coadd(
                             alpha_min=f"{alpha_min:.3f}",
                             alpha_max=f"{alpha_max:.3f}",
                             valid_frac=f"{valid_frac:.3f}",
+                            soft_weights=bool(alpha_soft_weights_enabled),
+                            weight_floor=f"{alpha_weight_floor:.3f}",
+                            weight_min=f"{w_min:.3f}",
+                            weight_max=f"{w_max:.3f}",
                             weight_shape=str(alpha_weight2d.shape),
                             data_shape=str(data.shape[:2]),
                         )
@@ -17428,6 +17904,16 @@ def assemble_final_mosaic_reproject_coadd(
             )
             pending_affine_list = None
             nontrivial_affine = False
+
+
+        try:
+            export_graph_debug = _coerce_bool_flag(worker_config_cache.get("phase5_export_graph_debug", True))
+            if export_graph_debug is None:
+                export_graph_debug = True
+            if diagnostics_output_dir is not None and bool(export_graph_debug):
+                _export_intertile_graph_diagnostics(diagnostics_output_dir, effective_tiles)
+        except Exception:
+            logger.debug("intertile graph export failed", exc_info=logger.isEnabledFor(logging.DEBUG))
 
     total_tiles_prepared = len(effective_tiles)
     pending_affine_list, anchor_shift_applied = _compose_global_anchor_shift(
@@ -18306,6 +18792,21 @@ def assemble_final_mosaic_reproject_coadd(
 
     if isinstance(coverage, np.ndarray):
         coverage = np.where(np.isfinite(coverage), coverage, 0.0).astype(np.float32, copy=False)
+
+    try:
+        export_weight_maps = _coerce_bool_flag(worker_config_cache.get("phase5_export_weight_maps", True))
+        if export_weight_maps is None:
+            export_weight_maps = True
+        if diagnostics_output_dir is not None and bool(export_weight_maps) and isinstance(coverage, np.ndarray):
+            _export_weighted_coverage_and_winner_maps(
+                diagnostics_output_dir=diagnostics_output_dir,
+                effective_tiles=effective_tiles,
+                final_output_wcs=final_output_wcs,
+                shape_hw=(int(coverage.shape[0]), int(coverage.shape[1])),
+            )
+    except Exception:
+        logger.debug("weighted coverage / winner map export failed", exc_info=logger.isEnabledFor(logging.DEBUG))
+
     if isinstance(coverage, np.ndarray) and existing_master_tiles_mode:
         try:
             cov_mask_bool = np.asarray(coverage, dtype=np.float32, order="C")
@@ -21178,6 +21679,30 @@ def run_hierarchical_mosaic_classic_legacy(
                         return True
                     if "final_mosaic" in name or name.startswith("zemosaic_mt"):
                         return True
+
+                    # Existing-master mode is recursive by design, but must never
+                    # re-ingest tiles parked in rejection/quarantine folders.
+                    # Keep this scoped to existing-master discovery only.
+                    reject_exact = {
+                        "rejected_by_quality",
+                        "rejected",
+                        "rejects",
+                        "quarantine",
+                        "trash",
+                        "failed",
+                    }
+                    reject_contains = (
+                        "reject",
+                        "rejet",
+                    )
+                    for parent_part in path_obj.parts[:-1]:
+                        pp = str(parent_part).strip().lower()
+                        if not pp:
+                            continue
+                        if pp in reject_exact:
+                            return True
+                        if any(tok in pp for tok in reject_contains):
+                            return True
                     return False
 
                 candidates: list[Path] = []
@@ -21197,13 +21722,21 @@ def run_hierarchical_mosaic_classic_legacy(
                             continue
 
                 unique_candidates = {}
+                excluded_existing_candidates = 0
                 for candidate in candidates:
                     try:
                         if _exclude_master_tile(candidate):
+                            excluded_existing_candidates += 1
                             continue
                         unique_candidates[str(candidate)] = candidate
                     except Exception:
                         continue
+
+                if excluded_existing_candidates > 0:
+                    logger.info(
+                        "[ExistingMaster] excluded %d recursive candidate(s) from reject/quarantine folders",
+                        int(excluded_existing_candidates),
+                    )
 
                 filtered_candidates = sorted(
                     unique_candidates.values(), key=lambda p: str(p).lower()
@@ -22787,6 +23320,15 @@ def run_hierarchical_mosaic_classic_legacy(
             "intertile_force_safe_mode": intertile_force_safe_mode_config,
             "intertile_prune_k": intertile_prune_k_config,
             "intertile_prune_weight_mode": intertile_prune_weight_mode_config,
+            "intertile_offset_only_v1": bool((worker_config_cache or {}).get("intertile_offset_only_v1", False)),
+            "intertile_gain_offset_v2": bool((worker_config_cache or {}).get("intertile_gain_offset_v2", False)),
+            "intertile_gain_prior_lambda": float((worker_config_cache or {}).get("intertile_gain_prior_lambda", 0.02) or 0.02),
+            "intertile_gain_clip": (worker_config_cache or {}).get("intertile_gain_clip", (0.90, 1.10)) or (0.90, 1.10),
+            "intertile_offset_clip": (worker_config_cache or {}).get("intertile_offset_clip", (-2000.0, 2000.0)) or (-2000.0, 2000.0),
+            "intertile_pair_gain_clip": (worker_config_cache or {}).get("intertile_pair_gain_clip", (0.5, 2.0)) or (0.5, 2.0),
+            "intertile_pair_offset_abs_max": float((worker_config_cache or {}).get("intertile_pair_offset_abs_max", 5000.0) or 5000.0),
+            "intertile_max_irls_iters": int((worker_config_cache or {}).get("intertile_max_irls_iters", 3) or 3),
+            "intertile_enforce_requested_solver": bool((worker_config_cache or {}).get("intertile_enforce_requested_solver", False)),
             "coadd_use_memmap": coadd_use_memmap_config,
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
@@ -25033,6 +25575,193 @@ def run_hierarchical_mosaic_classic_legacy(
                     apply_wb=preview_apply_wb,
                 )
 
+                raw_visual_seam_heal_enabled = (
+                    getattr(_cfg_obj, "visual_seam_heal_enabled", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_enabled is None:
+                    raw_visual_seam_heal_enabled = _cfg_cache.get("visual_seam_heal_enabled", False)
+                visual_seam_heal_enabled = _coerce_bool_flag(raw_visual_seam_heal_enabled)
+                if visual_seam_heal_enabled is None:
+                    visual_seam_heal_enabled = False
+                visual_seam_heal_enabled = bool(visual_seam_heal_enabled)
+
+                raw_visual_seam_heal_strength = (
+                    getattr(_cfg_obj, "visual_seam_heal_strength", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_strength is None:
+                    raw_visual_seam_heal_strength = _cfg_cache.get("visual_seam_heal_strength", 0.45)
+
+                raw_visual_seam_heal_sigma_small = (
+                    getattr(_cfg_obj, "visual_seam_heal_sigma_small", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_sigma_small is None:
+                    raw_visual_seam_heal_sigma_small = _cfg_cache.get("visual_seam_heal_sigma_small", 24.0)
+
+                raw_visual_seam_heal_sigma_large = (
+                    getattr(_cfg_obj, "visual_seam_heal_sigma_large", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_sigma_large is None:
+                    raw_visual_seam_heal_sigma_large = _cfg_cache.get("visual_seam_heal_sigma_large", 96.0)
+
+                raw_visual_seam_heal_seam_sigma = (
+                    getattr(_cfg_obj, "visual_seam_heal_seam_sigma", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_seam_sigma is None:
+                    raw_visual_seam_heal_seam_sigma = _cfg_cache.get("visual_seam_heal_seam_sigma", 2.5)
+
+                raw_visual_seam_heal_max_rel_delta = (
+                    getattr(_cfg_obj, "visual_seam_heal_max_rel_delta", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_max_rel_delta is None:
+                    raw_visual_seam_heal_max_rel_delta = _cfg_cache.get("visual_seam_heal_max_rel_delta", 0.08)
+
+                try:
+                    visual_seam_heal_strength = float(raw_visual_seam_heal_strength)
+                except Exception:
+                    visual_seam_heal_strength = 0.45
+                try:
+                    visual_seam_heal_sigma_small = float(raw_visual_seam_heal_sigma_small)
+                except Exception:
+                    visual_seam_heal_sigma_small = 24.0
+                try:
+                    visual_seam_heal_sigma_large = float(raw_visual_seam_heal_sigma_large)
+                except Exception:
+                    visual_seam_heal_sigma_large = 96.0
+                try:
+                    visual_seam_heal_seam_sigma = float(raw_visual_seam_heal_seam_sigma)
+                except Exception:
+                    visual_seam_heal_seam_sigma = 2.5
+                try:
+                    visual_seam_heal_max_rel_delta = float(raw_visual_seam_heal_max_rel_delta)
+                except Exception:
+                    visual_seam_heal_max_rel_delta = 0.08
+
+                raw_visual_seam_heal_multiscale_enabled = (
+                    getattr(_cfg_obj, "visual_seam_heal_multiscale_enabled", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_multiscale_enabled is None:
+                    raw_visual_seam_heal_multiscale_enabled = _cfg_cache.get("visual_seam_heal_multiscale_enabled", False)
+                visual_seam_heal_multiscale_enabled = _coerce_bool_flag(raw_visual_seam_heal_multiscale_enabled)
+                if visual_seam_heal_multiscale_enabled is None:
+                    visual_seam_heal_multiscale_enabled = False
+                visual_seam_heal_multiscale_enabled = bool(visual_seam_heal_multiscale_enabled)
+
+                raw_visual_seam_heal_multiscale_mid_gain = (
+                    getattr(_cfg_obj, "visual_seam_heal_multiscale_mid_gain", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_multiscale_mid_gain is None:
+                    raw_visual_seam_heal_multiscale_mid_gain = _cfg_cache.get("visual_seam_heal_multiscale_mid_gain", 0.35)
+
+                raw_visual_seam_heal_multiscale_mid_sigma_scale = (
+                    getattr(_cfg_obj, "visual_seam_heal_multiscale_mid_sigma_scale", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_multiscale_mid_sigma_scale is None:
+                    raw_visual_seam_heal_multiscale_mid_sigma_scale = _cfg_cache.get("visual_seam_heal_multiscale_mid_sigma_scale", 0.60)
+
+                raw_visual_seam_heal_multiscale_mid_rel_scale = (
+                    getattr(_cfg_obj, "visual_seam_heal_multiscale_mid_rel_scale", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_multiscale_mid_rel_scale is None:
+                    raw_visual_seam_heal_multiscale_mid_rel_scale = _cfg_cache.get("visual_seam_heal_multiscale_mid_rel_scale", 0.70)
+
+                try:
+                    visual_seam_heal_multiscale_mid_gain = float(raw_visual_seam_heal_multiscale_mid_gain)
+                except Exception:
+                    visual_seam_heal_multiscale_mid_gain = 0.35
+                try:
+                    visual_seam_heal_multiscale_mid_sigma_scale = float(raw_visual_seam_heal_multiscale_mid_sigma_scale)
+                except Exception:
+                    visual_seam_heal_multiscale_mid_sigma_scale = 0.60
+                try:
+                    visual_seam_heal_multiscale_mid_rel_scale = float(raw_visual_seam_heal_multiscale_mid_rel_scale)
+                except Exception:
+                    visual_seam_heal_multiscale_mid_rel_scale = 0.70
+
+                if visual_seam_heal_enabled:
+                    coverage_preview = None
+                    if final_mosaic_coverage_HW is not None:
+                        try:
+                            cov_src = np.asarray(final_mosaic_coverage_HW, dtype=np.float32)
+                            if cov_src.ndim > 2:
+                                cov_src = np.squeeze(cov_src)
+                            coverage_preview = cov_src[::step, ::step] if step > 1 else cov_src
+                            if (
+                                coverage_preview is not None
+                                and coverage_preview.shape[:2] != preview_view.shape[:2]
+                            ):
+                                try:
+                                    import cv2  # type: ignore
+
+                                    coverage_preview = cv2.resize(
+                                        coverage_preview,
+                                        (preview_view.shape[1], preview_view.shape[0]),
+                                        interpolation=cv2.INTER_LINEAR,
+                                    )
+                                except Exception:
+                                    coverage_preview = None
+                        except Exception:
+                            coverage_preview = None
+
+                    if visual_seam_heal_multiscale_enabled:
+                        preview_view, seam_heal_info = _apply_visual_seam_heal_multiscale(
+                            preview_view,
+                            alpha_mask=alpha_preview,
+                            coverage_hw=coverage_preview,
+                            strength=visual_seam_heal_strength,
+                            sigma_small=visual_seam_heal_sigma_small,
+                            sigma_large=visual_seam_heal_sigma_large,
+                            seam_sigma=visual_seam_heal_seam_sigma,
+                            max_rel_delta=visual_seam_heal_max_rel_delta,
+                            mid_gain=visual_seam_heal_multiscale_mid_gain,
+                            mid_sigma_scale=visual_seam_heal_multiscale_mid_sigma_scale,
+                            mid_rel_scale=visual_seam_heal_multiscale_mid_rel_scale,
+                            logger=logger,
+                        )
+                        logger.info(
+                            "[SeamHeal] preview gate enabled=True mode=multiscale applied=%s reason=%s",
+                            bool((seam_heal_info or {}).get("applied", False)),
+                            (seam_heal_info or {}).get("reason", ""),
+                        )
+                    else:
+                        preview_view, seam_heal_info = _apply_visual_seam_heal_low_frequency(
+                            preview_view,
+                            alpha_mask=alpha_preview,
+                            coverage_hw=coverage_preview,
+                            strength=visual_seam_heal_strength,
+                            sigma_small=visual_seam_heal_sigma_small,
+                            sigma_large=visual_seam_heal_sigma_large,
+                            seam_sigma=visual_seam_heal_seam_sigma,
+                            max_rel_delta=visual_seam_heal_max_rel_delta,
+                            logger=logger,
+                        )
+                        logger.info(
+                            "[SeamHeal] preview gate enabled=True mode=single applied=%s reason=%s",
+                            bool((seam_heal_info or {}).get("applied", False)),
+                            (seam_heal_info or {}).get("reason", ""),
+                        )
+                else:
+                    logger.info("[SeamHeal] preview gate enabled=False")
+
                 # Prefer GPU stretch when GPU is enabled/available
                 if use_gpu_phase5_flag and hasattr(zemosaic_utils, 'stretch_auto_asifits_like_gpu'):
                     m_stretched = zemosaic_utils.stretch_auto_asifits_like_gpu(
@@ -25614,6 +26343,14 @@ def run_hierarchical_mosaic(
     global_wcs_plan["sds_mode"] = bool(sds_mode_flag)
 
     if (not grid_mode_detected) and (not sds_mode_flag):
+        # Keep prune parameters explicit in classic path (fallback to config cache).
+        # This avoids accidental fallback to legacy defaults (K=8, mode=area).
+        try:
+            intertile_prune_k_config = int(worker_config_cache.get("intertile_prune_k", 8) or 8)
+        except Exception:
+            intertile_prune_k_config = 8
+        intertile_prune_weight_mode_config = str(worker_config_cache.get("intertile_prune_weight_mode", "area") or "area")
+
         logger.info("[Classic] Using legacy classic pipeline from non grid worker")
         return run_hierarchical_mosaic_classic_legacy(
             input_folder=input_folder,
@@ -25684,6 +26421,9 @@ def run_hierarchical_mosaic(
             intertile_global_recenter_config=intertile_global_recenter_config,
             intertile_recenter_clip_config=intertile_recenter_clip_config,
             use_auto_intertile_config=use_auto_intertile_config,
+            intertile_force_safe_mode_config=intertile_force_safe_mode_config,
+            intertile_prune_k_config=intertile_prune_k_config,
+            intertile_prune_weight_mode_config=intertile_prune_weight_mode_config,
             match_background_for_final_config=match_background_for_final_config,
             incremental_feather_parity_config=incremental_feather_parity_config,
             two_pass_coverage_renorm_config=two_pass_coverage_renorm_config,
@@ -29662,6 +30402,63 @@ def run_hierarchical_mosaic(
                                       # ASIFitsView utilise souvent un 'midtones balance' (gamma-like) aussi.
                                       # Un 'a' de 10 comme dans ton code de test est très doux. Essayons 0.5 ou 1.0.
                 preview_asinh_a = 20.0 # Test avec une valeur plus douce pour le 'a' de asinh
+
+                raw_visual_seam_heal_enabled_legacy = getattr(zconfig, "visual_seam_heal_enabled", False)
+                visual_seam_heal_enabled_legacy = _coerce_bool_flag(raw_visual_seam_heal_enabled_legacy)
+                if visual_seam_heal_enabled_legacy is None:
+                    visual_seam_heal_enabled_legacy = False
+                visual_seam_heal_enabled_legacy = bool(visual_seam_heal_enabled_legacy)
+
+                if visual_seam_heal_enabled_legacy:
+                    try:
+                        visual_seam_heal_strength_legacy = float(getattr(zconfig, "visual_seam_heal_strength", 0.45))
+                    except Exception:
+                        visual_seam_heal_strength_legacy = 0.45
+                    try:
+                        visual_seam_heal_sigma_small_legacy = float(getattr(zconfig, "visual_seam_heal_sigma_small", 24.0))
+                    except Exception:
+                        visual_seam_heal_sigma_small_legacy = 24.0
+                    try:
+                        visual_seam_heal_sigma_large_legacy = float(getattr(zconfig, "visual_seam_heal_sigma_large", 96.0))
+                    except Exception:
+                        visual_seam_heal_sigma_large_legacy = 96.0
+                    try:
+                        visual_seam_heal_seam_sigma_legacy = float(getattr(zconfig, "visual_seam_heal_seam_sigma", 2.5))
+                    except Exception:
+                        visual_seam_heal_seam_sigma_legacy = 2.5
+                    try:
+                        visual_seam_heal_max_rel_delta_legacy = float(getattr(zconfig, "visual_seam_heal_max_rel_delta", 0.08))
+                    except Exception:
+                        visual_seam_heal_max_rel_delta_legacy = 0.08
+
+                    coverage_preview_legacy = None
+                    if final_mosaic_coverage_HW is not None:
+                        try:
+                            cov_src = np.asarray(final_mosaic_coverage_HW, dtype=np.float32)
+                            if cov_src.ndim > 2:
+                                cov_src = np.squeeze(cov_src)
+                            coverage_preview_legacy = cov_src[::step, ::step] if step > 1 else cov_src
+                        except Exception:
+                            coverage_preview_legacy = None
+
+                    preview_view, seam_heal_info_legacy = _apply_visual_seam_heal_low_frequency(
+                        preview_view,
+                        alpha_mask=alpha_preview,
+                        coverage_hw=coverage_preview_legacy,
+                        strength=visual_seam_heal_strength_legacy,
+                        sigma_small=visual_seam_heal_sigma_small_legacy,
+                        sigma_large=visual_seam_heal_sigma_large_legacy,
+                        seam_sigma=visual_seam_heal_seam_sigma_legacy,
+                        max_rel_delta=visual_seam_heal_max_rel_delta_legacy,
+                        logger=logger,
+                    )
+                    logger.info(
+                        "[SeamHeal] preview gate enabled=True applied=%s reason=%s",
+                        bool((seam_heal_info_legacy or {}).get("applied", False)),
+                        (seam_heal_info_legacy or {}).get("reason", ""),
+                    )
+                else:
+                    logger.info("[SeamHeal] preview gate enabled=False")
 
                 # Prefer GPU stretch when GPU is enabled/available
                 if use_gpu_phase5_flag and hasattr(zemosaic_utils, 'stretch_auto_asifits_like_gpu'):

@@ -1,0 +1,12 @@
+{
+    "intertile_gain_offset_v2": true,
+    "intertile_offset_only_v1": false,
+    "intertile_photometric_match": true,
+    "intertile_global_recenter": false,
+    "intertile_gain_prior_lambda": 0.05,
+    "intertile_gain_clip": [0.9, 1.1],
+    "intertile_offset_clip": [-2000.0, 2000.0],
+    "intertile_pair_gain_clip": [0.75, 1.25],
+    "intertile_pair_offset_abs_max": 4000.0,
+    "intertile_max_irls_iters": 8
+}

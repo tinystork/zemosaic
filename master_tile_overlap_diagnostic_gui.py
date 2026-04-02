@@ -8,6 +8,7 @@ master tile overlap diagnostic tool.
 from __future__ import annotations
 
 import sys
+import shlex
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -159,7 +160,16 @@ class MasterTileOverlapDiagnosticGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Please specify input paths.")
             return
 
-        args = inputs.split()
+        try:
+            # Use shell-like parsing so quoted paths containing spaces are preserved
+            # (e.g. /media/tristan/X10 Pro/...).
+            args = shlex.split(inputs)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Error", f"Invalid input paths: {exc}")
+            return
+
+        # Normalize accidental extra quotes from manual edits.
+        args = [a.strip().strip('"').strip("'") for a in args if a.strip()]
         if self.recursive_check.isChecked():
             args.insert(0, "--recursive")
 

@@ -505,3 +505,75 @@ Pour chaque tuile `t`:
   - exiger logs `constraints/kept/rejected`, `residual_abs_med/p95`, `worst pairs`,
   - puis comparer seams et métriques sur run dédié (M2 ON / M1 OFF).
 
+
+
+## Addendum 2026-03-30 (runs L/M + préparation N)
+
+### Constat
+- L -> M: amélioration incrémentale seulement (pas de saut visuel massif).
+- Run M confirme l'effet de `tile_weight_v4` (ratio tile weights 1.10 au lieu de 1.00).
+- `SeamHeal` actif sur L et M, gains surtout sur indicateurs seam-weight, faible sur `delta_abs_p95`.
+
+### Décision de méthode
+- Continuer en **un seul changement par run** pour garder une attribution causale claire.
+- Préparer le run N en GUI-launch avec une variable unique: `visual_seam_heal_strength`.
+
+
+## Addendum 2026-03-30 (bascule étape suivante — brique multiscale)
+
+Décision:
+- Stopper le fine-tuning mono-paramètre du seam-heal v1 (gains marginaux, seams encore visibles).
+- Passer à une brique plus structurante: **SeamHeal preview multiscale** (Phase 6, visuel uniquement).
+
+Implémentation installée:
+- Nouveau mode config-gated dans `zemosaic_worker.py`:
+  - `_apply_visual_seam_heal_multiscale(...)`
+  - pass 1 low-frequency (v1 existant)
+  - pass 2 mid-scale (amplitude réduite) pour mieux lisser les discontinuités persistantes
+- Nouvelles clés `DEFAULT_CONFIG`:
+  - `visual_seam_heal_multiscale_enabled`
+  - `visual_seam_heal_multiscale_mid_gain`
+  - `visual_seam_heal_multiscale_mid_sigma_scale`
+  - `visual_seam_heal_multiscale_mid_rel_scale`
+- Validation technique: `py_compile` OK.
+
+
+## Addendum 2026-03-31 (plan runs témoins avant recalibration géométrique)
+
+Décision opératoire validée:
+- Ne pas engager immédiatement la recalibration géométrique.
+- Exécuter d'abord 2 runs témoins pour dissocier limite algorithme vs limite dataset.
+
+Runs planifiés:
+1) `M106_2` sur `/home/tristan/zemosaic/zemosaic/example/lights/` (run complet).
+2) `NGC6888_6` sur `/media/tristan/X10 Pro/mosaic/test/NGC6888_4/zemosaic_temp_master_tiles/` (existing masters).
+
+Règle stricte:
+- Conserver un seul axe de variation (dataset), avec réglages seam/blend identiques.
+- Après comparaison métriques + visuel: décision GO/NO-GO recalibration géométrique.
+
+
+## Addendum 2026-04-01 — Runs témoins effectués (M106_2 / NGC6888_6)
+
+Statut:
+- `M106_2` exécuté et complété.
+- `NGC6888_6` exécuté et complété.
+
+Conclusion opérationnelle:
+- Les deux runs témoins sont jugés **non concluants** pour valider une amélioration seams suffisamment décisive.
+- La phase de micro-retune visuelle seule n'est pas suffisante pour clore la mission.
+
+Décision mission:
+- Prioriser les axes structurels (pondération effective, masques/alpha, reproject/coadd, instrumentation winner/coverage) avant toute nouvelle série de micro-ajustements visuels.
+- Conserver la discipline: un changement causal à la fois, preuve logs + artefacts à chaque itération.
+
+
+## Addendum 2026-04-01 — Instrumentation diagnostic structurelle
+
+Ajout validé:
+- `winner_map` + `weighted_coverage_map` exportés automatiquement en sortie run.
+- Graphe intertile exporté en 3 vues (raw/kept/rejected) + résumé JSON.
+
+Règle d'exploitation:
+- toute hypothèse "trou" doit être corrélée à ces artefacts (pas uniquement au rendu PNG).
+- privilégier explication causale: zone vide = faible weighted coverage + winner instable + arêtes critiques rejetées.

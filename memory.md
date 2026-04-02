@@ -3463,3 +3463,172 @@ Intention produit:
 - réduire la domination locale des tuiles fortes,
 - conserver un léger levier de blend,
 - laisser la correction des seams se jouer principalement côté harmonisation intertile.
+
+## 2026-03-29 00:53 — Comparatif runs J/K (seams) + décision de trajectoire
+
+Contexte:
+- comparaison demandée entre:
+  - `/media/tristan/X10 Pro/mosaic/test/test run J/`
+  - `/media/tristan/X10 Pro/mosaic/test/test run K/`
+- objectif: vérifier si les derniers seams visibles sont réellement atténués.
+
+Résultats objectifs:
+- `coverage_5873x4667.dat`: **identique** (hash identique).
+- `mosaic_5873x4667x3.dat`: différences **ultra-minimes**:
+  - 95 valeurs différentes sur 82,227,873 (1.16e-6)
+  - diff max = 0.0038146973
+- `zemosaic_MT197_R0_preview.png`: 224 valeurs différentes, diff max = 1 ADU (négligeable visuellement).
+- Logs `TwoPassWorst`: mêmes paires/ordres de grandeur entre J et K.
+- Conclusion terrain: **pas de différence notable** sur les seams entre J et K.
+
+Paramètres/snapshot observés différents J vs K (mais impact final quasi nul):
+- `intertile_affine_blend`: 1.0 (J) vs 0.5 (K)
+- `radial_feather_fraction`: 0.94 (J) vs 0.92 (K)
+- contexte machine/chemins (3070 vs MX150, Windows vs Linux paths)
+
+Décision mission:
+- La phase actuelle n'indique pas un gain via micro-retune de ces seuls paramètres.
+- Priorité: **sortir du tuning fin isolé** et valider une piste plus structurante:
+  1) exécuter run dédié M2 (gain+offset robuste) avec protocole métrique strict,
+  2) revalider le graphe intertile réellement retenu (pruning/scoring),
+  3) si stagnation confirmée: ouvrir une piste supplémentaire dédiée aux résidus (correction low-frequency visuelle en finition, optionnelle).
+
+Position opérationnelle:
+- Continuer les tests, mais éviter d'enchaîner des retunes faibles J/K-like qui ne bougent pas le résultat.
+- Chercher un "step change" mesurable plutôt qu'un ajustement incrémental imperceptible.
+
+## 2026-03-29 00:54 — Kit opérationnel M2 + revalidation graphe/pruning mis en place
+
+Pour sortir du plateau J/K (diff quasi nulle), mise en place d'un kit de validation structuré:
+
+Fichiers ajoutés:
+- `tools/m2_graph_revalidation_protocol.md`
+  - protocole de runs R0/R1/R2/(R3 optionnel)
+  - garde-fous de comparabilité
+  - critères GO/NO-GO
+- `tools/m2_seam_report.py`
+  - comparaison objective de 2 runs:
+    - diff config (clés M2/pruning/weighting)
+    - stats `tile_weights_final.csv`
+    - résumé logs (`TwoPassWorst`, marqueurs M2)
+    - diff numérique `mosaic_5873x4667x3.dat`
+
+Profils overrides prêts:
+- `profiles/run_r1_m2_on_overrides.json`
+- `profiles/run_r2_m2_on_prune_reval_overrides.json`
+- `profiles/run_r3_m2_on_weighting_off_overrides.json`
+
+Commande de comparaison testée (J vs K):
+- `python3 tools/m2_seam_report.py "...run J" "...run K"`
+- confirme plateau: `TwoPassWorst` inchangé et diff mosaïque ultra-minime.
+
+Décision opérationnelle:
+- passer en campagne R1/R2 (et R3 si besoin) avec analyse systématique via `m2_seam_report.py`,
+- arrêter les micro-retunes isolées tant qu'un step change mesurable n'apparaît pas.
+
+## 2026-03-29 22:xx — Verdict R1/R2 + activation contrôlée du seam-heal visuel
+
+Constat protocole strict (outil `tools/m2_seam_report.py` + logs):
+- R1 vs R2: **identiques bit-à-bit** sur `mosaic_5873x4667x3.dat` (`nonzero_diff=0`, `max_diff=0.0`).
+- Seule différence config observée: `intertile_prune_k` (12 -> 14), sans effet mesurable.
+- `TwoPassWorst`: mêmes valeurs/ordre de paires.
+- Marqueur `M2 gain+offset solve`: absent dans R1/R2.
+
+Décision:
+- Arrêt des micro-retunes R1/R2: aucun gain réel.
+- Piste seam-heal visuel réactivée comme finition contrôlée (non-science).
+
+Implémentation réalisée (Phase 6 preview path):
+- Ajout d'un pass optionnel **luma-first low-frequency seam-heal** dans `zemosaic_worker.py`:
+  - helper: `_apply_visual_seam_heal_low_frequency(...)`
+  - utilitaire blur: `_gaussian_blur_2d_float32(...)`
+  - modulation par signal de seam (gradient coverage/alpha), correction luma bornée.
+- Garde-fous respectés:
+  - `visual-only`
+  - `OFF par défaut`
+  - `Phase 6`
+  - pas d'altération du FITS science principal.
+
+Nouvelles clés config persistées (`DEFAULT_CONFIG`):
+- `visual_seam_heal_enabled` (false)
+- `visual_seam_heal_strength` (0.45)
+- `visual_seam_heal_sigma_small` (24.0)
+- `visual_seam_heal_sigma_large` (96.0)
+- `visual_seam_heal_seam_sigma` (2.5)
+- `visual_seam_heal_max_rel_delta` (0.08)
+
+Validation technique locale:
+- `python -m py_compile zemosaic_worker.py zemosaic_config.py` OK.
+- `pytest -q tests/test_phase3_adaptive_invariants.py` OK.
+
+
+## 2026-03-30 15:xx — Comparatif L/M et discipline d'expérimentation
+
+Résultat vérifié (logs + hashes):
+- M terminé sans erreur, légèrement plus rapide que L (~19 min gagnées).
+- M réactive effectivement le tile-weighting (`ratio=1.10`), L était neutre (`ratio=1.00`).
+- SeamHeal: amélioration modeste (`seam_w_mean/p95` mieux), `delta_abs_p95` quasi identique.
+
+Leçon validée:
+- Sur ce dataset, les gains sont faibles et cumulatifs; la meilleure pratique est **1 variable modifiée par run**.
+- Ne pas mélanger "nouvelle brique" + tuning de valeur dans le même test (sinon attribution impossible).
+
+Action préparée:
+- Run N prêt pour lancement GUI (sortie dédiée `test run N`) avec unique changement `visual_seam_heal_strength=0.5`.
+
+
+## 2026-03-30 23:xx — Stop fine-tuning, installation brique multiscale, préparation P
+
+Contexte:
+- Après N, seams encore visibles à l'œil nu; fine-tuning v1 jugé insuffisant.
+
+Action décidée avec Tristan:
+- Abandon du run O (micro-tune), passage immédiat à l'étape suivante.
+- Installation d'une nouvelle brique **SeamHeal multiscale** (preview-only, Phase 6).
+
+Détails techniques ajoutés:
+- `visual_seam_heal_multiscale_enabled`
+- `visual_seam_heal_multiscale_mid_gain`
+- `visual_seam_heal_multiscale_mid_sigma_scale`
+- `visual_seam_heal_multiscale_mid_rel_scale`
+- `py_compile` OK sur `zemosaic_worker.py` et `zemosaic_config.py`.
+
+Préparation run P:
+- Output: `/media/tristan/X10 Pro/mosaic/test/test run P`
+- Brique multiscale activée avec paramètres conservateurs (0.35 / 0.60 / 0.70)
+- Baseline N conservée (tile weighting ON, strength=0.5, max_rel=0.08).
+
+
+## 2026-03-31 13:5x — Point d'étape mission + plan M106_2 / NGC6888_6
+
+- Run P multiscale jugé utile mais à gain visuel limité sur dataset très hétérogène.
+- Décision avec Tristan: avant recalibration géométrique, lancer 2 runs témoins:
+  - `M106_2` (complet) sur `example/lights` (jeu faible mais révélateur),
+  - `NGC6888_6` (existing masters) sur `NGC6888_4/zemosaic_temp_master_tiles` (jeu plus consistant).
+- Règle conservée: même réglage seam/blend entre les deux runs, seule la source dataset change.
+- Décision recalibration géométrique reportée après comparaison objective de ces deux témoins.
+
+
+### 2026-04-01 — Runs témoins M106_2 / NGC6888_6 vérifiés et statut mission ajusté
+- Vérification disque effectuée dans `/media/tristan/X10 Pro/mosaic/test/`: dossiers `M106_2` et `NGC6888_6` présents avec logs/snapshots/previews.
+- Vérification logs: les deux runs sont terminés (`run_success_processing_completed` + `Run Hierarchical Mosaic COMPLETED`).
+- Retour opérationnel consolidé: résultats **non concluants** pour démontrer un gain seams décisif par simple variation dataset témoin.
+- Décision mission: ne plus investir en priorité dans les micro-retunes visuelles; remonter sur les pistes structurelles (poids effectifs, chaîne alpha/masque, reproject/coadd, instrumentation winner/coverage).
+
+
+### 2026-04-01 — Ajout instrumentation winner/coverage/graph
+- Implémentation de l’instrumentation demandée pour diagnostiquer les trous:
+  - `weighted_coverage_map.fits`
+  - `winner_map.fits`
+  - `winner_index.csv`
+  - `intertile_graph_summary.json`
+  - `intertile_graph_edges_raw/kept/rejected.csv`
+- Source intertile enrichie avec diagnostics internes exposés via `get_last_intertile_diagnostics()`.
+- Objectif: passer d’un diagnostic visuel à une preuve causale exploitable run par run.
+
+
+### 2026-04-01 — Fix de propagation intertile (classic) + bug NameError identifié
+- Diagnostic confirmé: mismatch config/exécution sur NGC6888 (`run_config_snapshot` vs `intertile_graph_summary`) avec retombée observée en `K=8` / `mode=area`.
+- Cause côté wrapper classic non-grid: propagation partielle des paramètres intertile.
+- Correctif appliqué dans `zemosaic_worker.py`: récupération explicite `intertile_prune_k` + `intertile_prune_weight_mode` depuis la config avant appel legacy.
+- Incident introduit puis corrigé immédiatement: `NameError` au lancement de `NGC6888_12` (variable prune non définie), patch de sécurité ajouté, compilation OK.

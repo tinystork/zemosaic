@@ -1,0 +1,10 @@
+{
+  "visual_seam_heal_enabled": true,
+  "visual_seam_heal_strength": 0.40,
+  "visual_seam_heal_sigma_small": 24.0,
+  "visual_seam_heal_sigma_large": 96.0,
+  "visual_seam_heal_seam_sigma": 2.5,
+  "visual_seam_heal_max_rel_delta": 0.08,
+  "enable_tile_weighting": false,
+  "tile_weight_v4_enabled": false
+}
