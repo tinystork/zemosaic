@@ -17113,23 +17113,57 @@ def assemble_final_mosaic_reproject_coadd(
     zero_masked_total = 0
     zero_masked_tiles = 0
     zero_mask_fraction_threshold = 0.05
+    invalid_tiles_skipped = 0
+    invalid_tile_samples: list[str] = []
     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
         tile_header = None
         alpha_mask_arr: np.ndarray | None = None
         alpha_weight2d: np.ndarray | None = None
-        with fits.open(tile_path, memmap=False) as hdul:
-            primary_hdu = hdul[0]
-            data = np.asarray(primary_hdu.data, dtype=np.float32, order="C")
-            try:
-                tile_header = primary_hdu.header.copy()
-            except Exception:
-                tile_header = None
-            if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+        try:
+            with fits.open(tile_path, memmap=False) as hdul:
+                primary_hdu = hdul[0]
+                primary_data = primary_hdu.data
+                if primary_data is None:
+                    raise ValueError("missing primary data")
+                data = np.asarray(primary_data, dtype=np.float32, order="C")
+                if data.size == 0:
+                    raise ValueError("empty primary data")
                 try:
-                    alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
+                    tile_header = primary_hdu.header.copy()
                 except Exception:
-                    alpha_mask_arr = None
+                    tile_header = None
+                if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+                    try:
+                        alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
+                    except Exception:
+                        alpha_mask_arr = None
+        except Exception as open_exc:
+            invalid_tiles_skipped += 1
+            try:
+                _tile_name = _safe_basename(tile_path)
+            except Exception:
+                _tile_name = str(tile_path)
+            if len(invalid_tile_samples) < 12:
+                invalid_tile_samples.append(_tile_name)
+            logger.warning(
+                "Phase5 prep: invalid/corrupt master tile skipped: %s (%s)",
+                _tile_name,
+                open_exc,
+            )
+            try:
+                _pcb(
+                    "run_warn_phase5_invalid_tile_skipped_for_assembly",
+                    prog=None,
+                    lvl="WARN",
+                    filename=_tile_name,
+                    reason=str(open_exc),
+                )
+            except Exception:
+                pass
+            if idx == 1 or (idx % 5 == 0) or (idx == total_tiles_for_prep):
+                _update_eta_prepare(idx, total_tiles_for_prep)
+            continue
 
         # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
         # which stores color images in ``C x H x W`` within the FITS file. When
@@ -17357,6 +17391,20 @@ def assemble_final_mosaic_reproject_coadd(
         # Keep ETA responsive during preparation
         if idx == 1 or (idx % 5 == 0) or (idx == total_tiles_for_prep):
             _update_eta_prepare(idx, total_tiles_for_prep)
+
+
+    if invalid_tiles_skipped > 0:
+        logger.warning(
+            "Phase5 prep: skipped %d invalid/corrupt master tiles; sample=%s",
+            invalid_tiles_skipped,
+            ", ".join(invalid_tile_samples) if invalid_tile_samples else "(none)",
+        )
+
+    if not effective_tiles:
+        logger.error(
+            "Phase5 prep: no valid master tiles available after filtering invalid/corrupt files"
+        )
+        return None, None, None
 
 
     if tile_weighting_active and tile_weight_values:

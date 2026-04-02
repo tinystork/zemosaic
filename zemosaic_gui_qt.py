@@ -4017,7 +4017,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "assembly_process_workers": 0,
             "auto_limit_frames_per_master_tile": True,
             "winsor_max_frames_per_pass": 0,
-            "winsor_worker_limit": 10,
+            "winsor_worker_limit": 0,
             "max_raw_per_master_tile": 0,
             "use_gpu_phase5": False,
             "stack_use_gpu": False,

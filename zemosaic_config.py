@@ -234,7 +234,7 @@ DEFAULT_CONFIG = {
     "cache_retention": "run_end",
     "assembly_process_workers": 0,  # Worker count for final assembly (both methods)
     "auto_limit_frames_per_master_tile": True,
-    "winsor_worker_limit": 10,
+    "winsor_worker_limit": 0,
     "winsor_max_frames_per_pass": 0,
     "winsor_auto_fallback_on_memory_error": True,
     "winsor_min_frames_per_pass": 4,
