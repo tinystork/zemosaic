@@ -4000,6 +4000,22 @@ class FilterQtDialog(QDialog):
         ]
         if not optimized_groups:
             optimized_groups = merged_groups
+
+        debt_stats: dict[str, int] = {
+            "groups_touched": 0,
+            "duplicated_assignments": 0,
+        }
+        allow_duplication = bool(self._config_value("allow_batch_duplication", True))
+        if bool(payload.get("coverage_first")) and allow_duplication and len(optimized_groups) >= 2:
+            rebalanced_groups, debt_stats = self._rebalance_groups_by_coverage_debt(
+                optimized_groups,
+                path_map=path_map,
+                target_size=int(desired_target),
+                cap_limit=cap_limit,
+            )
+            if rebalanced_groups:
+                optimized_groups = rebalanced_groups
+
         payload["final_groups"] = optimized_groups
         payload["sizes"] = [len(group) for group in optimized_groups]
 
@@ -4015,6 +4031,119 @@ class FilterQtDialog(QDialog):
                     SIZES=final_sizes,
                 )
             )
+            if bool(payload.get("coverage_first")) and allow_duplication:
+                messages.append(
+                    self._format_message(
+                        "auto_optimiser_covdebt",
+                        "[AutoOptimiser] coverage-debt rebalance: groups_touched={TOUCHED}, duplicated_assignments={DUP}",
+                        TOUCHED=int(debt_stats.get("groups_touched", 0)),
+                        DUP=int(debt_stats.get("duplicated_assignments", 0)),
+                    )
+                )
+
+    @staticmethod
+    def _group_entry_path_key(info: dict[str, Any]) -> str:
+        for key in ("path", "file_path", "path_raw", "file", "filename"):
+            try:
+                value = info.get(key)
+            except Exception:
+                value = None
+            if value:
+                try:
+                    return casefold_path(str(value))
+                except Exception:
+                    return str(value)
+        return f"entry_{id(info)}"
+
+    def _rebalance_groups_by_coverage_debt(
+        self,
+        groups: list[list[dict[str, Any]]],
+        *,
+        path_map: dict[str, _NormalizedItem],
+        target_size: int,
+        cap_limit: int | None,
+    ) -> tuple[list[list[dict[str, Any]]], dict[str, int]]:
+        if not groups or len(groups) < 2:
+            return groups, {"groups_touched": 0, "duplicated_assignments": 0}
+
+        target = max(1, int(target_size))
+        output_groups = [list(group or []) for group in groups]
+        centers = [self._compute_center_from_coords(self._gather_group_coordinates(group, path_map)) for group in output_groups]
+        sigs = [self._group_eqmode_signature(group) for group in output_groups]
+
+        groups_touched = 0
+        duplicated_assignments = 0
+
+        order = sorted(range(len(output_groups)), key=lambda idx: len(output_groups[idx]))
+        for debtor_idx in order:
+            debtor = output_groups[debtor_idx]
+            if not debtor:
+                continue
+            if len(debtor) >= target:
+                continue
+            if cap_limit is not None and len(debtor) >= int(cap_limit):
+                continue
+
+            missing = target - len(debtor)
+            if cap_limit is not None:
+                missing = min(missing, max(0, int(cap_limit) - len(debtor)))
+            if missing <= 0:
+                continue
+
+            debtor_paths = {self._group_entry_path_key(entry) for entry in debtor if isinstance(entry, dict)}
+            debtor_sig = sigs[debtor_idx]
+            debtor_center = centers[debtor_idx]
+
+            donor_order = sorted(
+                [i for i in range(len(output_groups)) if i != debtor_idx],
+                key=lambda i: self._angular_distance(debtor_center, centers[i]),
+            )
+
+            added_here = 0
+            for donor_idx in donor_order:
+                if missing <= 0:
+                    break
+                donor = output_groups[donor_idx]
+                if not donor:
+                    continue
+                if len(donor) <= max(2, int(target * 0.6)):
+                    continue
+
+                donor_sig = sigs[donor_idx]
+                if debtor_sig in {"EQ", "ALT_AZ"} and donor_sig in {"EQ", "ALT_AZ"} and debtor_sig != donor_sig:
+                    continue
+
+                donor_center = centers[donor_idx]
+                candidate_entries = sorted(
+                    [entry for entry in donor if isinstance(entry, dict)],
+                    key=lambda e: self._angular_distance(
+                        debtor_center,
+                        self._compute_center_from_coords(self._gather_group_coordinates([e], path_map)) or donor_center,
+                    ),
+                )
+                for entry in candidate_entries:
+                    if missing <= 0:
+                        break
+                    path_key = self._group_entry_path_key(entry)
+                    if path_key in debtor_paths:
+                        continue
+                    debtor.append(dict(entry))
+                    debtor_paths.add(path_key)
+                    missing -= 1
+                    added_here += 1
+                    duplicated_assignments += 1
+                    if cap_limit is not None and len(debtor) >= int(cap_limit):
+                        missing = 0
+                        break
+
+            if added_here > 0:
+                groups_touched += 1
+                centers[debtor_idx] = self._compute_center_from_coords(self._gather_group_coordinates(debtor, path_map))
+
+        return output_groups, {
+            "groups_touched": int(groups_touched),
+            "duplicated_assignments": int(duplicated_assignments),
+        }
 
     def _build_path_to_entry_map(self) -> dict[str, _NormalizedItem]:
         path_map: dict[str, _NormalizedItem] = {}

@@ -3632,3 +3632,60 @@ Préparation run P:
 - Cause côté wrapper classic non-grid: propagation partielle des paramètres intertile.
 - Correctif appliqué dans `zemosaic_worker.py`: récupération explicite `intertile_prune_k` + `intertile_prune_weight_mode` depuis la config avant appel legacy.
 - Incident introduit puis corrigé immédiatement: `NameError` au lancement de `NGC6888_12` (variable prune non définie), patch de sécurité ajouté, compilation OK.
+
+### 2026-04-03 — Phase 3 RAM anti-livelock (CPU+GPU working-set adaptation)
+- Contexte terrain: run `NGC6888_17` bloqué en Phase 3 (`MASTER_TILE_COUNT_UPDATE` figé), avec boucles `RAM_ADAPT_RT: admission_pause` et RAM ~99% sans traceback final.
+- Décision: conserver l'objectif "traiter toutes les brutes" (pas de cap sur nombre d'images), et agir sur la **taille des sous-opérations**.
+- Implémentation dans `zemosaic_worker.py` (double bloc Phase 3 concerné):
+  - ajout d'un état runtime thread-safe `runtime_working_set_limit` piloté par le moniteur RAM,
+  - adaptation dynamique en fonction du niveau RAM (hystérésis déjà en place):
+    - `winsor_frames_per_pass` (frames par passe),
+    - `cpu_rows_per_chunk`,
+    - `gpu_rows_per_chunk`,
+    - `max_chunk_mb`.
+  - application de ces limites **au moment de soumettre chaque master tile**:
+    - `winsor_max_frames_per_pass` devient runtime-adaptatif,
+    - `parallel_plan` runtime cloné + override des clés CPU/GPU.
+  - ajout de télémétrie explicite: `RAM_ADAPT_RT: working_set_update ...`.
+- Invariant respecté: aucune réduction du volume total de brutes traitées; uniquement du micro-batching / chunking adaptatif.
+- Sanity: compilation Python OK (`py_compile zemosaic_worker.py`).
+
+### 2026-04-03 — Phase 3 watchdog anti-livelock (abort coopératif + relance auto)
+- Suite demandée implémentée: abort coopératif intra-tile quand un worker reste sans progrès sous pression RAM critique.
+- Mécanisme ajouté (Phase 3, CPU+GPU):
+  - `abort_event` injecté dans `create_master_tile`,
+  - heartbeat runtime (`heartbeat_callback`) pour mesurer la progression intra-tile,
+  - watchdog côté scheduler: si `stall_s` dépasse le seuil ET RAM au-dessus du seuil, envoi d'une requête d'abort (`livelock_abort_request`).
+- Abort coopératif:
+  - `create_master_tile` vérifie régulièrement l'état abort (`_check_abort`) pendant chargement/alignment/stack/pipeline,
+  - levée d'une exception dédiée `Phase3TileAbortRequested`.
+- Reprise automatique:
+  - le scheduler intercepte `Phase3TileAbortRequested`,
+  - replanifie le même groupe (retry group) en incrémentant `retry_attempt`,
+  - garde-fou: abandon si `retry_attempt` dépasse `MAX_ALIGNMENT_RETRY_ATTEMPTS`.
+- Hygiène ressources:
+  - encapsulation des slots de concurrence Phase 3 avec compteur local (`_acquire_phase3_slot`/`_release_phase3_slot`) pour éviter les fuites de sémaphore même en abort.
+- Config runtime exposée (avec defaults sûrs):
+  - `phase3_tile_livelock_watchdog_enabled` (True)
+  - `phase3_tile_livelock_timeout_s` (240)
+  - `phase3_tile_livelock_min_runtime_s` (90)
+  - `phase3_tile_livelock_ram_pct` (>= critical)
+  - `phase3_tile_livelock_max_abort_per_tile` (2)
+- Vérification: compilation OK (`py_compile zemosaic_worker.py`).
+
+### 2026-04-03 — Auto-profiling mémoire runtime (UX zéro réglage)
+- Implémentation d'une couche d'auto-calibration au démarrage de la Phase 3 (sans clé config supplémentaire obligatoire):
+  - lecture `RAM totale`, `swap totale`, `swap utilisée`;
+  - recalage conservateur automatique de `ram_low/high/critical` + `admission_pause_s` selon profil machine;
+  - journalisation explicite: `RAM_ADAPT_RT: auto_profile ...`.
+- Auto-calibration du watchdog anti-livelock:
+  - ajuste `timeout_s`, `min_runtime_s`, `watchdog_ram_pct` selon RAM/swap disponibles;
+  - journalisation explicite: `RAM_ADAPT_RT: watchdog_auto_profile ...`.
+- Objectif UX: comportement réellement autonome (petites machines plus prudentes, grosses machines plus permissives) sans tuning manuel obligatoire.
+- Vérification: compilation OK (`py_compile zemosaic_worker.py`).
+
+### 2026-04-03 — Hotfix immédiat `ram_critical_pct` NameError
+- Incident terrain sur `NGC6888_17`: `[ERROR] name 'ram_critical_pct' is not defined`.
+- Cause: variable locale du monitor réutilisée hors scope dans l'initialisation watchdog Phase 3.
+- Correctif: fallback watchdog basé sur `phase3_ram_critical_pct` lu depuis `zconfig` (`watchdog_base_critical_pct`), sans dépendance à une variable locale.
+- Validation: compilation OK (`py_compile zemosaic_worker.py`).

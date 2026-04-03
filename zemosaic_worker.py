@@ -13916,6 +13916,10 @@ def get_wcs_and_pretreat_raw_file(
 
 # ... (vos imports existants : os, shutil, time, traceback, gc, logging, np, astropy, reproject, et les modules zemosaic_...)
 
+class Phase3TileAbortRequested(RuntimeError):
+    """Raised when a Phase 3 master-tile task is cooperatively aborted by watchdog."""
+
+
 def _safe_load_cache(path: str, *, pcb: Callable | None = None, tile_id: int | None = None):
     """Load a numpy cache with a WinError-1455 aware fallback.
 
@@ -14375,6 +14379,8 @@ def create_master_tile(
     target_stack_size: int = 5,
     min_safe_stack_size: int = 3,
     dbg_tile_ids: set[int] | None = None,
+    abort_event: threading.Event | None = None,
+    heartbeat_callback: Callable[[int], None] | None = None,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
@@ -14388,7 +14394,51 @@ def create_master_tile(
         - ``(path, wcs)`` du master stack produit (``None`` si échec).
         - Liste de sous-groupes à retraiter (copie des ``raw_info`` pour les images non alignées).
     """
-    pcb_tile = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
+    def _abort_requested() -> bool:
+        try:
+            return bool(abort_event is not None and abort_event.is_set())
+        except Exception:
+            return False
+
+    def _touch_progress() -> None:
+        if heartbeat_callback is None:
+            return
+        try:
+            heartbeat_callback(int(tile_id))
+        except Exception:
+            pass
+
+    ph3_sem_hold_count = 0
+
+    def _release_phase3_slot(force_all: bool = False) -> None:
+        nonlocal ph3_sem_hold_count
+        while ph3_sem_hold_count > 0:
+            try:
+                _PH3_CONCURRENCY_SEMAPHORE.release()
+            except Exception:
+                break
+            ph3_sem_hold_count -= 1
+            if not force_all:
+                break
+
+    def _acquire_phase3_slot() -> None:
+        nonlocal ph3_sem_hold_count
+        _PH3_CONCURRENCY_SEMAPHORE.acquire()
+        ph3_sem_hold_count += 1
+
+    def _check_abort(stage: str) -> None:
+        if _abort_requested():
+            _release_phase3_slot(force_all=True)
+            raise Phase3TileAbortRequested(f"tile={tile_id} stage={stage}")
+
+    def _tile_progress_callback(*args, **kwargs):
+        _touch_progress()
+        _check_abort("progress_callback")
+        if progress_callback is not None:
+            return progress_callback(*args, **kwargs)
+        return None
+
+    pcb_tile = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=_tile_progress_callback, **kwargs)
     # Load persistent configuration to forward GPU preference
     if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
         try:
@@ -14565,7 +14615,7 @@ def create_master_tile(
     # Acquire a dynamic Phase 3 I/O concurrency slot to avoid disk stalls
     # when the system is busy (e.g., another app reading video files).
     try:
-        _PH3_CONCURRENCY_SEMAPHORE.acquire()
+        _acquire_phase3_slot()
     except Exception:
         pass
 
@@ -14577,6 +14627,8 @@ def create_master_tile(
     loaded_group_indices = []
 
     for i, raw_file_info in enumerate(seestar_stack_group_info):
+        _touch_progress()
+        _check_abort("load_cache_loop")
         cached_image_file_path = raw_file_info.get('path_preprocessed_cache')
         original_raw_path = raw_file_info.get('path_raw', 'UnknownRawPathForTileImg') # Plus descriptif
 
@@ -14612,7 +14664,7 @@ def create_master_tile(
              pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
              # Release the concurrency slot before aborting
              try:
-                 _PH3_CONCURRENCY_SEMAPHORE.release()
+                 _release_phase3_slot()
              except Exception:
                  pass
              del tile_images_data_HWC_adu, tile_original_raw_headers, loaded_infos, loaded_group_indices; gc.collect(); return (None, None), failed_groups_to_retry
@@ -14623,7 +14675,7 @@ def create_master_tile(
             
     # Release the concurrency slot as soon as disk reads are done for this tile
     try:
-        _PH3_CONCURRENCY_SEMAPHORE.release()
+        _release_phase3_slot()
     except Exception:
         pass
 
@@ -14683,7 +14735,7 @@ def create_master_tile(
     pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
     # Limit concurrency during alignment/stacking as well to reduce peak RAM
     try:
-        _PH3_CONCURRENCY_SEMAPHORE.acquire()
+        _acquire_phase3_slot()
     except Exception:
         pass
     winsorized_reject = str(stack_reject_algo or "").lower() == "winsorized_sigma_clip"
@@ -14697,12 +14749,15 @@ def create_master_tile(
             lvl="DEBUG_DETAIL",
             tile_id=int(tile_id),
         )
+    _check_abort("before_alignment")
     aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
         image_data_list=tile_images_data_HWC_adu,
         reference_image_index=ref_loaded_idx,
         propagate_mask=propagate_mask_for_coverage,
-        progress_callback=progress_callback
+        progress_callback=_tile_progress_callback
     )
+    _touch_progress()
+    _check_abort("after_alignment")
     auto_pad_used = False
     orig_hw = None
     aligned_hw = None
@@ -14845,7 +14900,7 @@ def create_master_tile(
     if not valid_aligned_images:
         pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
+            _release_phase3_slot()
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
@@ -15072,6 +15127,7 @@ def create_master_tile(
                 pass
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
+    _check_abort("before_stack")
     master_tile_stacked_HWC, stack_metadata, used_gpu = _stack_master_tile_auto(
         valid_aligned_images,
         stack_norm_method=stack_norm_method,
@@ -15087,7 +15143,7 @@ def create_master_tile(
         radial_shape_power=radial_shape_power,
         winsor_pool_workers=winsor_pool_workers,
         winsor_max_frames_per_pass=adaptive_winsor_max_frames_per_pass,
-        progress_callback=progress_callback,
+        progress_callback=_tile_progress_callback,
         zconfig=zconfig,
         parallel_plan=adaptive_parallel_plan,
         pcb_tile=pcb_tile,
@@ -15096,6 +15152,8 @@ def create_master_tile(
         logger=logger,
     )
 
+    _touch_progress()
+    _check_abort("after_stack")
     if debug_tile:
         _dbg_rgb_stats("P3_post_stack_core", master_tile_stacked_HWC, logger=logger)
 
@@ -15108,7 +15166,7 @@ def create_master_tile(
     if master_tile_stacked_HWC is None:
         pcb_tile(f"{func_id_log_base}_error_stacking_failed", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
+            _release_phase3_slot()
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
@@ -15201,6 +15259,8 @@ def create_master_tile(
                     reason=norm_mode,
                 )
 
+    _touch_progress()
+    _check_abort("pre_post_stack_pipeline")
     quality_crop_rect: tuple[int, int, int, int] | None = None
     if quality_crop_enabled_effective:
         try:
@@ -15484,6 +15544,8 @@ def create_master_tile(
         )
         lecropper_applied = True
 
+    _touch_progress()
+    _check_abort("pre_edge_trim")
     try:
         if master_tile_stacked_HWC is not None and auto_pad_used:
             pcb_tile(
@@ -15992,7 +16054,7 @@ def create_master_tile(
         )
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
         try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
+            _release_phase3_slot()
         except Exception:
             pass
         return (final_tile_path, final_wcs), failed_groups_to_retry
@@ -16001,11 +16063,15 @@ def create_master_tile(
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
         logger.error(f"Traceback pour {func_id_log_base}_{tile_id} sauvegarde:", exc_info=True)
         try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
+            _release_phase3_slot()
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
     finally:
+        try:
+            _release_phase3_slot(force_all=True)
+        except Exception:
+            pass
         if 'master_tile_stacked_HWC' in locals() and master_tile_stacked_HWC is not None: 
             del master_tile_stacked_HWC
         gc.collect()
@@ -24024,6 +24090,13 @@ def run_hierarchical_mosaic_classic_legacy(
             # Start a lightweight real-time monitor to adapt concurrency while Phase 3 runs
             monitor_stop_evt = threading.Event()
             runtime_launch_limit: dict[str, Any] = {"value": int(actual_num_workers_ph3), "pause_until": 0.0, "pause_reason": ""}
+            runtime_adapt_lock = threading.Lock()
+            runtime_working_set_limit: dict[str, Any] = {
+                "winsor_frames_per_pass": int(winsor_max_frames_per_pass) if int(winsor_max_frames_per_pass or 0) > 0 else 256,
+                "cpu_rows_per_chunk": None,
+                "gpu_rows_per_chunk": None,
+                "max_chunk_mb": None,
+            }
 
             def _rt_adapt_concurrency():
                 try:
@@ -24041,12 +24114,76 @@ def run_hierarchical_mosaic_classic_legacy(
                 max_level_changes_per_min = int(getattr(zconfig, "phase3_adapt_max_changes_per_min", 6))
                 pause_seconds = float(getattr(zconfig, "phase3_admission_pause_s", 2.5))
 
+                auto_profile = {}
+                try:
+                    vm_boot = _ps.virtual_memory()
+                    sm_boot = _ps.swap_memory()
+                    total_ram_gb = float(getattr(vm_boot, "total", 0.0)) / (1024.0 ** 3)
+                    swap_total_gb = float(getattr(sm_boot, "total", 0.0)) / (1024.0 ** 3)
+                    swap_used_pct = float(getattr(sm_boot, "percent", 0.0))
+
+                    if total_ram_gb <= 8.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 64.0, 76.0, 83.0, 3.8
+                    elif total_ram_gb <= 12.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 68.0, 79.0, 85.0, 3.2
+                    elif total_ram_gb <= 24.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 70.0, 82.0, 87.0, 2.8
+                    else:
+                        auto_low, auto_high, auto_critical, auto_pause = 72.0, 84.0, 89.0, 2.5
+
+                    if swap_total_gb < 1.0:
+                        auto_low -= 2.0
+                        auto_high -= 2.0
+                        auto_critical -= 2.0
+                        auto_pause = max(auto_pause, 3.8)
+                    elif swap_used_pct >= 70.0:
+                        auto_critical = min(auto_critical, 86.0)
+                        auto_pause = max(auto_pause, 4.0)
+
+                    auto_low = max(50.0, min(auto_low, auto_high - 4.0))
+                    auto_high = max(auto_low + 4.0, min(auto_high, auto_critical - 2.0))
+                    auto_critical = max(auto_high + 2.0, min(95.0, auto_critical))
+
+                    ram_low_pct = min(float(ram_low_pct), float(auto_low))
+                    ram_high_pct = min(float(ram_high_pct), float(auto_high))
+                    ram_critical_pct = min(float(ram_critical_pct), float(auto_critical))
+                    pause_seconds = max(float(pause_seconds), float(auto_pause))
+
+                    auto_profile = {
+                        "total_ram_gb": round(total_ram_gb, 2),
+                        "swap_total_gb": round(swap_total_gb, 2),
+                        "swap_used_pct": round(swap_used_pct, 1),
+                    }
+                except Exception:
+                    auto_profile = {}
+
                 if max_level_changes_per_min < 1:
                     max_level_changes_per_min = 1
                 if adapt_cooldown_s < 0.0:
                     adapt_cooldown_s = 0.0
                 if pause_seconds < 0.5:
                     pause_seconds = 0.5
+
+                try:
+                    if auto_profile:
+                        pcb(
+                            "RAM_ADAPT_RT: auto_profile "
+                            f"ram_low={ram_low_pct:.1f} ram_high={ram_high_pct:.1f} "
+                            f"ram_critical={ram_critical_pct:.1f} pause_s={pause_seconds:.1f} "
+                            f"total_ram_gb={auto_profile.get('total_ram_gb')} "
+                            f"swap_gb={auto_profile.get('swap_total_gb')} "
+                            f"swap_used_pct={auto_profile.get('swap_used_pct')}",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                        )
+                except Exception:
+                    pass
+
+                min_frames_per_pass = max(8, int(getattr(zconfig, "phase3_runtime_min_frames_per_pass", 16)))
+                max_frames_per_pass = max(min_frames_per_pass, int(getattr(zconfig, "phase3_runtime_max_frames_per_pass", runtime_working_set_limit.get("winsor_frames_per_pass", 256))))
+                min_cpu_rows = max(32, int(getattr(zconfig, "phase3_runtime_min_cpu_rows_per_chunk", 96)))
+                min_gpu_rows = max(16, int(getattr(zconfig, "phase3_runtime_min_gpu_rows_per_chunk", 64)))
+                min_chunk_mb = max(32.0, float(getattr(zconfig, "phase3_runtime_min_max_chunk_mb", 256.0)))
 
                 ram_level = 0
                 last_change_t = 0.0
@@ -24094,6 +24231,15 @@ def run_hierarchical_mosaic_classic_legacy(
 
                     new_ph3_limit = current_ph3_limit
                     new_cache_slots = current_cache_slots if current_cache_slots is not None else default_cache_slots
+                    with runtime_adapt_lock:
+                        cur_frames_per_pass = int(runtime_working_set_limit.get("winsor_frames_per_pass", 256))
+                        cur_cpu_rows = runtime_working_set_limit.get("cpu_rows_per_chunk")
+                        cur_gpu_rows = runtime_working_set_limit.get("gpu_rows_per_chunk")
+                        cur_max_chunk_mb = runtime_working_set_limit.get("max_chunk_mb")
+                    new_frames_per_pass = cur_frames_per_pass
+                    new_cpu_rows = cur_cpu_rows
+                    new_gpu_rows = cur_gpu_rows
+                    new_max_chunk_mb = cur_max_chunk_mb
 
                     if read_mbps is not None:
                         if os.name == 'nt':
@@ -24152,6 +24298,37 @@ def run_hierarchical_mosaic_classic_legacy(
 
                     new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
                     new_cache_slots = max(1, int(new_cache_slots))
+
+                    if ram_level >= 2:
+                        new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.70)))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, int(math.floor(float(new_cpu_rows) * 0.75)))
+                        elif new_cpu_rows is None:
+                            new_cpu_rows = max(min_cpu_rows, 256)
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, int(math.floor(float(new_gpu_rows) * 0.75)))
+                        elif new_gpu_rows is None:
+                            new_gpu_rows = max(min_gpu_rows, 128)
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, float(new_max_chunk_mb) * 0.75)
+                        elif new_max_chunk_mb is None:
+                            new_max_chunk_mb = max(min_chunk_mb, 512.0)
+                    elif ram_level == 1:
+                        new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.85)))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, int(math.floor(float(new_cpu_rows) * 0.90)))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, int(math.floor(float(new_gpu_rows) * 0.90)))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, float(new_max_chunk_mb) * 0.90)
+                    elif ram_level <= 0:
+                        new_frames_per_pass = min(max_frames_per_pass, max(min_frames_per_pass, int(math.ceil(float(new_frames_per_pass) * 1.10))))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = min(2048, max(min_cpu_rows, int(math.ceil(float(new_cpu_rows) * 1.10))))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = min(1024, max(min_gpu_rows, int(math.ceil(float(new_gpu_rows) * 1.10))))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = min(4096.0, max(min_chunk_mb, float(new_max_chunk_mb) * 1.10))
 
                     budget_change_blocked_reason = None
                     if new_ph3_limit != current_ph3_limit:
@@ -24259,6 +24436,33 @@ def run_hierarchical_mosaic_classic_legacy(
                                 )
                             except Exception:
                                 pass
+
+                        ws_changed = (
+                            int(new_frames_per_pass) != int(cur_frames_per_pass)
+                            or (new_cpu_rows != cur_cpu_rows)
+                            or (new_gpu_rows != cur_gpu_rows)
+                            or (new_max_chunk_mb != cur_max_chunk_mb)
+                        )
+                        if ws_changed:
+                            with runtime_adapt_lock:
+                                runtime_working_set_limit["winsor_frames_per_pass"] = int(new_frames_per_pass)
+                                runtime_working_set_limit["cpu_rows_per_chunk"] = int(new_cpu_rows) if isinstance(new_cpu_rows, (int, float)) and int(new_cpu_rows) > 0 else None
+                                runtime_working_set_limit["gpu_rows_per_chunk"] = int(new_gpu_rows) if isinstance(new_gpu_rows, (int, float)) and int(new_gpu_rows) > 0 else None
+                                runtime_working_set_limit["max_chunk_mb"] = float(new_max_chunk_mb) if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0 else None
+                            try:
+                                pcb(
+                                    "RAM_ADAPT_RT: working_set_update "
+                                    f"frames_per_pass={int(new_frames_per_pass)} "
+                                    f"cpu_rows={runtime_working_set_limit.get('cpu_rows_per_chunk')} "
+                                    f"gpu_rows={runtime_working_set_limit.get('gpu_rows_per_chunk')} "
+                                    f"max_chunk_mb={runtime_working_set_limit.get('max_chunk_mb')} "
+                                    f"ram_level={ram_level} "
+                                    f"ram_used_pct={ram_used_pct if ram_used_pct is not None else 'n/a'}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                            except Exception:
+                                pass
                     except Exception:
                         pass
             monitor_thread = threading.Thread(target=_rt_adapt_concurrency, name="ZeMosaic_Ph3_RTAdapt", daemon=True)
@@ -24276,6 +24480,11 @@ def run_hierarchical_mosaic_classic_legacy(
             executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
 
             future_to_tile_id: dict = {}
+            future_to_group_info: dict = {}
+            future_abort_events: dict = {}
+            tile_runtime_state_lock = threading.Lock()
+            tile_last_progress_monotonic: dict[int, float] = {}
+            tile_abort_request_count: dict[int, int] = {}
             tile_cache_paths_unique: dict[int, set[str]] = {}
             cache_refcount: dict[str, int] = {}
             shared_cache_detected = False
@@ -24283,6 +24492,63 @@ def run_hierarchical_mosaic_classic_legacy(
             total_removed_cache_bytes = 0
             pending_futures: set = set()
             next_dynamic_tile_id = num_seestar_stacks_to_process
+
+            watchdog_enabled = bool(getattr(zconfig, "phase3_tile_livelock_watchdog_enabled", True))
+            watchdog_timeout_s = max(45.0, float(getattr(zconfig, "phase3_tile_livelock_timeout_s", 240.0)))
+            watchdog_min_runtime_s = max(10.0, float(getattr(zconfig, "phase3_tile_livelock_min_runtime_s", 90.0)))
+            watchdog_base_critical_pct = float(getattr(zconfig, "phase3_ram_critical_pct", 88.0))
+            watchdog_ram_pct = float(getattr(zconfig, "phase3_tile_livelock_ram_pct", max(90.0, watchdog_base_critical_pct)))
+            watchdog_max_abort_per_tile = max(1, int(getattr(zconfig, "phase3_tile_livelock_max_abort_per_tile", 2)))
+
+            try:
+                vm_watch_boot = psutil.virtual_memory()
+                sm_watch_boot = psutil.swap_memory()
+                total_ram_watch_gb = float(getattr(vm_watch_boot, "total", 0.0)) / (1024.0 ** 3)
+                swap_watch_gb = float(getattr(sm_watch_boot, "total", 0.0)) / (1024.0 ** 3)
+                swap_watch_used_pct = float(getattr(sm_watch_boot, "percent", 0.0))
+
+                if total_ram_watch_gb <= 8.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 170.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 60.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 84.0)
+                elif total_ram_watch_gb <= 12.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 210.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 75.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 86.0)
+                elif total_ram_watch_gb <= 24.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 240.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 90.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 88.0)
+                else:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 300.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 120.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 90.0)
+
+                if swap_watch_gb < 1.0:
+                    watchdog_ram_pct = min(watchdog_ram_pct, 83.0)
+                    watchdog_timeout_s = min(watchdog_timeout_s, 150.0)
+                elif swap_watch_used_pct >= 75.0:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 130.0)
+
+                watchdog_timeout_s = max(45.0, float(watchdog_timeout_s))
+                watchdog_min_runtime_s = max(10.0, min(float(watchdog_min_runtime_s), float(watchdog_timeout_s * 0.85)))
+                watchdog_ram_pct = float(np.clip(float(watchdog_ram_pct), 75.0, 98.0))
+
+                pcb(
+                    "RAM_ADAPT_RT: watchdog_auto_profile "
+                    f"enabled={int(bool(watchdog_enabled))} "
+                    f"timeout_s={watchdog_timeout_s:.1f} "
+                    f"min_runtime_s={watchdog_min_runtime_s:.1f} "
+                    f"ram_pct={watchdog_ram_pct:.1f} "
+                    f"max_abort_per_tile={int(watchdog_max_abort_per_tile)} "
+                    f"total_ram_gb={total_ram_watch_gb:.2f} "
+                    f"swap_gb={swap_watch_gb:.2f} "
+                    f"swap_used_pct={swap_watch_used_pct:.1f}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            except Exception:
+                pass
 
             def _register_tile_cache_paths(tile_id: int, group_info_list: list[dict]) -> None:
                 nonlocal shared_cache_detected
@@ -24379,6 +24645,30 @@ def run_hierarchical_mosaic_classic_legacy(
                     )
                 except Exception:
                     pass
+                with runtime_adapt_lock:
+                    runtime_winsor_frames_per_pass = int(runtime_working_set_limit.get("winsor_frames_per_pass", winsor_max_frames_per_pass if int(winsor_max_frames_per_pass or 0) > 0 else 256))
+                    runtime_cpu_rows = runtime_working_set_limit.get("cpu_rows_per_chunk")
+                    runtime_gpu_rows = runtime_working_set_limit.get("gpu_rows_per_chunk")
+                    runtime_max_chunk_mb = runtime_working_set_limit.get("max_chunk_mb")
+
+                base_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
+                runtime_parallel_plan = copy.deepcopy(base_parallel_plan) if isinstance(base_parallel_plan, dict) else {}
+                if not isinstance(runtime_parallel_plan, dict):
+                    runtime_parallel_plan = {}
+                if runtime_cpu_rows is not None:
+                    runtime_parallel_plan["cpu_rows_per_chunk"] = int(runtime_cpu_rows)
+                if runtime_gpu_rows is not None:
+                    runtime_parallel_plan["gpu_rows_per_chunk"] = int(runtime_gpu_rows)
+                if runtime_max_chunk_mb is not None:
+                    runtime_parallel_plan["max_chunk_mb"] = float(runtime_max_chunk_mb)
+
+                tile_abort_event = threading.Event()
+
+                def _heartbeat_cb(tile_id_for_hb: int) -> None:
+                    now_hb = time.monotonic()
+                    with tile_runtime_state_lock:
+                        tile_last_progress_monotonic[int(tile_id_for_hb)] = now_hb
+
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -24406,16 +24696,24 @@ def run_hierarchical_mosaic_classic_legacy(
                     astap_exe_path, astap_data_dir_param, astap_search_radius_config,
                     astap_downsample_config, astap_sensitivity_config, 180,
                     winsor_worker_limit,
-                    winsor_max_frames_per_pass,
+                    runtime_winsor_frames_per_pass,
                     progress_callback,
                     resource_strategy=auto_resource_strategy,
                     center_out_context=center_out_context,
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
-                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    parallel_plan=runtime_parallel_plan,
                     dbg_tile_ids=dbg_tile_ids,
+                    abort_event=tile_abort_event,
+                    heartbeat_callback=_heartbeat_cb,
                 )
                 future_to_tile_id[future] = assigned_tile_id
+                future_to_group_info[future] = list(group_info_list or [])
+                future_abort_events[future] = tile_abort_event
+                with tile_runtime_state_lock:
+                    now_submit = time.monotonic()
+                    tile_last_progress_monotonic[int(assigned_tile_id)] = now_submit
+                    tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
 
             pending_launch_queue: list[tuple[list[dict], int, int | None]] = []
@@ -24441,6 +24739,51 @@ def run_hierarchical_mosaic_classic_legacy(
                 except Exception:
                     resolved = int(actual_num_workers_ph3)
                 return max(0, min(int(actual_num_workers_ph3), resolved))
+
+            def _request_livelock_abort_if_needed() -> None:
+                if not watchdog_enabled or not pending_futures:
+                    return
+                try:
+                    vm_watch = psutil.virtual_memory()
+                    ram_pct_watch = float(getattr(vm_watch, "percent", 0.0))
+                except Exception:
+                    return
+                if not math.isfinite(ram_pct_watch) or ram_pct_watch < watchdog_ram_pct:
+                    return
+
+                now_watch = time.monotonic()
+                for fut in list(pending_futures):
+                    tile_id_watch = future_to_tile_id.get(fut)
+                    if tile_id_watch is None:
+                        continue
+                    start_watch = phase3_tile_start_monotonic.get(tile_id_watch, now_watch)
+                    with tile_runtime_state_lock:
+                        last_progress = tile_last_progress_monotonic.get(int(tile_id_watch), start_watch)
+                        current_abort_count = int(tile_abort_request_count.get(int(tile_id_watch), 0))
+                    runtime_s = max(0.0, now_watch - float(start_watch))
+                    stalled_s = max(0.0, now_watch - float(last_progress))
+                    if runtime_s < watchdog_min_runtime_s or stalled_s < watchdog_timeout_s:
+                        continue
+                    if current_abort_count >= watchdog_max_abort_per_tile:
+                        continue
+                    abort_evt = future_abort_events.get(fut)
+                    if abort_evt is None or abort_evt.is_set():
+                        continue
+                    abort_evt.set()
+                    with tile_runtime_state_lock:
+                        tile_abort_request_count[int(tile_id_watch)] = current_abort_count + 1
+                    try:
+                        pcb(
+                            "RAM_ADAPT_RT: livelock_abort_request "
+                            f"tile_id={int(tile_id_watch)} "
+                            f"stall_s={stalled_s:.1f} runtime_s={runtime_s:.1f} "
+                            f"ram_used_pct={ram_pct_watch:.1f} "
+                            f"attempt={current_abort_count + 1}/{watchdog_max_abort_per_tile}",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    except Exception:
+                        pass
 
             def _drain_launch_queue() -> int:
                 launched = 0
@@ -24499,15 +24842,22 @@ def run_hierarchical_mosaic_classic_legacy(
 
             while pending_futures or pending_launch_queue:
                 _drain_launch_queue()
+                _request_livelock_abort_if_needed()
                 if not pending_futures:
                     time.sleep(0.05)
                     continue
-                done_futures, _ = wait(pending_futures, return_when=FIRST_COMPLETED)
+                done_futures, _ = wait(pending_futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done_futures:
+                    continue
                 for future in done_futures:
                     pending_futures.discard(future)
                     tile_id_for_future = future_to_tile_id.pop(future, None)
+                    original_group_for_future = future_to_group_info.pop(future, None)
+                    future_abort_events.pop(future, None)
                     if tile_id_for_future is None:
                         continue
+                    with tile_runtime_state_lock:
+                        tile_last_progress_monotonic.pop(int(tile_id_for_future), None)
                     tiles_processed_count_ph3 += 1
 
                     pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
@@ -24631,14 +24981,68 @@ def run_hierarchical_mosaic_classic_legacy(
                                     except Exception:
                                         pass
                     except Exception as exc_thread_ph3:
-                        pcb(
-                            "run_error_phase3_thread_exception",
-                            prog=prog_step_phase3,
-                            lvl="ERROR",
-                            stack_num=int(tile_id_for_future) + 1,
-                            error=str(exc_thread_ph3),
-                        )
-                        logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+                        if isinstance(exc_thread_ph3, Phase3TileAbortRequested):
+                            pcb(
+                                "run_warn_phase3_tile_abort_requested",
+                                prog=prog_step_phase3,
+                                lvl="WARN",
+                                stack_num=int(tile_id_for_future) + 1,
+                                tile_id=int(tile_id_for_future),
+                                reason=str(exc_thread_ph3),
+                            )
+                            retry_group: list[dict] = []
+                            for raw_info in (original_group_for_future or []):
+                                if isinstance(raw_info, dict):
+                                    info_copy = dict(raw_info)
+                                    info_copy["retry_attempt"] = int(info_copy.get("retry_attempt", 0)) + 1
+                                    info_copy["retry_reason"] = "phase3_livelock_abort"
+                                    retry_group.append(info_copy)
+                                else:
+                                    retry_group.append(raw_info)
+                            if retry_group:
+                                max_retry_attempt = 0
+                                try:
+                                    max_retry_attempt = max(
+                                        int(item.get("retry_attempt", 0))
+                                        for item in retry_group
+                                        if isinstance(item, dict)
+                                    )
+                                except Exception:
+                                    max_retry_attempt = 0
+                                if max_retry_attempt > MAX_ALIGNMENT_RETRY_ATTEMPTS:
+                                    pcb(
+                                        "run_warn_phase3_alignment_retry_abandoned",
+                                        prog=None,
+                                        lvl="WARN",
+                                        tile_id=int(tile_id_for_future),
+                                        attempts=int(max_retry_attempt),
+                                        reason="phase3_livelock_abort",
+                                    )
+                                else:
+                                    new_tile_id = next_dynamic_tile_id
+                                    next_dynamic_tile_id += 1
+                                    num_seestar_stacks_to_process += 1
+                                    _register_tile_cache_paths(new_tile_id, retry_group)
+                                    retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
+                                    pending_launch_queue.append((retry_group, new_tile_id, retry_rank))
+                                    pcb(
+                                        "run_info_phase3_retry_submitted",
+                                        prog=None,
+                                        lvl="INFO_DETAIL",
+                                        origin_tile=int(tile_id_for_future),
+                                        new_tile=new_tile_id,
+                                        frames=len(retry_group),
+                                        reason="phase3_livelock_abort",
+                                    )
+                        else:
+                            pcb(
+                                "run_error_phase3_thread_exception",
+                                prog=prog_step_phase3,
+                                lvl="ERROR",
+                                stack_num=int(tile_id_for_future) + 1,
+                                error=str(exc_thread_ph3),
+                            )
+                            logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
                     finally:
                         # Aggressively free CuPy memory pools between tiles to avoid device/pinned host growth
                         try:
@@ -29137,6 +29541,13 @@ def run_hierarchical_mosaic(
             # Start a lightweight real-time monitor to adapt concurrency while Phase 3 runs
             monitor_stop_evt = threading.Event()
             runtime_launch_limit: dict[str, Any] = {"value": int(actual_num_workers_ph3), "pause_until": 0.0, "pause_reason": ""}
+            runtime_adapt_lock = threading.Lock()
+            runtime_working_set_limit: dict[str, Any] = {
+                "winsor_frames_per_pass": int(winsor_max_frames_per_pass) if int(winsor_max_frames_per_pass or 0) > 0 else 256,
+                "cpu_rows_per_chunk": None,
+                "gpu_rows_per_chunk": None,
+                "max_chunk_mb": None,
+            }
 
             def _rt_adapt_concurrency():
                 try:
@@ -29154,12 +29565,76 @@ def run_hierarchical_mosaic(
                 max_level_changes_per_min = int(getattr(zconfig, "phase3_adapt_max_changes_per_min", 6))
                 pause_seconds = float(getattr(zconfig, "phase3_admission_pause_s", 2.5))
 
+                auto_profile = {}
+                try:
+                    vm_boot = _ps.virtual_memory()
+                    sm_boot = _ps.swap_memory()
+                    total_ram_gb = float(getattr(vm_boot, "total", 0.0)) / (1024.0 ** 3)
+                    swap_total_gb = float(getattr(sm_boot, "total", 0.0)) / (1024.0 ** 3)
+                    swap_used_pct = float(getattr(sm_boot, "percent", 0.0))
+
+                    if total_ram_gb <= 8.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 64.0, 76.0, 83.0, 3.8
+                    elif total_ram_gb <= 12.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 68.0, 79.0, 85.0, 3.2
+                    elif total_ram_gb <= 24.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 70.0, 82.0, 87.0, 2.8
+                    else:
+                        auto_low, auto_high, auto_critical, auto_pause = 72.0, 84.0, 89.0, 2.5
+
+                    if swap_total_gb < 1.0:
+                        auto_low -= 2.0
+                        auto_high -= 2.0
+                        auto_critical -= 2.0
+                        auto_pause = max(auto_pause, 3.8)
+                    elif swap_used_pct >= 70.0:
+                        auto_critical = min(auto_critical, 86.0)
+                        auto_pause = max(auto_pause, 4.0)
+
+                    auto_low = max(50.0, min(auto_low, auto_high - 4.0))
+                    auto_high = max(auto_low + 4.0, min(auto_high, auto_critical - 2.0))
+                    auto_critical = max(auto_high + 2.0, min(95.0, auto_critical))
+
+                    ram_low_pct = min(float(ram_low_pct), float(auto_low))
+                    ram_high_pct = min(float(ram_high_pct), float(auto_high))
+                    ram_critical_pct = min(float(ram_critical_pct), float(auto_critical))
+                    pause_seconds = max(float(pause_seconds), float(auto_pause))
+
+                    auto_profile = {
+                        "total_ram_gb": round(total_ram_gb, 2),
+                        "swap_total_gb": round(swap_total_gb, 2),
+                        "swap_used_pct": round(swap_used_pct, 1),
+                    }
+                except Exception:
+                    auto_profile = {}
+
                 if max_level_changes_per_min < 1:
                     max_level_changes_per_min = 1
                 if adapt_cooldown_s < 0.0:
                     adapt_cooldown_s = 0.0
                 if pause_seconds < 0.5:
                     pause_seconds = 0.5
+
+                try:
+                    if auto_profile:
+                        pcb(
+                            "RAM_ADAPT_RT: auto_profile "
+                            f"ram_low={ram_low_pct:.1f} ram_high={ram_high_pct:.1f} "
+                            f"ram_critical={ram_critical_pct:.1f} pause_s={pause_seconds:.1f} "
+                            f"total_ram_gb={auto_profile.get('total_ram_gb')} "
+                            f"swap_gb={auto_profile.get('swap_total_gb')} "
+                            f"swap_used_pct={auto_profile.get('swap_used_pct')}",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                        )
+                except Exception:
+                    pass
+
+                min_frames_per_pass = max(8, int(getattr(zconfig, "phase3_runtime_min_frames_per_pass", 16)))
+                max_frames_per_pass = max(min_frames_per_pass, int(getattr(zconfig, "phase3_runtime_max_frames_per_pass", runtime_working_set_limit.get("winsor_frames_per_pass", 256))))
+                min_cpu_rows = max(32, int(getattr(zconfig, "phase3_runtime_min_cpu_rows_per_chunk", 96)))
+                min_gpu_rows = max(16, int(getattr(zconfig, "phase3_runtime_min_gpu_rows_per_chunk", 64)))
+                min_chunk_mb = max(32.0, float(getattr(zconfig, "phase3_runtime_min_max_chunk_mb", 256.0)))
 
                 ram_level = 0
                 last_change_t = 0.0
@@ -29207,6 +29682,15 @@ def run_hierarchical_mosaic(
 
                     new_ph3_limit = current_ph3_limit
                     new_cache_slots = current_cache_slots if current_cache_slots is not None else default_cache_slots
+                    with runtime_adapt_lock:
+                        cur_frames_per_pass = int(runtime_working_set_limit.get("winsor_frames_per_pass", 256))
+                        cur_cpu_rows = runtime_working_set_limit.get("cpu_rows_per_chunk")
+                        cur_gpu_rows = runtime_working_set_limit.get("gpu_rows_per_chunk")
+                        cur_max_chunk_mb = runtime_working_set_limit.get("max_chunk_mb")
+                    new_frames_per_pass = cur_frames_per_pass
+                    new_cpu_rows = cur_cpu_rows
+                    new_gpu_rows = cur_gpu_rows
+                    new_max_chunk_mb = cur_max_chunk_mb
 
                     if read_mbps is not None:
                         if os.name == 'nt':
@@ -29265,6 +29749,37 @@ def run_hierarchical_mosaic(
 
                     new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
                     new_cache_slots = max(1, int(new_cache_slots))
+
+                    if ram_level >= 2:
+                        new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.70)))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, int(math.floor(float(new_cpu_rows) * 0.75)))
+                        elif new_cpu_rows is None:
+                            new_cpu_rows = max(min_cpu_rows, 256)
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, int(math.floor(float(new_gpu_rows) * 0.75)))
+                        elif new_gpu_rows is None:
+                            new_gpu_rows = max(min_gpu_rows, 128)
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, float(new_max_chunk_mb) * 0.75)
+                        elif new_max_chunk_mb is None:
+                            new_max_chunk_mb = max(min_chunk_mb, 512.0)
+                    elif ram_level == 1:
+                        new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.85)))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, int(math.floor(float(new_cpu_rows) * 0.90)))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, int(math.floor(float(new_gpu_rows) * 0.90)))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, float(new_max_chunk_mb) * 0.90)
+                    elif ram_level <= 0:
+                        new_frames_per_pass = min(max_frames_per_pass, max(min_frames_per_pass, int(math.ceil(float(new_frames_per_pass) * 1.10))))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = min(2048, max(min_cpu_rows, int(math.ceil(float(new_cpu_rows) * 1.10))))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = min(1024, max(min_gpu_rows, int(math.ceil(float(new_gpu_rows) * 1.10))))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = min(4096.0, max(min_chunk_mb, float(new_max_chunk_mb) * 1.10))
 
                     budget_change_blocked_reason = None
                     if new_ph3_limit != current_ph3_limit:
@@ -29372,6 +29887,33 @@ def run_hierarchical_mosaic(
                                 )
                             except Exception:
                                 pass
+
+                        ws_changed = (
+                            int(new_frames_per_pass) != int(cur_frames_per_pass)
+                            or (new_cpu_rows != cur_cpu_rows)
+                            or (new_gpu_rows != cur_gpu_rows)
+                            or (new_max_chunk_mb != cur_max_chunk_mb)
+                        )
+                        if ws_changed:
+                            with runtime_adapt_lock:
+                                runtime_working_set_limit["winsor_frames_per_pass"] = int(new_frames_per_pass)
+                                runtime_working_set_limit["cpu_rows_per_chunk"] = int(new_cpu_rows) if isinstance(new_cpu_rows, (int, float)) and int(new_cpu_rows) > 0 else None
+                                runtime_working_set_limit["gpu_rows_per_chunk"] = int(new_gpu_rows) if isinstance(new_gpu_rows, (int, float)) and int(new_gpu_rows) > 0 else None
+                                runtime_working_set_limit["max_chunk_mb"] = float(new_max_chunk_mb) if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0 else None
+                            try:
+                                pcb(
+                                    "RAM_ADAPT_RT: working_set_update "
+                                    f"frames_per_pass={int(new_frames_per_pass)} "
+                                    f"cpu_rows={runtime_working_set_limit.get('cpu_rows_per_chunk')} "
+                                    f"gpu_rows={runtime_working_set_limit.get('gpu_rows_per_chunk')} "
+                                    f"max_chunk_mb={runtime_working_set_limit.get('max_chunk_mb')} "
+                                    f"ram_level={ram_level} "
+                                    f"ram_used_pct={ram_used_pct if ram_used_pct is not None else 'n/a'}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                            except Exception:
+                                pass
                     except Exception:
                         pass
             monitor_thread = threading.Thread(target=_rt_adapt_concurrency, name="ZeMosaic_Ph3_RTAdapt", daemon=True)
@@ -29385,6 +29927,11 @@ def run_hierarchical_mosaic(
             executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
 
             future_to_tile_id: dict = {}
+            future_to_group_info: dict = {}
+            future_abort_events: dict = {}
+            tile_runtime_state_lock = threading.Lock()
+            tile_last_progress_monotonic: dict[int, float] = {}
+            tile_abort_request_count: dict[int, int] = {}
             tile_cache_paths_unique: dict[int, set[str]] = {}
             cache_refcount: dict[str, int] = {}
             shared_cache_detected = False
@@ -29392,6 +29939,63 @@ def run_hierarchical_mosaic(
             total_removed_cache_bytes = 0
             pending_futures: set = set()
             next_dynamic_tile_id = num_seestar_stacks_to_process
+
+            watchdog_enabled = bool(getattr(zconfig, "phase3_tile_livelock_watchdog_enabled", True))
+            watchdog_timeout_s = max(45.0, float(getattr(zconfig, "phase3_tile_livelock_timeout_s", 240.0)))
+            watchdog_min_runtime_s = max(10.0, float(getattr(zconfig, "phase3_tile_livelock_min_runtime_s", 90.0)))
+            watchdog_base_critical_pct = float(getattr(zconfig, "phase3_ram_critical_pct", 88.0))
+            watchdog_ram_pct = float(getattr(zconfig, "phase3_tile_livelock_ram_pct", max(90.0, watchdog_base_critical_pct)))
+            watchdog_max_abort_per_tile = max(1, int(getattr(zconfig, "phase3_tile_livelock_max_abort_per_tile", 2)))
+
+            try:
+                vm_watch_boot = psutil.virtual_memory()
+                sm_watch_boot = psutil.swap_memory()
+                total_ram_watch_gb = float(getattr(vm_watch_boot, "total", 0.0)) / (1024.0 ** 3)
+                swap_watch_gb = float(getattr(sm_watch_boot, "total", 0.0)) / (1024.0 ** 3)
+                swap_watch_used_pct = float(getattr(sm_watch_boot, "percent", 0.0))
+
+                if total_ram_watch_gb <= 8.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 170.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 60.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 84.0)
+                elif total_ram_watch_gb <= 12.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 210.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 75.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 86.0)
+                elif total_ram_watch_gb <= 24.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 240.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 90.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 88.0)
+                else:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 300.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 120.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 90.0)
+
+                if swap_watch_gb < 1.0:
+                    watchdog_ram_pct = min(watchdog_ram_pct, 83.0)
+                    watchdog_timeout_s = min(watchdog_timeout_s, 150.0)
+                elif swap_watch_used_pct >= 75.0:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 130.0)
+
+                watchdog_timeout_s = max(45.0, float(watchdog_timeout_s))
+                watchdog_min_runtime_s = max(10.0, min(float(watchdog_min_runtime_s), float(watchdog_timeout_s * 0.85)))
+                watchdog_ram_pct = float(np.clip(float(watchdog_ram_pct), 75.0, 98.0))
+
+                pcb(
+                    "RAM_ADAPT_RT: watchdog_auto_profile "
+                    f"enabled={int(bool(watchdog_enabled))} "
+                    f"timeout_s={watchdog_timeout_s:.1f} "
+                    f"min_runtime_s={watchdog_min_runtime_s:.1f} "
+                    f"ram_pct={watchdog_ram_pct:.1f} "
+                    f"max_abort_per_tile={int(watchdog_max_abort_per_tile)} "
+                    f"total_ram_gb={total_ram_watch_gb:.2f} "
+                    f"swap_gb={swap_watch_gb:.2f} "
+                    f"swap_used_pct={swap_watch_used_pct:.1f}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            except Exception:
+                pass
 
             def _register_tile_cache_paths(tile_id: int, group_info_list: list[dict]) -> None:
                 nonlocal shared_cache_detected
@@ -29488,6 +30092,30 @@ def run_hierarchical_mosaic(
                     )
                 except Exception:
                     pass
+                with runtime_adapt_lock:
+                    runtime_winsor_frames_per_pass = int(runtime_working_set_limit.get("winsor_frames_per_pass", winsor_max_frames_per_pass if int(winsor_max_frames_per_pass or 0) > 0 else 256))
+                    runtime_cpu_rows = runtime_working_set_limit.get("cpu_rows_per_chunk")
+                    runtime_gpu_rows = runtime_working_set_limit.get("gpu_rows_per_chunk")
+                    runtime_max_chunk_mb = runtime_working_set_limit.get("max_chunk_mb")
+
+                base_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
+                runtime_parallel_plan = copy.deepcopy(base_parallel_plan) if isinstance(base_parallel_plan, dict) else {}
+                if not isinstance(runtime_parallel_plan, dict):
+                    runtime_parallel_plan = {}
+                if runtime_cpu_rows is not None:
+                    runtime_parallel_plan["cpu_rows_per_chunk"] = int(runtime_cpu_rows)
+                if runtime_gpu_rows is not None:
+                    runtime_parallel_plan["gpu_rows_per_chunk"] = int(runtime_gpu_rows)
+                if runtime_max_chunk_mb is not None:
+                    runtime_parallel_plan["max_chunk_mb"] = float(runtime_max_chunk_mb)
+
+                tile_abort_event = threading.Event()
+
+                def _heartbeat_cb(tile_id_for_hb: int) -> None:
+                    now_hb = time.monotonic()
+                    with tile_runtime_state_lock:
+                        tile_last_progress_monotonic[int(tile_id_for_hb)] = now_hb
+
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -29515,19 +30143,27 @@ def run_hierarchical_mosaic(
                     astap_exe_path, astap_data_dir_param, astap_search_radius_config,
                     astap_downsample_config, astap_sensitivity_config, 180,
                     winsor_worker_limit,
-                    winsor_max_frames_per_pass,
+                    runtime_winsor_frames_per_pass,
                     progress_callback,
                     resource_strategy=auto_resource_strategy,
                     center_out_context=center_out_context,
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
-                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    parallel_plan=runtime_parallel_plan,
                     dbg_tile_ids=dbg_tile_ids,
                     allow_batch_duplication=bool(allow_duplication_config),
                     target_stack_size=int(target_stack_config),
                     min_safe_stack_size=int(min_safe_stack_config),
+                    abort_event=tile_abort_event,
+                    heartbeat_callback=_heartbeat_cb,
                 )
                 future_to_tile_id[future] = assigned_tile_id
+                future_to_group_info[future] = list(group_info_list or [])
+                future_abort_events[future] = tile_abort_event
+                with tile_runtime_state_lock:
+                    now_submit = time.monotonic()
+                    tile_last_progress_monotonic[int(assigned_tile_id)] = now_submit
+                    tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
 
             pending_launch_queue: list[tuple[list[dict], int, int | None]] = []
@@ -29553,6 +30189,51 @@ def run_hierarchical_mosaic(
                 except Exception:
                     resolved = int(actual_num_workers_ph3)
                 return max(0, min(int(actual_num_workers_ph3), resolved))
+
+            def _request_livelock_abort_if_needed() -> None:
+                if not watchdog_enabled or not pending_futures:
+                    return
+                try:
+                    vm_watch = psutil.virtual_memory()
+                    ram_pct_watch = float(getattr(vm_watch, "percent", 0.0))
+                except Exception:
+                    return
+                if not math.isfinite(ram_pct_watch) or ram_pct_watch < watchdog_ram_pct:
+                    return
+
+                now_watch = time.monotonic()
+                for fut in list(pending_futures):
+                    tile_id_watch = future_to_tile_id.get(fut)
+                    if tile_id_watch is None:
+                        continue
+                    start_watch = phase3_tile_start_monotonic.get(tile_id_watch, now_watch)
+                    with tile_runtime_state_lock:
+                        last_progress = tile_last_progress_monotonic.get(int(tile_id_watch), start_watch)
+                        current_abort_count = int(tile_abort_request_count.get(int(tile_id_watch), 0))
+                    runtime_s = max(0.0, now_watch - float(start_watch))
+                    stalled_s = max(0.0, now_watch - float(last_progress))
+                    if runtime_s < watchdog_min_runtime_s or stalled_s < watchdog_timeout_s:
+                        continue
+                    if current_abort_count >= watchdog_max_abort_per_tile:
+                        continue
+                    abort_evt = future_abort_events.get(fut)
+                    if abort_evt is None or abort_evt.is_set():
+                        continue
+                    abort_evt.set()
+                    with tile_runtime_state_lock:
+                        tile_abort_request_count[int(tile_id_watch)] = current_abort_count + 1
+                    try:
+                        pcb(
+                            "RAM_ADAPT_RT: livelock_abort_request "
+                            f"tile_id={int(tile_id_watch)} "
+                            f"stall_s={stalled_s:.1f} runtime_s={runtime_s:.1f} "
+                            f"ram_used_pct={ram_pct_watch:.1f} "
+                            f"attempt={current_abort_count + 1}/{watchdog_max_abort_per_tile}",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    except Exception:
+                        pass
 
             def _drain_launch_queue() -> int:
                 launched = 0
@@ -29611,15 +30292,22 @@ def run_hierarchical_mosaic(
 
             while pending_futures or pending_launch_queue:
                 _drain_launch_queue()
+                _request_livelock_abort_if_needed()
                 if not pending_futures:
                     time.sleep(0.05)
                     continue
-                done_futures, _ = wait(pending_futures, return_when=FIRST_COMPLETED)
+                done_futures, _ = wait(pending_futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done_futures:
+                    continue
                 for future in done_futures:
                     pending_futures.discard(future)
                     tile_id_for_future = future_to_tile_id.pop(future, None)
+                    original_group_for_future = future_to_group_info.pop(future, None)
+                    future_abort_events.pop(future, None)
                     if tile_id_for_future is None:
                         continue
+                    with tile_runtime_state_lock:
+                        tile_last_progress_monotonic.pop(int(tile_id_for_future), None)
                     tiles_processed_count_ph3 += 1
 
                     pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
@@ -29743,14 +30431,68 @@ def run_hierarchical_mosaic(
                                     except Exception:
                                         pass
                     except Exception as exc_thread_ph3:
-                        pcb(
-                            "run_error_phase3_thread_exception",
-                            prog=prog_step_phase3,
-                            lvl="ERROR",
-                            stack_num=int(tile_id_for_future) + 1,
-                            error=str(exc_thread_ph3),
-                        )
-                        logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+                        if isinstance(exc_thread_ph3, Phase3TileAbortRequested):
+                            pcb(
+                                "run_warn_phase3_tile_abort_requested",
+                                prog=prog_step_phase3,
+                                lvl="WARN",
+                                stack_num=int(tile_id_for_future) + 1,
+                                tile_id=int(tile_id_for_future),
+                                reason=str(exc_thread_ph3),
+                            )
+                            retry_group: list[dict] = []
+                            for raw_info in (original_group_for_future or []):
+                                if isinstance(raw_info, dict):
+                                    info_copy = dict(raw_info)
+                                    info_copy["retry_attempt"] = int(info_copy.get("retry_attempt", 0)) + 1
+                                    info_copy["retry_reason"] = "phase3_livelock_abort"
+                                    retry_group.append(info_copy)
+                                else:
+                                    retry_group.append(raw_info)
+                            if retry_group:
+                                max_retry_attempt = 0
+                                try:
+                                    max_retry_attempt = max(
+                                        int(item.get("retry_attempt", 0))
+                                        for item in retry_group
+                                        if isinstance(item, dict)
+                                    )
+                                except Exception:
+                                    max_retry_attempt = 0
+                                if max_retry_attempt > MAX_ALIGNMENT_RETRY_ATTEMPTS:
+                                    pcb(
+                                        "run_warn_phase3_alignment_retry_abandoned",
+                                        prog=None,
+                                        lvl="WARN",
+                                        tile_id=int(tile_id_for_future),
+                                        attempts=int(max_retry_attempt),
+                                        reason="phase3_livelock_abort",
+                                    )
+                                else:
+                                    new_tile_id = next_dynamic_tile_id
+                                    next_dynamic_tile_id += 1
+                                    num_seestar_stacks_to_process += 1
+                                    _register_tile_cache_paths(new_tile_id, retry_group)
+                                    retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
+                                    pending_launch_queue.append((retry_group, new_tile_id, retry_rank))
+                                    pcb(
+                                        "run_info_phase3_retry_submitted",
+                                        prog=None,
+                                        lvl="INFO_DETAIL",
+                                        origin_tile=int(tile_id_for_future),
+                                        new_tile=new_tile_id,
+                                        frames=len(retry_group),
+                                        reason="phase3_livelock_abort",
+                                    )
+                        else:
+                            pcb(
+                                "run_error_phase3_thread_exception",
+                                prog=prog_step_phase3,
+                                lvl="ERROR",
+                                stack_num=int(tile_id_for_future) + 1,
+                                error=str(exc_thread_ph3),
+                            )
+                            logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
                     finally:
                         # Aggressively free CuPy memory pools between tiles to avoid device/pinned host growth
                         try:
