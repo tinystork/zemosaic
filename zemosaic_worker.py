@@ -4791,8 +4791,11 @@ def _coerce_to_builtin(value):
 def _ensure_hwc_master_tile(
     data: np.ndarray,
     tile_label: str | None = None,
+    *,
+    out_dtype: np.dtype | type = np.float32,
+    c_contiguous: bool = True,
 ) -> np.ndarray:
-    """Normalize master tile data to ``H x W x C`` float32 layout.
+    """Normalize master tile data to ``H x W x C`` layout.
 
     Parameters
     ----------
@@ -4800,11 +4803,15 @@ def _ensure_hwc_master_tile(
         Array loaded from FITS (typically via ``hdul[0].data``).
     tile_label : str | None
         Optional identifier used for logging in case of shape issues.
+    out_dtype : np.dtype | type
+        Output dtype (default: ``float32``).
+    c_contiguous : bool
+        When ``True``, enforce C-order contiguous output.
 
     Returns
     -------
     np.ndarray
-        Array with shape ``(H, W, C)`` and dtype ``float32``.
+        Array with shape ``(H, W, C)`` and requested dtype.
 
     Raises
     ------
@@ -4813,7 +4820,7 @@ def _ensure_hwc_master_tile(
         into an ``HWC`` representation.
     """
 
-    arr = np.asarray(data, dtype=np.float32)
+    arr = np.asarray(data, dtype=out_dtype)
 
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
@@ -4837,7 +4844,9 @@ def _ensure_hwc_master_tile(
         logger.error(msg)
         raise ValueError(msg)
 
-    return np.asarray(arr, dtype=np.float32, order="C")
+    if c_contiguous:
+        return np.asarray(arr, dtype=out_dtype, order="C")
+    return np.asarray(arr, dtype=out_dtype, order="K")
 
 
 def _header_flag_is_set(header: Any | None, key: str) -> bool:
@@ -5570,6 +5579,81 @@ def _move_quality_reject_file(src_path: str) -> tuple[str, bool]:
     except Exception as exc:
         logger.warning("Failed to move rejected master tile %s: %s", src_path, exc)
         return src_path, False
+
+
+def _recover_rejected_master_tiles_for_phase3(
+    temp_master_tile_storage_dir: str | None,
+    *,
+    pcb: Callable | None = None,
+) -> dict[int, tuple[str, Any]]:
+    """Last-resort recovery when quality gate rejected every Phase 3 tile.
+
+    If Phase 3 would otherwise fail with zero master tiles, recover valid FITS
+    from ``rejected_by_quality`` so the run can proceed.
+    """
+
+    recovered: dict[int, tuple[str, Any]] = {}
+    if not temp_master_tile_storage_dir:
+        return recovered
+
+    try:
+        rej_dir = Path(str(temp_master_tile_storage_dir)) / "rejected_by_quality"
+    except Exception:
+        return recovered
+    if not rej_dir.exists():
+        return recovered
+
+    candidates = sorted(rej_dir.glob("master_tile_*.fits"), key=lambda p: str(p).lower())
+    for idx, fpath in enumerate(candidates):
+        try:
+            header = fits.getheader(fpath, 0)
+        except Exception:
+            continue
+        wcs_obj = None
+        try:
+            ok, wcs_obj, _failure = zemosaic_utils.validate_wcs_header(header, require_footprint=True)
+            if not ok:
+                wcs_obj = None
+        except Exception:
+            wcs_obj = None
+        if wcs_obj is None:
+            try:
+                wcs_obj = WCS(header, naxis=2, relax=True)
+            except Exception:
+                continue
+
+        tile_id = None
+        try:
+            tile_id = int(header.get("ZMT_ID"))
+        except Exception:
+            tile_id = None
+        if tile_id is None:
+            m = re.search(r"master_tile_(\d+)", fpath.name)
+            if m:
+                try:
+                    tile_id = int(m.group(1))
+                except Exception:
+                    tile_id = None
+        if tile_id is None:
+            tile_id = 100000 + idx
+
+        while tile_id in recovered:
+            tile_id += 1
+        recovered[int(tile_id)] = (str(fpath), wcs_obj)
+
+    if recovered and pcb:
+        try:
+            pcb(
+                "run_warn_phase3_quality_gate_all_rejected_recovering",
+                prog=None,
+                lvl="WARN",
+                recovered=int(len(recovered)),
+                directory=str(rej_dir),
+            )
+        except Exception:
+            pass
+
+    return recovered
 
 
 def _existing_master_tile_robust_stats(path: str) -> dict[str, float] | None:
@@ -8538,18 +8622,18 @@ def _compute_intertile_affine_corrections_from_sources(
             alpha_mask_arr: np.ndarray | None = None
             label = _safe_basename(src.path)
             if src.data is not None:
-                tile_arr = _ensure_hwc_master_tile(src.data, label)
+                tile_arr = _ensure_hwc_master_tile(src.data, label, out_dtype=np.float32, c_contiguous=False)
             else:
                 if not src.path:
                     raise ValueError("Tile data missing and no path provided.")
-                with fits.open(src.path, memmap=False) as hdul:
-                    tile_arr = _ensure_hwc_master_tile(hdul[0].data, label)
+                with fits.open(src.path, memmap=True) as hdul:
+                    tile_arr = _ensure_hwc_master_tile(hdul[0].data, label, out_dtype=np.float32, c_contiguous=False)
                     if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
                         try:
                             alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
                         except Exception:
                             alpha_mask_arr = None
-            tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
+            # Keep intertile buffers lightweight; avoid forcing contiguous float32 copies here.
             mask_source = getattr(src, "mask", None)
             if mask_source is not None:
                 try:
@@ -11882,7 +11966,61 @@ if not logger.handlers:
             continue
     if not file_handler_added:
         logger.addHandler(logging.NullHandler())
+logger.propagate = False
 logger.info("Logging pour ZeMosaicWorker initialisé. Logs écrits dans: %s", log_file_path)
+
+
+def _sanitize_spawned_process_logging() -> None:
+    """Harden logging in spawned child processes (notably on Windows).
+
+    Some spawned workers inherit console/pipe stream handlers that can become
+    invalid and raise PermissionError during handler flush().
+    We keep file handlers and drop fragile stream handlers in child processes.
+    """
+
+    try:
+        proc = multiprocessing.current_process()
+        is_child = (getattr(proc, "name", "") != "MainProcess") or bool(getattr(proc, "daemon", False))
+    except Exception:
+        is_child = False
+
+    if not is_child:
+        return
+
+    try:
+        logging.raiseExceptions = False
+    except Exception:
+        pass
+
+    def _drop_stream_handlers(log_obj: logging.Logger) -> None:
+        for handler in list(getattr(log_obj, "handlers", []) or []):
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                try:
+                    log_obj.removeHandler(handler)
+                except Exception:
+                    pass
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+
+    try:
+        _drop_stream_handlers(logging.getLogger())
+    except Exception:
+        pass
+    try:
+        _drop_stream_handlers(logger)
+    except Exception:
+        pass
+    try:
+        _drop_stream_handlers(logging.getLogger("multiprocessing"))
+    except Exception:
+        pass
+
+    try:
+        logger.propagate = False
+    except Exception:
+        pass
 
 
 def _configure_worker_logging(logging_level_config: str | None, *, source_hint: str | None = None) -> None:
@@ -25131,7 +25269,14 @@ def run_hierarchical_mosaic_classic_legacy(
             master_tiles_results_list = [master_tiles_results_list_temp[i] for i in sorted(master_tiles_results_list_temp.keys())]
             del master_tiles_results_list_temp; gc.collect()
             if not master_tiles_results_list:
-                pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
+                recovered = _recover_rejected_master_tiles_for_phase3(
+                    temp_master_tile_storage_dir,
+                    pcb=pcb,
+                )
+                if recovered:
+                    master_tiles_results_list = [recovered[i] for i in sorted(recovered.keys())]
+                else:
+                    pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
 
             current_global_progress = base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
             _log_memory_usage(progress_callback, "Fin Phase 3");
@@ -30581,7 +30726,14 @@ def run_hierarchical_mosaic(
             master_tiles_results_list = [master_tiles_results_list_temp[i] for i in sorted(master_tiles_results_list_temp.keys())]
             del master_tiles_results_list_temp; gc.collect()
             if not master_tiles_results_list:
-                pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
+                recovered = _recover_rejected_master_tiles_for_phase3(
+                    temp_master_tile_storage_dir,
+                    pcb=pcb,
+                )
+                if recovered:
+                    master_tiles_results_list = [recovered[i] for i in sorted(recovered.keys())]
+                else:
+                    pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
 
             current_global_progress = base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
             _log_memory_usage(progress_callback, "Fin Phase 3");
@@ -31520,6 +31672,8 @@ def run_hierarchical_mosaic_process(
     **kwargs,
 ):
     """Wrapper for running :func:`run_hierarchical_mosaic` in a separate process."""
+
+    _sanitize_spawned_process_logging()
 
     # progress_callback(stage: str, current: int, total: int)
 
