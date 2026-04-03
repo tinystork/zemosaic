@@ -175,6 +175,11 @@ DEFAULT_CONFIG = {
     "tile_weight_v4_strength": 1.0,
     "tile_weight_v4_min": 0.75,
     "tile_weight_v4_max": 1.35,
+    "tile_weight_v4_residual_penalty_enabled": False,
+    "tile_weight_v4_residual_penalty_strength": 0.35,
+    "tile_weight_v4_temporal_penalty_enabled": False,
+    "tile_weight_v4_temporal_penalty_strength": 0.20,
+    "tile_weight_v4_temporal_penalty_hours": 6.0,
     "final_assembly_method": "reproject_coadd",  # Options: "reproject_coadd", "incremental",
     "auto_detect_seestar": True,
     "force_seestar_mode": False,
@@ -591,6 +596,36 @@ def get_config_path():
     """
     return str(_SCRIPT_DIR / CONFIG_FILE_NAME)
 
+def _sync_path_aliases(config_obj: dict) -> dict:
+    """Keep legacy/new path keys synchronized.
+
+    Source of truth: prefer *_dir keys (used by Qt GUI), fallback to *_folder.
+    Always mirror both directions so external edits are visible in UI and vice versa.
+    """
+    if not isinstance(config_obj, dict):
+        return config_obj
+
+    def _norm(v):
+        if v is None:
+            return ""
+        txt = str(v).strip()
+        return txt
+
+    input_dir = _norm(config_obj.get("input_dir", ""))
+    input_folder = _norm(config_obj.get("input_folder", ""))
+    output_dir = _norm(config_obj.get("output_dir", ""))
+    output_folder = _norm(config_obj.get("output_folder", ""))
+
+    canonical_input = input_dir or input_folder
+    canonical_output = output_dir or output_folder
+
+    config_obj["input_dir"] = canonical_input
+    config_obj["input_folder"] = canonical_input
+    config_obj["output_dir"] = canonical_output
+    config_obj["output_folder"] = canonical_output
+
+    return config_obj
+
 def load_config():
     config_path = Path(get_config_path())
     try:
@@ -676,6 +711,7 @@ def load_config():
         fmt_val = "png"
     current_config["altaz_alpha_sidecar_format"] = fmt_val
 
+    _sync_path_aliases(current_config)
     return current_config
 
 def save_config(config_data):
@@ -739,6 +775,7 @@ def save_config(config_data):
              return False # Ne pas créer un fichier vide
 
 
+        _sync_path_aliases(config_to_save)
         with config_path.open("w", encoding="utf-8") as f: # Spécifier encoding
             json.dump(config_to_save, f, indent=4, ensure_ascii=False) # ensure_ascii=False pour les caractères non-ASCII
         print(f"Configuration sauvegardée vers {config_path}")

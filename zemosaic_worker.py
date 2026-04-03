@@ -10406,6 +10406,11 @@ def _run_shared_phase45_phase5_pipeline(
     tile_weight_v4_strength_config = float(phase5_options.get("tile_weight_v4_strength") or 1.0)
     tile_weight_v4_min_config = float(phase5_options.get("tile_weight_v4_min") or 0.75)
     tile_weight_v4_max_config = float(phase5_options.get("tile_weight_v4_max") or 1.35)
+    tile_weight_v4_residual_penalty_enabled_config = bool(phase5_options.get("tile_weight_v4_residual_penalty_enabled"))
+    tile_weight_v4_residual_penalty_strength_config = float(phase5_options.get("tile_weight_v4_residual_penalty_strength") or 0.35)
+    tile_weight_v4_temporal_penalty_enabled_config = bool(phase5_options.get("tile_weight_v4_temporal_penalty_enabled"))
+    tile_weight_v4_temporal_penalty_strength_config = float(phase5_options.get("tile_weight_v4_temporal_penalty_strength") or 0.20)
+    tile_weight_v4_temporal_penalty_hours_config = float(phase5_options.get("tile_weight_v4_temporal_penalty_hours") or 6.0)
     pcb(
         (
             "[Phase5] tile_weight_v4 "
@@ -10413,7 +10418,9 @@ def _run_shared_phase45_phase5_pipeline(
             f"curve={tile_weight_v4_curve_config} "
             f"strength={tile_weight_v4_strength_config:.4g} "
             f"min={tile_weight_v4_min_config:.4g} "
-            f"max={tile_weight_v4_max_config:.4g}"
+            f"max={tile_weight_v4_max_config:.4g} "
+            f"res_pen={int(tile_weight_v4_residual_penalty_enabled_config)}({tile_weight_v4_residual_penalty_strength_config:.3g}) "
+            f"tmp_pen={int(tile_weight_v4_temporal_penalty_enabled_config)}({tile_weight_v4_temporal_penalty_strength_config:.3g}/{tile_weight_v4_temporal_penalty_hours_config:.3g}h)"
         ),
         prog=None,
         lvl="INFO",
@@ -11005,6 +11012,11 @@ def _run_shared_phase45_phase5_pipeline(
                 tile_weight_v4_strength=tile_weight_v4_strength_config,
                 tile_weight_v4_min=tile_weight_v4_min_config,
                 tile_weight_v4_max=tile_weight_v4_max_config,
+                tile_weight_v4_residual_penalty_enabled=tile_weight_v4_residual_penalty_enabled_config,
+                tile_weight_v4_residual_penalty_strength=tile_weight_v4_residual_penalty_strength_config,
+                tile_weight_v4_temporal_penalty_enabled=tile_weight_v4_temporal_penalty_enabled_config,
+                tile_weight_v4_temporal_penalty_strength=tile_weight_v4_temporal_penalty_strength_config,
+                tile_weight_v4_temporal_penalty_hours=tile_weight_v4_temporal_penalty_hours_config,
                 stats_callback=_emit_phase5_stats,
                 worker_config_cache=worker_config_cache,
                 gpu_safety_ctx_phase5=gpu_safety_ctx_phase5,
@@ -12143,27 +12155,162 @@ def _export_intertile_graph_diagnostics(diagnostics_output_dir: Path | None, eff
     diag = zemosaic_utils.get_last_intertile_diagnostics() or {}
     if not isinstance(diag, dict) or not diag:
         return
+
     ids = [str((e or {}).get("tile_id", i)) for i, e in enumerate(effective_tiles)]
     paths = [str((e or {}).get("path", "")) for e in effective_tiles]
+
+    def _tile_id_for_index(i: int) -> str:
+        return ids[i] if 0 <= i < len(ids) else ""
+
+    def _tile_path_for_index(i: int) -> str:
+        return paths[i] if 0 <= i < len(paths) else ""
+
     def rows(edges):
-        out=[]
+        out = []
         for e in (edges or []):
-            i,j=int(e.get("i",-1)),int(e.get("j",-1))
-            out.append([i,j, ids[i] if 0<=i<len(ids) else "", ids[j] if 0<=j<len(ids) else "", paths[i] if 0<=i<len(paths) else "", paths[j] if 0<=j<len(paths) else "", float(e.get("weight",0.0) or 0.0), float(e.get("weight_area",0.0) or 0.0), float(e.get("weight_strength",0.0) or 0.0), bool(e.get("kept",False))])
+            i, j = int(e.get("i", -1)), int(e.get("j", -1))
+            out.append([
+                i,
+                j,
+                _tile_id_for_index(i),
+                _tile_id_for_index(j),
+                _tile_path_for_index(i),
+                _tile_path_for_index(j),
+                float(e.get("weight", 0.0) or 0.0),
+                float(e.get("weight_area", 0.0) or 0.0),
+                float(e.get("weight_strength", 0.0) or 0.0),
+                bool(e.get("kept", False)),
+            ])
         return out
-    _write_json_diagnostic(diagnostics_output_dir / "intertile_graph_summary.json", {
-        "status": diag.get("status"), "raw_pairs_count": int(diag.get("raw_pairs_count",0) or 0),
-        "pruned_pairs_count": int(diag.get("pruned_pairs_count",0) or 0), "active_tile_count": int(diag.get("active_tile_count",0) or 0),
-        "components_active": int(diag.get("components_active",0) or 0), "bridges_added": int(diag.get("bridges_added",0) or 0),
-        "fallback_used": bool(diag.get("fallback_used",False)), "prune_k": int(diag.get("prune_k",0) or 0),
-        "prune_weight_mode": str(diag.get("prune_weight_mode","")), "anchor": diag.get("anchor"),
-        "pair_entries_count": int(diag.get("pair_entries_count",0) or 0), "n_tiles": len(ids),
-    })
-    hdr=["i","j","tile_id_i","tile_id_j","path_i","path_j","weight","weight_area","weight_strength","kept"]
+
+    m2_diag = diag.get("m2_diag") if isinstance(diag.get("m2_diag"), dict) else {}
+    m1_diag = diag.get("m1_diag") if isinstance(diag.get("m1_diag"), dict) else {}
+
+    _write_json_diagnostic(
+        diagnostics_output_dir / "intertile_graph_summary.json",
+        {
+            "status": diag.get("status"),
+            "raw_pairs_count": int(diag.get("raw_pairs_count", 0) or 0),
+            "pruned_pairs_count": int(diag.get("pruned_pairs_count", 0) or 0),
+            "active_tile_count": int(diag.get("active_tile_count", 0) or 0),
+            "components_active": int(diag.get("components_active", 0) or 0),
+            "bridges_added": int(diag.get("bridges_added", 0) or 0),
+            "fallback_used": bool(diag.get("fallback_used", False)),
+            "prune_k": int(diag.get("prune_k", 0) or 0),
+            "prune_weight_mode": str(diag.get("prune_weight_mode", "")),
+            "anchor": diag.get("anchor"),
+            "pair_entries_count": int(diag.get("pair_entries_count", 0) or 0),
+            "n_tiles": len(ids),
+            "m2_constraints": int(m2_diag.get("constraints", 0) or 0),
+            "m2_kept": int(m2_diag.get("kept", 0) or 0),
+            "m2_rejected": int(m2_diag.get("rejected", 0) or 0),
+            "m2_residual_abs_median": float(m2_diag.get("residual_abs_median", 0.0) or 0.0),
+            "m2_residual_abs_p95": float(m2_diag.get("residual_abs_p95", 0.0) or 0.0),
+            "m1_constraints": int(m1_diag.get("constraints", 0) or 0),
+            "m1_residual_abs_median": float(m1_diag.get("residual_abs_median", 0.0) or 0.0),
+            "m1_residual_abs_p95": float(m1_diag.get("residual_abs_p95", 0.0) or 0.0),
+        },
+    )
+
+    solver_profile = m2_diag.get("solver_profile") if isinstance(m2_diag, dict) else None
+    if isinstance(solver_profile, dict) and solver_profile:
+        _write_json_diagnostic(
+            diagnostics_output_dir / "intertile_solver_profile.json",
+            solver_profile,
+        )
+
+    hdr = ["i", "j", "tile_id_i", "tile_id_j", "path_i", "path_j", "weight", "weight_area", "weight_strength", "kept"]
     _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_raw.csv", hdr, rows(diag.get("graph_raw_edges")))
     _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_kept.csv", hdr, rows(diag.get("graph_kept_edges")))
     _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_rejected.csv", hdr, rows(diag.get("graph_rejected_edges")))
 
+    affine_solution = diag.get("affine_solution") if isinstance(diag.get("affine_solution"), dict) else {}
+    if affine_solution:
+        solve_rows = []
+        for k in sorted(affine_solution.keys(), key=lambda x: int(x) if str(x).lstrip('-').isdigit() else str(x)):
+            try:
+                idx = int(k)
+            except Exception:
+                continue
+            vals = affine_solution.get(k)
+            if not isinstance(vals, (list, tuple)) or len(vals) < 2:
+                continue
+            gain = float(vals[0])
+            offset = float(vals[1])
+            solve_rows.append([
+                idx,
+                _tile_id_for_index(idx),
+                _tile_path_for_index(idx),
+                gain,
+                offset,
+            ])
+        _write_csv_diagnostic(
+            diagnostics_output_dir / "intertile_photometric_solve.csv",
+            ["tile_index", "tile_id", "path", "gain", "offset"],
+            solve_rows,
+        )
+
+    pair_residuals = m2_diag.get("pair_residuals") if isinstance(m2_diag, dict) else None
+    if isinstance(pair_residuals, list) and pair_residuals:
+        residual_rows = []
+        for e in pair_residuals:
+            if not isinstance(e, dict):
+                continue
+            i = int(e.get("i", -1))
+            j = int(e.get("j", -1))
+            residual_rows.append([
+                i,
+                j,
+                _tile_id_for_index(i),
+                _tile_id_for_index(j),
+                _tile_path_for_index(i),
+                _tile_path_for_index(j),
+                float(e.get("a_ij", 0.0) or 0.0),
+                float(e.get("b_ij", 0.0) or 0.0),
+                float(e.get("weight", 0.0) or 0.0),
+                float(e.get("residual_gain", 0.0) or 0.0),
+                float(e.get("residual_offset", 0.0) or 0.0),
+                float(e.get("residual_abs", 0.0) or 0.0),
+            ])
+        _write_csv_diagnostic(
+            diagnostics_output_dir / "intertile_residuals.csv",
+            [
+                "i",
+                "j",
+                "tile_id_i",
+                "tile_id_j",
+                "path_i",
+                "path_j",
+                "a_ij",
+                "b_ij",
+                "weight",
+                "residual_gain",
+                "residual_offset",
+                "residual_abs",
+            ],
+            residual_rows,
+        )
+
+    tile_residual_summary = m2_diag.get("tile_residual_summary") if isinstance(m2_diag, dict) else None
+    if isinstance(tile_residual_summary, list) and tile_residual_summary:
+        tr_rows = []
+        for e in tile_residual_summary:
+            if not isinstance(e, dict):
+                continue
+            idx = int(e.get("tile_index", -1))
+            tr_rows.append([
+                idx,
+                _tile_id_for_index(idx),
+                _tile_path_for_index(idx),
+                int(e.get("pair_count", 0) or 0),
+                float(e.get("residual_abs_median", 0.0) or 0.0),
+                float(e.get("residual_abs_p95", 0.0) or 0.0),
+            ])
+        _write_csv_diagnostic(
+            diagnostics_output_dir / "intertile_tile_residual_summary.csv",
+            ["tile_index", "tile_id", "path", "pair_count", "residual_abs_median", "residual_abs_p95"],
+            tr_rows,
+        )
 
 def _export_weighted_coverage_and_winner_maps(diagnostics_output_dir: Path | None, effective_tiles: list[dict[str, Any]] | None, final_output_wcs, shape_hw: tuple[int, int]) -> None:
     if diagnostics_output_dir is None or not effective_tiles:
@@ -16993,6 +17140,11 @@ def assemble_final_mosaic_reproject_coadd(
     tile_weight_v4_strength: float = 1.0,
     tile_weight_v4_min: float = 0.75,
     tile_weight_v4_max: float = 1.35,
+    tile_weight_v4_residual_penalty_enabled: bool = False,
+    tile_weight_v4_residual_penalty_strength: float = 0.35,
+    tile_weight_v4_temporal_penalty_enabled: bool = False,
+    tile_weight_v4_temporal_penalty_strength: float = 0.20,
+    tile_weight_v4_temporal_penalty_hours: float = 6.0,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -17263,7 +17415,7 @@ def assemble_final_mosaic_reproject_coadd(
                 return value_f
         return None
 
-    def _apply_tile_weight_v4(weights: list[float]) -> list[float]:
+    def _apply_tile_weight_v4(weights: list[float], tile_entries: list[dict[str, Any]] | None = None) -> list[float]:
         if not tile_weight_v4_enabled or not weights:
             return weights
         arr = np.asarray(weights, dtype=np.float64)
@@ -17286,11 +17438,124 @@ def assemble_final_mosaic_reproject_coadd(
         else:
             transformed = np.sqrt(np.maximum(norm, 1e-6))
         transformed = 1.0 + strength * (transformed - 1.0)
+
+        residual_raw_by_id, residual_norm_by_id = _build_residual_penalty_maps(tile_entries or [])
+
+        temporal_enabled = bool(tile_weight_v4_temporal_penalty_enabled)
+        temporal_strength = float(tile_weight_v4_temporal_penalty_strength) if math.isfinite(float(tile_weight_v4_temporal_penalty_strength)) else 0.2
+        temporal_strength = float(np.clip(temporal_strength, 0.0, 1.0))
+        temporal_hours = float(tile_weight_v4_temporal_penalty_hours) if math.isfinite(float(tile_weight_v4_temporal_penalty_hours)) else 6.0
+        temporal_hours = max(0.25, temporal_hours)
+
+        residual_enabled = bool(tile_weight_v4_residual_penalty_enabled)
+        residual_strength = float(tile_weight_v4_residual_penalty_strength) if math.isfinite(float(tile_weight_v4_residual_penalty_strength)) else 0.35
+        residual_strength = float(np.clip(residual_strength, 0.0, 1.0))
+
+        temporal_center = None
+        if temporal_enabled and tile_entries:
+            ts_vals = []
+            for e in tile_entries:
+                try:
+                    ts_v = float((e or {}).get("obs_timestamp"))
+                except Exception:
+                    ts_v = float("nan")
+                if math.isfinite(ts_v):
+                    ts_vals.append(ts_v)
+            if ts_vals:
+                temporal_center = float(np.median(np.asarray(ts_vals, dtype=np.float64)))
+
+        telemetry_rows = []
+        if tile_entries and len(tile_entries) == transformed.size:
+            for idx, entry in enumerate(tile_entries):
+                tile_id = str((entry or {}).get("tile_id", ""))
+                penalty = 1.0
+                residual_norm = float(residual_norm_by_id.get(tile_id, 0.0)) if residual_enabled else 0.0
+                residual_raw = float(residual_raw_by_id.get(tile_id, 0.0)) if residual_enabled else 0.0
+                if residual_enabled and residual_norm > 0.0:
+                    penalty *= float(1.0 / (1.0 + residual_strength * residual_norm))
+
+                temporal_delta_h = 0.0
+                temporal_norm = 0.0
+                if temporal_enabled and temporal_center is not None:
+                    try:
+                        ts_v = float((entry or {}).get("obs_timestamp"))
+                    except Exception:
+                        ts_v = float("nan")
+                    if math.isfinite(ts_v):
+                        temporal_delta_h = abs(ts_v - temporal_center) / 3600.0
+                        temporal_norm = min(1.0, temporal_delta_h / temporal_hours)
+                        penalty *= float(1.0 / (1.0 + temporal_strength * temporal_norm))
+
+                penalty = float(np.clip(penalty, 0.5, 1.0))
+                transformed[idx] = float(transformed[idx]) * penalty
+                telemetry_rows.append({
+                    "tile_id": tile_id,
+                    "path": str((entry or {}).get("path", "")),
+                    "base_weight": float(arr[idx]),
+                    "v4_weight_before_penalty": float(transformed[idx] / max(1e-9, penalty)),
+                    "penalty_factor": float(penalty),
+                    "residual_raw": float(residual_raw),
+                    "residual_norm": float(residual_norm),
+                    "temporal_delta_h": float(temporal_delta_h),
+                    "temporal_norm": float(temporal_norm),
+                })
+
         lo = float(tile_weight_v4_min) if math.isfinite(float(tile_weight_v4_min)) else 0.75
         hi = float(tile_weight_v4_max) if math.isfinite(float(tile_weight_v4_max)) else 1.35
         if lo > hi:
             lo, hi = hi, lo
         transformed = np.clip(transformed, lo, hi)
+
+        if diagnostics_output_dir is not None and telemetry_rows:
+            _write_csv_diagnostic(
+                diagnostics_output_dir / "tile_weights_v4_telemetry.csv",
+                [
+                    "tile_id",
+                    "path",
+                    "base_weight",
+                    "v4_weight_before_penalty",
+                    "penalty_factor",
+                    "residual_raw",
+                    "residual_norm",
+                    "temporal_delta_h",
+                    "temporal_norm",
+                ],
+                [
+                    [
+                        r["tile_id"],
+                        r["path"],
+                        r["base_weight"],
+                        r["v4_weight_before_penalty"],
+                        r["penalty_factor"],
+                        r["residual_raw"],
+                        r["residual_norm"],
+                        r["temporal_delta_h"],
+                        r["temporal_norm"],
+                    ]
+                    for r in telemetry_rows
+                ],
+            )
+            try:
+                penalties = np.asarray([float(r["penalty_factor"]) for r in telemetry_rows], dtype=np.float64)
+                _write_json_diagnostic(
+                    diagnostics_output_dir / "tile_weights_v4_summary.json",
+                    {
+                        "enabled": True,
+                        "curve": str(tile_weight_v4_curve),
+                        "strength": float(strength),
+                        "residual_penalty_enabled": bool(residual_enabled),
+                        "residual_penalty_strength": float(residual_strength),
+                        "temporal_penalty_enabled": bool(temporal_enabled),
+                        "temporal_penalty_strength": float(temporal_strength),
+                        "temporal_penalty_hours": float(temporal_hours),
+                        "penalty_min": float(np.nanmin(penalties)) if penalties.size else 1.0,
+                        "penalty_p50": float(np.nanmedian(penalties)) if penalties.size else 1.0,
+                        "penalty_p95": float(np.nanpercentile(penalties, 95)) if penalties.size else 1.0,
+                    },
+                )
+            except Exception:
+                pass
+
         return transformed.astype(np.float64).tolist()
 
     def _resolve_runtime_tile_weight(entry_obj: Any) -> float:
@@ -17307,6 +17572,82 @@ def assemble_final_mosaic_reproject_coadd(
             if math.isfinite(value) and value > 0.0:
                 return value
         return 1.0
+
+    def _parse_obs_timestamp(tile_header_obj) -> float | None:
+        if tile_header_obj is None:
+            return None
+        getter = tile_header_obj.get if hasattr(tile_header_obj, "get") else None
+        for key in ("DATE-OBS", "DATEOBS", "DATE_OBS"):
+            try:
+                raw = getter(key) if getter else tile_header_obj[key]  # type: ignore[index]
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+            try:
+                text = str(raw).strip()
+                if not text:
+                    continue
+                text = text.replace("Z", "+00:00")
+                ts = datetime.fromisoformat(text).timestamp()
+                if math.isfinite(ts):
+                    return float(ts)
+            except Exception:
+                continue
+        return None
+
+    def _build_residual_penalty_maps(tiles_ref: list[dict[str, Any]]) -> tuple[dict[str, float], dict[str, float]]:
+        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(zemosaic_utils, "get_last_intertile_diagnostics")):
+            return {}, {}
+        try:
+            diag_payload = zemosaic_utils.get_last_intertile_diagnostics() or {}
+        except Exception:
+            return {}, {}
+        if not isinstance(diag_payload, dict):
+            return {}, {}
+        m2_diag = diag_payload.get("m2_diag") if isinstance(diag_payload.get("m2_diag"), dict) else {}
+        rows = m2_diag.get("tile_residual_summary") if isinstance(m2_diag.get("tile_residual_summary"), list) else []
+        if not rows:
+            return {}, {}
+
+        res_by_idx: dict[int, float] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                idx = int(row.get("tile_index", -1))
+                p95 = float(row.get("residual_abs_p95", 0.0) or 0.0)
+            except Exception:
+                continue
+            if idx < 0 or not math.isfinite(p95):
+                continue
+            res_by_idx[idx] = max(0.0, p95)
+
+        if not res_by_idx:
+            return {}, {}
+        vals = np.asarray(list(res_by_idx.values()), dtype=np.float64)
+        med = float(np.nanmedian(vals)) if vals.size else 0.0
+        p95_global = float(np.nanpercentile(vals, 95)) if vals.size else med
+        if not math.isfinite(med):
+            med = 0.0
+        if not math.isfinite(p95_global):
+            p95_global = med
+        spread = max(1e-9, p95_global - med)
+
+        norm_by_idx: dict[int, float] = {}
+        for idx, raw_v in res_by_idx.items():
+            norm_by_idx[idx] = float(max(0.0, (raw_v - med) / spread))
+
+        raw_by_tile_id: dict[str, float] = {}
+        norm_by_tile_id: dict[str, float] = {}
+        for idx, entry in enumerate(tiles_ref):
+            tile_id = str((entry or {}).get("tile_id", ""))
+            if tile_id == "":
+                continue
+            if idx in res_by_idx:
+                raw_by_tile_id[tile_id] = float(res_by_idx[idx])
+                norm_by_tile_id[tile_id] = float(norm_by_idx.get(idx, 0.0))
+        return raw_by_tile_id, norm_by_tile_id
 
 
     effective_tiles: list[dict[str, Any]] = []
@@ -17578,6 +17919,7 @@ def assemble_final_mosaic_reproject_coadd(
             "tile_id": _resolve_tile_identifier(tile_path, tile_header, idx - 1),
             "coverage_mask": coverage_mask_entry,
             "tile_weight": tile_weight_value,
+            "obs_timestamp": _parse_obs_timestamp(tile_header),
         }
         if alpha_weight2d is not None:
             tile_entry["alpha_weight2d"] = alpha_weight2d
@@ -17612,7 +17954,7 @@ def assemble_final_mosaic_reproject_coadd(
 
 
     if tile_weighting_active and tile_weight_values:
-        tile_weight_values = _apply_tile_weight_v4(tile_weight_values)
+        tile_weight_values = _apply_tile_weight_v4(tile_weight_values, effective_tiles)
 
     if tile_weight_values and len(tile_weight_values) == len(effective_tiles):
         for _idx, _tw_eff in enumerate(tile_weight_values):
@@ -23596,6 +23938,11 @@ def run_hierarchical_mosaic_classic_legacy(
             "tile_weight_v4_strength": float((worker_config_cache or {}).get("tile_weight_v4_strength", 1.0) or 1.0),
             "tile_weight_v4_min": float((worker_config_cache or {}).get("tile_weight_v4_min", 0.75) or 0.75),
             "tile_weight_v4_max": float((worker_config_cache or {}).get("tile_weight_v4_max", 1.35) or 1.35),
+            "tile_weight_v4_residual_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_residual_penalty_enabled", False)),
+            "tile_weight_v4_residual_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_residual_penalty_strength", 0.35) or 0.35),
+            "tile_weight_v4_temporal_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_enabled", False)),
+            "tile_weight_v4_temporal_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_strength", 0.20) or 0.20),
+            "tile_weight_v4_temporal_penalty_hours": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_hours", 6.0) or 6.0),
             "existing_master_tiles_mode": bool(use_existing_master_tiles_mode),
         }
 
@@ -29070,6 +29417,11 @@ def run_hierarchical_mosaic(
             "tile_weight_v4_strength": float((worker_config_cache or {}).get("tile_weight_v4_strength", 1.0) or 1.0),
             "tile_weight_v4_min": float((worker_config_cache or {}).get("tile_weight_v4_min", 0.75) or 0.75),
             "tile_weight_v4_max": float((worker_config_cache or {}).get("tile_weight_v4_max", 1.35) or 1.35),
+            "tile_weight_v4_residual_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_residual_penalty_enabled", False)),
+            "tile_weight_v4_residual_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_residual_penalty_strength", 0.35) or 0.35),
+            "tile_weight_v4_temporal_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_enabled", False)),
+            "tile_weight_v4_temporal_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_strength", 0.20) or 0.20),
+            "tile_weight_v4_temporal_penalty_hours": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_hours", 6.0) or 6.0),
         }
 
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:
@@ -33349,6 +33701,21 @@ def assemble_global_mosaic_sds(
     parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Batch Mosaic-First workflow that stacks per-batch mosaics in the global WCS."""
+
+    diagnostics_output_dir: Path | None = None
+    try:
+        if isinstance(postprocess_context, dict):
+            candidate = postprocess_context.get("diagnostics_output_dir")
+            if candidate:
+                diagnostics_output_dir = Path(str(candidate))
+    except Exception:
+        diagnostics_output_dir = None
+    if diagnostics_output_dir is None:
+        try:
+            if cache_root:
+                diagnostics_output_dir = Path(str(cache_root))
+        except Exception:
+            diagnostics_output_dir = None
 
     if not global_plan or not global_plan.get("enabled"):
         return None, None, None

@@ -3689,3 +3689,28 @@ Préparation run P:
 - Cause: variable locale du monitor réutilisée hors scope dans l'initialisation watchdog Phase 3.
 - Correctif: fallback watchdog basé sur `phase3_ram_critical_pct` lu depuis `zconfig` (`watchdog_base_critical_pct`), sans dépendance à une variable locale.
 - Validation: compilation OK (`py_compile zemosaic_worker.py`).
+
+### 2026-04-03 — Intertile exports + Weighting V4 (résidu/temporel) + protocole validation
+- Implémentation diagnostics intertile enrichis:
+  - `intertile_photometric_solve.csv` (tile_index/tile_id/path/gain/offset)
+  - `intertile_residuals.csv` (paires i-j + a_ij/b_ij/weight + residual_gain/residual_offset/residual_abs)
+  - `intertile_tile_residual_summary.csv` (résumé résidus par tuile)
+  - `intertile_graph_summary.json` enrichi avec métriques solve M2/M1.
+- `zemosaic_utils.solve_global_affine_v2` enrichi pour exposer:
+  - `pair_residuals`
+  - `tile_residual_summary`
+  - capture solution affine dans `LAST_INTERTILE_DIAGNOSTICS["affine_solution"]`.
+- Weighting V4 étendu (config-gated) dans `assemble_final_mosaic_reproject_coadd`:
+  - pénalité résiduelle basée sur résidus solve intertile par tuile,
+  - pénalité temporelle optionnelle (distance au temps médian),
+  - télémétrie dédiée:
+    - `tile_weights_v4_telemetry.csv`
+    - `tile_weights_v4_summary.json`.
+- Nouveaux flags config ajoutés:
+  - `tile_weight_v4_residual_penalty_enabled`
+  - `tile_weight_v4_residual_penalty_strength`
+  - `tile_weight_v4_temporal_penalty_enabled`
+  - `tile_weight_v4_temporal_penalty_strength`
+  - `tile_weight_v4_temporal_penalty_hours`
+- Protocole formalisé: `validation_protocol_phase5_weighting.md` pour campagne OFF/ON/ON+V4 + non-régression multi-modes.
+- Sanity: compilation Python OK (`zemosaic_utils.py`, `zemosaic_worker.py`, `zemosaic_config.py`).

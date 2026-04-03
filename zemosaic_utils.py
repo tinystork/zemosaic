@@ -2311,9 +2311,9 @@ def solve_global_affine_v2(
 
     defaults = {i: (1.0, 0.0) for i in range(max(0, int(num_tiles)))}
     if num_tiles <= 0:
-        return {}, {"constraints": 0, "kept": 0, "rejected": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+        return {}, {"constraints": 0, "kept": 0, "rejected": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": [], "pair_residuals": [], "tile_residual_summary": [], "reject_reason_counts": {}, "relaxed_filter_used": False, "solver_profile": {}}
     if not pair_entries:
-        return defaults, {"constraints": 0, "kept": 0, "rejected": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+        return defaults, {"constraints": 0, "kept": 0, "rejected": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": [], "pair_residuals": [], "tile_residual_summary": [], "reject_reason_counts": {}, "relaxed_filter_used": False, "solver_profile": {}}
 
     try:
         gmin, gmax = float(gain_clip[0]), float(gain_clip[1])
@@ -2343,29 +2343,132 @@ def solve_global_affine_v2(
     if not np.isfinite(b_abs_max) or b_abs_max <= 0.0:
         b_abs_max = 5000.0
 
+    effective_agmin = float(agmin)
+    effective_agmax = float(agmax)
+    effective_b_abs_max = float(b_abs_max)
+    solver_profile = {
+        "pair_gain_clip_requested": [float(agmin), float(agmax)],
+        "pair_offset_abs_max_requested": float(b_abs_max),
+    }
+
     anchor = int(max(0, min(int(anchor_index), num_tiles - 1)))
     total_constraints = 0
     valid_entries = []
+    reject_reason_counts = {
+        "parse": 0,
+        "index": 0,
+        "non_finite": 0,
+        "gain_clip": 0,
+        "offset_clip": 0,
+    }
+    finite_candidates = []
+
     for e in pair_entries:
         total_constraints += 1
         try:
             i = int(e[0]); j = int(e[1]); a_ij = float(e[2]); b_ij = float(e[3]); w = float(e[4])
         except Exception:
+            reject_reason_counts["parse"] += 1
             continue
         if i < 0 or j < 0 or i >= num_tiles or j >= num_tiles or i == j:
+            reject_reason_counts["index"] += 1
             continue
         if not np.isfinite(a_ij) or not np.isfinite(b_ij):
+            reject_reason_counts["non_finite"] += 1
             continue
-        if a_ij < agmin or a_ij > agmax:
-            continue
-        if abs(b_ij) > b_abs_max:
-            continue
+
         if not np.isfinite(w) or w <= 0.0:
             w = 1.0
+        finite_candidates.append((i, j, a_ij, b_ij, max(1e-6, w)))
+
+        if a_ij < agmin or a_ij > agmax:
+            reject_reason_counts["gain_clip"] += 1
+            continue
+        if abs(b_ij) > b_abs_max:
+            reject_reason_counts["offset_clip"] += 1
+            continue
         valid_entries.append((i, j, a_ij, b_ij, max(1e-6, w)))
 
+    try:
+        if finite_candidates:
+            arr_a0 = np.asarray([float(x[2]) for x in finite_candidates], dtype=np.float64)
+            arr_b0 = np.asarray([float(x[3]) for x in finite_candidates], dtype=np.float64)
+            arr_abs_b0 = np.abs(arr_b0)
+            solver_profile.update({
+                "candidate_count": int(len(finite_candidates)),
+                "a_q01": float(np.nanpercentile(arr_a0, 1)) if arr_a0.size else 0.0,
+                "a_q50": float(np.nanmedian(arr_a0)) if arr_a0.size else 0.0,
+                "a_q99": float(np.nanpercentile(arr_a0, 99)) if arr_a0.size else 0.0,
+                "abs_b_q50": float(np.nanmedian(arr_abs_b0)) if arr_abs_b0.size else 0.0,
+                "abs_b_q99": float(np.nanpercentile(arr_abs_b0, 99)) if arr_abs_b0.size else 0.0,
+            })
+    except Exception:
+        pass
+
+    relaxed_filter_used = False
+    if (not valid_entries) and finite_candidates:
+        try:
+            arr_a = np.asarray([float(x[2]) for x in finite_candidates], dtype=np.float64)
+            arr_b = np.asarray([float(x[3]) for x in finite_candidates], dtype=np.float64)
+            arr_abs_b = np.abs(arr_b)
+
+            finite_a = arr_a[np.isfinite(arr_a)]
+            finite_abs_b = arr_abs_b[np.isfinite(arr_abs_b)]
+
+            if finite_a.size and finite_abs_b.size:
+                q01 = float(np.nanpercentile(finite_a, 1))
+                q99 = float(np.nanpercentile(finite_a, 99))
+                aq01 = float(np.nanpercentile(np.abs(finite_a), 1))
+                bq99 = float(np.nanpercentile(finite_abs_b, 99))
+
+                relaxed_agmin = min(agmin, q01)
+                relaxed_agmax = max(agmax, q99)
+                if not np.isfinite(relaxed_agmin):
+                    relaxed_agmin = agmin
+                if not np.isfinite(relaxed_agmax):
+                    relaxed_agmax = agmax
+                if relaxed_agmin > relaxed_agmax:
+                    relaxed_agmin, relaxed_agmax = relaxed_agmax, relaxed_agmin
+
+                # Avoid degenerate near-zero slopes while still relaxing hard clips.
+                min_abs_a = max(1e-4, aq01 * 0.25) if np.isfinite(aq01) else 1e-4
+                relaxed_b_abs_max = max(b_abs_max, bq99) if np.isfinite(bq99) else b_abs_max
+
+                relaxed_entries = []
+                for i, j, a_ij, b_ij, w in finite_candidates:
+                    if not np.isfinite(a_ij) or not np.isfinite(b_ij):
+                        continue
+                    if a_ij < relaxed_agmin or a_ij > relaxed_agmax:
+                        continue
+                    if abs(a_ij) < min_abs_a:
+                        continue
+                    if abs(b_ij) > relaxed_b_abs_max:
+                        continue
+                    relaxed_entries.append((i, j, a_ij, b_ij, max(1e-6, w)))
+
+                if relaxed_entries:
+                    valid_entries = relaxed_entries
+                    relaxed_filter_used = True
+                    effective_agmin = float(relaxed_agmin)
+                    effective_agmax = float(relaxed_agmax)
+                    effective_b_abs_max = float(relaxed_b_abs_max)
+                    solver_profile["relaxed_min_abs_a"] = float(min_abs_a)
+        except Exception:
+            pass
+
     if not valid_entries:
-        return defaults, {"constraints": total_constraints, "kept": 0, "rejected": total_constraints, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+        return defaults, {
+            "constraints": total_constraints,
+            "kept": 0,
+            "rejected": total_constraints,
+            "residual_abs": np.asarray([], dtype=np.float64),
+            "worst": [],
+            "pair_residuals": [],
+            "tile_residual_summary": [],
+            "reject_reason_counts": reject_reason_counts,
+            "relaxed_filter_used": bool(relaxed_filter_used),
+            "solver_profile": dict(solver_profile),
+        }
 
     nvars = 2 * num_tiles
     lam = float(gain_prior_lambda) if np.isfinite(gain_prior_lambda) else 0.02
@@ -2418,7 +2521,7 @@ def solve_global_affine_v2(
             b = np.asarray(rhs, dtype=np.float64)
             sol, *_ = np.linalg.lstsq(A, b, rcond=None)
         except Exception:
-            return defaults, {"constraints": total_constraints, "kept": len(valid_entries), "rejected": total_constraints - len(valid_entries), "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+            return defaults, {"constraints": total_constraints, "kept": len(valid_entries), "rejected": total_constraints - len(valid_entries), "residual_abs": np.asarray([], dtype=np.float64), "worst": [], "pair_residuals": [], "tile_residual_summary": [], "reject_reason_counts": reject_reason_counts, "relaxed_filter_used": bool(relaxed_filter_used), "solver_profile": dict(solver_profile)}
 
         gains = np.asarray(sol[:num_tiles], dtype=np.float64)
         offsets = np.asarray(sol[num_tiles:], dtype=np.float64)
@@ -2462,6 +2565,8 @@ def solve_global_affine_v2(
 
     residual_abs = []
     worst = []
+    pair_residual_rows = []
+    tile_residual_acc = {}
     for (i, j, a_ij, b_ij, w) in valid_entries:
         gi, oi = result.get(i, (1.0, 0.0))
         gj, oj = result.get(j, (1.0, 0.0))
@@ -2470,8 +2575,43 @@ def solve_global_affine_v2(
         r = math.sqrt(float(rg * rg + ro * ro))
         if not np.isfinite(r):
             continue
-        residual_abs.append(abs(r))
-        worst.append((abs(r), i, j, float(rg), float(ro), float(a_ij), float(b_ij), float(w)))
+        abs_r = abs(r)
+        residual_abs.append(abs_r)
+        worst.append((abs_r, i, j, float(rg), float(ro), float(a_ij), float(b_ij), float(w)))
+        pair_residual_rows.append({
+            "i": int(i),
+            "j": int(j),
+            "a_ij": float(a_ij),
+            "b_ij": float(b_ij),
+            "weight": float(w),
+            "residual_gain": float(rg),
+            "residual_offset": float(ro),
+            "residual_abs": float(abs_r),
+        })
+        tile_residual_acc.setdefault(int(i), []).append(float(abs_r))
+        tile_residual_acc.setdefault(int(j), []).append(float(abs_r))
+
+    tile_residual_summary = []
+    for tile_idx in sorted(tile_residual_acc.keys()):
+        vals = np.asarray(tile_residual_acc.get(tile_idx, []), dtype=np.float64)
+        if vals.size == 0:
+            continue
+        tile_residual_summary.append({
+            "tile_index": int(tile_idx),
+            "pair_count": int(vals.size),
+            "residual_abs_median": float(np.nanmedian(vals)),
+            "residual_abs_p95": float(np.nanpercentile(vals, 95)) if vals.size >= 2 else float(vals[0]),
+        })
+
+    try:
+        solver_profile["total_constraints"] = int(total_constraints)
+        solver_profile["kept_constraints"] = int(len(valid_entries))
+        solver_profile["rejected_constraints"] = int(max(0, total_constraints - len(valid_entries)))
+        solver_profile["relaxed_filter_used"] = bool(relaxed_filter_used)
+        solver_profile["pair_gain_clip_effective"] = [float(effective_agmin), float(effective_agmax)]
+        solver_profile["pair_offset_abs_max_effective"] = float(effective_b_abs_max)
+    except Exception:
+        pass
 
     worst.sort(key=lambda x: x[0], reverse=True)
     diag = {
@@ -2480,6 +2620,11 @@ def solve_global_affine_v2(
         "rejected": int(max(0, total_constraints - len(valid_entries))),
         "residual_abs": np.asarray(residual_abs, dtype=np.float64),
         "worst": worst[:5],
+        "pair_residuals": pair_residual_rows,
+        "tile_residual_summary": tile_residual_summary,
+        "reject_reason_counts": reject_reason_counts,
+        "relaxed_filter_used": bool(relaxed_filter_used),
+        "solver_profile": dict(solver_profile),
     }
     return result, diag
 
@@ -3482,10 +3627,25 @@ def compute_intertile_affine_calibration(
         else:
             res_med = 0.0
             res_p95 = 0.0
+        reject_counts = diag_m2.get("reject_reason_counts") if isinstance(diag_m2.get("reject_reason_counts"), dict) else {}
+        relaxed_used = bool(diag_m2.get("relaxed_filter_used", False))
         _log_intertile(
-            f"M2 gain+offset solve: constraints={c_all} kept={c_kept} rejected={c_rej} residual_abs_med={res_med:.5f} residual_abs_p95={res_p95:.5f}",
+            f"M2 gain+offset solve: constraints={c_all} kept={c_kept} rejected={c_rej} residual_abs_med={res_med:.5f} residual_abs_p95={res_p95:.5f} relaxed={int(relaxed_used)}",
             level="INFO",
         )
+        if reject_counts:
+            try:
+                _log_intertile(
+                    "M2 reject reasons: "
+                    f"parse={int(reject_counts.get('parse', 0))} "
+                    f"index={int(reject_counts.get('index', 0))} "
+                    f"non_finite={int(reject_counts.get('non_finite', 0))} "
+                    f"gain_clip={int(reject_counts.get('gain_clip', 0))} "
+                    f"offset_clip={int(reject_counts.get('offset_clip', 0))}",
+                    level="INFO",
+                )
+            except Exception:
+                pass
         for rank, worst in enumerate((diag_m2.get("worst") or [])[:3], 1):
             try:
                 abs_res, wi, wj, wrg, wro, wa, wb, ww = worst
@@ -3495,9 +3655,66 @@ def compute_intertile_affine_calibration(
                 )
             except Exception:
                 pass
-        if sol_m2:
-            LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m2"
+        try:
+            LAST_INTERTILE_DIAGNOSTICS["m2_diag"] = {
+                "constraints": int(diag_m2.get("constraints", 0) or 0),
+                "kept": int(diag_m2.get("kept", 0) or 0),
+                "rejected": int(diag_m2.get("rejected", 0) or 0),
+                "residual_abs_median": float(res_med),
+                "residual_abs_p95": float(res_p95),
+                "worst": list(diag_m2.get("worst") or []),
+                "pair_residuals": list(diag_m2.get("pair_residuals") or []),
+                "tile_residual_summary": list(diag_m2.get("tile_residual_summary") or []),
+                "reject_reason_counts": dict(diag_m2.get("reject_reason_counts") or {}),
+                "relaxed_filter_used": bool(diag_m2.get("relaxed_filter_used", False)),
+                "solver_profile": dict(diag_m2.get("solver_profile") or {}),
+            }
+        except Exception:
+            pass
+        if sol_m2 and c_kept > 0:
+            try:
+                LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m2"
+                LAST_INTERTILE_DIAGNOSTICS["affine_solution"] = {
+                    int(k): [float(v[0]), float(v[1])] for k, v in sol_m2.items()
+                }
+            except Exception:
+                LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m2"
             return sol_m2
+
+        if bool(gain_offset_v2) and pair_entries and c_kept <= 0:
+            _log_intertile(
+                "M2 produced no kept constraints; attempting automatic M1 offset-only fallback",
+                level="WARN",
+            )
+            offset_entries_auto = []
+            for p in pair_entries:
+                try:
+                    i = int(p[0]); j = int(p[1]); b_ij = float(p[3]); w_ij = float(p[4])
+                except Exception:
+                    continue
+                if not np.isfinite(b_ij):
+                    continue
+                if not np.isfinite(w_ij) or w_ij <= 0:
+                    w_ij = 1.0
+                offset_entries_auto.append((i, j, b_ij, w_ij))
+            offsets_sol_auto, offset_diag_auto = solve_global_offsets_v1(num_tiles, offset_entries_auto, anchor_index=anchor)
+            if offsets_sol_auto:
+                sol_m1_auto = {idx: (1.0, float(offsets_sol_auto.get(idx, 0.0))) for idx in range(num_tiles)}
+                try:
+                    LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m1_auto_fallback"
+                    LAST_INTERTILE_DIAGNOSTICS["m1_diag"] = {
+                        "constraints": int(offset_diag_auto.get("constraints", 0) or 0),
+                        "residual_abs_median": float(np.nanmedian(np.asarray(offset_diag_auto.get("residual_abs", []), dtype=np.float64))) if len(offset_diag_auto.get("residual_abs", [])) else 0.0,
+                        "residual_abs_p95": float(np.nanpercentile(np.asarray(offset_diag_auto.get("residual_abs", []), dtype=np.float64), 95)) if len(offset_diag_auto.get("residual_abs", [])) else 0.0,
+                        "worst": list(offset_diag_auto.get("worst") or []),
+                        "auto_fallback_from_m2": True,
+                    }
+                    LAST_INTERTILE_DIAGNOSTICS["affine_solution"] = {
+                        int(k): [float(v[0]), float(v[1])] for k, v in sol_m1_auto.items()
+                    }
+                except Exception:
+                    pass
+                return sol_m1_auto
 
     if bool(offset_only_v1) and pair_entries:
         offset_entries = []
@@ -3537,8 +3754,21 @@ def compute_intertile_affine_calibration(
                 pass
 
         if offsets_sol:
-            LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m1"
-            return {idx: (1.0, float(offsets_sol.get(idx, 0.0))) for idx in range(num_tiles)}
+            sol_m1 = {idx: (1.0, float(offsets_sol.get(idx, 0.0))) for idx in range(num_tiles)}
+            try:
+                LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m1"
+                LAST_INTERTILE_DIAGNOSTICS["m1_diag"] = {
+                    "constraints": int(offset_diag.get("constraints", 0) or 0),
+                    "residual_abs_median": float(res_med),
+                    "residual_abs_p95": float(res_p95),
+                    "worst": list(offset_diag.get("worst") or []),
+                }
+                LAST_INTERTILE_DIAGNOSTICS["affine_solution"] = {
+                    int(k): [float(v[0]), float(v[1])] for k, v in sol_m1.items()
+                }
+            except Exception:
+                pass
+            return sol_m1
 
     if bool(gain_offset_v2) and bool(enforce_requested_solver):
         _log_intertile(
@@ -3550,6 +3780,9 @@ def compute_intertile_affine_calibration(
     solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
     try:
         LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_legacy"
+        LAST_INTERTILE_DIAGNOSTICS["affine_solution"] = {
+            int(k): [float(v[0]), float(v[1])] for k, v in solution.items()
+        }
     except Exception:
         pass
     if progress_callback:
