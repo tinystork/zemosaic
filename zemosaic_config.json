@@ -162,7 +162,7 @@
     "sds_min_coverage_keep": 0.4,
     "tile_weight_v4_curve": "sqrt",
     "stacking_kappa_high": 3.0,
-    "quality_gate_threshold": 0.48,
+    "quality_gate_threshold": 0.52,
     "existing_master_tiles_rgb_balance_gain_clip": [
         0.9,
         1.1

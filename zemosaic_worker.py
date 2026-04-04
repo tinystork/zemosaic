@@ -14949,6 +14949,7 @@ def create_master_tile(
         chunk_tmp_dir.mkdir(parents=True, exist_ok=True)
 
         synthetic_infos: list[dict] = []
+        chunk_quality: list[tuple[float, int, str, Any]] = []
         nested_retries: list[list[dict]] = []
 
         for ci, chunk_group in enumerate(chunks, start=1):
@@ -14985,10 +14986,10 @@ def create_master_tile(
                 quality_crop_k_sigma,
                 quality_crop_margin_px,
                 quality_crop_min_run,
-                altaz_cleanup_enabled,
+                False,
                 altaz_margin_percent,
                 altaz_decay,
-                altaz_nanize,
+                False,
                 False,
                 quality_gate_threshold,
                 quality_gate_edge_band_px,
@@ -15019,7 +15020,16 @@ def create_master_tile(
             )
 
             if chunk_retries:
-                nested_retries.extend(chunk_retries)
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_RETRY_IGNORED",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    chunk_index=int(ci),
+                    retries=int(len(chunk_retries)),
+                    reason="keep_single_tile_identity",
+                )
+
             if not chunk_path or chunk_wcs is None:
                 pcb_tile(
                     "P3_INTERNAL_CHUNK_FAIL",
@@ -15044,6 +15054,24 @@ def create_master_tile(
                 elif arr_chunk.ndim == 3 and arr_chunk.shape[-1] > 3:
                     arr_chunk = arr_chunk[..., :3]
                 arr_chunk = np.ascontiguousarray(arr_chunk.astype(np.float32, copy=False))
+                finite_mask = np.isfinite(arr_chunk)
+                finite_frac = float(np.count_nonzero(finite_mask) / arr_chunk.size) if arr_chunk.size else 0.0
+                nz_mask = finite_mask & (np.abs(arr_chunk) > 1e-12)
+                valid_frac = float(np.count_nonzero(nz_mask) / arr_chunk.size) if arr_chunk.size else 0.0
+                if not np.any(finite_mask) or valid_frac <= 1e-6:
+                    pcb_tile(
+                        "P3_INTERNAL_CHUNK_INVALID",
+                        prog=None,
+                        lvl="WARN",
+                        tile_id=int(tile_id),
+                        chunk_index=int(ci),
+                        finite_frac=float(finite_frac),
+                        valid_frac=float(valid_frac),
+                    )
+                    del arr_chunk
+                    gc.collect()
+                    continue
+                arr_chunk = np.nan_to_num(arr_chunk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
                 np.save(str(npy_path), arr_chunk, allow_pickle=False)
                 del arr_chunk
                 gc.collect()
@@ -15067,6 +15095,7 @@ def create_master_tile(
                     "internal_chunk_members": int(len(chunk_group)),
                 }
             )
+            chunk_quality.append((float(valid_frac), int(len(chunk_group)), str(chunk_path), chunk_wcs))
 
         if not synthetic_infos:
             pcb_tile(
@@ -15076,6 +15105,18 @@ def create_master_tile(
                 tile_id=int(tile_id),
             )
             return (None, None), nested_retries
+
+        if len(synthetic_infos) == 1:
+            only = synthetic_infos[0]
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_PASSTHROUGH",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                reason="single_valid_chunk",
+                chunk_outputs=1,
+            )
+            return (only.get("path_raw"), only.get("wcs")), nested_retries
 
         pcb_tile(
             "P3_INTERNAL_CHUNK_MERGE",
@@ -15087,12 +15128,19 @@ def create_master_tile(
             mode="single_tile_adaptive",
         )
 
+        merge_parallel_plan = parallel_plan
+        try:
+            if parallel_plan is not None and hasattr(parallel_plan, "use_gpu") and bool(getattr(parallel_plan, "use_gpu")):
+                merge_parallel_plan = replace(parallel_plan, use_gpu=False)
+        except Exception:
+            merge_parallel_plan = parallel_plan
+
         (merged_path, merged_wcs), merge_retries = create_master_tile(
             synthetic_infos,
             tile_id,
             output_temp_dir,
-            stack_norm_method,
-            stack_weight_method,
+            "none",
+            "none",
             stack_reject_algo,
             stack_kappa_low,
             stack_kappa_high,
@@ -15103,21 +15151,21 @@ def create_master_tile(
             radial_feather_fraction,
             radial_shape_power,
             min_radial_weight_floor,
-            quality_crop_enabled,
+            False,
             quality_crop_band_px,
             quality_crop_k_sigma,
             quality_crop_margin_px,
             quality_crop_min_run,
-            altaz_cleanup_enabled,
+            False,
             altaz_margin_percent,
             altaz_decay,
-            altaz_nanize,
-            quality_gate_enabled,
+            False,
+            False,
             quality_gate_threshold,
             quality_gate_edge_band_px,
             quality_gate_k_sigma,
             quality_gate_erode_px,
-            quality_gate_move_rejects,
+            False,
             astap_exe_path_global,
             astap_data_dir_global,
             astap_search_radius_global,
@@ -15131,7 +15179,7 @@ def create_master_tile(
             center_out_context=center_out_context,
             center_out_settings=center_out_settings,
             center_out_rank=center_out_rank,
-            parallel_plan=parallel_plan,
+            parallel_plan=merge_parallel_plan,
             allow_batch_duplication=False,
             target_stack_size=max(1, int(min_safe_stack_size)),
             min_safe_stack_size=max(1, int(min_safe_stack_size)),
@@ -15140,9 +15188,35 @@ def create_master_tile(
             heartbeat_callback=heartbeat_callback,
             _internal_chunk_depth=int(_internal_chunk_depth) + 1,
         )
+
         if merge_retries:
-            nested_retries.extend(merge_retries)
-        return (merged_path, merged_wcs), nested_retries
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_MERGE_RETRY_IGNORED",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                retries=int(len(merge_retries)),
+                reason="keep_single_tile_identity",
+            )
+
+        if merged_path and merged_wcs is not None:
+            return (merged_path, merged_wcs), nested_retries
+
+        try:
+            chunk_quality.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            best_valid, best_members, best_path, best_wcs = chunk_quality[0]
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_FALLBACK_BEST",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                best_valid_frac=float(best_valid),
+                best_members=int(best_members),
+                outputs=int(len(chunk_quality)),
+            )
+            return (best_path, best_wcs), nested_retries
+        except Exception:
+            return (None, None), nested_retries
 
     # Acquire a dynamic Phase 3 I/O concurrency slot to avoid disk stalls
     # when the system is busy (e.g., another app reading video files).
