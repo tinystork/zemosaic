@@ -14666,6 +14666,7 @@ def create_master_tile(
     dbg_tile_ids: set[int] | None = None,
     abort_event: threading.Event | None = None,
     heartbeat_callback: Callable[[int], None] | None = None,
+    _internal_chunk_depth: int = 0,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
@@ -14896,6 +14897,252 @@ def create_master_tile(
                 ):
                     preferred_group_idx = idx
                     break
+
+    # --- Single-tile internal chunk mode for very large stacks ---
+    try:
+        vm_local = psutil.virtual_memory()
+        total_ram_gb_local = float(getattr(vm_local, "total", 0.0)) / (1024.0 ** 3)
+    except Exception:
+        total_ram_gb_local = 8.0
+
+    try:
+        internal_chunk_threshold = int(getattr(zconfig, "phase3_internal_chunk_threshold", 0) or 0)
+    except Exception:
+        internal_chunk_threshold = 0
+    if internal_chunk_threshold <= 0:
+        internal_chunk_threshold = 128 if total_ram_gb_local <= 8.5 else 224
+
+    try:
+        internal_chunk_size = int(getattr(zconfig, "phase3_internal_chunk_size", 0) or 0)
+    except Exception:
+        internal_chunk_size = 0
+    if internal_chunk_size <= 0:
+        internal_chunk_size = 24 if total_ram_gb_local <= 8.5 else 40
+
+    internal_chunk_enabled = (
+        int(_internal_chunk_depth) <= 0
+        and int(len(seestar_stack_group_info or [])) > int(internal_chunk_threshold)
+        and int(internal_chunk_size) > 0
+    )
+
+    if internal_chunk_enabled:
+        total_raw = int(len(seestar_stack_group_info or []))
+        chunks = [
+            seestar_stack_group_info[i:i + internal_chunk_size]
+            for i in range(0, total_raw, internal_chunk_size)
+        ]
+        chunks = [c for c in chunks if c]
+        pcb_tile(
+            "P3_INTERNAL_CHUNK_MODE",
+            prog=None,
+            lvl="WARN",
+            tile_id=int(tile_id),
+            depth=int(_internal_chunk_depth),
+            raw_frames=total_raw,
+            chunk_size=int(internal_chunk_size),
+            chunks=int(len(chunks)),
+            ram_gb=float(total_ram_gb_local),
+            mode="single_tile_adaptive",
+        )
+
+        chunk_tmp_dir = Path(output_temp_dir) / f".p3_internal_tile_{int(tile_id):04d}"
+        chunk_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        synthetic_infos: list[dict] = []
+        nested_retries: list[list[dict]] = []
+
+        for ci, chunk_group in enumerate(chunks, start=1):
+            chunk_tile_id = int(tile_id) * 1000 + int(ci)
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_BEGIN",
+                prog=None,
+                lvl="INFO_DETAIL",
+                tile_id=int(tile_id),
+                chunk_index=int(ci),
+                chunk_total=int(len(chunks)),
+                chunk_frames=int(len(chunk_group)),
+                chunk_tile_id=int(chunk_tile_id),
+            )
+
+            (chunk_path, chunk_wcs), chunk_retries = create_master_tile(
+                chunk_group,
+                chunk_tile_id,
+                output_temp_dir,
+                stack_norm_method,
+                stack_weight_method,
+                stack_reject_algo,
+                stack_kappa_low,
+                stack_kappa_high,
+                parsed_winsor_limits,
+                stack_final_combine,
+                poststack_equalize_rgb,
+                apply_radial_weight,
+                radial_feather_fraction,
+                radial_shape_power,
+                min_radial_weight_floor,
+                False,
+                quality_crop_band_px,
+                quality_crop_k_sigma,
+                quality_crop_margin_px,
+                quality_crop_min_run,
+                altaz_cleanup_enabled,
+                altaz_margin_percent,
+                altaz_decay,
+                altaz_nanize,
+                False,
+                quality_gate_threshold,
+                quality_gate_edge_band_px,
+                quality_gate_k_sigma,
+                quality_gate_erode_px,
+                False,
+                astap_exe_path_global,
+                astap_data_dir_global,
+                astap_search_radius_global,
+                astap_downsample_global,
+                astap_sensitivity_global,
+                astap_timeout_seconds_global,
+                winsor_pool_workers,
+                winsor_max_frames_per_pass,
+                progress_callback,
+                resource_strategy=resource_strategy,
+                center_out_context=None,
+                center_out_settings=None,
+                center_out_rank=center_out_rank,
+                parallel_plan=parallel_plan,
+                allow_batch_duplication=False,
+                target_stack_size=max(1, int(min_safe_stack_size)),
+                min_safe_stack_size=max(1, int(min_safe_stack_size)),
+                dbg_tile_ids=dbg_tile_ids,
+                abort_event=abort_event,
+                heartbeat_callback=heartbeat_callback,
+                _internal_chunk_depth=int(_internal_chunk_depth) + 1,
+            )
+
+            if chunk_retries:
+                nested_retries.extend(chunk_retries)
+            if not chunk_path or chunk_wcs is None:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_FAIL",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    chunk_index=int(ci),
+                    chunk_total=int(len(chunks)),
+                    chunk_tile_id=int(chunk_tile_id),
+                )
+                continue
+
+            npy_path = chunk_tmp_dir / f"chunk_{ci:04d}.npy"
+            try:
+                with fits.open(str(chunk_path), memmap=True) as hdul_chunk:
+                    arr_chunk = np.asarray(hdul_chunk[0].data, dtype=np.float32)
+                    hdr_chunk = hdul_chunk[0].header.copy()
+                if arr_chunk.ndim == 2:
+                    arr_chunk = np.repeat(arr_chunk[..., None], 3, axis=2)
+                elif arr_chunk.ndim == 3 and arr_chunk.shape[-1] == 1:
+                    arr_chunk = np.repeat(arr_chunk, 3, axis=2)
+                elif arr_chunk.ndim == 3 and arr_chunk.shape[-1] > 3:
+                    arr_chunk = arr_chunk[..., :3]
+                arr_chunk = np.ascontiguousarray(arr_chunk.astype(np.float32, copy=False))
+                np.save(str(npy_path), arr_chunk, allow_pickle=False)
+                del arr_chunk
+                gc.collect()
+            except Exception as exc_chunk_io:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_CONVERT_FAIL",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    chunk_index=int(ci),
+                    error=str(exc_chunk_io),
+                )
+                continue
+
+            synthetic_infos.append(
+                {
+                    "path_preprocessed_cache": str(npy_path),
+                    "path_raw": str(chunk_path),
+                    "wcs": chunk_wcs,
+                    "header": hdr_chunk,
+                    "internal_chunk_members": int(len(chunk_group)),
+                }
+            )
+
+        if not synthetic_infos:
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_EMPTY",
+                prog=None,
+                lvl="ERROR",
+                tile_id=int(tile_id),
+            )
+            return (None, None), nested_retries
+
+        pcb_tile(
+            "P3_INTERNAL_CHUNK_MERGE",
+            prog=None,
+            lvl="WARN",
+            tile_id=int(tile_id),
+            chunk_outputs=int(len(synthetic_infos)),
+            raw_frames=int(total_raw),
+            mode="single_tile_adaptive",
+        )
+
+        (merged_path, merged_wcs), merge_retries = create_master_tile(
+            synthetic_infos,
+            tile_id,
+            output_temp_dir,
+            stack_norm_method,
+            stack_weight_method,
+            stack_reject_algo,
+            stack_kappa_low,
+            stack_kappa_high,
+            parsed_winsor_limits,
+            stack_final_combine,
+            poststack_equalize_rgb,
+            apply_radial_weight,
+            radial_feather_fraction,
+            radial_shape_power,
+            min_radial_weight_floor,
+            quality_crop_enabled,
+            quality_crop_band_px,
+            quality_crop_k_sigma,
+            quality_crop_margin_px,
+            quality_crop_min_run,
+            altaz_cleanup_enabled,
+            altaz_margin_percent,
+            altaz_decay,
+            altaz_nanize,
+            quality_gate_enabled,
+            quality_gate_threshold,
+            quality_gate_edge_band_px,
+            quality_gate_k_sigma,
+            quality_gate_erode_px,
+            quality_gate_move_rejects,
+            astap_exe_path_global,
+            astap_data_dir_global,
+            astap_search_radius_global,
+            astap_downsample_global,
+            astap_sensitivity_global,
+            astap_timeout_seconds_global,
+            winsor_pool_workers,
+            winsor_max_frames_per_pass,
+            progress_callback,
+            resource_strategy=resource_strategy,
+            center_out_context=center_out_context,
+            center_out_settings=center_out_settings,
+            center_out_rank=center_out_rank,
+            parallel_plan=parallel_plan,
+            allow_batch_duplication=False,
+            target_stack_size=max(1, int(min_safe_stack_size)),
+            min_safe_stack_size=max(1, int(min_safe_stack_size)),
+            dbg_tile_ids=dbg_tile_ids,
+            abort_event=abort_event,
+            heartbeat_callback=heartbeat_callback,
+            _internal_chunk_depth=int(_internal_chunk_depth) + 1,
+        )
+        if merge_retries:
+            nested_retries.extend(merge_retries)
+        return (merged_path, merged_wcs), nested_retries
 
     # Acquire a dynamic Phase 3 I/O concurrency slot to avoid disk stalls
     # when the system is busy (e.g., another app reading video files).
