@@ -2110,6 +2110,16 @@ class FilterQtDialog(QDialog):
         self._instrument_unknown_token = "__unknown__"
         self._scan_thread: QThread | None = None
         self._scan_worker: _DirectoryScanWorker | None = None
+        self._scan_row_update_pending: dict[int, dict] = {}
+        self._scan_row_update_order: list[int] = []
+        self._scan_row_update_batch_size = 200
+        self._scan_row_update_timer = QTimer(self)
+        self._scan_row_update_timer.setSingleShot(True)
+        self._scan_row_update_timer.setInterval(80)
+        self._scan_row_update_timer.timeout.connect(self._flush_scan_row_updates)
+        self._scan_progress_last_log_percent = -1
+        self._scan_progress_last_log_msg = ""
+        self._scan_progress_last_log_ts = 0.0
         self._auto_group_checkbox: QCheckBox | None = None
         self._seestar_checkbox: QCheckBox | None = None
         self._sds_checkbox: QCheckBox | None = None
@@ -8800,11 +8810,37 @@ class FilterQtDialog(QDialog):
                 self._status_label.setText(message)
             except Exception:
                 pass
-            self._append_log(message)
+            try:
+                now = time.monotonic()
+                should_log = False
+                if int(percent) != int(self._scan_progress_last_log_percent):
+                    should_log = True
+                elif str(message) != str(self._scan_progress_last_log_msg) and (now - float(self._scan_progress_last_log_ts)) >= 0.8:
+                    should_log = True
+                if should_log:
+                    self._append_log(message)
+                    self._scan_progress_last_log_percent = int(percent)
+                    self._scan_progress_last_log_msg = str(message)
+                    self._scan_progress_last_log_ts = float(now)
+            except Exception:
+                self._append_log(message)
 
     def _on_scan_row_update(self, row: int, payload: dict) -> None:
-        if not (0 <= row < len(self._normalized_items)):
+        if not isinstance(payload, dict):
             return
+        try:
+            row_i = int(row)
+        except Exception:
+            return
+        if row_i not in self._scan_row_update_pending:
+            self._scan_row_update_order.append(row_i)
+        self._scan_row_update_pending[row_i] = payload
+        if not self._scan_row_update_timer.isActive():
+            self._scan_row_update_timer.start()
+
+    def _apply_scan_row_update(self, row: int, payload: dict) -> bool:
+        if not (0 <= row < len(self._normalized_items)):
+            return False
         entry = self._normalized_items[row]
         has_wcs = payload.get("has_wcs")
         if isinstance(has_wcs, bool):
@@ -8821,11 +8857,35 @@ class FilterQtDialog(QDialog):
             entry.center_ra_deg = float(ra_deg)
             entry.center_dec_deg = float(dec_deg)
         self._refresh_entry_row(row)
-        self._update_summary_label()
-        self._schedule_preview_refresh()
-        self._schedule_cluster_refresh()
-        if instrument_changed:
-            self._refresh_instrument_options()
+        return instrument_changed
+
+    @Slot()
+    def _flush_scan_row_updates(self) -> None:
+        if not self._scan_row_update_order:
+            return
+
+        batch_size = max(25, int(self._scan_row_update_batch_size or 200))
+        rows = self._scan_row_update_order[:batch_size]
+        self._scan_row_update_order = self._scan_row_update_order[batch_size:]
+
+        instrument_changed_any = False
+        applied_any = False
+        for row in rows:
+            payload = self._scan_row_update_pending.pop(row, None)
+            if not isinstance(payload, dict):
+                continue
+            instrument_changed_any = self._apply_scan_row_update(int(row), payload) or instrument_changed_any
+            applied_any = True
+
+        if applied_any:
+            self._update_summary_label()
+            self._schedule_preview_refresh()
+            self._schedule_cluster_refresh()
+            if instrument_changed_any:
+                self._refresh_instrument_options()
+
+        if self._scan_row_update_order:
+            self._scan_row_update_timer.start(0)
 
     def _on_scan_error(self, message: str) -> None:
         if not message:
@@ -8837,6 +8897,12 @@ class FilterQtDialog(QDialog):
         self._append_log(message, level="ERROR")
 
     def _on_scan_finished(self) -> None:
+        if self._scan_row_update_timer.isActive():
+            try:
+                self._scan_row_update_timer.stop()
+            except Exception:
+                pass
+        self._flush_scan_row_updates()
         self._hide_processing_overlay()
         if self._run_analysis_btn is not None:
             self._run_analysis_btn.setEnabled(True)

@@ -25201,11 +25201,93 @@ def run_hierarchical_mosaic_classic_legacy(
                     tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
 
+            def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> int:
+                try:
+                    vm_local = psutil.virtual_memory()
+                    total_ram_gb = float(getattr(vm_local, "total", 0.0)) / (1024.0 ** 3)
+                except Exception:
+                    total_ram_gb = 16.0
+
+                if total_ram_gb <= 8.5:
+                    base_chunk = 96
+                elif total_ram_gb <= 16.5:
+                    base_chunk = 128
+                elif total_ram_gb <= 32.5:
+                    base_chunk = 192
+                elif total_ram_gb <= 64.5:
+                    base_chunk = 320
+                else:
+                    base_chunk = 480
+
+                frame_mb = None
+                try:
+                    for _e in (group_items or []):
+                        if not isinstance(_e, dict):
+                            continue
+                        cache_p = _e.get("path_preprocessed_cache")
+                        if cache_p and _path_exists(cache_p):
+                            frame_mb = float(os.path.getsize(cache_p)) / (1024.0 * 1024.0)
+                            if math.isfinite(frame_mb) and frame_mb > 0.0:
+                                break
+                except Exception:
+                    frame_mb = None
+
+                if isinstance(frame_mb, (int, float)) and math.isfinite(float(frame_mb)) and float(frame_mb) > 0.0:
+                    if frame_mb >= 48.0:
+                        base_chunk = int(max(64, base_chunk * 0.45))
+                    elif frame_mb >= 32.0:
+                        base_chunk = int(max(64, base_chunk * 0.60))
+                    elif frame_mb >= 20.0:
+                        base_chunk = int(max(64, base_chunk * 0.75))
+
+                chunk_cfg = int(getattr(zconfig, "phase3_extreme_group_split_chunk_size", 0) or 0)
+                if chunk_cfg > 0:
+                    base_chunk = chunk_cfg
+                return int(max(48, min(600, base_chunk)))
+
+            split_threshold_cfg = int(getattr(zconfig, "phase3_extreme_group_split_threshold", 0) or 0)
+            if split_threshold_cfg <= 0:
+                split_threshold_cfg = 1200
+
             pending_launch_queue: list[tuple[list[dict], int, int | None]] = []
+            extra_tile_id = int(max(tile_id_order) + 1) if tile_id_order else int(len(seestar_stack_groups))
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
+                n_frames_group = int(len(sg_info_list or []))
+                chunk_size = _estimate_phase3_split_chunk_size(sg_info_list)
+                dynamic_threshold = max(128, min(int(split_threshold_cfg), int(chunk_size * 2)))
+
+                if n_frames_group > dynamic_threshold and chunk_size > 0:
+                    chunks = [sg_info_list[i:i + chunk_size] for i in range(0, n_frames_group, chunk_size)]
+                    if chunks:
+                        for ci, chunk in enumerate(chunks):
+                            if ci == 0:
+                                chunk_tile_id = assigned_tile_id
+                            else:
+                                chunk_tile_id = extra_tile_id
+                                extra_tile_id += 1
+                            rank = center_out_context.get_rank(chunk_tile_id) if center_out_context else chunk_tile_id
+                            pending_launch_queue.append((chunk, chunk_tile_id, rank))
+                        try:
+                            pcb(
+                                "P3_EXTREME_GROUP_SPLIT: "
+                                f"tile={assigned_tile_id} frames={n_frames_group} "
+                                f"chunk_size={chunk_size} chunks={len(chunks)} "
+                                f"ram_gb≈{total_ram_gb if 'total_ram_gb' in locals() else 'n/a'}",
+                                prog=None,
+                                lvl="WARN",
+                            )
+                        except Exception:
+                            pass
+                        continue
+
                 rank = center_out_context.get_rank(assigned_tile_id) if center_out_context else proc_idx
                 pending_launch_queue.append((sg_info_list, assigned_tile_id, rank))
+
+            try:
+                num_seestar_stacks_to_process = int(len(pending_launch_queue))
+            except Exception:
+                pass
 
             def _current_launch_budget() -> int:
                 try:
@@ -30663,11 +30745,93 @@ def run_hierarchical_mosaic(
                     tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
 
+            def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> int:
+                try:
+                    vm_local = psutil.virtual_memory()
+                    total_ram_gb = float(getattr(vm_local, "total", 0.0)) / (1024.0 ** 3)
+                except Exception:
+                    total_ram_gb = 16.0
+
+                if total_ram_gb <= 8.5:
+                    base_chunk = 96
+                elif total_ram_gb <= 16.5:
+                    base_chunk = 128
+                elif total_ram_gb <= 32.5:
+                    base_chunk = 192
+                elif total_ram_gb <= 64.5:
+                    base_chunk = 320
+                else:
+                    base_chunk = 480
+
+                frame_mb = None
+                try:
+                    for _e in (group_items or []):
+                        if not isinstance(_e, dict):
+                            continue
+                        cache_p = _e.get("path_preprocessed_cache")
+                        if cache_p and _path_exists(cache_p):
+                            frame_mb = float(os.path.getsize(cache_p)) / (1024.0 * 1024.0)
+                            if math.isfinite(frame_mb) and frame_mb > 0.0:
+                                break
+                except Exception:
+                    frame_mb = None
+
+                if isinstance(frame_mb, (int, float)) and math.isfinite(float(frame_mb)) and float(frame_mb) > 0.0:
+                    if frame_mb >= 48.0:
+                        base_chunk = int(max(64, base_chunk * 0.45))
+                    elif frame_mb >= 32.0:
+                        base_chunk = int(max(64, base_chunk * 0.60))
+                    elif frame_mb >= 20.0:
+                        base_chunk = int(max(64, base_chunk * 0.75))
+
+                chunk_cfg = int(getattr(zconfig, "phase3_extreme_group_split_chunk_size", 0) or 0)
+                if chunk_cfg > 0:
+                    base_chunk = chunk_cfg
+                return int(max(48, min(600, base_chunk)))
+
+            split_threshold_cfg = int(getattr(zconfig, "phase3_extreme_group_split_threshold", 0) or 0)
+            if split_threshold_cfg <= 0:
+                split_threshold_cfg = 1200
+
             pending_launch_queue: list[tuple[list[dict], int, int | None]] = []
+            extra_tile_id = int(max(tile_id_order) + 1) if tile_id_order else int(len(seestar_stack_groups))
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
+                n_frames_group = int(len(sg_info_list or []))
+                chunk_size = _estimate_phase3_split_chunk_size(sg_info_list)
+                dynamic_threshold = max(128, min(int(split_threshold_cfg), int(chunk_size * 2)))
+
+                if n_frames_group > dynamic_threshold and chunk_size > 0:
+                    chunks = [sg_info_list[i:i + chunk_size] for i in range(0, n_frames_group, chunk_size)]
+                    if chunks:
+                        for ci, chunk in enumerate(chunks):
+                            if ci == 0:
+                                chunk_tile_id = assigned_tile_id
+                            else:
+                                chunk_tile_id = extra_tile_id
+                                extra_tile_id += 1
+                            rank = center_out_context.get_rank(chunk_tile_id) if center_out_context else chunk_tile_id
+                            pending_launch_queue.append((chunk, chunk_tile_id, rank))
+                        try:
+                            pcb(
+                                "P3_EXTREME_GROUP_SPLIT: "
+                                f"tile={assigned_tile_id} frames={n_frames_group} "
+                                f"chunk_size={chunk_size} chunks={len(chunks)} "
+                                f"ram_gb≈{total_ram_gb if 'total_ram_gb' in locals() else 'n/a'}",
+                                prog=None,
+                                lvl="WARN",
+                            )
+                        except Exception:
+                            pass
+                        continue
+
                 rank = center_out_context.get_rank(assigned_tile_id) if center_out_context else proc_idx
                 pending_launch_queue.append((sg_info_list, assigned_tile_id, rank))
+
+            try:
+                num_seestar_stacks_to_process = int(len(pending_launch_queue))
+            except Exception:
+                pass
 
             def _current_launch_budget() -> int:
                 try:
