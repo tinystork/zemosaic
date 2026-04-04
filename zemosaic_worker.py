@@ -24975,6 +24975,7 @@ def run_hierarchical_mosaic_classic_legacy(
             shared_cache_detected = False
             total_removed_cache_files = 0
             total_removed_cache_bytes = 0
+            skip_release_once_tile_ids: set[int] = set()
             pending_futures: set = set()
             next_dynamic_tile_id = num_seestar_stacks_to_process
 
@@ -25260,28 +25261,19 @@ def run_hierarchical_mosaic_classic_legacy(
                 dynamic_threshold = max(16, min(int(split_threshold_cfg), int(max(chunk_size, chunk_size * 1.35))))
 
                 if n_frames_group > dynamic_threshold and chunk_size > 0:
-                    chunks = [sg_info_list[i:i + chunk_size] for i in range(0, n_frames_group, chunk_size)]
-                    if chunks:
-                        for ci, chunk in enumerate(chunks):
-                            if ci == 0:
-                                chunk_tile_id = assigned_tile_id
-                            else:
-                                chunk_tile_id = extra_tile_id
-                                extra_tile_id += 1
-                            rank = center_out_context.get_rank(chunk_tile_id) if center_out_context else chunk_tile_id
-                            pending_launch_queue.append((chunk, chunk_tile_id, rank))
-                        try:
-                            pcb(
-                                "P3_EXTREME_GROUP_SPLIT: "
-                                f"tile={assigned_tile_id} frames={n_frames_group} "
-                                f"chunk_size={chunk_size} chunks={len(chunks)} "
-                                f"ram_gb≈{total_ram_gb_for_split:.2f}",
-                                prog=None,
-                                lvl="WARN",
-                            )
-                        except Exception:
-                            pass
-                        continue
+                    planned_chunks = int(math.ceil(float(n_frames_group) / max(1.0, float(chunk_size))))
+                    try:
+                        pcb(
+                            "P3_EXTREME_GROUP_SPLIT_PLAN: "
+                            f"tile={assigned_tile_id} frames={n_frames_group} "
+                            f"chunk_size={chunk_size} chunks_planned={planned_chunks} "
+                            f"ram_gb≈{total_ram_gb_for_split:.2f} "
+                            "mode=single_tile_adaptive",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    except Exception:
+                        pass
 
                 rank = center_out_context.get_rank(assigned_tile_id) if center_out_context else proc_idx
                 pending_launch_queue.append((sg_info_list, assigned_tile_id, rank))
@@ -25588,54 +25580,24 @@ def run_hierarchical_mosaic_classic_legacy(
                                         reason="phase3_livelock_abort",
                                     )
                                 else:
-                                    retry_chunk_size = 0
+                                    # Keep single master-tile identity: retry same tile with tighter adaptive working set.
                                     try:
-                                        retry_chunk_size = int(_estimate_phase3_split_chunk_size(retry_group))
+                                        skip_release_once_tile_ids.add(int(tile_id_for_future))
                                     except Exception:
-                                        retry_chunk_size = 0
-                                    if retry_chunk_size <= 0:
-                                        retry_chunk_size = max(8, int(len(retry_group) or 0))
-
-                                    split_factor = max(1, int(2 ** max(0, int(max_retry_attempt) - 1)))
-                                    retry_chunk_size = max(8, int(retry_chunk_size // split_factor))
-
-                                    retry_chunks = [retry_group]
-                                    if len(retry_group) > retry_chunk_size > 0:
-                                        retry_chunks = [
-                                            retry_group[i:i + retry_chunk_size]
-                                            for i in range(0, len(retry_group), retry_chunk_size)
-                                        ]
-                                        retry_chunks = [c for c in retry_chunks if c]
-
-                                    if len(retry_chunks) > 1:
-                                        pcb(
-                                            "run_info_phase3_retry_split",
-                                            prog=None,
-                                            lvl="WARN",
-                                            origin_tile=int(tile_id_for_future),
-                                            frames_total=len(retry_group),
-                                            attempt=int(max_retry_attempt),
-                                            chunk_size=int(retry_chunk_size),
-                                            chunks=len(retry_chunks),
-                                            reason="phase3_livelock_abort",
-                                        )
-
-                                    for retry_chunk in retry_chunks:
-                                        new_tile_id = next_dynamic_tile_id
-                                        next_dynamic_tile_id += 1
-                                        num_seestar_stacks_to_process += 1
-                                        _register_tile_cache_paths(new_tile_id, retry_chunk)
-                                        retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
-                                        pending_launch_queue.append((retry_chunk, new_tile_id, retry_rank))
-                                        pcb(
-                                            "run_info_phase3_retry_submitted",
-                                            prog=None,
-                                            lvl="INFO_DETAIL",
-                                            origin_tile=int(tile_id_for_future),
-                                            new_tile=new_tile_id,
-                                            frames=len(retry_chunk),
-                                            reason="phase3_livelock_abort",
-                                        )
+                                        pass
+                                    retry_rank = center_out_context.get_rank(int(tile_id_for_future)) if center_out_context else None
+                                    pending_launch_queue.append((retry_group, int(tile_id_for_future), retry_rank))
+                                    pcb(
+                                        "run_info_phase3_retry_submitted",
+                                        prog=None,
+                                        lvl="WARN",
+                                        origin_tile=int(tile_id_for_future),
+                                        new_tile=int(tile_id_for_future),
+                                        frames=len(retry_group),
+                                        attempt=int(max_retry_attempt),
+                                        mode="single_tile_adaptive",
+                                        reason="phase3_livelock_abort",
+                                    )
                         else:
                             pcb(
                                 "run_error_phase3_thread_exception",
@@ -25658,17 +25620,24 @@ def run_hierarchical_mosaic_classic_legacy(
                             pass
 
                     if cache_retention_mode == "per_tile":
-                        removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
-                        total_removed_cache_files += removed_count
-                        total_removed_cache_bytes += removed_bytes
-                        if removed_count or removed_bytes:
-                            freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                        if int(tile_id_for_future) in skip_release_once_tile_ids:
+                            skip_release_once_tile_ids.discard(int(tile_id_for_future))
                             logger.debug(
-                                "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                "Per-tile cache cleanup skipped once for tile %s (pending retry)",
                                 tile_id_for_future,
-                                removed_count,
-                                freed_mb,
                             )
+                        else:
+                            removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
+                            total_removed_cache_files += removed_count
+                            total_removed_cache_bytes += removed_bytes
+                            if removed_count or removed_bytes:
+                                freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                                logger.debug(
+                                    "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                    tile_id_for_future,
+                                    removed_count,
+                                    freed_mb,
+                                )
 
                     if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                          _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
@@ -30551,6 +30520,7 @@ def run_hierarchical_mosaic(
             shared_cache_detected = False
             total_removed_cache_files = 0
             total_removed_cache_bytes = 0
+            skip_release_once_tile_ids: set[int] = set()
             pending_futures: set = set()
             next_dynamic_tile_id = num_seestar_stacks_to_process
 
@@ -30839,28 +30809,19 @@ def run_hierarchical_mosaic(
                 dynamic_threshold = max(16, min(int(split_threshold_cfg), int(max(chunk_size, chunk_size * 1.35))))
 
                 if n_frames_group > dynamic_threshold and chunk_size > 0:
-                    chunks = [sg_info_list[i:i + chunk_size] for i in range(0, n_frames_group, chunk_size)]
-                    if chunks:
-                        for ci, chunk in enumerate(chunks):
-                            if ci == 0:
-                                chunk_tile_id = assigned_tile_id
-                            else:
-                                chunk_tile_id = extra_tile_id
-                                extra_tile_id += 1
-                            rank = center_out_context.get_rank(chunk_tile_id) if center_out_context else chunk_tile_id
-                            pending_launch_queue.append((chunk, chunk_tile_id, rank))
-                        try:
-                            pcb(
-                                "P3_EXTREME_GROUP_SPLIT: "
-                                f"tile={assigned_tile_id} frames={n_frames_group} "
-                                f"chunk_size={chunk_size} chunks={len(chunks)} "
-                                f"ram_gb≈{total_ram_gb_for_split:.2f}",
-                                prog=None,
-                                lvl="WARN",
-                            )
-                        except Exception:
-                            pass
-                        continue
+                    planned_chunks = int(math.ceil(float(n_frames_group) / max(1.0, float(chunk_size))))
+                    try:
+                        pcb(
+                            "P3_EXTREME_GROUP_SPLIT_PLAN: "
+                            f"tile={assigned_tile_id} frames={n_frames_group} "
+                            f"chunk_size={chunk_size} chunks_planned={planned_chunks} "
+                            f"ram_gb≈{total_ram_gb_for_split:.2f} "
+                            "mode=single_tile_adaptive",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    except Exception:
+                        pass
 
                 rank = center_out_context.get_rank(assigned_tile_id) if center_out_context else proc_idx
                 pending_launch_queue.append((sg_info_list, assigned_tile_id, rank))
@@ -31167,54 +31128,24 @@ def run_hierarchical_mosaic(
                                         reason="phase3_livelock_abort",
                                     )
                                 else:
-                                    retry_chunk_size = 0
+                                    # Keep single master-tile identity: retry same tile with tighter adaptive working set.
                                     try:
-                                        retry_chunk_size = int(_estimate_phase3_split_chunk_size(retry_group))
+                                        skip_release_once_tile_ids.add(int(tile_id_for_future))
                                     except Exception:
-                                        retry_chunk_size = 0
-                                    if retry_chunk_size <= 0:
-                                        retry_chunk_size = max(8, int(len(retry_group) or 0))
-
-                                    split_factor = max(1, int(2 ** max(0, int(max_retry_attempt) - 1)))
-                                    retry_chunk_size = max(8, int(retry_chunk_size // split_factor))
-
-                                    retry_chunks = [retry_group]
-                                    if len(retry_group) > retry_chunk_size > 0:
-                                        retry_chunks = [
-                                            retry_group[i:i + retry_chunk_size]
-                                            for i in range(0, len(retry_group), retry_chunk_size)
-                                        ]
-                                        retry_chunks = [c for c in retry_chunks if c]
-
-                                    if len(retry_chunks) > 1:
-                                        pcb(
-                                            "run_info_phase3_retry_split",
-                                            prog=None,
-                                            lvl="WARN",
-                                            origin_tile=int(tile_id_for_future),
-                                            frames_total=len(retry_group),
-                                            attempt=int(max_retry_attempt),
-                                            chunk_size=int(retry_chunk_size),
-                                            chunks=len(retry_chunks),
-                                            reason="phase3_livelock_abort",
-                                        )
-
-                                    for retry_chunk in retry_chunks:
-                                        new_tile_id = next_dynamic_tile_id
-                                        next_dynamic_tile_id += 1
-                                        num_seestar_stacks_to_process += 1
-                                        _register_tile_cache_paths(new_tile_id, retry_chunk)
-                                        retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
-                                        pending_launch_queue.append((retry_chunk, new_tile_id, retry_rank))
-                                        pcb(
-                                            "run_info_phase3_retry_submitted",
-                                            prog=None,
-                                            lvl="INFO_DETAIL",
-                                            origin_tile=int(tile_id_for_future),
-                                            new_tile=new_tile_id,
-                                            frames=len(retry_chunk),
-                                            reason="phase3_livelock_abort",
-                                        )
+                                        pass
+                                    retry_rank = center_out_context.get_rank(int(tile_id_for_future)) if center_out_context else None
+                                    pending_launch_queue.append((retry_group, int(tile_id_for_future), retry_rank))
+                                    pcb(
+                                        "run_info_phase3_retry_submitted",
+                                        prog=None,
+                                        lvl="WARN",
+                                        origin_tile=int(tile_id_for_future),
+                                        new_tile=int(tile_id_for_future),
+                                        frames=len(retry_group),
+                                        attempt=int(max_retry_attempt),
+                                        mode="single_tile_adaptive",
+                                        reason="phase3_livelock_abort",
+                                    )
                         else:
                             pcb(
                                 "run_error_phase3_thread_exception",
@@ -31237,17 +31168,24 @@ def run_hierarchical_mosaic(
                             pass
 
                     if cache_retention_mode == "per_tile":
-                        removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
-                        total_removed_cache_files += removed_count
-                        total_removed_cache_bytes += removed_bytes
-                        if removed_count or removed_bytes:
-                            freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                        if int(tile_id_for_future) in skip_release_once_tile_ids:
+                            skip_release_once_tile_ids.discard(int(tile_id_for_future))
                             logger.debug(
-                                "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                "Per-tile cache cleanup skipped once for tile %s (pending retry)",
                                 tile_id_for_future,
-                                removed_count,
-                                freed_mb,
                             )
+                        else:
+                            removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
+                            total_removed_cache_files += removed_count
+                            total_removed_cache_bytes += removed_bytes
+                            if removed_count or removed_bytes:
+                                freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                                logger.debug(
+                                    "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                    tile_id_for_future,
+                                    removed_count,
+                                    freed_mb,
+                                )
 
                     if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                          _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
