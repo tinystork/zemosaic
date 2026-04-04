@@ -25201,7 +25201,7 @@ def run_hierarchical_mosaic_classic_legacy(
                     tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
 
-            def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> int:
+            def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> tuple[int, float]:
                 try:
                     vm_local = psutil.virtual_memory()
                     total_ram_gb = float(getattr(vm_local, "total", 0.0)) / (1024.0 ** 3)
@@ -25209,15 +25209,15 @@ def run_hierarchical_mosaic_classic_legacy(
                     total_ram_gb = 16.0
 
                 if total_ram_gb <= 8.5:
-                    base_chunk = 96
+                    base_chunk = 48
                 elif total_ram_gb <= 16.5:
-                    base_chunk = 128
+                    base_chunk = 96
                 elif total_ram_gb <= 32.5:
-                    base_chunk = 192
+                    base_chunk = 160
                 elif total_ram_gb <= 64.5:
-                    base_chunk = 320
+                    base_chunk = 256
                 else:
-                    base_chunk = 480
+                    base_chunk = 384
 
                 frame_mb = None
                 try:
@@ -25234,16 +25234,18 @@ def run_hierarchical_mosaic_classic_legacy(
 
                 if isinstance(frame_mb, (int, float)) and math.isfinite(float(frame_mb)) and float(frame_mb) > 0.0:
                     if frame_mb >= 48.0:
-                        base_chunk = int(max(64, base_chunk * 0.45))
+                        base_chunk = int(max(12, base_chunk * 0.22))
                     elif frame_mb >= 32.0:
-                        base_chunk = int(max(64, base_chunk * 0.60))
+                        base_chunk = int(max(16, base_chunk * 0.35))
                     elif frame_mb >= 20.0:
-                        base_chunk = int(max(64, base_chunk * 0.75))
+                        base_chunk = int(max(24, base_chunk * 0.50))
+                    elif frame_mb >= 12.0:
+                        base_chunk = int(max(32, base_chunk * 0.70))
 
                 chunk_cfg = int(getattr(zconfig, "phase3_extreme_group_split_chunk_size", 0) or 0)
                 if chunk_cfg > 0:
                     base_chunk = chunk_cfg
-                return int(max(48, min(600, base_chunk)))
+                return int(max(12, min(600, base_chunk))), float(total_ram_gb)
 
             split_threshold_cfg = int(getattr(zconfig, "phase3_extreme_group_split_threshold", 0) or 0)
             if split_threshold_cfg <= 0:
@@ -25254,8 +25256,8 @@ def run_hierarchical_mosaic_classic_legacy(
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
                 n_frames_group = int(len(sg_info_list or []))
-                chunk_size = _estimate_phase3_split_chunk_size(sg_info_list)
-                dynamic_threshold = max(128, min(int(split_threshold_cfg), int(chunk_size * 2)))
+                chunk_size, total_ram_gb_for_split = _estimate_phase3_split_chunk_size(sg_info_list)
+                dynamic_threshold = max(16, min(int(split_threshold_cfg), int(max(chunk_size, chunk_size * 1.35))))
 
                 if n_frames_group > dynamic_threshold and chunk_size > 0:
                     chunks = [sg_info_list[i:i + chunk_size] for i in range(0, n_frames_group, chunk_size)]
@@ -25273,7 +25275,7 @@ def run_hierarchical_mosaic_classic_legacy(
                                 "P3_EXTREME_GROUP_SPLIT: "
                                 f"tile={assigned_tile_id} frames={n_frames_group} "
                                 f"chunk_size={chunk_size} chunks={len(chunks)} "
-                                f"ram_gb≈{total_ram_gb if 'total_ram_gb' in locals() else 'n/a'}",
+                                f"ram_gb≈{total_ram_gb_for_split:.2f}",
                                 prog=None,
                                 lvl="WARN",
                             )
@@ -25586,21 +25588,54 @@ def run_hierarchical_mosaic_classic_legacy(
                                         reason="phase3_livelock_abort",
                                     )
                                 else:
-                                    new_tile_id = next_dynamic_tile_id
-                                    next_dynamic_tile_id += 1
-                                    num_seestar_stacks_to_process += 1
-                                    _register_tile_cache_paths(new_tile_id, retry_group)
-                                    retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
-                                    pending_launch_queue.append((retry_group, new_tile_id, retry_rank))
-                                    pcb(
-                                        "run_info_phase3_retry_submitted",
-                                        prog=None,
-                                        lvl="INFO_DETAIL",
-                                        origin_tile=int(tile_id_for_future),
-                                        new_tile=new_tile_id,
-                                        frames=len(retry_group),
-                                        reason="phase3_livelock_abort",
-                                    )
+                                    retry_chunk_size = 0
+                                    try:
+                                        retry_chunk_size = int(_estimate_phase3_split_chunk_size(retry_group))
+                                    except Exception:
+                                        retry_chunk_size = 0
+                                    if retry_chunk_size <= 0:
+                                        retry_chunk_size = max(8, int(len(retry_group) or 0))
+
+                                    split_factor = max(1, int(2 ** max(0, int(max_retry_attempt) - 1)))
+                                    retry_chunk_size = max(8, int(retry_chunk_size // split_factor))
+
+                                    retry_chunks = [retry_group]
+                                    if len(retry_group) > retry_chunk_size > 0:
+                                        retry_chunks = [
+                                            retry_group[i:i + retry_chunk_size]
+                                            for i in range(0, len(retry_group), retry_chunk_size)
+                                        ]
+                                        retry_chunks = [c for c in retry_chunks if c]
+
+                                    if len(retry_chunks) > 1:
+                                        pcb(
+                                            "run_info_phase3_retry_split",
+                                            prog=None,
+                                            lvl="WARN",
+                                            origin_tile=int(tile_id_for_future),
+                                            frames_total=len(retry_group),
+                                            attempt=int(max_retry_attempt),
+                                            chunk_size=int(retry_chunk_size),
+                                            chunks=len(retry_chunks),
+                                            reason="phase3_livelock_abort",
+                                        )
+
+                                    for retry_chunk in retry_chunks:
+                                        new_tile_id = next_dynamic_tile_id
+                                        next_dynamic_tile_id += 1
+                                        num_seestar_stacks_to_process += 1
+                                        _register_tile_cache_paths(new_tile_id, retry_chunk)
+                                        retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
+                                        pending_launch_queue.append((retry_chunk, new_tile_id, retry_rank))
+                                        pcb(
+                                            "run_info_phase3_retry_submitted",
+                                            prog=None,
+                                            lvl="INFO_DETAIL",
+                                            origin_tile=int(tile_id_for_future),
+                                            new_tile=new_tile_id,
+                                            frames=len(retry_chunk),
+                                            reason="phase3_livelock_abort",
+                                        )
                         else:
                             pcb(
                                 "run_error_phase3_thread_exception",
@@ -30745,7 +30780,7 @@ def run_hierarchical_mosaic(
                     tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
 
-            def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> int:
+            def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> tuple[int, float]:
                 try:
                     vm_local = psutil.virtual_memory()
                     total_ram_gb = float(getattr(vm_local, "total", 0.0)) / (1024.0 ** 3)
@@ -30753,15 +30788,15 @@ def run_hierarchical_mosaic(
                     total_ram_gb = 16.0
 
                 if total_ram_gb <= 8.5:
-                    base_chunk = 96
+                    base_chunk = 48
                 elif total_ram_gb <= 16.5:
-                    base_chunk = 128
+                    base_chunk = 96
                 elif total_ram_gb <= 32.5:
-                    base_chunk = 192
+                    base_chunk = 160
                 elif total_ram_gb <= 64.5:
-                    base_chunk = 320
+                    base_chunk = 256
                 else:
-                    base_chunk = 480
+                    base_chunk = 384
 
                 frame_mb = None
                 try:
@@ -30778,16 +30813,18 @@ def run_hierarchical_mosaic(
 
                 if isinstance(frame_mb, (int, float)) and math.isfinite(float(frame_mb)) and float(frame_mb) > 0.0:
                     if frame_mb >= 48.0:
-                        base_chunk = int(max(64, base_chunk * 0.45))
+                        base_chunk = int(max(12, base_chunk * 0.22))
                     elif frame_mb >= 32.0:
-                        base_chunk = int(max(64, base_chunk * 0.60))
+                        base_chunk = int(max(16, base_chunk * 0.35))
                     elif frame_mb >= 20.0:
-                        base_chunk = int(max(64, base_chunk * 0.75))
+                        base_chunk = int(max(24, base_chunk * 0.50))
+                    elif frame_mb >= 12.0:
+                        base_chunk = int(max(32, base_chunk * 0.70))
 
                 chunk_cfg = int(getattr(zconfig, "phase3_extreme_group_split_chunk_size", 0) or 0)
                 if chunk_cfg > 0:
                     base_chunk = chunk_cfg
-                return int(max(48, min(600, base_chunk)))
+                return int(max(12, min(600, base_chunk))), float(total_ram_gb)
 
             split_threshold_cfg = int(getattr(zconfig, "phase3_extreme_group_split_threshold", 0) or 0)
             if split_threshold_cfg <= 0:
@@ -30798,8 +30835,8 @@ def run_hierarchical_mosaic(
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
                 n_frames_group = int(len(sg_info_list or []))
-                chunk_size = _estimate_phase3_split_chunk_size(sg_info_list)
-                dynamic_threshold = max(128, min(int(split_threshold_cfg), int(chunk_size * 2)))
+                chunk_size, total_ram_gb_for_split = _estimate_phase3_split_chunk_size(sg_info_list)
+                dynamic_threshold = max(16, min(int(split_threshold_cfg), int(max(chunk_size, chunk_size * 1.35))))
 
                 if n_frames_group > dynamic_threshold and chunk_size > 0:
                     chunks = [sg_info_list[i:i + chunk_size] for i in range(0, n_frames_group, chunk_size)]
@@ -30817,7 +30854,7 @@ def run_hierarchical_mosaic(
                                 "P3_EXTREME_GROUP_SPLIT: "
                                 f"tile={assigned_tile_id} frames={n_frames_group} "
                                 f"chunk_size={chunk_size} chunks={len(chunks)} "
-                                f"ram_gb≈{total_ram_gb if 'total_ram_gb' in locals() else 'n/a'}",
+                                f"ram_gb≈{total_ram_gb_for_split:.2f}",
                                 prog=None,
                                 lvl="WARN",
                             )
@@ -31130,21 +31167,54 @@ def run_hierarchical_mosaic(
                                         reason="phase3_livelock_abort",
                                     )
                                 else:
-                                    new_tile_id = next_dynamic_tile_id
-                                    next_dynamic_tile_id += 1
-                                    num_seestar_stacks_to_process += 1
-                                    _register_tile_cache_paths(new_tile_id, retry_group)
-                                    retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
-                                    pending_launch_queue.append((retry_group, new_tile_id, retry_rank))
-                                    pcb(
-                                        "run_info_phase3_retry_submitted",
-                                        prog=None,
-                                        lvl="INFO_DETAIL",
-                                        origin_tile=int(tile_id_for_future),
-                                        new_tile=new_tile_id,
-                                        frames=len(retry_group),
-                                        reason="phase3_livelock_abort",
-                                    )
+                                    retry_chunk_size = 0
+                                    try:
+                                        retry_chunk_size = int(_estimate_phase3_split_chunk_size(retry_group))
+                                    except Exception:
+                                        retry_chunk_size = 0
+                                    if retry_chunk_size <= 0:
+                                        retry_chunk_size = max(8, int(len(retry_group) or 0))
+
+                                    split_factor = max(1, int(2 ** max(0, int(max_retry_attempt) - 1)))
+                                    retry_chunk_size = max(8, int(retry_chunk_size // split_factor))
+
+                                    retry_chunks = [retry_group]
+                                    if len(retry_group) > retry_chunk_size > 0:
+                                        retry_chunks = [
+                                            retry_group[i:i + retry_chunk_size]
+                                            for i in range(0, len(retry_group), retry_chunk_size)
+                                        ]
+                                        retry_chunks = [c for c in retry_chunks if c]
+
+                                    if len(retry_chunks) > 1:
+                                        pcb(
+                                            "run_info_phase3_retry_split",
+                                            prog=None,
+                                            lvl="WARN",
+                                            origin_tile=int(tile_id_for_future),
+                                            frames_total=len(retry_group),
+                                            attempt=int(max_retry_attempt),
+                                            chunk_size=int(retry_chunk_size),
+                                            chunks=len(retry_chunks),
+                                            reason="phase3_livelock_abort",
+                                        )
+
+                                    for retry_chunk in retry_chunks:
+                                        new_tile_id = next_dynamic_tile_id
+                                        next_dynamic_tile_id += 1
+                                        num_seestar_stacks_to_process += 1
+                                        _register_tile_cache_paths(new_tile_id, retry_chunk)
+                                        retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
+                                        pending_launch_queue.append((retry_chunk, new_tile_id, retry_rank))
+                                        pcb(
+                                            "run_info_phase3_retry_submitted",
+                                            prog=None,
+                                            lvl="INFO_DETAIL",
+                                            origin_tile=int(tile_id_for_future),
+                                            new_tile=new_tile_id,
+                                            frames=len(retry_chunk),
+                                            reason="phase3_livelock_abort",
+                                        )
                         else:
                             pcb(
                                 "run_error_phase3_thread_exception",
