@@ -14987,7 +14987,7 @@ def create_master_tile(
             infos_for_merge: list[dict],
             *,
             reason: str,
-        ) -> tuple[tuple[str | None, Any], list[dict]]:
+        ) -> tuple[tuple[str | None, Any], list[list[dict]]]:
             """Finalize internal chunk outputs into canonical master_tile_<tile_id>.fits."""
             merge_plan_local = parallel_plan
             try:
@@ -15257,7 +15257,7 @@ def create_master_tile(
                 reason="single_valid_chunk",
             )
             if single_retries:
-                nested_retries.append(single_retries)
+                nested_retries.extend(single_retries)
             if single_path and single_wcs is not None:
                 return (single_path, single_wcs), nested_retries
             only = synthetic_infos[0]
@@ -15285,7 +15285,7 @@ def create_master_tile(
             reason="merge",
         )
         if merge_retries:
-            nested_retries.append(merge_retries)
+            nested_retries.extend(merge_retries)
 
         if merged_path and merged_wcs is not None:
             return (merged_path, merged_wcs), nested_retries
@@ -15316,7 +15316,7 @@ def create_master_tile(
                     reason="fallback_best_chunk",
                 )
                 if fallback_retries:
-                    nested_retries.append(fallback_retries)
+                    nested_retries.extend(fallback_retries)
                 if fallback_path and fallback_wcs is not None:
                     return (fallback_path, fallback_wcs), nested_retries
             return (best_path, best_wcs), nested_retries
