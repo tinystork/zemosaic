@@ -14952,6 +14952,127 @@ def create_master_tile(
         chunk_quality: list[tuple[float, int, str, Any]] = []
         nested_retries: list[list[dict]] = []
 
+        def _cleanup_internal_chunk_artifacts(
+            *,
+            preserve_paths: set[str] | None = None,
+            remove_split_fits: bool = False,
+        ) -> None:
+            """Best-effort cleanup of internal chunk artifacts for single-tile identity."""
+            keep = set(str(p) for p in (preserve_paths or set()))
+            for info_obj in synthetic_infos:
+                try:
+                    npy_obj = info_obj.get("path_preprocessed_cache")
+                    if npy_obj:
+                        p_npy = Path(str(npy_obj))
+                        if p_npy.exists() and str(p_npy) not in keep:
+                            p_npy.unlink()
+                except Exception:
+                    pass
+                if remove_split_fits:
+                    try:
+                        raw_obj = info_obj.get("path_raw")
+                        if raw_obj:
+                            p_raw = Path(str(raw_obj))
+                            if p_raw.exists() and str(p_raw) not in keep:
+                                p_raw.unlink()
+                    except Exception:
+                        pass
+            try:
+                if chunk_tmp_dir.exists():
+                    shutil.rmtree(chunk_tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        def _finalize_internal_chunk_identity(
+            infos_for_merge: list[dict],
+            *,
+            reason: str,
+        ) -> tuple[tuple[str | None, Any], list[dict]]:
+            """Finalize internal chunk outputs into canonical master_tile_<tile_id>.fits."""
+            merge_plan_local = parallel_plan
+            try:
+                if parallel_plan is not None and hasattr(parallel_plan, "use_gpu") and bool(getattr(parallel_plan, "use_gpu")):
+                    merge_plan_local = replace(parallel_plan, use_gpu=False)
+            except Exception:
+                merge_plan_local = parallel_plan
+
+            (final_path, final_wcs), final_retries = create_master_tile(
+                infos_for_merge,
+                tile_id,
+                output_temp_dir,
+                "none",
+                "none",
+                stack_reject_algo,
+                stack_kappa_low,
+                stack_kappa_high,
+                parsed_winsor_limits,
+                stack_final_combine,
+                poststack_equalize_rgb,
+                apply_radial_weight,
+                radial_feather_fraction,
+                radial_shape_power,
+                min_radial_weight_floor,
+                False,
+                quality_crop_band_px,
+                quality_crop_k_sigma,
+                quality_crop_margin_px,
+                quality_crop_min_run,
+                False,
+                altaz_margin_percent,
+                altaz_decay,
+                False,
+                False,
+                quality_gate_threshold,
+                quality_gate_edge_band_px,
+                quality_gate_k_sigma,
+                quality_gate_erode_px,
+                False,
+                astap_exe_path_global,
+                astap_data_dir_global,
+                astap_search_radius_global,
+                astap_downsample_global,
+                astap_sensitivity_global,
+                astap_timeout_seconds_global,
+                winsor_pool_workers,
+                winsor_max_frames_per_pass,
+                progress_callback,
+                resource_strategy=resource_strategy,
+                center_out_context=center_out_context,
+                center_out_settings=center_out_settings,
+                center_out_rank=center_out_rank,
+                parallel_plan=merge_plan_local,
+                allow_batch_duplication=False,
+                target_stack_size=max(1, int(min_safe_stack_size)),
+                min_safe_stack_size=max(1, int(min_safe_stack_size)),
+                dbg_tile_ids=dbg_tile_ids,
+                abort_event=abort_event,
+                heartbeat_callback=heartbeat_callback,
+                _internal_chunk_depth=int(_internal_chunk_depth) + 1,
+            )
+            if final_retries:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_MERGE_RETRY_IGNORED",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    retries=int(len(final_retries)),
+                    reason="keep_single_tile_identity",
+                )
+            if final_path and final_wcs is not None:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_IDENTITY_FINALIZED",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    reason=str(reason),
+                    final_path=_safe_basename(str(final_path)),
+                )
+                _cleanup_internal_chunk_artifacts(
+                    preserve_paths={str(final_path)},
+                    remove_split_fits=True,
+                )
+            return (final_path, final_wcs), final_retries
+
         for ci, chunk_group in enumerate(chunks, start=1):
             chunk_tile_id = int(tile_id) * 1000 + int(ci)
             pcb_tile(
@@ -15049,10 +15170,26 @@ def create_master_tile(
                     hdr_chunk = hdul_chunk[0].header.copy()
                 if arr_chunk.ndim == 2:
                     arr_chunk = np.repeat(arr_chunk[..., None], 3, axis=2)
-                elif arr_chunk.ndim == 3 and arr_chunk.shape[-1] == 1:
-                    arr_chunk = np.repeat(arr_chunk, 3, axis=2)
-                elif arr_chunk.ndim == 3 and arr_chunk.shape[-1] > 3:
-                    arr_chunk = arr_chunk[..., :3]
+                elif arr_chunk.ndim == 3:
+                    # FITS stores RGB cubes mostly as CHW (C,H,W). Convert to HWC for cache path.
+                    if arr_chunk.shape[0] in (1, 3) and arr_chunk.shape[-1] not in (1, 3):
+                        arr_chunk = np.moveaxis(arr_chunk, 0, -1)
+                    if arr_chunk.shape[-1] == 1:
+                        arr_chunk = np.repeat(arr_chunk, 3, axis=2)
+                    elif arr_chunk.shape[-1] > 3:
+                        arr_chunk = arr_chunk[..., :3]
+                if not (isinstance(arr_chunk, np.ndarray) and arr_chunk.ndim == 3 and arr_chunk.shape[-1] == 3):
+                    pcb_tile(
+                        "P3_INTERNAL_CHUNK_INVALID_SHAPE",
+                        prog=None,
+                        lvl="WARN",
+                        tile_id=int(tile_id),
+                        chunk_index=int(ci),
+                        shape=tuple(int(v) for v in getattr(arr_chunk, "shape", ())),
+                    )
+                    del arr_chunk
+                    gc.collect()
+                    continue
                 arr_chunk = np.ascontiguousarray(arr_chunk.astype(np.float32, copy=False))
                 finite_mask = np.isfinite(arr_chunk)
                 finite_frac = float(np.count_nonzero(finite_mask) / arr_chunk.size) if arr_chunk.size else 0.0
@@ -15107,7 +15244,6 @@ def create_master_tile(
             return (None, None), nested_retries
 
         if len(synthetic_infos) == 1:
-            only = synthetic_infos[0]
             pcb_tile(
                 "P3_INTERNAL_CHUNK_PASSTHROUGH",
                 prog=None,
@@ -15115,6 +15251,22 @@ def create_master_tile(
                 tile_id=int(tile_id),
                 reason="single_valid_chunk",
                 chunk_outputs=1,
+            )
+            (single_path, single_wcs), single_retries = _finalize_internal_chunk_identity(
+                synthetic_infos,
+                reason="single_valid_chunk",
+            )
+            if single_retries:
+                nested_retries.append(single_retries)
+            if single_path and single_wcs is not None:
+                return (single_path, single_wcs), nested_retries
+            only = synthetic_infos[0]
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_PASSTHROUGH_DEGRADED",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                reason="identity_finalize_failed",
             )
             return (only.get("path_raw"), only.get("wcs")), nested_retries
 
@@ -15128,76 +15280,12 @@ def create_master_tile(
             mode="single_tile_adaptive",
         )
 
-        merge_parallel_plan = parallel_plan
-        try:
-            if parallel_plan is not None and hasattr(parallel_plan, "use_gpu") and bool(getattr(parallel_plan, "use_gpu")):
-                merge_parallel_plan = replace(parallel_plan, use_gpu=False)
-        except Exception:
-            merge_parallel_plan = parallel_plan
-
-        (merged_path, merged_wcs), merge_retries = create_master_tile(
+        (merged_path, merged_wcs), merge_retries = _finalize_internal_chunk_identity(
             synthetic_infos,
-            tile_id,
-            output_temp_dir,
-            "none",
-            "none",
-            stack_reject_algo,
-            stack_kappa_low,
-            stack_kappa_high,
-            parsed_winsor_limits,
-            stack_final_combine,
-            poststack_equalize_rgb,
-            apply_radial_weight,
-            radial_feather_fraction,
-            radial_shape_power,
-            min_radial_weight_floor,
-            False,
-            quality_crop_band_px,
-            quality_crop_k_sigma,
-            quality_crop_margin_px,
-            quality_crop_min_run,
-            False,
-            altaz_margin_percent,
-            altaz_decay,
-            False,
-            False,
-            quality_gate_threshold,
-            quality_gate_edge_band_px,
-            quality_gate_k_sigma,
-            quality_gate_erode_px,
-            False,
-            astap_exe_path_global,
-            astap_data_dir_global,
-            astap_search_radius_global,
-            astap_downsample_global,
-            astap_sensitivity_global,
-            astap_timeout_seconds_global,
-            winsor_pool_workers,
-            winsor_max_frames_per_pass,
-            progress_callback,
-            resource_strategy=resource_strategy,
-            center_out_context=center_out_context,
-            center_out_settings=center_out_settings,
-            center_out_rank=center_out_rank,
-            parallel_plan=merge_parallel_plan,
-            allow_batch_duplication=False,
-            target_stack_size=max(1, int(min_safe_stack_size)),
-            min_safe_stack_size=max(1, int(min_safe_stack_size)),
-            dbg_tile_ids=dbg_tile_ids,
-            abort_event=abort_event,
-            heartbeat_callback=heartbeat_callback,
-            _internal_chunk_depth=int(_internal_chunk_depth) + 1,
+            reason="merge",
         )
-
         if merge_retries:
-            pcb_tile(
-                "P3_INTERNAL_CHUNK_MERGE_RETRY_IGNORED",
-                prog=None,
-                lvl="WARN",
-                tile_id=int(tile_id),
-                retries=int(len(merge_retries)),
-                reason="keep_single_tile_identity",
-            )
+            nested_retries.append(merge_retries)
 
         if merged_path and merged_wcs is not None:
             return (merged_path, merged_wcs), nested_retries
@@ -15214,6 +15302,23 @@ def create_master_tile(
                 best_members=int(best_members),
                 outputs=int(len(chunk_quality)),
             )
+            best_info = None
+            for info_obj in synthetic_infos:
+                try:
+                    if str(info_obj.get("path_raw")) == str(best_path):
+                        best_info = info_obj
+                        break
+                except Exception:
+                    continue
+            if best_info is not None:
+                (fallback_path, fallback_wcs), fallback_retries = _finalize_internal_chunk_identity(
+                    [best_info],
+                    reason="fallback_best_chunk",
+                )
+                if fallback_retries:
+                    nested_retries.append(fallback_retries)
+                if fallback_path and fallback_wcs is not None:
+                    return (fallback_path, fallback_wcs), nested_retries
             return (best_path, best_wcs), nested_retries
         except Exception:
             return (None, None), nested_retries
@@ -16593,8 +16698,41 @@ def create_master_tile(
             except Exception:
                 pass
 
+        master_tile_export_data = master_tile_stacked_HWC
+        try:
+            arr_export = np.asarray(master_tile_stacked_HWC, dtype=np.float32, order="C")
+            nonfinite_mask = ~np.isfinite(arr_export)
+            nonfinite_count = int(np.count_nonzero(nonfinite_mask))
+            if nonfinite_count > 0:
+                # Viewer compatibility: some Linux FITS viewers render NaN-rich tiles as black.
+                # Keep in-memory pipeline arrays unchanged; sanitize only on disk export.
+                master_tile_export_data = np.nan_to_num(
+                    arr_export,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).astype(np.float32, copy=False)
+                header_mt_save['ZMT_NANZ'] = (1, 'Non-finite values were zeroed for export')
+                header_mt_save['ZMT_NANC'] = (nonfinite_count, 'Count of non-finite values zeroed on export')
+                try:
+                    header_mt_save.add_history('Export sanitize: NaN/Inf -> 0 for viewer compatibility')
+                except Exception:
+                    pass
+                logger.debug(
+                    "[MT_EXPORT_SANITIZE] tile=%s nonfinite=%d path=%s",
+                    tile_id,
+                    nonfinite_count,
+                    temp_fits_path,
+                )
+            else:
+                master_tile_export_data = arr_export
+                header_mt_save['ZMT_NANZ'] = (0, 'Non-finite values were zeroed for export')
+                header_mt_save['ZMT_NANC'] = (0, 'Count of non-finite values zeroed on export')
+        except Exception:
+            master_tile_export_data = master_tile_stacked_HWC
+
         zemosaic_utils.save_fits_image(
-            image_data=master_tile_stacked_HWC,
+            image_data=master_tile_export_data,
             output_path=str(temp_fits_path),
             header=header_mt_save,
             overwrite=True,

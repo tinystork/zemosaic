@@ -16,7 +16,7 @@
         890,
         918
     ],
-    "quality_gate_enabled": true,
+    "quality_gate_enabled": false,
     "poststack_rgb_equalize_bg_percentile": [
         5.0,
         85.0
@@ -182,7 +182,7 @@
     "tile_weight_v4_min": 0.75,
     "final_mosaic_rgb_equalize_enabled": false,
     "save_final_as_uint16": false,
-    "quality_gate_move_rejects": true,
+    "quality_gate_move_rejects": false,
     "global_wcs_padding_percent": 2.0,
     "phase5_alpha_soft_weights": true,
     "visual_seam_heal_seam_sigma": 2.5,

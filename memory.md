@@ -3714,3 +3714,28 @@ Préparation run P:
   - `tile_weight_v4_temporal_penalty_hours`
 - Protocole formalisé: `validation_protocol_phase5_weighting.md` pour campagne OFF/ON/ON+V4 + non-régression multi-modes.
 - Sanity: compilation Python OK (`zemosaic_utils.py`, `zemosaic_worker.py`, `zemosaic_config.py`).
+
+## 2026-04-05 — Fix split extrême Phase 3 (identité single-tile restaurée)
+
+Contexte terrain (`NGC6888_18`):
+- les groupes extrêmes (`114`, `115`) produisaient des sous-master-tiles (`114001..`, `115001..`)
+- la tuile logique finale pouvait être absente ou incohérente (ex `master_tile_114.fits` shape anormale),
+- risque de perte de signal via passthrough/fallback sur un sous-chunk unique.
+
+Root cause confirmé:
+- conversion/lecture des chunks internes FITS incomplète (cas CHW `(3,H,W)` traité comme HWC),
+- logique de finalisation permissive sur `single_valid_chunk` / `fallback_best` sans finalisation canonique stricte.
+
+Correctifs appliqués dans `zemosaic_worker.py`:
+- normalisation robuste des chunks internes: CHW -> HWC + garde-fou forme `HWC(3)`
+- ajout log `P3_INTERNAL_CHUNK_INVALID_SHAPE`
+- finalisation canonique centralisée (`_finalize_internal_chunk_identity`) pour:
+  - merge normal,
+  - `single_valid_chunk`,
+  - `fallback_best_chunk`
+- ajout log `P3_INTERNAL_CHUNK_IDENTITY_FINALIZED`
+- nettoyage best-effort des artefacts internes (`.npy` + sous-master-tiles) après finalisation.
+
+Invariant produit réaffirmé:
+- le split interne est un mécanisme mémoire, pas un changement de sémantique scientifique;
+- la sortie cible reste `master_tile_<tile_id>.fits` (tuile logique unique).

@@ -577,3 +577,14 @@ Ajout validé:
 Règle d'exploitation:
 - toute hypothèse "trou" doit être corrélée à ces artefacts (pas uniquement au rendu PNG).
 - privilégier explication causale: zone vide = faible weighted coverage + winner instable + arêtes critiques rejetées.
+
+## Addendum 2026-04-05 — Phase 3 extreme split identity (single-tile invariant)
+
+Décision produit rappelée: le split interne d'un groupe extrême sert uniquement à éviter OOM (RAM/VRAM).
+La sortie canonique de fin de traitement doit rester **une seule master tile logique** (`master_tile_<tile_id>.fits`).
+
+Consigne d'implémentation:
+- les sous-tiles/chunks internes sont des artefacts transitoires,
+- la finalisation doit repasser par la tuile logique d'origine,
+- éviter le passthrough brut d'un chunk comme sortie finale implicite,
+- nettoyer les artefacts internes après finalisation quand possible.

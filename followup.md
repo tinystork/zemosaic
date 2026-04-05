@@ -190,3 +190,11 @@ Mission considérée close uniquement si:
 - [x] Protocole OFF/ON/ON+V4 formalisé: `validation_protocol_phase5_weighting.md`
 - [ ] Validation comparative complète (OFF vs ON vs ON+V4) encore à exécuter
 - [ ] Non-régression multi-modes (classic/existing/SDS/ZeGrid) encore à clôturer
+
+## P0-D — Correctif split extrême / identité de tuile (2026-04-05)
+
+- [x] Corriger lecture des chunks FITS internes (CHW->HWC) pour éviter les formes invalides au merge
+- [x] Finaliser les cas `single_valid_chunk` et `fallback_best_chunk` via sortie canonique `master_tile_<tile_id>.fits`
+- [x] Ajouter logs explicites (`P3_INTERNAL_CHUNK_IDENTITY_FINALIZED`, `P3_INTERNAL_CHUNK_INVALID_SHAPE`)
+- [x] Nettoyage best-effort des artefacts `.p3_internal_tile_*` et sous-master-tiles après finalisation
+- [ ] Validation terrain: run extrême (tile 114/115) sans dérive d'identité ni perte de signal apparente
