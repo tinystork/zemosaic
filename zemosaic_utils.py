@@ -5351,6 +5351,20 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     import cupy as cp  # type: ignore
     from cupyx.scipy.ndimage import map_coordinates  # type: ignore
 
+    gpu_sync_diag_cfg = kwargs.get("gpu_sync_diagnostics", None)
+    if gpu_sync_diag_cfg is None:
+        # GUI "Debug logs" switch drives worker logger to DEBUG; use that as default trigger
+        # so end users can enable GPU diagnostics without env vars/CLI.
+        gpu_sync_diag = bool(logger.isEnabledFor(logging.DEBUG))
+    else:
+        gpu_sync_diag = bool(gpu_sync_diag_cfg)
+
+    gpu_sync_diag_env = str(os.environ.get("ZEMOSAIC_GPU_SYNC_DIAG", "")).strip().lower()
+    if gpu_sync_diag_env in {"1", "true", "yes", "on"}:
+        gpu_sync_diag = True
+    elif gpu_sync_diag_env in {"0", "false", "no", "off"}:
+        gpu_sync_diag = False
+
     ensure_cupy_pool_initialized()
     try:
         from astropy.wcs import WCS as _WCS
@@ -5931,14 +5945,30 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     try:
         if combine_mode == "mean":
-            return _gpu_mean_path()
-        if combine_mode == "median":
-            return _gpu_chunkwise_path("median")
-        if combine_mode == "winsorized":
-            return _gpu_chunkwise_path("winsorized")
-        if combine_mode == "kappa_sigma":
-            return _gpu_kappa_sigma_path()
-        raise NotImplementedError(f"Unsupported combine_function '{combine_function}' for GPU coadd")
+            result = _gpu_mean_path()
+        elif combine_mode == "median":
+            result = _gpu_chunkwise_path("median")
+        elif combine_mode == "winsorized":
+            result = _gpu_chunkwise_path("winsorized")
+        elif combine_mode == "kappa_sigma":
+            result = _gpu_kappa_sigma_path()
+        else:
+            raise NotImplementedError(f"Unsupported combine_function '{combine_function}' for GPU coadd")
+
+        if gpu_sync_diag:
+            try:
+                cp.cuda.runtime.deviceSynchronize()
+            except Exception as sync_exc:
+                logger.warning("[GPU_DIAG] synchronize-after-kernel failed: %s", sync_exc)
+                raise
+        return result
+    except Exception:
+        if gpu_sync_diag:
+            try:
+                cp.cuda.runtime.deviceSynchronize()
+            except Exception as sync_exc:
+                logger.warning("[GPU_DIAG] synchronize-after-error failed: %s", sync_exc)
+        raise
     finally:
         free_cupy_memory_pools()
 
@@ -6039,6 +6069,118 @@ def _reproject_and_coadd_wrapper_impl(
                 if local_max > max_val:
                     max_val = local_max
         return max_val if seen else None
+
+
+    def _sample_input_signature(max_items: int = 3) -> list[dict[str, Any]]:
+        """Return lightweight per-input signatures for GPU crash diagnostics."""
+        signatures: list[dict[str, Any]] = []
+        try:
+            total = int(len(data_list))
+        except Exception:
+            total = 0
+        limit = max(0, min(int(max_items), total))
+        for idx in range(limit):
+            sig: dict[str, Any] = {"idx": int(idx)}
+            try:
+                arr = np.asarray(data_list[idx])
+                sig.update(
+                    {
+                        "shape": tuple(int(v) for v in arr.shape),
+                        "dtype": str(arr.dtype),
+                        "c_contig": bool(arr.flags.c_contiguous),
+                        "f_contig": bool(arr.flags.f_contiguous),
+                        "strides": tuple(int(v) for v in arr.strides),
+                    }
+                )
+            except Exception as exc_arr:
+                sig["array_error"] = str(exc_arr)
+            try:
+                wcs_obj = wcs_list[idx] if idx < len(wcs_list) else None
+                sig["wcs_type"] = type(wcs_obj).__name__ if wcs_obj is not None else None
+            except Exception as exc_wcs:
+                sig["wcs_error"] = str(exc_wcs)
+            signatures.append(sig)
+        return signatures
+
+    def _collect_gpu_failure_diagnostics(exc: Exception, *, call_kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Collect concise runtime diagnostics when GPU reprojection fails."""
+        diag: dict[str, Any] = {
+            "event": "gpu_reproject_failure",
+            "exception_type": type(exc).__name__,
+            "error": str(exc),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+            "shape_out": tuple(int(v) for v in shape_out) if isinstance(shape_out, (list, tuple, np.ndarray)) else str(shape_out),
+            "n_inputs": int(len(data_list)) if isinstance(data_list, (list, tuple)) else None,
+            "combine_function": str(kwargs.get("combine_function") or ""),
+            "stack_reject_algo": str(kwargs.get("stack_reject_algo") or ""),
+            "rows_per_chunk": kwargs.get("rows_per_chunk"),
+            "max_chunk_bytes": kwargs.get("max_chunk_bytes"),
+            "env": {
+                "CUDA_LAUNCH_BLOCKING": os.environ.get("CUDA_LAUNCH_BLOCKING"),
+                "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "CUPY_ACCELERATORS": os.environ.get("CUPY_ACCELERATORS"),
+                "ZEMOSAIC_GPU_SYNC_DIAG": os.environ.get("ZEMOSAIC_GPU_SYNC_DIAG"),
+            },
+            "logger_debug_enabled": bool(logger.isEnabledFor(logging.DEBUG)),
+            "gpu_sync_diag_active": bool(gpu_sync_diag),
+            "input_sample": _sample_input_signature(max_items=3),
+        }
+        if isinstance(call_kwargs, dict):
+            try:
+                diag["call_rows_per_chunk"] = call_kwargs.get("rows_per_chunk")
+                diag["call_max_chunk_bytes"] = call_kwargs.get("max_chunk_bytes")
+            except Exception:
+                pass
+        try:
+            import cupy as cp  # type: ignore
+
+            try:
+                runtime_ver = int(cp.cuda.runtime.runtimeGetVersion())
+            except Exception:
+                runtime_ver = None
+            try:
+                driver_ver = int(cp.cuda.runtime.driverGetVersion())
+            except Exception:
+                driver_ver = None
+            try:
+                dev = cp.cuda.Device()
+                dev_id = int(getattr(dev, "id", 0))
+            except Exception:
+                dev_id = 0
+            try:
+                props = cp.cuda.runtime.getDeviceProperties(dev_id)
+            except Exception:
+                props = None
+            try:
+                free_b, total_b = cp.cuda.runtime.memGetInfo()
+            except Exception:
+                free_b, total_b = None, None
+            sync_error = None
+            try:
+                cp.cuda.runtime.deviceSynchronize()
+            except Exception as sync_exc:
+                sync_error = str(sync_exc)
+            diag["cuda"] = {
+                "device_id": int(dev_id),
+                "device_name": (
+                    props.get("name", b"").decode(errors="ignore")
+                    if isinstance(props, dict)
+                    else None
+                ),
+                "runtime_version": runtime_ver,
+                "driver_version": driver_ver,
+                "mem_free_mb": (float(free_b) / (1024 ** 2)) if isinstance(free_b, (int, float)) else None,
+                "mem_total_mb": (float(total_b) / (1024 ** 2)) if isinstance(total_b, (int, float)) else None,
+                "sync_error": sync_error,
+            }
+            try:
+                diag["cupy_version"] = str(cp.__version__)
+            except Exception:
+                pass
+        except Exception as cp_exc:
+            diag["cupy_diag_error"] = str(cp_exc)
+        return diag
 
     # Support per-tile (per-pixel) weight maps without forwarding unknown kwargs into
     # astropy-reproject (it would pass them down to reproject_function and crash).
@@ -6172,6 +6314,7 @@ def _reproject_and_coadd_wrapper_impl(
                 return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **local_kwargs)
             except Exception as exc:
                 if not _is_gpu_oom_exception(exc) or retry_index >= max_retries:
+                    setattr(exc, "_zemosaic_gpu_call_kwargs", dict(local_kwargs))
                     raise
                 retry_index += 1
                 new_max, new_rows = _shrink_chunk_hints(
@@ -6224,6 +6367,15 @@ def _reproject_and_coadd_wrapper_impl(
             try:
                 return _gpu_call_with_oom_retry()
             except Exception as e:  # pragma: no cover - GPU failures
+                gpu_call_kwargs = getattr(e, "_zemosaic_gpu_call_kwargs", None)
+                try:
+                    diag = _collect_gpu_failure_diagnostics(e, call_kwargs=gpu_call_kwargs)
+                    logger.warning(
+                        "[GPU_DIAG] %s",
+                        json.dumps(diag, ensure_ascii=False, default=str),
+                    )
+                except Exception:
+                    logger.debug("Failed to collect GPU diagnostics", exc_info=True)
                 _log_gpu_event(
                     "gpu_fallback_runtime_error",
                     "WARN",
