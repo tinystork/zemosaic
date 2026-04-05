@@ -198,3 +198,54 @@ Mission considérée close uniquement si:
 - [x] Ajouter logs explicites (`P3_INTERNAL_CHUNK_IDENTITY_FINALIZED`, `P3_INTERNAL_CHUNK_INVALID_SHAPE`)
 - [x] Nettoyage best-effort des artefacts `.p3_internal_tile_*` et sous-master-tiles après finalisation
 - [ ] Validation terrain: run extrême (tile 114/115) sans dérive d'identité ni perte de signal apparente
+
+## P0-E — Orchestrateur mémoire unifié (toutes phases, petites machines)
+
+### Scope
+- [ ] Définir un budget mémoire global unifié (RAM/VRAM) + marges de sécurité.
+- [ ] Implémenter un arbitre central de budget partagé entre phases P1..P6.
+- [ ] Poser des hard caps contraignants (pas seulement adaptation réactive).
+- [ ] Appliquer le budget aux dimensions critiques: workers, frames/pass, rows/chunk, chunk_mb, cache IO.
+- [ ] Ajouter une politique low-RAM déterministe (profil « safe legacy machine »).
+
+### Observabilité / logs
+- [ ] Émettre des logs normalisés `MEM_ORCH_*` (budget global, allocation phase, refus d'escalade, downgrade appliqué).
+- [ ] Exporter un résumé fin de run (`memory_orchestrator_report.json`) avec timeline des changements.
+- [ ] Rendre corrélable `resource_telemetry.csv` ↔ décisions orchestrateur.
+
+### Validation
+- [ ] Linux 8GB: run complet sans exitcode -9.
+- [ ] Windows machine plus puissante: vérifier absence de bridage inutile (throughput acceptable).
+- [ ] Vérifier non-régression split extrême Phase 3 (tuile canonique finale unique).
+- [ ] Vérifier absence de dérive science (comparaison stats/artefacts avant-après).
+
+### Notes de transition
+- [ ] Garder P0-D ouvert jusqu'à validation terrain complète, mais priorité d'exécution = P0-E.
+
+## Progress update (2026-04-05 — P0-E lot 1)
+
+- [x] Introduire un profil mémoire orchestrateur (Phase 3) avec hard caps dérivés RAM/swap (`_phase3_memory_orchestrator_profile`)
+- [x] Ajouter logs normalisés `MEM_ORCH_PROFILE` au démarrage du contrôleur runtime
+- [x] Appliquer caps durs sur workers/cache slots/frames-per-pass/rows/chunk/chunk_mb (deux chemins classic/legacy)
+- [x] Ajouter garde de réserve mémoire (`MEM_ORCH_GUARD reserve_enter/reserve_exit`) pour limiter le risque d'OOM-kill
+- [ ] Étendre le même orchestrateur aux autres phases (P1/P2/P4/P5/P6)
+- [ ] Ajouter export de synthèse `memory_orchestrator_report.json`
+
+
+## Progress update (2026-04-05 — P0-E lot 2)
+
+- [x] Ajout d'un profil orchestrateur mémoire global cross-phase (`_memory_orchestrator_profile`)
+- [x] Cap hard des workers Phase 1 (`MEM_ORCH_PHASE1`)
+- [x] Cap hard des paramètres Winsor (workers + frames/pass) (`MEM_ORCH_WINSOR`)
+- [x] Cap hard de `assembly_process_workers` pour Phase 5 (`MEM_ORCH_PHASE5`)
+- [ ] Étendre les caps hard à tous les sous-chemins SDS/ZeGrid restants (audit fin)
+- [ ] Ajouter le rapport JSON consolidé orchestrateur (`memory_orchestrator_report.json`)
+
+
+## Progress update (2026-04-05 — P0-E lot 3)
+
+- [x] Ajout writer best-effort de rapport orchestrateur: `_write_memory_orchestrator_report`
+- [x] Écriture fin de run: `memory_orchestrator_report.json` (chemins classic/legacy)
+- [x] Rapport inclut profils globaux + profils Phase 3 + caps appliqués
+- [ ] Corrélation enrichie timeline télémétrie ↔ décisions runtime (itération suivante)
+- [ ] Audit final SDS/ZeGrid spécifique sur dataset de non-régression

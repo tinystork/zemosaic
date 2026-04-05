@@ -3739,3 +3739,58 @@ Correctifs appliqués dans `zemosaic_worker.py`:
 Invariant produit réaffirmé:
 - le split interne est un mécanisme mémoire, pas un changement de sémantique scientifique;
 - la sortie cible reste `master_tile_<tile_id>.fits` (tuile logique unique).
+
+## 2026-04-05 — Réorientation mission: orchestrateur mémoire unifié multi-phases
+
+Décision validée avec Tristan:
+- priorité immédiate déplacée vers la robustesse mémoire cross-phase,
+- objectif explicite: faire fonctionner ZeMosaic sur petites/vieilles machines,
+- cible architecture: orchestrateur mémoire unifié (P1..P6) avec hard caps.
+
+Motif:
+- crash Linux `exitcode=-9` observé sur run NGC6888_19,
+- adaptation runtime actuelle jugée trop réactive/non-garante sous forte pression RAM,
+- besoin de garanties de sûreté mémoire plutôt que simple auto-ajustement opportuniste.
+
+Contraintes produit conservées:
+- pas de régression sémantique single-tile identity en Phase 3,
+- préserver le comportement scientifique (pas de drop silencieux de signal).
+
+## 2026-04-05 — P0-E lot 1 implémenté (hard caps Phase 3)
+
+Implémentation immédiate après réorientation mission:
+- ajout d'un profil orchestrateur mémoire (`_phase3_memory_orchestrator_profile`) avec caps hard selon RAM/swap + overrides config,
+- branchement dans les deux boucles runtime Phase 3 (chemins classic/legacy),
+- nouveaux logs:
+  - `MEM_ORCH_PROFILE` (budget/caps actifs)
+  - `MEM_ORCH_GUARD reserve_enter/reserve_exit` (protection réserve mémoire),
+- caps durs appliqués à:
+  - workers Phase 3,
+  - cache read slots,
+  - winsor frames per pass,
+  - cpu/gpu rows per chunk,
+  - max_chunk_mb.
+
+Objectif de ce lot: limiter les montées agressives du working set sur petites machines et réduire les risques de `exitcode=-9`.
+
+
+## 2026-04-05 — P0-E lot 2 implémenté (caps cross-phase initiaux)
+
+- Ajout d'un profil orchestrateur mémoire global (`_memory_orchestrator_profile`) distinct du contrôleur Phase 3.
+- Application immédiate des caps hard sur:
+  - Phase 1: workers (`MEM_ORCH_PHASE1`),
+  - Stacking Winsor: worker limit + frames per pass (`MEM_ORCH_WINSOR`),
+  - Phase 5: `assembly_process_workers` (`MEM_ORCH_PHASE5`).
+- Objectif: réduire les pics agressifs hors Phase 3 pure et améliorer la robustesse low-RAM sans casser les modes SDS/ZeGrid.
+
+
+## 2026-04-05 — P0-E lot 3 implémenté (report JSON orchestrateur)
+
+- Ajout d'un report fin de run `memory_orchestrator_report.json` dans le dossier de sortie.
+- Report initial contient:
+  - profil orchestrateur global (`_memory_orchestrator_profile`),
+  - profil Phase 3 (`_phase3_memory_orchestrator_profile`),
+  - caps appliqués observables (winsor workers/frames, assembly workers, base workers).
+- Couvre les deux chemins de run (`run_hierarchical_mosaic_classic_legacy` et `run_hierarchical_mosaic`).
+
+Note: la timeline détaillée décision par décision reste à enrichir dans une itération dédiée.

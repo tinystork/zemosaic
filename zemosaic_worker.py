@@ -10367,6 +10367,25 @@ def _run_shared_phase45_phase5_pipeline(
         except Exception:
             pass
     assembly_process_workers_config = int(phase5_options.get("assembly_process_workers") or 0)
+    try:
+        vm_orch = psutil.virtual_memory()
+        sm_orch = psutil.swap_memory()
+        mem_orch_global = _memory_orchestrator_profile(
+            float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+            float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+            zconfig=None,
+        )
+        if assembly_process_workers_config and int(assembly_process_workers_config) > 0:
+            prev_asm = int(assembly_process_workers_config)
+            assembly_process_workers_config = max(1, min(int(assembly_process_workers_config), int(mem_orch_global.get("max_phase5_assembly_workers", assembly_process_workers_config))))
+            if assembly_process_workers_config != prev_asm:
+                pcb(
+                    f"MEM_ORCH_PHASE5: assembly_workers_cap {prev_asm}->{assembly_process_workers_config} class={mem_orch_global.get('class')}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+    except Exception:
+        pass
     intertile_preview_size_config = phase5_options.get("intertile_preview_size") or 512
     intertile_overlap_min_config = phase5_options.get("intertile_overlap_min") or 0.05
     intertile_sky_percentile_tuple = phase5_options.get("intertile_sky_percentile") or (30.0, 70.0)
@@ -14610,6 +14629,172 @@ def _phase3_budget_change_block_reason(
         return pruned_change_times, "rate_limit"
 
     return pruned_change_times, None
+
+
+def _phase3_memory_orchestrator_profile(total_ram_gb: float, swap_total_gb: float, zconfig: Any | None = None) -> dict[str, Any]:
+    """Return conservative hard caps for Phase 3 runtime adaptation.
+
+    This is step 1 of a unified memory orchestrator: explicit hard ceilings to avoid
+    runaway auto-growth on low-RAM machines.
+    """
+    try:
+        total_ram_gb = float(total_ram_gb)
+    except Exception:
+        total_ram_gb = 0.0
+    try:
+        swap_total_gb = float(swap_total_gb)
+    except Exception:
+        swap_total_gb = 0.0
+
+    legacy_threshold = 9.0
+    try:
+        if zconfig is not None:
+            legacy_threshold = float(getattr(zconfig, "phase3_mem_orch_legacy_ram_threshold_gb", legacy_threshold))
+    except Exception:
+        pass
+
+    is_low_ram = total_ram_gb > 0.0 and total_ram_gb <= legacy_threshold
+    if total_ram_gb <= 0.0:
+        # Unknown RAM: fail-safe conservative defaults.
+        is_low_ram = True
+
+    if is_low_ram:
+        reserve_mb_default = 1536.0
+        max_workers_default = 1
+        max_cache_slots_default = 1
+        max_frames_default = 32
+        max_cpu_rows_default = 640
+        max_gpu_rows_default = 192
+        max_chunk_mb_default = 640.0
+    elif total_ram_gb <= 12.5:
+        reserve_mb_default = 1280.0
+        max_workers_default = 2
+        max_cache_slots_default = 2
+        max_frames_default = 64
+        max_cpu_rows_default = 1024
+        max_gpu_rows_default = 320
+        max_chunk_mb_default = 1024.0
+    elif total_ram_gb <= 24.5:
+        reserve_mb_default = 1024.0
+        max_workers_default = 3
+        max_cache_slots_default = 3
+        max_frames_default = 128
+        max_cpu_rows_default = 1536
+        max_gpu_rows_default = 512
+        max_chunk_mb_default = 2048.0
+    else:
+        reserve_mb_default = 768.0
+        max_workers_default = 8
+        max_cache_slots_default = 3
+        max_frames_default = 256
+        max_cpu_rows_default = 2048
+        max_gpu_rows_default = 1024
+        max_chunk_mb_default = 4096.0
+
+    if swap_total_gb < 1.0:
+        reserve_mb_default = max(reserve_mb_default, 1792.0)
+        max_frames_default = min(max_frames_default, 24 if is_low_ram else 48)
+        max_chunk_mb_default = min(max_chunk_mb_default, 512.0 if is_low_ram else 896.0)
+
+    reserve_mb = reserve_mb_default
+    max_workers = max_workers_default
+    max_cache_slots = max_cache_slots_default
+    max_frames_per_pass = max_frames_default
+    max_cpu_rows_per_chunk = max_cpu_rows_default
+    max_gpu_rows_per_chunk = max_gpu_rows_default
+    max_chunk_mb = max_chunk_mb_default
+
+    try:
+        if zconfig is not None:
+            reserve_mb = max(384.0, float(getattr(zconfig, "phase3_mem_orch_reserve_mb", reserve_mb_default)))
+            max_workers = max(1, int(getattr(zconfig, "phase3_mem_orch_max_workers_hard", max_workers_default)))
+            max_cache_slots = max(1, int(getattr(zconfig, "phase3_mem_orch_max_cache_slots_hard", max_cache_slots_default)))
+            max_frames_per_pass = max(8, int(getattr(zconfig, "phase3_mem_orch_max_frames_per_pass_hard", max_frames_default)))
+            max_cpu_rows_per_chunk = max(64, int(getattr(zconfig, "phase3_mem_orch_max_cpu_rows_hard", max_cpu_rows_default)))
+            max_gpu_rows_per_chunk = max(32, int(getattr(zconfig, "phase3_mem_orch_max_gpu_rows_hard", max_gpu_rows_default)))
+            max_chunk_mb = max(128.0, float(getattr(zconfig, "phase3_mem_orch_max_chunk_mb_hard", max_chunk_mb_default)))
+    except Exception:
+        pass
+
+    return {
+        "is_low_ram": bool(is_low_ram),
+        "reserve_mb": float(reserve_mb),
+        "max_workers": int(max_workers),
+        "max_cache_slots": int(max_cache_slots),
+        "max_frames_per_pass": int(max_frames_per_pass),
+        "max_cpu_rows_per_chunk": int(max_cpu_rows_per_chunk),
+        "max_gpu_rows_per_chunk": int(max_gpu_rows_per_chunk),
+        "max_chunk_mb": float(max_chunk_mb),
+        "total_ram_gb": float(total_ram_gb),
+        "swap_total_gb": float(swap_total_gb),
+    }
+
+
+def _memory_orchestrator_profile(total_ram_gb: float, swap_total_gb: float, zconfig: Any | None = None) -> dict[str, Any]:
+    """Global memory orchestrator profile (cross-phase hard limits)."""
+    try:
+        total_ram_gb = float(total_ram_gb)
+    except Exception:
+        total_ram_gb = 0.0
+    try:
+        swap_total_gb = float(swap_total_gb)
+    except Exception:
+        swap_total_gb = 0.0
+
+    if total_ram_gb <= 0.0 or total_ram_gb <= 8.5:
+        profile = {"class": "legacy_low_ram", "reserve_mb": 1536.0, "max_base_workers": 2, "max_winsor_workers": 1, "max_winsor_frames": 24, "max_phase5_assembly_workers": 1}
+    elif total_ram_gb <= 12.5:
+        profile = {"class": "mid_low_ram", "reserve_mb": 1280.0, "max_base_workers": 4, "max_winsor_workers": 2, "max_winsor_frames": 48, "max_phase5_assembly_workers": 2}
+    elif total_ram_gb <= 24.5:
+        profile = {"class": "mid_ram", "reserve_mb": 1024.0, "max_base_workers": 8, "max_winsor_workers": 4, "max_winsor_frames": 96, "max_phase5_assembly_workers": 4}
+    else:
+        profile = {"class": "high_ram", "reserve_mb": 768.0, "max_base_workers": 16, "max_winsor_workers": 8, "max_winsor_frames": 256, "max_phase5_assembly_workers": 8}
+
+    if swap_total_gb < 1.0:
+        profile["reserve_mb"] = max(float(profile["reserve_mb"]), 1792.0)
+        profile["max_winsor_frames"] = min(int(profile["max_winsor_frames"]), 16 if total_ram_gb <= 8.5 else 32)
+
+    try:
+        if zconfig is not None:
+            profile["reserve_mb"] = max(384.0, float(getattr(zconfig, "mem_orch_reserve_mb", profile["reserve_mb"])))
+            profile["max_base_workers"] = max(1, int(getattr(zconfig, "mem_orch_max_base_workers", profile["max_base_workers"])))
+            profile["max_winsor_workers"] = max(1, int(getattr(zconfig, "mem_orch_max_winsor_workers", profile["max_winsor_workers"])))
+            profile["max_winsor_frames"] = max(8, int(getattr(zconfig, "mem_orch_max_winsor_frames", profile["max_winsor_frames"])))
+            profile["max_phase5_assembly_workers"] = max(1, int(getattr(zconfig, "mem_orch_max_phase5_assembly_workers", profile["max_phase5_assembly_workers"])))
+    except Exception:
+        pass
+
+    profile["total_ram_gb"] = float(total_ram_gb)
+    profile["swap_total_gb"] = float(swap_total_gb)
+    return profile
+
+
+def _write_memory_orchestrator_report(output_folder: str, report_payload: dict[str, Any], *, logger: Any | None = None, progress_callback: callable | None = None) -> None:
+    """Best-effort JSON report writer for memory orchestrator observability."""
+    try:
+        if not output_folder:
+            return
+        os.makedirs(output_folder, exist_ok=True)
+        out_path = os.path.join(output_folder, "memory_orchestrator_report.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report_payload, f, indent=2, ensure_ascii=False, default=str)
+        if logger is not None:
+            try:
+                logger.info("[MEM_ORCH] report written: %s", out_path)
+            except Exception:
+                pass
+        if progress_callback is not None:
+            try:
+                progress_callback("memory_orchestrator_report_written", None, "INFO_DETAIL", {"path": out_path})
+            except Exception:
+                pass
+    except Exception:
+        if logger is not None:
+            try:
+                logger.debug("Failed to write memory orchestrator report", exc_info=True)
+            except Exception:
+                pass
+
 
 def create_master_tile(
     seestar_stack_group_info: list[dict],
@@ -23408,6 +23593,25 @@ def run_hierarchical_mosaic_classic_legacy(
             num_total_raw_files,
             DEFAULT_PHASE_WORKER_RATIO,
         )
+        try:
+            vm_orch = psutil.virtual_memory()
+            sm_orch = psutil.swap_memory()
+            mem_orch_global = _memory_orchestrator_profile(
+                float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+                float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+                zconfig=zconfig,
+            )
+            hard_base = max(1, int(mem_orch_global.get("max_base_workers", actual_num_workers_ph1)))
+            prev_ph1 = int(actual_num_workers_ph1)
+            actual_num_workers_ph1 = max(1, min(int(actual_num_workers_ph1), hard_base))
+            if actual_num_workers_ph1 != prev_ph1:
+                pcb(
+                    f"MEM_ORCH_PHASE1: workers_cap {prev_ph1}->{actual_num_workers_ph1} class={mem_orch_global.get('class')}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+        except Exception:
+            pass
         pcb(
             f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
             prog=None,
@@ -24053,6 +24257,32 @@ def run_hierarchical_mosaic_classic_legacy(
             candidate = winsor_worker_limit_cfg
         winsor_worker_limit = max(1, min(int(candidate), cpu_total))
         winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
+        try:
+            vm_orch = psutil.virtual_memory()
+            sm_orch = psutil.swap_memory()
+            mem_orch_global = _memory_orchestrator_profile(
+                float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+                float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+                zconfig=zconfig,
+            )
+            prev_winsor_workers = int(winsor_worker_limit)
+            prev_winsor_frames = int(winsor_max_frames_per_pass)
+            winsor_worker_limit = max(1, min(int(winsor_worker_limit), int(mem_orch_global.get("max_winsor_workers", winsor_worker_limit))))
+            if winsor_max_frames_per_pass <= 0:
+                winsor_max_frames_per_pass = int(mem_orch_global.get("max_winsor_frames", 0))
+            else:
+                winsor_max_frames_per_pass = max(8, min(int(winsor_max_frames_per_pass), int(mem_orch_global.get("max_winsor_frames", winsor_max_frames_per_pass))))
+            if winsor_worker_limit != prev_winsor_workers or winsor_max_frames_per_pass != prev_winsor_frames:
+                pcb(
+                    "MEM_ORCH_WINSOR: "
+                    f"workers {prev_winsor_workers}->{winsor_worker_limit} "
+                    f"frames {prev_winsor_frames}->{winsor_max_frames_per_pass} "
+                    f"class={mem_orch_global.get('class')}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+        except Exception:
+            pass
         global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
         global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
         global_wcs_plan["use_align_helpers"] = True
@@ -25123,15 +25353,45 @@ def run_hierarchical_mosaic_classic_legacy(
                 except Exception:
                     pass
 
+                mem_orch_profile = _phase3_memory_orchestrator_profile(
+                    float(auto_profile.get("total_ram_gb") or 0.0),
+                    float(auto_profile.get("swap_total_gb") or 0.0),
+                    zconfig=zconfig,
+                )
+                try:
+                    pcb(
+                        "MEM_ORCH_PROFILE: "
+                        f"low_ram={int(bool(mem_orch_profile.get('is_low_ram')))} "
+                        f"reserve_mb={float(mem_orch_profile.get('reserve_mb', 0.0)):.0f} "
+                        f"max_workers={int(mem_orch_profile.get('max_workers', 1))} "
+                        f"max_frames={int(mem_orch_profile.get('max_frames_per_pass', 16))} "
+                        f"max_chunk_mb={float(mem_orch_profile.get('max_chunk_mb', 256.0)):.1f}",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                except Exception:
+                    pass
+
                 min_frames_per_pass = max(8, int(getattr(zconfig, "phase3_runtime_min_frames_per_pass", 16)))
                 max_frames_per_pass = max(min_frames_per_pass, int(getattr(zconfig, "phase3_runtime_max_frames_per_pass", runtime_working_set_limit.get("winsor_frames_per_pass", 256))))
                 min_cpu_rows = max(32, int(getattr(zconfig, "phase3_runtime_min_cpu_rows_per_chunk", 96)))
                 min_gpu_rows = max(16, int(getattr(zconfig, "phase3_runtime_min_gpu_rows_per_chunk", 64)))
                 min_chunk_mb = max(32.0, float(getattr(zconfig, "phase3_runtime_min_max_chunk_mb", 256.0)))
 
+                mem_orch_max_workers = max(1, int(mem_orch_profile.get("max_workers", int(actual_num_workers_ph3))))
+                mem_orch_max_cache_slots = max(1, int(mem_orch_profile.get("max_cache_slots", default_cache_slots)))
+                mem_orch_max_frames = max(min_frames_per_pass, int(mem_orch_profile.get("max_frames_per_pass", max_frames_per_pass)))
+                mem_orch_max_cpu_rows = max(min_cpu_rows, int(mem_orch_profile.get("max_cpu_rows_per_chunk", 2048)))
+                mem_orch_max_gpu_rows = max(min_gpu_rows, int(mem_orch_profile.get("max_gpu_rows_per_chunk", 1024)))
+                mem_orch_max_chunk_mb = max(min_chunk_mb, float(mem_orch_profile.get("max_chunk_mb", 4096.0)))
+                mem_orch_reserve_mb = max(384.0, float(mem_orch_profile.get("reserve_mb", 1024.0)))
+
+                max_frames_per_pass = min(max_frames_per_pass, mem_orch_max_frames)
+
                 ram_level = 0
                 last_change_t = 0.0
                 change_times: list[float] = []
+                mem_orch_guard_active = False
 
                 last_io = None
                 last_t = None
@@ -25240,8 +25500,9 @@ def run_hierarchical_mosaic_classic_legacy(
                             ram_cap = max(1, int(math.ceil(int(actual_num_workers_ph3) * 0.5)))
                             new_ph3_limit = min(new_ph3_limit, ram_cap)
 
+                    new_ph3_limit = min(int(new_ph3_limit), int(mem_orch_max_workers))
                     new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
-                    new_cache_slots = max(1, int(new_cache_slots))
+                    new_cache_slots = max(1, min(int(new_cache_slots), int(mem_orch_max_cache_slots)))
 
                     if ram_level >= 2:
                         new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.70)))
@@ -25268,11 +25529,45 @@ def run_hierarchical_mosaic_classic_legacy(
                     elif ram_level <= 0:
                         new_frames_per_pass = min(max_frames_per_pass, max(min_frames_per_pass, int(math.ceil(float(new_frames_per_pass) * 1.10))))
                         if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
-                            new_cpu_rows = min(2048, max(min_cpu_rows, int(math.ceil(float(new_cpu_rows) * 1.10))))
+                            new_cpu_rows = min(mem_orch_max_cpu_rows, max(min_cpu_rows, int(math.ceil(float(new_cpu_rows) * 1.10))))
                         if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
-                            new_gpu_rows = min(1024, max(min_gpu_rows, int(math.ceil(float(new_gpu_rows) * 1.10))))
+                            new_gpu_rows = min(mem_orch_max_gpu_rows, max(min_gpu_rows, int(math.ceil(float(new_gpu_rows) * 1.10))))
                         if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
-                            new_max_chunk_mb = min(4096.0, max(min_chunk_mb, float(new_max_chunk_mb) * 1.10))
+                            new_max_chunk_mb = min(mem_orch_max_chunk_mb, max(min_chunk_mb, float(new_max_chunk_mb) * 1.10))
+
+                    # Hard reserve guard: avoid OS OOM kill on low-memory hosts.
+                    if ram_available_mb is not None and ram_available_mb < mem_orch_reserve_mb:
+                        new_ph3_limit = 1
+                        new_cache_slots = 1
+                        new_frames_per_pass = max(min_frames_per_pass, min(int(new_frames_per_pass), int(math.floor(float(cur_frames_per_pass) * 0.80))))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, min(int(new_cpu_rows), int(math.floor(float(new_cpu_rows) * 0.80))))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, min(int(new_gpu_rows), int(math.floor(float(new_gpu_rows) * 0.80))))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, min(float(new_max_chunk_mb), float(new_max_chunk_mb) * 0.80))
+                        if not mem_orch_guard_active:
+                            try:
+                                pcb(
+                                    "MEM_ORCH_GUARD: reserve_enter "
+                                    f"ram_avail_mb={ram_available_mb:.0f} reserve_mb={mem_orch_reserve_mb:.0f}",
+                                    prog=None,
+                                    lvl="WARN",
+                                )
+                            except Exception:
+                                pass
+                            mem_orch_guard_active = True
+                    elif mem_orch_guard_active:
+                        try:
+                            pcb(
+                                "MEM_ORCH_GUARD: reserve_exit "
+                                f"ram_avail_mb={ram_available_mb if ram_available_mb is not None else 'n/a'} reserve_mb={mem_orch_reserve_mb:.0f}",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                            )
+                        except Exception:
+                            pass
+                        mem_orch_guard_active = False
 
                     budget_change_blocked_reason = None
                     if new_ph3_limit != current_ph3_limit:
@@ -27529,6 +27824,34 @@ def run_hierarchical_mosaic_classic_legacy(
     gc.collect(); _log_memory_usage(progress_callback, "Fin Run Hierarchical Mosaic (après GC final)")
     _log_alignment_warning_summary()
     telemetry.close()
+    try:
+        vm_end = psutil.virtual_memory()
+        sm_end = psutil.swap_memory()
+        total_ram_gb_end = float(getattr(vm_end, "total", 0.0)) / (1024.0 ** 3)
+        swap_total_gb_end = float(getattr(sm_end, "total", 0.0)) / (1024.0 ** 3)
+        mem_orch_global_end = _memory_orchestrator_profile(total_ram_gb_end, swap_total_gb_end, zconfig=zconfig if 'zconfig' in locals() else None)
+        mem_orch_p3_end = _phase3_memory_orchestrator_profile(total_ram_gb_end, swap_total_gb_end, zconfig=zconfig if 'zconfig' in locals() else None)
+        report_payload = {
+            "schema": "zemosaic.memory_orchestrator_report.v1",
+            "generated_utc": datetime.utcnow().isoformat() + "Z",
+            "run_output_folder": output_folder,
+            "duration_s": float(total_duration_sec),
+            "global_profile": mem_orch_global_end,
+            "phase3_profile": mem_orch_p3_end,
+            "applied_caps": {
+                "winsor_worker_limit": int(locals().get("winsor_worker_limit", 0) or 0),
+                "winsor_max_frames_per_pass": int(locals().get("winsor_max_frames_per_pass", 0) or 0),
+                "assembly_process_workers": int(locals().get("assembly_process_workers_config", 0) or 0),
+                "effective_base_workers": int(locals().get("effective_base_workers", 0) or 0),
+            },
+            "notes": [
+                "Initial unified memory orchestrator report (lot 3).",
+                "Cross-phase hard caps + Phase 3 runtime guard active when configured.",
+            ],
+        }
+        _write_memory_orchestrator_report(output_folder, report_payload, logger=logger, progress_callback=progress_callback)
+    except Exception:
+        pass
     logger.info(f"===== Run Hierarchical Mosaic COMPLETED in {total_duration_sec:.2f}s =====")
 ################################################################################
 ################################################################################
@@ -28969,6 +29292,25 @@ def run_hierarchical_mosaic(
         num_total_raw_files,
         DEFAULT_PHASE_WORKER_RATIO,
     )
+    try:
+        vm_orch = psutil.virtual_memory()
+        sm_orch = psutil.swap_memory()
+        mem_orch_global = _memory_orchestrator_profile(
+            float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+            float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+            zconfig=zconfig,
+        )
+        hard_base = max(1, int(mem_orch_global.get("max_base_workers", actual_num_workers_ph1)))
+        prev_ph1 = int(actual_num_workers_ph1)
+        actual_num_workers_ph1 = max(1, min(int(actual_num_workers_ph1), hard_base))
+        if actual_num_workers_ph1 != prev_ph1:
+            pcb(
+                f"MEM_ORCH_PHASE1: workers_cap {prev_ph1}->{actual_num_workers_ph1} class={mem_orch_global.get('class')}",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
+    except Exception:
+        pass
     pcb(
         f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
         prog=None,
@@ -29649,6 +29991,32 @@ def run_hierarchical_mosaic(
         candidate = winsor_worker_limit_cfg
     winsor_worker_limit = max(1, min(int(candidate), cpu_total))
     winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
+    try:
+        vm_orch = psutil.virtual_memory()
+        sm_orch = psutil.swap_memory()
+        mem_orch_global = _memory_orchestrator_profile(
+            float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+            float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+            zconfig=zconfig,
+        )
+        prev_winsor_workers = int(winsor_worker_limit)
+        prev_winsor_frames = int(winsor_max_frames_per_pass)
+        winsor_worker_limit = max(1, min(int(winsor_worker_limit), int(mem_orch_global.get("max_winsor_workers", winsor_worker_limit))))
+        if winsor_max_frames_per_pass <= 0:
+            winsor_max_frames_per_pass = int(mem_orch_global.get("max_winsor_frames", 0))
+        else:
+            winsor_max_frames_per_pass = max(8, min(int(winsor_max_frames_per_pass), int(mem_orch_global.get("max_winsor_frames", winsor_max_frames_per_pass))))
+        if winsor_worker_limit != prev_winsor_workers or winsor_max_frames_per_pass != prev_winsor_frames:
+            pcb(
+                "MEM_ORCH_WINSOR: "
+                f"workers {prev_winsor_workers}->{winsor_worker_limit} "
+                f"frames {prev_winsor_frames}->{winsor_max_frames_per_pass} "
+                f"class={mem_orch_global.get('class')}",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
+    except Exception:
+        pass
     global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
     global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
     global_wcs_plan["use_align_helpers"] = True
@@ -30672,15 +31040,45 @@ def run_hierarchical_mosaic(
                 except Exception:
                     pass
 
+                mem_orch_profile = _phase3_memory_orchestrator_profile(
+                    float(auto_profile.get("total_ram_gb") or 0.0),
+                    float(auto_profile.get("swap_total_gb") or 0.0),
+                    zconfig=zconfig,
+                )
+                try:
+                    pcb(
+                        "MEM_ORCH_PROFILE: "
+                        f"low_ram={int(bool(mem_orch_profile.get('is_low_ram')))} "
+                        f"reserve_mb={float(mem_orch_profile.get('reserve_mb', 0.0)):.0f} "
+                        f"max_workers={int(mem_orch_profile.get('max_workers', 1))} "
+                        f"max_frames={int(mem_orch_profile.get('max_frames_per_pass', 16))} "
+                        f"max_chunk_mb={float(mem_orch_profile.get('max_chunk_mb', 256.0)):.1f}",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                except Exception:
+                    pass
+
                 min_frames_per_pass = max(8, int(getattr(zconfig, "phase3_runtime_min_frames_per_pass", 16)))
                 max_frames_per_pass = max(min_frames_per_pass, int(getattr(zconfig, "phase3_runtime_max_frames_per_pass", runtime_working_set_limit.get("winsor_frames_per_pass", 256))))
                 min_cpu_rows = max(32, int(getattr(zconfig, "phase3_runtime_min_cpu_rows_per_chunk", 96)))
                 min_gpu_rows = max(16, int(getattr(zconfig, "phase3_runtime_min_gpu_rows_per_chunk", 64)))
                 min_chunk_mb = max(32.0, float(getattr(zconfig, "phase3_runtime_min_max_chunk_mb", 256.0)))
 
+                mem_orch_max_workers = max(1, int(mem_orch_profile.get("max_workers", int(actual_num_workers_ph3))))
+                mem_orch_max_cache_slots = max(1, int(mem_orch_profile.get("max_cache_slots", default_cache_slots)))
+                mem_orch_max_frames = max(min_frames_per_pass, int(mem_orch_profile.get("max_frames_per_pass", max_frames_per_pass)))
+                mem_orch_max_cpu_rows = max(min_cpu_rows, int(mem_orch_profile.get("max_cpu_rows_per_chunk", 2048)))
+                mem_orch_max_gpu_rows = max(min_gpu_rows, int(mem_orch_profile.get("max_gpu_rows_per_chunk", 1024)))
+                mem_orch_max_chunk_mb = max(min_chunk_mb, float(mem_orch_profile.get("max_chunk_mb", 4096.0)))
+                mem_orch_reserve_mb = max(384.0, float(mem_orch_profile.get("reserve_mb", 1024.0)))
+
+                max_frames_per_pass = min(max_frames_per_pass, mem_orch_max_frames)
+
                 ram_level = 0
                 last_change_t = 0.0
                 change_times: list[float] = []
+                mem_orch_guard_active = False
 
                 last_io = None
                 last_t = None
@@ -30789,8 +31187,9 @@ def run_hierarchical_mosaic(
                             ram_cap = max(1, int(math.ceil(int(actual_num_workers_ph3) * 0.5)))
                             new_ph3_limit = min(new_ph3_limit, ram_cap)
 
+                    new_ph3_limit = min(int(new_ph3_limit), int(mem_orch_max_workers))
                     new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
-                    new_cache_slots = max(1, int(new_cache_slots))
+                    new_cache_slots = max(1, min(int(new_cache_slots), int(mem_orch_max_cache_slots)))
 
                     if ram_level >= 2:
                         new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.70)))
@@ -30817,11 +31216,45 @@ def run_hierarchical_mosaic(
                     elif ram_level <= 0:
                         new_frames_per_pass = min(max_frames_per_pass, max(min_frames_per_pass, int(math.ceil(float(new_frames_per_pass) * 1.10))))
                         if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
-                            new_cpu_rows = min(2048, max(min_cpu_rows, int(math.ceil(float(new_cpu_rows) * 1.10))))
+                            new_cpu_rows = min(mem_orch_max_cpu_rows, max(min_cpu_rows, int(math.ceil(float(new_cpu_rows) * 1.10))))
                         if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
-                            new_gpu_rows = min(1024, max(min_gpu_rows, int(math.ceil(float(new_gpu_rows) * 1.10))))
+                            new_gpu_rows = min(mem_orch_max_gpu_rows, max(min_gpu_rows, int(math.ceil(float(new_gpu_rows) * 1.10))))
                         if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
-                            new_max_chunk_mb = min(4096.0, max(min_chunk_mb, float(new_max_chunk_mb) * 1.10))
+                            new_max_chunk_mb = min(mem_orch_max_chunk_mb, max(min_chunk_mb, float(new_max_chunk_mb) * 1.10))
+
+                    # Hard reserve guard: avoid OS OOM kill on low-memory hosts.
+                    if ram_available_mb is not None and ram_available_mb < mem_orch_reserve_mb:
+                        new_ph3_limit = 1
+                        new_cache_slots = 1
+                        new_frames_per_pass = max(min_frames_per_pass, min(int(new_frames_per_pass), int(math.floor(float(cur_frames_per_pass) * 0.80))))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, min(int(new_cpu_rows), int(math.floor(float(new_cpu_rows) * 0.80))))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, min(int(new_gpu_rows), int(math.floor(float(new_gpu_rows) * 0.80))))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, min(float(new_max_chunk_mb), float(new_max_chunk_mb) * 0.80))
+                        if not mem_orch_guard_active:
+                            try:
+                                pcb(
+                                    "MEM_ORCH_GUARD: reserve_enter "
+                                    f"ram_avail_mb={ram_available_mb:.0f} reserve_mb={mem_orch_reserve_mb:.0f}",
+                                    prog=None,
+                                    lvl="WARN",
+                                )
+                            except Exception:
+                                pass
+                            mem_orch_guard_active = True
+                    elif mem_orch_guard_active:
+                        try:
+                            pcb(
+                                "MEM_ORCH_GUARD: reserve_exit "
+                                f"ram_avail_mb={ram_available_mb if ram_available_mb is not None else 'n/a'} reserve_mb={mem_orch_reserve_mb:.0f}",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                            )
+                        except Exception:
+                            pass
+                        mem_orch_guard_active = False
 
                     budget_change_blocked_reason = None
                     if new_ph3_limit != current_ph3_limit:
@@ -32643,6 +33076,34 @@ def run_hierarchical_mosaic(
     gc.collect(); _log_memory_usage(progress_callback, "Fin Run Hierarchical Mosaic (après GC final)")
     _log_alignment_warning_summary()
     telemetry.close()
+    try:
+        vm_end = psutil.virtual_memory()
+        sm_end = psutil.swap_memory()
+        total_ram_gb_end = float(getattr(vm_end, "total", 0.0)) / (1024.0 ** 3)
+        swap_total_gb_end = float(getattr(sm_end, "total", 0.0)) / (1024.0 ** 3)
+        mem_orch_global_end = _memory_orchestrator_profile(total_ram_gb_end, swap_total_gb_end, zconfig=zconfig if 'zconfig' in locals() else None)
+        mem_orch_p3_end = _phase3_memory_orchestrator_profile(total_ram_gb_end, swap_total_gb_end, zconfig=zconfig if 'zconfig' in locals() else None)
+        report_payload = {
+            "schema": "zemosaic.memory_orchestrator_report.v1",
+            "generated_utc": datetime.utcnow().isoformat() + "Z",
+            "run_output_folder": output_folder,
+            "duration_s": float(total_duration_sec),
+            "global_profile": mem_orch_global_end,
+            "phase3_profile": mem_orch_p3_end,
+            "applied_caps": {
+                "winsor_worker_limit": int(locals().get("winsor_worker_limit", 0) or 0),
+                "winsor_max_frames_per_pass": int(locals().get("winsor_max_frames_per_pass", 0) or 0),
+                "assembly_process_workers": int(locals().get("assembly_process_workers_config", 0) or 0),
+                "effective_base_workers": int(locals().get("effective_base_workers", 0) or 0),
+            },
+            "notes": [
+                "Initial unified memory orchestrator report (lot 3).",
+                "Cross-phase hard caps + Phase 3 runtime guard active when configured.",
+            ],
+        }
+        _write_memory_orchestrator_report(output_folder, report_payload, logger=logger, progress_callback=progress_callback)
+    except Exception:
+        pass
     logger.info(f"===== Run Hierarchical Mosaic COMPLETED in {total_duration_sec:.2f}s =====")
 ################################################################################
 ################################################################################

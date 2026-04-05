@@ -588,3 +588,23 @@ Consigne d'implémentation:
 - la finalisation doit repasser par la tuile logique d'origine,
 - éviter le passthrough brut d'un chunk comme sortie finale implicite,
 - nettoyer les artefacts internes après finalisation quand possible.
+
+## Addendum 2026-04-05 — P0 mission reorientation: unified memory orchestrator (all phases)
+
+Objectif prioritaire validé avec Tristan:
+- ZeMosaic doit rester opérationnel sur petites/anciennes machines (RAM/VRAM limitées),
+- avec un orchestrateur mémoire unifié couvrant **toutes les phases** (P1→P6),
+- et des garde-fous « hard caps » pour éviter les `exitcode=-9`/OOM kill.
+
+Principes produit:
+- adaptation mémoire = contrainte de sûreté, pas optimisation opportuniste uniquement;
+- budget global unique (RAM + VRAM) décliné en sous-budgets phase/task;
+- marges de sécurité explicites (OS + fragmentation + overhead libs);
+- comportement déterministe en low-RAM: réduction contrôlée de concurrence/chunks/passes,
+  sans casser la sémantique scientifique.
+
+Definition of done (P0):
+1) run Linux 8GB complet sans `Worker process terminated unexpectedly (exitcode=-9)`;
+2) logs explicites de budget hard-cap et raisons de refus d'escalade;
+3) contrôleur stabilisé (pas d'oscillation agressive post-décrue courte);
+4) non-régression de la règle single-tile identity pour les groupes extrêmes Phase 3.
