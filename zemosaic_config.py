@@ -325,6 +325,11 @@ DEFAULT_CONFIG = {
     "altaz_nanize": True,  # UI: "Alt-Az → NaN"
     "altaz_alpha_soft_threshold": 0.001,
     "altaz_nanize_threshold": 0.001,
+    # Policy for groups with unknown EQMODE markers:
+    # - auto: treat UNKNOWN as ALT_AZ only for Seestar-like datasets
+    # - on:   always treat UNKNOWN as ALT_AZ
+    # - off:  never treat UNKNOWN as ALT_AZ
+    "altaz_unknown_policy": "auto",
     # --- Alt-Az coverage-based mask (Master Tiles) ---
     "altaz_min_coverage_abs": 3.0,
     "altaz_min_coverage_frac": 0.5,

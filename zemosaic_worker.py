@@ -15255,10 +15255,10 @@ def create_master_tile(
                 quality_crop_k_sigma,
                 quality_crop_margin_px,
                 quality_crop_min_run,
-                False,
+                bool(altaz_cleanup_enabled_effective),
                 altaz_margin_percent,
                 altaz_decay,
-                False,
+                bool(altaz_nanize),
                 False,
                 quality_gate_threshold,
                 quality_gate_edge_band_px,
@@ -15422,10 +15422,10 @@ def create_master_tile(
                 quality_crop_k_sigma,
                 quality_crop_margin_px,
                 quality_crop_min_run,
-                False,
+                bool(altaz_cleanup_enabled_effective),
                 altaz_margin_percent,
                 altaz_decay,
-                False,
+                bool(altaz_nanize),
                 False,
                 quality_gate_threshold,
                 quality_gate_edge_band_px,
@@ -26354,12 +26354,29 @@ def run_hierarchical_mosaic_classic_legacy(
                     phase3_tile_nframes[assigned_tile_id] = 0
                 phase3_tile_start_monotonic[assigned_tile_id] = time.monotonic()
                 group_eqmode = _infer_group_eqmode(group_info_list)
-                altaz_cleanup_for_tile = bool(altaz_cleanup_effective_flag) and (group_eqmode == "ALT_AZ")
+                unknown_policy = str(getattr(zconfig, "altaz_unknown_policy", "auto") or "auto").strip().lower()
+                if unknown_policy not in ("auto", "on", "off"):
+                    unknown_policy = "auto"
+                seestar_hint = False
+                try:
+                    seestar_hint = any(_entry_is_seestar(entry) for entry in (group_info_list or []))
+                except Exception:
+                    seestar_hint = False
+                unknown_as_altaz = False
+                if group_eqmode == "UNKNOWN":
+                    if unknown_policy == "on":
+                        unknown_as_altaz = True
+                    elif unknown_policy == "auto":
+                        unknown_as_altaz = bool(seestar_hint)
+                altaz_cleanup_for_tile = bool(altaz_cleanup_effective_flag) and (
+                    group_eqmode == "ALT_AZ" or unknown_as_altaz
+                )
                 try:
                     pcb(
                         f"P3_ALTaz_GATING: tile_id={assigned_tile_id} "
                         f"eqmode={group_eqmode} global_enabled={bool(altaz_cleanup_effective_flag)} "
-                        f"=> tile_enabled={altaz_cleanup_for_tile}",
+                        f"unknown_policy={unknown_policy} seestar_hint={bool(seestar_hint)} "
+                        f"unknown_as_altaz={bool(unknown_as_altaz)} => tile_enabled={altaz_cleanup_for_tile}",
                         prog=None,
                         lvl="DEBUG_DETAIL",
                     )
@@ -32037,12 +32054,29 @@ def run_hierarchical_mosaic(
                     phase3_tile_nframes[assigned_tile_id] = 0
                 phase3_tile_start_monotonic[assigned_tile_id] = time.monotonic()
                 group_eqmode = _infer_group_eqmode(group_info_list)
-                altaz_cleanup_for_tile = bool(altaz_cleanup_enabled_config) and (group_eqmode == "ALT_AZ")
+                unknown_policy = str(getattr(zconfig, "altaz_unknown_policy", "auto") or "auto").strip().lower()
+                if unknown_policy not in ("auto", "on", "off"):
+                    unknown_policy = "auto"
+                seestar_hint = False
+                try:
+                    seestar_hint = any(_entry_is_seestar(entry) for entry in (group_info_list or []))
+                except Exception:
+                    seestar_hint = False
+                unknown_as_altaz = False
+                if group_eqmode == "UNKNOWN":
+                    if unknown_policy == "on":
+                        unknown_as_altaz = True
+                    elif unknown_policy == "auto":
+                        unknown_as_altaz = bool(seestar_hint)
+                altaz_cleanup_for_tile = bool(altaz_cleanup_enabled_config) and (
+                    group_eqmode == "ALT_AZ" or unknown_as_altaz
+                )
                 try:
                     pcb(
                         f"P3_ALTaz_GATING: tile_id={assigned_tile_id} "
                         f"eqmode={group_eqmode} global_enabled={bool(altaz_cleanup_enabled_config)} "
-                        f"=> tile_enabled={altaz_cleanup_for_tile}",
+                        f"unknown_policy={unknown_policy} seestar_hint={bool(seestar_hint)} "
+                        f"unknown_as_altaz={bool(unknown_as_altaz)} => tile_enabled={altaz_cleanup_for_tile}",
                         prog=None,
                         lvl="DEBUG_DETAIL",
                     )
