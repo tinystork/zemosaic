@@ -15128,10 +15128,47 @@ def create_master_tile(
 
     if internal_chunk_enabled:
         total_raw = int(len(seestar_stack_group_info or []))
-        chunks = [
-            seestar_stack_group_info[i:i + internal_chunk_size]
-            for i in range(0, total_raw, internal_chunk_size)
-        ]
+
+        # Keep split chunks mode-homogeneous when possible (EQ vs ALT_AZ vs UNKNOWN)
+        # to avoid pathological chunk degradation on mixed-mount groups.
+        mode_buckets: dict[str, list[dict]] = {"EQ": [], "ALT_AZ": [], "UNKNOWN": []}
+        for _entry in seestar_stack_group_info or []:
+            try:
+                _mode = _infer_group_eqmode([_entry])
+            except Exception:
+                _mode = "UNKNOWN"
+            if _mode not in mode_buckets:
+                _mode = "UNKNOWN"
+            mode_buckets[_mode].append(_entry)
+
+        non_empty_modes = [m for m in ("EQ", "ALT_AZ", "UNKNOWN") if mode_buckets.get(m)]
+        chunks: list[list[dict]] = []
+        if len(non_empty_modes) > 1:
+            for _mode in ("EQ", "ALT_AZ", "UNKNOWN"):
+                _items = mode_buckets.get(_mode) or []
+                if not _items:
+                    continue
+                for i in range(0, len(_items), internal_chunk_size):
+                    _chunk = _items[i:i + internal_chunk_size]
+                    if _chunk:
+                        chunks.append(_chunk)
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_MODE_MIXED_EQMODE",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                eq_count=int(len(mode_buckets.get("EQ") or [])),
+                altaz_count=int(len(mode_buckets.get("ALT_AZ") or [])),
+                unknown_count=int(len(mode_buckets.get("UNKNOWN") or [])),
+                chunk_size=int(internal_chunk_size),
+                chunks=int(len(chunks)),
+                strategy="mode_homogeneous",
+            )
+        else:
+            chunks = [
+                seestar_stack_group_info[i:i + internal_chunk_size]
+                for i in range(0, total_raw, internal_chunk_size)
+            ]
         chunks = [c for c in chunks if c]
         pcb_tile(
             "P3_INTERNAL_CHUNK_MODE",
@@ -15273,6 +15310,83 @@ def create_master_tile(
                     remove_split_fits=True,
                 )
             return (final_path, final_wcs), final_retries
+
+        canonical_master_tile_path = Path(output_temp_dir) / f"master_tile_{int(tile_id):03d}.fits"
+
+        def _promote_chunk_output_to_canonical(
+            info_obj: dict | None,
+            *,
+            reason: str,
+        ) -> tuple[str | None, Any]:
+            """Ensure split fallback output is materialized as canonical master_tile_<tile_id>.fits."""
+            if not isinstance(info_obj, dict):
+                return None, None
+            src_obj = info_obj.get("path_raw")
+            if not src_obj:
+                return None, None
+            src_path = Path(str(src_obj))
+            if not src_path.exists():
+                return None, None
+
+            dst_path = canonical_master_tile_path
+            wcs_out = info_obj.get("wcs")
+            try:
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                if str(src_path.resolve()) != str(dst_path.resolve()):
+                    try:
+                        if dst_path.exists():
+                            dst_path.unlink()
+                    except Exception:
+                        pass
+                    shutil.copy2(str(src_path), str(dst_path))
+                dst_final = str(dst_path)
+            except Exception as exc_promote:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_CANONICALIZE_FAIL",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    reason=str(reason),
+                    error=str(exc_promote),
+                )
+                return str(src_path), wcs_out
+
+            if wcs_out is None:
+                try:
+                    hdr_dst = fits.getheader(dst_final, 0)
+                    ok_dst, wcs_dst, _reason_dst = zemosaic_utils.validate_wcs_header(
+                        hdr_dst,
+                        require_footprint=False,
+                    )
+                    if ok_dst and wcs_dst is not None:
+                        wcs_out = wcs_dst
+                except Exception:
+                    pass
+
+            try:
+                _register_master_tile_identity(dst_final, f"tile:{int(tile_id):04d}")
+            except Exception:
+                _register_master_tile_identity(dst_final, tile_id)
+
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_CANONICALIZED",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                reason=str(reason),
+                src=_safe_basename(str(src_path)),
+                dst=_safe_basename(dst_final),
+            )
+
+            try:
+                _cleanup_internal_chunk_artifacts(
+                    preserve_paths={str(dst_final)},
+                    remove_split_fits=True,
+                )
+            except Exception:
+                pass
+
+            return dst_final, wcs_out
 
         for ci, chunk_group in enumerate(chunks, start=1):
             chunk_tile_id = int(tile_id) * 1000 + int(ci)
@@ -15460,6 +15574,12 @@ def create_master_tile(
             if single_retries:
                 nested_retries.extend(single_retries)
             if single_path and single_wcs is not None:
+                canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                    {"path_raw": single_path, "wcs": single_wcs},
+                    reason="single_valid_chunk_finalize",
+                )
+                if canonical_path and canonical_wcs is not None:
+                    return (canonical_path, canonical_wcs), nested_retries
                 return (single_path, single_wcs), nested_retries
             only = synthetic_infos[0]
             pcb_tile(
@@ -15469,6 +15589,12 @@ def create_master_tile(
                 tile_id=int(tile_id),
                 reason="identity_finalize_failed",
             )
+            canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                only,
+                reason="single_valid_chunk_degraded",
+            )
+            if canonical_path and canonical_wcs is not None:
+                return (canonical_path, canonical_wcs), nested_retries
             return (only.get("path_raw"), only.get("wcs")), nested_retries
 
         pcb_tile(
@@ -15489,6 +15615,12 @@ def create_master_tile(
             nested_retries.extend(merge_retries)
 
         if merged_path and merged_wcs is not None:
+            canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                {"path_raw": merged_path, "wcs": merged_wcs},
+                reason="merge_finalize",
+            )
+            if canonical_path and canonical_wcs is not None:
+                return (canonical_path, canonical_wcs), nested_retries
             return (merged_path, merged_wcs), nested_retries
 
         try:
@@ -15519,7 +15651,19 @@ def create_master_tile(
                 if fallback_retries:
                     nested_retries.extend(fallback_retries)
                 if fallback_path and fallback_wcs is not None:
+                    canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                        {"path_raw": fallback_path, "wcs": fallback_wcs},
+                        reason="fallback_best_finalize",
+                    )
+                    if canonical_path and canonical_wcs is not None:
+                        return (canonical_path, canonical_wcs), nested_retries
                     return (fallback_path, fallback_wcs), nested_retries
+            canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                best_info if isinstance(best_info, dict) else {"path_raw": best_path, "wcs": best_wcs},
+                reason="fallback_best_raw",
+            )
+            if canonical_path and canonical_wcs is not None:
+                return (canonical_path, canonical_wcs), nested_retries
             return (best_path, best_wcs), nested_retries
         except Exception:
             return (None, None), nested_retries

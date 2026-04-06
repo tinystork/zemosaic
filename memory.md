@@ -3794,3 +3794,28 @@ Objectif de ce lot: limiter les montées agressives du working set sur petites m
 - Couvre les deux chemins de run (`run_hierarchical_mosaic_classic_legacy` et `run_hierarchical_mosaic`).
 
 Note: la timeline détaillée décision par décision reste à enrichir dans une itération dédiée.
+
+
+## 2026-04-06 — Split Phase 3: canonical single-tile identity hardening + mixed EQ/ALT_AZ guard
+
+Contexte terrain (run Windows validé):
+- un cas split extrême (`tile 37`) finissait en `P3_INTERNAL_CHUNK_PASSTHROUGH (single_valid_chunk)` avec fuite d'identité (`tile:37013` dans `tile_weights_final.csv`/`winner_index.csv`) au lieu de `tile:0037`.
+
+Correctif 1 (identité canonique forcée):
+- ajout d'une promotion canonique post-split (`_promote_chunk_output_to_canonical`) pour tous les chemins dégradés:
+  - `single_valid_chunk`
+  - `fallback_best_chunk`
+  - retour merge/fallback vers chunk
+- sortie toujours matérialisée en `master_tile_<tile_id>.fits` (ex: `master_tile_037.fits`) + enregistrement identité `tile:0037`.
+- logs ajoutés:
+  - `P3_INTERNAL_CHUNK_CANONICALIZED`
+  - `P3_INTERNAL_CHUNK_CANONICALIZE_FAIL`
+
+Correctif 2 (prévention chunks dégradés sur groupes mixtes):
+- au split interne, détection des modes monture par frame (`EQ` / `ALT_AZ` / `UNKNOWN`) via `_infer_group_eqmode`.
+- si groupe mixte, chunking désormais *mode-homogeneous* (pas de mélange EQ+ALT_AZ dans un même chunk).
+- log ajouté:
+  - `P3_INTERNAL_CHUNK_MODE_MIXED_EQMODE` (counts EQ/ALT_AZ/UNKNOWN + stratégie)
+
+Sanity:
+- `python3 -m py_compile zemosaic_worker.py` ✅
