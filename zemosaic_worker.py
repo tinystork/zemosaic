@@ -14033,20 +14033,36 @@ def get_wcs_and_pretreat_raw_file(
         _pcb_local(skip_msg, lvl="INFO")
         logger.info(skip_msg)
     if wcs_brute is None and ASTROPY_AVAILABLE and WCS: # S'assurer que WCS est bien l'objet d'Astropy
-        try:
-            wcs_from_header = WCS(header_orig, naxis=2, relax=True) # Utiliser WCS d'Astropy
-            if wcs_from_header.is_celestial and hasattr(wcs_from_header.wcs,'crval') and \
-               (hasattr(wcs_from_header.wcs,'cdelt') or hasattr(wcs_from_header.wcs,'cd') or hasattr(wcs_from_header.wcs,'pc')):
-                wcs_brute = wcs_from_header
-                _pcb_local(f"    WCS trouvé dans header FITS de '{filename}'.", lvl="DEBUG_DETAIL")
-                skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
-                _pcb_local(skip_msg, lvl="INFO")
-                logger.info(skip_msg)
-                # WCS déjà présent => pas besoin de réécrire le header
-                should_write_header_back = False
-        except Exception as e_wcs_hdr:
-            _pcb_local("getwcs_warn_header_wcs_read_failed", lvl="WARN", filename=filename, error=str(e_wcs_hdr))
-            wcs_brute = None
+        # Important: if strict WCS validation already rejected the header,
+        # do NOT re-accept it here via permissive Astropy parsing.
+        # Otherwise we can end up with contradictory logs:
+        # "Existing WCS rejected" followed by "Skip WCS solve (WCS present)".
+        if wcs_validation_reason:
+            _pcb_local(
+                "getwcs_info_header_wcs_not_reused_after_reject",
+                lvl="DEBUG_DETAIL",
+                filename=filename,
+                reason=wcs_validation_reason,
+            )
+            logger.debug(
+                "Header WCS not reused for '%s' after strict rejection (%s).",
+                filename,
+                wcs_validation_reason,
+            )
+        else:
+            try:
+                wcs_from_header = WCS(header_orig, naxis=2, relax=True) # Utiliser WCS d'Astropy
+                if wcs_from_header.is_celestial and hasattr(wcs_from_header.wcs,'crval') and                    (hasattr(wcs_from_header.wcs,'cdelt') or hasattr(wcs_from_header.wcs,'cd') or hasattr(wcs_from_header.wcs,'pc')):
+                    wcs_brute = wcs_from_header
+                    _pcb_local(f"    WCS trouvé dans header FITS de '{filename}'.", lvl="DEBUG_DETAIL")
+                    skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
+                    _pcb_local(skip_msg, lvl="INFO")
+                    logger.info(skip_msg)
+                    # WCS déjà présent => pas besoin de réécrire le header
+                    should_write_header_back = False
+            except Exception as e_wcs_hdr:
+                _pcb_local("getwcs_warn_header_wcs_read_failed", lvl="WARN", filename=filename, error=str(e_wcs_hdr))
+                wcs_brute = None
             
     solver_choice_effective = (solver_settings or {}).get("solver_choice", "ASTAP")
     api_key_len = len((solver_settings or {}).get("api_key", ""))
@@ -16927,8 +16943,123 @@ def create_master_tile(
             alpha_mask=alpha_mask_out,
         )
 
+        # Post-save WCS hardening (important for "Use existing master tiles").
+        # Validate on-disk header and attempt a surgical repair if needed.
+        validated_saved_wcs = wcs_for_master_tile
+        try:
+            header_saved_mt = fits.getheader(str(temp_fits_path), 0)
+            ok_saved_mt, wcs_saved_mt, reason_saved_mt = zemosaic_utils.validate_wcs_header(
+                header_saved_mt,
+                require_footprint=True,
+            )
+        except Exception as exc_saved_mt:
+            ok_saved_mt, wcs_saved_mt, reason_saved_mt = False, None, f"postsave_validate_exception: {exc_saved_mt}"
+
+        if not ok_saved_mt:
+            pcb_tile(
+                "mastertile_warn_postsave_wcs_invalid",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                filename=_safe_basename(str(temp_fits_path)),
+                reason=str(reason_saved_mt),
+            )
+            logger.warning(
+                "[MT_WCS_HARDEN] tile=%s invalid on-disk WCS after save: %s (%s)",
+                tile_id,
+                _safe_basename(str(temp_fits_path)),
+                reason_saved_mt,
+            )
+
+            try:
+                if wcs_for_master_tile is not None and hasattr(wcs_for_master_tile, "to_header"):
+                    wcs_hdr_repair = wcs_for_master_tile.to_header(relax=True)
+                    with fits.open(str(temp_fits_path), mode="update", memmap=False) as hdul_mt_repair:
+                        hdr_mt_repair = hdul_mt_repair[0].header
+
+                        purge_prefixes = (
+                            "CD", "PC", "PV", "CDELT", "CTYPE", "CUNIT",
+                            "CRPIX", "CRVAL", "WCSAXES", "LONPOLE", "LATPOLE",
+                            "RADESYS", "EQUINOX", "A_", "B_", "AP_", "BP_",
+                        )
+                        keys_to_drop = [
+                            key for key in list(hdr_mt_repair.keys())
+                            if any(str(key).startswith(pref) for pref in purge_prefixes)
+                        ]
+                        for key in keys_to_drop:
+                            try:
+                                del hdr_mt_repair[key]
+                            except Exception:
+                                pass
+
+                        try:
+                            hdr_mt_repair["WCSAXES"] = 2
+                        except Exception:
+                            pass
+                        try:
+                            hdr_mt_repair.update(wcs_hdr_repair)
+                        except Exception:
+                            for k in wcs_hdr_repair.keys():
+                                try:
+                                    hdr_mt_repair[k] = wcs_hdr_repair[k]
+                                except Exception:
+                                    continue
+                        hdul_mt_repair.flush(output_verify="fix")
+
+                    header_saved_mt2 = fits.getheader(str(temp_fits_path), 0)
+                    ok_saved_mt2, wcs_saved_mt2, reason_saved_mt2 = zemosaic_utils.validate_wcs_header(
+                        header_saved_mt2,
+                        require_footprint=True,
+                    )
+                    if ok_saved_mt2 and wcs_saved_mt2 is not None:
+                        validated_saved_wcs = wcs_saved_mt2
+                        pcb_tile(
+                            "mastertile_info_postsave_wcs_repaired",
+                            prog=None,
+                            lvl="WARN",
+                            tile_id=int(tile_id),
+                            filename=_safe_basename(str(temp_fits_path)),
+                        )
+                        logger.warning(
+                            "[MT_WCS_HARDEN] tile=%s WCS repaired on-disk (%s)",
+                            tile_id,
+                            _safe_basename(str(temp_fits_path)),
+                        )
+                    else:
+                        pcb_tile(
+                            "mastertile_error_postsave_wcs_repair_failed",
+                            prog=None,
+                            lvl="ERROR",
+                            tile_id=int(tile_id),
+                            filename=_safe_basename(str(temp_fits_path)),
+                            reason=str(reason_saved_mt2),
+                        )
+                        logger.error(
+                            "[MT_WCS_HARDEN] tile=%s WCS repair failed for %s: %s",
+                            tile_id,
+                            _safe_basename(str(temp_fits_path)),
+                            reason_saved_mt2,
+                        )
+            except Exception as exc_repair_mt:
+                pcb_tile(
+                    "mastertile_error_postsave_wcs_repair_exception",
+                    prog=None,
+                    lvl="ERROR",
+                    tile_id=int(tile_id),
+                    filename=_safe_basename(str(temp_fits_path)),
+                    error=str(exc_repair_mt),
+                )
+                logger.error(
+                    "[MT_WCS_HARDEN] tile=%s WCS repair exception for %s: %s",
+                    tile_id,
+                    _safe_basename(str(temp_fits_path)),
+                    exc_repair_mt,
+                )
+        elif wcs_saved_mt is not None:
+            validated_saved_wcs = wcs_saved_mt
+
         final_tile_path: Optional[str] = str(temp_fits_path)
-        final_wcs = wcs_for_master_tile
+        final_wcs = validated_saved_wcs
 
         if quality_gate_eval and quality_gate_eval.get("metrics"):
             metrics = quality_gate_eval.get("metrics") or {}
