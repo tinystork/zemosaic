@@ -3831,3 +3831,30 @@ Sanity:
 - UNKNOWN entries are no longer auto-injected into EQ/ALT_AZ majority groups.
 - Goal: robustness on heterogeneous datasets / degraded FITS headers / very large runs (e.g. 10k raws).
 - Sanity: `python3 -m py_compile zemosaic_filter_gui_qt.py` ✅
+
+
+## 2026-04-06 — Alt-Az strict overlap bbox crop (worker-side)
+
+- Implémentation d’un mode explicite de *strict overlap crop* pour master tiles Alt-Az, sans dénaturer `lecropper.py`.
+- Point d’insertion: `zemosaic_worker.py` juste après `_apply_lecropper_pipeline` (masque coverage-driven déjà calculé).
+- Comportement:
+  - source masque = `pipeline_alpha_mask` (fallback coverage normalisée si besoin),
+  - extraction du *high-confidence core* via seuil alpha,
+  - calcul bbox serré + padding,
+  - crop synchronisé de `master_tile_stacked_HWC`, `pipeline_alpha_mask`, `coverage_count_hw`,
+  - mise à jour WCS (`CRPIX`, `pixel_shape`, `array_shape`).
+- Garde-fous conservateurs pour edge tiles:
+  - `min_nonzero_frac` du core,
+  - `min_size_px` bbox,
+  - logs explicites en cas de skip.
+- Nouvelles clés config (`zemosaic_config.py`):
+  - `altaz_strict_overlap_crop_enabled` (True)
+  - `altaz_strict_overlap_crop_alpha_threshold` (0.02)
+  - `altaz_strict_overlap_crop_min_nonzero_frac` (0.08)
+  - `altaz_strict_overlap_crop_bbox_pad_px` (6)
+  - `altaz_strict_overlap_crop_min_size_px` (256)
+- Observabilité:
+  - `MT_ALTAZ_STRICT_CROP_APPLIED`
+  - `MT_ALTAZ_STRICT_CROP_SKIPPED` (+ reason)
+- Sanity compile OK:
+  - `python3 -m py_compile zemosaic_worker.py zemosaic_config.py`

@@ -329,6 +329,13 @@ DEFAULT_CONFIG = {
     "altaz_min_coverage_abs": 3.0,
     "altaz_min_coverage_frac": 0.5,
     "altaz_morph_open_px": 3,
+    # --- Alt-Az strict overlap crop (Master Tiles) ---
+    # Crops Alt-Az master tiles to the high-confidence core bbox from coverage-driven alpha.
+    "altaz_strict_overlap_crop_enabled": True,
+    "altaz_strict_overlap_crop_alpha_threshold": 0.02,
+    "altaz_strict_overlap_crop_min_nonzero_frac": 0.08,
+    "altaz_strict_overlap_crop_bbox_pad_px": 6,
+    "altaz_strict_overlap_crop_min_size_px": 256,
     # --- Alt-Az Alpha export ---
     "altaz_export_alpha_fits": True,
     "altaz_export_alpha_sidecar": False,

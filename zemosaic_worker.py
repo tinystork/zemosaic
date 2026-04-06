@@ -16600,6 +16600,182 @@ def create_master_tile(
         )
         lecropper_applied = True
 
+    def _apply_master_tile_rect_crop(y0: int, x0: int, y1: int, x1: int, *, reason: str) -> bool:
+        nonlocal master_tile_stacked_HWC, pipeline_alpha_mask, coverage_count_hw, wcs_for_master_tile
+        try:
+            if master_tile_stacked_HWC is None:
+                return False
+            h0, w0 = master_tile_stacked_HWC.shape[:2]
+            y0_i = int(max(0, min(y0, h0 - 1)))
+            y1_i = int(max(y0_i + 1, min(y1, h0)))
+            x0_i = int(max(0, min(x0, w0 - 1)))
+            x1_i = int(max(x0_i + 1, min(x1, w0)))
+            if y0_i <= 0 and x0_i <= 0 and y1_i >= h0 and x1_i >= w0:
+                return False
+
+            master_tile_stacked_HWC = master_tile_stacked_HWC[y0_i:y1_i, x0_i:x1_i]
+            if pipeline_alpha_mask is not None:
+                try:
+                    pipeline_alpha_mask = pipeline_alpha_mask[y0_i:y1_i, x0_i:x1_i]
+                except Exception:
+                    pass
+            if coverage_count_hw is not None:
+                try:
+                    cov_arr = np.asarray(coverage_count_hw)
+                    if cov_arr.ndim == 2 and cov_arr.shape == (h0, w0):
+                        coverage_count_hw = cov_arr[y0_i:y1_i, x0_i:x1_i]
+                except Exception:
+                    pass
+
+            if wcs_for_master_tile is not None:
+                try:
+                    if hasattr(wcs_for_master_tile, 'wcs') and wcs_for_master_tile.wcs:
+                        wcs_for_master_tile.wcs.crpix[0] -= float(x0_i)
+                        wcs_for_master_tile.wcs.crpix[1] -= float(y0_i)
+                except Exception:
+                    pass
+                try:
+                    h2, w2 = master_tile_stacked_HWC.shape[:2]
+                    wcs_for_master_tile.pixel_shape = (int(w2), int(h2))
+                    if hasattr(wcs_for_master_tile, 'array_shape'):
+                        wcs_for_master_tile.array_shape = (int(h2), int(w2))
+                except Exception:
+                    pass
+
+            try:
+                pcb_tile(
+                    f"MT_ALTAZ_STRICT_CROP_APPLIED: tile={tile_id} reason={reason} rect=({x0_i}:{x1_i},{y0_i}:{y1_i})",
+                    prog=None,
+                    lvl="INFO",
+                )
+            except Exception:
+                pass
+            return True
+        except Exception as exc_crop_apply:
+            try:
+                pcb_tile(
+                    f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=apply_exception:{type(exc_crop_apply).__name__}",
+                    prog=None,
+                    lvl="WARN",
+                )
+            except Exception:
+                pass
+            return False
+
+    # Optional strict overlap bbox crop for Alt-Az master tiles.
+    # Goal: remove unreliable peripheral zones using the coverage-driven alpha core,
+    # while preserving edge-tile safety with conservative guards.
+    try:
+        strict_crop_enabled = bool(getattr(zconfig, "altaz_strict_overlap_crop_enabled", True))
+    except Exception:
+        strict_crop_enabled = True
+    if strict_crop_enabled and bool(altaz_cleanup_enabled_effective) and isinstance(master_tile_stacked_HWC, np.ndarray):
+        try:
+            alpha_thr = float(getattr(zconfig, "altaz_strict_overlap_crop_alpha_threshold", 0.02))
+        except Exception:
+            alpha_thr = 0.02
+        try:
+            min_nonzero_frac_strict = float(getattr(zconfig, "altaz_strict_overlap_crop_min_nonzero_frac", 0.08))
+        except Exception:
+            min_nonzero_frac_strict = 0.08
+        try:
+            bbox_pad_px_strict = int(getattr(zconfig, "altaz_strict_overlap_crop_bbox_pad_px", 6))
+        except Exception:
+            bbox_pad_px_strict = 6
+        try:
+            min_size_px_strict = int(getattr(zconfig, "altaz_strict_overlap_crop_min_size_px", 256))
+        except Exception:
+            min_size_px_strict = 256
+
+        alpha_thr = float(np.clip(alpha_thr, 0.0, 1.0))
+        min_nonzero_frac_strict = float(np.clip(min_nonzero_frac_strict, 0.0, 1.0))
+        bbox_pad_px_strict = max(0, int(bbox_pad_px_strict))
+        min_size_px_strict = max(16, int(min_size_px_strict))
+
+        alpha_src = None
+        if pipeline_alpha_mask is not None:
+            alpha_src = np.asarray(pipeline_alpha_mask)
+        elif coverage_count_hw is not None:
+            try:
+                cov_arr = np.asarray(coverage_count_hw, dtype=np.float32)
+                if cov_arr.ndim == 2 and cov_arr.size > 0:
+                    cmax = float(np.nanmax(cov_arr))
+                    if math.isfinite(cmax) and cmax > 0.0:
+                        alpha_src = np.clip(cov_arr / cmax, 0.0, 1.0)
+            except Exception:
+                alpha_src = None
+
+        if alpha_src is None or alpha_src.size == 0:
+            pcb_tile(
+                f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=no_alpha_source",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
+        else:
+            try:
+                if alpha_src.ndim == 3:
+                    alpha_src = alpha_src[..., 0]
+                h0, w0 = master_tile_stacked_HWC.shape[:2]
+                if alpha_src.shape != (h0, w0):
+                    alpha_u8 = _normalize_alpha_mask(alpha_src, target_hw=(h0, w0), opacity_threshold=0.0)
+                    if alpha_u8 is not None:
+                        alpha_src = alpha_u8.astype(np.float32) / 255.0
+                    else:
+                        alpha_src = None
+            except Exception:
+                alpha_src = None
+
+            if alpha_src is None:
+                pcb_tile(
+                    f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=alpha_shape_unusable",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            else:
+                alpha_src = np.nan_to_num(np.asarray(alpha_src, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                amax = float(np.nanmax(alpha_src)) if alpha_src.size else 0.0
+                amin = float(np.nanmin(alpha_src)) if alpha_src.size else 0.0
+                if amax > 1.0 + 1e-6 or amin < -1e-6:
+                    alpha_src = np.clip(alpha_src, 0.0, 255.0) / 255.0
+                else:
+                    alpha_src = np.clip(alpha_src, 0.0, 1.0)
+
+                core_mask = alpha_src >= float(alpha_thr)
+                nonzero_frac_core = float(np.count_nonzero(core_mask) / core_mask.size) if core_mask.size else 0.0
+
+                if not np.any(core_mask):
+                    pcb_tile(
+                        f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=empty_core_mask thr={alpha_thr:.4f}",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                elif nonzero_frac_core < min_nonzero_frac_strict:
+                    pcb_tile(
+                        f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=small_core_mask frac={nonzero_frac_core:.4f}<min={min_nonzero_frac_strict:.4f}",
+                        prog=None,
+                        lvl="WARN",
+                    )
+                else:
+                    ys, xs = np.where(core_mask)
+                    y0 = int(np.min(ys)); y1 = int(np.max(ys)) + 1
+                    x0 = int(np.min(xs)); x1 = int(np.max(xs)) + 1
+                    if bbox_pad_px_strict > 0:
+                        h0, w0 = core_mask.shape
+                        y0 = max(0, y0 - bbox_pad_px_strict)
+                        x0 = max(0, x0 - bbox_pad_px_strict)
+                        y1 = min(h0, y1 + bbox_pad_px_strict)
+                        x1 = min(w0, x1 + bbox_pad_px_strict)
+                    w_new = int(x1 - x0)
+                    h_new = int(y1 - y0)
+                    if w_new < min_size_px_strict or h_new < min_size_px_strict:
+                        pcb_tile(
+                            f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=min_size_guard size=({w_new}x{h_new}) min={min_size_px_strict}",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    else:
+                        _apply_master_tile_rect_crop(y0, x0, y1, x1, reason="altaz_high_conf_core")
+    
     _touch_progress()
     _check_abort("pre_edge_trim")
     try:
