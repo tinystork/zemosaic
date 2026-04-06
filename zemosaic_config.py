@@ -348,6 +348,10 @@ DEFAULT_CONFIG = {
     # --- Qualité avancée ---
     "quality_crop_min_run": 2,  # UI: "min run"
     "crop_follow_signal": True,
+    # Drop statistically dead aligned frames before normalization/weighting.
+    "stack_stat_min_finite_frac": 0.02,
+    "stack_stat_min_nonzero_frac": 1e-5,
+    "stack_stat_min_finite_px_per_channel": 4096,
     # --- FIN CLES POUR LE ROGNAGE ---
 }
 

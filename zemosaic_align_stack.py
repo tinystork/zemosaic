@@ -2667,7 +2667,8 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
         progress_callback (callable, optional): Fonction de callback pour les logs.
 
     Returns:
-        tuple[float, float]: (stat_low, stat_high). Retourne (0.0, 1.0) en cas d'erreur majeure.
+        tuple[float, float]: (stat_low, stat_high).
+        Retourne (nan, nan) en cas d'erreur majeure / données inexploitable.
     """
     # Define a local alias for the callback for brevity and safety
     # Uses _internal_logger as a fallback if progress_callback is None
@@ -2678,18 +2679,18 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
         _pcb("stathelper_error_invalid_input_for_stats", lvl="WARN",
              shape=image_data_2d_float32.shape if hasattr(image_data_2d_float32, 'shape') else 'N/A',
              ndim=image_data_2d_float32.ndim if hasattr(image_data_2d_float32, 'ndim') else 'N/A')
-        return 0.0, 1.0 # Fallback pour une entrée clairement incorrecte
+        return float("nan"), float("nan") # Fallback pour une entrée clairement incorrecte
 
     if image_data_2d_float32.size == 0:
         _pcb("stathelper_error_empty_image_for_stats", lvl="WARN")
-        return 0.0, 1.0
+        return float("nan"), float("nan")
 
     # Assurer que les données sont finies pour le calcul des percentiles
     # np.nanpercentile gère déjà les NaNs, mais il est bon de savoir si tout est non-fini.
     finite_data = image_data_2d_float32[np.isfinite(image_data_2d_float32)]
     if finite_data.size == 0:
         _pcb("stathelper_warn_all_nan_or_inf_for_stats", lvl="WARN")
-        return 0.0, 1.0 # Pas de données valides pour calculer les percentiles
+        return float("nan"), float("nan") # Pas de données valides pour calculer les percentiles
 
     try:
         # Prefer GPU percentiles when requested and available
@@ -2723,7 +2724,7 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
              stat_high = float(np.max(finite_data))
              _pcb(f"stathelper_warn_percentile_exception_fallback_minmax: low={stat_low:.3g}, high={stat_high:.3g}", lvl="WARN")
         else: # Ne devrait jamais être atteint si la logique précédente est correcte
-            return 0.0, 1.0
+            return float("nan"), float("nan")
 
 
     # Gérer le cas où l'image est (presque) plate
@@ -4802,6 +4803,120 @@ def stack_aligned_images(
         else:
             return _internal_logger.debug(f"PCB_FALLBACK_{level}_{prog}: {msg_key} {kwargs}")
 
+    try:
+        stat_min_finite_frac = float(getattr(zconfig, "stack_stat_min_finite_frac", 0.02)) if zconfig is not None else 0.02
+    except Exception:
+        stat_min_finite_frac = 0.02
+    try:
+        stat_min_nonzero_frac = float(getattr(zconfig, "stack_stat_min_nonzero_frac", 1e-5)) if zconfig is not None else 1e-5
+    except Exception:
+        stat_min_nonzero_frac = 1e-5
+    try:
+        stat_min_finite_px_per_channel = int(getattr(zconfig, "stack_stat_min_finite_px_per_channel", 4096)) if zconfig is not None else 4096
+    except Exception:
+        stat_min_finite_px_per_channel = 4096
+    stat_min_finite_frac = float(np.clip(stat_min_finite_frac, 0.0, 1.0))
+    stat_min_nonzero_frac = float(np.clip(stat_min_nonzero_frac, 0.0, 1.0))
+    stat_min_finite_px_per_channel = max(0, int(stat_min_finite_px_per_channel))
+
+    def _filter_statistically_dead_frames(
+        images_in: list[np.ndarray],
+        *,
+        stage: str,
+    ) -> list[np.ndarray]:
+        kept: list[np.ndarray] = []
+        drop_counts: dict[str, int] = {}
+        for idx_local, img_local in enumerate(images_in):
+            if img_local is None:
+                drop_counts["none"] = drop_counts.get("none", 0) + 1
+                continue
+            arr = np.asarray(img_local, dtype=np.float32)
+            if arr.size == 0:
+                drop_counts["empty"] = drop_counts.get("empty", 0) + 1
+                continue
+
+            finite_mask = np.isfinite(arr)
+            finite_px = int(np.count_nonzero(finite_mask))
+            finite_frac = float(finite_px / arr.size) if arr.size else 0.0
+            if finite_frac < stat_min_finite_frac:
+                drop_counts["finite_frac_below_threshold"] = drop_counts.get("finite_frac_below_threshold", 0) + 1
+                _pcb(
+                    "STACK_IMG_STAT_DROP",
+                    lvl="WARN",
+                    stage=stage,
+                    img_idx=int(idx_local),
+                    reason="finite_frac_below_threshold",
+                    finite_frac=float(finite_frac),
+                    threshold=float(stat_min_finite_frac),
+                )
+                continue
+
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            nz_frac = float(np.count_nonzero(np.abs(arr) > 1e-12) / arr.size) if arr.size else 0.0
+            if nz_frac < stat_min_nonzero_frac:
+                drop_counts["nonzero_frac_below_threshold"] = drop_counts.get("nonzero_frac_below_threshold", 0) + 1
+                _pcb(
+                    "STACK_IMG_STAT_DROP",
+                    lvl="WARN",
+                    stage=stage,
+                    img_idx=int(idx_local),
+                    reason="nonzero_frac_below_threshold",
+                    nonzero_frac=float(nz_frac),
+                    threshold=float(stat_min_nonzero_frac),
+                )
+                continue
+
+            if arr.ndim == 3 and arr.shape[-1] in (1, 3):
+                per_ch = [int(np.count_nonzero(np.isfinite(arr[..., c]))) for c in range(arr.shape[-1])]
+                if min(per_ch) < stat_min_finite_px_per_channel:
+                    drop_counts["finite_px_per_channel_below_threshold"] = drop_counts.get("finite_px_per_channel_below_threshold", 0) + 1
+                    _pcb(
+                        "STACK_IMG_STAT_DROP",
+                        lvl="WARN",
+                        stage=stage,
+                        img_idx=int(idx_local),
+                        reason="finite_px_per_channel_below_threshold",
+                        min_px=int(min(per_ch)),
+                        threshold=int(stat_min_finite_px_per_channel),
+                    )
+                    continue
+            elif arr.ndim == 2:
+                if finite_px < stat_min_finite_px_per_channel:
+                    drop_counts["finite_px_below_threshold"] = drop_counts.get("finite_px_below_threshold", 0) + 1
+                    _pcb(
+                        "STACK_IMG_STAT_DROP",
+                        lvl="WARN",
+                        stage=stage,
+                        img_idx=int(idx_local),
+                        reason="finite_px_below_threshold",
+                        finite_px=int(finite_px),
+                        threshold=int(stat_min_finite_px_per_channel),
+                    )
+                    continue
+
+            kept.append(np.ascontiguousarray(arr, dtype=np.float32))
+
+        if drop_counts:
+            dominant_reason = max(drop_counts.items(), key=lambda kv: kv[1])[0]
+            _pcb(
+                "STACK_IMG_STAT_FILTER_SUMMARY",
+                lvl="WARN",
+                stage=stage,
+                kept=int(len(kept)),
+                dropped=int(sum(drop_counts.values())),
+                dominant_reason=str(dominant_reason),
+                reasons=dict(drop_counts),
+            )
+        else:
+            _pcb(
+                "STACK_IMG_STAT_FILTER_SUMMARY",
+                lvl="DEBUG_DETAIL",
+                stage=stage,
+                kept=int(len(kept)),
+                dropped=0,
+            )
+        return kept
+
     _pcb("STACK_IMG_ENTRY: Début stack_aligned_images.", lvl="ERROR") # Log d'entrée
 
     plan_hints = _extract_parallel_plan_hints(parallel_plan)
@@ -4856,7 +4971,10 @@ def stack_aligned_images(
         _pcb("STACK_IMG_EXIT: Retourne None (pas d'images après check shape).", lvl="ERROR")
         return None
     
-    current_images_data_list = processed_images_for_stack # Renommage pour la suite
+    current_images_data_list = _filter_statistically_dead_frames(
+        processed_images_for_stack,
+        stage="pre_normalization",
+    )
     _pcb(f"STACK_IMG_PREP: {len(current_images_data_list)} images prêtes pour normalisation.", lvl="ERROR")
 
 
@@ -4884,18 +5002,13 @@ def stack_aligned_images(
         _pcb("STACK_IMG_EXIT: Retourne None (pas d'images après normalisation).", lvl="ERROR")
         return None
 
-    _pcb(f"STACK_IMG_NORM: {len(current_images_data_list)} images après normalisation. Vérification des non-finis POST-normalisation.", lvl="ERROR")
-    temp_list_post_norm = []
-    for idx_post_norm, img_post_norm in enumerate(current_images_data_list):
-        if img_post_norm is not None:
-            if not np.all(np.isfinite(img_post_norm)):
-                _pcb(f"STACK_IMG_NORM: AVERT Image post-norm {idx_post_norm} (shape {img_post_norm.shape}) a des non-finis. Remplacement par 0.", lvl="ERROR")
-                img_post_norm = np.nan_to_num(img_post_norm, nan=0.0, posinf=0.0, neginf=0.0)
-            temp_list_post_norm.append(img_post_norm)
-    current_images_data_list = temp_list_post_norm
-    del temp_list_post_norm
+    _pcb(f"STACK_IMG_NORM: {len(current_images_data_list)} images après normalisation. Vérification de viabilité statistique POST-normalisation.", lvl="ERROR")
+    current_images_data_list = _filter_statistically_dead_frames(
+        [img for img in current_images_data_list if img is not None],
+        stage="post_normalization",
+    )
     if not current_images_data_list: # Double check
-        _pcb("STACK_IMG_NORM: Toutes les images sont devenues None après nettoyage post-normalisation.", lvl="ERROR")
+        _pcb("STACK_IMG_NORM: Toutes les images sont devenues non-viables après filtrage post-normalisation.", lvl="ERROR")
         return None
 
 
