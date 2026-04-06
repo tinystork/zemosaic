@@ -615,7 +615,11 @@ def _classify_mount_mode_from_header(header: Any) -> str:
 
 
 def _split_group_by_mount_mode(group: list[dict]) -> list[list[dict]]:
-    """Split group into EQ / ALT_AZ buckets; UNKNOWN entries follow the majority."""
+    """Split group into strict EQ / ALT_AZ / UNKNOWN buckets.
+
+    UNKNOWN entries are *not* merged into a majority mount mode. This keeps
+    grouping robust when headers are degraded or heterogeneous datasets are used.
+    """
 
     if not group:
         return [group]
@@ -636,31 +640,30 @@ def _split_group_by_mount_mode(group: list[dict]) -> list[list[dict]]:
     def _is_altaz(mode: str) -> bool:
         return mode == "ALT_AZ"
 
-    eq_count = sum(1 for mode in modes if _is_eq(mode))
-    altaz_count = sum(1 for mode in modes if _is_altaz(mode))
-
-    if eq_count == 0 and altaz_count == 0:
-        return [group]
-    if eq_count == 0 or altaz_count == 0:
-        return [group]
-
-    majority = "EQ" if eq_count >= altaz_count else "ALT_AZ"
     eq_entries: list[dict] = []
     altaz_entries: list[dict] = []
-    for entry, mode in zip(group, modes):
-        target = None
-        if _is_eq(mode):
-            target = "EQ"
-        elif _is_altaz(mode):
-            target = "ALT_AZ"
-        else:
-            target = majority
-        if target == "EQ":
-            eq_entries.append(entry)
-        elif target == "ALT_AZ":
-            altaz_entries.append(entry)
+    unknown_entries: list[dict] = []
 
-    return [eq_entries, altaz_entries]
+    for entry, mode in zip(group, modes):
+        if _is_eq(mode):
+            eq_entries.append(entry)
+        elif _is_altaz(mode):
+            altaz_entries.append(entry)
+        else:
+            unknown_entries.append(entry)
+
+    # No known mode at all: keep original single UNKNOWN group.
+    if not eq_entries and not altaz_entries:
+        return [group]
+
+    out: list[list[dict]] = []
+    if eq_entries:
+        out.append(eq_entries)
+    if altaz_entries:
+        out.append(altaz_entries)
+    if unknown_entries:
+        out.append(unknown_entries)
+    return out or [group]
 
 
 ANGLE_SPLIT_DEFAULT_DEG = 5.0

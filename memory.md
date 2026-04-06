@@ -3819,3 +3819,15 @@ Correctif 2 (prévention chunks dégradés sur groupes mixtes):
 
 Sanity:
 - `python3 -m py_compile zemosaic_worker.py` ✅
+
+
+## 2026-04-06 — GUI mount-mode split strict UNKNOWN bucket
+
+- `zemosaic_filter_gui_qt.py`: `_split_group_by_mount_mode` changed from majority-assignment behavior to strict bucketing.
+- New behavior:
+  - EQ frames -> EQ bucket
+  - ALT_AZ frames -> ALT_AZ bucket
+  - UNKNOWN / degraded EQMODE headers -> dedicated UNKNOWN bucket
+- UNKNOWN entries are no longer auto-injected into EQ/ALT_AZ majority groups.
+- Goal: robustness on heterogeneous datasets / degraded FITS headers / very large runs (e.g. 10k raws).
+- Sanity: `python3 -m py_compile zemosaic_filter_gui_qt.py` ✅
