@@ -233,7 +233,7 @@ DEFAULT_CONFIG = {
     "parallel_gpu_vram_fraction": 0.8,
     "parallel_max_cpu_workers": 0,  # 0 → no explicit cap beyond detected logical cores
     # Resume policy for classic legacy runs: "off", "auto", "force".
-    "resume": "off",
+    "resume": "auto",
     # Cache retention policy for Phase 1 preprocessed .npy files.
     # Allowed values: "run_end", "per_tile", "keep".
     "cache_retention": "run_end",
