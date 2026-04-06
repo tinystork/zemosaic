@@ -22238,10 +22238,25 @@ def run_hierarchical_mosaic_classic_legacy(
     seestar_hint_global = False
     try:
         # Seestar-oriented run: consider UNKNOWN as likely Alt-Az when policy=auto.
-        if bool(globals().get("IS_SEESTAR_RUNTIME", False)):
+        mode_hint = str(global_wcs_plan.get("mode", "") or "").strip().lower()
+        if mode_hint == "seestar":
             seestar_hint_global = True
     except Exception:
         seestar_hint_global = False
+    if not seestar_hint_global and isinstance(filter_overrides, dict):
+        try:
+            mode_override = str(filter_overrides.get("mode", "") or "").strip().lower()
+            if mode_override == "seestar":
+                seestar_hint_global = True
+        except Exception:
+            pass
+    if not seestar_hint_global:
+        try:
+            # Last-resort runtime flag for older launchers.
+            if bool(globals().get("IS_SEESTAR_RUNTIME", False)):
+                seestar_hint_global = True
+        except Exception:
+            pass
 
     unknown_as_altaz_global = False
     if unknown_count > 0:
