@@ -22230,16 +22230,48 @@ def run_hierarchical_mosaic_classic_legacy(
     quality_crop_requested_flag = bool(quality_crop_enabled_config)
     altaz_cleanup_requested_flag = bool(altaz_cleanup_enabled_config)
     altaz_cleanup_effective_flag = bool(altaz_cleanup_requested_flag)
-    if contains_altaz:
+
+    unknown_policy_global = str(getattr(zconfig, "altaz_unknown_policy", "auto") or "auto").strip().lower()
+    if unknown_policy_global not in ("auto", "on", "off"):
+        unknown_policy_global = "auto"
+
+    seestar_hint_global = False
+    try:
+        # Seestar-oriented run: consider UNKNOWN as likely Alt-Az when policy=auto.
+        if bool(globals().get("IS_SEESTAR_RUNTIME", False)):
+            seestar_hint_global = True
+    except Exception:
+        seestar_hint_global = False
+
+    unknown_as_altaz_global = False
+    if unknown_count > 0:
+        if unknown_policy_global == "on":
+            unknown_as_altaz_global = True
+        elif unknown_policy_global == "auto":
+            # Conservative auto-mode:
+            # - enable on Seestar-like runs
+            # - or when no EQ markers exist in summary (legacy headers often UNKNOWN)
+            unknown_as_altaz_global = bool(seestar_hint_global or eq_count == 0)
+
+    contains_altaz_effective = bool(contains_altaz or unknown_as_altaz_global)
+    if contains_altaz_effective:
         if not altaz_cleanup_effective_flag:
             try:
-                logger.info("AUTO_ALTaz_cleanup: enabled (contains_altaz=True, config_requested=False)")
+                logger.info(
+                    "AUTO_ALTaz_cleanup: enabled "
+                    "(contains_altaz_effective=True, config_requested=False, "
+                    "unknown_policy=%s, unknown_as_altaz=%s)",
+                    unknown_policy_global,
+                    bool(unknown_as_altaz_global),
+                )
             except Exception:
                 pass
         altaz_cleanup_effective_flag = True
     else:
         if altaz_cleanup_effective_flag:
-            warn_msg = "ALTaz cleanup requested but no ALT_AZ frames detected -> disabled (EQ-only run)."
+            warn_msg = (
+                "ALTaz cleanup requested but no ALT_AZ/UNKNOWN-effective frames detected -> disabled (EQ-only run)."
+            )
             try:
                 logger.warning(warn_msg)
             except Exception:
@@ -22249,6 +22281,20 @@ def run_hierarchical_mosaic_classic_legacy(
             except Exception:
                 pass
         altaz_cleanup_effective_flag = False
+
+    try:
+        logger.info(
+            "ALTaz gating global: policy=%s eq=%d altaz=%d unknown=%d seestar_hint=%s unknown_as_altaz=%s altaz_cleanup_effective=%s",
+            unknown_policy_global,
+            int(eq_count),
+            int(altaz_count),
+            int(unknown_count),
+            bool(seestar_hint_global),
+            bool(unknown_as_altaz_global),
+            bool(altaz_cleanup_effective_flag),
+        )
+    except Exception:
+        pass
     lecropper_pipeline_flag = (
         bool(_LECROPPER_AVAILABLE) and (quality_crop_requested_flag or altaz_cleanup_effective_flag)
     )
