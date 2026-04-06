@@ -19976,9 +19976,38 @@ def assemble_final_mosaic_reproject_coadd(
                         raise ValueError(
                             f"alpha_union shape {a.shape} mismatch with mosaic {mosaic_data.shape}"
                         )
-            threshold_u8 = int(ALPHA_OPACITY_THRESHOLD * 255)
-            if threshold_u8 > 0:
-                a = np.where(a >= threshold_u8, 255, 0).astype(np.uint8, copy=False)
+            # Keep a *soft* alpha map at final-mosaic stage.
+            # A hard 0.5 binarization can wipe valid coverage after reprojection
+            # (especially with soft edge weights), then coverage gets force-zeroed
+            # from alpha and the final image appears fully empty.
+            #
+            # We only clamp near-zero opacity to 0, while preserving the rest.
+            tiny_alpha_floor_u8 = 1  # ~= 0.4% opacity
+            if tiny_alpha_floor_u8 > 0:
+                a = np.where(a >= tiny_alpha_floor_u8, a, 0).astype(np.uint8, copy=False)
+
+            # Safety guard: if alpha had non-zero signal before clamp but ended up
+            # empty, revert to the unclamped alpha candidate instead of blacking out
+            # the full mosaic downstream.
+            if not np.any(a):
+                try:
+                    a_unclamped = np.nan_to_num(alpha_union, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.issubdtype(a_unclamped.dtype, np.floating):
+                        max_val_u = float(np.nanmax(a_unclamped)) if a_unclamped.size else 0.0
+                        min_val_u = float(np.nanmin(a_unclamped)) if a_unclamped.size else 0.0
+                        if max_val_u <= 1.0 + 1e-6 and min_val_u >= -1e-6:
+                            a_unclamped = (np.clip(a_unclamped, 0.0, 1.0) * 255.0).astype(np.uint8)
+                        else:
+                            a_unclamped = np.clip(a_unclamped, 0.0, 255.0).astype(np.uint8)
+                    elif a_unclamped.dtype != np.uint8:
+                        a_unclamped = np.clip(a_unclamped, 0, 255).astype(np.uint8)
+                    if np.any(a_unclamped):
+                        logger.warning(
+                            "phase6: alpha clamp produced an empty mask; restoring soft alpha_union values"
+                        )
+                        a = a_unclamped
+                except Exception:
+                    pass
             alpha_final = np.ascontiguousarray(a, dtype=np.uint8)
             logger.info(
                 "phase6: alpha_union received, propagating to alpha_final (uint8 %s)",
