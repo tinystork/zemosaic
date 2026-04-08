@@ -2679,6 +2679,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
             intertile_layout,
             self._tr("qt_field_use_auto_intertile", "Auto-adjust intertile parameters"),
         )
+        patchwork_checkbox = self._register_checkbox(
+            "patchwork_suppressor_enabled",
+            intertile_layout,
+            self._tr("qt_field_patchwork_suppressor", "Patchwork suppressor"),
+        )
+        patchwork_checkbox.setToolTip(
+            self._tr(
+                "qt_field_patchwork_suppressor_tip",
+                "Reduce visible tile imprint in overlaps when master tiles have different depth or background.",
+            )
+        )
         self._register_spinbox(
             "intertile_preview_size",
             intertile_layout,
@@ -3977,6 +3988,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "two_pass_coverage_renorm": False,
             "two_pass_cov_sigma_px": 50,
             "two_pass_cov_gain_clip": [0.85, 1.18],
+            "patchwork_suppressor_enabled": False,
+            "patchwork_suppressor_strength": "normal",
+            "patchwork_suppressor_sigma_px": 64.0,
+            "patchwork_suppressor_seam_band_px": 160,
+            "patchwork_suppressor_max_delta": 0.20,
+            "patchwork_suppressor_protect_stars": True,
+            "patchwork_suppressor_only_near_seams": True,
             "apply_master_tile_crop": True,
             "master_tile_crop_percent": 3.0,
             "match_background_for_final": True,

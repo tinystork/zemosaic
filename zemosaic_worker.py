@@ -4172,6 +4172,13 @@ def _apply_phase5_post_stack_pipeline(
     fallback_two_pass_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
     parallel_plan: ParallelPlan | None = None,
     telemetry_ctrl: ResourceTelemetryController | None = None,
+    patchwork_suppressor_enabled: bool = False,
+    patchwork_suppressor_strength: str = "normal",
+    patchwork_suppressor_sigma_px: float = 64.0,
+    patchwork_suppressor_seam_band_px: int = 160,
+    patchwork_suppressor_max_delta: float = 0.20,
+    patchwork_suppressor_protect_stars: bool = True,
+    patchwork_suppressor_only_near_seams: bool = True,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Run the reusable Phase 5 post-stack operations."""
 
@@ -4214,7 +4221,285 @@ def _apply_phase5_post_stack_pipeline(
         parallel_plan=parallel_plan,
         telemetry_ctrl=telemetry_ctrl,
     )
+
+    if patchwork_suppressor_enabled:
+        final_mosaic_data, _patchwork_info = _apply_patchwork_suppressor_if_requested(
+            final_mosaic_data,
+            final_mosaic_coverage,
+            final_alpha_map,
+            enabled=bool(patchwork_suppressor_enabled),
+            strength=str(patchwork_suppressor_strength or "normal"),
+            sigma_px=float(patchwork_suppressor_sigma_px),
+            seam_band_px=int(patchwork_suppressor_seam_band_px),
+            max_delta=float(patchwork_suppressor_max_delta),
+            protect_stars=bool(patchwork_suppressor_protect_stars),
+            only_near_seams=bool(patchwork_suppressor_only_near_seams),
+            logger=logger,
+        )
+        try:
+            if isinstance(_patchwork_info, dict):
+                logger.info(
+                    "[Patchwork] seam_mask_frac=%.5f correction_abs_p95=%.5f",
+                    float(_patchwork_info.get("seam_weight_mean", 0.0) or 0.0),
+                    float(_patchwork_info.get("delta_abs_p95", 0.0) or 0.0),
+                )
+        except Exception:
+            pass
+
     return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+
+def _resolve_patchwork_strength(strength_value: Any) -> tuple[float, float, float]:
+    """Map patchwork preset to (strength_scale, sigma_scale, rel_delta_scale)."""
+
+    key = str(strength_value or "normal").strip().lower()
+    table = {
+        "low": (0.70, 0.90, 0.85),
+        "normal": (1.00, 1.00, 1.00),
+        "strong": (1.30, 1.10, 1.20),
+    }
+    return table.get(key, table["normal"])
+
+
+def _apply_patchwork_suppressor_if_requested(
+    mosaic_hwc: np.ndarray | None,
+    coverage_hw: np.ndarray | None,
+    alpha_hw: np.ndarray | None,
+    *,
+    enabled: bool,
+    strength: str,
+    sigma_px: float,
+    seam_band_px: int,
+    max_delta: float,
+    protect_stars: bool,
+    only_near_seams: bool,
+    logger: logging.Logger | None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Optional Phase-5 visual harmonization for low-frequency tile imprint."""
+
+    info: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "reason": "disabled" if not enabled else "",
+        "strength": str(strength or "normal"),
+    }
+    if not enabled:
+        return mosaic_hwc, info
+    if mosaic_hwc is None:
+        info["reason"] = "no_mosaic"
+        return mosaic_hwc, info
+
+    try:
+        sigma_base = float(max(8.0, min(512.0, float(sigma_px))))
+    except Exception:
+        sigma_base = 64.0
+    try:
+        seam_band_px = int(max(16, min(1024, int(seam_band_px))))
+    except Exception:
+        seam_band_px = 160
+    try:
+        max_delta = float(max(0.02, min(0.35, float(max_delta))))
+    except Exception:
+        max_delta = 0.20
+
+    strength_scale, sigma_scale, rel_scale = _resolve_patchwork_strength(strength)
+    if not bool(protect_stars):
+        strength_scale *= 1.10
+
+    sigma_small = max(12.0, sigma_base * sigma_scale)
+    sigma_large = max(sigma_small + 1.0, sigma_base * 2.6 * sigma_scale)
+    seam_sigma = max(1.2, min(8.0, float(seam_band_px) / 64.0))
+    rel_delta = max(0.02, min(0.35, max_delta * rel_scale))
+
+    out, seam_info = _apply_visual_seam_heal_low_frequency(
+        mosaic_hwc,
+        alpha_mask=alpha_hw,
+        coverage_hw=coverage_hw,
+        strength=min(1.0, 0.45 * strength_scale),
+        sigma_small=sigma_small,
+        sigma_large=sigma_large,
+        seam_sigma=seam_sigma,
+        max_rel_delta=rel_delta,
+        logger=None,
+    )
+
+    if isinstance(seam_info, dict):
+        info.update(seam_info)
+    info["enabled"] = True
+    info["strength"] = str(strength or "normal")
+    info["only_near_seams"] = bool(only_near_seams)
+    info["protect_stars"] = bool(protect_stars)
+
+    if logger is not None:
+        logger.info(
+            "[Patchwork] enabled=%s strength=%s only_near_seams=%s protect_stars=%s sigma=%.1f seam_band_px=%d max_delta=%.3f applied=%s reason=%s seam_mask_frac=%.5f correction_abs_p95=%.5f",
+            True,
+            str(strength or "normal"),
+            bool(only_near_seams),
+            bool(protect_stars),
+            float(sigma_base),
+            int(seam_band_px),
+            float(max_delta),
+            bool(info.get("applied", False)),
+            str(info.get("reason", "")),
+            float(info.get("seam_weight_mean", 0.0) or 0.0),
+            float(info.get("delta_abs_p95", 0.0) or 0.0),
+        )
+
+    return out, info
+
+
+def _load_intertile_graph_summary(diagnostics_output_dir: Path | None) -> dict[str, Any]:
+    if diagnostics_output_dir is None:
+        return {}
+    try:
+        p = Path(diagnostics_output_dir) / "intertile_graph_summary.json"
+        if not p.exists():
+            return {}
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _apply_intertile_underconstrained_guard(
+    *,
+    pending_affine_list: list[tuple[float, float]] | None,
+    affine_by_id: dict[str, tuple[float, float]] | None,
+    effective_tiles: list[dict[str, Any]] | None,
+    worker_config_cache: dict[str, Any] | None,
+    diagnostics_output_dir: Path | None,
+    existing_master_tiles_mode: bool,
+    logger_obj: logging.Logger,
+) -> tuple[list[tuple[float, float]] | None, dict[str, tuple[float, float]] | None, dict[str, Any]]:
+    """Clamp/fallback affine corrections in sparse underconstrained regimes."""
+
+    meta: dict[str, Any] = {"enabled": False, "triggered": False, "reasons": []}
+    cfg = worker_config_cache or {}
+    enabled = bool(cfg.get("intertile_underconstrained_guard_enabled", True))
+    meta["enabled"] = enabled
+    if not enabled:
+        return pending_affine_list, affine_by_id, meta
+    if not pending_affine_list or not affine_by_id:
+        return pending_affine_list, affine_by_id, meta
+
+    def _pair(val: Any, default_pair: tuple[float, float]) -> tuple[float, float]:
+        lo, hi = default_pair
+        try:
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                lo = float(val[0]); hi = float(val[1])
+        except Exception:
+            lo, hi = default_pair
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            lo, hi = default_pair
+        if lo > hi:
+            lo, hi = hi, lo
+        return float(lo), float(hi)
+
+    max_pairs = int(cfg.get("intertile_underconstrained_max_pairs", 1) or 1)
+    max_active_tiles = int(cfg.get("intertile_underconstrained_max_active_tiles", 2) or 2)
+    force_mode = str(cfg.get("intertile_underconstrained_force_mode", "offset_only") or "offset_only").strip().lower()
+    if force_mode not in {"offset_only", "disable_photometric"}:
+        force_mode = "offset_only"
+    gain_clip = _pair(cfg.get("intertile_underconstrained_gain_clip", (0.85, 1.18)), (0.85, 1.18))
+    offset_clip = _pair(cfg.get("intertile_underconstrained_offset_clip", (-2000.0, 2000.0)), (-2000.0, 2000.0))
+
+    graph_summary = _load_intertile_graph_summary(diagnostics_output_dir)
+    raw_pairs = int(graph_summary.get("raw_pairs_count", -1) or -1)
+    pruned_pairs = int(graph_summary.get("pruned_pairs_count", -1) or -1)
+    active_tiles = int(graph_summary.get("active_tile_count", 0) or 0)
+    if active_tiles <= 0:
+        active_tiles = len(effective_tiles or [])
+
+    reasons: list[str] = []
+    if existing_master_tiles_mode:
+        reasons.append("existing_master_tiles_mode")
+    if active_tiles > 0 and active_tiles <= max_active_tiles:
+        reasons.append(f"active_tiles<={max_active_tiles}")
+    if raw_pairs >= 0 and raw_pairs <= max_pairs:
+        reasons.append(f"raw_pairs<={max_pairs}")
+    if pruned_pairs >= 0 and pruned_pairs <= max_pairs:
+        reasons.append(f"pruned_pairs<={max_pairs}")
+
+    suspect_cnt = int(cfg.get("existing_master_tiles_qg_suspect_count", 0) or 0)
+    if suspect_cnt > 0:
+        reasons.append(f"qg_suspect={suspect_cnt}")
+
+    if not reasons:
+        return pending_affine_list, affine_by_id, meta
+
+    meta["triggered"] = True
+    meta["reasons"] = reasons
+    meta["force_mode"] = force_mode
+    meta["active_tiles"] = active_tiles
+    meta["raw_pairs"] = raw_pairs
+    meta["pruned_pairs"] = pruned_pairs
+
+    logger_obj.warning(
+        "[IntertileGuard] triggered=True mode=%s reasons=%s active_tiles=%s raw_pairs=%s pruned_pairs=%s",
+        force_mode,
+        ",".join(reasons),
+        active_tiles,
+        raw_pairs,
+        pruned_pairs,
+    )
+
+    if force_mode == "disable_photometric":
+        logger_obj.warning("[IntertileGuard] fallback=disable_photometric")
+        return None, None, meta
+
+    guarded: dict[str, tuple[float, float]] = {}
+    gain_vals_before: list[float] = []
+    gain_vals_after: list[float] = []
+    off_vals_before: list[float] = []
+    off_vals_after: list[float] = []
+
+    for tid, pair in affine_by_id.items():
+        try:
+            g = float(pair[0])
+        except Exception:
+            g = 1.0
+        try:
+            o = float(pair[1])
+        except Exception:
+            o = 0.0
+        if not math.isfinite(g):
+            g = 1.0
+        if not math.isfinite(o):
+            o = 0.0
+        gain_vals_before.append(g)
+        off_vals_before.append(o)
+
+        g_new = 1.0
+        o_new = max(offset_clip[0], min(offset_clip[1], o))
+        g_new = max(gain_clip[0], min(gain_clip[1], g_new))
+
+        gain_vals_after.append(g_new)
+        off_vals_after.append(o_new)
+        guarded[str(tid)] = (float(g_new), float(o_new))
+
+    if effective_tiles:
+        rebuilt: list[tuple[float, float]] = []
+        for entry in effective_tiles:
+            tid = str(entry.get("tile_id", ""))
+            rebuilt.append(guarded.get(tid, (1.0, 0.0)))
+        pending_affine_list = rebuilt
+    else:
+        pending_affine_list = list(guarded.values())
+
+    logger_obj.warning(
+        "[IntertileGuard] fallback=offset_only gain_before=[%.5f, %.5f] gain_after=[%.5f, %.5f] offset_before=[%.5f, %.5f] offset_after=[%.5f, %.5f]",
+        float(min(gain_vals_before) if gain_vals_before else 1.0),
+        float(max(gain_vals_before) if gain_vals_before else 1.0),
+        float(min(gain_vals_after) if gain_vals_after else 1.0),
+        float(max(gain_vals_after) if gain_vals_after else 1.0),
+        float(min(off_vals_before) if off_vals_before else 0.0),
+        float(max(off_vals_before) if off_vals_before else 0.0),
+        float(min(off_vals_after) if off_vals_after else 0.0),
+        float(max(off_vals_after) if off_vals_after else 0.0),
+    )
+    return pending_affine_list, guarded, meta
 
 
 def _mask_sds_low_coverage_pixels(
@@ -10531,6 +10816,25 @@ def _run_shared_phase45_phase5_pipeline(
         (0.95, 1.05),
     )
 
+    patchwork_suppressor_enabled_config = bool(phase5_options.get("patchwork_suppressor_enabled", False))
+    patchwork_suppressor_strength_config = str(phase5_options.get("patchwork_suppressor_strength", "normal") or "normal").strip().lower()
+    if patchwork_suppressor_strength_config not in {"low", "normal", "strong"}:
+        patchwork_suppressor_strength_config = "normal"
+    try:
+        patchwork_suppressor_sigma_px_config = float(phase5_options.get("patchwork_suppressor_sigma_px", 64.0) or 64.0)
+    except Exception:
+        patchwork_suppressor_sigma_px_config = 64.0
+    try:
+        patchwork_suppressor_seam_band_px_config = int(phase5_options.get("patchwork_suppressor_seam_band_px", 160) or 160)
+    except Exception:
+        patchwork_suppressor_seam_band_px_config = 160
+    try:
+        patchwork_suppressor_max_delta_config = float(phase5_options.get("patchwork_suppressor_max_delta", 0.20) or 0.20)
+    except Exception:
+        patchwork_suppressor_max_delta_config = 0.20
+    patchwork_suppressor_protect_stars_config = bool(phase5_options.get("patchwork_suppressor_protect_stars", True))
+    patchwork_suppressor_only_near_seams_config = bool(phase5_options.get("patchwork_suppressor_only_near_seams", True))
+
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(
         progress_callback,
@@ -11118,6 +11422,13 @@ def _run_shared_phase45_phase5_pipeline(
             zconfig=zconfig,
         ),
         telemetry_ctrl=None if sds_mode_phase5 else telemetry_ctrl,
+        patchwork_suppressor_enabled=bool(patchwork_suppressor_enabled_config),
+        patchwork_suppressor_strength=str(patchwork_suppressor_strength_config),
+        patchwork_suppressor_sigma_px=float(patchwork_suppressor_sigma_px_config),
+        patchwork_suppressor_seam_band_px=int(patchwork_suppressor_seam_band_px_config),
+        patchwork_suppressor_max_delta=float(patchwork_suppressor_max_delta_config),
+        patchwork_suppressor_protect_stars=bool(patchwork_suppressor_protect_stars_config),
+        patchwork_suppressor_only_near_seams=bool(patchwork_suppressor_only_near_seams_config),
     )
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -19668,6 +19979,20 @@ def assemble_final_mosaic_reproject_coadd(
         pending_affine_list = None
 
     if pending_affine_list and affine_by_id:
+        pending_affine_list, affine_by_id, _guard_meta = _apply_intertile_underconstrained_guard(
+            pending_affine_list=pending_affine_list,
+            affine_by_id=affine_by_id,
+            effective_tiles=effective_tiles,
+            worker_config_cache=worker_config_cache,
+            diagnostics_output_dir=diagnostics_output_dir,
+            existing_master_tiles_mode=bool(existing_master_tiles_mode),
+            logger_obj=logger,
+        )
+        if (not pending_affine_list) or (not affine_by_id):
+            nontrivial_affine = False
+            tile_affine_for_gpu = None
+
+    if pending_affine_list and affine_by_id:
         if diagnostics_output_dir is not None:
             _rows_aff = []
             for _entry in effective_tiles:
@@ -23559,6 +23884,10 @@ def run_hierarchical_mosaic_classic_legacy(
                             int(precheck.get("total", 0)),
                             existing_mt_qg_mode,
                         )
+                    try:
+                        worker_config_cache["existing_master_tiles_qg_suspect_count"] = int(precheck.get("suspect", 0) or 0)
+                    except Exception:
+                        pass
                     if existing_mt_qg_enabled and existing_mt_qg_mode == "fail" and int(precheck.get("suspect", 0)) > 0:
                         pcb(
                             "run_error_existing_master_tiles_quality_gate_failed",
@@ -25173,6 +25502,19 @@ def run_hierarchical_mosaic_classic_legacy(
             "tile_weight_v4_temporal_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_enabled", False)),
             "tile_weight_v4_temporal_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_strength", 0.20) or 0.20),
             "tile_weight_v4_temporal_penalty_hours": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_hours", 6.0) or 6.0),
+            "patchwork_suppressor_enabled": bool((worker_config_cache or {}).get("patchwork_suppressor_enabled", False)),
+            "patchwork_suppressor_strength": str((worker_config_cache or {}).get("patchwork_suppressor_strength", "normal") or "normal"),
+            "patchwork_suppressor_sigma_px": float((worker_config_cache or {}).get("patchwork_suppressor_sigma_px", 64.0) or 64.0),
+            "patchwork_suppressor_seam_band_px": int((worker_config_cache or {}).get("patchwork_suppressor_seam_band_px", 160) or 160),
+            "patchwork_suppressor_max_delta": float((worker_config_cache or {}).get("patchwork_suppressor_max_delta", 0.20) or 0.20),
+            "patchwork_suppressor_protect_stars": bool((worker_config_cache or {}).get("patchwork_suppressor_protect_stars", True)),
+            "patchwork_suppressor_only_near_seams": bool((worker_config_cache or {}).get("patchwork_suppressor_only_near_seams", True)),
+            "intertile_underconstrained_guard_enabled": bool((worker_config_cache or {}).get("intertile_underconstrained_guard_enabled", True)),
+            "intertile_underconstrained_max_pairs": int((worker_config_cache or {}).get("intertile_underconstrained_max_pairs", 1) or 1),
+            "intertile_underconstrained_max_active_tiles": int((worker_config_cache or {}).get("intertile_underconstrained_max_active_tiles", 2) or 2),
+            "intertile_underconstrained_force_mode": str((worker_config_cache or {}).get("intertile_underconstrained_force_mode", "offset_only") or "offset_only"),
+            "intertile_underconstrained_gain_clip": (worker_config_cache or {}).get("intertile_underconstrained_gain_clip", (0.85, 1.18)) or (0.85, 1.18),
+            "intertile_underconstrained_offset_clip": (worker_config_cache or {}).get("intertile_underconstrained_offset_clip", (-2000.0, 2000.0)) or (-2000.0, 2000.0),
             "existing_master_tiles_mode": bool(use_existing_master_tiles_mode),
         }
 

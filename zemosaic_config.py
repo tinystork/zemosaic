@@ -279,6 +279,13 @@ DEFAULT_CONFIG = {
     "intertile_pair_offset_abs_max": 5000.0,
     "intertile_max_irls_iters": 3,
     "intertile_enforce_requested_solver": False,
+    # Guardrail for sparse/underconstrained intertile solves.
+    "intertile_underconstrained_guard_enabled": True,
+    "intertile_underconstrained_max_pairs": 1,
+    "intertile_underconstrained_max_active_tiles": 2,
+    "intertile_underconstrained_force_mode": "offset_only",  # offset_only|disable_photometric
+    "intertile_underconstrained_gain_clip": [0.85, 1.18],
+    "intertile_underconstrained_offset_clip": [-2000.0, 2000.0],
     "intertile_global_recenter": True,
     "force_resolve_existing_wcs": False,
     "intertile_recenter_clip": [0.85, 1.18],
@@ -287,6 +294,14 @@ DEFAULT_CONFIG = {
     "use_auto_intertile": False,
     "match_background_for_final": True,
     "incremental_feather_parity": False,
+    # Phase 5 visual harmonization for low-frequency tile imprint suppression.
+    "patchwork_suppressor_enabled": False,
+    "patchwork_suppressor_strength": "normal",  # low|normal|strong
+    "patchwork_suppressor_sigma_px": 64.0,
+    "patchwork_suppressor_seam_band_px": 160,
+    "patchwork_suppressor_max_delta": 0.20,
+    "patchwork_suppressor_protect_stars": True,
+    "patchwork_suppressor_only_near_seams": True,
     "final_mosaic_dbe_enabled": True,
     "final_mosaic_dbe_strength": "normal",
     # Final black-point equalization (power-user; can alter low/mid ADU chroma balance)

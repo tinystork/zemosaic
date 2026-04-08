@@ -1,610 +1,136 @@
-# agent.md
+# agent.md — ZeMosaic mission brief (aesthetic-first, speed-safe)
 
-## Existing content
+## Product objective (updated)
+Deliver a mosaic output that is:
+1. **visually smooth and homogeneous** (background + nebulosity, minimal seams/patches/holes),
+2. **easy to edit** in Siril / PixInsight / Seti Astro Suite,
+3. while preserving ZeMosaic’s core advantage: **high-throughput processing of very large datasets**.
 
-# agent.md
-
-# ZeMosaic — Mission Codex / Junior
-## Seam root-cause elimination (Classic first, all modes preserved)
-
-Date: 2026-03-17
-Owner: Tristan / ZeMosaic core
-Mission mode: diagnostic-first / quality-first / surgical / strict non-regression
+This mission explicitly prioritizes aesthetic usability for most users, **without sacrificing** scientific integrity or pipeline speed.
 
 ---
 
-## Mission objective
+## Output contract (mandatory)
 
-Supprimer les seams visibles dans ZeMosaic en traitant **d’abord leurs causes structurelles**, puis seulement les artefacts résiduels de rendu.
+### Output A — Scientific
+- canonical FITS, physically faithful as much as possible,
+- never silently altered by aesthetic-only operations,
+- remains the reference output.
 
-La mission n’est plus pilotée principalement par:
-- le tuning visuel du blend,
-- ou un futur pass cosmétique de type seam-heal.
+### Output B — Aesthetic
+- dedicated visually-optimized FITS,
+- may include seam suppression + local hole-fill/inpainting,
+- intended for downstream editing workflows.
 
-La mission est désormais pilotée par ce triptyque:
-
-1. **graphe photométrique réellement retenu**
-2. **homogénéisation photométrique réellement obtenue**
-3. **weighting final réellement appliqué**
-
-But final:
-- obtenir une mosaïque visuellement beaucoup plus homogène,
-- conserver une voie FITS scientifiquement conservatrice,
-- éviter qu’un weighting trop affirmatif “imprime” la géométrie des master tiles dans le rendu final,
-- traiter d’abord le mode **Classic**, sans casser les autres modes.
+Naming recommendation:
+- `*_science.fits`
+- `*_aesthetic.fits`
 
 ---
 
-## Core diagnosis (current state)
+## Implemented foundations (already done)
 
-Constats consolidés à ce stade:
+### A) Patchwork suppressor
+- config + pipeline hook + logs (`[Patchwork]`) available.
 
-- Le problème principal ne semble **pas** être un manque global de recouvrement géométrique entre master tiles.
-- Le graphe brut de recouvrement est dense, mais le graphe réellement exploité après pruning est nettement plus maigre.
-- Les master tiles sont hétérogènes:
-  - couverture / nombre de raws,
-  - qualité locale / SNR,
-  - sessions temporelles éloignées,
-  - résidus photométriques parfois encore élevés après solve.
-- Le weighting final actuel peut amplifier cette hétérogénéité au lieu de la dissoudre.
-- Les seams visibles semblent naître **en amont** du polish visuel:
-  - solve photométrique trop simplifié ou trop agressivement pruné,
-  - tuiles insuffisamment homogénéisées,
-  - weighting final trop dominateur,
-  - puis seulement ensuite rendu des coutures.
+### B) Underconstrained intertile guardrail
+- sparse-graph detection + safe fallback + logs (`[IntertileGuard]`) available.
 
-Conclusion de travail:
-- **Visual seam-heal** reste une bonne idée, mais seulement comme finition.
-- La priorité doit porter sur:
-  1. diagnostic réel du pipeline,
-  2. graph rework,
-  3. weighting V4.
+These remain active as baseline protections.
 
 ---
 
-## Non-negotiable execution rules
+## New Objective C — Dual FITS export
+Status: **next implementation target**
 
-1. **Mode Classic d’abord.**
-   - Ne pas lancer de refactor transversal brutal SDS / ZeGrid / Existing master tiles.
-2. **Patchs chirurgicaux uniquement.**
-   - Pas de gros ménage architectural.
-3. **Prouver chaque claim.**
-   - Logs, exports, images diag, comparaisons avant/après.
-4. **Toujours séparer diagnostic et correction produit.**
-   - D’abord voir ce que fait réellement le pipeline, ensuite corriger.
-5. **Conserver la séparation science / visuel.**
-   - FITS: conservateur.
-   - rendu visuel: plus tolérant si nécessaire.
-6. **Tout nouveau levier sensible doit être config-gated.**
-   - Defaults conservateurs.
-7. **Aucune régression silencieuse.**
-   - outputs, coverage, headers, modes, GUI.
-8. **Mettre à jour `memory.md` à chaque itération significative.**
-9. **Respecter le comportement connu stable.**
-   - Ne pas toucher au comportement `batch size = 0` et `batch size > 1` qui fonctionne bien.
-10. **Ne pas dériver vers du tuning visuel prématuré.**
-    - `intertile_affine_blend` et futur seam-heal ne sont plus les axes principaux tant que la cause amont n’est pas clarifiée.
+### Requirements
+- [ ] Add `export_aesthetic_fits` switch.
+- [ ] Export both science and aesthetic FITS when enabled.
+- [ ] Guarantee no overwrite ambiguity (safe filenames).
+- [ ] Add metadata/header tags identifying branch + parameters.
+
+Suggested keys:
+```json
+"export_aesthetic_fits": false,
+"scientific_fits_suffix": "_science",
+"aesthetic_fits_suffix": "_aesthetic"
+```
 
 ---
 
-## Scope
+## New Objective D — Aesthetic hole-fill / seam completion
+Status: **next implementation target**
 
-### In scope
-- Instrumentation du pipeline réel de solve / intertile / final assembly
-- Export du graphe réellement retenu
-- Export des arêtes rejetées mais potentiellement fortes
-- Export des poids réellement appliqués aux master tiles
-- Export de l’ancre réellement utilisée
-- Export des gains / offsets / résidus par arête
-- Diagnostics de domination de tuile (winner map / weighted coverage)
-- Rework du graphe photométrique
-- Rework du weighting final (V4)
-- Validation comparative sur datasets réels hétérogènes
+Purpose:
+- remove residual “holes” and patch discontinuities in visual branch,
+- keep edits local and low-frequency aware,
+- avoid destructive star/core smearing.
 
-### Out of scope
-- Réécriture globale du worker
-- Beautification destructrice du signal
-- Généralisation immédiate à tous les modes sans preuve sur Classic
-- Finition visuelle lourde avant résolution des causes amont
+### V1 behavior (aesthetic branch only)
+- detect invalid/near-invalid holes from coverage/alpha maps,
+- fill locally using seam-aware inpainting / low-frequency completion,
+- feather transitions to avoid hard patches,
+- protect compact high-frequency structures (stars, sharp filaments).
+
+Suggested keys:
+```json
+"aesthetic_hole_fill_enabled": true,
+"aesthetic_hole_fill_max_radius_px": 64,
+"aesthetic_hole_fill_blend": 0.7,
+"aesthetic_hole_fill_only_near_seams": true
+```
+
+---
+
+## Throughput constraint (non-negotiable)
+
+Any new aesthetic module must respect large-scale throughput:
+- O(N) / tiled-friendly memory behavior,
+- no heavy global optimization loops in default mode,
+- one-pass or bounded multi-pass,
+- optional stronger mode allowed only as explicit opt-in.
+
+Default should stay **fast + robust**.
+
+---
+
+## Validation matrix (must complete)
+
+### Sparse pathological case (existing master tiles)
+- [ ] baseline (A/B off)
+- [ ] A+B on
+- [ ] A+B+C (dual export)
+- [ ] A+B+C+D (with hole-fill)
+
+### Dense normal case
+- [ ] regression check runtime
+- [ ] regression check visual integrity
+
+### Performance checks
+- [ ] runtime overhead delta (%)
+- [ ] peak RAM delta
+- [ ] output size delta
+
+---
+
+## Acceptance criteria
+
+### Visual (aesthetic branch)
+- visibly reduced seams/patches,
+- problematic holes substantially reduced or visually neutralized,
+- output judged “ready to edit” in Siril/PixInsight/Seti Astro Suite.
+
+### Integrity (science branch)
+- scientific FITS unchanged in semantics vs baseline branch.
+
+### Performance
+- no unacceptable slowdown on large runs,
+- throughput profile remains compatible with thousands-of-frames workflows.
 
 ---
 
 ## Priority order
-
-### P0 — Instrument real pipeline
-Comprendre exactement ce que ZeMosaic fait réellement sur un gros dataset hétérogène.
-
-### P1 — Photometric graph rework
-Réduire la perte d’information utile causée par le pruning actuel.
-
-### P2 — Weighting V4
-Faire du weighting un outil de couture, pas de domination globale.
-
-### P3 — Visual seam finishing
-Seulement après P0/P1/P2, pour les résidus basse fréquence restants.
-
----
-
-## Mission phases
-
-### [ ] A — Baseline and diagnostics freeze
-- Geler le dataset de référence principal.
-- Geler les sorties de benchmark déjà obtenues.
-- Définir clairement les comparaisons à refaire:
-  - weighting OFF
-  - weighting ON actuel
-  - future weighting V4
-
-### [ ] B — Real pipeline instrumentation
-- Exporter le graphe réellement retenu par le pipeline.
-- Exporter les arêtes fortes rejetées.
-- Exporter l’ancre réellement choisie.
-- Exporter les gains / offsets photométriques avant/après solve.
-- Exporter les résidus par arête.
-- Exporter les poids finaux réellement appliqués par tuile.
-- Produire une winner map / dominant-tile map.
-- Produire une weighted-coverage map.
-- Journaliser la source exacte des poids en mode “existing master tiles”.
-
-### [ ] C — Root-cause proof
-- Prouver où naissent réellement les seams:
-  - solve insuffisant,
-  - pruning trop agressif,
-  - weighting trop fort,
-  - combinaison des trois.
-- Corréler:
-  - seams visibles,
-  - winner map,
-  - weighted coverage,
-  - résidus photométriques,
-  - structure des tuiles.
-
-### [ ] D — Photometric graph rework
-- Tester un pruning moins brutal.
-- Étudier un top-K adaptatif selon densité locale.
-- Étudier un score d’arête combinant:
-  - overlap,
-  - stabilité photométrique,
-  - cohérence temporelle.
-- Étudier une logique par cohortes temporelles si utile.
-
-### [ ] E — Weighting V4
-- Conserver `master tile weighting = OFF` comme profil conservatoire tant que V4 n’est pas validé.
-- Introduire une compression forte de dynamique (`sqrt`, `log`, soft-cap ou équivalent robuste).
-- Réduire la domination au centre des tuiles.
-- Favoriser un plateau intérieur quasi neutre et un weighting surtout utile en couture.
-- Ajouter cap / pénalité si résidu photométrique trop élevé.
-- Ajouter pénalité d’hétérogénéité temporelle si nécessaire.
-
-### [ ] F — Validation
-- Comparer sur mêmes master tiles:
-  - OFF
-  - ON actuel
-  - ON V4
-- Vérifier:
-  - réduction des seams,
-  - réduction de l’empreinte rectangulaire des tiles,
-  - pas de dérive couleur,
-  - pas de régression géométrique,
-  - pas de halos / banding / zones molles.
-
-### [ ] G — Visual seam finishing (only after A/B/C/D/E)
-- Réévaluer le futur pass low-frequency seam-heal.
-- Le garder explicitement visuel, optionnel, OFF par défaut.
-- L’utiliser uniquement pour polir les résidus restants, pas pour masquer un solve/weighting défaillant.
-
----
-
-## Release gate (mission)
-
-Mission close only if:
-
-1. Les seams ont diminué de manière visible sur dataset de référence.
-2. L’empreinte géométrique des master tiles n’est plus fortement imprimée dans le rendu final.
-3. Le pipeline réel est instrumenté de manière exploitable pour debug futur.
-4. Le weighting V4 apporte un gain réel ou, à défaut, le choix OFF par défaut est documenté et justifié.
-5. Aucun mode n’a subi de régression fonctionnelle majeure.
-6. `memory.md` conserve un historique clair du pivot, des preuves et des décisions.
-
----
-
-## Product stance (important)
-
-Tant que le pipeline réel n’est pas suffisamment instrumenté et que le weighting V4 n’est pas validé:
-
-- ne pas considérer un futur seam-heal comme la réponse principale,
-- ne pas surinvestir dans le tuning cosmétique,
-- considérer que la suppression durable des seams passe d’abord par:
-  - un meilleur graphe photométrique,
-  - une meilleure homogénéisation,
-  - un weighting final moins dominateur.
-
----
-
-## Addendum 2026-03-20 — Proto V4 + prudence régression Classic
-
-### Avancement concret
-- Un proto **Weighting V4 config-gated** a été branché (compression + bornes), sans activation par défaut.
-- Le pruning intertile est désormais **pilotable par config** (`intertile_prune_k`, `intertile_prune_weight_mode`) au lieu d'un seul K figé.
-- Objectif maintenu: comparer OFF / ON actuel / ON V4 sur même mini-dataset avant toute décision de défaut produit.
-
-### Guardrail majeur (hérité des incidents de régression)
-Le code de la voie Classic est **fortement intriqué** avec d'autres branches de pipeline.
-Toute modification en Classic doit être considérée à risque de casse collatérale si non isolée.
-
-Règles opératoires renforcées:
-1. Avant patch: identifier explicitement la/les fonctions partagées touchées.
-2. Pendant patch: privilégier les flags config-gated et les defaults conservateurs.
-3. Après patch: vérifier au minimum non-régression rapide sur Classic / ZeGrid / SDS.
-4. Traçabilité: documenter systématiquement dans `memory.md` la zone touchée + risque + preuve compile/test/run.
-
-### Position mission
-- Continuer le pivot root-cause (graph + weighting réel),
-- mais avec discipline stricte de non-régression multi-voies,
-- et sans multiplier les sources d'info hors `memory.md` (source de vérité opérationnelle).
-
-
-## Imported from agent_prepivot_20260317.md
-
-# agent.md
-
-# ZeMosaic — Mission Codex
-## Seamless Mosaic & Viewer Preview Quality (all modes)
-
-Date: 2026-03-15
-Owner: Tristan / ZeMosaic core
-Mission mode: quality-first / surgical / strict non-regression
-
----
-
-## Mission objective
-
-Atteindre un rendu final visuellement homogène et propre dans tous les modes en ciblant 3 défauts majeurs encore présents:
-
-1. **Lignes de couture inter-tuiles visibles** (parfois très visibles)
-2. **PNG viewer final trop stretché / mal tonemappé** (coeurs brûlés ou rendu trop sombre selon preset)
-3. **`poststack_equalize_rgb` instable** (sur-correction chromatique sur certains datasets, drift R/B)
-
-Objectif final:
-- produire un rendu **seamless** (ou quasi seamless) inter-tuiles,
-- conserver la fidélité scientifique des FITS,
-- améliorer le rendu PNG viewer sans sur-stretch,
-- garantir la cohérence inter-modes: **Classique / Existing master tiles / SDS / ZeGrid**.
-
----
-
-## Context to preserve
-
-- Les pipelines sont maintenant fonctionnels dans tous les modes (outputs générés correctement).
-- La priorité passe de la stabilité fonctionnelle à la **qualité visuelle finale**.
-- Les précédentes améliorations DBE/RGB/normalisation doivent être conservées (pas de rollback implicite).
-- Le PNG viewer est un produit de visualisation: son amélioration ne doit pas altérer les sorties FITS scientifiques.
-
----
-
-## Non-negotiable execution rules
-
-1. **Ne pas casser les voies exclusives**: Classique, SDS, ZeGrid, Existing-master-tiles.
-2. **Patchs incrémentaux, un problème à la fois** (coutures puis stretch viewer).
-3. **Aucune régression silencieuse** sur FITS/coverage/output structure.
-4. **Toujours prouver** les claims (logs, captures, stats, comparaison avant/après).
-5. **Ne pas forcer une recette unique brute** si un mode nécessite un tuning dédié.
-6. **Séparer science vs esthétique**: FITS intacts, viewer PNG optimisé à part.
-7. **Traçabilité obligatoire** dans `memory.md` à chaque itération significative.
-8. **Garder des switches config** pour les nouveaux leviers sensibles (defaults conservateurs).
-
----
-
-## Scope
-
-### In scope
-- Audit des mécanismes de fusion inter-tuiles (weights, feather, overlap normalization, blending)
-- Audit des causes visuelles de seams par mode
-- Ajustements du blending/normalisation locale pour réduire les coutures
-- Audit du pipeline de génération preview PNG (stretch, clip, black/white points, saturation)
-- Nouvelle stratégie de stretch viewer plus robuste (moins brûlée, fond plus propre)
-- Validation comparative inter-modes
-
-### Out of scope
-- Réécriture globale de l’architecture worker
-- Changement des invariants scientifiques des FITS
-- “Beautification” extrême destructrice de signal
-
----
-
-## Mission phases
-
-### [ ] S0 — Baseline visuelle & métriques
-- Constituer un jeu de référence avant/après (au moins 1 run par mode si possible, sinon priorité ZeGrid + mode classique).
-- Définir des métriques simples et traçables:
-  - contraste des seams en zone overlap (delta médiane/gradient de frontière),
-  - clipping hautes lumières sur PNG,
-  - niveau de fond (stabilité + propreté perceptuelle).
-- Capturer baseline (images + logs + config snapshot).
-
-### [ ] S1 — Audit couture inter-tuiles
-- Cartographier les mécanismes existants par mode:
-  - pondération, feather, overlap blending, recenter photométrique, normalisation locale.
-- Identifier où les seams naissent réellement:
-  - mismatch photométrique local,
-  - transitions de poids trop abruptes,
-  - manque de compensation locale de fond,
-  - différences de stack tile-à-tile.
-- Produire une table "cause probable / preuve / mode impacté".
-
-### [ ] S2 — Correctifs seamless (priorité couture)
-- Implémenter des corrections progressives et config-gated:
-  - adoucir transitions overlap (feather/weight profile),
-  - harmonisation locale inter-tuiles (offset/gain robuste),
-  - garde-fous anti-surcorrection.
-- Commencer par le mode le plus touché, puis généraliser prudemment.
-- Journaliser précisément les nouveaux paramètres.
-
-### [ ] S3 — Audit stretch PNG viewer
-- Tracer le pipeline exact de génération preview PNG (où et comment le stretch est appliqué).
-- Confirmer les causes du rendu trop agressif:
-  - percentiles trop extrêmes,
-  - black-point/white-point mal bornés,
-  - gamma/saturation inadaptés,
-  - masquage NaN/alpha influençant le rendu.
-
-### [ ] S4 — Correctifs viewer (esthétique contrôlée)
-- Introduire un stretch viewer plus équilibré (moins de blancs brûlés, fond mieux tenu).
-- Prévoir presets/toggles si nécessaire (conservateur par défaut).
-- Garantir: pas d’impact sur FITS scientifiques.
-
-### [ ] S5 — Validation inter-modes & non-régression
-- Runs comparatifs avant/après sur modes clés.
-- Vérifier:
-  - réduction visible des coutures,
-  - PNG viewer plus naturel,
-  - absence de régression fonctionnelle/scientifique.
-- Documenter limites résiduelles (si certaines coutures restent sur cas extrêmes).
-
-### [ ] S5bis — Assainissement conceptuel `poststack_equalize_rgb`
-- Prouver et documenter la cause de drift:
-  - égalisation par médianes globales par sous-stack sans masque “fond/objets”,
-  - sensibilité aux couvertures partielles et gradients non homogènes.
-- Redéfinir l’algorithme pour un comportement conservateur:
-  - estimation des gains sur masque robuste (fond valide, exclusion objets brillants),
-  - clip gains serré (ex. `[0.95, 1.05]` par défaut),
-  - seuil minimum de fiabilité (samples/overlap), sinon no-op.
-- Règle produit: **OFF par défaut** tant que la version robuste n’est pas validée terrain.
-
-### [ ] S6 — Clôture mission
-- Rapport final:
-  - gains visuels mesurés + ressenti,
-  - impacts perf/mémoire,
-  - nouveaux paramètres et defaults,
-  - recommandations d’usage terrain.
-- Décision finale GO / NO-GO production.
-
----
-
-## Release gate (mission)
-
-Mission close only if:
-1. Les coutures inter-tuiles sont significativement atténuées sur les cas de référence.
-2. Le PNG viewer n’est plus sur-stretché (moins de blancs brûlés, fond plus propre).
-3. Aucun mode n’a subi de régression fonctionnelle majeure.
-4. Les nouveaux réglages sensibles sont documentés et pilotables par config/GUI si pertinent.
-5. `poststack_equalize_rgb` est soit robustifié et validé, soit maintenu OFF par défaut avec justification documentée.
-6. `memory.md` conserve un historique clair des corrections et variables branchées.
-
-
----
-
-## Addendum mission — 2026-03-16 (réévaluation visuelle seams)
-
-### Constat consolidé (log lourd, machine plus puissante)
-- Les seams restent pilotés par des deltas de fond locaux élevés sur certaines jonctions (preuve: `TwoPassWorst abs_delta_med` très élevés), malgré des gains globaux proches de 1.
-- Les overlaps observés sont souvent modestes (~3–8%), ce qui limite la robustesse de la correction locale.
-- Le patchwork perçu provient davantage d'un résidu basse fréquence inter-tuiles que d'un simple problème de stretch preview.
-
-### Décision produit (priorité visuelle assumée)
-- **Oui, amélioration visuelle nette possible** au prix d'une baisse de pureté scientifique sur la sortie de visualisation.
-- Conserver la séparation stricte:
-  - FITS: voie conservatrice/scientifique.
-  - PNG/rendu visuel: voie "visual-first" plus tolérante et plus lissante.
-
-### Profil recommandé "VISUAL_SEAMLESS_v1" (proposition réévaluée)
-> Ajustement de la proposition précédente: `intertile_overlap_min` est maintenu à `0.05` (au lieu de 0.10) pour éviter de perdre trop de contraintes utiles sur ce dataset.
-
-Paramètres cibles:
-- `poststack_equalize_rgb = false`
-- `intertile_affine_blend = 0.40`
-- `intertile_recenter_clip = [0.96, 1.04]`
-- `intertile_overlap_min = 0.05`
-- `intertile_robust_clip_sigma = 2.0`
-- `apply_radial_weight = true`
-- `radial_feather_fraction = 0.94`
-- `radial_shape_power = 2.6`
-- `final_mosaic_dbe_enabled = true`
-- `final_mosaic_dbe_strength = "normal"`
-- `final_mosaic_dbe_smoothing = 0.75`
-- `final_mosaic_dbe_sample_step = 20`
-- `final_mosaic_dbe_obj_dilate_px = 4`
-- `preview_png_apply_wb = false`
-- `preview_png_p_low = 0.40`
-- `preview_png_p_high = 99.93`
-- `preview_png_asinh_a = 0.14`
-
-### Nouvelle proposition d'architecture (à traiter plus tard)
-- Ajouter un **pass optionnel "seam-heal low-frequency"** (preview/rendu visuel):
-  - détection des zones de couture,
-  - correction locale du fond à basse fréquence uniquement,
-  - diffusion douce de la correction pour éviter halos/banding.
-- Garder ce pass **désactivé par défaut** côté science, activable dans un preset visuel.
-
-
----
-
-## Addendum 2026-03-26 — Pivot exécution: normalisation globale inter‑tuiles avant reprojection
-
-### Décision
-Le prochain levier principal pour supprimer les seams est désormais explicite:
-
-1. **Normaliser photométriquement les tuiles entre elles avant reprojection**,
-2. **résoudre globalement sur l’ensemble des overlaps**,
-3. **conserver le tile weighting en aval pour le blend**,
-4. **ajouter un feather multibande léger uniquement si nécessaire**.
-
-Le weighting seul ne doit plus être considéré comme un mécanisme suffisant de correction photométrique.
-
-### Modèle cible
-Pour chaque tuile `t`:
-
-`I_corr_t = a_t * I_t + b_t`
-
-- V1 robuste: `b_t` seulement (offset-only)
-- V2: `a_t + b_t` (gain + offset) avec garde-fous
-
-### Principe de solve
-- Les contraintes sont extraites sur zones de recouvrement `(i,j)` via stats robustes.
-- Le solve est **global** (pas pairwise isolé), avec ancre fixée:
-  - `a_ref = 1`
-  - `b_ref = 0`
-- Régularisation légère pour éviter dérives inutiles (notamment sur `a_t`).
-
-### Ordre pipeline imposé
-1. Estimation contraintes overlaps
-2. Solve global photométrique
-3. Application des corrections par tuile (`a,b`)
-4. Reprojection géométrique
-5. Tile weighting / blend final
-6. Feather multibande léger (optionnel, visuel, prudent)
-
-### Guardrails
-- Config-gated, defaults conservateurs.
-- Clamp sur `a_t` et `b_t` pour éviter sur-corrections.
-- Rejet robuste des outliers (saturations, étoiles extrêmes, bords instables).
-- Pas d’impact silencieux sur sorties science/FITS.
-
-### Critères de validation mission
-- baisse mesurable des deltas de fond sur overlaps,
-- baisse des seams visibles aux frontières,
-- stabilité photométrique des étoiles communes,
-- pas de régression géométrique / couleur / modes.
-
-## Addendum 2026-03-26 (après runs D/E) — Impasse M1 et bascule M2
-
-### Constat terrain
-- Le mode **M1 offset-only** (normalisation additive seule) n'apporte pas de réduction visuelle significative des seams sur le dataset hétérogène courant.
-- Les comparatifs D/E montrent surtout un shift photométrique global, pas une amélioration structurelle des discontinuités inter‑tuiles.
-
-### Décision mission
-- M1 reste utile comme baseline de diagnostic, mais n'est plus la cible principale.
-- La trajectoire active devient **M2 gain+offset robuste** avec garde-fous:
-  - solve global ancré (`a_ref=1`, `b_ref=0`),
-  - régularisation légère des gains vers 1,
-  - rejet des paires aberrantes,
-  - clamps conservateurs des corrections finales.
-
-### Critère d'acceptation immédiat
-- Ne pas juger M2 à l'œil uniquement:
-  - exiger logs `constraints/kept/rejected`, `residual_abs_med/p95`, `worst pairs`,
-  - puis comparer seams et métriques sur run dédié (M2 ON / M1 OFF).
-
-
-
-## Addendum 2026-03-30 (runs L/M + préparation N)
-
-### Constat
-- L -> M: amélioration incrémentale seulement (pas de saut visuel massif).
-- Run M confirme l'effet de `tile_weight_v4` (ratio tile weights 1.10 au lieu de 1.00).
-- `SeamHeal` actif sur L et M, gains surtout sur indicateurs seam-weight, faible sur `delta_abs_p95`.
-
-### Décision de méthode
-- Continuer en **un seul changement par run** pour garder une attribution causale claire.
-- Préparer le run N en GUI-launch avec une variable unique: `visual_seam_heal_strength`.
-
-
-## Addendum 2026-03-30 (bascule étape suivante — brique multiscale)
-
-Décision:
-- Stopper le fine-tuning mono-paramètre du seam-heal v1 (gains marginaux, seams encore visibles).
-- Passer à une brique plus structurante: **SeamHeal preview multiscale** (Phase 6, visuel uniquement).
-
-Implémentation installée:
-- Nouveau mode config-gated dans `zemosaic_worker.py`:
-  - `_apply_visual_seam_heal_multiscale(...)`
-  - pass 1 low-frequency (v1 existant)
-  - pass 2 mid-scale (amplitude réduite) pour mieux lisser les discontinuités persistantes
-- Nouvelles clés `DEFAULT_CONFIG`:
-  - `visual_seam_heal_multiscale_enabled`
-  - `visual_seam_heal_multiscale_mid_gain`
-  - `visual_seam_heal_multiscale_mid_sigma_scale`
-  - `visual_seam_heal_multiscale_mid_rel_scale`
-- Validation technique: `py_compile` OK.
-
-
-## Addendum 2026-03-31 (plan runs témoins avant recalibration géométrique)
-
-Décision opératoire validée:
-- Ne pas engager immédiatement la recalibration géométrique.
-- Exécuter d'abord 2 runs témoins pour dissocier limite algorithme vs limite dataset.
-
-Runs planifiés:
-1) `M106_2` sur `/home/tristan/zemosaic/zemosaic/example/lights/` (run complet).
-2) `NGC6888_6` sur `/media/tristan/X10 Pro/mosaic/test/NGC6888_4/zemosaic_temp_master_tiles/` (existing masters).
-
-Règle stricte:
-- Conserver un seul axe de variation (dataset), avec réglages seam/blend identiques.
-- Après comparaison métriques + visuel: décision GO/NO-GO recalibration géométrique.
-
-
-## Addendum 2026-04-01 — Runs témoins effectués (M106_2 / NGC6888_6)
-
-Statut:
-- `M106_2` exécuté et complété.
-- `NGC6888_6` exécuté et complété.
-
-Conclusion opérationnelle:
-- Les deux runs témoins sont jugés **non concluants** pour valider une amélioration seams suffisamment décisive.
-- La phase de micro-retune visuelle seule n'est pas suffisante pour clore la mission.
-
-Décision mission:
-- Prioriser les axes structurels (pondération effective, masques/alpha, reproject/coadd, instrumentation winner/coverage) avant toute nouvelle série de micro-ajustements visuels.
-- Conserver la discipline: un changement causal à la fois, preuve logs + artefacts à chaque itération.
-
-
-## Addendum 2026-04-01 — Instrumentation diagnostic structurelle
-
-Ajout validé:
-- `winner_map` + `weighted_coverage_map` exportés automatiquement en sortie run.
-- Graphe intertile exporté en 3 vues (raw/kept/rejected) + résumé JSON.
-
-Règle d'exploitation:
-- toute hypothèse "trou" doit être corrélée à ces artefacts (pas uniquement au rendu PNG).
-- privilégier explication causale: zone vide = faible weighted coverage + winner instable + arêtes critiques rejetées.
-
-## Addendum 2026-04-05 — Phase 3 extreme split identity (single-tile invariant)
-
-Décision produit rappelée: le split interne d'un groupe extrême sert uniquement à éviter OOM (RAM/VRAM).
-La sortie canonique de fin de traitement doit rester **une seule master tile logique** (`master_tile_<tile_id>.fits`).
-
-Consigne d'implémentation:
-- les sous-tiles/chunks internes sont des artefacts transitoires,
-- la finalisation doit repasser par la tuile logique d'origine,
-- éviter le passthrough brut d'un chunk comme sortie finale implicite,
-- nettoyer les artefacts internes après finalisation quand possible.
-
-## Addendum 2026-04-05 — P0 mission reorientation: unified memory orchestrator (all phases)
-
-Objectif prioritaire validé avec Tristan:
-- ZeMosaic doit rester opérationnel sur petites/anciennes machines (RAM/VRAM limitées),
-- avec un orchestrateur mémoire unifié couvrant **toutes les phases** (P1→P6),
-- et des garde-fous « hard caps » pour éviter les `exitcode=-9`/OOM kill.
-
-Principes produit:
-- adaptation mémoire = contrainte de sûreté, pas optimisation opportuniste uniquement;
-- budget global unique (RAM + VRAM) décliné en sous-budgets phase/task;
-- marges de sécurité explicites (OS + fragmentation + overhead libs);
-- comportement déterministe en low-RAM: réduction contrôlée de concurrence/chunks/passes,
-  sans casser la sémantique scientifique.
-
-Definition of done (P0):
-1) run Linux 8GB complet sans `Worker process terminated unexpectedly (exitcode=-9)`;
-2) logs explicites de budget hard-cap et raisons de refus d'escalade;
-3) contrôleur stabilisé (pas d'oscillation agressive post-décrue courte);
-4) non-régression de la règle single-tile identity pour les groupes extrêmes Phase 3.
+1. Objective C (dual FITS export)
+2. Objective D (hole-fill visual completion)
+3. tuning presets (Balanced / Strong)
+4. finalize default profile for production.
