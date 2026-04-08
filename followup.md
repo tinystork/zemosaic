@@ -37,17 +37,17 @@ Primary product target is now:
 ## TODO by objective
 
 ### C — Dual FITS export
-- [ ] Add config keys (`export_aesthetic_fits`, suffixes)
+- [x] Add config keys (`export_aesthetic_fits`, suffixes)
 - [ ] Add UI switch + help text
-- [ ] Export both files in one run when enabled
-- [ ] Add explicit logs + header provenance
+- [x] Export both files in one run when enabled
+- [x] Add explicit logs + header provenance
 
 ### D — Aesthetic hole-fill
-- [ ] Add hole-mask detection from coverage/alpha
-- [ ] Add local inpainting/fill (aesthetic branch only)
+- [x] Add hole-mask detection from coverage/alpha
+- [x] Add local inpainting/fill (aesthetic branch only)
 - [ ] Add blend/feather controls
 - [ ] Add star/detail protection guard
-- [ ] Add diagnostics (`[AestheticFill]` suggested)
+- [x] Add diagnostics (`[AestheticFill]` suggested)
 
 ### Performance guardrails
 - [ ] Measure runtime overhead on sparse + dense runs

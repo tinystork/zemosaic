@@ -4349,6 +4349,136 @@ def _apply_patchwork_suppressor_if_requested(
     return out, info
 
 
+def _apply_aesthetic_hole_fill(
+    mosaic_hwc: np.ndarray | None,
+    *,
+    alpha_mask: np.ndarray | None = None,
+    coverage_hw: np.ndarray | None = None,
+    enabled: bool = False,
+    max_radius_px: int = 64,
+    blend: float = 0.70,
+    only_near_seams: bool = True,
+    logger: logging.Logger | None = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Visual-only local hole completion for aesthetic branch."""
+
+    info: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "reason": "disabled" if not enabled else "",
+        "filled_px": 0,
+        "hole_px": 0,
+        "max_radius_px": int(max_radius_px),
+        "blend": float(blend),
+        "only_near_seams": bool(only_near_seams),
+    }
+    if not enabled or mosaic_hwc is None or not isinstance(mosaic_hwc, np.ndarray):
+        return mosaic_hwc, info
+    if mosaic_hwc.ndim != 3 or mosaic_hwc.shape[-1] != 3:
+        info["reason"] = "non_rgb"
+        return mosaic_hwc, info
+
+    try:
+        max_radius_px = int(max(4, min(512, int(max_radius_px))))
+    except Exception:
+        max_radius_px = 64
+    try:
+        blend = float(max(0.0, min(1.0, float(blend))))
+    except Exception:
+        blend = 0.70
+
+    rgb = np.asarray(mosaic_hwc, dtype=np.float32)
+    out = np.array(rgb, copy=True)
+
+    valid = np.isfinite(rgb).all(axis=-1)
+    if isinstance(alpha_mask, np.ndarray):
+        try:
+            a = np.asarray(alpha_mask)
+            if a.ndim == 3 and a.shape[-1] == 1:
+                a = a[..., 0]
+            elif a.ndim > 2:
+                a = np.squeeze(a)
+            if a.shape[:2] == valid.shape:
+                valid &= (a > 0)
+        except Exception:
+            pass
+    elif isinstance(coverage_hw, np.ndarray):
+        try:
+            c = np.asarray(coverage_hw, dtype=np.float32)
+            if c.ndim > 2:
+                c = np.squeeze(c)
+            if c.shape[:2] == valid.shape:
+                valid &= np.isfinite(c) & (c > 0)
+        except Exception:
+            pass
+
+    hole = ~valid
+    hole_px = int(np.count_nonzero(hole))
+    info["hole_px"] = hole_px
+    if hole_px <= 0:
+        info["reason"] = "no_holes"
+        return out, info
+
+    target = hole.copy()
+    dist = None
+    if only_near_seams:
+        try:
+            import cv2  # type: ignore
+            dist = cv2.distanceTransform(hole.astype(np.uint8), cv2.DIST_L2, 3)
+            target = hole & (dist <= float(max_radius_px))
+        except Exception:
+            # fallback: binary dilation-limited mask via blur threshold
+            soft = _gaussian_blur_2d_float32(hole.astype(np.float32), sigma_px=max(1.0, float(max_radius_px) / 6.0))
+            target = hole & (soft > 0.05)
+
+    fill_px = int(np.count_nonzero(target))
+    info["filled_px"] = fill_px
+    if fill_px <= 0:
+        info["reason"] = "no_target_after_radius"
+        return out, info
+
+    if dist is None:
+        # approximate feather where distance transform unavailable
+        soft = _gaussian_blur_2d_float32(target.astype(np.float32), sigma_px=max(1.0, float(max_radius_px) / 5.0))
+        feather = np.clip(soft, 0.0, 1.0) * float(blend)
+    else:
+        feather = np.clip((float(max_radius_px) - dist) / max(1.0, float(max_radius_px)), 0.0, 1.0) * float(blend)
+    feather *= target.astype(np.float32)
+
+    for ch in range(3):
+        src = out[..., ch]
+        if np.any(valid):
+            med = float(np.nanmedian(src[valid]))
+        else:
+            med = 0.0
+        seeded = np.where(valid, src, med).astype(np.float32, copy=False)
+        sigma_fill = max(2.0, float(max_radius_px) * 0.5)
+        smooth = _gaussian_blur_2d_float32(seeded, sigma_fill)
+        src_nonan = np.where(np.isfinite(src), src, smooth)
+        src[:] = np.where(
+            target,
+            src_nonan * (1.0 - feather) + smooth * feather,
+            src_nonan,
+        )
+
+    info["applied"] = True
+    info["reason"] = "ok"
+
+    if logger is not None:
+        logger.info(
+            "[AestheticFill] enabled=%s applied=%s hole_px=%d filled_px=%d max_radius_px=%d blend=%.3f only_near_seams=%s",
+            bool(enabled),
+            True,
+            hole_px,
+            fill_px,
+            int(max_radius_px),
+            float(blend),
+            bool(only_near_seams),
+        )
+
+    return out, info
+
+
 def _load_intertile_graph_summary(diagnostics_output_dir: Path | None) -> dict[str, Any]:
     if diagnostics_output_dir is None:
         return {}
@@ -25515,6 +25645,14 @@ def run_hierarchical_mosaic_classic_legacy(
             "intertile_underconstrained_force_mode": str((worker_config_cache or {}).get("intertile_underconstrained_force_mode", "offset_only") or "offset_only"),
             "intertile_underconstrained_gain_clip": (worker_config_cache or {}).get("intertile_underconstrained_gain_clip", (0.85, 1.18)) or (0.85, 1.18),
             "intertile_underconstrained_offset_clip": (worker_config_cache or {}).get("intertile_underconstrained_offset_clip", (-2000.0, 2000.0)) or (-2000.0, 2000.0),
+            "export_aesthetic_fits": bool((worker_config_cache or {}).get("export_aesthetic_fits", False)),
+            "scientific_fits_suffix": str((worker_config_cache or {}).get("scientific_fits_suffix", "_science") or "_science"),
+            "aesthetic_fits_suffix": str((worker_config_cache or {}).get("aesthetic_fits_suffix", "_aesthetic") or "_aesthetic"),
+            "aesthetic_fits_use_patchwork": bool((worker_config_cache or {}).get("aesthetic_fits_use_patchwork", True)),
+            "aesthetic_hole_fill_enabled": bool((worker_config_cache or {}).get("aesthetic_hole_fill_enabled", True)),
+            "aesthetic_hole_fill_max_radius_px": int((worker_config_cache or {}).get("aesthetic_hole_fill_max_radius_px", 64) or 64),
+            "aesthetic_hole_fill_blend": float((worker_config_cache or {}).get("aesthetic_hole_fill_blend", 0.70) or 0.70),
+            "aesthetic_hole_fill_only_near_seams": bool((worker_config_cache or {}).get("aesthetic_hole_fill_only_near_seams", True)),
             "existing_master_tiles_mode": bool(use_existing_master_tiles_mode),
         }
 
@@ -27839,6 +27977,64 @@ def run_hierarchical_mosaic_classic_legacy(
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         legacy_rgb_flag = bool(legacy_rgb_cube_config)
         save_display_fits_config = bool(getattr(zconfig, "save_display_fits", False))
+
+        _cfg_cache_local = locals().get("worker_config_cache", {})
+        if not isinstance(_cfg_cache_local, dict):
+            _cfg_cache_local = {}
+
+        export_aesthetic_fits_config = _coerce_bool_flag(getattr(zconfig, "export_aesthetic_fits", None))
+        if export_aesthetic_fits_config is None:
+            export_aesthetic_fits_config = _coerce_bool_flag(_cfg_cache_local.get("export_aesthetic_fits", False))
+        if export_aesthetic_fits_config is None:
+            export_aesthetic_fits_config = False
+        export_aesthetic_fits_config = bool(export_aesthetic_fits_config)
+
+        scientific_suffix_cfg = str(getattr(zconfig, "scientific_fits_suffix", _cfg_cache_local.get("scientific_fits_suffix", "_science")) or "_science")
+        aesthetic_suffix_cfg = str(getattr(zconfig, "aesthetic_fits_suffix", _cfg_cache_local.get("aesthetic_fits_suffix", "_aesthetic")) or "_aesthetic")
+
+        def _clean_suffix(val: str, default: str) -> str:
+            sfx = str(val or default).strip()
+            if not sfx:
+                sfx = default
+            if not sfx.startswith("_"):
+                sfx = f"_{sfx}"
+            sfx = "".join(ch for ch in sfx if ch.isalnum() or ch in {"_", "-"})
+            if not sfx:
+                sfx = default
+            return sfx
+
+        scientific_suffix_cfg = _clean_suffix(scientific_suffix_cfg, "_science")
+        aesthetic_suffix_cfg = _clean_suffix(aesthetic_suffix_cfg, "_aesthetic")
+        if aesthetic_suffix_cfg == scientific_suffix_cfg:
+            aesthetic_suffix_cfg = "_aesthetic"
+
+        science_fits_path = final_fits_path
+        aesthetic_fits_path = output_folder_path / f"{output_base_name}{aesthetic_suffix_cfg}.fits"
+        if export_aesthetic_fits_config:
+            science_fits_path = output_folder_path / f"{output_base_name}{scientific_suffix_cfg}.fits"
+
+        aesthetic_hole_fill_enabled_cfg = _coerce_bool_flag(getattr(zconfig, "aesthetic_hole_fill_enabled", None))
+        if aesthetic_hole_fill_enabled_cfg is None:
+            aesthetic_hole_fill_enabled_cfg = _coerce_bool_flag(_cfg_cache_local.get("aesthetic_hole_fill_enabled", True))
+        if aesthetic_hole_fill_enabled_cfg is None:
+            aesthetic_hole_fill_enabled_cfg = True
+        aesthetic_hole_fill_enabled_cfg = bool(aesthetic_hole_fill_enabled_cfg)
+
+        try:
+            aesthetic_hole_fill_max_radius_cfg = int(getattr(zconfig, "aesthetic_hole_fill_max_radius_px", _cfg_cache_local.get("aesthetic_hole_fill_max_radius_px", 64)) or 64)
+        except Exception:
+            aesthetic_hole_fill_max_radius_cfg = 64
+        try:
+            aesthetic_hole_fill_blend_cfg = float(getattr(zconfig, "aesthetic_hole_fill_blend", _cfg_cache_local.get("aesthetic_hole_fill_blend", 0.70)) or 0.70)
+        except Exception:
+            aesthetic_hole_fill_blend_cfg = 0.70
+        aesthetic_hole_fill_only_near_seams_cfg = _coerce_bool_flag(getattr(zconfig, "aesthetic_hole_fill_only_near_seams", None))
+        if aesthetic_hole_fill_only_near_seams_cfg is None:
+            aesthetic_hole_fill_only_near_seams_cfg = _coerce_bool_flag(_cfg_cache_local.get("aesthetic_hole_fill_only_near_seams", True))
+        if aesthetic_hole_fill_only_near_seams_cfg is None:
+            aesthetic_hole_fill_only_near_seams_cfg = True
+        aesthetic_hole_fill_only_near_seams_cfg = bool(aesthetic_hole_fill_only_near_seams_cfg)
+
         # Ensure the final mosaic buffer is a contiguous, writeable ndarray for I/O
         save_array = None
         try:
@@ -27871,6 +28067,12 @@ def run_hierarchical_mosaic_classic_legacy(
             except Exception as exc_alpha:
                 logger.warning("phase6: could not write ALPHA extension: %s", exc_alpha)
 
+        try:
+            final_header["ZMROLE"] = ("SCI", "Output role: SCI or AESTH")
+            final_header["ZMAESTH"] = (False, "Aesthetic-only output")
+        except Exception:
+            pass
+
         is_rgb = (
             isinstance(save_array, np.ndarray)
             and save_array.ndim == 3
@@ -27878,7 +28080,7 @@ def run_hierarchical_mosaic_classic_legacy(
         )
         zemosaic_utils.save_fits_image(
             image_data=save_array,
-            output_path=str(final_fits_path),
+            output_path=str(science_fits_path),
             header=final_header,
             overwrite=True,
             save_as_float=True,
@@ -27887,7 +28089,65 @@ def run_hierarchical_mosaic_classic_legacy(
             axis_order="HWC",
             alpha_mask=alpha_final,
         )
-        _attach_alpha_extension(final_fits_path, log_success=True)
+        _attach_alpha_extension(science_fits_path, log_success=True)
+
+        if export_aesthetic_fits_config:
+            try:
+                aesthetic_header = final_header.copy()
+                aesthetic_header["ZMROLE"] = ("AESTH", "Output role: AESTH or SCI")
+                aesthetic_header["ZMAESTH"] = (True, "Aesthetic-only output")
+                aesthetic_header["ZMHFILL"] = (bool(aesthetic_hole_fill_enabled_cfg), "Aesthetic hole-fill enabled")
+                aesthetic_header["ZMHFRAD"] = (int(max(0, aesthetic_hole_fill_max_radius_cfg)), "Aesthetic hole-fill radius")
+                aesthetic_header["ZMHFBLD"] = (float(aesthetic_hole_fill_blend_cfg), "Aesthetic hole-fill blend")
+
+                aesthetic_array = np.array(save_array, copy=True) if isinstance(save_array, np.ndarray) else None
+                if aesthetic_array is None:
+                    raise RuntimeError("aesthetic source mosaic unavailable")
+
+                if aesthetic_hole_fill_enabled_cfg:
+                    aesthetic_array, aesthetic_fill_info = _apply_aesthetic_hole_fill(
+                        aesthetic_array,
+                        alpha_mask=alpha_final,
+                        coverage_hw=final_mosaic_coverage_HW,
+                        enabled=True,
+                        max_radius_px=int(aesthetic_hole_fill_max_radius_cfg),
+                        blend=float(aesthetic_hole_fill_blend_cfg),
+                        only_near_seams=bool(aesthetic_hole_fill_only_near_seams_cfg),
+                        logger=logger,
+                    )
+                    if isinstance(aesthetic_fill_info, dict):
+                        logger.info(
+                            "[AestheticFill] summary applied=%s hole_px=%s filled_px=%s",
+                            bool(aesthetic_fill_info.get("applied", False)),
+                            aesthetic_fill_info.get("hole_px"),
+                            aesthetic_fill_info.get("filled_px"),
+                        )
+
+                zemosaic_utils.save_fits_image(
+                    image_data=np.ascontiguousarray(aesthetic_array),
+                    output_path=str(aesthetic_fits_path),
+                    header=aesthetic_header,
+                    overwrite=True,
+                    save_as_float=True,
+                    legacy_rgb_cube=legacy_rgb_flag,
+                    progress_callback=progress_callback,
+                    axis_order="HWC",
+                    alpha_mask=alpha_final,
+                )
+                _attach_alpha_extension(aesthetic_fits_path, log_success=False)
+                pcb(
+                    "run_info_phase6_aesthetic_fits_saved",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    filename=_safe_basename(aesthetic_fits_path),
+                )
+            except Exception as exc_aesthetic:
+                pcb(
+                    "run_warn_phase6_aesthetic_fits_failed",
+                    prog=None,
+                    lvl="WARN",
+                    error=str(exc_aesthetic),
+                )
 
         # Always generate a display-oriented FITS companion (non-scientific stretch)
         # to improve compatibility with viewers that do not auto-stretch float mosaics.
@@ -28023,7 +28283,7 @@ def run_hierarchical_mosaic_classic_legacy(
         logger.info("[Alpha] Final mosaic saved with ALPHA=%s", bool(alpha_final is not None))
 
         current_global_progress = base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE
-        pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=_safe_basename(final_fits_path))
+        pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=_safe_basename(science_fits_path))
 
         if logger.isEnabledFor(logging.DEBUG):
             _dbg_rgb_stats(

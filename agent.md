@@ -41,7 +41,7 @@ These remain active as baseline protections.
 ---
 
 ## New Objective C — Dual FITS export
-Status: **next implementation target**
+Status: **in progress (core runtime implemented)**
 
 ### Requirements
 - [ ] Add `export_aesthetic_fits` switch.
@@ -59,7 +59,7 @@ Suggested keys:
 ---
 
 ## New Objective D — Aesthetic hole-fill / seam completion
-Status: **next implementation target**
+Status: **in progress (core runtime implemented)**
 
 Purpose:
 - remove residual “holes” and patch discontinuities in visual branch,
