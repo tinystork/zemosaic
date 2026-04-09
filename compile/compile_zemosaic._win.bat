@@ -7,6 +7,8 @@ REM This script must be run from the project root folder
 
 setlocal EnableExtensions EnableDelayedExpansion
 
+if "%ZEMOSAIC_REQUIREMENTS_FILE%"=="" set "ZEMOSAIC_REQUIREMENTS_FILE=requirements.txt"
+
 REM Usage:
 REM   compile\compile_zemosaic._win.bat [onedir|onefile] [debug|release]
 REM Examples:
@@ -40,9 +42,14 @@ if not exist ".venv\Scripts\python.exe" (
 REM Activate the local virtual environment
 call .venv\Scripts\activate
 
+if not exist "%ZEMOSAIC_REQUIREMENTS_FILE%" (
+  echo [ERROR] Requirements file not found: %ZEMOSAIC_REQUIREMENTS_FILE%
+  exit /b 1
+)
+
 REM Install/update deps (reproducible builds benefit from a clean venv)
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r "%ZEMOSAIC_REQUIREMENTS_FILE%"
 python -m pip install --upgrade pyinstaller pyinstaller-hooks-contrib
 
 REM Optional: install CuPy package for GPU-enabled builds.
@@ -51,7 +58,7 @@ if not "%ZEMOSAIC_CUPY_PKG%"=="" (
   echo [INFO] Installing CuPy package: %ZEMOSAIC_CUPY_PKG%
   python -m pip install "%ZEMOSAIC_CUPY_PKG%"
 ) else (
-  echo [INFO] CuPy package not specified; GPU support will be disabled in the build.
+  echo [INFO] No extra CuPy package specified; GPU support depends on %ZEMOSAIC_REQUIREMENTS_FILE%.
 )
 
 REM Clean build outputs

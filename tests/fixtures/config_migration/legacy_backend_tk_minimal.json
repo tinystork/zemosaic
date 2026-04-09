@@ -1,0 +1,6 @@
+{
+  "language": "en",
+  "preferred_gui_backend": "tk",
+  "preferred_gui_backend_explicit": true,
+  "output_dir": "./out"
+}

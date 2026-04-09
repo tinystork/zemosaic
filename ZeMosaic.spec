@@ -42,7 +42,6 @@ hiddenimports = [
     'locales.zemosaic_localization',
     'solver_settings',
     'zemosaic_config',
-    'lecropper',
     'zemosaic_worker',
     'zemosaic_astrometry',
     'zemosaic_filter_gui',
@@ -61,9 +60,6 @@ if importlib.util.find_spec("matplotlib") is not None:
             "matplotlib.backends.backend_qtagg",
             "matplotlib.backends.backend_qt",
             "matplotlib.backends.qt_compat",
-            "matplotlib.backends.backend_tkagg",
-            "matplotlib.backends._backend_tk",
-            "matplotlib.backends._tkagg",
         ]
     )
     try:
@@ -193,7 +189,9 @@ if ONEFILE:
         debug=DEBUG_BUILD,
         bootloader_ignore_signals=False,
         strip=False,
-        upx=True,
+        # Keep UPX disabled: packed Windows executables are more likely to be
+        # quarantined or removed by security software during/after the build.
+        upx=False,
         upx_exclude=[],
         runtime_tmpdir=os.environ.get("ZEMOSAIC_RUNTIME_TMPDIR") or None,
         console=DEBUG_BUILD,
@@ -209,7 +207,9 @@ else:
         debug=DEBUG_BUILD,
         bootloader_ignore_signals=False,
         strip=False,
-        upx=True,
+        # Keep UPX disabled: packed Windows executables are more likely to be
+        # quarantined or removed by security software during/after the build.
+        upx=False,
         upx_exclude=[],
         console=DEBUG_BUILD,
         icon=str(PROJECT_ROOT / 'icon' / 'zemosaic.ico')
@@ -220,7 +220,7 @@ else:
         a.zipfiles,
         a.datas,
         strip=False,
-        upx=True,
+        upx=False,
         upx_exclude=[],
         name='ZeMosaic',
     )

@@ -186,14 +186,12 @@ cython_debug/
 # === ZeMosaic: Dossiers de compilation ===
 dist/
 build/
-
-# === ZeMosaic: configuration de innosetup ===
-*.iss
+compile/
 
 # === ZeMosaic: fichiers temporaires divers ===
 # --- Examples de fichiers à ignorer dans le dossier tests ---
 example/
 
 # === ZeMosaic: outils locaux non versionnés ===
-tools/
+#tools/
 agents/

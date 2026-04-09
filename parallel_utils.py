@@ -185,7 +185,10 @@ def _probe_gpu() -> Tuple[bool, str | None, int | None, int | None]:
 
     try:
         props = cp.cuda.runtime.getDeviceProperties(current_dev)
-        gpu_name = props.get("name", "").strip() or None
+        gpu_name = props.get("name", "")
+        if isinstance(gpu_name, bytes):
+            gpu_name = gpu_name.decode("utf-8", errors="ignore")
+        gpu_name = str(gpu_name).strip() or None
         total_bytes = _safe_int(props.get("totalGlobalMem"), None)
     except Exception:
         _log_gpu_probe_info("GPU probe: failed to read CUDA device properties.")

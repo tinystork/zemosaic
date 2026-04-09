@@ -136,8 +136,7 @@ try:
 except ImportError as exc:  # pragma: no cover - import guard
     raise ImportError(
         "Unable to import PySide6 which is required for the ZeMosaic Qt interface. "
-        "Install the optional dependency with `pip install PySide6` or continue "
-        "using the Tk interface."
+        "Install the optional dependency with `pip install PySide6`."
     ) from exc
 
 SYSTEM_NAME = platform.system().lower()
@@ -444,8 +443,17 @@ class ZeMosaicQtWorker(QObject):
         queue_obj: multiprocessing.Queue | None = None
         process: multiprocessing.Process | None = None
         try:
-            queue_obj = multiprocessing.Queue()
-            process = multiprocessing.Process(
+            # On POSIX, prefer "spawn" so the worker does not inherit a live
+            # CUDA/CuPy state from the Qt process after GPU probing.
+            mp_ctx: Any = multiprocessing
+            if platform.system().lower() != "windows":
+                try:
+                    mp_ctx = multiprocessing.get_context("spawn")
+                except Exception:
+                    mp_ctx = multiprocessing
+
+            queue_obj = mp_ctx.Queue()
+            process = mp_ctx.Process(
                 target=run_hierarchical_mosaic_process,
                 args=(queue_obj, *worker_args),
                 kwargs=worker_kwargs,
@@ -883,7 +891,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.4.1, Extractio Fundi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.5.0, Extractio Fundi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -1329,7 +1337,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _populate_skin_tab(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._create_skin_group())
-        layout.addWidget(self._create_backend_group())
         layout.addStretch(1)
 
     def _populate_language_tab(self, layout: QVBoxLayout) -> None:
@@ -2672,6 +2679,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
             intertile_layout,
             self._tr("qt_field_use_auto_intertile", "Auto-adjust intertile parameters"),
         )
+        patchwork_checkbox = self._register_checkbox(
+            "patchwork_suppressor_enabled",
+            intertile_layout,
+            self._tr("qt_field_patchwork_suppressor", "Patchwork suppressor"),
+        )
+        patchwork_checkbox.setToolTip(
+            self._tr(
+                "qt_field_patchwork_suppressor_tip",
+                "Reduce visible tile imprint in overlaps when master tiles have different depth or background.",
+            )
+        )
         self._register_spinbox(
             "intertile_preview_size",
             intertile_layout,
@@ -3008,51 +3026,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         return group
 
-    def _create_backend_group(self) -> QGroupBox:
-        group = QGroupBox(
-            self._tr("qt_group_backend_title", "Preferred GUI backend"),
-            self,
-        )
-        layout = QFormLayout(group)
-        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-
-        backend_options = [
-            ("tk", self._tr("backend_option_tk", "Classic Tk GUI (stable)")),
-            ("qt", self._tr("backend_option_qt", "Qt GUI (preview)")),
-        ]
-        combo = QComboBox(group)
-        for value, label in backend_options:
-            combo.addItem(label, value)
-
-        current_backend = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
-        index = next(
-            (idx for idx, (value, _label) in enumerate(backend_options) if value == current_backend),
-            0,
-        )
-        combo.blockSignals(True)
-        combo.setCurrentIndex(index)
-        combo.blockSignals(False)
-
-        layout.addRow(
-            QLabel(self._tr("qt_field_preferred_backend", "Preferred backend"), group),
-            combo,
-        )
-
-        notice_label = QLabel(
-            self._tr(
-                "backend_change_notice",
-                "Backend change will take effect next time you launch ZeMosaic.",
-            ),
-            group,
-        )
-        notice_label.setWordWrap(True)
-        layout.addRow(notice_label)
-
-        combo.currentIndexChanged.connect(self._on_backend_selection_changed)  # type: ignore[arg-type]
-        self.backend_combo = combo
-
-        return group
-
     def _create_language_group(self) -> QGroupBox:
         group = QGroupBox(
             self._tr("qt_group_language_title", "Language"),
@@ -3224,20 +3197,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
         mode = data.strip().lower() or "system"
         self.config["qt_theme_mode"] = mode
         self._apply_theme(mode)
-
-    def _on_backend_selection_changed(self, index: int) -> None:
-        if self.backend_combo is None:
-            return
-        data = self.backend_combo.itemData(index)
-        backend = str(data or "").strip().lower()
-        if backend not in {"tk", "qt"}:
-            return
-        current = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
-        if backend == current:
-            return
-        self.config["preferred_gui_backend"] = backend
-        self.config["preferred_gui_backend_explicit"] = True
-        self._save_config()
 
     def _on_language_combo_changed(self, index: int) -> None:
         if self.language_combo is None:
@@ -3987,7 +3946,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "stacking_kappa_high": 3.0,
             "stacking_winsor_limits": "0.05,0.05",
             "stacking_final_combine_method": "mean",
-            "poststack_equalize_rgb": True,
+            "poststack_equalize_rgb": False,
             "apply_radial_weight": False,
             "radial_feather_fraction": 0.8,
             "min_radial_weight_floor": 0.0,
@@ -4029,6 +3988,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "two_pass_coverage_renorm": False,
             "two_pass_cov_sigma_px": 50,
             "two_pass_cov_gain_clip": [0.85, 1.18],
+            "patchwork_suppressor_enabled": False,
+            "patchwork_suppressor_strength": "normal",
+            "patchwork_suppressor_sigma_px": 64.0,
+            "patchwork_suppressor_seam_band_px": 160,
+            "patchwork_suppressor_max_delta": 0.20,
+            "patchwork_suppressor_protect_stars": True,
+            "patchwork_suppressor_only_near_seams": True,
+            "export_aesthetic_fits": False,
+            "scientific_fits_suffix": "_science",
+            "aesthetic_fits_suffix": "_aesthetic",
+            "aesthetic_fits_use_patchwork": True,
+            "aesthetic_hole_fill_enabled": True,
+            "aesthetic_hole_fill_max_radius_px": 64,
+            "aesthetic_hole_fill_blend": 0.70,
+            "aesthetic_hole_fill_only_near_seams": True,
             "apply_master_tile_crop": True,
             "master_tile_crop_percent": 3.0,
             "match_background_for_final": True,
@@ -4069,7 +4043,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "assembly_process_workers": 0,
             "auto_limit_frames_per_master_tile": True,
             "winsor_max_frames_per_pass": 0,
-            "winsor_worker_limit": 10,
+            "winsor_worker_limit": 0,
             "max_raw_per_master_tile": 0,
             "use_gpu_phase5": False,
             "stack_use_gpu": False,
@@ -4308,7 +4282,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.4.1, Extractio Fundi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.5.0, Extractio Fundi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
@@ -5371,6 +5345,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         ram_total_mb = payload.get("ram_total_mb")
         gpu_used_mb = payload.get("gpu_used_mb")
         gpu_total_mb = payload.get("gpu_total_mb")
+        gpu_util_percent = payload.get("gpu_util_percent")
         parts: List[str] = []
         if isinstance(cpu_percent, (int, float)):
             parts.append(f"CPU {cpu_percent:4.1f}%")
@@ -5381,8 +5356,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if isinstance(gpu_used_mb, (int, float)) and isinstance(gpu_total_mb, (int, float)) and gpu_total_mb > 0:
             used_gib = gpu_used_mb / 1024.0
             total_gib = gpu_total_mb / 1024.0
-            gpu_percent = 100.0 * (gpu_used_mb / gpu_total_mb)
-            parts.append(f"GPU {gpu_percent:4.1f}% ({used_gib:4.1f} / {total_gib:4.1f} GiB)")
+            if isinstance(gpu_util_percent, (int, float)):
+                parts.append(
+                    f"GPU {float(gpu_util_percent):4.1f}% ({used_gib:4.1f} / {total_gib:4.1f} GiB)"
+                )
+            else:
+                gpu_percent = 100.0 * (gpu_used_mb / gpu_total_mb)
+                parts.append(f"GPU {gpu_percent:4.1f}% ({used_gib:4.1f} / {total_gib:4.1f} GiB)")
         if self.resource_monitor_label is not None:
             self.resource_monitor_label.setText(" | ".join(parts) if parts else "")
 

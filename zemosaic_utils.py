@@ -89,6 +89,19 @@ map_coordinates = None  # Lazily imported when needed
 
 logger = logging.getLogger(__name__)
 _PREVIEW_WCS_LINEARIZED_LOGGED = False
+_PHASE5_GPU_OOM_HINT: dict[str, int | None] = {"max_chunk_bytes": None, "rows_per_chunk": None, "oom_events": 0}
+
+# Latest intertile diagnostics payload (debug/export helper for worker instrumentation)
+LAST_INTERTILE_DIAGNOSTICS: dict[str, Any] = {}
+
+
+def get_last_intertile_diagnostics() -> dict[str, Any]:
+    """Return a shallow copy of the latest intertile diagnostic payload."""
+
+    try:
+        return dict(LAST_INTERTILE_DIAGNOSTICS)
+    except Exception:
+        return {}
 
 
 EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
@@ -2205,8 +2218,418 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
         result[idx] = (g, o)
     return result
 
+
+def solve_global_offsets_v1(num_tiles: int, offset_entries, anchor_index: int = 0):
+    """Solve global per-tile additive offsets from pairwise delta constraints."""
+
+    if num_tiles <= 0:
+        return {}, {"constraints": 0, "residual_abs": np.asarray([], dtype=np.float64)}
+    if not offset_entries:
+        zeros = {i: 0.0 for i in range(num_tiles)}
+        return zeros, {"constraints": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+    anchor = int(max(0, min(anchor_index, num_tiles - 1)))
+    rows = []
+    rhs = []
+    valid_entries = []
+
+    for entry in offset_entries:
+        try:
+            i = int(entry[0]); j = int(entry[1]); delta_ij = float(entry[2])
+            weight = float(entry[3]) if len(entry) > 3 else 1.0
+        except Exception:
+            continue
+        if i < 0 or j < 0 or i >= num_tiles or j >= num_tiles or i == j:
+            continue
+        if not np.isfinite(delta_ij):
+            continue
+        if not np.isfinite(weight) or weight <= 0.0:
+            weight = 1.0
+
+        sqrt_w = math.sqrt(max(1e-9, weight))
+        row = np.zeros(num_tiles, dtype=np.float64)
+        row[i] = -sqrt_w
+        row[j] = +sqrt_w
+        rows.append(row)
+        rhs.append((-delta_ij) * sqrt_w)
+        valid_entries.append((i, j, delta_ij, weight))
+
+    row_anchor = np.zeros(num_tiles, dtype=np.float64)
+    row_anchor[anchor] = 1.0
+    rows.append(row_anchor)
+    rhs.append(0.0)
+
+    if len(rows) <= 1:
+        zeros = {i: 0.0 for i in range(num_tiles)}
+        return zeros, {"constraints": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+    try:
+        A = np.vstack(rows)
+        b = np.asarray(rhs, dtype=np.float64)
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except Exception:
+        zeros = {i: 0.0 for i in range(num_tiles)}
+        return zeros, {"constraints": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": []}
+
+    offsets = {}
+    for t in range(num_tiles):
+        v = float(sol[t]) if t < len(sol) else 0.0
+        offsets[t] = v if np.isfinite(v) else 0.0
+
+    residual_abs = []
+    worst = []
+    for i, j, delta_ij, weight in valid_entries:
+        res = (offsets[j] - offsets[i]) + delta_ij
+        if not np.isfinite(res):
+            continue
+        abs_res = abs(float(res))
+        residual_abs.append(abs_res)
+        worst.append((abs_res, i, j, float(res), float(delta_ij), float(weight)))
+
+    worst.sort(key=lambda x: x[0], reverse=True)
+    return offsets, {
+        "constraints": int(len(valid_entries)),
+        "residual_abs": np.asarray(residual_abs, dtype=np.float64),
+        "worst": worst[:5],
+    }
+
+
+
+def solve_global_affine_v2(
+    num_tiles: int,
+    pair_entries,
+    anchor_index: int = 0,
+    gain_prior_lambda: float = 0.02,
+    gain_clip: tuple[float, float] = (0.90, 1.10),
+    offset_clip: tuple[float, float] = (-2000.0, 2000.0),
+    pair_gain_clip: tuple[float, float] = (0.5, 2.0),
+    pair_offset_abs_max: float = 5000.0,
+    max_irls_iters: int = 3,
+    enforce_requested_solver: bool = False,
+):
+    """Robust global solve for per-tile gain+offset with conservative guards (M2)."""
+
+    defaults = {i: (1.0, 0.0) for i in range(max(0, int(num_tiles)))}
+    if num_tiles <= 0:
+        return {}, {"constraints": 0, "kept": 0, "rejected": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": [], "pair_residuals": [], "tile_residual_summary": [], "reject_reason_counts": {}, "relaxed_filter_used": False, "solver_profile": {}}
+    if not pair_entries:
+        return defaults, {"constraints": 0, "kept": 0, "rejected": 0, "residual_abs": np.asarray([], dtype=np.float64), "worst": [], "pair_residuals": [], "tile_residual_summary": [], "reject_reason_counts": {}, "relaxed_filter_used": False, "solver_profile": {}}
+
+    try:
+        gmin, gmax = float(gain_clip[0]), float(gain_clip[1])
+    except Exception:
+        gmin, gmax = 0.90, 1.10
+    if gmin > gmax:
+        gmin, gmax = gmax, gmin
+
+    try:
+        bmin, bmax = float(offset_clip[0]), float(offset_clip[1])
+    except Exception:
+        bmin, bmax = -2000.0, 2000.0
+    if bmin > bmax:
+        bmin, bmax = bmax, bmin
+
+    try:
+        agmin, agmax = float(pair_gain_clip[0]), float(pair_gain_clip[1])
+    except Exception:
+        agmin, agmax = 0.5, 2.0
+    if agmin > agmax:
+        agmin, agmax = agmax, agmin
+
+    try:
+        b_abs_max = abs(float(pair_offset_abs_max))
+    except Exception:
+        b_abs_max = 5000.0
+    if not np.isfinite(b_abs_max) or b_abs_max <= 0.0:
+        b_abs_max = 5000.0
+
+    effective_agmin = float(agmin)
+    effective_agmax = float(agmax)
+    effective_b_abs_max = float(b_abs_max)
+    solver_profile = {
+        "pair_gain_clip_requested": [float(agmin), float(agmax)],
+        "pair_offset_abs_max_requested": float(b_abs_max),
+    }
+
+    anchor = int(max(0, min(int(anchor_index), num_tiles - 1)))
+    total_constraints = 0
+    valid_entries = []
+    reject_reason_counts = {
+        "parse": 0,
+        "index": 0,
+        "non_finite": 0,
+        "gain_clip": 0,
+        "offset_clip": 0,
+    }
+    finite_candidates = []
+
+    for e in pair_entries:
+        total_constraints += 1
+        try:
+            i = int(e[0]); j = int(e[1]); a_ij = float(e[2]); b_ij = float(e[3]); w = float(e[4])
+        except Exception:
+            reject_reason_counts["parse"] += 1
+            continue
+        if i < 0 or j < 0 or i >= num_tiles or j >= num_tiles or i == j:
+            reject_reason_counts["index"] += 1
+            continue
+        if not np.isfinite(a_ij) or not np.isfinite(b_ij):
+            reject_reason_counts["non_finite"] += 1
+            continue
+
+        if not np.isfinite(w) or w <= 0.0:
+            w = 1.0
+        finite_candidates.append((i, j, a_ij, b_ij, max(1e-6, w)))
+
+        if a_ij < agmin or a_ij > agmax:
+            reject_reason_counts["gain_clip"] += 1
+            continue
+        if abs(b_ij) > b_abs_max:
+            reject_reason_counts["offset_clip"] += 1
+            continue
+        valid_entries.append((i, j, a_ij, b_ij, max(1e-6, w)))
+
+    try:
+        if finite_candidates:
+            arr_a0 = np.asarray([float(x[2]) for x in finite_candidates], dtype=np.float64)
+            arr_b0 = np.asarray([float(x[3]) for x in finite_candidates], dtype=np.float64)
+            arr_abs_b0 = np.abs(arr_b0)
+            solver_profile.update({
+                "candidate_count": int(len(finite_candidates)),
+                "a_q01": float(np.nanpercentile(arr_a0, 1)) if arr_a0.size else 0.0,
+                "a_q50": float(np.nanmedian(arr_a0)) if arr_a0.size else 0.0,
+                "a_q99": float(np.nanpercentile(arr_a0, 99)) if arr_a0.size else 0.0,
+                "abs_b_q50": float(np.nanmedian(arr_abs_b0)) if arr_abs_b0.size else 0.0,
+                "abs_b_q99": float(np.nanpercentile(arr_abs_b0, 99)) if arr_abs_b0.size else 0.0,
+            })
+    except Exception:
+        pass
+
+    relaxed_filter_used = False
+    if (not valid_entries) and finite_candidates:
+        try:
+            arr_a = np.asarray([float(x[2]) for x in finite_candidates], dtype=np.float64)
+            arr_b = np.asarray([float(x[3]) for x in finite_candidates], dtype=np.float64)
+            arr_abs_b = np.abs(arr_b)
+
+            finite_a = arr_a[np.isfinite(arr_a)]
+            finite_abs_b = arr_abs_b[np.isfinite(arr_abs_b)]
+
+            if finite_a.size and finite_abs_b.size:
+                q01 = float(np.nanpercentile(finite_a, 1))
+                q99 = float(np.nanpercentile(finite_a, 99))
+                aq01 = float(np.nanpercentile(np.abs(finite_a), 1))
+                bq99 = float(np.nanpercentile(finite_abs_b, 99))
+
+                relaxed_agmin = min(agmin, q01)
+                relaxed_agmax = max(agmax, q99)
+                if not np.isfinite(relaxed_agmin):
+                    relaxed_agmin = agmin
+                if not np.isfinite(relaxed_agmax):
+                    relaxed_agmax = agmax
+                if relaxed_agmin > relaxed_agmax:
+                    relaxed_agmin, relaxed_agmax = relaxed_agmax, relaxed_agmin
+
+                # Avoid degenerate near-zero slopes while still relaxing hard clips.
+                min_abs_a = max(1e-4, aq01 * 0.25) if np.isfinite(aq01) else 1e-4
+                relaxed_b_abs_max = max(b_abs_max, bq99) if np.isfinite(bq99) else b_abs_max
+
+                relaxed_entries = []
+                for i, j, a_ij, b_ij, w in finite_candidates:
+                    if not np.isfinite(a_ij) or not np.isfinite(b_ij):
+                        continue
+                    if a_ij < relaxed_agmin or a_ij > relaxed_agmax:
+                        continue
+                    if abs(a_ij) < min_abs_a:
+                        continue
+                    if abs(b_ij) > relaxed_b_abs_max:
+                        continue
+                    relaxed_entries.append((i, j, a_ij, b_ij, max(1e-6, w)))
+
+                if relaxed_entries:
+                    valid_entries = relaxed_entries
+                    relaxed_filter_used = True
+                    effective_agmin = float(relaxed_agmin)
+                    effective_agmax = float(relaxed_agmax)
+                    effective_b_abs_max = float(relaxed_b_abs_max)
+                    solver_profile["relaxed_min_abs_a"] = float(min_abs_a)
+        except Exception:
+            pass
+
+    if not valid_entries:
+        return defaults, {
+            "constraints": total_constraints,
+            "kept": 0,
+            "rejected": total_constraints,
+            "residual_abs": np.asarray([], dtype=np.float64),
+            "worst": [],
+            "pair_residuals": [],
+            "tile_residual_summary": [],
+            "reject_reason_counts": reject_reason_counts,
+            "relaxed_filter_used": bool(relaxed_filter_used),
+            "solver_profile": dict(solver_profile),
+        }
+
+    nvars = 2 * num_tiles
+    lam = float(gain_prior_lambda) if np.isfinite(gain_prior_lambda) else 0.02
+    lam = max(0.0, lam)
+    n_iter = max(1, int(max_irls_iters))
+    robust_weights = np.ones(len(valid_entries), dtype=np.float64)
+    sol = np.zeros(nvars, dtype=np.float64)
+
+    for _ in range(n_iter):
+        rows = []
+        rhs = []
+        for k, (i, j, a_ij, b_ij, w) in enumerate(valid_entries):
+            sqrt_w = math.sqrt(max(1e-9, w * float(robust_weights[k])))
+
+            row_gain = np.zeros(nvars, dtype=np.float64)
+            row_gain[i] = -sqrt_w
+            row_gain[j] = a_ij * sqrt_w
+            rows.append(row_gain)
+            rhs.append(0.0)
+
+            row_off = np.zeros(nvars, dtype=np.float64)
+            row_off[num_tiles + i] = sqrt_w
+            row_off[num_tiles + j] = -sqrt_w
+            row_off[j] = -b_ij * sqrt_w
+            rows.append(row_off)
+            rhs.append(0.0)
+
+        row_anchor_gain = np.zeros(nvars, dtype=np.float64)
+        row_anchor_gain[anchor] = 1.0
+        rows.append(row_anchor_gain)
+        rhs.append(1.0)
+
+        row_anchor_off = np.zeros(nvars, dtype=np.float64)
+        row_anchor_off[num_tiles + anchor] = 1.0
+        rows.append(row_anchor_off)
+        rhs.append(0.0)
+
+        if lam > 0.0:
+            reg = math.sqrt(lam)
+            for t in range(num_tiles):
+                if t == anchor:
+                    continue
+                row_reg = np.zeros(nvars, dtype=np.float64)
+                row_reg[t] = reg
+                rows.append(row_reg)
+                rhs.append(reg)
+
+        try:
+            A = np.vstack(rows)
+            b = np.asarray(rhs, dtype=np.float64)
+            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+        except Exception:
+            return defaults, {"constraints": total_constraints, "kept": len(valid_entries), "rejected": total_constraints - len(valid_entries), "residual_abs": np.asarray([], dtype=np.float64), "worst": [], "pair_residuals": [], "tile_residual_summary": [], "reject_reason_counts": reject_reason_counts, "relaxed_filter_used": bool(relaxed_filter_used), "solver_profile": dict(solver_profile)}
+
+        gains = np.asarray(sol[:num_tiles], dtype=np.float64)
+        offsets = np.asarray(sol[num_tiles:], dtype=np.float64)
+        if gains.size < num_tiles:
+            gains = np.pad(gains, (0, num_tiles - gains.size), constant_values=1.0)
+        if offsets.size < num_tiles:
+            offsets = np.pad(offsets, (0, num_tiles - offsets.size), constant_values=0.0)
+
+        residual_mag = np.zeros(len(valid_entries), dtype=np.float64)
+        for k, (i, j, a_ij, b_ij, _w) in enumerate(valid_entries):
+            rg = (-gains[i] + a_ij * gains[j])
+            ro = (offsets[i] - offsets[j] - b_ij * gains[j])
+            residual_mag[k] = math.sqrt(float(rg * rg + ro * ro))
+
+        scale = 1.4826 * float(np.nanmedian(np.abs(residual_mag - np.nanmedian(residual_mag)))) if residual_mag.size else 0.0
+        if not np.isfinite(scale) or scale <= 1e-9:
+            break
+        c = 4.685 * scale
+        if c <= 1e-9:
+            break
+        u = residual_mag / c
+        new_w = np.where(u < 1.0, (1.0 - u * u) ** 2, 0.02)
+        robust_weights = np.clip(new_w, 0.02, 1.0)
+
+    gains = np.asarray(sol[:num_tiles], dtype=np.float64)
+    offsets = np.asarray(sol[num_tiles:], dtype=np.float64)
+    if gains.size < num_tiles:
+        gains = np.pad(gains, (0, num_tiles - gains.size), constant_values=1.0)
+    if offsets.size < num_tiles:
+        offsets = np.pad(offsets, (0, num_tiles - offsets.size), constant_values=0.0)
+
+    result = {}
+    for t in range(num_tiles):
+        g = float(gains[t]) if np.isfinite(gains[t]) else 1.0
+        o = float(offsets[t]) if np.isfinite(offsets[t]) else 0.0
+        g = float(np.clip(g, gmin, gmax))
+        o = float(np.clip(o, bmin, bmax))
+        result[t] = (g, o)
+
+    result[anchor] = (1.0, 0.0)
+
+    residual_abs = []
+    worst = []
+    pair_residual_rows = []
+    tile_residual_acc = {}
+    for (i, j, a_ij, b_ij, w) in valid_entries:
+        gi, oi = result.get(i, (1.0, 0.0))
+        gj, oj = result.get(j, (1.0, 0.0))
+        rg = (-gi + a_ij * gj)
+        ro = (oi - oj - b_ij * gj)
+        r = math.sqrt(float(rg * rg + ro * ro))
+        if not np.isfinite(r):
+            continue
+        abs_r = abs(r)
+        residual_abs.append(abs_r)
+        worst.append((abs_r, i, j, float(rg), float(ro), float(a_ij), float(b_ij), float(w)))
+        pair_residual_rows.append({
+            "i": int(i),
+            "j": int(j),
+            "a_ij": float(a_ij),
+            "b_ij": float(b_ij),
+            "weight": float(w),
+            "residual_gain": float(rg),
+            "residual_offset": float(ro),
+            "residual_abs": float(abs_r),
+        })
+        tile_residual_acc.setdefault(int(i), []).append(float(abs_r))
+        tile_residual_acc.setdefault(int(j), []).append(float(abs_r))
+
+    tile_residual_summary = []
+    for tile_idx in sorted(tile_residual_acc.keys()):
+        vals = np.asarray(tile_residual_acc.get(tile_idx, []), dtype=np.float64)
+        if vals.size == 0:
+            continue
+        tile_residual_summary.append({
+            "tile_index": int(tile_idx),
+            "pair_count": int(vals.size),
+            "residual_abs_median": float(np.nanmedian(vals)),
+            "residual_abs_p95": float(np.nanpercentile(vals, 95)) if vals.size >= 2 else float(vals[0]),
+        })
+
+    try:
+        solver_profile["total_constraints"] = int(total_constraints)
+        solver_profile["kept_constraints"] = int(len(valid_entries))
+        solver_profile["rejected_constraints"] = int(max(0, total_constraints - len(valid_entries)))
+        solver_profile["relaxed_filter_used"] = bool(relaxed_filter_used)
+        solver_profile["pair_gain_clip_effective"] = [float(effective_agmin), float(effective_agmax)]
+        solver_profile["pair_offset_abs_max_effective"] = float(effective_b_abs_max)
+    except Exception:
+        pass
+
+    worst.sort(key=lambda x: x[0], reverse=True)
+    diag = {
+        "constraints": int(total_constraints),
+        "kept": int(len(valid_entries)),
+        "rejected": int(max(0, total_constraints - len(valid_entries))),
+        "residual_abs": np.asarray(residual_abs, dtype=np.float64),
+        "worst": worst[:5],
+        "pair_residuals": pair_residual_rows,
+        "tile_residual_summary": tile_residual_summary,
+        "reject_reason_counts": reject_reason_counts,
+        "relaxed_filter_used": bool(relaxed_filter_used),
+        "solver_profile": dict(solver_profile),
+    }
+    return result, diag
+
 # Constants for pruning
-MAX_NEIGHBORS_PER_TILE = 8
+max_neighbors_per_tile = 8
 
 
 # Helper for consistent edge key
@@ -2264,6 +2687,17 @@ def compute_intertile_affine_calibration(
     progress_callback=None,
     tile_weights=None,
     cpu_workers: int | None = None,
+    max_neighbors_per_tile: int = 8,
+    prune_weight_mode: str = "area",
+    offset_only_v1: bool = False,
+    gain_offset_v2: bool = False,
+    gain_prior_lambda: float = 0.02,
+    gain_clip: tuple[float, float] = (0.90, 1.10),
+    offset_clip: tuple[float, float] = (-2000.0, 2000.0),
+    pair_gain_clip: tuple[float, float] = (0.5, 2.0),
+    pair_offset_abs_max: float = 5000.0,
+    max_irls_iters: int = 3,
+    enforce_requested_solver: bool = False,
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
 
@@ -2272,7 +2706,16 @@ def compute_intertile_affine_calibration(
     d'overlap.
     """
 
+    LAST_INTERTILE_DIAGNOSTICS.clear()
+    LAST_INTERTILE_DIAGNOSTICS.update({
+        "status": "init",
+        "raw_pairs_count": 0,
+        "pruned_pairs_count": 0,
+        "anchor": None,
+    })
+
     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
+        LAST_INTERTILE_DIAGNOSTICS["status"] = "skipped_not_enough_tiles"
         return {}
     if reproject_interp is None or not ASTROPY_AVAILABLE_IN_UTILS:
         return {}
@@ -2515,6 +2958,16 @@ def compute_intertile_affine_calibration(
 
         return {}
 
+    try:
+        max_neighbors_per_tile = int(max_neighbors_per_tile)
+    except Exception:
+        max_neighbors_per_tile = 8
+    max_neighbors_per_tile = max(0, max_neighbors_per_tile)
+
+    prune_weight_mode_norm = str(prune_weight_mode or "area").strip().lower()
+    if prune_weight_mode_norm not in {"area", "strength", "hybrid"}:
+        prune_weight_mode_norm = "area"
+
     # --- START PRUNING LOGIC ---
     raw_pairs_count = len(overlaps)
     overlaps_raw = list(overlaps)
@@ -2523,24 +2976,48 @@ def compute_intertile_affine_calibration(
     active_tiles = np.zeros(num_tiles, dtype=bool)
 
     def _ensure_overlap_weight(entry: dict) -> float:
-        weight = entry.get("weight", None)
-        try:
-            weight_val = float(weight)
-        except Exception:
-            weight_val = float("nan")
-        if not math.isfinite(weight_val) or weight_val <= 0.0:
+        def _safe_f(v, default=0.0):
+            try:
+                fv = float(v)
+                return fv if math.isfinite(fv) else default
+            except Exception:
+                return default
+
+        area_weight = _safe_f(entry.get("weight"), default=float("nan"))
+        if not math.isfinite(area_weight) or area_weight <= 0.0:
             try:
                 bbox = entry.get("bbox")
                 if bbox is not None and len(bbox) == 4:
                     x0, x1, y0, y1 = bbox
-                    weight_val = float((x1 - x0) * (y1 - y0))
+                    area_weight = float((x1 - x0) * (y1 - y0))
                 else:
-                    weight_val = 0.0
+                    area_weight = 0.0
             except Exception:
-                weight_val = 0.0
+                area_weight = 0.0
+        area_weight = area_weight if (math.isfinite(area_weight) and area_weight > 0.0) else 0.0
+
+        strength = _safe_f(entry.get("pair_strength_avg"), default=float("nan"))
+        if not math.isfinite(strength) or strength <= 0.0:
+            fi = _safe_f(entry.get("frac_i"), default=float("nan"))
+            fj = _safe_f(entry.get("frac_j"), default=float("nan"))
+            if math.isfinite(fi) and math.isfinite(fj) and fi > 0.0 and fj > 0.0:
+                strength = 0.5 * (fi + fj)
+            else:
+                strength = max(fi if math.isfinite(fi) else 0.0, fj if math.isfinite(fj) else 0.0, 0.0)
+        strength = strength if (math.isfinite(strength) and strength > 0.0) else 0.0
+
+        if prune_weight_mode_norm == "strength":
+            weight_val = strength if strength > 0.0 else area_weight
+        elif prune_weight_mode_norm == "hybrid":
+            weight_val = math.sqrt(max(area_weight, 0.0)) * max(strength, 1e-6)
+        else:
+            weight_val = area_weight if area_weight > 0.0 else strength
+
         if not math.isfinite(weight_val) or weight_val < 0.0:
             weight_val = 0.0
         entry["weight"] = weight_val
+        entry["weight_area"] = area_weight
+        entry["weight_strength"] = strength
         return weight_val
 
     for entry in overlaps_raw:
@@ -2567,9 +3044,9 @@ def compute_intertile_affine_calibration(
         return len(roots)
 
     # Pruning condition
-    if (raw_pairs_count > num_tiles * MAX_NEIGHBORS_PER_TILE * 2 and num_tiles >= 10):
+    if (raw_pairs_count > num_tiles * max_neighbors_per_tile * 2 and num_tiles >= 10):
         _log_intertile(
-            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={MAX_NEIGHBORS_PER_TILE}",
+            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={max_neighbors_per_tile}",
             level="INFO",
         )
 
@@ -2594,10 +3071,10 @@ def compute_intertile_affine_calibration(
             # Keep top K, ensuring at least one if it had neighbors.
             to_keep_for_tile = []
             if neighbors[tile_id]:
-                if MAX_NEIGHBORS_PER_TILE == 0 and len(neighbors[tile_id]) >= 1:
+                if max_neighbors_per_tile == 0 and len(neighbors[tile_id]) >= 1:
                     to_keep_for_tile.append(neighbors[tile_id][0][1])
                 else:
-                    for k_idx in range(min(MAX_NEIGHBORS_PER_TILE, len(neighbors[tile_id]))):
+                    for k_idx in range(min(max_neighbors_per_tile, len(neighbors[tile_id]))):
                         to_keep_for_tile.append(neighbors[tile_id][k_idx][1])
 
             kept_keys.update(to_keep_for_tile)
@@ -2672,7 +3149,7 @@ def compute_intertile_affine_calibration(
     else:
         _log_intertile(
             "Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)"
-            % (raw_pairs_count, num_tiles, MAX_NEIGHBORS_PER_TILE),
+            % (raw_pairs_count, num_tiles, max_neighbors_per_tile),
             level="INFO",
         )
         uf = _UnionFind(num_tiles)
@@ -2691,12 +3168,52 @@ def compute_intertile_affine_calibration(
     _log_intertile(
         (
             "Pair pruning summary: "
-            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={MAX_NEIGHBORS_PER_TILE} "
+            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={max_neighbors_per_tile} "
             f"active={active_tile_count} components={components_active} bridges={bridges_added} "
-            f"fallback={'yes' if fallback_used else 'no'}"
+            f"fallback={'yes' if fallback_used else 'no'} mode={prune_weight_mode_norm}"
         ),
         level="INFO",
     )
+
+    try:
+        kept_keys_final = {_intertile_edge_key(e) for e in overlaps}
+        graph_raw_edges = []
+        graph_kept_edges = []
+        graph_rejected_edges = []
+        for _e in overlaps_raw:
+            _ek = _intertile_edge_key(_e)
+            _row = {
+                "i": int(_e.get("i", -1)),
+                "j": int(_e.get("j", -1)),
+                "weight": float(_e.get("weight", 0.0) or 0.0),
+                "weight_area": float(_e.get("weight_area", 0.0) or 0.0),
+                "weight_strength": float(_e.get("weight_strength", 0.0) or 0.0),
+                "frac_i": float(_e.get("frac_i", 0.0) or 0.0),
+                "frac_j": float(_e.get("frac_j", 0.0) or 0.0),
+                "bbox": list(_e.get("bbox", [])) if isinstance(_e.get("bbox"), (list, tuple)) else [],
+                "kept": bool(_ek in kept_keys_final),
+            }
+            graph_raw_edges.append(_row)
+            if _row["kept"]:
+                graph_kept_edges.append(_row)
+            else:
+                graph_rejected_edges.append(_row)
+        LAST_INTERTILE_DIAGNOSTICS.update({
+            "status": "pairs_ready",
+            "raw_pairs_count": int(raw_pairs_count),
+            "pruned_pairs_count": int(pruned_pairs_count),
+            "active_tile_count": int(active_tile_count),
+            "components_active": int(components_active),
+            "bridges_added": int(bridges_added),
+            "fallback_used": bool(fallback_used),
+            "prune_k": int(max_neighbors_per_tile),
+            "prune_weight_mode": str(prune_weight_mode_norm),
+            "graph_raw_edges": graph_raw_edges,
+            "graph_kept_edges": graph_kept_edges,
+            "graph_rejected_edges": graph_rejected_edges,
+        })
+    except Exception:
+        pass
 
     # --- END PRUNING LOGIC ---
 
@@ -3076,7 +3593,198 @@ def compute_intertile_affine_calibration(
         except Exception:
             pass
 
+    try:
+        LAST_INTERTILE_DIAGNOSTICS["anchor"] = int(anchor)
+        LAST_INTERTILE_DIAGNOSTICS["pair_entries_count"] = int(len(pair_entries))
+        LAST_INTERTILE_DIAGNOSTICS["connectivity"] = [float(x) for x in np.asarray(connectivity, dtype=np.float64).tolist()]
+    except Exception:
+        pass
+
+    if bool(gain_offset_v2):
+        _log_intertile(
+            f"M2 request: pair_entries={len(pair_entries)} enforce={bool(enforce_requested_solver)}",
+            level="INFO",
+        )
+    if bool(gain_offset_v2) and pair_entries:
+        sol_m2, diag_m2 = solve_global_affine_v2(
+            num_tiles,
+            pair_entries,
+            anchor_index=anchor,
+            gain_prior_lambda=float(gain_prior_lambda),
+            gain_clip=tuple(gain_clip) if isinstance(gain_clip, (list, tuple)) and len(gain_clip) >= 2 else (0.90, 1.10),
+            offset_clip=tuple(offset_clip) if isinstance(offset_clip, (list, tuple)) and len(offset_clip) >= 2 else (-2000.0, 2000.0),
+            pair_gain_clip=tuple(pair_gain_clip) if isinstance(pair_gain_clip, (list, tuple)) and len(pair_gain_clip) >= 2 else (0.5, 2.0),
+            pair_offset_abs_max=float(pair_offset_abs_max),
+            max_irls_iters=int(max_irls_iters),
+        )
+        residual_abs = np.asarray(diag_m2.get("residual_abs", []), dtype=np.float64)
+        c_all = int(diag_m2.get("constraints", 0))
+        c_kept = int(diag_m2.get("kept", 0))
+        c_rej = int(diag_m2.get("rejected", 0))
+        if residual_abs.size:
+            res_med = float(np.nanmedian(residual_abs))
+            res_p95 = float(np.nanpercentile(residual_abs, 95))
+        else:
+            res_med = 0.0
+            res_p95 = 0.0
+        reject_counts = diag_m2.get("reject_reason_counts") if isinstance(diag_m2.get("reject_reason_counts"), dict) else {}
+        relaxed_used = bool(diag_m2.get("relaxed_filter_used", False))
+        _log_intertile(
+            f"M2 gain+offset solve: constraints={c_all} kept={c_kept} rejected={c_rej} residual_abs_med={res_med:.5f} residual_abs_p95={res_p95:.5f} relaxed={int(relaxed_used)}",
+            level="INFO",
+        )
+        if reject_counts:
+            try:
+                _log_intertile(
+                    "M2 reject reasons: "
+                    f"parse={int(reject_counts.get('parse', 0))} "
+                    f"index={int(reject_counts.get('index', 0))} "
+                    f"non_finite={int(reject_counts.get('non_finite', 0))} "
+                    f"gain_clip={int(reject_counts.get('gain_clip', 0))} "
+                    f"offset_clip={int(reject_counts.get('offset_clip', 0))}",
+                    level="INFO",
+                )
+            except Exception:
+                pass
+        for rank, worst in enumerate((diag_m2.get("worst") or [])[:3], 1):
+            try:
+                abs_res, wi, wj, wrg, wro, wa, wb, ww = worst
+                _log_intertile(
+                    f"M2 worst[{rank}] pair={wi}-{wj} abs_res={float(abs_res):.5f} rg={float(wrg):.5f} ro={float(wro):.5f} a={float(wa):.5f} b={float(wb):.5f} w={float(ww):.3f}",
+                    level="INFO",
+                )
+            except Exception:
+                pass
+        try:
+            LAST_INTERTILE_DIAGNOSTICS["m2_diag"] = {
+                "constraints": int(diag_m2.get("constraints", 0) or 0),
+                "kept": int(diag_m2.get("kept", 0) or 0),
+                "rejected": int(diag_m2.get("rejected", 0) or 0),
+                "residual_abs_median": float(res_med),
+                "residual_abs_p95": float(res_p95),
+                "worst": list(diag_m2.get("worst") or []),
+                "pair_residuals": list(diag_m2.get("pair_residuals") or []),
+                "tile_residual_summary": list(diag_m2.get("tile_residual_summary") or []),
+                "reject_reason_counts": dict(diag_m2.get("reject_reason_counts") or {}),
+                "relaxed_filter_used": bool(diag_m2.get("relaxed_filter_used", False)),
+                "solver_profile": dict(diag_m2.get("solver_profile") or {}),
+            }
+        except Exception:
+            pass
+        if sol_m2 and c_kept > 0:
+            try:
+                LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m2"
+                LAST_INTERTILE_DIAGNOSTICS["affine_solution"] = {
+                    int(k): [float(v[0]), float(v[1])] for k, v in sol_m2.items()
+                }
+            except Exception:
+                LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m2"
+            return sol_m2
+
+        if bool(gain_offset_v2) and pair_entries and c_kept <= 0:
+            _log_intertile(
+                "M2 produced no kept constraints; attempting automatic M1 offset-only fallback",
+                level="WARN",
+            )
+            offset_entries_auto = []
+            for p in pair_entries:
+                try:
+                    i = int(p[0]); j = int(p[1]); b_ij = float(p[3]); w_ij = float(p[4])
+                except Exception:
+                    continue
+                if not np.isfinite(b_ij):
+                    continue
+                if not np.isfinite(w_ij) or w_ij <= 0:
+                    w_ij = 1.0
+                offset_entries_auto.append((i, j, b_ij, w_ij))
+            offsets_sol_auto, offset_diag_auto = solve_global_offsets_v1(num_tiles, offset_entries_auto, anchor_index=anchor)
+            if offsets_sol_auto:
+                sol_m1_auto = {idx: (1.0, float(offsets_sol_auto.get(idx, 0.0))) for idx in range(num_tiles)}
+                try:
+                    LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m1_auto_fallback"
+                    LAST_INTERTILE_DIAGNOSTICS["m1_diag"] = {
+                        "constraints": int(offset_diag_auto.get("constraints", 0) or 0),
+                        "residual_abs_median": float(np.nanmedian(np.asarray(offset_diag_auto.get("residual_abs", []), dtype=np.float64))) if len(offset_diag_auto.get("residual_abs", [])) else 0.0,
+                        "residual_abs_p95": float(np.nanpercentile(np.asarray(offset_diag_auto.get("residual_abs", []), dtype=np.float64), 95)) if len(offset_diag_auto.get("residual_abs", [])) else 0.0,
+                        "worst": list(offset_diag_auto.get("worst") or []),
+                        "auto_fallback_from_m2": True,
+                    }
+                    LAST_INTERTILE_DIAGNOSTICS["affine_solution"] = {
+                        int(k): [float(v[0]), float(v[1])] for k, v in sol_m1_auto.items()
+                    }
+                except Exception:
+                    pass
+                return sol_m1_auto
+
+    if bool(offset_only_v1) and pair_entries:
+        offset_entries = []
+        for p in pair_entries:
+            try:
+                i = int(p[0]); j = int(p[1]); b_ij = float(p[3]); w_ij = float(p[4])
+            except Exception:
+                continue
+            if not np.isfinite(b_ij):
+                continue
+            if not np.isfinite(w_ij) or w_ij <= 0:
+                w_ij = 1.0
+            # Approximate additive delta from fitted intercept (V1 offset-only)
+            offset_entries.append((i, j, b_ij, w_ij))
+
+        offsets_sol, offset_diag = solve_global_offsets_v1(num_tiles, offset_entries, anchor_index=anchor)
+        residual_abs = np.asarray(offset_diag.get("residual_abs", []), dtype=np.float64)
+        constraints_count = int(offset_diag.get("constraints", 0))
+        if residual_abs.size:
+            res_med = float(np.nanmedian(residual_abs))
+            res_p95 = float(np.nanpercentile(residual_abs, 95))
+        else:
+            res_med = 0.0
+            res_p95 = 0.0
+        _log_intertile(
+            f"M1 offset-only solve: constraints={constraints_count} residual_abs_med={res_med:.5f} residual_abs_p95={res_p95:.5f}",
+            level="INFO",
+        )
+        for rank, worst in enumerate((offset_diag.get("worst") or [])[:3], 1):
+            try:
+                abs_res, wi, wj, wres, wdelta, wweight = worst
+                _log_intertile(
+                    f"M1 worst[{rank}] pair={wi}-{wj} abs_res={float(abs_res):.5f} res={float(wres):.5f} delta={float(wdelta):.5f} weight={float(wweight):.3f}",
+                    level="INFO",
+                )
+            except Exception:
+                pass
+
+        if offsets_sol:
+            sol_m1 = {idx: (1.0, float(offsets_sol.get(idx, 0.0))) for idx in range(num_tiles)}
+            try:
+                LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_m1"
+                LAST_INTERTILE_DIAGNOSTICS["m1_diag"] = {
+                    "constraints": int(offset_diag.get("constraints", 0) or 0),
+                    "residual_abs_median": float(res_med),
+                    "residual_abs_p95": float(res_p95),
+                    "worst": list(offset_diag.get("worst") or []),
+                }
+                LAST_INTERTILE_DIAGNOSTICS["affine_solution"] = {
+                    int(k): [float(v[0]), float(v[1])] for k, v in sol_m1.items()
+                }
+            except Exception:
+                pass
+            return sol_m1
+
+    if bool(gain_offset_v2) and bool(enforce_requested_solver):
+        _log_intertile(
+            "M2 requested but not applied (no usable pair entries or empty solution) — aborting by policy",
+            level="ERROR",
+        )
+        raise RuntimeError("M2 requested but not applied")
+
     solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
+    try:
+        LAST_INTERTILE_DIAGNOSTICS["status"] = "solved_legacy"
+        LAST_INTERTILE_DIAGNOSTICS["affine_solution"] = {
+            int(k): [float(v[0]), float(v[1])] for k, v in solution.items()
+        }
+    except Exception:
+        pass
     if progress_callback:
         try:
             progress_callback(
@@ -3940,6 +4648,21 @@ def _prepare_int16_header(base_header, width: int, height: int, *, extname: str 
     return header
 
 
+
+
+def _header_declares_2d_wcs(header) -> bool:
+    """Return True when header explicitly declares a 2-D WCS."""
+
+    try:
+        wcs_axes = header.get("WCSAXES")
+    except Exception:
+        return False
+    try:
+        return int(wcs_axes) == 2
+    except Exception:
+        return False
+
+
 def _update_dataminmax(header, data: np.ndarray) -> None:
     """Set ``DATAMIN``/``DATAMAX`` cards to match the stored integer range."""
 
@@ -4024,8 +4747,11 @@ def _build_legacy_rgb_cube_hdu(
     header = _prepare_int16_header(base_header, width, height)
     header["NAXIS"] = 3
     header["NAXIS3"] = int(channels)
-    header["CTYPE3"] = ("RGB", "Color Format")
-    header["EXTNAME"] = "RGB"
+    if _header_declares_2d_wcs(header):
+        header.pop("CTYPE3", None)
+    else:
+        header["CTYPE3"] = ("RGB", "Color Format")
+    header.pop("EXTNAME", None)
     _update_dataminmax(header, cube_i16)
     log_fn(
         f"  SAVE_DEBUG: Legacy cube range [{np.min(cube_i16)}, {np.max(cube_i16)}]",
@@ -4310,10 +5036,11 @@ def save_fits_image(image_data: np.ndarray,
             header_float['NAXIS1'] = int(w)
             header_float['NAXIS2'] = int(h)
             header_float['NAXIS3'] = int(c)
-            if 'CTYPE3' not in header_float:
+            if _header_declares_2d_wcs(header_float):
+                header_float.pop('CTYPE3', None)
+            elif 'CTYPE3' not in header_float:
                 header_float['CTYPE3'] = ('RGB', 'Color Format')
-            if 'EXTNAME' not in header_float:
-                header_float['EXTNAME'] = 'RGB'
+            header_float.pop('EXTNAME', None)
         else:
             header_float['NAXIS'] = 2
             header_float['NAXIS1'] = int(data_for_primary.shape[1])
@@ -4623,6 +5350,20 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     import cupy as cp  # type: ignore
     from cupyx.scipy.ndimage import map_coordinates  # type: ignore
+
+    gpu_sync_diag_cfg = kwargs.get("gpu_sync_diagnostics", None)
+    if gpu_sync_diag_cfg is None:
+        # GUI "Debug logs" switch drives worker logger to DEBUG; use that as default trigger
+        # so end users can enable GPU diagnostics without env vars/CLI.
+        gpu_sync_diag = bool(logger.isEnabledFor(logging.DEBUG))
+    else:
+        gpu_sync_diag = bool(gpu_sync_diag_cfg)
+
+    gpu_sync_diag_env = str(os.environ.get("ZEMOSAIC_GPU_SYNC_DIAG", "")).strip().lower()
+    if gpu_sync_diag_env in {"1", "true", "yes", "on"}:
+        gpu_sync_diag = True
+    elif gpu_sync_diag_env in {"0", "false", "no", "off"}:
+        gpu_sync_diag = False
 
     ensure_cupy_pool_initialized()
     try:
@@ -5204,14 +5945,30 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     try:
         if combine_mode == "mean":
-            return _gpu_mean_path()
-        if combine_mode == "median":
-            return _gpu_chunkwise_path("median")
-        if combine_mode == "winsorized":
-            return _gpu_chunkwise_path("winsorized")
-        if combine_mode == "kappa_sigma":
-            return _gpu_kappa_sigma_path()
-        raise NotImplementedError(f"Unsupported combine_function '{combine_function}' for GPU coadd")
+            result = _gpu_mean_path()
+        elif combine_mode == "median":
+            result = _gpu_chunkwise_path("median")
+        elif combine_mode == "winsorized":
+            result = _gpu_chunkwise_path("winsorized")
+        elif combine_mode == "kappa_sigma":
+            result = _gpu_kappa_sigma_path()
+        else:
+            raise NotImplementedError(f"Unsupported combine_function '{combine_function}' for GPU coadd")
+
+        if gpu_sync_diag:
+            try:
+                cp.cuda.runtime.deviceSynchronize()
+            except Exception as sync_exc:
+                logger.warning("[GPU_DIAG] synchronize-after-kernel failed: %s", sync_exc)
+                raise
+        return result
+    except Exception:
+        if gpu_sync_diag:
+            try:
+                cp.cuda.runtime.deviceSynchronize()
+            except Exception as sync_exc:
+                logger.warning("[GPU_DIAG] synchronize-after-error failed: %s", sync_exc)
+        raise
     finally:
         free_cupy_memory_pools()
 
@@ -5313,6 +6070,118 @@ def _reproject_and_coadd_wrapper_impl(
                     max_val = local_max
         return max_val if seen else None
 
+
+    def _sample_input_signature(max_items: int = 3) -> list[dict[str, Any]]:
+        """Return lightweight per-input signatures for GPU crash diagnostics."""
+        signatures: list[dict[str, Any]] = []
+        try:
+            total = int(len(data_list))
+        except Exception:
+            total = 0
+        limit = max(0, min(int(max_items), total))
+        for idx in range(limit):
+            sig: dict[str, Any] = {"idx": int(idx)}
+            try:
+                arr = np.asarray(data_list[idx])
+                sig.update(
+                    {
+                        "shape": tuple(int(v) for v in arr.shape),
+                        "dtype": str(arr.dtype),
+                        "c_contig": bool(arr.flags.c_contiguous),
+                        "f_contig": bool(arr.flags.f_contiguous),
+                        "strides": tuple(int(v) for v in arr.strides),
+                    }
+                )
+            except Exception as exc_arr:
+                sig["array_error"] = str(exc_arr)
+            try:
+                wcs_obj = wcs_list[idx] if idx < len(wcs_list) else None
+                sig["wcs_type"] = type(wcs_obj).__name__ if wcs_obj is not None else None
+            except Exception as exc_wcs:
+                sig["wcs_error"] = str(exc_wcs)
+            signatures.append(sig)
+        return signatures
+
+    def _collect_gpu_failure_diagnostics(exc: Exception, *, call_kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Collect concise runtime diagnostics when GPU reprojection fails."""
+        diag: dict[str, Any] = {
+            "event": "gpu_reproject_failure",
+            "exception_type": type(exc).__name__,
+            "error": str(exc),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+            "shape_out": tuple(int(v) for v in shape_out) if isinstance(shape_out, (list, tuple, np.ndarray)) else str(shape_out),
+            "n_inputs": int(len(data_list)) if isinstance(data_list, (list, tuple)) else None,
+            "combine_function": str(kwargs.get("combine_function") or ""),
+            "stack_reject_algo": str(kwargs.get("stack_reject_algo") or ""),
+            "rows_per_chunk": kwargs.get("rows_per_chunk"),
+            "max_chunk_bytes": kwargs.get("max_chunk_bytes"),
+            "env": {
+                "CUDA_LAUNCH_BLOCKING": os.environ.get("CUDA_LAUNCH_BLOCKING"),
+                "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "CUPY_ACCELERATORS": os.environ.get("CUPY_ACCELERATORS"),
+                "ZEMOSAIC_GPU_SYNC_DIAG": os.environ.get("ZEMOSAIC_GPU_SYNC_DIAG"),
+            },
+            "logger_debug_enabled": bool(logger.isEnabledFor(logging.DEBUG)),
+            "gpu_sync_diag_active": bool(gpu_sync_diag),
+            "input_sample": _sample_input_signature(max_items=3),
+        }
+        if isinstance(call_kwargs, dict):
+            try:
+                diag["call_rows_per_chunk"] = call_kwargs.get("rows_per_chunk")
+                diag["call_max_chunk_bytes"] = call_kwargs.get("max_chunk_bytes")
+            except Exception:
+                pass
+        try:
+            import cupy as cp  # type: ignore
+
+            try:
+                runtime_ver = int(cp.cuda.runtime.runtimeGetVersion())
+            except Exception:
+                runtime_ver = None
+            try:
+                driver_ver = int(cp.cuda.runtime.driverGetVersion())
+            except Exception:
+                driver_ver = None
+            try:
+                dev = cp.cuda.Device()
+                dev_id = int(getattr(dev, "id", 0))
+            except Exception:
+                dev_id = 0
+            try:
+                props = cp.cuda.runtime.getDeviceProperties(dev_id)
+            except Exception:
+                props = None
+            try:
+                free_b, total_b = cp.cuda.runtime.memGetInfo()
+            except Exception:
+                free_b, total_b = None, None
+            sync_error = None
+            try:
+                cp.cuda.runtime.deviceSynchronize()
+            except Exception as sync_exc:
+                sync_error = str(sync_exc)
+            diag["cuda"] = {
+                "device_id": int(dev_id),
+                "device_name": (
+                    props.get("name", b"").decode(errors="ignore")
+                    if isinstance(props, dict)
+                    else None
+                ),
+                "runtime_version": runtime_ver,
+                "driver_version": driver_ver,
+                "mem_free_mb": (float(free_b) / (1024 ** 2)) if isinstance(free_b, (int, float)) else None,
+                "mem_total_mb": (float(total_b) / (1024 ** 2)) if isinstance(total_b, (int, float)) else None,
+                "sync_error": sync_error,
+            }
+            try:
+                diag["cupy_version"] = str(cp.__version__)
+            except Exception:
+                pass
+        except Exception as cp_exc:
+            diag["cupy_diag_error"] = str(cp_exc)
+        return diag
+
     # Support per-tile (per-pixel) weight maps without forwarding unknown kwargs into
     # astropy-reproject (it would pass them down to reproject_function and crash).
     tile_weight_maps = kwargs.pop("tile_weight_maps", None)
@@ -5377,16 +6246,75 @@ def _reproject_and_coadd_wrapper_impl(
         phase5_oom_retry_max = 0
 
     def _gpu_call_with_oom_retry():
+        local_kwargs = dict(gpu_kwargs)
+
+        # Platform-adaptive pre-clamp: keep low-VRAM GPUs conservative while
+        # leaving higher-end desktops mostly unconstrained.
+        try:
+            if gpu_is_available():
+                import cupy as cp  # type: ignore
+
+                free_b, total_b = cp.cuda.runtime.memGetInfo()
+                gib = 1024 ** 3
+                tier_frac = None
+                tier_rows_cap = None
+                if total_b and total_b <= 3 * gib:
+                    tier_frac = 0.35
+                    tier_rows_cap = 1024
+                elif total_b and total_b <= 4 * gib:
+                    tier_frac = 0.42
+                    tier_rows_cap = 1536
+                elif total_b and total_b <= 6 * gib:
+                    tier_frac = 0.50
+                    tier_rows_cap = 2048
+
+                if tier_frac is not None and free_b and free_b > 0:
+                    tier_max = max(32 * 1024 * 1024, int(free_b * float(tier_frac)))
+                    try:
+                        current_max = int(local_kwargs.get("max_chunk_bytes") or 0)
+                    except Exception:
+                        current_max = 0
+                    if current_max <= 0 or tier_max < current_max:
+                        local_kwargs["max_chunk_bytes"] = int(tier_max)
+
+                    try:
+                        current_rows = int(local_kwargs.get("rows_per_chunk") or 0)
+                    except Exception:
+                        current_rows = 0
+                    if tier_rows_cap is not None:
+                        if current_rows <= 0:
+                            local_kwargs["rows_per_chunk"] = int(tier_rows_cap)
+                        else:
+                            local_kwargs["rows_per_chunk"] = int(min(current_rows, int(tier_rows_cap)))
+        except Exception:
+            pass
+
+        # Persisted per-process OOM hint from previous retries in this run.
+        try:
+            hint_max = _PHASE5_GPU_OOM_HINT.get("max_chunk_bytes")
+            if hint_max:
+                cur_max = local_kwargs.get("max_chunk_bytes")
+                if not cur_max or int(hint_max) < int(cur_max):
+                    local_kwargs["max_chunk_bytes"] = int(hint_max)
+            hint_rows = _PHASE5_GPU_OOM_HINT.get("rows_per_chunk")
+            if hint_rows:
+                cur_rows = local_kwargs.get("rows_per_chunk")
+                if not cur_rows or int(hint_rows) < int(cur_rows):
+                    local_kwargs["rows_per_chunk"] = int(hint_rows)
+        except Exception:
+            pass
+
         if not phase5_oom_retry or phase5_oom_retry_max <= 0:
-            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **local_kwargs)
+
         max_retries = int(phase5_oom_retry_max)
         retry_index = 0
-        local_kwargs = dict(gpu_kwargs)
         while True:
             try:
                 return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **local_kwargs)
             except Exception as exc:
                 if not _is_gpu_oom_exception(exc) or retry_index >= max_retries:
+                    setattr(exc, "_zemosaic_gpu_call_kwargs", dict(local_kwargs))
                     raise
                 retry_index += 1
                 new_max, new_rows = _shrink_chunk_hints(
@@ -5395,18 +6323,32 @@ def _reproject_and_coadd_wrapper_impl(
                 )
                 local_kwargs["max_chunk_bytes"] = new_max
                 local_kwargs["rows_per_chunk"] = new_rows
+
+                # Persist tighter hints for subsequent channels/tiles in this process.
+                try:
+                    prev_max = _PHASE5_GPU_OOM_HINT.get("max_chunk_bytes")
+                    _PHASE5_GPU_OOM_HINT["max_chunk_bytes"] = int(new_max) if not prev_max else int(min(int(prev_max), int(new_max)))
+                    prev_rows = _PHASE5_GPU_OOM_HINT.get("rows_per_chunk")
+                    _PHASE5_GPU_OOM_HINT["rows_per_chunk"] = int(new_rows) if not prev_rows else int(min(int(prev_rows), int(new_rows)))
+                    _PHASE5_GPU_OOM_HINT["oom_events"] = int(_PHASE5_GPU_OOM_HINT.get("oom_events") or 0) + 1
+                except Exception:
+                    pass
+
                 free_bytes = _probe_free_vram_bytes()
                 if free_bytes is not None and free_bytes > 0:
                     free_mb = f"{(free_bytes / (1024 ** 2)):.1f}"
                 else:
                     free_mb = "n/a"
                 logger.warning(
-                    "[GPU Reproject] OOM retry %d/%d: max_chunk_mb=%.1f rows=%s free_vram_mb=%s",
+                    "[GPU Reproject] OOM retry %d/%d: max_chunk_mb=%.1f rows=%s free_vram_mb=%s hint_max_mb=%.1f hint_rows=%s oom_events=%s",
                     retry_index,
                     max_retries,
                     float(new_max or 0) / (1024 ** 2),
                     int(new_rows),
                     free_mb,
+                    float((_PHASE5_GPU_OOM_HINT.get("max_chunk_bytes") or 0)) / (1024 ** 2),
+                    str(_PHASE5_GPU_OOM_HINT.get("rows_per_chunk")),
+                    str(_PHASE5_GPU_OOM_HINT.get("oom_events")),
                 )
                 free_cupy_memory_pools()
                 gc.collect()
@@ -5425,6 +6367,15 @@ def _reproject_and_coadd_wrapper_impl(
             try:
                 return _gpu_call_with_oom_retry()
             except Exception as e:  # pragma: no cover - GPU failures
+                gpu_call_kwargs = getattr(e, "_zemosaic_gpu_call_kwargs", None)
+                try:
+                    diag = _collect_gpu_failure_diagnostics(e, call_kwargs=gpu_call_kwargs)
+                    logger.warning(
+                        "[GPU_DIAG] %s",
+                        json.dumps(diag, ensure_ascii=False, default=str),
+                    )
+                except Exception:
+                    logger.debug("Failed to collect GPU diagnostics", exc_info=True)
                 _log_gpu_event(
                     "gpu_fallback_runtime_error",
                     "WARN",

@@ -117,10 +117,15 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     import cupy as cp
+    try:
+        import cupyx  # type: ignore
+    except Exception:
+        cupyx = None  # type: ignore
 
     _CUPY_AVAILABLE = True
 except Exception:  # pragma: no cover - GPU libraries missing
     cp = None
+    cupyx = None  # type: ignore
     _CUPY_AVAILABLE = False
 
 try:
@@ -705,13 +710,64 @@ def _normalize_mount(value: object) -> str | None:
 
 
 def _resolve_path(base_dir: Path, text: str | os.PathLike[str]) -> Path:
+    """Resolve frame paths from stack_plan entries.
+
+    Supports native absolute/relative paths and Windows-exported paths reused on
+    POSIX hosts (e.g. ``D:\\...\\file.fit``). In cross-platform cases we try
+    sane fallbacks under ``base_dir`` before returning a non-existing candidate.
+    """
+    raw = str(text).strip().strip('"').strip("'")
+    candidates: list[Path] = []
+
     try:
-        candidate = Path(text)
+        candidate = Path(raw)
     except Exception:
-        candidate = Path(str(text))
-    if not candidate.is_absolute():
-        candidate = base_dir / candidate
-    return candidate.expanduser().resolve(strict=False)
+        candidate = Path(str(raw))
+
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        candidates.append(base_dir / candidate)
+
+    # Windows absolute path serialized into CSV and reused on Linux/macOS.
+    windows_drive_like = len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha()
+    windows_unc_like = raw.startswith("\\")
+    if windows_drive_like or windows_unc_like or "\\" in raw:
+        posixish = raw.replace("\\", "/")
+        # Keep only path tail after drive if present: D:/a/b/file.fit -> a/b/file.fit
+        if windows_drive_like and ":" in posixish:
+            posixish = posixish.split(":", 1)[1].lstrip("/")
+        if posixish:
+            candidates.append(base_dir / Path(posixish))
+        # Last-resort: basename in current input folder
+        try:
+            basename = Path(posixish).name if posixish else Path(raw).name
+        except Exception:
+            basename = ""
+        if basename:
+            candidates.append(base_dir / basename)
+
+    # Return first existing candidate.
+    seen: set[str] = set()
+    first_resolved: Path | None = None
+    for cand in candidates:
+        try:
+            resolved = cand.expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if first_resolved is None:
+            first_resolved = resolved
+        try:
+            if resolved.is_file():
+                return resolved
+        except Exception:
+            pass
+
+    return first_resolved if first_resolved is not None else (base_dir / Path(raw)).expanduser().resolve(strict=False)
 
 
 def _dialect_from_sample(sample: str) -> csv.Dialect | None:
@@ -1934,6 +1990,8 @@ def _stack_weighted_patches_gpu(
     return_weight_sum: bool = False,
     return_ref_median: bool = False,
     progress_callback: ProgressCallback = None,
+    raise_on_gpu_failure: bool = False,
+    gpu_failure_context: dict | None = None,
 ) -> np.ndarray | tuple | None:
     """Stack patches with GPU acceleration and optional sigma clipping."""
     if not _CUPY_AVAILABLE:
@@ -2020,6 +2078,8 @@ def _stack_weighted_patches_gpu(
                     outputs = [cp.asarray(result, dtype=cp.float32)]
                 else:
                     errstate = getattr(cp, "errstate", None)
+                    if not callable(errstate):
+                        errstate = getattr(cupyx, "errstate", None) if cupyx is not None else None
                     ctx = errstate(divide="ignore", invalid="ignore") if callable(errstate) else nullcontext()
                     with ctx:
                         result = cp.sum(data_masked * weight_effective, axis=0) / cp.clip(weight_sum, 1e-6, None)
@@ -2031,6 +2091,21 @@ def _stack_weighted_patches_gpu(
                 outputs.append(ref_median_used)
             return cp.asnumpy(outputs[0]) if len(outputs) == 1 else tuple(cp.asnumpy(o) for o in outputs)
     except Exception as e:
+        msg = str(e)
+        msg_l = msg.lower()
+        is_oom = (
+            "out of memory" in msg_l
+            or "memoryallocation" in msg_l
+            or "cuda_error_out_of_memory" in msg_l
+            or "cudaerroroutofmemory" in msg_l
+        )
+        errstate_missing = ("errstate" in msg_l and "attribute" in msg_l)
+        if isinstance(gpu_failure_context, dict):
+            gpu_failure_context["error"] = msg
+            gpu_failure_context["is_oom"] = bool(is_oom)
+            gpu_failure_context["errstate_missing"] = bool(errstate_missing)
+        if raise_on_gpu_failure:
+            raise
         _emit(f"GPU stack failed, falling back to CPU: {e}", lvl="WARN")
         return _stack_weighted_patches(
             patches, weights, config, reference_median=reference_median, return_weight_sum=return_weight_sum, return_ref_median=return_ref_median
@@ -2044,6 +2119,7 @@ def process_tile(
     *,
     progress_callback: ProgressCallback = None,
     gpu_stack_semaphore: threading.Semaphore | None = None,
+    gpu_runtime_state: dict | None = None,
 ) -> Path | None:
     """Process a single tile and write it to disk."""
 
@@ -2093,6 +2169,9 @@ def process_tile(
     running_weight: np.ndarray | None = None
     reference_median: float | None = None
     chunk_failed = False
+    tile_gpu_enabled = bool(config.use_gpu)
+    if isinstance(gpu_runtime_state, dict) and gpu_runtime_state.get("disabled"):
+        tile_gpu_enabled = False
 
     def _cleanup_gpu_memory() -> None:
         if not (_CUPY_AVAILABLE and cp and config.use_gpu):
@@ -2109,12 +2188,13 @@ def process_tile(
     def flush_chunk() -> None:
         """Stack the current chunk and fold it into the running accumulator."""
 
-        nonlocal running_sum, running_weight, reference_median, chunk_failed
+        nonlocal running_sum, running_weight, reference_median, chunk_failed, chunk_limit, tile_gpu_enabled
         if chunk_failed or not aligned_patches:
             aligned_patches.clear()
             weight_maps.clear()
             return
-        if config.use_gpu:
+        if tile_gpu_enabled:
+            failure_ctx: dict = {}
             def _stack_gpu() -> np.ndarray | tuple | None:
                 return _stack_weighted_patches_gpu(
                     aligned_patches,
@@ -2123,19 +2203,58 @@ def process_tile(
                     reference_median=reference_median,
                     return_weight_sum=True,
                     return_ref_median=True,
+                    raise_on_gpu_failure=True,
+                    gpu_failure_context=failure_ctx,
                 )
 
-            if gpu_stack_semaphore is not None:
-                with gpu_stack_semaphore:
-                    try:
+            try:
+                if gpu_stack_semaphore is not None:
+                    with gpu_stack_semaphore:
                         res = _stack_gpu()
-                    finally:
-                        _cleanup_gpu_memory()
-            else:
-                try:
+                else:
                     res = _stack_gpu()
-                finally:
-                    _cleanup_gpu_memory()
+            except Exception as gpu_exc:
+                err = str(failure_ctx.get("error") or gpu_exc)
+                is_oom = bool(failure_ctx.get("is_oom"))
+                errstate_missing = bool(failure_ctx.get("errstate_missing"))
+                _emit(f"Tile {tile.tile_id}: GPU stack failed -> CPU fallback ({err})", lvl="WARN", callback=progress_callback)
+
+                if is_oom and chunk_limit > 1:
+                    old_limit = int(chunk_limit)
+                    chunk_limit = max(1, int(math.floor(chunk_limit * 0.5)))
+                    if chunk_limit < old_limit:
+                        _emit(
+                            f"Tile {tile.tile_id}: reducing GPU chunk_size {old_limit} -> {chunk_limit} after OOM",
+                            lvl="INFO",
+                            callback=progress_callback,
+                        )
+
+                if isinstance(gpu_runtime_state, dict):
+                    gpu_runtime_state["failure_count"] = int(gpu_runtime_state.get("failure_count", 0)) + 1
+                    max_failures = max(1, int(gpu_runtime_state.get("max_failures", 3)))
+                    if errstate_missing:
+                        gpu_runtime_state["disabled"] = True
+                        _emit("[GRID] GPU disabled for this run: cupy/cupyx errstate unavailable", lvl="WARN", callback=progress_callback)
+                    elif int(gpu_runtime_state.get("failure_count", 0)) >= max_failures:
+                        gpu_runtime_state["disabled"] = True
+                        _emit(
+                            f"[GRID] GPU circuit breaker triggered after {int(gpu_runtime_state.get('failure_count',0))} failures; forcing CPU for remaining tiles",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+                    if gpu_runtime_state.get("disabled"):
+                        tile_gpu_enabled = False
+
+                res = _stack_weighted_patches(
+                    aligned_patches,
+                    weight_maps,
+                    config,
+                    reference_median=reference_median,
+                    return_weight_sum=True,
+                    return_ref_median=True,
+                )
+            finally:
+                _cleanup_gpu_memory()
         else:
             res = _stack_weighted_patches(
                 aligned_patches,
@@ -2740,6 +2859,131 @@ def _blend_overlap_region(
     return blended.astype(np.float32), weight_out, used_pyramid
 
 
+
+def _apply_grid_final_dbe(
+    mosaic: np.ndarray,
+    *,
+    valid_mask_hw: np.ndarray | None = None,
+    strength: str = "normal",
+    progress_callback: ProgressCallback = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Apply a light final DBE-style correction for Grid mode (RGB, per-channel)."""
+
+    info: dict[str, object] = {
+        "applied": False,
+        "reason": "",
+        "strength": str(strength).strip().lower() if str(strength).strip() else "normal",
+        "sigma": 0.0,
+        "applied_channels": 0,
+    }
+
+    if not isinstance(mosaic, np.ndarray):
+        info["reason"] = "invalid_input"
+        return mosaic, info
+
+    if mosaic.ndim != 3 or mosaic.shape[-1] != 3:
+        info["reason"] = "non_rgb"
+        return mosaic, info
+
+    if not _NDIMAGE_AVAILABLE or ndimage is None:
+        info["reason"] = "scipy_ndimage_unavailable"
+        return mosaic, info
+
+    strength_map = {
+        "weak": 24.0,
+        "low": 24.0,
+        "normal": 36.0,
+        "strong": 52.0,
+        "high": 52.0,
+        "aggressive": 68.0,
+    }
+    sigma = float(strength_map.get(str(info["strength"]), strength_map["normal"]))
+    info["sigma"] = sigma
+
+    out = np.asarray(mosaic, dtype=np.float32, order="C")
+    if not out.flags.writeable:
+        out = out.copy()
+
+    h, w = out.shape[:2]
+    finite_any = np.any(np.isfinite(out), axis=-1)
+    valid_hw = finite_any
+    if isinstance(valid_mask_hw, np.ndarray) and valid_mask_hw.shape[:2] == (h, w):
+        try:
+            valid_hw = valid_hw & np.asarray(valid_mask_hw, dtype=bool)
+        except Exception:
+            valid_hw = finite_any
+
+    if not np.any(valid_hw):
+        info["reason"] = "no_valid"
+        return out, info
+
+    for c in range(3):
+        ch = out[..., c]
+        ch_finite = np.isfinite(ch)
+        ch_valid = valid_hw & ch_finite
+        if not np.any(ch_valid):
+            continue
+
+        median = float(np.nanmedian(ch[ch_valid]))
+        mad = float(np.nanmedian(np.abs(ch[ch_valid] - median))) if np.any(ch_valid) else 0.0
+        robust_sigma = float(1.4826 * mad)
+        obj_k_map = {
+            "weak": 3.0,
+            "low": 3.0,
+            "normal": 2.8,
+            "strong": 2.5,
+            "high": 2.5,
+            "aggressive": 2.2,
+        }
+        obj_k = float(obj_k_map.get(str(info["strength"]), 2.8))
+        obj_thr = float(median + (obj_k * robust_sigma))
+
+        obj_mask = ch_valid & (ch > obj_thr)
+        dil_iter_map = {
+            "weak": 2,
+            "low": 2,
+            "normal": 3,
+            "strong": 4,
+            "high": 4,
+            "aggressive": 5,
+        }
+        dil_iters = int(dil_iter_map.get(str(info["strength"]), 3))
+        try:
+            obj_mask = ndimage.binary_dilation(obj_mask, iterations=max(1, dil_iters))
+        except Exception:
+            pass
+
+        bg_valid = ch_valid & (~obj_mask)
+        if not np.any(bg_valid):
+            bg_valid = ch_valid
+
+        fill_ref = float(np.nanmedian(ch[bg_valid])) if np.any(bg_valid) else median
+        ch_filled = np.where(ch_valid, ch, fill_ref).astype(np.float32, copy=False)
+        # Protect bright structures before background model estimation
+        ch_model = np.where(obj_mask, fill_ref, ch_filled).astype(np.float32, copy=False)
+
+        try:
+            bg = ndimage.gaussian_filter(ch_model, sigma=sigma, mode="nearest")
+        except Exception:
+            continue
+
+        bg_med = float(np.nanmedian(bg[bg_valid])) if np.any(bg_valid) else fill_ref
+        corrected = ch_filled - (bg - bg_med)
+        # Keep protected object regions untouched to avoid dark halos
+        corrected = np.where(obj_mask, ch_filled, corrected)
+
+        ch_out = np.where(ch_valid, corrected, np.nan).astype(np.float32, copy=False)
+        out[..., c] = ch_out
+        info["applied_channels"] = int(info.get("applied_channels", 0)) + 1
+
+    if int(info.get("applied_channels", 0)) > 0:
+        info["applied"] = True
+    else:
+        info["reason"] = "no_channel_processed"
+
+    return out, info
+
+
 def assemble_tiles(
     grid: GridDefinition,
     tiles: Iterable[GridTile],
@@ -2749,6 +2993,7 @@ def assemble_tiles(
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool = True,
     final_mosaic_dbe_enabled: bool = True,
+    final_mosaic_dbe_strength: str = "normal",
     progress_callback: ProgressCallback = None,
     progress_reporter: _GridProgressReporter | None = None,
 ) -> Path | None:
@@ -3600,14 +3845,27 @@ def assemble_tiles(
         reporter.emit_eta()
 
     if final_mosaic_dbe_enabled:
+        valid_mask_hw = np.asarray(np.any(weight_sum > 0, axis=-1) if getattr(weight_sum, "ndim", 0) == 3 else (weight_sum > 0), dtype=bool)
+        mosaic, dbe_info = _apply_grid_final_dbe(
+            mosaic,
+            valid_mask_hw=valid_mask_hw,
+            strength=final_mosaic_dbe_strength,
+            progress_callback=progress_callback,
+        )
         _emit(
-            "[DBE] grid_mode: bypassing worker Phase 6, DBE hook point is in grid_mode final save path",
+            "[DBE] grid_mode: applied=%s strength=%s sigma=%s channels=%s reason=%s" % (
+                bool(dbe_info.get("applied", False)),
+                str(dbe_info.get("strength", final_mosaic_dbe_strength)),
+                str(dbe_info.get("sigma", "n/a")),
+                str(dbe_info.get("applied_channels", 0)),
+                str(dbe_info.get("reason", "")),
+            ),
             lvl="INFO",
             callback=progress_callback,
         )
     else:
         _emit(
-            "[DBE] grid_mode: disabled by config (final_mosaic_dbe_enabled=False)",
+            "[DBE] grid_mode: skipped (final_mosaic_dbe_enabled=False)",
             lvl="INFO",
             callback=progress_callback,
         )
@@ -4094,6 +4352,13 @@ def run_grid_mode(
             gpu_stack_semaphore: threading.Semaphore | None = None
             concurrency = 1
             details = None
+            gpu_runtime_state: dict = {"disabled": False, "failure_count": 0, "max_failures": 3}
+            try:
+                env_fail = os.environ.get("ZEMOSAIC_GRID_GPU_MAX_FAILURES", "").strip()
+                if env_fail:
+                    gpu_runtime_state["max_failures"] = max(1, int(env_fail))
+            except Exception:
+                pass
             if config.use_gpu:
                 concurrency, details = _compute_gpu_concurrency(config.stack_chunk_budget_mb)
                 gpu_stack_semaphore = threading.Semaphore(max(1, concurrency))
@@ -4222,6 +4487,7 @@ def run_grid_mode(
                         config,
                         progress_callback=progress_callback,
                         gpu_stack_semaphore=gpu_stack_semaphore,
+                        gpu_runtime_state=gpu_runtime_state,
                     ): tile
                     for tile in grid.tiles
                 }
@@ -4257,6 +4523,7 @@ def run_grid_mode(
             )
             if grid_dbe_flag is None:
                 grid_dbe_flag = True
+            grid_dbe_strength = str(getattr(zconfig, "final_mosaic_dbe_strength", cfg_disk.get("final_mosaic_dbe_strength", "normal")))
             mosaic_path = assemble_tiles(
                 grid,
                 grid.tiles,
@@ -4265,6 +4532,7 @@ def run_grid_mode(
                 legacy_rgb_cube=legacy_rgb_cube,
                 grid_rgb_equalize=grid_rgb_equalize,
                 final_mosaic_dbe_enabled=bool(grid_dbe_flag),
+                final_mosaic_dbe_strength=grid_dbe_strength,
                 progress_callback=progress_callback,
                 progress_reporter=reporter,
             )

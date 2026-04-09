@@ -329,7 +329,7 @@ class ZeMosaicGUI:
                 "stacking_kappa_high": 3.0,
                 "stacking_winsor_limits": "0.05,0.05",
                 "stacking_final_combine_method": "mean",
-                "poststack_equalize_rgb": True,
+                "poststack_equalize_rgb": False,
                 # Logging
                 "logging_level": "INFO",
                 "apply_radial_weight": False,
@@ -612,7 +612,7 @@ class ZeMosaicGUI:
         if num_workers_from_config == -1:
             num_workers_from_config = 0
         self.num_workers_var = tk.IntVar(master=self.root, value=num_workers_from_config)
-        self.winsor_workers_var = tk.IntVar(master=self.root, value=self.config.get("winsor_worker_limit", 6))
+        self.winsor_workers_var = tk.IntVar(master=self.root, value=self.config.get("winsor_worker_limit", 0))
         self.winsor_max_frames_var = tk.IntVar(master=self.root, value=self.config.get("winsor_max_frames_per_pass", 0))
         # --- FIN NOMBRE DE WORKERS ---
         # --- NOUVELLES VARIABLES TKINTER POUR LE ROGNAGE ---

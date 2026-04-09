@@ -76,10 +76,32 @@ WSC_STREAM_OVERHEAD = float(os.environ.get("ZEMOSAIC_WSC_STREAM_OVERHEAD", 12.0)
 _WSC_GPU_PARITY_CHECKED = False
 _WSC_GPU_PARITY_OK = False
 _WSC_GPU_PARITY_MAX_ABS: float | None = None
+_P3_GPU_RUNTIME_STATS: dict[str, Any] = {}
+_WSC_DYNAMIC_ROWS_CAP: int | None = None
+_WSC_OOM_EVENTS: int = 0
 
 
 class GPUStackingError(RuntimeError):
     """Raised when GPU-based stacking is unavailable or fails."""
+
+
+def reset_phase3_gpu_runtime_stats() -> None:
+    """Clear last-known Phase 3 GPU runtime metrics."""
+
+    _P3_GPU_RUNTIME_STATS.clear()
+
+
+def get_phase3_gpu_runtime_stats() -> dict[str, Any]:
+    """Return a shallow copy of the latest Phase 3 GPU runtime metrics."""
+
+    return dict(_P3_GPU_RUNTIME_STATS)
+
+
+def _update_phase3_gpu_runtime_stats(**kwargs: Any) -> None:
+    try:
+        _P3_GPU_RUNTIME_STATS.update(kwargs)
+    except Exception:
+        pass
 
 
 def _available_ram_bytes() -> int | None:
@@ -242,9 +264,31 @@ def _gpu_safe_mode_enabled() -> bool:
     return os.environ.get("ZEMOSAIC_GPU_SAFE_MODE", "").strip() == "1"
 
 
+def _is_cupy_runtime_unavailable_error(exc: Exception) -> bool:
+    """Return True when CuPy is present but required CUDA runtime/compiler libs are missing."""
+
+    try:
+        msg = str(exc).lower()
+    except Exception:
+        msg = repr(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "libnvrtc",
+            "nvrtc64",
+            "dynamiclibnotfounderror",
+            "failure finding \"libnvrtc",
+            "failure finding 'libnvrtc",
+            "cuda runtime",
+            "cudart",
+            "nvrtc",
+        )
+    )
+
+
 def _gpu_is_usable(logger: logging.Logger | None = None) -> bool:
     """
-    Return True if a CUDA device is available and a tiny CuPy allocation works.
+    Return True if a CUDA device is available and core CuPy ops work.
 
     The result is cached because devices rarely change between calls.
     """
@@ -258,12 +302,22 @@ def _gpu_is_usable(logger: logging.Logger | None = None) -> bool:
         return False
     try:
         cp.cuda.runtime.getDeviceCount()
-        cp.zeros((4, 4), dtype=cp.float32)
+        probe = cp.zeros((4, 4), dtype=cp.float32)
+        # Force a tiny reduction kernel compilation so missing NVRTC/libcudart
+        # is detected here instead of later during Phase 3 chunk processing.
+        _ = float(cp.sum(probe).item())
         _GPU_HEALTHY = True
     except Exception as exc:  # pragma: no cover - GPU failure path
         if logger:
             try:
-                logger.debug("CuPy GPU smoke test failed: %s", exc)
+                if _is_cupy_runtime_unavailable_error(exc):
+                    logger.warning(
+                        "CuPy detected but CUDA runtime/compiler support is incomplete (%s). "
+                        "Disabling GPU path and falling back to CPU.",
+                        exc,
+                    )
+                else:
+                    logger.debug("CuPy GPU smoke test failed: %s", exc)
             except Exception:
                 pass
         _GPU_HEALTHY = False
@@ -330,6 +384,43 @@ def _wsc_estimate_bytes_per_row(
     return int(frames * w * dbytes * ovh)
 
 
+
+
+def _wsc_budget_fraction_by_vram(total_vram_bytes: int | None, n_frames: int) -> float:
+    """Return a conservative VRAM budget fraction for WSC chunks.
+
+    Low-VRAM GPUs are clamped more aggressively to avoid recurrent CuPy OOMs,
+    while larger GPUs keep higher utilization.
+    """
+
+    total = int(total_vram_bytes or 0)
+    gib = 1024 * 1024 * 1024
+
+    if total and total <= 3 * gib:
+        frac = 0.35
+    elif total and total <= 4 * gib:
+        frac = 0.40
+    elif total and total <= 6 * gib:
+        frac = 0.48
+    elif total and total <= 8 * gib:
+        frac = 0.52
+    else:
+        frac = 0.55
+
+    # More source frames increase temporary buffers and allocator pressure.
+    try:
+        n = max(1, int(n_frames))
+    except Exception:
+        n = 1
+    if n >= 8:
+        frac -= 0.08
+    elif n >= 6:
+        frac -= 0.05
+    elif n >= 4:
+        frac -= 0.03
+
+    return float(min(0.60, max(0.22, frac)))
+
 def _should_use_wsc_streaming_cpu(
     *,
     frames_count: int,
@@ -374,19 +465,28 @@ def _resolve_rows_per_chunk_wsc(
 
     bytes_per_row = _wsc_estimate_bytes_per_row(n_frames, width)
     free_b = None
+    total_b = None
     if cp_mod is not None:
         try:
-            free_b, _total_b = cp_mod.cuda.runtime.memGetInfo()
+            free_b, total_b = cp_mod.cuda.runtime.memGetInfo()
         except Exception:
             free_b = None
+            total_b = None
     if free_b is None:
         free_b = max_bytes if max_bytes > 0 else 0
 
-    budget = min(max_bytes if max_bytes > 0 else free_b, int(free_b * 0.55))
+    budget_fraction = _wsc_budget_fraction_by_vram(total_b, n_frames)
+    if _WSC_OOM_EVENTS > 0:
+        # Tighten progressively after observed OOMs during the current run.
+        budget_fraction = max(0.20, budget_fraction * (0.92 ** min(4, int(_WSC_OOM_EVENTS))))
+
+    budget = min(max_bytes if max_bytes > 0 else free_b, int(free_b * budget_fraction))
     rows_budget = budget // bytes_per_row if budget > 0 and bytes_per_row > 0 else 0
     rows_final = rows_budget if rows_budget > 0 else 1
     if rows_hint and rows_hint > 0:
         rows_final = min(rows_final, int(rows_hint))
+    if _WSC_DYNAMIC_ROWS_CAP and int(_WSC_DYNAMIC_ROWS_CAP) > 0:
+        rows_final = min(rows_final, int(_WSC_DYNAMIC_ROWS_CAP))
     rows_final = min(height, rows_final)
     if _gpu_safe_mode_enabled():
         rows_final = min(rows_final, SAFE_MODE_ROWS_CAP, height)
@@ -395,14 +495,18 @@ def _resolve_rows_per_chunk_wsc(
         try:
             mib = 1024.0 * 1024.0
             logger.info(
-                "[P3][WSC][VRAM_PREFLIGHT] N=%d W=%d C=%d free=%.1fMiB budget=%.1fMiB est_row=%.3fMiB rows=%d channelwise=yes",
+                "[P3][WSC][VRAM_PREFLIGHT] N=%d W=%d C=%d free=%.1fMiB total=%.1fMiB budget=%.1fMiB frac=%.3f est_row=%.3fMiB rows=%d rows_cap=%s oom_events=%d channelwise=yes",
                 int(n_frames),
                 int(width),
                 int(channels),
                 float(free_b) / mib if mib else 0.0,
+                float(total_b) / mib if (mib and total_b) else 0.0,
                 float(budget) / mib if mib else 0.0,
+                float(budget_fraction),
                 float(bytes_per_row) / mib if mib else 0.0,
                 int(rows_final),
+                str(int(_WSC_DYNAMIC_ROWS_CAP)) if _WSC_DYNAMIC_ROWS_CAP else "none",
+                int(_WSC_OOM_EVENTS),
             )
         except Exception:
             pass
@@ -1148,14 +1252,9 @@ def _poststack_rgb_equalization(
     stacking_params: Mapping[str, Any] | None = None,
     zconfig: Any | None = None,
 ) -> dict[str, Any]:
-    """
-    Apply optional RGB median equalization and return metadata.
+    """Apply optional poststack RGB equalization and return telemetry."""
 
-    Keeps GPU-only or mixed GPU/CPU runs consistent with the CPU stacker's
-    per-stack equalization behavior.
-    """
-
-    default_enabled = True
+    default_enabled = False
     enabled = default_enabled
     try:
         if stacking_params is not None and hasattr(stacking_params, "get"):
@@ -1176,54 +1275,109 @@ def _poststack_rgb_equalization(
             pass
 
     info = {
-        "enabled": enabled,
+        "enabled": bool(enabled),
         "applied": False,
         "gain_r": 1.0,
         "gain_g": 1.0,
         "gain_b": 1.0,
         "target_median": float("nan"),
+        "samples": 0,
+        "mask_coverage": 0.0,
+        "raw_gains": [1.0, 1.0, 1.0],
+        "clipped_gains": [1.0, 1.0, 1.0],
+        "decision": "disabled",
     }
 
     if not enabled or stacked is None or not isinstance(stacked, np.ndarray):
         return info
     if stacked.ndim != 3 or stacked.shape[2] != 3:
+        info["decision"] = "non_rgb"
         return info
 
-    try:
-        med = np.nanmedian(stacked, axis=(0, 1)).astype(np.float32)
-        finite = np.isfinite(med) & (med > 0)
-        if not np.any(finite):
-            return info
-
-        target = float(np.nanmedian(med[finite]))
-        gains = np.ones(3, dtype=np.float32)
-        gains[finite] = target / med[finite]
+    def _cfg_get(name: str, default: Any) -> Any:
         try:
-            if not stacked.flags.writeable:
-                try:
-                    stacked.setflags(write=True)
-                except Exception:
-                    pass
-            np.multiply(stacked, gains[None, None, :], out=stacked, casting="unsafe")
+            if stacking_params is not None and hasattr(stacking_params, "get") and name in stacking_params:
+                return stacking_params.get(name)
         except Exception:
-            np.multiply(stacked, gains[None, None, :], out=None, casting="unsafe")
+            pass
+        try:
+            if zconfig is not None:
+                return getattr(zconfig, name, default)
+        except Exception:
+            pass
+        return default
 
-        info.update(
-            gain_r=float(gains[0]),
-            gain_g=float(gains[1]),
-            gain_b=float(gains[2]),
-            target_median=float(target),
-        )
-        if np.isfinite(target):
-            info["applied"] = True
+    gain_clip = _cfg_get("poststack_rgb_equalize_gain_clip", (0.95, 1.05))
+    bg_percentile = _cfg_get("poststack_rgb_equalize_bg_percentile", (5.0, 85.0))
+    min_samples = _cfg_get("poststack_rgb_equalize_min_samples", 5000)
+    min_coverage = _cfg_get("poststack_rgb_equalize_min_coverage", 0.01)
+
+    try:
+        if _CPU_STACK_HELPERS_AVAILABLE and _zas is not None and hasattr(_zas, "equalize_rgb_medians_inplace"):
+            eq_info = _zas.equalize_rgb_medians_inplace(
+                stacked,
+                gain_clip=gain_clip,
+                bg_percentile=bg_percentile,
+                min_samples=min_samples,
+                min_coverage=min_coverage,
+                return_info=True,
+            )
+            if isinstance(eq_info, dict):
+                info.update(
+                    applied=bool(eq_info.get("applied", False)),
+                    gain_r=float(eq_info.get("gain_r", 1.0)),
+                    gain_g=float(eq_info.get("gain_g", 1.0)),
+                    gain_b=float(eq_info.get("gain_b", 1.0)),
+                    target_median=float(eq_info.get("target_median", float("nan"))),
+                    samples=int(eq_info.get("samples", 0) or 0),
+                    mask_coverage=float(eq_info.get("mask_coverage", 0.0) or 0.0),
+                    raw_gains=list(eq_info.get("raw_gains", [1.0, 1.0, 1.0])),
+                    clipped_gains=list(eq_info.get("clipped_gains", [1.0, 1.0, 1.0])),
+                    decision=str(eq_info.get("decision", "no-op")),
+                )
+        else:
+            med = np.nanmedian(stacked, axis=(0, 1)).astype(np.float32)
+            finite = np.isfinite(med) & (med > 0)
+            if not np.any(finite):
+                info["decision"] = "invalid_channel_medians"
+                return info
+            target = float(np.nanmedian(med[finite]))
+            gains = np.ones(3, dtype=np.float32)
+            gains[finite] = target / med[finite]
+            np.multiply(stacked, gains[None, None, :], out=stacked, casting="unsafe")
+            info.update(
+                applied=np.isfinite(target),
+                gain_r=float(gains[0]),
+                gain_g=float(gains[1]),
+                gain_b=float(gains[2]),
+                target_median=float(target),
+                decision="applied" if np.isfinite(target) else "invalid_target",
+                raw_gains=[float(gains[0]), float(gains[1]), float(gains[2])],
+                clipped_gains=[float(gains[0]), float(gains[1]), float(gains[2])],
+            )
+
+        if info.get("applied"):
             LOGGER.info(
-                "[RGB-EQ][GPU] Applied per-substack RGB equalization: gains=(%.6f,%.6f,%.6f) target=%.6g",
-                gains[0],
-                gains[1],
-                gains[2],
-                target,
+                "[RGB-EQ][GPU] poststack robust eq applied: samples=%d, mask_coverage=%.4f, raw=(%.6f,%.6f,%.6f), clipped=(%.6f,%.6f,%.6f), target=%.6g",
+                int(info.get("samples", 0) or 0),
+                float(info.get("mask_coverage", 0.0) or 0.0),
+                float(info.get("raw_gains", [1.0,1.0,1.0])[0]),
+                float(info.get("raw_gains", [1.0,1.0,1.0])[1]),
+                float(info.get("raw_gains", [1.0,1.0,1.0])[2]),
+                float(info.get("clipped_gains", [1.0,1.0,1.0])[0]),
+                float(info.get("clipped_gains", [1.0,1.0,1.0])[1]),
+                float(info.get("clipped_gains", [1.0,1.0,1.0])[2]),
+                float(info.get("target_median", float("nan"))),
+            )
+        else:
+            LOGGER.info(
+                "[RGB-EQ][GPU] poststack robust eq no-op: decision=%s, samples=%d, mask_coverage=%.4f",
+                str(info.get("decision", "no-op")),
+                int(info.get("samples", 0) or 0),
+                float(info.get("mask_coverage", 0.0) or 0.0),
             )
     except Exception as exc:
+        info["decision"] = "error"
         LOGGER.warning("[RGB-EQ][GPU] Skipped RGB equalization due to error: %s", exc)
 
     return info
@@ -1255,6 +1409,8 @@ def gpu_stack_from_arrays(
     zconfig:
         Optional configuration namespace mirroring the CPU stacker options.
     """
+
+    global _WSC_DYNAMIC_ROWS_CAP, _WSC_OOM_EVENTS
 
     if logger is None:
         logger = LOGGER
@@ -1504,13 +1660,25 @@ def gpu_stack_from_arrays(
                                 raise GPUStackingError("WSC GPU VRAM exhausted") from exc
                             current_rows = max(1, current_rows // 2)
                             rows_per_chunk = current_rows
+
+                            # Persist a conservative cap for subsequent chunks/tiles in this run.
+                            try:
+                                _WSC_OOM_EVENTS = int(_WSC_OOM_EVENTS) + 1
+                            except Exception:
+                                _WSC_OOM_EVENTS = 1
+                            tightened_cap = max(1, int(current_rows * 0.85))
+                            if _WSC_DYNAMIC_ROWS_CAP is None or tightened_cap < int(_WSC_DYNAMIC_ROWS_CAP):
+                                _WSC_DYNAMIC_ROWS_CAP = int(tightened_cap)
+
                             if logger:
                                 try:
                                     logger.warning(
-                                        "[P3][WSC][VRAM_BACKOFF] oom retry=%d rows->%d row_start=%d",
+                                        "[P3][WSC][VRAM_BACKOFF] oom retry=%d rows->%d rows_cap=%s row_start=%d oom_events=%d",
                                         retry_count,
                                         current_rows,
+                                        str(int(_WSC_DYNAMIC_ROWS_CAP)) if _WSC_DYNAMIC_ROWS_CAP else "none",
                                         row_start,
+                                        int(_WSC_OOM_EVENTS),
                                     )
                                 except Exception:
                                     pass
@@ -1659,6 +1827,27 @@ def gpu_stack_from_arrays(
         )
 
     duration = time.perf_counter() - start_time
+    total_profile_ms = prof_upload_ms + prof_reject_ms + prof_combine_ms + prof_download_ms
+    upload_share = (100.0 * prof_upload_ms / total_profile_ms) if total_profile_ms > 0.0 else None
+    compute_share = (
+        100.0 * (prof_reject_ms + prof_combine_ms) / total_profile_ms
+    ) if total_profile_ms > 0.0 else None
+    download_share = (100.0 * prof_download_ms / total_profile_ms) if total_profile_ms > 0.0 else None
+    _update_phase3_gpu_runtime_stats(
+        p3_gpu_last_rows_per_chunk=int(rows_per_chunk),
+        p3_gpu_last_total_rows=int(height),
+        p3_gpu_last_frames=int(len(frames_for_stack)),
+        p3_gpu_last_duration_s=float(duration),
+        p3_gpu_last_upload_ms=float(prof_upload_ms),
+        p3_gpu_last_reject_ms=float(prof_reject_ms),
+        p3_gpu_last_combine_ms=float(prof_combine_ms),
+        p3_gpu_last_download_ms=float(prof_download_ms),
+        p3_gpu_last_upload_share_pct=float(upload_share) if upload_share is not None else None,
+        p3_gpu_last_compute_share_pct=float(compute_share) if compute_share is not None else None,
+        p3_gpu_last_download_share_pct=float(download_share) if download_share is not None else None,
+        p3_gpu_last_algo=str(algo),
+        p3_gpu_last_used=True,
+    )
     if pcb_tile:
         try:
             pcb_tile(

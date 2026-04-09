@@ -1,0 +1,8 @@
+/home/tristan/zemosaic/zemosaic/CHANGELOG.md
+/home/tristan/zemosaic/zemosaic/README.md
+/home/tristan/zemosaic/zemosaic/RELEASE_NOTES.md
+/home/tristan/zemosaic/zemosaic/agent_prepivot_20260317.md
+/home/tristan/zemosaic/zemosaic/fix_regression.md
+/home/tristan/zemosaic/zemosaic/followup_prepivot_20260317.md
+/home/tristan/zemosaic/zemosaic/memory_compacted.md
+/home/tristan/zemosaic/zemosaic/memory_full_archive_20260315-1024.md

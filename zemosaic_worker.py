@@ -58,6 +58,7 @@ import inspect  # Pas utilisé directement ici, mais peut être utile pour des i
 import math
 import hashlib
 import json
+import csv
 from datetime import datetime
 import psutil
 import tempfile
@@ -67,6 +68,7 @@ import multiprocessing
 import threading
 import itertools
 import platform
+import importlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -97,13 +99,12 @@ from core.path_helpers import (
     safe_path_isfile,
 )
 
-try:
-    import lecropper  # noqa: F401
-
-    _LECROPPER_AVAILABLE = True
-except Exception:
-    lecropper = None
-    _LECROPPER_AVAILABLE = False
+# Annex tool: keep optional and lazy; official runtime must not depend on it.
+lecropper = None
+_LECROPPER_AVAILABLE = False
+_LECROPPER_LOAD_ATTEMPTED = False
+_LECROPPER_LOAD_LOCK = threading.Lock()
+_LECROPPER_IMPORT_ERROR: Exception | None = None
 
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
@@ -850,7 +851,9 @@ def _apply_lecropper_pipeline(
     Returns (processed_array, optional_alpha_mask_float).
     """
 
-    if not (_LECROPPER_AVAILABLE and isinstance(arr, np.ndarray) and arr.size):
+    if not isinstance(arr, np.ndarray) or not arr.size:
+        return arr, None
+    if not _LECROPPER_AVAILABLE and not _ensure_lecropper_loaded():
         return arr, None
 
     cfg = cfg or {}
@@ -915,14 +918,60 @@ def _apply_lecropper_pipeline(
     altaz_mask2d_used = False
     altaz_mask2d_applied = False
     try:
-        if q_enabled and hasattr(lecropper, "quality_crop"):
-            out = lecropper.quality_crop(
-                out,
-                band_px=band_px,
-                k_sigma=k_sigma,
-                margin_px=margin_px,
-                min_run=min_run,
-            )
+        if q_enabled:
+            detect_autocrop = getattr(lecropper, "detect_autocrop_rgb", None)
+            if callable(detect_autocrop):
+                crop_src = np.asarray(out, dtype=np.float32)
+                axis_mode = "HWC"
+                if crop_src.ndim == 3 and crop_src.shape[0] == 3 and crop_src.shape[-1] != 3:
+                    crop_src = np.moveaxis(crop_src, 0, -1)
+                    axis_mode = "CHW"
+                elif crop_src.ndim == 2:
+                    crop_src = crop_src[..., np.newaxis]
+                    axis_mode = "HW"
+
+                if crop_src.ndim >= 3:
+                    if crop_src.shape[-1] >= 3:
+                        R = crop_src[..., 0]
+                        G = crop_src[..., 1]
+                        B = crop_src[..., 2]
+                    else:
+                        mono = crop_src[..., 0]
+                        R = G = B = mono
+
+                    lum2d = np.nanmean(np.stack([R, G, B], axis=0), axis=0).astype(np.float32)
+                    R = np.nan_to_num(np.asarray(R, dtype=np.float32), nan=0.0)
+                    G = np.nan_to_num(np.asarray(G, dtype=np.float32), nan=0.0)
+                    B = np.nan_to_num(np.asarray(B, dtype=np.float32), nan=0.0)
+                    lum2d = np.nan_to_num(lum2d, nan=0.0)
+
+                    y0, x0, y1, x1 = detect_autocrop(
+                        lum2d,
+                        R,
+                        G,
+                        B,
+                        band_px=band_px,
+                        k_sigma=k_sigma,
+                        margin_px=margin_px,
+                    )
+                    h_lum, w_lum = lum2d.shape
+                    crop_area = (y1 - y0) * (x1 - x0)
+                    full_area = h_lum * w_lum
+                    if (
+                        0 <= y0 < y1 <= h_lum
+                        and 0 <= x0 < x1 <= w_lum
+                        and crop_area > 0
+                        and (crop_area / max(1, full_area)) < 0.97
+                    ):
+                        cropped = crop_src[y0:y1, x0:x1, ...]
+                        if axis_mode == "CHW":
+                            out = np.moveaxis(cropped, -1, 0)
+                        elif axis_mode == "HW":
+                            out = cropped[..., 0]
+                        else:
+                            out = cropped
+                        if coverage is not None and getattr(coverage, "shape", None) == (h_lum, w_lum):
+                            coverage = np.asarray(coverage, dtype=np.float32)[y0:y1, x0:x1]
 
         if az_enabled:
             mask2d = None
@@ -2168,6 +2217,123 @@ class _TwoPassDiagnostics:
                 len(self.overlap_records),
             )
 
+
+
+
+
+# Conservative runtime-cost shares by phase for global ETA projection.
+# Purpose: avoid dramatic underestimation during early fast phases (P1/P2/P3)
+# when heavy late phases (especially P5) still dominate wall-clock time.
+_PHASE_ETA_COST_SHARE = {
+    1: 0.04,
+    2: 0.01,
+    3: 0.20,
+    4: 0.05,
+    45: 0.10,  # Phase 4.5 intertile
+    5: 0.52,
+    6: 0.06,
+    7: 0.02,
+}
+
+
+
+
+def _estimate_parallel_makespan_seconds(durations_sec: list[float], workers: int) -> float:
+    """Greedy parallel makespan estimator (LPT-like) for ETA projection."""
+    try:
+        if not durations_sec:
+            return 0.0
+        k = max(1, int(workers))
+        jobs = [max(0.0, float(d)) for d in durations_sec if d is not None]
+        if not jobs:
+            return 0.0
+        jobs.sort(reverse=True)
+        lanes = [0.0] * k
+        for d in jobs:
+            idx = min(range(k), key=lambda i: lanes[i])
+            lanes[idx] += d
+        return max(lanes)
+    except Exception:
+        return 0.0
+
+def _eta_seconds_from_phase_model(
+    start_time_total_run: float | None,
+    *,
+    phase_index: int,
+    phase_fraction: float,
+) -> float:
+    """Estimate remaining runtime from conservative phase-cost model."""
+    try:
+        if start_time_total_run is None:
+            return 0.0
+        elapsed = max(0.0, float(time.monotonic() - float(start_time_total_run)))
+        frac = min(1.0, max(0.0, float(phase_fraction)))
+        consumed = 0.0
+        order = [1, 2, 3, 4, 45, 5, 6, 7]
+        for ph in order:
+            w = float(_PHASE_ETA_COST_SHARE.get(ph, 0.0))
+            if ph < phase_index:
+                consumed += w
+            elif ph == phase_index:
+                consumed += w * frac
+                break
+            else:
+                break
+        consumed = min(0.98, max(0.01, consumed))
+        rem = elapsed * (1.0 - consumed) / consumed
+        if not math.isfinite(rem):
+            return 0.0
+        return max(0.0, rem)
+    except Exception:
+        return 0.0
+
+def _eta_seconds_from_progress(start_time_total_run: float | None, current_progress_pct: float | None) -> float:
+    """Estimate remaining time from global run progress only.
+
+    Uses a guarded ratio to avoid extreme spikes at very low progress.
+    """
+    try:
+        if start_time_total_run is None or current_progress_pct is None:
+            return 0.0
+        elapsed = max(0.0, float(time.monotonic() - float(start_time_total_run)))
+        p = float(current_progress_pct)
+        if not math.isfinite(p):
+            return 0.0
+        p = min(99.5, max(0.5, p))
+        rem = elapsed * (100.0 - p) / p
+        if not math.isfinite(rem):
+            return 0.0
+        return max(0.0, rem)
+    except Exception:
+        return 0.0
+
+
+def _eta_smooth_seconds(prev_eta: float | None, raw_eta: float | None, *, alpha: float = 0.22) -> float:
+    """Low-pass filter ETA updates while allowing phase-transition resets.
+
+    Important: during phase transitions ETA can legitimately jump by large factors.
+    In that case we reset to the new estimate instead of clamping upward.
+    """
+    try:
+        if raw_eta is None:
+            return float(prev_eta or 0.0)
+        new = max(0.0, float(raw_eta))
+        if prev_eta is None:
+            return new
+        old = max(0.0, float(prev_eta))
+        if old <= 0.0:
+            return new
+
+        # Phase-shift / regime-change detection: allow immediate reset.
+        if (new > old * 4.0 and (new - old) > 90.0) or (old > new * 4.0 and (old - new) > 180.0):
+            return new
+
+        a_base = min(0.9, max(0.05, float(alpha)))
+        a = min(0.75, a_base * (2.0 if new > old else 1.0))
+        return old + a * (new - old)
+    except Exception:
+        return max(0.0, float(raw_eta or 0.0))
+
 def _apply_two_pass_coverage_renorm_if_requested(
     final_mosaic_data: np.ndarray | None,
     final_mosaic_coverage: np.ndarray | None,
@@ -2437,7 +2603,11 @@ def _apply_final_mosaic_rgb_equalization(
     zconfig=None,
     logger: logging.Logger | None = None,
 ):
-    """Apply final RGB equalization to the mosaic using the poststack helper."""
+    """Apply final RGB equalization to the mosaic using the poststack helper.
+
+    Tune mode: when enabled, channel gains are clipped to a conservative range
+    to avoid over-corrections (e.g. strong blue boosts).
+    """
 
     default_info = {
         "enabled": False,
@@ -2446,6 +2616,7 @@ def _apply_final_mosaic_rgb_equalization(
         "gain_g": 1.0,
         "gain_b": 1.0,
         "target_median": float("nan"),
+        "tuned": False,
     }
 
     if final_mosaic_data is None or not isinstance(final_mosaic_data, np.ndarray):
@@ -2456,6 +2627,46 @@ def _apply_final_mosaic_rgb_equalization(
             logger.debug("[RGB-EQ] final mosaic equalization skipped: helper unavailable")
         return final_mosaic_data, default_info
 
+    def _cfg_get(name: str, default: Any = None) -> Any:
+        try:
+            if isinstance(zconfig, dict):
+                return zconfig.get(name, default)
+            return getattr(zconfig, name, default)
+        except Exception:
+            return default
+
+    def _parse_gain_clip(raw: Any, default_clip: tuple[float, float]) -> tuple[float, float]:
+        lo, hi = default_clip
+        try:
+            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                lo = float(raw[0])
+                hi = float(raw[1])
+            elif isinstance(raw, str):
+                parts = [p.strip() for p in raw.replace(';', ',').split(',') if p.strip()]
+                if len(parts) >= 2:
+                    lo = float(parts[0])
+                    hi = float(parts[1])
+        except Exception:
+            lo, hi = default_clip
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            lo, hi = default_clip
+        if lo <= 0:
+            lo = default_clip[0]
+        if hi <= 0:
+            hi = default_clip[1]
+        if lo > hi:
+            lo, hi = hi, lo
+        return float(lo), float(hi)
+
+    tune_enabled = _coerce_bool_flag(_cfg_get("final_mosaic_rgb_equalize_clip_enabled", True))
+    if tune_enabled is None:
+        tune_enabled = True
+    tune_enabled = bool(tune_enabled)
+    gain_clip = _parse_gain_clip(
+        _cfg_get("final_mosaic_rgb_equalize_gain_clip", (0.80, 1.25)),
+        default_clip=(0.80, 1.25),
+    )
+
     try:
         info = _poststack_rgb_equalization(final_mosaic_data, zconfig=zconfig, stack_metadata=None)
     except Exception as exc:
@@ -2464,10 +2675,56 @@ def _apply_final_mosaic_rgb_equalization(
         return final_mosaic_data, default_info
 
     if not isinstance(info, dict):
-        info = default_info
+        info = default_info.copy()
     else:
         for key, value in default_info.items():
             info.setdefault(key, value)
+
+    if tune_enabled and bool(info.get("applied", False)):
+        try:
+            raw_gains = np.array(
+                [
+                    float(info.get("gain_r", 1.0)),
+                    float(info.get("gain_g", 1.0)),
+                    float(info.get("gain_b", 1.0)),
+                ],
+                dtype=np.float32,
+            )
+            clipped_gains = np.clip(raw_gains, gain_clip[0], gain_clip[1]).astype(np.float32)
+            if np.any(np.abs(clipped_gains - raw_gains) > 1e-7):
+                safe_raw = np.where(raw_gains == 0, 1.0, raw_gains).astype(np.float32)
+                correction = (clipped_gains / safe_raw).astype(np.float32)
+                np.multiply(
+                    final_mosaic_data,
+                    correction[None, None, :],
+                    out=final_mosaic_data,
+                    casting="unsafe",
+                )
+                info["gain_r_raw"] = float(raw_gains[0])
+                info["gain_g_raw"] = float(raw_gains[1])
+                info["gain_b_raw"] = float(raw_gains[2])
+                info["gain_r"] = float(clipped_gains[0])
+                info["gain_g"] = float(clipped_gains[1])
+                info["gain_b"] = float(clipped_gains[2])
+                info["tuned"] = True
+                if logger is not None:
+                    logger.info(
+                        "[RGB-EQ][TUNE] gain clip applied: raw=(%.6f, %.6f, %.6f) clipped=(%.6f, %.6f, %.6f) clip=(%.3f, %.3f)",
+                        float(raw_gains[0]),
+                        float(raw_gains[1]),
+                        float(raw_gains[2]),
+                        float(clipped_gains[0]),
+                        float(clipped_gains[1]),
+                        float(clipped_gains[2]),
+                        float(gain_clip[0]),
+                        float(gain_clip[1]),
+                    )
+            else:
+                info["tuned"] = False
+        except Exception as exc:
+            info["tuned"] = False
+            if logger is not None:
+                logger.warning("[RGB-EQ][TUNE] gain clip skipped due to error: %s", exc)
 
     if logger is not None and info.get("applied"):
         logger.info(
@@ -2479,7 +2736,6 @@ def _apply_final_mosaic_rgb_equalization(
         )
 
     return final_mosaic_data, info
-
 
 def equalize_black_point_rgb(
     mosaic_hwc: np.ndarray | None,
@@ -2728,6 +2984,363 @@ def _equalize_rgb_black_level_hwc(
         return out, info
 
     return rgb_hwc, info
+
+
+
+
+def _gaussian_blur_2d_float32(arr: np.ndarray, sigma_px: float) -> np.ndarray:
+    """Small utility blur for preview-time visual filtering (best-effort)."""
+
+    try:
+        sigma = float(sigma_px)
+    except Exception:
+        sigma = 0.0
+    if sigma <= 1e-6:
+        return np.asarray(arr, dtype=np.float32)
+
+    src = np.asarray(arr, dtype=np.float32)
+
+    try:
+        import cv2  # type: ignore
+
+        k = max(3, int(2 * round(sigma * 1.5) + 1))
+        return cv2.GaussianBlur(src, (k, k), sigmaX=sigma).astype(np.float32, copy=False)
+    except Exception:
+        pass
+
+    try:
+        from scipy.ndimage import gaussian_filter  # type: ignore
+
+        return gaussian_filter(src, sigma=float(sigma), truncate=4.0).astype(np.float32, copy=False)
+    except Exception:
+        return src
+
+
+def _apply_visual_seam_heal_low_frequency(
+    mosaic_hwc: np.ndarray | None,
+    *,
+    alpha_mask: np.ndarray | None = None,
+    coverage_hw: np.ndarray | None = None,
+    strength: float = 0.45,
+    sigma_small: float = 24.0,
+    sigma_large: float = 96.0,
+    seam_sigma: float = 2.5,
+    max_rel_delta: float = 0.08,
+    logger: logging.Logger | None = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Optional visual-only seam heal for preview/export rendering.
+
+    Luma-first, low-frequency correction modulated by seam likelihood from
+    coverage/alpha gradients. Intended for Phase 6 visual outputs only.
+    """
+
+    info: dict[str, Any] = {
+        'enabled': True,
+        'applied': False,
+        'reason': '',
+        'strength': float(strength),
+        'sigma_small': float(sigma_small),
+        'sigma_large': float(sigma_large),
+        'seam_sigma': float(seam_sigma),
+        'max_rel_delta': float(max_rel_delta),
+        'seam_weight_mean': 0.0,
+        'seam_weight_p95': 0.0,
+        'delta_abs_p95': 0.0,
+        'valid_frac': 0.0,
+    }
+
+    if mosaic_hwc is None or not isinstance(mosaic_hwc, np.ndarray):
+        info['reason'] = 'invalid_input'
+        return mosaic_hwc, info
+    if mosaic_hwc.ndim != 3 or mosaic_hwc.shape[-1] != 3:
+        info['reason'] = 'non_rgb'
+        return mosaic_hwc, info
+
+    try:
+        strength = float(max(0.0, min(1.0, float(strength))))
+    except Exception:
+        strength = 0.45
+    try:
+        sigma_small = float(max(1.0, min(512.0, float(sigma_small))))
+    except Exception:
+        sigma_small = 24.0
+    try:
+        sigma_large = float(max(sigma_small + 1.0, min(1024.0, float(sigma_large))))
+    except Exception:
+        sigma_large = max(48.0, sigma_small * 3.0)
+    try:
+        seam_sigma = float(max(0.5, min(64.0, float(seam_sigma))))
+    except Exception:
+        seam_sigma = 2.5
+    try:
+        max_rel_delta = float(max(0.01, min(0.30, float(max_rel_delta))))
+    except Exception:
+        max_rel_delta = 0.08
+
+    rgb = np.asarray(mosaic_hwc, dtype=np.float32)
+    if not rgb.flags.writeable:
+        rgb = rgb.copy()
+
+    finite = np.isfinite(rgb).all(axis=-1)
+    valid = finite.copy()
+
+    alpha_arr = None
+    if isinstance(alpha_mask, np.ndarray):
+        try:
+            alpha_arr = np.asarray(alpha_mask)
+            if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
+                alpha_arr = alpha_arr[..., 0]
+            elif alpha_arr.ndim > 2:
+                alpha_arr = np.squeeze(alpha_arr)
+            if alpha_arr.shape[:2] == rgb.shape[:2]:
+                valid &= alpha_arr > 0
+            else:
+                alpha_arr = None
+        except Exception:
+            alpha_arr = None
+
+    cov_arr = None
+    if isinstance(coverage_hw, np.ndarray):
+        try:
+            cov_arr = np.asarray(coverage_hw, dtype=np.float32)
+            if cov_arr.ndim > 2:
+                cov_arr = np.squeeze(cov_arr)
+            if cov_arr.shape[:2] == rgb.shape[:2]:
+                valid &= np.isfinite(cov_arr) & (cov_arr > 0)
+            else:
+                cov_arr = None
+        except Exception:
+            cov_arr = None
+
+    valid_px = int(np.count_nonzero(valid))
+    total_px = int(valid.size)
+    info['valid_frac'] = float(valid_px / total_px) if total_px > 0 else 0.0
+    if valid_px <= 0:
+        info['reason'] = 'no_valid'
+        return rgb, info
+
+    luma = (
+        (0.2126 * rgb[..., 0])
+        + (0.7152 * rgb[..., 1])
+        + (0.0722 * rgb[..., 2])
+    ).astype(np.float32, copy=False)
+
+    luma_fill = luma.copy()
+    if not np.all(valid):
+        try:
+            med = float(np.nanmedian(luma[valid]))
+        except Exception:
+            med = 0.0
+        luma_fill[~valid] = np.float32(med)
+
+    seam_source = None
+    if cov_arr is not None:
+        try:
+            src = np.nan_to_num(cov_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            vmax = float(np.nanmax(src)) if src.size else 0.0
+            if vmax > 0:
+                seam_source = np.clip(src / vmax, 0.0, 1.0)
+        except Exception:
+            seam_source = None
+    if seam_source is None and alpha_arr is not None:
+        try:
+            a = np.asarray(alpha_arr, dtype=np.float32)
+            if a.size:
+                vmax = float(np.nanmax(a))
+                if vmax > 1.0:
+                    a = np.clip(a / 255.0, 0.0, 1.0)
+                else:
+                    a = np.clip(a, 0.0, 1.0)
+                seam_source = a.astype(np.float32, copy=False)
+        except Exception:
+            seam_source = None
+    if seam_source is None:
+        seam_source = valid.astype(np.float32)
+
+    try:
+        gy, gx = np.gradient(np.nan_to_num(seam_source, nan=0.0, posinf=0.0, neginf=0.0))
+        grad = np.sqrt((gx * gx) + (gy * gy)).astype(np.float32, copy=False)
+    except Exception:
+        info['reason'] = 'gradient_failed'
+        return rgb, info
+
+    try:
+        grad_ref = float(np.nanpercentile(grad[valid], 99.0)) if np.any(valid) else float(np.nanmax(grad))
+    except Exception:
+        grad_ref = float(np.nanmax(grad)) if grad.size else 0.0
+    if not math.isfinite(grad_ref) or grad_ref <= 1e-9:
+        info['reason'] = 'no_seam_signal'
+        return rgb, info
+
+    seam_weight = np.clip(grad / grad_ref, 0.0, 1.0).astype(np.float32, copy=False)
+    seam_weight = _gaussian_blur_2d_float32(seam_weight, seam_sigma)
+    seam_weight = np.clip(seam_weight, 0.0, 1.0)
+    seam_weight *= valid.astype(np.float32)
+
+    if float(np.nanmax(seam_weight)) <= 1e-6:
+        info['reason'] = 'seam_weight_zero'
+        return rgb, info
+
+    low_small = _gaussian_blur_2d_float32(luma_fill, sigma_small)
+    low_large = _gaussian_blur_2d_float32(luma_fill, sigma_large)
+    delta = (low_small - low_large).astype(np.float32, copy=False)
+
+    try:
+        abs_cap = float(np.nanpercentile(np.abs(delta[valid]), 99.5))
+    except Exception:
+        abs_cap = float(np.nanmax(np.abs(delta))) if delta.size else 0.0
+    if not math.isfinite(abs_cap) or abs_cap <= 1e-9:
+        info['reason'] = 'delta_too_small'
+        return rgb, info
+
+    delta = np.clip(delta, -abs_cap, abs_cap)
+    correction = (strength * seam_weight * delta).astype(np.float32, copy=False)
+
+    eps = max(1e-6, float(np.nanpercentile(np.abs(luma_fill[valid]), 5.0)) * 0.05)
+    luma_corr = luma_fill - correction
+    ratio = np.ones_like(luma_fill, dtype=np.float32)
+    ratio[valid] = luma_corr[valid] / np.maximum(luma_fill[valid], eps)
+    ratio = np.clip(ratio, 1.0 - max_rel_delta, 1.0 + max_rel_delta)
+
+    out = np.where(valid[..., None], rgb * ratio[..., None], rgb).astype(np.float32, copy=False)
+
+    info['applied'] = True
+    info['reason'] = 'ok'
+    try:
+        info['seam_weight_mean'] = float(np.nanmean(seam_weight[valid]))
+        info['seam_weight_p95'] = float(np.nanpercentile(seam_weight[valid], 95.0))
+        info['delta_abs_p95'] = float(np.nanpercentile(np.abs(delta[valid]), 95.0))
+    except Exception:
+        pass
+
+    if logger is not None:
+        logger.info(
+            "[SeamHeal] applied=True strength=%.3f sigma_small=%.1f sigma_large=%.1f seam_sigma=%.2f max_rel=%.3f seam_w_mean=%.5f seam_w_p95=%.5f delta_abs_p95=%.5f",
+            float(strength),
+            float(sigma_small),
+            float(sigma_large),
+            float(seam_sigma),
+            float(max_rel_delta),
+            float(info.get('seam_weight_mean', 0.0)),
+            float(info.get('seam_weight_p95', 0.0)),
+            float(info.get('delta_abs_p95', 0.0)),
+        )
+
+    return out, info
+
+
+def _apply_visual_seam_heal_multiscale(
+    mosaic_hwc: np.ndarray | None,
+    *,
+    alpha_mask: np.ndarray | None = None,
+    coverage_hw: np.ndarray | None = None,
+    strength: float = 0.45,
+    sigma_small: float = 24.0,
+    sigma_large: float = 96.0,
+    seam_sigma: float = 2.5,
+    max_rel_delta: float = 0.08,
+    mid_gain: float = 0.35,
+    mid_sigma_scale: float = 0.60,
+    mid_rel_scale: float = 0.70,
+    logger: logging.Logger | None = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Preview-only multiscale seam heal.
+
+    Pass 1 = existing low-frequency seam heal.
+    Pass 2 = mid-scale seam heal with reduced amplitude.
+    """
+
+    info: dict[str, Any] = {
+        'enabled': True,
+        'applied': False,
+        'reason': '',
+        'multiscale': True,
+        'base_strength': float(strength),
+        'mid_gain': float(mid_gain),
+        'mid_sigma_scale': float(mid_sigma_scale),
+        'mid_rel_scale': float(mid_rel_scale),
+        'pass1': {},
+        'pass2': {},
+        'seam_weight_mean': 0.0,
+        'seam_weight_p95': 0.0,
+        'delta_abs_p95': 0.0,
+    }
+
+    try:
+        mid_gain = float(max(0.0, min(1.0, float(mid_gain))))
+    except Exception:
+        mid_gain = 0.35
+    try:
+        mid_sigma_scale = float(max(0.30, min(1.20, float(mid_sigma_scale))))
+    except Exception:
+        mid_sigma_scale = 0.60
+    try:
+        mid_rel_scale = float(max(0.30, min(1.50, float(mid_rel_scale))))
+    except Exception:
+        mid_rel_scale = 0.70
+
+    out1, info1 = _apply_visual_seam_heal_low_frequency(
+        mosaic_hwc,
+        alpha_mask=alpha_mask,
+        coverage_hw=coverage_hw,
+        strength=strength,
+        sigma_small=sigma_small,
+        sigma_large=sigma_large,
+        seam_sigma=seam_sigma,
+        max_rel_delta=max_rel_delta,
+        logger=logger,
+    )
+    info['pass1'] = info1 or {}
+
+    if out1 is None or not bool((info1 or {}).get('applied', False)):
+        info['reason'] = f"pass1_{(info1 or {}).get('reason', 'failed')}"
+        return out1, info
+
+    mid_strength = float(max(0.0, min(1.0, float(strength) * mid_gain)))
+    mid_small = float(max(1.0, float(sigma_small) * mid_sigma_scale))
+    mid_large = float(max(mid_small + 1.0, float(sigma_large) * mid_sigma_scale))
+    mid_seam_sigma = float(max(0.5, float(seam_sigma) * 0.85))
+    mid_rel = float(max(0.01, min(0.30, float(max_rel_delta) * mid_rel_scale)))
+
+    out2, info2 = _apply_visual_seam_heal_low_frequency(
+        out1,
+        alpha_mask=alpha_mask,
+        coverage_hw=coverage_hw,
+        strength=mid_strength,
+        sigma_small=mid_small,
+        sigma_large=mid_large,
+        seam_sigma=mid_seam_sigma,
+        max_rel_delta=mid_rel,
+        logger=logger,
+    )
+    info['pass2'] = info2 or {}
+
+    applied1 = bool((info1 or {}).get('applied', False))
+    applied2 = bool((info2 or {}).get('applied', False))
+    info['applied'] = bool(applied1 or applied2)
+    info['reason'] = 'ok' if info['applied'] else f"pass2_{(info2 or {}).get('reason', 'failed')}"
+
+    src = info2 if applied2 else info1
+    if isinstance(src, dict):
+        info['seam_weight_mean'] = float(src.get('seam_weight_mean', 0.0) or 0.0)
+        info['seam_weight_p95'] = float(src.get('seam_weight_p95', 0.0) or 0.0)
+        info['delta_abs_p95'] = float(src.get('delta_abs_p95', 0.0) or 0.0)
+
+    if logger is not None:
+        logger.info(
+            "[SeamHealMS] applied=%s pass1=%s pass2=%s mid_gain=%.3f mid_sigma_scale=%.3f mid_rel_scale=%.3f final_seam_w_mean=%.5f final_seam_w_p95=%.5f final_delta_abs_p95=%.5f",
+            bool(info.get('applied', False)),
+            bool((info1 or {}).get('applied', False)),
+            bool((info2 or {}).get('applied', False)),
+            float(mid_gain),
+            float(mid_sigma_scale),
+            float(mid_rel_scale),
+            float(info.get('seam_weight_mean', 0.0)),
+            float(info.get('seam_weight_p95', 0.0)),
+            float(info.get('delta_abs_p95', 0.0)),
+        )
+
+    return out2 if out2 is not None else out1, info
 
 
 def _apply_final_mosaic_dbe_per_channel(
@@ -3398,6 +4011,10 @@ def _compute_phase5_vram_budget_bytes(
     if cap_bytes is not None and cap_bytes <= 0:
         cap_bytes = None
 
+    allow_plan_cap = bool(on_battery or phase5_safe_mode_env or not power_plugged)
+    if cap_bytes is not None and not allow_plan_cap:
+        reasons.append("plan_cap_ignored_on_ac")
+
     def _apply_cap(value: int, cap: int | None, reason: str) -> int:
         if cap is None or cap <= 0:
             return value
@@ -3407,13 +4024,15 @@ def _compute_phase5_vram_budget_bytes(
         return value
 
     budget_bytes = max(0, int(budget_bytes))
-    budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    if allow_plan_cap:
+        budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
     budget_bytes = _apply_cap(budget_bytes, ui_cap_bytes, "ui_chunk_cap")
     budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
     if budget_bytes > 0 and budget_bytes < min_chunk_bytes:
         budget_bytes = min_chunk_bytes
         reasons.append("min_clamp")
-    budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
+    if allow_plan_cap:
+        budget_bytes = _apply_cap(budget_bytes, cap_bytes, "plan_cap")
     budget_bytes = _apply_cap(budget_bytes, ui_cap_bytes, "ui_chunk_cap")
     budget_bytes = _apply_cap(budget_bytes, hard_cap_bytes, "hard_cap")
     if usable_bytes is not None:
@@ -3553,6 +4172,13 @@ def _apply_phase5_post_stack_pipeline(
     fallback_two_pass_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
     parallel_plan: ParallelPlan | None = None,
     telemetry_ctrl: ResourceTelemetryController | None = None,
+    patchwork_suppressor_enabled: bool = False,
+    patchwork_suppressor_strength: str = "normal",
+    patchwork_suppressor_sigma_px: float = 64.0,
+    patchwork_suppressor_seam_band_px: int = 160,
+    patchwork_suppressor_max_delta: float = 0.20,
+    patchwork_suppressor_protect_stars: bool = True,
+    patchwork_suppressor_only_near_seams: bool = True,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Run the reusable Phase 5 post-stack operations."""
 
@@ -3595,7 +4221,415 @@ def _apply_phase5_post_stack_pipeline(
         parallel_plan=parallel_plan,
         telemetry_ctrl=telemetry_ctrl,
     )
+
+    if patchwork_suppressor_enabled:
+        final_mosaic_data, _patchwork_info = _apply_patchwork_suppressor_if_requested(
+            final_mosaic_data,
+            final_mosaic_coverage,
+            final_alpha_map,
+            enabled=bool(patchwork_suppressor_enabled),
+            strength=str(patchwork_suppressor_strength or "normal"),
+            sigma_px=float(patchwork_suppressor_sigma_px),
+            seam_band_px=int(patchwork_suppressor_seam_band_px),
+            max_delta=float(patchwork_suppressor_max_delta),
+            protect_stars=bool(patchwork_suppressor_protect_stars),
+            only_near_seams=bool(patchwork_suppressor_only_near_seams),
+            logger=logger,
+        )
+        try:
+            if isinstance(_patchwork_info, dict):
+                logger.info(
+                    "[Patchwork] seam_mask_frac=%.5f correction_abs_p95=%.5f",
+                    float(_patchwork_info.get("seam_weight_mean", 0.0) or 0.0),
+                    float(_patchwork_info.get("delta_abs_p95", 0.0) or 0.0),
+                )
+        except Exception:
+            pass
+
     return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+
+def _resolve_patchwork_strength(strength_value: Any) -> tuple[float, float, float]:
+    """Map patchwork preset to (strength_scale, sigma_scale, rel_delta_scale)."""
+
+    key = str(strength_value or "normal").strip().lower()
+    table = {
+        "low": (0.70, 0.90, 0.85),
+        "normal": (1.00, 1.00, 1.00),
+        "strong": (1.30, 1.10, 1.20),
+    }
+    return table.get(key, table["normal"])
+
+
+def _apply_patchwork_suppressor_if_requested(
+    mosaic_hwc: np.ndarray | None,
+    coverage_hw: np.ndarray | None,
+    alpha_hw: np.ndarray | None,
+    *,
+    enabled: bool,
+    strength: str,
+    sigma_px: float,
+    seam_band_px: int,
+    max_delta: float,
+    protect_stars: bool,
+    only_near_seams: bool,
+    logger: logging.Logger | None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Optional Phase-5 visual harmonization for low-frequency tile imprint."""
+
+    info: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "reason": "disabled" if not enabled else "",
+        "strength": str(strength or "normal"),
+    }
+    if not enabled:
+        return mosaic_hwc, info
+    if mosaic_hwc is None:
+        info["reason"] = "no_mosaic"
+        return mosaic_hwc, info
+
+    try:
+        sigma_base = float(max(8.0, min(512.0, float(sigma_px))))
+    except Exception:
+        sigma_base = 64.0
+    try:
+        seam_band_px = int(max(16, min(1024, int(seam_band_px))))
+    except Exception:
+        seam_band_px = 160
+    try:
+        max_delta = float(max(0.02, min(0.35, float(max_delta))))
+    except Exception:
+        max_delta = 0.20
+
+    strength_scale, sigma_scale, rel_scale = _resolve_patchwork_strength(strength)
+    if not bool(protect_stars):
+        strength_scale *= 1.10
+
+    sigma_small = max(12.0, sigma_base * sigma_scale)
+    sigma_large = max(sigma_small + 1.0, sigma_base * 2.6 * sigma_scale)
+    seam_sigma = max(1.2, min(8.0, float(seam_band_px) / 64.0))
+    rel_delta = max(0.02, min(0.35, max_delta * rel_scale))
+
+    out, seam_info = _apply_visual_seam_heal_low_frequency(
+        mosaic_hwc,
+        alpha_mask=alpha_hw,
+        coverage_hw=coverage_hw,
+        strength=min(1.0, 0.45 * strength_scale),
+        sigma_small=sigma_small,
+        sigma_large=sigma_large,
+        seam_sigma=seam_sigma,
+        max_rel_delta=rel_delta,
+        logger=None,
+    )
+
+    if isinstance(seam_info, dict):
+        info.update(seam_info)
+    info["enabled"] = True
+    info["strength"] = str(strength or "normal")
+    info["only_near_seams"] = bool(only_near_seams)
+    info["protect_stars"] = bool(protect_stars)
+
+    if logger is not None:
+        logger.info(
+            "[Patchwork] enabled=%s strength=%s only_near_seams=%s protect_stars=%s sigma=%.1f seam_band_px=%d max_delta=%.3f applied=%s reason=%s seam_mask_frac=%.5f correction_abs_p95=%.5f",
+            True,
+            str(strength or "normal"),
+            bool(only_near_seams),
+            bool(protect_stars),
+            float(sigma_base),
+            int(seam_band_px),
+            float(max_delta),
+            bool(info.get("applied", False)),
+            str(info.get("reason", "")),
+            float(info.get("seam_weight_mean", 0.0) or 0.0),
+            float(info.get("delta_abs_p95", 0.0) or 0.0),
+        )
+
+    return out, info
+
+
+def _apply_aesthetic_hole_fill(
+    mosaic_hwc: np.ndarray | None,
+    *,
+    alpha_mask: np.ndarray | None = None,
+    coverage_hw: np.ndarray | None = None,
+    enabled: bool = False,
+    max_radius_px: int = 64,
+    blend: float = 0.70,
+    only_near_seams: bool = True,
+    logger: logging.Logger | None = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Visual-only local hole completion for aesthetic branch."""
+
+    info: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "reason": "disabled" if not enabled else "",
+        "filled_px": 0,
+        "hole_px": 0,
+        "max_radius_px": int(max_radius_px),
+        "blend": float(blend),
+        "only_near_seams": bool(only_near_seams),
+    }
+    if not enabled or mosaic_hwc is None or not isinstance(mosaic_hwc, np.ndarray):
+        return mosaic_hwc, info
+    if mosaic_hwc.ndim != 3 or mosaic_hwc.shape[-1] != 3:
+        info["reason"] = "non_rgb"
+        return mosaic_hwc, info
+
+    try:
+        max_radius_px = int(max(4, min(512, int(max_radius_px))))
+    except Exception:
+        max_radius_px = 64
+    try:
+        blend = float(max(0.0, min(1.0, float(blend))))
+    except Exception:
+        blend = 0.70
+
+    rgb = np.asarray(mosaic_hwc, dtype=np.float32)
+    out = np.array(rgb, copy=True)
+
+    valid = np.isfinite(rgb).all(axis=-1)
+    if isinstance(alpha_mask, np.ndarray):
+        try:
+            a = np.asarray(alpha_mask)
+            if a.ndim == 3 and a.shape[-1] == 1:
+                a = a[..., 0]
+            elif a.ndim > 2:
+                a = np.squeeze(a)
+            if a.shape[:2] == valid.shape:
+                valid &= (a > 0)
+        except Exception:
+            pass
+    elif isinstance(coverage_hw, np.ndarray):
+        try:
+            c = np.asarray(coverage_hw, dtype=np.float32)
+            if c.ndim > 2:
+                c = np.squeeze(c)
+            if c.shape[:2] == valid.shape:
+                valid &= np.isfinite(c) & (c > 0)
+        except Exception:
+            pass
+
+    hole = ~valid
+    hole_px = int(np.count_nonzero(hole))
+    info["hole_px"] = hole_px
+    if hole_px <= 0:
+        info["reason"] = "no_holes"
+        return out, info
+
+    target = hole.copy()
+    dist = None
+    if only_near_seams:
+        try:
+            import cv2  # type: ignore
+            dist = cv2.distanceTransform(hole.astype(np.uint8), cv2.DIST_L2, 3)
+            target = hole & (dist <= float(max_radius_px))
+        except Exception:
+            # fallback: binary dilation-limited mask via blur threshold
+            soft = _gaussian_blur_2d_float32(hole.astype(np.float32), sigma_px=max(1.0, float(max_radius_px) / 6.0))
+            target = hole & (soft > 0.05)
+
+    fill_px = int(np.count_nonzero(target))
+    info["filled_px"] = fill_px
+    if fill_px <= 0:
+        info["reason"] = "no_target_after_radius"
+        return out, info
+
+    if dist is None:
+        # approximate feather where distance transform unavailable
+        soft = _gaussian_blur_2d_float32(target.astype(np.float32), sigma_px=max(1.0, float(max_radius_px) / 5.0))
+        feather = np.clip(soft, 0.0, 1.0) * float(blend)
+    else:
+        feather = np.clip((float(max_radius_px) - dist) / max(1.0, float(max_radius_px)), 0.0, 1.0) * float(blend)
+    feather *= target.astype(np.float32)
+
+    for ch in range(3):
+        src = out[..., ch]
+        if np.any(valid):
+            med = float(np.nanmedian(src[valid]))
+        else:
+            med = 0.0
+        seeded = np.where(valid, src, med).astype(np.float32, copy=False)
+        sigma_fill = max(2.0, float(max_radius_px) * 0.5)
+        smooth = _gaussian_blur_2d_float32(seeded, sigma_fill)
+        src_nonan = np.where(np.isfinite(src), src, smooth)
+        src[:] = np.where(
+            target,
+            src_nonan * (1.0 - feather) + smooth * feather,
+            src_nonan,
+        )
+
+    info["applied"] = True
+    info["reason"] = "ok"
+
+    if logger is not None:
+        logger.info(
+            "[AestheticFill] enabled=%s applied=%s hole_px=%d filled_px=%d max_radius_px=%d blend=%.3f only_near_seams=%s",
+            bool(enabled),
+            True,
+            hole_px,
+            fill_px,
+            int(max_radius_px),
+            float(blend),
+            bool(only_near_seams),
+        )
+
+    return out, info
+
+
+def _load_intertile_graph_summary(diagnostics_output_dir: Path | None) -> dict[str, Any]:
+    if diagnostics_output_dir is None:
+        return {}
+    try:
+        p = Path(diagnostics_output_dir) / "intertile_graph_summary.json"
+        if not p.exists():
+            return {}
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _apply_intertile_underconstrained_guard(
+    *,
+    pending_affine_list: list[tuple[float, float]] | None,
+    affine_by_id: dict[str, tuple[float, float]] | None,
+    effective_tiles: list[dict[str, Any]] | None,
+    worker_config_cache: dict[str, Any] | None,
+    diagnostics_output_dir: Path | None,
+    existing_master_tiles_mode: bool,
+    logger_obj: logging.Logger,
+) -> tuple[list[tuple[float, float]] | None, dict[str, tuple[float, float]] | None, dict[str, Any]]:
+    """Clamp/fallback affine corrections in sparse underconstrained regimes."""
+
+    meta: dict[str, Any] = {"enabled": False, "triggered": False, "reasons": []}
+    cfg = worker_config_cache or {}
+    enabled = bool(cfg.get("intertile_underconstrained_guard_enabled", True))
+    meta["enabled"] = enabled
+    if not enabled:
+        return pending_affine_list, affine_by_id, meta
+    if not pending_affine_list or not affine_by_id:
+        return pending_affine_list, affine_by_id, meta
+
+    def _pair(val: Any, default_pair: tuple[float, float]) -> tuple[float, float]:
+        lo, hi = default_pair
+        try:
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                lo = float(val[0]); hi = float(val[1])
+        except Exception:
+            lo, hi = default_pair
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            lo, hi = default_pair
+        if lo > hi:
+            lo, hi = hi, lo
+        return float(lo), float(hi)
+
+    max_pairs = int(cfg.get("intertile_underconstrained_max_pairs", 1) or 1)
+    max_active_tiles = int(cfg.get("intertile_underconstrained_max_active_tiles", 2) or 2)
+    force_mode = str(cfg.get("intertile_underconstrained_force_mode", "offset_only") or "offset_only").strip().lower()
+    if force_mode not in {"offset_only", "disable_photometric"}:
+        force_mode = "offset_only"
+    gain_clip = _pair(cfg.get("intertile_underconstrained_gain_clip", (0.85, 1.18)), (0.85, 1.18))
+    offset_clip = _pair(cfg.get("intertile_underconstrained_offset_clip", (-2000.0, 2000.0)), (-2000.0, 2000.0))
+
+    graph_summary = _load_intertile_graph_summary(diagnostics_output_dir)
+    raw_pairs = int(graph_summary.get("raw_pairs_count", -1) or -1)
+    pruned_pairs = int(graph_summary.get("pruned_pairs_count", -1) or -1)
+    active_tiles = int(graph_summary.get("active_tile_count", 0) or 0)
+    if active_tiles <= 0:
+        active_tiles = len(effective_tiles or [])
+
+    reasons: list[str] = []
+    if existing_master_tiles_mode:
+        reasons.append("existing_master_tiles_mode")
+    if active_tiles > 0 and active_tiles <= max_active_tiles:
+        reasons.append(f"active_tiles<={max_active_tiles}")
+    if raw_pairs >= 0 and raw_pairs <= max_pairs:
+        reasons.append(f"raw_pairs<={max_pairs}")
+    if pruned_pairs >= 0 and pruned_pairs <= max_pairs:
+        reasons.append(f"pruned_pairs<={max_pairs}")
+
+    suspect_cnt = int(cfg.get("existing_master_tiles_qg_suspect_count", 0) or 0)
+    if suspect_cnt > 0:
+        reasons.append(f"qg_suspect={suspect_cnt}")
+
+    if not reasons:
+        return pending_affine_list, affine_by_id, meta
+
+    meta["triggered"] = True
+    meta["reasons"] = reasons
+    meta["force_mode"] = force_mode
+    meta["active_tiles"] = active_tiles
+    meta["raw_pairs"] = raw_pairs
+    meta["pruned_pairs"] = pruned_pairs
+
+    logger_obj.warning(
+        "[IntertileGuard] triggered=True mode=%s reasons=%s active_tiles=%s raw_pairs=%s pruned_pairs=%s",
+        force_mode,
+        ",".join(reasons),
+        active_tiles,
+        raw_pairs,
+        pruned_pairs,
+    )
+
+    if force_mode == "disable_photometric":
+        logger_obj.warning("[IntertileGuard] fallback=disable_photometric")
+        return None, None, meta
+
+    guarded: dict[str, tuple[float, float]] = {}
+    gain_vals_before: list[float] = []
+    gain_vals_after: list[float] = []
+    off_vals_before: list[float] = []
+    off_vals_after: list[float] = []
+
+    for tid, pair in affine_by_id.items():
+        try:
+            g = float(pair[0])
+        except Exception:
+            g = 1.0
+        try:
+            o = float(pair[1])
+        except Exception:
+            o = 0.0
+        if not math.isfinite(g):
+            g = 1.0
+        if not math.isfinite(o):
+            o = 0.0
+        gain_vals_before.append(g)
+        off_vals_before.append(o)
+
+        g_new = 1.0
+        o_new = max(offset_clip[0], min(offset_clip[1], o))
+        g_new = max(gain_clip[0], min(gain_clip[1], g_new))
+
+        gain_vals_after.append(g_new)
+        off_vals_after.append(o_new)
+        guarded[str(tid)] = (float(g_new), float(o_new))
+
+    if effective_tiles:
+        rebuilt: list[tuple[float, float]] = []
+        for entry in effective_tiles:
+            tid = str(entry.get("tile_id", ""))
+            rebuilt.append(guarded.get(tid, (1.0, 0.0)))
+        pending_affine_list = rebuilt
+    else:
+        pending_affine_list = list(guarded.values())
+
+    logger_obj.warning(
+        "[IntertileGuard] fallback=offset_only gain_before=[%.5f, %.5f] gain_after=[%.5f, %.5f] offset_before=[%.5f, %.5f] offset_after=[%.5f, %.5f]",
+        float(min(gain_vals_before) if gain_vals_before else 1.0),
+        float(max(gain_vals_before) if gain_vals_before else 1.0),
+        float(min(gain_vals_after) if gain_vals_after else 1.0),
+        float(max(gain_vals_after) if gain_vals_after else 1.0),
+        float(min(off_vals_before) if off_vals_before else 0.0),
+        float(max(off_vals_before) if off_vals_before else 0.0),
+        float(min(off_vals_after) if off_vals_after else 0.0),
+        float(max(off_vals_after) if off_vals_after else 0.0),
+    )
+    return pending_affine_list, guarded, meta
 
 
 def _mask_sds_low_coverage_pixels(
@@ -3951,12 +4985,24 @@ def _finalize_sds_global_mosaic(
 
     final_output_shape = final_output_shape_hw or mosaic_arr.shape[:2]
     final_alpha_map = None
+
+    # SDS global polish must preserve global descriptor geometry (H,W).
+    # Quality crop may change array dimensions, which can desynchronize
+    # mosaic/coverage maps and break later broadcast operations.
+    sds_pipeline_cfg = dict(pipeline_cfg or {})
+    if sds_pipeline_cfg.get("quality_crop_enabled"):
+        try:
+            pcb("phase5_sds_quality_crop_disabled", prog=None, lvl="INFO_DETAIL")
+        except Exception:
+            pass
+        sds_pipeline_cfg["quality_crop_enabled"] = False
+
     mosaic_arr, coverage_arr, final_alpha_map = _apply_phase5_post_stack_pipeline(
         mosaic_arr,
         coverage_arr,
         final_alpha_map,
         enable_lecropper_pipeline=enable_lecropper_pipeline,
-        pipeline_cfg=pipeline_cfg or {},
+        pipeline_cfg=sds_pipeline_cfg,
         enable_master_tile_crop=enable_master_tile_crop,
         master_tile_crop_percent=master_tile_crop_percent,
         two_pass_enabled=two_pass_enabled,
@@ -4101,7 +5147,7 @@ MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
-CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None and IS_WINDOWS
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
 
 GLOBAL_SEESTAR_TOKENS = ("seestar", "s30", "s50")
 
@@ -4160,8 +5206,11 @@ def _coerce_to_builtin(value):
 def _ensure_hwc_master_tile(
     data: np.ndarray,
     tile_label: str | None = None,
+    *,
+    out_dtype: np.dtype | type = np.float32,
+    c_contiguous: bool = True,
 ) -> np.ndarray:
-    """Normalize master tile data to ``H x W x C`` float32 layout.
+    """Normalize master tile data to ``H x W x C`` layout.
 
     Parameters
     ----------
@@ -4169,11 +5218,15 @@ def _ensure_hwc_master_tile(
         Array loaded from FITS (typically via ``hdul[0].data``).
     tile_label : str | None
         Optional identifier used for logging in case of shape issues.
+    out_dtype : np.dtype | type
+        Output dtype (default: ``float32``).
+    c_contiguous : bool
+        When ``True``, enforce C-order contiguous output.
 
     Returns
     -------
     np.ndarray
-        Array with shape ``(H, W, C)`` and dtype ``float32``.
+        Array with shape ``(H, W, C)`` and requested dtype.
 
     Raises
     ------
@@ -4182,7 +5235,7 @@ def _ensure_hwc_master_tile(
         into an ``HWC`` representation.
     """
 
-    arr = np.asarray(data, dtype=np.float32)
+    arr = np.asarray(data, dtype=out_dtype)
 
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
@@ -4206,7 +5259,9 @@ def _ensure_hwc_master_tile(
         logger.error(msg)
         raise ValueError(msg)
 
-    return np.asarray(arr, dtype=np.float32, order="C")
+    if c_contiguous:
+        return np.asarray(arr, dtype=out_dtype, order="C")
+    return np.asarray(arr, dtype=out_dtype, order="K")
 
 
 def _header_flag_is_set(header: Any | None, key: str) -> bool:
@@ -4941,6 +5996,230 @@ def _move_quality_reject_file(src_path: str) -> tuple[str, bool]:
         return src_path, False
 
 
+def _recover_rejected_master_tiles_for_phase3(
+    temp_master_tile_storage_dir: str | None,
+    *,
+    pcb: Callable | None = None,
+) -> dict[int, tuple[str, Any]]:
+    """Last-resort recovery when quality gate rejected every Phase 3 tile.
+
+    If Phase 3 would otherwise fail with zero master tiles, recover valid FITS
+    from ``rejected_by_quality`` so the run can proceed.
+    """
+
+    recovered: dict[int, tuple[str, Any]] = {}
+    if not temp_master_tile_storage_dir:
+        return recovered
+
+    try:
+        rej_dir = Path(str(temp_master_tile_storage_dir)) / "rejected_by_quality"
+    except Exception:
+        return recovered
+    if not rej_dir.exists():
+        return recovered
+
+    candidates = sorted(rej_dir.glob("master_tile_*.fits"), key=lambda p: str(p).lower())
+    for idx, fpath in enumerate(candidates):
+        try:
+            header = fits.getheader(fpath, 0)
+        except Exception:
+            continue
+        wcs_obj = None
+        try:
+            ok, wcs_obj, _failure = zemosaic_utils.validate_wcs_header(header, require_footprint=True)
+            if not ok:
+                wcs_obj = None
+        except Exception:
+            wcs_obj = None
+        if wcs_obj is None:
+            try:
+                wcs_obj = WCS(header, naxis=2, relax=True)
+            except Exception:
+                continue
+
+        tile_id = None
+        try:
+            tile_id = int(header.get("ZMT_ID"))
+        except Exception:
+            tile_id = None
+        if tile_id is None:
+            m = re.search(r"master_tile_(\d+)", fpath.name)
+            if m:
+                try:
+                    tile_id = int(m.group(1))
+                except Exception:
+                    tile_id = None
+        if tile_id is None:
+            tile_id = 100000 + idx
+
+        while tile_id in recovered:
+            tile_id += 1
+        recovered[int(tile_id)] = (str(fpath), wcs_obj)
+
+    if recovered and pcb:
+        try:
+            pcb(
+                "run_warn_phase3_quality_gate_all_rejected_recovering",
+                prog=None,
+                lvl="WARN",
+                recovered=int(len(recovered)),
+                directory=str(rej_dir),
+            )
+        except Exception:
+            pass
+
+    return recovered
+
+
+def _existing_master_tile_robust_stats(path: str) -> dict[str, float] | None:
+    """Compute lightweight robust photometric stats for an existing master tile."""
+    try:
+        arr = fits.getdata(path, 0)
+    except Exception:
+        return None
+    try:
+        data = _prepare_quality_gate_array(np.asarray(arr, dtype=np.float32))
+    except Exception:
+        return None
+
+    finite = np.isfinite(data)
+    finite3 = np.all(finite, axis=-1)
+    total_px = int(finite3.size)
+    valid_px = int(np.count_nonzero(finite3))
+    valid_frac = float(valid_px / total_px) if total_px > 0 else 0.0
+    if valid_px <= 0:
+        return {
+            "valid_frac": valid_frac,
+            "med": 0.0,
+            "max_abs": 0.0,
+            "mad": 0.0,
+            "log_med": -12.0,
+            "ratio_max_med": float('inf'),
+        }
+
+    vals = data[finite3]
+    if vals.ndim == 1:
+        vals = vals[:, np.newaxis]
+    med_ch = np.nanmedian(vals, axis=0)
+    med = float(np.nanmedian(med_ch))
+    abs_vals = np.abs(vals)
+    max_abs = float(np.nanmax(abs_vals)) if abs_vals.size else 0.0
+    mad = float(np.nanmedian(np.abs(vals - np.nanmedian(vals, axis=0, keepdims=True))))
+    med_abs_floor = max(abs(med), 1e-6)
+    ratio = float(max_abs / med_abs_floor)
+    log_med = float(np.log10(max(med_abs_floor, 1e-12)))
+    return {
+        "valid_frac": valid_frac,
+        "med": med,
+        "max_abs": max_abs,
+        "mad": mad,
+        "log_med": log_med,
+        "ratio_max_med": ratio,
+    }
+
+
+def _scan_existing_master_tiles_quality(
+    records: list[tuple[str, Any]],
+    *,
+    enabled: bool,
+    mode: str,
+    sigma_threshold: float,
+    ratio_threshold: float,
+    min_valid_frac: float,
+    pcb: Optional[Callable] = None,
+) -> dict[str, Any]:
+    """Pre-check existing master tiles to catch catastrophic photometric outliers."""
+    summary: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "mode": str(mode or "warn").strip().lower(),
+        "total": int(len(records or [])),
+        "ok": 0,
+        "suspect": 0,
+        "failed_reads": 0,
+        "suspects": [],
+        "z_center": 0.0,
+        "z_scale": 1.0,
+    }
+    if not enabled or not records:
+        return summary
+
+    sigma_thr = max(2.0, float(sigma_threshold))
+    ratio_thr = max(10.0, float(ratio_threshold))
+    min_valid = float(np.clip(min_valid_frac, 0.0, 1.0))
+
+    per_tile: list[dict[str, Any]] = []
+    for path, _wcs in records:
+        st = _existing_master_tile_robust_stats(path)
+        if st is None:
+            summary["failed_reads"] += 1
+            continue
+        item = {"path": str(path), **st}
+        per_tile.append(item)
+
+    if not per_tile:
+        return summary
+
+    log_meds = np.array([float(t.get("log_med", 0.0)) for t in per_tile], dtype=np.float64)
+    center = float(np.nanmedian(log_meds))
+    mad = float(np.nanmedian(np.abs(log_meds - center)))
+    scale = max(1.4826 * mad, 1e-6)
+    summary["z_center"] = center
+    summary["z_scale"] = scale
+
+    for t in per_tile:
+        z = abs((float(t.get("log_med", center)) - center) / scale)
+        t["z_log_med"] = float(z)
+        fail_valid = float(t.get("valid_frac", 0.0)) < min_valid
+        fail_ratio = float(t.get("ratio_max_med", 0.0)) > ratio_thr
+        fail_z = float(z) > sigma_thr
+        suspect = bool(fail_valid or fail_ratio or fail_z)
+        t["suspect"] = suspect
+        if suspect:
+            reasons = []
+            if fail_valid:
+                reasons.append("valid_frac")
+            if fail_ratio:
+                reasons.append("ratio_max_med")
+            if fail_z:
+                reasons.append("z_log_med")
+            t["reasons"] = reasons
+            summary["suspects"].append(t)
+        else:
+            summary["ok"] += 1
+
+    summary["suspect"] = len(summary["suspects"])
+    if pcb:
+        try:
+            pcb(
+                "run_info_existing_master_tiles_quality_precheck",
+                prog=None,
+                lvl="INFO",
+                total=int(summary["total"]),
+                ok=int(summary["ok"]),
+                suspect=int(summary["suspect"]),
+                failed_reads=int(summary["failed_reads"]),
+                mode=summary["mode"],
+            )
+        except Exception:
+            pass
+        for sitem in summary["suspects"][:12]:
+            try:
+                pcb(
+                    "run_warn_existing_master_tile_suspect",
+                    prog=None,
+                    lvl="WARN",
+                    path=_safe_basename(sitem.get("path", "")),
+                    z=f"{float(sitem.get('z_log_med', 0.0)):.2f}",
+                    ratio=f"{float(sitem.get('ratio_max_med', 0.0)):.2e}",
+                    valid=f"{float(sitem.get('valid_frac', 0.0)):.3f}",
+                    reasons=",".join(sitem.get("reasons") or []),
+                )
+            except Exception:
+                pass
+
+    return summary
+
+
 @dataclass
 class _TileAffineSource:
     """Container for intertile photometric calibration inputs."""
@@ -4959,7 +6238,9 @@ def _apply_preview_quality_crop(
 
     if tile_array is None or not crop_settings:
         return tile_array
-    if not crop_settings.get("enabled", False) or not ANCHOR_AUTOCROP_AVAILABLE:
+    if not crop_settings.get("enabled", False):
+        return tile_array
+    if not ANCHOR_AUTOCROP_AVAILABLE and not _ensure_lecropper_loaded():
         return tile_array
 
     arr = np.asarray(tile_array, dtype=np.float32)
@@ -5107,6 +6388,71 @@ def _sanitize_affine_corrections(
         return None, False
 
     return sanitized, True
+
+
+def _blend_affine_corrections(
+    affine_list: list[tuple[float, float]] | None,
+    blend_factor: float | int | None,
+) -> tuple[list[tuple[float, float]] | None, bool, dict[str, float | bool]]:
+    """Blend intertile affine corrections towards neutral to reduce seam visibility.
+
+    gain' = 1 + (gain - 1) * blend
+    offset' = offset * blend
+    """
+
+    stats: dict[str, float | bool] = {
+        "applied": False,
+        "blend": 1.0,
+        "median_abs_gain_delta_before": 0.0,
+        "median_abs_gain_delta_after": 0.0,
+        "median_abs_offset_before": 0.0,
+        "median_abs_offset_after": 0.0,
+    }
+    if not affine_list:
+        return None, False, stats
+
+    try:
+        blend = float(blend_factor) if blend_factor is not None else 1.0
+    except Exception:
+        blend = 1.0
+    blend = float(max(0.0, min(1.0, blend)))
+    stats["blend"] = blend
+
+    before_gain = np.asarray([abs(float(g) - 1.0) for g, _ in affine_list], dtype=np.float64)
+    before_off = np.asarray([abs(float(o)) for _, o in affine_list], dtype=np.float64)
+    if before_gain.size:
+        stats["median_abs_gain_delta_before"] = float(np.nanmedian(before_gain))
+    if before_off.size:
+        stats["median_abs_offset_before"] = float(np.nanmedian(before_off))
+
+    if blend >= 0.999999:
+        nontrivial = any(abs(g - 1.0) > 1e-6 or abs(o) > 1e-6 for g, o in affine_list)
+        stats["median_abs_gain_delta_after"] = float(stats["median_abs_gain_delta_before"])
+        stats["median_abs_offset_after"] = float(stats["median_abs_offset_before"])
+        return (affine_list if nontrivial else None), bool(nontrivial), stats
+
+    blended: list[tuple[float, float]] = []
+    nontrivial_after = False
+    for gain_val, offset_val in affine_list:
+        g = float(gain_val) if np.isfinite(gain_val) else 1.0
+        o = float(offset_val) if np.isfinite(offset_val) else 0.0
+        g2 = 1.0 + (g - 1.0) * blend
+        o2 = o * blend
+        if abs(g2 - 1.0) > 1e-6 or abs(o2) > 1e-6:
+            nontrivial_after = True
+        blended.append((float(g2), float(o2)))
+
+    after_gain = np.asarray([abs(g - 1.0) for g, _ in blended], dtype=np.float64)
+    after_off = np.asarray([abs(o) for _, o in blended], dtype=np.float64)
+    if after_gain.size:
+        stats["median_abs_gain_delta_after"] = float(np.nanmedian(after_gain))
+    if after_off.size:
+        stats["median_abs_offset_after"] = float(np.nanmedian(after_off))
+    stats["applied"] = True
+
+    if not nontrivial_after:
+        return None, False, stats
+    return blended, True, stats
 
 
 def _select_affine_log_indices(
@@ -5278,7 +6624,7 @@ def _log_affine_photometric_summary(
         unique_pairs.add((round(g, 5), round(o, 5)))
 
     if not gains:
-        return
+        return {"unique_count": 0, "degenerate": False, "anchor_shift_only": False, "gain_min": 1.0, "gain_max": 1.0}
 
     gain_min = min(gains)
     gain_max = max(gains)
@@ -5313,6 +6659,16 @@ def _log_affine_photometric_summary(
         logger_obj.warning(
             "Intertile photometric degenerate: all tiles share same gain/offset -> cannot reduce seams"
         )
+
+    return {
+        "unique_count": int(unique_count),
+        "degenerate": bool(unique_count <= 1),
+        "anchor_shift_only": bool(anchor_shift_only),
+        "gain_min": float(gain_min),
+        "gain_max": float(gain_max),
+        "offset_min": float(offset_min),
+        "offset_max": float(offset_max),
+    }
 
 
 @dataclass
@@ -7593,6 +8949,17 @@ def _compute_intertile_affine_corrections_from_sources(
     tile_weights: list[float] | None = None,
     cpu_workers: int | None = None,
     force_safe_mode: bool | None = None,
+    intertile_prune_k: int = 8,
+    intertile_prune_weight_mode: str = "area",
+    intertile_offset_only_v1: bool = False,
+    intertile_gain_offset_v2: bool = False,
+    intertile_gain_prior_lambda: float = 0.02,
+    intertile_gain_clip: tuple[float, float] | list[float] = (0.90, 1.10),
+    intertile_offset_clip: tuple[float, float] | list[float] = (-2000.0, 2000.0),
+    intertile_pair_gain_clip: tuple[float, float] | list[float] = (0.5, 2.0),
+    intertile_pair_offset_abs_max: float = 5000.0,
+    intertile_max_irls_iters: int = 3,
+    intertile_enforce_requested_solver: bool = False,
 ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
     """Common implementation for intertile gain/offset computation.
 
@@ -7670,18 +9037,18 @@ def _compute_intertile_affine_corrections_from_sources(
             alpha_mask_arr: np.ndarray | None = None
             label = _safe_basename(src.path)
             if src.data is not None:
-                tile_arr = _ensure_hwc_master_tile(src.data, label)
+                tile_arr = _ensure_hwc_master_tile(src.data, label, out_dtype=np.float32, c_contiguous=False)
             else:
                 if not src.path:
                     raise ValueError("Tile data missing and no path provided.")
-                with fits.open(src.path, memmap=False) as hdul:
-                    tile_arr = _ensure_hwc_master_tile(hdul[0].data, label)
+                with fits.open(src.path, memmap=True) as hdul:
+                    tile_arr = _ensure_hwc_master_tile(hdul[0].data, label, out_dtype=np.float32, c_contiguous=False)
                     if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
                         try:
                             alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
                         except Exception:
                             alpha_mask_arr = None
-            tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
+            # Keep intertile buffers lightweight; avoid forcing contiguous float32 copies here.
             mask_source = getattr(src, "mask", None)
             if mask_source is not None:
                 try:
@@ -7768,15 +9135,65 @@ def _compute_intertile_affine_corrections_from_sources(
                 except Exception:
                     pass
 
-    # [ETA Bridge] Wrapper pour intercepter "[Intertile] Using: ... pairs=K"
+    # [ETA Bridge] Wrapper pour intercepter la progression intertile et produire une ETA cohérente.
+    intertile_eta_start_mono: float | None = None
+    intertile_eta_prev_sec: float | None = None
+    intertile_eta_last_emit_mono: float = 0.0
+
+    def _emit_intertile_eta(done_pairs: int, total_pairs: int) -> None:
+        nonlocal intertile_eta_start_mono, intertile_eta_prev_sec, intertile_eta_last_emit_mono
+        try:
+            done = int(done_pairs)
+            total = int(total_pairs)
+        except Exception:
+            return
+        if total <= 0 or done <= 0:
+            return
+        if done > total:
+            done = total
+        now_m = time.monotonic()
+        if intertile_eta_start_mono is None:
+            intertile_eta_start_mono = now_m
+        elapsed = max(0.0, now_m - float(intertile_eta_start_mono))
+        raw_eta = elapsed * max(0, total - done) / max(1, done)
+        eta_sec = _eta_smooth_seconds(intertile_eta_prev_sec, raw_eta, alpha=0.35)
+        intertile_eta_prev_sec = eta_sec
+
+        should_emit = (
+            done == 1
+            or done == total
+            or (done % 5 == 0)
+            or ((now_m - intertile_eta_last_emit_mono) >= 2.0)
+        )
+        if not should_emit:
+            return
+        intertile_eta_last_emit_mono = now_m
+        h, rem = divmod(int(max(0.0, eta_sec)), 3600)
+        m, s = divmod(rem, 60)
+        _log_and_callback(
+            f"ETA_UPDATE:{h:02d}:{m:02d}:{s:02d}",
+            None,
+            "ETA_LEVEL",
+            callback=progress_callback,
+        )
+
     def _intertile_progress_bridge(message_or_stage, current, level, **kwargs):
         try:
-            # Seed ETA dès que l'on connaît le nombre de paires et la taille de preview
-            if isinstance(message_or_stage, str) and message_or_stage.startswith("[Intertile] Using:"):
-                # Ex: "[Intertile] Using: preview=512, min_overlap=0.0500, sky=(30.0,70.0), clip=2.50, pairs=353"
+            # Structured progress from zemosaic_utils.
+            if message_or_stage == "phase5_intertile_pairs":
+                _emit_intertile_eta(current, level)
+            # Compatibility with textual log progress: "[Intertile] progress pairs_done=X/Y"
+            elif isinstance(message_or_stage, str) and "pairs_done=" in message_or_stage:
+                try:
+                    tail = message_or_stage.split("pairs_done=", 1)[1].strip()
+                    done_s, total_s = tail.split("/", 1)
+                    _emit_intertile_eta(int(done_s), int(total_s))
+                except Exception:
+                    pass
+            # Keep debug seed only for traceability (not shown as ETA).
+            elif isinstance(message_or_stage, str) and message_or_stage.startswith("[Intertile] Using:"):
                 try:
                     parts = message_or_stage.split("Using:", 1)[1]
-                    # petite extraction clé=valeur robuste
                     kv = {}
                     for p in parts.split(","):
                         if "=" in p:
@@ -7784,20 +9201,22 @@ def _compute_intertile_affine_corrections_from_sources(
                             kv[k.strip()] = v.strip().strip(",")
                     preview = int(kv.get("preview", "512"))
                     pairs = int(kv.get("pairs", "0"))
-                    # Heuristique : coût ~ C * pairs * (preview/512)^2
-                    # GPU/CPU : facteur 1.0 (GPU) / 3.0 (CPU) basique (peut être affiné)
                     gpu_factor = 1.0 if bool(getattr(zconfig, "use_gpu_phase5", False)) else 3.0
-                    base_cost_per_pair = 0.020  # 20 ms/pair @ preview=512 sur GPU (à ajuster)
+                    base_cost_per_pair = 0.020
                     seconds = gpu_factor * base_cost_per_pair * pairs * (preview / 512.0) ** 2
                     h, rem = divmod(int(seconds), 3600)
                     m, s = divmod(rem, 60)
-                    # Pousser une ETA initiale vers le GUI (il se recadrera ensuite avec les ticks "pairs")
-                    _log_and_callback(f"ETA_UPDATE:{h:02d}:{m:02d}:{s:02d}", None, "ETA_LEVEL", callback=progress_callback)
+                    _log_and_callback(
+                        f"[Intertile][ETA seed] {h:02d}:{m:02d}:{s:02d}",
+                        None,
+                        "DEBUG_DETAIL",
+                        callback=progress_callback,
+                    )
                 except Exception:
                     pass
         except Exception:
             pass
-        # Relais vers le callback GUI d'origine pour l'affichage + ETA fine (via on_worker_progress)
+        # Relais vers le callback GUI d'origine.
         if progress_callback:
             try:
                 progress_callback(message_or_stage, current, level, **kwargs)
@@ -7819,6 +9238,17 @@ def _compute_intertile_affine_corrections_from_sources(
             progress_callback=_intertile_progress_bridge,
             tile_weights=tile_weights,
             cpu_workers=cpu_workers,
+            max_neighbors_per_tile=int(intertile_prune_k),
+            prune_weight_mode=str(intertile_prune_weight_mode),
+            offset_only_v1=bool(intertile_offset_only_v1),
+            gain_offset_v2=bool(intertile_gain_offset_v2),
+            gain_prior_lambda=float(intertile_gain_prior_lambda),
+            gain_clip=tuple(intertile_gain_clip) if isinstance(intertile_gain_clip, (list, tuple)) and len(intertile_gain_clip) >= 2 else (0.90, 1.10),
+            offset_clip=tuple(intertile_offset_clip) if isinstance(intertile_offset_clip, (list, tuple)) and len(intertile_offset_clip) >= 2 else (-2000.0, 2000.0),
+            pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
+            pair_offset_abs_max=float(intertile_pair_offset_abs_max),
+            max_irls_iters=int(intertile_max_irls_iters),
+            enforce_requested_solver=bool(intertile_enforce_requested_solver),
         )
     except Exception as exc:
         if cpu_workers and cpu_workers > 1 and not force_safe_mode:
@@ -7848,6 +9278,17 @@ def _compute_intertile_affine_corrections_from_sources(
                     progress_callback=_intertile_progress_bridge,
                     tile_weights=tile_weights,
                     cpu_workers=cpu_workers,
+                    max_neighbors_per_tile=int(intertile_prune_k),
+                    prune_weight_mode=str(intertile_prune_weight_mode),
+                    offset_only_v1=bool(intertile_offset_only_v1),
+                    gain_offset_v2=bool(intertile_gain_offset_v2),
+                    gain_prior_lambda=float(intertile_gain_prior_lambda),
+                    gain_clip=tuple(intertile_gain_clip) if isinstance(intertile_gain_clip, (list, tuple)) and len(intertile_gain_clip) >= 2 else (0.90, 1.10),
+                    offset_clip=tuple(intertile_offset_clip) if isinstance(intertile_offset_clip, (list, tuple)) and len(intertile_offset_clip) >= 2 else (-2000.0, 2000.0),
+                    pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
+                    pair_offset_abs_max=float(intertile_pair_offset_abs_max),
+                    max_irls_iters=int(intertile_max_irls_iters),
+                    enforce_requested_solver=bool(intertile_enforce_requested_solver),
                 )
             except Exception as exc_single:
                 if logger_obj:
@@ -9341,14 +10782,52 @@ def _run_shared_phase45_phase5_pipeline(
         except Exception:
             pass
     assembly_process_workers_config = int(phase5_options.get("assembly_process_workers") or 0)
+    try:
+        vm_orch = psutil.virtual_memory()
+        sm_orch = psutil.swap_memory()
+        mem_orch_global = _memory_orchestrator_profile(
+            float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+            float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+            zconfig=None,
+        )
+        if assembly_process_workers_config and int(assembly_process_workers_config) > 0:
+            prev_asm = int(assembly_process_workers_config)
+            assembly_process_workers_config = max(1, min(int(assembly_process_workers_config), int(mem_orch_global.get("max_phase5_assembly_workers", assembly_process_workers_config))))
+            if assembly_process_workers_config != prev_asm:
+                pcb(
+                    f"MEM_ORCH_PHASE5: assembly_workers_cap {prev_asm}->{assembly_process_workers_config} class={mem_orch_global.get('class')}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+    except Exception:
+        pass
     intertile_preview_size_config = phase5_options.get("intertile_preview_size") or 512
     intertile_overlap_min_config = phase5_options.get("intertile_overlap_min") or 0.05
     intertile_sky_percentile_tuple = phase5_options.get("intertile_sky_percentile") or (30.0, 70.0)
     intertile_robust_clip_sigma_config = phase5_options.get("intertile_robust_clip_sigma") or 2.5
     intertile_global_recenter_config = phase5_options.get("intertile_global_recenter")
     intertile_recenter_clip_tuple = phase5_options.get("intertile_recenter_clip") or (0.85, 1.18)
+    intertile_affine_blend_config = phase5_options.get("intertile_affine_blend", 1.0)
     use_auto_intertile_config = phase5_options.get("use_auto_intertile")
     intertile_force_safe_mode_config = bool(phase5_options.get("intertile_force_safe_mode"))
+    intertile_prune_k_config = int(phase5_options.get("intertile_prune_k") or 8)
+    intertile_prune_weight_mode_config = str(phase5_options.get("intertile_prune_weight_mode") or "area")
+    intertile_offset_only_v1_config = bool(phase5_options.get("intertile_offset_only_v1"))
+    intertile_gain_offset_v2_config = bool(phase5_options.get("intertile_gain_offset_v2"))
+    intertile_gain_prior_lambda_config = float(phase5_options.get("intertile_gain_prior_lambda") or 0.02)
+    intertile_gain_clip_config = phase5_options.get("intertile_gain_clip") or (0.90, 1.10)
+    intertile_offset_clip_config = phase5_options.get("intertile_offset_clip") or (-2000.0, 2000.0)
+    intertile_pair_gain_clip_config = phase5_options.get("intertile_pair_gain_clip") or (0.5, 2.0)
+    intertile_pair_offset_abs_max_config = float(phase5_options.get("intertile_pair_offset_abs_max") or 5000.0)
+    intertile_max_irls_iters_config = int(phase5_options.get("intertile_max_irls_iters") or 3)
+    intertile_enforce_requested_solver_config = bool(phase5_options.get("intertile_enforce_requested_solver"))
+    intertile_gain_offset_v2_config = bool(phase5_options.get("intertile_gain_offset_v2"))
+    intertile_gain_prior_lambda_config = float(phase5_options.get("intertile_gain_prior_lambda") or 0.02)
+    intertile_gain_clip_config = phase5_options.get("intertile_gain_clip") or (0.90, 1.10)
+    intertile_offset_clip_config = phase5_options.get("intertile_offset_clip") or (-2000.0, 2000.0)
+    intertile_pair_gain_clip_config = phase5_options.get("intertile_pair_gain_clip") or (0.5, 2.0)
+    intertile_pair_offset_abs_max_config = float(phase5_options.get("intertile_pair_offset_abs_max") or 5000.0)
+    intertile_max_irls_iters_config = int(phase5_options.get("intertile_max_irls_iters") or 3)
     coadd_use_memmap_config = bool(phase5_options.get("coadd_use_memmap"))
     coadd_memmap_dir_config = phase5_options.get("coadd_memmap_dir")
     start_time_total = start_time_total_run
@@ -9356,6 +10835,30 @@ def _run_shared_phase45_phase5_pipeline(
     parallel_plan = phase5_options.get("parallel_plan")
     tile_weighting_enabled_flag = bool(phase5_options.get("tile_weighting_enabled"))
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
+    tile_weight_v4_enabled_config = bool(phase5_options.get("tile_weight_v4_enabled"))
+    tile_weight_v4_curve_config = str(phase5_options.get("tile_weight_v4_curve") or "sqrt")
+    tile_weight_v4_strength_config = float(phase5_options.get("tile_weight_v4_strength") or 1.0)
+    tile_weight_v4_min_config = float(phase5_options.get("tile_weight_v4_min") or 0.75)
+    tile_weight_v4_max_config = float(phase5_options.get("tile_weight_v4_max") or 1.35)
+    tile_weight_v4_residual_penalty_enabled_config = bool(phase5_options.get("tile_weight_v4_residual_penalty_enabled"))
+    tile_weight_v4_residual_penalty_strength_config = float(phase5_options.get("tile_weight_v4_residual_penalty_strength") or 0.35)
+    tile_weight_v4_temporal_penalty_enabled_config = bool(phase5_options.get("tile_weight_v4_temporal_penalty_enabled"))
+    tile_weight_v4_temporal_penalty_strength_config = float(phase5_options.get("tile_weight_v4_temporal_penalty_strength") or 0.20)
+    tile_weight_v4_temporal_penalty_hours_config = float(phase5_options.get("tile_weight_v4_temporal_penalty_hours") or 6.0)
+    pcb(
+        (
+            "[Phase5] tile_weight_v4 "
+            f"enabled={tile_weight_v4_enabled_config} "
+            f"curve={tile_weight_v4_curve_config} "
+            f"strength={tile_weight_v4_strength_config:.4g} "
+            f"min={tile_weight_v4_min_config:.4g} "
+            f"max={tile_weight_v4_max_config:.4g} "
+            f"res_pen={int(tile_weight_v4_residual_penalty_enabled_config)}({tile_weight_v4_residual_penalty_strength_config:.3g}) "
+            f"tmp_pen={int(tile_weight_v4_temporal_penalty_enabled_config)}({tile_weight_v4_temporal_penalty_strength_config:.3g}/{tile_weight_v4_temporal_penalty_hours_config:.3g}h)"
+        ),
+        prog=None,
+        lvl="INFO",
+    )
     existing_master_tiles_mode = bool(phase5_options.get("existing_master_tiles_mode"))
     worker_config_cache = phase45_options.get("worker_config") or {}
     phase5_force_gpu_on_ac_cfg = worker_config_cache.get("phase5_force_gpu_on_ac")
@@ -9373,11 +10876,11 @@ def _run_shared_phase45_phase5_pipeline(
     )
     final_mosaic_black_point_equalize_enabled = phase5_options.get(
         "final_mosaic_black_point_equalize_enabled",
-        getattr(zconfig, "final_mosaic_black_point_equalize_enabled", True),
+        getattr(zconfig, "final_mosaic_black_point_equalize_enabled", False),
     )
     final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(final_mosaic_black_point_equalize_enabled)
     if final_mosaic_black_point_equalize_enabled is None:
-        final_mosaic_black_point_equalize_enabled = True
+        final_mosaic_black_point_equalize_enabled = False
     final_mosaic_black_point_equalize_enabled = bool(final_mosaic_black_point_equalize_enabled)
     try:
         final_mosaic_black_point_percentile = float(
@@ -9385,10 +10888,82 @@ def _run_shared_phase45_phase5_pipeline(
                 "final_mosaic_black_point_percentile",
                 getattr(zconfig, "final_mosaic_black_point_percentile", 0.1),
             )
-            or 0.1
         )
     except Exception:
         final_mosaic_black_point_percentile = 0.1
+
+    sds_enable_final_rgb_equalize = _coerce_bool_flag(
+        phase5_options.get(
+            "sds_enable_final_rgb_equalize",
+            getattr(zconfig, "sds_enable_final_rgb_equalize", False),
+        )
+    )
+    if sds_enable_final_rgb_equalize is None:
+        sds_enable_final_rgb_equalize = False
+    sds_enable_final_rgb_equalize = bool(sds_enable_final_rgb_equalize)
+
+    sds_enable_final_black_point_equalize = _coerce_bool_flag(
+        phase5_options.get(
+            "sds_enable_final_black_point_equalize",
+            getattr(zconfig, "sds_enable_final_black_point_equalize", False),
+        )
+    )
+    if sds_enable_final_black_point_equalize is None:
+        sds_enable_final_black_point_equalize = False
+    sds_enable_final_black_point_equalize = bool(sds_enable_final_black_point_equalize)
+
+    sds_final_rgb_eq_active = bool(sds_mode_phase5 and sds_enable_final_rgb_equalize)
+    sds_final_blackpoint_active = bool(sds_mode_phase5 and sds_enable_final_black_point_equalize)
+
+    sds_final_rgb_equalize_gain_clip = phase5_options.get(
+        "sds_final_rgb_equalize_gain_clip",
+        getattr(zconfig, "sds_final_rgb_equalize_gain_clip", (0.95, 1.05)),
+    )
+
+    def _parse_gain_clip_pair(value: Any, default_pair: tuple[float, float]) -> tuple[float, float]:
+        lo, hi = default_pair
+        try:
+            if isinstance(value, str):
+                parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+                if len(parts) >= 2:
+                    lo = float(parts[0])
+                    hi = float(parts[1])
+            elif isinstance(value, (list, tuple)) and len(value) >= 2:
+                lo = float(value[0])
+                hi = float(value[1])
+        except Exception:
+            lo, hi = default_pair
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            lo, hi = default_pair
+        if lo <= 0 or hi <= 0:
+            lo, hi = default_pair
+        if lo > hi:
+            lo, hi = hi, lo
+        return float(lo), float(hi)
+
+    sds_final_rgb_equalize_gain_clip = _parse_gain_clip_pair(
+        sds_final_rgb_equalize_gain_clip,
+        (0.95, 1.05),
+    )
+
+    patchwork_suppressor_enabled_config = bool(phase5_options.get("patchwork_suppressor_enabled", False))
+    patchwork_suppressor_strength_config = str(phase5_options.get("patchwork_suppressor_strength", "normal") or "normal").strip().lower()
+    if patchwork_suppressor_strength_config not in {"low", "normal", "strong"}:
+        patchwork_suppressor_strength_config = "normal"
+    try:
+        patchwork_suppressor_sigma_px_config = float(phase5_options.get("patchwork_suppressor_sigma_px", 64.0) or 64.0)
+    except Exception:
+        patchwork_suppressor_sigma_px_config = 64.0
+    try:
+        patchwork_suppressor_seam_band_px_config = int(phase5_options.get("patchwork_suppressor_seam_band_px", 160) or 160)
+    except Exception:
+        patchwork_suppressor_seam_band_px_config = 160
+    try:
+        patchwork_suppressor_max_delta_config = float(phase5_options.get("patchwork_suppressor_max_delta", 0.20) or 0.20)
+    except Exception:
+        patchwork_suppressor_max_delta_config = 0.20
+    patchwork_suppressor_protect_stars_config = bool(phase5_options.get("patchwork_suppressor_protect_stars", True))
+    patchwork_suppressor_only_near_seams_config = bool(phase5_options.get("patchwork_suppressor_only_near_seams", True))
 
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(
@@ -9539,8 +11114,20 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                 intertile_global_recenter=bool(intertile_global_recenter_config),
                 intertile_recenter_clip=intertile_recenter_clip_tuple,
+                intertile_affine_blend=float(intertile_affine_blend_config),
                 use_auto_intertile=bool(use_auto_intertile_config),
                 intertile_force_safe_mode=intertile_force_safe_mode_config,
+                intertile_prune_k=int(intertile_prune_k_config),
+                intertile_prune_weight_mode=str(intertile_prune_weight_mode_config),
+                intertile_offset_only_v1=bool(intertile_offset_only_v1_config),
+                intertile_gain_offset_v2=bool(intertile_gain_offset_v2_config),
+                intertile_gain_prior_lambda=float(intertile_gain_prior_lambda_config),
+                intertile_gain_clip=tuple(intertile_gain_clip_config) if isinstance(intertile_gain_clip_config, (list, tuple)) and len(intertile_gain_clip_config) >= 2 else (0.90, 1.10),
+                intertile_offset_clip=tuple(intertile_offset_clip_config) if isinstance(intertile_offset_clip_config, (list, tuple)) and len(intertile_offset_clip_config) >= 2 else (-2000.0, 2000.0),
+                intertile_pair_gain_clip=tuple(intertile_pair_gain_clip_config) if isinstance(intertile_pair_gain_clip_config, (list, tuple)) and len(intertile_pair_gain_clip_config) >= 2 else (0.5, 2.0),
+                intertile_pair_offset_abs_max=float(intertile_pair_offset_abs_max_config),
+                intertile_max_irls_iters=int(intertile_max_irls_iters_config),
+                intertile_enforce_requested_solver=bool(intertile_enforce_requested_solver_config),
                 match_background=match_background_flag,
                 feather_parity=feather_parity_flag,
                 two_pass_coverage_renorm=two_pass_coverage_renorm_config,
@@ -9849,8 +11436,20 @@ def _run_shared_phase45_phase5_pipeline(
                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                 intertile_global_recenter=bool(intertile_global_recenter_config),
                 intertile_recenter_clip=intertile_recenter_clip_tuple,
+                intertile_affine_blend=float(intertile_affine_blend_config),
                 use_auto_intertile=bool(use_auto_intertile_config),
                 intertile_force_safe_mode=intertile_force_safe_mode_config,
+                intertile_prune_k=int(intertile_prune_k_config),
+                intertile_prune_weight_mode=str(intertile_prune_weight_mode_config),
+                intertile_offset_only_v1=bool(intertile_offset_only_v1_config),
+                intertile_gain_offset_v2=bool(intertile_gain_offset_v2_config),
+                intertile_gain_prior_lambda=float(intertile_gain_prior_lambda_config),
+                intertile_gain_clip=tuple(intertile_gain_clip_config) if isinstance(intertile_gain_clip_config, (list, tuple)) and len(intertile_gain_clip_config) >= 2 else (0.90, 1.10),
+                intertile_offset_clip=tuple(intertile_offset_clip_config) if isinstance(intertile_offset_clip_config, (list, tuple)) and len(intertile_offset_clip_config) >= 2 else (-2000.0, 2000.0),
+                intertile_pair_gain_clip=tuple(intertile_pair_gain_clip_config) if isinstance(intertile_pair_gain_clip_config, (list, tuple)) and len(intertile_pair_gain_clip_config) >= 2 else (0.5, 2.0),
+                intertile_pair_offset_abs_max=float(intertile_pair_offset_abs_max_config),
+                intertile_max_irls_iters=int(intertile_max_irls_iters_config),
+                intertile_enforce_requested_solver=bool(intertile_enforce_requested_solver_config),
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
                 phase45_enabled=phase45_active_flag,
@@ -9861,6 +11460,16 @@ def _run_shared_phase45_phase5_pipeline(
                 radial_feather_fraction=float(phase5_options.get("radial_feather_fraction") or 0.8),
                 radial_shape_power=float(phase5_options.get("radial_shape_power") or 2.0),
                 min_radial_weight_floor=float(phase5_options.get("min_radial_weight_floor") or 0.0),
+                tile_weight_v4_enabled=tile_weight_v4_enabled_config,
+                tile_weight_v4_curve=tile_weight_v4_curve_config,
+                tile_weight_v4_strength=tile_weight_v4_strength_config,
+                tile_weight_v4_min=tile_weight_v4_min_config,
+                tile_weight_v4_max=tile_weight_v4_max_config,
+                tile_weight_v4_residual_penalty_enabled=tile_weight_v4_residual_penalty_enabled_config,
+                tile_weight_v4_residual_penalty_strength=tile_weight_v4_residual_penalty_strength_config,
+                tile_weight_v4_temporal_penalty_enabled=tile_weight_v4_temporal_penalty_enabled_config,
+                tile_weight_v4_temporal_penalty_strength=tile_weight_v4_temporal_penalty_strength_config,
+                tile_weight_v4_temporal_penalty_hours=tile_weight_v4_temporal_penalty_hours_config,
                 stats_callback=_emit_phase5_stats,
                 worker_config_cache=worker_config_cache,
                 gpu_safety_ctx_phase5=gpu_safety_ctx_phase5,
@@ -9943,6 +11552,13 @@ def _run_shared_phase45_phase5_pipeline(
             zconfig=zconfig,
         ),
         telemetry_ctrl=None if sds_mode_phase5 else telemetry_ctrl,
+        patchwork_suppressor_enabled=bool(patchwork_suppressor_enabled_config),
+        patchwork_suppressor_strength=str(patchwork_suppressor_strength_config),
+        patchwork_suppressor_sigma_px=float(patchwork_suppressor_sigma_px_config),
+        patchwork_suppressor_seam_band_px=int(patchwork_suppressor_seam_band_px_config),
+        patchwork_suppressor_max_delta=float(patchwork_suppressor_max_delta_config),
+        patchwork_suppressor_protect_stars=bool(patchwork_suppressor_protect_stars_config),
+        patchwork_suppressor_only_near_seams=bool(patchwork_suppressor_only_near_seams_config),
     )
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -9958,30 +11574,78 @@ def _run_shared_phase45_phase5_pipeline(
         collected_tiles_for_second_pass.clear()
 
     final_rgb_eq_info = None
-
-# NOTE:
-# We temporarily disable final mosaic RGB equalization.
-# Master tiles are already RGB-normalized individually, and
-# applying the same algorithm again on the assembled mosaic
-# has been shown to produce a strong green cast.
-#
-# if (
-#     final_mosaic_rgb_equalize_enabled
-#     and final_mosaic_data_HWC is not None
-#     and not sds_mode_phase5
-# ):
-#     try:
-#         final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
-#             final_mosaic_data_HWC,
-#             zconfig=zconfig,
-#             logger=logger,
-#         )
-#     except Exception as exc:
-#         if logger:
-#             logger.warning(
-#                 "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
-#                 exc,
-#             )
+    if final_mosaic_rgb_equalize_enabled:
+        if sds_mode_phase5 and not sds_final_rgb_eq_active:
+            logger.info("[RGB-EQ] final mosaic skipped: enabled=True but sds_mode_phase5=True")
+        elif final_mosaic_data_HWC is None:
+            logger.info("[RGB-EQ] final mosaic skipped: enabled=True but mosaic buffer is None")
+        else:
+            try:
+                restore_clip = False
+                previous_clip = None
+                if sds_final_rgb_eq_active:
+                    logger.info(
+                        "[SDS][RGB-EQ] enabling final rgb-eq in phase5 with clip=(%.3f, %.3f)",
+                        float(sds_final_rgb_equalize_gain_clip[0]),
+                        float(sds_final_rgb_equalize_gain_clip[1]),
+                    )
+                    try:
+                        if isinstance(zconfig, dict):
+                            previous_clip = zconfig.get("final_mosaic_rgb_equalize_gain_clip")
+                            zconfig["final_mosaic_rgb_equalize_gain_clip"] = [
+                                float(sds_final_rgb_equalize_gain_clip[0]),
+                                float(sds_final_rgb_equalize_gain_clip[1]),
+                            ]
+                            restore_clip = True
+                        else:
+                            previous_clip = getattr(zconfig, "final_mosaic_rgb_equalize_gain_clip", None)
+                            setattr(
+                                zconfig,
+                                "final_mosaic_rgb_equalize_gain_clip",
+                                [
+                                    float(sds_final_rgb_equalize_gain_clip[0]),
+                                    float(sds_final_rgb_equalize_gain_clip[1]),
+                                ],
+                            )
+                            restore_clip = True
+                    except Exception:
+                        restore_clip = False
+                final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
+                    final_mosaic_data_HWC,
+                    zconfig=zconfig,
+                    logger=logger,
+                )
+                if restore_clip:
+                    try:
+                        if isinstance(zconfig, dict):
+                            zconfig["final_mosaic_rgb_equalize_gain_clip"] = previous_clip
+                        else:
+                            setattr(zconfig, "final_mosaic_rgb_equalize_gain_clip", previous_clip)
+                    except Exception:
+                        pass
+                if isinstance(final_rgb_eq_info, dict):
+                    try:
+                        _target = float(final_rgb_eq_info.get("target_median", float("nan")))
+                    except Exception:
+                        _target = float("nan")
+                    target_str = f"{_target:.6g}" if math.isfinite(_target) else "nan"
+                    logger.info(
+                        "[RGB-EQ] final mosaic gate: enabled=True applied=%s gains=(%.6f, %.6f, %.6f) target_median=%s",
+                        bool(final_rgb_eq_info.get("applied", False)),
+                        float(final_rgb_eq_info.get("gain_r", 1.0)),
+                        float(final_rgb_eq_info.get("gain_g", 1.0)),
+                        float(final_rgb_eq_info.get("gain_b", 1.0)),
+                        target_str,
+                    )
+                else:
+                    logger.info("[RGB-EQ] final mosaic gate: enabled=True applied=unknown")
+            except Exception as exc:
+                logger.warning(
+                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
+                    exc,
+                )
+    else:
+        logger.info("[RGB-EQ] final mosaic skipped: disabled by config (final_mosaic_rgb_equalize_enabled=False)")
 
     alpha_final = _derive_final_alpha_mask(
         final_alpha_map,
@@ -10001,11 +11665,12 @@ def _run_shared_phase45_phase5_pipeline(
 
     if (
         final_mosaic_black_point_equalize_enabled
+        and float(final_mosaic_black_point_percentile) > 0.0
         and final_mosaic_data_HWC is not None
         and isinstance(final_mosaic_data_HWC, np.ndarray)
         and final_mosaic_data_HWC.ndim == 3
         and final_mosaic_data_HWC.shape[-1] == 3
-        and not sds_mode_phase5
+        and (not sds_mode_phase5 or sds_final_blackpoint_active)
     ):
         try:
             final_mosaic_data_HWC, rgb_black_eq_info = equalize_black_point_rgb(
@@ -10708,20 +12373,126 @@ def _apply_ram_budget_to_groups(
 
 
 # --- Configuration du Logging ---
-try:
-    log_file_path = ensure_user_config_dir() / "zemosaic_worker.log"
-except Exception:
-    log_file_path = Path("zemosaic_worker.log")
+def _early_worker_log_dir() -> Path:
+    """Return a writable per-user directory before optional helpers are imported."""
+
+    try:
+        home = Path.home()
+    except Exception:
+        home = Path(tempfile.gettempdir())
+
+    system = platform.system().lower()
+    candidates: list[Path] = []
+
+    if system == "windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "ZeMosaic")
+        candidates.append(home / "AppData" / "Roaming" / "ZeMosaic")
+    elif system == "darwin":
+        candidates.append(home / "Library" / "Application Support" / "ZeMosaic")
+    else:
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        if xdg_config:
+            candidates.append(Path(xdg_config) / "ZeMosaic")
+        candidates.append(home / ".config" / "ZeMosaic")
+
+    candidates.append(home / "ZeMosaic")
+    candidates.append(Path(tempfile.gettempdir()) / "ZeMosaic")
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+
+    return Path(tempfile.gettempdir())
+
+
+def _resolve_worker_log_file_path() -> Path:
+    """Resolve worker log path in repository directory (git-visible)."""
+    try:
+        return Path(__file__).resolve().parent / "zemosaic_worker.log"
+    except Exception:
+        return _early_worker_log_dir() / "zemosaic_worker.log"
+
+
+log_file_path = _resolve_worker_log_file_path()
 
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(str(log_file_path), mode='w', encoding='utf-8')
-    fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    file_handler_added = False
+    for candidate_path in (log_file_path, Path(tempfile.gettempdir()) / "zemosaic_worker.log"):
+        try:
+            fh = logging.FileHandler(str(candidate_path), mode='w', encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(formatter)
+            logger.addHandler(fh)
+            log_file_path = candidate_path
+            file_handler_added = True
+            break
+        except Exception:
+            continue
+    if not file_handler_added:
+        logger.addHandler(logging.NullHandler())
+logger.propagate = False
 logger.info("Logging pour ZeMosaicWorker initialisé. Logs écrits dans: %s", log_file_path)
+
+
+def _sanitize_spawned_process_logging() -> None:
+    """Harden logging in spawned child processes (notably on Windows).
+
+    Some spawned workers inherit console/pipe stream handlers that can become
+    invalid and raise PermissionError during handler flush().
+    We keep file handlers and drop fragile stream handlers in child processes.
+    """
+
+    try:
+        proc = multiprocessing.current_process()
+        is_child = (getattr(proc, "name", "") != "MainProcess") or bool(getattr(proc, "daemon", False))
+    except Exception:
+        is_child = False
+
+    if not is_child:
+        return
+
+    try:
+        logging.raiseExceptions = False
+    except Exception:
+        pass
+
+    def _drop_stream_handlers(log_obj: logging.Logger) -> None:
+        for handler in list(getattr(log_obj, "handlers", []) or []):
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                try:
+                    log_obj.removeHandler(handler)
+                except Exception:
+                    pass
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+
+    try:
+        _drop_stream_handlers(logging.getLogger())
+    except Exception:
+        pass
+    try:
+        _drop_stream_handlers(logger)
+    except Exception:
+        pass
+    try:
+        _drop_stream_handlers(logging.getLogger("multiprocessing"))
+    except Exception:
+        pass
+
+    try:
+        logger.propagate = False
+    except Exception:
+        pass
 
 
 def _configure_worker_logging(logging_level_config: str | None, *, source_hint: str | None = None) -> None:
@@ -10761,6 +12532,296 @@ def _configure_worker_logging(logging_level_config: str | None, *, source_hint: 
         logger.info("Worker logging level set to %s", level_name)
     except Exception:
         pass
+
+
+def _attach_run_output_log_handler(output_folder: str | None) -> None:
+    """Mirror worker logs into the run output directory when available."""
+
+    if not output_folder:
+        return
+
+    try:
+        target_dir = Path(str(output_folder)).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / "zemosaic_worker.log"
+    except Exception:
+        return
+
+    try:
+        target_resolved = target_path.resolve()
+    except Exception:
+        target_resolved = target_path
+
+    # Avoid duplicate handlers on the same file path.
+    for handler in list(logger.handlers):
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        try:
+            existing_path = Path(getattr(handler, "baseFilename", "")).resolve()
+        except Exception:
+            continue
+        if existing_path == target_resolved:
+            return
+
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s'
+    )
+    try:
+        fh = logging.FileHandler(str(target_path), mode='w', encoding='utf-8')
+        fh.setLevel(logger.level)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+        logger.info("[LOGCFG] run_output_log_attached path=%s", target_path)
+    except Exception as e:
+        logger.warning("[LOGCFG] run_output_log_attach_failed path=%s reason=%s", target_path, e)
+
+
+def _diagnostics_output_dir_from_cache(worker_config_cache: dict | None) -> Path | None:
+    try:
+        cfg = worker_config_cache or {}
+        output_dir = str(cfg.get("output_dir") or "").strip()
+        if not output_dir:
+            return None
+        out = Path(output_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+    except Exception:
+        return None
+
+
+def _write_json_diagnostic(path: Path, payload: dict) -> None:
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        logger.debug("diagnostic write failed (json): %s", path, exc_info=logger.isEnabledFor(logging.DEBUG))
+
+
+def _write_csv_diagnostic(path: Path, header: list[str], rows: list[list[Any]]) -> None:
+    try:
+        with path.open('w', encoding='utf-8', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for r in rows:
+                w.writerow(r)
+    except Exception:
+        logger.debug("diagnostic write failed (csv): %s", path, exc_info=logger.isEnabledFor(logging.DEBUG))
+
+
+def _export_intertile_graph_diagnostics(diagnostics_output_dir: Path | None, effective_tiles: list[dict[str, Any]] | None) -> None:
+    if diagnostics_output_dir is None or not effective_tiles:
+        return
+    if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(zemosaic_utils, "get_last_intertile_diagnostics")):
+        return
+    diag = zemosaic_utils.get_last_intertile_diagnostics() or {}
+    if not isinstance(diag, dict) or not diag:
+        return
+
+    ids = [str((e or {}).get("tile_id", i)) for i, e in enumerate(effective_tiles)]
+    paths = [str((e or {}).get("path", "")) for e in effective_tiles]
+
+    def _tile_id_for_index(i: int) -> str:
+        return ids[i] if 0 <= i < len(ids) else ""
+
+    def _tile_path_for_index(i: int) -> str:
+        return paths[i] if 0 <= i < len(paths) else ""
+
+    def rows(edges):
+        out = []
+        for e in (edges or []):
+            i, j = int(e.get("i", -1)), int(e.get("j", -1))
+            out.append([
+                i,
+                j,
+                _tile_id_for_index(i),
+                _tile_id_for_index(j),
+                _tile_path_for_index(i),
+                _tile_path_for_index(j),
+                float(e.get("weight", 0.0) or 0.0),
+                float(e.get("weight_area", 0.0) or 0.0),
+                float(e.get("weight_strength", 0.0) or 0.0),
+                bool(e.get("kept", False)),
+            ])
+        return out
+
+    m2_diag = diag.get("m2_diag") if isinstance(diag.get("m2_diag"), dict) else {}
+    m1_diag = diag.get("m1_diag") if isinstance(diag.get("m1_diag"), dict) else {}
+
+    _write_json_diagnostic(
+        diagnostics_output_dir / "intertile_graph_summary.json",
+        {
+            "status": diag.get("status"),
+            "raw_pairs_count": int(diag.get("raw_pairs_count", 0) or 0),
+            "pruned_pairs_count": int(diag.get("pruned_pairs_count", 0) or 0),
+            "active_tile_count": int(diag.get("active_tile_count", 0) or 0),
+            "components_active": int(diag.get("components_active", 0) or 0),
+            "bridges_added": int(diag.get("bridges_added", 0) or 0),
+            "fallback_used": bool(diag.get("fallback_used", False)),
+            "prune_k": int(diag.get("prune_k", 0) or 0),
+            "prune_weight_mode": str(diag.get("prune_weight_mode", "")),
+            "anchor": diag.get("anchor"),
+            "pair_entries_count": int(diag.get("pair_entries_count", 0) or 0),
+            "n_tiles": len(ids),
+            "m2_constraints": int(m2_diag.get("constraints", 0) or 0),
+            "m2_kept": int(m2_diag.get("kept", 0) or 0),
+            "m2_rejected": int(m2_diag.get("rejected", 0) or 0),
+            "m2_residual_abs_median": float(m2_diag.get("residual_abs_median", 0.0) or 0.0),
+            "m2_residual_abs_p95": float(m2_diag.get("residual_abs_p95", 0.0) or 0.0),
+            "m1_constraints": int(m1_diag.get("constraints", 0) or 0),
+            "m1_residual_abs_median": float(m1_diag.get("residual_abs_median", 0.0) or 0.0),
+            "m1_residual_abs_p95": float(m1_diag.get("residual_abs_p95", 0.0) or 0.0),
+        },
+    )
+
+    solver_profile = m2_diag.get("solver_profile") if isinstance(m2_diag, dict) else None
+    if isinstance(solver_profile, dict) and solver_profile:
+        _write_json_diagnostic(
+            diagnostics_output_dir / "intertile_solver_profile.json",
+            solver_profile,
+        )
+
+    hdr = ["i", "j", "tile_id_i", "tile_id_j", "path_i", "path_j", "weight", "weight_area", "weight_strength", "kept"]
+    _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_raw.csv", hdr, rows(diag.get("graph_raw_edges")))
+    _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_kept.csv", hdr, rows(diag.get("graph_kept_edges")))
+    _write_csv_diagnostic(diagnostics_output_dir / "intertile_graph_edges_rejected.csv", hdr, rows(diag.get("graph_rejected_edges")))
+
+    affine_solution = diag.get("affine_solution") if isinstance(diag.get("affine_solution"), dict) else {}
+    if affine_solution:
+        solve_rows = []
+        for k in sorted(affine_solution.keys(), key=lambda x: int(x) if str(x).lstrip('-').isdigit() else str(x)):
+            try:
+                idx = int(k)
+            except Exception:
+                continue
+            vals = affine_solution.get(k)
+            if not isinstance(vals, (list, tuple)) or len(vals) < 2:
+                continue
+            gain = float(vals[0])
+            offset = float(vals[1])
+            solve_rows.append([
+                idx,
+                _tile_id_for_index(idx),
+                _tile_path_for_index(idx),
+                gain,
+                offset,
+            ])
+        _write_csv_diagnostic(
+            diagnostics_output_dir / "intertile_photometric_solve.csv",
+            ["tile_index", "tile_id", "path", "gain", "offset"],
+            solve_rows,
+        )
+
+    pair_residuals = m2_diag.get("pair_residuals") if isinstance(m2_diag, dict) else None
+    if isinstance(pair_residuals, list) and pair_residuals:
+        residual_rows = []
+        for e in pair_residuals:
+            if not isinstance(e, dict):
+                continue
+            i = int(e.get("i", -1))
+            j = int(e.get("j", -1))
+            residual_rows.append([
+                i,
+                j,
+                _tile_id_for_index(i),
+                _tile_id_for_index(j),
+                _tile_path_for_index(i),
+                _tile_path_for_index(j),
+                float(e.get("a_ij", 0.0) or 0.0),
+                float(e.get("b_ij", 0.0) or 0.0),
+                float(e.get("weight", 0.0) or 0.0),
+                float(e.get("residual_gain", 0.0) or 0.0),
+                float(e.get("residual_offset", 0.0) or 0.0),
+                float(e.get("residual_abs", 0.0) or 0.0),
+            ])
+        _write_csv_diagnostic(
+            diagnostics_output_dir / "intertile_residuals.csv",
+            [
+                "i",
+                "j",
+                "tile_id_i",
+                "tile_id_j",
+                "path_i",
+                "path_j",
+                "a_ij",
+                "b_ij",
+                "weight",
+                "residual_gain",
+                "residual_offset",
+                "residual_abs",
+            ],
+            residual_rows,
+        )
+
+    tile_residual_summary = m2_diag.get("tile_residual_summary") if isinstance(m2_diag, dict) else None
+    if isinstance(tile_residual_summary, list) and tile_residual_summary:
+        tr_rows = []
+        for e in tile_residual_summary:
+            if not isinstance(e, dict):
+                continue
+            idx = int(e.get("tile_index", -1))
+            tr_rows.append([
+                idx,
+                _tile_id_for_index(idx),
+                _tile_path_for_index(idx),
+                int(e.get("pair_count", 0) or 0),
+                float(e.get("residual_abs_median", 0.0) or 0.0),
+                float(e.get("residual_abs_p95", 0.0) or 0.0),
+            ])
+        _write_csv_diagnostic(
+            diagnostics_output_dir / "intertile_tile_residual_summary.csv",
+            ["tile_index", "tile_id", "path", "pair_count", "residual_abs_median", "residual_abs_p95"],
+            tr_rows,
+        )
+
+def _export_weighted_coverage_and_winner_maps(diagnostics_output_dir: Path | None, effective_tiles: list[dict[str, Any]] | None, final_output_wcs, shape_hw: tuple[int, int]) -> None:
+    if diagnostics_output_dir is None or not effective_tiles:
+        return
+    if not (REPROJECT_AVAILABLE and reproject_interp is not None and ASTROPY_AVAILABLE and fits):
+        return
+    h,w=int(shape_hw[0]),int(shape_hw[1])
+    wcov=np.zeros((h,w),dtype=np.float32)
+    winw=np.full((h,w),-np.inf,dtype=np.float32)
+    wini=np.zeros((h,w),dtype=np.int32)
+    for idx,e in enumerate(effective_tiles,1):
+        try:
+            tw_candidate = e.get("tile_weight_effective")
+            if tw_candidate is None:
+                tw_candidate = e.get("tile_weight")
+            try:
+                tw=float(tw_candidate if tw_candidate is not None else 1.0)
+            except Exception:
+                tw=1.0
+            if not math.isfinite(tw) or tw<=0: tw=1.0
+
+            m = e.get("alpha_weight2d")
+            if m is None:
+                m = e.get("coverage_mask")
+            if m is None:
+                a=np.asarray(e.get("data")); m=(np.any(np.isfinite(a),axis=-1) if a.ndim==3 else np.isfinite(a)).astype(np.float32)
+            m=np.clip(np.nan_to_num(np.asarray(m,dtype=np.float32),nan=0.0,posinf=0.0,neginf=0.0),0.0,None)
+            proj,fp=reproject_interp((m*tw,e.get("wcs")), final_output_wcs, shape_out=(h,w), return_footprint=True)
+            if proj is None: continue
+            p=np.asarray(proj,dtype=np.float32); valid=np.isfinite(p)
+            if fp is not None: valid &= (np.asarray(fp,dtype=np.float32)>0)
+            c=np.where(valid,np.maximum(p,0.0),0.0).astype(np.float32)
+            wcov += c
+            better=valid & (c>winw); winw[better]=c[better]; wini[better]=idx
+        except Exception:
+            continue
+    hdr=fits.Header();
+    try: hdr.update(final_output_wcs.to_header(relax=True))
+    except Exception: pass
+    hdr['EXTNAME']=("WEIGHTCOV","Weighted coverage map")
+    zemosaic_utils.save_fits_image(wcov, str(diagnostics_output_dir / "weighted_coverage_map.fits"), header=hdr, overwrite=True, save_as_float=True, axis_order="HWC")
+    hdr2=fits.Header();
+    try: hdr2.update(final_output_wcs.to_header(relax=True))
+    except Exception: pass
+    hdr2['EXTNAME']=("WINNERMAP","Dominant tile index map")
+    zemosaic_utils.save_fits_image(wini.astype(np.int32), str(diagnostics_output_dir / "winner_map.fits"), header=hdr2, overwrite=True, save_as_float=False, axis_order="HWC")
+    tot=int(np.prod(wini.shape)) if wini.size else 0
+    rows=[]
+    for idx,e in enumerate(effective_tiles,1):
+        px=int(np.count_nonzero(wini==idx)); rows.append([idx,str(e.get("tile_id",idx)),str(e.get("path","")),px,(float(px)/float(tot) if tot>0 else 0.0)])
+    _write_csv_diagnostic(diagnostics_output_dir / "winner_index.csv", ["winner_index","tile_id","path","pixels_won","fraction_of_frame"], rows)
 
 # --- Alignment Warning Tracking ---
 # These warnings come from zemosaic_align_stack when an image fails to align.
@@ -10876,15 +12937,54 @@ try:
 except ImportError:
     from solver_settings import SolverSettings  # type: ignore
 
-try:
-    from .lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
-except ImportError:
-    try:
-        from lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
-    except Exception:
-        _anchor_detect_autocrop = None
+_anchor_detect_autocrop = None
+ANCHOR_AUTOCROP_AVAILABLE = False
 
-ANCHOR_AUTOCROP_AVAILABLE = callable(_anchor_detect_autocrop)
+
+def _ensure_lecropper_loaded() -> bool:
+    """Load the optional lecropper module on demand and cache the outcome."""
+
+    global lecropper, _LECROPPER_AVAILABLE, _LECROPPER_LOAD_ATTEMPTED, _LECROPPER_IMPORT_ERROR
+    global _anchor_detect_autocrop, ANCHOR_AUTOCROP_AVAILABLE
+
+    if _LECROPPER_AVAILABLE and lecropper is not None:
+        return True
+
+    with _LECROPPER_LOAD_LOCK:
+        if _LECROPPER_AVAILABLE and lecropper is not None:
+            return True
+        if _LECROPPER_LOAD_ATTEMPTED and lecropper is None:
+            return False
+
+        _LECROPPER_LOAD_ATTEMPTED = True
+        try:
+            module = importlib.import_module("lecropper")
+        except Exception as exc:
+            lecropper = None
+            _LECROPPER_AVAILABLE = False
+            _LECROPPER_IMPORT_ERROR = exc
+            _anchor_detect_autocrop = None
+            ANCHOR_AUTOCROP_AVAILABLE = False
+            try:
+                logger.warning("Optional lecropper import failed: %s", exc)
+            except Exception:
+                pass
+            return False
+
+        lecropper = module
+        _LECROPPER_AVAILABLE = True
+        _LECROPPER_IMPORT_ERROR = None
+        detect_autocrop = getattr(module, "detect_autocrop_rgb", None)
+        _anchor_detect_autocrop = detect_autocrop if callable(detect_autocrop) else None
+        ANCHOR_AUTOCROP_AVAILABLE = callable(_anchor_detect_autocrop)
+        try:
+            logger.info(
+                "Optional lecropper module loaded (detect_autocrop=%s).",
+                bool(ANCHOR_AUTOCROP_AVAILABLE),
+            )
+        except Exception:
+            pass
+        return True
 
 # Optional configuration import for GPU toggle
 try:
@@ -10899,6 +12999,8 @@ try:
         gpu_stack_from_paths as _p3_gpu_stack_from_paths,
         GPUStackingError as _P3GPUStackingError,
         _gpu_is_usable as _p3_gpu_is_usable,
+        get_phase3_gpu_runtime_stats as _get_p3_gpu_runtime_stats,
+        reset_phase3_gpu_runtime_stats as _reset_p3_gpu_runtime_stats,
     )
     _P3_GPU_HELPERS_AVAILABLE = True
 except Exception:
@@ -10909,6 +13011,12 @@ except Exception:
 
     def _p3_gpu_is_usable(logger=None):
         return False
+
+    def _get_p3_gpu_runtime_stats():
+        return {}
+
+    def _reset_p3_gpu_runtime_stats():
+        return None
 
     _P3_GPU_HELPERS_AVAILABLE = False
 
@@ -12366,20 +14474,36 @@ def get_wcs_and_pretreat_raw_file(
         _pcb_local(skip_msg, lvl="INFO")
         logger.info(skip_msg)
     if wcs_brute is None and ASTROPY_AVAILABLE and WCS: # S'assurer que WCS est bien l'objet d'Astropy
-        try:
-            wcs_from_header = WCS(header_orig, naxis=2, relax=True) # Utiliser WCS d'Astropy
-            if wcs_from_header.is_celestial and hasattr(wcs_from_header.wcs,'crval') and \
-               (hasattr(wcs_from_header.wcs,'cdelt') or hasattr(wcs_from_header.wcs,'cd') or hasattr(wcs_from_header.wcs,'pc')):
-                wcs_brute = wcs_from_header
-                _pcb_local(f"    WCS trouvé dans header FITS de '{filename}'.", lvl="DEBUG_DETAIL")
-                skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
-                _pcb_local(skip_msg, lvl="INFO")
-                logger.info(skip_msg)
-                # WCS déjà présent => pas besoin de réécrire le header
-                should_write_header_back = False
-        except Exception as e_wcs_hdr:
-            _pcb_local("getwcs_warn_header_wcs_read_failed", lvl="WARN", filename=filename, error=str(e_wcs_hdr))
-            wcs_brute = None
+        # Important: if strict WCS validation already rejected the header,
+        # do NOT re-accept it here via permissive Astropy parsing.
+        # Otherwise we can end up with contradictory logs:
+        # "Existing WCS rejected" followed by "Skip WCS solve (WCS present)".
+        if wcs_validation_reason:
+            _pcb_local(
+                "getwcs_info_header_wcs_not_reused_after_reject",
+                lvl="DEBUG_DETAIL",
+                filename=filename,
+                reason=wcs_validation_reason,
+            )
+            logger.debug(
+                "Header WCS not reused for '%s' after strict rejection (%s).",
+                filename,
+                wcs_validation_reason,
+            )
+        else:
+            try:
+                wcs_from_header = WCS(header_orig, naxis=2, relax=True) # Utiliser WCS d'Astropy
+                if wcs_from_header.is_celestial and hasattr(wcs_from_header.wcs,'crval') and                    (hasattr(wcs_from_header.wcs,'cdelt') or hasattr(wcs_from_header.wcs,'cd') or hasattr(wcs_from_header.wcs,'pc')):
+                    wcs_brute = wcs_from_header
+                    _pcb_local(f"    WCS trouvé dans header FITS de '{filename}'.", lvl="DEBUG_DETAIL")
+                    skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
+                    _pcb_local(skip_msg, lvl="INFO")
+                    logger.info(skip_msg)
+                    # WCS déjà présent => pas besoin de réécrire le header
+                    should_write_header_back = False
+            except Exception as e_wcs_hdr:
+                _pcb_local("getwcs_warn_header_wcs_read_failed", lvl="WARN", filename=filename, error=str(e_wcs_hdr))
+                wcs_brute = None
             
     solver_choice_effective = (solver_settings or {}).get("solver_choice", "ASTAP")
     api_key_len = len((solver_settings or {}).get("api_key", ""))
@@ -12553,6 +14677,10 @@ def get_wcs_and_pretreat_raw_file(
 
 # ... (vos imports existants : os, shutil, time, traceback, gc, logging, np, astropy, reproject, et les modules zemosaic_...)
 
+class Phase3TileAbortRequested(RuntimeError):
+    """Raised when a Phase 3 master-tile task is cooperatively aborted by watchdog."""
+
+
 def _safe_load_cache(path: str, *, pcb: Callable | None = None, tile_id: int | None = None):
     """Load a numpy cache with a WinError-1455 aware fallback.
 
@@ -12609,96 +14737,124 @@ def _stack_master_tile_cpu(
     """
 
     stack_metadata: dict[str, Any] = {}
-
     current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
+    saved_gpu_flags: dict[str, Any] = {}
+    missing = object()
+    for attr_name in ("stack_use_gpu", "use_gpu_stack", "use_gpu"):
+        try:
+            saved_gpu_flags[attr_name] = getattr(zconfig, attr_name)
+        except AttributeError:
+            saved_gpu_flags[attr_name] = missing
+        except Exception:
+            saved_gpu_flags[attr_name] = missing
+        try:
+            setattr(zconfig, attr_name, False)
+        except Exception:
+            pass
+    if current_parallel_plan is not None:
+        try:
+            if hasattr(current_parallel_plan, "use_gpu") and bool(getattr(current_parallel_plan, "use_gpu")):
+                current_parallel_plan = replace(current_parallel_plan, use_gpu=False)
+        except Exception:
+            pass
     effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
-    if effective_winsor_frames_per_pass < 0:
-        effective_winsor_frames_per_pass = 0
     try:
-        sample_frame = aligned_images_for_stack[0] if aligned_images_for_stack else None
-        if sample_frame is not None:
-            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
-            available_bytes = int(psutil.virtual_memory().available)
-            overhead = 3.2
-            target_fraction = 0.55
-            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
-            if per_frame_bytes > 0:
-                preemptive_limit = max(
-                    min_pass,
-                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
-                )
-                if preemptive_limit < len(aligned_images_for_stack):
-                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
-                        effective_winsor_frames_per_pass = preemptive_limit
-                    try:
-                        setattr(zconfig, "stack_memmap_enabled", True)
-                    except Exception:
-                        pass
-                    try:
-                        pcb_tile(
-                            "stack_mem_preemptive_stream",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            frames_per_pass=effective_winsor_frames_per_pass,
-                            tile_id=tile_id,
-                        )
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+        if effective_winsor_frames_per_pass < 0:
+            effective_winsor_frames_per_pass = 0
+        try:
+            sample_frame = aligned_images_for_stack[0] if aligned_images_for_stack else None
+            if sample_frame is not None:
+                per_frame_bytes = int(np.asarray(sample_frame).nbytes)
+                available_bytes = int(psutil.virtual_memory().available)
+                overhead = 3.2
+                target_fraction = 0.55
+                min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
+                if per_frame_bytes > 0:
+                    preemptive_limit = max(
+                        min_pass,
+                        int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
+                    )
+                    if preemptive_limit < len(aligned_images_for_stack):
+                        if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
+                            effective_winsor_frames_per_pass = preemptive_limit
+                        try:
+                            setattr(zconfig, "stack_memmap_enabled", True)
+                        except Exception:
+                            pass
+                        try:
+                            pcb_tile(
+                                "stack_mem_preemptive_stream",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                frames_per_pass=effective_winsor_frames_per_pass,
+                                tile_id=tile_id,
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
-    if stack_reject_algo == "winsorized_sigma_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            kappa=stack_kappa_low,
-            winsor_limits=parsed_winsor_limits,
-            apply_rewinsor=True,
-            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
-            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "kappa_sigma":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma_low=stack_kappa_low,
-            sigma_high=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "linear_fit_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    else:
-        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
-            aligned_image_data_list=aligned_images_for_stack,
-            normalize_method=stack_norm_method,
-            weighting_method=stack_weight_method,
-            rejection_algorithm=stack_reject_algo,
-            final_combine_method=stack_final_combine,
-            sigma_clip_low=stack_kappa_low,
-            sigma_clip_high=stack_kappa_high,
-            winsor_limits=parsed_winsor_limits,
-            minimum_signal_adu_target=0.0,
-            apply_radial_weight=apply_radial_weight,
-            radial_feather_fraction=radial_feather_fraction,
-            radial_shape_power=radial_shape_power,
-            winsor_max_workers=winsor_pool_workers,
-            progress_callback=progress_callback,
-            zconfig=zconfig,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
+        if stack_reject_algo == "winsorized_sigma_clip":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                aligned_images_for_stack,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                kappa=stack_kappa_low,
+                winsor_limits=parsed_winsor_limits,
+                apply_rewinsor=True,
+                winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
+                winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        elif stack_reject_algo == "kappa_sigma":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
+                aligned_images_for_stack,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                sigma_low=stack_kappa_low,
+                sigma_high=stack_kappa_high,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        elif stack_reject_algo == "linear_fit_clip":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
+                aligned_images_for_stack,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                sigma=stack_kappa_high,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        else:
+            master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
+                aligned_image_data_list=aligned_images_for_stack,
+                normalize_method=stack_norm_method,
+                weighting_method=stack_weight_method,
+                rejection_algorithm=stack_reject_algo,
+                final_combine_method=stack_final_combine,
+                sigma_clip_low=stack_kappa_low,
+                sigma_clip_high=stack_kappa_high,
+                winsor_limits=parsed_winsor_limits,
+                minimum_signal_adu_target=0.0,
+                apply_radial_weight=apply_radial_weight,
+                radial_feather_fraction=radial_feather_fraction,
+                radial_shape_power=radial_shape_power,
+                winsor_max_workers=winsor_pool_workers,
+                progress_callback=progress_callback,
+                zconfig=zconfig,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+    finally:
+        for attr_name, old_value in saved_gpu_flags.items():
+            try:
+                if old_value is missing:
+                    delattr(zconfig, attr_name)
+                else:
+                    setattr(zconfig, attr_name, old_value)
+            except Exception:
+                pass
 
     del aligned_images_for_stack
     gc.collect()
@@ -12890,6 +15046,213 @@ def _stack_master_tile_auto(
     return stacked_cpu, meta_cpu, False
 
 
+
+
+def _phase3_budget_change_block_reason(
+    now_loop: float,
+    last_change_t: float,
+    change_times: list[float],
+    adapt_cooldown_s: float,
+    max_level_changes_per_min: int,
+) -> tuple[list[float], str | None]:
+    """Return pruned ``change_times`` and optional block reason for launch-budget updates.
+
+    Behavior contract:
+    - keeps only changes from the last 60s
+    - enforces cooldown between two budget changes
+    - enforces max changes per minute to avoid thrashing
+    """
+
+    try:
+        pruned_change_times = [t for t in (change_times or []) if (now_loop - t) <= 60.0]
+    except Exception:
+        pruned_change_times = []
+
+    try:
+        cooldown = float(adapt_cooldown_s)
+    except Exception:
+        cooldown = 0.0
+    if cooldown > 0.0 and (now_loop - float(last_change_t)) < cooldown:
+        return pruned_change_times, "cooldown"
+
+    try:
+        limit = int(max_level_changes_per_min)
+    except Exception:
+        limit = 1
+    if limit < 1:
+        limit = 1
+
+    if len(pruned_change_times) >= limit:
+        return pruned_change_times, "rate_limit"
+
+    return pruned_change_times, None
+
+
+def _phase3_memory_orchestrator_profile(total_ram_gb: float, swap_total_gb: float, zconfig: Any | None = None) -> dict[str, Any]:
+    """Return conservative hard caps for Phase 3 runtime adaptation.
+
+    This is step 1 of a unified memory orchestrator: explicit hard ceilings to avoid
+    runaway auto-growth on low-RAM machines.
+    """
+    try:
+        total_ram_gb = float(total_ram_gb)
+    except Exception:
+        total_ram_gb = 0.0
+    try:
+        swap_total_gb = float(swap_total_gb)
+    except Exception:
+        swap_total_gb = 0.0
+
+    legacy_threshold = 9.0
+    try:
+        if zconfig is not None:
+            legacy_threshold = float(getattr(zconfig, "phase3_mem_orch_legacy_ram_threshold_gb", legacy_threshold))
+    except Exception:
+        pass
+
+    is_low_ram = total_ram_gb > 0.0 and total_ram_gb <= legacy_threshold
+    if total_ram_gb <= 0.0:
+        # Unknown RAM: fail-safe conservative defaults.
+        is_low_ram = True
+
+    if is_low_ram:
+        reserve_mb_default = 1536.0
+        max_workers_default = 1
+        max_cache_slots_default = 1
+        max_frames_default = 32
+        max_cpu_rows_default = 640
+        max_gpu_rows_default = 192
+        max_chunk_mb_default = 640.0
+    elif total_ram_gb <= 12.5:
+        reserve_mb_default = 1280.0
+        max_workers_default = 2
+        max_cache_slots_default = 2
+        max_frames_default = 64
+        max_cpu_rows_default = 1024
+        max_gpu_rows_default = 320
+        max_chunk_mb_default = 1024.0
+    elif total_ram_gb <= 24.5:
+        reserve_mb_default = 1024.0
+        max_workers_default = 3
+        max_cache_slots_default = 3
+        max_frames_default = 128
+        max_cpu_rows_default = 1536
+        max_gpu_rows_default = 512
+        max_chunk_mb_default = 2048.0
+    else:
+        reserve_mb_default = 768.0
+        max_workers_default = 8
+        max_cache_slots_default = 3
+        max_frames_default = 256
+        max_cpu_rows_default = 2048
+        max_gpu_rows_default = 1024
+        max_chunk_mb_default = 4096.0
+
+    if swap_total_gb < 1.0:
+        reserve_mb_default = max(reserve_mb_default, 1792.0)
+        max_frames_default = min(max_frames_default, 24 if is_low_ram else 48)
+        max_chunk_mb_default = min(max_chunk_mb_default, 512.0 if is_low_ram else 896.0)
+
+    reserve_mb = reserve_mb_default
+    max_workers = max_workers_default
+    max_cache_slots = max_cache_slots_default
+    max_frames_per_pass = max_frames_default
+    max_cpu_rows_per_chunk = max_cpu_rows_default
+    max_gpu_rows_per_chunk = max_gpu_rows_default
+    max_chunk_mb = max_chunk_mb_default
+
+    try:
+        if zconfig is not None:
+            reserve_mb = max(384.0, float(getattr(zconfig, "phase3_mem_orch_reserve_mb", reserve_mb_default)))
+            max_workers = max(1, int(getattr(zconfig, "phase3_mem_orch_max_workers_hard", max_workers_default)))
+            max_cache_slots = max(1, int(getattr(zconfig, "phase3_mem_orch_max_cache_slots_hard", max_cache_slots_default)))
+            max_frames_per_pass = max(8, int(getattr(zconfig, "phase3_mem_orch_max_frames_per_pass_hard", max_frames_default)))
+            max_cpu_rows_per_chunk = max(64, int(getattr(zconfig, "phase3_mem_orch_max_cpu_rows_hard", max_cpu_rows_default)))
+            max_gpu_rows_per_chunk = max(32, int(getattr(zconfig, "phase3_mem_orch_max_gpu_rows_hard", max_gpu_rows_default)))
+            max_chunk_mb = max(128.0, float(getattr(zconfig, "phase3_mem_orch_max_chunk_mb_hard", max_chunk_mb_default)))
+    except Exception:
+        pass
+
+    return {
+        "is_low_ram": bool(is_low_ram),
+        "reserve_mb": float(reserve_mb),
+        "max_workers": int(max_workers),
+        "max_cache_slots": int(max_cache_slots),
+        "max_frames_per_pass": int(max_frames_per_pass),
+        "max_cpu_rows_per_chunk": int(max_cpu_rows_per_chunk),
+        "max_gpu_rows_per_chunk": int(max_gpu_rows_per_chunk),
+        "max_chunk_mb": float(max_chunk_mb),
+        "total_ram_gb": float(total_ram_gb),
+        "swap_total_gb": float(swap_total_gb),
+    }
+
+
+def _memory_orchestrator_profile(total_ram_gb: float, swap_total_gb: float, zconfig: Any | None = None) -> dict[str, Any]:
+    """Global memory orchestrator profile (cross-phase hard limits)."""
+    try:
+        total_ram_gb = float(total_ram_gb)
+    except Exception:
+        total_ram_gb = 0.0
+    try:
+        swap_total_gb = float(swap_total_gb)
+    except Exception:
+        swap_total_gb = 0.0
+
+    if total_ram_gb <= 0.0 or total_ram_gb <= 8.5:
+        profile = {"class": "legacy_low_ram", "reserve_mb": 1536.0, "max_base_workers": 2, "max_winsor_workers": 1, "max_winsor_frames": 24, "max_phase5_assembly_workers": 1}
+    elif total_ram_gb <= 12.5:
+        profile = {"class": "mid_low_ram", "reserve_mb": 1280.0, "max_base_workers": 4, "max_winsor_workers": 2, "max_winsor_frames": 48, "max_phase5_assembly_workers": 2}
+    elif total_ram_gb <= 24.5:
+        profile = {"class": "mid_ram", "reserve_mb": 1024.0, "max_base_workers": 8, "max_winsor_workers": 4, "max_winsor_frames": 96, "max_phase5_assembly_workers": 4}
+    else:
+        profile = {"class": "high_ram", "reserve_mb": 768.0, "max_base_workers": 16, "max_winsor_workers": 8, "max_winsor_frames": 256, "max_phase5_assembly_workers": 8}
+
+    if swap_total_gb < 1.0:
+        profile["reserve_mb"] = max(float(profile["reserve_mb"]), 1792.0)
+        profile["max_winsor_frames"] = min(int(profile["max_winsor_frames"]), 16 if total_ram_gb <= 8.5 else 32)
+
+    try:
+        if zconfig is not None:
+            profile["reserve_mb"] = max(384.0, float(getattr(zconfig, "mem_orch_reserve_mb", profile["reserve_mb"])))
+            profile["max_base_workers"] = max(1, int(getattr(zconfig, "mem_orch_max_base_workers", profile["max_base_workers"])))
+            profile["max_winsor_workers"] = max(1, int(getattr(zconfig, "mem_orch_max_winsor_workers", profile["max_winsor_workers"])))
+            profile["max_winsor_frames"] = max(8, int(getattr(zconfig, "mem_orch_max_winsor_frames", profile["max_winsor_frames"])))
+            profile["max_phase5_assembly_workers"] = max(1, int(getattr(zconfig, "mem_orch_max_phase5_assembly_workers", profile["max_phase5_assembly_workers"])))
+    except Exception:
+        pass
+
+    profile["total_ram_gb"] = float(total_ram_gb)
+    profile["swap_total_gb"] = float(swap_total_gb)
+    return profile
+
+
+def _write_memory_orchestrator_report(output_folder: str, report_payload: dict[str, Any], *, logger: Any | None = None, progress_callback: callable | None = None) -> None:
+    """Best-effort JSON report writer for memory orchestrator observability."""
+    try:
+        if not output_folder:
+            return
+        os.makedirs(output_folder, exist_ok=True)
+        out_path = os.path.join(output_folder, "memory_orchestrator_report.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report_payload, f, indent=2, ensure_ascii=False, default=str)
+        if logger is not None:
+            try:
+                logger.info("[MEM_ORCH] report written: %s", out_path)
+            except Exception:
+                pass
+        if progress_callback is not None:
+            try:
+                progress_callback("memory_orchestrator_report_written", None, "INFO_DETAIL", {"path": out_path})
+            except Exception:
+                pass
+    except Exception:
+        if logger is not None:
+            try:
+                logger.debug("Failed to write memory orchestrator report", exc_info=True)
+            except Exception:
+                pass
+
+
 def create_master_tile(
     seestar_stack_group_info: list[dict],
     tile_id: int,
@@ -12943,6 +15306,9 @@ def create_master_tile(
     target_stack_size: int = 5,
     min_safe_stack_size: int = 3,
     dbg_tile_ids: set[int] | None = None,
+    abort_event: threading.Event | None = None,
+    heartbeat_callback: Callable[[int], None] | None = None,
+    _internal_chunk_depth: int = 0,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
@@ -12956,7 +15322,51 @@ def create_master_tile(
         - ``(path, wcs)`` du master stack produit (``None`` si échec).
         - Liste de sous-groupes à retraiter (copie des ``raw_info`` pour les images non alignées).
     """
-    pcb_tile = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
+    def _abort_requested() -> bool:
+        try:
+            return bool(abort_event is not None and abort_event.is_set())
+        except Exception:
+            return False
+
+    def _touch_progress() -> None:
+        if heartbeat_callback is None:
+            return
+        try:
+            heartbeat_callback(int(tile_id))
+        except Exception:
+            pass
+
+    ph3_sem_hold_count = 0
+
+    def _release_phase3_slot(force_all: bool = False) -> None:
+        nonlocal ph3_sem_hold_count
+        while ph3_sem_hold_count > 0:
+            try:
+                _PH3_CONCURRENCY_SEMAPHORE.release()
+            except Exception:
+                break
+            ph3_sem_hold_count -= 1
+            if not force_all:
+                break
+
+    def _acquire_phase3_slot() -> None:
+        nonlocal ph3_sem_hold_count
+        _PH3_CONCURRENCY_SEMAPHORE.acquire()
+        ph3_sem_hold_count += 1
+
+    def _check_abort(stage: str) -> None:
+        if _abort_requested():
+            _release_phase3_slot(force_all=True)
+            raise Phase3TileAbortRequested(f"tile={tile_id} stage={stage}")
+
+    def _tile_progress_callback(*args, **kwargs):
+        _touch_progress()
+        _check_abort("progress_callback")
+        if progress_callback is not None:
+            return progress_callback(*args, **kwargs)
+        return None
+
+    pcb_tile = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=_tile_progress_callback, **kwargs)
     # Load persistent configuration to forward GPU preference
     if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
         try:
@@ -13080,6 +15490,8 @@ def create_master_tile(
     quality_crop_enabled_effective = bool(quality_crop_enabled)
     altaz_cleanup_enabled_effective = bool(altaz_cleanup_enabled)
     quality_gate_enabled_effective = bool(quality_gate_enabled)
+    if quality_crop_enabled_effective or altaz_cleanup_enabled_effective:
+        _ensure_lecropper_loaded()
     min_safe_stack_effective = max(1, int(min_safe_stack_size))
     target_stack_effective = max(min_safe_stack_effective, int(target_stack_size))
 
@@ -13128,10 +15540,579 @@ def create_master_tile(
                     preferred_group_idx = idx
                     break
 
+    # --- Single-tile internal chunk mode for very large stacks ---
+    try:
+        vm_local = psutil.virtual_memory()
+        total_ram_gb_local = float(getattr(vm_local, "total", 0.0)) / (1024.0 ** 3)
+    except Exception:
+        total_ram_gb_local = 8.0
+
+    try:
+        internal_chunk_threshold = int(getattr(zconfig, "phase3_internal_chunk_threshold", 0) or 0)
+    except Exception:
+        internal_chunk_threshold = 0
+    if internal_chunk_threshold <= 0:
+        internal_chunk_threshold = 128 if total_ram_gb_local <= 8.5 else 224
+
+    try:
+        internal_chunk_size = int(getattr(zconfig, "phase3_internal_chunk_size", 0) or 0)
+    except Exception:
+        internal_chunk_size = 0
+    if internal_chunk_size <= 0:
+        internal_chunk_size = 24 if total_ram_gb_local <= 8.5 else 40
+
+    internal_chunk_enabled = (
+        int(_internal_chunk_depth) <= 0
+        and int(len(seestar_stack_group_info or [])) > int(internal_chunk_threshold)
+        and int(internal_chunk_size) > 0
+    )
+
+    if internal_chunk_enabled:
+        total_raw = int(len(seestar_stack_group_info or []))
+
+        # Keep split chunks mode-homogeneous when possible (EQ vs ALT_AZ vs UNKNOWN)
+        # to avoid pathological chunk degradation on mixed-mount groups.
+        mode_buckets: dict[str, list[dict]] = {"EQ": [], "ALT_AZ": [], "UNKNOWN": []}
+        for _entry in seestar_stack_group_info or []:
+            try:
+                _mode = _infer_group_eqmode([_entry])
+            except Exception:
+                _mode = "UNKNOWN"
+            if _mode not in mode_buckets:
+                _mode = "UNKNOWN"
+            mode_buckets[_mode].append(_entry)
+
+        non_empty_modes = [m for m in ("EQ", "ALT_AZ", "UNKNOWN") if mode_buckets.get(m)]
+        chunks: list[list[dict]] = []
+        if len(non_empty_modes) > 1:
+            for _mode in ("EQ", "ALT_AZ", "UNKNOWN"):
+                _items = mode_buckets.get(_mode) or []
+                if not _items:
+                    continue
+                for i in range(0, len(_items), internal_chunk_size):
+                    _chunk = _items[i:i + internal_chunk_size]
+                    if _chunk:
+                        chunks.append(_chunk)
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_MODE_MIXED_EQMODE",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                eq_count=int(len(mode_buckets.get("EQ") or [])),
+                altaz_count=int(len(mode_buckets.get("ALT_AZ") or [])),
+                unknown_count=int(len(mode_buckets.get("UNKNOWN") or [])),
+                chunk_size=int(internal_chunk_size),
+                chunks=int(len(chunks)),
+                strategy="mode_homogeneous",
+            )
+        else:
+            chunks = [
+                seestar_stack_group_info[i:i + internal_chunk_size]
+                for i in range(0, total_raw, internal_chunk_size)
+            ]
+        chunks = [c for c in chunks if c]
+        pcb_tile(
+            "P3_INTERNAL_CHUNK_MODE",
+            prog=None,
+            lvl="WARN",
+            tile_id=int(tile_id),
+            depth=int(_internal_chunk_depth),
+            raw_frames=total_raw,
+            chunk_size=int(internal_chunk_size),
+            chunks=int(len(chunks)),
+            ram_gb=float(total_ram_gb_local),
+            mode="single_tile_adaptive",
+        )
+
+        chunk_tmp_dir = Path(output_temp_dir) / f".p3_internal_tile_{int(tile_id):04d}"
+        chunk_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        synthetic_infos: list[dict] = []
+        chunk_quality: list[tuple[float, int, str, Any]] = []
+        nested_retries: list[list[dict]] = []
+
+        def _cleanup_internal_chunk_artifacts(
+            *,
+            preserve_paths: set[str] | None = None,
+            remove_split_fits: bool = False,
+        ) -> None:
+            """Best-effort cleanup of internal chunk artifacts for single-tile identity."""
+            keep = set(str(p) for p in (preserve_paths or set()))
+            for info_obj in synthetic_infos:
+                try:
+                    npy_obj = info_obj.get("path_preprocessed_cache")
+                    if npy_obj:
+                        p_npy = Path(str(npy_obj))
+                        if p_npy.exists() and str(p_npy) not in keep:
+                            p_npy.unlink()
+                except Exception:
+                    pass
+                if remove_split_fits:
+                    try:
+                        raw_obj = info_obj.get("path_raw")
+                        if raw_obj:
+                            p_raw = Path(str(raw_obj))
+                            if p_raw.exists() and str(p_raw) not in keep:
+                                p_raw.unlink()
+                    except Exception:
+                        pass
+            try:
+                if chunk_tmp_dir.exists():
+                    shutil.rmtree(chunk_tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        def _finalize_internal_chunk_identity(
+            infos_for_merge: list[dict],
+            *,
+            reason: str,
+        ) -> tuple[tuple[str | None, Any], list[list[dict]]]:
+            """Finalize internal chunk outputs into canonical master_tile_<tile_id>.fits."""
+            merge_plan_local = parallel_plan
+            try:
+                if parallel_plan is not None and hasattr(parallel_plan, "use_gpu") and bool(getattr(parallel_plan, "use_gpu")):
+                    merge_plan_local = replace(parallel_plan, use_gpu=False)
+            except Exception:
+                merge_plan_local = parallel_plan
+
+            (final_path, final_wcs), final_retries = create_master_tile(
+                infos_for_merge,
+                tile_id,
+                output_temp_dir,
+                "none",
+                "none",
+                stack_reject_algo,
+                stack_kappa_low,
+                stack_kappa_high,
+                parsed_winsor_limits,
+                stack_final_combine,
+                poststack_equalize_rgb,
+                apply_radial_weight,
+                radial_feather_fraction,
+                radial_shape_power,
+                min_radial_weight_floor,
+                False,
+                quality_crop_band_px,
+                quality_crop_k_sigma,
+                quality_crop_margin_px,
+                quality_crop_min_run,
+                bool(altaz_cleanup_enabled_effective),
+                altaz_margin_percent,
+                altaz_decay,
+                bool(altaz_nanize),
+                False,
+                quality_gate_threshold,
+                quality_gate_edge_band_px,
+                quality_gate_k_sigma,
+                quality_gate_erode_px,
+                False,
+                astap_exe_path_global,
+                astap_data_dir_global,
+                astap_search_radius_global,
+                astap_downsample_global,
+                astap_sensitivity_global,
+                astap_timeout_seconds_global,
+                winsor_pool_workers,
+                winsor_max_frames_per_pass,
+                progress_callback,
+                resource_strategy=resource_strategy,
+                center_out_context=center_out_context,
+                center_out_settings=center_out_settings,
+                center_out_rank=center_out_rank,
+                parallel_plan=merge_plan_local,
+                allow_batch_duplication=False,
+                target_stack_size=max(1, int(min_safe_stack_size)),
+                min_safe_stack_size=max(1, int(min_safe_stack_size)),
+                dbg_tile_ids=dbg_tile_ids,
+                abort_event=abort_event,
+                heartbeat_callback=heartbeat_callback,
+                _internal_chunk_depth=int(_internal_chunk_depth) + 1,
+            )
+            if final_retries:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_MERGE_RETRY_IGNORED",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    retries=int(len(final_retries)),
+                    reason="keep_single_tile_identity",
+                )
+            if final_path and final_wcs is not None:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_IDENTITY_FINALIZED",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    reason=str(reason),
+                    final_path=_safe_basename(str(final_path)),
+                )
+                _cleanup_internal_chunk_artifacts(
+                    preserve_paths={str(final_path)},
+                    remove_split_fits=True,
+                )
+            return (final_path, final_wcs), final_retries
+
+        canonical_master_tile_path = Path(output_temp_dir) / f"master_tile_{int(tile_id):03d}.fits"
+
+        def _promote_chunk_output_to_canonical(
+            info_obj: dict | None,
+            *,
+            reason: str,
+        ) -> tuple[str | None, Any]:
+            """Ensure split fallback output is materialized as canonical master_tile_<tile_id>.fits."""
+            if not isinstance(info_obj, dict):
+                return None, None
+            src_obj = info_obj.get("path_raw")
+            if not src_obj:
+                return None, None
+            src_path = Path(str(src_obj))
+            if not src_path.exists():
+                return None, None
+
+            dst_path = canonical_master_tile_path
+            wcs_out = info_obj.get("wcs")
+            try:
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                if str(src_path.resolve()) != str(dst_path.resolve()):
+                    try:
+                        if dst_path.exists():
+                            dst_path.unlink()
+                    except Exception:
+                        pass
+                    shutil.copy2(str(src_path), str(dst_path))
+                dst_final = str(dst_path)
+            except Exception as exc_promote:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_CANONICALIZE_FAIL",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    reason=str(reason),
+                    error=str(exc_promote),
+                )
+                return str(src_path), wcs_out
+
+            if wcs_out is None:
+                try:
+                    hdr_dst = fits.getheader(dst_final, 0)
+                    ok_dst, wcs_dst, _reason_dst = zemosaic_utils.validate_wcs_header(
+                        hdr_dst,
+                        require_footprint=False,
+                    )
+                    if ok_dst and wcs_dst is not None:
+                        wcs_out = wcs_dst
+                except Exception:
+                    pass
+
+            try:
+                _register_master_tile_identity(dst_final, f"tile:{int(tile_id):04d}")
+            except Exception:
+                _register_master_tile_identity(dst_final, tile_id)
+
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_CANONICALIZED",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                reason=str(reason),
+                src=_safe_basename(str(src_path)),
+                dst=_safe_basename(dst_final),
+            )
+
+            try:
+                _cleanup_internal_chunk_artifacts(
+                    preserve_paths={str(dst_final)},
+                    remove_split_fits=True,
+                )
+            except Exception:
+                pass
+
+            return dst_final, wcs_out
+
+        for ci, chunk_group in enumerate(chunks, start=1):
+            chunk_tile_id = int(tile_id) * 1000 + int(ci)
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_BEGIN",
+                prog=None,
+                lvl="INFO_DETAIL",
+                tile_id=int(tile_id),
+                chunk_index=int(ci),
+                chunk_total=int(len(chunks)),
+                chunk_frames=int(len(chunk_group)),
+                chunk_tile_id=int(chunk_tile_id),
+            )
+
+            (chunk_path, chunk_wcs), chunk_retries = create_master_tile(
+                chunk_group,
+                chunk_tile_id,
+                output_temp_dir,
+                stack_norm_method,
+                stack_weight_method,
+                stack_reject_algo,
+                stack_kappa_low,
+                stack_kappa_high,
+                parsed_winsor_limits,
+                stack_final_combine,
+                poststack_equalize_rgb,
+                apply_radial_weight,
+                radial_feather_fraction,
+                radial_shape_power,
+                min_radial_weight_floor,
+                False,
+                quality_crop_band_px,
+                quality_crop_k_sigma,
+                quality_crop_margin_px,
+                quality_crop_min_run,
+                bool(altaz_cleanup_enabled_effective),
+                altaz_margin_percent,
+                altaz_decay,
+                bool(altaz_nanize),
+                False,
+                quality_gate_threshold,
+                quality_gate_edge_band_px,
+                quality_gate_k_sigma,
+                quality_gate_erode_px,
+                False,
+                astap_exe_path_global,
+                astap_data_dir_global,
+                astap_search_radius_global,
+                astap_downsample_global,
+                astap_sensitivity_global,
+                astap_timeout_seconds_global,
+                winsor_pool_workers,
+                winsor_max_frames_per_pass,
+                progress_callback,
+                resource_strategy=resource_strategy,
+                center_out_context=None,
+                center_out_settings=None,
+                center_out_rank=center_out_rank,
+                parallel_plan=parallel_plan,
+                allow_batch_duplication=False,
+                target_stack_size=max(1, int(min_safe_stack_size)),
+                min_safe_stack_size=max(1, int(min_safe_stack_size)),
+                dbg_tile_ids=dbg_tile_ids,
+                abort_event=abort_event,
+                heartbeat_callback=heartbeat_callback,
+                _internal_chunk_depth=int(_internal_chunk_depth) + 1,
+            )
+
+            if chunk_retries:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_RETRY_IGNORED",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    chunk_index=int(ci),
+                    retries=int(len(chunk_retries)),
+                    reason="keep_single_tile_identity",
+                )
+
+            if not chunk_path or chunk_wcs is None:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_FAIL",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    chunk_index=int(ci),
+                    chunk_total=int(len(chunks)),
+                    chunk_tile_id=int(chunk_tile_id),
+                )
+                continue
+
+            npy_path = chunk_tmp_dir / f"chunk_{ci:04d}.npy"
+            try:
+                with fits.open(str(chunk_path), memmap=True) as hdul_chunk:
+                    arr_chunk = np.asarray(hdul_chunk[0].data, dtype=np.float32)
+                    hdr_chunk = hdul_chunk[0].header.copy()
+                if arr_chunk.ndim == 2:
+                    arr_chunk = np.repeat(arr_chunk[..., None], 3, axis=2)
+                elif arr_chunk.ndim == 3:
+                    # FITS stores RGB cubes mostly as CHW (C,H,W). Convert to HWC for cache path.
+                    if arr_chunk.shape[0] in (1, 3) and arr_chunk.shape[-1] not in (1, 3):
+                        arr_chunk = np.moveaxis(arr_chunk, 0, -1)
+                    if arr_chunk.shape[-1] == 1:
+                        arr_chunk = np.repeat(arr_chunk, 3, axis=2)
+                    elif arr_chunk.shape[-1] > 3:
+                        arr_chunk = arr_chunk[..., :3]
+                if not (isinstance(arr_chunk, np.ndarray) and arr_chunk.ndim == 3 and arr_chunk.shape[-1] == 3):
+                    pcb_tile(
+                        "P3_INTERNAL_CHUNK_INVALID_SHAPE",
+                        prog=None,
+                        lvl="WARN",
+                        tile_id=int(tile_id),
+                        chunk_index=int(ci),
+                        shape=tuple(int(v) for v in getattr(arr_chunk, "shape", ())),
+                    )
+                    del arr_chunk
+                    gc.collect()
+                    continue
+                arr_chunk = np.ascontiguousarray(arr_chunk.astype(np.float32, copy=False))
+                finite_mask = np.isfinite(arr_chunk)
+                finite_frac = float(np.count_nonzero(finite_mask) / arr_chunk.size) if arr_chunk.size else 0.0
+                nz_mask = finite_mask & (np.abs(arr_chunk) > 1e-12)
+                valid_frac = float(np.count_nonzero(nz_mask) / arr_chunk.size) if arr_chunk.size else 0.0
+                if not np.any(finite_mask) or valid_frac <= 1e-6:
+                    pcb_tile(
+                        "P3_INTERNAL_CHUNK_INVALID",
+                        prog=None,
+                        lvl="WARN",
+                        tile_id=int(tile_id),
+                        chunk_index=int(ci),
+                        finite_frac=float(finite_frac),
+                        valid_frac=float(valid_frac),
+                    )
+                    del arr_chunk
+                    gc.collect()
+                    continue
+                arr_chunk = np.nan_to_num(arr_chunk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                np.save(str(npy_path), arr_chunk, allow_pickle=False)
+                del arr_chunk
+                gc.collect()
+            except Exception as exc_chunk_io:
+                pcb_tile(
+                    "P3_INTERNAL_CHUNK_CONVERT_FAIL",
+                    prog=None,
+                    lvl="WARN",
+                    tile_id=int(tile_id),
+                    chunk_index=int(ci),
+                    error=str(exc_chunk_io),
+                )
+                continue
+
+            synthetic_infos.append(
+                {
+                    "path_preprocessed_cache": str(npy_path),
+                    "path_raw": str(chunk_path),
+                    "wcs": chunk_wcs,
+                    "header": hdr_chunk,
+                    "internal_chunk_members": int(len(chunk_group)),
+                }
+            )
+            chunk_quality.append((float(valid_frac), int(len(chunk_group)), str(chunk_path), chunk_wcs))
+
+        if not synthetic_infos:
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_EMPTY",
+                prog=None,
+                lvl="ERROR",
+                tile_id=int(tile_id),
+            )
+            return (None, None), nested_retries
+
+        if len(synthetic_infos) == 1:
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_PASSTHROUGH",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                reason="single_valid_chunk",
+                chunk_outputs=1,
+            )
+            (single_path, single_wcs), single_retries = _finalize_internal_chunk_identity(
+                synthetic_infos,
+                reason="single_valid_chunk",
+            )
+            if single_retries:
+                nested_retries.extend(single_retries)
+            if single_path and single_wcs is not None:
+                canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                    {"path_raw": single_path, "wcs": single_wcs},
+                    reason="single_valid_chunk_finalize",
+                )
+                if canonical_path and canonical_wcs is not None:
+                    return (canonical_path, canonical_wcs), nested_retries
+                return (single_path, single_wcs), nested_retries
+            only = synthetic_infos[0]
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_PASSTHROUGH_DEGRADED",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                reason="identity_finalize_failed",
+            )
+            canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                only,
+                reason="single_valid_chunk_degraded",
+            )
+            if canonical_path and canonical_wcs is not None:
+                return (canonical_path, canonical_wcs), nested_retries
+            return (only.get("path_raw"), only.get("wcs")), nested_retries
+
+        pcb_tile(
+            "P3_INTERNAL_CHUNK_MERGE",
+            prog=None,
+            lvl="WARN",
+            tile_id=int(tile_id),
+            chunk_outputs=int(len(synthetic_infos)),
+            raw_frames=int(total_raw),
+            mode="single_tile_adaptive",
+        )
+
+        (merged_path, merged_wcs), merge_retries = _finalize_internal_chunk_identity(
+            synthetic_infos,
+            reason="merge",
+        )
+        if merge_retries:
+            nested_retries.extend(merge_retries)
+
+        if merged_path and merged_wcs is not None:
+            canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                {"path_raw": merged_path, "wcs": merged_wcs},
+                reason="merge_finalize",
+            )
+            if canonical_path and canonical_wcs is not None:
+                return (canonical_path, canonical_wcs), nested_retries
+            return (merged_path, merged_wcs), nested_retries
+
+        try:
+            chunk_quality.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            best_valid, best_members, best_path, best_wcs = chunk_quality[0]
+            pcb_tile(
+                "P3_INTERNAL_CHUNK_FALLBACK_BEST",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                best_valid_frac=float(best_valid),
+                best_members=int(best_members),
+                outputs=int(len(chunk_quality)),
+            )
+            best_info = None
+            for info_obj in synthetic_infos:
+                try:
+                    if str(info_obj.get("path_raw")) == str(best_path):
+                        best_info = info_obj
+                        break
+                except Exception:
+                    continue
+            if best_info is not None:
+                (fallback_path, fallback_wcs), fallback_retries = _finalize_internal_chunk_identity(
+                    [best_info],
+                    reason="fallback_best_chunk",
+                )
+                if fallback_retries:
+                    nested_retries.extend(fallback_retries)
+                if fallback_path and fallback_wcs is not None:
+                    canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                        {"path_raw": fallback_path, "wcs": fallback_wcs},
+                        reason="fallback_best_finalize",
+                    )
+                    if canonical_path and canonical_wcs is not None:
+                        return (canonical_path, canonical_wcs), nested_retries
+                    return (fallback_path, fallback_wcs), nested_retries
+            canonical_path, canonical_wcs = _promote_chunk_output_to_canonical(
+                best_info if isinstance(best_info, dict) else {"path_raw": best_path, "wcs": best_wcs},
+                reason="fallback_best_raw",
+            )
+            if canonical_path and canonical_wcs is not None:
+                return (canonical_path, canonical_wcs), nested_retries
+            return (best_path, best_wcs), nested_retries
+        except Exception:
+            return (None, None), nested_retries
+
     # Acquire a dynamic Phase 3 I/O concurrency slot to avoid disk stalls
     # when the system is busy (e.g., another app reading video files).
     try:
-        _PH3_CONCURRENCY_SEMAPHORE.acquire()
+        _acquire_phase3_slot()
     except Exception:
         pass
 
@@ -13143,6 +16124,8 @@ def create_master_tile(
     loaded_group_indices = []
 
     for i, raw_file_info in enumerate(seestar_stack_group_info):
+        _touch_progress()
+        _check_abort("load_cache_loop")
         cached_image_file_path = raw_file_info.get('path_preprocessed_cache')
         original_raw_path = raw_file_info.get('path_raw', 'UnknownRawPathForTileImg') # Plus descriptif
 
@@ -13178,7 +16161,7 @@ def create_master_tile(
              pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
              # Release the concurrency slot before aborting
              try:
-                 _PH3_CONCURRENCY_SEMAPHORE.release()
+                 _release_phase3_slot()
              except Exception:
                  pass
              del tile_images_data_HWC_adu, tile_original_raw_headers, loaded_infos, loaded_group_indices; gc.collect(); return (None, None), failed_groups_to_retry
@@ -13189,7 +16172,7 @@ def create_master_tile(
             
     # Release the concurrency slot as soon as disk reads are done for this tile
     try:
-        _PH3_CONCURRENCY_SEMAPHORE.release()
+        _release_phase3_slot()
     except Exception:
         pass
 
@@ -13249,7 +16232,7 @@ def create_master_tile(
     pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
     # Limit concurrency during alignment/stacking as well to reduce peak RAM
     try:
-        _PH3_CONCURRENCY_SEMAPHORE.acquire()
+        _acquire_phase3_slot()
     except Exception:
         pass
     winsorized_reject = str(stack_reject_algo or "").lower() == "winsorized_sigma_clip"
@@ -13263,12 +16246,15 @@ def create_master_tile(
             lvl="DEBUG_DETAIL",
             tile_id=int(tile_id),
         )
+    _check_abort("before_alignment")
     aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
         image_data_list=tile_images_data_HWC_adu,
         reference_image_index=ref_loaded_idx,
         propagate_mask=propagate_mask_for_coverage,
-        progress_callback=progress_callback
+        progress_callback=_tile_progress_callback
     )
+    _touch_progress()
+    _check_abort("after_alignment")
     auto_pad_used = False
     orig_hw = None
     aligned_hw = None
@@ -13411,7 +16397,7 @@ def create_master_tile(
     if not valid_aligned_images:
         pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
+            _release_phase3_slot()
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
@@ -13500,8 +16486,145 @@ def create_master_tile(
     if debug_tile and valid_aligned_images:
         _dbg_rgb_stats("P3_pre_stack_core", valid_aligned_images[0], logger=logger)
 
+    # Per-tile adaptive working-set control (S3): adjust pass/chunk sizing only.
+    # Scientific membership is preserved: we never remove frames from `valid_aligned_images`.
+    adaptive_winsor_max_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
+    adaptive_parallel_plan = parallel_plan
+    ram_used_pct = None
+    ram_avail_mb = None
+    pressure_level = 0
+    rows_before = None
+    rows_after = None
+    chunk_before = None
+    chunk_after = None
+    winsor_before = int(adaptive_winsor_max_frames_per_pass)
+    winsor_after = int(adaptive_winsor_max_frames_per_pass)
+
+    reject_algo_norm = str(stack_reject_algo or "").strip().lower()
+    combine_mode_norm = str(stack_final_combine or "").strip().lower()
+    # Exactness policy (conservative):
+    # - pass adaptation enabled only for winsorized sigma clip (validated streaming/memmap path)
+    # - chunk adaptation enabled for winsorized/kappa/linear-fit paths
+    pass_adapt_enabled = reject_algo_norm == "winsorized_sigma_clip"
+    chunk_adapt_enabled = reject_algo_norm in {"winsorized_sigma_clip", "kappa_sigma", "linear_fit_clip"}
+
+    try:
+        vm = psutil.virtual_memory()
+        ram_used_pct = float(getattr(vm, "percent", 0.0))
+        ram_available_bytes = int(getattr(vm, "available", 0))
+        ram_avail_mb = ram_available_bytes / (1024.0 * 1024.0)
+
+        high_pct = float(getattr(zconfig, "phase3_ram_high_pct", 82.0))
+        critical_pct = float(getattr(zconfig, "phase3_ram_critical_pct", 88.0))
+        if ram_used_pct >= critical_pct:
+            pressure_level = 2
+        elif ram_used_pct >= high_pct:
+            pressure_level = 1
+
+        if pressure_level > 0 and valid_aligned_images:
+            sample_img = valid_aligned_images[0]
+            per_frame_bytes = int(np.asarray(sample_img).nbytes) if sample_img is not None else 0
+            total_frames = int(len(valid_aligned_images))
+            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
+
+            if pass_adapt_enabled and per_frame_bytes > 0 and total_frames > 1:
+                target_fraction = 0.40 if pressure_level == 2 else 0.50
+                overhead = 3.0
+                target_by_ram = int((ram_available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead)))
+                target_by_ram = max(min_pass, min(total_frames, target_by_ram))
+
+                if adaptive_winsor_max_frames_per_pass <= 0:
+                    winsor_after = int(target_by_ram)
+                else:
+                    winsor_after = int(min(max(min_pass, adaptive_winsor_max_frames_per_pass), target_by_ram))
+
+                if pressure_level >= 2:
+                    winsor_after = max(min_pass, min(total_frames, int(max(1, winsor_after // 2))))
+
+                adaptive_winsor_max_frames_per_pass = int(max(min_pass, min(total_frames, winsor_after)))
+
+            if chunk_adapt_enabled and parallel_plan is not None:
+                scale = 0.50 if pressure_level >= 2 else 0.70
+                rows_before = getattr(parallel_plan, "rows_per_chunk", None)
+                chunk_before = getattr(parallel_plan, "max_chunk_bytes", None)
+                gpu_rows_before = getattr(parallel_plan, "gpu_rows_per_chunk", None)
+                gpu_chunk_before = getattr(parallel_plan, "gpu_max_chunk_bytes", None)
+
+                rows_after = rows_before
+                chunk_after = chunk_before
+                gpu_rows_after = gpu_rows_before
+                gpu_chunk_after = gpu_chunk_before
+
+                if isinstance(rows_before, int) and rows_before > 0:
+                    rows_after = max(64, int(rows_before * scale))
+                if isinstance(chunk_before, int) and chunk_before > 0:
+                    chunk_after = max(64 * 1024 * 1024, int(chunk_before * scale))
+                if isinstance(gpu_rows_before, int) and gpu_rows_before > 0:
+                    gpu_rows_after = max(32, int(gpu_rows_before * scale))
+                if isinstance(gpu_chunk_before, int) and gpu_chunk_before > 0:
+                    gpu_chunk_after = max(64 * 1024 * 1024, int(gpu_chunk_before * scale))
+
+                if (
+                    rows_after != rows_before
+                    or chunk_after != chunk_before
+                    or gpu_rows_after != gpu_rows_before
+                    or gpu_chunk_after != gpu_chunk_before
+                ):
+                    adaptive_parallel_plan = replace(
+                        parallel_plan,
+                        rows_per_chunk=rows_after,
+                        max_chunk_bytes=chunk_after,
+                        gpu_rows_per_chunk=gpu_rows_after,
+                        gpu_max_chunk_bytes=gpu_chunk_after,
+                    )
+
+        winsor_after = int(adaptive_winsor_max_frames_per_pass)
+    except Exception:
+        adaptive_winsor_max_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
+        adaptive_parallel_plan = parallel_plan
+
+    if pressure_level > 0:
+        try:
+            pcb_tile(
+                "P3_MEM_ADAPT_TILE",
+                prog=None,
+                lvl="INFO_DETAIL",
+                tile_id=tile_id,
+                level=int(pressure_level),
+                ram_used_pct=None if ram_used_pct is None else float(ram_used_pct),
+                ram_available_mb=None if ram_avail_mb is None else float(ram_avail_mb),
+                reject_algo=reject_algo_norm,
+                combine_mode=combine_mode_norm,
+                pass_adapt_enabled=bool(pass_adapt_enabled),
+                chunk_adapt_enabled=bool(chunk_adapt_enabled),
+                winsor_before=int(winsor_before),
+                winsor_after=int(winsor_after),
+                rows_before=rows_before,
+                rows_after=rows_after,
+                chunk_before=chunk_before,
+                chunk_after=chunk_after,
+                n_frames=int(len(valid_aligned_images)),
+            )
+        except Exception:
+            pass
+        if not pass_adapt_enabled or not chunk_adapt_enabled:
+            try:
+                pcb_tile(
+                    "P3_MEM_ADAPT_MODE_CONSERVATIVE",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    tile_id=tile_id,
+                    reject_algo=reject_algo_norm,
+                    combine_mode=combine_mode_norm,
+                    pass_adapt_enabled=bool(pass_adapt_enabled),
+                    chunk_adapt_enabled=bool(chunk_adapt_enabled),
+                    reason="mode_exactness_not_validated",
+                )
+            except Exception:
+                pass
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
+    _check_abort("before_stack")
     master_tile_stacked_HWC, stack_metadata, used_gpu = _stack_master_tile_auto(
         valid_aligned_images,
         stack_norm_method=stack_norm_method,
@@ -13516,16 +16639,18 @@ def create_master_tile(
         radial_feather_fraction=radial_feather_fraction,
         radial_shape_power=radial_shape_power,
         winsor_pool_workers=winsor_pool_workers,
-        winsor_max_frames_per_pass=winsor_max_frames_per_pass,
-        progress_callback=progress_callback,
+        winsor_max_frames_per_pass=adaptive_winsor_max_frames_per_pass,
+        progress_callback=_tile_progress_callback,
         zconfig=zconfig,
-        parallel_plan=parallel_plan,
+        parallel_plan=adaptive_parallel_plan,
         pcb_tile=pcb_tile,
         func_id_log_base=func_id_log_base,
         tile_id=tile_id,
         logger=logger,
     )
 
+    _touch_progress()
+    _check_abort("after_stack")
     if debug_tile:
         _dbg_rgb_stats("P3_post_stack_core", master_tile_stacked_HWC, logger=logger)
 
@@ -13538,7 +16663,7 @@ def create_master_tile(
     if master_tile_stacked_HWC is None:
         pcb_tile(f"{func_id_log_base}_error_stacking_failed", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
+            _release_phase3_slot()
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
@@ -13631,6 +16756,8 @@ def create_master_tile(
                     reason=norm_mode,
                 )
 
+    _touch_progress()
+    _check_abort("pre_post_stack_pipeline")
     quality_crop_rect: tuple[int, int, int, int] | None = None
     if quality_crop_enabled_effective:
         try:
@@ -13779,8 +16906,9 @@ def create_master_tile(
             )
 
     pipeline_alpha_mask: np.ndarray | None = None
-    lecropper_pipeline_requested = bool(quality_crop_enabled_effective or altaz_cleanup_enabled_effective)
-    lecropper_applied = False
+    quality_crop_enabled_for_pipeline = bool(quality_crop_enabled_effective and quality_crop_rect is None)
+    lecropper_pipeline_requested = bool(quality_crop_enabled_for_pipeline or altaz_cleanup_enabled_effective)
+    lecropper_applied = bool(quality_crop_rect is not None)
     if lecropper_pipeline_requested and _LECROPPER_AVAILABLE:
         coverage_for_lecropper: np.ndarray | None = None
         coverage_reject_reason: str | None = None
@@ -13888,7 +17016,7 @@ def create_master_tile(
             )
 
         pipeline_cfg = {
-            "quality_crop_enabled": quality_crop_enabled_effective,
+            "quality_crop_enabled": quality_crop_enabled_for_pipeline,
             "quality_crop_band_px": quality_crop_band_px,
             "quality_crop_k_sigma": quality_crop_k_sigma,
             "quality_crop_margin_px": quality_crop_margin_px,
@@ -13913,6 +17041,184 @@ def create_master_tile(
         )
         lecropper_applied = True
 
+    def _apply_master_tile_rect_crop(y0: int, x0: int, y1: int, x1: int, *, reason: str) -> bool:
+        nonlocal master_tile_stacked_HWC, pipeline_alpha_mask, coverage_count_hw, wcs_for_master_tile
+        try:
+            if master_tile_stacked_HWC is None:
+                return False
+            h0, w0 = master_tile_stacked_HWC.shape[:2]
+            y0_i = int(max(0, min(y0, h0 - 1)))
+            y1_i = int(max(y0_i + 1, min(y1, h0)))
+            x0_i = int(max(0, min(x0, w0 - 1)))
+            x1_i = int(max(x0_i + 1, min(x1, w0)))
+            if y0_i <= 0 and x0_i <= 0 and y1_i >= h0 and x1_i >= w0:
+                return False
+
+            master_tile_stacked_HWC = master_tile_stacked_HWC[y0_i:y1_i, x0_i:x1_i]
+            if pipeline_alpha_mask is not None:
+                try:
+                    pipeline_alpha_mask = pipeline_alpha_mask[y0_i:y1_i, x0_i:x1_i]
+                except Exception:
+                    pass
+            if coverage_count_hw is not None:
+                try:
+                    cov_arr = np.asarray(coverage_count_hw)
+                    if cov_arr.ndim == 2 and cov_arr.shape == (h0, w0):
+                        coverage_count_hw = cov_arr[y0_i:y1_i, x0_i:x1_i]
+                except Exception:
+                    pass
+
+            if wcs_for_master_tile is not None:
+                try:
+                    if hasattr(wcs_for_master_tile, 'wcs') and wcs_for_master_tile.wcs:
+                        wcs_for_master_tile.wcs.crpix[0] -= float(x0_i)
+                        wcs_for_master_tile.wcs.crpix[1] -= float(y0_i)
+                except Exception:
+                    pass
+                try:
+                    h2, w2 = master_tile_stacked_HWC.shape[:2]
+                    wcs_for_master_tile.pixel_shape = (int(w2), int(h2))
+                    if hasattr(wcs_for_master_tile, 'array_shape'):
+                        wcs_for_master_tile.array_shape = (int(h2), int(w2))
+                except Exception:
+                    pass
+
+            try:
+                pcb_tile(
+                    f"MT_ALTAZ_STRICT_CROP_APPLIED: tile={tile_id} reason={reason} rect=({x0_i}:{x1_i},{y0_i}:{y1_i})",
+                    prog=None,
+                    lvl="INFO",
+                )
+            except Exception:
+                pass
+            return True
+        except Exception as exc_crop_apply:
+            try:
+                pcb_tile(
+                    f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=apply_exception:{type(exc_crop_apply).__name__}",
+                    prog=None,
+                    lvl="WARN",
+                )
+            except Exception:
+                pass
+            return False
+
+    # Optional strict overlap bbox crop for Alt-Az master tiles.
+    # Goal: remove unreliable peripheral zones using the coverage-driven alpha core,
+    # while preserving edge-tile safety with conservative guards.
+    try:
+        strict_crop_enabled = bool(getattr(zconfig, "altaz_strict_overlap_crop_enabled", True))
+    except Exception:
+        strict_crop_enabled = True
+    if strict_crop_enabled and bool(altaz_cleanup_enabled_effective) and isinstance(master_tile_stacked_HWC, np.ndarray):
+        try:
+            alpha_thr = float(getattr(zconfig, "altaz_strict_overlap_crop_alpha_threshold", 0.02))
+        except Exception:
+            alpha_thr = 0.02
+        try:
+            min_nonzero_frac_strict = float(getattr(zconfig, "altaz_strict_overlap_crop_min_nonzero_frac", 0.08))
+        except Exception:
+            min_nonzero_frac_strict = 0.08
+        try:
+            bbox_pad_px_strict = int(getattr(zconfig, "altaz_strict_overlap_crop_bbox_pad_px", 6))
+        except Exception:
+            bbox_pad_px_strict = 6
+        try:
+            min_size_px_strict = int(getattr(zconfig, "altaz_strict_overlap_crop_min_size_px", 256))
+        except Exception:
+            min_size_px_strict = 256
+
+        alpha_thr = float(np.clip(alpha_thr, 0.0, 1.0))
+        min_nonzero_frac_strict = float(np.clip(min_nonzero_frac_strict, 0.0, 1.0))
+        bbox_pad_px_strict = max(0, int(bbox_pad_px_strict))
+        min_size_px_strict = max(16, int(min_size_px_strict))
+
+        alpha_src = None
+        if pipeline_alpha_mask is not None:
+            alpha_src = np.asarray(pipeline_alpha_mask)
+        elif coverage_count_hw is not None:
+            try:
+                cov_arr = np.asarray(coverage_count_hw, dtype=np.float32)
+                if cov_arr.ndim == 2 and cov_arr.size > 0:
+                    cmax = float(np.nanmax(cov_arr))
+                    if math.isfinite(cmax) and cmax > 0.0:
+                        alpha_src = np.clip(cov_arr / cmax, 0.0, 1.0)
+            except Exception:
+                alpha_src = None
+
+        if alpha_src is None or alpha_src.size == 0:
+            pcb_tile(
+                f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=no_alpha_source",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
+        else:
+            try:
+                if alpha_src.ndim == 3:
+                    alpha_src = alpha_src[..., 0]
+                h0, w0 = master_tile_stacked_HWC.shape[:2]
+                if alpha_src.shape != (h0, w0):
+                    alpha_u8 = _normalize_alpha_mask(alpha_src, target_hw=(h0, w0), opacity_threshold=0.0)
+                    if alpha_u8 is not None:
+                        alpha_src = alpha_u8.astype(np.float32) / 255.0
+                    else:
+                        alpha_src = None
+            except Exception:
+                alpha_src = None
+
+            if alpha_src is None:
+                pcb_tile(
+                    f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=alpha_shape_unusable",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            else:
+                alpha_src = np.nan_to_num(np.asarray(alpha_src, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                amax = float(np.nanmax(alpha_src)) if alpha_src.size else 0.0
+                amin = float(np.nanmin(alpha_src)) if alpha_src.size else 0.0
+                if amax > 1.0 + 1e-6 or amin < -1e-6:
+                    alpha_src = np.clip(alpha_src, 0.0, 255.0) / 255.0
+                else:
+                    alpha_src = np.clip(alpha_src, 0.0, 1.0)
+
+                core_mask = alpha_src >= float(alpha_thr)
+                nonzero_frac_core = float(np.count_nonzero(core_mask) / core_mask.size) if core_mask.size else 0.0
+
+                if not np.any(core_mask):
+                    pcb_tile(
+                        f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=empty_core_mask thr={alpha_thr:.4f}",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                elif nonzero_frac_core < min_nonzero_frac_strict:
+                    pcb_tile(
+                        f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=small_core_mask frac={nonzero_frac_core:.4f}<min={min_nonzero_frac_strict:.4f}",
+                        prog=None,
+                        lvl="WARN",
+                    )
+                else:
+                    ys, xs = np.where(core_mask)
+                    y0 = int(np.min(ys)); y1 = int(np.max(ys)) + 1
+                    x0 = int(np.min(xs)); x1 = int(np.max(xs)) + 1
+                    if bbox_pad_px_strict > 0:
+                        h0, w0 = core_mask.shape
+                        y0 = max(0, y0 - bbox_pad_px_strict)
+                        x0 = max(0, x0 - bbox_pad_px_strict)
+                        y1 = min(h0, y1 + bbox_pad_px_strict)
+                        x1 = min(w0, x1 + bbox_pad_px_strict)
+                    w_new = int(x1 - x0)
+                    h_new = int(y1 - y0)
+                    if w_new < min_size_px_strict or h_new < min_size_px_strict:
+                        pcb_tile(
+                            f"MT_ALTAZ_STRICT_CROP_SKIPPED: tile={tile_id} reason=min_size_guard size=({w_new}x{h_new}) min={min_size_px_strict}",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    else:
+                        _apply_master_tile_rect_crop(y0, x0, y1, x1, reason="altaz_high_conf_core")
+    
+    _touch_progress()
+    _check_abort("pre_edge_trim")
     try:
         if master_tile_stacked_HWC is not None and auto_pad_used:
             pcb_tile(
@@ -14354,8 +17660,41 @@ def create_master_tile(
             except Exception:
                 pass
 
+        master_tile_export_data = master_tile_stacked_HWC
+        try:
+            arr_export = np.asarray(master_tile_stacked_HWC, dtype=np.float32, order="C")
+            nonfinite_mask = ~np.isfinite(arr_export)
+            nonfinite_count = int(np.count_nonzero(nonfinite_mask))
+            if nonfinite_count > 0:
+                # Viewer compatibility: some Linux FITS viewers render NaN-rich tiles as black.
+                # Keep in-memory pipeline arrays unchanged; sanitize only on disk export.
+                master_tile_export_data = np.nan_to_num(
+                    arr_export,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).astype(np.float32, copy=False)
+                header_mt_save['ZMT_NANZ'] = (1, 'Non-finite values were zeroed for export')
+                header_mt_save['ZMT_NANC'] = (nonfinite_count, 'Count of non-finite values zeroed on export')
+                try:
+                    header_mt_save.add_history('Export sanitize: NaN/Inf -> 0 for viewer compatibility')
+                except Exception:
+                    pass
+                logger.debug(
+                    "[MT_EXPORT_SANITIZE] tile=%s nonfinite=%d path=%s",
+                    tile_id,
+                    nonfinite_count,
+                    temp_fits_path,
+                )
+            else:
+                master_tile_export_data = arr_export
+                header_mt_save['ZMT_NANZ'] = (0, 'Non-finite values were zeroed for export')
+                header_mt_save['ZMT_NANC'] = (0, 'Count of non-finite values zeroed on export')
+        except Exception:
+            master_tile_export_data = master_tile_stacked_HWC
+
         zemosaic_utils.save_fits_image(
-            image_data=master_tile_stacked_HWC,
+            image_data=master_tile_export_data,
             output_path=str(temp_fits_path),
             header=header_mt_save,
             overwrite=True,
@@ -14365,8 +17704,123 @@ def create_master_tile(
             alpha_mask=alpha_mask_out,
         )
 
+        # Post-save WCS hardening (important for "Use existing master tiles").
+        # Validate on-disk header and attempt a surgical repair if needed.
+        validated_saved_wcs = wcs_for_master_tile
+        try:
+            header_saved_mt = fits.getheader(str(temp_fits_path), 0)
+            ok_saved_mt, wcs_saved_mt, reason_saved_mt = zemosaic_utils.validate_wcs_header(
+                header_saved_mt,
+                require_footprint=True,
+            )
+        except Exception as exc_saved_mt:
+            ok_saved_mt, wcs_saved_mt, reason_saved_mt = False, None, f"postsave_validate_exception: {exc_saved_mt}"
+
+        if not ok_saved_mt:
+            pcb_tile(
+                "mastertile_warn_postsave_wcs_invalid",
+                prog=None,
+                lvl="WARN",
+                tile_id=int(tile_id),
+                filename=_safe_basename(str(temp_fits_path)),
+                reason=str(reason_saved_mt),
+            )
+            logger.warning(
+                "[MT_WCS_HARDEN] tile=%s invalid on-disk WCS after save: %s (%s)",
+                tile_id,
+                _safe_basename(str(temp_fits_path)),
+                reason_saved_mt,
+            )
+
+            try:
+                if wcs_for_master_tile is not None and hasattr(wcs_for_master_tile, "to_header"):
+                    wcs_hdr_repair = wcs_for_master_tile.to_header(relax=True)
+                    with fits.open(str(temp_fits_path), mode="update", memmap=False) as hdul_mt_repair:
+                        hdr_mt_repair = hdul_mt_repair[0].header
+
+                        purge_prefixes = (
+                            "CD", "PC", "PV", "CDELT", "CTYPE", "CUNIT",
+                            "CRPIX", "CRVAL", "WCSAXES", "LONPOLE", "LATPOLE",
+                            "RADESYS", "EQUINOX", "A_", "B_", "AP_", "BP_",
+                        )
+                        keys_to_drop = [
+                            key for key in list(hdr_mt_repair.keys())
+                            if any(str(key).startswith(pref) for pref in purge_prefixes)
+                        ]
+                        for key in keys_to_drop:
+                            try:
+                                del hdr_mt_repair[key]
+                            except Exception:
+                                pass
+
+                        try:
+                            hdr_mt_repair["WCSAXES"] = 2
+                        except Exception:
+                            pass
+                        try:
+                            hdr_mt_repair.update(wcs_hdr_repair)
+                        except Exception:
+                            for k in wcs_hdr_repair.keys():
+                                try:
+                                    hdr_mt_repair[k] = wcs_hdr_repair[k]
+                                except Exception:
+                                    continue
+                        hdul_mt_repair.flush(output_verify="fix")
+
+                    header_saved_mt2 = fits.getheader(str(temp_fits_path), 0)
+                    ok_saved_mt2, wcs_saved_mt2, reason_saved_mt2 = zemosaic_utils.validate_wcs_header(
+                        header_saved_mt2,
+                        require_footprint=True,
+                    )
+                    if ok_saved_mt2 and wcs_saved_mt2 is not None:
+                        validated_saved_wcs = wcs_saved_mt2
+                        pcb_tile(
+                            "mastertile_info_postsave_wcs_repaired",
+                            prog=None,
+                            lvl="WARN",
+                            tile_id=int(tile_id),
+                            filename=_safe_basename(str(temp_fits_path)),
+                        )
+                        logger.warning(
+                            "[MT_WCS_HARDEN] tile=%s WCS repaired on-disk (%s)",
+                            tile_id,
+                            _safe_basename(str(temp_fits_path)),
+                        )
+                    else:
+                        pcb_tile(
+                            "mastertile_error_postsave_wcs_repair_failed",
+                            prog=None,
+                            lvl="ERROR",
+                            tile_id=int(tile_id),
+                            filename=_safe_basename(str(temp_fits_path)),
+                            reason=str(reason_saved_mt2),
+                        )
+                        logger.error(
+                            "[MT_WCS_HARDEN] tile=%s WCS repair failed for %s: %s",
+                            tile_id,
+                            _safe_basename(str(temp_fits_path)),
+                            reason_saved_mt2,
+                        )
+            except Exception as exc_repair_mt:
+                pcb_tile(
+                    "mastertile_error_postsave_wcs_repair_exception",
+                    prog=None,
+                    lvl="ERROR",
+                    tile_id=int(tile_id),
+                    filename=_safe_basename(str(temp_fits_path)),
+                    error=str(exc_repair_mt),
+                )
+                logger.error(
+                    "[MT_WCS_HARDEN] tile=%s WCS repair exception for %s: %s",
+                    tile_id,
+                    _safe_basename(str(temp_fits_path)),
+                    exc_repair_mt,
+                )
+        elif wcs_saved_mt is not None:
+            validated_saved_wcs = wcs_saved_mt
+
         final_tile_path: Optional[str] = str(temp_fits_path)
-        final_wcs = wcs_for_master_tile
+        final_wcs = validated_saved_wcs
 
         if quality_gate_eval and quality_gate_eval.get("metrics"):
             metrics = quality_gate_eval.get("metrics") or {}
@@ -14421,7 +17875,7 @@ def create_master_tile(
         )
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
         try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
+            _release_phase3_slot()
         except Exception:
             pass
         return (final_tile_path, final_wcs), failed_groups_to_retry
@@ -14430,11 +17884,15 @@ def create_master_tile(
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
         logger.error(f"Traceback pour {func_id_log_base}_{tile_id} sauvegarde:", exc_info=True)
         try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
+            _release_phase3_slot()
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
     finally:
+        try:
+            _release_phase3_slot(force_all=True)
+        except Exception:
+            pass
         if 'master_tile_stacked_HWC' in locals() and master_tile_stacked_HWC is not None: 
             del master_tile_stacked_HWC
         gc.collect()
@@ -14519,8 +17977,20 @@ def assemble_final_mosaic_incremental(
     intertile_robust_clip_sigma: float = 2.5,
     intertile_global_recenter: bool = True,
     intertile_recenter_clip: tuple[float, float] | list[float] = (0.85, 1.18),
+    intertile_affine_blend: float = 1.0,
     use_auto_intertile: bool = False,
     intertile_force_safe_mode: bool | None = None,
+    intertile_prune_k: int = 8,
+    intertile_prune_weight_mode: str = "area",
+    intertile_offset_only_v1: bool = False,
+    intertile_gain_offset_v2: bool = False,
+    intertile_gain_prior_lambda: float = 0.02,
+    intertile_gain_clip: tuple[float, float] | list[float] = (0.90, 1.10),
+    intertile_offset_clip: tuple[float, float] | list[float] = (-2000.0, 2000.0),
+    intertile_pair_gain_clip: tuple[float, float] | list[float] = (0.5, 2.0),
+    intertile_pair_offset_abs_max: float = 5000.0,
+    intertile_max_irls_iters: int = 3,
+    intertile_enforce_requested_solver: bool = False,
     match_background: bool = True,
     feather_parity: bool = False,
     use_radial_feather: bool | None = None,
@@ -14673,6 +18143,17 @@ def assemble_final_mosaic_incremental(
                 intertile_global_recenter=bool(intertile_global_recenter),
                 intertile_recenter_clip=intertile_recenter_clip,
                 force_safe_mode=intertile_force_safe_mode,
+                intertile_prune_k=int(intertile_prune_k),
+                intertile_prune_weight_mode=str(intertile_prune_weight_mode),
+                intertile_offset_only_v1=bool(intertile_offset_only_v1),
+                intertile_gain_offset_v2=bool(intertile_gain_offset_v2),
+                intertile_gain_prior_lambda=float(intertile_gain_prior_lambda),
+                intertile_gain_clip=tuple(intertile_gain_clip) if isinstance(intertile_gain_clip, (list, tuple)) and len(intertile_gain_clip) >= 2 else (0.90, 1.10),
+                intertile_offset_clip=tuple(intertile_offset_clip) if isinstance(intertile_offset_clip, (list, tuple)) and len(intertile_offset_clip) >= 2 else (-2000.0, 2000.0),
+                intertile_pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
+                intertile_pair_offset_abs_max=float(intertile_pair_offset_abs_max),
+                intertile_max_irls_iters=int(intertile_max_irls_iters),
+                intertile_enforce_requested_solver=bool(intertile_enforce_requested_solver),
                 cpu_workers=(
                     int(processing_threads)
                     if processing_threads and int(processing_threads) > 0
@@ -14731,6 +18212,25 @@ def assemble_final_mosaic_incremental(
         logger.info(
             "anchor_shift present but intertile affine_list is None => skipping anchor-only application"
         )
+
+    pending_affine_list, nontrivial_detected, affine_blend_stats = _blend_affine_corrections(
+        pending_affine_list,
+        intertile_affine_blend,
+    )
+    if bool(affine_blend_stats.get("applied", False)):
+        try:
+            pcb_asm(
+                "run_info_incremental_affine_blend",
+                prog=None,
+                lvl="INFO_DETAIL",
+                blend=float(affine_blend_stats.get("blend", 1.0)),
+                gain_med_before=float(affine_blend_stats.get("median_abs_gain_delta_before", 0.0)),
+                gain_med_after=float(affine_blend_stats.get("median_abs_gain_delta_after", 0.0)),
+                off_med_before=float(affine_blend_stats.get("median_abs_offset_before", 0.0)),
+                off_med_after=float(affine_blend_stats.get("median_abs_offset_after", 0.0)),
+            )
+        except Exception:
+            pass
 
     affine_log_indices = _select_affine_log_indices(pending_affine_list)
 
@@ -15142,8 +18642,20 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_robust_clip_sigma: float = 2.5,
     intertile_global_recenter: bool = True,
     intertile_recenter_clip: tuple[float, float] | list[float] | None = (0.85, 1.18),
+    intertile_affine_blend: float = 1.0,
     use_auto_intertile: bool = False,
     intertile_force_safe_mode: bool | None = None,
+    intertile_prune_k: int = 8,
+    intertile_prune_weight_mode: str = "area",
+    intertile_offset_only_v1: bool = False,
+    intertile_gain_offset_v2: bool = False,
+    intertile_gain_prior_lambda: float = 0.02,
+    intertile_gain_clip: tuple[float, float] | list[float] = (0.90, 1.10),
+    intertile_offset_clip: tuple[float, float] | list[float] = (-2000.0, 2000.0),
+    intertile_pair_gain_clip: tuple[float, float] | list[float] = (0.5, 2.0),
+    intertile_pair_offset_abs_max: float = 5000.0,
+    intertile_max_irls_iters: int = 3,
+    intertile_enforce_requested_solver: bool = False,
     collect_tile_data: list | None = None,
     tile_affine_corrections: list[tuple[float, float]] | None = None,
     global_anchor_shift: tuple[float, float] | None = None,
@@ -15159,12 +18671,23 @@ def assemble_final_mosaic_reproject_coadd(
     radial_feather_fraction: float = 0.8,
     radial_shape_power: float = 2.0,
     min_radial_weight_floor: float = 0.0,
+    tile_weight_v4_enabled: bool = False,
+    tile_weight_v4_curve: str = "sqrt",
+    tile_weight_v4_strength: float = 1.0,
+    tile_weight_v4_min: float = 0.75,
+    tile_weight_v4_max: float = 1.35,
+    tile_weight_v4_residual_penalty_enabled: bool = False,
+    tile_weight_v4_residual_penalty_strength: float = 0.35,
+    tile_weight_v4_temporal_penalty_enabled: bool = False,
+    tile_weight_v4_temporal_penalty_strength: float = 0.20,
+    tile_weight_v4_temporal_penalty_hours: float = 6.0,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
     worker_config_cache = worker_config_cache or {}
+    diagnostics_output_dir = _diagnostics_output_dir_from_cache(worker_config_cache)
 
     _log_memory_usage(progress_callback, "Début assemble_final_mosaic_reproject_coadd")
     _pcb(
@@ -15255,9 +18778,13 @@ def assemble_final_mosaic_reproject_coadd(
             if done_tiles > 0 and total_tiles_local > 0:
                 time_per_tile = elapsed_phase_local / float(done_tiles)
                 eta_pre_sec = max(0.0, (total_tiles_local - done_tiles) * time_per_tile)
-            elapsed_total = time.monotonic() - start_time_total_run
-            sec_per_pct = elapsed_total / max(1.0, current_progress_pct)
-            total_eta_sec = eta_pre_sec + (100 - current_progress_pct) * sec_per_pct
+            eta_global_sec = _eta_seconds_from_progress(start_time_total_run, current_progress_pct)
+            eta_phase_model_sec = _eta_seconds_from_phase_model(
+                start_time_total_run,
+                phase_index=5,
+                phase_fraction=(0.08 * prep_fraction),
+            )
+            total_eta_sec = max(eta_pre_sec, eta_global_sec, eta_phase_model_sec)
             h, rem = divmod(int(total_eta_sec), 3600)
             m, s = divmod(rem, 60)
             _pcb(f"ETA_UPDATE:{h:02d}:{m:02d}:{s:02d}", prog=None, lvl="ETA_LEVEL")
@@ -15277,10 +18804,14 @@ def assemble_final_mosaic_reproject_coadd(
             current_progress_pct = base_progress_phase5 + (
                 completed_channels / n_channels
             ) * progress_weight_phase5
-            elapsed_total = time.monotonic() - start_time_total_run
-            # Avoid zero-division at early stage; use at least 1%% of run for denominator
-            sec_per_pct = elapsed_total / max(1.0, current_progress_pct)
-            total_eta_sec = eta_ch_sec + (100 - current_progress_pct) * sec_per_pct
+            eta_global_sec = _eta_seconds_from_progress(start_time_total_run, current_progress_pct)
+            phase_frac = 0.08 + 0.92 * (completed_channels / max(1, n_channels))
+            eta_phase_model_sec = _eta_seconds_from_phase_model(
+                start_time_total_run,
+                phase_index=5,
+                phase_fraction=phase_frac,
+            )
+            total_eta_sec = max(eta_ch_sec, eta_global_sec, eta_phase_model_sec)
             h, rem = divmod(int(total_eta_sec), 3600)
             m, s = divmod(rem, 60)
             _pcb(
@@ -15420,6 +18951,240 @@ def assemble_final_mosaic_reproject_coadd(
                 return value_f
         return None
 
+    def _apply_tile_weight_v4(weights: list[float], tile_entries: list[dict[str, Any]] | None = None) -> list[float]:
+        if not tile_weight_v4_enabled or not weights:
+            return weights
+        arr = np.asarray(weights, dtype=np.float64)
+        with np.errstate(invalid="ignore"):
+            arr = np.where(np.isfinite(arr) & (arr > 0.0), arr, 1.0)
+        med = float(np.median(arr)) if arr.size else 1.0
+        if not math.isfinite(med) or med <= 0.0:
+            med = 1.0
+        norm = arr / med
+        curve = str(tile_weight_v4_curve or "sqrt").strip().lower()
+        try:
+            strength = float(tile_weight_v4_strength)
+        except Exception:
+            strength = 1.0
+        strength = min(max(strength, 0.0), 2.0)
+        if curve == "log":
+            transformed = 1.0 + np.log1p(np.maximum(0.0, norm - 1.0))
+        elif curve == "softcap":
+            transformed = 1.0 + (norm - 1.0) / (1.0 + np.abs(norm - 1.0))
+        else:
+            transformed = np.sqrt(np.maximum(norm, 1e-6))
+        transformed = 1.0 + strength * (transformed - 1.0)
+
+        residual_raw_by_id, residual_norm_by_id = _build_residual_penalty_maps(tile_entries or [])
+
+        temporal_enabled = bool(tile_weight_v4_temporal_penalty_enabled)
+        temporal_strength = float(tile_weight_v4_temporal_penalty_strength) if math.isfinite(float(tile_weight_v4_temporal_penalty_strength)) else 0.2
+        temporal_strength = float(np.clip(temporal_strength, 0.0, 1.0))
+        temporal_hours = float(tile_weight_v4_temporal_penalty_hours) if math.isfinite(float(tile_weight_v4_temporal_penalty_hours)) else 6.0
+        temporal_hours = max(0.25, temporal_hours)
+
+        residual_enabled = bool(tile_weight_v4_residual_penalty_enabled)
+        residual_strength = float(tile_weight_v4_residual_penalty_strength) if math.isfinite(float(tile_weight_v4_residual_penalty_strength)) else 0.35
+        residual_strength = float(np.clip(residual_strength, 0.0, 1.0))
+
+        temporal_center = None
+        if temporal_enabled and tile_entries:
+            ts_vals = []
+            for e in tile_entries:
+                try:
+                    ts_v = float((e or {}).get("obs_timestamp"))
+                except Exception:
+                    ts_v = float("nan")
+                if math.isfinite(ts_v):
+                    ts_vals.append(ts_v)
+            if ts_vals:
+                temporal_center = float(np.median(np.asarray(ts_vals, dtype=np.float64)))
+
+        telemetry_rows = []
+        if tile_entries and len(tile_entries) == transformed.size:
+            for idx, entry in enumerate(tile_entries):
+                tile_id = str((entry or {}).get("tile_id", ""))
+                penalty = 1.0
+                residual_norm = float(residual_norm_by_id.get(tile_id, 0.0)) if residual_enabled else 0.0
+                residual_raw = float(residual_raw_by_id.get(tile_id, 0.0)) if residual_enabled else 0.0
+                if residual_enabled and residual_norm > 0.0:
+                    penalty *= float(1.0 / (1.0 + residual_strength * residual_norm))
+
+                temporal_delta_h = 0.0
+                temporal_norm = 0.0
+                if temporal_enabled and temporal_center is not None:
+                    try:
+                        ts_v = float((entry or {}).get("obs_timestamp"))
+                    except Exception:
+                        ts_v = float("nan")
+                    if math.isfinite(ts_v):
+                        temporal_delta_h = abs(ts_v - temporal_center) / 3600.0
+                        temporal_norm = min(1.0, temporal_delta_h / temporal_hours)
+                        penalty *= float(1.0 / (1.0 + temporal_strength * temporal_norm))
+
+                penalty = float(np.clip(penalty, 0.5, 1.0))
+                transformed[idx] = float(transformed[idx]) * penalty
+                telemetry_rows.append({
+                    "tile_id": tile_id,
+                    "path": str((entry or {}).get("path", "")),
+                    "base_weight": float(arr[idx]),
+                    "v4_weight_before_penalty": float(transformed[idx] / max(1e-9, penalty)),
+                    "penalty_factor": float(penalty),
+                    "residual_raw": float(residual_raw),
+                    "residual_norm": float(residual_norm),
+                    "temporal_delta_h": float(temporal_delta_h),
+                    "temporal_norm": float(temporal_norm),
+                })
+
+        lo = float(tile_weight_v4_min) if math.isfinite(float(tile_weight_v4_min)) else 0.75
+        hi = float(tile_weight_v4_max) if math.isfinite(float(tile_weight_v4_max)) else 1.35
+        if lo > hi:
+            lo, hi = hi, lo
+        transformed = np.clip(transformed, lo, hi)
+
+        if diagnostics_output_dir is not None and telemetry_rows:
+            _write_csv_diagnostic(
+                diagnostics_output_dir / "tile_weights_v4_telemetry.csv",
+                [
+                    "tile_id",
+                    "path",
+                    "base_weight",
+                    "v4_weight_before_penalty",
+                    "penalty_factor",
+                    "residual_raw",
+                    "residual_norm",
+                    "temporal_delta_h",
+                    "temporal_norm",
+                ],
+                [
+                    [
+                        r["tile_id"],
+                        r["path"],
+                        r["base_weight"],
+                        r["v4_weight_before_penalty"],
+                        r["penalty_factor"],
+                        r["residual_raw"],
+                        r["residual_norm"],
+                        r["temporal_delta_h"],
+                        r["temporal_norm"],
+                    ]
+                    for r in telemetry_rows
+                ],
+            )
+            try:
+                penalties = np.asarray([float(r["penalty_factor"]) for r in telemetry_rows], dtype=np.float64)
+                _write_json_diagnostic(
+                    diagnostics_output_dir / "tile_weights_v4_summary.json",
+                    {
+                        "enabled": True,
+                        "curve": str(tile_weight_v4_curve),
+                        "strength": float(strength),
+                        "residual_penalty_enabled": bool(residual_enabled),
+                        "residual_penalty_strength": float(residual_strength),
+                        "temporal_penalty_enabled": bool(temporal_enabled),
+                        "temporal_penalty_strength": float(temporal_strength),
+                        "temporal_penalty_hours": float(temporal_hours),
+                        "penalty_min": float(np.nanmin(penalties)) if penalties.size else 1.0,
+                        "penalty_p50": float(np.nanmedian(penalties)) if penalties.size else 1.0,
+                        "penalty_p95": float(np.nanpercentile(penalties, 95)) if penalties.size else 1.0,
+                    },
+                )
+            except Exception:
+                pass
+
+        return transformed.astype(np.float64).tolist()
+
+    def _resolve_runtime_tile_weight(entry_obj: Any) -> float:
+        if not isinstance(entry_obj, dict):
+            return 1.0
+        for candidate in (
+            entry_obj.get("tile_weight_effective"),
+            entry_obj.get("tile_weight"),
+        ):
+            try:
+                value = float(candidate)
+            except Exception:
+                continue
+            if math.isfinite(value) and value > 0.0:
+                return value
+        return 1.0
+
+    def _parse_obs_timestamp(tile_header_obj) -> float | None:
+        if tile_header_obj is None:
+            return None
+        getter = tile_header_obj.get if hasattr(tile_header_obj, "get") else None
+        for key in ("DATE-OBS", "DATEOBS", "DATE_OBS"):
+            try:
+                raw = getter(key) if getter else tile_header_obj[key]  # type: ignore[index]
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+            try:
+                text = str(raw).strip()
+                if not text:
+                    continue
+                text = text.replace("Z", "+00:00")
+                ts = datetime.fromisoformat(text).timestamp()
+                if math.isfinite(ts):
+                    return float(ts)
+            except Exception:
+                continue
+        return None
+
+    def _build_residual_penalty_maps(tiles_ref: list[dict[str, Any]]) -> tuple[dict[str, float], dict[str, float]]:
+        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(zemosaic_utils, "get_last_intertile_diagnostics")):
+            return {}, {}
+        try:
+            diag_payload = zemosaic_utils.get_last_intertile_diagnostics() or {}
+        except Exception:
+            return {}, {}
+        if not isinstance(diag_payload, dict):
+            return {}, {}
+        m2_diag = diag_payload.get("m2_diag") if isinstance(diag_payload.get("m2_diag"), dict) else {}
+        rows = m2_diag.get("tile_residual_summary") if isinstance(m2_diag.get("tile_residual_summary"), list) else []
+        if not rows:
+            return {}, {}
+
+        res_by_idx: dict[int, float] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                idx = int(row.get("tile_index", -1))
+                p95 = float(row.get("residual_abs_p95", 0.0) or 0.0)
+            except Exception:
+                continue
+            if idx < 0 or not math.isfinite(p95):
+                continue
+            res_by_idx[idx] = max(0.0, p95)
+
+        if not res_by_idx:
+            return {}, {}
+        vals = np.asarray(list(res_by_idx.values()), dtype=np.float64)
+        med = float(np.nanmedian(vals)) if vals.size else 0.0
+        p95_global = float(np.nanpercentile(vals, 95)) if vals.size else med
+        if not math.isfinite(med):
+            med = 0.0
+        if not math.isfinite(p95_global):
+            p95_global = med
+        spread = max(1e-9, p95_global - med)
+
+        norm_by_idx: dict[int, float] = {}
+        for idx, raw_v in res_by_idx.items():
+            norm_by_idx[idx] = float(max(0.0, (raw_v - med) / spread))
+
+        raw_by_tile_id: dict[str, float] = {}
+        norm_by_tile_id: dict[str, float] = {}
+        for idx, entry in enumerate(tiles_ref):
+            tile_id = str((entry or {}).get("tile_id", ""))
+            if tile_id == "":
+                continue
+            if idx in res_by_idx:
+                raw_by_tile_id[tile_id] = float(res_by_idx[idx])
+                norm_by_tile_id[tile_id] = float(norm_by_idx.get(idx, 0.0))
+        return raw_by_tile_id, norm_by_tile_id
+
 
     effective_tiles: list[dict[str, Any]] = []
     hdr_for_output = None
@@ -15429,23 +19194,57 @@ def assemble_final_mosaic_reproject_coadd(
     zero_masked_total = 0
     zero_masked_tiles = 0
     zero_mask_fraction_threshold = 0.05
+    invalid_tiles_skipped = 0
+    invalid_tile_samples: list[str] = []
     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
         tile_header = None
         alpha_mask_arr: np.ndarray | None = None
         alpha_weight2d: np.ndarray | None = None
-        with fits.open(tile_path, memmap=False) as hdul:
-            primary_hdu = hdul[0]
-            data = np.asarray(primary_hdu.data, dtype=np.float32, order="C")
-            try:
-                tile_header = primary_hdu.header.copy()
-            except Exception:
-                tile_header = None
-            if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+        try:
+            with fits.open(tile_path, memmap=False) as hdul:
+                primary_hdu = hdul[0]
+                primary_data = primary_hdu.data
+                if primary_data is None:
+                    raise ValueError("missing primary data")
+                data = np.asarray(primary_data, dtype=np.float32, order="C")
+                if data.size == 0:
+                    raise ValueError("empty primary data")
                 try:
-                    alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
+                    tile_header = primary_hdu.header.copy()
                 except Exception:
-                    alpha_mask_arr = None
+                    tile_header = None
+                if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+                    try:
+                        alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
+                    except Exception:
+                        alpha_mask_arr = None
+        except Exception as open_exc:
+            invalid_tiles_skipped += 1
+            try:
+                _tile_name = _safe_basename(tile_path)
+            except Exception:
+                _tile_name = str(tile_path)
+            if len(invalid_tile_samples) < 12:
+                invalid_tile_samples.append(_tile_name)
+            logger.warning(
+                "Phase5 prep: invalid/corrupt master tile skipped: %s (%s)",
+                _tile_name,
+                open_exc,
+            )
+            try:
+                _pcb(
+                    "run_warn_phase5_invalid_tile_skipped_for_assembly",
+                    prog=None,
+                    lvl="WARN",
+                    filename=_tile_name,
+                    reason=str(open_exc),
+                )
+            except Exception:
+                pass
+            if idx == 1 or (idx % 5 == 0) or (idx == total_tiles_for_prep):
+                _update_eta_prepare(idx, total_tiles_for_prep)
+            continue
 
         # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
         # which stores color images in ``C x H x W`` within the FITS file. When
@@ -15539,18 +19338,51 @@ def assemble_final_mosaic_reproject_coadd(
                 )
                 alpha_mask_arr = None
             else:
-                valid2d = alpha_mask_arr > ALPHA_OPACITY_THRESHOLD
-                alpha_weight2d = valid2d.astype(np.float32, copy=False)
+                # NEW (MVP): allow soft per-pixel alpha weights instead of hard binarization.
+                # This preserves edge contributions and reduces risk of hard holes/seams.
+                alpha_soft_weights_enabled = bool(
+                    worker_config_cache.get("phase5_alpha_soft_weights", True)
+                )
+                try:
+                    alpha_weight_floor = float(
+                        worker_config_cache.get("phase5_alpha_weight_floor", 0.0)
+                    )
+                except Exception:
+                    alpha_weight_floor = 0.0
+                if not math.isfinite(alpha_weight_floor):
+                    alpha_weight_floor = 0.0
+                alpha_weight_floor = float(np.clip(alpha_weight_floor, 0.0, 1.0))
+
+                alpha_arr = np.asarray(alpha_mask_arr, dtype=np.float32, order="C")
+                alpha_arr = np.nan_to_num(alpha_arr, nan=0.0, posinf=0.0, neginf=0.0)
+                alpha_arr = np.clip(alpha_arr, 0.0, 1.0)
+
+                if alpha_soft_weights_enabled:
+                    alpha_weight2d = alpha_arr
+                    if alpha_weight_floor > 0.0:
+                        alpha_weight2d = np.where(
+                            alpha_weight2d > 0.0,
+                            np.maximum(alpha_weight2d, alpha_weight_floor),
+                            0.0,
+                        ).astype(np.float32, copy=False)
+                    valid2d = alpha_weight2d > 0.0
+                else:
+                    valid2d = alpha_arr > ALPHA_OPACITY_THRESHOLD
+                    alpha_weight2d = valid2d.astype(np.float32, copy=False)
+
                 data = np.array(data, dtype=np.float32, order="C", copy=True)
                 if data.ndim == 3:
                     data[~valid2d, :] = 0.0
                 else:
                     data[~valid2d] = 0.0
+
                 if not alpha_debug_logged:
                     try:
-                        alpha_min = float(np.nanmin(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
-                        alpha_max = float(np.nanmax(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
+                        alpha_min = float(np.nanmin(alpha_arr)) if alpha_arr.size else 0.0
+                        alpha_max = float(np.nanmax(alpha_arr)) if alpha_arr.size else 0.0
                         valid_frac = float(np.mean(valid2d)) if valid2d.size else 0.0
+                        w_min = float(np.nanmin(alpha_weight2d)) if alpha_weight2d is not None and alpha_weight2d.size else 0.0
+                        w_max = float(np.nanmax(alpha_weight2d)) if alpha_weight2d is not None and alpha_weight2d.size else 0.0
                         _pcb(
                             "[Alpha] mask stats",
                             prog=None,
@@ -15558,6 +19390,10 @@ def assemble_final_mosaic_reproject_coadd(
                             alpha_min=f"{alpha_min:.3f}",
                             alpha_max=f"{alpha_max:.3f}",
                             valid_frac=f"{valid_frac:.3f}",
+                            soft_weights=bool(alpha_soft_weights_enabled),
+                            weight_floor=f"{alpha_weight_floor:.3f}",
+                            weight_min=f"{w_min:.3f}",
+                            weight_max=f"{w_max:.3f}",
                             weight_shape=str(alpha_weight2d.shape),
                             data_shape=str(data.shape[:2]),
                         )
@@ -15619,6 +19455,7 @@ def assemble_final_mosaic_reproject_coadd(
             "tile_id": _resolve_tile_identifier(tile_path, tile_header, idx - 1),
             "coverage_mask": coverage_mask_entry,
             "tile_weight": tile_weight_value,
+            "obs_timestamp": _parse_obs_timestamp(tile_header),
         }
         if alpha_weight2d is not None:
             tile_entry["alpha_weight2d"] = alpha_weight2d
@@ -15637,6 +19474,56 @@ def assemble_final_mosaic_reproject_coadd(
         if idx == 1 or (idx % 5 == 0) or (idx == total_tiles_for_prep):
             _update_eta_prepare(idx, total_tiles_for_prep)
 
+
+    if invalid_tiles_skipped > 0:
+        logger.warning(
+            "Phase5 prep: skipped %d invalid/corrupt master tiles; sample=%s",
+            invalid_tiles_skipped,
+            ", ".join(invalid_tile_samples) if invalid_tile_samples else "(none)",
+        )
+
+    if not effective_tiles:
+        logger.error(
+            "Phase5 prep: no valid master tiles available after filtering invalid/corrupt files"
+        )
+        return None, None, None
+
+
+    if tile_weighting_active and tile_weight_values:
+        tile_weight_values = _apply_tile_weight_v4(tile_weight_values, effective_tiles)
+
+    if tile_weight_values and len(tile_weight_values) == len(effective_tiles):
+        for _idx, _tw_eff in enumerate(tile_weight_values):
+            try:
+                effective_tiles[_idx]["tile_weight_effective"] = float(_tw_eff)
+            except Exception:
+                effective_tiles[_idx]["tile_weight_effective"] = 1.0
+
+    if diagnostics_output_dir is not None and effective_tiles:
+        rows = []
+        for _entry in effective_tiles:
+            _raw = _entry.get("tile_weight", 1.0) if isinstance(_entry, dict) else 1.0
+            _eff = _entry.get("tile_weight_effective", _raw) if isinstance(_entry, dict) else _raw
+            try:
+                _raw = float(_raw)
+            except Exception:
+                _raw = 1.0
+            try:
+                _eff = float(_eff)
+            except Exception:
+                _eff = _raw
+            rows.append([
+                str(_entry.get("tile_id", "")),
+                str(_entry.get("path", "")),
+                _raw,
+                _eff,
+                bool(_entry.get("alpha_weight2d") is not None),
+            ])
+        _write_csv_diagnostic(
+            diagnostics_output_dir / "tile_weights_final.csv",
+            ["tile_id", "path", "tile_weight_raw", "tile_weight_effective", "has_alpha_weight2d"],
+            rows,
+        )
 
     tile_weighting_applied = tile_weighting_active and bool(tile_weight_values)
     if tile_weighting_applied:
@@ -15686,8 +19573,181 @@ def assemble_final_mosaic_reproject_coadd(
             zero_masked_tiles,
         )
 
+    def _apply_existing_mt_rgb_balance_prephase5() -> None:
+        if not existing_master_tiles_mode:
+            return
+        if len(effective_tiles) < 1:
+            return
+
+        enabled_flag = _coerce_bool_flag(
+            worker_config_cache.get("existing_master_tiles_rgb_balance_prephase5", True)
+        )
+        if enabled_flag is None:
+            enabled_flag = True
+        if not bool(enabled_flag):
+            logger.info(
+                "existing_master_tiles_mode: pre-phase5 rgb balance skipped (disabled by config)"
+            )
+            return
+
+        clip_cfg = worker_config_cache.get("existing_master_tiles_rgb_balance_gain_clip", (0.90, 1.10))
+        try:
+            if isinstance(clip_cfg, str):
+                parts = [p.strip() for p in clip_cfg.replace(";", ",").split(",") if p.strip()]
+                if len(parts) >= 2:
+                    gain_clip = (float(parts[0]), float(parts[1]))
+                else:
+                    gain_clip = (0.90, 1.10)
+            elif isinstance(clip_cfg, (list, tuple)) and len(clip_cfg) >= 2:
+                gain_clip = (float(clip_cfg[0]), float(clip_cfg[1]))
+            else:
+                gain_clip = (0.90, 1.10)
+        except Exception:
+            gain_clip = (0.90, 1.10)
+        if not (math.isfinite(gain_clip[0]) and math.isfinite(gain_clip[1])):
+            gain_clip = (0.90, 1.10)
+        if gain_clip[0] <= 0 or gain_clip[1] <= 0:
+            gain_clip = (0.90, 1.10)
+        if gain_clip[0] > gain_clip[1]:
+            gain_clip = (gain_clip[1], gain_clip[0])
+
+        try:
+            min_pixels = int(worker_config_cache.get("existing_master_tiles_rgb_balance_min_pixels", 5000) or 5000)
+        except Exception:
+            min_pixels = 5000
+        min_pixels = max(256, min_pixels)
+
+        applied_tiles = 0
+        skipped_tiles = 0
+        for entry in effective_tiles:
+            try:
+                data_arr = np.asarray(entry.get("data"), dtype=np.float32, order="C")
+            except Exception:
+                skipped_tiles += 1
+                continue
+            if data_arr.ndim != 3 or data_arr.shape[-1] < 3:
+                skipped_tiles += 1
+                continue
+
+            mask_arr = entry.get("alpha_weight2d")
+            if mask_arr is None:
+                mask_arr = entry.get("coverage_mask")
+            if mask_arr is not None:
+                try:
+                    mask2d = np.asarray(mask_arr)
+                    if mask2d.ndim > 2:
+                        mask2d = np.squeeze(mask2d)
+                    valid_mask = (mask2d > 0)
+                except Exception:
+                    valid_mask = np.ones(data_arr.shape[:2], dtype=bool)
+            else:
+                valid_mask = np.ones(data_arr.shape[:2], dtype=bool)
+
+            try:
+                finite_mask = np.all(np.isfinite(data_arr[..., :3]), axis=-1)
+                valid_mask = valid_mask & finite_mask
+            except Exception:
+                skipped_tiles += 1
+                continue
+
+            valid_count = int(np.count_nonzero(valid_mask))
+            if valid_count < min_pixels:
+                skipped_tiles += 1
+                continue
+
+            try:
+                channel_vals = data_arr[..., :3][valid_mask]
+                channel_medians = np.nanmedian(channel_vals, axis=0).astype(np.float32)
+            except Exception:
+                skipped_tiles += 1
+                continue
+
+            finite = np.isfinite(channel_medians) & (np.abs(channel_medians) > 1e-6)
+            if not np.any(finite):
+                skipped_tiles += 1
+                continue
+
+            target = float(np.nanmedian(channel_medians[finite]))
+            if not math.isfinite(target) or abs(target) <= 1e-6:
+                skipped_tiles += 1
+                continue
+
+            gains = np.ones(3, dtype=np.float32)
+            gains[finite] = target / channel_medians[finite]
+            gains = np.clip(gains, gain_clip[0], gain_clip[1]).astype(np.float32)
+
+            if not np.any(np.abs(gains - 1.0) > 1e-6):
+                skipped_tiles += 1
+                continue
+
+            for c in range(3):
+                np.multiply(data_arr[..., c], float(gains[c]), out=data_arr[..., c], casting="unsafe")
+            entry["data"] = data_arr
+            applied_tiles += 1
+            logger.info(
+                "existing_master_tiles_mode: pre-phase5 rgb balance tile=%s valid=%d gains=(%.6f, %.6f, %.6f) clip=(%.3f, %.3f)",
+                entry.get("tile_id"),
+                valid_count,
+                float(gains[0]),
+                float(gains[1]),
+                float(gains[2]),
+                float(gain_clip[0]),
+                float(gain_clip[1]),
+            )
+
+        logger.info(
+            "existing_master_tiles_mode: pre-phase5 rgb balance summary applied=%d skipped=%d clip=(%.3f, %.3f) min_pixels=%d",
+            applied_tiles,
+            skipped_tiles,
+            float(gain_clip[0]),
+            float(gain_clip[1]),
+            int(min_pixels),
+        )
+
+    try:
+        _apply_existing_mt_rgb_balance_prephase5()
+    except Exception:
+        logger.info(
+            "existing_master_tiles_mode: pre-phase5 rgb balance failed; continuing without it",
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
+
+    existing_mt_anchor_enabled_raw = worker_config_cache.get(
+        "existing_master_tiles_anchor_photometry_enabled",
+        True,
+    )
+    existing_mt_anchor_enabled = _coerce_bool_flag(existing_mt_anchor_enabled_raw)
+    if existing_mt_anchor_enabled is None:
+        existing_mt_anchor_enabled = True
+    existing_mt_anchor_enabled = bool(existing_mt_anchor_enabled)
+
+    existing_mt_anchor_gain_clip_raw = worker_config_cache.get(
+        "existing_master_tiles_anchor_gain_clip",
+        (0.90, 1.10),
+    )
+    try:
+        if isinstance(existing_mt_anchor_gain_clip_raw, str):
+            parts = [float(x.strip()) for x in existing_mt_anchor_gain_clip_raw.split(",")]
+        else:
+            parts = [
+                float(existing_mt_anchor_gain_clip_raw[0]),
+                float(existing_mt_anchor_gain_clip_raw[1]),
+            ]
+        if len(parts) >= 2:
+            low_clip, high_clip = float(parts[0]), float(parts[1])
+        else:
+            low_clip, high_clip = 0.90, 1.10
+    except Exception:
+        low_clip, high_clip = 0.90, 1.10
+    low_clip = float(max(0.50, min(1.50, low_clip)))
+    high_clip = float(max(low_clip + 1e-3, min(2.00, high_clip)))
+    existing_mt_anchor_gain_clip = (low_clip, high_clip)
+
     def _best_effort_anchor_photometry() -> None:
         if not existing_master_tiles_mode:
+            return
+        if not existing_mt_anchor_enabled:
+            logger.info("existing_master_tiles_mode: best-effort anchor skipped (disabled by config)")
             return
         if len(effective_tiles) < 2:
             return
@@ -15706,7 +19766,7 @@ def assemble_final_mosaic_reproject_coadd(
         scale = min(1.0, max_preview / max(preview_h, preview_w)) if max(preview_h, preview_w) > 0 else 1.0
         preview_shape = (max(32, int(preview_h * scale)), max(32, int(preview_w * scale)))
         min_overlap_pixels = 256
-        gain_clip = (0.5, 2.0)
+        gain_clip = existing_mt_anchor_gain_clip
 
         def _resolve_mask(entry: dict[str, Any]) -> np.ndarray | None:
             mask = None
@@ -15910,12 +19970,7 @@ def assemble_final_mosaic_reproject_coadd(
                 mask = entry.get("alpha_weight2d")
                 if mask is None:
                     mask = entry.get("coverage_mask")
-                try:
-                    weight_val = float(entry.get("tile_weight", 1.0))
-                except Exception:
-                    weight_val = 1.0
-                if not math.isfinite(weight_val) or weight_val <= 0:
-                    weight_val = 1.0
+                weight_val = _resolve_runtime_tile_weight(entry)
             tile_weights_for_sources.append(weight_val)
             tile_sources.append(
                 _TileAffineSource(
@@ -15942,6 +19997,17 @@ def assemble_final_mosaic_reproject_coadd(
                 intertile_recenter_clip=intertile_recenter_clip,
                 tile_weights=tile_weights_for_sources,
                 force_safe_mode=intertile_force_safe_mode,
+                intertile_prune_k=int(intertile_prune_k),
+                intertile_prune_weight_mode=str(intertile_prune_weight_mode),
+                intertile_offset_only_v1=bool(intertile_offset_only_v1),
+                intertile_gain_offset_v2=bool(intertile_gain_offset_v2),
+                intertile_gain_prior_lambda=float(intertile_gain_prior_lambda),
+                intertile_gain_clip=tuple(intertile_gain_clip) if isinstance(intertile_gain_clip, (list, tuple)) and len(intertile_gain_clip) >= 2 else (0.90, 1.10),
+                intertile_offset_clip=tuple(intertile_offset_clip) if isinstance(intertile_offset_clip, (list, tuple)) and len(intertile_offset_clip) >= 2 else (-2000.0, 2000.0),
+                intertile_pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
+                intertile_pair_offset_abs_max=float(intertile_pair_offset_abs_max),
+                intertile_max_irls_iters=int(intertile_max_irls_iters),
+                intertile_enforce_requested_solver=bool(intertile_enforce_requested_solver),
                 cpu_workers=(
                     int(assembly_process_workers)
                     if assembly_process_workers and int(assembly_process_workers) > 0
@@ -15969,6 +20035,16 @@ def assemble_final_mosaic_reproject_coadd(
             pending_affine_list = None
             nontrivial_affine = False
 
+
+        try:
+            export_graph_debug = _coerce_bool_flag(worker_config_cache.get("phase5_export_graph_debug", True))
+            if export_graph_debug is None:
+                export_graph_debug = True
+            if diagnostics_output_dir is not None and bool(export_graph_debug):
+                _export_intertile_graph_diagnostics(diagnostics_output_dir, effective_tiles)
+        except Exception:
+            logger.debug("intertile graph export failed", exc_info=logger.isEnabledFor(logging.DEBUG))
+
     total_tiles_prepared = len(effective_tiles)
     pending_affine_list, anchor_shift_applied = _compose_global_anchor_shift(
         pending_affine_list,
@@ -15981,6 +20057,25 @@ def assemble_final_mosaic_reproject_coadd(
         logger.info(
             "anchor_shift present but intertile affine_list is None => skipping anchor-only application"
         )
+
+    pending_affine_list, nontrivial_affine, affine_blend_stats = _blend_affine_corrections(
+        pending_affine_list,
+        intertile_affine_blend,
+    )
+    if bool(affine_blend_stats.get("applied", False)):
+        try:
+            _pcb(
+                "assemble_info_intertile_affine_blend",
+                prog=None,
+                lvl="INFO_DETAIL",
+                blend=float(affine_blend_stats.get("blend", 1.0)),
+                gain_med_before=float(affine_blend_stats.get("median_abs_gain_delta_before", 0.0)),
+                gain_med_after=float(affine_blend_stats.get("median_abs_gain_delta_after", 0.0)),
+                off_med_before=float(affine_blend_stats.get("median_abs_offset_before", 0.0)),
+                off_med_after=float(affine_blend_stats.get("median_abs_offset_after", 0.0)),
+            )
+        except Exception:
+            pass
 
     affine_by_id: dict[str, tuple[float, float]] | None = None
     if pending_affine_list:
@@ -16014,15 +20109,48 @@ def assemble_final_mosaic_reproject_coadd(
         pending_affine_list = None
 
     if pending_affine_list and affine_by_id:
+        pending_affine_list, affine_by_id, _guard_meta = _apply_intertile_underconstrained_guard(
+            pending_affine_list=pending_affine_list,
+            affine_by_id=affine_by_id,
+            effective_tiles=effective_tiles,
+            worker_config_cache=worker_config_cache,
+            diagnostics_output_dir=diagnostics_output_dir,
+            existing_master_tiles_mode=bool(existing_master_tiles_mode),
+            logger_obj=logger,
+        )
+        if (not pending_affine_list) or (not affine_by_id):
+            nontrivial_affine = False
+            tile_affine_for_gpu = None
+
+    if pending_affine_list and affine_by_id:
+        if diagnostics_output_dir is not None:
+            _rows_aff = []
+            for _entry in effective_tiles:
+                _tid = str(_entry.get("tile_id", ""))
+                _gain, _off = affine_by_id.get(_tid, (1.0, 0.0))
+                _rows_aff.append([_tid, float(_gain), float(_off)])
+            _write_csv_diagnostic(
+                diagnostics_output_dir / "intertile_affine_corrections.csv",
+                ["tile_id", "gain", "offset"],
+                _rows_aff,
+            )
+
         tile_affine_for_gpu = pending_affine_list
-        _log_affine_photometric_summary(
+        affine_summary = _log_affine_photometric_summary(
             affine_by_id,
             logger_obj=logger,
             anchor_shift_applied=anchor_shift_applied,
             global_anchor_shift=global_anchor_shift,
         )
+        if (not affine_from_user) and bool(affine_summary.get("degenerate")):
+            logger.warning(
+                "apply_photometric: skipping degenerate intertile solution (non-user affine, unique_pairs<=1)"
+            )
+            pending_affine_list = None
+            tile_affine_for_gpu = None
+            nontrivial_affine = False
         clamp_affine = bool(match_bg and not affine_from_user)
-        if use_gpu:
+        if pending_affine_list and use_gpu:
             # GPU path regression fix: apply computed affine gain/offset to tile data,
             # mirroring the CPU branch behavior (including clamping + callback).
             corrected_tiles = 0
@@ -16114,7 +20242,7 @@ def assemble_final_mosaic_reproject_coadd(
                 nontrivial_affine = False
                 pending_affine_list = None
                 tile_affine_for_gpu = None
-        else:
+        elif pending_affine_list:
             corrected_tiles = 0
             for tile_entry in effective_tiles:
                 tile_id = tile_entry.get("tile_id")
@@ -16195,12 +20323,7 @@ def assemble_final_mosaic_reproject_coadd(
             coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
             tile_weight_val = 1.0
             if isinstance(entry, dict):
-                try:
-                    tile_weight_val = float(entry.get("tile_weight", 1.0))
-                except Exception:
-                    tile_weight_val = 1.0
-                if not math.isfinite(tile_weight_val) or tile_weight_val <= 0.0:
-                    tile_weight_val = 1.0
+                tile_weight_val = _resolve_runtime_tile_weight(entry)
             if arr is None or tile_wcs is None:
                 continue
             try:
@@ -16512,13 +20635,7 @@ def assemble_final_mosaic_reproject_coadd(
                         )
                         weight_source_base = f"{weight_source_base}*radial"
                 if tile_weighting_applied:
-                    try:
-                        tw_raw = entry.get("tile_weight", 1.0) if isinstance(entry, dict) else 1.0
-                        tw_value = float(tw_raw)
-                    except Exception:
-                        tw_value = 1.0
-                    if not math.isfinite(tw_value) or tw_value <= 0.0:
-                        tw_value = 1.0
+                    tw_value = _resolve_runtime_tile_weight(entry)
                     tile_weights_for_entries.append(tw_value)
                 input_weights_list.append(weight2d)
                 if (
@@ -16765,9 +20882,38 @@ def assemble_final_mosaic_reproject_coadd(
                         raise ValueError(
                             f"alpha_union shape {a.shape} mismatch with mosaic {mosaic_data.shape}"
                         )
-            threshold_u8 = int(ALPHA_OPACITY_THRESHOLD * 255)
-            if threshold_u8 > 0:
-                a = np.where(a >= threshold_u8, 255, 0).astype(np.uint8, copy=False)
+            # Keep a *soft* alpha map at final-mosaic stage.
+            # A hard 0.5 binarization can wipe valid coverage after reprojection
+            # (especially with soft edge weights), then coverage gets force-zeroed
+            # from alpha and the final image appears fully empty.
+            #
+            # We only clamp near-zero opacity to 0, while preserving the rest.
+            tiny_alpha_floor_u8 = 1  # ~= 0.4% opacity
+            if tiny_alpha_floor_u8 > 0:
+                a = np.where(a >= tiny_alpha_floor_u8, a, 0).astype(np.uint8, copy=False)
+
+            # Safety guard: if alpha had non-zero signal before clamp but ended up
+            # empty, revert to the unclamped alpha candidate instead of blacking out
+            # the full mosaic downstream.
+            if not np.any(a):
+                try:
+                    a_unclamped = np.nan_to_num(alpha_union, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.issubdtype(a_unclamped.dtype, np.floating):
+                        max_val_u = float(np.nanmax(a_unclamped)) if a_unclamped.size else 0.0
+                        min_val_u = float(np.nanmin(a_unclamped)) if a_unclamped.size else 0.0
+                        if max_val_u <= 1.0 + 1e-6 and min_val_u >= -1e-6:
+                            a_unclamped = (np.clip(a_unclamped, 0.0, 1.0) * 255.0).astype(np.uint8)
+                        else:
+                            a_unclamped = np.clip(a_unclamped, 0.0, 255.0).astype(np.uint8)
+                    elif a_unclamped.dtype != np.uint8:
+                        a_unclamped = np.clip(a_unclamped, 0, 255).astype(np.uint8)
+                    if np.any(a_unclamped):
+                        logger.warning(
+                            "phase6: alpha clamp produced an empty mask; restoring soft alpha_union values"
+                        )
+                        a = a_unclamped
+                except Exception:
+                    pass
             alpha_final = np.ascontiguousarray(a, dtype=np.uint8)
             logger.info(
                 "phase6: alpha_union received, propagating to alpha_final (uint8 %s)",
@@ -16819,6 +20965,21 @@ def assemble_final_mosaic_reproject_coadd(
 
     if isinstance(coverage, np.ndarray):
         coverage = np.where(np.isfinite(coverage), coverage, 0.0).astype(np.float32, copy=False)
+
+    try:
+        export_weight_maps = _coerce_bool_flag(worker_config_cache.get("phase5_export_weight_maps", True))
+        if export_weight_maps is None:
+            export_weight_maps = True
+        if diagnostics_output_dir is not None and bool(export_weight_maps) and isinstance(coverage, np.ndarray):
+            _export_weighted_coverage_and_winner_maps(
+                diagnostics_output_dir=diagnostics_output_dir,
+                effective_tiles=effective_tiles,
+                final_output_wcs=final_output_wcs,
+                shape_hw=(int(coverage.shape[0]), int(coverage.shape[1])),
+            )
+    except Exception:
+        logger.debug("weighted coverage / winner map export failed", exc_info=logger.isEnabledFor(logging.DEBUG))
+
     if isinstance(coverage, np.ndarray) and existing_master_tiles_mode:
         try:
             cov_mask_bool = np.asarray(coverage, dtype=np.float32, order="C")
@@ -18351,6 +22512,8 @@ def run_hierarchical_mosaic_classic_legacy(
     intertile_recenter_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile_config: bool = False,
     intertile_force_safe_mode_config: bool = False,
+    intertile_prune_k_config: int = 8,
+    intertile_prune_weight_mode_config: str = "area",
     match_background_for_final_config: bool = True,
     incremental_feather_parity_config: bool = False,
     two_pass_coverage_renorm_config: bool = False,
@@ -18408,6 +22571,17 @@ def run_hierarchical_mosaic_classic_legacy(
 
     gpu_safety_ctx_global: GpuRuntimeContext | None = None
     gpu_safety_ctx_phase5: GpuRuntimeContext | None = None
+
+    final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(
+        final_mosaic_rgb_equalize_enabled_config
+    )
+    if final_mosaic_rgb_equalize_enabled is None:
+        final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(
+            getattr(zconfig, "final_mosaic_rgb_equalize_enabled", None)
+        )
+    if final_mosaic_rgb_equalize_enabled is None:
+        final_mosaic_rgb_equalize_enabled = False
+    final_mosaic_rgb_equalize_enabled = bool(final_mosaic_rgb_equalize_enabled)
 
     final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(
         final_mosaic_black_point_equalize_enabled
@@ -18511,16 +22685,63 @@ def run_hierarchical_mosaic_classic_legacy(
     quality_crop_requested_flag = bool(quality_crop_enabled_config)
     altaz_cleanup_requested_flag = bool(altaz_cleanup_enabled_config)
     altaz_cleanup_effective_flag = bool(altaz_cleanup_requested_flag)
-    if contains_altaz:
+
+    unknown_policy_global = str(getattr(zconfig, "altaz_unknown_policy", "auto") or "auto").strip().lower()
+    if unknown_policy_global not in ("auto", "on", "off"):
+        unknown_policy_global = "auto"
+
+    seestar_hint_global = False
+    try:
+        # Seestar-oriented run: consider UNKNOWN as likely Alt-Az when policy=auto.
+        mode_hint = str(global_wcs_plan.get("mode", "") or "").strip().lower()
+        if mode_hint == "seestar":
+            seestar_hint_global = True
+    except Exception:
+        seestar_hint_global = False
+    if not seestar_hint_global and isinstance(filter_overrides, dict):
+        try:
+            mode_override = str(filter_overrides.get("mode", "") or "").strip().lower()
+            if mode_override == "seestar":
+                seestar_hint_global = True
+        except Exception:
+            pass
+    if not seestar_hint_global:
+        try:
+            # Last-resort runtime flag for older launchers.
+            if bool(globals().get("IS_SEESTAR_RUNTIME", False)):
+                seestar_hint_global = True
+        except Exception:
+            pass
+
+    unknown_as_altaz_global = False
+    if unknown_count > 0:
+        if unknown_policy_global == "on":
+            unknown_as_altaz_global = True
+        elif unknown_policy_global == "auto":
+            # Conservative auto-mode:
+            # - enable on Seestar-like runs
+            # - or when no EQ markers exist in summary (legacy headers often UNKNOWN)
+            unknown_as_altaz_global = bool(seestar_hint_global or eq_count == 0)
+
+    contains_altaz_effective = bool(contains_altaz or unknown_as_altaz_global)
+    if contains_altaz_effective:
         if not altaz_cleanup_effective_flag:
             try:
-                logger.info("AUTO_ALTaz_cleanup: enabled (contains_altaz=True, config_requested=False)")
+                logger.info(
+                    "AUTO_ALTaz_cleanup: enabled "
+                    "(contains_altaz_effective=True, config_requested=False, "
+                    "unknown_policy=%s, unknown_as_altaz=%s)",
+                    unknown_policy_global,
+                    bool(unknown_as_altaz_global),
+                )
             except Exception:
                 pass
         altaz_cleanup_effective_flag = True
     else:
         if altaz_cleanup_effective_flag:
-            warn_msg = "ALTaz cleanup requested but no ALT_AZ frames detected -> disabled (EQ-only run)."
+            warn_msg = (
+                "ALTaz cleanup requested but no ALT_AZ/UNKNOWN-effective frames detected -> disabled (EQ-only run)."
+            )
             try:
                 logger.warning(warn_msg)
             except Exception:
@@ -18530,6 +22751,20 @@ def run_hierarchical_mosaic_classic_legacy(
             except Exception:
                 pass
         altaz_cleanup_effective_flag = False
+
+    try:
+        logger.info(
+            "ALTaz gating global: policy=%s eq=%d altaz=%d unknown=%d seestar_hint=%s unknown_as_altaz=%s altaz_cleanup_effective=%s",
+            unknown_policy_global,
+            int(eq_count),
+            int(altaz_count),
+            int(unknown_count),
+            bool(seestar_hint_global),
+            bool(unknown_as_altaz_global),
+            bool(altaz_cleanup_effective_flag),
+        )
+    except Exception:
+        pass
     lecropper_pipeline_flag = (
         bool(_LECROPPER_AVAILABLE) and (quality_crop_requested_flag or altaz_cleanup_effective_flag)
     )
@@ -18566,6 +22801,7 @@ def run_hierarchical_mosaic_classic_legacy(
     else:
         sds_mode_flag = False
     global_wcs_plan["sds_mode"] = bool(sds_mode_flag)
+    sds_mode_phase5 = bool(sds_mode_flag)
 
     try:
         sds_coverage_threshold_config = float(worker_config_cache.get("sds_coverage_threshold", 0.92))
@@ -18641,6 +22877,7 @@ def run_hierarchical_mosaic_classic_legacy(
         cleanup_temp_artifacts_config = True
 
     _configure_worker_logging(logging_level_config, source_hint="qt_gui_dropdown")
+    _attach_run_output_log_handler(output_folder)
 
     # --- Harmoniser les méthodes de pondération issues du GUI / CLI / fallback config ---
     requested_stack_weight_method = stack_weight_method
@@ -18671,11 +22908,14 @@ def run_hierarchical_mosaic_classic_legacy(
     for k in ALIGN_WARNING_COUNTS:
         ALIGN_WARNING_COUNTS[k] = 0
     
+    _eta_state_holder = {"value": None}
     def update_gui_eta(eta_seconds_total):
         if progress_callback and callable(progress_callback):
             eta_str = "--:--:--"
             if eta_seconds_total is not None and eta_seconds_total >= 0:
-                h, rem = divmod(int(eta_seconds_total), 3600); m, s = divmod(rem, 60)
+                smoothed = _eta_smooth_seconds(_eta_state_holder.get("value"), eta_seconds_total)
+                _eta_state_holder["value"] = smoothed
+                h, rem = divmod(int(smoothed), 3600); m, s = divmod(rem, 60)
                 eta_str = f"{h:02d}:{m:02d}:{s:02d}"
             pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL")
 
@@ -18742,10 +22982,20 @@ def run_hierarchical_mosaic_classic_legacy(
             ctx.setdefault("use_gpu_phase5", bool(use_gpu_phase5))
         except Exception:
             pass
+        try:
+            p3_runtime = _get_p3_gpu_runtime_stats()
+            if isinstance(p3_runtime, dict) and p3_runtime:
+                ctx.update(p3_runtime)
+        except Exception:
+            pass
         if extra:
             ctx.update(extra)
         return ctx
 
+    try:
+        _reset_p3_gpu_runtime_stats()
+    except Exception:
+        pass
     telemetry.maybe_emit_stats(_telemetry_context({"phase_name": "Init", "phase_index": 0}))
 
 
@@ -19663,6 +23913,30 @@ def run_hierarchical_mosaic_classic_legacy(
                         return True
                     if "final_mosaic" in name or name.startswith("zemosaic_mt"):
                         return True
+
+                    # Existing-master mode is recursive by design, but must never
+                    # re-ingest tiles parked in rejection/quarantine folders.
+                    # Keep this scoped to existing-master discovery only.
+                    reject_exact = {
+                        "rejected_by_quality",
+                        "rejected",
+                        "rejects",
+                        "quarantine",
+                        "trash",
+                        "failed",
+                    }
+                    reject_contains = (
+                        "reject",
+                        "rejet",
+                    )
+                    for parent_part in path_obj.parts[:-1]:
+                        pp = str(parent_part).strip().lower()
+                        if not pp:
+                            continue
+                        if pp in reject_exact:
+                            return True
+                        if any(tok in pp for tok in reject_contains):
+                            return True
                     return False
 
                 candidates: list[Path] = []
@@ -19682,13 +23956,21 @@ def run_hierarchical_mosaic_classic_legacy(
                             continue
 
                 unique_candidates = {}
+                excluded_existing_candidates = 0
                 for candidate in candidates:
                     try:
                         if _exclude_master_tile(candidate):
+                            excluded_existing_candidates += 1
                             continue
                         unique_candidates[str(candidate)] = candidate
                     except Exception:
                         continue
+
+                if excluded_existing_candidates > 0:
+                    logger.info(
+                        "[ExistingMaster] excluded %d recursive candidate(s) from reject/quarantine folders",
+                        int(excluded_existing_candidates),
+                    )
 
                 filtered_candidates = sorted(
                     unique_candidates.values(), key=lambda p: str(p).lower()
@@ -19708,6 +23990,44 @@ def run_hierarchical_mosaic_classic_legacy(
                         existing_master_tiles_results.append((str(candidate), wcs_obj))
 
                 if len(existing_master_tiles_results) >= 2:
+                    existing_mt_qg_enabled = bool((worker_config_cache or {}).get("existing_master_tiles_quality_gate_enabled", True))
+                    existing_mt_qg_mode = str((worker_config_cache or {}).get("existing_master_tiles_quality_gate_mode", "warn") or "warn").strip().lower()
+                    if existing_mt_qg_mode not in {"warn", "fail"}:
+                        existing_mt_qg_mode = "warn"
+                    existing_mt_qg_sigma = float((worker_config_cache or {}).get("existing_master_tiles_quality_gate_sigma_threshold", 8.0) or 8.0)
+                    existing_mt_qg_ratio = float((worker_config_cache or {}).get("existing_master_tiles_quality_gate_ratio_threshold", 5000.0) or 5000.0)
+                    existing_mt_qg_min_valid = float((worker_config_cache or {}).get("existing_master_tiles_quality_gate_min_valid_frac", 0.05) or 0.05)
+
+                    precheck = _scan_existing_master_tiles_quality(
+                        existing_master_tiles_results,
+                        enabled=existing_mt_qg_enabled,
+                        mode=existing_mt_qg_mode,
+                        sigma_threshold=existing_mt_qg_sigma,
+                        ratio_threshold=existing_mt_qg_ratio,
+                        min_valid_frac=existing_mt_qg_min_valid,
+                        pcb=pcb,
+                    )
+                    if precheck.get("suspect", 0) > 0:
+                        logger.warning(
+                            "[ExistingMasterQG] suspect=%d/%d mode=%s",
+                            int(precheck.get("suspect", 0)),
+                            int(precheck.get("total", 0)),
+                            existing_mt_qg_mode,
+                        )
+                    try:
+                        worker_config_cache["existing_master_tiles_qg_suspect_count"] = int(precheck.get("suspect", 0) or 0)
+                    except Exception:
+                        pass
+                    if existing_mt_qg_enabled and existing_mt_qg_mode == "fail" and int(precheck.get("suspect", 0)) > 0:
+                        pcb(
+                            "run_error_existing_master_tiles_quality_gate_failed",
+                            prog=None,
+                            lvl="ERROR",
+                            suspect=int(precheck.get("suspect", 0)),
+                            total=int(precheck.get("total", 0)),
+                        )
+                        return
+
                     use_existing_master_tiles_mode = True
                     pcb(
                         "run_info_existing_master_tiles_mode",
@@ -20273,6 +24593,25 @@ def run_hierarchical_mosaic_classic_legacy(
             num_total_raw_files,
             DEFAULT_PHASE_WORKER_RATIO,
         )
+        try:
+            vm_orch = psutil.virtual_memory()
+            sm_orch = psutil.swap_memory()
+            mem_orch_global = _memory_orchestrator_profile(
+                float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+                float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+                zconfig=zconfig,
+            )
+            hard_base = max(1, int(mem_orch_global.get("max_base_workers", actual_num_workers_ph1)))
+            prev_ph1 = int(actual_num_workers_ph1)
+            actual_num_workers_ph1 = max(1, min(int(actual_num_workers_ph1), hard_base))
+            if actual_num_workers_ph1 != prev_ph1:
+                pcb(
+                    f"MEM_ORCH_PHASE1: workers_cap {prev_ph1}->{actual_num_workers_ph1} class={mem_orch_global.get('class')}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+        except Exception:
+            pass
         pcb(
             f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
             prog=None,
@@ -20918,6 +25257,32 @@ def run_hierarchical_mosaic_classic_legacy(
             candidate = winsor_worker_limit_cfg
         winsor_worker_limit = max(1, min(int(candidate), cpu_total))
         winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
+        try:
+            vm_orch = psutil.virtual_memory()
+            sm_orch = psutil.swap_memory()
+            mem_orch_global = _memory_orchestrator_profile(
+                float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+                float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+                zconfig=zconfig,
+            )
+            prev_winsor_workers = int(winsor_worker_limit)
+            prev_winsor_frames = int(winsor_max_frames_per_pass)
+            winsor_worker_limit = max(1, min(int(winsor_worker_limit), int(mem_orch_global.get("max_winsor_workers", winsor_worker_limit))))
+            if winsor_max_frames_per_pass <= 0:
+                winsor_max_frames_per_pass = int(mem_orch_global.get("max_winsor_frames", 0))
+            else:
+                winsor_max_frames_per_pass = max(8, min(int(winsor_max_frames_per_pass), int(mem_orch_global.get("max_winsor_frames", winsor_max_frames_per_pass))))
+            if winsor_worker_limit != prev_winsor_workers or winsor_max_frames_per_pass != prev_winsor_frames:
+                pcb(
+                    "MEM_ORCH_WINSOR: "
+                    f"workers {prev_winsor_workers}->{winsor_worker_limit} "
+                    f"frames {prev_winsor_frames}->{winsor_max_frames_per_pass} "
+                    f"class={mem_orch_global.get('class')}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+        except Exception:
+            pass
         global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
         global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
         global_wcs_plan["use_align_helpers"] = True
@@ -21233,8 +25598,20 @@ def run_hierarchical_mosaic_classic_legacy(
             "intertile_robust_clip_sigma": intertile_robust_clip_sigma_config,
             "intertile_global_recenter": intertile_global_recenter_config,
             "intertile_recenter_clip": intertile_recenter_clip_tuple,
+            "intertile_affine_blend": float((worker_config_cache or {}).get("intertile_affine_blend", 1.0) or 1.0),
             "use_auto_intertile": use_auto_intertile_config,
             "intertile_force_safe_mode": intertile_force_safe_mode_config,
+            "intertile_prune_k": intertile_prune_k_config,
+            "intertile_prune_weight_mode": intertile_prune_weight_mode_config,
+            "intertile_offset_only_v1": bool((worker_config_cache or {}).get("intertile_offset_only_v1", False)),
+            "intertile_gain_offset_v2": bool((worker_config_cache or {}).get("intertile_gain_offset_v2", False)),
+            "intertile_gain_prior_lambda": float((worker_config_cache or {}).get("intertile_gain_prior_lambda", 0.02) or 0.02),
+            "intertile_gain_clip": (worker_config_cache or {}).get("intertile_gain_clip", (0.90, 1.10)) or (0.90, 1.10),
+            "intertile_offset_clip": (worker_config_cache or {}).get("intertile_offset_clip", (-2000.0, 2000.0)) or (-2000.0, 2000.0),
+            "intertile_pair_gain_clip": (worker_config_cache or {}).get("intertile_pair_gain_clip", (0.5, 2.0)) or (0.5, 2.0),
+            "intertile_pair_offset_abs_max": float((worker_config_cache or {}).get("intertile_pair_offset_abs_max", 5000.0) or 5000.0),
+            "intertile_max_irls_iters": int((worker_config_cache or {}).get("intertile_max_irls_iters", 3) or 3),
+            "intertile_enforce_requested_solver": bool((worker_config_cache or {}).get("intertile_enforce_requested_solver", False)),
             "coadd_use_memmap": coadd_use_memmap_config,
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
@@ -21245,6 +25622,37 @@ def run_hierarchical_mosaic_classic_legacy(
             "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,
             "tile_weight_mode": tile_weight_mode_config,
+            "tile_weight_v4_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_enabled", False)),
+            "tile_weight_v4_curve": str((worker_config_cache or {}).get("tile_weight_v4_curve", "sqrt") or "sqrt"),
+            "tile_weight_v4_strength": float((worker_config_cache or {}).get("tile_weight_v4_strength", 1.0) or 1.0),
+            "tile_weight_v4_min": float((worker_config_cache or {}).get("tile_weight_v4_min", 0.75) or 0.75),
+            "tile_weight_v4_max": float((worker_config_cache or {}).get("tile_weight_v4_max", 1.35) or 1.35),
+            "tile_weight_v4_residual_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_residual_penalty_enabled", False)),
+            "tile_weight_v4_residual_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_residual_penalty_strength", 0.35) or 0.35),
+            "tile_weight_v4_temporal_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_enabled", False)),
+            "tile_weight_v4_temporal_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_strength", 0.20) or 0.20),
+            "tile_weight_v4_temporal_penalty_hours": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_hours", 6.0) or 6.0),
+            "patchwork_suppressor_enabled": bool((worker_config_cache or {}).get("patchwork_suppressor_enabled", False)),
+            "patchwork_suppressor_strength": str((worker_config_cache or {}).get("patchwork_suppressor_strength", "normal") or "normal"),
+            "patchwork_suppressor_sigma_px": float((worker_config_cache or {}).get("patchwork_suppressor_sigma_px", 64.0) or 64.0),
+            "patchwork_suppressor_seam_band_px": int((worker_config_cache or {}).get("patchwork_suppressor_seam_band_px", 160) or 160),
+            "patchwork_suppressor_max_delta": float((worker_config_cache or {}).get("patchwork_suppressor_max_delta", 0.20) or 0.20),
+            "patchwork_suppressor_protect_stars": bool((worker_config_cache or {}).get("patchwork_suppressor_protect_stars", True)),
+            "patchwork_suppressor_only_near_seams": bool((worker_config_cache or {}).get("patchwork_suppressor_only_near_seams", True)),
+            "intertile_underconstrained_guard_enabled": bool((worker_config_cache or {}).get("intertile_underconstrained_guard_enabled", True)),
+            "intertile_underconstrained_max_pairs": int((worker_config_cache or {}).get("intertile_underconstrained_max_pairs", 1) or 1),
+            "intertile_underconstrained_max_active_tiles": int((worker_config_cache or {}).get("intertile_underconstrained_max_active_tiles", 2) or 2),
+            "intertile_underconstrained_force_mode": str((worker_config_cache or {}).get("intertile_underconstrained_force_mode", "offset_only") or "offset_only"),
+            "intertile_underconstrained_gain_clip": (worker_config_cache or {}).get("intertile_underconstrained_gain_clip", (0.85, 1.18)) or (0.85, 1.18),
+            "intertile_underconstrained_offset_clip": (worker_config_cache or {}).get("intertile_underconstrained_offset_clip", (-2000.0, 2000.0)) or (-2000.0, 2000.0),
+            "export_aesthetic_fits": bool((worker_config_cache or {}).get("export_aesthetic_fits", False)),
+            "scientific_fits_suffix": str((worker_config_cache or {}).get("scientific_fits_suffix", "_science") or "_science"),
+            "aesthetic_fits_suffix": str((worker_config_cache or {}).get("aesthetic_fits_suffix", "_aesthetic") or "_aesthetic"),
+            "aesthetic_fits_use_patchwork": bool((worker_config_cache or {}).get("aesthetic_fits_use_patchwork", True)),
+            "aesthetic_hole_fill_enabled": bool((worker_config_cache or {}).get("aesthetic_hole_fill_enabled", True)),
+            "aesthetic_hole_fill_max_radius_px": int((worker_config_cache or {}).get("aesthetic_hole_fill_max_radius_px", 64) or 64),
+            "aesthetic_hole_fill_blend": float((worker_config_cache or {}).get("aesthetic_hole_fill_blend", 0.70) or 0.70),
+            "aesthetic_hole_fill_only_near_seams": bool((worker_config_cache or {}).get("aesthetic_hole_fill_only_near_seams", True)),
             "existing_master_tiles_mode": bool(use_existing_master_tiles_mode),
         }
 
@@ -21876,6 +26284,14 @@ def run_hierarchical_mosaic_classic_legacy(
 
             # Start a lightweight real-time monitor to adapt concurrency while Phase 3 runs
             monitor_stop_evt = threading.Event()
+            runtime_launch_limit: dict[str, Any] = {"value": int(actual_num_workers_ph3), "pause_until": 0.0, "pause_reason": ""}
+            runtime_adapt_lock = threading.Lock()
+            runtime_working_set_limit: dict[str, Any] = {
+                "winsor_frames_per_pass": int(winsor_max_frames_per_pass) if int(winsor_max_frames_per_pass or 0) > 0 else 256,
+                "cpu_rows_per_chunk": None,
+                "gpu_rows_per_chunk": None,
+                "max_chunk_mb": None,
+            }
 
             def _rt_adapt_concurrency():
                 try:
@@ -21885,6 +26301,119 @@ def run_hierarchical_mosaic_classic_legacy(
                 current_ph3_limit = int(actual_num_workers_ph3)
                 current_cache_slots = None
                 default_cache_slots = 2 if os.name == 'nt' else 3
+
+                ram_high_pct = float(getattr(zconfig, "phase3_ram_high_pct", 82.0))
+                ram_low_pct = float(getattr(zconfig, "phase3_ram_low_pct", 72.0))
+                ram_critical_pct = float(getattr(zconfig, "phase3_ram_critical_pct", 88.0))
+                adapt_cooldown_s = float(getattr(zconfig, "phase3_adapt_cooldown_s", 10.0))
+                max_level_changes_per_min = int(getattr(zconfig, "phase3_adapt_max_changes_per_min", 6))
+                pause_seconds = float(getattr(zconfig, "phase3_admission_pause_s", 2.5))
+
+                auto_profile = {}
+                try:
+                    vm_boot = _ps.virtual_memory()
+                    sm_boot = _ps.swap_memory()
+                    total_ram_gb = float(getattr(vm_boot, "total", 0.0)) / (1024.0 ** 3)
+                    swap_total_gb = float(getattr(sm_boot, "total", 0.0)) / (1024.0 ** 3)
+                    swap_used_pct = float(getattr(sm_boot, "percent", 0.0))
+
+                    if total_ram_gb <= 8.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 64.0, 76.0, 83.0, 3.8
+                    elif total_ram_gb <= 12.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 68.0, 79.0, 85.0, 3.2
+                    elif total_ram_gb <= 24.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 70.0, 82.0, 87.0, 2.8
+                    else:
+                        auto_low, auto_high, auto_critical, auto_pause = 72.0, 84.0, 89.0, 2.5
+
+                    if swap_total_gb < 1.0:
+                        auto_low -= 2.0
+                        auto_high -= 2.0
+                        auto_critical -= 2.0
+                        auto_pause = max(auto_pause, 3.8)
+                    elif swap_used_pct >= 70.0:
+                        auto_critical = min(auto_critical, 86.0)
+                        auto_pause = max(auto_pause, 4.0)
+
+                    auto_low = max(50.0, min(auto_low, auto_high - 4.0))
+                    auto_high = max(auto_low + 4.0, min(auto_high, auto_critical - 2.0))
+                    auto_critical = max(auto_high + 2.0, min(95.0, auto_critical))
+
+                    ram_low_pct = min(float(ram_low_pct), float(auto_low))
+                    ram_high_pct = min(float(ram_high_pct), float(auto_high))
+                    ram_critical_pct = min(float(ram_critical_pct), float(auto_critical))
+                    pause_seconds = max(float(pause_seconds), float(auto_pause))
+
+                    auto_profile = {
+                        "total_ram_gb": round(total_ram_gb, 2),
+                        "swap_total_gb": round(swap_total_gb, 2),
+                        "swap_used_pct": round(swap_used_pct, 1),
+                    }
+                except Exception:
+                    auto_profile = {}
+
+                if max_level_changes_per_min < 1:
+                    max_level_changes_per_min = 1
+                if adapt_cooldown_s < 0.0:
+                    adapt_cooldown_s = 0.0
+                if pause_seconds < 0.5:
+                    pause_seconds = 0.5
+
+                try:
+                    if auto_profile:
+                        pcb(
+                            "RAM_ADAPT_RT: auto_profile "
+                            f"ram_low={ram_low_pct:.1f} ram_high={ram_high_pct:.1f} "
+                            f"ram_critical={ram_critical_pct:.1f} pause_s={pause_seconds:.1f} "
+                            f"total_ram_gb={auto_profile.get('total_ram_gb')} "
+                            f"swap_gb={auto_profile.get('swap_total_gb')} "
+                            f"swap_used_pct={auto_profile.get('swap_used_pct')}",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                        )
+                except Exception:
+                    pass
+
+                mem_orch_profile = _phase3_memory_orchestrator_profile(
+                    float(auto_profile.get("total_ram_gb") or 0.0),
+                    float(auto_profile.get("swap_total_gb") or 0.0),
+                    zconfig=zconfig,
+                )
+                try:
+                    pcb(
+                        "MEM_ORCH_PROFILE: "
+                        f"low_ram={int(bool(mem_orch_profile.get('is_low_ram')))} "
+                        f"reserve_mb={float(mem_orch_profile.get('reserve_mb', 0.0)):.0f} "
+                        f"max_workers={int(mem_orch_profile.get('max_workers', 1))} "
+                        f"max_frames={int(mem_orch_profile.get('max_frames_per_pass', 16))} "
+                        f"max_chunk_mb={float(mem_orch_profile.get('max_chunk_mb', 256.0)):.1f}",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                except Exception:
+                    pass
+
+                min_frames_per_pass = max(8, int(getattr(zconfig, "phase3_runtime_min_frames_per_pass", 16)))
+                max_frames_per_pass = max(min_frames_per_pass, int(getattr(zconfig, "phase3_runtime_max_frames_per_pass", runtime_working_set_limit.get("winsor_frames_per_pass", 256))))
+                min_cpu_rows = max(32, int(getattr(zconfig, "phase3_runtime_min_cpu_rows_per_chunk", 96)))
+                min_gpu_rows = max(16, int(getattr(zconfig, "phase3_runtime_min_gpu_rows_per_chunk", 64)))
+                min_chunk_mb = max(32.0, float(getattr(zconfig, "phase3_runtime_min_max_chunk_mb", 256.0)))
+
+                mem_orch_max_workers = max(1, int(mem_orch_profile.get("max_workers", int(actual_num_workers_ph3))))
+                mem_orch_max_cache_slots = max(1, int(mem_orch_profile.get("max_cache_slots", default_cache_slots)))
+                mem_orch_max_frames = max(min_frames_per_pass, int(mem_orch_profile.get("max_frames_per_pass", max_frames_per_pass)))
+                mem_orch_max_cpu_rows = max(min_cpu_rows, int(mem_orch_profile.get("max_cpu_rows_per_chunk", 2048)))
+                mem_orch_max_gpu_rows = max(min_gpu_rows, int(mem_orch_profile.get("max_gpu_rows_per_chunk", 1024)))
+                mem_orch_max_chunk_mb = max(min_chunk_mb, float(mem_orch_profile.get("max_chunk_mb", 4096.0)))
+                mem_orch_reserve_mb = max(384.0, float(mem_orch_profile.get("reserve_mb", 1024.0)))
+
+                max_frames_per_pass = min(max_frames_per_pass, mem_orch_max_frames)
+
+                ram_level = 0
+                last_change_t = 0.0
+                change_times: list[float] = []
+                mem_orch_guard_active = False
+
                 last_io = None
                 last_t = None
                 try:
@@ -21892,13 +26421,17 @@ def run_hierarchical_mosaic_classic_legacy(
                     last_t = time.perf_counter()
                 except Exception:
                     last_io, last_t = None, None
+
                 while not monitor_stop_evt.is_set():
                     time.sleep(1.25)
+                    now_loop = time.monotonic()
+
                     # CPU snapshot
                     try:
                         cpu_pct = _ps.cpu_percent(interval=None)
                     except Exception:
                         cpu_pct = None
+
                     # Disk read throughput MB/s
                     read_mbps = None
                     try:
@@ -21911,8 +26444,27 @@ def run_hierarchical_mosaic_classic_legacy(
                     except Exception:
                         pass
 
+                    # RAM snapshot
+                    ram_used_pct = None
+                    ram_available_mb = None
+                    try:
+                        vm = _ps.virtual_memory()
+                        ram_used_pct = float(getattr(vm, "percent", 0.0))
+                        ram_available_mb = float(getattr(vm, "available", 0.0)) / (1024.0 * 1024.0)
+                    except Exception:
+                        pass
+
                     new_ph3_limit = current_ph3_limit
                     new_cache_slots = current_cache_slots if current_cache_slots is not None else default_cache_slots
+                    with runtime_adapt_lock:
+                        cur_frames_per_pass = int(runtime_working_set_limit.get("winsor_frames_per_pass", 256))
+                        cur_cpu_rows = runtime_working_set_limit.get("cpu_rows_per_chunk")
+                        cur_gpu_rows = runtime_working_set_limit.get("gpu_rows_per_chunk")
+                        cur_max_chunk_mb = runtime_working_set_limit.get("max_chunk_mb")
+                    new_frames_per_pass = cur_frames_per_pass
+                    new_cpu_rows = cur_cpu_rows
+                    new_gpu_rows = cur_gpu_rows
+                    new_max_chunk_mb = cur_max_chunk_mb
 
                     if read_mbps is not None:
                         if os.name == 'nt':
@@ -21941,49 +26493,238 @@ def run_hierarchical_mosaic_classic_legacy(
                         elif cpu_pct <= 45:
                             new_ph3_limit = max(new_ph3_limit, min(int(actual_num_workers_ph3), 3 if os.name == 'nt' else int(actual_num_workers_ph3)))
 
-                    new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
-                    new_cache_slots = max(1, int(new_cache_slots))
+                    ram_transition = None
+                    if ram_used_pct is not None:
+                        prev_level = ram_level
+                        if ram_level <= 0:
+                            if ram_used_pct >= ram_critical_pct:
+                                ram_level = 2
+                            elif ram_used_pct >= ram_high_pct:
+                                ram_level = 1
+                        elif ram_level == 1:
+                            if ram_used_pct >= ram_critical_pct:
+                                ram_level = 2
+                            elif ram_used_pct <= ram_low_pct:
+                                ram_level = 0
+                        else:  # ram_level == 2
+                            if ram_used_pct <= ram_low_pct:
+                                ram_level = 0
+                            elif ram_used_pct <= max(ram_low_pct, ram_high_pct - 2.0):
+                                ram_level = 1
 
-                    try:
-                        if new_ph3_limit != current_ph3_limit:
-                            current_ph3_limit = new_ph3_limit
+                        if ram_level != prev_level:
+                            ram_transition = f"{prev_level}->{ram_level}"
+
+                        if ram_level >= 2:
+                            new_ph3_limit = min(new_ph3_limit, 1)
+                        elif ram_level == 1:
+                            ram_cap = max(1, int(math.ceil(int(actual_num_workers_ph3) * 0.5)))
+                            new_ph3_limit = min(new_ph3_limit, ram_cap)
+
+                    new_ph3_limit = min(int(new_ph3_limit), int(mem_orch_max_workers))
+                    new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
+                    new_cache_slots = max(1, min(int(new_cache_slots), int(mem_orch_max_cache_slots)))
+
+                    if ram_level >= 2:
+                        new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.70)))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, int(math.floor(float(new_cpu_rows) * 0.75)))
+                        elif new_cpu_rows is None:
+                            new_cpu_rows = max(min_cpu_rows, 256)
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, int(math.floor(float(new_gpu_rows) * 0.75)))
+                        elif new_gpu_rows is None:
+                            new_gpu_rows = max(min_gpu_rows, 128)
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, float(new_max_chunk_mb) * 0.75)
+                        elif new_max_chunk_mb is None:
+                            new_max_chunk_mb = max(min_chunk_mb, 512.0)
+                    elif ram_level == 1:
+                        new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.85)))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, int(math.floor(float(new_cpu_rows) * 0.90)))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, int(math.floor(float(new_gpu_rows) * 0.90)))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, float(new_max_chunk_mb) * 0.90)
+                    elif ram_level <= 0:
+                        new_frames_per_pass = min(max_frames_per_pass, max(min_frames_per_pass, int(math.ceil(float(new_frames_per_pass) * 1.10))))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = min(mem_orch_max_cpu_rows, max(min_cpu_rows, int(math.ceil(float(new_cpu_rows) * 1.10))))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = min(mem_orch_max_gpu_rows, max(min_gpu_rows, int(math.ceil(float(new_gpu_rows) * 1.10))))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = min(mem_orch_max_chunk_mb, max(min_chunk_mb, float(new_max_chunk_mb) * 1.10))
+
+                    # Hard reserve guard: avoid OS OOM kill on low-memory hosts.
+                    if ram_available_mb is not None and ram_available_mb < mem_orch_reserve_mb:
+                        new_ph3_limit = 1
+                        new_cache_slots = 1
+                        new_frames_per_pass = max(min_frames_per_pass, min(int(new_frames_per_pass), int(math.floor(float(cur_frames_per_pass) * 0.80))))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, min(int(new_cpu_rows), int(math.floor(float(new_cpu_rows) * 0.80))))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, min(int(new_gpu_rows), int(math.floor(float(new_gpu_rows) * 0.80))))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, min(float(new_max_chunk_mb), float(new_max_chunk_mb) * 0.80))
+                        if not mem_orch_guard_active:
                             try:
-                                global _PH3_CONCURRENCY_SEMAPHORE
-                                _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
-                                _io_dbg = []
-                                if read_mbps is not None:
-                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
-                                if cpu_pct is not None:
-                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
-                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
                                 pcb(
-                                    f"IO_ADAPT_RT: runtime throttle: ph3_workers -> {current_ph3_limit}"
-                                    f" (limits Phase 3 concurrency){_io_dbg_s}",
-                                    prog=None, lvl="INFO_DETAIL"
+                                    "MEM_ORCH_GUARD: reserve_enter "
+                                    f"ram_avail_mb={ram_available_mb:.0f} reserve_mb={mem_orch_reserve_mb:.0f}",
+                                    prog=None,
+                                    lvl="WARN",
                                 )
                             except Exception:
                                 pass
+                            mem_orch_guard_active = True
+                    elif mem_orch_guard_active:
+                        try:
+                            pcb(
+                                "MEM_ORCH_GUARD: reserve_exit "
+                                f"ram_avail_mb={ram_available_mb if ram_available_mb is not None else 'n/a'} reserve_mb={mem_orch_reserve_mb:.0f}",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                            )
+                        except Exception:
+                            pass
+                        mem_orch_guard_active = False
+
+                    budget_change_blocked_reason = None
+                    if new_ph3_limit != current_ph3_limit:
+                        change_times, budget_change_blocked_reason = _phase3_budget_change_block_reason(
+                            now_loop=now_loop,
+                            last_change_t=last_change_t,
+                            change_times=change_times,
+                            adapt_cooldown_s=adapt_cooldown_s,
+                            max_level_changes_per_min=max_level_changes_per_min,
+                        )
+                        if budget_change_blocked_reason:
+                            new_ph3_limit = current_ph3_limit
+
+                    try:
+                        if new_ph3_limit != current_ph3_limit:
+                            previous_limit = current_ph3_limit
+                            current_ph3_limit = new_ph3_limit
+                            try:
+                                runtime_launch_limit["value"] = int(current_ph3_limit)
+                            except Exception:
+                                pass
+                            try:
+                                change_times.append(now_loop)
+                                last_change_t = now_loop
+                            except Exception:
+                                pass
+                            try:
+                                dbg = []
+                                if read_mbps is not None:
+                                    dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                if ram_used_pct is not None:
+                                    dbg.append(f"ram≈{ram_used_pct:.1f}%")
+                                if ram_available_mb is not None:
+                                    dbg.append(f"ram_avail≈{ram_available_mb:.0f}MB")
+                                if ram_transition:
+                                    dbg.append(f"ram_level={ram_transition}")
+                                dbg_s = (" (" + ", ".join(dbg) + ")") if dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: launch_budget {previous_limit} -> {current_ph3_limit}"
+                                    f" (lazy Phase 3 admission){dbg_s}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                            except Exception:
+                                pass
+                        elif budget_change_blocked_reason and ram_level > 0:
+                            try:
+                                pcb(
+                                    f"RAM_ADAPT_RT: launch_budget_hold={current_ph3_limit} "
+                                    f"reason={budget_change_blocked_reason} "
+                                    f"ram_used_pct={ram_used_pct if ram_used_pct is not None else 'n/a'} "
+                                    f"ram_level={ram_level}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                            except Exception:
+                                pass
+
+                        if (
+                            ram_used_pct is not None
+                            and ram_level >= 2
+                            and current_ph3_limit <= 1
+                            and ram_used_pct >= ram_critical_pct
+                        ):
+                            try:
+                                pause_until = float(runtime_launch_limit.get("pause_until", 0.0))
+                            except Exception:
+                                pause_until = 0.0
+                            if pause_until <= now_loop + 0.2:
+                                try:
+                                    runtime_launch_limit["pause_until"] = float(now_loop + pause_seconds)
+                                    runtime_launch_limit["pause_reason"] = "critical_ram"
+                                except Exception:
+                                    pass
+                                try:
+                                    pcb(
+                                        f"RAM_ADAPT_RT: admission_pause seconds={pause_seconds:.1f} "
+                                        f"ram_used_pct={ram_used_pct:.1f} level={ram_level}",
+                                        prog=None,
+                                        lvl="INFO_DETAIL",
+                                    )
+                                except Exception:
+                                    pass
+
                         if (current_cache_slots is None) or (new_cache_slots != current_cache_slots):
                             current_cache_slots = new_cache_slots
                             try:
                                 global _CACHE_IO_SEMAPHORE
                                 _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
-                                _io_dbg = []
+                                dbg = []
                                 if read_mbps is not None:
-                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                    dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
                                 if cpu_pct is not None:
-                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
-                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                    dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                if ram_used_pct is not None:
+                                    dbg.append(f"ram≈{ram_used_pct:.1f}%")
+                                dbg_s = (" (" + ", ".join(dbg) + ")") if dbg else ""
                                 pcb(
                                     f"IO_ADAPT_RT: runtime throttle: cache_read_slots -> {current_cache_slots}"
-                                    f" (limits concurrent cache reads){_io_dbg_s}",
-                                    prog=None, lvl="INFO_DETAIL"
+                                    f" (limits concurrent cache reads){dbg_s}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                            except Exception:
+                                pass
+
+                        ws_changed = (
+                            int(new_frames_per_pass) != int(cur_frames_per_pass)
+                            or (new_cpu_rows != cur_cpu_rows)
+                            or (new_gpu_rows != cur_gpu_rows)
+                            or (new_max_chunk_mb != cur_max_chunk_mb)
+                        )
+                        if ws_changed:
+                            with runtime_adapt_lock:
+                                runtime_working_set_limit["winsor_frames_per_pass"] = int(new_frames_per_pass)
+                                runtime_working_set_limit["cpu_rows_per_chunk"] = int(new_cpu_rows) if isinstance(new_cpu_rows, (int, float)) and int(new_cpu_rows) > 0 else None
+                                runtime_working_set_limit["gpu_rows_per_chunk"] = int(new_gpu_rows) if isinstance(new_gpu_rows, (int, float)) and int(new_gpu_rows) > 0 else None
+                                runtime_working_set_limit["max_chunk_mb"] = float(new_max_chunk_mb) if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0 else None
+                            try:
+                                pcb(
+                                    "RAM_ADAPT_RT: working_set_update "
+                                    f"frames_per_pass={int(new_frames_per_pass)} "
+                                    f"cpu_rows={runtime_working_set_limit.get('cpu_rows_per_chunk')} "
+                                    f"gpu_rows={runtime_working_set_limit.get('gpu_rows_per_chunk')} "
+                                    f"max_chunk_mb={runtime_working_set_limit.get('max_chunk_mb')} "
+                                    f"ram_level={ram_level} "
+                                    f"ram_used_pct={ram_used_pct if ram_used_pct is not None else 'n/a'}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
                                 )
                             except Exception:
                                 pass
                     except Exception:
                         pass
-
             monitor_thread = threading.Thread(target=_rt_adapt_concurrency, name="ZeMosaic_Ph3_RTAdapt", daemon=True)
             monitor_thread.start()
 
@@ -21999,13 +26740,76 @@ def run_hierarchical_mosaic_classic_legacy(
             executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
 
             future_to_tile_id: dict = {}
+            future_to_group_info: dict = {}
+            future_abort_events: dict = {}
+            tile_runtime_state_lock = threading.Lock()
+            tile_last_progress_monotonic: dict[int, float] = {}
+            tile_abort_request_count: dict[int, int] = {}
             tile_cache_paths_unique: dict[int, set[str]] = {}
             cache_refcount: dict[str, int] = {}
             shared_cache_detected = False
             total_removed_cache_files = 0
             total_removed_cache_bytes = 0
+            skip_release_once_tile_ids: set[int] = set()
             pending_futures: set = set()
             next_dynamic_tile_id = num_seestar_stacks_to_process
+
+            watchdog_enabled = bool(getattr(zconfig, "phase3_tile_livelock_watchdog_enabled", True))
+            watchdog_timeout_s = max(45.0, float(getattr(zconfig, "phase3_tile_livelock_timeout_s", 240.0)))
+            watchdog_min_runtime_s = max(10.0, float(getattr(zconfig, "phase3_tile_livelock_min_runtime_s", 90.0)))
+            watchdog_base_critical_pct = float(getattr(zconfig, "phase3_ram_critical_pct", 88.0))
+            watchdog_ram_pct = float(getattr(zconfig, "phase3_tile_livelock_ram_pct", max(90.0, watchdog_base_critical_pct)))
+            watchdog_max_abort_per_tile = max(1, int(getattr(zconfig, "phase3_tile_livelock_max_abort_per_tile", 2)))
+
+            try:
+                vm_watch_boot = psutil.virtual_memory()
+                sm_watch_boot = psutil.swap_memory()
+                total_ram_watch_gb = float(getattr(vm_watch_boot, "total", 0.0)) / (1024.0 ** 3)
+                swap_watch_gb = float(getattr(sm_watch_boot, "total", 0.0)) / (1024.0 ** 3)
+                swap_watch_used_pct = float(getattr(sm_watch_boot, "percent", 0.0))
+
+                if total_ram_watch_gb <= 8.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 170.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 60.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 84.0)
+                elif total_ram_watch_gb <= 12.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 210.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 75.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 86.0)
+                elif total_ram_watch_gb <= 24.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 240.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 90.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 88.0)
+                else:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 300.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 120.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 90.0)
+
+                if swap_watch_gb < 1.0:
+                    watchdog_ram_pct = min(watchdog_ram_pct, 83.0)
+                    watchdog_timeout_s = min(watchdog_timeout_s, 150.0)
+                elif swap_watch_used_pct >= 75.0:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 130.0)
+
+                watchdog_timeout_s = max(45.0, float(watchdog_timeout_s))
+                watchdog_min_runtime_s = max(10.0, min(float(watchdog_min_runtime_s), float(watchdog_timeout_s * 0.85)))
+                watchdog_ram_pct = float(np.clip(float(watchdog_ram_pct), 75.0, 98.0))
+
+                pcb(
+                    "RAM_ADAPT_RT: watchdog_auto_profile "
+                    f"enabled={int(bool(watchdog_enabled))} "
+                    f"timeout_s={watchdog_timeout_s:.1f} "
+                    f"min_runtime_s={watchdog_min_runtime_s:.1f} "
+                    f"ram_pct={watchdog_ram_pct:.1f} "
+                    f"max_abort_per_tile={int(watchdog_max_abort_per_tile)} "
+                    f"total_ram_gb={total_ram_watch_gb:.2f} "
+                    f"swap_gb={swap_watch_gb:.2f} "
+                    f"swap_used_pct={swap_watch_used_pct:.1f}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            except Exception:
+                pass
 
             def _register_tile_cache_paths(tile_id: int, group_info_list: list[dict]) -> None:
                 nonlocal shared_cache_detected
@@ -22085,18 +26889,64 @@ def run_hierarchical_mosaic_classic_legacy(
             def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int, processing_rank: int | None = None) -> None:
                 if cache_retention_mode == "per_tile" and assigned_tile_id not in tile_cache_paths_unique:
                     _register_tile_cache_paths(assigned_tile_id, group_info_list)
+                try:
+                    phase3_tile_nframes[assigned_tile_id] = int(len(group_info_list or []))
+                except Exception:
+                    phase3_tile_nframes[assigned_tile_id] = 0
+                phase3_tile_start_monotonic[assigned_tile_id] = time.monotonic()
                 group_eqmode = _infer_group_eqmode(group_info_list)
-                altaz_cleanup_for_tile = bool(altaz_cleanup_effective_flag) and (group_eqmode == "ALT_AZ")
+                unknown_policy = str(getattr(zconfig, "altaz_unknown_policy", "auto") or "auto").strip().lower()
+                if unknown_policy not in ("auto", "on", "off"):
+                    unknown_policy = "auto"
+                seestar_hint = False
+                try:
+                    seestar_hint = any(_entry_is_seestar(entry) for entry in (group_info_list or []))
+                except Exception:
+                    seestar_hint = False
+                unknown_as_altaz = False
+                if group_eqmode == "UNKNOWN":
+                    if unknown_policy == "on":
+                        unknown_as_altaz = True
+                    elif unknown_policy == "auto":
+                        unknown_as_altaz = bool(seestar_hint)
+                altaz_cleanup_for_tile = bool(altaz_cleanup_effective_flag) and (
+                    group_eqmode == "ALT_AZ" or unknown_as_altaz
+                )
                 try:
                     pcb(
                         f"P3_ALTaz_GATING: tile_id={assigned_tile_id} "
                         f"eqmode={group_eqmode} global_enabled={bool(altaz_cleanup_effective_flag)} "
-                        f"=> tile_enabled={altaz_cleanup_for_tile}",
+                        f"unknown_policy={unknown_policy} seestar_hint={bool(seestar_hint)} "
+                        f"unknown_as_altaz={bool(unknown_as_altaz)} => tile_enabled={altaz_cleanup_for_tile}",
                         prog=None,
                         lvl="DEBUG_DETAIL",
                     )
                 except Exception:
                     pass
+                with runtime_adapt_lock:
+                    runtime_winsor_frames_per_pass = int(runtime_working_set_limit.get("winsor_frames_per_pass", winsor_max_frames_per_pass if int(winsor_max_frames_per_pass or 0) > 0 else 256))
+                    runtime_cpu_rows = runtime_working_set_limit.get("cpu_rows_per_chunk")
+                    runtime_gpu_rows = runtime_working_set_limit.get("gpu_rows_per_chunk")
+                    runtime_max_chunk_mb = runtime_working_set_limit.get("max_chunk_mb")
+
+                base_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
+                runtime_parallel_plan = copy.deepcopy(base_parallel_plan) if isinstance(base_parallel_plan, dict) else {}
+                if not isinstance(runtime_parallel_plan, dict):
+                    runtime_parallel_plan = {}
+                if runtime_cpu_rows is not None:
+                    runtime_parallel_plan["cpu_rows_per_chunk"] = int(runtime_cpu_rows)
+                if runtime_gpu_rows is not None:
+                    runtime_parallel_plan["gpu_rows_per_chunk"] = int(runtime_gpu_rows)
+                if runtime_max_chunk_mb is not None:
+                    runtime_parallel_plan["max_chunk_mb"] = float(runtime_max_chunk_mb)
+
+                tile_abort_event = threading.Event()
+
+                def _heartbeat_cb(tile_id_for_hb: int) -> None:
+                    now_hb = time.monotonic()
+                    with tile_runtime_state_lock:
+                        tile_last_progress_monotonic[int(tile_id_for_hb)] = now_hb
+
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -22124,34 +26974,243 @@ def run_hierarchical_mosaic_classic_legacy(
                     astap_exe_path, astap_data_dir_param, astap_search_radius_config,
                     astap_downsample_config, astap_sensitivity_config, 180,
                     winsor_worker_limit,
-                    winsor_max_frames_per_pass,
+                    runtime_winsor_frames_per_pass,
                     progress_callback,
                     resource_strategy=auto_resource_strategy,
                     center_out_context=center_out_context,
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
-                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    parallel_plan=runtime_parallel_plan,
                     dbg_tile_ids=dbg_tile_ids,
+                    abort_event=tile_abort_event,
+                    heartbeat_callback=_heartbeat_cb,
                 )
                 future_to_tile_id[future] = assigned_tile_id
+                future_to_group_info[future] = list(group_info_list or [])
+                future_abort_events[future] = tile_abort_event
+                with tile_runtime_state_lock:
+                    now_submit = time.monotonic()
+                    tile_last_progress_monotonic[int(assigned_tile_id)] = now_submit
+                    tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
 
+            def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> tuple[int, float]:
+                try:
+                    vm_local = psutil.virtual_memory()
+                    total_ram_gb = float(getattr(vm_local, "total", 0.0)) / (1024.0 ** 3)
+                except Exception:
+                    total_ram_gb = 16.0
+
+                if total_ram_gb <= 8.5:
+                    base_chunk = 48
+                elif total_ram_gb <= 16.5:
+                    base_chunk = 96
+                elif total_ram_gb <= 32.5:
+                    base_chunk = 160
+                elif total_ram_gb <= 64.5:
+                    base_chunk = 256
+                else:
+                    base_chunk = 384
+
+                frame_mb = None
+                try:
+                    for _e in (group_items or []):
+                        if not isinstance(_e, dict):
+                            continue
+                        cache_p = _e.get("path_preprocessed_cache")
+                        if cache_p and _path_exists(cache_p):
+                            frame_mb = float(os.path.getsize(cache_p)) / (1024.0 * 1024.0)
+                            if math.isfinite(frame_mb) and frame_mb > 0.0:
+                                break
+                except Exception:
+                    frame_mb = None
+
+                if isinstance(frame_mb, (int, float)) and math.isfinite(float(frame_mb)) and float(frame_mb) > 0.0:
+                    if frame_mb >= 48.0:
+                        base_chunk = int(max(12, base_chunk * 0.22))
+                    elif frame_mb >= 32.0:
+                        base_chunk = int(max(16, base_chunk * 0.35))
+                    elif frame_mb >= 20.0:
+                        base_chunk = int(max(24, base_chunk * 0.50))
+                    elif frame_mb >= 12.0:
+                        base_chunk = int(max(32, base_chunk * 0.70))
+
+                chunk_cfg = int(getattr(zconfig, "phase3_extreme_group_split_chunk_size", 0) or 0)
+                if chunk_cfg > 0:
+                    base_chunk = chunk_cfg
+                return int(max(12, min(600, base_chunk))), float(total_ram_gb)
+
+            split_threshold_cfg = int(getattr(zconfig, "phase3_extreme_group_split_threshold", 0) or 0)
+            if split_threshold_cfg <= 0:
+                split_threshold_cfg = 1200
+
+            pending_launch_queue: list[tuple[list[dict], int, int | None]] = []
+            extra_tile_id = int(max(tile_id_order) + 1) if tile_id_order else int(len(seestar_stack_groups))
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
+                n_frames_group = int(len(sg_info_list or []))
+                chunk_size, total_ram_gb_for_split = _estimate_phase3_split_chunk_size(sg_info_list)
+                dynamic_threshold = max(16, min(int(split_threshold_cfg), int(max(chunk_size, chunk_size * 1.35))))
+
+                if n_frames_group > dynamic_threshold and chunk_size > 0:
+                    planned_chunks = int(math.ceil(float(n_frames_group) / max(1.0, float(chunk_size))))
+                    try:
+                        pcb(
+                            "P3_EXTREME_GROUP_SPLIT_PLAN: "
+                            f"tile={assigned_tile_id} frames={n_frames_group} "
+                            f"chunk_size={chunk_size} chunks_planned={planned_chunks} "
+                            f"ram_gb≈{total_ram_gb_for_split:.2f} "
+                            "mode=single_tile_adaptive",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    except Exception:
+                        pass
+
                 rank = center_out_context.get_rank(assigned_tile_id) if center_out_context else proc_idx
-                _submit_master_tile_group(sg_info_list, assigned_tile_id, rank)
+                pending_launch_queue.append((sg_info_list, assigned_tile_id, rank))
+
+            try:
+                num_seestar_stacks_to_process = int(len(pending_launch_queue))
+            except Exception:
+                pass
+
+            def _current_launch_budget() -> int:
+                try:
+                    pause_until = float(runtime_launch_limit.get("pause_until", 0.0))
+                except Exception:
+                    pause_until = 0.0
+                if pause_until > time.monotonic():
+                    return 0
+                try:
+                    if runtime_launch_limit.get("pause_reason"):
+                        runtime_launch_limit["pause_reason"] = ""
+                except Exception:
+                    pass
+                try:
+                    resolved = int(runtime_launch_limit.get("value", actual_num_workers_ph3))
+                except Exception:
+                    resolved = int(actual_num_workers_ph3)
+                return max(0, min(int(actual_num_workers_ph3), resolved))
+
+            def _request_livelock_abort_if_needed() -> None:
+                if not watchdog_enabled or not pending_futures:
+                    return
+                try:
+                    vm_watch = psutil.virtual_memory()
+                    ram_pct_watch = float(getattr(vm_watch, "percent", 0.0))
+                except Exception:
+                    return
+                if not math.isfinite(ram_pct_watch) or ram_pct_watch < watchdog_ram_pct:
+                    return
+
+                now_watch = time.monotonic()
+                for fut in list(pending_futures):
+                    tile_id_watch = future_to_tile_id.get(fut)
+                    if tile_id_watch is None:
+                        continue
+                    start_watch = phase3_tile_start_monotonic.get(tile_id_watch, now_watch)
+                    with tile_runtime_state_lock:
+                        last_progress = tile_last_progress_monotonic.get(int(tile_id_watch), start_watch)
+                        current_abort_count = int(tile_abort_request_count.get(int(tile_id_watch), 0))
+                    runtime_s = max(0.0, now_watch - float(start_watch))
+                    stalled_s = max(0.0, now_watch - float(last_progress))
+                    if runtime_s < watchdog_min_runtime_s or stalled_s < watchdog_timeout_s:
+                        continue
+                    if current_abort_count >= watchdog_max_abort_per_tile:
+                        continue
+                    abort_evt = future_abort_events.get(fut)
+                    if abort_evt is None or abort_evt.is_set():
+                        continue
+                    abort_evt.set()
+                    with tile_runtime_state_lock:
+                        tile_abort_request_count[int(tile_id_watch)] = current_abort_count + 1
+                    try:
+                        pcb(
+                            "RAM_ADAPT_RT: livelock_abort_request "
+                            f"tile_id={int(tile_id_watch)} "
+                            f"stall_s={stalled_s:.1f} runtime_s={runtime_s:.1f} "
+                            f"ram_used_pct={ram_pct_watch:.1f} "
+                            f"attempt={current_abort_count + 1}/{watchdog_max_abort_per_tile}",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    except Exception:
+                        pass
+
+            def _drain_launch_queue() -> int:
+                launched = 0
+                launch_budget = _current_launch_budget()
+                if launch_budget <= 0:
+                    return launched
+                while pending_launch_queue and len(pending_futures) < launch_budget:
+                    queued_group, queued_tile_id, queued_rank = pending_launch_queue.pop(0)
+                    _submit_master_tile_group(queued_group, queued_tile_id, queued_rank)
+                    launched += 1
+                return launched
 
             start_time_loop_ph3 = time.time()
             last_time_loop_ph3 = start_time_loop_ph3
             step_times_ph3 = []
 
-            while pending_futures:
-                done_futures, _ = wait(pending_futures, return_when=FIRST_COMPLETED)
+            # Phase3 ETA model: per-master-tile online predictor keyed by frame count.
+            phase3_tile_start_monotonic: dict[int, float] = {}
+            phase3_tile_nframes: dict[int, int] = {}
+            phase3_eta_global_ewma_s: float | None = None
+            phase3_eta_by_frames_ewma_s: dict[int, float] = {}
+            phase3_eta_alpha = 0.25
+
+            def _phase3_predict_tile_seconds(n_frames: int | None) -> float:
+                try:
+                    if n_frames is not None and int(n_frames) in phase3_eta_by_frames_ewma_s:
+                        return float(phase3_eta_by_frames_ewma_s[int(n_frames)])
+                except Exception:
+                    pass
+                if phase3_eta_global_ewma_s is not None:
+                    return float(phase3_eta_global_ewma_s)
+                # Conservative cold-start for first few tiles.
+                return 18.0
+
+            def _phase3_eta_remaining_seconds() -> float:
+                durations: list[float] = []
+                now_m = time.monotonic()
+                for fut in list(pending_futures):
+                    tid = future_to_tile_id.get(fut)
+                    nfr = phase3_tile_nframes.get(tid) if tid is not None else None
+                    est = _phase3_predict_tile_seconds(nfr)
+                    st = phase3_tile_start_monotonic.get(tid) if tid is not None else None
+                    if st is not None:
+                        est = max(0.0, est - max(0.0, now_m - st))
+                    durations.append(est)
+                for queued_group, _queued_tile_id, _queued_rank in pending_launch_queue:
+                    try:
+                        nfr = int(len(queued_group or []))
+                    except Exception:
+                        nfr = None
+                    durations.append(_phase3_predict_tile_seconds(nfr))
+                workers_eff = max(1, _current_launch_budget() or len(pending_futures) or 1)
+                return _estimate_parallel_makespan_seconds(durations, workers_eff)
+
+            _drain_launch_queue()
+
+            while pending_futures or pending_launch_queue:
+                _drain_launch_queue()
+                _request_livelock_abort_if_needed()
+                if not pending_futures:
+                    time.sleep(0.05)
+                    continue
+                done_futures, _ = wait(pending_futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done_futures:
+                    continue
                 for future in done_futures:
                     pending_futures.discard(future)
                     tile_id_for_future = future_to_tile_id.pop(future, None)
+                    original_group_for_future = future_to_group_info.pop(future, None)
+                    future_abort_events.pop(future, None)
                     if tile_id_for_future is None:
                         continue
+                    with tile_runtime_state_lock:
+                        tile_last_progress_monotonic.pop(int(tile_id_for_future), None)
                     tiles_processed_count_ph3 += 1
 
                     pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
@@ -22179,6 +27238,35 @@ def run_hierarchical_mosaic_classic_legacy(
                     now = time.time()
                     step_times_ph3.append(now - last_time_loop_ph3)
                     last_time_loop_ph3 = now
+
+                    # Update online duration model from completed tile runtime.
+                    try:
+                        t_start = phase3_tile_start_monotonic.pop(int(tile_id_for_future), None)
+                    except Exception:
+                        t_start = None
+                    if t_start is not None:
+                        tile_elapsed_s = max(0.0, time.monotonic() - float(t_start))
+                        if math.isfinite(tile_elapsed_s) and tile_elapsed_s > 0.0:
+                            if phase3_eta_global_ewma_s is None:
+                                phase3_eta_global_ewma_s = tile_elapsed_s
+                            else:
+                                phase3_eta_global_ewma_s = (
+                                    (1.0 - phase3_eta_alpha) * float(phase3_eta_global_ewma_s)
+                                    + phase3_eta_alpha * tile_elapsed_s
+                                )
+                            try:
+                                nfr_done = int(phase3_tile_nframes.get(int(tile_id_for_future), 0) or 0)
+                            except Exception:
+                                nfr_done = 0
+                            if nfr_done > 0:
+                                prev_n = phase3_eta_by_frames_ewma_s.get(nfr_done)
+                                if prev_n is None:
+                                    phase3_eta_by_frames_ewma_s[nfr_done] = tile_elapsed_s
+                                else:
+                                    phase3_eta_by_frames_ewma_s[nfr_done] = (
+                                        (1.0 - phase3_eta_alpha) * float(prev_n)
+                                        + phase3_eta_alpha * tile_elapsed_s
+                                    )
 
                     try:
                         main_result, retry_groups = future.result()
@@ -22233,7 +27321,8 @@ def run_hierarchical_mosaic_classic_legacy(
                                     frames=len(filtered_retry_group),
                                 )
                                 retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
-                                _submit_master_tile_group(filtered_retry_group, new_tile_id, retry_rank)
+                                pending_launch_queue.append((filtered_retry_group, new_tile_id, retry_rank))
+                                _drain_launch_queue()
                                 pcb(
                                     f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}",
                                     prog=None,
@@ -22245,14 +27334,71 @@ def run_hierarchical_mosaic_classic_legacy(
                                     except Exception:
                                         pass
                     except Exception as exc_thread_ph3:
-                        pcb(
-                            "run_error_phase3_thread_exception",
-                            prog=prog_step_phase3,
-                            lvl="ERROR",
-                            stack_num=int(tile_id_for_future) + 1,
-                            error=str(exc_thread_ph3),
-                        )
-                        logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+                        if isinstance(exc_thread_ph3, Phase3TileAbortRequested):
+                            pcb(
+                                "run_warn_phase3_tile_abort_requested",
+                                prog=prog_step_phase3,
+                                lvl="WARN",
+                                stack_num=int(tile_id_for_future) + 1,
+                                tile_id=int(tile_id_for_future),
+                                reason=str(exc_thread_ph3),
+                            )
+                            retry_group: list[dict] = []
+                            for raw_info in (original_group_for_future or []):
+                                if isinstance(raw_info, dict):
+                                    info_copy = dict(raw_info)
+                                    info_copy["retry_attempt"] = int(info_copy.get("retry_attempt", 0)) + 1
+                                    info_copy["retry_reason"] = "phase3_livelock_abort"
+                                    retry_group.append(info_copy)
+                                else:
+                                    retry_group.append(raw_info)
+                            if retry_group:
+                                max_retry_attempt = 0
+                                try:
+                                    max_retry_attempt = max(
+                                        int(item.get("retry_attempt", 0))
+                                        for item in retry_group
+                                        if isinstance(item, dict)
+                                    )
+                                except Exception:
+                                    max_retry_attempt = 0
+                                if max_retry_attempt > MAX_ALIGNMENT_RETRY_ATTEMPTS:
+                                    pcb(
+                                        "run_warn_phase3_alignment_retry_abandoned",
+                                        prog=None,
+                                        lvl="WARN",
+                                        tile_id=int(tile_id_for_future),
+                                        attempts=int(max_retry_attempt),
+                                        reason="phase3_livelock_abort",
+                                    )
+                                else:
+                                    # Keep single master-tile identity: retry same tile with tighter adaptive working set.
+                                    try:
+                                        skip_release_once_tile_ids.add(int(tile_id_for_future))
+                                    except Exception:
+                                        pass
+                                    retry_rank = center_out_context.get_rank(int(tile_id_for_future)) if center_out_context else None
+                                    pending_launch_queue.append((retry_group, int(tile_id_for_future), retry_rank))
+                                    pcb(
+                                        "run_info_phase3_retry_submitted",
+                                        prog=None,
+                                        lvl="WARN",
+                                        origin_tile=int(tile_id_for_future),
+                                        new_tile=int(tile_id_for_future),
+                                        frames=len(retry_group),
+                                        attempt=int(max_retry_attempt),
+                                        mode="single_tile_adaptive",
+                                        reason="phase3_livelock_abort",
+                                    )
+                        else:
+                            pcb(
+                                "run_error_phase3_thread_exception",
+                                prog=prog_step_phase3,
+                                lvl="ERROR",
+                                stack_num=int(tile_id_for_future) + 1,
+                                error=str(exc_thread_ph3),
+                            )
+                            logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
                     finally:
                         # Aggressively free CuPy memory pools between tiles to avoid device/pinned host growth
                         try:
@@ -22266,27 +27412,43 @@ def run_hierarchical_mosaic_classic_legacy(
                             pass
 
                     if cache_retention_mode == "per_tile":
-                        removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
-                        total_removed_cache_files += removed_count
-                        total_removed_cache_bytes += removed_bytes
-                        if removed_count or removed_bytes:
-                            freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                        if int(tile_id_for_future) in skip_release_once_tile_ids:
+                            skip_release_once_tile_ids.discard(int(tile_id_for_future))
                             logger.debug(
-                                "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                "Per-tile cache cleanup skipped once for tile %s (pending retry)",
                                 tile_id_for_future,
-                                removed_count,
-                                freed_mb,
                             )
+                        else:
+                            removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
+                            total_removed_cache_files += removed_count
+                            total_removed_cache_bytes += removed_bytes
+                            if removed_count or removed_bytes:
+                                freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                                logger.debug(
+                                    "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                    tile_id_for_future,
+                                    removed_count,
+                                    freed_mb,
+                                )
 
                     if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                          _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
 
                     elapsed_phase3 = time.monotonic() - start_time_phase3
                     time_per_master_tile_creation = elapsed_phase3 / max(1, tiles_processed_count_ph3)
-                    eta_phase3_sec = (num_seestar_stacks_to_process - tiles_processed_count_ph3) * time_per_master_tile_creation
+                    eta_phase3_sec_avg = (num_seestar_stacks_to_process - tiles_processed_count_ph3) * time_per_master_tile_creation
+                    eta_phase3_sec_model = _phase3_eta_remaining_seconds()
                     current_progress_in_run_percent_ph3 = base_progress_phase3 + (tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process)) * PROGRESS_WEIGHT_PHASE3_MASTER_TILES
-                    time_per_percent_point_global_ph3 = (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent_ph3) if current_progress_in_run_percent_ph3 > 0 else (time.monotonic() - start_time_total_run)
-                    total_eta_sec_ph3 = eta_phase3_sec + (100 - current_progress_in_run_percent_ph3) * time_per_percent_point_global_ph3
+                    eta_global_sec_ph3 = _eta_seconds_from_progress(
+                        start_time_total_run,
+                        current_progress_in_run_percent_ph3,
+                    )
+                    eta_phase_model_sec_ph3 = _eta_seconds_from_phase_model(
+                        start_time_total_run,
+                        phase_index=3,
+                        phase_fraction=(tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process)),
+                    )
+                    total_eta_sec_ph3 = max(eta_phase3_sec_avg, eta_phase3_sec_model, eta_global_sec_ph3, eta_phase_model_sec_ph3)
                     update_gui_eta(total_eta_sec_ph3)
 
             # Toutes les futures sont terminées → fermeture propre
@@ -22332,7 +27494,14 @@ def run_hierarchical_mosaic_classic_legacy(
             master_tiles_results_list = [master_tiles_results_list_temp[i] for i in sorted(master_tiles_results_list_temp.keys())]
             del master_tiles_results_list_temp; gc.collect()
             if not master_tiles_results_list:
-                pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
+                recovered = _recover_rejected_master_tiles_for_phase3(
+                    temp_master_tile_storage_dir,
+                    pcb=pcb,
+                )
+                if recovered:
+                    master_tiles_results_list = [recovered[i] for i in sorted(recovered.keys())]
+                else:
+                    pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
 
             current_global_progress = base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
             _log_memory_usage(progress_callback, "Fin Phase 3");
@@ -22436,6 +27605,44 @@ def run_hierarchical_mosaic_classic_legacy(
             )
         pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
 
+        if use_existing_master_tiles_mode and final_mosaic_rgb_equalize_enabled:
+            existing_clip_cfg = worker_config_cache.get(
+                "existing_master_tiles_final_rgb_equalize_gain_clip",
+                (0.90, 1.10),
+            )
+            try:
+                if isinstance(existing_clip_cfg, str):
+                    parts = [p.strip() for p in existing_clip_cfg.replace(";", ",").split(",") if p.strip()]
+                    if len(parts) >= 2:
+                        existing_clip = (float(parts[0]), float(parts[1]))
+                    else:
+                        existing_clip = (0.90, 1.10)
+                elif isinstance(existing_clip_cfg, (list, tuple)) and len(existing_clip_cfg) >= 2:
+                    existing_clip = (float(existing_clip_cfg[0]), float(existing_clip_cfg[1]))
+                else:
+                    existing_clip = (0.90, 1.10)
+            except Exception:
+                existing_clip = (0.90, 1.10)
+            if not (math.isfinite(existing_clip[0]) and math.isfinite(existing_clip[1])):
+                existing_clip = (0.90, 1.10)
+            if existing_clip[0] <= 0 or existing_clip[1] <= 0:
+                existing_clip = (0.90, 1.10)
+            if existing_clip[0] > existing_clip[1]:
+                existing_clip = (existing_clip[1], existing_clip[0])
+            try:
+                setattr(
+                    zconfig,
+                    "final_mosaic_rgb_equalize_gain_clip",
+                    [float(existing_clip[0]), float(existing_clip[1])],
+                )
+                logger.info(
+                    "existing_master_tiles_mode: overriding final RGB-eq gain clip to (%.3f, %.3f)",
+                    float(existing_clip[0]),
+                    float(existing_clip[1]),
+                )
+            except Exception:
+                pass
+
         base_progress_phase4_5 = current_global_progress
         phase45_options = _build_phase45_options_dict(base_progress_phase4_5)
         base_progress_phase5 = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
@@ -22518,7 +27725,7 @@ def run_hierarchical_mosaic_classic_legacy(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic V4.4.1','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic V4.5.0','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
@@ -22712,9 +27919,47 @@ def run_hierarchical_mosaic_classic_legacy(
     else:
         logger.info("[DBE] skipped: disabled by config (final_mosaic_dbe_enabled=False)")
 
+    final_rgb_eq_info: dict[str, Any] | None = None
+    if final_mosaic_rgb_equalize_enabled:
+        if sds_mode_phase5:
+            logger.info("[RGB-EQ] final mosaic skipped: enabled=True but sds_mode_phase5=True")
+        elif final_mosaic_data_HWC is None:
+            logger.info("[RGB-EQ] final mosaic skipped: enabled=True but mosaic buffer is None")
+        else:
+            try:
+                final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
+                    final_mosaic_data_HWC,
+                    zconfig=zconfig,
+                    logger=logger,
+                )
+                if isinstance(final_rgb_eq_info, dict):
+                    try:
+                        _target = float(final_rgb_eq_info.get("target_median", float("nan")))
+                    except Exception:
+                        _target = float("nan")
+                    target_str = f"{_target:.6g}" if math.isfinite(_target) else "nan"
+                    logger.info(
+                        "[RGB-EQ] final mosaic gate: enabled=True applied=%s gains=(%.6f, %.6f, %.6f) target_median=%s",
+                        bool(final_rgb_eq_info.get("applied", False)),
+                        float(final_rgb_eq_info.get("gain_r", 1.0)),
+                        float(final_rgb_eq_info.get("gain_g", 1.0)),
+                        float(final_rgb_eq_info.get("gain_b", 1.0)),
+                        target_str,
+                    )
+                else:
+                    logger.info("[RGB-EQ] final mosaic gate: enabled=True applied=unknown")
+            except Exception as exc:
+                logger.warning(
+                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
+                    exc,
+                )
+    else:
+        logger.info("[RGB-EQ] final mosaic skipped: disabled by config (final_mosaic_rgb_equalize_enabled=False)")
+
     rgb_black_level_info: dict[str, Any] | None = None
     if (
         final_mosaic_black_point_equalize_enabled
+        and float(final_mosaic_black_point_percentile) > 0.0
         and final_mosaic_data_HWC is not None
         and not sds_mode_phase5
     ):
@@ -22731,6 +27976,65 @@ def run_hierarchical_mosaic_classic_legacy(
         if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         legacy_rgb_flag = bool(legacy_rgb_cube_config)
+        save_display_fits_config = bool(getattr(zconfig, "save_display_fits", False))
+
+        _cfg_cache_local = locals().get("worker_config_cache", {})
+        if not isinstance(_cfg_cache_local, dict):
+            _cfg_cache_local = {}
+
+        export_aesthetic_fits_config = _coerce_bool_flag(getattr(zconfig, "export_aesthetic_fits", None))
+        if export_aesthetic_fits_config is None:
+            export_aesthetic_fits_config = _coerce_bool_flag(_cfg_cache_local.get("export_aesthetic_fits", False))
+        if export_aesthetic_fits_config is None:
+            export_aesthetic_fits_config = False
+        export_aesthetic_fits_config = bool(export_aesthetic_fits_config)
+
+        scientific_suffix_cfg = str(getattr(zconfig, "scientific_fits_suffix", _cfg_cache_local.get("scientific_fits_suffix", "_science")) or "_science")
+        aesthetic_suffix_cfg = str(getattr(zconfig, "aesthetic_fits_suffix", _cfg_cache_local.get("aesthetic_fits_suffix", "_aesthetic")) or "_aesthetic")
+
+        def _clean_suffix(val: str, default: str) -> str:
+            sfx = str(val or default).strip()
+            if not sfx:
+                sfx = default
+            if not sfx.startswith("_"):
+                sfx = f"_{sfx}"
+            sfx = "".join(ch for ch in sfx if ch.isalnum() or ch in {"_", "-"})
+            if not sfx:
+                sfx = default
+            return sfx
+
+        scientific_suffix_cfg = _clean_suffix(scientific_suffix_cfg, "_science")
+        aesthetic_suffix_cfg = _clean_suffix(aesthetic_suffix_cfg, "_aesthetic")
+        if aesthetic_suffix_cfg == scientific_suffix_cfg:
+            aesthetic_suffix_cfg = "_aesthetic"
+
+        science_fits_path = final_fits_path
+        aesthetic_fits_path = output_folder_path / f"{output_base_name}{aesthetic_suffix_cfg}.fits"
+        if export_aesthetic_fits_config:
+            science_fits_path = output_folder_path / f"{output_base_name}{scientific_suffix_cfg}.fits"
+
+        aesthetic_hole_fill_enabled_cfg = _coerce_bool_flag(getattr(zconfig, "aesthetic_hole_fill_enabled", None))
+        if aesthetic_hole_fill_enabled_cfg is None:
+            aesthetic_hole_fill_enabled_cfg = _coerce_bool_flag(_cfg_cache_local.get("aesthetic_hole_fill_enabled", True))
+        if aesthetic_hole_fill_enabled_cfg is None:
+            aesthetic_hole_fill_enabled_cfg = True
+        aesthetic_hole_fill_enabled_cfg = bool(aesthetic_hole_fill_enabled_cfg)
+
+        try:
+            aesthetic_hole_fill_max_radius_cfg = int(getattr(zconfig, "aesthetic_hole_fill_max_radius_px", _cfg_cache_local.get("aesthetic_hole_fill_max_radius_px", 64)) or 64)
+        except Exception:
+            aesthetic_hole_fill_max_radius_cfg = 64
+        try:
+            aesthetic_hole_fill_blend_cfg = float(getattr(zconfig, "aesthetic_hole_fill_blend", _cfg_cache_local.get("aesthetic_hole_fill_blend", 0.70)) or 0.70)
+        except Exception:
+            aesthetic_hole_fill_blend_cfg = 0.70
+        aesthetic_hole_fill_only_near_seams_cfg = _coerce_bool_flag(getattr(zconfig, "aesthetic_hole_fill_only_near_seams", None))
+        if aesthetic_hole_fill_only_near_seams_cfg is None:
+            aesthetic_hole_fill_only_near_seams_cfg = _coerce_bool_flag(_cfg_cache_local.get("aesthetic_hole_fill_only_near_seams", True))
+        if aesthetic_hole_fill_only_near_seams_cfg is None:
+            aesthetic_hole_fill_only_near_seams_cfg = True
+        aesthetic_hole_fill_only_near_seams_cfg = bool(aesthetic_hole_fill_only_near_seams_cfg)
+
         # Ensure the final mosaic buffer is a contiguous, writeable ndarray for I/O
         save_array = None
         try:
@@ -22763,6 +28067,12 @@ def run_hierarchical_mosaic_classic_legacy(
             except Exception as exc_alpha:
                 logger.warning("phase6: could not write ALPHA extension: %s", exc_alpha)
 
+        try:
+            final_header["ZMROLE"] = ("SCI", "Output role: SCI or AESTH")
+            final_header["ZMAESTH"] = (False, "Aesthetic-only output")
+        except Exception:
+            pass
+
         is_rgb = (
             isinstance(save_array, np.ndarray)
             and save_array.ndim == 3
@@ -22770,7 +28080,7 @@ def run_hierarchical_mosaic_classic_legacy(
         )
         zemosaic_utils.save_fits_image(
             image_data=save_array,
-            output_path=str(final_fits_path),
+            output_path=str(science_fits_path),
             header=final_header,
             overwrite=True,
             save_as_float=True,
@@ -22779,7 +28089,146 @@ def run_hierarchical_mosaic_classic_legacy(
             axis_order="HWC",
             alpha_mask=alpha_final,
         )
-        _attach_alpha_extension(final_fits_path, log_success=True)
+        _attach_alpha_extension(science_fits_path, log_success=True)
+
+        if export_aesthetic_fits_config:
+            try:
+                aesthetic_header = final_header.copy()
+                aesthetic_header["ZMROLE"] = ("AESTH", "Output role: AESTH or SCI")
+                aesthetic_header["ZMAESTH"] = (True, "Aesthetic-only output")
+                aesthetic_header["ZMHFILL"] = (bool(aesthetic_hole_fill_enabled_cfg), "Aesthetic hole-fill enabled")
+                aesthetic_header["ZMHFRAD"] = (int(max(0, aesthetic_hole_fill_max_radius_cfg)), "Aesthetic hole-fill radius")
+                aesthetic_header["ZMHFBLD"] = (float(aesthetic_hole_fill_blend_cfg), "Aesthetic hole-fill blend")
+
+                aesthetic_array = np.array(save_array, copy=True) if isinstance(save_array, np.ndarray) else None
+                if aesthetic_array is None:
+                    raise RuntimeError("aesthetic source mosaic unavailable")
+
+                if aesthetic_hole_fill_enabled_cfg:
+                    aesthetic_array, aesthetic_fill_info = _apply_aesthetic_hole_fill(
+                        aesthetic_array,
+                        alpha_mask=alpha_final,
+                        coverage_hw=final_mosaic_coverage_HW,
+                        enabled=True,
+                        max_radius_px=int(aesthetic_hole_fill_max_radius_cfg),
+                        blend=float(aesthetic_hole_fill_blend_cfg),
+                        only_near_seams=bool(aesthetic_hole_fill_only_near_seams_cfg),
+                        logger=logger,
+                    )
+                    if isinstance(aesthetic_fill_info, dict):
+                        logger.info(
+                            "[AestheticFill] summary applied=%s hole_px=%s filled_px=%s",
+                            bool(aesthetic_fill_info.get("applied", False)),
+                            aesthetic_fill_info.get("hole_px"),
+                            aesthetic_fill_info.get("filled_px"),
+                        )
+
+                zemosaic_utils.save_fits_image(
+                    image_data=np.ascontiguousarray(aesthetic_array),
+                    output_path=str(aesthetic_fits_path),
+                    header=aesthetic_header,
+                    overwrite=True,
+                    save_as_float=True,
+                    legacy_rgb_cube=legacy_rgb_flag,
+                    progress_callback=progress_callback,
+                    axis_order="HWC",
+                    alpha_mask=alpha_final,
+                )
+                _attach_alpha_extension(aesthetic_fits_path, log_success=False)
+                pcb(
+                    "run_info_phase6_aesthetic_fits_saved",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    filename=_safe_basename(aesthetic_fits_path),
+                )
+            except Exception as exc_aesthetic:
+                pcb(
+                    "run_warn_phase6_aesthetic_fits_failed",
+                    prog=None,
+                    lvl="WARN",
+                    error=str(exc_aesthetic),
+                )
+
+        # Always generate a display-oriented FITS companion (non-scientific stretch)
+        # to improve compatibility with viewers that do not auto-stretch float mosaics.
+        if (
+            bool(save_display_fits_config)
+            and not legacy_rgb_flag
+            and ZEMOSAIC_UTILS_AVAILABLE
+            and hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware")
+        ):
+            display_fits_path = output_folder_path / f"{output_base_name}_display.fits"
+            try:
+                display_src = save_array if isinstance(save_array, np.ndarray) else final_mosaic_data_HWC
+                if display_src is None:
+                    raise RuntimeError("display source mosaic unavailable")
+
+                # Reuse preview-like robust stretch settings for a readable display FITS.
+                disp_p_low = 2.5
+                disp_p_high = 99.8
+                disp_asinh_a = 20.0
+
+                if (
+                    bool(use_gpu_phase5_flag)
+                    and hasattr(zemosaic_utils, "stretch_auto_asifits_like_gpu")
+                    and callable(zemosaic_utils.stretch_auto_asifits_like_gpu)
+                ):
+                    display_stretched = zemosaic_utils.stretch_auto_asifits_like_gpu(
+                        display_src,
+                        p_low=disp_p_low,
+                        p_high=disp_p_high,
+                        asinh_a=disp_asinh_a,
+                        apply_wb=preview_apply_wb,
+                    )
+                elif hasattr(zemosaic_utils, "stretch_auto_asifits_like") and callable(zemosaic_utils.stretch_auto_asifits_like):
+                    display_stretched = zemosaic_utils.stretch_auto_asifits_like(
+                        display_src,
+                        p_low=disp_p_low,
+                        p_high=disp_p_high,
+                        asinh_a=disp_asinh_a,
+                        apply_wb=True,
+                    )
+                else:
+                    display_stretched = None
+
+                if display_stretched is None:
+                    raise RuntimeError("display stretch helper unavailable")
+
+                display_stretched = np.nan_to_num(
+                    np.clip(np.asarray(display_stretched, dtype=np.float32), 0.0, 1.0),
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                )
+
+                display_header = final_header.copy()
+                display_header["ZMDISPF"] = (True, "Display-stretched FITS (non-scientific)")
+                display_header["ZMDPLWR"] = (float(disp_p_low), "Display stretch low percentile")
+                display_header["ZMDPHIG"] = (float(disp_p_high), "Display stretch high percentile")
+                display_header["ZMDPASH"] = (float(disp_asinh_a), "Display stretch asinh parameter")
+
+                zemosaic_utils.write_final_fits_uint16_color_aware(
+                    str(display_fits_path),
+                    display_stretched,
+                    header=display_header,
+                    force_rgb_planes=is_rgb,
+                    legacy_rgb_cube=legacy_rgb_flag,
+                    overwrite=True,
+                )
+                _attach_alpha_extension(display_fits_path, log_success=False)
+                pcb(
+                    "run_info_phase6_display_fits_saved",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    filename=_safe_basename(display_fits_path),
+                )
+            except Exception as e_display:
+                pcb(
+                    "run_warn_phase6_display_fits_failed",
+                    prog=None,
+                    lvl="WARN",
+                    error=str(e_display),
+                )
 
         if (
             bool(save_final_as_uint16_config)
@@ -22834,7 +28283,7 @@ def run_hierarchical_mosaic_classic_legacy(
         logger.info("[Alpha] Final mosaic saved with ALPHA=%s", bool(alpha_final is not None))
 
         current_global_progress = base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE
-        pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=_safe_basename(final_fits_path))
+        pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=_safe_basename(science_fits_path))
 
         if logger.isEnabledFor(logging.DEBUG):
             _dbg_rgb_stats(
@@ -22902,7 +28351,24 @@ def run_hierarchical_mosaic_classic_legacy(
             alpha_preview: np.ndarray | None = None
             try:
                 h_prev, w_prev = int(final_mosaic_data_HWC.shape[0]), int(final_mosaic_data_HWC.shape[1])
-                max_preview_dim = 4000  # cap the longest side for preview
+                _cfg_obj = locals().get("zconfig", None)
+                _cfg_cache = locals().get("worker_config_cache", {})
+                try:
+                    _cfg_cache = _cfg_cache if isinstance(_cfg_cache, dict) else {}
+                except Exception:
+                    _cfg_cache = {}
+                raw_preview_max_dim = (
+                    getattr(_cfg_obj, "preview_png_max_dim", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_max_dim is None:
+                    raw_preview_max_dim = _cfg_cache.get("preview_png_max_dim", 3200)
+                try:
+                    max_preview_dim = int(raw_preview_max_dim)
+                except Exception:
+                    max_preview_dim = 3200
+                max_preview_dim = int(max(1024, min(8000, max_preview_dim)))
                 step_h = max(1, h_prev // max_preview_dim)
                 step_w = max(1, w_prev // max_preview_dim)
                 step = max(step_h, step_w)
@@ -22992,13 +28458,253 @@ def run_hierarchical_mosaic_classic_legacy(
                 # Paramètres pour stretch_auto_asifits_like (à ajuster si besoin)
                 # Ces valeurs sont des exemples, tu devras peut-être les affiner
                 # ou les rendre configurables plus tard.
-                preview_p_low = 2.5  # Percentile pour le point noir (plus élevé que pour asinh seul)
-                preview_p_high = 99.8 # Percentile pour le point blanc initial
-                                      # Facteur 'a' pour le stretch asinh après la normalisation initiale
-                                      # Pour un stretch plus "doux" similaire à ASIFitsView, 'a' peut être plus grand.
-                                      # ASIFitsView utilise souvent un 'midtones balance' (gamma-like) aussi.
-                                      # Un 'a' de 10 comme dans ton code de test est très doux. Essayons 0.5 ou 1.0.
-                preview_asinh_a = 20.0 # Test avec une valeur plus douce pour le 'a' de asinh
+                raw_preview_p_low = (
+                    getattr(_cfg_obj, "preview_png_p_low", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_p_low is None:
+                    raw_preview_p_low = _cfg_cache.get("preview_png_p_low", 1.0)
+                raw_preview_p_high = (
+                    getattr(_cfg_obj, "preview_png_p_high", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_p_high is None:
+                    raw_preview_p_high = _cfg_cache.get("preview_png_p_high", 99.9)
+                raw_preview_asinh_a = (
+                    getattr(_cfg_obj, "preview_png_asinh_a", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_asinh_a is None:
+                    raw_preview_asinh_a = _cfg_cache.get("preview_png_asinh_a", 12.0)
+
+                try:
+                    preview_p_low = float(raw_preview_p_low)
+                except Exception:
+                    preview_p_low = 1.0
+                try:
+                    preview_p_high = float(raw_preview_p_high)
+                except Exception:
+                    preview_p_high = 99.9
+                try:
+                    preview_asinh_a = float(raw_preview_asinh_a)
+                except Exception:
+                    preview_asinh_a = 12.0
+
+                raw_preview_apply_wb = (
+                    getattr(_cfg_obj, "preview_png_apply_wb", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_preview_apply_wb is None:
+                    raw_preview_apply_wb = _cfg_cache.get("preview_png_apply_wb", False)
+                preview_apply_wb = _coerce_bool_flag(raw_preview_apply_wb)
+                if preview_apply_wb is None:
+                    preview_apply_wb = False
+                preview_apply_wb = bool(preview_apply_wb)
+
+                preview_p_low = float(max(0.0, min(20.0, preview_p_low)))
+                preview_p_high = float(max(preview_p_low + 0.1, min(100.0, preview_p_high)))
+                preview_asinh_a = float(max(0.001, min(200.0, preview_asinh_a)))
+                pcb(
+                    "run_info_preview_png_params",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    p_low=preview_p_low,
+                    p_high=preview_p_high,
+                    asinh_a=preview_asinh_a,
+                    max_dim=max_preview_dim,
+                    apply_wb=preview_apply_wb,
+                )
+
+                raw_visual_seam_heal_enabled = (
+                    getattr(_cfg_obj, "visual_seam_heal_enabled", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_enabled is None:
+                    raw_visual_seam_heal_enabled = _cfg_cache.get("visual_seam_heal_enabled", False)
+                visual_seam_heal_enabled = _coerce_bool_flag(raw_visual_seam_heal_enabled)
+                if visual_seam_heal_enabled is None:
+                    visual_seam_heal_enabled = False
+                visual_seam_heal_enabled = bool(visual_seam_heal_enabled)
+
+                raw_visual_seam_heal_strength = (
+                    getattr(_cfg_obj, "visual_seam_heal_strength", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_strength is None:
+                    raw_visual_seam_heal_strength = _cfg_cache.get("visual_seam_heal_strength", 0.45)
+
+                raw_visual_seam_heal_sigma_small = (
+                    getattr(_cfg_obj, "visual_seam_heal_sigma_small", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_sigma_small is None:
+                    raw_visual_seam_heal_sigma_small = _cfg_cache.get("visual_seam_heal_sigma_small", 24.0)
+
+                raw_visual_seam_heal_sigma_large = (
+                    getattr(_cfg_obj, "visual_seam_heal_sigma_large", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_sigma_large is None:
+                    raw_visual_seam_heal_sigma_large = _cfg_cache.get("visual_seam_heal_sigma_large", 96.0)
+
+                raw_visual_seam_heal_seam_sigma = (
+                    getattr(_cfg_obj, "visual_seam_heal_seam_sigma", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_seam_sigma is None:
+                    raw_visual_seam_heal_seam_sigma = _cfg_cache.get("visual_seam_heal_seam_sigma", 2.5)
+
+                raw_visual_seam_heal_max_rel_delta = (
+                    getattr(_cfg_obj, "visual_seam_heal_max_rel_delta", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_max_rel_delta is None:
+                    raw_visual_seam_heal_max_rel_delta = _cfg_cache.get("visual_seam_heal_max_rel_delta", 0.08)
+
+                try:
+                    visual_seam_heal_strength = float(raw_visual_seam_heal_strength)
+                except Exception:
+                    visual_seam_heal_strength = 0.45
+                try:
+                    visual_seam_heal_sigma_small = float(raw_visual_seam_heal_sigma_small)
+                except Exception:
+                    visual_seam_heal_sigma_small = 24.0
+                try:
+                    visual_seam_heal_sigma_large = float(raw_visual_seam_heal_sigma_large)
+                except Exception:
+                    visual_seam_heal_sigma_large = 96.0
+                try:
+                    visual_seam_heal_seam_sigma = float(raw_visual_seam_heal_seam_sigma)
+                except Exception:
+                    visual_seam_heal_seam_sigma = 2.5
+                try:
+                    visual_seam_heal_max_rel_delta = float(raw_visual_seam_heal_max_rel_delta)
+                except Exception:
+                    visual_seam_heal_max_rel_delta = 0.08
+
+                raw_visual_seam_heal_multiscale_enabled = (
+                    getattr(_cfg_obj, "visual_seam_heal_multiscale_enabled", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_multiscale_enabled is None:
+                    raw_visual_seam_heal_multiscale_enabled = _cfg_cache.get("visual_seam_heal_multiscale_enabled", False)
+                visual_seam_heal_multiscale_enabled = _coerce_bool_flag(raw_visual_seam_heal_multiscale_enabled)
+                if visual_seam_heal_multiscale_enabled is None:
+                    visual_seam_heal_multiscale_enabled = False
+                visual_seam_heal_multiscale_enabled = bool(visual_seam_heal_multiscale_enabled)
+
+                raw_visual_seam_heal_multiscale_mid_gain = (
+                    getattr(_cfg_obj, "visual_seam_heal_multiscale_mid_gain", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_multiscale_mid_gain is None:
+                    raw_visual_seam_heal_multiscale_mid_gain = _cfg_cache.get("visual_seam_heal_multiscale_mid_gain", 0.35)
+
+                raw_visual_seam_heal_multiscale_mid_sigma_scale = (
+                    getattr(_cfg_obj, "visual_seam_heal_multiscale_mid_sigma_scale", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_multiscale_mid_sigma_scale is None:
+                    raw_visual_seam_heal_multiscale_mid_sigma_scale = _cfg_cache.get("visual_seam_heal_multiscale_mid_sigma_scale", 0.60)
+
+                raw_visual_seam_heal_multiscale_mid_rel_scale = (
+                    getattr(_cfg_obj, "visual_seam_heal_multiscale_mid_rel_scale", None)
+                    if _cfg_obj is not None
+                    else None
+                )
+                if raw_visual_seam_heal_multiscale_mid_rel_scale is None:
+                    raw_visual_seam_heal_multiscale_mid_rel_scale = _cfg_cache.get("visual_seam_heal_multiscale_mid_rel_scale", 0.70)
+
+                try:
+                    visual_seam_heal_multiscale_mid_gain = float(raw_visual_seam_heal_multiscale_mid_gain)
+                except Exception:
+                    visual_seam_heal_multiscale_mid_gain = 0.35
+                try:
+                    visual_seam_heal_multiscale_mid_sigma_scale = float(raw_visual_seam_heal_multiscale_mid_sigma_scale)
+                except Exception:
+                    visual_seam_heal_multiscale_mid_sigma_scale = 0.60
+                try:
+                    visual_seam_heal_multiscale_mid_rel_scale = float(raw_visual_seam_heal_multiscale_mid_rel_scale)
+                except Exception:
+                    visual_seam_heal_multiscale_mid_rel_scale = 0.70
+
+                if visual_seam_heal_enabled:
+                    coverage_preview = None
+                    if final_mosaic_coverage_HW is not None:
+                        try:
+                            cov_src = np.asarray(final_mosaic_coverage_HW, dtype=np.float32)
+                            if cov_src.ndim > 2:
+                                cov_src = np.squeeze(cov_src)
+                            coverage_preview = cov_src[::step, ::step] if step > 1 else cov_src
+                            if (
+                                coverage_preview is not None
+                                and coverage_preview.shape[:2] != preview_view.shape[:2]
+                            ):
+                                try:
+                                    import cv2  # type: ignore
+
+                                    coverage_preview = cv2.resize(
+                                        coverage_preview,
+                                        (preview_view.shape[1], preview_view.shape[0]),
+                                        interpolation=cv2.INTER_LINEAR,
+                                    )
+                                except Exception:
+                                    coverage_preview = None
+                        except Exception:
+                            coverage_preview = None
+
+                    if visual_seam_heal_multiscale_enabled:
+                        preview_view, seam_heal_info = _apply_visual_seam_heal_multiscale(
+                            preview_view,
+                            alpha_mask=alpha_preview,
+                            coverage_hw=coverage_preview,
+                            strength=visual_seam_heal_strength,
+                            sigma_small=visual_seam_heal_sigma_small,
+                            sigma_large=visual_seam_heal_sigma_large,
+                            seam_sigma=visual_seam_heal_seam_sigma,
+                            max_rel_delta=visual_seam_heal_max_rel_delta,
+                            mid_gain=visual_seam_heal_multiscale_mid_gain,
+                            mid_sigma_scale=visual_seam_heal_multiscale_mid_sigma_scale,
+                            mid_rel_scale=visual_seam_heal_multiscale_mid_rel_scale,
+                            logger=logger,
+                        )
+                        logger.info(
+                            "[SeamHeal] preview gate enabled=True mode=multiscale applied=%s reason=%s",
+                            bool((seam_heal_info or {}).get("applied", False)),
+                            (seam_heal_info or {}).get("reason", ""),
+                        )
+                    else:
+                        preview_view, seam_heal_info = _apply_visual_seam_heal_low_frequency(
+                            preview_view,
+                            alpha_mask=alpha_preview,
+                            coverage_hw=coverage_preview,
+                            strength=visual_seam_heal_strength,
+                            sigma_small=visual_seam_heal_sigma_small,
+                            sigma_large=visual_seam_heal_sigma_large,
+                            seam_sigma=visual_seam_heal_seam_sigma,
+                            max_rel_delta=visual_seam_heal_max_rel_delta,
+                            logger=logger,
+                        )
+                        logger.info(
+                            "[SeamHeal] preview gate enabled=True mode=single applied=%s reason=%s",
+                            bool((seam_heal_info or {}).get("applied", False)),
+                            (seam_heal_info or {}).get("reason", ""),
+                        )
+                else:
+                    logger.info("[SeamHeal] preview gate enabled=False")
 
                 # Prefer GPU stretch when GPU is enabled/available
                 if use_gpu_phase5_flag and hasattr(zemosaic_utils, 'stretch_auto_asifits_like_gpu'):
@@ -23015,7 +28721,7 @@ def run_hierarchical_mosaic_classic_legacy(
                         p_low=preview_p_low,
                         p_high=preview_p_high,
                         asinh_a=preview_asinh_a,
-                        apply_wb=True  # Applique une balance des blancs automatique
+                        apply_wb=preview_apply_wb
                     )
 
                 if m_stretched is not None:
@@ -23278,6 +28984,34 @@ def run_hierarchical_mosaic_classic_legacy(
     gc.collect(); _log_memory_usage(progress_callback, "Fin Run Hierarchical Mosaic (après GC final)")
     _log_alignment_warning_summary()
     telemetry.close()
+    try:
+        vm_end = psutil.virtual_memory()
+        sm_end = psutil.swap_memory()
+        total_ram_gb_end = float(getattr(vm_end, "total", 0.0)) / (1024.0 ** 3)
+        swap_total_gb_end = float(getattr(sm_end, "total", 0.0)) / (1024.0 ** 3)
+        mem_orch_global_end = _memory_orchestrator_profile(total_ram_gb_end, swap_total_gb_end, zconfig=zconfig if 'zconfig' in locals() else None)
+        mem_orch_p3_end = _phase3_memory_orchestrator_profile(total_ram_gb_end, swap_total_gb_end, zconfig=zconfig if 'zconfig' in locals() else None)
+        report_payload = {
+            "schema": "zemosaic.memory_orchestrator_report.v1",
+            "generated_utc": datetime.utcnow().isoformat() + "Z",
+            "run_output_folder": output_folder,
+            "duration_s": float(total_duration_sec),
+            "global_profile": mem_orch_global_end,
+            "phase3_profile": mem_orch_p3_end,
+            "applied_caps": {
+                "winsor_worker_limit": int(locals().get("winsor_worker_limit", 0) or 0),
+                "winsor_max_frames_per_pass": int(locals().get("winsor_max_frames_per_pass", 0) or 0),
+                "assembly_process_workers": int(locals().get("assembly_process_workers_config", 0) or 0),
+                "effective_base_workers": int(locals().get("effective_base_workers", 0) or 0),
+            },
+            "notes": [
+                "Initial unified memory orchestrator report (lot 3).",
+                "Cross-phase hard caps + Phase 3 runtime guard active when configured.",
+            ],
+        }
+        _write_memory_orchestrator_report(output_folder, report_payload, logger=logger, progress_callback=progress_callback)
+    except Exception:
+        pass
     logger.info(f"===== Run Hierarchical Mosaic COMPLETED in {total_duration_sec:.2f}s =====")
 ################################################################################
 ################################################################################
@@ -23581,6 +29315,14 @@ def run_hierarchical_mosaic(
     global_wcs_plan["sds_mode"] = bool(sds_mode_flag)
 
     if (not grid_mode_detected) and (not sds_mode_flag):
+        # Keep prune parameters explicit in classic path (fallback to config cache).
+        # This avoids accidental fallback to legacy defaults (K=8, mode=area).
+        try:
+            intertile_prune_k_config = int(worker_config_cache.get("intertile_prune_k", 8) or 8)
+        except Exception:
+            intertile_prune_k_config = 8
+        intertile_prune_weight_mode_config = str(worker_config_cache.get("intertile_prune_weight_mode", "area") or "area")
+
         logger.info("[Classic] Using legacy classic pipeline from non grid worker")
         return run_hierarchical_mosaic_classic_legacy(
             input_folder=input_folder,
@@ -23651,6 +29393,9 @@ def run_hierarchical_mosaic(
             intertile_global_recenter_config=intertile_global_recenter_config,
             intertile_recenter_clip_config=intertile_recenter_clip_config,
             use_auto_intertile_config=use_auto_intertile_config,
+            intertile_force_safe_mode_config=intertile_force_safe_mode_config,
+            intertile_prune_k_config=intertile_prune_k_config,
+            intertile_prune_weight_mode_config=intertile_prune_weight_mode_config,
             match_background_for_final_config=match_background_for_final_config,
             incremental_feather_parity_config=incremental_feather_parity_config,
             two_pass_coverage_renorm_config=two_pass_coverage_renorm_config,
@@ -23762,6 +29507,7 @@ def run_hierarchical_mosaic(
         cleanup_temp_artifacts_config = True
 
     _configure_worker_logging(logging_level_config, source_hint="qt_gui_dropdown")
+    _attach_run_output_log_handler(output_folder)
 
     try:
         batch_overlap_pct_config = float(worker_config_cache.get("batch_overlap_pct", 0.0))
@@ -23835,11 +29581,14 @@ def run_hierarchical_mosaic(
     for k in ALIGN_WARNING_COUNTS:
         ALIGN_WARNING_COUNTS[k] = 0
     
+    _eta_state_holder = {"value": None}
     def update_gui_eta(eta_seconds_total):
         if progress_callback and callable(progress_callback):
             eta_str = "--:--:--"
             if eta_seconds_total is not None and eta_seconds_total >= 0:
-                h, rem = divmod(int(eta_seconds_total), 3600); m, s = divmod(rem, 60)
+                smoothed = _eta_smooth_seconds(_eta_state_holder.get("value"), eta_seconds_total)
+                _eta_state_holder["value"] = smoothed
+                h, rem = divmod(int(smoothed), 3600); m, s = divmod(rem, 60)
                 eta_str = f"{h:02d}:{m:02d}:{s:02d}"
             pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL")
 
@@ -23906,10 +29655,20 @@ def run_hierarchical_mosaic(
             ctx.setdefault("use_gpu_phase5", bool(use_gpu_phase5))
         except Exception:
             pass
+        try:
+            p3_runtime = _get_p3_gpu_runtime_stats()
+            if isinstance(p3_runtime, dict) and p3_runtime:
+                ctx.update(p3_runtime)
+        except Exception:
+            pass
         if extra:
             ctx.update(extra)
         return ctx
 
+    try:
+        _reset_p3_gpu_runtime_stats()
+    except Exception:
+        pass
     telemetry.maybe_emit_stats(_telemetry_context({"phase_name": "Init", "phase_index": 0}))
 
 
@@ -24693,6 +30452,25 @@ def run_hierarchical_mosaic(
         num_total_raw_files,
         DEFAULT_PHASE_WORKER_RATIO,
     )
+    try:
+        vm_orch = psutil.virtual_memory()
+        sm_orch = psutil.swap_memory()
+        mem_orch_global = _memory_orchestrator_profile(
+            float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+            float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+            zconfig=zconfig,
+        )
+        hard_base = max(1, int(mem_orch_global.get("max_base_workers", actual_num_workers_ph1)))
+        prev_ph1 = int(actual_num_workers_ph1)
+        actual_num_workers_ph1 = max(1, min(int(actual_num_workers_ph1), hard_base))
+        if actual_num_workers_ph1 != prev_ph1:
+            pcb(
+                f"MEM_ORCH_PHASE1: workers_cap {prev_ph1}->{actual_num_workers_ph1} class={mem_orch_global.get('class')}",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
+    except Exception:
+        pass
     pcb(
         f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
         prog=None,
@@ -24844,14 +30622,16 @@ def run_hierarchical_mosaic(
                     current_progress_in_run_percent = base_progress_phase1 + (
                         files_processed_count_ph1 / max(1, num_total_raw_files)
                     ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
-                    time_per_percent_point_global = (
-                        (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent)
-                        if current_progress_in_run_percent > 0
-                        else (time.monotonic() - start_time_total_run)
+                    eta_global_sec = _eta_seconds_from_progress(
+                        start_time_total_run,
+                        current_progress_in_run_percent,
                     )
-                    total_eta_sec = eta_phase1_sec + (
-                        100 - current_progress_in_run_percent
-                    ) * time_per_percent_point_global
+                    eta_phase_model_sec = _eta_seconds_from_phase_model(
+                        start_time_total_run,
+                        phase_index=1,
+                        phase_fraction=(files_processed_count_ph1 / max(1, num_total_raw_files)),
+                    )
+                    total_eta_sec = max(eta_phase1_sec, eta_global_sec, eta_phase_model_sec)
                     update_gui_eta(total_eta_sec)
 
     # Construire la liste finale des informations des fichiers traités avec succès
@@ -25371,6 +31151,32 @@ def run_hierarchical_mosaic(
         candidate = winsor_worker_limit_cfg
     winsor_worker_limit = max(1, min(int(candidate), cpu_total))
     winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
+    try:
+        vm_orch = psutil.virtual_memory()
+        sm_orch = psutil.swap_memory()
+        mem_orch_global = _memory_orchestrator_profile(
+            float(getattr(vm_orch, "total", 0.0)) / (1024.0 ** 3),
+            float(getattr(sm_orch, "total", 0.0)) / (1024.0 ** 3),
+            zconfig=zconfig,
+        )
+        prev_winsor_workers = int(winsor_worker_limit)
+        prev_winsor_frames = int(winsor_max_frames_per_pass)
+        winsor_worker_limit = max(1, min(int(winsor_worker_limit), int(mem_orch_global.get("max_winsor_workers", winsor_worker_limit))))
+        if winsor_max_frames_per_pass <= 0:
+            winsor_max_frames_per_pass = int(mem_orch_global.get("max_winsor_frames", 0))
+        else:
+            winsor_max_frames_per_pass = max(8, min(int(winsor_max_frames_per_pass), int(mem_orch_global.get("max_winsor_frames", winsor_max_frames_per_pass))))
+        if winsor_worker_limit != prev_winsor_workers or winsor_max_frames_per_pass != prev_winsor_frames:
+            pcb(
+                "MEM_ORCH_WINSOR: "
+                f"workers {prev_winsor_workers}->{winsor_worker_limit} "
+                f"frames {prev_winsor_frames}->{winsor_max_frames_per_pass} "
+                f"class={mem_orch_global.get('class')}",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
+    except Exception:
+        pass
     global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
     global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
     global_wcs_plan["use_align_helpers"] = True
@@ -25568,7 +31374,8 @@ def run_hierarchical_mosaic(
     final_alpha_map = None
     sds_fallback_logged = False
     alpha_final: np.ndarray | None = None
-    master_tiles_results_list: list[tuple[str, Any]] = list(existing_master_tiles_results)
+    # SDS/grid pipeline does not build existing-master-tiles preload in this function.
+    master_tiles_results_list: list[tuple[str, Any]] = []
     final_quality_pipeline_cfg = {
         "quality_crop_enabled": bool(quality_crop_enabled_config),
         "quality_crop_band_px": int(quality_crop_band_px_config),
@@ -25666,6 +31473,8 @@ def run_hierarchical_mosaic(
             "intertile_recenter_clip": intertile_recenter_clip_tuple,
             "use_auto_intertile": use_auto_intertile_config,
             "intertile_force_safe_mode": intertile_force_safe_mode_config,
+            "intertile_prune_k": intertile_prune_k_config,
+            "intertile_prune_weight_mode": intertile_prune_weight_mode_config,
             "coadd_use_memmap": coadd_use_memmap_config,
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
@@ -25676,6 +31485,16 @@ def run_hierarchical_mosaic(
             "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,
             "tile_weight_mode": tile_weight_mode_config,
+            "tile_weight_v4_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_enabled", False)),
+            "tile_weight_v4_curve": str((worker_config_cache or {}).get("tile_weight_v4_curve", "sqrt") or "sqrt"),
+            "tile_weight_v4_strength": float((worker_config_cache or {}).get("tile_weight_v4_strength", 1.0) or 1.0),
+            "tile_weight_v4_min": float((worker_config_cache or {}).get("tile_weight_v4_min", 0.75) or 0.75),
+            "tile_weight_v4_max": float((worker_config_cache or {}).get("tile_weight_v4_max", 1.35) or 1.35),
+            "tile_weight_v4_residual_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_residual_penalty_enabled", False)),
+            "tile_weight_v4_residual_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_residual_penalty_strength", 0.35) or 0.35),
+            "tile_weight_v4_temporal_penalty_enabled": bool((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_enabled", False)),
+            "tile_weight_v4_temporal_penalty_strength": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_strength", 0.20) or 0.20),
+            "tile_weight_v4_temporal_penalty_hours": float((worker_config_cache or {}).get("tile_weight_v4_temporal_penalty_hours", 6.0) or 6.0),
         }
 
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:
@@ -26291,6 +32110,14 @@ def run_hierarchical_mosaic(
 
             # Start a lightweight real-time monitor to adapt concurrency while Phase 3 runs
             monitor_stop_evt = threading.Event()
+            runtime_launch_limit: dict[str, Any] = {"value": int(actual_num_workers_ph3), "pause_until": 0.0, "pause_reason": ""}
+            runtime_adapt_lock = threading.Lock()
+            runtime_working_set_limit: dict[str, Any] = {
+                "winsor_frames_per_pass": int(winsor_max_frames_per_pass) if int(winsor_max_frames_per_pass or 0) > 0 else 256,
+                "cpu_rows_per_chunk": None,
+                "gpu_rows_per_chunk": None,
+                "max_chunk_mb": None,
+            }
 
             def _rt_adapt_concurrency():
                 try:
@@ -26300,6 +32127,119 @@ def run_hierarchical_mosaic(
                 current_ph3_limit = int(actual_num_workers_ph3)
                 current_cache_slots = None
                 default_cache_slots = 2 if os.name == 'nt' else 3
+
+                ram_high_pct = float(getattr(zconfig, "phase3_ram_high_pct", 82.0))
+                ram_low_pct = float(getattr(zconfig, "phase3_ram_low_pct", 72.0))
+                ram_critical_pct = float(getattr(zconfig, "phase3_ram_critical_pct", 88.0))
+                adapt_cooldown_s = float(getattr(zconfig, "phase3_adapt_cooldown_s", 10.0))
+                max_level_changes_per_min = int(getattr(zconfig, "phase3_adapt_max_changes_per_min", 6))
+                pause_seconds = float(getattr(zconfig, "phase3_admission_pause_s", 2.5))
+
+                auto_profile = {}
+                try:
+                    vm_boot = _ps.virtual_memory()
+                    sm_boot = _ps.swap_memory()
+                    total_ram_gb = float(getattr(vm_boot, "total", 0.0)) / (1024.0 ** 3)
+                    swap_total_gb = float(getattr(sm_boot, "total", 0.0)) / (1024.0 ** 3)
+                    swap_used_pct = float(getattr(sm_boot, "percent", 0.0))
+
+                    if total_ram_gb <= 8.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 64.0, 76.0, 83.0, 3.8
+                    elif total_ram_gb <= 12.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 68.0, 79.0, 85.0, 3.2
+                    elif total_ram_gb <= 24.5:
+                        auto_low, auto_high, auto_critical, auto_pause = 70.0, 82.0, 87.0, 2.8
+                    else:
+                        auto_low, auto_high, auto_critical, auto_pause = 72.0, 84.0, 89.0, 2.5
+
+                    if swap_total_gb < 1.0:
+                        auto_low -= 2.0
+                        auto_high -= 2.0
+                        auto_critical -= 2.0
+                        auto_pause = max(auto_pause, 3.8)
+                    elif swap_used_pct >= 70.0:
+                        auto_critical = min(auto_critical, 86.0)
+                        auto_pause = max(auto_pause, 4.0)
+
+                    auto_low = max(50.0, min(auto_low, auto_high - 4.0))
+                    auto_high = max(auto_low + 4.0, min(auto_high, auto_critical - 2.0))
+                    auto_critical = max(auto_high + 2.0, min(95.0, auto_critical))
+
+                    ram_low_pct = min(float(ram_low_pct), float(auto_low))
+                    ram_high_pct = min(float(ram_high_pct), float(auto_high))
+                    ram_critical_pct = min(float(ram_critical_pct), float(auto_critical))
+                    pause_seconds = max(float(pause_seconds), float(auto_pause))
+
+                    auto_profile = {
+                        "total_ram_gb": round(total_ram_gb, 2),
+                        "swap_total_gb": round(swap_total_gb, 2),
+                        "swap_used_pct": round(swap_used_pct, 1),
+                    }
+                except Exception:
+                    auto_profile = {}
+
+                if max_level_changes_per_min < 1:
+                    max_level_changes_per_min = 1
+                if adapt_cooldown_s < 0.0:
+                    adapt_cooldown_s = 0.0
+                if pause_seconds < 0.5:
+                    pause_seconds = 0.5
+
+                try:
+                    if auto_profile:
+                        pcb(
+                            "RAM_ADAPT_RT: auto_profile "
+                            f"ram_low={ram_low_pct:.1f} ram_high={ram_high_pct:.1f} "
+                            f"ram_critical={ram_critical_pct:.1f} pause_s={pause_seconds:.1f} "
+                            f"total_ram_gb={auto_profile.get('total_ram_gb')} "
+                            f"swap_gb={auto_profile.get('swap_total_gb')} "
+                            f"swap_used_pct={auto_profile.get('swap_used_pct')}",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                        )
+                except Exception:
+                    pass
+
+                mem_orch_profile = _phase3_memory_orchestrator_profile(
+                    float(auto_profile.get("total_ram_gb") or 0.0),
+                    float(auto_profile.get("swap_total_gb") or 0.0),
+                    zconfig=zconfig,
+                )
+                try:
+                    pcb(
+                        "MEM_ORCH_PROFILE: "
+                        f"low_ram={int(bool(mem_orch_profile.get('is_low_ram')))} "
+                        f"reserve_mb={float(mem_orch_profile.get('reserve_mb', 0.0)):.0f} "
+                        f"max_workers={int(mem_orch_profile.get('max_workers', 1))} "
+                        f"max_frames={int(mem_orch_profile.get('max_frames_per_pass', 16))} "
+                        f"max_chunk_mb={float(mem_orch_profile.get('max_chunk_mb', 256.0)):.1f}",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                except Exception:
+                    pass
+
+                min_frames_per_pass = max(8, int(getattr(zconfig, "phase3_runtime_min_frames_per_pass", 16)))
+                max_frames_per_pass = max(min_frames_per_pass, int(getattr(zconfig, "phase3_runtime_max_frames_per_pass", runtime_working_set_limit.get("winsor_frames_per_pass", 256))))
+                min_cpu_rows = max(32, int(getattr(zconfig, "phase3_runtime_min_cpu_rows_per_chunk", 96)))
+                min_gpu_rows = max(16, int(getattr(zconfig, "phase3_runtime_min_gpu_rows_per_chunk", 64)))
+                min_chunk_mb = max(32.0, float(getattr(zconfig, "phase3_runtime_min_max_chunk_mb", 256.0)))
+
+                mem_orch_max_workers = max(1, int(mem_orch_profile.get("max_workers", int(actual_num_workers_ph3))))
+                mem_orch_max_cache_slots = max(1, int(mem_orch_profile.get("max_cache_slots", default_cache_slots)))
+                mem_orch_max_frames = max(min_frames_per_pass, int(mem_orch_profile.get("max_frames_per_pass", max_frames_per_pass)))
+                mem_orch_max_cpu_rows = max(min_cpu_rows, int(mem_orch_profile.get("max_cpu_rows_per_chunk", 2048)))
+                mem_orch_max_gpu_rows = max(min_gpu_rows, int(mem_orch_profile.get("max_gpu_rows_per_chunk", 1024)))
+                mem_orch_max_chunk_mb = max(min_chunk_mb, float(mem_orch_profile.get("max_chunk_mb", 4096.0)))
+                mem_orch_reserve_mb = max(384.0, float(mem_orch_profile.get("reserve_mb", 1024.0)))
+
+                max_frames_per_pass = min(max_frames_per_pass, mem_orch_max_frames)
+
+                ram_level = 0
+                last_change_t = 0.0
+                change_times: list[float] = []
+                mem_orch_guard_active = False
+
                 last_io = None
                 last_t = None
                 try:
@@ -26307,13 +32247,17 @@ def run_hierarchical_mosaic(
                     last_t = time.perf_counter()
                 except Exception:
                     last_io, last_t = None, None
+
                 while not monitor_stop_evt.is_set():
                     time.sleep(1.25)
+                    now_loop = time.monotonic()
+
                     # CPU snapshot
                     try:
                         cpu_pct = _ps.cpu_percent(interval=None)
                     except Exception:
                         cpu_pct = None
+
                     # Disk read throughput MB/s
                     read_mbps = None
                     try:
@@ -26326,8 +32270,27 @@ def run_hierarchical_mosaic(
                     except Exception:
                         pass
 
+                    # RAM snapshot
+                    ram_used_pct = None
+                    ram_available_mb = None
+                    try:
+                        vm = _ps.virtual_memory()
+                        ram_used_pct = float(getattr(vm, "percent", 0.0))
+                        ram_available_mb = float(getattr(vm, "available", 0.0)) / (1024.0 * 1024.0)
+                    except Exception:
+                        pass
+
                     new_ph3_limit = current_ph3_limit
                     new_cache_slots = current_cache_slots if current_cache_slots is not None else default_cache_slots
+                    with runtime_adapt_lock:
+                        cur_frames_per_pass = int(runtime_working_set_limit.get("winsor_frames_per_pass", 256))
+                        cur_cpu_rows = runtime_working_set_limit.get("cpu_rows_per_chunk")
+                        cur_gpu_rows = runtime_working_set_limit.get("gpu_rows_per_chunk")
+                        cur_max_chunk_mb = runtime_working_set_limit.get("max_chunk_mb")
+                    new_frames_per_pass = cur_frames_per_pass
+                    new_cpu_rows = cur_cpu_rows
+                    new_gpu_rows = cur_gpu_rows
+                    new_max_chunk_mb = cur_max_chunk_mb
 
                     if read_mbps is not None:
                         if os.name == 'nt':
@@ -26356,49 +32319,238 @@ def run_hierarchical_mosaic(
                         elif cpu_pct <= 45:
                             new_ph3_limit = max(new_ph3_limit, min(int(actual_num_workers_ph3), 3 if os.name == 'nt' else int(actual_num_workers_ph3)))
 
-                    new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
-                    new_cache_slots = max(1, int(new_cache_slots))
+                    ram_transition = None
+                    if ram_used_pct is not None:
+                        prev_level = ram_level
+                        if ram_level <= 0:
+                            if ram_used_pct >= ram_critical_pct:
+                                ram_level = 2
+                            elif ram_used_pct >= ram_high_pct:
+                                ram_level = 1
+                        elif ram_level == 1:
+                            if ram_used_pct >= ram_critical_pct:
+                                ram_level = 2
+                            elif ram_used_pct <= ram_low_pct:
+                                ram_level = 0
+                        else:  # ram_level == 2
+                            if ram_used_pct <= ram_low_pct:
+                                ram_level = 0
+                            elif ram_used_pct <= max(ram_low_pct, ram_high_pct - 2.0):
+                                ram_level = 1
 
-                    try:
-                        if new_ph3_limit != current_ph3_limit:
-                            current_ph3_limit = new_ph3_limit
+                        if ram_level != prev_level:
+                            ram_transition = f"{prev_level}->{ram_level}"
+
+                        if ram_level >= 2:
+                            new_ph3_limit = min(new_ph3_limit, 1)
+                        elif ram_level == 1:
+                            ram_cap = max(1, int(math.ceil(int(actual_num_workers_ph3) * 0.5)))
+                            new_ph3_limit = min(new_ph3_limit, ram_cap)
+
+                    new_ph3_limit = min(int(new_ph3_limit), int(mem_orch_max_workers))
+                    new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
+                    new_cache_slots = max(1, min(int(new_cache_slots), int(mem_orch_max_cache_slots)))
+
+                    if ram_level >= 2:
+                        new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.70)))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, int(math.floor(float(new_cpu_rows) * 0.75)))
+                        elif new_cpu_rows is None:
+                            new_cpu_rows = max(min_cpu_rows, 256)
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, int(math.floor(float(new_gpu_rows) * 0.75)))
+                        elif new_gpu_rows is None:
+                            new_gpu_rows = max(min_gpu_rows, 128)
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, float(new_max_chunk_mb) * 0.75)
+                        elif new_max_chunk_mb is None:
+                            new_max_chunk_mb = max(min_chunk_mb, 512.0)
+                    elif ram_level == 1:
+                        new_frames_per_pass = max(min_frames_per_pass, int(math.floor(float(new_frames_per_pass) * 0.85)))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, int(math.floor(float(new_cpu_rows) * 0.90)))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, int(math.floor(float(new_gpu_rows) * 0.90)))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, float(new_max_chunk_mb) * 0.90)
+                    elif ram_level <= 0:
+                        new_frames_per_pass = min(max_frames_per_pass, max(min_frames_per_pass, int(math.ceil(float(new_frames_per_pass) * 1.10))))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = min(mem_orch_max_cpu_rows, max(min_cpu_rows, int(math.ceil(float(new_cpu_rows) * 1.10))))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = min(mem_orch_max_gpu_rows, max(min_gpu_rows, int(math.ceil(float(new_gpu_rows) * 1.10))))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = min(mem_orch_max_chunk_mb, max(min_chunk_mb, float(new_max_chunk_mb) * 1.10))
+
+                    # Hard reserve guard: avoid OS OOM kill on low-memory hosts.
+                    if ram_available_mb is not None and ram_available_mb < mem_orch_reserve_mb:
+                        new_ph3_limit = 1
+                        new_cache_slots = 1
+                        new_frames_per_pass = max(min_frames_per_pass, min(int(new_frames_per_pass), int(math.floor(float(cur_frames_per_pass) * 0.80))))
+                        if isinstance(new_cpu_rows, (int, float)) and new_cpu_rows > 0:
+                            new_cpu_rows = max(min_cpu_rows, min(int(new_cpu_rows), int(math.floor(float(new_cpu_rows) * 0.80))))
+                        if isinstance(new_gpu_rows, (int, float)) and new_gpu_rows > 0:
+                            new_gpu_rows = max(min_gpu_rows, min(int(new_gpu_rows), int(math.floor(float(new_gpu_rows) * 0.80))))
+                        if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0:
+                            new_max_chunk_mb = max(min_chunk_mb, min(float(new_max_chunk_mb), float(new_max_chunk_mb) * 0.80))
+                        if not mem_orch_guard_active:
                             try:
-                                global _PH3_CONCURRENCY_SEMAPHORE
-                                _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
-                                _io_dbg = []
-                                if read_mbps is not None:
-                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
-                                if cpu_pct is not None:
-                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
-                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
                                 pcb(
-                                    f"IO_ADAPT_RT: runtime throttle: ph3_workers -> {current_ph3_limit}"
-                                    f" (limits Phase 3 concurrency){_io_dbg_s}",
-                                    prog=None, lvl="INFO_DETAIL"
+                                    "MEM_ORCH_GUARD: reserve_enter "
+                                    f"ram_avail_mb={ram_available_mb:.0f} reserve_mb={mem_orch_reserve_mb:.0f}",
+                                    prog=None,
+                                    lvl="WARN",
                                 )
                             except Exception:
                                 pass
+                            mem_orch_guard_active = True
+                    elif mem_orch_guard_active:
+                        try:
+                            pcb(
+                                "MEM_ORCH_GUARD: reserve_exit "
+                                f"ram_avail_mb={ram_available_mb if ram_available_mb is not None else 'n/a'} reserve_mb={mem_orch_reserve_mb:.0f}",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                            )
+                        except Exception:
+                            pass
+                        mem_orch_guard_active = False
+
+                    budget_change_blocked_reason = None
+                    if new_ph3_limit != current_ph3_limit:
+                        change_times, budget_change_blocked_reason = _phase3_budget_change_block_reason(
+                            now_loop=now_loop,
+                            last_change_t=last_change_t,
+                            change_times=change_times,
+                            adapt_cooldown_s=adapt_cooldown_s,
+                            max_level_changes_per_min=max_level_changes_per_min,
+                        )
+                        if budget_change_blocked_reason:
+                            new_ph3_limit = current_ph3_limit
+
+                    try:
+                        if new_ph3_limit != current_ph3_limit:
+                            previous_limit = current_ph3_limit
+                            current_ph3_limit = new_ph3_limit
+                            try:
+                                runtime_launch_limit["value"] = int(current_ph3_limit)
+                            except Exception:
+                                pass
+                            try:
+                                change_times.append(now_loop)
+                                last_change_t = now_loop
+                            except Exception:
+                                pass
+                            try:
+                                dbg = []
+                                if read_mbps is not None:
+                                    dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                if cpu_pct is not None:
+                                    dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                if ram_used_pct is not None:
+                                    dbg.append(f"ram≈{ram_used_pct:.1f}%")
+                                if ram_available_mb is not None:
+                                    dbg.append(f"ram_avail≈{ram_available_mb:.0f}MB")
+                                if ram_transition:
+                                    dbg.append(f"ram_level={ram_transition}")
+                                dbg_s = (" (" + ", ".join(dbg) + ")") if dbg else ""
+                                pcb(
+                                    f"IO_ADAPT_RT: launch_budget {previous_limit} -> {current_ph3_limit}"
+                                    f" (lazy Phase 3 admission){dbg_s}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                            except Exception:
+                                pass
+                        elif budget_change_blocked_reason and ram_level > 0:
+                            try:
+                                pcb(
+                                    f"RAM_ADAPT_RT: launch_budget_hold={current_ph3_limit} "
+                                    f"reason={budget_change_blocked_reason} "
+                                    f"ram_used_pct={ram_used_pct if ram_used_pct is not None else 'n/a'} "
+                                    f"ram_level={ram_level}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                            except Exception:
+                                pass
+
+                        if (
+                            ram_used_pct is not None
+                            and ram_level >= 2
+                            and current_ph3_limit <= 1
+                            and ram_used_pct >= ram_critical_pct
+                        ):
+                            try:
+                                pause_until = float(runtime_launch_limit.get("pause_until", 0.0))
+                            except Exception:
+                                pause_until = 0.0
+                            if pause_until <= now_loop + 0.2:
+                                try:
+                                    runtime_launch_limit["pause_until"] = float(now_loop + pause_seconds)
+                                    runtime_launch_limit["pause_reason"] = "critical_ram"
+                                except Exception:
+                                    pass
+                                try:
+                                    pcb(
+                                        f"RAM_ADAPT_RT: admission_pause seconds={pause_seconds:.1f} "
+                                        f"ram_used_pct={ram_used_pct:.1f} level={ram_level}",
+                                        prog=None,
+                                        lvl="INFO_DETAIL",
+                                    )
+                                except Exception:
+                                    pass
+
                         if (current_cache_slots is None) or (new_cache_slots != current_cache_slots):
                             current_cache_slots = new_cache_slots
                             try:
                                 global _CACHE_IO_SEMAPHORE
                                 _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
-                                _io_dbg = []
+                                dbg = []
                                 if read_mbps is not None:
-                                    _io_dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
+                                    dbg.append(f"disk_read≈{read_mbps:.0f}MB/s")
                                 if cpu_pct is not None:
-                                    _io_dbg.append(f"cpu≈{cpu_pct:.0f}%")
-                                _io_dbg_s = (" (" + ", ".join(_io_dbg) + ")") if _io_dbg else ""
+                                    dbg.append(f"cpu≈{cpu_pct:.0f}%")
+                                if ram_used_pct is not None:
+                                    dbg.append(f"ram≈{ram_used_pct:.1f}%")
+                                dbg_s = (" (" + ", ".join(dbg) + ")") if dbg else ""
                                 pcb(
                                     f"IO_ADAPT_RT: runtime throttle: cache_read_slots -> {current_cache_slots}"
-                                    f" (limits concurrent cache reads){_io_dbg_s}",
-                                    prog=None, lvl="INFO_DETAIL"
+                                    f" (limits concurrent cache reads){dbg_s}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                            except Exception:
+                                pass
+
+                        ws_changed = (
+                            int(new_frames_per_pass) != int(cur_frames_per_pass)
+                            or (new_cpu_rows != cur_cpu_rows)
+                            or (new_gpu_rows != cur_gpu_rows)
+                            or (new_max_chunk_mb != cur_max_chunk_mb)
+                        )
+                        if ws_changed:
+                            with runtime_adapt_lock:
+                                runtime_working_set_limit["winsor_frames_per_pass"] = int(new_frames_per_pass)
+                                runtime_working_set_limit["cpu_rows_per_chunk"] = int(new_cpu_rows) if isinstance(new_cpu_rows, (int, float)) and int(new_cpu_rows) > 0 else None
+                                runtime_working_set_limit["gpu_rows_per_chunk"] = int(new_gpu_rows) if isinstance(new_gpu_rows, (int, float)) and int(new_gpu_rows) > 0 else None
+                                runtime_working_set_limit["max_chunk_mb"] = float(new_max_chunk_mb) if isinstance(new_max_chunk_mb, (int, float)) and float(new_max_chunk_mb) > 0 else None
+                            try:
+                                pcb(
+                                    "RAM_ADAPT_RT: working_set_update "
+                                    f"frames_per_pass={int(new_frames_per_pass)} "
+                                    f"cpu_rows={runtime_working_set_limit.get('cpu_rows_per_chunk')} "
+                                    f"gpu_rows={runtime_working_set_limit.get('gpu_rows_per_chunk')} "
+                                    f"max_chunk_mb={runtime_working_set_limit.get('max_chunk_mb')} "
+                                    f"ram_level={ram_level} "
+                                    f"ram_used_pct={ram_used_pct if ram_used_pct is not None else 'n/a'}",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
                                 )
                             except Exception:
                                 pass
                     except Exception:
                         pass
-
             monitor_thread = threading.Thread(target=_rt_adapt_concurrency, name="ZeMosaic_Ph3_RTAdapt", daemon=True)
             monitor_thread.start()
 
@@ -26410,13 +32562,76 @@ def run_hierarchical_mosaic(
             executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
 
             future_to_tile_id: dict = {}
+            future_to_group_info: dict = {}
+            future_abort_events: dict = {}
+            tile_runtime_state_lock = threading.Lock()
+            tile_last_progress_monotonic: dict[int, float] = {}
+            tile_abort_request_count: dict[int, int] = {}
             tile_cache_paths_unique: dict[int, set[str]] = {}
             cache_refcount: dict[str, int] = {}
             shared_cache_detected = False
             total_removed_cache_files = 0
             total_removed_cache_bytes = 0
+            skip_release_once_tile_ids: set[int] = set()
             pending_futures: set = set()
             next_dynamic_tile_id = num_seestar_stacks_to_process
+
+            watchdog_enabled = bool(getattr(zconfig, "phase3_tile_livelock_watchdog_enabled", True))
+            watchdog_timeout_s = max(45.0, float(getattr(zconfig, "phase3_tile_livelock_timeout_s", 240.0)))
+            watchdog_min_runtime_s = max(10.0, float(getattr(zconfig, "phase3_tile_livelock_min_runtime_s", 90.0)))
+            watchdog_base_critical_pct = float(getattr(zconfig, "phase3_ram_critical_pct", 88.0))
+            watchdog_ram_pct = float(getattr(zconfig, "phase3_tile_livelock_ram_pct", max(90.0, watchdog_base_critical_pct)))
+            watchdog_max_abort_per_tile = max(1, int(getattr(zconfig, "phase3_tile_livelock_max_abort_per_tile", 2)))
+
+            try:
+                vm_watch_boot = psutil.virtual_memory()
+                sm_watch_boot = psutil.swap_memory()
+                total_ram_watch_gb = float(getattr(vm_watch_boot, "total", 0.0)) / (1024.0 ** 3)
+                swap_watch_gb = float(getattr(sm_watch_boot, "total", 0.0)) / (1024.0 ** 3)
+                swap_watch_used_pct = float(getattr(sm_watch_boot, "percent", 0.0))
+
+                if total_ram_watch_gb <= 8.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 170.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 60.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 84.0)
+                elif total_ram_watch_gb <= 12.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 210.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 75.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 86.0)
+                elif total_ram_watch_gb <= 24.5:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 240.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 90.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 88.0)
+                else:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 300.0)
+                    watchdog_min_runtime_s = min(watchdog_min_runtime_s, 120.0)
+                    watchdog_ram_pct = min(watchdog_ram_pct, 90.0)
+
+                if swap_watch_gb < 1.0:
+                    watchdog_ram_pct = min(watchdog_ram_pct, 83.0)
+                    watchdog_timeout_s = min(watchdog_timeout_s, 150.0)
+                elif swap_watch_used_pct >= 75.0:
+                    watchdog_timeout_s = min(watchdog_timeout_s, 130.0)
+
+                watchdog_timeout_s = max(45.0, float(watchdog_timeout_s))
+                watchdog_min_runtime_s = max(10.0, min(float(watchdog_min_runtime_s), float(watchdog_timeout_s * 0.85)))
+                watchdog_ram_pct = float(np.clip(float(watchdog_ram_pct), 75.0, 98.0))
+
+                pcb(
+                    "RAM_ADAPT_RT: watchdog_auto_profile "
+                    f"enabled={int(bool(watchdog_enabled))} "
+                    f"timeout_s={watchdog_timeout_s:.1f} "
+                    f"min_runtime_s={watchdog_min_runtime_s:.1f} "
+                    f"ram_pct={watchdog_ram_pct:.1f} "
+                    f"max_abort_per_tile={int(watchdog_max_abort_per_tile)} "
+                    f"total_ram_gb={total_ram_watch_gb:.2f} "
+                    f"swap_gb={swap_watch_gb:.2f} "
+                    f"swap_used_pct={swap_watch_used_pct:.1f}",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            except Exception:
+                pass
 
             def _register_tile_cache_paths(tile_id: int, group_info_list: list[dict]) -> None:
                 nonlocal shared_cache_detected
@@ -26496,18 +32711,64 @@ def run_hierarchical_mosaic(
             def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int, processing_rank: int | None = None) -> None:
                 if cache_retention_mode == "per_tile" and assigned_tile_id not in tile_cache_paths_unique:
                     _register_tile_cache_paths(assigned_tile_id, group_info_list)
+                try:
+                    phase3_tile_nframes[assigned_tile_id] = int(len(group_info_list or []))
+                except Exception:
+                    phase3_tile_nframes[assigned_tile_id] = 0
+                phase3_tile_start_monotonic[assigned_tile_id] = time.monotonic()
                 group_eqmode = _infer_group_eqmode(group_info_list)
-                altaz_cleanup_for_tile = bool(altaz_cleanup_enabled_config) and (group_eqmode == "ALT_AZ")
+                unknown_policy = str(getattr(zconfig, "altaz_unknown_policy", "auto") or "auto").strip().lower()
+                if unknown_policy not in ("auto", "on", "off"):
+                    unknown_policy = "auto"
+                seestar_hint = False
+                try:
+                    seestar_hint = any(_entry_is_seestar(entry) for entry in (group_info_list or []))
+                except Exception:
+                    seestar_hint = False
+                unknown_as_altaz = False
+                if group_eqmode == "UNKNOWN":
+                    if unknown_policy == "on":
+                        unknown_as_altaz = True
+                    elif unknown_policy == "auto":
+                        unknown_as_altaz = bool(seestar_hint)
+                altaz_cleanup_for_tile = bool(altaz_cleanup_enabled_config) and (
+                    group_eqmode == "ALT_AZ" or unknown_as_altaz
+                )
                 try:
                     pcb(
                         f"P3_ALTaz_GATING: tile_id={assigned_tile_id} "
                         f"eqmode={group_eqmode} global_enabled={bool(altaz_cleanup_enabled_config)} "
-                        f"=> tile_enabled={altaz_cleanup_for_tile}",
+                        f"unknown_policy={unknown_policy} seestar_hint={bool(seestar_hint)} "
+                        f"unknown_as_altaz={bool(unknown_as_altaz)} => tile_enabled={altaz_cleanup_for_tile}",
                         prog=None,
                         lvl="DEBUG_DETAIL",
                     )
                 except Exception:
                     pass
+                with runtime_adapt_lock:
+                    runtime_winsor_frames_per_pass = int(runtime_working_set_limit.get("winsor_frames_per_pass", winsor_max_frames_per_pass if int(winsor_max_frames_per_pass or 0) > 0 else 256))
+                    runtime_cpu_rows = runtime_working_set_limit.get("cpu_rows_per_chunk")
+                    runtime_gpu_rows = runtime_working_set_limit.get("gpu_rows_per_chunk")
+                    runtime_max_chunk_mb = runtime_working_set_limit.get("max_chunk_mb")
+
+                base_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
+                runtime_parallel_plan = copy.deepcopy(base_parallel_plan) if isinstance(base_parallel_plan, dict) else {}
+                if not isinstance(runtime_parallel_plan, dict):
+                    runtime_parallel_plan = {}
+                if runtime_cpu_rows is not None:
+                    runtime_parallel_plan["cpu_rows_per_chunk"] = int(runtime_cpu_rows)
+                if runtime_gpu_rows is not None:
+                    runtime_parallel_plan["gpu_rows_per_chunk"] = int(runtime_gpu_rows)
+                if runtime_max_chunk_mb is not None:
+                    runtime_parallel_plan["max_chunk_mb"] = float(runtime_max_chunk_mb)
+
+                tile_abort_event = threading.Event()
+
+                def _heartbeat_cb(tile_id_for_hb: int) -> None:
+                    now_hb = time.monotonic()
+                    with tile_runtime_state_lock:
+                        tile_last_progress_monotonic[int(tile_id_for_hb)] = now_hb
+
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -26535,37 +32796,246 @@ def run_hierarchical_mosaic(
                     astap_exe_path, astap_data_dir_param, astap_search_radius_config,
                     astap_downsample_config, astap_sensitivity_config, 180,
                     winsor_worker_limit,
-                    winsor_max_frames_per_pass,
+                    runtime_winsor_frames_per_pass,
                     progress_callback,
                     resource_strategy=auto_resource_strategy,
                     center_out_context=center_out_context,
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
-                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    parallel_plan=runtime_parallel_plan,
                     dbg_tile_ids=dbg_tile_ids,
                     allow_batch_duplication=bool(allow_duplication_config),
                     target_stack_size=int(target_stack_config),
                     min_safe_stack_size=int(min_safe_stack_config),
+                    abort_event=tile_abort_event,
+                    heartbeat_callback=_heartbeat_cb,
                 )
                 future_to_tile_id[future] = assigned_tile_id
+                future_to_group_info[future] = list(group_info_list or [])
+                future_abort_events[future] = tile_abort_event
+                with tile_runtime_state_lock:
+                    now_submit = time.monotonic()
+                    tile_last_progress_monotonic[int(assigned_tile_id)] = now_submit
+                    tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
 
+            def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> tuple[int, float]:
+                try:
+                    vm_local = psutil.virtual_memory()
+                    total_ram_gb = float(getattr(vm_local, "total", 0.0)) / (1024.0 ** 3)
+                except Exception:
+                    total_ram_gb = 16.0
+
+                if total_ram_gb <= 8.5:
+                    base_chunk = 48
+                elif total_ram_gb <= 16.5:
+                    base_chunk = 96
+                elif total_ram_gb <= 32.5:
+                    base_chunk = 160
+                elif total_ram_gb <= 64.5:
+                    base_chunk = 256
+                else:
+                    base_chunk = 384
+
+                frame_mb = None
+                try:
+                    for _e in (group_items or []):
+                        if not isinstance(_e, dict):
+                            continue
+                        cache_p = _e.get("path_preprocessed_cache")
+                        if cache_p and _path_exists(cache_p):
+                            frame_mb = float(os.path.getsize(cache_p)) / (1024.0 * 1024.0)
+                            if math.isfinite(frame_mb) and frame_mb > 0.0:
+                                break
+                except Exception:
+                    frame_mb = None
+
+                if isinstance(frame_mb, (int, float)) and math.isfinite(float(frame_mb)) and float(frame_mb) > 0.0:
+                    if frame_mb >= 48.0:
+                        base_chunk = int(max(12, base_chunk * 0.22))
+                    elif frame_mb >= 32.0:
+                        base_chunk = int(max(16, base_chunk * 0.35))
+                    elif frame_mb >= 20.0:
+                        base_chunk = int(max(24, base_chunk * 0.50))
+                    elif frame_mb >= 12.0:
+                        base_chunk = int(max(32, base_chunk * 0.70))
+
+                chunk_cfg = int(getattr(zconfig, "phase3_extreme_group_split_chunk_size", 0) or 0)
+                if chunk_cfg > 0:
+                    base_chunk = chunk_cfg
+                return int(max(12, min(600, base_chunk))), float(total_ram_gb)
+
+            split_threshold_cfg = int(getattr(zconfig, "phase3_extreme_group_split_threshold", 0) or 0)
+            if split_threshold_cfg <= 0:
+                split_threshold_cfg = 1200
+
+            pending_launch_queue: list[tuple[list[dict], int, int | None]] = []
+            extra_tile_id = int(max(tile_id_order) + 1) if tile_id_order else int(len(seestar_stack_groups))
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
+                n_frames_group = int(len(sg_info_list or []))
+                chunk_size, total_ram_gb_for_split = _estimate_phase3_split_chunk_size(sg_info_list)
+                dynamic_threshold = max(16, min(int(split_threshold_cfg), int(max(chunk_size, chunk_size * 1.35))))
+
+                if n_frames_group > dynamic_threshold and chunk_size > 0:
+                    planned_chunks = int(math.ceil(float(n_frames_group) / max(1.0, float(chunk_size))))
+                    try:
+                        pcb(
+                            "P3_EXTREME_GROUP_SPLIT_PLAN: "
+                            f"tile={assigned_tile_id} frames={n_frames_group} "
+                            f"chunk_size={chunk_size} chunks_planned={planned_chunks} "
+                            f"ram_gb≈{total_ram_gb_for_split:.2f} "
+                            "mode=single_tile_adaptive",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    except Exception:
+                        pass
+
                 rank = center_out_context.get_rank(assigned_tile_id) if center_out_context else proc_idx
-                _submit_master_tile_group(sg_info_list, assigned_tile_id, rank)
+                pending_launch_queue.append((sg_info_list, assigned_tile_id, rank))
+
+            try:
+                num_seestar_stacks_to_process = int(len(pending_launch_queue))
+            except Exception:
+                pass
+
+            def _current_launch_budget() -> int:
+                try:
+                    pause_until = float(runtime_launch_limit.get("pause_until", 0.0))
+                except Exception:
+                    pause_until = 0.0
+                if pause_until > time.monotonic():
+                    return 0
+                try:
+                    if runtime_launch_limit.get("pause_reason"):
+                        runtime_launch_limit["pause_reason"] = ""
+                except Exception:
+                    pass
+                try:
+                    resolved = int(runtime_launch_limit.get("value", actual_num_workers_ph3))
+                except Exception:
+                    resolved = int(actual_num_workers_ph3)
+                return max(0, min(int(actual_num_workers_ph3), resolved))
+
+            def _request_livelock_abort_if_needed() -> None:
+                if not watchdog_enabled or not pending_futures:
+                    return
+                try:
+                    vm_watch = psutil.virtual_memory()
+                    ram_pct_watch = float(getattr(vm_watch, "percent", 0.0))
+                except Exception:
+                    return
+                if not math.isfinite(ram_pct_watch) or ram_pct_watch < watchdog_ram_pct:
+                    return
+
+                now_watch = time.monotonic()
+                for fut in list(pending_futures):
+                    tile_id_watch = future_to_tile_id.get(fut)
+                    if tile_id_watch is None:
+                        continue
+                    start_watch = phase3_tile_start_monotonic.get(tile_id_watch, now_watch)
+                    with tile_runtime_state_lock:
+                        last_progress = tile_last_progress_monotonic.get(int(tile_id_watch), start_watch)
+                        current_abort_count = int(tile_abort_request_count.get(int(tile_id_watch), 0))
+                    runtime_s = max(0.0, now_watch - float(start_watch))
+                    stalled_s = max(0.0, now_watch - float(last_progress))
+                    if runtime_s < watchdog_min_runtime_s or stalled_s < watchdog_timeout_s:
+                        continue
+                    if current_abort_count >= watchdog_max_abort_per_tile:
+                        continue
+                    abort_evt = future_abort_events.get(fut)
+                    if abort_evt is None or abort_evt.is_set():
+                        continue
+                    abort_evt.set()
+                    with tile_runtime_state_lock:
+                        tile_abort_request_count[int(tile_id_watch)] = current_abort_count + 1
+                    try:
+                        pcb(
+                            "RAM_ADAPT_RT: livelock_abort_request "
+                            f"tile_id={int(tile_id_watch)} "
+                            f"stall_s={stalled_s:.1f} runtime_s={runtime_s:.1f} "
+                            f"ram_used_pct={ram_pct_watch:.1f} "
+                            f"attempt={current_abort_count + 1}/{watchdog_max_abort_per_tile}",
+                            prog=None,
+                            lvl="WARN",
+                        )
+                    except Exception:
+                        pass
+
+            def _drain_launch_queue() -> int:
+                launched = 0
+                launch_budget = _current_launch_budget()
+                if launch_budget <= 0:
+                    return launched
+                while pending_launch_queue and len(pending_futures) < launch_budget:
+                    queued_group, queued_tile_id, queued_rank = pending_launch_queue.pop(0)
+                    _submit_master_tile_group(queued_group, queued_tile_id, queued_rank)
+                    launched += 1
+                return launched
 
             start_time_loop_ph3 = time.time()
             last_time_loop_ph3 = start_time_loop_ph3
             step_times_ph3 = []
 
-            while pending_futures:
-                done_futures, _ = wait(pending_futures, return_when=FIRST_COMPLETED)
+            # Phase3 ETA model: per-master-tile online predictor keyed by frame count.
+            phase3_tile_start_monotonic: dict[int, float] = {}
+            phase3_tile_nframes: dict[int, int] = {}
+            phase3_eta_global_ewma_s: float | None = None
+            phase3_eta_by_frames_ewma_s: dict[int, float] = {}
+            phase3_eta_alpha = 0.25
+
+            def _phase3_predict_tile_seconds(n_frames: int | None) -> float:
+                try:
+                    if n_frames is not None and int(n_frames) in phase3_eta_by_frames_ewma_s:
+                        return float(phase3_eta_by_frames_ewma_s[int(n_frames)])
+                except Exception:
+                    pass
+                if phase3_eta_global_ewma_s is not None:
+                    return float(phase3_eta_global_ewma_s)
+                # Conservative cold-start for first few tiles.
+                return 18.0
+
+            def _phase3_eta_remaining_seconds() -> float:
+                durations: list[float] = []
+                now_m = time.monotonic()
+                for fut in list(pending_futures):
+                    tid = future_to_tile_id.get(fut)
+                    nfr = phase3_tile_nframes.get(tid) if tid is not None else None
+                    est = _phase3_predict_tile_seconds(nfr)
+                    st = phase3_tile_start_monotonic.get(tid) if tid is not None else None
+                    if st is not None:
+                        est = max(0.0, est - max(0.0, now_m - st))
+                    durations.append(est)
+                for queued_group, _queued_tile_id, _queued_rank in pending_launch_queue:
+                    try:
+                        nfr = int(len(queued_group or []))
+                    except Exception:
+                        nfr = None
+                    durations.append(_phase3_predict_tile_seconds(nfr))
+                workers_eff = max(1, _current_launch_budget() or len(pending_futures) or 1)
+                return _estimate_parallel_makespan_seconds(durations, workers_eff)
+
+            _drain_launch_queue()
+
+            while pending_futures or pending_launch_queue:
+                _drain_launch_queue()
+                _request_livelock_abort_if_needed()
+                if not pending_futures:
+                    time.sleep(0.05)
+                    continue
+                done_futures, _ = wait(pending_futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done_futures:
+                    continue
                 for future in done_futures:
                     pending_futures.discard(future)
                     tile_id_for_future = future_to_tile_id.pop(future, None)
+                    original_group_for_future = future_to_group_info.pop(future, None)
+                    future_abort_events.pop(future, None)
                     if tile_id_for_future is None:
                         continue
+                    with tile_runtime_state_lock:
+                        tile_last_progress_monotonic.pop(int(tile_id_for_future), None)
                     tiles_processed_count_ph3 += 1
 
                     pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
@@ -26593,6 +33063,35 @@ def run_hierarchical_mosaic(
                     now = time.time()
                     step_times_ph3.append(now - last_time_loop_ph3)
                     last_time_loop_ph3 = now
+
+                    # Update online duration model from completed tile runtime.
+                    try:
+                        t_start = phase3_tile_start_monotonic.pop(int(tile_id_for_future), None)
+                    except Exception:
+                        t_start = None
+                    if t_start is not None:
+                        tile_elapsed_s = max(0.0, time.monotonic() - float(t_start))
+                        if math.isfinite(tile_elapsed_s) and tile_elapsed_s > 0.0:
+                            if phase3_eta_global_ewma_s is None:
+                                phase3_eta_global_ewma_s = tile_elapsed_s
+                            else:
+                                phase3_eta_global_ewma_s = (
+                                    (1.0 - phase3_eta_alpha) * float(phase3_eta_global_ewma_s)
+                                    + phase3_eta_alpha * tile_elapsed_s
+                                )
+                            try:
+                                nfr_done = int(phase3_tile_nframes.get(int(tile_id_for_future), 0) or 0)
+                            except Exception:
+                                nfr_done = 0
+                            if nfr_done > 0:
+                                prev_n = phase3_eta_by_frames_ewma_s.get(nfr_done)
+                                if prev_n is None:
+                                    phase3_eta_by_frames_ewma_s[nfr_done] = tile_elapsed_s
+                                else:
+                                    phase3_eta_by_frames_ewma_s[nfr_done] = (
+                                        (1.0 - phase3_eta_alpha) * float(prev_n)
+                                        + phase3_eta_alpha * tile_elapsed_s
+                                    )
 
                     try:
                         main_result, retry_groups = future.result()
@@ -26647,7 +33146,8 @@ def run_hierarchical_mosaic(
                                     frames=len(filtered_retry_group),
                                 )
                                 retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
-                                _submit_master_tile_group(filtered_retry_group, new_tile_id, retry_rank)
+                                pending_launch_queue.append((filtered_retry_group, new_tile_id, retry_rank))
+                                _drain_launch_queue()
                                 pcb(
                                     f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}",
                                     prog=None,
@@ -26659,14 +33159,71 @@ def run_hierarchical_mosaic(
                                     except Exception:
                                         pass
                     except Exception as exc_thread_ph3:
-                        pcb(
-                            "run_error_phase3_thread_exception",
-                            prog=prog_step_phase3,
-                            lvl="ERROR",
-                            stack_num=int(tile_id_for_future) + 1,
-                            error=str(exc_thread_ph3),
-                        )
-                        logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+                        if isinstance(exc_thread_ph3, Phase3TileAbortRequested):
+                            pcb(
+                                "run_warn_phase3_tile_abort_requested",
+                                prog=prog_step_phase3,
+                                lvl="WARN",
+                                stack_num=int(tile_id_for_future) + 1,
+                                tile_id=int(tile_id_for_future),
+                                reason=str(exc_thread_ph3),
+                            )
+                            retry_group: list[dict] = []
+                            for raw_info in (original_group_for_future or []):
+                                if isinstance(raw_info, dict):
+                                    info_copy = dict(raw_info)
+                                    info_copy["retry_attempt"] = int(info_copy.get("retry_attempt", 0)) + 1
+                                    info_copy["retry_reason"] = "phase3_livelock_abort"
+                                    retry_group.append(info_copy)
+                                else:
+                                    retry_group.append(raw_info)
+                            if retry_group:
+                                max_retry_attempt = 0
+                                try:
+                                    max_retry_attempt = max(
+                                        int(item.get("retry_attempt", 0))
+                                        for item in retry_group
+                                        if isinstance(item, dict)
+                                    )
+                                except Exception:
+                                    max_retry_attempt = 0
+                                if max_retry_attempt > MAX_ALIGNMENT_RETRY_ATTEMPTS:
+                                    pcb(
+                                        "run_warn_phase3_alignment_retry_abandoned",
+                                        prog=None,
+                                        lvl="WARN",
+                                        tile_id=int(tile_id_for_future),
+                                        attempts=int(max_retry_attempt),
+                                        reason="phase3_livelock_abort",
+                                    )
+                                else:
+                                    # Keep single master-tile identity: retry same tile with tighter adaptive working set.
+                                    try:
+                                        skip_release_once_tile_ids.add(int(tile_id_for_future))
+                                    except Exception:
+                                        pass
+                                    retry_rank = center_out_context.get_rank(int(tile_id_for_future)) if center_out_context else None
+                                    pending_launch_queue.append((retry_group, int(tile_id_for_future), retry_rank))
+                                    pcb(
+                                        "run_info_phase3_retry_submitted",
+                                        prog=None,
+                                        lvl="WARN",
+                                        origin_tile=int(tile_id_for_future),
+                                        new_tile=int(tile_id_for_future),
+                                        frames=len(retry_group),
+                                        attempt=int(max_retry_attempt),
+                                        mode="single_tile_adaptive",
+                                        reason="phase3_livelock_abort",
+                                    )
+                        else:
+                            pcb(
+                                "run_error_phase3_thread_exception",
+                                prog=prog_step_phase3,
+                                lvl="ERROR",
+                                stack_num=int(tile_id_for_future) + 1,
+                                error=str(exc_thread_ph3),
+                            )
+                            logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
                     finally:
                         # Aggressively free CuPy memory pools between tiles to avoid device/pinned host growth
                         try:
@@ -26680,27 +33237,43 @@ def run_hierarchical_mosaic(
                             pass
 
                     if cache_retention_mode == "per_tile":
-                        removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
-                        total_removed_cache_files += removed_count
-                        total_removed_cache_bytes += removed_bytes
-                        if removed_count or removed_bytes:
-                            freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                        if int(tile_id_for_future) in skip_release_once_tile_ids:
+                            skip_release_once_tile_ids.discard(int(tile_id_for_future))
                             logger.debug(
-                                "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                "Per-tile cache cleanup skipped once for tile %s (pending retry)",
                                 tile_id_for_future,
-                                removed_count,
-                                freed_mb,
                             )
+                        else:
+                            removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
+                            total_removed_cache_files += removed_count
+                            total_removed_cache_bytes += removed_bytes
+                            if removed_count or removed_bytes:
+                                freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                                logger.debug(
+                                    "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                    tile_id_for_future,
+                                    removed_count,
+                                    freed_mb,
+                                )
 
                     if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                          _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
 
                     elapsed_phase3 = time.monotonic() - start_time_phase3
                     time_per_master_tile_creation = elapsed_phase3 / max(1, tiles_processed_count_ph3)
-                    eta_phase3_sec = (num_seestar_stacks_to_process - tiles_processed_count_ph3) * time_per_master_tile_creation
+                    eta_phase3_sec_avg = (num_seestar_stacks_to_process - tiles_processed_count_ph3) * time_per_master_tile_creation
+                    eta_phase3_sec_model = _phase3_eta_remaining_seconds()
                     current_progress_in_run_percent_ph3 = base_progress_phase3 + (tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process)) * PROGRESS_WEIGHT_PHASE3_MASTER_TILES
-                    time_per_percent_point_global_ph3 = (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent_ph3) if current_progress_in_run_percent_ph3 > 0 else (time.monotonic() - start_time_total_run)
-                    total_eta_sec_ph3 = eta_phase3_sec + (100 - current_progress_in_run_percent_ph3) * time_per_percent_point_global_ph3
+                    eta_global_sec_ph3 = _eta_seconds_from_progress(
+                        start_time_total_run,
+                        current_progress_in_run_percent_ph3,
+                    )
+                    eta_phase_model_sec_ph3 = _eta_seconds_from_phase_model(
+                        start_time_total_run,
+                        phase_index=3,
+                        phase_fraction=(tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process)),
+                    )
+                    total_eta_sec_ph3 = max(eta_phase3_sec_avg, eta_phase3_sec_model, eta_global_sec_ph3, eta_phase_model_sec_ph3)
                     update_gui_eta(total_eta_sec_ph3)
 
             # Toutes les futures sont terminées → fermeture propre
@@ -26746,7 +33319,14 @@ def run_hierarchical_mosaic(
             master_tiles_results_list = [master_tiles_results_list_temp[i] for i in sorted(master_tiles_results_list_temp.keys())]
             del master_tiles_results_list_temp; gc.collect()
             if not master_tiles_results_list:
-                pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
+                recovered = _recover_rejected_master_tiles_for_phase3(
+                    temp_master_tile_storage_dir,
+                    pcb=pcb,
+                )
+                if recovered:
+                    master_tiles_results_list = [recovered[i] for i in sorted(recovered.keys())]
+                else:
+                    pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
 
             current_global_progress = base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
             _log_memory_usage(progress_callback, "Fin Phase 3");
@@ -26913,7 +33493,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic V4.4.1','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic V4.5.0','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
@@ -27110,6 +33690,7 @@ def run_hierarchical_mosaic(
     rgb_black_level_info: dict[str, Any] | None = None
     if (
         final_mosaic_black_point_equalize_enabled
+        and float(final_mosaic_black_point_percentile) > 0.0
         and final_mosaic_data_HWC is not None
         and not sds_mode_phase5
     ):
@@ -27356,6 +33937,63 @@ def run_hierarchical_mosaic(
                                       # ASIFitsView utilise souvent un 'midtones balance' (gamma-like) aussi.
                                       # Un 'a' de 10 comme dans ton code de test est très doux. Essayons 0.5 ou 1.0.
                 preview_asinh_a = 20.0 # Test avec une valeur plus douce pour le 'a' de asinh
+
+                raw_visual_seam_heal_enabled_legacy = getattr(zconfig, "visual_seam_heal_enabled", False)
+                visual_seam_heal_enabled_legacy = _coerce_bool_flag(raw_visual_seam_heal_enabled_legacy)
+                if visual_seam_heal_enabled_legacy is None:
+                    visual_seam_heal_enabled_legacy = False
+                visual_seam_heal_enabled_legacy = bool(visual_seam_heal_enabled_legacy)
+
+                if visual_seam_heal_enabled_legacy:
+                    try:
+                        visual_seam_heal_strength_legacy = float(getattr(zconfig, "visual_seam_heal_strength", 0.45))
+                    except Exception:
+                        visual_seam_heal_strength_legacy = 0.45
+                    try:
+                        visual_seam_heal_sigma_small_legacy = float(getattr(zconfig, "visual_seam_heal_sigma_small", 24.0))
+                    except Exception:
+                        visual_seam_heal_sigma_small_legacy = 24.0
+                    try:
+                        visual_seam_heal_sigma_large_legacy = float(getattr(zconfig, "visual_seam_heal_sigma_large", 96.0))
+                    except Exception:
+                        visual_seam_heal_sigma_large_legacy = 96.0
+                    try:
+                        visual_seam_heal_seam_sigma_legacy = float(getattr(zconfig, "visual_seam_heal_seam_sigma", 2.5))
+                    except Exception:
+                        visual_seam_heal_seam_sigma_legacy = 2.5
+                    try:
+                        visual_seam_heal_max_rel_delta_legacy = float(getattr(zconfig, "visual_seam_heal_max_rel_delta", 0.08))
+                    except Exception:
+                        visual_seam_heal_max_rel_delta_legacy = 0.08
+
+                    coverage_preview_legacy = None
+                    if final_mosaic_coverage_HW is not None:
+                        try:
+                            cov_src = np.asarray(final_mosaic_coverage_HW, dtype=np.float32)
+                            if cov_src.ndim > 2:
+                                cov_src = np.squeeze(cov_src)
+                            coverage_preview_legacy = cov_src[::step, ::step] if step > 1 else cov_src
+                        except Exception:
+                            coverage_preview_legacy = None
+
+                    preview_view, seam_heal_info_legacy = _apply_visual_seam_heal_low_frequency(
+                        preview_view,
+                        alpha_mask=alpha_preview,
+                        coverage_hw=coverage_preview_legacy,
+                        strength=visual_seam_heal_strength_legacy,
+                        sigma_small=visual_seam_heal_sigma_small_legacy,
+                        sigma_large=visual_seam_heal_sigma_large_legacy,
+                        seam_sigma=visual_seam_heal_seam_sigma_legacy,
+                        max_rel_delta=visual_seam_heal_max_rel_delta_legacy,
+                        logger=logger,
+                    )
+                    logger.info(
+                        "[SeamHeal] preview gate enabled=True applied=%s reason=%s",
+                        bool((seam_heal_info_legacy or {}).get("applied", False)),
+                        (seam_heal_info_legacy or {}).get("reason", ""),
+                    )
+                else:
+                    logger.info("[SeamHeal] preview gate enabled=False")
 
                 # Prefer GPU stretch when GPU is enabled/available
                 if use_gpu_phase5_flag and hasattr(zemosaic_utils, 'stretch_auto_asifits_like_gpu'):
@@ -27615,6 +34253,34 @@ def run_hierarchical_mosaic(
     gc.collect(); _log_memory_usage(progress_callback, "Fin Run Hierarchical Mosaic (après GC final)")
     _log_alignment_warning_summary()
     telemetry.close()
+    try:
+        vm_end = psutil.virtual_memory()
+        sm_end = psutil.swap_memory()
+        total_ram_gb_end = float(getattr(vm_end, "total", 0.0)) / (1024.0 ** 3)
+        swap_total_gb_end = float(getattr(sm_end, "total", 0.0)) / (1024.0 ** 3)
+        mem_orch_global_end = _memory_orchestrator_profile(total_ram_gb_end, swap_total_gb_end, zconfig=zconfig if 'zconfig' in locals() else None)
+        mem_orch_p3_end = _phase3_memory_orchestrator_profile(total_ram_gb_end, swap_total_gb_end, zconfig=zconfig if 'zconfig' in locals() else None)
+        report_payload = {
+            "schema": "zemosaic.memory_orchestrator_report.v1",
+            "generated_utc": datetime.utcnow().isoformat() + "Z",
+            "run_output_folder": output_folder,
+            "duration_s": float(total_duration_sec),
+            "global_profile": mem_orch_global_end,
+            "phase3_profile": mem_orch_p3_end,
+            "applied_caps": {
+                "winsor_worker_limit": int(locals().get("winsor_worker_limit", 0) or 0),
+                "winsor_max_frames_per_pass": int(locals().get("winsor_max_frames_per_pass", 0) or 0),
+                "assembly_process_workers": int(locals().get("assembly_process_workers_config", 0) or 0),
+                "effective_base_workers": int(locals().get("effective_base_workers", 0) or 0),
+            },
+            "notes": [
+                "Initial unified memory orchestrator report (lot 3).",
+                "Cross-phase hard caps + Phase 3 runtime guard active when configured.",
+            ],
+        }
+        _write_memory_orchestrator_report(output_folder, report_payload, logger=logger, progress_callback=progress_callback)
+    except Exception:
+        pass
     logger.info(f"===== Run Hierarchical Mosaic COMPLETED in {total_duration_sec:.2f}s =====")
 ################################################################################
 ################################################################################
@@ -27627,6 +34293,8 @@ def run_hierarchical_mosaic_process(
     **kwargs,
 ):
     """Wrapper for running :func:`run_hierarchical_mosaic` in a separate process."""
+
+    _sanitize_spawned_process_logging()
 
     # progress_callback(stage: str, current: int, total: int)
 
@@ -27796,6 +34464,87 @@ if __name__ == "__main__":
         except Exception:
             solver_cfg = SolverSettings().__dict__
 
+    def _cli_progress_callback(message_key_or_raw, progress_value=None, level="INFO", **kwargs):
+        try:
+            lvl = str(level).upper()
+        except Exception:
+            lvl = "INFO"
+        if lvl in {"ERROR", "WARN", "SUCCESS", "INFO"}:
+            txt = str(message_key_or_raw)
+            if kwargs:
+                txt = f"{txt} {kwargs}"
+            print(f"[{lvl}] {txt}")
+
+    cli_cfg = dict(cfg)
+    cli_cfg["input_dir"] = args.input_folder
+    cli_cfg["output_dir"] = args.output_folder
+    if args.coadd_use_memmap:
+        cli_cfg["coadd_use_memmap"] = True
+    if args.coadd_memmap_dir:
+        cli_cfg["coadd_memmap_dir"] = args.coadd_memmap_dir
+    if args.coadd_cleanup_memmap:
+        cli_cfg["coadd_cleanup_memmap"] = True
+    if args.no_auto_limit_frames:
+        cli_cfg["auto_limit_frames_per_master_tile"] = False
+    if args.assembly_process_workers is not None:
+        cli_cfg["assembly_process_workers"] = int(args.assembly_process_workers)
+    if args.winsor_workers is not None:
+        cli_cfg["winsor_worker_limit"] = int(args.winsor_workers)
+    if args.max_raw_per_master_tile is not None:
+        cli_cfg["max_raw_per_master_tile"] = int(args.max_raw_per_master_tile)
+
+    final_kwargs = dict(cli_cfg)
+    final_kwargs["progress_callback"] = _cli_progress_callback
+    final_kwargs["solver_settings"] = solver_cfg
+
+    rename_map = {
+        "input_dir": "input_folder",
+        "output_dir": "output_folder",
+        "astap_executable_path": "astap_exe_path",
+        "astap_data_directory_path": "astap_data_dir_param",
+        "astap_default_search_radius": "astap_search_radius_config",
+        "astap_default_downsample": "astap_downsample_config",
+        "astap_default_sensitivity": "astap_sensitivity_config",
+        "stacking_normalize_method": "stack_norm_method",
+        "stacking_weighting_method": "stack_weight_method",
+        "stacking_rejection_algorithm": "stack_reject_algo",
+        "stacking_final_combine_method": "stack_final_combine",
+        "stacking_kappa_low": "stack_kappa_low",
+        "stacking_kappa_high": "stack_kappa_high",
+        "cluster_panel_threshold": "cluster_threshold_config",
+        "cluster_target_groups": "cluster_target_groups_config",
+        "cluster_orientation_split_deg": "cluster_orientation_split_deg_config",
+    }
+    for old_key, new_key in rename_map.items():
+        if old_key in final_kwargs:
+            final_kwargs[new_key] = final_kwargs.pop(old_key)
+
+    if "stacking_winsor_limits" in final_kwargs:
+        limits_str = final_kwargs.pop("stacking_winsor_limits")
+        try:
+            parts = [float(p.strip()) for p in str(limits_str).split(",")]
+            final_kwargs["parsed_winsor_limits"] = tuple(parts) if len(parts) == 2 else (0.05, 0.05)
+        except Exception:
+            final_kwargs["parsed_winsor_limits"] = (0.05, 0.05)
+
+    sig_params = inspect.signature(run_hierarchical_mosaic).parameters
+    for key in list(final_kwargs.keys()):
+        config_key = f"{key}_config"
+        if config_key in sig_params and key not in sig_params:
+            final_kwargs[config_key] = final_kwargs.pop(key)
+
+    final_kwargs = {k: v for k, v in final_kwargs.items() if k in sig_params}
+    if "stack_ram_budget_gb_config" not in final_kwargs:
+        final_kwargs["stack_ram_budget_gb_config"] = 0.0
+    if "num_base_workers_config" not in final_kwargs:
+        final_kwargs["num_base_workers_config"] = 0
+    # CLI safety defaults for required args that may be absent in sparse JSON configs
+    final_kwargs.setdefault("cluster_threshold_config", 0.03)
+    final_kwargs.setdefault("cluster_target_groups_config", 0)
+    final_kwargs.setdefault("cluster_orientation_split_deg_config", 0.0)
+    final_kwargs.setdefault("min_radial_weight_floor_config", 0.0)
+
+    run_hierarchical_mosaic(**final_kwargs)
 
 
 def _assemble_global_mosaic_first_impl(
@@ -28441,7 +35190,7 @@ def _assemble_global_mosaic_first_impl(
         _maybe_emit_cpu_eta(int(done_count))
 
     def _attempt_gpu_helper_route() -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, int]] | None:
-        nonlocal helper_partial_gpu_artifacts
+        nonlocal helper_partial_gpu_artifacts, plan_rows_gpu_hint, plan_chunk_gpu_hint
         helper_entries: list[tuple[dict, Any]] = []
         helper_seen = 0
         helper_valid = 0
@@ -28534,40 +35283,79 @@ def _assemble_global_mosaic_first_impl(
                 if final_channels:
                     helper_partial_gpu_artifacts = True
                 return None
-            gpu_reproj_kwargs: dict[str, Any] = {}
-            row_hint_gpu = plan_rows_gpu_hint or plan_rows_cpu_hint
-            if row_hint_gpu:
-                gpu_reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint_gpu))
-            chunk_hint_gpu = plan_chunk_gpu_hint or plan_chunk_cpu_hint
-            if chunk_hint_gpu:
-                gpu_reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint_gpu))
-            try:
-                chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
-                    data_list=data_list,
-                    wcs_list=wcs_list_local,
-                    shape_out=(height, width),
-                    output_projection=global_wcs_obj,
-                    reproject_function=reproject_interp,
-                    combine_function=coadd_method,
-                    stack_reject_algo=stack_reject_algo,
-                    winsor_limits=winsor_limits,
-                    coadd_k=kappa_sigma_k,
-                    cpu_func=reproject_and_coadd,
-                    use_gpu=True,
-                    allow_cpu_fallback=False,
-                    match_background=match_background,
-                    progress_callback=pcb,
-                    **gpu_reproj_kwargs,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[Worker] Global GPU helper path failed on channel %d: %s",
-                    channel_idx,
-                    exc,
-                )
-                if final_channels:
-                    helper_partial_gpu_artifacts = True
-                return None
+            max_gpu_helper_retries = 3
+            attempt = 0
+            while True:
+                attempt += 1
+                gpu_reproj_kwargs: dict[str, Any] = {}
+                row_hint_gpu = plan_rows_gpu_hint or plan_rows_cpu_hint
+                if row_hint_gpu:
+                    gpu_reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint_gpu))
+                chunk_hint_gpu = plan_chunk_gpu_hint or plan_chunk_cpu_hint
+                if chunk_hint_gpu:
+                    gpu_reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint_gpu))
+                try:
+                    chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
+                        data_list=data_list,
+                        wcs_list=wcs_list_local,
+                        shape_out=(height, width),
+                        output_projection=global_wcs_obj,
+                        reproject_function=reproject_interp,
+                        combine_function=coadd_method,
+                        stack_reject_algo=stack_reject_algo,
+                        winsor_limits=winsor_limits,
+                        coadd_k=kappa_sigma_k,
+                        cpu_func=reproject_and_coadd,
+                        use_gpu=True,
+                        allow_cpu_fallback=False,
+                        match_background=match_background,
+                        progress_callback=pcb,
+                        **gpu_reproj_kwargs,
+                    )
+                    break
+                except Exception as exc:
+                    is_oom = _is_gpu_oom_error(exc)
+                    if is_oom and attempt < max_gpu_helper_retries:
+                        try:
+                            if ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(
+                                zemosaic_utils, "free_cupy_memory_pools"
+                            ):
+                                zemosaic_utils.free_cupy_memory_pools()
+                        except Exception:
+                            pass
+                        prev_rows = int(row_hint_gpu) if row_hint_gpu else 0
+                        prev_chunk = int(chunk_hint_gpu) if chunk_hint_gpu else 0
+                        next_rows = max(32, int(math.ceil(prev_rows / 2.0))) if prev_rows > 0 else 256
+                        if prev_chunk > 0:
+                            next_chunk = max(32 * 1024 * 1024, int(prev_chunk * 0.5))
+                        else:
+                            next_chunk = 256 * 1024 * 1024
+                        plan_rows_gpu_hint = int(next_rows)
+                        plan_chunk_gpu_hint = int(next_chunk)
+                        pcb(
+                            "global_coadd_gpu_oom_retry",
+                            prog=None,
+                            lvl="WARN",
+                            **_payload(
+                                helper="gpu_reproject",
+                                channel=int(channel_idx + 1),
+                                attempt=int(attempt),
+                                rows_before=int(prev_rows),
+                                rows_after=int(next_rows),
+                                chunk_mb_before=float(prev_chunk / (1024 ** 2)) if prev_chunk > 0 else None,
+                                chunk_mb_after=float(next_chunk / (1024 ** 2)),
+                                error=str(exc),
+                            ),
+                        )
+                        continue
+                    logger.warning(
+                        "[Worker] Global GPU helper path failed on channel %d: %s",
+                        channel_idx,
+                        exc,
+                    )
+                    if final_channels:
+                        helper_partial_gpu_artifacts = True
+                    return None
             if gpu_verify_tolerance is not None:
                 cpu_reproj_kwargs: dict[str, Any] = {}
                 cpu_rows_hint = plan_rows_cpu_hint or plan_rows_gpu_hint
@@ -29182,6 +35970,21 @@ def assemble_global_mosaic_sds(
     parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Batch Mosaic-First workflow that stacks per-batch mosaics in the global WCS."""
+
+    diagnostics_output_dir: Path | None = None
+    try:
+        if isinstance(postprocess_context, dict):
+            candidate = postprocess_context.get("diagnostics_output_dir")
+            if candidate:
+                diagnostics_output_dir = Path(str(candidate))
+    except Exception:
+        diagnostics_output_dir = None
+    if diagnostics_output_dir is None:
+        try:
+            if cache_root:
+                diagnostics_output_dir = Path(str(cache_root))
+        except Exception:
+            diagnostics_output_dir = None
 
     if not global_plan or not global_plan.get("enabled"):
         return None, None, None
@@ -29998,6 +36801,20 @@ def assemble_global_mosaic_sds(
         )
     except Exception:
         pass
+
+    if diagnostics_output_dir is not None:
+        _payload = {
+            "tile_count": int(len(effective_tiles)) if 'effective_tiles' in locals() else 0,
+            "tile_weighting_active": bool(tile_weighting_active) if 'tile_weighting_active' in locals() else False,
+            "tile_weighting_applied": bool(tile_weighting_applied) if 'tile_weighting_applied' in locals() else False,
+            "tile_weight_mode": str(weight_mode_normalized) if 'weight_mode_normalized' in locals() else "n_frames",
+            "intertile_photometric_match": bool(intertile_photometric_match) if 'intertile_photometric_match' in locals() else False,
+            "intertile_prune_k": int(intertile_prune_k) if 'intertile_prune_k' in locals() else 0,
+            "intertile_prune_weight_mode": str(intertile_prune_weight_mode) if 'intertile_prune_weight_mode' in locals() else "",
+            "affine_solution_present": bool(pending_affine_list) if 'pending_affine_list' in locals() else False,
+            "affine_nontrivial": bool(nontrivial_affine) if 'nontrivial_affine' in locals() else False,
+        }
+        _write_json_diagnostic(diagnostics_output_dir / "intertile_residuals_summary.json", _payload)
 
     return final_image, final_coverage, final_alpha
 

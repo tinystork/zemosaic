@@ -28,8 +28,13 @@ import numpy as np
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 if GPU_AVAILABLE:
     import cupy as cp
+    try:
+        import cupyx  # type: ignore
+    except Exception:
+        cupyx = None  # type: ignore
 else:
     cp = None
+    cupyx = None  # type: ignore
 
 try:
     from zemosaic_align_stack import _reject_outliers_kappa_sigma
@@ -49,6 +54,18 @@ def get_backend_module(backend: str):
         return np
     else:
         raise ValueError(f"Unsupported backend: {backend}")
+
+
+def _xp_errstate(xp_module, **kwargs):
+    errstate = getattr(xp_module, "errstate", None)
+    if callable(errstate):
+        return errstate(**kwargs)
+    if xp_module is cp and cupyx is not None:
+        cupyx_errstate = getattr(cupyx, "errstate", None)
+        if callable(cupyx_errstate):
+            return cupyx_errstate(**kwargs)
+    from contextlib import nullcontext
+    return nullcontext()
 
 
 def _ensure_hwc_tile(tile: np.ndarray) -> np.ndarray:
@@ -328,7 +345,7 @@ def stack_core(
     if final_combine_method == 'mean':
         weighted_data = xp.where(finite_mask, stacked * weights_backend, 0.0)
         weighted_sum = xp.sum(weighted_data, axis=0)
-        with xp.errstate(divide='ignore', invalid='ignore'):
+        with _xp_errstate(xp, divide='ignore', invalid='ignore'):
             result = xp.where(weight_sum > 0, weighted_sum / weight_sum, xp.nan)
     elif final_combine_method == 'median':
         # Median ignores weights

@@ -64,12 +64,26 @@ except Exception:  # pragma: no cover - fallback when utils unavailable
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-try:  # Tkinter is optional for headless/CLI usage
-    import tkinter.filedialog as fd
-    import tkinter.messagebox as mb
-except Exception:  # pragma: no cover - depends on OS packages
-    fd = None
-    mb = None
+fd = None
+mb = None
+
+
+def _ensure_tk_dialogs_loaded() -> tuple[object | None, object | None]:
+    """Load tkinter dialog helpers lazily for legacy interactive prompts only."""
+    global fd, mb
+    if fd is not None or mb is not None:
+        return fd, mb
+    try:  # pragma: no cover - optional dependency
+        import importlib
+        _fd = importlib.import_module("tkinter.filedialog")
+        _mb = importlib.import_module("tkinter.messagebox")
+    except Exception:
+        fd = None
+        mb = None
+        return fd, mb
+    fd = _fd
+    mb = _mb
+    return fd, mb
 
 CONFIG_FILE_NAME = "zemosaic_config.json"
 SYSTEM_NAME = platform.system().lower()
@@ -85,7 +99,7 @@ DEFAULT_CONFIG = {
     "astap_max_instances": 1,
     "astap_drizzled_fallback_enabled": False,
     "language": "en",
-    "preferred_gui_backend": "tk",  # "tk" or "qt"
+    "preferred_gui_backend": "qt",  # official runtime is Qt-only
     "preferred_gui_backend_explicit": False,
     "qt_theme_mode": "system",
     "qt_main_window_geometry": None,
@@ -105,8 +119,41 @@ DEFAULT_CONFIG = {
     "stacking_winsor_limits": "0.05,0.05",  # String, sera parsé
     "wsc_impl": "pixinsight",
     "stacking_final_combine_method": "mean",
-    "poststack_equalize_rgb": True,
+    "poststack_equalize_rgb": False,
+    "poststack_rgb_equalize_gain_clip": [0.95, 1.05],
+    "poststack_rgb_equalize_bg_percentile": [5.0, 85.0],
+    "poststack_rgb_equalize_min_samples": 5000,
+    "poststack_rgb_equalize_min_coverage": 0.01,
     "final_mosaic_rgb_equalize_enabled": False,
+    "final_mosaic_rgb_equalize_clip_enabled": True,
+    "final_mosaic_rgb_equalize_gain_clip": [0.80, 1.25],
+    # Power-user only (JSON): preview PNG stretch controls (no dedicated GUI fields)
+    "preview_png_p_low": 1.0,
+    "preview_png_p_high": 99.9,
+    "preview_png_asinh_a": 12.0,
+    "preview_png_max_dim": 3200,
+    "preview_png_apply_wb": False,
+    "visual_seam_heal_enabled": False,
+    "visual_seam_heal_strength": 0.45,
+    "visual_seam_heal_sigma_small": 24.0,
+    "visual_seam_heal_sigma_large": 96.0,
+    "visual_seam_heal_seam_sigma": 2.5,
+    "visual_seam_heal_max_rel_delta": 0.08,
+    # Optional preview-only multiscale seam heal (Phase 6 visual output)
+    "visual_seam_heal_multiscale_enabled": False,
+    "visual_seam_heal_multiscale_mid_gain": 0.35,
+    "visual_seam_heal_multiscale_mid_sigma_scale": 0.60,
+    "visual_seam_heal_multiscale_mid_rel_scale": 0.70,
+    "existing_master_tiles_rgb_balance_prephase5": True,
+    "existing_master_tiles_rgb_balance_gain_clip": [0.90, 1.10],
+    "existing_master_tiles_rgb_balance_min_pixels": 5000,
+    # Existing-master anchor photometry (post-refactor safeguard)
+    "existing_master_tiles_anchor_photometry_enabled": True,
+    "existing_master_tiles_anchor_gain_clip": [0.90, 1.10],
+    "existing_master_tiles_final_rgb_equalize_gain_clip": [0.90, 1.10],
+    "sds_enable_final_rgb_equalize": False,
+    "sds_final_rgb_equalize_gain_clip": [0.95, 1.05],
+    "sds_enable_final_black_point_equalize": False,
     "apply_radial_weight": False,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
@@ -123,6 +170,16 @@ DEFAULT_CONFIG = {
     "phase5_chunk_mb": 128,
     "enable_tile_weighting": True,
     "tile_weight_mode": "n_frames",
+    "tile_weight_v4_enabled": True,
+    "tile_weight_v4_curve": "sqrt",
+    "tile_weight_v4_strength": 1.0,
+    "tile_weight_v4_min": 0.75,
+    "tile_weight_v4_max": 1.35,
+    "tile_weight_v4_residual_penalty_enabled": False,
+    "tile_weight_v4_residual_penalty_strength": 0.35,
+    "tile_weight_v4_temporal_penalty_enabled": False,
+    "tile_weight_v4_temporal_penalty_strength": 0.20,
+    "tile_weight_v4_temporal_penalty_hours": 6.0,
     "final_assembly_method": "reproject_coadd",  # Options: "reproject_coadd", "incremental",
     "auto_detect_seestar": True,
     "force_seestar_mode": False,
@@ -150,7 +207,7 @@ DEFAULT_CONFIG = {
     "inter_master_photometry_intragroup": True,
     "inter_master_photometry_intersuper": True,
     "inter_master_photometry_clip_sigma": 3.0,
-    "two_pass_coverage_renorm": False,
+    "two_pass_coverage_renorm": True,
     "two_pass_cov_sigma_px": 50,
     "two_pass_cov_gain_clip": [0.85, 1.18],
     "solver_method": "ansvr",
@@ -158,6 +215,7 @@ DEFAULT_CONFIG = {
     "astrometry_api_key": "",
     "save_final_as_uint16": False,
     "legacy_rgb_cube": False,
+    "save_display_fits": False,
     "coadd_use_memmap": True,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": True,
@@ -175,13 +233,13 @@ DEFAULT_CONFIG = {
     "parallel_gpu_vram_fraction": 0.8,
     "parallel_max_cpu_workers": 0,  # 0 → no explicit cap beyond detected logical cores
     # Resume policy for classic legacy runs: "off", "auto", "force".
-    "resume": "off",
+    "resume": "auto",
     # Cache retention policy for Phase 1 preprocessed .npy files.
     # Allowed values: "run_end", "per_tile", "keep".
     "cache_retention": "run_end",
     "assembly_process_workers": 0,  # Worker count for final assembly (both methods)
     "auto_limit_frames_per_master_tile": True,
-    "winsor_worker_limit": 10,
+    "winsor_worker_limit": 0,
     "winsor_max_frames_per_pass": 0,
     "winsor_auto_fallback_on_memory_error": True,
     "winsor_min_frames_per_pass": 4,
@@ -210,14 +268,79 @@ DEFAULT_CONFIG = {
     "intertile_overlap_min": 0.05,
     "intertile_sky_percentile": [30.0, 70.0],
     "intertile_robust_clip_sigma": 2.5,
+    "intertile_prune_k": 8,
+    "intertile_prune_weight_mode": "area",
+    "intertile_offset_only_v1": False,
+    "intertile_gain_offset_v2": False,
+    "intertile_gain_prior_lambda": 0.02,
+    "intertile_gain_clip": [0.90, 1.10],
+    "intertile_offset_clip": [-2000.0, 2000.0],
+    "intertile_pair_gain_clip": [0.5, 2.0],
+    "intertile_pair_offset_abs_max": 5000.0,
+    "intertile_max_irls_iters": 3,
+    "intertile_enforce_requested_solver": False,
+    # Guardrail for sparse/underconstrained intertile solves.
+    "intertile_underconstrained_guard_enabled": True,
+    "intertile_underconstrained_max_pairs": 1,
+    "intertile_underconstrained_max_active_tiles": 2,
+    "intertile_underconstrained_force_mode": "offset_only",  # offset_only|disable_photometric
+    "intertile_underconstrained_gain_clip": [0.85, 1.18],
+    "intertile_underconstrained_offset_clip": [-2000.0, 2000.0],
     "intertile_global_recenter": True,
     "force_resolve_existing_wcs": False,
     "intertile_recenter_clip": [0.85, 1.18],
+    # Power-user only (JSON): blend affine corrections toward neutral to reduce seam visibility
+    "intertile_affine_blend": 0.30,
     "use_auto_intertile": False,
     "match_background_for_final": True,
     "incremental_feather_parity": False,
+    # Phase 5 visual harmonization for low-frequency tile imprint suppression.
+    "patchwork_suppressor_enabled": True,
+    "patchwork_suppressor_strength": "strong",  # low|normal|strong
+    "patchwork_suppressor_sigma_px": 64.0,
+    "patchwork_suppressor_seam_band_px": 320,
+    "patchwork_suppressor_max_delta": 0.30,
+    "patchwork_suppressor_protect_stars": False,
+    "patchwork_suppressor_only_near_seams": True,
+    "phase5_alpha_soft_weights": True,
+    "phase5_alpha_weight_floor": 0.02,
+    # Dual-output aesthetic workflow (visual-only branch).
+    "export_aesthetic_fits": True,
+    "scientific_fits_suffix": "_science",
+    "aesthetic_fits_suffix": "_aesthetic",
+    "aesthetic_fits_use_patchwork": True,
+    "aesthetic_hole_fill_enabled": True,
+    "aesthetic_hole_fill_max_radius_px": 96,
+    "aesthetic_hole_fill_blend": 0.85,
+    "aesthetic_hole_fill_only_near_seams": True,
+    # Aesthetic profile presets (for quick switching).
+    # Keep strong as active default for now.
+    "aesthetic_profile_preset": "strong",  # balanced|strong
+    "aesthetic_profile_presets": {
+        "balanced": {
+            "patchwork_suppressor_strength": "normal",
+            "patchwork_suppressor_seam_band_px": 200,
+            "patchwork_suppressor_max_delta": 0.22,
+            "patchwork_suppressor_protect_stars": True,
+            "aesthetic_hole_fill_max_radius_px": 64,
+            "aesthetic_hole_fill_blend": 0.70,
+            "aesthetic_hole_fill_only_near_seams": True,
+        },
+        "strong": {
+            "patchwork_suppressor_strength": "strong",
+            "patchwork_suppressor_seam_band_px": 320,
+            "patchwork_suppressor_max_delta": 0.30,
+            "patchwork_suppressor_protect_stars": False,
+            "aesthetic_hole_fill_max_radius_px": 96,
+            "aesthetic_hole_fill_blend": 0.85,
+            "aesthetic_hole_fill_only_near_seams": True,
+        },
+    },
     "final_mosaic_dbe_enabled": True,
     "final_mosaic_dbe_strength": "normal",
+    # Final black-point equalization (power-user; can alter low/mid ADU chroma balance)
+    "final_mosaic_black_point_equalize_enabled": False,
+    "final_mosaic_black_point_percentile": 0.1,
     "final_mosaic_dbe_obj_k": 3.0,
     "final_mosaic_dbe_obj_dilate_px": 3,
     "final_mosaic_dbe_sample_step": 24,
@@ -238,6 +361,12 @@ DEFAULT_CONFIG = {
     "quality_gate_k_sigma": 2.5,
     "quality_gate_erode_px": 3,
     "quality_gate_move_rejects": True,
+    # Existing-master-tiles pre-check gate (protect Phase 5 from catastrophic outliers)
+    "existing_master_tiles_quality_gate_enabled": True,
+    "existing_master_tiles_quality_gate_mode": "warn",  # warn|fail
+    "existing_master_tiles_quality_gate_sigma_threshold": 8.0,
+    "existing_master_tiles_quality_gate_ratio_threshold": 5000.0,
+    "existing_master_tiles_quality_gate_min_valid_frac": 0.05,
     # --- Alt-Az cleanup (lecropper altZ) ---
     "altaz_cleanup_enabled": False,
     "altaz_margin_percent": 5.0,  # UI: "AltAz margin %"
@@ -245,10 +374,22 @@ DEFAULT_CONFIG = {
     "altaz_nanize": True,  # UI: "Alt-Az → NaN"
     "altaz_alpha_soft_threshold": 0.001,
     "altaz_nanize_threshold": 0.001,
+    # Policy for groups with unknown EQMODE markers:
+    # - auto: treat UNKNOWN as ALT_AZ only for Seestar-like datasets
+    # - on:   always treat UNKNOWN as ALT_AZ
+    # - off:  never treat UNKNOWN as ALT_AZ
+    "altaz_unknown_policy": "auto",
     # --- Alt-Az coverage-based mask (Master Tiles) ---
     "altaz_min_coverage_abs": 3.0,
     "altaz_min_coverage_frac": 0.5,
     "altaz_morph_open_px": 3,
+    # --- Alt-Az strict overlap crop (Master Tiles) ---
+    # Crops Alt-Az master tiles to the high-confidence core bbox from coverage-driven alpha.
+    "altaz_strict_overlap_crop_enabled": True,
+    "altaz_strict_overlap_crop_alpha_threshold": 0.02,
+    "altaz_strict_overlap_crop_min_nonzero_frac": 0.08,
+    "altaz_strict_overlap_crop_bbox_pad_px": 6,
+    "altaz_strict_overlap_crop_min_size_px": 256,
     # --- Alt-Az Alpha export ---
     "altaz_export_alpha_fits": True,
     "altaz_export_alpha_sidecar": False,
@@ -256,6 +397,10 @@ DEFAULT_CONFIG = {
     # --- Qualité avancée ---
     "quality_crop_min_run": 2,  # UI: "min run"
     "crop_follow_signal": True,
+    # Drop statistically dead aligned frames before normalization/weighting.
+    "stack_stat_min_finite_frac": 0.02,
+    "stack_stat_min_nonzero_frac": 1e-5,
+    "stack_stat_min_finite_px_per_channel": 4096,
     # --- FIN CLES POUR LE ROGNAGE ---
 }
 
@@ -512,9 +657,39 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 def get_config_path():
     """
     Retourne le chemin du fichier de configuration.
-    Le fichier est stocké dans le répertoire utilisateur ZeMosaic.
+    Le fichier est stocké dans le répertoire du repo ZeMosaic.
     """
-    return str(ensure_user_config_dir() / CONFIG_FILE_NAME)
+    return str(_SCRIPT_DIR / CONFIG_FILE_NAME)
+
+def _sync_path_aliases(config_obj: dict) -> dict:
+    """Keep legacy/new path keys synchronized.
+
+    Source of truth: prefer *_dir keys (used by Qt GUI), fallback to *_folder.
+    Always mirror both directions so external edits are visible in UI and vice versa.
+    """
+    if not isinstance(config_obj, dict):
+        return config_obj
+
+    def _norm(v):
+        if v is None:
+            return ""
+        txt = str(v).strip()
+        return txt
+
+    input_dir = _norm(config_obj.get("input_dir", ""))
+    input_folder = _norm(config_obj.get("input_folder", ""))
+    output_dir = _norm(config_obj.get("output_dir", ""))
+    output_folder = _norm(config_obj.get("output_folder", ""))
+
+    canonical_input = input_dir or input_folder
+    canonical_output = output_dir or output_folder
+
+    config_obj["input_dir"] = canonical_input
+    config_obj["input_folder"] = canonical_input
+    config_obj["output_dir"] = canonical_output
+    config_obj["output_folder"] = canonical_output
+
+    return config_obj
 
 def load_config():
     config_path = Path(get_config_path())
@@ -529,26 +704,20 @@ def load_config():
                 loaded_config = json.load(f)
                 for key, default_value in DEFAULT_CONFIG.items():
                     current_config[key] = loaded_config.get(key, default_value)
-                # Gérer les clés obsolètes ou nouvelles non présentes dans DEFAULT_CONFIG
-                # Par exemple, on pourrait choisir de ne garder que les clés de DEFAULT_CONFIG
-                # ou d'ajouter les nouvelles clés de loaded_config qui ne sont pas dans DEFAULT_CONFIG.
-                # Pour l'instant, la boucle ci-dessus s'assure que toutes les clés de DEFAULT_CONFIG
-                # sont présentes dans current_config, en prenant la valeur chargée si elle existe.
+                # Preserve power-user / hidden keys that are present in JSON but not
+                # declared in DEFAULT_CONFIG so GUI round-trips never erase them.
+                if isinstance(loaded_config, dict):
+                    for key, value in loaded_config.items():
+                        if key not in current_config:
+                            current_config[key] = value
         except json.JSONDecodeError:
-            # Utiliser mb (messagebox) si disponible, sinon print
             msg_title = "Config Error"
             msg_text = f"Error reading {config_path}. Using default configuration."
-            try:
-                if mb: mb.showwarning(msg_title, msg_text)
-                else: print(f"WARNING: {msg_title} - {msg_text}")
-            except Exception: print(f"WARNING: {msg_title} - {msg_text} (messagebox error)")
+            print(f"WARNING: {msg_title} - {msg_text}")
         except Exception as e:
             msg_title = "Config Error"
             msg_text = f"Unexpected error reading {config_path}: {e}. Using defaults."
-            try:
-                if mb: mb.showerror(msg_title, msg_text)
-                else: print(f"ERROR: {msg_title} - {msg_text}")
-            except Exception: print(f"ERROR: {msg_title} - {msg_text} (messagebox error)")
+            print(f"ERROR: {msg_title} - {msg_text}")
     # else:
         # print(f"Config file not found at {config_path}. Using default configuration.")
     current_config.setdefault("crop_follow_signal", False)
@@ -568,6 +737,15 @@ def load_config():
                 current_config[key] = str(expanded)
     _apply_astap_platform_defaults(current_config)
     _normalize_gpu_flags(current_config)
+
+    # Qt-only migration: backend selection is obsolete in official runtime.
+    # Keep backward readability for legacy config files, but neutralize runtime state.
+    legacy_backend = str(current_config.get("preferred_gui_backend", "") or "").strip().lower()
+    if legacy_backend == "tk":
+        current_config["preferred_gui_backend"] = "qt"
+    elif legacy_backend != "qt":
+        current_config["preferred_gui_backend"] = "qt"
+    current_config["preferred_gui_backend_explicit"] = False
 
     def _env_flag(env_key: str, default: bool) -> bool:
         val = os.environ.get(env_key)
@@ -598,10 +776,15 @@ def load_config():
         fmt_val = "png"
     current_config["altaz_alpha_sidecar_format"] = fmt_val
 
+    _sync_path_aliases(current_config)
     return current_config
 
 def save_config(config_data):
     _normalize_gpu_flags(config_data)
+    # Qt-only official runtime: always persist neutral backend selection state.
+    if isinstance(config_data, dict):
+        config_data["preferred_gui_backend"] = "qt"
+        config_data["preferred_gui_backend_explicit"] = False
     config_path = Path(get_config_path())
     config_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -614,15 +797,26 @@ def save_config(config_data):
                     existing_resume = loaded_existing.get("resume")
             except Exception:
                 existing_resume = None
-        # Avant de sauvegarder, s'assurer que config_data ne contient que les clés attendues
-        # pour éviter d'écrire des clés temporaires ou obsolètes.
-        # On ne garde que les clés qui sont dans DEFAULT_CONFIG.
+        # Preserve unknown/power-user keys already present in JSON, then overlay
+        # current config values. This guarantees GUI saves are non-destructive.
         config_to_save = {}
-        for key in DEFAULT_CONFIG.keys():
-            if key in config_data:
-                config_to_save[key] = config_data[key]
-            # else: # Optionnel: si une clé par défaut manque dans config_data, la remettre
-            #     config_to_save[key] = DEFAULT_CONFIG[key]
+        existing_payload = None
+        if config_path.exists():
+            try:
+                with config_path.open("r", encoding="utf-8") as existing_handle:
+                    existing_payload = json.load(existing_handle)
+            except Exception:
+                existing_payload = None
+        if isinstance(existing_payload, dict):
+            config_to_save.update(existing_payload)
+
+        if isinstance(config_data, dict):
+            config_to_save.update(config_data)
+
+        # Ensure known defaults always exist for forward compatibility.
+        for key, default_value in DEFAULT_CONFIG.items():
+            if key not in config_to_save:
+                config_to_save[key] = default_value
 
         default_resume = DEFAULT_CONFIG.get("resume")
         if existing_resume is not None and isinstance(config_data, dict):
@@ -646,6 +840,7 @@ def save_config(config_data):
              return False # Ne pas créer un fichier vide
 
 
+        _sync_path_aliases(config_to_save)
         with config_path.open("w", encoding="utf-8") as f: # Spécifier encoding
             json.dump(config_to_save, f, indent=4, ensure_ascii=False) # ensure_ascii=False pour les caractères non-ASCII
         print(f"Configuration sauvegardée vers {config_path}")
@@ -653,22 +848,13 @@ def save_config(config_data):
     except IOError as e:
         msg_title = "Config Error"
         msg_text = f"Unable to save configuration to {config_path}:\n{e}"
-        try:
-            if mb: mb.showerror(msg_title, msg_text)
-            else: print(f"ERROR: {msg_title} - {msg_text}")
-        except Exception: print(f"ERROR: {msg_title} - {msg_text} (messagebox error)")
+        print(f"ERROR: {msg_title} - {msg_text}")
         return False
-
-# Les fonctions ask_and_set_... et get_... restent les mêmes,
-# elles utiliseront le nouveau chemin via get_config_path().
-# Assurez-vous que tkinter.filedialog (fd) est importé si vous l'utilisez dans ces fonctions.
-# Par exemple :
-# import tkinter.filedialog as fd # Au début du fichier si ce n'est pas déjà fait globalement
-# ... (vos fonctions ask_and_set_astap_path, etc.)
 
 def ask_and_set_astap_path(current_config):
     """Prompt the user for the ASTAP executable in a cross-platform friendly way."""
-    if fd is None:
+    dialog_fd, dialog_mb = _ensure_tk_dialogs_loaded()
+    if dialog_fd is None:
         print("ASTAP path prompt unavailable (tkinter non installé).")
         return current_config.get("astap_executable_path", "")
 
@@ -683,20 +869,20 @@ def ask_and_set_astap_path(current_config):
     else:
         filetypes = (("Binaires", "astap"), ("Tous les fichiers", "*"))
 
-    astap_path = fd.askopenfilename(
+    astap_path = dialog_fd.askopenfilename(
         title="Sélectionner l'exécutable ASTAP",
         filetypes=filetypes,
     )
     if IS_MAC and not astap_path:
         # Allow selecting the .app bundle if the binary is hidden.
-        astap_path = fd.askdirectory(title="Sélectionner l'application ASTAP (.app)")
+        astap_path = dialog_fd.askdirectory(title="Sélectionner l'application ASTAP (.app)")
 
     resolved_path = _resolve_astap_executable(astap_path)
     if not resolved_path:
         if astap_path:
             message = f"Le chemin sélectionné ne semble pas contenir l'exécutable ASTAP: {astap_path}"
-            if mb:
-                mb.showwarning("Chemin ASTAP invalide", message, parent=None)
+            if dialog_mb:
+                dialog_mb.showwarning("Chemin ASTAP invalide", message, parent=None)
             else:
                 print(f"WARNING: {message}")
         return current_config.get("astap_executable_path", "")
@@ -704,8 +890,8 @@ def ask_and_set_astap_path(current_config):
     current_config["astap_executable_path"] = resolved_path
     if save_config(current_config):
         msg = f"Chemin ASTAP défini à : {resolved_path}"
-        if mb:
-            mb.showinfo("Chemin ASTAP Défini", msg, parent=None)
+        if dialog_mb:
+            dialog_mb.showinfo("Chemin ASTAP Défini", msg, parent=None)
         else:
             print(msg)
     return resolved_path
@@ -713,19 +899,20 @@ def ask_and_set_astap_path(current_config):
 
 def ask_and_set_astap_data_dir_path(current_config):
     """Prompt for the ASTAP star database directory."""
-    if fd is None:
+    dialog_fd, dialog_mb = _ensure_tk_dialogs_loaded()
+    if dialog_fd is None:
         print("ASTAP data directory prompt indisponible (tkinter non installé).")
         return current_config.get("astap_data_directory_path", "")
 
-    astap_data_dir = fd.askdirectory(
+    astap_data_dir = dialog_fd.askdirectory(
         title="Sélectionner le dossier de données ASTAP (contenant G17, H17, etc.)"
     )
     resolved_dir = _resolve_astap_data_dir(astap_data_dir)
     if not resolved_dir:
         if astap_data_dir:
             message = f"Le dossier sélectionné n'existe pas ou ne contient pas les catalogues ASTAP: {astap_data_dir}"
-            if mb:
-                mb.showwarning("Dossier ASTAP invalide", message, parent=None)
+            if dialog_mb:
+                dialog_mb.showwarning("Dossier ASTAP invalide", message, parent=None)
             else:
                 print(f"WARNING: {message}")
         return current_config.get("astap_data_directory_path", "")
@@ -733,8 +920,8 @@ def ask_and_set_astap_data_dir_path(current_config):
     current_config["astap_data_directory_path"] = resolved_dir
     if save_config(current_config):
         msg = f"Dossier de données ASTAP défini à : {resolved_dir}"
-        if mb:
-            mb.showinfo("Dossier Données ASTAP Défini", msg, parent=None)
+        if dialog_mb:
+            dialog_mb.showinfo("Dossier Données ASTAP Défini", msg, parent=None)
         else:
             print(msg)
     return resolved_dir

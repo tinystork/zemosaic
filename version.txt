@@ -1,0 +1,5 @@
+ZeMosaic 4.4.1
+Windows x64
+Installer build
+CuPy CUDA 12.x bundle
+Automatic CPU fallback enabled

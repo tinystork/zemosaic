@@ -1,0 +1,113 @@
+numpy
+matplotlib
+astropy
+astroquery
+reproject
+astroalign
+opencv-python-headless
+psutil>=5.9
+fsspec
+bottleneck
+threadpoolctl
+Photutils
+zarr>=2
+packaging
+shapely                     # Geometry operations (used by ccdproc)
+
+# --- Optional GUI & tooling dependencies ---
+PySide6>=6.6                # Required official frontend (Qt-only)
+PyQt5                       # Standalone visu.py FITS viewer
+wmi; platform_system == "Windows"     # Windows-only GPU detection helper
+
+# --- Optional science / analysis helpers ---
+acstools                    # Satellite trail detection (enable when needed)
+
+# ---------------------------------------------------------------------------
+# NOTES ON NUMPY 2.x COMPATIBILITY (IMPORTANT!)
+# ---------------------------------------------------------------------------
+# This project has been tested with NumPy 2.x (e.g., 2.0.0).
+# However, some users with NumPy >= 2.0 might encounter errors when using
+# optional GPU acceleration with certain CuPy versions, specifically errors like:
+# "Unable to avoid copy while creating an array as requested."
+#
+# If you encounter this error *while using the GPU*, it likely indicates a
+# compatibility issue between your specific NumPy 2.x version and your CuPy version.
+#
+# TROUBLESHOOTING: If you see the error above and want to use the GPU:
+#   1. Ensure you have the LATEST CuPy version matching your CUDA Toolkit.
+#   2. If the error persists, try DOWNGRADING NumPy to the latest 1.x release as a
+#      temporary workaround:
+#      pip install "numpy<2.0"
+#
+# If you are *not* using the GPU, NumPy 2.x should generally work fine, and
+# the program's CPU fallback will handle any GPU-specific errors.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# OPTIONAL GPU ACCELERATION (CUDA for Core App)
+# ---------------------------------------------------------------------------
+# This file intentionally excludes CuPy so build environments stay CPU-only by
+# default. Install the matching package manually if you want a GPU-enabled build.
+#
+# Example:
+#   pip install cupy-cuda12x
+#
+# Find the correct package for your CUDA version:
+#   https://docs.cupy.dev/en/stable/install.html
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# DEPENDENCIES FOR STANDALONE TOOLS (Not required for Seestar Stacker GUI)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Dependencies ONLY for sat_trail.py (Satellite Trail Analyzer Tool)
+# ---------------------------------------------------------------------------
+# acstools                # For satellite trail detection (satdet.detsat using Hough)
+# scipy                   # Dependency for acstools/skimage/other scientific tasks
+
+# ---------------------------------------------------------------------------
+# Dependencies ONLY for visu.py (PyQt5 FITS Viewer Tool)
+# ---------------------------------------------------------------------------
+# PyQt5 is documented in the optional GUI dependencies section above.
+
+# ===========================================================================
+# FIN DES NOTES (Version Française)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# NOTES SUR LA COMPATIBILITÉ NUMPY 2.x (IMPORTANT !)
+# ---------------------------------------------------------------------------
+# Ce projet a été testé avec NumPy 2.x (ex: 2.0.0).
+# Cependant, certains utilisateurs avec NumPy >= 2.0 pourraient rencontrer des
+# erreurs en utilisant l'accélération GPU optionnelle avec certaines versions
+# de CuPy, notamment des erreurs comme :
+# "Unable to avoid copy while creating an array as requested."
+#
+# Si vous rencontrez cette erreur *en utilisant le GPU*, cela indique probablement
+# un problème de compatibilité entre votre version spécifique de NumPy 2.x et
+# votre version de CuPy.
+#
+# DÉPANNAGE : Si vous voyez l'erreur ci-dessus et souhaitez utiliser le GPU :
+#   1. Assurez-vous d'avoir la DERNIÈRE version de CuPy correspondant à votre CUDA Toolkit.
+#   2. Si l'erreur persiste, essayez de REVENIR à la dernière version 1.x de NumPy
+#      comme solution temporaire :
+#      pip install "numpy<2.0"
+#
+# Si vous n'utilisez *pas* le GPU, NumPy 2.x devrait fonctionner correctement, et
+# le repli sur CPU du programme gérera les erreurs spécifiques au GPU.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ACCÉLÉRATION GPU OPTIONNELLE (CUDA pour l'App Principale)
+# ---------------------------------------------------------------------------
+# Ce fichier exclut volontairement CuPy afin de garder les environnements de
+# build en mode CPU par défaut. Installez manuellement le paquet adapté si vous
+# voulez un build avec support GPU.
+#
+# Exemple :
+#   pip install cupy-cuda12x
+#
+# Trouvez le paquet correspondant à votre version de CUDA :
+#   https://docs.cupy.dev/en/stable/install.html
+# ---------------------------------------------------------------------------

@@ -267,35 +267,157 @@ def _extract_parallel_plan_hints(parallel_plan: Any | None) -> dict[str, int | N
     return hints
 
 
-def equalize_rgb_medians_inplace(img: np.ndarray) -> tuple[float, float, float, float]:
-    """In-place per-channel median equalization so that median(R)==median(G)==median(B)."""
+def _parse_percentile_pair(raw: Any, default: tuple[float, float]) -> tuple[float, float]:
+    lo, hi = default
+    try:
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            lo = float(raw[0])
+            hi = float(raw[1])
+        elif isinstance(raw, str):
+            parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+            if len(parts) >= 2:
+                lo = float(parts[0])
+                hi = float(parts[1])
+    except Exception:
+        lo, hi = default
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        lo, hi = default
+    lo = float(np.clip(lo, 0.0, 100.0))
+    hi = float(np.clip(hi, 0.0, 100.0))
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _parse_gain_clip_pair(raw: Any, default: tuple[float, float]) -> tuple[float, float]:
+    lo, hi = _parse_percentile_pair(raw, default)
+    if lo <= 0.0:
+        lo = default[0]
+    if hi <= 0.0:
+        hi = default[1]
+    if lo > hi:
+        lo, hi = hi, lo
+    return float(lo), float(hi)
+
+
+def equalize_rgb_medians_inplace(
+    img: np.ndarray,
+    *,
+    gain_clip: tuple[float, float] = (0.95, 1.05),
+    bg_percentile: tuple[float, float] = (5.0, 85.0),
+    min_samples: int = 5000,
+    min_coverage: float = 0.01,
+    return_info: bool = False,
+) -> tuple[float, float, float, float] | dict[str, Any]:
+    """Conservative in-place RGB equalization using a robust background mask."""
+
+    neutral_info: dict[str, Any] = {
+        "applied": False,
+        "decision": "invalid_input",
+        "samples": 0,
+        "mask_coverage": 0.0,
+        "target_median": float("nan"),
+        "raw_gains": [1.0, 1.0, 1.0],
+        "clipped_gains": [1.0, 1.0, 1.0],
+        "gain_r": 1.0,
+        "gain_g": 1.0,
+        "gain_b": 1.0,
+    }
 
     if img is None or img.ndim != 3 or img.shape[2] != 3:
-        return (1.0, 1.0, 1.0, float("nan"))
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
 
-    med = np.nanmedian(img, axis=(0, 1)).astype(np.float32)
-    finite = np.isfinite(med) & (med > 0)
-    if not np.any(finite):
-        return (1.0, 1.0, 1.0, float("nan"))
+    arr = np.asarray(img, dtype=np.float32)
+    finite = np.isfinite(arr)
+    positive = arr > 0
+    valid_rgb = np.all(finite & positive, axis=2)
+    valid_count = int(np.count_nonzero(valid_rgb))
+    if valid_count <= 0:
+        neutral_info["decision"] = "no_valid_pixels"
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
 
-    target = float(np.nanmedian(med[finite]))
-    gains = np.ones(3, dtype=np.float32)
-    gains[finite] = target / med[finite]
-    # Perform in-place multiply but tolerate read-only buffers by skipping
-    # the write and just returning computed gains.
+    lo_p, hi_p = _parse_percentile_pair(bg_percentile, (5.0, 85.0))
+    clip_lo, clip_hi = _parse_gain_clip_pair(gain_clip, (0.95, 1.05))
+
+    lum = np.nanmedian(arr, axis=2)
+    lum_vals = lum[valid_rgb & np.isfinite(lum)]
+    if lum_vals.size == 0:
+        neutral_info["decision"] = "invalid_luminance"
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
     try:
-        if not img.flags.writeable:
+        p_lo, p_hi = np.nanpercentile(lum_vals, [lo_p, hi_p])
+    except Exception:
+        neutral_info["decision"] = "percentile_error"
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
+    mask = valid_rgb & np.isfinite(lum) & (lum >= p_lo) & (lum <= p_hi)
+    samples = int(np.count_nonzero(mask))
+    coverage = float(samples / valid_count) if valid_count > 0 else 0.0
+
+    try:
+        min_samples_i = max(1, int(min_samples))
+    except Exception:
+        min_samples_i = 5000
+    try:
+        min_coverage_f = float(min_coverage)
+    except Exception:
+        min_coverage_f = 0.01
+    if not np.isfinite(min_coverage_f):
+        min_coverage_f = 0.01
+    min_coverage_f = float(np.clip(min_coverage_f, 0.0, 1.0))
+
+    if samples < min_samples_i:
+        neutral_info.update(samples=samples, mask_coverage=coverage, decision="insufficient_samples")
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+    if coverage < min_coverage_f:
+        neutral_info.update(samples=samples, mask_coverage=coverage, decision="insufficient_coverage")
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
+    med = np.array([np.nanmedian(arr[..., c][mask]) for c in range(3)], dtype=np.float32)
+    finite_chan = np.isfinite(med) & (med > 0)
+    if not np.any(finite_chan):
+        neutral_info.update(samples=samples, mask_coverage=coverage, decision="invalid_channel_medians")
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
+    target = float(np.nanmedian(med[finite_chan]))
+    if not np.isfinite(target) or target <= 0:
+        neutral_info.update(samples=samples, mask_coverage=coverage, decision="invalid_target")
+        return neutral_info if return_info else (1.0, 1.0, 1.0, float("nan"))
+
+    raw_gains = np.ones(3, dtype=np.float32)
+    raw_gains[finite_chan] = target / med[finite_chan]
+    clipped = np.clip(raw_gains, clip_lo, clip_hi).astype(np.float32)
+
+    applied = False
+    decision = "applied"
+    try:
+        if not arr.flags.writeable:
             try:
-                img.setflags(write=True)
+                arr.setflags(write=True)
             except Exception:
                 pass
-        np.multiply(img, gains[None, None, :], out=img, casting="unsafe")
+        np.multiply(arr, clipped[None, None, :], out=arr, casting="unsafe")
+        applied = True
     except Exception:
-        # If we can't apply in place (e.g., read-only memmap), skip silently.
-        # Caller records gains in metadata; visual effect may differ slightly
-        # but the pipeline should continue.
-        return (float(gains[0]), float(gains[1]), float(gains[2]), target)
-    return (float(gains[0]), float(gains[1]), float(gains[2]), target)
+        decision = "write_failed"
+        applied = False
+
+    info = {
+        "applied": bool(applied),
+        "decision": decision if applied else decision,
+        "samples": samples,
+        "mask_coverage": coverage,
+        "target_median": float(target),
+        "raw_gains": [float(raw_gains[0]), float(raw_gains[1]), float(raw_gains[2])],
+        "clipped_gains": [float(clipped[0]), float(clipped[1]), float(clipped[2])],
+        "gain_r": float(clipped[0]),
+        "gain_g": float(clipped[1]),
+        "gain_b": float(clipped[2]),
+    }
+    if return_info:
+        return info
+    return (float(clipped[0]), float(clipped[1]), float(clipped[2]), float(target))
 
 
 def _coerce_config_bool(value: Any, default: bool = True) -> bool:
@@ -325,9 +447,9 @@ def _poststack_rgb_equalization(
     zconfig=None,
     stack_metadata: dict | None = None,
 ) -> dict:
-    """Apply optional RGB equalization and record metadata."""
+    """Apply optional conservative RGB equalization and record telemetry."""
 
-    default_enabled = True
+    default_enabled = False
     try:
         if isinstance(zconfig, dict):
             enabled = _coerce_config_bool(zconfig.get("poststack_equalize_rgb", default_enabled), default_enabled)
@@ -336,6 +458,25 @@ def _poststack_rgb_equalization(
     except Exception:
         enabled = default_enabled
 
+    def _cfg_get(name: str, default: Any) -> Any:
+        try:
+            if isinstance(zconfig, dict):
+                return zconfig.get(name, default)
+            return getattr(zconfig, name, default)
+        except Exception:
+            return default
+
+    gain_clip = _parse_gain_clip_pair(_cfg_get("poststack_rgb_equalize_gain_clip", (0.95, 1.05)), (0.95, 1.05))
+    bg_percentile = _parse_percentile_pair(_cfg_get("poststack_rgb_equalize_bg_percentile", (5.0, 85.0)), (5.0, 85.0))
+    try:
+        min_samples = int(_cfg_get("poststack_rgb_equalize_min_samples", 5000))
+    except Exception:
+        min_samples = 5000
+    try:
+        min_coverage = float(_cfg_get("poststack_rgb_equalize_min_coverage", 0.01))
+    except Exception:
+        min_coverage = 0.01
+
     info = {
         "enabled": enabled,
         "applied": False,
@@ -343,6 +484,11 @@ def _poststack_rgb_equalization(
         "gain_g": 1.0,
         "gain_b": 1.0,
         "target_median": float("nan"),
+        "samples": 0,
+        "mask_coverage": 0.0,
+        "raw_gains": [1.0, 1.0, 1.0],
+        "clipped_gains": [1.0, 1.0, 1.0],
+        "decision": "disabled",
     }
 
     if not enabled or stacked is None or not isinstance(stacked, np.ndarray):
@@ -351,29 +497,56 @@ def _poststack_rgb_equalization(
         return info
 
     if stacked.ndim != 3 or stacked.shape[2] != 3:
+        info["decision"] = "non_rgb"
         if stack_metadata is not None:
             stack_metadata["rgb_equalization"] = info
         return info
 
     try:
-        gain_r, gain_g, gain_b, target = equalize_rgb_medians_inplace(stacked)
-        info.update(
-            gain_r=float(gain_r),
-            gain_g=float(gain_g),
-            gain_b=float(gain_b),
-            target_median=float(target),
+        eq_info = equalize_rgb_medians_inplace(
+            stacked,
+            gain_clip=gain_clip,
+            bg_percentile=bg_percentile,
+            min_samples=min_samples,
+            min_coverage=min_coverage,
+            return_info=True,
         )
-        if np.isfinite(target):
-            info["applied"] = True
+        if isinstance(eq_info, dict):
+            info.update(
+                applied=bool(eq_info.get("applied", False)),
+                gain_r=float(eq_info.get("gain_r", 1.0)),
+                gain_g=float(eq_info.get("gain_g", 1.0)),
+                gain_b=float(eq_info.get("gain_b", 1.0)),
+                target_median=float(eq_info.get("target_median", float("nan"))),
+                samples=int(eq_info.get("samples", 0) or 0),
+                mask_coverage=float(eq_info.get("mask_coverage", 0.0) or 0.0),
+                raw_gains=list(eq_info.get("raw_gains", [1.0, 1.0, 1.0])),
+                clipped_gains=list(eq_info.get("clipped_gains", [1.0, 1.0, 1.0])),
+                decision=str(eq_info.get("decision", "no-op")),
+            )
+        if info["applied"]:
             _internal_logger.info(
-                "[RGB-EQ] Applied per-substack RGB median equalization: "
-                f"gains (R,G,B)=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target_median={target:.6g}"
+                "[RGB-EQ] poststack robust eq applied: samples=%d, mask_coverage=%.4f, "
+                "raw_gains=(%.6f,%.6f,%.6f), clipped_gains=(%.6f,%.6f,%.6f), target=%.6g",
+                info["samples"],
+                info["mask_coverage"],
+                float(info["raw_gains"][0]),
+                float(info["raw_gains"][1]),
+                float(info["raw_gains"][2]),
+                float(info["clipped_gains"][0]),
+                float(info["clipped_gains"][1]),
+                float(info["clipped_gains"][2]),
+                info["target_median"],
             )
         else:
             _internal_logger.info(
-                "[RGB-EQ] Skipped RGB equalization due to non-finite channel medians."
+                "[RGB-EQ] poststack robust eq no-op: decision=%s, samples=%d, mask_coverage=%.4f",
+                info.get("decision", "no-op"),
+                info["samples"],
+                info["mask_coverage"],
             )
     except Exception as exc:
+        info["decision"] = "error"
         _internal_logger.warning(f"[RGB-EQ] Skipped RGB equalization due to error: {exc}")
     finally:
         if stack_metadata is not None:
@@ -2494,7 +2667,8 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
         progress_callback (callable, optional): Fonction de callback pour les logs.
 
     Returns:
-        tuple[float, float]: (stat_low, stat_high). Retourne (0.0, 1.0) en cas d'erreur majeure.
+        tuple[float, float]: (stat_low, stat_high).
+        Retourne (nan, nan) en cas d'erreur majeure / données inexploitable.
     """
     # Define a local alias for the callback for brevity and safety
     # Uses _internal_logger as a fallback if progress_callback is None
@@ -2505,18 +2679,18 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
         _pcb("stathelper_error_invalid_input_for_stats", lvl="WARN",
              shape=image_data_2d_float32.shape if hasattr(image_data_2d_float32, 'shape') else 'N/A',
              ndim=image_data_2d_float32.ndim if hasattr(image_data_2d_float32, 'ndim') else 'N/A')
-        return 0.0, 1.0 # Fallback pour une entrée clairement incorrecte
+        return float("nan"), float("nan") # Fallback pour une entrée clairement incorrecte
 
     if image_data_2d_float32.size == 0:
         _pcb("stathelper_error_empty_image_for_stats", lvl="WARN")
-        return 0.0, 1.0
+        return float("nan"), float("nan")
 
     # Assurer que les données sont finies pour le calcul des percentiles
     # np.nanpercentile gère déjà les NaNs, mais il est bon de savoir si tout est non-fini.
     finite_data = image_data_2d_float32[np.isfinite(image_data_2d_float32)]
     if finite_data.size == 0:
         _pcb("stathelper_warn_all_nan_or_inf_for_stats", lvl="WARN")
-        return 0.0, 1.0 # Pas de données valides pour calculer les percentiles
+        return float("nan"), float("nan") # Pas de données valides pour calculer les percentiles
 
     try:
         # Prefer GPU percentiles when requested and available
@@ -2550,7 +2724,7 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
              stat_high = float(np.max(finite_data))
              _pcb(f"stathelper_warn_percentile_exception_fallback_minmax: low={stat_low:.3g}, high={stat_high:.3g}", lvl="WARN")
         else: # Ne devrait jamais être atteint si la logique précédente est correcte
-            return 0.0, 1.0
+            return float("nan"), float("nan")
 
 
     # Gérer le cas où l'image est (presque) plate
@@ -4629,6 +4803,120 @@ def stack_aligned_images(
         else:
             return _internal_logger.debug(f"PCB_FALLBACK_{level}_{prog}: {msg_key} {kwargs}")
 
+    try:
+        stat_min_finite_frac = float(getattr(zconfig, "stack_stat_min_finite_frac", 0.02)) if zconfig is not None else 0.02
+    except Exception:
+        stat_min_finite_frac = 0.02
+    try:
+        stat_min_nonzero_frac = float(getattr(zconfig, "stack_stat_min_nonzero_frac", 1e-5)) if zconfig is not None else 1e-5
+    except Exception:
+        stat_min_nonzero_frac = 1e-5
+    try:
+        stat_min_finite_px_per_channel = int(getattr(zconfig, "stack_stat_min_finite_px_per_channel", 4096)) if zconfig is not None else 4096
+    except Exception:
+        stat_min_finite_px_per_channel = 4096
+    stat_min_finite_frac = float(np.clip(stat_min_finite_frac, 0.0, 1.0))
+    stat_min_nonzero_frac = float(np.clip(stat_min_nonzero_frac, 0.0, 1.0))
+    stat_min_finite_px_per_channel = max(0, int(stat_min_finite_px_per_channel))
+
+    def _filter_statistically_dead_frames(
+        images_in: list[np.ndarray],
+        *,
+        stage: str,
+    ) -> list[np.ndarray]:
+        kept: list[np.ndarray] = []
+        drop_counts: dict[str, int] = {}
+        for idx_local, img_local in enumerate(images_in):
+            if img_local is None:
+                drop_counts["none"] = drop_counts.get("none", 0) + 1
+                continue
+            arr = np.asarray(img_local, dtype=np.float32)
+            if arr.size == 0:
+                drop_counts["empty"] = drop_counts.get("empty", 0) + 1
+                continue
+
+            finite_mask = np.isfinite(arr)
+            finite_px = int(np.count_nonzero(finite_mask))
+            finite_frac = float(finite_px / arr.size) if arr.size else 0.0
+            if finite_frac < stat_min_finite_frac:
+                drop_counts["finite_frac_below_threshold"] = drop_counts.get("finite_frac_below_threshold", 0) + 1
+                _pcb(
+                    "STACK_IMG_STAT_DROP",
+                    lvl="WARN",
+                    stage=stage,
+                    img_idx=int(idx_local),
+                    reason="finite_frac_below_threshold",
+                    finite_frac=float(finite_frac),
+                    threshold=float(stat_min_finite_frac),
+                )
+                continue
+
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            nz_frac = float(np.count_nonzero(np.abs(arr) > 1e-12) / arr.size) if arr.size else 0.0
+            if nz_frac < stat_min_nonzero_frac:
+                drop_counts["nonzero_frac_below_threshold"] = drop_counts.get("nonzero_frac_below_threshold", 0) + 1
+                _pcb(
+                    "STACK_IMG_STAT_DROP",
+                    lvl="WARN",
+                    stage=stage,
+                    img_idx=int(idx_local),
+                    reason="nonzero_frac_below_threshold",
+                    nonzero_frac=float(nz_frac),
+                    threshold=float(stat_min_nonzero_frac),
+                )
+                continue
+
+            if arr.ndim == 3 and arr.shape[-1] in (1, 3):
+                per_ch = [int(np.count_nonzero(np.isfinite(arr[..., c]))) for c in range(arr.shape[-1])]
+                if min(per_ch) < stat_min_finite_px_per_channel:
+                    drop_counts["finite_px_per_channel_below_threshold"] = drop_counts.get("finite_px_per_channel_below_threshold", 0) + 1
+                    _pcb(
+                        "STACK_IMG_STAT_DROP",
+                        lvl="WARN",
+                        stage=stage,
+                        img_idx=int(idx_local),
+                        reason="finite_px_per_channel_below_threshold",
+                        min_px=int(min(per_ch)),
+                        threshold=int(stat_min_finite_px_per_channel),
+                    )
+                    continue
+            elif arr.ndim == 2:
+                if finite_px < stat_min_finite_px_per_channel:
+                    drop_counts["finite_px_below_threshold"] = drop_counts.get("finite_px_below_threshold", 0) + 1
+                    _pcb(
+                        "STACK_IMG_STAT_DROP",
+                        lvl="WARN",
+                        stage=stage,
+                        img_idx=int(idx_local),
+                        reason="finite_px_below_threshold",
+                        finite_px=int(finite_px),
+                        threshold=int(stat_min_finite_px_per_channel),
+                    )
+                    continue
+
+            kept.append(np.ascontiguousarray(arr, dtype=np.float32))
+
+        if drop_counts:
+            dominant_reason = max(drop_counts.items(), key=lambda kv: kv[1])[0]
+            _pcb(
+                "STACK_IMG_STAT_FILTER_SUMMARY",
+                lvl="WARN",
+                stage=stage,
+                kept=int(len(kept)),
+                dropped=int(sum(drop_counts.values())),
+                dominant_reason=str(dominant_reason),
+                reasons=dict(drop_counts),
+            )
+        else:
+            _pcb(
+                "STACK_IMG_STAT_FILTER_SUMMARY",
+                lvl="DEBUG_DETAIL",
+                stage=stage,
+                kept=int(len(kept)),
+                dropped=0,
+            )
+        return kept
+
     _pcb("STACK_IMG_ENTRY: Début stack_aligned_images.", lvl="ERROR") # Log d'entrée
 
     plan_hints = _extract_parallel_plan_hints(parallel_plan)
@@ -4683,7 +4971,10 @@ def stack_aligned_images(
         _pcb("STACK_IMG_EXIT: Retourne None (pas d'images après check shape).", lvl="ERROR")
         return None
     
-    current_images_data_list = processed_images_for_stack # Renommage pour la suite
+    current_images_data_list = _filter_statistically_dead_frames(
+        processed_images_for_stack,
+        stage="pre_normalization",
+    )
     _pcb(f"STACK_IMG_PREP: {len(current_images_data_list)} images prêtes pour normalisation.", lvl="ERROR")
 
 
@@ -4711,18 +5002,13 @@ def stack_aligned_images(
         _pcb("STACK_IMG_EXIT: Retourne None (pas d'images après normalisation).", lvl="ERROR")
         return None
 
-    _pcb(f"STACK_IMG_NORM: {len(current_images_data_list)} images après normalisation. Vérification des non-finis POST-normalisation.", lvl="ERROR")
-    temp_list_post_norm = []
-    for idx_post_norm, img_post_norm in enumerate(current_images_data_list):
-        if img_post_norm is not None:
-            if not np.all(np.isfinite(img_post_norm)):
-                _pcb(f"STACK_IMG_NORM: AVERT Image post-norm {idx_post_norm} (shape {img_post_norm.shape}) a des non-finis. Remplacement par 0.", lvl="ERROR")
-                img_post_norm = np.nan_to_num(img_post_norm, nan=0.0, posinf=0.0, neginf=0.0)
-            temp_list_post_norm.append(img_post_norm)
-    current_images_data_list = temp_list_post_norm
-    del temp_list_post_norm
+    _pcb(f"STACK_IMG_NORM: {len(current_images_data_list)} images après normalisation. Vérification de viabilité statistique POST-normalisation.", lvl="ERROR")
+    current_images_data_list = _filter_statistically_dead_frames(
+        [img for img in current_images_data_list if img is not None],
+        stage="post_normalization",
+    )
     if not current_images_data_list: # Double check
-        _pcb("STACK_IMG_NORM: Toutes les images sont devenues None après nettoyage post-normalisation.", lvl="ERROR")
+        _pcb("STACK_IMG_NORM: Toutes les images sont devenues non-viables après filtrage post-normalisation.", lvl="ERROR")
         return None
 
 

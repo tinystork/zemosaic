@@ -1,0 +1,1286 @@
+#!/usr/bin/env python3
+"""Standalone GUI + CLI diagnostic for ZeMosaic master-tile overlaps (V2).
+
+V2 additions
+------------
+- Tile metrics CSV (neighbors, overlap robustness, peripheral distance)
+- Overview PNG with:
+  - footprints colored by number of neighbors
+  - overlap graph colored by overlap strength
+- Log summary sections for weakest links, weakest tiles, and peripheral tiles
+- GUI remains optional; CLI still works the same way
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import sys
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+try:
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.wcs.utils import proj_plane_pixel_scales
+    import astropy.units as u
+except Exception as exc:  # pragma: no cover
+    print(f"ERROR: astropy is required: {exc}", file=sys.stderr)
+    raise
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection, PatchCollection
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+    from matplotlib.patches import Polygon as MplPolygon
+except Exception as exc:  # pragma: no cover
+    print(f"ERROR: matplotlib is required: {exc}", file=sys.stderr)
+    raise
+
+try:
+    from PySide6.QtCore import QThread, Qt, QUrl, Signal
+    from PySide6.QtGui import QDesktopServices
+    from PySide6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QDoubleSpinBox,
+        QFileDialog,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QListWidget,
+        QListWidgetItem,
+        QMainWindow,
+        QMessageBox,
+        QPlainTextEdit,
+        QPushButton,
+        QSplitter,
+        QVBoxLayout,
+        QWidget,
+    )
+    HAVE_QT = True
+except Exception:
+    HAVE_QT = False
+
+
+FITS_EXTS = {".fits", ".fit", ".fts", ".fz"}
+
+
+@dataclass
+class TileInfo:
+    index: int
+    path: Path
+    name: str
+    shape_hw: Tuple[int, int]
+    center_radec_deg: Tuple[float, float]
+    center_xy_deg: Tuple[float, float]
+    pa_deg: Optional[float]
+    pixel_scale_arcsec: Optional[float]
+    footprint_radec_deg: np.ndarray
+    footprint_xy_deg: np.ndarray
+    area_sqdeg: float
+    width_deg: float
+    height_deg: float
+    filter_name: str
+    exposure_s: Optional[float]
+    date_obs: str
+    stack_count: Optional[int]
+    raw_header_keys: dict
+
+
+@dataclass
+class OverlapInfo:
+    i: int
+    j: int
+    tile_i: str
+    tile_j: str
+    area_sqdeg: float
+    frac_of_i: float
+    frac_of_j: float
+    pair_strength_min: float
+    pair_strength_avg: float
+    center_dist_deg: float
+    bbox_touch: bool
+
+
+@dataclass
+class TileMetric:
+    index: int
+    name: str
+    neighbors: int
+    best_local_overlap_frac: float
+    mean_local_overlap_frac: float
+    best_pair_strength: float
+    mean_pair_strength: float
+    total_pair_strength: float
+    center_x_deg: float
+    center_y_deg: float
+    radial_distance_deg: float
+    area_sqdeg: float
+    width_deg: float
+    height_deg: float
+    is_isolated: bool = False
+    is_low_neighbor: bool = False
+    is_low_best_overlap: bool = False
+    is_peripheral: bool = False
+
+
+@dataclass
+class DiagnosticConfig:
+    inputs: List[Path]
+    recursive: bool = True
+    outdir: Path = Path("tile_overlap_diag")
+    prefix: str = "master_tiles"
+    min_overlap_frac: float = 0.0
+    ref_ra: Optional[float] = None
+    ref_dec: Optional[float] = None
+    annotate: bool = False
+    draw_links: bool = True
+    top_n_summary: int = 20
+    label_top_n: int = 16
+
+
+@dataclass
+class DiagnosticResult:
+    tile_count: int
+    overlap_count: int
+    out_overview_png: Path
+    out_log: Path
+    out_overlaps_csv: Path
+    out_tiles_csv: Path
+
+
+class CancelledError(RuntimeError):
+    pass
+
+
+def polygon_area(poly: np.ndarray) -> float:
+    if poly is None or len(poly) < 3:
+        return 0.0
+    x = poly[:, 0]
+    y = poly[:, 1]
+    signed = 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    return abs(signed)
+
+
+def signed_polygon_area(poly: np.ndarray) -> float:
+    if poly is None or len(poly) < 3:
+        return 0.0
+    x = poly[:, 0]
+    y = poly[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _cross(a: np.ndarray, b: np.ndarray) -> float:
+    return float(a[0] * b[1] - a[1] * b[0])
+
+
+def _ensure_ccw(poly: np.ndarray) -> np.ndarray:
+    return poly.copy() if signed_polygon_area(poly) >= 0 else poly[::-1].copy()
+
+
+def _inside(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> bool:
+    return _cross(b - a, p - a) >= -1e-12
+
+
+def _segment_intersection(p1: np.ndarray, p2: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    r = p2 - p1
+    s = b - a
+    denom = _cross(r, s)
+    if abs(denom) < 1e-15:
+        return (p1 + p2) / 2.0
+    t = _cross(a - p1, s) / denom
+    return p1 + t * r
+
+
+def convex_polygon_intersection(subject: np.ndarray, clipper: np.ndarray) -> np.ndarray:
+    if subject is None or clipper is None or len(subject) < 3 or len(clipper) < 3:
+        return np.empty((0, 2), dtype=float)
+    output = _ensure_ccw(np.asarray(subject, dtype=float))
+    clip = _ensure_ccw(np.asarray(clipper, dtype=float))
+    for idx in range(len(clip)):
+        a = clip[idx]
+        b = clip[(idx + 1) % len(clip)]
+        input_list = output
+        if len(input_list) == 0:
+            break
+        output_pts: List[np.ndarray] = []
+        s = input_list[-1]
+        for e in input_list:
+            e_in = _inside(e, a, b)
+            s_in = _inside(s, a, b)
+            if e_in:
+                if not s_in:
+                    output_pts.append(_segment_intersection(s, e, a, b))
+                output_pts.append(e)
+            elif s_in:
+                output_pts.append(_segment_intersection(s, e, a, b))
+            s = e
+        output = np.array(output_pts, dtype=float) if output_pts else np.empty((0, 2), dtype=float)
+    return output
+
+
+def normalize_ra_deg(ra_deg: np.ndarray, ref_ra_deg: float) -> np.ndarray:
+    return ((ra_deg - ref_ra_deg + 180.0) % 360.0) - 180.0 + ref_ra_deg
+
+
+def project_radec_to_plane_deg(points_radec: np.ndarray, ref_ra_deg: float, ref_dec_deg: float) -> np.ndarray:
+    ra = normalize_ra_deg(np.asarray(points_radec[:, 0], dtype=float), ref_ra_deg)
+    dec = np.asarray(points_radec[:, 1], dtype=float)
+    cos_dec0 = math.cos(math.radians(ref_dec_deg))
+    if abs(cos_dec0) < 1e-8:
+        cos_dec0 = 1e-8 if cos_dec0 >= 0 else -1e-8
+    x = (ra - ref_ra_deg) * cos_dec0
+    y = dec - ref_dec_deg
+    return np.column_stack([x, y])
+
+
+def compute_position_angle_deg(wcs_obj: WCS, width: int, height: int) -> Optional[float]:
+    try:
+        cx = width / 2.0
+        cy = height / 2.0
+        c0 = wcs_obj.pixel_to_world(cx, cy)
+        c1 = wcs_obj.pixel_to_world(cx + 1.0, cy)
+        return float(c0.position_angle(c1).to(u.deg).value) % 360.0
+    except Exception:
+        return None
+
+
+def compute_footprint_radec_deg(wcs_obj: WCS, width: int, height: int) -> np.ndarray:
+    corners_px = np.array(
+        [
+            [0.0, 0.0],
+            [width - 1.0, 0.0],
+            [width - 1.0, height - 1.0],
+            [0.0, height - 1.0],
+        ],
+        dtype=float,
+    )
+    sky = wcs_obj.pixel_to_world(corners_px[:, 0], corners_px[:, 1])
+    ra_deg = np.asarray(sky.ra.to(u.deg).value, dtype=float)
+    dec_deg = np.asarray(sky.dec.to(u.deg).value, dtype=float)
+    return np.column_stack([ra_deg, dec_deg])
+
+
+def estimate_width_height_deg(poly_xy_deg: np.ndarray) -> Tuple[float, float]:
+    return (
+        float(np.nanmax(poly_xy_deg[:, 0]) - np.nanmin(poly_xy_deg[:, 0])),
+        float(np.nanmax(poly_xy_deg[:, 1]) - np.nanmin(poly_xy_deg[:, 1])),
+    )
+
+
+def extract_stack_count(header) -> Optional[int]:
+    for key in ("STACKCNT", "STACKN", "NSTACK", "NCOMBINE", "IMCNT"):
+        val = header.get(key)
+        if isinstance(val, (int, np.integer)):
+            return int(val)
+        if isinstance(val, float) and np.isfinite(val):
+            return int(round(val))
+    return None
+
+
+def iter_fits_files(paths: Sequence[Path], recursive: bool) -> Iterable[Path]:
+    for path in paths:
+        if path.is_file():
+            if path.suffix.lower() in FITS_EXTS:
+                yield path
+            continue
+        if not path.is_dir():
+            continue
+        iterator = path.rglob("*") if recursive else path.glob("*")
+        for child in iterator:
+            if child.is_file() and child.suffix.lower() in FITS_EXTS:
+                yield child
+
+
+def open_header_and_wcs(path: Path) -> Tuple[Optional[object], Optional[WCS]]:
+    try:
+        header = fits.getheader(path, 0)
+    except Exception:
+        return None, None
+    try:
+        wcs_obj = WCS(header, naxis=2, relax=True)
+    except Exception:
+        return header, None
+    if not getattr(wcs_obj, "is_celestial", False):
+        return header, None
+    return header, wcs_obj
+
+
+def build_tile_infos(
+    files: Sequence[Path],
+    ref_ra_deg: Optional[float] = None,
+    ref_dec_deg: Optional[float] = None,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> List[TileInfo]:
+    pre_tiles = []
+    centers = []
+    total = len(files)
+    for idx, path in enumerate(files, start=1):
+        if cancel_check and cancel_check():
+            raise CancelledError("Cancelled by user")
+        if progress and (idx == 1 or idx == total or idx % 25 == 0):
+            progress(f"Reading headers/WCS: {idx}/{total}")
+        header, wcs_obj = open_header_and_wcs(path)
+        if header is None or wcs_obj is None:
+            continue
+        width = header.get("NAXIS1")
+        height = header.get("NAXIS2")
+        if not isinstance(width, (int, np.integer)) or not isinstance(height, (int, np.integer)):
+            continue
+        if width <= 1 or height <= 1:
+            continue
+        try:
+            cx = width / 2.0
+            cy = height / 2.0
+            center = wcs_obj.pixel_to_world(cx, cy)
+            ra0 = float(center.ra.deg)
+            dec0 = float(center.dec.deg)
+        except Exception:
+            ra_val = header.get("CRVAL1")
+            dec_val = header.get("CRVAL2")
+            if ra_val is None or dec_val is None:
+                continue
+            ra0 = float(ra_val)
+            dec0 = float(dec_val)
+        centers.append((ra0, dec0))
+        pre_tiles.append((path, header, wcs_obj, int(width), int(height), ra0, dec0))
+
+    if not pre_tiles:
+        return []
+
+    if ref_ra_deg is None or ref_dec_deg is None:
+        ra_vals = np.array([c[0] for c in centers], dtype=float)
+        dec_vals = np.array([c[1] for c in centers], dtype=float)
+        ref_ra_deg = float(np.median(ra_vals)) if ref_ra_deg is None else float(ref_ra_deg)
+        ref_dec_deg = float(np.median(dec_vals)) if ref_dec_deg is None else float(ref_dec_deg)
+
+    tiles: List[TileInfo] = []
+    for idx, (path, header, wcs_obj, width, height, ra0, dec0) in enumerate(pre_tiles):
+        if cancel_check and cancel_check():
+            raise CancelledError("Cancelled by user")
+        fp_radec = compute_footprint_radec_deg(wcs_obj, width, height)
+        fp_xy = project_radec_to_plane_deg(fp_radec, ref_ra_deg, ref_dec_deg)
+        center_xy = project_radec_to_plane_deg(np.array([[ra0, dec0]], dtype=float), ref_ra_deg, ref_dec_deg)[0]
+        area_sqdeg = polygon_area(fp_xy)
+        width_deg, height_deg = estimate_width_height_deg(fp_xy)
+        scale_arcsec = None
+        try:
+            scales = proj_plane_pixel_scales(wcs_obj.celestial) * 3600.0
+            if scales is not None and len(scales) >= 2:
+                scale_arcsec = float(np.nanmean(np.abs(scales[:2])))
+        except Exception:
+            scale_arcsec = None
+        exposure_val = header.get("EXPTIME")
+        exposure_s = float(exposure_val) if isinstance(exposure_val, (int, float, np.integer, np.floating)) else None
+        tiles.append(
+            TileInfo(
+                index=idx,
+                path=path,
+                name=path.name,
+                shape_hw=(int(height), int(width)),
+                center_radec_deg=(float(ra0), float(dec0)),
+                center_xy_deg=(float(center_xy[0]), float(center_xy[1])),
+                pa_deg=compute_position_angle_deg(wcs_obj, width, height),
+                pixel_scale_arcsec=scale_arcsec,
+                footprint_radec_deg=fp_radec,
+                footprint_xy_deg=fp_xy,
+                area_sqdeg=float(area_sqdeg),
+                width_deg=float(width_deg),
+                height_deg=float(height_deg),
+                filter_name=str(header.get("FILTER", header.get("FILTNAME", "")) or ""),
+                exposure_s=exposure_s,
+                date_obs=str(header.get("DATE-OBS", "") or ""),
+                stack_count=extract_stack_count(header),
+                raw_header_keys={
+                    key: header.get(key)
+                    for key in (
+                        "OBJECT", "TELESCOP", "INSTRUME", "FILTER", "EXPTIME",
+                        "DATE-OBS", "CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2",
+                        "CDELT1", "CDELT2", "CD1_1", "CD1_2", "CD2_1", "CD2_2",
+                        "PC1_1", "PC1_2", "PC2_1", "PC2_2", "STACKCNT", "NCOMBINE",
+                    )
+                },
+            )
+        )
+    return tiles
+
+
+def bbox_intersects(a: np.ndarray, b: np.ndarray) -> bool:
+    ax0, ay0 = np.nanmin(a[:, 0]), np.nanmin(a[:, 1])
+    ax1, ay1 = np.nanmax(a[:, 0]), np.nanmax(a[:, 1])
+    bx0, by0 = np.nanmin(b[:, 0]), np.nanmin(b[:, 1])
+    bx1, by1 = np.nanmax(b[:, 0]), np.nanmax(b[:, 1])
+    return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
+
+
+def analyze_overlaps(
+    tiles: Sequence[TileInfo],
+    min_fraction: float = 0.0,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> List[OverlapInfo]:
+    overlaps: List[OverlapInfo] = []
+    n = len(tiles)
+    total_pairs = n * (n - 1) // 2
+    pair_index = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair_index += 1
+            if cancel_check and cancel_check():
+                raise CancelledError("Cancelled by user")
+            if progress and (pair_index == 1 or pair_index == total_pairs or pair_index % max(1, total_pairs // 20 or 1) == 0):
+                progress(f"Analyzing overlaps: {pair_index}/{total_pairs}")
+            ti = tiles[i]
+            tj = tiles[j]
+            bbox_touch = bbox_intersects(ti.footprint_xy_deg, tj.footprint_xy_deg)
+            if not bbox_touch:
+                continue
+            inter = convex_polygon_intersection(ti.footprint_xy_deg, tj.footprint_xy_deg)
+            inter_area = polygon_area(inter)
+            if inter_area <= 0.0:
+                continue
+            frac_i = inter_area / max(ti.area_sqdeg, 1e-15)
+            frac_j = inter_area / max(tj.area_sqdeg, 1e-15)
+            if max(frac_i, frac_j) < min_fraction:
+                continue
+            pair_strength_min = min(frac_i, frac_j)
+            pair_strength_avg = 0.5 * (frac_i + frac_j)
+            dx = ti.center_radec_deg[0] - tj.center_radec_deg[0]
+            dy = ti.center_radec_deg[1] - tj.center_radec_deg[1]
+            center_dist = math.hypot(dx * math.cos(math.radians((ti.center_radec_deg[1] + tj.center_radec_deg[1]) * 0.5)), dy)
+            overlaps.append(
+                OverlapInfo(
+                    i=i,
+                    j=j,
+                    tile_i=ti.name,
+                    tile_j=tj.name,
+                    area_sqdeg=float(inter_area),
+                    frac_of_i=float(frac_i),
+                    frac_of_j=float(frac_j),
+                    pair_strength_min=float(pair_strength_min),
+                    pair_strength_avg=float(pair_strength_avg),
+                    center_dist_deg=float(center_dist),
+                    bbox_touch=bbox_touch,
+                )
+            )
+    overlaps.sort(key=lambda o: o.pair_strength_min, reverse=True)
+    return overlaps
+
+
+def compute_tile_metrics(tiles: Sequence[TileInfo], overlaps: Sequence[OverlapInfo]) -> Dict[int, TileMetric]:
+    metrics: Dict[int, TileMetric] = {
+        t.index: TileMetric(
+            index=t.index,
+            name=t.name,
+            neighbors=0,
+            best_local_overlap_frac=0.0,
+            mean_local_overlap_frac=0.0,
+            best_pair_strength=0.0,
+            mean_pair_strength=0.0,
+            total_pair_strength=0.0,
+            center_x_deg=t.center_xy_deg[0],
+            center_y_deg=t.center_xy_deg[1],
+            radial_distance_deg=0.0,
+            area_sqdeg=t.area_sqdeg,
+            width_deg=t.width_deg,
+            height_deg=t.height_deg,
+        )
+        for t in tiles
+    }
+    local_vals: Dict[int, List[float]] = {t.index: [] for t in tiles}
+    pair_vals: Dict[int, List[float]] = {t.index: [] for t in tiles}
+
+    for ov in overlaps:
+        metrics[ov.i].neighbors += 1
+        metrics[ov.j].neighbors += 1
+        local_vals[ov.i].append(ov.frac_of_i)
+        local_vals[ov.j].append(ov.frac_of_j)
+        pair_vals[ov.i].append(ov.pair_strength_min)
+        pair_vals[ov.j].append(ov.pair_strength_min)
+
+    cx = np.array([t.center_xy_deg[0] for t in tiles], dtype=float)
+    cy = np.array([t.center_xy_deg[1] for t in tiles], dtype=float)
+    x0 = float(np.median(cx)) if len(cx) else 0.0
+    y0 = float(np.median(cy)) if len(cy) else 0.0
+
+    for idx, metric in metrics.items():
+        lv = np.array(local_vals[idx], dtype=float)
+        pv = np.array(pair_vals[idx], dtype=float)
+        if lv.size:
+            metric.best_local_overlap_frac = float(np.nanmax(lv))
+            metric.mean_local_overlap_frac = float(np.nanmean(lv))
+        if pv.size:
+            metric.best_pair_strength = float(np.nanmax(pv))
+            metric.mean_pair_strength = float(np.nanmean(pv))
+            metric.total_pair_strength = float(np.nansum(pv))
+        metric.radial_distance_deg = float(math.hypot(metric.center_x_deg - x0, metric.center_y_deg - y0))
+        metric.is_isolated = metric.neighbors == 0
+
+    if metrics:
+        neigh = np.array([m.neighbors for m in metrics.values()], dtype=float)
+        best = np.array([m.best_local_overlap_frac for m in metrics.values()], dtype=float)
+        radial = np.array([m.radial_distance_deg for m in metrics.values()], dtype=float)
+        low_neighbor_thr = float(np.nanpercentile(neigh, 10))
+        low_best_thr = float(np.nanpercentile(best, 10))
+        peripheral_thr = float(np.nanpercentile(radial, 90))
+        for metric in metrics.values():
+            metric.is_low_neighbor = metric.neighbors <= low_neighbor_thr
+            metric.is_low_best_overlap = metric.best_local_overlap_frac <= low_best_thr
+            metric.is_peripheral = metric.radial_distance_deg >= peripheral_thr
+
+    return metrics
+
+
+def write_overlap_csv(overlaps: Sequence[OverlapInfo], metrics: Dict[int, TileMetric], out_csv: Path) -> None:
+    with out_csv.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "index_i", "index_j", "tile_i", "tile_j", "area_sqdeg",
+            "frac_of_i", "frac_of_j", "pair_strength_min", "pair_strength_avg",
+            "center_dist_deg", "neighbors_i", "neighbors_j", "bbox_touch",
+        ])
+        for ov in overlaps:
+            writer.writerow([
+                ov.i, ov.j, ov.tile_i, ov.tile_j,
+                f"{ov.area_sqdeg:.8f}", f"{ov.frac_of_i:.6f}", f"{ov.frac_of_j:.6f}",
+                f"{ov.pair_strength_min:.6f}", f"{ov.pair_strength_avg:.6f}",
+                f"{ov.center_dist_deg:.6f}", metrics[ov.i].neighbors, metrics[ov.j].neighbors,
+                int(ov.bbox_touch),
+            ])
+
+
+def write_tile_metrics_csv(tiles: Sequence[TileInfo], metrics: Dict[int, TileMetric], out_csv: Path) -> None:
+    with out_csv.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "index", "tile_name", "path", "neighbors", "best_local_overlap_frac",
+            "mean_local_overlap_frac", "best_pair_strength", "mean_pair_strength",
+            "total_pair_strength", "radial_distance_deg", "center_x_deg", "center_y_deg",
+            "area_sqdeg", "width_deg", "height_deg", "pixel_scale_arcsec", "pa_deg",
+            "filter", "exposure_s", "date_obs", "stack_count",
+            "is_isolated", "is_low_neighbor", "is_low_best_overlap", "is_peripheral",
+        ])
+        for tile in tiles:
+            m = metrics[tile.index]
+            writer.writerow([
+                tile.index, tile.name, str(tile.path), m.neighbors,
+                f"{m.best_local_overlap_frac:.6f}", f"{m.mean_local_overlap_frac:.6f}",
+                f"{m.best_pair_strength:.6f}", f"{m.mean_pair_strength:.6f}",
+                f"{m.total_pair_strength:.6f}", f"{m.radial_distance_deg:.6f}",
+                f"{m.center_x_deg:.6f}", f"{m.center_y_deg:.6f}",
+                f"{m.area_sqdeg:.8f}", f"{m.width_deg:.6f}", f"{m.height_deg:.6f}",
+                "" if tile.pixel_scale_arcsec is None else f"{tile.pixel_scale_arcsec:.6f}",
+                "" if tile.pa_deg is None else f"{tile.pa_deg:.4f}",
+                tile.filter_name, "" if tile.exposure_s is None else f"{tile.exposure_s:.6f}",
+                tile.date_obs, "" if tile.stack_count is None else tile.stack_count,
+                int(m.is_isolated), int(m.is_low_neighbor), int(m.is_low_best_overlap), int(m.is_peripheral),
+            ])
+
+
+def _format_metric_line(tile: TileInfo, metric: TileMetric) -> str:
+    return (
+        f"[{tile.index:03d}] {tile.name} | neighbors={metric.neighbors} | "
+        f"best_local={metric.best_local_overlap_frac:.4f} | mean_local={metric.mean_local_overlap_frac:.4f} | "
+        f"best_pair={metric.best_pair_strength:.4f} | radial={metric.radial_distance_deg:.4f} deg"
+    )
+
+
+def write_tile_log(
+    tiles: Sequence[TileInfo],
+    overlaps: Sequence[OverlapInfo],
+    metrics: Dict[int, TileMetric],
+    out_log: Path,
+    ref_ra_deg: float,
+    ref_dec_deg: float,
+    top_n_summary: int,
+) -> None:
+    isolated = [tile.name for tile in tiles if metrics[tile.index].is_isolated]
+    weak_neighbors = sorted(tiles, key=lambda t: (metrics[t.index].neighbors, metrics[t.index].best_local_overlap_frac, metrics[t.index].radial_distance_deg))
+    weak_best = sorted(tiles, key=lambda t: (metrics[t.index].best_local_overlap_frac, metrics[t.index].neighbors, -metrics[t.index].radial_distance_deg))
+    peripheral = sorted(tiles, key=lambda t: metrics[t.index].radial_distance_deg, reverse=True)
+    weak_pairs = sorted(overlaps, key=lambda ov: (ov.pair_strength_min, ov.pair_strength_avg, ov.center_dist_deg))
+    strong_pairs = sorted(overlaps, key=lambda ov: (ov.pair_strength_min, ov.pair_strength_avg), reverse=True)
+
+    neighbor_vals = np.array([metrics[t.index].neighbors for t in tiles], dtype=float) if tiles else np.array([], dtype=float)
+    strength_vals = np.array([ov.pair_strength_min for ov in overlaps], dtype=float) if overlaps else np.array([], dtype=float)
+
+    with out_log.open("w", encoding="utf-8") as fh:
+        fh.write("ZeMosaic master-tile overlap diagnostic (V2)\n")
+        fh.write("=" * 78 + "\n")
+        fh.write(f"Tiles scanned                : {len(tiles)}\n")
+        fh.write(f"Pairs with overlap           : {len(overlaps)}\n")
+        fh.write(f"Projection reference         : RA={ref_ra_deg:.6f} deg  Dec={ref_dec_deg:.6f} deg\n")
+        fh.write(f"Isolated tiles               : {len(isolated)}\n")
+        if isolated:
+            fh.write("  " + ", ".join(isolated) + "\n")
+        if neighbor_vals.size:
+            fh.write(f"Average neighbors / tile     : {float(np.nanmean(neighbor_vals)):.2f}\n")
+            fh.write(f"Median neighbors / tile      : {float(np.nanmedian(neighbor_vals)):.2f}\n")
+            fh.write(f"Min / max neighbors          : {int(np.nanmin(neighbor_vals))} / {int(np.nanmax(neighbor_vals))}\n")
+        if strength_vals.size:
+            fh.write(f"Mean pair strength (min frac): {float(np.nanmean(strength_vals)):.4f}\n")
+            fh.write(f"Median pair strength         : {float(np.nanmedian(strength_vals)):.4f}\n")
+            fh.write(f"Min / max pair strength      : {float(np.nanmin(strength_vals)):.4f} / {float(np.nanmax(strength_vals)):.4f}\n")
+        fh.write("\n")
+
+        fh.write("Lowest-neighbor tiles\n")
+        fh.write("-" * 78 + "\n")
+        for tile in weak_neighbors[:top_n_summary]:
+            fh.write(_format_metric_line(tile, metrics[tile.index]) + "\n")
+        fh.write("\n")
+
+        fh.write("Lowest best-overlap tiles\n")
+        fh.write("-" * 78 + "\n")
+        for tile in weak_best[:top_n_summary]:
+            fh.write(_format_metric_line(tile, metrics[tile.index]) + "\n")
+        fh.write("\n")
+
+        fh.write("Most peripheral tiles\n")
+        fh.write("-" * 78 + "\n")
+        for tile in peripheral[:top_n_summary]:
+            fh.write(_format_metric_line(tile, metrics[tile.index]) + "\n")
+        fh.write("\n")
+
+        fh.write("Weakest overlap pairs (sorted by conservative pair strength = min(frac_i, frac_j))\n")
+        fh.write("-" * 78 + "\n")
+        for ov in weak_pairs[:top_n_summary]:
+            fh.write(
+                f"[{ov.i:03d}] {ov.tile_i} <-> [{ov.j:03d}] {ov.tile_j} | "
+                f"pair_strength={ov.pair_strength_min:.4f} | avg_pair={ov.pair_strength_avg:.4f} | "
+                f"frac_i={ov.frac_of_i:.4f} | frac_j={ov.frac_of_j:.4f} | dist={ov.center_dist_deg:.4f} deg\n"
+            )
+        fh.write("\n")
+
+        fh.write("Strongest overlap pairs\n")
+        fh.write("-" * 78 + "\n")
+        for ov in strong_pairs[:top_n_summary]:
+            fh.write(
+                f"[{ov.i:03d}] {ov.tile_i} <-> [{ov.j:03d}] {ov.tile_j} | "
+                f"pair_strength={ov.pair_strength_min:.4f} | avg_pair={ov.pair_strength_avg:.4f} | "
+                f"frac_i={ov.frac_of_i:.4f} | frac_j={ov.frac_of_j:.4f} | dist={ov.center_dist_deg:.4f} deg\n"
+            )
+        fh.write("\n")
+
+        fh.write("Per-tile characteristics\n")
+        fh.write("-" * 78 + "\n")
+        for tile in tiles:
+            metric = metrics[tile.index]
+            flags = []
+            if metric.is_isolated:
+                flags.append("isolated")
+            if metric.is_low_neighbor:
+                flags.append("low-neighbor")
+            if metric.is_low_best_overlap:
+                flags.append("low-best-overlap")
+            if metric.is_peripheral:
+                flags.append("peripheral")
+            fh.write(f"[{tile.index:03d}] {tile.name}\n")
+            fh.write(f"  path                  : {tile.path}\n")
+            fh.write(f"  shape (H,W)           : {tile.shape_hw[0]} x {tile.shape_hw[1]}\n")
+            fh.write(f"  center (RA,Dec)       : {tile.center_radec_deg[0]:.6f}, {tile.center_radec_deg[1]:.6f} deg\n")
+            fh.write(f"  center (x,y)          : {tile.center_xy_deg[0]:.6f}, {tile.center_xy_deg[1]:.6f} deg\n")
+            fh.write(f"  footprint WxH         : {tile.width_deg:.5f} x {tile.height_deg:.5f} deg\n")
+            fh.write(f"  footprint area        : {tile.area_sqdeg:.8f} sq.deg\n")
+            fh.write(f"  pixel scale           : {tile.pixel_scale_arcsec:.4f} arcsec/px\n" if tile.pixel_scale_arcsec is not None else "  pixel scale           : n/a\n")
+            fh.write(f"  PA                    : {tile.pa_deg:.2f} deg\n" if tile.pa_deg is not None else "  PA                    : n/a\n")
+            fh.write(f"  filter / exposure     : {tile.filter_name or '-'} / {tile.exposure_s if tile.exposure_s is not None else 'n/a'} s\n")
+            fh.write(f"  date-obs              : {tile.date_obs or '-'}\n")
+            fh.write(f"  stack count           : {tile.stack_count if tile.stack_count is not None else 'n/a'}\n")
+            fh.write(f"  neighbors             : {metric.neighbors}\n")
+            fh.write(f"  best local overlap    : {metric.best_local_overlap_frac:.4f}\n")
+            fh.write(f"  mean local overlap    : {metric.mean_local_overlap_frac:.4f}\n")
+            fh.write(f"  best pair strength    : {metric.best_pair_strength:.4f}\n")
+            fh.write(f"  mean pair strength    : {metric.mean_pair_strength:.4f}\n")
+            fh.write(f"  total pair strength   : {metric.total_pair_strength:.4f}\n")
+            fh.write(f"  radial distance       : {metric.radial_distance_deg:.4f} deg\n")
+            fh.write(f"  flags                 : {', '.join(flags) if flags else '-'}\n")
+            hdr_bits = []
+            for key, value in tile.raw_header_keys.items():
+                if value is None or value == "":
+                    continue
+                hdr_bits.append(f"{key}={value}")
+            fh.write("  header keys           : " + "; ".join(hdr_bits) + "\n\n")
+
+        fh.write("Full pairwise overlap table is available in the CSV output.\n")
+
+
+def _select_label_indices(tiles: Sequence[TileInfo], metrics: Dict[int, TileMetric], top_n: int) -> List[int]:
+    weak_neighbors = sorted(tiles, key=lambda t: (metrics[t.index].neighbors, metrics[t.index].best_local_overlap_frac, metrics[t.index].radial_distance_deg))
+    weak_best = sorted(tiles, key=lambda t: (metrics[t.index].best_local_overlap_frac, metrics[t.index].neighbors, -metrics[t.index].radial_distance_deg))
+    peripheral = sorted(tiles, key=lambda t: metrics[t.index].radial_distance_deg, reverse=True)
+    picked: List[int] = []
+    for tile in weak_neighbors[:top_n]:
+        if tile.index not in picked:
+            picked.append(tile.index)
+    for tile in weak_best[:top_n]:
+        if tile.index not in picked:
+            picked.append(tile.index)
+    for tile in peripheral[: max(4, top_n // 2)]:
+        if tile.index not in picked:
+            picked.append(tile.index)
+    return picked[: max(top_n, 1)]
+
+
+def plot_overview_v2(
+    tiles: Sequence[TileInfo],
+    overlaps: Sequence[OverlapInfo],
+    metrics: Dict[int, TileMetric],
+    out_png: Path,
+    annotate: bool,
+    draw_overlap_links: bool,
+    label_top_n: int,
+) -> None:
+    if not tiles:
+        raise RuntimeError("No tiles to plot")
+
+    tile_values = np.array([metrics[t.index].neighbors for t in tiles], dtype=float)
+    edge_values = np.array([ov.pair_strength_min for ov in overlaps], dtype=float) if overlaps else np.array([0.0], dtype=float)
+    tile_norm = Normalize(vmin=float(np.nanmin(tile_values)), vmax=float(np.nanmax(tile_values) if np.nanmax(tile_values) > np.nanmin(tile_values) else np.nanmin(tile_values) + 1.0))
+    edge_norm = Normalize(vmin=float(np.nanmin(edge_values)), vmax=float(np.nanmax(edge_values) if np.nanmax(edge_values) > np.nanmin(edge_values) else np.nanmin(edge_values) + 1.0))
+    tile_cmap = plt.get_cmap("viridis")
+    edge_cmap = plt.get_cmap("plasma")
+
+    label_indices = set(_select_label_indices(tiles, metrics, label_top_n)) if annotate else set()
+
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(16, 8), dpi=170)
+
+    patches0 = [MplPolygon(tile.footprint_xy_deg, closed=True) for tile in tiles]
+    pc0 = PatchCollection(patches0, cmap=tile_cmap, norm=tile_norm, edgecolor="black", linewidth=0.75, alpha=0.45)
+    pc0.set_array(tile_values)
+    ax0.add_collection(pc0)
+    cbar0 = fig.colorbar(ScalarMappable(norm=tile_norm, cmap=tile_cmap), ax=ax0, fraction=0.046, pad=0.04)
+    cbar0.set_label("Neighbors per tile")
+    for tile in tiles:
+        cx, cy = tile.center_xy_deg
+        ax0.plot(cx, cy, marker="+", markersize=4, color="black", alpha=0.7)
+        if tile.index in label_indices:
+            ax0.text(cx, cy, str(tile.index), fontsize=8, ha="center", va="center", color="black")
+
+    if draw_overlap_links and overlaps:
+        lines = []
+        strengths = []
+        for ov in overlaps:
+            ti = tiles[ov.i]
+            tj = tiles[ov.j]
+            lines.append([(ti.center_xy_deg[0], ti.center_xy_deg[1]), (tj.center_xy_deg[0], tj.center_xy_deg[1])])
+            strengths.append(ov.pair_strength_min)
+        lc = LineCollection(lines, cmap=edge_cmap, norm=edge_norm, linewidths=0.35, alpha=0.6)
+        lc.set_array(np.array(strengths, dtype=float))
+        ax1.add_collection(lc)
+        cbar1 = fig.colorbar(ScalarMappable(norm=edge_norm, cmap=edge_cmap), ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label("Overlap strength = min(frac_i, frac_j)")
+    else:
+        cbar1 = fig.colorbar(ScalarMappable(norm=edge_norm, cmap=edge_cmap), ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label("Overlap strength = min(frac_i, frac_j)")
+
+    patches1 = [MplPolygon(tile.footprint_xy_deg, closed=True) for tile in tiles]
+    pc1 = PatchCollection(patches1, cmap=tile_cmap, norm=tile_norm, edgecolor="black", linewidth=0.55, alpha=0.20)
+    pc1.set_array(tile_values)
+    ax1.add_collection(pc1)
+    for tile in tiles:
+        cx, cy = tile.center_xy_deg
+        ax1.scatter([cx], [cy], s=max(10.0, 6.0 + 0.8 * metrics[tile.index].neighbors), c=[tile_cmap(tile_norm(metrics[tile.index].neighbors))], edgecolors="black", linewidths=0.3, alpha=0.9)
+        if tile.index in label_indices:
+            ax1.text(cx, cy, str(tile.index), fontsize=8, ha="center", va="center", color="black")
+
+    titles = [
+        "Footprints colored by neighbor count",
+        "Overlap network colored by conservative overlap strength",
+    ]
+    axes = [ax0, ax1]
+    for ax, title in zip(axes, titles):
+        ax.set_title(title)
+        ax.set_xlabel("Delta RA * cos(Dec₀) [deg]")
+        ax.set_ylabel("Delta Dec [deg]")
+        ax.grid(True, alpha=0.22)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.invert_xaxis()
+
+    fig.suptitle("Master-tile overlap diagnostic V2", fontsize=15)
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_diagnostic(
+    config: DiagnosticConfig,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> DiagnosticResult:
+    def emit(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    if not config.inputs:
+        raise ValueError("No input paths were provided.")
+
+    emit("Scanning input paths...")
+    files = sorted(set(iter_fits_files(config.inputs, recursive=config.recursive)))
+    if cancel_check and cancel_check():
+        raise CancelledError("Cancelled by user")
+    if not files:
+        raise RuntimeError("No FITS files found.")
+
+    emit(f"FITS files found: {len(files)}")
+    tiles = build_tile_infos(
+        files,
+        ref_ra_deg=config.ref_ra,
+        ref_dec_deg=config.ref_dec,
+        progress=progress,
+        cancel_check=cancel_check,
+    )
+    if not tiles:
+        raise RuntimeError("No valid celestial WCS could be extracted from the provided FITS headers.")
+
+    ref_ra = float(np.median([t.center_radec_deg[0] for t in tiles])) if config.ref_ra is None else float(config.ref_ra)
+    ref_dec = float(np.median([t.center_radec_deg[1] for t in tiles])) if config.ref_dec is None else float(config.ref_dec)
+
+    if config.ref_ra is not None or config.ref_dec is not None:
+        emit("Reprojecting footprints around custom reference...")
+        updated_tiles: List[TileInfo] = []
+        for t in tiles:
+            if cancel_check and cancel_check():
+                raise CancelledError("Cancelled by user")
+            fp_xy = project_radec_to_plane_deg(t.footprint_radec_deg, ref_ra, ref_dec)
+            center_xy = project_radec_to_plane_deg(np.array([[t.center_radec_deg[0], t.center_radec_deg[1]]], dtype=float), ref_ra, ref_dec)[0]
+            area_sqdeg = polygon_area(fp_xy)
+            width_deg, height_deg = estimate_width_height_deg(fp_xy)
+            updated_tiles.append(
+                TileInfo(
+                    index=t.index,
+                    path=t.path,
+                    name=t.name,
+                    shape_hw=t.shape_hw,
+                    center_radec_deg=t.center_radec_deg,
+                    center_xy_deg=(float(center_xy[0]), float(center_xy[1])),
+                    pa_deg=t.pa_deg,
+                    pixel_scale_arcsec=t.pixel_scale_arcsec,
+                    footprint_radec_deg=t.footprint_radec_deg,
+                    footprint_xy_deg=fp_xy,
+                    area_sqdeg=area_sqdeg,
+                    width_deg=width_deg,
+                    height_deg=height_deg,
+                    filter_name=t.filter_name,
+                    exposure_s=t.exposure_s,
+                    date_obs=t.date_obs,
+                    stack_count=t.stack_count,
+                    raw_header_keys=t.raw_header_keys,
+                )
+            )
+        tiles = updated_tiles
+
+    emit("Computing pairwise overlaps...")
+    overlaps = analyze_overlaps(
+        tiles,
+        min_fraction=max(0.0, float(config.min_overlap_frac)),
+        progress=progress,
+        cancel_check=cancel_check,
+    )
+    metrics = compute_tile_metrics(tiles, overlaps)
+
+    outdir = config.outdir.expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+    prefix = config.prefix.strip() or "master_tiles"
+    out_overview_png = outdir / f"{prefix}_v2_overview.png"
+    out_log = outdir / f"{prefix}_diagnostic.log"
+    out_overlaps_csv = outdir / f"{prefix}_overlaps.csv"
+    out_tiles_csv = outdir / f"{prefix}_tiles.csv"
+
+    emit("Writing outputs...")
+    plot_overview_v2(
+        tiles,
+        overlaps,
+        metrics,
+        out_overview_png,
+        annotate=config.annotate,
+        draw_overlap_links=config.draw_links,
+        label_top_n=max(1, int(config.label_top_n)),
+    )
+    write_tile_log(tiles, overlaps, metrics, out_log, ref_ra, ref_dec, max(1, int(config.top_n_summary)))
+    write_overlap_csv(overlaps, metrics, out_overlaps_csv)
+    write_tile_metrics_csv(tiles, metrics, out_tiles_csv)
+
+    emit(f"Tiles analyzed : {len(tiles)}")
+    emit(f"Overlaps kept  : {len(overlaps)}")
+    emit(f"Overview PNG   : {out_overview_png}")
+    emit(f"LOG            : {out_log}")
+    emit(f"Tiles CSV      : {out_tiles_csv}")
+    emit(f"Overlaps CSV   : {out_overlaps_csv}")
+
+    return DiagnosticResult(
+        tile_count=len(tiles),
+        overlap_count=len(overlaps),
+        out_overview_png=out_overview_png,
+        out_log=out_log,
+        out_overlaps_csv=out_overlaps_csv,
+        out_tiles_csv=out_tiles_csv,
+    )
+
+
+class DiagnosticWorker(QThread):
+    log_line = Signal(str)
+    succeeded = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, config: DiagnosticConfig, parent: Optional[QWidget] = None) -> None:  # type: ignore[name-defined]
+        super().__init__(parent)
+        self.config = config
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _is_cancelled(self) -> bool:
+        return self._cancel_requested
+
+    def run(self) -> None:
+        try:
+            result = run_diagnostic(self.config, progress=self.log_line.emit, cancel_check=self._is_cancelled)
+            if self._cancel_requested:
+                self.cancelled.emit()
+            else:
+                self.succeeded.emit(result)
+        except CancelledError:
+            self.cancelled.emit()
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+if HAVE_QT:
+    class MainWindow(QMainWindow):
+        def __init__(self) -> None:
+            super().__init__()
+            self.worker: Optional[DiagnosticWorker] = None
+            self.last_result: Optional[DiagnosticResult] = None
+            self.setWindowTitle("ZeMosaic Master Tile Overlap Diagnostic V2")
+            self.resize(1050, 760)
+
+            central = QWidget(self)
+            self.setCentralWidget(central)
+            root = QVBoxLayout(central)
+
+            splitter = QSplitter(Qt.Orientation.Vertical)
+            root.addWidget(splitter)
+
+            top = QWidget()
+            top_layout = QVBoxLayout(top)
+            splitter.addWidget(top)
+
+            input_group = QGroupBox("Inputs")
+            ig = QVBoxLayout(input_group)
+            self.input_list = QListWidget()
+            self.input_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+            ig.addWidget(self.input_list)
+            btn_row = QHBoxLayout()
+            self.add_files_btn = QPushButton("Add FITS files...")
+            self.add_dir_btn = QPushButton("Add folder...")
+            self.remove_btn = QPushButton("Remove selected")
+            self.clear_btn = QPushButton("Clear")
+            btn_row.addWidget(self.add_files_btn)
+            btn_row.addWidget(self.add_dir_btn)
+            btn_row.addWidget(self.remove_btn)
+            btn_row.addWidget(self.clear_btn)
+            ig.addLayout(btn_row)
+            self.recursive_check = QCheckBox("Recursive search inside folders")
+            self.recursive_check.setChecked(True)
+            ig.addWidget(self.recursive_check)
+            top_layout.addWidget(input_group)
+
+            options_group = QGroupBox("Options")
+            og = QGridLayout(options_group)
+            self.outdir_edit = QLineEdit(str(Path("tile_overlap_diag")))
+            self.outdir_btn = QPushButton("Browse...")
+            self.prefix_edit = QLineEdit("master_tiles")
+            self.min_overlap_spin = QDoubleSpinBox()
+            self.min_overlap_spin.setRange(0.0, 1.0)
+            self.min_overlap_spin.setDecimals(3)
+            self.min_overlap_spin.setSingleStep(0.01)
+            self.min_overlap_spin.setValue(0.0)
+            self.ref_ra_edit = QLineEdit("")
+            self.ref_dec_edit = QLineEdit("")
+            self.annotate_check = QCheckBox("Annotate only suspicious/peripheral indices on PNG")
+            self.annotate_check.setChecked(False)
+            self.links_check = QCheckBox("Draw overlap links")
+            self.links_check.setChecked(True)
+            self.top_n_spin = QDoubleSpinBox()
+            self.top_n_spin.setRange(1, 200)
+            self.top_n_spin.setDecimals(0)
+            self.top_n_spin.setValue(20)
+            self.label_top_n_spin = QDoubleSpinBox()
+            self.label_top_n_spin.setRange(1, 100)
+            self.label_top_n_spin.setDecimals(0)
+            self.label_top_n_spin.setValue(16)
+
+            og.addWidget(QLabel("Output folder:"), 0, 0)
+            og.addWidget(self.outdir_edit, 0, 1)
+            og.addWidget(self.outdir_btn, 0, 2)
+            og.addWidget(QLabel("Filename prefix:"), 1, 0)
+            og.addWidget(self.prefix_edit, 1, 1, 1, 2)
+            og.addWidget(QLabel("Min overlap fraction:"), 2, 0)
+            og.addWidget(self.min_overlap_spin, 2, 1)
+            og.addWidget(QLabel("Summary top-N:"), 2, 2)
+            og.addWidget(self.top_n_spin, 2, 3)
+            og.addWidget(QLabel("Label top-N:"), 3, 2)
+            og.addWidget(self.label_top_n_spin, 3, 3)
+            og.addWidget(QLabel("Ref. RA (deg, optional):"), 3, 0)
+            og.addWidget(self.ref_ra_edit, 3, 1)
+            og.addWidget(QLabel("Ref. Dec (deg, optional):"), 4, 0)
+            og.addWidget(self.ref_dec_edit, 4, 1)
+            og.addWidget(self.annotate_check, 5, 0, 1, 2)
+            og.addWidget(self.links_check, 5, 2, 1, 2)
+            top_layout.addWidget(options_group)
+
+            actions_group = QGroupBox("Run")
+            ag = QHBoxLayout(actions_group)
+            self.run_btn = QPushButton("Run diagnostic")
+            self.cancel_btn = QPushButton("Cancel")
+            self.cancel_btn.setEnabled(False)
+            self.open_out_btn = QPushButton("Open output folder")
+            self.open_out_btn.setEnabled(False)
+            ag.addWidget(self.run_btn)
+            ag.addWidget(self.cancel_btn)
+            ag.addWidget(self.open_out_btn)
+            top_layout.addWidget(actions_group)
+
+            bottom = QWidget()
+            bottom_layout = QVBoxLayout(bottom)
+            splitter.addWidget(bottom)
+            self.status_label = QLabel("Ready.")
+            bottom_layout.addWidget(self.status_label)
+            self.log_edit = QPlainTextEdit()
+            self.log_edit.setReadOnly(True)
+            bottom_layout.addWidget(self.log_edit)
+
+            splitter.setStretchFactor(0, 0)
+            splitter.setStretchFactor(1, 1)
+
+            self.add_files_btn.clicked.connect(self.add_files)
+            self.add_dir_btn.clicked.connect(self.add_directory)
+            self.remove_btn.clicked.connect(self.remove_selected)
+            self.clear_btn.clicked.connect(self.input_list.clear)
+            self.outdir_btn.clicked.connect(self.pick_outdir)
+            self.run_btn.clicked.connect(self.run_diagnostic)
+            self.cancel_btn.clicked.connect(self.cancel_diagnostic)
+            self.open_out_btn.clicked.connect(self.open_output_folder)
+
+        def append_log(self, text: str) -> None:
+            if not text:
+                return
+            self.log_edit.appendPlainText(text.rstrip())
+            self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
+
+        def add_files(self) -> None:
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Select FITS files",
+                "",
+                "FITS files (*.fits *.fit *.fts *.fz);;All files (*)",
+            )
+            for path in files:
+                self._add_unique_item(path)
+
+        def add_directory(self) -> None:
+            folder = QFileDialog.getExistingDirectory(self, "Select folder")
+            if folder:
+                self._add_unique_item(folder)
+
+        def _add_unique_item(self, path: str) -> None:
+            norm = str(Path(path).expanduser())
+            existing = {self.input_list.item(i).text() for i in range(self.input_list.count())}
+            if norm not in existing:
+                self.input_list.addItem(QListWidgetItem(norm))
+
+        def remove_selected(self) -> None:
+            for item in self.input_list.selectedItems():
+                row = self.input_list.row(item)
+                self.input_list.takeItem(row)
+
+        def pick_outdir(self) -> None:
+            folder = QFileDialog.getExistingDirectory(self, "Select output folder", self.outdir_edit.text().strip() or "")
+            if folder:
+                self.outdir_edit.setText(folder)
+
+        def _parse_optional_float(self, edit: QLineEdit, label: str) -> Optional[float]:
+            text = edit.text().strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                raise ValueError(f"{label} must be a valid number.")
+
+        def _collect_inputs(self) -> List[Path]:
+            return [Path(self.input_list.item(i).text()).expanduser() for i in range(self.input_list.count())]
+
+        def build_config(self) -> DiagnosticConfig:
+            inputs = self._collect_inputs()
+            if not inputs:
+                raise ValueError("Please add at least one FITS file or folder.")
+            return DiagnosticConfig(
+                inputs=inputs,
+                recursive=self.recursive_check.isChecked(),
+                outdir=Path(self.outdir_edit.text().strip() or "tile_overlap_diag").expanduser(),
+                prefix=self.prefix_edit.text().strip() or "master_tiles",
+                min_overlap_frac=float(self.min_overlap_spin.value()),
+                ref_ra=self._parse_optional_float(self.ref_ra_edit, "Reference RA"),
+                ref_dec=self._parse_optional_float(self.ref_dec_edit, "Reference Dec"),
+                annotate=self.annotate_check.isChecked(),
+                draw_links=self.links_check.isChecked(),
+                top_n_summary=int(self.top_n_spin.value()),
+                label_top_n=int(self.label_top_n_spin.value()),
+            )
+
+        def set_running_state(self, running: bool) -> None:
+            self.run_btn.setEnabled(not running)
+            self.cancel_btn.setEnabled(running)
+            self.add_files_btn.setEnabled(not running)
+            self.add_dir_btn.setEnabled(not running)
+            self.remove_btn.setEnabled(not running)
+            self.clear_btn.setEnabled(not running)
+
+        def run_diagnostic(self) -> None:
+            try:
+                config = self.build_config()
+            except Exception as exc:
+                QMessageBox.warning(self, "Invalid configuration", str(exc))
+                return
+
+            self.log_edit.clear()
+            self.last_result = None
+            self.open_out_btn.setEnabled(False)
+            self.append_log("Starting diagnostic V2...")
+            self.status_label.setText("Running...")
+            self.set_running_state(True)
+
+            self.worker = DiagnosticWorker(config, self)
+            self.worker.log_line.connect(self.append_log)
+            self.worker.succeeded.connect(self.on_success)
+            self.worker.failed.connect(self.on_failure)
+            self.worker.cancelled.connect(self.on_cancelled)
+            self.worker.start()
+
+        def cancel_diagnostic(self) -> None:
+            if self.worker is not None:
+                self.append_log("Cancellation requested...")
+                self.status_label.setText("Cancelling...")
+                self.worker.request_cancel()
+
+        def on_success(self, result: DiagnosticResult) -> None:
+            self.last_result = result
+            self.status_label.setText(f"Done. {result.tile_count} tiles, {result.overlap_count} overlaps.")
+            self.append_log("Diagnostic completed successfully.")
+            self.set_running_state(False)
+            self.open_out_btn.setEnabled(True)
+            self.worker = None
+            QMessageBox.information(
+                self,
+                "Diagnostic finished",
+                f"Tiles analyzed: {result.tile_count}\n"
+                f"Overlaps kept: {result.overlap_count}\n\n"
+                f"Overview PNG: {result.out_overview_png}\n"
+                f"LOG: {result.out_log}\n"
+                f"Tiles CSV: {result.out_tiles_csv}\n"
+                f"Overlaps CSV: {result.out_overlaps_csv}",
+            )
+
+        def on_failure(self, details: str) -> None:
+            self.status_label.setText("Failed.")
+            self.append_log(details)
+            self.set_running_state(False)
+            self.open_out_btn.setEnabled(False)
+            self.worker = None
+            QMessageBox.critical(self, "Diagnostic failed", "The diagnostic failed. See the log panel for details.")
+
+        def on_cancelled(self) -> None:
+            self.status_label.setText("Cancelled.")
+            self.append_log("Diagnostic cancelled.")
+            self.set_running_state(False)
+            self.worker = None
+
+        def open_output_folder(self) -> None:
+            target = None
+            if self.last_result is not None:
+                target = self.last_result.out_overview_png.parent
+            else:
+                text = self.outdir_edit.text().strip()
+                if text:
+                    target = Path(text).expanduser()
+            if target is not None:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.resolve())))
+
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Master tile overlap diagnostic V2 (GUI + CLI)")
+    parser.add_argument("inputs", nargs="*", help="Input FITS files and/or directories")
+    parser.add_argument("--recursive", action="store_true", help="Recurse into input directories")
+    parser.add_argument("--outdir", default="tile_overlap_diag", help="Output directory")
+    parser.add_argument("--prefix", default="master_tiles", help="Output filename prefix")
+    parser.add_argument("--min-overlap-frac", type=float, default=0.0, help="Minimum pairwise overlap fraction to keep")
+    parser.add_argument("--ref-ra", type=float, default=None, help="Override projection reference RA in deg")
+    parser.add_argument("--ref-dec", type=float, default=None, help="Override projection reference Dec in deg")
+    parser.add_argument("--annotate", action="store_true", help="Annotate suspicious/peripheral tile indices on the PNG")
+    parser.add_argument("--no-links", action="store_true", help="Disable overlap link lines in the PNG")
+    parser.add_argument("--top-n-summary", type=int, default=20, help="Top-N rows for summary sections in the log")
+    parser.add_argument("--label-top-n", type=int, default=16, help="Maximum number of labeled suspicious/peripheral tiles")
+    parser.add_argument("--gui", action="store_true", help="Force GUI mode")
+    return parser
+
+
+def run_cli_from_args(args: argparse.Namespace) -> int:
+    config = DiagnosticConfig(
+        inputs=[Path(p).expanduser() for p in args.inputs],
+        recursive=args.recursive,
+        outdir=Path(args.outdir).expanduser(),
+        prefix=args.prefix,
+        min_overlap_frac=max(0.0, float(args.min_overlap_frac)),
+        ref_ra=args.ref_ra,
+        ref_dec=args.ref_dec,
+        annotate=bool(args.annotate),
+        draw_links=not args.no_links,
+        top_n_summary=max(1, int(args.top_n_summary)),
+        label_top_n=max(1, int(args.label_top_n)),
+    )
+    try:
+        run_diagnostic(config, progress=print)
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def run_gui() -> int:
+    if not HAVE_QT:
+        print("ERROR: PySide6 is required for GUI mode.", file=sys.stderr)
+        return 2
+    app = QApplication.instance() or QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.gui or not args.inputs:
+        return run_gui()
+    return run_cli_from_args(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
