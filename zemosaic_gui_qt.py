@@ -411,6 +411,7 @@ class ZeMosaicQtWorker(QObject):
         self._finished_emitted = False
         self._cancelled = False
         self._sds_stage_total = 0
+        self._worker_output_dir: str | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle management
@@ -439,6 +440,12 @@ class ZeMosaicQtWorker(QObject):
             raise RuntimeError("Worker backend is unavailable")
         if self.is_running():
             return None
+
+        try:
+            out_dir = worker_kwargs.get("output_dir") or worker_kwargs.get("output_folder")
+            self._worker_output_dir = str(out_dir) if out_dir else None
+        except Exception:
+            self._worker_output_dir = None
 
         queue_obj: multiprocessing.Queue | None = None
         process: multiprocessing.Process | None = None
@@ -780,14 +787,35 @@ class ZeMosaicQtWorker(QObject):
             # If the worker was killed (OOM/crash), the queue listener finishes quietly;
             # mark the run as failed so the GUI cannot emit a false SUCCESS.
             self._had_error = True
+            crash_payload: Dict[str, Any] = {"exitcode": exitcode}
+            ctx_bits: list[str] = []
+            try:
+                if self._worker_output_dir:
+                    from pathlib import Path as _Path
+                    import json as _json
+
+                    st_path = _Path(self._worker_output_dir) / "worker_last_state.json"
+                    if st_path.exists():
+                        with st_path.open("r", encoding="utf-8") as _f:
+                            state = _json.load(_f)
+                        if isinstance(state, dict):
+                            crash_payload["last_state"] = state
+                            for k in ("phase", "operation", "tile_id", "event"):
+                                if k in state and state.get(k) not in (None, ""):
+                                    ctx_bits.append(f"{k}={state.get(k)}")
+                            crash_payload["last_state_path"] = str(st_path)
+            except Exception:
+                pass
+
+            suffix = f" Last state: {', '.join(ctx_bits)}." if ctx_bits else ""
             self._last_error = (
                 f"Worker process terminated unexpectedly (exitcode={exitcode}). "
-                "Likely OOM/crash."
+                f"Likely native crash (not necessarily OOM).{suffix}"
             )
             self.log_message_emitted.emit(
                 "ERROR",
                 self._last_error,
-                {"exitcode": exitcode},
+                crash_payload,
             )
 
         success = not self._had_error and not self._stop_requested and not self._cancelled

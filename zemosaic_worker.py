@@ -151,6 +151,105 @@ _PHASE5_GPU_RUNTIME_STATE: dict[str, Any] = {
 }
 
 
+
+# Crash autopsy breadcrumbs (append-only JSONL + last-state JSON)
+_CRASH_BREADCRUMB_LOCK = threading.Lock()
+_CRASH_BREADCRUMB_PATH: Path | None = None
+_CRASH_STATE_PATH: Path | None = None
+
+
+def _configure_crash_breadcrumbs(output_folder: str | None) -> None:
+    """Initialize breadcrumb paths for this worker run.
+
+    Files are best-effort and must never break processing.
+    """
+
+    global _CRASH_BREADCRUMB_PATH, _CRASH_STATE_PATH
+    try:
+        if not output_folder:
+            _CRASH_BREADCRUMB_PATH = None
+            _CRASH_STATE_PATH = None
+            return
+        out_dir = Path(str(output_folder)).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _CRASH_BREADCRUMB_PATH = out_dir / "worker_crash_breadcrumbs.jsonl"
+        _CRASH_STATE_PATH = out_dir / "worker_last_state.json"
+    except Exception:
+        _CRASH_BREADCRUMB_PATH = None
+        _CRASH_STATE_PATH = None
+
+
+def _safe_runtime_snapshot() -> dict[str, Any]:
+    """Best-effort RAM/VRAM/pid snapshot for crash forensics."""
+
+    snap: dict[str, Any] = {
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "ts_unix": time.time(),
+    }
+    try:
+        vm = psutil.virtual_memory()
+        snap.update(
+            {
+                "ram_used_mb": float(getattr(vm, "used", 0.0)) / (1024.0 * 1024.0),
+                "ram_total_mb": float(getattr(vm, "total", 0.0)) / (1024.0 * 1024.0),
+                "ram_pct": float(getattr(vm, "percent", 0.0)),
+            }
+        )
+    except Exception:
+        pass
+
+    try:
+        if ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(zemosaic_utils, "get_gpu_vram_info"):
+            vram_used, vram_total, vram_free = zemosaic_utils.get_gpu_vram_info()
+            snap.update(
+                {
+                    "gpu_used_mb": float(vram_used) if vram_used is not None else None,
+                    "gpu_total_mb": float(vram_total) if vram_total is not None else None,
+                    "gpu_free_mb": float(vram_free) if vram_free is not None else None,
+                }
+            )
+    except Exception:
+        pass
+    return snap
+
+
+def _emit_crash_breadcrumb(event: str, **payload: Any) -> None:
+    """Append one JSON line breadcrumb and refresh last-state JSON.
+
+    This is intentionally side-channel to survive GUI queue filtering and abrupt exits.
+    """
+
+    path_jsonl = _CRASH_BREADCRUMB_PATH
+    path_state = _CRASH_STATE_PATH
+    if path_jsonl is None and path_state is None:
+        return
+
+    record: dict[str, Any] = {
+        "event": str(event),
+        "iso": datetime.utcnow().isoformat() + "Z",
+    }
+    record.update(_safe_runtime_snapshot())
+    if payload:
+        record.update(payload)
+
+    try:
+        with _CRASH_BREADCRUMB_LOCK:
+            if path_jsonl is not None:
+                try:
+                    with path_jsonl.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                except Exception:
+                    pass
+            if path_state is not None:
+                try:
+                    with path_state.open("w", encoding="utf-8") as f:
+                        json.dump(record, f, ensure_ascii=False, indent=2, default=str)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 def reset_phase5_gpu_runtime_state() -> None:
     """Reset cached Phase 5 GPU runtime state."""
 
@@ -17693,6 +17792,14 @@ def create_master_tile(
         except Exception:
             master_tile_export_data = master_tile_stacked_HWC
 
+        _emit_crash_breadcrumb(
+            "SAVE_MASTER_TILE_ENTER",
+            phase="phase3_master_tiles",
+            operation="save_fits_image",
+            tile_id=int(tile_id),
+            output_path=str(temp_fits_path),
+            has_alpha=bool(alpha_mask_out is not None),
+        )
         zemosaic_utils.save_fits_image(
             image_data=master_tile_export_data,
             output_path=str(temp_fits_path),
@@ -17703,15 +17810,39 @@ def create_master_tile(
             axis_order="HWC",
             alpha_mask=alpha_mask_out,
         )
+        _emit_crash_breadcrumb(
+            "SAVE_MASTER_TILE_LEAVE",
+            phase="phase3_master_tiles",
+            operation="save_fits_image_done",
+            tile_id=int(tile_id),
+            output_path=str(temp_fits_path),
+            has_alpha=bool(alpha_mask_out is not None),
+        )
 
         # Post-save WCS hardening (important for "Use existing master tiles").
         # Validate on-disk header and attempt a surgical repair if needed.
         validated_saved_wcs = wcs_for_master_tile
         try:
+            _emit_crash_breadcrumb(
+                "POSTSAVE_WCS_REOPEN_ENTER",
+                phase="phase3_master_tiles",
+                operation="postsave_getheader",
+                tile_id=int(tile_id),
+                output_path=str(temp_fits_path),
+            )
             header_saved_mt = fits.getheader(str(temp_fits_path), 0)
             ok_saved_mt, wcs_saved_mt, reason_saved_mt = zemosaic_utils.validate_wcs_header(
                 header_saved_mt,
                 require_footprint=True,
+            )
+            _emit_crash_breadcrumb(
+                "POSTSAVE_WCS_REOPEN_LEAVE",
+                phase="phase3_master_tiles",
+                operation="postsave_getheader_done",
+                tile_id=int(tile_id),
+                output_path=str(temp_fits_path),
+                ok=bool(ok_saved_mt),
+                reason=str(reason_saved_mt),
             )
         except Exception as exc_saved_mt:
             ok_saved_mt, wcs_saved_mt, reason_saved_mt = False, None, f"postsave_validate_exception: {exc_saved_mt}"
@@ -26738,6 +26869,14 @@ def run_hierarchical_mosaic_classic_legacy(
                 pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
             
             executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
+            _emit_crash_breadcrumb(
+                "EXECUTOR_OPEN",
+                phase="phase3_master_tiles",
+                executor_type="ThreadPoolExecutor",
+                max_workers=int(actual_num_workers_ph3),
+                winsor_workers=int(winsor_worker_limit),
+                operation="phase3_executor_open",
+            )
 
             future_to_tile_id: dict = {}
             future_to_group_info: dict = {}
@@ -26947,6 +27086,16 @@ def run_hierarchical_mosaic_classic_legacy(
                     with tile_runtime_state_lock:
                         tile_last_progress_monotonic[int(tile_id_for_hb)] = now_hb
 
+                _emit_crash_breadcrumb(
+                    "TASK_SUBMIT",
+                    phase="phase3_master_tiles",
+                    operation="submit_create_master_tile",
+                    tile_id=int(assigned_tile_id),
+                    frames=int(len(group_info_list or [])),
+                    in_flight=int(len(pending_futures)),
+                    max_workers=int(actual_num_workers_ph3),
+                    winsor_workers=int(winsor_worker_limit),
+                )
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -26993,6 +27142,13 @@ def run_hierarchical_mosaic_classic_legacy(
                     tile_last_progress_monotonic[int(assigned_tile_id)] = now_submit
                     tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
+                _emit_crash_breadcrumb(
+                    "TASK_SUBMITTED",
+                    phase="phase3_master_tiles",
+                    operation="submit_done",
+                    tile_id=int(assigned_tile_id),
+                    in_flight=int(len(pending_futures)),
+                )
 
             def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> tuple[int, float]:
                 try:
@@ -27269,8 +27425,25 @@ def run_hierarchical_mosaic_classic_legacy(
                                     )
 
                     try:
+                        _emit_crash_breadcrumb(
+                            "TASK_RESULT_WAIT",
+                            phase="phase3_master_tiles",
+                            operation="future_result",
+                            tile_id=int(tile_id_for_future),
+                            in_flight=int(len(pending_futures)),
+                        )
                         main_result, retry_groups = future.result()
                         mt_result_path, mt_result_wcs = (main_result or (None, None))
+                        _emit_crash_breadcrumb(
+                            "TASK_RESULT_OK",
+                            phase="phase3_master_tiles",
+                            operation="future_result_ok",
+                            tile_id=int(tile_id_for_future),
+                            has_path=bool(mt_result_path),
+                            has_wcs=bool(mt_result_wcs),
+                            retry_groups=int(len(retry_groups or [])),
+                            in_flight=int(len(pending_futures)),
+                        )
                         if mt_result_path and mt_result_wcs:
                             master_tiles_results_list_temp[tile_id_for_future] = (mt_result_path, mt_result_wcs)
                         else:
@@ -27399,6 +27572,16 @@ def run_hierarchical_mosaic_classic_legacy(
                                 error=str(exc_thread_ph3),
                             )
                             logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+                            _emit_crash_breadcrumb(
+                                "TASK_RESULT_EXCEPTION",
+                                phase="phase3_master_tiles",
+                                operation="future_result_exception",
+                                tile_id=int(tile_id_for_future),
+                                error=str(exc_thread_ph3),
+                                in_flight=int(len(pending_futures)),
+                                max_workers=int(actual_num_workers_ph3),
+                                winsor_workers=int(winsor_worker_limit),
+                            )
                     finally:
                         # Aggressively free CuPy memory pools between tiles to avoid device/pinned host growth
                         try:
@@ -27459,6 +27642,12 @@ def run_hierarchical_mosaic_classic_legacy(
                     monitor_thread.join(timeout=2.0)
             except Exception:
                 pass
+            _emit_crash_breadcrumb(
+                "EXECUTOR_CLOSE",
+                phase="phase3_master_tiles",
+                operation="phase3_executor_close",
+                in_flight=int(len(pending_futures)) if 'pending_futures' in locals() else None,
+            )
             executor_ph3.shutdown(wait=True)
 
             if cache_retention_mode == "per_tile":
@@ -32560,6 +32749,14 @@ def run_hierarchical_mosaic(
                 pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
             
             executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
+            _emit_crash_breadcrumb(
+                "EXECUTOR_OPEN",
+                phase="phase3_master_tiles",
+                executor_type="ThreadPoolExecutor",
+                max_workers=int(actual_num_workers_ph3),
+                winsor_workers=int(winsor_worker_limit),
+                operation="phase3_executor_open",
+            )
 
             future_to_tile_id: dict = {}
             future_to_group_info: dict = {}
@@ -32769,6 +32966,16 @@ def run_hierarchical_mosaic(
                     with tile_runtime_state_lock:
                         tile_last_progress_monotonic[int(tile_id_for_hb)] = now_hb
 
+                _emit_crash_breadcrumb(
+                    "TASK_SUBMIT",
+                    phase="phase3_master_tiles",
+                    operation="submit_create_master_tile",
+                    tile_id=int(assigned_tile_id),
+                    frames=int(len(group_info_list or [])),
+                    in_flight=int(len(pending_futures)),
+                    max_workers=int(actual_num_workers_ph3),
+                    winsor_workers=int(winsor_worker_limit),
+                )
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -32818,6 +33025,13 @@ def run_hierarchical_mosaic(
                     tile_last_progress_monotonic[int(assigned_tile_id)] = now_submit
                     tile_abort_request_count.setdefault(int(assigned_tile_id), 0)
                 pending_futures.add(future)
+                _emit_crash_breadcrumb(
+                    "TASK_SUBMITTED",
+                    phase="phase3_master_tiles",
+                    operation="submit_done",
+                    tile_id=int(assigned_tile_id),
+                    in_flight=int(len(pending_futures)),
+                )
 
             def _estimate_phase3_split_chunk_size(group_items: list[dict]) -> tuple[int, float]:
                 try:
@@ -33094,8 +33308,25 @@ def run_hierarchical_mosaic(
                                     )
 
                     try:
+                        _emit_crash_breadcrumb(
+                            "TASK_RESULT_WAIT",
+                            phase="phase3_master_tiles",
+                            operation="future_result",
+                            tile_id=int(tile_id_for_future),
+                            in_flight=int(len(pending_futures)),
+                        )
                         main_result, retry_groups = future.result()
                         mt_result_path, mt_result_wcs = (main_result or (None, None))
+                        _emit_crash_breadcrumb(
+                            "TASK_RESULT_OK",
+                            phase="phase3_master_tiles",
+                            operation="future_result_ok",
+                            tile_id=int(tile_id_for_future),
+                            has_path=bool(mt_result_path),
+                            has_wcs=bool(mt_result_wcs),
+                            retry_groups=int(len(retry_groups or [])),
+                            in_flight=int(len(pending_futures)),
+                        )
                         if mt_result_path and mt_result_wcs:
                             master_tiles_results_list_temp[tile_id_for_future] = (mt_result_path, mt_result_wcs)
                         else:
@@ -33224,6 +33455,16 @@ def run_hierarchical_mosaic(
                                 error=str(exc_thread_ph3),
                             )
                             logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+                            _emit_crash_breadcrumb(
+                                "TASK_RESULT_EXCEPTION",
+                                phase="phase3_master_tiles",
+                                operation="future_result_exception",
+                                tile_id=int(tile_id_for_future),
+                                error=str(exc_thread_ph3),
+                                in_flight=int(len(pending_futures)),
+                                max_workers=int(actual_num_workers_ph3),
+                                winsor_workers=int(winsor_worker_limit),
+                            )
                     finally:
                         # Aggressively free CuPy memory pools between tiles to avoid device/pinned host growth
                         try:
@@ -33284,6 +33525,12 @@ def run_hierarchical_mosaic(
                     monitor_thread.join(timeout=2.0)
             except Exception:
                 pass
+            _emit_crash_breadcrumb(
+                "EXECUTOR_CLOSE",
+                phase="phase3_master_tiles",
+                operation="phase3_executor_close",
+                in_flight=int(len(pending_futures)) if 'pending_futures' in locals() else None,
+            )
             executor_ph3.shutdown(wait=True)
 
             if cache_retention_mode == "per_tile":
@@ -34296,6 +34543,24 @@ def run_hierarchical_mosaic_process(
 
     _sanitize_spawned_process_logging()
 
+    crash_ctx: dict[str, Any] = {
+        "phase": "bootstrap",
+        "operation": "worker_start",
+        "stage": None,
+        "tile_progress": None,
+        "in_flight": None,
+        "cpu_workers": None,
+        "gpu_rows_per_chunk": None,
+        "max_chunk_bytes": None,
+        "winsor_workers": None,
+    }
+
+    def _ctx_update(**items: Any) -> None:
+        try:
+            crash_ctx.update(items)
+        except Exception:
+            pass
+
     # progress_callback(stage: str, current: int, total: int)
 
     def queue_callback(*cb_args, **cb_kwargs):
@@ -34316,16 +34581,44 @@ def run_hierarchical_mosaic_process(
             and isinstance(cb_args[2], int)
         ):
             stage, current, total = cb_args
+            _ctx_update(phase=str(stage), stage=str(stage), operation="stage_progress")
+            _emit_crash_breadcrumb(
+                "STAGE_PROGRESS",
+                phase=str(stage),
+                current=int(current),
+                total=int(total),
+            )
             progress_queue.put(("STAGE_PROGRESS", stage, current, {"total": total}))
             return
 
         message_key_or_raw = cb_args[0] if cb_args else ""
         progress_value = cb_args[1] if len(cb_args) > 1 else None
         level = cb_args[2] if len(cb_args) > 2 else cb_kwargs.pop("level", "INFO")
+        try:
+            msg_txt = str(message_key_or_raw)
+            if msg_txt.startswith("MASTER_TILE_COUNT_UPDATE:"):
+                counts = msg_txt.split(":", 1)[1] if ":" in msg_txt else ""
+                cur_s, tot_s = counts.split("/", 1)
+                _ctx_update(phase="phase3_master_tiles", operation="master_tile_progress", tile_progress={"done": int(cur_s), "total": int(tot_s)})
+            elif msg_txt.startswith("RAW_FILE_COUNT_UPDATE:"):
+                _ctx_update(phase="phase1_preprocessing", operation="raw_progress")
+            elif msg_txt.startswith("run_warn_phase3_master_tile_creation_failed_thread"):
+                _ctx_update(phase="phase3_master_tiles", operation="tile_failed")
+        except Exception:
+            pass
         if "lvl" in cb_kwargs:
             level = cb_kwargs.pop("lvl")
         # Only forward user-facing or control messages to the GUI queue
         lvl_str = str(level).upper() if isinstance(level, str) else "INFO"
+        if lvl_str in {"WARN", "ERROR"}:
+            _emit_crash_breadcrumb(
+                "GUI_LOG",
+                level=lvl_str,
+                message=str(message_key_or_raw),
+                progress=progress_value,
+                payload=dict(cb_kwargs or {}),
+                context=dict(crash_ctx),
+            )
         if lvl_str not in {"INFO", "WARN", "ERROR", "SUCCESS", "ETA_LEVEL", "CHRONO_LEVEL"}:
             return
         progress_queue.put((message_key_or_raw, progress_value, level, cb_kwargs))
@@ -34400,6 +34693,34 @@ def run_hierarchical_mosaic_process(
     if 'num_base_workers_config' not in final_kwargs:
         final_kwargs['num_base_workers_config'] = 0
 
+    output_for_breadcrumbs = (
+        final_kwargs.get("output_folder")
+        or kwargs.get("output_dir")
+        or kwargs.get("output_folder")
+    )
+    _configure_crash_breadcrumbs(str(output_for_breadcrumbs) if output_for_breadcrumbs else None)
+    _ctx_update(
+        operation="before_run",
+        phase="run_hierarchical_mosaic",
+        cpu_workers=final_kwargs.get("num_base_workers_config"),
+        winsor_workers=final_kwargs.get("winsor_worker_limit_config") or final_kwargs.get("winsor_worker_limit"),
+        gpu_rows_per_chunk=final_kwargs.get("gpu_rows_per_chunk_config"),
+        max_chunk_bytes=final_kwargs.get("max_chunk_bytes_config"),
+    )
+    _emit_crash_breadcrumb("WORKER_START", context=dict(crash_ctx))
+
+    hb_stop_evt = threading.Event()
+
+    def _heartbeat_writer() -> None:
+        while not hb_stop_evt.wait(2.0):
+            _emit_crash_breadcrumb("WORKER_HEARTBEAT", context=dict(crash_ctx))
+
+    hb_thread = threading.Thread(target=_heartbeat_writer, name="ZeMosaicCrashHB", daemon=True)
+    try:
+        hb_thread.start()
+    except Exception:
+        pass
+
     try:
         run_hierarchical_mosaic(**final_kwargs)
     except Exception as e_proc:
@@ -34407,8 +34728,32 @@ def run_hierarchical_mosaic_process(
             logger.exception("Worker process crashed before completion")
         except Exception:
             pass
-        progress_queue.put(("PROCESS_ERROR", None, "ERROR", {"error": str(e_proc)}))
+        _ctx_update(operation="worker_exception", phase="run_hierarchical_mosaic")
+        _emit_crash_breadcrumb(
+            "WORKER_EXCEPTION",
+            error=str(e_proc),
+            traceback=traceback.format_exc(),
+            context=dict(crash_ctx),
+        )
+        progress_queue.put((
+            "PROCESS_ERROR",
+            None,
+            "ERROR",
+            {
+                "error": str(e_proc),
+                "crash_context": dict(crash_ctx),
+                "breadcrumb_path": str(_CRASH_BREADCRUMB_PATH) if _CRASH_BREADCRUMB_PATH else None,
+                "last_state_path": str(_CRASH_STATE_PATH) if _CRASH_STATE_PATH else None,
+            },
+        ))
     finally:
+        try:
+            hb_stop_evt.set()
+            if hb_thread.is_alive():
+                hb_thread.join(timeout=0.4)
+        except Exception:
+            pass
+        _emit_crash_breadcrumb("WORKER_DONE", context=dict(crash_ctx))
         progress_queue.put(("PROCESS_DONE", None, "INFO", {}))
 
 if __name__ == "__main__":
