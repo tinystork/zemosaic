@@ -313,6 +313,29 @@ DEFAULT_CONFIG = {
     "aesthetic_hole_fill_max_radius_px": 96,
     "aesthetic_hole_fill_blend": 0.85,
     "aesthetic_hole_fill_only_near_seams": True,
+    # Aesthetic profile presets (for quick switching).
+    # Keep strong as active default for now.
+    "aesthetic_profile_preset": "strong",  # balanced|strong
+    "aesthetic_profile_presets": {
+        "balanced": {
+            "patchwork_suppressor_strength": "normal",
+            "patchwork_suppressor_seam_band_px": 200,
+            "patchwork_suppressor_max_delta": 0.22,
+            "patchwork_suppressor_protect_stars": True,
+            "aesthetic_hole_fill_max_radius_px": 64,
+            "aesthetic_hole_fill_blend": 0.70,
+            "aesthetic_hole_fill_only_near_seams": True,
+        },
+        "strong": {
+            "patchwork_suppressor_strength": "strong",
+            "patchwork_suppressor_seam_band_px": 320,
+            "patchwork_suppressor_max_delta": 0.30,
+            "patchwork_suppressor_protect_stars": False,
+            "aesthetic_hole_fill_max_radius_px": 96,
+            "aesthetic_hole_fill_blend": 0.85,
+            "aesthetic_hole_fill_only_near_seams": True,
+        },
+    },
     "final_mosaic_dbe_enabled": True,
     "final_mosaic_dbe_strength": "normal",
     # Final black-point equalization (power-user; can alter low/mid ADU chroma balance)
