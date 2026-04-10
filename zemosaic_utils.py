@@ -6401,27 +6401,45 @@ def _reproject_and_coadd_wrapper_impl(
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
     input_weights_from_call = cpu_kwargs.get("input_weights")
+    cpu_weight_dtype = np.float32 if use_gpu else np.float64
+
+    def _coerce_weights_dtype(weights_obj, dtype_target):
+        try:
+            items = list(weights_obj)
+        except Exception:
+            items = [weights_obj]
+        coerced = []
+        for item in items:
+            if item is None:
+                coerced.append(None)
+                continue
+            try:
+                coerced.append(np.asarray(item, dtype=dtype_target))
+            except Exception:
+                coerced.append(item)
+        return coerced
+
     if normalized_weights is not None:
         weight_maps = []
         for idx, (arr, w) in enumerate(zip(data_list, normalized_weights)):
-            arr_np = np.asarray(arr, dtype=np.float32)
+            arr_np = np.asarray(arr, dtype=cpu_weight_dtype)
             base_weight = None
             if isinstance(input_weights_from_call, (list, tuple, np.ndarray)) and idx < len(input_weights_from_call):
                 base_weight = input_weights_from_call[idx]
             if base_weight is not None:
-                base_arr = np.asarray(base_weight, dtype=np.float32)
+                base_arr = np.asarray(base_weight, dtype=cpu_weight_dtype)
                 try:
-                    weight_maps.append(np.multiply(base_arr, float(w), dtype=np.float32))
+                    weight_maps.append(np.multiply(base_arr, float(w), dtype=cpu_weight_dtype))
                 except Exception:
-                    weight_maps.append(base_arr.astype(np.float32, copy=False) * float(w))
+                    weight_maps.append(base_arr.astype(cpu_weight_dtype, copy=False) * float(w))
             else:
                 try:
-                    weight_maps.append(np.full_like(arr_np, float(w), dtype=np.float32))
+                    weight_maps.append(np.full_like(arr_np, float(w), dtype=cpu_weight_dtype))
                 except Exception:
-                    weight_maps.append(np.full(arr_np.shape, float(w), dtype=np.float32))
+                    weight_maps.append(np.full(arr_np.shape, float(w), dtype=cpu_weight_dtype))
         cpu_kwargs["input_weights"] = weight_maps
     elif input_weights_from_call is not None:
-        cpu_kwargs["input_weights"] = input_weights_from_call
+        cpu_kwargs["input_weights"] = _coerce_weights_dtype(input_weights_from_call, cpu_weight_dtype)
     inputs = list(zip(data_list, wcs_list))
     output_proj = cpu_kwargs.pop("output_projection")
     def _run_reproject(inp, out_proj):
