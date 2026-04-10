@@ -3966,6 +3966,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     raw_value = self.config.get(key, raw_value)
 
             self.config[key] = raw_value
+            if key in {"use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"}:
+                self._synchronize_gpu_config_keys()
         except Exception:
             self.config[key] = self.config.get(key)
 
