@@ -1363,6 +1363,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _populate_advanced_tab(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._create_quality_group())
         layout.addWidget(self._create_stacking_group())
+        layout.addWidget(self._create_aesthetic_output_group())
         layout.addStretch(1)
 
     def _populate_skin_tab(self, layout: QVBoxLayout) -> None:
@@ -2468,6 +2469,64 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         return group
 
+    def _create_aesthetic_output_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_aesthetic_output", "Aesthetic output (advanced)"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        hole_fill_checkbox = self._register_checkbox(
+            "aesthetic_hole_fill_enabled",
+            layout,
+            self._tr("qt_field_aesthetic_hole_fill_enabled", "Aesthetic hole fill"),
+        )
+        hole_fill_checkbox.setToolTip(
+            self._tr(
+                "qt_field_aesthetic_hole_fill_tip",
+                "Fill residual visual holes in the aesthetic FITS branch only.",
+            )
+        )
+        self._register_spinbox(
+            "aesthetic_hole_fill_max_radius_px",
+            layout,
+            self._tr("qt_field_aesthetic_hole_fill_radius", "Hole fill radius (px)"),
+            minimum=4,
+            maximum=512,
+            single_step=4,
+        )
+        self._register_double_spinbox(
+            "aesthetic_hole_fill_blend",
+            layout,
+            self._tr("qt_field_aesthetic_hole_fill_blend", "Hole fill blend / feather"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.05,
+            decimals=2,
+        )
+        self._register_checkbox(
+            "aesthetic_hole_fill_only_near_seams",
+            layout,
+            self._tr("qt_field_aesthetic_hole_fill_near_seams", "Only fill near seams"),
+        )
+        guard_checkbox = self._register_checkbox(
+            "aesthetic_hole_fill_protect_stars_details",
+            layout,
+            self._tr(
+                "qt_field_aesthetic_hole_fill_guard",
+                "Protect stars and fine details during fill",
+            ),
+        )
+        guard_checkbox.setToolTip(
+            self._tr(
+                "qt_field_aesthetic_hole_fill_guard_tip",
+                "Reduces hole-fill influence over bright stars and high-detail regions.",
+            )
+        )
+
+        return group
+
     def _create_final_assembly_group(self, parent: QWidget | None = None) -> QFrame:
         container = parent or self
         header_text = self._tr("qt_group_final_assembly", "Final assembly & output")
@@ -2538,6 +2597,29 @@ class ZeMosaicQtMainWindow(QMainWindow):
             general_layout,
             self._tr("qt_field_legacy_rgb_cube", "Legacy RGB cube layout"),
         )
+
+        export_aesthetic_checkbox = self._register_checkbox(
+            "export_aesthetic_fits",
+            general_layout,
+            self._tr("qt_field_export_aesthetic_fits", "Export dual FITS (science + aesthetic)"),
+        )
+        export_aesthetic_checkbox.setToolTip(
+            self._tr(
+                "qt_field_export_aesthetic_fits_tip",
+                "When enabled, ZeMosaic writes both scientific and aesthetic FITS outputs in one run.",
+            )
+        )
+        self._register_line_edit(
+            "scientific_fits_suffix",
+            general_layout,
+            self._tr("qt_field_scientific_fits_suffix", "Scientific FITS suffix"),
+        )
+        self._register_line_edit(
+            "aesthetic_fits_suffix",
+            general_layout,
+            self._tr("qt_field_aesthetic_fits_suffix", "Aesthetic FITS suffix"),
+        )
+
         dbe_checkbox = self._register_checkbox(
             "final_mosaic_dbe_enabled",
             general_layout,
@@ -4033,6 +4115,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "aesthetic_hole_fill_max_radius_px": 64,
             "aesthetic_hole_fill_blend": 0.70,
             "aesthetic_hole_fill_only_near_seams": True,
+            "aesthetic_hole_fill_protect_stars_details": True,
             "apply_master_tile_crop": True,
             "master_tile_crop_percent": 3.0,
             "match_background_for_final": True,

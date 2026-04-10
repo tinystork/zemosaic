@@ -321,6 +321,7 @@ DEFAULT_CONFIG = {
     "aesthetic_hole_fill_max_radius_px": 96,
     "aesthetic_hole_fill_blend": 0.85,
     "aesthetic_hole_fill_only_near_seams": True,
+    "aesthetic_hole_fill_protect_stars_details": True,
     # Aesthetic profile presets (for quick switching).
     # Keep strong as active default for now.
     "aesthetic_profile_preset": "strong",  # balanced|strong
@@ -333,6 +334,7 @@ DEFAULT_CONFIG = {
             "aesthetic_hole_fill_max_radius_px": 64,
             "aesthetic_hole_fill_blend": 0.70,
             "aesthetic_hole_fill_only_near_seams": True,
+            "aesthetic_hole_fill_protect_stars_details": True,
         },
         "strong": {
             "patchwork_suppressor_strength": "strong",
@@ -342,6 +344,7 @@ DEFAULT_CONFIG = {
             "aesthetic_hole_fill_max_radius_px": 96,
             "aesthetic_hole_fill_blend": 0.85,
             "aesthetic_hole_fill_only_near_seams": True,
+            "aesthetic_hole_fill_protect_stars_details": True,
         },
     },
     "final_mosaic_dbe_enabled": True,

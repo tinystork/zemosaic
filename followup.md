@@ -38,15 +38,15 @@ Primary product target is now:
 
 ### C — Dual FITS export
 - [x] Add config keys (`export_aesthetic_fits`, suffixes)
-- [ ] Add UI switch + help text
+- [x] Add UI switch + help text
 - [x] Export both files in one run when enabled
 - [x] Add explicit logs + header provenance
 
 ### D — Aesthetic hole-fill
 - [x] Add hole-mask detection from coverage/alpha
 - [x] Add local inpainting/fill (aesthetic branch only)
-- [ ] Add blend/feather controls
-- [ ] Add star/detail protection guard
+- [x] Add blend/feather controls
+- [x] Add star/detail protection guard
 - [x] Add diagnostics (`[AestheticFill]` suggested)
 
 ### Performance guardrails
@@ -127,11 +127,12 @@ Mission considered complete when:
 - Prefer adaptive memory scaling and bounded chunk growth over unsafe static maxing.
 
 ### Remaining TODO (crash track)
-- [ ] Produce a safe A/B memory profile: `SAFE+` then `AGGRESSIVE`, with explicit rollback.
-- [ ] Measure phase timing deltas (P3/P5), peak RSS, and swap impact on each profile.
+Status: ⏸️ paused by decision (2026-04-10) because recent runs are stable and no native crash reproduced.
 - [x] Keep crash breadcrumbs enabled and compare event timelines when failure reappears.
-- [ ] Correlate any future native crash with WER/Event Viewer module data.
-- [ ] Decide production defaults only after proving no OOM regressions on large stacks.
+- [ ] (Paused) Produce a safe A/B memory profile: `SAFE+` then `AGGRESSIVE`, with explicit rollback.
+- [ ] (Paused) Measure phase timing deltas (P3/P5), peak RSS, and swap impact on each profile.
+- [ ] (Paused) Correlate any future native crash with WER/Event Viewer module data.
+- [ ] (Paused) Decide production defaults only after proving no OOM regressions on large stacks.
 
 ## Mission update (2026-04-10) — ETA GUI first
 

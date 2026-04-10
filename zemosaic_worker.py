@@ -4658,6 +4658,7 @@ def _apply_aesthetic_hole_fill(
     max_radius_px: int = 64,
     blend: float = 0.70,
     only_near_seams: bool = True,
+    protect_stars_details: bool = True,
     logger: logging.Logger | None = None,
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
     """Visual-only local hole completion for aesthetic branch."""
@@ -4671,6 +4672,8 @@ def _apply_aesthetic_hole_fill(
         "max_radius_px": int(max_radius_px),
         "blend": float(blend),
         "only_near_seams": bool(only_near_seams),
+        "protect_stars_details": bool(protect_stars_details),
+        "protected_frac": 0.0,
     }
     if not enabled or mosaic_hwc is None or not isinstance(mosaic_hwc, np.ndarray):
         return mosaic_hwc, info
@@ -4745,6 +4748,32 @@ def _apply_aesthetic_hole_fill(
         feather = np.clip((float(max_radius_px) - dist) / max(1.0, float(max_radius_px)), 0.0, 1.0) * float(blend)
     feather *= target.astype(np.float32)
 
+    if bool(protect_stars_details) and np.any(valid):
+        try:
+            luminance = np.nanmean(out, axis=-1).astype(np.float32, copy=False)
+            valid_luma = luminance[valid]
+            protect_mask = np.zeros_like(target, dtype=bool)
+            if valid_luma.size > 0:
+                star_thr = float(np.nanpercentile(valid_luma, 99.5))
+                if math.isfinite(star_thr):
+                    protect_mask |= np.isfinite(luminance) & (luminance >= star_thr)
+
+            gx, gy = np.gradient(np.where(np.isfinite(luminance), luminance, 0.0).astype(np.float32, copy=False))
+            grad = np.hypot(gx, gy).astype(np.float32, copy=False)
+            grad_valid = grad[valid]
+            if grad_valid.size > 0:
+                detail_thr = float(np.nanpercentile(grad_valid, 97.0))
+                if math.isfinite(detail_thr):
+                    protect_mask |= grad >= detail_thr
+
+            if np.any(protect_mask):
+                protect_soft = _gaussian_blur_2d_float32(protect_mask.astype(np.float32), sigma_px=1.2)
+                protect_soft = np.clip(protect_soft, 0.0, 1.0)
+                feather *= (1.0 - 0.85 * protect_soft)
+                info["protected_frac"] = float(np.count_nonzero(protect_mask)) / float(protect_mask.size)
+        except Exception:
+            pass
+
     for ch in range(3):
         src = out[..., ch]
         if np.any(valid):
@@ -4766,7 +4795,7 @@ def _apply_aesthetic_hole_fill(
 
     if logger is not None:
         logger.info(
-            "[AestheticFill] enabled=%s applied=%s hole_px=%d filled_px=%d max_radius_px=%d blend=%.3f only_near_seams=%s",
+            "[AestheticFill] enabled=%s applied=%s hole_px=%d filled_px=%d max_radius_px=%d blend=%.3f only_near_seams=%s protect_stars_details=%s protected_frac=%.5f",
             bool(enabled),
             True,
             hole_px,
@@ -4774,6 +4803,8 @@ def _apply_aesthetic_hole_fill(
             int(max_radius_px),
             float(blend),
             bool(only_near_seams),
+            bool(protect_stars_details),
+            float(info.get("protected_frac", 0.0) or 0.0),
         )
 
     return out, info
@@ -16973,6 +17004,14 @@ def create_master_tile(
              # min_val=np.nanmin(master_tile_stacked_HWC), # Peut être verbeux
              # max_val=np.nanmax(master_tile_stacked_HWC),
              # mean_val=np.nanmean(master_tile_stacked_HWC))
+    _emit_crash_breadcrumb(
+        "P3_STACK_CORE_DONE",
+        phase="phase3_master_tiles",
+        operation="stack_core_done",
+        tile_id=int(tile_id),
+        shape=tuple(int(x) for x in np.shape(master_tile_stacked_HWC)[:3]),
+        used_gpu=bool(used_gpu),
+    )
 
     stack_metadata["phase3_used_gpu"] = bool(used_gpu)
     rgb_eq_info = stack_metadata.get("rgb_equalization", {})
@@ -17003,6 +17042,17 @@ def create_master_tile(
     if debug_tile and poststack_equalize_rgb:
         _dbg_rgb_stats("P3_pre_poststack_rgb_eq", master_tile_stacked_HWC, logger=logger)
 
+    _emit_crash_breadcrumb(
+        "P3_POSTSTACK_EQ_STATE",
+        phase="phase3_master_tiles",
+        operation="poststack_eq_state",
+        tile_id=int(tile_id),
+        eq_enabled=bool(eq_enabled),
+        eq_applied=bool(eq_applied),
+        gain_r=float(gain_r),
+        gain_g=float(gain_g),
+        gain_b=float(gain_b),
+    )
     pcb_tile(
         f"[RGB-EQ] poststack_equalize_rgb enabled={eq_enabled}, applied={eq_applied}, "
         f"gains=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target={target_str}",
@@ -17993,6 +18043,16 @@ def create_master_tile(
         except Exception:
             master_tile_export_data = master_tile_stacked_HWC
 
+        _emit_crash_breadcrumb(
+            "P3_PRE_SAVE_READY",
+            phase="phase3_master_tiles",
+            operation="pre_save_ready",
+            tile_id=int(tile_id),
+            output_path=str(temp_fits_path),
+            has_alpha=bool(alpha_mask_out is not None),
+            export_nonfinite_zeroed=bool(header_mt_save.get("ZMT_NANZ", (0,))[0] if isinstance(header_mt_save.get("ZMT_NANZ", (0,)), tuple) else header_mt_save.get("ZMT_NANZ", 0)),
+            export_nonfinite_count=int(header_mt_save.get("ZMT_NANC", (0,))[0] if isinstance(header_mt_save.get("ZMT_NANC", (0,)), tuple) else (header_mt_save.get("ZMT_NANC", 0) or 0)),
+        )
         _emit_crash_breadcrumb(
             "SAVE_MASTER_TILE_ENTER",
             phase="phase3_master_tiles",
@@ -28524,6 +28584,13 @@ def run_hierarchical_mosaic_classic_legacy(
             aesthetic_hole_fill_only_near_seams_cfg = True
         aesthetic_hole_fill_only_near_seams_cfg = bool(aesthetic_hole_fill_only_near_seams_cfg)
 
+        aesthetic_hole_fill_protect_stars_details_cfg = _coerce_bool_flag(getattr(zconfig, "aesthetic_hole_fill_protect_stars_details", None))
+        if aesthetic_hole_fill_protect_stars_details_cfg is None:
+            aesthetic_hole_fill_protect_stars_details_cfg = _coerce_bool_flag(_cfg_cache_local.get("aesthetic_hole_fill_protect_stars_details", True))
+        if aesthetic_hole_fill_protect_stars_details_cfg is None:
+            aesthetic_hole_fill_protect_stars_details_cfg = True
+        aesthetic_hole_fill_protect_stars_details_cfg = bool(aesthetic_hole_fill_protect_stars_details_cfg)
+
         # Ensure the final mosaic buffer is a contiguous, writeable ndarray for I/O
         save_array = None
         try:
@@ -28588,6 +28655,7 @@ def run_hierarchical_mosaic_classic_legacy(
                 aesthetic_header["ZMHFILL"] = (bool(aesthetic_hole_fill_enabled_cfg), "Aesthetic hole-fill enabled")
                 aesthetic_header["ZMHFRAD"] = (int(max(0, aesthetic_hole_fill_max_radius_cfg)), "Aesthetic hole-fill radius")
                 aesthetic_header["ZMHFBLD"] = (float(aesthetic_hole_fill_blend_cfg), "Aesthetic hole-fill blend")
+                aesthetic_header["ZMHFPRT"] = (bool(aesthetic_hole_fill_protect_stars_details_cfg), "Aesthetic hole-fill star/detail guard")
 
                 aesthetic_array = np.array(save_array, copy=True) if isinstance(save_array, np.ndarray) else None
                 if aesthetic_array is None:
@@ -28602,6 +28670,7 @@ def run_hierarchical_mosaic_classic_legacy(
                         max_radius_px=int(aesthetic_hole_fill_max_radius_cfg),
                         blend=float(aesthetic_hole_fill_blend_cfg),
                         only_near_seams=bool(aesthetic_hole_fill_only_near_seams_cfg),
+                        protect_stars_details=bool(aesthetic_hole_fill_protect_stars_details_cfg),
                         logger=logger,
                     )
                     if isinstance(aesthetic_fill_info, dict):
