@@ -52,7 +52,21 @@ Primary product target is now:
 ### Performance guardrails
 - [ ] Measure runtime overhead on sparse + dense runs
 - [ ] Measure peak RAM delta
-- [ ] Keep default mode fast (bounded pass count)
+- [x] Keep default mode fast (bounded pass count)
+
+Validation snapshot (2026-04-10, log corpus `/media/tristan/X10 Pro/mosaic/test`):
+- Reviewed 62 run logs + 4 crash-breadcrumb files.
+- Bounded-pass guard confirmed in logs via `Winsor streaming limit set to ... frame(s) per pass`:
+  - 24 frames/pass on current M106 Linux runs (`M106_8`, `M106_9`, `M106_10`),
+  - 256 frames/pass on heavy historical Markarian/M31 runs.
+- Runtime overhead (sparse+dense) is not yet signed off: latest M106 enhanced runs (dual export + hole-fill) are not all completed/paired against strict same-input baseline.
+- Peak RAM delta is partially observable but not yet finalized as a guardrail metric:
+  - breadcrumbs maxima: `M106_8` 95.7% (~7366 MB), `M106_9` 96.6% (~7438 MB), `M106_10` 97.0% (~7466 MB), `marikian/C` 97.9% (~31775 MB).
+  - need final paired completed runs to publish authoritative delta numbers.
+- Additional heavy-run context from `/media/tristan/X10 Pro/mosaic/andromeda/out` (older code branch, still useful for guardrail scale):
+  - root Andromeda run: `38136s` (~10h35), peak proc RSS `~9705 MB`, max system RAM usage `~63.7%`.
+  - `V4 RUN A/B/D`: `34986s / 17519s / 18480s`, peak proc RSS `~3645 / 3192 / 4092 MB`, max system RAM usage around `~94–95%`.
+  - all these runs show `winsor_max_frames_per_pass=0` in snapshots; bounded-pass protection is still enforced by runtime caps where applicable (seen in newer logs via explicit `Winsor streaming limit set ...`).
 
 ---
 
@@ -92,3 +106,78 @@ Mission considered complete when:
 1. aesthetic output is consistently editable and visually smooth,
 2. science output remains trustworthy and clearly separated,
 3. throughput remains compatible with high-volume workflows.
+
+## Markarian crash investigation update (2026-04-10)
+
+### Current status
+- Root cause is still not identified (intermittent behavior).
+- A full Markarian run (`.../marikian/C/`) completed successfully with outputs + no `TASK_RESULT_EXCEPTION` in breadcrumbs.
+- Fast stress run (`FAST_CRASH_HUNT_STRESS_20260410_090040`) also completed in ~12m33s, but with only 5 groups and `WORKERS_PHASE3: Utilisation de 1 worker(s)`, so limited concurrency stress.
+- A larger stress run (450 FIT + target groups ~195) is much slower and currently shows long Phase 3 and Phase 5 durations.
+- Crash breadcrumbs remain enabled and available for future incident forensics (`worker_crash_breadcrumbs.jsonl` + `worker_last_state.json`).
+
+### Resource utilization findings from latest large stress log
+- VRAM mostly low-use: about 1.1 to 2.0 GB used on ~8.2 GB total.
+- CPU median low (around 16%).
+- RAM system load is non-trivial (roughly 18 to 26.6 GB used on 32.5 GB), but process-level usage is moderate and variable.
+- GPU chunk cap remains conservative (`gpu_max_chunk_bytes=134217728`), likely limiting throughput.
+
+### Guardrail to keep
+- Any tuning must preserve the ability to process very large datasets (up to 10k images) without OOM.
+- Prefer adaptive memory scaling and bounded chunk growth over unsafe static maxing.
+
+### Remaining TODO (crash track)
+- [ ] Produce a safe A/B memory profile: `SAFE+` then `AGGRESSIVE`, with explicit rollback.
+- [ ] Measure phase timing deltas (P3/P5), peak RSS, and swap impact on each profile.
+- [x] Keep crash breadcrumbs enabled and compare event timelines when failure reappears.
+- [ ] Correlate any future native crash with WER/Event Viewer module data.
+- [ ] Decide production defaults only after proving no OOM regressions on large stacks.
+
+## Mission update (2026-04-10) — ETA GUI first
+
+### Decision
+Before any new performance work (auto-chunking dynamic, RAM/VRAM tuning), fix ETA behavior in GUI.
+
+### Why this is first
+- Current long runs (Markarian stress) complete, but ETA is not reliable enough for operational confidence.
+- We need trustworthy timing to quantify gains/losses from future tuning.
+
+### Active TODO (ETA)
+- [x] Audit current ETA pipeline (emitters + GUI display path).
+- [x] Separate phase ETA and global ETA clearly in GUI/state.
+- [x] Add smoothing + hysteresis to reduce oscillations.
+- [x] Reinitialize ETA model at phase boundaries (notably P3 and P5).
+- [x] Add ETA confidence/status (warmup/learning/stable) to prevent misleading early values.
+- [x] Add diagnostic logs for ETA source and windowing.
+- [x] Validate on M106 runs (normal + resume).
+
+### ETA mission status
+- ✅ Considered accomplished (2026-04-10, validated in real runs).
+- GUI now maintains a coherent countdown between updates.
+- Resume startup ETA no longer relies on obviously unrealistic short values.
+
+### Constraints for next step (after ETA)
+- Keep 10k-images-no-OOM objective as hard requirement.
+- Dynamic chunking must be SAFE by default (reserved RAM/VRAM + rollback on pressure).
+- Aggressive profile remains opt-in.
+
+### Next block after ETA is validated
+- [x] Implement SAFE_DYNAMIC chunking profile.
+- [x] Run A/B benchmark vs baseline.
+- [x] Report total time gain + P3/P5 gain + memory/swap deltas.
+
+A/B results (2026-04-10, same M106 dataset):
+- SAFE_DYNAMIC run: `/media/tristan/X10 Pro/mosaic/test/M106_10/`
+- BASELINE run: `/media/tristan/X10 Pro/mosaic/test/M106_AB_BASELINE/`
+
+Measured deltas (baseline relative to SAFE_DYNAMIC):
+- Total runtime: `1814.57s` vs `1695.35s` → baseline `+119.22s` (`+7.03%`) => SAFE_DYNAMIC faster.
+- Phase 3 runtime: `607.74s` vs `565.90s` → baseline `+41.84s` (`+7.39%`).
+- Phase 5 runtime: `1182.62s` vs `1103.43s` → baseline `+79.19s` (`+7.18%`).
+- Peak process RSS: `2038.5 MB` vs `2542.1 MB` → baseline lower (`-503.6 MB`, `-19.81%`).
+- Max system RAM%: `85.3%` vs `89.5%` → baseline lower (`-4.2 pts`).
+- Max swap used: `9183 MB` vs `8920 MB` → baseline higher (`+263 MB`, `+2.95%`), so SAFE_DYNAMIC slightly better on swap pressure.
+
+Interpretation:
+- SAFE_DYNAMIC gives a clear throughput gain on this dataset (about 7% overall, consistent on P3/P5).
+- Memory profile tradeoff observed: higher process RSS / system RAM peaks, but slightly reduced swap usage.

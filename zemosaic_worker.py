@@ -156,17 +156,22 @@ _PHASE5_GPU_RUNTIME_STATE: dict[str, Any] = {
 _CRASH_BREADCRUMB_LOCK = threading.Lock()
 _CRASH_BREADCRUMB_PATH: Path | None = None
 _CRASH_STATE_PATH: Path | None = None
+_CRASH_BREADCRUMB_MODE: str = "always"
 
 
-def _configure_crash_breadcrumbs(output_folder: str | None) -> None:
+def _configure_crash_breadcrumbs(output_folder: str | None, mode: str = "always") -> None:
     """Initialize breadcrumb paths for this worker run.
 
     Files are best-effort and must never break processing.
     """
 
-    global _CRASH_BREADCRUMB_PATH, _CRASH_STATE_PATH
+    global _CRASH_BREADCRUMB_PATH, _CRASH_STATE_PATH, _CRASH_BREADCRUMB_MODE
     try:
-        if not output_folder:
+        mode_norm = str(mode or "always").strip().lower()
+        if mode_norm not in {"always", "errors_only", "off"}:
+            mode_norm = "always"
+        _CRASH_BREADCRUMB_MODE = mode_norm
+        if not output_folder or mode_norm == "off":
             _CRASH_BREADCRUMB_PATH = None
             _CRASH_STATE_PATH = None
             return
@@ -222,6 +227,13 @@ def _emit_crash_breadcrumb(event: str, **payload: Any) -> None:
 
     path_jsonl = _CRASH_BREADCRUMB_PATH
     path_state = _CRASH_STATE_PATH
+    mode = str(_CRASH_BREADCRUMB_MODE or "always").strip().lower()
+    if mode == "off":
+        return
+    if mode == "errors_only":
+        e = str(event or "").upper()
+        if not ("ERROR" in e or "EXCEPTION" in e or "CRASH" in e):
+            return
     if path_jsonl is None and path_state is None:
         return
 
@@ -2432,6 +2444,195 @@ def _eta_smooth_seconds(prev_eta: float | None, raw_eta: float | None, *, alpha:
         return old + a * (new - old)
     except Exception:
         return max(0.0, float(raw_eta or 0.0))
+
+
+
+def _apply_safe_dynamic_chunk_profile(
+    worker_config_cache: dict[str, Any] | None,
+    zconfig: Any,
+    *,
+    pcb: Callable[..., Any] | None = None,
+) -> str:
+    """Apply runtime chunk/memory profile (SAFE_DYNAMIC by default).
+
+    Modes:
+    - safe_dynamic (default): conservative dynamic adaptation + guarded RAM/VRAM budgets
+    - baseline: keep raw config values
+    - aggressive: higher budgets (opt-in)
+    """
+    cfg = worker_config_cache if isinstance(worker_config_cache, dict) else {}
+    mode_raw = cfg.get("chunk_profile_mode", getattr(zconfig, "chunk_profile_mode", "safe_dynamic"))
+    mode = str(mode_raw or "safe_dynamic").strip().lower()
+    if mode not in {"safe_dynamic", "safe_dynamic_plus", "baseline", "aggressive"}:
+        mode = "safe_dynamic"
+
+    profile_map: dict[str, dict[str, Any]] = {
+        "safe_dynamic": {
+            "parallel_autotune_enabled": True,
+            "parallel_target_cpu_load": 0.90,
+            "parallel_target_ram_fraction": 0.82,
+            "parallel_gpu_vram_fraction": 0.72,
+            "phase5_chunk_auto": True,
+            "phase3_ram_high_pct": 80.0,
+            "phase3_ram_critical_pct": 86.0,
+            "phase3_chunk_scale_high": 0.70,
+            "phase3_chunk_scale_critical": 0.50,
+        },
+        "safe_dynamic_plus": {
+            "parallel_autotune_enabled": True,
+            "parallel_target_cpu_load": 0.94,
+            "parallel_target_ram_fraction": 0.85,
+            "parallel_gpu_vram_fraction": 0.75,
+            "phase5_chunk_auto": True,
+            "phase3_ram_high_pct": 82.0,
+            "phase3_ram_critical_pct": 88.0,
+            "phase3_chunk_scale_high": 0.72,
+            "phase3_chunk_scale_critical": 0.55,
+        },
+        "aggressive": {
+            "parallel_autotune_enabled": True,
+            "parallel_target_cpu_load": 0.95,
+            "parallel_target_ram_fraction": 0.90,
+            "parallel_gpu_vram_fraction": 0.80,
+            "phase5_chunk_auto": True,
+            "phase3_ram_high_pct": 84.0,
+            "phase3_ram_critical_pct": 90.0,
+            "phase3_chunk_scale_high": 0.75,
+            "phase3_chunk_scale_critical": 0.60,
+        },
+    }
+
+    selected = profile_map.get(mode)
+    if selected is None:
+        return mode
+
+    for key, value in selected.items():
+        try:
+            cfg[key] = value
+        except Exception:
+            pass
+        try:
+            setattr(zconfig, key, value)
+        except Exception:
+            pass
+
+    if pcb is not None:
+        try:
+            pcb(
+                "chunk_profile_applied",
+                prog=None,
+                lvl="INFO_DETAIL",
+                mode=mode,
+                ram_fraction=float(selected.get("parallel_target_ram_fraction", 0.0)),
+                gpu_fraction=float(selected.get("parallel_gpu_vram_fraction", 0.0)),
+                p3_high=float(selected.get("phase3_ram_high_pct", 0.0)),
+                p3_critical=float(selected.get("phase3_ram_critical_pct", 0.0)),
+            )
+        except Exception:
+            pass
+    return mode
+
+
+_ETA_HISTORY_SCHEMA = "zemosaic.eta_history.v1"
+_ETA_HISTORY_MAX_SAMPLES = 120
+
+
+def _eta_history_path() -> Path:
+    try:
+        return Path.home() / ".zemosaic_eta_history.json"
+    except Exception:
+        return Path(".zemosaic_eta_history.json")
+
+
+def _load_eta_history_records(path: Path | None = None) -> list[dict[str, Any]]:
+    try:
+        p = Path(path) if path is not None else _eta_history_path()
+        if not p.exists():
+            return []
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return []
+        records = payload.get("records")
+        if not isinstance(records, list):
+            return []
+        return [rec for rec in records if isinstance(rec, dict)]
+    except Exception:
+        return []
+
+
+def _append_eta_history_record(record: dict[str, Any], path: Path | None = None) -> None:
+    try:
+        p = Path(path) if path is not None else _eta_history_path()
+        records = _load_eta_history_records(p)
+        records.append(dict(record))
+        if len(records) > _ETA_HISTORY_MAX_SAMPLES:
+            records = records[-_ETA_HISTORY_MAX_SAMPLES:]
+        payload = {
+            "schema": _ETA_HISTORY_SCHEMA,
+            "updated_utc": datetime.utcnow().isoformat() + "Z",
+            "records": records,
+        }
+        p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _estimate_eta_prior_total_seconds(
+    records: list[dict[str, Any]],
+    *,
+    n_frames: int,
+    resume_mode: str,
+    master_tiles_hint: int | None = None,
+) -> float | None:
+    try:
+        n = max(1, int(n_frames))
+    except Exception:
+        return None
+    if not records:
+        return None
+
+    resume_flag = str(resume_mode or "off").lower().strip() != "off"
+    samples: list[tuple[float, int, bool, int]] = []
+    for rec in records:
+        try:
+            d = float(rec.get("duration_s") or 0.0)
+            f = int(rec.get("n_frames") or 0)
+            r = bool(rec.get("resume", False))
+            t = int(rec.get("master_tiles") or 0)
+            if d <= 30.0 or f <= 0:
+                continue
+            samples.append((d, f, r, t))
+        except Exception:
+            continue
+    if not samples:
+        return None
+
+    mode_samples = [s for s in samples if s[2] == resume_flag]
+    if len(mode_samples) < 3:
+        mode_samples = samples
+
+    spf = [d / max(1, f) for (d, f, _r, _t) in mode_samples if d > 0.0]
+    if not spf:
+        return None
+    prior_from_frames = float(np.median(np.asarray(spf, dtype=float))) * float(n)
+    prior = prior_from_frames
+
+    try:
+        mt = int(master_tiles_hint or 0)
+    except Exception:
+        mt = 0
+    if resume_flag and mt > 0:
+        spt = [d / max(1, t) for (d, _f, r, t) in samples if r and t > 0]
+        if len(spt) >= 2:
+            prior_from_tiles = float(np.median(np.asarray(spt, dtype=float))) * float(mt)
+            prior = 0.6 * prior_from_frames + 0.4 * prior_from_tiles
+
+    if not math.isfinite(prior) or prior <= 0.0:
+        return None
+
+    low = max(120.0, 0.25 * prior_from_frames)
+    high = max(300.0, 3.0 * prior_from_frames)
+    return float(min(high, max(low, prior)))
 
 def _apply_two_pass_coverage_renorm_if_requested(
     final_mosaic_data: np.ndarray | None,
@@ -16643,7 +16844,7 @@ def create_master_tile(
                 adaptive_winsor_max_frames_per_pass = int(max(min_pass, min(total_frames, winsor_after)))
 
             if chunk_adapt_enabled and parallel_plan is not None:
-                scale = 0.50 if pressure_level >= 2 else 0.70
+                scale = float(getattr(zconfig, "phase3_chunk_scale_critical", 0.50)) if pressure_level >= 2 else float(getattr(zconfig, "phase3_chunk_scale_high", 0.70))
                 rows_before = getattr(parallel_plan, "rows_per_chunk", None)
                 chunk_before = getattr(parallel_plan, "max_chunk_bytes", None)
                 gpu_rows_before = getattr(parallel_plan, "gpu_rows_per_chunk", None)
@@ -22700,6 +22901,8 @@ def run_hierarchical_mosaic_classic_legacy(
     except Exception:
         zconfig = SimpleNamespace()
 
+    _apply_safe_dynamic_chunk_profile(worker_config_cache, zconfig, pcb=None)
+
     gpu_safety_ctx_global: GpuRuntimeContext | None = None
     gpu_safety_ctx_phase5: GpuRuntimeContext | None = None
 
@@ -23039,16 +23242,69 @@ def run_hierarchical_mosaic_classic_legacy(
     for k in ALIGN_WARNING_COUNTS:
         ALIGN_WARNING_COUNTS[k] = 0
     
-    _eta_state_holder = {"value": None}
+    _eta_state_holder = {"value": None, "last_emit_mono": None}
+    _eta_prior_holder = {"total": None}
+
+    def _set_eta_prior_total_from_history(n_frames: int, resume_mode: str = "off", master_tiles_hint: int | None = None) -> None:
+        try:
+            records = _load_eta_history_records()
+            prior = _estimate_eta_prior_total_seconds(
+                records,
+                n_frames=max(1, int(n_frames)),
+                resume_mode=str(resume_mode or "off"),
+                master_tiles_hint=master_tiles_hint,
+            )
+            if prior is not None and prior > 0:
+                _eta_prior_holder["total"] = float(prior)
+        except Exception:
+            pass
+
+    def _get_live_eta_seconds() -> float | None:
+        """Return continuously decreasing global ETA between explicit updates."""
+        try:
+            v = _eta_state_holder.get("value")
+            t0 = _eta_state_holder.get("last_emit_mono")
+            if v is None:
+                return None
+            vv = float(v)
+            if not math.isfinite(vv) or vv < 0:
+                return None
+            if t0 is None:
+                return max(0.0, vv)
+            dt = max(0.0, float(time.monotonic() - float(t0)))
+            return max(0.0, vv - dt)
+        except Exception:
+            return None
+
     def update_gui_eta(eta_seconds_total):
         if progress_callback and callable(progress_callback):
             eta_str = "--:--:--"
             if eta_seconds_total is not None and eta_seconds_total >= 0:
+                try:
+                    prior_total = _eta_prior_holder.get("total")
+                    if prior_total is not None and start_time_total_run is not None:
+                        elapsed_total = max(0.0, float(time.monotonic() - float(start_time_total_run)))
+                        prior_remaining = max(0.0, float(prior_total) - elapsed_total)
+                        eta_seconds_total = max(float(eta_seconds_total), prior_remaining)
+                except Exception:
+                    pass
                 smoothed = _eta_smooth_seconds(_eta_state_holder.get("value"), eta_seconds_total)
                 _eta_state_holder["value"] = smoothed
+                _eta_state_holder["last_emit_mono"] = time.monotonic()
                 h, rem = divmod(int(smoothed), 3600); m, s = divmod(rem, 60)
                 eta_str = f"{h:02d}:{m:02d}:{s:02d}"
+            else:
+                _eta_state_holder["value"] = None
+                _eta_state_holder["last_emit_mono"] = None
             pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL")
+            # Also emit structured ETA for GUI consumers so ETA can stay coherent
+            # even when textual ETA pulses are sparse or phase-local.
+            try:
+                eta_live = _get_live_eta_seconds()
+                if eta_live is not None:
+                    pcb("STATS_UPDATE", prog=None, lvl="ETA_LEVEL", eta_seconds=float(eta_live))
+            except Exception:
+                pass
 
 
     try:
@@ -23117,6 +23373,12 @@ def run_hierarchical_mosaic_classic_legacy(
             p3_runtime = _get_p3_gpu_runtime_stats()
             if isinstance(p3_runtime, dict) and p3_runtime:
                 ctx.update(p3_runtime)
+        except Exception:
+            pass
+        try:
+            eta_live = _get_live_eta_seconds()
+            if eta_live is not None:
+                ctx["eta_seconds"] = float(eta_live)
         except Exception:
             pass
         if extra:
@@ -23784,6 +24046,14 @@ def run_hierarchical_mosaic_classic_legacy(
                 lvl="INFO",
                 num_valid_raws=num_total_raw_files,
             )
+            try:
+                _set_eta_prior_total_from_history(
+                    num_total_raw_files,
+                    resume_mode=resume_mode,
+                    master_tiles_hint=int(len(preplan_groups_override_paths or []) or 0),
+                )
+            except Exception:
+                pass
             phase0_header_items = []
             for info in all_raw_files_processed_info:
                 entry_path = info.get("path_raw")
@@ -24266,6 +24536,10 @@ def run_hierarchical_mosaic_classic_legacy(
             return # Sortie anticipée si aucun fichier FITS n'est trouvé
         
         num_total_raw_files = len(fits_file_paths)
+        try:
+            _set_eta_prior_total_from_history(num_total_raw_files, resume_mode="off", master_tiles_hint=None)
+        except Exception:
+            pass
         pcb("run_info_found_potential_fits", prog=base_progress_phase1, lvl="INFO_DETAIL", num_files=num_total_raw_files)
     
         telemetry.maybe_emit_stats(
@@ -24889,20 +25163,36 @@ def run_hierarchical_mosaic_classic_legacy(
     
                     elapsed_phase1 = time.monotonic() - start_time_phase1
                     if files_processed_count_ph1 > 0:
-                        time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
-                        eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
-                        current_progress_in_run_percent = base_progress_phase1 + (
-                            files_processed_count_ph1 / max(1, num_total_raw_files)
-                        ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
-                        time_per_percent_point_global = (
-                            (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent)
-                            if current_progress_in_run_percent > 0
-                            else (time.monotonic() - start_time_total_run)
-                        )
-                        total_eta_sec = eta_phase1_sec + (
-                            100 - current_progress_in_run_percent
-                        ) * time_per_percent_point_global
-                        update_gui_eta(total_eta_sec)
+                        phase1_frac = files_processed_count_ph1 / max(1, num_total_raw_files)
+                        warmup_min_files = max(12, min(80, int(num_total_raw_files * 0.25)))
+                        warmup_min_elapsed_s = 12.0
+
+                        # Early phase-1 is noisy (cache/file-size variance, thread warmup).
+                        # Use conservative model ETA until enough samples are seen.
+                        if files_processed_count_ph1 < warmup_min_files or elapsed_phase1 < warmup_min_elapsed_s:
+                            eta_phase_model_sec = _eta_seconds_from_phase_model(
+                                start_time_total_run,
+                                phase_index=1,
+                                phase_fraction=max(0.02, min(0.90, phase1_frac * 0.6)),
+                            )
+                            update_gui_eta(eta_phase_model_sec)
+                        else:
+                            time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
+                            eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
+                            current_progress_in_run_percent = base_progress_phase1 + (
+                                files_processed_count_ph1 / max(1, num_total_raw_files)
+                            ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+                            eta_global_sec = _eta_seconds_from_progress(
+                                start_time_total_run,
+                                current_progress_in_run_percent,
+                            )
+                            eta_phase_model_sec = _eta_seconds_from_phase_model(
+                                start_time_total_run,
+                                phase_index=1,
+                                phase_fraction=phase1_frac,
+                            )
+                            total_eta_sec = max(eta_phase1_sec, eta_global_sec, eta_phase_model_sec)
+                            update_gui_eta(total_eta_sec)
     
         # Construire la liste finale des informations des fichiers traités avec succès
         all_raw_files_processed_info = [
@@ -24952,6 +25242,16 @@ def run_hierarchical_mosaic_classic_legacy(
         _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
         pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
         pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
+        try:
+            update_gui_eta(
+                _eta_seconds_from_phase_model(
+                    start_time_total_run,
+                    phase_index=2,
+                    phase_fraction=0.02,
+                )
+            )
+        except Exception:
+            pass
         # Use order-invariant connected-components clustering for robustness
         preplan_groups_active = False
         if preplan_groups_override_paths:
@@ -29169,6 +29469,19 @@ def run_hierarchical_mosaic_classic_legacy(
     current_global_progress = base_progress_phase7 + PROGRESS_WEIGHT_PHASE7_CLEANUP; current_global_progress = min(100, current_global_progress)
     _log_memory_usage(progress_callback, "Fin Phase 7"); pcb("CHRONO_STOP_REQUEST", prog=None, lvl="CHRONO_LEVEL"); update_gui_eta(0)
     total_duration_sec = time.monotonic() - start_time_total_run
+    try:
+        _append_eta_history_record(
+            {
+                "ts_utc": datetime.utcnow().isoformat() + "Z",
+                "duration_s": float(total_duration_sec),
+                "n_frames": int(max(0, num_total_raw_files)),
+                "resume": bool(str(locals().get("resume_mode", "off")).lower().strip() != "off"),
+                "master_tiles": int(locals().get("num_seestar_stacks_to_process", 0) or 0),
+                "existing_master_tiles_mode": bool(locals().get("use_existing_master_tiles_mode", False)),
+            }
+        )
+    except Exception:
+        pass
     pcb("run_success_processing_completed", prog=current_global_progress, lvl="SUCCESS", duration=f"{total_duration_sec:.2f}")
     gc.collect(); _log_memory_usage(progress_callback, "Fin Run Hierarchical Mosaic (après GC final)")
     _log_alignment_warning_summary()
@@ -29339,6 +29652,8 @@ def run_hierarchical_mosaic(
         zconfig = SimpleNamespace(**worker_config_cache)
     except Exception:
         zconfig = SimpleNamespace()
+
+    _apply_safe_dynamic_chunk_profile(worker_config_cache, zconfig, pcb=None)
 
     gpu_safety_ctx_global: GpuRuntimeContext | None = None
     gpu_safety_ctx_phase5: GpuRuntimeContext | None = None
@@ -29770,16 +30085,69 @@ def run_hierarchical_mosaic(
     for k in ALIGN_WARNING_COUNTS:
         ALIGN_WARNING_COUNTS[k] = 0
     
-    _eta_state_holder = {"value": None}
+    _eta_state_holder = {"value": None, "last_emit_mono": None}
+    _eta_prior_holder = {"total": None}
+
+    def _set_eta_prior_total_from_history(n_frames: int, resume_mode: str = "off", master_tiles_hint: int | None = None) -> None:
+        try:
+            records = _load_eta_history_records()
+            prior = _estimate_eta_prior_total_seconds(
+                records,
+                n_frames=max(1, int(n_frames)),
+                resume_mode=str(resume_mode or "off"),
+                master_tiles_hint=master_tiles_hint,
+            )
+            if prior is not None and prior > 0:
+                _eta_prior_holder["total"] = float(prior)
+        except Exception:
+            pass
+
+    def _get_live_eta_seconds() -> float | None:
+        """Return continuously decreasing global ETA between explicit updates."""
+        try:
+            v = _eta_state_holder.get("value")
+            t0 = _eta_state_holder.get("last_emit_mono")
+            if v is None:
+                return None
+            vv = float(v)
+            if not math.isfinite(vv) or vv < 0:
+                return None
+            if t0 is None:
+                return max(0.0, vv)
+            dt = max(0.0, float(time.monotonic() - float(t0)))
+            return max(0.0, vv - dt)
+        except Exception:
+            return None
+
     def update_gui_eta(eta_seconds_total):
         if progress_callback and callable(progress_callback):
             eta_str = "--:--:--"
             if eta_seconds_total is not None and eta_seconds_total >= 0:
+                try:
+                    prior_total = _eta_prior_holder.get("total")
+                    if prior_total is not None and start_time_total_run is not None:
+                        elapsed_total = max(0.0, float(time.monotonic() - float(start_time_total_run)))
+                        prior_remaining = max(0.0, float(prior_total) - elapsed_total)
+                        eta_seconds_total = max(float(eta_seconds_total), prior_remaining)
+                except Exception:
+                    pass
                 smoothed = _eta_smooth_seconds(_eta_state_holder.get("value"), eta_seconds_total)
                 _eta_state_holder["value"] = smoothed
+                _eta_state_holder["last_emit_mono"] = time.monotonic()
                 h, rem = divmod(int(smoothed), 3600); m, s = divmod(rem, 60)
                 eta_str = f"{h:02d}:{m:02d}:{s:02d}"
+            else:
+                _eta_state_holder["value"] = None
+                _eta_state_holder["last_emit_mono"] = None
             pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL")
+            # Also emit structured ETA for GUI consumers so ETA can stay coherent
+            # even when textual ETA pulses are sparse or phase-local.
+            try:
+                eta_live = _get_live_eta_seconds()
+                if eta_live is not None:
+                    pcb("STATS_UPDATE", prog=None, lvl="ETA_LEVEL", eta_seconds=float(eta_live))
+            except Exception:
+                pass
 
 
     try:
@@ -29848,6 +30216,12 @@ def run_hierarchical_mosaic(
             p3_runtime = _get_p3_gpu_runtime_stats()
             if isinstance(p3_runtime, dict) and p3_runtime:
                 ctx.update(p3_runtime)
+        except Exception:
+            pass
+        try:
+            eta_live = _get_live_eta_seconds()
+            if eta_live is not None:
+                ctx["eta_seconds"] = float(eta_live)
         except Exception:
             pass
         if extra:
@@ -30183,6 +30557,10 @@ def run_hierarchical_mosaic(
         return # Sortie anticipée si aucun fichier FITS n'est trouvé
     
     num_total_raw_files = len(fits_file_paths)
+    try:
+        _set_eta_prior_total_from_history(num_total_raw_files, resume_mode="off", master_tiles_hint=None)
+    except Exception:
+        pass
     pcb("run_info_found_potential_fits", prog=base_progress_phase1, lvl="INFO_DETAIL", num_files=num_total_raw_files)
 
     telemetry.maybe_emit_stats(
@@ -30806,22 +31184,36 @@ def run_hierarchical_mosaic(
 
                 elapsed_phase1 = time.monotonic() - start_time_phase1
                 if files_processed_count_ph1 > 0:
-                    time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
-                    eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
-                    current_progress_in_run_percent = base_progress_phase1 + (
-                        files_processed_count_ph1 / max(1, num_total_raw_files)
-                    ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
-                    eta_global_sec = _eta_seconds_from_progress(
-                        start_time_total_run,
-                        current_progress_in_run_percent,
-                    )
-                    eta_phase_model_sec = _eta_seconds_from_phase_model(
-                        start_time_total_run,
-                        phase_index=1,
-                        phase_fraction=(files_processed_count_ph1 / max(1, num_total_raw_files)),
-                    )
-                    total_eta_sec = max(eta_phase1_sec, eta_global_sec, eta_phase_model_sec)
-                    update_gui_eta(total_eta_sec)
+                    phase1_frac = files_processed_count_ph1 / max(1, num_total_raw_files)
+                    warmup_min_files = max(12, min(80, int(num_total_raw_files * 0.25)))
+                    warmup_min_elapsed_s = 12.0
+
+                    # Early phase-1 is noisy (cache/file-size variance, thread warmup).
+                    # Use conservative model ETA until enough samples are seen.
+                    if files_processed_count_ph1 < warmup_min_files or elapsed_phase1 < warmup_min_elapsed_s:
+                        eta_phase_model_sec = _eta_seconds_from_phase_model(
+                            start_time_total_run,
+                            phase_index=1,
+                            phase_fraction=max(0.02, min(0.90, phase1_frac * 0.6)),
+                        )
+                        update_gui_eta(eta_phase_model_sec)
+                    else:
+                        time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
+                        eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
+                        current_progress_in_run_percent = base_progress_phase1 + (
+                            files_processed_count_ph1 / max(1, num_total_raw_files)
+                        ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+                        eta_global_sec = _eta_seconds_from_progress(
+                            start_time_total_run,
+                            current_progress_in_run_percent,
+                        )
+                        eta_phase_model_sec = _eta_seconds_from_phase_model(
+                            start_time_total_run,
+                            phase_index=1,
+                            phase_fraction=phase1_frac,
+                        )
+                        total_eta_sec = max(eta_phase1_sec, eta_global_sec, eta_phase_model_sec)
+                        update_gui_eta(total_eta_sec)
 
     # Construire la liste finale des informations des fichiers traités avec succès
     all_raw_files_processed_info = [
@@ -30860,6 +31252,16 @@ def run_hierarchical_mosaic(
     _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
+    try:
+        update_gui_eta(
+            _eta_seconds_from_phase_model(
+                start_time_total_run,
+                phase_index=2,
+                phase_fraction=0.02,
+            )
+        )
+    except Exception:
+        pass
     # Use order-invariant connected-components clustering for robustness
     preplan_groups_active = False
     # If we successfully map preplanned group(s) from the Filter UI then
@@ -34496,6 +34898,19 @@ def run_hierarchical_mosaic(
     current_global_progress = base_progress_phase7 + PROGRESS_WEIGHT_PHASE7_CLEANUP; current_global_progress = min(100, current_global_progress)
     _log_memory_usage(progress_callback, "Fin Phase 7"); pcb("CHRONO_STOP_REQUEST", prog=None, lvl="CHRONO_LEVEL"); update_gui_eta(0)
     total_duration_sec = time.monotonic() - start_time_total_run
+    try:
+        _append_eta_history_record(
+            {
+                "ts_utc": datetime.utcnow().isoformat() + "Z",
+                "duration_s": float(total_duration_sec),
+                "n_frames": int(max(0, num_total_raw_files)),
+                "resume": bool(str(locals().get("resume_mode", "off")).lower().strip() != "off"),
+                "master_tiles": int(locals().get("num_seestar_stacks_to_process", 0) or 0),
+                "existing_master_tiles_mode": bool(locals().get("use_existing_master_tiles_mode", False)),
+            }
+        )
+    except Exception:
+        pass
     pcb("run_success_processing_completed", prog=current_global_progress, lvl="SUCCESS", duration=f"{total_duration_sec:.2f}")
     gc.collect(); _log_memory_usage(progress_callback, "Fin Run Hierarchical Mosaic (après GC final)")
     _log_alignment_warning_summary()
@@ -34698,7 +35113,17 @@ def run_hierarchical_mosaic_process(
         or kwargs.get("output_dir")
         or kwargs.get("output_folder")
     )
-    _configure_crash_breadcrumbs(str(output_for_breadcrumbs) if output_for_breadcrumbs else None)
+    crash_breadcrumbs_mode = str(kwargs.get("crash_breadcrumbs_mode", "always") or "always").strip().lower()
+    if crash_breadcrumbs_mode not in {"always", "errors_only", "off"}:
+        crash_breadcrumbs_mode = "always"
+    try:
+        crash_breadcrumbs_heartbeat_sec = float(kwargs.get("crash_breadcrumbs_heartbeat_sec", 2.0) or 2.0)
+    except Exception:
+        crash_breadcrumbs_heartbeat_sec = 2.0
+    _configure_crash_breadcrumbs(
+        str(output_for_breadcrumbs) if output_for_breadcrumbs else None,
+        mode=crash_breadcrumbs_mode,
+    )
     _ctx_update(
         operation="before_run",
         phase="run_hierarchical_mosaic",
@@ -34712,14 +35137,17 @@ def run_hierarchical_mosaic_process(
     hb_stop_evt = threading.Event()
 
     def _heartbeat_writer() -> None:
-        while not hb_stop_evt.wait(2.0):
+        interval = max(0.5, float(crash_breadcrumbs_heartbeat_sec))
+        while not hb_stop_evt.wait(interval):
             _emit_crash_breadcrumb("WORKER_HEARTBEAT", context=dict(crash_ctx))
 
-    hb_thread = threading.Thread(target=_heartbeat_writer, name="ZeMosaicCrashHB", daemon=True)
-    try:
-        hb_thread.start()
-    except Exception:
-        pass
+    hb_thread = None
+    if crash_breadcrumbs_mode == "always":
+        hb_thread = threading.Thread(target=_heartbeat_writer, name="ZeMosaicCrashHB", daemon=True)
+        try:
+            hb_thread.start()
+        except Exception:
+            pass
 
     try:
         run_hierarchical_mosaic(**final_kwargs)
@@ -34749,7 +35177,7 @@ def run_hierarchical_mosaic_process(
     finally:
         try:
             hb_stop_evt.set()
-            if hb_thread.is_alive():
+            if hb_thread is not None and hb_thread.is_alive():
                 hb_thread.join(timeout=0.4)
         except Exception:
             pass

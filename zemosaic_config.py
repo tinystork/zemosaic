@@ -228,10 +228,18 @@ DEFAULT_CONFIG = {
     # Applied to both the global plan and the Phase 5 mosaic plan ("global_reproject")
     # derived from the final mosaic size and number of master tiles.
     "parallel_autotune_enabled": True,
+    # Runtime chunk profile: baseline|safe_dynamic|safe_dynamic_plus|aggressive
+    # safe_dynamic is the development default for safer adaptive chunking.
+    "chunk_profile_mode": "safe_dynamic",
     "parallel_target_cpu_load": 0.95,
     "parallel_target_ram_fraction": 0.9,
     "parallel_gpu_vram_fraction": 0.8,
     "parallel_max_cpu_workers": 0,  # 0 → no explicit cap beyond detected logical cores
+    # Phase 3 adaptive memory/chunk guardrails (used by SAFE_DYNAMIC profile overrides).
+    "phase3_ram_high_pct": 82.0,
+    "phase3_ram_critical_pct": 88.0,
+    "phase3_chunk_scale_high": 0.70,
+    "phase3_chunk_scale_critical": 0.50,
     # Resume policy for classic legacy runs: "off", "auto", "force".
     "resume": "auto",
     # Cache retention policy for Phase 1 preprocessed .npy files.

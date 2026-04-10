@@ -1002,6 +1002,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_global_progress: float = 0.0
         self._eta_seconds_smoothed: float | None = None
         self._eta_calc: ETACalculator | None = None
+        self._last_eta_seconds_update_mono: float | None = None
+        self._last_eta_seconds_value: float | None = None
         self._cpu_eta_override_deadline: float | None = None
         self._weighted_progress_active = False
         self._sds_progress_active = False
@@ -5362,6 +5364,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         neutral_eta = self._update_sds_eta_placeholder(current_phase_idx)
         if isinstance(eta_seconds, (int, float)) and eta_seconds >= 0 and not neutral_eta:
             eta_text = format_eta_hms(eta_seconds)
+            self._last_eta_seconds_value = float(eta_seconds)
+            self._last_eta_seconds_update_mono = time.monotonic()
             if sds_active and not self._sds_completed:
                 self._sds_last_eta_str = eta_text
                 self._set_eta_display(eta_text)
@@ -5397,12 +5401,53 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _on_worker_eta_updated(self, eta_text: str) -> None:
         if not isinstance(eta_text, str):
             return
+        # Prefer structured ETA from STATS_UPDATE when available recently.
+        # This avoids regressions to phase-local textual ETA pulses.
+        try:
+            last_eta_sec_ts = self._last_eta_seconds_update_mono
+            if last_eta_sec_ts is not None and (time.monotonic() - float(last_eta_sec_ts)) < 3.0:
+                return
+        except Exception:
+            pass
         self._cpu_eta_override_deadline = time.monotonic() + CPU_HELPER_OVERRIDE_TTL
         text = eta_text.strip()
         if not text:
             placeholder = self._tr("qt_progress_placeholder", "—")
             self._set_eta_display(placeholder, force=True)
             return
+
+        eta_seconds_text: float | None = None
+        try:
+            raw = text.strip()
+            sign = -1.0 if raw.startswith("+") else 1.0
+            if raw.startswith(("+", "-")):
+                raw = raw[1:]
+            parts = raw.split(":")
+            if len(parts) == 3:
+                h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                if h >= 0 and 0 <= m < 60 and 0 <= s < 60:
+                    eta_seconds_text = sign * float(h * 3600 + m * 60 + s)
+        except Exception:
+            eta_seconds_text = None
+
+        # Guard against phase-local textual ETA pulses collapsing to 0 while
+        # global ETA is still much larger (observed around intertile pairing).
+        try:
+            prev_eta = self._last_eta_seconds_value
+            if (
+                eta_seconds_text is not None
+                and prev_eta is not None
+                and float(prev_eta) >= 120.0
+                and float(eta_seconds_text) <= 1.0
+            ):
+                return
+        except Exception:
+            pass
+
+        if eta_seconds_text is not None:
+            self._last_eta_seconds_value = float(eta_seconds_text)
+            self._last_eta_seconds_update_mono = time.monotonic()
+
         current_phase = self._sds_current_phase_index or 1
         if self._update_sds_eta_placeholder(current_phase):
             return
@@ -5418,6 +5463,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         normalized = action.strip().lower()
         if normalized == "start":
             self._run_started_monotonic = time.monotonic()
+            self._last_eta_seconds_update_mono = None
+            self._last_eta_seconds_value = None
             self.elapsed_value_label.setText(
                 self._tr("initial_elapsed_time", "00:00:00")
             )
@@ -5478,6 +5525,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.is_processing = False
         self._elapsed_timer.stop()
         self._run_started_monotonic = None
+        self._last_eta_seconds_update_mono = None
+        self._last_eta_seconds_value = None
         self._set_processing_state(False)
         self.stop_button.setEnabled(False)
 
@@ -5579,10 +5628,27 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if not self.is_processing or self._run_started_monotonic is None:
             self._elapsed_timer.stop()
             return
-        elapsed = max(0.0, time.monotonic() - self._run_started_monotonic)
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._run_started_monotonic)
         elapsed_h, remainder = divmod(int(elapsed + 0.5), 3600)
         elapsed_m, elapsed_s = divmod(remainder, 60)
         self.elapsed_value_label.setText(f"{elapsed_h:02d}:{elapsed_m:02d}:{elapsed_s:02d}")
+
+        # Keep ETA as a visible countdown between worker updates.
+        if self._is_eta_override_active():
+            return
+        try:
+            eta0 = self._last_eta_seconds_value
+            t0 = self._last_eta_seconds_update_mono
+            if eta0 is None or t0 is None:
+                return
+            remaining_signed = float(eta0) - max(0.0, now - float(t0))
+            if remaining_signed >= 0.0:
+                self._set_eta_display(format_eta_hms(remaining_signed), force=True)
+            else:
+                self._set_eta_display(format_eta_hms(abs(remaining_signed), prefix="+"), force=True)
+        except Exception:
+            return
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)

@@ -134,3 +134,37 @@ Default should stay **fast + robust**.
 2. Objective D (hole-fill visual completion)
 3. tuning presets (Balanced / Strong)
 4. finalize default profile for production.
+
+---
+
+## New mission addendum (2026-04-10) — Markarian stability/performance track
+
+### Immediate priority (before memory/chunk tuning)
+Fix ETA behavior in GUI so runtime estimates remain trustworthy during long runs.
+
+Rationale:
+- Current Markarian stress runs show ETA drift/jumps and poor user trust in progress forecasting.
+- Any throughput optimization (dynamic chunking, memory scaling) must be measured against a reliable ETA baseline.
+
+### Priority sequence (updated)
+1. **ETA reliability in GUI** (first, mandatory)
+2. Dynamic auto-chunking SAFE mode (RAM/VRAM adaptive with guardrails)
+3. Throughput tuning validation (A/B vs baseline)
+4. Production default decision
+
+### ETA reliability requirements
+- Stable ETA smoothing (avoid oscillation/yo-yo).
+- Distinguish per-phase ETA vs global ETA.
+- Re-baseline ETA when entering a new phase (P3/P5 especially).
+- Avoid reporting unrealistically short ETA early in long phases.
+- Keep logs that explain ETA updates (`source`, `window`, `confidence`).
+
+### Hard safety constraints (non-negotiable)
+- Preserve ability to process very large datasets (target up to ~10k images) without OOM.
+- Keep adaptive memory reserves for system stability (do not consume all RAM/VRAM).
+- Any aggressive tuning must remain opt-in.
+
+### Acceptance criteria for this addendum
+- ETA in GUI remains coherent and usable on long Markarian-like runs.
+- No regression in run stability.
+- Then only: start SAFE dynamic chunking rollout.

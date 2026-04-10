@@ -89,3 +89,13 @@ Key guardrail:
 - Conservative defaults first, opt-in for stronger aesthetic behavior.
 - Explicit logs and reproducibility over hidden heuristics.
 - Preserve scientific output integrity while enabling pragmatic aesthetic tooling for majority users.
+
+## 8) Markarian crash-track status (2026-04-10)
+
+- Intermittent crash root cause remains unidentified at this stage.
+- Durable operational decision: keep crash breadcrumbs enabled for future incidents.
+- Forensics artifacts to preserve when a crash occurs:
+  - `worker_crash_breadcrumbs.jsonl`
+  - `worker_last_state.json`
+- Use these breadcrumbs as primary timeline evidence before any new hypothesis or tuning rollback.
+
