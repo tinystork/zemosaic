@@ -168,3 +168,51 @@ Rationale:
 - ETA in GUI remains coherent and usable on long Markarian-like runs.
 - No regression in run stability.
 - Then only: start SAFE dynamic chunking rollout.
+
+---
+
+## Dedicated mission (new, 2026-04-10 evening) — Progressive Resume + Crash Recovery
+
+### Product decision
+This is now a dedicated mission, not a side-task.
+
+Goal: make ZeMosaic resumable by stages, tolerant to partial losses, and robust after interruption/crash.
+
+### Scope (target behavior)
+1. Phase 1 partial reuse (rebuild only missing/invalid cache entries).
+2. Reuse compatible stack/group plan when possible.
+3. Reuse valid master tiles; rebuild only missing/corrupted/obsolete tiles.
+4. Resume from highest valid level (final > masters > plan > phase1 partial > full restart).
+5. Add explicit user actions: **Quit and Save Progress** (priority) and **Pause** (second step).
+
+### Architecture baseline
+State folder (proposed): `.zemosaic_state/`
+- `run_state.json`
+- `phase1_manifest.json`
+- `stack_plan_manifest.json`
+- `master_tiles_manifest.json`
+- `final_assembly_manifest.json`
+
+Each manifest must answer:
+- artifact exists?
+- artifact compatible with current run signature?
+
+### Non-negotiable rules
+- Never invalidate all cache for one missing file.
+- Invalidate locally, not globally.
+- Use atomic writes for manifests.
+- Never mark a stage done before outputs are fully written + validated.
+
+### Execution plan and tracking
+- [ ] Design note (short) for run signature, manifests, validation, invalidation, atomicity, partial resume paths.
+- [x] Refactor `_try_resume_phase1(...)` from all-or-nothing to partial rebuild mode.
+- [x] Add official stack-plan reuse with compatibility validation.
+- [x] Add official master-tiles reuse with per-tile validation.
+- [x] Add `Quit and Save Progress` (clean stop + flush manifests/state).
+- [ ] Add `Pause` behavior (safe suspension semantics).
+- [ ] Add resume logs (`phase1 partial reuse X/Y`, `plan reused`, `master reused A/B`, `rebuild tiles [...]`).
+- [ ] Add interrupted-run scenarios/tests (phase1 hole, after grouping, mid-phase3, battery/quit-save, local corruption).
+
+### Completion definition
+Mission completes when partial resume works by stage on large datasets without restarting from zero after local cache loss.
+

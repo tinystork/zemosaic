@@ -99,3 +99,12 @@ Key guardrail:
   - `worker_last_state.json`
 - Use these breadcrumbs as primary timeline evidence before any new hypothesis or tuning rollback.
 
+## 9) Crash-track update (2026-04-10 evening)
+
+- New capture evidence (Windows + breadcrumbs) points to intermittent native GPU/driver failure behavior rather than regular Python exceptions:
+  - WER shows `LiveKernelEvent 141/117` around crash windows,
+  - worker breadcrumbs stop after Phase 3 post-stack markers with pending in-flight tiles.
+- Practical test hypothesis validated as priority: NaN-heavy normalization path may increase fragility in some GPU contexts; run targeted A/B `linear_fit` vs `sky_mean` (CPU first, then GPU).
+- GUI reliability fix recorded: GPU toggle now synchronizes `use_gpu_phase5`, `stack_use_gpu`, and `use_gpu_stack` to avoid accidental GPU use in Phase 3 when user selects CPU mode.
+
+- New durable product direction (2026-04-10 evening): promote resume to a dedicated architecture mission with progressive, stage-wise recovery (phase1 partial, plan reuse, per-tile master reuse) and explicit Quit-and-Save checkpoints; avoid all-or-nothing invalidation on single missing cache files.

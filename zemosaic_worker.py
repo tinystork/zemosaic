@@ -65,6 +65,7 @@ import tempfile
 import glob
 import uuid
 import multiprocessing
+import signal
 import threading
 import itertools
 import platform
@@ -9328,23 +9329,39 @@ def _compute_intertile_affine_corrections_from_sources(
 
     probe_reason = None
     if not force_single_worker and cpu_workers and cpu_workers > 1:
+        current_proc_daemon = False
         try:
-            ctx = multiprocessing.get_context("spawn" if sys.platform == "win32" else None)
-            with ctx.Pool(processes=min(cpu_workers, max(1, cpu_workers))) as pool:
-                pool.map(int, range(min(cpu_workers, 2)))
-        except Exception as exc_probe:
-            force_single_worker = True
-            probe_reason = f"probe_failed_{exc_probe.__class__.__name__}"
-            force_single_reason = probe_reason
+            current_proc_daemon = bool(multiprocessing.current_process().daemon)
+        except Exception:
+            current_proc_daemon = False
+
+        if current_proc_daemon:
             if logger_obj:
                 try:
-                    logger_obj.warning(
-                        "[Intertile] Multiprocessing probe failed (requested=%s): %s — falling back to single worker",
+                    logger_obj.info(
+                        "[Intertile] Skipping multiprocessing probe in daemon worker (requested=%s); keeping threadpool workers",
                         requested_workers,
-                        exc_probe,
                     )
                 except Exception:
                     pass
+        else:
+            try:
+                ctx = multiprocessing.get_context("spawn" if sys.platform == "win32" else None)
+                with ctx.Pool(processes=min(cpu_workers, max(1, cpu_workers))) as pool:
+                    pool.map(int, range(min(cpu_workers, 2)))
+            except Exception as exc_probe:
+                force_single_worker = True
+                probe_reason = f"probe_failed_{exc_probe.__class__.__name__}"
+                force_single_reason = probe_reason
+                if logger_obj:
+                    try:
+                        logger_obj.warning(
+                            "[Intertile] Multiprocessing probe failed (requested=%s): %s — falling back to single worker",
+                            requested_workers,
+                            exc_probe,
+                        )
+                    except Exception:
+                        pass
 
     if force_single_worker:
         cpu_workers = 1
@@ -23866,6 +23883,147 @@ def run_hierarchical_mosaic_classic_legacy(
             path_obj = Path(path_value).expanduser()
         return _normcase_path(path_obj)
 
+    def _atomic_write_json(path_value: str, payload: Any) -> None:
+        path_obj = Path(path_value)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path_obj.with_suffix(path_obj.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as fh_tmp:
+            json.dump(payload, fh_tmp, indent=2, sort_keys=True, ensure_ascii=True)
+        os.replace(str(tmp_path), str(path_obj))
+
+    def _read_json_file(path_value: str) -> Any | None:
+        if not _path_exists(path_value):
+            return None
+        try:
+            with open(path_value, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    def _phase_group_signature(group_info_list: list[dict]) -> str:
+        normalized_paths: list[str] = []
+        for info in (group_info_list or []):
+            if not isinstance(info, dict):
+                continue
+            raw_path = info.get("path_raw") or info.get("path")
+            norm = _normalize_path_for_matching(raw_path)
+            if norm:
+                normalized_paths.append(norm)
+        normalized_paths.sort()
+        canonical = json.dumps(normalized_paths, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _state_paths(output_root: str) -> dict[str, str]:
+        state_dir = str(Path(output_root).expanduser() / ".zemosaic_state")
+        return {
+            "dir": state_dir,
+            "stack_plan": str(Path(state_dir) / "stack_plan_manifest.json"),
+            "master_tiles": str(Path(state_dir) / "master_tiles_manifest.json"),
+        }
+
+    def _write_stack_plan_manifest(output_root: str, run_signature: str | None, groups: list[list[dict]]) -> None:
+        if not run_signature:
+            return
+        paths = _state_paths(output_root)
+        payload_groups: list[dict] = []
+        for idx, grp in enumerate(groups or []):
+            raw_paths: list[str] = []
+            for info in (grp or []):
+                if isinstance(info, dict):
+                    p_raw = info.get("path_raw") or info.get("path")
+                else:
+                    p_raw = None
+                p_norm = _normalize_path_for_matching(p_raw)
+                if p_norm:
+                    raw_paths.append(p_norm)
+            raw_paths.sort()
+            payload_groups.append(
+                {
+                    "group_index": int(idx),
+                    "raw_paths": raw_paths,
+                    "group_signature": hashlib.sha256(
+                        json.dumps(raw_paths, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+        payload = {
+            "schema_version": 1,
+            "pipeline": "classic_legacy",
+            "created_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "run_signature": str(run_signature),
+            "groups": payload_groups,
+        }
+        _atomic_write_json(paths["stack_plan"], payload)
+
+    def _try_load_stack_plan_manifest(output_root: str, run_signature: str | None) -> list[list[str]] | None:
+        if not run_signature:
+            return None
+        paths = _state_paths(output_root)
+        data = _read_json_file(paths["stack_plan"])
+        if not isinstance(data, dict):
+            return None
+        if int(data.get("schema_version", -1)) != 1:
+            return None
+        if str(data.get("pipeline", "")).strip().lower() != "classic_legacy":
+            return None
+        if str(data.get("run_signature") or "") != str(run_signature):
+            return None
+        groups = data.get("groups")
+        if not isinstance(groups, list) or not groups:
+            return None
+        result: list[list[str]] = []
+        for grp in groups:
+            if not isinstance(grp, dict):
+                continue
+            raw_paths = grp.get("raw_paths")
+            if not isinstance(raw_paths, list):
+                continue
+            normed = [_normalize_path_for_matching(x) for x in raw_paths]
+            normed = [x for x in normed if x]
+            if normed:
+                result.append(normed)
+        return result or None
+
+    def _write_master_tiles_manifest(output_root: str, run_signature: str | None, records: list[dict]) -> None:
+        if not run_signature:
+            return
+        paths = _state_paths(output_root)
+        payload = {
+            "schema_version": 1,
+            "pipeline": "classic_legacy",
+            "created_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "run_signature": str(run_signature),
+            "tiles": list(records or []),
+        }
+        _atomic_write_json(paths["master_tiles"], payload)
+
+    def _try_load_master_tiles_manifest(output_root: str, run_signature: str | None) -> dict[int, dict]:
+        if not run_signature:
+            return {}
+        paths = _state_paths(output_root)
+        data = _read_json_file(paths["master_tiles"])
+        if not isinstance(data, dict):
+            return {}
+        if int(data.get("schema_version", -1)) != 1:
+            return {}
+        if str(data.get("pipeline", "")).strip().lower() != "classic_legacy":
+            return {}
+        if str(data.get("run_signature") or "") != str(run_signature):
+            return {}
+        tiles = data.get("tiles")
+        if not isinstance(tiles, list):
+            return {}
+        out: dict[int, dict] = {}
+        for item in tiles:
+            if not isinstance(item, dict):
+                continue
+            try:
+                tid = int(item.get("tile_id"))
+            except Exception:
+                continue
+            out[tid] = item
+        return out
+
     def _try_resume_phase1(
         cache_dir: str,
         resume_mode: str,
@@ -23888,14 +24046,11 @@ def run_hierarchical_mosaic_classic_legacy(
         if str(manifest.get("pipeline", "")).strip().lower() != "classic_legacy":
             return False, None, "pipeline mismatch"
         phase1_meta = manifest.get("phase1") if isinstance(manifest.get("phase1"), dict) else {}
-        done_marker_name = phase1_meta.get("done_marker") or "phase1.done"
         processed_name = phase1_meta.get("processed_info_file") or "phase1_processed_info.json"
-        done_marker_path = os.path.join(cache_dir, done_marker_name)
         processed_path = os.path.join(cache_dir, processed_name)
-        if not _path_exists(done_marker_path):
-            return False, None, "phase1.done missing"
         if not _path_exists(processed_path):
             return False, None, "phase1_processed_info.json missing"
+
         manifest_signature = manifest.get("run_signature")
         if resume_mode == "auto":
             if not manifest_signature or not signature_current or manifest_signature != signature_current:
@@ -23905,6 +24060,7 @@ def run_hierarchical_mosaic_classic_legacy(
                 pcb("Resume force: signature unavailable, proceeding.", prog=None, lvl="WARN")
             elif manifest_signature != signature_current:
                 pcb("Resume force: signature mismatch ignored.", prog=None, lvl="WARN")
+
         try:
             with open(processed_path, "r", encoding="utf-8") as fh_info:
                 processed_info = json.load(fh_info)
@@ -23914,21 +24070,32 @@ def run_hierarchical_mosaic_classic_legacy(
             return False, None, "processed info empty"
         if not (ASTROPY_AVAILABLE and fits is not None and WCS is not None):
             return False, None, "astropy unavailable"
+
         loaded_entries: list[dict] = []
+        invalid_count = 0
+        missing_cache_count = 0
+        missing_raw_count = 0
         for idx, item in enumerate(processed_info):
             if not isinstance(item, dict):
-                return False, None, f"entry {idx} invalid"
+                invalid_count += 1
+                continue
             path_raw = item.get("path_raw")
             path_cache = item.get("path_preprocessed_cache")
             header_str = item.get("header_str")
             if not (path_raw and path_cache and header_str):
-                return False, None, f"entry {idx} missing required fields"
+                invalid_count += 1
+                continue
+            if not _path_exists(path_raw):
+                missing_raw_count += 1
+                continue
             if not _path_exists(path_cache):
-                return False, None, f"entry {idx} cache missing"
+                missing_cache_count += 1
+                continue
             try:
                 header = fits.Header.fromstring(header_str, sep="\n")
-            except Exception as exc:
-                return False, None, f"entry {idx} header invalid ({exc})"
+            except Exception:
+                invalid_count += 1
+                continue
             try:
                 wcs_obj = WCS(header, naxis=2, relax=True)
             except Exception:
@@ -23937,8 +24104,9 @@ def run_hierarchical_mosaic_classic_legacy(
                 except Exception:
                     try:
                         wcs_obj = WCS(header)
-                    except Exception as exc:
-                        return False, None, f"entry {idx} wcs invalid ({exc})"
+                    except Exception:
+                        invalid_count += 1
+                        continue
             entry = dict(item)
             entry["path_raw"] = str(path_raw)
             entry["path_preprocessed_cache"] = str(path_cache)
@@ -23955,7 +24123,24 @@ def run_hierarchical_mosaic_classic_legacy(
             entry["wcs"] = wcs_obj
             entry.pop("header_str", None)
             loaded_entries.append(entry)
-        return True, loaded_entries, "ok"
+
+        total_entries = len(processed_info)
+        valid_entries = len(loaded_entries)
+        if valid_entries <= 0:
+            reason = (
+                f"phase1 cache unusable (valid=0/{total_entries}, "
+                f"missing_cache={missing_cache_count}, missing_raw={missing_raw_count}, invalid={invalid_count})"
+            )
+            return False, None, reason
+
+        if valid_entries == total_entries:
+            return True, loaded_entries, "ok"
+
+        reason = (
+            f"phase1 partial cache (valid={valid_entries}/{total_entries}, "
+            f"missing_cache={missing_cache_count}, missing_raw={missing_raw_count}, invalid={invalid_count})"
+        )
+        return False, loaded_entries, reason
 
     def _write_phase1_resume_cache(
         cache_dir: str,
@@ -24057,11 +24242,13 @@ def run_hierarchical_mosaic_classic_legacy(
             resume_mode_source = "config"
     resume_mode = _normalize_resume_mode(resume_mode_raw)
     resume_after_phase1 = False
+    resume_preloaded_phase1_entries: list[dict] = []
     resume_signature_payload: dict | None = None
     resume_signature_current: str | None = None
     all_raw_files_processed_info: list[dict] = []
     cache_dir_name = ".zemosaic_img_cache"
     temp_image_cache_dir = str(Path(output_folder).expanduser() / cache_dir_name)
+    resume_state_paths = _state_paths(output_folder)
     temp_master_tile_storage_dir: str | None = None
     pcb(
         f"Resume mode resolved: {resume_mode} (source={resume_mode_source})",
@@ -24084,7 +24271,10 @@ def run_hierarchical_mosaic_classic_legacy(
     if resume_mode == "off":
         try:
             if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
+            if _path_exists(resume_state_paths.get("dir")):
+                shutil.rmtree(resume_state_paths.get("dir"))
             os.makedirs(temp_image_cache_dir, exist_ok=True)
+            os.makedirs(resume_state_paths.get("dir"), exist_ok=True)
         except OSError as e_mkdir_cache:
             pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
     else:
@@ -24314,21 +24504,35 @@ def run_hierarchical_mosaic_classic_legacy(
                 effective_base_workers = 1
                 pcb("WORKERS_CONFIG: AVERT - effective_base_workers était <= 0, forcé à 1.", prog=None, lvl="WARN")
         else:
-            pcb(f"Resume refused: {resume_reason}", prog=None, lvl="WARN")
-            if _path_exists(temp_image_cache_dir):
-                ts_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                archive_dir = f"{temp_image_cache_dir}_{ts_suffix}.old"
+            if loaded_info:
+                resume_preloaded_phase1_entries = loaded_info
+                pcb(
+                    f"Resume partial: {resume_reason}. Will rebuild missing Phase 1 entries.",
+                    prog=None,
+                    lvl="WARN",
+                )
                 try:
-                    shutil.move(temp_image_cache_dir, archive_dir)
-                except Exception:
+                    os.makedirs(temp_image_cache_dir, exist_ok=True)
+                    os.makedirs(resume_state_paths.get("dir"), exist_ok=True)
+                except OSError as e_mkdir_cache:
+                    pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
+            else:
+                pcb(f"Resume refused: {resume_reason}", prog=None, lvl="WARN")
+                if _path_exists(temp_image_cache_dir):
+                    ts_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                    archive_dir = f"{temp_image_cache_dir}_{ts_suffix}.old"
                     try:
-                        shutil.rmtree(temp_image_cache_dir)
+                        shutil.move(temp_image_cache_dir, archive_dir)
                     except Exception:
-                        pass
-            try:
-                os.makedirs(temp_image_cache_dir, exist_ok=True)
-            except OSError as e_mkdir_cache:
-                pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
+                        try:
+                            shutil.rmtree(temp_image_cache_dir)
+                        except Exception:
+                            pass
+                try:
+                    os.makedirs(temp_image_cache_dir, exist_ok=True)
+                    os.makedirs(resume_state_paths.get("dir"), exist_ok=True)
+                except OSError as e_mkdir_cache:
+                    pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
     try:
         cache_probe = _probe_system_resources(
             temp_image_cache_dir,
@@ -25084,13 +25288,25 @@ def run_hierarchical_mosaic_classic_legacy(
         )  # Log mis à jour pour plus de clarté
         
         start_time_phase1 = time.monotonic()
-        all_raw_files_processed_info_dict = {} # Pour stocker les infos des fichiers traités avec succès
-        files_processed_count_ph1 = 0      # Compteur pour les fichiers soumis au ThreadPoolExecutor
-    
+        preloaded_phase1_map = {
+            str(entry.get("path_raw")): entry
+            for entry in (resume_preloaded_phase1_entries or [])
+            if isinstance(entry, dict) and entry.get("path_raw")
+        }
+        all_raw_files_processed_info_dict = dict(preloaded_phase1_map) # valid reused + newly rebuilt
+        files_processed_count_ph1 = len(preloaded_phase1_map)      # include reused entries in progress
+        fits_file_paths_pending = [fp for fp in fits_file_paths if fp not in preloaded_phase1_map]
+        if preloaded_phase1_map:
+            pcb(
+                f"Resume phase1 partial reuse: {len(preloaded_phase1_map)}/{len(fits_file_paths)} reused, {len(fits_file_paths_pending)} to rebuild",
+                prog=None,
+                lvl="INFO",
+            )
+
         with ThreadPoolExecutor(max_workers=actual_num_workers_ph1, thread_name_prefix="ZeMosaic_Ph1_") as executor_ph1:
             batch_size = 200
-            for i in range(0, len(fits_file_paths), batch_size):
-                batch = fits_file_paths[i:i+batch_size]
+            for i in range(0, len(fits_file_paths_pending), batch_size):
+                batch = fits_file_paths_pending[i:i+batch_size]
                 future_to_filepath_ph1 = {
                     executor_ph1.submit(
                         get_wcs_and_pretreat_raw_file,
@@ -25314,6 +25530,18 @@ def run_hierarchical_mosaic_classic_legacy(
             pass
         # Use order-invariant connected-components clustering for robustness
         preplan_groups_active = False
+        if (not preplan_groups_override_paths) and resume_mode != "off":
+            try:
+                loaded_preplan = _try_load_stack_plan_manifest(output_folder, resume_signature_current)
+            except Exception:
+                loaded_preplan = None
+            if loaded_preplan:
+                preplan_groups_override_paths = loaded_preplan
+                pcb(
+                    f"Resume plan: loaded {len(loaded_preplan)} group(s) from stack_plan manifest.",
+                    prog=None,
+                    lvl="INFO",
+                )
         if preplan_groups_override_paths:
             try:
                 path_lookup = {
@@ -25873,6 +26101,15 @@ def run_hierarchical_mosaic_classic_legacy(
                 pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
         current_global_progress = base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING
         num_seestar_stacks_to_process = len(seestar_stack_groups)
+        try:
+            _write_stack_plan_manifest(output_folder, resume_signature_current, seestar_stack_groups)
+            pcb(
+                f"Resume plan saved: {num_seestar_stacks_to_process} group(s).",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
+        except Exception as exc_stack_manifest:
+            pcb(f"Resume plan save failed: {exc_stack_manifest}", prog=None, lvl="WARN")
         phase2_completed = True
         telemetry.maybe_emit_stats(
             _telemetry_context(
@@ -26534,12 +26771,15 @@ def run_hierarchical_mosaic_classic_legacy(
             )
             temp_master_tile_storage_dir = str(Path(output_folder).expanduser() / "zemosaic_temp_master_tiles")
             try:
-                if _path_exists(temp_master_tile_storage_dir): shutil.rmtree(temp_master_tile_storage_dir)
+                if resume_mode == "off":
+                    if _path_exists(temp_master_tile_storage_dir):
+                        shutil.rmtree(temp_master_tile_storage_dir)
                 os.makedirs(temp_master_tile_storage_dir, exist_ok=True)
             except OSError as e_mkdir_mt: 
                 pcb("run_error_phase3_mkdir_failed", prog=current_global_progress, lvl="ERROR", directory=temp_master_tile_storage_dir, error=str(e_mkdir_mt)); return
-                
+
             master_tiles_results_list_temp = {}
+            preloaded_master_tiles: dict[int, tuple[str, Any]] = {}
             start_time_phase3 = time.monotonic()
 
             tile_id_order = list(range(len(seestar_stack_groups)))
@@ -27562,9 +27802,11 @@ def run_hierarchical_mosaic_classic_legacy(
 
             pending_launch_queue: list[tuple[list[dict], int, int | None]] = []
             extra_tile_id = int(max(tile_id_order) + 1) if tile_id_order else int(len(seestar_stack_groups))
+            tile_group_signature: dict[int, str] = {}
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
                 n_frames_group = int(len(sg_info_list or []))
+                tile_group_signature[int(assigned_tile_id)] = _phase_group_signature(sg_info_list)
                 chunk_size, total_ram_gb_for_split = _estimate_phase3_split_chunk_size(sg_info_list)
                 dynamic_threshold = max(16, min(int(split_threshold_cfg), int(max(chunk_size, chunk_size * 1.35))))
 
@@ -27586,10 +27828,64 @@ def run_hierarchical_mosaic_classic_legacy(
                 rank = center_out_context.get_rank(assigned_tile_id) if center_out_context else proc_idx
                 pending_launch_queue.append((sg_info_list, assigned_tile_id, rank))
 
+            if resume_mode != "off":
+                try:
+                    mt_manifest = _try_load_master_tiles_manifest(output_folder, resume_signature_current)
+                except Exception:
+                    mt_manifest = {}
+                if mt_manifest:
+                    kept_queue: list[tuple[list[dict], int, int | None]] = []
+                    reused_count = 0
+                    for queued_group, queued_tile_id, queued_rank in pending_launch_queue:
+                        rec = mt_manifest.get(int(queued_tile_id)) if isinstance(mt_manifest, dict) else None
+                        can_reuse = False
+                        if isinstance(rec, dict):
+                            rec_sig = str(rec.get("group_signature") or "")
+                            rec_path = rec.get("path")
+                            if rec_sig and rec_sig == tile_group_signature.get(int(queued_tile_id)) and rec_path and _path_exists(rec_path):
+                                try:
+                                    hdr = fits.getheader(rec_path, 0)
+                                    wcs_obj = WCS(hdr, naxis=2, relax=True)
+                                    if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
+                                        preloaded_master_tiles[int(queued_tile_id)] = (str(rec_path), wcs_obj)
+                                        can_reuse = True
+                                except Exception:
+                                    can_reuse = False
+                        if can_reuse:
+                            reused_count += 1
+                        else:
+                            kept_queue.append((queued_group, queued_tile_id, queued_rank))
+                    if reused_count > 0:
+                        pending_launch_queue = kept_queue
+                        master_tiles_results_list_temp.update(preloaded_master_tiles)
+                        tiles_processed_count_ph3 = int(len(preloaded_master_tiles))
+                        pcb(
+                            f"Resume master tiles: reused {reused_count}/{len(seestar_stack_groups)} from manifest, rebuilding {len(pending_launch_queue)}.",
+                            prog=None,
+                            lvl="INFO",
+                        )
+
             try:
-                num_seestar_stacks_to_process = int(len(pending_launch_queue))
+                num_seestar_stacks_to_process = int(len(seestar_stack_groups))
             except Exception:
                 pass
+
+            def _flush_master_tiles_manifest_partial() -> None:
+                if resume_mode == "off":
+                    return
+                try:
+                    tile_records_for_manifest: list[dict] = []
+                    for _tid, (_p, _w) in sorted(master_tiles_results_list_temp.items(), key=lambda kv: int(kv[0])):
+                        tile_records_for_manifest.append(
+                            {
+                                "tile_id": int(_tid),
+                                "path": str(_p) if _p else None,
+                                "group_signature": tile_group_signature.get(int(_tid)),
+                            }
+                        )
+                    _write_master_tiles_manifest(output_folder, resume_signature_current, tile_records_for_manifest)
+                except Exception as exc_master_manifest_partial:
+                    pcb(f"Resume master manifest incremental save failed: {exc_master_manifest_partial}", prog=None, lvl="WARN")
 
             def _current_launch_budget() -> int:
                 try:
@@ -27709,10 +28005,36 @@ def run_hierarchical_mosaic_classic_legacy(
 
             _drain_launch_queue()
 
+            launch_starvation_since: float | None = None
             while pending_futures or pending_launch_queue:
                 _drain_launch_queue()
                 _request_livelock_abort_if_needed()
                 if not pending_futures:
+                    if pending_launch_queue:
+                        try:
+                            launch_budget_now = int(_current_launch_budget())
+                        except Exception:
+                            launch_budget_now = 0
+                        if launch_budget_now <= 0:
+                            now_starve = time.monotonic()
+                            if launch_starvation_since is None:
+                                launch_starvation_since = now_starve
+                            elif (now_starve - float(launch_starvation_since)) >= 12.0:
+                                try:
+                                    runtime_launch_limit["value"] = max(1, int(runtime_launch_limit.get("value", 1) or 1))
+                                    runtime_launch_limit["pause_until"] = 0.0
+                                    runtime_launch_limit["pause_reason"] = "starvation_guard"
+                                except Exception:
+                                    pass
+                                pcb(
+                                    "RAM_ADAPT_RT: starvation_guard forcing launch budget >=1 to avoid deadloop",
+                                    prog=None,
+                                    lvl="WARN",
+                                )
+                                launch_starvation_since = None
+                                _drain_launch_queue()
+                        else:
+                            launch_starvation_since = None
                     time.sleep(0.05)
                     continue
                 done_futures, _ = wait(pending_futures, timeout=1.0, return_when=FIRST_COMPLETED)
@@ -27806,6 +28128,7 @@ def run_hierarchical_mosaic_classic_legacy(
                         )
                         if mt_result_path and mt_result_wcs:
                             master_tiles_results_list_temp[tile_id_for_future] = (mt_result_path, mt_result_wcs)
+                            _flush_master_tiles_manifest_partial()
                         else:
                             pcb(
                                 "run_warn_phase3_master_tile_creation_failed_thread",
@@ -28053,6 +28376,19 @@ def run_hierarchical_mosaic_classic_legacy(
                     pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
 
             current_global_progress = base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+            try:
+                tile_records_for_manifest: list[dict] = []
+                for _tid, (_p, _w) in sorted(master_tiles_results_list_temp.items(), key=lambda kv: int(kv[0])):
+                    tile_records_for_manifest.append(
+                        {
+                            "tile_id": int(_tid),
+                            "path": str(_p) if _p else None,
+                            "group_signature": tile_group_signature.get(int(_tid)),
+                        }
+                    )
+                _write_master_tiles_manifest(output_folder, resume_signature_current, tile_records_for_manifest)
+            except Exception as exc_master_manifest:
+                pcb(f"Resume master manifest save failed: {exc_master_manifest}", prog=None, lvl="WARN")
             _log_memory_usage(progress_callback, "Fin Phase 3");
             if step_times_ph3:
                 avg_step = sum(step_times_ph3) / len(step_times_ph3)
@@ -33703,10 +34039,36 @@ def run_hierarchical_mosaic(
 
             _drain_launch_queue()
 
+            launch_starvation_since: float | None = None
             while pending_futures or pending_launch_queue:
                 _drain_launch_queue()
                 _request_livelock_abort_if_needed()
                 if not pending_futures:
+                    if pending_launch_queue:
+                        try:
+                            launch_budget_now = int(_current_launch_budget())
+                        except Exception:
+                            launch_budget_now = 0
+                        if launch_budget_now <= 0:
+                            now_starve = time.monotonic()
+                            if launch_starvation_since is None:
+                                launch_starvation_since = now_starve
+                            elif (now_starve - float(launch_starvation_since)) >= 12.0:
+                                try:
+                                    runtime_launch_limit["value"] = max(1, int(runtime_launch_limit.get("value", 1) or 1))
+                                    runtime_launch_limit["pause_until"] = 0.0
+                                    runtime_launch_limit["pause_reason"] = "starvation_guard"
+                                except Exception:
+                                    pass
+                                pcb(
+                                    "RAM_ADAPT_RT: starvation_guard forcing launch budget >=1 to avoid deadloop",
+                                    prog=None,
+                                    lvl="WARN",
+                                )
+                                launch_starvation_since = None
+                                _drain_launch_queue()
+                        else:
+                            launch_starvation_since = None
                     time.sleep(0.05)
                     continue
                 done_futures, _ = wait(pending_futures, timeout=1.0, return_when=FIRST_COMPLETED)
@@ -35204,6 +35566,27 @@ def run_hierarchical_mosaic_process(
     _emit_crash_breadcrumb("WORKER_START", context=dict(crash_ctx))
 
     hb_stop_evt = threading.Event()
+    graceful_stop_requested = False
+
+    _prev_sigterm = None
+    _prev_sigint = None
+
+    def _signal_stop_handler(signum, _frame):
+        nonlocal graceful_stop_requested
+        graceful_stop_requested = True
+        _ctx_update(operation="signal_stop", phase="run_hierarchical_mosaic", signal=int(signum))
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    try:
+        _prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, _signal_stop_handler)
+    except Exception:
+        _prev_sigterm = None
+    try:
+        _prev_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, _signal_stop_handler)
+    except Exception:
+        _prev_sigint = None
 
     def _heartbeat_writer() -> None:
         interval = max(0.5, float(crash_breadcrumbs_heartbeat_sec))
@@ -35220,6 +35603,17 @@ def run_hierarchical_mosaic_process(
 
     try:
         run_hierarchical_mosaic(**final_kwargs)
+    except KeyboardInterrupt:
+        graceful_stop_requested = True
+        _ctx_update(operation="worker_cancelled", phase="run_hierarchical_mosaic")
+        _emit_crash_breadcrumb(
+            "WORKER_CANCELLED",
+            context=dict(crash_ctx),
+        )
+        try:
+            progress_queue.put(("log_key_processing_cancelled", None, "WARN", {"reason": "quit_save"}))
+        except Exception:
+            pass
     except Exception as e_proc:
         try:
             logger.exception("Worker process crashed before completion")
@@ -35250,7 +35644,14 @@ def run_hierarchical_mosaic_process(
                 hb_thread.join(timeout=0.4)
         except Exception:
             pass
-        _emit_crash_breadcrumb("WORKER_DONE", context=dict(crash_ctx))
+        try:
+            if _prev_sigterm is not None:
+                signal.signal(signal.SIGTERM, _prev_sigterm)
+            if _prev_sigint is not None:
+                signal.signal(signal.SIGINT, _prev_sigint)
+        except Exception:
+            pass
+        _emit_crash_breadcrumb("WORKER_DONE", context=dict(crash_ctx), graceful_stop=bool(graceful_stop_requested))
         progress_queue.put(("PROCESS_DONE", None, "INFO", {}))
 
 if __name__ == "__main__":

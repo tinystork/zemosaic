@@ -61,6 +61,7 @@ import os
 import platform
 import shutil
 import subprocess
+import signal
 import sys
 import multiprocessing
 import queue
@@ -533,7 +534,7 @@ class ZeMosaicQtWorker(QObject):
         self._listener_thread = listener_thread
         self._listener = listener
 
-    def stop(self) -> None:
+    def stop(self, *, graceful: bool = False, wait_timeout: float = 4.0) -> None:
         self._stop_requested = True
         if self._listener is not None:
             try:
@@ -543,8 +544,19 @@ class ZeMosaicQtWorker(QObject):
         proc = self._process
         if proc and proc.is_alive():
             try:
-                proc.terminate()
-                proc.join(timeout=0.5)
+                if graceful:
+                    try:
+                        if hasattr(proc, "pid") and proc.pid:
+                            os.kill(int(proc.pid), signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+                    proc.join(timeout=max(0.5, float(wait_timeout)))
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(timeout=0.5)
+                else:
+                    proc.terminate()
+                    proc.join(timeout=0.5)
             except Exception:
                 pass
         # Finalization happens once the listener thread finishes and emits its signal.
@@ -1232,8 +1244,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.filter_button.clicked.connect(self._on_filter_clicked)  # type: ignore[attr-defined]
         self.start_button = QPushButton(self._tr("qt_button_start", "Start"))
         self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
+        self.quit_save_button = QPushButton(self._tr("qt_button_stop_save_progress", "Stop and Save Progress"))
         self.start_button.clicked.connect(self._on_start_clicked)  # type: ignore[attr-defined]
         self.stop_button.clicked.connect(self._on_stop_clicked)  # type: ignore[attr-defined]
+        self.quit_save_button.clicked.connect(self._on_quit_save_clicked)  # type: ignore[attr-defined]
 
         # Bouton "Analyse" uniquement si un backend est détecté
         self.analysis_button = None
@@ -1251,6 +1265,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         row.addWidget(self.filter_button)
         row.addWidget(self.start_button)
         row.addWidget(self.stop_button)
+        row.addWidget(self.quit_save_button)
         if self.analysis_button is not None:
             row.addWidget(self.analysis_button)
         return row
@@ -5113,6 +5128,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._cpu_eta_override_deadline = None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        try:
+            self.quit_save_button.setEnabled(running)
+        except Exception:
+            pass
         self.filter_button.setEnabled((not running) and (not self._existing_master_tiles_enabled()))
         if running:
             self.progress_bar.setValue(0)
@@ -5614,6 +5633,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_eta_seconds_value = None
         self._set_processing_state(False)
         self.stop_button.setEnabled(False)
+        try:
+            self.quit_save_button.setEnabled(False)
+        except Exception:
+            pass
 
         # Distinguish clean completion from user cancellation and errors.
         is_cancel = (not success) and (
@@ -5933,13 +5956,42 @@ class ZeMosaicQtMainWindow(QMainWindow):
             level="warning",
         )
         try:
-            self.worker_controller.stop()
+            self.worker_controller.stop(graceful=False)
         except Exception as exc:  # pragma: no cover - defensive
             template = self._tr(
                 "qt_log_stop_failure", "Failed to stop worker cleanly: {error}"
             )
             self._append_log(template.format(error=exc), level="error")
         self.stop_button.setEnabled(False)
+        try:
+            self.quit_save_button.setEnabled(False)
+        except Exception:
+            pass
+
+    def _on_quit_save_clicked(self) -> None:
+        if not self.is_processing:
+            self._append_log(
+                self._tr("qt_log_stop_ignored", "No processing is currently running."),
+                level="warning",
+            )
+            return
+
+        self._append_log(
+            self._tr("qt_log_quit_save_requested", "Quit and Save requested."),
+            level="warning",
+        )
+        try:
+            self.worker_controller.stop(graceful=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            template = self._tr(
+                "qt_log_stop_failure", "Failed to stop worker cleanly: {error}"
+            )
+            self._append_log(template.format(error=exc), level="error")
+        self.stop_button.setEnabled(False)
+        try:
+            self.quit_save_button.setEnabled(False)
+        except Exception:
+            pass
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self._record_splitter_states()
@@ -5949,7 +6001,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._save_config()
         if self.is_processing:
             try:
-                self.worker_controller.stop()
+                self.worker_controller.stop(graceful=True)
             except Exception:
                 pass
 

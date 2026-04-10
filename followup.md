@@ -126,6 +126,20 @@ Mission considered complete when:
 - Any tuning must preserve the ability to process very large datasets (up to 10k images) without OOM.
 - Prefer adaptive memory scaling and bounded chunk growth over unsafe static maxing.
 
+
+### New evidence + test plan (2026-04-10 evening)
+- New captures (`capture 1` and `capture 2`) show abrupt stop in Phase 3 without Python traceback, with pending in-flight tiles.
+- Breadcrumb sequence now localizes the stop after `P3_STACK_CORE_DONE` / `P3_POSTSTACK_EQ_STATE` and before save for some tiles.
+- Windows WER around crash time reports `LiveKernelEvent 141/117` patterns (GPU watchdog/driver reset), consistent with native GPU instability rather than Python exception flow.
+
+Immediate validation plan:
+- [ ] Re-run same dataset with GPU fully disabled (`use_gpu_phase5=false`, `stack_use_gpu=false`, `use_gpu_stack=false`) to confirm CPU stability baseline.
+- [ ] Run normalization A/B focused on NaN-heavy data: `linear_fit` vs `sky_mean` (CPU first, then GPU).
+- [ ] If CPU is stable and GPU fails, keep crash-track open as GPU/driver-sensitive path; do not treat as resolved.
+
+Implementation note:
+- [x] Qt propagation fix: toggling GPU in GUI now synchronizes all three keys (`use_gpu_phase5`, `stack_use_gpu`, `use_gpu_stack`).
+
 ### Remaining TODO (crash track)
 Status: ⏸️ paused by decision (2026-04-10) because recent runs are stable and no native crash reproduced.
 - [x] Keep crash breadcrumbs enabled and compare event timelines when failure reappears.
@@ -182,3 +196,31 @@ Measured deltas (baseline relative to SAFE_DYNAMIC):
 Interpretation:
 - SAFE_DYNAMIC gives a clear throughput gain on this dataset (about 7% overall, consistent on P3/P5).
 - Memory profile tradeoff observed: higher process RSS / system RAM peaks, but slightly reduced swap usage.
+
+---
+
+## New dedicated mission (2026-04-10 evening) — Resume progressif et tolérant
+
+Context trigger:
+- Current resume is still too strict (all-or-nothing in Phase 1 in practical scenarios).
+- Large runs can lose 1–3 days after interruption/crash even when most artifacts are still reusable.
+
+### Design & implementation backlog (open)
+- [ ] Write short design note (data model, manifests, local invalidation, atomic writes, partial resume cases, controlled-abort cases).
+- [ ] Introduce `.zemosaic_state/` manifests (`run_state`, `phase1`, `stack_plan`, `master_tiles`, `final_assembly`).
+- [x] Implement partial Phase 1 resume (recompute only missing/invalid entries, never global purge for one miss).
+- [x] Implement stack-plan reuse with compatibility check.
+- [x] Implement master-tile reuse with per-tile validation (readable FITS + WCS + shape + alpha/coverage coherence).
+- [ ] Implement resume selection by highest valid level (final > masters > plan > phase1 partial > full restart).
+- [x] Add `Quit and Save Progress` (priority): clean stop, flush checkpoints/state, safe restart.
+- [ ] Add `Pause` semantics (secondary milestone).
+- [ ] Add explicit resume logs (`phase1 partial reuse X/Y`, `stack plan reused`, `master reused A/B`, `rebuild tiles [...]`).
+- [ ] Add interruption/resume test scenarios matching acceptance criteria.
+
+### Acceptance scenarios (open)
+- [ ] Phase 1 cache partial hole: only missing cache rebuilt.
+- [ ] Interruption after grouping: plan reused if compatible.
+- [ ] Interruption mid-Phase 3: valid masters reused, only missing/corrupted rebuilt.
+- [ ] Quit-and-save then restart: no full rescans/recompute when not required.
+- [ ] Local corruption remains local (no global invalidation).
+
