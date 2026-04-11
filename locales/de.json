@@ -1,5 +1,5 @@
 {
-    "window_title": "ZeMosaic V4.5.0 – Superacervandi Hierarchischer Mosaiker",
+    "window_title": "ZeMosaic V4.5.0 – Continuum Sine Sutura Hierarchischer Mosaiker",
     "language_selector_label": "Sprache:",
     "language_name_en": "Englisch (EN)",
     "language_name_fr": "Französisch (FR)",
@@ -118,7 +118,7 @@
     "qt_field_sds_mode": "Aktivieren Sie standardmäßig den SDS-Modus",
     "qt_field_sds_threshold": "SDS-Abdeckungsschwellenwert",
     "qt_field_astap_max_instances": "Max. ASTAP-Instanzen",
-    "qt_window_title_preview": "ZeMosaic V4.5.0 – Superacervandi (Qt-Vorschau)",
+    "qt_window_title_preview": "ZeMosaic V4.5.0 – Continuum Sine Sutura (Qt-Vorschau)",
     "qt_worker_generic_update": "Worker-Update",
     "qt_worker_error_generic": "Arbeiterfehler",
     "qt_log_save_config_error": "Konfiguration konnte nicht gespeichert werden: {error}",
