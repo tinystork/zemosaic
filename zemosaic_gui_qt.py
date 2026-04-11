@@ -1021,6 +1021,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._sds_progress_active = False
         self._sds_total_phases = 7  # SDS phases: 1=Preprocess, 2=Cluster, 3=MasterTiles, 4=GlobalCoadd, 5=Polish, 6=Save, 7=Cleanup
         self._sds_current_phase_index = 0
+        self._phase_label_floor = 0
         self._sds_files_done = 0
         self._sds_files_total = 0
         self._sds_last_eta_str = ""
@@ -5012,6 +5013,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._weighted_progress_active = False
         self._sds_progress_active = False
         self._sds_current_phase_index = 0
+        self._phase_label_floor = 0
         self._sds_files_done = 0
         self._sds_files_total = 0
         self._sds_last_eta_str = ""
@@ -5270,8 +5272,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _on_worker_stage_progress(self, stage: str, current: int, total: int) -> None:
         if not (self._sds_phase_active and stage == "phase4_grid"):
-            stage_label = self._format_stage_name(stage)
-            self.phase_value_label.setText(stage_label)
+            stage_idx = self._infer_phase_index_from_stage(stage)
+            floor_idx = int(self._phase_label_floor or 0)
+            if not (isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx):
+                self._bump_phase_label_floor(stage_idx)
+                stage_label = self._format_stage_name(stage)
+                self.phase_value_label.setText(stage_label)
         self._update_stage_progress(stage, current, total)
 
     def _update_stage_progress(self, stage: str, current: int, total: int) -> None:
@@ -5402,10 +5408,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             phase_id_raw = payload_dict.get("phase_id")
             if isinstance(phase_id_raw, str) and phase_id_raw.strip().isdigit():
                 idx = int(phase_id_raw.strip())
+                self._bump_phase_label_floor(idx)
                 self._apply_sds_progress(self._compute_sds_progress_fraction(idx, None, None))
         phase_id = payload_dict.get("phase_id")
         if isinstance(phase_id, str):
             normalized_id = phase_id.strip()
+            phase_idx = self._phase_id_to_index(normalized_id)
+            self._bump_phase_label_floor(phase_idx)
             if self._sds_phase_active and normalized_id == "4":
                 return
             stage_label = self._format_phase_display_from_id(normalized_id)
@@ -5428,8 +5437,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
         else:
             if stage == "phase4_grid":
                 self._sds_phase_active = False
-            stage_label = self._format_stage_name(stage)
-        self.phase_value_label.setText(stage_label)
+            stage_idx = self._infer_phase_index_from_stage(stage)
+            floor_idx = int(self._phase_label_floor or 0)
+            if isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx:
+                stage_label = None
+            else:
+                self._bump_phase_label_floor(stage_idx)
+                stage_label = self._format_stage_name(stage)
+        if isinstance(stage_label, str):
+            self.phase_value_label.setText(stage_label)
 
         current = payload_dict.get("current")
         total = payload_dict.get("total")
@@ -5774,6 +5790,56 @@ class ZeMosaicQtMainWindow(QMainWindow):
         normalized_key = normalized.replace(".", "_")
         phase_name = self._tr(f"phase_name_{normalized_key}", normalized)
         return template.format(num=normalized, name=phase_name)
+
+    def _phase_id_to_index(self, phase_id: str) -> int | None:
+        normalized = (phase_id or "").strip()
+        if not normalized:
+            return None
+        if normalized.isdigit():
+            try:
+                idx = int(normalized)
+                return idx if idx > 0 else None
+            except Exception:
+                return None
+        try:
+            as_float = float(normalized)
+            idx = int(as_float)
+            return idx if idx > 0 else None
+        except Exception:
+            return None
+
+    def _infer_phase_index_from_stage(self, stage: str) -> int | None:
+        s = str(stage or "").strip().lower()
+        if not s:
+            return None
+        if s.startswith("phase"):
+            tail = s[5:]
+            num_chars: list[str] = []
+            for ch in tail:
+                if ch.isdigit() or ch == ".":
+                    num_chars.append(ch)
+                else:
+                    break
+            if num_chars:
+                try:
+                    idx = int(float("".join(num_chars)))
+                    if idx > 0:
+                        return idx
+                except Exception:
+                    pass
+        if "master_tile" in s or "phase3" in s:
+            return 3
+        if "calcgrid" in s or "phase4" in s:
+            return 4
+        if "assemble" in s or "intertile" in s or "phase5" in s:
+            return 5
+        return None
+
+    def _bump_phase_label_floor(self, phase_index: int | None) -> None:
+        if not isinstance(phase_index, int) or phase_index <= 0:
+            return
+        if phase_index > (self._phase_label_floor or 0):
+            self._phase_label_floor = phase_index
 
     def _format_sds_phase_label(self, done: Any, total: Any) -> str:
         try:

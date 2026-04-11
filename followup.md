@@ -224,3 +224,26 @@ Context trigger:
 - [ ] Quit-and-save then restart: no full rescans/recompute when not required.
 - [ ] Local corruption remains local (no global invalidation).
 
+
+### Resume mission update (2026-04-11 00:58)
+
+Implemented in `zemosaic_worker.py` (classic legacy path):
+- [x] Added Phase 5 / final-assembly checkpoint manifest in `.zemosaic_state/phase5_manifest.json`.
+- [x] Added binary checkpoints for assembly buffers:
+  - `.zemosaic_state/phase5_mosaic.npy`
+  - `.zemosaic_state/phase5_coverage.npy`
+  - `.zemosaic_state/phase5_alpha.npy`
+- [x] Added auto-resume attempt from Phase 5 checkpoint (signature + method + counts + shape validation) before recomputing Phase 5.
+- [x] Added save-on-success of Phase 5 checkpoint after successful assembly.
+
+Current scope note:
+- Resume now supports `phase5 checkpoint -> phase6 save` reuse in classic legacy path.
+- Phase 4 grid is still recomputed before checkpoint check (cheap), then Phase 5 can be skipped when checkpoint is valid.
+
+Systematic interruption/crash scenarios to run next:
+1. Interrupt right after Phase 5 complete (before/at Phase 6), then relaunch with `resume=auto` and verify log contains `Resume phase5 checkpoint: reused final assembly`.
+2. Corrupt `phase5_mosaic.npy` only, relaunch, verify local invalidation and Phase 5 rebuild (no global reset P1/P2/P3).
+3. Change assembly method (`final_assembly_method`) then relaunch, verify checkpoint rejected and Phase 5 rebuilt.
+4. Change input set (signature drift), relaunch, verify checkpoint rejected by signature.
+5. Remove only `phase5_alpha.npy`, relaunch, verify resume still possible (mosaic+coverage reused) and alpha regenerated downstream if needed.
+

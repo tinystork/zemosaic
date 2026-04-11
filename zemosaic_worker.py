@@ -23919,6 +23919,10 @@ def run_hierarchical_mosaic_classic_legacy(
             "dir": state_dir,
             "stack_plan": str(Path(state_dir) / "stack_plan_manifest.json"),
             "master_tiles": str(Path(state_dir) / "master_tiles_manifest.json"),
+            "phase5": str(Path(state_dir) / "phase5_manifest.json"),
+            "phase5_mosaic": str(Path(state_dir) / "phase5_mosaic.npy"),
+            "phase5_coverage": str(Path(state_dir) / "phase5_coverage.npy"),
+            "phase5_alpha": str(Path(state_dir) / "phase5_alpha.npy"),
         }
 
     def _write_stack_plan_manifest(output_root: str, run_signature: str | None, groups: list[list[dict]]) -> None:
@@ -24023,6 +24027,186 @@ def run_hierarchical_mosaic_classic_legacy(
                 continue
             out[tid] = item
         return out
+
+    def _atomic_save_npy(path_value: str, array: np.ndarray) -> None:
+        path_obj = Path(path_value)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path_obj.with_suffix(path_obj.suffix + ".tmp")
+        with open(tmp_path, "wb") as fh_tmp:
+            np.save(fh_tmp, np.asarray(array), allow_pickle=False)
+        os.replace(str(tmp_path), str(path_obj))
+
+    def _write_phase5_checkpoint(
+        output_root: str,
+        run_signature: str | None,
+        *,
+        final_assembly_method: str,
+        mosaic_hwc: np.ndarray,
+        coverage_hw: np.ndarray | None,
+        alpha_hw: np.ndarray | None,
+        final_output_shape_hw: tuple[int, int] | list[int] | None,
+        master_tiles_count: int,
+        raw_count: int,
+    ) -> None:
+        if not run_signature:
+            return
+        paths = _state_paths(output_root)
+        mosaic_arr = np.asarray(mosaic_hwc)
+        if mosaic_arr.ndim != 3:
+            raise ValueError("phase5 checkpoint mosaic must be HWC")
+        _atomic_save_npy(paths["phase5_mosaic"], mosaic_arr.astype(np.float32, copy=False))
+
+        coverage_path: str | None = None
+        if coverage_hw is not None:
+            cov_arr = np.asarray(coverage_hw)
+            if cov_arr.ndim == 3 and cov_arr.shape[-1] == 1:
+                cov_arr = cov_arr[..., 0]
+            if cov_arr.ndim != 2:
+                raise ValueError("phase5 checkpoint coverage must be HW")
+            _atomic_save_npy(paths["phase5_coverage"], cov_arr.astype(np.float32, copy=False))
+            coverage_path = paths["phase5_coverage"]
+
+        alpha_path: str | None = None
+        if alpha_hw is not None:
+            alpha_arr = np.asarray(alpha_hw)
+            if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
+                alpha_arr = alpha_arr[..., 0]
+            if alpha_arr.ndim != 2:
+                raise ValueError("phase5 checkpoint alpha must be HW")
+            _atomic_save_npy(paths["phase5_alpha"], alpha_arr.astype(np.float32, copy=False))
+            alpha_path = paths["phase5_alpha"]
+
+        shape_hw: list[int] = []
+        if isinstance(final_output_shape_hw, (list, tuple)) and len(final_output_shape_hw) >= 2:
+            try:
+                shape_hw = [int(final_output_shape_hw[0]), int(final_output_shape_hw[1])]
+            except Exception:
+                shape_hw = [int(mosaic_arr.shape[0]), int(mosaic_arr.shape[1])]
+        else:
+            shape_hw = [int(mosaic_arr.shape[0]), int(mosaic_arr.shape[1])]
+
+        payload = {
+            "schema_version": 1,
+            "pipeline": "classic_legacy",
+            "created_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "run_signature": str(run_signature),
+            "final_assembly_method": str(final_assembly_method or ""),
+            "master_tiles_count": int(master_tiles_count),
+            "raw_count": int(raw_count),
+            "output_shape_hw": shape_hw,
+            "mosaic": {
+                "path": paths["phase5_mosaic"],
+                "dtype": str(np.asarray(mosaic_arr).dtype),
+            },
+            "coverage": {
+                "path": coverage_path,
+                "dtype": "float32",
+            },
+            "alpha": {
+                "path": alpha_path,
+                "dtype": "float32",
+            },
+        }
+        _atomic_write_json(paths["phase5"], payload)
+
+    def _try_load_phase5_checkpoint(
+        output_root: str,
+        run_signature: str | None,
+        *,
+        expected_final_assembly_method: str | None = None,
+        expected_master_tiles_count: int | None = None,
+        expected_raw_count: int | None = None,
+        expected_output_shape_hw: tuple[int, int] | list[int] | None = None,
+    ) -> dict[str, Any] | None:
+        if not run_signature:
+            return None
+        paths = _state_paths(output_root)
+        data = _read_json_file(paths["phase5"])
+        if not isinstance(data, dict):
+            return None
+        if int(data.get("schema_version", -1)) != 1:
+            return None
+        if str(data.get("pipeline", "")).strip().lower() != "classic_legacy":
+            return None
+        if str(data.get("run_signature") or "") != str(run_signature):
+            return None
+
+        if expected_final_assembly_method:
+            got_method = str(data.get("final_assembly_method") or "").strip().lower()
+            if got_method and got_method != str(expected_final_assembly_method).strip().lower():
+                return None
+
+        if isinstance(expected_master_tiles_count, int) and expected_master_tiles_count > 0:
+            try:
+                if int(data.get("master_tiles_count", -1)) != int(expected_master_tiles_count):
+                    return None
+            except Exception:
+                return None
+
+        if isinstance(expected_raw_count, int) and expected_raw_count > 0:
+            try:
+                if int(data.get("raw_count", -1)) != int(expected_raw_count):
+                    return None
+            except Exception:
+                return None
+
+        mosaic_meta = data.get("mosaic") if isinstance(data.get("mosaic"), dict) else {}
+        mosaic_path = mosaic_meta.get("path") if isinstance(mosaic_meta.get("path"), str) else paths["phase5_mosaic"]
+        if not _path_exists(mosaic_path):
+            return None
+        try:
+            mosaic_arr = np.load(mosaic_path, allow_pickle=False)
+        except Exception:
+            return None
+        if not isinstance(mosaic_arr, np.ndarray) or mosaic_arr.ndim != 3:
+            return None
+
+        output_shape_hw = data.get("output_shape_hw") if isinstance(data.get("output_shape_hw"), list) else None
+        if isinstance(output_shape_hw, list) and len(output_shape_hw) >= 2:
+            try:
+                oh = int(output_shape_hw[0]); ow = int(output_shape_hw[1])
+                if oh > 0 and ow > 0 and (mosaic_arr.shape[0] != oh or mosaic_arr.shape[1] != ow):
+                    return None
+            except Exception:
+                pass
+
+        if isinstance(expected_output_shape_hw, (list, tuple)) and len(expected_output_shape_hw) >= 2:
+            try:
+                eh = int(expected_output_shape_hw[0]); ew = int(expected_output_shape_hw[1])
+                if eh > 0 and ew > 0 and (mosaic_arr.shape[0] != eh or mosaic_arr.shape[1] != ew):
+                    return None
+            except Exception:
+                pass
+
+        cov_arr = None
+        cov_meta = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}
+        cov_path = cov_meta.get("path") if isinstance(cov_meta.get("path"), str) else None
+        if cov_path and _path_exists(cov_path):
+            try:
+                loaded_cov = np.load(cov_path, allow_pickle=False)
+                if isinstance(loaded_cov, np.ndarray) and loaded_cov.ndim == 2 and loaded_cov.shape[:2] == mosaic_arr.shape[:2]:
+                    cov_arr = loaded_cov
+            except Exception:
+                cov_arr = None
+
+        alpha_arr = None
+        alpha_meta = data.get("alpha") if isinstance(data.get("alpha"), dict) else {}
+        alpha_path = alpha_meta.get("path") if isinstance(alpha_meta.get("path"), str) else None
+        if alpha_path and _path_exists(alpha_path):
+            try:
+                loaded_alpha = np.load(alpha_path, allow_pickle=False)
+                if isinstance(loaded_alpha, np.ndarray) and loaded_alpha.ndim == 2 and loaded_alpha.shape[:2] == mosaic_arr.shape[:2]:
+                    alpha_arr = loaded_alpha
+            except Exception:
+                alpha_arr = None
+
+        return {
+            "mosaic": mosaic_arr,
+            "coverage": cov_arr,
+            "alpha": alpha_arr,
+            "output_shape_hw": [int(mosaic_arr.shape[0]), int(mosaic_arr.shape[1])],
+            "final_assembly_method": str(data.get("final_assembly_method") or ""),
+        }
 
     def _try_resume_phase1(
         cache_dir: str,
@@ -28533,38 +28717,84 @@ def run_hierarchical_mosaic_classic_legacy(
         base_progress_phase5 = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
         phase5_options = _build_phase5_options_dict(base_progress_phase5)
 
-        telemetry.maybe_emit_stats(
-            _telemetry_context(
-                {
-                    "phase_name": "Phase 5: Assembly",
-                    "phase_index": 5,
-                    "tiles_total": len(master_tiles_results_list),
-                }
+        phase5_resume_hit = False
+        if resume_mode != "off":
+            try:
+                phase5_checkpoint = _try_load_phase5_checkpoint(
+                    output_folder,
+                    resume_signature_current,
+                    expected_final_assembly_method=final_assembly_method_config,
+                    expected_master_tiles_count=len(master_tiles_results_list),
+                    expected_raw_count=len(all_raw_files_processed_info),
+                    expected_output_shape_hw=final_output_shape_hw,
+                )
+            except Exception:
+                phase5_checkpoint = None
+            if isinstance(phase5_checkpoint, dict):
+                final_mosaic_data_HWC = phase5_checkpoint.get("mosaic")
+                final_mosaic_coverage_HW = phase5_checkpoint.get("coverage")
+                alpha_final = phase5_checkpoint.get("alpha")
+                final_alpha_map = alpha_final
+                phase5_resume_hit = isinstance(final_mosaic_data_HWC, np.ndarray)
+                if phase5_resume_hit:
+                    current_global_progress = base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
+                    pcb(
+                        f"Resume phase5 checkpoint: reused final assembly (shape={getattr(final_mosaic_data_HWC, 'shape', None)}).",
+                        prog=current_global_progress,
+                        lvl="INFO",
+                    )
+
+        if not phase5_resume_hit:
+            telemetry.maybe_emit_stats(
+                _telemetry_context(
+                    {
+                        "phase_name": "Phase 5: Assembly",
+                        "phase_index": 5,
+                        "tiles_total": len(master_tiles_results_list),
+                    }
+                )
             )
-        )
-        (
-            master_tiles_results_list,
-            final_mosaic_data_HWC,
-            final_mosaic_coverage_HW,
-            final_alpha_map,
-            alpha_final,
-            current_global_progress,
-        ) = _run_shared_phase45_phase5_pipeline(
-            master_tiles_results_list,
-            final_output_wcs=final_output_wcs,
-            final_output_shape_hw=final_output_shape_hw,
-            temp_master_tile_storage_dir=temp_master_tile_storage_dir,
-            output_folder=output_folder,
-            cache_retention_mode=cache_retention_mode,
-            phase45_options=phase45_options,
-            phase5_options=phase5_options,
-            final_quality_pipeline_cfg=final_quality_pipeline_cfg,
-            start_time_total_run=start_time_total_run,
-            progress_callback=progress_callback,
-            pcb=pcb,
-            logger=logger,
-        )
-        if final_mosaic_data_HWC is None:
+            (
+                master_tiles_results_list,
+                final_mosaic_data_HWC,
+                final_mosaic_coverage_HW,
+                final_alpha_map,
+                alpha_final,
+                current_global_progress,
+            ) = _run_shared_phase45_phase5_pipeline(
+                master_tiles_results_list,
+                final_output_wcs=final_output_wcs,
+                final_output_shape_hw=final_output_shape_hw,
+                temp_master_tile_storage_dir=temp_master_tile_storage_dir,
+                output_folder=output_folder,
+                cache_retention_mode=cache_retention_mode,
+                phase45_options=phase45_options,
+                phase5_options=phase5_options,
+                final_quality_pipeline_cfg=final_quality_pipeline_cfg,
+                start_time_total_run=start_time_total_run,
+                progress_callback=progress_callback,
+                pcb=pcb,
+                logger=logger,
+            )
+            if final_mosaic_data_HWC is None:
+                return
+            if resume_mode != "off":
+                try:
+                    _write_phase5_checkpoint(
+                        output_folder,
+                        resume_signature_current,
+                        final_assembly_method=final_assembly_method_config,
+                        mosaic_hwc=np.asarray(final_mosaic_data_HWC),
+                        coverage_hw=(np.asarray(final_mosaic_coverage_HW) if isinstance(final_mosaic_coverage_HW, np.ndarray) else None),
+                        alpha_hw=(np.asarray(alpha_final) if isinstance(alpha_final, np.ndarray) else None),
+                        final_output_shape_hw=final_output_shape_hw,
+                        master_tiles_count=len(master_tiles_results_list),
+                        raw_count=len(all_raw_files_processed_info),
+                    )
+                    pcb("Resume phase5 checkpoint saved.", prog=None, lvl="INFO_DETAIL")
+                except Exception as exc_phase5_checkpoint:
+                    pcb(f"Resume phase5 checkpoint save failed: {exc_phase5_checkpoint}", prog=None, lvl="WARN")
+        elif final_mosaic_data_HWC is None:
             return
         if alpha_final is not None:
             try:
