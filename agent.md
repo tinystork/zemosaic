@@ -216,3 +216,18 @@ Each manifest must answer:
 ### Completion definition
 Mission completes when partial resume works by stage on large datasets without restarting from zero after local cache loss.
 
+
+## Crash-track addendum (2026-04-11/12) — Intertile fail-fast on Windows
+
+New forensic evidence collected from crash artifacts:
+- Python faulthandler stack lands in intertile overlap calibration path (`_process_overlap_pair` -> `reproject_interp` -> `astropy.wcs` transforms).
+- Windows dump indicates fast-fail style termination (`0xC0000409`) with crash context in `PySide6/Qt6Core` for the supervising process.
+
+Operational observation:
+- `intertile_preview_size=256` still crashed on Markarian D.
+- `intertile_preview_size=128` appears stable on the same workload.
+
+Decision direction:
+- Prioritize an adaptive intertile preview guardrail with risk-based tier selection and fallback ladder (`512 -> 256 -> 128`) on failure.
+- Keep this on the crash-track critical path for dense overlap datasets.
+

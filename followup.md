@@ -140,6 +140,39 @@ Immediate validation plan:
 Implementation note:
 - [x] Qt propagation fix: toggling GPU in GUI now synchronizes all three keys (`use_gpu_phase5`, `stack_use_gpu`, `use_gpu_stack`).
 
+
+### Crash investigation addendum (2026-04-11 night)
+
+New evidence from Windows crash artifacts (faulthandler + dump triage):
+- Recurrent hard stop during Phase 5 intertile overlap calibration, around `pairs_done≈5000/5579`.
+- Python faulthandler stack points to:
+  - `zemosaic_utils._process_overlap_pair`
+  - `reproject.interpolation.high_level.reproject_interp`
+  - `astropy.wcs` world/pixel transforms
+- Windows dump analysis also reports a fast-fail style termination (`0xC0000409`) with crash context involving `PySide6/Qt6Core`, suggesting the supervising Qt process can be part of the failure chain (not only worker math path).
+
+Interpretation update:
+- This is still a native crash track (not a regular Python exception path).
+- Evidence now supports a mixed interaction zone: intertile reprojection stack + process orchestration/supervision on Windows.
+
+New stabilization direction (priority): adaptive intertile preview guardrail
+- Field result observed:
+  - `intertile_preview_size=256` can still crash on this dataset.
+  - `intertile_preview_size=128` appears significantly more stable.
+- Product need: avoid long-run hard crashes on very large overlap graphs (hundreds of master tiles / thousands of pairs).
+
+Proposed mechanism:
+1. Pre-phase risk scoring using `num_tiles`, `num_pairs`, RAM pressure and platform.
+2. Auto-select preview tier (`512/384/256/192/128`) from risk score.
+3. Runtime fallback ladder on failure (`512 -> 256 -> 128`) with explicit logs.
+4. Windows-safe cap for very dense graphs (default max preview <= 256, with 128 for high-risk bands).
+
+Validation items:
+- [ ] Add intertile risk-score logs (inputs + chosen preview tier).
+- [ ] Add automatic fallback + retry policy for intertile preview tiers.
+- [ ] Benchmark quality/runtime deltas at 512/256/128 on Markarian dataset.
+- [ ] Define production default thresholds for dense overlap workloads.
+
 ### Remaining TODO (crash track)
 Status: ⏸️ paused by decision (2026-04-10) because recent runs are stable and no native crash reproduced.
 - [x] Keep crash breadcrumbs enabled and compare event timelines when failure reappears.

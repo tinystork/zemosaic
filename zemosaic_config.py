@@ -272,7 +272,7 @@ DEFAULT_CONFIG = {
     "p3_center_min_overlap_fraction": 0.03,
     # --- Intertile photometric calibration options ---
     "intertile_photometric_match": True,
-    "intertile_preview_size": 512,
+    "intertile_preview_size": 128,
     "intertile_overlap_min": 0.05,
     "intertile_sky_percentile": [30.0, 70.0],
     "intertile_robust_clip_sigma": 2.5,

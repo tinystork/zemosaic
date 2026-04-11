@@ -108,3 +108,15 @@ Key guardrail:
 - GUI reliability fix recorded: GPU toggle now synchronizes `use_gpu_phase5`, `stack_use_gpu`, and `use_gpu_stack` to avoid accidental GPU use in Phase 3 when user selects CPU mode.
 
 - New durable product direction (2026-04-10 evening): promote resume to a dedicated architecture mission with progressive, stage-wise recovery (phase1 partial, plan reuse, per-tile master reuse) and explicit Quit-and-Save checkpoints; avoid all-or-nothing invalidation on single missing cache files.
+
+
+## 10) Crash-track update (2026-04-11/12) — intertile preview threshold
+
+- New evidence combines two signals on the same failure window:
+  - Python faulthandler in intertile reprojection path (`_process_overlap_pair` -> `reproject_interp` -> `astropy.wcs`).
+  - Windows dump fast-fail (`0xC0000409`) with Qt/PySide (`Qt6Core`) context in supervising process.
+- Practical threshold observed on Markarian D:
+  - `intertile_preview_size=256`: still crashes.
+  - `intertile_preview_size=128`: appears stable.
+- Durable direction: implement adaptive intertile preview guardrail (risk scoring + automatic fallback ladder).
+
