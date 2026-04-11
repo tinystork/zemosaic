@@ -61,6 +61,7 @@ import os
 import platform
 import shutil
 import subprocess
+import signal
 import sys
 import multiprocessing
 import queue
@@ -411,6 +412,7 @@ class ZeMosaicQtWorker(QObject):
         self._finished_emitted = False
         self._cancelled = False
         self._sds_stage_total = 0
+        self._worker_output_dir: str | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle management
@@ -439,6 +441,12 @@ class ZeMosaicQtWorker(QObject):
             raise RuntimeError("Worker backend is unavailable")
         if self.is_running():
             return None
+
+        try:
+            out_dir = worker_kwargs.get("output_dir") or worker_kwargs.get("output_folder")
+            self._worker_output_dir = str(out_dir) if out_dir else None
+        except Exception:
+            self._worker_output_dir = None
 
         queue_obj: multiprocessing.Queue | None = None
         process: multiprocessing.Process | None = None
@@ -526,7 +534,7 @@ class ZeMosaicQtWorker(QObject):
         self._listener_thread = listener_thread
         self._listener = listener
 
-    def stop(self) -> None:
+    def stop(self, *, graceful: bool = False, wait_timeout: float = 4.0) -> None:
         self._stop_requested = True
         if self._listener is not None:
             try:
@@ -536,8 +544,19 @@ class ZeMosaicQtWorker(QObject):
         proc = self._process
         if proc and proc.is_alive():
             try:
-                proc.terminate()
-                proc.join(timeout=0.5)
+                if graceful:
+                    try:
+                        if hasattr(proc, "pid") and proc.pid:
+                            os.kill(int(proc.pid), signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+                    proc.join(timeout=max(0.5, float(wait_timeout)))
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(timeout=0.5)
+                else:
+                    proc.terminate()
+                    proc.join(timeout=0.5)
             except Exception:
                 pass
         # Finalization happens once the listener thread finishes and emits its signal.
@@ -780,14 +799,35 @@ class ZeMosaicQtWorker(QObject):
             # If the worker was killed (OOM/crash), the queue listener finishes quietly;
             # mark the run as failed so the GUI cannot emit a false SUCCESS.
             self._had_error = True
+            crash_payload: Dict[str, Any] = {"exitcode": exitcode}
+            ctx_bits: list[str] = []
+            try:
+                if self._worker_output_dir:
+                    from pathlib import Path as _Path
+                    import json as _json
+
+                    st_path = _Path(self._worker_output_dir) / "worker_last_state.json"
+                    if st_path.exists():
+                        with st_path.open("r", encoding="utf-8") as _f:
+                            state = _json.load(_f)
+                        if isinstance(state, dict):
+                            crash_payload["last_state"] = state
+                            for k in ("phase", "operation", "tile_id", "event"):
+                                if k in state and state.get(k) not in (None, ""):
+                                    ctx_bits.append(f"{k}={state.get(k)}")
+                            crash_payload["last_state_path"] = str(st_path)
+            except Exception:
+                pass
+
+            suffix = f" Last state: {', '.join(ctx_bits)}." if ctx_bits else ""
             self._last_error = (
                 f"Worker process terminated unexpectedly (exitcode={exitcode}). "
-                "Likely OOM/crash."
+                f"Likely native crash (not necessarily OOM).{suffix}"
             )
             self.log_message_emitted.emit(
                 "ERROR",
                 self._last_error,
-                {"exitcode": exitcode},
+                crash_payload,
             )
 
         success = not self._had_error and not self._stop_requested and not self._cancelled
@@ -891,7 +931,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.5.0, Extractio Fundi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.5.0, Continuum Sine Sutura")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -974,11 +1014,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_global_progress: float = 0.0
         self._eta_seconds_smoothed: float | None = None
         self._eta_calc: ETACalculator | None = None
+        self._last_eta_seconds_update_mono: float | None = None
+        self._last_eta_seconds_value: float | None = None
         self._cpu_eta_override_deadline: float | None = None
         self._weighted_progress_active = False
         self._sds_progress_active = False
         self._sds_total_phases = 7  # SDS phases: 1=Preprocess, 2=Cluster, 3=MasterTiles, 4=GlobalCoadd, 5=Polish, 6=Save, 7=Cleanup
         self._sds_current_phase_index = 0
+        self._phase_label_floor = 0
         self._sds_files_done = 0
         self._sds_files_total = 0
         self._sds_last_eta_str = ""
@@ -1202,8 +1245,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.filter_button.clicked.connect(self._on_filter_clicked)  # type: ignore[attr-defined]
         self.start_button = QPushButton(self._tr("qt_button_start", "Start"))
         self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
+        self.quit_save_button = QPushButton(self._tr("qt_button_stop_save_progress", "Stop and Save Progress"))
         self.start_button.clicked.connect(self._on_start_clicked)  # type: ignore[attr-defined]
         self.stop_button.clicked.connect(self._on_stop_clicked)  # type: ignore[attr-defined]
+        self.quit_save_button.clicked.connect(self._on_quit_save_clicked)  # type: ignore[attr-defined]
 
         # Bouton "Analyse" uniquement si un backend est détecté
         self.analysis_button = None
@@ -1221,6 +1266,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         row.addWidget(self.filter_button)
         row.addWidget(self.start_button)
         row.addWidget(self.stop_button)
+        row.addWidget(self.quit_save_button)
         if self.analysis_button is not None:
             row.addWidget(self.analysis_button)
         return row
@@ -1333,6 +1379,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _populate_advanced_tab(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._create_quality_group())
         layout.addWidget(self._create_stacking_group())
+        layout.addWidget(self._create_aesthetic_output_group())
         layout.addStretch(1)
 
     def _populate_skin_tab(self, layout: QVBoxLayout) -> None:
@@ -2438,6 +2485,64 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         return group
 
+    def _create_aesthetic_output_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_aesthetic_output", "Aesthetic output (advanced)"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        hole_fill_checkbox = self._register_checkbox(
+            "aesthetic_hole_fill_enabled",
+            layout,
+            self._tr("qt_field_aesthetic_hole_fill_enabled", "Aesthetic hole fill"),
+        )
+        hole_fill_checkbox.setToolTip(
+            self._tr(
+                "qt_field_aesthetic_hole_fill_tip",
+                "Fill residual visual holes in the aesthetic FITS branch only.",
+            )
+        )
+        self._register_spinbox(
+            "aesthetic_hole_fill_max_radius_px",
+            layout,
+            self._tr("qt_field_aesthetic_hole_fill_radius", "Hole fill radius (px)"),
+            minimum=4,
+            maximum=512,
+            single_step=4,
+        )
+        self._register_double_spinbox(
+            "aesthetic_hole_fill_blend",
+            layout,
+            self._tr("qt_field_aesthetic_hole_fill_blend", "Hole fill blend / feather"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.05,
+            decimals=2,
+        )
+        self._register_checkbox(
+            "aesthetic_hole_fill_only_near_seams",
+            layout,
+            self._tr("qt_field_aesthetic_hole_fill_near_seams", "Only fill near seams"),
+        )
+        guard_checkbox = self._register_checkbox(
+            "aesthetic_hole_fill_protect_stars_details",
+            layout,
+            self._tr(
+                "qt_field_aesthetic_hole_fill_guard",
+                "Protect stars and fine details during fill",
+            ),
+        )
+        guard_checkbox.setToolTip(
+            self._tr(
+                "qt_field_aesthetic_hole_fill_guard_tip",
+                "Reduces hole-fill influence over bright stars and high-detail regions.",
+            )
+        )
+
+        return group
+
     def _create_final_assembly_group(self, parent: QWidget | None = None) -> QFrame:
         container = parent or self
         header_text = self._tr("qt_group_final_assembly", "Final assembly & output")
@@ -2508,6 +2613,29 @@ class ZeMosaicQtMainWindow(QMainWindow):
             general_layout,
             self._tr("qt_field_legacy_rgb_cube", "Legacy RGB cube layout"),
         )
+
+        export_aesthetic_checkbox = self._register_checkbox(
+            "export_aesthetic_fits",
+            general_layout,
+            self._tr("qt_field_export_aesthetic_fits", "Export dual FITS (science + aesthetic)"),
+        )
+        export_aesthetic_checkbox.setToolTip(
+            self._tr(
+                "qt_field_export_aesthetic_fits_tip",
+                "When enabled, ZeMosaic writes both scientific and aesthetic FITS outputs in one run.",
+            )
+        )
+        self._register_line_edit(
+            "scientific_fits_suffix",
+            general_layout,
+            self._tr("qt_field_scientific_fits_suffix", "Scientific FITS suffix"),
+        )
+        self._register_line_edit(
+            "aesthetic_fits_suffix",
+            general_layout,
+            self._tr("qt_field_aesthetic_fits_suffix", "Aesthetic FITS suffix"),
+        )
+
         dbe_checkbox = self._register_checkbox(
             "final_mosaic_dbe_enabled",
             general_layout,
@@ -3854,6 +3982,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     raw_value = self.config.get(key, raw_value)
 
             self.config[key] = raw_value
+            if key in {"use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"}:
+                self._synchronize_gpu_config_keys()
         except Exception:
             self.config[key] = self.config.get(key)
 
@@ -4003,6 +4133,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "aesthetic_hole_fill_max_radius_px": 64,
             "aesthetic_hole_fill_blend": 0.70,
             "aesthetic_hole_fill_only_near_seams": True,
+            "aesthetic_hole_fill_protect_stars_details": True,
             "apply_master_tile_crop": True,
             "master_tile_crop_percent": 3.0,
             "match_background_for_final": True,
@@ -4282,7 +4413,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.5.0, Extractio Fundi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.5.0, Continuum Sine Sutura")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
@@ -4882,6 +5013,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._weighted_progress_active = False
         self._sds_progress_active = False
         self._sds_current_phase_index = 0
+        self._phase_label_floor = 0
         self._sds_files_done = 0
         self._sds_files_total = 0
         self._sds_last_eta_str = ""
@@ -4998,6 +5130,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._cpu_eta_override_deadline = None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        try:
+            self.quit_save_button.setEnabled(running)
+        except Exception:
+            pass
         self.filter_button.setEnabled((not running) and (not self._existing_master_tiles_enabled()))
         if running:
             self.progress_bar.setValue(0)
@@ -5136,8 +5272,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _on_worker_stage_progress(self, stage: str, current: int, total: int) -> None:
         if not (self._sds_phase_active and stage == "phase4_grid"):
-            stage_label = self._format_stage_name(stage)
-            self.phase_value_label.setText(stage_label)
+            stage_idx = self._infer_phase_index_from_stage(stage)
+            floor_idx = int(self._phase_label_floor or 0)
+            if not (isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx):
+                self._bump_phase_label_floor(stage_idx)
+                stage_label = self._format_stage_name(stage)
+                self.phase_value_label.setText(stage_label)
         self._update_stage_progress(stage, current, total)
 
     def _update_stage_progress(self, stage: str, current: int, total: int) -> None:
@@ -5268,10 +5408,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             phase_id_raw = payload_dict.get("phase_id")
             if isinstance(phase_id_raw, str) and phase_id_raw.strip().isdigit():
                 idx = int(phase_id_raw.strip())
+                self._bump_phase_label_floor(idx)
                 self._apply_sds_progress(self._compute_sds_progress_fraction(idx, None, None))
         phase_id = payload_dict.get("phase_id")
         if isinstance(phase_id, str):
             normalized_id = phase_id.strip()
+            phase_idx = self._phase_id_to_index(normalized_id)
+            self._bump_phase_label_floor(phase_idx)
             if self._sds_phase_active and normalized_id == "4":
                 return
             stage_label = self._format_phase_display_from_id(normalized_id)
@@ -5294,8 +5437,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
         else:
             if stage == "phase4_grid":
                 self._sds_phase_active = False
-            stage_label = self._format_stage_name(stage)
-        self.phase_value_label.setText(stage_label)
+            stage_idx = self._infer_phase_index_from_stage(stage)
+            floor_idx = int(self._phase_label_floor or 0)
+            if isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx:
+                stage_label = None
+            else:
+                self._bump_phase_label_floor(stage_idx)
+                stage_label = self._format_stage_name(stage)
+        if isinstance(stage_label, str):
+            self.phase_value_label.setText(stage_label)
 
         current = payload_dict.get("current")
         total = payload_dict.get("total")
@@ -5334,6 +5484,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         neutral_eta = self._update_sds_eta_placeholder(current_phase_idx)
         if isinstance(eta_seconds, (int, float)) and eta_seconds >= 0 and not neutral_eta:
             eta_text = format_eta_hms(eta_seconds)
+            self._last_eta_seconds_value = float(eta_seconds)
+            self._last_eta_seconds_update_mono = time.monotonic()
             if sds_active and not self._sds_completed:
                 self._sds_last_eta_str = eta_text
                 self._set_eta_display(eta_text)
@@ -5369,12 +5521,53 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _on_worker_eta_updated(self, eta_text: str) -> None:
         if not isinstance(eta_text, str):
             return
+        # Prefer structured ETA from STATS_UPDATE when available recently.
+        # This avoids regressions to phase-local textual ETA pulses.
+        try:
+            last_eta_sec_ts = self._last_eta_seconds_update_mono
+            if last_eta_sec_ts is not None and (time.monotonic() - float(last_eta_sec_ts)) < 3.0:
+                return
+        except Exception:
+            pass
         self._cpu_eta_override_deadline = time.monotonic() + CPU_HELPER_OVERRIDE_TTL
         text = eta_text.strip()
         if not text:
             placeholder = self._tr("qt_progress_placeholder", "—")
             self._set_eta_display(placeholder, force=True)
             return
+
+        eta_seconds_text: float | None = None
+        try:
+            raw = text.strip()
+            sign = -1.0 if raw.startswith("+") else 1.0
+            if raw.startswith(("+", "-")):
+                raw = raw[1:]
+            parts = raw.split(":")
+            if len(parts) == 3:
+                h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                if h >= 0 and 0 <= m < 60 and 0 <= s < 60:
+                    eta_seconds_text = sign * float(h * 3600 + m * 60 + s)
+        except Exception:
+            eta_seconds_text = None
+
+        # Guard against phase-local textual ETA pulses collapsing to 0 while
+        # global ETA is still much larger (observed around intertile pairing).
+        try:
+            prev_eta = self._last_eta_seconds_value
+            if (
+                eta_seconds_text is not None
+                and prev_eta is not None
+                and float(prev_eta) >= 120.0
+                and float(eta_seconds_text) <= 1.0
+            ):
+                return
+        except Exception:
+            pass
+
+        if eta_seconds_text is not None:
+            self._last_eta_seconds_value = float(eta_seconds_text)
+            self._last_eta_seconds_update_mono = time.monotonic()
+
         current_phase = self._sds_current_phase_index or 1
         if self._update_sds_eta_placeholder(current_phase):
             return
@@ -5390,6 +5583,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         normalized = action.strip().lower()
         if normalized == "start":
             self._run_started_monotonic = time.monotonic()
+            self._last_eta_seconds_update_mono = None
+            self._last_eta_seconds_value = None
             self.elapsed_value_label.setText(
                 self._tr("initial_elapsed_time", "00:00:00")
             )
@@ -5450,8 +5645,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.is_processing = False
         self._elapsed_timer.stop()
         self._run_started_monotonic = None
+        self._last_eta_seconds_update_mono = None
+        self._last_eta_seconds_value = None
         self._set_processing_state(False)
         self.stop_button.setEnabled(False)
+        try:
+            self.quit_save_button.setEnabled(False)
+        except Exception:
+            pass
 
         # Distinguish clean completion from user cancellation and errors.
         is_cancel = (not success) and (
@@ -5551,10 +5752,27 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if not self.is_processing or self._run_started_monotonic is None:
             self._elapsed_timer.stop()
             return
-        elapsed = max(0.0, time.monotonic() - self._run_started_monotonic)
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._run_started_monotonic)
         elapsed_h, remainder = divmod(int(elapsed + 0.5), 3600)
         elapsed_m, elapsed_s = divmod(remainder, 60)
         self.elapsed_value_label.setText(f"{elapsed_h:02d}:{elapsed_m:02d}:{elapsed_s:02d}")
+
+        # Keep ETA as a visible countdown between worker updates.
+        if self._is_eta_override_active():
+            return
+        try:
+            eta0 = self._last_eta_seconds_value
+            t0 = self._last_eta_seconds_update_mono
+            if eta0 is None or t0 is None:
+                return
+            remaining_signed = float(eta0) - max(0.0, now - float(t0))
+            if remaining_signed >= 0.0:
+                self._set_eta_display(format_eta_hms(remaining_signed), force=True)
+            else:
+                self._set_eta_display(format_eta_hms(abs(remaining_signed), prefix="+"), force=True)
+        except Exception:
+            return
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -5572,6 +5790,56 @@ class ZeMosaicQtMainWindow(QMainWindow):
         normalized_key = normalized.replace(".", "_")
         phase_name = self._tr(f"phase_name_{normalized_key}", normalized)
         return template.format(num=normalized, name=phase_name)
+
+    def _phase_id_to_index(self, phase_id: str) -> int | None:
+        normalized = (phase_id or "").strip()
+        if not normalized:
+            return None
+        if normalized.isdigit():
+            try:
+                idx = int(normalized)
+                return idx if idx > 0 else None
+            except Exception:
+                return None
+        try:
+            as_float = float(normalized)
+            idx = int(as_float)
+            return idx if idx > 0 else None
+        except Exception:
+            return None
+
+    def _infer_phase_index_from_stage(self, stage: str) -> int | None:
+        s = str(stage or "").strip().lower()
+        if not s:
+            return None
+        if s.startswith("phase"):
+            tail = s[5:]
+            num_chars: list[str] = []
+            for ch in tail:
+                if ch.isdigit() or ch == ".":
+                    num_chars.append(ch)
+                else:
+                    break
+            if num_chars:
+                try:
+                    idx = int(float("".join(num_chars)))
+                    if idx > 0:
+                        return idx
+                except Exception:
+                    pass
+        if "master_tile" in s or "phase3" in s:
+            return 3
+        if "calcgrid" in s or "phase4" in s:
+            return 4
+        if "assemble" in s or "intertile" in s or "phase5" in s:
+            return 5
+        return None
+
+    def _bump_phase_label_floor(self, phase_index: int | None) -> None:
+        if not isinstance(phase_index, int) or phase_index <= 0:
+            return
+        if phase_index > (self._phase_label_floor or 0):
+            self._phase_label_floor = phase_index
 
     def _format_sds_phase_label(self, done: Any, total: Any) -> str:
         try:
@@ -5754,13 +6022,42 @@ class ZeMosaicQtMainWindow(QMainWindow):
             level="warning",
         )
         try:
-            self.worker_controller.stop()
+            self.worker_controller.stop(graceful=False)
         except Exception as exc:  # pragma: no cover - defensive
             template = self._tr(
                 "qt_log_stop_failure", "Failed to stop worker cleanly: {error}"
             )
             self._append_log(template.format(error=exc), level="error")
         self.stop_button.setEnabled(False)
+        try:
+            self.quit_save_button.setEnabled(False)
+        except Exception:
+            pass
+
+    def _on_quit_save_clicked(self) -> None:
+        if not self.is_processing:
+            self._append_log(
+                self._tr("qt_log_stop_ignored", "No processing is currently running."),
+                level="warning",
+            )
+            return
+
+        self._append_log(
+            self._tr("qt_log_quit_save_requested", "Quit and Save requested."),
+            level="warning",
+        )
+        try:
+            self.worker_controller.stop(graceful=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            template = self._tr(
+                "qt_log_stop_failure", "Failed to stop worker cleanly: {error}"
+            )
+            self._append_log(template.format(error=exc), level="error")
+        self.stop_button.setEnabled(False)
+        try:
+            self.quit_save_button.setEnabled(False)
+        except Exception:
+            pass
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self._record_splitter_states()
@@ -5770,7 +6067,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._save_config()
         if self.is_processing:
             try:
-                self.worker_controller.stop()
+                self.worker_controller.stop(graceful=True)
             except Exception:
                 pass
 
