@@ -2697,6 +2697,7 @@ def compute_intertile_affine_calibration(
     pair_gain_clip: tuple[float, float] = (0.5, 2.0),
     pair_offset_abs_max: float = 5000.0,
     max_irls_iters: int = 3,
+    force_safe_mode: bool = False,
     enforce_requested_solver: bool = False,
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
@@ -3045,6 +3046,41 @@ def compute_intertile_affine_calibration(
     fallback_used = False
     pruned_pairs_count = raw_pairs_count
 
+    configured_prune_k = int(max_neighbors_per_tile)
+    windows_massive_pairs_threshold = 3000
+    windows_massive_tiles_threshold = 300
+    windows_massive_prune_pairs_threshold = 3000
+    windows_massive_prune_k = 4
+    is_windows_platform = sys.platform == "win32"
+    windows_massive_run = bool(
+        is_windows_platform
+        and (
+            raw_pairs_count >= windows_massive_pairs_threshold
+            or num_tiles >= windows_massive_tiles_threshold
+        )
+    )
+    effective_prune_k = int(configured_prune_k)
+    if windows_massive_run:
+        if effective_prune_k > 0:
+            effective_prune_k = max(1, min(effective_prune_k, windows_massive_prune_k))
+        _log_intertile(
+            (
+                "INTERTILE massive-run detection: "
+                f"windows={is_windows_platform} pairs={raw_pairs_count} tiles={num_tiles} "
+                f"preview={preview_size} => massive=True"
+            ),
+            level="INFO",
+        )
+        if effective_prune_k != configured_prune_k:
+            _log_intertile(
+                (
+                    "INTERTILE pruning override: "
+                    f"configured_k={configured_prune_k} effective_k={effective_prune_k} "
+                    "reason=windows_massive_run"
+                ),
+                level="INFO",
+            )
+
     def _count_active_components(uf: _UnionFind) -> int:
         if active_tile_count <= 1:
             return active_tile_count
@@ -3055,9 +3091,23 @@ def compute_intertile_affine_calibration(
         return len(roots)
 
     # Pruning condition
-    if (raw_pairs_count > num_tiles * max_neighbors_per_tile * 2 and num_tiles >= 10):
+    should_prune_pairs = False
+    if num_tiles >= 10:
+        default_prune_threshold = num_tiles * max(1, effective_prune_k) * 2
+        should_prune_pairs = raw_pairs_count > default_prune_threshold
+        if windows_massive_run and raw_pairs_count >= windows_massive_prune_pairs_threshold:
+            should_prune_pairs = True
+            _log_intertile(
+                (
+                    "INTERTILE pruning massive override: "
+                    f"raw_pairs={raw_pairs_count} threshold={windows_massive_prune_pairs_threshold}"
+                ),
+                level="INFO",
+            )
+
+    if should_prune_pairs:
         _log_intertile(
-            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={max_neighbors_per_tile}",
+            f"Pair pruning (topK): raw_pairs={raw_pairs_count} max_neighbors={effective_prune_k}",
             level="INFO",
         )
 
@@ -3082,10 +3132,10 @@ def compute_intertile_affine_calibration(
             # Keep top K, ensuring at least one if it had neighbors.
             to_keep_for_tile = []
             if neighbors[tile_id]:
-                if max_neighbors_per_tile == 0 and len(neighbors[tile_id]) >= 1:
+                if effective_prune_k == 0 and len(neighbors[tile_id]) >= 1:
                     to_keep_for_tile.append(neighbors[tile_id][0][1])
                 else:
-                    for k_idx in range(min(max_neighbors_per_tile, len(neighbors[tile_id]))):
+                    for k_idx in range(min(effective_prune_k, len(neighbors[tile_id]))):
                         to_keep_for_tile.append(neighbors[tile_id][k_idx][1])
 
             kept_keys.update(to_keep_for_tile)
@@ -3159,8 +3209,8 @@ def compute_intertile_affine_calibration(
         )
     else:
         _log_intertile(
-            "Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d)"
-            % (raw_pairs_count, num_tiles, max_neighbors_per_tile),
+            "Pair pruning skipped (raw_pairs=%d, num_tiles=%d, max_neighbors=%d, effective_k=%d)"
+            % (raw_pairs_count, num_tiles, configured_prune_k, effective_prune_k),
             level="INFO",
         )
         uf = _UnionFind(num_tiles)
@@ -3179,7 +3229,7 @@ def compute_intertile_affine_calibration(
     _log_intertile(
         (
             "Pair pruning summary: "
-            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={max_neighbors_per_tile} "
+            f"raw={raw_pairs_count} pruned={pruned_pairs_count} K={effective_prune_k} "
             f"active={active_tile_count} components={components_active} bridges={bridges_added} "
             f"fallback={'yes' if fallback_used else 'no'} mode={prune_weight_mode_norm}"
         ),
@@ -3217,7 +3267,8 @@ def compute_intertile_affine_calibration(
             "components_active": int(components_active),
             "bridges_added": int(bridges_added),
             "fallback_used": bool(fallback_used),
-            "prune_k": int(max_neighbors_per_tile),
+            "prune_k": int(effective_prune_k),
+            "configured_prune_k": int(configured_prune_k),
             "prune_weight_mode": str(prune_weight_mode_norm),
             "graph_raw_edges": graph_raw_edges,
             "graph_kept_edges": graph_kept_edges,
@@ -3472,8 +3523,26 @@ def compute_intertile_affine_calibration(
                 preview_size,
             )
 
-            safe_mode = sys.platform == "win32" and preview_size >= 512 and total_pairs >= 2000
-            if safe_mode:
+            explicit_force_safe = bool(force_safe_mode)
+            legacy_preview_safe_mode = sys.platform == "win32" and preview_size >= 512 and total_pairs >= 2000
+            if explicit_force_safe:
+                effective_workers = 1
+                clamp_reasons = ["force_safe_mode"] + clamp_reasons
+                _log_intertile(
+                    "SAFE_MODE: forcing single-worker because intertile_force_safe_mode=True",
+                    level="INFO",
+                )
+            elif windows_massive_run:
+                effective_workers = 1
+                clamp_reasons = ["safe_mode_windows_massive"] + clamp_reasons
+                _log_intertile(
+                    (
+                        "SAFE_MODE_WINDOWS_MASSIVE: forcing single-worker "
+                        f"(pairs={total_pairs} tiles={num_tiles} preview={preview_size})"
+                    ),
+                    level="INFO",
+                )
+            elif legacy_preview_safe_mode:
                 effective_workers = 1
                 clamp_reasons = ["safe_mode_windows"] + clamp_reasons
                 _log_intertile(
@@ -3497,6 +3566,7 @@ def compute_intertile_affine_calibration(
                     "Parallel: effective_workers=1 -> running sequentially (no ThreadPoolExecutor) to avoid native thread issues",
                     level="INFO",
                 )
+                _log_intertile("INTERTILE execution mode: sequential", level="INFO")
                 _run_overlaps_sequentially()
             else:
                 with ThreadPoolExecutor(max_workers=effective_workers) as executor:
@@ -3563,6 +3633,7 @@ def compute_intertile_affine_calibration(
                             )
                             last_heartbeat_ts = now
         else:
+            _log_intertile("INTERTILE execution mode: sequential", level="INFO")
             _run_overlaps_sequentially()
 
         if not pair_entries:

@@ -9596,6 +9596,7 @@ def _compute_intertile_affine_corrections_from_sources(
             pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
             pair_offset_abs_max=float(intertile_pair_offset_abs_max),
             max_irls_iters=int(intertile_max_irls_iters),
+            force_safe_mode=bool(force_safe_mode),
             enforce_requested_solver=bool(intertile_enforce_requested_solver),
         )
     except Exception as exc:
@@ -9636,6 +9637,7 @@ def _compute_intertile_affine_corrections_from_sources(
                     pair_gain_clip=tuple(intertile_pair_gain_clip) if isinstance(intertile_pair_gain_clip, (list, tuple)) and len(intertile_pair_gain_clip) >= 2 else (0.5, 2.0),
                     pair_offset_abs_max=float(intertile_pair_offset_abs_max),
                     max_irls_iters=int(intertile_max_irls_iters),
+                    force_safe_mode=bool(force_safe_mode),
                     enforce_requested_solver=bool(intertile_enforce_requested_solver),
                 )
             except Exception as exc_single:
