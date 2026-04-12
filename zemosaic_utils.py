@@ -2824,14 +2824,25 @@ def compute_intertile_affine_calibration(
                 pass
 
     if use_auto_intertile and num_tiles > 20:
-        tuned_preview = max(1024, preview_size)
-        tuned_overlap = min(min_overlap_fraction, 0.01)
-        preview_size = int(tuned_preview)
-        min_overlap_fraction = float(tuned_overlap)
-        _log_intertile(
-            f"Auto-tune enabled for {num_tiles} tiles — using preview={preview_size}, min_overlap={min_overlap_fraction:.4f}",
-            level="INFO",
-        )
+        # Respect explicit low preview settings (e.g. 128/256) to avoid forcing
+        # Windows safe-mode single-worker on large pair sets.
+        if int(preview_size) <= 256:
+            _log_intertile(
+                (
+                    "Auto-tune requested but low manual preview is locked "
+                    f"(preview={int(preview_size)}); keeping preview/min_overlap unchanged"
+                ),
+                level="INFO",
+            )
+        else:
+            tuned_preview = max(1024, preview_size)
+            tuned_overlap = min(min_overlap_fraction, 0.01)
+            preview_size = int(tuned_preview)
+            min_overlap_fraction = float(tuned_overlap)
+            _log_intertile(
+                f"Auto-tune enabled for {num_tiles} tiles — using preview={preview_size}, min_overlap={min_overlap_fraction:.4f}",
+                level="INFO",
+            )
 
     if preview_size >= 1024 and min_overlap_fraction <= 0.015:
         prev_preview = preview_size
