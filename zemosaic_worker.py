@@ -13908,13 +13908,25 @@ def _wait_for_memmap_files(prefixes, timeout=10.0):
 
 
 def astap_paths_valid(astap_exe_path: str, astap_data_dir: str) -> bool:
-    """Return True if ASTAP executable and data directory look valid."""
-    return (
-        astap_exe_path
-        and _path_isfile(astap_exe_path)
-        and astap_data_dir
-        and _path_isdir(astap_data_dir)
-    )
+    """Return True if ASTAP executable is resolvable.
+
+    ``astap_data_dir`` may be empty/invalid here, the astrometry layer can
+    auto-resolve a valid catalog directory (e.g. /opt/astap) at runtime.
+    """
+
+    if not astap_exe_path:
+        return False
+
+    try:
+        if _path_isfile(astap_exe_path):
+            return True
+    except Exception:
+        pass
+
+    try:
+        return bool(shutil.which(str(astap_exe_path)))
+    except Exception:
+        return False
 
 
 def _write_header_to_fits(file_path: str, header_obj, pcb=None):

@@ -413,6 +413,7 @@ class ZeMosaicQtWorker(QObject):
         self._cancelled = False
         self._sds_stage_total = 0
         self._worker_output_dir: str | None = None
+        self._process_done_seen = False
 
     # ------------------------------------------------------------------
     # Lifecycle management
@@ -496,6 +497,7 @@ class ZeMosaicQtWorker(QObject):
         self._finished_emitted = False
         self._cancelled = False
         self._sds_stage_total = 0
+        self._process_done_seen = False
 
         listener_thread = QThread()
         listener = _WorkerQueueListener(
@@ -617,6 +619,7 @@ class ZeMosaicQtWorker(QObject):
 
         if msg_key == "PROCESS_DONE":
             # Process will terminate shortly; finalization occurs in the listener finished handler.
+            self._process_done_seen = True
             return
 
         # High-priority control and counter messages mirrored from Tk GUI.
@@ -798,7 +801,6 @@ class ZeMosaicQtWorker(QObject):
         ):
             # If the worker was killed (OOM/crash), the queue listener finishes quietly;
             # mark the run as failed so the GUI cannot emit a false SUCCESS.
-            self._had_error = True
             crash_payload: Dict[str, Any] = {"exitcode": exitcode}
             ctx_bits: list[str] = []
             try:
@@ -820,15 +822,27 @@ class ZeMosaicQtWorker(QObject):
                 pass
 
             suffix = f" Last state: {', '.join(ctx_bits)}." if ctx_bits else ""
-            self._last_error = (
-                f"Worker process terminated unexpectedly (exitcode={exitcode}). "
-                f"Likely native crash (not necessarily OOM).{suffix}"
-            )
-            self.log_message_emitted.emit(
-                "ERROR",
-                self._last_error,
-                crash_payload,
-            )
+            if self._is_soft_success_after_teardown_crash(crash_payload):
+                self.log_message_emitted.emit(
+                    "WARN",
+                    (
+                        f"Worker exited with non-zero code after completion "
+                        f"(exitcode={exitcode}). Treating run as SUCCESS because "
+                        f"WORKER_DONE and final outputs are present.{suffix}"
+                    ),
+                    crash_payload,
+                )
+            else:
+                self._had_error = True
+                self._last_error = (
+                    f"Worker process terminated unexpectedly (exitcode={exitcode}). "
+                    f"Likely native crash (not necessarily OOM).{suffix}"
+                )
+                self.log_message_emitted.emit(
+                    "ERROR",
+                    self._last_error,
+                    crash_payload,
+                )
 
         success = not self._had_error and not self._stop_requested and not self._cancelled
         if success:
@@ -839,6 +853,41 @@ class ZeMosaicQtWorker(QObject):
             else:
                 message = self._last_error
         self._finalize(success=success, message=message)
+
+    def _has_final_output_artifacts(self) -> bool:
+        out_dir = self._worker_output_dir
+        if not out_dir:
+            return False
+        try:
+            root = Path(out_dir)
+            if not root.is_dir():
+                return False
+            patterns = (
+                "zemosaic_*_science.fits",
+                "zemosaic_*_aesthetic.fits",
+                "zemosaic_*_preview.png",
+                "global_mosaic_wcs.fits",
+            )
+            for pat in patterns:
+                if next(root.glob(pat), None) is not None:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _is_soft_success_after_teardown_crash(self, crash_payload: Dict[str, Any]) -> bool:
+        if self._stop_requested or self._cancelled or self._had_error:
+            return False
+
+        state = crash_payload.get("last_state")
+        event = ""
+        if isinstance(state, dict):
+            event = str(state.get("event") or "")
+
+        if event != "WORKER_DONE" and not self._process_done_seen:
+            return False
+
+        return self._has_final_output_artifacts()
 
     # ------------------------------------------------------------------
     # Helpers
