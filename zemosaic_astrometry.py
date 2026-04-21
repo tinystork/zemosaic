@@ -96,6 +96,154 @@ def _path_display_name(pathish: str | os.PathLike[str] | Path | None) -> str:
     except Exception:
         return str(pathish)
 
+
+def _resolve_astap_executable(pathish: str | os.PathLike[str] | Path | None) -> Path | None:
+    """Resolve ASTAP executable path from absolute path or PATH lookup."""
+
+    p = _expand_path(pathish)
+    try:
+        if p and p.is_file():
+            return p
+    except Exception:
+        pass
+
+    try:
+        if pathish:
+            resolved = shutil.which(str(pathish))
+            if resolved:
+                rp = _expand_path(resolved)
+                if rp and rp.is_file():
+                    return rp
+    except Exception:
+        pass
+    return None
+
+
+def _astap_data_dir_has_catalogs(path_obj: Path | None) -> bool:
+    """Return True when *path_obj* contains ASTAP star-database files."""
+
+    if not path_obj:
+        return False
+    try:
+        if not path_obj.is_dir():
+            return False
+        # Common ASTAP catalogs: d50_*.1476, d80_*.290, etc.
+        patterns = (
+            "d*_*.1476",
+            "d*_*.290",
+            "g*.1476",
+            "h*.1476",
+            "g*.290",
+            "h*.290",
+        )
+        for pat in patterns:
+            try:
+                if next(path_obj.glob(pat), None) is not None:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _resolve_astap_data_dir(
+    requested_dir: str | os.PathLike[str] | Path | None,
+    exe_path: Path | None,
+) -> Path | None:
+    """Resolve a usable ASTAP catalog directory, preferring requested_dir."""
+
+    candidates: list[Path] = []
+
+    req = _expand_path(requested_dir)
+    if req is not None:
+        candidates.append(req)
+
+    if exe_path is not None:
+        candidates.extend([
+            exe_path.parent,
+            exe_path.parent / "data",
+            exe_path.parent / "database",
+        ])
+
+    # Common install locations on Linux/macOS/Windows.
+    for raw in (
+        "/opt/astap",
+        "/usr/share/astap",
+        "/usr/local/share/astap",
+        "~/astap",
+        "~/ASTAP",
+        "C:/Program Files/astap",
+    ):
+        c = _expand_path(raw)
+        if c is not None:
+            candidates.append(c)
+
+    seen: set[str] = set()
+    for c in candidates:
+        try:
+            key = str(c.resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _astap_data_dir_has_catalogs(c):
+            return c
+
+    return None
+
+
+def _header_has_reasonable_wcs_for_hints(header: Any) -> bool:
+    """Return True when CRVAL-based hints look trustworthy in *header*."""
+
+    if header is None:
+        return False
+
+    def _f(key: str):
+        try:
+            val = header.get(key) if hasattr(header, 'get') else header[key]
+            return float(val)
+        except Exception:
+            return None
+
+    try:
+        c1 = str(header.get('CTYPE1', '')).upper()
+        c2 = str(header.get('CTYPE2', '')).upper()
+    except Exception:
+        c1 = c2 = ''
+    if not (('RA' in c1 or 'LON' in c1) and ('DEC' in c2 or 'LAT' in c2)):
+        return False
+
+    cd = None
+    vals = [_f(k) for k in ('CD1_1', 'CD1_2', 'CD2_1', 'CD2_2')]
+    if all(v is not None for v in vals):
+        cd = np.array([[vals[0], vals[1]], [vals[2], vals[3]]], dtype=np.float64)
+    else:
+        vals_pc = [_f(k) for k in ('PC1_1', 'PC1_2', 'PC2_1', 'PC2_2', 'CDELT1', 'CDELT2')]
+        if all(v is not None for v in vals_pc):
+            pc = np.array([[vals_pc[0], vals_pc[1]], [vals_pc[2], vals_pc[3]]], dtype=np.float64)
+            cd = pc @ np.diag([vals_pc[4], vals_pc[5]])
+
+    if cd is None or not np.all(np.isfinite(cd)):
+        return False
+    try:
+        det = float(np.linalg.det(cd))
+    except Exception:
+        return False
+    if (not np.isfinite(det)) or abs(det) < 1e-16:
+        return False
+
+    scales_deg = np.sqrt(np.sum(cd ** 2, axis=0))
+    scales_arcsec = np.abs(scales_deg) * 3600.0
+    finite = scales_arcsec[np.isfinite(scales_arcsec)]
+    if finite.size == 0:
+        return False
+    if float(np.nanmin(finite)) < 0.3 or float(np.nanmax(finite)) > 15.0:
+        return False
+
+    return True
+
 try:
     import msvcrt
 except ImportError:  # pragma: no cover - only available on Windows
@@ -1166,8 +1314,9 @@ def solve_with_astap(
         raise RuntimeError(msg)
 
     image_fits_path = _expand_path(image_fits_path)
-    astap_exe_path = _expand_path(astap_exe_path)
-    astap_data_dir = _expand_path(astap_data_dir)
+    astap_exe_resolved = _resolve_astap_executable(astap_exe_path)
+    astap_data_dir_requested = _expand_path(astap_data_dir)
+    astap_data_dir_resolved = _resolve_astap_data_dir(astap_data_dir_requested, astap_exe_resolved)
 
     img_basename_log = _path_display_name(image_fits_path)
     if progress_callback:
@@ -1175,10 +1324,10 @@ def solve_with_astap(
     logger.debug(f"ASTAP Solve params (entrée fonction): image='{img_basename_log}', radius={search_radius_deg}, "
                  f"downsample={downsample_factor}, sensitivity={sensitivity}")
 
-    if not (astap_exe_path and astap_exe_path.is_file()):
+    if not (astap_exe_resolved and astap_exe_resolved.is_file()):
         if progress_callback:
             progress_callback(
-                f"ASTAP Solve ERREUR: Chemin ASTAP exe invalide: '{astap_exe_path}'.",
+                f"ASTAP Solve ERREUR: Chemin ASTAP exe invalide/non résolu: '{astap_exe_path}'.",
                 None,
                 "ERROR",
             )
@@ -1191,12 +1340,20 @@ def solve_with_astap(
                 "ERROR",
             )
         return None
-    if not (astap_data_dir and astap_data_dir.is_dir()):
+    if astap_data_dir_resolved is None:
         if progress_callback:
             progress_callback(
-                f"ASTAP Solve AVERT: Chemin ASTAP data non spécifié ou invalide: '{astap_data_dir}'. ASTAP pourrait ne pas trouver ses bases.",
+                f"ASTAP Solve AVERT: Dossier catalogues ASTAP introuvable. Config='{astap_data_dir_requested}'. "
+                f"Chemins testés autour de '{astap_exe_resolved.parent if astap_exe_resolved else '<none>'}'.",
                 None,
                 "WARN",
+            )
+    elif astap_data_dir_requested is None or astap_data_dir_resolved != astap_data_dir_requested:
+        if progress_callback:
+            progress_callback(
+                f"ASTAP Solve: Dossier catalogues auto-résolu: '{astap_data_dir_resolved}'.",
+                None,
+                "INFO_DETAIL",
             )
     if original_fits_header is None: # Should not happen if called from worker
         if progress_callback: progress_callback("ASTAP Solve ERREUR: Header FITS original non fourni.", None, "ERROR")
@@ -1231,9 +1388,9 @@ def solve_with_astap(
                 "WARN",
             )
 
-    cmd_list_astap = [str(astap_exe_path), "-f", str(image_fits_path), "-log", "-wcs"]
-    if astap_data_dir and astap_data_dir.is_dir():
-        cmd_list_astap.extend(["-d", str(astap_data_dir)])
+    cmd_list_astap = [str(astap_exe_resolved), "-f", str(image_fits_path), "-log", "-wcs"]
+    if astap_data_dir_resolved and astap_data_dir_resolved.is_dir():
+        cmd_list_astap.extend(["-d", str(astap_data_dir_resolved)])
 
     def _make_fov0_cmd(cmd: list[str]) -> list[str]:
         filtered: list[str] = []
@@ -1301,18 +1458,33 @@ def solve_with_astap(
                 return None
 
         # RA/DEC candidats (ordre de priorité)
-        ra_candidates = [
-            original_fits_header.get("CRVAL1"),
-            original_fits_header.get("RA"),
-            original_fits_header.get("OBJCTRA"),
-            original_fits_header.get("TELRA"),
-        ]
-        dec_candidates = [
-            original_fits_header.get("CRVAL2"),
-            original_fits_header.get("DEC"),
-            original_fits_header.get("OBJCTDEC"),
-            original_fits_header.get("TELDEC"),
-        ]
+        # Important: si le WCS header est douteux (ex: matrix singulière),
+        # ne PAS utiliser CRVAL1/2 comme hints (sinon faux centre + -r trop strict).
+        wcs_hints_ok = _header_has_reasonable_wcs_for_hints(original_fits_header)
+        if wcs_hints_ok:
+            ra_candidates = [
+                original_fits_header.get("CRVAL1"),
+                original_fits_header.get("RA"),
+                original_fits_header.get("OBJCTRA"),
+                original_fits_header.get("TELRA"),
+            ]
+            dec_candidates = [
+                original_fits_header.get("CRVAL2"),
+                original_fits_header.get("DEC"),
+                original_fits_header.get("OBJCTDEC"),
+                original_fits_header.get("TELDEC"),
+            ]
+        else:
+            # Lorsque le WCS est invalide (ex: matrix singulière), même RA/DEC du
+            # header peuvent être incohérents. On préfère un vrai blind-solve.
+            ra_candidates = []
+            dec_candidates = []
+            if progress_callback:
+                progress_callback(
+                    "  ASTAP Solve: WCS header jugé non fiable, hints RA/Dec désactivés (blind-solve).",
+                    None,
+                    "DEBUG_DETAIL",
+                )
 
         # Keep CRVAL1 to disambiguate units: CRVAL1 is always in degrees (WCS)
         crval1_val = original_fits_header.get("CRVAL1")
@@ -1472,16 +1644,16 @@ def solve_with_astap(
                     if tried_fallback:
                         break
                     if (
-                        rc_astap == 1
-                        and astap_drizzled_fallback_enabled
+                        rc_astap in (1, 2)
                         and used_pxscale
                         and not tried_fallback
+                        and (astap_drizzled_fallback_enabled or rc_astap == 2)
                     ):
                         tried_fallback = True
                         cmd_list_astap = _make_fov0_cmd(cmd_list_astap)
                         if progress_callback:
                             progress_callback(
-                                "  ASTAP Solve: RC=1 avec -pxscale; nouvel essai unique avec -fov 0.",
+                                f"  ASTAP Solve: RC={rc_astap} avec -pxscale; nouvel essai unique avec -fov 0.",
                                 None,
                                 "WARN",
                             )
@@ -1490,7 +1662,7 @@ def solve_with_astap(
                                 None,
                                 "DEBUG",
                             )
-                        logger.warning("ASTAP rc=1 with -pxscale; retrying once with -fov 0.")
+                        logger.warning("ASTAP rc=%s with -pxscale; retrying once with -fov 0.", rc_astap)
                         logger.debug("ASTAP fallback command: %s", " ".join(cmd_list_astap))
                         if attempt >= total_attempts:
                             total_attempts += 1
@@ -1579,8 +1751,8 @@ def solve_with_astap(
         if progress_callback: progress_callback(f"ASTAP Solve ERREUR: Timeout ({timeout_sec}s) pour '{img_basename_log}'.", None, "ERROR")
         logger.error(f"ASTAP command timed out for {img_basename_log}", exc_info=False)
     except FileNotFoundError:
-        if progress_callback: progress_callback(f"ASTAP Solve ERREUR: Exécutable ASTAP '{astap_exe_path}' non trouvé.", None, "ERROR")
-        logger.error(f"ASTAP executable not found at '{astap_exe_path}'.", exc_info=False)
+        if progress_callback: progress_callback(f"ASTAP Solve ERREUR: Exécutable ASTAP '{astap_exe_resolved or astap_exe_path}' non trouvé.", None, "ERROR")
+        logger.error(f"ASTAP executable not found at '{astap_exe_resolved or astap_exe_path}'.", exc_info=False)
     except Exception as e_astap_glob:
         if progress_callback: progress_callback(f"ASTAP Solve ERREUR Inattendue: {e_astap_glob}", None, "ERROR")
         logger.error(f"Unexpected error during ASTAP execution for {img_basename_log}: {e_astap_glob}", exc_info=True)

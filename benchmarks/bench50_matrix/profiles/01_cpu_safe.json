@@ -1,0 +1,17 @@
+{
+  "stack_use_gpu": false,
+  "use_gpu_stack": false,
+  "use_gpu_grid": false,
+  "use_gpu_phase5": false,
+  "parallel_autotune_enabled": true,
+  "parallel_target_cpu_load": 0.9,
+  "parallel_target_ram_fraction": 0.8,
+  "num_processing_workers": 0,
+  "grid_workers": 0,
+  "assembly_process_workers": 0,
+  "winsor_worker_limit": 0,
+  "phase5_chunk_auto": true,
+  "phase5_chunk_mb": 128,
+  "intertile_preview_size": 128,
+  "final_assembly_method": "reproject_coadd"
+}
