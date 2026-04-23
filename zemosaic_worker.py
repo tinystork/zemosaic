@@ -614,6 +614,33 @@ def _coerce_bool_flag(value) -> bool | None:
         return None
 
 
+
+def _resolve_intertile_force_safe_mode(
+    value,
+    platform_name: str | None = None,
+) -> tuple[bool, str, str]:
+    """Resolve intertile safe-mode policy with platform-aware default.
+
+    Accepted user values:
+    - true/false (or equivalent strings): explicit override
+    - "auto" (or missing/empty): Windows => True, others => False
+    """
+
+    platform_norm = str(platform_name or sys.platform or "").strip().lower()
+    platform_label = "windows" if platform_norm.startswith("win") else (platform_norm or "unknown")
+    auto_default = platform_norm.startswith("win")
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "auto", "default", "platform"}:
+            return bool(auto_default), "auto", platform_label
+
+    coerced = _coerce_bool_flag(value)
+    if coerced is not None:
+        return bool(coerced), "explicit", platform_label
+
+    return bool(auto_default), "auto_fallback", platform_label
+
 def _select_debug_tile_ids(tile_order: list[int]) -> set[int]:
     """Select a small sample of tile ids for debug instrumentation."""
 
@@ -11159,7 +11186,21 @@ def _run_shared_phase45_phase5_pipeline(
     intertile_recenter_clip_tuple = phase5_options.get("intertile_recenter_clip") or (0.85, 1.18)
     intertile_affine_blend_config = phase5_options.get("intertile_affine_blend", 1.0)
     use_auto_intertile_config = phase5_options.get("use_auto_intertile")
-    intertile_force_safe_mode_config = bool(phase5_options.get("intertile_force_safe_mode"))
+    intertile_force_safe_mode_raw = phase5_options.get("intertile_force_safe_mode", "auto")
+    (
+        intertile_force_safe_mode_config,
+        intertile_force_safe_mode_source,
+        intertile_force_safe_mode_platform,
+    ) = _resolve_intertile_force_safe_mode(intertile_force_safe_mode_raw)
+    pcb(
+        "[Intertile] force_safe_mode resolved"
+        f" raw={intertile_force_safe_mode_raw!r}"
+        f" effective={int(bool(intertile_force_safe_mode_config))}"
+        f" source={intertile_force_safe_mode_source}"
+        f" platform={intertile_force_safe_mode_platform}",
+        prog=None,
+        lvl="INFO",
+    )
     intertile_prune_k_config = int(phase5_options.get("intertile_prune_k") or 8)
     intertile_prune_weight_mode_config = str(phase5_options.get("intertile_prune_weight_mode") or "area")
     intertile_offset_only_v1_config = bool(phase5_options.get("intertile_offset_only_v1"))
@@ -22934,7 +22975,7 @@ def run_hierarchical_mosaic_classic_legacy(
     intertile_global_recenter_config: bool = True,
     intertile_recenter_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile_config: bool = False,
-    intertile_force_safe_mode_config: bool = False,
+    intertile_force_safe_mode_config: bool | str | None = "auto",
     intertile_prune_k_config: int = 8,
     intertile_prune_weight_mode_config: str = "area",
     match_background_for_final_config: bool = True,
@@ -30240,7 +30281,7 @@ def run_hierarchical_mosaic(
     intertile_global_recenter_config: bool = True,
     intertile_recenter_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile_config: bool = False,
-    intertile_force_safe_mode_config: bool = False,
+    intertile_force_safe_mode_config: bool | str | None = "auto",
     match_background_for_final_config: bool = True,
     incremental_feather_parity_config: bool = False,
     two_pass_coverage_renorm_config: bool = False,

@@ -78,6 +78,7 @@ ZeMosaic uses a layered configuration model:
 Notes:
 - `input_dir`/`input_folder` and `output_dir`/`output_folder` are synchronized aliases.
 - GPU flags (`use_gpu_phase5`, `stack_use_gpu`, `use_gpu_stack`) are normalized for consistency.
+- Intertile safety key: `intertile_force_safe_mode` in `zemosaic_config.json` (`"auto"` default, `true` to force single-worker intertile, `false` to disable forced safe-mode). In `"auto"`, Windows resolves to safe-mode ON by default; other OS keep automatic parallel mode.
 
 ---
 
@@ -274,6 +275,7 @@ ZeMosaic utilise un modèle de configuration en couches:
 Notes:
 - `input_dir`/`input_folder` et `output_dir`/`output_folder` sont des alias synchronisés.
 - Les flags GPU (`use_gpu_phase5`, `stack_use_gpu`, `use_gpu_stack`) sont normalisés pour rester cohérents.
+- Clé de sécurité intertile: `intertile_force_safe_mode` dans `zemosaic_config.json` (défaut `"auto"`, `true` pour forcer le mode intertile mono-worker, `false` pour désactiver ce forçage). En mode `"auto"`, Windows active le safe-mode par défaut; les autres OS restent en mode parallèle automatique.
 
 ---
 

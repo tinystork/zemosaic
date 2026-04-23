@@ -273,6 +273,8 @@ DEFAULT_CONFIG = {
     # --- Intertile photometric calibration options ---
     "intertile_photometric_match": True,
     "intertile_preview_size": 128,
+    # Intertile crash-safety policy: "auto" => True on Windows, False on other OS.
+    "intertile_force_safe_mode": "auto",
     "intertile_overlap_min": 0.05,
     "intertile_sky_percentile": [30.0, 70.0],
     "intertile_robust_clip_sigma": 2.5,

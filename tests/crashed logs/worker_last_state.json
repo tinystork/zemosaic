@@ -1,0 +1,24 @@
+{
+  "event": "WORKER_HEARTBEAT",
+  "iso": "2026-04-23T13:59:27.399441Z",
+  "pid": 32084,
+  "ppid": 57364,
+  "ts_unix": 1776952767.3994634,
+  "ram_used_mb": 17840.66796875,
+  "ram_total_mb": 32469.49609375,
+  "ram_pct": 54.9,
+  "context": {
+    "phase": "phase5_intertile",
+    "operation": "stage_progress",
+    "stage": "phase5_intertile",
+    "tile_progress": {
+      "done": 40,
+      "total": 40
+    },
+    "in_flight": null,
+    "cpu_workers": 0,
+    "gpu_rows_per_chunk": null,
+    "max_chunk_bytes": null,
+    "winsor_workers": null
+  }
+}
