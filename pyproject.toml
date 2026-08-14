@@ -86,6 +86,7 @@ include = ["zemosaic*"]
 
 [tool.setuptools.package-data]
 zemosaic = [
+    "zesoftware_interop.json",
     "locales/*.json",
     "icon/*.ico",
     "icon/*.png",

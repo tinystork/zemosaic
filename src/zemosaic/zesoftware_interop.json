@@ -1,0 +1,24 @@
+{
+  "schema": "zesoftware.interop.v1",
+  "product_id": "zemosaic",
+  "distribution_name": "ZeMosaic",
+  "provides": [],
+  "consumes": [
+    {
+      "provider_product_id": "zesolver",
+      "provider_distribution_name": "ZeSolver",
+      "optional": true,
+      "api_module": "zesolver.api.v1",
+      "api_version": ">=1,<2",
+      "required_capabilities": ["wcs_write"],
+      "any_of_capabilities": [
+        {
+          "id": "solve_backend",
+          "capabilities": ["near_solve", "blind_solve"],
+          "required": true
+        }
+      ],
+      "optional_capabilities": ["cancel", "gpu"]
+    }
+  ]
+}
