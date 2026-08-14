@@ -1621,6 +1621,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             ("ASTAP", self._tr("qt_solver_astap", "ASTAP (recommended)")),
             ("ASTROMETRY", self._tr("qt_solver_astrometry", "Astrometry.net")),
             ("ANSVR", self._tr("qt_solver_ansvr", "ANSVR (local server)")),
+            ("ZESOLVER", self._tr("qt_solver_zesolver", "ZeSolver (optional)")),
             ("NONE", self._tr("qt_solver_none", "None (WCS already present)")),
         ]
         for value, label in solver_options:
@@ -1759,6 +1760,64 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         outer_layout.addWidget(ansvr_box)
 
+        zesolver_box = QGroupBox(
+            self._tr("qt_group_zesolver", "ZeSolver configuration"),
+            group,
+        )
+        zesolver_layout = QFormLayout(zesolver_box)
+        zesolver_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        zesolver_hint = QLabel(
+            self._tr(
+                "qt_zesolver_hint",
+                "ZeSolver is an optional solver. It is only used when installed "
+                "and its public API v1 is available; otherwise the legacy solvers "
+                "remain untouched.",
+            ),
+            zesolver_box,
+        )
+        zesolver_hint.setWordWrap(True)
+        zesolver_layout.addRow(zesolver_hint)
+        self._register_line_edit(
+            "zesolver_resources_path",
+            zesolver_layout,
+            self._tr(
+                "qt_field_zesolver_resources_path",
+                "Catalog resources path (optional)",
+            ),
+            browse_action="directory",
+            dialog_title=self._tr(
+                "qt_dialog_select_zesolver_resources",
+                "Select ZeSolver catalog resources directory",
+            ),
+        )
+
+        zesolver_gpu_combo = QComboBox(zesolver_box)
+        gpu_options = [
+            ("auto", self._tr("qt_zesolver_gpu_auto", "Auto")),
+            ("disabled", self._tr("qt_zesolver_gpu_disabled", "Disabled")),
+            ("required", self._tr("qt_zesolver_gpu_required", "Required")),
+        ]
+        for value, label in gpu_options:
+            zesolver_gpu_combo.addItem(label, value)
+        current_gpu = str(self.config.get("zesolver_gpu_policy", "auto") or "auto").lower()
+        gpu_index = next(
+            (idx for idx, (value, _label) in enumerate(gpu_options) if value == current_gpu),
+            0,
+        )
+        zesolver_gpu_combo.setCurrentIndex(gpu_index)
+        zesolver_layout.addRow(
+            QLabel(self._tr("qt_field_zesolver_gpu_policy", "GPU policy"), zesolver_box),
+            zesolver_gpu_combo,
+        )
+        self._config_fields["zesolver_gpu_policy"] = {
+            "kind": "combobox",
+            "widget": zesolver_gpu_combo,
+            "type": str,
+            "value_getter": zesolver_gpu_combo.currentData,
+        }
+
+        outer_layout.addWidget(zesolver_box)
+
         none_hint = QLabel(
             self._tr(
                 "qt_solver_none_hint",
@@ -1773,6 +1832,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "ASTAP": astap_box,
             "ASTROMETRY": astrometry_box,
             "ANSVR": ansvr_box,
+            "ZESOLVER": zesolver_box,
         }
         self._solver_none_hint = none_hint
 
@@ -4130,6 +4190,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "astrometry_api_key": "",
             "astrometry_timeout": 60,
             "astrometry_downsample": 2,
+            "zesolver_resources_path": "",
+            "zesolver_gpu_policy": "auto",
+            "zesolver_backend_policy": "auto",
+            "zesolver_timeout_s": 300,
             "astap_executable_path": "",
             "astap_data_directory_path": "",
             "astap_default_search_radius": 3.0,
@@ -6027,6 +6091,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
         solver_choice = str(self.config.get("solver_method", "ASTAP") or "ASTAP")
         api_key = str(self.config.get("astrometry_api_key", "") or "")
+        zesolver_resources_path = str(
+            self.config.get("zesolver_resources_path", "") or ""
+        )
+        zesolver_gpu_policy = str(
+            self.config.get("zesolver_gpu_policy", "auto") or "auto"
+        )
+        zesolver_backend_policy = str(
+            self.config.get("zesolver_backend_policy", "auto") or "auto"
+        )
+        zesolver_timeout_s = self.config.get("zesolver_timeout_s")
 
         if SolverSettings is None:
             return {
@@ -6042,6 +6116,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "astap_sensitivity": astap_sensitivity,
                 "astap_max_instances": astap_max_instances,
                 "astap_drizzled_fallback_enabled": astap_drizzled_fallback_enabled,
+                "zesolver_resources_path": zesolver_resources_path,
+                "zesolver_gpu_policy": zesolver_gpu_policy,
+                "zesolver_backend_policy": zesolver_backend_policy,
+                "zesolver_timeout_s": zesolver_timeout_s,
             }
 
         try:
@@ -6071,6 +6149,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
         settings.astap_drizzled_fallback_enabled = astap_drizzled_fallback_enabled
         payload = asdict(settings)
         payload["astap_max_instances"] = astap_max_instances
+        payload["zesolver_resources_path"] = zesolver_resources_path
+        payload["zesolver_gpu_policy"] = zesolver_gpu_policy
+        payload["zesolver_backend_policy"] = zesolver_backend_policy
+        if zesolver_timeout_s is not None:
+            try:
+                payload["zesolver_timeout_s"] = float(zesolver_timeout_s)
+            except (TypeError, ValueError):
+                payload["zesolver_timeout_s"] = 300.0
         return payload
 
     def _on_start_clicked(self) -> None:

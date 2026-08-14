@@ -67,6 +67,7 @@ import uuid
 import multiprocessing
 import signal
 import threading
+import functools
 import itertools
 import platform
 import importlib
@@ -13295,6 +13296,33 @@ try:
 except ImportError:
     from .solver_settings import SolverSettings  # type: ignore
 
+# --- SolverPort boundary (internal, lightweight; ZeSolver stays optional/lazy) ---
+try:
+    from . import solver_port as _solver_port
+    from .solver_port import (
+        SolverOutcome,
+        LegacySolverAdapter,
+        SolveStatus,
+        SOLVER_CHOICE_ZESOLVER,
+    )
+    _SOLVER_PORT_AVAILABLE = True
+except Exception as _e_solver_port_imp:  # pragma: no cover - defensive
+    logger.error(f"Import 'solver_port.py' échoué: {_e_solver_port_imp}.")
+    _solver_port = None
+    SolverOutcome = None  # type: ignore
+    LegacySolverAdapter = None  # type: ignore
+    SolveStatus = None  # type: ignore
+    SOLVER_CHOICE_ZESOLVER = "ZESOLVER"
+    _SOLVER_PORT_AVAILABLE = False
+
+try:
+    from . import zesolver_adapter as _zesolver_adapter
+    _ZESOLVER_ADAPTER_AVAILABLE = True
+except Exception as _e_zesolver_imp:  # pragma: no cover - defensive
+    logger.error(f"Import 'zesolver_adapter.py' échoué: {_e_zesolver_imp}.")
+    _zesolver_adapter = None
+    _ZESOLVER_ADAPTER_AVAILABLE = False
+
 _anchor_detect_autocrop = None
 ANCHOR_AUTOCROP_AVAILABLE = False
 
@@ -14024,6 +14052,230 @@ def solve_with_ansvr(
             f"Ansvr solve error: {e}", prog=None, lvl="WARN", callback=progress_callback
         )
         return None
+
+
+# --- SolverPort dispatch helpers -------------------------------------------
+# Lazy, process-scoped ZeSolver adapter instance (one SolverRuntime per process).
+# The adapter is rebuilt (closing the previous runtime) whenever the
+# runtime-affecting ZeSolver settings change between runs in the same process.
+_ZESOLVER_ADAPTER_INSTANCE = None
+_ZESOLVER_ADAPTER_FINGERPRINT = None
+_ZESOLVER_ADAPTER_LOCK = threading.Lock()
+
+# Runtime/session-affecting settings that must invalidate a cached adapter when
+# they change. ``zesolver_backend_policy`` is per-solve today but is included
+# conservatively so no ZeSolver setting is ever silently reused across runs.
+_ZESOLVER_FINGERPRINT_KEYS = (
+    "zesolver_resources_path",
+    "zesolver_gpu_policy",
+    "zesolver_backend_policy",
+)
+
+_LEGACY_SOLVER_ADAPTER_INSTANCE = None
+_LEGACY_SOLVER_ADAPTER_LOCK = threading.Lock()
+
+
+def _get_legacy_solver_adapter():
+    """Return the process-scoped LegacySolverAdapter (lazily built)."""
+    global _LEGACY_SOLVER_ADAPTER_INSTANCE
+    if _LEGACY_SOLVER_ADAPTER_INSTANCE is not None:
+        return _LEGACY_SOLVER_ADAPTER_INSTANCE
+    with _LEGACY_SOLVER_ADAPTER_LOCK:
+        if _LEGACY_SOLVER_ADAPTER_INSTANCE is None:
+            astap_fn = None
+            if ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry and hasattr(
+                zemosaic_astrometry, "solve_with_astap"
+            ):
+                astap_fn = zemosaic_astrometry.solve_with_astap
+            _LEGACY_SOLVER_ADAPTER_INSTANCE = LegacySolverAdapter(
+                astrometry_fn=solve_with_astrometry,
+                ansvr_fn=solve_with_ansvr,
+                astap_fn=astap_fn,
+                astap_paths_valid_fn=astap_paths_valid,
+            )
+        return _LEGACY_SOLVER_ADAPTER_INSTANCE
+
+
+def _zesolver_settings_fingerprint(settings):
+    """Build a stable fingerprint of the runtime-affecting ZeSolver settings."""
+    s = settings or {}
+    parts = []
+    for key in _ZESOLVER_FINGERPRINT_KEYS:
+        value = s.get(key)
+        if value is None:
+            value = ""
+        else:
+            try:
+                value = str(value).strip()
+            except Exception:
+                value = ""
+        parts.append(f"{key}={value}")
+    return tuple(parts)
+
+
+def _get_zesolver_adapter(settings):
+    """Return the process-scoped ZeSolverAdapter, rebuilt when settings change.
+
+    The adapter is cached per settings fingerprint so that a later run with
+    different ``zesolver_resources_path`` / ``zesolver_gpu_policy`` /
+    ``zesolver_backend_policy`` never silently reuses a stale runtime: the old
+    adapter is closed and a fresh one is created.
+    """
+    global _ZESOLVER_ADAPTER_INSTANCE, _ZESOLVER_ADAPTER_FINGERPRINT
+    fingerprint = _zesolver_settings_fingerprint(settings)
+    if (
+        _ZESOLVER_ADAPTER_INSTANCE is not None
+        and _ZESOLVER_ADAPTER_FINGERPRINT == fingerprint
+    ):
+        return _ZESOLVER_ADAPTER_INSTANCE
+    with _ZESOLVER_ADAPTER_LOCK:
+        if (
+            _ZESOLVER_ADAPTER_INSTANCE is not None
+            and _ZESOLVER_ADAPTER_FINGERPRINT == fingerprint
+        ):
+            return _ZESOLVER_ADAPTER_INSTANCE
+        # First use or fingerprint change: close any stale adapter, then build.
+        if _ZESOLVER_ADAPTER_INSTANCE is not None:
+            try:
+                _ZESOLVER_ADAPTER_INSTANCE.close()
+            except Exception:  # pragma: no cover - close must never raise
+                logger.debug("ZeSolver adapter close failed", exc_info=True)
+        s = settings or {}
+        _ZESOLVER_ADAPTER_INSTANCE = _zesolver_adapter.ZeSolverAdapter(
+            resources_path=s.get("zesolver_resources_path") or None,
+            gpu_policy=s.get("zesolver_gpu_policy") or None,
+        )
+        _ZESOLVER_ADAPTER_FINGERPRINT = fingerprint
+    return _ZESOLVER_ADAPTER_INSTANCE
+
+
+def _close_zesolver_adapter():
+    """Close and invalidate the process-scoped ZeSolverAdapter (if any).
+
+    Idempotent and safe to call at run boundaries; a later solve transparently
+    recreates a fresh runtime/session.  Never raises.
+    """
+    global _ZESOLVER_ADAPTER_INSTANCE, _ZESOLVER_ADAPTER_FINGERPRINT
+    instance = None
+    with _ZESOLVER_ADAPTER_LOCK:
+        instance = _ZESOLVER_ADAPTER_INSTANCE
+        _ZESOLVER_ADAPTER_INSTANCE = None
+        _ZESOLVER_ADAPTER_FINGERPRINT = None
+    if instance is not None:
+        try:
+            instance.close()
+        except Exception:  # pragma: no cover - close must never raise
+            logger.debug("ZeSolver adapter close failed", exc_info=True)
+
+
+def _close_zesolver_on_run_exit(fn):
+    """Decorate a run entrypoint to close its ZeSolver runtime on exit.
+
+    Guarantees a :class:`~zemosaic.zesolver_adapter.ZeSolverAdapter` created
+    during a batch is closed on success, failure or cancellation, so a
+    long-lived process (e.g. a GUI hosting several batches) never leaks a
+    SolverRuntime between runs.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _close_zesolver_adapter()
+
+    return wrapper
+
+
+def _solve_through_solver_port(
+    *,
+    solver_choice_effective,
+    image_fits_path,
+    fits_header,
+    settings,
+    progress_callback,
+    log,
+    astap_exe_path,
+    astap_data_dir,
+    astap_search_radius,
+    astap_downsample,
+    astap_sensitivity,
+    astap_timeout_seconds,
+    astap_drizzled_fallback_enabled,
+):
+    """Route the Phase 1 WCS solve through the internal SolverPort boundary.
+
+    Legacy choices preserve the exact pre-port dispatch semantics; ``ZESOLVER``
+    is optional and only attempted after a successful lazy discovery.
+    """
+    choice = (solver_choice_effective or "ASTAP").upper().strip() or "ASTAP"
+    filename = _safe_basename(image_fits_path)
+
+    if choice == SOLVER_CHOICE_ZESOLVER:
+        if not _ZESOLVER_ADAPTER_AVAILABLE:
+            log(
+                "getwcs_warn_no_wcs_source_available_or_failed",
+                lvl="WARN",
+                filename=filename,
+            )
+            return SolverOutcome(
+                status=SolveStatus.UNAVAILABLE,
+                message="zesolver adapter unavailable",
+                backend_used="zesolver",
+            )
+        discovery = _zesolver_adapter.discover_zesolver()
+        if discovery.state.value != "available":
+            log(
+                "getwcs_warn_no_wcs_source_available_or_failed",
+                lvl="WARN",
+                filename=filename,
+                error=discovery.message or discovery.state.value,
+            )
+            return SolverOutcome(
+                status=SolveStatus.UNAVAILABLE,
+                failure_code=discovery.state.value,
+                message=discovery.message,
+                backend_used="zesolver",
+            )
+        adapter = _get_zesolver_adapter(settings)
+        log("GetWCS: using ZESOLVER", lvl="DEBUG")
+        return adapter.solve(
+            image_fits_path=image_fits_path,
+            fits_header=fits_header,
+            settings=settings,
+            progress_callback=progress_callback,
+            log=log,
+        )
+
+    # Legacy choices (ASTAP / ASTROMETRY / ANSVR / NONE).
+    if not (ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry):
+        log(
+            "getwcs_warn_no_wcs_source_available_or_failed",
+            lvl="WARN",
+            filename=filename,
+        )
+        return SolverOutcome(
+            status=SolveStatus.UNAVAILABLE,
+            message="astrometry module unavailable",
+            backend_used="astap",
+        )
+
+    adapter = _get_legacy_solver_adapter()
+    return adapter.solve(
+        solver_choice=choice,
+        image_fits_path=image_fits_path,
+        fits_header=fits_header,
+        settings=settings,
+        progress_callback=progress_callback,
+        astap_exe_path=astap_exe_path,
+        astap_data_dir=astap_data_dir,
+        astap_search_radius=astap_search_radius,
+        astap_downsample=astap_downsample,
+        astap_sensitivity=astap_sensitivity,
+        astap_timeout_seconds=astap_timeout_seconds,
+        astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
+        log=log,
+    )
 
 
 # Note: Ancienne fonction _prepare_image_for_astap supprimée. Les images sont
@@ -14876,96 +15128,38 @@ def get_wcs_and_pretreat_raw_file(
                 wcs_brute = None
             
     solver_choice_effective = (solver_settings or {}).get("solver_choice", "ASTAP")
-    api_key_len = len((solver_settings or {}).get("api_key", ""))
     _pcb_local(
         f"Solver choice effective={solver_choice_effective}",
         lvl="DEBUG_DETAIL",
     )
-    if wcs_brute is None and ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry:
+    if wcs_brute is None:
         try:
-            # Utiliser directement le fichier original sans conversion mono ni FITS minimal
-            input_for_solver = file_path
-
-            if solver_choice_effective == "ASTROMETRY":
-                _pcb_local("GetWCS: using ASTROMETRY", lvl="DEBUG")
-                wcs_brute = solve_with_astrometry(
-                    input_for_solver,
-                    header_orig,
-                    solver_settings or {},
-                    progress_callback,
-                )
-                if not wcs_brute and astap_paths_valid(astap_exe_path, astap_data_dir):
-                    _pcb_local("Astrometry failed; fallback to ASTAP", lvl="INFO")
-                    _pcb_local("GetWCS: using ASTAP (fallback)", lvl="DEBUG")
-                    wcs_brute = zemosaic_astrometry.solve_with_astap(
-                        image_fits_path=input_for_solver,
-                        original_fits_header=header_orig,
-                        astap_exe_path=astap_exe_path,
-                        astap_data_dir=astap_data_dir,
-                        search_radius_deg=astap_search_radius,
-                        downsample_factor=astap_downsample,
-                        sensitivity=astap_sensitivity,
-                        astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
-                        timeout_sec=astap_timeout_seconds,
-                        update_original_header_in_place=True,
-                        progress_callback=progress_callback,
-                    )
-                # Si un solver a réussi, le header_orig a potentiellement été mis à jour
-                if wcs_brute:
-                    should_write_header_back = True
-                if wcs_brute:
-                    _pcb_local("getwcs_info_astrometry_solved", lvl="INFO_DETAIL", filename=filename)
-            elif solver_choice_effective == "ANSVR":
-                _pcb_local("GetWCS: using ANSVR", lvl="DEBUG")
-                wcs_brute = solve_with_ansvr(
-                    input_for_solver,
-                    header_orig,
-                    solver_settings or {},
-                    progress_callback,
-                )
-                if not wcs_brute and astap_paths_valid(astap_exe_path, astap_data_dir):
-                    _pcb_local("Ansvr failed; fallback to ASTAP", lvl="INFO")
-                    _pcb_local("GetWCS: using ASTAP (fallback)", lvl="DEBUG")
-                    wcs_brute = zemosaic_astrometry.solve_with_astap(
-                        image_fits_path=input_for_solver,
-                        original_fits_header=header_orig,
-                        astap_exe_path=astap_exe_path,
-                        astap_data_dir=astap_data_dir,
-                        search_radius_deg=astap_search_radius,
-                        downsample_factor=astap_downsample,
-                        sensitivity=astap_sensitivity,
-                        astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
-                        timeout_sec=astap_timeout_seconds,
-                        update_original_header_in_place=True,
-                        progress_callback=progress_callback,
-                    )
-                # Si ANSVR/ASTAP réussit, le header a été mis à jour par le solver
-                if wcs_brute:
-                    should_write_header_back = True
-                if wcs_brute:
-                    _pcb_local("getwcs_info_astrometry_solved", lvl="INFO_DETAIL", filename=filename)
-            else:
-                _pcb_local("GetWCS: using ASTAP", lvl="DEBUG")
-                wcs_brute = zemosaic_astrometry.solve_with_astap(
-                    image_fits_path=input_for_solver,
-                    original_fits_header=header_orig,
-                    astap_exe_path=astap_exe_path,
-                    astap_data_dir=astap_data_dir,
-                    search_radius_deg=astap_search_radius,
-                    downsample_factor=astap_downsample,
-                    sensitivity=astap_sensitivity,
-                    astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
-                    timeout_sec=astap_timeout_seconds,
-                    update_original_header_in_place=True,
-                    progress_callback=progress_callback,
-                )
-                # ASTAP a potentiellement mis à jour le header_orig
-                if wcs_brute:
-                    should_write_header_back = True
-                if wcs_brute:
-                    _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
-                else:
-                    _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename)
+            # Route the Phase 1 WCS solve through the internal SolverPort
+            # boundary (legacy adapters preserve the exact pre-port semantics;
+            # ZeSolver is optional and lazily discovered).
+            outcome = _solve_through_solver_port(
+                solver_choice_effective=solver_choice_effective,
+                image_fits_path=file_path,
+                fits_header=header_orig,
+                settings=solver_settings or {},
+                progress_callback=progress_callback,
+                log=_pcb_local,
+                astap_exe_path=astap_exe_path,
+                astap_data_dir=astap_data_dir,
+                astap_search_radius=astap_search_radius,
+                astap_downsample=astap_downsample,
+                astap_sensitivity=astap_sensitivity,
+                astap_timeout_seconds=astap_timeout_seconds,
+                astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
+            )
+            if outcome.wcs is not None:
+                wcs_brute = outcome.wcs
+                should_write_header_back = outcome.should_write_header_back
+                if outcome.header is not None:
+                    header_orig = outcome.header
+            # Progress messages (solved / failed / fallback / unavailable) are
+            # emitted inside the adapters using the same message keys as before
+            # to keep GUI/localization output stable.
         except Exception as e_solver_call:
             _pcb_local("getwcs_error_astap_exception", lvl="ERROR", filename=filename, error=str(e_solver_call))
             logger.error(f"Erreur solver pour {filename}", exc_info=True)
@@ -14973,9 +15167,6 @@ def get_wcs_and_pretreat_raw_file(
         finally:
             del img_data_raw_adu
             gc.collect()
-    elif wcs_brute is None: # Ni header, ni ASTAP n'a fonctionné ou n'était dispo
-        _pcb_local("getwcs_warn_no_wcs_source_available_or_failed", lvl="WARN", filename=filename)
-        # Action de déplacement sera gérée par le check suivant
 
     # --- Vérification finale du WCS et action de déplacement si échec ---
     if wcs_brute and wcs_brute.is_celestial:
@@ -22871,6 +23062,7 @@ def prepare_tiles_and_calc_grid(
 
 
 
+@_close_zesolver_on_run_exit
 def run_hierarchical_mosaic_classic_legacy(
     input_folder: str,
     output_folder: str,
@@ -30177,6 +30369,7 @@ def run_hierarchical_mosaic_classic_legacy(
 ####
 
 
+@_close_zesolver_on_run_exit
 def run_hierarchical_mosaic(
     input_folder: str,
     output_folder: str,
