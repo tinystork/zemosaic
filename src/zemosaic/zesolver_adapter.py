@@ -24,10 +24,12 @@ from typing import Any
 
 from .solver_port import (
     DiscoveryState,
+    REQUIRED_ZESOLVER_CAPABILITIES,
     SOLVER_CHOICE_ZESOLVER,
     SolverDiscovery,
     SolverOutcome,
     SolveStatus,
+    ZESOLVER_SOLVE_BACKEND_CAPABILITIES,
     _basename,
 )
 
@@ -35,6 +37,16 @@ logger = logging.getLogger("zemosaic.zesolver_adapter")
 
 _ZESOLVER_API_MODULE = "zesolver.api.v1"
 _ZESOLVER_SUPPORTED_API_MAJOR = 1
+
+# Progress phase -> ZeMosaic progress message key (real phases only, no invented
+# percentage and no ETA).  The value is emitted verbatim as a DEBUG_DETAIL
+# progress line through the ZeMosaic progress callback.
+_PROGRESS_PHASE_KEYS = {
+    "preparing": "GetWCS: ZESOLVER preparing",
+    "solving": "GetWCS: ZESOLVER solving",
+    "writing": "GetWCS: ZESOLVER writing WCS",
+    "finalizing": "GetWCS: ZESOLVER finalizing",
+}
 
 # Options that map directly onto public SolveHints fields (all optional).
 _HINTS_KEY_MAP = (
@@ -57,20 +69,53 @@ def _parse_major(version: Any) -> int | None:
         return None
 
 
+def _is_zesolver_module_absent(exc: BaseException) -> bool:
+    """Return True when ``exc`` means the ZeSolver public module itself is absent.
+
+    A :class:`ModuleNotFoundError` whose ``name`` is the public ``zesolver`` /
+    ``zesolver.api`` / ``zesolver.api.v1`` chain means "not installed".  A
+    ``ModuleNotFoundError`` naming any *other* module means the public module was
+    found but one of its internal imports failed, i.e. "installed but broken".
+    """
+    name = getattr(exc, "name", None)
+    if not isinstance(name, str) or not name:
+        return False
+    return name == "zesolver" or name.startswith("zesolver.api")
+
+
 def discover_zesolver() -> SolverDiscovery:
     """Lazily discover and health-check the installed ZeSolver public API v1.
 
     Compatibility is based exclusively on the public ``API_VERSION`` /
-    ``API_MAJOR`` (major == 1), never on Git branch or product version.  The
-    health check is intentionally cheap: ``probe`` is called without catalog
-    scan, without GPU/CuPy import and without network access.
+    ``API_MAJOR`` (major == 1) plus the declared/negotiated capabilities, never
+    on Git branch or product version.  The health check is intentionally cheap:
+    ``probe`` is called without catalog scan, without GPU/CuPy import and
+    without network access.
+
+    The state distinguishes "not installed" from "installed but broken": a
+    genuinely absent public module reports :data:`DiscoveryState.NOT_INSTALLED`,
+    while a present-but-failing import/probe reports
+    :data:`DiscoveryState.UNHEALTHY` (never a corrupted ZeSolver masquerading as
+    "not installed").
     """
     try:
         v1 = importlib.import_module(_ZESOLVER_API_MODULE)
-    except Exception as exc:  # pragma: no cover - exercised via fake modules
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via fake modules
+        if _is_zesolver_module_absent(exc):
+            return SolverDiscovery(
+                state=DiscoveryState.NOT_INSTALLED,
+                message=f"{type(exc).__name__}: {exc}",
+            )
+        # Public module found but one of its internal imports failed.
         return SolverDiscovery(
-            state=DiscoveryState.NOT_INSTALLED,
-            message=f"{type(exc).__name__}: {exc}",
+            state=DiscoveryState.UNHEALTHY,
+            message=f"import failed: {type(exc).__name__}: {exc}",
+        )
+    except Exception as exc:  # pragma: no cover - exercised via fake modules
+        # Found but raised a non-import error while importing -> broken install.
+        return SolverDiscovery(
+            state=DiscoveryState.UNHEALTHY,
+            message=f"import failed: {type(exc).__name__}: {exc}",
         )
 
     api_version = getattr(v1, "API_VERSION", None)
@@ -79,10 +124,15 @@ def discover_zesolver() -> SolverDiscovery:
         api_major = _parse_major(api_version)
 
     product_version = None
+    declared_capabilities: tuple[str, ...] = ()
     try:
         info_fn = getattr(v1, "get_api_info", None)
         if info_fn is not None:
-            product_version = info_fn().product_version
+            info = info_fn()
+            product_version = getattr(info, "product_version", None)
+            declared = getattr(info, "supported_capabilities", None)
+            if isinstance(declared, (tuple, list)):
+                declared_capabilities = tuple(str(c) for c in declared)
     except Exception:  # pragma: no cover - defensive
         product_version = None
 
@@ -97,10 +147,42 @@ def discover_zesolver() -> SolverDiscovery:
             ),
         )
 
+    # Capability challenge against the *declared* static set.  A required
+    # capability that is missing makes the backend unusable on the v1 path.
+    declared_set = set(declared_capabilities)
+    missing_required = [
+        cap for cap in REQUIRED_ZESOLVER_CAPABILITIES if cap not in declared_set
+    ]
+    if missing_required:
+        return SolverDiscovery(
+            state=DiscoveryState.INCOMPATIBLE,
+            api_version=str(api_version),
+            product_version=product_version,
+            message=(
+                "ZeSolver is missing required capability(ies) "
+                f"{', '.join(missing_required)} (declared: "
+                f"{', '.join(declared_capabilities) or 'none'})"
+            ),
+        )
+
+    # "solve" challenge: at least one solve backend must be declared.
+    if not (declared_set & set(ZESOLVER_SOLVE_BACKEND_CAPABILITIES)):
+        return SolverDiscovery(
+            state=DiscoveryState.INCOMPATIBLE,
+            api_version=str(api_version),
+            product_version=product_version,
+            message=(
+                "ZeSolver declares no solve backend (expected at least one of "
+                f"{', '.join(ZESOLVER_SOLVE_BACKEND_CAPABILITIES)})"
+            ),
+        )
+
+    # Negotiated availability: required capabilities must not be reported
+    # UNAVAILABLE (NOT_CHECKED is tolerated — see solver_port constants).
     probe_fn = getattr(v1, "probe", None)
     if probe_fn is not None:
         try:
-            probe_fn(check_catalogs=False, check_gpu=False)
+            probe_result = probe_fn(check_catalogs=False, check_gpu=False)
         except Exception as exc:  # pragma: no cover - exercised via fake modules
             return SolverDiscovery(
                 state=DiscoveryState.UNHEALTHY,
@@ -108,6 +190,22 @@ def discover_zesolver() -> SolverDiscovery:
                 product_version=product_version,
                 message=f"probe failed: {type(exc).__name__}: {exc}",
             )
+        negotiated = {}
+        for cap_state in getattr(probe_result, "capabilities", ()) or ():
+            cap_id = getattr(cap_state, "id", None)
+            availability = getattr(cap_state, "availability", None)
+            if cap_id is not None:
+                negotiated[str(cap_id)] = getattr(availability, "value", availability)
+        for cap in REQUIRED_ZESOLVER_CAPABILITIES:
+            if negotiated.get(cap) == "unavailable":
+                return SolverDiscovery(
+                    state=DiscoveryState.UNHEALTHY,
+                    api_version=str(api_version),
+                    product_version=product_version,
+                    message=(
+                        f"required capability {cap!r} reported unavailable"
+                    ),
+                )
 
     return SolverDiscovery(
         state=DiscoveryState.AVAILABLE,
@@ -144,6 +242,8 @@ class ZeSolverAdapter:
         self._sessions = threading.local()
         self._session_registry = set()
         self._session_registry_lock = threading.Lock()
+        self._active_tokens = set()
+        self._active_tokens_lock = threading.Lock()
 
     # -- public ------------------------------------------------------------
 
@@ -168,7 +268,14 @@ class ZeSolverAdapter:
             v1 = self._import_api()
             request = self._build_request(v1, image_fits_path, settings or {})
             cancellation = v1.CancellationToken()
-            result = self._session().solve(request, cancellation=cancellation)
+            progress = self._make_progress_forwarder(progress_callback)
+            self._register_active_token(cancellation)
+            try:
+                result = self._session().solve(
+                    request, cancellation=cancellation, progress=progress
+                )
+            finally:
+                self._unregister_active_token(cancellation)
             return self._convert_result(v1, result, fits_header, filename)
         except Exception as exc:  # noqa: BLE001 - fail this file, never the import
             if log is not None:
@@ -205,6 +312,12 @@ class ZeSolverAdapter:
         except Exception:  # pragma: no cover - defensive
             pass
 
+        # Cancel and clear any in-flight tokens (cleanup must cover cancellation
+        # and run-abort paths, not just the happy path).
+        self.cancel_active_solve()
+        with self._active_tokens_lock:
+            self._active_tokens.clear()
+
         sessions_to_close = []
         with self._session_registry_lock:
             sessions_to_close = list(self._session_registry)
@@ -230,10 +343,67 @@ class ZeSolverAdapter:
             except Exception:  # pragma: no cover - close must never raise
                 logger.debug("ZeSolver runtime close failed", exc_info=True)
 
+    def cancel_active_solve(self) -> None:
+        """Cooperatively cancel any in-flight ZeSolver solve(s).
+
+        Thread-safe and idempotent: it cancels every active token tracked by
+        this adapter (one per worker thread with an in-flight solve) and never
+        raises.  The process-level cleanup (run-exit close / subprocess kill)
+        remains the safety net; this is the first, cooperative cancellation
+        level exposed to the worker.
+        """
+        with self._active_tokens_lock:
+            tokens = list(self._active_tokens)
+        for token in tokens:
+            try:
+                cancel = getattr(token, "cancel", None)
+                if callable(cancel):
+                    cancel()
+            except Exception:  # pragma: no cover - cancel must never raise
+                logger.debug("ZeSolver token cancel failed", exc_info=True)
+
     # -- internal ----------------------------------------------------------
 
     def _import_api(self):
         return importlib.import_module(_ZESOLVER_API_MODULE)
+
+    def _register_active_token(self, token) -> None:
+        with self._active_tokens_lock:
+            self._active_tokens.add(token)
+
+    def _unregister_active_token(self, token) -> None:
+        with self._active_tokens_lock:
+            self._active_tokens.discard(token)
+
+    def _make_progress_forwarder(self, progress_callback):
+        """Build a ZeSolver progress callback mapping real phases to ZeMosaic.
+
+        ZeSolver calls ``progress(ProgressEvent(phase=..., message=...))``.  We
+        forward the *real* phase (PREPARING / SOLVING / WRITING / FINALIZING) to
+        the ZeMosaic progress callback using its ``(key, prog, lvl, **kwargs)``
+        shape — no invented percentage (``prog=None``) and no ETA.
+        """
+        if progress_callback is None:
+            return None
+
+        def forward(event) -> None:
+            phase = getattr(event, "phase", None)
+            phase_value = getattr(phase, "value", None)
+            if phase_value is None:
+                phase_value = str(phase)
+            message = getattr(event, "message", None)
+            key = _PROGRESS_PHASE_KEYS.get(
+                phase_value, "GetWCS: ZESOLVER progress"
+            )
+            kwargs = {"phase": phase_value}
+            if message:
+                kwargs["detail"] = str(message)
+            try:
+                progress_callback(key, None, "DEBUG_DETAIL", **kwargs)
+            except Exception:  # pragma: no cover - progress must never raise
+                pass
+
+        return forward
 
     def _ensure_runtime(self):
         if self._runtime is not None:
@@ -278,6 +448,15 @@ class ZeSolverAdapter:
             # Network is always disabled (v1 default and ZeMosaic policy).
             "network_policy": v1.NetworkPolicy.DISABLED,
         }
+        # ZeMosaic decides whether to enter the solve (worker's
+        # ``force_resolve_existing_wcs``, settings key of the same name).  Map
+        # that decision onto ZeSolver's ``overwrite_existing_wcs`` so a forced
+        # resolve actually re-solves instead of returning SKIPPED_EXISTING_WCS.
+        # We never add a skip here: the worker's existing validation is the only
+        # place that decides to skip.
+        options_kwargs["overwrite_existing_wcs"] = bool(
+            settings.get("force_resolve_existing_wcs")
+        )
         backend_policy = settings.get("zesolver_backend_policy")
         if backend_policy:
             try:
@@ -313,7 +492,9 @@ class ZeSolverAdapter:
                 status=SolveStatus.SOLVED,
                 wcs=wcs,
                 header=merged_header,
-                should_write_header_back=True,
+                # ZeSolver (WritePolicy.OVERWRITE_INPUT) already wrote the WCS
+                # into the FITS; ZeMosaic must not write it a second time.
+                should_write_header_back=False,
                 backend_used=self.name,
             )
 
@@ -328,16 +509,36 @@ class ZeSolverAdapter:
 
         if result.status == v1.SolveStatus.CANCELLED:
             return SolverOutcome(
-                status=SolveStatus.FAILED,
+                status=SolveStatus.CANCELLED,
                 failure_code="cancelled",
                 message=result.message,
                 backend_used=self.name,
             )
 
-        # SKIPPED_EXISTING_WCS (or any other non-solved status): no new WCS.
+        # SKIPPED_EXISTING_WCS means ZeSolver found an existing valid WCS it did
+        # not overwrite.  The worker only reaches the adapter after deciding to
+        # resolve (absent/invalid/forced WCS), so a skip here would be a silent
+        # "unresolved" for a file ZeMosaic already rejected.  Surface it as an
+        # explicit failure instead of a false SKIPPED.
+        if result.status == v1.SolveStatus.SKIPPED_EXISTING_WCS:
+            return SolverOutcome(
+                status=SolveStatus.FAILED,
+                failure_code="existing_wcs_not_overwritten",
+                message=(
+                    result.message
+                    or "existing valid WCS present and overwrite not requested"
+                ),
+                backend_used=self.name,
+            )
+
+        # Any other unrecognised non-solved status: fail explicitly, never skip.
         return SolverOutcome(
-            status=SolveStatus.SKIPPED,
-            message=result.message,
+            status=SolveStatus.FAILED,
+            failure_code="unexpected_status",
+            message=(
+                f"unexpected solve status "
+                f"{getattr(result.status, 'value', result.status)}"
+            ),
             backend_used=self.name,
         )
 
@@ -375,8 +576,11 @@ class ZeSolverAdapter:
     @staticmethod
     def _resolve_network_policy(value, v1):
         text = str(value).strip().lower()
-        mapping = {
-            "disabled": v1.NetworkPolicy.DISABLED,
-            "allowed": v1.NetworkPolicy.ALLOWED,
-        }
-        return mapping[text]
+        # API 1.0 is strictly local-only: ``NetworkPolicy`` exposes no member
+        # other than ``DISABLED``.  There is no "allowed" policy in the public
+        # v1 contract, so any value other than "disabled" is a caller error.
+        if text != "disabled":
+            raise ValueError(
+                f"network_policy must be 'disabled' (API v1 is local-only), got {value!r}"
+            )
+        return v1.NetworkPolicy.DISABLED

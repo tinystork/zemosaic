@@ -54,6 +54,7 @@ class SolveStatus(str, Enum):
     SOLVED = "solved"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
     UNAVAILABLE = "unavailable"
 
 
@@ -100,6 +101,43 @@ class SolverDiscovery:
     api_version: str | None = None
     product_version: str | None = None
     message: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# ZeSolver capability negotiation.
+#
+# ZeSolver exposes two capability signals through its public v1 API:
+#   * ``get_api_info().supported_capabilities`` — the *static, declared* set of
+#     capability IDs the installed API implementation supports (never changes
+#     at runtime, cheap, no I/O); and
+#   * ``probe(...).capabilities`` — the *negotiated* per-capability availability
+#     (AVAILABLE / UNAVAILABLE / NOT_CHECKED).
+#
+# The adapter challenges only the IDs ZeSolver actually publishes through its
+# public ``supported_capabilities`` metadata (near_solve, blind_solve,
+# wcs_write, gpu, cancel).  There is no literal ``"solve"`` ID — the "can this
+# API solve at all" requirement is expressed as "at least one solve backend
+# (near_solve or blind_solve) is declared".
+# ---------------------------------------------------------------------------
+
+# Hard requirement for the v1 adapter path.  ZeSolver's default write policy is
+# ``WritePolicy.OVERWRITE_INPUT`` (it writes the solved WCS back into the input
+# FITS itself) and the adapter consumes the returned canonical header.  Without
+# ``wcs_write`` the adapter cannot consume a solved result, so a ZeSolver that
+# does not declare ``wcs_write`` is reported unavailable/incompatible.
+REQUIRED_ZESOLVER_CAPABILITIES: tuple[str, ...] = ("wcs_write",)
+
+# At least one of these solve-backend IDs must be declared.  Their *runtime*
+# availability (catalog presence) is intentionally NOT a discovery blocker: the
+# cheap probe reports them NOT_CHECKED and the real availability is negotiated
+# lazily at solve time (ZeSolver returns MISSING_RESOURCE / BACKEND_UNAVAILABLE
+# then).  Declared support is all discovery needs to establish.
+ZESOLVER_SOLVE_BACKEND_CAPABILITIES: tuple[str, ...] = ("near_solve", "blind_solve")
+
+# Optional capabilities: their absence (or runtime unavailability) never blocks
+# the adapter.  ``cancel`` enables cooperative cancellation (best-effort);
+# ``gpu`` enables GPU-accelerated solving (policy-dependent).
+OPTIONAL_ZESOLVER_CAPABILITIES: tuple[str, ...] = ("cancel", "gpu")
 
 
 # ---------------------------------------------------------------------------

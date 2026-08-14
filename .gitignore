@@ -195,3 +195,7 @@ example/
 # === ZeMosaic: outils locaux non versionnés ===
 #tools/
 agents/
+
+# === ZeMosaic: bundles de review de l'agent ===
+# (répertoire de travail standard de review, jamais versionné)
+/AGENT/

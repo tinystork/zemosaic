@@ -14062,9 +14062,21 @@ _ZESOLVER_ADAPTER_INSTANCE = None
 _ZESOLVER_ADAPTER_FINGERPRINT = None
 _ZESOLVER_ADAPTER_LOCK = threading.Lock()
 
+# Lazy discovery cache.  ``discover_zesolver()`` is cheap but must not be run
+# once per image on thousands of images.  It is cached once per adapter/run
+# lifecycle and invalidated only on a new adapter (fingerprint change), a new
+# run (``_close_zesolver_adapter``), or an explicit close/reset — never per
+# image.  Discovery does not depend on per-image settings.
+_ZESOLVER_DISCOVERY_CACHE = None
+_ZESOLVER_DISCOVERY_CACHE_LOCK = threading.Lock()
+
 # Runtime/session-affecting settings that must invalidate a cached adapter when
 # they change. ``zesolver_backend_policy`` is per-solve today but is included
 # conservatively so no ZeSolver setting is ever silently reused across runs.
+# Only settings that actually change the ZeSolver *runtime/session* shape are
+# fingerprinted (never per-image values such as RA/Dec hints, timeout or WCS
+# force-resolve flags): a new fingerprint means "rebuild the adapter/runtime",
+# which is a heavyweight, run-scoped operation.
 _ZESOLVER_FINGERPRINT_KEYS = (
     "zesolver_resources_path",
     "zesolver_gpu_policy",
@@ -14140,6 +14152,9 @@ def _get_zesolver_adapter(settings):
                 _ZESOLVER_ADAPTER_INSTANCE.close()
             except Exception:  # pragma: no cover - close must never raise
                 logger.debug("ZeSolver adapter close failed", exc_info=True)
+        # A new adapter (fingerprint change) invalidates the discovery cache so
+        # a reconfiguration re-discovers instead of reusing a stale probe.
+        _invalidate_zesolver_discovery_cache()
         s = settings or {}
         _ZESOLVER_ADAPTER_INSTANCE = _zesolver_adapter.ZeSolverAdapter(
             resources_path=s.get("zesolver_resources_path") or None,
@@ -14147,6 +14162,24 @@ def _get_zesolver_adapter(settings):
         )
         _ZESOLVER_ADAPTER_FINGERPRINT = fingerprint
     return _ZESOLVER_ADAPTER_INSTANCE
+
+
+def _invalidate_zesolver_discovery_cache():
+    """Invalidate the cached ZeSolver discovery result (new adapter/run)."""
+    global _ZESOLVER_DISCOVERY_CACHE
+    with _ZESOLVER_DISCOVERY_CACHE_LOCK:
+        _ZESOLVER_DISCOVERY_CACHE = None
+
+
+def _get_zesolver_discovery():
+    """Return the lazily-discovered ZeSolver state (cached per adapter/run)."""
+    global _ZESOLVER_DISCOVERY_CACHE
+    if _ZESOLVER_DISCOVERY_CACHE is not None:
+        return _ZESOLVER_DISCOVERY_CACHE
+    with _ZESOLVER_DISCOVERY_CACHE_LOCK:
+        if _ZESOLVER_DISCOVERY_CACHE is None:
+            _ZESOLVER_DISCOVERY_CACHE = _zesolver_adapter.discover_zesolver()
+        return _ZESOLVER_DISCOVERY_CACHE
 
 
 def _close_zesolver_adapter():
@@ -14161,11 +14194,32 @@ def _close_zesolver_adapter():
         instance = _ZESOLVER_ADAPTER_INSTANCE
         _ZESOLVER_ADAPTER_INSTANCE = None
         _ZESOLVER_ADAPTER_FINGERPRINT = None
+    _invalidate_zesolver_discovery_cache()
     if instance is not None:
         try:
             instance.close()
         except Exception:  # pragma: no cover - close must never raise
             logger.debug("ZeSolver adapter close failed", exc_info=True)
+
+
+def cancel_active_zesolver_solves():
+    """Cooperatively cancel any in-flight ZeSolver solve (first cancellation level).
+
+    Best-effort and never raises: it forwards to the cached adapter's
+    ``cancel_active_solve``.  The process-level cleanup (run-exit close hook,
+    worker subprocess SIGTERM/SIGINT handling) remains the safety net and is not
+    replaced by this cooperative cancellation.
+    """
+    instance = None
+    with _ZESOLVER_ADAPTER_LOCK:
+        instance = _ZESOLVER_ADAPTER_INSTANCE
+    if instance is not None:
+        try:
+            cancel = getattr(instance, "cancel_active_solve", None)
+            if callable(cancel):
+                cancel()
+        except Exception:  # pragma: no cover - cancel must never raise
+            logger.debug("ZeSolver active-solve cancel failed", exc_info=True)
 
 
 def _close_zesolver_on_run_exit(fn):
@@ -14223,7 +14277,7 @@ def _solve_through_solver_port(
                 message="zesolver adapter unavailable",
                 backend_used="zesolver",
             )
-        discovery = _zesolver_adapter.discover_zesolver()
+        discovery = _get_zesolver_discovery()
         if discovery.state.value != "available":
             log(
                 "getwcs_warn_no_wcs_source_available_or_failed",
@@ -36020,6 +36074,7 @@ def run_hierarchical_mosaic_process(
         nonlocal graceful_stop_requested
         graceful_stop_requested = True
         _ctx_update(operation="signal_stop", phase="run_hierarchical_mosaic", signal=int(signum))
+        cancel_active_zesolver_solves()
         raise KeyboardInterrupt(f"signal {signum}")
 
     try:

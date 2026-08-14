@@ -62,6 +62,17 @@ class _FakeFailureCode(enum.Enum):
     MISSING_RESOURCE = "missing_resource"
 
 
+class _FakeCancellationToken:
+    def __init__(self):
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def is_cancelled(self):
+        return self._cancelled
+
+
 def _install_package_stubs(monkeypatch, v1: types.ModuleType) -> None:
     pkg = types.ModuleType("zesolver")
     pkg.__path__ = []
@@ -72,14 +83,24 @@ def _install_package_stubs(monkeypatch, v1: types.ModuleType) -> None:
     monkeypatch.setitem(sys.modules, "zesolver.api.v1", v1)
 
 
-def _make_v1(*, api_version="1.0", api_major=1, probe=None, product_version="1.2.3"):
+def _make_v1(
+    *,
+    api_version="1.0",
+    api_major=1,
+    probe=None,
+    product_version="1.2.3",
+    supported_capabilities=("near_solve", "blind_solve", "wcs_write", "gpu", "cancel"),
+):
     v1 = types.ModuleType("zesolver.api.v1")
     v1.API_VERSION = api_version
     v1.API_MAJOR = api_major
     v1.probe = probe if probe is not None else (lambda **kw: None)
 
     def get_api_info():
-        return types.SimpleNamespace(product_version=product_version)
+        return types.SimpleNamespace(
+            product_version=product_version,
+            supported_capabilities=supported_capabilities,
+        )
 
     v1.get_api_info = get_api_info
     return v1
@@ -187,9 +208,10 @@ def _make_full_v1():
             self.message = message
 
     class FakeSession:
-        def solve(self, request, cancellation=None):
+        def solve(self, request, cancellation=None, progress=None):
             rec.solve_calls += 1
             rec.last_cancellation = cancellation
+            rec.last_progress = progress
             if rec.solve_exc is not None:
                 raise rec.solve_exc
             return rec.result
@@ -227,7 +249,7 @@ def _make_full_v1():
     v1.NetworkPolicy = _FakeNetworkPolicy
     v1.GpuPolicy = _FakeGpuPolicy
     v1.BackendPolicy = _FakeBackendPolicy
-    v1.CancellationToken = types.SimpleNamespace
+    v1.CancellationToken = _FakeCancellationToken
     v1.create_solver_runtime = create_solver_runtime
     v1.FakeRuntime = FakeRuntime
     return v1, rec
@@ -257,7 +279,8 @@ def test_adapter_maps_request_and_converts_solved_result(monkeypatch):
     assert outcome.status is SolveStatus.SOLVED
     assert outcome.wcs == "FAKE_WCS"
     assert outcome.header == {"NAXIS1": 100, "CRVAL1": 10.0}
-    assert outcome.should_write_header_back is True
+    # ZeSolver (OVERWRITE_INPUT) already wrote the WCS -> no second write.
+    assert outcome.should_write_header_back is False
     assert outcome.backend_used == "ZESOLVER"
 
 
