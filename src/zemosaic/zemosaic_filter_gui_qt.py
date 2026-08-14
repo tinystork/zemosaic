@@ -55,6 +55,8 @@ import datetime
 import logging
 import importlib.util
 import os
+import platform
+import tempfile
 from os import path as ospath
 from pathlib import Path
 import math
@@ -69,7 +71,8 @@ import numpy as np
 
 import numpy as np
 
-from core.path_helpers import casefold_path
+from .core.path_helpers import casefold_path
+from ._resources import resource_path_optional
 
 
 _pyside_spec = importlib.util.find_spec("PySide6")
@@ -121,11 +124,59 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
 )
 
 
+def _filter_log_dir() -> Path:
+    """Return a writable per-user log directory for the filter UI.
+
+    Mirrors the platform layout used by ``zemosaic_utils.get_user_config_dir``
+    but keeps a ``logs`` subdirectory so filter logs never land inside
+    ``site-packages`` when the package is installed.
+    """
+
+    try:
+        home = Path.home()
+    except Exception:
+        home = Path(os.environ.get("TMPDIR", "/tmp"))
+
+    system = platform.system().lower()
+    candidates: list[Path] = []
+    if system == "windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "ZeMosaic" / "logs")
+        candidates.append(home / "AppData" / "Roaming" / "ZeMosaic" / "logs")
+    elif system == "darwin":
+        candidates.append(home / "Library" / "Application Support" / "ZeMosaic" / "logs")
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        if xdg:
+            candidates.append(Path(xdg) / "ZeMosaic" / "logs")
+        candidates.append(home / ".config" / "ZeMosaic" / "logs")
+    candidates.append(home / "ZeMosaic" / "logs")
+    try:
+        candidates.append(Path(tempfile.gettempdir()) / "ZeMosaic" / "logs")
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+    return Path(tempfile.gettempdir())
+
+
+def _filter_log_path() -> Path:
+    """Return the filter log file path (outside the installed package)."""
+
+    return _filter_log_dir() / "zemosaic_filter.log"
+
+
 def _reset_filter_log() -> None:
     """Supprime le log du filtre au chargement pour repartir d'un fichier propre."""
 
     try:
-        log_path = Path(__file__).with_name("zemosaic_filter.log")
+        log_path = _filter_log_path()
         if log_path.exists():
             log_path.unlink()
     except Exception:
@@ -145,7 +196,7 @@ def _ensure_filter_file_logger() -> None:
     - Do not crash UI startup if logging setup fails.
     """
     try:
-        log_path = Path(__file__).with_name("zemosaic_filter.log")
+        log_path = _filter_log_path()
         target_path = log_path.resolve()
 
         root_logger = logging.getLogger()  # root
@@ -247,20 +298,19 @@ def _path_is_dir(value: Any) -> bool:
 
 
 def _load_zemosaic_qicon() -> QIcon | None:
-    try:
-        icon_dir = get_app_base_dir() / "icon"
-    except Exception:
-        return None
+    icon_names = (
+        "zemosaic.ico",
+        "zemosaic_64x64.png",
+        "zemosaic_icon.png",
+        "zemosaic.png",
+    )
 
-    candidates = [
-        icon_dir / "zemosaic.ico",
-        icon_dir / "zemosaic_64x64.png",
-        icon_dir / "zemosaic_icon.png",
-        icon_dir / "zemosaic.png",
-    ]
-
-    for path in candidates:
+    # 1. Bundled package resource (install-safe).
+    for name in icon_names:
         try:
+            path = resource_path_optional("icon", name)
+            if path is None:
+                continue
             if not path.is_file():
                 continue
             icon = QIcon(str(path))
@@ -269,7 +319,24 @@ def _load_zemosaic_qicon() -> QIcon | None:
         except Exception:
             continue
 
-    print(f"[QtFilter] Aucune icône ZeMosaic trouvée dans {icon_dir}")
+    # 2. Legacy checkout layout (get_app_base_dir / "icon").
+    try:
+        icon_dir = get_app_base_dir() / "icon"
+    except Exception:
+        icon_dir = None
+    if icon_dir is not None:
+        for name in icon_names:
+            path = icon_dir / name
+            try:
+                if not path.is_file():
+                    continue
+                icon = QIcon(str(path))
+                if not icon.isNull():
+                    return icon
+            except Exception:
+                continue
+
+    print("[QtFilter] Aucune icône ZeMosaic trouvée.")
     return None
 
 
@@ -278,8 +345,8 @@ PREVIEW_DRAW_THROTTLE_SEC = 0.30
 PREVIEW_HARD_LIMIT = 1500
 PREVIEW_LEGEND_MAX_GROUPS = 30
 
-if importlib.util.find_spec("locales.zemosaic_localization") is not None:
-    from locales.zemosaic_localization import ZeMosaicLocalization  # type: ignore
+if importlib.util.find_spec("zemosaic.locales.zemosaic_localization") is not None:
+    from .locales.zemosaic_localization import ZeMosaicLocalization  # type: ignore
 else:  # pragma: no cover - optional dependency guard
     ZeMosaicLocalization = None  # type: ignore[assignment]
 
@@ -323,7 +390,7 @@ except Exception:  # pragma: no matplotlib optional
     Line2D = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
-    from zemosaic_astrometry import (
+    from .zemosaic_astrometry import (
         compute_astap_recommended_max_instances,
         set_astap_max_concurrent_instances,
         solve_with_astap,
@@ -334,7 +401,7 @@ except Exception:  # pragma: no cover - optional dependency guard
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
-    import zemosaic_worker as _zemosaic_worker  # type: ignore
+    from . import zemosaic_worker as _zemosaic_worker  # type: ignore
 except Exception:  # pragma: no cover - optional dependency guard
     _zemosaic_worker = None  # type: ignore[assignment]
 
@@ -348,7 +415,7 @@ else:  # pragma: no cover - helper fallback
     _COMPUTE_MAX_SEPARATION = None
 
 try:  # pragma: no cover - optional dependency guard
-    from zemosaic_filter_gui import (  # type: ignore
+    from .zemosaic_filter_gui import (  # type: ignore
         _merge_small_groups as _tk_merge_small_groups,
         _split_group_by_orientation as _tk_split_group_by_orientation,
         _circular_dispersion_deg as _tk_circular_dispersion_deg,
@@ -820,16 +887,16 @@ def _apply_borrowing_per_mount_mode(
     return combined_groups, aggregated_stats
 
 try:  # pragma: no cover - optional dependency guard
-    from zemosaic_config import DEFAULT_CONFIG as _DEFAULT_GUI_CONFIG  # type: ignore
-    from zemosaic_config import load_config as _load_gui_config  # type: ignore
-    from zemosaic_config import save_config as _save_gui_config  # type: ignore
+    from .zemosaic_config import DEFAULT_CONFIG as _DEFAULT_GUI_CONFIG  # type: ignore
+    from .zemosaic_config import load_config as _load_gui_config  # type: ignore
+    from .zemosaic_config import save_config as _save_gui_config  # type: ignore
 except Exception:  # pragma: no cover - optional dependency guard
     _DEFAULT_GUI_CONFIG = {}
     _load_gui_config = None  # type: ignore[assignment]
     _save_gui_config = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
-    from zemosaic_utils import (  # type: ignore
+    from .zemosaic_utils import (  # type: ignore
         EXCLUDED_DIRS,
         apply_borrowing_v1,
         get_app_base_dir,

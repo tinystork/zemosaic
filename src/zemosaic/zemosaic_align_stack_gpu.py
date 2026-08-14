@@ -17,7 +17,7 @@ from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 import numpy as np
 from contextlib import nullcontext
 
-from core.robust_rejection import (
+from .core.robust_rejection import (
     WSC_IMPL_LEGACY,
     WSC_IMPL_PIXINSIGHT,
     resolve_wsc_impl,
@@ -36,14 +36,14 @@ except Exception:  # pragma: no cover - GPU libraries missing on many machines
     _CUPY_AVAILABLE = False
 
 if TYPE_CHECKING:  # pragma: no cover - hints only
-    from parallel_utils import ParallelPlan
+    from .parallel_utils import ParallelPlan
 else:
     ParallelPlan = Any  # type: ignore
 
 LOGGER = logging.getLogger(__name__)
 
 try:
-    import zemosaic_align_stack as _zas  # type: ignore
+    from . import zemosaic_align_stack as _zas  # type: ignore
 
     _CPU_STACK_HELPERS_AVAILABLE = True
 except Exception:  # pragma: no cover - guards GPU path even if CPU helpers fail to import
@@ -51,7 +51,7 @@ except Exception:  # pragma: no cover - guards GPU path even if CPU helpers fail
     _CPU_STACK_HELPERS_AVAILABLE = False
 
 try:
-    from zemosaic_utils import make_radial_weight_map as _make_radial_weight_map  # type: ignore
+    from .zemosaic_utils import make_radial_weight_map as _make_radial_weight_map  # type: ignore
 
     _RADIAL_WEIGHT_AVAILABLE = True
 except Exception:  # pragma: no cover - radial weighting optional

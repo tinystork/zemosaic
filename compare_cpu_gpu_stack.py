@@ -6,15 +6,15 @@ from types import SimpleNamespace
 import numpy as np
 
 try:
-    import zemosaic_align_stack as zas
+    from zemosaic import zemosaic_align_stack as zas
 except Exception as exc:
-    print(f"Failed to import zemosaic_align_stack: {exc}")
+    print(f"Failed to import zemosaic.zemosaic_align_stack: {exc}")
     sys.exit(1)
 
 
 def _gpu_available() -> bool:
     try:
-        import zemosaic_align_stack_gpu as gpu_mod
+        from zemosaic import zemosaic_align_stack_gpu as gpu_mod
 
         return bool(getattr(gpu_mod, "_gpu_is_usable", lambda: False)())
     except Exception:

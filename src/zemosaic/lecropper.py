@@ -179,7 +179,7 @@ def _get_altaz_alpha_settings():
     }
 
     try:
-        import zemosaic_config as _zconf  # type: ignore[import]
+        from . import zemosaic_config as _zconf  # type: ignore[import]
 
         cfg = {}
         try:

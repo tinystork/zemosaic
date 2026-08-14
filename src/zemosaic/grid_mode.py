@@ -65,8 +65,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import psutil
 
-from zemosaic_resource_telemetry import ResourceTelemetryController
-from zemosaic_utils import (
+from .zemosaic_resource_telemetry import ResourceTelemetryController
+from .zemosaic_utils import (
     debayer_image,
     load_and_validate_fits,
     save_fits_image,
@@ -74,7 +74,7 @@ from zemosaic_utils import (
 )
 
 try:
-    from zemosaic_gpu_safety import probe_gpu_runtime_context  # type: ignore
+    from .zemosaic_gpu_safety import probe_gpu_runtime_context  # type: ignore
 except Exception:  # pragma: no cover - optional safety layer
     probe_gpu_runtime_context = None  # type: ignore
 
@@ -129,7 +129,7 @@ except Exception:  # pragma: no cover - GPU libraries missing
     _CUPY_AVAILABLE = False
 
 try:
-    from zemosaic_align_stack import (
+    from .zemosaic_align_stack import (
         _reject_outliers_kappa_sigma,
         _reject_outliers_winsorized_sigma_clip,
         equalize_rgb_medians_inplace,
@@ -140,7 +140,7 @@ except Exception:  # pragma: no cover - worker remains functional without reject
     equalize_rgb_medians_inplace = None
 
 try:
-    from zemosaic_stack_core import (
+    from .zemosaic_stack_core import (
         apply_tile_photometric_scaling,
         compute_tile_photometric_scaling,
         stack_core,
@@ -3984,7 +3984,7 @@ def assemble_tiles(
 
 def _load_config_from_disk() -> dict:
     try:
-        import zemosaic_config
+        from . import zemosaic_config
 
         return zemosaic_config.load_config() or {}
     except Exception:

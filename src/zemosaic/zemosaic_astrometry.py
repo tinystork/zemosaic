@@ -65,10 +65,10 @@ from typing import Any, Callable, Deque, Optional
 
 import multiprocessing
 
-from core.path_helpers import expand_to_path, safe_path_exists, safe_path_getsize
+from .core.path_helpers import expand_to_path, safe_path_exists, safe_path_getsize
 
 try:
-    from zemosaic_utils import get_runtime_temp_dir  # type: ignore
+    from .zemosaic_utils import get_runtime_temp_dir  # type: ignore
 except Exception:  # pragma: no cover - standalone usage
     def get_runtime_temp_dir() -> Path:
         root = Path(tempfile.gettempdir()) / "zemosaic_runtime"
@@ -288,7 +288,7 @@ logger = logging.getLogger("ZeMosaicAstrometry")
 
 try:
     from astropy.io import fits
-    from astropy.wcs import WCS as AstropyWCS, FITSFixedWarning 
+    from astropy.wcs import WCS as AstropyWCS, FITSFixedWarning
     from astropy.utils.exceptions import AstropyWarning
     from astropy import units as u # Nécessaire pour _update_fits_header_with_wcs_za
     ASTROPY_AVAILABLE_ASTROMETRY = True
@@ -300,7 +300,7 @@ except ImportError:
     class AstropyWCS: pass
     class FITSFixedWarning(Warning): pass
     u = None
-    
+
 try:
     # Optional import placed outside the main astropy try to avoid failing the module import
     # if coordinates submodule is unavailable. We degrade gracefully to None.
@@ -737,7 +737,7 @@ def _log_memory_usage(progress_callback: callable, context_message: str = ""):
         progress_callback(log_msg, None, "DEBUG")
     except Exception as e_mem_log:
         progress_callback(f"Erreur lors du logging mémoire ({context_message}): {e_mem_log}", None, "WARN")
-    
+
 
 
 def extract_center_from_header(original_fits_header) -> "AstropySkyCoord | None":
@@ -1221,26 +1221,26 @@ def _parse_wcs_file_content_za_v2(wcs_file_path, image_shape_hw, progress_callba
         return None
 
 
-def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header, 
-                                   wcs_object_solution: AstropyWCS, 
-                                   solver_name="ASTAP_ZeMosaic", 
+def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
+                                   wcs_object_solution: AstropyWCS,
+                                   solver_name="ASTAP_ZeMosaic",
                                    progress_callback=None):
     if not (fits_header_to_update is not None and wcs_object_solution and wcs_object_solution.is_celestial):
         if progress_callback: progress_callback("  ASTAP HeaderUpdate: MàJ header annulée: header/WCS invalide.", None, "WARN")
-        return False 
+        return False
     if progress_callback: progress_callback(f"  ASTAP HeaderUpdate: MàJ header FITS avec solution WCS de {solver_name}...", None, "DEBUG_DETAIL")
     if not ASTROPY_AVAILABLE_ASTROMETRY:
         if progress_callback: progress_callback("  ASTAP HeaderUpdate ERREUR: Astropy non disponible pour MàJ header.", None, "ERROR")
         return False
     try:
         wcs_keys_to_remove = [
-            'WCSAXES', 'CRPIX1', 'CRPIX2', 'CRVAL1', 'CRVAL2', 
+            'WCSAXES', 'CRPIX1', 'CRPIX2', 'CRVAL1', 'CRVAL2',
             'CTYPE1', 'CTYPE2', 'CUNIT1', 'CUNIT2',
             'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2',
             'PC1_1', 'PC1_2', 'PC2_1', 'PC2_2',
-            'CDELT1', 'CDELT2', 'CROTA1', 'CROTA2', 
+            'CDELT1', 'CDELT2', 'CROTA1', 'CROTA2',
             'LONPOLE', 'LATPOLE', 'EQUINOX', 'RADESYS',
-            'PV1_0', 'PV1_1', 'PV1_2', 'PV2_0', 'PV2_1', 'PV2_2' 
+            'PV1_0', 'PV1_1', 'PV1_2', 'PV2_0', 'PV2_1', 'PV2_2'
         ]
         for key_del in wcs_keys_to_remove:
             if key_del in fits_header_to_update:
@@ -1248,13 +1248,13 @@ def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
                     del fits_header_to_update[key_del]
                 except KeyError:
                     pass
-        
+
         # Correction de la coquille ici :
         new_wcs_header_cards = wcs_object_solution.to_header(relax=True) # Utiliser relax=True est plus simple et robuste
-        
+
         fits_header_to_update.update(new_wcs_header_cards)
         fits_header_to_update[f'{solver_name.upper()}_SOLVED'] = (True, f'{solver_name} solution')
-        
+
         if u is not None: # S'assurer que astropy.units est importé
             try:
                 if hasattr(wcs_object_solution, 'proj_plane_pixel_scales') and callable(wcs_object_solution.proj_plane_pixel_scales):
@@ -1263,7 +1263,7 @@ def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
                     fits_header_to_update[f'{solver_name.upper()}_PSCALE'] = (float(f"{pixscale_arcsec:.4f}"), f'[asec/pix] Scale from {solver_name} WCS')
             except Exception:
                 pass
-            
+
         if progress_callback: progress_callback("  ASTAP HeaderUpdate: Header FITS MàJ avec WCS.", None, "DEBUG_DETAIL")
         return True
     except Exception as e_upd:

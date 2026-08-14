@@ -123,6 +123,15 @@ def get_app_base_dir() -> Path:
         candidate = base / "zemosaic"
         return candidate if candidate.is_dir() else base
 
+    # Package-aware: the directory containing the bundled zemosaic resources.
+    try:
+        import importlib.resources as _resources  # type: ignore
+        anchor = _resources.files("zemosaic")
+        if isinstance(anchor, Path):
+            return anchor
+    except Exception:
+        pass
+
     try:
         spec = importlib.util.find_spec("zemosaic")
         if spec and spec.origin:

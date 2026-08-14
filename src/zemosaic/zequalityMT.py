@@ -52,7 +52,7 @@ import threading
 from pathlib import Path
 
 try:
-    from core.path_helpers import safe_path_exists
+    from .core.path_helpers import safe_path_exists
 except Exception:  # pragma: no cover - standalone usage outside ZeMosaic
     def safe_path_exists(path, *, expanduser: bool = True):
         """Best-effort path existence check when core helpers are unavailable."""

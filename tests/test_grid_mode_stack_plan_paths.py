@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import grid_mode
+from zemosaic import grid_mode
 
 
 def test_load_stack_plan_resolves_windows_paths_against_input_folder(tmp_path: Path) -> None:

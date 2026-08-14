@@ -1,5 +1,5 @@
-import zemosaic_resource_telemetry as rt
-from zemosaic_align_stack_gpu import _is_cupy_runtime_unavailable_error
+from zemosaic import zemosaic_resource_telemetry as rt
+from zemosaic.zemosaic_align_stack_gpu import _is_cupy_runtime_unavailable_error
 
 
 def test_gpu_defaults_are_stable():

@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ZeMosaic"
+description = "Open-source astronomical mosaic builder for FITS images (Seestar-style high-volume datasets)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "Tinystork (Tristan Nauleau)" },
+]
+keywords = ["astronomy", "fits", "mosaic", "stacking", "astrometry", "seestar"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dynamic = ["version"]
+
+dependencies = [
+    # --- Core science / numerics -------------------------------------------------
+    "numpy",
+    "scipy",
+    "astropy",
+    "reproject",
+    "astroalign",
+    "opencv-python-headless",
+    "photutils",
+    "shapely",
+    # --- Runtime services / I/O --------------------------------------------------
+    "psutil>=5.9",
+    "fsspec",
+    "bottleneck",
+    "threadpoolctl",
+    "zarr>=2",
+    "packaging",
+    # --- Official Qt frontend ----------------------------------------------------
+    "PySide6>=6.6",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+# GPU acceleration is strictly optional. CuPy must NEVER be a base dependency;
+# install the variant matching your CUDA toolkit (cupy-cuda12x, cupy-cuda11x, ...).
+gpu = [
+    "cupy-cuda12x",
+]
+# Online astrometry.net solving (catalog queries / API solve fallback).
+online = [
+    "astroquery",
+]
+# Standalone auxiliary tools (legacy PyQt5 FITS viewer, satellite trail detection).
+tools = [
+    "PyQt5",
+    "acstools",
+]
+# Development / build / test extras.
+dev = [
+    "pytest",
+    "build",
+]
+test = [
+    "pytest",
+]
+
+[project.gui-scripts]
+zemosaic = "zemosaic._app:main"
+
+[project.urls]
+Homepage = "https://github.com/zemosaic/zemosaic"
+Repository = "https://github.com/zemosaic/zemosaic"
+
+[tool.setuptools.dynamic]
+version = { attr = "zemosaic.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["zemosaic*"]
+
+[tool.setuptools.package-data]
+zemosaic = [
+    "locales/*.json",
+    "icon/*.ico",
+    "icon/*.png",
+    "gif/*.gif",
+]

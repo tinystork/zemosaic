@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_PKG = REPO_ROOT / "src" / "zemosaic"
 
 
 def _cupy_available_line(path: Path) -> str:
@@ -13,12 +14,12 @@ def _cupy_available_line(path: Path) -> str:
 
 
 def test_worker_cupy_detection_is_not_windows_only():
-    line = _cupy_available_line(REPO_ROOT / "zemosaic_worker.py")
+    line = _cupy_available_line(SRC_PKG / "zemosaic_worker.py")
     assert 'find_spec("cupy") is not None' in line
     assert "IS_WINDOWS" not in line
 
 
 def test_telemetry_cupy_detection_is_not_windows_only():
-    line = _cupy_available_line(REPO_ROOT / "zemosaic_resource_telemetry.py")
+    line = _cupy_available_line(SRC_PKG / "zemosaic_resource_telemetry.py")
     assert 'find_spec("cupy") is not None' in line
     assert "IS_WINDOWS" not in line

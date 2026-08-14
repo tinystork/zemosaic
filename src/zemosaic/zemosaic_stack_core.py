@@ -37,7 +37,7 @@ else:
     cupyx = None  # type: ignore
 
 try:
-    from zemosaic_align_stack import _reject_outliers_kappa_sigma
+    from .zemosaic_align_stack import _reject_outliers_kappa_sigma
 except Exception:
     _reject_outliers_kappa_sigma = None
 

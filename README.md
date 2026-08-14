@@ -37,9 +37,15 @@ Built by **Tinystork (Tristan Nauleau)** with **J.A.R.V.I.S.** (ChatGPT), it tar
 
 ### Python packages
 
+**Recommended (wheel install):**
+
 ```bash
-pip install -r requirements.txt
+pip install .            # CPU-only base install (CuPy is optional)
+pip install '.[gpu]'     # add optional CuPy GPU acceleration
 ```
+
+`requirements.txt` / `requirements_no_gpu.txt` are kept as legacy compatibility
+docs. The canonical dependency metadata now lives in `pyproject.toml`.
 
 Or manually:
 
@@ -52,6 +58,10 @@ pip install numpy astropy reproject opencv-python photutils scipy psutil
 ## ▶️ Run
 
 ```bash
+zemosaic                  # console script (after pip install)
+# or
+python -m zemosaic
+# or (from a source checkout, without installing)
 python run_zemosaic.py
 ```
 
@@ -61,6 +71,52 @@ Then in the GUI:
 3. Check ASTAP executable + data paths
 4. Tune stacking/assembly options
 5. Start mosaic processing
+
+---
+
+## 📦 Packaging & installation
+
+ZeMosaic ships as a standard Python wheel using a `src/` layout. The runtime is
+the `zemosaic` package, so the checkout directory name no longer matters.
+
+**Build a wheel** (from a source checkout):
+
+```bash
+python -m pip install build
+python -m build --wheel
+```
+
+**Install**:
+
+```bash
+pip install dist/ZeMosaic-*.whl
+```
+
+**Entry points**:
+
+- `zemosaic` (gui_script) → `zemosaic._app:main`
+- `python -m zemosaic`
+- `python run_zemosaic.py` (thin in-repo launcher, dev convenience only)
+
+**CPU vs GPU**: the base install is CPU-only. CuPy is an optional `[gpu]` extra
+(`pip install '.[gpu]'`, or install the CuPy variant matching your CUDA toolkit
+directly). The application automatically falls back to CPU when CuPy/CUDA is
+unavailable.
+
+**Configuration**: persistent config now lives in the per-user config dir
+(e.g. `~/.config/ZeMosaic/zemosaic_config.json` on Linux,
+`%APPDATA%\ZeMosaic\zemosaic_config.json` on Windows), not next to the source.
+On first run, a legacy checkout-adjacent `zemosaic_config.json` is migrated
+there once and never overwrites an existing user config.
+
+**Logs**: `zemosaic_worker.log` and `zemosaic_filter.log` are written to the
+per-user log dir (e.g. `~/.config/ZeMosaic/logs/`), never inside
+`site-packages`. A run-output mirror is still written into the output folder
+when available.
+
+**Resources**: locales JSON, icon and opening GIF are bundled as package data
+and resolved with `importlib.resources`, so they are found from any working
+directory.
 
 ---
 
@@ -154,13 +210,19 @@ If solving or processing fails:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install .            # or: pip install -r requirements.txt (legacy)
 compile\build_zemosaic.bat
 ```
 
 Output executable:
 
 - `dist/zemosaic.exe`
+
+The PyInstaller `ZeMosaic.spec` now targets the packaged `src/zemosaic` entry
+(via the thin `run_zemosaic.py` launcher) and bundles resources under
+`zemosaic/locales`, `zemosaic/icon` and `zemosaic/gif`. Standalone builds are
+expected to work as before, but the full Windows/macOS PyInstaller build was
+not re-validated in this packaging milestone.
 
 ---
 
@@ -350,13 +412,19 @@ Si la résolution astrométrique ou le traitement échoue:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install .            # ou : pip install -r requirements.txt (legacy)
 compile\build_zemosaic.bat
 ```
 
 Exécutable de sortie:
 
 - `dist/zemosaic.exe`
+
+Le `ZeMosaic.spec` PyInstaller cible désormais le package `src/zemosaic` (via le
+launcher léger `run_zemosaic.py`) et empaquette les ressources sous
+`zemosaic/locales`, `zemosaic/icon` et `zemosaic/gif`. Les builds autonomes
+devraient fonctionner comme avant, mais le build PyInstaller complet
+Windows/macOS n'a pas été re-validé dans ce jalon de packaging.
 
 ---
 

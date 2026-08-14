@@ -1,6 +1,6 @@
 import numpy as np
 
-import grid_mode
+from zemosaic import grid_mode
 
 
 def test_grid_final_dbe_applies_on_rgb_with_valid_mask():

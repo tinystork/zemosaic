@@ -49,7 +49,7 @@ import json
 from pathlib import Path
 
 try:
-    from zemosaic_utils import ensure_user_config_dir  # type: ignore
+    from .zemosaic_utils import ensure_user_config_dir  # type: ignore
 except Exception:  # pragma: no cover - standalone usage
     def ensure_user_config_dir() -> Path:
         root = Path.home() / "ZeMosaic"

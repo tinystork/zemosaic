@@ -10,16 +10,18 @@ try:
     PROJECT_ROOT = Path(__file__).resolve().parent
 except NameError:
     PROJECT_ROOT = Path.cwd()
+SRC_ROOT = PROJECT_ROOT / "src"
+PACKAGE_DIR = SRC_ROOT / "zemosaic"
 DEBUG_BUILD = os.environ.get("ZEMOSAIC_DEBUG_BUILD") == "1"
 BUILD_MODE = os.environ.get("ZEMOSAIC_BUILD_MODE", "onedir").strip().lower()
 ONEFILE = BUILD_MODE == "onefile"
 CUPY_REQUIRED = os.environ.get("ZEMOSAIC_REQUIRE_CUPY") == "1"
 
 datas = [
-    (str(PROJECT_ROOT / 'locales' / '*.json'), 'locales'),
-    (str(PROJECT_ROOT / 'icon' / '*.ico'), 'icon'),
-    (str(PROJECT_ROOT / 'icon' / '*.png'), 'icon'),
-    (str(PROJECT_ROOT / 'gif' / '*.gif'), 'gif'),
+    (str(PACKAGE_DIR / 'locales' / '*.json'), 'zemosaic/locales'),
+    (str(PACKAGE_DIR / 'icon' / '*.ico'), 'zemosaic/icon'),
+    (str(PACKAGE_DIR / 'icon' / '*.png'), 'zemosaic/icon'),
+    (str(PACKAGE_DIR / 'gif' / '*.gif'), 'zemosaic/gif'),
 ]
 binaries = []
 
@@ -39,14 +41,28 @@ if _version_stub.exists():
 
 hiddenimports = [
     'reproject',
-    'locales.zemosaic_localization',
-    'solver_settings',
-    'zemosaic_config',
-    'zemosaic_worker',
-    'zemosaic_astrometry',
-    'zemosaic_filter_gui',
-    'zemosaic_filter_gui_qt',
-    'zemosaic_gui_qt',
+    'zemosaic._app',
+    'zemosaic._resources',
+    'zemosaic.locales.zemosaic_localization',
+    'zemosaic.solver_settings',
+    'zemosaic.zemosaic_config',
+    'zemosaic.zemosaic_worker',
+    'zemosaic.zemosaic_astrometry',
+    'zemosaic.zemosaic_align_stack',
+    'zemosaic.zemosaic_align_stack_gpu',
+    'zemosaic.zemosaic_stack_core',
+    'zemosaic.zemosaic_gpu_safety',
+    'zemosaic.zemosaic_resource_telemetry',
+    'zemosaic.zemosaic_time_utils',
+    'zemosaic.zemosaic_utils',
+    'zemosaic.cuda_utils',
+    'zemosaic.parallel_utils',
+    'zemosaic.grid_mode',
+    'zemosaic.lecropper',
+    'zemosaic.zequalityMT',
+    'zemosaic.zemosaic_filter_gui',
+    'zemosaic.zemosaic_filter_gui_qt',
+    'zemosaic.zemosaic_gui_qt',
 ]
 
 # Optional preview plots in the Qt filter UI
@@ -142,7 +158,7 @@ if _sep_spec is not None:
 
 a = Analysis(
     ['run_zemosaic.py'],
-    pathex=[str(PROJECT_ROOT), str(PROJECT_ROOT.parent)],
+    pathex=[str(SRC_ROOT), str(PROJECT_ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -195,7 +211,7 @@ if ONEFILE:
         upx_exclude=[],
         runtime_tmpdir=os.environ.get("ZEMOSAIC_RUNTIME_TMPDIR") or None,
         console=DEBUG_BUILD,
-        icon=str(PROJECT_ROOT / 'icon' / 'zemosaic.ico')
+        icon=str(PACKAGE_DIR / 'icon' / 'zemosaic.ico')
     )
 else:
     exe = EXE(
@@ -212,7 +228,7 @@ else:
         upx=False,
         upx_exclude=[],
         console=DEBUG_BUILD,
-        icon=str(PROJECT_ROOT / 'icon' / 'zemosaic.ico')
+        icon=str(PACKAGE_DIR / 'icon' / 'zemosaic.ico')
     )
     coll = COLLECT(
         exe,

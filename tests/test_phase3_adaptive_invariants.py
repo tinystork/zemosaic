@@ -6,10 +6,14 @@ import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_PKG = REPO_ROOT / "src" / "zemosaic"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-zas = pytest.importorskip("zemosaic_align_stack", reason="CPU stacker module unavailable on sys.path")
+zas = pytest.importorskip("zemosaic.zemosaic_align_stack", reason="CPU stacker module unavailable on sys.path")
 
 
 def _cpu_only_zconfig() -> SimpleNamespace:
@@ -22,15 +26,15 @@ def _cpu_only_zconfig() -> SimpleNamespace:
 
 
 def _worker_source() -> str:
-    return (REPO_ROOT / "zemosaic_worker.py").read_text(encoding="utf-8", errors="ignore")
+    return (SRC_PKG / "zemosaic_worker.py").read_text(encoding="utf-8", errors="ignore")
 
 
 def _align_gpu_source() -> str:
-    return (REPO_ROOT / "zemosaic_align_stack_gpu.py").read_text(encoding="utf-8", errors="ignore")
+    return (SRC_PKG / "zemosaic_align_stack_gpu.py").read_text(encoding="utf-8", errors="ignore")
 
 
 def _utils_source() -> str:
-    return (REPO_ROOT / "zemosaic_utils.py").read_text(encoding="utf-8", errors="ignore")
+    return (SRC_PKG / "zemosaic_utils.py").read_text(encoding="utf-8", errors="ignore")
 
 
 def _adaptation_block() -> str:
@@ -216,7 +220,10 @@ def test_phase3_pass_and_chunk_shrink_markers_present():
 
     assert "target_fraction = 0.40 if pressure_level == 2 else 0.50" in src
     assert "winsor_after = max(min_pass, min(total_frames, int(max(1, winsor_after // 2))))" in src
-    assert "scale = 0.50 if pressure_level >= 2 else 0.70" in src
+    assert "phase3_chunk_scale_critical" in src
+    assert "phase3_chunk_scale_high" in src
+    assert "0.50" in src
+    assert "0.70" in src
     assert "adaptive_parallel_plan = replace(" in src
 
 

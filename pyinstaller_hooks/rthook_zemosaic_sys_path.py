@@ -2,14 +2,11 @@
 
 Goal: avoid importing stray modules from the user's TEMP directory.
 
-`run_zemosaic.py` prepends the parent directory of its location to `sys.path`.
-In onefile builds, the app is extracted under `%TEMP%\\_MEIxxxxx`, so the parent
-directory becomes `%TEMP%`. If `%TEMP%` is prepended, any accidental files like
-`%TEMP%\\zemosaic_worker.py` can shadow the bundled modules and crash at startup.
-
-This hook runs *before* the entry-point script and ensures the `%TEMP%` parent
-directory is present (so `run_zemosaic.py` won't re-insert it at position 0),
-but only at the end of `sys.path`.
+The packaged application is a proper ``zemosaic`` package (src layout), so no
+bootstrap sys.path manipulation is required. In onefile builds the app is
+extracted under ``%TEMP%\\_MEIxxxxx``; this hook keeps the ``%TEMP%`` parent
+directory at the *end* of ``sys.path`` so accidental files like
+``%TEMP%\\zemosaic_worker.py`` cannot shadow the bundled modules.
 """
 
 from __future__ import annotations

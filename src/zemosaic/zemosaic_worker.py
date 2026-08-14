@@ -81,16 +81,16 @@ from types import SimpleNamespace
 import numpy as np
 
 try:
-    import grid_mode
+    from . import grid_mode
 except Exception:
     grid_mode = None
 
-from zemosaic_resource_telemetry import (
+from .zemosaic_resource_telemetry import (
     ResourceTelemetryController,
     _sample_runtime_resources_for_telemetry,
 )
 
-from core.path_helpers import (
+from .core.path_helpers import (
     casefold_path,
     expand_to_path,
     normpath_segments,
@@ -113,7 +113,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FI
 from concurrent.futures.process import BrokenProcessPool
 
 try:
-    from parallel_utils import (
+    from .parallel_utils import (
         ParallelCapabilities,
         ParallelPlan,
         auto_tune_parallel_plan,
@@ -133,7 +133,7 @@ except Exception:
 
     PARALLEL_HELPERS_AVAILABLE = False
 
-from zemosaic_gpu_safety import (
+from .zemosaic_gpu_safety import (
     GpuRuntimeContext,
     apply_gpu_safety_to_parallel_plan,
     apply_gpu_safety_to_phase5_flag,
@@ -340,7 +340,7 @@ def should_use_gpu_for_reproject(tag: str, config: Any, parallel_plan: Any | Non
 
 # ZeQualityMT (quality gate for Master Tiles)
 try:
-    from zequalityMT import quality_metrics as _zq_quality_metrics
+    from .zequalityMT import quality_metrics as _zq_quality_metrics
 except Exception:
     _zq_quality_metrics = None
 
@@ -357,7 +357,7 @@ def _fallback_runtime_temp_dir() -> Path:
 
 
 try:
-    from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded, get_runtime_temp_dir
+    from .zemosaic_utils import EXCLUDED_DIRS, is_path_excluded, get_runtime_temp_dir
 except Exception:
     EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
 
@@ -372,7 +372,7 @@ except Exception:
 
 
 try:
-    from zemosaic_align_stack import _poststack_rgb_equalization
+    from .zemosaic_align_stack import _poststack_rgb_equalization
 except Exception:
     _poststack_rgb_equalization = None
 
@@ -12761,11 +12761,19 @@ def _early_worker_log_dir() -> Path:
 
 
 def _resolve_worker_log_file_path() -> Path:
-    """Resolve worker log path in repository directory (git-visible)."""
+    """Resolve the default worker log path in a per-user log directory.
+
+    The log must never target the installed package directory (site-packages);
+    it lives under the per-user config dir in a ``logs`` subdirectory.
+    """
+
+    base = _early_worker_log_dir()
+    log_dir = base / "logs"
     try:
-        return Path(__file__).resolve().parent / "zemosaic_worker.log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return log_dir / "zemosaic_worker.log"
     except Exception:
-        return _early_worker_log_dir() / "zemosaic_worker.log"
+        return base / "zemosaic_worker.log"
 
 
 log_file_path = _resolve_worker_log_file_path()
@@ -13269,8 +13277,8 @@ CALC_GRID_OPTIMIZED_AVAILABLE = False
 _calculate_final_mosaic_grid_optimized = None
 
 try:
-    import zemosaic_utils
-    from zemosaic_utils import (
+    from . import zemosaic_utils
+    from .zemosaic_utils import (
         gpu_assemble_final_mosaic_reproject_coadd,
         gpu_assemble_final_mosaic_incremental,
         reproject_and_coadd_wrapper,
@@ -13278,14 +13286,14 @@ try:
     ZEMOSAIC_UTILS_AVAILABLE = True
     logger.info("Module 'zemosaic_utils' importé.")
 except ImportError as e: logger.error(f"Import 'zemosaic_utils.py' échoué: {e}.")
-try: import zemosaic_astrometry; ZEMOSAIC_ASTROMETRY_AVAILABLE = True; logger.info("Module 'zemosaic_astrometry' importé.")
+try: from . import zemosaic_astrometry; ZEMOSAIC_ASTROMETRY_AVAILABLE = True; logger.info("Module 'zemosaic_astrometry' importé.")
 except ImportError as e: logger.error(f"Import 'zemosaic_astrometry.py' échoué: {e}.")
-try: import zemosaic_align_stack; ZEMOSAIC_ALIGN_STACK_AVAILABLE = True; logger.info("Module 'zemosaic_align_stack' importé.")
+try: from . import zemosaic_align_stack; ZEMOSAIC_ALIGN_STACK_AVAILABLE = True; logger.info("Module 'zemosaic_align_stack' importé.")
 except ImportError as e: logger.error(f"Import 'zemosaic_align_stack.py' échoué: {e}.")
 try:
     from .solver_settings import SolverSettings  # type: ignore
 except ImportError:
-    from solver_settings import SolverSettings  # type: ignore
+    from .solver_settings import SolverSettings  # type: ignore
 
 _anchor_detect_autocrop = None
 ANCHOR_AUTOCROP_AVAILABLE = False
@@ -13308,7 +13316,7 @@ def _ensure_lecropper_loaded() -> bool:
 
         _LECROPPER_LOAD_ATTEMPTED = True
         try:
-            module = importlib.import_module("lecropper")
+            module = importlib.import_module(".lecropper", __package__)
         except Exception as exc:
             lecropper = None
             _LECROPPER_AVAILABLE = False
@@ -13338,14 +13346,14 @@ def _ensure_lecropper_loaded() -> bool:
 
 # Optional configuration import for GPU toggle
 try:
-    import zemosaic_config
+    from . import zemosaic_config
     ZEMOSAIC_CONFIG_AVAILABLE = True
 except Exception:
     zemosaic_config = None  # type: ignore
     ZEMOSAIC_CONFIG_AVAILABLE = False
 
 try:
-    from zemosaic_align_stack_gpu import (
+    from .zemosaic_align_stack_gpu import (
         gpu_stack_from_paths as _p3_gpu_stack_from_paths,
         GPUStackingError as _P3GPUStackingError,
         _gpu_is_usable as _p3_gpu_is_usable,
@@ -13750,7 +13758,7 @@ def _auto_crop_mosaic_to_valid_region(
 
     if follow_signal is None:
         try:
-            import zemosaic_config
+            from . import zemosaic_config
 
             cfg = zemosaic_config.load_config() or {}
             follow_signal = bool(cfg.get("crop_follow_signal", False))
@@ -25123,7 +25131,7 @@ def run_hierarchical_mosaic_classic_legacy(
             launch_filter_interface_fn = None
             if early_filter_enabled:
                 try:
-                    from zemosaic_filter_gui import launch_filter_interface as launch_filter_interface_fn  # type: ignore
+                    from .zemosaic_filter_gui import launch_filter_interface as launch_filter_interface_fn  # type: ignore
                 except ImportError:
                     launch_filter_interface_fn = None
                     pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")
@@ -31331,7 +31339,7 @@ def run_hierarchical_mosaic(
         launch_filter_interface_fn = None
         if early_filter_enabled:
             try:
-                from zemosaic_filter_gui import launch_filter_interface as launch_filter_interface_fn  # type: ignore
+                from .zemosaic_filter_gui import launch_filter_interface as launch_filter_interface_fn  # type: ignore
             except ImportError:
                 launch_filter_interface_fn = None
                 pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")

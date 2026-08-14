@@ -71,10 +71,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
 
+from ._resources import resource_path_optional
+
 try:  # pragma: no cover - optional dependency guard
-    from zemosaic_utils import get_app_base_dir  # type: ignore
-    from zemosaic_time_utils import ETACalculator, format_eta_hms
-    from core.path_helpers import safe_path_isdir
+    from .zemosaic_utils import get_app_base_dir  # type: ignore
+    from .zemosaic_time_utils import ETACalculator, format_eta_hms
+    from .core.path_helpers import safe_path_isdir
 except Exception:  # pragma: no cover - fallback when utils missing
     def get_app_base_dir() -> Path:  # type: ignore
         return Path(__file__).resolve().parent
@@ -210,28 +212,28 @@ else:
 
 CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
 
-if importlib.util.find_spec("zemosaic_config") is not None:
-    import zemosaic_config  # type: ignore
+if importlib.util.find_spec("zemosaic.zemosaic_config") is not None:
+    from . import zemosaic_config  # type: ignore
 else:  # pragma: no cover - optional dependency guard
     zemosaic_config = None  # type: ignore[assignment]
 
-if importlib.util.find_spec("solver_settings") is not None:
-    from solver_settings import SolverSettings  # type: ignore
+if importlib.util.find_spec("zemosaic.solver_settings") is not None:
+    from .solver_settings import SolverSettings  # type: ignore
 else:  # pragma: no cover - optional dependency guard
     SolverSettings = None  # type: ignore[assignment]
 
-if importlib.util.find_spec("zemosaic_worker") is not None:
-    from zemosaic_worker import run_hierarchical_mosaic_process  # type: ignore
+if importlib.util.find_spec("zemosaic.zemosaic_worker") is not None:
+    from .zemosaic_worker import run_hierarchical_mosaic_process  # type: ignore
 else:  # pragma: no cover - optional dependency guard
     run_hierarchical_mosaic_process = None  # type: ignore[assignment]
 
-if importlib.util.find_spec("locales.zemosaic_localization") is not None:
-    from locales.zemosaic_localization import ZeMosaicLocalization  # type: ignore
+if importlib.util.find_spec("zemosaic.locales.zemosaic_localization") is not None:
+    from .locales.zemosaic_localization import ZeMosaicLocalization  # type: ignore
 else:  # pragma: no cover - optional dependency guard
     ZeMosaicLocalization = None  # type: ignore[assignment]
 
-if importlib.util.find_spec("zemosaic_astrometry") is not None:
-    from zemosaic_astrometry import (  # type: ignore
+if importlib.util.find_spec("zemosaic.zemosaic_astrometry") is not None:
+    from .zemosaic_astrometry import (  # type: ignore
         compute_astap_recommended_max_instances,
         set_astap_max_concurrent_instances,
     )
@@ -262,20 +264,19 @@ LANGUAGE_OPTION_DEFINITIONS = [
 
 def _load_zemosaic_qicon() -> QIcon | None:
     """Return a QIcon for ZeMosaic using the best available icon file."""
-    try:
-        icon_dir = get_app_base_dir() / "icon"
-    except Exception:
-        return None
+    icon_names = (
+        "zemosaic.ico",
+        "zemosaic_64x64.png",
+        "zemosaic_icon.png",
+        "zemosaic.png",
+    )
 
-    candidates = [
-        icon_dir / "zemosaic.ico",
-        icon_dir / "zemosaic_64x64.png",
-        icon_dir / "zemosaic_icon.png",
-        icon_dir / "zemosaic.png",
-    ]
-
-    for path in candidates:
+    # 1. Bundled package resource (install-safe).
+    for name in icon_names:
         try:
+            path = resource_path_optional("icon", name)
+            if path is None:
+                continue
             if not path.is_file():
                 continue
             icon = QIcon(str(path))
@@ -284,7 +285,24 @@ def _load_zemosaic_qicon() -> QIcon | None:
         except Exception:
             continue
 
-    print(f"[QtMain] Aucune icône ZeMosaic trouvée dans {icon_dir}")
+    # 2. Legacy checkout layout (get_app_base_dir / "icon").
+    try:
+        icon_dir = get_app_base_dir() / "icon"
+    except Exception:
+        icon_dir = None
+    if icon_dir is not None:
+        for name in icon_names:
+            path = icon_dir / name
+            try:
+                if not path.is_file():
+                    continue
+                icon = QIcon(str(path))
+                if not icon.isNull():
+                    return icon
+            except Exception:
+                continue
+
+    print("[QtMain] Aucune icône ZeMosaic trouvée.")
     return None
 
 
@@ -6441,7 +6459,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         import_error: Exception | None = None
         try:
-            from zemosaic_filter_gui_qt import launch_filter_interface_qt
+            from .zemosaic_filter_gui_qt import launch_filter_interface_qt
         except Exception as exc:
             import_error = exc
             try:
@@ -6548,7 +6566,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # saving the main configuration does not overwrite it with a stale
         # snapshot on application shutdown.
         try:
-            import zemosaic_config as _zem_cfg  # type: ignore[import]
+            from . import zemosaic_config as _zem_cfg  # type: ignore[import]
         except Exception:
             _zem_cfg = None  # type: ignore[assignment]
         if _zem_cfg is not None and hasattr(_zem_cfg, "load_config"):

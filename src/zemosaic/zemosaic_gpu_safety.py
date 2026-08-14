@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover - wmi absent on most platforms
     wmi = None
 
 try:
-    from parallel_utils import ParallelCapabilities, ParallelPlan, detect_parallel_capabilities  # type: ignore
+    from .parallel_utils import ParallelCapabilities, ParallelPlan, detect_parallel_capabilities  # type: ignore
 except Exception:  # pragma: no cover - keep imports optional
     ParallelCapabilities = Any  # type: ignore
     ParallelPlan = Any  # type: ignore

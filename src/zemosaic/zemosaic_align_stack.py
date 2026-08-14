@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable, Any, Iterable, Sequence
 
-from core.robust_rejection import (
+from .core.robust_rejection import (
     WSC_IMPL_LEGACY,
     WSC_IMPL_PIXINSIGHT,
     resolve_wsc_impl,
@@ -71,7 +71,7 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 try:
-    from zemosaic_utils import get_app_base_dir  # type: ignore
+    from .zemosaic_utils import get_app_base_dir  # type: ignore
 except Exception:  # pragma: no cover - fallback for standalone usage
     def get_app_base_dir() -> Path:
         try:
@@ -208,7 +208,7 @@ def _winsorize_block_numpy(arr_block: np.ndarray, limits: tuple[float, float]) -
 ZEMOSAIC_UTILS_AVAILABLE_FOR_RADIAL = False
 make_radial_weight_map_func = None
 try:
-    from zemosaic_utils import make_radial_weight_map
+    from .zemosaic_utils import make_radial_weight_map
     make_radial_weight_map_func = make_radial_weight_map
     ZEMOSAIC_UTILS_AVAILABLE_FOR_RADIAL = True
 except ImportError as e_util_rad:
@@ -962,7 +962,7 @@ def _broadcast_weights_for_chunk(weights_chunk: np.ndarray, target_shape: tuple[
 ZU_AVAILABLE = False
 zutils = None
 try:
-    import zemosaic_utils as zutils  # type: ignore
+    from . import zemosaic_utils as zutils  # type: ignore
     ZU_AVAILABLE = True
 except Exception:
     ZU_AVAILABLE = False

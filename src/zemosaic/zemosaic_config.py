@@ -54,7 +54,7 @@ from typing import Any, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
-    from zemosaic_utils import ensure_user_config_dir, get_user_config_dir
+    from .zemosaic_utils import ensure_user_config_dir, get_user_config_dir
 except Exception:  # pragma: no cover - fallback when utils unavailable
     def get_user_config_dir() -> Path:
         return Path.home() / "ZeMosaic"
@@ -665,12 +665,100 @@ def _apply_astap_platform_defaults(config: dict) -> bool:
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+def _legacy_config_candidates() -> list[Path]:
+    """Return candidate legacy config locations, in deterministic priority order.
+
+    Historically the config lived next to the flat runtime modules (i.e. the
+    checkout root).  After packaging it must move to the per-user config dir,
+    so these candidates cover the most common legacy checkout layouts.
+    """
+
+    module_dir = _SCRIPT_DIR
+    candidates: list[Path] = []
+
+    try:
+        candidates.append(Path.cwd() / CONFIG_FILE_NAME)
+    except Exception:
+        pass
+
+    # In-repo src layout: <repo>/src/zemosaic -> parents[2] is the checkout root.
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+    except Exception:
+        repo_root = None
+    if repo_root is not None:
+        candidates.append(repo_root / CONFIG_FILE_NAME)
+
+    candidates.append(module_dir / CONFIG_FILE_NAME)
+
+    # De-duplicate while preserving order.
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve())
+        except Exception:
+            key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+    return ordered
+
+
+def _migrate_legacy_config(user_config: Path) -> bool:
+    """Copy a legacy checkout-adjacent config into the user config dir, once.
+
+    The migration is deterministic: it only runs when the user config does not
+    already exist, and never overwrites an existing user config.  It copies the
+    first existing legacy candidate and ignores the rest.
+    """
+
+    if user_config.exists():
+        return False
+
+    for candidate in _legacy_config_candidates():
+        if not candidate.is_file():
+            continue
+        try:
+            if candidate.resolve() == user_config.resolve():
+                continue
+        except Exception:
+            pass
+        try:
+            data = candidate.read_bytes()
+        except Exception:
+            continue
+        try:
+            user_config.parent.mkdir(parents=True, exist_ok=True)
+            user_config.write_bytes(data)
+            try:
+                logger.info("Migrated legacy config %s -> %s", candidate, user_config)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            try:
+                logger.warning("Unable to migrate legacy config %s", candidate)
+            except Exception:
+                pass
+    return False
+
+
 def get_config_path():
     """
-    Retourne le chemin du fichier de configuration.
-    Le fichier est stocké dans le répertoire du repo ZeMosaic.
+    Retourne le chemin du fichier de configuration persistant par utilisateur.
+
+    Le fichier vit dans le répertoire de configuration utilisateur de la
+    plateforme (voir ``zemosaic_utils.get_user_config_dir``) plutôt qu'à côté
+    du package, afin de survivre aux réinstallations et d'être accessible en
+    écriture même depuis un wheel installé.
     """
-    return str(_SCRIPT_DIR / CONFIG_FILE_NAME)
+
+    user_dir = ensure_user_config_dir()
+    user_config = user_dir / CONFIG_FILE_NAME
+    _migrate_legacy_config(user_config)
+    return str(user_config)
 
 def _sync_path_aliases(config_obj: dict) -> dict:
     """Keep legacy/new path keys synchronized.

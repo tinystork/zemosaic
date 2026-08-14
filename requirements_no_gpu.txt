@@ -1,3 +1,8 @@
+# ZeMosaic CPU-only compatibility requirements (legacy).
+#
+# Canonical install: `pip install .` (CPU-only by default; CuPy is an optional
+# `[gpu]` extra in pyproject.toml). This file intentionally excludes CuPy.
+
 numpy
 matplotlib
 astropy

@@ -45,7 +45,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from core.tk_safe import patch_tk_variables
+from .core.tk_safe import patch_tk_variables
 
 patch_tk_variables()
 import threading
@@ -64,8 +64,8 @@ import json
 from pathlib import Path
 from typing import Any, MutableMapping, Optional
 
-from zemosaic_utils import get_app_base_dir, apply_windows_icon_to_window
-from zemosaic_time_utils import ETACalculator, format_eta_hms
+from .zemosaic_utils import get_app_base_dir, apply_windows_icon_to_window
+from .zemosaic_time_utils import ETACalculator, format_eta_hms
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
@@ -107,7 +107,7 @@ except ImportError:
 ZEMOSAIC_LOCALIZATION_AVAILABLE = False
 ZeMosaicLocalization = None
 _localization_errors = []
-for candidate in ("locales.zemosaic_localization", "zemosaic_localization"):
+for candidate in ("zemosaic.locales.zemosaic_localization", "locales.zemosaic_localization", "zemosaic_localization"):
     spec = importlib.util.find_spec(candidate)
     if spec is None:
         _localization_errors.append(f"Module not found: {candidate}")
@@ -131,7 +131,7 @@ ZEMOSAIC_CONFIG_AVAILABLE = False
 config_candidates = []
 if __package__:
     config_candidates.append(f"{__package__}.zemosaic_config")
-config_candidates.extend(["zemosaic_config", "core.zemosaic_config"])
+config_candidates.extend(["zemosaic.zemosaic_config"])
 _config_errors = []
 for candidate in config_candidates:
     spec = importlib.util.find_spec(candidate)
@@ -199,7 +199,7 @@ ZEMOSAIC_WORKER_AVAILABLE = False
 worker_candidates = []
 if __package__:
     worker_candidates.append(f"{__package__}.zemosaic_worker")
-worker_candidates.extend(["zemosaic_worker", "core.zemosaic_worker"])
+worker_candidates.extend(["zemosaic.zemosaic_worker"])
 _worker_errors = []
 for candidate in worker_candidates:
     spec = importlib.util.find_spec(candidate)
@@ -225,7 +225,7 @@ SolverSettings = None
 solver_candidates = []
 if __package__:
     solver_candidates.append(f"{__package__}.solver_settings")
-solver_candidates.append("solver_settings")
+solver_candidates.append("zemosaic.solver_settings")
 _solver_errors = []
 for candidate in solver_candidates:
     spec = importlib.util.find_spec(candidate)
@@ -2707,7 +2707,7 @@ class ZeMosaicGUI:
             try:
                 from .zemosaic_filter_gui import launch_filter_interface
             except Exception:
-                from zemosaic_filter_gui import launch_filter_interface
+                from .zemosaic_filter_gui import launch_filter_interface
         except Exception:
             messagebox.showerror(self._tr("critical_error_title"), "Filter UI not available.", parent=self.root)
             return
@@ -4270,7 +4270,7 @@ class ZeMosaicGUI:
                     try:
                         from .zemosaic_filter_gui import launch_filter_interface
                     except Exception:
-                        from zemosaic_filter_gui import launch_filter_interface
+                        from .zemosaic_filter_gui import launch_filter_interface
                 except Exception:
                     self._log_message("[ZGUI] Filter UI not available (pre-run). Proceeding without it.", level="WARN")
                     skip_filter_ui_for_run = True
@@ -4327,7 +4327,7 @@ class ZeMosaicGUI:
                     try:
                         try:
                             import importlib  # noqa: F401  (only for parity with CLI test)
-                            import zemosaic_filter_gui as _zfg_dbg  # type: ignore
+                            from . import zemosaic_filter_gui as _zfg_dbg  # type: ignore
                             self._log_message(
                                 f"[ZGUI] Filter GUI module path: {_zfg_dbg.__file__}",
                                 level="DEBUG",

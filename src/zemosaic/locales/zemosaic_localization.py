@@ -49,7 +49,13 @@ import traceback # Gardé pour un log d'erreur plus détaillé si besoin (mais p
 from pathlib import Path
 
 try:
-    from core.path_helpers import safe_path_getsize
+    from .._resources import resource_path
+except Exception:  # pragma: no cover - standalone usage
+    def resource_path(*parts: str) -> Path:
+        return Path(__file__).resolve().parent.joinpath(*parts)
+
+try:
+    from ..core.path_helpers import safe_path_getsize
 except Exception:  # pragma: no cover - localization module may be reused standalone
     def safe_path_getsize(path, *, expanduser: bool = True, default: int = 0):
         """Fallback size helper when core utilities are unavailable."""
@@ -69,7 +75,7 @@ except Exception:  # pragma: no cover - localization module may be reused standa
             return default
 
 try:
-    from zemosaic_utils import get_app_base_dir  # type: ignore
+    from ..zemosaic_utils import get_app_base_dir  # type: ignore
 except Exception:  # pragma: no cover - standalone usage
     get_app_base_dir = None
 
@@ -84,11 +90,17 @@ class ZeMosaicLocalization:
         """
         # print(f"DEBUG (Localization __init__): Initialisation de ZeMosaicLocalization...")
         base_path: Path | None = None
-        if callable(get_app_base_dir):
-            try:
-                base_path = get_app_base_dir() / "locales"
-            except Exception:
-                base_path = None
+        # Prefer the package-aware resource directory (install-safe).
+        try:
+            base_path = resource_path("locales")
+        except Exception:
+            base_path = None
+        if base_path is None:
+            if callable(get_app_base_dir):
+                try:
+                    base_path = get_app_base_dir() / "locales"
+                except Exception:
+                    base_path = None
         if base_path is None:
             try:
                 base_path = Path(__file__).resolve().parent

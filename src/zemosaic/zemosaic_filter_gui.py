@@ -68,9 +68,9 @@ import math
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from core.path_helpers import casefold_path, expand_to_path, safe_path_exists
+from .core.path_helpers import casefold_path, expand_to_path, safe_path_exists
 
-from zemosaic_utils import (
+from .zemosaic_utils import (
     EXCLUDED_DIRS,
     apply_borrowing_v1,
     compute_global_wcs_descriptor,
@@ -867,14 +867,6 @@ def launch_filter_interface(
             except Exception:
                 return max(1, fallback)
 
-        # Ensure project directory and parent are on sys.path to import project modules
-        base_dir = Path(__file__).resolve().parent
-        project_root = base_dir.parent
-        for candidate in (base_dir, project_root):
-            candidate_str = str(candidate)
-            if candidate_str and candidate_str not in sys.path:
-                sys.path.insert(0, candidate_str)
-
         pkg_prefix = globals().get("__package__") or ""
 
         def _import_optional_module(*module_names: str):
@@ -892,8 +884,7 @@ def launch_filter_interface(
 
         # Try to load localization support from either legacy or packaged paths
         localization_candidates = [
-            "locales.zemosaic_localization",
-            "zemosaic_localization",
+            "zemosaic.locales.zemosaic_localization",
         ]
         if pkg_prefix:
             localization_candidates.insert(0, f"{pkg_prefix}.zemosaic_localization")
@@ -914,7 +905,7 @@ def launch_filter_interface(
         config_candidates = []
         if pkg_prefix:
             config_candidates.append(f"{pkg_prefix}.zemosaic_config")
-        config_candidates.append("zemosaic_config")
+        config_candidates.append("zemosaic.zemosaic_config")
         zconfig_module, config_error = _import_optional_module(*config_candidates)
 
         if zconfig_module is not None:
@@ -963,7 +954,7 @@ def launch_filter_interface(
         solver_candidates = []
         if pkg_prefix:
             solver_candidates.append(f"{pkg_prefix}.solver_settings")
-        solver_candidates.append("solver_settings")
+        solver_candidates.append("zemosaic.solver_settings")
         solver_module, solver_error = _import_optional_module(*solver_candidates)
         if solver_module is not None:
             solver_cls = getattr(solver_module, "SolverSettings", None)
@@ -1071,7 +1062,7 @@ def launch_filter_interface(
         import tkinter as tk
         from tkinter import ttk, messagebox, scrolledtext
 
-        from core.tk_safe import patch_tk_variables
+        from .core.tk_safe import patch_tk_variables
 
         patch_tk_variables()
 

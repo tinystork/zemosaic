@@ -1,3 +1,11 @@
+# ZeMosaic compatibility requirements (legacy).
+#
+# The canonical install is now via the package metadata in `pyproject.toml`:
+#   pip install .            # CPU-only base install
+#   pip install '.[gpu]'     # optional CuPy GPU acceleration
+# This file is kept for historical/CI compatibility and is NOT the source of
+# truth for dependencies. CuPy is OPTIONAL and never a base requirement.
+
 numpy
 matplotlib
 astropy
@@ -22,7 +30,7 @@ wmi; platform_system == "Windows"     # Windows-only GPU detection helper
 # --- Optional science / analysis helpers ---
 acstools                    # Satellite trail detection (enable when needed)
 
-cupy-cuda12x      # For GPU acceleration (EXAMPLE! VERSION MUST MATCH YOUR CUDA TOOLKIT!)
+# cupy-cuda12x              # For GPU acceleration (OPTIONAL - see pyproject.toml [gpu] extra)
 #                           # Replace '11x' with your CUDA major version (e.g., 11x, 12x)
 #                           # Check available versions: https://pypi.org/project/cupy-cuda11x/
 #                           # Uncomment and adjust if you have a compatible NVIDIA GPU and CUDA installed.
