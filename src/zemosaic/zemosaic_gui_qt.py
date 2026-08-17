@@ -55,6 +55,7 @@ selects the Tk interface even if the environment variable requests Qt.
 from __future__ import annotations
 
 import base64
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -63,6 +64,7 @@ import shutil
 import subprocess
 import signal
 import sys
+import sysconfig
 import multiprocessing
 import queue
 import threading
@@ -170,37 +172,140 @@ from typing import Literal, Tuple
 
 AnalysisBackend = Literal["none", "zeanalyser", "beforehand"]
 
+# ZeAnalyser public launch contract (interop rules 2, 6, 19, 20): discovery goes
+# exclusively through installed distribution metadata plus the declared
+# gui_scripts entry point, and launch goes through the installed entry-point
+# script or the documented ``python -m zeanalyser`` module entry point.
+# ZeAnalyser is never imported, its checkout is never inspected and sys.path is
+# never touched; ZeMosaic remains fully usable without ZeAnalyser.
+ZEANALYSER_DISTRIBUTION = "ZeAnalyser"
+ZEANALYSER_ENTRY_POINT_GROUP = "gui_scripts"
+ZEANALYSER_ENTRY_POINT_NAME = "zeanalyser"
+ZEANALYSER_MODULE = "zeanalyser"
 
-def _detect_analysis_backend() -> Tuple[AnalysisBackend, Optional[Path]]:
+_ZeAnalyserDiscoveryState = Literal["not_installed", "available", "unhealthy"]
+
+
+def _discover_zeanalyser() -> Tuple[_ZeAnalyserDiscoveryState, Optional[str]]:
+    """Lazily discover the installed ZeAnalyser distribution (public contract).
+
+    Uses only standard-library package metadata: the ``ZeAnalyser``
+    distribution must be installed and must declare the ``zeanalyser``
+    ``gui_scripts`` entry point.  Never inspects sibling checkouts, never
+    mutates ``sys.path`` and never imports ``zeanalyser`` (interop rule 19).
+
+    Returns ``(state, diagnostic)`` where ``state`` distinguishes:
+
+    - ``not_installed``: the distribution is absent;
+    - ``available``: installed with the expected entry point;
+    - ``unhealthy``: installed but broken (metadata unreadable, entry point
+      missing).  Unhealthy is treated as unavailable with a diagnostic so the
+      failure stays local to the analysis integration (interop rule 20).
+
+    Never raises.
     """
-    Inspecte l'arborescence autour de ZeMosaic pour trouver un backend d'analyse.
+    try:
+        importlib.metadata.distribution(ZEANALYSER_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        return "not_installed", None
+    except Exception as exc:  # pragma: no cover - defensive
+        return (
+            "unhealthy",
+            "cannot inspect the ZeAnalyser installation metadata: "
+            f"{type(exc).__name__}: {exc}",
+        )
 
-    Logique :
-      - base_dir = get_app_base_dir()  -> dossier zemosaic
-      - toolbox_root = base_dir.parent
-      - Si toolbox_root / "zeanalyser" est un dossier  -> "zeanalyser"
-      - Sinon si toolbox_root / "seestar" / "beforehand" est un dossier -> "beforehand"
-      - Sinon -> "none"
+    try:
+        matches = importlib.metadata.entry_points(
+            group=ZEANALYSER_ENTRY_POINT_GROUP, name=ZEANALYSER_ENTRY_POINT_NAME
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        return (
+            "unhealthy",
+            "cannot read installed entry points while checking ZeAnalyser: "
+            f"{type(exc).__name__}: {exc}",
+        )
+
+    if matches:
+        return "available", None
+
+    return (
+        "unhealthy",
+        "the ZeAnalyser distribution is installed but does not declare the "
+        f"{ZEANALYSER_ENTRY_POINT_NAME!r} {ZEANALYSER_ENTRY_POINT_GROUP!r} "
+        "entry point (broken or too-old installation); reinstall ZeAnalyser.",
+    )
+
+
+def _resolve_zeanalyser_launch_command() -> List[str]:
+    """Resolve the command that launches the installed ZeAnalyser GUI.
+
+    Resolution order, always inside the same Python environment as ZeMosaic:
+
+    1. the current environment's entry-point script
+       (``sysconfig.get_path("scripts")/<zeanalyser[.exe]>``) when that file
+       exists and is executable;
+    2. otherwise ``[sys.executable, "-m", "zeanalyser"]`` (the stable,
+       documented ``python -m zeanalyser`` module entry point).
+
+    ``shutil.which`` is deliberately not used alone (it could pick up an
+    unrelated checkout binary from ``PATH``) and no working directory is
+    assumed: the installed ZeAnalyser must not depend on the launch CWD
+    (interop rule 18).
     """
+    try:
+        scripts_dir = sysconfig.get_path("scripts")
+    except Exception:  # pragma: no cover - defensive
+        scripts_dir = None
 
+    if scripts_dir:
+        script_name = "zeanalyser.exe" if IS_WINDOWS else "zeanalyser"
+        candidate = Path(scripts_dir) / script_name
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return [str(candidate)]
+        except OSError:  # pragma: no cover - defensive
+            pass
+
+    return [sys.executable, "-m", ZEANALYSER_MODULE]
+
+
+def _detect_analysis_backend() -> Tuple[AnalysisBackend, Optional[Path], Optional[str]]:
+    """
+    Detect the available analysis backend.
+
+    - ZeAnalyser: discovered lazily through the *installed* distribution and
+      its public ``zeanalyser`` gui_scripts entry point (interop rule 19).
+      No sibling checkout, no sys.path, no private import.  An installed but
+      broken ZeAnalyser is treated as unavailable and reported through the
+      returned diagnostic (interop rule 20).
+    - Beforehand (ZeSeestarStacker): legacy sibling-folder detection, kept
+      exactly as-is (deferred M1-3B scope).
+    - Otherwise: "none".
+
+    Returns ``(backend, root, diagnostic)`` where ``root`` is only meaningful
+    for the "beforehand" backend and ``diagnostic`` explains why an installed
+    ZeAnalyser was reported unavailable (or is None).
+    """
+    state, diagnostic = _discover_zeanalyser()
+    if state == "available":
+        return "zeanalyser", None, None
+
+    # ZeAnalyser absent or broken: fall through to the legacy Beforehand
+    # detection (an alternative backend is preserved, interop rule 6).  An
+    # unhealthy installation keeps its diagnostic even when Beforehand wins.
     try:
         base_dir = get_app_base_dir()
     except Exception:
-        return "none", None
+        return "none", None, diagnostic
 
     toolbox_root = base_dir.parent
-
-    zeanalyser_dir = toolbox_root / "zeanalyser"
     beforehand_dir = toolbox_root / "seestar" / "beforehand"
 
-    # Priorité à ZeAnalyser si les deux existent
-    if safe_path_isdir(zeanalyser_dir):
-        return "zeanalyser", zeanalyser_dir
-
     if safe_path_isdir(beforehand_dir):
-        return "beforehand", beforehand_dir
+        return "beforehand", beforehand_dir, diagnostic
 
-    return "none", None
+    return "none", None, diagnostic
 
 if IS_WINDOWS:
     try:  # pragma: no cover - optional dependency for GPU detection
@@ -986,6 +1091,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._persisted_config_keys: set[str] = set()
         self.analysis_backend: AnalysisBackend = "none"
         self.analysis_backend_root: Optional[Path] = None
+        self.analysis_backend_diagnostic: Optional[str] = None
         self.analysis_button: QPushButton | None = None
         self.language_combo: QComboBox | None = None
         self.backend_combo: QComboBox | None = None
@@ -995,7 +1101,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # Force the flag off regardless of persisted config so the worker never
         # receives an enabled state from this GUI.
         self._disable_phase45_config()
-        self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
+        (
+            self.analysis_backend,
+            self.analysis_backend_root,
+            self.analysis_backend_diagnostic,
+        ) = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
             self._tr("qt_window_title_preview", "ZeMosaic V4.6.0, Continuum Sine Sutura")
@@ -1006,6 +1116,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         else:
             self.config.setdefault("gpu_selector", "CPU (no GPU)")
         self._initialize_log_level_prefixes()
+        if self.analysis_backend_diagnostic:
+            self._append_log(
+                f"[ZeAnalyser] {self.analysis_backend_diagnostic}",
+                level="warning",
+            )
         for path_key in (
             "astap_executable_path",
             "astap_data_directory_path",
@@ -6443,61 +6558,76 @@ class ZeMosaicQtMainWindow(QMainWindow):
         """
         Launch the selected analysis backend in a separate process (non-blocking).
 
-        - If backend == "zeanalyser": run analyse_gui_qt.py using the current Python
-          interpreter (sys.executable).
+        - If backend == "zeanalyser": launch the *installed* ZeAnalyser through
+          the current environment's entry-point script, falling back to
+          ``python -m zeanalyser`` (public launch contract; no checkout CWD).
         - If backend == "beforehand": for now, only show an informational message.
-        - If no backend or script is missing: show a warning and return gracefully.
+        - If no backend: show an informative message (including any ZeAnalyser
+          discovery diagnostic) and return gracefully.
         """
         backend = getattr(self, "analysis_backend", "none")
         root = getattr(self, "analysis_backend_root", None)
 
-        if backend == "none" or root is None:
-            QMessageBox.information(
-                self,
-                "Analysis",
-                "No analysis backend is available near this ZeMosaic installation.",
-            )
-            return
-
         if backend == "zeanalyser":
-            script = root / "analyse_gui_qt.py"
-            backend_label = "ZeAnalyser"
-        elif backend == "beforehand":
-            # For now, we do not auto-launch Beforehand, just inform the user.
-            QMessageBox.information(
-                self,
-                "Beforehand detected",
-                f"A 'beforehand' analysis workflow was detected here:\n\n{root}\n\n"
-                "Automatic launch is not wired yet. "
-                "You can still run your Beforehand tools manually from this folder.",
-            )
-            return
-        else:
-            QMessageBox.warning(
-                self,
-                "Analysis",
-                f"Unknown analysis backend: {backend}",
-            )
+            self._launch_installed_zeanalyser()
             return
 
-        # At this point we are in the ZeAnalyser case
-        if not script.is_file():
-            QMessageBox.warning(
-                self,
-                "Analysis",
-                f"Cannot find the analysis script:\n{script}",
-            )
+        if backend == "beforehand":
+            if root is None:
+                QMessageBox.information(
+                    self,
+                    "Analysis",
+                    "No analysis backend is available near this ZeMosaic installation.",
+                )
+            else:
+                # For now, we do not auto-launch Beforehand, just inform the user.
+                QMessageBox.information(
+                    self,
+                    "Beforehand detected",
+                    f"A 'beforehand' analysis workflow was detected here:\n\n{root}\n\n"
+                    "Automatic launch is not wired yet. "
+                    "You can still run your Beforehand tools manually from this folder.",
+                )
             return
 
-        # Use the same Python executable as the running ZeMosaic process
-        import sys
-        import subprocess
+        if backend == "none":
+            diagnostic = getattr(self, "analysis_backend_diagnostic", None)
+            if diagnostic:
+                QMessageBox.information(
+                    self,
+                    "Analysis",
+                    "ZeAnalyser is installed but cannot be used:\n\n" + str(diagnostic),
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Analysis",
+                    "No analysis backend is available near this ZeMosaic installation.",
+                )
+            return
 
-        cmd = [sys.executable, str(script)]
+        QMessageBox.warning(
+            self,
+            "Analysis",
+            f"Unknown analysis backend: {backend}",
+        )
+
+    def _launch_installed_zeanalyser(self) -> None:
+        """Launch the installed ZeAnalyser GUI in the current Python environment.
+
+        The command is resolved by :func:`_resolve_zeanalyser_launch_command`
+        (installed entry-point script first, ``python -m zeanalyser``
+        fallback).  No checkout working directory is passed: the installed
+        ZeAnalyser must not depend on the launch CWD.  The launch is
+        non-blocking so ZeMosaic stays responsive, and a launch failure is
+        reported through a critical dialog without affecting ZeMosaic itself
+        (failure stays local to the analysis integration).
+        """
+        cmd = _resolve_zeanalyser_launch_command()
 
         # Optional: log the command for debugging purposes
         try:
-            self._append_log(f"[INFO] [Analysis] Launching {backend_label}: {' '.join(cmd)}")
+            self._append_log(f"[INFO] [Analysis] Launching ZeAnalyser: {' '.join(cmd)}")
         except Exception:
             # Never fail just because logging failed
             pass
@@ -6506,7 +6636,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             # Non-blocking launch; ZeMosaic stays responsive.
             subprocess.Popen(
                 cmd,
-                cwd=str(root),
                 close_fds=False,  # portable, safe default
                 shell=False,      # avoid shell injection issues
                 creationflags=0,  # let OS decide; we keep it simple/portable
@@ -6515,8 +6644,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Analysis launch failed",
-                f"Failed to launch {backend_label}.\n\n"
-                f"Script: {script}\n"
+                "Failed to launch ZeAnalyser.\n\n"
+                f"Command: {' '.join(cmd)}\n"
                 f"Error: {exc}",
             )
 
