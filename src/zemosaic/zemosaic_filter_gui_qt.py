@@ -57,6 +57,7 @@ import importlib.util
 import os
 import platform
 import tempfile
+import shutil
 from os import path as ospath
 from pathlib import Path
 import math
@@ -399,6 +400,28 @@ except Exception:  # pragma: no cover - optional dependency guard
     compute_astap_recommended_max_instances = None  # type: ignore[assignment]
     solve_with_astap = None  # type: ignore[assignment]
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
+
+# --- Internal SolverPort boundary (lightweight; ZeSolver stays optional/lazy) ---
+# ``solver_port`` imports only the standard library and ``zesolver_adapter``
+# only resolves the public ``zesolver.api.v1`` lazily inside a solve/discovery
+# call.  Importing either here must never import ``zesolver`` itself, so the
+# Filter module keeps working when ZeSolver is not installed.
+try:  # pragma: no cover - optional solver boundary
+    from . import solver_port as _solver_port
+    from .solver_port import SOLVER_CHOICE_ASTAP, SOLVER_CHOICE_ZESOLVER
+    _SOLVER_PORT_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive fallback
+    _solver_port = None
+    SOLVER_CHOICE_ASTAP = "ASTAP"
+    SOLVER_CHOICE_ZESOLVER = "ZESOLVER"
+    _SOLVER_PORT_AVAILABLE = False
+
+try:  # pragma: no cover - optional solver boundary
+    from . import zesolver_adapter as _zesolver_adapter
+    _ZESOLVER_ADAPTER_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive fallback
+    _zesolver_adapter = None
+    _ZESOLVER_ADAPTER_AVAILABLE = False
 
 try:  # pragma: no cover - optional dependency guard
     from . import zemosaic_worker as _zemosaic_worker  # type: ignore
@@ -1636,7 +1659,13 @@ def _force_phase45_disabled(mapping: Any) -> None:
 
 
 class _DirectoryScanWorker(QObject):
-    """Background worker resolving missing WCS entries with ASTAP."""
+    """Background worker resolving missing WCS entries.
+
+    ASTAP remains the historical default; when the solver settings select
+    ``ZESOLVER`` the worker lazily discovers the optional ZeSolver public API
+    (once per run), attempts a ZeSolver solve first and falls back to ASTAP on
+    any unavailability/failure — but never after a cancellation.
+    """
 
     progress_changed = Signal(int, str)
     row_updated = Signal(int, dict)
@@ -1657,6 +1686,10 @@ class _DirectoryScanWorker(QObject):
         self._overrides = astap_overrides or {}
         self._stop_requested = False
         self._write_wcs_to_file = bool(self._overrides.get("write_wcs_to_file", False))
+        # ZeSolver state, owned by this worker's run (created once per scan,
+        # closed deterministically on success/failure/fallback/cancel/exception).
+        self._zesolver_discovery = None
+        self._zesolver_adapter = None
 
     @Slot()
     def run(self) -> None:
@@ -1666,8 +1699,20 @@ class _DirectoryScanWorker(QObject):
             self.finished.emit()
             return
 
+        solver_choice = self._resolve_solver_choice()
         astap_cfg = self._prepare_astap_configuration()
-        if astap_cfg is None:
+
+        # ZeSolver is optional and discovered lazily, once per run.  It is only
+        # the active backend when explicitly selected *and* the public API is
+        # healthy; any other state routes through the historical ASTAP path.
+        zesolver_active = False
+        if solver_choice == SOLVER_CHOICE_ZESOLVER:
+            zesolver_active = self._zesolver_active_for_run()
+
+        # ASTAP is still required when it is the effective backend (primary
+        # ASTAP path or the ZeSolver fallback).  When ZeSolver is healthy and
+        # active, a missing ASTAP is not an error — it just means no fallback.
+        if astap_cfg is None and not zesolver_active:
             message = self._localizer.get(
                 "filter.scan.astap_missing",
                 "ASTAP configuration is incomplete; skipping WCS solving.",
@@ -1680,7 +1725,11 @@ class _DirectoryScanWorker(QObject):
         pending_futures: list[Any] = []
         processed_count = 0
 
-        if astap_cfg is not None:
+        # The ASTAP executor/semaphore is only used for the primary ASTAP path.
+        # In ZeSolver mode solves run sequentially (simultaneous ZeSolver solves
+        # == 1) and the ASTAP fallback also runs inline; ASTAP concurrency
+        # settings are never reinterpreted as ZeSolver concurrency.
+        if not zesolver_active and astap_cfg is not None:
             executor = ThreadPoolExecutor(
                 max_workers=concurrency_value,
                 thread_name_prefix="FilterASTAP",
@@ -1825,6 +1874,32 @@ class _DirectoryScanWorker(QObject):
                             base_payload["RA"] = float(ra_deg)
                             base_payload["DEC"] = float(dec_deg)
 
+                if not has_wcs and header is not None and zesolver_active:
+                    solving_message = self._localizer.get(
+                        "filter.scan.solving_zesolver",
+                        "Solving WCS with ZeSolver…",
+                    )
+                    self.progress_changed.emit(self._progress_percent(processed_count, total), solving_message)
+                    solved_idx, solved_row = self._solve_zesolver_with_fallback(
+                        index,
+                        item,
+                        path,
+                        header,
+                        row_update.copy(),
+                        base_payload,
+                        astap_cfg,
+                    )
+                    self.row_updated.emit(solved_idx, solved_row)
+                    processed_count += 1
+                    completion_msg = self._localizer.get(
+                        "filter.scan.progress",
+                        "Processed {done}/{total} files.",
+                        done=processed_count,
+                        total=total,
+                    )
+                    self.progress_changed.emit(self._progress_percent(processed_count, total), completion_msg)
+                    continue
+
                 needs_astap = (
                     astap_cfg is not None
                     and not has_wcs
@@ -1888,11 +1963,290 @@ class _DirectoryScanWorker(QObject):
         finally:
             if executor is not None:
                 executor.shutdown(wait=True)
+            self._close_zesolver_adapter()
 
         self.finished.emit()
 
     def request_stop(self) -> None:
         self._stop_requested = True
+        # Cooperative cancellation of any in-flight ZeSolver solve.  No ASTAP
+        # fallback may run after this (handled by ``_stop_requested`` checks).
+        adapter = self._zesolver_adapter
+        if adapter is not None:
+            try:
+                cancel = getattr(adapter, "cancel_active_solve", None)
+                if callable(cancel):
+                    cancel()
+            except Exception:  # pragma: no cover - cancel must never raise
+                pass
+
+    # -- solver choice / ZeSolver helpers ------------------------------------
+
+    def _resolve_solver_choice(self) -> str:
+        """Return the effective solver choice (normalized, defaults to ASTAP)."""
+        choice = (
+            self._solver_settings.get("solver_choice")
+            or self._solver_settings.get("solver_method")
+            or SOLVER_CHOICE_ASTAP
+        )
+        try:
+            choice = str(choice).strip().upper()
+        except Exception:  # pragma: no cover - defensive
+            choice = SOLVER_CHOICE_ASTAP
+        return choice or SOLVER_CHOICE_ASTAP
+
+    def _get_zesolver_discovery(self):
+        """Lazily discover the optional ZeSolver public API (cached per run)."""
+        if not _ZESOLVER_ADAPTER_AVAILABLE:
+            return None
+        if self._zesolver_discovery is not None:
+            return self._zesolver_discovery
+        self._zesolver_discovery = _zesolver_adapter.discover_zesolver()
+        return self._zesolver_discovery
+
+    def _zesolver_active_for_run(self) -> bool:
+        """Return True when ZeSolver is healthy and usable for this run."""
+        discovery = self._get_zesolver_discovery()
+        if discovery is None:
+            return False
+        state = getattr(discovery, "state", None)
+        if state is None:
+            return False
+        state_value = getattr(state, "value", None)
+        if state_value is None:
+            state_value = str(state)
+        return state_value == "available"
+
+    def _get_zesolver_adapter(self):
+        """Return the run-scoped ZeSolverAdapter, created lazily on first use."""
+        if not _ZESOLVER_ADAPTER_AVAILABLE:
+            return None
+        if self._zesolver_adapter is not None:
+            return self._zesolver_adapter
+        self._zesolver_adapter = _zesolver_adapter.ZeSolverAdapter(
+            resources_path=self._solver_settings.get("zesolver_resources_path") or None,
+            gpu_policy=self._solver_settings.get("zesolver_gpu_policy") or None,
+        )
+        return self._zesolver_adapter
+
+    def _close_zesolver_adapter(self) -> None:
+        """Close the run-scoped ZeSolverAdapter (idempotent, never raises)."""
+        adapter = self._zesolver_adapter
+        self._zesolver_adapter = None
+        if adapter is not None:
+            try:
+                adapter.close()
+            except Exception:  # pragma: no cover - close must never raise
+                logger.debug("Qt Filter: ZeSolver adapter close failed", exc_info=True)
+
+    def _zesolver_progress(self, key, prog, lvl, **kwargs) -> None:
+        """Forward ZeSolver real-phase progress into the filter log."""
+        try:
+            logger.debug("Qt Filter ZeSolver progress: %s %s", key, kwargs)
+        except Exception:  # pragma: no cover - logging must never raise
+            pass
+
+    def _zesolver_log(self, msg_key, lvl="DEBUG", **kwargs) -> None:
+        """Forward ZeSolver log events into the filter log (diagnostics)."""
+        try:
+            logger.debug("Qt Filter ZeSolver: %s (lvl=%s) %s", msg_key, lvl, kwargs)
+        except Exception:  # pragma: no cover - logging must never raise
+            pass
+
+    @staticmethod
+    def _make_collision_safe_temp_copy(image_path: str) -> str | None:
+        """Copy a FITS to a collision-safe temporary sibling for a no-write solve."""
+        src = _expand_to_path(image_path)
+        if src is None or not src.is_file():
+            return None
+        try:
+            fd, tmp = tempfile.mkstemp(
+                prefix="zemosaic_zesolver_", suffix=".fits", dir=str(src.parent)
+            )
+            os.close(fd)
+            shutil.copyfile(str(src), tmp)
+            return tmp
+        except Exception:  # pragma: no cover - defensive I/O guard
+            return None
+
+    @staticmethod
+    def _cleanup_temp_path(temp_path: str | None) -> None:
+        if not temp_path:
+            return
+        try:
+            os.remove(temp_path)
+        except OSError:  # pragma: no cover - defensive
+            pass
+
+    def _run_zesolver_solve(self, image_path: str, header_obj: Any, write_inplace: bool):
+        """Run one ZeSolver solve honouring the Filter write-WCS semantics.
+
+        Write WCS ON  -> solve the original in place (ZeSolver OVERWRITE_INPUT).
+        Write WCS OFF -> solve a collision-safe temporary copy so the original
+                         FITS is never mutated; the solved header is returned
+                         in-memory and the temp is cleaned up on every path.
+        """
+        adapter = self._get_zesolver_adapter()
+        if adapter is None:
+            return None
+        if write_inplace:
+            return adapter.solve(
+                image_fits_path=image_path,
+                fits_header=header_obj,
+                settings=self._solver_settings,
+                progress_callback=self._zesolver_progress,
+                log=self._zesolver_log,
+            )
+        temp_path = self._make_collision_safe_temp_copy(image_path)
+        if temp_path is None:
+            # Cannot stage a safe copy -> fall back to ASTAP (never mutate the
+            # original here), reported by the caller as a ZeSolver failure.
+            return None
+        try:
+            return adapter.solve(
+                image_fits_path=temp_path,
+                fits_header=header_obj,
+                settings=self._solver_settings,
+                progress_callback=self._zesolver_progress,
+                log=self._zesolver_log,
+            )
+        finally:
+            self._cleanup_temp_path(temp_path)
+
+    @staticmethod
+    def _apply_solved_outcome(
+        row_snapshot: dict[str, Any],
+        payload: dict | None,
+        entry: _NormalizedItem,
+        solver_name: str,
+        wcs_obj: Any,
+        header_obj: Any,
+    ) -> dict[str, Any]:
+        """Normalize a solved row/cache with the backend that solved it."""
+        row_snapshot["solver"] = solver_name
+        row_snapshot["has_wcs"] = True
+        if payload is not None:
+            payload["has_wcs"] = True
+            payload["solver"] = solver_name
+        if wcs_obj is not None:
+            try:
+                entry.wcs_cache = wcs_obj
+            except Exception:  # pragma: no cover - defensive
+                pass
+        if header_obj is not None:
+            sanitized = _sanitize_header_subset(header_obj)
+            if sanitized is not None:
+                if payload is not None:
+                    payload["header"] = sanitized
+                try:
+                    entry.header_cache = sanitized
+                except Exception:  # pragma: no cover - defensive
+                    pass
+        return row_snapshot
+
+    def _solve_zesolver_with_fallback(
+        self,
+        idx: int,
+        entry: _NormalizedItem,
+        image_path: str,
+        header_obj: Any,
+        row_snapshot: dict[str, Any],
+        payload: dict | None,
+        astap_cfg: dict[str, Any] | None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Solve one file via ZeSolver, falling back to ASTAP on failure.
+
+        Cancellation is terminal: a cancelled solve (or a stop requested during
+        the fallback window) never triggers the ASTAP fallback.
+        """
+        display_name = _path_display_name(image_path)
+        write_inplace = bool(self._write_wcs_to_file)
+
+        outcome = None
+        zesolver_error = None
+        try:
+            outcome = self._run_zesolver_solve(image_path, header_obj, write_inplace)
+        except Exception as exc:  # pragma: no cover - defensive
+            zesolver_error = f"{type(exc).__name__}: {exc}"
+
+        if outcome is not None:
+            status = getattr(outcome, "status", None)
+            status_value = getattr(status, "value", None) if status is not None else None
+            if status_value is None:
+                status_value = str(status)
+            if status_value == "solved" and outcome.wcs is not None:
+                self._apply_solved_outcome(
+                    row_snapshot, payload, entry, "ZESOLVER", outcome.wcs, outcome.header
+                )
+                return idx, row_snapshot
+            if status_value == "cancelled":
+                if "error" not in row_snapshot:
+                    row_snapshot["error"] = self._localizer.get(
+                        "filter.scan.cancelled",
+                        "Solving cancelled for {name}.",
+                        name=display_name,
+                    )
+                return idx, row_snapshot
+
+        # Never fall back after a cancellation.
+        if self._stop_requested:
+            if "error" not in row_snapshot:
+                row_snapshot["error"] = self._localizer.get(
+                    "filter.scan.cancelled",
+                    "Solving cancelled for {name}.",
+                    name=display_name,
+                )
+            return idx, row_snapshot
+
+        # ASTAP fallback (configured/available only).
+        if astap_cfg is not None and solve_with_astap is not None and header_obj is not None:
+            wcs_result = None
+            try:
+                wcs_result = solve_with_astap(
+                    image_path,
+                    header_obj,
+                    astap_cfg["exe"],
+                    astap_cfg["data"],
+                    search_radius_deg=astap_cfg.get("radius"),
+                    downsample_factor=astap_cfg.get("downsample"),
+                    sensitivity=astap_cfg.get("sensitivity"),
+                    astap_drizzled_fallback_enabled=astap_cfg.get(
+                        "astap_drizzled_fallback_enabled", False
+                    ),
+                    timeout_sec=astap_cfg.get("timeout") or 180,
+                    update_original_header_in_place=write_inplace,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                row_snapshot["error"] = str(exc)
+                wcs_result = None
+
+            if wcs_result is not None and getattr(wcs_result, "is_celestial", False):
+                self._apply_solved_outcome(
+                    row_snapshot, payload, entry, "ASTAP", wcs_result, None
+                )
+                if write_inplace and header_obj is not None:
+                    try:
+                        _persist_wcs_header_if_requested(image_path, header_obj, True)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                return idx, row_snapshot
+            if "error" not in row_snapshot:
+                row_snapshot["error"] = self._localizer.get(
+                    "filter.scan.astap_failed",
+                    "ASTAP failed for {name}.",
+                    name=display_name,
+                )
+            return idx, row_snapshot
+
+        if "error" not in row_snapshot:
+            row_snapshot["error"] = self._localizer.get(
+                "filter.scan.solve_failed",
+                "Solver failed for {name}.",
+                name=display_name,
+            )
+            if zesolver_error:
+                row_snapshot["zesolver_error"] = zesolver_error
+        return idx, row_snapshot
 
     def _prepare_astap_configuration(self) -> dict[str, Any] | None:
         exe_candidates = [
