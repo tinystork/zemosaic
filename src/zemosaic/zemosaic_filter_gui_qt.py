@@ -1709,6 +1709,17 @@ class _DirectoryScanWorker(QObject):
         if solver_choice == SOLVER_CHOICE_ZESOLVER:
             zesolver_active = self._zesolver_active_for_run()
 
+        # Run-level diagnostic: when ZeSolver is selected but not usable,
+        # explain the fallback once (never once per FITS, never on cancel).
+        if solver_choice == SOLVER_CHOICE_ZESOLVER and not zesolver_active:
+            reason = self._zesolver_unavailable_reason(self._get_zesolver_discovery())
+            fallback_msg = self._localizer.get(
+                "filter.scan.zesolver_unavailable",
+                "ZeSolver unavailable ({reason}); falling back to ASTAP.",
+                reason=reason or "unavailable",
+            )
+            self.progress_changed.emit(self._progress_percent(0, total), fallback_msg)
+
         # ASTAP is still required when it is the effective backend (primary
         # ASTAP path or the ZeSolver fallback).  When ZeSolver is healthy and
         # active, a missing ASTAP is not an error — it just means no fallback.
@@ -1960,6 +1971,17 @@ class _DirectoryScanWorker(QObject):
                         total=total,
                     )
                     self.progress_changed.emit(self._progress_percent(processed_count, total), completion_msg)
+        except Exception as exc:
+            # Report unexpected (programmer) errors without silently swallowing
+            # them; adapter cleanup and the finished signal still run below.
+            try:
+                logger.exception("Qt Filter scan worker failed", exc_info=True)
+            except Exception:
+                pass
+            try:
+                self.error.emit(str(exc))
+            except Exception:
+                pass
         finally:
             if executor is not None:
                 executor.shutdown(wait=True)
@@ -2016,6 +2038,23 @@ class _DirectoryScanWorker(QObject):
         if state_value is None:
             state_value = str(state)
         return state_value == "available"
+
+    def _zesolver_unavailable_reason(self, discovery) -> str | None:
+        """Return a human-readable reason why ZeSolver is unavailable (or None)."""
+        if discovery is None:
+            return None
+        state = getattr(discovery, "state", None)
+        state_value = getattr(state, "value", None) if state is not None else None
+        if state_value is None:
+            state_value = str(state) if state is not None else None
+        if not state_value:
+            return str(getattr(discovery, "message", None) or "") or None
+        reason = str(state_value).replace("_", " ")
+        if state_value != "not_installed":
+            message = getattr(discovery, "message", None)
+            if message:
+                reason = f"{reason}: {message}"
+        return reason
 
     def _get_zesolver_adapter(self):
         """Return the run-scoped ZeSolverAdapter, created lazily on first use."""
@@ -2200,6 +2239,14 @@ class _DirectoryScanWorker(QObject):
 
         # ASTAP fallback (configured/available only).
         if astap_cfg is not None and solve_with_astap is not None and header_obj is not None:
+            failed_msg = self._localizer.get(
+                "filter.scan.zesolver_failed_fallback",
+                "ZeSolver solve failed for {name}; falling back to ASTAP.",
+                name=display_name,
+            )
+            self.progress_changed.emit(
+                self._progress_percent(idx, max(1, len(self._items))), failed_msg
+            )
             wcs_result = None
             try:
                 wcs_result = solve_with_astap(

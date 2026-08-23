@@ -14845,6 +14845,127 @@ def cluster_seestar_stacks(all_raw_files_with_info: list, stack_threshold_deg: f
     _log_and_callback("clusterstacks_info_finished", num_groups=len(groups), level="INFO", callback=progress_callback)
     return groups
 
+
+def _solver_outcome_is_cancelled(outcome) -> bool:
+    """Return ``True`` when a :class:`SolverOutcome` reports a cooperative cancel.
+
+    ZeSolver cancellation must be distinguished from a genuine solve failure so
+    the Phase 1 loop never moves the original FITS nor classifies the file as an
+    unsolved terminal failure.  The check is defensive: it works whether the
+    status is the internal :class:`SolveStatus` enum or a plain string.
+    """
+    if outcome is None:
+        return False
+    status = getattr(outcome, "status", None)
+    if status is None:
+        return False
+    try:
+        if SolveStatus is not None and status == SolveStatus.CANCELLED:
+            return True
+    except Exception:
+        pass
+    try:
+        return str(getattr(status, "value", status)) == "cancelled"
+    except Exception:
+        return False
+
+
+_PRE_RESOLVED_WCS_CARD_KEYS = frozenset(
+    (
+        "CTYPE1",
+        "CTYPE2",
+        "CRVAL1",
+        "CRVAL2",
+        "CRPIX1",
+        "CRPIX2",
+        "CDELT1",
+        "CDELT2",
+        "CD1_1",
+        "CD1_2",
+        "CD2_1",
+        "CD2_2",
+        "PC1_1",
+        "PC1_2",
+        "PC2_1",
+        "PC2_2",
+    )
+)
+
+
+def _merge_pre_resolved_wcs_cards(target_header, pre_resolved_header) -> None:
+    """Fold canonical FITS WCS/NAXIS cards from a pre-resolved header into ``target_header``.
+
+    The Qt Filter passes a lightweight in-memory header subset (e.g. the result of
+    a Write-WCS-OFF solve against a temp copy).  Only canonical WCS keywords are
+    copied so non-FITS helper keys (``shape``, ...) and unrelated metadata never
+    leak into a real ``fits.Header``.  Never writes to disk; best-effort.
+    """
+    if target_header is None or pre_resolved_header is None:
+        return
+    try:
+        source_items = pre_resolved_header.items()
+    except Exception:
+        try:
+            source_items = dict(pre_resolved_header).items()
+        except Exception:
+            return
+    for key, value in source_items:
+        try:
+            key_str = str(key)
+        except Exception:
+            continue
+        if key_str not in _PRE_RESOLVED_WCS_CARD_KEYS:
+            continue
+        try:
+            if hasattr(target_header, "set"):
+                target_header.set(key_str, value)
+            else:
+                target_header[key_str] = value
+        except Exception:
+            continue
+
+
+def _pre_resolved_header_for_path(path, phase0_lookup):
+    """Return the Filter-provided in-memory header for ``path`` (if any).
+
+    The header is validated later inside :func:`get_wcs_and_pretreat_raw_file`
+    (``has_wcs`` flags are never trusted here).  Returns ``None`` when no header
+    is available so the historical solver dispatch proceeds unchanged.
+    """
+    if not isinstance(phase0_lookup, dict):
+        return None
+    item = phase0_lookup.get(path)
+    if not isinstance(item, dict):
+        return None
+    return item.get("header") or item.get("header_subset")
+
+
+def _build_pre_resolved_wcs(pre_resolved_header):
+    """Validate a Filter-provided header and return its celestial WCS (or ``None``).
+
+    The header is treated as authoritative only when :func:`validate_wcs_header`
+    accepts it; ``has_wcs`` flags are never trusted.  Returns ``None`` when the
+    header is absent or invalid so the historical solver dispatch proceeds.
+    """
+    if pre_resolved_header is None:
+        return None
+    if hasattr(zemosaic_utils, "validate_wcs_header"):
+        try:
+            valid, wcs_obj, _reason = zemosaic_utils.validate_wcs_header(pre_resolved_header)
+        except Exception:
+            return None
+        return wcs_obj if (valid and wcs_obj is not None) else None
+    if hasattr(zemosaic_utils, "has_valid_wcs") and ASTROPY_AVAILABLE and WCS:
+        try:
+            if bool(zemosaic_utils.has_valid_wcs(pre_resolved_header)):
+                wcs_obj = WCS(pre_resolved_header, naxis=2, relax=True)
+                if getattr(wcs_obj, "is_celestial", False):
+                    return wcs_obj
+        except Exception:
+            return None
+    return None
+
+
 def get_wcs_and_pretreat_raw_file(
     file_path: str,
     astap_exe_path: str,
@@ -14856,6 +14977,7 @@ def get_wcs_and_pretreat_raw_file(
     progress_callback: callable,
     hotpix_mask_dir: str | None = None,
     solver_settings: dict | None = None,
+    pre_resolved_header=None,
 ):
     filename = _safe_basename(file_path)
     # Utiliser une fonction helper pour les logs internes à cette fonction si _log_and_callback
@@ -15082,7 +15204,32 @@ def get_wcs_and_pretreat_raw_file(
     skip_solver_due_to_existing_wcs = False
     wcs_validation_reason = None
     preexisting_wcs_obj = None
-    if header_for_wcs_check is not None and hasattr(zemosaic_utils, "validate_wcs_header"):
+
+    # --- Pre-resolved WCS/header reuse (Filter in-memory solved WCS) ---
+    # When the Qt Filter already solved this file (e.g. Write WCS OFF solved a
+    # temp copy and kept the WCS/header in memory), reuse that validated WCS
+    # instead of re-solving the original FITS.  The actual header/WCS is
+    # validated here; ``has_wcs`` flags are never trusted blindly.  The original
+    # FITS is never modified (no solver call, no header write-back).
+    pre_resolved_wcs = _build_pre_resolved_wcs(pre_resolved_header)
+    if pre_resolved_header is not None and pre_resolved_wcs is None:
+        _pcb_local(
+            "getwcs_info_presolved_header_invalid",
+            lvl="DEBUG_DETAIL",
+            filename=filename,
+        )
+
+    if pre_resolved_wcs is not None:
+        # Valid Filter-resolved WCS: reuse it, skip the solver, no on-disk write.
+        skip_solver_due_to_existing_wcs = True
+        preexisting_wcs_obj = pre_resolved_wcs
+        wcs_validation_reason = None
+        _pcb_local(
+            f"    WCS réutilisé depuis le pré-résultat du filtre pour '{filename}'.",
+            lvl="DEBUG_DETAIL",
+        )
+        _merge_pre_resolved_wcs_cards(header_orig, pre_resolved_header)
+    elif header_for_wcs_check is not None and hasattr(zemosaic_utils, "validate_wcs_header"):
         try:
             valid_wcs, candidate_wcs, failure_reason = zemosaic_utils.validate_wcs_header(header_for_wcs_check)
         except Exception as exc_validate_hdr:
@@ -15145,6 +15292,7 @@ def get_wcs_and_pretreat_raw_file(
     # Nous ne réécrivons le header que si un solver externe (ASTAP/ASTROMETRY/ANSVR)
     # a effectivement injecté/ajusté des clés WCS dans header_orig.
     should_write_header_back = False
+    solve_cancelled = False
     if preexisting_wcs_obj is not None:
         skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
         _pcb_local(skip_msg, lvl="INFO")
@@ -15206,6 +15354,8 @@ def get_wcs_and_pretreat_raw_file(
                 astap_timeout_seconds=astap_timeout_seconds,
                 astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
             )
+            if _solver_outcome_is_cancelled(outcome):
+                solve_cancelled = True
             if outcome.wcs is not None:
                 wcs_brute = outcome.wcs
                 should_write_header_back = outcome.should_write_header_back
@@ -15245,6 +15395,21 @@ def get_wcs_and_pretreat_raw_file(
                 _write_header_to_fits(file_path, header_orig, _pcb_local)
             return img_data_processed_adu, wcs_brute, header_orig, hp_mask_path
         # else: tombe dans le bloc de déplacement ci-dessous
+
+    # --- Cancellation guard: never move/fallback a cooperatively-cancelled solve ---
+    # A cancelled solve (ZeSolver CANCELLED) is not an unsolved terminal failure:
+    # the run is shutting down and the original FITS must stay in place.
+    if solve_cancelled:
+        _pcb_local(
+            "getwcs_info_solve_cancelled_no_move",
+            lvl="INFO",
+            filename=filename,
+        )
+        logger.info("Solve cancelled for '%s'; original FITS left in place.", filename)
+        if img_data_processed_adu is not None:
+            del img_data_processed_adu
+        gc.collect()
+        return None, None, None, None
 
     # Si on arrive ici, c'est que wcs_brute est None ou non céleste
     _pcb_local("getwcs_action_moving_unsolved_file", lvl="WARN", filename=filename)
@@ -25771,7 +25936,8 @@ def run_hierarchical_mosaic_classic_legacy(
                         180,
                         progress_callback,
                         temp_image_cache_dir,
-                        solver_settings
+                        solver_settings,
+                        pre_resolved_header=_pre_resolved_header_for_path(f_path, phase0_lookup),
                     ): f_path for f_path in batch
                 }
     
@@ -31968,7 +32134,8 @@ def run_hierarchical_mosaic(
                     180,
                     progress_callback,
                     temp_image_cache_dir,
-                    solver_settings
+                    solver_settings,
+                    pre_resolved_header=_pre_resolved_header_for_path(f_path, phase0_lookup),
                 ): f_path for f_path in batch
             }
 

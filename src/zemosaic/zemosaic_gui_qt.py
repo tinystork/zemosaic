@@ -1157,6 +1157,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_filtered_header_items: List[Any] | None = None
         self._worker_start_thread: threading.Thread | None = None
         self._worker_start_result: tuple[bool, str | None] | None = None
+        self._closing: bool = False
+        self._worker_start_pending: bool = False
 
         self._stage_aliases = {
             "phase1_scan": "phase1",
@@ -6328,6 +6330,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        # Mark closing before any async decision completes so a pending spawn can
+        # never finalize/attach after the window has started shutting down.
+        self._closing = True
         self._record_splitter_states()
         self._record_window_geometry()
         self._collect_config_from_widgets()
@@ -6368,6 +6373,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         skip_filter_prompt: bool,
         predecided_skip_filter_ui: bool | None = None,
     ) -> None:
+        if self._closing:
+            return
         if self.is_processing:
             QMessageBox.warning(
                 self,
@@ -6448,8 +6455,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         worker_args: Sequence[Any],
         worker_kwargs: Dict[str, Any],
     ) -> None:
+        if self._closing:
+            return
         if self._worker_start_thread is not None:
             return
+        self._worker_start_pending = True
         self._worker_start_result = None
         self.start_button.setEnabled(False)
         self.filter_button.setEnabled(False)
@@ -6483,9 +6493,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
             QTimer.singleShot(100, self._poll_worker_start_result)
             return
         self._worker_start_thread = None
+        self._worker_start_pending = False
         result = self._worker_start_result or (False, self._tr("qt_error_start_worker_generic", "Failed to start worker process."))
         self._worker_start_result = None
         started, payload = result
+        if self._closing:
+            # Shutdown began while the spawn was pending.  Never finalize/attach,
+            # never re-enable buttons or show startup-failure UI.  If a process
+            # was returned, terminate and clean it up immediately.
+            if started:
+                queue_obj, process = payload  # type: ignore[misc]
+                self._discard_spawned_worker(queue_obj, process)
+            return
         if started:
             queue_obj, process = payload  # type: ignore[misc]
             try:
@@ -6497,6 +6516,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
         else:
             error_message = payload
             self._handle_worker_start_failure(error_message if isinstance(error_message, str) else None)
+
+    def _discard_spawned_worker(self, queue_obj: Any, process: Any) -> None:
+        """Terminate and clean up a worker process spawned during shutdown."""
+        if process is not None:
+            try:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=0.5)
+            except Exception:
+                pass
+        if queue_obj is not None:
+            try:
+                queue_obj.close()
+            except Exception:
+                pass
 
     def _finalize_successful_worker_start(self) -> None:
         self.is_processing = True
