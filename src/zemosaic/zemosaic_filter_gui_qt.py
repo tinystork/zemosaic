@@ -408,12 +408,19 @@ except Exception:  # pragma: no cover - optional dependency guard
 # Filter module keeps working when ZeSolver is not installed.
 try:  # pragma: no cover - optional solver boundary
     from . import solver_port as _solver_port
-    from .solver_port import SOLVER_CHOICE_ASTAP, SOLVER_CHOICE_ZESOLVER
+    from .solver_port import (
+        SOLVER_CHOICE_ASTAP,
+        SOLVER_CHOICE_ZESOLVER,
+        count_filter_handoff_wcs,
+        header_carries_wcs_material,
+    )
     _SOLVER_PORT_AVAILABLE = True
 except Exception:  # pragma: no cover - defensive fallback
     _solver_port = None
     SOLVER_CHOICE_ASTAP = "ASTAP"
     SOLVER_CHOICE_ZESOLVER = "ZESOLVER"
+    count_filter_handoff_wcs = None  # type: ignore
+    header_carries_wcs_material = None  # type: ignore
     _SOLVER_PORT_AVAILABLE = False
 
 try:  # pragma: no cover - optional solver boundary
@@ -1793,6 +1800,10 @@ class _DirectoryScanWorker(QObject):
                 if payload is not None:
                     payload["has_wcs"] = True
                 try:
+                    entry.has_wcs = True
+                except Exception:
+                    pass
+                try:
                     entry.wcs_cache = wcs_result
                 except Exception:
                     pass
@@ -2164,6 +2175,10 @@ class _DirectoryScanWorker(QObject):
         """Normalize a solved row/cache with the backend that solved it."""
         row_snapshot["solver"] = solver_name
         row_snapshot["has_wcs"] = True
+        try:
+            entry.has_wcs = True
+        except Exception:  # pragma: no cover - defensive
+            pass
         if payload is not None:
             payload["has_wcs"] = True
             payload["solver"] = solver_name
@@ -2539,6 +2554,9 @@ class FilterQtDialog(QDialog):
             # Keep the explicit max-raw cap (0 = unlimited) so autosplit respects the choice.
             self._config_overrides["max_raw_per_master_tile"] = int(self._max_raw_per_tile_value)
         self._accepted = False
+        self._reject_pending = False
+        self._close_pending = False
+        self._accept_pending = False
 
         self._localizer = self._load_localizer()
         self._normalized_items: list[_NormalizedItem] = []
@@ -7372,6 +7390,9 @@ class FilterQtDialog(QDialog):
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_worker.finished.connect(self._scan_worker.deleteLater)
+        self._scan_thread.finished.connect(
+            lambda t=self._scan_thread: self._on_scan_thread_finished(t)
+        )
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
         self._debug_log("[Filter] Analyse clicked — starting directory crawl…")
         self._scan_thread.start()
@@ -8578,8 +8599,67 @@ class FilterQtDialog(QDialog):
         super().resizeEvent(event)
         self._update_overlay_geometry()
 
+    def _disable_dialog_actions(self) -> None:
+        """Disable actions that could complete/destroy the dialog mid-scan.
+
+        Disables Analyse (re-run), Ok (accept) and Cancel (reject) so that no
+        user interaction can complete the dialog while a directory scan is
+        still winding down.  ``_restore_dialog_actions`` re-enables them only
+        once the real ``QThread.finished`` event has been observed and no
+        reject/close/accept completion is pending.
+        """
+        if self._run_analysis_btn is not None:
+            self._run_analysis_btn.setEnabled(False)
+        try:
+            button_box = self._dialog_button_box
+            if button_box is not None:
+                for role in (QDialogButtonBox.Ok, QDialogButtonBox.Cancel):
+                    button = button_box.button(role)
+                    if button is not None:
+                        button.setEnabled(False)
+        except Exception:
+            pass
+
+    def _dialog_completion_pending(self) -> bool:
+        """Return True when a deferred reject/accept/close completion is pending."""
+        return self._reject_pending or self._accept_pending or self._close_pending
+
+    def _restore_dialog_actions(self) -> None:
+        """Re-enable actions that ``_disable_dialog_actions`` disabled."""
+        if self._run_analysis_btn is not None:
+            self._run_analysis_btn.setEnabled(True)
+        try:
+            button_box = self._dialog_button_box
+            if button_box is not None:
+                for role in (QDialogButtonBox.Ok, QDialogButtonBox.Cancel):
+                    button = button_box.button(role)
+                    if button is not None:
+                        button.setEnabled(True)
+        except Exception:
+            pass
+
+    def _cooperative_stop_scan(self) -> None:
+        """Request a cooperative stop of any active directory scan.
+
+        ``request_stop`` sets the worker's ``_stop_requested`` flag and cancels
+        any in-flight ZeSolver solve via the adapter's ``cancel_active_solve``;
+        it never blocks and never calls ``QThread.terminate``.
+        """
+        worker = self._scan_worker
+        if worker is not None:
+            worker.request_stop()
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._persist_window_geometry()
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            # A directory scan is still running: defer the close until the
+            # worker/thread have stopped (see ``_finalize_pending_dialog``).
+            # Never call ``_stop_scan_worker``/``terminate`` here.
+            self._close_pending = True
+            self._disable_dialog_actions()
+            self._cooperative_stop_scan()
+            event.ignore()
+            return
         self._stop_stream_worker()
         self._stop_scan_worker()
         self._hide_processing_overlay()
@@ -8600,15 +8680,33 @@ class FilterQtDialog(QDialog):
 
     def accept(self) -> None:  # noqa: D401 - inherit docstring
         self._accepted = True
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self._accept_pending = True
+            self._disable_dialog_actions()
+            self._cooperative_stop_scan()
+            return
         super().accept()
 
     def reject(self) -> None:  # noqa: D401 - inherit docstring
         self._accepted = False
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self._reject_pending = True
+            self._disable_dialog_actions()
+            self._cooperative_stop_scan()
+            return
         super().reject()
 
     # ------------------------------------------------------------------
     # Public helpers queried by ``launch_filter_interface_qt``
     # ------------------------------------------------------------------
+    @staticmethod
+    def _log_filter_handoff(metric: str, value: Any) -> None:
+        """Emit a single FILTER_HANDOFF diagnostic line (best-effort)."""
+        try:
+            logger.info("FILTER_HANDOFF %s=%s", metric, value)
+        except Exception:  # pragma: no cover - logging must never raise
+            pass
+
     def _serialize_entry_for_worker(
         self,
         entry: _NormalizedItem,
@@ -8640,8 +8738,6 @@ class FilterQtDialog(QDialog):
         if row_index is not None:
             payload.setdefault("index", row_index)
 
-        payload["has_wcs"] = bool(entry.has_wcs or payload.get("wcs"))
-
         if entry.instrument and not payload.get("instrument"):
             payload["instrument"] = entry.instrument
         if entry.group_label and not payload.get("group_label"):
@@ -8658,8 +8754,71 @@ class FilterQtDialog(QDialog):
             or payload.get("header_subset")
             or getattr(entry, "header_cache", None)
         )
+        # Invariant: a solved entry (has_wcs) must carry its solved WCS header
+        # even in Write-WCS-OFF / stream mode, where the original FITS on disk
+        # has no WCS.  If no cached header is available yet — or the cached
+        # header carries no WCS material (e.g. an ASTAP Write-WCS-OFF solve
+        # that cached the on-disk header plus a WCS object but never wrote the
+        # WCS back to disk) — reconstruct one from the cached WCS object so the
+        # worker never has to re-solve.
+        wcs_cache = getattr(entry, "wcs_cache", None)
+        solved = (
+            bool(getattr(entry, "has_wcs", False))
+            or bool(payload.get("has_wcs"))
+            or wcs_cache is not None
+        )
+        header_has_wcs = (
+            header_carries_wcs_material(header_obj)
+            if header_carries_wcs_material is not None
+            else False
+        )
+        if solved and (header_obj is None or not header_has_wcs):
+            wcs_header = None
+            to_header = getattr(wcs_cache, "to_header", None)
+            if callable(to_header):
+                reconstructed = None
+                try:
+                    reconstructed = to_header()
+                except TypeError:
+                    try:
+                        reconstructed = to_header(relax=True)
+                    except Exception:  # pragma: no cover - defensive
+                        reconstructed = None
+                except Exception:  # pragma: no cover - defensive
+                    reconstructed = None
+                if reconstructed is not None:
+                    wcs_header = _sanitize_header_subset(reconstructed)
+            if wcs_header is not None:
+                if header_obj is None:
+                    header_obj = wcs_header
+                else:
+                    # Preserve useful non-WCS metadata from the existing
+                    # header/subset and overlay the solved WCS cards so a solved
+                    # entry always serialises a complete WCS header.
+                    try:
+                        merged = dict(header_obj)
+                    except Exception:  # pragma: no cover - defensive
+                        merged = _sanitize_header_subset(header_obj) or {}
+                    merged.update(wcs_header)
+                    header_obj = merged
         if include_header and header_obj is not None:
             payload["header"] = header_obj
+
+        # Compute ``has_wcs`` from authoritative WCS material, never from a
+        # single flag that may still be False because the GUI signal round-trip
+        # has not run yet.  A solved in-memory entry (header_cache/wcs_cache)
+        # must always serialize ``has_wcs=True``.
+        header_material_has_wcs = (
+            header_carries_wcs_material(header_obj)
+            if header_carries_wcs_material is not None
+            else False
+        )
+        payload["has_wcs"] = bool(
+            entry.has_wcs
+            or payload.get("has_wcs")
+            or getattr(entry, "wcs_cache", None) is not None
+            or header_material_has_wcs
+        )
 
         # Surface RA/DEC + footprint metadata for downstream grouping parity.
         ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
@@ -8685,16 +8844,26 @@ class FilterQtDialog(QDialog):
             return True
         if getattr(entry, "wcs_cache", None) is not None:
             return True
+        # A solved entry must always carry its solved WCS header, even in
+        # stream-scan mode where the on-disk header has no WCS (Write WCS OFF).
+        if getattr(entry, "has_wcs", False):
+            return True
         return not self._stream_scan
 
     def selected_items(self) -> List[Any]:
         results: list[Any] = []
+        with_header_count = 0
         for row, entry in enumerate(self._normalized_items):
             if self._entry_is_checked(row):
                 include_header = self._should_include_header_for_entry(entry)
-                results.append(
-                    self._serialize_entry_for_worker(entry, row, include_header=include_header)
-                )
+                item = self._serialize_entry_for_worker(entry, row, include_header=include_header)
+                results.append(item)
+                if isinstance(item, dict) and (item.get("header") or item.get("header_subset")):
+                    with_header_count += 1
+        _, valid_wcs = count_filter_handoff_wcs(results) if count_filter_handoff_wcs is not None else (len(results), 0)
+        self._log_filter_handoff("dialog_selected_count", len(results))
+        self._log_filter_handoff("dialog_with_header_count", with_header_count)
+        self._log_filter_handoff("dialog_valid_wcs_count", valid_wcs)
         return results
 
     def was_accepted(self) -> bool:
@@ -9367,7 +9536,59 @@ class FilterQtDialog(QDialog):
             pass
         self._append_log(message, level="ERROR")
 
+    def _finalize_pending_dialog(self) -> None:
+        """Complete a deferred accept/reject/close once the scan thread stopped.
+
+        Called from ``_on_scan_thread_finished`` (which is connected to
+        ``QThread.finished`` before the thread's deferred deletion), so by the
+        time this runs the directory-scan thread is no longer executing and the
+        dialog can be destroyed safely.
+        """
+        reject_pending = self._reject_pending
+        accept_pending = self._accept_pending
+        close_pending = self._close_pending
+        self._reject_pending = False
+        self._accept_pending = False
+        self._close_pending = False
+        if reject_pending:
+            self._accepted = False
+            super().reject()
+        elif accept_pending:
+            self._accepted = True
+            super().accept()
+        elif close_pending:
+            self.close()
+
+    def _on_scan_thread_finished(self, thread: QThread | None = None) -> None:
+        """Handle the real ``QThread.finished`` event for a directory scan.
+
+        This runs only after the scan thread is no longer executing.  It is
+        connected *before* the thread's deferred ``deleteLater`` so that the
+        dialog references are cleared and any deferred completion is finalized
+        while the thread object is still valid.
+
+        ``thread`` is the specific thread captured at connection time; a stale
+        ``finished`` signal from an older scan is ignored so it cannot clear a
+        newer scan's references.
+        """
+        if thread is None:
+            return
+        if self._scan_thread is not None and self._scan_thread is not thread:
+            # A newer scan owns the references now; ignore this stale signal.
+            return
+        self._scan_thread = None
+        self._scan_worker = None
+        if not self._dialog_completion_pending():
+            self._restore_dialog_actions()
+        self._finalize_pending_dialog()
+
     def _on_scan_finished(self) -> None:
+        # The scan worker emitted ``finished``, but the underlying ``QThread``
+        # has *not* necessarily finished yet.  Do not clear
+        # ``_scan_thread``/``_scan_worker`` here and do not re-enable dialog
+        # actions while a reject/close/accept completion is pending: both are
+        # deferred to ``_on_scan_thread_finished``, which runs only after the
+        # real ``QThread.finished`` event (see below).
         if self._scan_row_update_timer.isActive():
             try:
                 self._scan_row_update_timer.stop()
@@ -9375,10 +9596,6 @@ class FilterQtDialog(QDialog):
                 pass
         self._flush_scan_row_updates()
         self._hide_processing_overlay()
-        if self._run_analysis_btn is not None:
-            self._run_analysis_btn.setEnabled(True)
-        self._scan_thread = None
-        self._scan_worker = None
         completed_text = self._localizer.get("filter.scan.completed", "Analysis completed.")
         self._status_label.setText(completed_text)
         self._append_log(completed_text)

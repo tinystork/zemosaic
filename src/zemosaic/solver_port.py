@@ -166,6 +166,75 @@ def _basename(path: Any) -> str:
         return str(path)
 
 
+def header_carries_wcs_material(header: Any) -> bool:
+    """Return True when *header* carries the minimum FITS WCS material.
+
+    Lightweight structural check with no astropy dependency: requires CTYPE1/2
+    and CRVAL1/2 and CRPIX1/2 plus either a full CD matrix or a PC matrix with
+    a CDELT pair.  This is the *diagnostic* FILTER_HANDOFF check only; the
+    authoritative validation remains :func:`zemosaic_utils.validate_wcs_header`.
+    """
+    if header is None:
+        return False
+
+    def _get(key: str) -> Any:
+        try:
+            if hasattr(header, "get"):
+                return header.get(key)
+            return header[key]
+        except Exception:
+            return None
+
+    def _nonempty(value: Any) -> bool:
+        if value is None:
+            return False
+        try:
+            return bool(str(value).strip())
+        except Exception:
+            return False
+
+    def _num(value: Any) -> bool:
+        if value is None:
+            return False
+        try:
+            float(value)
+            return True
+        except Exception:
+            return False
+
+    if not (_nonempty(_get("CTYPE1")) and _nonempty(_get("CTYPE2"))):
+        return False
+    for key in ("CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2"):
+        if not _num(_get(key)):
+            return False
+    has_cd = all(_num(_get(k)) for k in ("CD1_1", "CD1_2", "CD2_1", "CD2_2"))
+    has_pc_cdelt = (
+        all(_num(_get(k)) for k in ("PC1_1", "PC1_2", "PC2_1", "PC2_2"))
+        and all(_num(_get(k)) for k in ("CDELT1", "CDELT2"))
+    )
+    return has_cd or has_pc_cdelt
+
+
+def count_filter_handoff_wcs(items: Any) -> tuple[int, int]:
+    """Return ``(total, valid_wcs)`` for an iterable of Filter handoff items.
+
+    A handoff item is a plain mapping with an optional ``header`` /
+    ``header_subset`` key.  Only items whose header carries the minimum WCS
+    material count as "valid".  Never raises.
+    """
+    if not isinstance(items, (list, tuple)):
+        return 0, 0
+    total = len(items)
+    valid = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        header = item.get("header") or item.get("header_subset")
+        if header_carries_wcs_material(header):
+            valid += 1
+    return total, valid
+
+
 # ---------------------------------------------------------------------------
 # Legacy adapter: faithful preservation of the pre-port dispatch.
 # ---------------------------------------------------------------------------

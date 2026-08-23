@@ -13304,6 +13304,8 @@ try:
         LegacySolverAdapter,
         SolveStatus,
         SOLVER_CHOICE_ZESOLVER,
+        count_filter_handoff_wcs,
+        header_carries_wcs_material,
     )
     _SOLVER_PORT_AVAILABLE = True
 except Exception as _e_solver_port_imp:  # pragma: no cover - defensive
@@ -13313,6 +13315,8 @@ except Exception as _e_solver_port_imp:  # pragma: no cover - defensive
     LegacySolverAdapter = None  # type: ignore
     SolveStatus = None  # type: ignore
     SOLVER_CHOICE_ZESOLVER = "ZESOLVER"
+    count_filter_handoff_wcs = None  # type: ignore
+    header_carries_wcs_material = None  # type: ignore
     _SOLVER_PORT_AVAILABLE = False
 
 try:
@@ -14925,6 +14929,59 @@ def _merge_pre_resolved_wcs_cards(target_header, pre_resolved_header) -> None:
             continue
 
 
+def _phase0_lookup_key(path) -> str:
+    """Return a deterministic lookup key for ``path`` (str/Path, any spelling).
+
+    Uses casefold + expanduser (no symlink/realpath resolution) so relative,
+    absolute and ``~``-expanded spellings of the same file map to one key
+    without changing path semantics.  Never raises.
+    """
+    try:
+        key = casefold_path(path, expanduser=True)
+        if key:
+            return key
+    except Exception:
+        pass
+    try:
+        return os.path.normcase(os.path.expanduser(os.fspath(path)))
+    except Exception:
+        try:
+            return str(path)
+        except Exception:
+            return ""
+
+
+def _log_filter_handoff(metric: str, value) -> None:
+    """Emit a single FILTER_HANDOFF diagnostic line (best-effort)."""
+    try:
+        logger.info("FILTER_HANDOFF %s=%s", metric, value)
+    except Exception:  # pragma: no cover - logging must never raise
+        pass
+
+
+def _build_phase0_lookup(phase0_header_items) -> dict:
+    """Build the Phase-0 path lookup keyed by raw path plus a normalized key.
+
+    Keeping the raw ``item["path"]`` key preserves the existing
+    ``phase0_lookup.get(file_path_original)`` behaviour, while the additional
+    normalized key lets ``_pre_resolved_header_for_path`` match a Phase-1 path
+    whose spelling differs (relative/absolute/expanded) without resolving
+    symlinks.  ``setdefault`` avoids overwriting a raw key on collision.
+    """
+    lookup: dict = {}
+    for item in phase0_header_items:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("path")
+        if not raw:
+            continue
+        lookup[raw] = item
+        norm = _phase0_lookup_key(raw)
+        if norm and norm != raw:
+            lookup.setdefault(norm, item)
+    return lookup
+
+
 def _pre_resolved_header_for_path(path, phase0_lookup):
     """Return the Filter-provided in-memory header for ``path`` (if any).
 
@@ -14935,6 +14992,11 @@ def _pre_resolved_header_for_path(path, phase0_lookup):
     if not isinstance(phase0_lookup, dict):
         return None
     item = phase0_lookup.get(path)
+    if not isinstance(item, dict):
+        # Path spelling may differ between the Phase-1 loop and the Filter
+        # payload (relative/absolute/expanded).  Fall back to a deterministic
+        # normalized key without changing semantics.
+        item = phase0_lookup.get(_phase0_lookup_key(path))
     if not isinstance(item, dict):
         return None
     return item.get("header") or item.get("header_subset")
@@ -15296,7 +15358,10 @@ def get_wcs_and_pretreat_raw_file(
     should_write_header_back = False
     solve_cancelled = False
     if preexisting_wcs_obj is not None:
-        skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
+        if pre_resolved_wcs_reused:
+            skip_msg = f"Skip WCS solve for '{filename}' (Filter pre-resolved WCS reused)."
+        else:
+            skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
         _pcb_local(skip_msg, lvl="INFO")
         logger.info(skip_msg)
     if wcs_brute is None and ASTROPY_AVAILABLE and WCS: # S'assurer que WCS est bien l'objet d'Astropy
@@ -24934,11 +24999,7 @@ def run_hierarchical_mosaic_classic_legacy(
                 elif header is not None:
                     item["header"] = header
                 phase0_header_items.append(item)
-            phase0_lookup = {
-                item["path"]: item
-                for item in phase0_header_items
-                if isinstance(item, dict) and item.get("path")
-            }
+            phase0_lookup = _build_phase0_lookup(phase0_header_items)
             if isinstance(filter_overrides, dict):
                 try:
                     if "cluster_panel_threshold" in filter_overrides:
@@ -25513,6 +25574,13 @@ def run_hierarchical_mosaic_classic_legacy(
         filter_invoked_arg = filter_invoked
         filter_overrides_arg = filter_overrides
         filtered_header_items_arg = filtered_header_items
+
+        # FILTER_HANDOFF boundary: what the worker process received.
+        _received_total, _received_valid = count_filter_handoff_wcs(filtered_header_items_arg) if count_filter_handoff_wcs is not None else (0, 0)
+        _log_filter_handoff("worker_received_count", _received_total)
+        _log_filter_handoff("worker_received_valid_wcs_count", _received_valid)
+        pcb(f"FILTER_HANDOFF worker_received_count={_received_total}", prog=None, lvl="INFO_DETAIL")
+        pcb(f"FILTER_HANDOFF worker_received_valid_wcs_count={_received_valid}", prog=None, lvl="INFO_DETAIL")
     
         skip_filter_ui = bool(skip_filter_ui)
         # Resolve early filter enable policy: explicit argument takes precedence,
@@ -25591,6 +25659,12 @@ def run_hierarchical_mosaic_classic_legacy(
                     filtered_items = list(header_items_for_filter)
                 except Exception:
                     filtered_items = header_items_for_filter
+                _adopt_total, _adopt_valid = count_filter_handoff_wcs(header_items_for_filter) if count_filter_handoff_wcs is not None else (len(header_items_for_filter), 0)
+                pcb(
+                    f"FILTER_HANDOFF adopted {_adopt_total} pre-resolved Filter item(s), {_adopt_valid} with valid WCS",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
     
             solver_payload_for_filter = solver_settings if isinstance(solver_settings, dict) else None
             config_payload_for_filter = {
@@ -25821,7 +25895,13 @@ def run_hierarchical_mosaic_classic_legacy(
             phase0_header_items = []
             pcb("Phase 0: header scan unavailable (Astropy missing)", prog=None, lvl="WARN")
     
-        phase0_lookup = {item["path"]: item for item in phase0_header_items if isinstance(item, dict) and item.get("path")}
+        phase0_lookup = _build_phase0_lookup(phase0_header_items)
+        # FILTER_HANDOFF boundary: what Phase 0 actually adopted.
+        _adopted_total, _adopted_valid = count_filter_handoff_wcs(phase0_header_items) if count_filter_handoff_wcs is not None else (0, 0)
+        _log_filter_handoff("phase0_adopted_count", _adopted_total)
+        _log_filter_handoff("phase0_valid_wcs_count", _adopted_valid)
+        pcb(f"FILTER_HANDOFF phase0_adopted_count={_adopted_total}", prog=None, lvl="INFO_DETAIL")
+        pcb(f"FILTER_HANDOFF phase0_valid_wcs_count={_adopted_valid}", prog=None, lvl="INFO_DETAIL")
         per_frame_info = _estimate_per_frame_cost_mb(phase0_header_items)
         auto_caps_info = _compute_auto_tile_caps(
             resource_probe_info,
@@ -31724,6 +31804,13 @@ def run_hierarchical_mosaic(
     filter_overrides_arg = filter_overrides
     filtered_header_items_arg = filtered_header_items
 
+    # FILTER_HANDOFF boundary: what the worker process received.
+    _received_total, _received_valid = count_filter_handoff_wcs(filtered_header_items_arg) if count_filter_handoff_wcs is not None else (0, 0)
+    _log_filter_handoff("worker_received_count", _received_total)
+    _log_filter_handoff("worker_received_valid_wcs_count", _received_valid)
+    pcb(f"FILTER_HANDOFF worker_received_count={_received_total}", prog=None, lvl="INFO_DETAIL")
+    pcb(f"FILTER_HANDOFF worker_received_valid_wcs_count={_received_valid}", prog=None, lvl="INFO_DETAIL")
+
     skip_filter_ui = bool(skip_filter_ui)
     # Resolve early filter enable policy: explicit argument takes precedence,
     # otherwise load from config, then apply skip_filter_ui override.
@@ -31801,6 +31888,12 @@ def run_hierarchical_mosaic(
                 filtered_items = list(header_items_for_filter)
             except Exception:
                 filtered_items = header_items_for_filter
+            _adopt_total, _adopt_valid = count_filter_handoff_wcs(header_items_for_filter) if count_filter_handoff_wcs is not None else (len(header_items_for_filter), 0)
+            pcb(
+                f"FILTER_HANDOFF adopted {_adopt_total} pre-resolved Filter item(s), {_adopt_valid} with valid WCS",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
 
         solver_payload_for_filter = solver_settings if isinstance(solver_settings, dict) else None
         config_payload_for_filter = {
@@ -32031,7 +32124,13 @@ def run_hierarchical_mosaic(
         phase0_header_items = []
         pcb("Phase 0: header scan unavailable (Astropy missing)", prog=None, lvl="WARN")
 
-    phase0_lookup = {item["path"]: item for item in phase0_header_items if isinstance(item, dict) and item.get("path")}
+    phase0_lookup = _build_phase0_lookup(phase0_header_items)
+    # FILTER_HANDOFF boundary: what Phase 0 actually adopted.
+    _adopted_total, _adopted_valid = count_filter_handoff_wcs(phase0_header_items) if count_filter_handoff_wcs is not None else (0, 0)
+    _log_filter_handoff("phase0_adopted_count", _adopted_total)
+    _log_filter_handoff("phase0_valid_wcs_count", _adopted_valid)
+    pcb(f"FILTER_HANDOFF phase0_adopted_count={_adopted_total}", prog=None, lvl="INFO_DETAIL")
+    pcb(f"FILTER_HANDOFF phase0_valid_wcs_count={_adopted_valid}", prog=None, lvl="INFO_DETAIL")
     per_frame_info = _estimate_per_frame_cost_mb(phase0_header_items)
     auto_caps_info = _compute_auto_tile_caps(
         resource_probe_info,

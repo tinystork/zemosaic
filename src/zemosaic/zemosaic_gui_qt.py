@@ -58,6 +58,7 @@ import base64
 import importlib.metadata
 import importlib.util
 import json
+import logging
 import os
 import platform
 import shutil
@@ -74,6 +75,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
 
 from ._resources import resource_path_optional
+
+logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - optional dependency guard
     from .zemosaic_utils import get_app_base_dir  # type: ignore
@@ -6156,7 +6159,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             if isinstance(self._last_filtered_header_items, list):
                 worker_kwargs["filtered_header_items"] = self._last_filtered_header_items
             worker_kwargs["early_filter_enabled"] = False
-        
+
+        # FILTER_HANDOFF boundary: what the GUI actually builds into the worker
+        # invocation (the payload that crosses the process boundary next).
+        build_total, build_valid = self._count_filter_handoff_wcs(worker_kwargs.get("filtered_header_items"))
+        self._log_filter_handoff("worker_build_count", build_total)
+        self._log_filter_handoff("worker_build_valid_wcs_count", build_valid)
+
         return (), worker_kwargs
 
     def _log_run_config_snapshot(self, snapshot: Dict[str, Any]) -> None:
@@ -6929,6 +6938,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_filtered_header_items = filtered_list if isinstance(filtered_list, list) else None
         self._apply_filter_overrides_to_config(self._last_filter_overrides)
 
+        # FILTER_HANDOFF boundary: what the GUI received from the Filter dialog.
+        gui_total, gui_valid = self._count_filter_handoff_wcs(self._last_filtered_header_items)
+        self._log_filter_handoff("gui_received_count", gui_total)
+        self._log_filter_handoff("gui_valid_wcs_count", gui_valid)
+
         return True
 
     def _apply_filter_overrides_to_config(self, overrides: Dict[str, Any] | None) -> None:
@@ -6982,6 +6996,41 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _clear_filter_results(self) -> None:
         self._last_filter_overrides = None
         self._last_filtered_header_items = None
+
+    @staticmethod
+    def _count_filter_handoff_wcs(items: Any) -> tuple[int, int]:
+        """Return ``(total, valid_wcs)`` for a list of Filter handoff items."""
+        try:
+            from .solver_port import (  # type: ignore
+                count_filter_handoff_wcs as _count,
+                header_carries_wcs_material as _has,
+            )
+        except Exception:  # pragma: no cover - defensive
+            _count = _has = None
+        if _count is not None:
+            try:
+                return _count(items)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        total = len(items) if isinstance(items, (list, tuple)) else 0
+        valid = 0
+        if isinstance(items, (list, tuple)):
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and _has is not None
+                    and _has(item.get("header") or item.get("header_subset"))
+                ):
+                    valid += 1
+        return total, valid
+
+    @staticmethod
+    def _log_filter_handoff(metric: str, value: Any) -> None:
+        """Emit a single FILTER_HANDOFF diagnostic line (best-effort)."""
+        try:
+            logger.info("FILTER_HANDOFF %s=%s", metric, value)
+        except Exception:  # pragma: no cover - logging must never raise
+            pass
 
     @staticmethod
     def _input_dir_contains_fits(input_dir: Path | str) -> bool:
