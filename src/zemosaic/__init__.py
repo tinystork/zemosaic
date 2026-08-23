@@ -10,6 +10,6 @@ outside the package (see ``zemosaic.zemosaic_utils``).
 
 from __future__ import annotations
 
-__version__ = "4.6.0"
+__version__ = "4.7.0"
 
 __all__ = ["__version__"]
