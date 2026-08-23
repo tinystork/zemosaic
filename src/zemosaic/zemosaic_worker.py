@@ -15212,6 +15212,7 @@ def get_wcs_and_pretreat_raw_file(
     # validated here; ``has_wcs`` flags are never trusted blindly.  The original
     # FITS is never modified (no solver call, no header write-back).
     pre_resolved_wcs = _build_pre_resolved_wcs(pre_resolved_header)
+    pre_resolved_wcs_reused = False
     if pre_resolved_header is not None and pre_resolved_wcs is None:
         _pcb_local(
             "getwcs_info_presolved_header_invalid",
@@ -15222,6 +15223,7 @@ def get_wcs_and_pretreat_raw_file(
     if pre_resolved_wcs is not None:
         # Valid Filter-resolved WCS: reuse it, skip the solver, no on-disk write.
         skip_solver_due_to_existing_wcs = True
+        pre_resolved_wcs_reused = True
         preexisting_wcs_obj = pre_resolved_wcs
         wcs_validation_reason = None
         _pcb_local(
@@ -15266,7 +15268,7 @@ def get_wcs_and_pretreat_raw_file(
     if not skip_solver_due_to_existing_wcs and wcs_validation_reason is None:
         wcs_validation_reason = preexisting_wcs_failure_reason
 
-    if force_resolve_existing_wcs and skip_solver_due_to_existing_wcs:
+    if force_resolve_existing_wcs and skip_solver_due_to_existing_wcs and not pre_resolved_wcs_reused:
         _pcb_local(
             "getwcs_info_force_resolve_existing_wcs",
             lvl="INFO",

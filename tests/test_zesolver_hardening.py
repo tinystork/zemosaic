@@ -115,6 +115,17 @@ def _remove_zesolver(monkeypatch) -> None:
             monkeypatch.delitem(sys.modules, key, raising=False)
 
 
+def _block_zesolver_public_import(monkeypatch) -> None:
+    real_import_module = importlib.import_module
+
+    def _blocked_import(name, *args, **kwargs):
+        if name == "zesolver.api.v1":
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", _blocked_import)
+
+
 def _make_basic_v1(
     *,
     api_version="1.0",
@@ -407,6 +418,7 @@ def test_discover_broken_internal_import_is_unhealthy(monkeypatch, tmp_path):
 
 def test_discover_not_installed_is_not_installed(monkeypatch):
     _remove_zesolver(monkeypatch)
+    _block_zesolver_public_import(monkeypatch)
     assert discover_zesolver().state is DiscoveryState.NOT_INSTALLED
 
 

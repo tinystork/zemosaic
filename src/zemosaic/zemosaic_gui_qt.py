@@ -6343,6 +6343,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 self.worker_controller.stop(graceful=True)
             except Exception:
                 pass
+        self._discard_pending_worker_start()
 
         # Explicitly clean up GPU resources before the application fully closes.
         # This prevents CUDA errors during interpreter shutdown.
@@ -6473,11 +6474,25 @@ class ZeMosaicQtMainWindow(QMainWindow):
             try:
                 spawn_result = self.worker_controller.spawn_worker_process(worker_args, worker_kwargs)
             except Exception as exc:  # pragma: no cover - start failures are rare
+                if self._closing:
+                    self._worker_start_result = (False, None)
+                    self._worker_start_pending = False
+                    return
                 self._worker_start_result = (False, str(exc))
             else:
                 if spawn_result is None:
+                    if self._closing:
+                        self._worker_start_result = (False, None)
+                        self._worker_start_pending = False
+                        return
                     self._worker_start_result = (False, None)
                 else:
+                    if self._closing:
+                        queue_obj, process = spawn_result
+                        self._discard_spawned_worker(queue_obj, process)
+                        self._worker_start_result = (False, None)
+                        self._worker_start_pending = False
+                        return
                     self._worker_start_result = (True, spawn_result)
 
         thread = threading.Thread(target=_runner, daemon=True)
@@ -6526,13 +6541,52 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     process.join(timeout=0.5)
             except Exception:
                 pass
+            try:
+                close_proc = getattr(process, "close", None)
+                if callable(close_proc):
+                    close_proc()
+            except Exception:
+                pass
         if queue_obj is not None:
             try:
                 queue_obj.close()
             except Exception:
                 pass
 
+    def _discard_pending_worker_start(self) -> None:
+        """Best-effort cleanup for a worker spawn that completed during shutdown.
+
+        The background spawn thread may finish between the moment closing starts
+        and the next Qt timer poll.  Closing the window can also stop the event
+        loop before that poll runs, so cleanup cannot rely on
+        ``_poll_worker_start_result`` alone.
+        """
+        result = self._worker_start_result
+        if result is not None:
+            self._worker_start_result = None
+            try:
+                started, payload = result
+            except Exception:
+                started, payload = False, None
+            if started:
+                try:
+                    queue_obj, process = payload  # type: ignore[misc]
+                    self._discard_spawned_worker(queue_obj, process)
+                except Exception:
+                    pass
+        thread = self._worker_start_thread
+        if thread is not None:
+            try:
+                if not thread.is_alive():
+                    self._worker_start_thread = None
+            except Exception:
+                self._worker_start_thread = None
+        if self._worker_start_thread is None:
+            self._worker_start_pending = False
+
     def _finalize_successful_worker_start(self) -> None:
+        if self._closing:
+            return
         self.is_processing = True
         self._run_started_monotonic = time.monotonic()
         self._elapsed_timer.start()
@@ -6543,6 +6597,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
 
     def _handle_worker_start_failure(self, error_message: str | None) -> None:
+        if self._closing:
+            return
         self.start_button.setEnabled(True)
         self.filter_button.setEnabled(not self._existing_master_tiles_enabled())
         self.stop_button.setEnabled(False)

@@ -9,6 +9,7 @@ write-WCS semantics, cancellation and cleanup paths.
 from __future__ import annotations
 
 import enum
+import os
 import re
 import sys
 import threading
@@ -28,20 +29,21 @@ from zemosaic.zemosaic_filter_gui_qt import (  # noqa: E402
     _FallbackLocalizer,
     _NormalizedItem,
 )
-from zemosaic.solver_port import SolverOutcome, SolveStatus  # noqa: E402
+from zemosaic.solver_port import DiscoveryState, SolverDiscovery, SolverOutcome, SolveStatus  # noqa: E402
 
 FILTER_SOURCE = SRC / "zemosaic" / "zemosaic_filter_gui_qt.py"
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _qapp():
-    """Ensure a QCoreApplication exists for QObject/signal use in tests."""
+    """Ensure a QApplication exists for QObject/signal/widget-compatible tests."""
     try:
-        from PySide6.QtCore import QCoreApplication
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
 
-        app = QCoreApplication.instance()
+        app = QApplication.instance()
         if app is None:
-            app = QCoreApplication([])
+            app = QApplication([])
         return app
     except Exception:  # pragma: no cover - PySide6 absent
         return None
@@ -100,6 +102,12 @@ def _remove_zesolver(monkeypatch) -> None:
     for key in list(sys.modules):
         if key == "zesolver" or key.startswith("zesolver"):
             monkeypatch.delitem(sys.modules, key, raising=False)
+    monkeypatch.setattr(
+        qt_filter._zesolver_adapter,
+        "discover_zesolver",
+        lambda: SolverDiscovery(state=DiscoveryState.NOT_INSTALLED, message="test no zesolver"),
+        raising=False,
+    )
 
 
 def _install_fake_zesolver(

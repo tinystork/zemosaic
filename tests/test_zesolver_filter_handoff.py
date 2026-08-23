@@ -17,6 +17,7 @@ with the repo's existing source-inspection + fake-module style.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import types
 from pathlib import Path
@@ -191,7 +192,7 @@ class _FakeFits:
         return _FakeHDUList(self._header)
 
 
-def _run_getwcs(monkeypatch, tmp_path, *, pre_resolved_header=None, outcome=None):
+def _run_getwcs(monkeypatch, tmp_path, *, pre_resolved_header=None, outcome=None, solver_settings=None):
     """Run get_wcs_and_pretreat_raw_file against a fully fake environment."""
     worker = _load_worker()
     from zemosaic.solver_port import SolverOutcome, SolveStatus
@@ -251,7 +252,7 @@ def _run_getwcs(monkeypatch, tmp_path, *, pre_resolved_header=None, outcome=None
         "astap_exe", "astap_data", 3.0, 2, 100, 180,
         _noop_pcb,
         None,
-        {},
+        solver_settings or {},
         pre_resolved_header=pre_resolved_header,
     )
     return src_path, result, calls
@@ -277,6 +278,30 @@ def test_a_valid_presolved_wcs_reused_no_solver_no_move(monkeypatch, tmp_path):
     assert calls.move == []
     assert calls.write == []
     # Original FITS is byte-identical (never modified).
+    assert src_path.read_bytes() == b"ORIGINAL"
+
+
+def test_a_valid_presolved_wcs_reused_even_when_force_resolve_enabled(monkeypatch, tmp_path):
+    pre = {
+        "CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN",
+        "CRVAL1": 10.0, "CRVAL2": 20.0,
+        "CRPIX1": 5.0, "CRPIX2": 5.0,
+        "CD1_1": -1e-4, "CD1_2": 0.0, "CD2_1": 0.0, "CD2_2": 1e-4,
+        "NAXIS1": 10, "NAXIS2": 10,
+    }
+    src_path, result, calls = _run_getwcs(
+        monkeypatch,
+        tmp_path,
+        pre_resolved_header=pre,
+        solver_settings={"force_resolve_existing_wcs": True},
+    )
+    img_data, wcs, header, hp_mask = result
+    assert img_data is not None and wcs is not None and header is not None
+    # A Filter-resolved Write-WCS-OFF header is a trusted handoff, not an
+    # on-disk stale WCS to force re-resolve.
+    assert calls.solver == []
+    assert calls.move == []
+    assert calls.write == []
     assert src_path.read_bytes() == b"ORIGINAL"
 
 
@@ -321,6 +346,7 @@ def test_g_genuine_failure_still_moves_to_unaligned(monkeypatch, tmp_path):
 @pytest.fixture(scope="module")
 def _qapp():
     try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
 
         app = QApplication.instance()
@@ -349,6 +375,7 @@ class _FakeProcess:
     def __init__(self):
         self.terminated = False
         self.joined = False
+        self.closed = False
 
     def is_alive(self):
         return True
@@ -358,6 +385,9 @@ class _FakeProcess:
 
     def join(self, timeout=None):
         self.joined = True
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeQueue:
@@ -414,7 +444,37 @@ def test_d_closing_discards_pending_spawn(monkeypatch, _qapp):
         # Never finalized/attached; process terminated; queue closed; no active run.
         assert events == []
         assert proc.terminated is True
+        assert proc.closed is True
         assert queue.closed is True
+        assert w._worker_start_thread is None
+        assert w._worker_start_pending is False
+        assert w.is_processing is False
+    finally:
+        w.deleteLater()
+
+
+def test_d_close_cleanup_does_not_rely_on_timer_poll(monkeypatch, _qapp):
+    if _qapp is None:
+        pytest.skip("PySide6 unavailable")
+    w = _make_window(_qapp)
+    try:
+        w._closing = True
+        w._worker_start_pending = True
+        w._worker_start_thread = _DoneThread()
+        proc = _FakeProcess()
+        queue = _FakeQueue()
+        w._worker_start_result = (True, (queue, proc))
+
+        events = []
+        monkeypatch.setattr(w.worker_controller, "finalize_spawn", lambda q, p: events.append("finalize"), raising=False)
+        monkeypatch.setattr(w, "_finalize_successful_worker_start", lambda: events.append("success"), raising=False)
+
+        w._discard_pending_worker_start()
+        assert events == []
+        assert proc.terminated is True
+        assert proc.closed is True
+        assert queue.closed is True
+        assert w._worker_start_result is None
         assert w._worker_start_thread is None
         assert w._worker_start_pending is False
         assert w.is_processing is False
