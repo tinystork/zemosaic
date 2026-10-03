@@ -173,9 +173,30 @@ The normalization/photometry data-flow is five distinct steps in exact order:
 - float32 output throughout stacking (`stack_core`, Grid `_stack_weighted_patches`, classic).
 - NaN masking: classic and Grid mask non-positive weights / non-finite data before combine;
   `stack_core` uses `xp.isfinite` gating and `nan` for `weight_sum==0`.
-- low-N / all-invalid: Grid CPU returns zero tiles when `not any(valid_positions)`
-  (`grid_mode:1960`); `stack_core` returns `nan` where `weight_sum<=0`; classic filters
-  statistically-dead frames (`_filter_statistically_dead_frames`) post-normalization.
+- low-N / all-invalid (CPU, WITNESSED via `tests/test_stacking_low_n_all_invalid_witness.py`,
+  18 pass, deterministic float32 HWC 2×2×1, CPU only):
+  - Grid CPU `_stack_weighted_patches` empty patches → returns bare `None`.
+  - Grid CPU N=1 valid + positive weights (norm/reject disabled) → returns HWC float32 equal
+    to input; `weight_sum` = summed per-pixel weight; both float32.
+  - Grid CPU all-zero weights OR all-NaN data → zero tiles (`weight_sum` all zero); the
+    all-invalid **pixel** inside an otherwise-valid mean combine collapses to `0.0`
+    (division clipped at `1e-6`, `grid_mode:1960`), NOT NaN.
+  - Grid CPU median combine: weight **magnitude** ignored for the median, but `weight<=0`
+    is still treated as invalid (frame masked to NaN before median); `weight_sum` still
+    reports the summed magnitudes.
+  - `stack_core` (CPU) N=1 valid → HWC float32 equal to input; `weight_sum` = unit weights;
+    `rejected_pct=0.0`. Empty `images` → `ValueError`. 2D `(H,W)` input → 2D output.
+  - `stack_core` all-zero weights OR all-NaN data → `NaN` everywhere (`weight_sum` zero);
+    an all-invalid **pixel** in a mixed mean combine is `NaN` (not 0.0). Median combine
+    ignores weights entirely (a zero-weight finite frame still enters the median); median
+    over an all-NaN stack returns NaN with a `RuntimeWarning`.
+  - **PINNED DIVERGENCE (SCI-03, characterization not parity):** the same all-invalid input
+    yields zeros in Grid CPU and NaN in `stack_core` at zero `weight_sum`; mixed
+    all-invalid pixels likewise 0.0 vs NaN. No fix applied.
+  - Classic low-N (WITNESSED, N=1/N=2 only): `stack_kappa_sigma_clip` N=1 returns the input
+    frame unchanged, N=2 returns the per-pixel mean (sigma clip keeps all at N=2), both
+    `rejected=0.0`; `stack_winsorized_sigma_clip` N=1 logs `"Winsorized clip needs >=3
+    images; forcing CPU."` and returns the input frame with `rejected=0.0`.
 - `winsor_limits` aliases: `(low,high)` tuple; default `(0.05,0.05)`; string parsed in worker.
 
 ## Fallback / error / OOM
@@ -192,10 +213,14 @@ The normalization/photometry data-flow is five distinct steps in exact order:
 
 - Witnessed: `test_grid_mode_dbe.py` (DBE + star protection, not full stacking parity),
   `test_grid_mode_stack_plan_paths.py` (CSV path resolution only),
-  `test_phase3_adaptive_invariants.py` (22 passed, 11 silently skipped — worker-source
-  text invariants NOT exercised due to flat `importorskip("zemosaic_worker")`).
+  `test_phase3_adaptive_invariants.py` (worker-source text invariants),
+  `test_stacking_low_n_all_invalid_witness.py` (18 pass, low-N / all-invalid / zero-weight
+  CPU characterization; Grid CPU vs `stack_core` vs classic N<3).
 - **NOT_RUN / no witness**: no CPU↔GPU parity measurement, no WSC numerical equivalence
-  measurement, no low-N/all-invalid characterization, no Phase 4.5 execution. All such
-  cells remain UNKNOWN.
+  measurement, no Phase 4.5 execution, no Grid GPU `stack_core` backend execution, no
+  classic N≥3 / SDS stacking execution, no `linear_fit` normalization/rejection numerical
+  witness. All such cells remain UNKNOWN.
+- low-N/all-invalid is now witnessed **for the CPU backend only**; the divergence Grid CPU
+  zeros vs `stack_core` NaN is pinned, not resolved.
 - GPU qualification limits: CuPy runtime OK on MX150 (compute 6.1, ~2 GB); RawKernel/JIT OK
   without nvcc (NVRTC 12.9 bundled); no GPU stacking execution was run in R0.
