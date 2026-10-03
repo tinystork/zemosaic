@@ -18,8 +18,10 @@ R2 n'a encore été réalisée; M106 reste une gate scientifique manuelle finale
 - [x] Recevoir l'instruction de lancer la mission.
 - [x] Exécuter et accepter R0 (archéologie + baseline, Nono `review-3: ACCEPT`).
 - [x] Clore R1 sans suppression : aucun candidat PROVEN DEAD après témoins et revue.
+- [x] Témoins de caractérisation pré-R2 complets (TEST-01/03/04/05/06 clos).
+- [x] Finaliser la carte des contrats R3 (baseline PRE-R2) : `docs/refactor/STACKING_CONTRACTS_R3.md` accepté comme freeze de comportement/contrats après Nono `review-1: ACCEPT` et acceptation Junior.
 - [ ] Exécuter les extractions R2 acceptées une par une.
-- [ ] Finaliser la carte des contrats R3 et le rapport.
+- [ ] Finaliser l'audit R3 et le rapport post-R2 (FINAL_REPORT.md + audit final).
 - [ ] Obtenir l'acceptation scientifique manuelle de Tristan sur M106.
 
 ## 1. Base canonique et branche
@@ -251,6 +253,22 @@ puis petites responsabilités transversales aux contrats connus; ne pas commence
 par réécrire/déplacer en bloc Classic/SDS. La priorité exacte dépend des témoins,
 des dépendances et du risque, pas du nombre de lignes.
 
+### Premier lot R2 borné (gelé avant R2 — à ne pas implémenter dans cette mission)
+
+Le premier lot R2 est **borné** aux trois helpers purs réellement partagés du filtre :
+`_merge_small_groups`, `_split_group_by_orientation`, `_circular_dispersion_deg`.
+
+Critères d'acceptation du lot :
+- Nouveau module neutre (sans import Tk) hébergeant ces trois helpers.
+- Imports/exports de compatibilité legacy préservés (signatures/symboles/sémantique identiques).
+- Le chemin officiel Qt n'importe plus le module legacy Tk pour ces trois helpers.
+- Tests de comportement exacts : wrap circulaire, PA invalide, min-size, cap, ordre.
+- Aucun changement worker/science ; pas de modification de comportement numérique.
+- Tests d'import / Qt / package pertinents.
+- Revue Nono du diff exact.
+
+Ne pas implémenter ce lot ici (mission R3 baseline freeze).
+
 Pour CHAQUE extraction :
 
 - [ ] Identifier comportement exact, tous appelants/imports/monkeypatchs, globals,
@@ -271,24 +289,27 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 
 ## 9. R3 — carte des contrats de stacking
 
-- [ ] Créer `docs/refactor/STACKING_CONTRACTS_R3.md` (version préliminaire en R0).
-- [ ] Lignes : Classic CPU/GPU, SDS CPU/GPU si réel, Grid CPU/GPU, Phase 4.5 si accessible.
-- [ ] Pour chacun : median/mean, Kappa-Sigma, WSC, linear-fit NORMALISATION et
-  linear-fit REJET distincts; documenter les modes non supportés, pas les inventer.
-- [ ] Colonnes : entrée/caller, config/aliases/précédence, implémentation,
+- [x] Créer `docs/refactor/STACKING_CONTRACTS_R3.md` — **baseline PRE-R2 acceptée** après Nono `review-1: ACCEPT` et acceptation Junior, cf. mission `ZM-ARCH-R3-BASELINE-FREEZE-20261004`.
+- [x] Lignes : Classic CPU/GPU, SDS (CPU réel, pas de SDS GPU), Grid CPU/GPU core/GPU legacy
+  fallback, Phase 4.5 (branches alpha-weighted et configured-rejection).
+- [x] Pour chacun : median/mean, Kappa-Sigma, WSC, linear-fit NORMALISATION et
+  linear-fit REJET distincts; modes non supportés documentés, pas inventés.
+- [x] Colonnes : entrée/caller, config/aliases/précédence, implémentation,
   normalisation, pondération scalaire/pixel, NaN/Inf, masque/rejet, dtype,
   axes/canaux, low-N/all-invalid, paramètres effectivement propagés,
   fallback/import/erreur/OOM, backend réel, tests et limites des preuves.
-- [ ] Tracer Grid CPU, GPU core et GPU legacy fallback si core indisponible;
-  inclure `core/robust_rejection.py` dans les chemins qui l'utilisent réellement.
-- [ ] Ne déclarer une parité que mesurée; conserver échecs préexistants et
-  limites de matériel sans modifier la science pour rendre le tableau vert.
+- [x] Tracer Grid CPU, GPU core et GPU legacy fallback si core indisponible;
+  `core/robust_rejection.py` mappé sur ses appelants réels (align_stack / align_stack_gpu).
+- [x] Aucune parité non mesurée; échecs préexistants et limites matériel conservés sans
+  modifier la science.
+- [ ] **Audit et rapport R3 post-R2** (FINAL_REPORT.md + audit final) — reste non coché,
+  à réaliser après les extractions R2.
 
 ## 10. TODO / FOLLOW-UP — SCIENCE et inconnues
 
 | ID | Sujet | Statut initial / suite, hors corrections R0–R3 |
 | --- | --- | --- |
-| SCI-01 | Grid CPU winsorized_sigma_clip établi (winsorize-then-clip) vs GPU core winsorized_sigma_clip simplifié (médian/σ clip) | Divergence de code confirmée (pas du WSC PixInsight; kappa-sigma n'est PAS divergent sur GPU) ; construire témoin reproductible, quantifier, ne pas corriger |
+| SCI-01 | Grid CPU / Grid GPU legacy appellent `_reject_outliers_winsorized_sigma_clip` SANS `wsc_impl` explicite → helper résout env/config/default et dispatche vers PixInsight WSC PAR DÉFAUT (`pixinsight`; env peut choisir `legacy_quantile`). GPU core `stack_core` winsorized = médian/σ simplifié (ni WSC, ni winsorization) | Divergence structurelle conservée (Grid CPU/legacy = WSC par défaut vs core = simplifié), impact numérique NOT_RUN ; kappa-sigma n'est PAS divergent sur GPU ; construire témoin reproductible, quantifier, ne pas corriger |
 | SCI-02 | Placeholder linear_fit dans core | Présent; Grid GPU passe none au core. Identifier tout caller effectif et distinguer normalisation/rejet |
 | SCI-03 | Masques/poids Grid CPU/GPU, all-invalid, aliases et winsor_limits | À caractériser : CPU masque les poids non positifs avant rejet; configuration transmise au core différente. Pas de conclusion de parité ni de correctif ici |
 | SCI-04 | Variantes Classic/SDS/Phase 4.5 / low-N / chunking | Différences à inventorier avant toute consolidation |

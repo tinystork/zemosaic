@@ -616,12 +616,18 @@ from its presence.
 
 ## 11. Scientific anomaly ledger (preserve, do not fix)
 
-- **SCI-01 (renamed) — Grid CPU vs Grid GPU-core winsorized-sigma divergence.**
-  Grid CPU uses the established `_reject_outliers_winsorized_sigma_clip`
-  (`grid_mode.py:1950-1957`) — full winsorize-then-clip. Grid GPU via `stack_core` uses a
-  **simplified median/σ clip (not real winsorization)** for `winsorized_sigma_clip`
-  (`zemosaic_stack_core.py:320-327`), for both backends. This is the genuine structural
-  divergence; numeric impact **not measured** in R0.
+- **SCI-01 (renamed) — Grid CPU / Grid GPU legacy vs Grid GPU-core winsorized-sigma divergence.**
+  Grid CPU (`grid_mode.py:1950`) and Grid GPU legacy fallback (`grid_mode.py:2051-2058`) call
+  the established `_reject_outliers_winsorized_sigma_clip` (`zemosaic_align_stack.py:4486`)
+  **without an explicit `wsc_impl`**. That helper resolves the implementation via
+  `resolve_wsc_impl` (env `ZEMOSAIC_WSC_IMPL` → config → default) and dispatches to
+  **PixInsight WSC by default** (`pixinsight`, `wsc_pixinsight_core`,
+  `zemosaic_align_stack.py:4528-4530`); `legacy_quantile` (winsorize-then-clip) is selectable
+  via env only. Grid GPU via `stack_core` uses a **simplified median/σ clip (not real
+  winsorization, not WSC)** for `winsorized_sigma_clip` (`zemosaic_stack_core.py:325-333`),
+  for both backends. This is the genuine structural divergence (Grid CPU/legacy = PixInsight
+  WSC by default vs `stack_core` = simplified median/σ clip); numeric impact **not measured**
+  (NOT_RUN) in R0. *(Supersedes the earlier "Grid CPU = winsorize-then-clip" wording.)*
 - **SCI-02 — kappa-sigma is NOT divergent on GPU.** In `stack_core` (`zemosaic_stack_core.py:291-317`),
   when the imported helper is available, `kappa_sigma` on GPU does `cp.asnumpy` then calls
   the **same established `_reject_outliers_kappa_sigma`**; CPU calls it directly. The
