@@ -495,6 +495,29 @@ kind (static vs runtime), error/fallback behavior, extraction risk.
 - Mode: CPU (filesystem). Risk: high — resume/restart formats must not be migrated or
   invalidated incidentally by any refactor.
 
+Witnessed formats/semantics (2026-10-04, mission ZM-ARCH-WITNESS-CACHE-RESUME-20261004;
+`tests/test_cache_resume_characterization_witness.py`, 18 pass/0 skip):
+- `_safe_load_cache` (`:15531`) memmap load `mmap_mode="r"` returns `np.memmap`;
+  WinError 1455 retries once with `mmap_mode=None` and emits `stack_mem_fallback_memmap_to_ram`
+  (lvl WARN); non-1455 OSError and fallback failures are re-raised.
+- Phase 5 checkpoint manifest is `schema_version=1`, `pipeline=classic_legacy`; the saved mosaic
+  artifact is HWC float32 + optional HW coverage/alpha (singleton trailing channel `(H,W,1)`
+  normalized to `(H,W)`). Signature/schema/pipeline/output-shape mismatches reject the checkpoint;
+  method mismatch is enforced only when the stored method is non-empty, and master-tile/raw counts
+  are enforced only for positive integer expectations. A missing/corrupt/non-3D mosaic rejects the
+  whole checkpoint, while missing/wrong-shape coverage/alpha degrade to `None` with a valid mosaic
+  still loaded. Atomic `.tmp` files do not remain after success. The witness used float32 input;
+  for non-float32 input, the manifest `mosaic.dtype` field reflects the pre-cast input while the
+  saved artifact is float32 (not behaviorally witnessed here).
+- Phase 1 resume cache: `cache_manifest.json` + `phase1_processed_info.json` + `phase1.done`;
+  `auto` mode requires exact signature, `force` proceeds with a warning on mismatch; partial
+  caches return `(False, usable_entries, reason)` with counters; reasons are pinned for
+  missing/invalid manifest, schema/pipeline mismatch, and missing processed-info.
+- Still NOT_RUN (not witnessed): non-float32 manifest-dtype semantics, permissive empty-method and
+  non-positive expected-count branches, per-tile retention/refcount deletion, `run_end` cleanup,
+  master-tile reuse, resumed-vs-fresh scientific equality, interruption/crash recovery, and
+  cross-platform filesystem semantics.
+
 ### 7.7 Preview / progress / queue / crash-breadcrumb lifecycle
 
 - Progress callback protocol: legacy tuples + `STAGE_PROGRESS` (see §3); `_eta_seconds_from_progress`
