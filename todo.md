@@ -269,6 +269,14 @@ Critères d'acceptation du lot :
 
 Ne pas implémenter ce lot ici (mission R3 baseline freeze).
 
+**Statut R2 lot 1 — implémentation terminée, revue Nono `review-0: ACCEPT`, commit local en cours** (mission `ZM-ARCH-R2-LOT1-GROUPING-HELPERS-20261004`, 2026-10-04) :
+- Nouveau module neutre `src/zemosaic/core/grouping_helpers.py` (imports `math`/`typing`/`collections.abc` uniquement, aucun import Tk/Qt/`zemosaic_filter_gui`) hébergeant les trois helpers canoniques `_merge_small_groups`, `_split_group_by_orientation`, `_circular_dispersion_deg` **déplacés verbatim** + leurs deps privés `_group_center_deg`, `_angular_sep_deg`, `_circ_delta_deg` (non réutilisés ailleurs dans `zemosaic_filter_gui.py`).
+- `zemosaic_filter_gui.py` réexporte les six noms depuis le module neutre (mêmes objets, identité `is` vérifiée).
+- `zemosaic_filter_gui_qt.py` importe les trois helpers depuis `core.grouping_helpers` (chemin officiel) ; les copies fallback inline Qt restent intactes et distinctes (garde `if _tk_* is None` conservée).
+- Témoin : `tests/test_grouping_helpers_r2_lot1.py` (25 pass). Suite post-edit : 140 pass. Diff body byte-identique vérifié par AST.
+
+**Seam extraction Q2** : la variante Qt `_split_group_by_orientation_key` / `split_clusters_by_orientation` / `_split_group_by_mount_mode` (buckets gloutons, algorithmes DIFFÉRENTS des canoniques) reste volontairement NON consolidée ; de même les trois copies fallback inline Qt sont des algorithmes distincts (mean-angle/max-deviation, buckets gloutons, log texte différent) laissés en fallback, jamais unifiés avec les canoniques. Toute consolidation future = décision scientifique séparée, pas une extraction mécanique.
+
 Pour CHAQUE extraction :
 
 - [ ] Identifier comportement exact, tous appelants/imports/monkeypatchs, globals,
