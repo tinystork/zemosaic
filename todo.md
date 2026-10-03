@@ -172,6 +172,9 @@ SolverPort/adapters publics conservés, aucun import/probing de dépôt frère.
 - [x] Établir une baseline rapide, isolée et honnête (cf. section 6).
 - [ ] Ajouter avant extraction les petits témoins de comportement absents.
   (non exécuté en R0 — interdit d'éditer les tests dans cette itération)
+  TEST-01 clos séparément (mission ZM-ARCH-TEST01-PHASE3-IMPORTS-20261003) : imports
+  plats Phase 3 → qualifiés, 33 pass/0 skip. Restent à ajouter les témoins
+  dispatch/cache/low-N/spawn, hors périmètre de cette mission.
 - [x] Produire premiers tableaux R3, anomalies scientifiques, UNKNOWN/STOP et
   ordre proposé des extractions avec critères de sortie de chaque lot.
 - [x] Revue Nono indépendante de R0; toute classification PROVEN DEAD contestée
@@ -280,7 +283,7 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 | SCI-02 | Placeholder linear_fit dans core | Présent; Grid GPU passe none au core. Identifier tout caller effectif et distinguer normalisation/rejet |
 | SCI-03 | Masques/poids Grid CPU/GPU, all-invalid, aliases et winsor_limits | À caractériser : CPU masque les poids non positifs avant rejet; configuration transmise au core différente. Pas de conclusion de parité ni de correctif ici |
 | SCI-04 | Variantes Classic/SDS/Phase 4.5 / low-N / chunking | Différences à inventorier avant toute consolidation |
-| TEST-01 | 11 imports plats importorskip Phase 3 | Risque de couverture absente confirmé dans le source; mesurer collecte/skips et réparer le témoin, pas le namespace produit |
+| TEST-01 | 11 imports plats importorskip Phase 3 | RÉSOLU (mission ZM-ARCH-TEST01-PHASE3-IMPORTS-20261003) : imports plats → qualifiés (`zemosaic.zemosaic_worker`, `zemosaic.parallel_utils`) dans `tests/test_phase3_adaptive_invariants.py`, sans alias produit. Résultat témoin : baseline historique 22 pass/11 skip → 33 pass/0 skip ; `tests/test_packaging.py` 17 pass. |
 | ARCH-01 | Invocations supportées de Phase 4.5 / fallback Tk | UNKNOWN jusqu'à preuve/revue; conserver |
 | ARCH-02 | Contrats externes / frozen / API programmatique | Inventaire incomplet; ambiguïté bloque une suppression, pas toute R0 |
 | MANUAL-01 | M106 avant/après et plateformes/GPU réels | NOT_RUN; nécessaires aux validations qu'ils prétendent établir |

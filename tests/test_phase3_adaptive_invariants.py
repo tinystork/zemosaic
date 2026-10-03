@@ -308,8 +308,8 @@ def test_existing_master_tiles_overrides_final_rgb_clip_markers_present():
 def test_create_master_tile_adaptation_preserves_membership_and_modes(monkeypatch, tmp_path):
     astropy_wcs = pytest.importorskip("astropy.wcs")
     astropy_fits = pytest.importorskip("astropy.io.fits")
-    zw = pytest.importorskip("zemosaic_worker")
-    pu = pytest.importorskip("parallel_utils")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
+    pu = pytest.importorskip("zemosaic.parallel_utils")
 
     # Build synthetic cached frames used by Phase 3 tile processing.
     group = []
@@ -442,8 +442,8 @@ def test_create_master_tile_adaptation_preserves_membership_and_modes(monkeypatc
 def test_create_master_tile_output_count_parity_baseline_vs_pressure(monkeypatch, tmp_path):
     astropy_wcs = pytest.importorskip("astropy.wcs")
     astropy_fits = pytest.importorskip("astropy.io.fits")
-    zw = pytest.importorskip("zemosaic_worker")
-    pu = pytest.importorskip("parallel_utils")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
+    pu = pytest.importorskip("zemosaic.parallel_utils")
 
     group = []
     for i in range(3):
@@ -563,7 +563,7 @@ def test_create_master_tile_output_count_parity_baseline_vs_pressure(monkeypatch
 
 
 def test_phase3_budget_change_guard_allows_change_when_limits_clear():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     times, reason = zw._phase3_budget_change_block_reason(
         now_loop=100.0,
         last_change_t=0.0,
@@ -576,7 +576,7 @@ def test_phase3_budget_change_guard_allows_change_when_limits_clear():
 
 
 def test_phase3_budget_change_guard_blocks_on_cooldown():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     times, reason = zw._phase3_budget_change_block_reason(
         now_loop=105.0,
         last_change_t=100.0,
@@ -589,7 +589,7 @@ def test_phase3_budget_change_guard_blocks_on_cooldown():
 
 
 def test_phase3_budget_change_guard_blocks_on_rate_limit_and_prunes_old_entries():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     # Two entries are stale (>60s) and must be pruned before rate-limit check.
     raw_times = [20.0, 25.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0]
     times, reason = zw._phase3_budget_change_block_reason(
@@ -605,7 +605,7 @@ def test_phase3_budget_change_guard_blocks_on_rate_limit_and_prunes_old_entries(
 
 
 def test_affine_photometric_summary_flags_degenerate_solution():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     summary = zw._log_affine_photometric_summary(
         {"tile:0001": (0.0, 996.0), "tile:0002": (0.0, 996.0)},
         logger_obj=zw.logger,
@@ -617,7 +617,7 @@ def test_affine_photometric_summary_flags_degenerate_solution():
 
 
 def test_affine_photometric_summary_flags_non_degenerate_solution():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     summary = zw._log_affine_photometric_summary(
         {"tile:0001": (0.95, 10.0), "tile:0002": (1.03, -7.0)},
         logger_obj=zw.logger,
@@ -646,7 +646,7 @@ def test_source_contract_phase6_writes_display_fits_companion():
 
 
 def test_eta_seconds_from_progress_monotonic_behavior():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     now = zw.time.monotonic()
     start = now - 100.0
     eta_10 = zw._eta_seconds_from_progress(start, 10.0)
@@ -656,7 +656,7 @@ def test_eta_seconds_from_progress_monotonic_behavior():
 
 
 def test_eta_smoothing_phase_shift_allows_reset():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     prev = 120.0
     huge = 20000.0
     smoothed = zw._eta_smooth_seconds(prev, huge, alpha=0.22)
@@ -665,7 +665,7 @@ def test_eta_smoothing_phase_shift_allows_reset():
 
 
 def test_eta_smoothing_regular_changes_stay_smoothed():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     prev = 120.0
     new_eta = 180.0
     smoothed = zw._eta_smooth_seconds(prev, new_eta, alpha=0.22)
@@ -680,7 +680,7 @@ def test_source_contract_eta_uses_max_not_double_count_sum():
 
 
 def test_eta_phase_model_conservative_vs_progress_in_phase3_midrun():
-    zw = pytest.importorskip("zemosaic_worker")
+    zw = pytest.importorskip("zemosaic.zemosaic_worker")
     start = zw.time.monotonic() - 180.0
     # Typical mid-phase3 progress where global-progress-only ETA can underpredict.
     eta_prog = zw._eta_seconds_from_progress(start, 48.0)
