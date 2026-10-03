@@ -2,12 +2,13 @@
 
 ## Statut et autorisation
 
-**R0 ACCEPTÉ LOCALEMENT — témoins pré-R1 à compléter**, le 2026-10-03.
+**R1 CLOS SANS SUPPRESSION — R2 prêt à être borné**, le 2026-10-04.
 
 Tristan a autorisé le lancement de la mission. R0 (archéologie + baseline ciblée)
 est terminé et accepté par Junior après revue indépendante Nono `review-3: ACCEPT`.
-Les rapports d'architecture sont sous `docs/refactor/`. Aucune suppression ou
-extraction n'a encore été réalisée; M106 reste une gate scientifique manuelle finale.
+Les témoins pré-extraction TEST-01/03/04/05/06 sont en place. R1 est clos sans
+suppression : aucun candidat n'a franchi le seuil PROVEN DEAD. Aucune extraction
+R2 n'a encore été réalisée; M106 reste une gate scientifique manuelle finale.
 
 - [x] Vérifier l'identité du dépôt et actualiser les références distantes.
 - [x] Vérifier base, version et propreté initiale.
@@ -16,7 +17,7 @@ extraction n'a encore été réalisée; M106 reste une gate scientifique manuell
 - [x] Écrire le plan, ses corrections et ses gates.
 - [x] Recevoir l'instruction de lancer la mission.
 - [x] Exécuter et accepter R0 (archéologie + baseline, Nono `review-3: ACCEPT`).
-- [ ] Exécuter les seules suppressions R1 prouvées sûres.
+- [x] Clore R1 sans suppression : aucun candidat PROVEN DEAD après témoins et revue.
 - [ ] Exécuter les extractions R2 acceptées une par une.
 - [ ] Finaliser la carte des contrats R3 et le rapport.
 - [ ] Obtenir l'acceptation scientifique manuelle de Tristan sur M106.
@@ -170,12 +171,12 @@ SolverPort/adapters publics conservés, aucun import/probing de dépôt frère.
   (conclusion : DORMANT BUT REACHABLE / programme seulement, désactivé sur GUI Qt)
 - [x] Séparer helpers métier/Tk/fallbacks dans le filtre, sans suppression immédiate.
 - [x] Établir une baseline rapide, isolée et honnête (cf. section 6).
-- [ ] Ajouter avant extraction les petits témoins de comportement absents.
+- [x] Ajouter avant extraction les petits témoins de comportement absents.
   (non exécuté en R0 — interdit d'éditer les tests dans cette itération)
   TEST-01 clos séparément (mission ZM-ARCH-TEST01-PHASE3-IMPORTS-20261003) : imports
   plats Phase 3 → qualifiés, 33 pass/0 skip. Témoin dispatch RÉSOLU séparément
-  (mission ZM-ARCH-WITNESS-DISPATCH-20261003, cf. TEST-03). Restent à ajouter les
-  témoins cache/reprise, low-N/all-invalid et spawn réel, hors périmètre de cette mission.
+  (mission ZM-ARCH-WITNESS-DISPATCH-20261003, cf. TEST-03). Les témoins
+  low-N/all-invalid, spawn réel et cache/reprise sont clos par TEST-04/05/06.
 - [x] Produire premiers tableaux R3, anomalies scientifiques, UNKNOWN/STOP et
   ordre proposé des extractions avec critères de sortie de chaque lot.
 - [x] Revue Nono indépendante de R0; toute classification PROVEN DEAD contestée
@@ -219,6 +220,13 @@ le diff, pas toute la suite à chaque déplacement.
   pas de full suite répétitive après chaque petit diff.
 
 ## 7. R1 — supprimer seulement le code prouvé mort
+
+**Décision R1 (2026-10-04) : CLOS, AUCUNE SUPPRESSION.** R0 §14 et la revue Nono
+acceptée n'identifient aucun PROVEN DEAD. Les témoins ajoutés depuis R0 n'ont fait
+passer aucun SUSPECTED DEAD au niveau PROVEN DEAD; `ARCH-03` reste donc conservé.
+Les checklists ci-dessous sont sans objet pour ce passage R1 et restent le gate à
+réutiliser si une preuve nouvelle apparaît. Aucun diff produit/test de suppression,
+aucun commit `refactor: remove ...`.
 
 Pour CHAQUE unité, checklist à copier dans son rapport :
 
@@ -289,9 +297,9 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 | ARCH-02 | Contrats externes / frozen / API programmatique | Inventaire incomplet; ambiguïté bloque une suppression, pas toute R0 |
 | MANUAL-01 | M106 avant/après et plateformes/GPU réels | NOT_RUN; nécessaires aux validations qu'ils prétendent établir |
 | TEST-02 | `tests/test_version_gpu.py` = script diagnostic sans `test_*` (0 items collectés) | R0 observé : `no tests ran in 0.05s` ; c'est un script d'impression CUDA, pas un témoin. À renommer ou convertir en vrai témoin GPU. Ne pas compter comme couverture |
-| TEST-03 | Témoin de propagation dispatch GUI/config → `run_hierarchical_mosaic_process` → `run_hierarchical_mosaic` (kwargs effectifs) | RÉSOLU (mission ZM-ARCH-WITNESS-DISPATCH-20261003) : nouveau `tests/test_dispatch_propagation_witness.py`, 14 pass/0 skip en 4.63s. Caractérise rename GUI→worker (stacking_* → stack_*), parsing `stacking_winsor_limits`→`parsed_winsor_limits` (tuple, fallback (0.05,0.05)), promotion suffixe `_config`, drop silencieux des kwargs inconnus (risque architectural), défauts `stack_ram_budget_gb_config=0.0`/`num_base_workers_config=0`, préservation des valeurs falsy (False/0/""/numériques), invocation unique sans travail lourd. Aucun fix produit ; reste ouvert : cache/reprise, low-N/all-invalid, spawn réel. |
-| TEST-04 | Témoin low-N / all-invalid / zero-weight du stacking (Grid CPU vs `stack_core` vs classic N<3) | RÉSOLU (mission ZM-ARCH-WITNESS-STACK-EDGES-20261003) : nouveau `tests/test_stacking_low_n_all_invalid_witness.py`, 18 pass/0 skip en 2.15s, CPU uniquement, float32 HWC 2×2×1. Épingle : Grid CPU all-invalid → zéros vs `stack_core` → NaN (pixel all-invalid 0.0 vs NaN en mean) ; median Grid CPU ignore la magnitude mais traite `weight<=0` comme invalide, `stack_core` ignore totalement les poids en median ; classic kappa N=1/N=2 et winsorized N=1 (warning « needs >=3 images ; forcing CPU ») renvoient des stacks valides `rejected=0.0`. Divergence SCI-03 caractérisée, PAS corrigée. Restent ouverts (non testés) : cache/reprise, spawn réel, parité CPU↔GPU, Grid GPU `stack_core`, classic N≥3 / SDS, `linear_fit` numériques, Phase 4.5 exécution. |
-| TEST-05 | Témoin spawn réel du worker package-qualifié (`zemosaic.zemosaic_worker.run_hierarchical_mosaic_process`) | RÉSOLU (mission ZM-ARCH-WITNESS-SPAWN-20261003) : nouveau `tests/test_spawn_worker_process_witness.py`, 1 pass/0 skip en ~6.5s (stable sur 3 exécutions, aucun sleep arbitraire). Spawn réel via `multiprocessing.get_context("spawn")` + `Queue` réelle, cible = fonction produit package-qualifiée (prouve pickling/import sous spawn, pas un double in-process). Invocation volontairement sans arguments scientifiques → `TypeError` (args requis manquants) attrapé par le wrapper → protocole `PROCESS_ERROR` (le champ `error` identifie « missing … input_folder », pas un échec import/pickle) suivi de `PROCESS_DONE` (finally), sortie propre exitcode=0, aucun enfant fuité. `crash_breadcrumbs_mode="off"`, HOME/XDG/cwd/temp isolés, pas de heartbeat, aucun fichier breadcrumb/state, cwd vide, queue fermée/jointe. Ne témoigne PAS d'une exécution scientifique réussie, ni GPU/solver, ni parité GUI end-to-end, ni plateformes hors environnement exécuté (Linux x64). Reste ouvert : cache/reprise et exécution scientifique réussie. |
+| TEST-03 | Témoin de propagation dispatch GUI/config → `run_hierarchical_mosaic_process` → `run_hierarchical_mosaic` (kwargs effectifs) | RÉSOLU (mission ZM-ARCH-WITNESS-DISPATCH-20261003) : nouveau `tests/test_dispatch_propagation_witness.py`, 14 pass/0 skip en 4.63s. Caractérise rename GUI→worker (stacking_* → stack_*), parsing `stacking_winsor_limits`→`parsed_winsor_limits` (tuple, fallback (0.05,0.05)), promotion suffixe `_config`, drop silencieux des kwargs inconnus (risque architectural), défauts `stack_ram_budget_gb_config=0.0`/`num_base_workers_config=0`, préservation des valeurs falsy (False/0/""/numériques), invocation unique sans travail lourd. Aucun fix produit ; les autres témoins alors ouverts sont désormais suivis par TEST-04/05/06. |
+| TEST-04 | Témoin low-N / all-invalid / zero-weight du stacking (Grid CPU vs `stack_core` vs classic N<3) | RÉSOLU (mission ZM-ARCH-WITNESS-STACK-EDGES-20261003) : nouveau `tests/test_stacking_low_n_all_invalid_witness.py`, 18 pass/0 skip en 2.15s, CPU uniquement, float32 HWC 2×2×1. Épingle : Grid CPU all-invalid → zéros vs `stack_core` → NaN (pixel all-invalid 0.0 vs NaN en mean) ; median Grid CPU ignore la magnitude mais traite `weight<=0` comme invalide, `stack_core` ignore totalement les poids en median ; classic kappa N=1/N=2 et winsorized N=1 (warning « needs >=3 images ; forcing CPU ») renvoient des stacks valides `rejected=0.0`. Divergence SCI-03 caractérisée, PAS corrigée. Restent ouverts (non testés) : parité CPU↔GPU, Grid GPU `stack_core`, classic N≥3 / SDS, `linear_fit` numériques, Phase 4.5 exécution ; cache/reprise et spawn sont désormais couverts par TEST-06/05. |
+| TEST-05 | Témoin spawn réel du worker package-qualifié (`zemosaic.zemosaic_worker.run_hierarchical_mosaic_process`) | RÉSOLU (mission ZM-ARCH-WITNESS-SPAWN-20261003) : nouveau `tests/test_spawn_worker_process_witness.py`, 1 pass/0 skip en ~6.5s (stable sur 3 exécutions, aucun sleep arbitraire). Spawn réel via `multiprocessing.get_context("spawn")` + `Queue` réelle, cible = fonction produit package-qualifiée (prouve pickling/import sous spawn, pas un double in-process). Invocation volontairement sans arguments scientifiques → `TypeError` (args requis manquants) attrapé par le wrapper → protocole `PROCESS_ERROR` (le champ `error` identifie « missing … input_folder », pas un échec import/pickle) suivi de `PROCESS_DONE` (finally), sortie propre exitcode=0, aucun enfant fuité. `crash_breadcrumbs_mode="off"`, HOME/XDG/cwd/temp isolés, pas de heartbeat, aucun fichier breadcrumb/state, cwd vide, queue fermée/jointe. Ne témoigne PAS d'une exécution scientifique réussie, ni GPU/solver, ni parité GUI end-to-end, ni plateformes hors environnement exécuté (Linux x64). Cache/reprise est désormais couvert par TEST-06 ; l'exécution scientifique réussie reste NOT_RUN. |
 | TEST-06 | Témoin cache/reprise/checkpoint Classic (`_safe_load_cache`, checkpoint Phase 5, reprise/écriture Phase 1) | RÉSOLU (mission ZM-ARCH-WITNESS-CACHE-RESUME-20261004) : nouveau `tests/test_cache_resume_characterization_witness.py`, 18 pass/0 skip en ~2.8s, CPU uniquement, petits tableaux + Header/WCS Astropy réels sous `tmp_path`. Épingle : `_safe_load_cache` charge en memmap `mmap_mode="r"` (retourne `np.memmap`) sans pickle ; retente une fois sans memmap sur OSError WinError 1455 avec callback `stack_mem_fallback_memmap_to_ram` (lvl WARN) ; relance les OSError non-1455 et les échecs du fallback. Checkpoint Phase 5 : écrit/relit un artefact mosaïque HWC float32 + coverage/alpha HW, manifest `schema_version=1`/`pipeline=classic_legacy`, rejet signature/schema/pipeline/output-shape ; méthode vérifiée seulement si stockée non vide, counts seulement pour attentes entières positives. Mosaïque manquante/corrompue/mauvaise dimension rejette tout ; coverage/alpha manquants ou mal dimensionnés → None (mosaïque valide encore chargée), normalisation singleton trailing channel `(H,W,1)→(H,W)`, aucun `.tmp` résiduel après succès. Reprise Phase 1 : écrit manifest + `phase1_processed_info.json` + `phase1.done` ; mode auto signature exacte → `(True, entries, "ok")` avec Header/WCS reconstruits ; auto mismatch rejeté / force mismatch procède avec warning ; cache partiel → `(False, entries, raison)` avec compteurs ; raisons épinglées (manifest/schema/pipeline/processed-info/manifest missing). Seam test-only par reconstruction des code objects imbriqués via `run_hierarchical_mosaic_classic_legacy.__wrapped__.__code__` (identité prouvée, aucune copie de formule). Reste NOT_RUN : entrée mosaïque non-float32 (champ dtype manifest pré-cast), branches permissives méthode vide/count attendu non positif, rétention/refcount par tuile, nettoyage `run_end`, réutilisation master tiles, égalité scientifique reprise-vs-neuf, interruption/crash recovery, sémantique filesystem cross-platform. |
 | ARCH-03 | `core/cuda_utils.py::enforce_nvidia_gpu` sans importeur trouvé ; `cuda_utils.py::gpu_supported/enforce_nvidia_gpu` sans caller (mais `CUPY_AVAILABLE` vivant via `_app.py`) | SUSPECTED DEAD — vérifier avant R1 ; ne pas supprimer sans preuve |
 | ARCH-04 | `zemosaic_gui.py` (Tk legacy) sans importeur dans src ni dans `ZeMosaic.spec` hiddenimports ; `--tk-gui` rejeté par `_app._determine_backend` | DORMANT BUT REACHABLE — conserver jusqu'à preuve contraire |
