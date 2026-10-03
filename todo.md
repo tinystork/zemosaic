@@ -173,8 +173,9 @@ SolverPort/adapters publics conservés, aucun import/probing de dépôt frère.
 - [ ] Ajouter avant extraction les petits témoins de comportement absents.
   (non exécuté en R0 — interdit d'éditer les tests dans cette itération)
   TEST-01 clos séparément (mission ZM-ARCH-TEST01-PHASE3-IMPORTS-20261003) : imports
-  plats Phase 3 → qualifiés, 33 pass/0 skip. Restent à ajouter les témoins
-  dispatch/cache/low-N/spawn, hors périmètre de cette mission.
+  plats Phase 3 → qualifiés, 33 pass/0 skip. Témoin dispatch RÉSOLU séparément
+  (mission ZM-ARCH-WITNESS-DISPATCH-20261003, cf. TEST-03). Restent à ajouter les
+  témoins cache/reprise, low-N/all-invalid et spawn réel, hors périmètre de cette mission.
 - [x] Produire premiers tableaux R3, anomalies scientifiques, UNKNOWN/STOP et
   ordre proposé des extractions avec critères de sortie de chaque lot.
 - [x] Revue Nono indépendante de R0; toute classification PROVEN DEAD contestée
@@ -288,6 +289,7 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 | ARCH-02 | Contrats externes / frozen / API programmatique | Inventaire incomplet; ambiguïté bloque une suppression, pas toute R0 |
 | MANUAL-01 | M106 avant/après et plateformes/GPU réels | NOT_RUN; nécessaires aux validations qu'ils prétendent établir |
 | TEST-02 | `tests/test_version_gpu.py` = script diagnostic sans `test_*` (0 items collectés) | R0 observé : `no tests ran in 0.05s` ; c'est un script d'impression CUDA, pas un témoin. À renommer ou convertir en vrai témoin GPU. Ne pas compter comme couverture |
+| TEST-03 | Témoin de propagation dispatch GUI/config → `run_hierarchical_mosaic_process` → `run_hierarchical_mosaic` (kwargs effectifs) | RÉSOLU (mission ZM-ARCH-WITNESS-DISPATCH-20261003) : nouveau `tests/test_dispatch_propagation_witness.py`, 14 pass/0 skip en 4.63s. Caractérise rename GUI→worker (stacking_* → stack_*), parsing `stacking_winsor_limits`→`parsed_winsor_limits` (tuple, fallback (0.05,0.05)), promotion suffixe `_config`, drop silencieux des kwargs inconnus (risque architectural), défauts `stack_ram_budget_gb_config=0.0`/`num_base_workers_config=0`, préservation des valeurs falsy (False/0/""/numériques), invocation unique sans travail lourd. Aucun fix produit ; reste ouvert : cache/reprise, low-N/all-invalid, spawn réel. |
 | ARCH-03 | `core/cuda_utils.py::enforce_nvidia_gpu` sans importeur trouvé ; `cuda_utils.py::gpu_supported/enforce_nvidia_gpu` sans caller (mais `CUPY_AVAILABLE` vivant via `_app.py`) | SUSPECTED DEAD — vérifier avant R1 ; ne pas supprimer sans preuve |
 | ARCH-04 | `zemosaic_gui.py` (Tk legacy) sans importeur dans src ni dans `ZeMosaic.spec` hiddenimports ; `--tk-gui` rejeté par `_app._determine_backend` | DORMANT BUT REACHABLE — conserver jusqu'à preuve contraire |
 | ARCH-05 | `run_hierarchical_mosaic_classic_legacy` contient son propre bloc de résolution SDS (`worker:23690-23715`) + helpers SDS partagés, en plus du dispatcher `run_hierarchical_mosaic` | Duplication à documenter avant toute extraction Classic/SDS ; ne pas consolider sans témoin |
