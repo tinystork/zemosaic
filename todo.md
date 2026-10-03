@@ -2,20 +2,20 @@
 
 ## Statut et autorisation
 
-**PRÉPARÉ — NON DÉMARRÉ**, le 2026-10-03, à la demande de Tristan.
+**R0 ACCEPTÉ LOCALEMENT — témoins pré-R1 à compléter**, le 2026-10-03.
 
-Ce fichier conserve la mission et les compléments issus d'une lecture ciblée du
-code. Ce n'est ni le rapport d'archéologie R0, ni une preuve de validation
-scientifique. Ne pas lancer R0–R3, Coco/Nono, pytest, builds ou M106 sans une
-nouvelle instruction de lancement. Aucune suppression/extraction réalisée.
+Tristan a autorisé le lancement de la mission. R0 (archéologie + baseline ciblée)
+est terminé et accepté par Junior après revue indépendante Nono `review-3: ACCEPT`.
+Les rapports d'architecture sont sous `docs/refactor/`. Aucune suppression ou
+extraction n'a encore été réalisée; M106 reste une gate scientifique manuelle finale.
 
 - [x] Vérifier l'identité du dépôt et actualiser les références distantes.
 - [x] Vérifier base, version et propreté initiale.
 - [x] Vérifier les principales hypothèses de la mission par lecture du code.
 - [x] Créer la branche locale dédiée depuis le SHA exact.
 - [x] Écrire le plan, ses corrections et ses gates.
-- [ ] Recevoir l'instruction de lancer la mission.
-- [ ] Exécuter R0 et obtenir sa revue indépendante.
+- [x] Recevoir l'instruction de lancer la mission.
+- [x] Exécuter et accepter R0 (archéologie + baseline, Nono `review-3: ACCEPT`).
 - [ ] Exécuter les seules suppressions R1 prouvées sûres.
 - [ ] Exécuter les extractions R2 acceptées une par une.
 - [ ] Finaliser la carte des contrats R3 et le rapport.
@@ -32,9 +32,9 @@ nouvelle instruction de lancement. Aucune suppression/extraction réalisée.
 | `origin/main`, `origin/beta`, HEAD initial | Tous égaux à BASE SHA après `git fetch origin --prune` |
 | Branche initiale | `beta`, worktree propre |
 | Branche préparée | `refactor/zm-architecture-cleanup-r0-r3` |
-| HEAD préparé | BASE SHA, aucun commit de préparation |
+| HEAD après checkpoint documentaire | `035119eb72266eeb8279a63fd244beff803ec213` |
 | Version | `4.7.0`, `src/zemosaic/__init__.py`; concorde avec `version.txt` |
-| Changements de préparation | Ce seul `todo.md`, laissé non commité |
+| Checkpoint de préparation | `035119e docs: plan ZeMosaic architectural cleanup` |
 
 Ne pas réinitialiser une branche existante, rebaser, fusionner ou avancer la base
 opportunistement. Aucun push, merge, tag, release, bump de version ou modification
@@ -42,23 +42,23 @@ de `main`/`beta`. Les commits futurs restent petits et locaux.
 
 ### Gate de reprise
 
-- [ ] Relire ce fichier et les instructions locales; vérifier qu'aucun worker n'est actif.
-- [ ] Refaire `git fetch origin --prune`, `git status --short`,
+- [x] Relire ce fichier et les instructions locales; vérifier qu'aucun worker n'est actif.
+- [x] Refaire `git fetch origin --prune`, `git status --short`,
   `git branch --show-current`, `git rev-parse origin/main origin/beta HEAD`,
   `git log --oneline --decorate -10` et `git worktree list` dans le vrai checkout.
-- [ ] Si une branche distante diffère de BASE SHA : STOP et rapport, sans changement de base.
-- [ ] Préserver toute modification nouvelle de Tristan, ne rien stasher/effacer implicitement.
-- [ ] Résoudre le checkpoint documentaire : ce `todo.md` rend volontairement le
-  worktree non propre après préparation. Lors du lancement autorisé, inspecter et
-  enregistrer ce document seul dans un commit local `docs: plan ZeMosaic architectural cleanup`;
-  puis vérifier le worktree propre AVANT les travaux R0/tests. Ne pas le supprimer
-  pour satisfaire artificiellement la gate. Aucun commit n'a été créé aujourd'hui.
-- [ ] Garder BASE SHA comme référence scientifique immuable même après les commits docs/tests.
+- [x] Si une branche distante diffère de BASE SHA : STOP et rapport, sans changement de base.
+  (vérifié : origin/main == origin/beta == BASE SHA après fetch, aucun écart)
+- [x] Préserver toute modification nouvelle de Tristan, ne rien stasher/effacer implicitement.
+- [x] Résoudre le checkpoint documentaire : le commit local
+  `docs: plan ZeMosaic architectural cleanup` (`035119e`) existe déjà et le worktree
+  était propre avant R0. Ne pas le supprimer pour satisfaire artificiellement la gate.
+  Aucun commit de produit/test créé pendant R0.
+- [x] Garder BASE SHA comme référence scientifique immuable même après les commits docs/tests.
 
 ## 2. Avis de cohérence — constats ciblés, pas R0 complet
 
 La mission est cohérente avec le code de cette base. Les avertissements Classic,
-Phase 4.5, helpers Tk et divergence Grid WSC sont fondés. Les précisions suivantes
+Phase 4.5, helpers Tk et divergence Grid `winsorized_sigma_clip` sont fondés. Les précisions suivantes
 font partie du plan corrigé. Les numéros de ligne ci-dessous désignent BASE SHA.
 
 | Sujet | Preuve statique et conséquence |
@@ -71,7 +71,7 @@ font partie du plan corrigé. Les numéros de ligne ci-dessous désignent BASE S
 | Phase 5 partagée | `_run_shared_phase45_phase5_pipeline` exécute aussi la Phase 5 lorsque 4.5 est désactivée. Ne jamais supprimer ce helper au motif que 4.5 serait obsolète. |
 | Filtre historique | `zemosaic_filter_gui_qt.py:448` importe les trois helpers nommés dans la mission, avec copies de secours en cas d'échec. Worker : imports dynamiques de `launch_filter_interface` à `:25615` et `:31844`. Tk est importé dans certaines fonctions, pas simplement à l'import de tout le module. |
 | Couplage retour | Le filtre Qt prend aussi des helpers du worker (`:434`); les extractions doivent examiner ce graphe dans les deux sens et les références capturées à l'import. |
-| Grid CPU/GPU | `grid_mode.py:1913` utilise les rejets établis; `:1984` / `:2018` appelle `stack_core` côté GPU. Le core contient WSC simplifié (`zemosaic_stack_core.py:325`). Divergence structurelle confirmée, impact numérique NON MESURÉ ici. |
+| Grid CPU/GPU | `grid_mode.py:1913` utilise les rejets établis; `:1984` / `:2018` appelle `stack_core` côté GPU. Le core contient un `winsorized_sigma_clip` simplifié (`zemosaic_stack_core.py:325`), distinct du WSC PixInsight. Divergence structurelle confirmée, impact numérique NON MESURÉ ici. |
 | Nuance linear_fit | Le placeholder existe à `zemosaic_stack_core.py:294`, mais Grid GPU normalise en amont puis passe `normalize_method='none'` (`grid_mode.py:2012`). Ne pas lui attribuer sans preuve ce placeholder. Cartographier séparément normalisation linear-fit et rejet linear-fit. |
 | Monolithe | `zemosaic_worker.py` : 38 882 lignes, 1 736 598 octets. La taille n'est pas un critère de succès en elle-même. |
 | Témoins Phase 3 | 11 appels `pytest.importorskip("zemosaic_worker")` persistent dans `tests/test_phase3_adaptive_invariants.py`, alors que le package interdit les alias plats (`tests/test_packaging.py`, NamespaceTests). Risque de skips silencieux; aucun résultat pytest revendiqué à ce stade. |
@@ -80,27 +80,31 @@ font partie du plan corrigé. Les numéros de ligne ci-dessous désignent BASE S
 
 ## 3. Compléments nécessaires à la mission
 
-- [ ] **Définir les chemins supportés en R0** : GUI installée, `python -m`, checkout,
+- [x] **Définir les chemins supportés en R0** : GUI installée, `python -m`, checkout,
   distribution frozen, éventuelle API programmatique documentée, scripts externes.
   Une fonction importable n'est pas automatiquement publique; l'absence de caller
   local ne prouve pas son abandon. En cas de doute : UNKNOWN, conserver.
-- [ ] **Préparer R3 dès R0** pour les zones touchées, puis le compléter en fin de
+  (documenté dans ARCHAEOLOGY_R0.md §1)
+- [x] **Préparer R3 dès R0** pour les zones touchées, puis le compléter en fin de
   mission. La carte du stacking et ses témoins doivent précéder une extraction,
   pas être découverts après R2.
+  (STACKING_CONTRACTS_R3.md préliminaire créé)
 - [ ] **Définir une comparaison avant/après par chemin**, à entrées/config/environnement
   identiques, distincte d'une comparaison CPU/GPU. Bit-identité lorsque déterministe;
   sinon tolérances explicites justifiées sur la baseline, définies AVANT changement,
   jamais élargies pour faire passer le candidat. Comparer masques et couverture
   autant que les pixels; ne pas exiger une parité entre deux chemins déjà divergents.
-- [ ] **Inventorier l'environnement réel** : Python, dépendances/versions, OS,
+- [x] **Inventorier l'environnement réel** : Python, dépendances/versions, OS,
   GPU/driver/CUDA/CuPy, BLAS/threads, graines, disponibilité solveurs/catalogues.
   Distinguer backend demandé, effectivement exécuté et fallback. Un skip GPU ou
   un mock CuPy ne vaut pas qualification GPU physique.
-- [ ] **Isoler les tests** : répertoires temporaires pour profil/config/cwd/XDG,
+  (documenté dans ARCHAEOLOGY_R0.md §0.1 ; CuPy runtime OK sur MX150, nvcc absent)
+- [x] **Isoler les tests** : répertoires temporaires pour profil/config/cwd/XDG,
   copies de FITS; pas de modification du profil ni des brutes de Tristan, pas de
   téléchargement/catalogue/réseau implicite. Consigner passed/failed/skipped/xfail,
   collecte, warnings utiles et raisons. Vérifier les 11 imports plats avant de
   compter ces tests comme témoins; ne pas réintroduire d'alias produit pour eux.
+  (isolé sous /tmp/zm-r0-home + /tmp/zm-r0-xdg ; 11 skips confirmés, cf. TEST-01)
 - [ ] **Préserver GUI → process → moteur** : valeurs et précédence des paramètres,
   pas seulement clés/signatures. Le wrapper renomme, parse, suffixe puis filtre
   silencieusement les kwargs via `inspect.signature` (`worker:36251` et suivantes).
@@ -142,40 +146,47 @@ sélection ZeAnalyser, acquisition Seestar, refonte Grid, ajout de dépendance m
 Standalone impératif : ZeAlfie non requis au runtime, intégrations optionnelles,
 SolverPort/adapters publics conservés, aucun import/probing de dépôt frère.
 
-## 5. R0 — archéologie complète (à exécuter ultérieurement)
+## 5. R0 — archéologie complète (acceptée localement)
 
-- [ ] Créer `docs/refactor/ARCHAEOLOGY_R0.md`, ancré à BASE SHA, symboles et preuves.
-- [ ] Dessiner le graphe application : entrée installée / module / wrapper / frozen
+- [x] Créer `docs/refactor/ARCHAEOLOGY_R0.md`, ancré à BASE SHA, symboles et preuves.
+- [x] Dessiner le graphe application : entrée installée / module / wrapper / frozen
   → bootstrap Qt → GUI/filtre → wrapper process → dispatcher → Classic/SDS/Grid.
-- [ ] Détailler précédence Grid/SDS, erreurs/fallbacks et payloads GUI/filter.
-- [ ] Cartographier Classic, SDS, Grid et 4.5 si accessible : appelant →
+- [x] Détailler précédence Grid/SDS, erreurs/fallbacks et payloads GUI/filter.
+- [x] Cartographier Classic, SDS, Grid et 4.5 si accessible : appelant →
   normalisation → pondération → rejet → combine → backend réel/fallback.
-- [ ] Couvrir Filter Qt/Tk, SolverPort/ZeSolver/ASTAP, lancement ZeAnalyser,
+  (4.5 corrigé jusqu'au rework-3 : flux A–E, CPU-only, normalisation active,
+  branche alpha-weighted, gain inter-super et branches dormantes documentés)
+- [x] Couvrir Filter Qt/Tk, SolverPort/ZeSolver/ASTAP, lancement ZeAnalyser,
   FITS I/O, WCS, reprojection, photométrie, assembly, checkpoint/resume,
   preview/progress, ressources/GPU, modules `core/robust_rejection` et `cuda_utils`.
-- [ ] Inventorier globals, caches, imports dynamiques, side effects et dépendances
+  (ARCHAEOLOGY_R0.md §7 — cartes data-plane ajoutées en rework-1)
+- [x] Inventorier globals, caches, imports dynamiques, side effects et dépendances
   inverses worker↔GUI avant d'identifier des modules extractibles.
-- [ ] Classer chaque module ET chemin significatif : ACTIVE, COMPATIBILITY,
+- [x] Classer chaque module ET chemin significatif : ACTIVE, COMPATIBILITY,
   TEST / DIAGNOSTIC, DORMANT BUT REACHABLE, SUSPECTED DEAD, PROVEN DEAD ou UNKNOWN.
   Inclure preuves, appelants, contrat supporté, témoins, risque et revue.
-- [ ] Établir le statut supporté de Phase 4.5 : preuve de chemin et témoin ciblé;
+- [x] Établir le statut supporté de Phase 4.5 : preuve de chemin et témoin ciblé;
   jamais « False dans Qt = mort ». Ne pas changer les defaults pour la tester.
-- [ ] Séparer helpers métier/Tk/fallbacks dans le filtre, sans suppression immédiate.
-- [ ] Établir une baseline rapide, isolée et honnête (cf. section 6).
+  (conclusion : DORMANT BUT REACHABLE / programme seulement, désactivé sur GUI Qt)
+- [x] Séparer helpers métier/Tk/fallbacks dans le filtre, sans suppression immédiate.
+- [x] Établir une baseline rapide, isolée et honnête (cf. section 6).
 - [ ] Ajouter avant extraction les petits témoins de comportement absents.
-- [ ] Produire premiers tableaux R3, anomalies scientifiques, UNKNOWN/STOP et
+  (non exécuté en R0 — interdit d'éditer les tests dans cette itération)
+- [x] Produire premiers tableaux R3, anomalies scientifiques, UNKNOWN/STOP et
   ordre proposé des extractions avec critères de sortie de chaque lot.
-- [ ] Revue Nono indépendante de R0; toute classification PROVEN DEAD contestée
+- [x] Revue Nono indépendante de R0; toute classification PROVEN DEAD contestée
   redevient UNKNOWN ou SUSPECTED DEAD avant R1.
+  (trois cycles de correction docs-only; Nono `review-3: ACCEPT`, puis ACCEPT Junior)
 
 PROVEN DEAD exige, selon le composant : aucun caller supporté, dépendance d'import,
 chemin Qt/CLI/package/API publique, import dynamique, dépendance packaging/resource,
 contrat de test pertinent ou besoin de compatibilité. Recherche AST/texte seule
 insuffisante. Aucun candidat n'est déclaré PROVEN DEAD dans cette préparation.
 
-## 6. Inventaire initial des témoins — tous NOT_RUN ici
+## 6. Inventaire initial des témoins — baseline R0 exécutée
 
-Commandes futures : utiliser l'interpréteur de l'environnement constaté et
+Résultats exacts, durées et skips de R0 : `docs/refactor/ARCHAEOLOGY_R0.md` §12.
+Pour les prochains témoins, utiliser l'interpréteur de l'environnement constaté et
 `python -m pytest -q -ra <fichiers>` sous isolation; enregistrer commande exacte,
 SHA, environnement, durée, compteurs et contrat prouvé. Groupes sélectionnés selon
 le diff, pas toute la suite à chaque déplacement.
@@ -190,7 +201,7 @@ le diff, pas toute la suite à chaque déplacement.
 | `tests/test_zesolver_filter_handoff.py`, `tests/test_zesolver_filter_handoff_hg2.py`, `tests/test_zesolver_filter_qt.py` | Filtre → GUI → process → Phase 1, WCS en mémoire et cycle Qt |
 | `tests/test_zesolver_filter_cancel_hg2.py` | Annulation/fermeture pendant solve, non seulement chemin succès |
 | `tests/test_zesoftware_interop.py`, `tests/test_zeanalyser_launch.py` | Standalone et lancement via contrats installés |
-| `tests/test_cupy_platform_guard.py`, `tests/test_version_gpu.py`, `tests/test_phase5_vram_budget.py`, `tests/test_resource_telemetry.py` | GPU optionnel, imports/absence NVRTC, budgets et télémétrie |
+| `tests/test_cupy_platform_guard.py`, `tests/test_version_gpu.py`, `tests/test_phase5_vram_budget.py`, `tests/test_resource_telemetry.py` | GPU optionnel, gardes CuPy/NVRTC, budgets et télémétrie (`test_version_gpu.py` reste un diagnostic sans test collecté) |
 | `tests/SMOKE_PROTOCOL_Windows_macOS.md` et garde CI Qt | Compléments plateforme, ne pas annoncer PASS sans exécution |
 
 - [ ] Compléter les trous : dispatch réel, paramètres aval, absence de Tk sur
@@ -265,7 +276,7 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 
 | ID | Sujet | Statut initial / suite, hors corrections R0–R3 |
 | --- | --- | --- |
-| SCI-01 | Grid CPU WSC établi vs GPU core WSC simplifié | Divergence de code confirmée; construire témoin reproductible, quantifier, ne pas corriger |
+| SCI-01 | Grid CPU winsorized_sigma_clip établi (winsorize-then-clip) vs GPU core winsorized_sigma_clip simplifié (médian/σ clip) | Divergence de code confirmée (pas du WSC PixInsight; kappa-sigma n'est PAS divergent sur GPU) ; construire témoin reproductible, quantifier, ne pas corriger |
 | SCI-02 | Placeholder linear_fit dans core | Présent; Grid GPU passe none au core. Identifier tout caller effectif et distinguer normalisation/rejet |
 | SCI-03 | Masques/poids Grid CPU/GPU, all-invalid, aliases et winsor_limits | À caractériser : CPU masque les poids non positifs avant rejet; configuration transmise au core différente. Pas de conclusion de parité ni de correctif ici |
 | SCI-04 | Variantes Classic/SDS/Phase 4.5 / low-N / chunking | Différences à inventorier avant toute consolidation |
@@ -273,6 +284,12 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 | ARCH-01 | Invocations supportées de Phase 4.5 / fallback Tk | UNKNOWN jusqu'à preuve/revue; conserver |
 | ARCH-02 | Contrats externes / frozen / API programmatique | Inventaire incomplet; ambiguïté bloque une suppression, pas toute R0 |
 | MANUAL-01 | M106 avant/après et plateformes/GPU réels | NOT_RUN; nécessaires aux validations qu'ils prétendent établir |
+| TEST-02 | `tests/test_version_gpu.py` = script diagnostic sans `test_*` (0 items collectés) | R0 observé : `no tests ran in 0.05s` ; c'est un script d'impression CUDA, pas un témoin. À renommer ou convertir en vrai témoin GPU. Ne pas compter comme couverture |
+| ARCH-03 | `core/cuda_utils.py::enforce_nvidia_gpu` sans importeur trouvé ; `cuda_utils.py::gpu_supported/enforce_nvidia_gpu` sans caller (mais `CUPY_AVAILABLE` vivant via `_app.py`) | SUSPECTED DEAD — vérifier avant R1 ; ne pas supprimer sans preuve |
+| ARCH-04 | `zemosaic_gui.py` (Tk legacy) sans importeur dans src ni dans `ZeMosaic.spec` hiddenimports ; `--tk-gui` rejeté par `_app._determine_backend` | DORMANT BUT REACHABLE — conserver jusqu'à preuve contraire |
+| ARCH-05 | `run_hierarchical_mosaic_classic_legacy` contient son propre bloc de résolution SDS (`worker:23690-23715`) + helpers SDS partagés, en plus du dispatcher `run_hierarchical_mosaic` | Duplication à documenter avant toute extraction Classic/SDS ; ne pas consolider sans témoin |
+| ARCH-06 | `stack_core` réutilisé par Grid GPU ; `linear_fit` = placeholder médian ; winsorized GPU simplifié vs CPU établi | SCI-01/02 confirmés ; Grid GPU normalise en amont et passe `none` au core (`grid_mode:2012`) |
+| SCI-07 | Helpers Phase 4.5 `estimate_affine_photometry` / `apply_affine_photometry` / `micro_align_stack` ABSENTS à BASE | Runtime `hasattr` `False False False` ; gates `worker:7412-7414` éteignent micro-align/intra-group affine/legacy affine/global-affine inter-super (`:8034`,`:7701-7705`,`:7766`,`:8084`,`:8095`,`:8151-8154`,`:8865`) → DORMANT/UNREACHABLE, PAS PROVEN DEAD. Seule normalisation 4.5 ACTIVE = `linear_fit`/`sky_mean` pré-stack (`worker:8202-8290`) + gain-only inter-super post-stack (`:8622-8832`). Ne pas documenter comme couverture photométrique exécutée |
 
 Pour toute découverte ajouter : ID, SHA, chemin/caller, attendu vs observé,
 commande/témoin/artefacts, impact, raison de non-correction, prochain pas unique.
