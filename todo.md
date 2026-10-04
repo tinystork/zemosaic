@@ -2,14 +2,20 @@
 
 ## Statut et autorisation
 
-**R1 CLOS SANS SUPPRESSION — R2 prêt à être borné**, le 2026-10-04.
+**R2 SCOPE BORNÉ CLOS — R3 TECHNIQUE ACCEPTÉ — M106 HOLD**, le 2026-10-04.
 
 Tristan a autorisé le lancement de la mission. R0 (archéologie + baseline ciblée)
 est terminé et accepté par Junior après revue indépendante Nono `review-3: ACCEPT`.
 Les témoins pré-extraction TEST-01/03/04/05/06/07 sont en place. R1 est clos sans
-suppression : aucun candidat n'a franchi le seuil PROVEN DEAD. Le premier lot R2
-(lot 1, helpers de regroupement) est DONE (commit `8b7a979`) ; les lots R2
-suivants restent ouverts. M106 reste une gate scientifique manuelle finale.
+suppression : aucun candidat n'a franchi le seuil PROVEN DEAD. Le scope R2 **borné**
+accepté est clos pour CETTE mission : lot 1 (helpers de regroupement, commit `8b7a979`),
+lot 2A (témoin crash-breadcrumb, commit `5d7920d`), lot 2B (moteur crash-breadcrumb
+stateless, commit `1282cfe`) — tous Nono `review-0: ACCEPT` + acceptation Junior.
+Ceci ne prétend PAS que le worker de ~38k lignes est « terminé » : les extractions
+arbitraires sont volontairement évitées et toute décomposition future exige une nouvelle
+mission bornée (témoins/critères/revue). L'audit R3 post-R2 et `FINAL_REPORT.md` sont
+**acceptés techniquement** après Nono `review-0: ACCEPT` + acceptation Junior.
+M106 reste une gate scientifique manuelle finale HOLD, non lancée.
 
 - [x] Vérifier l'identité du dépôt et actualiser les références distantes.
 - [x] Vérifier base, version et propreté initiale.
@@ -21,9 +27,10 @@ suivants restent ouverts. M106 reste une gate scientifique manuelle finale.
 - [x] Clore R1 sans suppression : aucun candidat PROVEN DEAD après témoins et revue.
 - [x] Témoins de caractérisation pré-R2 complets (TEST-01/03/04/05/06 clos).
 - [x] Finaliser la carte des contrats R3 (baseline PRE-R2) : `docs/refactor/STACKING_CONTRACTS_R3.md` accepté comme freeze de comportement/contrats après Nono `review-1: ACCEPT` et acceptation Junior.
-- [ ] Exécuter les extractions R2 acceptées une par une.
-- [ ] Finaliser l'audit R3 et le rapport post-R2 (FINAL_REPORT.md + audit final).
-- [ ] Obtenir l'acceptation scientifique manuelle de Tristan sur M106.
+- [x] Exécuter le scope R2 borné accepté (lot 1 `8b7a979`, lot 2A `5d7920d`, lot 2B `1282cfe` — Nono review-0 ACCEPT + Junior).
+- [x] Rédiger l'audit R3 post-R2 + `FINAL_REPORT.md`.
+- [x] Obtenir l'acceptation R3 technique finale (Nono `review-0: ACCEPT` + Junior).
+- [ ] Obtenir l'acceptation scientifique manuelle de Tristan sur M106 (HOLD — non lancée).
 
 ## 1. Base canonique et branche
 
@@ -318,8 +325,10 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
   `core/robust_rejection.py` mappé sur ses appelants réels (align_stack / align_stack_gpu).
 - [x] Aucune parité non mesurée; échecs préexistants et limites matériel conservés sans
   modifier la science.
-- [ ] **Audit et rapport R3 post-R2** (FINAL_REPORT.md + audit final) — reste non coché,
-  à réaliser après les extractions R2.
+- [x] **Audit et rapport R3 post-R2** — `FINAL_REPORT.md` et
+  `STACKING_CONTRACTS_R3.md` **POST-R2 AUDITED — ACCEPTED** après Nono
+  `review-0: ACCEPT` + Junior ; aucune extraction R2 ne touche stacking
+  math/order/weights/rejection/WCS/FITS/science. M106 reste HOLD.
 
 ## 10. TODO / FOLLOW-UP — SCIENCE et inconnues
 
@@ -387,12 +396,14 @@ Pas de délégation déclenchée par la seule présence de ce fichier.
   des modes/options qu'il n'exerce pas (SDS/Grid/GPU/Phase 4.5 notamment).
 - [ ] Tristan réalise/valide l'acceptation manuelle finale; baseline indisponible
   ou test non passé = HOLD explicite, jamais promotion automatique.
-- [ ] Écrire `docs/refactor/FINAL_REPORT.md` : BASE SHA, branche, HEAD final, statut
+- [x] Écrire `docs/refactor/FINAL_REPORT.md` : BASE SHA, branche, HEAD final, statut
   worktree, synthèse R0/classifications, suppressions et preuves, extractions,
   contrats R3, anomalies intentionnellement NON corrigées, tests/commandes/durées/
   résultats/skips, revues Nono, commits, TODO restants et gates manuelles.
-- [ ] Distinguer ACCEPT technique local, PARTIAL/BLOCKED et ACCEPT scientifique
-  humain. Même après M106, une publication nécessite une autorisation distincte.
+  (accepté techniquement le 2026-10-04 après Nono review-0 + Junior ; le commit docs
+  est séparé, HEAD d'implémentation audité `1282cfe`.)
+- [x] Distinguer **LOCAL TECHNICAL ACCEPT / HUMAN SCIENCE HOLD**. Même après M106,
+  une publication nécessite une autorisation distincte.
 
 Succès = chemin officiel évident, code mort démontré, responsabilités moins
 couplées/testables, science préservée et anomalies isolées. Pas « beaucoup de

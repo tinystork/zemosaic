@@ -596,6 +596,13 @@ Witness extended `tests/test_crash_breadcrumbs_characterization_witness.py` 47 â
 skip (6 additive extraction assertions, none weakened). Combined
 new+dispatch+spawn+packaging+grouping+phase3 = 143 pass/0 fail.
 
+Post-R2 audit cross-reference (2026-10-04): the R3 post-R2 technical audit and final
+report are recorded in `docs/refactor/FINAL_REPORT.md` (**POST-R2 AUDITED â€” ACCEPTED**
+after Nono `review-0: ACCEPT` + Junior acceptance). The R2 scope is closed for that
+mission after lots 1/2A/2B;
+this does **not** claim the worker is finished, and any further decomposition requires a
+new bounded mission.
+
 ### 7.8 Resource / GPU planning and cleanup
 
 - VRAM budget: `_compute_phase5_vram_budget_bytes` (`:4179`).

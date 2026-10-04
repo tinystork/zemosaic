@@ -1,18 +1,35 @@
-# ZeMosaic — Stacking Contracts (R3) — PRE-R2 BASELINE FREEZE
+# ZeMosaic — Stacking Contracts (R3) — PRE-R2 BASELINE FREEZE (post-R2 audited/accepted)
 
 Mission: `ZM-ARCH-R3-BASELINE-FREEZE-20261004`
-Phase: pre-R2 baseline freeze (accepted)
+Phase: pre-R2 baseline freeze (accepted) → post-R2 audited/accepted
 Date: 2026-10-04
 Base SHA: `c03d0bb965d073b12ad9978094327829f0d0c366`
-Branch: `refactor/zm-architecture-cleanup-r0-r3` (HEAD `e975c93`)
+Branch: `refactor/zm-architecture-cleanup-r0-r3`
 
-> **Status: ACCEPTED by Junior after Nono review-1 ACCEPT** (pre-R2 behavior/contract
-> freeze). This document consolidates the actual reachable stacking paths
+Chronology (explicit):
+- **Pre-R2 source/audit HEAD** `e975c936c84b8c6622664b1f273b71c5b8c311d3` — the HEAD at which
+  this map's rows were authored and independently re-anchored (Nono review-1).
+- **Accepted pre-R2 freeze commit** `7c469562cb40521bb4f4d8a4ab511a5099ce17a4`
+  (`docs: freeze pre-R2 stacking contracts`).
+- **Post-R2 audited implementation HEAD** `1282cfe8901fac86ef21751991dcd98ae63679d2`
+  (`refactor: extract crash breadcrumb engine`).
+
+The map rows below were authored from the pre-R2 source at `e975c93` (== canonical base science;
+no stacking code changed after it). They were **not** regenerated from a different science base;
+the post-R2 audit only re-verified that the two bounded extractions do not touch stacking.
+
+> **Status: POST-R2 AUDITED — ACCEPTED** after Nono review-0 ACCEPT + Junior acceptance.
+> The pre-R2 freeze was accepted by Junior after Nono review-1 ACCEPT. Post-R2, the two
+> bounded extractions (R2 lot 1 `core/grouping_helpers.py`, R2 lot 2B `core/crash_breadcrumbs.py`)
+> were re-audited against this map: **neither extraction touches stacking math/order/weights/
+> rejection/WCS/FITS/science**, so every row below remains valid unchanged. This is a technical
+> acceptance of the map, **not** M106 scientific acceptance.
+> This document consolidates the actual reachable stacking paths
 > from source at the canonical base, plus the accepted runtime witnesses. It replaces the
 > earlier `PRELIMINARY R0 map (rework-1)` / `corrected rework-2` labels. It is **not** a
 > numerical-parity validation. Cells marked UNKNOWN / NOT_RUN are open; they are not invented,
-> and no CPU↔GPU parity is claimed. The post-R2 final audit remains outstanding and is
-> tracked separately in `todo.md`.
+> and no CPU↔GPU parity is claimed. The post-R2 final audit is recorded in `FINAL_REPORT.md`
+> and tracked in `todo.md`.
 
 Legend:
 - **requested** = config/flag asked for; **effective** = post-guard/fallback decision;
