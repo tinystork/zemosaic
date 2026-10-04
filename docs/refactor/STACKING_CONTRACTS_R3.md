@@ -502,13 +502,21 @@ The normalization/photometry data-flow is five labeled steps in exact order:
   classic N<3, TEST-04); `test_spawn_worker_process_witness.py` (1 pass, TEST-05);
   `test_cache_resume_characterization_witness.py` (18 pass, TEST-06);
   `test_phase3_adaptive_invariants.py` (33 pass/0 skip after TEST-01 import fix);
-  `test_packaging.py` (17 pass).
+  `test_packaging.py` (17 pass);
+  `test_classic_sds_phase45_variants_characterization.py` (34 pass, Classic/SDS/Phase 4.5
+  variants + SDS pure-helper contracts + chunking inventory, SCI-04).
 - Historical R0 22 pass/11 skip for `test_phase3_adaptive_invariants.py` is **historical**
   (pre-TEST-01); current witness state is 33 pass/0 skip.
 - **NOT_RUN / no witness**: no CPU↔GPU parity, no WSC numerical equivalence, no Phase 4.5
   execution, no Grid GPU `stack_core` backend execution, no classic N≥3 / SDS stacking
   execution, no `linear_fit` normalization/rejection numerical witness. All such cells remain
   UNKNOWN.
+- SCI-04 (Classic/SDS/Phase 4.5 variants) is now characterized CLOS-NO-FIX: route/difference
+  inventory + SDS pure-helper contracts (DYNAMIC) + Phase 4.5 `linear_fit`/`sky_mean` and
+  alpha-weighted branch (RECONSTRUCTION) + chunking mechanisms (DYNAMIC profile / STATIC
+  `max_group` loop / DYNAMIC VRAM budget / STATIC DBE RBF). See
+  `SCI_04_CLASSIC_SDS_PHASE45_VARIANTS.md`. Phase 4.5 full execution, SDS real-data, Grid GPU
+  core arithmetic, classic N≥3 remain NOT_RUN.
 - low-N/all-invalid witnessed **CPU backend only**; Grid CPU zeros vs `stack_core` NaN pinned
   (SCI-03), not resolved.
 - GPU qualification: CuPy runtime OK on MX150 (compute 6.1, ~2 GB); RawKernel/JIT OK without
