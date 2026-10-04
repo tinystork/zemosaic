@@ -572,6 +572,30 @@ Witnessed formats/semantics (2026-10-04, mission ZM-ARCH-R2-LOT2A-CRASH-BREADCRU
   (patched fakes only), real `spawn` with crash mode on, a successful scientific run,
   Windows/macOS filesystem/process semantics.
 
+#### R2 lot 2B — stateless extraction status (2026-10-04)
+
+Mission `ZM-ARCH-R2-LOT2B-CRASH-BREADCRUMB-EXTRACTION-20261004` (base HEAD `5d7920d`,
+the R2 lot 2A characterization-witness commit) **mechanically extracted** the
+crash-breadcrumb engine into a neutral, stateless core module
+`src/zemosaic/core/crash_breadcrumbs.py` (stdlib imports only — `json`/`os`/`time`/
+`datetime`/`pathlib`/`typing`; no `zemosaic_worker`/GUI/Qt/Tk/GPU/CuPy/config/solver/
+science import, no new dependency, no mutable breadcrumb paths/mode/lock singleton).
+
+`zemosaic_worker` **remains the single compatibility source of truth** for the four
+observable bindings `_CRASH_BREADCRUMB_LOCK` / `_CRASH_BREADCRUMB_PATH` /
+`_CRASH_STATE_PATH` / `_CRASH_BREADCRUMB_MODE`; `_configure_crash_breadcrumbs` /
+`_safe_runtime_snapshot` / `_emit_crash_breadcrumb` are now thin adapters (same names/
+signatures) that read worker globals at CALL TIME, so direct assignment and monkeypatching
+of those names keep their exact effect. The heartbeat writer thread, signal install/restore,
+queue protocol, wrapper context, and every `_emit_crash_breadcrumb` call site were **not**
+extracted (they remain in the worker); `run_hierarchical_mosaic_process` still reads
+`_CRASH_BREADCRUMB_PATH`/`_CRASH_STATE_PATH` directly for the `PROCESS_ERROR` payload.
+
+Status: **DONE — Nono `review-0: ACCEPT`, accepted by Junior**.
+Witness extended `tests/test_crash_breadcrumbs_characterization_witness.py` 47 → 53 pass/0
+skip (6 additive extraction assertions, none weakened). Combined
+new+dispatch+spawn+packaging+grouping+phase3 = 143 pass/0 fail.
+
 ### 7.8 Resource / GPU planning and cleanup
 
 - VRAM budget: `_compute_phase5_vram_budget_bytes` (`:4179`).

@@ -8,7 +8,10 @@ extraction, so a future move/refactor can prove "behavior unchanged".  It is a
 characterization, not an endorsement: everything asserted here is the baseline
 to preserve, not the desired ideal.
 
-Scope (no production edits; no `src/` changes; CPU-only; no GPU required):
+The original characterization scope was TEST/DOCS-only. R2 lot 2B later extended
+this same witness with additive compatibility assertions for the production
+extraction into ``zemosaic.core.crash_breadcrumbs``. All tests remain CPU-only
+and require no GPU:
     A. ``_configure_crash_breadcrumbs``  (valid/invalid/off modes, filenames,
        dir creation, no-output/off clearing, best-effort failure, globals).
     B. ``_safe_runtime_snapshot``        (pid/ppid/time, psutil RAM fields,
@@ -36,7 +39,9 @@ import inspect
 import json
 import os
 import signal
+import subprocess
 import sys
+import textwrap
 import threading
 import time
 import types
@@ -729,3 +734,182 @@ def test_heartbeat_cadence_bounded_event(
     # The heartbeat line was actually persisted to the JSONL via the real emit.
     records = _read_jsonl(out / "worker_crash_breadcrumbs.jsonl")
     assert any(r["event"] == "WORKER_HEARTBEAT" for r in records)
+
+
+# ===========================================================================
+# F2. R2-LOT2B extraction compatibility assertions (additive)
+# ===========================================================================
+#
+# After the stateless extraction into ``zemosaic.core.crash_breadcrumbs``, the
+# worker-owned globals remain the single source of truth and are read at CALL
+# TIME.  These assertions pin that binding-identity seam explicitly.
+
+
+def test_extraction_direct_worker_global_assignment_controls_emit(
+    _isolated_env: None, tmp_path: Path
+) -> None:
+    """Direct assignment to worker path/mode globals still controls emit."""
+    jsonl_file = tmp_path / "worker_crash_breadcrumbs.jsonl"
+    state_file = tmp_path / "worker_last_state.json"
+    zw._CRASH_BREADCRUMB_PATH = jsonl_file
+    zw._CRASH_STATE_PATH = state_file
+    zw._CRASH_BREADCRUMB_MODE = "always"
+
+    zw._emit_crash_breadcrumb("DIRECT_ASSIGN", marker=42)
+    records = _read_jsonl(jsonl_file)
+    assert [r["event"] for r in records] == ["DIRECT_ASSIGN"]
+    state = _read_state(state_file)
+    assert state is not None and state["marker"] == 42
+
+    # Flipping the worker-owned mode directly to "off" makes the next emit a no-op.
+    zw._CRASH_BREADCRUMB_MODE = "off"
+    zw._emit_crash_breadcrumb("SHOULD_NOT_APPEAR")
+    assert [r["event"] for r in _read_jsonl(jsonl_file)] == ["DIRECT_ASSIGN"]
+
+
+def test_extraction_configure_mode_str_raises_preserves_prior_mode(
+    _isolated_env: None, tmp_path: Path
+) -> None:
+    """Mode-normalization failure preserves prior mode and clears paths (try ordering)."""
+    # Preset a valid prior mode and non-None paths.
+    zw._CRASH_BREADCRUMB_MODE = "errors_only"
+    zw._CRASH_BREADCRUMB_PATH = tmp_path / "worker_crash_breadcrumbs.jsonl"
+    zw._CRASH_STATE_PATH = tmp_path / "worker_last_state.json"
+
+    # A mode whose str() raises fails normalization BEFORE the mode assignment,
+    # matching the original ``_configure_crash_breadcrumbs`` try ordering.
+    zw._configure_crash_breadcrumbs(  # type: ignore[arg-type]
+        str(tmp_path / "out"), mode=_ExplodingStr()
+    )
+
+    assert zw._CRASH_BREADCRUMB_PATH is None
+    assert zw._CRASH_STATE_PATH is None
+    # Prior mode is preserved (not reset to "always").
+    assert zw._CRASH_BREADCRUMB_MODE == "errors_only"
+
+
+def test_extraction_monkeypatched_snapshot_consumed_by_emit(
+    monkeypatch: pytest.MonkeyPatch, _isolated_env: None, tmp_path: Path
+) -> None:
+    """Worker ``_emit_crash_breadcrumb`` resolves the snapshot at CALL TIME."""
+    out = tmp_path / "out"
+    zw._configure_crash_breadcrumbs(str(out), mode="always")
+
+    def fake_snapshot() -> dict:
+        return {"pid": 12345, "ppid": 67890, "ts_unix": 1.5, "snapshot_tag": "PATCHED"}
+
+    monkeypatch.setattr(zw, "_safe_runtime_snapshot", fake_snapshot)
+    zw._emit_crash_breadcrumb("SNAPSHOT_PATCH")
+
+    records = _read_jsonl(out / "worker_crash_breadcrumbs.jsonl")
+    rec = records[0]
+    assert rec["pid"] == 12345
+    assert rec["ppid"] == 67890
+    assert rec["ts_unix"] == 1.5
+    assert rec["snapshot_tag"] == "PATCHED"
+
+
+def test_extraction_worker_compat_surface_signatures_and_globals() -> None:
+    """Exact worker function signatures and global names are preserved."""
+    sig = inspect.signature(zw._configure_crash_breadcrumbs)
+    assert list(sig.parameters) == ["output_folder", "mode"]
+    assert sig.parameters["mode"].default == "always"
+
+    sig = inspect.signature(zw._safe_runtime_snapshot)
+    assert list(sig.parameters) == []
+
+    sig = inspect.signature(zw._emit_crash_breadcrumb)
+    assert list(sig.parameters) == ["event", "payload"]
+    assert sig.parameters["payload"].kind == inspect.Parameter.VAR_KEYWORD
+
+    for name in (
+        "_CRASH_BREADCRUMB_LOCK",
+        "_CRASH_BREADCRUMB_PATH",
+        "_CRASH_STATE_PATH",
+        "_CRASH_BREADCRUMB_MODE",
+    ):
+        assert hasattr(zw, name), f"worker global {name!r} must remain"
+
+
+def test_extraction_emit_monkeypatch_intercepts_wrapper_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, _isolated_env: None, tmp_path: Path
+) -> None:
+    """Wrapper lifecycle call sites still resolve the monkeypatched emit name."""
+    real_sig = _real_signature()
+    seen: list[str] = []
+    monkeypatch.setattr(
+        zw, "_emit_crash_breadcrumb", lambda event, **p: seen.append(event)
+    )
+
+    def stub(**final_kwargs: object) -> None:
+        pass
+
+    stub.__signature__ = real_sig  # type: ignore[attr-defined]
+    monkeypatch.setattr(zw, "run_hierarchical_mosaic", stub)
+
+    queue = _RecordingQueue()
+    zw.run_hierarchical_mosaic_process(
+        queue,
+        solver_settings_dict=None,
+        output_dir=str(tmp_path / "out"),
+        crash_breadcrumbs_mode="always",
+        crash_breadcrumbs_heartbeat_sec=3600.0,
+    )
+    assert "WORKER_START" in seen
+    assert "WORKER_DONE" in seen
+
+
+def test_extraction_core_module_neutral_and_side_effect_free(tmp_path: Path) -> None:
+    """Standalone core import pulls in no worker/GUI/Qt/Tk and has no side effects."""
+    code = textwrap.dedent(
+        f"""
+        import os
+        import sys
+        import threading
+
+        sys.path.insert(0, {str(SRC)!r})
+
+        before_files = set(os.listdir(os.getcwd()))
+        before_threads = set(t.name for t in threading.enumerate())
+        before_modules = set(sys.modules)
+
+        import zemosaic.core.crash_breadcrumbs as cb  # noqa: E402
+
+        # Only the *newly* imported modules matter (packaging finders such as
+        # ``__editable__*_finder`` are already present and must not count).
+        new_modules = set(sys.modules) - before_modules
+        forbidden = (
+            "zemosaic_worker", "zemosaic_gui", "zemosaic_filter_gui",
+            "zemosaic_gui_qt", "zemosaic_filter_gui_qt",
+            "tkinter", "pyside", "cupy", "cuda", "solver", "config",
+            "astropy", "matplotlib", "numpy", "scipy",
+        )
+        bad = sorted(m for m in new_modules if any(k in m.lower() for k in forbidden))
+        assert not bad, f"unexpected modules imported: {{bad!r}}"
+
+        # The core owns NO mutable breadcrumb state.
+        for name in (
+            "_CRASH_BREADCRUMB_PATH",
+            "_CRASH_STATE_PATH",
+            "_CRASH_BREADCRUMB_MODE",
+            "_CRASH_BREADCRUMB_LOCK",
+        ):
+            assert not hasattr(cb, name), f"core must not own {{name!r}}"
+
+        after_files = set(os.listdir(os.getcwd()))
+        assert after_files == before_files, "core import created files"
+        after_threads = [t for t in threading.enumerate() if t.name not in before_threads]
+        assert not after_threads, f"core import spawned threads: {{after_threads!r}}"
+
+        print("CORE_NEUTRAL_OK")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    assert "CORE_NEUTRAL_OK" in result.stdout

@@ -278,6 +278,13 @@ Ne pas implémenter ce lot ici (mission R3 baseline freeze).
 
 **Seam extraction Q2** : la variante Qt `_split_group_by_orientation_key` / `split_clusters_by_orientation` / `_split_group_by_mount_mode` (buckets gloutons, algorithmes DIFFÉRENTS des canoniques) reste volontairement NON consolidée ; de même les trois copies fallback inline Qt sont des algorithmes distincts (mean-angle/max-deviation, buckets gloutons, log texte différent) laissés en fallback, jamais unifiés avec les canoniques. Toute consolidation future = décision scientifique séparée, pas une extraction mécanique.
 
+**Statut R2 lot 2B — DONE, revue Nono `review-0: ACCEPT`, acceptation Junior** (mission `ZM-ARCH-R2-LOT2B-CRASH-BREADCRUMB-EXTRACTION-20261004`, 2026-10-04, base HEAD `5d7920d`) :
+- Moteur crash-breadcrumb extrait mécaniquement dans `src/zemosaic/core/crash_breadcrumbs.py` (neutre, sans état runtime breadcrumb, imports stdlib seulement — `json`/`os`/`time`/`datetime`/`pathlib`/`typing` — aucun import `zemosaic_worker`/GUI/Qt/Tk/GPU/CuPy/config/solver/science, aucune dépendance nouvelle).
+- `zemosaic_worker.py` conserve les 4 globals observables `_CRASH_BREADCRUMB_LOCK` / `_CRASH_BREADCRUMB_PATH` / `_CRASH_STATE_PATH` / `_CRASH_BREADCRUMB_MODE` comme source de vérité de compatibilité ; `_configure_crash_breadcrumbs` / `_safe_runtime_snapshot` / `_emit_crash_breadcrumb` deviennent des adaptateurs minces (mêmes noms/signatures) qui lisent les globals au CALL TIME (assignation directe + monkeypatch conservent leur effet exact).
+- Le thread heartbeat, l'install/restore des signaux, le protocole de queue et TOUS les call sites `_emit_crash_breadcrumb` restent dans le worker (NON extraits) ; `run_hierarchical_mosaic_process` lit toujours `_CRASH_BREADCRUMB_PATH`/`_CRASH_STATE_PATH` directement pour le payload `PROCESS_ERROR`.
+- Témoin étendu : `tests/test_crash_breadcrumbs_characterization_witness.py` 47 → 53 pass/0 skip (6 assertions d'extraction ajoutées, aucun affaiblissement des 47 existantes). Combined new+dispatch+spawn+packaging+grouping+phase3 = 143 pass/0 fail. `git diff --check` OK, compile/AST OK.
+- Lot 2A (commit `5d7920d`) = témoin de caractérisation de référence ; 2B ne le modifie pas.
+
 Pour CHAQUE extraction :
 
 - [ ] Identifier comportement exact, tous appelants/imports/monkeypatchs, globals,
