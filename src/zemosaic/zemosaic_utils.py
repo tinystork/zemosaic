@@ -1345,6 +1345,17 @@ def compute_intertile_workers_limit(
             reasons.append("ram<6000mb")
 
     effective = max(1, min(base, hard_cap))
+    if "windows" in platform_name:
+        # Conservative safeguard (Windows): serialize every intertile overlap
+        # pair through the sequential runner. Concurrent reproject_interp ->
+        # Astropy WCS/wcslib native execution has been implicated in a recurring
+        # native heap crash (0xC0000374) on Windows Phase 5 runs. Force
+        # effective_workers=1 regardless of pair count, preview size, CPU count,
+        # requested workers, or RAM, and do it after every cap/relaxation above so
+        # no later relaxation (e.g. pairs<200) can raise Windows above 1 and no
+        # ThreadPoolExecutor is ever built.
+        effective = 1
+        reasons.append("windows_reproject_wcs_serial")
     if not reasons:
         reasons.append("no_clamp")
     return effective, reasons
@@ -3531,6 +3542,25 @@ def compute_intertile_affine_calibration(
                 total_pairs,
                 preview_size,
             )
+
+            # Defense-in-depth (Windows): the authoritative serialization decision
+            # lives in compute_intertile_workers_limit(), which keys off
+            # platform.system(). Enforce sys.platform directly here too so a
+            # platform-name seam mismatch can never construct a
+            # ThreadPoolExecutor for intertile reproject/WCS work on Windows.
+            # Single source of truth for the reason token:
+            # windows_reproject_wcs_serial.
+            if sys.platform == "win32":
+                effective_workers = 1
+                if "windows_reproject_wcs_serial" not in clamp_reasons:
+                    clamp_reasons.append("windows_reproject_wcs_serial")
+                _log_intertile(
+                    "SAFE_MODE_WINDOWS_SERIAL: conservative safeguard — running "
+                    "intertile overlap pairs sequentially "
+                    "(windows_reproject_wcs_serial) to avoid concurrent "
+                    "reproject_interp/Astropy WCS native execution",
+                    level="INFO",
+                )
 
             explicit_force_safe = bool(force_safe_mode)
             legacy_preview_safe_mode = sys.platform == "win32" and preview_size >= 512 and total_pairs >= 2000
