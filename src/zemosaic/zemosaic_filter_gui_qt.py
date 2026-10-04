@@ -445,7 +445,7 @@ else:  # pragma: no cover - helper fallback
     _COMPUTE_MAX_SEPARATION = None
 
 try:  # pragma: no cover - optional dependency guard
-    from .zemosaic_filter_gui import (  # type: ignore
+    from .core.grouping_helpers import (  # type: ignore
         _merge_small_groups as _tk_merge_small_groups,
         _split_group_by_orientation as _tk_split_group_by_orientation,
         _circular_dispersion_deg as _tk_circular_dispersion_deg,

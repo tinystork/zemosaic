@@ -101,6 +101,8 @@ from .core.path_helpers import (
     safe_path_isfile,
 )
 
+from .core import crash_breadcrumbs
+
 # Annex tool: keep optional and lazy; official runtime must not depend on it.
 lecropper = None
 _LECROPPER_AVAILABLE = False
@@ -169,18 +171,15 @@ def _configure_crash_breadcrumbs(output_folder: str | None, mode: str = "always"
 
     global _CRASH_BREADCRUMB_PATH, _CRASH_STATE_PATH, _CRASH_BREADCRUMB_MODE
     try:
-        mode_norm = str(mode or "always").strip().lower()
-        if mode_norm not in {"always", "errors_only", "off"}:
-            mode_norm = "always"
+        mode_norm = crash_breadcrumbs.normalize_crash_breadcrumb_mode(mode)
         _CRASH_BREADCRUMB_MODE = mode_norm
         if not output_folder or mode_norm == "off":
             _CRASH_BREADCRUMB_PATH = None
             _CRASH_STATE_PATH = None
             return
-        out_dir = Path(str(output_folder)).expanduser()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        _CRASH_BREADCRUMB_PATH = out_dir / "worker_crash_breadcrumbs.jsonl"
-        _CRASH_STATE_PATH = out_dir / "worker_last_state.json"
+        _CRASH_BREADCRUMB_PATH, _CRASH_STATE_PATH = crash_breadcrumbs.compute_crash_breadcrumb_paths(
+            output_folder, mode_norm
+        )
     except Exception:
         _CRASH_BREADCRUMB_PATH = None
         _CRASH_STATE_PATH = None
@@ -189,36 +188,11 @@ def _configure_crash_breadcrumbs(output_folder: str | None, mode: str = "always"
 def _safe_runtime_snapshot() -> dict[str, Any]:
     """Best-effort RAM/VRAM/pid snapshot for crash forensics."""
 
-    snap: dict[str, Any] = {
-        "pid": os.getpid(),
-        "ppid": os.getppid(),
-        "ts_unix": time.time(),
-    }
-    try:
-        vm = psutil.virtual_memory()
-        snap.update(
-            {
-                "ram_used_mb": float(getattr(vm, "used", 0.0)) / (1024.0 * 1024.0),
-                "ram_total_mb": float(getattr(vm, "total", 0.0)) / (1024.0 * 1024.0),
-                "ram_pct": float(getattr(vm, "percent", 0.0)),
-            }
-        )
-    except Exception:
-        pass
-
-    try:
-        if ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(zemosaic_utils, "get_gpu_vram_info"):
-            vram_used, vram_total, vram_free = zemosaic_utils.get_gpu_vram_info()
-            snap.update(
-                {
-                    "gpu_used_mb": float(vram_used) if vram_used is not None else None,
-                    "gpu_total_mb": float(vram_total) if vram_total is not None else None,
-                    "gpu_free_mb": float(vram_free) if vram_free is not None else None,
-                }
-            )
-    except Exception:
-        pass
-    return snap
+    return crash_breadcrumbs.build_runtime_snapshot(
+        psutil,
+        zemosaic_utils,
+        ZEMOSAIC_UTILS_AVAILABLE,
+    )
 
 
 def _emit_crash_breadcrumb(event: str, **payload: Any) -> None:
@@ -230,39 +204,15 @@ def _emit_crash_breadcrumb(event: str, **payload: Any) -> None:
     path_jsonl = _CRASH_BREADCRUMB_PATH
     path_state = _CRASH_STATE_PATH
     mode = str(_CRASH_BREADCRUMB_MODE or "always").strip().lower()
-    if mode == "off":
-        return
-    if mode == "errors_only":
-        e = str(event or "").upper()
-        if not ("ERROR" in e or "EXCEPTION" in e or "CRASH" in e):
-            return
-    if path_jsonl is None and path_state is None:
-        return
-
-    record: dict[str, Any] = {
-        "event": str(event),
-        "iso": datetime.utcnow().isoformat() + "Z",
-    }
-    record.update(_safe_runtime_snapshot())
-    if payload:
-        record.update(payload)
-
-    try:
-        with _CRASH_BREADCRUMB_LOCK:
-            if path_jsonl is not None:
-                try:
-                    with path_jsonl.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-                except Exception:
-                    pass
-            if path_state is not None:
-                try:
-                    with path_state.open("w", encoding="utf-8") as f:
-                        json.dump(record, f, ensure_ascii=False, indent=2, default=str)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    crash_breadcrumbs.emit_crash_breadcrumb(
+        event,
+        path_jsonl=path_jsonl,
+        path_state=path_state,
+        mode=mode,
+        lock=_CRASH_BREADCRUMB_LOCK,
+        snapshot_fn=_safe_runtime_snapshot,
+        payload=payload,
+    )
 
 def reset_phase5_gpu_runtime_state() -> None:
     """Reset cached Phase 5 GPU runtime state."""
