@@ -1,339 +1,379 @@
-# SCI-05 — Canonical Stacking Contract (DRAFT — requires Junior scientific acceptance before Gate B)
+# SCI-05 — Canonical Stacking Contract (JUNIOR SCIENTIFIC ACCEPT — IMPLEMENTATION CONTRACT)
 
-- **Mission:** `ZM-SCI-05-GATE-A-ARCHAEOLOGY-CONTRACT-20261005`
-- **Phase:** Gate A draft only — facts separated from Junior decisions; nothing frozen as approved.
+- **Mission:** `ZM-SCI-05-GATE-A2-CONTRACT-FREEZE-20261005`
+- **Phase:** Gate A2 decision freeze — Junior scientific decisions recorded; contract frozen as the implementation target.
 - **Repository:** `/home/tristan/.openclaw/workspace/projects/zemosaic`
 - **Branch:** `science/zm-sci-05-canonical-stacking-coverage`
-- **Base / HEAD:** `ea4b189f2017a03797261c5484702102ad5d3828` (`origin/beta`)
+- **Base:** `ea4b189f2017a03797261c5484702102ad5d3828` (`origin/beta`)
 - **Donor (read-only):** `zsss-sci05-donor` @ `9b891de6e7ba71967d03db75d11c3fc279854b26`
 
-> ## ⚠️ STATUS: DRAFT
-> This document is a **candidate** scientific contract authored from current
-> behavior + the coverage donor inventory. **Coco does not choose the final
-> science.** Every disputed method is listed as an explicit **Junior decision
-> point**. Nothing here is frozen until Junior issues scientific acceptance,
-> which gates Gate B (port/implementation). No source change accompanies this
-> draft.
+> ## ⚠️ STATUS: JUNIOR SCIENTIFIC ACCEPT — IMPLEMENTATION CONTRACT
+>
+> This document records the **frozen Junior scientific decisions** that Gate B must
+> implement. It is no longer a candidate/decision register: every previously-open
+> decision point (N1–N4, W1–W3, S1–S3, R1–R3, C1–C2, G1) is resolved in §16.
+>
+> **Evidence:** Nono independent review of Gate A archaeology (`SCI05_ARCHAEOLOGY_MATRIX.md`
+> + the archaeology witnesses) reached `review-2: ACCEPT`. Junior scientific acceptance
+> of these decisions is recorded below.
+>
+> **Review status of THIS freeze: ACCEPT.** Nono review-0 findings F1–F5 were bounded
+> contract-fidelity/clarity defects only (no science reopened); REWORK-2 resolved all five,
+> and independent Nono review-1 returned **ACCEPT**. Junior independently verified the
+> resulting contract. Gate B (implementation/port) may open. No runtime source/test/config/
+> GUI/locales/deps/version/packaging/workflow change accompanies this freeze.
 
 ---
 
 ## 1. Purpose and non-goals
 
-Freeze a single canonical target pipeline and its per-stage semantics so Gate B
-can implement the coverage-aware support domain without silently changing the
-existing stacking science.
+Freeze a single canonical target pipeline and its per-stage semantics so Gate B can
+implement the coverage-aware support domain without silently changing the existing
+stacking science. This document is the **target contract**; it does not claim any of
+this is implemented at HEAD.
 
-**Target pipeline order (frozen for discussion):**
+**Canonical pipeline order (frozen):**
 
 ```
 ALIGNED INPUTS
   → NORMALIZATION
-  → QUALITY WEIGHTS
-  → SUPPORT / VALIDITY (channel-invariant 2-D positive support)
+  → SCALAR QUALITY WEIGHTS
+  → GEOMETRIC/SCIENCE VALIDITY + SUPPORT TAPER
   → OUTLIER REJECTION
   → COMBINATION
-  → CanonicalStackResult(science, support, diagnostics)
+  → [OPTIONAL explicit post-combine RGB equalization]
+  → CanonicalStackResult(science, estimator_weight_sum, support_w1, support_w2,
+    n_eff_support, rejection_mask/diagnostics, provenance)
 ```
 
-Non-goals for Gate A/B: no canonical-engine implementation here, no algorithm
-replacement, no GUI change, no coverage port yet, no commit/push.
+Coverage **render** is later/downstream and never mutates `CanonicalStackResult`
+science or support (§12).
+
+Non-goals: no canonical-engine implementation here, no algorithm replacement, no GUI
+change, no coverage port yet, no commit/push. This is the contract only.
 
 ---
 
-## 2. Coverage donor inventory (pinned SHA, read-only)
+## 2. Canonical engine (request/result) — decision A
 
-Donor worktree `zsss-sci05-donor` @ `9b891de6e7ba71967d03db75d11c3fc279854b26`.
-ZeMosaic must **not** import or runtime-depend on the donor; these are target
-semantics to reproduce, not code to link.
-
-### 2.1 Portable symbols / algorithms (target semantics)
-
-| Donor symbol | File | Target semantics |
-| --- | --- | --- |
-| `PositiveSupportAccumulator` / `accumulate_support_pair` | `seestar/core/coverage_support.py` | `SUP_W1 += s_i`, `SUP_W2 += s_i²`; positive-only; fail-before-mutation (negative/NaN/Inf/shape/overflow rejected); atomic pair; float64 default (float32 opt-in); channel-invariant 2-D `(H,W)` |
-| `N_eff_support = SUP_W1²/SUP_W2` (else 0.0) | same | derived view; overflow-resistant `(W1/√W2)²` fallback; never mutates |
-| `SUPPORT_STATE_VERSION=1`, `SUPPORT_DTYPES=(f32,f64)` | same | snapshot/restore schema |
-| `make_footprint_taper(mask, feather_px=8.0, floor=0.0)` | `seestar/enhancement/weight_utils.py` | EDT distance-to-footprint-boundary → `1.0` interior, ramp to `floor` over `feather_px` px near boundary, `0.0` outside; translation/rotation invariant; chamfer fallback; padded so array boundary feathers symmetrically |
-| `_footprint_distance_fallback` | same | chamfer 3-4 two-pass fallback (no scipy) |
-| `make_radial_weight_map(h,w,feather,floor)` | same | **legacy** center-radial falloff (the thing COV-02 replaces) |
-| `coverage_aware_render(sci, neff_support, n_ref=32, …)` | `seestar/enhancement/coverage_render.py` | render-only: `RENDER = B + (1−α)·D + α·D_denoised`, `α=clip(1−N_eff/n_ref,0,1)`; never brightness-gains low coverage; never inpaints |
-| `start_processing` render default **False** | `seestar/queuep/queue_manager.py:5131` | `apply_coverage_render=False`, `support_taper_px=8.0`, `support_taper_floor=0.0`, `coverage_render_n_ref=32.0` |
-
-### 2.2 Support formula (donor canonical)
-
-```
-s_i = valid_geometric_support
-      * optional_quality_significance
-      * optional_footprint_taper          (spatial, per original exposure)
-
-SUP_W1 += s_i ;  SUP_W2 += s_i²
-N_eff_support = SUP_W1²/SUP_W2  (SUP_W2>0) else 0.0
-```
-
-- `SUP_W1` is a raw exposure count **only** in the unit-weight case (`s_i ∈ {0,1}`).
-- Support is independent of estimator WHT and of rejection survivors; no rejection
-  mask is consumed.
-- Support is channel-invariant and exactly 2-D `(H,W)` — one map per original
-  exposure, no per-channel copies. No `science != 0` test.
-
-### 2.3 Donor wiring (what Gate B would need to reproduce)
-
-- `queue_manager.py`: `apply_batch_feathering=True` (COV-02), `apply_coverage_render=False`
-  (COV-04), `support_taper_px=8.0`, `support_taper_floor=0.0`, `_ibn_reliable_fraction=0.02`
-  (COV-03), `_reproject_support_tracking_enabled` (COV-01D).
-- `gui_qt/settings_state.py`: `apply_batch_feathering=True`, `apply_coverage_render=True`
-  (Qt dataclass default), `apply_feathering=False` (legacy inverse-WHT feather OFF).
-- `settings_migration.py`: `SETTINGS_SCHEMA_VERSION_KEY="settings_schema_version"`.
-
-### 2.4 Donor tests (portable witnesses, not ported here)
-
-`test_coverage_support.py` (23), `test_coverage_support_classic.py`,
-`test_coverage_taper.py` (translation invariance, boundary symmetry, bad-param
-rejection, mean flat-field invariance), `test_coverage_render.py` (flat-field no-gain,
-high-support no-op), `test_cov06b_render_ab.py` (render OFF/ON → equal scientific FITS,
-differ only in preview).
-
-### 2.5 ZeMosaic true-footprint source candidates (per route)
-
-ZeMosaic has **no** dedicated positive-support accumulator. Candidate geometric
-footprint sources per route (to be mapped at Gate B):
-
-| Route | Candidate geometric source | Status |
-| --- | --- | --- |
-| Classic CPU | footprint masks from `align_images_in_group` (`_coerce_footprint_to_hw_bool`), alpha/coverage from `_stack_master_tile_cpu` | CANDIDATE (needs Gate-B mapping) |
-| Classic GPU (Phase-3 auto) | `_prepare_frames_and_weights` footprint/alpha | CANDIDATE |
-| SDS | `_sanitize_sds_megatile_payload` coverage/alpha (normalized by max) | CANDIDATE |
-| Grid CPU/GPU | `process_tile` `footprint` → `np.clip(footprint,0,1)*weight_scalar` | CANDIDATE |
-| Global coadd | `coverage_map` (weight_grid) / alpha map | CANDIDATE |
-| Reproject (intertile) | reprojection footprint / validity mask | UNKNOWN (needs Gate-B archaeology) |
-
-Only genuinely-geometric footprints (reprojection footprint, alpha, valid mask,
-coverage) qualify; **NaN-only is not a geometric footprint** and must be labeled
-UNKNOWN where the source is not yet established.
+- One **backend-neutral engine**:
+  `CanonicalStackRequest(images, geometric_support, normalization, weighting, rejection, combine, optional_reference_index, parameters)`
+  → `CanonicalStackResult(science, estimator_weight_sum, support_w1, support_w2, n_eff_support, rejection_mask/diagnostics, provenance)`.
+- HWC/HW inputs accepted; internal canonical form is HWC **float32 inputs** with
+  **float64** statistics/accumulation; output `science` is **float32** restoring the mono
+  shape; support maps are **exactly 2-D float64** internally.
+- `estimator_weight_sum` has the **same spatial/channel shape as `science`** (HW mono,
+  HWC RGB — rejection may be channel-specific), float64 internally and in the result, and
+  is **separate from the 2-D positive support maps**: for `mean` it is the per-pixel/channel
+  **sum of `w_i`** over original surviving valid samples; for `median` it is the
+  per-pixel/channel **count** of original surviving valid samples with `w_i > 0` (unit
+  effective estimator weights — positive weight magnitude intentionally ignored); `0` where
+  no survivors (see §9).
 
 ---
 
-## 3. Frozen candidate contracts and Junior decision points
+## 3. Reference selection — decision B (N1)
 
-Each subsection: **(a) exact current formulas**, **(b) candidate canonical math**,
-**(c) unresolved Junior decision**.
-
-### 3.1 Normalization — `none` / `linear_fit` / `sky_mean`
-
-**Current (verified):**
-- `none` = passthrough everywhere.
-- `linear_fit`:
-  - Grid: per-channel `slope=cov(x,y)/var(x)`, `intercept=ȳ−slope·x̄` (`_fit_linear_scale`).
-  - Classic: percentile points `a=Δref/Δsrc`, `b=ref_low−a·src_low`, gain clamp ±20, delta gates.
-  - Phase 4.5 inline: OLS `slope=Σxy/Σx²` clipped `[0.25,4.0]`, intercept on **unclipped** slope, `max(5000,1%)` px gate.
-  - `stack_core`: **median placeholder** (non-affine).
-- `sky_mean`:
-  - Classic: luminance percentile, additive `offset=ref_sky−src_sky`.
-  - Phase 4.5 inline: percentile band `[30,70]`, per-channel median, additive delta, no px gate.
-  - Grid: unsupported.
-
-**Candidate canonical math (for Junior):**
-- Reference selection: explicit reference index / median-of-stack / first-frame (pick one).
-- Finite mask: common-finite-only overlap for every method.
-- Mono/RGB: per-channel affine for `linear_fit`; luminance-additive for `sky_mean`.
-- Robust estimator: robust percentile (classic) vs covariance/variance (Grid) vs OLS (4.5) — **must converge to one**.
-- Min pixels / low-N: a single hard gate (e.g. `max(5000, 1%)`) or per-method.
-- Failure policy: no-op (keep unnormalized) vs drop-frame vs fallback.
-
-**Junior decisions (N1–N4):**
-- **N1** — reference selection rule (which image is the reference?).
-- **N2** — single `linear_fit` estimator (percentile vs covariance vs OLS) or
-  accept documented per-route divergence.
-- **N3** — low-N / min-pixel gate and failure policy (no-op vs fallback; **never**
-  substitute a different science method).
-- **N4** — dispose of the `stack_core` `linear_fit` median placeholder: keep
-  documented, remove the option, or implement genuine affine (separate mission).
-
-### 3.2 Weighting — `uniform` / `noise_variance` / `noise_fwhm`
-
-**Current (verified):**
-- `none`/`unit`/`unity`: Classic → no quality weights (unweighted); Grid →
-  exposure-only `exposure_w=max(exposure,1e-3)` (exposure-folded). DIVERGENT for
-  heterogeneous exposure.
-- `noise_variance` (Classic): per-channel sigma-clipped (`sigma=3.0/3.0,maxiters=5`)
-  variance `σ²`; global `min_overall_variance` (min finite positive variance, floored
-  `1e-9`); weight `min_overall_variance/σ²`; invalid/≤0 variance → `1e-6`;
-  unprocessed valid frame → `1.0`/`[1,1,1]`. Grid: `exposure_w / max(nanstd²,1e-8)`.
-  DIVERGENT (formula, exposure fold, fallback constants).
-- `noise_fwhm` (Classic) — reachable behaviors, NOT "every route → variance":
-  1. Photutils **unavailable** → explicit `noise_variance` substitution (effective
-     `noise_variance`).
-  2. Photutils available + **all-unusable/star-free** → the estimator returns unit
-     weights, the sanitizer sees no effect → `(None, "none", None)` = **no
-     weighting**, not variance.
-  3. Photutils available + **partial** → usable frames `min_overall_valid_fwhm/fwhm`,
-     failed estimates constant `1e-6`, skipped/unprocessed `1.0`; effective label
-     may remain `noise_fwhm`.
-  4. All usable → genuine `min_fwhm/fwhm` weighting.
-  Grid `noise_fwhm` → variance-only `exposure_w/variance` (a **separate** fallback).
-  Under Tristan's absolute fallback policy, branches 1, 2, and 3 (and Grid's
-  variance-only) are all prohibited `SILENT_SCIENCE_FALLBACK` /
-  `SILENT_SCIENCE_DEGRADATION` — the exact numeric outcome differs but the
-  classification does not.
-
-**Candidate canonical math (for Junior):**
-- Estimator: robust sigma-clipped stddev (Astropy) — pin sigma_lower/upper/maxiters.
-- Floor: variance floor `1e-8`/`1e-9` (pick one) vs `∞` sentinel.
-- FWHM: either a real FWHM estimator (photutils `equivalent_fwhm`) **or** an
-  explicit unsupported-status (no silent fallback). Dependence policy on photutils.
-
-**Junior decisions (W1–W3):**
-- **W1** — `noise_fwhm`: implement a real estimator, or make it an honest
-  `UNSUPPORTED` (GUI disabled / structured status) instead of the current silent
-  fallback/degradation mix (variance-if-unavailable / no-weighting-if-star-free /
-  partial constants) — all currently prohibited `SILENT_SCIENCE_FALLBACK` /
-  `SILENT_SCIENCE_DEGRADATION`.
-- **W2** — variance floor and exposure-fold policy (fold exposure into
-  `noise_variance` like Grid, or keep pure `min_var/σ²` like classic).
-- **W3** — weight application shape (scalar vs per-channel `(1,1,C)` vs per-pixel).
-
-### 3.3 NaN / Inf / footprint / weight zero-negative / all-invalid / support
-
-**Current (verified):**
-- Grid CPU/legacy mask `weight<=0` → NaN **before** rejection; mean uses positive
-  magnitude; median gates on `weight>0`; all-invalid → zero tile.
-- `stack_core`: raw weights (zero/negative included); mean → NaN at `weight_sum=0`;
-  median ignores weights entirely; no pre-mask.
-- Classic: `_filter_statistically_dead_frames` drops empty/degenerate; `nan_to_num`
-  before combine; `where(Σw>1e-9)` division.
-
-**Candidate canonical (for Junior):**
-- NaN/Inf data = invalid (masked) everywhere; support mask is channel-invariant 2-D.
-- `weight == 0` = zero support (frame excluded from mean); `weight < 0` = invalid
-  (rejected/zeroed) — never applied as a magnitude.
-- Support **independent of estimator WHT**; no `science != 0` predicate.
-- All-invalid output is **an open decision**, not a presumption of zero.
-
-**Junior decisions (S1–S3):**
-- **S1** — all-invalid output: decide neutrally among NaN/invalid, zero, or another
-  **deliberately chosen documented sentinel**. **Tristan's explicit constraint:**
-  the result must be NaN/invalid or a documented sentinel chosen on purpose; an
-  arbitrary historical zero is **not** acceptable. (Recorded, not decided here.)
-- **S2** — unify `weight<=0` handling (pre-mask vs raw-forward) at the core boundary.
-- **S3** — freeze the 2-D channel-invariant support contract (no per-channel copies).
-
-### 3.4 Rejection — kappa / WSC / linear-fit-clip
-
-**Current (verified):** see matrix §3; the three meanings of `winsorized_sigma_clip`
-and the `linear_fit_clip` no-op placeholder.
-
-**Candidate canonical (for Junior):**
-- `kappa_sigma`: Grid/`stack_core` uses the astropy iterative
-  `sigma_clipped_stats(..., maxiters=5)` helper; Classic CPU wrapper may use the
-  optional external `cpu_stack_kappa`, else the internal `_cpu_stack_kappa_fallback`
-  (raw `nanmedian`/`nanstd` single-pass thresholds); wrapper GPU `gpu_stack_kappa`
-  is median/raw-std style. **These are divergent estimators/implementations** — the
-  canonical contract must pick one; current code has no canonical parity here.
-- `winsorized_sigma_clip`: **one** implementation (PixInsight WSC is the default);
-  `winsor_limits` honored; low-N policy.
-- `linear_fit_clip`: **fork A** = define a real linear-fit clip; **fork B** = disable/
-  remove the GUI option (current helper is a no-op placeholder).
-
-**Junior decisions (R1–R3):**
-- **R1** — WSC unique target: freeze PixInsight WSC as the single winsorized
-  implementation (and migrate `stack_core` simplified + global-coadd percentile clip).
-- **R2** — kappa/WSC exact parameters (sigma defaults, winsor limits defaults,
-  max iters) and low-N (<3) policy.
-- **R3** — Linear Fit Clip: real definition (A) vs GUI disable/remove (B).
-
-### 3.5 Combine — mean / median
-
-**Current (verified):** mean weighted everywhere (divergent invalid semantics);
-median unweighted everywhere (divergent `weight<=0` exclusion).
-
-**Candidate canonical (for Junior):**
-- mean: `Σ(w·d)/Σ(w)` with `Σw≤ε → 0` (pick ε: `1e-6` Grid vs `1e-9` classic vs `>0` core).
-- median: explicit **unweighted-valid-sample** contract (weights only gate validity,
-  never scale).
-
-**Junior decisions (C1–C2):**
-- **C1** — a single zero-sum epsilon.
-- **C2** — median weight contract: unweighted-valid-sample (weights = validity mask
-  only) unless Junior decides otherwise.
-
-### 3.6 Global coadd
-
-**Current (verified):** `mean`/`median`/`kappa_sigma`/`winsorized` (nanpercentile clip).
-
-**Candidate canonical (for Junior):**
-- Same-label consistency rule: a given label must mean the **same executed symbol**
-  at master-tile and global-coadd level, or be renamed.
-
-**Junior decision (G1):**
-- **G1** — rename global-coadd `winsorized` (or unify its semantics with the
-  master-tile `winsorized_sigma_clip`).
-
-### 3.7 CPU/GPU same-algorithm requirement
-
-- Every route's CPU and GPU path **must execute the same algorithm** (same estimator,
-  same params, same support). Where they currently differ (WSC vs simplified), the
-  canonical contract requires convergence.
-- Honest provenance: report `PHYSICAL_GPU_PASS` only when GPU arithmetic actually ran;
-  otherwise `PHYSICAL_GPU_NOT_RUN`. No CPU↔GPU parity claim without a physical run.
-
-### 3.8 Fallback policy
-
-- **Backend fallback (allowed):** GPU→CPU fallback that executes the **same science**.
-- **Scientific fallback / degradation (forbidden):** any silent substitution of a
-  different method (`noise_fwhm` → `noise_variance`), any silent degradation to
-  no-weighting (effective `none`), and any hidden constant substitution (`1e-6` /
-  `1.0`) must each be surfaced as a structured status, not a silent WARN/DEBUG.
-
-### 3.9 Logging / provenance
-
-- Per stage, record **requested** and **effective** method (and reason), bounded
-  (no array dumps). The donor's `COVERAGE_CONFIG` / `COVERAGE_RENDER_RESULT` /
-  `RUN_EFFECTIVE` structured-event pattern is the target; ZeMosaic currently lacks
-  this (see matrix §8 gap).
+- The caller may provide an **explicit valid `reference_index`**.
+- Otherwise: choose the frame with the greatest `count_nonzero(m_i)` — the count of
+  channel-invariant valid geometric-support pixels `m_i` on the aligned **PRE-normalization**
+  input validity (finite/all-channel), with **no weights and no rejection involved**; on a
+  stable tie, choose the **lowest original input index**.
+- The reference frame is **identity** (no normalization applied to it).
+- The **same chosen reference** is used across channels and methods.
+- Provenance records `explicit`/`auto` and the index.
 
 ---
 
-## 4. Fresh target defaults (required by Tristan — not inferred)
+## 4. Valid sample and failure rules — decision C
 
-- **Support taper ON** (`support_taper_px=8.0`, `support_taper_floor=0.0`).
-- **Final reconstruction OFF** (`apply_coverage_render=False`).
-
-**Donor discrepancy to report (do not hide):** the donor's Qt settings dataclass
-`settings_state.py:269` defaults `apply_coverage_render=True`, while the engine
-instance `queue_manager.py:5131` defaults `apply_coverage_render=False`. These
-conflict; **Tristan's fresh target is OFF**, and ZeMosaic must follow Tristan, not
-silently infer from the incidental Qt dataclass default.
+- Geometric support **must be explicit 2-D**; never infer it from brightness/nonzero.
+- A science sample is **valid iff** geometric support is true **AND** (mono finite OR all
+  RGB channels finite). This is channel-invariant 2-D validity.
+- NaN/Inf → invalid.
+- `quality weight == 0` means **absent**; `quality weight < 0` or nonfinite is **invalid
+  input** and fails **before mutation**.
+- **All-invalid output** = NaN/invalid science, `estimator_weight_sum = 0`, `support = 0`.
+  **No historical zero sentinel.**
+- A method failure is **never** a different method or a no-op disguised as success.
+  A frame whose requested normalization/quality metric cannot be computed is explicitly
+  excluded **with reason**; if the reference is invalid or no frame remains, the stack
+  request **fails cleanly**.
+- N=1 normalization is a **documented identity success**, not a fallback.
 
 ---
 
-## 5. Junior decision register (consolidated)
+## 5. Normalization — decision D (N2/N3/N4)
 
-| ID | Decision |
+**`none`:** exact passthrough on valid samples.
+
+**`linear_fit`:** per-channel affine `source → reference`, convention `y_ref = a*x_src + b`,
+fit on common 2-D validity. Exact estimator:
+1. require `min_common = max(256, ceil(0.01 * min(ref_valid_count, src_valid_count)))`
+   common pixels;
+2. initial unweighted float64 OLS;
+3. residual center = median, scale = `1.4826*MAD`; if `scale > 0` retain residuals within
+   the inclusive interval `±3*scale`; if `scale == 0` retain only residuals exactly equal
+   to the residual median; the residual-mask update is **monotonic**; refit; max 5
+   iterations or stable (mask unchanged);
+4. after every update require at least `min_common` retained samples AND a finite
+   nondegenerate OLS denominator — otherwise the frame **fails explicitly**; require
+   finite `a,b` and `0.25 <= a <= 4.0`; **out-of-range FAILS the frame (do not clip
+   slope)**; final intercept from final accepted set;
+5. apply only to valid pixels; invalid remain invalid.
+
+**`sky_mean`:** true name/formula, **not median**: same reference/common-valid/min_common
+rule; per channel Astropy-equivalent iterative sigma-clipped **MEAN**
+(`sigma_lower=sigma_upper=3`, `maxiters=5`); offset `mean_ref - mean_src`; apply additive
+offset to valid pixels. N=1 identity. Failure excludes the frame explicitly.
+
+**`stack_core` placeholder (`linear_fit == median`):** must **disappear from supported
+paths**. Old callers route to the canonical implementation or error — **never** median
+substitution.
+
+---
+
+## 6. Quality weights — decision E (W1/W2/W3)
+
+- **Exactly one scalar per frame**, shared by all channels (preserve color); **no**
+  per-channel/per-pixel quality magnitude. Geometric/taper remain separate 2-D factors.
+- **`none`:** scalar `1.0`; **NO exposure fold**.
+- **robust noise sigma:** computed on the **normalized valid samples** (pipeline order),
+  retaining channel-invariant 2-D validity and a scalar per-frame weight: luminance for
+  RGB (`0.2126R + 0.7152G + 0.0722B`), mono direct; geometric-valid finite samples;
+  sigma-clipped std (`3/3`, `maxiters=5`), float64. Nonfinite/nonpositive sigma → metric
+  failure.
+- **`noise_variance`:** raw `1/sigma²`, computed float64, then normalize all surviving
+  positive frame weights by the maximum raw weight so max = 1; no epsilon/constant/unity
+  fallback; failed frame excluded explicitly.
+- **`noise_fwhm`:** raw `1/(sigma² * FWHM²)` (background-limited point-source justification:
+  PSF area proportional FWHM²), then same max=1 normalization. FWHM = median
+  `equivalent_fwhm` from Photutils sources satisfying finite `0.8 < FWHM < 20 px`,
+  eccentricity ≤ 0.8, minimum 3 accepted sources. Missing Photutils disables the GUI
+  option; persisted/programmatic request fails validation **before run**. Per-frame
+  insufficient sources excludes the frame explicitly. **No** variance/no-weight/unit/1e-6
+  fallback.
+- Quality raw weights are computed **after** normalization exclusions; max-normalization is
+  applied **only over surviving positive weights** (frames with a failed/absent metric are
+  excluded first).
+- Quality weight magnitudes affect **only** weighted-mean combination and the quality factor
+  `q_i` in positive support (§7 — always present, `q_i = 1` for `none`); rejection
+  thresholds/masks **never** consume weight magnitudes.
+
+---
+
+## 7. Support / coverage — decision F (S1/S2/S3 + donor)
+
+- `q_i` = normalized canonical scalar quality weight, or `1` for `none`.
+- `m_i` = explicit channel-invariant 2-D valid geometric/science sample mask.
+- `a_i` = donor-exact footprint taper if enabled, else `1` within mask and `0` outside.
+- Per original exposure (before rejection): the quality contribution to support is **not
+  optional** once the request is resolved — `s_i == w_i == q_i * m_i * a_i`, with `q_i = 1`
+  for `none`. The **SAME factor** multiplies numerator and denominator (constant-field
+  invariant).
+- "Independent" support means the support pair is **accumulated independently** and is
+  **never reconstructed** from `estimator_weight_sum`, the final estimator WHT, or rejection
+  survivors/masks; it does **not** mean `q` is omitted. Rejection **does not** change
+  support.
+- **Donor support-accumulator invariants (restored):**
+  - Each `s_i` must be **exact-shape 2-D**, **finite**, and **non-negative**.
+  - `s_i²` and candidate cumulative W1/W2 are preflighted: negative / NaN / Inf / shape
+    mismatch / square overflow / cumulative overflow **fail before mutation**.
+  - `SUP_W1` and `SUP_W2` are an **atomic pair** — either both update or neither; a failed
+    add/restore leaves both unchanged.
+  - Target internal accumulators remain **float64** (float32 is **not** reintroduced as the
+    target default or alternative).
+  - `N_eff` is a **pure derived view** that never mutates state: exact-first `W1²/W2` where
+    finite; overflow-resistant `(W1/√W2)²` fallback where `W1²` would overflow; undefined /
+    nonfinite / negative → documented neutral `0`.
+  - Support accumulates in **original-exposure ordered-add** semantics; never derived
+    post-hoc from estimator maps or rejection masks.
+  - Required donor algorithms (`make_footprint_taper` and the support accumulator) are
+    **source-ported / reimplemented locally into ZeMosaic** with **no runtime import or
+    dependency on ZSSS**.
+- median value ignores positive weight magnitude but requires `w_i > 0` validity; support
+  still records `q/m/a`.
+- donor exact `make_footprint_taper`: boolean 2-D footprint, padded false border, scipy EDT
+  primary + donor chamfer fallback, `feather_px=8.0`, `floor=0.0`; `1` interior / ramp /
+  `floor` / `0` outside. Taper preserves **translation/rotation invariance** and
+  **padded-boundary symmetry (up to rasterization)**.
+
+---
+
+## 8. Rejection — decision G (R1/R2/R3)
+
+**General:** per pixel/channel, operate on **original normalized valid samples**; weight
+magnitudes do **NOT** affect rejection. Rejection mask may be channel-specific diagnostics;
+2-D support remains independent.
+
+**`none`:** keep all valid.
+
+**`kappa_sigma`** — UNIQUE canonical algorithm CPU/GPU: float64; initial survivors = valid;
+each iteration center = median(survivors), dispersion = population std (`ddof=0`) of
+survivors; keep original samples inside `[center - sigma_low*std, center + sigma_high*std]`;
+monotonic mask; max 5 or stable. Defaults `low/high = 3.0`. If valid N<3, explicit low-N
+no-rejection success (not fallback). Degenerate `std<=0` keeps equal finite samples, rejects
+values unequal to center only if outside the zero-width interval; diagnostics explicit.
+
+**`winsorized_sigma_clip`** — UNIQUE canonical true WSC using **BOTH** winsor limits and
+sigma limits:
+1. survivors = valid; require N≥3 else explicit no-rejection success;
+2. on current survivors compute per-pixel/channel lower/upper quantiles at
+   `winsor_limit_low` and `1 - winsor_limit_high` (defaults `0.05/0.05`; each finite in
+   `[0, 0.5)`);
+3. winsorize survivors to those quantile bounds;
+4. center = mean and dispersion = population std of winsorized survivors;
+5. update **MONOTONIC** survivor mask by applying asymmetric
+   `[center - sigma_low*std, center + sigma_high*std]` to **ORIGINAL** normalized samples;
+6. max 5 or stable; final combine uses **original surviving samples**, not winsorized
+   replacements.
+
+Defaults sigma low/high = 3.0. Degenerate policy (explicit): if the winsorized population
+std <= 0, use a **zero-width inclusive interval** at the winsorized mean applied to the
+**ORIGINAL** normalized samples — original samples exactly equal to the center survive,
+unequal values are rejected; the survivor-mask update remains a **monotonic intersection**;
+diagnostics record the degenerate case. Stable means the survivor mask is unchanged. WSC
+quantile convention is pinned to NumPy/CuPy `method='linear'` semantics (or a mathematically
+exact equivalent if the backend API differs), so CPU/GPU/chunked implementations cannot
+choose different interpolation variants. Remove implementation selector/env ambiguity
+(`wsc_impl` **cannot** choose another science on supported paths). CPU/GPU same `xp`
+algorithm; chunking may change resource use only, not operation semantics beyond documented
+numeric tolerance.
+
+**`linear_fit_clip`:** DISABLE/REMOVE from Qt supported choices and the canonical enum.
+Persisted/programmatic token fails validation with explicit `unsupported_removed_sci05`;
+**do NOT** migrate to `none`/`kappa`/WSC. Legacy internal helpers may remain temporarily
+unreachable, clearly legacy, with no supported caller.
+
+---
+
+## 9. Combine — decision H (C1/C2)
+
+**`mean`:** float64 `SUM(original_surviving_normalized_sample * w_i) / SUM(w_i)`; only valid
+survivors; denominator condition is **exactly `> 0`** (no route-specific epsilon);
+`denom <= 0` → NaN invalid + `estimator_weight_sum = 0`. `estimator_weight_sum` is the
+per-pixel/channel **sum of `w_i`** over original surviving valid samples (float64).
+
+**`median`:** float64 unweighted median of original surviving samples for which `w_i > 0`;
+positive weight magnitude ignored; **no** invented weighted median; no survivors → NaN.
+`estimator_weight_sum` is the per-pixel/channel **count** of original surviving valid
+samples with `w_i > 0` (unit effective estimator weights, **not** `Σ q·m·a`); `0` where no
+survivors. Output float32.
+
+---
+
+## 10. Global coadd — decision I (G1)
+
+- GUI labels `Mean`, `Median`, `Kappa-Sigma`, `Winsorized` route to the **SAME canonical
+  engine/method contracts**, processed in spatial chunks if needed.
+- The current percentile-winsorized global implementation is **removed** from the supported
+  `Winsorized` route (no same-label approximation).
+- No rename workaround selected: **unify science**.
+
+---
+
+## 11. Equalize RGB — decision J
+
+- Keep as an explicit **OPTIONAL POST-COMBINE SCIENCE TRANSFORM**, never hidden in
+  normalization/rejection and never in coverage render.
+- Same existing robust implementation for all supported callers:
+  `equalize_rgb_medians_inplace`, background percentile `5/85`, min samples `5000`,
+  min coverage `0.01`, gain clip `[0.95, 1.05]`; requested/effective/applied + gains logged.
+- If inapplicable, explicit no-op status, not falsely "applied". Scientific result reflects
+  it when enabled.
+
+---
+
+## 12. Coverage UX / migration / render — decision K
+
+- Replace normal modern radial controls with **Coverage support taper** (default ON) and
+  **Coverage-aware final reconstruction** (default OFF).
+- Internal taper params remain `8.0/0.0`; render tuning is internal, not GUI.
+- Deprecated old keys: `apply_radial_weight`, `radial_feather_fraction`,
+  `min_radial_weight_floor`, `radial_shape_power`. **Never** map values mathematically.
+  Migration sets the legacy radial path disabled/inert; both old `true` and old `false` yield
+  the independent fresh canonical support-taper default ON; neither old feather/floor/power
+  value maps to new px/floor. Record migration/provenance.
+- Donor exact render formula: `alpha = clip(1 - N_eff/n_ref, 0, 1)`, `n_ref=32`,
+  `sigma_denoise=2`, `sigma_low=32`; B+D detail blend. No support → no-op/fail-open
+  diagnostic; high support no-op; no gain/inpainting/low-frequency coverage correction.
+- Render acts ONLY on a separate preview/display render array. Scientific FITS
+  pixels/header/WCS and `CanonicalStackResult`
+  science/estimator_weight_sum/SUP_W1/SUP_W2/N_eff/rejection diagnostics are **exactly
+  unchanged** ON/OFF. No rendered FITS overwrite.
+
+---
+
+## 13. Fallback / provenance — decision L
+
+- Backend fallback GPU→CPU allowed **only** under the same exact method/params/masks
+  contract, logged.
+- Any method unavailable/failed is an explicit validation/frame-exclusion/request failure as
+  above; **no substitution**.
+- Bounded `STACK_EFFECTIVE` and coverage events record requested/effective normalization,
+  weighting, rejection, combine, backend, reference, excluded frames/reasons, taper, render,
+  parameters, and backend fallback reason. FITS headers describe the **actual executed**
+  method.
+
+---
+
+## 14. Implementation gates — decision M (sequence only; no code now)
+
+- **B** — normalization + weighting + deterministic witnesses.
+- **C** — rejection + combine.
+- **D** — CPU/GPU convergence / physical qualification.
+- **E** — donor Coverage transplant + settings/GUI/migration/render A/B.
+- **F** — caller convergence: Classic / SDS / Grid / Phase 4.5 / global coadd.
+- **G** — final independent audit + one full suite + optional real-data/human science gate.
+
+Full suite runs **once at final**. New ZeGrid is out of scope.
+
+---
+
+## 15. Archaeology separation and no-implementation claim
+
+The current-behavior archaeology is **kept separate** in
+`docs/science/SCI05_ARCHAEOLOGY_MATRIX.md` (9 routes; per-column executed symbols; verdicts
+CANONICAL / DIVERGENT / PLACEHOLDER / SILENT_SCIENCE_FALLBACK / SILENT_SCIENCE_DEGRADATION /
+UNSUPPORTED / NOT_REACHABLE / NOT_RUN; evidence class STATIC/DYNAMIC/RECONSTRUCTION/
+ROUTING_SEAM/PHYSICAL_GPU_NOT_RUN). **This contract does not claim any target semantics are
+implemented at HEAD** — it is the specification Gate B will build toward.
+
+**Donor discrepancy (preserved, do not hide):** the donor's Qt settings dataclass
+(`settings_state.py:269`) defaults `apply_coverage_render=True`, while the engine instance
+(`queue_manager.py:5131`) defaults `apply_coverage_render=False`. These conflict;
+**Tristan's fresh target is OFF**, and ZeMosaic must follow Tristan, not silently infer from
+the incidental Qt dataclass default.
+
+## 16. Resolved decision table (frozen)
+
+| ID | Resolved decision |
 | --- | --- |
-| N1 | Normalization reference selection rule |
-| N2 | Single `linear_fit` estimator vs documented divergence |
-| N3 | Low-N / min-pixel gate + failure policy (no silent substitution) |
-| N4 | Dispose of `stack_core` `linear_fit` median placeholder |
-| W1 | `noise_fwhm`: real estimator vs honest UNSUPPORTED (no silent fallback) |
-| W2 | Variance floor + exposure-fold policy |
-| W3 | Weight application shape (scalar/per-channel/per-pixel) |
-| S1 | All-invalid output: NaN/invalid vs another **deliberately documented sentinel**; arbitrary historical zero **forbidden** (Tristan constraint; §3.3) |
-| S2 | `weight<=0` pre-mask vs raw-forward at core boundary |
-| S3 | 2-D channel-invariant support contract |
-| R1 | WSC unique target + migrate `stack_core`/global-coadd |
-| R2 | kappa/WSC params + low-N policy |
-| R3 | Linear Fit Clip: real (A) vs disable/remove (B) |
-| C1 | Single zero-sum epsilon |
-| C2 | Median unweighted-valid-sample contract |
-| G1 | Global-coadd label consistency / rename |
+| N1 | Reference selection: explicit valid `reference_index`; else greatest `count_nonzero(m_i)` (channel-invariant valid mask) on aligned PRE-normalization validity, no weights/rejection; stable tie → lowest index; identity reference; same reference across channels/methods; provenance `explicit`/`auto` + index. |
+| N2 | Single `linear_fit` estimator: float64 OLS + robust MAD refinement (median center, `1.4826*MAD`, ±3·scale, monotonic, ≤5 iters), `0.25 ≤ a ≤ 4.0`, out-of-range fails frame (no clip). |
+| N3 | Low-N/min-pixel gate + failure: `min_common = max(256, ceil(0.01 * min(counts)))`; failure excludes frame with reason; N=1 normalization is identity success; no silent substitution. |
+| N4 | `stack_core` `linear_fit==median` placeholder removed from supported paths; old callers route canonical or error, never median substitution. |
+| W1 | `noise_fwhm`: real estimator (Photutils `equivalent_fwhm` median, `0.8<FWHM<20`, ecc≤0.8, ≥3 sources); missing Photutils disables GUI / persisted fails validation; per-frame insufficient sources excluded; no fallback. |
+| W2 | No exposure fold (`none` = scalar `1.0`); `noise_variance` = raw `1/σ²` then max=1 normalization; no floor/epsilon/constant/unity fallback. |
+| W3 | Exactly one scalar weight per frame, shared across channels; geometric/taper are separate 2-D factors. |
+| S1 | All-invalid output = NaN/invalid science + `estimator_weight_sum=0` + `support=0`; no historical zero sentinel. |
+| S2 | `weight==0` = absent; `weight<0`/nonfinite = invalid input failing before mutation. |
+| S3 | Channel-invariant 2-D support: `m_i` explicit 2-D; `s_i == w_i == q_i*m_i*a_i` per exposure (`q=1` for `none`); `SUP_W1/W2` float64 atomic pair, fail-before-mutation (negative/NaN/Inf/shape/overflow), original-exposure ordered-add, never derived from estimator WHT/rejection; `N_eff` pure derived view `W1²/W2` (overflow-resistant `(W1/√W2)²` fallback, neutral `0` if undefined); donor algorithms source-ported, no runtime ZSSS dependency. |
+| R1 | Unique WSC target: true WSC using both winsor+sigma limits (PixInsight-style defaults); unify `stack_core` simplified and global-coadd percentile clip onto it. |
+| R2 | kappa: median center + population std `ddof=0`, sigma `low/high=3.0`, ≤5 iters; WSC winsor `0.05/0.05`, sigma `3.0`; N<3 → explicit no-rejection success. |
+| R3 | Linear Fit Clip: disable/remove (fork B); persisted token fails `unsupported_removed_sci05`; no migration to none/kappa/WSC. |
+| C1 | Single zero-sum epsilon: denominator is **exactly `>0`** (no epsilon). |
+| C2 | Median: unweighted median of `w_i>0` original surviving samples; magnitude ignored; no survivors → NaN. |
+| G1 | Global-coadd labels route to the same canonical engine; remove percentile-winsorized; no rename (unify science). |
 
 ---
 
-## 6. Honesty and limits
+## 17. Honesty and limits
 
-- No physical GPU run was performed at Gate A; all GPU cells are STATIC /
-  ROUTING_SEAM / NOT_RUN.
-- No CPU↔GPU parity, no WSC numerical equivalence beyond the existing SCI-01/02/03
+- No physical GPU run was performed at Gate A; all GPU cells remain STATIC / ROUTING_SEAM /
+  NOT_RUN.
+- No CPU↔GPU parity, no WSC numerical equivalence beyond the existing SCI-01/02/03/04
   witnesses, no Phase 4.5 / SDS / classic N≥3 runtime execution.
-- This contract **freezes no disputed method as approved**. Gate B may not start
-  until Junior accepts the contract and resolves (or defers) the decision register.
+- This contract is the **accepted decision freeze**; it is not an implementation and does
+  not alter runtime behavior. Independent Nono review-1 returned **ACCEPT**; Gate B may
+  start under this contract.
