@@ -385,7 +385,14 @@ The normalization/photometry data-flow is five labeled steps in exact order:
   gain/offset; `none` = passthrough; default median scaling.
 - `stack_core`: `linear_fit` is a **placeholder** (median subtraction, `stack_core:294-296`);
   Grid GPU normalizes upstream and passes `'none'` to the core, so the placeholder is not
-  reached on the Grid path (SCI-02).
+  reached on the Grid path. **SCI-02 CHARACTERIZED / CLOSED-NO-FIX**
+  (`ZM-SCI-02-STACKCORE-LINEARFIT-CHAR-20261004`): placeholder proven bit-exact == `median`
+  and non-affine (residual 240.33 vs 7.6e-06 for real Grid linear fit); AST inventory confirms
+  a single production caller (`grid_mode._stack_weighted_patches_gpu`) that passes `none`;
+  real linear-fit paths (Grid covariance/variance regression; classic percentile-based) are
+  genuine affine mappings distinct from the placeholder; normalization `linear_fit` ≠
+  rejection `linear_fit_clip`. Witness: `tests/test_stack_core_linear_fit_characterization.py`
+  (16 pass) + `docs/refactor/SCI_02_STACK_CORE_LINEAR_FIT_CHARACTERIZATION.md`.
 
 ## Weighting
 
