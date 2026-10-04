@@ -2,7 +2,7 @@
 
 ## Statut et autorisation
 
-**R2 SCOPE BORNÉ CLOS — R3 TECHNIQUE ACCEPTÉ — M106 HOLD**, le 2026-10-04.
+**R2 SCOPE BORNÉ CLOS — R3 TECHNIQUE ACCEPTÉ — M106 SCIENCE ACCEPTÉ**, le 2026-10-04.
 
 Tristan a autorisé le lancement de la mission. R0 (archéologie + baseline ciblée)
 est terminé et accepté par Junior après revue indépendante Nono `review-3: ACCEPT`.
@@ -15,7 +15,11 @@ Ceci ne prétend PAS que le worker de ~38k lignes est « terminé » : les extra
 arbitraires sont volontairement évitées et toute décomposition future exige une nouvelle
 mission bornée (témoins/critères/revue). L'audit R3 post-R2 et `FINAL_REPORT.md` sont
 **acceptés techniquement** après Nono `review-0: ACCEPT` + acceptation Junior.
-M106 reste une gate scientifique manuelle finale HOLD, non lancée.
+M106 a ensuite été exécutée sur le corpus privé de 66 FITS : géométrie/coverage/winner/weighted
+bit-identiques, variations science/aesthetic bornées par une variabilité même-build plus grande.
+Après contrôle plein format sans anomalie visible, Tristan a rendu `HUMAN_VISUAL_VERDICT=ACCEPT`
+le 2026-10-04 à 14:17 Europe/Paris. Le dossier de preuve est conservé sous
+`/home/tristan/M106/gate_evidence_20261004/`.
 
 - [x] Vérifier l'identité du dépôt et actualiser les références distantes.
 - [x] Vérifier base, version et propreté initiale.
@@ -30,7 +34,7 @@ M106 reste une gate scientifique manuelle finale HOLD, non lancée.
 - [x] Exécuter le scope R2 borné accepté (lot 1 `8b7a979`, lot 2A `5d7920d`, lot 2B `1282cfe` — Nono review-0 ACCEPT + Junior).
 - [x] Rédiger l'audit R3 post-R2 + `FINAL_REPORT.md`.
 - [x] Obtenir l'acceptation R3 technique finale (Nono `review-0: ACCEPT` + Junior).
-- [ ] Obtenir l'acceptation scientifique manuelle de Tristan sur M106 (HOLD — non lancée).
+- [x] Obtenir l'acceptation scientifique manuelle de Tristan sur M106 (`ACCEPT`, 2026-10-04 14:17 Europe/Paris).
 
 ## 1. Base canonique et branche
 
@@ -328,7 +332,7 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 - [x] **Audit et rapport R3 post-R2** — `FINAL_REPORT.md` et
   `STACKING_CONTRACTS_R3.md` **POST-R2 AUDITED — ACCEPTED** après Nono
   `review-0: ACCEPT` + Junior ; aucune extraction R2 ne touche stacking
-  math/order/weights/rejection/WCS/FITS/science. M106 reste HOLD.
+  math/order/weights/rejection/WCS/FITS/science. M106 est désormais acceptée par Tristan.
 
 ## 10. TODO / FOLLOW-UP — SCIENCE et inconnues
 
@@ -341,7 +345,7 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 | TEST-01 | 11 imports plats importorskip Phase 3 | RÉSOLU (mission ZM-ARCH-TEST01-PHASE3-IMPORTS-20261003) : imports plats → qualifiés (`zemosaic.zemosaic_worker`, `zemosaic.parallel_utils`) dans `tests/test_phase3_adaptive_invariants.py`, sans alias produit. Résultat témoin : baseline historique 22 pass/11 skip → 33 pass/0 skip ; `tests/test_packaging.py` 17 pass. |
 | ARCH-01 | Invocations supportées de Phase 4.5 / fallback Tk | UNKNOWN jusqu'à preuve/revue; conserver |
 | ARCH-02 | Contrats externes / frozen / API programmatique | Inventaire incomplet; ambiguïté bloque une suppression, pas toute R0 |
-| MANUAL-01 | M106 avant/après et plateformes/GPU réels | NOT_RUN; nécessaires aux validations qu'ils prétendent établir |
+| MANUAL-01 | M106 avant/après sur GPU réel | RÉSOLU : trois runs cupy/MX150 (BASE, CANDIDATE, repeat même-build), preuves sous `/home/tristan/M106/gate_evidence_20261004/`; technique `INCONCLUSIVE/HOLD` sous critère bit-identique, verdict visuel/scientifique Tristan `ACCEPT`. Les autres plateformes restent NOT_RUN. |
 | TEST-02 | `tests/test_version_gpu.py` = script diagnostic sans `test_*` (0 items collectés) | R0 observé : `no tests ran in 0.05s` ; c'est un script d'impression CUDA, pas un témoin. À renommer ou convertir en vrai témoin GPU. Ne pas compter comme couverture |
 | TEST-03 | Témoin de propagation dispatch GUI/config → `run_hierarchical_mosaic_process` → `run_hierarchical_mosaic` (kwargs effectifs) | RÉSOLU (mission ZM-ARCH-WITNESS-DISPATCH-20261003) : nouveau `tests/test_dispatch_propagation_witness.py`, 14 pass/0 skip en 4.63s. Caractérise rename GUI→worker (stacking_* → stack_*), parsing `stacking_winsor_limits`→`parsed_winsor_limits` (tuple, fallback (0.05,0.05)), promotion suffixe `_config`, drop silencieux des kwargs inconnus (risque architectural), défauts `stack_ram_budget_gb_config=0.0`/`num_base_workers_config=0`, préservation des valeurs falsy (False/0/""/numériques), invocation unique sans travail lourd. Aucun fix produit ; les autres témoins alors ouverts sont désormais suivis par TEST-04/05/06. |
 | TEST-04 | Témoin low-N / all-invalid / zero-weight du stacking (Grid CPU vs `stack_core` vs classic N<3) | RÉSOLU (mission ZM-ARCH-WITNESS-STACK-EDGES-20261003) : nouveau `tests/test_stacking_low_n_all_invalid_witness.py`, 18 pass/0 skip en 2.15s, CPU uniquement, float32 HWC 2×2×1. Épingle : Grid CPU all-invalid → zéros vs `stack_core` → NaN (pixel all-invalid 0.0 vs NaN en mean) ; median Grid CPU ignore la magnitude mais traite `weight<=0` comme invalide, `stack_core` ignore totalement les poids en median ; classic kappa N=1/N=2 et winsorized N=1 (warning « needs >=3 images ; forcing CPU ») renvoient des stacks valides `rejected=0.0`. Divergence SCI-03 caractérisée, PAS corrigée. Restent ouverts (non testés) : parité CPU↔GPU, Grid GPU `stack_core`, classic N≥3 / SDS, `linear_fit` numériques, Phase 4.5 exécution ; cache/reprise et spawn sont désormais couverts par TEST-06/05. |
@@ -384,17 +388,17 @@ Pas de délégation déclenchée par la seule présence de ce fichier.
 
 ## 12. Comparaison M106, clôture et rapport final
 
-- [ ] AVANT refactor scientifique/structurel : localiser le corpus historique
+- [x] AVANT refactor scientifique/structurel : localiser le corpus historique
   « M106 de l'enfer », créer manifeste de fichiers/hash/config/ordre, capturer
   dépendances et backend réel; conserver référence BASE SHA, logs et sorties
   dans un espace distinct, sans écraser/modifier les brutes de référence.
-- [ ] Préserver sorties intermédiaires pertinentes : nombre/identité des tuiles,
+- [x] Préserver sorties intermédiaires pertinentes : nombre/identité des tuiles,
   FITS data/WCS/headers scientifiques, poids/alpha/coverage, NaN, rejets, stats et
   diagnostics des trous/seams. Identifier métadonnées volatiles séparément.
-- [ ] Comparer candidat et base avec même corpus/config/matériel; un résultat
+- [x] Comparer candidat et base avec même corpus/config/matériel; un résultat
   simplement « joli » ne prouve pas la science. M106 ne remplace pas les témoins
   des modes/options qu'il n'exerce pas (SDS/Grid/GPU/Phase 4.5 notamment).
-- [ ] Tristan réalise/valide l'acceptation manuelle finale; baseline indisponible
+- [x] Tristan réalise/valide l'acceptation manuelle finale; baseline indisponible
   ou test non passé = HOLD explicite, jamais promotion automatique.
 - [x] Écrire `docs/refactor/FINAL_REPORT.md` : BASE SHA, branche, HEAD final, statut
   worktree, synthèse R0/classifications, suppressions et preuves, extractions,
@@ -402,7 +406,7 @@ Pas de délégation déclenchée par la seule présence de ce fichier.
   résultats/skips, revues Nono, commits, TODO restants et gates manuelles.
   (accepté techniquement le 2026-10-04 après Nono review-0 + Junior ; le commit docs
   est séparé, HEAD d'implémentation audité `1282cfe`.)
-- [x] Distinguer **LOCAL TECHNICAL ACCEPT / HUMAN SCIENCE HOLD**. Même après M106,
+- [x] Distinguer le résultat mécanique `INCONCLUSIVE/HOLD` du verdict final **HUMAN SCIENCE ACCEPT**. Même après M106,
   une publication nécessite une autorisation distincte.
 
 Succès = chemin officiel évident, code mort démontré, responsabilités moins

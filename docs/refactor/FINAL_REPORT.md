@@ -2,17 +2,17 @@
 
 - **mission_id:** `ZM-ARCH-R3-POST-R2-AUDIT-20261004`
 - **phase:** implementation (docs + validation only)
-- **status:** `LOCAL TECHNICAL ACCEPT / HUMAN SCIENCE HOLD`
+- **status:** `LOCAL TECHNICAL ACCEPT / HUMAN SCIENCE ACCEPT`
 - **date:** 2026-10-04
 - **author:** Coco (implementation worker) for Junior (architect) + Tristan (final human authority)
 - **repository:** `/home/tristan/.openclaw/workspace/projects/zemosaic`
 - **branch:** `refactor/zm-architecture-cleanup-r0-r3`
 
 This document closes the bounded R2 scope for **this mission** and records the R3
-post-R2 audit. It is **locally accepted on technical grounds** after Nono `review-0:
-ACCEPT` and Junior acceptance, but it is not a scientific acceptance:
-M106 (the manual before/after scientific gate) is **HOLD** and must not be launched here.
-No publication gate (push/merge/tag/release) is authorized by this mission.
+post-R2 audit. It was **locally accepted on technical grounds** after Nono `review-0:
+ACCEPT` and Junior acceptance. M106 was subsequently executed as a separate mission and
+received Tristan's explicit visual/scientific `ACCEPT` on 2026-10-04 at 14:17 Europe/Paris.
+No publication gate (push/merge/tag/release) is authorized by that acceptance.
 
 ---
 
@@ -167,7 +167,7 @@ stacking math/order/weights/rejection/WCS/FITS/science**:
 The map remains valid: all eight stacking rows (Classic CPU/GPU, SDS CPU, Grid CPU/GPU-core/
 GPU-legacy, Phase 4.5 alpha + configured-rejection) and the SCI-01/02/03 divergence pinning are
 unchanged. **Status: POST-R2 AUDITED — ACCEPTED** after Nono `review-0: ACCEPT` and
-Junior acceptance. This remains a technical conclusion, not M106 scientific acceptance.
+Junior acceptance. M106 scientific acceptance was subsequently granted by Tristan; see §12.
 
 ## 9. Validation (exact commands / results)
 
@@ -277,24 +277,31 @@ Preserved unchanged (see `todo.md` §10 for full ledger):
 - **ARCH-06** — Grid GPU `stack_core` reuse + linear_fit placeholder (SCI-01/02 confirmation).
 - **SCI-07** — Phase 4.5 affine/micro-align helpers absent at BASE (DORMANT/UNREACHABLE).
 - **TEST-02** — `test_version_gpu.py` is a diagnostic script (0 items collected), not a test.
-- **MANUAL-01** — M106 before/after + real GPU/platforms: NOT_RUN.
-- No CPU/GPU parity claimed anywhere; no GPU stacking execution; no physical GPU probe
-  (fakes only); no external solver/catalogue; no network; no PyInstaller build; no
-  Windows/macOS claim. All remain NOT_RUN.
+- **MANUAL-01** — M106 before/after: completed on cupy/MX150 with BASE, CANDIDATE and a
+  same-build repeat; Tristan visual/scientific verdict `ACCEPT`. Other platforms remain NOT_RUN.
+- No CPU/GPU parity is claimed. The original R3 validation used fakes and did not execute GPU
+  stacking; the later M106 gate exercised real cupy/MX150 for this corpus only and does not prove
+  backend parity. No external solver/catalogue, network, PyInstaller build, or Windows/macOS
+  qualification was performed; those remain NOT_RUN.
 
-## 12. M106 manual gate (HOLD — not launched)
+## 12. M106 manual gate (COMPLETED — HUMAN ACCEPT)
 
-M106 is a **MANUAL/HUMAN scientific gate** and is **not launched** in this mission. No large
-private corpus was located/hashed/copied. For Tristan, the protocol is:
+M106 was executed later under mission `ZM-ARCH-M106-GATE-20261004` against the private
+66-FITS corpus. Immutable source snapshots, manifests, adapted/effective configs, logs,
+telemetry, FITS comparisons and visual artifacts are preserved under
+`/home/tristan/M106/gate_evidence_20261004/`.
 
-1. **Preserve BASE reference** — corpus, config, order, hardware, logs, and outputs in a
-   separate directory; never overwrite the reference raw data.
-2. **Separate output dirs** for BASE vs candidate runs.
-3. **Compare** tile identity/count; FITS arrays / WCS / headers; weights / alpha / coverage /
-   NaN / rejections / seams; logs / backend / fallback.
-4. **Explicit human visual + scientific verdict** — a "looks nice" result is not science.
-5. If historical BASE output/manifests are absent, a strict before/after comparison is
-   **BLOCKED/HOLD**, not fabricated.
+- BASE `c03d0bb`, CANDIDATE `1282cfe`, plus one same-build candidate repeat ran sequentially
+  through cupy on the MX150 with the same corpus, 26-group preplan and isolated outputs.
+- Coverage, winner map and weighted coverage map are array-bit-identical; shapes, WCS and
+  NaN masks match. Science/aesthetic are not bit-identical.
+- Same-build variability is comparable to or larger than BASE↔CANDIDATE. The locked mechanical
+  criterion therefore remains `INCONCLUSIVE/HOLD`; no threshold was loosened post hoc and no
+  refactor-attributable science regression was demonstrated.
+- Tristan inspected the full-resolution result, reported no visible issue, and explicitly set
+  `HUMAN_VISUAL_VERDICT=ACCEPT` on 2026-10-04 at 14:17 Europe/Paris.
+
+Final M106 project gate: **HUMAN SCIENCE ACCEPT**. This does not authorize publication.
 
 ## 13. Publication gates
 
@@ -304,15 +311,15 @@ private corpus was located/hashed/copied. For Tristan, the protocol is:
 
 ## 14. Next steps
 
-1. Junior creates the separate docs/report commit (not part of audited implementation HEAD
-   `1282cfe`) and reports its SHA separately.
-2. Tristan performs the M106 manual scientific gate (HOLD until then); a separate
-   publication authorization is required even after M106.
+1. The technical docs/report checkpoint is commit `97c08f1`; commit this M106 acceptance addendum
+   separately. Neither documentation commit changes the audited implementation HEAD `1282cfe`.
+2. M106 is complete and human-accepted. The only remaining project gate is a separate,
+   explicit publication decision (push/merge/tag/release remain unauthorized).
 
 ## 15. Limitations / review readiness
 
-- Technical state: **LOCAL TECHNICAL ACCEPT / HUMAN SCIENCE HOLD** (Nono review-0
-  ACCEPT + Junior acceptance).
+- Final state: **LOCAL TECHNICAL ACCEPT / HUMAN SCIENCE ACCEPT** (Nono review-0,
+  Junior acceptance, then Tristan M106 visual/scientific acceptance).
 - This report is a docs-only artifact; it cannot self-reference its own commit SHA.
 - All observed facts above are reproduced from live git/pytest/wheel evidence; unverified
   hypotheses are labelled UNKNOWN/NOT_RUN.
