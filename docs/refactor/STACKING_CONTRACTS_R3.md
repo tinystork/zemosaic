@@ -55,8 +55,8 @@ irrelevant to CuPy JIT.
 | Classic GPU | `_stack_master_tile_auto` → Phase-3 `_p3_gpu_stack_from_paths` (`:13389`, `zemosaic_align_stack_gpu.gpu_stack_from_paths`); plus wrapper-internal `gpu_stack_winsorized`/`gpu_stack_kappa`/`gpu_stack_linear` (`align_stack:1539/1628/1695`) gated by `_plan_gpu_stack_execution` (`:1139`) | GPU (cupy) | STATIC ACTIVE; NOT_RUN (no GPU stacking executed in R0) |
 | SDS | `assemble_global_mosaic_sds` (`worker:37965`) → `_stack_mosaics` (`:38683`) → `stack_winsorized_sigma_clip` / `stack_kappa_sigma_clip` with `zconfig=None` (`:38704-38708`, `:38719-38723`) | **CPU (numpy)** — wrappers called with `zconfig=None` → `use_gpu=False` | STATIC ACTIVE; NOT_RUN (no SDS runtime witness) |
 | Grid CPU | `_stack_weighted_patches` (`grid_mode:1913`) | CPU (numpy) | STATIC ACTIVE; low-N/all-invalid WITNESSED (`test_stacking_low_n_all_invalid_witness.py`) |
-| Grid GPU (core) | `_stack_weighted_patches_gpu` (`grid_mode:1984`) → `stack_core(backend='gpu')` (`:2010-2028`) | GPU if `_CUPY_AVAILABLE` + `config.use_gpu` | STATIC ACTIVE; NOT_RUN (no GPU `stack_core` execution) |
-| Grid GPU (legacy fallback) | same fn, `stack_core` is None → legacy cp rejection (`grid_mode:2034+`) | GPU, numpy rejection via `cp.asnumpy` | DORMANT (reachable only if `stack_core` import fails); NOT_RUN |
+| Grid GPU (core) | `_stack_weighted_patches_gpu` (`grid_mode:1984`) → `stack_core(backend='gpu')` (`:2010-2028`) | GPU if `_CUPY_AVAILABLE` + `config.use_gpu` | STATIC ACTIVE; physical GPU arithmetic NOT_RUN — NumPy-backed routing seam + core-CPU adapter WITNESSED (SCI-03, `tests/test_grid_mask_weight_characterization.py`) |
+| Grid GPU (legacy fallback) | same fn, `stack_core` is None → legacy cp rejection (`grid_mode:2034+`) | GPU, numpy rejection via `cp.asnumpy` | DORMANT (reachable only if `stack_core` import fails); physical GPU arithmetic NOT_RUN — NumPy-backed routing seam WITNESSED (SCI-03) |
 | Phase 4.5 (alpha-weighted direct) | `_run_phase4_5_inter_master_merge` `weights_ready` branch (`worker:8315-8337`) | CPU (numpy direct weighted mean) | STATIC ACTIVE; NOT_RUN (no Phase 4.5 execution) |
 | Phase 4.5 (configured rejection) | same fn rejection branch (`worker:8342-8372`) | **CPU (numpy)** — wrappers called with `zconfig=None` | STATIC ACTIVE; NOT_RUN |
 
@@ -208,7 +208,7 @@ irrelevant to CuPy JIT.
    (`test_stacking_low_n_all_invalid_witness.py`, 18 pass, CPU).
 9. **Error/OOM fallback** — `_stack_weighted_patches_gpu` falls back to this CPU path on any
    GPU error/OOM (`grid_mode:2098+`); if `_CUPY_AVAILABLE` false → CPU directly.
-10. **Evidence** — STATIC ACTIVE; low-N/all-invalid WITNESSED (CPU).
+10. **Evidence** — STATIC ACTIVE; low-N/all-invalid WITNESSED (CPU); mask/weight/alias/winsor_limits WITNESSED (`tests/test_grid_mask_weight_characterization.py`, SCI-03, `docs/refactor/SCI_03_GRID_MASK_WEIGHT_CHARACTERIZATION.md`).
 
 ## Row detail — Grid GPU (via `stack_core`)
 
@@ -241,7 +241,7 @@ irrelevant to CuPy JIT.
 9. **Error/OOM fallback** — `_stack_weighted_patches_gpu` catches GPU OOM/error →
    `_stack_weighted_patches` (CPU) (`grid_mode:2098+`); if `stack_core` is None → legacy GPU
    branch (next row).
-10. **Evidence** — STATIC ACTIVE; NOT_RUN (no GPU `stack_core` execution).
+10. **Evidence** — STATIC ACTIVE; physical GPU arithmetic NOT_RUN (no physical GPU `stack_core` execution); core-CPU-adapter route seam + 3 divergences WITNESSED (SCI-03, `tests/test_grid_mask_weight_characterization.py`).
 
 ## Row detail — Grid GPU (legacy fallback)
 
@@ -260,7 +260,7 @@ irrelevant to CuPy JIT.
    clipped `1e-6`).
 8. **dtype / axes / NaN-Inf / masks / low-N** — float32; empty valid positions → zero tile.
 9. **Error/OOM fallback** — same outer try/except → CPU `_stack_weighted_patches` (`:2098+`).
-10. **Evidence** — DORMANT (reachable only if `stack_core` import fails); NOT_RUN.
+10. **Evidence** — DORMANT (reachable only if `stack_core` import fails); physical GPU arithmetic NOT_RUN (NumPy-backed routing seam itself is exercised); mask/alias/winsor_limits ordering WITNESSED (SCI-03, `tests/test_grid_mask_weight_characterization.py`).
 
 ## Row detail — Phase 4.5 alpha-weighted direct branch
 
