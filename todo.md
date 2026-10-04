@@ -2,7 +2,23 @@
 
 ## Statut et autorisation
 
-**R2 SCOPE BORNÉ CLOS — R3 TECHNIQUE ACCEPTÉ — M106 SCIENCE ACCEPTÉ**, le 2026-10-04.
+**STATUT TERMINAL — R0–R3 CLOS / PROMOTED BETA+MAIN / TECHNICAL ACCEPT / HUMAN SCIENCE ACCEPT**, le 2026-10-04.
+
+La mission R0–R3 est **CLOS** et **promue** à travers `beta` puis `main`. Version **inchangée** (`4.7.0`) ; aucun bump/tag/release/déploiement. **Aucune action de refactor active ne subsiste** pour cette mission.
+
+Références et preuves de promotion (exactes) :
+
+- PR #420 refactor → beta : https://github.com/tinystork/zemosaic/pull/420 — merge `bbe63d4edc65d4d762a6d42e59081f6fe7130697`.
+- PR #421 Windows intertile safeguard → beta : https://github.com/tinystork/zemosaic/pull/421 — merge/current beta `14607d94342a308672b5be04d0db5a562fc564ab`.
+- PR #422 beta → main : https://github.com/tinystork/zemosaic/pull/422 — merge/current main `940655a7202568dad8dd8fa18ea5f12bfea284f8`.
+- `origin/main` et `origin/beta` diffèrent en commit ID mais ont des **arbres exactement identiques**.
+- Suite post-main en worktree détaché : **445 passed, 0 failed, 261 warnings**.
+- M106 : critère mécanique bitwise verrouillé `INCONCLUSIVE/HOLD` ; verdict humain/scientifique Tristan `ACCEPT` (2026-10-04 14:17 Europe/Paris). Distinction préservée.
+- Preuve incident Windows (domaine de crash, PAS la couche native exacte) : `/home/tristan/M106/faulthandler_intertile.log` — `0xc0000374`, exactement six ThreadPool workers dans `_process_overlap_pair -> reproject_interp`, stacks concentrés reproject/Astropy WCS, parent attend sur futures, OpenCV absent des stacks capturés.
+- Preuve mitigation Windows : `/home/tristan/M106/outwinsequential/` — workers 14→1, token `windows_reproject_wcs_serial`, mode séquentiel, 279/279 paires, 26/26 Phase 5, WORKER_DONE/run succès, artefacts FITS/preview ; intertile séquentiel ~144.1s sur 1570.1s de run complet.
+- Optimisation différée (NON implémentée) : élagage top-K séquentiel des paires. Pour la simulation M106, K=8 → 279→155 paires, graphe connecté, estimé linéaire ~144→80s. K=8 ne change PAS le compte workers Windows (toujours effective_workers=1 / aucun ThreadPool). Comparaison scientifique vs graphe complet requise. Backlog `PERF-01`, pas une feature complétée.
+
+Historique (archivé, inchangé) :
 
 Tristan a autorisé le lancement de la mission. R0 (archéologie + baseline ciblée)
 est terminé et accepté par Junior après revue indépendante Nono `review-3: ACCEPT`.
@@ -35,6 +51,21 @@ le 2026-10-04 à 14:17 Europe/Paris. Le dossier de preuve est conservé sous
 - [x] Rédiger l'audit R3 post-R2 + `FINAL_REPORT.md`.
 - [x] Obtenir l'acceptation R3 technique finale (Nono `review-0: ACCEPT` + Junior).
 - [x] Obtenir l'acceptation scientifique manuelle de Tristan sur M106 (`ACCEPT`, 2026-10-04 14:17 Europe/Paris).
+
+> Les puces `- ARCHIVAL/GATE —` qui suivent dans ce fichier sont des éléments historiques ou des gates réutilisables pour de futures missions bornées — **PAS des tâches actives** de la mission R0–R3 (close).
+
+## Backlog actif (missions séparées, non bloquantes)
+
+La mission R0–R3 est close. Les éléments ci-dessous sont des **missions distinctes** à lancer séparément ; aucun n'est implémenté ici.
+
+| Priorité | ID | Sujet | Posture |
+| --- | --- | --- | --- |
+| **P1 (recommandé)** | SCI-01 | Grid CPU / legacy WSC vs `stack_core` GPU simplifié — témoin/quantification numérique, sans correction groupée | mission séparée |
+| P2 | SCI-02 / SCI-03 / SCI-04 | dettes scientifiques (linear_fit placeholder ; masques/poids/all-invalid ; variantes Classic/SDS/Phase 4.5 low-N/chunking) | missions séparées |
+| P2 | ARCH-01/02/03/04/05 + SCI-07 | dettes architecture/inconnues/dormantes (invocations Phase 4.5, contrats externes/frozen, `cuda_utils` SUSPECTED DEAD, Tk legacy dormant, duplication SDS Classic, helpers affine 4.5 absents) | missions séparées |
+| P2 | TEST-02 | nettoyage script diagnostic `test_version_gpu.py` (0 items collectés) → vrai témoin ou renommage | mission séparée |
+| P3 | Plateforme/parité | parité distribution restante (macOS, frozen/PyInstaller/external solver plus large, CPU↔GPU) ; revendication Windows bornée au chemin standalone M106 observé | missions séparées |
+| P3 (différé) | PERF-01 | élagage top-K séquentiel K=8 (279→155 paires, graphe connecté, ~144→80s estimé) ; ne change PAS effective_workers=1 / aucun ThreadPool ; comparaison science vs graphe complet requise | différé, non implémenté |
 
 ## 1. Base canonique et branche
 
@@ -104,7 +135,7 @@ font partie du plan corrigé. Les numéros de ligne ci-dessous désignent BASE S
   mission. La carte du stacking et ses témoins doivent précéder une extraction,
   pas être découverts après R2.
   (STACKING_CONTRACTS_R3.md préliminaire créé)
-- [ ] **Définir une comparaison avant/après par chemin**, à entrées/config/environnement
+- ARCHIVAL/GATE — **Définir une comparaison avant/après par chemin**, à entrées/config/environnement
   identiques, distincte d'une comparaison CPU/GPU. Bit-identité lorsque déterministe;
   sinon tolérances explicites justifiées sur la baseline, définies AVANT changement,
   jamais élargies pour faire passer le candidat. Comparer masques et couverture
@@ -120,27 +151,27 @@ font partie du plan corrigé. Les numéros de ligne ci-dessous désignent BASE S
   collecte, warnings utiles et raisons. Vérifier les 11 imports plats avant de
   compter ces tests comme témoins; ne pas réintroduire d'alias produit pour eux.
   (isolé sous /tmp/zm-r0-home + /tmp/zm-r0-xdg ; 11 skips confirmés, cf. TEST-01)
-- [ ] **Préserver GUI → process → moteur** : valeurs et précédence des paramètres,
+- ARCHIVAL/GATE — **Préserver GUI → process → moteur** : valeurs et précédence des paramètres,
   pas seulement clés/signatures. Le wrapper renomme, parse, suffixe puis filtre
   silencieusement les kwargs via `inspect.signature` (`worker:36251` et suivantes).
   Exiger un témoin de propagation et un petit témoin process réel si cette zone bouge.
-- [ ] **Préserver concurrence/lifecycle** : `spawn`, objets picklables et chemins
+- ARCHIVAL/GATE — **Préserver concurrence/lifecycle** : `spawn`, objets picklables et chemins
   d'import, queues/protocoles, callbacks, globals/closures, initialisation CUDA,
   annulation/arrêt, nettoyage threads/process/memmap/FITS. Pas de passage fork↔spawn
   ni changement d'ordre des opérations/imports sous couvert de déplacement.
-- [ ] **Préserver les acquis 4.7.0** : WCS filtré transmis en mémoire, absence de
+- ARCHIVAL/GATE — **Préserver les acquis 4.7.0** : WCS filtré transmis en mémoire, absence de
   second solve, choix write-WCS respecté, annulation sans déplacement de source,
   fermeture du filtre et arrêt worker sans fallback scientifique involontaire.
-- [ ] **Préserver caches/reprise** : formats et signatures, paths, réutilisation de
+- ARCHIVAL/GATE — **Préserver caches/reprise** : formats et signatures, paths, réutilisation de
   master tiles, checkpoints Phase 1/5, invalidation et run repris vs neuf; pas de
   migration incidente ni effacement des artefacts de référence.
-- [ ] **Étendre la matrice distribution** : wheel installé hors checkout/CWD,
+- ARCHIVAL/GATE — **Étendre la matrice distribution** : wheel installé hors checkout/CWD,
   ressources et locales, PyInstaller/hiddenimports/hooks, lancement Windows/macOS/Linux,
   CPU sans CuPy et intégrations absentes. Une plateforme non testée reste NOT_RUN.
-- [ ] **Clarifier les STOP** : divergence CPU/GPU préexistante = geler la
+- ARCHIVAL/GATE — **Clarifier les STOP** : divergence CPU/GPU préexistante = geler la
   consolidation/parité concernée, documenter et continuer ailleurs; changement
   nouveau avant/après = bloquer le lot. Aucune correction scientifique incidente.
-- [ ] **Borner R2** après R0 : liste ordonnée de lots et critères mesurables validés
+- ARCHIVAL/GATE — **Borner R2** après R0 : liste ordonnée de lots et critères mesurables validés
   par Junior/Nono. Pas de promesse de finir le monolithe « dans la nuit », pas de
   nombre arbitraire de fichiers ou lignes. Limiter chaque correction à 3 REWORK.
 
@@ -223,14 +254,14 @@ le diff, pas toute la suite à chaque déplacement.
 | `tests/test_cupy_platform_guard.py`, `tests/test_version_gpu.py`, `tests/test_phase5_vram_budget.py`, `tests/test_resource_telemetry.py` | GPU optionnel, gardes CuPy/NVRTC, budgets et télémétrie (`test_version_gpu.py` reste un diagnostic sans test collecté) |
 | `tests/SMOKE_PROTOCOL_Windows_macOS.md` et garde CI Qt | Compléments plateforme, ne pas annoncer PASS sans exécution |
 
-- [ ] Compléter les trous : dispatch réel, paramètres aval, absence de Tk sur
+- ARCHIVAL/GATE — Compléter les trous : dispatch réel, paramètres aval, absence de Tk sur
   chemins officiels, cache/reprise, stacking petits tableaux et erreurs/fallbacks.
-- [ ] Préserver les différences existantes avec des tests de caractérisation;
+- ARCHIVAL/GATE — Préserver les différences existantes avec des tests de caractérisation;
   séparer une parité attendue mais fausse des gates de non-régression. Si xfail
   nécessaire : ciblé/strict, témoin d'échec et entrée SCIENCE, jamais xfail global.
-- [ ] Tests structurels déplacés : adapter leur localisation ou les remplacer par
+- ARCHIVAL/GATE — Tests structurels déplacés : adapter leur localisation ou les remplacer par
   un témoin comportemental équivalent avec revue; ne pas masquer un vrai échec.
-- [ ] Une validation globale consolidée à la fin d'un jalon significatif est utile;
+- ARCHIVAL/GATE — Une validation globale consolidée à la fin d'un jalon significatif est utile;
   pas de full suite répétitive après chaque petit diff.
 
 ## 7. R1 — supprimer seulement le code prouvé mort
@@ -244,12 +275,12 @@ aucun commit `refactor: remove ...`.
 
 Pour CHAQUE unité, checklist à copier dans son rapport :
 
-- [ ] Preuves R0 + revue Nono acceptées, contrats/packaging/compatibilité exclus.
-- [ ] Témoins ciblés avant modification, résultats conservés.
-- [ ] Petit diff mécanique; aucune refonte nécessaire.
-- [ ] Témoins après, `git diff --check`, inspection des fichiers inattendus.
-- [ ] Revue Nono du diff final, vérification indépendante Junior.
-- [ ] Commit local distinct `refactor: remove proven-dead <specific thing>`.
+- ARCHIVAL/GATE — Preuves R0 + revue Nono acceptées, contrats/packaging/compatibilité exclus.
+- ARCHIVAL/GATE — Témoins ciblés avant modification, résultats conservés.
+- ARCHIVAL/GATE — Petit diff mécanique; aucune refonte nécessaire.
+- ARCHIVAL/GATE — Témoins après, `git diff --check`, inspection des fichiers inattendus.
+- ARCHIVAL/GATE — Revue Nono du diff final, vérification indépendante Junior.
+- ARCHIVAL/GATE — Commit local distinct `refactor: remove proven-dead <specific thing>`.
 
 Ne pas présumer morts Classic legacy, filtre historique, Phase 4.5, wrapper,
 `_version.py`, modules CUDA « doublons », scripts de build ou diagnostics utilisés.
@@ -298,16 +329,16 @@ Ne pas implémenter ce lot ici (mission R3 baseline freeze).
 
 Pour CHAQUE extraction :
 
-- [ ] Identifier comportement exact, tous appelants/imports/monkeypatchs, globals,
+- ARCHIVAL/GATE — Identifier comportement exact, tous appelants/imports/monkeypatchs, globals,
   lifecycle et frontière proposée sans cycle ni dépendance lourde nouvelle.
-- [ ] Définir critère d'acceptation : responsabilité nommée/testable localement,
+- ARCHIVAL/GATE — Définir critère d'acceptation : responsabilité nommée/testable localement,
   contrat identique, dépendances connues; pas simple éclatement arbitraire.
-- [ ] Témoins avant; déplacer mécaniquement, conserver signatures/symboles/semantics
+- ARCHIVAL/GATE — Témoins avant; déplacer mécaniquement, conserver signatures/symboles/semantics
   lorsque nécessaires (shim/réexport seulement si justifié et testé).
-- [ ] Préserver ordre des calculs, structures, copies/vues et effets de bord.
-- [ ] Tests ciblés/import/process/package pertinents après, diff-check, revue Nono,
+- ARCHIVAL/GATE — Préserver ordre des calculs, structures, copies/vues et effets de bord.
+- ARCHIVAL/GATE — Tests ciblés/import/process/package pertinents après, diff-check, revue Nono,
   contrôle indépendant Junior; commit distinct après acceptation du diff exact.
-- [ ] Mettre à jour carte, témoins et ce TODO avant la tâche suivante.
+- ARCHIVAL/GATE — Mettre à jour carte, témoins et ce TODO avant la tâche suivante.
 
 Duplication : distinguer copie exacte, helper partagé, variante scientifique,
 compatibilité et comportement de mode. Consolider uniquement les vrais doublons
@@ -338,7 +369,7 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 
 | ID | Sujet | Statut initial / suite, hors corrections R0–R3 |
 | --- | --- | --- |
-| SCI-01 | Grid CPU / Grid GPU legacy appellent `_reject_outliers_winsorized_sigma_clip` SANS `wsc_impl` explicite → helper résout env/config/default et dispatche vers PixInsight WSC PAR DÉFAUT (`pixinsight`; env peut choisir `legacy_quantile`). GPU core `stack_core` winsorized = médian/σ simplifié (ni WSC, ni winsorization) | Divergence structurelle conservée (Grid CPU/legacy = WSC par défaut vs core = simplifié), impact numérique NOT_RUN ; kappa-sigma n'est PAS divergent sur GPU ; construire témoin reproductible, quantifier, ne pas corriger |
+| SCI-01 | Grid CPU / Grid GPU legacy appellent `_reject_outliers_winsorized_sigma_clip` SANS `wsc_impl` explicite → helper résout env/config/default et dispatche vers PixInsight WSC PAR DÉFAUT (`pixinsight`; env peut choisir `legacy_quantile`). GPU core `stack_core` winsorized = médian/σ simplifié (ni WSC, ni winsorization) | Divergence structurelle conservée (Grid CPU/legacy = WSC par défaut vs core = simplifié), impact numérique NOT_RUN ; kappa-sigma n'est PAS divergent sur GPU ; construire témoin reproductible, quantifier, ne pas corriger — **→ P1 recommandé next (mission séparée, sans correction groupée)** |
 | SCI-02 | Placeholder linear_fit dans core | Présent; Grid GPU passe none au core. Identifier tout caller effectif et distinguer normalisation/rejet |
 | SCI-03 | Masques/poids Grid CPU/GPU, all-invalid, aliases et winsor_limits | À caractériser : CPU masque les poids non positifs avant rejet; configuration transmise au core différente. Pas de conclusion de parité ni de correctif ici |
 | SCI-04 | Variantes Classic/SDS/Phase 4.5 / low-N / chunking | Différences à inventorier avant toute consolidation |
@@ -357,6 +388,7 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 | ARCH-05 | `run_hierarchical_mosaic_classic_legacy` contient son propre bloc de résolution SDS (`worker:23690-23715`) + helpers SDS partagés, en plus du dispatcher `run_hierarchical_mosaic` | Duplication à documenter avant toute extraction Classic/SDS ; ne pas consolider sans témoin |
 | ARCH-06 | `stack_core` réutilisé par Grid GPU ; `linear_fit` = placeholder médian ; winsorized GPU simplifié vs CPU établi | SCI-01/02 confirmés ; Grid GPU normalise en amont et passe `none` au core (`grid_mode:2012`) |
 | SCI-07 | Helpers Phase 4.5 `estimate_affine_photometry` / `apply_affine_photometry` / `micro_align_stack` ABSENTS à BASE | Runtime `hasattr` `False False False` ; gates `worker:7412-7414` éteignent micro-align/intra-group affine/legacy affine/global-affine inter-super (`:8034`,`:7701-7705`,`:7766`,`:8084`,`:8095`,`:8151-8154`,`:8865`) → DORMANT/UNREACHABLE, PAS PROVEN DEAD. Seule normalisation 4.5 ACTIVE = `linear_fit`/`sky_mean` pré-stack (`worker:8202-8290`) + gain-only inter-super post-stack (`:8622-8832`). Ne pas documenter comme couverture photométrique exécutée |
+| PERF-01 | Élagage top-K séquentiel des paires (Windows séquentiel) | DIFFÉRÉ / NON implémenté : pour la simulation M106, K=8 → 279→155 paires, graphe connecté, estimé linéaire ~144→80s. K=8 ne change PAS effective_workers=1 / aucun ThreadPool. Comparaison scientifique vs graphe complet requise avant toute activation. Backlog, pas une feature complétée. |
 
 Pour toute découverte ajouter : ID, SHA, chemin/caller, attendu vs observé,
 commande/témoin/artefacts, impact, raison de non-correction, prochain pas unique.
@@ -366,23 +398,23 @@ commande/témoin/artefacts, impact, raison de non-correction, prochain pas uniqu
 Junior dirige et accepte; Coco implémente des lots bornés, Nono révise indépendamment.
 Pas de délégation déclenchée par la seule présence de ce fichier.
 
-- [ ] Une mission_id stable par lot indépendant, rapports durables distincts par
+- ARCHIVAL/GATE — Une mission_id stable par lot indépendant, rapports durables distincts par
   itération sous `/home/tristan/.openclaw/workspace/.a2a-reports/`.
-- [ ] Coco neuf/reset seulement à la frontière d'une mission indépendante, après
+- ARCHIVAL/GATE — Coco neuf/reset seulement à la frontière d'une mission indépendante, après
   preuve d'inactivité; conserver son contexte pendant revue et REWORK (maximum 3).
   Un contexte Nono frais peut servir un lot indépendant, jamais effacer un actif.
-- [ ] Transport direct `sessions_send(timeoutSeconds=0)`, callback vers l'exact
+- ARCHIVAL/GATE — Transport direct `sessions_send(timeoutSeconds=0)`, callback vers l'exact
   `sourceSession` fourni par OpenClaw, rapport écrit avant callback, puis REPLY_SKIP;
   pas de polling, spawn natif ou attente synchrone Coco/Nono. Inclure le contrat
   intégral de callback des instructions workspace dans chaque délégation.
-- [ ] Junior vérifie dépôt/diff/tests/artefacts indépendamment; Nono ne modifie pas
+- ARCHIVAL/GATE — Junior vérifie dépôt/diff/tests/artefacts indépendamment; Nono ne modifie pas
   le dépôt lors d'une revue. Une revue R0 n'exempte pas les futurs diffs de revue.
-- [ ] Inspecter branche/HEAD/status avant et après chaque lot; préserver les
+- ARCHIVAL/GATE — Inspecter branche/HEAD/status avant et après chaque lot; préserver les
   changements tiers. Tout commit code/test : témoins, diff-check, revue Nono du
   diff exact avant commit; nouveau delta après revue = revue à compléter.
-- [ ] Commits locaux petits/réversibles : docs, témoin, suppression ou extraction
+- ARCHIVAL/GATE — Commits locaux petits/réversibles : docs, témoin, suppression ou extraction
   distincts. Pas de « cleanup everything », pas de réécriture d'historique.
-- [ ] Gates humaines : changement de périmètre/architecture fondamentale/API
+- ARCHIVAL/GATE — Gates humaines : changement de périmètre/architecture fondamentale/API
   supportée, retrait de fonctionnalité, migration destructive/dépendance majeure,
   publication. Aucun push/merge/tag/release autorisé par cette mission.
 

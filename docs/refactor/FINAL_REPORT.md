@@ -323,3 +323,61 @@ Final M106 project gate: **HUMAN SCIENCE ACCEPT**. This does not authorize publi
 - This report is a docs-only artifact; it cannot self-reference its own commit SHA.
 - All observed facts above are reproduced from live git/pytest/wheel evidence; unverified
   hypotheses are labelled UNKNOWN/NOT_RUN.
+
+---
+
+## 16. Post-report promotion and Windows closure addendum — 2026-10-04
+
+> **Operationally supersedes** the earlier publication gate / next-step state in §13–§14.
+> Sections 1–15 remain the historical audit-time report and are **not** rewritten. Statements
+> that publication was not yet authorized were true at audit time; the promotion below is a
+> separate, later product-owner action and does not retcon those statements.
+
+### Terminal mission status
+
+**R0–R3 CLOSED / TECHNICAL ACCEPT / HUMAN SCIENCE ACCEPT / PROMOTED MAIN+BETA.** The locked
+mechanical bitwise result remains `INCONCLUSIVE/HOLD`; Tristan's human/scientific verdict is
+`ACCEPT` (2026-10-04 14:17 Europe/Paris). This distinction is preserved.
+
+### Promotion references (exact)
+
+| Item | Ref / SHA |
+| --- | --- |
+| PR #420 refactor → beta | https://github.com/tinystork/zemosaic/pull/420 — merge `bbe63d4edc65d4d762a6d42e59081f6fe7130697` |
+| PR #421 Windows intertile safeguard → beta | https://github.com/tinystork/zemosaic/pull/421 — merge/current beta `14607d94342a308672b5be04d0db5a562fc564ab` |
+| PR #422 beta → main | https://github.com/tinystork/zemosaic/pull/422 — merge/current main `940655a7202568dad8dd8fa18ea5f12bfea284f8` |
+| Version | `4.7.0` (unchanged; no bump) |
+| Tree equality | `origin/main` and `origin/beta` commit IDs differ; trees are **exactly identical** |
+
+### Runtime and test facts
+
+- Post-main detached-worktree suite: **445 passed, 0 failed, 261 warnings**.
+- No tag, release, deployment, or version bump was performed.
+- **Windows incident proof (bounded conclusion):** `/home/tristan/M106/faulthandler_intertile.log`
+  records `0xc0000374` with exactly six ThreadPool workers in `_process_overlap_pair -> reproject_interp`;
+  captured worker stacks concentrate in reproject/Astropy WCS; parent waits on futures; OpenCV is
+  absent from the captured worker stacks. This proves the crash **domain** (intertile reprojection
+  under concurrency) — **not** the exact defective native layer, **nor** that a shared WCS identity
+  is the necessary cause.
+- **Windows mitigation proof:** `/home/tristan/M106/outwinsequential/` logs workers 14→1, token
+  `windows_reproject_wcs_serial`, sequential mode, 279/279 pairs, 26/26 Phase 5, WORKER_DONE/run
+  success, FITS/preview artifacts. Intertile sequential ~144.1s of the 1570.1s full run.
+
+### Remaining backlog (separate, non-blocking missions)
+
+Nothing below is implemented as part of this closure.
+
+- **SCI-01 (P1, recommended next)** — numerical Grid CPU/legacy WSC vs GPU `stack_core` simplified
+  witness/quantification; no correction bundled.
+- **SCI-02 / SCI-03 / SCI-04** — scientific debts (linear_fit placeholder; Grid CPU/GPU masks/
+  weights/all-invalid/aliases; Classic/SDS/Phase 4.5 low-N/chunking variants).
+- **ARCH-01/02/03/04/05 + SCI-07** — architecture/unknown/dormant debts.
+- **TEST-02** — diagnostic-script cleanup (`test_version_gpu.py`).
+- **Platform/distribution parity** — macOS, broader frozen/PyInstaller/external solver, CPU↔GPU;
+  Windows claim is bound to the observed standalone M106 path.
+- **PERF-01 (deferred)** — sequential top-K pair pruning; K=8 → 279→155 pairs, graph connected,
+  ideal linear estimate ~144→80s. K=8 MUST NOT change the Windows worker count (still
+  effective_workers=1 / no ThreadPool). Not implemented/active; requires science comparison
+  against the full graph.
+
+No CPU/GPU parity, macOS qualification, bitwise science identity, or dead-code proof is claimed.
