@@ -530,6 +530,48 @@ Witnessed formats/semantics (2026-10-04, mission ZM-ARCH-WITNESS-CACHE-RESUME-20
   `_tile_progress_callback` (`:16209`), `_touch_progress` (`:16178`).
 - Mode: CPU. Risk: low-medium — protocol/order must be preserved across any worker split.
 
+Witnessed formats/semantics (2026-10-04, mission ZM-ARCH-R2-LOT2A-CRASH-BREADCRUMB-WITNESS-20261004;
+`tests/test_crash_breadcrumbs_characterization_witness.py`, 47 pass/0 skip, CPU-only, no GPU required):
+- `_configure_crash_breadcrumbs` (`:164`): valid modes `always`/`errors_only` set exact
+  paths `<out>/worker_crash_breadcrumbs.jsonl` + `<out>/worker_last_state.json` and create the
+  output directory (`mkdir(parents=True, exist_ok=True)`); mode `off` clears both paths and does
+  **not** create the directory; an invalid mode string falls back to `always`; `None`/empty output
+  clears paths; a best-effort failure (e.g. `str(output)` raising) clears paths without raising;
+  the three module globals (`_CRASH_BREADCRUMB_PATH`, `_CRASH_STATE_PATH`, `_CRASH_BREADCRUMB_MODE`)
+  remain directly observable after configuration.
+- `_safe_runtime_snapshot` (`:189`): always emits `pid`/`ppid`/`ts_unix`; psutil RAM fields
+  (`ram_used_mb`/`ram_total_mb`/`ram_pct`, derived via `getattr` defaults / (1024²)) appear when
+  `psutil.virtual_memory()` works and are **absent (fail-open)** when it raises; GPU fields
+  (`gpu_used_mb`/`gpu_total_mb`/`gpu_free_mb`) are **absent at BASE** because `zemosaic_utils`
+  has no `get_gpu_vram_info` (`hasattr` False), appear when a fake helper is patched in, and are
+  **absent (fail-open)** when the GPU probe raises.
+- `_emit_crash_breadcrumb` (`:224`): appends one `json.dumps(..., default=str)` line to the JSONL
+  and **replaces** the last-state JSON; record = `event` + `iso` (`datetime.utcnow().isoformat()+"Z"`)
+  + snapshot + payload (payload overrides snapshot keys — witnessed via `pid`/`ppid`/`ts_unix` override);
+  `errors_only` filters on whether the uppercased event string **contains** ERROR/EXCEPTION/CRASH as
+  substrings (case-insensitive; e.g. `WORKER_ERROR_X`, `foo_exception_bar`, `preCRASHpost` pass, and
+  near-misses `ERR`/`EROR`/`EXCEPTON`/`CRSH` do not) **before** the no-path check; `off`/no-paths is a no-op;
+  individual JSONL/state write failures (independent — one surviving while the other fails — and
+  simultaneous) and an outer lock failure are all swallowed.
+- Concurrency/lock: 8 threads × 25 events → 200 valid, non-interleaved JSONL lines and a valid
+  complete last-state record (single `_CRASH_BREADCRUMB_LOCK` serializes both writes).
+- `run_hierarchical_mosaic_process` lifecycle (in-process, scientific runner monkeypatched + queue
+  double): mode `off` → no files/thread, queue `[PROCESS_DONE]` only; `always` → JSONL
+  `[WORKER_START, WORKER_DONE]` (`WORKER_DONE` carries `graceful_stop=False`), the `ZeMosaicCrashHB`
+  heartbeat thread is started during the run and terminates afterward, and SIGTERM/SIGINT handlers
+  are restored; a controlled exception → JSONL `[WORKER_START, WORKER_EXCEPTION, WORKER_DONE]`
+  (`WORKER_EXCEPTION` carries `error`+`traceback`), queue `[PROCESS_ERROR, PROCESS_DONE]` with
+  `PROCESS_ERROR` carrying `error`/`breadcrumb_path`/`last_state_path`; `errors_only` suppresses the
+  non-error lifecycle (only `WORKER_EXCEPTION` on error; no files on a clean run) and never starts
+  the heartbeat thread. `_sanitize_spawned_process_logging` is a no-op in the main process (returns
+  early when `current_process().name == "MainProcess"`).
+- Heartbeat cadence: witnessed with a **bounded event** (no arbitrary sleep) — `WORKER_HEARTBEAT`
+  is emitted between `WORKER_START` and `WORKER_DONE`, interval clamped `max(0.5, heartbeat_sec)`;
+  only existence+ordering are witnessed, not precise cadence under load.
+- NOT_RUN (not witnessed): precise heartbeat cadence/timing under load, physical GPU probing
+  (patched fakes only), real `spawn` with crash mode on, a successful scientific run,
+  Windows/macOS filesystem/process semantics.
+
 ### 7.8 Resource / GPU planning and cleanup
 
 - VRAM budget: `_compute_phase5_vram_budget_bytes` (`:4179`).
