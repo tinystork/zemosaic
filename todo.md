@@ -60,8 +60,9 @@ La mission R0–R3 est close. Les éléments ci-dessous sont des **missions dist
 
 | Priorité | ID | Sujet | Posture |
 | --- | --- | --- | --- |
-| **P1 (recommandé)** | SCI-01 | Grid CPU / legacy WSC vs `stack_core` GPU simplifié — témoin/quantification numérique, sans correction groupée | mission séparée |
-| P2 | SCI-02 / SCI-03 / SCI-04 | dettes scientifiques (linear_fit placeholder ; masques/poids/all-invalid ; variantes Classic/SDS/Phase 4.5 low-N/chunking) | missions séparées |
+| **CLOS** | SCI-01 | Grid CPU / legacy WSC vs `stack_core` GPU simplifié — témoin/quantification numérique, sans correction groupée | **FAIT** (ZM-SCI-01-GRID-WSC-CHAR-20261004) — CLOS-NO-FIX, voir ligne SCI-01 §10 |
+| **P1 (recommandé)** | SCI-02 | Placeholder `linear_fit` dans `stack_core` — caractérisation seule (callers effectifs ; distinguer normalisation vs rejet), sans correction groupée | mission séparée |
+| P2 | SCI-03 / SCI-04 | dettes scientifiques (masques/poids/all-invalid ; variantes Classic/SDS/Phase 4.5 low-N/chunking) | missions séparées |
 | P2 | ARCH-01/02/03/04/05 + SCI-07 | dettes architecture/inconnues/dormantes (invocations Phase 4.5, contrats externes/frozen, `cuda_utils` SUSPECTED DEAD, Tk legacy dormant, duplication SDS Classic, helpers affine 4.5 absents) | missions séparées |
 | P2 | TEST-02 | nettoyage script diagnostic `test_version_gpu.py` (0 items collectés) → vrai témoin ou renommage | mission séparée |
 | P3 | Plateforme/parité | parité distribution restante (macOS, frozen/PyInstaller/external solver plus large, CPU↔GPU) ; revendication Windows bornée au chemin standalone M106 observé | missions séparées |
@@ -369,7 +370,7 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 
 | ID | Sujet | Statut initial / suite, hors corrections R0–R3 |
 | --- | --- | --- |
-| SCI-01 | Grid CPU / Grid GPU legacy appellent `_reject_outliers_winsorized_sigma_clip` SANS `wsc_impl` explicite → helper résout env/config/default et dispatche vers PixInsight WSC PAR DÉFAUT (`pixinsight`; env peut choisir `legacy_quantile`). GPU core `stack_core` winsorized = médian/σ simplifié (ni WSC, ni winsorization) | Divergence structurelle conservée (Grid CPU/legacy = WSC par défaut vs core = simplifié), impact numérique NOT_RUN ; kappa-sigma n'est PAS divergent sur GPU ; construire témoin reproductible, quantifier, ne pas corriger — **→ P1 recommandé next (mission séparée, sans correction groupée)** |
+| SCI-01 | Grid CPU / Grid GPU legacy appellent `_reject_outliers_winsorized_sigma_clip` SANS `wsc_impl` explicite → helper résout env/config/default et dispatche vers PixInsight WSC PAR DÉFAUT (`pixinsight`; env peut choisir `legacy_quantile`). GPU core `stack_core` winsorized = médian/σ simplifié (ni WSC, ni winsorization) | **CARACTÉRISÉ / CLOS-NO-FIX** (mission ZM-SCI-01-GRID-WSC-CHAR-20261004) : divergence conservée ET quantifiée — Grid CPU/legacy = WSC PixInsight par défaut vs core = médian/σ simplifié. Preuve dynamique : `tests/test_grid_wsc_characterization.py` (26 pass/0 skip) + `docs/refactor/SCI_01_GRID_WSC_CHARACTERIZATION.md` (matrice numérique : delta abs 0.25→20.0 selon corpus). Kappa-sigma n'est PAS divergent sur GPU ; GPU physique NOT_RUN (seams hermétiques fake-CuPy uniquement, pas de parité CPU↔GPU). Aucune correction ; toute décision scientifique (unifier `stack_core` sur PixInsight après qualification GPU physique, ou exposer une politique Grid explicite) reste un gate humain. |
 | SCI-02 | Placeholder linear_fit dans core | Présent; Grid GPU passe none au core. Identifier tout caller effectif et distinguer normalisation/rejet |
 | SCI-03 | Masques/poids Grid CPU/GPU, all-invalid, aliases et winsor_limits | À caractériser : CPU masque les poids non positifs avant rejet; configuration transmise au core différente. Pas de conclusion de parité ni de correctif ici |
 | SCI-04 | Variantes Classic/SDS/Phase 4.5 / low-N / chunking | Différences à inventorier avant toute consolidation |

@@ -424,7 +424,9 @@ The normalization/photometry data-flow is five labeled steps in exact order:
     delegates to WSC by default).
   - **`stack_core` winsorized_sigma_clip is NOT WSC and NOT winsorization** — it is a
     simplified median/σ clip (`stack_core:325-333`). Structural divergence from Grid CPU
-    (SCI-01); numeric impact unmeasured. Grid is not a *stack_core*-level WSC consumer.
+    (SCI-01); numeric impact CHARACTERIZED/MEASURED (no fix) — see
+    `SCI_01_GRID_WSC_CHARACTERIZATION.md` + `tests/test_grid_wsc_characterization.py`
+    (mission ZM-SCI-01-GRID-WSC-CHAR-20261004). Grid is not a *stack_core*-level WSC consumer.
 - **Linear-fit clip** (`linear_fit_clip`): wrapper `stack_linear_fit_clip` (`:2526`) →
   GPU `gpu_stack_linear` (median-residual clip, `:1695`) or CPU `cpu_stack_linear` (external
   Seestar) / `_cpu_stack_linear_fallback` (`:5511`, median-residual clip). **Note:**
