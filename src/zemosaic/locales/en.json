@@ -889,5 +889,9 @@
   "winsor_workers_label": "Winsor worker limit:",
   "winsor_workers_note": "(1-16, per-channel rejection)",
   "worker_module_missing_critical_error": "Worker module (zemosaic_worker.py) not found or import error.\nZeMosaic cannot start its main functionalities.\n\nPlease check console logs for import error details and ensure all dependencies (Astropy, Reproject, etc.) are installed.",
-  "worker_module_unavailable_error": "Worker module (zemosaic_worker.py) is not available or incomplete.\nCannot start processing."
+  "worker_module_unavailable_error": "Worker module (zemosaic_worker.py) is not available or incomplete.\nCannot start processing.",
+  "stacking_coverage_support_taper_label": "Coverage support taper",
+  "stacking_coverage_support_taper_note": "Smoothly fades stacking support at the coverage boundary (footprint taper).",
+  "stacking_coverage_reconstruction_label": "Coverage-aware reconstruction",
+  "stacking_coverage_reconstruction_note": "Preview coverage-aware final reconstruction (OFF by default)."
 }

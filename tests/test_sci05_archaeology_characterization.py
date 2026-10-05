@@ -641,9 +641,9 @@ class TestGlobalCoaddDispatch:
 class TestCoverageProvenanceGaps:
     def test_no_support_or_coverage_render_domain(self):
         # Gate A snapshot recorded the support/taper and coverage-render domains as
-        # absent. Gate E1 (support/taper) and Gate E3 (preview-only render) now
-        # provide these in the bounded canonical modules, while the coverage
-        # render/config and support_taper symbols remain absent pending later gates.
+        # absent. Gates E1/E3/E5a now provide core/canonical_support.py,
+        # core/canonical_render.py, and the coverage_support_taper setting; the
+        # render/config execution tokens remain absent pending later gates.
 
         def _scan(token):
             found = []
@@ -656,21 +656,21 @@ class TestCoverageProvenanceGaps:
                     found.append(str(py.relative_to(_SRC)))
             return found
 
-        # (1) Support/taper + render tokens now PRESENT (Gate E1/E3), each
-        # specifically in its bounded, documented canonical module (presence
-        # elsewhere is not sufficient; the assertion fails if a symbol disappears).
+        # (1) Support/taper + render + settings tokens now PRESENT (Gate E1/E3/E5a),
+        # each specifically in its bounded, documented module (presence elsewhere is
+        # not sufficient; the assertion fails if a symbol disappears).
         present = {
             "make_footprint_taper": "core/canonical_support.py",
             "PositiveSupportAccumulator": "core/canonical_support.py",
             "N_eff_support": "core/canonical_support.py",
             "coverage_aware_render": "core/canonical_render.py",
+            "support_taper": "zemosaic_config.py",  # coverage_support_taper (decision K)
         }
         for token, module in present.items():
             found = _scan(token)
             assert module in found, f"{token!r} not in {module}; found in {found}"
 
-        # (2) Coverage render/config tokens still ABSENT (later gates).
-        for token in ("support_taper", "apply_coverage_render",
-                      "COVERAGE_RENDER_RESULT", "COVERAGE_CONFIG"):
+        # (2) Coverage render/config execution tokens still ABSENT (later gates).
+        for token in ("apply_coverage_render", "COVERAGE_RENDER_RESULT", "COVERAGE_CONFIG"):
             found = _scan(token)
             assert not found, f"{token!r} unexpectedly present in {found}"

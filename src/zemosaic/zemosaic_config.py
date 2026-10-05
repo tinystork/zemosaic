@@ -154,6 +154,14 @@ DEFAULT_CONFIG = {
     "sds_enable_final_rgb_equalize": False,
     "sds_final_rgb_equalize_gain_clip": [0.95, 1.05],
     "sds_enable_final_black_point_equalize": False,
+    # --- Canonical Coverage settings (SCI-05, decision K) ---
+    # Support taper ON / coverage-aware reconstruction OFF (Tristan's fresh target).
+    # Internal taper params (8.0 px / 0.0 floor) stay internal canonical defaults,
+    # never exposed as new config/GUI knobs.
+    "coverage_support_taper": True,
+    "coverage_aware_reconstruction": False,
+    # Legacy radial-weighting keys (DEPRECATED — the canonical Coverage path never
+    # reads them; kept for backward readability only).
     "apply_radial_weight": False,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
@@ -790,6 +798,47 @@ def _sync_path_aliases(config_obj: dict) -> dict:
 
     return config_obj
 
+# --- SCI-05 canonical Coverage settings + legacy radial migration (decision K) ---
+
+_COVERAGE_SUPPORT_TAPER = "coverage_support_taper"
+_COVERAGE_AWARE_RECONSTRUCTION = "coverage_aware_reconstruction"
+_LEGACY_APPLY_RADIAL_WEIGHT = "apply_radial_weight"
+
+
+def migrate_coverage_settings(config):
+    """Migrate legacy radial-weighting settings to the canonical Coverage settings.
+
+    Pure and deterministic; never mutates the caller's dict. Returns
+    ``(migrated_config, notes)`` where ``migrated_config`` is a shallow copy and
+    ``notes`` is a bounded list of short strings (no array dumps).
+
+    Decision K semantics:
+    * ``coverage_support_taper`` → ``True`` and ``coverage_aware_reconstruction``
+      → ``False`` for **both** legacy ``apply_radial_weight=True`` and ``=False``;
+    * the legacy radial path is marked **inert** by forcing
+      ``apply_radial_weight=False``;
+    * ``radial_feather_fraction`` / ``min_radial_weight_floor`` /
+      ``radial_shape_power`` values are **never** read or mapped to the internal
+      taper px/floor (which stay 8.0 / 0.0 and are not config-exposed);
+    * unrelated keys are untouched; idempotent (no duplicate notes on re-run).
+    """
+    if not isinstance(config, dict):
+        return config, []
+    cfg = dict(config)
+    notes = []
+
+    if cfg.get(_COVERAGE_SUPPORT_TAPER) is not True:
+        cfg[_COVERAGE_SUPPORT_TAPER] = True
+        notes.append("coverage_support_taper:default_on")
+    if cfg.get(_COVERAGE_AWARE_RECONSTRUCTION) is not False:
+        cfg[_COVERAGE_AWARE_RECONSTRUCTION] = False
+        notes.append("coverage_aware_reconstruction:default_off")
+    if cfg.get(_LEGACY_APPLY_RADIAL_WEIGHT) is not False:
+        cfg[_LEGACY_APPLY_RADIAL_WEIGHT] = False
+        notes.append("legacy_radial:inert")
+
+    return cfg, notes
+
 def load_config():
     config_path = Path(get_config_path())
     try:
@@ -876,6 +925,9 @@ def load_config():
     current_config["altaz_alpha_sidecar_format"] = fmt_val
 
     _sync_path_aliases(current_config)
+    # SCI-05 canonical Coverage settings + legacy radial migration (non-breaking:
+    # only touches coverage/radial keys; unrelated keys preserved).
+    current_config, _coverage_migration_notes = migrate_coverage_settings(current_config)
     return current_config
 
 def save_config(config_data):

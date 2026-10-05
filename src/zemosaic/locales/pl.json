@@ -842,5 +842,9 @@
     "qt_field_theme_mode": "Tryb tematyczny",
     "qt_theme_option_system": "Domyślne systemowe",
     "qt_theme_option_dark": "Ciemny",
-    "qt_theme_option_light": "Światło"
+    "qt_theme_option_light": "Światło",
+    "stacking_coverage_support_taper_label": "Coverage support taper",
+    "stacking_coverage_support_taper_note": "Smoothly fades stacking support at the coverage boundary (footprint taper).",
+    "stacking_coverage_reconstruction_label": "Coverage-aware reconstruction",
+    "stacking_coverage_reconstruction_note": "Preview coverage-aware final reconstruction (OFF by default)."
 }
