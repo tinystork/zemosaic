@@ -640,14 +640,32 @@ class TestGlobalCoaddDispatch:
 
 class TestCoverageProvenanceGaps:
     def test_no_support_or_coverage_render_domain(self):
-        # Current ZeMosaic has no positive-support domain, no footprint taper, and
-        # no coverage-aware render — the donor's COV-01..04 symbols are absent.
+        # Gate A snapshot recorded the support/taper domain as absent. Gate E1
+        # (donor-exact port) now provides make_footprint_taper and the
+        # positive-support accumulator in core/canonical_support.py, while the
+        # coverage render/config domain remains absent pending Gate E2.
+
+        # (1) Support/taper tokens now PRESENT (Gate E1), specifically in the
+        # bounded, documented canonical support module: presence elsewhere is not
+        # sufficient, presence in core/canonical_support.py is required (and the
+        # assertion fails if the symbols disappear).
+        for token in ("make_footprint_taper", "PositiveSupportAccumulator", "N_eff_support"):
+            found = []
+            for py in sorted(_SRC.rglob("*.py")):
+                try:
+                    text = py.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                if token in text:
+                    found.append(str(py.relative_to(_SRC)))
+            assert "core/canonical_support.py" in found, (
+                f"{token!r} not in core/canonical_support.py; found in {found}"
+            )
+
+        # (2) Coverage render/config tokens still ABSENT (Gate E2 not implemented).
         absent = (
-            "make_footprint_taper",
-            "PositiveSupportAccumulator",
             "support_taper",
             "apply_coverage_render",
-            "N_eff_support",
             "COVERAGE_RENDER_RESULT",
             "COVERAGE_CONFIG",
         )
