@@ -2,11 +2,13 @@
 
 Pure CPU, deterministic, backend-neutral primitives implementing the frozen
 SCI-05 contract (``docs/science/SCI05_CANONICAL_STACKING_CONTRACT.md``) for the
-**normalization and scalar quality weighting stages**. This is **Gate B1**
-(canonical input validation, reference selection, per-frame normalization) and
-**Gate B2** (scalar quality weighting ``none``/``noise_variance``/``noise_fwhm``).
-Rejection/combine (Gate C) and coverage support/taper are explicitly out of
-scope here and are assembled by later gates.
+**normalization and scalar quality weighting stages**, plus the **Gate C1**
+canonical rejection primitives (``none``/``kappa_sigma``/
+``winsorized_sigma_clip``). This is **Gate B1** (canonical input validation,
+reference selection, per-frame normalization), **Gate B2** (scalar quality
+weighting ``none``/``noise_variance``/``noise_fwhm``) and **Gate C1** (rejection
+only; combine is Gate C2). Coverage support/taper and combine are explicitly out
+of scope here and are assembled by later gates.
 
 Design invariants
 -----------------
@@ -27,9 +29,10 @@ Public API
 ----------
 ``prepare_canonical_inputs``, ``select_canonical_reference``,
 ``normalize_canonical_images``, ``compute_canonical_quality_weights``,
-``canonical_noise_fwhm_available`` plus the frozen dataclasses
-``CanonicalInputBatch`` / ``CanonicalNormalizationResult`` /
-``CanonicalWeightingResult`` and ``FrameExclusion``.
+``reject_canonical_samples``, ``canonical_noise_fwhm_available`` plus the frozen
+dataclasses ``CanonicalInputBatch`` / ``CanonicalNormalizationResult`` /
+``CanonicalWeightingResult`` / ``CanonicalRejectionResult`` and
+``FrameExclusion``.
 """
 
 from __future__ import annotations
@@ -60,10 +63,12 @@ __all__ = [
     "CanonicalInputBatch",
     "CanonicalNormalizationResult",
     "CanonicalWeightingResult",
+    "CanonicalRejectionResult",
     "prepare_canonical_inputs",
     "select_canonical_reference",
     "normalize_canonical_images",
     "compute_canonical_quality_weights",
+    "reject_canonical_samples",
     "canonical_noise_fwhm_available",
 ]
 
@@ -1067,6 +1072,375 @@ def compute_canonical_quality_weights(
         height=normalization.height,
         width=normalization.width,
         channels=normalization.channels,
+        original_ndim=normalization.original_ndim,
+        original_shape=normalization.original_shape,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate C1: canonical rejection primitives
+# ---------------------------------------------------------------------------
+
+_METHOD_REJECT_NONE = "none"
+_METHOD_REJECT_KAPPA_SIGMA = "kappa_sigma"
+_METHOD_REJECT_WSC = "winsorized_sigma_clip"
+_SUPPORTED_REJECT_METHODS = (
+    _METHOD_REJECT_NONE,
+    _METHOD_REJECT_KAPPA_SIGMA,
+    _METHOD_REJECT_WSC,
+)
+_REJECT_TOKEN_REMOVED = "unsupported_removed_sci05"
+
+_REJECT_DEFAULT_SIGMA_LOW = 3.0
+_REJECT_DEFAULT_SIGMA_HIGH = 3.0
+_REJECT_DEFAULT_MAX_ITERS = 5
+_REJECT_DEFAULT_WINSOR_LOW = 0.05
+_REJECT_DEFAULT_WINSOR_HIGH = 0.05
+
+
+@dataclass(frozen=True)
+class CanonicalRejectionResult:
+    """Deterministic output of :func:`reject_canonical_samples`.
+
+    Attributes
+    ----------
+    survivor_mask:
+        Owned contiguous ``(N, H, W, C)`` bool; True only for original
+        normalized valid samples from B2-active frames that survive rejection.
+    rejection_mask:
+        Owned contiguous ``(N, H, W, C)`` bool; True exactly for initially-valid
+        active samples rejected by the canonical algorithm; never marks prior
+        invalid/inactive samples.
+    active_frames:
+        Owned ``(N,)`` bool inherited from weighting (rejection never globally
+        excludes frames).
+    reference_index:
+        Chosen normalization reference frame index (identity).
+    requested_method / effective_method:
+        Rejection method token; always equal (validation errors raise instead of
+        falling back).
+    sigma_low / sigma_high / max_iters / winsor_limit_low / winsor_limit_high:
+        Exact validated parameters (winsor limits retained but unused for the
+        ``none``/``kappa_sigma`` methods).
+    iterations_used:
+        ``0`` for ``none``; otherwise the number of loop passes executed.
+    initial_sample_count / surviving_sample_count / rejected_sample_count:
+        Exact integer sample counts over ``(N, H, W, C)``.
+    rejected_fraction:
+        ``rejected / initial``, or ``0.0`` when ``initial == 0``.
+    low_n_cell_count:
+        Number of distinct cells whose INITIAL active-valid count is ``< 3``
+        (each cell counted once; includes 0/1/2).
+    degenerate_cell_count:
+        Number of distinct cells encountering finite ``std <= 0`` in at least one
+        executed iteration (counted once, not per iteration; ``0`` for ``none``).
+    exclusions:
+        Inherited ``FrameExclusion`` records (B1 + B2).
+    original_mono / n_frames / height / width / channels / original_ndim /
+    original_shape:
+        Output shape metadata for downstream restoration (Gate C2).
+    """
+
+    survivor_mask: np.ndarray
+    rejection_mask: np.ndarray
+    active_frames: np.ndarray
+    reference_index: int
+    requested_method: str
+    effective_method: str
+    sigma_low: float
+    sigma_high: float
+    max_iters: int
+    winsor_limit_low: float
+    winsor_limit_high: float
+    iterations_used: int
+    initial_sample_count: int
+    surviving_sample_count: int
+    rejected_sample_count: int
+    rejected_fraction: float
+    low_n_cell_count: int
+    degenerate_cell_count: int
+    exclusions: tuple
+    original_mono: bool
+    n_frames: int
+    height: int
+    width: int
+    channels: int
+    original_ndim: int
+    original_shape: tuple
+
+
+def _validate_reject_sigma(value, name: str) -> float:
+    if isinstance(value, bool):
+        raise CanonicalStackValidationError(f"{name} must be a real number, not bool")
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        raise CanonicalStackValidationError(
+            f"{name} must be a real number, got {type(value).__name__}"
+        )
+    f = float(value)
+    if not np.isfinite(f) or not (f > 0.0):
+        raise CanonicalStackValidationError(f"{name} must be finite and > 0, got {value!r}")
+    return f
+
+
+def _validate_winsor_limit(value, name: str) -> float:
+    if isinstance(value, bool):
+        raise CanonicalStackValidationError(f"{name} must be a real number, not bool")
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        raise CanonicalStackValidationError(
+            f"{name} must be a real number, got {type(value).__name__}"
+        )
+    f = float(value)
+    if not np.isfinite(f) or not (0.0 <= f < 0.5):
+        raise CanonicalStackValidationError(f"{name} must be finite in [0, 0.5), got {value!r}")
+    return f
+
+
+def _validate_max_iters(value) -> int:
+    if isinstance(value, bool):
+        raise CanonicalStackValidationError("max_iters must be an integer, not bool")
+    try:
+        i = operator.index(value)
+    except TypeError:
+        raise CanonicalStackValidationError(
+            f"max_iters must be an integer, got {type(value).__name__}"
+        )
+    if not (1 <= i <= 5):
+        raise CanonicalStackValidationError(f"max_iters must be in 1..5, got {i}")
+    return i
+
+
+def _nan_axis_median(a):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmedian(a, axis=0)
+
+
+def _nan_axis_mean(a):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmean(a, axis=0)
+
+
+def _nan_axis_popstd(a):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanstd(a, axis=0)
+
+
+def _nan_axis_quantile(a, q):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanquantile(a, q, axis=0, method="linear")
+
+
+def _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high):
+    """Return ``(keep, degenerate)`` for one iteration over the ``N`` axis.
+
+    ``orig2`` is ``(N, M)`` float64 original normalized samples; ``center`` and
+    ``std`` are ``(M,)``; ``active`` is ``(M,)`` bool (current N >= 3). For
+    active cells ``keep`` is the inclusive asymmetric sigma interval test applied
+    to the ORIGINAL samples (degenerate ``std <= 0`` uses the zero-width equality
+    test at ``center``); inactive cells are frozen (``keep`` all-True).
+    """
+    lower = center - sigma_low * std
+    upper = center + sigma_high * std
+    interval = (orig2 >= lower[np.newaxis, :]) & (orig2 <= upper[np.newaxis, :])
+    degenerate = (std <= 0.0) & active
+    equality = orig2 == center[np.newaxis, :]
+    keep = np.where(degenerate[np.newaxis, :], equality, interval)
+    keep = np.where(active[np.newaxis, :], keep, True)
+    return keep, degenerate
+
+
+def _kappa_sigma_step(orig2, survivor2, count, sigma_low, sigma_high):
+    active = count >= 3
+    masked = np.where(survivor2, orig2, np.nan)
+    center = _nan_axis_median(masked)
+    std = _nan_axis_popstd(masked)
+    keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high)
+    return survivor2 & keep, degenerate
+
+
+def _winsorized_sigma_clip_step(
+    orig2, survivor2, count, sigma_low, sigma_high, winsor_low, winsor_high
+):
+    active = count >= 3
+    masked = np.where(survivor2, orig2, np.nan)
+    q_low = _nan_axis_quantile(masked, winsor_low)
+    q_high = _nan_axis_quantile(masked, 1.0 - winsor_high)
+    winsor = np.clip(masked, q_low[np.newaxis, :], q_high[np.newaxis, :])
+    center = _nan_axis_mean(winsor)
+    std = _nan_axis_popstd(winsor)
+    keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high)
+    return survivor2 & keep, degenerate
+
+
+def reject_canonical_samples(
+    normalization,
+    weighting,
+    method,
+    *,
+    sigma_low: float = _REJECT_DEFAULT_SIGMA_LOW,
+    sigma_high: float = _REJECT_DEFAULT_SIGMA_HIGH,
+    max_iters: int = _REJECT_DEFAULT_MAX_ITERS,
+    winsor_limit_low: float = _REJECT_DEFAULT_WINSOR_LOW,
+    winsor_limit_high: float = _REJECT_DEFAULT_WINSOR_HIGH,
+) -> CanonicalRejectionResult:
+    """Compute canonical outlier-rejection masks on a normalized/weighted batch.
+
+    ``method`` must be exactly ``none``, ``kappa_sigma``, or
+    ``winsorized_sigma_clip`` (after strip/lower; aliases and unknown tokens are
+    rejected with :class:`CanonicalStackValidationError`; the removed token
+    ``linear_fit_clip`` fails with the stable token
+    ``unsupported_removed_sci05`` and is never migrated/substituted).
+
+    Never mutates/aliases the normalization/weighting inputs. Weight values,
+    magnitudes, and raw metrics do **not** enter any rejection calculation: only
+    B2 ``active_frames`` gates absent frames. Rejection is per pixel/channel
+    along the ``N`` axis; statistics are float64; survivor updates are monotonic
+    intersections over the original normalized samples; a cell with fewer than 3
+    current survivors is frozen (explicit low-N no-rejection success).
+    """
+    if not isinstance(method, str):
+        raise CanonicalStackValidationError(
+            f"rejection method must be a string, got {type(method).__name__}"
+        )
+    token = method.strip().lower()
+    if token == "linear_fit_clip":
+        raise CanonicalStackValidationError(
+            "rejection method linear_fit_clip is removed; use none/kappa_sigma/"
+            f"winsorized_sigma_clip ({_REJECT_TOKEN_REMOVED})"
+        )
+    if token not in _SUPPORTED_REJECT_METHODS:
+        raise CanonicalStackValidationError(
+            f"unsupported rejection method {method!r}; expected one of "
+            "none/kappa_sigma/winsorized_sigma_clip (aliases are not accepted)"
+        )
+
+    s_low = _validate_reject_sigma(sigma_low, "sigma_low")
+    s_high = _validate_reject_sigma(sigma_high, "sigma_high")
+    iters = _validate_max_iters(max_iters)
+    w_low = _validate_winsor_limit(winsor_limit_low, "winsor_limit_low")
+    w_high = _validate_winsor_limit(winsor_limit_high, "winsor_limit_high")
+    if w_low + w_high >= 1.0:
+        raise CanonicalStackValidationError(
+            f"winsor_limit_low + winsor_limit_high must be < 1, got {w_low} + {w_high}"
+        )
+
+    if not isinstance(normalization, CanonicalNormalizationResult):
+        raise CanonicalStackValidationError(
+            f"normalization must be a CanonicalNormalizationResult, got "
+            f"{type(normalization).__name__}"
+        )
+    if not isinstance(weighting, CanonicalWeightingResult):
+        raise CanonicalStackValidationError(
+            f"weighting must be a CanonicalWeightingResult, got {type(weighting).__name__}"
+        )
+
+    n = normalization.n_frames
+    h = normalization.height
+    w = normalization.width
+    c = normalization.channels
+
+    if weighting.n_frames != n:
+        raise CanonicalStackValidationError(
+            f"normalization/weighting N mismatch ({n} vs {weighting.n_frames})"
+        )
+    if (weighting.height, weighting.width, weighting.channels) != (h, w, c):
+        raise CanonicalStackValidationError(
+            "normalization/weighting H/W/C mismatch"
+        )
+    if weighting.original_mono != normalization.original_mono:
+        raise CanonicalStackValidationError(
+            "normalization/weighting original_mono mismatch"
+        )
+    if weighting.original_shape != normalization.original_shape:
+        raise CanonicalStackValidationError(
+            "normalization/weighting original_shape mismatch"
+        )
+    if weighting.reference_index != normalization.reference_index:
+        raise CanonicalStackValidationError(
+            "normalization/weighting reference_index mismatch"
+        )
+    if np.asarray(weighting.active_frames).shape != (n,):
+        raise CanonicalStackValidationError(
+            f"weighting.active_frames must have length {n}"
+        )
+    if np.asarray(normalization.images).shape != (n, h, w, c):
+        raise CanonicalStackValidationError("normalization.images shape mismatch")
+    if np.asarray(normalization.valid_mask).shape != (n, h, w):
+        raise CanonicalStackValidationError("normalization.valid_mask shape mismatch")
+
+    active_frames = np.array(weighting.active_frames, dtype=bool, copy=True)
+    images64 = np.array(normalization.images, dtype=np.float64, copy=True)
+    valid = np.asarray(normalization.valid_mask, dtype=bool)
+
+    finite = np.isfinite(images64)
+    initial = active_frames[:, None, None, None] & valid[..., None] & finite
+
+    n_cells = h * w * c
+
+    if token == _METHOD_REJECT_NONE:
+        survivor = initial.copy()
+        iterations_used = 0
+        degenerate_seen = np.zeros(n_cells, dtype=bool)
+    else:
+        orig2 = images64.reshape(n, n_cells)
+        survivor2 = initial.reshape(n, n_cells)
+        degenerate_seen = np.zeros(n_cells, dtype=bool)
+        iterations_used = 0
+        for _ in range(iters):
+            count = survivor2.sum(axis=0)
+            if token == _METHOD_REJECT_KAPPA_SIGMA:
+                new_survivor2, degenerate = _kappa_sigma_step(
+                    orig2, survivor2, count, s_low, s_high
+                )
+            else:
+                new_survivor2, degenerate = _winsorized_sigma_clip_step(
+                    orig2, survivor2, count, s_low, s_high, w_low, w_high
+                )
+            iterations_used += 1
+            degenerate_seen |= degenerate
+            if np.array_equal(new_survivor2, survivor2):
+                survivor2 = new_survivor2
+                break
+            survivor2 = new_survivor2
+        survivor = survivor2.reshape(n, h, w, c)
+
+    rejection = initial & ~survivor
+
+    initial_count = int(initial.sum())
+    surviving_count = int(survivor.sum())
+    rejected_count = int(rejection.sum())
+    rejected_fraction = (rejected_count / initial_count) if initial_count > 0 else 0.0
+    low_n_cell_count = int((initial.sum(axis=0) < 3).sum())
+    degenerate_cell_count = int(degenerate_seen.sum())
+
+    return CanonicalRejectionResult(
+        survivor_mask=np.array(survivor, dtype=bool, copy=True),
+        rejection_mask=np.array(rejection, dtype=bool, copy=True),
+        active_frames=np.array(active_frames, dtype=bool, copy=True),
+        reference_index=int(normalization.reference_index),
+        requested_method=token,
+        effective_method=token,
+        sigma_low=s_low,
+        sigma_high=s_high,
+        max_iters=iters,
+        winsor_limit_low=w_low,
+        winsor_limit_high=w_high,
+        iterations_used=iterations_used,
+        initial_sample_count=initial_count,
+        surviving_sample_count=surviving_count,
+        rejected_sample_count=rejected_count,
+        rejected_fraction=rejected_fraction,
+        low_n_cell_count=low_n_cell_count,
+        degenerate_cell_count=degenerate_cell_count,
+        exclusions=tuple(weighting.exclusions),
+        original_mono=normalization.original_mono,
+        n_frames=n,
+        height=h,
+        width=w,
+        channels=c,
         original_ndim=normalization.original_ndim,
         original_shape=normalization.original_shape,
     )

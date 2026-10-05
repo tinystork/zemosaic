@@ -269,6 +269,28 @@ Persisted/programmatic token fails validation with explicit `unsupported_removed
 **do NOT** migrate to `none`/`kappa`/WSC. Legacy internal helpers may remain temporarily
 unreachable, clearly legacy, with no supported caller.
 
+**C1 implementation-resolution clarifications (rejection stage):**
+* kappa `std` is the ordinary population std (`ddof=0`) **around the sample mean**, while the
+  interval bounds remain centered on the **median** (asymmetric `sigma_low`/`sigma_high`
+  applied to the ORIGINAL samples). WSC `std` is the population std (`ddof=0`) of the
+  winsorized current survivors.
+* A cell whose **current** survivor count is `< 3` is frozen (explicit low-N no-rejection
+  success from the current state) for that and all later iterations; it never falls back and
+  rejected samples never re-enter (monotonic intersection only).
+* Interval bounds are inclusive on both sides; `stable` means the complete survivor mask is
+  exactly unchanged; rejection stops when stable or after `max_iters`.
+* Parameter validation (before any work): `sigma_low/high` finite real non-bool `> 0`;
+  `max_iters` integer `1..5`; winsor limits finite real non-bool each `0 <= limit < 0.5` with
+  `low + high < 1`; the removed token `linear_fit_clip` fails with
+  `unsupported_removed_sci05`; aliases/unknown rejected.
+* Diagnostics (deterministic scalar definitions): `cell` = one `(H,W,C)` position across
+  frames; `initial_sample_count`/`surviving_sample_count`/`rejected_sample_count` are integer
+  sums over `(N,H,W,C)`; `rejected_fraction = rejected/initial` (or `0` when `initial == 0`);
+  `low_n_cell_count` = number of distinct cells whose INITIAL active-valid count `< 3`
+  (includes 0/1/2, counted once); `degenerate_cell_count` = number of distinct cells that
+  encounter finite `std <= 0` in at least one executed iteration (counted once; `0` for
+  `none`); `iterations_used = 0` for `none`, otherwise the number of loop passes executed.
+
 ---
 
 ## 9. Combine — decision H (C1/C2)
@@ -384,7 +406,7 @@ the incidental Qt dataclass default.
 | S2 | `weight==0` = absent; `weight<0`/nonfinite = invalid input failing before mutation. |
 | S3 | Channel-invariant 2-D support: `m_i` explicit 2-D; `s_i == w_i == q_i*m_i*a_i` per exposure (`q=1` for `none`); `SUP_W1/W2` float64 atomic pair, fail-before-mutation (negative/NaN/Inf/shape/overflow), original-exposure ordered-add, never derived from estimator WHT/rejection; `N_eff` pure derived view `W1²/W2` (overflow-resistant `(W1/√W2)²` fallback, neutral `0` if undefined); donor algorithms source-ported, no runtime ZSSS dependency. |
 | R1 | Unique WSC target: true WSC using both winsor+sigma limits (PixInsight-style defaults); unify `stack_core` simplified and global-coadd percentile clip onto it. |
-| R2 | kappa: median center + population std `ddof=0`, sigma `low/high=3.0`, ≤5 iters; WSC winsor `0.05/0.05`, sigma `3.0`; N<3 → explicit no-rejection success. |
+| R2 | kappa: median center + population std `ddof=0` (ordinary std **around the mean**, bounds centered on median), sigma `low/high=3.0`, ≤5 iters, inclusive bounds, `stable` = exact mask unchanged; WSC winsor `0.05/0.05`, sigma `3.0`; current-survivor-count `< 3` freezes the cell for that and later iterations; N<3 → explicit no-rejection success. |
 | R3 | Linear Fit Clip: disable/remove (fork B); persisted token fails `unsupported_removed_sci05`; no migration to none/kappa/WSC. |
 | C1 | Single zero-sum epsilon: denominator is **exactly `>0`** (no epsilon). |
 | C2 | Median: unweighted median of `w_i>0` original surviving samples; magnitude ignored; no survivors → NaN. |
