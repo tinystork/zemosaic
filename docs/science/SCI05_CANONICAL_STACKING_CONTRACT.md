@@ -70,6 +70,30 @@ change, no coverage port yet, no commit/push. This is the contract only.
   effective estimator weights — positive weight magnitude intentionally ignored); `0` where
   no survivors (see §9).
 
+**E2 implementation-resolution clarifications (engine entry point):**
+* Assembled as one backend-neutral entry point
+  `run_canonical_stack(CanonicalStackRequest) → CanonicalStackResult` in
+  `src/zemosaic/core/canonical_engine.py`, running B1 (input/reference/normalization) →
+  B2 (scalar quality weights) → E1 (estimator-weight map + support accumulation) → C1
+  (rejection) → C2 (combine) in order.
+* Support is accumulated from the **pre-rejection** `s_i = w_i = q*m*a` map
+  (original-exposure ordered-add, only active frames contribute), so `SUP_W1/W2/N_eff` are
+  **rejection-independent** (a `none` rejection and a `kappa_sigma`/WSC rejection over the
+  same corpus give identical support).
+* The result carries **bounded provenance** (requested/effective per stage, reference
+  mode+index, taper kind/px/floor, equalize_rgb requested/applied, excluded frames, and a
+  bounded `STACK_EFFECTIVE`-style `effective_event`) — scalars/strings/lists only, no array
+  dumps.
+* **Per-stage backend**: B1 (normalization), B2 (weighting), and E1 (support) execute on
+  CPU; only C1 (rejection) and C2 (combine) honour `request.backend`. `provenance["backend"]`
+  reports the requested token plus the per-stage effective backend, and `effective_event`
+  mirrors it — never claiming GPU for stages that ran on CPU. `equalize_rgb=True` raises an
+  explicit deferred-token validation error (the RGB equalizer is **not** wired at this gate);
+  `backend="gpu"` propagates the explicit Gate-D validation (no silent CPU fallback); a
+  reference quality failure surfaces as `CanonicalStackFailure`.
+* **No claim**: Coverage render, the RGB equalizer, GUI/config/migration/locales, and
+  production caller wiring remain **not** implemented (later gates E3+/F).
+
 ---
 
 ## 3. Reference selection — decision B (N1)
@@ -474,7 +498,7 @@ the incidental Qt dataclass default.
 | W3 | Exactly one scalar weight per frame, shared across channels; geometric/taper are separate 2-D factors. |
 | S1 | All-invalid output = NaN/invalid science + `estimator_weight_sum=0` + `support=0`; no historical zero sentinel. |
 | S2 | `weight==0` = absent; `weight<0`/nonfinite = invalid input failing before mutation. |
-| S3 | Channel-invariant 2-D support: `m_i` explicit 2-D; `s_i == w_i == q_i*m_i*a_i` per exposure (`q=1` for `none`); `SUP_W1/W2` float64 atomic pair, fail-before-mutation (negative/NaN/Inf/shape/overflow), original-exposure ordered-add, never derived from estimator WHT/rejection; `N_eff` pure derived view `W1²/W2` (overflow-resistant `(W1/√W2)²` fallback, neutral `0` if undefined); donor algorithms source-ported, no runtime ZSSS dependency. **E1:** source-ported into `src/zemosaic/core/canonical_support.py` — `make_footprint_taper` (EDT primary + chamfer fallback), `PositiveSupportAccumulator`/`accumulate_support_pair`, and `build_canonical_estimator_weights` (explicit `(N,H,W)` `w=q*m*a` map for C2). |
+| S3 | Channel-invariant 2-D support: `m_i` explicit 2-D; `s_i == w_i == q_i*m_i*a_i` per exposure (`q=1` for `none`); `SUP_W1/W2` float64 atomic pair, fail-before-mutation (negative/NaN/Inf/shape/overflow), original-exposure ordered-add, never derived from estimator WHT/rejection; `N_eff` pure derived view `W1²/W2` (overflow-resistant `(W1/√W2)²` fallback, neutral `0` if undefined); donor algorithms source-ported, no runtime ZSSS dependency. **E1:** source-ported into `src/zemosaic/core/canonical_support.py` — `make_footprint_taper` (EDT primary + chamfer fallback), `PositiveSupportAccumulator`/`accumulate_support_pair`, and `build_canonical_estimator_weights` (explicit `(N,H,W)` `w=q*m*a` map for C2). **E2:** assembled by `run_canonical_stack` (`canonical_engine.py`): support accumulated **pre-rejection** (rejection-independent), bounded provenance (per-stage backend: B1/B2/support CPU, C1/C2 requested); Coverage render / RGB equalizer / GUI / caller wiring **not** implemented. |
 | R1 | Unique WSC target: true WSC using both winsor+sigma limits (PixInsight-style defaults); unify `stack_core` simplified and global-coadd percentile clip onto it. |
 | R2 | kappa: median center + population std `ddof=0` (ordinary std **around the mean**, bounds centered on median), sigma `low/high=3.0`, ≤5 iters, inclusive bounds, `stable` = exact mask unchanged; WSC winsor `0.05/0.05`, sigma `3.0`; current-survivor-count `< 3` freezes the cell for that and later iterations; N<3 → explicit no-rejection success. |
 | R3 | Linear Fit Clip: disable/remove (fork B); persisted token fails `unsupported_removed_sci05`; no migration to none/kappa/WSC. |
