@@ -13356,6 +13356,8 @@ except Exception:
 
     _P3_GPU_HELPERS_AVAILABLE = False
 
+_RADIAL_INERT_LOGGED = False
+
 _P3_GPU_STATE = {
     "allowed": True,
     "hard_disabled": False,
@@ -14415,21 +14417,18 @@ def reproject_tile_to_mosaic(
         raise ValueError(f"Expected HWC data after normalization, got shape {data.shape}")
 
     base_weight = np.ones(data.shape[:2], dtype=np.float32)
-    if (
-        feather
-        and ZEMOSAIC_UTILS_AVAILABLE
-        and hasattr(zemosaic_utils, "make_radial_weight_map")
-    ):
-        try:
-            base_weight = zemosaic_utils.make_radial_weight_map(
-                data.shape[0],
-                data.shape[1],
-                feather_fraction=0.92,
-                min_weight_floor=0.10,
-            )
-            logger.debug("Feather applied with min_weight_floor=0.10")
-        except Exception:
-            base_weight = np.ones(data.shape[:2], dtype=np.float32)
+    # F3 (decision K): the legacy radial/feather map is inert — never built/applied, so no
+    # radial map ever multiplies image/quality weights.
+    if feather:
+        global _RADIAL_INERT_LOGGED
+        if not _RADIAL_INERT_LOGGED:
+            _RADIAL_INERT_LOGGED = True
+            try:
+                logger.warning(
+                    "Legacy radial/feather weighting is inert (SCI-05 decision K): feather has no effect"
+                )
+            except Exception:
+                pass
 
     # --- Determine bounding box covered by the tile on the mosaic
     if alpha_weight_map is not None and alpha_weight_map.shape == base_weight.shape:
@@ -18389,12 +18388,9 @@ def create_master_tile(
                 header_mt_save['ZMT_PADHW'] = (pad_hw_note, 'Auto-pad H,W -> H,W')
         header_mt_save['ZMT_NORM'] = (str(stack_norm_method), 'Normalization method')
         header_mt_save['ZMT_WGHT'] = (str(stack_weight_method), 'Weighting method')
-        if apply_radial_weight: # Log des paramètres radiaux
-            header_mt_save['ZMT_RADW'] = (True, 'Radial weighting applied')
-            header_mt_save['ZMT_RADF'] = (radial_feather_fraction, 'Radial feather fraction')
-            header_mt_save['ZMT_RADP'] = (radial_shape_power, 'Radial shape power')
-        else:
-            header_mt_save['ZMT_RADW'] = (False, 'Radial weighting applied')
+        # F3 (decision K): legacy radial weighting is inert — never applied, so we never claim
+        # it. ZMT_RADF/ZMT_RADP are omitted; ZMT_RADW is always False (inert).
+        header_mt_save['ZMT_RADW'] = (False, 'Radial weighting applied (inert)')
 
         header_mt_save['RGBGAINR'] = (gain_r, 'RGB equalization gain (red)')
         header_mt_save['RGBGAING'] = (gain_g, 'RGB equalization gain (green)')
@@ -21490,35 +21486,18 @@ def assemble_final_mosaic_reproject_coadd(
                     if weight2d is None:
                         weight2d = np.ones_like(data_plane, dtype=np.float32)
 
-                if (
-                    apply_radial_weight
-                    and ZEMOSAIC_UTILS_AVAILABLE
-                    and zemosaic_utils
-                    and hasattr(zemosaic_utils, "make_radial_weight_map")
-                ):
-                    radial2d = entry.get("radial_weight2d") if isinstance(entry, dict) else None
-                    if radial2d is None:
+                # F3 (decision K): the legacy radial map is inert — never built/applied, so no
+                # radial map ever multiplies image/quality weights.
+                if apply_radial_weight:
+                    global _RADIAL_INERT_LOGGED
+                    if not _RADIAL_INERT_LOGGED:
+                        _RADIAL_INERT_LOGGED = True
                         try:
-                            radial2d = zemosaic_utils.make_radial_weight_map(
-                                int(data_plane.shape[0]),
-                                int(data_plane.shape[1]),
-                                feather_fraction=float(radial_feather_fraction),
-                                shape_power=float(radial_shape_power),
-                                min_weight_floor=float(min_radial_weight_floor),
-                                progress_callback=_pcb if progress_callback else None,
+                            logger.warning(
+                                "Legacy radial weighting is inert (SCI-05 decision K): apply_radial_weight has no effect"
                             )
-                            radial2d = np.asarray(radial2d, dtype=np.float32)
-                            if radial2d.shape != data_plane.shape:
-                                radial2d = None
                         except Exception:
-                            radial2d = None
-                        if radial2d is not None and isinstance(entry, dict):
-                            entry["radial_weight2d"] = radial2d
-                    if isinstance(radial2d, np.ndarray) and radial2d.shape == weight2d.shape:
-                        weight2d = (weight2d.astype(np.float32, copy=False) * radial2d).astype(
-                            np.float32, copy=False
-                        )
-                        weight_source_base = f"{weight_source_base}*radial"
+                            pass
                 if tile_weighting_applied:
                     tw_value = _resolve_runtime_tile_weight(entry)
                     tile_weights_for_entries.append(tw_value)
@@ -29340,13 +29319,9 @@ def run_hierarchical_mosaic_classic_legacy(
     # ... (autres clés de config comme ASTAP, Stacking, etc.) ...
     final_header['STK_NORM'] = (str(stack_norm_method), 'Stacking: Normalization Method')
     final_header['STK_WGHT'] = (str(stack_weight_method), 'Stacking: Weighting Method')
-    if apply_radial_weight_config:
-        final_header['STK_RADW'] = (True, 'Stacking: Radial Weighting Applied')
-        final_header['STK_RADFF'] = (radial_feather_fraction_config, 'Stacking: Radial Feather Fraction')
-        final_header['STK_RADPW'] = (radial_shape_power_config, 'Stacking: Radial Weight Shape Power')
-        final_header['STK_RADFLR'] = (min_radial_weight_floor_config, 'Stacking: Min Radial Weight Floor')
-    else:
-        final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied')
+    # F3 (decision K): legacy radial weighting is inert — never applied, so never claimed.
+    # STK_RADW is always False (inert); STK_RADFF/STK_RADPW/STK_RADFLR are omitted.
+    final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied (inert)')
     final_header['STK_REJ'] = (str(stack_reject_algo), 'Stacking: Rejection Algorithm')
     # ... (kappa, winsor si pertinent pour l'algo de rejet) ...
     final_header['STK_COMB'] = (str(stack_final_combine), 'Stacking: Final Combine Method')
@@ -35324,13 +35299,9 @@ def run_hierarchical_mosaic(
     # ... (autres clés de config comme ASTAP, Stacking, etc.) ...
     final_header['STK_NORM'] = (str(stack_norm_method), 'Stacking: Normalization Method')
     final_header['STK_WGHT'] = (str(stack_weight_method), 'Stacking: Weighting Method')
-    if apply_radial_weight_config:
-        final_header['STK_RADW'] = (True, 'Stacking: Radial Weighting Applied')
-        final_header['STK_RADFF'] = (radial_feather_fraction_config, 'Stacking: Radial Feather Fraction')
-        final_header['STK_RADPW'] = (radial_shape_power_config, 'Stacking: Radial Weight Shape Power')
-        final_header['STK_RADFLR'] = (min_radial_weight_floor_config, 'Stacking: Min Radial Weight Floor')
-    else:
-        final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied')
+    # F3 (decision K): legacy radial weighting is inert — never applied, so never claimed.
+    # STK_RADW is always False (inert); STK_RADFF/STK_RADPW/STK_RADFLR are omitted.
+    final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied (inert)')
     final_header['STK_REJ'] = (str(stack_reject_algo), 'Stacking: Rejection Algorithm')
     # ... (kappa, winsor si pertinent pour l'algo de rejet) ...
     final_header['STK_COMB'] = (str(stack_final_combine), 'Stacking: Final Combine Method')

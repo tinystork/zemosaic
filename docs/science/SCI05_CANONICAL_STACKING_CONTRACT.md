@@ -536,6 +536,19 @@ survivors. Output float32.
   Phase4.5/coadd — remains **not** implemented (Gate F). This gate only disables legacy radial
   weighting; it does not enable the canonical taper in any caller.
 
+**F3 implementation-resolution clarification (radial inert on ALL stacking paths):**
+* The remaining legacy radial application points are now inert: `zemosaic_align_stack.py::
+  stack_aligned_images` (the `final_radial_weights_list` block), `zemosaic_worker.py` (the
+  tile-feather `base_weight` block and the Phase-5 `radial2d` block). No radial map is ever
+  built/applied, so no radial map multiplies image/quality weights (bounded one-time deprecation
+  log). Grid mode never applied a radial map (param threaded for logging only); the GPU path
+  stays inert (E5b).
+* `apply_radial_weight=True` is now **bit-identical** to `False` (inert) — the intended
+  decision-K change; the `False` default is unchanged. Deprecated config keys/params remain
+  readable but ineffective.
+* Headers: `ZMT_RADW` and `STK_RADW` are always `False` (inert); `ZMT_RADF`/`ZMT_RADP` and
+  `STK_RADFF`/`STK_RADPW`/`STK_RADFLR` are omitted (never claim an applied radial weighting).
+
 ---
 
 ## 13. Fallback / provenance — decision L
@@ -564,6 +577,11 @@ survivors. Output float32.
   rectangle), propagation unconditional, no-footprint frames excluded; `coverage_support_taper`
   consumed; legacy radial inert; render preview-only. SDS / Grid / Phase 4.5 / global coadd
   remain later F lots.
+  **F3 (legacy radial inert on all paths, implemented):** the remaining radial application
+  points (legacy `stack_aligned_images`, worker tile-feather and Phase-5 blocks) are inert —
+  `apply_radial_weight=True` is bit-identical to `False`; `ZMT_RADW` always `False`,
+  `ZMT_RADF`/`ZMT_RADP` omitted; deprecated keys readable-but-inert; Grid never applied a
+  radial map; GPU path stays inert.
 - **G** — final independent audit + one full suite + optional real-data/human science gate.
 
 Full suite runs **once at final**. New ZeGrid is out of scope.

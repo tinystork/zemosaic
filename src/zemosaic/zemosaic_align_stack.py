@@ -207,6 +207,7 @@ def _winsorize_block_numpy(arr_block: np.ndarray, limits: tuple[float, float]) -
 
 ZEMOSAIC_UTILS_AVAILABLE_FOR_RADIAL = False
 make_radial_weight_map_func = None
+_RADIAL_INERT_LOGGED = False
 try:
     from .zemosaic_utils import make_radial_weight_map
     make_radial_weight_map_func = make_radial_weight_map
@@ -5233,18 +5234,16 @@ def stack_aligned_images(
     # --- PONDÉRATION RADIALE ---
     final_radial_weights_list = [None] * len(current_images_data_list)
     _pcb(f"STACK_IMG_WEIGHT_RAD: Début calcul poids radiaux. Apply: {apply_radial_weight}", lvl="ERROR")
-    if apply_radial_weight and ZEMOSAIC_UTILS_AVAILABLE_FOR_RADIAL and make_radial_weight_map_func:
-        for idx, img_data_HWC in enumerate(current_images_data_list):
-            if img_data_HWC is None: continue
-            h, w = img_data_HWC.shape[:2]
-            try:
-                w_radial_2d = make_radial_weight_map_func(h, w, feather_fraction=radial_feather_fraction, shape_power=radial_shape_power)
-                if img_data_HWC.ndim == 3:
-                    final_radial_weights_list[idx] = np.repeat(w_radial_2d[..., np.newaxis], img_data_HWC.shape[-1], axis=2).astype(np.float32, copy=False)
-                elif img_data_HWC.ndim == 2:
-                    final_radial_weights_list[idx] = w_radial_2d.astype(np.float32, copy=False)
-            except Exception as e_radw_post: # ... log erreur ...
-                final_radial_weights_list[idx] = np.ones_like(img_data_HWC, dtype=np.float32)
+    if apply_radial_weight:
+        # F3 (decision K): the legacy radial map is inert — never built/applied. Radial
+        # weights stay None so no radial map ever multiplies image/quality weights.
+        global _RADIAL_INERT_LOGGED
+        if not _RADIAL_INERT_LOGGED:
+            _RADIAL_INERT_LOGGED = True
+            _internal_logger.warning(
+                "Legacy radial weighting is inert (SCI-05 decision K): apply_radial_weight "
+                "has no effect on the Classic stacking path"
+            )
     _pcb(f"STACK_IMG_WEIGHT_RAD: Fin calcul poids radiaux. final_radial_weights_list is {'None' if final_radial_weights_list is None else 'Exists'}.", lvl="ERROR")
     if final_radial_weights_list and any(w is not None for w in final_radial_weights_list):
         first_valid_r_weight = next((w for w in final_radial_weights_list if w is not None), None)
