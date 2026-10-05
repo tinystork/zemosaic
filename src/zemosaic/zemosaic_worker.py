@@ -5073,13 +5073,8 @@ def _sds_compute_tile_payload(
         stats["coverage_weight"] = float(np.nansum(cov_np))
         stats["coverage_pixels"] = int(np.count_nonzero(cov_np > 0.0))
         stats["coverage_max"] = float(np.nanmax(cov_np)) if cov_np.size else 0.0
-        threshold = 0.0
-        if stats["coverage_max"] > 0.0:
-            # Ignore extremely low coverage (<1% of the local peak) to avoid noisy edges.
-            threshold = 0.01 * stats["coverage_max"]
-        mask = cov_np > threshold
-        if not np.any(mask):
-            mask = cov_np > 0.0
+        # F6 (D3): plain finite + explicit-support mask (no derived constant).
+        mask = cov_np > 0.0
         if np.any(mask):
             masked_vals = arr[mask]
             if masked_vals.size:
@@ -5102,7 +5097,11 @@ def _sds_choose_reference_index(
     payloads: list[tuple[np.ndarray, float, dict[str, float]]],
     requested_index: int | None,
 ) -> int:
-    """Select a deterministic reference megatile index."""
+    """Select a deterministic reference megatile index.
+
+    F6 (D2): aligned to canonical N1 — honor an explicit index when provided; otherwise
+    auto-select by MAX VALID SUPPORT COUNT (canonical auto), not coverage-weight/central-tile.
+    """
 
     count = len(payloads)
     if count == 0:
@@ -5110,18 +5109,14 @@ def _sds_choose_reference_index(
     if isinstance(requested_index, int) and 0 <= requested_index < count:
         return requested_index
     best_idx: int | None = None
-    best_weight = -1.0
+    best_count = -1
     for idx, (_, _, stats) in enumerate(payloads):
-        weight = float(stats.get("coverage_weight", 0.0) or 0.0)
-        if weight > best_weight and weight > 0.0:
+        support_count = int(stats.get("coverage_pixels", 0) or 0)
+        if support_count > best_count:
             best_idx = idx
-            best_weight = weight
+            best_count = support_count
     if best_idx is not None:
         return best_idx
-    # Fallback to central tile when no usable coverage weight is available.
-    central_idx = count // 2
-    if 0 <= central_idx < count:
-        return central_idx
     return 0
 
 
@@ -5133,7 +5128,13 @@ def _normalize_sds_megatiles_photometry(
     pcb: Callable | None = None,
 ) -> list[np.ndarray]:
     """
-    Normalize mega-tiles against a reference median (coverage-aware when available).
+    Inter-master photometric gain (EXPLICIT inter-master operation, not canonical normalization).
+
+    F6 (D1): applies a per-tile photometric gain ``gain = ref_median / tile_median`` (median
+    scaling) to align inter-master megatiles. This is a DISTINCT inter-master operation, NOT the
+    canonical per-frame ``stacking_normalize_method`` (none/linear_fit/sky_mean): converting it to
+    affine ``linear_fit`` would add an intercept and change SDS photometry. Deferred pending
+    real-data validation; non-silent and recorded.
 
     Returns a new list of float32 mega-tiles.
     """
@@ -8266,75 +8267,94 @@ def _run_phase4_5_inter_master_merge(
             super_arr = None
             if weights_ready:
                 try:
-                    frames_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
-                    reference_shape = frames_np.shape[1:3]
-                    weight_stack_list: list[np.ndarray] = []
+                    # F6 A2 (D4): canonical mean with the per-pixel alpha as the explicit
+                    # estimator-weight taper (a_i) — not an ad-hoc weighted mean.
+                    from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
+                    reference_shape = frames[0].shape[:2]
+                    alpha_maps: list[np.ndarray] = []
+                    supports: list[np.ndarray] = []
                     for wmap in frame_weights:
                         if isinstance(wmap, np.ndarray) and wmap.shape == reference_shape:
-                            weight_stack_list.append(wmap.astype(np.float32, copy=False))
+                            a = np.clip(np.nan_to_num(wmap, nan=0.0), 0.0, 1.0).astype(np.float32, copy=False)
                         else:
-                            weight_stack_list.append(np.ones(reference_shape, dtype=np.float32))
-                    weight_stack = np.stack(weight_stack_list, axis=0)
-                    weight_stack = np.clip(np.nan_to_num(weight_stack, nan=0.0), 0.0, 1.0)
-                    weight_expanded = weight_stack[..., None]
-                    num = np.nansum(frames_np * weight_expanded, axis=0)
-                    den = np.nansum(weight_expanded, axis=0)
-                    super_arr = np.where(den > 0, num / den, np.nan)
-                    alpha_out = (np.nanmax(weight_stack, axis=0) * 255.0).astype(np.uint8)
+                            a = np.ones(reference_shape, dtype=np.float32)
+                        alpha_maps.append(a)
+                        supports.append(a > 0.0)
+                    ref_idx = 0 if (frames and np.any(supports[0])) else None
+                    req = CanonicalStackRequest(
+                        images=list(frames),
+                        geometric_support=supports,
+                        normalization="none",
+                        weighting="none",
+                        rejection="none",
+                        combine="mean",
+                        reference_index=ref_idx,
+                        taper=alpha_maps,
+                        backend="cpu",
+                    )
+                    res = run_canonical_stack(req)
+                    super_arr = res.science
+                    alpha_out = (np.nanmax(np.stack(alpha_maps, axis=0), axis=0) * 255.0).astype(np.uint8)
                     alpha_sources.append("stack_weights")
-                    logger.debug("[P4.5][G%03d] Applied alpha-weighted stacking", group_id)
+                    logger.debug("[P4.5][G%03d] Applied canonical alpha-tapered stacking", group_id)
                 except Exception as exc:
                     alpha_out = None
                     super_arr = None
                     logger.debug("[P4.5][G%03d] Alpha-weighted stack failed: %s", group_id, exc)
             if super_arr is None:
                 try:
-                    if reject_algo in ("winsor", "winsorized_sigma_clip"):
-                        result = zemosaic_align_stack.stack_winsorized_sigma_clip(
-                            frames,
-                            weight_method=weight_method,
-                            zconfig=None,
-                            parallel_plan=current_parallel_plan,
-                            **stack_kwargs,
+                    # F6 A3 (D5): canonical rejection; honest geometric support required.
+                    reject_norm = str(reject_algo).strip().lower()
+                    if reject_norm == "linear_fit_clip":
+                        raise ValueError(
+                            "rejection algorithm 'linear_fit_clip' is unsupported "
+                            "(unsupported_removed_sci05)"
                         )
-                        super_arr = result[0] if isinstance(result, (tuple, list)) else result
-                    elif reject_algo == "kappa_sigma":
-                        stack_result = None
-                        if hasattr(zemosaic_align_stack, "stack_kappa_sigma"):
-                            stack_result = zemosaic_align_stack.stack_kappa_sigma(
-                                frames,
-                                kappa=float(stack_cfg.get("kappa_low", 3.0)),
-                                combine=final_combine,
-                                weight_method=weight_method,
-                            )
-                        elif hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
-                            stack_result = zemosaic_align_stack.stack_kappa_sigma_clip(
-                                frames,
-                                weight_method=weight_method,
-                                zconfig=None,
-                                sigma_low=float(stack_cfg.get("kappa_low", 3.0)),
-                                sigma_high=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
-                                parallel_plan=current_parallel_plan,
-                            )
-                        if stack_result is not None:
-                            super_arr = stack_result[0] if isinstance(stack_result, (tuple, list)) else stack_result
-                    elif reject_algo == "linear_fit_clip" and hasattr(zemosaic_align_stack, "stack_linear_fit_clip"):
-                        result = zemosaic_align_stack.stack_linear_fit_clip(
-                            frames,
-                            weight_method=weight_method,
-                            zconfig=None,
-                            sigma=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
-                            parallel_plan=current_parallel_plan,
+                    if reject_norm in ("winsor", "winsorized_sigma_clip"):
+                        rejection_token = "winsorized_sigma_clip"
+                        combine_token = "mean"
+                    elif reject_norm == "kappa_sigma":
+                        rejection_token = "kappa_sigma"
+                        combine_token = "mean"
+                    elif reject_norm in ("", "none"):
+                        rejection_token = "none"
+                        combine_token = final_combine if final_combine in ("mean", "median") else "mean"
+                    else:
+                        raise ValueError(f"unsupported rejection algorithm {reject_algo!r}")
+                    if weights_ready:
+                        from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
+                        reference_shape = frames[0].shape[:2]
+                        supports: list[np.ndarray] = []
+                        for wmap in frame_weights:
+                            if isinstance(wmap, np.ndarray) and wmap.shape == reference_shape:
+                                supports.append(np.asarray(wmap, dtype=np.float32) > 0.0)
+                            else:
+                                supports.append(np.ones(reference_shape, dtype=bool))
+                        ref_idx = 0 if (frames and np.any(supports[0])) else None
+                        req = CanonicalStackRequest(
+                            images=list(frames),
+                            geometric_support=supports,
+                            normalization="none",
+                            weighting="none",
+                            rejection=rejection_token,
+                            combine=combine_token,
+                            reference_index=ref_idx,
+                            taper="none",
+                            backend="cpu",
                         )
-                        super_arr = result[0] if isinstance(result, (tuple, list)) else result
-
-                    if super_arr is None:
-                        stack_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
-                        super_arr = (
-                            np.nanmedian(stack_np, axis=0).astype(np.float32)
-                            if final_combine == "median"
-                            else np.nanmean(stack_np, axis=0).astype(np.float32)
+                        res = run_canonical_stack(req)
+                        super_arr = res.science
+                    else:
+                        # No honest geometric footprint available (no per-tile alpha/footprint):
+                        # deferred, not invented (A3). Non-silent.
+                        pcb(
+                            "p45_no_honest_footprint_deferred",
+                            prog=None,
+                            lvl="WARN",
+                            group_id=int(group_id),
+                            reason="no_honest_geometric_support",
                         )
+                        logger.debug("[P4.5][G%03d] no honest footprint; canonical rejection deferred", group_id)
                 except Exception as exc:
                     logger.debug("[P4.5][G%03d] Stack failed: %s", group_id, exc)
                     _phase45_cleanup_storage(storage, memmap_path)
@@ -13360,6 +13380,8 @@ except Exception:
 
     _P3_GPU_HELPERS_AVAILABLE = False
 
+_RADIAL_INERT_LOGGED = False
+
 _P3_GPU_STATE = {
     "allowed": True,
     "hard_disabled": False,
@@ -14419,21 +14441,18 @@ def reproject_tile_to_mosaic(
         raise ValueError(f"Expected HWC data after normalization, got shape {data.shape}")
 
     base_weight = np.ones(data.shape[:2], dtype=np.float32)
-    if (
-        feather
-        and ZEMOSAIC_UTILS_AVAILABLE
-        and hasattr(zemosaic_utils, "make_radial_weight_map")
-    ):
-        try:
-            base_weight = zemosaic_utils.make_radial_weight_map(
-                data.shape[0],
-                data.shape[1],
-                feather_fraction=0.92,
-                min_weight_floor=0.10,
-            )
-            logger.debug("Feather applied with min_weight_floor=0.10")
-        except Exception:
-            base_weight = np.ones(data.shape[:2], dtype=np.float32)
+    # F3 (decision K): the legacy radial/feather map is inert — never built/applied, so no
+    # radial map ever multiplies image/quality weights.
+    if feather:
+        global _RADIAL_INERT_LOGGED
+        if not _RADIAL_INERT_LOGGED:
+            _RADIAL_INERT_LOGGED = True
+            try:
+                logger.warning(
+                    "Legacy radial/feather weighting is inert (SCI-05 decision K): feather has no effect"
+                )
+            except Exception:
+                pass
 
     # --- Determine bounding box covered by the tile on the mosaic
     if alpha_weight_map is not None and alpha_weight_map.shape == base_weight.shape:
@@ -15508,6 +15527,8 @@ def _safe_load_cache(path: str, *, pcb: Callable | None = None, tile_id: int | N
 
 def _stack_master_tile_cpu(
     aligned_images_for_stack: list,
+    footprints: list | None = None,
+    reference_index: int | None = 0,
     *,
     stack_norm_method: str,
     stack_weight_method: str,
@@ -15591,41 +15612,19 @@ def _stack_master_tile_cpu(
         except Exception:
             pass
 
-        if stack_reject_algo == "winsorized_sigma_clip":
-            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-                aligned_images_for_stack,
-                weight_method=stack_weight_method,
-                zconfig=zconfig,
-                kappa=stack_kappa_low,
-                winsor_limits=parsed_winsor_limits,
-                apply_rewinsor=True,
-                winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
-                winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
-                stack_metadata=stack_metadata,
-                parallel_plan=current_parallel_plan,
-            )
-        elif stack_reject_algo == "kappa_sigma":
-            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-                aligned_images_for_stack,
-                weight_method=stack_weight_method,
-                zconfig=zconfig,
-                sigma_low=stack_kappa_low,
-                sigma_high=stack_kappa_high,
-                stack_metadata=stack_metadata,
-                parallel_plan=current_parallel_plan,
-            )
-        elif stack_reject_algo == "linear_fit_clip":
-            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-                aligned_images_for_stack,
-                weight_method=stack_weight_method,
-                zconfig=zconfig,
-                sigma=stack_kappa_high,
-                stack_metadata=stack_metadata,
-                parallel_plan=current_parallel_plan,
+        # F6 R3: route ALL supported rejection algos (none/kappa_sigma/winsorized_sigma_clip)
+        # through the canonical engine via stack_aligned_images (F2); the legacy
+        # stack_winsorized_sigma_clip / stack_kappa_sigma_clip wrappers are no longer called.
+        if stack_reject_algo == "linear_fit_clip":
+            raise ValueError(
+                "rejection algorithm 'linear_fit_clip' is unsupported "
+                "(unsupported_removed_sci05)"
             )
         else:
             master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
                 aligned_image_data_list=aligned_images_for_stack,
+                geometric_support=footprints,
+                reference_index=reference_index,
                 normalize_method=stack_norm_method,
                 weighting_method=stack_weight_method,
                 rejection_algorithm=stack_reject_algo,
@@ -15712,6 +15711,8 @@ def _shrink_parallel_plan_for_gpu(parallel_plan: ParallelPlan | None) -> Paralle
 
 def _stack_master_tile_auto(
     image_descriptors: list,
+    footprints: list | None = None,
+    reference_index: int | None = 0,
     *,
     stack_norm_method: str,
     stack_weight_method: str,
@@ -15821,6 +15822,8 @@ def _stack_master_tile_auto(
 
     stacked_cpu, meta_cpu = _stack_master_tile_cpu(
         image_descriptors,
+        footprints=footprints,
+        reference_index=reference_index,
         stack_norm_method=stack_norm_method,
         stack_weight_method=stack_weight_method,
         stack_reject_algo=stack_reject_algo,
@@ -17036,6 +17039,9 @@ def create_master_tile(
     propagate_mask_for_coverage = bool(
         altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE # commented for test purpose replace the above line to return to the previous state, winsorized_reject or (altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE)
     )
+    # F2/R1: footprint propagation is UNCONDITIONAL for the Classic CPU route so an honest
+    # geometric footprint always exists (threaded to the canonical engine).
+    propagate_mask_for_stack = True
     if debug_tile:
         pcb_tile(
             f"MT_COVERAGE: propagate_mask={propagate_mask_for_coverage}",
@@ -17044,11 +17050,12 @@ def create_master_tile(
             tile_id=int(tile_id),
         )
     _check_abort("before_alignment")
-    aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
+    aligned_images_for_stack, failed_alignment_indices, aligned_footprints = zemosaic_align_stack.align_images_in_group(
         image_data_list=tile_images_data_HWC_adu,
         reference_image_index=ref_loaded_idx,
-        propagate_mask=propagate_mask_for_coverage,
-        progress_callback=_tile_progress_callback
+        propagate_mask=propagate_mask_for_stack,
+        progress_callback=_tile_progress_callback,
+        return_footprints=True,
     )
     _touch_progress()
     _check_abort("after_alignment")
@@ -17177,16 +17184,35 @@ def create_master_tile(
     if aligned_images_for_stack and 0 <= ref_loaded_idx < len(aligned_images_for_stack):
         ref_aligned_img = aligned_images_for_stack[ref_loaded_idx]
 
+    def _footprint_at(idx):
+        if aligned_footprints and 0 <= idx < len(aligned_footprints):
+            return aligned_footprints[idx]
+        return None
+
+    valid_aligned_images = []
+    valid_footprints = []
     if ref_aligned_img is not None:
-        valid_aligned_images = [ref_aligned_img]
+        valid_aligned_images.append(ref_aligned_img)
+        valid_footprints.append(_footprint_at(ref_loaded_idx))
         for idx_img, img in enumerate(aligned_images_for_stack):
             if idx_img == ref_loaded_idx or img is None:
                 continue
             valid_aligned_images.append(img)
+            valid_footprints.append(_footprint_at(idx_img))
     else:
-        valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
+        for idx_img, img in enumerate(aligned_images_for_stack):
+            if img is None:
+                continue
+            valid_aligned_images.append(img)
+            valid_footprints.append(_footprint_at(idx_img))
     if aligned_images_for_stack:
         del aligned_images_for_stack # Libérer la liste originale après filtrage
+    if aligned_footprints:
+        del aligned_footprints
+
+    # F2/R1: reference present (alignment reference first) -> explicit index 0; reference
+    # missing -> auto-select (None) so the canonical engine picks max-valid-count (N1).
+    stack_reference_index = 0 if ref_aligned_img is not None else None
 
     num_actually_aligned_for_header = len(valid_aligned_images)
     pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
@@ -17265,8 +17291,10 @@ def create_master_tile(
                 lvl="DEBUG_DETAIL",
             )
 
-    # If we nanized aligned images for coverage, clean them before stacking to avoid stacker ERROR logs.
-    if propagate_mask_for_coverage and not winsorized_reject:
+    # If we nanized aligned images (coverage or F2 unconditional footprint), clean them
+    # before the legacy stacker to avoid stacker ERROR logs. The canonical route (Gate F2)
+    # ignores this: it uses the threaded footprint masks as the authority.
+    if (propagate_mask_for_coverage or propagate_mask_for_stack) and not winsorized_reject:
         try:
             for idx_img, img in enumerate(valid_aligned_images):
                 if isinstance(img, np.ndarray):
@@ -17303,7 +17331,7 @@ def create_master_tile(
     # - pass adaptation enabled only for winsorized sigma clip (validated streaming/memmap path)
     # - chunk adaptation enabled for winsorized/kappa/linear-fit paths
     pass_adapt_enabled = reject_algo_norm == "winsorized_sigma_clip"
-    chunk_adapt_enabled = reject_algo_norm in {"winsorized_sigma_clip", "kappa_sigma", "linear_fit_clip"}
+    chunk_adapt_enabled = reject_algo_norm in {"winsorized_sigma_clip", "kappa_sigma"}
 
     try:
         vm = psutil.virtual_memory()
@@ -17424,6 +17452,8 @@ def create_master_tile(
     _check_abort("before_stack")
     master_tile_stacked_HWC, stack_metadata, used_gpu = _stack_master_tile_auto(
         valid_aligned_images,
+        footprints=valid_footprints,
+        reference_index=stack_reference_index,
         stack_norm_method=stack_norm_method,
         stack_weight_method=stack_weight_method,
         stack_reject_algo=stack_reject_algo,
@@ -18362,12 +18392,9 @@ def create_master_tile(
                 header_mt_save['ZMT_PADHW'] = (pad_hw_note, 'Auto-pad H,W -> H,W')
         header_mt_save['ZMT_NORM'] = (str(stack_norm_method), 'Normalization method')
         header_mt_save['ZMT_WGHT'] = (str(stack_weight_method), 'Weighting method')
-        if apply_radial_weight: # Log des paramètres radiaux
-            header_mt_save['ZMT_RADW'] = (True, 'Radial weighting applied')
-            header_mt_save['ZMT_RADF'] = (radial_feather_fraction, 'Radial feather fraction')
-            header_mt_save['ZMT_RADP'] = (radial_shape_power, 'Radial shape power')
-        else:
-            header_mt_save['ZMT_RADW'] = (False, 'Radial weighting applied')
+        # F3 (decision K): legacy radial weighting is inert — never applied, so we never claim
+        # it. ZMT_RADF/ZMT_RADP are omitted; ZMT_RADW is always False (inert).
+        header_mt_save['ZMT_RADW'] = (False, 'Radial weighting applied (inert)')
 
         header_mt_save['RGBGAINR'] = (gain_r, 'RGB equalization gain (red)')
         header_mt_save['RGBGAING'] = (gain_g, 'RGB equalization gain (green)')
@@ -21463,35 +21490,18 @@ def assemble_final_mosaic_reproject_coadd(
                     if weight2d is None:
                         weight2d = np.ones_like(data_plane, dtype=np.float32)
 
-                if (
-                    apply_radial_weight
-                    and ZEMOSAIC_UTILS_AVAILABLE
-                    and zemosaic_utils
-                    and hasattr(zemosaic_utils, "make_radial_weight_map")
-                ):
-                    radial2d = entry.get("radial_weight2d") if isinstance(entry, dict) else None
-                    if radial2d is None:
+                # F3 (decision K): the legacy radial map is inert — never built/applied, so no
+                # radial map ever multiplies image/quality weights.
+                if apply_radial_weight:
+                    global _RADIAL_INERT_LOGGED
+                    if not _RADIAL_INERT_LOGGED:
+                        _RADIAL_INERT_LOGGED = True
                         try:
-                            radial2d = zemosaic_utils.make_radial_weight_map(
-                                int(data_plane.shape[0]),
-                                int(data_plane.shape[1]),
-                                feather_fraction=float(radial_feather_fraction),
-                                shape_power=float(radial_shape_power),
-                                min_weight_floor=float(min_radial_weight_floor),
-                                progress_callback=_pcb if progress_callback else None,
+                            logger.warning(
+                                "Legacy radial weighting is inert (SCI-05 decision K): apply_radial_weight has no effect"
                             )
-                            radial2d = np.asarray(radial2d, dtype=np.float32)
-                            if radial2d.shape != data_plane.shape:
-                                radial2d = None
                         except Exception:
-                            radial2d = None
-                        if radial2d is not None and isinstance(entry, dict):
-                            entry["radial_weight2d"] = radial2d
-                    if isinstance(radial2d, np.ndarray) and radial2d.shape == weight2d.shape:
-                        weight2d = (weight2d.astype(np.float32, copy=False) * radial2d).astype(
-                            np.float32, copy=False
-                        )
-                        weight_source_base = f"{weight_source_base}*radial"
+                            pass
                 if tile_weighting_applied:
                     tw_value = _resolve_runtime_tile_weight(entry)
                     tile_weights_for_entries.append(tw_value)
@@ -29313,13 +29323,9 @@ def run_hierarchical_mosaic_classic_legacy(
     # ... (autres clés de config comme ASTAP, Stacking, etc.) ...
     final_header['STK_NORM'] = (str(stack_norm_method), 'Stacking: Normalization Method')
     final_header['STK_WGHT'] = (str(stack_weight_method), 'Stacking: Weighting Method')
-    if apply_radial_weight_config:
-        final_header['STK_RADW'] = (True, 'Stacking: Radial Weighting Applied')
-        final_header['STK_RADFF'] = (radial_feather_fraction_config, 'Stacking: Radial Feather Fraction')
-        final_header['STK_RADPW'] = (radial_shape_power_config, 'Stacking: Radial Weight Shape Power')
-        final_header['STK_RADFLR'] = (min_radial_weight_floor_config, 'Stacking: Min Radial Weight Floor')
-    else:
-        final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied')
+    # F3 (decision K): legacy radial weighting is inert — never applied, so never claimed.
+    # STK_RADW is always False (inert); STK_RADFF/STK_RADPW/STK_RADFLR are omitted.
+    final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied (inert)')
     final_header['STK_REJ'] = (str(stack_reject_algo), 'Stacking: Rejection Algorithm')
     # ... (kappa, winsor si pertinent pour l'algo de rejet) ...
     final_header['STK_COMB'] = (str(stack_final_combine), 'Stacking: Final Combine Method')
@@ -35297,13 +35303,9 @@ def run_hierarchical_mosaic(
     # ... (autres clés de config comme ASTAP, Stacking, etc.) ...
     final_header['STK_NORM'] = (str(stack_norm_method), 'Stacking: Normalization Method')
     final_header['STK_WGHT'] = (str(stack_weight_method), 'Stacking: Weighting Method')
-    if apply_radial_weight_config:
-        final_header['STK_RADW'] = (True, 'Stacking: Radial Weighting Applied')
-        final_header['STK_RADFF'] = (radial_feather_fraction_config, 'Stacking: Radial Feather Fraction')
-        final_header['STK_RADPW'] = (radial_shape_power_config, 'Stacking: Radial Weight Shape Power')
-        final_header['STK_RADFLR'] = (min_radial_weight_floor_config, 'Stacking: Min Radial Weight Floor')
-    else:
-        final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied')
+    # F3 (decision K): legacy radial weighting is inert — never applied, so never claimed.
+    # STK_RADW is always False (inert); STK_RADFF/STK_RADPW/STK_RADFLR are omitted.
+    final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied (inert)')
     final_header['STK_REJ'] = (str(stack_reject_algo), 'Stacking: Rejection Algorithm')
     # ... (kappa, winsor si pertinent pour l'algo de rejet) ...
     final_header['STK_COMB'] = (str(stack_final_combine), 'Stacking: Final Combine Method')
@@ -36711,6 +36713,8 @@ def _assemble_global_mosaic_first_impl(
     if coadd_method not in allowed_methods:
         coadd_method = "kappa_sigma"
     stack_reject_algo = str(global_plan.get("stack_reject_algo") or coadd_method).strip().lower()
+    # F5 R1 (R2): `coadd_k` and `winsor_limits` are accepted-but-INERT — the canonical
+    # global-coadd routing uses the frozen defaults (kappa sigma 3.0; WSC winsor 0.05/0.05).
     try:
         kappa_sigma_k = float(global_plan.get("coadd_k", 2.0) or 2.0)
     except Exception:
@@ -36786,6 +36790,18 @@ def _assemble_global_mosaic_first_impl(
         _log_helper_cpu_resume("gpu_reproject", reason=helper_reason, discarded=False)
     gpu_supported_methods = {"mean", "median", "winsorized", "kappa_sigma"}
     gpu_helper_supported = gpu_helper_candidate and coadd_method in gpu_supported_methods
+    # F5 R2 (decision G1, backend consistency): the legacy GPU helper combine diverges from the
+    # canonical engine (coadd_k=2.0, legacy winsorized/mean/median). Disable it for the global
+    # coadd so BOTH CPU and GPU environments run the canonical CPU stage (coadd_k/winsor_limits
+    # inert everywhere). Explicit and non-silent.
+    if gpu_helper_supported:
+        pcb(
+            "global_coadd_helper_legacy_disabled_canonical_only",
+            prog=None,
+            lvl="INFO",
+            **_payload(helper="gpu_reproject", method=coadd_method, reason="legacy_combine_disabled"),
+        )
+        gpu_helper_supported = False
     if gpu_helper_candidate and not gpu_helper_supported:
         reason = "unsupported_method"
         if coadd_method in allowed_methods:
@@ -37498,7 +37514,7 @@ def _assemble_global_mosaic_first_impl(
         ),
     )
 
-    store_patches = coadd_method in {"median", "winsorized", "kappa_sigma"}
+    store_patches = True  # F5 R1: all four labels route through the chunked canonical engine
     sum_grid: np.ndarray | None = None
     sumsq_grid: np.ndarray | None = None
     weight_grid: np.ndarray | None = None
@@ -37697,6 +37713,13 @@ def _assemble_global_mosaic_first_impl(
             return chunk or min(height, 64)
 
         def _finalize_chunked(method: str) -> tuple[np.ndarray, np.ndarray]:
+            _coadd_map = {
+                "mean": ("none", "mean"),
+                "median": ("none", "median"),
+                "kappa_sigma": ("kappa_sigma", "mean"),
+                "winsorized": ("winsorized_sigma_clip", "mean"),
+            }
+            _rejection, _combine = _coadd_map[method]
             chunk_h = _compute_chunk_height()
             if chunk_h <= 0:
                 chunk_h = min(height, 128)
@@ -37741,23 +37764,27 @@ def _assemble_global_mosaic_first_impl(
                         weight_stack[idx, global_y0:global_y1, x_start:x_end] = weight_mm[
                             local_y0:local_y1, :
                         ]
-                    if method == "median":
-                        chunk_result = np.nanmedian(stack, axis=0)
-                        chunk_weight = np.nansum(weight_stack, axis=0)
-                    else:
-                        low_pct = max(0.0, min(100.0, winsor_limits[0] * 100.0))
-                        high_pct = max(0.0, min(100.0, 100.0 - winsor_limits[1] * 100.0))
-                        lower = np.nanpercentile(stack, low_pct, axis=0).astype(np.float32, copy=False)
-                        upper = np.nanpercentile(stack, high_pct, axis=0).astype(np.float32, copy=False)
-                        # Keep processing in float32 and reuse the large stack buffer in-place to avoid
-                        # allocating huge float64 intermediates (which can hard-crash Windows).
-                        np.clip(stack, lower, upper, out=stack)
-                        stack *= weight_stack[..., None]
-                        chunk_weight = np.nansum(weight_stack, axis=0)
-                        with np.errstate(invalid="ignore", divide="ignore"):
-                            chunk_result = np.nansum(stack, axis=0) / np.expand_dims(
-                                chunk_weight, axis=-1
-                            )
+                    # F5 R1 (decision G1, option a): route every label through the same
+                    # canonical engine (rejection/combine mapped from the method label).
+                    from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
+                    n_frames = stack.shape[0]
+                    frames = [stack[i] for i in range(n_frames)]
+                    supports = [(weight_stack[i] > 0) for i in range(n_frames)]
+                    ref_idx = 0 if (n_frames > 0 and np.any(supports[0])) else None
+                    req = CanonicalStackRequest(
+                        images=frames,
+                        geometric_support=supports,
+                        normalization="none",
+                        weighting="none",
+                        rejection=_rejection,
+                        combine=_combine,
+                        reference_index=ref_idx,
+                        taper="none",
+                        backend="cpu",
+                    )
+                    res = run_canonical_stack(req)
+                    chunk_result = res.science
+                    chunk_weight = res.estimator_weight_sum
                     chunk_result = np.asarray(chunk_result, dtype=np.float32)
                     chunk_result[~np.isfinite(chunk_result)] = np.nan
                     chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0).astype(
@@ -37795,12 +37822,10 @@ def _assemble_global_mosaic_first_impl(
                     chunk_h = max(1, chunk_h // 2)
             return final, coverage
 
-        if coadd_method == "mean":
-            final_image, coverage_map = _finalize_mean()
-        elif coadd_method == "kappa_sigma":
-            final_image, coverage_map = _finalize_kappa_sigma()
-        else:
-            final_image, coverage_map = _finalize_chunked(coadd_method)
+        # F5 R1 (decision G1, option a): route ALL FOUR labels through the same canonical
+        # engine. The legacy `_finalize_mean`/`_finalize_kappa_sigma` ad-hoc paths are no
+        # longer the supported route for those labels (left unreachable).
+        final_image, coverage_map = _finalize_chunked(coadd_method)
 
         if final_image is None or coverage_map is None:
             return _fail("global_coadd_error_finalize_failed")
@@ -38631,59 +38656,71 @@ def assemble_global_mosaic_sds(
         manual_weights = None
 
     def _stack_mosaics() -> np.ndarray:
-        if not (ZEMOSAIC_ALIGN_STACK_AVAILABLE and zemosaic_align_stack):
-            stack_cube = np.stack(mosaics, axis=0).astype(np.float32, copy=False)
-            if len(mosaics) == 1:
-                return stack_cube[0]
-            combine = str((stack_params or {}).get("stack_final_combine") or "mean").lower()
-            if combine == "median":
-                return np.nanmedian(stack_cube, axis=0).astype(np.float32)
-            return np.nanmean(stack_cube, axis=0).astype(np.float32)
+        # F6 R3: route the supported algos through the canonical engine with the honest
+        # WCS-derived coverage footprint as geometric support (no ~isnan/brightness support).
+        from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
 
         algo = str((stack_params or {}).get("stack_reject_algo") or "winsorized_sigma_clip").lower()
-        weight_method = (stack_params or {}).get("stack_weight_method", "none")
-        kappa_low = float((stack_params or {}).get("stack_kappa_low", 3.0))
-        kappa_high = float((stack_params or {}).get("stack_kappa_high", 3.0))
-        winsor_limits = (stack_params or {}).get("parsed_winsor_limits", (0.05, 0.05))
-        winsor_workers = int((stack_params or {}).get("winsor_worker_limit", 1))
-        winsor_frames = int((stack_params or {}).get("winsor_max_frames_per_pass", 0))
-
-        if algo in {"winsorized_sigma_clip", "winsorized", "winsor"} and hasattr(
-            zemosaic_align_stack, "stack_winsorized_sigma_clip"
-        ):
-            stacked, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-                mosaics,
-                weights=manual_weights,
-                weight_method=weight_method,
-                zconfig=None,
-                kappa=kappa_low,
-                winsor_limits=winsor_limits,
-                apply_rewinsor=True,
-                winsor_max_frames_per_pass=winsor_frames,
-                winsor_max_workers=winsor_workers,
-                parallel_plan=parallel_plan,
-            )
-            return np.asarray(stacked, dtype=np.float32)
-
-        if algo == "kappa_sigma" and hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
-            stacked, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-                mosaics,
-                weights=manual_weights,
-                weight_method=weight_method,
-                zconfig=None,
-                sigma_low=kappa_low,
-                sigma_high=kappa_high,
-                parallel_plan=parallel_plan,
-            )
-            return np.asarray(stacked, dtype=np.float32)
-
-        stack_cube = np.stack(mosaics, axis=0).astype(np.float32, copy=False)
-        if len(mosaics) == 1:
-            return stack_cube[0]
         combine = str((stack_params or {}).get("stack_final_combine") or "mean").lower()
-        if combine == "median":
-            return np.nanmedian(stack_cube, axis=0).astype(np.float32)
-        return np.nanmean(stack_cube, axis=0).astype(np.float32)
+
+        if len(mosaics) == 1:
+            return np.asarray(mosaics[0], dtype=np.float32)
+
+        if algo == "linear_fit_clip":
+            raise ValueError(
+                "rejection algorithm 'linear_fit_clip' is unsupported (unsupported_removed_sci05)"
+            )
+        if algo in ("winsorized_sigma_clip", "winsorized", "winsor"):
+            rejection_token = "winsorized_sigma_clip"
+            combine_token = "mean"
+        elif algo == "kappa_sigma":
+            rejection_token = "kappa_sigma"
+            combine_token = "mean"
+        else:
+            rejection_token = "none"
+            combine_token = combine if combine in ("mean", "median") else "mean"
+
+        # Honest geometric support: the WCS-derived coverage footprint (coverages[i] > 0).
+        reference_shape = mosaics[0].shape[:2]
+        supports: list[np.ndarray] = []
+        for i in range(len(mosaics)):
+            cov = coverages[i] if i < len(coverages) else None
+            if cov is not None:
+                c = np.asarray(cov, dtype=np.float32)
+                if c.ndim > 2:
+                    c = np.squeeze(c)
+                if c.ndim == 2 and c.shape == reference_shape:
+                    supports.append(c > 0.0)
+                    continue
+            supports.append(np.zeros(reference_shape, dtype=bool))
+
+        if not any(np.any(s) for s in supports):
+            # No honest geometric footprint available: SKIP (explicit, non-silent) — do NOT
+            # fabricate science with a non-canonical nanmean/nanmedian combine.
+            pcb(
+                "sds_final_no_honest_footprint_deferred",
+                prog=None,
+                lvl="WARN",
+                reason="no_honest_geometric_support",
+                mosaics=int(len(mosaics)),
+                zero_support_frames=int(sum(1 for s in supports if not np.any(s))),
+            )
+            return np.full(mosaics[0].shape, np.nan, dtype=np.float32)
+
+        ref_idx = 0 if np.any(supports[0]) else None
+        req = CanonicalStackRequest(
+            images=[np.asarray(m, dtype=np.float32) for m in mosaics],
+            geometric_support=supports,
+            normalization="none",
+            weighting="none",
+            rejection=rejection_token,
+            combine=combine_token,
+            reference_index=ref_idx,
+            taper="none",
+            backend="cpu",
+        )
+        res = run_canonical_stack(req)
+        return np.asarray(res.science, dtype=np.float32)
 
     try:
         final_image = _stack_mosaics()

@@ -876,5 +876,9 @@
   "winsor_workers_label": "Limite workers Winsor :",
   "winsor_workers_note": "(1-16, rejet parallèle par canal)",
   "worker_module_missing_critical_error": "Module worker (zemosaic_worker.py) non trouvé ou erreur d'importation.\nZeMosaic ne peut pas démarrer ses fonctionnalités principales.\n\nVeuillez vérifier les logs console pour les détails et vous assurer que toutes les dépendances sont installées.",
-  "worker_module_unavailable_error": "Module worker (zemosaic_worker.py) non disponible ou incomplet.\nImpossible de démarrer le traitement."
+  "worker_module_unavailable_error": "Module worker (zemosaic_worker.py) non disponible ou incomplet.\nImpossible de démarrer le traitement.",
+  "stacking_coverage_support_taper_label": "Coverage support taper",
+  "stacking_coverage_support_taper_note": "Smoothly fades stacking support at the coverage boundary (footprint taper).",
+  "stacking_coverage_reconstruction_label": "Coverage-aware reconstruction",
+  "stacking_coverage_reconstruction_note": "Preview coverage-aware final reconstruction (OFF by default)."
 }

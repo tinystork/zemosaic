@@ -550,14 +550,13 @@ def test_sds_compute_tile_payload_median_and_stats():
     }
 
 
-def test_sds_compute_tile_payload_coverage_weighted_1pct_threshold():
-    # Low-coverage pixel below 1% of peak is excluded from the weighted median.
+def test_sds_compute_tile_payload_coverage_positive_mask():
+    # F6 (D3): plain finite + explicit-support mask (no 1% derived-constant threshold).
     tile = np.array([[100, 2], [3, 4]], dtype=np.float32)
     cov = np.array([[0.005, 1.0], [1.0, 1.0]], dtype=np.float32)
     _, median, stats = zw._sds_compute_tile_payload(tile, cov)
-    # threshold = 0.01 * 1.0 = 0.01; pixel [0,0] cov=0.005 < threshold -> excluded
-    # median of [2,3,4] = 3.0 (not median of [100,2,3,4] = 3.5)
-    assert median == 3.0
+    # mask = cov > 0.0 includes the low-coverage pixel [0,0]; median of [100,2,3,4] = 3.5.
+    assert median == 3.5
     assert stats["coverage_max"] == 1.0
     assert stats["coverage_weight"] == pytest.approx(3.005)
 
@@ -582,17 +581,18 @@ def test_sds_compute_tile_payload_all_invalid_and_positive_abs():
 
 
 def test_sds_choose_reference_index_contracts():
-    def payload(w):
-        return (np.zeros((1, 1), dtype=np.float32), 1.0, {"coverage_weight": w})
+    # F6 (D2): canonical N1 — max VALID SUPPORT COUNT (coverage_pixels), not coverage_weight/central.
+    def payload(pixels):
+        return (np.zeros((1, 1), dtype=np.float32), 1.0, {"coverage_pixels": pixels})
 
-    pl = [payload(0.1), payload(0.9), payload(0.5)]
+    pl = [payload(1), payload(9), payload(5)]
     # requested valid index wins
     assert zw._sds_choose_reference_index(pl, 2) == 2
-    # max coverage_weight selection
+    # max coverage_pixels selection
     assert zw._sds_choose_reference_index(pl, None) == 1
     assert zw._sds_choose_reference_index(pl, 99) == 1
-    # central fallback when no positive coverage weight
-    assert zw._sds_choose_reference_index([payload(0.0), payload(0.0)], None) == 1
+    # no valid support -> first index (0)
+    assert zw._sds_choose_reference_index([payload(0), payload(0)], None) == 0
     # empty list -> 0
     assert zw._sds_choose_reference_index([], None) == 0
 

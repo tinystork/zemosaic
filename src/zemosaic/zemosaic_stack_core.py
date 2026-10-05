@@ -292,9 +292,12 @@ def stack_core(
         median = xp.nanmedian(stacked, axis=0)
         stacked = stacked - median
     elif normalize_method == 'linear_fit':
-        # Placeholder: for now, use median. Full linear fit would require per-pixel regression.
-        median = xp.nanmedian(stacked, axis=0)
-        stacked = stacked - median
+        # N4 (SCI-05): the median-substitution placeholder is removed from supported
+        # paths; this must never silently substitute median.
+        raise ValueError(
+            "normalize_method 'linear_fit' is unsupported (unsupported_removed_sci05); "
+            "use 'none' or 'median' instead"
+        )
     # 'none' : no change
 
     # Outlier rejection

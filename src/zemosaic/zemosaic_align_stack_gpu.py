@@ -914,6 +914,9 @@ def _broadcast_weight_template(weight_template: Any, target_shape: tuple[int, ..
         return None
 
 
+_RADIAL_INERT_LOGGED = False
+
+
 def _compute_radial_weight_map(
     height: int,
     width: int,
@@ -921,37 +924,25 @@ def _compute_radial_weight_map(
     stacking_params: Mapping[str, Any],
     logger: logging.Logger | None,
 ) -> np.ndarray | None:
-    """Create a per-pixel radial weighting map if requested."""
+    """Legacy radial weighting — now INERT (decision K).
 
-    apply_radial = bool(stacking_params.get("apply_radial_weight"))
-    if not apply_radial:
-        return None
-    if not _RADIAL_WEIGHT_AVAILABLE or _make_radial_weight_map is None:
+    The historical radial falloff is deprecated and can never be applied by the
+    canonical/stacking paths; the canonical Coverage support taper (Gate E1)
+    replaces it. Always returns None (regardless of ``apply_radial_weight``) and
+    logs a bounded deprecation note at most once.
+    """
+    global _RADIAL_INERT_LOGGED
+    if not _RADIAL_INERT_LOGGED:
+        _RADIAL_INERT_LOGGED = True
         if logger:
             try:
-                logger.warning("Radial weighting requested but helper unavailable; continuing without it.")
+                logger.info(
+                    "Legacy radial weighting is inert (decision K); the canonical "
+                    "Coverage support taper replaces it — radial weighting is never applied."
+                )
             except Exception:
                 pass
-        return None
-    try:
-        feather = float(stacking_params.get("radial_feather_fraction", 0.8))
-        shape_power = float(stacking_params.get("radial_shape_power", 2.0))
-    except Exception:
-        feather = 0.8
-        shape_power = 2.0
-    try:
-        radial_2d = _make_radial_weight_map(height, width, feather_fraction=feather, shape_power=shape_power)
-        radial_2d = np.asarray(radial_2d, dtype=np.float32)
-        if channels == 1:
-            return radial_2d[..., None]
-        return np.repeat(radial_2d[..., None], channels, axis=2)
-    except Exception as exc:
-        if logger:
-            try:
-                logger.warning("Radial weighting failed (%s); continuing without it.", exc)
-            except Exception:
-                pass
-        return None
+    return None
 
 
 def _build_wsc_weights_block(
@@ -1743,7 +1734,7 @@ def gpu_stack_from_arrays(
                 elif algo in {"kappa_sigma", "sigma_clip"}:
                     data_gpu = _kappa_clip_chunk(data_gpu, kappa_low, kappa_high)
                 elif algo in {"linear_fit_clip"}:
-                    raise GPUStackingError("linear_fit_clip is not implemented for GPU stacking yet")
+                    raise GPUStackingError("linear_fit_clip is unsupported (unsupported_removed_sci05)")
                 prof_reject_ms += (time.perf_counter() - t1) * 1000.0
 
                 t2 = time.perf_counter()

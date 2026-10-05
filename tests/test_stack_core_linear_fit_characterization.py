@@ -128,34 +128,34 @@ def _run_core(images, normalize, *, final="mean"):
 
 @pytest.mark.parametrize("final", ["mean", "median"])
 def test_stack_core_linear_fit_identical_to_median(final):
-    """``linear_fit`` runs the exact median-subtraction code; bit-identical to ``median``."""
+    """Gate A/SCI-02 recorded ``linear_fit`` == ``median`` (bit-exact placeholder); Gate F1
+    (N4) removed the placeholder: ``linear_fit`` now raises, never silently becomes median."""
     images = _affine_corpus()
-    lf_result, lf_rej, lf_ws = _run_core(images, "linear_fit", final=final)
-    med_result, med_rej, med_ws = _run_core(images, "median", final=final)
+    with pytest.raises(ValueError) as ei:
+        _run_core(images, "linear_fit", final=final)
+    assert "unsupported_removed_sci05" in str(ei.value)
 
-    np.testing.assert_array_equal(lf_result, med_result)
-    assert float(lf_rej) == float(med_rej) == 0.0
-    np.testing.assert_array_equal(lf_ws, med_ws)
+    med_result, med_rej, med_ws = _run_core(images, "median", final=final)
+    assert med_result.shape == (_H, _W, _C)
+    assert float(med_rej) == 0.0
 
 
 def test_stack_core_linear_fit_differs_from_none():
-    """The placeholder does change the stack (median subtraction), unlike ``none``."""
+    """Gate F1 (N4): ``linear_fit`` is now unsupported (raises); ``none`` still works."""
     images = _affine_corpus()
-    lf_result, _, _ = _run_core(images, "linear_fit")
-    none_result, _, _ = _run_core(images, "none")
+    with pytest.raises(ValueError) as ei:
+        _run_core(images, "linear_fit")
+    assert "unsupported_removed_sci05" in str(ei.value)
 
-    assert lf_result.shape == none_result.shape == (_H, _W, _C)
-    assert lf_result.dtype == none_result.dtype == np.float32
-    # Median subtraction recentres the stack around zero; 'none' keeps the raw mean.
-    assert not np.allclose(lf_result, none_result, rtol=1e-4, atol=1e-4)
+    none_result, _, _ = _run_core(images, "none")
+    assert none_result.shape == (_H, _W, _C)
+    assert none_result.dtype == np.float32
 
 
 def test_stack_core_linear_fit_is_not_affine_mapping():
-    """Placeholder is NOT a genuine affine mapping.
-
-    On the affine corpus, Grid's real ``_normalize_patches(linear_fit)`` maps every target
-    back onto the reference (max err ~3e-5), whereas ``stack_core`` ``linear_fit``
-    (median subtraction) does not — its output stays far from the reference.
+    """Gate F1 (N4): the stack_core median placeholder is gone (raises); Grid's real
+    ``_normalize_patches(linear_fit)`` affine mapping is unaffected and still maps targets
+    onto the reference.
     """
     ref = _ref_patch()
     images = _affine_corpus()
@@ -164,17 +164,16 @@ def test_stack_core_linear_fit_is_not_affine_mapping():
     for patch in normalized:
         np.testing.assert_allclose(patch, ref, rtol=1e-3, atol=1e-3)
 
-    core_result, _, _ = _run_core(images, "linear_fit")
-    # Median subtraction leaves residual per-pixel offsets; it does NOT collapse the
-    # affine family onto the reference (which would be the affine-mapping behavior).
-    assert not np.allclose(core_result, ref, rtol=1e-1, atol=1.0)
-    assert float(np.max(np.abs(core_result - ref))) > 1.0
+    with pytest.raises(ValueError) as ei:
+        _run_core(images, "linear_fit")
+    assert "unsupported_removed_sci05" in str(ei.value)
 
 
 def test_stack_core_shapes_dtypes_weights():
-    """Pin output shape/dtype/weight_sum/rejected_pct for the placeholder path."""
+    """Pin output shape/dtype/weight_sum/rejected_pct on a supported path (``none``), and
+    assert ``linear_fit`` now raises (Gate F1/N4)."""
     images = _affine_corpus()
-    result, rejected_pct, weight_sum = _run_core(images, "linear_fit")
+    result, rejected_pct, weight_sum = _run_core(images, "none")
 
     assert result.shape == (_H, _W, _C)
     assert result.dtype == np.float32
@@ -183,6 +182,10 @@ def test_stack_core_shapes_dtypes_weights():
     assert float(rejected_pct) == 0.0
     # Equal unit weights, no rejection -> weight_sum == N everywhere.
     np.testing.assert_allclose(weight_sum, np.full((_H, _W, _C), 3.0, dtype=np.float32))
+
+    with pytest.raises(ValueError) as ei:
+        _run_core(images, "linear_fit")
+    assert "unsupported_removed_sci05" in str(ei.value)
 
 
 # NaN / masked semantics are NOT_RUN here: the corpus is all-finite and does not exercise
@@ -506,8 +509,9 @@ def test_grid_affine_regression_distinct_from_classic_percentile(monkeypatch):
 
 
 def test_linear_fit_clip_rejection_is_separate_noop_placeholder():
-    """``_reject_outliers_linear_fit_clip`` is a *rejection* placeholder: it returns the
-    input unchanged with an all-True keep mask (does no normalization, no rejection)."""
+    """``_reject_outliers_linear_fit_clip`` is a legacy/unreachable *rejection* helper
+    (Gate F1/R3): it returns the input unchanged with an all-True keep mask. No supported
+    caller invokes it; any request fails upstream with ``unsupported_removed_sci05``."""
     stack = np.stack(_affine_corpus(), axis=0)
     out, mask = zemosaic_align_stack._reject_outliers_linear_fit_clip(stack)
 
@@ -529,10 +533,12 @@ def test_selecting_normalization_does_not_select_rejection(monkeypatch):
     monkeypatch.setattr(zemosaic_align_stack, "_reject_outliers_linear_fit_clip", forbidden_reject)
     monkeypatch.setattr(zemosaic_align_stack, "stack_linear_fit_clip", forbidden_reject)
 
-    # Grid CPU route with normalization=linear_fit, rejection=none.
+    # Grid CPU route with normalization=linear_fit, rejection=none (real affine path).
     grid_mode._stack_weighted_patches(images, _ones_weights(len(images)), _grid_config("linear_fit", "none"))
-    # Shared core route with normalization=linear_fit, rejection=none.
-    _run_core(images, "linear_fit")
+    # Shared core route with normalization=linear_fit now raises (never substitutes median).
+    with pytest.raises(ValueError) as ei:
+        _run_core(images, "linear_fit")
+    assert "unsupported_removed_sci05" in str(ei.value)
     # Classic normalize helper (the real affine path) — no rejection involved.
     zemosaic_align_stack._normalize_images_linear_fit(images, reference_index=0)
 

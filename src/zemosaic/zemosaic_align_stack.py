@@ -207,6 +207,7 @@ def _winsorize_block_numpy(arr_block: np.ndarray, limits: tuple[float, float]) -
 
 ZEMOSAIC_UTILS_AVAILABLE_FOR_RADIAL = False
 make_radial_weight_map_func = None
+_RADIAL_INERT_LOGGED = False
 try:
     from .zemosaic_utils import make_radial_weight_map
     make_radial_weight_map_func = make_radial_weight_map
@@ -1765,6 +1766,10 @@ def stack_winsorized_sigma_clip(
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
 
+    LEGACY / UNREACHABLE (SCI-05 Gate F6, rework-3): no supported caller invokes this
+    wrapper — the Classic CPU master-tile and mosaic-assembly routes now go through the
+    canonical engine (``run_canonical_stack``). Kept callable for compatibility only.
+
     - En mode legacy, la voie GPU ignore les `weights`.
     - Si la voie GPU échoue ou viole la parité WSC, fallback CPU (WSC uniquement).
     - La voie CPU accepte `weights` en mot-clé si fournis.
@@ -2406,6 +2411,10 @@ def stack_kappa_sigma_clip(
 ):
     """Wrapper calling GPU or CPU kappa-sigma clip.
 
+    LEGACY / UNREACHABLE (SCI-05 Gate F6, rework-3): no supported caller invokes this
+    wrapper — the Classic CPU master-tile and mosaic-assembly routes now go through the
+    canonical engine (``run_canonical_stack``). Kept callable for compatibility only.
+
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
     falls back to the legacy ``use_gpu_phase5`` flag used by the GUI.
     """
@@ -2532,6 +2541,10 @@ def stack_linear_fit_clip(
     **kwargs,
 ):
     """Wrapper calling GPU or CPU linear fit clip.
+
+    LEGACY / UNREACHABLE (SCI-05 Gate F1, decision R3): ``linear_fit_clip`` was
+    removed from supported paths. No supported caller invokes this wrapper; any
+    programmatic request fails upstream with ``unsupported_removed_sci05``.
 
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
     falls back to the legacy ``use_gpu_phase5`` flag used by the GUI.
@@ -2743,10 +2756,16 @@ def align_images_in_group(image_data_list: list,
                           detection_sigma: float = 3.0,
                           min_area: int = 5,
                           propagate_mask: bool = False,
-                          progress_callback: callable = None) -> tuple[list, list[int]]:
+                          progress_callback: callable = None,
+                          return_footprints: bool = False):
     """
     Aligne une liste d'images (données NumPy HWC, float32, ADU) sur une image de référence
     de ce même groupe en utilisant astroalign.
+
+    When ``return_footprints=True``, returns ``(aligned_images, failed_indices,
+    footprints)`` where ``footprints[i]`` is the per-frame transform-derived geometric
+    footprint (2-D bool, all-True for the reference identity frame, or ``None`` for an
+    excluded frame). Otherwise returns the legacy 2-tuple.
     """
     # Define a local alias for the callback
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
@@ -2883,6 +2902,15 @@ def align_images_in_group(image_data_list: list,
         xt = slice(max(0, -dx), max(0, -dx) + (xs.stop - xs.start))
         return yt, xt
 
+    def _fft_overlap_footprint(fft_out: np.ndarray, dy: int, dx: int) -> np.ndarray:
+        """Axis-aligned overlap rectangle (transform-derived geometric footprint)."""
+        h, w = fft_out.shape[:2]
+        yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
+        fp = np.zeros((h, w), dtype=bool)
+        if (yt.stop - yt.start) > 0 and (xt.stop - xt.start) > 0:
+            fp[yt, xt] = True
+        return fp
+
     # Internal GPU FFT phase-correlation aligner (translation only)
     def _fft_phase_shift(src2d: np.ndarray, ref2d: np.ndarray) -> tuple[int, int, float]:
         """Return (dy, dx, confidence_ratio). Uses CuPy if available, else NumPy."""
@@ -2952,26 +2980,34 @@ def align_images_in_group(image_data_list: list,
         # We'll still try FFT phase-correlation if possible
         if not image_data_list or not (0 <= reference_image_index < len(image_data_list)):
             empty = [None] * len(image_data_list)
+            if return_footprints:
+                return empty, list(range(len(empty))), [None] * len(empty)
             return empty, list(range(len(empty)))
         ref = image_data_list[reference_image_index]
         if ref is None:
             empty = [None] * len(image_data_list)
+            if return_footprints:
+                return empty, list(range(len(empty))), [None] * len(empty)
             return empty, list(range(len(empty)))
         if ref.ndim == 3 and ref.shape[-1] == 3:
             ref_lum = 0.299 * ref[..., 0] + 0.587 * ref[..., 1] + 0.114 * ref[..., 2]
         else:
             ref_lum = ref.astype(np.float32, copy=False)
         aligned = [None] * len(image_data_list)
+        footprints = [None] * len(image_data_list) if return_footprints else None
         for i, src in enumerate(image_data_list):
             if src is None:
                 continue
             if i == reference_image_index:
                 aligned[i] = ref.astype(np.float32, copy=True)
+                if footprints is not None:
+                    footprints[i] = np.ones(ref.shape[:2], dtype=bool)
                 continue
             src_lum = (0.299 * src[..., 0] + 0.587 * src[..., 1] + 0.114 * src[..., 2]).astype(np.float32) if (src.ndim == 3 and src.shape[-1] == 3) else src.astype(np.float32)
             dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
             if abs(dy) > 0 or abs(dx) > 0:
                 fft_aligned = _apply_integer_shift_hw_or_hwc(src.astype(np.float32, copy=False), dy, dx)
+                valid_hw = None
                 if propagate_mask and isinstance(fft_aligned, np.ndarray) and fft_aligned.ndim >= 2:
                     h, w = fft_aligned.shape[:2]
                     yt, xt = _overlap_slices_from_shift(h, w, dy, dx)
@@ -2992,15 +3028,23 @@ def align_images_in_group(image_data_list: list,
                         except Exception:
                             pass
                         fft_aligned = _nanize_outside_mask_hw(fft_aligned, valid_hw, img_idx=i, tag="fft_only")
+                if footprints is not None:
+                    footprints[i] = valid_hw if valid_hw is not None else np.ones(fft_aligned.shape[:2], dtype=bool)
                 aligned[i] = fft_aligned
             else:
                 aligned[i] = src.astype(np.float32, copy=True)
+                if footprints is not None:
+                    footprints[i] = np.ones(src.shape[:2], dtype=bool)
         failed_idx = [idx for idx, img in enumerate(aligned) if img is None]
+        if return_footprints:
+            return aligned, failed_idx, footprints
         return aligned, failed_idx
 
     if not image_data_list or not (0 <= reference_image_index < len(image_data_list)):
         _pcb("aligngroup_error_invalid_input_list_or_ref_index", lvl="ERROR", ref_idx=reference_image_index)
         empty = [None] * len(image_data_list)
+        if return_footprints:
+            return empty, list(range(len(empty))), [None] * len(empty)
         return empty, list(range(len(empty)))
 
     pad_applied = False
@@ -3010,6 +3054,8 @@ def align_images_in_group(image_data_list: list,
         if reference_image_adu is None:
             _pcb("aligngroup_error_ref_image_none", lvl="ERROR", ref_idx=reference_image_index)
             empty = [None] * len(image_data_list)
+            if return_footprints:
+                return empty, list(range(len(empty))), [None] * len(empty)
             return empty, list(range(len(empty)))
 
         if reference_image_adu.dtype != np.float32:
@@ -3018,6 +3064,7 @@ def align_images_in_group(image_data_list: list,
 
         _pcb(f"AlignGroup: Alignement intra-tuile sur réf. idx {reference_image_index} (shape {reference_image_adu.shape}).", lvl="DEBUG")
         aligned_images = [None] * len(image_data_list)
+        footprints = [None] * len(image_data_list) if return_footprints else None
 
         for i, source_image_adu_orig in enumerate(image_data_list):
             if source_image_adu_orig is None:
@@ -3028,6 +3075,8 @@ def align_images_in_group(image_data_list: list,
 
             if i == reference_image_index:
                 aligned_images[i] = reference_image_adu.copy()
+                if footprints is not None:
+                    footprints[i] = np.ones(reference_image_adu.shape[:2], dtype=bool)
                 _pcb(f"AlignGroup: Image {i} est la référence, copiée.", lvl="DEBUG_DETAIL")
                 continue
 
@@ -3127,6 +3176,8 @@ def align_images_in_group(image_data_list: list,
                                     except Exception:
                                         pass
                                     fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
+                            if footprints is not None:
+                                footprints[i] = _fft_overlap_footprint(fft_out, dy, dx)
                             aligned_images[i] = fft_out
                             _pcb("AlignGroup: Fallback FFT-only après mismatch de forme.", lvl="WARN")
                         else:
@@ -3166,6 +3217,20 @@ def align_images_in_group(image_data_list: list,
                                     img_idx=i,
                                     tag="astroalign",
                                 )
+                        if footprints is not None:
+                            if fp2d is None:
+                                try:
+                                    _pcb(
+                                        "AlignGroup: no honest footprint -> frame excluded",
+                                        lvl="WARN",
+                                        img_idx=int(i),
+                                        reason=str(ignore_reason),
+                                    )
+                                except Exception:
+                                    pass
+                                aligned_images[i] = None
+                                continue
+                            footprints[i] = fp2d
                         aligned_images[i] = aligned_out
                         _pcb(f"AlignGroup: Image {i} alignée (affine).", lvl="DEBUG_DETAIL")
                 else:
@@ -3194,6 +3259,8 @@ def align_images_in_group(image_data_list: list,
                                 except Exception:
                                     pass
                                 fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
+                        if footprints is not None:
+                            footprints[i] = _fft_overlap_footprint(fft_out, dy, dx)
                         aligned_images[i] = fft_out
                         _pcb("AlignGroup: Fallback FFT-only (astroalign None).", lvl="WARN")
                     else:
@@ -3226,6 +3293,8 @@ def align_images_in_group(image_data_list: list,
                                 except Exception:
                                     pass
                                 fft_out = _nanize_outside_mask_hw(fft_out, valid_hw, img_idx=i, tag="fft_fallback")
+                        if footprints is not None:
+                            footprints[i] = _fft_overlap_footprint(fft_out, dy, dx)
                         aligned_images[i] = fft_out
                         _pcb("AlignGroup: Fallback FFT-only (MaxIterError).", lvl="WARN")
                     else:
@@ -3289,6 +3358,8 @@ def align_images_in_group(image_data_list: list,
                     err_type=type(exc).__name__,
                     diag=diag,
                 )
+        if return_footprints:
+            return aligned_images, failed_indices, footprints
         return aligned_images, failed_indices
 
 
@@ -4735,6 +4806,11 @@ def _reject_outliers_linear_fit_clip(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Rejette les outliers en utilisant un Linear Fit Clipping (PLACEHOLDER).
+
+    LEGACY / UNREACHABLE (SCI-05 Gate F1, decision R3): ``linear_fit_clip`` was
+    removed from supported paths; no supported caller invokes this helper and any
+    programmatic request fails upstream with ``unsupported_removed_sci05``.
+
     Cette méthode vise à modéliser et à soustraire les variations lentes (gradients)
     entre les images et l'image de référence (ex: médiane du stack), puis à rejeter
     les pixels qui s'écartent significativement de ce modèle.
@@ -4764,6 +4840,110 @@ def _reject_outliers_linear_fit_clip(
 
 # ... (imports et autres fonctions restent les mêmes) ...
 
+
+_SUPPORTED_REJECTION_TOKENS = ("none", "kappa_sigma", "winsorized_sigma_clip")
+
+
+def _validate_rejection_token(rejection_algorithm) -> str:
+    """Normalize + validate a rejection token (SCI-05 R1/R3 central guard).
+
+    Returns the normalized (strip/lower) token for the supported set; raises for the
+    removed ``linear_fit_clip`` token (``unsupported_removed_sci05``) and for
+    unknown/alias tokens (never a silent no-rejection / silent degradation).
+    """
+    token = "none" if rejection_algorithm is None else str(rejection_algorithm).strip().lower()
+    if token == "linear_fit_clip":
+        raise ValueError(
+            "rejection algorithm 'linear_fit_clip' is unsupported (unsupported_removed_sci05)"
+        )
+    if token not in _SUPPORTED_REJECTION_TOKENS:
+        raise ValueError(
+            f"unknown rejection algorithm {rejection_algorithm!r}; expected "
+            "'none', 'kappa_sigma', or 'winsorized_sigma_clip'"
+        )
+    return token
+
+
+def _stack_via_canonical_engine(
+    aligned_image_data_list: list,
+    geometric_support: list,
+    *,
+    normalize_method: str,
+    weighting_method: str,
+    rejection_algorithm: str,
+    final_combine_method: str,
+    sigma_clip_low: float,
+    sigma_clip_high: float,
+    winsor_limits: tuple[float, float],
+    zconfig,
+    progress_callback: callable,
+    reference_index: int | None = 0,
+) -> np.ndarray | None:
+    """Route Classic CPU stacking through the accepted canonical engine (Gate F2).
+
+    The ``geometric_support`` masks are the transform-derived alignment footprints
+    threaded from ``align_images_in_group`` and passed verbatim to the engine (never
+    inferred from brightness/NaN). ``coverage_support_taper`` (default ON) selects the
+    footprint taper for the estimator-weight map. Backend is CPU-only in F2.
+    """
+    from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
+
+    images: list = []
+    supports: list = []
+    for img, sup in zip(aligned_image_data_list, geometric_support):
+        if img is None:
+            continue
+        images.append(img)
+        supports.append(sup)
+    if not images:
+        return None
+
+    taper_enabled = True
+    try:
+        taper_enabled = bool(getattr(zconfig, "coverage_support_taper", True))
+    except Exception:
+        taper_enabled = True
+
+    request = CanonicalStackRequest(
+        images=images,
+        geometric_support=supports,
+        normalization=normalize_method,
+        weighting=weighting_method,
+        rejection=rejection_algorithm,
+        combine=final_combine_method,
+        reference_index=reference_index,
+        taper="footprint" if taper_enabled else "none",
+        taper_px=8.0,
+        taper_floor=0.0,
+        sigma_low=float(sigma_clip_low),
+        sigma_high=float(sigma_clip_high),
+        winsor_limit_low=float(winsor_limits[0]),
+        winsor_limit_high=float(winsor_limits[1]),
+        backend="cpu",
+        equalize_rgb=False,
+    )
+
+    result = run_canonical_stack(request)
+
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                "STACK_CANONICAL_EFFECTIVE",
+                None,
+                "INFO",
+                normalization=normalize_method,
+                weighting=weighting_method,
+                rejection=rejection_algorithm,
+                combine=final_combine_method,
+                taper=request.taper,
+                n_frames=int(result.n_frames),
+            )
+        except Exception:
+            pass
+
+    return result.science
+
+
 def stack_aligned_images(
     aligned_image_data_list: list[np.ndarray | None],
     normalize_method: str = 'none',
@@ -4782,6 +4962,8 @@ def stack_aligned_images(
     zconfig=None,
     stack_metadata: dict | None = None,
     parallel_plan=None,
+    geometric_support: list | None = None,
+    reference_index: int | None = 0,
 ) -> np.ndarray | None:
     """
     Stacke une liste d'images alignées, appliquant normalisation, pondération (qualité + radiale),
@@ -4789,6 +4971,26 @@ def stack_aligned_images(
     ``winsor_max_workers`` permet de paralléliser la phase de Winsorisation lors
     du rejet Winsorized Sigma Clip.
     """
+    # Central rejection-token guard (SCI-05 R1/R3): normalize + validate so
+    # 'linear_fit_clip' (any case/whitespace) and unknown tokens fail explicitly.
+    rejection_algorithm = _validate_rejection_token(rejection_algorithm)
+    # Gate F2/R1: when the geometric footprints are threaded (from align_images_in_group),
+    # route the Classic CPU stacking through the accepted canonical engine.
+    if geometric_support is not None:
+        return _stack_via_canonical_engine(
+            aligned_image_data_list,
+            geometric_support,
+            normalize_method=normalize_method,
+            weighting_method=weighting_method,
+            rejection_algorithm=rejection_algorithm,
+            final_combine_method=final_combine_method,
+            sigma_clip_low=sigma_clip_low,
+            sigma_clip_high=sigma_clip_high,
+            winsor_limits=winsor_limits,
+            zconfig=zconfig,
+            progress_callback=progress_callback,
+            reference_index=reference_index,
+        )
     # Wrapper: demote very verbose internal logs so they don't flood the GUI
     def _pcb(msg_key, prog=None, lvl="INFO_DETAIL", **kwargs):
         level = lvl
@@ -5040,18 +5242,16 @@ def stack_aligned_images(
     # --- PONDÉRATION RADIALE ---
     final_radial_weights_list = [None] * len(current_images_data_list)
     _pcb(f"STACK_IMG_WEIGHT_RAD: Début calcul poids radiaux. Apply: {apply_radial_weight}", lvl="ERROR")
-    if apply_radial_weight and ZEMOSAIC_UTILS_AVAILABLE_FOR_RADIAL and make_radial_weight_map_func:
-        for idx, img_data_HWC in enumerate(current_images_data_list):
-            if img_data_HWC is None: continue
-            h, w = img_data_HWC.shape[:2]
-            try:
-                w_radial_2d = make_radial_weight_map_func(h, w, feather_fraction=radial_feather_fraction, shape_power=radial_shape_power)
-                if img_data_HWC.ndim == 3:
-                    final_radial_weights_list[idx] = np.repeat(w_radial_2d[..., np.newaxis], img_data_HWC.shape[-1], axis=2).astype(np.float32, copy=False)
-                elif img_data_HWC.ndim == 2:
-                    final_radial_weights_list[idx] = w_radial_2d.astype(np.float32, copy=False)
-            except Exception as e_radw_post: # ... log erreur ...
-                final_radial_weights_list[idx] = np.ones_like(img_data_HWC, dtype=np.float32)
+    if apply_radial_weight:
+        # F3 (decision K): the legacy radial map is inert — never built/applied. Radial
+        # weights stay None so no radial map ever multiplies image/quality weights.
+        global _RADIAL_INERT_LOGGED
+        if not _RADIAL_INERT_LOGGED:
+            _RADIAL_INERT_LOGGED = True
+            _internal_logger.warning(
+                "Legacy radial weighting is inert (SCI-05 decision K): apply_radial_weight "
+                "has no effect on the Classic stacking path"
+            )
     _pcb(f"STACK_IMG_WEIGHT_RAD: Fin calcul poids radiaux. final_radial_weights_list is {'None' if final_radial_weights_list is None else 'Exists'}.", lvl="ERROR")
     if final_radial_weights_list and any(w is not None for w in final_radial_weights_list):
         first_valid_r_weight = next((w for w in final_radial_weights_list if w is not None), None)
