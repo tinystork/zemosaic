@@ -170,11 +170,12 @@ class TestQtStackingTokens:
     def test_rejection_tokens_and_labels(self):
         opts = _gui_option_lists()["reject_options"]
         got = [(v, label) for v, _k, label in opts]
+        # Gate A/R3 snapshot recorded 'linear_fit_clip' as a visible Qt choice; Gate F1
+        # removed it (decision R3).
         assert got == [
             ("none", "None"),
             ("kappa_sigma", "Kappa-Sigma Clip"),
             ("winsorized_sigma_clip", "Winsorized Sigma Clip"),
-            ("linear_fit_clip", "Linear Fit Clip"),
         ]
 
     def test_combine_tokens_and_labels(self):
@@ -236,32 +237,25 @@ def _affine_frames() -> list[np.ndarray]:
 
 class TestStackCorePlaceholderCrossCheck:
     def test_linear_fit_is_median_bit_exact(self):
-        # SCI-02: linear_fit executes the exact same median-subtraction code.
-        a, _r, _ws = zemosaic_stack_core.stack_core(
-            _affine_frames(),
-            stack_config={"normalize_method": "linear_fit", "final_combine_method": "mean"},
-            backend="cpu",
-        )
-        b, _r2, _ws2 = zemosaic_stack_core.stack_core(
-            _affine_frames(),
-            stack_config={"normalize_method": "median", "final_combine_method": "mean"},
-            backend="cpu",
-        )
-        assert np.array_equal(a, b)
+        # Gate A/SCI-02 recorded linear_fit == median (bit-exact placeholder); Gate F1 (N4)
+        # removed the placeholder: linear_fit now raises, never silently becomes median.
+        with pytest.raises(ValueError) as ei:
+            zemosaic_stack_core.stack_core(
+                _affine_frames(),
+                stack_config={"normalize_method": "linear_fit", "final_combine_method": "mean"},
+                backend="cpu",
+            )
+        assert "unsupported_removed_sci05" in str(ei.value)
 
     def test_linear_fit_differs_from_none(self):
-        # Placeholder is not a no-op; it re-centres (median subtraction) the stack.
-        a, _r, _ws = zemosaic_stack_core.stack_core(
-            _affine_frames(),
-            stack_config={"normalize_method": "linear_fit", "final_combine_method": "mean"},
-            backend="cpu",
-        )
-        n, _r2, _ws2 = zemosaic_stack_core.stack_core(
-            _affine_frames(),
-            stack_config={"normalize_method": "none", "final_combine_method": "mean"},
-            backend="cpu",
-        )
-        assert not np.array_equal(a, n)
+        # Gate F1 (N4): linear_fit no longer re-centres the stack; it raises instead.
+        with pytest.raises(ValueError) as ei:
+            zemosaic_stack_core.stack_core(
+                _affine_frames(),
+                stack_config={"normalize_method": "linear_fit", "final_combine_method": "mean"},
+                backend="cpu",
+            )
+        assert "unsupported_removed_sci05" in str(ei.value)
 
     def test_winsorized_simplified_diverges_from_pixinsight_wsc(self, monkeypatch):
         # SCI-01: stack_core winsorized = median/σ clip (keeps an impulse outlier
@@ -295,6 +289,8 @@ class TestStackCorePlaceholderCrossCheck:
 
 class TestLinearFitClipPlaceholder:
     def test_reject_outliers_linear_fit_clip_is_noop(self):
+        # Gate F1 (R3): the helper remains only as a legacy/unreachable no-op; no supported
+        # caller invokes it.
         stacked = np.array([[[[1.0]], [[2.0]], [[100.0]]]], dtype=np.float32)
         out, mask = zas._reject_outliers_linear_fit_clip(stacked)
         assert np.array_equal(out, stacked)  # returned unchanged

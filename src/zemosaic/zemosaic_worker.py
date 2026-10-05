@@ -8318,15 +8318,11 @@ def _run_phase4_5_inter_master_merge(
                             )
                         if stack_result is not None:
                             super_arr = stack_result[0] if isinstance(stack_result, (tuple, list)) else stack_result
-                    elif reject_algo == "linear_fit_clip" and hasattr(zemosaic_align_stack, "stack_linear_fit_clip"):
-                        result = zemosaic_align_stack.stack_linear_fit_clip(
-                            frames,
-                            weight_method=weight_method,
-                            zconfig=None,
-                            sigma=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
-                            parallel_plan=current_parallel_plan,
+                    elif reject_algo == "linear_fit_clip":
+                        raise ValueError(
+                            "rejection algorithm 'linear_fit_clip' is unsupported "
+                            "(unsupported_removed_sci05)"
                         )
-                        super_arr = result[0] if isinstance(result, (tuple, list)) else result
 
                     if super_arr is None:
                         stack_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
@@ -15615,13 +15611,9 @@ def _stack_master_tile_cpu(
                 parallel_plan=current_parallel_plan,
             )
         elif stack_reject_algo == "linear_fit_clip":
-            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-                aligned_images_for_stack,
-                weight_method=stack_weight_method,
-                zconfig=zconfig,
-                sigma=stack_kappa_high,
-                stack_metadata=stack_metadata,
-                parallel_plan=current_parallel_plan,
+            raise ValueError(
+                "rejection algorithm 'linear_fit_clip' is unsupported "
+                "(unsupported_removed_sci05)"
             )
         else:
             master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
@@ -17303,7 +17295,7 @@ def create_master_tile(
     # - pass adaptation enabled only for winsorized sigma clip (validated streaming/memmap path)
     # - chunk adaptation enabled for winsorized/kappa/linear-fit paths
     pass_adapt_enabled = reject_algo_norm == "winsorized_sigma_clip"
-    chunk_adapt_enabled = reject_algo_norm in {"winsorized_sigma_clip", "kappa_sigma", "linear_fit_clip"}
+    chunk_adapt_enabled = reject_algo_norm in {"winsorized_sigma_clip", "kappa_sigma"}
 
     try:
         vm = psutil.virtual_memory()

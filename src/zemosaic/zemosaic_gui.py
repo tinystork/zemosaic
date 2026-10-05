@@ -447,7 +447,7 @@ class ZeMosaicGUI:
         # --- Définition des listes de clés pour les ComboBoxes ---
         self.norm_method_keys = ["none", "linear_fit", "sky_mean"]
         self.weight_method_keys = ["none", "noise_variance", "noise_fwhm"]
-        self.reject_algo_keys = ["none", "kappa_sigma", "winsorized_sigma_clip", "linear_fit_clip"]
+        self.reject_algo_keys = ["none", "kappa_sigma", "winsorized_sigma_clip"]
         self.combine_method_keys = ["mean", "median"]
         self.assembly_method_keys = ["reproject_coadd", "incremental"]
         # --- FIN Définition des listes de clés ---
@@ -2576,11 +2576,6 @@ class ZeMosaicGUI:
         elif selected_algo == "winsorized_sigma_clip":
             kappa_params_state = tk.NORMAL  # Kappa est utilisé APRES la winsorisation
             winsor_params_state = tk.NORMAL
-        elif selected_algo == "linear_fit_clip":
-            # Pour l'instant, on désactive tout, car les paramètres spécifiques ne sont pas définis.
-            # Si Linear Fit Clip utilisait Kappa, on mettrait kappa_params_state = tk.NORMAL
-            kappa_params_state = tk.DISABLED 
-            winsor_params_state = tk.DISABLED
         elif selected_algo == "none":
             kappa_params_state = tk.DISABLED
             winsor_params_state = tk.DISABLED

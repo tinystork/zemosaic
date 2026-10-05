@@ -1734,7 +1734,7 @@ def gpu_stack_from_arrays(
                 elif algo in {"kappa_sigma", "sigma_clip"}:
                     data_gpu = _kappa_clip_chunk(data_gpu, kappa_low, kappa_high)
                 elif algo in {"linear_fit_clip"}:
-                    raise GPUStackingError("linear_fit_clip is not implemented for GPU stacking yet")
+                    raise GPUStackingError("linear_fit_clip is unsupported (unsupported_removed_sci05)")
                 prof_reject_ms += (time.perf_counter() - t1) * 1000.0
 
                 t2 = time.perf_counter()

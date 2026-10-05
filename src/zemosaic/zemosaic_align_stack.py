@@ -2533,6 +2533,10 @@ def stack_linear_fit_clip(
 ):
     """Wrapper calling GPU or CPU linear fit clip.
 
+    LEGACY / UNREACHABLE (SCI-05 Gate F1, decision R3): ``linear_fit_clip`` was
+    removed from supported paths. No supported caller invokes this wrapper; any
+    programmatic request fails upstream with ``unsupported_removed_sci05``.
+
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
     falls back to the legacy ``use_gpu_phase5`` flag used by the GUI.
     """
@@ -4735,6 +4739,11 @@ def _reject_outliers_linear_fit_clip(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Rejette les outliers en utilisant un Linear Fit Clipping (PLACEHOLDER).
+
+    LEGACY / UNREACHABLE (SCI-05 Gate F1, decision R3): ``linear_fit_clip`` was
+    removed from supported paths; no supported caller invokes this helper and any
+    programmatic request fails upstream with ``unsupported_removed_sci05``.
+
     Cette méthode vise à modéliser et à soustraire les variations lentes (gradients)
     entre les images et l'image de référence (ex: médiane du stack), puis à rejeter
     les pixels qui s'écartent significativement de ce modèle.
@@ -4764,6 +4773,30 @@ def _reject_outliers_linear_fit_clip(
 
 # ... (imports et autres fonctions restent les mêmes) ...
 
+
+_SUPPORTED_REJECTION_TOKENS = ("none", "kappa_sigma", "winsorized_sigma_clip")
+
+
+def _validate_rejection_token(rejection_algorithm) -> str:
+    """Normalize + validate a rejection token (SCI-05 R1/R3 central guard).
+
+    Returns the normalized (strip/lower) token for the supported set; raises for the
+    removed ``linear_fit_clip`` token (``unsupported_removed_sci05``) and for
+    unknown/alias tokens (never a silent no-rejection / silent degradation).
+    """
+    token = "none" if rejection_algorithm is None else str(rejection_algorithm).strip().lower()
+    if token == "linear_fit_clip":
+        raise ValueError(
+            "rejection algorithm 'linear_fit_clip' is unsupported (unsupported_removed_sci05)"
+        )
+    if token not in _SUPPORTED_REJECTION_TOKENS:
+        raise ValueError(
+            f"unknown rejection algorithm {rejection_algorithm!r}; expected "
+            "'none', 'kappa_sigma', or 'winsorized_sigma_clip'"
+        )
+    return token
+
+
 def stack_aligned_images(
     aligned_image_data_list: list[np.ndarray | None],
     normalize_method: str = 'none',
@@ -4789,6 +4822,9 @@ def stack_aligned_images(
     ``winsor_max_workers`` permet de paralléliser la phase de Winsorisation lors
     du rejet Winsorized Sigma Clip.
     """
+    # Central rejection-token guard (SCI-05 R1/R3): normalize + validate so
+    # 'linear_fit_clip' (any case/whitespace) and unknown tokens fail explicitly.
+    rejection_algorithm = _validate_rejection_token(rejection_algorithm)
     # Wrapper: demote very verbose internal logs so they don't flood the GUI
     def _pcb(msg_key, prog=None, lvl="INFO_DETAIL", **kwargs):
         level = lvl

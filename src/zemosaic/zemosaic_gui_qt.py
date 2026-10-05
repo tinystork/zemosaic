@@ -2479,7 +2479,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "winsorized_sigma_clip",
                 self._tr("reject_algo_winsorized_sigma_clip", "Winsorized Sigma Clip"),
             ),
-            ("linear_fit_clip", self._tr("reject_algo_linear_fit_clip", "Linear Fit Clip")),
         ]
         for value, label in reject_options:
             reject_combo.addItem(label, value)

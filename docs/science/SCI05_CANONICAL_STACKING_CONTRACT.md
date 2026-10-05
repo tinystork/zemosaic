@@ -155,6 +155,13 @@ offset to valid pixels. N=1 identity. Failure excludes the frame explicitly.
 paths**. Old callers route to the canonical implementation or error — **never** median
 substitution.
 
+**F1 implementation-resolution clarification (N4):**
+* `zemosaic_stack_core.stack_core` now raises an explicit `ValueError` containing
+  `unsupported_removed_sci05` for `normalize_method='linear_fit'` (the median-substitution
+  placeholder is gone); `none`/`median` remain supported. The sole production caller
+  (`grid_mode._stack_weighted_patches_gpu`) already passes `normalize_method='none'` and is
+  unaffected.
+
 ---
 
 ## 6. Quality weights — decision E (W1/W2/W3)
@@ -309,6 +316,18 @@ numeric tolerance.
 Persisted/programmatic token fails validation with explicit `unsupported_removed_sci05`;
 **do NOT** migrate to `none`/`kappa`/WSC. Legacy internal helpers may remain temporarily
 unreachable, clearly legacy, with no supported caller.
+
+**F1 implementation-resolution clarification (R3):**
+* `linear_fit_clip` removed from the Qt/Tk rejection choices; the two worker rejection sites
+  now raise explicitly with `unsupported_removed_sci05` (never silently migrate to
+  `none`/`kappa`/WSC); the GPU error token is aligned; `stack_linear_fit_clip`/
+  `_reject_outliers_linear_fit_clip` remain only as clearly-legacy, unreachable code with no
+  supported caller.
+* **R1 (central guard):** `_validate_rejection_token` (in `zemosaic_align_stack.py`) normalizes
+  (strip/lower) + validates the rejection token at `stack_aligned_images` (the legacy entry
+  point); `linear_fit_clip` (any case/whitespace) raises `unsupported_removed_sci05`, unknown/
+  alias tokens raise an explicit validation error, and `none`/`kappa_sigma`/
+  `winsorized_sigma_clip` pass through unchanged (bit-identical).
 
 **C1 implementation-resolution clarifications (rejection stage):**
 * kappa `std` is the ordinary population std (`ddof=0`) **around the sample mean**, while the
@@ -552,7 +571,7 @@ the incidental Qt dataclass default.
 | N1 | Reference selection: explicit valid `reference_index`; else greatest `count_nonzero(m_i)` (channel-invariant valid mask) on aligned PRE-normalization validity, no weights/rejection; stable tie → lowest index; identity reference; same reference across channels/methods; provenance `explicit`/`auto` + index. |
 | N2 | Single `linear_fit` estimator: float64 OLS + robust MAD refinement (median center, `1.4826*MAD`, ±3·scale, monotonic, ≤5 iters), `0.25 ≤ a ≤ 4.0`, out-of-range fails frame (no clip). |
 | N3 | Low-N/min-pixel gate + failure: `min_common = max(256, ceil(0.01 * min(counts)))`; failure excludes frame with reason; N=1 normalization is identity success; no silent substitution. |
-| N4 | `stack_core` `linear_fit==median` placeholder removed from supported paths; old callers route canonical or error, never median substitution. |
+| N4 | `stack_core` `linear_fit==median` placeholder removed from supported paths; old callers route canonical or error, never median substitution. **F1:** implemented (raises `unsupported_removed_sci05`). |
 | W1 | `noise_fwhm`: real estimator (Photutils 3 `SourceCatalog.fwhm` — **circularized FWHM from equal second-order central moments**; the previously frozen `equivalent_fwhm` is stale/nonexistent in Photutils 3.0.0 and is corrected to `fwhm`); deterministic detection: ≥256 valid luminance samples, sigma-clipped std (3/3, 5 iters) + median background, one `detect_sources` pass `threshold=3σ, n_pixels=5, connectivity=8`, no deblend/second-pass/threshold/property fallback; accept finite `0.8<FWHM<20`, ecc≤0.8, ≥3 accepted sources (else `fwhm_insufficient_sources`), frame FWHM = float64 median (finite >0 else `fwhm_measurement_failed`); **missing OR signature/property-incompatible Photutils fails availability preflight before per-frame work** (disables GUI / persisted fails validation; capabilities: `detect_sources(n_pixels, connectivity, mask)`, `SourceCatalog(mask, progress_bar, .fwhm)`, `SegmentationImage.n_labels`); per-frame insufficient sources excluded; no fallback. |
 | W2 | No exposure fold (`none` = scalar `1.0`); `noise_variance` = raw `1/σ²` then max=1 normalization; no floor/epsilon/constant/unity fallback. |
 | W3 | Exactly one scalar weight per frame, shared across channels; geometric/taper are separate 2-D factors. |
@@ -561,7 +580,7 @@ the incidental Qt dataclass default.
 | S3 | Channel-invariant 2-D support: `m_i` explicit 2-D; `s_i == w_i == q_i*m_i*a_i` per exposure (`q=1` for `none`); `SUP_W1/W2` float64 atomic pair, fail-before-mutation (negative/NaN/Inf/shape/overflow), original-exposure ordered-add, never derived from estimator WHT/rejection; `N_eff` pure derived view `W1²/W2` (overflow-resistant `(W1/√W2)²` fallback, neutral `0` if undefined); donor algorithms source-ported, no runtime ZSSS dependency. **E1:** source-ported into `src/zemosaic/core/canonical_support.py` — `make_footprint_taper` (EDT primary + chamfer fallback), `PositiveSupportAccumulator`/`accumulate_support_pair`, and `build_canonical_estimator_weights` (explicit `(N,H,W)` `w=q*m*a` map for C2). **E2:** assembled by `run_canonical_stack` (`canonical_engine.py`): support accumulated **pre-rejection** (rejection-independent), bounded provenance (per-stage backend: B1/B2/support CPU, C1/C2 requested); Coverage render / RGB equalizer / GUI / caller wiring **not** implemented. **E3:** `coverage_aware_render` source-ported into `canonical_render.py` (preview-only, never mutates science/support). **E4:** `equalize_rgb_medians_canonical` source-ported into `canonical_equalize.py` (out-of-place post-combine, RGB-only). **E5a:** `coverage_support_taper=True`/`coverage_aware_reconstruction=False` config defaults + no-value-mapping `migrate_coverage_settings` (legacy radial inert). **E5b:** Qt/Tk coverage controls + legacy radial runtime-inert (`_compute_radial_weight_map` no-op). |
 | R1 | Unique WSC target: true WSC using both winsor+sigma limits (PixInsight-style defaults); unify `stack_core` simplified and global-coadd percentile clip onto it. |
 | R2 | kappa: median center + population std `ddof=0` (ordinary std **around the mean**, bounds centered on median), sigma `low/high=3.0`, ≤5 iters, inclusive bounds, `stable` = exact mask unchanged; WSC winsor `0.05/0.05`, sigma `3.0`; current-survivor-count `< 3` freezes the cell for that and later iterations; N<3 → explicit no-rejection success. |
-| R3 | Linear Fit Clip: disable/remove (fork B); persisted token fails `unsupported_removed_sci05`; no migration to none/kappa/WSC. |
+| R3 | Linear Fit Clip: disable/remove (fork B); persisted token fails `unsupported_removed_sci05`; no migration to none/kappa/WSC. **F1:** implemented (Qt/Tk choice removed; worker/GPU raise `unsupported_removed_sci05`). **R1:** centralized `_validate_rejection_token` guard at `stack_aligned_images` (normalize + validate). |
 | C1 | Single zero-sum epsilon: denominator is **exactly `>0`** (no epsilon); combine consumes an explicit pre-rejection `w_i=q*m*a` estimator-weight map (no default `a=1`); mean `estimator_weight_sum = Σ w_i` over original survivors. |
 | C2 | Median: unweighted median of `w_i>0` original surviving samples; magnitude ignored; no survivors → NaN; `estimator_weight_sum = count` of `w_i>0` originals (unit effective estimator weights, not `Σ q·m·a`). |
 | G1 | Global-coadd labels route to the same canonical engine; remove percentile-winsorized; no rename (unify science). |
