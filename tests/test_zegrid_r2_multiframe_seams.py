@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from zemosaic.core.zegrid import execution as zx
 from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import science_adapter as zs
 from zemosaic.core.zegrid import seam as zsm
@@ -132,20 +133,26 @@ def test_core_ownership_exactness(manifest, canvas):
 # Heavy tests: real stacks (gated on fixtures + memory)
 # ---------------------------------------------------------------------------
 
-def _run_cell(manifest, canvas, row, col):
+def _run_cell(manifest, canvas, row, col, normalization="linear_fit"):
     _cell, _patch, mem = zsw.build_cell_context(manifest, canvas, row, col)
     keys = list(mem.patch_ids)
     _gate_or_skip(len(keys))
     _ensure_fixtures(keys)
     prepared = {k: _prepared(k) for k in keys}
     return zsw.run_cell_stack(
-        manifest, canvas, prepared, row, col, zs.MiniTileScienceConfig()
+        manifest,
+        canvas,
+        prepared,
+        row,
+        col,
+        zs.MiniTileScienceConfig(normalization=normalization),
     )
 
 
 @pytest.fixture(scope="module")
 def corner_run(manifest, canvas):
-    return _run_cell(manifest, canvas, 0, 0)
+    # FROZEN linear_fit config (R1 default) — documented config-sensitivity control.
+    return _run_cell(manifest, canvas, 0, 0, "linear_fit")
 
 
 def test_corner_cell_single_frame_guard(corner_run):
@@ -167,7 +174,7 @@ def test_section_read_locality(manifest, canvas, corner_run):
 
 def test_permutation_determinism(manifest, canvas, corner_run):
     # Same cell, reversed frame list -> identical reference/exclusion/adequacy.
-    rev = _run_cell(manifest, canvas, 0, 0)  # run_cell_stack sorts internally
+    rev = _run_cell(manifest, canvas, 0, 0, "linear_fit")  # sorts internally
     base = corner_run
     assert rev.reference_frame_id == base.reference_frame_id
     assert rev.excluded == base.excluded
@@ -175,35 +182,79 @@ def test_permutation_determinism(manifest, canvas, corner_run):
     assert rev.adequacy.valid_fraction == base.adequacy.valid_fraction
 
 
+# ---------------------------------------------------------------------------
+# Rework: sky_mean variant — normalization-only defect evidence (no full stack)
+# ---------------------------------------------------------------------------
+
+def test_normalization_defect_evidence(manifest, canvas):
+    """Document the linear_fit defect on real contributors (normalization-only).
+
+    On r0002c0000 (near-full coverage, 97.5% valid), the SCI-05 ``linear_fit``
+    normalization excludes EVERY non-reference frame (``slope_out_of_range``),
+    leaving a single-frame witness; ``sky_mean`` keeps all 23 contributors. This
+    runs only the B1 normalization stage (no weighting/rejection/combine).
+    """
+    from zemosaic.core.canonical_stacking import (
+        normalize_canonical_images,
+        prepare_canonical_inputs,
+    )
+
+    _cell, patch, mem = zsw.build_cell_context(manifest, canvas, 2, 0)  # r0002c0000
+    keys = list(mem.patch_ids)
+    _gate_or_skip(len(keys))
+    _ensure_fixtures(keys)
+    prepared = {k: _prepared(k) for k in keys}
+    by_id = {f.frame_id.logical_path: f for f in manifest}
+    patch_frames = [by_id[k] for k in keys]
+    crop_plans = {
+        f.frame_id.logical_path: zg.plan_source_roi(f, canvas, patch)
+        for f in patch_frames
+    }
+    contribs = zx.build_patch_contributors(
+        patch_frames, prepared, canvas, patch, crop_plans
+    )
+    batch = prepare_canonical_inputs(
+        [c.rgb for c in contribs], [c.geometric_support for c in contribs]
+    )
+    lin = normalize_canonical_images(batch, "linear_fit")
+    sky = normalize_canonical_images(batch, "sky_mean")
+    lin_active = int(np.sum(lin.active_frames))
+    sky_active = int(np.sum(sky.active_frames))
+    # linear_fit excludes every non-reference frame (slope_out_of_range).
+    assert lin_active == 1
+    assert {e.reason for e in lin.exclusions} == {"slope_out_of_range"}
+    # sky_mean keeps all contributors.
+    assert sky_active == len(contribs)
+
+
+# ---------------------------------------------------------------------------
+# Rework: sky_mean chosen-cell guard + adjacent-Cell seam (multi-frame)
+# ---------------------------------------------------------------------------
+
 @pytest.fixture(scope="module")
 def chosen_run(manifest, canvas):
-    # Fast path: the sweep tool persisted an authoritative summary. If it found a
-    # multi-frame cell, verify that cell's persisted adequacy; if BLOCKED (no cell
-    # reached >=3), skip (the acceptance precondition is unmet).
+    import json
+
     summary_path = Path("/home/tristan/zegrid_r2_outputs/sweep_summary.json")
     if summary_path.exists():
-        import json
-
         summary = json.loads(summary_path.read_text())
         chosen = summary.get("chosen_cell")
         if chosen is None:
-            pytest.skip(
-                "BLOCKED: sweep found no candidate with effective_contributor_count>=3 "
-                "(single-frame witnesses only)"
-            )
+            pytest.skip("BLOCKED: no candidate reached effective>=3 under sky_mean")
         rec = json.loads(
             (Path("/home/tristan/zegrid_r2_outputs") / f"minitile_{chosen}.json").read_text()
         )
+        assert rec["normalization_method"] == "sky_mean"
         cand = next(
             c for c in zsw.candidate_order(manifest, canvas) if c.cell_id == chosen
         )
         return cand, rec["adequacy"]
-    # Self-contained fallback: bounded mini-sweep (same deterministic order).
+    # Self-contained fallback: bounded sky_mean mini-sweep (same deterministic order).
     for cand in zsw.candidate_order(manifest, canvas)[: zsw.DEFAULT_MAX_CELLS]:
-        res = _run_cell(manifest, canvas, cand.row, cand.col)
+        res = _run_cell(manifest, canvas, cand.row, cand.col, "sky_mean")
         if res.adequacy.effective_contributor_count >= 3:
-            return cand, res.adequacy
-    pytest.skip("no candidate reached effective>=3 within 6 cells / memory cap")
+            return cand, res.adequacy.to_dict()
+    pytest.skip("no candidate reached effective>=3 under sky_mean within 6 cells")
 
 
 def test_chosen_cell_multiframe_guard(chosen_run):
@@ -227,29 +278,35 @@ def _load_persisted_minitile_planes(cell_id: str) -> dict:
     }
 
 
-def test_seam_diagnostic_computed_and_recorded(manifest, canvas):
-    """Compute the seam diagnostic on a real adjacent pair (r0000c0000 / r0000c0001).
+def _rc(cell_id: str) -> tuple[int, int]:
+    return int(cell_id[1:5]), int(cell_id[6:10])
 
-    Both cells are persisted from the sweep; the seam diagnostic is exercised on
-    real single-frame MiniTiles (the chosen multi-frame cell does not exist under
-    the frozen linear_fit config — documented as BLOCKED). This proves the
-    Objective-C diagnostic (core ownership + halo non-double-count + seam
-    residual) is computed and recorded, and quantifies the residual.
-    """
+
+def test_seam_diagnostic_computed_and_recorded(manifest, canvas):
+    """Compute the seam diagnostic on the chosen multi-frame Cell + neighbour."""
+    import json
+
     from types import SimpleNamespace
 
-    ch_cell, ch_patch, _ = zsw.build_cell_context(manifest, canvas, 0, 0)  # corner
-    nb_cell, nb_patch, _ = zsw.build_cell_context(manifest, canvas, 0, 1)  # right
+    summary = json.loads(
+        Path("/home/tristan/zegrid_r2_outputs/sweep_summary.json").read_text()
+    )
+    chosen = summary.get("chosen_cell")
+    neighbour = summary.get("neighbour")
+    if chosen is None or neighbour is None:
+        pytest.skip("no chosen multi-frame cell + neighbour pair persisted")
+
+    ch_cell, ch_patch, _ = zsw.build_cell_context(manifest, canvas, *_rc(chosen))
+    nb_cell, nb_patch, _ = zsw.build_cell_context(manifest, canvas, *_rc(neighbour))
     mt_ch = SimpleNamespace(**{
-        k: _load_persisted_minitile_planes("r0000c0000")[k]
+        k: _load_persisted_minitile_planes(chosen)[k]
         for k in ("science", "valid_mask", "n_eff_support", "surviving_sample_count")
     })
     mt_nb = SimpleNamespace(**{
-        k: _load_persisted_minitile_planes("r0000c0001")[k]
+        k: _load_persisted_minitile_planes(neighbour)[k]
         for k in ("science", "valid_mask", "n_eff_support", "surviving_sample_count")
     })
 
-    # Core ownership: disjoint + exhaustive over the whole layout.
     layout = zg.build_layout(canvas, 5, 4)
     owned = zsm.assert_core_partition_exact(layout, canvas)
     assert int(owned.min()) == 1 and int(owned.max()) == 1
@@ -270,6 +327,5 @@ def test_seam_diagnostic_computed_and_recorded(manifest, canvas):
     assert "valid_fraction_abs_diff" in seam["residual"]
     assert "mean_science_abs_diff_per_channel" in seam["residual"]
     assert "measurable_discontinuity" in seam
-    assert {seam["low_cell"], seam["high_cell"]} == {"r0000c0000", "r0000c0001"}
-    # residual fields are real numbers (finite where defined).
+    assert {seam["low_cell"], seam["high_cell"]} == {chosen, neighbour}
     assert np.isfinite(seam["residual"]["valid_fraction_abs_diff"])

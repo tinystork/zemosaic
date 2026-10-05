@@ -60,6 +60,15 @@ R1_PREP = Path(__file__).resolve().parents[1] / "zegrid_r1" / "prepare_rgb_fixtu
 GATE_WAIT_SECONDS = 20
 GATE_MAX_ATTEMPTS = 6
 
+# R1 frozen normalization (NEVER changed). The R2 rework runs an EXPLICIT,
+# labelled per-run ``sky_mean`` variant instead (Tristan-approved); the frozen
+# ``DEFAULT_NORMALIZATION`` constant in science_adapter.py is untouched.
+R1_FROZEN_NORMALIZATION = "linear_fit"
+SKY_MEAN_VARIANT_REASON = (
+    "linear_fit MAD refinement rejects bright core -> slope gate; "
+    "approved sky_mean variant"
+)
+
 
 def prepared_path(key: str) -> str:
     return str(FIXTURES / (Path(key).stem + "_rgb.fits"))
@@ -142,29 +151,32 @@ def ensure_fixtures(keys: list[str]) -> None:
     )
 
 
-def run_cell_worker(cell_id: str, row: int, col: int) -> dict:
+def run_cell_worker(
+    cell_id: str, row: int, col: int, normalization: str, variant_reason: str | None
+) -> dict:
     """Run ONE cell in a fresh subprocess and return its persisted result JSON."""
-    out_dir = str(OUT)
-    subprocess.run(
-        [
-            sys.executable,
-            str(__file__),
-            "--cell",
-            cell_id,
-            "--row",
-            str(row),
-            "--col",
-            str(col),
-        ],
-        check=True,
-        cwd=SRC.parent,  # repo root so ``zemosaic`` resolves
-    )
+    cmd = [
+        sys.executable,
+        str(__file__),
+        "--cell",
+        cell_id,
+        "--row",
+        str(row),
+        "--col",
+        str(col),
+        "--normalization",
+        normalization,
+    ]
+    if variant_reason:
+        cmd += ["--variant-reason", variant_reason]
+    subprocess.run(cmd, check=True, cwd=SRC.parent)  # repo root so ``zemosaic`` resolves
     return json.loads((OUT / f"minitile_{cell_id}.json").read_text())
 
 
-def _worker(cell_id: str, row: int, col: int) -> int:
+def _worker(
+    cell_id: str, row: int, col: int, normalization: str, variant_reason: str | None
+) -> int:
     """Worker mode: run one cell, persist NPZ + JSON, report peak RSS + adequacy."""
-    import resource
 
     frames, canvas = load_geometry_cache()
     cell, patch, mem = zsw.build_cell_context(frames, canvas, row, col)
@@ -195,7 +207,7 @@ def _worker(cell_id: str, row: int, col: int) -> int:
         (OUT / f"minitile_{cell_id}.json").write_text(json.dumps(rec, indent=2) + "\n")
         return 2
 
-    cfg = zs.MiniTileScienceConfig()
+    cfg = zs.MiniTileScienceConfig(normalization=normalization)
     tracker = zx_section_tracker()
     res = zsw.run_cell_stack(
         frames, canvas, prepared_paths, row, col, cfg, tracker=tracker
@@ -251,6 +263,9 @@ def _worker(cell_id: str, row: int, col: int) -> int:
             "taper_floor": cfg.taper_floor,
             "reference_index": cfg.reference_index,
         },
+        "normalization_method": cfg.normalization,
+        "r1_frozen_default": R1_FROZEN_NORMALIZATION,
+        "variant_reason": variant_reason,
         "frame_order": list(mt.frame_order),
         "reference_frame_id": mt.reference_frame_id,
         "excluded_frames": list(mt.excluded),
@@ -319,6 +334,10 @@ def _orchestrator() -> int:
 
     summary = {
         "mission": "ZM-ZEGRID-R2",
+        "phase": "rework-1",
+        "normalization": "sky_mean",
+        "r1_frozen_default": R1_FROZEN_NORMALIZATION,
+        "variant_reason": SKY_MEAN_VARIANT_REASON,
         "canvas": {"width": canvas.width, "height": canvas.height},
         "candidate_order": [c.cell_id for c in candidates],
         "cells_tried": [],
@@ -359,7 +378,9 @@ def _orchestrator() -> int:
             break
 
         ensure_fixtures(list(mem.patch_ids))
-        rec = run_cell_worker(cand.cell_id, cand.row, cand.col)
+        rec = run_cell_worker(
+            cand.cell_id, cand.row, cand.col, "sky_mean", SKY_MEAN_VARIANT_REASON
+        )
         summary["cells_tried"].append(rec)
         if rec.get("blocked_memory"):
             summary["blocked"] = True
@@ -386,11 +407,14 @@ def _orchestrator() -> int:
     # --- Objective C: one adjacent neighbour + seam diagnostic (no blend) ---
     ch_row, ch_col = chosen["row"], chosen["col"]
     seam_rec = None
-    # Pick the LOWEST-N adjacent neighbour (memory-friendly; "as near as memory
-    # permits"). Tie-break by direction priority (right, bottom, left, top).
+    # Pick the LOWEST-N adjacent neighbour that is itself a genuine multi-frame
+    # (sky_mean) patch. The frozen corner r0000c0000 stays a linear_fit control
+    # (single-frame), so it is NOT a valid multi-frame seam partner; exclude it.
     nbr_choices = []
     for _dir, r, c in zsm.adjacent_neighbours(ch_row, ch_col, zsw.NX, zsw.NY):
         _c, _p, _m = zsw.build_cell_context(frames, canvas, r, c)
+        if _c.cell_id in zsw.EXCLUDED_CELLS:
+            continue
         nbr_choices.append((len(_m.patch_ids), _dir, r, c, _c.cell_id))
     nbr_choices.sort(key=lambda t: (t[0], t[1]))
     if nbr_choices:
@@ -407,7 +431,9 @@ def _orchestrator() -> int:
             summary["blocked_reason"] = f"neighbour {n_cell.cell_id} memory gate failed"
         else:
             ensure_fixtures(list(n_mem.patch_ids))
-            n_rec = run_cell_worker(n_cell.cell_id, n_row, n_col)
+            n_rec = run_cell_worker(
+                n_cell.cell_id, n_row, n_col, "sky_mean", SKY_MEAN_VARIANT_REASON
+            )
             summary["neighbour"] = n_rec["cell_id"]
             # Re-load both MiniTiles and compute the seam residual.
             seam_rec = _compute_and_persist_seam(chosen, n_rec, ch_row, ch_col, n_row, n_col)
@@ -472,10 +498,14 @@ def main() -> int:
     ap.add_argument("--cell", type=str, default=None)
     ap.add_argument("--row", type=int, default=None)
     ap.add_argument("--col", type=int, default=None)
+    ap.add_argument("--normalization", type=str, default=R1_FROZEN_NORMALIZATION)
+    ap.add_argument("--variant-reason", type=str, default=None)
     args = ap.parse_args()
 
     if args.cell is not None:
-        return _worker(args.cell, args.row, args.col)
+        return _worker(
+            args.cell, args.row, args.col, args.normalization, args.variant_reason
+        )
     return _orchestrator()
 
 

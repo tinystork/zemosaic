@@ -25,6 +25,18 @@ from zemosaic.core.canonical_engine import (
 )
 
 # Frozen default science configuration for R1. Explicit, not silent defaults.
+# NOTE (R2 finding): ``linear_fit`` (this frozen default) is known to yield
+# effectively single-frame witnesses on the M106 corpus: its robust (MAD)
+# refinement rejects the bright core pixels first, collapsing the OLS slope to
+# noise level and tripping the slope gate (rejecting every non-reference frame
+# with ``slope_out_of_range``). The R2 rework therefore runs an EXPLICIT,
+# per-run, Tristan-approved ``sky_mean`` variant (additive offset, a=1) via
+# ``MiniTileScienceConfig(normalization="sky_mean")`` -- WITHOUT changing this
+# frozen default. CAVEAT (hypothesis, not a proven science claim): ``sky_mean``
+# (a=1 additive offset) is valid only if the frames share gain/exposure and no
+# flat-fielding/vignetting scaling is required; it is not a substitute for a
+# photometrically correct multiplicative normalization when those assumptions
+# break. This module makes no claim about which normalization is "correct".
 DEFAULT_NORMALIZATION = "linear_fit"
 DEFAULT_WEIGHTING = "noise_variance"
 DEFAULT_REJECTION = "kappa_sigma"
