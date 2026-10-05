@@ -7,10 +7,12 @@ canonical rejection primitives (``none``/``kappa_sigma``/
 ``winsorized_sigma_clip``), and the **Gate C2** pure canonical combine
 primitive (``mean``/``median``). This is **Gate B1** (canonical input validation,
 reference selection, per-frame normalization), **Gate B2** (scalar quality
-weighting ``none``/``noise_variance``/``noise_fwhm``), **Gate C1** (rejection)
-and **Gate C2** (combine only). Coverage support/taper construction (Gate E) and
-the final request/result orchestration are explicitly out of scope here and are
-assembled by later gates.
+weighting ``none``/``noise_variance``/``noise_fwhm``), **Gate C1** (rejection),
+**Gate C2** (combine only), and **Gate D** backend neutrality: the rejection and
+combine stages run one shared ``xp``-generic algorithm on NumPy (CPU, default)
+or CuPy (GPU, explicit opt-in). Normalization and weighting remain CPU in this
+gate. Coverage support/taper construction (Gate E) and the final request/result
+orchestration are explicitly out of scope here and are assembled by later gates.
 
 Design invariants
 -----------------
@@ -32,7 +34,8 @@ Public API
 ``prepare_canonical_inputs``, ``select_canonical_reference``,
 ``normalize_canonical_images``, ``compute_canonical_quality_weights``,
 ``reject_canonical_samples``, ``combine_canonical_samples``,
-``canonical_noise_fwhm_available`` plus the frozen dataclasses
+``canonical_noise_fwhm_available``, ``canonical_gpu_available`` plus the frozen
+dataclasses
 ``CanonicalInputBatch`` / ``CanonicalNormalizationResult`` /
 ``CanonicalWeightingResult`` / ``CanonicalRejectionResult`` /
 ``CanonicalCombineResult`` and ``FrameExclusion``.
@@ -75,6 +78,7 @@ __all__ = [
     "combine_canonical_samples",
     "CanonicalCombineResult",
     "canonical_noise_fwhm_available",
+    "canonical_gpu_available",
 ]
 
 # ---------------------------------------------------------------------------
@@ -149,6 +153,94 @@ class CanonicalStackValidationError(ValueError):
 
 class CanonicalStackFailure(RuntimeError):
     """Raised when no viable frame remains or a canonical stage fails."""
+
+
+# ---------------------------------------------------------------------------
+# Backend selection (Gate D): one xp-generic algorithm, CPU default, GPU opt-in
+# ---------------------------------------------------------------------------
+
+_BACKEND_CPU = "cpu"
+_BACKEND_GPU = "gpu"
+_SUPPORTED_BACKENDS = (_BACKEND_CPU, _BACKEND_GPU)
+
+
+def canonical_gpu_available() -> bool:
+    """True only when CuPy is importable AND at least one CUDA device exists.
+
+    Lazily imports CuPy (never at module import); any import/device-probe error
+    returns False. The canonical layer never silently substitutes GPU for CPU.
+    """
+    try:
+        import cupy as _cupy  # noqa: F401
+    except Exception:
+        return False
+    try:
+        return int(_cupy.cuda.runtime.getDeviceCount()) > 0
+    except Exception:
+        return False
+
+
+def _resolve_backend(backend) -> str:
+    """Validate ``backend`` and return the resolved token (``"cpu"``/``"gpu"``).
+
+    ``"cpu"`` (default) selects NumPy; ``"gpu"`` selects CuPy. A non-string or
+    unknown token, or an unavailable ``"gpu"``, raises
+    :class:`CanonicalStackValidationError` (never a silent CPU fallback).
+    """
+    if not isinstance(backend, str):
+        raise CanonicalStackValidationError(
+            f"backend must be a string 'cpu' or 'gpu', got {type(backend).__name__}"
+        )
+    token = backend.strip().lower()
+    if token not in _SUPPORTED_BACKENDS:
+        raise CanonicalStackValidationError(
+            f"unknown backend {backend!r}; expected 'cpu' or 'gpu' (aliases not accepted)"
+        )
+    if token == _BACKEND_GPU and not canonical_gpu_available():
+        raise CanonicalStackValidationError(
+            "backend 'gpu' requested but CuPy/GPU is unavailable"
+        )
+    return token
+
+
+def _get_xp(backend):
+    """Return the backend array module for a resolved backend token."""
+    if backend == _BACKEND_GPU:
+        import cupy as _cupy
+        return _cupy
+    return np
+
+
+def _as_host_numpy(arr, xp) -> np.ndarray:
+    """Return a host NumPy array from a backend array (identity for NumPy)."""
+    if xp is np:
+        return np.asarray(arr)
+    return xp.asnumpy(arr)
+
+
+def _safe_divide(numerator, denominator, xp):
+    """Elementwise float64 divide under controlled errstate/warnings.
+
+    NumPy wraps ``numerator / denominator`` in ``np.errstate`` + warning
+    suppression so NaN/Inf for ``denominator == 0`` is silent and deterministic;
+    CuPy performs the identical IEEE operation without Python warnings.
+    """
+    if xp is np:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
+                return numerator / denominator
+    return numerator / denominator
+
+
+def _astype_float32(arr, xp):
+    """Cast to float32 under controlled errstate/warnings (NumPy) / plain (CuPy)."""
+    if xp is np:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with np.errstate(over="ignore", invalid="ignore"):
+                return arr.astype(np.float32)
+    return arr.astype(xp.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -1214,31 +1306,64 @@ def _validate_max_iters(value) -> int:
     return i
 
 
-def _nan_axis_median(a):
+def _nan_axis_median(a, xp):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmedian(a, axis=0)
+        return xp.nanmedian(a, axis=0)
 
 
-def _nan_axis_mean(a):
+def _nan_axis_mean(a, xp):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmean(a, axis=0)
+        return xp.nanmean(a, axis=0)
 
 
-def _nan_axis_popstd(a):
+def _nan_axis_popstd(a, xp):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanstd(a, axis=0)
+        return xp.nanstd(a, axis=0)
 
 
-def _nan_axis_quantile(a, q):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanquantile(a, q, axis=0, method="linear")
+def _nan_axis_quantile(a, q, xp):
+    if xp is np:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            return np.nanquantile(a, q, axis=0, method="linear")
+    return _nan_axis_quantile_gpu(a, q, xp)
 
 
-def _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high):
+def _nan_axis_quantile_gpu(a, q, xp):
+    """NaN-aware per-column linear quantile for CuPy (``cupy.nanquantile`` absent).
+
+    Bit-exact equivalent of NumPy ``nanquantile(a, q, axis=0, method="linear")``:
+    replace NaN with ``+inf`` then sort (valid values first); linearly interpolate
+    the ``q``-th order statistic over the per-column valid count using NumPy's
+    **two-sided** ``_lerp`` — ``a[lo] + (a[hi] - a[lo]) * frac`` for ``frac < 0.5``
+    and ``a[hi] - (a[hi] - a[lo]) * (1 - frac)`` otherwise — so the result matches
+    ``np.nanquantile`` bit-for-bit for every interpolation fraction (not just
+    all-equal columns). Columns with no valid value yield NaN.
+    """
+    valid = ~xp.isnan(a)
+    count = valid.sum(axis=0)
+    eff_count = xp.maximum(count, 1)
+    b = xp.where(valid, a, xp.inf)
+    b = xp.sort(b, axis=0)
+    index = q * (eff_count.astype(xp.float64) - 1.0)
+    lo = xp.floor(index).astype(xp.int64)
+    hi = xp.minimum(lo + 1, eff_count - 1)
+    frac = index - lo.astype(xp.float64)
+    v_lo = xp.take_along_axis(b, lo[xp.newaxis, :], axis=0)[0]
+    v_hi = xp.take_along_axis(b, hi[xp.newaxis, :], axis=0)[0]
+    diff = v_hi - v_lo
+    result = xp.where(
+        frac < 0.5,
+        v_lo + diff * frac,
+        v_hi - diff * (1.0 - frac),
+    )
+    return xp.where(count > 0, result, xp.nan)
+
+
+def _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high, xp):
     """Return ``(keep, degenerate)`` for one iteration over the ``N`` axis.
 
     ``orig2`` is ``(N, M)`` float64 original normalized samples; ``center`` and
@@ -1249,34 +1374,34 @@ def _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high):
     """
     lower = center - sigma_low * std
     upper = center + sigma_high * std
-    interval = (orig2 >= lower[np.newaxis, :]) & (orig2 <= upper[np.newaxis, :])
+    interval = (orig2 >= lower[xp.newaxis, :]) & (orig2 <= upper[xp.newaxis, :])
     degenerate = (std <= 0.0) & active
-    equality = orig2 == center[np.newaxis, :]
-    keep = np.where(degenerate[np.newaxis, :], equality, interval)
-    keep = np.where(active[np.newaxis, :], keep, True)
+    equality = orig2 == center[xp.newaxis, :]
+    keep = xp.where(degenerate[xp.newaxis, :], equality, interval)
+    keep = xp.where(active[xp.newaxis, :], keep, True)
     return keep, degenerate
 
 
-def _kappa_sigma_step(orig2, survivor2, count, sigma_low, sigma_high):
+def _kappa_sigma_step(orig2, survivor2, count, sigma_low, sigma_high, xp):
     active = count >= 3
-    masked = np.where(survivor2, orig2, np.nan)
-    center = _nan_axis_median(masked)
-    std = _nan_axis_popstd(masked)
-    keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high)
+    masked = xp.where(survivor2, orig2, xp.nan)
+    center = _nan_axis_median(masked, xp)
+    std = _nan_axis_popstd(masked, xp)
+    keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high, xp)
     return survivor2 & keep, degenerate
 
 
 def _winsorized_sigma_clip_step(
-    orig2, survivor2, count, sigma_low, sigma_high, winsor_low, winsor_high
+    orig2, survivor2, count, sigma_low, sigma_high, winsor_low, winsor_high, xp
 ):
     active = count >= 3
-    masked = np.where(survivor2, orig2, np.nan)
-    q_low = _nan_axis_quantile(masked, winsor_low)
-    q_high = _nan_axis_quantile(masked, 1.0 - winsor_high)
-    winsor = np.clip(masked, q_low[np.newaxis, :], q_high[np.newaxis, :])
-    center = _nan_axis_mean(winsor)
-    std = _nan_axis_popstd(winsor)
-    keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high)
+    masked = xp.where(survivor2, orig2, xp.nan)
+    q_low = _nan_axis_quantile(masked, winsor_low, xp)
+    q_high = _nan_axis_quantile(masked, 1.0 - winsor_high, xp)
+    winsor = xp.clip(masked, q_low[xp.newaxis, :], q_high[xp.newaxis, :])
+    center = _nan_axis_mean(winsor, xp)
+    std = _nan_axis_popstd(winsor, xp)
+    keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high, xp)
     return survivor2 & keep, degenerate
 
 
@@ -1290,6 +1415,7 @@ def reject_canonical_samples(
     max_iters: int = _REJECT_DEFAULT_MAX_ITERS,
     winsor_limit_low: float = _REJECT_DEFAULT_WINSOR_LOW,
     winsor_limit_high: float = _REJECT_DEFAULT_WINSOR_HIGH,
+    backend: str = _BACKEND_CPU,
 ) -> CanonicalRejectionResult:
     """Compute canonical outlier-rejection masks on a normalized/weighted batch.
 
@@ -1298,6 +1424,11 @@ def reject_canonical_samples(
     rejected with :class:`CanonicalStackValidationError`; the removed token
     ``linear_fit_clip`` fails with the stable token
     ``unsupported_removed_sci05`` and is never migrated/substituted).
+
+    ``backend`` is ``"cpu"`` (NumPy, default) or ``"gpu"`` (CuPy, opt-in): one
+    shared ``xp``-generic algorithm runs on either backend, producing identical
+    host-NumPy outputs. ``"gpu"`` raises :class:`CanonicalStackValidationError`
+    when CuPy/GPU is unavailable (never a silent CPU fallback).
 
     Never mutates/aliases the normalization/weighting inputs. Weight values,
     magnitudes, and raw metrics do **not** enter any rejection calculation: only
@@ -1321,6 +1452,9 @@ def reject_canonical_samples(
             f"unsupported rejection method {method!r}; expected one of "
             "none/kappa_sigma/winsorized_sigma_clip (aliases are not accepted)"
         )
+
+    backend_token = _resolve_backend(backend)
+    xp = _get_xp(backend_token)
 
     s_low = _validate_reject_sigma(sigma_low, "sigma_low")
     s_high = _validate_reject_sigma(sigma_high, "sigma_high")
@@ -1377,36 +1511,37 @@ def reject_canonical_samples(
         raise CanonicalStackValidationError("normalization.valid_mask shape mismatch")
 
     active_frames = np.array(weighting.active_frames, dtype=bool, copy=True)
-    images64 = np.array(normalization.images, dtype=np.float64, copy=True)
-    valid = np.asarray(normalization.valid_mask, dtype=bool)
+    images64 = xp.asarray(np.array(normalization.images, dtype=np.float64, copy=True))
+    valid = xp.asarray(np.asarray(normalization.valid_mask, dtype=bool))
+    active_xp = xp.asarray(active_frames)
 
-    finite = np.isfinite(images64)
-    initial = active_frames[:, None, None, None] & valid[..., None] & finite
+    finite = xp.isfinite(images64)
+    initial = active_xp[:, None, None, None] & valid[..., None] & finite
 
     n_cells = h * w * c
 
     if token == _METHOD_REJECT_NONE:
         survivor = initial.copy()
         iterations_used = 0
-        degenerate_seen = np.zeros(n_cells, dtype=bool)
+        degenerate_seen = xp.zeros(n_cells, dtype=bool)
     else:
         orig2 = images64.reshape(n, n_cells)
         survivor2 = initial.reshape(n, n_cells)
-        degenerate_seen = np.zeros(n_cells, dtype=bool)
+        degenerate_seen = xp.zeros(n_cells, dtype=bool)
         iterations_used = 0
         for _ in range(iters):
             count = survivor2.sum(axis=0)
             if token == _METHOD_REJECT_KAPPA_SIGMA:
                 new_survivor2, degenerate = _kappa_sigma_step(
-                    orig2, survivor2, count, s_low, s_high
+                    orig2, survivor2, count, s_low, s_high, xp
                 )
             else:
                 new_survivor2, degenerate = _winsorized_sigma_clip_step(
-                    orig2, survivor2, count, s_low, s_high, w_low, w_high
+                    orig2, survivor2, count, s_low, s_high, w_low, w_high, xp
                 )
             iterations_used += 1
             degenerate_seen |= degenerate
-            if np.array_equal(new_survivor2, survivor2):
+            if bool(xp.array_equal(new_survivor2, survivor2)):
                 survivor2 = new_survivor2
                 break
             survivor2 = new_survivor2
@@ -1414,16 +1549,23 @@ def reject_canonical_samples(
 
     rejection = initial & ~survivor
 
-    initial_count = int(initial.sum())
-    surviving_count = int(survivor.sum())
-    rejected_count = int(rejection.sum())
+    # Host conversion (identity for NumPy) for the scalar diagnostics and the
+    # frozen host-NumPy result arrays.
+    survivor_host = _as_host_numpy(survivor, xp)
+    rejection_host = _as_host_numpy(rejection, xp)
+    initial_host = _as_host_numpy(initial, xp)
+    degenerate_seen_host = _as_host_numpy(degenerate_seen, xp)
+
+    initial_count = int(initial_host.sum())
+    surviving_count = int(survivor_host.sum())
+    rejected_count = int(rejection_host.sum())
     rejected_fraction = (rejected_count / initial_count) if initial_count > 0 else 0.0
-    low_n_cell_count = int((initial.sum(axis=0) < 3).sum())
-    degenerate_cell_count = int(degenerate_seen.sum())
+    low_n_cell_count = int((initial_host.sum(axis=0) < 3).sum())
+    degenerate_cell_count = int(degenerate_seen_host.sum())
 
     return CanonicalRejectionResult(
-        survivor_mask=np.array(survivor, dtype=bool, copy=True),
-        rejection_mask=np.array(rejection, dtype=bool, copy=True),
+        survivor_mask=np.array(survivor_host, dtype=bool, copy=True),
+        rejection_mask=np.array(rejection_host, dtype=bool, copy=True),
         active_frames=np.array(active_frames, dtype=bool, copy=True),
         reference_index=int(normalization.reference_index),
         requested_method=token,
@@ -1586,7 +1728,9 @@ def _validate_estimator_weights(estimator_weights, n: int, h: int, w: int) -> np
     return out
 
 
-def combine_canonical_samples(normalization, weighting, rejection, estimator_weights, method):
+def combine_canonical_samples(
+    normalization, weighting, rejection, estimator_weights, method, *, backend: str = _BACKEND_CPU
+):
     """Combine canonical samples into the final science/estimate arrays.
 
     Pure, deterministic, backend-neutral combine primitive (Gate C2). It consumes
@@ -1599,6 +1743,11 @@ def combine_canonical_samples(normalization, weighting, rejection, estimator_wei
 
     ``method`` must be exactly ``mean`` or ``median`` (after strip/lower;
     aliases/unknown/non-string rejected).
+
+    ``backend`` is ``"cpu"`` (NumPy, default) or ``"gpu"`` (CuPy, opt-in): one
+    shared ``xp``-generic algorithm runs on either backend, producing identical
+    host-NumPy outputs. ``"gpu"`` raises :class:`CanonicalStackValidationError`
+    when CuPy/GPU is unavailable (never a silent CPU fallback).
 
     Semantics
     ---------
@@ -1646,6 +1795,8 @@ def combine_canonical_samples(normalization, weighting, rejection, estimator_wei
             f"unsupported combine method {method!r}; expected one of mean/median "
             "(aliases are not accepted)"
         )
+
+    backend_token = _resolve_backend(backend)
 
     if not isinstance(normalization, CanonicalNormalizationResult):
         raise CanonicalStackValidationError(
@@ -1775,10 +1926,10 @@ def combine_canonical_samples(normalization, weighting, rejection, estimator_wei
             "estimator_weights exceed the quality weight q_i (canonical w=q*m*a)"
         )
 
-    # --- C1 mask invariants ---
-    images64 = np.array(images, dtype=np.float64, copy=True)
-    finite = np.isfinite(images64)
-    initial = active[:, None, None, None] & valid[..., None] & finite
+    # --- C1 mask invariants (host NumPy, unchanged) ---
+    images64_host = np.array(images, dtype=np.float64, copy=True)
+    finite_host = np.isfinite(images64_host)
+    initial = active[:, None, None, None] & valid[..., None] & finite_host
     if np.any(survivor & ~initial):
         raise CanonicalStackValidationError(
             "survivor_mask is not a subset of active/valid/finite"
@@ -1794,46 +1945,53 @@ def combine_canonical_samples(normalization, weighting, rejection, estimator_wei
             "survivor | rejection != initial active-valid samples"
         )
 
-    # --- combine ---
-    w_positive = wmap[:, :, :, None] > 0.0  # (N, H, W, 1) broadcasts to channels
-    eligible = survivor & w_positive & finite  # (N, H, W, C)
+    # --- combine (single xp-generic algorithm on the selected backend) ---
+    xp = _get_xp(backend_token)
+    images64 = xp.asarray(images64_host)
+    finite = xp.asarray(finite_host)
+    survivor_xp = xp.asarray(survivor)
+    wmap_xp = xp.asarray(wmap)
 
-    input_surviving = int(survivor.sum())
-    contributing = int(eligible.sum())
+    w_positive = wmap_xp[:, :, :, None] > 0.0  # (N, H, W, 1) broadcasts to channels
+    eligible = survivor_xp & w_positive & finite  # (N, H, W, C)
+
+    input_surviving = int(survivor.sum())  # host NumPy scalar (unchanged)
 
     if token == _METHOD_COMBINE_MEAN:
-        masked_images = np.where(eligible, images64, 0.0)
-        w_contrib = np.where(eligible, wmap[:, :, :, None], 0.0)
-        numerator = np.sum(masked_images * w_contrib, axis=0, dtype=np.float64)
-        denominator = np.sum(w_contrib, axis=0, dtype=np.float64)
+        masked_images = xp.where(eligible, images64, 0.0)
+        w_contrib = xp.where(eligible, wmap_xp[:, :, :, None], 0.0)
+        numerator = xp.sum(masked_images * w_contrib, axis=0, dtype=xp.float64)
+        denominator = xp.sum(w_contrib, axis=0, dtype=xp.float64)
         den_valid = denominator > 0.0
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
-                estimate64 = numerator / denominator
-                science32 = estimate64.astype(np.float32)
-        final_finite = np.isfinite(estimate64) & np.isfinite(science32)
+        estimate64 = _safe_divide(numerator, denominator, xp)
+        science32 = _astype_float32(estimate64, xp)
+        final_finite = xp.isfinite(estimate64) & xp.isfinite(science32)
         valid_out = den_valid & final_finite
-        science_c = np.where(valid_out, science32, np.nan)
-        weight_sum = np.where(valid_out, denominator, 0.0)
-        nonfinite_count = int((den_valid & ~valid_out).sum())
+        science_c = xp.where(valid_out, science32, xp.nan)
+        weight_sum = xp.where(valid_out, denominator, 0.0)
     else:  # median
-        masked = np.where(eligible, images64, np.nan)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            median64 = np.nanmedian(masked, axis=0)
-            with np.errstate(over="ignore", invalid="ignore"):
-                science32 = median64.astype(np.float32)
-        count = eligible.sum(axis=0).astype(np.float64)
+        masked = xp.where(eligible, images64, xp.nan)
+        median64 = _nan_axis_median(masked, xp)
+        science32 = _astype_float32(median64, xp)
+        count = eligible.sum(axis=0).astype(xp.float64)
         den_valid = count > 0.0
-        final_finite = np.isfinite(median64) & np.isfinite(science32)
+        final_finite = xp.isfinite(median64) & xp.isfinite(science32)
         valid_out = den_valid & final_finite
-        science_c = np.where(valid_out, science32, np.nan)
-        weight_sum = np.where(valid_out, count, 0.0)
-        nonfinite_count = int((den_valid & ~valid_out).sum())
+        science_c = xp.where(valid_out, science32, xp.nan)
+        weight_sum = xp.where(valid_out, count, 0.0)
 
-    surviving_c = eligible.sum(axis=0).astype(np.int64)
+    surviving_c = eligible.sum(axis=0).astype(xp.int64)
     valid_mask_c = weight_sum > 0.0
+
+    # Host conversion (identity for NumPy) + scalar diagnostics.
+    science_c = _as_host_numpy(science_c, xp)
+    weight_sum = _as_host_numpy(weight_sum, xp)
+    valid_mask_c = _as_host_numpy(valid_mask_c, xp)
+    surviving_c = _as_host_numpy(surviving_c, xp)
+    den_valid_host = _as_host_numpy(den_valid, xp)
+    valid_out_host = _as_host_numpy(valid_out, xp)
+    nonfinite_count = int((den_valid_host & ~valid_out_host).sum())
+    contributing = int(surviving_c.sum())
 
     # --- restore original shape (strip canonical C=1 for original mono) ---
     if normalization.original_mono:

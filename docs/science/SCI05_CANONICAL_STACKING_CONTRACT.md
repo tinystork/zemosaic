@@ -221,6 +221,10 @@ substitution.
   primary + donor chamfer fallback, `feather_px=8.0`, `floor=0.0`; `1` interior / ramp /
   `floor` / `0` outside. Taper preserves **translation/rotation invariance** and
   **padded-boundary symmetry (up to rasterization)**.
+* **Gate D scope note**: the backend-neutrality work covers **rejection (§8) and combine
+  (§9)** only. The support/taper accumulator, `make_footprint_taper`, and positive-support
+  maps (Gate E) and the normalization/weighting stages remain **CPU-only** in Gate D; their
+  GPU parity (if any) is a **later bounded step**.
 
 ---
 
@@ -291,6 +295,21 @@ unreachable, clearly legacy, with no supported caller.
   encounter finite `std <= 0` in at least one executed iteration (counted once; `0` for
   `none`); `iterations_used = 0` for `none`, otherwise the number of loop passes executed.
 
+**Gate D implementation-resolution clarification (rejection — backend neutrality):**
+* One **shared `xp`-generic algorithm** runs on NumPy (CPU, **default**) or CuPy (GPU,
+  **explicit opt-in** via a `backend` keyword). There is **no** silent CPU↔GPU fallback,
+  no `os.environ`/`wsc_impl`/config selection inside the canonical layer, and no different
+  science per backend.
+* `backend` validation (before work): a non-string/unknown token, or `"gpu"` with
+  CuPy/GPU unavailable, raises a validation error (never a substituted CPU run).
+* GPU results are **host-converted** (device→host) into the **unchanged** owned NumPy
+  result contract (masks bool, diagnostics Python scalars); CPU results stay byte-identical
+  to the accepted C1 behavior.
+* Parity: masks and diagnostic integers exactly equal; statistics use identical semantics
+  (population std `ddof=0`; WSC quantile `method="linear"` — CuPy lacks
+  `cupy.nanquantile`, so a **bit-exact** NaN-aware equivalent using NumPy's
+  two-sided `_lerp` form is used and documented in the code).
+
 ---
 
 ## 9. Combine — decision H (C1/C2)
@@ -332,6 +351,17 @@ survivors. Output float32.
   values and stay finite — the branch is a defensive seam, no clip/saturate.
 * **No claim**: the support/taper accumulator and the final request/result engine are
   **not** implemented/accepted at this gate.
+
+**Gate D implementation-resolution clarification (combine — backend neutrality):**
+* One **shared `xp`-generic algorithm** runs on NumPy (CPU, **default**) or CuPy (GPU,
+  **explicit opt-in**); no silent fallback and no config/env selection.
+* GPU results are **host-converted** into the **unchanged** owned NumPy result contract
+  (`science` float32, `estimator_weight_sum` float64, `valid_mask` bool,
+  `surviving_sample_count` int64).
+* Parity: `valid_mask`/`surviving_sample_count`/diagnostic integers exactly equal;
+  `science`/`estimator_weight_sum` equal within a documented `~1e-12` relative tolerance
+  (GPU float64 tree reductions may sum in a different order — a ~1e-15 effect); the
+  denominator-`>0` and count-vs-sum semantics are identical.
 
 ---
 
