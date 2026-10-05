@@ -65,8 +65,15 @@ GATE_MAX_ATTEMPTS = 6
 # ``DEFAULT_NORMALIZATION`` constant in science_adapter.py is untouched.
 R1_FROZEN_NORMALIZATION = "linear_fit"
 SKY_MEAN_VARIANT_REASON = (
-    "linear_fit MAD refinement rejects bright core -> slope gate; "
-    "approved sky_mean variant"
+    "linear_fit rejects every non-reference frame on this corpus (single-frame "
+    "witness) for TWO reasons: (a) most contributors overlap only in thin/"
+    "low-variance common strips whose raw OLS slope on the common mask is already "
+    "~0 (< the 0.25 gate), an ill-conditioned fit independent of the MAD step; "
+    "(b) for near-full-overlap contributors the MAD robust refinement rejects the "
+    "brightest (high-leverage) core pixels first, collapsing the slope to noise "
+    "and tripping the gate (r0002c0000 raw 0.4528 -> 0.0726 removing ~0.65% of "
+    "pixels; brightest-1%/5% OLS 0.648). Mechanism (b) is demonstrated on "
+    "near-full contributors, not the thin ones. Approved sky_mean variant."
 )
 
 

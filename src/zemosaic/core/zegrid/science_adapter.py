@@ -25,18 +25,27 @@ from zemosaic.core.canonical_engine import (
 )
 
 # Frozen default science configuration for R1. Explicit, not silent defaults.
-# NOTE (R2 finding): ``linear_fit`` (this frozen default) is known to yield
-# effectively single-frame witnesses on the M106 corpus: its robust (MAD)
-# refinement rejects the bright core pixels first, collapsing the OLS slope to
-# noise level and tripping the slope gate (rejecting every non-reference frame
-# with ``slope_out_of_range``). The R2 rework therefore runs an EXPLICIT,
-# per-run, Tristan-approved ``sky_mean`` variant (additive offset, a=1) via
-# ``MiniTileScienceConfig(normalization="sky_mean")`` -- WITHOUT changing this
-# frozen default. CAVEAT (hypothesis, not a proven science claim): ``sky_mean``
-# (a=1 additive offset) is valid only if the frames share gain/exposure and no
-# flat-fielding/vignetting scaling is required; it is not a substitute for a
-# photometrically correct multiplicative normalization when those assumptions
-# break. This module makes no claim about which normalization is "correct".
+# NOTE (R2 finding, TWO mechanisms): ``linear_fit`` (this frozen default) rejects
+# EVERY non-reference frame on the M106 corpus -> an effectively single-frame
+# witness, for two distinct reasons:
+#   (a) most contributors overlap only in thin / low-variance common strips, whose
+#       raw OLS slope on the common mask is ALREADY ~0 (median |slope| 0.0075,
+#       common px 10,550-95,038; < the 0.25 gate) -- an ill-conditioned fit
+#       INDEPENDENT of the MAD step;
+#   (b) for near-full-overlap contributors, the MAD robust refinement rejects the
+#       brightest (high-leverage) core pixels first, collapsing the slope to noise
+#       and tripping the gate (measured on r0002c0000: raw 0.4528 -> 0.153 ->
+#       0.0726 while removing only ~0.65% of pixels; brightest-1%/5% OLS 0.648).
+# Mechanism (b) is demonstrated on NEAR-FULL contributors, not on the thin ones.
+# Either way ``linear_fit`` yields a single-frame witness here.
+# The R2 rework therefore runs an EXPLICIT per-run, Tristan-approved ``sky_mean``
+# variant (additive offset, a=1) via ``MiniTileScienceConfig(normalization=
+# "sky_mean")`` -- WITHOUT changing this frozen default. CAVEAT (hypothesis, not a
+# proven science claim): ``sky_mean`` (a=1 additive offset) is valid only if the
+# frames share gain/exposure and no flat-fielding/vignetting scaling is required;
+# it is not a substitute for a photometrically correct multiplicative
+# normalization when those assumptions break. No claim about which normalization
+# is "correct".
 DEFAULT_NORMALIZATION = "linear_fit"
 DEFAULT_WEIGHTING = "noise_variance"
 DEFAULT_REJECTION = "kappa_sigma"
