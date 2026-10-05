@@ -486,6 +486,22 @@ survivors. Output float32.
   (`stacking_coverage_support_taper_label/_note`, `stacking_coverage_reconstruction_label/_note`).
 * **No claim**: GUI widgets and runtime/worker wiring remain **not** implemented (E5b/Gate F).
 
+**E5b implementation-resolution clarification (Qt/Tk GUI controls + runtime inert):**
+* Qt GUI (`zemosaic_gui_qt.py`) stacking group: the legacy radial widgets/fields
+  (`apply_radial_weight`, `radial_feather_fraction`, `min_radial_weight_floor`) are removed
+  from the UI and `_config_fields`; two checkboxes bound to config are added —
+  `coverage_support_taper` (default `True`) and `coverage_aware_reconstruction` (default
+  `False`) — using the locale label/note keys.
+* Legacy Tk GUI (`zemosaic_gui.py`): the same two canonical booleans are exposed and bound to
+  config; the legacy radial controls remain constructable but are forced inert
+  (`apply_radial_weight_var=False`).
+* Legacy radial weighting runtime-INERT: `zemosaic_align_stack_gpu.py::_compute_radial_weight_map`
+  is a documented no-op returning `None` regardless of `apply_radial_weight` (bounded one-time
+  deprecation log).
+* **No claim**: caller convergence — the taper/render actually consumed by Classic/SDS/Grid/
+  Phase4.5/coadd — remains **not** implemented (Gate F). This gate only disables legacy radial
+  weighting; it does not enable the canonical taper in any caller.
+
 ---
 
 ## 13. Fallback / provenance — decision L
@@ -542,7 +558,7 @@ the incidental Qt dataclass default.
 | W3 | Exactly one scalar weight per frame, shared across channels; geometric/taper are separate 2-D factors. |
 | S1 | All-invalid output = NaN/invalid science + `estimator_weight_sum=0` + `support=0`; no historical zero sentinel. |
 | S2 | `weight==0` = absent; `weight<0`/nonfinite = invalid input failing before mutation. |
-| S3 | Channel-invariant 2-D support: `m_i` explicit 2-D; `s_i == w_i == q_i*m_i*a_i` per exposure (`q=1` for `none`); `SUP_W1/W2` float64 atomic pair, fail-before-mutation (negative/NaN/Inf/shape/overflow), original-exposure ordered-add, never derived from estimator WHT/rejection; `N_eff` pure derived view `W1²/W2` (overflow-resistant `(W1/√W2)²` fallback, neutral `0` if undefined); donor algorithms source-ported, no runtime ZSSS dependency. **E1:** source-ported into `src/zemosaic/core/canonical_support.py` — `make_footprint_taper` (EDT primary + chamfer fallback), `PositiveSupportAccumulator`/`accumulate_support_pair`, and `build_canonical_estimator_weights` (explicit `(N,H,W)` `w=q*m*a` map for C2). **E2:** assembled by `run_canonical_stack` (`canonical_engine.py`): support accumulated **pre-rejection** (rejection-independent), bounded provenance (per-stage backend: B1/B2/support CPU, C1/C2 requested); Coverage render / RGB equalizer / GUI / caller wiring **not** implemented. **E3:** `coverage_aware_render` source-ported into `canonical_render.py` (preview-only, never mutates science/support). **E4:** `equalize_rgb_medians_canonical` source-ported into `canonical_equalize.py` (out-of-place post-combine, RGB-only). **E5a:** `coverage_support_taper=True`/`coverage_aware_reconstruction=False` config defaults + no-value-mapping `migrate_coverage_settings` (legacy radial inert). |
+| S3 | Channel-invariant 2-D support: `m_i` explicit 2-D; `s_i == w_i == q_i*m_i*a_i` per exposure (`q=1` for `none`); `SUP_W1/W2` float64 atomic pair, fail-before-mutation (negative/NaN/Inf/shape/overflow), original-exposure ordered-add, never derived from estimator WHT/rejection; `N_eff` pure derived view `W1²/W2` (overflow-resistant `(W1/√W2)²` fallback, neutral `0` if undefined); donor algorithms source-ported, no runtime ZSSS dependency. **E1:** source-ported into `src/zemosaic/core/canonical_support.py` — `make_footprint_taper` (EDT primary + chamfer fallback), `PositiveSupportAccumulator`/`accumulate_support_pair`, and `build_canonical_estimator_weights` (explicit `(N,H,W)` `w=q*m*a` map for C2). **E2:** assembled by `run_canonical_stack` (`canonical_engine.py`): support accumulated **pre-rejection** (rejection-independent), bounded provenance (per-stage backend: B1/B2/support CPU, C1/C2 requested); Coverage render / RGB equalizer / GUI / caller wiring **not** implemented. **E3:** `coverage_aware_render` source-ported into `canonical_render.py` (preview-only, never mutates science/support). **E4:** `equalize_rgb_medians_canonical` source-ported into `canonical_equalize.py` (out-of-place post-combine, RGB-only). **E5a:** `coverage_support_taper=True`/`coverage_aware_reconstruction=False` config defaults + no-value-mapping `migrate_coverage_settings` (legacy radial inert). **E5b:** Qt/Tk coverage controls + legacy radial runtime-inert (`_compute_radial_weight_map` no-op). |
 | R1 | Unique WSC target: true WSC using both winsor+sigma limits (PixInsight-style defaults); unify `stack_core` simplified and global-coadd percentile clip onto it. |
 | R2 | kappa: median center + population std `ddof=0` (ordinary std **around the mean**, bounds centered on median), sigma `low/high=3.0`, ≤5 iters, inclusive bounds, `stable` = exact mask unchanged; WSC winsor `0.05/0.05`, sigma `3.0`; current-survivor-count `< 3` freezes the cell for that and later iterations; N<3 → explicit no-rejection success. |
 | R3 | Linear Fit Clip: disable/remove (fork B); persisted token fails `unsupported_removed_sci05`; no migration to none/kappa/WSC. |

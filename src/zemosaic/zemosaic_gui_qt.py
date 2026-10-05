@@ -2664,71 +2664,37 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("stacking_post_equalize_rgb_label", "Equalize RGB (per sub-stack):"),
         )
 
-        radial_checkbox = QCheckBox(
-            self._tr("stacking_apply_radial_label", "Apply Radial Weighting:"),
+        # --- Canonical Coverage controls (decision K; replaces legacy radial) ---
+        self._register_checkbox(
+            "coverage_support_taper",
+            layout,
+            self._tr("stacking_coverage_support_taper_label", "Coverage support taper:"),
+            default=True,
+        )
+        taper_note = QLabel(
+            self._tr(
+                "stacking_coverage_support_taper_note",
+                "Smoothly fades stacking support at the coverage boundary.",
+            ),
             group,
         )
-        radial_checkbox.setChecked(bool(self.config.get("apply_radial_weight", False)))
-        layout.addRow(radial_checkbox)
-        self._config_fields["apply_radial_weight"] = {
-            "kind": "checkbox",
-            "widget": radial_checkbox,
-            "type": bool,
-        }
+        taper_note.setWordWrap(True)
+        layout.addRow(QLabel(""), taper_note)
 
-        radial_feather = QDoubleSpinBox(group)
-        radial_feather.setRange(0.1, 1.0)
-        radial_feather.setSingleStep(0.05)
-        radial_feather.setDecimals(2)
-        radial_feather.setValue(float(self.config.get("radial_feather_fraction", 0.8)))
-        layout.addRow(
-            QLabel(
-                self._tr(
-                    "stacking_radial_feather_label",
-                    "Radial Feather Fraction (0.1-1.0):",
-                )
-            ),
-            radial_feather,
+        self._register_checkbox(
+            "coverage_aware_reconstruction",
+            layout,
+            self._tr("stacking_coverage_reconstruction_label", "Coverage-aware reconstruction:"),
         )
-        self._config_fields["radial_feather_fraction"] = {
-            "kind": "double_spinbox",
-            "widget": radial_feather,
-            "type": float,
-        }
-
-        radial_floor = QDoubleSpinBox(group)
-        radial_floor.setRange(0.0, 0.5)
-        radial_floor.setSingleStep(0.01)
-        radial_floor.setDecimals(2)
-        radial_floor.setValue(float(self.config.get("min_radial_weight_floor", 0.0)))
-        layout.addRow(
-            QLabel(
-                self._tr(
-                    "stacking_min_radial_floor_label",
-                    "Min Radial Weight Floor (0.0-0.5):",
-                )
+        recon_note = QLabel(
+            self._tr(
+                "stacking_coverage_reconstruction_note",
+                "Preview coverage-aware final reconstruction (OFF by default).",
             ),
-            radial_floor,
-        )
-        radial_floor_note = QLabel(
-            self._tr("stacking_min_radial_floor_note", "(0.0 = no floor)"),
             group,
         )
-        radial_floor_note.setWordWrap(True)
-        layout.addRow(QLabel(""), radial_floor_note)
-        self._config_fields["min_radial_weight_floor"] = {
-            "kind": "double_spinbox",
-            "widget": radial_floor,
-            "type": float,
-        }
-
-        def _update_radial_controls(enabled: bool) -> None:
-            radial_feather.setEnabled(enabled)
-            radial_floor.setEnabled(enabled)
-            radial_floor_note.setEnabled(enabled)
-
-        _update_radial_controls(radial_checkbox.isChecked())
-        radial_checkbox.toggled.connect(_update_radial_controls)  # type: ignore[arg-type]
+        recon_note.setWordWrap(True)
+        layout.addRow(QLabel(""), recon_note)
 
         return group
 
@@ -3894,9 +3860,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         }
         widget.editingFinished.connect(lambda k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
-    def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str) -> QCheckBox:
+    def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str, *, default: bool = False) -> QCheckBox:
         checkbox = QCheckBox(label_text)
-        checkbox.setChecked(self._normalize_config_bool(self.config.get(key, False), False))
+        checkbox.setChecked(self._normalize_config_bool(self.config.get(key, default), default))
         layout.addRow(checkbox)
         self._config_fields[key] = {
             "kind": "checkbox",
@@ -4328,6 +4294,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "stacking_winsor_limits": "0.05,0.05",
             "stacking_final_combine_method": "mean",
             "poststack_equalize_rgb": False,
+            "coverage_support_taper": True,
+            "coverage_aware_reconstruction": False,
             "apply_radial_weight": False,
             "radial_feather_fraction": 0.8,
             "min_radial_weight_floor": 0.0,

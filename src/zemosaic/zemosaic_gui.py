@@ -330,6 +330,8 @@ class ZeMosaicGUI:
                 "stacking_winsor_limits": "0.05,0.05",
                 "stacking_final_combine_method": "mean",
                 "poststack_equalize_rgb": False,
+                "coverage_support_taper": True,
+                "coverage_aware_reconstruction": False,
                 # Logging
                 "logging_level": "INFO",
                 "apply_radial_weight": False,
@@ -561,11 +563,15 @@ class ZeMosaicGUI:
         self.stacking_final_combine_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_final_combine_method", self.combine_method_keys[0]))
         self.poststack_equalize_rgb_var = tk.BooleanVar(master=self.root, value=self.config.get("poststack_equalize_rgb", True))
 
-        # --- PONDÉRATION RADIALE ---
-        self.apply_radial_weight_var = tk.BooleanVar(master=self.root, value=self.config.get("apply_radial_weight", False))
+        # --- PONDÉRATION RADIALE (legacy, inerte — décision K) ---
+        self.apply_radial_weight_var = tk.BooleanVar(master=self.root, value=False)  # inert (decision K)
         self.radial_feather_fraction_var = tk.DoubleVar(master=self.root, value=self.config.get("radial_feather_fraction", 0.8))
         self.min_radial_weight_floor_var = tk.DoubleVar(master=self.root, value=self.config.get("min_radial_weight_floor", 0.0)) # Ajouté
         # radial_shape_power est géré via self.config directement
+
+        # --- COUVERTURE (canonical, décision K) ---
+        self.coverage_support_taper_var = tk.BooleanVar(master=self.root, value=self.config.get("coverage_support_taper", True))
+        self.coverage_aware_reconstruction_var = tk.BooleanVar(master=self.root, value=self.config.get("coverage_aware_reconstruction", False))
         
         # --- METHODE D'ASSEMBLAGE ---
         self.final_assembly_method_var = tk.StringVar(master=self.root,
@@ -1274,6 +1280,13 @@ class ZeMosaicGUI:
         self.post_equalize_rgb_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_post_equalize_rgb_label"] = self.post_equalize_rgb_label
         self.post_equalize_rgb_check = ttk.Checkbutton(stacking_options_frame, variable=self.poststack_equalize_rgb_var)
         self.post_equalize_rgb_check.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="w"); stk_opt_row += 1
+        # Couverture (canonical, décision K)
+        self.coverage_support_taper_label = ttk.Label(stacking_options_frame, text="")
+        self.coverage_support_taper_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_coverage_support_taper_label"] = self.coverage_support_taper_label
+        self.coverage_support_taper_check = ttk.Checkbutton(stacking_options_frame, variable=self.coverage_support_taper_var); self.coverage_support_taper_check.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="w"); stk_opt_row += 1
+        self.coverage_aware_reconstruction_label = ttk.Label(stacking_options_frame, text="")
+        self.coverage_aware_reconstruction_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_coverage_reconstruction_label"] = self.coverage_aware_reconstruction_label
+        self.coverage_aware_reconstruction_check = ttk.Checkbutton(stacking_options_frame, variable=self.coverage_aware_reconstruction_var); self.coverage_aware_reconstruction_check.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="w"); stk_opt_row += 1
         # Pondération Radiale
         self.apply_radial_weight_label = ttk.Label(stacking_options_frame, text="")
         self.apply_radial_weight_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_apply_radial_label"] = self.apply_radial_weight_label
@@ -4088,6 +4101,8 @@ class ZeMosaicGUI:
             radial_feather_fraction_val = self.radial_feather_fraction_var.get()
             min_radial_weight_floor_val = self.min_radial_weight_floor_var.get()
             radial_shape_power_val = self.config.get("radial_shape_power", 2.0) # Toujours depuis config pour l'instant
+            coverage_support_taper_val = self.coverage_support_taper_var.get()
+            coverage_aware_reconstruction_val = self.coverage_aware_reconstruction_var.get()
 
             final_assembly_method_val = self.final_assembly_method_var.get()
             num_base_workers_gui_val = self.num_workers_var.get()
@@ -4207,6 +4222,8 @@ class ZeMosaicGUI:
             self.config["stacking_kappa_high"] = float(stack_kappa_high)
             self.config["stacking_final_combine_method"] = stack_final_combine
             self.config["poststack_equalize_rgb"] = bool(poststack_equalize_rgb_val)
+            self.config["coverage_support_taper"] = bool(coverage_support_taper_val)
+            self.config["coverage_aware_reconstruction"] = bool(coverage_aware_reconstruction_val)
         except Exception:
             pass
 

@@ -193,13 +193,19 @@ class TestQtStackingTokens:
         ]
 
     def test_legacy_radial_controls_registered(self):
+        from zemosaic import zemosaic_config
         keys = _gui_config_field_keys()
-        # The three radial controls exposed in the Qt stacking group.
-        assert {"apply_radial_weight", "radial_feather_fraction", "min_radial_weight_floor"} <= keys
-        # ``radial_shape_power`` is a config default but is NOT a Qt stacking-group
-        # field (legacy, config-only). Proving the *gap*, not asserting absence by accident:
-        # it must not be registered as a config field here.
+        # Gate A snapshot recorded the legacy radial Qt controls as registered;
+        # Gate E5b replaced them with the canonical Coverage controls (decision K).
+        # (1) Legacy radial fields are NO LONGER registered in the Qt stacking group.
+        for legacy in ("apply_radial_weight", "radial_feather_fraction", "min_radial_weight_floor"):
+            assert legacy not in keys
+        # ``radial_shape_power`` remains config-only (never a Qt stacking field).
         assert "radial_shape_power" not in keys
+        # (2) The two canonical Coverage controls ARE registered, with correct defaults.
+        assert {"coverage_support_taper", "coverage_aware_reconstruction"} <= keys
+        assert zemosaic_config.DEFAULT_CONFIG["coverage_support_taper"] is True
+        assert zemosaic_config.DEFAULT_CONFIG["coverage_aware_reconstruction"] is False
 
     def test_all_requested_keys_registered(self):
         keys = _gui_config_field_keys()
