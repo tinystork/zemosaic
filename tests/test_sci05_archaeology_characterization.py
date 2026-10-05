@@ -524,13 +524,9 @@ class TestGlobalCoaddDispatch:
         assert allowed == {"mean", "median", "kappa_sigma", "winsorized"}
 
     def test_finalizer_dispatch_symbols(self):
-        # The coadd dispatch maps method → executed finalizer symbol:
-        #   mean → _finalize_mean; kappa_sigma → _finalize_kappa_sigma;
-        #   median / winsorized → _finalize_chunked(method).
-        # We locate the dispatch structurally: the ``If`` whose body calls
-        # ``_finalize_mean``, then walk its ``elif`` chain (nested ``orelse``).
-        # (A separate ``if coadd_method == "kappa_sigma"`` allocates the sumsq
-        # grid earlier; structural location avoids that false match.)
+        # F5 R1 (decision G1, option a): the coadd dispatch routes ALL FOUR labels through
+        # the same canonical engine via `_finalize_chunked(method)`; the legacy
+        # `_finalize_mean` / `_finalize_kappa_sigma` ad-hoc paths are no longer dispatched.
         tree = _parse(_WORKER_PATH)
         fn = _find_func(tree, "_assemble_global_mosaic_first_impl")
         assert fn is not None
@@ -542,28 +538,21 @@ class TestGlobalCoaddDispatch:
                     return call.func.id
             return None
 
+        # The legacy `_finalize_mean` is no longer dispatched (no `If` calls it).
         mean_if = None
         for node in ast.walk(fn):
             if isinstance(node, ast.If) and _body_call(node) == "_finalize_mean":
                 mean_if = node
                 break
-        assert mean_if is not None
-        # elif coadd_method == "kappa_sigma" → _finalize_kappa_sigma
-        kappa_if = mean_if.orelse[0]
-        assert isinstance(kappa_if, ast.If)
-        assert _body_call(kappa_if) == "_finalize_kappa_sigma"
-        # else → _finalize_chunked(coadd_method)
-        chunked_call = kappa_if.orelse[0]
-        assert isinstance(chunked_call, ast.Assign)
-        assert isinstance(chunked_call.value, ast.Call)
-        assert isinstance(chunked_call.value.func, ast.Name)
-        assert chunked_call.value.func.id == "_finalize_chunked"
+        assert mean_if is None
 
         chunked = _find_func(fn, "_finalize_chunked")
         assert chunked is not None
         src = ast.dump(chunked)
-        assert "nanmedian" in src  # median branch
-        assert "nanpercentile" in src  # winsorized percentile clip
+        assert "winsorized_sigma_clip" in src  # Winsorized -> canonical WSC
+        assert "kappa_sigma" in src  # Kappa-Sigma -> canonical kappa
+        assert "nanmedian" not in src  # ad-hoc median removed (routes canonical)
+        assert "nanpercentile" not in src  # divergent percentile clip removed
 
     def test_chunked_median_and_winsorized_semantics_reconstruction(self):
         # RECONSTRUCTION of the chunked finalizer formulas (worker:37743+) with

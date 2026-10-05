@@ -36709,6 +36709,8 @@ def _assemble_global_mosaic_first_impl(
     if coadd_method not in allowed_methods:
         coadd_method = "kappa_sigma"
     stack_reject_algo = str(global_plan.get("stack_reject_algo") or coadd_method).strip().lower()
+    # F5 R1 (R2): `coadd_k` and `winsor_limits` are accepted-but-INERT — the canonical
+    # global-coadd routing uses the frozen defaults (kappa sigma 3.0; WSC winsor 0.05/0.05).
     try:
         kappa_sigma_k = float(global_plan.get("coadd_k", 2.0) or 2.0)
     except Exception:
@@ -36784,6 +36786,18 @@ def _assemble_global_mosaic_first_impl(
         _log_helper_cpu_resume("gpu_reproject", reason=helper_reason, discarded=False)
     gpu_supported_methods = {"mean", "median", "winsorized", "kappa_sigma"}
     gpu_helper_supported = gpu_helper_candidate and coadd_method in gpu_supported_methods
+    # F5 R2 (decision G1, backend consistency): the legacy GPU helper combine diverges from the
+    # canonical engine (coadd_k=2.0, legacy winsorized/mean/median). Disable it for the global
+    # coadd so BOTH CPU and GPU environments run the canonical CPU stage (coadd_k/winsor_limits
+    # inert everywhere). Explicit and non-silent.
+    if gpu_helper_supported:
+        pcb(
+            "global_coadd_helper_legacy_disabled_canonical_only",
+            prog=None,
+            lvl="INFO",
+            **_payload(helper="gpu_reproject", method=coadd_method, reason="legacy_combine_disabled"),
+        )
+        gpu_helper_supported = False
     if gpu_helper_candidate and not gpu_helper_supported:
         reason = "unsupported_method"
         if coadd_method in allowed_methods:
@@ -37496,7 +37510,7 @@ def _assemble_global_mosaic_first_impl(
         ),
     )
 
-    store_patches = coadd_method in {"median", "winsorized", "kappa_sigma"}
+    store_patches = True  # F5 R1: all four labels route through the chunked canonical engine
     sum_grid: np.ndarray | None = None
     sumsq_grid: np.ndarray | None = None
     weight_grid: np.ndarray | None = None
@@ -37695,6 +37709,13 @@ def _assemble_global_mosaic_first_impl(
             return chunk or min(height, 64)
 
         def _finalize_chunked(method: str) -> tuple[np.ndarray, np.ndarray]:
+            _coadd_map = {
+                "mean": ("none", "mean"),
+                "median": ("none", "median"),
+                "kappa_sigma": ("kappa_sigma", "mean"),
+                "winsorized": ("winsorized_sigma_clip", "mean"),
+            }
+            _rejection, _combine = _coadd_map[method]
             chunk_h = _compute_chunk_height()
             if chunk_h <= 0:
                 chunk_h = min(height, 128)
@@ -37739,23 +37760,27 @@ def _assemble_global_mosaic_first_impl(
                         weight_stack[idx, global_y0:global_y1, x_start:x_end] = weight_mm[
                             local_y0:local_y1, :
                         ]
-                    if method == "median":
-                        chunk_result = np.nanmedian(stack, axis=0)
-                        chunk_weight = np.nansum(weight_stack, axis=0)
-                    else:
-                        low_pct = max(0.0, min(100.0, winsor_limits[0] * 100.0))
-                        high_pct = max(0.0, min(100.0, 100.0 - winsor_limits[1] * 100.0))
-                        lower = np.nanpercentile(stack, low_pct, axis=0).astype(np.float32, copy=False)
-                        upper = np.nanpercentile(stack, high_pct, axis=0).astype(np.float32, copy=False)
-                        # Keep processing in float32 and reuse the large stack buffer in-place to avoid
-                        # allocating huge float64 intermediates (which can hard-crash Windows).
-                        np.clip(stack, lower, upper, out=stack)
-                        stack *= weight_stack[..., None]
-                        chunk_weight = np.nansum(weight_stack, axis=0)
-                        with np.errstate(invalid="ignore", divide="ignore"):
-                            chunk_result = np.nansum(stack, axis=0) / np.expand_dims(
-                                chunk_weight, axis=-1
-                            )
+                    # F5 R1 (decision G1, option a): route every label through the same
+                    # canonical engine (rejection/combine mapped from the method label).
+                    from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
+                    n_frames = stack.shape[0]
+                    frames = [stack[i] for i in range(n_frames)]
+                    supports = [(weight_stack[i] > 0) for i in range(n_frames)]
+                    ref_idx = 0 if (n_frames > 0 and np.any(supports[0])) else None
+                    req = CanonicalStackRequest(
+                        images=frames,
+                        geometric_support=supports,
+                        normalization="none",
+                        weighting="none",
+                        rejection=_rejection,
+                        combine=_combine,
+                        reference_index=ref_idx,
+                        taper="none",
+                        backend="cpu",
+                    )
+                    res = run_canonical_stack(req)
+                    chunk_result = res.science
+                    chunk_weight = res.estimator_weight_sum
                     chunk_result = np.asarray(chunk_result, dtype=np.float32)
                     chunk_result[~np.isfinite(chunk_result)] = np.nan
                     chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0).astype(
@@ -37793,12 +37818,10 @@ def _assemble_global_mosaic_first_impl(
                     chunk_h = max(1, chunk_h // 2)
             return final, coverage
 
-        if coadd_method == "mean":
-            final_image, coverage_map = _finalize_mean()
-        elif coadd_method == "kappa_sigma":
-            final_image, coverage_map = _finalize_kappa_sigma()
-        else:
-            final_image, coverage_map = _finalize_chunked(coadd_method)
+        # F5 R1 (decision G1, option a): route ALL FOUR labels through the same canonical
+        # engine. The legacy `_finalize_mean`/`_finalize_kappa_sigma` ad-hoc paths are no
+        # longer the supported route for those labels (left unreachable).
+        final_image, coverage_map = _finalize_chunked(coadd_method)
 
         if final_image is None or coverage_map is None:
             return _fail("global_coadd_error_finalize_failed")

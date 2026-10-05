@@ -453,6 +453,22 @@ survivors. Output float32.
   `Winsorized` route (no same-label approximation).
 - No rename workaround selected: **unify science**.
 
+**F5 implementation-resolution clarification (global-coadd route convergence):**
+* All four global-coadd labels (`Mean`, `Median`, `Kappa-Sigma`, `Winsorized`) route to the
+  canonical engine (`run_canonical_stack`, `backend="cpu"`, processed per spatial chunk) in
+  `_finalize_chunked`: `mean` → rejection `none`/combine `mean`; `median` → `none`/`median`;
+  `kappa_sigma` → `kappa_sigma` (frozen sigma 3.0)/`mean`; `winsorized` → `winsorized_sigma_clip`/
+  `mean`. The divergent percentile-winsorized clip and the ad-hoc mean/median/kappa finalizers are
+  removed. The reprojected per-frame footprint (`> 0`) is the geometric support; normalization/
+  weighting `none`.
+* R2: `coadd_k` and user-set `winsor_limits` are accepted-but-**inert** (canonical frozen defaults:
+  kappa sigma 3.0; WSC winsor 0.05/0.05) — explicit, not silent.
+* R2 (backend consistency): the legacy GPU helper combine (`reproject_and_coadd_wrapper` with
+  `combine_function=coadd_method`, `coadd_k`, `winsor_limits`) is **disabled** for the global coadd
+  (explicit `global_coadd_helper_legacy_disabled_canonical_only` log, then `gpu_helper_supported =
+  False`); both CPU and GPU environments run the canonical CPU stage, so the same label yields
+  canonical semantics regardless of GPU presence.
+
 ---
 
 ## 11. Equalize RGB — decision J
@@ -597,6 +613,12 @@ survivors. Output float32.
   `_reproject_frame_to_tile` (never inferred from brightness/NaN); `coverage_support_taper`
   consumed; the GPU path runs the canonical stage on CPU (explicit — B1/B2/support are CPU-only).
   SDS / Phase 4.5 / global coadd remain later F lots.
+  **F5 (global-coadd route convergence, implemented):** all four `global_coadd_method` labels
+  (`Mean`/`Median`/`Kappa-Sigma`/`Winsorized`) route to the canonical engine (`run_canonical_stack`,
+  per spatial chunk, backend `cpu`); the divergent percentile-winsorized clip and ad-hoc
+  mean/median/kappa finalizers are removed; `coadd_k`/`winsor_limits` accepted-but-inert;
+  the legacy GPU helper combine is disabled (canonical-only; explicit log).
+  SDS / Phase 4.5 remain the next lot.
 - **G** — final independent audit + one full suite + optional real-data/human science gate.
 
 Full suite runs **once at final**. New ZeGrid is out of scope.
