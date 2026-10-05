@@ -15504,6 +15504,8 @@ def _safe_load_cache(path: str, *, pcb: Callable | None = None, tile_id: int | N
 
 def _stack_master_tile_cpu(
     aligned_images_for_stack: list,
+    footprints: list | None = None,
+    reference_index: int | None = 0,
     *,
     stack_norm_method: str,
     stack_weight_method: str,
@@ -15618,6 +15620,8 @@ def _stack_master_tile_cpu(
         else:
             master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
                 aligned_image_data_list=aligned_images_for_stack,
+                geometric_support=footprints,
+                reference_index=reference_index,
                 normalize_method=stack_norm_method,
                 weighting_method=stack_weight_method,
                 rejection_algorithm=stack_reject_algo,
@@ -15704,6 +15708,8 @@ def _shrink_parallel_plan_for_gpu(parallel_plan: ParallelPlan | None) -> Paralle
 
 def _stack_master_tile_auto(
     image_descriptors: list,
+    footprints: list | None = None,
+    reference_index: int | None = 0,
     *,
     stack_norm_method: str,
     stack_weight_method: str,
@@ -15813,6 +15819,8 @@ def _stack_master_tile_auto(
 
     stacked_cpu, meta_cpu = _stack_master_tile_cpu(
         image_descriptors,
+        footprints=footprints,
+        reference_index=reference_index,
         stack_norm_method=stack_norm_method,
         stack_weight_method=stack_weight_method,
         stack_reject_algo=stack_reject_algo,
@@ -17028,6 +17036,9 @@ def create_master_tile(
     propagate_mask_for_coverage = bool(
         altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE # commented for test purpose replace the above line to return to the previous state, winsorized_reject or (altaz_cleanup_enabled_effective and _LECROPPER_AVAILABLE)
     )
+    # F2/R1: footprint propagation is UNCONDITIONAL for the Classic CPU route so an honest
+    # geometric footprint always exists (threaded to the canonical engine).
+    propagate_mask_for_stack = True
     if debug_tile:
         pcb_tile(
             f"MT_COVERAGE: propagate_mask={propagate_mask_for_coverage}",
@@ -17036,11 +17047,12 @@ def create_master_tile(
             tile_id=int(tile_id),
         )
     _check_abort("before_alignment")
-    aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
+    aligned_images_for_stack, failed_alignment_indices, aligned_footprints = zemosaic_align_stack.align_images_in_group(
         image_data_list=tile_images_data_HWC_adu,
         reference_image_index=ref_loaded_idx,
-        propagate_mask=propagate_mask_for_coverage,
-        progress_callback=_tile_progress_callback
+        propagate_mask=propagate_mask_for_stack,
+        progress_callback=_tile_progress_callback,
+        return_footprints=True,
     )
     _touch_progress()
     _check_abort("after_alignment")
@@ -17169,16 +17181,35 @@ def create_master_tile(
     if aligned_images_for_stack and 0 <= ref_loaded_idx < len(aligned_images_for_stack):
         ref_aligned_img = aligned_images_for_stack[ref_loaded_idx]
 
+    def _footprint_at(idx):
+        if aligned_footprints and 0 <= idx < len(aligned_footprints):
+            return aligned_footprints[idx]
+        return None
+
+    valid_aligned_images = []
+    valid_footprints = []
     if ref_aligned_img is not None:
-        valid_aligned_images = [ref_aligned_img]
+        valid_aligned_images.append(ref_aligned_img)
+        valid_footprints.append(_footprint_at(ref_loaded_idx))
         for idx_img, img in enumerate(aligned_images_for_stack):
             if idx_img == ref_loaded_idx or img is None:
                 continue
             valid_aligned_images.append(img)
+            valid_footprints.append(_footprint_at(idx_img))
     else:
-        valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
+        for idx_img, img in enumerate(aligned_images_for_stack):
+            if img is None:
+                continue
+            valid_aligned_images.append(img)
+            valid_footprints.append(_footprint_at(idx_img))
     if aligned_images_for_stack:
         del aligned_images_for_stack # Libérer la liste originale après filtrage
+    if aligned_footprints:
+        del aligned_footprints
+
+    # F2/R1: reference present (alignment reference first) -> explicit index 0; reference
+    # missing -> auto-select (None) so the canonical engine picks max-valid-count (N1).
+    stack_reference_index = 0 if ref_aligned_img is not None else None
 
     num_actually_aligned_for_header = len(valid_aligned_images)
     pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
@@ -17257,8 +17288,10 @@ def create_master_tile(
                 lvl="DEBUG_DETAIL",
             )
 
-    # If we nanized aligned images for coverage, clean them before stacking to avoid stacker ERROR logs.
-    if propagate_mask_for_coverage and not winsorized_reject:
+    # If we nanized aligned images (coverage or F2 unconditional footprint), clean them
+    # before the legacy stacker to avoid stacker ERROR logs. The canonical route (Gate F2)
+    # ignores this: it uses the threaded footprint masks as the authority.
+    if (propagate_mask_for_coverage or propagate_mask_for_stack) and not winsorized_reject:
         try:
             for idx_img, img in enumerate(valid_aligned_images):
                 if isinstance(img, np.ndarray):
@@ -17416,6 +17449,8 @@ def create_master_tile(
     _check_abort("before_stack")
     master_tile_stacked_HWC, stack_metadata, used_gpu = _stack_master_tile_auto(
         valid_aligned_images,
+        footprints=valid_footprints,
+        reference_index=stack_reference_index,
         stack_norm_method=stack_norm_method,
         stack_weight_method=stack_weight_method,
         stack_reject_algo=stack_reject_algo,

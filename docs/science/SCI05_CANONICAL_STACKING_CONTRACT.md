@@ -269,6 +269,21 @@ substitution.
     length-N sequence of `(H,W)` tapers — never a radial map.
   * **No claim**: Coverage render, the final request/result engine, and production caller
     wiring remain **not** implemented at this sub-lot (Gate E2+).
+* **F2 implementation-resolution clarification (Classic CPU route convergence + support source):**
+  * The Classic CPU stacking route (`stack_aligned_images`) now executes the canonical engine
+    (`run_canonical_stack`, `backend="cpu"`) when the geometric footprints are threaded; the
+    worker threads them unconditionally (`align_images_in_group(..., propagate_mask=True,
+    return_footprints=True)` → `_stack_master_tile_auto` → `_stack_master_tile_cpu` →
+    `stack_aligned_images(geometric_support=<footprints>)`).
+  * The Classic geometric support `m_i` is the **transform-derived alignment footprint** —
+    astroalign `propagate_mask` on the astroalign path, or the axis-aligned overlap rectangle
+    from `_overlap_slices_from_shift` on the FFT-only/fallback path (reference identity frame
+    = all-True). It is **never** inferred from brightness/NaN; frames with no honest footprint
+    are explicitly excluded.
+  * `coverage_support_taper` (default ON) selects the footprint taper for the estimator-weight
+    map (`taper="footprint"`/`"none"`); legacy radial weighting stays inert; the Coverage render
+    stays preview-only (never mutates science). No silent science fallback (`noise_fwhm` +
+    missing Photutils fails explicitly; `linear_fit_clip` fails `unsupported_removed_sci05`).
 
 ---
 
@@ -543,6 +558,12 @@ survivors. Output float32.
 - **D** — CPU/GPU convergence / physical qualification.
 - **E** — donor Coverage transplant + settings/GUI/migration/render A/B.
 - **F** — caller convergence: Classic / SDS / Grid / Phase 4.5 / global coadd.
+  **F2 (Classic CPU route, implemented):** `stack_aligned_images` routes through
+  `run_canonical_stack` (backend `cpu`) for the supported method set; geometric support
+  `m_i` = transform-derived alignment footprint (astroalign `propagate_mask` or FFT overlap
+  rectangle), propagation unconditional, no-footprint frames excluded; `coverage_support_taper`
+  consumed; legacy radial inert; render preview-only. SDS / Grid / Phase 4.5 / global coadd
+  remain later F lots.
 - **G** — final independent audit + one full suite + optional real-data/human science gate.
 
 Full suite runs **once at final**. New ZeGrid is out of scope.
