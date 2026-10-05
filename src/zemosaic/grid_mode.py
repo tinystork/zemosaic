@@ -496,6 +496,7 @@ class GridModeConfig:
     save_final_as_uint16: bool = False
     legacy_rgb_cube: bool = False
     use_gpu: bool = False
+    coverage_support_taper: bool = True
 
 
 @dataclass
@@ -1910,6 +1911,64 @@ def _normalize_patches_gpu(
     return normalized, float(ref_median)
 
 
+def _stack_grid_via_canonical(
+    patches: list[np.ndarray],
+    geometric_support: list[np.ndarray],
+    config: GridModeConfig,
+    *,
+    reference_median: float | None = None,
+    return_weight_sum: bool = False,
+    return_ref_median: bool = False,
+):
+    """Route Grid per-tile stacking through the accepted canonical engine (Gate F4).
+
+    ``geometric_support`` is the per-frame WCS-reprojection footprint (× alpha mask)
+    surfaced by ``_reproject_frame_to_tile`` — an honest transform-derived mask, never
+    inferred from brightness/NaN. ``coverage_support_taper`` selects the footprint taper.
+    The canonical stage runs on CPU in this lot (B1/B2/support are CPU-only).
+    """
+    from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
+
+    if not patches:
+        return None
+
+    taper_enabled = bool(getattr(config, "coverage_support_taper", True))
+    # R1: reference present (first patch has non-empty support) -> explicit 0; else auto (None)
+    # so the canonical engine picks max-valid-count (N1) instead of failing on a zero-support frame.
+    ref_idx: int | None = 0
+    try:
+        first_sup = geometric_support[0] if geometric_support else None
+        if first_sup is not None and isinstance(first_sup, np.ndarray) and not bool(np.any(first_sup)):
+            ref_idx = None
+    except Exception:
+        ref_idx = 0
+    request = CanonicalStackRequest(
+        images=patches,
+        geometric_support=list(geometric_support),
+        normalization=config.stack_norm_method,
+        weighting=config.stack_weight_method,
+        rejection=config.stack_reject_algo,
+        combine=config.stack_final_combine,
+        reference_index=ref_idx,
+        taper="footprint" if taper_enabled else "none",
+        taper_px=8.0,
+        taper_floor=0.0,
+        sigma_low=float(config.stack_kappa_low),
+        sigma_high=float(config.stack_kappa_high),
+        winsor_limit_low=float(config.winsor_limits[0]),
+        winsor_limit_high=float(config.winsor_limits[1]),
+        backend="cpu",
+        equalize_rgb=False,
+    )
+    result = run_canonical_stack(request)
+    outputs = [result.science]
+    if return_weight_sum:
+        outputs.append(result.estimator_weight_sum.astype(np.float32))
+    if return_ref_median:
+        outputs.append(reference_median)
+    return tuple(outputs) if len(outputs) > 1 else outputs[0]
+
+
 def _stack_weighted_patches(
     patches: list[np.ndarray],
     weights: list[np.ndarray],
@@ -1918,6 +1977,7 @@ def _stack_weighted_patches(
     reference_median: float | None = None,
     return_weight_sum: bool = False,
     return_ref_median: bool = False,
+    geometric_support: list[np.ndarray] | None = None,
 ) -> np.ndarray | tuple | None:
     """Stack patches with optional sigma clipping and shared photometric anchor.
 
@@ -1928,6 +1988,13 @@ def _stack_weighted_patches(
 
     if not patches:
         return None
+    if geometric_support is not None:
+        return _stack_grid_via_canonical(
+            patches, geometric_support, config,
+            reference_median=reference_median,
+            return_weight_sum=return_weight_sum,
+            return_ref_median=return_ref_median,
+        )
     # Ensure shapes match and promote to float32
     normalized, ref_median_used = _normalize_patches(
         patches,
@@ -1992,8 +2059,18 @@ def _stack_weighted_patches_gpu(
     progress_callback: ProgressCallback = None,
     raise_on_gpu_failure: bool = False,
     gpu_failure_context: dict | None = None,
+    geometric_support: list[np.ndarray] | None = None,
 ) -> np.ndarray | tuple | None:
     """Stack patches with GPU acceleration and optional sigma clipping."""
+    if geometric_support is not None:
+        # F4: the canonical engine stage runs on CPU (B1/B2/support are CPU-only); explicit
+        # and documented — no silent backend mismatch for the GPU path.
+        return _stack_grid_via_canonical(
+            patches, geometric_support, config,
+            reference_median=reference_median,
+            return_weight_sum=return_weight_sum,
+            return_ref_median=return_ref_median,
+        )
     if not _CUPY_AVAILABLE:
         return _stack_weighted_patches(
             patches, weights, config, reference_median=reference_median, return_weight_sum=return_weight_sum, return_ref_median=return_ref_median
@@ -2150,6 +2227,7 @@ def process_tile(
     _emit(f"Tile {tile.tile_id}: using {'GPU' if config.use_gpu else 'CPU'} for stacking", callback=progress_callback)
     aligned_patches: list[np.ndarray] = []
     weight_maps: list[np.ndarray] = []
+    footprint_maps: list[np.ndarray] = []
     # Chunking logic to control memory usage per tile.
     # stack_chunk_budget_mb is the max MB per tile for stacking.
     # Per-tile RAM ≈ chunk_limit × per_frame_bytes + tile_canvas_bytes
@@ -2192,6 +2270,7 @@ def process_tile(
         if chunk_failed or not aligned_patches:
             aligned_patches.clear()
             weight_maps.clear()
+            footprint_maps.clear()
             return
         if tile_gpu_enabled:
             failure_ctx: dict = {}
@@ -2205,6 +2284,7 @@ def process_tile(
                     return_ref_median=True,
                     raise_on_gpu_failure=True,
                     gpu_failure_context=failure_ctx,
+                    geometric_support=footprint_maps,
                 )
 
             try:
@@ -2252,6 +2332,7 @@ def process_tile(
                     reference_median=reference_median,
                     return_weight_sum=True,
                     return_ref_median=True,
+                    geometric_support=footprint_maps,
                 )
             finally:
                 _cleanup_gpu_memory()
@@ -2263,6 +2344,7 @@ def process_tile(
                 reference_median=reference_median,
                 return_weight_sum=True,
                 return_ref_median=True,
+                geometric_support=footprint_maps,
             )
         if not isinstance(res, tuple) or len(res) < 2:
             chunk_failed = True
@@ -2286,6 +2368,7 @@ def process_tile(
                     running_weight = running_weight + weight_sum
         aligned_patches.clear()
         weight_maps.clear()
+        footprint_maps.clear()
 
     for frame in tile.frames:
         patch, footprint = _reproject_frame_to_tile(frame, tile, tile_shape, progress_callback=progress_callback)
@@ -2315,8 +2398,10 @@ def process_tile(
                     f"({len(tile.frames)} frames -> chunk_size={chunk_limit}, ~{est_chunk_mb:.1f} MB)",
                     callback=progress_callback,
                 )
+        footprint_bool = np.asarray(footprint, dtype=np.float32) > 0
         aligned_patches.append(patch)
         weight_maps.append(weight_map)
+        footprint_maps.append(footprint_bool)
         if len(aligned_patches) >= chunk_limit:
             flush_chunk()
             if chunk_failed:
@@ -4280,6 +4365,7 @@ def run_grid_mode(
         save_final_as_uint16=save_final_as_uint16,
         legacy_rgb_cube=legacy_rgb_cube,
         use_gpu=use_gpu_effective,
+        coverage_support_taper=bool(getattr(zconfig, "coverage_support_taper", True)),
     )
 
     csv_path = Path(input_folder).expanduser() / "stack_plan.csv"

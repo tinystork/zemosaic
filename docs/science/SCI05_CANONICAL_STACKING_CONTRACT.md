@@ -284,6 +284,15 @@ substitution.
     map (`taper="footprint"`/`"none"`); legacy radial weighting stays inert; the Coverage render
     stays preview-only (never mutates science). No silent science fallback (`noise_fwhm` +
     missing Photutils fails explicitly; `linear_fit_clip` fails `unsupported_removed_sci05`).
+* **F4 implementation-resolution clarification (Grid route convergence + support source):**
+  * The Grid per-tile stacking (`grid_mode._stack_weighted_patches` / `_stack_weighted_patches_gpu`)
+    now executes the canonical engine (`run_canonical_stack`, `backend="cpu"`) when the geometric
+    support is threaded (footprints collected alongside aligned patches in `run_grid_mode`).
+  * The Grid geometric support `m_i` is the **WCS-reprojection footprint** from
+    `_reproject_frame_to_tile` (`reproject_interp(return_footprint=True)` × optional alpha mask),
+    binarized `> 0`. It is **never** inferred from brightness/NaN. `coverage_support_taper` selects
+    the footprint taper. The GPU path runs the canonical stage on CPU (explicit — B1/B2/support
+    are CPU-only).
 
 ---
 
@@ -582,6 +591,12 @@ survivors. Output float32.
   `apply_radial_weight=True` is bit-identical to `False`; `ZMT_RADW` always `False`,
   `ZMT_RADF`/`ZMT_RADP` omitted; deprecated keys readable-but-inert; Grid never applied a
   radial map; GPU path stays inert.
+  **F4 (Grid route convergence, implemented):** `grid_mode._stack_weighted_patches` /
+  `_stack_weighted_patches_gpu` route through `run_canonical_stack` (backend `cpu`) when the
+  geometric support is threaded; `m_i` = WCS-reprojection footprint (× alpha mask) from
+  `_reproject_frame_to_tile` (never inferred from brightness/NaN); `coverage_support_taper`
+  consumed; the GPU path runs the canonical stage on CPU (explicit — B1/B2/support are CPU-only).
+  SDS / Phase 4.5 / global coadd remain later F lots.
 - **G** — final independent audit + one full suite + optional real-data/human science gate.
 
 Full suite runs **once at final**. New ZeGrid is out of scope.
