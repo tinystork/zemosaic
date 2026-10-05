@@ -265,9 +265,11 @@ class TestProvenance:
     def test_effective_event_bounded(self):
         res = run_canonical_stack(_request(_values_corpus([1.0, 2.0, 3.0])))
         ev = res.provenance["effective_event"]
-        # all values are scalars/strings (no arrays, no numpy scalars)
+        # all values are JSON-serializable scalars/strings/lists (no numpy
+        # arrays/scalars); the non-requested equalizer decision is None.
         for v in ev.values():
-            assert isinstance(v, (str, int, float, bool))
+            assert isinstance(v, (str, int, float, bool, list, type(None)))
+        json.dumps(ev)  # must not raise
         json.dumps(ev)
 
 
@@ -300,12 +302,64 @@ class TestValidation:
         with pytest.raises(cs.CanonicalStackValidationError):
             run_canonical_stack(_request(arrays, masks=[np.ones((2, 2), bool)] * 2))
 
-    def test_equalize_rgb_deferred(self):
-        req = _request(_values_corpus([1.0, 2.0]), equalize_rgb=True)
+    def _rgb_frames(self, n=3, h=100, w=100):
+        rng = np.random.default_rng(0)
+        offsets = np.array([10.0, 12.0, 14.0], dtype=np.float32)
+        return [
+            (rng.normal(0, 1, (h, w, 3)).astype(np.float32) + offsets)
+            for _ in range(n)
+        ]
+
+    def test_equalize_rgb_false_no_equalizer(self):
+        arrays = self._rgb_frames()
+        res = run_canonical_stack(_request(arrays, combine="mean", equalize_rgb=False))
+        assert res.provenance["equalize_rgb"] == {"requested": False, "applied": False}
+        assert res.provenance["effective_event"]["equalize_rgb_applied"] is False
+
+    def test_equalize_rgb_changes_only_science(self):
+        arrays = self._rgb_frames()
+        off = run_canonical_stack(_request(arrays, combine="mean", equalize_rgb=False))
+        on = run_canonical_stack(_request(arrays, combine="mean", equalize_rgb=True))
+        prov = on.provenance["equalize_rgb"]
+        assert prov["requested"] is True
+        assert prov["applied"] is True
+        assert prov["decision"] == "applied"
+        assert len(prov["clipped_gains"]) == 3
+        # only science changes; everything else stays bit-identical
+        assert not np.array_equal(on.science, off.science)
+        np.testing.assert_array_equal(on.estimator_weight_sum, off.estimator_weight_sum)
+        np.testing.assert_array_equal(on.valid_mask, off.valid_mask)
+        np.testing.assert_array_equal(on.surviving_sample_count, off.surviving_sample_count)
+        np.testing.assert_array_equal(on.support_w1, off.support_w1)
+        np.testing.assert_array_equal(on.support_w2, off.support_w2)
+        np.testing.assert_array_equal(on.n_eff_support, off.n_eff_support)
+        # effective_event mirrors it
+        ev = on.provenance["effective_event"]
+        assert ev["equalize_rgb_applied"] is True
+        assert ev["equalize_rgb_decision"] == "applied"
+        assert ev["equalize_rgb_gains"] == prov["clipped_gains"]
+
+    def test_equalize_rgb_mono_raises(self):
+        req = _request(_values_corpus([1.0, 2.0, 3.0]), equalize_rgb=True)
         with pytest.raises(cs.CanonicalStackValidationError) as ei:
             run_canonical_stack(req)
-        assert "equalize_rgb not wired yet" in str(ei.value)
-        assert "caller-convergence" in str(ei.value)
+        assert "RGB" in str(ei.value)
+
+    def test_equalize_rgb_hwc1_raises(self):
+        hwc1 = [np.ones((10, 10, 1), dtype=np.float32) * v for v in (1.0, 2.0, 3.0)]
+        with pytest.raises(cs.CanonicalStackValidationError):
+            run_canonical_stack(_request(hwc1, equalize_rgb=True))
+
+    def test_equalize_rgb_noop_insufficient_samples(self):
+        # small RGB corpus -> insufficient samples -> explicit no-op (applied=False,
+        # science stays the un-equalized combined values).
+        arrays = [np.ones((20, 20, 3), dtype=np.float32) * v for v in (1.0, 2.0, 3.0)]
+        off = run_canonical_stack(_request(arrays, combine="mean", equalize_rgb=False))
+        on = run_canonical_stack(_request(arrays, combine="mean", equalize_rgb=True))
+        prov = on.provenance["equalize_rgb"]
+        assert prov["applied"] is False
+        assert prov["decision"] == "insufficient_samples"
+        np.testing.assert_array_equal(on.science, off.science)
 
     def test_backend_gpu_unavailable_raises(self, monkeypatch):
         monkeypatch.setattr(

@@ -59,17 +59,13 @@ from zemosaic.core.canonical_support import (
     PositiveSupportAccumulator,
     build_canonical_estimator_weights,
 )
+from zemosaic.core.canonical_equalize import equalize_rgb_medians_copy
 
 __all__ = [
     "CanonicalStackRequest",
     "CanonicalStackResult",
     "run_canonical_stack",
 ]
-
-# Stable token for the deferred RGB equalizer wiring (never a silent no-op).
-_EQUALIZE_RGB_DEFERRED_TOKEN = (
-    "equalize_rgb not wired yet (deferred to caller-convergence gate)"
-)
 
 _BACKEND_CPU = "cpu"
 _BACKEND_GPU = "gpu"
@@ -122,8 +118,9 @@ class CanonicalStackRequest:
         ``"cpu"`` (default) or ``"gpu"``; forwarded to C1/C2 only (B1/B2/support
         stay CPU).
     equalize_rgb:
-        Reserved; ``True`` raises the explicit deferred-token error (the RGB
-        equalizer is not wired at this gate).
+        Optional post-combine RGB equalization (decision J). ``True`` applies the
+        canonical equalizer out-of-place to the combined science (RGB only;
+        mono/HWC1 raises ``CanonicalStackValidationError``).
     """
 
     images: object
@@ -200,10 +197,10 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
     """Run the canonical stack pipeline (B1 → B2 → E1 → C1 → C2).
 
     Deterministic, backend-neutral, side-effect free. Never mutates the request
-    or any input array. ``equalize_rgb=True`` raises the explicit deferred-token
-    error; a reference quality failure propagates ``CanonicalStackFailure``; a
-    ``"gpu"`` backend propagates the explicit Gate-D validation (no silent CPU
-    fallback).
+    or any input array. ``equalize_rgb=True`` applies the canonical equalizer
+    out-of-place to the combined science (RGB only); a reference quality failure
+    propagates ``CanonicalStackFailure``; a ``"gpu"`` backend propagates the
+    explicit Gate-D validation (no silent CPU fallback).
     """
     if not isinstance(request, CanonicalStackRequest):
         raise CanonicalStackValidationError(
@@ -211,9 +208,6 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
         )
 
     # --- engine-level config validation (fail before any stage work) ---
-    if request.equalize_rgb:
-        raise CanonicalStackValidationError(_EQUALIZE_RGB_DEFERRED_TOKEN)
-
     taper_token = request.taper
     if isinstance(taper_token, str):
         taper_token = taper_token.strip().lower()
@@ -274,6 +268,39 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
         backend=backend_token,
     )
 
+    # --- E4: optional post-combine RGB equalization (out-of-place) ---
+    science = combine.science
+    equalize_info = None
+    if request.equalize_rgb:
+        if combine.channels != 3:
+            raise CanonicalStackValidationError(
+                "equalize_rgb requires an RGB (3-channel) stack; got "
+                f"channels={combine.channels} (mono/HWC1 not supported)"
+            )
+        science, equalize_info = equalize_rgb_medians_copy(combine.science)
+
+    if equalize_info is None:
+        equalize_prov = {"requested": False, "applied": False}
+        eq_applied = False
+        eq_decision = None
+        eq_gains = [1.0, 1.0, 1.0]
+    else:
+        tm = equalize_info["target_median"]
+        tm = None if not np.isfinite(tm) else float(tm)
+        equalize_prov = {
+            "requested": True,
+            "decision": equalize_info["decision"],
+            "applied": bool(equalize_info["applied"]),
+            "raw_gains": equalize_info["raw_gains"],
+            "clipped_gains": equalize_info["clipped_gains"],
+            "target_median": tm,
+            "samples": int(equalize_info["samples"]),
+            "mask_coverage": float(equalize_info["mask_coverage"]),
+        }
+        eq_applied = bool(equalize_info["applied"])
+        eq_decision = equalize_info["decision"]
+        eq_gains = equalize_info["clipped_gains"]
+
     # --- provenance (bounded: scalars/strings/lists, no arrays) ---
     reference_mode = "explicit" if request.reference_index is not None else "auto"
     excluded_frames = [
@@ -313,7 +340,7 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
             "px": float(request.taper_px),
             "floor": float(request.taper_floor),
         },
-        "equalize_rgb": {"requested": bool(request.equalize_rgb), "applied": False},
+        "equalize_rgb": equalize_prov,
         "excluded_frames": excluded_frames,
         "effective_event": {
             "normalization": normalization.effective_method,
@@ -331,12 +358,14 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
             "taper": taper_token,
             "taper_px": float(request.taper_px),
             "taper_floor": float(request.taper_floor),
-            "equalize_rgb_applied": False,
+            "equalize_rgb_applied": eq_applied,
+            "equalize_rgb_decision": eq_decision,
+            "equalize_rgb_gains": eq_gains,
         },
     }
 
     return CanonicalStackResult(
-        science=combine.science,
+        science=science,
         estimator_weight_sum=combine.estimator_weight_sum,
         valid_mask=combine.valid_mask,
         surviving_sample_count=combine.surviving_sample_count,
