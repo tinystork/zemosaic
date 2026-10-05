@@ -640,16 +640,12 @@ class TestGlobalCoaddDispatch:
 
 class TestCoverageProvenanceGaps:
     def test_no_support_or_coverage_render_domain(self):
-        # Gate A snapshot recorded the support/taper domain as absent. Gate E1
-        # (donor-exact port) now provides make_footprint_taper and the
-        # positive-support accumulator in core/canonical_support.py, while the
-        # coverage render/config domain remains absent pending Gate E2.
+        # Gate A snapshot recorded the support/taper and coverage-render domains as
+        # absent. Gate E1 (support/taper) and Gate E3 (preview-only render) now
+        # provide these in the bounded canonical modules, while the coverage
+        # render/config and support_taper symbols remain absent pending later gates.
 
-        # (1) Support/taper tokens now PRESENT (Gate E1), specifically in the
-        # bounded, documented canonical support module: presence elsewhere is not
-        # sufficient, presence in core/canonical_support.py is required (and the
-        # assertion fails if the symbols disappear).
-        for token in ("make_footprint_taper", "PositiveSupportAccumulator", "N_eff_support"):
+        def _scan(token):
             found = []
             for py in sorted(_SRC.rglob("*.py")):
                 try:
@@ -658,24 +654,23 @@ class TestCoverageProvenanceGaps:
                     continue
                 if token in text:
                     found.append(str(py.relative_to(_SRC)))
-            assert "core/canonical_support.py" in found, (
-                f"{token!r} not in core/canonical_support.py; found in {found}"
-            )
+            return found
 
-        # (2) Coverage render/config tokens still ABSENT (Gate E2 not implemented).
-        absent = (
-            "support_taper",
-            "apply_coverage_render",
-            "COVERAGE_RENDER_RESULT",
-            "COVERAGE_CONFIG",
-        )
-        for token in absent:
-            found = []
-            for py in sorted(_SRC.rglob("*.py")):
-                try:
-                    text = py.read_text(encoding="utf-8")
-                except Exception:
-                    continue
-                if token in text:
-                    found.append(str(py.relative_to(_SRC)))
+        # (1) Support/taper + render tokens now PRESENT (Gate E1/E3), each
+        # specifically in its bounded, documented canonical module (presence
+        # elsewhere is not sufficient; the assertion fails if a symbol disappears).
+        present = {
+            "make_footprint_taper": "core/canonical_support.py",
+            "PositiveSupportAccumulator": "core/canonical_support.py",
+            "N_eff_support": "core/canonical_support.py",
+            "coverage_aware_render": "core/canonical_render.py",
+        }
+        for token, module in present.items():
+            found = _scan(token)
+            assert module in found, f"{token!r} not in {module}; found in {found}"
+
+        # (2) Coverage render/config tokens still ABSENT (later gates).
+        for token in ("support_taper", "apply_coverage_render",
+                      "COVERAGE_RENDER_RESULT", "COVERAGE_CONFIG"):
+            found = _scan(token)
             assert not found, f"{token!r} unexpectedly present in {found}"
