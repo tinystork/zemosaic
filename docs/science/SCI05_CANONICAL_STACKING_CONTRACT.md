@@ -680,6 +680,17 @@ the incidental Qt dataclass default.
 | C2 | Median: unweighted median of `w_i>0` original surviving samples; magnitude ignored; no survivors → NaN; `estimator_weight_sum = count` of `w_i>0` originals (unit effective estimator weights, not `Σ q·m·a`). |
 | G1 | Global-coadd labels route to the same canonical engine; remove percentile-winsorized; no rename (unify science). |
 
+**Gate G (final audit, done):** full suite green (975 passed / 0 failed) after a bounded Phase-3
+regression fix (`align_images_in_group` test doubles accept `return_footprints`/`**kwargs`, returning
+`(images, failed_indices, footprints)` with honest per-frame footprints when `return_footprints=True`).
+Final divergence scan found **no remaining supported-path divergence**: no percentile-winsorized /
+`np.nanpercentile` stacking combine/rejection clip; no stacking epsilon/derived constant; no
+zero-sentinel all-invalid fallback; no live `stack_winsorized_sigma_clip`/`stack_kappa_sigma_clip`/
+`stack_linear_fit_clip` call; no live `make_radial_weight_map` application (radial inert, decision K);
+no silent backend fallback (GPU unavailable raises, never CPU substitution). Remaining
+`np.nanpercentile`/`np.nanmedian`/`np.nanmean` uses are legitimate statistics/QA/seam/lecropper/
+photometric normalization, plus the D1-documented SDS inter-master photometric gain.
+
 ---
 
 ## 17. Honesty and limits

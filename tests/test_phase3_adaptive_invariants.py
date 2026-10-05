@@ -340,7 +340,10 @@ def test_create_master_tile_adaptation_preserves_membership_and_modes(monkeypatc
     monkeypatch.setattr(zw.psutil, "virtual_memory", lambda: SimpleNamespace(percent=95.0, available=64 * 1024 * 1024))
 
     # Keep alignment deterministic and simple in unit test.
-    monkeypatch.setattr(zw.zemosaic_align_stack, "align_images_in_group", lambda image_data_list, reference_image_index, propagate_mask, progress_callback: (image_data_list, []))
+    monkeypatch.setattr(zw.zemosaic_align_stack, "align_images_in_group", lambda image_data_list, reference_image_index=0, propagate_mask=False, progress_callback=None, return_footprints=False, **kwargs: (
+        (image_data_list, [], [np.ones(frame.shape[:2], dtype=bool) for frame in image_data_list])
+        if return_footprints else (image_data_list, [])
+    ))
 
     captured: dict = {}
 
@@ -472,7 +475,10 @@ def test_create_master_tile_output_count_parity_baseline_vs_pressure(monkeypatch
     vm_state = {"percent": 30.0, "available": 1024 * 1024 * 1024}
     monkeypatch.setattr(zw.psutil, "virtual_memory", lambda: SimpleNamespace(percent=vm_state["percent"], available=vm_state["available"]))
 
-    monkeypatch.setattr(zw.zemosaic_align_stack, "align_images_in_group", lambda image_data_list, reference_image_index, propagate_mask, progress_callback: (image_data_list, []))
+    monkeypatch.setattr(zw.zemosaic_align_stack, "align_images_in_group", lambda image_data_list, reference_image_index=0, propagate_mask=False, progress_callback=None, return_footprints=False, **kwargs: (
+        (image_data_list, [], [np.ones(frame.shape[:2], dtype=bool) for frame in image_data_list])
+        if return_footprints else (image_data_list, [])
+    ))
     monkeypatch.setattr(zw, "_PH3_CONCURRENCY_SEMAPHORE", __import__("threading").Semaphore(8))
     monkeypatch.setattr(zw, "_CACHE_IO_SEMAPHORE", __import__("threading").Semaphore(8))
 
