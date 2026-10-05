@@ -306,6 +306,33 @@ positive weight magnitude ignored; **no** invented weighted median; no survivors
 samples with `w_i > 0` (unit effective estimator weights, **not** `Σ q·m·a`); `0` where no
 survivors. Output float32.
 
+**C2 implementation-resolution clarifications (combine stage):**
+* The combine primitive consumes an **explicit pre-rejection 2-D canonical
+  estimator-weight map** `w_i = q_i * m_i * a_i` per exposure (`(N,H,W)` float64)
+  produced by the **future Gate E** support/taper builder. **No** default or optional
+  weight map and **no** invented `a_i = 1`: the frozen default footprint taper is ON, so
+  combine requires the explicit map.
+* Estimator-weight validation (before any mutation): exact `(N,H,W)`, real numeric (not
+  bool/object/complex), finite in `[0,1]`; **zero** on prior-inactive frames, **zero**
+  outside `normalization.valid_mask`, and `w_i <= weighting.weights[i]` (the scalar
+  `q_i`); zero on a valid sample (absent) is allowed. Weights are **shared across
+  channels** for a given exposure/pixel, while the survivor mask is channel-specific.
+* Eligible per-channel sample = `survivor_mask` AND `w_i > 0` AND finite original;
+  original normalized values only (never winsorized replacements); weight magnitude
+  never changes median values.
+* Output shape/dtype: `science` float32, `estimator_weight_sum` float64, `valid_mask`
+  bool (exactly `estimator_weight_sum > 0`), `surviving_sample_count` int64; all
+  restored to the original shape (HW mono strips canonical C=1; HWC1 stays `(H,W,1)`;
+  RGB stays HWC). Mean `estimator_weight_sum = Σ w_i`; median = **count** of eligible
+  originals (unit effective estimator weights).
+* Post-cast invariant: no NaN/Inf is ever marked valid; a mathematically valid estimate
+  that becomes nonfinite (float64 or float32 post-cast) invalidates its cell (`science`
+  NaN, `estimator_weight_sum` 0) and increments `nonfinite_output_count`. With finite
+  float32 inputs and weights in `[0,1]`, mean/median are convex combinations of finite
+  values and stay finite — the branch is a defensive seam, no clip/saturate.
+* **No claim**: the support/taper accumulator and the final request/result engine are
+  **not** implemented/accepted at this gate.
+
 ---
 
 ## 10. Global coadd — decision I (G1)
@@ -408,8 +435,8 @@ the incidental Qt dataclass default.
 | R1 | Unique WSC target: true WSC using both winsor+sigma limits (PixInsight-style defaults); unify `stack_core` simplified and global-coadd percentile clip onto it. |
 | R2 | kappa: median center + population std `ddof=0` (ordinary std **around the mean**, bounds centered on median), sigma `low/high=3.0`, ≤5 iters, inclusive bounds, `stable` = exact mask unchanged; WSC winsor `0.05/0.05`, sigma `3.0`; current-survivor-count `< 3` freezes the cell for that and later iterations; N<3 → explicit no-rejection success. |
 | R3 | Linear Fit Clip: disable/remove (fork B); persisted token fails `unsupported_removed_sci05`; no migration to none/kappa/WSC. |
-| C1 | Single zero-sum epsilon: denominator is **exactly `>0`** (no epsilon). |
-| C2 | Median: unweighted median of `w_i>0` original surviving samples; magnitude ignored; no survivors → NaN. |
+| C1 | Single zero-sum epsilon: denominator is **exactly `>0`** (no epsilon); combine consumes an explicit pre-rejection `w_i=q*m*a` estimator-weight map (no default `a=1`); mean `estimator_weight_sum = Σ w_i` over original survivors. |
+| C2 | Median: unweighted median of `w_i>0` original surviving samples; magnitude ignored; no survivors → NaN; `estimator_weight_sum = count` of `w_i>0` originals (unit effective estimator weights, not `Σ q·m·a`). |
 | G1 | Global-coadd labels route to the same canonical engine; remove percentile-winsorized; no rename (unify science). |
 
 ---

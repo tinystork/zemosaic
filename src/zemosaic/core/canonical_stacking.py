@@ -2,13 +2,15 @@
 
 Pure CPU, deterministic, backend-neutral primitives implementing the frozen
 SCI-05 contract (``docs/science/SCI05_CANONICAL_STACKING_CONTRACT.md``) for the
-**normalization and scalar quality weighting stages**, plus the **Gate C1**
+**normalization and scalar quality weighting stages**, the **Gate C1**
 canonical rejection primitives (``none``/``kappa_sigma``/
-``winsorized_sigma_clip``). This is **Gate B1** (canonical input validation,
+``winsorized_sigma_clip``), and the **Gate C2** pure canonical combine
+primitive (``mean``/``median``). This is **Gate B1** (canonical input validation,
 reference selection, per-frame normalization), **Gate B2** (scalar quality
-weighting ``none``/``noise_variance``/``noise_fwhm``) and **Gate C1** (rejection
-only; combine is Gate C2). Coverage support/taper and combine are explicitly out
-of scope here and are assembled by later gates.
+weighting ``none``/``noise_variance``/``noise_fwhm``), **Gate C1** (rejection)
+and **Gate C2** (combine only). Coverage support/taper construction (Gate E) and
+the final request/result orchestration are explicitly out of scope here and are
+assembled by later gates.
 
 Design invariants
 -----------------
@@ -29,10 +31,11 @@ Public API
 ----------
 ``prepare_canonical_inputs``, ``select_canonical_reference``,
 ``normalize_canonical_images``, ``compute_canonical_quality_weights``,
-``reject_canonical_samples``, ``canonical_noise_fwhm_available`` plus the frozen
-dataclasses ``CanonicalInputBatch`` / ``CanonicalNormalizationResult`` /
-``CanonicalWeightingResult`` / ``CanonicalRejectionResult`` and
-``FrameExclusion``.
+``reject_canonical_samples``, ``combine_canonical_samples``,
+``canonical_noise_fwhm_available`` plus the frozen dataclasses
+``CanonicalInputBatch`` / ``CanonicalNormalizationResult`` /
+``CanonicalWeightingResult`` / ``CanonicalRejectionResult`` /
+``CanonicalCombineResult`` and ``FrameExclusion``.
 """
 
 from __future__ import annotations
@@ -69,6 +72,8 @@ __all__ = [
     "normalize_canonical_images",
     "compute_canonical_quality_weights",
     "reject_canonical_samples",
+    "combine_canonical_samples",
+    "CanonicalCombineResult",
     "canonical_noise_fwhm_available",
 ]
 
@@ -1436,6 +1441,445 @@ def reject_canonical_samples(
         low_n_cell_count=low_n_cell_count,
         degenerate_cell_count=degenerate_cell_count,
         exclusions=tuple(weighting.exclusions),
+        original_mono=normalization.original_mono,
+        n_frames=n,
+        height=h,
+        width=w,
+        channels=c,
+        original_ndim=normalization.original_ndim,
+        original_shape=normalization.original_shape,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate C2: canonical combine primitive (mean / median)
+# ---------------------------------------------------------------------------
+
+_METHOD_COMBINE_MEAN = "mean"
+_METHOD_COMBINE_MEDIAN = "median"
+_SUPPORTED_COMBINE_METHODS = (_METHOD_COMBINE_MEAN, _METHOD_COMBINE_MEDIAN)
+
+
+@dataclass(frozen=True)
+class CanonicalCombineResult:
+    """Deterministic output of :func:`combine_canonical_samples`.
+
+    Attributes
+    ----------
+    science:
+        Owned contiguous float32; restored original shape (HW mono, HWC1, RGB
+        HWC). No-estimate cells are NaN; valid cells are never Inf/NaN.
+    estimator_weight_sum:
+        Owned contiguous float64 with the **same shape as ``science``**. For
+        ``mean`` it is the per-pixel/channel sum of the canonical estimator
+        weights ``w_i`` over original surviving samples; for ``median`` it is
+        the per-pixel/channel **count** of eligible originals (unit effective
+        estimator weights, not ``Σ q·m·a``); ``0`` where no survivors.
+    valid_mask:
+        Owned contiguous bool with the same shape as ``science``; exactly
+        ``estimator_weight_sum > 0``.
+    surviving_sample_count:
+        Owned contiguous int64 with the same shape as ``science``; count of
+        original survivors with ``w_i > 0`` (for mean and median diagnostics;
+        for mean the estimator-weight sum can differ).
+    requested_method / effective_method:
+        Combine method token (``mean``/``median``); always equal (validation
+        errors raise instead of falling back).
+    reference_index:
+        Chosen normalization reference frame index (identity), inherited from
+        normalization.
+    normalization_method / weighting_method / rejection_method:
+        Inherited stage method tokens (bounded metadata for the final result).
+    sigma_low / sigma_high / max_iters / winsor_limit_low / winsor_limit_high:
+        Inherited validated rejection parameters.
+    iterations_used / initial_sample_count / rejected_sample_count /
+    rejected_fraction / low_n_cell_count / degenerate_cell_count:
+        Inherited C1 rejection scalar diagnostics.
+    input_surviving_sample_count:
+        Python int: original survivors **before** the positive-weight gate
+        (equals ``rejection.surviving_sample_count``).
+    contributing_sample_count:
+        Python int: eligible samples **after** the positive-weight gate.
+    valid_output_count / invalid_output_count:
+        Python ints: number of output channel cells with/without an estimate
+        (invalid includes every no-estimate cell).
+    nonfinite_output_count:
+        Python int: number of output cells invalidated because a mathematically
+        valid estimate became nonfinite (float64 or float32 post-cast). Defensive
+        seam: with finite float32 inputs and weights in ``[0, 1]`` the mean and
+        median are convex combinations of finite values and stay finite, so this
+        is ``0`` in practice (see the combine function docstring).
+    exclusions:
+        Inherited ``FrameExclusion`` records (B1 + B2).
+    original_mono / n_frames / height / width / channels / original_ndim /
+    original_shape:
+        Original shape metadata for downstream final-result assembly.
+    """
+
+    science: np.ndarray
+    estimator_weight_sum: np.ndarray
+    valid_mask: np.ndarray
+    surviving_sample_count: np.ndarray
+    requested_method: str
+    effective_method: str
+    reference_index: int
+    normalization_method: str
+    weighting_method: str
+    rejection_method: str
+    sigma_low: float
+    sigma_high: float
+    max_iters: int
+    winsor_limit_low: float
+    winsor_limit_high: float
+    iterations_used: int
+    initial_sample_count: int
+    rejected_sample_count: int
+    rejected_fraction: float
+    low_n_cell_count: int
+    degenerate_cell_count: int
+    input_surviving_sample_count: int
+    contributing_sample_count: int
+    valid_output_count: int
+    invalid_output_count: int
+    nonfinite_output_count: int
+    exclusions: tuple
+    original_mono: bool
+    n_frames: int
+    height: int
+    width: int
+    channels: int
+    original_ndim: int
+    original_shape: tuple
+
+
+def _validate_estimator_weights(estimator_weights, n: int, h: int, w: int) -> np.ndarray:
+    """Validate the explicit pre-rejection ``(N, H, W)`` estimator-weight map.
+
+    Returns an owned contiguous float64 copy. Rejects non-array, non-real-numeric
+    (bool/object/complex), wrong ndim/shape, nonfinite, and out-of-``[0, 1]``
+    values **before** any copy/mutation of the caller's array.
+    """
+    try:
+        arr = np.asarray(estimator_weights)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise CanonicalStackValidationError(
+            f"estimator_weights is not array-convertible: {exc}"
+        )
+    if arr.dtype == np.bool_ or arr.dtype.kind not in "iuf":
+        raise CanonicalStackValidationError(
+            f"estimator_weights must be real numeric (int/uint/float), not "
+            f"bool/object/complex; got dtype {arr.dtype}"
+        )
+    if arr.ndim != 3:
+        raise CanonicalStackValidationError(
+            f"estimator_weights must be 3-D (N, H, W), got shape {arr.shape}"
+        )
+    if arr.shape != (n, h, w):
+        raise CanonicalStackValidationError(
+            f"estimator_weights shape {arr.shape} != (N, H, W) {(n, h, w)}"
+        )
+    out = np.array(arr, dtype=np.float64, copy=True)
+    if not np.all(np.isfinite(out)):
+        raise CanonicalStackValidationError("estimator_weights must be finite")
+    if np.any(out < 0.0) or np.any(out > 1.0):
+        raise CanonicalStackValidationError("estimator_weights must be in [0, 1]")
+    return out
+
+
+def combine_canonical_samples(normalization, weighting, rejection, estimator_weights, method):
+    """Combine canonical samples into the final science/estimate arrays.
+
+    Pure, deterministic, backend-neutral combine primitive (Gate C2). It consumes
+    the B1 normalized originals, the B2 scalar quality weights, the C1 survivor/
+    rejection masks, and an **explicit** pre-rejection 2-D canonical
+    estimator-weight map ``w_i = q_i * m_i * a_i`` per exposure (``(N, H, W)``
+    float64). There is **no** optional/default weight map and **no** invented
+    ``a_i = 1``: the frozen default footprint taper is ON, and Gate E owns taper/
+    support construction, so this stage requires the explicit map.
+
+    ``method`` must be exactly ``mean`` or ``median`` (after strip/lower;
+    aliases/unknown/non-string rejected).
+
+    Semantics
+    ---------
+    * Eligible per-channel sample = ``rejection.survivor_mask`` AND
+      ``estimator_weights > 0`` AND finite original. Original normalized values
+      only (never winsorized replacements); weight magnitude never changes median
+      values (rejection is already weight-independent).
+    * ``mean``: float64 ``Σ(original * w_i) / Σ(w_i)`` per pixel/channel; the
+      denominator condition is exactly ``> 0`` (no epsilon); ``denom <= 0`` →
+      NaN science, sum ``0``, valid False.
+    * ``median``: float64 unweighted ``median`` of eligible originals (even-N
+      NumPy convention averages the middle two); no survivors → NaN science,
+      sum ``0``, valid False. ``estimator_weight_sum`` is the **count** of
+      eligible originals (unit effective estimator weights), not ``Σ q·m·a``.
+    * Output ``science`` is float32; ``estimator_weight_sum`` float64;
+      ``valid_mask`` bool (exactly ``estimator_weight_sum > 0``);
+      ``surviving_sample_count`` int64 (count of ``w_i > 0`` survivors).
+    * Post-cast invariant: no NaN/Inf is ever marked valid. Defensive seam —
+      with finite float32 inputs and weights in ``[0, 1]``, both the weighted
+      mean and the median are convex combinations of finite values and therefore
+      stay finite in float64 and in float32, so the ``nonfinite_output_count``
+      branch is unreachable for well-formed inputs. It is kept (no clip/saturate)
+      so any genuinely nonfinite estimate invalidates its cell deterministically.
+
+    Validation (all **before** any mutation):
+    * exact result types; B1↔B2↔C1 agreement of N/H/W/C, original_mono/ndim/
+      shape, reference index, active_frames (C1 exactly equals B2; B2 is a
+      subset of B1), and exclusions (C1 exactly equals B2; B1 is a prefix of B2);
+    * C1 masks are exact ``(N, H, W, C)`` bool, survivor/rejection subsets of
+      active+valid+finite, disjoint, and ``survivor | rejection == initial``;
+    * ``weighting.weights`` exact ``(N,)``, finite in ``[0, 1]``, active strictly
+      > 0, inactive exactly 0;
+    * ``estimator_weights`` exact ``(N, H, W)`` real numeric, finite in
+      ``[0, 1]``; zero on inactive frames, zero outside ``valid_mask``, and
+      ``<= weighting.weights[i]`` (canonical ``w = q*m*a``); zero on a valid
+      sample (absent) is allowed.
+    """
+    if not isinstance(method, str):
+        raise CanonicalStackValidationError(
+            f"combine method must be a string, got {type(method).__name__}"
+        )
+    token = method.strip().lower()
+    if token not in _SUPPORTED_COMBINE_METHODS:
+        raise CanonicalStackValidationError(
+            f"unsupported combine method {method!r}; expected one of mean/median "
+            "(aliases are not accepted)"
+        )
+
+    if not isinstance(normalization, CanonicalNormalizationResult):
+        raise CanonicalStackValidationError(
+            f"normalization must be a CanonicalNormalizationResult, got "
+            f"{type(normalization).__name__}"
+        )
+    if not isinstance(weighting, CanonicalWeightingResult):
+        raise CanonicalStackValidationError(
+            f"weighting must be a CanonicalWeightingResult, got "
+            f"{type(weighting).__name__}"
+        )
+    if not isinstance(rejection, CanonicalRejectionResult):
+        raise CanonicalStackValidationError(
+            f"rejection must be a CanonicalRejectionResult, got "
+            f"{type(rejection).__name__}"
+        )
+
+    n = normalization.n_frames
+    h = normalization.height
+    w = normalization.width
+    c = normalization.channels
+
+    # --- B1 <-> B2 <-> C1 agreement ---
+    if weighting.n_frames != n or rejection.n_frames != n:
+        raise CanonicalStackValidationError(
+            "normalization/weighting/rejection N mismatch"
+        )
+    if (weighting.height, weighting.width, weighting.channels) != (h, w, c):
+        raise CanonicalStackValidationError("normalization/weighting H/W/C mismatch")
+    if (rejection.height, rejection.width, rejection.channels) != (h, w, c):
+        raise CanonicalStackValidationError("normalization/rejection H/W/C mismatch")
+    if weighting.original_mono != normalization.original_mono:
+        raise CanonicalStackValidationError("normalization/weighting original_mono mismatch")
+    if rejection.original_mono != normalization.original_mono:
+        raise CanonicalStackValidationError("normalization/rejection original_mono mismatch")
+    if (
+        weighting.original_ndim != normalization.original_ndim
+        or rejection.original_ndim != normalization.original_ndim
+    ):
+        raise CanonicalStackValidationError("original_ndim mismatch")
+    if (
+        weighting.original_shape != normalization.original_shape
+        or rejection.original_shape != normalization.original_shape
+    ):
+        raise CanonicalStackValidationError("original_shape mismatch")
+    if (
+        weighting.reference_index != normalization.reference_index
+        or rejection.reference_index != normalization.reference_index
+    ):
+        raise CanonicalStackValidationError("reference_index mismatch")
+
+    active = np.asarray(weighting.active_frames, dtype=bool)
+    if active.shape != (n,):
+        raise CanonicalStackValidationError(
+            f"weighting.active_frames must have length {n}"
+        )
+    if not np.array_equal(active, np.asarray(rejection.active_frames, dtype=bool)):
+        raise CanonicalStackValidationError("weighting/rejection active_frames mismatch")
+    norm_active = np.asarray(normalization.active_frames, dtype=bool)
+    if norm_active.shape != (n,):
+        raise CanonicalStackValidationError(
+            f"normalization.active_frames must have length {n}"
+        )
+    if not np.all(active <= norm_active):
+        raise CanonicalStackValidationError(
+            "weighting reactivated a frame that normalization excluded"
+        )
+
+    if tuple(rejection.exclusions) != tuple(weighting.exclusions):
+        raise CanonicalStackValidationError("weighting/rejection exclusions mismatch")
+    b1_excl = tuple(normalization.exclusions)
+    b2_excl = tuple(weighting.exclusions)
+    if b2_excl[: len(b1_excl)] != b1_excl:
+        raise CanonicalStackValidationError(
+            "normalization exclusions are not a prefix of weighting exclusions"
+        )
+
+    # --- array shape / dtype guards ---
+    images = np.asarray(normalization.images)
+    valid = np.asarray(normalization.valid_mask)
+    survivor = np.asarray(rejection.survivor_mask)
+    rejection_mask = np.asarray(rejection.rejection_mask)
+    if images.shape != (n, h, w, c):
+        raise CanonicalStackValidationError("normalization.images shape mismatch")
+    if valid.shape != (n, h, w):
+        raise CanonicalStackValidationError("normalization.valid_mask shape mismatch")
+    if survivor.shape != (n, h, w, c):
+        raise CanonicalStackValidationError("rejection.survivor_mask shape mismatch")
+    if rejection_mask.shape != (n, h, w, c):
+        raise CanonicalStackValidationError("rejection.rejection_mask shape mismatch")
+    if survivor.dtype != np.bool_ or rejection_mask.dtype != np.bool_:
+        raise CanonicalStackValidationError("rejection masks must be bool dtype")
+
+    # --- weighting.weights validation ---
+    weights = np.asarray(weighting.weights)
+    if weights.shape != (n,):
+        raise CanonicalStackValidationError(f"weighting.weights must have length {n}")
+    if weights.dtype == np.bool_ or weights.dtype.kind not in "iuf":
+        raise CanonicalStackValidationError(
+            f"weighting.weights must be real numeric, got dtype {weights.dtype}"
+        )
+    if not np.all(np.isfinite(weights)):
+        raise CanonicalStackValidationError("weighting.weights must be finite")
+    if np.any(weights < 0.0) or np.any(weights > 1.0):
+        raise CanonicalStackValidationError("weighting.weights must be in [0, 1]")
+    if np.any(weights[active] <= 0.0):
+        raise CanonicalStackValidationError(
+            "active frames must have strictly positive quality weight"
+        )
+    if np.any(weights[~active] != 0.0):
+        raise CanonicalStackValidationError(
+            "inactive frames must have exactly zero quality weight"
+        )
+
+    # --- estimator weights + canonical w = q*m*a ---
+    wmap = _validate_estimator_weights(estimator_weights, n, h, w)
+    if np.any(wmap[~active] != 0.0):
+        raise CanonicalStackValidationError(
+            "estimator_weights must be zero for inactive frames"
+        )
+    if np.any(wmap[~valid] != 0.0):
+        raise CanonicalStackValidationError(
+            "estimator_weights must be zero outside the valid mask"
+        )
+    if np.any(wmap > weights[:, None, None]):
+        raise CanonicalStackValidationError(
+            "estimator_weights exceed the quality weight q_i (canonical w=q*m*a)"
+        )
+
+    # --- C1 mask invariants ---
+    images64 = np.array(images, dtype=np.float64, copy=True)
+    finite = np.isfinite(images64)
+    initial = active[:, None, None, None] & valid[..., None] & finite
+    if np.any(survivor & ~initial):
+        raise CanonicalStackValidationError(
+            "survivor_mask is not a subset of active/valid/finite"
+        )
+    if np.any(rejection_mask & ~initial):
+        raise CanonicalStackValidationError(
+            "rejection_mask is not a subset of active/valid/finite"
+        )
+    if np.any(survivor & rejection_mask):
+        raise CanonicalStackValidationError("survivor_mask and rejection_mask overlap")
+    if not np.array_equal(survivor | rejection_mask, initial):
+        raise CanonicalStackValidationError(
+            "survivor | rejection != initial active-valid samples"
+        )
+
+    # --- combine ---
+    w_positive = wmap[:, :, :, None] > 0.0  # (N, H, W, 1) broadcasts to channels
+    eligible = survivor & w_positive & finite  # (N, H, W, C)
+
+    input_surviving = int(survivor.sum())
+    contributing = int(eligible.sum())
+
+    if token == _METHOD_COMBINE_MEAN:
+        masked_images = np.where(eligible, images64, 0.0)
+        w_contrib = np.where(eligible, wmap[:, :, :, None], 0.0)
+        numerator = np.sum(masked_images * w_contrib, axis=0, dtype=np.float64)
+        denominator = np.sum(w_contrib, axis=0, dtype=np.float64)
+        den_valid = denominator > 0.0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
+                estimate64 = numerator / denominator
+                science32 = estimate64.astype(np.float32)
+        final_finite = np.isfinite(estimate64) & np.isfinite(science32)
+        valid_out = den_valid & final_finite
+        science_c = np.where(valid_out, science32, np.nan)
+        weight_sum = np.where(valid_out, denominator, 0.0)
+        nonfinite_count = int((den_valid & ~valid_out).sum())
+    else:  # median
+        masked = np.where(eligible, images64, np.nan)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            median64 = np.nanmedian(masked, axis=0)
+            with np.errstate(over="ignore", invalid="ignore"):
+                science32 = median64.astype(np.float32)
+        count = eligible.sum(axis=0).astype(np.float64)
+        den_valid = count > 0.0
+        final_finite = np.isfinite(median64) & np.isfinite(science32)
+        valid_out = den_valid & final_finite
+        science_c = np.where(valid_out, science32, np.nan)
+        weight_sum = np.where(valid_out, count, 0.0)
+        nonfinite_count = int((den_valid & ~valid_out).sum())
+
+    surviving_c = eligible.sum(axis=0).astype(np.int64)
+    valid_mask_c = weight_sum > 0.0
+
+    # --- restore original shape (strip canonical C=1 for original mono) ---
+    if normalization.original_mono:
+        # ``arr[..., 0]`` is a contiguous view; ``.copy()`` guarantees an owned
+        # C-contiguous array (``np.ascontiguousarray`` would return the view).
+        science = science_c[..., 0].copy()
+        weight_sum = weight_sum[..., 0].copy()
+        valid_mask = valid_mask_c[..., 0].copy()
+        surviving = surviving_c[..., 0].copy()
+    else:
+        science = np.ascontiguousarray(science_c)
+        weight_sum = np.ascontiguousarray(weight_sum)
+        valid_mask = np.ascontiguousarray(valid_mask_c)
+        surviving = np.ascontiguousarray(surviving_c)
+
+    valid_output_count = int(valid_mask_c.sum())
+    invalid_output_count = (h * w * c) - valid_output_count
+
+    return CanonicalCombineResult(
+        science=science,
+        estimator_weight_sum=weight_sum,
+        valid_mask=valid_mask,
+        surviving_sample_count=surviving,
+        requested_method=token,
+        effective_method=token,
+        reference_index=int(normalization.reference_index),
+        normalization_method=normalization.requested_method,
+        weighting_method=weighting.requested_method,
+        rejection_method=rejection.requested_method,
+        sigma_low=rejection.sigma_low,
+        sigma_high=rejection.sigma_high,
+        max_iters=rejection.max_iters,
+        winsor_limit_low=rejection.winsor_limit_low,
+        winsor_limit_high=rejection.winsor_limit_high,
+        iterations_used=rejection.iterations_used,
+        initial_sample_count=rejection.initial_sample_count,
+        rejected_sample_count=rejection.rejected_sample_count,
+        rejected_fraction=rejection.rejected_fraction,
+        low_n_cell_count=rejection.low_n_cell_count,
+        degenerate_cell_count=rejection.degenerate_cell_count,
+        input_surviving_sample_count=input_surviving,
+        contributing_sample_count=contributing,
+        valid_output_count=valid_output_count,
+        invalid_output_count=invalid_output_count,
+        nonfinite_output_count=nonfinite_count,
+        exclusions=tuple(rejection.exclusions),
         original_mono=normalization.original_mono,
         n_frames=n,
         height=h,
