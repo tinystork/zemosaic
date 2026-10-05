@@ -8,13 +8,25 @@ Modules:
 * ``adequacy``   — explicit witness-adequacy fields (closes Nono M1).
 * ``sweep``      — deterministic multi-frame candidate sweep + memory guard.
 * ``seam``       — adjacent-Cell continuity diagnostics (diagnostic, no blend).
+* ``executor``   — R3 full-layout deterministic executor (row-major, sky_mean).
+* ``mosaic``     — R3 deterministic canvas assembly (one-owner, no blend).
 
 Not wired into production dispatch.
 """
 
 from __future__ import annotations
 
-from . import adequacy, assembly, execution, geometry, science_adapter, seam, sweep
+from . import (
+    adequacy,
+    assembly,
+    execution,
+    executor,
+    geometry,
+    mosaic,
+    science_adapter,
+    seam,
+    sweep,
+)
 
 __all__ = [
     "geometry",
@@ -24,4 +36,6 @@ __all__ = [
     "adequacy",
     "sweep",
     "seam",
+    "executor",
+    "mosaic",
 ]
