@@ -70,10 +70,10 @@ class TestStackCoreN4:
 
 class TestLinearFitClipR3:
     def test_worker_raises_unsupported(self):
-        # Both worker rejection sites now raise the stable unsupported token (no call to
-        # stack_linear_fit_clip).
+        # All three worker rejection sites raise the stable unsupported token (no call to
+        # stack_linear_fit_clip): _stack_master_tile_cpu, the Phase 4.5 merge, and _stack_mosaics.
         worker_src = (_SRC / "zemosaic_worker.py").read_text(encoding="utf-8-sig")
-        assert worker_src.count("unsupported_removed_sci05") == 2
+        assert worker_src.count("unsupported_removed_sci05") == 3
 
     def test_gpu_error_token_aligned(self):
         gpu_src = (_SRC / "zemosaic_align_stack_gpu.py").read_text(encoding="utf-8-sig")

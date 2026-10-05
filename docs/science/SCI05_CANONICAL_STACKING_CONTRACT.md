@@ -267,6 +267,11 @@ substitution.
   * The builder's `taper` argument is `None` (`a_i=1`), `"footprint"` (generate per-frame
     from `valid_mask` via `make_footprint_taper`), an explicit `(N,H,W)` array, or a
     length-N sequence of `(H,W)` tapers — never a radial map.
+  * **A1 implementation-resolution (explicit taper in the engine):** `CanonicalStackRequest.taper`
+    now accepts, in addition to `"footprint"`/`"none"`, an explicit per-frame taper map (`(N,H,W)`
+    float array in `[0,1]` or a length-N sequence of `(H,W)` arrays), forwarded verbatim to
+    `build_canonical_estimator_weights`. Strictly additive — `"footprint"`/`"none"` are
+    byte-identical; provenance `taper.kind` records `"explicit"`/`"footprint"`/`"none"`.
   * **No claim**: Coverage render, the final request/result engine, and production caller
     wiring remain **not** implemented at this sub-lot (Gate E2+).
 * **F2 implementation-resolution clarification (Classic CPU route convergence + support source):**
@@ -619,6 +624,20 @@ survivors. Output float32.
   mean/median/kappa finalizers are removed; `coadd_k`/`winsor_limits` accepted-but-inert;
   the legacy GPU helper combine is disabled (canonical-only; explicit log).
   SDS / Phase 4.5 remain the next lot.
+  **F6 (SDS + Phase 4.5 route convergence, implemented):** SDS reference selection aligned to
+  canonical N1 (max valid support count) and the 1% derived-constant threshold removed (D2/D3); the
+  inter-master photometric gain is documented as an explicit non-canonical inter-master operation
+  (D1). Phase 4.5 alpha-weighted combine routes per-chunk through `run_canonical_stack` with the
+  per-pixel alpha as the explicit taper (A1/A2) and the legacy stack calls route through canonical
+  rejection (A3) with the honest WCS-reprojection footprint; the no-honest-footprint sub-path is
+  deferred (non-silent). Simplified WSC / legacy kappa removed from the supported route.
+  **F6 R3 (Classic master-tile + mosaic assembly legacy dispatch, implemented):**
+  `_stack_master_tile_cpu` and `_stack_mosaics` no longer call the legacy
+  `stack_winsorized_sigma_clip`/`stack_kappa_sigma_clip` wrappers; all supported rejection algos
+  route through the canonical engine (`stack_aligned_images`/`run_canonical_stack`) with the honest
+  WCS-derived coverage/footprint support. The legacy wrappers are marked LEGACY/UNREACHABLE.
+  **R4:** the deferred no-honest-footprint sub-path now SKIPs (returns NaN, non-silent event) —
+  never a non-canonical nanmean/nanmedian combine.
 - **G** — final independent audit + one full suite + optional real-data/human science gate.
 
 Full suite runs **once at final**. New ZeGrid is out of scope.

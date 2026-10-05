@@ -111,7 +111,10 @@ class CanonicalStackRequest:
         Optional explicit reference frame index (``None`` = auto-select).
     taper / taper_px / taper_floor:
         Footprint-taper config: ``"footprint"`` (generate per-frame from
-        ``valid_mask`` via ``make_footprint_taper``) or ``"none"`` (``a_i = 1``).
+        ``valid_mask`` via ``make_footprint_taper``), ``"none"`` (``a_i = 1``), or
+        an EXPLICIT per-frame taper map — an ``(N, H, W)`` float array in ``[0, 1]``
+        or a length-N sequence of ``(H, W)`` float arrays — forwarded verbatim to
+        ``build_canonical_estimator_weights`` (validated there).
     sigma_low / sigma_high / max_iters / winsor_limit_low / winsor_limit_high:
         Rejection parameters (forwarded to ``reject_canonical_samples``).
     backend:
@@ -130,7 +133,7 @@ class CanonicalStackRequest:
     rejection: str
     combine: str
     reference_index: int | None = None
-    taper: str = "footprint"
+    taper: object = "footprint"
     taper_px: float = 8.0
     taper_floor: float = 0.0
     sigma_low: float = 3.0
@@ -208,13 +211,25 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
         )
 
     # --- engine-level config validation (fail before any stage work) ---
-    taper_token = request.taper
-    if isinstance(taper_token, str):
-        taper_token = taper_token.strip().lower()
-    if taper_token not in ("footprint", "none"):
-        raise CanonicalStackValidationError(
-            f"taper must be 'footprint' or 'none', got {request.taper!r}"
-        )
+    taper_arg = request.taper
+    taper_kind = "none"
+    builder_taper = None
+    if isinstance(taper_arg, str):
+        taper_kind = taper_arg.strip().lower()
+        if taper_kind == "footprint":
+            builder_taper = "footprint"
+        elif taper_kind == "none":
+            builder_taper = None
+        else:
+            raise CanonicalStackValidationError(
+                f"taper string must be 'footprint' or 'none', got {request.taper!r}"
+            )
+    else:
+        # A1 (additive): explicit per-frame taper map (N,H,W) array or length-N
+        # sequence of (H,W) arrays in [0,1] — forwarded verbatim (validated by
+        # build_canonical_estimator_weights via _resolve_taper).
+        taper_kind = "explicit"
+        builder_taper = taper_arg
 
     # Resolve/validate the backend token up front (only C1/C2 honour it; B1/B2/
     # support stay CPU). Fails before any stage work on an invalid/unavailable gpu.
@@ -230,7 +245,6 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
     weighting = compute_canonical_quality_weights(normalization, request.weighting)
 
     # --- E1: estimator-weight map + positive-support accumulation ---
-    builder_taper = "footprint" if taper_token == "footprint" else None
     wmap = build_canonical_estimator_weights(
         weighting.weights,
         normalization.valid_mask,
@@ -336,7 +350,7 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
             "index": int(normalization.reference_index),
         },
         "taper": {
-            "kind": taper_token,
+            "kind": taper_kind,
             "px": float(request.taper_px),
             "floor": float(request.taper_floor),
         },
@@ -355,7 +369,7 @@ def run_canonical_stack(request: CanonicalStackRequest) -> CanonicalStackResult:
             "backend_combine": backend_token,
             "reference_index": int(normalization.reference_index),
             "reference_mode": reference_mode,
-            "taper": taper_token,
+            "taper": taper_kind,
             "taper_px": float(request.taper_px),
             "taper_floor": float(request.taper_floor),
             "equalize_rgb_applied": eq_applied,

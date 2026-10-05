@@ -444,3 +444,65 @@ class TestBackendGPU:
         assert ev["backend_rejection"] == "gpu"
         assert ev["backend_combine"] == "gpu"
         json.dumps(gpu.provenance)  # still JSON-serializable
+
+
+# ---------------------------------------------------------------------------
+# 8. A1 — explicit per-frame taper map (additive core extension)
+# ---------------------------------------------------------------------------
+
+class TestExplicitTaper:
+    def test_explicit_taper_accepted_and_provenance(self):
+        arrays = _values_corpus([10.0, 20.0, 100.0])
+        masks = [_full_support(1, 1) for _ in arrays]
+        explicit = [np.full((1, 1), 0.5, dtype=np.float32) for _ in arrays]
+        res = run_canonical_stack(
+            CanonicalStackRequest(
+                images=arrays, geometric_support=masks,
+                normalization="none", weighting="none", rejection="none", combine="mean",
+                taper=explicit, backend="cpu",
+            )
+        )
+        assert res.provenance["taper"]["kind"] == "explicit"
+        assert res.provenance["effective_event"]["taper"] == "explicit"
+        json.dumps(res.provenance)  # still JSON-serializable (no arrays)
+
+    def test_explicit_taper_ndarray_sequence_equivalence(self):
+        arrays = _values_corpus([10.0, 20.0, 100.0])
+        masks = [_full_support(1, 1) for _ in arrays]
+        seq = [np.full((1, 1), 0.5, dtype=np.float32) for _ in arrays]
+        nd = np.stack(seq, axis=0)  # (N, H, W)
+        a = run_canonical_stack(_request(arrays, masks, taper=seq))
+        b = run_canonical_stack(_request(arrays, masks, taper=nd))
+        np.testing.assert_array_equal(a.science, b.science)
+        np.testing.assert_array_equal(a.support_w1, b.support_w1)
+
+    def test_explicit_taper_matches_builder(self):
+        # support_w1 == pre-rejection s_i = w_i = q*m*a with a = the explicit taper.
+        arrays = _values_corpus([10.0, 20.0, 100.0])
+        masks = [_full_support(1, 1) for _ in arrays]
+        explicit = [np.full((1, 1), 0.25, dtype=np.float32) for _ in arrays]
+        res = run_canonical_stack(_request(arrays, masks, taper=explicit))
+        q = np.ones(len(arrays), dtype=np.float64)
+        valid = np.stack(masks, axis=0)  # (N, 1, 1)
+        wmap = build_canonical_estimator_weights(q, valid, taper=explicit)
+        np.testing.assert_allclose(res.support_w1, wmap.sum(axis=0))
+
+    def test_taper_string_behavior_unchanged(self):
+        arrays = _values_corpus([10.0, 20.0, 100.0])
+        masks = [_full_support(1, 1) for _ in arrays]
+        fp = run_canonical_stack(_request(arrays, masks, taper="footprint"))
+        none = run_canonical_stack(_request(arrays, masks, taper="none"))
+        assert fp.provenance["taper"]["kind"] == "footprint"
+        assert none.provenance["taper"]["kind"] == "none"
+
+    def test_invalid_explicit_taper_raises(self):
+        arrays = _values_corpus([10.0, 20.0, 100.0])
+        masks = [_full_support(1, 1) for _ in arrays]
+        # wrong shape
+        bad_shape = [np.full((2, 2), 0.5, dtype=np.float32) for _ in arrays]
+        with pytest.raises(cs.CanonicalStackValidationError):
+            run_canonical_stack(_request(arrays, masks, taper=bad_shape))
+        # out of [0, 1]
+        bad_range = [np.full((1, 1), 1.5, dtype=np.float32) for _ in arrays]
+        with pytest.raises(cs.CanonicalStackValidationError):
+            run_canonical_stack(_request(arrays, masks, taper=bad_range))

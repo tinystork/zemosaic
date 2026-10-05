@@ -1766,6 +1766,10 @@ def stack_winsorized_sigma_clip(
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
 
+    LEGACY / UNREACHABLE (SCI-05 Gate F6, rework-3): no supported caller invokes this
+    wrapper — the Classic CPU master-tile and mosaic-assembly routes now go through the
+    canonical engine (``run_canonical_stack``). Kept callable for compatibility only.
+
     - En mode legacy, la voie GPU ignore les `weights`.
     - Si la voie GPU échoue ou viole la parité WSC, fallback CPU (WSC uniquement).
     - La voie CPU accepte `weights` en mot-clé si fournis.
@@ -2406,6 +2410,10 @@ def stack_kappa_sigma_clip(
     **kwargs,
 ):
     """Wrapper calling GPU or CPU kappa-sigma clip.
+
+    LEGACY / UNREACHABLE (SCI-05 Gate F6, rework-3): no supported caller invokes this
+    wrapper — the Classic CPU master-tile and mosaic-assembly routes now go through the
+    canonical engine (``run_canonical_stack``). Kept callable for compatibility only.
 
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
     falls back to the legacy ``use_gpu_phase5`` flag used by the GUI.
