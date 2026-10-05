@@ -148,11 +148,35 @@ substitution.
   fallback; failed frame excluded explicitly.
 - **`noise_fwhm`:** raw `1/(sigma² * FWHM²)` (background-limited point-source justification:
   PSF area proportional FWHM²), then same max=1 normalization. FWHM = median
-  `equivalent_fwhm` from Photutils sources satisfying finite `0.8 < FWHM < 20 px`,
-  eccentricity ≤ 0.8, minimum 3 accepted sources. Missing Photutils disables the GUI
-  option; persisted/programmatic request fails validation **before run**. Per-frame
-  insufficient sources excludes the frame explicitly. **No** variance/no-weight/unit/1e-6
-  fallback.
+  `SourceCatalog.fwhm` from Photutils 3.0 sources satisfying finite `0.8 < FWHM < 20 px`,
+  eccentricity ≤ 0.8, minimum 3 accepted sources. **Property correction (B2
+  implementation-resolution):** the previously frozen name `equivalent_fwhm` is stale —
+  it does not exist in installed Photutils 3.0.0; the intended measurement is
+  `SourceCatalog.fwhm`, the **circularized FWHM of the 2-D Gaussian with the same
+  second-order central moments** (equal-second-moment / circularized-Gaussian FWHM).
+  **Deterministic detection mechanics (frozen by Junior, B2):** on the normalized
+  luminance plane with the inherited 2-D valid mask, require at least **256 valid
+  luminance samples** for any noise metric (fewer → explicit
+  `insufficient_quality_samples`); robust sigma via Astropy sigma-clipped std (3/3,
+  maxiters=5); detection background = the sigma-clipped **median**; build float64
+  `luminance - median` (invalid pixels zeroed and supplied as mask); exactly one Photutils
+  `detect_sources` pass with `threshold = 3*sigma`, `n_pixels=5`, `connectivity=8` (current
+  keyword `n_pixels`, never deprecated `npixels`); **no** deblend, **no** second pass,
+  **no** lowered-threshold / DAO / moment / custom fallback, **no** unrelated-property
+  probing. Accept a source only if its `fwhm` is finite and strictly `0.8 < fwhm < 20` px
+  AND its `eccentricity` is finite and `≤ 0.8` (missing/non-finite values rejected);
+  require ≥ 3 accepted sources (frame failure `fwhm_insufficient_sources`); frame FWHM =
+  float64 median of accepted FWHMs (finite > 0 else `fwhm_measurement_failed`). No
+  image-size gate, no cap/top-N, no brightness/exposure fold, no fallback constants.
+  **Availability preflight (B2):** a missing **or** importable-but-API-incompatible
+  Photutils (signature/property mismatch) fails method availability **before** any
+  per-frame work — the persisted/programmatic request fails validation (no per-frame
+  substitution). Current API capabilities checked: `detect_sources` named `n_pixels`,
+  `connectivity`, `mask`; `SourceCatalog` named `mask`, `progress_bar`;
+  `SourceCatalog.fwhm` property; `SegmentationImage.n_labels` (or legacy `nlabels`).
+  Missing Photutils disables the GUI option; persisted/programmatic request fails
+  validation **before run**. Per-frame insufficient sources excludes the frame explicitly.
+  **No** variance/no-weight/unit/1e-6 fallback.
 - Quality raw weights are computed **after** normalization exclusions; max-normalization is
   applied **only over surviving positive weights** (frames with a failed/absent metric are
   excluded first).
@@ -353,7 +377,7 @@ the incidental Qt dataclass default.
 | N2 | Single `linear_fit` estimator: float64 OLS + robust MAD refinement (median center, `1.4826*MAD`, ±3·scale, monotonic, ≤5 iters), `0.25 ≤ a ≤ 4.0`, out-of-range fails frame (no clip). |
 | N3 | Low-N/min-pixel gate + failure: `min_common = max(256, ceil(0.01 * min(counts)))`; failure excludes frame with reason; N=1 normalization is identity success; no silent substitution. |
 | N4 | `stack_core` `linear_fit==median` placeholder removed from supported paths; old callers route canonical or error, never median substitution. |
-| W1 | `noise_fwhm`: real estimator (Photutils `equivalent_fwhm` median, `0.8<FWHM<20`, ecc≤0.8, ≥3 sources); missing Photutils disables GUI / persisted fails validation; per-frame insufficient sources excluded; no fallback. |
+| W1 | `noise_fwhm`: real estimator (Photutils 3 `SourceCatalog.fwhm` — **circularized FWHM from equal second-order central moments**; the previously frozen `equivalent_fwhm` is stale/nonexistent in Photutils 3.0.0 and is corrected to `fwhm`); deterministic detection: ≥256 valid luminance samples, sigma-clipped std (3/3, 5 iters) + median background, one `detect_sources` pass `threshold=3σ, n_pixels=5, connectivity=8`, no deblend/second-pass/threshold/property fallback; accept finite `0.8<FWHM<20`, ecc≤0.8, ≥3 accepted sources (else `fwhm_insufficient_sources`), frame FWHM = float64 median (finite >0 else `fwhm_measurement_failed`); **missing OR signature/property-incompatible Photutils fails availability preflight before per-frame work** (disables GUI / persisted fails validation; capabilities: `detect_sources(n_pixels, connectivity, mask)`, `SourceCatalog(mask, progress_bar, .fwhm)`, `SegmentationImage.n_labels`); per-frame insufficient sources excluded; no fallback. |
 | W2 | No exposure fold (`none` = scalar `1.0`); `noise_variance` = raw `1/σ²` then max=1 normalization; no floor/epsilon/constant/unity fallback. |
 | W3 | Exactly one scalar weight per frame, shared across channels; geometric/taper are separate 2-D factors. |
 | S1 | All-invalid output = NaN/invalid science + `estimator_weight_sum=0` + `support=0`; no historical zero sentinel. |

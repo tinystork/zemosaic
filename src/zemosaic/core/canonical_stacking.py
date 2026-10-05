@@ -2,9 +2,10 @@
 
 Pure CPU, deterministic, backend-neutral primitives implementing the frozen
 SCI-05 contract (``docs/science/SCI05_CANONICAL_STACKING_CONTRACT.md``) for the
-**normalization stage only**. This is **Gate B1**: canonical input validation,
-reference selection, and per-frame normalization. Weighting (Gate B2),
-rejection/combine (Gate C), and coverage support/taper are explicitly out of
+**normalization and scalar quality weighting stages**. This is **Gate B1**
+(canonical input validation, reference selection, per-frame normalization) and
+**Gate B2** (scalar quality weighting ``none``/``noise_variance``/``noise_fwhm``).
+Rejection/combine (Gate C) and coverage support/taper are explicitly out of
 scope here and are assembled by later gates.
 
 Design invariants
@@ -25,13 +26,15 @@ Design invariants
 Public API
 ----------
 ``prepare_canonical_inputs``, ``select_canonical_reference``,
-``normalize_canonical_images`` plus the frozen dataclasses
-``CanonicalInputBatch`` / ``CanonicalNormalizationResult`` and
-``FrameExclusion``.
+``normalize_canonical_images``, ``compute_canonical_quality_weights``,
+``canonical_noise_fwhm_available`` plus the frozen dataclasses
+``CanonicalInputBatch`` / ``CanonicalNormalizationResult`` /
+``CanonicalWeightingResult`` and ``FrameExclusion``.
 """
 
 from __future__ import annotations
 
+import inspect
 import operator
 import warnings
 from dataclasses import dataclass
@@ -39,15 +42,29 @@ from dataclasses import dataclass
 import numpy as np
 from astropy.stats import sigma_clipped_stats
 
+try:  # pragma: no cover - import availability is environment-dependent
+    from photutils.segmentation import SegmentationImage as _SegmentationImage
+    from photutils.segmentation import SourceCatalog as _SourceCatalog
+    from photutils.segmentation import detect_sources as _detect_sources
+    from photutils.utils.exceptions import NoDetectionsWarning as _NoDetectionsWarning
+except Exception:  # pragma: no cover - defensive; photutils is a declared dependency
+    _SegmentationImage = None
+    _SourceCatalog = None
+    _detect_sources = None
+    _NoDetectionsWarning = None
+
 __all__ = [
     "CanonicalStackValidationError",
     "CanonicalStackFailure",
     "FrameExclusion",
     "CanonicalInputBatch",
     "CanonicalNormalizationResult",
+    "CanonicalWeightingResult",
     "prepare_canonical_inputs",
     "select_canonical_reference",
     "normalize_canonical_images",
+    "compute_canonical_quality_weights",
+    "canonical_noise_fwhm_available",
 ]
 
 # ---------------------------------------------------------------------------
@@ -63,6 +80,37 @@ REASON_SKY_MEAN_FAILED = "sky_mean_failed"
 REASON_NONFINITE_NORMALIZED_OUTPUT = "nonfinite_normalized_output"
 
 STAGE_NORMALIZATION = "normalization"
+STAGE_WEIGHTING = "weighting"
+
+REASON_INSUFFICIENT_QUALITY_SAMPLES = "insufficient_quality_samples"
+REASON_NOISE_SIGMA_FAILED = "noise_sigma_failed"
+REASON_FWHM_INSUFFICIENT_SOURCES = "fwhm_insufficient_sources"
+REASON_FWHM_MEASUREMENT_FAILED = "fwhm_measurement_failed"
+REASON_RAW_WEIGHT_FAILED = "raw_weight_failed"
+
+_METHOD_WEIGHT_NONE = "none"
+_METHOD_WEIGHT_NOISE_VARIANCE = "noise_variance"
+_METHOD_WEIGHT_NOISE_FWHM = "noise_fwhm"
+_SUPPORTED_WEIGHT_METHODS = (
+    _METHOD_WEIGHT_NONE,
+    _METHOD_WEIGHT_NOISE_VARIANCE,
+    _METHOD_WEIGHT_NOISE_FWHM,
+)
+
+_MIN_QUALITY_SAMPLES = 256
+_REC709_R = 0.2126
+_REC709_G = 0.7152
+_REC709_B = 0.0722
+_QUALITY_SIGMA_LOW = 3.0
+_QUALITY_SIGMA_HIGH = 3.0
+_QUALITY_SIGMA_MAXITERS = 5
+_FWHM_MIN = 0.8
+_FWHM_MAX = 20.0
+_FWHM_ECC_MAX = 0.8
+_FWHM_MIN_SOURCES = 3
+_FWHM_THRESHOLD_SIGMA = 3.0
+_FWHM_N_PIXELS = 5
+_FWHM_CONNECTIVITY = 8
 
 _METHOD_NONE = "none"
 _METHOD_LINEAR_FIT = "linear_fit"
@@ -186,6 +234,56 @@ class CanonicalNormalizationResult:
     requested_method: str
     effective_method: str
     coefficients: np.ndarray
+    exclusions: tuple
+    original_mono: bool
+    n_frames: int
+    height: int
+    width: int
+    channels: int
+    original_ndim: int
+    original_shape: tuple
+
+
+@dataclass(frozen=True)
+class CanonicalWeightingResult:
+    """Deterministic output of :func:`compute_canonical_quality_weights`.
+
+    Attributes
+    ----------
+    weights:
+        Owned contiguous ``(N,)`` float64 canonical normalized quality weights.
+        Active survivors are positive with max exactly 1 for weighted methods;
+        inactive/excluded frames are exactly 0.
+    raw_weights:
+        Owned ``(N,)`` float64. 1 for active ``none`` frames, the raw formula for
+        successful weighted frames, NaN for metric-failed/prior-inactive frames.
+    noise_sigma:
+        Owned ``(N,)`` float64 robust sigma; NaN for ``none``/failed/inactive.
+    fwhm:
+        Owned ``(N,)`` float64 median source FWHM; NaN except successful
+        ``noise_fwhm`` frames.
+    active_frames:
+        Owned ``(N,)`` bool preserving N and original frame indices.
+    reference_index:
+        Chosen normalization reference frame index (identity).
+    requested_method / effective_method:
+        Weighting method token; always equal (validation errors raise instead of
+        falling back).
+    exclusions:
+        Tuple of :class:`FrameExclusion` records (B1 inherited + B2 weighting).
+    original_mono / n_frames / height / width / channels / original_ndim /
+    original_shape:
+        Output shape metadata for downstream restoration (Gate C).
+    """
+
+    weights: np.ndarray
+    raw_weights: np.ndarray
+    noise_sigma: np.ndarray
+    fwhm: np.ndarray
+    active_frames: np.ndarray
+    reference_index: int
+    requested_method: str
+    effective_method: str
     exclusions: tuple
     original_mono: bool
     n_frames: int
@@ -678,4 +776,297 @@ def normalize_canonical_images(
         channels=c,
         original_ndim=batch.original_ndim,
         original_shape=batch.original_shape,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate B2: scalar quality weighting
+# ---------------------------------------------------------------------------
+
+def _frame_luminance(frame: np.ndarray) -> np.ndarray:
+    """Return the float64 luminance plane of one NHWC frame.
+
+    RGB uses exact Rec.709 ``0.2126R + 0.7152G + 0.0722B``; HWC1 uses channel 0.
+    """
+    if frame.shape[-1] == 1:
+        return frame[:, :, 0].astype(np.float64)
+    r = frame[:, :, 0].astype(np.float64)
+    g = frame[:, :, 1].astype(np.float64)
+    b = frame[:, :, 2].astype(np.float64)
+    return _REC709_R * r + _REC709_G * g + _REC709_B * b
+
+
+def _noise_stats(lum: np.ndarray, valid: np.ndarray) -> tuple:
+    """Return ``(median, sigma, reason)`` for the valid luminance samples.
+
+    ``reason`` is ``None`` on success. Requires at least
+    ``_MIN_QUALITY_SAMPLES`` valid samples; sigma-clipped stats use default
+    median centering / std clipping (3/3, maxiters 5). Requires finite sigma
+    > 0 and finite median. Astropy/statistics exceptions are contained into
+    ``noise_sigma_failed`` (no raw leak, no fallback).
+    """
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid < _MIN_QUALITY_SAMPLES:
+        return float("nan"), float("nan"), REASON_INSUFFICIENT_QUALITY_SAMPLES
+    valid_lum = lum[valid]
+    try:
+        stats = sigma_clipped_stats(
+            valid_lum,
+            sigma_lower=_QUALITY_SIGMA_LOW,
+            sigma_upper=_QUALITY_SIGMA_HIGH,
+            maxiters=_QUALITY_SIGMA_MAXITERS,
+        )
+        median = float(stats[1])
+        sigma = float(stats[2])
+    except Exception:
+        return float("nan"), float("nan"), REASON_NOISE_SIGMA_FAILED
+    if not (np.isfinite(sigma) and sigma > 0.0):
+        return float("nan"), float("nan"), REASON_NOISE_SIGMA_FAILED
+    if not np.isfinite(median):
+        return float("nan"), float("nan"), REASON_NOISE_SIGMA_FAILED
+    return median, sigma, None
+
+
+def _source_value_to_float(value) -> float:
+    """Deterministically convert a Photutils source property to float.
+
+    Astropy ``Quantity`` values expose ``.value``; ``float(Quantity)`` raises for
+    dimensioned quantities (e.g. FWHM in pixels), so ``.value`` is read explicitly.
+    """
+    if hasattr(value, "value"):
+        return float(value.value)
+    return float(value)
+
+
+def _frame_fwhm(
+    lum: np.ndarray, valid: np.ndarray, median: float, sigma: float
+) -> tuple:
+    """Return ``(fwhm_median, reason)`` from Photutils source detection.
+
+    Exactly one detect pass on ``luminance - median`` (invalid pixels zeroed and
+    supplied as mask), threshold ``3*sigma``, ``n_pixels=5``, connectivity 8. No
+    deblend, no lowered-threshold/DAO/moment/custom fallback, no property
+    fallback. Accepts sources with finite ``0.8 < fwhm < 20`` px and
+    ``eccentricity <= 0.8``; requires >= 3 accepted sources; frame FWHM is the
+    float64 median of accepted FWHMs.
+    """
+    if _detect_sources is None or _SourceCatalog is None:
+        return float("nan"), REASON_FWHM_MEASUREMENT_FAILED
+
+    plane = (lum - median).astype(np.float64)
+    plane[~valid] = 0.0
+    mask = ~valid
+
+    try:
+        with warnings.catch_warnings():
+            if _NoDetectionsWarning is not None:
+                # "no sources found" is an expected, handled branch (mapped to
+                # fwhm_insufficient_sources), not an actionable warning.
+                warnings.simplefilter("ignore", _NoDetectionsWarning)
+            segm = _detect_sources(
+                plane,
+                threshold=_FWHM_THRESHOLD_SIGMA * sigma,
+                n_pixels=_FWHM_N_PIXELS,
+                connectivity=_FWHM_CONNECTIVITY,
+                mask=mask,
+            )
+    except Exception:
+        return float("nan"), REASON_FWHM_MEASUREMENT_FAILED
+
+    if segm is None:
+        return float("nan"), REASON_FWHM_INSUFFICIENT_SOURCES
+    try:
+        # Current Photutils name is ``n_labels`` (``nlabels`` deprecated).
+        n_labels = int(segm.n_labels)
+    except AttributeError:  # pragma: no cover - older Photutils
+        n_labels = int(getattr(segm, "nlabels", 0))
+    except Exception:
+        n_labels = 0
+    if n_labels <= 0:
+        return float("nan"), REASON_FWHM_INSUFFICIENT_SOURCES
+
+    try:
+        catalog = _SourceCatalog(plane, segm, mask=mask, progress_bar=False)
+        accepted = []
+        for source in catalog:
+            try:
+                fwhm = _source_value_to_float(source.fwhm)
+                ecc = _source_value_to_float(source.eccentricity)
+            except Exception:
+                continue  # reject missing/non-convertible values
+            if not (np.isfinite(fwhm) and np.isfinite(ecc)):
+                continue
+            if not (_FWHM_MIN < fwhm < _FWHM_MAX):
+                continue
+            if not (ecc <= _FWHM_ECC_MAX):
+                continue
+            accepted.append(fwhm)
+    except Exception:
+        return float("nan"), REASON_FWHM_MEASUREMENT_FAILED
+
+    if len(accepted) < _FWHM_MIN_SOURCES:
+        return float("nan"), REASON_FWHM_INSUFFICIENT_SOURCES
+    fwhm_median = float(np.median(np.asarray(accepted, dtype=np.float64)))
+    if not (np.isfinite(fwhm_median) and fwhm_median > 0.0):
+        return float("nan"), REASON_FWHM_MEASUREMENT_FAILED
+    return fwhm_median, None
+
+
+def canonical_noise_fwhm_available() -> bool:
+    """Read-only availability signal for the ``noise_fwhm`` weighting method.
+
+    True only when Photutils detection/catalog support is importable AND every
+    exact capability the estimator calls is present, so an importable-but-API-
+    incompatible Photutils reports unavailable **before** any per-frame work:
+
+    * ``detect_sources`` accepts named ``n_pixels``, ``connectivity``, ``mask``;
+    * ``SourceCatalog`` accepts named ``mask``, ``progress_bar``;
+    * ``SourceCatalog`` exposes the exact ``fwhm`` property (no substitute);
+    * ``SegmentationImage`` exposes ``n_labels`` (or legacy ``nlabels``).
+
+    Signature introspection is wrapped in a bounded try/except; any missing
+    capability or introspection failure returns False. Suitable for later GUI
+    option validation.
+    """
+    if _detect_sources is None or _SourceCatalog is None or _SegmentationImage is None:
+        return False
+    try:
+        detect_params = inspect.signature(_detect_sources).parameters
+        if not {"n_pixels", "connectivity", "mask"}.issubset(detect_params):
+            return False
+        catalog_params = inspect.signature(_SourceCatalog).parameters
+        if not {"mask", "progress_bar"}.issubset(catalog_params):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if not hasattr(_SourceCatalog, "fwhm"):
+        return False
+    if not (hasattr(_SegmentationImage, "n_labels") or hasattr(_SegmentationImage, "nlabels")):
+        return False
+    return True
+
+
+def compute_canonical_quality_weights(
+    normalization: CanonicalNormalizationResult, method: str
+) -> CanonicalWeightingResult:
+    """Compute canonical scalar quality weights on a normalized batch.
+
+    ``method`` must be exactly ``none``, ``noise_variance``, or ``noise_fwhm``
+    (after strip/lower; aliases/unknown rejected with
+    :class:`CanonicalStackValidationError`). Never mutates/aliases the
+    normalization inputs; inherits B1 ``active_frames``/exclusions;
+    prior-inactive frames stay inactive (q=0, metrics NaN). One scalar per frame
+    shared by all channels. See module docstring for the full per-method
+    contract.
+    """
+    if not isinstance(method, str):
+        raise CanonicalStackValidationError(
+            f"weighting method must be a string, got {type(method).__name__}"
+        )
+    token = method.strip().lower()
+    if token not in _SUPPORTED_WEIGHT_METHODS:
+        raise CanonicalStackValidationError(
+            f"unsupported weighting method {method!r}; expected one of "
+            "none/noise_variance/noise_fwhm (aliases are not accepted)"
+        )
+    if token == _METHOD_WEIGHT_NOISE_FWHM and not canonical_noise_fwhm_available():
+        raise CanonicalStackValidationError(
+            "weighting method noise_fwhm unavailable: Photutils source "
+            "detection/catalog support is missing or lacks SourceCatalog.fwhm"
+        )
+
+    n = normalization.n_frames
+    active = np.array(normalization.active_frames, dtype=bool, copy=True)
+    ref_idx = int(normalization.reference_index)
+
+    weights = np.zeros(n, dtype=np.float64)
+    raw_weights = np.full(n, np.nan, dtype=np.float64)
+    noise_sigma = np.full(n, np.nan, dtype=np.float64)
+    fwhm = np.full(n, np.nan, dtype=np.float64)
+    new_exclusions = []
+
+    if token == _METHOD_WEIGHT_NONE:
+        weights[active] = 1.0
+        raw_weights[active] = 1.0
+    else:
+        for i in range(n):
+            if not active[i]:
+                continue  # prior inactive: q=0, raw/metrics NaN (already set)
+
+            lum = _frame_luminance(normalization.images[i])
+            valid = normalization.valid_mask[i]
+
+            median, sigma, reason = _noise_stats(lum, valid)
+            fwhm_val = np.nan
+            if reason is None and token == _METHOD_WEIGHT_NOISE_FWHM:
+                fwhm_val, reason = _frame_fwhm(lum, valid, median, sigma)
+
+            if reason is not None:
+                if i == ref_idx:
+                    raise CanonicalStackFailure(
+                        f"reference frame {i} quality metric failed "
+                        f"(stage=weighting, reason={reason})"
+                    )
+                active[i] = False
+                new_exclusions.append(
+                    FrameExclusion(index=i, stage=STAGE_WEIGHTING, reason=reason)
+                )
+                continue
+
+            if token == _METHOD_WEIGHT_NOISE_VARIANCE:
+                with np.errstate(divide="ignore", over="ignore", under="ignore", invalid="ignore"):
+                    raw = float(1.0 / (np.float64(sigma) * np.float64(sigma)))
+            else:
+                with np.errstate(divide="ignore", over="ignore", under="ignore", invalid="ignore"):
+                    raw = float(
+                        1.0
+                        / (
+                            np.float64(sigma)
+                            * np.float64(sigma)
+                            * np.float64(fwhm_val)
+                            * np.float64(fwhm_val)
+                        )
+                    )
+            if not (np.isfinite(raw) and raw > 0.0):
+                if i == ref_idx:
+                    raise CanonicalStackFailure(
+                        f"reference frame {i} quality metric failed "
+                        f"(stage=weighting, reason={REASON_RAW_WEIGHT_FAILED})"
+                    )
+                active[i] = False
+                new_exclusions.append(
+                    FrameExclusion(
+                        index=i, stage=STAGE_WEIGHTING, reason=REASON_RAW_WEIGHT_FAILED
+                    )
+                )
+                continue
+
+            noise_sigma[i] = sigma
+            fwhm[i] = fwhm_val
+            raw_weights[i] = raw
+
+        if not active.any():
+            raise CanonicalStackFailure("no frame remains after quality weighting")
+        max_raw = float(np.max(raw_weights[active]))
+        if not (np.isfinite(max_raw) and max_raw > 0.0):
+            raise CanonicalStackFailure("no positive quality weight remains after weighting")
+        weights[active] = raw_weights[active] / max_raw
+
+    return CanonicalWeightingResult(
+        weights=np.ascontiguousarray(weights),
+        raw_weights=np.ascontiguousarray(raw_weights),
+        noise_sigma=np.ascontiguousarray(noise_sigma),
+        fwhm=np.ascontiguousarray(fwhm),
+        active_frames=np.ascontiguousarray(active),
+        reference_index=ref_idx,
+        requested_method=token,
+        effective_method=token,
+        exclusions=tuple(normalization.exclusions) + tuple(new_exclusions),
+        original_mono=normalization.original_mono,
+        n_frames=n,
+        height=normalization.height,
+        width=normalization.width,
+        channels=normalization.channels,
+        original_ndim=normalization.original_ndim,
+        original_shape=normalization.original_shape,
     )
