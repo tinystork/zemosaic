@@ -19,6 +19,7 @@ from __future__ import annotations
 from . import (
     adequacy,
     assembly,
+    auto_layout,
     execution,
     executor,
     geometry,
@@ -38,4 +39,5 @@ __all__ = [
     "seam",
     "executor",
     "mosaic",
+    "auto_layout",
 ]
