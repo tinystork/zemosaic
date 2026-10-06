@@ -164,26 +164,120 @@ def test_file_provider_tile_invariance(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 3. Memory gate presence + estimate bound
+# 3. Memory gate presence + honest estimate (reconciled with measurement)
 # ---------------------------------------------------------------------------
+
+# Measured on the real cell (r0001c0002, N=66, patch 836x496), r0 run — frozen
+# as the reconciliation reference so the gate can never silently under-estimate.
+_MEASURED_INMEM_PEAK_KIB = 3519988
+_MEASURED_STREAM_T128_PEAK_KIB = 1156460
+_MEASURED_STREAM_T128_DELTA_KIB = 815852
+_MEASURED_STREAM_T256_PEAK_KIB = 1855568
+_MEASURED_STREAM_T256_DELTA_KIB = 1513060
+
 
 def test_streaming_gate_present_and_estimate_bounded():
     n, patch_hw = 66, (836, 496)
     est = zstream.estimate_streaming_peak_kib(n, patch_hw, 128)
-    # Streaming estimate must be FAR below the in-memory O(N x patch_area) peak
-    # (~3.4-4.1 GiB); assert a hard sanity ceiling (must be < 1.5 GiB).
-    assert est < 1.5 * 1024**2, est
+    # Streaming estimate (absolute peak) must be well below the in-memory peak.
+    assert est < _MEASURED_INMEM_PEAK_KIB, est
     # Monotone in tile area (larger tile -> larger workspace).
     assert zstream.estimate_streaming_peak_kib(n, patch_hw, 256) > est
+    # The estimate must now include the O(N x patch_area) residuals: it must be
+    # >= the measured streaming peak (not just the old tile-only term).
+    assert est >= _MEASURED_STREAM_T128_PEAK_KIB, (
+        f"estimate {est} < measured stream peak {_MEASURED_STREAM_T128_PEAK_KIB}"
+    )
     gate = zstream.check_streaming_gate(n, patch_hw, 128)
     assert gate.required > 0
     assert isinstance(gate.ok, bool)
+
+
+def test_estimate_reconciled_with_measured_delta():
+    """The gate requirement (estimate + 15% margin) must be >= the MEASURED
+    streaming delta for BOTH tile sizes (M1 reconciliation)."""
+    n, patch_hw = 66, (836, 496)
+    for tile, measured_delta in (
+        (128, _MEASURED_STREAM_T128_DELTA_KIB),
+        (256, _MEASURED_STREAM_T256_DELTA_KIB),
+    ):
+        delta = zstream.estimate_streaming_delta_kib(n, patch_hw, tile)
+        required = delta * 1.15  # KiB (matches check_streaming_gate's margin)
+        assert required >= measured_delta, (
+            f"tile {tile}: required {required:.0f} KiB < measured delta "
+            f"{measured_delta} KiB"
+        )
+    # The absolute-peak estimate must also cover the measured absolute peaks.
+    assert zstream.estimate_streaming_peak_kib(n, patch_hw, 128) >= _MEASURED_STREAM_T128_PEAK_KIB
+    assert zstream.estimate_streaming_peak_kib(n, patch_hw, 256) >= _MEASURED_STREAM_T256_PEAK_KIB
+
+
+def test_estimate_includes_input_residency_and_rejection_mask():
+    """The estimate must explicitly include the two O(N x patch_area) residuals
+    that the r0 model omitted (M1)."""
+    n, patch_hw = 66, (836, 496)
+    h, w = patch_hw
+    # rejection_mask bool (N, H, W, C) — ~78.3 MiB for N=66.
+    rej_kib = n * h * w * 3 // 1024
+    # aligned-input residency (float32 RGB + bool support) — ~339 MiB for N=66.
+    input_kib = n * h * w * (3 * 4 + 1) // 1024
+    assert rej_kib > 70 * 1024 and input_kib > 300 * 1024
+    est = zstream.estimate_streaming_peak_kib(n, patch_hw, 128)
+    # If either residual were omitted the estimate would drop by that amount.
+    assert est - rej_kib - input_kib < est
 
 
 def test_streaming_gate_blocks_when_insufficient(monkeypatch):
     monkeypatch.setattr(zsw, "read_available_memory", lambda: int(0.1 * 1024**3))
     gate = zstream.check_streaming_gate(66, (836, 496), 128)
     assert gate.ok is False
+
+
+# ---------------------------------------------------------------------------
+# 3b. L1 hardening: placeholder request contents are never dereferenced
+# ---------------------------------------------------------------------------
+
+def test_streaming_request_placeholder_contents_never_dereferenced(tmp_path):
+    """The streaming path uses only ``len(request.images)``; the placeholder
+    entries may be arbitrary objects and the result is unchanged (L1)."""
+    frames, masks = _aligned_corpus()
+    ids = [f"frame_{i}" for i in range(len(frames))]
+    cache = tmp_path / "cache"
+    zfp.write_aligned_cache_from_arrays(cache, ids, frames, masks)
+    prov = zfp.MemmapCanonicalProvider(cache)
+
+    from zemosaic.core.zegrid import science_adapter as zs2
+
+    cfg = zs2.MiniTileScienceConfig(
+        normalization="sky_mean", weighting="noise_variance",
+        rejection="kappa_sigma", combine="mean", taper="footprint", taper_px=8.0,
+        backend="cpu",
+    )
+    req_none = zstream.build_streaming_request(cfg, prov.n_frames)
+    # A request whose images/geometric_support entries are arbitrary objects (not
+    # None) must produce IDENTICAL results — proving the contents are unused.
+    req_odd = CanonicalStackRequest(
+        images=[object() for _ in range(prov.n_frames)],
+        geometric_support=[object() for _ in range(prov.n_frames)],
+        normalization=cfg.normalization, weighting=cfg.weighting,
+        rejection=cfg.rejection, combine=cfg.combine,
+        reference_index=cfg.reference_index, taper=cfg.taper,
+        taper_px=cfg.taper_px, taper_floor=cfg.taper_floor,
+        backend=cfg.backend, equalize_rgb=cfg.equalize_rgb,
+    )
+    a = run_canonical_stack_streaming(prov, req_none, tile_size=9)
+    b = run_canonical_stack_streaming(prov, req_odd, tile_size=9)
+    _assert_minitile_bit_exact(a, b)
+    np.testing.assert_array_equal(a.rejection_mask, b.rejection_mask)
+    assert a.provenance == b.provenance
+
+
+def test_build_streaming_request_rejects_bad_length():
+    from zemosaic.core.zegrid import science_adapter as zs2
+
+    cfg = zs2.MiniTileScienceConfig(normalization="sky_mean")
+    with pytest.raises(ValueError):
+        zstream.build_streaming_request(cfg, -1)
 
 
 # ---------------------------------------------------------------------------

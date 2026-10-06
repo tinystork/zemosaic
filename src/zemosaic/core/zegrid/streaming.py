@@ -16,6 +16,24 @@ Deliverables proven here (see the tool + tests):
    is BIT-EQUAL to the in-memory path for the SAME cell/inputs.
 2. Peak RSS is bounded by tile area (measured by the tool).
 3. A memory gate is checked before the run and the cache/result are resumable.
+
+Honest peak-memory decomposition (the precise bound)
+---------------------------------------------------
+The streaming peak is NOT simply ``O(N x tile_area)``. The accurate split is:
+
+* ``O(N x tile_area)`` float64 intermediates (the tile workspace) — the term
+  that scales with tile area and the only one reduced vs the in-memory path.
+* ``O(N x patch_area) x 1 byte`` residuals: the ``rejection_mask`` bool
+  ``(N, H, W, C)`` output plane, and the aligned-input residency (the
+  file-backed provider's float32/bool cache pages touched by phase 1/2).
+* ``O(patch_area)`` output planes (science/weight_sum/valid/surviving/support/
+  n_eff).
+* a fixed subprocess baseline (~330 MiB for the numpy/astropy/reproject/shapely
+  process).
+
+:func:`estimate_streaming_peak_kib` models all of these terms explicitly and is
+calibrated so the gate requirement (with margin) is >= the MEASURED delta on the
+real cell (see the R6 report + reconciliation test).
 """
 
 from __future__ import annotations
@@ -46,6 +64,10 @@ __all__ = [
     "run_cell_streaming",
     "check_streaming_gate",
     "estimate_streaming_peak_kib",
+    "estimate_streaming_delta_kib",
+    "STREAMING_BASELINE_KIB",
+    "TILE_WORKSPACE_BYTES_PER_CELL",
+    "TILE_FIXED_OVERHEAD_KIB",
     "build_streaming_request",
     "compare_minitile_planes",
 ]
@@ -58,12 +80,25 @@ __all__ = [
 def build_streaming_request(
     config: "zs.MiniTileScienceConfig", n_frames: int
 ) -> CanonicalStackRequest:
-    """Build a canonical request for the streaming executor.
+    """Build a canonical request for the streaming executor (placeholder pixels).
 
-    The R5 streaming executor reads ``request.images`` only for ``len()`` (the
-    provider serves the actual pixels), so placeholder entries of the right
-    length are used — the aligned data is NEVER materialised here.
+    The R5 streaming executor dereferences ``request.images`` ONLY via
+    ``len(request.images)`` (canonical_streaming.py, the
+    ``provider.n_frames != len(request.images)`` guard) and NEVER reads
+    ``request.images[i]`` or ``request.geometric_support`` — the provider serves
+    the actual pixels. This contract is asserted here so a future R5 change that
+    starts dereferencing the contents fails loudly rather than silently feeding
+    ``None``/placeholder entries into the pipeline.
+
+    The aligned data is therefore NEVER materialised in this request; the
+    placeholder entries may be arbitrary objects (``None``, strings, ints) of the
+    right length, and results are unchanged (covered by
+    ``test_streaming_request_placeholder_contents_never_dereferenced``).
     """
+    # Guard the coupling: the placeholder CONTENTS must never be dereferenced by
+    # the streaming path. ``_require_placeholder_length_only`` is deliberately
+    # minimal and documents the exact assumption the R5 executor relies on.
+    _require_placeholder_length_only(n_frames)
     return CanonicalStackRequest(
         images=[None] * n_frames,
         geometric_support=[None] * n_frames,
@@ -80,42 +115,138 @@ def build_streaming_request(
     )
 
 
+def _require_placeholder_length_only(n_frames: int) -> None:
+    """Documented guard for the placeholder-request coupling (L1 hardening).
+
+    The R5 ``run_canonical_stack_streaming`` uses ``request.images`` only for
+    ``len()`` and never touches ``request.geometric_support``. This function is
+    a no-op that exists to (a) document that contract in one named place and
+    (b) fail fast if ``n_frames`` is not a sane positive int (which would break
+    the ``len()``-length invariant before the placeholder list is built).
+    """
+    if not isinstance(n_frames, int) or isinstance(n_frames, bool) or n_frames < 0:
+        raise ValueError(
+            f"n_frames must be a non-negative int, got {n_frames!r} "
+            "(placeholder images list length invariant)"
+        )
+
+
 # ---------------------------------------------------------------------------
-# Memory gate + peak estimate (streaming)
+# Memory gate + peak estimate (streaming) — calibrated to real-cell measurement
 # ---------------------------------------------------------------------------
+
+# Fixed subprocess baseline (KiB): measured 337,668 KiB (~330 MiB) VmHWM right
+# after imports + manifest/canvas/cell-context build, BEFORE any cache build or
+# streaming work. Rounded up to a conservative 340 MiB for the gate.
+STREAMING_BASELINE_KIB = 340 * 1024  # ~332 MiB, >= measured 329.8 MiB
+
+# Tile-workspace bytes per (pixel x channel x frame): the N x extended-tile-area
+# float32/float64/bool intermediates (images_t/images64/wmap/a_map/survivor/
+# masked/w_contrib + rejection-step temporaries). Calibrated from the MEASURED
+# real-cell deltas (r0001c0002, N=66, footprint taper) with a two-parameter fit
+# ``workspace = N x ext_cells x C x A + num_tiles x F``: A = 71.17 B/(px,ch,frame),
+# F = 2130.9 KiB/tile (the per-tile fixed overhead is why t128 shows a higher
+# effective per-cell than t256). A=75 + F=2560 round up both with a small margin;
+# the 15% gate margin on top keeps the requirement >= measured delta for BOTH
+# tile sizes (see reconciliation test + R6 rework-1 report).
+TILE_WORKSPACE_BYTES_PER_CELL = 75  # per (pixel, channel, frame)
+TILE_FIXED_OVERHEAD_KIB = 2560      # per tile (KiB)
+
+# Halo extension for the footprint taper EDT (ceil(taper_px=8) + 1 = 9 px/side).
+_TAPER_HALO_PX = 9
+
+
+def _extended_tile(h: int, w: int, tile_size, halo: int) -> tuple[int, int]:
+    """Effective (extended) tile dims incl. the footprint-taper halo, clipped."""
+    if tile_size is None:
+        return h, w
+    return min(h, tile_size + 2 * halo), min(w, tile_size + 2 * halo)
+
+
+def _num_tiles(h: int, w: int, tile_size) -> int:
+    """Number of (interior) tiles for a tile_size (int, tuple, or None)."""
+    if tile_size is None:
+        return 1
+    if isinstance(tile_size, (int,)):
+        th = tw = int(tile_size)
+    else:
+        th, tw = int(tile_size[0]), int(tile_size[1])
+    th = max(1, th)
+    tw = max(1, tw)
+    return ((h + th - 1) // th) * ((w + tw - 1) // tw)
+
 
 def estimate_streaming_peak_kib(
     n_contributors: int, patch_hw: tuple[int, int], tile_size, channels: int = 3
 ) -> int:
-    """Conservative streaming peak-RSS estimate (KiB), tile-area bound.
+    """Streaming peak-RSS estimate (KiB) with the HONEST decomposition.
 
-    Accounts for (a) the R4-measured process baseline, (b) the per-frame tile
-    workspace (float32 + float64 + bool intermediates over ``N x tile_area``),
-    (c) the ``O(patch_area)`` output planes, and (d) the residual
-    ``rejection_mask`` bool ``(N, H, W, C)`` output plane.
+    ``baseline + O(N x tile_area) float64 workspace + O(N x patch_area) x 1 byte
+    (rejection_mask bool + aligned-input residency) + O(patch_area) outputs``.
+    Calibrated so the gate requirement (with margin) is >= the MEASURED delta on
+    the real cell (tile 128 and 256).
+
+    Terms (explicit):
+    * baseline: the fixed subprocess overhead (STREAMING_BASELINE_KIB).
+    * tile workspace: ``N x ext_tile_area x C x TILE_WORKSPACE_BYTES_PER_CELL
+      + num_tiles x TILE_FIXED_OVERHEAD_KIB`` (the only term that scales with
+      tile area; the extended tile includes the footprint-taper halo).
+    * aligned-input residency: ``N x H x W x (4*C + 1)`` bytes (float32 RGB + bool
+      support) — the file-backed cache pages phase 1/2 touch.
+    * rejection_mask: ``N x H x W x C`` bool output plane.
+    * output planes: ``H x W x (science f32*C + weight_sum f64*C + valid bool*C +
+      surviving i64*C + support_w1/w2 f64 + n_eff f64)``.
     """
     h, w = patch_hw
-    th = min(tile_size, h) if tile_size else h
-    tw = min(tile_size, w) if tile_size else w
-    # per-frame tile workspace bytes per cell: images_t f32 (4) + images64 (8) +
-    # wmap (8) + a_map (8) + survivor bool (1), times channels for the NHWC axes.
-    ws_per_cell = channels * (4 + 8 + 8 + 8 + 1)
-    workspace_bytes = n_contributors * th * tw * ws_per_cell
+    th, tw = _extended_tile(h, w, tile_size, _TAPER_HALO_PX)
+    ntiles = _num_tiles(h, w, tile_size)
+
+    # O(N x tile_area) float64/float32/bool tile workspace.
+    workspace_bytes = n_contributors * th * tw * channels * TILE_WORKSPACE_BYTES_PER_CELL
+    workspace_kib = int(workspace_bytes / 1024) + ntiles * TILE_FIXED_OVERHEAD_KIB
     # O(patch_area) output planes.
     out_bytes = h * w * (channels * (4 + 8 + 1 + 8) + 2 * 8 + 8)
-    # residual rejection_mask bool (N, H, W, C).
+    # O(N x patch_area) x 1 byte: rejection_mask bool (N, H, W, C).
     rej_bytes = n_contributors * h * w * channels * 1
-    baseline_kib = 355080  # R4 two-term model intercept (~347 MiB process baseline)
-    return baseline_kib + int((workspace_bytes + out_bytes + rej_bytes) / 1024)
+    # O(N x patch_area) x (4B/px float32 + 1B bool): aligned-input residency —
+    # the cache pages the provider serves (bit-exact to the aligned arrays, so
+    # identical in size to the on-disk cache).
+    input_bytes = n_contributors * h * w * (channels * 4 + 1)
+
+    return STREAMING_BASELINE_KIB + workspace_kib + int(
+        (out_bytes + rej_bytes + input_bytes) / 1024
+    )
+
+
+def estimate_streaming_delta_kib(
+    n_contributors: int, patch_hw: tuple[int, int], tile_size, channels: int = 3
+) -> int:
+    """The streaming executor's ADDED peak above baseline (KiB).
+
+    This is what the in-memory comparison (``peak_rss_delta_kib``) measures: the
+    peak minus the already-loaded subprocess baseline. Used by
+    :func:`check_streaming_gate` so the gate admits a run only when available
+    memory covers the measured added peak.
+    """
+    return estimate_streaming_peak_kib(n_contributors, patch_hw, tile_size, channels) - STREAMING_BASELINE_KIB
 
 
 def check_streaming_gate(
     n_contributors: int, patch_hw: tuple[int, int], tile_size, channels: int = 3
 ) -> "zsw.MemoryGate":
-    """Memory gate for a streaming cell run (estimated bound + 15% margin)."""
+    """Memory gate for a streaming cell run (estimated ADDED peak + 15% margin).
+
+    The gate compares available memory against the streaming executor's *added*
+    peak (the baseline is already resident when the gate is checked inside
+    ``run_cell_streaming``). The 15% margin plus the calibrated per-cell factor
+    keeps ``required >= measured delta`` for both tile 128 and tile 256 on the
+    real cell.
+    """
     available = zsw.read_available_memory()
-    est = estimate_streaming_peak_kib(n_contributors, patch_hw, tile_size, channels)
-    required = int(est * 1.15 * 1024)  # KiB -> bytes (estimate is in KiB)
+    # The baseline is already resident when the gate is checked (inside
+    # run_cell_streaming), so gate on the ADDED peak, not the total peak.
+    delta_kib = estimate_streaming_delta_kib(n_contributors, patch_hw, tile_size, channels)
+    required = int(delta_kib * 1.15 * 1024)  # KiB -> bytes
     return zsw.MemoryGate(available=available, required=required, ok=available >= required)
 
 

@@ -13,8 +13,21 @@ The R1/R2/R3 in-memory path materialises every patch contributor's aligned RGB
 intermediates (float64 normalization/taper/rejection/combine) at once. For a real
 cell with N=66 at ~410k px this peaks at ~3.4-4.1 GiB (R3 measured).
 
-This module removes the **input-resident** term and leaves the R5 executor's
-``O(N x tile_area)`` working set as the dominant live term:
+This module removes the **input-resident float64 term** and leaves the R5
+executor's ``O(N x tile_area)`` tile workspace as the dominant *tile-scaled*
+live term. The HONEST peak decomposition is:
+
+* ``O(N x tile_area)`` float64 intermediates (the tile workspace) — the only term
+  reduced vs the in-memory path;
+* ``O(N x patch_area) x 1 byte`` residuals: the ``rejection_mask`` bool
+  ``(N, H, W, C)`` output plane, and the aligned-input residency (this cache's
+  float32/bool pages touched by phase 1/2);
+* ``O(patch_area)`` output planes;
+* a fixed subprocess baseline.
+
+(That is: NOT ``O(N x patch_area)`` float64, but the ``O(N x patch_area)`` term
+shrinks to ~1 byte/px bool residency, which is what makes the streaming run
+~3x cheaper than the in-memory path in measured RSS.)
 
 * **Build (streaming reprojection, one frame at a time).** Each contributor's
   aligned patch (RGB float32 + bool geometric support) is materialised, written
