@@ -231,3 +231,84 @@ def test_mode_aware_layout_coarser_floor_honouring_bounded_deterministic():
     d1 = zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=int(2.0 * 2**30))
     d2 = zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=int(2.0 * 2**30))
     assert (d1["nx"], d1["ny"]) == (d2["nx"], d2["ny"])
+
+
+# ---------------------------------------------------------------------------
+# rework-2: pinned layout, cache reuse, selected-mode bound (L2)
+# ---------------------------------------------------------------------------
+
+def test_parse_pinned_layout():
+    assert zegrid._parse_pinned_layout("6x5") == (6, 5)
+    assert zegrid._parse_pinned_layout("6X5") == (6, 5)
+    assert zegrid._parse_pinned_layout((3, 2)) == (3, 2)
+    assert zegrid._parse_pinned_layout(None) is None
+    assert zegrid._parse_pinned_layout("") is None
+    assert zegrid._parse_pinned_layout("6*5") == (6, 5)
+    with pytest.raises(ValueError):
+        zegrid._parse_pinned_layout("garbage")
+    with pytest.raises(ValueError):
+        zegrid._parse_pinned_layout("6")
+
+
+@pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
+def test_pinned_layout_honoured_floors_and_infeasible():
+    frames, _ = zg.read_manifest(LIGHTS)
+    canvas = zg.build_canvas(frames)
+
+    # Honoured: pinned (6,5) at 4 GiB bypasses the RAM-adaptive choice.
+    d = zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=int(4 * 2**30), pinned_layout=(6, 5))
+    assert d["layout_source"] == "pinned"
+    assert (d["nx"], d["ny"]) == (6, 5)
+
+    # Infeasible budget: pinned (3,2) at 1 GiB (cheaper bound > budget).
+    with pytest.raises(zal.LayoutInfeasible):
+        zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=int(1 * 2**30), pinned_layout=(3, 2))
+
+    # Floor violation: pinned (200,200) violates min_patch_area / max_halo_overhead.
+    with pytest.raises(zal.LayoutInfeasible):
+        zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=int(4 * 2**30), pinned_layout=(200, 200))
+
+
+def test_pick_mode_reports_selected_mode_bound():
+    n = 6
+    area = 500_000
+    patch_hw = (500, 1000)
+
+    # Tiny available -> stream; the reported bound must be the STREAMING bound.
+    mode, bound = zegrid._pick_mode(n, area, patch_hw, 1)
+    assert mode == "stream"
+    assert bound == zegrid._estimate_streaming_bytes(n, patch_hw)
+
+    # Huge available -> inmem; the reported bound must be the R4 in-memory bound.
+    mode2, bound2 = zegrid._pick_mode(n, area, patch_hw, 10**15)
+    assert mode2 == "inmem"
+    assert bound2 == int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
+
+
+@pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
+def test_cache_reuse_second_build(tmp_path):
+    frames = sorted(LIGHTS.glob("*.fit"))[:4]
+    input_dir = tmp_path / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    for p in frames:
+        shutil.copy2(p, input_dir / p.name)
+
+    descs, _ = zg.read_manifest(input_dir)
+    canvas = zg.build_canvas(descs)
+    nx, ny = 2, 2
+    cell_ctxs = []
+    for row, col, _b in zg.build_layout(canvas, nx, ny).iter_cells(canvas):
+        cell, patch, mem = zsw.build_cell_context(descs, canvas, row, col, nx, ny)
+        cell_ctxs.append((row, col, cell, patch, mem))
+    cache_root = tmp_path / "cache"
+
+    _, manifests1, report1 = zegrid._build_aligned_cache_frame_major(
+        descs, canvas, cell_ctxs, cache_root, None)
+    _, manifests2, report2 = zegrid._build_aligned_cache_frame_major(
+        descs, canvas, cell_ctxs, cache_root, None)
+
+    assert report1["reused"] == []
+    assert report1["rebuilt"] != []
+    # Second build: everything reused, nothing rebuilt (no re-decode).
+    assert report2["rebuilt"] == []
+    assert set(report2["reused"]) == set(report1["rebuilt"])

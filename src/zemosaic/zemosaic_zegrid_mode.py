@@ -26,6 +26,23 @@ honoured but logs a clear WARNING (see ``core/zegrid/science_adapter.py``).
 There is **NO silent engine fallback**: any ZeGrid failure raises (mirroring the
 legacy Grid abort), and the legacy ``grid_mode.run_grid_mode`` path is untouched
 (selected via the ``grid_engine`` setting in the worker dispatch).
+
+## Reproducibility (IMPORTANT, durable)
+
+The output science ``mosaic_grid.fits`` depends on the chosen **layout**: each
+Cell's ``sky_mean`` normalization is computed over that Cell's halo-extended
+patch, so a different (nx, ny) partition shifts the per-frame additive offset
+slightly and thus the science values. The **coverage** map
+(``mosaic_grid_coverage.fits``, per-pixel stack depth) is pure geometry and is
+**layout-invariant**. The layout is chosen RAM-adaptively from
+``psutil.virtual_memory().available`` by default, so the SAME ``stack_plan.csv``
+can produce slightly different science on different hosts / at different times.
+
+To make a run **reproducible**, pin the layout with the ``zegrid_layout`` config
+key (e.g. ``"6x5"``). When set, the RAM-adaptive choice is bypassed and exactly
+that layout is used (scientific floors are still enforced; an infeasible pinned
+layout raises). The chosen layout and its source (``"auto"`` | ``"pinned"``) are
+recorded in ``zegrid_manifest.json``.
 """
 
 from __future__ import annotations
@@ -130,6 +147,35 @@ def resolve_normalization(stack_norm_method) -> str:
     return _resolve_normalization(stack_norm_method)
 
 
+def _parse_pinned_layout(value) -> tuple[int, int] | None:
+    """Parse a pinned layout spec (``"NXxNY"``) into ``(nx, ny)``, or ``None``.
+
+    Accepts ``"NXxNY"`` (also ``"*"`` or ``","`` separators) and a 2-tuple/list.
+    Raises ``ValueError`` on an unparseable value (never silently ignored).
+    """
+    if value is None:
+        return None
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        try:
+            return int(value[0]), int(value[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid pinned layout {value!r}") from exc
+    text = str(value).strip().lower().replace(" ", "")
+    if not text:
+        return None
+    for sep in ("x", "*", ","):
+        if sep in text:
+            parts = text.split(sep)
+            if len(parts) == 2:
+                try:
+                    return int(parts[0]), int(parts[1])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid pinned layout {value!r} (expected 'NXxNY')"
+                    ) from exc
+    raise ValueError(f"invalid pinned layout {value!r} (expected 'NXxNY')")
+
+
 # ---------------------------------------------------------------------------
 # FrameDescriptor construction from legacy FrameInfo
 # ---------------------------------------------------------------------------
@@ -213,25 +259,47 @@ def _build_aligned_cache_frame_major(descs, canvas, cell_ctxs, cache_root, progr
     For each frame (sorted FrameId): decode ONCE (O(1 frame)), then for every
     Cell whose patch that frame touches, plan the source ROI, crop, reproject and
     APPEND to that Cell's cache. Memory O(1 frame); nothing held across frames.
-    Returns ``(cache_dirs, manifests)`` keyed by cell_id (empty cells omitted).
+
+    Cache REUSE: a Cell whose cache is already COMPLETE (R6 ``cache_is_complete``)
+    is reused (no re-decode, no wipe); only missing/incomplete Cell caches are
+    rebuilt. The wipe is scoped to the single Cell dir (never outside
+    ``<cache_root>/<cell>``). Returns ``(cache_dirs, manifests, cache_report)``.
     """
     cache_root = Path(cache_root)
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    # Active cells (>= 1 patch contributor) with a builder + patch-id set.
-    builders = {}
-    cache_dirs = {}
-    patch_id_sets = {}
-    active = []
+    builders = {}      # cell_id -> AlignedCacheBuilder (rebuild cells only)
+    cache_dirs = {}    # cell_id -> Path
+    patch_id_sets = {} # cell_id -> set of frame ids
+    active = []        # (cell, patch, mem) for rebuild cells
+    reused = []        # cell ids whose cache was reused
+    rebuilt = []       # cell ids whose cache was (re)built
     for (_row, _col, cell, patch, mem) in cell_ctxs:
         if not mem.patch_ids:
             continue
         cid = cell.cell_id
         cache_dir = cache_root / cid
         cache_dirs[cid] = cache_dir
-        builders[cid] = zfp.AlignedCacheBuilder(cache_dir)
         patch_id_sets[cid] = set(mem.patch_ids)
+        if zfp.cache_is_complete(cache_dir, list(mem.patch_ids)):
+            reused.append(cid)
+            continue  # reuse: no wipe, no decode
+        builders[cid] = zfp.AlignedCacheBuilder(cache_dir)  # wipes THIS cell dir only
+        rebuilt.append(cid)
         active.append((cell, patch, mem))
+
+    if reused:
+        _emit(
+            f"ZeGrid: cache reused for {len(reused)} cell(s): {', '.join(reused)}",
+            lvl="INFO",
+            callback=progress_callback,
+        )
+    if rebuilt:
+        _emit(
+            f"ZeGrid: cache (re)built for {len(rebuilt)} cell(s): {', '.join(rebuilt)}",
+            lvl="INFO",
+            callback=progress_callback,
+        )
 
     # Precompute per-frame (cell, crop_plan) so the inner loop is cheap.
     frame_plans = {}
@@ -255,38 +323,47 @@ def _build_aligned_cache_frame_major(descs, canvas, cell_ctxs, cache_root, progr
         frame_plans[key] = lst
 
     total = len(descs)
-    for i, f in enumerate(sorted(descs, key=lambda d: d.frame_id), 1):
-        key = f.frame_id.logical_path
-        _emit(f"decode+cache: frame {i}/{total} ({key})", lvl="DEBUG", callback=progress_callback)
-        hwc = _decode_frame_hwc(f, progress_callback)
-        for (cell, patch, plan) in frame_plans[key]:
-            sb = plan.source_bounds
-            crop_hwc = hwc[sb.y0:sb.y1, sb.x0:sb.x1]
-            crop_chw = np.ascontiguousarray(np.moveaxis(crop_hwc, -1, 0))
-            cropped_wcs = zxe.slice_wcs(f.wcs(), sb)
-            rgb, geom = zxe.reproject_cropped(
-                crop_chw, cropped_wcs, patch.patch_wcs(), patch.patch_shape_hw
-            )
-            builders[cell.cell_id].add(key, rgb, geom)
-            del crop_hwc, crop_chw, rgb, geom
-        del hwc
+    if active:
+        for i, f in enumerate(sorted(descs, key=lambda d: d.frame_id), 1):
+            key = f.frame_id.logical_path
+            _emit(f"decode+cache: frame {i}/{total} ({key})", lvl="DEBUG", callback=progress_callback)
+            hwc = _decode_frame_hwc(f, progress_callback)
+            for (cell, patch, plan) in frame_plans[key]:
+                sb = plan.source_bounds
+                crop_hwc = hwc[sb.y0:sb.y1, sb.x0:sb.x1]
+                crop_chw = np.ascontiguousarray(np.moveaxis(crop_hwc, -1, 0))
+                cropped_wcs = zxe.slice_wcs(f.wcs(), sb)
+                rgb, geom = zxe.reproject_cropped(
+                    crop_chw, cropped_wcs, patch.patch_wcs(), patch.patch_shape_hw
+                )
+                builders[cell.cell_id].add(key, rgb, geom)
+                del crop_hwc, crop_chw, rgb, geom
+            del hwc
 
     manifests = {}
     for cid, b in builders.items():
         manifests[cid] = b.finish()
-    return cache_dirs, manifests
+    for cid in reused:
+        manifests[cid] = zfp.load_cache_manifest(cache_dirs[cid])
+    return cache_dirs, manifests, {"reused": reused, "rebuilt": rebuilt}
 
 
 # ---------------------------------------------------------------------------
 # Per-cell execution (in-memory vs streaming, both bit-equal)
 # ---------------------------------------------------------------------------
 
-def _pick_mode(n_contributors, patch_area_px, available_bytes):
-    """Return ``("inmem" | "stream", bound_bytes)`` for one cell."""
-    bound = zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n_contributors, patch_area_px)
-    if bound <= available_bytes * INMEM_AVAILABLE_FRAC:
-        return "inmem", int(bound)
-    return "stream", int(bound)
+def _pick_mode(n_contributors, patch_area_px, patch_hw, available_bytes, tile_size=STREAM_TILE_SIZE):
+    """Return ``("inmem" | "stream", selected_mode_bound_bytes)`` for one cell.
+
+    The returned bound is the SELECTED mode's OWN bound (R4 in-memory bound for
+    ``"inmem"``; R6 streaming bound for ``"stream"``), so the manifest reports the
+    bound of the mode actually used (L2).
+    """
+    inmem_bound = zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n_contributors, patch_area_px)
+    if inmem_bound <= available_bytes * INMEM_AVAILABLE_FRAC:
+        return "inmem", int(inmem_bound)
+    stream_bound = _estimate_streaming_bytes(n_contributors, patch_hw, tile_size)
+    return "stream", int(stream_bound)
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +423,7 @@ def _choose_layout_mode_aware(
     tile_size=STREAM_TILE_SIZE,
     floors=None,
     halo_px=zsw.HALO_PX,
+    pinned_layout=None,
 ):
     """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
 
@@ -353,12 +431,68 @@ def _choose_layout_mode_aware(
     floors, footprint membership) verbatim, but a candidate is FEASIBLE iff the
     CHEAPER-fitting per-cell mode's worst bound fits ``ram_budget``. Deterministic
     (identical enumeration order); returns a dict (layout + per-cell predictions).
+
+    ``pinned_layout`` (``(nx, ny)`` or ``None``) BYPASSES the RAM-adaptive search
+    and uses exactly that layout (scientific floors still enforced; an infeasible
+    pinned layout raises). ``layout_source`` records ``"pinned"`` vs ``"auto"``.
     """
     floors = floors or zal.ScientificFloors()
     mw, mh = zal.median_projected_footprint(frames, canvas)
     if not (mw > 0 and mh > 0):
         raise zal.LayoutInfeasible("median projected footprint is degenerate")
     footprints = zal._footprints(frames, canvas)
+
+    if pinned_layout is not None:
+        nx, ny = int(pinned_layout[0]), int(pinned_layout[1])
+        if not (1 <= nx <= canvas.width and 1 <= ny <= canvas.height):
+            raise ValueError(
+                f"pinned layout {nx}x{ny} out of canvas bounds {canvas.width}x{canvas.height}"
+            )
+        geom = zal._nominal_geometry(canvas, nx, ny, halo_px)
+        patch_ok = geom["min_patch_area"] >= floors.min_patch_area_px
+        halo_ok = geom["halo_overhead"] <= floors.max_halo_overhead
+        if not (patch_ok and halo_ok):
+            raise zal.LayoutInfeasible(
+                f"pinned layout {nx}x{ny} violates scientific floors: "
+                f"min_patch_area={geom['min_patch_area']} (limit {floors.min_patch_area_px}), "
+                f"halo_overhead={geom['halo_overhead']:.4f} (limit {floors.max_halo_overhead})"
+            )
+        cells = list(_iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size))
+        max_n = max((c["n"] for c in cells), default=0)
+        worst_bound = max((min(c["inmem_bound_bytes"], c["stream_bound_bytes"]) for c in cells), default=0)
+        if ram_budget is not None and worst_bound > ram_budget:
+            raise zal.LayoutInfeasible(
+                f"pinned layout {nx}x{ny} cannot fit any mode within budget: "
+                f"cheaper bound {worst_bound / 2**20:.1f} MiB > budget {ram_budget / 2**20:.1f} MiB"
+            )
+        contrib_ok = max_n >= floors.min_contributors
+        warnings = []
+        if not contrib_ok:
+            warnings.append(
+                f"deepest cell has {max_n} contributors < min_contributors "
+                f"({floors.min_contributors}); the layout may be scientifically degraded"
+            )
+        return {
+            "nx": nx, "ny": ny,
+            "cell_count": nx * ny,
+            "ram_budget_bytes": ram_budget,
+            "available_bytes": available_bytes if available_bytes is not None else ram_budget,
+            "max_contributors": max_n,
+            "refinement_factor": None,
+            "predicted_bound_bytes": int(worst_bound),
+            "max_patch_area": max((c["patch_area"] for c in cells), default=0),
+            "budget_bound_choice": False,
+            "warnings": tuple(warnings),
+            "cells": cells,
+            "layout_source": "pinned",
+            "floors": {
+                "min_patch_area_px": {"value": geom["min_patch_area"],
+                                       "limit": floors.min_patch_area_px, "ok": patch_ok},
+                "max_halo_overhead": {"value": round(geom["halo_overhead"], 6),
+                                       "limit": floors.max_halo_overhead, "ok": halo_ok},
+                "min_contributors": {"value": max_n, "limit": floors.min_contributors, "ok": contrib_ok},
+            },
+        }
 
     candidates = []
     seen = set()
@@ -439,6 +573,7 @@ def _choose_layout_mode_aware(
         "budget_bound_choice": constrained,
         "warnings": tuple(warnings),
         "cells": cells,
+        "layout_source": "auto",
         "floors": {
             "min_patch_area_px": {"value": chosen["geom"]["min_patch_area"],
                                    "limit": floors.min_patch_area_px,
@@ -512,6 +647,7 @@ def _run_single(
     progress_callback,
     science_config,
     zconfig,
+    pinned_layout=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -526,15 +662,16 @@ def _run_single(
     )
 
     # LAYOUT — MODE-AWARE RAM-aware Auto layout (in-memory OR streaming bound),
-    # budgeted from psutil (portable).
+    # budgeted from psutil (portable). Pinnable via ``zegrid_layout``.
     available = available_memory_bytes()
     layout = _choose_layout_mode_aware(
         canvas, descs, ram_budget=available, available_bytes=available,
-        tile_size=STREAM_TILE_SIZE,
+        tile_size=STREAM_TILE_SIZE, pinned_layout=pinned_layout,
     )
     nx, ny = layout["nx"], layout["ny"]
     _emit(
-        f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells) from RAM budget "
+        f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells, "
+        f"source={layout.get('layout_source', 'auto')}) from RAM budget "
         f"{available / 2**30:.2f} GiB; worst-cell cheaper-mode bound "
         f"{layout['predicted_bound_bytes'] / 2**20:.1f} MiB (maxN={layout['max_contributors']})",
         callback=progress_callback,
@@ -550,7 +687,7 @@ def _run_single(
     # FRAME-MAJOR decode+cache.
     _emit(f"ZeGrid: decode+cache (frame-major, O(1 frame) memory)", callback=progress_callback)
     cache_root = output_dir / CACHE_DIR_NAME
-    cache_dirs, manifests = _build_aligned_cache_frame_major(
+    cache_dirs, manifests, cache_report = _build_aligned_cache_frame_major(
         descs, canvas, cell_ctxs, cache_root, progress_callback
     )
 
@@ -570,7 +707,7 @@ def _run_single(
 
         n = len(mem.patch_ids)
         area = patch.patch.width * patch.patch.height
-        mode, bound = _pick_mode(n, area, available_memory_bytes())
+        mode, bound = _pick_mode(n, area, patch.patch_shape_hw, available_memory_bytes())
         _emit(
             f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) N={n} area={area}px "
             f"mode={mode} bound={bound / 2**20:.1f}MiB",
@@ -614,10 +751,19 @@ def _run_single(
     assembled = zmosaic.assemble_canvas(canvas, nx, ny, cores)
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
 
+    # I2 — no covered pixels -> explicit abort (never an all-NaN mosaic).
+    if assembled.coverage_pixels == 0:
+        _emit(
+            "ZeGrid: canvas has NO covered pixels; aborting (would produce an all-NaN mosaic)",
+            lvl="ERROR",
+            callback=progress_callback,
+        )
+        raise RuntimeError("ZeGrid: no covered pixels; cannot assemble a mosaic")
+
     # Write legacy-compatible outputs.
     sci_path, cov_path, manifest_path = _write_outputs(
         assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
-        layout, science_config, peak_rss_kib, progress_callback,
+        layout, science_config, peak_rss_kib, cache_report, progress_callback,
     )
     _emit(
         f"ZeGrid: done — {sci_path.name} ({assembled.science.shape}) + coverage, "
@@ -631,7 +777,7 @@ def _run_single(
 
 def _write_outputs(
     assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
-    layout, science_config, peak_rss_kib, progress_callback,
+    layout, science_config, peak_rss_kib, cache_report, progress_callback,
 ):
     output_dir = Path(output_dir)
     science = np.asarray(assembled.science, dtype=np.float32)  # (H, W, 3)
@@ -666,6 +812,13 @@ def _write_outputs(
                    "available_bytes": layout["available_bytes"],
                    "max_contributors": layout["max_contributors"],
                    "predicted_bound_bytes": layout["predicted_bound_bytes"]},
+        "layout_source": layout.get("layout_source", "auto"),
+        "reproducibility_note": (
+            "output science depends on the layout (per-cell sky_mean normalization "
+            "is computed over the haloed patch); coverage (stack depth) is layout-"
+            "invariant. Pin the layout via the 'zegrid_layout' config key (e.g. "
+            "'6x5') for reproducible output."
+        ),
         "n_frames": len(descs),
         "frame_ids": [d.frame_id.logical_path for d in descs],
         "complete_cells": assembled.complete_cells,
@@ -674,7 +827,9 @@ def _write_outputs(
         "coverage_pixels": assembled.coverage_pixels,
         "cells": cell_records,
         "cache": {"dir": CACHE_DIR_NAME, "total_bytes": cache_total_bytes,
-                  "n_frame_entries": cache_files},
+                  "n_frame_entries": cache_files,
+                  "reused_cells": (cache_report or {}).get("reused", []),
+                  "rebuilt_cells": (cache_report or {}).get("rebuilt", [])},
         "peak_rss_kib": peak_rss_kib,
         "outputs": {
             "science": sci_path.name,
@@ -740,6 +895,22 @@ def run_zegrid_mode(
         callback=progress_callback,
     )
 
+    # PINNABLE layout (reproducibility): read ``zegrid_layout`` from the same
+    # config source as ``grid_engine`` (zconfig is SimpleNamespace(**worker_config_cache)).
+    pinned_layout = None
+    if zconfig is not None:
+        try:
+            pinned_layout = _parse_pinned_layout(getattr(zconfig, "zegrid_layout", None))
+        except ValueError as exc:
+            _emit(f"ZeGrid: {exc}", lvl="ERROR", callback=progress_callback)
+            raise
+        if pinned_layout is not None:
+            _emit(
+                f"ZeGrid: pinned layout {pinned_layout[0]}x{pinned_layout[1]} "
+                f"(zegrid_layout); bypassing RAM-adaptive choice",
+                callback=progress_callback,
+            )
+
     # MOUNT SEGREGATION (same rule as legacy grid_mode ~4643).
     known_mount_frames = [f for f in frames_info if f.mount]
     mount_values = {f.mount for f in known_mount_frames}
@@ -755,14 +926,17 @@ def run_zegrid_mode(
         if eq_frames:
             _run_single(eq_frames, input_folder, base_out / "grid_EQ",
                         progress_callback=progress_callback,
-                        science_config=science_config, zconfig=zconfig)
+                        science_config=science_config, zconfig=zconfig,
+                        pinned_layout=pinned_layout)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
-                        science_config=science_config, zconfig=zconfig)
+                        science_config=science_config, zconfig=zconfig,
+                        pinned_layout=pinned_layout)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
         _run_single(frames_info, input_folder, base_out,
                     progress_callback=progress_callback,
-                    science_config=science_config, zconfig=zconfig)
+                    science_config=science_config, zconfig=zconfig,
+                    pinned_layout=pinned_layout)
