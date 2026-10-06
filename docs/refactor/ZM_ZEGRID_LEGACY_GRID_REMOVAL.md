@@ -41,3 +41,22 @@ This branch is historical reference only and is **not** to be modified.
 
 `stack_plan.csv` → `zemosaic_zegrid_mode.run_zegrid_mode` (R7, verified). The R7
 end-to-end output for a pinned layout is unchanged by this removal.
+
+## R9 follow-up — orphaned `zemosaic_stack_core` also removed
+
+After the Grid removal, `src/zemosaic/zemosaic_stack_core.py` had **zero** importers
+in `src/` and no functional use (it was only reached by the removed Grid GPU path).
+The Classic pipeline has its own stacking helpers (`zemosaic_align_stack.py`:
+`stack_kappa_sigma_clip`, `stack_winsorized_sigma_clip`), so nothing depends on it.
+Tristan confirmed "on peut s'en débarrasser".
+
+- **Deleted** `src/zemosaic/zemosaic_stack_core.py` (dead code).
+- **Removed** the now-dangling `'zemosaic.grid_mode'` and
+  `'zemosaic.zemosaic_stack_core'` entries from `ZeMosaic.spec` hiddenimports
+  (both modules no longer exist; the PyInstaller/Windows build would have failed).
+- `tests/test_stack_core_contracts.py` was deleted; three characterization tests
+  were adapted to drop `stack_core` references while keeping the shipped Classic /
+  SDS / Phase45 / `noise_fwhm` / radial / `robust_rejection` assertions.
+
+The frozen `core/robust_rejection` (PixInsight WSC) is unchanged and still imported
+by `zemosaic_align_stack.py` / `zemosaic_align_stack_gpu.py`.

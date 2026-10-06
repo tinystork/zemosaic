@@ -76,7 +76,6 @@ if str(SRC) not in sys.path:
 
 import zemosaic.zemosaic_worker as zw  # noqa: E402
 from zemosaic import zemosaic_align_stack  # noqa: E402
-from zemosaic import zemosaic_stack_core  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +307,9 @@ def test_route_module_ownership_static():
         assert name in align_names
 
     core_src = (
-        REPO_ROOT / "src" / "zemosaic" / "zemosaic_stack_core.py"
+        REPO_ROOT / "src" / "zemosaic" / "zemosaic_align_stack.py"
     ).read_text(encoding="utf-8")
-    assert "stack_core" in _function_def_names(core_src)
+    assert "stack_aligned_images" in _function_def_names(core_src)
 
     worker_names = _function_def_names(_WORKER_SRC.read_text(encoding="utf-8"))
     for name in (
