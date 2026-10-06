@@ -99,18 +99,22 @@ def _read_section_chw(
 
 
 def slice_wcs(wcs_2d: WCS, bounds: SourceBounds) -> WCS:
-    """Exact CRPIX shift for an undistorted 2-D celestial WCS crop.
+    """Exact SIP-aware crop via ``WCS.slice``.
 
-    ``WCS.slice`` / equivalent exact CRPIX shift for undistorted 2-D TAN. The
-    cropped array's pixel ``(x,y)`` corresponds to source pixel
-    ``(x + bounds.x0, y + bounds.y0)``.
+    ``WCS.slice`` produces the exact cropped WCS for BOTH plain TAN and
+    SIP-distorted WCS (it propagates the SIP coefficients correctly). For a
+    plain TAN WCS the result is IDENTICAL to the previous manual CRPIX shift
+    (verified by the R10 regression test); for a SIP WCS the manual shift was
+    INVALID (it ignored the distortion polynomial's reference frame), so this
+    is the required correction. The cropped array's pixel ``(x,y)`` corresponds
+    to source pixel ``(x + bounds.x0, y + bounds.y0)``.
     """
-    w = wcs_2d.deepcopy()
-    w.wcs.crpix = np.array(
-        [wcs_2d.wcs.crpix[0] - bounds.x0, wcs_2d.wcs.crpix[1] - bounds.y0]
+    sliced = wcs_2d.slice(
+        (slice(bounds.x0, bounds.x1), slice(bounds.y0, bounds.y1)),
+        numpy_order=False,
     )
-    w.array_shape = (bounds.height, bounds.width)
-    return w
+    sliced.array_shape = (bounds.height, bounds.width)
+    return sliced
 
 
 def reproject_cropped(
