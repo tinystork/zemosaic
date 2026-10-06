@@ -1,0 +1,23 @@
+{
+  "legacy_grid": {
+    "factor": 1.0,
+    "overlap": 0.1,
+    "shape_hw": [
+      3275,
+      2410
+    ],
+    "offset_xy": [
+      -669,
+      -670
+    ],
+    "tile_count": 4,
+    "pixel_scale_helper": 1.0
+  },
+  "legacy_header_offset_unapplied": true,
+  "reverse": {
+    "canvas_layout_membership_and_metrics_exact": true
+  },
+  "random_seed_42": {
+    "canvas_layout_membership_and_metrics_exact": true
+  }
+}
