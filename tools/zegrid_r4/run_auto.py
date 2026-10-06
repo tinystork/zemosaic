@@ -85,7 +85,7 @@ def _load_decision(out: Path) -> za.LayoutDecision:
         available_bytes=d["available_bytes"],
         median_footprint_w=d["median_footprint_w"],
         median_footprint_h=d["median_footprint_h"],
-        n_upper=d["n_upper"], refinement_factor=d["refinement_factor"],
+        max_contributors=d["max_contributors"], refinement_factor=d["refinement_factor"],
         predicted_bound_bytes=d["predicted_bound_bytes"],
         predicted_mean_bytes=d["predicted_mean_bytes"],
         max_patch_area=d["max_patch_area"], model=d["model"], floors=d["floors"],

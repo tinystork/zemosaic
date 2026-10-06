@@ -4,27 +4,43 @@ Replaces a FIXED ``Nx x Ny`` with a deterministic, MEASURED, RAM-aware layout
 policy. The layout is chosen from a RAM budget instead of a fixed cell count.
 
 Core idea (Levier 1, from ``ZEGRID_MEMORY_NOTES.md``): the peak RSS of one Cell
-scales as ``~ baseline + coeff * N_cell * patch_area`` (the canonical engine
+scales with the patch size and the contributor count (the canonical engine
 materialises ``O(N * H * W * C)`` aligned arrays + float64 taper + rejection/
 normalization intermediates). Reducing the Cell size reduces the PEAK, while the
 TOTAL work is roughly invariant modulo halo overhead. This is a *memory* lever,
 not a *compute* lever.
 
-The memory model is **derived from measured data** (the ZM-ZEGRID-R3 M106
-per-cell records), never invented:
+Memory model (DERIVED from measured data, never invented)::
 
-    peak_rss_kib ~ baseline + coeff * (N_patch * patch_area)
+    peak_rss = baseline
+             + area_coeff  * patch_area          (per-patch fixed cost, N-independent)
+             + frame_coeff * N * patch_area      (per (frame x pixel) materialisation)
 
-* ``baseline``      — intercept (process + Python/NumPy/Astropy/SciPy footprint).
-* ``coeff``         — bytes per (frame x pixel) of patch area materialised.
+* ``baseline``     — process + Python/NumPy/Astropy/SciPy footprint.
+* ``area_coeff``   — bytes per patch pixel (N-independent: reprojection target,
+  output planes, WCS machinery, etc.).
+* ``frame_coeff``  — bytes per (frame x pixel) of the materialised aligned arrays.
 
-``FITTED_MEMORY_MODEL`` holds the OLS fit on the 20 M106 R3 cells plus a
-conservative *safety margin* (relative) derived from the residual distribution.
-The conservative bound is what ``choose_layout`` enforces against the budget.
+The single-slope ``baseline + coeff * N * area`` model fit at ~410k-px patch scale
+OVER-predicts small patches (its intercept dominates at ~51k px), which makes Auto
+over-refine. The two-term model above is fit on the COMBINED calibration set
+(the 20 R3 M106 cells at ~410k px + the 166 tight-run complete cells at ~51k px),
+is physically sensible (positive, ~347 MiB process baseline), and stays
+conservative at BOTH scales with a 15% safety margin (max positive relative
+residual 11.3% on both sets). ``fit_memory_model`` re-derives it from raw records.
+
+``FITTED_MEMORY_MODEL`` holds the frozen fit + the conservative safety margin.
 
 Determinism: same canvas + frames + budget + floors -> same layout. The search
 is a fixed, sorted refinement sequence over ``target = median_projected_footprint
 / factor``; no randomness, no filesystem-order dependence.
+
+Budget search uses the CANDIDATE'S EXACT contributor counts (not ``len(frames)``):
+for each candidate (nx, ny) the actual per-cell contributor counts are computed
+from geometry/membership and the true worst cell (max of
+``predict_bound(N_cell, patch_area_cell)``) bounds the peak. This avoids the old
+``n_upper = len(frames)`` over-estimate (the true max N varies 61..66 across
+candidates) and pairs each N with its real patch area.
 
 Scientific floors (NEVER silently degrade science):
 * ``min_patch_area_px``   — a Cell's patch must be large enough for meaningful
@@ -36,6 +52,17 @@ Scientific floors (NEVER silently degrade science):
 If the budget cannot be met while honouring the floors, ``choose_layout`` raises
 ``LayoutInfeasible`` with an explicit reason (never silently picks a degraded
 layout).
+
+KNOWN LIMITATION (uniform partition): ``choose_layout`` selects a uniform
+``Nx x Ny`` grid over the whole canvas. For a mosaic whose geometric sky union
+covers only a fraction of the canvas (M106 ~84.65%), the outermost cells of a
+fine uniform grid can fall entirely OUTSIDE the union and become genuinely EMPTY
+(0 contributors). These are reported EXPLICITLY by the executor/assembly (status
+``empty``, ``coverage==0`` holes, and ``ownership.exact_one_owner`` is False only
+over those data-less cells) — they are never silently filled. This is a known
+limitation of the uniform partition model, NOT a memory-model defect; a
+non-uniform / footprint-aware partition is deferred (do not change the partition
+model here).
 """
 
 from __future__ import annotations
@@ -53,43 +80,56 @@ from . import sweep as zsw
 # Memory model — DERIVED (measured), not invented.
 # ---------------------------------------------------------------------------
 
-# OLS fit on the 20 ZM-ZEGRID-R3 M106 per-cell records (cell_*.json):
-#   peak_rss_kib = baseline + coeff * (n_patch_contributors * patch_area)
-#   baseline = 867997.2 KiB  (intercept)
-#   coeff    =    0.130753 KiB per (frame x pixel)  =>  133.891 bytes
-#   R^2      =    0.8989
-#   residual std = 297,989 KiB ; max |rel residual| = 22.35% (low side, safe);
-#   max POSITIVE rel residual (dangerous side) = 13.71% (r0002c0003).
-FITTED_BASELINE_KIB = 867997.2
-FITTED_COEFF_KIB_PER_N_PX = 0.130753
-FITTED_R2 = 0.8989
-FITTED_RESIDUAL_STD_KIB = 297989.0
-FITTED_MAX_POS_RESID_FRAC = 0.1371
+# Two-term model fit by OLS on the COMBINED calibration set:
+#   * the 20 ZM-ZEGRID-R3 M106 per-cell records (cell_*.json, ~410k-px patches), and
+#   * the 166 complete cells of the ZM-ZEGRID-R4 tight run (~51k-px patches).
+#   peak_rss_kib = baseline + area_coeff * patch_area + frame_coeff * N * patch_area
+#
+#   baseline    = 355,080.24 KiB  (346.76 MiB process baseline)
+#   area_coeff  =   1.039765 KiB/px  =>  1064.72 bytes/px  (N-independent)
+#   frame_coeff =   0.136787 KiB/(N*px) => 140.07 bytes/(frame*px)
+#   R^2 = 0.9799 ; residual std = 107,002 KiB (~104 MiB)
+#   max POSITIVE relative residual (dangerous: measured > predicted) = +11.34%
+#   max |relative residual| = 24.61% (safe side)
+# The 15% safety margin covers +11.34% with headroom.
+FITTED_BASELINE_KIB = 355080.2365954309
+FITTED_AREA_COEFF_KIB_PER_PX = 1.0397652126
+FITTED_FRAME_COEFF_KIB_PER_N_PX = 0.1367872099
+FITTED_R2 = 0.97994525
+FITTED_RESIDUAL_STD_KIB = 107001.5604
+FITTED_MAX_POS_RESID_FRAC = 0.11341365
+FITTED_MAX_ABS_RESID_FRAC = 0.24607071
 
 # Conservative safety margin (relative) on the mean prediction. Justified by the
-# residual distribution: the largest positive (dangerous) relative residual on
-# the R3 M106 data is +13.71%; mean+2*sigma of the relative residuals is ~15%.
-# 15% therefore covers the observed worst case with headroom for run-to-run
-# allocator variance.
+# residual distribution of the COMBINED calibration set: the largest positive
+# (dangerous) relative residual is +11.34%; 15% covers it with headroom for
+# run-to-run allocator variance. (The R3-only single-slope fit had +12.55% max
+# positive; the combined two-term fit is better calibrated and 15% still covers.)
 DEFAULT_SAFETY_MARGIN_FRAC = 0.15
 
 
 @dataclass(frozen=True)
 class MemoryModel:
-    """A linear peak-RSS model: ``peak = baseline + coeff * N * patch_area``.
+    """Peak-RSS model: ``peak = baseline + area_coeff*area + frame_coeff*N*area``.
 
-    ``coeff_bytes_per_n_px`` is bytes per (frame x pixel). ``safety_margin_frac``
-    is a relative margin applied to the mean prediction to form the conservative
-    bound used for budget enforcement.
+    ``area_coeff_bytes_per_px`` is the N-independent per-patch-pixel fixed cost;
+    ``frame_coeff_bytes_per_n_px`` is the per-(frame x pixel) materialisation cost.
+    ``safety_margin_frac`` is a relative margin on the mean prediction forming the
+    conservative bound used for budget enforcement.
     """
 
     baseline_bytes: float
-    coeff_bytes_per_n_px: float
+    area_coeff_bytes_per_px: float
+    frame_coeff_bytes_per_n_px: float
     safety_margin_frac: float = DEFAULT_SAFETY_MARGIN_FRAC
 
     def predict_peak_bytes(self, n_contributors: int, patch_area_px: int) -> float:
         """Mean predicted peak RSS in bytes."""
-        return self.baseline_bytes + self.coeff_bytes_per_n_px * n_contributors * patch_area_px
+        return (
+            self.baseline_bytes
+            + self.area_coeff_bytes_per_px * patch_area_px
+            + self.frame_coeff_bytes_per_n_px * n_contributors * patch_area_px
+        )
 
     def predict_bound_bytes(self, n_contributors: int, patch_area_px: int) -> float:
         """Conservative upper bound on peak RSS (mean x (1 + margin))."""
@@ -99,79 +139,105 @@ class MemoryModel:
         return {
             "baseline_bytes": self.baseline_bytes,
             "baseline_kib": self.baseline_bytes / 1024.0,
-            "coeff_bytes_per_n_px": self.coeff_bytes_per_n_px,
-            "coeff_kib_per_n_px": self.coeff_bytes_per_n_px / 1024.0,
+            "area_coeff_bytes_per_px": self.area_coeff_bytes_per_px,
+            "area_coeff_kib_per_px": self.area_coeff_bytes_per_px / 1024.0,
+            "frame_coeff_bytes_per_n_px": self.frame_coeff_bytes_per_n_px,
+            "frame_coeff_kib_per_n_px": self.frame_coeff_bytes_per_n_px / 1024.0,
             "safety_margin_frac": self.safety_margin_frac,
         }
 
 
-# The frozen fitted model (DERIVED from ZM-ZEGRID-R3 M106 measurements).
+# The frozen fitted model (DERIVED from the combined R3 + tight calibration set).
 FITTED_MEMORY_MODEL = MemoryModel(
     baseline_bytes=FITTED_BASELINE_KIB * 1024.0,
-    coeff_bytes_per_n_px=FITTED_COEFF_KIB_PER_N_PX * 1024.0,
+    area_coeff_bytes_per_px=FITTED_AREA_COEFF_KIB_PER_PX * 1024.0,
+    frame_coeff_bytes_per_n_px=FITTED_FRAME_COEFF_KIB_PER_N_PX * 1024.0,
     safety_margin_frac=DEFAULT_SAFETY_MARGIN_FRAC,
 )
 
 FITTED_MEMORY_MODEL_META = {
-    "source": "ZM-ZEGRID-R3 M106 full-layout executor per-cell records (cell_*.json)",
-    "data_path": "/home/tristan/zegrid_r3_m106_outputs",
-    "n_cells": 20,
+    "source": (
+        "combined calibration set: ZM-ZEGRID-R3 M106 per-cell records (20 cells, "
+        "~410k-px patches) + ZM-ZEGRID-R4 tight-run complete cells (166 cells, "
+        "~51k-px patches)"
+    ),
+    "data_paths": [
+        "/home/tristan/zegrid_r3_m106_outputs",
+        "/home/tristan/zegrid_r4_m106_tight",
+    ],
+    "n_cells": 186,
     "canvas": "2403x3278",
     "halo_px": 8,
-    "fit_method": "ordinary least squares on peak_rss_kib vs n_patch_contributors*patch_area",
+    "fit_method": "ordinary least squares on peak_rss_kib vs [patch_area, n_patch_contributors*patch_area]",
     "baseline_kib": FITTED_BASELINE_KIB,
-    "coeff_kib_per_n_px": FITTED_COEFF_KIB_PER_N_PX,
+    "area_coeff_kib_per_px": FITTED_AREA_COEFF_KIB_PER_PX,
+    "frame_coeff_kib_per_n_px": FITTED_FRAME_COEFF_KIB_PER_N_PX,
     "r2": FITTED_R2,
     "residual_std_kib": FITTED_RESIDUAL_STD_KIB,
     "max_positive_residual_frac": FITTED_MAX_POS_RESID_FRAC,
+    "max_abs_residual_frac": FITTED_MAX_ABS_RESID_FRAC,
     "safety_margin_frac": DEFAULT_SAFETY_MARGIN_FRAC,
     "note": (
-        "coeff (~133.9 bytes/frame/pixel) is the empirical slope including ALL "
-        "materialised planes (aligned float32 RGB images + float64 taper + "
-        "normalization/rejection intermediates); it is not a single-plane "
-        "coefficient. The MEMORY_NOTES rough estimate of 13-20 bytes/frame/pixel "
-        "under-estimates the full canonical materialisation and is superseded by "
-        "this measured value."
+        "Two-term model (baseline + area_coeff*patch_area + frame_coeff*N*patch_area) "
+        "fit on the COMBINED large+small patch calibration set. This corrects the "
+        "single-slope model's over-prediction at small patches (its ~848 MiB intercept "
+        "dominated at ~51k px), while staying conservative at both scales. "
+        "area_coeff ~1065 B/px is the N-independent per-patch fixed cost; "
+        "frame_coeff ~140 B/(frame*px) is the per-frame-per-pixel materialisation. "
+        "The MEMORY_NOTES rough 13-20 bytes/frame/pixel under-counts the full "
+        "canonical materialisation and is superseded by this measured value."
     ),
 }
 
 
 def fit_memory_model(records: Sequence[dict]) -> tuple[MemoryModel, dict]:
-    """Fit ``peak_rss_kib = baseline + coeff * (N * patch_area)`` from records.
+    """Fit the two-term peak-RSS model from per-cell records.
 
     Each record is a dict with ``n_patch_contributors`` (int), ``patch`` (list
-    ``[x0, y0, x1, y1]``) and ``peak_rss_kib`` (int). Returns the fitted
-    :class:`MemoryModel` (with default margin) and a stats dict (R^2, residual
-    std, max positive relative residual) for reporting/validation.
+    ``[x0, y0, x1, y1]``) and ``peak_rss_kib`` (int). Fits::
+
+        peak_rss_kib = baseline + area_coeff * patch_area + frame_coeff * N * patch_area
+
+    Returns the fitted :class:`MemoryModel` (with default margin) and a stats dict
+    (R^2, residual std, max positive/abs relative residual) for reporting and
+    validation. Deriving the residual stats here (rather than hard-coding them)
+    keeps the frozen constants honest and prevents them going stale.
     """
-    xs = []
+    areas = []
+    n_areas = []
     ys = []
     for r in records:
         p = r["patch"]
         area = (p[2] - p[0]) * (p[3] - p[1])
-        xs.append(r["n_patch_contributors"] * area)
+        areas.append(area)
+        n_areas.append(r["n_patch_contributors"] * area)
         ys.append(r["peak_rss_kib"])
-    X = np.array(xs, dtype=float)
+    X = np.column_stack([np.ones(len(ys)), np.array(areas, dtype=float), np.array(n_areas, dtype=float)])
     y = np.array(ys, dtype=float)
-    A = np.column_stack([np.ones(len(X)), X])
-    coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-    baseline_kib, coeff_kib = float(coef[0]), float(coef[1])
-    pred = A @ coef
+    coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    baseline_kib = float(coef[0])
+    area_coeff_kib = float(coef[1])
+    frame_coeff_kib = float(coef[2])
+    pred = X @ coef
     resid = y - pred
     r2 = 1.0 - float(np.sum(resid ** 2) / np.sum((y - y.mean()) ** 2))
     resid_std = float(resid.std())
     rel = resid / pred
     max_pos_rel = float(rel.max()) if len(rel) else 0.0
+    max_abs_rel = float(np.abs(rel).max()) if len(rel) else 0.0
     model = MemoryModel(
         baseline_bytes=baseline_kib * 1024.0,
-        coeff_bytes_per_n_px=coeff_kib * 1024.0,
+        area_coeff_bytes_per_px=area_coeff_kib * 1024.0,
+        frame_coeff_bytes_per_n_px=frame_coeff_kib * 1024.0,
     )
     stats = {
         "baseline_kib": baseline_kib,
-        "coeff_kib_per_n_px": coeff_kib,
+        "area_coeff_kib_per_px": area_coeff_kib,
+        "frame_coeff_kib_per_n_px": frame_coeff_kib,
         "r2": r2,
         "residual_std_kib": resid_std,
         "max_positive_residual_frac": max_pos_rel,
+        "max_abs_residual_frac": max_abs_rel,
         "n_cells": len(records),
     }
     return model, stats
@@ -255,9 +321,10 @@ def median_projected_footprint(
 def _nominal_geometry(canvas: zg.GlobalCanvas, nx: int, ny: int, halo_px: int) -> dict:
     """Nominal Cell geometry for a layout (integer math only, deterministic).
 
-    The worst-case (peak) Cell is an INTERIOR Cell with the largest core
-    (``ceil(W/nx) x ceil(H/ny)``) and full halo. The floor check uses the
-    smallest core (``floor(W/nx) x floor(H/ny)``) so it is conservative.
+    Floor checks use the smallest core (``floor(W/nx) x floor(H/ny)``) so they are
+    conservative; the nominal worst patch area is ``ceil(W/nx) x ceil(H/ny)`` plus
+    full halo (used only for floors, NOT for the peak bound — the peak bound uses
+    exact per-cell geometry).
     """
     W, H = canvas.width, canvas.height
     max_cw = -(-W // nx)          # ceil(W/nx)
@@ -295,7 +362,7 @@ def _footprints(frames: Sequence[zg.FrameDescriptor], canvas: zg.GlobalCanvas):
 
 
 def _cell_contributor_count(footprints, canvas, bounds: zg.GlobalBounds) -> int:
-    """Number of frames whose projected footprint intersects a cell's core."""
+    """Number of frames whose projected footprint intersects a cell's patch rect."""
     rect = zg._rect(bounds)
     n = 0
     for _f, poly in footprints:
@@ -332,11 +399,11 @@ class LayoutDecision:
     available_bytes: int
     median_footprint_w: float
     median_footprint_h: float
-    n_upper: int
+    max_contributors: int           # true max N over cells (exact membership)
     refinement_factor: float
-    predicted_bound_bytes: float    # conservative bound on the worst cell
-    predicted_mean_bytes: float     # mean prediction on the worst cell
-    max_patch_area: int
+    predicted_bound_bytes: float    # conservative bound on the worst cell (exact)
+    predicted_mean_bytes: float     # mean prediction on the worst cell (exact)
+    max_patch_area: int             # exact worst-cell patch area
     model: dict
     floors: dict
     budget_bound_choice: bool
@@ -352,7 +419,7 @@ class LayoutDecision:
             "available_bytes": self.available_bytes,
             "median_footprint_w": self.median_footprint_w,
             "median_footprint_h": self.median_footprint_h,
-            "n_upper": self.n_upper,
+            "max_contributors": self.max_contributors,
             "refinement_factor": self.refinement_factor,
             "predicted_bound_bytes": self.predicted_bound_bytes,
             "predicted_mean_bytes": self.predicted_mean_bytes,
@@ -365,9 +432,44 @@ class LayoutDecision:
         }
 
 
+def _scan_layout(
+    canvas: zg.GlobalCanvas,
+    footprints,
+    nx: int,
+    ny: int,
+    halo_px: int,
+    model: MemoryModel,
+) -> tuple[float, float, int, int]:
+    """Exact worst-cell peak for a candidate layout.
+
+    Iterates every Cell, computes its exact patch contributor count (geometry
+    membership) and exact patch area, and returns
+    ``(worst_bound_bytes, worst_mean_bytes, worst_n, worst_patch_area)`` for the
+    cell that maximises ``predict_bound_bytes``. Deterministic (row-major).
+    """
+    layout = zg.build_layout(canvas, nx, ny)
+    worst_bound = -1.0
+    worst_mean = -1.0
+    worst_n = 0
+    worst_area = 0
+    for row, col, bounds in layout.iter_cells(canvas):
+        cid = zg.cell_id(row, col)
+        cell = zg.ZeGridCell(cid, canvas.canvas_id, layout.layout_id, row, col, bounds)
+        patch = zg.build_patch(canvas, cell, halo_px)
+        n = _cell_contributor_count(footprints, canvas, patch.patch)
+        area = patch.patch.width * patch.patch.height
+        bound = model.predict_bound_bytes(n, area)
+        if bound > worst_bound:
+            worst_bound = bound
+            worst_mean = model.predict_peak_bytes(n, area)
+            worst_n = n
+            worst_area = area
+    return worst_bound, worst_mean, worst_n, worst_area
+
+
 def _predict_cells(
     canvas: zg.GlobalCanvas,
-    frames: Sequence[zg.FrameDescriptor],
+    footprints,
     nx: int,
     ny: int,
     halo_px: int,
@@ -375,7 +477,6 @@ def _predict_cells(
 ) -> tuple[tuple[LayoutCellPrediction, ...], int]:
     """Exact per-cell predictions (geometry membership + patch area)."""
     layout = zg.build_layout(canvas, nx, ny)
-    footprints = _footprints(frames, canvas)
     out = []
     max_n = 0
     for row, col, bounds in layout.iter_cells(canvas):
@@ -408,127 +509,138 @@ def choose_layout(
     * ``ram_budget`` — peak-RSS budget in BYTES (``None`` = no budget -> coarsest
       sensible layout, cell ~= median projected footprint).
     * ``floors`` — scientific floors (defaults if ``None``).
-    * ``model`` — memory model (defaults to the fitted R3 model).
+    * ``model`` — memory model (defaults to the fitted R3+tight model).
 
     The chosen layout is the COARSEST (fewest Cells) whose conservative peak
-    bound fits ``ram_budget`` while honouring the floors. A tighter budget forces
-    a finer (smaller-Cell) layout — monotonic. Raises :class:`LayoutInfeasible`
+    bound (computed from the candidate's EXACT contributor counts and patch areas)
+    fits ``ram_budget`` while honouring the floors. A tighter budget forces a
+    finer (smaller-Cell) layout — monotonic. Raises :class:`LayoutInfeasible`
     if no layout honours both the budget and the floors (never silent).
     """
     floors = floors or ScientificFloors()
     model = model or FITTED_MEMORY_MODEL
     available = zsw.read_available_memory()
-    n_upper = len(frames)
 
     mw, mh = median_projected_footprint(frames, canvas)
     if not (mw > 0 and mh > 0):
         raise LayoutInfeasible("median projected footprint is degenerate")
 
-    best_candidate = None
-    best_geometry = None
+    footprints = _footprints(frames, canvas)
+
+    # Enumerate candidate layouts (coarse -> fine), deduping (nx, ny), computing
+    # the EXACT worst-cell bound from geometry/membership for each. The floors are
+    # MONOTONIC in refinement: as (nx, ny) grow, min_patch_area shrinks and
+    # halo_overhead grows, so once either floor is violated, every finer candidate
+    # also violates it -> stop early (never scan the huge fine layouts).
+    candidates = []
+    seen: set[tuple[int, int]] = set()
     for factor in REFINEMENT_FACTORS:
-        target_w = mw / factor
-        target_h = mh / factor
-        nx = max(1, int(math.ceil(canvas.width / target_w)))
-        ny = max(1, int(math.ceil(canvas.height / target_h)))
+        nx = max(1, int(math.ceil(canvas.width / (mw / factor))))
+        ny = max(1, int(math.ceil(canvas.height / (mh / factor))))
         nx = min(nx, canvas.width)
         ny = min(ny, canvas.height)
+        if (nx, ny) in seen:
+            continue
+        seen.add((nx, ny))
+
         geom = _nominal_geometry(canvas, nx, ny, halo_px)
-
-        bound = model.predict_bound_bytes(n_upper, geom["max_patch_area"])
-        mean = model.predict_peak_bytes(n_upper, geom["max_patch_area"])
-
-        memory_ok = (ram_budget is None) or (bound <= ram_budget)
         patch_ok = geom["min_patch_area"] >= floors.min_patch_area_px
         halo_ok = geom["halo_overhead"] <= floors.max_halo_overhead
+        if not (patch_ok and halo_ok):
+            # Floors are monotonic in refinement: finer candidates also fail.
+            break
 
-        floors_report = {
-            "min_patch_area_px": {
-                "value": geom["min_patch_area"], "limit": floors.min_patch_area_px, "ok": patch_ok,
-            },
-            "max_halo_overhead": {
-                "value": round(geom["halo_overhead"], 6), "limit": floors.max_halo_overhead, "ok": halo_ok,
-            },
-            "min_contributors": {"value": None, "limit": floors.min_contributors, "ok": True},
-        }
+        worst_bound, worst_mean, worst_n, worst_area = _scan_layout(
+            canvas, footprints, nx, ny, halo_px, model
+        )
+        memory_ok = (ram_budget is None) or (worst_bound <= ram_budget)
+        candidates.append({
+            "factor": factor, "nx": nx, "ny": ny,
+            "bound": worst_bound, "mean": worst_mean,
+            "worst_n": worst_n, "worst_area": worst_area,
+            "memory_ok": memory_ok, "patch_ok": patch_ok, "halo_ok": halo_ok,
+            "geom": geom,
+        })
 
-        if memory_ok and patch_ok and halo_ok:
-            best_candidate = dict(
-                nx=nx, ny=ny, factor=factor, bound=bound, mean=mean,
-                max_patch_area=geom["max_patch_area"], floors=floors_report,
-            )
-            best_geometry = geom
-            break  # coarsest feasible found
+    # Pick the coarsest feasible candidate.
+    chosen = None
+    chosen_index = None
+    for i, cand in enumerate(candidates):
+        if cand["memory_ok"]:
+            chosen = cand
+            chosen_index = i
+            break
 
-    if best_candidate is None:
+    if chosen is None:
         # Diagnose WHY nothing was feasible (explicit, never silent).
-        finest = _nominal_geometry(canvas, canvas.width, canvas.height, halo_px)
-        bound = model.predict_bound_bytes(n_upper, finest["max_patch_area"])
+        finest = candidates[-1] if candidates else None
         reasons = []
-        if ram_budget is not None and bound > ram_budget:
+        if ram_budget is not None and finest is not None and finest["bound"] > ram_budget:
             reasons.append(
-                f"even the finest layout (1px cells) peak bound "
-                f"{bound / 2**20:.1f} MiB exceeds budget {ram_budget / 2**20:.1f} MiB"
+                f"even the finest floor-feasible layout ({finest['nx']}x{finest['ny']}) peak bound "
+                f"{finest['bound'] / 2**20:.1f} MiB exceeds budget {ram_budget / 2**20:.1f} MiB"
             )
-        if finest["min_patch_area"] < floors.min_patch_area_px:
-            reasons.append(
-                f"min_patch_area floor ({floors.min_patch_area_px} px) cannot be "
-                f"satisfied with any budget below the finest feasible cells "
-                f"(finest nominal patch area {finest['min_patch_area']} px)"
-            )
+        reasons.append(
+            f"min_patch_area floor ({floors.min_patch_area_px} px) / "
+            f"max_halo_overhead floor ({floors.max_halo_overhead}) cannot be satisfied "
+            f"together with the budget (search stopped at the floor boundary)"
+        )
         raise LayoutInfeasible(
             "RAM budget cannot satisfy scientific floors: " + "; ".join(reasons),
-            floors_report={"finest": finest},
+            floors_report={
+                "finest": {
+                    k: finest["geom"][k] for k in ("nx", "ny", "min_patch_area")
+                } if finest else {}
+            },
         )
 
     # Post-selection: exact per-cell predictions + min_contributors floor check.
-    cells, max_n = _predict_cells(canvas, frames, best_candidate["nx"], best_candidate["ny"],
-                                  halo_px, model)
+    cells, max_n = _predict_cells(canvas, footprints, chosen["nx"], chosen["ny"], halo_px, model)
     warnings: list[str] = []
     contrib_ok = max_n >= floors.min_contributors
-    best_candidate["floors"]["min_contributors"] = {
-        "value": max_n, "limit": floors.min_contributors, "ok": contrib_ok,
-    }
     if not contrib_ok:
         warnings.append(
             f"deepest cell has {max_n} contributors < min_contributors "
             f"({floors.min_contributors}); the layout may be scientifically degraded"
         )
 
-    budget_bound_choice = (ram_budget is not None) and (
-        model.predict_bound_bytes(n_upper, best_candidate["max_patch_area"]) <= ram_budget
-    )
-    # Whether the budget actually constrained the choice (a coarser layout would not fit).
+    floors_report = {
+        "min_patch_area_px": {
+            "value": chosen["geom"]["min_patch_area"], "limit": floors.min_patch_area_px,
+            "ok": chosen["patch_ok"],
+        },
+        "max_halo_overhead": {
+            "value": round(chosen["geom"]["halo_overhead"], 6), "limit": floors.max_halo_overhead,
+            "ok": chosen["halo_ok"],
+        },
+        "min_contributors": {"value": max_n, "limit": floors.min_contributors, "ok": contrib_ok},
+    }
+
+    # budget_bound_choice: True if the budget actually constrained the choice
+    # (i.e. a coarser candidate was rejected specifically because its memory
+    # bound exceeded the budget).
     constrained = False
-    if ram_budget is not None:
-        # Check the next-coarser factor would exceed budget (or floors block coarser).
-        idx = REFINEMENT_FACTORS.index(best_candidate["factor"])
-        if idx > 0:
-            coarser_factor = REFINEMENT_FACTORS[idx - 1]
-            tw, th = mw / coarser_factor, mh / coarser_factor
-            cnx = max(1, min(canvas.width, int(math.ceil(canvas.width / tw))))
-            cny = max(1, min(canvas.height, int(math.ceil(canvas.height / th))))
-            cg = _nominal_geometry(canvas, cnx, cny, halo_px)
-            cbound = model.predict_bound_bytes(n_upper, cg["max_patch_area"])
-            constrained = cbound > ram_budget
-        else:
-            constrained = False
+    if ram_budget is not None and chosen_index is not None:
+        for cand in candidates[:chosen_index]:
+            if not cand["memory_ok"]:
+                constrained = True
+                break
 
     return LayoutDecision(
-        nx=best_candidate["nx"],
-        ny=best_candidate["ny"],
+        nx=chosen["nx"],
+        ny=chosen["ny"],
         status="ok",
         ram_budget_bytes=ram_budget,
         available_bytes=available,
         median_footprint_w=mw,
         median_footprint_h=mh,
-        n_upper=n_upper,
-        refinement_factor=best_candidate["factor"],
-        predicted_bound_bytes=best_candidate["bound"],
-        predicted_mean_bytes=best_candidate["mean"],
-        max_patch_area=best_candidate["max_patch_area"],
+        max_contributors=max_n,
+        refinement_factor=chosen["factor"],
+        predicted_bound_bytes=chosen["bound"],
+        predicted_mean_bytes=chosen["mean"],
+        max_patch_area=chosen["worst_area"],
         model={"fitted": FITTED_MEMORY_MODEL_META, "model": model.to_dict()},
-        floors=best_candidate["floors"],
+        floors=floors_report,
         budget_bound_choice=constrained,
         warnings=tuple(warnings),
         cells=cells,
