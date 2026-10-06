@@ -12,8 +12,9 @@ Conventions (frozen, must not drift):
 * NumPy arrays are ``(H, W) = (y, x)``; slicing is ``arr[y0:y1, x0:x1]``.
 * Polygon pixel edges are ``x0-0.5`` etc. (zero-origin pixel *centres* are
   ``x+0.5``), i.e. the same pixel-edge convention as the R0 simulator.
-* Qualified WCS only: undistorted 2-D celestial RA/DEC TAN, no SIP/PV/CPDIS/
-  DET2IM, no HWC/CHW channel-axis ambiguity.
+* Qualified WCS only: 2-D celestial RA/DEC TAN — either plain (undistorted) or
+  SIP-distorted (``RA---TAN-SIP`` / ``DEC--TAN-SIP``). PV / CPDIS / DET2IM and
+  non-TAN projections are still rejected. No HWC/CHW channel-axis ambiguity.
 """
 
 from __future__ import annotations
@@ -46,6 +47,16 @@ INTERSECTION_AREA_EPS = 1e-8
 
 # Hemisphere roundtrip tolerance (deg) used to reject opposite-TAN projections.
 ROUNDTRIP_TOL_DEG = 1e-7
+
+# SIP footprint sampling policy (ZM-ZEGRID-R10). With SIP distortion the source
+# edges project to CURVED edges, so a 4-corner polygon under-bounds the true
+# footprint. We sample each source edge at a fixed deterministic step, project
+# every sample, take the convex hull, and add a small conservative pixel margin.
+# The margin is expressed in target (canvas) pixels and is far above the
+# measured SIP magnitude on the Caldwell 11 corpus (max ~0.5 px; see the R10
+# cross-consistency measurement).
+SIP_FOOTPRINT_EDGE_STEP_PX = 128   # source-pixel step along each edge
+SIP_FOOTPRINT_MARGIN_PX = 1.0      # conservative target-pixel margin
 
 
 # ---------------------------------------------------------------------------
@@ -139,21 +150,64 @@ class FrameId:
 # WCS qualification
 # ---------------------------------------------------------------------------
 
-def qualify_wcs(w: WCS) -> str | None:
-    """Return ``None`` if ``w`` is a qualified undistorted 2-D celestial TAN WCS.
+def _has_sip(w: WCS) -> bool:
+    """Return True when the WCS carries SIP distortion coefficients."""
+    return w.sip is not None
 
-    Otherwise return an explicit human-readable rejection reason. Rejects SIP /
-    PV / lookup (CPDIS / DET2IM) distortion, non-2-D, non-celestial, and non-TAN
-    projections. This is a *gate*, not a silent strip.
+
+def _sip_base_ctype(ct: str) -> str | None:
+    """Return the base projection for a SIP ctype, or None if not a '-SIP' ctype."""
+    return ct[:-4] if ct.endswith("-SIP") else None
+
+
+def strip_sip(w: WCS) -> WCS:
+    """Return a distortion-free copy of a SIP WCS (legacy-style strip).
+
+    Removes the SIP coefficients and the ``-SIP`` CTYPE suffix, yielding the
+    underlying plain TAN (linear) WCS. Used by the CONFIGURABLE fallback for
+    SIP-vs-TAN consistency. Non-SIP WCS are returned unchanged.
+    """
+    out = w.deepcopy()
+    if not _has_sip(out):
+        return out
+    out.sip = None
+    ctype = list(out.wcs.ctype)
+    out.wcs.ctype = [c[:-4] if c.endswith("-SIP") else c for c in ctype]
+    return out
+
+
+def qualify_wcs(w: WCS) -> str | None:
+    """Return ``None`` if ``w`` is a qualified 2-D celestial TAN WCS.
+
+    Accepts BOTH plain (undistorted) TAN and SIP-distorted TAN
+    (``RA---TAN-SIP`` / ``DEC--TAN-SIP``) — and only those. Everything else is
+    rejected with an explicit human-readable reason: PV / lookup (CPDIS/DET2IM)
+    distortion, non-2-D, non-celestial, and non-TAN projections. This is a
+    *gate*, not a silent strip.
     """
     try:
         if w.pixel_n_dim != 2:
             return f"pixel_n_dim={w.pixel_n_dim} (expected 2-D)"
         if not w.has_celestial:
             return "WCS has no celestial component"
-        if w.has_distortion:
-            return "WCS has distortion terms (SIP/PV/CPDIS/DET2IM); undistorted TAN required"
         ctype = tuple(w.wcs.ctype)
+        if _has_sip(w):
+            # SIP-distorted celestial TAN — accepted only on a pure TAN base,
+            # with no additional PV / lookup distortion on top of the SIP terms.
+            base = tuple(_sip_base_ctype(c) for c in ctype)
+            if any(b is None for b in base):
+                return f"ctype={ctype!r} (SIP coefficients present without '-SIP' suffix; ambiguous)"
+            if base != ("RA---TAN", "DEC--TAN"):
+                return f"ctype={ctype!r} (SIP requires a TAN base; expected RA---TAN-SIP/DEC--TAN-SIP)"
+            if w.wcs.get_pv():
+                return "WCS has PV terms in addition to SIP; unsupported"
+            for attr in ("cpdis1", "cpdis2", "det2im1", "det2im2"):
+                if getattr(w, attr, None) is not None:
+                    return f"WCS has lookup distortion ({attr}) in addition to SIP; unsupported"
+            return None
+        # Non-SIP path (unchanged frozen semantics): undistorted TAN only.
+        if w.has_distortion:
+            return "WCS has distortion terms (PV/CPDIS/DET2IM); undistorted TAN required"
         if ctype != ("RA---TAN", "DEC--TAN"):
             return f"ctype={ctype!r} (expected ('RA---TAN', 'DEC--TAN'))"
         if w.wcs.get_pv():
@@ -304,6 +358,34 @@ def _boundary(shape_hw: tuple[int, int]) -> np.ndarray:
     return np.array([[-0.5, -0.5], [w - 0.5, -0.5], [w - 0.5, h - 0.5], [-0.5, h - 0.5]])
 
 
+def _boundary_samples(shape_hw: tuple[int, int], step: int) -> np.ndarray:
+    """Return corner + per-edge sample points (source pixel edges) at fixed step.
+
+    Walks the four pixel-edge segments (bottom, right, top, left) in a closed
+    loop, sampling at a deterministic ``step`` so every curved SIP edge is
+    resolved. The corners are included exactly once each.
+    """
+    h, w = shape_hw
+    step = max(1, int(step))
+    pts: list[tuple[float, float]] = []
+    # bottom edge y = -0.5, x from -0.5 .. w-0.5
+    for x in np.arange(-0.5, w - 0.5 + 1e-9, step):
+        pts.append((float(x), -0.5))
+    # right edge x = w-0.5, y from -0.5 .. h-0.5
+    for y in np.arange(-0.5, h - 0.5 + 1e-9, step):
+        pts.append((w - 0.5, float(y)))
+    # top edge y = h-0.5, x from w-0.5 .. -0.5
+    for x in np.arange(w - 0.5, -0.5 - 1e-9, -step):
+        pts.append((float(x), h - 0.5))
+    # left edge x = -0.5, y from h-0.5 .. -0.5
+    for y in np.arange(h - 0.5, -0.5 - 1e-9, -step):
+        pts.append((-0.5, float(y)))
+    # Ensure the loop closes on the bottom-left corner.
+    if not pts or (abs(pts[-1][0] - (-0.5)) > 1e-9 or abs(pts[-1][1] - (-0.5)) > 1e-9):
+        pts.append((-0.5, -0.5))
+    return np.array(pts)
+
+
 def _project_points(points: np.ndarray, source: WCS, target: WCS) -> np.ndarray:
     sky = source.pixel_to_world(points[:, 0], points[:, 1])
     x, y = target.world_to_pixel(sky)
@@ -317,9 +399,40 @@ def _project_points(points: np.ndarray, source: WCS, target: WCS) -> np.ndarray:
 
 
 def _source_polygon(shape_hw: tuple[int, int], src_wcs: WCS, tgt_wcs: WCS) -> Polygon:
+    if _has_sip(src_wcs):
+        return _sip_source_polygon(shape_hw, src_wcs, tgt_wcs)
+    # Plain TAN path (unchanged frozen semantics): exact 4-corner projection.
     p = Polygon(_project_points(_boundary(shape_hw), src_wcs, tgt_wcs))
     if not p.is_valid or p.area <= 0:
         raise ValueError("invalid projected footprint")
+    return p
+
+
+def _sip_source_polygon(
+    shape_hw: tuple[int, int],
+    src_wcs: WCS,
+    tgt_wcs: WCS,
+    *,
+    step: int = SIP_FOOTPRINT_EDGE_STEP_PX,
+    margin: float = SIP_FOOTPRINT_MARGIN_PX,
+) -> Polygon:
+    """Conservative SIP footprint: sampled edges -> convex hull -> margin.
+
+    With SIP distortion the projected edges are curved, so the 4-corner polygon
+    under-bounds the true footprint. We sample every edge at a fixed
+    deterministic step, project all samples, take the convex hull (which bounds
+    every sampled point), and dilate by a small conservative margin in target
+    pixels. The result bounds the true SIP footprint with a small margin and is
+    guaranteed valid.
+    """
+    pts = _boundary_samples(shape_hw, step)
+    xy = _project_points(pts, src_wcs, tgt_wcs)
+    hull = Polygon(xy).convex_hull
+    if margin and margin > 0:
+        hull = hull.buffer(margin)
+    p = Polygon(hull.exterior.coords) if hull.geom_type != "Polygon" else hull
+    if not p.is_valid or p.area <= 0:
+        raise ValueError("invalid projected SIP footprint")
     return p
 
 

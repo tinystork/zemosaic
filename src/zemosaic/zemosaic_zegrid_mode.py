@@ -182,12 +182,17 @@ def _parse_pinned_layout(value) -> tuple[int, int] | None:
 # FrameDescriptor construction from legacy FrameInfo
 # ---------------------------------------------------------------------------
 
-def _build_frame_descriptors(frames_info, input_folder, progress_callback):
+def _build_frame_descriptors(frames_info, input_folder, progress_callback, *, sip_mode="keep"):
     """Convert legacy ``FrameInfo`` (WCS populated) to ZeGrid ``FrameDescriptor``.
 
-    Each frame's WCS is QUALIFIED (undistorted 2-D celestial TAN). Unqualified
-    frames are recorded (not silently dropped) and skipped; if NONE qualify a
+    Each frame's WCS is QUALIFIED (2-D celestial TAN — plain or SIP). Unqualified
+    frames are recorded (never silently dropped) and skipped; if NONE qualify a
     ``RuntimeError`` is raised (no silent degradation).
+
+    ``sip_mode`` controls SIP handling:
+      * ``"keep"``  (default) — accept and correctly apply SIP distortion.
+      * ``"strip"`` — strip the SIP coefficients (legacy-consistent plain TAN).
+    Returns ``(descs, rejected)``.
     """
     base = Path(input_folder).expanduser().resolve()
     descs = []
@@ -198,7 +203,10 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback):
             if not ok or fi.wcs is None or fi.shape_hw is None:
                 rejected.append({"path": str(fi.path), "reason": "no usable celestial WCS/shape"})
                 continue
-        reason = zg.qualify_wcs(fi.wcs)
+        wcs = fi.wcs
+        if sip_mode == "strip" and zg._has_sip(wcs):
+            wcs = zg.strip_sip(wcs)
+        reason = zg.qualify_wcs(wcs)
         if reason is not None:
             rejected.append({"path": str(fi.path), "reason": reason})
             continue
@@ -211,23 +219,28 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback):
                 frame_id=zg.FrameId(rel),
                 source_path=str(fi.path),
                 shape_hw=(int(fi.shape_hw[0]), int(fi.shape_hw[1])),
-                wcs_header=zg._serialize_wcs(fi.wcs),
+                wcs_header=zg._serialize_wcs(wcs),
                 header_sha256="",
                 instrument="",
             )
         )
-    for r in rejected:
+    if rejected:
+        from collections import Counter
+
+        breakdown = Counter(r["reason"] for r in rejected)
         _emit(
-            f"Rejected frame (unqualified WCS): {r['path']} — {r['reason']}",
+            f"ZeGrid: rejected {len(rejected)} frame(s) with unqualified WCS — "
+            f"breakdown: " + ", ".join(f"{reason} x{count}" for reason, count in sorted(breakdown.items()))
+            + f" | paths: " + ", ".join(r["path"] for r in rejected),
             lvl="WARN",
             callback=progress_callback,
         )
     if not descs:
         raise RuntimeError(
-            "ZeGrid: no frames with a qualified (undistorted 2-D TAN) WCS; cannot build a mosaic"
+            "ZeGrid: no frames with a qualified (2-D celestial TAN) WCS; cannot build a mosaic"
         )
     descs.sort(key=lambda d: d.frame_id)
-    return descs
+    return descs, rejected
 
 
 def _decode_frame_hwc(frame_desc, progress_callback):
@@ -650,12 +663,15 @@ def _run_single(
     science_config,
     zconfig,
     pinned_layout=None,
+    sip_mode="keep",
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     _emit(f"ZeGrid: setup — {len(frames_info)} frame(s) -> {output_dir}", callback=progress_callback)
-    descs = _build_frame_descriptors(frames_info, input_folder, progress_callback)
+    descs, rejected = _build_frame_descriptors(
+        frames_info, input_folder, progress_callback, sip_mode=sip_mode
+    )
     canvas = zg.build_canvas(descs)
     _emit(
         f"ZeGrid: canvas {canvas.width}x{canvas.height} "
@@ -766,6 +782,7 @@ def _run_single(
     sci_path, cov_path, manifest_path = _write_outputs(
         assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
         layout, science_config, peak_rss_kib, cache_report, progress_callback,
+        rejected=rejected, sip_mode=sip_mode,
     )
     _emit(
         f"ZeGrid: done — {sci_path.name} ({assembled.science.shape}) + coverage, "
@@ -780,6 +797,7 @@ def _run_single(
 def _write_outputs(
     assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
     layout, science_config, peak_rss_kib, cache_report, progress_callback,
+    rejected=None, sip_mode="keep",
 ):
     output_dir = Path(output_dir)
     science = np.asarray(assembled.science, dtype=np.float32)  # (H, W, 3)
@@ -823,6 +841,16 @@ def _write_outputs(
         ),
         "n_frames": len(descs),
         "frame_ids": [d.frame_id.logical_path for d in descs],
+        "sip_mode": sip_mode,
+        "rejected_frames": {
+            "count": len(rejected or []),
+            "by_reason": (
+                {reason: sum(1 for r in rejected if r["reason"] == reason)
+                 for reason in sorted({r["reason"] for r in rejected})}
+                if rejected else {}
+            ),
+            "paths": [r["path"] for r in (rejected or [])],
+        },
         "complete_cells": assembled.complete_cells,
         "incomplete_cells": assembled.incomplete_cells,
         "hole_pixels": assembled.hole_pixels,
@@ -912,6 +940,27 @@ def run_zegrid_mode(
                 callback=progress_callback,
             )
 
+    # SIP mode (ZM-ZEGRID-R10): "keep" (default) applies SIP distortion
+    # correctly; "strip" removes it for legacy-consistent plain-TAN behaviour.
+    # Default "keep" is justified by the R10 cross-consistency measurement.
+    sip_mode = "keep"
+    if zconfig is not None:
+        candidate = str(getattr(zconfig, "zegrid_sip_mode", "keep") or "keep").strip().lower()
+        if candidate not in ("keep", "strip"):
+            _emit(
+                f"ZeGrid: invalid zegrid_sip_mode={candidate!r} (expected 'keep' or 'strip'); using 'keep'",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            candidate = "keep"
+        sip_mode = candidate
+    _emit(
+        f"ZeGrid: SIP mode={sip_mode} ("
+        + ("apply SIP distortion correctly" if sip_mode == "keep" else "strip SIP distortion (legacy-consistent)")
+        + ")",
+        callback=progress_callback,
+    )
+
     # MOUNT SEGREGATION (same rule as the removed legacy Grid).
     known_mount_frames = [f for f in frames_info if f.mount]
     mount_values = {f.mount for f in known_mount_frames}
@@ -928,16 +977,16 @@ def run_zegrid_mode(
             _run_single(eq_frames, input_folder, base_out / "grid_EQ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
-                        pinned_layout=pinned_layout)
+                        pinned_layout=pinned_layout, sip_mode=sip_mode)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
-                        pinned_layout=pinned_layout)
+                        pinned_layout=pinned_layout, sip_mode=sip_mode)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
         _run_single(frames_info, input_folder, base_out,
                     progress_callback=progress_callback,
                     science_config=science_config, zconfig=zconfig,
-                    pinned_layout=pinned_layout)
+                    pinned_layout=pinned_layout, sip_mode=sip_mode)
