@@ -1,6 +1,5 @@
 """R0 geometry-only witness and executable historical claims; no production changes."""
 from pathlib import Path
-import copy
 import importlib.util
 import sys
 import numpy as np
@@ -9,7 +8,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 from shapely.geometry import Polygon, box
-from zemosaic import grid_mode as gm
+from zemosaic import zemosaic_stack_plan as zsp
 from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
 from zemosaic.core.canonical_support import make_footprint_taper
 
@@ -95,18 +94,18 @@ def test_legacy_cd_scale_bug_is_observable():
     w=frame().wcs
     assert np.mean(proj_plane_pixel_scales(w))==pytest.approx(.001)
     with pytest.warns(RuntimeWarning,match='cdelt'):
-        assert gm._extract_pixel_scale_deg(w)==pytest.approx(1.)
+        assert zsp._extract_pixel_scale_deg(w)==pytest.approx(1.)
 
 
 def test_csv_order_metadata_not_sort_and_header_case(tmp_path):
     for name in ('a.fit','b.fit'): (tmp_path/name).touch()
     csv=tmp_path/'stack_plan.csv'
     csv.write_text('path,order,exposure,mount\nb.fit,99,20,EQ\na.fit,0,10,ALTZ\n')
-    fs=gm.load_stack_plan(csv)
+    fs=zsp.load_stack_plan(csv)
     assert [f.path.name for f in fs]==['b.fit','a.fit']
     assert [f.order for f in fs]==[99,0]
     csv.write_text('PATH,ORDER\na.fit,0\n')
-    assert gm.load_stack_plan(csv)==[]
+    assert zsp.load_stack_plan(csv)==[]
 
 
 def request(images,**kw):
@@ -147,23 +146,3 @@ def test_taper_needs_context_but_not_new_science():
     padded=make_footprint_taper(np.ones((32,32),bool),8,0)[8:-8,8:-8]
     assert not np.array_equal(direct,large[24:40,24:40])
     np.testing.assert_array_equal(padded,large[24:40,24:40])
-
-
-def test_legacy_alpha_is_not_reprojected_and_can_be_ignored(monkeypatch):
-    f=gm.FrameInfo(Path('dummy'),wcs=frame().wcs,shape_hw=(8,8))
-    tile=gm.GridTile(1,(0,4,0,4),copy.deepcopy(f.wcs))
-    monkeypatch.setattr(gm,'_load_image_with_optional_alpha',lambda *a,**k:(np.ones((8,8,1),np.float32),np.zeros((8,8),np.float32)))
-    monkeypatch.setattr(gm,'reproject_interp',lambda *a,**k:(np.ones((4,4)),np.ones((4,4))))
-    _,support=gm._reproject_frame_to_tile(f,tile,(4,4))
-    # Multiplication target(4,4) *= source(8,8) fails and is silently ignored.
-    assert np.all(support==1)
-
-
-def test_legacy_fallback_offset_is_not_baked_into_global_header():
-    a=frame('a',angle=10,shape=(300,300));b=frame('b',ra=10.1,shape=(300,300))
-    fs=[gm.FrameInfo(Path(f.key),wcs=f.wcs,shape_hw=f.shape) for f in (a,b)]
-    w,shape,_,offset=gm._build_fallback_global_wcs(fs)
-    assert offset!=(0,0)
-    tile=gm._clone_tile_wcs(w,offset,shape)
-    np.testing.assert_allclose(tile.wcs.crpix,w.wcs.crpix-np.array(offset))
-    assert tile.pixel_to_world(0,0).separation(w.pixel_to_world(0,0)).arcsec>1

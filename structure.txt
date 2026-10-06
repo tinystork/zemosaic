@@ -9,7 +9,6 @@ f:\\seescan\\env\\zemosaic\\
 ├───detect_pyside.py
 ├───diagnose.py
 ├───followup.md
-├───grid_mode.py
 ├───lecropper.py
 ├───parallel_utils.py
 ├───quality_manifest.json
@@ -29,7 +28,6 @@ f:\\seescan\\env\\zemosaic\\
 ├───zemosaic_gui_qt.py
 ├───zemosaic_gui.py
 ├───zemosaic_resource_telemetry.py
-├───zemosaic_stack_core.py
 ├───zemosaic_time_utils.py
 ├───zemosaic_utils.py
 ├───zemosaic_worker.py

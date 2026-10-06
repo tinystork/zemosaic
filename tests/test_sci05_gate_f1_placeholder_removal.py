@@ -1,8 +1,13 @@
-"""SCI-05 Gate F1 — placeholder removal (R3 ``linear_fit_clip`` + N4 ``stack_core`` ``linear_fit``).
+"""SCI-05 Gate F1 — placeholder removal (R3 ``linear_fit_clip`` removal).
 
-Deterministic, hermetic tests for the frozen decisions R3 (``linear_fit_clip`` removed from
-supported choices, explicit ``unsupported_removed_sci05`` failure) and N4 (``stack_core``
-``linear_fit`` median-substitution placeholder removed). No random data, no network, no GPU.
+Deterministic, hermetic tests for the frozen decision R3 (``linear_fit_clip`` removed from
+supported choices, explicit ``unsupported_removed_sci05`` failure). No random data, no
+network, no GPU.
+
+(Historical note: the N4 ``stack_core`` ``linear_fit`` placeholder-removal assertions were
+removed in ZM-ZEGRID-R9 — ``zemosaic_stack_core`` itself was dead code after the legacy Grid
+removal and was deleted; the R3 assertions below guard shipped canonical behaviour and are
+retained.)
 """
 
 from __future__ import annotations
@@ -13,60 +18,8 @@ import numpy as np
 import pytest
 
 from zemosaic import zemosaic_align_stack
-from zemosaic import zemosaic_stack_core
 
-_SRC = Path(zemosaic_stack_core.__file__).resolve().parent
-
-
-def _frames():
-    return [np.full((4, 5, 3), float(v), dtype=np.float32) for v in (1.0, 2.0, 3.0)]
-
-
-# ---------------------------------------------------------------------------
-# N4 — stack_core linear_fit placeholder removal
-# ---------------------------------------------------------------------------
-
-class TestStackCoreN4:
-    def test_linear_fit_raises_unsupported(self):
-        with pytest.raises(ValueError) as ei:
-            zemosaic_stack_core.stack_core(
-                _frames(),
-                stack_config={"normalize_method": "linear_fit", "final_combine_method": "mean"},
-                backend="cpu",
-            )
-        assert "unsupported_removed_sci05" in str(ei.value)
-
-    def test_linear_fit_no_median_substitution(self):
-        # The old placeholder produced the median-subtraction result; that result is no
-        # longer produced for 'linear_fit' (it raises instead), while 'median' still works.
-        median_result, _, _ = zemosaic_stack_core.stack_core(
-            _frames(),
-            stack_config={"normalize_method": "median", "final_combine_method": "mean"},
-            backend="cpu",
-        )
-        with pytest.raises(ValueError):
-            zemosaic_stack_core.stack_core(
-                _frames(),
-                stack_config={"normalize_method": "linear_fit", "final_combine_method": "mean"},
-                backend="cpu",
-            )
-        assert median_result.shape == (4, 5, 3)
-        assert median_result.dtype == np.float32
-
-    def test_supported_normalize_methods_work(self):
-        for norm in ("none", "median"):
-            result, _, _ = zemosaic_stack_core.stack_core(
-                _frames(),
-                stack_config={"normalize_method": norm, "final_combine_method": "mean"},
-                backend="cpu",
-            )
-            assert result.shape == (4, 5, 3)
-            assert result.dtype == np.float32
-
-
-# ---------------------------------------------------------------------------
-# R3 — linear_fit_clip removal (explicit failure, absent from GUIs)
-# ---------------------------------------------------------------------------
+_SRC = Path(zemosaic_align_stack.__file__).resolve().parent
 
 class TestLinearFitClipR3:
     def test_worker_raises_unsupported(self):

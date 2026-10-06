@@ -75,9 +75,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import zemosaic.zemosaic_worker as zw  # noqa: E402
-from zemosaic import grid_mode  # noqa: E402
 from zemosaic import zemosaic_align_stack  # noqa: E402
-from zemosaic import zemosaic_stack_core  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -279,12 +277,14 @@ def test_route_dispatcher_and_legacy_are_distinct_entry_points():
     )
 
 
-def test_route_dispatcher_calls_legacy_and_grid_statically():
-    """STATIC AST: the dispatcher references the legacy wrapper and Grid runner."""
+def test_route_dispatcher_calls_classic_and_zegrid_statically():
+    """STATIC AST: the dispatcher references the legacy wrapper and ZeGrid runner."""
     dispatcher_src = inspect.getsource(zw.run_hierarchical_mosaic)
     names = _call_names(dispatcher_src)
     assert "run_hierarchical_mosaic_classic_legacy" in names
-    assert "run_grid_mode" in names
+    assert "run_zegrid_mode" in names
+    # The removed legacy Grid runner must NOT be referenced anymore.
+    assert "run_grid_mode" not in names
     # The dispatcher itself must NOT be defined to *call itself* recursively as its
     # own name in a way that would collapse the two entry points.
     assert "run_hierarchical_mosaic_classic_legacy" in _function_def_names(
@@ -294,14 +294,6 @@ def test_route_dispatcher_calls_legacy_and_grid_statically():
 
 def test_route_module_ownership_static():
     """STATIC AST/import: each stacking route lives in its owning module/function."""
-    grid_src = (REPO_ROOT / "src" / "zemosaic" / "grid_mode.py").read_text(
-        encoding="utf-8"
-    )
-    grid_names = _function_def_names(grid_src)
-    assert "run_grid_mode" in grid_names
-    assert "_stack_weighted_patches" in grid_names
-    assert "_stack_weighted_patches_gpu" in grid_names
-
     align_src = (
         REPO_ROOT / "src" / "zemosaic" / "zemosaic_align_stack.py"
     ).read_text(encoding="utf-8")
@@ -315,9 +307,9 @@ def test_route_module_ownership_static():
         assert name in align_names
 
     core_src = (
-        REPO_ROOT / "src" / "zemosaic" / "zemosaic_stack_core.py"
+        REPO_ROOT / "src" / "zemosaic" / "zemosaic_align_stack.py"
     ).read_text(encoding="utf-8")
-    assert "stack_core" in _function_def_names(core_src)
+    assert "stack_aligned_images" in _function_def_names(core_src)
 
     worker_names = _function_def_names(_WORKER_SRC.read_text(encoding="utf-8"))
     for name in (

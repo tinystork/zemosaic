@@ -10,6 +10,14 @@ Author: Coco (implementation worker), for Junior (architect/reviewer) and Nono (
 > incorporates the material findings of the Nono review (HIGH-1…HIGH-4, MEDIUM-5/6,
 > LOW-7/8) and Junior's independent confirmation.
 
+> **SUPERSEDED (ZM-ZEGRID-R8):** the legacy Grid (`src/zemosaic/grid_mode.py`),
+> described herein as ACTIVE/current, was **REMOVED** from the product and is
+> ARCHIVED at `origin/archive/zegrid-legacy-grid-5.0.0` (branch tip `83b94f4`). The
+> `stack_plan.csv` path now routes directly to the new ZeGrid engine
+> (`zemosaic_zegrid_mode.run_zegrid_mode`). See
+> `docs/refactor/ZM_ZEGRID_LEGACY_GRID_REMOVAL.md`. Sections below that describe the
+> removed Grid reflect **past** state, not current behaviour.
+
 ## 0. Canonical anchors
 
 | Anchor | Value |

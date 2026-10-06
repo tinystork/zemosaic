@@ -2,7 +2,7 @@
 """ZM-ZEGRID-R1 — prepare immutable prepared RGB FITS fixtures (reproducible).
 
 Uses the EXISTING shared decode path (no new science):
-    ``zemosaic.grid_mode._load_image_with_optional_alpha``
+    ``zemosaic.zemosaic_utils.load_image_with_optional_alpha``
 which internally calls ``zemosaic_utils.load_and_validate_fits`` (BZERO/BSCALE,
 axis normalization, nonfinite repair) then ``zemosaic_utils.debayer_image``
 (OpenCV Bayer GRBG -> RGB) with full-frame min/max normalization, then rescales
@@ -37,13 +37,13 @@ from astropy.io import fits
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from zemosaic import grid_mode as gm  # noqa: E402  (existing shared decode path)
+from zemosaic.zemosaic_utils import load_image_with_optional_alpha  # noqa: E402  (existing shared decode path)
 
 
 def prepare_one(raw_path: Path, out_path: Path) -> dict:
     """Decode one raw frame via the shared path and write a prepared RGB FITS."""
     # Existing shared decoder: full-frame Bayer -> HWC float32 RGB (ADU).
-    rgb_hwc, alpha = gm._load_image_with_optional_alpha(raw_path)
+    rgb_hwc, alpha = load_image_with_optional_alpha(raw_path)
     if rgb_hwc.ndim != 3 or rgb_hwc.shape[-1] != 3:
         raise ValueError(f"unexpected decoded shape {rgb_hwc.shape}")
     # CHW on disk so the 2-D celestial WCS stays on axes 1-2.
@@ -74,7 +74,7 @@ def prepare_one(raw_path: Path, out_path: Path) -> dict:
         "shape_hwc": list(rgb_hwc.shape),
         "dtype": str(rgb_hwc.dtype),
         "alpha_present": alpha is not None,
-        "decoder": "zemosaic.grid_mode._load_image_with_optional_alpha "
+        "decoder": "zemosaic.zemosaic_utils.load_image_with_optional_alpha "
         "(load_and_validate_fits + debayer_image GRBG->RGB)",
     }
 

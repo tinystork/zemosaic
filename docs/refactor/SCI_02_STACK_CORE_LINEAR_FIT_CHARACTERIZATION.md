@@ -1,5 +1,11 @@
 # SCI-02 — `stack_core` `linear_fit` reachability & semantics (NO FIX)
 
+> **HISTORICAL RECORD** (marked 2026-10-06, ZM-ZEGRID-R9). The subject module
+> `src/zemosaic/zemosaic_stack_core.py` **no longer exists**: it was dead code
+> after the legacy Grid removal (R8) and was deleted in R9. This document is kept
+> unmodified as a historical characterization record of that now-removed module;
+> it is **not** an active reference and does not describe shipped behaviour.
+
 - **Mission:** `ZM-SCI-02-STACKCORE-LINEARFIT-CHAR-20261004`
 - **Phase:** implementation (characterization-only witness)
 - **Branch:** `science/sci-02-linear-fit-characterization`

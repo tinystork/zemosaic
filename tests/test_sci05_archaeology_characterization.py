@@ -10,24 +10,19 @@ Scope of evidence (minimum dynamic coverage required by the mission):
 1.  Qt exposes the exact token/label for every requested stacking choice and the
     legacy radial controls (AST over ``_create_stacking_group`` — no Qt import,
     no brittle line numbers).
-2.  ``stack_core`` ``linear_fit`` placeholder (== ``median``) and its simplified
-    winsorized (median/σ, not PixInsight WSC) are cross-checked against the
-    existing SCI-01/02 corpora with a *light* spot-probe (no corpus duplication).
-3.  ``linear_fit_clip`` is a visible Qt choice whose executed helper
+2.  ``linear_fit_clip`` is a visible Qt choice whose executed helper
     ``_reject_outliers_linear_fit_clip`` is a proven no-op placeholder.
-4.  ``noise_fwhm`` reachable Classic behavior (variance substitution only when
+3.  ``noise_fwhm`` reachable Classic behavior (variance substitution only when
     Photutils is unavailable; no-weighting when star-free; partial ``1e-6``/``1.0``
     substitutions) plus the separate Grid variance-only fallback — proven via the
     real estimator (star-free) and controlled seams, NOT a blanket "→ variance".
-5.  Weight zero/negative, median weight-ignore and all-invalid divergences are
-    cross-referenced (SCI-03/TEST-04) and lightly spot-probed.
-6.  The legacy center-radial map fails translation invariance and differs from
+4.  The legacy center-radial map fails translation invariance and differs from
     the donor footprint-taper *concept* (reconstructed in test-only code; the
     donor module is **never** imported).
-7.  Global-coadd dispatch names the actually-executed finalizer symbols/formulas
+5.  Global-coadd dispatch names the actually-executed finalizer symbols/formulas
     per method (AST seam + small reconstruction of the chunked median/winsorized
     formulas).
-8.  Current logging/provenance gaps (no support domain, no footprint taper, no
+6.  Current logging/provenance gaps (no support domain, no footprint taper, no
     coverage render, no ``N_eff``/``COVERAGE_*`` provenance) are named with
     evidence (absence scan over the package source).
 
@@ -51,17 +46,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from zemosaic import grid_mode
 from zemosaic import zemosaic_align_stack as zas
-from zemosaic import zemosaic_stack_core
 from zemosaic.zemosaic_utils import make_radial_weight_map
 
 
 _SRC = Path(__file__).resolve().parents[1] / "src" / "zemosaic"
 _GUI_PATH = _SRC / "zemosaic_gui_qt.py"
 _WORKER_PATH = _SRC / "zemosaic_worker.py"
-
-_WSC_ENV = "ZEMOSAIC_WSC_IMPL"
 
 
 # ---------------------------------------------------------------------------
@@ -225,66 +216,7 @@ class TestQtStackingTokens:
 
 
 # ---------------------------------------------------------------------------
-# 2. stack_core linear_fit placeholder + simplified winsorized (cross-ref SCI-01/02)
-# ---------------------------------------------------------------------------
-
-def _affine_frames() -> list[np.ndarray]:
-    """Two small float32 (2,2,1) frames: a ramp ref and an affine target."""
-    ref = np.array([[[10.0], [20.0]], [[30.0], [40.0]]], dtype=np.float32)
-    tgt = (2.0 * ref + 10.0).astype(np.float32)
-    return [ref, tgt]
-
-
-class TestStackCorePlaceholderCrossCheck:
-    def test_linear_fit_is_median_bit_exact(self):
-        # Gate A/SCI-02 recorded linear_fit == median (bit-exact placeholder); Gate F1 (N4)
-        # removed the placeholder: linear_fit now raises, never silently becomes median.
-        with pytest.raises(ValueError) as ei:
-            zemosaic_stack_core.stack_core(
-                _affine_frames(),
-                stack_config={"normalize_method": "linear_fit", "final_combine_method": "mean"},
-                backend="cpu",
-            )
-        assert "unsupported_removed_sci05" in str(ei.value)
-
-    def test_linear_fit_differs_from_none(self):
-        # Gate F1 (N4): linear_fit no longer re-centres the stack; it raises instead.
-        with pytest.raises(ValueError) as ei:
-            zemosaic_stack_core.stack_core(
-                _affine_frames(),
-                stack_config={"normalize_method": "linear_fit", "final_combine_method": "mean"},
-                backend="cpu",
-            )
-        assert "unsupported_removed_sci05" in str(ei.value)
-
-    def test_winsorized_simplified_diverges_from_pixinsight_wsc(self, monkeypatch):
-        # SCI-01: stack_core winsorized = median/σ clip (keeps an impulse outlier
-        # whose median is the floor), while the PixInsight WSC collapses it.
-        monkeypatch.delenv(_WSC_ENV, raising=False)
-        frames = [np.array([[[v]]], dtype=np.float32) for v in (0.0, 0.0, 0.0, 0.0, 100.0)]
-        core_result, rejected, _ws = zemosaic_stack_core.stack_core(
-            frames,
-            stack_config={
-                "rejection_algorithm": "winsorized_sigma_clip",
-                "sigma_clip_low": 2.5,
-                "sigma_clip_high": 2.5,
-                "final_combine_method": "mean",
-            },
-            backend="cpu",
-        )
-        assert rejected == 0.0  # simplified clip keeps all five (median=0, σ large)
-        stacked = np.stack(frames, axis=0)  # (5,1,1,1)
-        wsc_out, _mask = zas._reject_outliers_winsorized_sigma_clip(
-            stacked, (0.05, 0.05), 2.5, 2.5, max_workers=1
-        )
-        wsc_result = float(np.nanmean(wsc_out))
-        # Material divergence: simplified keeps the outlier (≈20.0); PixInsight
-        # winsorizes it to ≈0. Assert only a large gap, not an exact value.
-        assert abs(float(np.mean(core_result)) - wsc_result) > 1.0
-
-
-# ---------------------------------------------------------------------------
-# 3. linear_fit_clip: visible Qt choice + no-op placeholder
+# 2. linear_fit_clip: visible Qt choice + no-op placeholder
 # ---------------------------------------------------------------------------
 
 class TestLinearFitClipPlaceholder:
@@ -298,7 +230,7 @@ class TestLinearFitClipPlaceholder:
 
 
 # ---------------------------------------------------------------------------
-# 4. noise_fwhm reachable Classic behavior (real path + controlled seams)
+# 3. noise_fwhm reachable Classic behavior (real path + controlled seams)
 # ---------------------------------------------------------------------------
 #
 # Reachable Classic semantics (zemosaic_align_stack._compute_quality_weights):
@@ -313,8 +245,6 @@ class TestLinearFitClipPlaceholder:
 #     skipped/unprocessed frames get ``1.0``; effective label may stay
 #     ``noise_fwhm``.
 #   * Photutils available + all usable → genuine ``min_fwhm/fwhm`` weighting.
-# Grid (grid_mode._compute_frame_weight) is separately variance-only with an
-# exposure fold — a different fallback, not the Classic one.
 #
 # Evidence labels are honest: the Photutils-unavailable branch is a reachable
 # dependency seam (photutils is optional, ``PHOTOUTILS_AVAILABLE`` starts False);
@@ -393,58 +323,9 @@ class TestNoiseFwhmBehavior:
         # The 1.0 (skipped) frame has no effect and is dropped by the sanitizer.
         assert weights[2] is None
 
-    def test_grid_compute_frame_weight_noise_fwhm_is_variance_only(self):
-        # Grid route: _compute_frame_weight('noise_fwhm') executes the identical
-        # variance-only formula (exposure_w / variance) — a SEPARATE fallback from
-        # the Classic one (Grid never computes per-frame FWHM).
-        frame = grid_mode.FrameInfo(path=Path("x.fits"), exposure=4.0)
-        patch = np.array([[[1.0], [2.0]], [[3.0], [4.0]]], dtype=np.float32)
-        footprint = np.ones((2, 2), dtype=np.float32)
-        cfg_fwhm = grid_mode.GridModeConfig(stack_weight_method="noise_fwhm")
-        cfg_var = grid_mode.GridModeConfig(stack_weight_method="noise_variance")
-        w_fwhm = grid_mode._compute_frame_weight(frame, patch, footprint, cfg_fwhm)
-        w_var = grid_mode._compute_frame_weight(frame, patch, footprint, cfg_var)
-        assert w_fwhm == w_var
-
 
 # ---------------------------------------------------------------------------
-# 5. weight zero/negative, median weight-ignore, all-invalid (cross-ref SCI-03/TEST-04)
-# ---------------------------------------------------------------------------
-
-class TestWeightEdgeSpotProbes:
-    def test_stack_core_median_ignores_zero_weight(self):
-        # cross-ref SCI-03 D2: stack_core median ignores weights entirely, so a
-        # zero-weight finite frame is still included (median of 10 and 100 == 55).
-        frames = [
-            np.array([[[10.0]]], dtype=np.float32),
-            np.array([[[100.0]]], dtype=np.float32),
-        ]
-        weights = np.array([[[0.0]], [[1.0]]], dtype=np.float32)
-        result, _r, _ws = zemosaic_stack_core.stack_core(
-            frames,
-            weights=weights,
-            stack_config={"normalize_method": "none", "final_combine_method": "median"},
-            backend="cpu",
-        )
-        assert float(result[0, 0, 0]) == pytest.approx(55.0)
-
-    def test_stack_core_mean_all_zero_weight_is_nan(self):
-        # cross-ref SCI-03 D1 / TEST-04: stack_core mean at zero weight_sum → NaN
-        # (Grid CPU returns a zero tile instead).
-        frames = [np.array([[[10.0]]], dtype=np.float32)]
-        weights = np.array([[[0.0]]], dtype=np.float32)
-        result, _r, ws = zemosaic_stack_core.stack_core(
-            frames,
-            weights=weights,
-            stack_config={"normalize_method": "none", "final_combine_method": "mean"},
-            backend="cpu",
-        )
-        assert np.isnan(result[0, 0, 0])
-        assert float(ws[0, 0, 0]) == 0.0
-
-
-# ---------------------------------------------------------------------------
-# 6. center-radial map fails translation invariance (vs footprint-taper concept)
+# 4. center-radial map fails translation invariance (vs footprint-taper concept)
 # ---------------------------------------------------------------------------
 
 def _footprint_taper_reconstruction(mask: np.ndarray, feather_px: float = 4.0, floor: float = 0.0) -> np.ndarray:
@@ -506,7 +387,7 @@ class TestRadialVsFootprintTaper:
 
 
 # ---------------------------------------------------------------------------
-# 7. global-coadd dispatch: actual executed symbols/formulas per method
+# 5. global-coadd dispatch: actual executed symbols/formulas per method
 # ---------------------------------------------------------------------------
 
 class TestGlobalCoaddDispatch:
@@ -626,7 +507,7 @@ class TestGlobalCoaddDispatch:
 
 
 # ---------------------------------------------------------------------------
-# 8. logging / provenance gaps (named with evidence)
+# 6. logging / provenance gaps (named with evidence)
 # ---------------------------------------------------------------------------
 
 class TestCoverageProvenanceGaps:

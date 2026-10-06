@@ -68,10 +68,6 @@ class TestRadialInert:
         # All worker radial application points were removed: no make_radial_weight_map call remains.
         assert "make_radial_weight_map" not in worker_src
 
-    def test_grid_mode_no_radial_application(self):
-        grid_src = (_SRC / "grid_mode.py").read_text(encoding="utf-8-sig")
-        assert "make_radial_weight_map" not in grid_src
-
     def test_gpu_path_still_inert(self):
         from zemosaic import zemosaic_align_stack_gpu as zasgpu
         assert zasgpu._compute_radial_weight_map(16, 16, 3, {"apply_radial_weight": True}, None) is None
