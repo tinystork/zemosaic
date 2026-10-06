@@ -21,6 +21,8 @@ from astropy.io import fits
 
 from zemosaic import grid_mode
 from zemosaic import zemosaic_zegrid_mode as zegrid
+from zemosaic.core.zegrid import auto_layout as zal
+from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import sweep as zsw
 from zemosaic.zemosaic_worker import (
     _resolve_grid_engine,
@@ -199,3 +201,33 @@ def test_end_to_end_real_m106_subset(tmp_path):
     assert manifest["coverage_pixels"] == int(np.count_nonzero(covered))
     # Ownership invariant: exactly one owner per covered pixel (no overlap).
     assert manifest["complete_cells"], "no complete cells in the assembled canvas"
+
+
+# ---------------------------------------------------------------------------
+# Mode-aware layout (rework-1): coarser, floor-honouring, bounded, deterministic
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
+def test_mode_aware_layout_coarser_floor_honouring_bounded_deterministic():
+    frames, _ = zg.read_manifest(LIGHTS)
+    canvas = zg.build_canvas(frames)
+
+    for gib in (1.0, 2.0, 4.0):
+        budget = int(gib * 2**30)
+        before = zal.choose_layout(canvas, frames, ram_budget=budget)
+        after = zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=budget)
+
+        # Mode-aware is never finer than the in-memory-only policy.
+        assert after["cell_count"] <= before.nx * before.ny
+        # Scientific floors must hold.
+        assert after["floors"]["min_patch_area_px"]["ok"]
+        assert after["floors"]["max_halo_overhead"]["ok"]
+        # No cell's cheaper-mode bound exceeds the budget.
+        for c in after["cells"]:
+            cheaper = min(c["inmem_bound_bytes"], c["stream_bound_bytes"])
+            assert cheaper <= budget
+
+    # Determinism: identical inputs -> identical layout.
+    d1 = zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=int(2.0 * 2**30))
+    d2 = zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=int(2.0 * 2**30))
+    assert (d1["nx"], d1["ny"]) == (d2["nx"], d2["ny"])

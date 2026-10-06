@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
 import time
 from dataclasses import replace
@@ -288,6 +289,168 @@ def _pick_mode(n_contributors, patch_area_px, available_bytes):
     return "stream", int(bound)
 
 
+# ---------------------------------------------------------------------------
+# Mode-aware layout selection (R4 floors + in-memory OR streaming bound)
+# ---------------------------------------------------------------------------
+
+def _estimate_streaming_bytes(n_contributors, patch_hw, tile_size=STREAM_TILE_SIZE, channels=3):
+    """Streaming per-cell peak bound in BYTES (R6 estimate, KiB -> bytes)."""
+    return int(zstream.estimate_streaming_peak_kib(n_contributors, patch_hw, tile_size, channels) * 1024)
+
+
+def _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
+    """Yield per-Cell dicts with BOTH in-memory and streaming peak bounds.
+
+    Reuses the R4 membership primitive (:func:`auto_layout._cell_contributor_count`)
+    and the R4/R6 published models verbatim — no science is duplicated.
+    """
+    layout = zg.build_layout(canvas, nx, ny)
+    for row, col, bounds in layout.iter_cells(canvas):
+        cid = zg.cell_id(row, col)
+        cell = zg.ZeGridCell(cid, canvas.canvas_id, layout.layout_id, row, col, bounds)
+        patch = zg.build_patch(canvas, cell, halo_px)
+        n = zal._cell_contributor_count(footprints, canvas, patch.patch)
+        area = patch.patch.width * patch.patch.height
+        inmem_b = zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area)
+        stream_b = _estimate_streaming_bytes(n, patch.patch_shape_hw, tile_size)
+        yield {
+            "cell_id": cid, "row": row, "col": col, "n": n,
+            "patch_area": area, "patch_hw": list(patch.patch_shape_hw),
+            "inmem_bound_bytes": int(inmem_b),
+            "stream_bound_bytes": int(stream_b),
+            "cheaper_mode": "inmem" if inmem_b <= stream_b else "stream",
+        }
+
+
+def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
+    """Worst-cell cheaper-mode bound for a candidate layout.
+
+    For every Cell, takes the CHEAPER of the in-memory and streaming bounds and
+    maximises over Cells (mirrors ``auto_layout._scan_layout`` but mode-aware).
+    """
+    worst = None
+    for c in _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
+        cheaper = min(c["inmem_bound_bytes"], c["stream_bound_bytes"])
+        if worst is None or cheaper > worst["cheaper_bound_bytes"]:
+            worst = dict(c)
+            worst["cheaper_bound_bytes"] = cheaper
+    return worst
+
+
+def _choose_layout_mode_aware(
+    canvas,
+    frames,
+    ram_budget,
+    *,
+    available_bytes=None,
+    tile_size=STREAM_TILE_SIZE,
+    floors=None,
+    halo_px=zsw.HALO_PX,
+):
+    """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
+
+    Reuses the R4 candidate enumeration (``REFINEMENT_FACTORS``, scientific
+    floors, footprint membership) verbatim, but a candidate is FEASIBLE iff the
+    CHEAPER-fitting per-cell mode's worst bound fits ``ram_budget``. Deterministic
+    (identical enumeration order); returns a dict (layout + per-cell predictions).
+    """
+    floors = floors or zal.ScientificFloors()
+    mw, mh = zal.median_projected_footprint(frames, canvas)
+    if not (mw > 0 and mh > 0):
+        raise zal.LayoutInfeasible("median projected footprint is degenerate")
+    footprints = zal._footprints(frames, canvas)
+
+    candidates = []
+    seen = set()
+    for factor in zal.REFINEMENT_FACTORS:
+        nx = max(1, int(math.ceil(canvas.width / (mw / factor))))
+        ny = max(1, int(math.ceil(canvas.height / (mh / factor))))
+        nx = min(nx, canvas.width)
+        ny = min(ny, canvas.height)
+        if (nx, ny) in seen:
+            continue
+        seen.add((nx, ny))
+        geom = zal._nominal_geometry(canvas, nx, ny, halo_px)
+        if not (geom["min_patch_area"] >= floors.min_patch_area_px and
+                geom["halo_overhead"] <= floors.max_halo_overhead):
+            break  # floors are monotonic in refinement
+        worst = _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
+        memory_ok = (ram_budget is None) or (worst["cheaper_bound_bytes"] <= ram_budget)
+        candidates.append({
+            "factor": factor, "nx": nx, "ny": ny,
+            "bound": worst["cheaper_bound_bytes"], "worst_cell": worst,
+            "memory_ok": memory_ok, "geom": geom,
+        })
+
+    chosen = None
+    chosen_index = None
+    for i, cand in enumerate(candidates):
+        if cand["memory_ok"]:
+            chosen = cand
+            chosen_index = i
+            break
+
+    if chosen is None:
+        finest = candidates[-1] if candidates else None
+        reasons = []
+        if ram_budget is not None and finest is not None and finest["bound"] > ram_budget:
+            reasons.append(
+                f"even the finest floor-feasible layout ({finest['nx']}x{finest['ny']}) "
+                f"cheaper-mode bound {finest['bound'] / 2**20:.1f} MiB exceeds budget "
+                f"{ram_budget / 2**20:.1f} MiB"
+            )
+        reasons.append(
+            f"min_patch_area floor ({floors.min_patch_area_px} px) / "
+            f"max_halo_overhead floor ({floors.max_halo_overhead}) cannot be satisfied "
+            f"together with the budget (mode-aware)"
+        )
+        raise zal.LayoutInfeasible(
+            "RAM budget cannot satisfy scientific floors (mode-aware): " + "; ".join(reasons)
+        )
+
+    cells = list(_iter_cell_bounds_mode_aware(
+        canvas, footprints, chosen["nx"], chosen["ny"], halo_px, tile_size
+    ))
+    max_n = max((c["n"] for c in cells), default=0)
+    contrib_ok = max_n >= floors.min_contributors
+    warnings = []
+    if not contrib_ok:
+        warnings.append(
+            f"deepest cell has {max_n} contributors < min_contributors "
+            f"({floors.min_contributors}); the layout may be scientifically degraded"
+        )
+
+    constrained = False
+    if ram_budget is not None and chosen_index is not None:
+        for cand in candidates[:chosen_index]:
+            if not cand["memory_ok"]:
+                constrained = True
+                break
+
+    return {
+        "nx": chosen["nx"], "ny": chosen["ny"],
+        "cell_count": chosen["nx"] * chosen["ny"],
+        "ram_budget_bytes": ram_budget,
+        "available_bytes": available_bytes if available_bytes is not None else ram_budget,
+        "max_contributors": max_n,
+        "refinement_factor": chosen["factor"],
+        "predicted_bound_bytes": int(chosen["bound"]),
+        "max_patch_area": chosen["worst_cell"]["patch_area"],
+        "budget_bound_choice": constrained,
+        "warnings": tuple(warnings),
+        "cells": cells,
+        "floors": {
+            "min_patch_area_px": {"value": chosen["geom"]["min_patch_area"],
+                                   "limit": floors.min_patch_area_px,
+                                   "ok": chosen["geom"]["min_patch_area"] >= floors.min_patch_area_px},
+            "max_halo_overhead": {"value": round(chosen["geom"]["halo_overhead"], 6),
+                                   "limit": floors.max_halo_overhead,
+                                   "ok": chosen["geom"]["halo_overhead"] <= floors.max_halo_overhead},
+            "min_contributors": {"value": max_n, "limit": floors.min_contributors, "ok": contrib_ok},
+        },
+    }
+
+
 def _run_cell_inmem(cache_dir, patch, config, progress_callback):
     provider = zfp.MemmapCanonicalProvider(cache_dir)
     images = []
@@ -362,17 +525,21 @@ def _run_single(
         callback=progress_callback,
     )
 
-    # LAYOUT — R4 RAM-aware Auto layout, budgeted from psutil (portable).
+    # LAYOUT — MODE-AWARE RAM-aware Auto layout (in-memory OR streaming bound),
+    # budgeted from psutil (portable).
     available = available_memory_bytes()
-    layout = zal.choose_layout(canvas, descs, ram_budget=available)
-    nx, ny = layout.nx, layout.ny
+    layout = _choose_layout_mode_aware(
+        canvas, descs, ram_budget=available, available_bytes=available,
+        tile_size=STREAM_TILE_SIZE,
+    )
+    nx, ny = layout["nx"], layout["ny"]
     _emit(
-        f"ZeGrid: layout {nx}x{ny} ({nx * ny} cells) from RAM budget "
-        f"{available / 2**30:.2f} GiB; worst-cell bound "
-        f"{layout.predicted_bound_bytes / 2**20:.1f} MiB (maxN={layout.max_contributors})",
+        f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells) from RAM budget "
+        f"{available / 2**30:.2f} GiB; worst-cell cheaper-mode bound "
+        f"{layout['predicted_bound_bytes'] / 2**20:.1f} MiB (maxN={layout['max_contributors']})",
         callback=progress_callback,
     )
-    for w in layout.warnings:
+    for w in layout["warnings"]:
         _emit(f"ZeGrid: layout warning — {w}", lvl="WARN", callback=progress_callback)
 
     cell_ctxs = []
@@ -495,10 +662,10 @@ def _write_outputs(
         "canvas": {"width": canvas.width, "height": canvas.height,
                    "resolution_deg": canvas.resolution_deg, "id": canvas.canvas_id},
         "layout": {"nx": nx, "ny": ny,
-                   "ram_budget_bytes": layout.ram_budget_bytes,
-                   "available_bytes": layout.available_bytes,
-                   "max_contributors": layout.max_contributors,
-                   "predicted_bound_bytes": layout.predicted_bound_bytes},
+                   "ram_budget_bytes": layout["ram_budget_bytes"],
+                   "available_bytes": layout["available_bytes"],
+                   "max_contributors": layout["max_contributors"],
+                   "predicted_bound_bytes": layout["predicted_bound_bytes"]},
         "n_frames": len(descs),
         "frame_ids": [d.frame_id.logical_path for d in descs],
         "complete_cells": assembled.complete_cells,
