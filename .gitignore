@@ -199,3 +199,6 @@ agents/
 # === ZeMosaic: bundles de review de l'agent ===
 # (répertoire de travail standard de review, jamais versionné)
 /AGENT/
+
+# === ZeGrid (R7) runtime disk cache: never commit pixels ===
+__zegrid_cache__/

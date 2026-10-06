@@ -721,6 +721,44 @@ def detect_grid_mode(input_folder: str | os.PathLike | None) -> bool:
         return False
 
 
+def _resolve_grid_engine(worker_config_cache, zconfig) -> str:
+    """Return the selected Grid engine: ``"zegrid"`` (DEFAULT) or ``"legacy"``.
+
+    Reads ``grid_engine`` from the same config source the worker already uses
+    (``worker_config_cache`` then ``zconfig``). Unknown/empty values fall back to
+    ``"zegrid"`` (the default). ``"legacy"`` keeps the byte-identical
+    ``grid_mode.run_grid_mode`` path reachable.
+    """
+    value = None
+    if isinstance(worker_config_cache, dict):
+        value = worker_config_cache.get("grid_engine")
+    if value is None and zconfig is not None and hasattr(zconfig, "grid_engine"):
+        value = getattr(zconfig, "grid_engine")
+    token = str(value or "").strip().lower()
+    if token == "legacy":
+        return "legacy"
+    return "zegrid"
+
+
+def _resolve_zegrid_normalization(worker_config_cache, stack_norm_method) -> str:
+    """Resolve the ZeGrid normalization token (sky_mean default).
+
+    ZeGrid defaults to ``sky_mean`` (Tristan's decision; the legacy ``linear_fit``
+    is known-defective on real data). An explicit user choice is read from the
+    config cache (``stacking_normalize_method`` then ``stack_norm_method``) and
+    honoured verbatim; otherwise ``sky_mean`` is returned.
+    """
+    explicit = None
+    if isinstance(worker_config_cache, dict):
+        explicit = worker_config_cache.get("stacking_normalize_method")
+        if explicit is None:
+            explicit = worker_config_cache.get("stack_norm_method")
+    token = str(explicit or "").strip().lower()
+    if token in ("sky_mean", "linear_fit", "none"):
+        return token
+    return "sky_mean"
+
+
 def _move_to_unaligned_safe(
     src_path: str | os.PathLike,
     input_root: str | os.PathLike,
@@ -30853,6 +30891,48 @@ def run_hierarchical_mosaic(
 
     grid_mode_detected = detect_grid_mode(input_folder)
     if grid_mode_detected:
+        grid_engine = _resolve_grid_engine(worker_config_cache, zconfig)
+        if grid_engine == "zegrid":
+            # NEW ZeGrid engine (default). No silent fallback: any failure raises.
+            try:
+                from .zemosaic_zegrid_mode import run_zegrid_mode
+            except Exception as exc:
+                logger.error("[GRID] ZeGrid engine unavailable; aborting (no legacy fallback).", exc_info=True)
+                raise RuntimeError("[GRID] ZeGrid engine unavailable") from exc
+            try:
+                zegrid_norm = _resolve_zegrid_normalization(worker_config_cache, stack_norm_method)
+                logger.info(
+                    "[GRID] Invoking ZeGrid engine run_zegrid_mode(...) with "
+                    "stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
+                    zegrid_norm,
+                    stack_weight_method,
+                    stack_reject_algo,
+                    stack_final_combine,
+                )
+                run_zegrid_mode(
+                    input_folder=input_folder,
+                    output_folder=output_folder,
+                    progress_callback=progress_callback,
+                    stack_norm_method=zegrid_norm,
+                    stack_weight_method=stack_weight_method,
+                    stack_reject_algo=stack_reject_algo,
+                    stack_kappa_low=stack_kappa_low,
+                    stack_kappa_high=stack_kappa_high,
+                    winsor_limits=parsed_winsor_limits,
+                    stack_final_combine=stack_final_combine,
+                    apply_radial_weight=apply_radial_weight_config,
+                    radial_feather_fraction=radial_feather_fraction_config,
+                    radial_shape_power=radial_shape_power_config,
+                    save_final_as_uint16=save_final_as_uint16_config,
+                    legacy_rgb_cube=legacy_rgb_cube_config,
+                    grid_rgb_equalize=grid_rgb_equalize_flag,
+                    zconfig=zconfig,
+                )
+                return
+            except Exception:
+                logger.error("[GRID] ZeGrid engine failed; aborting (no silent fallback to legacy).", exc_info=True)
+                raise
+        # grid_engine == "legacy" -> unchanged legacy path below.
         if grid_mode and hasattr(grid_mode, "run_grid_mode"):
             try:
                 logger.info(

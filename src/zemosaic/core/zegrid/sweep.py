@@ -21,9 +21,18 @@ aborts gracefully with an explicit ``MemoryInsufficient`` (BLOCKED), never OOM.
 
 from __future__ import annotations
 
-import resource
 from dataclasses import dataclass, field
 from typing import Sequence
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows (no POSIX resource module)
+    resource = None
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - psutil is a product dependency
+    psutil = None
 
 import numpy as np
 
@@ -59,12 +68,27 @@ class MemoryInsufficient(RuntimeError):
 
 
 def read_available_memory() -> int:
-    """Return available memory in bytes from ``/proc/meminfo`` ``MemAvailable``."""
-    with open("/proc/meminfo", "r", encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    raise OSError("MemAvailable not found in /proc/meminfo")
+    """Return available memory in bytes (PORTABLE, psutil-first).
+
+    ``psutil.virtual_memory().available`` is the product's portable probe (psutil
+    is already a dependency) and works on Windows/macOS/Linux. A ``/proc/meminfo``
+    fallback is kept only for environments where psutil is unavailable; the
+    production wiring MUST use this function (never ``resource`` / ``/proc``
+    directly) so ZeGrid stays Windows-portable.
+    """
+    if psutil is not None:
+        try:
+            return int(psutil.virtual_memory().available)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception as exc:  # pragma: no cover - fallback failure
+        raise OSError("unable to determine available memory (no psutil, no /proc)") from exc
+    raise OSError("unable to determine available memory (no psutil, no /proc)")
 
 
 def required_available_bytes(n_contributors: int) -> int:
@@ -73,8 +97,23 @@ def required_available_bytes(n_contributors: int) -> int:
 
 
 def peak_rss_kib() -> int:
-    """Peak RSS (KiB) of the current process so far (Linux ``RUSAGE_SELF``)."""
-    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    """Peak RSS (KiB) of the current process so far (portable).
+
+    Uses ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` where available (Linux) and
+    falls back to ``psutil.Process().memory_info().rss`` (current RSS, Windows /
+    non-POSIX) so reporting never crashes on Windows.
+    """
+    if resource is not None:
+        try:
+            return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    if psutil is not None:
+        try:
+            return int(psutil.Process().memory_info().rss // 1024)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return 0
 
 
 @dataclass(frozen=True)
