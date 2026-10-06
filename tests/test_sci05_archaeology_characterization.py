@@ -51,7 +51,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from zemosaic import grid_mode
 from zemosaic import zemosaic_align_stack as zas
 from zemosaic import zemosaic_stack_core
 from zemosaic.zemosaic_utils import make_radial_weight_map
@@ -313,8 +312,6 @@ class TestLinearFitClipPlaceholder:
 #     skipped/unprocessed frames get ``1.0``; effective label may stay
 #     ``noise_fwhm``.
 #   * Photutils available + all usable → genuine ``min_fwhm/fwhm`` weighting.
-# Grid (grid_mode._compute_frame_weight) is separately variance-only with an
-# exposure fold — a different fallback, not the Classic one.
 #
 # Evidence labels are honest: the Photutils-unavailable branch is a reachable
 # dependency seam (photutils is optional, ``PHOTOUTILS_AVAILABLE`` starts False);
@@ -392,19 +389,6 @@ class TestNoiseFwhmBehavior:
         assert weights[1] is not None and float(np.asarray(weights[1]).ravel()[0]) == pytest.approx(1e-6)
         # The 1.0 (skipped) frame has no effect and is dropped by the sanitizer.
         assert weights[2] is None
-
-    def test_grid_compute_frame_weight_noise_fwhm_is_variance_only(self):
-        # Grid route: _compute_frame_weight('noise_fwhm') executes the identical
-        # variance-only formula (exposure_w / variance) — a SEPARATE fallback from
-        # the Classic one (Grid never computes per-frame FWHM).
-        frame = grid_mode.FrameInfo(path=Path("x.fits"), exposure=4.0)
-        patch = np.array([[[1.0], [2.0]], [[3.0], [4.0]]], dtype=np.float32)
-        footprint = np.ones((2, 2), dtype=np.float32)
-        cfg_fwhm = grid_mode.GridModeConfig(stack_weight_method="noise_fwhm")
-        cfg_var = grid_mode.GridModeConfig(stack_weight_method="noise_variance")
-        w_fwhm = grid_mode._compute_frame_weight(frame, patch, footprint, cfg_fwhm)
-        w_var = grid_mode._compute_frame_weight(frame, patch, footprint, cfg_var)
-        assert w_fwhm == w_var
 
 
 # ---------------------------------------------------------------------------

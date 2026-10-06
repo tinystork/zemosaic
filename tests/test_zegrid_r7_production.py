@@ -11,6 +11,8 @@ directory (skipped with an explicit reason when absent), mirroring the R6 tests.
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,15 +21,16 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-from zemosaic import grid_mode
+from zemosaic import zemosaic_stack_plan
 from zemosaic import zemosaic_zegrid_mode as zegrid
+from zemosaic import zemosaic_worker as zw
 from zemosaic.core.zegrid import auto_layout as zal
 from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import sweep as zsw
 from zemosaic.zemosaic_worker import (
-    _resolve_grid_engine,
     _resolve_zegrid_normalization,
 )
+from zemosaic.zemosaic_utils import load_image_with_optional_alpha
 
 LIGHTS = Path("/home/tristan/M106/lights")
 N_END_TO_END_FRAMES = 6
@@ -77,23 +80,6 @@ def test_sweep_peak_rss_portable_without_resource(monkeypatch):
 # (ii) Engine dispatch + normalization resolution
 # ---------------------------------------------------------------------------
 
-def test_resolve_grid_engine_default_zegrid():
-    assert _resolve_grid_engine({}, None) == "zegrid"
-    assert _resolve_grid_engine({"grid_engine": "zegrid"}, None) == "zegrid"
-
-
-def test_resolve_grid_engine_legacy():
-    assert _resolve_grid_engine({"grid_engine": "legacy"}, None) == "legacy"
-
-
-def test_resolve_grid_engine_invalid_defaults_zegrid():
-    assert _resolve_grid_engine({"grid_engine": "bogus"}, None) == "zegrid"
-
-
-def test_resolve_grid_engine_from_zconfig():
-    assert _resolve_grid_engine({}, SimpleNamespace(grid_engine="legacy")) == "legacy"
-
-
 def test_resolve_zegrid_normalization_default_sky_mean():
     # No explicit choice (empty cache) -> sky_mean (ZeGrid default), NOT legacy linear_fit.
     assert _resolve_zegrid_normalization({}, "linear_fit") == "sky_mean"
@@ -107,10 +93,10 @@ def test_resolve_zegrid_normalization_explicit_honoured():
     assert _resolve_zegrid_normalization({"stack_norm_method": "none"}, "x") == "none"
 
 
-def test_legacy_grid_path_still_reachable():
-    # The legacy engine module + entry point remain importable and callable.
-    assert hasattr(grid_mode, "run_grid_mode")
-    assert callable(grid_mode.run_grid_mode)
+def test_legacy_grid_module_removed():
+    # The legacy Grid engine module is GONE (archived at
+    # origin/archive/zegrid-legacy-grid-5.0.0); it must no longer be importable.
+    assert importlib.util.find_spec("zemosaic.grid_mode") is None
 
 
 # ---------------------------------------------------------------------------
@@ -132,15 +118,49 @@ def test_normalization_linear_fit_honoured(caplog):
 # No silent fallback
 # ---------------------------------------------------------------------------
 
-def test_zegrid_mode_no_silent_legacy_fallback(tmp_path, monkeypatch):
-    # run_zegrid_mode must RAISE on failure and never silently invoke the legacy
-    # grid_mode.run_grid_mode path.
-    called = []
-    monkeypatch.setattr(grid_mode, "run_grid_mode", lambda *a, **k: called.append(1))
+def test_zegrid_mode_raises_on_failure_no_fallback(tmp_path):
+    # run_zegrid_mode must RAISE on failure; there is no legacy fallback anymore.
     (tmp_path / "stack_plan.csv").write_text("file_path\n", encoding="utf-8")
     with pytest.raises(RuntimeError):
         zegrid.run_zegrid_mode(str(tmp_path), str(tmp_path / "out"))
-    assert called == []
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R8 — direct stack_plan.csv -> ZeGrid dispatch + relocated decoder
+# ---------------------------------------------------------------------------
+
+def test_worker_dispatch_direct_to_zegrid_no_engine_setting():
+    # The legacy branch and _resolve_grid_engine are removed; the dispatcher
+    # routes stack_plan.csv DIRECTLY to run_zegrid_mode (no grid_engine setting).
+    assert not hasattr(zw, "_resolve_grid_engine")
+    dispatcher_src = inspect.getsource(zw.run_hierarchical_mosaic)
+    assert "run_zegrid_mode" in dispatcher_src
+    assert "run_grid_mode" not in dispatcher_src
+    assert "grid_engine" not in dispatcher_src
+
+
+def test_worker_detect_grid_mode_delegates_to_relocated_module(tmp_path):
+    # Worker's detect_grid_mode delegates to zemosaic_stack_plan.detect_grid_mode.
+    assert zw.detect_grid_mode(str(tmp_path)) is False
+    (tmp_path / "stack_plan.csv").write_text("file_path\n", encoding="utf-8")
+    assert zw.detect_grid_mode(str(tmp_path)) is True
+    assert zemosaic_stack_plan.detect_grid_mode(str(tmp_path)) is True
+
+
+def test_load_image_with_optional_alpha_mono_hwc(tmp_path):
+    # Relocated decoder (formerly grid_mode._load_image_with_optional_alpha) must
+    # decode a mono (non-Bayer) 2-D FITS into HWC float32 with no alpha weights.
+    h, w = 8, 10
+    data = np.arange(h * w, dtype=np.float32).reshape(h, w)
+    path = tmp_path / "mono.fits"
+    fits.writeto(path, data, overwrite=True)
+
+    arr, weights = load_image_with_optional_alpha(path)
+
+    assert arr.shape == (h, w, 1)
+    assert arr.dtype == np.float32
+    assert weights is None
+    np.testing.assert_allclose(arr[..., 0], data, rtol=1e-6)
 
 
 # ---------------------------------------------------------------------------

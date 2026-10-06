@@ -5,7 +5,7 @@ re-implement the canonical pipeline or the R1-R6 science; it wires the frozen
 foundation modules into the production ``stack_plan.csv`` path:
 
 * **FRAME-MAJOR decode-once** — each frame is decoded ONCE via the existing
-  product decoder (:func:`zemosaic.grid_mode._load_image_with_optional_alpha`,
+  product decoder (:func:`zemosaic.zemosaic_utils.load_image_with_optional_alpha`,
   i.e. ``load_and_validate_fits`` + ``debayer_image``), then for every Cell whose
   patch that frame touches the required source ROI is reprojected and
   APPENDED to that Cell's aligned disk cache (R6 ``file_provider`` format,
@@ -24,8 +24,9 @@ Normalization is ``sky_mean`` by DEFAULT (Tristan's decision; the frozen
 honoured but logs a clear WARNING (see ``core/zegrid/science_adapter.py``).
 
 There is **NO silent engine fallback**: any ZeGrid failure raises (mirroring the
-legacy Grid abort), and the legacy ``grid_mode.run_grid_mode`` path is untouched
-(selected via the ``grid_engine`` setting in the worker dispatch).
+removed legacy Grid abort). The legacy Grid engine was REMOVED (ZM-ZEGRID-R8)
+and is ARCHIVED at ``origin/archive/zegrid-legacy-grid-5.0.0``; ``stack_plan.csv``
+routes DIRECTLY to this ZeGrid path (no ``grid_engine`` setting).
 
 ## Reproducibility (IMPORTANT, durable)
 
@@ -61,7 +62,8 @@ import psutil
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from . import grid_mode as _legacy_grid
+from . import zemosaic_stack_plan as _stack_plan
+from .zemosaic_utils import load_image_with_optional_alpha
 from .core.canonical_streaming import run_canonical_stack_streaming
 from .core.zegrid import assembly as za
 from .core.zegrid import auto_layout as zal
@@ -192,7 +194,7 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback):
     rejected = []
     for fi in frames_info:
         if fi.wcs is None or fi.shape_hw is None:
-            ok = _legacy_grid._load_frame_wcs(fi, progress_callback=progress_callback)
+            ok = _stack_plan.load_frame_wcs(fi, progress_callback=progress_callback)
             if not ok or fi.wcs is None or fi.shape_hw is None:
                 rejected.append({"path": str(fi.path), "reason": "no usable celestial WCS/shape"})
                 continue
@@ -231,12 +233,12 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback):
 def _decode_frame_hwc(frame_desc, progress_callback):
     """Decode ONE raw frame via the existing product decoder -> HWC float32 RGB.
 
-    Uses :func:`zemosaic.grid_mode._load_image_with_optional_alpha` verbatim
+    Uses :func:`zemosaic.zemosaic_utils.load_image_with_optional_alpha` verbatim
     (``load_and_validate_fits`` + ``debayer_image``). Returns ``(H, W, 3)``
     float32. Mono (non-Bayer) inputs are replicated to 3 channels to match the
     RGB-oriented ZeGrid pipeline. Peak memory O(1 frame).
     """
-    arr, _weights = _legacy_grid._load_image_with_optional_alpha(
+    arr, _weights = load_image_with_optional_alpha(
         Path(frame_desc.source_path), progress_callback=progress_callback
     )
     arr = np.asarray(arr, dtype=np.float32)
@@ -842,7 +844,7 @@ def _write_outputs(
 
 
 # ---------------------------------------------------------------------------
-# Public entry point (mirrors legacy run_grid_mode signature)
+# Public entry point
 # ---------------------------------------------------------------------------
 
 def run_zegrid_mode(
@@ -868,8 +870,7 @@ def run_zegrid_mode(
 ) -> None:
     """Run the NEW ZeGrid engine over a ``stack_plan.csv`` (production entry).
 
-    Signature mirrors :func:`zemosaic.grid_mode.run_grid_mode` so the worker can
-    call it with the same arguments. Normalization defaults to ``sky_mean``;
+    Normalization defaults to ``sky_mean``;
     weighting/rejection/combine/taper use the frozen ZeGrid science config.
     """
     _emit("ZeGrid engine activated (stack_plan.csv detected)", callback=progress_callback)
@@ -881,7 +882,7 @@ def run_zegrid_mode(
         )
 
     csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
-    frames_info = _legacy_grid.load_stack_plan(csv_path, progress_callback=progress_callback)
+    frames_info = _stack_plan.load_stack_plan(csv_path, progress_callback=progress_callback)
     if not frames_info:
         raise RuntimeError("ZeGrid failed: no frames loaded from stack_plan.csv")
 
@@ -896,7 +897,7 @@ def run_zegrid_mode(
     )
 
     # PINNABLE layout (reproducibility): read ``zegrid_layout`` from the same
-    # config source as ``grid_engine`` (zconfig is SimpleNamespace(**worker_config_cache)).
+    # config source (zconfig is SimpleNamespace(**worker_config_cache)).
     pinned_layout = None
     if zconfig is not None:
         try:
@@ -911,7 +912,7 @@ def run_zegrid_mode(
                 callback=progress_callback,
             )
 
-    # MOUNT SEGREGATION (same rule as legacy grid_mode ~4643).
+    # MOUNT SEGREGATION (same rule as the removed legacy Grid).
     known_mount_frames = [f for f in frames_info if f.mount]
     mount_values = {f.mount for f in known_mount_frames}
     base_out = Path(output_folder).expanduser()

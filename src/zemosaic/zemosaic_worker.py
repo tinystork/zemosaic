@@ -81,10 +81,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-try:
-    from . import grid_mode
-except Exception:
-    grid_mode = None
+from . import zemosaic_stack_plan
 
 from .zemosaic_resource_telemetry import (
     ResourceTelemetryController,
@@ -707,37 +704,7 @@ def _normpath_parts(path: str | os.PathLike | None) -> tuple[str, ...]:
 def detect_grid_mode(input_folder: str | os.PathLike | None) -> bool:
     """Return True when Grid/Survey mode should be activated (stack_plan.csv present)."""
 
-    if grid_mode and hasattr(grid_mode, "detect_grid_mode"):
-        try:
-            return bool(grid_mode.detect_grid_mode(input_folder))  # type: ignore[attr-defined]
-        except Exception as exc:
-            try:
-                logger.debug("[GRID] detect_grid_mode failed: %s", exc)
-            except Exception:
-                pass
-    try:
-        return Path(input_folder or "").expanduser().joinpath("stack_plan.csv").is_file()
-    except Exception:
-        return False
-
-
-def _resolve_grid_engine(worker_config_cache, zconfig) -> str:
-    """Return the selected Grid engine: ``"zegrid"`` (DEFAULT) or ``"legacy"``.
-
-    Reads ``grid_engine`` from the same config source the worker already uses
-    (``worker_config_cache`` then ``zconfig``). Unknown/empty values fall back to
-    ``"zegrid"`` (the default). ``"legacy"`` keeps the byte-identical
-    ``grid_mode.run_grid_mode`` path reachable.
-    """
-    value = None
-    if isinstance(worker_config_cache, dict):
-        value = worker_config_cache.get("grid_engine")
-    if value is None and zconfig is not None and hasattr(zconfig, "grid_engine"):
-        value = getattr(zconfig, "grid_engine")
-    token = str(value or "").strip().lower()
-    if token == "legacy":
-        return "legacy"
-    return "zegrid"
+    return zemosaic_stack_plan.detect_grid_mode(input_folder)
 
 
 def _resolve_zegrid_normalization(worker_config_cache, stack_norm_method) -> str:
@@ -30889,88 +30856,47 @@ def run_hierarchical_mosaic(
     )
     setattr(zconfig, "final_mosaic_black_point_percentile", final_mosaic_black_point_percentile)
 
-    grid_mode_detected = detect_grid_mode(input_folder)
-    if grid_mode_detected:
-        grid_engine = _resolve_grid_engine(worker_config_cache, zconfig)
-        if grid_engine == "zegrid":
-            # NEW ZeGrid engine (default). No silent fallback: any failure raises.
-            try:
-                from .zemosaic_zegrid_mode import run_zegrid_mode
-            except Exception as exc:
-                logger.error("[GRID] ZeGrid engine unavailable; aborting (no legacy fallback).", exc_info=True)
-                raise RuntimeError("[GRID] ZeGrid engine unavailable") from exc
-            try:
-                zegrid_norm = _resolve_zegrid_normalization(worker_config_cache, stack_norm_method)
-                logger.info(
-                    "[GRID] Invoking ZeGrid engine run_zegrid_mode(...) with "
-                    "stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
-                    zegrid_norm,
-                    stack_weight_method,
-                    stack_reject_algo,
-                    stack_final_combine,
-                )
-                run_zegrid_mode(
-                    input_folder=input_folder,
-                    output_folder=output_folder,
-                    progress_callback=progress_callback,
-                    stack_norm_method=zegrid_norm,
-                    stack_weight_method=stack_weight_method,
-                    stack_reject_algo=stack_reject_algo,
-                    stack_kappa_low=stack_kappa_low,
-                    stack_kappa_high=stack_kappa_high,
-                    winsor_limits=parsed_winsor_limits,
-                    stack_final_combine=stack_final_combine,
-                    apply_radial_weight=apply_radial_weight_config,
-                    radial_feather_fraction=radial_feather_fraction_config,
-                    radial_shape_power=radial_shape_power_config,
-                    save_final_as_uint16=save_final_as_uint16_config,
-                    legacy_rgb_cube=legacy_rgb_cube_config,
-                    grid_rgb_equalize=grid_rgb_equalize_flag,
-                    zconfig=zconfig,
-                )
-                return
-            except Exception:
-                logger.error("[GRID] ZeGrid engine failed; aborting (no silent fallback to legacy).", exc_info=True)
-                raise
-        # grid_engine == "legacy" -> unchanged legacy path below.
-        if grid_mode and hasattr(grid_mode, "run_grid_mode"):
-            try:
-                logger.info(
-                    "[GRID] Invoking grid_mode.run_grid_mode(...) with "
-                    "grid_rgb_equalize=%s (source=%s), stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
-                    grid_rgb_equalize_flag,
-                    grid_rgb_equalize_source,
-                    stack_norm_method,
-                    stack_weight_method,
-                    stack_reject_algo,
-                    stack_final_combine,
-                )
-                grid_mode.run_grid_mode(  # type: ignore[attr-defined]
-                    input_folder=input_folder,
-                    output_folder=output_folder,
-                    progress_callback=progress_callback,
-                    stack_norm_method=stack_norm_method,
-                    stack_weight_method=stack_weight_method,
-                    stack_reject_algo=stack_reject_algo,
-                    stack_kappa_low=stack_kappa_low,
-                    stack_kappa_high=stack_kappa_high,
-                    winsor_limits=parsed_winsor_limits,
-                    stack_final_combine=stack_final_combine,
-                    apply_radial_weight=apply_radial_weight_config,
-                    radial_feather_fraction=radial_feather_fraction_config,
-                    radial_shape_power=radial_shape_power_config,
-                    save_final_as_uint16=save_final_as_uint16_config,
-                    legacy_rgb_cube=legacy_rgb_cube_config,
-                    grid_rgb_equalize=grid_rgb_equalize_flag,
-                    zconfig=zconfig,
-                )
-                return
-            except Exception:
-                logger.error("[GRID] Grid/Survey mode failed; aborting without classic fallback", exc_info=True)
-                raise
-        error_msg = "[GRID] grid_mode module unavailable; aborting (no classic fallback)."
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
+    stack_plan_detected = detect_grid_mode(input_folder)
+    if stack_plan_detected:
+        # ZeGrid engine (stack_plan.csv). No silent fallback: any failure raises.
+        try:
+            from .zemosaic_zegrid_mode import run_zegrid_mode
+        except Exception as exc:
+            logger.error("[GRID] ZeGrid engine unavailable; aborting.", exc_info=True)
+            raise RuntimeError("[GRID] ZeGrid engine unavailable") from exc
+        try:
+            zegrid_norm = _resolve_zegrid_normalization(worker_config_cache, stack_norm_method)
+            logger.info(
+                "[GRID] Invoking ZeGrid engine run_zegrid_mode(...) with "
+                "stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
+                zegrid_norm,
+                stack_weight_method,
+                stack_reject_algo,
+                stack_final_combine,
+            )
+            run_zegrid_mode(
+                input_folder=input_folder,
+                output_folder=output_folder,
+                progress_callback=progress_callback,
+                stack_norm_method=zegrid_norm,
+                stack_weight_method=stack_weight_method,
+                stack_reject_algo=stack_reject_algo,
+                stack_kappa_low=stack_kappa_low,
+                stack_kappa_high=stack_kappa_high,
+                winsor_limits=parsed_winsor_limits,
+                stack_final_combine=stack_final_combine,
+                apply_radial_weight=apply_radial_weight_config,
+                radial_feather_fraction=radial_feather_fraction_config,
+                radial_shape_power=radial_shape_power_config,
+                save_final_as_uint16=save_final_as_uint16_config,
+                legacy_rgb_cube=legacy_rgb_cube_config,
+                grid_rgb_equalize=grid_rgb_equalize_flag,
+                zconfig=zconfig,
+            )
+            return
+        except Exception:
+            logger.error("[GRID] ZeGrid engine failed; aborting.", exc_info=True)
+            raise
 
     def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
         """Shortcut to emit log+callback events with the current progress callback."""
@@ -31006,7 +30932,7 @@ def run_hierarchical_mosaic(
         sds_mode_flag = False
     global_wcs_plan["sds_mode"] = bool(sds_mode_flag)
 
-    if (not grid_mode_detected) and (not sds_mode_flag):
+    if (not stack_plan_detected) and (not sds_mode_flag):
         # Keep prune parameters explicit in classic path (fallback to config cache).
         # This avoids accidental fallback to legacy defaults (K=8, mode=area).
         try:
