@@ -1212,14 +1212,31 @@ def _run_single(
     # per-phase footprint — the gauge reprojects full-canvas frames so it is heavier
     # than the per-cell cache build).
     if workers is None:
-        gauge_footprint = zpar._GAUGE_PER_WORKER_FOOTPRINT_BYTES
-        cache_footprint = zpar._CACHE_PER_WORKER_FOOTPRINT_BYTES
-        gauge_workers = zpar.choose_workers(None, available_memory_bytes(), gauge_footprint)
-        cache_workers = zpar.choose_workers(None, available_memory_bytes(), cache_footprint)
+        # ZM-ZEGRID-R17 (R16-M1 fix): derive the per-worker footprint from the ACTUAL
+        # pixel areas rather than a static estimate. The gauge's pairs pass unions
+        # the reference's and the frame's bboxes, which can approach the CANVAS
+        # area; the cache build reprojects one cell patch. Using the real areas
+        # prevents over-spawning (OOM) on a large mosaic.
+        canvas_px = int(canvas.width) * int(canvas.height)
+        patch_px = 0
+        for _row, _col, _cell, _patch, _mem in cell_ctxs:
+            try:
+                _ph, _pw = _patch.patch_shape_hw
+                patch_px = max(patch_px, int(_ph) * int(_pw))
+            except Exception:
+                pass
+        gauge_footprint = zpar.gauge_footprint_bytes(canvas_px)
+        cache_footprint = zpar.cache_footprint_bytes(patch_px or canvas_px)
+        # ZM-ZEGRID-R17 (R16-M1): budget on a FRACTION of the available RAM (the
+        # workers' peak sits on top of the main process + the product) so the rule
+        # cannot admit more workers than the machine can hold.
+        worker_budget = int(available_memory_bytes() * zpar.RAM_SAFETY_FRACTION)
+        gauge_workers = zpar.choose_workers(None, worker_budget, gauge_footprint)
+        cache_workers = zpar.choose_workers(None, worker_budget, cache_footprint)
         _emit(
             f"ZeGrid: parallel workers — gauge={gauge_workers} "
             f"(CPU={os.cpu_count()}, avail={available / 2**30:.2f}GiB, "
-            f"footprint={gauge_footprint / 2**20:.0f}MiB), "
+            f"budget={worker_budget / 2**30:.2f}GiB, footprint={gauge_footprint / 2**20:.0f}MiB), "
             f"cache_build={cache_workers} (footprint={cache_footprint / 2**20:.0f}MiB)",
             callback=progress_callback,
         )

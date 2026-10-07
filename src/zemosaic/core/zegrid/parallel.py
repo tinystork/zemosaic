@@ -56,6 +56,40 @@ _GAUGE_PER_WORKER_FOOTPRINT_BYTES = _PER_WORKER_BASELINE_BYTES + (1600 * 1200 * 
 # patch reprojection — smaller working set than the full-canvas gauge).
 _CACHE_PER_WORKER_FOOTPRINT_BYTES = _PER_WORKER_BASELINE_BYTES + (512 * 512 * 3 * 8)
 
+# ZM-ZEGRID-R17 (R16-M1 fix): the static estimates above UNDER-count the real
+# per-worker cost on a large mosaic. A gauge worker reprojects a frame over its
+# footprint bbox, and the pairs pass over the UNION of the reference's and the
+# frame's bboxes — which can approach the CANVAS area (e.g. ~18 Mpx on the real
+# Caldwell canvas -> ~0.66-1.0 GiB/worker instead of ~0.39 GiB). The production
+# call site therefore derives the footprint from the ACTUAL canvas / patch pixel
+# area (helpers below); the constants remain as conservative fallbacks.
+_CHANNELS_F64_TEMPS_BYTES = 3 * 8   # float64 RGB temporaries inside the worker
+_CHANNELS_F32_PLANE_BYTES = 3 * 4   # the float32 RGB plane the task keeps
+
+# ZM-ZEGRID-R17 (R16-M1 fix): the production decision budgets on a FRACTION of the
+# available RAM so the workers' peak (which is on top of the main process and the
+# product) cannot exhaust the machine. The rule itself is unchanged; the caller
+# applies this headroom to the `available_bytes` it passes.
+RAM_SAFETY_FRACTION = 0.8
+
+
+def gauge_footprint_bytes(canvas_px: int) -> int:
+    """Worst-case per-worker gauge footprint: the union bbox may approach the canvas.
+
+    ``canvas_px`` is the canvas area in pixels (``width * height``). Using the whole
+    canvas is a deliberate CONSERVATIVE upper bound (the pairs pass unions the
+    reference's and the frame's bboxes); it prevents over-spawning on large mosaics
+    where a static small-bbox estimate under-counts by ~2-2.6x.
+    """
+    px = max(0, int(canvas_px))
+    return _PER_WORKER_BASELINE_BYTES + px * (_CHANNELS_F64_TEMPS_BYTES + _CHANNELS_F32_PLANE_BYTES)
+
+
+def cache_footprint_bytes(patch_px: int) -> int:
+    """Per-worker cache-build footprint (one per-cell patch reprojection)."""
+    px = max(0, int(patch_px))
+    return _PER_WORKER_BASELINE_BYTES + px * (_CHANNELS_F64_TEMPS_BYTES + _CHANNELS_F32_PLANE_BYTES)
+
 
 def adaptive_worker_count(
     cpu: int,
