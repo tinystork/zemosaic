@@ -441,6 +441,7 @@ def test_deletion_failure_does_not_change_result(tmp_path, monkeypatch):
 # Gated end-to-end: per-cell delete failure -> run completes, science bit-equal
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
 def test_end_to_end_delete_failure_non_fatal_and_bit_equal(tmp_path, monkeypatch):
     import shutil as _sh

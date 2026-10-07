@@ -294,10 +294,10 @@ def _synthetic_tan_wcs(shape=(20, 20)):
 # Layout scan explainability: candidate + rejection reasons + LayoutInfeasible
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
-def test_layout_scan_logs_candidates_and_rejection():
-    frames, _ = zg.read_manifest(LIGHTS)
-    canvas = zg.build_canvas(frames)
+def test_layout_scan_logs_candidates_and_rejection(m106_corpus):
+    frames, _rejected, canvas = m106_corpus
     msgs = []
     zz._choose_layout_mode_aware(
         canvas, frames, ram_budget=int(4 * 2**30),
@@ -311,10 +311,10 @@ def test_layout_scan_logs_candidates_and_rejection():
     assert "source=auto" in chosen[0]
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
-def test_layout_infeasible_message_states_binding_and_budget_and_remedy():
-    frames, _ = zg.read_manifest(LIGHTS)
-    canvas = zg.build_canvas(frames)
+def test_layout_infeasible_message_states_binding_and_budget_and_remedy(m106_corpus):
+    frames, _rejected, canvas = m106_corpus
     msgs = []
     with pytest.raises(zal.LayoutInfeasible) as exc:
         zz._choose_layout_mode_aware(

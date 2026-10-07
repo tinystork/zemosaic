@@ -76,14 +76,15 @@ def _gate_or_skip(n: int):
 
 
 @pytest.fixture(scope="module")
-def manifest():
-    frames, _ = zg.read_manifest(LIGHTS)
+def manifest(m106_corpus):
+    frames, _rejected, _canvas = m106_corpus
     return frames
 
 
 @pytest.fixture(scope="module")
-def canvas(manifest):
-    return zg.build_canvas(manifest)
+def canvas(m106_corpus):
+    _frames, _rejected, canvas = m106_corpus
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,7 @@ def corner_run(manifest, canvas):
     return _run_cell(manifest, canvas, 0, 0, "linear_fit")
 
 
+@pytest.mark.slow
 def test_corner_cell_single_frame_guard(corner_run):
     res = corner_run
     assert res.cell_id == "r0000c0000"
@@ -173,6 +175,7 @@ def test_corner_cell_single_frame_guard(corner_run):
     assert res.adequacy.excluded_count == 6
 
 
+@pytest.mark.slow
 def test_section_read_locality(manifest, canvas, corner_run):
     res = corner_run
     assert len(res.section_reads) == 7
@@ -181,6 +184,7 @@ def test_section_read_locality(manifest, canvas, corner_run):
         assert rec.source_bounds.width * rec.source_bounds.height * 3 == rec.n_pixels_read
 
 
+@pytest.mark.slow
 def test_permutation_determinism(manifest, canvas, corner_run):
     # Same cell, reversed frame list -> identical reference/exclusion/adequacy.
     rev = _run_cell(manifest, canvas, 0, 0, "linear_fit")  # sorts internally
@@ -195,6 +199,7 @@ def test_permutation_determinism(manifest, canvas, corner_run):
 # Rework: sky_mean variant — normalization-only defect evidence (no full stack)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_normalization_defect_evidence(manifest, canvas):
     """Document the linear_fit defect on real contributors (normalization-only).
 
@@ -266,6 +271,7 @@ def chosen_run(manifest, canvas):
     pytest.skip("no candidate reached effective>=3 under sky_mean within 6 cells")
 
 
+@pytest.mark.slow
 def test_chosen_cell_multiframe_guard(chosen_run):
     cand, adequacy = chosen_run
     assert adequacy["effective_contributor_count"] >= 3
@@ -291,6 +297,7 @@ def _rc(cell_id: str) -> tuple[int, int]:
     return int(cell_id[1:5]), int(cell_id[6:10])
 
 
+@pytest.mark.slow
 def test_seam_diagnostic_computed_and_recorded(manifest, canvas):
     """Compute the seam diagnostic on the chosen multi-frame Cell + neighbour."""
     import json

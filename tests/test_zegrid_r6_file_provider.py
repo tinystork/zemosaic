@@ -288,6 +288,7 @@ def _fixtures_present():
     return FIXTURES.exists() and len(list(FIXTURES.glob("*_rgb.fits"))) >= 66
 
 
+@pytest.mark.slow
 def test_real_cell_streaming_vs_inmemory_parity():
     if not _fixtures_present():
         pytest.skip("M106 fixtures missing (run prepare_rgb_fixture.py)")

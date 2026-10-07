@@ -308,12 +308,13 @@ def test_manifest_has_ignored_run_args(tmp_path):
 # F1: bounded gauge vs full-canvas gauge — NEAR-FULL-OVERLAP (M16) case
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M16 lights directory not present")
-def test_bounded_gauge_near_full_overlap_matches_full_canvas(tmp_path):
+def test_bounded_gauge_near_full_overlap_matches_full_canvas(tmp_path, m16_corpus):
     """M16 = NEAR-FULL-OVERLAP (bboxes ≈ canvas): bounded gauge matches the
     full-canvas gauge EXACTLY (array-equal). This is the case where the claim of
     exact equality is valid; partial overlap is covered separately (tolerance)."""
-    descs, _ = zg.read_manifest(LIGHTS)
+    descs, _full_canvas = m16_corpus
     descs = sorted(descs, key=lambda d: d.frame_id)[:6]
     canvas = zg.build_canvas(descs)
     config = ExecutorConfig().science_config()
@@ -482,10 +483,10 @@ def _dir_hash(d: Path) -> str:
     return h.hexdigest()
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M16 lights directory not present")
-def test_parallel_cache_bit_equal_serial(tmp_path):
-    descs, _ = zg.read_manifest(LIGHTS)
-    canvas = zg.build_canvas(descs)
+def test_parallel_cache_bit_equal_serial(tmp_path, m16_corpus):
+    descs, canvas = m16_corpus
     nx, ny = 3, 3
     cell_ctxs = []
     for row, col, _b in zg.build_layout(canvas, nx, ny).iter_cells(canvas):

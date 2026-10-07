@@ -79,14 +79,15 @@ def _gate_or_skip(n: int):
 
 
 @pytest.fixture(scope="module")
-def manifest():
-    frames, _ = zg.read_manifest(LIGHTS)
+def manifest(m106_corpus):
+    frames, _rejected, _canvas = m106_corpus
     return frames
 
 
 @pytest.fixture(scope="module")
-def canvas(manifest):
-    return zg.build_canvas(manifest)
+def canvas(m106_corpus):
+    _frames, _rejected, canvas = m106_corpus
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +232,7 @@ def corner_exec(manifest, canvas):
     return _run_cell(manifest, canvas, 0, 0)
 
 
+@pytest.mark.slow
 def test_executor_corner_cell_complete(corner_exec):
     res = corner_exec
     assert res.cell_id == "r0000c0000"
@@ -245,6 +247,7 @@ def test_executor_corner_cell_complete(corner_exec):
     assert res.section_read_count == 7
 
 
+@pytest.mark.slow
 def test_executor_rerun_stable(manifest, canvas, corner_exec):
     """Per-cell result is stable on rerun (deterministic executor)."""
     rev = _run_cell(manifest, canvas, 0, 0)
@@ -266,6 +269,7 @@ def _load_persisted_layout(out_dir: str):
     return json.loads(manifest_path.read_text())
 
 
+@pytest.mark.slow
 def test_m106_full_layout_manifest_present():
     manifest = _load_persisted_layout("/home/tristan/zegrid_r3_m106_outputs")
     assert manifest["canvas"]["width"] == 2403
@@ -285,6 +289,7 @@ def test_m106_full_layout_manifest_present():
     assert "holes" in manifest
 
 
+@pytest.mark.slow
 def test_m106_assembly_coverage_preserved():
     manifest = _load_persisted_layout("/home/tristan/zegrid_r3_m106_outputs")
     assert manifest["holes"]["coverage_pixels"] > 0
@@ -297,6 +302,7 @@ def test_m106_assembly_coverage_preserved():
 # M16 depth guard (Scope C): >=1 cell with effective contributors >= 20
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_m16_depth_guard():
     out = Path("/home/tristan/zegrid_r3_m16_outputs")
     manifest_path = out / "assembly_manifest.json"

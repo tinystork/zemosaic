@@ -104,6 +104,7 @@ def m16_results():
     }
 
 
+@pytest.mark.slow
 def test_layout_independence_identical_science(m16_results):
     r = m16_results
     assert r["hash_3x3_after"] == PINNED_SCIENCE_SHA256
@@ -112,6 +113,7 @@ def test_layout_independence_identical_science(m16_results):
     np.testing.assert_array_equal(r["science_3x3_after"], r["science_2x2_after"])
 
 
+@pytest.mark.slow
 def test_reference_unification(m16_results):
     r = m16_results
     # BEFORE: each cell picks its OWN reference (the root cause).
@@ -122,6 +124,7 @@ def test_reference_unification(m16_results):
     assert r["global_frame_ids"][int(r["gauge"].reference_index)] == PINNED_GLOBAL_REFERENCE
 
 
+@pytest.mark.slow
 def test_seam_metric_improves(m16_results):
     r = m16_results
     before = r["seam_before"]
