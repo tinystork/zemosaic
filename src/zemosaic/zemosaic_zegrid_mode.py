@@ -128,6 +128,37 @@ def available_memory_bytes() -> int:
     return int(psutil.virtual_memory().available)
 
 
+# ZM-ZEGRID-R15: Windows releases file handles asynchronously, so a memmap/``.npy``
+# may still be open when the cache is deleted -> ``WinError 32``. Deletion is an
+# OPTIMISATION and must NEVER fail a run: retry a few times with a short backoff
+# and, on final failure, emit a WARN and continue.
+_RMTREE_ATTEMPTS = 3
+_RMTREE_BACKOFF_S = 0.2
+
+
+def _safe_rmtree(path, progress_callback=None) -> bool:
+    """Best-effort recursive delete (never raises); emits a WARN on final failure."""
+    path = Path(path)
+    if not path.exists():
+        return True
+    last_exc = None
+    for attempt in range(_RMTREE_ATTEMPTS):
+        try:
+            shutil.rmtree(str(path))
+            return True
+        except OSError as exc:  # noqa: BLE001 - deletion is best-effort by design
+            last_exc = exc
+            if attempt + 1 < _RMTREE_ATTEMPTS:
+                time.sleep(_RMTREE_BACKOFF_S * (attempt + 1))
+    _emit(
+        f"cache cleanup FAILED (non-fatal): {last_exc}; leftover cache at {path} "
+        f"will be reused or ignored",
+        lvl="WARN",
+        callback=progress_callback,
+    )
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Normalization policy (sky_mean default; linear_fit honoured + warned)
 # ---------------------------------------------------------------------------
@@ -342,8 +373,8 @@ def _build_one_cell_cache(
     cache_dir = Path(cache_dir)
     if reuse_cache and zfp.cache_is_complete(str(cache_dir), frame_ids):
         return zfp.load_cache_manifest(str(cache_dir))
-    if cache_dir.exists():
-        shutil.rmtree(str(cache_dir))
+    # R15: rebuild wipe is best-effort (Windows WinError 32 on open handles).
+    _safe_rmtree(cache_dir, progress_callback)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     patch_wcs_header = patch.patch_wcs_header
@@ -800,6 +831,9 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
         rgb, sup = provider.get_raw_frame(i)
         images.append(np.array(rgb, dtype=np.float32, copy=True))
         supports.append(np.array(sup, dtype=bool, copy=True))
+    # R15: release the memmap handles once the aligned frames are materialised
+    # (Windows: the cache dir is deleted right after this cell).
+    provider.close()
     inmem_provider = InMemoryCanonicalProvider(images, supports)
     request = zstream.build_streaming_request(config, inmem_provider.n_frames)
     result = run_canonical_stack_streaming(
@@ -812,11 +846,16 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
 
 def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STREAM_TILE_SIZE, fixed=None):
     provider = zfp.MemmapCanonicalProvider(cache_dir)
-    request = zstream.build_streaming_request(config, provider.n_frames)
-    result = run_canonical_stack_streaming(provider, request, tile_size=tile_size, fixed=fixed)
-    sres = _build_cell_sres(result, list(provider.frame_ids))
-    mt = za.extract_minitile(patch, sres)
-    return mt, sres
+    try:
+        request = zstream.build_streaming_request(config, provider.n_frames)
+        result = run_canonical_stack_streaming(provider, request, tile_size=tile_size, fixed=fixed)
+        sres = _build_cell_sres(result, list(provider.frame_ids))
+        mt = za.extract_minitile(patch, sres)
+        return mt, sres
+    finally:
+        # R15: release the memmap handles before the caller deletes the cache
+        # (Windows: an open .npy cannot be deleted -> WinError 32).
+        provider.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1110,7 +1149,7 @@ def _run_single(
         callback=progress_callback,
     )
     if gauge_cache_dir.exists():
-        shutil.rmtree(str(gauge_cache_dir))
+        _safe_rmtree(gauge_cache_dir, progress_callback)
 
     # PER-CELL: build aligned cache (parallel reproject) -> stack -> DELETE cache
     # (per-cell temp reuse: peak disk is the LARGEST single cell, not the sum).
@@ -1171,9 +1210,14 @@ def _run_single(
 
         # R11: subset the global gauge to THIS cell's frames (in cache order), so
         # the cell reuses the SAME per-frame coefficients/weights as every other
-        # cell (a single photometric anchor).
+        # cell (a single photometric anchor). Open the provider ONLY long enough
+        # to read the frame-id list, then CLOSE it (R15: release the memmap
+        # handles before the cache is deleted below).
         cell_provider = zfp.MemmapCanonicalProvider(cache_dir)
-        cell_frame_ids = list(cell_provider.frame_ids)
+        try:
+            cell_frame_ids = list(cell_provider.frame_ids)
+        finally:
+            cell_provider.close()
         cell_fixed = subset_fixed_normalization(
             global_gauge, global_frame_ids, cell_frame_ids
         )
@@ -1222,8 +1266,8 @@ def _run_single(
         )
 
         # Per-cell temp reuse: delete the cell cache after stacking (bounded disk).
-        if cache_dir.exists():
-            shutil.rmtree(str(cache_dir))
+        # R15: best-effort (Windows WinError 32 on open handles -> WARN + continue).
+        _safe_rmtree(cache_dir, progress_callback)
 
     _cache_rep.end(
         throughput=_fmt_throughput(cache_total_frames, timings.get("cache_build"), "frames/s")

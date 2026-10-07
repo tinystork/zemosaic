@@ -59,6 +59,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -97,7 +100,6 @@ __all__ = [
 def cache_manifest_path(cache_dir) -> Path:
     return Path(cache_dir) / "manifest.json"
 
-
 def _frame_rgb_path(cache_dir, idx: int) -> Path:
     return Path(cache_dir) / f"frame_{idx:04d}_rgb.npy"
 
@@ -112,6 +114,53 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+# ZM-ZEGRID-R15: Windows releases file handles asynchronously; a memmap/``.npy``
+# may still be open when we try to delete the cache, raising ``WinError 32``.
+# Deletion is an OPTIMISATION, never fatal: retry a few times with a short
+# backoff, and on final failure log a WARN and continue.
+_RMTREE_ATTEMPTS = 3
+_RMTREE_BACKOFF_S = 0.2
+
+
+def safe_rmtree(path) -> bool:
+    """Best-effort recursive delete (never raises); returns True on success."""
+    path = Path(path)
+    if not path.exists():
+        return True
+    last_exc = None
+    for attempt in range(_RMTREE_ATTEMPTS):
+        try:
+            shutil.rmtree(str(path))
+            return True
+        except OSError as exc:  # noqa: BLE001 - deletion is best-effort by design
+            last_exc = exc
+            if attempt + 1 < _RMTREE_ATTEMPTS:
+                time.sleep(_RMTREE_BACKOFF_S * (attempt + 1))
+    logging.getLogger(__name__).warning(
+        "cache cleanup FAILED (non-fatal): %s — leftover cache at %s will be reused/ignored",
+        last_exc,
+        path,
+    )
+    return False
+
+
+def _close_memmap(arr) -> None:
+    """Release a numpy memmap's underlying ``mmap`` handle (best-effort, never raises).
+
+    ZM-ZEGRID-R15: ``np.load(..., mmap_mode="r")`` returns a ``numpy.memmap`` whose
+    ``.base`` is the ``mmap.mmap`` object. Closing that ``mmap`` releases the OS file
+    handle, which is REQUIRED on Windows before the ``.npy`` file can be deleted
+    (otherwise ``WinError 32``). Falls back to ``_mmap`` if ``.base`` is unavailable.
+    """
+    for attr in ("base", "_mmap"):
+        try:
+            obj = getattr(arr, attr, None)
+            if obj is not None and hasattr(obj, "close"):
+                obj.close()
+        except Exception:
+            pass
 
 
 def _array_meta(rgb: np.ndarray):
@@ -208,10 +257,7 @@ class AlignedCacheBuilder:
 
     def __init__(self, cache_dir) -> None:
         self.cache_dir = Path(cache_dir)
-        if self.cache_dir.exists():
-            import shutil
-
-            shutil.rmtree(self.cache_dir)
+        safe_rmtree(self.cache_dir)  # ZM-ZEGRID-R15: best-effort wipe (never fatal)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._meta = None
         self._frames: list[dict] = []
@@ -355,6 +401,11 @@ class MemmapCanonicalProvider:
     The served arrays are bit-identical to the aligned arrays an in-memory
     provider would hold, because they are ``.npy`` round-trips of the same
     ``execution.reproject_cropped`` output (float32 + bool, bit-exact).
+
+    ZM-ZEGRID-R15: the provider is a CONTEXT MANAGER and exposes :meth:`close`,
+    which releases every memmap's underlying ``mmap`` handle. On Windows a file
+    still mapped/opened cannot be deleted (``WinError 32``), so callers MUST
+    ``close()`` (or ``with``) the provider BEFORE deleting the cache directory.
     """
 
     def __init__(self, cache_dir) -> None:
@@ -377,6 +428,25 @@ class MemmapCanonicalProvider:
             np.load(_frame_sup_path(self.cache_dir, i), mmap_mode="r")
             for i in range(self.n_frames)
         ]
+
+    def close(self) -> None:
+        """Release every memmap handle (idempotent; never raises).
+
+        ZM-ZEGRID-R15: must be called (or ``with`` used) before the cache
+        directory is deleted, otherwise Windows raises ``WinError 32`` on the
+        ``.npy`` files still mapped into the process.
+        """
+        for arr in list(self._rgb) + list(self._sup):
+            _close_memmap(arr)
+        self._rgb = []
+        self._sup = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     # -- metadata -----------------------------------------------------------
     @property
