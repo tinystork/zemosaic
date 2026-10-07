@@ -39,15 +39,16 @@ IGNORED_SETTING_PREFIXES: tuple[str, ...] = ("final_mosaic_dbe_",)
 
 # ``run_zegrid_mode`` arguments the ZeGrid engine ACCEPTS (for backward
 # compatibility with the removed legacy Grid) but does NOT honour, because
-# ZeGrid uses the FROZEN science config (sky_mean / noise_variance / kappa_sigma
-# / mean / footprint taper) and emits standard ``mosaic_grid.fits`` +
+# ZeGrid uses the FROZEN science config (sky_mean / noise_variance / mean /
+# footprint taper) and emits standard ``mosaic_grid.fits`` +
 # ``mosaic_grid_coverage.fits``. Surfaced so nothing is silently dropped.
+# NOTE (ZM-ZEGRID-R16): ``stack_reject_algo`` / ``stack_kappa_low`` /
+# ``stack_kappa_high`` / ``winsor_limits`` are NO LONGER ignored — they are now
+# mapped into the science config where the canonical engine supports them (see
+# ``zemosaic_zegrid_mode.resolve_rejection_science``); unsupported values stay
+# surfaced via that mapping's ``unhonoured`` dict, never silently dropped.
 IGNORED_RUN_ARGS: tuple[str, ...] = (
     "stack_weight_method",
-    "stack_reject_algo",
-    "stack_kappa_low",
-    "stack_kappa_high",
-    "winsor_limits",
     "stack_final_combine",
     "apply_radial_weight",
     "radial_feather_fraction",

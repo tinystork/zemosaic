@@ -65,6 +65,10 @@ class ExecutorConfig:
     taper: str = zs.DEFAULT_TAPER
     taper_px: float = zs.DEFAULT_TAPER_PX
     taper_floor: float = zs.DEFAULT_TAPER_FLOOR
+    sigma_low: float = zs.DEFAULT_SIGMA_LOW
+    sigma_high: float = zs.DEFAULT_SIGMA_HIGH
+    winsor_limit_low: float = zs.DEFAULT_WINSOR_LOW
+    winsor_limit_high: float = zs.DEFAULT_WINSOR_HIGH
     r1_frozen_default: str = R1_FROZEN_DEFAULT
     variant_reason: str = SKY_MEAN_VARIANT_REASON
 
@@ -78,6 +82,10 @@ class ExecutorConfig:
             taper=self.taper,
             taper_px=self.taper_px,
             taper_floor=self.taper_floor,
+            sigma_low=self.sigma_low,
+            sigma_high=self.sigma_high,
+            winsor_limit_low=self.winsor_limit_low,
+            winsor_limit_high=self.winsor_limit_high,
         )
 
     def to_dict(self) -> dict:
@@ -92,6 +100,10 @@ class ExecutorConfig:
             "taper": self.taper,
             "taper_px": self.taper_px,
             "taper_floor": self.taper_floor,
+            "sigma_low": self.sigma_low,
+            "sigma_high": self.sigma_high,
+            "winsor_limit_low": self.winsor_limit_low,
+            "winsor_limit_high": self.winsor_limit_high,
         }
 
 

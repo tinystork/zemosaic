@@ -191,6 +191,93 @@ def resolve_normalization(stack_norm_method) -> str:
     return _resolve_normalization(stack_norm_method)
 
 
+# ---------------------------------------------------------------------------
+# Rejection mapping (ZM-ZEGRID-R16): honour the user's stack_reject_algo + sigma
+# / winsor choice where the canonical engine supports it; surface anything it
+# cannot honour (never silently drop a science choice).
+# ---------------------------------------------------------------------------
+
+# Canonical rejection tokens supported by the frozen SCI-05 engine. Aliases are
+# NOT accepted; anything else (incl. the removed ``linear_fit_clip``) cannot be
+# honoured and must be surfaced, never silently dropped.
+_SUPPORTED_REJECT_ALGOS = ("none", "kappa_sigma", "winsorized_sigma_clip")
+
+
+def _valid_sigma(value) -> float | None:
+    """Validate a kappa/sigma value against the canonical engine (finite, > 0)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0.0:
+        return None
+    return f
+
+
+def _valid_winsor_limits(value) -> tuple[float, float] | None:
+    """Validate winsor limits: each finite in [0, 0.5) and low+high < 1."""
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    try:
+        low, high = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return None
+    if not (0.0 <= low < 0.5 and 0.0 <= high < 0.5):
+        return None
+    if low + high >= 1.0:
+        return None
+    return (low, high)
+
+
+def resolve_rejection_science(
+    stack_reject_algo,
+    stack_kappa_low,
+    stack_kappa_high,
+    winsor_limits,
+) -> tuple[dict, dict]:
+    """Map the user's rejection choice into canonical science-config overrides.
+
+    Returns ``(overrides, unhonoured)``:
+      * ``overrides`` — dict of :class:`MiniTileScienceConfig` fields the frozen
+        engine CAN honour (``rejection``, ``sigma_low/high``, ``winsor_limit_*``).
+      * ``unhonoured`` — dict of ``{arg_name: value}`` it CANNOT honour (kept in
+        the ignored-run-args list + a WARN, never silent).
+
+    ``kappa_sigma`` -> ``rejection="kappa_sigma"``; ``winsorized_sigma_clip`` ->
+    ``rejection="winsorized_sigma_clip"`` (so it is ACTUALLY applied, not the
+    frozen ``kappa_sigma``); ``none`` -> ``rejection="none"``. Anything else and
+    any out-of-range sigma/winsor value is surfaced, never silently dropped.
+    """
+    overrides: dict = {}
+    unhonoured: dict = {}
+
+    algo = str(stack_reject_algo or "").strip().lower()
+    if algo in _SUPPORTED_REJECT_ALGOS:
+        overrides["rejection"] = algo
+    else:
+        unhonoured["stack_reject_algo"] = stack_reject_algo
+
+    sigma_low = _valid_sigma(stack_kappa_low)
+    sigma_high = _valid_sigma(stack_kappa_high)
+    if sigma_low is not None and sigma_high is not None:
+        overrides["sigma_low"] = sigma_low
+        overrides["sigma_high"] = sigma_high
+    else:
+        unhonoured["stack_kappa_low"] = stack_kappa_low
+        unhonoured["stack_kappa_high"] = stack_kappa_high
+
+    wl = _valid_winsor_limits(winsor_limits)
+    if wl is not None:
+        overrides["winsor_limit_low"] = wl[0]
+        overrides["winsor_limit_high"] = wl[1]
+    else:
+        unhonoured["winsor_limits"] = winsor_limits
+
+    return overrides, unhonoured
+
+
 def _parse_pinned_layout(value) -> tuple[int, int] | None:
     """Parse a pinned layout spec (``"NXxNY"``) into ``(nx, ny)``, or ``None``.
 
@@ -1121,11 +1208,25 @@ def _run_single(
     for w in layout["warnings"]:
         _emit(f"ZeGrid: layout warning — {w}", lvl="WARN", callback=progress_callback)
 
-    # Parallel workers (memory-aware: 2-4 by default, clamped by CPU + RAM).
+    # Parallel workers (ZM-ZEGRID-R16 adaptive rule: clamp(min(cpu-2, RAM//footprint), 2, 14),
+    # per-phase footprint — the gauge reprojects full-canvas frames so it is heavier
+    # than the per-cell cache build).
     if workers is None:
-        workers = zpar.choose_workers(None, available_memory_bytes())
-    _emit(f"ZeGrid: parallel workers={workers} (CPU={os.cpu_count()}, avail={available / 2**30:.2f}GiB)",
-          callback=progress_callback)
+        gauge_footprint = zpar._GAUGE_PER_WORKER_FOOTPRINT_BYTES
+        cache_footprint = zpar._CACHE_PER_WORKER_FOOTPRINT_BYTES
+        gauge_workers = zpar.choose_workers(None, available_memory_bytes(), gauge_footprint)
+        cache_workers = zpar.choose_workers(None, available_memory_bytes(), cache_footprint)
+        _emit(
+            f"ZeGrid: parallel workers — gauge={gauge_workers} "
+            f"(CPU={os.cpu_count()}, avail={available / 2**30:.2f}GiB, "
+            f"footprint={gauge_footprint / 2**20:.0f}MiB), "
+            f"cache_build={cache_workers} (footprint={cache_footprint / 2**20:.0f}MiB)",
+            callback=progress_callback,
+        )
+        workers = gauge_workers
+        cache_build_workers = cache_workers
+    else:
+        cache_build_workers = workers
 
     cache_root = output_dir / CACHE_DIR_NAME
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -1216,7 +1317,7 @@ def _run_single(
         t0 = time.perf_counter()
         try:
             manifest = _build_one_cell_cache(
-                descs, canvas, cell, patch, mem, cache_dir, workers=workers
+                descs, canvas, cell, patch, mem, cache_dir, workers=cache_build_workers
             )
         except Exception as exc:
             _emit(f"ZeGrid: cell {cid} cache build failed: {exc}", lvl="ERROR", callback=progress_callback)
@@ -1540,15 +1641,15 @@ def run_zegrid_mode(
             callback=progress_callback,
         )
 
-    # ZM-ZEGRID-R12 F2: surface the run_zegrid_mode arguments ZeGrid accepts for
-    # backward compatibility but does NOT honour (frozen science config + standard
-    # FITS outputs). Nothing is silently dropped.
+    # ZM-ZEGRID-R16: honour the user's rejection choice (stack_reject_algo +
+    # kappa/winsor) where the canonical engine supports it; surface (WARN) anything
+    # it cannot honour, never silently drop it. The R12 F2 list keeps the OTHER
+    # accepted-but-ignored arguments (weighting/combine/taper/FITS outputs).
+    rej_overrides, rej_unhonoured = resolve_rejection_science(
+        stack_reject_algo, stack_kappa_low, stack_kappa_high, winsor_limits
+    )
     ignored_run_args = {
         "stack_weight_method": stack_weight_method,
-        "stack_reject_algo": stack_reject_algo,
-        "stack_kappa_low": stack_kappa_low,
-        "stack_kappa_high": stack_kappa_high,
-        "winsor_limits": list(winsor_limits),
         "stack_final_combine": stack_final_combine,
         "apply_radial_weight": apply_radial_weight,
         "radial_feather_fraction": radial_feather_fraction,
@@ -1558,6 +1659,7 @@ def run_zegrid_mode(
         "grid_rgb_equalize": grid_rgb_equalize,
         "use_gpu": bool(use_gpu),
     }
+    ignored_run_args.update(rej_unhonoured)
     for line in zin.describe_ignored_run_args(ignored_run_args):
         _emit(line, lvl="WARN", callback=progress_callback)
 
@@ -1566,13 +1668,18 @@ def run_zegrid_mode(
     if not frames_info:
         raise RuntimeError("ZeGrid failed: no frames loaded from stack_plan.csv")
 
-    science_config = replace(ExecutorConfig().science_config(),
-                             normalization=_resolve_normalization(stack_norm_method))
+    science_config = replace(
+        ExecutorConfig().science_config(),
+        normalization=_resolve_normalization(stack_norm_method),
+        **rej_overrides,
+    )
     _emit(
         f"ZeGrid science config: normalization={science_config.normalization} "
         f"(default={DEFAULT_NORMALIZATION}), weighting={science_config.weighting}, "
-        f"rejection={science_config.rejection}, combine={science_config.combine}, "
-        f"taper={science_config.taper}",
+        f"rejection={science_config.rejection} "
+        f"(sigma={science_config.sigma_low:.2f}/{science_config.sigma_high:.2f}, "
+        f"winsor={science_config.winsor_limit_low:.3f}/{science_config.winsor_limit_high:.3f}), "
+        f"combine={science_config.combine}, taper={science_config.taper}",
         callback=progress_callback,
     )
 

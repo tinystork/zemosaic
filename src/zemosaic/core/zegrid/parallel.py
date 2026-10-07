@@ -37,26 +37,100 @@ log = logging.getLogger(__name__)
 # footprint (~330 MiB, matching the R6 STREAMING_BASELINE_KIB measurement).
 _PER_WORKER_BASELINE_BYTES = 340 * 1024 * 1024
 
-DEFAULT_WORKERS = 4
+# ZM-ZEGRID-R16 adaptive worker rule. ``cpu - 2`` leaves ~2 cores for the OS (the
+# user's suggestion); the memory side divides the available RAM by the per-worker
+# footprint for the CURRENT phase. The result is clamped to [2, 14] so a 16-core
+# box uses ~14 processes while small/low-RAM machines never under- or over-spawn.
+DEFAULT_WORKERS = 4  # retained for backward-compat references only (R16 rule below)
+_CPU_OS_RESERVE = 2
+_WORKERS_MIN = 2
+_WORKERS_MAX = 14
+
+# Estimated per-worker footprint (bytes) for the GLOBAL-GAUGE phase. Each gauge
+# worker reprojects a frame over a full-canvas / union bbox (the dominant cost),
+# holding a float32 RGB plane + float64 temporaries; this is measurably heavier
+# than the per-cell cache build, so it gets its own (larger) footprint.
+_GAUGE_PER_WORKER_FOOTPRINT_BYTES = _PER_WORKER_BASELINE_BYTES + (1600 * 1200 * 3 * 8)
+
+# Estimated per-worker footprint (bytes) for the CACHE-BUILD phase (per-cell
+# patch reprojection — smaller working set than the full-canvas gauge).
+_CACHE_PER_WORKER_FOOTPRINT_BYTES = _PER_WORKER_BASELINE_BYTES + (512 * 512 * 3 * 8)
 
 
-def choose_workers(requested: int | None = None, available_bytes: int | None = None) -> int:
-    """Memory-aware worker count: ``min(requested, cpu_count, mem_budget)``.
+def adaptive_worker_count(
+    cpu: int,
+    available_bytes: int | None,
+    per_worker_footprint_bytes: int | None = None,
+) -> int:
+    """ZM-ZEGRID-R16 adaptive rule: ``clamp(min(cpu-2, RAM//footprint), 2, 14)``.
 
-    Returns 1..4 (clamped to the CPU count and, when ``available_bytes`` is given,
-    to the number of ~340 MiB baselines that fit). Never 0.
+    Parameters
+    ----------
+    cpu:
+        Logical CPU count (``os.cpu_count()``).
+    available_bytes:
+        Available RAM at the decision point (``None``/0 = no memory bound).
+    per_worker_footprint_bytes:
+        Estimated per-worker cost (bytes) for the current phase (gauge vs cache
+        build). Defaults to the import baseline.
+
+    Returns a worker count in ``[2, 14]`` (never < 2 on a healthy multi-core box;
+    memory/CPU may force ``1`` only when they genuinely cannot support 2).
+    """
+    footprint = int(per_worker_footprint_bytes or _PER_WORKER_BASELINE_BYTES)
+    footprint = max(1, footprint)
+
+    cpu_budget = max(1, int(cpu) - _CPU_OS_RESERVE)
+    ram_budget = 0
+    if available_bytes is not None and available_bytes > 0:
+        ram_budget = max(1, int(available_bytes // footprint))
+
+    if ram_budget > 0:
+        target = min(cpu_budget, ram_budget)
+    else:
+        target = cpu_budget
+
+    # Clamp to [2, 14]; only CPU/RAM genuinely too small may force < 2 (floor 1).
+    workers = target
+    if workers > _WORKERS_MAX:
+        workers = _WORKERS_MAX
+    if workers < _WORKERS_MIN:
+        # Force up to 2 unless the machine cannot actually support 2 workers.
+        hard_floor = _WORKERS_MIN
+        if int(cpu) < _WORKERS_MIN:
+            hard_floor = max(1, int(cpu))
+        if ram_budget > 0 and ram_budget < hard_floor:
+            hard_floor = max(1, ram_budget)
+        workers = max(workers, hard_floor)
+    return max(1, workers)
+
+
+def choose_workers(
+    requested: int | None = None,
+    available_bytes: int | None = None,
+    per_worker_footprint_bytes: int | None = None,
+) -> int:
+    """Memory/CPU-aware worker count (R16 adaptive rule).
+
+    When ``requested`` is ``None`` (the normal production case), returns the R16
+    adaptive count ``clamp(min(cpu-2, RAM//footprint), 2, 14)``. An explicit
+    ``requested`` value is still honoured (clamped to CPU and, when available,
+    to the memory budget) — this keeps an operator's manual pin working.
 
     Note: the daemonic-parent case does NOT force ``1`` here — a daemonic parent
     simply uses threads (see :func:`pmap`) and threads are cheap, so the same
     memory/CPU clamp applies unchanged.
     """
     cpu = int(os.cpu_count() or 1)
-    workers = DEFAULT_WORKERS if requested is None else int(requested)
-    workers = max(1, min(workers, cpu))
-    if available_bytes is not None and available_bytes > 0:
-        budget = max(1, int(available_bytes // _PER_WORKER_BASELINE_BYTES))
-        workers = min(workers, budget)
-    return workers
+    if requested is not None:
+        workers = max(1, int(requested))
+        workers = min(workers, cpu)
+        footprint = int(per_worker_footprint_bytes or _PER_WORKER_BASELINE_BYTES)
+        if available_bytes is not None and available_bytes > 0:
+            budget = max(1, int(available_bytes // max(1, footprint)))
+            workers = min(workers, budget)
+        return workers
+    return adaptive_worker_count(cpu, available_bytes, per_worker_footprint_bytes)
 
 
 def _parent_is_daemonic() -> bool:

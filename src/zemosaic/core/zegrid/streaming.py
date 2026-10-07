@@ -112,6 +112,10 @@ def build_streaming_request(
         taper_floor=config.taper_floor,
         backend=config.backend,
         equalize_rgb=config.equalize_rgb,
+        sigma_low=config.sigma_low,
+        sigma_high=config.sigma_high,
+        winsor_limit_low=config.winsor_limit_low,
+        winsor_limit_high=config.winsor_limit_high,
     )
 
 

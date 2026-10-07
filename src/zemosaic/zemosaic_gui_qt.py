@@ -588,11 +588,15 @@ class ZeMosaicQtWorker(QObject):
                     mp_ctx = multiprocessing
 
             queue_obj = mp_ctx.Queue()
+            # ZM-ZEGRID-R16: NON-DAEMON worker so the ZeGrid engine may spawn a
+            # real PROCESS pool (a daemonic process may not create children).
+            # "Dies with the GUI" is restored by a parent watchdog inside the
+            # worker (zemosaic_process_guard), NOT by the daemon flag.
             process = mp_ctx.Process(
                 target=run_hierarchical_mosaic_process,
                 args=(queue_obj, *worker_args),
                 kwargs=worker_kwargs,
-                daemon=True,
+                daemon=False,
                 name="ZeMosaicWorkerProcessQt",
             )
             process.start()
