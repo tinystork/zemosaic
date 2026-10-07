@@ -105,8 +105,9 @@ def test_ignored_settings_exact_and_prefix():
     assert got["use_gpu_stack"] is True
     assert "use_gpu_grid" not in got  # False -> absent
     assert got["stack_use_gpu"] is True
-    assert got["final_mosaic_dbe_enabled"] is True
-    assert got["final_mosaic_dbe_sigma"] == 2.0
+    # ZM-ZEGRID-R18: final_mosaic_dbe_* is now HONOURED (no longer ignored).
+    assert "final_mosaic_dbe_enabled" not in got
+    assert "final_mosaic_dbe_sigma" not in got
     assert "final_mosaic_dbe_iterations" not in got
     assert "center_out_normalization_p3" not in got
 
@@ -259,13 +260,14 @@ def test_gpu_note_mentions_cupy_product_init():
 
 def test_ignored_run_args_present_and_described():
     # F2: run_zegrid_mode accepts but ignores these stack/final-mosaic args.
-    assert "save_final_as_uint16" in zin.IGNORED_RUN_ARGS
+    # ZM-ZEGRID-R18: save_final_as_uint16 and grid_rgb_equalize are now HONOURED.
+    assert "save_final_as_uint16" not in zin.IGNORED_RUN_ARGS
+    assert "grid_rgb_equalize" not in zin.IGNORED_RUN_ARGS
     assert "legacy_rgb_cube" in zin.IGNORED_RUN_ARGS
     assert "apply_radial_weight" in zin.IGNORED_RUN_ARGS
-    assert "grid_rgb_equalize" in zin.IGNORED_RUN_ARGS
     assert "use_gpu" in zin.IGNORED_RUN_ARGS
-    lines = zin.describe_ignored_run_args({"save_final_as_uint16": True})
-    assert any("save_final_as_uint16" in ln for ln in lines)
+    lines = zin.describe_ignored_run_args({"legacy_rgb_cube": True})
+    assert any("legacy_rgb_cube" in ln for ln in lines)
     empty = zin.describe_ignored_run_args({})
     assert len(empty) == 1
 
@@ -298,10 +300,10 @@ def test_manifest_has_ignored_run_args(tmp_path):
         layout, zz.ExecutorConfig().science_config(), 0, {}, None,
         rejected=[], sip_mode="keep", frames_loaded=1,
         global_reference_frame_id="a.fits",
-        ignored_run_args={"save_final_as_uint16": True},
+        ignored_run_args={"legacy_rgb_cube": True},
     )
     m = json.loads(mp.read_text())
-    assert m["ignored_run_args"]["save_final_as_uint16"] is True
+    assert m["ignored_run_args"]["legacy_rgb_cube"] is True
 
 
 # ---------------------------------------------------------------------------

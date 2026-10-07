@@ -35,7 +35,10 @@ IGNORED_SETTINGS: tuple[str, ...] = (
 )
 
 # Settings matched by prefix (final_mosaic_dbe_* : enable / sigma / iterations / ...).
-IGNORED_SETTING_PREFIXES: tuple[str, ...] = ("final_mosaic_dbe_",)
+# ZM-ZEGRID-R18: ``final_mosaic_dbe_*`` is NO LONGER ignored — it is now honoured
+# by the final-mosaic finishing step (see ``final_mosaic_finishing.py``), so the
+# prefix list is empty.
+IGNORED_SETTING_PREFIXES: tuple[str, ...] = ()
 
 # ``run_zegrid_mode`` arguments the ZeGrid engine ACCEPTS (for backward
 # compatibility with the removed legacy Grid) but does NOT honour, because
@@ -47,15 +50,15 @@ IGNORED_SETTING_PREFIXES: tuple[str, ...] = ("final_mosaic_dbe_",)
 # mapped into the science config where the canonical engine supports them (see
 # ``zemosaic_zegrid_mode.resolve_rejection_science``); unsupported values stay
 # surfaced via that mapping's ``unhonoured`` dict, never silently dropped.
+# NOTE (ZM-ZEGRID-R18): ``save_final_as_uint16`` and ``grid_rgb_equalize`` are
+# NO LONGER ignored — they are now honoured by the final-mosaic finishing step.
 IGNORED_RUN_ARGS: tuple[str, ...] = (
     "stack_weight_method",
     "stack_final_combine",
     "apply_radial_weight",
     "radial_feather_fraction",
     "radial_shape_power",
-    "save_final_as_uint16",
     "legacy_rgb_cube",
-    "grid_rgb_equalize",
     "use_gpu",
 )
 

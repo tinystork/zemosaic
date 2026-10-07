@@ -74,6 +74,7 @@ from .core.zegrid import assembly as za
 from .core.zegrid import auto_layout as zal
 from .core.zegrid import execution as zxe
 from .core.zegrid import file_provider as zfp
+from .core.zegrid import final_mosaic_finishing as zfin
 from .core.zegrid import geometry as zg
 from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
@@ -1057,6 +1058,7 @@ def _write_run_log(
     cache_info,
     global_reference_frame_id,
     ignored_run_args=None,
+    finishing_info=None,
 ):
     """Append the run-log SUMMARY into the output folder.
 
@@ -1089,6 +1091,32 @@ def _write_run_log(
     lines.append("Accepted-but-ignored run_zegrid_mode arguments:")
     lines.extend(zin.describe_ignored_run_args(ignored_run_args or {}))
     lines.append("")
+    lines.append("Final-mosaic finishing (ZM-ZEGRID-R18):")
+    fin = finishing_info or {}
+    if not fin or not fin.get("enabled"):
+        lines.append("  disabled (no finishing settings applied)")
+    else:
+        dbe = fin.get("dbe", {})
+        rgb = fin.get("rgb_equalize", {})
+        u16 = fin.get("uint16", {})
+        lines.append(f"  enabled: {bool(fin.get('enabled'))}")
+        lines.append(
+            f"  failed: {bool(fin.get('failed'))} {fin.get('failure_reason') or ''}".rstrip()
+        )
+        lines.append(
+            f"  dbe: enabled={dbe.get('enabled')} applied={dbe.get('applied')} "
+            f"strength={dbe.get('strength')} factor={dbe.get('strength_factor')} "
+            f"params={dbe.get('params')}"
+        )
+        lines.append(
+            f"  rgb_equalize: enabled={rgb.get('enabled')} applied={rgb.get('applied')} "
+            f"skies_before={rgb.get('skies_before')} skies_after={rgb.get('skies_after')}"
+        )
+        lines.append(
+            f"  uint16: enabled={u16.get('enabled')} written={u16.get('written')} "
+            f"vmin={u16.get('vmin')} vmax={u16.get('vmax')}"
+        )
+    lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
     lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
     lines.append(f"photometric_gauge.global_reference_frame_id: {global_reference_frame_id}")
@@ -1114,6 +1142,7 @@ def _run_single(
     sip_mode="keep",
     workers=None,
     ignored_run_args=None,
+    finishing_config=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1448,6 +1477,43 @@ def _run_single(
         "cleanup_failures": cleanup_failures,
     }
 
+    # ZM-ZEGRID-R18: FINAL-MOSAIC FINISHING (post-assembly, before outputs).
+    # Opt-in + fail-safe: a finishing failure WARNS and lets the run complete with
+    # the raw assembled science (never crashes a run; never silently dropped).
+    finished_science = np.asarray(assembled.science, dtype=np.float32)
+    finishing_info = {"enabled": False, "failed": False, "failure_reason": ""}
+    fin_uint16 = None
+    try:
+        _fin = zfin.apply_final_mosaic_finishing(
+            assembled.science, assembled.stack_depth, config=finishing_config
+        )
+        finished_science = _fin.science
+        finishing_info = _fin.info
+        fin_uint16 = _fin.uint16
+        if finishing_info.get("enabled"):
+            _emit(
+                f"ZeGrid: final-mosaic finishing applied — dbe={finishing_info.get('dbe', {}).get('applied')} "
+                f"rgb_equalize={finishing_info.get('rgb_equalize', {}).get('applied')} "
+                f"uint16={finishing_info.get('uint16', {}).get('written')}",
+                callback=progress_callback,
+            )
+    except Exception as exc:
+        _emit(
+            f"ZeGrid: final-mosaic finishing FAILED ({exc}); writing raw mosaic (WARN)",
+            lvl="WARN", callback=progress_callback,
+        )
+        finished_science = np.asarray(assembled.science, dtype=np.float32)
+        finishing_info = {
+            "enabled": bool(finishing_config and any([
+                finishing_config.get("dbe_enabled"),
+                finishing_config.get("rgb_equalize"),
+                finishing_config.get("save_uint16"),
+            ])),
+            "failed": True,
+            "failure_reason": repr(exc),
+        }
+        fin_uint16 = None
+
     # Write legacy-compatible outputs.
     sci_path, cov_path, manifest_path = _write_outputs(
         assembled, canvas, nx, ny, output_dir, descs, {}, cell_records,
@@ -1457,6 +1523,8 @@ def _run_single(
         global_reference_frame_id=global_reference_frame_id,
         timings=timings, gpu_used=gpu_used, ignored_settings=ignored_settings,
         ignored_run_args=ignored_run_args,
+        finished_science=finished_science, finishing_info=finishing_info,
+        fin_uint16=fin_uint16,
     )
 
     _write_run_log(
@@ -1474,6 +1542,7 @@ def _run_single(
         peak_rss_kib=peak_rss_kib,
         cache_info=cache_report,
         global_reference_frame_id=global_reference_frame_id,
+        finishing_info=finishing_info,
     )
 
     _emit(
@@ -1493,15 +1562,37 @@ def _write_outputs(
     rejected=None, sip_mode="keep", frames_loaded=None,
     global_reference_frame_id=None,
     timings=None, gpu_used=False, ignored_settings=None, ignored_run_args=None,
+    finished_science=None, finishing_info=None, fin_uint16=None,
 ):
     output_dir = Path(output_dir)
-    science = np.asarray(assembled.science, dtype=np.float32)  # (H, W, 3)
+    # ZM-ZEGRID-R18: use the finished science when provided (bit-equal to the raw
+    # path when finishing is disabled -> ``finished_science`` is the same array).
+    science = np.asarray(
+        assembled.science if finished_science is None else finished_science,
+        dtype=np.float32,
+    )  # (H, W, 3)
     stack_depth = np.asarray(assembled.stack_depth, dtype=np.int32)  # (H, W)
 
     sci_header = _canvas_header(canvas, ndim=3, channels=3)
     sci_data = np.ascontiguousarray(np.moveaxis(science, -1, 0))  # (3, H, W)
     sci_path = output_dir / "mosaic_grid.fits"
     fits.PrimaryHDU(sci_data, header=sci_header).writeto(sci_path, overwrite=True)
+
+    # ZM-ZEGRID-R18: optional uint16 render (save_final_as_uint16). Documented
+    # linear stretch; the float science FITS above remains the primary product.
+    uint16_path = None
+    if fin_uint16 is not None:
+        u16 = np.asarray(fin_uint16, dtype=np.uint16)
+        u16_header = _canvas_header(canvas, ndim=3, channels=3)
+        u16_header["BUNIT"] = ("adu16", "uint16 render (see finishing.uint16)")
+        _u16_info = (finishing_info or {}).get("uint16", {})
+        if "vmin" in _u16_info:
+            u16_header["U16VMIN"] = (float(_u16_info["vmin"]), "scaling vmin (float ADU)")
+            u16_header["U16VMAX"] = (float(_u16_info["vmax"]), "scaling vmax (float ADU)")
+        uint16_path = output_dir / "mosaic_grid_uint16.fits"
+        fits.PrimaryHDU(
+            np.ascontiguousarray(np.moveaxis(u16, -1, 0)), header=u16_header
+        ).writeto(uint16_path, overwrite=True)
 
     cov_header = _canvas_header(canvas, ndim=2)
     cov_header["BUNIT"] = ("count", "per-pixel stack depth (max over channels)")
@@ -1607,10 +1698,12 @@ def _write_outputs(
         "gpu": {"used": bool(gpu_used), "note": zin.GPU_USAGE_NOTE},
         "ignored_settings": (ignored_settings or {}),
         "ignored_run_args": (ignored_run_args or {}),
+        "finishing": (finishing_info or {}),
         "peak_rss_kib": peak_rss_kib,
         "outputs": {
             "science": sci_path.name,
             "coverage": cov_path.name,
+            "uint16": (uint16_path.name if uint16_path is not None else None),
             "run_log": RUN_LOG_NAME,
         },
     }
@@ -1638,9 +1731,9 @@ def run_zegrid_mode(
     apply_radial_weight: bool = False,
     radial_feather_fraction: float = 0.8,
     radial_shape_power: float = 2.0,
-    save_final_as_uint16: bool = False,
+    save_final_as_uint16: bool | None = None,
     legacy_rgb_cube: bool = False,
-    grid_rgb_equalize: bool | None = True,
+    grid_rgb_equalize: bool | None = None,
     use_gpu: bool | None = None,
     zconfig: object | None = None,
     workers: int | None = None,
@@ -1671,14 +1764,28 @@ def run_zegrid_mode(
         "apply_radial_weight": apply_radial_weight,
         "radial_feather_fraction": radial_feather_fraction,
         "radial_shape_power": radial_shape_power,
-        "save_final_as_uint16": save_final_as_uint16,
         "legacy_rgb_cube": legacy_rgb_cube,
-        "grid_rgb_equalize": grid_rgb_equalize,
         "use_gpu": bool(use_gpu),
     }
     ignored_run_args.update(rej_unhonoured)
     for line in zin.describe_ignored_run_args(ignored_run_args):
         _emit(line, lvl="WARN", callback=progress_callback)
+
+    # ZM-ZEGRID-R18: the final-mosaic finishing settings are now HONOURED (they
+    # were previously accepted-but-ignored). Resolve them once and surface the
+    # resolved choice in the log so nothing is silently dropped.
+    finishing_config = zfin.resolve_finishing_config(
+        zconfig,
+        grid_rgb_equalize=grid_rgb_equalize,
+        save_final_as_uint16=save_final_as_uint16,
+    )
+    _emit(
+        f"ZeGrid: final-mosaic finishing — DBE={finishing_config['dbe_enabled']} "
+        f"(strength={finishing_config['dbe_strength']}, factor={finishing_config['dbe_strength_factor']}, "
+        f"params={finishing_config['dbe_params']}), rgb_equalize={finishing_config['rgb_equalize']}, "
+        f"uint16={finishing_config['save_uint16']}",
+        callback=progress_callback,
+    )
 
     csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
     frames_info = _stack_plan.load_stack_plan(csv_path, progress_callback=progress_callback)
@@ -1754,13 +1861,15 @@ def run_zegrid_mode(
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
-                        ignored_run_args=ignored_run_args)
+                        ignored_run_args=ignored_run_args,
+                        finishing_config=finishing_config)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
-                        ignored_run_args=ignored_run_args)
+                        ignored_run_args=ignored_run_args,
+                        finishing_config=finishing_config)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -1768,4 +1877,5 @@ def run_zegrid_mode(
                     progress_callback=progress_callback,
                     science_config=science_config, zconfig=zconfig,
                     pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
-                    ignored_run_args=ignored_run_args)
+                    ignored_run_args=ignored_run_args,
+                    finishing_config=finishing_config)
