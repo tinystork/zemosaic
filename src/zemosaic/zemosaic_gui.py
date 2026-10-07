@@ -4838,11 +4838,15 @@ class ZeMosaicGUI:
             worker_kwargs["early_filter_enabled"] = False
 
         self.progress_queue = multiprocessing.Queue()
+        # ZM-ZEGRID-R16: NON-DAEMON worker so the ZeGrid engine may spawn a real
+        # PROCESS pool (a daemonic process may not create children). "Dies with
+        # the GUI" is restored by a parent watchdog inside the worker
+        # (zemosaic_process_guard), NOT by the daemon flag.
         self.worker_process = multiprocessing.Process(
             target=run_hierarchical_mosaic_process,
             args=(self.progress_queue,) + worker_args[:-1],
             kwargs=worker_kwargs,
-            daemon=True,
+            daemon=False,
             name="ZeMosaicWorkerProcess",
         )
         self.worker_process.start()

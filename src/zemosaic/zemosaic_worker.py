@@ -36114,6 +36114,20 @@ def run_hierarchical_mosaic_process(
 
     _sanitize_spawned_process_logging()
 
+    # ZM-ZEGRID-R16: the worker is spawned NON-DAEMON (so it may legally create
+    # its own process pool). A non-daemon process is NOT auto-killed when its
+    # parent (the GUI) dies, so we install a parent watchdog (a daemon *thread*)
+    # that polls the parent pid and stops the worker cleanly when the parent
+    # disappears — preserving the old daemonic "dies with the GUI" property
+    # without the daemon flag. Fail-open: it never spuriously kills a healthy
+    # worker; on Windows it polls the parent process handle (no signals).
+    try:
+        from .zemosaic_process_guard import install_parent_watchdog
+
+        install_parent_watchdog()
+    except Exception:  # pragma: no cover - the watchdog is best-effort
+        pass
+
     crash_ctx: dict[str, Any] = {
         "phase": "bootstrap",
         "operation": "worker_start",

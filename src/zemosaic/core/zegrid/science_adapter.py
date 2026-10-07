@@ -54,6 +54,12 @@ DEFAULT_BACKEND = "cpu"
 DEFAULT_TAPER = "footprint"
 DEFAULT_TAPER_PX = 8.0
 DEFAULT_TAPER_FLOOR = 0.0
+# Rejection parameters (frozen canonical defaults; overridable per-run via the
+# R16 rejection mapping so the user's sigma/winsor choice is actually honoured).
+DEFAULT_SIGMA_LOW = 3.0
+DEFAULT_SIGMA_HIGH = 3.0
+DEFAULT_WINSOR_LOW = 0.05
+DEFAULT_WINSOR_HIGH = 0.05
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,12 @@ class MiniTileScienceConfig:
     taper_floor: float = DEFAULT_TAPER_FLOOR
     reference_index: int | None = None
     equalize_rgb: bool = False
+    # Rejection parameters (ZM-ZEGRID-R16): forwarded to the canonical engine so
+    # kappa_sigma / winsorized_sigma_clip honour the user's sigma/winsor values.
+    sigma_low: float = DEFAULT_SIGMA_LOW
+    sigma_high: float = DEFAULT_SIGMA_HIGH
+    winsor_limit_low: float = DEFAULT_WINSOR_LOW
+    winsor_limit_high: float = DEFAULT_WINSOR_HIGH
 
 
 def build_request(
@@ -95,6 +107,10 @@ def build_request(
         taper_floor=config.taper_floor,
         backend=config.backend,
         equalize_rgb=config.equalize_rgb,
+        sigma_low=config.sigma_low,
+        sigma_high=config.sigma_high,
+        winsor_limit_low=config.winsor_limit_low,
+        winsor_limit_high=config.winsor_limit_high,
     )
 
 
