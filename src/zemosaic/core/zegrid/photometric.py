@@ -193,14 +193,19 @@ def _reproject_full(decode_fn, f, canvas):
 
 
 def _counts_worker(task):
+    zxe.reset_reproject_path_stats()
     (decode_fn, f, bbox_wcs_header, bbox_shape) = task
     chw = _decode_to_chw(decode_fn, f)
     rgb, geom = zxe.reproject_cropped(chw, f.wcs(), WCS(bbox_wcs_header), tuple(bbox_shape))
     b = prepare_canonical_inputs([rgb], [geom])
-    return int(b.frame_valid_counts[0])
+    return {
+        "count": int(b.frame_valid_counts[0]),
+        "reproject": zxe.get_reproject_path_stats().to_dict(),
+    }
 
 
 def _pair_worker(task):
+    zxe.reset_reproject_path_stats()
     (index, decode_fn, f, bbox, bbox_wcs_header, bbox_shape, norm_token, weight_token) = task
     chw = _decode_to_chw(decode_fn, f)
     rgb, geom = zxe.reproject_cropped(chw, f.wcs(), WCS(bbox_wcs_header), tuple(bbox_shape))
@@ -242,6 +247,7 @@ def _pair_worker(task):
         "fwhm": fwhm,
         "weight_active": weight_active,
         "weight_exc": weight_exc,
+        "reproject": zxe.get_reproject_path_stats().to_dict(),
     }
 
 
@@ -318,13 +324,12 @@ def compute_global_gauge(
             emit(f"[ZEGRID] gauge phase=counts units={n} workers={workers}", "INFO")
         except Exception:
             pass
-    counts = np.asarray(
-        zpar.pmap(
-            _counts_worker, count_tasks, workers,
-            progress_callback=count_progress, emit=emit, meta=counts_meta,
-        ),
-        dtype=np.int64,
+    count_results = zpar.pmap(
+        _counts_worker, count_tasks, workers,
+        progress_callback=count_progress, emit=emit, meta=counts_meta,
     )
+    counts = np.asarray([r["count"] for r in count_results], dtype=np.int64)
+
 
     # --- reference selection (reuse the frozen function; exact argmax of counts) ---
     probe = CanonicalInputBatch(
@@ -343,7 +348,9 @@ def compute_global_gauge(
     ref_bbox = bboxes[ref_idx]
 
     # --- reference full-canvas alignment (ONE plane) + reference weighting ---
+    zxe.reset_reproject_path_stats()
     r_full, r_sup = _reproject_full(decode_fn, ordered[ref_idx], canvas)
+    ref_reproj = zxe.get_reproject_path_stats().to_dict()
     ref_norm = normalize_canonical_images(
         prepare_canonical_inputs([r_full], [r_sup]), norm_token, reference_index=0
     )
@@ -493,5 +500,13 @@ def compute_global_gauge(
                 "fallback_reason": pairs_meta.get("fallback_reason"),
             },
         }
+        # ZM-ZEGRID-R21: which reprojection path (fast vs fallback) the gauge
+        # actually took, aggregated over the reference plane + the counts/pairs
+        # workers (each worker reports its own process-local stats).
+        diagnostics["reprojection"] = zxe.merge_reproject_stats(
+            ref_reproj,
+            *(r.get("reproject") for r in count_results),
+            *(r.get("reproject") for r in pair_results),
+        )
 
     return gauge, tuple(frame_ids)
