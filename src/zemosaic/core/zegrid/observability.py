@@ -33,6 +33,8 @@ from typing import Callable, Optional
 DEFAULT_PROGRESS_INTERVAL_S = 2.0
 # Minimum number of (elapsed, done) samples before a per-phase ETA is produced.
 DEFAULT_ETA_MIN_SAMPLES = 2
+# Recent-window size (samples) for the per-phase ETA rate estimate (I1).
+DEFAULT_ETA_WINDOW_SAMPLES = 6
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +71,22 @@ def format_eta(seconds: Optional[float]) -> str:
 class PhaseEta:
     """Estimate the remaining time of a phase from observed throughput samples.
 
-    A sample is ``(elapsed_seconds, done_items)``. The rate is ``done / elapsed``
-    taken from the LATEST sample; the ETA is ``(total - done) / rate``. Returns
-    ``None`` (``n/a yet``) until ``min_samples`` samples exist and the latest
-    sample shows real progress (``done > 0``, ``elapsed > 0``).
+    A sample is ``(elapsed_seconds, done_items)``. The rate is computed over a
+    RECENT WINDOW of the last ``window`` samples (``(done_last - done_first) /
+    (elapsed_last - elapsed_first)``) rather than the whole-phase cumulative
+    average, so a mid-phase slowdown is reflected promptly instead of being
+    masked by the earlier fast portion. The window keeps the estimate stable
+    (no single-sample jitter). Returns ``None`` (``n/a yet``) until ``min_samples``
+    samples exist and the window shows real progress.
     """
 
-    def __init__(self, min_samples: int = DEFAULT_ETA_MIN_SAMPLES) -> None:
+    def __init__(
+        self,
+        min_samples: int = DEFAULT_ETA_MIN_SAMPLES,
+        window: int = DEFAULT_ETA_WINDOW_SAMPLES,
+    ) -> None:
         self.min_samples = int(min_samples)
+        self.window = max(2, int(window))
         self.samples: list[tuple[float, float]] = []
 
     def observe(self, elapsed_s: float, done: float) -> None:
@@ -91,13 +101,17 @@ class PhaseEta:
             return None
         if len(self.samples) < self.min_samples:
             return None
-        elapsed, done = self.samples[-1]
-        if elapsed <= 0.0 or done <= 0.0:
+        window = self.samples[-self.window:]
+        t0, d0 = window[0]
+        t1, d1 = window[-1]
+        dt = t1 - t0
+        dd = d1 - d0
+        if dt <= 0.0 or dd <= 0.0:
             return None
-        rate = done / elapsed
+        rate = dd / dt
         if rate <= 0.0:
             return None
-        remaining = max(0.0, float(total) - done)
+        remaining = max(0.0, float(total) - d1)
         if remaining <= 0.0:
             return 0.0
         return remaining / rate

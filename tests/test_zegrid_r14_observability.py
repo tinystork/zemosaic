@@ -67,12 +67,47 @@ def test_phase_eta_n_a_until_samples():
     assert got is not None and got > 0.0
 
 
-def test_phase_eta_rate_from_latest_sample():
-    eta = zobs.PhaseEta(min_samples=1)
-    eta.observe(10.0, 50.0)  # rate 5 items/s
-    # remaining = 100 - 50 = 50 items at 5/s -> 10 s
-    assert eta.eta_seconds(100) == pytest.approx(10.0)
-    assert eta.eta_seconds(40) == 0.0  # already past total
+def test_phase_eta_rate_from_recent_window():
+    # rework-1 (I1): rate is computed over the RECENT WINDOW (last k samples),
+    # not the whole-phase cumulative average.
+    eta = zobs.PhaseEta(min_samples=2, window=3)
+    eta.observe(1.0, 5.0)
+    eta.observe(2.0, 10.0)
+    eta.observe(3.0, 15.0)  # steady 5 items/s
+    # remaining = 100 - 15 = 85 items at 5/s -> 17 s
+    assert eta.eta_seconds(100) == pytest.approx(17.0)
+    assert eta.eta_seconds(40) is not None
+
+
+def test_phase_eta_recent_window_reacts_to_slowdown():
+    # rework-1 (I1): a mid-phase slowdown must be reflected quickly, not masked
+    # by the earlier fast portion.
+    eta = zobs.PhaseEta(min_samples=2, window=3)
+    # Fast start: 100 items/s for the first samples.
+    for i in range(1, 6):
+        eta.observe(float(i), float(i * 100))
+    # Slowdown: 1 item/s afterwards.
+    eta.observe(6.0, 501.0)
+    eta.observe(7.0, 502.0)
+    eta.observe(8.0, 503.0)
+    # The recent window now sees ~1 item/s; remaining = 1000-503 = 497 -> ~497 s.
+    # (A whole-phase cumulative average would still report ~62 items/s -> ~8 s.)
+    got = eta.eta_seconds(1000)
+    assert got is not None and got > 300.0
+
+
+def test_phase_eta_window_stable_not_jittery():
+    # rework-1 (I1): the window smooths a single anomalous sample — it must not
+    # flip the ETA sign or produce a wildly different number.
+    eta = zobs.PhaseEta(min_samples=2, window=4)
+    for i in range(1, 6):
+        eta.observe(float(i), float(i * 10))
+    before = eta.eta_seconds(100)
+    eta.observe(6.0, 61.0)  # one slightly-off sample
+    after = eta.eta_seconds(100)
+    assert before is not None and after is not None
+    # The estimate stays on the same order (no sign flip / no explosion).
+    assert after > 0.0 and after < before * 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +233,19 @@ def test_run_log_grows_during_run(tmp_path):
     after = path.read_text()
     assert "phase END: gauge" in after
     assert len(after) > len(mid)
+
+
+def test_run_log_replaces_previous_is_explicit(tmp_path):
+    # rework-1 (I2): a re-run into the SAME output folder overwrites the run log,
+    # but that replacement is now recorded explicitly (not silent).
+    zz._open_run_log(tmp_path, "2026-10-07T00:00:00")
+    first = (tmp_path / zz.RUN_LOG_NAME).read_text()
+    assert "replaces_previous_log" not in first
+
+    zz._open_run_log(tmp_path, "2026-10-07T01:00:00")
+    second = (tmp_path / zz.RUN_LOG_NAME).read_text()
+    assert "replaces_previous_log: true" in second
+    assert "started: 2026-10-07T01:00:00" in second
 
 
 def test_write_run_log_appends_summary(tmp_path):
@@ -345,12 +393,72 @@ def test_gauge_progress_seam_bit_equal():
     np.testing.assert_array_equal(ref.coefficients, new.coefficients)
     np.testing.assert_array_equal(ref.weights, new.weights)
 
-    # Progress callback was actually exercised with correct counters.
+    # Progress callback was actually exercised with correct cumulative counters.
     assert calls, "gauge progress callback was not called"
-    for done, total, _item in calls:
-        assert 1 <= done <= total
-    # The count pass reports total == n frames.
-    assert any(total == len(descs) for _d, total, _i in calls)
+    # rework-1 (M1): total is CUMULATIVE = 2N-1 across both sub-passes, and the
+    # done counter is monotone 1..2N-1 (no reset at the counts->pairs boundary).
+    n = len(descs)
+    assert all(total == 2 * n - 1 for _d, total, _i in calls)
+    done_seq = [d for d, _t, _i in calls]
+    assert done_seq == sorted(done_seq), "done is not monotone across the pass boundary"
+    assert done_seq[-1] == 2 * n - 1
+    # The sub-pass is made explicit via the counts:/pairs: item prefix.
+    assert any(i.startswith("counts:") for _d, _t, i in calls)
+    assert any(i.startswith("pairs:") for _d, _t, i in calls)
+
+
+def test_gauge_eta_does_not_explode_at_pass_boundary(monkeypatch):
+    """rework-1 (M1): the gauge ETA must stay honest across the counts->pairs
+    boundary. The two sub-passes report CUMULATIVE done over total=2N-1, so the
+    rate never collapses and the ETA never explodes when the second pass starts.
+    """
+    r = _Recorder()
+    rep = zobs.PhaseReporter(r.emit, interval_s=0.0)  # no throttle
+    n = 10
+    total = 2 * n - 1
+    rep.start("gauge", total=total, unit="frame-ops")
+
+    # Simulate elapsed time via a controllable clock.
+    clock = {"t": 0.0}
+    real_perf = zobs.time.perf_counter
+    monkeypatch.setattr(zobs.time, "perf_counter", lambda: clock["t"])
+
+    # Counts pass: 10 items over 10 s (1 item/s), done 1..10.
+    for d in range(1, n + 1):
+        clock["t"] = float(d)
+        rep.progress(d, item_id=f"counts:d{d}")
+    # Pairs pass continues at done=11..19 over the next 9 s (still 1 item/s).
+    for k in range(1, n):
+        d = n + k
+        clock["t"] = float(n + k)
+        rep.progress(d, item_id=f"pairs:d{k}")
+
+    progress = [m for m, lvl in r.emitted if m.startswith("phase PROGRESS: gauge")]
+    assert progress
+    # The % reflects the WHOLE phase: the final line is 19/19 = 100.0%.
+    assert any("19/19" in p and "(100.0%)" in p for p in progress)
+    # The ETA never explodes: at every emitted progress line the eta is a small
+    # bounded value (rate ~1 item/s, remaining <= 19 s), never None and never
+    # a huge number.
+    for p in progress:
+        assert "eta=" in p
+        eta_tok = p.split("eta=", 1)[1].split(" ", 1)[0]
+        assert eta_tok != "n/a yet"
+        # Format is e.g. "19s" / "18s" — a bounded seconds value, not minutes/hours.
+        assert "m" not in eta_tok and "h" not in eta_tok
+
+    monkeypatch.setattr(zobs.time, "perf_counter", real_perf)
+
+
+def test_gauge_reporter_total_is_cumulative():
+    """rework-1 (M1): the gauge phase total must be 2N-1 (counts N + pairs N-1),
+    matching the cumulative counters emitted by compute_global_gauge."""
+    r = _Recorder()
+    rep = zobs.PhaseReporter(r.emit, interval_s=0.0)
+    rep.start("gauge", total=2 * 10 - 1, unit="frame-ops")
+    rep.progress(19, item_id="pairs:d9")
+    starts = [m for m, lvl in r.emitted if "phase START: gauge" in m]
+    assert starts and "(total=19)" in starts[0]
 
 
 # ---------------------------------------------------------------------------

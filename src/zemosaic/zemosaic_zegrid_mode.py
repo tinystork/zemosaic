@@ -918,11 +918,22 @@ def _fmt_throughput(items, elapsed_s, unit):
 
 
 def _open_run_log(output_dir, start_ts):
-    """Create the run log with a header so it is readable DURING the run."""
+    """Create the run log with a header so it is readable DURING the run.
+
+    rework-1 (I2): a re-run into the SAME output folder would silently replace the
+    previous run log. We keep the single ``zegrid_run.log`` name (the manifest/
+    tests reference it) but, when a previous log already exists, record that it is
+    being replaced in the new header so the overwrite is explicit, not silent.
+    """
     try:
-        (Path(output_dir) / RUN_LOG_NAME).write_text(
+        path = Path(output_dir) / RUN_LOG_NAME
+        replaced = ""
+        if path.exists():
+            replaced = "replaces_previous_log: true (previous run log overwritten)\n"
+        path.write_text(
             "ZeGrid run log\n===============\n"
-            f"started: {start_ts}\n\n"
+            f"started: {start_ts}\n"
+            f"{replaced}\n"
             "[Live phase log]\n",
             encoding="utf-8",
         )
@@ -1127,7 +1138,9 @@ def _run_single(
     )
     gauge_cache_dir = cache_root / "__gauge__"
     _gauge_rep = _reporter()
-    _gauge_rep.start("gauge", total=len(descs), unit="frames")
+    # rework-1 (M1): the gauge phase spans TWO sub-passes (counts N + pairs N-1),
+    # so the honest phase total is 2N-1 and progress is CUMULATIVE across them.
+    _gauge_rep.start("gauge", total=2 * len(descs) - 1, unit="frame-ops")
 
     def _gauge_progress(done, total, item_id):
         _gauge_rep.progress(done, item_id=item_id, total=total)

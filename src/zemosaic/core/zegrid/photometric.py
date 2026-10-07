@@ -223,16 +223,20 @@ def compute_global_gauge(
     n = len(ordered)
     c = 3
 
-    # ZM-ZEGRID-R14: live gauge progress (frames done / total). Two passes over
-    # the frames — per-frame footprint counts (N) then per-frame normalization
-    # (N-1, reference excluded) — reported through the
-    # ``progress_callback(done, total, item_id)`` seam (best-effort, never fatal).
+    # ZM-ZEGRID-R14 rework-1 (M1): live gauge progress is CUMULATIVE across the
+    # two sub-passes so the phase-level ETA is honest throughout. Total work =
+    # N (per-frame footprint counts) + (N-1) (per-frame normalization; reference
+    # excluded) = 2N-1. The counts pass reports done=1..N; the pairs pass
+    # CONTINUES at done=N+1..2N-1. ``item_id`` is prefixed ``counts:`` / ``pairs:``
+    # so the sub-pass is unambiguous. Reported through
+    # ``progress_callback(done, total, item_id)`` (best-effort, never fatal).
+    gauge_total = 2 * n - 1
     count_progress = None
     if progress_callback is not None:
         def _count_progress(done: int, _total: int) -> None:
             try:
                 item = frame_ids[done - 1] if 0 < done <= n else None
-                progress_callback(int(done), int(n), item)
+                progress_callback(int(done), int(gauge_total), f"counts:{item}")
             except Exception:
                 pass
 
@@ -327,7 +331,9 @@ def compute_global_gauge(
             def _pair_progress(done: int, _total: int) -> None:
                 try:
                     item = pair_ids[done - 1] if 0 < done <= m else None
-                    progress_callback(int(done), int(m), item)
+                    # rework-1 (M1): cumulative — the pairs pass continues at
+                    # done = N+1..2N-1 so the phase-level ETA is monotone.
+                    progress_callback(int(n + done), int(gauge_total), f"pairs:{item}")
                 except Exception:
                     pass
 
