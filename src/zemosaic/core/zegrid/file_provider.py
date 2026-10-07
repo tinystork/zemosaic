@@ -123,6 +123,37 @@ def _array_meta(rgb: np.ndarray):
     return h, w, c, False, 3, (h, w, c)
 
 
+def _meta_from_hwc(h: int, w: int, c: int = 3):
+    """Aligned-cache metadata for a known HWC patch shape (parallel path)."""
+    if c == 1:
+        return h, w, 1, True, 2, (h, w)
+    return h, w, c, False, 3, (h, w, c)
+
+
+def _write_manifest(cache_dir, meta, frames, frame_ids, total_bytes) -> dict:
+    """Write the aligned-cache manifest from pre-collected frame metadata.
+
+    Shared by the serial :class:`AlignedCacheBuilder` and the parallel build path
+    so both produce the IDENTICAL manifest schema/content.
+    """
+    h, w, c, mono, ndim, shape = meta
+    manifest = {
+        "schema": CACHE_SCHEMA,
+        "n_frames": len(frames),
+        "height": h,
+        "width": w,
+        "channels": c,
+        "original_mono": mono,
+        "original_ndim": ndim,
+        "original_shape": list(shape),
+        "frame_ids": list(frame_ids),
+        "frames": list(frames),
+        "total_bytes": int(total_bytes),
+    }
+    cache_manifest_path(cache_dir).write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
 def load_cache_manifest(cache_dir) -> dict:
     mp = cache_manifest_path(cache_dir)
     if not mp.exists():
@@ -229,22 +260,9 @@ class AlignedCacheBuilder:
     def finish(self) -> dict:
         if self._meta is None:
             raise CanonicalStackValidationError("empty aligned cache (no frames written)")
-        h, w, c, mono, ndim, shape = self._meta
-        manifest = {
-            "schema": CACHE_SCHEMA,
-            "n_frames": self._n,
-            "height": h,
-            "width": w,
-            "channels": c,
-            "original_mono": mono,
-            "original_ndim": ndim,
-            "original_shape": list(shape),
-            "frame_ids": list(self._frame_ids),
-            "frames": self._frames,
-            "total_bytes": self._total_bytes,
-        }
-        cache_manifest_path(self.cache_dir).write_text(json.dumps(manifest, indent=2) + "\n")
-        return manifest
+        return _write_manifest(
+            self.cache_dir, self._meta, self._frames, self._frame_ids, self._total_bytes
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,17 @@ ROUNDTRIP_TOL_DEG = 1e-7
 SIP_FOOTPRINT_EDGE_STEP_PX = 128   # source-pixel step along each edge
 SIP_FOOTPRINT_MARGIN_PX = 1.0      # conservative target-pixel margin
 
+# ZM-ZEGRID-R11 L1 advisory: the margin above is CORPUS-VALIDATED, not a formal
+# bound. It is justified only because the measured SIP distortion on the Caldwell
+# 11 corpus (max ~0.5 px) is well below ``SIP_FOOTPRINT_MARGIN_PX`` (= 1.0 px). It
+# is NOT a guaranteed bound for arbitrarily strong SIP distortion (large/high-
+# order ``A``/``B`` coefficients can bend edges by more than the margin). For such
+# inputs the correct fix is a curvature-adaptive sampling step (subdivide edges
+# whose projected chord-vs-arc deviation exceeds a tolerance), not a larger fixed
+# margin. The convex-hull construction already guarantees a VALID polygon; this
+# advisory only bounds its geometric tightness, not its validity.
+SIP_MARGIN_IS_CORPUS_VALIDATED = True  # NOT a formal bound for arbitrary SIP
+
 
 # ---------------------------------------------------------------------------
 # Coordinate types (distinct for global / patch / source)
