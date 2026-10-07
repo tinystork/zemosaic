@@ -77,6 +77,7 @@ from .core.zegrid import file_provider as zfp
 from .core.zegrid import geometry as zg
 from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
+from .core.zegrid import observability as zobs
 from .core.zegrid import parallel as zpar
 from .core.zegrid import photometric as zphot
 from .core.zegrid import science_adapter as zs
@@ -125,6 +126,37 @@ def _emit(msg: str, *, lvl: str = "INFO", callback: ProgressCallback = None, **k
 def available_memory_bytes() -> int:
     """Portable available-memory probe (psutil). No POSIX-only ``resource``//proc."""
     return int(psutil.virtual_memory().available)
+
+
+# ZM-ZEGRID-R15: Windows releases file handles asynchronously, so a memmap/``.npy``
+# may still be open when the cache is deleted -> ``WinError 32``. Deletion is an
+# OPTIMISATION and must NEVER fail a run: retry a few times with a short backoff
+# and, on final failure, emit a WARN and continue.
+_RMTREE_ATTEMPTS = 3
+_RMTREE_BACKOFF_S = 0.2
+
+
+def _safe_rmtree(path, progress_callback=None) -> bool:
+    """Best-effort recursive delete (never raises); emits a WARN on final failure."""
+    path = Path(path)
+    if not path.exists():
+        return True
+    last_exc = None
+    for attempt in range(_RMTREE_ATTEMPTS):
+        try:
+            shutil.rmtree(str(path))
+            return True
+        except OSError as exc:  # noqa: BLE001 - deletion is best-effort by design
+            last_exc = exc
+            if attempt + 1 < _RMTREE_ATTEMPTS:
+                time.sleep(_RMTREE_BACKOFF_S * (attempt + 1))
+    _emit(
+        f"cache cleanup FAILED (non-fatal): {last_exc}; leftover cache at {path} "
+        f"will be reused or ignored",
+        lvl="WARN",
+        callback=progress_callback,
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +373,8 @@ def _build_one_cell_cache(
     cache_dir = Path(cache_dir)
     if reuse_cache and zfp.cache_is_complete(str(cache_dir), frame_ids):
         return zfp.load_cache_manifest(str(cache_dir))
-    if cache_dir.exists():
-        shutil.rmtree(str(cache_dir))
+    # R15: rebuild wipe is best-effort (Windows WinError 32 on open handles).
+    _safe_rmtree(cache_dir, progress_callback)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     patch_wcs_header = patch.patch_wcs_header
@@ -542,6 +574,7 @@ def _choose_layout_mode_aware(
     floors=None,
     halo_px=zsw.HALO_PX,
     pinned_layout=None,
+    emit=None,
 ):
     """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
 
@@ -553,7 +586,20 @@ def _choose_layout_mode_aware(
     ``pinned_layout`` (``(nx, ny)`` or ``None``) BYPASSES the RAM-adaptive search
     and uses exactly that layout (scientific floors still enforced; an infeasible
     pinned layout raises). ``layout_source`` records ``"pinned"`` vs ``"auto"``.
+
+    ``emit`` (optional) is ``callable(message, lvl="INFO")``: when supplied, the
+    scan is EXPLAINED live (ZM-ZEGRID-R14) — each candidate ``(nx, ny)``, why it
+    was rejected (which floor / which bound), and the final chosen layout.
     """
+
+    def _log(msg, lvl="INFO"):
+        if emit is None:
+            return
+        try:
+            emit(msg, lvl)
+        except Exception:
+            pass
+
     floors = floors or zal.ScientificFloors()
     mw, mh = zal.median_projected_footprint(frames, canvas)
     if not (mw > 0 and mh > 0):
@@ -570,19 +616,27 @@ def _choose_layout_mode_aware(
         patch_ok = geom["min_patch_area"] >= floors.min_patch_area_px
         halo_ok = geom["halo_overhead"] <= floors.max_halo_overhead
         if not (patch_ok and halo_ok):
-            raise zal.LayoutInfeasible(
+            msg = (
                 f"pinned layout {nx}x{ny} violates scientific floors: "
                 f"min_patch_area={geom['min_patch_area']} (limit {floors.min_patch_area_px}), "
-                f"halo_overhead={geom['halo_overhead']:.4f} (limit {floors.max_halo_overhead})"
+                f"halo_overhead={geom['halo_overhead']:.4f} (limit {floors.max_halo_overhead}). "
+                "Suggest increasing available RAM or pinning a coarser layout via the "
+                "'zegrid_layout' config key."
             )
+            _log(msg, "ERROR")
+            raise zal.LayoutInfeasible(msg)
         cells = list(_iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size))
         max_n = max((c["n"] for c in cells), default=0)
         worst_bound = max((min(c["inmem_bound_bytes"], c["stream_bound_bytes"]) for c in cells), default=0)
         if ram_budget is not None and worst_bound > ram_budget:
-            raise zal.LayoutInfeasible(
+            msg = (
                 f"pinned layout {nx}x{ny} cannot fit any mode within budget: "
-                f"cheaper bound {worst_bound / 2**20:.1f} MiB > budget {ram_budget / 2**20:.1f} MiB"
+                f"cheaper bound {worst_bound / 2**20:.1f} MiB > budget {ram_budget / 2**20:.1f} MiB. "
+                "Suggest increasing available RAM or pinning a coarser layout via the "
+                "'zegrid_layout' config key."
             )
+            _log(msg, "ERROR")
+            raise zal.LayoutInfeasible(msg)
         contrib_ok = max_n >= floors.min_contributors
         warnings = []
         if not contrib_ok:
@@ -625,9 +679,36 @@ def _choose_layout_mode_aware(
         geom = zal._nominal_geometry(canvas, nx, ny, halo_px)
         if not (geom["min_patch_area"] >= floors.min_patch_area_px and
                 geom["halo_overhead"] <= floors.max_halo_overhead):
+            # Explain WHICH floor blocked this candidate (ZM-ZEGRID-R14).
+            if geom["min_patch_area"] < floors.min_patch_area_px:
+                _log(
+                    f"layout scan: candidate {nx}x{ny} REJECTED — "
+                    f"min_patch_area floor: {geom['min_patch_area']} px < "
+                    f"{floors.min_patch_area_px} px"
+                )
+            if geom["halo_overhead"] > floors.max_halo_overhead:
+                _log(
+                    f"layout scan: candidate {nx}x{ny} REJECTED — "
+                    f"max_halo_overhead floor: {geom['halo_overhead']:.4f} > "
+                    f"{floors.max_halo_overhead}"
+                )
+            _log("layout scan: floors are monotonic in refinement — stopping")
             break  # floors are monotonic in refinement
         worst = _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
         memory_ok = (ram_budget is None) or (worst["cheaper_bound_bytes"] <= ram_budget)
+        bound_mib = worst["cheaper_bound_bytes"] / 2**20
+        budget_mib = (ram_budget / 2**20) if ram_budget is not None else None
+        if memory_ok:
+            _log(
+                f"layout scan: candidate {nx}x{ny} ACCEPTED "
+                f"(cheaper-mode bound {bound_mib:.1f} MiB"
+                + (f" <= budget {budget_mib:.1f} MiB" if budget_mib is not None else "") + ")"
+            )
+        else:
+            _log(
+                f"layout scan: candidate {nx}x{ny} REJECTED — "
+                f"cheaper-mode bound {bound_mib:.1f} MiB > budget {budget_mib:.1f} MiB"
+            )
         candidates.append({
             "factor": factor, "nx": nx, "ny": ny,
             "bound": worst["cheaper_bound_bytes"], "worst_cell": worst,
@@ -656,9 +737,14 @@ def _choose_layout_mode_aware(
             f"max_halo_overhead floor ({floors.max_halo_overhead}) cannot be satisfied "
             f"together with the budget (mode-aware)"
         )
-        raise zal.LayoutInfeasible(
-            "RAM budget cannot satisfy scientific floors (mode-aware): " + "; ".join(reasons)
+        msg = (
+            "RAM budget cannot satisfy scientific floors (mode-aware): "
+            + "; ".join(reasons)
+            + ". Suggest either increasing available RAM or pinning the layout via "
+            "the 'zegrid_layout' config key."
         )
+        _log(msg, "ERROR")
+        raise zal.LayoutInfeasible(msg)
 
     cells = list(_iter_cell_bounds_mode_aware(
         canvas, footprints, chosen["nx"], chosen["ny"], halo_px, tile_size
@@ -678,6 +764,12 @@ def _choose_layout_mode_aware(
             if not cand["memory_ok"]:
                 constrained = True
                 break
+
+    _log(
+        f"layout scan: CHOSEN {chosen['nx']}x{chosen['ny']} "
+        f"({chosen['nx'] * chosen['ny']} cells, mode-aware, source=auto) "
+        f"cheaper-mode bound {chosen['bound'] / 2**20:.1f} MiB"
+    )
 
     return {
         "nx": chosen["nx"], "ny": chosen["ny"],
@@ -732,13 +824,19 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
     before (legacy behaviour).
     """
     provider = zfp.MemmapCanonicalProvider(cache_dir)
-    frame_ids = list(provider.frame_ids)
-    images = []
-    supports = []
-    for i in range(provider.n_frames):
-        rgb, sup = provider.get_raw_frame(i)
-        images.append(np.array(rgb, dtype=np.float32, copy=True))
-        supports.append(np.array(sup, dtype=bool, copy=True))
+    try:
+        frame_ids = list(provider.frame_ids)
+        images = []
+        supports = []
+        for i in range(provider.n_frames):
+            rgb, sup = provider.get_raw_frame(i)
+            images.append(np.array(rgb, dtype=np.float32, copy=True))
+            supports.append(np.array(sup, dtype=bool, copy=True))
+    finally:
+        # R15 (rework-1 L1): release the memmap handles ALWAYS, even if the
+        # read/materialise loop raises, so the caller can delete the cache
+        # (Windows: an open .npy cannot be deleted -> WinError 32).
+        provider.close()
     inmem_provider = InMemoryCanonicalProvider(images, supports)
     request = zstream.build_streaming_request(config, inmem_provider.n_frames)
     result = run_canonical_stack_streaming(
@@ -751,11 +849,16 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
 
 def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STREAM_TILE_SIZE, fixed=None):
     provider = zfp.MemmapCanonicalProvider(cache_dir)
-    request = zstream.build_streaming_request(config, provider.n_frames)
-    result = run_canonical_stack_streaming(provider, request, tile_size=tile_size, fixed=fixed)
-    sres = _build_cell_sres(result, list(provider.frame_ids))
-    mt = za.extract_minitile(patch, sres)
-    return mt, sres
+    try:
+        request = zstream.build_streaming_request(config, provider.n_frames)
+        result = run_canonical_stack_streaming(provider, request, tile_size=tile_size, fixed=fixed)
+        sres = _build_cell_sres(result, list(provider.frame_ids))
+        mt = za.extract_minitile(patch, sres)
+        return mt, sres
+    finally:
+        # R15: release the memmap handles before the caller deletes the cache
+        # (Windows: an open .npy cannot be deleted -> WinError 32).
+        provider.close()
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +906,54 @@ def _reference_provenance(global_reference_frame_id, cell_frame_ids, cell_refere
     }
 
 
+# Canonical ZeGrid phase order (used for the R14 global ETA weights).
+_PHASE_ORDER = ("setup", "layout", "gauge", "cache_build", "per_cell_stack", "assembly")
+
+
+def _fmt_throughput(items, elapsed_s, unit):
+    """Human-readable throughput (``items / elapsed_s``), or ``None`` when unknown."""
+    try:
+        if elapsed_s is None or elapsed_s <= 0.0:
+            return None
+        return f"{float(items) / float(elapsed_s):.1f} {unit}"
+    except Exception:
+        return None
+
+
+def _open_run_log(output_dir, start_ts):
+    """Create the run log with a header so it is readable DURING the run.
+
+    rework-1 (I2): a re-run into the SAME output folder would silently replace the
+    previous run log. We keep the single ``zegrid_run.log`` name (the manifest/
+    tests reference it) but, when a previous log already exists, record that it is
+    being replaced in the new header so the overwrite is explicit, not silent.
+    """
+    try:
+        path = Path(output_dir) / RUN_LOG_NAME
+        replaced = ""
+        if path.exists():
+            replaced = "replaces_previous_log: true (previous run log overwritten)\n"
+        path.write_text(
+            "ZeGrid run log\n===============\n"
+            f"started: {start_ts}\n"
+            f"{replaced}\n"
+            "[Live phase log]\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _append_run_log_line(output_dir, line):
+    """Append + flush one line to the run log (readable during the run)."""
+    try:
+        with (Path(output_dir) / RUN_LOG_NAME).open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+
 def _write_run_log(
     output_dir,
     timings,
@@ -820,18 +971,17 @@ def _write_run_log(
     global_reference_frame_id,
     ignored_run_args=None,
 ):
-    """Write a human-readable run log into the output folder.
+    """Append the run-log SUMMARY into the output folder.
 
     The user's real complaint included "le log est absent": ZeGrid produced no
-    run log. This writes ``zegrid_run.log`` (per-mount output folder) with the
-    per-phase wall-clock timings, an explicit GPU-usage statement, and the list
-    of ignored product settings.
+    run log. The live header + per-phase lines are flushed DURING the run (see
+    :func:`_open_run_log` / :func:`_append_run_log_line`); this appends the final
+    summary (per-phase wall-clock timings, an explicit GPU-usage statement, and
+    the list of ignored product settings) so the complete log is readable both
+    during AND after the run.
     """
     lines = [
-        "ZeGrid run log",
-        "===============",
-        f"started: {start_ts}",
-        f"output: {output_dir}",
+        "",
         f"frames_loaded: {frames_loaded}  included: {n_included}  rejected_wcs: {n_rejected}",
         f"canvas: {canvas.width}x{canvas.height} (resolution {canvas.resolution_deg:.3g} deg/px)",
         f"layout: {layout['nx']}x{layout['ny']} (source={layout.get('layout_source', 'auto')})",
@@ -856,7 +1006,12 @@ def _write_run_log(
     lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
     lines.append(f"photometric_gauge.global_reference_frame_id: {global_reference_frame_id}")
     text = "\n".join(lines) + "\n"
-    (Path(output_dir) / RUN_LOG_NAME).write_text(text, encoding="utf-8")
+    try:
+        with (Path(output_dir) / RUN_LOG_NAME).open("a", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+    except Exception:
+        pass
     return text
 
 
@@ -878,6 +1033,35 @@ def _run_single(
     timings = zin.Timings()
     start_ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
+    # ZM-ZEGRID-R14: live observability — phase START/END lines, bounded
+    # intra-phase progress, live ETA, crash-breadcrumb stage, and an
+    # incrementally-flushed run log (readable DURING the run, not only at the end).
+    _open_run_log(output_dir, start_ts)
+    global_eta = zobs.GlobalEta(_PHASE_ORDER)
+
+    def _emit_live(msg, lvl="INFO"):
+        _emit(msg, lvl=lvl, callback=progress_callback)
+
+    def _stage_live(stage_str, current, total):
+        # Worker crash-breadcrumb `stage` (3-int progress_callback form).
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(stage_str, int(current), int(total))
+        except Exception:
+            pass
+
+    def _log_line(line):
+        _append_run_log_line(output_dir, line)
+
+    def _reporter():
+        return zobs.PhaseReporter(
+            _emit_live,
+            stage=_stage_live,
+            log_line=_log_line,
+            global_eta=global_eta.estimate,
+        )
+
     # Explicit GPU-usage + ignored-settings surfacing (nothing silently ignored).
     gpu_used = False  # ZeGrid engine is CPU-only.
     ignored_settings = zin.ignored_settings_present(zconfig)
@@ -890,11 +1074,17 @@ def _run_single(
     )
 
     _emit(f"ZeGrid: setup — {len(frames_info)} frame(s) -> {output_dir}", callback=progress_callback)
+    _setup_rep = _reporter()
+    _setup_rep.start("setup", total=len(frames_info), unit="frames")
     with timings.timed("setup"):
         descs, rejected = _build_frame_descriptors(
             frames_info, input_folder, progress_callback, sip_mode=sip_mode
         )
         canvas = zg.build_canvas(descs)
+    _setup_rep.end(
+        throughput=_fmt_throughput(len(frames_info), timings.get("setup"), "frames/s")
+    )
+    global_eta.phase_completed("setup", timings.get("setup"))
     _emit(
         f"ZeGrid: canvas {canvas.width}x{canvas.height} "
         f"(resolution {canvas.resolution_deg:.3g} deg/px)",
@@ -904,16 +1094,23 @@ def _run_single(
     # LAYOUT — MODE-AWARE RAM-aware Auto layout (in-memory OR streaming bound),
     # budgeted from psutil (portable). Pinnable via ``zegrid_layout``.
     available = available_memory_bytes()
+    _layout_rep = _reporter()
+    _layout_rep.start("layout")
     with timings.timed("layout"):
         layout = _choose_layout_mode_aware(
             canvas, descs, ram_budget=available, available_bytes=available,
             tile_size=STREAM_TILE_SIZE, pinned_layout=pinned_layout,
+            emit=_emit_live,
         )
         nx, ny = layout["nx"], layout["ny"]
         cell_ctxs = []
         for row, col, _bounds in zg.build_layout(canvas, nx, ny).iter_cells(canvas):
             cell, patch, mem = zsw.build_cell_context(descs, canvas, row, col, nx, ny)
             cell_ctxs.append((row, col, cell, patch, mem))
+    _layout_rep.end(
+        throughput=_fmt_throughput(nx * ny, timings.get("layout"), "cells/s")
+    )
+    global_eta.phase_completed("layout", timings.get("layout"))
     _emit(
         f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells, "
         f"source={layout.get('layout_source', 'auto')}) from RAM budget "
@@ -933,6 +1130,9 @@ def _run_single(
     cache_root = output_dir / CACHE_DIR_NAME
     cache_root.mkdir(parents=True, exist_ok=True)
 
+    # R15 (rework-1 L3): track cache cleanup failures (auditable in the manifest).
+    cleanup_failures: list[str] = []
+
     # GLOBAL PHOTOMETRIC GAUGE (ZM-ZEGRID-R11): one reference + per-frame
     # normalization coefficients/weights computed ONCE over the full canvas,
     # so every Cell shares a single photometric anchor. Frame-major full-canvas
@@ -943,10 +1143,23 @@ def _run_single(
         callback=progress_callback,
     )
     gauge_cache_dir = cache_root / "__gauge__"
+    _gauge_rep = _reporter()
+    # rework-1 (M1): the gauge phase spans TWO sub-passes (counts N + pairs N-1),
+    # so the honest phase total is 2N-1 and progress is CUMULATIVE across them.
+    _gauge_rep.start("gauge", total=2 * len(descs) - 1, unit="frame-ops")
+
+    def _gauge_progress(done, total, item_id):
+        _gauge_rep.progress(done, item_id=item_id, total=total)
+
     with timings.timed("gauge"):
         global_gauge, global_frame_ids = zphot.compute_global_gauge(
-            descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers
+            descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
+            progress_callback=_gauge_progress,
         )
+    _gauge_rep.end(
+        throughput=_fmt_throughput(len(descs), timings.get("gauge"), "frames/s")
+    )
+    global_eta.phase_completed("gauge", timings.get("gauge"))
     global_reference_frame_id = global_frame_ids[int(global_gauge.reference_index)]
     _emit(
         f"ZeGrid: global photometric gauge — reference frame {global_reference_frame_id!r} "
@@ -955,7 +1168,8 @@ def _run_single(
         callback=progress_callback,
     )
     if gauge_cache_dir.exists():
-        shutil.rmtree(str(gauge_cache_dir))
+        if not _safe_rmtree(gauge_cache_dir, progress_callback):
+            cleanup_failures.append(str(gauge_cache_dir))
 
     # PER-CELL: build aligned cache (parallel reproject) -> stack -> DELETE cache
     # (per-cell temp reuse: peak disk is the LARGEST single cell, not the sum).
@@ -966,6 +1180,17 @@ def _run_single(
     cache_total_bytes = 0
     cache_peak_bytes = 0
     cache_n_frames = 0
+
+    # ZM-ZEGRID-R14: intra-phase progress for the two long per-cell phases.
+    # cache_build reports FRAMES done/total (cumulative reprojected frames across
+    # cells); per_cell_stack reports CELLS done/total.
+    cache_total_frames = sum(len(mem.patch_ids) for (_r, _c, _ce, _p, mem) in cell_ctxs if mem.patch_ids)
+    cache_frames_done = 0
+    stack_cells_done = 0
+    _cache_rep = _reporter()
+    _stack_rep = _reporter()
+    _cache_rep.start("cache_build", total=cache_total_frames, unit="frames")
+    _stack_rep.start("per_cell_stack", total=total_cells, unit="cells")
     for (row, col, cell, patch, mem) in cell_ctxs:
         cid = cell.cell_id
         idx = row * nx + col
@@ -973,6 +1198,8 @@ def _run_single(
             _emit(f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) empty — no patch contributors",
                   callback=progress_callback)
             cell_records.append({"cell_id": cid, "status": "empty", "mode": None})
+            stack_cells_done += 1
+            _stack_rep.progress(stack_cells_done, item_id=cid)
             continue
 
         n = len(mem.patch_ids)
@@ -994,6 +1221,8 @@ def _run_single(
         except Exception as exc:
             _emit(f"ZeGrid: cell {cid} cache build failed: {exc}", lvl="ERROR", callback=progress_callback)
             raise
+        cache_frames_done += int(manifest.get("n_frames", 0))
+        _cache_rep.progress(cache_frames_done, item_id=cid)
         timings.add("cache_build", time.perf_counter() - t0)
         cache_total_bytes += int(manifest.get("total_bytes", 0))
         cache_n_frames += int(manifest.get("n_frames", 0))
@@ -1001,9 +1230,14 @@ def _run_single(
 
         # R11: subset the global gauge to THIS cell's frames (in cache order), so
         # the cell reuses the SAME per-frame coefficients/weights as every other
-        # cell (a single photometric anchor).
+        # cell (a single photometric anchor). Open the provider ONLY long enough
+        # to read the frame-id list, then CLOSE it (R15: release the memmap
+        # handles before the cache is deleted below).
         cell_provider = zfp.MemmapCanonicalProvider(cache_dir)
-        cell_frame_ids = list(cell_provider.frame_ids)
+        try:
+            cell_frame_ids = list(cell_provider.frame_ids)
+        finally:
+            cell_provider.close()
         cell_fixed = subset_fixed_normalization(
             global_gauge, global_frame_ids, cell_frame_ids
         )
@@ -1021,6 +1255,8 @@ def _run_single(
             _emit(f"ZeGrid: cell {cid} failed: {exc}", lvl="ERROR", callback=progress_callback)
             raise
         timings.add("per_cell_stack", time.perf_counter() - t0)
+        stack_cells_done += 1
+        _stack_rep.progress(stack_cells_done, item_id=cid)
 
         cores[cid] = za.crop_all_planes_to_core(mt)
         peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
@@ -1050,14 +1286,30 @@ def _run_single(
         )
 
         # Per-cell temp reuse: delete the cell cache after stacking (bounded disk).
-        if cache_dir.exists():
-            shutil.rmtree(str(cache_dir))
+        # R15: best-effort (Windows WinError 32 on open handles -> WARN + continue).
+        if not _safe_rmtree(cache_dir, progress_callback):
+            cleanup_failures.append(str(cache_dir))
+
+    _cache_rep.end(
+        throughput=_fmt_throughput(cache_total_frames, timings.get("cache_build"), "frames/s")
+    )
+    global_eta.phase_completed("cache_build", timings.get("cache_build"))
+    _stack_rep.end(
+        throughput=_fmt_throughput(total_cells, timings.get("per_cell_stack"), "cells/s")
+    )
+    global_eta.phase_completed("per_cell_stack", timings.get("per_cell_stack"))
 
     # ASSEMBLY.
     _emit("ZeGrid: assembly (R3 assemble_canvas)", callback=progress_callback)
+    _assembly_rep = _reporter()
+    _assembly_rep.start("assembly")
     with timings.timed("assembly"):
         assembled = zmosaic.assemble_canvas(canvas, nx, ny, cores)
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
+    _assembly_rep.end(
+        throughput=_fmt_throughput(len(assembled.complete_cells), timings.get("assembly"), "cells/s")
+    )
+    global_eta.phase_completed("assembly", timings.get("assembly"))
 
     # I2 — no covered pixels -> explicit abort (never an all-NaN mosaic).
     if assembled.coverage_pixels == 0:
@@ -1075,6 +1327,7 @@ def _run_single(
         "peak_cell_bytes": cache_peak_bytes,
         "n_frame_entries": cache_n_frames,
         "retention": "per-cell temporary (deleted after stacking); gauge cache deleted after use",
+        "cleanup_failures": cleanup_failures,
     }
 
     # Write legacy-compatible outputs.
@@ -1226,6 +1479,10 @@ def _write_outputs(
                   "peak_cell_bytes": int(cache_peak_bytes),
                   "retention": cache_retention,
                   "n_frame_entries": int(cache_files),
+                  "cleanup_failures": {
+                      "count": len((cache_report or {}).get("cleanup_failures", [])),
+                      "paths": list((cache_report or {}).get("cleanup_failures", [])),
+                  },
                   "reused_cells": (cache_report or {}).get("reused", []),
                   "rebuilt_cells": (cache_report or {}).get("rebuilt", [])},
         "timings": (timings.to_dict() if timings is not None else {}),

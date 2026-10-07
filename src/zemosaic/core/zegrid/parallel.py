@@ -67,11 +67,16 @@ def _parent_is_daemonic() -> bool:
         return False
 
 
-def pmap(worker, tasks, workers: int):
+def pmap(worker, tasks, workers: int, progress_callback=None):
     """Run ``worker`` over ``tasks`` in order; returns a list of results.
 
     ``worker`` must be a module-level (picklable-by-reference) pure function of
     one task argument. Serial fallback when ``workers <= 1`` or ``len(tasks) < 2``.
+
+    ``progress_callback`` (optional) is ``callable(done, total)`` invoked after
+    each completed task (1-based ``done``, ``total`` = number of tasks), used by
+    the R14 live gauge progress reporting. It is best-effort: a failure of the
+    callback is swallowed and never affects the results.
 
     Executor selection (ZM-ZEGRID-R13):
       * non-daemonic parent -> ``ProcessPoolExecutor`` (fork on Linux: workers
@@ -84,8 +89,21 @@ def pmap(worker, tasks, workers: int):
     with a single WARN — a parallel failure can never crash the run.
     """
     tasks = list(tasks)
-    if workers <= 1 or len(tasks) < 2:
-        return [worker(t) for t in tasks]
+    total = len(tasks)
+
+    def _report(done):
+        if progress_callback is not None:
+            try:
+                progress_callback(int(done), int(total))
+            except Exception:  # noqa: BLE001 - progress is never fatal
+                pass
+
+    if workers <= 1 or total < 2:
+        out = []
+        for i, t in enumerate(tasks):
+            out.append(worker(t))
+            _report(i + 1)
+        return out
 
     if _parent_is_daemonic():
         from concurrent.futures import ThreadPoolExecutor
@@ -102,16 +120,24 @@ def pmap(worker, tasks, workers: int):
         "[ZEGRID] pmap: %s pool, workers=%d, tasks=%d",
         kind,
         workers,
-        len(tasks),
+        total,
     )
 
     try:
         with Executor(max_workers=workers) as pool:
-            return list(pool.map(worker, tasks))
+            out = []
+            for i, res in enumerate(pool.map(worker, tasks)):
+                out.append(res)
+                _report(i + 1)
+            return out
     except Exception as exc:  # noqa: BLE001 - fail-safe: never let parallelism crash
         log.warning(
             "[ZEGRID] parallel map unavailable (%s: %s); falling back to serial",
             type(exc).__name__,
             exc,
         )
-        return [worker(t) for t in tasks]
+        out = []
+        for i, t in enumerate(tasks):
+            out.append(worker(t))
+            _report(i + 1)
+        return out

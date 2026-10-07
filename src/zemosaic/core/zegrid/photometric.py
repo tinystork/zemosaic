@@ -200,6 +200,7 @@ def compute_global_gauge(
     *,
     reuse_cache: bool = True,
     workers: int = 1,
+    progress_callback=None,
 ) -> tuple[FixedNormalization, tuple[str, ...]]:
     """Compute the global photometric gauge over the full canvas (bounded).
 
@@ -222,6 +223,25 @@ def compute_global_gauge(
     n = len(ordered)
     c = 3
 
+    # ZM-ZEGRID-R14 rework-1 (M1): live gauge progress is CUMULATIVE across the
+    # two sub-passes so the phase-level ETA is honest throughout. Total work =
+    # N (per-frame footprint counts) + (N-1) (per-frame normalization; reference
+    # excluded) = 2N-1. The counts pass reports done=1..N; the pairs pass
+    # CONTINUES at done=N+1..2N-1. ``item_id`` is prefixed ``counts:`` / ``pairs:``
+    # so the sub-pass is unambiguous. Reported through
+    # ``progress_callback(done, total, item_id)`` (best-effort, never fatal).
+    gauge_total = 2 * n - 1
+    count_progress = None
+    if progress_callback is not None:
+        def _count_progress(done: int, _total: int) -> None:
+            try:
+                item = frame_ids[done - 1] if 0 < done <= n else None
+                progress_callback(int(done), int(gauge_total), f"counts:{item}")
+            except Exception:
+                pass
+
+        count_progress = _count_progress
+
     norm_token = config.normalization
     weight_token = config.weighting
 
@@ -236,7 +256,10 @@ def compute_global_gauge(
         )
         for i, f in enumerate(ordered)
     ]
-    counts = np.asarray(zpar.pmap(_counts_worker, count_tasks, workers), dtype=np.int64)
+    counts = np.asarray(
+        zpar.pmap(_counts_worker, count_tasks, workers, progress_callback=count_progress),
+        dtype=np.int64,
+    )
 
     # --- reference selection (reuse the frozen function; exact argmax of counts) ---
     probe = CanonicalInputBatch(
@@ -282,6 +305,7 @@ def compute_global_gauge(
     _GAUGE_R_SUP = r_sup
     try:
         pair_tasks = []
+        pair_ids = []
         for i in range(n):
             if i == ref_idx:
                 continue
@@ -298,7 +322,26 @@ def compute_global_gauge(
                     weight_token,
                 )
             )
-        pair_results = zpar.pmap(_pair_worker, pair_tasks, workers)
+            pair_ids.append(ordered[i].frame_id.logical_path)
+
+        pair_progress = None
+        if progress_callback is not None:
+            m = len(pair_tasks)
+
+            def _pair_progress(done: int, _total: int) -> None:
+                try:
+                    item = pair_ids[done - 1] if 0 < done <= m else None
+                    # rework-1 (M1): cumulative — the pairs pass continues at
+                    # done = N+1..2N-1 so the phase-level ETA is monotone.
+                    progress_callback(int(n + done), int(gauge_total), f"pairs:{item}")
+                except Exception:
+                    pass
+
+            pair_progress = _pair_progress
+
+        pair_results = zpar.pmap(
+            _pair_worker, pair_tasks, workers, progress_callback=pair_progress
+        )
     finally:
         _GAUGE_R_FULL = None
         _GAUGE_R_SUP = None
