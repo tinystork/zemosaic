@@ -899,16 +899,19 @@ def _write_outputs(
         "reproducibility_note": (
             "output science is GLOBAL-gauge normalized (one reference frame + "
             "per-frame coefficients computed over the full canvas), so the science "
-            "is layout-INDEPENDENT (ZM-ZEGRID-R11 resolves the R7-M1 reproducibility "
-            "caveat). Pin the layout via the 'zegrid_layout' config key (e.g. '6x5') "
-            "for reproducible output; coverage (stack depth) is pure geometry."
+            "is layout-INDEPENDENT under the corrected global gauge "
+            "(ZM-ZEGRID-R11 rework-1: Cells lacking the global reference keep its "
+            "level, not a re-anchored local level). Pin the layout via the "
+            "'zegrid_layout' config key (e.g. '6x5') for reproducible output; "
+            "coverage (stack depth) is pure geometry."
         ),
         "photometric_gauge": {
             "mode": "global",
             "global_reference_frame_id": global_reference_frame_id,
             "note": (
                 "one reference frame + per-frame sky_mean coefficients computed once "
-                "over the full canvas footprint; every Cell reuses the same gauge."
+                "over the full canvas footprint; every Cell reuses the same gauge "
+                "(Cells lacking the global reference keep its GLOBAL level)."
             ),
         },
         "n_frames": len(descs),

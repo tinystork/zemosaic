@@ -141,28 +141,94 @@ def test_subset_remaps_reference_and_coefficients():
     np.testing.assert_array_equal(sub.coefficients[1], gauge.coefficients[3])
 
 
-def test_subset_reanchors_when_reference_absent():
+def test_subset_keeps_global_level_when_reference_absent():
     arrays, masks = _corpus()
     req = _request(arrays, masks)
     gauge = compute_fixed_normalization(InMemoryCanonicalProvider(arrays, masks), req)
     ref = gauge.reference_index
 
-    # A cell that does NOT contain the reference frame.
+    # A cell that does NOT contain the reference frame (the real-mosaic case).
     others = [i for i in range(len(arrays)) if i != ref][:2]
     sub = subset_fixed_normalization(gauge, list(range(len(arrays))), others)
 
-    # The re-anchor: each coefficient is re-expressed relative to the anchor so the
-    # photometric scale is unchanged. For sky_mean (a=1), this is an offset
-    # difference: b'_i = b_i - b_anchor, and the anchor gets the identity.
-    anchor = sub.reference_index
-    assert 0 <= anchor < len(others)
-    assert np.all(np.isclose(sub.coefficients[anchor, :, 0], 1.0))
-    assert np.all(np.isclose(sub.coefficients[anchor, :, 1], 0.0))
-    # The offset difference must reproduce the original (a=1 for sky_mean).
-    aL = gauge.coefficients[others[anchor], :, 1]
+    # F1 fix: coefficients stay GLOBAL (relative to R), NOT re-anchored to a local
+    # frame L. The cell's science therefore lands on R's level (residual step 0,
+    # not b_L).
     for j, gi in enumerate(others):
-        expected_b = gauge.coefficients[gi, :, 1] - aL
-        assert np.allclose(sub.coefficients[j, :, 1], expected_b)
+        np.testing.assert_array_equal(sub.coefficients[j], gauge.coefficients[gi])
+
+    # reference_index is a valid cell-local bookkeeping placeholder: the
+    # highest-weight active frame (ties -> lowest index).
+    assert 0 <= sub.reference_index < len(others)
+    anchor = int(np.argmax(np.where(sub.weight_active, sub.weights, -np.inf)))
+    assert sub.reference_index == anchor
+    # frame_ids are recorded for the I1 consistency check.
+    assert sub.frame_ids == tuple(others)
+
+
+def test_synthetic_mosaic_residual_zero_when_reference_absent():
+    """F1 regression: a cell WITHOUT the global reference lands on R's level.
+
+    Frames at DIFFERENT sky offsets (a mosaic); the global reference R is frame 0.
+    A cell-with-R and a cell-without-R must produce science on the SAME level
+    (residual ~0). The r0 bug re-anchored the cell-without-R to a local frame L,
+    producing a residual step of exactly b_L (>= 4 ADU here).
+    """
+    h, w = 40, 40
+    rng = np.random.default_rng(7)
+    offsets = np.array([0.0, 5.0, 12.0, -4.0, 20.0, -9.0])
+    frames = [(100.0 + off + rng.normal(0.0, 0.5, (h, w))).astype(np.float32) for off in offsets]
+    masks = [_full_support(h, w)] * len(frames)
+    masks[2][:, w // 2:] = False  # reduced support so frame 2 is not the reference
+
+    req = _request(frames, masks)
+    gauge = compute_fixed_normalization(InMemoryCanonicalProvider(frames, masks), req)
+    assert gauge.reference_index == 0  # greatest valid support, tie -> lowest index
+
+    global_ids = list(range(len(frames)))
+
+    def run(cell_ids):
+        sub_gauge = subset_fixed_normalization(gauge, global_ids, cell_ids)
+        sub_arrays = [frames[i] for i in cell_ids]
+        sub_masks = [masks[i] for i in cell_ids]
+        res = run_canonical_stack_streaming(
+            InMemoryCanonicalProvider(sub_arrays, sub_masks),
+            _request(sub_arrays, sub_masks),
+            tile_size=16,
+            fixed=sub_gauge,
+        )
+        return float(np.nanmean(res.science))
+
+    with_R = run([0, 1, 2])
+    without_R = run([1, 2, 3])
+    residual = abs(with_R - without_R)
+    # Pinned: residual must be ~0 (both cells on R's level); the r0 bug produced a
+    # step of b_L >= 4 ADU.
+    assert residual < 0.5, f"residual level step {residual:.4f} ADU (expected ~0)"
+
+
+def test_fixed_frame_id_consistency_check(tmp_path):
+    """R11 I1: a wrong-but-same-N gauge is rejected when the provider exposes ids."""
+    arrays, masks = _corpus()
+    req = _request(arrays, masks)
+    gauge = compute_fixed_normalization(InMemoryCanonicalProvider(arrays, masks), req)
+    wrong = FixedNormalization(
+        reference_index=gauge.reference_index,
+        coefficients=gauge.coefficients,
+        norm_active=gauge.norm_active,
+        weights=gauge.weights,
+        weight_active=gauge.weight_active,
+        exclusions=gauge.exclusions,
+        frame_ids=tuple(f"wrong{i}" for i in range(len(arrays))),
+    )
+    cache_dir = tmp_path / "cache"
+    zfp.write_aligned_cache_from_arrays(
+        str(cache_dir), [f"f{i}" for i in range(len(arrays))], arrays, masks
+    )
+    memprov = zfp.MemmapCanonicalProvider(str(cache_dir))
+    mem_req = _request([None] * memprov.n_frames, [None] * memprov.n_frames)
+    with pytest.raises(cs.CanonicalStackValidationError):
+        run_canonical_stack_streaming(memprov, mem_req, tile_size=16, fixed=wrong)
 
 
 def test_subset_rejects_unknown_frame():

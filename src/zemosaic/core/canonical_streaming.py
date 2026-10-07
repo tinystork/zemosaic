@@ -294,6 +294,11 @@ class FixedNormalization:
     exclusions:
         Tuple of :class:`FrameExclusion` (normalization then weighting), indexed
         by the frame order this gauge covers.
+    frame_ids:
+        Optional tuple of frame ids in the order this gauge covers. When set
+        (``subset_fixed_normalization`` sets it to the Cell's frame order), the
+        streaming executor verifies it against the provider's ``frame_ids`` so a
+        wrong-but-same-N gauge cannot apply silently (R11 I1).
     """
 
     reference_index: int
@@ -302,6 +307,7 @@ class FixedNormalization:
     weights: np.ndarray           # (N,) float64
     weight_active: np.ndarray     # (N,) bool
     exclusions: tuple             # FrameExclusion
+    frame_ids: tuple | None = None
 
 
 # --------------------------------------------------------------------------
@@ -537,13 +543,19 @@ def subset_fixed_normalization(
     Returns a :class:`FixedNormalization` over ``cell_frame_ids`` with
     ``reference_index`` remapped to the Cell-local index of the global reference.
 
-    When the global reference frame is NOT a contributor to the Cell, the gauge is
-    RE-ANCHORED to the Cell's highest-weight active frame: each coefficient
-    ``(a, b)`` is re-expressed relative to that frame ``L`` via
-    ``a' = a / a_L``, ``b' = (b - b_L) / a_L`` (for ``sky_mean`` ``a=1`` this is a
-    pure offset difference ``b - b_L``). The photometric scale is unchanged — only
-    the identity anchor moves — so Cells without the global reference still emit
-    science on the SAME global scale.
+    LEVEL-CORRECTNESS (ZM-ZEGRID-R11 rework-1, F1): the returned coefficients are
+    ALWAYS the GLOBAL coefficients, i.e. expressed relative to the global
+    reference ``R``. For ``sky_mean`` (``a=1``) the offset is
+    ``b_i = mean(R) - mean(frame_i)``, so ``frame_i + b_i`` lands on R's sky
+    level. When ``R`` is NOT a contributor to the Cell, the Cell is NOT re-anchored
+    to a local frame ``L`` — re-anchoring (``b'_i = b_i - b_L``) MOVES the level to
+    L's sky level (a residual step of exactly ``b_L``), which broke the global
+    anchor on real mosaics (most cells lack R). Instead the coefficients stay on
+    R's level and ``reference_index`` becomes a bookkeeping placeholder (the Cell's
+    highest-weight active frame); phase 2 applies the coefficients uniformly (it
+    never special-cases the reference), so the Cell lands on R's GLOBAL level
+    exactly like a Cell that contains R. The photometric SCALE and LEVEL are both
+    unchanged by this operation.
     """
     if len(global_frame_ids) != fixed.coefficients.shape[0]:
         raise CanonicalStackValidationError(
@@ -571,38 +583,32 @@ def subset_fixed_normalization(
     ref = int(fixed.reference_index)
     if ref in present:
         cell_ref = int(np.where(idx == ref)[0][0])
-        # The global reference frame keeps its identity coefficient by
-        # construction; verify it is the identity (defensive invariant).
+        # The global reference frame keeps its identity coefficient (a=1, b=0) by
+        # construction; verify it (defensive invariant).
         a_ref = float(coefficients[cell_ref, 0, 0])
-        if np.isfinite(a_ref) and not np.isclose(a_ref, 1.0, atol=0.0):
-            raise CanonicalStackValidationError(
-                "global reference frame does not carry the identity coefficient"
-            )
+        if np.isfinite(a_ref):
+            b_ref = float(coefficients[cell_ref, 0, 1])
+            if not (np.isclose(a_ref, 1.0, atol=0.0) and np.isclose(b_ref, 0.0, atol=0.0)):
+                raise CanonicalStackValidationError(
+                    "global reference frame does not carry the identity coefficient (1, 0)"
+                )
     else:
-        # Re-anchor to the Cell's highest-weight active frame (deterministic).
+        # R is NOT a contributor to this Cell (the real-mosaic case: on M106 5x4 the
+        # max-canvas-support reference covers ~26.4% of the canvas, so ~8/20 cells
+        # lack R). F1 fix: DO NOT re-anchor. The coefficients are already R-relative
+        # (global level); re-anchoring to a local frame L would shift the level by
+        # -b_L. The reference_index is a deterministic bookkeeping placeholder (the
+        # highest-weight active frame); phase 2 does not special-case the reference,
+        # so the science still lands on R's global level.
         active_cell = np.where(weight_active)[0]
         if active_cell.size == 0:
             raise CanonicalStackValidationError(
-                "cannot re-anchor a Cell whose gauge has no active frame"
+                "cell gauge has no active frame (no bookkeeping reference available)"
             )
         # Highest weight; ties resolved to the lowest index (deterministic).
         local_weights = np.where(weight_active, weights, -np.inf)
-        anchor = int(np.argmax(local_weights))
-        aL = coefficients[anchor]  # (C, 2)
-        if not np.all(np.isfinite(aL)) or np.any(aL[:, 0] == 0.0):
-            raise CanonicalStackValidationError(
-                "anchor frame has non-finite/zero-slope coefficients; cannot re-anchor"
-            )
-        new_coeff = np.full((n_cell, c, 2), np.nan, dtype=np.float64)
-        for j in range(n_cell):
-            if not np.isfinite(coefficients[j, 0, 0]):
-                continue  # excluded frame stays NaN
-            a = coefficients[j, :, 0]
-            b = coefficients[j, :, 1]
-            new_coeff[j, :, 0] = a / aL[:, 0]
-            new_coeff[j, :, 1] = (b - aL[:, 1]) / aL[:, 0]
-        coefficients = new_coeff
-        cell_ref = anchor
+        cell_ref = int(np.argmax(local_weights))
+        # coefficients stay R-relative; no re-anchoring.
 
     # Remap exclusions to the Cell-local frame order (drop frames not in the Cell).
     exclusions = tuple(
@@ -623,6 +629,7 @@ def subset_fixed_normalization(
         weights=weights,
         weight_active=weight_active,
         exclusions=exclusions,
+        frame_ids=tuple(cell_frame_ids),
     )
 
 
@@ -655,6 +662,17 @@ def _fixed_phase1(
         raise CanonicalStackValidationError(
             f"fixed reference_index {fixed.reference_index} out of range [0, {n})"
         )
+    # R11 I1: optional frame-id consistency check. A wrong-but-same-N gauge would
+    # otherwise apply silently (coefficients are keyed by POSITION, so a permuted
+    # or misaligned frame list would silently mis-map coefficients). When the fixed
+    # gauge carries frame ids AND the provider exposes its own, they must match.
+    if fixed.frame_ids is not None and hasattr(provider, "frame_ids"):
+        prov_ids = tuple(provider.frame_ids)
+        if tuple(fixed.frame_ids) != prov_ids:
+            raise CanonicalStackValidationError(
+                "fixed gauge frame_ids do not match the provider frame order "
+                f"({len(fixed.frame_ids)} vs {len(prov_ids)} frames)"
+            )
     return _Phase1(
         reference_index=int(fixed.reference_index),
         coefficients=np.array(fixed.coefficients, dtype=np.float64, copy=True),
@@ -949,6 +967,13 @@ def run_canonical_stack_streaming(
     the freshly-computed ones), so every Cell given the same gauge shares one
     photometric anchor. Results are bit-equal to computing the gauge over a Cell
     whose footprint equals the gauge's full footprint (see the R11 tests).
+
+    With ``fixed``, the GLOBAL exclusions / active flags apply to EVERY Cell
+    (R11 I2): a frame excluded or de-weighted at the gauge level (insufficient
+    overlap with the global reference, failed quality metric, …) is excluded or
+    de-weighted in every Cell, even a Cell whose per-Cell footprint would have
+    kept it. This is a deliberate behaviour change vs the per-Cell exclusions of
+    the non-fixed path and is what makes the science layout-independent.
     """
     if not isinstance(request, CanonicalStackRequest):
         raise CanonicalStackValidationError(
