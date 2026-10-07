@@ -32,18 +32,26 @@ verbatim on a 2-frame ``[R, i]`` batch:
 * **Per-frame normalization + weighting** reuses the frozen
   ``prepare_canonical_inputs`` / ``normalize_canonical_images`` /
   ``compute_canonical_quality_weights`` on a 2-frame ``[R_crop, i_crop]`` batch,
-  where BOTH are cropped to frame i's footprint bbox. Cropping to i's footprint
-  bbox (not just the R-i intersection) is what keeps the QUALITY WEIGHT
-  bit-identical: the weight is the noise sigma over frame i's FULL valid
-  footprint (the frozen weighting does not restrict to the intersection), while
-  the sky_mean offset is computed over the common region (a subset of the bbox).
+  where BOTH are cropped to the UNION of the reference's and frame i's footprint
+  bboxes. Cropping to the union bbox (not just the R-i intersection, and not just
+  i's bbox) is what keeps BOTH the QUALITY WEIGHT (over i's FULL footprint) AND
+  the frozen ``min_common`` gate basis on the SAME footing as the full-canvas
+  gauge: within the union bbox ``counts[0] == |R_full|`` and ``counts[1] ==
+  |i_full|``, so the discrete outputs (reference index, active flags, exclusions)
+  are IDENTICAL to the full-canvas gauge.
 
-Peak RAM is O(1-2 planes) (~0.5 GiB: R's full canvas + one footprint bbox), and
-peak DISK is ~0. The coefficients/weights/active flags/exclusions are BIT-
-IDENTICAL to the R11 full-canvas gauge because every scalar the frozen functions
-compute is a deterministic function of a 1-D sequence ``array[valid_mask]``
-(row-major), and a bbox crop that is a SUPERSET of the relevant valid region
-yields the identical sequence in the identical order.
+Peak RAM is O(1-2 planes) (~0.5 GiB: R's full canvas + one union bbox), and
+peak DISK is ~0.
+
+EQUIVALENCE (honesty note, ZM-ZEGRID-R12 rework-2): the bounded gauge is
+DETERMINISTIC and matches the R11 full-canvas gauge EXACTLY when the bboxes ≈
+canvas (near-full overlap, e.g. M16). On PARTIAL-OVERLAP corpora (bboxes strictly
+smaller than the canvas) it is EQUIVALENT UP TO REPROJECTION FP NOISE (~1e-4
+relative, negligible): frame i is reprojected onto a bbox SUB-canvas WCS (shifted
+CRPIX) rather than the full-canvas WCS, so ``reproject_interp`` differs in the
+last FP digits and the continuous coefficients/weights may differ ~1e-4 relative,
+while the discrete outputs remain identical. This is therefore NOT claimed as
+BIT-IDENTICAL on partial-overlap corpora (see the R12 partial-overlap test).
 """
 
 from __future__ import annotations
@@ -102,6 +110,16 @@ def _bbox_wcs_header(canvas, bbox) -> str:
     w.wcs.crpix -= np.array([x0, y0])
     w.array_shape = (bbox[1] - bbox[0], bbox[3] - bbox[2])
     return w.to_header(relax=True).tostring()
+
+
+def _union_bbox(b1, b2) -> tuple:
+    """Union of two canvas bboxes ``(y0, y1, x0, x1)``."""
+    return (
+        min(b1[0], b2[0]),
+        max(b1[1], b2[1]),
+        min(b1[2], b2[2]),
+        max(b1[3], b2[3]),
+    )
 
 
 def _decode_to_chw(decode_fn, f) -> np.ndarray:
@@ -194,6 +212,10 @@ def compute_global_gauge(
     ``cache_dir`` / ``reuse_cache`` are accepted for backward compatibility but
     are IGNORED: the R12 rework-1 gauge is a bounded streaming phase-1 with NO
     disk cache (peak disk ~0, peak RAM O(1-2 planes)).
+
+    The result is DETERMINISTIC and matches the R11 full-canvas gauge exactly
+    when bboxes ≈ canvas; on partial-overlap corpora it is equivalent up to
+    ~1e-4 relative reprojection FP noise (see the module docstring).
     """
     ordered = sorted(frames, key=lambda f: f.frame_id)
     frame_ids = [f.frame_id.logical_path for f in ordered]
@@ -230,6 +252,7 @@ def compute_global_gauge(
         original_shape=(canvas.height, canvas.width, c),
     )
     ref_idx = select_canonical_reference(probe, None)
+    ref_bbox = bboxes[ref_idx]
 
     # --- reference full-canvas alignment (ONE plane) + reference weighting ---
     r_full, r_sup = _reproject_full(decode_fn, ordered[ref_idx], canvas)
@@ -258,20 +281,23 @@ def compute_global_gauge(
     _GAUGE_R_FULL = r_full
     _GAUGE_R_SUP = r_sup
     try:
-        pair_tasks = [
-            (
-                i,
-                decode_fn,
-                ordered[i],
-                bboxes[i],
-                _bbox_wcs_header(canvas, bboxes[i]),
-                (bboxes[i][1] - bboxes[i][0], bboxes[i][3] - bboxes[i][2]),
-                norm_token,
-                weight_token,
+        pair_tasks = []
+        for i in range(n):
+            if i == ref_idx:
+                continue
+            ubox = _union_bbox(ref_bbox, bboxes[i])
+            pair_tasks.append(
+                (
+                    i,
+                    decode_fn,
+                    ordered[i],
+                    ubox,
+                    _bbox_wcs_header(canvas, ubox),
+                    (ubox[1] - ubox[0], ubox[3] - ubox[2]),
+                    norm_token,
+                    weight_token,
+                )
             )
-            for i in range(n)
-            if i != ref_idx
-        ]
         pair_results = zpar.pmap(_pair_worker, pair_tasks, workers)
     finally:
         _GAUGE_R_FULL = None

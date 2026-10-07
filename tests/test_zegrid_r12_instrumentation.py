@@ -305,11 +305,14 @@ def test_manifest_has_ignored_run_args(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# F1: bounded streaming gauge is BIT-IDENTICAL to the full-canvas gauge (M16)
+# F1: bounded gauge vs full-canvas gauge — NEAR-FULL-OVERLAP (M16) case
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M16 lights directory not present")
-def test_bounded_gauge_bit_identical_to_full_canvas(tmp_path):
+def test_bounded_gauge_near_full_overlap_matches_full_canvas(tmp_path):
+    """M16 = NEAR-FULL-OVERLAP (bboxes ≈ canvas): bounded gauge matches the
+    full-canvas gauge EXACTLY (array-equal). This is the case where the claim of
+    exact equality is valid; partial overlap is covered separately (tolerance)."""
     descs, _ = zg.read_manifest(LIGHTS)
     descs = sorted(descs, key=lambda d: d.frame_id)[:6]
     canvas = zg.build_canvas(descs)
@@ -342,6 +345,129 @@ def test_bounded_gauge_bit_identical_to_full_canvas(tmp_path):
     assert tuple((e.index, e.stage, e.reason, e.detail) for e in old.exclusions) == \
         tuple((e.index, e.stage, e.reason, e.detail) for e in new.exclusions)
     assert tuple(ids) == tuple(f.frame_id.logical_path for f in descs)
+
+
+# ---------------------------------------------------------------------------
+# F1: bounded gauge vs full-canvas gauge — PARTIAL-OVERLAP case (synthetic)
+# ---------------------------------------------------------------------------
+
+_DITHERED_DATA = {}
+
+
+def _dithered_decode(f):
+    """Module-level (picklable) decode for the synthetic dithered corpus."""
+    return _DITHERED_DATA[f.frame_id.logical_path]
+
+
+def _make_dithered_tan_wcs(h, w, ra_deg, dec_deg, scale_deg=0.001):
+    from astropy.wcs import WCS
+
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.crval = [ra_deg, dec_deg]
+    wcs.wcs.crpix = [w / 2.0, h / 2.0]
+    wcs.wcs.cd = np.array([[-1.0, 0.0], [0.0, 1.0]]) * scale_deg
+    wcs.array_shape = (h, w)
+    return wcs
+
+
+def _build_dithered_corpus():
+    """Synthetic TAN frames with a linear RA dither -> PARTIAL overlap.
+
+    Frames are 48x48 px at 0.001 deg/px with a 6-px RA dither, so each frame's
+    footprint bbox is strictly smaller than the canvas (partial overlap). Returns
+    ``(descs, offsets)``.
+    """
+    h = w = 48
+    scale = 0.001  # deg/px
+    dither_deg = 0.006  # 6 px per frame
+    offsets = [0.0, 5.0, 12.0, -4.0, 20.0, -9.0]
+    rng = np.random.default_rng(7)
+    yy, xx = np.mgrid[0:h, 0:w]
+    base = 100.0 + 20.0 * np.exp(-((yy - h / 2) ** 2 + (xx - w / 2) ** 2) / (2 * 12.0**2))
+    descs = []
+    _DITHERED_DATA.clear()
+    for i, off in enumerate(offsets):
+        ra = 10.0 + i * dither_deg
+        wcs = _make_dithered_tan_wcs(h, w, ra, 30.0, scale)
+        data = (base + off + rng.normal(0.0, 0.5, (h, w))).astype(np.float32)
+        hwc = np.stack([data, data, data], axis=-1)
+        fid = f"d{i}.fits"
+        _DITHERED_DATA[fid] = hwc
+        descs.append(
+            zg.FrameDescriptor(
+                frame_id=zg.FrameId(fid),
+                source_path=f"/x/{fid}",
+                shape_hw=(h, w),
+                wcs_header=wcs.to_header(relax=True).tostring(),
+                header_sha256="",
+                instrument="",
+            )
+        )
+    return descs, offsets
+
+
+def test_partial_overlap_gauge_equivalent_within_tolerance(tmp_path):
+    """PARTIAL OVERLAP (bboxes < canvas): the bounded gauge's discrete outputs
+    (reference index, active flags, exclusions) are IDENTICAL to the full-canvas
+    gauge, and the continuous coefficients/weights agree within a TIGHT documented
+    tolerance (~1e-4 reprojection FP noise, rtol<=1e-3)."""
+    descs, offsets = _build_dithered_corpus()
+    canvas = zg.build_canvas(descs)
+    config = ExecutorConfig().science_config()
+
+    # Sanity: partial overlap — each frame's bbox is strictly smaller than canvas.
+    for f in descs:
+        b = zphot._footprint_bbox(f, canvas)
+        assert (b[1] - b[0]) < canvas.height or (b[3] - b[2]) < canvas.width
+
+    # OLD (R11): full-canvas aligned cache + compute_fixed_normalization.
+    builder = zfp.AlignedCacheBuilder(str(tmp_path / "old_cache"))
+    for f in sorted(descs, key=lambda f: f.frame_id):
+        hwc = np.asarray(_dithered_decode(f), dtype=np.float32)
+        chw = np.ascontiguousarray(np.moveaxis(hwc, -1, 0))
+        rgb, geom = zxe.reproject_cropped(
+            chw, f.wcs(), canvas.wcs(), (canvas.height, canvas.width)
+        )
+        builder.add(f.frame_id.logical_path, rgb, geom)
+    builder.finish()
+    prov = zfp.MemmapCanonicalProvider(str(tmp_path / "old_cache"))
+    request = zstream.build_streaming_request(config, prov.n_frames)
+    old = compute_fixed_normalization(prov, request)
+
+    # NEW (R12): bounded streaming phase-1 (union bbox), no disk cache.
+    new, ids = zphot.compute_global_gauge(descs, canvas, _dithered_decode, config, None, workers=1)
+
+    # (a) discrete outputs IDENTICAL.
+    assert int(old.reference_index) == int(new.reference_index) == 0
+    np.testing.assert_array_equal(old.norm_active, new.norm_active)
+    np.testing.assert_array_equal(old.weight_active, new.weight_active)
+    assert tuple((e.index, e.stage, e.reason, e.detail) for e in old.exclusions) == \
+        tuple((e.index, e.stage, e.reason, e.detail) for e in new.exclusions)
+
+    # (b) continuous within TIGHT tolerance (~1e-4 FP noise, rtol<=1e-3).
+    assert np.allclose(old.coefficients, new.coefficients, rtol=1e-3, atol=1e-3, equal_nan=True)
+    assert np.allclose(old.weights, new.weights, rtol=1e-3, atol=1e-3, equal_nan=True)
+
+    # Pin the numbers (deterministic seed 7). sky_mean slope a == 1.0 (identity);
+    # the offsets are NOT exactly -offsets[i] because sky_mean is taken over the
+    # PARTIAL common region (the spatial gradient contributes), so they are pinned
+    # to the exact computed values.
+    pinned_offsets = {
+        1: -5.0483836942865,
+        2: -12.106878870411919,
+        3: 3.623317057887718,
+        4: -20.48067739863454,
+        5: 8.453891751070742,
+    }
+    for i, expected in pinned_offsets.items():
+        assert new.coefficients[i, 0, 0] == pytest.approx(1.0, abs=1e-6)
+        assert new.coefficients[i, 0, 1] == pytest.approx(expected, abs=1e-3)
+    pinned_weights = [
+        0.9975676058190871, 1.0, 0.9994368570190159,
+        0.9948389940794012, 0.9989957281457885, 0.9980533119874564,
+    ]
+    assert np.allclose(new.weights, pinned_weights, rtol=1e-3, atol=1e-3)
 
 
 # ---------------------------------------------------------------------------
