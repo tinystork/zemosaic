@@ -22,6 +22,7 @@ from . import (
     auto_layout,
     execution,
     executor,
+    final_mosaic_finishing,
     geometry,
     mosaic,
     observability,
@@ -44,4 +45,5 @@ __all__ = [
     "auto_layout",
     "photometric",
     "observability",
+    "final_mosaic_finishing",
 ]
