@@ -24,6 +24,7 @@ from . import (
     executor,
     geometry,
     mosaic,
+    observability,
     photometric,
     science_adapter,
     seam,
@@ -42,4 +43,5 @@ __all__ = [
     "mosaic",
     "auto_layout",
     "photometric",
+    "observability",
 ]
