@@ -950,6 +950,111 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
 
 
 # ---------------------------------------------------------------------------
+# ZM-ZEGRID-R20: concurrent per-cell stacking worker (process-pool safe)
+# ---------------------------------------------------------------------------
+
+# Module-level globals holding the per-cell worker's read-only inputs, handed to
+# the pooled workers via an initializer (the R19 start-method-agnostic pattern:
+# under fork the children inherit, under spawn they re-import and the initializer
+# re-populates them, under threads they are shared). Read-only, never pickled
+# per-task (descs/gauge can be large).
+_STACK_DESCS = None
+_STACK_CANVAS = None
+_STACK_CONFIG = None
+_STACK_GAUGE = None
+_STACK_GLOBAL_FRAME_IDS = None
+_STACK_GLOBAL_REF = None
+_STACK_TILE_SIZE = STREAM_TILE_SIZE
+
+
+def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id):
+    """Child/parent initializer: publish the read-only per-cell stack inputs."""
+    global _STACK_DESCS, _STACK_CANVAS, _STACK_CONFIG, _STACK_GAUGE
+    global _STACK_GLOBAL_FRAME_IDS, _STACK_GLOBAL_REF
+    _STACK_DESCS = descs
+    _STACK_CANVAS = canvas
+    _STACK_CONFIG = science_config
+    _STACK_GAUGE = global_gauge
+    _STACK_GLOBAL_FRAME_IDS = global_frame_ids
+    _STACK_GLOBAL_REF = global_reference_frame_id
+
+
+def _stack_cell(task):
+    """Module-level (picklable) worker: build cache + stack ONE cell (R20).
+
+    Task = ``(cell, patch, mem, cache_dir, mode, bound)`` (the cell context is
+    pre-built in the parent so membership is not recomputed); the read-only
+    frame/canvas/gauge inputs come from the module globals set by
+    :func:`_init_stack_worker`. Builds the aligned cache SERIALISED (workers=1
+    -> no nested pool; the cache build is still concurrent ACROSS cells via the
+    cell pool), subsets the global gauge, runs the in-memory or streaming stack
+    (bit-equal to the serial path), crops the core, deletes the cache, and
+    returns a picklable result. Identical in the parent (serial fallback) and in
+    a pool worker.
+    """
+    (cell, patch, mem, cache_dir, mode, bound) = task
+    cid = cell.cell_id
+    if not mem.patch_ids:
+        return {"cell_id": cid, "status": "empty",
+                "record": {"cell_id": cid, "status": "empty", "mode": None}}
+    cache_dir = Path(cache_dir)
+
+    # Build the cell cache (serialised: workers=1 -> no nested pool).
+    t0 = time.perf_counter()
+    manifest = _build_one_cell_cache(
+        _STACK_DESCS, _STACK_CANVAS, cell, patch, mem, cache_dir, workers=1
+    )
+    cache_build_s = time.perf_counter() - t0
+
+    # Subset the global gauge to this cell's frames (in cache order).
+    cell_provider = zfp.MemmapCanonicalProvider(cache_dir)
+    try:
+        cell_frame_ids = list(cell_provider.frame_ids)
+    finally:
+        cell_provider.close()
+    cell_fixed = subset_fixed_normalization(
+        _STACK_GAUGE, _STACK_GLOBAL_FRAME_IDS, cell_frame_ids
+    )
+
+    t0 = time.perf_counter()
+    if mode == "inmem":
+        mt, sres = _run_cell_inmem(cache_dir, patch, _STACK_CONFIG, None, fixed=cell_fixed)
+    else:
+        mt, sres = _run_cell_stream(cache_dir, patch, _STACK_CONFIG, None,
+                                    tile_size=_STACK_TILE_SIZE, fixed=cell_fixed)
+    stack_s = time.perf_counter() - t0
+
+    core = za.crop_all_planes_to_core(mt)
+    peak_rss = zsw.peak_rss_kib()
+
+    prov = _reference_provenance(
+        _STACK_GLOBAL_REF, cell_frame_ids, sres.reference_frame_id
+    )
+    record = {
+        "cell_id": cid, "row": cell.row, "col": cell.col, "status": "complete",
+        "mode": mode, "n_contributors": len(mem.patch_ids),
+        "reference_frame_id": sres.reference_frame_id,
+        "reference_frame_role": prov["reference_frame_role"],
+        "bookkeeping_reference_frame_id": prov["bookkeeping_reference_frame_id"],
+        "excluded": [list(e) for e in sres.excluded],
+        "bound_bytes": int(bound),
+    }
+
+    # Per-cell temp reuse: delete the cache after stacking (bounded disk). R15
+    # best-effort; a failure is reported so the parent can WARN + record.
+    cleanup_failed = not _safe_rmtree(cache_dir, None)
+
+    return {
+        "cell_id": cid, "status": "complete", "core": core, "record": record,
+        "n_frames": int(manifest.get("n_frames", 0)),
+        "total_bytes": int(manifest.get("total_bytes", 0)),
+        "cache_build_s": cache_build_s, "stack_s": stack_s,
+        "peak_rss_kib": peak_rss, "cleanup_failed": cleanup_failed,
+        "cache_dir": str(cache_dir),
+    }
+
+
+# ---------------------------------------------------------------------------
 # FITS output (legacy-compatible paths)
 # ---------------------------------------------------------------------------
 
@@ -1059,6 +1164,7 @@ def _write_run_log(
     global_reference_frame_id,
     ignored_run_args=None,
     gauge_diagnostics=None,
+    per_cell_diagnostics=None,
     finishing_info=None,
 ):
     """Append the run-log SUMMARY into the output folder.
@@ -1108,6 +1214,28 @@ def _write_run_log(
             )
     else:
         lines.append("  (no gauge diagnostics recorded)")
+    lines.append("Per-cell stacking concurrency (ZM-ZEGRID-R20 diagnostic):")
+    if per_cell_diagnostics:
+        pcd = per_cell_diagnostics
+        lines.append(
+            f"  executor: {pcd.get('executor')}  parent_daemon: {pcd.get('parent_daemon')}  "
+            f"cells_in_flight: {pcd.get('cells_in_flight')}  workers: {pcd.get('workers')}  "
+            f"fallback: {pcd.get('fallback')}"
+        )
+        lines.append(
+            f"  cpu: {pcd.get('cpu')}  avail: {pcd.get('available_bytes', 0) / 2**30:.2f}GiB  "
+            f"budget: {pcd.get('ram_budget_bytes', 0) / 2**30:.2f}GiB  "
+            f"footprint: {pcd.get('per_cell_footprint_bytes', 0) / 2**20:.0f}MiB"
+        )
+        lines.append(
+            f"  cells: {pcd.get('cells')}  seconds: {pcd.get('seconds')}  "
+            f"seconds_per_unit: {pcd.get('seconds_per_unit')}  "
+            f"cache_build_cpu_sum_s: {pcd.get('cache_build_cpu_sum_s')}  "
+            f"stack_cpu_sum_s: {pcd.get('stack_cpu_sum_s')}"
+            + (f" fallback_reason={pcd.get('fallback_reason')}" if pcd.get('fallback_reason') else "")
+        )
+    else:
+        lines.append("  (no per-cell concurrency diagnostics recorded)")
     lines.append("Final-mosaic finishing (ZM-ZEGRID-R18):")
     fin = finishing_info or {}
     if not fin or not fin.get("enabled"):
@@ -1353,109 +1481,123 @@ def _run_single(
     # cells); per_cell_stack reports CELLS done/total.
     cache_total_frames = sum(len(mem.patch_ids) for (_r, _c, _ce, _p, mem) in cell_ctxs if mem.patch_ids)
     cache_frames_done = 0
-    stack_cells_done = 0
     _cache_rep = _reporter()
     _stack_rep = _reporter()
     _cache_rep.start("cache_build", total=cache_total_frames, unit="frames")
     _stack_rep.start("per_cell_stack", total=total_cells, unit="cells")
+    # ZM-ZEGRID-R20: per-cell STACKING runs several cells CONCURRENTLY, bounded
+    # adaptively by the available RAM. Each cell worker builds its aligned cache
+    # SERIALISED (no nested pool), stacks, and deletes its cache — preserving the
+    # per-cell temp reuse + bounded-disk behaviour (peak disk is `cells_in_flight`
+    # x the largest cell, not the sum). A concurrent-path failure WARNs loudly and
+    # degrades to the serial loop via pmap's fail-safe (never crash, never silent).
+    available_now = available_memory_bytes()
+    cell_tasks = []
     for (row, col, cell, patch, mem) in cell_ctxs:
         cid = cell.cell_id
         idx = row * nx + col
         if not mem.patch_ids:
-            _emit(f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) empty — no patch contributors",
-                  callback=progress_callback)
-            cell_records.append({"cell_id": cid, "status": "empty", "mode": None})
-            stack_cells_done += 1
-            _stack_rep.progress(stack_cells_done, item_id=cid)
+            cell_tasks.append((cell, patch, mem, str(cache_root / cid), None, 0))
             continue
-
         n = len(mem.patch_ids)
         area = patch.patch.width * patch.patch.height
-        mode, bound = _pick_mode(n, area, patch.patch_shape_hw, available_memory_bytes())
+        mode, bound = _pick_mode(n, area, patch.patch_shape_hw, available_now)
         _emit(
             f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) N={n} area={area}px "
             f"mode={mode} bound={bound / 2**20:.1f}MiB",
             callback=progress_callback,
         )
-        cache_dir = cache_root / cid
+        cell_tasks.append((cell, patch, mem, str(cache_root / cid), mode, bound))
 
-        # Build this cell's aligned cache (parallel reproject).
-        t0 = time.perf_counter()
-        try:
-            manifest = _build_one_cell_cache(
-                descs, canvas, cell, patch, mem, cache_dir, workers=cache_build_workers
-            )
-        except Exception as exc:
-            _emit(f"ZeGrid: cell {cid} cache build failed: {exc}", lvl="ERROR", callback=progress_callback)
-            raise
-        cache_frames_done += int(manifest.get("n_frames", 0))
+    per_cell_footprint = max((t[5] for t in cell_tasks if t[4] is not None), default=0)
+    per_cell_budget = int(available_now * zpar.RAM_SAFETY_FRACTION)
+    cells_in_flight = zpar.cells_in_flight(
+        os.cpu_count(), per_cell_budget, per_cell_footprint
+    )
+    _emit(
+        f"ZeGrid: per-cell concurrency — cells_in_flight={cells_in_flight} "
+        f"(cpu={os.cpu_count()}, avail={available_now / 2**30:.2f}GiB, "
+        f"budget={per_cell_budget / 2**30:.2f}GiB, "
+        f"footprint={per_cell_footprint / 2**20:.0f}MiB, "
+        f"cache_build_workers={cache_build_workers})",
+        callback=progress_callback,
+    )
+
+    task_cids = [t[0].cell_id for t in cell_tasks]
+    per_cell_diagnostics = {
+        "cells_in_flight": int(cells_in_flight),
+        "cpu": int(os.cpu_count() or 1),
+        "available_bytes": int(available_now),
+        "ram_budget_bytes": int(per_cell_budget),
+        "per_cell_footprint_bytes": int(per_cell_footprint),
+        "cells": int(len(cell_tasks)),
+        "cache_build_workers": int(cache_build_workers),
+    }
+    per_cell_meta = {}
+
+    def _cell_progress(done, total):
+        cid = task_cids[int(done) - 1] if 0 < int(done) <= len(task_cids) else None
+        _stack_rep.progress(int(done), item_id=cid)
+
+    t_block0 = time.perf_counter()
+    results = zpar.pmap(
+        _stack_cell, cell_tasks, workers=cells_in_flight,
+        progress_callback=_cell_progress, emit=_emit_live, meta=per_cell_meta,
+        initializer=_init_stack_worker,
+        initargs=(descs, canvas, science_config, global_gauge, global_frame_ids,
+                  global_reference_frame_id),
+    )
+    block_wall = time.perf_counter() - t_block0
+
+    # R20 diagnostics (mirrors the R19 gauge diagnostics): effective executor,
+    # parent daemon flag, workers/cells-in-flight, seconds/unit.
+    per_cell_diagnostics["executor"] = per_cell_meta.get("executor", "serial")
+    per_cell_diagnostics["parent_daemon"] = bool(per_cell_meta.get("parent_daemon"))
+    per_cell_diagnostics["workers"] = int(per_cell_meta.get("workers", cells_in_flight))
+    per_cell_diagnostics["tasks"] = int(per_cell_meta.get("tasks", len(cell_tasks)))
+    per_cell_diagnostics["seconds"] = block_wall
+    per_cell_diagnostics["seconds_per_unit"] = block_wall / max(1, len(cell_tasks))
+    per_cell_diagnostics["fallback"] = bool(per_cell_meta.get("fallback"))
+    if per_cell_meta.get("fallback_reason"):
+        per_cell_diagnostics["fallback_reason"] = per_cell_meta["fallback_reason"]
+    per_cell_diagnostics["cache_build_cpu_sum_s"] = round(
+        sum(r.get("cache_build_s", 0.0) for r in results), 6
+    )
+    per_cell_diagnostics["stack_cpu_sum_s"] = round(
+        sum(r.get("stack_s", 0.0) for r in results), 6
+    )
+
+    # R20: cache build is FUSED into the concurrent per-cell phase (bounded disk
+    # requires the cache to be built+deleted inside each cell worker), so the
+    # phase's wall-clock is recorded under per_cell_stack; cache_build is 0 here.
+    timings.add("per_cell_stack", block_wall)
+    timings.add("cache_build", 0.0)
+
+    result_by_cid = {r["cell_id"]: r for r in results}
+
+    # Ordered (row-major) accounting + records, empty cells interleaved exactly
+    # as the serial loop emits them.
+    for (row, col, cell, patch, mem) in cell_ctxs:
+        cid = cell.cell_id
+        idx = row * nx + col
+        r = result_by_cid[cid]
+        if r["status"] == "empty":
+            _emit(f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) empty — no patch contributors",
+                  callback=progress_callback)
+            cell_records.append(r["record"])
+            continue
+        cache_frames_done += r["n_frames"]
         _cache_rep.progress(cache_frames_done, item_id=cid)
-        timings.add("cache_build", time.perf_counter() - t0)
-        cache_total_bytes += int(manifest.get("total_bytes", 0))
-        cache_n_frames += int(manifest.get("n_frames", 0))
-        cache_peak_bytes = max(cache_peak_bytes, int(manifest.get("total_bytes", 0)))
-
-        # R11: subset the global gauge to THIS cell's frames (in cache order), so
-        # the cell reuses the SAME per-frame coefficients/weights as every other
-        # cell (a single photometric anchor). Open the provider ONLY long enough
-        # to read the frame-id list, then CLOSE it (R15: release the memmap
-        # handles before the cache is deleted below).
-        cell_provider = zfp.MemmapCanonicalProvider(cache_dir)
-        try:
-            cell_frame_ids = list(cell_provider.frame_ids)
-        finally:
-            cell_provider.close()
-        cell_fixed = subset_fixed_normalization(
-            global_gauge, global_frame_ids, cell_frame_ids
-        )
-
-        t0 = time.perf_counter()
-        try:
-            if mode == "inmem":
-                mt, sres = _run_cell_inmem(cache_dir, patch, science_config, progress_callback,
-                                           fixed=cell_fixed)
-            else:
-                mt, sres = _run_cell_stream(cache_dir, patch, science_config, progress_callback,
-                                            fixed=cell_fixed)
-        except Exception as exc:
-            # No silent fallback: a per-cell ZeGrid failure raises.
-            _emit(f"ZeGrid: cell {cid} failed: {exc}", lvl="ERROR", callback=progress_callback)
-            raise
-        timings.add("per_cell_stack", time.perf_counter() - t0)
-        stack_cells_done += 1
-        _stack_rep.progress(stack_cells_done, item_id=cid)
-
-        cores[cid] = za.crop_all_planes_to_core(mt)
-        peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
-
-        # ZM-ZEGRID-R11 L1 (provenance honesty): the per-cell reference_frame_id is
-        # the TRUE photometric anchor only when the cell CONTAINS the global
-        # reference frame; otherwise it is a BOOKKEEPING placeholder (the cell's
-        # highest-weight active frame) and the true anchor is
-        # ``photometric_gauge.global_reference_frame_id``.
-        prov = _reference_provenance(
-            global_reference_frame_id, cell_frame_ids, sres.reference_frame_id
-        )
-        cell_records.append(
-            {
-                "cell_id": cid,
-                "row": row,
-                "col": col,
-                "status": "complete",
-                "mode": mode,
-                "n_contributors": n,
-                "reference_frame_id": sres.reference_frame_id,
-                "reference_frame_role": prov["reference_frame_role"],
-                "bookkeeping_reference_frame_id": prov["bookkeeping_reference_frame_id"],
-                "excluded": [list(e) for e in sres.excluded],
-                "bound_bytes": bound,
-            }
-        )
-
-        # Per-cell temp reuse: delete the cell cache after stacking (bounded disk).
-        # R15: best-effort (Windows WinError 32 on open handles -> WARN + continue).
-        if not _safe_rmtree(cache_dir, progress_callback):
-            cleanup_failures.append(str(cache_dir))
+        cache_total_bytes += r["total_bytes"]
+        cache_n_frames += r["n_frames"]
+        cache_peak_bytes = max(cache_peak_bytes, r["total_bytes"])
+        cores[cid] = r["core"]
+        peak_rss_kib = max(peak_rss_kib, r["peak_rss_kib"])
+        if r["cleanup_failed"]:
+            cleanup_failures.append(r["cache_dir"])
+            _emit(f"ZeGrid: cell {cid} cache cleanup failed (non-fatal)", lvl="WARN",
+                  callback=progress_callback)
+        cell_records.append(r["record"])
 
     _cache_rep.end(
         throughput=_fmt_throughput(cache_total_frames, timings.get("cache_build"), "frames/s")
@@ -1544,6 +1686,7 @@ def _run_single(
         timings=timings, gpu_used=gpu_used, ignored_settings=ignored_settings,
         ignored_run_args=ignored_run_args,
         gauge_diagnostics=gauge_diagnostics,
+        per_cell_diagnostics=per_cell_diagnostics,
         finished_science=finished_science, finishing_info=finishing_info,
         fin_uint16=fin_uint16,
     )
@@ -1564,6 +1707,7 @@ def _run_single(
         cache_info=cache_report,
         global_reference_frame_id=global_reference_frame_id,
         gauge_diagnostics=gauge_diagnostics,
+        per_cell_diagnostics=per_cell_diagnostics,
         finishing_info=finishing_info,
     )
 
@@ -1585,6 +1729,7 @@ def _write_outputs(
     global_reference_frame_id=None,
     timings=None, gpu_used=False, ignored_settings=None, ignored_run_args=None,
     gauge_diagnostics=None,
+    per_cell_diagnostics=None,
     finished_science=None, finishing_info=None, fin_uint16=None,
 ):
     output_dir = Path(output_dir)
@@ -1722,6 +1867,7 @@ def _write_outputs(
         "ignored_settings": (ignored_settings or {}),
         "ignored_run_args": (ignored_run_args or {}),
         "gauge_diagnostics": (gauge_diagnostics or {}),
+        "per_cell_diagnostics": (per_cell_diagnostics or {}),
         "finishing": (finishing_info or {}),
         "peak_rss_kib": peak_rss_kib,
         "outputs": {

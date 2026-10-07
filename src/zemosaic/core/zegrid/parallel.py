@@ -47,6 +47,11 @@ _CPU_OS_RESERVE = 2
 _WORKERS_MIN = 2
 _WORKERS_MAX = 14
 
+# ZM-ZEGRID-R20: per-cell STACKING concurrency cap (mirrors _WORKERS_MAX; the
+# RAM//footprint term usually binds first on real mosaics, so the cap is a
+# sanity ceiling, not the normal operating point).
+_CELLS_IN_FLIGHT_MAX = 14
+
 # Estimated per-worker footprint (bytes) for the GLOBAL-GAUGE phase. Each gauge
 # worker reprojects a frame over a full-canvas / union bbox (the dominant cost),
 # holding a float32 RGB plane + float64 temporaries; this is measurably heavier
@@ -166,6 +171,37 @@ def choose_workers(
             workers = min(workers, budget)
         return workers
     return adaptive_worker_count(cpu, available_bytes, per_worker_footprint_bytes)
+
+
+def cells_in_flight(
+    cpu: int,
+    ram_budget_bytes: int | None,
+    per_cell_footprint_bytes: int,
+    max_cells: int | None = None,
+) -> int:
+    """ZM-ZEGRID-R20: how many cells to stack concurrently.
+
+    ``clamp(min(cpu-2, RAM_budget // per_cell_footprint), 1, K)``.
+
+    * ``cpu`` — logical CPU count (``os.cpu_count()``).
+    * ``ram_budget_bytes`` — RAM budget for the whole in-flight batch (typically
+      ``available * RAM_SAFETY_FRACTION``); ``None``/0 = no memory bound.
+    * ``per_cell_footprint_bytes`` — peak bytes of ONE cell's stack (the in-memory
+      bound for mode=inmem, or the streaming estimate incl. the ~340 MiB worker
+      baseline for mode=stream).
+
+    Never exceeds the RAM budget; degrades to 1 when RAM is tight. Deterministic
+    (pure function) so the concurrency bound can be unit-checked.
+    """
+    cpu = int(cpu or 1)
+    cpu_budget = max(1, cpu - _CPU_OS_RESERVE)
+    footprint = max(1, int(per_cell_footprint_bytes))
+    ram_budget = 0
+    if ram_budget_bytes is not None and int(ram_budget_bytes) > 0:
+        ram_budget = max(1, int(int(ram_budget_bytes) // footprint))
+    target = min(cpu_budget, ram_budget) if ram_budget > 0 else cpu_budget
+    cap = int(max_cells or _CELLS_IN_FLIGHT_MAX)
+    return max(1, min(target, cap))
 
 
 def _parent_is_daemonic() -> bool:
