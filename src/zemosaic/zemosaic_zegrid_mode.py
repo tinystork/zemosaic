@@ -1057,6 +1057,7 @@ def _write_run_log(
     cache_info,
     global_reference_frame_id,
     ignored_run_args=None,
+    gauge_diagnostics=None,
 ):
     """Append the run-log SUMMARY into the output folder.
 
@@ -1088,6 +1089,23 @@ def _write_run_log(
     lines.append("")
     lines.append("Accepted-but-ignored run_zegrid_mode arguments:")
     lines.extend(zin.describe_ignored_run_args(ignored_run_args or {}))
+    lines.append("")
+    lines.append("Gauge parallelism (ZM-ZEGRID-R19 diagnostic):")
+    if gauge_diagnostics:
+        gd = gauge_diagnostics
+        lines.append(
+            f"  executor: {gd.get('executor')}  parent_daemon: {gd.get('parent_daemon')}  "
+            f"workers: {gd.get('workers')}  fallback: {gd.get('fallback')}"
+        )
+        for phase_name in ("counts", "pairs"):
+            ph = (gd.get("phases") or {}).get(phase_name) or {}
+            lines.append(
+                f"  phase={phase_name}: executor={ph.get('executor')} units={ph.get('units')} "
+                f"seconds={ph.get('seconds')} seconds_per_unit={ph.get('seconds_per_unit')}"
+                + (f" fallback_reason={ph.get('fallback_reason')}" if ph.get('fallback_reason') else "")
+            )
+    else:
+        lines.append("  (no gauge diagnostics recorded)")
     lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
     lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
@@ -1269,10 +1287,13 @@ def _run_single(
     def _gauge_progress(done, total, item_id):
         _gauge_rep.progress(done, item_id=item_id, total=total)
 
+    gauge_diagnostics: dict = {}
     with timings.timed("gauge"):
         global_gauge, global_frame_ids = zphot.compute_global_gauge(
             descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
             progress_callback=_gauge_progress,
+            emit=_emit_live,
+            diagnostics=gauge_diagnostics,
         )
     _gauge_rep.end(
         throughput=_fmt_throughput(len(descs), timings.get("gauge"), "frames/s")
@@ -1457,6 +1478,7 @@ def _run_single(
         global_reference_frame_id=global_reference_frame_id,
         timings=timings, gpu_used=gpu_used, ignored_settings=ignored_settings,
         ignored_run_args=ignored_run_args,
+        gauge_diagnostics=gauge_diagnostics,
     )
 
     _write_run_log(
@@ -1474,6 +1496,7 @@ def _run_single(
         peak_rss_kib=peak_rss_kib,
         cache_info=cache_report,
         global_reference_frame_id=global_reference_frame_id,
+        gauge_diagnostics=gauge_diagnostics,
     )
 
     _emit(
@@ -1493,6 +1516,7 @@ def _write_outputs(
     rejected=None, sip_mode="keep", frames_loaded=None,
     global_reference_frame_id=None,
     timings=None, gpu_used=False, ignored_settings=None, ignored_run_args=None,
+    gauge_diagnostics=None,
 ):
     output_dir = Path(output_dir)
     science = np.asarray(assembled.science, dtype=np.float32)  # (H, W, 3)
@@ -1607,6 +1631,7 @@ def _write_outputs(
         "gpu": {"used": bool(gpu_used), "note": zin.GPU_USAGE_NOTE},
         "ignored_settings": (ignored_settings or {}),
         "ignored_run_args": (ignored_run_args or {}),
+        "gauge_diagnostics": (gauge_diagnostics or {}),
         "peak_rss_kib": peak_rss_kib,
         "outputs": {
             "science": sci_path.name,

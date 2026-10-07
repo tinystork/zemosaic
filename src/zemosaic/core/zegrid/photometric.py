@@ -57,6 +57,10 @@ BIT-IDENTICAL on partial-overlap corpora (see the R12 partial-overlap test).
 from __future__ import annotations
 
 import copy
+import os
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
@@ -84,11 +88,61 @@ __all__ = ["compute_global_gauge"]
 _FOOTPRINT_MARGIN_PX = 8
 
 # Module-level globals holding the reference frame's full-canvas alignment,
-# handed to the forked parallel workers via copy-on-write inheritance (never
-# pickled — they can be large). Set by ``compute_global_gauge`` around the
-# per-frame parallel pass and cleared afterwards.
+# handed to the pooled workers via an initializer that MEMAPS them from the
+# run's cache dir (ZM-ZEGRID-R19). This is start-method-agnostic: under fork
+# the children inherit, under spawn they re-import and the initializer memmaps
+# them back, and under threads they are shared. They are read-only and never
+# pickled (they can be large).
 _GAUGE_R_FULL = None
 _GAUGE_R_SUP = None
+
+# Filenames for the memmapped reference planes written to the gauge cache dir.
+_GAUGE_REF_FULL_NAME = "r_full.npy"
+_GAUGE_REF_SUP_NAME = "r_sup.npy"
+
+
+def _write_gauge_reference(cache_dir, r_full, r_sup) -> str:
+    """Write the reference planes (float32 + bool) as a small ``.npy`` pair.
+
+    Returns the directory path holding ``r_full.npy`` / ``r_sup.npy``. Uses
+    ``cache_dir`` when given (the run's gauge cache dir) else a fresh temp dir.
+    """
+    if cache_dir is not None:
+        ref_dir = Path(cache_dir) / "__gauge_ref__"
+    else:
+        ref_dir = Path(tempfile.mkdtemp(prefix="zegrid_gauge_ref_"))
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    np.save(ref_dir / _GAUGE_REF_FULL_NAME, np.asarray(r_full), allow_pickle=False)
+    np.save(ref_dir / _GAUGE_REF_SUP_NAME, np.asarray(r_sup), allow_pickle=False)
+    return str(ref_dir)
+
+
+def _init_gauge_reference(ref_dir: str) -> None:
+    """Child/parent initializer: memmap the reference planes into the globals.
+
+    Read-only mmap keeps peak memory bounded and makes the pooled workers
+    start-method-agnostic (fork AND spawn AND threads).
+    """
+    global _GAUGE_R_FULL, _GAUGE_R_SUP
+    _GAUGE_R_FULL = np.load(os.path.join(ref_dir, _GAUGE_REF_FULL_NAME), mmap_mode="r")
+    _GAUGE_R_SUP = np.load(os.path.join(ref_dir, _GAUGE_REF_SUP_NAME), mmap_mode="r")
+
+
+def _clear_gauge_reference() -> None:
+    """Release the memmapped reference globals (best-effort)."""
+    global _GAUGE_R_FULL, _GAUGE_R_SUP
+    _GAUGE_R_FULL = None
+    _GAUGE_R_SUP = None
+
+
+def _cleanup_gauge_reference(ref_dir: str | None) -> None:
+    """Best-effort removal of the temp reference files; never fatal."""
+    if not ref_dir:
+        return
+    try:
+        shutil.rmtree(ref_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _footprint_bbox(f, canvas) -> tuple:
@@ -201,6 +255,8 @@ def compute_global_gauge(
     reuse_cache: bool = True,
     workers: int = 1,
     progress_callback=None,
+    emit=None,
+    diagnostics=None,
 ) -> tuple[FixedNormalization, tuple[str, ...]]:
     """Compute the global photometric gauge over the full canvas (bounded).
 
@@ -256,8 +312,17 @@ def compute_global_gauge(
         )
         for i, f in enumerate(ordered)
     ]
+    counts_meta: dict = {}
+    if emit is not None:
+        try:
+            emit(f"[ZEGRID] gauge phase=counts units={n} workers={workers}", "INFO")
+        except Exception:
+            pass
     counts = np.asarray(
-        zpar.pmap(_counts_worker, count_tasks, workers, progress_callback=count_progress),
+        zpar.pmap(
+            _counts_worker, count_tasks, workers,
+            progress_callback=count_progress, emit=emit, meta=counts_meta,
+        ),
         dtype=np.int64,
     )
 
@@ -300,9 +365,11 @@ def compute_global_gauge(
         fwhm[ref_idx] = float(ref_weight.fwhm[0])
 
     # --- per-frame normalization + weighting (bounded, parallel) ---
-    global _GAUGE_R_FULL, _GAUGE_R_SUP
-    _GAUGE_R_FULL = r_full
-    _GAUGE_R_SUP = r_sup
+    # ZM-ZEGRID-R19: instead of the fork-only copy-on-write globals, write the
+    # reference planes to the gauge cache dir and hand them to the pooled workers
+    # via a memmap initializer (works under fork, spawn AND threads).
+    ref_dir = _write_gauge_reference(cache_dir, r_full, r_sup)
+    pairs_meta: dict = {}
     try:
         pair_tasks = []
         pair_ids = []
@@ -339,12 +406,22 @@ def compute_global_gauge(
 
             pair_progress = _pair_progress
 
+        if emit is not None:
+            try:
+                emit(
+                    f"[ZEGRID] gauge phase=pairs units={len(pair_tasks)} workers={workers}",
+                    "INFO",
+                )
+            except Exception:
+                pass
         pair_results = zpar.pmap(
-            _pair_worker, pair_tasks, workers, progress_callback=pair_progress
+            _pair_worker, pair_tasks, workers, progress_callback=pair_progress,
+            initializer=_init_gauge_reference, initargs=(ref_dir,),
+            emit=emit, meta=pairs_meta,
         )
     finally:
-        _GAUGE_R_FULL = None
-        _GAUGE_R_SUP = None
+        _clear_gauge_reference()
+        _cleanup_gauge_reference(ref_dir)
 
     for res in pair_results:
         i = int(res["index"])
@@ -392,4 +469,29 @@ def compute_global_gauge(
         weight_active=np.ascontiguousarray(weight_active),
         exclusions=tuple(norm_exclusions) + tuple(weight_exclusions),
     )
+
+    if diagnostics is not None:
+        diagnostics["workers"] = int(workers)
+        diagnostics["parent_daemon"] = bool(zpar._parent_is_daemonic())
+        diagnostics["executor"] = pairs_meta.get("executor")
+        diagnostics["fallback"] = bool(
+            counts_meta.get("fallback") or pairs_meta.get("fallback")
+        )
+        diagnostics["phases"] = {
+            "counts": {
+                "executor": counts_meta.get("executor"),
+                "units": int(n),
+                "seconds": counts_meta.get("seconds"),
+                "seconds_per_unit": counts_meta.get("seconds_per_unit"),
+            },
+            "pairs": {
+                "executor": pairs_meta.get("executor"),
+                "units": int(n - 1),
+                "seconds": pairs_meta.get("seconds"),
+                "seconds_per_unit": pairs_meta.get("seconds_per_unit"),
+                "fallback": bool(pairs_meta.get("fallback")),
+                "fallback_reason": pairs_meta.get("fallback_reason"),
+            },
+        }
+
     return gauge, tuple(frame_ids)
