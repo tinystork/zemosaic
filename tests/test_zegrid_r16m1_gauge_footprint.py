@@ -1,4 +1,4 @@
-"""ZM-ZEGRID-R17 — R16-M1 fix: canvas-aware per-worker footprint for the gauge.
+"""ZM-ZEGRID-R16-M1 — canvas-aware per-worker footprint for the gauge.
 
 Nono's R16 M1: the static `_GAUGE_PER_WORKER_FOOTPRINT_BYTES` (~386 MiB, a ~1.9 Mpx
 bbox) under-counted the real gauge working set — the pairs pass reprojects the
