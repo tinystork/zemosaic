@@ -31,9 +31,12 @@ Design
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
+from astropy.wcs import WCS
 
 from zemosaic.core.canonical_streaming import (
     FixedNormalization,
@@ -42,9 +45,52 @@ from zemosaic.core.canonical_streaming import (
 from zemosaic.core.zegrid import execution as zxe
 from zemosaic.core.zegrid import file_provider as zfp
 from zemosaic.core.zegrid import geometry as zg
+from zemosaic.core.zegrid import parallel as zpar
 from zemosaic.core.zegrid.streaming import build_streaming_request
 
-__all__ = ["compute_global_gauge"]
+__all__ = ["compute_global_gauge", "gauge_frame_worker"]
+
+
+def gauge_frame_worker(task):
+    """Module-level (picklable) worker: decode + full-canvas reproject one frame.
+
+    Task shape: ``(decode_fn, frame_desc, canvas_wcs_header, canvas_hw,
+    rgb_path, sup_path, index, frame_id)``. ``decode_fn`` must be a module-level
+    (picklable-by-reference) function of one :class:`FrameDescriptor`. Reproduces
+    the serial full-canvas alignment bit-for-bit (decode -> ndim-2 stack ->
+    moveaxis -> ``reproject_cropped``).
+    """
+    (
+        decode_fn,
+        frame_desc,
+        canvas_wcs_header,
+        canvas_hw,
+        rgb_path,
+        sup_path,
+        index,
+        frame_id,
+    ) = task
+    hwc = np.asarray(decode_fn(frame_desc), dtype=np.float32)
+    if hwc.ndim == 2:
+        hwc = np.stack([hwc, hwc, hwc], axis=-1)
+    chw = np.ascontiguousarray(np.moveaxis(hwc, -1, 0))
+    rgb, geom = zxe.reproject_cropped(
+        chw, frame_desc.wcs(), WCS(canvas_wcs_header), tuple(canvas_hw)
+    )
+    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
+    geom = np.ascontiguousarray(np.asarray(geom, dtype=bool))
+    np.save(rgb_path, rgb)
+    np.save(sup_path, geom)
+    return {
+        "index": index,
+        "frame_id": frame_id,
+        "rgb": os.path.basename(str(rgb_path)),
+        "rgb_sha256": zfp._sha256(str(rgb_path)),
+        "rgb_bytes": int(os.path.getsize(str(rgb_path))),
+        "support": os.path.basename(str(sup_path)),
+        "support_sha256": zfp._sha256(str(sup_path)),
+        "support_bytes": int(os.path.getsize(str(sup_path))),
+    }
 
 
 def compute_global_gauge(
@@ -55,6 +101,7 @@ def compute_global_gauge(
     cache_dir,
     *,
     reuse_cache: bool = True,
+    workers: int = 1,
 ) -> tuple[FixedNormalization, tuple[str, ...]]:
     """Compute the global photometric gauge over the full canvas.
 
@@ -70,18 +117,37 @@ def compute_global_gauge(
     frame_ids = [f.frame_id.logical_path for f in ordered]
 
     if not (reuse_cache and zfp.cache_is_complete(str(cache_dir), frame_ids)):
-        builder = zfp.AlignedCacheBuilder(str(cache_dir))
-        for f in ordered:
-            hwc = np.asarray(decode_fn(f), dtype=np.float32)
-            if hwc.ndim == 2:
-                hwc = np.stack([hwc, hwc, hwc], axis=-1)
-            chw = np.ascontiguousarray(np.moveaxis(hwc, -1, 0))
-            rgb, geom = zxe.reproject_cropped(
-                chw, f.wcs(), canvas.wcs(), (canvas.height, canvas.width)
+        cache_dir = Path(str(cache_dir))
+        if cache_dir.exists():
+            import shutil
+
+            shutil.rmtree(str(cache_dir))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        canvas_wcs_header = canvas.wcs_header
+        canvas_hw = (canvas.height, canvas.width)
+        tasks = []
+        for idx, f in enumerate(ordered):
+            rgb_path = cache_dir / f"frame_{idx:04d}_rgb.npy"
+            sup_path = cache_dir / f"frame_{idx:04d}_support.npy"
+            tasks.append(
+                (
+                    decode_fn,
+                    f,
+                    canvas_wcs_header,
+                    canvas_hw,
+                    str(rgb_path),
+                    str(sup_path),
+                    idx,
+                    f.frame_id.logical_path,
+                )
             )
-            builder.add(f.frame_id.logical_path, rgb, geom)
-            del hwc, chw, rgb, geom
-        builder.finish()
+        results = zpar.pmap(gauge_frame_worker, tasks, workers)
+        results.sort(key=lambda r: r["index"])
+        meta = zfp._meta_from_hwc(canvas.height, canvas.width, 3)
+        zfp._write_manifest(
+            cache_dir, meta, results, frame_ids,
+            sum(r["rgb_bytes"] + r["support_bytes"] for r in results),
+        )
 
     provider = zfp.MemmapCanonicalProvider(str(cache_dir))
     request = build_streaming_request(config, provider.n_frames)

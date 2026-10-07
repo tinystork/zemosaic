@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import shutil
 import time
 from dataclasses import replace
@@ -74,7 +75,9 @@ from .core.zegrid import auto_layout as zal
 from .core.zegrid import execution as zxe
 from .core.zegrid import file_provider as zfp
 from .core.zegrid import geometry as zg
+from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
+from .core.zegrid import parallel as zpar
 from .core.zegrid import photometric as zphot
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
@@ -87,6 +90,8 @@ ProgressCallback = Optional[Callable[[str, object, str], None]]
 
 # Disk cache directory name (under the per-mount output folder). NEVER /tmp.
 CACHE_DIR_NAME = "__zegrid_cache__"
+# Run-log filename written into the run's output folder (the user reported it absent).
+RUN_LOG_NAME = "zegrid_run.log"
 # Streaming tile size for the R6 executor (safe, memory-bounded default).
 STREAM_TILE_SIZE = 128
 # Fraction of available memory the R4 in-memory bound must fit within to select
@@ -267,6 +272,99 @@ def _decode_frame_hwc(frame_desc, progress_callback):
     elif arr.ndim == 3 and arr.shape[-1] != 3:
         raise ValueError(f"unexpected decoded channel count {arr.shape[-1]} (expected 3)")
     return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _cell_cache_frame_worker(task):
+    """Module-level (picklable) worker: decode + crop + reproject ONE (frame, cell).
+
+    Task = ``(frame_desc, source_bounds, patch_wcs_header, patch_shape_hw,
+    rgb_path, sup_path, index, frame_id)``. Reproduces the serial frame-major
+    crop/reproject bit-for-bit (decode -> crop -> moveaxis -> ``slice_wcs`` ->
+    ``reproject_cropped``) and writes the ``.npy`` files directly (no array is
+    returned over the process boundary, so large-patch parallelism stays cheap).
+    """
+    (
+        frame_desc,
+        bounds,
+        patch_wcs_header,
+        patch_hw,
+        rgb_path,
+        sup_path,
+        index,
+        frame_id,
+    ) = task
+    hwc = _decode_frame_hwc(frame_desc, None)
+    crop_hwc = hwc[bounds.y0:bounds.y1, bounds.x0:bounds.x1]
+    crop_chw = np.ascontiguousarray(np.moveaxis(crop_hwc, -1, 0))
+    cropped_wcs = zxe.slice_wcs(frame_desc.wcs(), bounds)
+    rgb, geom = zxe.reproject_cropped(
+        crop_chw, cropped_wcs, WCS(patch_wcs_header), tuple(patch_hw)
+    )
+    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
+    geom = np.ascontiguousarray(np.asarray(geom, dtype=bool))
+    np.save(rgb_path, rgb)
+    np.save(sup_path, geom)
+    return {
+        "index": index,
+        "frame_id": frame_id,
+        "rgb": os.path.basename(str(rgb_path)),
+        "rgb_sha256": zfp._sha256(str(rgb_path)),
+        "rgb_bytes": int(os.path.getsize(str(rgb_path))),
+        "support": os.path.basename(str(sup_path)),
+        "support_sha256": zfp._sha256(str(sup_path)),
+        "support_bytes": int(os.path.getsize(str(sup_path))),
+    }
+
+
+def _build_one_cell_cache(
+    descs, canvas, cell, patch, mem, cache_dir, *,
+    workers: int = 1, reuse_cache: bool = True, progress_callback=None,
+):
+    """Build ONE cell's aligned disk cache (parallel reproject), resumable.
+
+    Mirrors the serial frame-major build's per-cell output exactly: the same
+    sorted-FrameId frame order, the same source-ROI plans, the same crop/slice/
+    reproject primitives, and the same ``frame_XXXX_rgb.npy`` / ``_support.npy``
+    naming + manifest. The reprojection (the dominant cost) is spread across
+    ``workers`` processes; the written bytes are bit-identical to the serial
+    build (verified by hash in the R12 tests).
+    """
+    by_id = {f.frame_id.logical_path: f for f in descs}
+    patch_frames = [by_id[k] for k in mem.patch_ids]  # mem.patch_ids is sorted
+    planned = []
+    for f in patch_frames:
+        plan = zg.plan_source_roi(f, canvas, patch)
+        if plan is not None:
+            planned.append((f, plan))
+    frame_ids = [f.frame_id.logical_path for f, _p in planned]
+
+    cache_dir = Path(cache_dir)
+    if reuse_cache and zfp.cache_is_complete(str(cache_dir), frame_ids):
+        return zfp.load_cache_manifest(str(cache_dir))
+    if cache_dir.exists():
+        shutil.rmtree(str(cache_dir))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    patch_wcs_header = patch.patch_wcs_header
+    patch_hw = patch.patch_shape_hw
+    tasks = []
+    for idx, (f, plan) in enumerate(planned):
+        key = f.frame_id.logical_path
+        rgb_path = cache_dir / f"frame_{idx:04d}_rgb.npy"
+        sup_path = cache_dir / f"frame_{idx:04d}_support.npy"
+        tasks.append(
+            (
+                f, plan.source_bounds, patch_wcs_header, patch_hw,
+                str(rgb_path), str(sup_path), idx, key,
+            )
+        )
+    results = zpar.pmap(_cell_cache_frame_worker, tasks, workers)
+    results.sort(key=lambda r: r["index"])
+    meta = zfp._meta_from_hwc(patch_hw[0], patch_hw[1], 3)
+    return zfp._write_manifest(
+        cache_dir, meta, results, frame_ids,
+        sum(r["rgb_bytes"] + r["support_bytes"] for r in results),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +777,85 @@ def _canvas_header(canvas, ndim, channels=None):
 # Single-pass pipeline (one mount group)
 # ---------------------------------------------------------------------------
 
+def _gauge_decode(frame_desc):
+    """Module-level (picklable) 1-arg decode wrapper for the parallel gauge."""
+    return _decode_frame_hwc(frame_desc, None)
+
+
+def _reference_provenance(global_reference_frame_id, cell_frame_ids, cell_reference_frame_id):
+    """ZM-ZEGRID-R11 L1 (provenance honesty): classify a Cell's reference.
+
+    A Cell's ``reference_frame_id`` is the TRUE photometric anchor only when the
+    Cell contains the global reference frame; otherwise it is a BOOKKEEPING
+    placeholder (the Cell's highest-weight active frame) and the true anchor is
+    ``photometric_gauge.global_reference_frame_id``.
+
+    Returns ``{reference_frame_role, bookkeeping_reference_frame_id}``.
+    """
+    has_global = global_reference_frame_id in cell_frame_ids
+    return {
+        "reference_frame_role": (
+            "global_photometric_anchor" if has_global else "bookkeeping_placeholder"
+        ),
+        "bookkeeping_reference_frame_id": (
+            None if has_global else cell_reference_frame_id
+        ),
+    }
+
+
+def _write_run_log(
+    output_dir,
+    timings,
+    *,
+    start_ts,
+    frames_loaded,
+    n_included,
+    n_rejected,
+    canvas,
+    layout,
+    gpu_used,
+    ignored_settings,
+    peak_rss_kib,
+    cache_info,
+    global_reference_frame_id,
+):
+    """Write a human-readable run log into the output folder.
+
+    The user's real complaint included "le log est absent": ZeGrid produced no
+    run log. This writes ``zegrid_run.log`` (per-mount output folder) with the
+    per-phase wall-clock timings, an explicit GPU-usage statement, and the list
+    of ignored product settings.
+    """
+    lines = [
+        "ZeGrid run log",
+        "===============",
+        f"started: {start_ts}",
+        f"output: {output_dir}",
+        f"frames_loaded: {frames_loaded}  included: {n_included}  rejected_wcs: {n_rejected}",
+        f"canvas: {canvas.width}x{canvas.height} (resolution {canvas.resolution_deg:.3g} deg/px)",
+        f"layout: {layout['nx']}x{layout['ny']} (source={layout.get('layout_source', 'auto')})",
+        "",
+        "Timings (wall-clock):",
+    ]
+    for name, sec in timings.to_dict().items():
+        lines.append(f"  {name}: {sec:.3f}s")
+    lines.append(f"  total: {timings.total():.3f}s")
+    lines.append("")
+    lines.append("GPU usage:")
+    lines.append(f"  used: {bool(gpu_used)}")
+    lines.append(f"  {zin.describe_gpu_usage()}")
+    lines.append("")
+    lines.append("Ignored product settings (ZeGrid is CPU-only + no post-stack processing):")
+    lines.extend(zin.ignored_settings_warning_lines(ignored_settings))
+    lines.append("")
+    lines.append(f"peak_rss_kib: {peak_rss_kib}")
+    lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
+    lines.append(f"photometric_gauge.global_reference_frame_id: {global_reference_frame_id}")
+    text = "\n".join(lines) + "\n"
+    (Path(output_dir) / RUN_LOG_NAME).write_text(text, encoding="utf-8")
+    return text
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -689,15 +866,30 @@ def _run_single(
     zconfig,
     pinned_layout=None,
     sip_mode="keep",
+    workers=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    timings = zin.Timings()
+    start_ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    # Explicit GPU-usage + ignored-settings surfacing (nothing silently ignored).
+    gpu_used = False  # ZeGrid engine is CPU-only.
+    ignored_settings = zin.ignored_settings_present(zconfig)
+    if ignored_settings:
+        for line in zin.ignored_settings_warning_lines(ignored_settings):
+            _emit(line, lvl="WARN", callback=progress_callback)
+    _emit(
+        f"ZeGrid: GPU usage — {zin.describe_gpu_usage()}",
+        callback=progress_callback,
+    )
 
     _emit(f"ZeGrid: setup — {len(frames_info)} frame(s) -> {output_dir}", callback=progress_callback)
-    descs, rejected = _build_frame_descriptors(
-        frames_info, input_folder, progress_callback, sip_mode=sip_mode
-    )
-    canvas = zg.build_canvas(descs)
+    with timings.timed("setup"):
+        descs, rejected = _build_frame_descriptors(
+            frames_info, input_folder, progress_callback, sip_mode=sip_mode
+        )
+        canvas = zg.build_canvas(descs)
     _emit(
         f"ZeGrid: canvas {canvas.width}x{canvas.height} "
         f"(resolution {canvas.resolution_deg:.3g} deg/px)",
@@ -707,11 +899,16 @@ def _run_single(
     # LAYOUT — MODE-AWARE RAM-aware Auto layout (in-memory OR streaming bound),
     # budgeted from psutil (portable). Pinnable via ``zegrid_layout``.
     available = available_memory_bytes()
-    layout = _choose_layout_mode_aware(
-        canvas, descs, ram_budget=available, available_bytes=available,
-        tile_size=STREAM_TILE_SIZE, pinned_layout=pinned_layout,
-    )
-    nx, ny = layout["nx"], layout["ny"]
+    with timings.timed("layout"):
+        layout = _choose_layout_mode_aware(
+            canvas, descs, ram_budget=available, available_bytes=available,
+            tile_size=STREAM_TILE_SIZE, pinned_layout=pinned_layout,
+        )
+        nx, ny = layout["nx"], layout["ny"]
+        cell_ctxs = []
+        for row, col, _bounds in zg.build_layout(canvas, nx, ny).iter_cells(canvas):
+            cell, patch, mem = zsw.build_cell_context(descs, canvas, row, col, nx, ny)
+            cell_ctxs.append((row, col, cell, patch, mem))
     _emit(
         f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells, "
         f"source={layout.get('layout_source', 'auto')}) from RAM budget "
@@ -722,34 +919,29 @@ def _run_single(
     for w in layout["warnings"]:
         _emit(f"ZeGrid: layout warning — {w}", lvl="WARN", callback=progress_callback)
 
-    cell_ctxs = []
-    for row, col, _bounds in zg.build_layout(canvas, nx, ny).iter_cells(canvas):
-        cell, patch, mem = zsw.build_cell_context(descs, canvas, row, col, nx, ny)
-        cell_ctxs.append((row, col, cell, patch, mem))
+    # Parallel workers (memory-aware: 2-4 by default, clamped by CPU + RAM).
+    if workers is None:
+        workers = zpar.choose_workers(None, available_memory_bytes())
+    _emit(f"ZeGrid: parallel workers={workers} (CPU={os.cpu_count()}, avail={available / 2**30:.2f}GiB)",
+          callback=progress_callback)
 
-    # FRAME-MAJOR decode+cache.
-    _emit(f"ZeGrid: decode+cache (frame-major, O(1 frame) memory)", callback=progress_callback)
     cache_root = output_dir / CACHE_DIR_NAME
-    cache_dirs, manifests, cache_report = _build_aligned_cache_frame_major(
-        descs, canvas, cell_ctxs, cache_root, progress_callback
-    )
+    cache_root.mkdir(parents=True, exist_ok=True)
 
     # GLOBAL PHOTOMETRIC GAUGE (ZM-ZEGRID-R11): one reference + per-frame
-    # normalization coefficients/weights computed ONCE over the full canvas, so
-    # every Cell shares a single photometric anchor (removes the inter-cell level
-    # steps). Frame-major, disk-backed, resumable.
+    # normalization coefficients/weights computed ONCE over the full canvas,
+    # so every Cell shares a single photometric anchor. Frame-major full-canvas
+    # reprojection (parallelised); the disk cache is DELETED after use (bounded
+    # disk — only the in-memory gauge coefficients are needed downstream).
     _emit(
-        f"ZeGrid: computing global photometric gauge (full-canvas, frame-major)",
+        f"ZeGrid: computing global photometric gauge (full-canvas, frame-major, workers={workers})",
         callback=progress_callback,
     )
     gauge_cache_dir = cache_root / "__gauge__"
-    global_gauge, global_frame_ids = zphot.compute_global_gauge(
-        descs,
-        canvas,
-        lambda f: _decode_frame_hwc(f, progress_callback),
-        science_config,
-        gauge_cache_dir,
-    )
+    with timings.timed("gauge"):
+        global_gauge, global_frame_ids = zphot.compute_global_gauge(
+            descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers
+        )
     global_reference_frame_id = global_frame_ids[int(global_gauge.reference_index)]
     _emit(
         f"ZeGrid: global photometric gauge — reference frame {global_reference_frame_id!r} "
@@ -757,12 +949,18 @@ def _run_single(
         f"exclusions={len(global_gauge.exclusions)}",
         callback=progress_callback,
     )
+    if gauge_cache_dir.exists():
+        shutil.rmtree(str(gauge_cache_dir))
 
-    # PER-CELL mode policy -> MiniTile -> core planes.
+    # PER-CELL: build aligned cache (parallel reproject) -> stack -> DELETE cache
+    # (per-cell temp reuse: peak disk is the LARGEST single cell, not the sum).
     cores = {}
     cell_records = []
     total_cells = nx * ny
     peak_rss_kib = zsw.peak_rss_kib()
+    cache_total_bytes = 0
+    cache_peak_bytes = 0
+    cache_n_frames = 0
     for (row, col, cell, patch, mem) in cell_ctxs:
         cid = cell.cell_id
         idx = row * nx + col
@@ -780,12 +978,21 @@ def _run_single(
             f"mode={mode} bound={bound / 2**20:.1f}MiB",
             callback=progress_callback,
         )
-        cache_dir = cache_dirs.get(cid)
-        if cache_dir is None or not (cache_dir / "manifest.json").exists():
-            _emit(f"ZeGrid: cell {cid} cache missing; treating as empty", lvl="WARN",
-                  callback=progress_callback)
-            cell_records.append({"cell_id": cid, "status": "empty", "mode": mode})
-            continue
+        cache_dir = cache_root / cid
+
+        # Build this cell's aligned cache (parallel reproject).
+        t0 = time.perf_counter()
+        try:
+            manifest = _build_one_cell_cache(
+                descs, canvas, cell, patch, mem, cache_dir, workers=workers
+            )
+        except Exception as exc:
+            _emit(f"ZeGrid: cell {cid} cache build failed: {exc}", lvl="ERROR", callback=progress_callback)
+            raise
+        timings.add("cache_build", time.perf_counter() - t0)
+        cache_total_bytes += int(manifest.get("total_bytes", 0))
+        cache_n_frames += int(manifest.get("n_frames", 0))
+        cache_peak_bytes = max(cache_peak_bytes, int(manifest.get("total_bytes", 0)))
 
         # R11: subset the global gauge to THIS cell's frames (in cache order), so
         # the cell reuses the SAME per-frame coefficients/weights as every other
@@ -796,6 +1003,7 @@ def _run_single(
             global_gauge, global_frame_ids, cell_frame_ids
         )
 
+        t0 = time.perf_counter()
         try:
             if mode == "inmem":
                 mt, sres = _run_cell_inmem(cache_dir, patch, science_config, progress_callback,
@@ -807,9 +1015,19 @@ def _run_single(
             # No silent fallback: a per-cell ZeGrid failure raises.
             _emit(f"ZeGrid: cell {cid} failed: {exc}", lvl="ERROR", callback=progress_callback)
             raise
+        timings.add("per_cell_stack", time.perf_counter() - t0)
 
         cores[cid] = za.crop_all_planes_to_core(mt)
         peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
+
+        # ZM-ZEGRID-R11 L1 (provenance honesty): the per-cell reference_frame_id is
+        # the TRUE photometric anchor only when the cell CONTAINS the global
+        # reference frame; otherwise it is a BOOKKEEPING placeholder (the cell's
+        # highest-weight active frame) and the true anchor is
+        # ``photometric_gauge.global_reference_frame_id``.
+        prov = _reference_provenance(
+            global_reference_frame_id, cell_frame_ids, sres.reference_frame_id
+        )
         cell_records.append(
             {
                 "cell_id": cid,
@@ -819,14 +1037,21 @@ def _run_single(
                 "mode": mode,
                 "n_contributors": n,
                 "reference_frame_id": sres.reference_frame_id,
+                "reference_frame_role": prov["reference_frame_role"],
+                "bookkeeping_reference_frame_id": prov["bookkeeping_reference_frame_id"],
                 "excluded": [list(e) for e in sres.excluded],
                 "bound_bytes": bound,
             }
         )
 
+        # Per-cell temp reuse: delete the cell cache after stacking (bounded disk).
+        if cache_dir.exists():
+            shutil.rmtree(str(cache_dir))
+
     # ASSEMBLY.
     _emit("ZeGrid: assembly (R3 assemble_canvas)", callback=progress_callback)
-    assembled = zmosaic.assemble_canvas(canvas, nx, ny, cores)
+    with timings.timed("assembly"):
+        assembled = zmosaic.assemble_canvas(canvas, nx, ny, cores)
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
 
     # I2 — no covered pixels -> explicit abort (never an all-NaN mosaic).
@@ -838,18 +1063,46 @@ def _run_single(
         )
         raise RuntimeError("ZeGrid: no covered pixels; cannot assemble a mosaic")
 
+    cache_report = {
+        "reused": [],
+        "rebuilt": assembled.complete_cells,
+        "total_bytes": cache_total_bytes,
+        "peak_cell_bytes": cache_peak_bytes,
+        "n_frame_entries": cache_n_frames,
+        "retention": "per-cell temporary (deleted after stacking); gauge cache deleted after use",
+    }
+
     # Write legacy-compatible outputs.
     sci_path, cov_path, manifest_path = _write_outputs(
-        assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
+        assembled, canvas, nx, ny, output_dir, descs, {}, cell_records,
         layout, science_config, peak_rss_kib, cache_report, progress_callback,
         rejected=rejected, sip_mode=sip_mode,
         frames_loaded=len(frames_info),
         global_reference_frame_id=global_reference_frame_id,
+        timings=timings, gpu_used=gpu_used, ignored_settings=ignored_settings,
     )
+
+    _write_run_log(
+        output_dir,
+        timings,
+        start_ts=start_ts,
+        frames_loaded=len(frames_info),
+        n_included=len(descs),
+        n_rejected=len(rejected or []),
+        canvas=canvas,
+        layout=layout,
+        gpu_used=gpu_used,
+        ignored_settings=ignored_settings,
+        peak_rss_kib=peak_rss_kib,
+        cache_info=cache_report,
+        global_reference_frame_id=global_reference_frame_id,
+    )
+
     _emit(
-        f"ZeGrid: done — {sci_path.name} ({assembled.science.shape}) + coverage, "
+        f"ZeGrid: done — {sci_path.name} ({assembled.science.shape}) + coverage + run log, "
         f"complete={len(assembled.complete_cells)} incomplete={len(assembled.incomplete_cells)} "
-        f"holes={assembled.hole_pixels}px peak_rss={peak_rss_kib}KiB",
+        f"holes={assembled.hole_pixels}px peak_rss={peak_rss_kib}KiB "
+        f"cache_total={cache_total_bytes / 2**20:.0f}MiB cache_peak={cache_peak_bytes / 2**20:.0f}MiB",
         lvl="SUCCESS",
         callback=progress_callback,
     )
@@ -861,6 +1114,7 @@ def _write_outputs(
     layout, science_config, peak_rss_kib, cache_report, progress_callback,
     rejected=None, sip_mode="keep", frames_loaded=None,
     global_reference_frame_id=None,
+    timings=None, gpu_used=False, ignored_settings=None,
 ):
     output_dir = Path(output_dir)
     science = np.asarray(assembled.science, dtype=np.float32)  # (H, W, 3)
@@ -876,12 +1130,21 @@ def _write_outputs(
     cov_path = output_dir / "mosaic_grid_coverage.fits"
     fits.PrimaryHDU(stack_depth, header=cov_header).writeto(cov_path, overwrite=True)
 
-    cache_total_bytes = 0
-    cache_files = 0
-    for _cid, m in (manifests or {}).items():
-        if isinstance(m, dict):
-            cache_total_bytes += int(m.get("total_bytes", 0))
-            cache_files += int(m.get("n_frames", 0))
+    # Cache accounting: prefer the explicit cache_report (per-cell temp reuse)
+    # and fall back to summing the manifests (legacy persistent-cache path).
+    cache_total_bytes = (cache_report or {}).get("total_bytes")
+    cache_files = (cache_report or {}).get("n_frame_entries")
+    if cache_total_bytes is None or cache_files is None:
+        _tb = 0
+        _cf = 0
+        for _cid, m in (manifests or {}).items():
+            if isinstance(m, dict):
+                _tb += int(m.get("total_bytes", 0))
+                _cf += int(m.get("n_frames", 0))
+        cache_total_bytes = _tb if cache_total_bytes is None else cache_total_bytes
+        cache_files = _cf if cache_files is None else cache_files
+    cache_peak_bytes = (cache_report or {}).get("peak_cell_bytes", cache_total_bytes)
+    cache_retention = (cache_report or {}).get("retention")
 
     manifest = {
         "schema": "zemosaic-zegrid-r7-manifest-v1",
@@ -913,6 +1176,16 @@ def _write_outputs(
                 "over the full canvas footprint; every Cell reuses the same gauge "
                 "(Cells lacking the global reference keep its GLOBAL level)."
             ),
+            "provenance_honesty": (
+                "ZM-ZEGRID-R11 L1: a Cell's 'reference_frame_id' is the TRUE "
+                "photometric anchor only when it equals global_reference_frame_id. "
+                "When a Cell lacks the global reference, its reference_frame_id is "
+                "a BOOKKEEPING placeholder (recorded in "
+                "'cells[].bookkeeping_reference_frame_id' with "
+                "reference_frame_role='bookkeeping_placeholder'); the true "
+                "photometric anchor is always "
+                "photometric_gauge.global_reference_frame_id."
+            ),
         },
         "n_frames": len(descs),
         "frame_ids": [d.frame_id.logical_path for d in descs],
@@ -942,14 +1215,20 @@ def _write_outputs(
         "hole_pixels": assembled.hole_pixels,
         "coverage_pixels": assembled.coverage_pixels,
         "cells": cell_records,
-        "cache": {"dir": CACHE_DIR_NAME, "total_bytes": cache_total_bytes,
-                  "n_frame_entries": cache_files,
+        "cache": {"dir": CACHE_DIR_NAME, "total_bytes": int(cache_total_bytes),
+                  "peak_cell_bytes": int(cache_peak_bytes),
+                  "retention": cache_retention,
+                  "n_frame_entries": int(cache_files),
                   "reused_cells": (cache_report or {}).get("reused", []),
                   "rebuilt_cells": (cache_report or {}).get("rebuilt", [])},
+        "timings": (timings.to_dict() if timings is not None else {}),
+        "gpu": {"used": bool(gpu_used), "note": zin.GPU_USAGE_NOTE},
+        "ignored_settings": (ignored_settings or {}),
         "peak_rss_kib": peak_rss_kib,
         "outputs": {
             "science": sci_path.name,
             "coverage": cov_path.name,
+            "run_log": RUN_LOG_NAME,
         },
     }
     manifest_path = output_dir / "zegrid_manifest.json"
@@ -981,6 +1260,7 @@ def run_zegrid_mode(
     grid_rgb_equalize: bool | None = True,
     use_gpu: bool | None = None,
     zconfig: object | None = None,
+    workers: int | None = None,
 ) -> None:
     """Run the NEW ZeGrid engine over a ``stack_plan.csv`` (production entry).
 
@@ -1063,16 +1343,16 @@ def run_zegrid_mode(
             _run_single(eq_frames, input_folder, base_out / "grid_EQ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
-                        pinned_layout=pinned_layout, sip_mode=sip_mode)
+                        pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
-                        pinned_layout=pinned_layout, sip_mode=sip_mode)
+                        pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
         _run_single(frames_info, input_folder, base_out,
                     progress_callback=progress_callback,
                     science_config=science_config, zconfig=zconfig,
-                    pinned_layout=pinned_layout, sip_mode=sip_mode)
+                    pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers)

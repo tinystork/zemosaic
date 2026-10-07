@@ -1,0 +1,133 @@
+"""ZM-ZEGRID-R12 — run instrumentation (timings, run log, GPU + ignored settings).
+
+Pure observation, no science. Provides:
+
+* :class:`Timings` — per-phase wall-clock accumulator (summed per named phase).
+* :func:`ignored_settings_present` — the product settings the CPU-only ZeGrid
+  engine currently reads but DOES NOT honour, surfaced so nothing is silently
+  dropped (the user's real complaint: settings were silently ignored).
+* :func:`describe_gpu_usage` — an explicit, truthful statement about GPU use.
+
+Everything here is import-safe (stdlib only) so it can be reused by tests and by
+the production orchestrator without pulling in the heavy decode/reproject stack.
+"""
+
+from __future__ import annotations
+
+import time
+from contextlib import contextmanager
+from typing import Iterator
+
+# Product settings the ZeGrid engine currently IGNORES (CPU-only engine + no
+# post-stack processing). Kept as an explicit list so the run log + manifest can
+# surface them and nothing is silently dropped.
+#   * GPU stack/grid routing: use_gpu_stack / use_gpu_grid / stack_use_gpu.
+#   * Post-processing (ZeGrid performs no DBE / inter-tile blend / normalization
+#     rework / anchor review / coverage renorm).
+IGNORED_SETTINGS: tuple[str, ...] = (
+    "use_gpu_stack",
+    "use_gpu_grid",
+    "stack_use_gpu",
+    "intertile_affine_blend",
+    "center_out_normalization_p3",
+    "enable_poststack_anchor_review",
+    "two_pass_coverage_renorm",
+)
+
+# Settings matched by prefix (final_mosaic_dbe_* : enable / sigma / iterations / ...).
+IGNORED_SETTING_PREFIXES: tuple[str, ...] = ("final_mosaic_dbe_",)
+
+GPU_USAGE_NOTE = (
+    "CPU-only: the ZeGrid engine performs all decode/reproject/stack work on the "
+    "CPU and never touches the GPU. Product use_gpu_* / stack_use_gpu flags are "
+    "read but ignored by ZeGrid."
+)
+
+
+class Timings:
+    """Accumulate wall-clock seconds per named phase (repeated samples sum)."""
+
+    def __init__(self) -> None:
+        self._totals: dict[str, float] = {}
+        self._order: list[str] = []
+
+    def add(self, name: str, seconds: float) -> None:
+        if name not in self._totals:
+            self._order.append(name)
+            self._totals[name] = 0.0
+        self._totals[name] += float(seconds)
+
+    @contextmanager
+    def timed(self, name: str) -> Iterator[None]:
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(name, time.perf_counter() - t0)
+
+    def get(self, name: str) -> float:
+        return self._totals.get(name, 0.0)
+
+    def total(self) -> float:
+        return float(sum(self._totals.values()))
+
+    def to_dict(self) -> dict:
+        return {name: round(self._totals[name], 6) for name in self._order}
+
+    def to_lines(self) -> list[str]:
+        return [f"  {name}: {self._totals[name]:.3f}s" for name in self._order]
+
+
+def _truthy(value) -> bool:
+    """A setting is 'present' when it is a truthy, non-empty, non-default value."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return value not in (0, 0.0)
+    if isinstance(value, str):
+        return value.strip() not in ("", "none", "false", "off", "0")
+    return True
+
+
+def ignored_settings_present(zconfig) -> dict:
+    """Return ``{setting_name: value}`` for every ignored setting present.
+
+    ``zconfig`` is the product config object (a ``SimpleNamespace`` in the
+    production path). ``None`` yields an empty dict. Values are read by name
+    (exact) or by prefix (``final_mosaic_dbe_*``); a setting is reported only when
+    it is truthy (so we warn about what is actually *set*, not a long default list).
+    """
+    out: dict = {}
+    if zconfig is None:
+        return out
+    for name in IGNORED_SETTINGS:
+        value = getattr(zconfig, name, None)
+        if _truthy(value):
+            out[name] = value
+    # Prefix matches (final_mosaic_dbe_*).
+    for attr in dir(zconfig):
+        for prefix in IGNORED_SETTING_PREFIXES:
+            if attr.startswith(prefix):
+                value = getattr(zconfig, attr, None)
+                if _truthy(value):
+                    out[attr] = value
+    return out
+
+
+def describe_gpu_usage() -> str:
+    return GPU_USAGE_NOTE
+
+
+def ignored_settings_warning_lines(ignored: dict) -> list[str]:
+    """Human-readable WARN lines listing ignored settings (or 'none set')."""
+    if not ignored:
+        return [
+            "No ignored ZeGrid settings detected (no use_gpu_*/stack_use_gpu or "
+            "post-stack-processing flags set)."
+        ]
+    lines = [f"ZeGrid ignores the following product settings (CPU-only engine):"]
+    for name in sorted(ignored):
+        lines.append(f"  - {name} = {ignored[name]!r}")
+    return lines
