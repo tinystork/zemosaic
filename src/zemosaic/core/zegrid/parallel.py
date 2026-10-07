@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import time
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +176,7 @@ def _parent_is_daemonic() -> bool:
         return False
 
 
-def pmap(worker, tasks, workers: int, progress_callback=None):
+def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, initargs=(), emit=None, meta=None):
     """Run ``worker`` over ``tasks`` in order; returns a list of results.
 
     ``worker`` must be a module-level (picklable-by-reference) pure function of
@@ -183,18 +184,39 @@ def pmap(worker, tasks, workers: int, progress_callback=None):
 
     ``progress_callback`` (optional) is ``callable(done, total)`` invoked after
     each completed task (1-based ``done``, ``total`` = number of tasks), used by
-    the R14 live gauge progress reporting. It is best-effort: a failure of the
-    callback is swallowed and never affects the results.
+    the R14 live gauge progress reporting. Best-effort: a failure of the callback
+    is swallowed and never affects the results.
+
+    ``initializer`` / ``initargs`` (optional, ZM-ZEGRID-R19): a child-startup
+    callable forwarded to ``ProcessPoolExecutor`` (which runs it in every worker
+    process, under fork AND spawn). ``ThreadPoolExecutor`` has no initializer, so
+    for the thread path it is called DIRECTLY in the parent before the map (the
+    parent's module state is shared with the threads). The parent also calls it
+    up-front so the SERIAL fallback path has the same module state. This is what
+    makes pooled workers start-method-agnostic (no fork-only copy-on-write
+    globals).
+
+    ``emit`` (optional) is ``callable(msg, lvl="INFO")`` used to surface the
+    executor decision and any fail-safe fallback through the run's
+    ``progress_callback`` (visible in the GUI log / run log / breadcrumbs) — the
+    ZM-ZEGRID-R19 visibility requirement.
+
+    ``meta`` (optional) is a mutable dict the caller may pass to receive the
+    EFFECTIVE executor kind + timing (for the manifest diagnostic):
+    ``executor`` ("serial"|"thread"|"process"), ``parent_daemon``, ``workers``,
+    ``tasks``, ``seconds``, ``seconds_per_unit``, ``fallback``,
+    ``fallback_reason``.
 
     Executor selection (ZM-ZEGRID-R13):
-      * non-daemonic parent -> ``ProcessPoolExecutor`` (fork on Linux: workers
-        inherit the parent's imported modules, so no re-import cost);
+      * non-daemonic parent -> ``ProcessPoolExecutor`` (fork on Linux; workers
+        inherit the parent's imported modules);
       * daemonic parent     -> ``ThreadPoolExecutor`` (a daemonic process may not
         spawn child processes; threads preserve order and share module state).
 
     FAIL-SAFE: any failure of the parallel path (daemonic asserts, spawn/pickle
     errors, ``OSError``, ``BrokenProcessPool``, ...) degrades to the serial loop
-    with a single WARN — a parallel failure can never crash the run.
+    with a WARN surfaced via BOTH ``log`` and ``emit`` — a parallel failure can
+    never crash the run.
     """
     tasks = list(tasks)
     total = len(tasks)
@@ -206,14 +228,50 @@ def pmap(worker, tasks, workers: int, progress_callback=None):
             except Exception:  # noqa: BLE001 - progress is never fatal
                 pass
 
+    def _surf(msg, lvl="INFO"):
+        if emit is not None:
+            try:
+                emit(msg, lvl)
+            except Exception:  # noqa: BLE001 - surfacing is never fatal
+                pass
+
+    def _finish(meta_dict, start_ts, n_units):
+        if meta_dict is None:
+            return
+        elapsed = float(time.perf_counter() - start_ts)
+        meta_dict["seconds"] = elapsed
+        meta_dict["seconds_per_unit"] = elapsed / max(1, n_units)
+
+    # Call the initializer in the PARENT up-front so the serial/thread paths (and
+    # the thread-shared module state) have it; the process path forwards it to the
+    # executor so each child runs it too (spawn-safe).
+    if initializer is not None:
+        try:
+            initializer(*tuple(initargs))
+        except Exception as exc:  # noqa: BLE001 - never fatal
+            log.warning("[ZEGRID] pmap initializer failed: %s", exc)
+
+    parent_daemon = _parent_is_daemonic()
+    if meta is not None:
+        meta["parent_daemon"] = bool(parent_daemon)
+        meta["workers"] = int(workers)
+        meta["tasks"] = int(total)
+        meta["fallback"] = False
+
+    t0 = time.perf_counter()
+
     if workers <= 1 or total < 2:
+        if meta is not None:
+            meta["executor"] = "serial"
+        _surf(f"[ZEGRID] pmap: serial (workers={workers}, tasks={total})")
         out = []
         for i, t in enumerate(tasks):
             out.append(worker(t))
             _report(i + 1)
+        _finish(meta, t0, total)
         return out
 
-    if _parent_is_daemonic():
+    if parent_daemon:
         from concurrent.futures import ThreadPoolExecutor
 
         Executor = ThreadPoolExecutor
@@ -224,28 +282,58 @@ def pmap(worker, tasks, workers: int, progress_callback=None):
         Executor = ProcessPoolExecutor
         kind = "process"
 
+    if meta is not None:
+        meta["executor"] = kind
+
     log.info(
-        "[ZEGRID] pmap: %s pool, workers=%d, tasks=%d",
+        "[ZEGRID] pmap: %s pool, workers=%d, daemon=%s, tasks=%d",
         kind,
         workers,
+        parent_daemon,
         total,
+    )
+    _surf(
+        f"[ZEGRID] pmap: {kind} pool, workers={workers}, daemon={parent_daemon}, tasks={total}"
     )
 
     try:
-        with Executor(max_workers=workers) as pool:
-            out = []
-            for i, res in enumerate(pool.map(worker, tasks)):
-                out.append(res)
-                _report(i + 1)
-            return out
+        if kind == "thread":
+            # ThreadPoolExecutor has no initializer; the parent already called it.
+            with Executor(max_workers=workers) as pool:
+                out = []
+                for i, res in enumerate(pool.map(worker, tasks)):
+                    out.append(res)
+                    _report(i + 1)
+        else:
+            with Executor(
+                max_workers=workers,
+                initializer=initializer,
+                initargs=tuple(initargs),
+            ) as pool:
+                out = []
+                for i, res in enumerate(pool.map(worker, tasks)):
+                    out.append(res)
+                    _report(i + 1)
+        _finish(meta, t0, total)
+        return out
     except Exception as exc:  # noqa: BLE001 - fail-safe: never let parallelism crash
         log.warning(
             "[ZEGRID] parallel map unavailable (%s: %s); falling back to serial",
             type(exc).__name__,
             exc,
         )
+        _surf(
+            f"[ZEGRID] parallel map unavailable ({type(exc).__name__}: {exc}); "
+            f"falling back to SERIAL — this phase will be slow",
+            lvl="WARN",
+        )
+        if meta is not None:
+            meta["executor"] = "serial"
+            meta["fallback"] = True
+            meta["fallback_reason"] = f"{type(exc).__name__}: {exc}"
         out = []
         for i, t in enumerate(tasks):
             out.append(worker(t))
             _report(i + 1)
+        _finish(meta, t0, total)
         return out
