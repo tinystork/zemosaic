@@ -77,6 +77,16 @@ zemosaic = "zemosaic._app:main"
 Homepage = "https://github.com/zemosaic/zemosaic"
 Repository = "https://github.com/zemosaic/zemosaic"
 
+[tool.pytest.ini_options]
+# Test tiers (see TESTING.md). `slow` marks the gated tests that run a full
+# pipeline or depend on the local corpora (M16/quick, M106/lights,
+# zegrid_r*_fixtures). The fast tier is everything else:
+#     pytest -m "not slow"   (loop gate, CI PR gate)
+#     pytest                 (full gate, human/release)
+markers = [
+    "slow: gated test (full pipeline or local corpora); excluded from the fast tier",
+]
+
 [tool.setuptools.dynamic]
 version = { attr = "zemosaic.__version__" }
 

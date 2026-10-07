@@ -42,14 +42,15 @@ def _m106_manifest():
 
 
 @pytest.fixture(scope="module")
-def manifest():
-    frames, _ = _m106_manifest()
+def manifest(m106_corpus):
+    frames, _rejected, _canvas = m106_corpus
     return frames
 
 
 @pytest.fixture(scope="module")
-def canvas(manifest):
-    return zg.build_canvas(manifest)
+def canvas(m106_corpus):
+    _frames, _rejected, canvas = m106_corpus
+    return canvas
 
 
 def _records_from(out: Path):
@@ -78,6 +79,7 @@ def _combined_records():
 # Memory model is DERIVED (not invented) and conservative on BOTH calibration sets.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_memory_model_fit_matches_combined_records():
     """The frozen two-term model is derived from the combined calibration set
     (R3 20 cells + tight 166 cells); refit must match the frozen coefficients."""
@@ -129,6 +131,7 @@ def _check_bound_covers(model, records, label):
     return max_pos_rel, max_abs_rel
 
 
+@pytest.mark.slow
 def test_bound_covers_measured_on_r3():
     recs = _r3_records()
     if len(recs) < 10:
@@ -139,6 +142,7 @@ def test_bound_covers_measured_on_r3():
     )
 
 
+@pytest.mark.slow
 def test_bound_covers_measured_on_tight():
     recs = _tight_records()
     if len(recs) < 100:
@@ -149,6 +153,7 @@ def test_bound_covers_measured_on_tight():
     )
 
 
+@pytest.mark.slow
 def test_two_term_model_not_overpredicting_small_patches():
     """The two-term model must NOT over-predict small patches the way the old
     single-slope model did. On the tight (~51k px) cells, the mean prediction
@@ -174,6 +179,7 @@ def test_two_term_model_not_overpredicting_small_patches():
 # Determinism + monotonicity + floors
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_choose_layout_deterministic(manifest, canvas):
     d1 = za.choose_layout(canvas, manifest, int(1500 * MILLION))
     d2 = za.choose_layout(canvas, manifest, int(1500 * MILLION))
@@ -182,12 +188,14 @@ def test_choose_layout_deterministic(manifest, canvas):
     assert d1.predicted_bound_bytes == d2.predicted_bound_bytes
 
 
+@pytest.mark.slow
 def test_choose_layout_permutation_invariant(manifest, canvas):
     base = za.choose_layout(canvas, manifest, int(1500 * MILLION))
     rev = za.choose_layout(zg.build_canvas(list(reversed(manifest))), list(reversed(manifest)), int(1500 * MILLION))
     assert (base.nx, base.ny) == (rev.nx, rev.ny)
 
 
+@pytest.mark.slow
 def test_budget_monotonicity_tighter_is_finer(manifest, canvas):
     """Tighter budget -> smaller-or-equal cells -> more-or-equal Nx/Ny."""
     loose = za.choose_layout(canvas, manifest, int(6000 * MILLION))
@@ -199,6 +207,7 @@ def test_budget_monotonicity_tighter_is_finer(manifest, canvas):
     assert tight.max_patch_area <= loose.max_patch_area
 
 
+@pytest.mark.slow
 def test_loose_no_budget_picks_coarsest(manifest, canvas):
     """No budget -> coarsest sensible layout (Cell ~= median projected footprint)."""
     d = za.choose_layout(canvas, manifest, None)
@@ -207,6 +216,7 @@ def test_loose_no_budget_picks_coarsest(manifest, canvas):
     assert d.nx <= tight.nx and d.ny <= tight.ny
 
 
+@pytest.mark.slow
 def test_budget_respected_bound(manifest, canvas):
     """The chosen layout's conservative peak bound must fit the budget."""
     for budget_mb in (2000, 3000, 4000, 6000):
@@ -215,6 +225,7 @@ def test_budget_respected_bound(manifest, canvas):
         assert d.budget_bound_choice
 
 
+@pytest.mark.slow
 def test_exact_contributor_counts_used(manifest, canvas):
     """The budget search uses the candidate's exact max contributor count (not
     len(frames)=66). The chosen layout's max_contributors must equal the exact
@@ -227,6 +238,7 @@ def test_exact_contributor_counts_used(manifest, canvas):
     assert d.max_contributors <= len(manifest)
 
 
+@pytest.mark.slow
 def test_floors_trigger_explicit_failure(manifest, canvas):
     """A budget that cannot honour the floors raises LayoutInfeasible (never
     silently degrades science). The finest floor-feasible layout (15x12) has a
@@ -235,6 +247,7 @@ def test_floors_trigger_explicit_failure(manifest, canvas):
         za.choose_layout(canvas, manifest, int(900 * MILLION))
 
 
+@pytest.mark.slow
 def test_min_patch_area_floor_blocks_fine_layout(manifest, canvas):
     """A very high min_patch_area floor with a tight budget is infeasible."""
     floors = za.ScientificFloors(min_patch_area_px=400_000)
@@ -242,6 +255,7 @@ def test_min_patch_area_floor_blocks_fine_layout(manifest, canvas):
         za.choose_layout(canvas, manifest, int(1500 * MILLION), floors=floors)
 
 
+@pytest.mark.slow
 def test_halo_overhead_floor_reported(manifest, canvas):
     d = za.choose_layout(canvas, manifest, int(2000 * MILLION))
     assert d.floors["max_halo_overhead"]["ok"] is True
@@ -250,6 +264,7 @@ def test_halo_overhead_floor_reported(manifest, canvas):
     assert d.floors["min_contributors"]["value"] >= 3
 
 
+@pytest.mark.slow
 def test_provenance_fields_present(manifest, canvas):
     d = za.choose_layout(canvas, manifest, int(1500 * MILLION))
     dd = d.to_dict()

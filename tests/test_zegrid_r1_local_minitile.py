@@ -31,6 +31,12 @@ _FROZEN_JSON = _MAIN_REPO / "docs/refactor/zegrid_r0/M106_geometry.json"
 _LIGHTS = Path("/home/tristan/M106/lights")
 _FIXTURES = Path("/tmp/zegrid_r1_fixtures")
 
+# The frozen R0 oracle + JSON live in the MAIN repo (not the git tree); on a
+# clean checkout / CI runner they are absent, so the whole module skips cleanly
+# instead of failing at import (the tests are slow-tier and excluded there anyway).
+if not (_R0_GEOM.is_file() and _FROZEN_JSON.is_file()):
+    pytest.skip("R1 frozen R0 oracle not present (main repo)", allow_module_level=True)
+
 
 def _load_r0_sim():
     spec = importlib.util.spec_from_file_location("zegrid_r0_geometry", _R0_GEOM)
@@ -49,21 +55,22 @@ def _frozen_wcs() -> WCS:
 
 
 @pytest.fixture(scope="module")
-def manifest():
-    frames, rejected = zg.read_manifest(_LIGHTS)
+def manifest(m106_corpus):
+    frames, rejected, _canvas = m106_corpus
     return frames, rejected
 
 
 @pytest.fixture(scope="module")
-def canvas(manifest):
-    frames, _ = manifest
-    return zg.build_canvas(frames)
+def canvas(m106_corpus):
+    _frames, _rejected, canvas = m106_corpus
+    return canvas
 
 
 # ---------------------------------------------------------------------------
 # Geometry: exact R0 reproduction
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_canvas_reproduces_frozen_exactly(canvas):
     assert canvas.width == _FROZEN["canvas"]["width"] == 2403
     assert canvas.height == _FROZEN["canvas"]["height"] == 3278
@@ -78,6 +85,7 @@ def test_canvas_reproduces_frozen_exactly(canvas):
     np.testing.assert_allclose(mine.wcs.get_pc(), frozen.wcs.get_pc(), atol=1e-12)
 
 
+@pytest.mark.slow
 def test_cell_r0000c0000_core_patch(manifest, canvas):
     frames, _ = manifest
     layout = zg.build_layout(canvas, 5, 4)
@@ -93,6 +101,7 @@ def test_cell_r0000c0000_core_patch(manifest, canvas):
     assert patch.patch_shape_hw == (827, 488)
 
 
+@pytest.mark.slow
 def test_membership_matches_frozen(manifest, canvas):
     frames, _ = manifest
     layout = zg.build_layout(canvas, 5, 4)
@@ -116,6 +125,7 @@ def test_membership_matches_frozen(manifest, canvas):
     assert len(mem.patch_ids) == 7
 
 
+@pytest.mark.slow
 def test_source_roi_plans_match_r0(manifest, canvas):
     frames, _ = manifest
     layout = zg.build_layout(canvas, 5, 4)
@@ -142,6 +152,7 @@ def test_source_roi_plans_match_r0(manifest, canvas):
         assert tuple(my.source_bounds.__dict__.values()) == tuple(r0crop)
 
 
+@pytest.mark.slow
 def test_layout_partition_disjoint_and_exhaustive(manifest, canvas):
     frames, _ = manifest
     layout = zg.build_layout(canvas, 5, 4)
@@ -155,6 +166,7 @@ def test_layout_partition_disjoint_and_exhaustive(manifest, canvas):
 # Permutation determinism
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_permutation_determinism(manifest):
     frames, _ = manifest
     rng = np.random.default_rng(42)
@@ -284,6 +296,7 @@ def execution_context(manifest, canvas):
     return patch_frames, prepared_paths, crop_plans, patch, by_id
 
 
+@pytest.mark.slow
 def test_section_reads_are_local(execution_context):
     patch_frames, prepared_paths, crop_plans, patch, by_id = execution_context
     canvas = zg.build_canvas(list(by_id.values()))
@@ -300,6 +313,7 @@ def test_section_reads_are_local(execution_context):
         assert rec.axis_layout == "CHW"
 
 
+@pytest.mark.slow
 def test_section_read_never_touches_full_data(monkeypatch, execution_context):
     patch_frames, prepared_paths, crop_plans, patch, by_id = execution_context
     canvas = zg.build_canvas(list(by_id.values()))
@@ -323,6 +337,7 @@ def test_section_read_never_touches_full_data(monkeypatch, execution_context):
         imghdu._ImageBaseHDU.data = orig
 
 
+@pytest.mark.slow
 def test_local_vs_full_reprojection_covers_every_valid_pixel(execution_context):
     patch_frames, prepared_paths, crop_plans, patch, by_id = execution_context
     canvas = zg.build_canvas(list(by_id.values()))
@@ -347,6 +362,7 @@ def test_local_vs_full_reprojection_covers_every_valid_pixel(execution_context):
             )
 
 
+@pytest.mark.slow
 def test_source_roi_covers_every_requested_valid_target_pixel(execution_context):
     patch_frames, prepared_paths, crop_plans, patch, by_id = execution_context
     canvas = zg.build_canvas(list(by_id.values()))
@@ -380,6 +396,7 @@ def test_source_roi_covers_every_requested_valid_target_pixel(execution_context)
 # Science adapter: canonical oracle + determinism + assembly
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_adapter_matches_direct_engine_exactly(execution_context):
     patch_frames, prepared_paths, crop_plans, patch, by_id = execution_context
     canvas = zg.build_canvas(list(by_id.values()))
@@ -422,6 +439,7 @@ def test_adapter_matches_direct_engine_exactly(execution_context):
     assert sres.reference_frame_id == order[int(sres.result.provenance["reference"]["index"])]
 
 
+@pytest.mark.slow
 def test_science_permutation_determinism(execution_context):
     patch_frames, prepared_paths, crop_plans, patch, by_id = execution_context
     canvas = zg.build_canvas(list(by_id.values()))
@@ -457,6 +475,7 @@ def test_science_permutation_determinism(execution_context):
         assert np.array_equal(other.result.rejection_mask, base.result.rejection_mask)
 
 
+@pytest.mark.slow
 def test_assembly_extracts_core_slice(execution_context):
     patch_frames, prepared_paths, crop_plans, patch, by_id = execution_context
     canvas = zg.build_canvas(list(by_id.values()))

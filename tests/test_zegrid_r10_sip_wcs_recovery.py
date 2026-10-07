@@ -99,6 +99,7 @@ def test_qualify_accepts_sip_tan():
     assert zg.qualify_wcs(w) is None
 
 
+@pytest.mark.slow
 def test_qualify_accepts_real_sip_and_tan():
     for f in (_SIP_FRAME, _TAN_FRAME):
         p = _CALDWELL / f
@@ -289,6 +290,7 @@ def _measure_sip_vs_tan_offset():
     return float(np.median(off)), float(off.max())
 
 
+@pytest.mark.slow
 def test_cross_consistency_sip_vs_tan_pinned():
     """Pin the measured SIP-vs-TAN systematic offset (small => 'keep' is safe).
 
@@ -390,6 +392,7 @@ def test_rejected_count_surfaced_in_manifest(tmp_path, caplog):
 # (g) real-frame end-to-end: SIP frame is now INCLUDED
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _SIP_FIXTURE.is_dir(), reason="R10 SIP fixture dir not present")
 def test_end_to_end_real_sip_frame_included(tmp_path):
     out = tmp_path / "out"
@@ -417,6 +420,7 @@ def test_end_to_end_real_sip_frame_included(tmp_path):
     assert int(np.count_nonzero(np.asarray(cov) > 0)) > 0
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _SIP_FIXTURE.is_dir(), reason="R10 SIP fixture dir not present")
 def test_end_to_end_strip_fallback_still_includes_frames(tmp_path):
     out = tmp_path / "out"

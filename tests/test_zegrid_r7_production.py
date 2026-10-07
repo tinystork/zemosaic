@@ -167,6 +167,7 @@ def test_load_image_with_optional_alpha_mono_hwc(tmp_path):
 # (i) End-to-end on a REAL small M106 subset
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
 def test_end_to_end_real_m106_subset(tmp_path):
     frames = sorted(LIGHTS.glob("*.fit"))[:N_END_TO_END_FRAMES]
@@ -227,10 +228,10 @@ def test_end_to_end_real_m106_subset(tmp_path):
 # Mode-aware layout (rework-1): coarser, floor-honouring, bounded, deterministic
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
-def test_mode_aware_layout_coarser_floor_honouring_bounded_deterministic():
-    frames, _ = zg.read_manifest(LIGHTS)
-    canvas = zg.build_canvas(frames)
+def test_mode_aware_layout_coarser_floor_honouring_bounded_deterministic(m106_corpus):
+    frames, _rejected, canvas = m106_corpus
 
     for gib in (1.0, 2.0, 4.0):
         budget = int(gib * 2**30)
@@ -270,10 +271,10 @@ def test_parse_pinned_layout():
         zegrid._parse_pinned_layout("6")
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
-def test_pinned_layout_honoured_floors_and_infeasible():
-    frames, _ = zg.read_manifest(LIGHTS)
-    canvas = zg.build_canvas(frames)
+def test_pinned_layout_honoured_floors_and_infeasible(m106_corpus):
+    frames, _rejected, canvas = m106_corpus
 
     # Honoured: pinned (6,5) at 4 GiB bypasses the RAM-adaptive choice.
     d = zegrid._choose_layout_mode_aware(canvas, frames, ram_budget=int(4 * 2**30), pinned_layout=(6, 5))
@@ -305,6 +306,7 @@ def test_pick_mode_reports_selected_mode_bound():
     assert bound2 == int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory not present")
 def test_cache_reuse_second_build(tmp_path):
     frames = sorted(LIGHTS.glob("*.fit"))[:4]
