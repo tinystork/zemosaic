@@ -26,10 +26,16 @@ import numpy as np
 import pytest
 
 from zemosaic import zemosaic_zegrid_mode as zz
+from zemosaic.core.canonical_streaming import compute_fixed_normalization
+from zemosaic.core.zegrid import execution as zxe
+from zemosaic.core.zegrid import file_provider as zfp
 from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import instrumentation as zin
 from zemosaic.core.zegrid import parallel as zpar
+from zemosaic.core.zegrid import photometric as zphot
+from zemosaic.core.zegrid import streaming as zstream
 from zemosaic.core.zegrid import sweep as zsw
+from zemosaic.core.zegrid.executor import ExecutorConfig
 
 LIGHTS = Path("/home/tristan/M16/quick")
 NOOP = lambda *a, **k: None
@@ -240,6 +246,102 @@ def test_pmap_serial_and_order_preserving():
     assert results == [1, 4, 9]
     results_par = zpar.pmap(_square, [1, 2, 3, 4], workers=2)
     assert results_par == [1, 4, 9, 16]
+
+
+def test_gpu_note_mentions_cupy_product_init():
+    # F3: the GPU note must answer the user's observation that loading "uses the
+    # GPU" — the ZeGrid ENGINE is CPU-only, but the PRODUCT worker initialises CuPy.
+    note = zin.describe_gpu_usage()
+    assert "CPU" in note and "GPU" in note
+    assert "CuPy" in note
+    assert "zemosaic_worker" in note
+
+
+def test_ignored_run_args_present_and_described():
+    # F2: run_zegrid_mode accepts but ignores these stack/final-mosaic args.
+    assert "save_final_as_uint16" in zin.IGNORED_RUN_ARGS
+    assert "legacy_rgb_cube" in zin.IGNORED_RUN_ARGS
+    assert "apply_radial_weight" in zin.IGNORED_RUN_ARGS
+    assert "grid_rgb_equalize" in zin.IGNORED_RUN_ARGS
+    assert "use_gpu" in zin.IGNORED_RUN_ARGS
+    lines = zin.describe_ignored_run_args({"save_final_as_uint16": True})
+    assert any("save_final_as_uint16" in ln for ln in lines)
+    empty = zin.describe_ignored_run_args({})
+    assert len(empty) == 1
+
+
+def test_manifest_has_ignored_run_args(tmp_path):
+    w = zg.GlobalCanvas(
+        canvas_id="x", wcs_header=_synthetic_tan_wcs().to_header().tostring(),
+        width=10, height=10, resolution_deg=0.001,
+    )
+
+    class _Assembled:
+        science = np.zeros((10, 10, 3), dtype=np.float32)
+        stack_depth = np.ones((10, 10), dtype=np.int32)
+        complete_cells = ["r0000c0000"]
+        incomplete_cells = []
+        hole_pixels = 0
+        coverage_pixels = 100
+
+    descs = [
+        zg.FrameDescriptor(
+            frame_id=zg.FrameId("a.fits"), source_path="/x/a.fits", shape_hw=(10, 10),
+            wcs_header=_synthetic_tan_wcs().to_header().tostring(),
+            header_sha256="", instrument="",
+        )
+    ]
+    layout = {"nx": 1, "ny": 1, "ram_budget_bytes": 0, "available_bytes": 0,
+              "max_contributors": 1, "predicted_bound_bytes": 0}
+    _, _, mp = zz._write_outputs(
+        _Assembled(), w, 1, 1, tmp_path, descs, {}, [],
+        layout, zz.ExecutorConfig().science_config(), 0, {}, None,
+        rejected=[], sip_mode="keep", frames_loaded=1,
+        global_reference_frame_id="a.fits",
+        ignored_run_args={"save_final_as_uint16": True},
+    )
+    m = json.loads(mp.read_text())
+    assert m["ignored_run_args"]["save_final_as_uint16"] is True
+
+
+# ---------------------------------------------------------------------------
+# F1: bounded streaming gauge is BIT-IDENTICAL to the full-canvas gauge (M16)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not LIGHTS.is_dir(), reason="M16 lights directory not present")
+def test_bounded_gauge_bit_identical_to_full_canvas(tmp_path):
+    descs, _ = zg.read_manifest(LIGHTS)
+    descs = sorted(descs, key=lambda d: d.frame_id)[:6]
+    canvas = zg.build_canvas(descs)
+    config = ExecutorConfig().science_config()
+
+    # OLD (R11): full-canvas aligned cache + compute_fixed_normalization.
+    builder = zfp.AlignedCacheBuilder(str(tmp_path / "old_cache"))
+    for f in descs:
+        hwc = np.asarray(zz._decode_frame_hwc(f, NOOP), dtype=np.float32)
+        if hwc.ndim == 2:
+            hwc = np.stack([hwc, hwc, hwc], axis=-1)
+        chw = np.ascontiguousarray(np.moveaxis(hwc, -1, 0))
+        rgb, geom = zxe.reproject_cropped(
+            chw, f.wcs(), canvas.wcs(), (canvas.height, canvas.width)
+        )
+        builder.add(f.frame_id.logical_path, rgb, geom)
+    builder.finish()
+    prov = zfp.MemmapCanonicalProvider(str(tmp_path / "old_cache"))
+    request = zstream.build_streaming_request(config, prov.n_frames)
+    old = compute_fixed_normalization(prov, request)
+
+    # NEW (R12): bounded streaming phase-1, no disk cache.
+    new, ids = zphot.compute_global_gauge(descs, canvas, zz._gauge_decode, config, None, workers=4)
+
+    assert int(old.reference_index) == int(new.reference_index)
+    np.testing.assert_array_equal(old.coefficients, new.coefficients)
+    np.testing.assert_array_equal(old.norm_active, new.norm_active)
+    np.testing.assert_array_equal(old.weights, new.weights)
+    np.testing.assert_array_equal(old.weight_active, new.weight_active)
+    assert tuple((e.index, e.stage, e.reason, e.detail) for e in old.exclusions) == \
+        tuple((e.index, e.stage, e.reason, e.detail) for e in new.exclusions)
+    assert tuple(ids) == tuple(f.frame_id.logical_path for f in descs)
 
 
 # ---------------------------------------------------------------------------

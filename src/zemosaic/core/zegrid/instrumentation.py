@@ -37,10 +37,38 @@ IGNORED_SETTINGS: tuple[str, ...] = (
 # Settings matched by prefix (final_mosaic_dbe_* : enable / sigma / iterations / ...).
 IGNORED_SETTING_PREFIXES: tuple[str, ...] = ("final_mosaic_dbe_",)
 
+# ``run_zegrid_mode`` arguments the ZeGrid engine ACCEPTS (for backward
+# compatibility with the removed legacy Grid) but does NOT honour, because
+# ZeGrid uses the FROZEN science config (sky_mean / noise_variance / kappa_sigma
+# / mean / footprint taper) and emits standard ``mosaic_grid.fits`` +
+# ``mosaic_grid_coverage.fits``. Surfaced so nothing is silently dropped.
+IGNORED_RUN_ARGS: tuple[str, ...] = (
+    "stack_weight_method",
+    "stack_reject_algo",
+    "stack_kappa_low",
+    "stack_kappa_high",
+    "winsor_limits",
+    "stack_final_combine",
+    "apply_radial_weight",
+    "radial_feather_fraction",
+    "radial_shape_power",
+    "save_final_as_uint16",
+    "legacy_rgb_cube",
+    "grid_rgb_equalize",
+    "use_gpu",
+)
+
+# ZM-ZEGRID-R12 F3: the precise answer to the user's observation that loading
+# "uses the GPU". The ZeGrid ENGINE is CPU-only, but the PRODUCT worker still
+# probes/initialises CuPy during its own (pre/post ZeGrid) phases.
 GPU_USAGE_NOTE = (
-    "CPU-only: the ZeGrid engine performs all decode/reproject/stack work on the "
-    "CPU and never touches the GPU. Product use_gpu_* / stack_use_gpu flags are "
-    "read but ignored by ZeGrid."
+    "The ZeGrid ENGINE is CPU-only: it performs all decode/reproject/stack work "
+    "on the CPU and never touches the GPU; its use_gpu_* / stack_use_gpu flags "
+    "are read but ignored. The PRODUCT worker may still initialise CuPy during "
+    "its own phases (gpu_runtime probing / apply_gpu_safety_to_phase5_flag do "
+    "cupy.cuda.Device().use() and cupy.is_available() in zemosaic_worker.py), so "
+    "a GPU spike during loading most likely comes from that product-level "
+    "initialisation, NOT from the ZeGrid engine."
 )
 
 
@@ -118,6 +146,19 @@ def ignored_settings_present(zconfig) -> dict:
 
 def describe_gpu_usage() -> str:
     return GPU_USAGE_NOTE
+
+
+def describe_ignored_run_args(ignored: dict) -> list[str]:
+    """Human-readable lines listing ``run_zegrid_mode`` args accepted but ignored."""
+    if not ignored:
+        return ["No accepted-but-ignored run_zegrid_mode arguments detected."]
+    lines = [
+        "ZeGrid accepts but IGNORES the following stack/final-mosaic arguments "
+        "(ZeGrid uses the frozen science config and standard FITS outputs):"
+    ]
+    for name in sorted(ignored):
+        lines.append(f"  - {name} = {ignored[name]!r}")
+    return lines
 
 
 def ignored_settings_warning_lines(ignored: dict) -> list[str]:

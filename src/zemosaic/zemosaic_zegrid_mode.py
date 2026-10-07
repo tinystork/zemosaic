@@ -818,6 +818,7 @@ def _write_run_log(
     peak_rss_kib,
     cache_info,
     global_reference_frame_id,
+    ignored_run_args=None,
 ):
     """Write a human-readable run log into the output folder.
 
@@ -848,6 +849,9 @@ def _write_run_log(
     lines.append("Ignored product settings (ZeGrid is CPU-only + no post-stack processing):")
     lines.extend(zin.ignored_settings_warning_lines(ignored_settings))
     lines.append("")
+    lines.append("Accepted-but-ignored run_zegrid_mode arguments:")
+    lines.extend(zin.describe_ignored_run_args(ignored_run_args or {}))
+    lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
     lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
     lines.append(f"photometric_gauge.global_reference_frame_id: {global_reference_frame_id}")
@@ -867,6 +871,7 @@ def _run_single(
     pinned_layout=None,
     sip_mode="keep",
     workers=None,
+    ignored_run_args=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1080,6 +1085,7 @@ def _run_single(
         frames_loaded=len(frames_info),
         global_reference_frame_id=global_reference_frame_id,
         timings=timings, gpu_used=gpu_used, ignored_settings=ignored_settings,
+        ignored_run_args=ignored_run_args,
     )
 
     _write_run_log(
@@ -1093,6 +1099,7 @@ def _run_single(
         layout=layout,
         gpu_used=gpu_used,
         ignored_settings=ignored_settings,
+        ignored_run_args=ignored_run_args,
         peak_rss_kib=peak_rss_kib,
         cache_info=cache_report,
         global_reference_frame_id=global_reference_frame_id,
@@ -1114,7 +1121,7 @@ def _write_outputs(
     layout, science_config, peak_rss_kib, cache_report, progress_callback,
     rejected=None, sip_mode="keep", frames_loaded=None,
     global_reference_frame_id=None,
-    timings=None, gpu_used=False, ignored_settings=None,
+    timings=None, gpu_used=False, ignored_settings=None, ignored_run_args=None,
 ):
     output_dir = Path(output_dir)
     science = np.asarray(assembled.science, dtype=np.float32)  # (H, W, 3)
@@ -1224,6 +1231,7 @@ def _write_outputs(
         "timings": (timings.to_dict() if timings is not None else {}),
         "gpu": {"used": bool(gpu_used), "note": zin.GPU_USAGE_NOTE},
         "ignored_settings": (ignored_settings or {}),
+        "ignored_run_args": (ignored_run_args or {}),
         "peak_rss_kib": peak_rss_kib,
         "outputs": {
             "science": sci_path.name,
@@ -1274,6 +1282,27 @@ def run_zegrid_mode(
             lvl="WARN",
             callback=progress_callback,
         )
+
+    # ZM-ZEGRID-R12 F2: surface the run_zegrid_mode arguments ZeGrid accepts for
+    # backward compatibility but does NOT honour (frozen science config + standard
+    # FITS outputs). Nothing is silently dropped.
+    ignored_run_args = {
+        "stack_weight_method": stack_weight_method,
+        "stack_reject_algo": stack_reject_algo,
+        "stack_kappa_low": stack_kappa_low,
+        "stack_kappa_high": stack_kappa_high,
+        "winsor_limits": list(winsor_limits),
+        "stack_final_combine": stack_final_combine,
+        "apply_radial_weight": apply_radial_weight,
+        "radial_feather_fraction": radial_feather_fraction,
+        "radial_shape_power": radial_shape_power,
+        "save_final_as_uint16": save_final_as_uint16,
+        "legacy_rgb_cube": legacy_rgb_cube,
+        "grid_rgb_equalize": grid_rgb_equalize,
+        "use_gpu": bool(use_gpu),
+    }
+    for line in zin.describe_ignored_run_args(ignored_run_args):
+        _emit(line, lvl="WARN", callback=progress_callback)
 
     csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
     frames_info = _stack_plan.load_stack_plan(csv_path, progress_callback=progress_callback)
@@ -1343,16 +1372,19 @@ def run_zegrid_mode(
             _run_single(eq_frames, input_folder, base_out / "grid_EQ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
-                        pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers)
+                        pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
+                        ignored_run_args=ignored_run_args)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
-                        pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers)
+                        pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
+                        ignored_run_args=ignored_run_args)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
         _run_single(frames_info, input_folder, base_out,
                     progress_callback=progress_callback,
                     science_config=science_config, zconfig=zconfig,
-                    pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers)
+                    pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
+                    ignored_run_args=ignored_run_args)
