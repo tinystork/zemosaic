@@ -24,6 +24,7 @@ from . import (
     executor,
     geometry,
     mosaic,
+    photometric,
     science_adapter,
     seam,
     sweep,
@@ -40,4 +41,5 @@ __all__ = [
     "executor",
     "mosaic",
     "auto_layout",
+    "photometric",
 ]

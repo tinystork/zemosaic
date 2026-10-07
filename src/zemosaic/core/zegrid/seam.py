@@ -26,7 +26,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .geometry import GlobalCanvas, ZeGridLayout, build_layout
+from .geometry import GlobalCanvas, ZeGridLayout, build_layout, cell_id
 
 # Seam context half-width in global pixels (== halo). The two sides of the
 # boundary are each ``SEAM_HALF`` pixels wide inside the overlapping halo.
@@ -67,6 +67,91 @@ def adjacent_neighbours(row: int, col: int, nx: int, ny: int) -> list[tuple[str,
     if row - 1 >= 0:
         out.append(("top", row - 1, col))
     return out
+
+
+def _boundary_step_pct(ml: float, mr: float) -> float:
+    """Relative % step between two strip means (symmetric percent difference)."""
+    if not (np.isfinite(ml) and np.isfinite(mr)):
+        return float("nan")
+    denom = (ml + mr) / 2.0
+    if denom == 0.0:
+        return 0.0 if ml == mr else float("inf")
+    return 100.0 * abs(ml - mr) / abs(denom)
+
+
+def _strip_mean_luminance(arr: np.ndarray) -> float:
+    """Mean Rec.709 luminance of the finite pixels of an (H, W[, 3]) strip."""
+    a = np.asarray(arr, dtype=np.float64)
+    if a.ndim == 3:
+        lum = 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+    else:
+        lum = a
+    finite = lum[np.isfinite(lum)]
+    return float(np.mean(finite)) if finite.size else float("nan")
+
+
+def compute_boundary_step_metric(
+    canvas: GlobalCanvas,
+    science: np.ndarray,
+    nx: int,
+    ny: int,
+    strip_px: int = 6,
+) -> dict:
+    """Inter-cell boundary-step metric (ZM-ZEGRID-R11 measurement).
+
+    For every internal boundary of an ``nx x ny`` layout (both vertical and
+    horizontal), take ``strip_px``-wide strips of the assembled ``science``
+    ``(H, W, 3)`` (NaN where uncovered) on each side of the boundary, INSIDE the
+    adjacent Cell cores, compute each strip's mean Rec.709 luminance over its
+    finite pixels, and the relative % step between the two sides
+    (``100 * |L - R| / ((L + R) / 2)``). Returns the median and max step over all
+    internal boundaries plus the per-boundary detail. Pure measurement — it never
+    modifies science or blends anything.
+    """
+    layout = build_layout(canvas, nx, ny)
+    per_boundary: list[dict] = []
+
+    def _record(axis, bnd, lo, hi, lo_id, hi_id):
+        ml = _strip_mean_luminance(lo)
+        mr = _strip_mean_luminance(hi)
+        step = _boundary_step_pct(ml, mr)
+        per_boundary.append({
+            "axis": axis,
+            "boundary_global": int(bnd),
+            "low_cell": lo_id,
+            "high_cell": hi_id,
+            "low_mean_lum": ml,
+            "high_mean_lum": mr,
+            "step_pct": step,
+        })
+
+    # Vertical boundaries (left/right neighbours).
+    for row in range(ny):
+        for col in range(nx - 1):
+            a = layout.cell_bounds(row, col, canvas)
+            b = layout.cell_bounds(row, col + 1, canvas)
+            bnd = a.x1  # == b.x0
+            lo = science[a.y0:a.y1, bnd - strip_px:bnd]
+            hi = science[a.y0:a.y1, bnd:bnd + strip_px]
+            _record("x", bnd, lo, hi, cell_id(row, col), cell_id(row, col + 1))
+
+    # Horizontal boundaries (top/bottom neighbours).
+    for row in range(ny - 1):
+        for col in range(nx):
+            a = layout.cell_bounds(row, col, canvas)
+            b = layout.cell_bounds(row + 1, col, canvas)
+            bnd = a.y1  # == b.y0
+            lo = science[bnd - strip_px:bnd, a.x0:a.x1]
+            hi = science[bnd:bnd + strip_px, a.x0:a.x1]
+            _record("y", bnd, lo, hi, cell_id(row, col), cell_id(row + 1, col))
+
+    steps = [p["step_pct"] for p in per_boundary if np.isfinite(p["step_pct"])]
+    return {
+        "median_pct": float(np.median(steps)) if steps else float("nan"),
+        "max_pct": float(np.max(steps)) if steps else float("nan"),
+        "n_boundaries": len(steps),
+        "per_boundary": per_boundary,
+    }
 
 
 def _orient(a, b):

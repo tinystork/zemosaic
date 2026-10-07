@@ -64,13 +64,18 @@ from astropy.wcs import WCS
 
 from . import zemosaic_stack_plan as _stack_plan
 from .zemosaic_utils import load_image_with_optional_alpha
-from .core.canonical_streaming import run_canonical_stack_streaming
+from .core.canonical_streaming import (
+    InMemoryCanonicalProvider,
+    run_canonical_stack_streaming,
+    subset_fixed_normalization,
+)
 from .core.zegrid import assembly as za
 from .core.zegrid import auto_layout as zal
 from .core.zegrid import execution as zxe
 from .core.zegrid import file_provider as zfp
 from .core.zegrid import geometry as zg
 from .core.zegrid import mosaic as zmosaic
+from .core.zegrid import photometric as zphot
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
 from .core.zegrid import sweep as zsw
@@ -601,36 +606,56 @@ def _choose_layout_mode_aware(
     }
 
 
-def _run_cell_inmem(cache_dir, patch, config, progress_callback):
-    provider = zfp.MemmapCanonicalProvider(cache_dir)
-    images = []
-    supports = []
-    for i in range(provider.n_frames):
-        rgb, sup = provider.get_raw_frame(i)
-        images.append(np.array(rgb, dtype=np.float32, copy=True))
-        supports.append(np.array(sup, dtype=bool, copy=True))
-    sres = zs.run_minitile_stack(images, supports, list(provider.frame_ids), config)
-    mt = za.extract_minitile(patch, sres)
-    return mt, sres
-
-
-def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STREAM_TILE_SIZE):
-    provider = zfp.MemmapCanonicalProvider(cache_dir)
-    request = zstream.build_streaming_request(config, provider.n_frames)
-    result = run_canonical_stack_streaming(provider, request, tile_size=tile_size)
-    order = list(provider.frame_ids)
+def _build_cell_sres(result, frame_ids):
+    """Build a MiniTileScienceResult from a canonical result + frame order."""
+    order = list(frame_ids)
     ref_idx = int(result.provenance["reference"]["index"])
     reference_frame_id = order[ref_idx] if 0 <= ref_idx < len(order) else None
     excluded = tuple(
         (order[idx] if 0 <= idx < len(order) else f"<index {idx}>", stage, reason)
         for idx, stage, reason in result.provenance["excluded_frames"]
     )
-    sres = zs.MiniTileScienceResult(
+    return zs.MiniTileScienceResult(
         result=result,
         reference_frame_id=reference_frame_id,
         excluded=excluded,
         frame_order=tuple(order),
     )
+
+
+def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
+    """In-memory cell run: aligned frames resident, single-tile streaming executor.
+
+    ZM-ZEGRID-R11: the in-memory path now goes through
+    :func:`run_canonical_stack_streaming` with an :class:`InMemoryCanonicalProvider`
+    (bit-equal to the engine by the R5/R6 contract) so it can consume the SAME
+    fixed photometric gauge as the streaming path. ``fixed`` is the Cell-local
+    :class:`FixedNormalization`; when None the per-Cell phase-1 is computed as
+    before (legacy behaviour).
+    """
+    provider = zfp.MemmapCanonicalProvider(cache_dir)
+    frame_ids = list(provider.frame_ids)
+    images = []
+    supports = []
+    for i in range(provider.n_frames):
+        rgb, sup = provider.get_raw_frame(i)
+        images.append(np.array(rgb, dtype=np.float32, copy=True))
+        supports.append(np.array(sup, dtype=bool, copy=True))
+    inmem_provider = InMemoryCanonicalProvider(images, supports)
+    request = zstream.build_streaming_request(config, inmem_provider.n_frames)
+    result = run_canonical_stack_streaming(
+        inmem_provider, request, tile_size=None, fixed=fixed
+    )
+    sres = _build_cell_sres(result, frame_ids)
+    mt = za.extract_minitile(patch, sres)
+    return mt, sres
+
+
+def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STREAM_TILE_SIZE, fixed=None):
+    provider = zfp.MemmapCanonicalProvider(cache_dir)
+    request = zstream.build_streaming_request(config, provider.n_frames)
+    result = run_canonical_stack_streaming(provider, request, tile_size=tile_size, fixed=fixed)
+    sres = _build_cell_sres(result, list(provider.frame_ids))
     mt = za.extract_minitile(patch, sres)
     return mt, sres
 
@@ -709,6 +734,30 @@ def _run_single(
         descs, canvas, cell_ctxs, cache_root, progress_callback
     )
 
+    # GLOBAL PHOTOMETRIC GAUGE (ZM-ZEGRID-R11): one reference + per-frame
+    # normalization coefficients/weights computed ONCE over the full canvas, so
+    # every Cell shares a single photometric anchor (removes the inter-cell level
+    # steps). Frame-major, disk-backed, resumable.
+    _emit(
+        f"ZeGrid: computing global photometric gauge (full-canvas, frame-major)",
+        callback=progress_callback,
+    )
+    gauge_cache_dir = cache_root / "__gauge__"
+    global_gauge, global_frame_ids = zphot.compute_global_gauge(
+        descs,
+        canvas,
+        lambda f: _decode_frame_hwc(f, progress_callback),
+        science_config,
+        gauge_cache_dir,
+    )
+    global_reference_frame_id = global_frame_ids[int(global_gauge.reference_index)]
+    _emit(
+        f"ZeGrid: global photometric gauge — reference frame {global_reference_frame_id!r} "
+        f"(index {global_gauge.reference_index} of {len(global_frame_ids)} frames); "
+        f"exclusions={len(global_gauge.exclusions)}",
+        callback=progress_callback,
+    )
+
     # PER-CELL mode policy -> MiniTile -> core planes.
     cores = {}
     cell_records = []
@@ -738,11 +787,22 @@ def _run_single(
             cell_records.append({"cell_id": cid, "status": "empty", "mode": mode})
             continue
 
+        # R11: subset the global gauge to THIS cell's frames (in cache order), so
+        # the cell reuses the SAME per-frame coefficients/weights as every other
+        # cell (a single photometric anchor).
+        cell_provider = zfp.MemmapCanonicalProvider(cache_dir)
+        cell_frame_ids = list(cell_provider.frame_ids)
+        cell_fixed = subset_fixed_normalization(
+            global_gauge, global_frame_ids, cell_frame_ids
+        )
+
         try:
             if mode == "inmem":
-                mt, sres = _run_cell_inmem(cache_dir, patch, science_config, progress_callback)
+                mt, sres = _run_cell_inmem(cache_dir, patch, science_config, progress_callback,
+                                           fixed=cell_fixed)
             else:
-                mt, sres = _run_cell_stream(cache_dir, patch, science_config, progress_callback)
+                mt, sres = _run_cell_stream(cache_dir, patch, science_config, progress_callback,
+                                            fixed=cell_fixed)
         except Exception as exc:
             # No silent fallback: a per-cell ZeGrid failure raises.
             _emit(f"ZeGrid: cell {cid} failed: {exc}", lvl="ERROR", callback=progress_callback)
@@ -783,6 +843,8 @@ def _run_single(
         assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
         layout, science_config, peak_rss_kib, cache_report, progress_callback,
         rejected=rejected, sip_mode=sip_mode,
+        frames_loaded=len(frames_info),
+        global_reference_frame_id=global_reference_frame_id,
     )
     _emit(
         f"ZeGrid: done — {sci_path.name} ({assembled.science.shape}) + coverage, "
@@ -797,7 +859,8 @@ def _run_single(
 def _write_outputs(
     assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
     layout, science_config, peak_rss_kib, cache_report, progress_callback,
-    rejected=None, sip_mode="keep",
+    rejected=None, sip_mode="keep", frames_loaded=None,
+    global_reference_frame_id=None,
 ):
     output_dir = Path(output_dir)
     science = np.asarray(assembled.science, dtype=np.float32)  # (H, W, 3)
@@ -834,11 +897,20 @@ def _write_outputs(
                    "predicted_bound_bytes": layout["predicted_bound_bytes"]},
         "layout_source": layout.get("layout_source", "auto"),
         "reproducibility_note": (
-            "output science depends on the layout (per-cell sky_mean normalization "
-            "is computed over the haloed patch); coverage (stack depth) is layout-"
-            "invariant. Pin the layout via the 'zegrid_layout' config key (e.g. "
-            "'6x5') for reproducible output."
+            "output science is GLOBAL-gauge normalized (one reference frame + "
+            "per-frame coefficients computed over the full canvas), so the science "
+            "is layout-INDEPENDENT (ZM-ZEGRID-R11 resolves the R7-M1 reproducibility "
+            "caveat). Pin the layout via the 'zegrid_layout' config key (e.g. '6x5') "
+            "for reproducible output; coverage (stack depth) is pure geometry."
         ),
+        "photometric_gauge": {
+            "mode": "global",
+            "global_reference_frame_id": global_reference_frame_id,
+            "note": (
+                "one reference frame + per-frame sky_mean coefficients computed once "
+                "over the full canvas footprint; every Cell reuses the same gauge."
+            ),
+        },
         "n_frames": len(descs),
         "frame_ids": [d.frame_id.logical_path for d in descs],
         "sip_mode": sip_mode,
@@ -850,6 +922,17 @@ def _write_outputs(
                 if rejected else {}
             ),
             "paths": [r["path"] for r in (rejected or [])],
+        },
+        "reconciliation": {
+            "frames_loaded": frames_loaded if frames_loaded is not None else (
+                len(descs) + len(rejected or [])
+            ),
+            "frames_included": len(descs),
+            "frames_rejected_wcs": len(rejected or []),
+            "note": (
+                "frames_loaded == frames_included + frames_rejected_wcs "
+                "(no silent drop outside the WCS gate; ZM-ZEGRID-R10 I1)"
+            ),
         },
         "complete_cells": assembled.complete_cells,
         "incomplete_cells": assembled.incomplete_cells,

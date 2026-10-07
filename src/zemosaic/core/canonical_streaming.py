@@ -109,6 +109,9 @@ from zemosaic.core.canonical_equalize import equalize_rgb_medians_copy
 __all__ = [
     "CanonicalFrameProvider",
     "InMemoryCanonicalProvider",
+    "FixedNormalization",
+    "compute_fixed_normalization",
+    "subset_fixed_normalization",
     "run_canonical_stack_streaming",
 ]
 
@@ -262,7 +265,46 @@ class _Phase1:
     original_shape: tuple
 
 
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class FixedNormalization:
+    """ZM-ZEGRID-R11 — a precomputed, cell-independent photometric gauge.
+
+    Carries the per-frame photometric normalization for a set of frames, all
+    expressed against ONE reference frame (``reference_index``). This is the
+    GLOBAL gauge: the coefficients/weights/active flags are computed ONCE over
+    the frames' full valid footprint (see
+    :func:`zemosaic.core.zegrid.photometric.compute_global_gauge`) and then
+    injected into every Cell, so all Cells share a single photometric anchor and
+    the inter-cell level steps disappear.
+
+    Fields
+    ------
+    reference_index:
+        Index (within the frame order this gauge covers) of the reference frame,
+        whose coefficient is the identity ``(1, 0)``.
+    coefficients:
+        Owned ``(N, C, 2)`` float64 ``(a, b)`` per frame/channel; NaN for frames
+        excluded at the normalization stage.
+    norm_active:
+        ``(N,)`` bool — frames surviving the normalization stage.
+    weights:
+        ``(N,)`` float64 canonical quality weights (normalized, max == 1).
+    weight_active:
+        ``(N,)`` bool — frames surviving the weighting stage.
+    exclusions:
+        Tuple of :class:`FrameExclusion` (normalization then weighting), indexed
+        by the frame order this gauge covers.
+    """
+
+    reference_index: int
+    coefficients: np.ndarray      # (N, C, 2) float64
+    norm_active: np.ndarray       # (N,) bool
+    weights: np.ndarray           # (N,) float64
+    weight_active: np.ndarray     # (N,) bool
+    exclusions: tuple             # FrameExclusion
+
+
+# --------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -452,6 +494,178 @@ def _phase1(provider: CanonicalFrameProvider, request: CanonicalStackRequest) ->
         height=h,
         width=w,
         channels=c,
+        original_mono=provider.original_mono,
+        original_ndim=provider.original_ndim,
+        original_shape=provider.original_shape,
+    )
+
+
+def compute_fixed_normalization(
+    provider: CanonicalFrameProvider, request: CanonicalStackRequest
+) -> "FixedNormalization":
+    """Compute the per-frame photometric gauge of ``provider`` once.
+
+    This is the GLOBAL gauge for the set of frames the provider serves: it runs
+    the EXACT same phase-1 pipeline (reference selection, per-frame normalization
+    coefficients, quality weights, active flags, exclusions) that
+    :func:`run_canonical_stack_streaming` would run per-Cell, but computed over
+    the provider's full domain (e.g. the full-canvas alignment), so every Cell can
+    then reuse the SAME coefficients instead of recomputing them over its own
+    patch. The coefficients are computed with the frozen canonical functions
+    verbatim — no re-implementation.
+    """
+    p1 = _phase1(provider, request)
+    return FixedNormalization(
+        reference_index=int(p1.reference_index),
+        coefficients=np.array(p1.coefficients, dtype=np.float64, copy=True),
+        norm_active=np.array(p1.norm_active, dtype=bool, copy=True),
+        weights=np.array(p1.weights, dtype=np.float64, copy=True),
+        weight_active=np.array(p1.weight_active, dtype=bool, copy=True),
+        exclusions=tuple(p1.exclusions),
+    )
+
+
+def subset_fixed_normalization(
+    fixed: "FixedNormalization",
+    global_frame_ids,
+    cell_frame_ids,
+) -> "FixedNormalization":
+    """Subset a global gauge to a Cell's frame list (in the Cell's order).
+
+    ``global_frame_ids`` is the frame order ``fixed`` covers (length ``N``);
+    ``cell_frame_ids`` is the Cell's frame order (a subset, possibly reordered).
+    Returns a :class:`FixedNormalization` over ``cell_frame_ids`` with
+    ``reference_index`` remapped to the Cell-local index of the global reference.
+
+    When the global reference frame is NOT a contributor to the Cell, the gauge is
+    RE-ANCHORED to the Cell's highest-weight active frame: each coefficient
+    ``(a, b)`` is re-expressed relative to that frame ``L`` via
+    ``a' = a / a_L``, ``b' = (b - b_L) / a_L`` (for ``sky_mean`` ``a=1`` this is a
+    pure offset difference ``b - b_L``). The photometric scale is unchanged — only
+    the identity anchor moves — so Cells without the global reference still emit
+    science on the SAME global scale.
+    """
+    if len(global_frame_ids) != fixed.coefficients.shape[0]:
+        raise CanonicalStackValidationError(
+            f"global_frame_ids length {len(global_frame_ids)} != gauge N "
+            f"{fixed.coefficients.shape[0]}"
+        )
+    gidx = {fid: i for i, fid in enumerate(global_frame_ids)}
+    try:
+        cell_global_idx = [gidx[fid] for fid in cell_frame_ids]
+    except KeyError as exc:
+        raise CanonicalStackValidationError(
+            f"cell frame {exc.args[0]!r} not present in the global gauge frame order"
+        ) from exc
+
+    idx = np.asarray(cell_global_idx, dtype=np.int64)
+    n_cell = len(idx)
+    c = fixed.coefficients.shape[1]
+
+    coefficients = np.array(fixed.coefficients[idx], dtype=np.float64, copy=True)
+    norm_active = np.array(fixed.norm_active[idx], dtype=bool, copy=True)
+    weights = np.array(fixed.weights[idx], dtype=np.float64, copy=True)
+    weight_active = np.array(fixed.weight_active[idx], dtype=bool, copy=True)
+
+    present = set(idx.tolist())
+    ref = int(fixed.reference_index)
+    if ref in present:
+        cell_ref = int(np.where(idx == ref)[0][0])
+        # The global reference frame keeps its identity coefficient by
+        # construction; verify it is the identity (defensive invariant).
+        a_ref = float(coefficients[cell_ref, 0, 0])
+        if np.isfinite(a_ref) and not np.isclose(a_ref, 1.0, atol=0.0):
+            raise CanonicalStackValidationError(
+                "global reference frame does not carry the identity coefficient"
+            )
+    else:
+        # Re-anchor to the Cell's highest-weight active frame (deterministic).
+        active_cell = np.where(weight_active)[0]
+        if active_cell.size == 0:
+            raise CanonicalStackValidationError(
+                "cannot re-anchor a Cell whose gauge has no active frame"
+            )
+        # Highest weight; ties resolved to the lowest index (deterministic).
+        local_weights = np.where(weight_active, weights, -np.inf)
+        anchor = int(np.argmax(local_weights))
+        aL = coefficients[anchor]  # (C, 2)
+        if not np.all(np.isfinite(aL)) or np.any(aL[:, 0] == 0.0):
+            raise CanonicalStackValidationError(
+                "anchor frame has non-finite/zero-slope coefficients; cannot re-anchor"
+            )
+        new_coeff = np.full((n_cell, c, 2), np.nan, dtype=np.float64)
+        for j in range(n_cell):
+            if not np.isfinite(coefficients[j, 0, 0]):
+                continue  # excluded frame stays NaN
+            a = coefficients[j, :, 0]
+            b = coefficients[j, :, 1]
+            new_coeff[j, :, 0] = a / aL[:, 0]
+            new_coeff[j, :, 1] = (b - aL[:, 1]) / aL[:, 0]
+        coefficients = new_coeff
+        cell_ref = anchor
+
+    # Remap exclusions to the Cell-local frame order (drop frames not in the Cell).
+    exclusions = tuple(
+        FrameExclusion(
+            index=int(np.where(idx == int(e.index))[0][0]),
+            stage=e.stage,
+            reason=e.reason,
+            detail=e.detail,
+        )
+        for e in fixed.exclusions
+        if int(e.index) in present
+    )
+
+    return FixedNormalization(
+        reference_index=cell_ref,
+        coefficients=np.ascontiguousarray(coefficients),
+        norm_active=norm_active,
+        weights=weights,
+        weight_active=weight_active,
+        exclusions=exclusions,
+    )
+
+
+def _fixed_phase1(
+    provider: CanonicalFrameProvider,
+    request: CanonicalStackRequest,
+    fixed: "FixedNormalization | None",
+) -> _Phase1:
+    """Return the phase-1 result: the fixed gauge when provided, else computed."""
+    if fixed is None:
+        return _phase1(provider, request)
+    if not isinstance(fixed, FixedNormalization):
+        raise CanonicalStackValidationError(
+            f"fixed must be a FixedNormalization, got {type(fixed).__name__}"
+        )
+    n = provider.n_frames
+    if fixed.coefficients.shape[0] != n:
+        raise CanonicalStackValidationError(
+            f"fixed gauge N {fixed.coefficients.shape[0]} != provider.n_frames {n}"
+        )
+    if fixed.norm_active.shape != (n,):
+        raise CanonicalStackValidationError(
+            f"fixed norm_active shape {fixed.norm_active.shape} != ({n},)"
+        )
+    if fixed.weights.shape != (n,) or fixed.weight_active.shape != (n,):
+        raise CanonicalStackValidationError(
+            "fixed weights/weight_active shapes do not match provider N"
+        )
+    if not (0 <= int(fixed.reference_index) < n):
+        raise CanonicalStackValidationError(
+            f"fixed reference_index {fixed.reference_index} out of range [0, {n})"
+        )
+    return _Phase1(
+        reference_index=int(fixed.reference_index),
+        coefficients=np.array(fixed.coefficients, dtype=np.float64, copy=True),
+        norm_active=np.array(fixed.norm_active, dtype=bool, copy=True),
+        weights=np.array(fixed.weights, dtype=np.float64, copy=True),
+        weight_active=np.array(fixed.weight_active, dtype=bool, copy=True),
+        exclusions=tuple(fixed.exclusions),
+        n_frames=n,
+        height=provider.height,
+        width=provider.width,
+        channels=provider.channels,
         original_mono=provider.original_mono,
         original_ndim=provider.original_ndim,
         original_shape=provider.original_shape,
@@ -712,6 +926,7 @@ def run_canonical_stack_streaming(
     request: CanonicalStackRequest,
     *,
     tile_size=None,
+    fixed: "FixedNormalization | None" = None,
 ) -> CanonicalStackResult:
     """Bounded-memory canonical stack, bit-equivalent to ``run_canonical_stack``.
 
@@ -725,6 +940,15 @@ def run_canonical_stack_streaming(
     or a ``(th, tw)`` tuple. Results are identical across tile sizes (within the
     documented bit-exact contract). Backend ``"gpu"`` and explicit taper maps are
     not yet supported and raise clearly (never silently substituted).
+
+    ``fixed`` (ZM-ZEGRID-R11): an optional precomputed
+    :class:`FixedNormalization` whose per-frame coefficients/weights/active flags
+    replace the per-Cell phase-1 computation. When provided, the phase-1
+    coefficient/weight computation is SKIPPED and the fixed gauge is applied
+    verbatim (phase 2 applies the fixed coefficients pointwise exactly as it does
+    the freshly-computed ones), so every Cell given the same gauge shares one
+    photometric anchor. Results are bit-equal to computing the gauge over a Cell
+    whose footprint equals the gauge's full footprint (see the R11 tests).
     """
     if not isinstance(request, CanonicalStackRequest):
         raise CanonicalStackValidationError(
@@ -756,7 +980,7 @@ def run_canonical_stack_streaming(
             f"provider.n_frames {provider.n_frames} != request.images length {len(request.images)}"
         )
 
-    p1 = _phase1(provider, request)
+    p1 = _fixed_phase1(provider, request, fixed)
 
     (science, weight_sum, valid_mask, surviving, support_w1, support_w2, n_eff, agg) = _phase2(
         provider, p1, request, tile_size
