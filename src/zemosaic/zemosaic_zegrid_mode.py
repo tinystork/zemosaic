@@ -996,10 +996,12 @@ def _stack_cell(task):
     cid = cell.cell_id
     if not mem.patch_ids:
         return {"cell_id": cid, "status": "empty",
-                "record": {"cell_id": cid, "status": "empty", "mode": None}}
+                "record": {"cell_id": cid, "status": "empty", "mode": None},
+                "reproject": None}
     cache_dir = Path(cache_dir)
 
     # Build the cell cache (serialised: workers=1 -> no nested pool).
+    zxe.reset_reproject_path_stats()
     t0 = time.perf_counter()
     manifest = _build_one_cell_cache(
         _STACK_DESCS, _STACK_CANVAS, cell, patch, mem, cache_dir, workers=1
@@ -1050,6 +1052,7 @@ def _stack_cell(task):
         "total_bytes": int(manifest.get("total_bytes", 0)),
         "cache_build_s": cache_build_s, "stack_s": stack_s,
         "peak_rss_kib": peak_rss, "cleanup_failed": cleanup_failed,
+        "reproject": zxe.get_reproject_path_stats().to_dict(),
         "cache_dir": str(cache_dir),
     }
 
@@ -1236,6 +1239,19 @@ def _write_run_log(
         )
     else:
         lines.append("  (no per-cell concurrency diagnostics recorded)")
+    lines.append("Reprojection path (ZM-ZEGRID-R21 diagnostic):")
+    _reproj = zxe.merge_reproject_stats(
+        (gauge_diagnostics or {}).get("reprojection"),
+        (per_cell_diagnostics or {}).get("reprojection"),
+    )
+    lines.append(
+        f"  path: {_reproj.get('path')}  fast_calls={_reproj.get('fast_calls')} "
+        f"fallback_calls={_reproj.get('fallback_calls')} "
+        f"fast_seconds={_reproj.get('fast_seconds')} "
+        f"fallback_seconds={_reproj.get('fallback_seconds')}"
+    )
+    if _reproj.get("fallback_reason"):
+        lines.append(f"  fallback_reason: {_reproj.get('fallback_reason')}")
     lines.append("Final-mosaic finishing (ZM-ZEGRID-R18):")
     fin = finishing_info or {}
     if not fin or not fin.get("enabled"):
@@ -1566,6 +1582,11 @@ def _run_single(
     per_cell_diagnostics["stack_cpu_sum_s"] = round(
         sum(r.get("stack_s", 0.0) for r in results), 6
     )
+    # ZM-ZEGRID-R21: which reprojection path the per-cell cache build took,
+    # aggregated over every cell worker (each reports its process-local stats).
+    per_cell_diagnostics["reprojection"] = zxe.merge_reproject_stats(
+        *(r.get("reproject") for r in results)
+    )
 
     # R20: cache build is FUSED into the concurrent per-cell phase (bounded disk
     # requires the cache to be built+deleted inside each cell worker), so the
@@ -1866,6 +1887,10 @@ def _write_outputs(
         "gpu": {"used": bool(gpu_used), "note": zin.GPU_USAGE_NOTE},
         "ignored_settings": (ignored_settings or {}),
         "ignored_run_args": (ignored_run_args or {}),
+        "reprojection": zxe.merge_reproject_stats(
+            (gauge_diagnostics or {}).get("reprojection"),
+            (per_cell_diagnostics or {}).get("reprojection"),
+        ),
         "gauge_diagnostics": (gauge_diagnostics or {}),
         "per_cell_diagnostics": (per_cell_diagnostics or {}),
         "finishing": (finishing_info or {}),
