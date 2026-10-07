@@ -31,7 +31,9 @@ from zemosaic import zemosaic_zegrid_mode as zz
 from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
 from zemosaic.core.canonical_streaming import run_canonical_stack_streaming
 from zemosaic.core.zegrid import file_provider as zfp
+from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import streaming as zstream
+from zemosaic.core.zegrid import sweep as zsw
 
 LIGHTS = Path("/home/tristan/M106/lights")
 
@@ -220,6 +222,34 @@ def test_run_cell_inmem_closes_provider(tmp_path, monkeypatch):
     assert mt.science.shape[:2] == (40, 40)
 
 
+def test_run_cell_inmem_closes_provider_on_read_error(tmp_path, monkeypatch):
+    """rework-1 (L1): if the read/materialise loop RAISES, the provider is STILL
+    closed (try/finally) so the caller can delete the cache on Windows."""
+    cache = tmp_path / "cache"
+    _write_cache(cache)
+    closed = []
+    orig_close = zfp.MemmapCanonicalProvider.close
+
+    def spy_close(self):
+        closed.append(True)
+        orig_close(self)
+
+    monkeypatch.setattr(zfp.MemmapCanonicalProvider, "close", spy_close)
+
+    def boom(self, i):
+        raise RuntimeError("simulated decode/read failure")
+
+    monkeypatch.setattr(zfp.MemmapCanonicalProvider, "get_raw_frame", boom)
+    cfg = zz.ExecutorConfig().science_config()
+    with pytest.raises(RuntimeError):
+        zz._run_cell_inmem(cache, _FakePatch(40, 40), cfg, None)
+    # The read loop raised, but the provider handle was STILL released.
+    assert closed, "provider.close() was NOT called when the read loop raised"
+    # And the cache is then deletable (no lingering handle).
+    assert zfp.safe_rmtree(cache) is True
+    assert not cache.exists()
+
+
 def test_cell_stream_result_bit_equal_to_inmemory(tmp_path):
     """Closing the provider in ``_run_cell_stream`` must not change the science."""
     cache = tmp_path / "cache"
@@ -237,6 +267,48 @@ def test_cell_stream_result_bit_equal_to_inmemory(tmp_path):
 
     mt, _sres = zz._run_cell_stream(cache, _FakePatch(40, 40), cfg, None)
     _assert_minitile_bit_exact(ref, mt)
+
+
+def test_run_cell_streaming_closes_provider(tmp_path, monkeypatch):
+    """rework-1 (L2): ``run_cell_streaming`` (streaming.py) must close its
+    ``MemmapCanonicalProvider``, so it is safe on Windows if promoted."""
+    cache = tmp_path / "cache"
+    frames, masks, ids = _write_cache(cache)
+
+    # Skip the heavy decode/reproject + membership; serve the pre-written cache.
+    class _Cell:
+        cell_id = "r0000c0000"
+
+    class _Mem:
+        patch_ids = ids  # non-empty
+
+    monkeypatch.setattr(
+        zsw, "build_cell_context",
+        lambda *a, **k: (_Cell(), _FakePatch(40, 40), _Mem()),
+    )
+    monkeypatch.setattr(zg, "plan_source_roi", lambda *a, **k: None)
+    monkeypatch.setattr(
+        zstream, "build_aligned_cache_from_sources",
+        lambda *a, **k: zfp.load_cache_manifest(cache),
+    )
+
+    closed = []
+    orig_close = zfp.MemmapCanonicalProvider.close
+
+    def spy_close(self):
+        closed.append(True)
+        orig_close(self)
+
+    monkeypatch.setattr(zfp.MemmapCanonicalProvider, "close", spy_close)
+
+    fake_frames = [SimpleNamespace(frame_id=SimpleNamespace(logical_path=i)) for i in ids]
+    cfg = zz.ExecutorConfig().science_config()
+    res = zstream.run_cell_streaming(
+        fake_frames, None, {}, 0, 0, cfg, cache, enforce_gate=False,
+    )
+    assert closed, "run_cell_streaming did not close its provider"
+    # The result is unchanged (valid MiniTile produced through the same path).
+    assert res.minitile.science.shape[:2] == (40, 40)
 
 
 def test_stream_bit_equal_after_provider_close(tmp_path):
@@ -258,6 +330,65 @@ def test_stream_bit_equal_after_provider_close(tmp_path):
     finally:
         prov.close()
     _assert_minitile_bit_exact(ref, st)
+
+
+# ---------------------------------------------------------------------------
+# L3: manifest carries cache.cleanup_failures (auditable bounded-disk promise)
+# ---------------------------------------------------------------------------
+
+def test_manifest_carries_cleanup_failures(tmp_path):
+    """rework-1 (L3): the manifest ``cache`` block records ``cleanup_failures``
+    (count + failed paths), so a persistent lock is auditable, not just a log line.
+    """
+    import json
+
+    class _Assembled:
+        science = np.zeros((10, 10, 3), dtype=np.float32)
+        stack_depth = np.ones((10, 10), dtype=np.int32)
+        complete_cells = 1
+        incomplete_cells = 0
+        hole_pixels = 0
+        coverage_pixels = 100
+
+    wcs = zg.WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.crval = [10.0, 30.0]
+    wcs.wcs.crpix = [5.0, 5.0]
+    wcs.wcs.cd = np.array([[-1, 0], [0, 1]]) * 0.001
+    wcs.array_shape = (10, 10)
+    canvas = zg.GlobalCanvas(
+        canvas_id="x", wcs_header=wcs.to_header().tostring(),
+        width=10, height=10, resolution_deg=0.001,
+    )
+    layout = {"nx": 1, "ny": 1, "ram_budget_bytes": 0, "available_bytes": 0,
+              "max_contributors": 1, "predicted_bound_bytes": 0}
+    descs = []
+
+    # Failure case: cache_report records two failed cleanups.
+    failed_paths = [str(tmp_path / "a.npy"), str(tmp_path / "b.npy")]
+    cache_report = {
+        "total_bytes": 100, "n_frame_entries": 2, "peak_cell_bytes": 50,
+        "cleanup_failures": failed_paths,
+    }
+    _, _, manifest_path = zz._write_outputs(
+        _Assembled(), canvas, 1, 1, tmp_path, descs, {}, [],
+        layout, SimpleNamespace(normalization="sky_mean"), 0, cache_report, None,
+    )
+    manifest = json.loads(manifest_path.read_text())
+    cf = manifest["cache"]["cleanup_failures"]
+    assert cf["count"] == 2
+    assert cf["paths"] == failed_paths
+
+    # No-failure case: count 0, empty paths.
+    cache_report_ok = {"total_bytes": 100, "n_frame_entries": 2, "peak_cell_bytes": 50}
+    _, _, manifest_path2 = zz._write_outputs(
+        _Assembled(), canvas, 1, 1, tmp_path, descs, {}, [],
+        layout, SimpleNamespace(normalization="sky_mean"), 0, cache_report_ok, None,
+    )
+    manifest2 = json.loads(manifest_path2.read_text())
+    cf2 = manifest2["cache"]["cleanup_failures"]
+    assert cf2["count"] == 0
+    assert cf2["paths"] == []
 
 
 # ---------------------------------------------------------------------------

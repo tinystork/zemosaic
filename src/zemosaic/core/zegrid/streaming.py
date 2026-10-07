@@ -350,11 +350,16 @@ def run_cell_streaming(
         tracker=tracker, reuse_cache=reuse_cache,
     )
     provider = MemmapCanonicalProvider(cache_dir)
-    request = build_streaming_request(config, provider.n_frames)
-    result = run_canonical_stack_streaming(provider, request, tile_size=tile_size)
+    try:
+        request = build_streaming_request(config, provider.n_frames)
+        result = run_canonical_stack_streaming(provider, request, tile_size=tile_size)
+        order = list(provider.frame_ids)
+    finally:
+        # R15 (rework-1 L2): release the memmap handles even on error so the cache
+        # dir is deletable (Windows: an open .npy cannot be deleted -> WinError 32).
+        provider.close()
     rss_after = zsw.peak_rss_kib()
 
-    order = list(provider.frame_ids)
     ref_idx = int(result.provenance["reference"]["index"])
     reference_frame_id = order[ref_idx] if 0 <= ref_idx < len(order) else None
     excluded = tuple(

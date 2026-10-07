@@ -824,16 +824,19 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
     before (legacy behaviour).
     """
     provider = zfp.MemmapCanonicalProvider(cache_dir)
-    frame_ids = list(provider.frame_ids)
-    images = []
-    supports = []
-    for i in range(provider.n_frames):
-        rgb, sup = provider.get_raw_frame(i)
-        images.append(np.array(rgb, dtype=np.float32, copy=True))
-        supports.append(np.array(sup, dtype=bool, copy=True))
-    # R15: release the memmap handles once the aligned frames are materialised
-    # (Windows: the cache dir is deleted right after this cell).
-    provider.close()
+    try:
+        frame_ids = list(provider.frame_ids)
+        images = []
+        supports = []
+        for i in range(provider.n_frames):
+            rgb, sup = provider.get_raw_frame(i)
+            images.append(np.array(rgb, dtype=np.float32, copy=True))
+            supports.append(np.array(sup, dtype=bool, copy=True))
+    finally:
+        # R15 (rework-1 L1): release the memmap handles ALWAYS, even if the
+        # read/materialise loop raises, so the caller can delete the cache
+        # (Windows: an open .npy cannot be deleted -> WinError 32).
+        provider.close()
     inmem_provider = InMemoryCanonicalProvider(images, supports)
     request = zstream.build_streaming_request(config, inmem_provider.n_frames)
     result = run_canonical_stack_streaming(
@@ -1127,6 +1130,9 @@ def _run_single(
     cache_root = output_dir / CACHE_DIR_NAME
     cache_root.mkdir(parents=True, exist_ok=True)
 
+    # R15 (rework-1 L3): track cache cleanup failures (auditable in the manifest).
+    cleanup_failures: list[str] = []
+
     # GLOBAL PHOTOMETRIC GAUGE (ZM-ZEGRID-R11): one reference + per-frame
     # normalization coefficients/weights computed ONCE over the full canvas,
     # so every Cell shares a single photometric anchor. Frame-major full-canvas
@@ -1162,7 +1168,8 @@ def _run_single(
         callback=progress_callback,
     )
     if gauge_cache_dir.exists():
-        _safe_rmtree(gauge_cache_dir, progress_callback)
+        if not _safe_rmtree(gauge_cache_dir, progress_callback):
+            cleanup_failures.append(str(gauge_cache_dir))
 
     # PER-CELL: build aligned cache (parallel reproject) -> stack -> DELETE cache
     # (per-cell temp reuse: peak disk is the LARGEST single cell, not the sum).
@@ -1280,7 +1287,8 @@ def _run_single(
 
         # Per-cell temp reuse: delete the cell cache after stacking (bounded disk).
         # R15: best-effort (Windows WinError 32 on open handles -> WARN + continue).
-        _safe_rmtree(cache_dir, progress_callback)
+        if not _safe_rmtree(cache_dir, progress_callback):
+            cleanup_failures.append(str(cache_dir))
 
     _cache_rep.end(
         throughput=_fmt_throughput(cache_total_frames, timings.get("cache_build"), "frames/s")
@@ -1319,6 +1327,7 @@ def _run_single(
         "peak_cell_bytes": cache_peak_bytes,
         "n_frame_entries": cache_n_frames,
         "retention": "per-cell temporary (deleted after stacking); gauge cache deleted after use",
+        "cleanup_failures": cleanup_failures,
     }
 
     # Write legacy-compatible outputs.
@@ -1470,6 +1479,10 @@ def _write_outputs(
                   "peak_cell_bytes": int(cache_peak_bytes),
                   "retention": cache_retention,
                   "n_frame_entries": int(cache_files),
+                  "cleanup_failures": {
+                      "count": len((cache_report or {}).get("cleanup_failures", [])),
+                      "paths": list((cache_report or {}).get("cleanup_failures", [])),
+                  },
                   "reused_cells": (cache_report or {}).get("reused", []),
                   "rebuilt_cells": (cache_report or {}).get("rebuilt", [])},
         "timings": (timings.to_dict() if timings is not None else {}),
