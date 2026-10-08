@@ -48,6 +48,7 @@ recorded in ``zegrid_manifest.json``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -1155,6 +1156,38 @@ def _canvas_header(canvas, ndim, channels=None):
     return header
 
 
+def _array_sha256(data: np.ndarray) -> str:
+    """SHA-256 of a float32 array's raw bytes (contiguous, deterministic)."""
+    arr = np.ascontiguousarray(data)
+    return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+def _science_header(
+    canvas,
+    *,
+    role: str,
+    dtype: str,
+    dbe_state: str,
+    sha256: str,
+    related_file: str | None = None,
+) -> fits.Header:
+    """Canvas WCS header + science-output role/relationship metadata.
+
+    ``role`` is ``science_raw`` (immutable pre-finishing reference) or
+    ``science_finished`` (delivered finished float32). ``dbe_state`` is one of
+    ``off`` / ``on`` / ``failed`` / ``n/a``. ``related_file`` records the
+    pre/post-finishing counterpart filename.
+    """
+    header = _canvas_header(canvas, ndim=3, channels=3)
+    header["SCIROLE"] = (role, "science output role")
+    header["SCIDTYPE"] = (dtype, "science array dtype")
+    header["DBESTAT"] = (dbe_state, "DBE finishing state (off/on/failed/n/a)")
+    header["SCIHASH"] = (sha256, "SHA-256 of science array bytes")
+    if related_file:
+        header["SCIREF"] = (related_file, "related pre/post-finishing output")
+    return header
+
+
 # ---------------------------------------------------------------------------
 # Single-pass pipeline (one mount group)
 # ---------------------------------------------------------------------------
@@ -1399,7 +1432,7 @@ def _write_run_log(
     )
     if _reproj.get("fallback_reason"):
         lines.append(f"  fallback_reason: {_reproj.get('fallback_reason')}")
-    lines.append("Final-mosaic finishing (ZM-ZEGRID-R18):")
+    lines.append("Final-mosaic finishing (ZM-ZEGRID-R23):")
     fin = finishing_info or {}
     if not fin or not fin.get("enabled"):
         lines.append("  disabled (no finishing settings applied)")
@@ -1413,9 +1446,22 @@ def _write_run_log(
         )
         lines.append(
             f"  dbe: enabled={dbe.get('enabled')} applied={dbe.get('applied')} "
-            f"strength={dbe.get('strength')} factor={dbe.get('strength_factor')} "
+            f"strength={dbe.get('strength')} "
+            f"params_source={dbe.get('params_source')} "
+            f"subtraction_factor={dbe.get('subtraction_factor')} "
             f"params={dbe.get('params')}"
         )
+        for ch in (dbe.get("channels") or []):
+            if isinstance(ch, dict):
+                before = ch.get("before") or {}
+                after = ch.get("after") or {}
+                lines.append(
+                    f"    ch{ch.get('channel')}: applied={ch.get('applied')} "
+                    f"fallback={ch.get('fallback')} "
+                    f"diffuse_frac={ch.get('diffuse_frac')} star_frac={ch.get('star_frac')} "
+                    f"bg_ref={ch.get('bg_ref')} "
+                    f"neg_frac {before.get('neg_frac')} -> {after.get('neg_frac')}"
+                )
         lines.append(
             f"  rgb_equalize: enabled={rgb.get('enabled')} applied={rgb.get('applied')} "
             f"skies_before={rgb.get('skies_before')} skies_after={rgb.get('skies_after')}"
@@ -1987,6 +2033,12 @@ def _run_single(
         "cleanup_failures": cleanup_failures,
     }
 
+    # ZM-ZEGRID-R23: write the immutable pre-finishing assembled science FIRST,
+    # so a finishing exception can never destroy the scientific reference.
+    raw_science = np.asarray(assembled.science, dtype=np.float32)
+    raw_science_path = output_dir / "mosaic_grid_science.fits"
+    _write_raw_science_fits(assembled, canvas, raw_science_path)
+
     # ZM-ZEGRID-R18: FINAL-MOSAIC FINISHING (post-assembly, before outputs).
     # Opt-in + fail-safe: a finishing failure WARNS and lets the run complete with
     # the raw assembled science (never crashes a run; never silently dropped).
@@ -2039,6 +2091,8 @@ def _run_single(
         fin_uint16=fin_uint16,
         gpu_context=gpu_ctx,
         aggregate_peak_rss_kib=aggregate_peak_rss_kib,
+        raw_science_path=raw_science_path,
+        raw_science=raw_science,
     )
 
     _write_run_log(
@@ -2074,6 +2128,36 @@ def _run_single(
     return sci_path
 
 
+def _write_raw_science_fits(assembled, canvas, raw_science_path):
+    """Write the immutable pre-finishing assembled science FITS.
+
+    Written BEFORE finishing runs so a finishing exception can never destroy the
+    scientific reference. Same WCS/axis layout as the delivered output, float32,
+    never clamped/offset/abs'd. Header records role + dtype + DBE state + hash.
+    """
+    raw_science = np.asarray(assembled.science, dtype=np.float32)
+    raw_data = np.ascontiguousarray(np.moveaxis(raw_science, -1, 0))  # (3, H, W)
+    raw_header = _science_header(
+        canvas,
+        role="science_raw",
+        dtype="float32",
+        dbe_state="n/a",
+        sha256=_array_sha256(raw_data),
+        related_file="mosaic_grid.fits",
+    )
+    _atomic_writeto(fits.PrimaryHDU(raw_data, header=raw_header), raw_science_path)
+    return raw_science_path
+
+
+def _atomic_writeto(hdu, path):
+    """Write a FITS HDU atomically (temp file + rename) so no half-written file
+    is silently presented as valid."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    hdu.writeto(tmp, overwrite=True)
+    os.replace(tmp, path)
+
+
 def _write_outputs(
     assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
     layout, science_config, peak_rss_kib, cache_report, progress_callback,
@@ -2085,6 +2169,8 @@ def _write_outputs(
     finished_science=None, finishing_info=None, fin_uint16=None,
     gpu_context=None,
     aggregate_peak_rss_kib=None,
+    raw_science_path=None,
+    raw_science=None,
 ):
     output_dir = Path(output_dir)
     # ZM-ZEGRID-R18: use the finished science when provided (bit-equal to the raw
@@ -2095,31 +2181,64 @@ def _write_outputs(
     )  # (H, W, 3)
     stack_depth = np.asarray(assembled.stack_depth, dtype=np.int32)  # (H, W)
 
-    sci_header = _canvas_header(canvas, ndim=3, channels=3)
     sci_data = np.ascontiguousarray(np.moveaxis(science, -1, 0))  # (3, H, W)
     sci_path = output_dir / "mosaic_grid.fits"
-    fits.PrimaryHDU(sci_data, header=sci_header).writeto(sci_path, overwrite=True)
+
+    # ZM-ZEGRID-R23: dual float32 output contract.
+    # ``mosaic_grid_science.fits`` is the immutable pre-finishing reference (written
+    # by ``_run_single`` before finishing). ``mosaic_grid.fits`` is the delivered
+    # finished float32 (bit-identical raw content when disabled / finishing failed).
+    if raw_science_path is None:
+        raw_science_path = output_dir / "mosaic_grid_science.fits"
+        _write_raw_science_fits(assembled, canvas, raw_science_path)
+    raw_science_path = Path(raw_science_path)
+
+    dbe_applied = bool((finishing_info or {}).get("dbe", {}).get("applied"))
+    finishing_failed = bool((finishing_info or {}).get("failed"))
+    if finishing_failed:
+        dbe_state = "failed"
+    elif dbe_applied:
+        dbe_state = "on"
+    elif (finishing_info or {}).get("dbe", {}).get("enabled"):
+        dbe_state = "off"
+    else:
+        dbe_state = "off"
+
+    sci_header = _science_header(
+        canvas,
+        role="science_finished",
+        dtype="float32",
+        dbe_state=dbe_state,
+        sha256=_array_sha256(sci_data),
+        related_file=raw_science_path.name,
+    )
+    _atomic_writeto(fits.PrimaryHDU(sci_data, header=sci_header), sci_path)
 
     # ZM-ZEGRID-R18: optional uint16 render (save_final_as_uint16). Documented
-    # linear stretch; the float science FITS above remains the primary product.
+    # linear stretch derived from the DELIVERED finished float32; never a
+    # scientific reference. The float science FITS above remains the primary.
     uint16_path = None
     if fin_uint16 is not None:
         u16 = np.asarray(fin_uint16, dtype=np.uint16)
         u16_header = _canvas_header(canvas, ndim=3, channels=3)
         u16_header["BUNIT"] = ("adu16", "uint16 render (see finishing.uint16)")
+        u16_header["SCIROLE"] = ("uint16_render", "derived render, NOT a science reference")
         _u16_info = (finishing_info or {}).get("uint16", {})
         if "vmin" in _u16_info:
             u16_header["U16VMIN"] = (float(_u16_info["vmin"]), "scaling vmin (float ADU)")
             u16_header["U16VMAX"] = (float(_u16_info["vmax"]), "scaling vmax (float ADU)")
         uint16_path = output_dir / "mosaic_grid_uint16.fits"
-        fits.PrimaryHDU(
-            np.ascontiguousarray(np.moveaxis(u16, -1, 0)), header=u16_header
-        ).writeto(uint16_path, overwrite=True)
+        _atomic_writeto(
+            fits.PrimaryHDU(
+                np.ascontiguousarray(np.moveaxis(u16, -1, 0)), header=u16_header
+            ),
+            uint16_path,
+        )
 
     cov_header = _canvas_header(canvas, ndim=2)
     cov_header["BUNIT"] = ("count", "per-pixel stack depth (max over channels)")
     cov_path = output_dir / "mosaic_grid_coverage.fits"
-    fits.PrimaryHDU(stack_depth, header=cov_header).writeto(cov_path, overwrite=True)
+    _atomic_writeto(fits.PrimaryHDU(stack_depth, header=cov_header), cov_path)
 
     # Cache accounting: prefer the explicit cache_report (per-cell temp reuse)
     # and fall back to summing the manifests (legacy persistent-cache path).
@@ -2240,9 +2359,36 @@ def _write_outputs(
         ),
         "outputs": {
             "science": sci_path.name,
+            "science_raw": raw_science_path.name,
+            "science_finished": sci_path.name,
             "coverage": cov_path.name,
             "uint16": (uint16_path.name if uint16_path is not None else None),
             "run_log": RUN_LOG_NAME,
+        },
+        "science_output_contract": {
+            "note": (
+                "ZM-ZEGRID-R23 dual float32 output: 'science_raw' is the immutable "
+                "pre-finishing assembled science (scientific reference, always "
+                "written); 'science'/'science_finished' is the delivered finished "
+                "float32 (bit-identical to raw when finishing is disabled or failed). "
+                "'uint16' is only an optional render derived from the finished float32, "
+                "never a scientific reference."
+            ),
+            "raw": {
+                "file": raw_science_path.name,
+                "role": "science_raw",
+                "dtype": "float32",
+                "sha256": _array_sha256(np.ascontiguousarray(np.moveaxis(
+                    np.asarray(assembled.science if raw_science is None else raw_science,
+                               dtype=np.float32), -1, 0))),
+            },
+            "finished": {
+                "file": sci_path.name,
+                "role": "science_finished",
+                "dtype": "float32",
+                "dbe_state": dbe_state,
+                "sha256": _array_sha256(sci_data),
+            },
         },
     }
     manifest_path = output_dir / "zegrid_manifest.json"
@@ -2372,7 +2518,9 @@ def run_zegrid_mode(
     )
     _emit(
         f"ZeGrid: final-mosaic finishing — DBE={finishing_config['dbe_enabled']} "
-        f"(strength={finishing_config['dbe_strength']}, factor={finishing_config['dbe_strength_factor']}, "
+        f"(strength={finishing_config['dbe_strength']}, "
+        f"params_source={finishing_config['dbe_params_source']}, "
+        f"subtraction_factor={finishing_config['dbe_subtraction_factor']}, "
         f"params={finishing_config['dbe_params']}), rgb_equalize={finishing_config['rgb_equalize']}, "
         f"uint16={finishing_config['save_uint16']}",
         callback=progress_callback,
