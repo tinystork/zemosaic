@@ -169,26 +169,50 @@ def test_worker_propagates_use_gpu_into_run_zegrid_mode(monkeypatch):
 def test_manifest_gpu_block_truth():
     ctx = {
         "requested": True, "requested_source": "use_gpu_grid", "available": True,
-        "effective": True, "device": "NVIDIA GeForce MX150", "cupy_version": "14.1.1",
+        "attempted": True, "final_effective": True, "actually_used": True,
+        "final_backend": "gpu", "gpu_executed_cells": 6,
+        "device": "NVIDIA GeForce MX150", "cupy_version": "14.1.1",
         "vram_total_bytes": 2 * GB, "vram_free_bytes": int(1.9 * GB),
         "vram_budget_bytes": int(0.95 * GB), "fallback_reason": None,
     }
     block = zz._manifest_gpu_block(True, ctx)
     assert block["used"] is True
+    assert block["actually_used"] is True
+    assert block["final_backend"] == "gpu"
     assert block["requested"] is True
+    assert block["attempted"] is True
     assert block["effective"] is True
+    assert block["gpu_executed_cells"] == 6
     assert block["device"] == "NVIDIA GeForce MX150"
     assert block["backend"]["per_cell_rejection"] == "gpu"
     assert block["backend"]["per_cell_combine"] == "gpu"
     assert block["backend"]["gauge_rejection"] == "cpu"
 
-    # CPU fallback case
-    block2 = zz._manifest_gpu_block(False, {**ctx, "effective": False, "available": False, "fallback_reason": "cupy_or_cuda_unavailable"})
+    # CPU fallback case (start-time unavailable)
+    block2 = zz._manifest_gpu_block(False, {
+        **ctx, "attempted": False, "final_effective": False, "actually_used": False,
+        "final_backend": "cpu", "gpu_executed_cells": 0,
+        "available": False, "fallback_reason": "cupy_or_cuda_unavailable",
+    })
     assert block2["used"] is False
+    assert block2["actually_used"] is False
     assert block2["requested"] is True
     assert block2["effective"] is False
     assert block2["fallback_reason"] == "cupy_or_cuda_unavailable"
     assert block2["backend"]["per_cell_rejection"] == "cpu"
+
+
+def test_manifest_gpu_block_empty_run_cannot_claim_used():
+    """H2: attempted-but-empty (no GPU cells executed) => used=false."""
+    ctx = {
+        "requested": True, "available": True, "attempted": True,
+        "final_effective": False, "actually_used": False, "final_backend": "cpu",
+        "gpu_executed_cells": 0, "fallback_reason": None,
+    }
+    block = zz._manifest_gpu_block(False, ctx)
+    assert block["used"] is False
+    assert block["actually_used"] is False
+    assert block["backend"]["per_cell_rejection"] == "cpu"
 
 
 def test_ignored_settings_drops_gpu_flags_only_when_honoured():
@@ -263,6 +287,52 @@ def test_vram_budget_and_tile_planner():
     # A degenerate (tiny) budget -> None (degrade to CPU).
     assert zgpu.choose_gpu_tile_size(66, 3, (3278, 2403), 1) is None
     assert zgpu.choose_gpu_tile_size(66, 3, (3278, 2403), None) is None
+
+
+def test_vram_budget_never_inflates():
+    """H3: free*fraction < GPU_MIN_VRAM_BUDGET_BYTES => None (degrade), never inflate."""
+    # 10 MiB free -> 5 MiB budget < 64 MiB floor -> None (NOT 64 MiB).
+    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 10 * 2**20}) is None
+    # 100 MiB free -> 50 MiB < 64 MiB -> None (NOT 64 MiB).
+    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 100 * 2**20}) is None
+    # Exactly at 2x the floor (128 MiB free -> 64 MiB) -> accepted.
+    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 128 * 2**20}) == 64 * 2**20
+    # 2 GiB free -> 1 GiB budget.
+    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 2 * 2**30}) == 1 * 2**30
+    # unavailable -> None.
+    assert zgpu.vram_budget_bytes({"available": False, "vram_free_bytes": 2 * 2**30}) is None
+    # unknown free (falls back to total).
+    assert zgpu.vram_budget_bytes({"available": True, "vram_total_bytes": 2 * 2**30, "vram_free_bytes": None}) == 1 * 2**30
+
+
+def test_is_gpu_runtime_error_classifier():
+    """H1: narrow classifier — CuPy errors => True; arbitrary errors => False."""
+    def _mk(name, mod):
+        cls = type(name, (Exception,), {})
+        cls.__module__ = mod
+        return cls
+
+    # Direct CuPy errors.
+    for name, mod in (
+        ("OutOfMemoryError", "cupy.cuda.memory"),
+        ("CUDARuntimeError", "cupy.cuda.runtime"),
+        ("CUDADriverError", "cupy.cuda.driver"),
+        ("CompileException", "cupy.cuda.compiler"),
+    ):
+        assert zgpu.is_gpu_runtime_error(_mk(name, mod)("boom"))
+
+    # Wrapped in cause/context chains.
+    inner = _mk("OutOfMemoryError", "cupy.cuda.memory")("oom")
+    wrapped = RuntimeError("wrapped")
+    wrapped.__cause__ = inner
+    assert zgpu.is_gpu_runtime_error(wrapped)
+
+    # Arbitrary errors must NOT classify as GPU.
+    assert not zgpu.is_gpu_runtime_error(ValueError("science bug"))
+    assert not zgpu.is_gpu_runtime_error(KeyError("missing"))
+    assert not zgpu.is_gpu_runtime_error(MemoryError("plain python OOM"))  # not cupy
+    assert not zgpu.is_gpu_runtime_error(ZeroDivisionError("x / 0"))
+    assert not zgpu.is_gpu_runtime_error(None)
 
 
 # ---------------------------------------------------------------------------

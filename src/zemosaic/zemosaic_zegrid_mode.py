@@ -1116,6 +1116,7 @@ def _stack_cell(task):
     record = {
         "cell_id": cid, "row": cell.row, "col": cell.col, "status": "complete",
         "mode": mode, "n_contributors": len(mem.patch_ids),
+        "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
         "reference_frame_id": sres.reference_frame_id,
         "reference_frame_role": prov["reference_frame_role"],
         "bookkeeping_reference_frame_id": prov["bookkeeping_reference_frame_id"],
@@ -1129,6 +1130,7 @@ def _stack_cell(task):
 
     return {
         "cell_id": cid, "status": "complete", "core": core, "record": record,
+        "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
         "n_frames": int(manifest.get("n_frames", 0)),
         "total_bytes": int(manifest.get("total_bytes", 0)),
         "cache_build_s": cache_build_s, "stack_s": stack_s,
@@ -1232,29 +1234,35 @@ def _append_run_log_line(output_dir, line):
 
 
 def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
-    """ZM-ZEGRID-R22: build the truthful manifest ``gpu`` block.
+    """ZM-ZEGRID-R22 (rework-1): truthful manifest ``gpu`` block from EXECUTION evidence.
 
-    Distinguishes requested / available / effective / device / VRAM (total + budget)
-    and the fallback/degrade reason. ``used`` is the EFFECTIVE backend (never
-    claimed from CuPy initialisation alone); the ``backend`` fields report which
-    canonical stage actually ran on the GPU (rejection + combine only; gauge /
-    normalization / weighting / support are CPU by the frozen contract).
+    ``used`` / ``effective`` / ``backend`` are derived from the ACTUAL executed
+    cells (per-cell ``backend_used`` aggregated in ``_run_single``), never from the
+    start-time selection alone. Distinguishes requested / available / attempted
+    (selected) / final_effective / actually_used / final_backend + start-time and
+    runtime fallback reasons.
     """
     ctx = gpu_context or {}
-    eff = bool(gpu_used)
-    backend = "gpu" if eff else "cpu"
+    actually_used = bool(ctx.get("actually_used"))
+    final_backend = ctx.get("final_backend") or ("gpu" if actually_used else "cpu")
+    backend = "gpu" if actually_used else "cpu"
     return {
-        "used": eff,
+        "used": actually_used,
         "requested": bool(ctx.get("requested")),
         "requested_source": ctx.get("requested_source"),
         "available": bool(ctx.get("available")),
-        "effective": eff,
+        "attempted": bool(ctx.get("attempted")),
+        "effective": bool(ctx.get("final_effective", ctx.get("attempted"))),
+        "actually_used": actually_used,
+        "final_backend": final_backend,
+        "gpu_executed_cells": ctx.get("gpu_executed_cells"),
         "device": ctx.get("device"),
         "cupy_version": ctx.get("cupy_version"),
         "vram_total_bytes": ctx.get("vram_total_bytes"),
         "vram_free_bytes": ctx.get("vram_free_bytes"),
         "vram_budget_bytes": ctx.get("vram_budget_bytes"),
         "fallback_reason": ctx.get("fallback_reason"),
+        "runtime_fallback": ctx.get("runtime_fallback"),
         "backend": {
             "gauge_rejection": "cpu",
             "gauge_combine": "cpu",
@@ -1313,7 +1321,12 @@ def _write_run_log(
     _gctx = gpu_context or {}
     lines.append(
         f"  requested: {bool(_gctx.get('requested'))} (source={_gctx.get('requested_source')})  "
-        f"available: {bool(_gctx.get('available'))}  effective: {bool(_gctx.get('effective'))}"
+        f"available: {bool(_gctx.get('available'))}  attempted: {bool(_gctx.get('attempted'))}"
+    )
+    lines.append(
+        f"  actually_used: {bool(_gctx.get('actually_used'))}  "
+        f"final_backend: {_gctx.get('final_backend')}  "
+        f"gpu_executed_cells: {_gctx.get('gpu_executed_cells')}"
     )
     if _gctx.get("device"):
         lines.append(
@@ -1323,6 +1336,9 @@ def _write_run_log(
         )
     if _gctx.get("fallback_reason"):
         lines.append(f"  fallback_reason: {_gctx.get('fallback_reason')}")
+    if _gctx.get("runtime_fallback"):
+        _rf = _gctx["runtime_fallback"]
+        lines.append(f"  runtime_fallback: type={_rf.get('type')} reason={_rf.get('reason')}")
     lines.append(f"  {zin.describe_gpu_usage()}")
     lines.append("")
     lines.append("Ignored product settings (ZeGrid honours use_gpu_* / stack_use_gpu; "
@@ -1747,6 +1763,10 @@ def _run_single(
             science_config = replace(science_config, backend="cpu")
             gpu_ctx = dict(gpu_ctx)
             gpu_ctx["effective"] = False
+            gpu_ctx["attempted"] = False
+            gpu_ctx["final_effective"] = False
+            gpu_ctx["actually_used"] = False
+            gpu_ctx["final_backend"] = "cpu"
             gpu_ctx["fallback_reason"] = gpu_ctx.get("fallback_reason") or "vram_tile_infeasible"
             ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
         else:
@@ -1787,14 +1807,84 @@ def _run_single(
         _stack_rep.progress(int(done), item_id=cid)
 
     t_block0 = time.perf_counter()
-    results = zpar.pmap(
-        _stack_cell, cell_tasks, workers=cells_in_flight,
-        progress_callback=_cell_progress, emit=_emit_live, meta=per_cell_meta,
-        initializer=_init_stack_worker,
-        initargs=(descs, canvas, science_config, global_gauge, global_frame_ids,
-                  global_reference_frame_id, gpu_tile_size, cache_workers_per_cell),
-    )
+
+    def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt):
+        """Run the WHOLE per-cell batch once; returns (results, meta).
+
+        ``gpu_attempt=True`` disables pmap's SAME-config serial retry (serial_fallback
+        False) so a CuPy OOM/driver error propagates here for a one-shot CPU rerun
+        instead of being retried with the same GPU config (which would repeat the
+        error and crash).
+        """
+        _meta = {}
+        _res = zpar.pmap(
+            _stack_cell, cell_tasks, workers=cells_in_flight,
+            progress_callback=_cell_progress, emit=_emit_live, meta=_meta,
+            initializer=_init_stack_worker,
+            initargs=(descs, canvas, science_cfg, global_gauge, global_frame_ids,
+                      global_reference_frame_id, tile_size, cache_workers_per_cell),
+            serial_fallback=not gpu_attempt,
+        )
+        return _res, _meta
+
+    runtime_gpu_fallback = None
+    if gpu_used:
+        try:
+            results, per_cell_meta = _run_cell_batch(
+                science_config, gpu_tile_size, gpu_attempt=True
+            )
+        except Exception as exc:
+            if zgpu.is_gpu_runtime_error(exc):
+                # H1: classified GPU runtime failure -> one-shot exact-CPU
+                # whole-batch rerun (WARN, recorded; no recursion).
+                runtime_gpu_fallback = {"reason": repr(exc), "type": type(exc).__name__}
+                _emit(
+                    f"ZeGrid: GPU RUNTIME failure ({type(exc).__name__}); "
+                    f"degrading to exact CPU whole-batch rerun (no silent fallback): {exc}",
+                    lvl="WARN", callback=progress_callback,
+                )
+                gpu_used = False
+                science_config = replace(science_config, backend="cpu")
+                gpu_ctx = dict(gpu_ctx)
+                gpu_ctx["effective"] = False
+                gpu_ctx["final_effective"] = False
+                gpu_ctx["actually_used"] = False
+                gpu_ctx["final_backend"] = "cpu"
+                gpu_ctx["runtime_fallback"] = runtime_gpu_fallback
+                ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
+                # Clean any partial per-cell cache left by the failed GPU workers
+                # (bounded disk + Windows file-lock safety: the failed workers are
+                # already closed when pmap re-raised; deletion is best-effort).
+                for _t in cell_tasks:
+                    if _t[4] is not None:
+                        _safe_rmtree(_t[3], None)
+                # Rerun the WHOLE batch exactly once on CPU (no recursion).
+                results, per_cell_meta = _run_cell_batch(
+                    science_config, STREAM_TILE_SIZE, gpu_attempt=False
+                )
+            else:
+                raise  # arbitrary science/programming error propagates (never swallowed)
+    else:
+        results, per_cell_meta = _run_cell_batch(
+            science_config, gpu_tile_size, gpu_attempt=False
+        )
+
     block_wall = time.perf_counter() - t_block0
+
+    # H2: actual backend EVIDENCE from the executed cells (never the selection).
+    # `used=true` only when a successful cell actually ran the GPU canonical and
+    # no whole-batch CPU rerun replaced it.
+    gpu_executed_cells = sum(
+        1 for r in results
+        if r.get("status") == "complete" and r.get("backend_used") == "gpu"
+    )
+    actually_used_gpu = bool(gpu_executed_cells > 0 and runtime_gpu_fallback is None)
+    gpu_ctx = dict(gpu_ctx)
+    gpu_ctx["gpu_executed_cells"] = int(gpu_executed_cells)
+    gpu_ctx["actually_used"] = bool(actually_used_gpu)
+    gpu_ctx["final_backend"] = "gpu" if actually_used_gpu else "cpu"
+    gpu_ctx["final_effective"] = bool(actually_used_gpu)
+    gpu_used = bool(actually_used_gpu)
 
     # R20 diagnostics (mirrors the R19 gauge diagnostics): effective executor,
     # parent daemon flag, workers/cells-in-flight, seconds/unit.
@@ -2234,7 +2324,17 @@ def run_zegrid_mode(
         "requested": bool(gpu_requested),
         "requested_source": gpu_source,
         "available": bool(gpu_probe["available"]),
+        # ZM-ZEGRID-R22 rework-1: distinguish SELECTED (attempted) from EXECUTED
+        # (actually_used). ``effective`` stays for back-compat (== attempted at
+        # start); ``actually_used``/``final_backend`` are filled in `_run_single`
+        # from per-cell execution evidence (H2).
+        "attempted": bool(gpu_effective),
         "effective": bool(gpu_effective),
+        "final_effective": bool(gpu_effective),
+        "actually_used": False,
+        "final_backend": "gpu" if gpu_effective else "cpu",
+        "gpu_executed_cells": 0,
+        "runtime_fallback": None,
         "device": gpu_probe["device"],
         "cupy_version": gpu_probe["cupy_version"],
         "vram_total_bytes": gpu_probe["vram_total_bytes"],

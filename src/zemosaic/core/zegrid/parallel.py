@@ -383,11 +383,18 @@ def _parent_is_daemonic() -> bool:
         return False
 
 
-def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, initargs=(), emit=None, meta=None):
+def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, initargs=(), emit=None, meta=None, serial_fallback: bool = True):
     """Run ``worker`` over ``tasks`` in order; returns a list of results.
 
     ``worker`` must be a module-level (picklable-by-reference) pure function of
     one task argument. Serial fallback when ``workers <= 1`` or ``len(tasks) < 2``.
+
+    ``serial_fallback`` (ZM-ZEGRID-R22): when True (default), a parallel-path
+    failure degrades to the serial loop with the SAME worker (the historical
+    fail-safe). When False, the exception is RE-RAISED instead of retrying serially
+    — used by the GPU cell batch so a CuPy OOM/driver error is NOT retried with the
+    SAME GPU config (which would repeat the error and crash); the caller then owns
+    the one-shot exact-CPU whole-batch rerun.
 
     ``progress_callback`` (optional) is ``callable(done, total)`` invoked after
     each completed task (1-based ``done``, ``total`` = number of tasks), used by
@@ -524,6 +531,10 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         _finish(meta, t0, total)
         return out
     except Exception as exc:  # noqa: BLE001 - fail-safe: never let parallelism crash
+        if not serial_fallback:
+            # ZM-ZEGRID-R22: re-raise instead of the SAME-config serial retry (the
+            # caller classifies the error and owns the one-shot CPU rerun).
+            raise
         log.warning(
             "[ZEGRID] parallel map unavailable (%s: %s); falling back to serial",
             type(exc).__name__,

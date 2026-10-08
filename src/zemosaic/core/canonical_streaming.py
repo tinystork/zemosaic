@@ -131,6 +131,26 @@ _REJECT_TOKEN_REMOVED = "unsupported_removed_sci05"
 _COMBINE_METHODS = ("mean", "median")
 
 
+def _release_gpu_workspace(xp) -> None:
+    """Best-effort release of the CuPy allocator pool between tiles (never raises).
+
+    CuPy's default memory pool does not return freed blocks to the device, so the
+    device high-water can grow across a tile loop. Freeing the pool's unused blocks
+    (and syncing the default stream) bounds the high-water by a small number of
+    tiles. A no-op for NumPy.
+    """
+    if xp is np:
+        return
+    try:
+        xp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    try:
+        xp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Provider contract
 # ---------------------------------------------------------------------------
@@ -926,6 +946,14 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         rejected_count += int(rej_int.sum())
         low_n_count += int((init_int.sum(axis=0) < 3).sum())
         degenerate_count += int(degenerate_seen_host.reshape(th, tw, c)[iy0:iy1, ix0:ix1, :].sum())
+
+        # ZM-ZEGRID-R22 (H3 rework-1): release per-tile device workspace between
+        # tiles. CuPy's default allocator pool does not return freed blocks to the
+        # device, so without this the high-water would grow across the whole patch
+        # (N x full-cell equivalent). free_all_blocks() + a null-stream sync bounds
+        # the device high-water by a small number of tiles, never the patch.
+        if xp is not np:
+            _release_gpu_workspace(xp)
 
     # --- restore shapes + n_eff + diagnostics ---
     rejected_fraction = (rejected_count / initial_count) if initial_count > 0 else 0.0
