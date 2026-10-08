@@ -76,6 +76,7 @@ from .core.zegrid import execution as zxe
 from .core.zegrid import file_provider as zfp
 from .core.zegrid import final_mosaic_finishing as zfin
 from .core.zegrid import geometry as zg
+from .core.zegrid import gpu as zgpu
 from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
 from .core.zegrid import observability as zobs
@@ -190,6 +191,70 @@ def _resolve_normalization(stack_norm_method) -> str:
 def resolve_normalization(stack_norm_method) -> str:
     """Public wrapper (testable) — see :func:`_resolve_normalization`."""
     return _resolve_normalization(stack_norm_method)
+
+
+# ---------------------------------------------------------------------------
+# GPU preference resolution (ZM-ZEGRID-R22): ONE canonical bool with explicit
+# precedence + strict coercion, resolved from the generic argument and the
+# product's GPU flags. This is the single source of truth for whether the
+# user asked for GPU in the ZeGrid engine.
+# ---------------------------------------------------------------------------
+
+# Resolution order (first non-None wins) for the zconfig GPU flags. ``use_gpu_grid``
+# is the grid-specific flag (most direct for the ZeGrid engine); ``stack_use_gpu`` /
+# ``use_gpu_stack`` are the stacking flags; ``use_gpu_phase5`` is the GUI canonical
+# phase-5 checkbox that ``_normalize_gpu_flags`` synchronises the others onto.
+_GPU_PREFERENCE_KEYS = ("use_gpu_grid", "stack_use_gpu", "use_gpu_stack", "use_gpu_phase5")
+
+
+def _coerce_bool_pref(value):
+    """Strict bool coercion for a GPU preference flag (None-aware).
+
+    Returns ``True``/``False`` for an explicit value, or ``None`` when the value
+    is absent/empty/unparseable (so the caller falls through to the next source).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if t in {"0", "false", "no", "off", "disable", "disabled", "none", ""}:
+            return False
+        return None
+    try:
+        return bool(value)
+    except Exception:
+        return None
+
+
+def resolve_gpu_preference(use_gpu=None, zconfig=None):
+    """Resolve ONE canonical GPU preference with explicit precedence.
+
+    Precedence (first explicit, non-None value wins):
+      1. the generic ``use_gpu`` argument (explicit caller intent);
+      2. ``use_gpu_grid`` (grid-specific GUI flag);
+      3. ``stack_use_gpu`` (stacking GPU flag);
+      4. ``use_gpu_stack`` (legacy alias);
+      5. ``use_gpu_phase5`` (GUI canonical phase-5 flag).
+
+    Returns ``(requested: bool, source: str)``. Unparseable/absent values are
+    treated as unset (fall through); the default is ``(False, "default")``.
+    """
+    if use_gpu is not None:
+        v = _coerce_bool_pref(use_gpu)
+        if v is not None:
+            return bool(v), "argument"
+    if zconfig is not None:
+        for key in _GPU_PREFERENCE_KEYS:
+            v = _coerce_bool_pref(getattr(zconfig, key, None))
+            if v is not None:
+                return bool(v), key
+    return False, "default"
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +966,7 @@ def _build_cell_sres(result, frame_ids):
     )
 
 
-def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
+def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, tile_size=None):
     """In-memory cell run: aligned frames resident, single-tile streaming executor.
 
     ZM-ZEGRID-R11: the in-memory path now goes through
@@ -910,6 +975,10 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
     fixed photometric gauge as the streaming path. ``fixed`` is the Cell-local
     :class:`FixedNormalization`; when None the per-Cell phase-1 is computed as
     before (legacy behaviour).
+
+    ``tile_size`` (ZM-ZEGRID-R22): ``None`` keeps the legacy single-tile full-patch
+    CPU behaviour; a bounded tile is passed when the cell runs on the GPU so the
+    device never materialises ``N x full-cell`` (VRAM-bounded).
     """
     provider = zfp.MemmapCanonicalProvider(cache_dir)
     try:
@@ -928,7 +997,7 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
     inmem_provider = InMemoryCanonicalProvider(images, supports)
     request = zstream.build_streaming_request(config, inmem_provider.n_frames)
     result = run_canonical_stack_streaming(
-        inmem_provider, request, tile_size=None, fixed=fixed
+        inmem_provider, request, tile_size=tile_size, fixed=fixed
     )
     sres = _build_cell_sres(result, frame_ids)
     mt = za.extract_minitile(patch, sres)
@@ -965,18 +1034,22 @@ _STACK_GAUGE = None
 _STACK_GLOBAL_FRAME_IDS = None
 _STACK_GLOBAL_REF = None
 _STACK_TILE_SIZE = STREAM_TILE_SIZE
+_STACK_CACHE_WORKERS = 1
 
 
-def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id):
+def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id, tile_size=STREAM_TILE_SIZE, cache_workers=1):
     """Child/parent initializer: publish the read-only per-cell stack inputs."""
     global _STACK_DESCS, _STACK_CANVAS, _STACK_CONFIG, _STACK_GAUGE
-    global _STACK_GLOBAL_FRAME_IDS, _STACK_GLOBAL_REF
+    global _STACK_GLOBAL_FRAME_IDS, _STACK_GLOBAL_REF, _STACK_TILE_SIZE
+    global _STACK_CACHE_WORKERS
     _STACK_DESCS = descs
     _STACK_CANVAS = canvas
     _STACK_CONFIG = science_config
     _STACK_GAUGE = global_gauge
     _STACK_GLOBAL_FRAME_IDS = global_frame_ids
     _STACK_GLOBAL_REF = global_reference_frame_id
+    _STACK_TILE_SIZE = tile_size
+    _STACK_CACHE_WORKERS = cache_workers
 
 
 def _stack_cell(task):
@@ -1000,11 +1073,14 @@ def _stack_cell(task):
                 "reproject": None}
     cache_dir = Path(cache_dir)
 
-    # Build the cell cache (serialised: workers=1 -> no nested pool).
+    # Build the cell cache (parallel reproject; the worker count is bounded by
+    # the joint planner — full budget when only one cell is active, cpu//K for K
+    # concurrent cells, so the total never explodes to K x cache_build_workers).
     zxe.reset_reproject_path_stats()
     t0 = time.perf_counter()
     manifest = _build_one_cell_cache(
-        _STACK_DESCS, _STACK_CANVAS, cell, patch, mem, cache_dir, workers=1
+        _STACK_DESCS, _STACK_CANVAS, cell, patch, mem, cache_dir,
+        workers=int(_STACK_CACHE_WORKERS),
     )
     cache_build_s = time.perf_counter() - t0
 
@@ -1020,7 +1096,12 @@ def _stack_cell(task):
 
     t0 = time.perf_counter()
     if mode == "inmem":
-        mt, sres = _run_cell_inmem(cache_dir, patch, _STACK_CONFIG, None, fixed=cell_fixed)
+        # ZM-ZEGRID-R22: when the cell runs on the GPU, use the VRAM-bounded tile
+        # size (never a single N x full-cell tile); CPU keeps the legacy
+        # single-tile full-patch behaviour.
+        inmem_tile = _STACK_TILE_SIZE if getattr(_STACK_CONFIG, "backend", "cpu") == "gpu" else None
+        mt, sres = _run_cell_inmem(cache_dir, patch, _STACK_CONFIG, None,
+                                   fixed=cell_fixed, tile_size=inmem_tile)
     else:
         mt, sres = _run_cell_stream(cache_dir, patch, _STACK_CONFIG, None,
                                     tile_size=_STACK_TILE_SIZE, fixed=cell_fixed)
@@ -1150,6 +1231,40 @@ def _append_run_log_line(output_dir, line):
         pass
 
 
+def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
+    """ZM-ZEGRID-R22: build the truthful manifest ``gpu`` block.
+
+    Distinguishes requested / available / effective / device / VRAM (total + budget)
+    and the fallback/degrade reason. ``used`` is the EFFECTIVE backend (never
+    claimed from CuPy initialisation alone); the ``backend`` fields report which
+    canonical stage actually ran on the GPU (rejection + combine only; gauge /
+    normalization / weighting / support are CPU by the frozen contract).
+    """
+    ctx = gpu_context or {}
+    eff = bool(gpu_used)
+    backend = "gpu" if eff else "cpu"
+    return {
+        "used": eff,
+        "requested": bool(ctx.get("requested")),
+        "requested_source": ctx.get("requested_source"),
+        "available": bool(ctx.get("available")),
+        "effective": eff,
+        "device": ctx.get("device"),
+        "cupy_version": ctx.get("cupy_version"),
+        "vram_total_bytes": ctx.get("vram_total_bytes"),
+        "vram_free_bytes": ctx.get("vram_free_bytes"),
+        "vram_budget_bytes": ctx.get("vram_budget_bytes"),
+        "fallback_reason": ctx.get("fallback_reason"),
+        "backend": {
+            "gauge_rejection": "cpu",
+            "gauge_combine": "cpu",
+            "per_cell_rejection": backend,
+            "per_cell_combine": backend,
+        },
+        "note": zin.GPU_USAGE_NOTE,
+    }
+
+
 def _write_run_log(
     output_dir,
     timings,
@@ -1169,6 +1284,8 @@ def _write_run_log(
     gauge_diagnostics=None,
     per_cell_diagnostics=None,
     finishing_info=None,
+    gpu_context=None,
+    aggregate_peak_rss_kib=None,
 ):
     """Append the run-log SUMMARY into the output folder.
 
@@ -1193,9 +1310,23 @@ def _write_run_log(
     lines.append("")
     lines.append("GPU usage:")
     lines.append(f"  used: {bool(gpu_used)}")
+    _gctx = gpu_context or {}
+    lines.append(
+        f"  requested: {bool(_gctx.get('requested'))} (source={_gctx.get('requested_source')})  "
+        f"available: {bool(_gctx.get('available'))}  effective: {bool(_gctx.get('effective'))}"
+    )
+    if _gctx.get("device"):
+        lines.append(
+            f"  device: {_gctx.get('device')}  cupy={_gctx.get('cupy_version')}  "
+            f"vram_total={_gctx.get('vram_total_bytes')}  vram_free={_gctx.get('vram_free_bytes')}  "
+            f"budget={_gctx.get('vram_budget_bytes')}"
+        )
+    if _gctx.get("fallback_reason"):
+        lines.append(f"  fallback_reason: {_gctx.get('fallback_reason')}")
     lines.append(f"  {zin.describe_gpu_usage()}")
     lines.append("")
-    lines.append("Ignored product settings (ZeGrid is CPU-only + no post-stack processing):")
+    lines.append("Ignored product settings (ZeGrid honours use_gpu_* / stack_use_gpu; "
+                 "no post-stack processing):")
     lines.extend(zin.ignored_settings_warning_lines(ignored_settings))
     lines.append("")
     lines.append("Accepted-but-ignored run_zegrid_mode arguments:")
@@ -1279,6 +1410,10 @@ def _write_run_log(
         )
     lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
+    lines.append(
+        f"aggregate_peak_rss_kib: {aggregate_peak_rss_kib if aggregate_peak_rss_kib is not None else 'n/a'} "
+        "(parent + cell workers, UPPER BOUND incl. per-worker import baseline)"
+    )
     lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
     lines.append(f"photometric_gauge.global_reference_frame_id: {global_reference_frame_id}")
     text = "\n".join(lines) + "\n"
@@ -1304,6 +1439,7 @@ def _run_single(
     workers=None,
     ignored_run_args=None,
     finishing_config=None,
+    gpu_context=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1339,16 +1475,31 @@ def _run_single(
             global_eta=global_eta.estimate,
         )
 
-    # Explicit GPU-usage + ignored-settings surfacing (nothing silently ignored).
-    gpu_used = False  # ZeGrid engine is CPU-only.
-    ignored_settings = zin.ignored_settings_present(zconfig)
+    # ZM-ZEGRID-R22: explicit GPU-usage + ignored-settings surfacing (nothing
+    # silently ignored). ``gpu_used`` is the EFFECTIVE GPU backend (never claimed
+    # from CuPy initialisation alone); ``gpu_context`` carries the requested /
+    # available / effective / device / VRAM truth + fallback reason.
+    gpu_ctx = gpu_context or {}
+    gpu_used = bool(gpu_ctx.get("effective"))
+    ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=gpu_used)
     if ignored_settings:
         for line in zin.ignored_settings_warning_lines(ignored_settings):
             _emit(line, lvl="WARN", callback=progress_callback)
-    _emit(
-        f"ZeGrid: GPU usage — {zin.describe_gpu_usage()}",
-        callback=progress_callback,
-    )
+    if gpu_used:
+        _emit(
+            f"ZeGrid: GPU backend ENABLED — device={gpu_ctx.get('device')} "
+            f"vram_total={gpu_ctx.get('vram_total_bytes')} "
+            f"vram_free={gpu_ctx.get('vram_free_bytes')} "
+            f"budget={gpu_ctx.get('vram_budget_bytes')}",
+            callback=progress_callback,
+        )
+    else:
+        _emit(
+            f"ZeGrid: CPU backend (gpu requested={gpu_ctx.get('requested')} "
+            f"available={gpu_ctx.get('available')} "
+            f"reason={gpu_ctx.get('fallback_reason')})",
+            callback=progress_callback,
+        )
 
     _emit(f"ZeGrid: setup — {len(frames_info)} frame(s) -> {output_dir}", callback=progress_callback)
     _setup_rep = _reporter()
@@ -1508,28 +1659,103 @@ def _run_single(
     # x the largest cell, not the sum). A concurrent-path failure WARNs loudly and
     # degrades to the serial loop via pmap's fail-safe (never crash, never silent).
     available_now = available_memory_bytes()
-    cell_tasks = []
+    per_cell_budget = int(available_now * zpar.RAM_SAFETY_FRACTION)
+    cell_specs = []          # (cell, patch, mem, cache_dir, inmem_b | None, stream_b)
+    cell_bound_pairs = []    # (inmem_b, stream_b) for the joint planner (non-empty)
     for (row, col, cell, patch, mem) in cell_ctxs:
         cid = cell.cell_id
         idx = row * nx + col
         if not mem.patch_ids:
-            cell_tasks.append((cell, patch, mem, str(cache_root / cid), None, 0))
+            cell_specs.append((cell, patch, mem, str(cache_root / cid), None, 0))
             continue
         n = len(mem.patch_ids)
         area = patch.patch.width * patch.patch.height
-        mode, bound = _pick_mode(n, area, patch.patch_shape_hw, available_now)
+        inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
+        stream_b = _estimate_streaming_bytes(n, patch.patch_shape_hw, STREAM_TILE_SIZE)
+        cell_bound_pairs.append((inmem_b, stream_b))
+        cell_specs.append((cell, patch, mem, str(cache_root / cid), inmem_b, stream_b))
         _emit(
             f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) N={n} area={area}px "
-            f"mode={mode} bound={bound / 2**20:.1f}MiB",
+            f"inmem={inmem_b / 2**20:.1f}MiB stream={stream_b / 2**20:.1f}MiB",
             callback=progress_callback,
         )
-        cell_tasks.append((cell, patch, mem, str(cache_root / cid), mode, bound))
+
+    # ZM-ZEGRID-R22: JOINT mode + concurrency planner (replaces the R20 two-step
+    # trap: 'pick inmem per cell, then discover concurrency=1'). One explicit
+    # candidate plan compares safe in-memory vs safe streaming concurrency against
+    # the CPU RAM AND (when GPU) the single-device owner constraint, and the
+    # chosen concurrency is recorded verbatim in the manifest (never a silent
+    # serial surprise).
+    _plan = zpar.plan_cell_concurrency(
+        cell_bound_pairs, os.cpu_count(), per_cell_budget,
+        gpu_backend=gpu_used, cache_build_workers=cache_build_workers,
+    )
+    chosen_mode = _plan["mode"]
+    cells_in_flight = int(_plan["cells_in_flight"])
+    cache_workers_per_cell = int(_plan["cache_workers_per_cell"])
+    _emit(
+        f"ZeGrid: joint plan — mode={chosen_mode} cells_in_flight={cells_in_flight} "
+        f"cache_workers_per_cell={cache_workers_per_cell} "
+        f"gpu_serialized={_plan['gpu_serialized']} — {_plan['chosen_reason']}",
+        callback=progress_callback,
+    )
+    for c in _plan["candidates"]:
+        _emit(
+            f"ZeGrid: plan candidate mode={c['mode']} cells_in_flight={c['cells_in_flight']} "
+            f"max_bound={c['max_bound_bytes'] / 2**20:.1f}MiB "
+            f"makespan_rel={c['makespan_rel']:.3f}",
+            callback=progress_callback,
+        )
+
+    # Build the final cell tasks with the CHOSEN uniform mode + its bound.
+    cell_tasks = []
+    for (cell, patch, mem, cache_dir, inmem_b, stream_b) in cell_specs:
+        if inmem_b is None:
+            cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
+        elif chosen_mode == "inmem":
+            cell_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
+        else:
+            cell_tasks.append((cell, patch, mem, cache_dir, "stream", stream_b))
 
     per_cell_footprint = max((t[5] for t in cell_tasks if t[4] is not None), default=0)
-    per_cell_budget = int(available_now * zpar.RAM_SAFETY_FRACTION)
-    cells_in_flight = zpar.cells_in_flight(
-        os.cpu_count(), per_cell_budget, per_cell_footprint
+
+    # ZM-ZEGRID-R22: VRAM-bounded GPU tile size for the stack phase (when the GPU
+    # backend is effective). Single GPU owner => stack tasks are serialised; the
+    # tile size is a pure function of (max N, worst patch, VRAM budget) so the
+    # device never materialises N x full-cell. A degenerate (None) tile degrades
+    # LOUDLY to exact CPU (no silent fallback).
+    gpu_tile_size = STREAM_TILE_SIZE
+    if gpu_used:
+        max_n = max((len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids), default=1)
+        worst_hw = (1, 1)
+        worst_area = -1
+        for (_r, _c, _ce, _p, m) in cell_ctxs:
+            if m.patch_ids:
+                hw = _p.patch_shape_hw
+                area = hw[0] * hw[1]
+                if area > worst_area:
+                    worst_area = area
+                    worst_hw = hw
+        _gpu_ts = zgpu.choose_gpu_tile_size(max_n, 3, worst_hw, gpu_ctx.get("vram_budget_bytes"))
+        if _gpu_ts is None:
+            _emit(
+                "ZeGrid: VRAM budget cannot hold even a minimum GPU tile for the "
+                "heaviest cell; degrading to exact CPU (no silent fallback)",
+                lvl="WARN", callback=progress_callback,
+            )
+            gpu_used = False
+            science_config = replace(science_config, backend="cpu")
+            gpu_ctx = dict(gpu_ctx)
+            gpu_ctx["effective"] = False
+            gpu_ctx["fallback_reason"] = gpu_ctx.get("fallback_reason") or "vram_tile_infeasible"
+            ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
+        else:
+            gpu_tile_size = _gpu_ts
+    _emit(
+        f"ZeGrid: stack tile size={gpu_tile_size} backend={science_config.backend}",
+        callback=progress_callback,
     )
+
     _emit(
         f"ZeGrid: per-cell concurrency — cells_in_flight={cells_in_flight} "
         f"(cpu={os.cpu_count()}, avail={available_now / 2**30:.2f}GiB, "
@@ -1548,6 +1774,11 @@ def _run_single(
         "per_cell_footprint_bytes": int(per_cell_footprint),
         "cells": int(len(cell_tasks)),
         "cache_build_workers": int(cache_build_workers),
+        "mode": chosen_mode,
+        "cache_workers_per_cell": int(cache_workers_per_cell),
+        "gpu_serialized": bool(_plan.get("gpu_serialized")),
+        "plan_chosen_reason": _plan.get("chosen_reason"),
+        "plan_candidates": _plan.get("candidates"),
     }
     per_cell_meta = {}
 
@@ -1561,7 +1792,7 @@ def _run_single(
         progress_callback=_cell_progress, emit=_emit_live, meta=per_cell_meta,
         initializer=_init_stack_worker,
         initargs=(descs, canvas, science_config, global_gauge, global_frame_ids,
-                  global_reference_frame_id),
+                  global_reference_frame_id, gpu_tile_size, cache_workers_per_cell),
     )
     block_wall = time.perf_counter() - t_block0
 
@@ -1636,6 +1867,12 @@ def _run_single(
     with timings.timed("assembly"):
         assembled = zmosaic.assemble_canvas(canvas, nx, ny, cores)
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
+    # ZM-ZEGRID-R22 honesty fix: peak_rss_kib is a SINGLE process's peak. Report
+    # the batch aggregate (parent + all cell workers) as a clearly-labelled UPPER
+    # bound alongside it, so the manifest no longer under-states parallel memory.
+    aggregate_peak_rss_kib = zsw.aggregate_peak_rss_kib(
+        zsw.peak_rss_kib(), [r.get("peak_rss_kib", 0) for r in results]
+    )
     _assembly_rep.end(
         throughput=_fmt_throughput(len(assembled.complete_cells), timings.get("assembly"), "cells/s")
     )
@@ -1710,6 +1947,8 @@ def _run_single(
         per_cell_diagnostics=per_cell_diagnostics,
         finished_science=finished_science, finishing_info=finishing_info,
         fin_uint16=fin_uint16,
+        gpu_context=gpu_ctx,
+        aggregate_peak_rss_kib=aggregate_peak_rss_kib,
     )
 
     _write_run_log(
@@ -1730,6 +1969,8 @@ def _run_single(
         gauge_diagnostics=gauge_diagnostics,
         per_cell_diagnostics=per_cell_diagnostics,
         finishing_info=finishing_info,
+        gpu_context=gpu_ctx,
+        aggregate_peak_rss_kib=aggregate_peak_rss_kib,
     )
 
     _emit(
@@ -1752,6 +1993,8 @@ def _write_outputs(
     gauge_diagnostics=None,
     per_cell_diagnostics=None,
     finished_science=None, finishing_info=None, fin_uint16=None,
+    gpu_context=None,
+    aggregate_peak_rss_kib=None,
 ):
     output_dir = Path(output_dir)
     # ZM-ZEGRID-R18: use the finished science when provided (bit-equal to the raw
@@ -1884,7 +2127,7 @@ def _write_outputs(
                   "reused_cells": (cache_report or {}).get("reused", []),
                   "rebuilt_cells": (cache_report or {}).get("rebuilt", [])},
         "timings": (timings.to_dict() if timings is not None else {}),
-        "gpu": {"used": bool(gpu_used), "note": zin.GPU_USAGE_NOTE},
+        "gpu": _manifest_gpu_block(gpu_used, gpu_context),
         "ignored_settings": (ignored_settings or {}),
         "ignored_run_args": (ignored_run_args or {}),
         "reprojection": zxe.merge_reproject_stats(
@@ -1895,6 +2138,16 @@ def _write_outputs(
         "per_cell_diagnostics": (per_cell_diagnostics or {}),
         "finishing": (finishing_info or {}),
         "peak_rss_kib": peak_rss_kib,
+        "peak_rss_kib_note": (
+            "peak RSS of a SINGLE process (RUSAGE_SELF on Linux / current RSS on "
+            "Windows); see aggregate_peak_rss_kib for the parent+worker batch bound"
+        ),
+        "aggregate_peak_rss_kib": aggregate_peak_rss_kib,
+        "aggregate_peak_rss_kib_note": (
+            "parent + sum of cell-worker peak RSS (UPPER BOUND: each worker includes "
+            "its own ~340 MiB import baseline; shared/copy-on-write pages are not "
+            "deduplicated)"
+        ),
         "outputs": {
             "science": sci_path.name,
             "coverage": cov_path.name,
@@ -1939,12 +2192,56 @@ def run_zegrid_mode(
     weighting/rejection/combine/taper use the frozen ZeGrid science config.
     """
     _emit("ZeGrid engine activated (stack_plan.csv detected)", callback=progress_callback)
-    if use_gpu:
+
+    # ZM-ZEGRID-R22: resolve ONE canonical GPU preference and decide the backend
+    # HONESTLY (requested -> available -> effective). ``use_gpu`` is now honoured
+    # (never silently dropped); an unavailable/undersized GPU degrades loudly to
+    # exact CPU with a recorded reason.
+    gpu_requested, gpu_source = resolve_gpu_preference(use_gpu, zconfig)
+    gpu_probe = zgpu.probe_gpu_backend()
+    vram_budget = zgpu.vram_budget_bytes(gpu_probe)
+    gpu_effective = False
+    gpu_fallback_reason = None
+    if gpu_requested:
+        if not gpu_probe["available"]:
+            gpu_fallback_reason = gpu_probe.get("reason") or "gpu_unavailable"
+        elif vram_budget is None:
+            gpu_fallback_reason = "vram_unknown_or_too_small"
+        else:
+            gpu_effective = True
+    if gpu_requested and not gpu_effective:
         _emit(
-            "ZeGrid engine is CPU-only (streaming/in-memory canonical); ignoring use_gpu=True",
+            "ZeGrid: GPU requested (use_gpu=True) but NOT usable — "
+            f"{gpu_fallback_reason}; degrading to exact CPU (bit-identical output, "
+            "slower). No silent CPU fallback: this is recorded in the manifest/log.",
             lvl="WARN",
             callback=progress_callback,
         )
+    elif gpu_requested and gpu_effective:
+        _emit(
+            f"ZeGrid: GPU ENABLED — device={gpu_probe['device']} "
+            f"vram_total={gpu_probe['vram_total_bytes']} "
+            f"vram_free={gpu_probe['vram_free_bytes']} budget={vram_budget} "
+            f"(source={gpu_source})",
+            callback=progress_callback,
+        )
+    else:
+        _emit(
+            f"ZeGrid: GPU not requested (source={gpu_source}); CPU backend",
+            callback=progress_callback,
+        )
+    gpu_context = {
+        "requested": bool(gpu_requested),
+        "requested_source": gpu_source,
+        "available": bool(gpu_probe["available"]),
+        "effective": bool(gpu_effective),
+        "device": gpu_probe["device"],
+        "cupy_version": gpu_probe["cupy_version"],
+        "vram_total_bytes": gpu_probe["vram_total_bytes"],
+        "vram_free_bytes": gpu_probe["vram_free_bytes"],
+        "vram_budget_bytes": vram_budget,
+        "fallback_reason": gpu_fallback_reason,
+    }
 
     # ZM-ZEGRID-R16: honour the user's rejection choice (stack_reject_algo +
     # kappa/winsor) where the canonical engine supports it; surface (WARN) anything
@@ -1960,7 +2257,6 @@ def run_zegrid_mode(
         "radial_feather_fraction": radial_feather_fraction,
         "radial_shape_power": radial_shape_power,
         "legacy_rgb_cube": legacy_rgb_cube,
-        "use_gpu": bool(use_gpu),
     }
     ignored_run_args.update(rej_unhonoured)
     for line in zin.describe_ignored_run_args(ignored_run_args):
@@ -1990,6 +2286,7 @@ def run_zegrid_mode(
     science_config = replace(
         ExecutorConfig().science_config(),
         normalization=_resolve_normalization(stack_norm_method),
+        backend=("gpu" if gpu_effective else "cpu"),
         **rej_overrides,
     )
     _emit(
@@ -1998,7 +2295,8 @@ def run_zegrid_mode(
         f"rejection={science_config.rejection} "
         f"(sigma={science_config.sigma_low:.2f}/{science_config.sigma_high:.2f}, "
         f"winsor={science_config.winsor_limit_low:.3f}/{science_config.winsor_limit_high:.3f}), "
-        f"combine={science_config.combine}, taper={science_config.taper}",
+        f"combine={science_config.combine}, taper={science_config.taper}, "
+        f"backend={science_config.backend}",
         callback=progress_callback,
     )
 
@@ -2057,14 +2355,16 @@ def run_zegrid_mode(
                         science_config=science_config, zconfig=zconfig,
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                         ignored_run_args=ignored_run_args,
-                        finishing_config=finishing_config)
+                        finishing_config=finishing_config,
+                        gpu_context=gpu_context)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                         ignored_run_args=ignored_run_args,
-                        finishing_config=finishing_config)
+                        finishing_config=finishing_config,
+                        gpu_context=gpu_context)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -2073,4 +2373,5 @@ def run_zegrid_mode(
                     science_config=science_config, zconfig=zconfig,
                     pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                     ignored_run_args=ignored_run_args,
-                    finishing_config=finishing_config)
+                    finishing_config=finishing_config,
+                    gpu_context=gpu_context)

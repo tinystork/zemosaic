@@ -350,10 +350,11 @@ def test_ignored_lists_updated():
     # save_final_as_uint16 / grid_rgb_equalize are no longer ignored run args.
     assert "save_final_as_uint16" not in zin.IGNORED_RUN_ARGS
     assert "grid_rgb_equalize" not in zin.IGNORED_RUN_ARGS
+    # ZM-ZEGRID-R22: use_gpu is now honoured (GPU backend resolution).
+    assert "use_gpu" not in zin.IGNORED_RUN_ARGS
     # Still-ignored args remain surfaced.
     assert "stack_weight_method" in zin.IGNORED_RUN_ARGS
     assert "legacy_rgb_cube" in zin.IGNORED_RUN_ARGS
-    assert "use_gpu" in zin.IGNORED_RUN_ARGS
 
 
 def test_resolve_finishing_config_defaults_and_flags():

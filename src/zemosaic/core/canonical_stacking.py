@@ -1313,27 +1313,72 @@ def _nan_axis_median(a, xp):
 
 
 def _nan_axis_mean(a, xp):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return xp.nanmean(a, axis=0)
+    """Per-column NaN-mean, BIT-EXACT across backends (ZM-ZEGRID-R22).
 
-
-def _nan_axis_popstd(a, xp):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return xp.nanstd(a, axis=0)
-
-
-def _nan_axis_quantile(a, q, xp):
+    CuPy's ``nanmean`` uses a device tree reduction whose summation order differs
+    from NumPy's pairwise summation, so the float64 result can differ by ~1 ULP.
+    For the GPU backend the reduction is therefore performed on the HOST with the
+    exact ``np.nanmean`` the CPU path uses, so rejection statistics (and thus the
+    survivor/rejection masks) are bit-identical CPU vs GPU. The result is returned
+    on the SAME backend module as ``a`` (the (M,) result is re-uploaded for GPU),
+    so the caller stays xp-generic.
+    """
     if xp is np:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            return np.nanquantile(a, q, axis=0, method="linear")
+            return np.nanmean(a, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        host = np.nanmean(xp.asnumpy(a), axis=0)
+    return xp.asarray(host)
+
+
+def _nan_axis_popstd(a, xp):
+    """Per-column NaN population std, BIT-EXACT across backends (ZM-ZEGRID-R22).
+
+    Same host-side reduction strategy as :func:`_nan_axis_mean` (see there).
+    """
+    if xp is np:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            return np.nanstd(a, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        host = np.nanstd(xp.asnumpy(a), axis=0)
+    return xp.asarray(host)
+
+
+def _axis_sum_f64(a, xp):
+    """Per-column float64 sum, BIT-EXACT across backends (ZM-ZEGRID-R22).
+
+    The C2 mean-combine numerator/denominator are float64 reductions; for the GPU
+    backend they are reduced on the HOST with ``np.sum`` (identical to the CPU
+    path) so the combined science is bit-identical. Returns a HOST NumPy array
+    (the caller restores/places it as needed).
+    """
+    if xp is np:
+        return np.sum(a, axis=0, dtype=np.float64)
+    return np.sum(xp.asnumpy(a), axis=0, dtype=np.float64)
+
+
+def _nan_axis_quantile(a, q, xp):
+    """NaN-aware per-column linear quantile (NumPy AND CuPy, backend-generic).
+
+    ZM-ZEGRID-R22 (exact winsor CPU optimisation): BOTH backends now use the
+    batched sort/interpolate primitive below instead of the pathological
+    ``np.nanquantile(axis=0, method="linear")`` path. The vectorised single sort
+    over the whole ``(N, M)`` array is materially faster than NumPy's per-column
+    Python-loop partition, and it is BIT-EXACT to ``np.nanquantile(method="linear")``
+    (verified over adversarial randomised matrices incl. ±inf, all-NaN, low-N,
+    even/odd N, duplicate values and asymmetric q — see
+    ``tests/test_sci05_canonical_quantile_exact.py``). The frozen rejection
+    science is unchanged: only the quantile primitive implementation changes.
+    """
     return _nan_axis_quantile_gpu(a, q, xp)
 
 
 def _nan_axis_quantile_gpu(a, q, xp):
-    """NaN-aware per-column linear quantile for CuPy (``cupy.nanquantile`` absent).
+    """NaN-aware per-column linear quantile (sort/interpolate; NumPy or CuPy).
 
     Bit-exact equivalent of NumPy ``nanquantile(a, q, axis=0, method="linear")``:
     replace NaN with ``+inf`` then sort (valid values first); linearly interpolate
@@ -1342,12 +1387,15 @@ def _nan_axis_quantile_gpu(a, q, xp):
     and ``a[hi] - (a[hi] - a[lo]) * (1 - frac)`` otherwise — so the result matches
     ``np.nanquantile`` bit-for-bit for every interpolation fraction (not just
     all-equal columns). Columns with no valid value yield NaN.
+
+    The helper name is retained for backward compatibility (the CuPy parity tests
+    import it); it is now the shared CPU/GPU primitive.
     """
     valid = ~xp.isnan(a)
     count = valid.sum(axis=0)
     eff_count = xp.maximum(count, 1)
     b = xp.where(valid, a, xp.inf)
-    b = xp.sort(b, axis=0)
+    b.sort(axis=0)  # in-place: avoids a second (N, M) transient copy
     index = q * (eff_count.astype(xp.float64) - 1.0)
     lo = xp.floor(index).astype(xp.int64)
     hi = xp.minimum(lo + 1, eff_count - 1)

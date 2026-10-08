@@ -30860,19 +30860,28 @@ def run_hierarchical_mosaic(
     if stack_plan_detected:
         # ZeGrid engine (stack_plan.csv). No silent fallback: any failure raises.
         try:
-            from .zemosaic_zegrid_mode import run_zegrid_mode
+            from .zemosaic_zegrid_mode import resolve_gpu_preference, run_zegrid_mode
         except Exception as exc:
             logger.error("[GRID] ZeGrid engine unavailable; aborting.", exc_info=True)
             raise RuntimeError("[GRID] ZeGrid engine unavailable") from exc
         try:
             zegrid_norm = _resolve_zegrid_normalization(worker_config_cache, stack_norm_method)
+            # ZM-ZEGRID-R22: propagate the user's GPU preference into the engine
+            # via the generic ``use_gpu`` argument (resolved from the product flags
+            # with the SAME precedence the engine uses). This is what makes the GUI
+            # checkbox (use_gpu_stack / use_gpu_grid / stack_use_gpu / use_gpu_phase5)
+            # actually reach the ZeGrid backend — previously dropped at this call.
+            _grid_gpu_requested, _grid_gpu_source = resolve_gpu_preference(None, zconfig)
             logger.info(
                 "[GRID] Invoking ZeGrid engine run_zegrid_mode(...) with "
-                "stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
+                "stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s, "
+                "use_gpu=%s (source=%s)",
                 zegrid_norm,
                 stack_weight_method,
                 stack_reject_algo,
                 stack_final_combine,
+                _grid_gpu_requested,
+                _grid_gpu_source,
             )
             run_zegrid_mode(
                 input_folder=input_folder,
@@ -30891,6 +30900,7 @@ def run_hierarchical_mosaic(
                 save_final_as_uint16=save_final_as_uint16_config,
                 legacy_rgb_cube=legacy_rgb_cube_config,
                 grid_rgb_equalize=grid_rgb_equalize_flag,
+                use_gpu=_grid_gpu_requested,
                 zconfig=zconfig,
             )
             return

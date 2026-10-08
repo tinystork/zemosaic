@@ -204,6 +204,177 @@ def cells_in_flight(
     return max(1, min(target, cap))
 
 
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R22: joint mode + concurrency planner
+# ---------------------------------------------------------------------------
+
+# Relative per-cell wall-clock cost used to COMPARE modes in the planner. This is
+# a PLANNING HEURISTIC (not a promised timing): streaming pays a small per-cell
+# penalty vs in-memory (tile re-materialisation + memmap page-ins) but the
+# canonical science (the dominant winsor/combine cost) is the SAME algorithm, so
+# the penalty is modest and, when it unlocks >=2 concurrent cells, streaming wins
+# the wall-clock on a CPU-bound stack.
+_PLANNER_INMEM_COST = 1.0
+_PLANNER_STREAM_COST = 1.2
+
+
+def plan_cell_concurrency(
+    cell_bounds,
+    cpu: int,
+    ram_budget_bytes: int | None,
+    *,
+    gpu_backend: bool = False,
+    cache_build_workers: int = _WORKERS_MIN,
+) -> dict:
+    """Joint mode + concurrency planner (replaces the R20 two-step trap).
+
+    ``cell_bounds`` is a sequence of ``(inmem_bound_bytes, stream_bound_bytes)``
+    (one per non-empty cell). For EACH mode it derives the safe concurrency from
+    the RAM budget (and CPU), compares the ESTIMATED makespan, and returns the
+    winning plan plus the full candidate comparison (recorded in the manifest so
+    the choice is auditable, never a silent ``serial`` surprise).
+
+    * GPU backend: the GPU stack phase is SINGLE-OWNER (cells_in_flight == 1 for
+      the stack) so no two cell processes contend for one device; the CPU cache
+      build may still be parallel (bounded). This is stated explicitly in
+      ``gpu_serialized``, not hidden.
+    * When only one cell is active, the cache build is NOT forced to workers=1:
+      ``cache_workers_per_cell`` rises to ``cache_build_workers``; for K>1 it is
+      bounded to ``cpu // K`` so the total never explodes to ``K x cache_workers``.
+
+    Returns a dict (JSON-serialisable) with ``mode``, ``cells_in_flight``,
+    ``cache_workers_per_cell``, ``gpu_serialized`` and the ``candidates`` list.
+    """
+    bounds = [(int(a), int(b)) for a, b in cell_bounds]
+    n_cells = len(bounds)
+    if n_cells == 0:
+        return {
+            "mode": "stream", "cells_in_flight": 1, "cache_workers_per_cell": 1,
+            "gpu_serialized": bool(gpu_backend), "candidates": [],
+            "n_cells": 0,
+        }
+    cpu = int(cpu or 1)
+    cpu_budget = max(1, cpu - _CPU_OS_RESERVE)
+    ram_budget = int(ram_budget_bytes) if ram_budget_bytes else 0
+
+    max_inmem = max(a for a, _b in bounds)
+    max_stream = max(b for _a, b in bounds)
+
+    def _in_flight(footprint: int) -> int:
+        # Reuse the existing cells_in_flight seam (so tests can force a fixed
+        # concurrency), then cap at n_cells (never more concurrent than cells).
+        n = cells_in_flight(cpu, ram_budget if ram_budget > 0 else None, footprint)
+        return max(1, min(n, n_cells))
+
+    def _makespan(in_flight: int, per_cell_cost: float) -> float:
+        waves = (n_cells + in_flight - 1) // in_flight
+        return waves * per_cell_cost
+
+    inmem_in_flight = _in_flight(max_inmem)
+    stream_in_flight = _in_flight(max_stream)
+
+    if gpu_backend:
+        # Single GPU owner + bounded device memory: the STACK phase serialises
+        # (cells_in_flight == 1) regardless of RAM, AND the mode is forced to
+        # stream (the memmap provider + VRAM-bounded tiles never materialise
+        # N x full-cell on the device, so the in-memory provider's RAM footprint
+        # buys nothing). This is stated explicitly, not hidden.
+        cache_workers_per_cell = max(1, int(cache_build_workers))
+        candidates = [
+            {
+                "mode": "inmem", "cells_in_flight": 1,
+                "max_bound_bytes": int(max_inmem),
+                "per_cell_cost_rel": _PLANNER_INMEM_COST,
+                "makespan_rel": _makespan(1, _PLANNER_INMEM_COST),
+                "gpu_serialized": True,
+            },
+            {
+                "mode": "stream", "cells_in_flight": 1,
+                "max_bound_bytes": int(max_stream),
+                "per_cell_cost_rel": _PLANNER_STREAM_COST,
+                "makespan_rel": _makespan(1, _PLANNER_STREAM_COST),
+                "gpu_serialized": True,
+            },
+        ]
+        return {
+            "mode": "stream",
+            "cells_in_flight": 1,
+            "cache_workers_per_cell": int(cache_workers_per_cell),
+            "gpu_serialized": True,
+            "cpu": cpu,
+            "ram_budget_bytes": ram_budget,
+            "n_cells": n_cells,
+            "chosen_reason": (
+                "GPU backend: single-device owner serialises the stack phase and "
+                "forces stream mode (VRAM-bounded tiles; N x full-cell never "
+                "materialised on the device)"
+            ),
+            "candidates": candidates,
+        }
+
+    def _makespan(in_flight: int, per_cell_cost: float) -> float:
+        waves = (n_cells + in_flight - 1) // in_flight
+        return waves * per_cell_cost
+
+    inmem_makespan = _makespan(inmem_in_flight, _PLANNER_INMEM_COST)
+    stream_makespan = _makespan(stream_in_flight, _PLANNER_STREAM_COST)
+
+    # Choose the lower estimated makespan; break ties toward inmem (faster/cell).
+    if stream_makespan < inmem_makespan - 1e-9:
+        mode = "stream"
+        chosen_in_flight = stream_in_flight
+        chosen_reason = (
+            f"streaming estimated makespan {stream_makespan:.3f} (cells_in_flight="
+            f"{stream_in_flight}) < in-memory {inmem_makespan:.3f} "
+            f"(cells_in_flight={inmem_in_flight})"
+        )
+    else:
+        mode = "inmem"
+        chosen_in_flight = inmem_in_flight
+        chosen_reason = (
+            f"in-memory estimated makespan {inmem_makespan:.3f} (cells_in_flight="
+            f"{inmem_in_flight}) <= streaming {stream_makespan:.3f} "
+            f"(cells_in_flight={stream_in_flight})"
+        )
+
+    # Bounded cache-build parallelism: full budget when one cell is active, else
+    # cpu // K so the total workers never explode to K x cache_build_workers.
+    cache_workers_per_cell = max(1, min(int(cache_build_workers), max(1, cpu // max(1, chosen_in_flight))))
+    if chosen_in_flight == 1:
+        cache_workers_per_cell = max(1, int(cache_build_workers))
+
+    candidates = [
+        {
+            "mode": "inmem",
+            "cells_in_flight": int(inmem_in_flight),
+            "max_bound_bytes": int(max_inmem),
+            "per_cell_cost_rel": _PLANNER_INMEM_COST,
+            "makespan_rel": float(inmem_makespan),
+            "gpu_serialized": bool(gpu_backend),
+        },
+        {
+            "mode": "stream",
+            "cells_in_flight": int(stream_in_flight),
+            "max_bound_bytes": int(max_stream),
+            "per_cell_cost_rel": _PLANNER_STREAM_COST,
+            "makespan_rel": float(stream_makespan),
+            "gpu_serialized": bool(gpu_backend),
+        },
+    ]
+
+    return {
+        "mode": mode,
+        "cells_in_flight": int(chosen_in_flight),
+        "cache_workers_per_cell": int(cache_workers_per_cell),
+        "gpu_serialized": bool(gpu_backend),
+        "cpu": cpu,
+        "ram_budget_bytes": ram_budget,
+        "n_cells": n_cells,
+        "chosen_reason": chosen_reason,
+        "candidates": candidates,
+    }
+
+
 def _parent_is_daemonic() -> bool:
     """True when the current process is daemonic (cannot spawn children)."""
     try:
