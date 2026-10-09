@@ -18,20 +18,30 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-# Product settings the ZeGrid engine currently IGNORES (CPU-only engine + no
-# post-stack processing). Kept as an explicit list so the run log + manifest can
-# surface them and nothing is silently dropped.
-#   * GPU stack/grid routing: use_gpu_stack / use_gpu_grid / stack_use_gpu.
+# Product settings the ZeGrid engine currently IGNORES (no post-stack
+# processing). Kept as an explicit list so the run log + manifest can surface
+# them and nothing is silently dropped.
 #   * Post-processing (ZeGrid performs no DBE / inter-tile blend / normalization
 #     rework / anchor review / coverage renorm).
+#
+# ZM-ZEGRID-R22: the GPU stack/grid routing flags (``use_gpu_stack`` /
+# ``use_gpu_grid`` / ``stack_use_gpu``) are NO LONGER unconditionally ignored —
+# they are now HONOURED by the GPU backend resolution. They are surfaced in
+# ``ignored_settings`` ONLY when the GPU is requested but the backend could not be
+# honoured (see ``GPU_SETTING_KEYS`` / ``ignored_settings_present(gpu_honoured=...)``).
 IGNORED_SETTINGS: tuple[str, ...] = (
-    "use_gpu_stack",
-    "use_gpu_grid",
-    "stack_use_gpu",
     "intertile_affine_blend",
     "center_out_normalization_p3",
     "enable_poststack_anchor_review",
     "two_pass_coverage_renorm",
+)
+
+# GPU flags that are honoured when the GPU backend is effective, and surfaced as
+# ignored ONLY when the GPU is requested but NOT honoured (loud exact-CPU fallback).
+GPU_SETTING_KEYS: tuple[str, ...] = (
+    "use_gpu_stack",
+    "use_gpu_grid",
+    "stack_use_gpu",
 )
 
 # Settings matched by prefix (final_mosaic_dbe_* : enable / sigma / iterations / ...).
@@ -52,6 +62,8 @@ IGNORED_SETTING_PREFIXES: tuple[str, ...] = ()
 # surfaced via that mapping's ``unhonoured`` dict, never silently dropped.
 # NOTE (ZM-ZEGRID-R18): ``save_final_as_uint16`` and ``grid_rgb_equalize`` are
 # NO LONGER ignored — they are now honoured by the final-mosaic finishing step.
+# NOTE (ZM-ZEGRID-R22): ``use_gpu`` is NO LONGER ignored — it is now honoured by
+# the GPU backend resolution (see ``zemosaic_zegrid_mode.resolve_gpu_preference``).
 IGNORED_RUN_ARGS: tuple[str, ...] = (
     "stack_weight_method",
     "stack_final_combine",
@@ -59,20 +71,19 @@ IGNORED_RUN_ARGS: tuple[str, ...] = (
     "radial_feather_fraction",
     "radial_shape_power",
     "legacy_rgb_cube",
-    "use_gpu",
 )
 
-# ZM-ZEGRID-R12 F3: the precise answer to the user's observation that loading
-# "uses the GPU". The ZeGrid ENGINE is CPU-only, but the PRODUCT worker still
-# probes/initialises CuPy during its own (pre/post ZeGrid) phases.
+# ZM-ZEGRID-R22: the GPU contract is now truthful. The rejection + combine stages
+# CAN run on the GPU (opt-in); the gauge (normalization + weighting) and the
+# support/taper construction stay on the CPU by the frozen canonical contract.
 GPU_USAGE_NOTE = (
-    "The ZeGrid ENGINE is CPU-only: it performs all decode/reproject/stack work "
-    "on the CPU and never touches the GPU; its use_gpu_* / stack_use_gpu flags "
-    "are read but ignored. The PRODUCT worker may still initialise CuPy during "
-    "its own phases (gpu_runtime probing / apply_gpu_safety_to_phase5_flag do "
-    "cupy.cuda.Device().use() and cupy.is_available() in zemosaic_worker.py), so "
-    "a GPU spike during loading most likely comes from that product-level "
-    "initialisation, NOT from the ZeGrid engine."
+    "ZeGrid honours the user's GPU preference: when requested AND a CUDA device "
+    "with sufficient free VRAM is available, the per-cell rejection + combine "
+    "stages run on a VRAM-bounded tiled GPU path (one cell at a time); otherwise "
+    "the engine degrades LOUDLY to the exact CPU backend with a recorded reason. "
+    "The photometric gauge (normalization + weighting) and support/taper stages "
+    "always run on the CPU. 'used' reports the EFFECTIVE per-cell backend, never "
+    "CuPy initialisation alone."
 )
 
 
@@ -123,13 +134,18 @@ def _truthy(value) -> bool:
     return True
 
 
-def ignored_settings_present(zconfig) -> dict:
+def ignored_settings_present(zconfig, *, gpu_honoured: bool = False) -> dict:
     """Return ``{setting_name: value}`` for every ignored setting present.
 
     ``zconfig`` is the product config object (a ``SimpleNamespace`` in the
     production path). ``None`` yields an empty dict. Values are read by name
     (exact) or by prefix (``final_mosaic_dbe_*``); a setting is reported only when
     it is truthy (so we warn about what is actually *set*, not a long default list).
+
+    ``gpu_honoured`` (ZM-ZEGRID-R22): when True, the GPU stack/grid flags
+    (``use_gpu_stack`` / ``use_gpu_grid`` / ``stack_use_gpu``) are NOT reported as
+    ignored (they ARE honoured); when False they are reported when set, so a loud
+    CPU fallback still surfaces the unhonoured user intent.
     """
     out: dict = {}
     if zconfig is None:
@@ -138,6 +154,11 @@ def ignored_settings_present(zconfig) -> dict:
         value = getattr(zconfig, name, None)
         if _truthy(value):
             out[name] = value
+    if not gpu_honoured:
+        for name in GPU_SETTING_KEYS:
+            value = getattr(zconfig, name, None)
+            if _truthy(value):
+                out[name] = value
     # Prefix matches (final_mosaic_dbe_*).
     for attr in dir(zconfig):
         for prefix in IGNORED_SETTING_PREFIXES:
@@ -169,10 +190,10 @@ def ignored_settings_warning_lines(ignored: dict) -> list[str]:
     """Human-readable WARN lines listing ignored settings (or 'none set')."""
     if not ignored:
         return [
-            "No ignored ZeGrid settings detected (no use_gpu_*/stack_use_gpu or "
-            "post-stack-processing flags set)."
+            "No ignored ZeGrid settings detected (no post-stack-processing flags "
+            "set, and any GPU flags are honoured)."
         ]
-    lines = [f"ZeGrid ignores the following product settings (CPU-only engine):"]
+    lines = [f"ZeGrid ignores the following product settings:"]
     for name in sorted(ignored):
         lines.append(f"  - {name} = {ignored[name]!r}")
     return lines

@@ -116,6 +116,30 @@ def peak_rss_kib() -> int:
     return 0
 
 
+def aggregate_peak_rss_kib(parent_peak_kib: int, worker_peak_kib: list[int]) -> int:
+    """Upper-bound aggregate peak RSS across the parent + all cell-worker processes.
+
+    ZM-ZEGRID-R22 honesty fix: ``peak_rss_kib`` is a SINGLE process's peak
+    (``RUSAGE_SELF`` on Linux / current RSS on Windows); it does NOT capture the
+    sum of a parallel batch. This helper reports the batch aggregate as
+    ``parent_peak + sum(worker_peaks)``. Each worker's peak includes its own
+    ~340 MiB import baseline, so this is an UPPER BOUND (shared/copy-on-write
+    pages are not deduplicated) — reported alongside ``peak_rss_kib``, never as a
+    replacement for it.
+    """
+    try:
+        parent = int(parent_peak_kib)
+    except (TypeError, ValueError):
+        parent = 0
+    total = parent
+    for w in worker_peak_kib:
+        try:
+            total += int(w)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 @dataclass(frozen=True)
 class MemoryGate:
     """Result of one memory-gate check."""

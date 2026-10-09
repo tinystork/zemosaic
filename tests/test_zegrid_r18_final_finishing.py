@@ -106,8 +106,9 @@ def _dbe_config(**over):
     cfg = dict(
         dbe_enabled=True,
         dbe_strength="normal",
-        dbe_strength_factor=zfin.resolve_strength_factor("normal"),
-        dbe_params=dict(obj_k=3.0, obj_dilate_px=3, sample_step=24, smoothing=0.6),
+        dbe_params_source="preset:normal",
+        dbe_subtraction_factor=1.0,
+        dbe_params=dict(sigma=36.0, obj_k=2.8, obj_dilate_px=3),
         rgb_equalize=False,
         save_uint16=False,
     )
@@ -116,48 +117,75 @@ def _dbe_config(**over):
 
 
 # ---------------------------------------------------------------------------
-# Strength mapping (documented)
+# Strength semantics (legacy light-DBE sigma/obj_k/dilate presets)
 # ---------------------------------------------------------------------------
 
-def test_strength_factor_mapping():
-    assert zfin.resolve_strength_factor("off") == 0.0
-    assert zfin.resolve_strength_factor("low") == 0.5
-    assert zfin.resolve_strength_factor("weak") == 0.5
-    assert zfin.resolve_strength_factor("normal") == 1.0
-    assert zfin.resolve_strength_factor("high") == 1.5
-    assert zfin.resolve_strength_factor("strong") == 1.5
-    assert zfin.resolve_strength_factor(None) == 1.0
-    assert zfin.resolve_strength_factor("") == 1.0
-    assert zfin.resolve_strength_factor("bogus") == 1.0
+def test_strength_presets_and_custom():
+    # Legacy light-DBE presets (exact historical Grid mappings).
+    assert zfin.DBE_STRENGTH_PRESETS["weak"] == {
+        "sigma": 24.0, "obj_k": 3.0, "obj_dilate_px": 2}
+    assert zfin.DBE_STRENGTH_PRESETS["normal"] == {
+        "sigma": 36.0, "obj_k": 2.8, "obj_dilate_px": 3}
+    assert zfin.DBE_STRENGTH_PRESETS["strong"] == {
+        "sigma": 52.0, "obj_k": 2.5, "obj_dilate_px": 4}
+    assert zfin.DBE_STRENGTH_PRESETS["aggressive"] == {
+        "sigma": 68.0, "obj_k": 2.2, "obj_dilate_px": 5}
+
+    r = zfin.resolve_dbe_strength(SimpleNamespace(final_mosaic_dbe_strength="strong"))
+    assert r["strength"] == "strong"
+    assert r["params_source"] == "preset:strong"
+    assert r["params"]["sigma"] == 52.0
 
 
-def test_strength_factor_scales_subtraction():
-    sci, cov = synthetic_mosaic()
-    full = zfin.apply_final_mosaic_finishing(
-        sci, cov, config=_dbe_config(dbe_strength_factor=1.0)
-    ).science
-    half = zfin.apply_final_mosaic_finishing(
-        sci, cov, config=_dbe_config(dbe_strength_factor=0.5)
-    ).science
-    # Amount of background removed (mean of |in - out| over the sky) halves.
-    removed_full = float(np.mean(np.abs(sci[..., 0] - full[..., 0])))
-    removed_half = float(np.mean(np.abs(sci[..., 0] - half[..., 0])))
-    assert removed_half == pytest.approx(0.5 * removed_full, rel=0.1)
+def test_strength_aliases_and_invalid_fallback():
+    # Legacy aliases low/high are accepted (map to weak/strong).
+    for alias, canonical in (("low", "weak"), ("high", "strong")):
+        r = zfin.resolve_dbe_strength(SimpleNamespace(final_mosaic_dbe_strength=alias))
+        assert r["strength"] == canonical
+        assert r["params"] == zfin.DBE_STRENGTH_PRESETS[alias]
+    # Invalid / empty fall back to normal.
+    for bad in ("bogus", "off", "", None):
+        z = SimpleNamespace(final_mosaic_dbe_strength=bad)
+        r = zfin.resolve_dbe_strength(z)
+        assert r["strength"] == "normal"
+        assert r["params_source"] == "preset:normal"
 
 
-def test_smoothing_honoured():
-    sci, cov = synthetic_mosaic()
-    ch = sci[..., 0]
-    valid = cov > 0
-    _, i0 = zfin.estimate_background_channel(
-        ch, valid, sample_step=24, obj_k=3.0, obj_dilate_px=3, smoothing=0.0
+def test_strength_custom_reads_explicit_config():
+    # Stored `custom` with only legacy block-median fields (no Gaussian sigma key)
+    # cannot be mapped to the legacy light-DBE algorithm, so it falls back to
+    # normal with an explicit record (never silent reinterpretation).
+    z = SimpleNamespace(
+        final_mosaic_dbe_strength="custom",
+        final_mosaic_dbe_obj_k=4.5,
+        final_mosaic_dbe_obj_dilate_px=5,
+        final_mosaic_dbe_sample_step=48,
+        final_mosaic_dbe_smoothing=1.2,
     )
-    _, i5 = zfin.estimate_background_channel(
-        ch, valid, sample_step=24, obj_k=3.0, obj_dilate_px=3, smoothing=5.0
-    )
-    # Stronger smoothing -> a flatter (lower-std) background model.
-    assert i5["grid_std"] < i0["grid_std"]
-    assert i5["grid_std"] < 0.5 * i0["grid_std"]
+    r = zfin.resolve_dbe_strength(z)
+    assert r["strength"] == "normal"
+    assert r["params_source"] == "preset:normal"
+    assert "custom_fallback" in r
+
+
+def test_strength_presets_produce_monotonic_sigma():
+    """Larger legacy sigma -> smoother model -> less variation removed.
+    weak(24) > normal(36) > strong(52) > aggressive(68) in removed magnitude."""
+    sci, cov = synthetic_mosaic()
+
+    def removed(strength):
+        out = zfin.apply_final_mosaic_finishing(
+            sci, cov, config=_dbe_config(dbe_strength=strength,
+                                         dbe_params_source=f"preset:{strength}",
+                                         dbe_params=zfin.DBE_STRENGTH_PRESETS[strength]),
+        ).science
+        return float(np.mean(np.abs(sci[..., 0] - out[..., 0])))
+
+    r_weak = removed("weak")
+    r_normal = removed("normal")
+    r_strong = removed("strong")
+    r_aggressive = removed("aggressive")
+    assert r_weak > r_normal > r_strong > r_aggressive
 
 
 # ---------------------------------------------------------------------------
@@ -170,9 +198,10 @@ def test_dbe_flattens_background_pinned():
     out = zfin.apply_final_mosaic_finishing(sci, cov, config=_dbe_config()).science
     after = _sky_box_std(out)
 
-    # Honest numbers for the synthetic M16-like case (256x256, gradient+vignette).
+    # Honest numbers for the synthetic M16-like case (256x256, gradient+vignette),
+    # R23 rework-2 legacy light-DBE (variation-only, gaussian mode=nearest).
     assert before == pytest.approx(18.41, abs=0.5)
-    assert after == pytest.approx(1.32, abs=0.5)
+    assert after == pytest.approx(1.43, abs=0.6)
     assert after < 0.15 * before
 
 
@@ -182,7 +211,7 @@ def test_dbe_preserves_bright_source():
     flux_before = _star_flux(sci)
     flux_after = _star_flux(out)
     # Object protection: the source's flux above background is preserved (the
-    # star is masked from the background estimate, so it is not subtracted out).
+    # star is masked from the background estimate and restored unchanged).
     assert flux_after == pytest.approx(flux_before, rel=0.02)
     # The source remains clearly above the (now-flattened) background.
     assert float(np.max(out[..., 0])) > 4000.0
@@ -193,8 +222,10 @@ def test_dbe_applied_flag():
     res = zfin.apply_final_mosaic_finishing(sci, cov, config=_dbe_config())
     assert res.info["dbe"]["applied"] is True
     assert res.info["dbe"]["strength"] == "normal"
-    assert res.info["dbe"]["strength_factor"] == 1.0
-    assert res.info["dbe"]["params"]["sample_step"] == 24
+    assert res.info["dbe"]["params_source"] == "preset:normal"
+    assert res.info["dbe"]["subtraction_factor"] == 1.0
+    assert res.info["dbe"]["params"]["sigma"] == 36.0
+    assert res.info["dbe"]["algorithm"] == "legacy_grid_light_dbe"
 
 
 # ---------------------------------------------------------------------------
@@ -350,10 +381,11 @@ def test_ignored_lists_updated():
     # save_final_as_uint16 / grid_rgb_equalize are no longer ignored run args.
     assert "save_final_as_uint16" not in zin.IGNORED_RUN_ARGS
     assert "grid_rgb_equalize" not in zin.IGNORED_RUN_ARGS
+    # ZM-ZEGRID-R22: use_gpu is now honoured (GPU backend resolution).
+    assert "use_gpu" not in zin.IGNORED_RUN_ARGS
     # Still-ignored args remain surfaced.
     assert "stack_weight_method" in zin.IGNORED_RUN_ARGS
     assert "legacy_rgb_cube" in zin.IGNORED_RUN_ARGS
-    assert "use_gpu" in zin.IGNORED_RUN_ARGS
 
 
 def test_resolve_finishing_config_defaults_and_flags():
@@ -363,7 +395,8 @@ def test_resolve_finishing_config_defaults_and_flags():
     assert cfg["rgb_equalize"] is True
     assert cfg["save_uint16"] is False
     assert cfg["dbe_strength"] == "normal"
-    assert cfg["dbe_strength_factor"] == 1.0
+    assert cfg["dbe_params_source"] == "preset:normal"
+    assert cfg["dbe_subtraction_factor"] == 1.0
 
     # Explicit off flags.
     z = SimpleNamespace(
@@ -377,20 +410,21 @@ def test_resolve_finishing_config_defaults_and_flags():
     assert cfg["rgb_equalize"] is False
     assert cfg["save_uint16"] is True
     assert cfg["dbe_strength"] == "strong"
-    assert cfg["dbe_strength_factor"] == 1.5
+    assert cfg["dbe_params_source"] == "preset:strong"
+    assert cfg["dbe_subtraction_factor"] == 1.0  # no hidden scalar multiplier
 
-    # Config params flow through.
+    # ``custom`` strength with only legacy block-median fields falls back to normal.
     z2 = SimpleNamespace(
+        final_mosaic_dbe_strength="custom",
         final_mosaic_dbe_sample_step=48,
         final_mosaic_dbe_smoothing=1.2,
         final_mosaic_dbe_obj_k=4.0,
         final_mosaic_dbe_obj_dilate_px=5,
     )
-    p = zfin.resolve_finishing_config(z2)["dbe_params"]
-    assert p["sample_step"] == 48
-    assert p["smoothing"] == 1.2
-    assert p["obj_k"] == 4.0
-    assert p["obj_dilate_px"] == 5
+    cfg2 = zfin.resolve_finishing_config(z2)
+    assert cfg2["dbe_params_source"] == "preset:normal"
+    assert cfg2["dbe_params"] == {"sigma": 36.0, "obj_k": 2.8, "obj_dilate_px": 3}
+    assert "custom" in cfg2["dbe_custom_fallback"]
 
 
 # ---------------------------------------------------------------------------
@@ -474,11 +508,15 @@ def test_forced_finishing_failure_warns_and_completes(tmp_path, routine_corpus, 
         lg.removeHandler(cap)
         lg.setLevel(old_level)
 
-    # Raw mosaic still produced (fail-safe).
+    # Raw mosaic still produced (fail-safe). With export_aesthetic_fits defaulting
+    # False (Classic fallback), the raw science is written at ``mosaic_grid.fits``
+    # (SCI role).
     assert (out / "mosaic_grid.fits").exists()
     manifest = json.loads((out / "zegrid_manifest.json").read_text())
     assert manifest["finishing"]["failed"] is True
     assert "forced finishing failure" in manifest["finishing"]["failure_reason"]
+    assert manifest["outputs"]["science"] == "mosaic_grid.fits"
+    assert manifest["science_reference"] == "mosaic_grid.fits"
     # A WARN was emitted (dedicated handler) and the durable run log records it.
     assert any("finishing FAILED" in m for m in captured)
     run_log = (out / zz.RUN_LOG_NAME).read_text()

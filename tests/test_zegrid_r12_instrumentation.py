@@ -250,22 +250,24 @@ def test_pmap_serial_and_order_preserving():
 
 
 def test_gpu_note_mentions_cupy_product_init():
-    # F3: the GPU note must answer the user's observation that loading "uses the
-    # GPU" — the ZeGrid ENGINE is CPU-only, but the PRODUCT worker initialises CuPy.
+    # ZM-ZEGRID-R22: the GPU contract is now truthful. The note must explain that
+    # the rejection+combine stages CAN run on the GPU (opt-in) and that 'used'
+    # reports the EFFECTIVE backend (never CuPy initialisation alone).
     note = zin.describe_gpu_usage()
-    assert "CPU" in note and "GPU" in note
+    assert "GPU" in note
     assert "CuPy" in note
-    assert "zemosaic_worker" in note
+    assert "effective" in note or "EFFECTIVE" in note
 
 
 def test_ignored_run_args_present_and_described():
     # F2: run_zegrid_mode accepts but ignores these stack/final-mosaic args.
     # ZM-ZEGRID-R18: save_final_as_uint16 and grid_rgb_equalize are now HONOURED.
+    # ZM-ZEGRID-R22: use_gpu is now HONOURED (GPU backend resolution).
     assert "save_final_as_uint16" not in zin.IGNORED_RUN_ARGS
     assert "grid_rgb_equalize" not in zin.IGNORED_RUN_ARGS
     assert "legacy_rgb_cube" in zin.IGNORED_RUN_ARGS
     assert "apply_radial_weight" in zin.IGNORED_RUN_ARGS
-    assert "use_gpu" in zin.IGNORED_RUN_ARGS
+    assert "use_gpu" not in zin.IGNORED_RUN_ARGS
     lines = zin.describe_ignored_run_args({"legacy_rgb_cube": True})
     assert any("legacy_rgb_cube" in ln for ln in lines)
     empty = zin.describe_ignored_run_args({})

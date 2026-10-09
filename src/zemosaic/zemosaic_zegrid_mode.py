@@ -48,6 +48,7 @@ recorded in ``zegrid_manifest.json``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -76,6 +77,7 @@ from .core.zegrid import execution as zxe
 from .core.zegrid import file_provider as zfp
 from .core.zegrid import final_mosaic_finishing as zfin
 from .core.zegrid import geometry as zg
+from .core.zegrid import gpu as zgpu
 from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
 from .core.zegrid import observability as zobs
@@ -190,6 +192,70 @@ def _resolve_normalization(stack_norm_method) -> str:
 def resolve_normalization(stack_norm_method) -> str:
     """Public wrapper (testable) — see :func:`_resolve_normalization`."""
     return _resolve_normalization(stack_norm_method)
+
+
+# ---------------------------------------------------------------------------
+# GPU preference resolution (ZM-ZEGRID-R22): ONE canonical bool with explicit
+# precedence + strict coercion, resolved from the generic argument and the
+# product's GPU flags. This is the single source of truth for whether the
+# user asked for GPU in the ZeGrid engine.
+# ---------------------------------------------------------------------------
+
+# Resolution order (first non-None wins) for the zconfig GPU flags. ``use_gpu_grid``
+# is the grid-specific flag (most direct for the ZeGrid engine); ``stack_use_gpu`` /
+# ``use_gpu_stack`` are the stacking flags; ``use_gpu_phase5`` is the GUI canonical
+# phase-5 checkbox that ``_normalize_gpu_flags`` synchronises the others onto.
+_GPU_PREFERENCE_KEYS = ("use_gpu_grid", "stack_use_gpu", "use_gpu_stack", "use_gpu_phase5")
+
+
+def _coerce_bool_pref(value):
+    """Strict bool coercion for a GPU preference flag (None-aware).
+
+    Returns ``True``/``False`` for an explicit value, or ``None`` when the value
+    is absent/empty/unparseable (so the caller falls through to the next source).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if t in {"0", "false", "no", "off", "disable", "disabled", "none", ""}:
+            return False
+        return None
+    try:
+        return bool(value)
+    except Exception:
+        return None
+
+
+def resolve_gpu_preference(use_gpu=None, zconfig=None):
+    """Resolve ONE canonical GPU preference with explicit precedence.
+
+    Precedence (first explicit, non-None value wins):
+      1. the generic ``use_gpu`` argument (explicit caller intent);
+      2. ``use_gpu_grid`` (grid-specific GUI flag);
+      3. ``stack_use_gpu`` (stacking GPU flag);
+      4. ``use_gpu_stack`` (legacy alias);
+      5. ``use_gpu_phase5`` (GUI canonical phase-5 flag).
+
+    Returns ``(requested: bool, source: str)``. Unparseable/absent values are
+    treated as unset (fall through); the default is ``(False, "default")``.
+    """
+    if use_gpu is not None:
+        v = _coerce_bool_pref(use_gpu)
+        if v is not None:
+            return bool(v), "argument"
+    if zconfig is not None:
+        for key in _GPU_PREFERENCE_KEYS:
+            v = _coerce_bool_pref(getattr(zconfig, key, None))
+            if v is not None:
+                return bool(v), key
+    return False, "default"
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +967,7 @@ def _build_cell_sres(result, frame_ids):
     )
 
 
-def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
+def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, tile_size=None):
     """In-memory cell run: aligned frames resident, single-tile streaming executor.
 
     ZM-ZEGRID-R11: the in-memory path now goes through
@@ -910,6 +976,10 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
     fixed photometric gauge as the streaming path. ``fixed`` is the Cell-local
     :class:`FixedNormalization`; when None the per-Cell phase-1 is computed as
     before (legacy behaviour).
+
+    ``tile_size`` (ZM-ZEGRID-R22): ``None`` keeps the legacy single-tile full-patch
+    CPU behaviour; a bounded tile is passed when the cell runs on the GPU so the
+    device never materialises ``N x full-cell`` (VRAM-bounded).
     """
     provider = zfp.MemmapCanonicalProvider(cache_dir)
     try:
@@ -928,7 +998,7 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None):
     inmem_provider = InMemoryCanonicalProvider(images, supports)
     request = zstream.build_streaming_request(config, inmem_provider.n_frames)
     result = run_canonical_stack_streaming(
-        inmem_provider, request, tile_size=None, fixed=fixed
+        inmem_provider, request, tile_size=tile_size, fixed=fixed
     )
     sres = _build_cell_sres(result, frame_ids)
     mt = za.extract_minitile(patch, sres)
@@ -965,18 +1035,22 @@ _STACK_GAUGE = None
 _STACK_GLOBAL_FRAME_IDS = None
 _STACK_GLOBAL_REF = None
 _STACK_TILE_SIZE = STREAM_TILE_SIZE
+_STACK_CACHE_WORKERS = 1
 
 
-def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id):
+def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id, tile_size=STREAM_TILE_SIZE, cache_workers=1):
     """Child/parent initializer: publish the read-only per-cell stack inputs."""
     global _STACK_DESCS, _STACK_CANVAS, _STACK_CONFIG, _STACK_GAUGE
-    global _STACK_GLOBAL_FRAME_IDS, _STACK_GLOBAL_REF
+    global _STACK_GLOBAL_FRAME_IDS, _STACK_GLOBAL_REF, _STACK_TILE_SIZE
+    global _STACK_CACHE_WORKERS
     _STACK_DESCS = descs
     _STACK_CANVAS = canvas
     _STACK_CONFIG = science_config
     _STACK_GAUGE = global_gauge
     _STACK_GLOBAL_FRAME_IDS = global_frame_ids
     _STACK_GLOBAL_REF = global_reference_frame_id
+    _STACK_TILE_SIZE = tile_size
+    _STACK_CACHE_WORKERS = cache_workers
 
 
 def _stack_cell(task):
@@ -1000,11 +1074,14 @@ def _stack_cell(task):
                 "reproject": None}
     cache_dir = Path(cache_dir)
 
-    # Build the cell cache (serialised: workers=1 -> no nested pool).
+    # Build the cell cache (parallel reproject; the worker count is bounded by
+    # the joint planner — full budget when only one cell is active, cpu//K for K
+    # concurrent cells, so the total never explodes to K x cache_build_workers).
     zxe.reset_reproject_path_stats()
     t0 = time.perf_counter()
     manifest = _build_one_cell_cache(
-        _STACK_DESCS, _STACK_CANVAS, cell, patch, mem, cache_dir, workers=1
+        _STACK_DESCS, _STACK_CANVAS, cell, patch, mem, cache_dir,
+        workers=int(_STACK_CACHE_WORKERS),
     )
     cache_build_s = time.perf_counter() - t0
 
@@ -1020,7 +1097,12 @@ def _stack_cell(task):
 
     t0 = time.perf_counter()
     if mode == "inmem":
-        mt, sres = _run_cell_inmem(cache_dir, patch, _STACK_CONFIG, None, fixed=cell_fixed)
+        # ZM-ZEGRID-R22: when the cell runs on the GPU, use the VRAM-bounded tile
+        # size (never a single N x full-cell tile); CPU keeps the legacy
+        # single-tile full-patch behaviour.
+        inmem_tile = _STACK_TILE_SIZE if getattr(_STACK_CONFIG, "backend", "cpu") == "gpu" else None
+        mt, sres = _run_cell_inmem(cache_dir, patch, _STACK_CONFIG, None,
+                                   fixed=cell_fixed, tile_size=inmem_tile)
     else:
         mt, sres = _run_cell_stream(cache_dir, patch, _STACK_CONFIG, None,
                                     tile_size=_STACK_TILE_SIZE, fixed=cell_fixed)
@@ -1035,6 +1117,7 @@ def _stack_cell(task):
     record = {
         "cell_id": cid, "row": cell.row, "col": cell.col, "status": "complete",
         "mode": mode, "n_contributors": len(mem.patch_ids),
+        "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
         "reference_frame_id": sres.reference_frame_id,
         "reference_frame_role": prov["reference_frame_role"],
         "bookkeeping_reference_frame_id": prov["bookkeeping_reference_frame_id"],
@@ -1048,6 +1131,7 @@ def _stack_cell(task):
 
     return {
         "cell_id": cid, "status": "complete", "core": core, "record": record,
+        "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
         "n_frames": int(manifest.get("n_frames", 0)),
         "total_bytes": int(manifest.get("total_bytes", 0)),
         "cache_build_s": cache_build_s, "stack_s": stack_s,
@@ -1069,6 +1153,38 @@ def _canvas_header(canvas, ndim, channels=None):
     header["NAXIS2"] = int(canvas.height)
     if ndim == 3:
         header["NAXIS3"] = int(channels)
+    return header
+
+
+def _array_sha256(data: np.ndarray) -> str:
+    """SHA-256 of a float32 array's raw bytes (contiguous, deterministic)."""
+    arr = np.ascontiguousarray(data)
+    return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+def _science_header(
+    canvas,
+    *,
+    role: str,
+    dtype: str,
+    dbe_state: str,
+    sha256: str,
+    related_file: str | None = None,
+) -> fits.Header:
+    """Canvas WCS header + science-output role/relationship metadata.
+
+    ``role`` is ``SCI`` (immutable pre-finishing scientific reference) or
+    ``AESTH`` (delivered legacy light-DBE aesthetic float32). ``dbe_state`` is
+    one of ``off`` / ``on`` / ``noop`` / ``failed`` / ``n/a``. ``related_file``
+    records the pre/post-finishing counterpart filename.
+    """
+    header = _canvas_header(canvas, ndim=3, channels=3)
+    header["SCIROLE"] = (role, "science output role")
+    header["SCIDTYPE"] = (dtype, "science array dtype")
+    header["DBESTAT"] = (dbe_state, "DBE finishing state (off/on/failed/n/a)")
+    header["SCIHASH"] = (sha256, "SHA-256 of science array bytes")
+    if related_file:
+        header["SCIREF"] = (related_file, "related pre/post-finishing output")
     return header
 
 
@@ -1150,6 +1266,46 @@ def _append_run_log_line(output_dir, line):
         pass
 
 
+def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
+    """ZM-ZEGRID-R22 (rework-1): truthful manifest ``gpu`` block from EXECUTION evidence.
+
+    ``used`` / ``effective`` / ``backend`` are derived from the ACTUAL executed
+    cells (per-cell ``backend_used`` aggregated in ``_run_single``), never from the
+    start-time selection alone. Distinguishes requested / available / attempted
+    (selected) / final_effective / actually_used / final_backend + start-time and
+    runtime fallback reasons.
+    """
+    ctx = gpu_context or {}
+    actually_used = bool(ctx.get("actually_used"))
+    final_backend = ctx.get("final_backend") or ("gpu" if actually_used else "cpu")
+    backend = "gpu" if actually_used else "cpu"
+    return {
+        "used": actually_used,
+        "requested": bool(ctx.get("requested")),
+        "requested_source": ctx.get("requested_source"),
+        "available": bool(ctx.get("available")),
+        "attempted": bool(ctx.get("attempted")),
+        "effective": bool(ctx.get("final_effective", ctx.get("attempted"))),
+        "actually_used": actually_used,
+        "final_backend": final_backend,
+        "gpu_executed_cells": ctx.get("gpu_executed_cells"),
+        "device": ctx.get("device"),
+        "cupy_version": ctx.get("cupy_version"),
+        "vram_total_bytes": ctx.get("vram_total_bytes"),
+        "vram_free_bytes": ctx.get("vram_free_bytes"),
+        "vram_budget_bytes": ctx.get("vram_budget_bytes"),
+        "fallback_reason": ctx.get("fallback_reason"),
+        "runtime_fallback": ctx.get("runtime_fallback"),
+        "backend": {
+            "gauge_rejection": "cpu",
+            "gauge_combine": "cpu",
+            "per_cell_rejection": backend,
+            "per_cell_combine": backend,
+        },
+        "note": zin.GPU_USAGE_NOTE,
+    }
+
+
 def _write_run_log(
     output_dir,
     timings,
@@ -1169,6 +1325,8 @@ def _write_run_log(
     gauge_diagnostics=None,
     per_cell_diagnostics=None,
     finishing_info=None,
+    gpu_context=None,
+    aggregate_peak_rss_kib=None,
 ):
     """Append the run-log SUMMARY into the output folder.
 
@@ -1193,9 +1351,31 @@ def _write_run_log(
     lines.append("")
     lines.append("GPU usage:")
     lines.append(f"  used: {bool(gpu_used)}")
+    _gctx = gpu_context or {}
+    lines.append(
+        f"  requested: {bool(_gctx.get('requested'))} (source={_gctx.get('requested_source')})  "
+        f"available: {bool(_gctx.get('available'))}  attempted: {bool(_gctx.get('attempted'))}"
+    )
+    lines.append(
+        f"  actually_used: {bool(_gctx.get('actually_used'))}  "
+        f"final_backend: {_gctx.get('final_backend')}  "
+        f"gpu_executed_cells: {_gctx.get('gpu_executed_cells')}"
+    )
+    if _gctx.get("device"):
+        lines.append(
+            f"  device: {_gctx.get('device')}  cupy={_gctx.get('cupy_version')}  "
+            f"vram_total={_gctx.get('vram_total_bytes')}  vram_free={_gctx.get('vram_free_bytes')}  "
+            f"budget={_gctx.get('vram_budget_bytes')}"
+        )
+    if _gctx.get("fallback_reason"):
+        lines.append(f"  fallback_reason: {_gctx.get('fallback_reason')}")
+    if _gctx.get("runtime_fallback"):
+        _rf = _gctx["runtime_fallback"]
+        lines.append(f"  runtime_fallback: type={_rf.get('type')} reason={_rf.get('reason')}")
     lines.append(f"  {zin.describe_gpu_usage()}")
     lines.append("")
-    lines.append("Ignored product settings (ZeGrid is CPU-only + no post-stack processing):")
+    lines.append("Ignored product settings (ZeGrid honours use_gpu_* / stack_use_gpu; "
+                 "no post-stack processing):")
     lines.extend(zin.ignored_settings_warning_lines(ignored_settings))
     lines.append("")
     lines.append("Accepted-but-ignored run_zegrid_mode arguments:")
@@ -1252,13 +1432,14 @@ def _write_run_log(
     )
     if _reproj.get("fallback_reason"):
         lines.append(f"  fallback_reason: {_reproj.get('fallback_reason')}")
-    lines.append("Final-mosaic finishing (ZM-ZEGRID-R18):")
+    lines.append("Final-mosaic finishing (ZM-ZEGRID-R23 rework-3):")
     fin = finishing_info or {}
     if not fin or not fin.get("enabled"):
         lines.append("  disabled (no finishing settings applied)")
     else:
         dbe = fin.get("dbe", {})
         rgb = fin.get("rgb_equalize", {})
+        hf = fin.get("hole_fill", {})
         u16 = fin.get("uint16", {})
         lines.append(f"  enabled: {bool(fin.get('enabled'))}")
         lines.append(
@@ -1266,19 +1447,50 @@ def _write_run_log(
         )
         lines.append(
             f"  dbe: enabled={dbe.get('enabled')} applied={dbe.get('applied')} "
-            f"strength={dbe.get('strength')} factor={dbe.get('strength_factor')} "
+            f"attempted={dbe.get('attempted')} reason={dbe.get('reason') or ''} "
+            f"algorithm={dbe.get('algorithm')} "
+            f"strength={dbe.get('strength')} "
+            f"params_source={dbe.get('params_source')} "
             f"params={dbe.get('params')}"
         )
+        for ch in (dbe.get("channels") or []):
+            if isinstance(ch, dict):
+                before = ch.get("before") or {}
+                after = ch.get("after") or {}
+                lines.append(
+                    f"    ch{ch.get('channel')}: applied={ch.get('applied')} "
+                    f"median={ch.get('median')} robust_sigma={ch.get('robust_sigma')} "
+                    f"obj_frac={ch.get('obj_frac')} "
+                    f"before_full_std={ch.get('before_full_std')} "
+                    f"after_full_std={ch.get('after_full_std')} "
+                    f"full_ratio={ch.get('full_ratio')} "
+                    f"neg_frac {before.get('neg_frac')} -> {after.get('neg_frac')}"
+                )
         lines.append(
             f"  rgb_equalize: enabled={rgb.get('enabled')} applied={rgb.get('applied')} "
             f"skies_before={rgb.get('skies_before')} skies_after={rgb.get('skies_after')}"
         )
         lines.append(
+            f"  hole_fill: enabled={hf.get('enabled')} applied={hf.get('applied')} "
+            f"reason={hf.get('reason') or ''} filled_px={hf.get('filled_px')} "
+            f"hole_px={hf.get('hole_px')} max_radius_px={hf.get('max_radius_px')} "
+            f"blend={hf.get('blend')} only_near_seams={hf.get('only_near_seams')} "
+            f"protect_stars_details={hf.get('protect_stars_details')}"
+        )
+        lines.append(
             f"  uint16: enabled={u16.get('enabled')} written={u16.get('written')} "
             f"vmin={u16.get('vmin')} vmax={u16.get('vmax')}"
         )
+    lines.append(
+        "  NOTE: aesthetic output is not photometrically neutral; use the "
+        "science reference FITS for measurement."
+    )
     lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
+    lines.append(
+        f"aggregate_peak_rss_kib: {aggregate_peak_rss_kib if aggregate_peak_rss_kib is not None else 'n/a'} "
+        "(parent + cell workers, UPPER BOUND incl. per-worker import baseline)"
+    )
     lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
     lines.append(f"photometric_gauge.global_reference_frame_id: {global_reference_frame_id}")
     text = "\n".join(lines) + "\n"
@@ -1304,6 +1516,7 @@ def _run_single(
     workers=None,
     ignored_run_args=None,
     finishing_config=None,
+    gpu_context=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1339,16 +1552,31 @@ def _run_single(
             global_eta=global_eta.estimate,
         )
 
-    # Explicit GPU-usage + ignored-settings surfacing (nothing silently ignored).
-    gpu_used = False  # ZeGrid engine is CPU-only.
-    ignored_settings = zin.ignored_settings_present(zconfig)
+    # ZM-ZEGRID-R22: explicit GPU-usage + ignored-settings surfacing (nothing
+    # silently ignored). ``gpu_used`` is the EFFECTIVE GPU backend (never claimed
+    # from CuPy initialisation alone); ``gpu_context`` carries the requested /
+    # available / effective / device / VRAM truth + fallback reason.
+    gpu_ctx = gpu_context or {}
+    gpu_used = bool(gpu_ctx.get("effective"))
+    ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=gpu_used)
     if ignored_settings:
         for line in zin.ignored_settings_warning_lines(ignored_settings):
             _emit(line, lvl="WARN", callback=progress_callback)
-    _emit(
-        f"ZeGrid: GPU usage — {zin.describe_gpu_usage()}",
-        callback=progress_callback,
-    )
+    if gpu_used:
+        _emit(
+            f"ZeGrid: GPU backend ENABLED — device={gpu_ctx.get('device')} "
+            f"vram_total={gpu_ctx.get('vram_total_bytes')} "
+            f"vram_free={gpu_ctx.get('vram_free_bytes')} "
+            f"budget={gpu_ctx.get('vram_budget_bytes')}",
+            callback=progress_callback,
+        )
+    else:
+        _emit(
+            f"ZeGrid: CPU backend (gpu requested={gpu_ctx.get('requested')} "
+            f"available={gpu_ctx.get('available')} "
+            f"reason={gpu_ctx.get('fallback_reason')})",
+            callback=progress_callback,
+        )
 
     _emit(f"ZeGrid: setup — {len(frames_info)} frame(s) -> {output_dir}", callback=progress_callback)
     _setup_rep = _reporter()
@@ -1508,28 +1736,107 @@ def _run_single(
     # x the largest cell, not the sum). A concurrent-path failure WARNs loudly and
     # degrades to the serial loop via pmap's fail-safe (never crash, never silent).
     available_now = available_memory_bytes()
-    cell_tasks = []
+    per_cell_budget = int(available_now * zpar.RAM_SAFETY_FRACTION)
+    cell_specs = []          # (cell, patch, mem, cache_dir, inmem_b | None, stream_b)
+    cell_bound_pairs = []    # (inmem_b, stream_b) for the joint planner (non-empty)
     for (row, col, cell, patch, mem) in cell_ctxs:
         cid = cell.cell_id
         idx = row * nx + col
         if not mem.patch_ids:
-            cell_tasks.append((cell, patch, mem, str(cache_root / cid), None, 0))
+            cell_specs.append((cell, patch, mem, str(cache_root / cid), None, 0))
             continue
         n = len(mem.patch_ids)
         area = patch.patch.width * patch.patch.height
-        mode, bound = _pick_mode(n, area, patch.patch_shape_hw, available_now)
+        inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
+        stream_b = _estimate_streaming_bytes(n, patch.patch_shape_hw, STREAM_TILE_SIZE)
+        cell_bound_pairs.append((inmem_b, stream_b))
+        cell_specs.append((cell, patch, mem, str(cache_root / cid), inmem_b, stream_b))
         _emit(
             f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) N={n} area={area}px "
-            f"mode={mode} bound={bound / 2**20:.1f}MiB",
+            f"inmem={inmem_b / 2**20:.1f}MiB stream={stream_b / 2**20:.1f}MiB",
             callback=progress_callback,
         )
-        cell_tasks.append((cell, patch, mem, str(cache_root / cid), mode, bound))
+
+    # ZM-ZEGRID-R22: JOINT mode + concurrency planner (replaces the R20 two-step
+    # trap: 'pick inmem per cell, then discover concurrency=1'). One explicit
+    # candidate plan compares safe in-memory vs safe streaming concurrency against
+    # the CPU RAM AND (when GPU) the single-device owner constraint, and the
+    # chosen concurrency is recorded verbatim in the manifest (never a silent
+    # serial surprise).
+    _plan = zpar.plan_cell_concurrency(
+        cell_bound_pairs, os.cpu_count(), per_cell_budget,
+        gpu_backend=gpu_used, cache_build_workers=cache_build_workers,
+    )
+    chosen_mode = _plan["mode"]
+    cells_in_flight = int(_plan["cells_in_flight"])
+    cache_workers_per_cell = int(_plan["cache_workers_per_cell"])
+    _emit(
+        f"ZeGrid: joint plan — mode={chosen_mode} cells_in_flight={cells_in_flight} "
+        f"cache_workers_per_cell={cache_workers_per_cell} "
+        f"gpu_serialized={_plan['gpu_serialized']} — {_plan['chosen_reason']}",
+        callback=progress_callback,
+    )
+    for c in _plan["candidates"]:
+        _emit(
+            f"ZeGrid: plan candidate mode={c['mode']} cells_in_flight={c['cells_in_flight']} "
+            f"max_bound={c['max_bound_bytes'] / 2**20:.1f}MiB "
+            f"makespan_rel={c['makespan_rel']:.3f}",
+            callback=progress_callback,
+        )
+
+    # Build the final cell tasks with the CHOSEN uniform mode + its bound.
+    cell_tasks = []
+    for (cell, patch, mem, cache_dir, inmem_b, stream_b) in cell_specs:
+        if inmem_b is None:
+            cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
+        elif chosen_mode == "inmem":
+            cell_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
+        else:
+            cell_tasks.append((cell, patch, mem, cache_dir, "stream", stream_b))
 
     per_cell_footprint = max((t[5] for t in cell_tasks if t[4] is not None), default=0)
-    per_cell_budget = int(available_now * zpar.RAM_SAFETY_FRACTION)
-    cells_in_flight = zpar.cells_in_flight(
-        os.cpu_count(), per_cell_budget, per_cell_footprint
+
+    # ZM-ZEGRID-R22: VRAM-bounded GPU tile size for the stack phase (when the GPU
+    # backend is effective). Single GPU owner => stack tasks are serialised; the
+    # tile size is a pure function of (max N, worst patch, VRAM budget) so the
+    # device never materialises N x full-cell. A degenerate (None) tile degrades
+    # LOUDLY to exact CPU (no silent fallback).
+    gpu_tile_size = STREAM_TILE_SIZE
+    if gpu_used:
+        max_n = max((len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids), default=1)
+        worst_hw = (1, 1)
+        worst_area = -1
+        for (_r, _c, _ce, _p, m) in cell_ctxs:
+            if m.patch_ids:
+                hw = _p.patch_shape_hw
+                area = hw[0] * hw[1]
+                if area > worst_area:
+                    worst_area = area
+                    worst_hw = hw
+        _gpu_ts = zgpu.choose_gpu_tile_size(max_n, 3, worst_hw, gpu_ctx.get("vram_budget_bytes"))
+        if _gpu_ts is None:
+            _emit(
+                "ZeGrid: VRAM budget cannot hold even a minimum GPU tile for the "
+                "heaviest cell; degrading to exact CPU (no silent fallback)",
+                lvl="WARN", callback=progress_callback,
+            )
+            gpu_used = False
+            science_config = replace(science_config, backend="cpu")
+            gpu_ctx = dict(gpu_ctx)
+            gpu_ctx["effective"] = False
+            gpu_ctx["attempted"] = False
+            gpu_ctx["final_effective"] = False
+            gpu_ctx["actually_used"] = False
+            gpu_ctx["final_backend"] = "cpu"
+            gpu_ctx["fallback_reason"] = gpu_ctx.get("fallback_reason") or "vram_tile_infeasible"
+            ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
+        else:
+            gpu_tile_size = _gpu_ts
+    _emit(
+        f"ZeGrid: stack tile size={gpu_tile_size} backend={science_config.backend}",
+        callback=progress_callback,
     )
+
     _emit(
         f"ZeGrid: per-cell concurrency — cells_in_flight={cells_in_flight} "
         f"(cpu={os.cpu_count()}, avail={available_now / 2**30:.2f}GiB, "
@@ -1548,6 +1855,11 @@ def _run_single(
         "per_cell_footprint_bytes": int(per_cell_footprint),
         "cells": int(len(cell_tasks)),
         "cache_build_workers": int(cache_build_workers),
+        "mode": chosen_mode,
+        "cache_workers_per_cell": int(cache_workers_per_cell),
+        "gpu_serialized": bool(_plan.get("gpu_serialized")),
+        "plan_chosen_reason": _plan.get("chosen_reason"),
+        "plan_candidates": _plan.get("candidates"),
     }
     per_cell_meta = {}
 
@@ -1556,14 +1868,84 @@ def _run_single(
         _stack_rep.progress(int(done), item_id=cid)
 
     t_block0 = time.perf_counter()
-    results = zpar.pmap(
-        _stack_cell, cell_tasks, workers=cells_in_flight,
-        progress_callback=_cell_progress, emit=_emit_live, meta=per_cell_meta,
-        initializer=_init_stack_worker,
-        initargs=(descs, canvas, science_config, global_gauge, global_frame_ids,
-                  global_reference_frame_id),
-    )
+
+    def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt):
+        """Run the WHOLE per-cell batch once; returns (results, meta).
+
+        ``gpu_attempt=True`` disables pmap's SAME-config serial retry (serial_fallback
+        False) so a CuPy OOM/driver error propagates here for a one-shot CPU rerun
+        instead of being retried with the same GPU config (which would repeat the
+        error and crash).
+        """
+        _meta = {}
+        _res = zpar.pmap(
+            _stack_cell, cell_tasks, workers=cells_in_flight,
+            progress_callback=_cell_progress, emit=_emit_live, meta=_meta,
+            initializer=_init_stack_worker,
+            initargs=(descs, canvas, science_cfg, global_gauge, global_frame_ids,
+                      global_reference_frame_id, tile_size, cache_workers_per_cell),
+            serial_fallback=not gpu_attempt,
+        )
+        return _res, _meta
+
+    runtime_gpu_fallback = None
+    if gpu_used:
+        try:
+            results, per_cell_meta = _run_cell_batch(
+                science_config, gpu_tile_size, gpu_attempt=True
+            )
+        except Exception as exc:
+            if zgpu.is_gpu_runtime_error(exc):
+                # H1: classified GPU runtime failure -> one-shot exact-CPU
+                # whole-batch rerun (WARN, recorded; no recursion).
+                runtime_gpu_fallback = {"reason": repr(exc), "type": type(exc).__name__}
+                _emit(
+                    f"ZeGrid: GPU RUNTIME failure ({type(exc).__name__}); "
+                    f"degrading to exact CPU whole-batch rerun (no silent fallback): {exc}",
+                    lvl="WARN", callback=progress_callback,
+                )
+                gpu_used = False
+                science_config = replace(science_config, backend="cpu")
+                gpu_ctx = dict(gpu_ctx)
+                gpu_ctx["effective"] = False
+                gpu_ctx["final_effective"] = False
+                gpu_ctx["actually_used"] = False
+                gpu_ctx["final_backend"] = "cpu"
+                gpu_ctx["runtime_fallback"] = runtime_gpu_fallback
+                ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
+                # Clean any partial per-cell cache left by the failed GPU workers
+                # (bounded disk + Windows file-lock safety: the failed workers are
+                # already closed when pmap re-raised; deletion is best-effort).
+                for _t in cell_tasks:
+                    if _t[4] is not None:
+                        _safe_rmtree(_t[3], None)
+                # Rerun the WHOLE batch exactly once on CPU (no recursion).
+                results, per_cell_meta = _run_cell_batch(
+                    science_config, STREAM_TILE_SIZE, gpu_attempt=False
+                )
+            else:
+                raise  # arbitrary science/programming error propagates (never swallowed)
+    else:
+        results, per_cell_meta = _run_cell_batch(
+            science_config, gpu_tile_size, gpu_attempt=False
+        )
+
     block_wall = time.perf_counter() - t_block0
+
+    # H2: actual backend EVIDENCE from the executed cells (never the selection).
+    # `used=true` only when a successful cell actually ran the GPU canonical and
+    # no whole-batch CPU rerun replaced it.
+    gpu_executed_cells = sum(
+        1 for r in results
+        if r.get("status") == "complete" and r.get("backend_used") == "gpu"
+    )
+    actually_used_gpu = bool(gpu_executed_cells > 0 and runtime_gpu_fallback is None)
+    gpu_ctx = dict(gpu_ctx)
+    gpu_ctx["gpu_executed_cells"] = int(gpu_executed_cells)
+    gpu_ctx["actually_used"] = bool(actually_used_gpu)
+    gpu_ctx["final_backend"] = "gpu" if actually_used_gpu else "cpu"
+    gpu_ctx["final_effective"] = bool(actually_used_gpu)
+    gpu_used = bool(actually_used_gpu)
 
     # R20 diagnostics (mirrors the R19 gauge diagnostics): effective executor,
     # parent daemon flag, workers/cells-in-flight, seconds/unit.
@@ -1636,6 +2018,12 @@ def _run_single(
     with timings.timed("assembly"):
         assembled = zmosaic.assemble_canvas(canvas, nx, ny, cores)
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
+    # ZM-ZEGRID-R22 honesty fix: peak_rss_kib is a SINGLE process's peak. Report
+    # the batch aggregate (parent + all cell workers) as a clearly-labelled UPPER
+    # bound alongside it, so the manifest no longer under-states parallel memory.
+    aggregate_peak_rss_kib = zsw.aggregate_peak_rss_kib(
+        zsw.peak_rss_kib(), [r.get("peak_rss_kib", 0) for r in results]
+    )
     _assembly_rep.end(
         throughput=_fmt_throughput(len(assembled.complete_cells), timings.get("assembly"), "cells/s")
     )
@@ -1659,6 +2047,18 @@ def _run_single(
         "retention": "per-cell temporary (deleted after stacking); gauge cache deleted after use",
         "cleanup_failures": cleanup_failures,
     }
+
+    # ZM-ZEGRID-R23 rework-3 (H1): resolve the Classic-compatible output naming
+    # from the finishing config (existing export_aesthetic_fits + cleaned suffixes).
+    raw_science = np.asarray(assembled.science, dtype=np.float32)
+    raw_science_path, aesthetic_path = _resolve_output_paths(output_dir, finishing_config)
+
+    # Write the immutable pre-finishing assembled science FIRST, so a finishing
+    # exception can never destroy the scientific reference.
+    _write_raw_science_fits(
+        assembled, canvas, raw_science_path,
+        related_file=(aesthetic_path.name if aesthetic_path is not None else None),
+    )
 
     # ZM-ZEGRID-R18: FINAL-MOSAIC FINISHING (post-assembly, before outputs).
     # Opt-in + fail-safe: a finishing failure WARNS and lets the run complete with
@@ -1697,7 +2097,8 @@ def _run_single(
         }
         fin_uint16 = None
 
-    # Write legacy-compatible outputs.
+    # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
+    export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
     sci_path, cov_path, manifest_path = _write_outputs(
         assembled, canvas, nx, ny, output_dir, descs, {}, cell_records,
         layout, science_config, peak_rss_kib, cache_report, progress_callback,
@@ -1710,6 +2111,15 @@ def _run_single(
         per_cell_diagnostics=per_cell_diagnostics,
         finished_science=finished_science, finishing_info=finishing_info,
         fin_uint16=fin_uint16,
+        gpu_context=gpu_ctx,
+        aggregate_peak_rss_kib=aggregate_peak_rss_kib,
+        raw_science_path=raw_science_path,
+        raw_science=raw_science,
+        aesthetic_path=aesthetic_path if export_aesthetic else None,
+        export_aesthetic_fits=export_aesthetic,
+        scientific_fits_suffix=(finishing_config or {}).get(
+            "scientific_fits_suffix", "_science"
+        ),
     )
 
     _write_run_log(
@@ -1730,10 +2140,14 @@ def _run_single(
         gauge_diagnostics=gauge_diagnostics,
         per_cell_diagnostics=per_cell_diagnostics,
         finishing_info=finishing_info,
+        gpu_context=gpu_ctx,
+        aggregate_peak_rss_kib=aggregate_peak_rss_kib,
     )
 
     _emit(
-        f"ZeGrid: done — {sci_path.name} ({assembled.science.shape}) + coverage + run log, "
+        f"ZeGrid: done — science={raw_science_path.name} "
+        f"aesthetic={aesthetic_path.name if (export_aesthetic and aesthetic_path is not None) else 'n/a'} "
+        f"({assembled.science.shape}) + coverage + run log, "
         f"complete={len(assembled.complete_cells)} incomplete={len(assembled.incomplete_cells)} "
         f"holes={assembled.hole_pixels}px peak_rss={peak_rss_kib}KiB "
         f"cache_total={cache_total_bytes / 2**20:.0f}MiB cache_peak={cache_peak_bytes / 2**20:.0f}MiB",
@@ -1741,6 +2155,263 @@ def _run_single(
         callback=progress_callback,
     )
     return sci_path
+
+
+def _resolve_output_paths(output_dir, finishing_config):
+    """Resolve the raw-science + aesthetic output paths (Classic naming).
+
+    Base name is ``mosaic_grid``. Per the rework-3 Classic-compatible contract:
+
+    * ``export_aesthetic_fits=false`` → raw science at ``mosaic_grid.fits``
+      (pre-finishing, SCI role), NO aesthetic float companion;
+    * ``export_aesthetic_fits=true`` → raw science at
+      ``mosaic_grid<clean scientific suffix>.fits`` + aesthetic float32 at
+      ``mosaic_grid<clean aesthetic suffix>.fits`` (defaults
+      ``mosaic_grid_science.fits`` / ``mosaic_grid_aesthetic.fits``).
+
+    Returns ``(raw_science_path, aesthetic_path_or_None)``.
+    """
+    cfg = finishing_config or {}
+    export = bool(cfg.get("export_aesthetic_fits", False))
+    sci_suffix = cfg.get("scientific_fits_suffix", "_science")
+    aest_suffix = cfg.get("aesthetic_fits_suffix", "_aesthetic")
+    output_dir = Path(output_dir)
+    if export:
+        raw_path = output_dir / f"mosaic_grid{sci_suffix}.fits"
+        aest_path = output_dir / f"mosaic_grid{aest_suffix}.fits"
+    else:
+        raw_path = output_dir / "mosaic_grid.fits"
+        aest_path = None
+    return raw_path, aest_path
+
+
+def _write_raw_science_fits(assembled, canvas, raw_science_path, role="SCI", related_file=None):
+    """Write the immutable pre-finishing assembled science FITS.
+
+    Written BEFORE finishing runs so a finishing exception can never destroy the
+    scientific reference. Same WCS/axis layout as the delivered output, float32,
+    never clamped/offset/abs'd. Header records role (``SCI`` scientific reference),
+    dtype + DBE state + hash, plus the related aesthetic file (when one is emitted).
+    """
+    raw_science = np.asarray(assembled.science, dtype=np.float32)
+    raw_data = np.ascontiguousarray(np.moveaxis(raw_science, -1, 0))  # (3, H, W)
+    raw_header = _science_header(
+        canvas,
+        role=role,
+        dtype="float32",
+        dbe_state="n/a",
+        sha256=_array_sha256(raw_data),
+        related_file=related_file,
+    )
+    _atomic_writeto(fits.PrimaryHDU(raw_data, header=raw_header), raw_science_path)
+    return raw_science_path
+
+
+def _remove_if_exists(path: Path) -> None:
+    """Best-effort unlink of ``path``; never raises (auditable failure only)."""
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _atomic_writeto(hdu, path):
+    """Write a FITS HDU atomically (temp file + rename) so no half-written file
+    is silently presented as valid.
+
+    Guarantees (ZM-ZEGRID-R24 A2):
+
+    * on success, only the final target exists (no ``<target>.tmp`` remains);
+    * if the temp write OR the final rename raises, the ``<target>.tmp`` is
+      removed best-effort and a pre-existing valid target is left untouched
+      (the target is only ever replaced by the atomic ``os.replace``, which
+      runs strictly after a fully successful temp write).
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        hdu.writeto(tmp, overwrite=True)
+    except Exception:
+        _remove_if_exists(tmp)
+        raise
+    try:
+        os.replace(tmp, path)
+    except Exception:
+        _remove_if_exists(tmp)
+        raise
+
+
+# Fixed output names that are NEVER a valid aesthetic companion (so a malicious/
+# hand-edited prior manifest can never convince the stale cleaner to delete a
+# science/coverage/uint16/log file under a fixed reserved name).
+_RESERVED_NON_AESTHETIC = {
+    "mosaic_grid.fits",
+    "mosaic_grid_coverage.fits",
+    "mosaic_grid_uint16.fits",
+    RUN_LOG_NAME,
+}
+
+
+def _scientific_suffix_from_name(name):
+    """Return the clean suffix of a ``mosaic_grid<suffix>.fits`` science name.
+
+    ZM-ZEGRID-R25: a candidate name matching a SCIENTIFIC output pattern must
+    never be removed. ``name`` is a recognised science-pattern name when it has
+    the ``mosaic_grid*.fits`` shape with a NON-EMPTY middle suffix, in which
+    case that middle suffix is returned (e.g. ``_science`` for
+    ``mosaic_grid_science.fits``). Returns ``None`` otherwise — including the
+    bare primary-science name ``mosaic_grid.fits`` (empty suffix, reserved
+    separately via ``_RESERVED_NON_AESTHETIC``).
+    """
+    if not isinstance(name, str):
+        return None
+    if not (name.startswith("mosaic_grid") and name.endswith(".fits")):
+        return None
+    suffix = name[len("mosaic_grid"):-len(".fits")]
+    return suffix or None
+
+
+def _cleanup_stale_aesthetic(
+    output_dir, current_aesthetic_path, protected_names=(), scientific_suffix=None
+):
+    """Best-effort removal of a prior manifest-declared stale aesthetic FITS.
+
+    ZM-ZEGRID-R24 (A2): on a rerun into the same output directory, a previous
+    run may have left an aesthetic companion (``mosaic_grid*.fits``) that is no
+    longer a current output (export checkbox turned OFF, or the aesthetic suffix
+    changed). Read ONLY the prior ``zegrid_manifest.json``; after the current
+    outputs are successfully written and before the current manifest is
+    published, remove that one prior-declared aesthetic FITS — and nothing else.
+
+    Strict validation before ANY deletion:
+
+    * the declared name must be a clean basename inside ``output_dir`` (no path
+      separators, no ``..``, no absolute path);
+    * it must be a recognised ``mosaic_grid*.fits`` name with a NON-EMPTY suffix
+      (the bare ``mosaic_grid.fits`` primary-science name and the fixed coverage/
+      uint16/log names are never deleted);
+    * it must not collide with any current output name (raw science / coverage /
+      uint16 / aesthetic / run log);
+    * ZM-ZEGRID-R25 (L1): it must NOT match a SCIENTIFIC output pattern —
+      ``mosaic_grid<scientific_suffix>.fits`` for the prior manifest's declared
+      scientific suffix (when it records one) or the current run's resolved
+      ``scientific_fits_suffix`` (default ``_science``). Both suffixes are
+      honoured, so a corrupt/hand-edited prior manifest can never convince the
+      cleaner to delete a raw science output, whatever name it declares.
+
+    Never glob-deletes, never touches science/coverage/uint16/user files, and
+    never a path outside ``output_dir``. Failures are recorded (never raised) so
+    the manifest ``stale_cleanup`` block / run log can surface them.
+    """
+    record: dict = {
+        "ran": True,
+        "removed": [],
+        "kept": [],
+        "warnings": [],
+    }
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "zegrid_manifest.json"
+    if not manifest_path.exists():
+        record["reason"] = "no_prior_manifest"
+        return record
+    try:
+        prior = json.loads(manifest_path.read_text())
+    except Exception as exc:
+        record["reason"] = "prior_manifest_unreadable"
+        record["warnings"].append(f"could not read prior manifest: {exc}")
+        return record
+    if not isinstance(prior, dict):
+        record["reason"] = "prior_manifest_not_object"
+        return record
+
+    prior_name = None
+    outputs = prior.get("outputs")
+    if isinstance(outputs, dict):
+        prior_name = outputs.get("aesthetic")
+    if not prior_name:
+        soc = prior.get("science_output_contract") or {}
+        aest = soc.get("aesthetic") if isinstance(soc, dict) else None
+        # ZM-ZEGRID-R25 (L1): only trust the contract's aesthetic record when it
+        # actually identifies an aesthetic (role == "AESTH").
+        if isinstance(aest, dict) and aest.get("role") == "AESTH":
+            prior_name = aest.get("file")
+    if not prior_name or not isinstance(prior_name, str):
+        record["reason"] = "no_prior_aesthetic_declared"
+        return record
+
+    # ZM-ZEGRID-R25 (L1): resolve every SCIENTIFIC output suffix that must NEVER
+    # be removed — the prior manifest's declared scientific suffix (when it
+    # records one) and the current run's resolved scientific suffix (default
+    # ``_science``). A name matching any of these patterns is a raw-science
+    # output and is refused unconditionally.
+    science_suffixes: set[str] = set()
+    _soc = prior.get("science_output_contract")
+    if isinstance(_soc, dict):
+        _raw = _soc.get("raw")
+        if isinstance(_raw, dict):
+            _sfx = _scientific_suffix_from_name(_raw.get("file"))
+            if _sfx:
+                science_suffixes.add(_sfx)
+    _outputs = prior.get("outputs")
+    if isinstance(_outputs, dict):
+        _sfx = _scientific_suffix_from_name(_outputs.get("science"))
+        if _sfx:
+            science_suffixes.add(_sfx)
+    _sfx = _scientific_suffix_from_name(prior.get("science_reference"))
+    if _sfx:
+        science_suffixes.add(_sfx)
+    science_suffixes.add(
+        scientific_suffix
+        if isinstance(scientific_suffix, str) and scientific_suffix
+        else "_science"
+    )
+
+    prior_name = prior_name.strip()
+    current_name = (
+        Path(current_aesthetic_path).name if current_aesthetic_path is not None else None
+    )
+    if current_name == prior_name:
+        record["reason"] = "prior_aesthetic_is_current"
+        record["kept"].append(prior_name)
+        return record
+
+    problems: list[str] = []
+    if not prior_name or prior_name in {"", ".", ".."}:
+        problems.append("empty or reserved name")
+    if Path(prior_name).name != prior_name or "/" in prior_name or "\\" in prior_name:
+        problems.append("not a clean basename (contains a path separator)")
+    if not (prior_name.startswith("mosaic_grid") and prior_name.endswith(".fits")):
+        problems.append("not a recognised mosaic_grid*.fits name")
+    if prior_name in _RESERVED_NON_AESTHETIC:
+        problems.append("fixed reserved (non-aesthetic) output name")
+    if _scientific_suffix_from_name(prior_name) in science_suffixes:
+        problems.append("matches a scientific output name (never removed)")
+    if prior_name in set(protected_names or ()):
+        problems.append("collides with a current output name")
+
+    if problems:
+        record["reason"] = "invalid_prior_declaration"
+        record["warnings"].append(
+            f"refusing to remove prior-declared aesthetic {prior_name!r}: "
+            + "; ".join(problems)
+        )
+        record["kept"].append(prior_name)
+        return record
+
+    target = output_dir / prior_name
+    try:
+        if target.exists():
+            target.unlink()
+            record["removed"].append(prior_name)
+        else:
+            record["reason"] = "prior_aesthetic_absent"
+            record["kept"].append(prior_name)
+    except Exception as exc:
+        record["reason"] = "removal_failed"
+        record["warnings"].append(f"could not remove {prior_name!r}: {exc}")
+        record["kept"].append(prior_name)
+    return record
 
 
 def _write_outputs(
@@ -1752,41 +2423,145 @@ def _write_outputs(
     gauge_diagnostics=None,
     per_cell_diagnostics=None,
     finished_science=None, finishing_info=None, fin_uint16=None,
+    gpu_context=None,
+    aggregate_peak_rss_kib=None,
+    raw_science_path=None,
+    raw_science=None,
+    aesthetic_path=None,
+    export_aesthetic_fits=False,
+    scientific_fits_suffix=None,
 ):
     output_dir = Path(output_dir)
-    # ZM-ZEGRID-R18: use the finished science when provided (bit-equal to the raw
-    # path when finishing is disabled -> ``finished_science`` is the same array).
+    # ZM-ZEGRID-R18: use the finished (aesthetic) science when provided (bit-equal
+    # to the raw path when finishing is disabled -> ``finished_science`` is the same
+    # array). The RAW science is written first (immutable reference), and the
+    # aesthetic float is written ONLY when ``export_aesthetic_fits`` (Classic naming).
     science = np.asarray(
         assembled.science if finished_science is None else finished_science,
         dtype=np.float32,
     )  # (H, W, 3)
     stack_depth = np.asarray(assembled.stack_depth, dtype=np.int32)  # (H, W)
 
-    sci_header = _canvas_header(canvas, ndim=3, channels=3)
     sci_data = np.ascontiguousarray(np.moveaxis(science, -1, 0))  # (3, H, W)
-    sci_path = output_dir / "mosaic_grid.fits"
-    fits.PrimaryHDU(sci_data, header=sci_header).writeto(sci_path, overwrite=True)
 
-    # ZM-ZEGRID-R18: optional uint16 render (save_final_as_uint16). Documented
-    # linear stretch; the float science FITS above remains the primary product.
+    # ZM-ZEGRID-R23 rework-3 (H1): Classic-compatible naming on base ``mosaic_grid``.
+    # ``mosaic_grid<clean scientific suffix>.fits`` is the immutable pre-finishing
+    # reference (SCI role, written by ``_run_single`` before finishing);
+    # ``mosaic_grid<clean aesthetic suffix>.fits`` is the delivered aesthetic
+    # float32 (AESTH role), written only when ``export_aesthetic_fits``.
+    if raw_science_path is None:
+        raw_science_path = output_dir / "mosaic_grid.fits"
+        _write_raw_science_fits(assembled, canvas, raw_science_path)
+    raw_science_path = Path(raw_science_path)
+
+    if aesthetic_path is not None:
+        aesthetic_path = Path(aesthetic_path)
+
+    dbe_applied = bool((finishing_info or {}).get("dbe", {}).get("applied"))
+    dbe_attempted = bool((finishing_info or {}).get("dbe", {}).get("attempted"))
+    dbe_enabled = bool((finishing_info or {}).get("dbe", {}).get("enabled"))
+    finishing_failed = bool((finishing_info or {}).get("failed"))
+    if finishing_failed:
+        dbe_state = "failed"
+    elif dbe_applied:
+        dbe_state = "on"
+    elif dbe_attempted:
+        dbe_state = "noop"
+    else:
+        dbe_state = "off"
+
+    # Aesthetic float is emitted only when the checkbox is set.
+    sci_path = aesthetic_path if aesthetic_path is not None else raw_science_path
+    if aesthetic_path is not None:
+        sci_header = _science_header(
+            canvas,
+            role="AESTH",
+            dtype="float32",
+            dbe_state=dbe_state,
+            sha256=_array_sha256(sci_data),
+            related_file=raw_science_path.name,
+        )
+        _atomic_writeto(fits.PrimaryHDU(sci_data, header=sci_header), aesthetic_path)
+    elif export_aesthetic_fits:
+        # Checkbox set but no aesthetic path resolved -> do not fabricate a file.
+        pass
+
+    # ZM-ZEGRID-R18: optional uint16 render (save_final_as_uint16). Derived from
+    # the post-aesthetic branch; clearly non-scientific.
     uint16_path = None
     if fin_uint16 is not None:
         u16 = np.asarray(fin_uint16, dtype=np.uint16)
         u16_header = _canvas_header(canvas, ndim=3, channels=3)
         u16_header["BUNIT"] = ("adu16", "uint16 render (see finishing.uint16)")
+        u16_header["SCIROLE"] = ("uint16_render", "derived render, NOT a science reference")
         _u16_info = (finishing_info or {}).get("uint16", {})
         if "vmin" in _u16_info:
             u16_header["U16VMIN"] = (float(_u16_info["vmin"]), "scaling vmin (float ADU)")
             u16_header["U16VMAX"] = (float(_u16_info["vmax"]), "scaling vmax (float ADU)")
         uint16_path = output_dir / "mosaic_grid_uint16.fits"
-        fits.PrimaryHDU(
-            np.ascontiguousarray(np.moveaxis(u16, -1, 0)), header=u16_header
-        ).writeto(uint16_path, overwrite=True)
+        _atomic_writeto(
+            fits.PrimaryHDU(
+                np.ascontiguousarray(np.moveaxis(u16, -1, 0)), header=u16_header
+            ),
+            uint16_path,
+        )
 
     cov_header = _canvas_header(canvas, ndim=2)
     cov_header["BUNIT"] = ("count", "per-pixel stack depth (max over channels)")
     cov_path = output_dir / "mosaic_grid_coverage.fits"
-    fits.PrimaryHDU(stack_depth, header=cov_header).writeto(cov_path, overwrite=True)
+    _atomic_writeto(fits.PrimaryHDU(stack_depth, header=cov_header), cov_path)
+
+    # ZM-ZEGRID-R24 (A2): conservative stale-aesthetic cleanup. Runs ONLY after
+    # every current output above has been successfully written and BEFORE the
+    # current manifest is published, so a failed current run never erases the
+    # prior valid aesthetic (its manifest is still intact on disk). Read-only on
+    # the prior manifest; never glob-deletes and never touches science/coverage/
+    # uint16/user files or anything outside ``output_dir``.
+    stale_cleanup = _cleanup_stale_aesthetic(
+        output_dir,
+        aesthetic_path,
+        protected_names={
+            raw_science_path.name,
+            cov_path.name,
+            RUN_LOG_NAME,
+            *([uint16_path.name] if uint16_path is not None else []),
+            *([aesthetic_path.name] if aesthetic_path is not None else []),
+        },
+        scientific_suffix=scientific_fits_suffix,
+    )
+
+    # ZM-ZEGRID-R24 (A1): the ``science_output_contract`` block is built here so
+    # the ``aesthetic`` sub-record can be OMITTED ENTIRELY when no aesthetic FITS
+    # is emitted (no ``file=None`` + in-memory SHA). ``outputs.aesthetic`` stays
+    # an explicit ``null`` for a stable top-level schema; only the contract's
+    # aesthetic truth is dropped when absent.
+    science_output_contract = {
+        "note": (
+            "ZM-ZEGRID-R23 rework-3: 'science'/'science_reference' is the "
+            "immutable pre-finishing assembled science (the scientific/"
+            "photometric reference, always written); 'aesthetic' is the "
+            "delivered legacy light-DBE aesthetic float32 (written only when "
+            "export_aesthetic_fits is true; bit-identical to raw when finishing "
+            "is disabled). 'uint16' is only an optional render derived from the "
+            "aesthetic float32, never a scientific reference."
+        ),
+        "raw": {
+            "file": raw_science_path.name,
+            "role": "SCI",
+            "dtype": "float32",
+            "sha256": _array_sha256(np.ascontiguousarray(np.moveaxis(
+                np.asarray(assembled.science if raw_science is None else raw_science,
+                           dtype=np.float32), -1, 0))),
+        },
+    }
+    if aesthetic_path is not None:
+        science_output_contract["aesthetic"] = {
+            "file": aesthetic_path.name,
+            "role": "AESTH",
+            "dtype": "float32",
+            "dbe_state": dbe_state,
+            "sha256": _array_sha256(sci_data),
+        }
 
     # Cache accounting: prefer the explicit cache_report (per-cell temp reuse)
     # and fall back to summing the manifests (legacy persistent-cache path).
@@ -1884,7 +2659,7 @@ def _write_outputs(
                   "reused_cells": (cache_report or {}).get("reused", []),
                   "rebuilt_cells": (cache_report or {}).get("rebuilt", [])},
         "timings": (timings.to_dict() if timings is not None else {}),
-        "gpu": {"used": bool(gpu_used), "note": zin.GPU_USAGE_NOTE},
+        "gpu": _manifest_gpu_block(gpu_used, gpu_context),
         "ignored_settings": (ignored_settings or {}),
         "ignored_run_args": (ignored_run_args or {}),
         "reprojection": zxe.merge_reproject_stats(
@@ -1895,12 +2670,32 @@ def _write_outputs(
         "per_cell_diagnostics": (per_cell_diagnostics or {}),
         "finishing": (finishing_info or {}),
         "peak_rss_kib": peak_rss_kib,
+        "peak_rss_kib_note": (
+            "peak RSS of a SINGLE process (RUSAGE_SELF on Linux / current RSS on "
+            "Windows); see aggregate_peak_rss_kib for the parent+worker batch bound"
+        ),
+        "aggregate_peak_rss_kib": aggregate_peak_rss_kib,
+        "aggregate_peak_rss_kib_note": (
+            "parent + sum of cell-worker peak RSS (UPPER BOUND: each worker includes "
+            "its own ~340 MiB import baseline; shared/copy-on-write pages are not "
+            "deduplicated)"
+        ),
         "outputs": {
-            "science": sci_path.name,
+            "science": raw_science_path.name,
+            "aesthetic": (aesthetic_path.name if aesthetic_path is not None else None),
             "coverage": cov_path.name,
             "uint16": (uint16_path.name if uint16_path is not None else None),
             "run_log": RUN_LOG_NAME,
         },
+        "science_reference": raw_science_path.name,
+        "algorithm": ("legacy_grid_light_dbe" if dbe_applied else None),
+        "aesthetic_warning": (
+            f"aesthetic output ({aesthetic_path.name}) is not photometrically "
+            f"neutral; use science_reference ({raw_science_path.name}) for "
+            "measurement" if aesthetic_path is not None else None
+        ),
+        "science_output_contract": science_output_contract,
+        "stale_cleanup": stale_cleanup,
     }
     manifest_path = output_dir / "zegrid_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -1939,12 +2734,66 @@ def run_zegrid_mode(
     weighting/rejection/combine/taper use the frozen ZeGrid science config.
     """
     _emit("ZeGrid engine activated (stack_plan.csv detected)", callback=progress_callback)
-    if use_gpu:
+
+    # ZM-ZEGRID-R22: resolve ONE canonical GPU preference and decide the backend
+    # HONESTLY (requested -> available -> effective). ``use_gpu`` is now honoured
+    # (never silently dropped); an unavailable/undersized GPU degrades loudly to
+    # exact CPU with a recorded reason.
+    gpu_requested, gpu_source = resolve_gpu_preference(use_gpu, zconfig)
+    gpu_probe = zgpu.probe_gpu_backend()
+    vram_budget = zgpu.vram_budget_bytes(gpu_probe)
+    gpu_effective = False
+    gpu_fallback_reason = None
+    if gpu_requested:
+        if not gpu_probe["available"]:
+            gpu_fallback_reason = gpu_probe.get("reason") or "gpu_unavailable"
+        elif vram_budget is None:
+            gpu_fallback_reason = "vram_unknown_or_too_small"
+        else:
+            gpu_effective = True
+    if gpu_requested and not gpu_effective:
         _emit(
-            "ZeGrid engine is CPU-only (streaming/in-memory canonical); ignoring use_gpu=True",
+            "ZeGrid: GPU requested (use_gpu=True) but NOT usable — "
+            f"{gpu_fallback_reason}; degrading to exact CPU (bit-identical output, "
+            "slower). No silent CPU fallback: this is recorded in the manifest/log.",
             lvl="WARN",
             callback=progress_callback,
         )
+    elif gpu_requested and gpu_effective:
+        _emit(
+            f"ZeGrid: GPU ENABLED — device={gpu_probe['device']} "
+            f"vram_total={gpu_probe['vram_total_bytes']} "
+            f"vram_free={gpu_probe['vram_free_bytes']} budget={vram_budget} "
+            f"(source={gpu_source})",
+            callback=progress_callback,
+        )
+    else:
+        _emit(
+            f"ZeGrid: GPU not requested (source={gpu_source}); CPU backend",
+            callback=progress_callback,
+        )
+    gpu_context = {
+        "requested": bool(gpu_requested),
+        "requested_source": gpu_source,
+        "available": bool(gpu_probe["available"]),
+        # ZM-ZEGRID-R22 rework-1: distinguish SELECTED (attempted) from EXECUTED
+        # (actually_used). ``effective`` stays for back-compat (== attempted at
+        # start); ``actually_used``/``final_backend`` are filled in `_run_single`
+        # from per-cell execution evidence (H2).
+        "attempted": bool(gpu_effective),
+        "effective": bool(gpu_effective),
+        "final_effective": bool(gpu_effective),
+        "actually_used": False,
+        "final_backend": "gpu" if gpu_effective else "cpu",
+        "gpu_executed_cells": 0,
+        "runtime_fallback": None,
+        "device": gpu_probe["device"],
+        "cupy_version": gpu_probe["cupy_version"],
+        "vram_total_bytes": gpu_probe["vram_total_bytes"],
+        "vram_free_bytes": gpu_probe["vram_free_bytes"],
+        "vram_budget_bytes": vram_budget,
+        "fallback_reason": gpu_fallback_reason,
+    }
 
     # ZM-ZEGRID-R16: honour the user's rejection choice (stack_reject_algo +
     # kappa/winsor) where the canonical engine supports it; surface (WARN) anything
@@ -1960,7 +2809,6 @@ def run_zegrid_mode(
         "radial_feather_fraction": radial_feather_fraction,
         "radial_shape_power": radial_shape_power,
         "legacy_rgb_cube": legacy_rgb_cube,
-        "use_gpu": bool(use_gpu),
     }
     ignored_run_args.update(rej_unhonoured)
     for line in zin.describe_ignored_run_args(ignored_run_args):
@@ -1976,11 +2824,22 @@ def run_zegrid_mode(
     )
     _emit(
         f"ZeGrid: final-mosaic finishing — DBE={finishing_config['dbe_enabled']} "
-        f"(strength={finishing_config['dbe_strength']}, factor={finishing_config['dbe_strength_factor']}, "
+        f"(strength={finishing_config['dbe_strength']}, "
+        f"params_source={finishing_config['dbe_params_source']}, "
+        f"subtraction_factor={finishing_config['dbe_subtraction_factor']}, "
         f"params={finishing_config['dbe_params']}), rgb_equalize={finishing_config['rgb_equalize']}, "
         f"uint16={finishing_config['save_uint16']}",
         callback=progress_callback,
     )
+    # ZM-ZEGRID-R24 (A4): surface any boolean-coercion fallback (unknown/typed
+    # string that fell back to the field default) so it is never silent.
+    for _fallback in finishing_config.get("bool_coercion_fallbacks", []) or []:
+        _emit(
+            f"ZeGrid: boolean coercion fallback — field={_fallback['field']!r} "
+            f"value={_fallback['value']!r} -> fallback={_fallback['fallback']!r}",
+            lvl="WARN",
+            callback=progress_callback,
+        )
 
     csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
     frames_info = _stack_plan.load_stack_plan(csv_path, progress_callback=progress_callback)
@@ -1990,6 +2849,7 @@ def run_zegrid_mode(
     science_config = replace(
         ExecutorConfig().science_config(),
         normalization=_resolve_normalization(stack_norm_method),
+        backend=("gpu" if gpu_effective else "cpu"),
         **rej_overrides,
     )
     _emit(
@@ -1998,7 +2858,8 @@ def run_zegrid_mode(
         f"rejection={science_config.rejection} "
         f"(sigma={science_config.sigma_low:.2f}/{science_config.sigma_high:.2f}, "
         f"winsor={science_config.winsor_limit_low:.3f}/{science_config.winsor_limit_high:.3f}), "
-        f"combine={science_config.combine}, taper={science_config.taper}",
+        f"combine={science_config.combine}, taper={science_config.taper}, "
+        f"backend={science_config.backend}",
         callback=progress_callback,
     )
 
@@ -2057,14 +2918,16 @@ def run_zegrid_mode(
                         science_config=science_config, zconfig=zconfig,
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                         ignored_run_args=ignored_run_args,
-                        finishing_config=finishing_config)
+                        finishing_config=finishing_config,
+                        gpu_context=gpu_context)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                         ignored_run_args=ignored_run_args,
-                        finishing_config=finishing_config)
+                        finishing_config=finishing_config,
+                        gpu_context=gpu_context)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -2073,4 +2936,5 @@ def run_zegrid_mode(
                     science_config=science_config, zconfig=zconfig,
                     pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                     ignored_run_args=ignored_run_args,
-                    finishing_config=finishing_config)
+                    finishing_config=finishing_config,
+                    gpu_context=gpu_context)

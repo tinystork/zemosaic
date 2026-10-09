@@ -4618,153 +4618,27 @@ def _apply_aesthetic_hole_fill(
     protect_stars_details: bool = True,
     logger: logging.Logger | None = None,
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
-    """Visual-only local hole completion for aesthetic branch."""
+    """Visual-only local hole completion for aesthetic branch.
 
-    info: dict[str, Any] = {
-        "enabled": bool(enabled),
-        "applied": False,
-        "reason": "disabled" if not enabled else "",
-        "filled_px": 0,
-        "hole_px": 0,
-        "max_radius_px": int(max_radius_px),
-        "blend": float(blend),
-        "only_near_seams": bool(only_near_seams),
-        "protect_stars_details": bool(protect_stars_details),
-        "protected_frac": 0.0,
-    }
-    if not enabled or mosaic_hwc is None or not isinstance(mosaic_hwc, np.ndarray):
-        return mosaic_hwc, info
-    if mosaic_hwc.ndim != 3 or mosaic_hwc.shape[-1] != 3:
-        info["reason"] = "non_rgb"
-        return mosaic_hwc, info
+    ZM-ZEGRID-R23 rework-3 (H2): delegates to the single canonical shared helper
+    ``core.zegrid.aesthetic_hole_fill.apply_aesthetic_hole_fill`` (no divergent
+    copy). The shared helper fixes the historical ``only_near_seams`` target-mask
+    bug: non-target holes (outside the configured target mask) keep their NaN,
+    so ``only_near_seams=true`` no longer silently fills every hole.
+    """
+    from .core.zegrid.aesthetic_hole_fill import apply_aesthetic_hole_fill
 
-    try:
-        max_radius_px = int(max(4, min(512, int(max_radius_px))))
-    except Exception:
-        max_radius_px = 64
-    try:
-        blend = float(max(0.0, min(1.0, float(blend))))
-    except Exception:
-        blend = 0.70
-
-    rgb = np.asarray(mosaic_hwc, dtype=np.float32)
-    out = np.array(rgb, copy=True)
-
-    valid = np.isfinite(rgb).all(axis=-1)
-    if isinstance(alpha_mask, np.ndarray):
-        try:
-            a = np.asarray(alpha_mask)
-            if a.ndim == 3 and a.shape[-1] == 1:
-                a = a[..., 0]
-            elif a.ndim > 2:
-                a = np.squeeze(a)
-            if a.shape[:2] == valid.shape:
-                valid &= (a > 0)
-        except Exception:
-            pass
-    elif isinstance(coverage_hw, np.ndarray):
-        try:
-            c = np.asarray(coverage_hw, dtype=np.float32)
-            if c.ndim > 2:
-                c = np.squeeze(c)
-            if c.shape[:2] == valid.shape:
-                valid &= np.isfinite(c) & (c > 0)
-        except Exception:
-            pass
-
-    hole = ~valid
-    hole_px = int(np.count_nonzero(hole))
-    info["hole_px"] = hole_px
-    if hole_px <= 0:
-        info["reason"] = "no_holes"
-        return out, info
-
-    target = hole.copy()
-    dist = None
-    if only_near_seams:
-        try:
-            import cv2  # type: ignore
-            dist = cv2.distanceTransform(hole.astype(np.uint8), cv2.DIST_L2, 3)
-            target = hole & (dist <= float(max_radius_px))
-        except Exception:
-            # fallback: binary dilation-limited mask via blur threshold
-            soft = _gaussian_blur_2d_float32(hole.astype(np.float32), sigma_px=max(1.0, float(max_radius_px) / 6.0))
-            target = hole & (soft > 0.05)
-
-    fill_px = int(np.count_nonzero(target))
-    info["filled_px"] = fill_px
-    if fill_px <= 0:
-        info["reason"] = "no_target_after_radius"
-        return out, info
-
-    if dist is None:
-        # approximate feather where distance transform unavailable
-        soft = _gaussian_blur_2d_float32(target.astype(np.float32), sigma_px=max(1.0, float(max_radius_px) / 5.0))
-        feather = np.clip(soft, 0.0, 1.0) * float(blend)
-    else:
-        feather = np.clip((float(max_radius_px) - dist) / max(1.0, float(max_radius_px)), 0.0, 1.0) * float(blend)
-    feather *= target.astype(np.float32)
-
-    if bool(protect_stars_details) and np.any(valid):
-        try:
-            luminance = np.nanmean(out, axis=-1).astype(np.float32, copy=False)
-            valid_luma = luminance[valid]
-            protect_mask = np.zeros_like(target, dtype=bool)
-            if valid_luma.size > 0:
-                star_thr = float(np.nanpercentile(valid_luma, 99.5))
-                if math.isfinite(star_thr):
-                    protect_mask |= np.isfinite(luminance) & (luminance >= star_thr)
-
-            gx, gy = np.gradient(np.where(np.isfinite(luminance), luminance, 0.0).astype(np.float32, copy=False))
-            grad = np.hypot(gx, gy).astype(np.float32, copy=False)
-            grad_valid = grad[valid]
-            if grad_valid.size > 0:
-                detail_thr = float(np.nanpercentile(grad_valid, 97.0))
-                if math.isfinite(detail_thr):
-                    protect_mask |= grad >= detail_thr
-
-            if np.any(protect_mask):
-                protect_soft = _gaussian_blur_2d_float32(protect_mask.astype(np.float32), sigma_px=1.2)
-                protect_soft = np.clip(protect_soft, 0.0, 1.0)
-                feather *= (1.0 - 0.85 * protect_soft)
-                info["protected_frac"] = float(np.count_nonzero(protect_mask)) / float(protect_mask.size)
-        except Exception:
-            pass
-
-    for ch in range(3):
-        src = out[..., ch]
-        if np.any(valid):
-            med = float(np.nanmedian(src[valid]))
-        else:
-            med = 0.0
-        seeded = np.where(valid, src, med).astype(np.float32, copy=False)
-        sigma_fill = max(2.0, float(max_radius_px) * 0.5)
-        smooth = _gaussian_blur_2d_float32(seeded, sigma_fill)
-        src_nonan = np.where(np.isfinite(src), src, smooth)
-        src[:] = np.where(
-            target,
-            src_nonan * (1.0 - feather) + smooth * feather,
-            src_nonan,
-        )
-
-    info["applied"] = True
-    info["reason"] = "ok"
-
-    if logger is not None:
-        logger.info(
-            "[AestheticFill] enabled=%s applied=%s hole_px=%d filled_px=%d max_radius_px=%d blend=%.3f only_near_seams=%s protect_stars_details=%s protected_frac=%.5f",
-            bool(enabled),
-            True,
-            hole_px,
-            fill_px,
-            int(max_radius_px),
-            float(blend),
-            bool(only_near_seams),
-            bool(protect_stars_details),
-            float(info.get("protected_frac", 0.0) or 0.0),
-        )
-
-    return out, info
+    return apply_aesthetic_hole_fill(
+        mosaic_hwc,
+        alpha_mask=alpha_mask,
+        coverage_hw=coverage_hw,
+        enabled=enabled,
+        max_radius_px=max_radius_px,
+        blend=blend,
+        only_near_seams=only_near_seams,
+        protect_stars_details=protect_stars_details,
+        logger=logger,
+    )
 
 
 def _load_intertile_graph_summary(diagnostics_output_dir: Path | None) -> dict[str, Any]:
@@ -30860,19 +30734,28 @@ def run_hierarchical_mosaic(
     if stack_plan_detected:
         # ZeGrid engine (stack_plan.csv). No silent fallback: any failure raises.
         try:
-            from .zemosaic_zegrid_mode import run_zegrid_mode
+            from .zemosaic_zegrid_mode import resolve_gpu_preference, run_zegrid_mode
         except Exception as exc:
             logger.error("[GRID] ZeGrid engine unavailable; aborting.", exc_info=True)
             raise RuntimeError("[GRID] ZeGrid engine unavailable") from exc
         try:
             zegrid_norm = _resolve_zegrid_normalization(worker_config_cache, stack_norm_method)
+            # ZM-ZEGRID-R22: propagate the user's GPU preference into the engine
+            # via the generic ``use_gpu`` argument (resolved from the product flags
+            # with the SAME precedence the engine uses). This is what makes the GUI
+            # checkbox (use_gpu_stack / use_gpu_grid / stack_use_gpu / use_gpu_phase5)
+            # actually reach the ZeGrid backend — previously dropped at this call.
+            _grid_gpu_requested, _grid_gpu_source = resolve_gpu_preference(None, zconfig)
             logger.info(
                 "[GRID] Invoking ZeGrid engine run_zegrid_mode(...) with "
-                "stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
+                "stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s, "
+                "use_gpu=%s (source=%s)",
                 zegrid_norm,
                 stack_weight_method,
                 stack_reject_algo,
                 stack_final_combine,
+                _grid_gpu_requested,
+                _grid_gpu_source,
             )
             run_zegrid_mode(
                 input_folder=input_folder,
@@ -30891,6 +30774,7 @@ def run_hierarchical_mosaic(
                 save_final_as_uint16=save_final_as_uint16_config,
                 legacy_rgb_cube=legacy_rgb_cube_config,
                 grid_rgb_equalize=grid_rgb_equalize_flag,
+                use_gpu=_grid_gpu_requested,
                 zconfig=zconfig,
             )
             return

@@ -89,7 +89,10 @@ from zemosaic.core.canonical_stacking import (
     # rejection / combine reductions are bit-identical to the full-patch ones.
     _as_bool_mask,
     _as_frame_array,
+    _as_host_numpy,
     _astype_float32,
+    _axis_sum_f64,
+    _get_xp,
     _kappa_sigma_step,
     _nan_axis_median,
     _require_frame_sequence,
@@ -98,6 +101,7 @@ from zemosaic.core.canonical_stacking import (
     _validate_reject_sigma,
     _validate_winsor_limit,
     _winsorized_sigma_clip_step,
+    canonical_gpu_available,
 )
 from zemosaic.core.canonical_support import make_footprint_taper
 from zemosaic.core.canonical_engine import (
@@ -125,6 +129,26 @@ _WEIGHT_METHODS = ("none", "noise_variance", "noise_fwhm")
 _REJECT_METHODS = ("none", "kappa_sigma", "winsorized_sigma_clip")
 _REJECT_TOKEN_REMOVED = "unsupported_removed_sci05"
 _COMBINE_METHODS = ("mean", "median")
+
+
+def _release_gpu_workspace(xp) -> None:
+    """Best-effort release of the CuPy allocator pool between tiles (never raises).
+
+    CuPy's default memory pool does not return freed blocks to the device, so the
+    device high-water can grow across a tile loop. Freeing the pool's unused blocks
+    (and syncing the default stream) bounds the high-water by a small number of
+    tiles. A no-op for NumPy.
+    """
+    if xp is np:
+        return
+    try:
+        xp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    try:
+        xp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -694,11 +718,16 @@ def _fixed_phase1(
 # Phase 2 — per-tile rejection / combine / support
 # ---------------------------------------------------------------------------
 
-def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size) -> CanonicalStackResult:
+def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, backend="cpu") -> CanonicalStackResult:
     n = p1.n_frames
     h = p1.height
     w = p1.width
     c = p1.channels
+
+    # ZM-ZEGRID-R22: resolve the backend module up front. The rejection + combine
+    # stages run xp-generic on ``xp`` (NumPy or CuPy); the reductions use the
+    # bit-exact host-side helpers so CPU vs GPU outputs are bit-identical.
+    xp = _get_xp(backend)
 
     # Method tokens + validated rejection parameters (reused validators).
     reject_token = _resolve_reject_token(request.rejection)
@@ -818,42 +847,54 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size) ->
         # --- rejection (reused step primitives on (N, tile_cells)) ---
         n_cells_t = th * tw * c
         initial = active[:, None, None, None] & valid_t[..., None] & np.isfinite(images64)
-        orig2 = images64.reshape(n, n_cells_t)
-        survivor2 = initial.reshape(n, n_cells_t)
-        degenerate_seen = np.zeros(n_cells_t, dtype=bool)
+        orig2_host = images64.reshape(n, n_cells_t)
+        survivor2_host = initial.reshape(n, n_cells_t)
+        degenerate_seen_host = np.zeros(n_cells_t, dtype=bool)
         tile_iters = 0
         if reject_token == "none":
             survivor = initial.copy()
         else:
+            # xp-generic rejection; the step primitives use the bit-exact
+            # host-side mean/std reductions (see canonical_stacking), so the
+            # survivor mask is bit-identical CPU vs GPU.
+            orig2 = xp.asarray(orig2_host)
+            survivor2 = xp.asarray(survivor2_host)
+            degenerate_seen = xp.zeros(n_cells_t, dtype=bool)
             for _ in range(iters):
                 count = survivor2.sum(axis=0)
                 if reject_token == "kappa_sigma":
                     new_survivor2, degenerate = _kappa_sigma_step(
-                        orig2, survivor2, count, s_low, s_high, np
+                        orig2, survivor2, count, s_low, s_high, xp
                     )
                 else:
                     new_survivor2, degenerate = _winsorized_sigma_clip_step(
-                        orig2, survivor2, count, s_low, s_high, w_low, w_high, np
+                        orig2, survivor2, count, s_low, s_high, w_low, w_high, xp
                     )
                 tile_iters += 1
                 degenerate_seen |= degenerate
-                if bool(np.array_equal(new_survivor2, survivor2)):
+                if bool(xp.array_equal(new_survivor2, survivor2)):
                     survivor2 = new_survivor2
                     break
                 survivor2 = new_survivor2
-            survivor = survivor2.reshape(n, th, tw, c)
+            survivor = _as_host_numpy(survivor2, xp).reshape(n, th, tw, c)
+            degenerate_seen_host = _as_host_numpy(degenerate_seen, xp)
             iterations_used = max(iterations_used, tile_iters)
 
         rejection_t = initial & ~survivor
 
-        # --- combine (reused reductions on the N axis) ---
+        # --- combine (reused reductions on the N axis, bit-exact across backends) ---
         w_positive = wmap[:, :, :, None] > 0.0
         eligible = survivor & w_positive & np.isfinite(images64)
+        images64_xp = xp.asarray(images64)
+        wmap_xp = xp.asarray(wmap[:, :, :, None])
+        eligible_xp = xp.asarray(eligible)
         if combine_token == "mean":
-            masked_images = np.where(eligible, images64, 0.0)
-            w_contrib = np.where(eligible, wmap[:, :, :, None], 0.0)
-            numerator = np.sum(masked_images * w_contrib, axis=0, dtype=np.float64)
-            denominator = np.sum(w_contrib, axis=0, dtype=np.float64)
+            masked_images = xp.where(eligible_xp, images64_xp, 0.0)
+            w_contrib = xp.where(eligible_xp, wmap_xp, 0.0)
+            # bit-exact float64 reductions: _axis_sum_f64 reduces on the host for
+            # the GPU backend (matching np.sum), so science is bit-identical.
+            numerator = _axis_sum_f64(masked_images * w_contrib, xp)
+            denominator = _axis_sum_f64(w_contrib, xp)
             den_valid = denominator > 0.0
             estimate64 = _safe_divide(numerator, denominator, np)
             science32 = _astype_float32(estimate64, np)
@@ -862,8 +903,9 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size) ->
             science_t = np.where(valid_out, science32, np.nan)
             weight_sum_t = np.where(valid_out, denominator, 0.0)
         else:  # median
-            masked = np.where(eligible, images64, np.nan)
-            median64 = _nan_axis_median(masked, np)
+            masked = xp.where(eligible_xp, images64_xp, xp.nan)
+            median64_xp = _nan_axis_median(masked, xp)
+            median64 = _as_host_numpy(median64_xp, xp)
             science32 = _astype_float32(median64, np)
             count = eligible.sum(axis=0).astype(np.float64)
             den_valid = count > 0.0
@@ -903,7 +945,15 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size) ->
         initial_count += int(init_int.sum())
         rejected_count += int(rej_int.sum())
         low_n_count += int((init_int.sum(axis=0) < 3).sum())
-        degenerate_count += int(degenerate_seen.reshape(th, tw, c)[iy0:iy1, ix0:ix1, :].sum())
+        degenerate_count += int(degenerate_seen_host.reshape(th, tw, c)[iy0:iy1, ix0:ix1, :].sum())
+
+        # ZM-ZEGRID-R22 (H3 rework-1): release per-tile device workspace between
+        # tiles. CuPy's default allocator pool does not return freed blocks to the
+        # device, so without this the high-water would grow across the whole patch
+        # (N x full-cell equivalent). free_all_blocks() + a null-stream sync bounds
+        # the device high-water by a small number of tiles, never the patch.
+        if xp is not np:
+            _release_gpu_workspace(xp)
 
     # --- restore shapes + n_eff + diagnostics ---
     rejected_fraction = (rejected_count / initial_count) if initial_count > 0 else 0.0
@@ -980,7 +1030,9 @@ def run_canonical_stack_streaming(
             f"request must be a CanonicalStackRequest, got {type(request).__name__}"
         )
 
-    # Backend: CPU only for streaming (validated up front, mirroring the engine).
+    # Backend: cpu (default) or gpu (ZM-ZEGRID-R22, opt-in). Mirrors the engine's
+    # validation: 'gpu' raises when CuPy/GPU is unavailable (never a silent CPU
+    # fallback INSIDE the executor — the ZeGrid orchestrator owns the loud degrade).
     backend = request.backend
     if not isinstance(backend, str):
         raise CanonicalStackValidationError(
@@ -991,9 +1043,9 @@ def run_canonical_stack_streaming(
         raise CanonicalStackValidationError(
             f"unknown backend {backend!r}; expected 'cpu' or 'gpu' (aliases not accepted)"
         )
-    if token == "gpu":
+    if token == "gpu" and not canonical_gpu_available():
         raise CanonicalStackValidationError(
-            "backend 'gpu' is not yet supported by the streaming executor (CPU only)"
+            "backend 'gpu' requested but CuPy/GPU is unavailable"
         )
 
     # Basic provider sanity checks.
@@ -1008,7 +1060,7 @@ def run_canonical_stack_streaming(
     p1 = _fixed_phase1(provider, request, fixed)
 
     (science, weight_sum, valid_mask, surviving, support_w1, support_w2, n_eff, agg) = _phase2(
-        provider, p1, request, tile_size
+        provider, p1, request, tile_size, backend=token
     )
 
     # --- post-combine RGB equalization (out-of-place, spatial-only) ---
