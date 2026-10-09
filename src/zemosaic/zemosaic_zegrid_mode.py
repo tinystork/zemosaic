@@ -2204,13 +2204,153 @@ def _write_raw_science_fits(assembled, canvas, raw_science_path, role="SCI", rel
     return raw_science_path
 
 
+def _remove_if_exists(path: Path) -> None:
+    """Best-effort unlink of ``path``; never raises (auditable failure only)."""
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 def _atomic_writeto(hdu, path):
     """Write a FITS HDU atomically (temp file + rename) so no half-written file
-    is silently presented as valid."""
+    is silently presented as valid.
+
+    Guarantees (ZM-ZEGRID-R24 A2):
+
+    * on success, only the final target exists (no ``<target>.tmp`` remains);
+    * if the temp write OR the final rename raises, the ``<target>.tmp`` is
+      removed best-effort and a pre-existing valid target is left untouched
+      (the target is only ever replaced by the atomic ``os.replace``, which
+      runs strictly after a fully successful temp write).
+    """
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
-    hdu.writeto(tmp, overwrite=True)
-    os.replace(tmp, path)
+    try:
+        hdu.writeto(tmp, overwrite=True)
+    except Exception:
+        _remove_if_exists(tmp)
+        raise
+    try:
+        os.replace(tmp, path)
+    except Exception:
+        _remove_if_exists(tmp)
+        raise
+
+
+# Fixed output names that are NEVER a valid aesthetic companion (so a malicious/
+# hand-edited prior manifest can never convince the stale cleaner to delete a
+# science/coverage/uint16/log file under a fixed reserved name).
+_RESERVED_NON_AESTHETIC = {
+    "mosaic_grid.fits",
+    "mosaic_grid_coverage.fits",
+    "mosaic_grid_uint16.fits",
+    RUN_LOG_NAME,
+}
+
+
+def _cleanup_stale_aesthetic(output_dir, current_aesthetic_path, protected_names=()):
+    """Best-effort removal of a prior manifest-declared stale aesthetic FITS.
+
+    ZM-ZEGRID-R24 (A2): on a rerun into the same output directory, a previous
+    run may have left an aesthetic companion (``mosaic_grid*.fits``) that is no
+    longer a current output (export checkbox turned OFF, or the aesthetic suffix
+    changed). Read ONLY the prior ``zegrid_manifest.json``; after the current
+    outputs are successfully written and before the current manifest is
+    published, remove that one prior-declared aesthetic FITS — and nothing else.
+
+    Strict validation before ANY deletion:
+
+    * the declared name must be a clean basename inside ``output_dir`` (no path
+      separators, no ``..``, no absolute path);
+    * it must be a recognised ``mosaic_grid*.fits`` name with a NON-EMPTY suffix
+      (the bare ``mosaic_grid.fits`` primary-science name and the fixed coverage/
+      uint16/log names are never deleted);
+    * it must not collide with any current output name (raw science / coverage /
+      uint16 / aesthetic / run log).
+
+    Never glob-deletes, never touches science/coverage/uint16/user files, and
+    never a path outside ``output_dir``. Failures are recorded (never raised) so
+    the manifest ``stale_cleanup`` block / run log can surface them.
+    """
+    record: dict = {
+        "ran": True,
+        "removed": [],
+        "kept": [],
+        "warnings": [],
+    }
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "zegrid_manifest.json"
+    if not manifest_path.exists():
+        record["reason"] = "no_prior_manifest"
+        return record
+    try:
+        prior = json.loads(manifest_path.read_text())
+    except Exception as exc:
+        record["reason"] = "prior_manifest_unreadable"
+        record["warnings"].append(f"could not read prior manifest: {exc}")
+        return record
+    if not isinstance(prior, dict):
+        record["reason"] = "prior_manifest_not_object"
+        return record
+
+    prior_name = None
+    outputs = prior.get("outputs")
+    if isinstance(outputs, dict):
+        prior_name = outputs.get("aesthetic")
+    if not prior_name:
+        soc = prior.get("science_output_contract") or {}
+        aest = soc.get("aesthetic") if isinstance(soc, dict) else None
+        if isinstance(aest, dict):
+            prior_name = aest.get("file")
+    if not prior_name or not isinstance(prior_name, str):
+        record["reason"] = "no_prior_aesthetic_declared"
+        return record
+
+    prior_name = prior_name.strip()
+    current_name = (
+        Path(current_aesthetic_path).name if current_aesthetic_path is not None else None
+    )
+    if current_name == prior_name:
+        record["reason"] = "prior_aesthetic_is_current"
+        record["kept"].append(prior_name)
+        return record
+
+    problems: list[str] = []
+    if not prior_name or prior_name in {"", ".", ".."}:
+        problems.append("empty or reserved name")
+    if Path(prior_name).name != prior_name or "/" in prior_name or "\\" in prior_name:
+        problems.append("not a clean basename (contains a path separator)")
+    if not (prior_name.startswith("mosaic_grid") and prior_name.endswith(".fits")):
+        problems.append("not a recognised mosaic_grid*.fits name")
+    if prior_name in _RESERVED_NON_AESTHETIC:
+        problems.append("fixed reserved (non-aesthetic) output name")
+    if prior_name in set(protected_names or ()):
+        problems.append("collides with a current output name")
+
+    if problems:
+        record["reason"] = "invalid_prior_declaration"
+        record["warnings"].append(
+            f"refusing to remove prior-declared aesthetic {prior_name!r}: "
+            + "; ".join(problems)
+        )
+        record["kept"].append(prior_name)
+        return record
+
+    target = output_dir / prior_name
+    try:
+        if target.exists():
+            target.unlink()
+            record["removed"].append(prior_name)
+        else:
+            record["reason"] = "prior_aesthetic_absent"
+            record["kept"].append(prior_name)
+    except Exception as exc:
+        record["reason"] = "removal_failed"
+        record["warnings"].append(f"could not remove {prior_name!r}: {exc}")
+        record["kept"].append(prior_name)
+    return record
 
 
 def _write_outputs(
@@ -2308,6 +2448,57 @@ def _write_outputs(
     cov_header["BUNIT"] = ("count", "per-pixel stack depth (max over channels)")
     cov_path = output_dir / "mosaic_grid_coverage.fits"
     _atomic_writeto(fits.PrimaryHDU(stack_depth, header=cov_header), cov_path)
+
+    # ZM-ZEGRID-R24 (A2): conservative stale-aesthetic cleanup. Runs ONLY after
+    # every current output above has been successfully written and BEFORE the
+    # current manifest is published, so a failed current run never erases the
+    # prior valid aesthetic (its manifest is still intact on disk). Read-only on
+    # the prior manifest; never glob-deletes and never touches science/coverage/
+    # uint16/user files or anything outside ``output_dir``.
+    stale_cleanup = _cleanup_stale_aesthetic(
+        output_dir,
+        aesthetic_path,
+        protected_names={
+            raw_science_path.name,
+            cov_path.name,
+            RUN_LOG_NAME,
+            *([uint16_path.name] if uint16_path is not None else []),
+            *([aesthetic_path.name] if aesthetic_path is not None else []),
+        },
+    )
+
+    # ZM-ZEGRID-R24 (A1): the ``science_output_contract`` block is built here so
+    # the ``aesthetic`` sub-record can be OMITTED ENTIRELY when no aesthetic FITS
+    # is emitted (no ``file=None`` + in-memory SHA). ``outputs.aesthetic`` stays
+    # an explicit ``null`` for a stable top-level schema; only the contract's
+    # aesthetic truth is dropped when absent.
+    science_output_contract = {
+        "note": (
+            "ZM-ZEGRID-R23 rework-3: 'science'/'science_reference' is the "
+            "immutable pre-finishing assembled science (the scientific/"
+            "photometric reference, always written); 'aesthetic' is the "
+            "delivered legacy light-DBE aesthetic float32 (written only when "
+            "export_aesthetic_fits is true; bit-identical to raw when finishing "
+            "is disabled). 'uint16' is only an optional render derived from the "
+            "aesthetic float32, never a scientific reference."
+        ),
+        "raw": {
+            "file": raw_science_path.name,
+            "role": "SCI",
+            "dtype": "float32",
+            "sha256": _array_sha256(np.ascontiguousarray(np.moveaxis(
+                np.asarray(assembled.science if raw_science is None else raw_science,
+                           dtype=np.float32), -1, 0))),
+        },
+    }
+    if aesthetic_path is not None:
+        science_output_contract["aesthetic"] = {
+            "file": aesthetic_path.name,
+            "role": "AESTH",
+            "dtype": "float32",
+            "dbe_state": dbe_state,
+            "sha256": _array_sha256(sci_data),
+        }
 
     # Cache accounting: prefer the explicit cache_report (per-cell temp reuse)
     # and fall back to summing the manifests (legacy persistent-cache path).
@@ -2440,32 +2631,8 @@ def _write_outputs(
             f"neutral; use science_reference ({raw_science_path.name}) for "
             "measurement" if aesthetic_path is not None else None
         ),
-        "science_output_contract": {
-            "note": (
-                "ZM-ZEGRID-R23 rework-3: 'science'/'science_reference' is the "
-                "immutable pre-finishing assembled science (the scientific/"
-                "photometric reference, always written); 'aesthetic' is the "
-                "delivered legacy light-DBE aesthetic float32 (written only when "
-                "export_aesthetic_fits is true; bit-identical to raw when finishing "
-                "is disabled). 'uint16' is only an optional render derived from the "
-                "aesthetic float32, never a scientific reference."
-            ),
-            "raw": {
-                "file": raw_science_path.name,
-                "role": "SCI",
-                "dtype": "float32",
-                "sha256": _array_sha256(np.ascontiguousarray(np.moveaxis(
-                    np.asarray(assembled.science if raw_science is None else raw_science,
-                               dtype=np.float32), -1, 0))),
-            },
-            "aesthetic": {
-                "file": (aesthetic_path.name if aesthetic_path is not None else None),
-                "role": "AESTH",
-                "dtype": "float32",
-                "dbe_state": dbe_state,
-                "sha256": _array_sha256(sci_data),
-            },
-        },
+        "science_output_contract": science_output_contract,
+        "stale_cleanup": stale_cleanup,
     }
     manifest_path = output_dir / "zegrid_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -2601,6 +2768,15 @@ def run_zegrid_mode(
         f"uint16={finishing_config['save_uint16']}",
         callback=progress_callback,
     )
+    # ZM-ZEGRID-R24 (A4): surface any boolean-coercion fallback (unknown/typed
+    # string that fell back to the field default) so it is never silent.
+    for _fallback in finishing_config.get("bool_coercion_fallbacks", []) or []:
+        _emit(
+            f"ZeGrid: boolean coercion fallback — field={_fallback['field']!r} "
+            f"value={_fallback['value']!r} -> fallback={_fallback['fallback']!r}",
+            lvl="WARN",
+            callback=progress_callback,
+        )
 
     csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
     frames_info = _stack_plan.load_stack_plan(csv_path, progress_callback=progress_callback)

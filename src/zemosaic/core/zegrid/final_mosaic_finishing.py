@@ -127,16 +127,55 @@ def _safe_int(value: Any, fallback: int) -> int:
         return int(fallback)
 
 
-def _truthy(value: Any) -> bool:
+# Fixed truthy/falsy string vocabulary (case-insensitive) for boolean coercion.
+# Unknown strings, empty/whitespace strings, None, and unrecognised types fall
+# back to the field's own default (never silently ``True`` — the classic
+# ``bool('false') is True`` foot-gun is explicitly avoided).
+_BOOL_TRUE_STRINGS = {"1", "true", "t", "yes", "y", "on", "enable", "enabled"}
+_BOOL_FALSE_STRINGS = {"0", "false", "f", "no", "n", "off", "disable", "disabled", "none", "null"}
+
+
+def _coerce_bool(value: Any, fallback: bool, notes: list | None = None) -> bool:
+    """Classic-compatible boolean coercion (never a naïve ``bool(value)``).
+
+    Accepts:
+
+    * a real ``bool`` (returned as-is);
+    * ``0``/``1`` numerics (0/0.0 → False, anything else → True);
+    * case-insensitive strings from a fixed vocabulary —
+      ``true/false``, ``yes/no``, ``on/off``, ``enable/disable``
+      (plus short aliases ``t/f``, ``y/n``, ``1/0``);
+    * ``None``, empty/whitespace strings, and ANY unrecognised value →
+      the caller-supplied ``fallback`` (per-field default), so an unknown string
+      can never silently become ``True``.
+
+    Unknown (non-empty) strings and unrecognised types are recorded in
+    ``notes`` (as ``(value, fallback)`` tuples) for visible surfacing; ``None``
+    and empty strings are the normal absent/default path and are not recorded.
+    """
     if value is None:
-        return False
+        return bool(fallback)
     if isinstance(value, bool):
-        return bool(value)
+        return value
     if isinstance(value, (int, float)):
         return value not in (0, 0.0)
     if isinstance(value, str):
-        return value.strip().lower() not in ("", "0", "false", "no", "off", "none")
-    return True
+        s = value.strip().lower()
+        if s in _BOOL_TRUE_STRINGS:
+            return True
+        if s in _BOOL_FALSE_STRINGS:
+            return False
+        # empty/whitespace -> per-field fallback (normal default path).
+        if not s:
+            return bool(fallback)
+        # unknown string -> per-field fallback (visible, never silently True).
+        if notes is not None:
+            notes.append((value, bool(fallback)))
+        return bool(fallback)
+    # unrecognised type (list/dict/...) -> per-field fallback.
+    if notes is not None:
+        notes.append((repr(value), bool(fallback)))
+    return bool(fallback)
 
 
 def _config_get(zconfig: Any, key: str, fallback: Any) -> Any:
@@ -263,30 +302,54 @@ def resolve_finishing_config(
     * ``hole_fill_enabled`` / ``hole_fill_max_radius_px`` / ``hole_fill_blend`` /
       ``hole_fill_only_near_seams`` / ``hole_fill_protect_stars_details`` — the
       existing ``aesthetic_hole_fill_*`` settings.
+    * ``bool_coercion_fallbacks`` — list of ``{field, value, fallback}`` records
+      for any boolean that fell back due to an unknown/typed string (visible,
+      never silently ``True``; see :func:`_coerce_bool`).
+
+    All booleans use Classic-compatible coercion (real bool / 0/1 / typed
+    strings / empty / None), never a naïve ``bool(value)``.
     """
-    raw = _config_get(zconfig, "final_mosaic_dbe_enabled", None)
-    dbe_enabled = True if raw is None else bool(raw)
+    # ZM-ZEGRID-R24 (A4): robust, Classic-compatible boolean coercion. Every
+    # boolean below is coerced via :func:`_coerce_bool` so a string like
+    # ``'false'``/``'off'``/``'no'``/``'disable'`` never silently becomes True
+    # (the classic ``bool('false') is True`` foot-gun). Unknown strings fall back
+    # to each field's default and are recorded (visible) in
+    # ``bool_coercion_fallbacks``. No new config key or GUI control is added.
+    bool_coercion_fallbacks: list[dict[str, Any]] = []
+
+    def _cb(field: str, value: Any, fallback: bool) -> bool:
+        notes: list[tuple[Any, bool]] = []
+        result = _coerce_bool(value, fallback, notes=notes)
+        for raw_val, fb in notes:
+            bool_coercion_fallbacks.append(
+                {"field": field, "value": raw_val, "fallback": bool(fb)}
+            )
+        return result
+
+    dbe_enabled = _cb("final_mosaic_dbe_enabled",
+                      _config_get(zconfig, "final_mosaic_dbe_enabled", None), True)
 
     strength_info = resolve_dbe_strength(zconfig)
 
     if grid_rgb_equalize is not None:
-        rgb_equalize = bool(grid_rgb_equalize)
+        rgb_equalize = _cb("grid_rgb_equalize (run arg)", grid_rgb_equalize, True)
     else:
-        cfg_val = _config_get(zconfig, "grid_rgb_equalize", None)
-        rgb_equalize = True if cfg_val is None else bool(cfg_val)
+        rgb_equalize = _cb("grid_rgb_equalize",
+                           _config_get(zconfig, "grid_rgb_equalize", None), True)
 
     if save_final_as_uint16 is not None:
-        save_uint16 = bool(save_final_as_uint16)
+        save_uint16 = _cb("save_final_as_uint16 (run arg)", save_final_as_uint16, False)
     else:
-        cfg_val = _config_get(zconfig, "save_final_as_uint16", None)
-        save_uint16 = False if cfg_val is None else bool(cfg_val)
+        save_uint16 = _cb("save_final_as_uint16",
+                          _config_get(zconfig, "save_final_as_uint16", None), False)
 
     # ZM-ZEGRID-R23 rework-3 (H1): resolve the EXISTING output naming + hole-fill
     # settings from the same ``zconfig`` the Classic worker uses. These are the
     # established GUI keys; NO new key or control is introduced. The default is
     # ``export_aesthetic_fits=false`` (matches the Classic worker's effective
     # fallback and preserves the old primary-name contract ``mosaic_grid.fits``).
-    export_aesthetic_fits = bool(_config_get(zconfig, "export_aesthetic_fits", False))
+    export_aesthetic_fits = _cb("export_aesthetic_fits",
+                                _config_get(zconfig, "export_aesthetic_fits", False), False)
     scientific_fits_suffix = clean_fits_suffix(
         _config_get(zconfig, "scientific_fits_suffix", "_science"), "_science"
     )
@@ -296,7 +359,8 @@ def resolve_finishing_config(
     if aesthetic_fits_suffix == scientific_fits_suffix:
         aesthetic_fits_suffix = "_aesthetic"
 
-    hole_fill_enabled = bool(_config_get(zconfig, "aesthetic_hole_fill_enabled", True))
+    hole_fill_enabled = _cb("aesthetic_hole_fill_enabled",
+                            _config_get(zconfig, "aesthetic_hole_fill_enabled", True), True)
     try:
         hole_fill_max_radius_px = int(_config_get(
             zconfig, "aesthetic_hole_fill_max_radius_px", 64) or 64)
@@ -306,10 +370,10 @@ def resolve_finishing_config(
         hole_fill_blend = float(_config_get(zconfig, "aesthetic_hole_fill_blend", 0.70) or 0.70)
     except Exception:
         hole_fill_blend = 0.70
-    hole_fill_only_near_seams = bool(_config_get(
-        zconfig, "aesthetic_hole_fill_only_near_seams", True))
-    hole_fill_protect_stars_details = bool(_config_get(
-        zconfig, "aesthetic_hole_fill_protect_stars_details", True))
+    hole_fill_only_near_seams = _cb("aesthetic_hole_fill_only_near_seams",
+                                    _config_get(zconfig, "aesthetic_hole_fill_only_near_seams", True), True)
+    hole_fill_protect_stars_details = _cb("aesthetic_hole_fill_protect_stars_details",
+                                          _config_get(zconfig, "aesthetic_hole_fill_protect_stars_details", True), True)
 
     return {
         "dbe_enabled": bool(dbe_enabled),
@@ -328,6 +392,7 @@ def resolve_finishing_config(
         "hole_fill_blend": float(hole_fill_blend),
         "hole_fill_only_near_seams": bool(hole_fill_only_near_seams),
         "hole_fill_protect_stars_details": bool(hole_fill_protect_stars_details),
+        "bool_coercion_fallbacks": bool_coercion_fallbacks,
     }
 
 

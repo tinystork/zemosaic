@@ -29,6 +29,7 @@ touches the raw science reference.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any
 
 import numpy as np
@@ -175,7 +176,15 @@ def apply_aesthetic_hole_fill(
 
     if bool(protect_stars_details) and np.any(valid):
         try:
-            luminance = np.nanmean(out, axis=-1).astype(np.float32, copy=False)
+            # ZM-ZEGRID-R24 (A5): a fully-empty RGB hole (all three channels NaN)
+            # makes ``np.nanmean`` reduce an empty slice, which emits NumPy's
+            # cosmetic ``RuntimeWarning: Mean of empty slice``. The per-pixel
+            # luminance is still NaN for those pixels and bit-identical for
+            # finite pixels; we only suppress that specific cosmetic warning so
+            # the aesthetic helper stays warning-clean under ``-W error``.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                luminance = np.nanmean(out, axis=-1).astype(np.float32, copy=False)
             valid_luma = luminance[valid]
             protect_mask = np.zeros_like(target, dtype=bool)
             if valid_luma.size > 0:
