@@ -2117,6 +2117,9 @@ def _run_single(
         raw_science=raw_science,
         aesthetic_path=aesthetic_path if export_aesthetic else None,
         export_aesthetic_fits=export_aesthetic,
+        scientific_fits_suffix=(finishing_config or {}).get(
+            "scientific_fits_suffix", "_science"
+        ),
     )
 
     _write_run_log(
@@ -2250,7 +2253,28 @@ _RESERVED_NON_AESTHETIC = {
 }
 
 
-def _cleanup_stale_aesthetic(output_dir, current_aesthetic_path, protected_names=()):
+def _scientific_suffix_from_name(name):
+    """Return the clean suffix of a ``mosaic_grid<suffix>.fits`` science name.
+
+    ZM-ZEGRID-R25: a candidate name matching a SCIENTIFIC output pattern must
+    never be removed. ``name`` is a recognised science-pattern name when it has
+    the ``mosaic_grid*.fits`` shape with a NON-EMPTY middle suffix, in which
+    case that middle suffix is returned (e.g. ``_science`` for
+    ``mosaic_grid_science.fits``). Returns ``None`` otherwise — including the
+    bare primary-science name ``mosaic_grid.fits`` (empty suffix, reserved
+    separately via ``_RESERVED_NON_AESTHETIC``).
+    """
+    if not isinstance(name, str):
+        return None
+    if not (name.startswith("mosaic_grid") and name.endswith(".fits")):
+        return None
+    suffix = name[len("mosaic_grid"):-len(".fits")]
+    return suffix or None
+
+
+def _cleanup_stale_aesthetic(
+    output_dir, current_aesthetic_path, protected_names=(), scientific_suffix=None
+):
     """Best-effort removal of a prior manifest-declared stale aesthetic FITS.
 
     ZM-ZEGRID-R24 (A2): on a rerun into the same output directory, a previous
@@ -2268,7 +2292,13 @@ def _cleanup_stale_aesthetic(output_dir, current_aesthetic_path, protected_names
       (the bare ``mosaic_grid.fits`` primary-science name and the fixed coverage/
       uint16/log names are never deleted);
     * it must not collide with any current output name (raw science / coverage /
-      uint16 / aesthetic / run log).
+      uint16 / aesthetic / run log);
+    * ZM-ZEGRID-R25 (L1): it must NOT match a SCIENTIFIC output pattern —
+      ``mosaic_grid<scientific_suffix>.fits`` for the prior manifest's declared
+      scientific suffix (when it records one) or the current run's resolved
+      ``scientific_fits_suffix`` (default ``_science``). Both suffixes are
+      honoured, so a corrupt/hand-edited prior manifest can never convince the
+      cleaner to delete a raw science output, whatever name it declares.
 
     Never glob-deletes, never touches science/coverage/uint16/user files, and
     never a path outside ``output_dir``. Failures are recorded (never raised) so
@@ -2302,11 +2332,40 @@ def _cleanup_stale_aesthetic(output_dir, current_aesthetic_path, protected_names
     if not prior_name:
         soc = prior.get("science_output_contract") or {}
         aest = soc.get("aesthetic") if isinstance(soc, dict) else None
-        if isinstance(aest, dict):
+        # ZM-ZEGRID-R25 (L1): only trust the contract's aesthetic record when it
+        # actually identifies an aesthetic (role == "AESTH").
+        if isinstance(aest, dict) and aest.get("role") == "AESTH":
             prior_name = aest.get("file")
     if not prior_name or not isinstance(prior_name, str):
         record["reason"] = "no_prior_aesthetic_declared"
         return record
+
+    # ZM-ZEGRID-R25 (L1): resolve every SCIENTIFIC output suffix that must NEVER
+    # be removed — the prior manifest's declared scientific suffix (when it
+    # records one) and the current run's resolved scientific suffix (default
+    # ``_science``). A name matching any of these patterns is a raw-science
+    # output and is refused unconditionally.
+    science_suffixes: set[str] = set()
+    _soc = prior.get("science_output_contract")
+    if isinstance(_soc, dict):
+        _raw = _soc.get("raw")
+        if isinstance(_raw, dict):
+            _sfx = _scientific_suffix_from_name(_raw.get("file"))
+            if _sfx:
+                science_suffixes.add(_sfx)
+    _outputs = prior.get("outputs")
+    if isinstance(_outputs, dict):
+        _sfx = _scientific_suffix_from_name(_outputs.get("science"))
+        if _sfx:
+            science_suffixes.add(_sfx)
+    _sfx = _scientific_suffix_from_name(prior.get("science_reference"))
+    if _sfx:
+        science_suffixes.add(_sfx)
+    science_suffixes.add(
+        scientific_suffix
+        if isinstance(scientific_suffix, str) and scientific_suffix
+        else "_science"
+    )
 
     prior_name = prior_name.strip()
     current_name = (
@@ -2326,6 +2385,8 @@ def _cleanup_stale_aesthetic(output_dir, current_aesthetic_path, protected_names
         problems.append("not a recognised mosaic_grid*.fits name")
     if prior_name in _RESERVED_NON_AESTHETIC:
         problems.append("fixed reserved (non-aesthetic) output name")
+    if _scientific_suffix_from_name(prior_name) in science_suffixes:
+        problems.append("matches a scientific output name (never removed)")
     if prior_name in set(protected_names or ()):
         problems.append("collides with a current output name")
 
@@ -2368,6 +2429,7 @@ def _write_outputs(
     raw_science=None,
     aesthetic_path=None,
     export_aesthetic_fits=False,
+    scientific_fits_suffix=None,
 ):
     output_dir = Path(output_dir)
     # ZM-ZEGRID-R18: use the finished (aesthetic) science when provided (bit-equal
@@ -2465,6 +2527,7 @@ def _write_outputs(
             *([uint16_path.name] if uint16_path is not None else []),
             *([aesthetic_path.name] if aesthetic_path is not None else []),
         },
+        scientific_suffix=scientific_fits_suffix,
     )
 
     # ZM-ZEGRID-R24 (A1): the ``science_output_contract`` block is built here so
