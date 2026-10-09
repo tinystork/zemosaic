@@ -508,11 +508,15 @@ def test_forced_finishing_failure_warns_and_completes(tmp_path, routine_corpus, 
         lg.removeHandler(cap)
         lg.setLevel(old_level)
 
-    # Raw mosaic still produced (fail-safe).
+    # Raw mosaic still produced (fail-safe). With export_aesthetic_fits defaulting
+    # False (Classic fallback), the raw science is written at ``mosaic_grid.fits``
+    # (SCI role).
     assert (out / "mosaic_grid.fits").exists()
     manifest = json.loads((out / "zegrid_manifest.json").read_text())
     assert manifest["finishing"]["failed"] is True
     assert "forced finishing failure" in manifest["finishing"]["failure_reason"]
+    assert manifest["outputs"]["science"] == "mosaic_grid.fits"
+    assert manifest["science_reference"] == "mosaic_grid.fits"
     # A WARN was emitted (dedicated handler) and the durable run log records it.
     assert any("finishing FAILED" in m for m in captured)
     run_log = (out / zz.RUN_LOG_NAME).read_text()

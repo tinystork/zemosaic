@@ -1,43 +1,55 @@
-"""ZM-ZEGRID-R23 rework-2 — final-mosaic finishing (legacy light-DBE aesthetic + equalize + uint16).
+"""ZM-ZEGRID-R23 rework-3 — final-mosaic finishing (legacy light-DBE aesthetic + equalize + hole fill + uint16).
 
 Post-assembly finishing applied to the ASSEMBLED mosaic BEFORE the outputs are
 written. Pure ``numpy``/``scipy`` (no new dependency). Opt-in, fail-safe, and
 fully documented. This module does **NOT** touch the per-cell / stacking
 science: it only post-processes ``AssembledCanvas.science`` (H, W, 3 float32).
 
-Rework-2 contract (human-gate resolved, Tristan):
+Rework-3 contract (human-gate resolved, Tristan):
 
-* **Two outputs, two roles.** The assembled float32 science is ALWAYS written
-  first, immutable, as the scientific/photometric reference
-  (``mosaic_grid_science.fits``). A second, backward-compatible **aesthetic**
-  float32 (``mosaic_grid.fits``) is produced by the *legacy light-DBE* algorithm
-  (optionally followed by RGB equalization). The aesthetic output is NOT
-  photometrically neutral and is never the measurement reference; the raw
-  science FITS is authoritative.
+* **Raw science is the immutable photometric reference** — always written FIRST,
+  pre-finishing, never mutated, never clamped/abs'd/offset.
+
+* **Aesthetic output is explicitly visual/non-photometric.** It is produced by
+  the *exact legacy light-DBE* algorithm (optionally followed by RGB equalization
+  and user-controlled aesthetic hole fill). Its diffuse-flux loss is a documented
+  property of the aesthetic branch only.
+
+* **Classic-compatible naming.** The existing ``export_aesthetic_fits`` checkbox
+  and ``scientific_fits_suffix`` / ``aesthetic_fits_suffix`` keys (defaults
+  ``_science`` / ``_aesthetic``) drive the file layout on the base ``mosaic_grid``:
+
+  - ``export_aesthetic_fits=false`` → ONE primary raw science float32 as
+    ``mosaic_grid.fits`` (pre-finishing, SCI role), no aesthetic companion;
+  - ``export_aesthetic_fits=true`` → raw science as
+    ``mosaic_grid<clean scientific suffix>.fits`` + aesthetic float32 as
+    ``mosaic_grid<clean aesthetic suffix>.fits`` (defaults
+    ``mosaic_grid_science.fits`` + ``mosaic_grid_aesthetic.fits``).
+
+  Suffix cleaning/collision matches the Classic worker (leading ``_``,
+  ``[A-Za-z0-9_-]``, equal-suffix fallback).
 
 * **Legacy light-DBE (exact historical algorithm).** Variation-only correction
   ``corrected = ch_filled - (bg - bg_med)`` with protected bright-object pixels
   restored unchanged, a Gaussian background model (``mode="nearest"``), and the
-  historical strength maps (sigma / obj_k / dilation). This preserves sky/DC by
-  construction and never performs a destructive full-background subtraction.
+  historical strength maps (sigma / obj_k / dilation). The DBE candidate retains
+  its NaN/coverage mask (uncovered pixels stay NaN).
 
-* **Honest aesthetics.** Because the aesthetic output is intentionally visual
-  (not photometric), it does NOT carry the impossible >=0.90 diffuse-flux
-  preservation gate that BLOCKED rework-1. Its known diffuse-flux loss is a
-  documented property of the AESTHETIC branch only; the raw science retains
-  100% of injected signal by construction.
+* **User-controlled aesthetic hole fill.** Runs ONLY when
+  ``aesthetic_hole_fill_enabled`` is true and reuses the shared Classic helper;
+  when disabled the aesthetic preserves the DBE coverage/NaN mask exactly.
 
 * **Safety guard (no negative explosion, no gross worsening).** After building
   the candidate, if any channel creates a MATERIAL negative-fraction explosion
   or GROSSLY worsens a fixed input-derived background-uniformity metric, the
-  whole RGB is returned unchanged (atomic no-op) with a visible reason. This
-  guards against pathological inputs without imposing a science-neutrality
-  requirement on the aesthetic output.
+  whole RGB is returned unchanged (atomic no-op, bit-identical incl. NaNs) with
+  a visible reason. The guard never imposes the >=0.90 diffuse-flux requirement.
 
-The three honoured user settings:
+The honoured user settings:
 
 * ``final_mosaic_dbe_*``  — legacy light-DBE on the assembled mosaic (aesthetic).
 * ``grid_rgb_equalize``   — per-channel background (sky) equalization.
+* ``aesthetic_hole_fill_*`` — optional visual hole completion (aesthetic only).
 * ``save_final_as_uint16``— an integer (uint16) render of the finished (aesthetic) science.
 
 When every setting is disabled the input array is returned **unchanged**
@@ -142,15 +154,17 @@ def resolve_dbe_strength(zconfig: Any) -> dict:
     Returns ``{strength, params_source, params}``.
 
     * ``strength`` — the effective strength name (canonical:
-      ``weak``/``normal``/``strong``/``aggressive``, or ``custom``).
-    * ``params_source`` — ``preset:<name>``, ``preset:<alias>`` or
-      ``custom_variation_dbe``.
+      ``weak``/``normal``/``strong``/``aggressive``).
+    * ``params_source`` — ``preset:<name>`` or ``preset:<alias>``.
     * ``params`` — the effective ``{sigma, obj_k, obj_dilate_px}``.
 
-    Legacy aliases ``low``/``high`` map to their canonical presets. ``custom``
-    reads the explicit ``final_mosaic_dbe_sigma`` / ``obj_k`` / ``obj_dilate_px``
-    config; it is recorded as ``custom_variation_dbe`` and is NOT claimed
-    bit-identical to legacy. An unknown/empty strength falls back to ``normal``.
+    Legacy aliases ``low``/``high`` map to their canonical presets. An
+    unknown/empty strength falls back to ``normal``. A stored ``custom`` strength
+    has NO Gaussian-``sigma`` config key (the legacy block-median
+    ``sample_step``/``smoothing`` fields are not meaningful for
+    ``legacy_grid_light_dbe``), so ``custom`` falls back to ``normal`` with an
+    explicit ``custom_fallback`` record — never a silent reinterpretation, and no
+    new setting/control is introduced.
     """
     raw = str(_config_get(zconfig, "final_mosaic_dbe_strength", DEFAULT_STRENGTH)
               or DEFAULT_STRENGTH).strip().lower()
@@ -192,6 +206,30 @@ def resolve_dbe_strength(zconfig: Any) -> dict:
     }
 
 
+def clean_fits_suffix(value: Any, default: str) -> str:
+    """Clean a FITS output suffix EXACTLY like the Classic worker.
+
+    Classic reference (``zemosaic_worker.run`` nested ``_clean_suffix``):
+
+    * strip; empty -> ``default``;
+    * ensure a single leading ``_``;
+    * keep only ``[A-Za-z0-9_-]``;
+    * empty after cleaning -> ``default``.
+
+    The collision fallback (aesthetic == scientific -> ``_aesthetic``) is applied
+    by :func:`resolve_finishing_config`.
+    """
+    sfx = str(value or default).strip()
+    if not sfx:
+        sfx = default
+    if not sfx.startswith("_"):
+        sfx = f"_{sfx}"
+    sfx = "".join(ch for ch in sfx if ch.isalnum() or ch in {"_", "-"})
+    if not sfx:
+        sfx = default
+    return sfx
+
+
 def resolve_dbe_params(zconfig: Any, strength: str | None = None) -> dict:
     """Resolve effective legacy light-DBE params (back-compat name).
 
@@ -212,12 +250,19 @@ def resolve_finishing_config(
     Returns a dict:
 
     * ``dbe_enabled``            — from ``final_mosaic_dbe_enabled`` (default True).
-    * ``dbe_strength``           — effective strength (weak/normal/strong/aggressive/custom).
-    * ``dbe_params_source``      — ``preset:*`` or ``custom_variation_dbe``.
+    * ``dbe_strength``           — effective strength (weak/normal/strong/aggressive).
+    * ``dbe_params_source``      — ``preset:*`` (or ``preset:normal`` after a
+      ``custom`` fallback).
     * ``dbe_params``             — effective legacy params ``{sigma, obj_k, obj_dilate_px}``.
     * ``dbe_subtraction_factor`` — always 1.0 (variation-only correction).
     * ``rgb_equalize``           — from ``grid_rgb_equalize`` (default True).
     * ``save_uint16``            — from ``save_final_as_uint16`` (default False).
+    * ``export_aesthetic_fits``  — from the existing ``export_aesthetic_fits`` key
+      (default False).
+    * ``scientific_fits_suffix`` / ``aesthetic_fits_suffix`` — cleaned Classic suffixes.
+    * ``hole_fill_enabled`` / ``hole_fill_max_radius_px`` / ``hole_fill_blend`` /
+      ``hole_fill_only_near_seams`` / ``hole_fill_protect_stars_details`` — the
+      existing ``aesthetic_hole_fill_*`` settings.
     """
     raw = _config_get(zconfig, "final_mosaic_dbe_enabled", None)
     dbe_enabled = True if raw is None else bool(raw)
@@ -236,6 +281,36 @@ def resolve_finishing_config(
         cfg_val = _config_get(zconfig, "save_final_as_uint16", None)
         save_uint16 = False if cfg_val is None else bool(cfg_val)
 
+    # ZM-ZEGRID-R23 rework-3 (H1): resolve the EXISTING output naming + hole-fill
+    # settings from the same ``zconfig`` the Classic worker uses. These are the
+    # established GUI keys; NO new key or control is introduced. The default is
+    # ``export_aesthetic_fits=false`` (matches the Classic worker's effective
+    # fallback and preserves the old primary-name contract ``mosaic_grid.fits``).
+    export_aesthetic_fits = bool(_config_get(zconfig, "export_aesthetic_fits", False))
+    scientific_fits_suffix = clean_fits_suffix(
+        _config_get(zconfig, "scientific_fits_suffix", "_science"), "_science"
+    )
+    aesthetic_fits_suffix = clean_fits_suffix(
+        _config_get(zconfig, "aesthetic_fits_suffix", "_aesthetic"), "_aesthetic"
+    )
+    if aesthetic_fits_suffix == scientific_fits_suffix:
+        aesthetic_fits_suffix = "_aesthetic"
+
+    hole_fill_enabled = bool(_config_get(zconfig, "aesthetic_hole_fill_enabled", True))
+    try:
+        hole_fill_max_radius_px = int(_config_get(
+            zconfig, "aesthetic_hole_fill_max_radius_px", 64) or 64)
+    except Exception:
+        hole_fill_max_radius_px = 64
+    try:
+        hole_fill_blend = float(_config_get(zconfig, "aesthetic_hole_fill_blend", 0.70) or 0.70)
+    except Exception:
+        hole_fill_blend = 0.70
+    hole_fill_only_near_seams = bool(_config_get(
+        zconfig, "aesthetic_hole_fill_only_near_seams", True))
+    hole_fill_protect_stars_details = bool(_config_get(
+        zconfig, "aesthetic_hole_fill_protect_stars_details", True))
+
     return {
         "dbe_enabled": bool(dbe_enabled),
         "dbe_strength": strength_info["strength"],
@@ -245,6 +320,14 @@ def resolve_finishing_config(
         "dbe_subtraction_factor": 1.0,
         "rgb_equalize": bool(rgb_equalize),
         "save_uint16": bool(save_uint16),
+        "export_aesthetic_fits": bool(export_aesthetic_fits),
+        "scientific_fits_suffix": scientific_fits_suffix,
+        "aesthetic_fits_suffix": aesthetic_fits_suffix,
+        "hole_fill_enabled": bool(hole_fill_enabled),
+        "hole_fill_max_radius_px": int(hole_fill_max_radius_px),
+        "hole_fill_blend": float(hole_fill_blend),
+        "hole_fill_only_near_seams": bool(hole_fill_only_near_seams),
+        "hole_fill_protect_stars_details": bool(hole_fill_protect_stars_details),
     }
 
 
@@ -458,14 +541,15 @@ def apply_dbe(
         if ch_info.get("reason"):
             cinfo["reason"] = ch_info["reason"]
 
-        # Fill NaN (uncovered) with the channel's fill reference so downstream
-        # equalize/uint16/render see a fully finite aesthetic plane.
+        # ZM-ZEGRID-R23 rework-3 (H2): the returned aesthetic must RETAIN the DBE
+        # candidate mask (NaN outside valid coverage). A temporary finite plane
+        # is used ONLY for scoring the safety guard; it is never returned.
         fill_ref = float(ch_info.get("fill_ref", 0.0))
-        cand_filled = np.where(np.isfinite(cand), cand, fill_ref).astype(np.float32)
+        cand_score = np.where(np.isfinite(cand), cand, fill_ref).astype(np.float32)
 
-        # negative-fraction + uniformity diagnostics
+        # negative-fraction + uniformity diagnostics (on the temp finite plane).
         if np.any(ch_valid):
-            cinfo["after"] = _channel_stats(cand_filled, ch_valid)
+            cinfo["after"] = _channel_stats(cand_score, ch_valid)
             before_neg = float(cinfo["before"]["neg_frac"])
             after_neg = float(cinfo["after"]["neg_frac"])
             cinfo["neg_frac_delta"] = after_neg - before_neg
@@ -474,7 +558,7 @@ def apply_dbe(
 
             full_mask = _eroded_valid_mask(ch_valid)
             bm, _ = _uniformity_metric(ch, full_mask)
-            am, _ = _uniformity_metric(cand_filled, full_mask)
+            am, _ = _uniformity_metric(cand_score, full_mask)
             if bm is not None:
                 cinfo["before_full_std"] = bm["std"]
                 before_full.append(bm["std"])
@@ -486,7 +570,7 @@ def apply_dbe(
             else:
                 cinfo["full_ratio"] = None
 
-        candidates.append((c, cand_filled))
+        candidates.append((c, cand))  # NaN-preserving candidate
         info["channels"].append(cinfo)
 
     # --- safety guard: gross uniformity worsening ---
@@ -615,13 +699,21 @@ def apply_final_mosaic_finishing(
     *,
     config: dict | None = None,
 ) -> FinishingResult:
-    """Apply the final-mosaic finishing (light-DBE -> RGB equalize -> uint16).
+    """Apply the final-mosaic finishing (light-DBE -> RGB equalize -> hole fill -> uint16).
 
     ``config`` is the dict from :func:`resolve_finishing_config`. When ``config``
     is None (or every feature is disabled) the input array is returned by
     identity and no work is done (bit-equal output). The order is documented:
-    light-DBE first, then RGB equalization, then the uint16 render.
+    light-DBE first, then RGB equalization, then (optional, user-controlled)
+    aesthetic hole fill, then the uint16 render.
+
+    The DBE candidate retains its NaN/coverage mask (uncovered pixels stay NaN).
+    Hole fill runs ONLY when ``aesthetic_hole_fill_enabled`` is true and reuses
+    the shared Classic helper; it never fills when disabled. The uint16 render is
+    derived from the post-aesthetic branch (after DBE/RGB/hole fill).
     """
+    from .aesthetic_hole_fill import apply_aesthetic_hole_fill
+
     cfg = dict(config or {})
     science = np.asarray(science, dtype=np.float32)
     coverage = np.asarray(coverage)
@@ -632,6 +724,7 @@ def apply_final_mosaic_finishing(
         "failure_reason": "",
         "dbe": {"enabled": False, "applied": False},
         "rgb_equalize": {"enabled": False, "applied": False},
+        "hole_fill": {"enabled": False, "applied": False},
         "uint16": {"enabled": False, "written": False},
     }
 
@@ -642,11 +735,13 @@ def apply_final_mosaic_finishing(
     dbe_enabled = bool(cfg.get("dbe_enabled", False))
     rgb_equalize = bool(cfg.get("rgb_equalize", False))
     save_uint16 = bool(cfg.get("save_uint16", False))
+    hole_fill_enabled = bool(cfg.get("hole_fill_enabled", False))
 
     info["dbe"]["enabled"] = dbe_enabled
     info["rgb_equalize"]["enabled"] = rgb_equalize
+    info["hole_fill"]["enabled"] = hole_fill_enabled
     info["uint16"]["enabled"] = save_uint16
-    info["enabled"] = bool(dbe_enabled or rgb_equalize or save_uint16)
+    info["enabled"] = bool(dbe_enabled or rgb_equalize or hole_fill_enabled or save_uint16)
 
     # When nothing is enabled, return the input by identity (bit-equal path).
     if not info["enabled"]:
@@ -669,6 +764,19 @@ def apply_final_mosaic_finishing(
         out, rgb_info = equalize_rgb(out, valid)
         info["rgb_equalize"].update(rgb_info)
         info["rgb_equalize"]["enabled"] = True
+
+    if hole_fill_enabled:
+        out, hf_info = apply_aesthetic_hole_fill(
+            out,
+            coverage_hw=coverage,
+            enabled=True,
+            max_radius_px=int(cfg.get("hole_fill_max_radius_px", 64)),
+            blend=float(cfg.get("hole_fill_blend", 0.70)),
+            only_near_seams=bool(cfg.get("hole_fill_only_near_seams", True)),
+            protect_stars_details=bool(cfg.get("hole_fill_protect_stars_details", True)),
+        )
+        info["hole_fill"].update(hf_info)
+        info["hole_fill"]["enabled"] = True
 
     uint16_data: np.ndarray | None = None
     if save_uint16:

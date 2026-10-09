@@ -1173,10 +1173,10 @@ def _science_header(
 ) -> fits.Header:
     """Canvas WCS header + science-output role/relationship metadata.
 
-    ``role`` is ``science_raw`` (immutable pre-finishing reference) or
-    ``aesthetic`` (delivered legacy light-DBE aesthetic float32). ``dbe_state``
-    is one of ``off`` / ``on`` / ``failed`` / ``n/a``. ``related_file`` records
-    the pre/post-finishing counterpart filename.
+    ``role`` is ``SCI`` (immutable pre-finishing scientific reference) or
+    ``AESTH`` (delivered legacy light-DBE aesthetic float32). ``dbe_state`` is
+    one of ``off`` / ``on`` / ``noop`` / ``failed`` / ``n/a``. ``related_file``
+    records the pre/post-finishing counterpart filename.
     """
     header = _canvas_header(canvas, ndim=3, channels=3)
     header["SCIROLE"] = (role, "science output role")
@@ -1432,13 +1432,14 @@ def _write_run_log(
     )
     if _reproj.get("fallback_reason"):
         lines.append(f"  fallback_reason: {_reproj.get('fallback_reason')}")
-    lines.append("Final-mosaic finishing (ZM-ZEGRID-R23 rework-2):")
+    lines.append("Final-mosaic finishing (ZM-ZEGRID-R23 rework-3):")
     fin = finishing_info or {}
     if not fin or not fin.get("enabled"):
         lines.append("  disabled (no finishing settings applied)")
     else:
         dbe = fin.get("dbe", {})
         rgb = fin.get("rgb_equalize", {})
+        hf = fin.get("hole_fill", {})
         u16 = fin.get("uint16", {})
         lines.append(f"  enabled: {bool(fin.get('enabled'))}")
         lines.append(
@@ -1470,12 +1471,19 @@ def _write_run_log(
             f"skies_before={rgb.get('skies_before')} skies_after={rgb.get('skies_after')}"
         )
         lines.append(
+            f"  hole_fill: enabled={hf.get('enabled')} applied={hf.get('applied')} "
+            f"reason={hf.get('reason') or ''} filled_px={hf.get('filled_px')} "
+            f"hole_px={hf.get('hole_px')} max_radius_px={hf.get('max_radius_px')} "
+            f"blend={hf.get('blend')} only_near_seams={hf.get('only_near_seams')} "
+            f"protect_stars_details={hf.get('protect_stars_details')}"
+        )
+        lines.append(
             f"  uint16: enabled={u16.get('enabled')} written={u16.get('written')} "
             f"vmin={u16.get('vmin')} vmax={u16.get('vmax')}"
         )
     lines.append(
-        "  NOTE: aesthetic output (mosaic_grid.fits) is not photometrically "
-        "neutral; use mosaic_grid_science.fits for measurement."
+        "  NOTE: aesthetic output is not photometrically neutral; use the "
+        "science reference FITS for measurement."
     )
     lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
@@ -2040,11 +2048,17 @@ def _run_single(
         "cleanup_failures": cleanup_failures,
     }
 
-    # ZM-ZEGRID-R23: write the immutable pre-finishing assembled science FIRST,
-    # so a finishing exception can never destroy the scientific reference.
+    # ZM-ZEGRID-R23 rework-3 (H1): resolve the Classic-compatible output naming
+    # from the finishing config (existing export_aesthetic_fits + cleaned suffixes).
     raw_science = np.asarray(assembled.science, dtype=np.float32)
-    raw_science_path = output_dir / "mosaic_grid_science.fits"
-    _write_raw_science_fits(assembled, canvas, raw_science_path)
+    raw_science_path, aesthetic_path = _resolve_output_paths(output_dir, finishing_config)
+
+    # Write the immutable pre-finishing assembled science FIRST, so a finishing
+    # exception can never destroy the scientific reference.
+    _write_raw_science_fits(
+        assembled, canvas, raw_science_path,
+        related_file=(aesthetic_path.name if aesthetic_path is not None else None),
+    )
 
     # ZM-ZEGRID-R18: FINAL-MOSAIC FINISHING (post-assembly, before outputs).
     # Opt-in + fail-safe: a finishing failure WARNS and lets the run complete with
@@ -2083,7 +2097,8 @@ def _run_single(
         }
         fin_uint16 = None
 
-    # Write legacy-compatible outputs.
+    # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
+    export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
     sci_path, cov_path, manifest_path = _write_outputs(
         assembled, canvas, nx, ny, output_dir, descs, {}, cell_records,
         layout, science_config, peak_rss_kib, cache_report, progress_callback,
@@ -2100,6 +2115,8 @@ def _run_single(
         aggregate_peak_rss_kib=aggregate_peak_rss_kib,
         raw_science_path=raw_science_path,
         raw_science=raw_science,
+        aesthetic_path=aesthetic_path if export_aesthetic else None,
+        export_aesthetic_fits=export_aesthetic,
     )
 
     _write_run_log(
@@ -2125,7 +2142,9 @@ def _run_single(
     )
 
     _emit(
-        f"ZeGrid: done — {sci_path.name} ({assembled.science.shape}) + coverage + run log, "
+        f"ZeGrid: done — science={raw_science_path.name} "
+        f"aesthetic={aesthetic_path.name if (export_aesthetic and aesthetic_path is not None) else 'n/a'} "
+        f"({assembled.science.shape}) + coverage + run log, "
         f"complete={len(assembled.complete_cells)} incomplete={len(assembled.incomplete_cells)} "
         f"holes={assembled.hole_pixels}px peak_rss={peak_rss_kib}KiB "
         f"cache_total={cache_total_bytes / 2**20:.0f}MiB cache_peak={cache_peak_bytes / 2**20:.0f}MiB",
@@ -2135,22 +2154,51 @@ def _run_single(
     return sci_path
 
 
-def _write_raw_science_fits(assembled, canvas, raw_science_path):
+def _resolve_output_paths(output_dir, finishing_config):
+    """Resolve the raw-science + aesthetic output paths (Classic naming).
+
+    Base name is ``mosaic_grid``. Per the rework-3 Classic-compatible contract:
+
+    * ``export_aesthetic_fits=false`` → raw science at ``mosaic_grid.fits``
+      (pre-finishing, SCI role), NO aesthetic float companion;
+    * ``export_aesthetic_fits=true`` → raw science at
+      ``mosaic_grid<clean scientific suffix>.fits`` + aesthetic float32 at
+      ``mosaic_grid<clean aesthetic suffix>.fits`` (defaults
+      ``mosaic_grid_science.fits`` / ``mosaic_grid_aesthetic.fits``).
+
+    Returns ``(raw_science_path, aesthetic_path_or_None)``.
+    """
+    cfg = finishing_config or {}
+    export = bool(cfg.get("export_aesthetic_fits", False))
+    sci_suffix = cfg.get("scientific_fits_suffix", "_science")
+    aest_suffix = cfg.get("aesthetic_fits_suffix", "_aesthetic")
+    output_dir = Path(output_dir)
+    if export:
+        raw_path = output_dir / f"mosaic_grid{sci_suffix}.fits"
+        aest_path = output_dir / f"mosaic_grid{aest_suffix}.fits"
+    else:
+        raw_path = output_dir / "mosaic_grid.fits"
+        aest_path = None
+    return raw_path, aest_path
+
+
+def _write_raw_science_fits(assembled, canvas, raw_science_path, role="SCI", related_file=None):
     """Write the immutable pre-finishing assembled science FITS.
 
     Written BEFORE finishing runs so a finishing exception can never destroy the
     scientific reference. Same WCS/axis layout as the delivered output, float32,
-    never clamped/offset/abs'd. Header records role + dtype + DBE state + hash.
+    never clamped/offset/abs'd. Header records role (``SCI`` scientific reference),
+    dtype + DBE state + hash, plus the related aesthetic file (when one is emitted).
     """
     raw_science = np.asarray(assembled.science, dtype=np.float32)
     raw_data = np.ascontiguousarray(np.moveaxis(raw_science, -1, 0))  # (3, H, W)
     raw_header = _science_header(
         canvas,
-        role="science_raw",
+        role=role,
         dtype="float32",
         dbe_state="n/a",
         sha256=_array_sha256(raw_data),
-        related_file="mosaic_grid.fits",
+        related_file=related_file,
     )
     _atomic_writeto(fits.PrimaryHDU(raw_data, header=raw_header), raw_science_path)
     return raw_science_path
@@ -2178,10 +2226,14 @@ def _write_outputs(
     aggregate_peak_rss_kib=None,
     raw_science_path=None,
     raw_science=None,
+    aesthetic_path=None,
+    export_aesthetic_fits=False,
 ):
     output_dir = Path(output_dir)
-    # ZM-ZEGRID-R18: use the finished science when provided (bit-equal to the raw
-    # path when finishing is disabled -> ``finished_science`` is the same array).
+    # ZM-ZEGRID-R18: use the finished (aesthetic) science when provided (bit-equal
+    # to the raw path when finishing is disabled -> ``finished_science`` is the same
+    # array). The RAW science is written first (immutable reference), and the
+    # aesthetic float is written ONLY when ``export_aesthetic_fits`` (Classic naming).
     science = np.asarray(
         assembled.science if finished_science is None else finished_science,
         dtype=np.float32,
@@ -2189,16 +2241,19 @@ def _write_outputs(
     stack_depth = np.asarray(assembled.stack_depth, dtype=np.int32)  # (H, W)
 
     sci_data = np.ascontiguousarray(np.moveaxis(science, -1, 0))  # (3, H, W)
-    sci_path = output_dir / "mosaic_grid.fits"
 
-    # ZM-ZEGRID-R23: dual float32 output contract.
-    # ``mosaic_grid_science.fits`` is the immutable pre-finishing reference (written
-    # by ``_run_single`` before finishing). ``mosaic_grid.fits`` is the delivered
-    # finished float32 (bit-identical raw content when disabled / finishing failed).
+    # ZM-ZEGRID-R23 rework-3 (H1): Classic-compatible naming on base ``mosaic_grid``.
+    # ``mosaic_grid<clean scientific suffix>.fits`` is the immutable pre-finishing
+    # reference (SCI role, written by ``_run_single`` before finishing);
+    # ``mosaic_grid<clean aesthetic suffix>.fits`` is the delivered aesthetic
+    # float32 (AESTH role), written only when ``export_aesthetic_fits``.
     if raw_science_path is None:
-        raw_science_path = output_dir / "mosaic_grid_science.fits"
+        raw_science_path = output_dir / "mosaic_grid.fits"
         _write_raw_science_fits(assembled, canvas, raw_science_path)
     raw_science_path = Path(raw_science_path)
+
+    if aesthetic_path is not None:
+        aesthetic_path = Path(aesthetic_path)
 
     dbe_applied = bool((finishing_info or {}).get("dbe", {}).get("applied"))
     dbe_attempted = bool((finishing_info or {}).get("dbe", {}).get("attempted"))
@@ -2209,26 +2264,28 @@ def _write_outputs(
     elif dbe_applied:
         dbe_state = "on"
     elif dbe_attempted:
-        # R23 rework-1: attempted but no-op (uniformity gate / model rejected).
         dbe_state = "noop"
-    elif dbe_enabled:
-        dbe_state = "off"
     else:
         dbe_state = "off"
 
-    sci_header = _science_header(
-        canvas,
-        role="aesthetic",
-        dtype="float32",
-        dbe_state=dbe_state,
-        sha256=_array_sha256(sci_data),
-        related_file=raw_science_path.name,
-    )
-    _atomic_writeto(fits.PrimaryHDU(sci_data, header=sci_header), sci_path)
+    # Aesthetic float is emitted only when the checkbox is set.
+    sci_path = aesthetic_path if aesthetic_path is not None else raw_science_path
+    if aesthetic_path is not None:
+        sci_header = _science_header(
+            canvas,
+            role="AESTH",
+            dtype="float32",
+            dbe_state=dbe_state,
+            sha256=_array_sha256(sci_data),
+            related_file=raw_science_path.name,
+        )
+        _atomic_writeto(fits.PrimaryHDU(sci_data, header=sci_header), aesthetic_path)
+    elif export_aesthetic_fits:
+        # Checkbox set but no aesthetic path resolved -> do not fabricate a file.
+        pass
 
-    # ZM-ZEGRID-R18: optional uint16 render (save_final_as_uint16). Documented
-    # linear stretch derived from the DELIVERED finished float32; never a
-    # scientific reference. The float science FITS above remains the primary.
+    # ZM-ZEGRID-R18: optional uint16 render (save_final_as_uint16). Derived from
+    # the post-aesthetic branch; clearly non-scientific.
     uint16_path = None
     if fin_uint16 is not None:
         u16 = np.asarray(fin_uint16, dtype=np.uint16)
@@ -2370,39 +2427,40 @@ def _write_outputs(
             "deduplicated)"
         ),
         "outputs": {
-            "science": sci_path.name,
-            "science_raw": raw_science_path.name,
-            "aesthetic": sci_path.name,
+            "science": raw_science_path.name,
+            "aesthetic": (aesthetic_path.name if aesthetic_path is not None else None),
             "coverage": cov_path.name,
             "uint16": (uint16_path.name if uint16_path is not None else None),
             "run_log": RUN_LOG_NAME,
         },
         "science_reference": raw_science_path.name,
-        "algorithm": "legacy_grid_light_dbe",
+        "algorithm": ("legacy_grid_light_dbe" if dbe_applied else None),
         "aesthetic_warning": (
-            "aesthetic output (mosaic_grid.fits) is not photometrically neutral; "
-            "use science_raw (mosaic_grid_science.fits) for measurement"
+            f"aesthetic output ({aesthetic_path.name}) is not photometrically "
+            f"neutral; use science_reference ({raw_science_path.name}) for "
+            "measurement" if aesthetic_path is not None else None
         ),
         "science_output_contract": {
             "note": (
-                "ZM-ZEGRID-R23 rework-2: 'science_raw' is the immutable pre-finishing "
-                "assembled science (the scientific/photometric reference, always "
-                "written); 'aesthetic'/'science' is the delivered legacy light-DBE "
-                "aesthetic float32 (bit-identical to raw when finishing is disabled "
-                "or failed). 'uint16' is only an optional render derived from the "
+                "ZM-ZEGRID-R23 rework-3: 'science'/'science_reference' is the "
+                "immutable pre-finishing assembled science (the scientific/"
+                "photometric reference, always written); 'aesthetic' is the "
+                "delivered legacy light-DBE aesthetic float32 (written only when "
+                "export_aesthetic_fits is true; bit-identical to raw when finishing "
+                "is disabled). 'uint16' is only an optional render derived from the "
                 "aesthetic float32, never a scientific reference."
             ),
             "raw": {
                 "file": raw_science_path.name,
-                "role": "science_raw",
+                "role": "SCI",
                 "dtype": "float32",
                 "sha256": _array_sha256(np.ascontiguousarray(np.moveaxis(
                     np.asarray(assembled.science if raw_science is None else raw_science,
                                dtype=np.float32), -1, 0))),
             },
-            "finished": {
-                "file": sci_path.name,
-                "role": "aesthetic",
+            "aesthetic": {
+                "file": (aesthetic_path.name if aesthetic_path is not None else None),
+                "role": "AESTH",
                 "dtype": "float32",
                 "dbe_state": dbe_state,
                 "sha256": _array_sha256(sci_data),

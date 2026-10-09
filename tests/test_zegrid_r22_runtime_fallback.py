@@ -54,7 +54,12 @@ def _prepare_input(input_dir, routine_corpus):
 
 
 def _science_sha256(out_dir):
-    with fits.open(out_dir / "mosaic_grid.fits") as hdul:
+    # Rework-3: the scientific reference file name comes from the manifest
+    # (export_aesthetic_fits default -> ``mosaic_grid_science.fits``).
+    import json
+    m = json.loads((Path(out_dir) / "zegrid_manifest.json").read_text(encoding="utf-8"))
+    sci_name = m.get("science_reference") or m["outputs"]["science"]
+    with fits.open(out_dir / sci_name) as hdul:
         data = np.ascontiguousarray(np.asarray(hdul[0].data, dtype=np.float32))
     return hashlib.sha256(data.tobytes()).hexdigest()
 
