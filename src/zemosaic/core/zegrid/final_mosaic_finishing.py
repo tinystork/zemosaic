@@ -1,47 +1,47 @@
-"""ZM-ZEGRID-R23 — final-mosaic finishing (scientific DBE + RGB equalize + uint16).
+"""ZM-ZEGRID-R23 rework-2 — final-mosaic finishing (legacy light-DBE aesthetic + equalize + uint16).
 
 Post-assembly finishing applied to the ASSEMBLED mosaic BEFORE the outputs are
 written. Pure ``numpy``/``scipy`` (no new dependency). Opt-in, fail-safe, and
 fully documented. This module does **NOT** touch the per-cell / stacking
 science: it only post-processes ``AssembledCanvas.science`` (H, W, 3 float32).
 
-R23 rework (contract ZM-ZEGRID-R23, from the R18 baseline):
+Rework-2 contract (human-gate resolved, Tristan):
 
-* **Scientific honesty.** DBE now corrects only the estimated BACKGROUND
-  VARIATION around a robust per-channel reference baseline::
+* **Two outputs, two roles.** The assembled float32 science is ALWAYS written
+  first, immutable, as the scientific/photometric reference
+  (``mosaic_grid_science.fits``). A second, backward-compatible **aesthetic**
+  float32 (``mosaic_grid.fits``) is produced by the *legacy light-DBE* algorithm
+  (optionally followed by RGB equalization). The aesthetic output is NOT
+  photometrically neutral and is never the measurement reference; the raw
+  science FITS is authoritative.
 
-      corrected = ch - (bg - bg_reference)
+* **Legacy light-DBE (exact historical algorithm).** Variation-only correction
+  ``corrected = ch_filled - (bg - bg_med)`` with protected bright-object pixels
+  restored unchanged, a Gaussian background model (``mode="nearest"``), and the
+  historical strength maps (sigma / obj_k / dilation). This preserves sky/DC by
+  construction and never performs a destructive full-background subtraction.
 
-  (legacy "light DBE" semantics), instead of R18's destructive full-background
-  subtraction ``ch - factor*bg`` which drove ~43% negatives on real M106 data.
-  Global sky/DC is preserved; negatives are legitimate science and are never
-  clamped, inverted, or absoluted.
+* **Honest aesthetics.** Because the aesthetic output is intentionally visual
+  (not photometric), it does NOT carry the impossible >=0.90 diffuse-flux
+  preservation gate that BLOCKED rework-1. Its known diffuse-flux loss is a
+  documented property of the AESTHETIC branch only; the raw science retains
+  100% of injected signal by construction.
 
-* **Strength/custom semantics restored.** ``weak`` / ``normal`` / ``strong``
-  choose *estimator parameter presets* (object-mask k, dilation, sample step,
-  smoothing) — exactly the legacy product presets. ``custom`` reads the explicit
-  numeric config fields. There is NO hidden 0.5 / 1.5 model multiplier: the
-  subtraction factor is always 1.0. Invalid strength -> documented ``normal``.
-
-* **Diffuse protection.** A multiscale coarse-residual mask excludes broad
-  low-contrast structures (galaxies, nebulosity) from the background fit, so the
-  smooth block-median model cannot absorb them; compact bright sources are masked
-  (and dilated) so they do not imprint dark halos. The correction field is a
-  smooth variation surface applied uniformly — no per-pixel masked/uncorrected
-  seams.
-
-* **Honest fallback.** When too few background samples remain, no correction is
-  applied (the channel is returned unchanged) and the reason is recorded — never
-  a silent revert to the destructive full-background subtraction.
+* **Safety guard (no negative explosion, no gross worsening).** After building
+  the candidate, if any channel creates a MATERIAL negative-fraction explosion
+  or GROSSLY worsens a fixed input-derived background-uniformity metric, the
+  whole RGB is returned unchanged (atomic no-op) with a visible reason. This
+  guards against pathological inputs without imposing a science-neutrality
+  requirement on the aesthetic output.
 
 The three honoured user settings:
 
-* ``final_mosaic_dbe_*``  — Dynamic Background Extraction on the assembled mosaic.
+* ``final_mosaic_dbe_*``  — legacy light-DBE on the assembled mosaic (aesthetic).
 * ``grid_rgb_equalize``   — per-channel background (sky) equalization.
-* ``save_final_as_uint16``— an integer (uint16) render of the finished science.
+* ``save_final_as_uint16``— an integer (uint16) render of the finished (aesthetic) science.
 
 When every setting is disabled the input array is returned **unchanged**
-(identity) so the written science FITS is bit-equal to the pre-finishing path.
+(identity) so the written aesthetic FITS is bit-equal to the raw reference.
 """
 
 from __future__ import annotations
@@ -54,37 +54,43 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Legacy strength presets (parameter presets, NOT subtraction multipliers)
+# Legacy strength presets (EXACT historical Grid mappings).
 # ---------------------------------------------------------------------------
 #
-# ``final_mosaic_dbe_strength`` selects ESTIMATOR PARAMETERS. The product's
-# documented legacy presets are reproduced exactly:
+# From the authoritative legacy reference
+# ``grid_mode._apply_grid_final_dbe`` (``git show origin/HEAD:src/zemosaic/grid_mode.py``):
 #
-#   weak   -> {obj_k: 4.0, obj_dilate_px: 2, sample_step: 32, smoothing: 1.0}
-#   normal -> {obj_k: 3.0, obj_dilate_px: 3, sample_step: 24, smoothing: 0.6}
-#   strong -> {obj_k: 2.2, obj_dilate_px: 4, sample_step: 16, smoothing: 0.25}
-#   custom -> the explicit ``final_mosaic_dbe_obj_k`` / ``obj_dilate_px`` /
-#             ``sample_step`` / ``smoothing`` config values.
+#   weak / low     -> sigma=24, obj_k=3.0, dilate=2
+#   normal         -> sigma=36, obj_k=2.8, dilate=3
+#   strong / high  -> sigma=52, obj_k=2.5, dilate=4
+#   aggressive     -> sigma=68, obj_k=2.2, dilate=5
 #
-# Any other value (including the legacy aliases ``off``/``low``/``high`` and
-# empty/None) is treated as the documented ``normal`` preset.
+# ``sigma`` is the Gaussian background-model sigma (px); ``obj_k`` the compact
+# object-detection k-sigma; ``obj_dilate_px`` the object-mask dilation radius.
+# These are reproduced EXACTLY; the legacy aliases are accepted.
 DBE_STRENGTH_PRESETS: dict[str, dict[str, float | int]] = {
-    "weak": {"obj_k": 4.0, "obj_dilate_px": 2, "sample_step": 32, "smoothing": 1.0},
-    "normal": {"obj_k": 3.0, "obj_dilate_px": 3, "sample_step": 24, "smoothing": 0.6},
-    "strong": {"obj_k": 2.2, "obj_dilate_px": 4, "sample_step": 16, "smoothing": 0.25},
+    "weak": {"sigma": 24.0, "obj_k": 3.0, "obj_dilate_px": 2},
+    "low": {"sigma": 24.0, "obj_k": 3.0, "obj_dilate_px": 2},
+    "normal": {"sigma": 36.0, "obj_k": 2.8, "obj_dilate_px": 3},
+    "strong": {"sigma": 52.0, "obj_k": 2.5, "obj_dilate_px": 4},
+    "high": {"sigma": 52.0, "obj_k": 2.5, "obj_dilate_px": 4},
+    "aggressive": {"sigma": 68.0, "obj_k": 2.2, "obj_dilate_px": 5},
 }
 DEFAULT_STRENGTH = "normal"
 
-# Subtraction factor is always 1.0 (variation-only correction). Kept explicit so
-# the contract is auditable and no hidden scalar can creep in.
+# Canonical strength names (the first in each legacy alias group).
+_CANONICAL = {"low": "weak", "high": "strong", "aggressive": "aggressive"}
+
+# Subtraction is always variation-only (factor 1.0); kept explicit/auditable.
 DBE_SUBTRACTION_FACTOR = 1.0
 
-
-# Diffuse-protection tuning (internal, documented; not user-facing knobs).
-DIFFUSE_COARSE_FACTOR = 8.0   # coarse bg sigma = sample_step * this, for residual
-DIFFUSE_DETECT_SIGMA = 24.0   # residual smoothing scale (px) for diffuse detection
-DIFFUSE_SIGNIFICANCE = 3.0    # diffuse residual significance (units of pixel noise)
-MIN_BG_SAMPLES = 9            # minimum background samples before honest fallback
+# Safety guard (aesthetic output only; does NOT impose science neutrality).
+NEG_FRAC_EXPLOSION_ABS = 0.05   # candidate - before negative fraction (absolute) triggering no-op
+UNIFORMITY_WORSE_FACTOR = 1.5   # candidate_full_std > before_full_std * this -> no-op
+UNIFORMITY_BOXES = 8            # NxN box grid for the fixed input-derived sky metric
+UNIFORMITY_MIN_BOX_SAMPLES = 25  # min sky samples per box to count it
+UNIFORMITY_MIN_BOXES = 16       # min counted boxes to trust the metric
+BOUNDARY_ERODE_PX = 2           # erode coverage boundary before the safety metric
 
 
 def _safe_float(value: Any, fallback: float) -> float:
@@ -131,49 +137,66 @@ def _config_get(zconfig: Any, key: str, fallback: Any) -> Any:
 
 
 def resolve_dbe_strength(zconfig: Any) -> dict:
-    """Resolve DBE strength into effective estimator params + provenance.
+    """Resolve DBE strength into effective legacy light-DBE params + provenance.
 
     Returns ``{strength, params_source, params}``.
 
-    * ``strength`` — the effective strength name (``weak``/``normal``/``strong``/
-      ``custom``); invalid/unknown -> ``normal``.
-    * ``params_source`` — ``preset:<name>`` or ``custom_cfg``.
-    * ``params`` — the effective ``{obj_k, obj_dilate_px, sample_step, smoothing}``.
+    * ``strength`` — the effective strength name (canonical:
+      ``weak``/``normal``/``strong``/``aggressive``, or ``custom``).
+    * ``params_source`` — ``preset:<name>``, ``preset:<alias>`` or
+      ``custom_variation_dbe``.
+    * ``params`` — the effective ``{sigma, obj_k, obj_dilate_px}``.
+
+    Legacy aliases ``low``/``high`` map to their canonical presets. ``custom``
+    reads the explicit ``final_mosaic_dbe_sigma`` / ``obj_k`` / ``obj_dilate_px``
+    config; it is recorded as ``custom_variation_dbe`` and is NOT claimed
+    bit-identical to legacy. An unknown/empty strength falls back to ``normal``.
     """
     raw = str(_config_get(zconfig, "final_mosaic_dbe_strength", DEFAULT_STRENGTH)
               or DEFAULT_STRENGTH).strip().lower()
+
     if raw in DBE_STRENGTH_PRESETS:
-        params = dict(DBE_STRENGTH_PRESETS[raw])
-        return {"strength": raw, "params_source": f"preset:{raw}", "params": params}
+        canonical = _CANONICAL.get(raw, raw)
+        return {
+            "strength": canonical,
+            "params_source": f"preset:{raw}",
+            "params": dict(DBE_STRENGTH_PRESETS[raw]),
+        }
 
     if raw == "custom":
-        normal = DBE_STRENGTH_PRESETS[DEFAULT_STRENGTH]
-        params = {
-            "obj_k": max(0.0, _safe_float(
-                _config_get(zconfig, "final_mosaic_dbe_obj_k", normal["obj_k"]),
-                float(normal["obj_k"]))),
-            "obj_dilate_px": max(0, _safe_int(
-                _config_get(zconfig, "final_mosaic_dbe_obj_dilate_px", normal["obj_dilate_px"]),
-                int(normal["obj_dilate_px"]))),
-            "sample_step": max(1, _safe_int(
-                _config_get(zconfig, "final_mosaic_dbe_sample_step", normal["sample_step"]),
-                int(normal["sample_step"]))),
-            "smoothing": max(0.0, _safe_float(
-                _config_get(zconfig, "final_mosaic_dbe_smoothing", normal["smoothing"]),
-                float(normal["smoothing"]))),
+        # The legacy light-DBE algorithm is defined by (sigma, obj_k, obj_dilate_px).
+        # obj_k / obj_dilate_px ARE existing config keys (object-mask params), but
+        # the Gaussian background-model scale (sigma) has NO existing config key
+        # and cannot be derived from the legacy block-median ``sample_step`` /
+        # ``smoothing`` fields without silently reinterpreting them. Per the
+        # rework-2 contract (and the product-owner "no new settings" constraint),
+        # a stored ``custom`` therefore falls back to the documented ``normal``
+        # preset with an explicit WARN — never a silent reinterpretation.
+        return {
+            "strength": DEFAULT_STRENGTH,
+            "params_source": "preset:normal",
+            "params": dict(DBE_STRENGTH_PRESETS[DEFAULT_STRENGTH]),
+            "custom_fallback": (
+                "custom requested but the legacy light-DBE Gaussian sigma has no "
+                "existing config key; block-median sample_step/smoothing are not "
+                "meaningful for legacy_grid_light_dbe, so fell back to normal "
+                "(config preserved, not reinterpreted)"
+            ),
         }
-        return {"strength": "custom", "params_source": "custom_cfg", "params": params}
 
-    # Invalid / legacy alias -> documented normal.
-    params = dict(DBE_STRENGTH_PRESETS[DEFAULT_STRENGTH])
-    return {"strength": DEFAULT_STRENGTH, "params_source": "preset:normal", "params": params}
+    # Invalid / unknown -> documented normal.
+    return {
+        "strength": DEFAULT_STRENGTH,
+        "params_source": "preset:normal",
+        "params": dict(DBE_STRENGTH_PRESETS[DEFAULT_STRENGTH]),
+    }
 
 
 def resolve_dbe_params(zconfig: Any, strength: str | None = None) -> dict:
-    """Resolve effective DBE estimation params (back-compat name).
+    """Resolve effective legacy light-DBE params (back-compat name).
 
-    ``strength`` is accepted for signature compatibility but is ignored: the
-    strength always comes from the config (see :func:`resolve_dbe_strength`).
+    ``strength`` is accepted for signature compatibility but ignored: strength
+    always comes from the config (see :func:`resolve_dbe_strength`).
     """
     return resolve_dbe_strength(zconfig)["params"]
 
@@ -189,9 +212,9 @@ def resolve_finishing_config(
     Returns a dict:
 
     * ``dbe_enabled``            — from ``final_mosaic_dbe_enabled`` (default True).
-    * ``dbe_strength``           — effective strength (weak/normal/strong/custom).
-    * ``dbe_params_source``      — ``preset:*`` or ``custom_cfg``.
-    * ``dbe_params``             — effective estimator params.
+    * ``dbe_strength``           — effective strength (weak/normal/strong/aggressive/custom).
+    * ``dbe_params_source``      — ``preset:*`` or ``custom_variation_dbe``.
+    * ``dbe_params``             — effective legacy params ``{sigma, obj_k, obj_dilate_px}``.
     * ``dbe_subtraction_factor`` — always 1.0 (variation-only correction).
     * ``rgb_equalize``           — from ``grid_rgb_equalize`` (default True).
     * ``save_uint16``            — from ``save_final_as_uint16`` (default False).
@@ -218,6 +241,7 @@ def resolve_finishing_config(
         "dbe_strength": strength_info["strength"],
         "dbe_params_source": strength_info["params_source"],
         "dbe_params": strength_info["params"],
+        "dbe_custom_fallback": strength_info.get("custom_fallback"),
         "dbe_subtraction_factor": 1.0,
         "rgb_equalize": bool(rgb_equalize),
         "save_uint16": bool(save_uint16),
@@ -240,177 +264,42 @@ def _robust_sky(values: np.ndarray) -> tuple[float, float]:
     return med, sigma
 
 
-def _block_median(values: np.ndarray, valid: np.ndarray, block: int) -> np.ndarray:
-    """Vectorized per-block median of ``values`` where ``valid`` is True.
+def _eroded_valid_mask(valid: np.ndarray, iterations: int = BOUNDARY_ERODE_PX) -> np.ndarray:
+    """Erode the coverage boundary so edge pixels don't contaminate the metric."""
+    from scipy.ndimage import binary_erosion
+    valid = np.asarray(valid, dtype=bool)
+    if not np.any(valid) or iterations <= 0:
+        return valid
+    return valid & binary_erosion(valid, iterations=int(iterations))
 
-    Returns a ``(n_blocks_h, n_blocks_w)`` float32 grid; blocks with no valid
-    samples are NaN. ``block`` is the block side in pixels.
+
+def _uniformity_metric(
+    channel: np.ndarray, sky_mask: np.ndarray, boxes: int = UNIFORMITY_BOXES
+) -> tuple[dict | None, int]:
+    """Fixed input-derived background-uniformity metric (safety guard only).
+
+    Splits the image into ``boxes x boxes`` fixed boxes; for each box computes the
+    median of the sky-masked pixels (boxes with fewer than
+    ``UNIFORMITY_MIN_BOX_SAMPLES`` samples are skipped). The metric is the std of
+    the box medians (robust sigma also reported). Returns
+    ``(metric_dict, n_boxes_used)``; the dict is None when fewer than
+    ``UNIFORMITY_MIN_BOXES`` boxes qualify (metric untrustworthy).
     """
-    h, w = values.shape
-    bh = (h + block - 1) // block
-    bw = (w + block - 1) // block
-    ph = bh * block - h
-    pw = bw * block - w
-
-    vp = np.pad(values, ((0, ph), (0, pw)), mode="constant", constant_values=np.nan)
-    mp = np.pad(valid, ((0, ph), (0, pw)), mode="constant", constant_values=False)
-    vp = np.asarray(vp, dtype=np.float64)
-    vp = vp.reshape(bh, block, bw, block)
-    mp = mp.reshape(bh, block, bw, block)
-    vp = np.where(mp, vp, np.nan)
-    with np.errstate(invalid="ignore"):
-        with _warnings.catch_warnings():
-            _warnings.simplefilter("ignore", RuntimeWarning)
-            grid = np.nanmedian(vp, axis=(1, 3))
-    return np.asarray(grid, dtype=np.float32)
-
-
-def _fill_nan_nearest(grid: np.ndarray) -> np.ndarray:
-    """Fill NaN cells of a 2-D grid with the nearest finite cell's value."""
-    from scipy.ndimage import distance_transform_edt
-
-    grid = np.asarray(grid, dtype=np.float32)
-    if not np.isnan(grid).any():
-        return grid
-    if np.all(np.isnan(grid)):
-        return np.zeros_like(grid, dtype=np.float32)
-    inds = distance_transform_edt(
-        np.isnan(grid), return_distances=False, return_indices=True
-    )
-    return np.asarray(grid[tuple(inds)], dtype=np.float32)
-
-
-def _upsample_bg(grid: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    """Bilinear upsample a low-res grid to ``shape`` (crop/pad exact)."""
-    from scipy.ndimage import zoom
-
-    grid = np.asarray(grid, dtype=np.float32)
-    zh = shape[0] / float(grid.shape[0])
-    zw = shape[1] / float(grid.shape[1])
-    bg = zoom(grid, (zh, zw), order=1).astype(np.float32)
-    if bg.shape != shape:
-        out = np.full(shape, np.nan, dtype=np.float32)
-        hh = min(bg.shape[0], shape[0])
-        ww = min(bg.shape[1], shape[1])
-        out[:hh, :ww] = bg[:hh, :ww]
-        bg = _fill_nan_nearest(out)
-    return bg
-
-
-# ---------------------------------------------------------------------------
-# Background estimation (scientific DBE, diffuse-safe)
-# ---------------------------------------------------------------------------
-
-def estimate_background_channel(
-    channel: np.ndarray,
-    valid: np.ndarray,
-    *,
-    sample_step: int,
-    obj_k: float,
-    obj_dilate_px: int,
-    smoothing: float,
-) -> tuple[np.ndarray, dict]:
-    """Estimate a smooth 2-D background VARIATION model for a single channel.
-
-    Algorithm (documented, deterministic, bounded-RAM):
-
-    1. Robust sky level/sigma (median + 1.4826*MAD) over valid pixels, plus a
-       high-pass pixel-noise estimate (robust to gradient/diffuse structure).
-    2. Compact-object mask: valid pixels brighter than ``sky + obj_k*sigma``,
-       dilated by ``obj_dilate_px`` (protects bright sources -> no dark halos).
-    3. Diffuse-object mask (multiscale): a coarse heavily-smoothed background
-       captures only the large-scale gradient/vignette; the smoothed residual
-       ``channel - coarse_bg`` reveals broad low-contrast structures; pixels
-       whose residual exceeds ``DIFFUSE_SIGNIFICANCE * noise`` (then morphologically
-       opened to require spatial extension) are excluded from the background fit.
-    4. Background grid: per-``sample_step``-block median of the background-only
-       samples, NaN-filled, Gaussian-smoothed (``smoothing``), bilinearly upsampled.
-    5. Robust reference baseline = median of the background model over the
-       background-only samples (preserves global sky/DC).
-
-    Returns ``(bg, info)``. On insufficient background samples the returned
-    ``bg`` is a flat field at the sky level (so ``ch - (bg - bg_ref)`` leaves the
-    channel unchanged) and ``info`` records the honest fallback.
-    """
-    from scipy.ndimage import (
-        binary_dilation,
-        binary_opening,
-        gaussian_filter,
-        generate_binary_structure,
-    )
-
-    info: dict = {
-        "reason": "",
-        "model": "block_median_variation_diffuse_safe",
-        "fallback": "none",
-    }
-    ch = np.asarray(channel, dtype=np.float32)
-    valid = np.asarray(valid, dtype=bool) & np.isfinite(ch)
-
-    if not np.any(valid):
-        info["reason"] = "no_valid"
-        return np.zeros_like(ch), info
-
-    sky, sigma = _robust_sky(ch[valid])
-    info["sky"] = float(sky)
-    info["sigma"] = float(sigma)
-
-    # high-pass pixel noise (robust to gradient + diffuse structure)
-    sm2 = gaussian_filter(np.nan_to_num(ch, nan=sky), sigma=2.0)
-    noise = _robust_sky((ch - sm2)[valid])[1]
-    info["noise"] = float(noise)
-
-    # 1. compact-object (star) mask
-    star = valid & (ch > sky + float(obj_k) * sigma)
-    if obj_dilate_px > 0:
-        star = binary_dilation(star, iterations=int(obj_dilate_px))
-    info["star_frac"] = float(np.count_nonzero(star) / max(1, int(np.count_nonzero(valid))))
-
-    # 2. diffuse-object mask (multiscale coarse residual)
-    filled = np.where(valid & ~star, ch, sky).astype(np.float32)
-    coarse_sigma = max(float(sample_step) * DIFFUSE_COARSE_FACTOR, DIFFUSE_DETECT_SIGMA)
-    bg_coarse = gaussian_filter(filled, sigma=coarse_sigma)
-    resid = ch - bg_coarse
-    resid_sm = gaussian_filter(np.nan_to_num(resid, nan=0.0), sigma=DIFFUSE_DETECT_SIGMA)
-    thr = float(DIFFUSE_SIGNIFICANCE) * float(noise) if noise > 0 else 0.0
-    diffuse = valid & (~star) & (resid_sm > thr)
-    if np.any(diffuse) and DIFFUSE_DETECT_SIGMA >= 3:
-        diffuse = binary_opening(
-            diffuse,
-            structure=generate_binary_structure(2, 1),
-            iterations=max(1, int(round(DIFFUSE_DETECT_SIGMA))),
-        )
-    info["diffuse_frac"] = float(np.count_nonzero(diffuse) / max(1, int(np.count_nonzero(valid))))
-
-    # 3. combined object mask, dilated to protect halo shoulders
-    obj = star | diffuse
-    if obj_dilate_px > 0:
-        obj = binary_dilation(obj, iterations=int(obj_dilate_px))
-    bg_pixels = valid & (~obj)
-    info["obj_frac"] = float(np.count_nonzero(obj) / max(1, int(np.count_nonzero(valid))))
-
-    if int(np.count_nonzero(bg_pixels)) < MIN_BG_SAMPLES:
-        info["reason"] = "insufficient_bg"
-        info["fallback"] = "no_subtraction"
-        return np.full_like(ch, sky), info
-
-    # 4. background model from background-only samples
-    block = max(1, int(sample_step))
-    grid = _block_median(ch, bg_pixels, block)
-    info["grid_shape"] = [int(grid.shape[0]), int(grid.shape[1])]
-    info["grid_nan_before_fill"] = int(np.count_nonzero(np.isnan(grid)))
-
-    grid = _fill_nan_nearest(grid)
-    info["smoothing_sigma"] = float(smoothing)
-    grid = gaussian_filter(grid, sigma=float(smoothing))
-    bg = _upsample_bg(grid, ch.shape)
-
-    # 5. robust reference baseline (preserve global sky/DC)
-    bg_ref = float(np.median(bg[bg_pixels]))
-    info["bg_ref"] = float(bg_ref)
-    info["grid_median"] = float(np.nanmedian(grid))
-    info["grid_std"] = float(np.nanstd(grid))
-    return bg, info
+    h, w = channel.shape
+    meds: list[float] = []
+    for i in range(boxes):
+        for j in range(boxes):
+            sl = (slice(i * h // boxes, (i + 1) * h // boxes),
+                  slice(j * w // boxes, (j + 1) * w // boxes))
+            seg = channel[sl][sky_mask[sl]]
+            if seg.size >= UNIFORMITY_MIN_BOX_SAMPLES:
+                meds.append(float(np.median(seg)))
+    meds = np.asarray(meds, dtype=np.float64)
+    if meds.size < UNIFORMITY_MIN_BOXES:
+        return None, int(meds.size)
+    med = float(np.median(meds))
+    robust = float(1.4826 * np.median(np.abs(meds - med)))
+    return {"std": float(np.std(meds)), "robust": robust, "n_boxes": int(meds.size)}, int(meds.size)
 
 
 def _channel_stats(ch: np.ndarray, valid: np.ndarray) -> dict:
@@ -423,6 +312,75 @@ def _channel_stats(ch: np.ndarray, valid: np.ndarray) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Legacy light-DBE (exact historical algorithm, aesthetic output)
+# ---------------------------------------------------------------------------
+
+def _legacy_light_dbe_channel(
+    ch: np.ndarray, valid_hw: np.ndarray, *, sigma: float, obj_k: float, obj_dilate_px: int
+) -> tuple[np.ndarray, dict]:
+    """Apply the EXACT legacy light-DBE to a single channel (historical algorithm).
+
+    Port of ``grid_mode._apply_grid_final_dbe`` (variation-only correction):
+
+    * per-channel median / MAD / robust sigma;
+    * compact-object mask ``ch > median + obj_k * robust_sigma``, dilated;
+    * background-only reference ``fill_ref = median(ch[bg])``;
+    * ``ch_filled`` fills uncovered pixels with ``fill_ref``;
+    * ``ch_model`` replaces protected object pixels with ``fill_ref``;
+    * Gaussian background ``bg = gaussian_filter(ch_model, sigma, mode="nearest")``;
+    * ``bg_med = median(bg[bg])``;
+    * ``corrected = ch_filled - (bg - bg_med)`` (variation-only, sky/DC preserved);
+    * protected object pixels restored unchanged (``where(obj, ch_filled, corrected)``).
+
+    Returns ``(ch_out, info)``. ``ch_out`` is NaN over uncovered pixels (the
+    caller fills/leaves NaN as the array already had).
+    """
+    from scipy.ndimage import binary_dilation, gaussian_filter
+
+    ch = np.asarray(ch, dtype=np.float32)
+    info: dict = {"sigma": float(sigma), "obj_k": float(obj_k),
+                  "obj_dilate_px": int(obj_dilate_px)}
+
+    ch_finite = np.isfinite(ch)
+    ch_valid = valid_hw & ch_finite
+    if not np.any(ch_valid):
+        info["reason"] = "no_valid"
+        return ch.copy(), info
+
+    median = float(np.nanmedian(ch[ch_valid]))
+    mad = float(np.nanmedian(np.abs(ch[ch_valid] - median)))
+    robust_sigma = float(1.4826 * mad)
+    info["median"] = median
+    info["robust_sigma"] = robust_sigma
+
+    obj_thr = float(median + obj_k * robust_sigma)
+    obj_mask = ch_valid & (ch > obj_thr)
+    if obj_dilate_px > 0:
+        obj_mask = binary_dilation(obj_mask, iterations=int(obj_dilate_px))
+    info["obj_frac"] = float(np.count_nonzero(obj_mask) / max(1, int(np.count_nonzero(ch_valid))))
+
+    bg_valid = ch_valid & (~obj_mask)
+    if not np.any(bg_valid):
+        bg_valid = ch_valid
+
+    fill_ref = float(np.nanmedian(ch[bg_valid])) if np.any(bg_valid) else median
+    info["fill_ref"] = fill_ref
+
+    ch_filled = np.where(ch_valid, ch, fill_ref).astype(np.float32)
+    ch_model = np.where(obj_mask, fill_ref, ch_filled).astype(np.float32)
+
+    bg = gaussian_filter(ch_model, sigma=float(sigma), mode="nearest")
+    bg_med = float(np.nanmedian(bg[bg_valid])) if np.any(bg_valid) else fill_ref
+    info["bg_med"] = bg_med
+
+    corrected = ch_filled - (bg - bg_med)
+    corrected = np.where(obj_mask, ch_filled, corrected).astype(np.float32)
+
+    ch_out = np.where(ch_valid, corrected, np.nan).astype(np.float32)
+    return ch_out, info
+
+
 def apply_dbe(
     science: np.ndarray,
     valid: np.ndarray,
@@ -430,60 +388,130 @@ def apply_dbe(
     strength: str,
     params: dict,
 ) -> tuple[np.ndarray, dict]:
-    """Correct per-channel BACKGROUND VARIATION (scientific DBE).
+    """Apply the LEGACY light-DBE (variation-only) to an RGB array (aesthetic).
 
-    ``corrected = ch - (bg - bg_ref)`` over valid pixels, preserving global
-    sky/DC. Returns ``(corrected, info)``. The input is never mutated. Negatives
-    are never clamped / absoluted / inverted.
+    ``corrected = ch_filled - (bg - bg_med)`` per channel with protected bright
+    object pixels restored unchanged; Gaussian model ``mode="nearest"``; the
+    historical strength maps (sigma / obj_k / dilation).
 
-    ``strength`` / ``params`` / ``params_source`` are recorded (see
-    :func:`apply_final_mosaic_finishing` for how the top-level info is assembled).
+    Safety guard (NOT a science-neutrality gate): after building the candidate,
+    if ANY channel creates a MATERIAL negative-fraction explosion or GROSSLY
+    worsens a fixed input-derived background-uniformity metric, the whole RGB is
+    returned unchanged (atomic no-op) with a visible reason. The guard never
+    imposes the >=0.90 diffuse-flux requirement — the aesthetic output is
+    allowed to lose diffuse flux by design (the raw science reference is
+    untouched and authoritative).
+
+    ``strength`` / ``params`` / ``params_source`` are recorded for the manifest.
     """
     science = np.asarray(science, dtype=np.float32)
-    out = science.copy()
     info: dict = {
         "strength": strength,
         "params": dict(params),
         "channels": [],
+        "attempted": True,
         "applied": False,
-        "model": "block_median_variation_diffuse_safe",
+        "reason": "",
+        "algorithm": "legacy_grid_light_dbe",
+        "guard": {
+            "neg_frac_explosion_abs": float(NEG_FRAC_EXPLOSION_ABS),
+            "uniformity_worse_factor": float(UNIFORMITY_WORSE_FACTOR),
+            "metric": "std of per-box medians over a fixed input-derived valid mask",
+            "note": (
+                "safety guard only: no-op on negative-fraction explosion or gross "
+                "background-uniformity worsening; does NOT require diffuse-flux "
+                "neutrality (aesthetic output may lose diffuse flux by design)"
+            ),
+        },
     }
 
     if science.ndim != 3 or science.shape[-1] != 3:
         info["reason"] = "non_rgb"
-        return out, info
+        info["attempted"] = False
+        return science.copy(), info
+
+    valid = np.asarray(valid, dtype=bool)
+    if not np.any(valid):
+        info["reason"] = "no_valid"
+        info["attempted"] = False
+        return science.copy(), info
+
+    sigma = float(params.get("sigma", 36.0))
+    obj_k = float(params.get("obj_k", 2.8))
+    obj_dilate_px = int(params.get("obj_dilate_px", 3))
+
+    candidates: list[tuple[int, np.ndarray]] = []
+    before_full: list[float] = []
+    after_full: list[float] = []
+    neg_exploded = False
 
     for c in range(3):
         ch = science[..., c]
         ch_valid = valid & np.isfinite(ch)
-        cinfo = {"channel": int(c), "applied": False}
+        cinfo: dict = {"channel": int(c), "applied": False}
         cinfo["before"] = _channel_stats(ch, ch_valid) if np.any(ch_valid) else None
 
-        bg, binfo = estimate_background_channel(
-            ch, valid,
-            sample_step=int(params["sample_step"]),
-            obj_k=float(params["obj_k"]),
-            obj_dilate_px=int(params["obj_dilate_px"]),
-            smoothing=float(params["smoothing"]),
+        cand, ch_info = _legacy_light_dbe_channel(
+            ch, valid, sigma=sigma, obj_k=obj_k, obj_dilate_px=obj_dilate_px
         )
-        cinfo.update({k: binfo[k] for k in binfo if k not in ("reason", "fallback")})
-        cinfo["fallback"] = binfo.get("fallback", "none")
+        cinfo.update({k: ch_info[k] for k in ch_info if k != "reason"})
+        if ch_info.get("reason"):
+            cinfo["reason"] = ch_info["reason"]
 
-        use = valid & np.isfinite(ch) & np.isfinite(bg)
-        if binfo.get("fallback") == "no_subtraction":
-            # Honest fallback: leave the channel unchanged (already == ch - (flat - flat)).
-            cinfo["reason"] = "no_subtraction"
-            cinfo["applied"] = False
-        elif np.any(use):
-            bg_ref = float(binfo["bg_ref"])
-            out[..., c][use] = ch[use] - (bg[use] - bg_ref)
-            cinfo["applied"] = True
-            cinfo["bg_mean_abs"] = float(np.mean(np.abs(bg[use] - bg_ref)))
+        # Fill NaN (uncovered) with the channel's fill reference so downstream
+        # equalize/uint16/render see a fully finite aesthetic plane.
+        fill_ref = float(ch_info.get("fill_ref", 0.0))
+        cand_filled = np.where(np.isfinite(cand), cand, fill_ref).astype(np.float32)
 
-        cinfo["after"] = _channel_stats(out[..., c], ch_valid) if np.any(ch_valid) else None
+        # negative-fraction + uniformity diagnostics
+        if np.any(ch_valid):
+            cinfo["after"] = _channel_stats(cand_filled, ch_valid)
+            before_neg = float(cinfo["before"]["neg_frac"])
+            after_neg = float(cinfo["after"]["neg_frac"])
+            cinfo["neg_frac_delta"] = after_neg - before_neg
+            if after_neg - before_neg > NEG_FRAC_EXPLOSION_ABS:
+                neg_exploded = True
+
+            full_mask = _eroded_valid_mask(ch_valid)
+            bm, _ = _uniformity_metric(ch, full_mask)
+            am, _ = _uniformity_metric(cand_filled, full_mask)
+            if bm is not None:
+                cinfo["before_full_std"] = bm["std"]
+                before_full.append(bm["std"])
+            if am is not None:
+                cinfo["after_full_std"] = am["std"]
+                after_full.append(am["std"])
+            if bm is not None and am is not None and bm["std"] > 0:
+                cinfo["full_ratio"] = am["std"] / bm["std"]
+            else:
+                cinfo["full_ratio"] = None
+
+        candidates.append((c, cand_filled))
         info["channels"].append(cinfo)
 
-    info["applied"] = bool(any(c.get("applied") for c in info["channels"]))
+    # --- safety guard: gross uniformity worsening ---
+    uniformity_worse = False
+    for b, a in zip(before_full, after_full):
+        if b > 0 and a > b * UNIFORMITY_WORSE_FACTOR:
+            uniformity_worse = True
+
+    if neg_exploded:
+        info["reason"] = "negative_fraction_explosion"
+        info["applied"] = False
+        return science.copy(), info
+    if uniformity_worse:
+        info["reason"] = "uniformity_worsened"
+        info["applied"] = False
+        return science.copy(), info
+
+    out = science.copy()
+    for c, cand in candidates:
+        out[..., c] = cand
+        for cinfo in info["channels"]:
+            if cinfo["channel"] == c:
+                cinfo["applied"] = True
+    info["applied"] = True
+    info["reason"] = ""
     return out, info
 
 
@@ -538,13 +566,14 @@ def equalize_rgb(science: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, di
 # ---------------------------------------------------------------------------
 
 def to_uint16(science: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, dict]:
-    """Map the finished float science to a uint16 array with a documented scale.
+    """Map the finished (aesthetic) float science to a uint16 array.
 
     ``uint16 = clip(round(65535 * (v - vmin) / (vmax - vmin)), 0, 65535)`` where
     ``vmin`` / ``vmax`` are the 1st / 99.9th percentile of the valid (finite)
     pixels pooled across channels. Invalid (NaN / hole) pixels map to 0. The
     scaling constants are recorded so the mapping is auditable. This render is
-    derived from the finished float science and is never a scientific reference.
+    derived from the finished (aesthetic) float science and is never a scientific
+    reference.
     """
     science = np.asarray(science, dtype=np.float32)
     finite = np.isfinite(science)
@@ -575,7 +604,7 @@ def to_uint16(science: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, dict]
 
 @dataclass
 class FinishingResult:
-    science: np.ndarray            # (H, W, 3) float32 (finished, or the input itself when off)
+    science: np.ndarray            # (H, W, 3) float32 (finished aesthetic, or the input itself when off)
     uint16: np.ndarray | None      # (H, W, 3) uint16, or None
     info: dict                     # full finishing record for the manifest/log
 
@@ -586,12 +615,12 @@ def apply_final_mosaic_finishing(
     *,
     config: dict | None = None,
 ) -> FinishingResult:
-    """Apply the final-mosaic finishing (DBE -> RGB equalize -> uint16).
+    """Apply the final-mosaic finishing (light-DBE -> RGB equalize -> uint16).
 
     ``config`` is the dict from :func:`resolve_finishing_config`. When ``config``
     is None (or every feature is disabled) the input array is returned by
     identity and no work is done (bit-equal output). The order is documented:
-    DBE first, then RGB equalization, then the uint16 render of the result.
+    light-DBE first, then RGB equalization, then the uint16 render.
     """
     cfg = dict(config or {})
     science = np.asarray(science, dtype=np.float32)
@@ -633,6 +662,8 @@ def apply_final_mosaic_finishing(
         info["dbe"]["enabled"] = True
         info["dbe"]["params_source"] = str(cfg.get("dbe_params_source", "preset:normal"))
         info["dbe"]["subtraction_factor"] = float(cfg.get("dbe_subtraction_factor", 1.0))
+        if cfg.get("dbe_custom_fallback"):
+            info["dbe"]["custom_fallback"] = str(cfg["dbe_custom_fallback"])
 
     if rgb_equalize:
         out, rgb_info = equalize_rgb(out, valid)

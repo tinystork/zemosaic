@@ -1174,9 +1174,9 @@ def _science_header(
     """Canvas WCS header + science-output role/relationship metadata.
 
     ``role`` is ``science_raw`` (immutable pre-finishing reference) or
-    ``science_finished`` (delivered finished float32). ``dbe_state`` is one of
-    ``off`` / ``on`` / ``failed`` / ``n/a``. ``related_file`` records the
-    pre/post-finishing counterpart filename.
+    ``aesthetic`` (delivered legacy light-DBE aesthetic float32). ``dbe_state``
+    is one of ``off`` / ``on`` / ``failed`` / ``n/a``. ``related_file`` records
+    the pre/post-finishing counterpart filename.
     """
     header = _canvas_header(canvas, ndim=3, channels=3)
     header["SCIROLE"] = (role, "science output role")
@@ -1432,7 +1432,7 @@ def _write_run_log(
     )
     if _reproj.get("fallback_reason"):
         lines.append(f"  fallback_reason: {_reproj.get('fallback_reason')}")
-    lines.append("Final-mosaic finishing (ZM-ZEGRID-R23):")
+    lines.append("Final-mosaic finishing (ZM-ZEGRID-R23 rework-2):")
     fin = finishing_info or {}
     if not fin or not fin.get("enabled"):
         lines.append("  disabled (no finishing settings applied)")
@@ -1446,9 +1446,10 @@ def _write_run_log(
         )
         lines.append(
             f"  dbe: enabled={dbe.get('enabled')} applied={dbe.get('applied')} "
+            f"attempted={dbe.get('attempted')} reason={dbe.get('reason') or ''} "
+            f"algorithm={dbe.get('algorithm')} "
             f"strength={dbe.get('strength')} "
             f"params_source={dbe.get('params_source')} "
-            f"subtraction_factor={dbe.get('subtraction_factor')} "
             f"params={dbe.get('params')}"
         )
         for ch in (dbe.get("channels") or []):
@@ -1457,9 +1458,11 @@ def _write_run_log(
                 after = ch.get("after") or {}
                 lines.append(
                     f"    ch{ch.get('channel')}: applied={ch.get('applied')} "
-                    f"fallback={ch.get('fallback')} "
-                    f"diffuse_frac={ch.get('diffuse_frac')} star_frac={ch.get('star_frac')} "
-                    f"bg_ref={ch.get('bg_ref')} "
+                    f"median={ch.get('median')} robust_sigma={ch.get('robust_sigma')} "
+                    f"obj_frac={ch.get('obj_frac')} "
+                    f"before_full_std={ch.get('before_full_std')} "
+                    f"after_full_std={ch.get('after_full_std')} "
+                    f"full_ratio={ch.get('full_ratio')} "
                     f"neg_frac {before.get('neg_frac')} -> {after.get('neg_frac')}"
                 )
         lines.append(
@@ -1470,6 +1473,10 @@ def _write_run_log(
             f"  uint16: enabled={u16.get('enabled')} written={u16.get('written')} "
             f"vmin={u16.get('vmin')} vmax={u16.get('vmax')}"
         )
+    lines.append(
+        "  NOTE: aesthetic output (mosaic_grid.fits) is not photometrically "
+        "neutral; use mosaic_grid_science.fits for measurement."
+    )
     lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
     lines.append(
@@ -2194,19 +2201,24 @@ def _write_outputs(
     raw_science_path = Path(raw_science_path)
 
     dbe_applied = bool((finishing_info or {}).get("dbe", {}).get("applied"))
+    dbe_attempted = bool((finishing_info or {}).get("dbe", {}).get("attempted"))
+    dbe_enabled = bool((finishing_info or {}).get("dbe", {}).get("enabled"))
     finishing_failed = bool((finishing_info or {}).get("failed"))
     if finishing_failed:
         dbe_state = "failed"
     elif dbe_applied:
         dbe_state = "on"
-    elif (finishing_info or {}).get("dbe", {}).get("enabled"):
+    elif dbe_attempted:
+        # R23 rework-1: attempted but no-op (uniformity gate / model rejected).
+        dbe_state = "noop"
+    elif dbe_enabled:
         dbe_state = "off"
     else:
         dbe_state = "off"
 
     sci_header = _science_header(
         canvas,
-        role="science_finished",
+        role="aesthetic",
         dtype="float32",
         dbe_state=dbe_state,
         sha256=_array_sha256(sci_data),
@@ -2360,19 +2372,25 @@ def _write_outputs(
         "outputs": {
             "science": sci_path.name,
             "science_raw": raw_science_path.name,
-            "science_finished": sci_path.name,
+            "aesthetic": sci_path.name,
             "coverage": cov_path.name,
             "uint16": (uint16_path.name if uint16_path is not None else None),
             "run_log": RUN_LOG_NAME,
         },
+        "science_reference": raw_science_path.name,
+        "algorithm": "legacy_grid_light_dbe",
+        "aesthetic_warning": (
+            "aesthetic output (mosaic_grid.fits) is not photometrically neutral; "
+            "use science_raw (mosaic_grid_science.fits) for measurement"
+        ),
         "science_output_contract": {
             "note": (
-                "ZM-ZEGRID-R23 dual float32 output: 'science_raw' is the immutable "
-                "pre-finishing assembled science (scientific reference, always "
-                "written); 'science'/'science_finished' is the delivered finished "
-                "float32 (bit-identical to raw when finishing is disabled or failed). "
-                "'uint16' is only an optional render derived from the finished float32, "
-                "never a scientific reference."
+                "ZM-ZEGRID-R23 rework-2: 'science_raw' is the immutable pre-finishing "
+                "assembled science (the scientific/photometric reference, always "
+                "written); 'aesthetic'/'science' is the delivered legacy light-DBE "
+                "aesthetic float32 (bit-identical to raw when finishing is disabled "
+                "or failed). 'uint16' is only an optional render derived from the "
+                "aesthetic float32, never a scientific reference."
             ),
             "raw": {
                 "file": raw_science_path.name,
@@ -2384,7 +2402,7 @@ def _write_outputs(
             },
             "finished": {
                 "file": sci_path.name,
-                "role": "science_finished",
+                "role": "aesthetic",
                 "dtype": "float32",
                 "dbe_state": dbe_state,
                 "sha256": _array_sha256(sci_data),
