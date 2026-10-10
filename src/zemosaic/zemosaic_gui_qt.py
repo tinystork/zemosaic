@@ -76,6 +76,7 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 
 from ._resources import resource_path_optional
 from . import progress_contract as zprogress
+from . import eta_service as zeta
 
 logger = logging.getLogger(__name__)
 
@@ -1212,6 +1213,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._progress_agg_mode: str | None = None
         self._zegrid_active: bool = False
         self._zegrid_phase_floor: int = 0
+        # ZM-ETA-SERVICE-R30: the ZeGrid hybrid ETA authority (separate from the
+        # R29 progress aggregator). Created/reset on the first ZeGrid stable
+        # stage, fed from structured stage events, and ticked by the elapsed
+        # timer. Priors are loaded once per run.
+        self._zegrid_eta: zeta.HybridEtaEstimator | None = None
+        self._zegrid_eta_priors_loaded: bool = False
+        self._zegrid_n_frames: int | None = None
+        self._zegrid_cell_count: int | None = None
         self._eta_calc: ETACalculator | None = None
         self._last_eta_seconds_update_mono: float | None = None
         self._last_eta_seconds_value: float | None = None
@@ -5264,6 +5273,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._progress_agg_mode = None
         self._zegrid_active = False
         self._zegrid_phase_floor = 0
+        # ZM-ETA-SERVICE-R30: reset the ZeGrid hybrid ETA authority + prior state
+        # so a new run starts clean (no stale estimate/priors/countdown).
+        self._zegrid_eta = None
+        self._zegrid_eta_priors_loaded = False
+        self._zegrid_n_frames = None
+        self._zegrid_cell_count = None
 
     def _maybe_detect_sds(self, payload: Dict[str, Any]) -> bool:
         if self._sds_progress_active:
@@ -5563,12 +5578,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         if is_zegrid:
             self._set_zegrid_phase_label(result)
-            # ZeGrid: suppress the %-derived ETA (a false estimate until R30's
-            # calibrated ETA service lands); label it honestly instead.
-            self._set_eta_display(
-                self._tr(zprogress.ETA_ESTIMATION_IN_PROGRESS, "estimation en cours"),
-                force=True,
-            )
+            # ZM-ETA-SERVICE-R30: feed the hybrid ETA authority from the stable
+            # structured stage event (never the UI global percentage) and render
+            # its honest estimate. Until it is ready, show the localized
+            # 'estimation en cours' placeholder.
+            self._feed_zegrid_eta(result, current_val, total_val)
         else:
             self._set_legacy_phase_label(stage_name)
             self._update_eta_from_progress(global_percent)
@@ -5601,6 +5615,90 @@ class ZeMosaicQtMainWindow(QMainWindow):
         except Exception:
             label = f"{roman} — {operation}" if operation else roman
         self.phase_value_label.setText(label)
+
+    # ------------------------------------------------------------------
+    # ZM-ETA-SERVICE-R30: ZeGrid hybrid ETA authority (separate from R29
+    # progress aggregator; never fed from the UI global percentage).
+    # ------------------------------------------------------------------
+    def _ensure_zegrid_eta(self) -> zeta.HybridEtaEstimator | None:
+        """Create the ZeGrid ETA estimator on first stable stage; load priors once."""
+        if self._zegrid_eta is not None:
+            return self._zegrid_eta
+        est = zeta.HybridEtaEstimator(zprogress.ZEGRID_PLAN)
+        self._zegrid_eta = est
+        # Load sanitized ZeGrid priors ONCE per run (best-effort; never fatal).
+        if not self._zegrid_eta_priors_loaded:
+            try:
+                records = zeta.load_eta_history()
+                priors, comparable = zeta.select_zegrid_priors(
+                    records,
+                    n_frames=self._zegrid_n_frames,
+                    cell_count=self._zegrid_cell_count,
+                )
+                est.set_priors(priors, comparable_histories=comparable)
+            except Exception:
+                pass
+            self._zegrid_eta_priors_loaded = True
+        return est
+
+    def _feed_zegrid_eta(self, result: zprogress.StageResult, current: int, total: int) -> None:
+        """Feed one stable ZeGrid stage event to the estimator and render its ETA."""
+        # Capture workload context from setup / per_cell_stack / assembly totals
+        # BEFORE creating the estimator, so frame-count-based prior scaling can
+        # apply on the very first (setup) stage event.
+        normalized = result.normalized_id
+        if normalized == "zegrid:setup" and total > 0:
+            self._zegrid_n_frames = int(total)
+        if normalized in ("zegrid:per_cell_stack", "zegrid:assembly") and total > 0:
+            self._zegrid_cell_count = int(total)
+        est = self._ensure_zegrid_eta()
+        if est is None:
+            return
+        try:
+            est.set_context(
+                n_frames=self._zegrid_n_frames,
+                cell_count=self._zegrid_cell_count,
+            )
+            eta = est.on_stage(normalized, int(current), int(total))
+        except Exception:
+            eta = None
+        self._render_zegrid_eta(eta)
+
+    def _render_zegrid_eta(self, eta) -> None:
+        """Render a ZeGrid EtaResult as a localized honest label."""
+        if eta is None:
+            self._set_eta_display(
+                self._tr(zprogress.ETA_ESTIMATION_IN_PROGRESS, "estimation en cours"),
+                force=True,
+            )
+            return
+        terminal = getattr(eta, "terminal", None)
+        if terminal == "success":
+            self._set_eta_display("00:00:00", force=True)
+            return
+        if terminal in ("fail", "cancel"):
+            self._set_eta_display(self._tr("initial_eta_value", "--:--:--"), force=True)
+            return
+        if not getattr(eta, "ready", False):
+            self._set_eta_display(
+                self._tr(zprogress.ETA_ESTIMATION_IN_PROGRESS, "estimation en cours"),
+                force=True,
+            )
+            return
+        remaining = getattr(eta, "remaining_seconds", None)
+        if remaining is None:
+            self._set_eta_display(
+                self._tr(zprogress.ETA_ESTIMATION_IN_PROGRESS, "estimation en cours"),
+                force=True,
+            )
+            return
+        approx = self._tr("zegrid_eta_approx_format", "≈ {eta}").format(
+            eta=format_eta_hms(float(remaining))
+        )
+        if getattr(eta, "stalled", False):
+            stalled = self._tr("zegrid_eta_stalled", "stalled")
+            approx = f"{approx} ({stalled})"
+        self._set_eta_display(approx, force=True)
 
     def _on_worker_phase45_event(self, key: str, payload: Dict[str, Any], level: str) -> None:
         data = payload if isinstance(payload, dict) else {}
@@ -5916,6 +6014,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
             # ZM-PROGRESS-CONTRACT-R29: a cancel never reaches 100%.
             if self._progress_agg is not None:
                 self._progress_agg.mark_cancel()
+            # ZM-ETA-SERVICE-R30: a cancel produces no completed ETA.
+            if self._zegrid_eta is not None:
+                try:
+                    self._zegrid_eta.mark_cancel()
+                except Exception:
+                    pass
             # ZM-PROGRESS-CONTRACT-R29 F3: a ZeGrid cancel must not retain a
             # deceptive active countdown; use the neutral placeholder (never
             # 00:00:00, which would imply successful completion).
@@ -5935,6 +6039,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     self._progress_agg.mark_success()
                     self.progress_bar.setValue(int(self._progress_agg.global_percent))
                     self._last_global_progress = float(self._progress_agg.global_percent)
+                # ZM-ETA-SERVICE-R30: terminal success -> ETA exactly 0.
+                if self._zegrid_eta is not None:
+                    try:
+                        self._zegrid_eta.mark_success()
+                    except Exception:
+                        pass
                 # ZM-PROGRESS-CONTRACT-R29 F3: ZeGrid terminal success resolves the
                 # ETA display to 00:00:00 (never a stale countdown).
                 if self._zegrid_active:
@@ -6009,6 +6119,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # ZM-PROGRESS-CONTRACT-R29: a failed run never reaches 100%.
         if self._progress_agg is not None:
             self._progress_agg.mark_fail()
+        # ZM-ETA-SERVICE-R30: a failure produces no completed ETA.
+        if self._zegrid_eta is not None:
+            try:
+                self._zegrid_eta.mark_fail()
+            except Exception:
+                pass
         # ZM-PROGRESS-CONTRACT-R29 F3: a ZeGrid failure must not retain a
         # deceptive active countdown; use the neutral placeholder (never
         # 00:00:00, which would imply successful completion).
@@ -6031,10 +6147,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
         elapsed_m, elapsed_s = divmod(remainder, 60)
         self.elapsed_value_label.setText(f"{elapsed_h:02d}:{elapsed_m:02d}:{elapsed_s:02d}")
 
-        # ZM-PROGRESS-CONTRACT-R29 F3: while ZeGrid is active, the ETA display
-        # shows 'estimation en cours'; the elapsed-timer countdown must not
-        # overwrite it with a stale legacy ETA. Elapsed time still updates above.
+        # ZM-ETA-SERVICE-R30 F3: while ZeGrid is active, the ETA display is owned
+        # by the hybrid ETA authority. Tick it (fresh countdown / stale hold) but
+        # keep the elapsed time updating above; never let a stale legacy ETA
+        # overwrite it.
         if self._zegrid_active:
+            est = self._zegrid_eta
+            if est is not None:
+                try:
+                    self._render_zegrid_eta(est.tick())
+                except Exception:
+                    pass
             return
 
         # Keep ETA as a visible countdown between worker updates.

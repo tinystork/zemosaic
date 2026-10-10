@@ -659,6 +659,8 @@
   "qt_progress_placeholder": "Idle",
   "qt_progress_tiles_label": "Tiles:",
   "eta_estimation_in_progress": "estimation in progress",
+  "zegrid_eta_approx_format": "≈ {eta}",
+  "zegrid_eta_stalled": "stalled",
   "zegrid_phase_assembly": "Assembly",
   "zegrid_phase_finalize": "Finishing, export and finalization",
   "zegrid_phase_gauge": "Global photometric harmonisation",

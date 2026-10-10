@@ -64,6 +64,7 @@ import psutil
 from astropy.io import fits
 from astropy.wcs import WCS
 
+from . import eta_service as zeta
 from . import zemosaic_stack_plan as _stack_plan
 from .zemosaic_utils import (
     NONFINITE_FILL_VALUE,
@@ -2271,7 +2272,42 @@ def _run_single(
     # the immutable science + aesthetic + coverage + manifest + run log are all
     # written. Its local 100% still leaves GLOBAL progress below 100% until the
     # worker's explicit terminal success.
-    _finalize_rep.end()
+    finalize_wall = _finalize_rep.end()
+
+    # ZM-ETA-SERVICE-R30: append ONE sanitized ZeGrid history record, best-effort,
+    # before the terminal success. It measures the finalize wall duration
+    # honestly (the run's ``Timings`` covers setup..assembly; finalize is added
+    # here) WITHOUT changing science/output order — the manifest is already
+    # written, so the finalize duration simply does not retroactively appear in
+    # it (documented). A history write failure is nonfatal and cannot change
+    # output/science success, and no history is written for a failed/cancelled
+    # run (any earlier exception raised before this point skips the write).
+    try:
+        zeta.append_zegrid_history(
+            zeta.build_zegrid_history_record(
+                total_duration_s=timings.total() + finalize_wall,
+                n_frames=len(frames_info),
+                cell_count=total_cells,
+                stage_seconds={
+                    "setup": timings.get("setup"),
+                    "layout": timings.get("layout"),
+                    "gauge": timings.get("gauge"),
+                    "per_cell_stack": timings.get("per_cell_stack"),
+                    "assembly": timings.get("assembly"),
+                    "finalize": finalize_wall,
+                },
+                stage_totals={
+                    "setup": len(frames_info),
+                    "gauge": 2 * len(descs) - 1,
+                    "per_cell_stack": total_cells,
+                    "finalize": 1,
+                },
+                workers=workers,
+                backend="gpu" if gpu_used else "cpu",
+            )
+        )
+    except Exception:
+        pass
 
     _emit(
         f"ZeGrid: done — science={raw_science_path.name} "
