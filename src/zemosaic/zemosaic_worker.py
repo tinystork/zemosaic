@@ -29561,6 +29561,7 @@ def run_hierarchical_mosaic_classic_legacy(
             progress_callback=progress_callback,
             axis_order="HWC",
             alpha_mask=alpha_final,
+            sanitize_nonfinite=True,
         )
         _attach_alpha_extension(science_fits_path, log_success=True)
 
@@ -29608,6 +29609,7 @@ def run_hierarchical_mosaic_classic_legacy(
                     progress_callback=progress_callback,
                     axis_order="HWC",
                     alpha_mask=alpha_final,
+                    sanitize_nonfinite=True,
                 )
                 _attach_alpha_extension(aesthetic_fits_path, log_success=False)
                 pcb(
@@ -35443,6 +35445,7 @@ def run_hierarchical_mosaic(
             progress_callback=progress_callback,
             axis_order="HWC",
             alpha_mask=alpha_final,
+            sanitize_nonfinite=True,
         )
         _attach_alpha_extension(final_fits_path, log_success=True)
 

@@ -65,7 +65,12 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 from . import zemosaic_stack_plan as _stack_plan
-from .zemosaic_utils import load_image_with_optional_alpha
+from .zemosaic_utils import (
+    NONFINITE_FILL_VALUE,
+    load_image_with_optional_alpha,
+    record_nonfinite_fill,
+    sanitize_nonfinite_float32,
+)
 from .core.canonical_streaming import (
     InMemoryCanonicalProvider,
     run_canonical_stack_streaming,
@@ -2192,9 +2197,15 @@ def _write_raw_science_fits(assembled, canvas, raw_science_path, role="SCI", rel
     scientific reference. Same WCS/axis layout as the delivered output, float32,
     never clamped/offset/abs'd. Header records role (``SCI`` scientific reference),
     dtype + DBE state + hash, plus the related aesthetic file (when one is emitted).
+
+    ZM-FITS-INTEROP-R26: non-finite samples (NaN/+Inf/-Inf) are replaced with
+    float32 0.0 in the serialized buffer ONLY (never the in-memory science), so
+    the on-disk FITS opens correctly in ASIFitsView Linux and Gwenview. The
+    replaced count + fill value are recorded in the header.
     """
     raw_science = np.asarray(assembled.science, dtype=np.float32)
     raw_data = np.ascontiguousarray(np.moveaxis(raw_science, -1, 0))  # (3, H, W)
+    raw_data, nf_replaced = sanitize_nonfinite_float32(raw_data, fill_value=0.0)
     raw_header = _science_header(
         canvas,
         role=role,
@@ -2203,6 +2214,7 @@ def _write_raw_science_fits(assembled, canvas, raw_science_path, role="SCI", rel
         sha256=_array_sha256(raw_data),
         related_file=related_file,
     )
+    record_nonfinite_fill(raw_header, nf_replaced)
     _atomic_writeto(fits.PrimaryHDU(raw_data, header=raw_header), raw_science_path)
     return raw_science_path
 
@@ -2440,9 +2452,22 @@ def _write_outputs(
         assembled.science if finished_science is None else finished_science,
         dtype=np.float32,
     )  # (H, W, 3)
-    stack_depth = np.asarray(assembled.stack_depth, dtype=np.int32)  # (H, W)
+    # ZM-FITS-INTEROP-R26: serialize ZeGrid coverage as contiguous float32
+    # (BITPIX=-32, no BSCALE/BZERO) so ASIFitsView Linux / Gwenview can read it;
+    # the exact pre-fix integer stack-depth values (0..46) are preserved.
+    stack_depth = np.ascontiguousarray(
+        np.asarray(assembled.stack_depth, dtype=np.float32)
+    )  # (H, W)
 
     sci_data = np.ascontiguousarray(np.moveaxis(science, -1, 0))  # (3, H, W)
+    # ZM-FITS-INTEROP-R26: sanitize non-finite (NaN/+Inf/-Inf -> 0.0) in the
+    # serialized science buffer ONLY (never the in-memory ``science``/raw
+    # arrays), and keep the count for the auditable header/manifest.
+    sci_data, _sci_nf_replaced = sanitize_nonfinite_float32(sci_data, fill_value=0.0)
+    _raw_ref_chw = np.ascontiguousarray(np.moveaxis(
+        np.asarray(assembled.science if raw_science is None else raw_science,
+                   dtype=np.float32), -1, 0))
+    _raw_ref_chw, _raw_nf_replaced = sanitize_nonfinite_float32(_raw_ref_chw, fill_value=0.0)
 
     # ZM-ZEGRID-R23 rework-3 (H1): Classic-compatible naming on base ``mosaic_grid``.
     # ``mosaic_grid<clean scientific suffix>.fits`` is the immutable pre-finishing
@@ -2473,6 +2498,7 @@ def _write_outputs(
     # Aesthetic float is emitted only when the checkbox is set.
     sci_path = aesthetic_path if aesthetic_path is not None else raw_science_path
     if aesthetic_path is not None:
+        # sci_data is already non-finite-sanitized (ZM-FITS-INTEROP-R26).
         sci_header = _science_header(
             canvas,
             role="AESTH",
@@ -2481,6 +2507,7 @@ def _write_outputs(
             sha256=_array_sha256(sci_data),
             related_file=raw_science_path.name,
         )
+        record_nonfinite_fill(sci_header, _sci_nf_replaced)
         _atomic_writeto(fits.PrimaryHDU(sci_data, header=sci_header), aesthetic_path)
     elif export_aesthetic_fits:
         # Checkbox set but no aesthetic path resolved -> do not fabricate a file.
@@ -2549,9 +2576,9 @@ def _write_outputs(
             "file": raw_science_path.name,
             "role": "SCI",
             "dtype": "float32",
-            "sha256": _array_sha256(np.ascontiguousarray(np.moveaxis(
-                np.asarray(assembled.science if raw_science is None else raw_science,
-                           dtype=np.float32), -1, 0))),
+            "sha256": _array_sha256(_raw_ref_chw),
+            "nonfinite_replaced": int(_raw_nf_replaced),
+            "nonfinite_fill": NONFINITE_FILL_VALUE,
         },
     }
     if aesthetic_path is not None:
