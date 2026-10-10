@@ -1623,6 +1623,9 @@ def _run_single(
     output_dir.mkdir(parents=True, exist_ok=True)
     timings = zin.Timings()
     start_ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    # ZM-ETA-SERVICE-R30 F4: honest actual wall duration for the history record
+    # (explicit perf_counter start; measured at the end, NOT a phase-sum guess).
+    run_wall_start = time.perf_counter()
 
     # ZM-ZEGRID-R14: live observability — phase START/END lines, bounded
     # intra-phase progress, live ETA, crash-breadcrumb stage, and an
@@ -2275,17 +2278,22 @@ def _run_single(
     finalize_wall = _finalize_rep.end()
 
     # ZM-ETA-SERVICE-R30: append ONE sanitized ZeGrid history record, best-effort,
-    # before the terminal success. It measures the finalize wall duration
-    # honestly (the run's ``Timings`` covers setup..assembly; finalize is added
-    # here) WITHOUT changing science/output order — the manifest is already
-    # written, so the finalize duration simply does not retroactively appear in
-    # it (documented). A history write failure is nonfatal and cannot change
-    # output/science success, and no history is written for a failed/cancelled
-    # run (any earlier exception raised before this point skips the write).
+    # before the terminal success. ``total_duration_s`` is the honest actual wall
+    # duration of this ``_run_single`` segment from an explicit perf_counter start
+    # (F4), NOT a phase-sum guess; the per-stage ``stage_seconds`` are unchanged
+    # (``Timings`` covers setup..assembly; finalize is added here). It measures
+    # the finalize wall duration honestly WITHOUT changing science/output order —
+    # the manifest is already written, so the finalize duration simply does not
+    # retroactively appear in it (documented). A history write failure is
+    # nonfatal and cannot change output/science success, and no history is
+    # written for a failed/cancelled segment (any earlier exception raised before
+    # this point skips the write). For a split EQ/ALTZ run, one record is written
+    # per successful ``_run_single`` segment (each is a valid comparable segment;
+    # deliberate).
     try:
         zeta.append_zegrid_history(
             zeta.build_zegrid_history_record(
-                total_duration_s=timings.total() + finalize_wall,
+                total_duration_s=time.perf_counter() - run_wall_start,
                 n_frames=len(frames_info),
                 cell_count=total_cells,
                 stage_seconds={

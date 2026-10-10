@@ -1216,9 +1216,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # ZM-ETA-SERVICE-R30: the ZeGrid hybrid ETA authority (separate from the
         # R29 progress aggregator). Created/reset on the first ZeGrid stable
         # stage, fed from structured stage events, and ticked by the elapsed
-        # timer. Priors are loaded once per run.
+        # timer. Raw sanitized history records are cached ONCE per run and
+        # priors are reselected (not reread from disk) whenever a newly observed
+        # exact stage total changes.
         self._zegrid_eta: zeta.HybridEtaEstimator | None = None
-        self._zegrid_eta_priors_loaded: bool = False
+        self._zegrid_eta_records: list | None = None
+        self._zegrid_stage_totals: Dict[str, int] = {}
         self._zegrid_n_frames: int | None = None
         self._zegrid_cell_count: int | None = None
         self._eta_calc: ETACalculator | None = None
@@ -5276,7 +5279,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # ZM-ETA-SERVICE-R30: reset the ZeGrid hybrid ETA authority + prior state
         # so a new run starts clean (no stale estimate/priors/countdown).
         self._zegrid_eta = None
-        self._zegrid_eta_priors_loaded = False
+        self._zegrid_eta_records = None
+        self._zegrid_stage_totals = {}
         self._zegrid_n_frames = None
         self._zegrid_cell_count = None
 
@@ -5621,36 +5625,79 @@ class ZeMosaicQtMainWindow(QMainWindow):
     # progress aggregator; never fed from the UI global percentage).
     # ------------------------------------------------------------------
     def _ensure_zegrid_eta(self) -> zeta.HybridEtaEstimator | None:
-        """Create the ZeGrid ETA estimator on first stable stage; load priors once."""
+        """Create the ZeGrid ETA estimator on first stable stage; cache records.
+
+        Raw sanitized history records are read from disk ONCE per run and cached
+        in ``_zegrid_eta_records`` (never reread per event). Priors are then
+        (re)selected from that cache via :meth:`_reselect_zegrid_priors`.
+        """
         if self._zegrid_eta is not None:
             return self._zegrid_eta
         est = zeta.HybridEtaEstimator(zprogress.ZEGRID_PLAN)
         self._zegrid_eta = est
-        # Load sanitized ZeGrid priors ONCE per run (best-effort; never fatal).
-        if not self._zegrid_eta_priors_loaded:
+        if self._zegrid_eta_records is None:
             try:
-                records = zeta.load_eta_history()
-                priors, comparable = zeta.select_zegrid_priors(
-                    records,
-                    n_frames=self._zegrid_n_frames,
-                    cell_count=self._zegrid_cell_count,
-                )
-                est.set_priors(priors, comparable_histories=comparable)
+                self._zegrid_eta_records = zeta.load_eta_history()
             except Exception:
-                pass
-            self._zegrid_eta_priors_loaded = True
+                self._zegrid_eta_records = []
+        self._reselect_zegrid_priors()
         return est
+
+    def _reselect_zegrid_priors(self) -> None:
+        """Reselect estimator priors from cached records + learned stage totals.
+
+        Uses exact per-stage totals (``_zegrid_stage_totals``) with
+        ``n_frames``/``cell_count`` as fallback for older records. Best-effort
+        (never fatal); called whenever a newly observed exact stage total changes
+        so the gauge/per-cell priors are rescaled as totals become known.
+        """
+        est = self._zegrid_eta
+        if est is None:
+            return
+        try:
+            records = self._zegrid_eta_records or []
+            priors, comparable = zeta.select_zegrid_priors(
+                records,
+                n_frames=self._zegrid_n_frames,
+                cell_count=self._zegrid_cell_count,
+                stage_totals=self._zegrid_stage_totals or None,
+            )
+            est.set_priors(priors, comparable_histories=comparable)
+        except Exception:
+            pass
+
+    def _observe_zegrid_stage_total(self, normalized: str, total: int) -> None:
+        """Record a newly learned exact stage total; reselect priors on change.
+
+        setup/gauge/per_cell_stack/finalize have exact totals; setup also drives
+        ``n_frames`` and per_cell_stack drives ``cell_count``. A change triggers a
+        prior reselection (per-cell rescale when cell_count arrives, exact gauge
+        total when gauge total arrives).
+        """
+        stage_total_key = None
+        if normalized == "zegrid:setup" and total > 0:
+            self._zegrid_n_frames = int(total)
+            stage_total_key = "setup"
+        elif normalized == "zegrid:gauge" and total > 0:
+            stage_total_key = "gauge"
+        elif normalized == "zegrid:per_cell_stack" and total > 0:
+            self._zegrid_cell_count = int(total)
+            stage_total_key = "per_cell_stack"
+        elif normalized == "zegrid:finalize" and total > 0:
+            stage_total_key = "finalize"
+        if stage_total_key is None:
+            return
+        new_total = int(total)
+        if self._zegrid_stage_totals.get(stage_total_key) != new_total:
+            self._zegrid_stage_totals[stage_total_key] = new_total
+            self._reselect_zegrid_priors()
 
     def _feed_zegrid_eta(self, result: zprogress.StageResult, current: int, total: int) -> None:
         """Feed one stable ZeGrid stage event to the estimator and render its ETA."""
-        # Capture workload context from setup / per_cell_stack / assembly totals
-        # BEFORE creating the estimator, so frame-count-based prior scaling can
-        # apply on the very first (setup) stage event.
+        # Capture workload context / exact stage totals BEFORE creating the
+        # estimator, so the very first (setup) event already scales priors.
         normalized = result.normalized_id
-        if normalized == "zegrid:setup" and total > 0:
-            self._zegrid_n_frames = int(total)
-        if normalized in ("zegrid:per_cell_stack", "zegrid:assembly") and total > 0:
-            self._zegrid_cell_count = int(total)
+        self._observe_zegrid_stage_total(normalized, int(total))
         est = self._ensure_zegrid_eta()
         if est is None:
             return

@@ -11,33 +11,42 @@ Two cooperating pieces live here:
   monotonic clock. It consumes STABLE R29 stage events ``(stage_id, current,
   total)`` and produces an immutable :class:`EtaResult`. The estimate is a
   HYBRID: the ACTIVE stage's remaining work is derived from a robust recent
-  wall-clock throughput (median + MAD filter, never the first-item ratio) when
-  the stage total is measurable, or from a historical phase prior when the
-  total is unknown; FUTURE stages are accounted from historical priors (or, in
-  the absence of any history, from a conservative fallback that only allocates
-  ALREADY-OBSERVED completed-phase evidence). COMPLETED stages are never
-  predicted again.
+  wall-clock throughput (median + MAD filter, never the first-item ratio) and/or
+  a historical phase prior; FUTURE stages are accounted from historical priors
+  (or, in the absence of any history, from a conservative fallback that only
+  allocates ALREADY-OBSERVED completed-phase evidence). COMPLETED stages are
+  never predicted again.
 
 * History store helpers — a backward-compatible v2 record shape on the existing
   ``~/.zemosaic_eta_history.json`` path. Legacy v1 ``{duration_s, n_frames, ...}``
   records still load safely and are preserved (never mixed into ZeGrid
-  per-stage priors), atomic append (temp + ``os.replace``), bounded count, and
-  fail-open on malformed/corrupt/unwritable files.
+  per-stage priors), atomic append (unique same-dir temp + ``os.replace`` with
+  guaranteed best-effort cleanup), bounded count, and fail-open on malformed/
+  corrupt/unwritable files.
 
-Design rules (see the R30 mission):
+Design rules (see the R30 mission + rework-1):
 
 * Stable ids, never counters or translated strings or progress percentages as
   model keys (normalized through the R29 progress contract).
 * Startup/calibration window: no live-rate ETA before ``MIN_RATE_SAMPLES``
   meaningful increasing samples AND ``MIN_ACTIVE_ELAPSED_S`` seconds elapsed in
-  the active measurable stage (constants documented + testable).
+  the active measurable stage. DURING that window a comparable/sane history
+  prior for the active stage is used IMMEDIATELY (history-based remaining =
+  ``prior x remaining-unit-fraction``), never first-item throughput. Once the
+  robust live rate is ready it is BLENDED with the active prior
+  (``ACTIVE_HISTORY_BLEND_ALPHA``); with no history the live gate still applies.
+* The estimate is split into an ACTIVE component and a FUTURE floor
+  (not-yet-started stages). ``tick`` decrements ONLY the active component and
+  never consumes the future floor. A live stage goes stale after
+  ``STALE_WINDOW_S`` (HOLD at >= future floor, ``stalled``, downgraded); an
+  unknown-total history stage, when its prior is exhausted without a transition,
+  HOLDs the future floor and flags ``stalled`` (re-evaluation).
+* Nonterminal estimates never display exactly 0: a documented
+  ``MIN_DISPLAY_FLOOR_S`` (1 s) applies. Only terminal success returns exactly 0.
 * Smoothing is asymmetric: legitimate UPWARD corrections apply immediately;
   downward corrections are damped so the display does not oscillate. The ETA is
-  NEVER forced monotonically downward. Phase transitions do a bounded regime
-  reset.
-* ``tick`` counts down between fresh samples only within ``STALE_WINDOW_S``;
-  when progress goes stale the estimate is HELD (never marched falsely to
-  zero) and flagged ``stalled``.
+  NEVER forced monotonically downward. Phase transitions reset component/floor
+  state cleanly.
 * Terminal success -> exactly ``0``; fail/cancel -> no completed ETA.
 * Always finite, nonnegative, no divide-by-zero.
 """
@@ -48,6 +57,7 @@ import json
 import math
 import os
 import statistics
+import tempfile
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -74,13 +84,26 @@ RATE_WINDOW_SAMPLES = 8
 MAD_OUTLIER_K = 3.0
 
 # Bounded freshness window (seconds): ``tick`` may count down between fresh
-# samples only within this window; beyond it the estimate is HELD (stalled).
+# live-rate samples only within this window; beyond it the ACTIVE component is
+# HELD (stalled) at >= the future floor (never marched falsely to zero).
 STALE_WINDOW_S = 30.0
 
 # Asymmetric smoothing: downward corrections move only this fraction toward the
 # new (lower) value per recompute, so the display does not oscillate. Upward
 # corrections are applied immediately (see :meth:`HybridEtaEstimator._smooth`).
 SMOOTH_DOWN_ALPHA = 0.5
+
+# Nonterminal estimates never display exactly 0: minimum display floor (seconds).
+# Only terminal success returns exactly 0.
+MIN_DISPLAY_FLOOR_S = 1.0
+
+# Blend weight given to the ACTIVE stage's history prior once the robust live
+# rate is ready::
+#   active = ALPHA * history_remaining + (1 - ALPHA) * live_remaining
+# where ``history_remaining = prior x remaining_unit_fraction`` (bounded) and
+# ``live_remaining = (total - done) / robust_rate``. History is a stabilising
+# term; the live rate still dominates the blend (never first-item throughput).
+ACTIVE_HISTORY_BLEND_ALPHA = 0.35
 
 # Relative WORK-COST shares for the six ZeGrid stages, used ONLY as a
 # conservative FALLBACK to allocate ALREADY-OBSERVED completed-phase evidence
@@ -101,6 +124,12 @@ ZEGRID_STAGE_NAMES = (
     "setup", "layout", "gauge", "per_cell_stack", "assembly", "finalize",
 )
 
+# Stages whose prior may be scaled by their EXACT per-stage total when both the
+# current run's and the record's ``stage_totals`` are valid. ``setup``/``gauge``
+# fall back to ``n_frames`` and ``per_cell_stack`` to ``cell_count`` for older
+# v2 records lacking exact totals.
+SCALABLE_STAGES = ("setup", "gauge", "per_cell_stack")
+
 CONFIDENCE_CALIBRATING = "calibrating"
 CONFIDENCE_LOW = "low"
 CONFIDENCE_MEDIUM = "medium"
@@ -117,16 +146,23 @@ class EtaResult:
 
     Attributes:
         remaining_seconds:    Remaining wall-clock seconds, or ``None`` when no
-                              honest estimate exists (``ready=False``).
+                              honest estimate exists (``ready=False``). For a
+                              nonterminal ready estimate this is >= the future
+                              floor (and >= ``MIN_DISPLAY_FLOOR_S``), never 0.
         ready:                ``True`` when the estimate is usable/displayable.
         confidence:           ``calibrating`` | ``low`` | ``medium`` | ``high``.
         active_stage:         Stable id of the active stage (``None`` if none).
-        basis:                ``history`` | ``live`` | ``blend`` | ``fallback`` |
-                              ``calibrating`` | ``terminal`` — the dominant
-                              mechanism behind the estimate.
-        stalled:              ``True`` when progress went stale and the estimate
-                              is HELD (not counting down).
-        source:               Same vocabulary as ``basis`` (diagnostic alias).
+        basis:                ACTIVE-stage mechanism: ``history`` | ``live`` |
+                              ``blend`` | ``calibrating`` | ``terminal``.
+        source:               FUTURE-stage mechanism: ``history`` | ``fallback``
+                              | ``blend`` | ``none`` | ``calibrating`` |
+                              ``terminal`` (diagnostic).
+        active_remaining:     The ACTIVE component of the estimate (diagnostic;
+                              post-smoothing / post-tick-decrement).
+        future_floor:         The FUTURE (not-yet-started) phase floor
+                              (diagnostic; never consumed by ``tick``).
+        stalled:              ``True`` when progress went stale or the active
+                              prior was exhausted and the estimate is HELD.
         sample_count:         Live-rate samples for the active stage (diagnostic).
         comparable_histories: Number of comparable ZeGrid history records used
                               for the priors (diagnostic).
@@ -143,6 +179,8 @@ class EtaResult:
     sample_count: int = 0
     comparable_histories: int = 0
     terminal: Optional[str] = None
+    active_remaining: Optional[float] = None
+    future_floor: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -247,16 +285,27 @@ def select_zegrid_priors(
     *,
     n_frames: Optional[int] = None,
     cell_count: Optional[int] = None,
+    stage_totals: Optional[Mapping[str, int]] = None,
 ) -> Tuple[Dict[str, float], int]:
     """Select comparable ZeGrid per-stage priors (median, outlier-resistant).
 
     Only ``mode == "zegrid"`` v2 records with a positive finite total duration
     and a ``stage_seconds`` dict contribute. Legacy v1 total records are NEVER
-    mixed into ZeGrid per-stage priors. Per-stage durations are scaled by units
-    when meaningful (setup/gauge by ``n_frames``, per_cell_stack by
-    ``cell_count``) and otherwise used verbatim. Returns ``(priors, comparable)``
-    where ``priors`` maps stable ``zegrid:<name>`` ids to median seconds and
-    ``comparable`` is the number of contributing records.
+    mixed into ZeGrid per-stage priors.
+
+    Scaling precedence (per scalable stage ``setup`` / ``gauge`` /
+    ``per_cell_stack``):
+
+    1. EXACT per-stage total: ``record.stage_totals[stage]`` -> current
+       ``stage_totals[stage]`` when both are valid (>0).
+    2. Fallback (older v2 records missing exact totals): ``setup``/``gauge`` by
+       ``n_frames``, ``per_cell_stack`` by ``cell_count``.
+    3. Otherwise the record's duration is used verbatim.
+
+    Gauge is NEVER scaled by raw/top-level ``n_frames`` when an exact gauge
+    total exists. Returns ``(priors, comparable)`` where ``priors`` maps stable
+    ``zegrid:<name>`` ids to median seconds and ``comparable`` is the number of
+    contributing records.
     """
     per_stage: Dict[str, List[float]] = {name: [] for name in ZEGRID_STAGE_NAMES}
     comparable = 0
@@ -268,6 +317,7 @@ def select_zegrid_priors(
         cur_c = int(cell_count) if cell_count else 0
     except (TypeError, ValueError):
         cur_c = 0
+    cur_totals = stage_totals if isinstance(stage_totals, Mapping) else {}
 
     for rec in records:
         if not isinstance(rec, dict):
@@ -285,6 +335,8 @@ def select_zegrid_priors(
             continue
         rec_n = _safe_int(rec.get("n_frames"))
         rec_c = _safe_int(rec.get("cell_count"))
+        rec_totals = rec.get("stage_totals")
+        rec_totals = rec_totals if isinstance(rec_totals, Mapping) else {}
         contributed = False
         for name in ZEGRID_STAGE_NAMES:
             raw = stages.get(name)
@@ -297,10 +349,16 @@ def select_zegrid_priors(
             if not math.isfinite(sec) or sec <= 0.0:
                 continue
             scaled = sec
-            if name in ("setup", "gauge") and cur_n and rec_n:
-                scaled = sec * (cur_n / max(1, rec_n))
-            elif name == "per_cell_stack" and cur_c and rec_c:
-                scaled = sec * (cur_c / max(1, rec_c))
+            if name in SCALABLE_STAGES:
+                rec_exact = _safe_int(rec_totals.get(name))
+                cur_exact = _safe_int(cur_totals.get(name))
+                if cur_exact > 0 and rec_exact > 0:
+                    # EXACT per-stage total scaling (preferred).
+                    scaled = sec * (cur_exact / float(rec_exact))
+                elif name in ("setup", "gauge") and cur_n > 0 and rec_n > 0:
+                    scaled = sec * (cur_n / float(rec_n))
+                elif name == "per_cell_stack" and cur_c > 0 and rec_c > 0:
+                    scaled = sec * (cur_c / float(rec_c))
             if math.isfinite(scaled) and scaled > 0.0:
                 per_stage[name].append(scaled)
                 contributed = True
@@ -319,16 +377,17 @@ def append_zegrid_history(
     record: dict,
     path: Optional[Path] = None,
 ) -> bool:
-    """Atomically append one v2 record (temp + ``os.replace``), bounded, fail-open.
+    """Atomically append one v2 record, bounded, fail-open.
 
     Existing records (v1 and v2) are preserved. The record count is capped to
-    :data:`ETA_HISTORY_MAX_RECORDS` (oldest dropped). Any I/O/JSON error returns
-    ``False`` and NEVER raises (a history write cannot change science/UI
-    success). The new record is sanitized by the caller (no raw paths/frame
-    names/user data).
+    :data:`ETA_HISTORY_MAX_RECORDS` (oldest dropped). A UNIQUE same-directory
+    temp file is created via :func:`tempfile.mkstemp`; on ANY write/replace
+    failure the temp file is removed (best-effort) and the existing target is
+    left untouched. Returns ``False`` and NEVER raises on any error.
     """
+    p = Path(path) if path is not None else eta_history_path()
+    tmp: Optional[Path] = None
     try:
-        p = Path(path) if path is not None else eta_history_path()
         records = load_eta_history(p)
         records.append(dict(record))
         if len(records) > ETA_HISTORY_MAX_RECORDS:
@@ -339,14 +398,25 @@ def append_zegrid_history(
             "records": records,
         }
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=p.name + ".", suffix=".tmp", dir=str(p.parent)
         )
+        tmp = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, p)
         return True
     except Exception:
         return False
+    finally:
+        if tmp is not None:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 def build_zegrid_history_record(
@@ -441,6 +511,8 @@ class HybridEtaEstimator:
         mad_k: float = MAD_OUTLIER_K,
         stale_window_s: float = STALE_WINDOW_S,
         smooth_down_alpha: float = SMOOTH_DOWN_ALPHA,
+        blend_history_alpha: float = ACTIVE_HISTORY_BLEND_ALPHA,
+        display_floor_s: float = MIN_DISPLAY_FLOOR_S,
     ) -> None:
         self._plan = plan
         self._cost_model: Dict[str, float] = dict(
@@ -453,6 +525,8 @@ class HybridEtaEstimator:
         self._mad_k = float(mad_k)
         self._stale_window_s = float(stale_window_s)
         self._smooth_down_alpha = float(smooth_down_alpha)
+        self._blend_history_alpha = float(blend_history_alpha)
+        self._display_floor_s = float(display_floor_s)
         self._priors: Dict[str, float] = {}
         self._comparable = 0
         self.reset()
@@ -467,8 +541,10 @@ class HybridEtaEstimator:
         self._terminal: Optional[str] = None
         self._last_live_sample_t: Optional[float] = None
         self._last_active_basis: Optional[str] = None
-        self._smoothed_remaining: Optional[float] = None
-        self._last_raw: Optional[float] = None
+        self._last_future_source: Optional[str] = None
+        self._active_smoothed: Optional[float] = None
+        self._future_floor: float = 0.0
+        self._last_raw_active: Optional[float] = None
         self._last_estimate: Optional[EtaResult] = None
         self._last_estimate_t: Optional[float] = None
         self._n_frames: Optional[int] = None
@@ -549,11 +625,15 @@ class HybridEtaEstimator:
             self._close_prior_stages(position, now)
             self._active_stage = sid
             self._active_position = position
-            # Bounded regime reset (smoothing/countdown restart for this phase).
-            self._smoothed_remaining = None
+            # Bounded regime reset (active component/floor/smoothing restart).
+            self._active_smoothed = None
+            self._future_floor = 0.0
+            self._last_raw_active = None
             self._last_estimate = None
             self._last_estimate_t = None
             self._last_active_basis = None
+            self._last_future_source = None
+            self._last_live_sample_t = None
 
         st = self._stages.setdefault(sid, _StageState())
         if st.start_t is None:
@@ -570,35 +650,63 @@ class HybridEtaEstimator:
         return self._estimate(now)
 
     def tick(self) -> EtaResult:
-        """Advance the countdown between fresh samples (call ~1/s from the GUI).
+        """Advance the ACTIVE-component countdown between fresh samples.
 
-        Within :data:`STALE_WINDOW_S` of the last fresh live-rate sample the
-        remaining time counts down smoothly. When the active stage is live-rate
-        and progress has gone stale, the estimate is HELD (never marched falsely
-        to zero) and flagged ``stalled``. History-prior (unknown-total) stages
-        count down by wall time without a staleness gate (elapsed IS the
-        progress signal there).
+        The FUTURE floor is NEVER consumed. Live/blend stages count down within
+        ``STALE_WINDOW_S`` of the last fresh live sample, then HOLD at >= the
+        future floor (``stalled``, downgraded). History (unknown-total) stages
+        count their prior down; when the prior is exhausted without a
+        transition, the future floor is HELD and the result is flagged
+        ``stalled`` (re-evaluation). Nonterminal remaining never reaches 0.
         """
         now = self._clock()
         if self._terminal is not None:
             return self._terminal_result()
-        if self._last_estimate is None or not self._last_estimate.ready:
+        est = self._last_estimate
+        if est is None or not est.ready or self._active_smoothed is None:
             return self._estimate(now)
-        if (
-            self._last_active_basis == "live"
-            and self._last_live_sample_t is not None
-            and (now - self._last_live_sample_t) > self._stale_window_s
-        ):
-            held = max(0.0, (self._smoothed_remaining or 0.0) - self._stale_window_s)
-            return replace(
-                self._last_estimate,
-                remaining_seconds=held,
-                stalled=True,
-                confidence=CONFIDENCE_LOW,
+
+        active = self._active_smoothed
+        future_floor = self._future_floor
+        basis = self._last_active_basis
+        stalled = False
+        confidence = est.confidence
+
+        if basis in ("live", "blend"):
+            ref_t = (
+                self._last_live_sample_t
+                if self._last_live_sample_t is not None
+                else self._last_estimate_t
             )
-        dt = now - (self._last_estimate_t or now)
-        remaining = max(0.0, (self._smoothed_remaining or 0.0) - dt)
-        return replace(self._last_estimate, remaining_seconds=remaining, stalled=False)
+            since = max(0.0, now - (ref_t if ref_t is not None else now))
+            if since > self._stale_window_s:
+                # HOLD: countdown capped at the freshness window.
+                active = max(0.0, active - self._stale_window_s)
+                stalled = True
+                confidence = CONFIDENCE_LOW
+            else:
+                active = max(0.0, active - since)
+        elif basis == "history":
+            # Count the active prior down by elapsed wall time.
+            age = max(0.0, now - (self._last_estimate_t if self._last_estimate_t is not None else now))
+            active = max(0.0, active - age)
+            if active <= 0.0:
+                # Prior exhausted without a transition: HOLD the future floor.
+                active = 0.0
+                stalled = True
+        else:
+            age = max(0.0, now - (self._last_estimate_t if self._last_estimate_t is not None else now))
+            active = max(0.0, active - age)
+
+        display = self._display_remaining(active, future_floor)
+        return replace(
+            est,
+            remaining_seconds=display,
+            active_remaining=active,
+            future_floor=future_floor,
+            stalled=stalled,
+            confidence=confidence,
+        )
 
     def mark_success(self) -> EtaResult:
         if self._terminal is None:
@@ -629,6 +737,8 @@ class HybridEtaEstimator:
                 sample_count=self._active_sample_count(),
                 comparable_histories=self._comparable,
                 terminal="success",
+                active_remaining=0.0,
+                future_floor=0.0,
             )
         return EtaResult(
             remaining_seconds=None,
@@ -655,7 +765,11 @@ class HybridEtaEstimator:
         )
         self._last_estimate = result
         self._last_estimate_t = now
-        self._smoothed_remaining = None
+        self._active_smoothed = None
+        self._future_floor = 0.0
+        self._last_raw_active = None
+        self._last_active_basis = None
+        self._last_future_source = None
         return result
 
     def _estimate(self, now: float) -> EtaResult:
@@ -666,78 +780,127 @@ class HybridEtaEstimator:
         if desc is None or st is None:
             return self._not_ready(now)
 
+        prior = self._priors.get(self._active_stage)
+        has_prior = prior is not None and prior > 0.0 and math.isfinite(prior)
+
         active_remaining: Optional[float] = None
         active_basis: Optional[str] = None
 
         total_known = st.total > 0
+        live_rate: Optional[float] = None
+        if total_known and self._live_ready(st, now):
+            live_rate = robust_rate(
+                st.samples, window=self._rate_window_samples, mad_k=self._mad_k
+            )
+
         if total_known:
-            # Measurable stage: use ONLY the robust live rate (gated by the
-            # calibration window). A history prior is NEVER substituted for the
-            # active measurable stage — the first estimate must not extrapolate
-            # from the first sample/frame.
-            if self._live_ready(st, now):
-                rate = robust_rate(st.samples, window=self._rate_window_samples, mad_k=self._mad_k)
-                if rate is not None:
-                    active_remaining = max(0.0, (st.total - st.last_current) / rate)
+            if live_rate is not None:
+                live_remaining = max(0.0, (st.total - st.last_current) / live_rate)
+                if has_prior:
+                    history_remaining = max(0.0, prior * self._remaining_fraction(st))
+                    active_remaining = (
+                        self._blend_history_alpha * history_remaining
+                        + (1.0 - self._blend_history_alpha) * live_remaining
+                    )
+                    active_basis = "blend"
+                else:
+                    active_remaining = live_remaining
                     active_basis = "live"
+            elif has_prior:
+                # Calibration window: history-based remaining (remaining-unit
+                # fraction), NEVER first-item throughput.
+                active_remaining = max(0.0, prior * self._remaining_fraction(st))
+                active_basis = "history"
+            else:
+                return self._not_ready(now)
         else:
-            # Unknown-total stage (layout/assembly): use the historical phase
-            # prior when available; otherwise stay calibrating (no fabricate).
-            prior = self._priors.get(self._active_stage)
-            if prior is not None and prior > 0.0:
-                elapsed = now - (st.start_t or now)
+            # Unknown-total stage (layout/assembly): historical prior only.
+            if has_prior:
+                elapsed = (now - st.start_t) if st.start_t is not None else 0.0
                 active_remaining = max(0.0, prior - elapsed)
                 active_basis = "history"
-        if active_remaining is None:
-            return self._not_ready(now)
-
-        # Future stages: historical priors, else conservative fallback that only
-        # allocates already-observed completed-phase evidence.
-        future_remaining = 0.0
-        future_uses_history = False
-        future_uses_fallback = False
-        for d in self._plan.stages:
-            if d.position <= desc.position:
-                continue
-            prior = self._priors.get(d.id)
-            if prior is not None and prior > 0.0:
-                future_remaining += prior
-                future_uses_history = True
             else:
-                unit = self._fallback_unit()
-                if unit is None:
-                    return self._not_ready(now)
-                cost = self._cost_model.get(d.id, 0.0)
-                if cost <= 0.0:
-                    return self._not_ready(now)
-                future_remaining += unit * cost
-                future_uses_fallback = True
+                return self._not_ready(now)
 
-        raw = active_remaining + future_remaining
-        if not math.isfinite(raw) or raw < 0.0:
+        future_floor, future_source = self._compute_future_floor(desc.position, now)
+        if future_floor is None:
             return self._not_ready(now)
-        raw = float(raw)
 
-        source = self._source(active_basis, future_uses_history, future_uses_fallback)
-        confidence = self._confidence(source)
+        if not math.isfinite(active_remaining) or active_remaining < 0.0:
+            active_remaining = 0.0
+        active_remaining = float(active_remaining)
 
-        smoothed = self._smooth(raw)
-        self._smoothed_remaining = smoothed
+        active_smoothed = self._smooth_active(active_remaining)
+        self._active_smoothed = active_smoothed
+        self._future_floor = future_floor
         self._last_active_basis = active_basis
+        self._last_future_source = future_source
+
+        display = self._display_remaining(active_smoothed, future_floor)
+        confidence = self._confidence(active_basis, future_source)
 
         result = EtaResult(
-            remaining_seconds=smoothed,
+            remaining_seconds=display,
             ready=True,
             confidence=confidence,
             active_stage=self._active_stage,
-            basis=source,
-            source=source,
+            basis=active_basis,
+            source=future_source,
             sample_count=len(st.samples),
             comparable_histories=self._comparable,
+            active_remaining=active_smoothed,
+            future_floor=future_floor,
         )
         self._last_estimate = result
         self._last_estimate_t = now
         return result
+
+    def _remaining_fraction(self, st: _StageState) -> float:
+        total = max(1, st.total)
+        return max(0.0, (total - st.last_current) / float(total))
+
+    def _compute_future_floor(
+        self, active_position: int, now: float
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """Future not-yet-started stage cost (priors, else conservative fallback).
+
+        Returns ``(floor, source)`` where ``source`` is ``history`` | ``fallback``
+        | ``blend`` | ``none``, or ``(None, None)`` when the floor cannot yet be
+        accounted honestly (no prior for a future stage and no observed evidence
+        for a fallback).
+        """
+        floor = 0.0
+        uses_history = False
+        uses_fallback = False
+        for d in self._plan.stages:
+            if d.position <= active_position:
+                continue
+            prior = self._priors.get(d.id)
+            if prior is not None and prior > 0.0 and math.isfinite(prior):
+                floor += prior
+                uses_history = True
+            else:
+                unit = self._fallback_unit()
+                if unit is None:
+                    return None, None
+                cost = self._cost_model.get(d.id, 0.0)
+                if cost <= 0.0:
+                    return None, None
+                floor += unit * cost
+                uses_fallback = True
+        if uses_history and uses_fallback:
+            source = "blend"
+        elif uses_history:
+            source = "history"
+        elif uses_fallback:
+            source = "fallback"
+        else:
+            source = "none"
+        return float(floor), source
+
+    def _display_remaining(self, active: float, future_floor: float) -> float:
+        total = max(0.0, active + future_floor)
+        return max(self._display_floor_s, total)
 
     def _live_ready(self, st: _StageState, now: float) -> bool:
         if len(st.samples) < self._min_rate_samples:
@@ -746,41 +909,29 @@ class HybridEtaEstimator:
             return False
         return (now - st.start_t) >= self._min_active_elapsed_s
 
-    def _smooth(self, raw: float) -> float:
-        if self._smoothed_remaining is None:
-            self._last_raw = raw
-            return raw
-        if raw == self._last_raw:
+    def _smooth_active(self, raw_active: float) -> float:
+        if self._active_smoothed is None:
+            self._last_raw_active = raw_active
+            return raw_active
+        if raw_active == self._last_raw_active:
             # No NEW raw evidence (duplicate/out-of-order event): keep the
             # current smoothed value — a duplicate must never drift the estimate.
-            return self._smoothed_remaining
-        self._last_raw = raw
-        prev = self._smoothed_remaining
-        if raw >= prev:
+            return self._active_smoothed
+        self._last_raw_active = raw_active
+        prev = self._active_smoothed
+        if raw_active >= prev:
             # Legitimate upward correction: apply immediately (never hide it).
-            return raw
-        return prev - self._smooth_down_alpha * (prev - raw)
+            return raw_active
+        return prev - self._smooth_down_alpha * (prev - raw_active)
 
-    def _source(
-        self,
-        active_basis: Optional[str],
-        future_history: bool,
-        future_fallback: bool,
-    ) -> str:
-        if active_basis == "live" and future_history:
-            return "blend"
-        if active_basis == "live":
-            return "live"
-        if active_basis == "history" and future_history:
-            return "history"
-        if active_basis == "history" and future_fallback:
-            return "blend"
-        return "fallback"
-
-    def _confidence(self, source: str) -> str:
-        if source in ("history", "blend"):
-            return CONFIDENCE_HIGH if self._comparable >= 3 else CONFIDENCE_MEDIUM
-        return CONFIDENCE_LOW
+    def _confidence(self, active_basis: Optional[str], future_source: Optional[str]) -> str:
+        uses_history = active_basis in ("history", "blend") or future_source in (
+            "history",
+            "blend",
+        )
+        if not uses_history:
+            return CONFIDENCE_LOW
+        return CONFIDENCE_HIGH if self._comparable >= 3 else CONFIDENCE_MEDIUM
 
     def _fallback_unit(self) -> Optional[float]:
         observed_cost = 0.0
@@ -825,6 +976,9 @@ class HybridEtaEstimator:
             "cell_count": self._cell_count,
             "workers": self._workers,
             "backend": self._backend,
+            "active_basis": self._last_active_basis,
+            "future_source": self._last_future_source,
+            "future_floor": self._future_floor,
             "last_estimate": (
                 None
                 if self._last_estimate is None
