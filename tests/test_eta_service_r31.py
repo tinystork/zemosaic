@@ -892,3 +892,23 @@ def test_f5_build_mode_history_record_rejects_unknown_mode():
             mode="nonsense", total_duration_s=1.0, stage_seconds={}
         )
 
+
+# ---------------------------------------------------------------------------
+# REWORK-2: guarded SDS output-confirmed success terminates the estimator
+# ---------------------------------------------------------------------------
+
+def test_rework2_sds_success_branch_terminates_estimator():
+    src = _method_src("_on_worker_log_message")
+    # The guarded SDS success branch (nested under elif self._sds_progress_active:)
+    # calls the estimator terminal and renders it; legacy cannot enter it.
+    guard_idx = src.index("elif self._sds_progress_active:")
+    success_idx = src.index('normalized_key == "run_success_processing_completed"')
+    assert success_idx > guard_idx
+    # Discriminating (not substring-only): the mark_success + render calls appear
+    # AFTER the success-key condition (inside that branch), and the estimator
+    # terminal path is conditional on _sds_eta existence.
+    assert "_sds_eta.mark_success()" in src
+    assert "_render_hybrid_eta(self._sds_eta.mark_success())" in src
+    mark_idx = src.index("_sds_eta.mark_success()")
+    assert mark_idx > success_idx
+

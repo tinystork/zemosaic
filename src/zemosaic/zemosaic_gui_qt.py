@@ -5575,7 +5575,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 elif normalized_key == "run_success_processing_completed":
                     self._sds_completed = True
                     self._apply_sds_progress(1.0)
-                    self._set_eta_display("00:00:00", force=True)
+                    # ZM-ETA-ALLMODES-R31 rework-2: output-confirmed SDS success
+                    # terminates the estimator at THIS instant (sticky), closing
+                    # its phase timing and preventing any later timer tick from
+                    # overwriting 00:00:00 before _on_worker_finished. No mode
+                    # (re)classification happens in this guarded branch.
+                    if self._sds_eta is not None:
+                        try:
+                            self._render_hybrid_eta(self._sds_eta.mark_success())
+                        except Exception:
+                            self._set_eta_display("00:00:00", force=True)
+                    else:
+                        self._set_eta_display("00:00:00", force=True)
         translated_message = self._translate_worker_message(
             message_key_or_raw, params, level_str
         )
