@@ -5090,6 +5090,55 @@ def _build_generic_cube_hdu(
     return generic_hdu
 
 
+NONFINITE_FILL_VALUE = 0.0
+
+
+def sanitize_nonfinite_float32(arr, fill_value=NONFINITE_FILL_VALUE):
+    """Return ``(sanitized, replaced_count)`` with non-finite samples replaced.
+
+    Replaces NaN/+Inf/-Inf with ``fill_value`` (default 0.0) in a fresh float32
+    copy and reports how many samples were replaced. The input is NEVER mutated;
+    finite samples are bit-identical to the input. When the input has no
+    non-finite samples it is returned unchanged (no copy, no semantic change).
+
+    This is the FINAL SERIALIZATION boundary helper for Linux reader
+    interoperability (ASIFitsView / Gwenview): only serialized non-finite
+    samples change; in-memory science arrays stay untouched.
+    """
+    arr_f = np.asarray(arr, dtype=np.float32)
+    finite = np.isfinite(arr_f)
+    replaced = int(arr_f.size - int(np.count_nonzero(finite)))
+    if replaced == 0:
+        return arr_f, 0
+    out = arr_f.copy()
+    out[~finite] = np.float32(fill_value)
+    return out, replaced
+
+
+def record_nonfinite_fill(header, replaced, fill_value=NONFINITE_FILL_VALUE):
+    """Record non-finite sanitization metadata (cards + HISTORY) on ``header``.
+
+    No-op when ``replaced`` is falsy so a finite-only write keeps an unchanged
+    header. Records the fill value and the number of replaced samples using
+    concise, valid FITS cards so the on-disk conversion is auditable.
+    """
+    if not replaced:
+        return header
+    try:
+        header["ZNFILL"] = (float(fill_value), "non-finite samples replaced with this value")
+        header["ZNFREPL"] = (int(replaced), "number of non-finite samples replaced")
+    except Exception:
+        pass
+    try:
+        header.add_history(
+            f"FITS Linux interop: replaced {int(replaced)} non-finite sample(s) "
+            f"with {float(fill_value):g}"
+        )
+    except Exception:
+        pass
+    return header
+
+
 
 
 def save_fits_image(image_data: np.ndarray,
@@ -5100,7 +5149,8 @@ def save_fits_image(image_data: np.ndarray,
                     legacy_rgb_cube: bool = False,
                     progress_callback: callable = None,
                     axis_order: str = "HWC",
-                    alpha_mask: Optional[np.ndarray] = None):
+                    alpha_mask: Optional[np.ndarray] = None,
+                    sanitize_nonfinite: bool = False):
     """
     Sauvegarde des données image NumPy dans un fichier FITS.
     Utilise ASTROPY_AVAILABLE_IN_UTILS défini localement.
@@ -5325,6 +5375,22 @@ def save_fits_image(image_data: np.ndarray,
                 final_header_to_write.add_history(shift_msg)
             except Exception:
                 pass
+
+        # ZM-FITS-INTEROP-R26: opt-in final-serialization non-finite sanitization.
+        # Replace NaN/+Inf/-Inf with 0.0 in the float32 export buffer ONLY (never
+        # mutates the caller array), and record the fill + count auditable in the
+        # header. Finite samples are bit-identical to the pre-sanitization buffer.
+        if sanitize_nonfinite:
+            data_for_primary, nf_replaced = sanitize_nonfinite_float32(
+                data_for_primary, fill_value=NONFINITE_FILL_VALUE
+            )
+            record_nonfinite_fill(header_float, nf_replaced)
+            if nf_replaced:
+                _log_util_save(
+                    f"SAVE_DEBUG: non-finite sanitization replaced {nf_replaced} "
+                    f"sample(s) with {NONFINITE_FILL_VALUE:g} (Linux interop)",
+                    "INFO",
+                )
 
         if data_to_write_temp.ndim == 3:
             if axis_order_upper == 'HWC':
