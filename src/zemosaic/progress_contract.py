@@ -267,9 +267,16 @@ def plan_for_mode(mode: str) -> ModePlan:
 
 
 def plan_for_stage_id(stage_id: str) -> ModePlan:
-    """Choose a plan by stage-id prefix (ZeGrid ids are ``zegrid:*``)."""
-    if str(stage_id or "").startswith("zegrid:"):
+    """Choose a plan by stage-id prefix.
+
+    ``zegrid:*`` -> ZeGrid; ``sds_phase_*`` (and any supported SDS prefix) -> SDS;
+    legacy ids fall back to LEGACY_PLAN.
+    """
+    sid = str(stage_id or "")
+    if sid.startswith("zegrid:"):
         return ZEGRID_PLAN
+    if sid.startswith("sds_phase_") or sid.startswith("sds:"):
+        return SDS_PLAN
     return LEGACY_PLAN
 
 

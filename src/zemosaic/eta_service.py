@@ -170,12 +170,17 @@ SDS_STAGE_NAMES = (
 
 
 def stage_names_for(mode: str) -> Tuple[str, ...]:
-    """Return the ordered stage names for a mode (``legacy`` | ``sds`` | ``zegrid``)."""
+    """Return the ordered stage names for a mode (``legacy`` | ``sds`` | ``zegrid``).
+
+    Rejects an unknown mode with ``ValueError`` (never silently maps to ZeGrid).
+    """
     if mode == "legacy":
         return LEGACY_STAGE_NAMES
     if mode == "sds":
         return SDS_STAGE_NAMES
-    return ZEGRID_STAGE_NAMES
+    if mode == "zegrid":
+        return ZEGRID_STAGE_NAMES
+    raise ValueError(f"unknown mode {mode!r}")
 
 
 def normalize_cost_model(model: Mapping[str, float]) -> Dict[str, float]:
@@ -481,12 +486,14 @@ def select_mode_priors(
         )
     if mode == "sds":
         return select_sds_priors(records, stage_totals=stage_totals)
-    return select_zegrid_priors(
-        records,
-        n_frames=n_frames,
-        cell_count=cell_count,
-        stage_totals=stage_totals,
-    )
+    if mode == "zegrid":
+        return select_zegrid_priors(
+            records,
+            n_frames=n_frames,
+            cell_count=cell_count,
+            stage_totals=stage_totals,
+        )
+    raise ValueError(f"unknown mode {mode!r}")
 
 
 def _select_v2_mode_priors(
@@ -550,14 +557,15 @@ def _select_v2_mode_priors(
             if not math.isfinite(sec) or sec <= 0.0:
                 continue
             scaled = sec
-            ctx_key = scale_by.get(name)
-            if ctx_key is not None:
-                rec_exact = _safe_int(rec_totals.get(name))
-                cur_exact = _safe_int(cur_totals.get(name))
-                if cur_exact > 0 and rec_exact > 0:
-                    # EXACT per-stage total scaling (preferred).
-                    scaled = sec * (cur_exact / float(rec_exact))
-                elif ctx_key == "n_frames" and cur_n > 0 and rec_n > 0:
+            rec_exact = _safe_int(rec_totals.get(name))
+            cur_exact = _safe_int(cur_totals.get(name))
+            if cur_exact > 0 and rec_exact > 0:
+                # EXACT per-stage total scaling (preferred) — applies to ANY
+                # stage whenever both totals are valid, independent of scale_by.
+                scaled = sec * (cur_exact / float(rec_exact))
+            else:
+                ctx_key = scale_by.get(name)
+                if ctx_key == "n_frames" and cur_n > 0 and rec_n > 0:
                     scaled = sec * (cur_n / float(rec_n))
                 elif ctx_key == "master_tiles" and cur_m > 0 and rec_m > 0:
                     scaled = sec * (cur_m / float(rec_m))
@@ -756,7 +764,8 @@ def build_mode_history_record(
 
     Only numeric totals/durations, per-stage seconds/totals, and (optionally)
     workload context + effective backend/worker concurrency are recorded — never
-    raw paths, frame names, or user data.
+    raw paths, frame names, or user data. Rejects an unknown mode with
+    ``ValueError`` (via :func:`stage_names_for`).
     """
     names = stage_names_for(mode)
     rec: dict = {
@@ -1099,6 +1108,11 @@ class HybridEtaEstimator:
 
     def mark_success(self) -> EtaResult:
         if self._terminal is None:
+            # Close the active stage at the success clock instant exactly once,
+            # so export_observed_stage_seconds() never absorbs a post-success
+            # delay. Repeated success/fail/cancel calls remain sticky/idempotent.
+            if self._active_stage is not None and self._active_position >= 0:
+                self._close_prior_stages(self._active_position + 1, self._clock())
             self._terminal = "success"
         return self._terminal_result()
 

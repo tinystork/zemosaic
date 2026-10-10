@@ -635,13 +635,14 @@ def test_mode_switch_legacy_to_sds_resets():
 
 
 def test_old_eta_writers_guarded_telemetry_live():
-    # The percent-derived writer is guarded for legacy/SDS hybrid active.
+    # The percent-derived writer is guarded by the all-mode structured authority
+    # predicate (ZeGrid|legacy|SDS) — exactly one writer.
     src = _method_src("_update_eta_from_progress")
-    assert "_legacy_eta_active" in src
-    assert "_sds_eta_active" in src
-    # GPU helper override is guarded too.
+    assert "_structured_eta_active()" in src
+    # GPU helper override is guarded by the SAME all-mode predicate (F4: ZeGrid
+    # is covered too, not just legacy/SDS).
     gpu_src = _method_src("_start_gpu_eta_override")
-    assert "_legacy_eta_active" in gpu_src
+    assert "_structured_eta_active()" in gpu_src
     # Textual ETA_UPDATE guarded.
     txt_src = _method_src("_on_worker_eta_updated")
     assert "_legacy_eta_active" in txt_src
@@ -650,6 +651,14 @@ def test_old_eta_writers_guarded_telemetry_live():
     assert "_legacy_eta_active" in stats_src
     # Resource telemetry still collected (CPU/RAM/GPU parts) — same method.
     assert "cpu_percent" in stats_src
+
+
+def test_structured_eta_active_covers_zegrid():
+    # F4: the all-mode single-writer predicate must include ZeGrid explicitly.
+    src = _method_src("_structured_eta_active")
+    assert "_zegrid_active" in src
+    assert "_legacy_eta_active" in src
+    assert "_sds_eta_active" in src
 
 
 def test_success_only_persistence_legacy_sds_not_zegrid():
@@ -697,3 +706,189 @@ def test_roman_phase_label_monotonic_floor():
     assert "roman_ordinal" in src
     assert "PHASE_LABEL_FORMAT" in src
     assert "never move the label backwards" in src
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 F1: log-key cross-mode contamination guard (static AST)
+# ---------------------------------------------------------------------------
+
+def test_f1_explicit_sds_evidence_activates_only_sds_global_finalize():
+    src = _method_src("_on_worker_log_message")
+    # Only the explicit SDS key may call _activate_sds_once (activating SDS).
+    assert "_activate_sds_once" in src
+    # The generic phase6/save/success keys are nested under a `_sds_progress_active`
+    # guard, never under the unconditional path.
+    assert "elif self._sds_progress_active:" in src
+    # The explicit key branch must appear BEFORE the guarded generic branch.
+    assert src.index('normalized_key == "sds_global_finalize_done"') < src.index(
+        "elif self._sds_progress_active:"
+    )
+
+
+def test_f1_generic_keys_never_call_mark_complete_unconditionally():
+    src = _method_src("_on_worker_log_message")
+    # The generic keys must NOT appear before the `elif self._sds_progress_active:`
+    # guard (i.e. they are all guarded).
+    guard_idx = src.index("elif self._sds_progress_active:")
+    for key in ("run_info_phase6_started", "run_success_mosaic_saved",
+                "run_success_preview_saved", "run_success_processing_completed"):
+        assert key in src
+        assert src.index(key) > guard_idx
+
+
+def test_f1_activate_sds_once_idempotent():
+    src = _method_src("_activate_sds_once")
+    assert "if self._sds_progress_active:" in src
+    assert "_on_sds_detected" in src
+    assert "_sds_current_phase_index = 1" in src
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 F2: exact stage-total scaling for ANY stage
+# ---------------------------------------------------------------------------
+
+def test_f2_sds_phase1_and_phase4_exact_scaling():
+    rec = zeta.build_mode_history_record(
+        mode="sds",
+        total_duration_s=500.0,
+        stage_seconds={"sds_phase_1": 50.0, "sds_phase_4": 200.0},
+        stage_totals={"sds_phase_1": 10, "sds_phase_4": 20},
+    )
+    priors, comparable = zeta.select_mode_priors(
+        [rec], mode="sds",
+        stage_totals={"sds_phase_1": 30, "sds_phase_4": 40},
+    )
+    assert comparable == 1
+    # sds_phase_1 50 * (30/10) = 150; sds_phase_4 200 * (40/20) = 400.
+    assert priors["sds_phase_1"] == pytest.approx(150.0)
+    assert priors["sds_phase_4"] == pytest.approx(400.0)
+
+
+def test_f2_legacy_phase5_exact_scaling():
+    rec = zeta.build_mode_history_record(
+        mode="legacy",
+        total_duration_s=1000.0,
+        stage_seconds={"phase5": 500.0},
+        stage_totals={"phase5": 100},
+    )
+    priors, comparable = zeta.select_mode_priors(
+        [rec], mode="legacy",
+        stage_totals={"phase5": 200},
+    )
+    assert comparable == 1
+    # phase5 has no scale_by context key, but its exact total still scales.
+    assert priors["phase5"] == pytest.approx(1000.0)
+
+
+def test_f2_exact_beats_context_fallback():
+    rec = zeta.build_mode_history_record(
+        mode="legacy",
+        total_duration_s=1000.0,
+        stage_seconds={"phase1": 50.0},
+        stage_totals={"phase1": 10},
+        n_frames=10,
+    )
+    # Both exact total (10 -> 30) and n_frames (10 -> 30) would give x3; make
+    # them disagree to prove exact wins: exact total 10 -> 30 (x3), n_frames
+    # 10 -> 20 (x2). Exact total must win (150, not 100).
+    priors, comparable = zeta.select_mode_priors(
+        [rec], mode="legacy", n_frames=20,
+        stage_totals={"phase1": 30},
+    )
+    assert comparable == 1
+    assert priors["phase1"] == pytest.approx(150.0)
+
+
+def test_f2_non_scaled_stages_without_exact_totals_verbatim():
+    rec = zeta.build_mode_history_record(
+        mode="legacy",
+        total_duration_s=1000.0,
+        stage_seconds={"phase2": 5.0, "phase4": 50.0},
+    )
+    priors, comparable = zeta.select_mode_priors([rec], mode="legacy")
+    assert comparable == 1
+    assert priors["phase2"] == pytest.approx(5.0)
+    assert priors["phase4"] == pytest.approx(50.0)
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 F3: close timing at terminal success
+# ---------------------------------------------------------------------------
+
+def test_f3_mark_success_closes_active_stage_at_success_instant():
+    ck = FakeClock(0.0)
+    est = _legacy_est(ck)
+    est.on_stage("phase1", 0, 653)
+    ck.advance(10.0)
+    est.on_stage("phase1", 653, 653)
+    est.on_stage("phase2", 0, 0)
+    ck.advance(5.0)
+    est.on_stage("phase3", 0, 40)
+    ck.advance(30.0)
+    est.on_stage("phase3", 40, 40)
+    est.on_stage("phase4", 0, 0)
+    ck.advance(2.0)
+    est.on_stage("phase5", 10, 100)
+    ck.advance(20.0)
+    # success at t=67.0
+    est.mark_success()
+    # A large post-success delay must NOT contaminate the observed durations.
+    ck.advance(1000.0)
+    observed = est.export_observed_stage_seconds()
+    assert observed["phase5"] == pytest.approx(20.0)
+    assert observed["phase4"] == pytest.approx(2.0)
+    assert observed["phase3"] == pytest.approx(30.0)
+
+
+def test_f3_mark_success_idempotent_and_sticky():
+    ck = FakeClock(0.0)
+    est = _legacy_est(ck)
+    est.on_stage("phase1", 0, 10)
+    ck.advance(4.0)
+    est.on_stage("phase1", 10, 10)
+    first = est.mark_success()
+    second = est.mark_success()
+    assert first.remaining_seconds == 0.0
+    assert second.remaining_seconds == 0.0
+    # Fail after success stays success (sticky), and does not re-close/re-time.
+    est.mark_fail()
+    ck.advance(50.0)
+    observed = est.export_observed_stage_seconds()
+    assert observed["phase1"] == pytest.approx(4.0)
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 F5: generic helpers
+# ---------------------------------------------------------------------------
+
+def test_f5_plan_for_stage_id_maps_sds():
+    assert zprogress.plan_for_stage_id("sds_phase_1") is zprogress.SDS_PLAN
+    assert zprogress.plan_for_stage_id("sds_phase_7") is zprogress.SDS_PLAN
+    assert zprogress.plan_for_stage_id("sds:something") is zprogress.SDS_PLAN
+    assert zprogress.plan_for_stage_id("zegrid:setup") is zprogress.ZEGRID_PLAN
+    assert zprogress.plan_for_stage_id("phase1") is zprogress.LEGACY_PLAN
+
+
+def test_f5_stage_names_for_rejects_unknown_mode():
+    assert zeta.stage_names_for("legacy") == zeta.LEGACY_STAGE_NAMES
+    assert zeta.stage_names_for("sds") == zeta.SDS_STAGE_NAMES
+    assert zeta.stage_names_for("zegrid") == zeta.ZEGRID_STAGE_NAMES
+    with pytest.raises(ValueError):
+        zeta.stage_names_for("nonsense")
+    with pytest.raises(ValueError):
+        zeta.stage_names_for("")
+
+
+def test_f5_select_mode_priors_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        zeta.select_mode_priors([], mode="nonsense")
+    with pytest.raises(ValueError):
+        zeta.select_mode_priors([], mode="")
+
+
+def test_f5_build_mode_history_record_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        zeta.build_mode_history_record(
+            mode="nonsense", total_duration_s=1.0, stage_seconds={}
+        )
+

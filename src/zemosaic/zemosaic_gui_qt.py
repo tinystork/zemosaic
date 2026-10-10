@@ -4771,9 +4771,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._set_eta_display(formatted, force=True)
 
     def _update_eta_from_progress(self, global_progress: float) -> None:
-        # ZM-ETA-ALLMODES-R31: while a legacy/SDS hybrid ETA authority is active,
-        # the percent-derived ETA must never overwrite it (exactly one writer).
-        if self._legacy_eta_active or self._sds_eta_active:
+        # ZM-ETA-ALLMODES-R31: while ANY hybrid ETA authority is active
+        # (ZeGrid|legacy|SDS), the percent-derived ETA must never overwrite it
+        # (exactly one writer).
+        if self._structured_eta_active():
             return
         if self._eta_calc is None or self._is_eta_override_active():
             return
@@ -4796,9 +4797,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._set_eta_display(format_eta_hms(smoothed))
 
     def _start_gpu_eta_override(self, seconds: float, helper_name: str) -> None:
-        # ZM-ETA-ALLMODES-R31: a legacy/SDS hybrid ETA authority owns the display;
-        # do not arm a CPU/GPU helper override that would overwrite it.
-        if self._legacy_eta_active or self._sds_eta_active:
+        # ZM-ETA-ALLMODES-R31: while ANY hybrid ETA authority is active
+        # (ZeGrid|legacy|SDS), do not arm a CPU/GPU helper override that would
+        # overwrite it.
+        if self._structured_eta_active():
             return
         try:
             predicted = float(seconds)
@@ -5551,18 +5553,29 @@ class ZeMosaicQtMainWindow(QMainWindow):
         level_str = str(level) if isinstance(level, str) else str(level)
         if isinstance(message_key_or_raw, str):
             normalized_key = message_key_or_raw.strip()
-            if normalized_key == "sds_global_finalize_done" or normalized_key == "run_info_phase6_started":
+            if normalized_key == "sds_global_finalize_done":
+                # ZM-ETA-ALLMODES-R31 F1: EXPLICIT SDS evidence may activate SDS
+                # exactly once (resetting any provisional legacy authority), then
+                # mark the polish phase (5) complete. Duplicate resets are avoided
+                # when SDS is already active.
+                self._activate_sds_once()
                 self._mark_sds_phase_complete(5, advance_to=6)
-                # ZM-ETA-ALLMODES-R31: polish phase (5) complete -> hybrid authority.
                 self._feed_sds_phase_complete(5)
-            elif normalized_key == "run_success_mosaic_saved" or normalized_key.startswith("run_success_preview_saved"):
-                self._mark_sds_phase_complete(6, advance_to=7)
-                # ZM-ETA-ALLMODES-R31: save phase (6) complete -> hybrid authority.
-                self._feed_sds_phase_complete(6)
-            elif normalized_key == "run_success_processing_completed":
-                self._sds_completed = True
-                self._apply_sds_progress(1.0)
-                self._set_eta_display("00:00:00", force=True)
+            elif self._sds_progress_active:
+                # Generic phase6/save/success keys are emitted by ordinary legacy
+                # runs too; they may only feed SDS when it is ALREADY active. They
+                # must never activate SDS, discard a legacy authority, or set
+                # 100%/ETA 0 for a legacy run.
+                if normalized_key == "run_info_phase6_started":
+                    self._mark_sds_phase_complete(5, advance_to=6)
+                    self._feed_sds_phase_complete(5)
+                elif normalized_key == "run_success_mosaic_saved" or normalized_key.startswith("run_success_preview_saved"):
+                    self._mark_sds_phase_complete(6, advance_to=7)
+                    self._feed_sds_phase_complete(6)
+                elif normalized_key == "run_success_processing_completed":
+                    self._sds_completed = True
+                    self._apply_sds_progress(1.0)
+                    self._set_eta_display("00:00:00", force=True)
         translated_message = self._translate_worker_message(
             message_key_or_raw, params, level_str
         )
@@ -5916,6 +5929,20 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _on_sds_detected(self) -> None:
         """SDS detected: replace/reset any provisional legacy authority."""
         self._discard_legacy_eta()
+
+    def _activate_sds_once(self) -> None:
+        """ZM-ETA-ALLMODES-R31 F1: activate SDS exactly once from explicit evidence.
+
+        Sets ``_sds_progress_active`` and resets any provisional legacy authority
+        on the FIRST activation only; no duplicate reset when SDS is already
+        active. Sets the initial phase index if not yet set.
+        """
+        if self._sds_progress_active:
+            return
+        self._sds_progress_active = True
+        self._on_sds_detected()
+        if self._sds_current_phase_index <= 0:
+            self._sds_current_phase_index = 1
 
     def _ensure_sds_eta(self) -> zeta.HybridEtaEstimator | None:
         """Create the SDS hybrid ETA authority on first SDS event."""
