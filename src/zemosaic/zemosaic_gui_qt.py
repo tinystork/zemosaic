@@ -1224,6 +1224,25 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._zegrid_stage_totals: Dict[str, int] = {}
         self._zegrid_n_frames: int | None = None
         self._zegrid_cell_count: int | None = None
+        # ZM-ETA-ALLMODES-R31: legacy/SDS hybrid ETA authorities (same pure
+        # HybridEtaEstimator reused per mode, distinct from the R29 progress
+        # aggregator and from the ZeGrid authority). Created/reset lazily per
+        # mode, fed from structured events, ticked by the elapsed timer, and
+        # persisted success-only from the GUI (worker v1 append already ran).
+        self._legacy_eta: zeta.HybridEtaEstimator | None = None
+        self._legacy_eta_records: list | None = None
+        self._legacy_stage_totals: Dict[str, int] = {}
+        self._legacy_n_frames: int | None = None
+        self._legacy_master_tiles: int | None = None
+        self._legacy_eta_active: bool = False
+        self._legacy_eta_written: bool = False
+        self._sds_eta: zeta.HybridEtaEstimator | None = None
+        self._sds_eta_records: list | None = None
+        self._sds_stage_totals: Dict[str, int] = {}
+        self._sds_eta_active: bool = False
+        self._sds_eta_written: bool = False
+        self._sds_phase_floor: int = 0
+        self._legacy_phase_floor: int = 0
         self._eta_calc: ETACalculator | None = None
         self._last_eta_seconds_update_mono: float | None = None
         self._last_eta_seconds_value: float | None = None
@@ -4752,6 +4771,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._set_eta_display(formatted, force=True)
 
     def _update_eta_from_progress(self, global_progress: float) -> None:
+        # ZM-ETA-ALLMODES-R31: while a legacy/SDS hybrid ETA authority is active,
+        # the percent-derived ETA must never overwrite it (exactly one writer).
+        if self._legacy_eta_active or self._sds_eta_active:
+            return
         if self._eta_calc is None or self._is_eta_override_active():
             return
         try:
@@ -4773,6 +4796,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._set_eta_display(format_eta_hms(smoothed))
 
     def _start_gpu_eta_override(self, seconds: float, helper_name: str) -> None:
+        # ZM-ETA-ALLMODES-R31: a legacy/SDS hybrid ETA authority owns the display;
+        # do not arm a CPU/GPU helper override that would overwrite it.
+        if self._legacy_eta_active or self._sds_eta_active:
+            return
         try:
             predicted = float(seconds)
         except Exception:
@@ -5283,18 +5310,40 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._zegrid_stage_totals = {}
         self._zegrid_n_frames = None
         self._zegrid_cell_count = None
+        # ZM-ETA-ALLMODES-R31 F: reset the legacy/SDS hybrid ETA authorities,
+        # records/totals/write-once flags, and Roman label floors so no stale
+        # estimator, ETA, or write-once state leaks run-to-run.
+        self._legacy_eta = None
+        self._legacy_eta_records = None
+        self._legacy_stage_totals = {}
+        self._legacy_n_frames = None
+        self._legacy_master_tiles = None
+        self._legacy_eta_active = False
+        self._legacy_eta_written = False
+        self._legacy_phase_floor = 0
+        self._sds_eta = None
+        self._sds_eta_records = None
+        self._sds_stage_totals = {}
+        self._sds_eta_active = False
+        self._sds_eta_written = False
+        self._sds_phase_floor = 0
 
     def _maybe_detect_sds(self, payload: Dict[str, Any]) -> bool:
         if self._sds_progress_active:
             return True
         if not isinstance(payload, dict):
             return False
+        was_active = self._sds_progress_active
         if bool(payload.get("sds_mode")):
             self._sds_progress_active = True
         else:
             phase_name = str(payload.get("phase_name") or "")
             if phase_name and any(tag in phase_name.lower() for tag in ("sds", "supadup")):
                 self._sds_progress_active = True
+        if self._sds_progress_active and not was_active:
+            # ZM-ETA-ALLMODES-R31 C.2: SDS just detected -> replace/reset any
+            # provisional legacy authority (never blend modes/histories).
+            self._on_sds_detected()
         if self._sds_progress_active and self._sds_current_phase_index <= 0:
             self._sds_current_phase_index = 1
         return self._sds_progress_active
@@ -5504,8 +5553,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
             normalized_key = message_key_or_raw.strip()
             if normalized_key == "sds_global_finalize_done" or normalized_key == "run_info_phase6_started":
                 self._mark_sds_phase_complete(5, advance_to=6)
+                # ZM-ETA-ALLMODES-R31: polish phase (5) complete -> hybrid authority.
+                self._feed_sds_phase_complete(5)
             elif normalized_key == "run_success_mosaic_saved" or normalized_key.startswith("run_success_preview_saved"):
                 self._mark_sds_phase_complete(6, advance_to=7)
+                # ZM-ETA-ALLMODES-R31: save phase (6) complete -> hybrid authority.
+                self._feed_sds_phase_complete(6)
             elif normalized_key == "run_success_processing_completed":
                 self._sds_completed = True
                 self._apply_sds_progress(1.0)
@@ -5588,19 +5641,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
             # 'estimation en cours' placeholder.
             self._feed_zegrid_eta(result, current_val, total_val)
         else:
-            self._set_legacy_phase_label(stage_name)
-            self._update_eta_from_progress(global_percent)
-            if global_percent >= 99.9:
-                self._eta_seconds_smoothed = 0.0
-                self._set_eta_display("00:00:00", force=True)
+            # ZM-ETA-ALLMODES-R31: legacy structured stage event feeds the hybrid
+            # ETA authority (never the percent-derived path while it is active).
+            self._set_legacy_phase_label(result)
+            self._feed_legacy_eta(result, current_val, total_val)
 
-    def _set_legacy_phase_label(self, stage: str) -> None:
-        stage_idx = self._infer_phase_index_from_stage(stage)
-        floor_idx = int(self._phase_label_floor or 0)
-        if isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx:
-            return  # never move the label backwards
-        self._bump_phase_label_floor(stage_idx)
-        self.phase_value_label.setText(self._format_stage_name(stage))
+    def _set_legacy_phase_label(self, result: zprogress.StageResult) -> None:
+        """Roman legacy phase label (I–VIII) with a monotonic floor."""
+        ordinal = result.ordinal
+        if not isinstance(ordinal, int) or ordinal <= 0:
+            return
+        self._set_roman_phase_label(ordinal, result.display_key or "", "_legacy_phase_floor")
 
     def _set_zegrid_phase_label(self, result: zprogress.StageResult) -> None:
         ordinal = result.ordinal
@@ -5709,10 +5760,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             eta = est.on_stage(normalized, int(current), int(total))
         except Exception:
             eta = None
-        self._render_zegrid_eta(eta)
+        self._render_hybrid_eta(eta)
 
-    def _render_zegrid_eta(self, eta) -> None:
-        """Render a ZeGrid EtaResult as a localized honest label."""
+    def _render_hybrid_eta(self, eta) -> None:
+        """Render a hybrid EtaResult as a localized honest label (all modes).
+
+        Not-ready -> ``estimation en cours``; ready -> ``≈ HH:MM:SS``; stalled
+        localized; terminal success -> ``00:00:00``; fail/cancel -> neutral.
+        """
         if eta is None:
             self._set_eta_display(
                 self._tr(zprogress.ETA_ESTIMATION_IN_PROGRESS, "estimation en cours"),
@@ -5747,6 +5802,233 @@ class ZeMosaicQtMainWindow(QMainWindow):
             approx = f"{approx} ({stalled})"
         self._set_eta_display(approx, force=True)
 
+    # ------------------------------------------------------------------
+    # ZM-ETA-ALLMODES-R31: legacy/SDS hybrid ETA authorities (same pure
+    # HybridEtaEstimator as ZeGrid, one per mode; never blend modes/history).
+    # ------------------------------------------------------------------
+    def _ensure_legacy_eta(self) -> zeta.HybridEtaEstimator | None:
+        """Create the legacy hybrid ETA authority on first structured event.
+
+        Records are read from disk ONCE per run (``_legacy_eta_records``) and
+        priors are (re)selected from that cache as learned totals change.
+        """
+        if self._legacy_eta is not None:
+            return self._legacy_eta
+        # Never create a legacy authority once SDS owns the run.
+        if self._sds_eta is not None or self._sds_eta_active:
+            return None
+        est = zeta.HybridEtaEstimator(zprogress.LEGACY_PLAN)
+        self._legacy_eta = est
+        if self._legacy_eta_records is None:
+            try:
+                self._legacy_eta_records = zeta.load_eta_history()
+            except Exception:
+                self._legacy_eta_records = []
+        self._reselect_legacy_priors()
+        return est
+
+    def _reselect_legacy_priors(self) -> None:
+        """Reselect legacy priors (v2 preferred, v1 bootstrap fallback).
+
+        ``phase1`` total -> ``n_frames``, ``phase3`` total -> ``master_tiles``,
+        with exact per-stage totals preferred. Best-effort; never fatal.
+        """
+        est = self._legacy_eta
+        if est is None:
+            return
+        try:
+            records = self._legacy_eta_records or []
+            priors, comparable = zeta.select_mode_priors(
+                records,
+                mode="legacy",
+                n_frames=self._legacy_n_frames,
+                master_tiles=self._legacy_master_tiles,
+                stage_totals=self._legacy_stage_totals or None,
+            )
+            est.set_priors(priors, comparable_histories=comparable)
+        except Exception:
+            pass
+
+    def _observe_legacy_stage_total(self, normalized: str, total: int) -> None:
+        """Learn legacy exact stage totals (phase1=n_frames, phase3=master tiles,
+        phase5=exact steps) and reselect priors on change."""
+        key = None
+        if normalized == "phase1" and total > 0:
+            self._legacy_n_frames = int(total)
+            key = "phase1"
+        elif normalized == "phase3" and total > 0:
+            self._legacy_master_tiles = int(total)
+            key = "phase3"
+        elif normalized == "phase5" and total > 0:
+            key = "phase5"
+        if key is None:
+            return
+        new_total = int(total)
+        if self._legacy_stage_totals.get(key) != new_total:
+            self._legacy_stage_totals[key] = new_total
+            self._reselect_legacy_priors()
+
+    def _feed_legacy_eta(self, result: zprogress.StageResult, current: int, total: int) -> None:
+        """Feed one stable legacy stage event to the estimator and render its ETA."""
+        normalized = result.normalized_id
+        self._observe_legacy_stage_total(normalized, int(total))
+        est = self._ensure_legacy_eta()
+        if est is None:
+            return
+        self._legacy_eta_active = True
+        try:
+            est.set_context(
+                n_frames=self._legacy_n_frames,
+                master_tiles=self._legacy_master_tiles,
+            )
+            eta = est.on_stage(normalized, int(current), int(total))
+        except Exception:
+            eta = None
+        self._render_hybrid_eta(eta)
+
+    def _feed_legacy_phase_transition(self, phase_id: str) -> None:
+        """Feed a legacy ``PHASE_UPDATE:<id>`` transition as an unknown-total
+        phase start (so phases lacking STAGE_PROGRESS still get timed/estimated)."""
+        stage_id = zprogress.legacy_phase_id_to_stage(phase_id)
+        if stage_id is None:
+            return
+        est = self._ensure_legacy_eta()
+        if est is None:
+            return
+        self._legacy_eta_active = True
+        try:
+            eta = est.on_stage(stage_id, 0, 0)
+        except Exception:
+            eta = None
+        self._render_hybrid_eta(eta)
+
+    def _discard_legacy_eta(self) -> None:
+        """Reset any provisional legacy authority (mode switch to SDS)."""
+        self._legacy_eta = None
+        self._legacy_eta_records = None
+        self._legacy_stage_totals = {}
+        self._legacy_n_frames = None
+        self._legacy_master_tiles = None
+        self._legacy_eta_active = False
+        self._legacy_eta_written = False
+        self._legacy_phase_floor = 0
+
+    def _on_sds_detected(self) -> None:
+        """SDS detected: replace/reset any provisional legacy authority."""
+        self._discard_legacy_eta()
+
+    def _ensure_sds_eta(self) -> zeta.HybridEtaEstimator | None:
+        """Create the SDS hybrid ETA authority on first SDS event."""
+        if self._sds_eta is not None:
+            return self._sds_eta
+        # SDS replaces any provisional legacy authority; never blend modes.
+        self._discard_legacy_eta()
+        est = zeta.HybridEtaEstimator(zprogress.SDS_PLAN)
+        self._sds_eta = est
+        if self._sds_eta_records is None:
+            try:
+                self._sds_eta_records = zeta.load_eta_history()
+            except Exception:
+                self._sds_eta_records = []
+        self._reselect_sds_priors()
+        return est
+
+    def _reselect_sds_priors(self) -> None:
+        """Reselect SDS priors (v2 only, never v1, never cross-mode)."""
+        est = self._sds_eta
+        if est is None:
+            return
+        try:
+            records = self._sds_eta_records or []
+            priors, comparable = zeta.select_mode_priors(
+                records,
+                mode="sds",
+                stage_totals=self._sds_stage_totals or None,
+            )
+            est.set_priors(priors, comparable_histories=comparable)
+        except Exception:
+            pass
+
+    def _observe_sds_stage_total(self, stage_id: str, total: int) -> None:
+        """Learn an SDS exact stage total and reselect priors on change."""
+        if stage_id not in zeta.SDS_STAGE_NAMES or total <= 0:
+            return
+        new_total = int(total)
+        if self._sds_stage_totals.get(stage_id) != new_total:
+            self._sds_stage_totals[stage_id] = new_total
+            self._reselect_sds_priors()
+
+    def _feed_sds_stage(self, stage_id: str, current: int, total: int) -> None:
+        """Feed one stable SDS stage event (files / coadd) to the estimator."""
+        self._observe_sds_stage_total(stage_id, int(total))
+        est = self._ensure_sds_eta()
+        if est is None:
+            return
+        self._sds_eta_active = True
+        try:
+            eta = est.on_stage(stage_id, int(current), int(total))
+        except Exception:
+            eta = None
+        self._render_hybrid_eta(eta)
+
+    def _feed_sds_phase_transition(self, phase_index: int) -> None:
+        """Feed an SDS numeric phase transition as an unknown-total phase start."""
+        stage_id = zprogress.sds_phase_id_to_stage(phase_index)
+        if stage_id is None:
+            return
+        est = self._ensure_sds_eta()
+        if est is None:
+            return
+        self._sds_eta_active = True
+        try:
+            eta = est.on_stage(stage_id, 0, 0)
+        except Exception:
+            eta = None
+        self._render_hybrid_eta(eta)
+
+    def _feed_sds_phase_complete(self, phase_index: int) -> None:
+        """Mark an SDS phase complete (polish/save/cleanup log transitions)."""
+        stage_id = zprogress.sds_phase_id_to_stage(phase_index)
+        if stage_id is None:
+            return
+        est = self._ensure_sds_eta()
+        if est is None:
+            return
+        self._sds_eta_active = True
+        try:
+            eta = est.on_stage(stage_id, 1, 1)
+        except Exception:
+            eta = None
+        self._render_hybrid_eta(eta)
+
+    def _structured_eta_active(self) -> bool:
+        """True when ANY hybrid ETA authority owns the display (any mode)."""
+        return bool(self._zegrid_active or self._legacy_eta_active or self._sds_eta_active)
+
+    def _set_roman_phase_label(self, ordinal: int, display_key: str, floor_attr: str) -> None:
+        """Set the phase label as ``{roman} — {operation}`` with a monotonic floor."""
+        if not isinstance(ordinal, int) or ordinal <= 0:
+            return
+        floor = getattr(self, floor_attr, 0) or 0
+        if ordinal < floor:
+            return  # never move the label backwards
+        setattr(self, floor_attr, ordinal)
+        roman = zprogress.roman_ordinal(ordinal)
+        operation = self._tr(display_key or "", "")
+        template = self._tr(zprogress.PHASE_LABEL_FORMAT, "{roman} — {operation}")
+        try:
+            label = template.format(roman=roman, operation=operation)
+        except Exception:
+            label = f"{roman} — {operation}" if operation else roman
+        self.phase_value_label.setText(label)
+
+    def _set_sds_phase_label(self, phase_index: int) -> None:
+        """Roman SDS phase label (I–VII) with a monotonic floor."""
+        desc = zprogress.SDS_PLAN.stage(zprogress.sds_phase_id_to_stage(phase_index) or "")
+        if desc is None:
+            return
+        self._set_roman_phase_label(desc.ordinal, desc.display_key, "_sds_phase_floor")
+
     def _on_worker_phase45_event(self, key: str, payload: Dict[str, Any], level: str) -> None:
         data = payload if isinstance(payload, dict) else {}
         normalized_level = self._normalize_log_level(level)
@@ -5774,19 +6056,30 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _on_worker_phase_changed(self, stage: str, payload: Dict[str, Any]) -> None:
         payload_dict = payload if isinstance(payload, dict) else {}
-        if self._sds_progress_active:
-            phase_id_raw = payload_dict.get("phase_id")
-            if isinstance(phase_id_raw, str) and phase_id_raw.strip().isdigit():
-                idx = int(phase_id_raw.strip())
-                self._bump_phase_label_floor(idx)
-                self._apply_sds_progress(self._compute_sds_progress_fraction(idx, None, None))
         phase_id = payload_dict.get("phase_id")
         if isinstance(phase_id, str):
             normalized_id = phase_id.strip()
+            if self._sds_progress_active:
+                # SDS numeric phase transition (1..7).
+                idx = self._phase_id_to_index(normalized_id)
+                self._bump_phase_label_floor(idx)
+                self._apply_sds_progress(self._compute_sds_progress_fraction(idx, None, None))
+                # ZM-ETA-ALLMODES-R31: feed the SDS hybrid ETA authority + Roman label.
+                if isinstance(idx, int) and idx > 0:
+                    self._feed_sds_phase_transition(idx)
+                    self._set_sds_phase_label(idx)
+                return
+            # Legacy PHASE_UPDATE transition (1..7 / 4.5): feed as unknown-total
+            # phase start; present the Roman label for known structured ids.
+            self._feed_legacy_phase_transition(normalized_id)
+            stage_id = zprogress.legacy_phase_id_to_stage(normalized_id)
+            desc = zprogress.LEGACY_PLAN.stage(stage_id) if stage_id else None
+            if desc is not None:
+                self._set_roman_phase_label(desc.ordinal, desc.display_key, "_legacy_phase_floor")
+                return
+            # Unknown/old raw phase id: safe existing formatting.
             phase_idx = self._phase_id_to_index(normalized_id)
             self._bump_phase_label_floor(phase_idx)
-            if self._sds_phase_active and normalized_id == "4":
-                return
             stage_label = self._format_phase_display_from_id(normalized_id)
             self.phase_value_label.setText(stage_label)
             return
@@ -5800,7 +6093,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             if isinstance(total_val, int):
                 self._sds_phase_total = total_val
             self._sds_phase_active = not payload_dict.get("sds_final", False)
-            stage_label = self._format_sds_phase_label(current_val, total_val)
+            # ZM-ETA-ALLMODES-R31: SDS global-coadd (phase 4) current/total payload
+            # feeds the hybrid authority; equal global percent is NOT the ETA.
+            if isinstance(current_val, int):
+                self._feed_sds_stage(
+                    "sds_phase_4", current_val, total_val if isinstance(total_val, int) else 0
+                )
+            self._set_sds_phase_label(4)
             self._apply_sds_progress(
                 self._compute_sds_progress_fraction(4, None, None)
             )
@@ -5838,9 +6137,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
             files_total = payload.get("files_total") if isinstance(payload.get("files_total"), int) else None
             fraction = self._compute_sds_progress_fraction(phase_idx, files_done, files_total)
             self._apply_sds_progress(fraction)
-            phase_name_raw = payload.get("phase_name")
-            if isinstance(phase_name_raw, str) and phase_name_raw.strip():
-                self.phase_value_label.setText(phase_name_raw.split(":", 1)[0].strip())
+            # ZM-ETA-ALLMODES-R31: SDS phase transition + phase-1 files feed the
+            # hybrid ETA authority (never the equal global percent).
+            if isinstance(phase_idx, int) and phase_idx > 0:
+                self._feed_sds_phase_transition(phase_idx)
+                self._set_sds_phase_label(phase_idx)
+            if (
+                phase_idx == 1
+                and isinstance(files_done, int)
+                and isinstance(files_total, int)
+                and files_total > 0
+            ):
+                self._feed_sds_stage("sds_phase_1", files_done, files_total)
             self._update_sds_tiles_counter()
         files_done = payload.get("files_done")
         files_total = payload.get("files_total")
@@ -5863,6 +6171,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 # ZM-PROGRESS-CONTRACT-R29 F3: ZeGrid shows 'estimation en cours';
                 # the legacy worker eta_seconds must not overwrite it. Clear the
                 # stale countdown state so it cannot reappear.
+                self._last_eta_seconds_value = None
+                self._last_eta_seconds_update_mono = None
+            elif self._legacy_eta_active or self._sds_eta_active:
+                # ZM-ETA-ALLMODES-R31: a legacy/SDS hybrid ETA authority owns the
+                # display; the worker eta_seconds must not overwrite it either.
                 self._last_eta_seconds_value = None
                 self._last_eta_seconds_update_mono = None
             else:
@@ -5907,6 +6220,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # update must not overwrite 'estimation en cours' (and no CPU helper
         # override may be armed). Clear stale countdown state instead.
         if self._zegrid_active:
+            self._cpu_eta_override_deadline = None
+            self._last_eta_seconds_value = None
+            self._last_eta_seconds_update_mono = None
+            return
+        # ZM-ETA-ALLMODES-R31: while a legacy/SDS hybrid ETA authority is active,
+        # the textual ETA_UPDATE must not overwrite it either.
+        if self._legacy_eta_active or self._sds_eta_active:
             self._cpu_eta_override_deadline = None
             self._last_eta_seconds_value = None
             self._last_eta_seconds_update_mono = None
@@ -6034,6 +6354,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _on_worker_finished(self, success: bool, message: str) -> None:
         self.is_processing = False
         self._elapsed_timer.stop()
+        # ZM-ETA-ALLMODES-R31 D.1: capture the GUI-observed wall duration BEFORE
+        # clearing the run start (needed for the legacy/SDS success-only record).
+        wall_duration: float | None = None
+        if self._run_started_monotonic is not None:
+            wall_duration = max(0.0, time.monotonic() - self._run_started_monotonic)
         self._run_started_monotonic = None
         self._last_eta_seconds_update_mono = None
         self._last_eta_seconds_value = None
@@ -6067,10 +6392,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     self._zegrid_eta.mark_cancel()
                 except Exception:
                     pass
+            # ZM-ETA-ALLMODES-R31: legacy/SDS cancel -> neutral (no record, no 0).
+            if self._legacy_eta is not None:
+                try:
+                    self._legacy_eta.mark_cancel()
+                except Exception:
+                    pass
+            if self._sds_eta is not None:
+                try:
+                    self._sds_eta.mark_cancel()
+                except Exception:
+                    pass
             # ZM-PROGRESS-CONTRACT-R29 F3: a ZeGrid cancel must not retain a
             # deceptive active countdown; use the neutral placeholder (never
             # 00:00:00, which would imply successful completion).
-            if self._zegrid_active:
+            if self._structured_eta_active():
                 self._set_eta_display(self._tr("initial_eta_value", "--:--:--"), force=True)
             return
 
@@ -6078,7 +6414,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
             if self._sds_progress_active:
                 self._sds_completed = True
                 self._apply_sds_progress(1.0)
+                # ZM-ETA-ALLMODES-R31: SDS terminal success -> ETA exactly 0.
+                if self._sds_eta is not None:
+                    try:
+                        self._sds_eta.mark_success()
+                    except Exception:
+                        pass
                 self._set_eta_display("00:00:00", force=True)
+                # ZM-ETA-ALLMODES-R31 D: success-only SDS history persistence
+                # (GUI-observed; the ZeGrid worker persists its own record).
+                self._persist_hybrid_history_success("sds", wall_duration)
             else:
                 # ZM-PROGRESS-CONTRACT-R29: explicit terminal success is the ONLY
                 # path to 100% for structured (legacy/ZeGrid) progress.
@@ -6092,6 +6437,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
                         self._zegrid_eta.mark_success()
                     except Exception:
                         pass
+                # ZM-ETA-ALLMODES-R31: legacy terminal success -> ETA exactly 0.
+                if self._legacy_eta is not None:
+                    try:
+                        self._legacy_eta.mark_success()
+                    except Exception:
+                        pass
+                    self._eta_seconds_smoothed = 0.0
+                    self._set_eta_display("00:00:00", force=True)
+                    # ZM-ETA-ALLMODES-R31 D: success-only legacy history persistence.
+                    self._persist_hybrid_history_success("legacy", wall_duration)
                 # ZM-PROGRESS-CONTRACT-R29 F3: ZeGrid terminal success resolves the
                 # ETA display to 00:00:00 (never a stale countdown).
                 if self._zegrid_active:
@@ -6172,10 +6527,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 self._zegrid_eta.mark_fail()
             except Exception:
                 pass
+        # ZM-ETA-ALLMODES-R31: legacy/SDS failure -> neutral (no record, no 0).
+        if self._legacy_eta is not None:
+            try:
+                self._legacy_eta.mark_fail()
+            except Exception:
+                pass
+        if self._sds_eta is not None:
+            try:
+                self._sds_eta.mark_fail()
+            except Exception:
+                pass
         # ZM-PROGRESS-CONTRACT-R29 F3: a ZeGrid failure must not retain a
         # deceptive active countdown; use the neutral placeholder (never
         # 00:00:00, which would imply successful completion).
-        if self._zegrid_active:
+        if self._structured_eta_active():
             self._set_eta_display(self._tr("initial_eta_value", "--:--:--"), force=True)
         if self.isVisible():
             QMessageBox.warning(
@@ -6183,6 +6549,51 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 self._tr("qt_processing_stopped_title", "Processing stopped"),
                 translated,
             )
+
+    def _persist_hybrid_history_success(self, mode: str, wall_duration: float | None) -> None:
+        """ZM-ETA-ALLMODES-R31 D: success-only legacy/SDS v2 history persistence.
+
+        Closes the estimator's active timing, exports the sanitized observed
+        per-stage seconds, builds a v2 mode record, and atomically appends it
+        EXACTLY ONCE per successful run. Never called for ZeGrid (whose worker
+        already persists). No write on cancel/fail/start-failure. History failure
+        is nonfatal. If no valid observed stage was seen, nothing is appended
+        (partial/empty is tolerated by the selector).
+        """
+        if mode not in ("legacy", "sds"):
+            return
+        est = self._legacy_eta if mode == "legacy" else self._sds_eta
+        written_flag = "_legacy_eta_written" if mode == "legacy" else "_sds_eta_written"
+        if est is None or getattr(self, written_flag):
+            return
+        # Write-once guard (set before any side effect; a failure is not retried).
+        setattr(self, written_flag, True)
+        try:
+            observed = est.export_observed_stage_seconds()
+        except Exception:
+            return
+        if not observed:
+            return  # no valid observed stage -> do not append
+        try:
+            total_s = float(wall_duration) if wall_duration else 0.0
+            if total_s <= 0.0:
+                total_s = float(sum(observed.values()))
+            rec = zeta.build_mode_history_record(
+                mode=mode,
+                total_duration_s=total_s,
+                stage_seconds=observed,
+                stage_totals=(
+                    self._legacy_stage_totals if mode == "legacy" else self._sds_stage_totals
+                ) or None,
+                n_frames=self._legacy_n_frames if mode == "legacy" else None,
+                master_tiles=self._legacy_master_tiles if mode == "legacy" else None,
+            )
+            # ZM-ETA-ALLMODES-R31 D.2: the worker's v1 append already ran before
+            # this finished callback; append_mode_history RELOADS the file and
+            # appends v2, preserving v1 (never a stale in-memory cache).
+            zeta.append_mode_history(rec)
+        except Exception:
+            pass
 
     def _on_elapsed_timer_tick(self) -> None:
         if not self.is_processing or self._run_started_monotonic is None:
@@ -6202,7 +6613,26 @@ class ZeMosaicQtMainWindow(QMainWindow):
             est = self._zegrid_eta
             if est is not None:
                 try:
-                    self._render_zegrid_eta(est.tick())
+                    self._render_hybrid_eta(est.tick())
+                except Exception:
+                    pass
+            return
+
+        # ZM-ETA-ALLMODES-R31: legacy/SDS hybrid ETA authorities own the display
+        # while active; tick them (never the stale legacy countdown).
+        if self._legacy_eta_active:
+            est = self._legacy_eta
+            if est is not None:
+                try:
+                    self._render_hybrid_eta(est.tick())
+                except Exception:
+                    pass
+            return
+        if self._sds_eta_active:
+            est = self._sds_eta
+            if est is not None:
+                try:
+                    self._render_hybrid_eta(est.tick())
                 except Exception:
                     pass
             return

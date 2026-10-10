@@ -124,6 +124,89 @@ ZEGRID_STAGE_NAMES = (
     "setup", "layout", "gauge", "per_cell_stack", "assembly", "finalize",
 )
 
+# ZM-ETA-ALLMODES-R31: per-mode ETA fallback cost models. These are WORK-COST
+# SHARES used ONLY as a conservative fallback to allocate ALREADY-OBSERVED
+# completed-phase evidence when no history exists, and (legacy only) to
+# distribute a v1-total bootstrap prior. They are NOT calibrated durations and
+# are NOT the R29 UI progress weights (a separate, unrelated quantity).
+#
+# LEGACY_COST_MODEL derives from the worker's historical conservative RUNTIME
+# shares (documented; no accuracy claim), NOT from the R29 UI weights
+# (30/5/35/5/6/9/8/2). The shares are normalized safely at use.
+LEGACY_COST_MODEL: Dict[str, float] = {
+    "phase1": 0.04,     # scan / preprocess (fast per frame; long tail)
+    "phase2": 0.01,     # clustering
+    "phase3": 0.20,     # master tiles
+    "phase4": 0.05,     # geometry / final grid
+    "phase4_5": 0.10,   # inter-master harmonization
+    "phase5": 0.52,     # final assembly / reproject+coadd (dominant)
+    "phase6": 0.06,     # output saving
+    "phase7": 0.02,     # cleanup / finalization
+}
+
+# SDS explicit conservative phase shares (documented rationale; no accuracy
+# claim). Separate from the SDS UI equal weights (100/7 each). Global coadd
+# dominates; preprocess and polish are material; cluster/save/cleanup are small.
+SDS_COST_MODEL: Dict[str, float] = {
+    "sds_phase_1": 0.15,   # preprocess
+    "sds_phase_2": 0.05,   # cluster
+    "sds_phase_3": 0.20,   # master tiles / batches
+    "sds_phase_4": 0.35,   # global coadd
+    "sds_phase_5": 0.15,   # polish
+    "sds_phase_6": 0.07,   # save
+    "sds_phase_7": 0.03,   # cleanup
+}
+
+# Ordered canonical stage ids for legacy / SDS (== the bare names used as the
+# compact history-record ``stage_seconds`` / ``stage_totals`` keys).
+LEGACY_STAGE_NAMES = (
+    "phase1", "phase2", "phase3", "phase4", "phase4_5",
+    "phase5", "phase6", "phase7",
+)
+SDS_STAGE_NAMES = (
+    "sds_phase_1", "sds_phase_2", "sds_phase_3", "sds_phase_4",
+    "sds_phase_5", "sds_phase_6", "sds_phase_7",
+)
+
+
+def stage_names_for(mode: str) -> Tuple[str, ...]:
+    """Return the ordered stage names for a mode (``legacy`` | ``sds`` | ``zegrid``)."""
+    if mode == "legacy":
+        return LEGACY_STAGE_NAMES
+    if mode == "sds":
+        return SDS_STAGE_NAMES
+    return ZEGRID_STAGE_NAMES
+
+
+def normalize_cost_model(model: Mapping[str, float]) -> Dict[str, float]:
+    """Normalize positive cost shares to sum to 1.0 (drop non-positive/NaN).
+
+    Scale-invariant, so normalizing never changes the estimator math; it only
+    makes the shares comparable and documents them as a normalized distribution.
+    """
+    cleaned: Dict[str, float] = {}
+    for k, v in (model or {}).items():
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f) and f > 0.0:
+            cleaned[str(k)] = f
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        return {}
+    return {k: v / total for k, v in cleaned.items()}
+
+
+def default_cost_model(plan) -> Dict[str, float]:
+    """Return the per-mode fallback cost model for a plan (legacy/sds/zegrid)."""
+    mode = getattr(plan, "mode", None)
+    if mode == "legacy":
+        return LEGACY_COST_MODEL
+    if mode == "sds":
+        return SDS_COST_MODEL
+    return ZEGRID_COST_MODEL
+
 # Stages whose prior may be scaled by their EXACT per-stage total when both the
 # current run's and the record's ``stage_totals`` are valid. ``setup``/``gauge``
 # fall back to ``n_frames`` and ``per_cell_stack`` to ``cell_count`` for older
@@ -373,11 +456,241 @@ def select_zegrid_priors(
     return priors, comparable
 
 
-def append_zegrid_history(
+def select_mode_priors(
+    records: Sequence[dict],
+    *,
+    mode: str,
+    n_frames: Optional[int] = None,
+    cell_count: Optional[int] = None,
+    master_tiles: Optional[int] = None,
+    stage_totals: Optional[Mapping[str, int]] = None,
+) -> Tuple[Dict[str, float], int]:
+    """Select comparable per-stage priors for ONE mode (legacy|sds|zegrid).
+
+    A generic front door on top of the per-mode selectors. Records are selected
+    ONLY within the matching mode (never blended across modes), and legacy v1
+    total records are NEVER used for SDS or ZeGrid. See the per-mode selectors
+    for scaling/bootstrapping details. Returns ``(priors, comparable)``.
+    """
+    if mode == "legacy":
+        return select_legacy_priors(
+            records,
+            n_frames=n_frames,
+            master_tiles=master_tiles,
+            stage_totals=stage_totals,
+        )
+    if mode == "sds":
+        return select_sds_priors(records, stage_totals=stage_totals)
+    return select_zegrid_priors(
+        records,
+        n_frames=n_frames,
+        cell_count=cell_count,
+        stage_totals=stage_totals,
+    )
+
+
+def _select_v2_mode_priors(
+    records: Sequence[dict],
+    *,
+    mode: str,
+    names: Tuple[str, ...],
+    scale_by: Mapping[str, str],
+    n_frames: Optional[int] = None,
+    master_tiles: Optional[int] = None,
+    stage_totals: Optional[Mapping[str, int]] = None,
+) -> Tuple[Dict[str, float], int]:
+    """Shared v2 per-stage prior selection (median, outlier-resistant).
+
+    Only ``mode``-matching v2 records with a positive finite total duration and
+    a ``stage_seconds`` dict contribute. Exact per-stage-total scaling is applied
+    when both the record's and the current run's ``stage_totals[stage]`` are
+    valid (>0), else the optional context fallback ``scale_by`` key is applied.
+    Legacy v1 total records (``duration_s`` without ``mode``) NEVER contribute
+    here. Returns ``(priors, comparable)``.
+    """
+    per_stage: Dict[str, List[float]] = {name: [] for name in names}
+    comparable = 0
+    try:
+        cur_n = int(n_frames) if n_frames else 0
+    except (TypeError, ValueError):
+        cur_n = 0
+    try:
+        cur_m = int(master_tiles) if master_tiles else 0
+    except (TypeError, ValueError):
+        cur_m = 0
+    cur_totals = stage_totals if isinstance(stage_totals, Mapping) else {}
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("mode") != mode:
+            continue
+        stages = rec.get("stage_seconds")
+        if not isinstance(stages, dict) or not stages:
+            continue
+        try:
+            total = float(rec.get("total_duration_s"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(total) or total <= 0.0:
+            continue
+        rec_n = _safe_int(rec.get("n_frames"))
+        rec_m = _safe_int(rec.get("master_tiles"))
+        rec_totals = rec.get("stage_totals")
+        rec_totals = rec_totals if isinstance(rec_totals, Mapping) else {}
+        contributed = False
+        for name in names:
+            raw = stages.get(name)
+            if raw is None:
+                continue
+            try:
+                sec = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(sec) or sec <= 0.0:
+                continue
+            scaled = sec
+            ctx_key = scale_by.get(name)
+            if ctx_key is not None:
+                rec_exact = _safe_int(rec_totals.get(name))
+                cur_exact = _safe_int(cur_totals.get(name))
+                if cur_exact > 0 and rec_exact > 0:
+                    # EXACT per-stage total scaling (preferred).
+                    scaled = sec * (cur_exact / float(rec_exact))
+                elif ctx_key == "n_frames" and cur_n > 0 and rec_n > 0:
+                    scaled = sec * (cur_n / float(rec_n))
+                elif ctx_key == "master_tiles" and cur_m > 0 and rec_m > 0:
+                    scaled = sec * (cur_m / float(rec_m))
+            if math.isfinite(scaled) and scaled > 0.0:
+                per_stage[name].append(scaled)
+                contributed = True
+        if contributed:
+            comparable += 1
+
+    priors: Dict[str, float] = {}
+    for name in names:
+        vals = per_stage[name]
+        if vals:
+            priors[name] = _median_outlier_resistant(vals)
+    return priors, comparable
+
+
+def select_legacy_priors(
+    records: Sequence[dict],
+    *,
+    n_frames: Optional[int] = None,
+    master_tiles: Optional[int] = None,
+    stage_totals: Optional[Mapping[str, int]] = None,
+) -> Tuple[Dict[str, float], int]:
+    """Select legacy per-stage priors (v2 preferred, v1 bootstrap fallback).
+
+    When ANY v2 legacy records (``mode == "legacy"`` with ``stage_seconds``)
+    exist, only those calibrated priors are used (v1 never double-counted).
+    ``phase1`` scales by ``n_frames`` and ``phase3`` by ``master_tiles`` with
+    exact per-stage totals preferred.
+
+    When NO v2 legacy records exist, a LOW/MEDIUM-confidence bootstrap is
+    derived from the v1 total records (median total duration, scaled by
+    ``n_frames`` when known, then distributed by :data:`LEGACY_COST_MODEL`).
+    This bootstrap is a total-duration prior, NOT per-stage calibration, and is
+    never used for SDS or ZeGrid.
+    """
+    priors, comparable = _select_v2_mode_priors(
+        records,
+        mode="legacy",
+        names=LEGACY_STAGE_NAMES,
+        scale_by={"phase1": "n_frames", "phase3": "master_tiles"},
+        n_frames=n_frames,
+        master_tiles=master_tiles,
+        stage_totals=stage_totals,
+    )
+    if comparable > 0:
+        return priors, comparable
+    return _legacy_v1_bootstrap(records, n_frames=n_frames)
+
+
+def _legacy_v1_bootstrap(
+    records: Sequence[dict],
+    *,
+    n_frames: Optional[int] = None,
+) -> Tuple[Dict[str, float], int]:
+    """LOW/MEDIUM-confidence legacy bootstrap from v1 total records.
+
+    Uses the robust median of v1 ``duration_s`` totals, scaled by ``n_frames``
+    when both a current ``n_frames`` and a robust median of the records'
+    ``n_frames`` are known, then distributes the result by
+    :data:`LEGACY_COST_MODEL`. This is a total-duration prior, not per-stage
+    calibration. ``comparable`` is returned 0 so the estimator confidence stays
+    at most MEDIUM for a bootstrap. Never used for SDS/ZeGrid.
+    """
+    durations: List[float] = []
+    frame_counts: List[float] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("mode"):
+            continue  # skip any v2 (typed) record — v1 records have no mode
+        try:
+            dur = float(rec.get("duration_s"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(dur) or dur <= 0.0:
+            continue
+        durations.append(dur)
+        nf = _safe_int(rec.get("n_frames"))
+        if nf > 0:
+            frame_counts.append(float(nf))
+    if not durations:
+        return {}, 0
+
+    median_total = _median_outlier_resistant(durations)
+    if median_total <= 0.0:
+        return {}, 0
+    try:
+        cur_n = int(n_frames) if n_frames else 0
+    except (TypeError, ValueError):
+        cur_n = 0
+    if cur_n > 0 and frame_counts:
+        median_frames = _median_outlier_resistant(frame_counts)
+        if median_frames > 0.0:
+            median_total = median_total * (cur_n / median_frames)
+
+    model = normalize_cost_model(LEGACY_COST_MODEL)
+    priors: Dict[str, float] = {}
+    for name in LEGACY_STAGE_NAMES:
+        share = model.get(name, 0.0)
+        if share > 0.0:
+            priors[name] = median_total * share
+    return priors, 0
+
+
+def select_sds_priors(
+    records: Sequence[dict],
+    *,
+    stage_totals: Optional[Mapping[str, int]] = None,
+) -> Tuple[Dict[str, float], int]:
+    """Select SDS per-stage priors (v2 only; never v1, never cross-mode).
+
+    Only ``mode == "sds"`` v2 records contribute. Exact per-stage-total scaling
+    applies when both record and current totals are valid. Legacy v1 records are
+    NEVER used for SDS. First successful Qt SDS runs have no v2 records yet, so
+    they return ``({}, 0)`` and the GUI shows ``estimation en cours`` until live
+    evidence accrues, then writes a v2 SDS record for future runs.
+    """
+    return _select_v2_mode_priors(
+        records,
+        mode="sds",
+        names=SDS_STAGE_NAMES,
+        scale_by={},
+        stage_totals=stage_totals,
+    )
+
+
+def append_mode_history(
     record: dict,
     path: Optional[Path] = None,
 ) -> bool:
-    """Atomically append one v2 record, bounded, fail-open.
+    """Atomically append one v2 mode record, bounded, fail-open (generic).
 
     Existing records (v1 and v2) are preserved. The record count is capped to
     :data:`ETA_HISTORY_MAX_RECORDS` (oldest dropped). A UNIQUE same-directory
@@ -417,6 +730,74 @@ def append_zegrid_history(
                     tmp.unlink()
             except Exception:
                 pass
+
+
+def append_zegrid_history(
+    record: dict,
+    path: Optional[Path] = None,
+) -> bool:
+    """Backward-compatible ZeGrid history append (alias of the generic append)."""
+    return append_mode_history(record, path=path)
+
+
+def build_mode_history_record(
+    *,
+    mode: str,
+    total_duration_s: float,
+    stage_seconds: Mapping[str, float],
+    stage_totals: Optional[Mapping[str, int]] = None,
+    n_frames: Optional[int] = None,
+    cell_count: Optional[int] = None,
+    master_tiles: Optional[int] = None,
+    workers: Optional[int] = None,
+    backend: Optional[str] = None,
+) -> dict:
+    """Build a sanitized, compact v2 mode history record (generic).
+
+    Only numeric totals/durations, per-stage seconds/totals, and (optionally)
+    workload context + effective backend/worker concurrency are recorded — never
+    raw paths, frame names, or user data.
+    """
+    names = stage_names_for(mode)
+    rec: dict = {
+        "schema_v": 2,
+        "mode": mode,
+        "ts_utc": _utcnow_iso(),
+        "total_duration_s": round(float(total_duration_s), 3),
+        "stage_seconds": {
+            name: round(float(stage_seconds.get(name, 0.0)), 3)
+            for name in names
+        },
+    }
+    if n_frames is not None:
+        try:
+            rec["n_frames"] = int(n_frames)
+        except (TypeError, ValueError):
+            pass
+    if cell_count is not None:
+        try:
+            rec["cell_count"] = int(cell_count)
+        except (TypeError, ValueError):
+            pass
+    if master_tiles is not None:
+        try:
+            rec["master_tiles"] = int(master_tiles)
+        except (TypeError, ValueError):
+            pass
+    if stage_totals:
+        rec["stage_totals"] = {
+            name: int(stage_totals[name])
+            for name in names
+            if stage_totals.get(name) is not None
+        }
+    if workers is not None:
+        try:
+            rec["workers"] = int(workers)
+        except (TypeError, ValueError):
+            pass
+    if backend:
+        rec["backend"] = str(backend)
+    return rec
 
 
 def build_zegrid_history_record(
@@ -489,14 +870,18 @@ class _StageState:
 # ---------------------------------------------------------------------------
 
 class HybridEtaEstimator:
-    """Deterministic hybrid ETA estimator for one mode plan (ZeGrid).
+    """Deterministic hybrid ETA estimator for ONE mode plan (legacy|sds|zegrid).
 
-    Feed stable stage events with :meth:`on_stage`, let wall time advance with
-    :meth:`tick`, and finish with :meth:`mark_success` / :meth:`mark_fail` /
-    :meth:`mark_cancel`. Historical per-stage priors are injected via
-    :meth:`set_priors` (the caller uses :func:`select_zegrid_priors` to build
-    them). The injectable ``clock`` (default ``time.monotonic``) makes the
-    estimator fully deterministic in tests.
+    The estimator is PLAN-AGNOSTIC: it consumes STABLE stage events from any
+    :class:`ModePlan` (``LEGACY_PLAN`` / ``SDS_PLAN`` / ``ZEGRID_PLAN``) and
+    applies an INJECTED per-mode ETA fallback cost model (distinct from the R29
+    UI progress weights). Feed stable stage events with :meth:`on_stage`, let
+    wall time advance with :meth:`tick`, finish with :meth:`mark_success` /
+    :meth:`mark_fail` / :meth:`mark_cancel`, and export sanitized observed
+    stage timings with :meth:`export_observed_stage_seconds`. Historical
+    per-stage priors are injected via :meth:`set_priors` (the caller uses
+    :func:`select_mode_priors` to build them). The injectable ``clock`` (default
+    ``time.monotonic``) makes the estimator fully deterministic in tests.
     """
 
     def __init__(
@@ -515,8 +900,8 @@ class HybridEtaEstimator:
         display_floor_s: float = MIN_DISPLAY_FLOOR_S,
     ) -> None:
         self._plan = plan
-        self._cost_model: Dict[str, float] = dict(
-            cost_model if cost_model is not None else ZEGRID_COST_MODEL
+        self._cost_model: Dict[str, float] = normalize_cost_model(
+            cost_model if cost_model is not None else default_cost_model(plan)
         )
         self._clock = clock if clock is not None else time.monotonic
         self._min_rate_samples = int(min_rate_samples)
@@ -549,6 +934,7 @@ class HybridEtaEstimator:
         self._last_estimate_t: Optional[float] = None
         self._n_frames: Optional[int] = None
         self._cell_count: Optional[int] = None
+        self._master_tiles: Optional[int] = None
         self._workers: Optional[int] = None
         self._backend: Optional[str] = None
 
@@ -572,6 +958,7 @@ class HybridEtaEstimator:
         *,
         n_frames: Optional[int] = None,
         cell_count: Optional[int] = None,
+        master_tiles: Optional[int] = None,
         workers: Optional[int] = None,
         backend: Optional[str] = None,
     ) -> None:
@@ -580,6 +967,8 @@ class HybridEtaEstimator:
             self._n_frames = int(n_frames)
         if cell_count is not None:
             self._cell_count = int(cell_count)
+        if master_tiles is not None:
+            self._master_tiles = int(master_tiles)
         if workers is not None:
             self._workers = int(workers)
         if backend is not None:
@@ -722,6 +1111,32 @@ class HybridEtaEstimator:
         if self._terminal is None:
             self._terminal = "cancel"
         return self._terminal_result()
+
+    # -- success-only observation export ------------------------------------
+
+    def export_observed_stage_seconds(self) -> Dict[str, float]:
+        """Close active timing and return sanitized observed stage seconds.
+
+        Call at terminal success to export the per-stage wall durations the
+        estimator ACTUALLY observed (stages with a positive closed elapsed
+        duration), keyed by stable canonical stage id. This is the pure,
+        sanitized observation source for the GUI's success-only v2 history
+        record — no GUI private-state scraping. Stages never seen (no event, or
+        zero/unknown elapsed) are omitted. Safe to call repeatedly (idempotent).
+        """
+        now = self._clock()
+        # Close the ACTIVE stage too (position + 1 closes all <= active).
+        if self._active_stage is not None and self._active_position >= 0:
+            self._close_prior_stages(self._active_position + 1, now)
+        observed: Dict[str, float] = {}
+        for d in self._plan.stages:
+            st = self._stages.get(d.id)
+            if st is None:
+                continue
+            sec = st.elapsed_s
+            if sec is not None and math.isfinite(sec) and sec > 0.0:
+                observed[d.id] = float(sec)
+        return observed
 
     # -- estimate internals -------------------------------------------------
 
@@ -974,6 +1389,7 @@ class HybridEtaEstimator:
             "comparable_histories": self._comparable,
             "n_frames": self._n_frames,
             "cell_count": self._cell_count,
+            "master_tiles": self._master_tiles,
             "workers": self._workers,
             "backend": self._backend,
             "active_basis": self._last_active_basis,

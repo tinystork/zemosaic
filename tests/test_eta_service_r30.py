@@ -969,7 +969,10 @@ def test_legacy_sds_paths_not_redirected():
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "_update_stage_progress":
             seg = ast.get_source_segment(text, node)
-            assert "_update_eta_from_progress" in seg
+            # ZM-ETA-ALLMODES-R31: the legacy branch feeds the hybrid authority
+            # (never the percent-derived path). The percent-derived writer still
+            # exists but is guarded once the hybrid authority is active.
+            assert "_feed_legacy_eta" in seg
             break
     else:
         raise AssertionError("_update_stage_progress not found")

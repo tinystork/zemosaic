@@ -55,6 +55,8 @@ ZEGRID_PHASE_ASSEMBLY = "zegrid_phase_assembly"
 ZEGRID_PHASE_FINALIZE = "zegrid_phase_finalize"
 ZEGRID_PHASE_LABEL_FORMAT = "zegrid_phase_label_format"
 ETA_ESTIMATION_IN_PROGRESS = "eta_estimation_in_progress"
+# ZM-ETA-ALLMODES-R31: shared Roman phase label formatter for all modes.
+PHASE_LABEL_FORMAT = "phase_label_format"
 
 
 def roman_ordinal(position: int) -> str:
@@ -269,6 +271,36 @@ def plan_for_stage_id(stage_id: str) -> ModePlan:
     if str(stage_id or "").startswith("zegrid:"):
         return ZEGRID_PLAN
     return LEGACY_PLAN
+
+
+def legacy_phase_id_to_stage(phase_id: str) -> Optional[str]:
+    """Map a legacy ``PHASE_UPDATE:<id>`` id to a canonical stage id.
+
+    ``"1".."7"`` -> ``phase1..phase7``; ``"4.5"`` / ``"4_5"`` -> ``phase4_5``.
+    Returns ``None`` for unknown ids (caller keeps the safe raw fallback).
+    """
+    pid = str(phase_id or "").strip()
+    mapping = {
+        "1": "phase1", "2": "phase2", "3": "phase3", "4": "phase4",
+        "4.5": "phase4_5", "4_5": "phase4_5",
+        "5": "phase5", "6": "phase6", "7": "phase7",
+    }
+    return mapping.get(pid)
+
+
+def sds_phase_id_to_stage(phase_id: object) -> Optional[str]:
+    """Map an SDS numeric phase (``1..7``) to a canonical SDS stage id.
+
+    ``1..7`` -> ``sds_phase_1..sds_phase_7``. Returns ``None`` otherwise (the
+    caller keeps the safe raw fallback).
+    """
+    try:
+        n = int(str(phase_id or "").strip())
+    except (TypeError, ValueError):
+        return None
+    if 1 <= n <= 7:
+        return f"sds_phase_{n}"
+    return None
 
 
 # ---------------------------------------------------------------------------
