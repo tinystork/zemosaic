@@ -88,16 +88,25 @@ GPU_USAGE_NOTE = (
 
 
 class Timings:
-    """Accumulate wall-clock seconds per named phase (repeated samples sum)."""
+    """Accumulate wall-clock seconds per named phase (repeated samples sum).
+
+    ``subordinate=True`` marks a timing as a CHILD of another phase (e.g.
+    ``layout.footprints`` under ``layout``): it still appears in ``to_dict()``
+    (manifest + run-log listing) but is EXCLUDED from ``total()`` so the overall
+    run wall-clock is never double-counted by summing a phase and its children.
+    """
 
     def __init__(self) -> None:
         self._totals: dict[str, float] = {}
         self._order: list[str] = []
+        self._subordinate: set[str] = set()
 
-    def add(self, name: str, seconds: float) -> None:
+    def add(self, name: str, seconds: float, *, subordinate: bool = False) -> None:
         if name not in self._totals:
             self._order.append(name)
             self._totals[name] = 0.0
+        if subordinate:
+            self._subordinate.add(name)
         self._totals[name] += float(seconds)
 
     @contextmanager
@@ -112,7 +121,10 @@ class Timings:
         return self._totals.get(name, 0.0)
 
     def total(self) -> float:
-        return float(sum(self._totals.values()))
+        return float(sum(
+            sec for name, sec in self._totals.items()
+            if name not in self._subordinate
+        ))
 
     def to_dict(self) -> dict:
         return {name: round(self._totals[name], 6) for name in self._order}

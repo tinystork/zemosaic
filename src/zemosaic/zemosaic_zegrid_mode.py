@@ -734,6 +734,8 @@ def _choose_layout_mode_aware(
     halo_px=zsw.HALO_PX,
     pinned_layout=None,
     emit=None,
+    log_line=None,
+    observer=None,
 ):
     """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
 
@@ -749,21 +751,54 @@ def _choose_layout_mode_aware(
     ``emit`` (optional) is ``callable(message, lvl="INFO")``: when supplied, the
     scan is EXPLAINED live (ZM-ZEGRID-R14) — each candidate ``(nx, ny)``, why it
     was rejected (which floor / which bound), and the final chosen layout.
+
+    ``log_line`` (optional, ZM-ZEGRID-R27) is ``callable(line)`` that appends one
+    line to the incremental run log; candidate ACCEPTED/REJECTED and CHOSEN
+    messages are routed here too (durably logged, not only the logger/GUI).
+
+    ``observer`` (optional, ZM-ZEGRID-R27) is a :class:`SubstepReporter` that
+    brackets the footprint-preparation and candidate-scan sub-steps with
+    throttled progress counters + per-sub-step elapsed timings. ``None`` (default)
+    keeps the exact previous behaviour (no observer, no progress callbacks).
     """
 
     def _log(msg, lvl="INFO"):
-        if emit is None:
-            return
-        try:
-            emit(msg, lvl)
-        except Exception:
-            pass
+        if emit is not None:
+            try:
+                emit(msg, lvl)
+            except Exception:
+                pass
+        if log_line is not None:
+            try:
+                log_line(msg)
+            except Exception:
+                pass
 
     floors = floors or zal.ScientificFloors()
-    mw, mh = zal.median_projected_footprint(frames, canvas)
+    n_frames = len(frames)
+    if observer is not None:
+        observer.start(
+            zobs.LAYOUT_SUBSTEP_FOOTPRINTS,
+            "WCS footprints / layout inputs",
+            total=2 * n_frames,
+        )
+
+    def _fp_progress(pass_offset):
+        def cb(done, total, item_id):
+            if observer is not None:
+                observer.progress(
+                    pass_offset + int(done), item_id=item_id, total=2 * n_frames
+                )
+        return cb
+
+    mw, mh = zal.median_projected_footprint(frames, canvas, progress=_fp_progress(0))
     if not (mw > 0 and mh > 0):
+        if observer is not None:
+            observer.end()
         raise zal.LayoutInfeasible("median projected footprint is degenerate")
-    footprints = zal._footprints(frames, canvas)
+    footprints = zal._footprints(frames, canvas, progress=_fp_progress(n_frames))
+    if observer is not None:
+        observer.end()
 
     if pinned_layout is not None:
         nx, ny = int(pinned_layout[0]), int(pinned_layout[1])
@@ -825,6 +860,12 @@ def _choose_layout_mode_aware(
             },
         }
 
+    if observer is not None:
+        observer.start(
+            zobs.LAYOUT_SUBSTEP_CANDIDATES,
+            "candidate grid scan",
+            total=None,  # candidate count is not known up-front; never fabricate
+        )
     candidates = []
     seen = set()
     for factor in zal.REFINEMENT_FACTORS:
@@ -881,6 +922,9 @@ def _choose_layout_mode_aware(
             chosen = cand
             chosen_index = i
             break
+
+    if observer is not None:
+        observer.end()
 
     if chosen is None:
         finest = candidates[-1] if candidates else None
@@ -1606,17 +1650,39 @@ def _run_single(
     available = available_memory_bytes()
     _layout_rep = _reporter()
     _layout_rep.start("layout")
+    # ZM-ZEGRID-R27: layout sub-step observability — a bounded, throttled reporter
+    # for the three stable layout sub-steps (footprints, candidate scan, chosen
+    # cells). It emits ONLY log/durable-detail events (never GUI stage/percent),
+    # so the current GUI cannot misinterpret a sub-step as a global phase.
+    layout_substep = zobs.SubstepReporter(_emit_live, log_line=_log_line)
     with timings.timed("layout"):
         layout = _choose_layout_mode_aware(
             canvas, descs, ram_budget=available, available_bytes=available,
             tile_size=STREAM_TILE_SIZE, pinned_layout=pinned_layout,
-            emit=_emit_live,
+            emit=_emit_live, log_line=_log_line, observer=layout_substep,
         )
         nx, ny = layout["nx"], layout["ny"]
+        cell_total = nx * ny
+        # Chosen-cell membership/context preparation — the final
+        # ``build_cell_context`` pass (previously a silent 170-cell loop).
+        layout_substep.start(
+            zobs.LAYOUT_SUBSTEP_CHOSEN_CELLS,
+            "chosen-cell membership/context preparation",
+            total=cell_total,
+        )
         cell_ctxs = []
+        done = 0
         for row, col, _bounds in zg.build_layout(canvas, nx, ny).iter_cells(canvas):
             cell, patch, mem = zsw.build_cell_context(descs, canvas, row, col, nx, ny)
             cell_ctxs.append((row, col, cell, patch, mem))
+            done += 1
+            layout_substep.progress(done, item_id=cell.cell_id, total=cell_total)
+        layout_substep.end()
+    # Record the layout sub-step timings as SUBORDINATE to the layout phase (they
+    # appear in the manifest/run-log but never become new top-level phases for the
+    # global ETA).
+    for sub_id, sec in layout_substep.timings().items():
+        timings.add(sub_id, sec, subordinate=True)
     _layout_rep.end(
         throughput=_fmt_throughput(nx * ny, timings.get("layout"), "cells/s")
     )

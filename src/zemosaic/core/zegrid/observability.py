@@ -13,6 +13,9 @@ Provides:
 * :class:`PhaseReporter` — START/END lines + throttled intra-phase progress with
                           percent, current item id, per-phase ETA and global ETA,
                           plus a breadcrumb-stage callback.
+* :class:`SubstepReporter` — nested sub-step progress + timing (throttled
+                          counters, no GUI stage/percent), used by the layout
+                          phase's three stable sub-steps.
 * :func:`format_eta`     — human-readable ETA (``n/a yet`` for ``None``).
 
 Cadence contract: intra-phase progress is emitted at most every
@@ -35,6 +38,15 @@ DEFAULT_PROGRESS_INTERVAL_S = 2.0
 DEFAULT_ETA_MIN_SAMPLES = 2
 # Recent-window size (samples) for the per-phase ETA rate estimate (I1).
 DEFAULT_ETA_WINDOW_SAMPLES = 6
+
+# Stable layout SUB-STEP ids (ZM-ZEGRID-R27). Separated from the human-readable
+# display text and from counters/items — the ids never embed counters (unlike the
+# legacy ``zegrid:<phase>:<done>/<total>`` stage string). They double as the
+# subordinate TIMING names: the ``layout:`` prefix marks each as a child of the
+# top-level ``layout`` phase (never a new top-level phase for the global ETA).
+LAYOUT_SUBSTEP_FOOTPRINTS = "layout:footprints"
+LAYOUT_SUBSTEP_CANDIDATES = "layout:candidates"
+LAYOUT_SUBSTEP_CHOSEN_CELLS = "layout:chosen_cells"
 
 
 # ---------------------------------------------------------------------------
@@ -297,3 +309,120 @@ class PhaseReporter:
             self.stage(stage_str, int(current), int(total))
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Sub-step reporter (ZM-ZEGRID-R27)
+# ---------------------------------------------------------------------------
+
+class SubstepReporter:
+    """Bounded, throttled progress + timing for a nested SUB-STEP of a phase.
+
+    Unlike :class:`PhaseReporter` (which drives the enclosing phase's
+    ``stage``/GUI progress), this emits only log/durable-detail events — it never
+    emits STAGE_PROGRESS percentages or stage ids — so the current GUI cannot
+    misinterpret a layout sub-step as a global phase.
+
+    Contracts:
+
+    * The STABLE ``substep_id`` is separated from the human-readable display text
+      and from counters/items; the id NEVER embeds counters (unlike the legacy
+      ``zegrid:<phase>:<done>/<total>`` stage string).
+    * Progress counters are throttled (``interval_s`` plus always the FIRST and
+      the FINAL sample). When ``total`` is unknown (``None``) no percent/total is
+      fabricated — only the completed count is emitted.
+    * ``emit`` / ``log_line`` failures are swallowed: observability must never
+      change or abort science.
+    * The clock is injectable for deterministic tests.
+    """
+
+    def __init__(
+        self,
+        emit: Callable[[str, str], None],
+        *,
+        log_line: Optional[Callable[[str], None]] = None,
+        clock: Optional[Callable[[], float]] = None,
+        interval_s: float = DEFAULT_PROGRESS_INTERVAL_S,
+    ) -> None:
+        self._emit = emit
+        self._log_line = log_line
+        self._clock = clock if clock is not None else time.perf_counter
+        self._interval_s = float(interval_s)
+        self._id: Optional[str] = None
+        self._t0: Optional[float] = None
+        self._last_report: Optional[tuple[float, int]] = None
+        self._elapsed: dict[str, float] = {}
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def start(self, substep_id: str, display: str, *, total: Optional[int] = None) -> None:
+        self._id = str(substep_id)
+        self._t0 = self._clock()
+        self._last_report = None
+        total_s = f" (total={int(total)})" if total is not None else ""
+        self._out(f"substep START: {self._id} — {display}{total_s}")
+
+    def progress(
+        self,
+        done: int,
+        *,
+        item_id: Optional[str] = None,
+        total: Optional[int] = None,
+        force: bool = False,
+    ) -> None:
+        """Report throttled intra-sub-step progress (first + final always emitted).
+
+        When ``total`` is ``None`` or ``<= 0``, only the completed count is emitted
+        — no fabricated percent/total (used for the candidate scan, whose total
+        candidate count is not known up-front).
+        """
+        if self._t0 is None:
+            return
+        done = int(done)
+        now = self._clock()
+        is_final = total is not None and int(total) > 0 and done >= int(total)
+        if not force and not is_final and self._last_report is not None:
+            if (now - self._last_report[0]) < self._interval_s:
+                return
+        self._last_report = (now, done)
+        if total is not None and int(total) > 0:
+            msg = (
+                f"substep PROGRESS: {self._id} {done}/{int(total)} "
+                f"({100.0 * done / int(total):.1f}%)"
+            )
+        else:
+            msg = f"substep PROGRESS: {self._id} done={done}"
+        if item_id is not None:
+            msg += f" item={item_id}"
+        self._out(msg)
+
+    def end(self) -> float:
+        """Emit the END line with elapsed; record + return the elapsed seconds."""
+        if self._t0 is None:
+            return 0.0
+        elapsed = self._clock() - self._t0
+        self._elapsed[self._id] = float(elapsed)
+        self._out(f"substep END: {self._id} elapsed={elapsed:.3f}s")
+        self._t0 = None
+        return float(elapsed)
+
+    def timings(self) -> dict[str, float]:
+        """Return ``{substep_id: elapsed_s}`` recorded by ``end()``.
+
+        Intended to be recorded as SUBORDINATE timings under the enclosing phase
+        (the caller adds them to the run's ``Timings`` with a subordinate flag).
+        """
+        return dict(self._elapsed)
+
+    # -- internals ----------------------------------------------------------
+
+    def _out(self, msg: str) -> None:
+        try:
+            self._emit(msg, "INFO")
+        except Exception:
+            pass
+        if self._log_line is not None:
+            try:
+                self._log_line(msg)
+            except Exception:
+                pass

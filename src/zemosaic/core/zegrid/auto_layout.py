@@ -69,7 +69,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
@@ -297,22 +297,35 @@ REFINEMENT_FACTORS = (
 
 
 def median_projected_footprint(
-    frames: Sequence[zg.FrameDescriptor], canvas: zg.GlobalCanvas
+    frames: Sequence[zg.FrameDescriptor],
+    canvas: zg.GlobalCanvas,
+    progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> tuple[float, float]:
     """Median projected source bbox ``(width, height)`` in canvas pixels.
 
     Projects each frame's pixel boundary onto the canvas WCS and takes the
     median bbox width/height (same notion as R0's "median projected source
     bbox"). Deterministic: sorts frames by FrameId first.
+
+    ``progress`` (optional, ZM-ZEGRID-R27) is ``callable(done, total, item_id)``
+    invoked after each frame's projection; ``None`` (default) keeps the exact
+    previous behaviour. Callback failures are swallowed (never abort science).
     """
     canvas_wcs = canvas.wcs()
     widths: list[float] = []
     heights: list[float] = []
-    for f in sorted(frames, key=lambda f: f.frame_id):
+    frames_sorted = sorted(frames, key=lambda f: f.frame_id)
+    n = len(frames_sorted)
+    for idx, f in enumerate(frames_sorted, 1):
         poly = zg._source_polygon(f.shape_hw, f.wcs(), canvas_wcs)
         minx, miny, maxx, maxy = poly.bounds
         widths.append(maxx - minx)
         heights.append(maxy - miny)
+        if progress is not None:
+            try:
+                progress(idx, n, f.frame_id.logical_path)
+            except Exception:
+                pass
     if not widths:
         raise ValueError("no frames for footprint estimation")
     return float(np.median(widths)), float(np.median(heights))
@@ -352,12 +365,28 @@ def _nominal_geometry(canvas: zg.GlobalCanvas, nx: int, ny: int, halo_px: int) -
     }
 
 
-def _footprints(frames: Sequence[zg.FrameDescriptor], canvas: zg.GlobalCanvas):
-    """Project every frame footprint once; return (frame, polygon) sorted by id."""
+def _footprints(
+    frames: Sequence[zg.FrameDescriptor],
+    canvas: zg.GlobalCanvas,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+):
+    """Project every frame footprint once; return (frame, polygon) sorted by id.
+
+    ``progress`` (optional, ZM-ZEGRID-R27) is ``callable(done, total, item_id)``
+    invoked after each frame's projection; ``None`` (default) keeps the exact
+    previous behaviour. Callback failures are swallowed (never abort science).
+    """
     canvas_wcs = canvas.wcs()
     out = []
-    for f in sorted(frames, key=lambda f: f.frame_id):
+    frames_sorted = sorted(frames, key=lambda f: f.frame_id)
+    n = len(frames_sorted)
+    for idx, f in enumerate(frames_sorted, 1):
         out.append((f, zg._source_polygon(f.shape_hw, f.wcs(), canvas_wcs)))
+        if progress is not None:
+            try:
+                progress(idx, n, f.frame_id.logical_path)
+            except Exception:
+                pass
     return out
 
 
