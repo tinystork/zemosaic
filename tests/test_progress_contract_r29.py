@@ -428,3 +428,137 @@ def test_finalize_seam_ordering_writes_before_completion():
     assert marks["write_outputs"] < marks["write_run_log"]
     assert marks["write_run_log"] < marks["finalize_end"]
     assert marks["finalize_end"] < marks["success_emit"]
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 F2 — terminal stickiness (all directions)
+# ---------------------------------------------------------------------------
+
+def test_terminal_fail_then_success_stays_fail_below_100():
+    agg = z.ProgressAggregator(z.ZEGRID_PLAN)
+    agg.on_stage("zegrid:setup", 100, 100)
+    agg.mark_fail()
+    agg.mark_success()
+    assert agg.terminal == "fail"
+    assert agg.global_percent < 100.0
+
+
+def test_terminal_cancel_then_success_stays_cancel_below_100():
+    agg = z.ProgressAggregator(z.ZEGRID_PLAN)
+    agg.on_stage("zegrid:setup", 100, 100)
+    agg.mark_cancel()
+    agg.mark_success()
+    assert agg.terminal == "cancel"
+    assert agg.global_percent < 100.0
+
+
+def test_terminal_success_then_fail_stays_success_100():
+    agg = z.ProgressAggregator(z.ZEGRID_PLAN)
+    agg.mark_success()
+    agg.mark_fail()
+    assert agg.terminal == "success"
+    assert agg.global_percent == 100.0
+
+
+def test_terminal_success_then_cancel_stays_success_100():
+    agg = z.ProgressAggregator(z.ZEGRID_PLAN)
+    agg.mark_success()
+    agg.mark_cancel()
+    assert agg.terminal == "success"
+    assert agg.global_percent == 100.0
+
+
+def test_terminal_repeated_calls_are_idempotent():
+    agg = z.ProgressAggregator(z.ZEGRID_PLAN)
+    agg.mark_fail()
+    agg.mark_fail()
+    assert agg.terminal == "fail"
+    assert agg.global_percent < 100.0
+    agg2 = z.ProgressAggregator(z.ZEGRID_PLAN)
+    agg2.mark_success()
+    agg2.mark_success()
+    assert agg2.terminal == "success"
+    assert agg2.global_percent == 100.0
+
+
+def test_success_from_nonterminal_only_reaches_100():
+    agg = z.ProgressAggregator(z.ZEGRID_PLAN)
+    assert agg.terminal is None
+    agg.mark_success()
+    assert agg.terminal == "success"
+    assert agg.global_percent == 100.0
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 F1 — honest V/VI locale wording (JSON validity + wording)
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def test_f1_phase_v_assembly_only_phase_vi_explicit_finalize():
+    for lang, v, vi in (
+        ("en", "Assembly", "Finishing, export and finalization"),
+        ("fr", "Assemblage", "Finition, export et finalisation"),
+    ):
+        path = SRC / "locales" / f"{lang}.json"
+        data = _json.loads(path.read_text(encoding="utf-8"))
+        assert data["zegrid_phase_assembly"] == v
+        assert data["zegrid_phase_finalize"] == vi
+        # Phase V must no longer claim finishing (which runs in VI).
+        assert "finish" not in data["zegrid_phase_assembly"].lower()
+        assert "finiti" not in data["zegrid_phase_assembly"].lower()
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 F3 — static GUI seam checks (no Qt import)
+# ---------------------------------------------------------------------------
+
+def _method_src(name: str) -> str:
+    path = SRC / "zemosaic_gui_qt.py"
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            seg = ast.get_source_segment(text, node)
+            assert seg is not None, f"no source segment for {name}"
+            return seg
+    raise AssertionError(f"method {name!r} not found in zemosaic_gui_qt.py")
+
+
+def test_f3_stats_updated_eta_seconds_is_zegrid_guarded():
+    src = _method_src("_on_worker_stats_updated")
+    # The legacy worker eta_seconds write is guarded by _zegrid_active.
+    assert "if self._zegrid_active:" in src
+    # And it clears the stale countdown state (never leaves it armed).
+    assert "self._last_eta_seconds_value = None" in src
+    assert "self._last_eta_seconds_update_mono = None" in src
+
+
+def test_f3_worker_eta_updated_is_zegrid_guarded():
+    src = _method_src("_on_worker_eta_updated")
+    assert "if self._zegrid_active:" in src
+    # CPU helper override is not armed for ZeGrid; stale state is cleared.
+    assert "self._cpu_eta_override_deadline = None" in src
+    assert "self._last_eta_seconds_value = None" in src
+
+
+def test_f3_elapsed_timer_tick_is_zegrid_guarded():
+    src = _method_src("_on_elapsed_timer_tick")
+    assert "if self._zegrid_active:" in src
+
+
+def test_f3_finished_success_resets_zegrid_eta_to_zero():
+    src = _method_src("_on_worker_finished")
+    assert "self._zegrid_active" in src
+    # On ZeGrid terminal success the ETA display resolves to 00:00:00.
+    assert '"00:00:00"' in src
+    # On cancel/fail it uses the neutral placeholder, never 00:00:00 for failure.
+    assert "initial_eta_value" in src
+
+
+def test_f3_reset_clears_eta_countdown_state():
+    src = _method_src("_reset_progress_tracking")
+    assert "self._zegrid_active = False" in src
+    assert "self._last_eta_seconds_value = None" in src
+    assert "self._last_eta_seconds_update_mono = None" in src

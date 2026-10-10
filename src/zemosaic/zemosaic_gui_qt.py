@@ -5240,6 +5240,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_global_progress = 0.0
         self._eta_seconds_smoothed = None
         self._cpu_eta_override_deadline = None
+        # ZM-PROGRESS-CONTRACT-R29 F3: clear the ETA countdown state so a stale
+        # legacy ETA cannot reappear between runs.
+        self._last_eta_seconds_value = None
+        self._last_eta_seconds_update_mono = None
         self._weighted_progress_active = False
         self._sds_progress_active = False
         self._sds_current_phase_index = 0
@@ -5710,13 +5714,20 @@ class ZeMosaicQtMainWindow(QMainWindow):
         neutral_eta = self._update_sds_eta_placeholder(current_phase_idx)
         if isinstance(eta_seconds, (int, float)) and eta_seconds >= 0 and not neutral_eta:
             eta_text = format_eta_hms(eta_seconds)
-            self._last_eta_seconds_value = float(eta_seconds)
-            self._last_eta_seconds_update_mono = time.monotonic()
-            if sds_active and not self._sds_completed:
-                self._sds_last_eta_str = eta_text
-                self._set_eta_display(eta_text)
-            elif not sds_active:
-                self._set_eta_display(eta_text)
+            if self._zegrid_active:
+                # ZM-PROGRESS-CONTRACT-R29 F3: ZeGrid shows 'estimation en cours';
+                # the legacy worker eta_seconds must not overwrite it. Clear the
+                # stale countdown state so it cannot reappear.
+                self._last_eta_seconds_value = None
+                self._last_eta_seconds_update_mono = None
+            else:
+                self._last_eta_seconds_value = float(eta_seconds)
+                self._last_eta_seconds_update_mono = time.monotonic()
+                if sds_active and not self._sds_completed:
+                    self._sds_last_eta_str = eta_text
+                    self._set_eta_display(eta_text)
+                elif not sds_active:
+                    self._set_eta_display(eta_text)
 
         cpu_percent = payload.get("cpu_percent")
         ram_used_mb = payload.get("ram_used_mb")
@@ -5746,6 +5757,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _on_worker_eta_updated(self, eta_text: str) -> None:
         if not isinstance(eta_text, str):
+            return
+        # ZM-PROGRESS-CONTRACT-R29 F3: while ZeGrid is active, the textual ETA
+        # update must not overwrite 'estimation en cours' (and no CPU helper
+        # override may be armed). Clear stale countdown state instead.
+        if self._zegrid_active:
+            self._cpu_eta_override_deadline = None
+            self._last_eta_seconds_value = None
+            self._last_eta_seconds_update_mono = None
             return
         # Prefer structured ETA from STATS_UPDATE when available recently.
         # This avoids regressions to phase-local textual ETA pulses.
@@ -5897,6 +5916,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             # ZM-PROGRESS-CONTRACT-R29: a cancel never reaches 100%.
             if self._progress_agg is not None:
                 self._progress_agg.mark_cancel()
+            # ZM-PROGRESS-CONTRACT-R29 F3: a ZeGrid cancel must not retain a
+            # deceptive active countdown; use the neutral placeholder (never
+            # 00:00:00, which would imply successful completion).
+            if self._zegrid_active:
+                self._set_eta_display(self._tr("initial_eta_value", "--:--:--"), force=True)
             return
 
         if success:
@@ -5911,6 +5935,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     self._progress_agg.mark_success()
                     self.progress_bar.setValue(int(self._progress_agg.global_percent))
                     self._last_global_progress = float(self._progress_agg.global_percent)
+                # ZM-PROGRESS-CONTRACT-R29 F3: ZeGrid terminal success resolves the
+                # ETA display to 00:00:00 (never a stale countdown).
+                if self._zegrid_active:
+                    self._eta_seconds_smoothed = 0.0
+                    self._set_eta_display("00:00:00", force=True)
             completion_message = self._tr(
                 "qt_log_processing_completed", "Processing completed successfully."
             )
@@ -5980,6 +6009,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # ZM-PROGRESS-CONTRACT-R29: a failed run never reaches 100%.
         if self._progress_agg is not None:
             self._progress_agg.mark_fail()
+        # ZM-PROGRESS-CONTRACT-R29 F3: a ZeGrid failure must not retain a
+        # deceptive active countdown; use the neutral placeholder (never
+        # 00:00:00, which would imply successful completion).
+        if self._zegrid_active:
+            self._set_eta_display(self._tr("initial_eta_value", "--:--:--"), force=True)
         if self.isVisible():
             QMessageBox.warning(
                 self,
@@ -5996,6 +6030,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         elapsed_h, remainder = divmod(int(elapsed + 0.5), 3600)
         elapsed_m, elapsed_s = divmod(remainder, 60)
         self.elapsed_value_label.setText(f"{elapsed_h:02d}:{elapsed_m:02d}:{elapsed_s:02d}")
+
+        # ZM-PROGRESS-CONTRACT-R29 F3: while ZeGrid is active, the ETA display
+        # shows 'estimation en cours'; the elapsed-timer countdown must not
+        # overwrite it with a stale legacy ETA. Elapsed time still updates above.
+        if self._zegrid_active:
+            return
 
         # Keep ETA as a visible countdown between worker updates.
         if self._is_eta_override_active():

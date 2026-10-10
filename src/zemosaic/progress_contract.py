@@ -388,8 +388,12 @@ class ProgressAggregator:
         return self._result_for(desc, normalized)
 
     def mark_success(self) -> StageResult:
-        self._terminal = "success"
-        self._global_pct = 100.0
+        # ZM-PROGRESS-CONTRACT-R29 F2: a terminal state is immutable. Once
+        # fail/cancel is set, success must NOT override it (never reach 100 from
+        # a nonterminal state). Only success from a nonterminal state reaches 100.
+        if self._terminal is None:
+            self._terminal = "success"
+            self._global_pct = 100.0
         return self._terminal_result()
 
     def mark_fail(self) -> StageResult:
