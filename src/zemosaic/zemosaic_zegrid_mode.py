@@ -736,6 +736,7 @@ def _choose_layout_mode_aware(
     emit=None,
     log_line=None,
     observer=None,
+    footprints_out=None,
 ):
     """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
 
@@ -760,6 +761,14 @@ def _choose_layout_mode_aware(
     brackets the footprint-preparation and candidate-scan sub-steps with
     throttled progress counters + per-sub-step elapsed timings. ``None`` (default)
     keeps the exact previous behaviour (no observer, no progress callbacks).
+
+    ``footprints_out`` (optional, ZM-ZEGRID-R28) is a mutable list that, when
+    supplied, receives the run-local
+    :class:`auto_layout.ProjectedFootprints` artifact (the exact
+    once-projected polygons + median). It is an INTERNAL seam so the caller can
+    build the final chosen-cell contexts from the SAME polygons without
+    re-projecting WCS. The artifact is never placed in the returned public
+    layout dict. ``None`` (default) keeps the exact previous behaviour.
     """
 
     def _log(msg, lvl="INFO"):
@@ -780,25 +789,29 @@ def _choose_layout_mode_aware(
         observer.start(
             zobs.LAYOUT_SUBSTEP_FOOTPRINTS,
             "WCS footprints / layout inputs",
-            total=2 * n_frames,
+            total=n_frames,  # ZM-ZEGRID-R28: ONE exact projection pass (was 2*N)
         )
 
-    def _fp_progress(pass_offset):
+    def _fp_progress():
         def cb(done, total, item_id):
             if observer is not None:
-                observer.progress(
-                    pass_offset + int(done), item_id=item_id, total=2 * n_frames
-                )
+                observer.progress(int(done), item_id=item_id, total=n_frames)
         return cb
 
-    mw, mh = zal.median_projected_footprint(frames, canvas, progress=_fp_progress(0))
+    # ZM-ZEGRID-R28: project each frame footprint EXACTLY ONCE and derive the
+    # median width/height from those SAME polygons (no second projection pass).
+    footprints = zal.project_footprints(frames, canvas, progress=_fp_progress())
+    mw, mh = footprints.median_w, footprints.median_h
     if not (mw > 0 and mh > 0):
         if observer is not None:
             observer.end()
         raise zal.LayoutInfeasible("median projected footprint is degenerate")
-    footprints = zal._footprints(frames, canvas, progress=_fp_progress(n_frames))
     if observer is not None:
         observer.end()
+    if footprints_out is not None:
+        # Private artifact channel: the caller reuses these exact polygons for
+        # the final chosen-cell memberships (never placed in the returned dict).
+        footprints_out.append(footprints)
 
     if pinned_layout is not None:
         nx, ny = int(pinned_layout[0]), int(pinned_layout[1])
@@ -914,6 +927,13 @@ def _choose_layout_mode_aware(
             "bound": worst["cheaper_bound_bytes"], "worst_cell": worst,
             "memory_ok": memory_ok, "geom": geom,
         })
+        if memory_ok:
+            # ZM-ZEGRID-R28: the returned choice is the FIRST floor-feasible +
+            # memory-admissible candidate (see the chosen loop below). Stop the
+            # production scan here rather than evaluating finer candidates that
+            # are never used. Prior rejected candidates are already in ``candidates``
+            # so ``budget_bound_choice`` and the no-fit error remain exact.
+            break
 
     chosen = None
     chosen_index = None
@@ -1552,6 +1572,37 @@ def _write_run_log(
     return text
 
 
+def _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep=None):
+    """Build the final chosen-cell contexts from the cached footprints (R28).
+
+    Brackets the work with the ``layout:chosen_cells`` sub-step (START + throttled
+    progress + END) and returns ``[(row, col, cell, patch, mem), ...]`` in
+    row-major order. ``layout_substep`` is a :class:`SubstepReporter` (or ``None``
+    to skip observability). This is the production seam for the chosen-cell
+    membership/context preparation (no per-cell WCS re-projection — it reuses the
+    once-projected footprint set).
+    """
+    cell_total = nx * ny
+    if layout_substep is not None:
+        layout_substep.start(
+            zobs.LAYOUT_SUBSTEP_CHOSEN_CELLS,
+            "chosen-cell membership/context preparation",
+            total=cell_total,
+        )
+    cell_ctxs = []
+    done = 0
+    for row, col, cell, patch, mem in zsw.build_cell_contexts_from_footprints(
+        footprints, canvas, nx, ny
+    ):
+        cell_ctxs.append((row, col, cell, patch, mem))
+        done += 1
+        if layout_substep is not None:
+            layout_substep.progress(done, item_id=cell.cell_id, total=cell_total)
+    if layout_substep is not None:
+        layout_substep.end()
+    return cell_ctxs
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -1656,28 +1707,21 @@ def _run_single(
     # so the current GUI cannot misinterpret a sub-step as a global phase.
     layout_substep = zobs.SubstepReporter(_emit_live, log_line=_log_line)
     with timings.timed("layout"):
+        footprints_out = []
         layout = _choose_layout_mode_aware(
             canvas, descs, ram_budget=available, available_bytes=available,
             tile_size=STREAM_TILE_SIZE, pinned_layout=pinned_layout,
             emit=_emit_live, log_line=_log_line, observer=layout_substep,
+            footprints_out=footprints_out,
         )
+        # ZM-ZEGRID-R28: reuse the once-projected footprint set for the final
+        # chosen-cell memberships (no per-cell WCS re-projection).
+        footprints = footprints_out[0] if footprints_out else None
         nx, ny = layout["nx"], layout["ny"]
-        cell_total = nx * ny
         # Chosen-cell membership/context preparation — the final
-        # ``build_cell_context`` pass (previously a silent 170-cell loop).
-        layout_substep.start(
-            zobs.LAYOUT_SUBSTEP_CHOSEN_CELLS,
-            "chosen-cell membership/context preparation",
-            total=cell_total,
-        )
-        cell_ctxs = []
-        done = 0
-        for row, col, _bounds in zg.build_layout(canvas, nx, ny).iter_cells(canvas):
-            cell, patch, mem = zsw.build_cell_context(descs, canvas, row, col, nx, ny)
-            cell_ctxs.append((row, col, cell, patch, mem))
-            done += 1
-            layout_substep.progress(done, item_id=cell.cell_id, total=cell_total)
-        layout_substep.end()
+        # ``build_cell_context`` pass (previously a silent 170-cell loop that
+        # re-projected every frame's WCS for every cell).
+        cell_ctxs = _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep)
     # Record the layout sub-step timings as SUBORDINATE to the layout phase (they
     # appear in the manifest/run-log but never become new top-level phases for the
     # global ETA).

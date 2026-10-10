@@ -44,6 +44,7 @@ from .geometry import (
     build_patch,
     cell_id,
     compute_membership,
+    compute_membership_from_polygons,
     plan_source_roi,
 )
 
@@ -222,6 +223,37 @@ def build_cell_context(
     patch = build_patch(canvas, cell, halo_px)
     mem = compute_membership(frames, canvas, cell, patch)
     return cell, patch, mem
+
+
+def build_cell_contexts_from_footprints(
+    footprints,
+    canvas: GlobalCanvas,
+    nx: int = NX,
+    ny: int = NY,
+    halo_px: int = HALO_PX,
+):
+    """Build every chosen-layout ``(row, col, cell, patch, membership)`` reusing
+    the once-projected footprint set (ZM-ZEGRID-R28) — NO WCS re-projection.
+
+    Equivalent to :func:`build_cell_context` for each cell in the same row-major
+    order, but computes core/patch membership from the already-projected,
+    FrameId-sorted polygons via :func:`geometry.compute_membership_from_polygons`
+    (the EXACT ``poly.intersection(rect).area > INTERSECTION_AREA_EPS``
+    predicate). Reuses ONE built layout object rather than rebuilding it per
+    cell. ``footprints`` is a :class:`auto_layout.ProjectedFootprints` artifact
+    (exposes ``.frames`` and ``.polygons`` aligned + sorted by FrameId).
+    """
+    layout = build_layout(canvas, nx, ny)
+    frames = footprints.frames
+    polygons = footprints.polygons
+    out = []
+    for row, col, bounds in layout.iter_cells(canvas):
+        cid = cell_id(row, col)
+        cell = ZeGridCell(cid, canvas.canvas_id, layout.layout_id, row, col, bounds)
+        patch = build_patch(canvas, cell, halo_px)
+        mem = compute_membership_from_polygons(frames, polygons, canvas, cell, patch)
+        out.append((row, col, cell, patch, mem))
+    return out
 
 
 @dataclass

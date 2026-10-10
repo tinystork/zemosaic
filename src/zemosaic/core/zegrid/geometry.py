@@ -662,6 +662,39 @@ def compute_membership(
     )
 
 
+def compute_membership_from_polygons(
+    frames: Sequence[FrameDescriptor],
+    polygons: Sequence,
+    canvas: GlobalCanvas,
+    cell: ZeGridCell,
+    patch: ProcessingPatch,
+) -> CellMembership:
+    """Exact core/patch membership from ALREADY-projected footprints.
+
+    ZM-ZEGRID-R28: the SAME narrow-phase decision predicate as
+    :func:`compute_membership` (``poly.intersection(rect).area >
+    INTERSECTION_AREA_EPS`` for both core and patch) but consuming the
+    once-projected, FrameId-sorted ``polygons`` instead of re-projecting each
+    frame's WCS. ``frames`` and ``polygons`` must be aligned and sorted by
+    FrameId (as produced by the run-local footprint projection). No bbox-only
+    approximation; the exact polygon intersection is the decision.
+    """
+    core_rect = _rect(cell.core)
+    patch_rect = _rect(patch.patch)
+    core_ids: list[str] = []
+    patch_ids: list[str] = []
+    for f, poly in zip(frames, polygons):
+        if poly.intersection(core_rect).area > INTERSECTION_AREA_EPS:
+            core_ids.append(f.frame_id.logical_path)
+        if poly.intersection(patch_rect).area > INTERSECTION_AREA_EPS:
+            patch_ids.append(f.frame_id.logical_path)
+    return CellMembership(
+        cell_id=cell.cell_id,
+        core_ids=tuple(core_ids),
+        patch_ids=tuple(patch_ids),
+    )
+
+
 @dataclass(frozen=True)
 class SourceCropPlan:
     """Conservative source read rectangle for one frame -> one patch."""

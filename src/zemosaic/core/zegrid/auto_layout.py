@@ -390,6 +390,79 @@ def _footprints(
     return out
 
 
+@dataclass(frozen=True)
+class ProjectedFootprints:
+    """Run-local exact projected footprint set (ZM-ZEGRID-R28, private artifact).
+
+    Holds the exact Shapely polygons projected ONCE per layout run (sorted by
+    FrameId) plus the derived median projected width/height. The candidate scan
+    and the final chosen-cell membership reuse these SAME polygons, so each
+    frame's WCS footprint is projected exactly once per run.
+
+    NOT JSON-serializable (Shapely polygons); it is an INTERNAL seam between the
+    layout choice and the final chosen-cell context build and is never placed in
+    the public layout dict/manifest. Run-local and in-memory only — never
+    persisted, never shared across canvas/SIP/config/run. Bounded
+    O(frames x polygon vertices).
+    """
+
+    frames: tuple[zg.FrameDescriptor, ...]
+    polygons: tuple
+    median_w: float
+    median_h: float
+
+    def __iter__(self):
+        return iter(zip(self.frames, self.polygons))
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+
+def project_footprints(
+    frames: Sequence[zg.FrameDescriptor],
+    canvas: zg.GlobalCanvas,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+) -> ProjectedFootprints:
+    """Project every frame footprint EXACTLY ONCE and derive the median bbox.
+
+    ZM-ZEGRID-R28: merges the previous two projection passes
+    (:func:`median_projected_footprint` + :func:`_footprints`) into ONE exact
+    pass. Each frame's pixel boundary is projected via ``zg._source_polygon``
+    (SIP sampling, round-trip/conservative envelope, coordinates and errors all
+    preserved), sorted by FrameId, and the median projected ``(width, height)``
+    is derived from those SAME polygons (never a second projection).
+
+    ``progress`` (optional) is ``callable(done, total, item_id)`` invoked after
+    each frame's projection; ``None`` (default) keeps the exact previous
+    behaviour. Callback failures are swallowed (never abort science).
+    """
+    canvas_wcs = canvas.wcs()
+    frames_sorted = sorted(frames, key=lambda f: f.frame_id)
+    widths: list[float] = []
+    heights: list[float] = []
+    polygons = []
+    n = len(frames_sorted)
+    for idx, f in enumerate(frames_sorted, 1):
+        poly = zg._source_polygon(f.shape_hw, f.wcs(), canvas_wcs)
+        polygons.append(poly)
+        minx, miny, maxx, maxy = poly.bounds
+        widths.append(maxx - minx)
+        heights.append(maxy - miny)
+        if progress is not None:
+            try:
+                progress(idx, n, f.frame_id.logical_path)
+            except Exception:
+                pass
+    if not widths:
+        raise ValueError("no frames for footprint estimation")
+    return ProjectedFootprints(
+        frames=tuple(frames_sorted),
+        polygons=tuple(polygons),
+        median_w=float(np.median(widths)),
+        median_h=float(np.median(heights)),
+    )
+
+
 def _cell_contributor_count(footprints, canvas, bounds: zg.GlobalBounds) -> int:
     """Number of frames whose projected footprint intersects a cell's patch rect."""
     rect = zg._rect(bounds)
