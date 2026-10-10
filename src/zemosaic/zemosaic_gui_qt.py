@@ -75,6 +75,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
 
 from ._resources import resource_path_optional
+from . import progress_contract as zprogress
 
 logger = logging.getLogger(__name__)
 
@@ -717,11 +718,11 @@ class ZeMosaicQtWorker(QObject):
                 total_val = int(kwargs.get("total", 0))
             except Exception:
                 total_val = 0
-            if total_val > 0:
-                percent = max(0.0, min(100.0, (current_val / float(total_val)) * 100.0))
-            else:
-                percent = 0.0
-            self.progress_changed.emit(percent)
+            # ZM-PROGRESS-CONTRACT-R29: route the structured stage event ONCE to
+            # the stage aggregator. Do NOT emit a raw local percent via
+            # progress_changed here — a phase reaching 100% locally must never
+            # drive the GLOBAL progress bar to 100%. The non-stage legacy numeric
+            # progress path (message_key + progress_value) is preserved unchanged.
             self.phase_changed.emit(stage_name, {"current": current_val, "total": total_val})
             self.stage_progress.emit(stage_name, current_val, total_val)
             return
@@ -1204,6 +1205,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._progress_start_time: float | None = None
         self._last_global_progress: float = 0.0
         self._eta_seconds_smoothed: float | None = None
+        # ZM-PROGRESS-CONTRACT-R29: the pure deterministic aggregator is the
+        # single authority for structured STAGE_PROGRESS global progress. It is
+        # (re)created lazily per mode; reset clears run state.
+        self._progress_agg: zprogress.ProgressAggregator | None = None
+        self._progress_agg_mode: str | None = None
+        self._zegrid_active: bool = False
+        self._zegrid_phase_floor: int = 0
         self._eta_calc: ETACalculator | None = None
         self._last_eta_seconds_update_mono: float | None = None
         self._last_eta_seconds_value: float | None = None
@@ -5245,6 +5253,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._sds_phase_done = 0
         self._sds_phase_total = 0
         self._sds_phase_progress.clear()
+        # ZM-PROGRESS-CONTRACT-R29: reset the pure aggregator + mode/ZeGrid state
+        # so a new run starts clean (no stale fractions, terminal state or mode).
+        if self._progress_agg is not None:
+            self._progress_agg.reset()
+        self._progress_agg_mode = None
+        self._zegrid_active = False
+        self._zegrid_phase_floor = 0
 
     def _maybe_detect_sds(self, payload: Dict[str, Any]) -> bool:
         if self._sds_progress_active:
@@ -5493,23 +5508,25 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._set_eta_display("00:00:00", force=True)
 
     def _on_worker_stage_progress(self, stage: str, current: int, total: int) -> None:
-        if not (self._sds_phase_active and stage == "phase4_grid"):
-            stage_idx = self._infer_phase_index_from_stage(stage)
-            floor_idx = int(self._phase_label_floor or 0)
-            if not (isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx):
-                self._bump_phase_label_floor(stage_idx)
-                stage_label = self._format_stage_name(stage)
-                self.phase_value_label.setText(stage_label)
         self._update_stage_progress(stage, current, total)
 
     def _update_stage_progress(self, stage: str, current: int, total: int) -> None:
         if self._sds_progress_active:
             return
         self._weighted_progress_active = True
-        now = time.monotonic()
-        stage_key = self._stage_aliases.get(stage, stage)
-        if stage_key not in self._stage_progress_values:
-            self._stage_progress_values[stage_key] = 0.0
+
+        stage_name = str(stage or "")
+        is_zegrid = stage_name.startswith("zegrid:")
+        if is_zegrid:
+            self._zegrid_active = True
+
+        # Single authority: a mode-aware pure aggregator keyed on stable ids.
+        # A phase reaching its local 100% never drives the GLOBAL bar to 100%.
+        mode = "zegrid" if is_zegrid else "legacy"
+        if self._progress_agg is None or self._progress_agg_mode != mode:
+            self._progress_agg = zprogress.ProgressAggregator(zprogress.plan_for_mode(mode))
+            self._progress_agg_mode = mode
+        agg = self._progress_agg
 
         try:
             current_val = int(current)
@@ -5519,7 +5536,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             total_val = int(total)
         except (TypeError, ValueError):
             total_val = 0
-
         if total_val < 0:
             total_val = 0
         if total_val > 0:
@@ -5527,77 +5543,60 @@ class ZeMosaicQtMainWindow(QMainWindow):
         else:
             current_val = max(0, current_val)
 
-        timings = self._stage_times.get(stage_key)
-        if timings is None or current_val <= 1:
-            timings = {
-                "start": now,
-                "last": now,
-                "steps": [],
-                "last_count": current_val,
-            }
-            self._stage_times[stage_key] = timings
-        else:
-            last_count = int(timings.get("last_count", 0))
-            if current_val > last_count:
-                delta = now - float(timings.get("last", now))
-                if delta >= 0:
-                    steps = timings.setdefault("steps", [])
-                    steps.append(delta)
-                    if len(steps) > 120:
-                        del steps[: len(steps) - 120]
-                timings["last"] = now
-                timings["last_count"] = current_val
-            else:
-                timings["last"] = now
-                timings["last_count"] = current_val
+        result = agg.on_stage(stage_name, current_val, total_val)
 
+        # Tiles/item counter remains separate from the global progress bar.
         if total_val > 0:
             self.tiles_value_label.setText(f"{current_val} / {total_val}")
 
-        if self._progress_start_time is None:
-            self._progress_start_time = now
-
-        stage_weight = self._stage_weights.get(stage_key)
-        if stage_weight is None:
-            percent = (current_val / float(total_val) * 100.0) if total_val else 0.0
-            percent = max(0.0, min(100.0, percent))
-            percent = max(self._last_global_progress, percent)
-            self._last_global_progress = percent
-            self.progress_bar.setValue(int(percent))
-            self._update_eta_from_progress(percent)
+        if not result.known:
+            # Unknown stage: never map local current/total to global progress.
             return
 
-        if stage_key in self._stage_order:
-            stage_index = self._stage_order.index(stage_key)
-            for previous_stage in self._stage_order[:stage_index]:
-                if self._stage_progress_values.get(previous_stage, 0.0) < 1.0:
-                    self._stage_progress_values[previous_stage] = 1.0
+        global_percent = float(result.global_percent)
+        self._last_global_progress = global_percent
+        self.progress_bar.setValue(int(global_percent))
 
-        stage_fraction = (current_val / float(total_val)) if total_val else 0.0
-        stage_fraction = max(0.0, min(1.0, stage_fraction))
-        self._stage_progress_values[stage_key] = stage_fraction
+        if is_zegrid:
+            self._set_zegrid_phase_label(result)
+            # ZeGrid: suppress the %-derived ETA (a false estimate until R30's
+            # calibrated ETA service lands); label it honestly instead.
+            self._set_eta_display(
+                self._tr(zprogress.ETA_ESTIMATION_IN_PROGRESS, "estimation en cours"),
+                force=True,
+            )
+        else:
+            self._set_legacy_phase_label(stage_name)
+            self._update_eta_from_progress(global_percent)
+            if global_percent >= 99.9:
+                self._eta_seconds_smoothed = 0.0
+                self._set_eta_display("00:00:00", force=True)
 
-        global_progress = 0.0
-        for key in self._stage_order:
-            weight = self._stage_weights.get(key, 0.0)
-            if weight <= 0.0:
-                continue
-            fraction = self._stage_progress_values.get(key, 0.0)
-            if fraction <= 0.0:
-                continue
-            if fraction > 1.0:
-                fraction = 1.0
-            global_progress += weight * fraction
+    def _set_legacy_phase_label(self, stage: str) -> None:
+        stage_idx = self._infer_phase_index_from_stage(stage)
+        floor_idx = int(self._phase_label_floor or 0)
+        if isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx:
+            return  # never move the label backwards
+        self._bump_phase_label_floor(stage_idx)
+        self.phase_value_label.setText(self._format_stage_name(stage))
 
-        global_progress = max(self._last_global_progress, min(100.0, global_progress))
-        self._last_global_progress = global_progress
-        self.progress_bar.setValue(int(global_progress))
-        self._update_eta_from_progress(global_progress)
-
-        if global_progress >= 99.9:
-            self._eta_seconds_smoothed = 0.0
-            self._set_eta_display("00:00:00", force=True)
+    def _set_zegrid_phase_label(self, result: zprogress.StageResult) -> None:
+        ordinal = result.ordinal
+        if not isinstance(ordinal, int) or ordinal <= 0:
             return
+        if ordinal < (self._zegrid_phase_floor or 0):
+            return  # never move the label backwards
+        self._zegrid_phase_floor = ordinal
+        roman = zprogress.roman_ordinal(ordinal)
+        operation = self._tr(result.display_key or "", "")
+        template = self._tr(
+            zprogress.ZEGRID_PHASE_LABEL_FORMAT, "{roman} — {operation}"
+        )
+        try:
+            label = template.format(roman=roman, operation=operation)
+        except Exception:
+            label = f"{roman} — {operation}" if operation else roman
+        self.phase_value_label.setText(label)
 
     def _on_worker_phase45_event(self, key: str, payload: Dict[str, Any], level: str) -> None:
         data = payload if isinstance(payload, dict) else {}
@@ -5659,13 +5658,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
         else:
             if stage == "phase4_grid":
                 self._sds_phase_active = False
-            stage_idx = self._infer_phase_index_from_stage(stage)
-            floor_idx = int(self._phase_label_floor or 0)
-            if isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx:
+            # ZM-PROGRESS-CONTRACT-R29: ZeGrid stage ids are owned by the stage
+            # aggregator path (_on_worker_stage_progress), not this label writer.
+            if str(stage).startswith("zegrid:"):
                 stage_label = None
             else:
-                self._bump_phase_label_floor(stage_idx)
-                stage_label = self._format_stage_name(stage)
+                stage_idx = self._infer_phase_index_from_stage(stage)
+                floor_idx = int(self._phase_label_floor or 0)
+                if isinstance(stage_idx, int) and stage_idx > 0 and stage_idx < floor_idx:
+                    stage_label = None
+                else:
+                    self._bump_phase_label_floor(stage_idx)
+                    stage_label = self._format_stage_name(stage)
         if isinstance(stage_label, str):
             self.phase_value_label.setText(stage_label)
 
@@ -5890,6 +5894,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             cancel_key = "log_key_processing_cancelled"
             translated = self._translate_worker_message(cancel_key, {}, "WARN")
             self._append_log(translated, level="warning")
+            # ZM-PROGRESS-CONTRACT-R29: a cancel never reaches 100%.
+            if self._progress_agg is not None:
+                self._progress_agg.mark_cancel()
             return
 
         if success:
@@ -5897,6 +5904,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 self._sds_completed = True
                 self._apply_sds_progress(1.0)
                 self._set_eta_display("00:00:00", force=True)
+            else:
+                # ZM-PROGRESS-CONTRACT-R29: explicit terminal success is the ONLY
+                # path to 100% for structured (legacy/ZeGrid) progress.
+                if self._progress_agg is not None:
+                    self._progress_agg.mark_success()
+                    self.progress_bar.setValue(int(self._progress_agg.global_percent))
+                    self._last_global_progress = float(self._progress_agg.global_percent)
             completion_message = self._tr(
                 "qt_log_processing_completed", "Processing completed successfully."
             )
@@ -5963,6 +5977,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         message_key = message or "qt_worker_error_generic"
         translated = self._translate_worker_message(message_key, {}, "ERROR")
         self._append_log(translated, level="error")
+        # ZM-PROGRESS-CONTRACT-R29: a failed run never reaches 100%.
+        if self._progress_agg is not None:
+            self._progress_agg.mark_fail()
         if self.isVisible():
             QMessageBox.warning(
                 self,

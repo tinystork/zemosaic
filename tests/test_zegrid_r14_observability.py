@@ -198,10 +198,15 @@ def test_reporter_stage_callback_populated():
     rep.progress(50, item_id="f049.fits")
     rep.end()
     assert r.stages, "no stage callbacks"
-    # start -> (0/100), progress -> (50/100), end -> (100/100)
-    assert ("zegrid:gauge:0/100", 0, 100) in r.stages
-    assert ("zegrid:gauge:50/100", 50, 100) in r.stages
-    assert ("zegrid:gauge:100/100", 100, 100) in r.stages
+    # ZM-PROGRESS-CONTRACT-R29: the stage id is STABLE (``zegrid:gauge``) with the
+    # counters in the separate current/total callback fields (no counter-embedded
+    # id like the legacy ``zegrid:gauge:50/100``).
+    assert ("zegrid:gauge", 0, 100) in r.stages
+    assert ("zegrid:gauge", 50, 100) in r.stages
+    assert ("zegrid:gauge", 100, 100) in r.stages
+    # Counters never appear inside the emitted id.
+    for stage_str, _cur, _tot in r.stages:
+        assert "/" not in stage_str
 
 
 def test_reporter_log_line_flushed_to_run_log(tmp_path):

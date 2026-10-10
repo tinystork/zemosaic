@@ -2168,6 +2168,14 @@ def _run_single(
     raw_science = np.asarray(assembled.science, dtype=np.float32)
     raw_science_path, aesthetic_path = _resolve_output_paths(output_dir, finishing_config)
 
+    # ZM-PROGRESS-CONTRACT-R29: honest ``zegrid:finalize`` seam. It spans final
+    # finishing + output publication (science/aesthetic/coverage/manifest) + the
+    # completed run log, and is marked done ONLY after those writes succeed. It
+    # participates in UI progress (its local 100% is still below the global 100%
+    # until the explicit terminal success) but carries NO GlobalEta cost here.
+    _finalize_rep = _reporter()
+    _finalize_rep.start("finalize", total=1)
+
     # Write the immutable pre-finishing assembled science FIRST, so a finishing
     # exception can never destroy the scientific reference.
     _write_raw_science_fits(
@@ -2258,6 +2266,12 @@ def _run_single(
         gpu_context=gpu_ctx,
         aggregate_peak_rss_kib=aggregate_peak_rss_kib,
     )
+
+    # ZM-PROGRESS-CONTRACT-R29: the finalize seam completes (1/1) only now that
+    # the immutable science + aesthetic + coverage + manifest + run log are all
+    # written. Its local 100% still leaves GLOBAL progress below 100% until the
+    # worker's explicit terminal success.
+    _finalize_rep.end()
 
     _emit(
         f"ZeGrid: done — science={raw_science_path.name} "

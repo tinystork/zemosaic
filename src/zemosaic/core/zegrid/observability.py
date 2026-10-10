@@ -300,11 +300,11 @@ class PhaseReporter:
     def _set_stage(self, current: int, total: int) -> None:
         if self.stage is None or self.name is None:
             return
-        stage_str = (
-            f"zegrid:{self.name}:{int(current)}/{int(total)}"
-            if total and total > 0
-            else f"zegrid:{self.name}"
-        )
+        # ZM-PROGRESS-CONTRACT-R29: emit a STABLE stage id (``zegrid:<phase>``)
+        # and keep the counters in the separate current/total callback fields.
+        # The id NEVER embeds ``<done>/<total>`` (unlike the legacy form) so the
+        # GUI progress contract can key on a stable machine identity.
+        stage_str = f"zegrid:{self.name}"
         try:
             self.stage(stage_str, int(current), int(total))
         except Exception:
