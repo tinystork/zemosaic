@@ -200,6 +200,21 @@ def test_levers_default_off():
     assert zphot._GAUGE_PREFILTER_PAIRS_DEFAULT is False
     assert zphot._GAUGE_DEDUP_REFERENCE_DEFAULT is False
     assert zphot._GAUGE_BOUNDED_PAIRS_DEFAULT is False
+    assert zphot._GAUGE_TILED_REFERENCE_DEFAULT is False
+
+
+@pytest.mark.parametrize("sip", [False, True])
+def test_tiled_reference_within_tolerance(sip):
+    """The tiled/memmap reference feeds the same supports with sub-WCS-sampled
+    values; discrete outputs identical, coefficients within the declared tol."""
+    descs, _ = _dithered_corpus(sip=sip)
+    canvas = zg.build_canvas(descs)
+    cfg = ExecutorConfig().science_config()
+    strict, _, _ = _run(descs, canvas, cfg)
+    opt, _, diag = _run(descs, canvas, cfg, tiled_reference=True)
+    _assert_parity(strict, opt, exact=False)
+    assert diag["instrumentation"]["levers"]["tiled_reference"] is True
+    assert diag["instrumentation"]["reference"]["tiled"] is True
 
 
 def test_default_path_equals_all_levers_off():
@@ -228,7 +243,10 @@ def test_instrumentation_schema_and_no_science_change():
     instr = diag["instrumentation"]
     assert instr["schema"] == "zegrid-gauge-instrumentation-r32a"
     assert instr["levers"] == {
-        "prefilter_pairs": False, "dedup_reference": False, "bounded_pairs": False
+        "prefilter_pairs": False,
+        "dedup_reference": False,
+        "bounded_pairs": False,
+        "tiled_reference": False,
     }
     for phase in ("counts", "pairs"):
         assert instr[phase]["reproject_s"]["n"] >= 1

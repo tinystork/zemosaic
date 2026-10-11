@@ -155,6 +155,15 @@ _GAUGE_REF_SUP_NAME = "r_sup.npy"
 _GAUGE_PREFILTER_PAIRS_DEFAULT = False
 _GAUGE_DEDUP_REFERENCE_DEFAULT = False
 _GAUGE_BOUNDED_PAIRS_DEFAULT = False
+# * ``_GAUGE_TILED_REFERENCE_DEFAULT`` (RAM fix, tolerance): build the reference
+#   full-canvas alignment TILE BY TILE straight into a disk-backed memmap
+#   instead of materialising one full-canvas float32 plane in RAM. Bounded
+#   transient (one tile) during reference construction; parity-gated within the
+#   same reprojection FP tolerance as the bounded path.
+_GAUGE_TILED_REFERENCE_DEFAULT = False
+
+# Canvas edge of ONE reference tile (R32b tiled reference).
+_GAUGE_REF_TILE_PX = 1024
 
 
 def _resolve_switch(value: bool | None, default: bool) -> bool:
@@ -227,20 +236,69 @@ def _prefilter_detail(upper_bound: int, min_common: int) -> str:
     return f"common<={upper_bound} < min_common={min_common}"
 
 
+def _ref_dir_for(cache_dir) -> str:
+    """Resolve (and create) the gauge reference-plane directory."""
+    if cache_dir is not None:
+        ref_dir = Path(cache_dir) / "__gauge_ref__"
+    else:
+        ref_dir = Path(tempfile.mkdtemp(prefix="zegrid_gauge_ref_"))
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    return str(ref_dir)
+
+
 def _write_gauge_reference(cache_dir, r_full, r_sup) -> str:
     """Write the reference planes (float32 + bool) as a small ``.npy`` pair.
 
     Returns the directory path holding ``r_full.npy`` / ``r_sup.npy``. Uses
     ``cache_dir`` when given (the run's gauge cache dir) else a fresh temp dir.
     """
-    if cache_dir is not None:
-        ref_dir = Path(cache_dir) / "__gauge_ref__"
-    else:
-        ref_dir = Path(tempfile.mkdtemp(prefix="zegrid_gauge_ref_"))
-    ref_dir.mkdir(parents=True, exist_ok=True)
-    np.save(ref_dir / _GAUGE_REF_FULL_NAME, np.asarray(r_full), allow_pickle=False)
-    np.save(ref_dir / _GAUGE_REF_SUP_NAME, np.asarray(r_sup), allow_pickle=False)
-    return str(ref_dir)
+    ref_dir = _ref_dir_for(cache_dir)
+    np.save(os.path.join(ref_dir, _GAUGE_REF_FULL_NAME), np.asarray(r_full), allow_pickle=False)
+    np.save(os.path.join(ref_dir, _GAUGE_REF_SUP_NAME), np.asarray(r_sup), allow_pickle=False)
+    return ref_dir
+
+
+def _reproject_reference_tiled(decode_fn, f, canvas, ref_dir, tile_px: int | None = None) -> str:
+    """ZM-ZEGRID-R32b: build the reference alignment TILE BY TILE into a memmap.
+
+    Instead of materialising ONE full-canvas float32 plane (+ support) in RAM,
+    the reference frame is reprojected onto canvas TILES and written straight
+    into two disk-backed ``.npy`` memmaps (``r_full.npy`` float32 HxWx3,
+    ``r_sup.npy`` bool HxW). Peak transient RAM is O(one tile), independent of
+    the canvas area. Returns the reference directory.
+
+    Parity: the reference pixels are the SAME support (the support is
+    pixel-wise deterministic); the VALUES are sampled on per-tile sub-WCS
+    (CRPIX shifted), i.e. the SAME ~1e-4 reprojection FP class as the bounded
+    pair path — gated by the run's declared tolerance, never claimed exact.
+    """
+    ref_dir = str(ref_dir)
+    tile = int(tile_px or _GAUGE_REF_TILE_PX)
+    tile = max(1, tile)
+    h, w = int(canvas.height), int(canvas.width)
+    full_path = os.path.join(ref_dir, _GAUGE_REF_FULL_NAME)
+    sup_path = os.path.join(ref_dir, _GAUGE_REF_SUP_NAME)
+    r_full = np.lib.format.open_memmap(
+        full_path, mode="w+", dtype=np.float32, shape=(h, w, 3)
+    )
+    r_sup = np.lib.format.open_memmap(
+        sup_path, mode="w+", dtype=np.bool_, shape=(h, w)
+    )
+    chw = _decode_to_chw(decode_fn, f)
+    for y0 in range(0, h, tile):
+        y1 = min(h, y0 + tile)
+        for x0 in range(0, w, tile):
+            x1 = min(w, x0 + tile)
+            hdr = _bbox_wcs_header(canvas, (y0, y1, x0, x1))
+            rgb, geom = zxe.reproject_cropped(
+                chw, f.wcs(), WCS(hdr), (y1 - y0, x1 - x0)
+            )
+            r_full[y0:y1, x0:x1, :] = rgb
+            r_sup[y0:y1, x0:x1] = geom
+    r_full.flush()
+    r_sup.flush()
+    del r_full, r_sup
+    return ref_dir
 
 
 def _init_gauge_reference(ref_dir: str) -> None:
@@ -456,6 +514,7 @@ def compute_global_gauge(
     prefilter_pairs: bool | None = None,
     dedup_reference: bool | None = None,
     bounded_pairs: bool | None = None,
+    tiled_reference: bool | None = None,
 ) -> tuple[FixedNormalization, tuple[str, ...]]:
     """Compute the global photometric gauge over the full canvas (bounded).
 
@@ -482,6 +541,7 @@ def compute_global_gauge(
     _prefilter = _resolve_switch(prefilter_pairs, _GAUGE_PREFILTER_PAIRS_DEFAULT)
     _dedup_ref = _resolve_switch(dedup_reference, _GAUGE_DEDUP_REFERENCE_DEFAULT)
     _bounded = _resolve_switch(bounded_pairs, _GAUGE_BOUNDED_PAIRS_DEFAULT)
+    _tiled_ref = _resolve_switch(tiled_reference, _GAUGE_TILED_REFERENCE_DEFAULT)
     _rss_start_kib = _rss_kib()
     _t_gauge0 = time.perf_counter()
 
@@ -529,6 +589,7 @@ def compute_global_gauge(
         progress_callback=count_progress, emit=emit, meta=counts_meta,
     )
     counts = np.asarray([r["count"] for r in count_results], dtype=np.int64)
+    _rss_counts_end = _rss_kib()
 
 
     # --- reference selection (reuse the frozen function; exact argmax of counts) ---
@@ -550,7 +611,22 @@ def compute_global_gauge(
     # --- reference full-canvas alignment (ONE plane) + reference weighting ---
     _t_ref0 = time.perf_counter()
     zxe.reset_reproject_path_stats()
-    r_full, r_sup = _reproject_full(decode_fn, ordered[ref_idx], canvas)
+    _ref_dir_prebuilt = None
+    if _tiled_ref:
+        # ZM-ZEGRID-R32b: build the reference alignment TILE BY TILE straight
+        # into a disk-backed memmap (bounded transient, independent of canvas).
+        _ref_dir_prebuilt = _ref_dir_for(cache_dir)
+        _reproject_reference_tiled(
+            decode_fn, ordered[ref_idx], canvas, _ref_dir_prebuilt
+        )
+        r_full = np.load(
+            os.path.join(_ref_dir_prebuilt, _GAUGE_REF_FULL_NAME), mmap_mode="r"
+        )
+        r_sup = np.load(
+            os.path.join(_ref_dir_prebuilt, _GAUGE_REF_SUP_NAME), mmap_mode="r"
+        )
+    else:
+        r_full, r_sup = _reproject_full(decode_fn, ordered[ref_idx], canvas)
     ref_reproj = zxe.get_reproject_path_stats().to_dict()
     _t_ref_reproj = time.perf_counter()
     ref_norm = normalize_canonical_images(
@@ -566,7 +642,14 @@ def compute_global_gauge(
         "total_s": _t_ref_weight - _t_ref0,
         "area_px": int(canvas.height) * int(canvas.width),
         "bytes_reprojected": int(canvas.height) * int(canvas.width) * 3 * 4,
+        "tiled": bool(_tiled_ref),
+        "tile_px": int(_GAUGE_REF_TILE_PX) if _tiled_ref else None,
     }
+    # Release the parent's reference-plane references before the pairs pass so
+    # the parent does not pin a full-canvas copy during the parallel phase
+    # (ZM-ZEGRID-R32b, best-effort; the quality metrics above are already kept
+    # as scalars in ref_weight). Done AFTER the reference planes have been
+    # written for the non-tiled path (see below).
 
     coefficients = np.full((n, c, 2), np.nan, dtype=np.float64)
     norm_active = np.zeros(n, dtype=bool)
@@ -587,7 +670,15 @@ def compute_global_gauge(
     # ZM-ZEGRID-R19: instead of the fork-only copy-on-write globals, write the
     # reference planes to the gauge cache dir and hand them to the pooled workers
     # via a memmap initializer (works under fork, spawn AND threads).
-    ref_dir = _write_gauge_reference(cache_dir, r_full, r_sup)
+    if _ref_dir_prebuilt is not None:
+        ref_dir = _ref_dir_prebuilt  # ZM-ZEGRID-R32b: already written tile by tile
+    else:
+        ref_dir = _write_gauge_reference(cache_dir, r_full, r_sup)
+    # Drop the parent's in-RAM reference planes now that they are on disk (and
+    # the reference quality scalars are already extracted). Bounded parent RAM
+    # during the pairs pass; harmless no-op for the memmap-tiled case.
+    del r_full, r_sup, ref_norm
+    _rss_ref_end = _rss_kib()
     pairs_meta: dict = {}
     prefiltered_pairs: list = []
     try:
@@ -716,6 +807,7 @@ def compute_global_gauge(
     norm_exclusions.sort(key=lambda e: e.index)
     weight_exclusions.sort(key=lambda e: e.index)
     _t_pairs_end = time.perf_counter()
+    _rss_pairs_end = _rss_kib()
 
     # --- weighting-level active + weight normalization (reuse _phase1 semantics) ---
     if weight_token == "none":
@@ -788,10 +880,14 @@ def compute_global_gauge(
             pairs_meta=pairs_meta,
             rss_start_kib=_rss_start_kib,
             rss_end_kib=_rss_kib(),
+            rss_counts_end_kib=_rss_counts_end,
+            rss_ref_end_kib=_rss_ref_end,
+            rss_pairs_end_kib=_rss_pairs_end,
             wall_s=_t_pairs_end - _t_gauge0,
             prefilter=_prefilter,
             dedup_reference=_dedup_ref,
             bounded=_bounded,
+            tiled_reference=_tiled_ref,
             chunk_px=int(canvas.height) * int(canvas.width),
         )
 
@@ -810,10 +906,14 @@ def _gauge_instrumentation(
     pairs_meta: dict,
     rss_start_kib: int,
     rss_end_kib: int,
+    rss_counts_end_kib: int = 0,
+    rss_ref_end_kib: int = 0,
+    rss_pairs_end_kib: int = 0,
     wall_s: float,
     prefilter: bool,
     dedup_reference: bool,
     bounded: bool,
+    tiled_reference: bool = False,
     chunk_px: int,
 ) -> dict:
     """Bounded per-subsystem gauge instrumentation (ZM-ZEGRID-R32a).
@@ -857,6 +957,7 @@ def _gauge_instrumentation(
             "prefilter_pairs": bool(prefilter),
             "dedup_reference": bool(dedup_reference),
             "bounded_pairs": bool(bounded),
+            "tiled_reference": bool(tiled_reference),
         },
         "counts": {
             "frames": int(n),
@@ -893,6 +994,8 @@ def _gauge_instrumentation(
             "total_s": round(float(ref_timing["total_s"]), 6),
             "area_px": int(ref_timing["area_px"]),
             "bytes_reprojected": int(ref_timing["bytes_reprojected"]),
+            "tiled": bool(ref_timing.get("tiled", False)),
+            "tile_px": ref_timing.get("tile_px"),
         },
         "totals": {
             "wall_seconds": round(float(wall_s), 6),
@@ -910,6 +1013,11 @@ def _gauge_instrumentation(
             "peak_rss_kib_start": int(rss_start_kib),
             "peak_rss_kib_end": int(rss_end_kib),
             "worker_rss_kib_max": max(worker_rss) if worker_rss else None,
+            "stage_peak_rss_kib": {
+                "after_counts": int(rss_counts_end_kib),
+                "after_reference": int(rss_ref_end_kib),
+                "after_pairs": int(rss_pairs_end_kib),
+            },
             "canvas_px": int(chunk_px),
             "reference_plane_canvas_px": int(chunk_px),
             "note": (
