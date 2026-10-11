@@ -52,6 +52,30 @@ CRPIX) rather than the full-canvas WCS, so ``reproject_interp`` differs in the
 last FP digits and the continuous coefficients/weights may differ ~1e-4 relative,
 while the discrete outputs remain identical. This is therefore NOT claimed as
 BIT-IDENTICAL on partial-overlap corpora (see the R12 partial-overlap test).
+
+ZM-ZEGRID-R32a — internal (NON-DEFAULT) performance levers + instrumentation
+----------------------------------------------------------------------------
+This module now also exposes three INTERNAL levers, all DEFAULT OFF so the
+production default path is bit-for-bit unchanged:
+
+* **Lever A — geometric prefilter** (`prefilter_pairs`): before any reprojection,
+  a pair is SKIPPED when a pure-geometry upper bound (the intersection area of
+  the two footprint bboxes, a superset of each frame's support) proves the pair
+  was excluded as ``insufficient_common`` anyway. Provably equivalent: never a
+  false negative (a skipped pair is always excluded under the strict path).
+* **Lever B — reference dedup** (`dedup_reference`): the reference frame's
+  quality metrics are computed once per pair instead of twice; the extracted
+  non-reference numbers are bit-identical.
+* **Bounded work** (`bounded_pairs`): frame ``i`` is reprojected on ITS OWN
+  footprint bbox instead of the union bbox(R, i), while the frozen ``min_common``
+  gate still receives the KNOWN full valid counts from the counts pass. Same
+  discrete decisions; coefficients equal within the declared reprojection FP
+  tolerance (measured 0.0 on the R32a synthetic fixtures; declared <=1e-4).
+
+The reference plane is still materialised as ONE full-canvas float32 plane
+(+ bool support); the tiled/bounded reference and the remaining RAM scaling are
+R32b items. The ``diagnostics`` dict gains a bounded ``instrumentation`` block
+(timings/areas/bytes/RSS per subsystem; no per-pixel logging).
 """
 
 from __future__ import annotations
@@ -60,6 +84,8 @@ import copy
 import os
 import shutil
 import tempfile
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -67,9 +93,12 @@ import numpy as np
 from astropy.wcs import WCS
 
 from zemosaic.core.canonical_stacking import (
+    REASON_INSUFFICIENT_COMMON,
+    STAGE_NORMALIZATION,
     CanonicalInputBatch,
     CanonicalStackFailure,
     FrameExclusion,
+    _compute_min_common,
     compute_canonical_quality_weights,
     normalize_canonical_images,
     prepare_canonical_inputs,
@@ -99,6 +128,103 @@ _GAUGE_R_SUP = None
 # Filenames for the memmapped reference planes written to the gauge cache dir.
 _GAUGE_REF_FULL_NAME = "r_full.npy"
 _GAUGE_REF_SUP_NAME = "r_sup.npy"
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R32a — internal, NON-DEFAULT gauge performance levers
+# ---------------------------------------------------------------------------
+#
+# These switches expose the R32a optimisations WITHOUT changing the production
+# default path. Defaults are the CURRENT (pre-R32a) behaviour; the levers are
+# exercised explicitly (tests) and may be promoted to defaults only in R32c
+# after the R32b real-corpus parity + gain gates.
+#
+# * ``_GAUGE_PREFILTER_PAIRS_DEFAULT`` (Lever A, EXACT): before reprojecting a
+#   pair, skip it when a pure-geometry upper bound on its common support proves
+#   it would be excluded as ``insufficient_common`` anyway (never a false
+#   negative). A skipped pair was excluded under the current path, so the
+#   discrete science outputs are unchanged.
+# * ``_GAUGE_DEDUP_REFERENCE_DEFAULT`` (Lever B, EXACT): compute the reference
+#   frame's quality metrics ONCE per pair instead of twice (the reference's
+#   contribution was recomputed every pair). The extracted non-reference
+#   metrics are bit-identical.
+# * ``_GAUGE_BOUNDED_PAIRS_DEFAULT`` (bounded work, tolerance): reproject frame
+#   ``i`` on ITS OWN footprint bbox instead of the union bbox(R, i), while the
+#   frozen ``min_common`` keeps using the FULL valid counts from the counts
+#   pass. Same discrete decisions; continuous coefficients within the declared
+#   reprojection FP tolerance (see the module docstring / R32a report).
+_GAUGE_PREFILTER_PAIRS_DEFAULT = False
+_GAUGE_DEDUP_REFERENCE_DEFAULT = False
+_GAUGE_BOUNDED_PAIRS_DEFAULT = False
+
+
+def _resolve_switch(value: bool | None, default: bool) -> bool:
+    """Resolve an internal lever switch (``None`` -> module default)."""
+    return bool(default) if value is None else bool(value)
+
+
+def _rss_kib() -> int:
+    """Best-effort peak RSS of THIS process in KiB (never fatal)."""
+    try:
+        import resource
+
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:  # noqa: BLE001 - instrumentation is never fatal
+        try:
+            import psutil
+
+            return int(psutil.Process().memory_info().rss // 1024)
+        except Exception:  # noqa: BLE001
+            return 0
+
+
+def _dist_stats(values) -> dict:
+    """Bounded distribution summary (count/min/median/mean/max) of a list."""
+    arr = np.asarray([v for v in values if v is not None], dtype=np.float64)
+    if arr.size == 0:
+        return {"n": 0}
+    return {
+        "n": int(arr.size),
+        "min": round(float(np.min(arr)), 6),
+        "median": round(float(np.median(arr)), 6),
+        "mean": round(float(np.mean(arr)), 6),
+        "max": round(float(np.max(arr)), 6),
+    }
+
+
+def _bbox_area(bbox) -> int:
+    """Pixel area of a canvas bbox ``(y0, y1, x0, x1)``."""
+    y0, y1, x0, x1 = bbox
+    return max(0, int(y1) - int(y0)) * max(0, int(x1) - int(x0))
+
+
+def _bbox_intersection_area(b1, b2) -> int:
+    """Pixel area of the intersection of two canvas bboxes (0 when disjoint).
+
+    Since both frames' reprojected supports are CONTAINED in their footprint
+    bboxes, this is a provable UPPER BOUND on their common support: it is used
+    by Lever A and never under-counts the true common pixels.
+    """
+    y0 = max(int(b1[0]), int(b2[0]))
+    y1 = min(int(b1[1]), int(b2[1]))
+    x0 = max(int(b1[2]), int(b2[2]))
+    x1 = min(int(b1[3]), int(b2[3]))
+    if y1 <= y0 or x1 <= x0:
+        return 0
+    return (y1 - y0) * (x1 - x0)
+
+
+def _prefilter_detail(upper_bound: int, min_common: int) -> str:
+    """Deterministic diagnostic detail for a Lever-A prefiltered pair.
+
+    When the geometric bound is exactly 0 the true common count is 0, so this
+    reproduces the strict-path detail byte-for-byte. Otherwise it records the
+    CONSERVATIVE bound (``<=``), which is an upper bound on the true
+    ``common=<n>`` the strict path would print; the exclusion reason is
+    unchanged.
+    """
+    if upper_bound <= 0:
+        return f"common=0 < min_common={min_common}"
+    return f"common<={upper_bound} < min_common={min_common}"
 
 
 def _write_gauge_reference(cache_dir, r_full, r_sup) -> str:
@@ -195,26 +321,60 @@ def _reproject_full(decode_fn, f, canvas):
 def _counts_worker(task):
     zxe.reset_reproject_path_stats()
     (decode_fn, f, bbox_wcs_header, bbox_shape) = task
+    t0 = time.perf_counter()
     chw = _decode_to_chw(decode_fn, f)
+    t1 = time.perf_counter()
     rgb, geom = zxe.reproject_cropped(chw, f.wcs(), WCS(bbox_wcs_header), tuple(bbox_shape))
+    t2 = time.perf_counter()
     b = prepare_canonical_inputs([rgb], [geom])
+    t3 = time.perf_counter()
+    area = int(bbox_shape[0]) * int(bbox_shape[1])
     return {
         "count": int(b.frame_valid_counts[0]),
+        "decode_s": t1 - t0,
+        "reproject_s": t2 - t1,
+        "prepare_s": t3 - t2,
+        "bbox_area": area,
+        "bytes_reprojected": int(area) * 3 * 4,
+        "rss_kib": _rss_kib(),
         "reproject": zxe.get_reproject_path_stats().to_dict(),
     }
 
 
 def _pair_worker(task):
     zxe.reset_reproject_path_stats()
-    (index, decode_fn, f, bbox, bbox_wcs_header, bbox_shape, norm_token, weight_token) = task
+    (
+        index,
+        decode_fn,
+        f,
+        bbox,
+        bbox_wcs_header,
+        bbox_shape,
+        norm_token,
+        weight_token,
+        dedup_reference,
+        bounded_counts,
+    ) = task
+    t0 = time.perf_counter()
     chw = _decode_to_chw(decode_fn, f)
+    t1 = time.perf_counter()
     rgb, geom = zxe.reproject_cropped(chw, f.wcs(), WCS(bbox_wcs_header), tuple(bbox_shape))
+    t2 = time.perf_counter()
     y0, y1, x0, x1 = bbox
     r_crop = np.ascontiguousarray(_GAUGE_R_FULL[y0:y1, x0:x1])
     r_sup = _GAUGE_R_SUP[y0:y1, x0:x1]
 
     batch2 = prepare_canonical_inputs([r_crop, rgb], [r_sup, geom])
+    if bounded_counts is not None:
+        # ZM-ZEGRID-R32a bounded path: the crop is frame i's OWN bbox (a subset
+        # of the union), but the FROZEN min_common gate must keep the KNOWN full
+        # valid counts from the counts pass (the union trick did this implicitly).
+        batch2 = replace(
+            batch2, frame_valid_counts=np.asarray(bounded_counts, dtype=np.int64)
+        )
+    t3 = time.perf_counter()
     norm2 = normalize_canonical_images(batch2, norm_token, reference_index=0)
+    t4 = time.perf_counter()
 
     norm_exc = []
     for e in norm2.exclusions:
@@ -227,7 +387,26 @@ def _pair_worker(task):
     weight_active = bool(norm2.active_frames[1])
     weight_exc = []
     if weight_token != "none" and bool(norm2.active_frames[1]):
-        weight2 = compute_canonical_quality_weights(norm2, weight_token)
+        # ZM-ZEGRID-R32a Lever B (EXACT): the reference (index 0) quality metrics
+        # are recomputed every pair although they are IDENTICAL for a given run
+        # (R's valid pixels within any union/bounded crop are exactly its full
+        # support). Mark the reference inactive so the frozen weighting branch
+        # SKIPS its metrics; the extracted index-1 numbers are unchanged. If the
+        # non-reference frame fails its own metric (which would leave the batch
+        # with no active frame), retry on the untouched 2-frame batch so the
+        # exact exclusion reason is preserved (rare; R stays active there).
+        if dedup_reference:
+            masked = np.array(norm2.active_frames, dtype=bool, copy=True)
+            masked[0] = False
+            try:
+                weight2 = compute_canonical_quality_weights(
+                    replace(norm2, active_frames=masked), weight_token
+                )
+            except CanonicalStackFailure:
+                weight2 = compute_canonical_quality_weights(norm2, weight_token)
+        else:
+            weight2 = compute_canonical_quality_weights(norm2, weight_token)
+        t5 = time.perf_counter()
         raw_weight = float(weight2.raw_weights[1])
         noise_sigma = float(weight2.noise_sigma[1])
         fwhm = float(weight2.fwhm[1])
@@ -236,7 +415,10 @@ def _pair_worker(task):
             for e in weight2.exclusions:
                 if e.index == 1 and e.stage == "weighting":
                     weight_exc.append({"stage": e.stage, "reason": e.reason, "detail": e.detail})
+    else:
+        t5 = t4
 
+    area = int(bbox_shape[0]) * int(bbox_shape[1])
     return {
         "index": index,
         "coeff": np.array(norm2.coefficients[1], dtype=np.float64, copy=True),
@@ -247,6 +429,14 @@ def _pair_worker(task):
         "fwhm": fwhm,
         "weight_active": weight_active,
         "weight_exc": weight_exc,
+        "decode_s": t1 - t0,
+        "reproject_s": t2 - t1,
+        "prepare_s": t3 - t2,
+        "normalize_s": t4 - t3,
+        "weight_s": t5 - t4,
+        "bbox_area": area,
+        "bytes_reprojected": int(area) * 3 * 4,
+        "rss_kib": _rss_kib(),
         "reproject": zxe.get_reproject_path_stats().to_dict(),
     }
 
@@ -263,6 +453,9 @@ def compute_global_gauge(
     progress_callback=None,
     emit=None,
     diagnostics=None,
+    prefilter_pairs: bool | None = None,
+    dedup_reference: bool | None = None,
+    bounded_pairs: bool | None = None,
 ) -> tuple[FixedNormalization, tuple[str, ...]]:
     """Compute the global photometric gauge over the full canvas (bounded).
 
@@ -284,6 +477,13 @@ def compute_global_gauge(
     frame_ids = [f.frame_id.logical_path for f in ordered]
     n = len(ordered)
     c = 3
+
+    # ZM-ZEGRID-R32a internal levers (NON-DEFAULT; see module constants).
+    _prefilter = _resolve_switch(prefilter_pairs, _GAUGE_PREFILTER_PAIRS_DEFAULT)
+    _dedup_ref = _resolve_switch(dedup_reference, _GAUGE_DEDUP_REFERENCE_DEFAULT)
+    _bounded = _resolve_switch(bounded_pairs, _GAUGE_BOUNDED_PAIRS_DEFAULT)
+    _rss_start_kib = _rss_kib()
+    _t_gauge0 = time.perf_counter()
 
     # ZM-ZEGRID-R14 rework-1 (M1): live gauge progress is CUMULATIVE across the
     # two sub-passes so the phase-level ETA is honest throughout. Total work =
@@ -348,13 +548,25 @@ def compute_global_gauge(
     ref_bbox = bboxes[ref_idx]
 
     # --- reference full-canvas alignment (ONE plane) + reference weighting ---
+    _t_ref0 = time.perf_counter()
     zxe.reset_reproject_path_stats()
     r_full, r_sup = _reproject_full(decode_fn, ordered[ref_idx], canvas)
     ref_reproj = zxe.get_reproject_path_stats().to_dict()
+    _t_ref_reproj = time.perf_counter()
     ref_norm = normalize_canonical_images(
         prepare_canonical_inputs([r_full], [r_sup]), norm_token, reference_index=0
     )
+    _t_ref_norm = time.perf_counter()
     ref_weight = compute_canonical_quality_weights(ref_norm, weight_token)
+    _t_ref_weight = time.perf_counter()
+    ref_timing = {
+        "reproject_s": _t_ref_reproj - _t_ref0,
+        "normalize_s": _t_ref_norm - _t_ref_reproj,
+        "weight_s": _t_ref_weight - _t_ref_norm,
+        "total_s": _t_ref_weight - _t_ref0,
+        "area_px": int(canvas.height) * int(canvas.width),
+        "bytes_reprojected": int(canvas.height) * int(canvas.width) * 3 * 4,
+    }
 
     coefficients = np.full((n, c, 2), np.nan, dtype=np.float64)
     norm_active = np.zeros(n, dtype=bool)
@@ -377,23 +589,47 @@ def compute_global_gauge(
     # via a memmap initializer (works under fork, spawn AND threads).
     ref_dir = _write_gauge_reference(cache_dir, r_full, r_sup)
     pairs_meta: dict = {}
+    prefiltered_pairs: list = []
     try:
         pair_tasks = []
         pair_ids = []
         for i in range(n):
             if i == ref_idx:
                 continue
-            ubox = _union_bbox(ref_bbox, bboxes[i])
+            # ZM-ZEGRID-R32a Lever A (EXACT geometric prefilter): the union bbox
+            # of the two footprints is a SUPERSET of each frame's reprojected
+            # support, so its intersection area is an UPPER BOUND on the true
+            # common pixel count. When that bound is below the frozen
+            # ``min_common`` the pair is PROVABLY excluded as insufficient_common
+            # by the strict path, so it can be skipped BEFORE any reprojection
+            # (never a false negative; the discrete outputs are unchanged for
+            # every pair the strict path keeps).
+            min_common_i = _compute_min_common(int(counts[ref_idx]), int(counts[i]))
+            upper = _bbox_intersection_area(ref_bbox, bboxes[i])
+            if _prefilter and upper < min_common_i:
+                prefiltered_pairs.append((i, int(upper), int(min_common_i)))
+                continue
+            if _bounded:
+                # ZM-ZEGRID-R32a bounded path: frame i is reprojected on ITS OWN
+                # footprint bbox (a subset of the union) and the frozen gate is
+                # fed the KNOWN full counts, so min_common is unchanged.
+                box = bboxes[i]
+                bounded_counts = (int(counts[ref_idx]), int(counts[i]))
+            else:
+                box = _union_bbox(ref_bbox, bboxes[i])
+                bounded_counts = None
             pair_tasks.append(
                 (
                     i,
                     decode_fn,
                     ordered[i],
-                    ubox,
-                    _bbox_wcs_header(canvas, ubox),
-                    (ubox[1] - ubox[0], ubox[3] - ubox[2]),
+                    box,
+                    _bbox_wcs_header(canvas, box),
+                    (box[1] - box[0], box[3] - box[2]),
                     norm_token,
                     weight_token,
+                    _dedup_ref,
+                    bounded_counts,
                 )
             )
             pair_ids.append(ordered[i].frame_id.logical_path)
@@ -401,13 +637,23 @@ def compute_global_gauge(
         pair_progress = None
         if progress_callback is not None:
             m = len(pair_tasks)
+            _pre_done = n + len(prefiltered_pairs)
+            # Report the prefiltered pairs as already done so the cumulative
+            # phase progress stays monotone and still reaches 2N-1.
+            for _j in range(len(prefiltered_pairs)):
+                try:
+                    progress_callback(
+                        int(n + _j + 1), int(gauge_total), f"pairs:{ordered[prefiltered_pairs[_j][0]].frame_id.logical_path}"
+                    )
+                except Exception:
+                    pass
 
             def _pair_progress(done: int, _total: int) -> None:
                 try:
                     item = pair_ids[done - 1] if 0 < done <= m else None
                     # rework-1 (M1): cumulative — the pairs pass continues at
                     # done = N+1..2N-1 so the phase-level ETA is monotone.
-                    progress_callback(int(n + done), int(gauge_total), f"pairs:{item}")
+                    progress_callback(int(_pre_done + done), int(gauge_total), f"pairs:{item}")
                 except Exception:
                     pass
 
@@ -416,7 +662,9 @@ def compute_global_gauge(
         if emit is not None:
             try:
                 emit(
-                    f"[ZEGRID] gauge phase=pairs units={len(pair_tasks)} workers={workers}",
+                    f"[ZEGRID] gauge phase=pairs units={len(pair_tasks)} workers={workers}"
+                    + (f" prefiltered={len(prefiltered_pairs)}" if prefiltered_pairs else "")
+                    + (" bounded=true" if _bounded else ""),
                     "INFO",
                 )
             except Exception:
@@ -449,6 +697,25 @@ def compute_global_gauge(
                             index=i, stage=e["stage"], reason=e["reason"], detail=e["detail"]
                         )
                     )
+
+    # ZM-ZEGRID-R32a Lever A: materialise the prefiltered pairs as the EXACT
+    # exclusion the strict path would have produced (insufficient_common), with
+    # no reprojection. Kept in ascending frame order so the exclusion tuple is
+    # identical to the strict path's.
+    for (i, upper, min_common_i) in prefiltered_pairs:
+        coefficients[i] = np.nan
+        norm_active[i] = False
+        norm_exclusions.append(
+            FrameExclusion(
+                index=i,
+                stage=STAGE_NORMALIZATION,
+                reason=REASON_INSUFFICIENT_COMMON,
+                detail=_prefilter_detail(upper, min_common_i),
+            )
+        )
+    norm_exclusions.sort(key=lambda e: e.index)
+    weight_exclusions.sort(key=lambda e: e.index)
+    _t_pairs_end = time.perf_counter()
 
     # --- weighting-level active + weight normalization (reuse _phase1 semantics) ---
     if weight_token == "none":
@@ -508,5 +775,148 @@ def compute_global_gauge(
             *(r.get("reproject") for r in count_results),
             *(r.get("reproject") for r in pair_results),
         )
+        # ZM-ZEGRID-R32a: bounded per-subsystem instrumentation (no per-pixel
+        # logging). Worker-reported timings/areas/bytes + parent peak RSS.
+        diagnostics["instrumentation"] = _gauge_instrumentation(
+            n=n,
+            ref_idx=ref_idx,
+            ref_timing=ref_timing,
+            count_results=count_results,
+            pair_results=pair_results,
+            prefiltered_pairs=prefiltered_pairs,
+            counts_meta=counts_meta,
+            pairs_meta=pairs_meta,
+            rss_start_kib=_rss_start_kib,
+            rss_end_kib=_rss_kib(),
+            wall_s=_t_pairs_end - _t_gauge0,
+            prefilter=_prefilter,
+            dedup_reference=_dedup_ref,
+            bounded=_bounded,
+            chunk_px=int(canvas.height) * int(canvas.width),
+        )
 
     return gauge, tuple(frame_ids)
+
+
+def _gauge_instrumentation(
+    *,
+    n: int,
+    ref_idx: int,
+    ref_timing: dict,
+    count_results: list,
+    pair_results: list,
+    prefiltered_pairs: list,
+    counts_meta: dict,
+    pairs_meta: dict,
+    rss_start_kib: int,
+    rss_end_kib: int,
+    wall_s: float,
+    prefilter: bool,
+    dedup_reference: bool,
+    bounded: bool,
+    chunk_px: int,
+) -> dict:
+    """Bounded per-subsystem gauge instrumentation (ZM-ZEGRID-R32a).
+
+    Pure aggregation of the worker-reported scalars and the phase metadata. It
+    never touches pixels and never alters science; it only describes what was
+    done (timings, areas, bytes, RSS, and the internal lever switches).
+    """
+
+    def _col(results, key):
+        return [r.get(key) for r in results if r.get(key) is not None]
+
+    counts_reproject = _col(count_results, "reproject_s")
+    counts_area = _col(count_results, "bbox_area")
+    counts_bytes = sum(int(r.get("bytes_reprojected", 0)) for r in count_results)
+
+    pairs_reproject = _col(pair_results, "reproject_s")
+    pairs_normalize = _col(pair_results, "normalize_s")
+    pairs_weight = _col(pair_results, "weight_s")
+    pairs_prepare = _col(pair_results, "prepare_s")
+    pairs_area = _col(pair_results, "bbox_area")
+    pairs_bytes = sum(int(r.get("bytes_reprojected", 0)) for r in pair_results)
+
+    worker_rss = [
+        int(r.get("rss_kib", 0))
+        for r in list(count_results) + list(pair_results)
+        if int(r.get("rss_kib", 0)) > 0
+    ]
+
+    # Cost per reprojected pixel (the O(area) claim): pairs_total_reproject_s /
+    # pairs_total_px. Reported so the R32b scaling gate can compare bbox areas.
+    pairs_px_total = int(sum(pairs_area)) if pairs_area else 0
+    pairs_reproject_sum = float(sum(pairs_reproject)) if pairs_reproject else 0.0
+    per_px = (
+        pairs_reproject_sum / pairs_px_total if pairs_px_total > 0 else None
+    )
+
+    return {
+        "schema": "zegrid-gauge-instrumentation-r32a",
+        "levers": {
+            "prefilter_pairs": bool(prefilter),
+            "dedup_reference": bool(dedup_reference),
+            "bounded_pairs": bool(bounded),
+        },
+        "counts": {
+            "frames": int(n),
+            "executor": counts_meta.get("executor"),
+            "phase_seconds": counts_meta.get("seconds"),
+            "seconds_per_unit": counts_meta.get("seconds_per_unit"),
+            "reproject_s": _dist_stats(counts_reproject),
+            "bbox_area_px": _dist_stats(counts_area),
+            "bytes_reprojected": int(counts_bytes),
+            "rss_kib_max": max(worker_rss) if worker_rss else None,
+        },
+        "pairs": {
+            "pairs": int(n - 1),
+            "pairs_prefiltered": int(len(prefiltered_pairs)),
+            "executor": pairs_meta.get("executor"),
+            "phase_seconds": pairs_meta.get("seconds"),
+            "seconds_per_unit": pairs_meta.get("seconds_per_unit"),
+            "reproject_s": _dist_stats(pairs_reproject),
+            "prepare_s": _dist_stats(pairs_prepare),
+            "normalize_s": _dist_stats(pairs_normalize),
+            "weight_s": _dist_stats(pairs_weight),
+            "crop_area_px": _dist_stats(pairs_area),
+            "bytes_reprojected": int(pairs_bytes),
+            "reproject_s_per_crop_px": (
+                round(float(per_px), 12) if per_px is not None else None
+            ),
+            "rss_kib_max": max(worker_rss) if worker_rss else None,
+        },
+        "reference": {
+            "index": int(ref_idx),
+            "reproject_s": round(float(ref_timing["reproject_s"]), 6),
+            "normalize_s": round(float(ref_timing["normalize_s"]), 6),
+            "weight_s": round(float(ref_timing["weight_s"]), 6),
+            "total_s": round(float(ref_timing["total_s"]), 6),
+            "area_px": int(ref_timing["area_px"]),
+            "bytes_reprojected": int(ref_timing["bytes_reprojected"]),
+        },
+        "totals": {
+            "wall_seconds": round(float(wall_s), 6),
+            "counts_seconds": counts_meta.get("seconds"),
+            "pairs_seconds": pairs_meta.get("seconds"),
+            "reproject_seconds_sum": round(
+                float(sum(counts_reproject) + sum(pairs_reproject)), 6
+            ),
+            "normalize_seconds_sum": round(float(sum(pairs_normalize)), 6),
+            "weight_seconds_sum": round(float(sum(pairs_weight)), 6),
+            "reference_seconds": round(float(ref_timing["total_s"]), 6),
+            "bytes_lifted": int(counts_bytes + pairs_bytes + ref_timing["bytes_reprojected"]),
+        },
+        "memory": {
+            "peak_rss_kib_start": int(rss_start_kib),
+            "peak_rss_kib_end": int(rss_end_kib),
+            "worker_rss_kib_max": max(worker_rss) if worker_rss else None,
+            "canvas_px": int(chunk_px),
+            "reference_plane_canvas_px": int(chunk_px),
+            "note": (
+                "R32a keeps the reference frame as ONE full-canvas float32 plane "
+                "(+ bool support) in RAM (see R32b for the tiled/bounded "
+                "reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the "
+                "sum of worker peaks."
+            ),
+        },
+    }

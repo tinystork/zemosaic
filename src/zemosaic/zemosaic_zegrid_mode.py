@@ -1465,6 +1465,49 @@ def _write_run_log(
                 f"seconds={ph.get('seconds')} seconds_per_unit={ph.get('seconds_per_unit')}"
                 + (f" fallback_reason={ph.get('fallback_reason')}" if ph.get('fallback_reason') else "")
             )
+        # ZM-ZEGRID-R32a: bounded per-subsystem gauge instrumentation (additive;
+        # never changes science). Rendered only when present.
+        _ginstr = gd.get("instrumentation") or {}
+        if _ginstr:
+            _lv = _ginstr.get("levers") or {}
+            _ct = _ginstr.get("counts") or {}
+            _pr = _ginstr.get("pairs") or {}
+            _rf = _ginstr.get("reference") or {}
+            _tot = _ginstr.get("totals") or {}
+            _mem = _ginstr.get("memory") or {}
+            lines.append(
+                "  instrumentation(R32a): "
+                f"prefilter_pairs={_lv.get('prefilter_pairs')} "
+                f"dedup_reference={_lv.get('dedup_reference')} "
+                f"bounded_pairs={_lv.get('bounded_pairs')}"
+            )
+            lines.append(
+                f"    counts: reproject_s={_ct.get('reproject_s')} "
+                f"bbox_area_px={_ct.get('bbox_area_px')} "
+                f"bytes_reprojected={_ct.get('bytes_reprojected')}"
+            )
+            lines.append(
+                f"    pairs: reproject_s={_pr.get('reproject_s')} "
+                f"normalize_s={_pr.get('normalize_s')} weight_s={_pr.get('weight_s')} "
+                f"crop_area_px={_pr.get('crop_area_px')} "
+                f"prefiltered={_pr.get('pairs_prefiltered')} "
+                f"reproject_s_per_crop_px={_pr.get('reproject_s_per_crop_px')}"
+            )
+            lines.append(
+                f"    reference: reproject_s={_rf.get('reproject_s')} "
+                f"normalize_s={_rf.get('normalize_s')} weight_s={_rf.get('weight_s')} "
+                f"area_px={_rf.get('area_px')}"
+            )
+            lines.append(
+                f"    totals: wall_s={_tot.get('wall_seconds')} "
+                f"reproject_seconds_sum={_tot.get('reproject_seconds_sum')} "
+                f"bytes_lifted={_tot.get('bytes_lifted')}"
+            )
+            lines.append(
+                f"    memory: peak_rss_kib_start={_mem.get('peak_rss_kib_start')} "
+                f"peak_rss_kib_end={_mem.get('peak_rss_kib_end')} "
+                f"worker_rss_kib_max={_mem.get('worker_rss_kib_max')}"
+            )
     else:
         lines.append("  (no gauge diagnostics recorded)")
     lines.append("Per-cell stacking concurrency (ZM-ZEGRID-R20 diagnostic):")
