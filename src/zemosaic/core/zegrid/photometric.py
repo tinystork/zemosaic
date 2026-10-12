@@ -117,6 +117,7 @@ __all__ = [
     "compute_cell_gauge",
     "resolve_cell_gauge_mode",
     "CellGaugeResult",
+    "CellReferencePin",
     "CELL_GAUGE_MODES",
     "CELL_GAUGE_MODE_DEFAULT",
     "CELL_GAUGE_MODE_GLOBAL",
@@ -195,6 +196,15 @@ class CellGaugeResult:
         Number of frames surviving to the weighting level in the Cell gauge.
     detail:
         Deterministic reason for an ``empty`` result (else ``None``).
+    reference_frame_id:
+        ZM-CELL-PHOTOMETRY-R34C reference STABILITY pin: the logical frame id of
+        the Cell's own reference frame (``None`` when the provider exposes no
+        frame ids, or the Cell is empty). Recording it lets a recompute be checked
+        against the SAME anchor, so a Cell's level cannot silently flip.
+    reference_support:
+        The reference frame's valid-support count (``None`` empty) — the second
+        half of the stability pin (support count + tie-break fully determine the
+        reference choice).
     """
 
     status: str
@@ -205,6 +215,33 @@ class CellGaugeResult:
     total_valid_support: int
     active_frames: int
     detail: str | None = None
+    reference_frame_id: str | None = None
+    reference_support: int | None = None
+
+    def pin(self) -> "CellReferencePin":
+        """Return the deterministic reference-stability pin (R34C)."""
+        return CellReferencePin(
+            frame_id=self.reference_frame_id,
+            support=self.reference_support,
+            reference_index=self.reference_index,
+        )
+
+
+@dataclass(frozen=True)
+class CellReferencePin:
+    """Deterministic per-Cell photometric-reference pin (ZM-CELL-PHOTOMETRY-R34C).
+
+    The Cell's additive level (its per-Cell gauge, R34b) is anchored on one frame;
+    if a recompute silently selected a different frame, the Cell's level would
+    shift. This pin records the (logical frame id, valid-support count,
+    cell-local index) that fully determines the choice, so recomputes can be
+    compared exactly. The support count is the tie-break key; the frame id is the
+    identity.
+    """
+
+    frame_id: str | None
+    support: int | None
+    reference_index: int | None
 
 # Canvas-pixel margin around a frame's projected-footprint bbox. This makes the
 # bbox a SUPERSET of the reprojected support (bilinear kernel + SIP margin), so
@@ -1224,6 +1261,8 @@ def compute_cell_gauge(provider, request) -> "CellGaugeResult":
             total_valid_support=0,
             active_frames=0,
             detail="zero_valid_support",
+            reference_frame_id=None,
+            reference_support=None,
         )
 
     # FROZEN estimator, reused verbatim: reference = greatest valid support
@@ -1236,13 +1275,19 @@ def compute_cell_gauge(provider, request) -> "CellGaugeResult":
         raise CanonicalStackFailure(
             "per-cell gauge has no active frame despite positive valid support"
         )
+    ref = int(gauge.reference_index)
+    ref_frame_id = (
+        frame_ids[ref] if (frame_ids is not None and 0 <= ref < len(frame_ids)) else None
+    )
     return CellGaugeResult(
         status=CELL_GAUGE_STATUS_OK,
         gauge=gauge,
         mode=CELL_GAUGE_MODE_PER_CELL,
         frame_ids=frame_ids,
-        reference_index=int(gauge.reference_index),
+        reference_index=ref,
         total_valid_support=total,
         active_frames=active,
         detail=None,
+        reference_frame_id=ref_frame_id,
+        reference_support=int(counts[ref]),
     )
