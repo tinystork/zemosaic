@@ -1123,6 +1123,36 @@ def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame
     _STACK_CACHE_WORKERS = cache_workers
 
 
+def _resolve_cell_normalization(mode, global_gauge, global_frame_ids, provider, science_config):
+    """Return ``(fixed, status, detail)`` for ONE Cell (ZM-CELL-PHOTOMETRY-R34B).
+
+    ``fixed`` is the :class:`FixedNormalization` to apply (``None`` when the Cell
+    has no usable gauge). ``status``/``detail`` describe the outcome for the
+    record/manifest (``"ok"`` or ``"empty"``).
+
+    * ``"global"`` (default): subset the R11 global gauge to the Cell's frames in
+      the Cell's order — NO re-anchor. This is the unchanged production path; a
+      Cell with no globally-active frame still raises ``cell gauge has no active
+      frame`` from ``subset_fixed_normalization`` (pre-R34B behaviour).
+    * ``"per_cell"`` (opt-in): compute the Cell's OWN self-anchored gauge from its
+      own aligned frames via the FROZEN estimator (``photometric.compute_cell_gauge``).
+      A zero-support Cell yields ``(None, "empty", detail)`` explicitly (never a
+      fabricated gauge). This is the path that removes the Caldwell
+      "no active frame" failure for geometrically-populated Cells.
+    """
+    resolved = zphot.resolve_cell_gauge_mode(mode)
+    if resolved == zphot.CELL_GAUGE_MODE_PER_CELL:
+        request = zstream.build_streaming_request(science_config, provider.n_frames)
+        cres = zphot.compute_cell_gauge(provider, request)
+        if cres.status != zphot.CELL_GAUGE_STATUS_OK:
+            return None, cres.status, cres.detail
+        return cres.gauge, cres.status, None
+    fixed = subset_fixed_normalization(
+        global_gauge, global_frame_ids, list(provider.frame_ids)
+    )
+    return fixed, zphot.CELL_GAUGE_STATUS_OK, None
+
+
 def _stack_cell(task):
     """Module-level (picklable) worker: build cache + stack ONE cell (R20).
 
@@ -1155,15 +1185,45 @@ def _stack_cell(task):
     )
     cache_build_s = time.perf_counter() - t0
 
-    # Subset the global gauge to this cell's frames (in cache order).
+    # Per-Cell photometric normalization (ZM-CELL-PHOTOMETRY-R34B).
+    #   "global"  (default): subset the R11 global gauge to this Cell's frames
+    #             (no re-anchor) — bit-for-bit unchanged production behaviour.
+    #   "per_cell" (opt-in): compute this Cell's OWN self-anchored gauge from its
+    #             aligned frames via the FROZEN estimator, so a Cell with no
+    #             globally-active frame calibrates instead of raising
+    #             "cell gauge has no active frame".
+    cell_gauge_mode = zphot.resolve_cell_gauge_mode(
+        getattr(_STACK_CONFIG, "cell_gauge_mode", None)
+    )
     cell_provider = zfp.MemmapCanonicalProvider(cache_dir)
     try:
         cell_frame_ids = list(cell_provider.frame_ids)
+        cell_fixed, gauge_status, gauge_detail = _resolve_cell_normalization(
+            cell_gauge_mode, _STACK_GAUGE, _STACK_GLOBAL_FRAME_IDS,
+            cell_provider, _STACK_CONFIG,
+        )
     finally:
         cell_provider.close()
-    cell_fixed = subset_fixed_normalization(
-        _STACK_GAUGE, _STACK_GLOBAL_FRAME_IDS, cell_frame_ids
-    )
+
+    if cell_fixed is None:
+        # Explicit, DETERMINISTIC zero-support Cell: no gauge, no fabricated data.
+        # (Distinct from a geometrically-empty Cell — this one HAS contributors but
+        # none carry finite support.)
+        _safe_rmtree(cache_dir, None)
+        return {
+            "cell_id": cid, "status": "empty", "reproject": None,
+            "gauge_status": gauge_status, "gauge_detail": gauge_detail,
+            "n_frames": 0, "total_bytes": 0, "cache_build_s": cache_build_s,
+            "stack_s": 0.0, "peak_rss_kib": zsw.peak_rss_kib(),
+            "cleanup_failed": False, "cache_dir": str(cache_dir),
+            "record": {
+                "cell_id": cid, "row": cell.row, "col": cell.col,
+                "status": "empty", "mode": mode,
+                "n_contributors": len(mem.patch_ids),
+                "cell_gauge_mode": cell_gauge_mode,
+                "gauge_status": gauge_status, "gauge_detail": gauge_detail,
+            },
+        }
 
     t0 = time.perf_counter()
     if mode == "inmem":
@@ -1182,11 +1242,13 @@ def _stack_cell(task):
     peak_rss = zsw.peak_rss_kib()
 
     prov = _reference_provenance(
-        _STACK_GLOBAL_REF, cell_frame_ids, sres.reference_frame_id
+        _STACK_GLOBAL_REF, cell_frame_ids, sres.reference_frame_id,
+        per_cell=(cell_gauge_mode == zphot.CELL_GAUGE_MODE_PER_CELL),
     )
     record = {
         "cell_id": cid, "row": cell.row, "col": cell.col, "status": "complete",
         "mode": mode, "n_contributors": len(mem.patch_ids),
+        "cell_gauge_mode": cell_gauge_mode,
         "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
         "reference_frame_id": sres.reference_frame_id,
         "reference_frame_role": prov["reference_frame_role"],
@@ -1267,7 +1329,7 @@ def _gauge_decode(frame_desc):
     return _decode_frame_hwc(frame_desc, None)
 
 
-def _reference_provenance(global_reference_frame_id, cell_frame_ids, cell_reference_frame_id):
+def _reference_provenance(global_reference_frame_id, cell_frame_ids, cell_reference_frame_id, per_cell=False):
     """ZM-ZEGRID-R11 L1 (provenance honesty): classify a Cell's reference.
 
     A Cell's ``reference_frame_id`` is the TRUE photometric anchor only when the
@@ -1275,8 +1337,18 @@ def _reference_provenance(global_reference_frame_id, cell_frame_ids, cell_refere
     placeholder (the Cell's highest-weight active frame) and the true anchor is
     ``photometric_gauge.global_reference_frame_id``.
 
+    ``per_cell`` (ZM-CELL-PHOTOMETRY-R34B): in the opt-in per-Cell gauge mode the
+    Cell's reference is its OWN self-anchoring frame (a TRUE local photometric
+    anchor), so it is labelled accordingly and there is no global bookkeeping
+    placeholder.
+
     Returns ``{reference_frame_role, bookkeeping_reference_frame_id}``.
     """
+    if per_cell:
+        return {
+            "reference_frame_role": "cell_local_photometric_anchor",
+            "bookkeeping_reference_frame_id": None,
+        }
     has_global = global_reference_frame_id in cell_frame_ids
     return {
         "reference_frame_role": (
@@ -2840,12 +2912,20 @@ def _write_outputs(
             "coverage (stack depth) is pure geometry."
         ),
         "photometric_gauge": {
-            "mode": "global",
+            "mode": getattr(science_config, "cell_gauge_mode", "global"),
             "global_reference_frame_id": global_reference_frame_id,
             "note": (
                 "one reference frame + per-frame sky_mean coefficients computed once "
                 "over the full canvas footprint; every Cell reuses the same gauge "
                 "(Cells lacking the global reference keep its GLOBAL level)."
+                if getattr(science_config, "cell_gauge_mode", "global") == "global"
+                else (
+                    "OPT-IN per-Cell gauge (ZM-CELL-PHOTOMETRY-R34B): every Cell "
+                    "self-anchors on its OWN greatest-support frame via the FROZEN "
+                    "estimator; global_reference_frame_id is the global-gauge "
+                    "reference retained for provenance only. Inter-cell coherence "
+                    "(R34c offset graph) and feathering (R34d) are NOT applied here."
+                )
             ),
             "provenance_honesty": (
                 "ZM-ZEGRID-R11 L1: a Cell's 'reference_frame_id' is the TRUE "
@@ -2856,6 +2936,14 @@ def _write_outputs(
                 "reference_frame_role='bookkeeping_placeholder'); the true "
                 "photometric anchor is always "
                 "photometric_gauge.global_reference_frame_id."
+                if getattr(science_config, "cell_gauge_mode", "global") == "global"
+                else (
+                    "ZM-CELL-PHOTOMETRY-R34B: in per_cell mode each Cell's "
+                    "'reference_frame_id' IS its TRUE local photometric anchor "
+                    "(reference_frame_role='cell_local_photometric_anchor'); Cells "
+                    "are NOT forced onto a shared global level (global coherence is "
+                    "R34c/R34d)."
+                )
             ),
         },
         "n_frames": len(descs),
@@ -2965,6 +3053,7 @@ def run_zegrid_mode(
     use_gpu: bool | None = None,
     zconfig: object | None = None,
     workers: int | None = None,
+    cell_gauge_mode: str | None = None,
 ) -> None:
     """Run the NEW ZeGrid engine over a ``stack_plan.csv`` (production entry).
 
@@ -3084,10 +3173,31 @@ def run_zegrid_mode(
     if not frames_info:
         raise RuntimeError("ZeGrid failed: no frames loaded from stack_plan.csv")
 
+    # Per-Cell photometric gauge mode (ZM-CELL-PHOTOMETRY-R34B): opt-in, default
+    # "global" (unchanged production path). Resolution order: explicit keyword >
+    # ``zegrid_cell_gauge_mode`` config key > default. An unknown token is a loud
+    # error (never a silent photometric-strategy change).
+    _mode_source = cell_gauge_mode
+    if _mode_source is None and zconfig is not None:
+        _mode_source = getattr(zconfig, "zegrid_cell_gauge_mode", None)
+    try:
+        resolved_cell_gauge_mode = zphot.resolve_cell_gauge_mode(_mode_source)
+    except ValueError as exc:
+        _emit(f"ZeGrid: {exc}", lvl="ERROR", callback=progress_callback)
+        raise
+    if resolved_cell_gauge_mode != zphot.CELL_GAUGE_MODE_DEFAULT:
+        _emit(
+            "ZeGrid: cell_gauge_mode=per_cell (OPT-IN) — every Cell self-anchors on "
+            "its own greatest-support frame via the frozen estimator; inter-cell "
+            "coherence/feathering are NOT part of this mode (R34c/R34d).",
+            lvl="WARN", callback=progress_callback,
+        )
+
     science_config = replace(
         ExecutorConfig().science_config(),
         normalization=_resolve_normalization(stack_norm_method),
         backend=("gpu" if gpu_effective else "cpu"),
+        cell_gauge_mode=resolved_cell_gauge_mode,
         **rej_overrides,
     )
     _emit(
@@ -3097,7 +3207,7 @@ def run_zegrid_mode(
         f"(sigma={science_config.sigma_low:.2f}/{science_config.sigma_high:.2f}, "
         f"winsor={science_config.winsor_limit_low:.3f}/{science_config.winsor_limit_high:.3f}), "
         f"combine={science_config.combine}, taper={science_config.taper}, "
-        f"backend={science_config.backend}",
+        f"backend={science_config.backend}, cell_gauge_mode={science_config.cell_gauge_mode}",
         callback=progress_callback,
     )
 

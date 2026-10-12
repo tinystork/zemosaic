@@ -85,7 +85,7 @@ import os
 import shutil
 import tempfile
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -104,12 +104,107 @@ from zemosaic.core.canonical_stacking import (
     prepare_canonical_inputs,
     select_canonical_reference,
 )
-from zemosaic.core.canonical_streaming import FixedNormalization
+from zemosaic.core.canonical_streaming import (
+    FixedNormalization,
+    compute_fixed_normalization,
+)
 from zemosaic.core.zegrid import execution as zxe
 from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import parallel as zpar
 
-__all__ = ["compute_global_gauge"]
+__all__ = [
+    "compute_global_gauge",
+    "compute_cell_gauge",
+    "resolve_cell_gauge_mode",
+    "CellGaugeResult",
+    "CELL_GAUGE_MODES",
+    "CELL_GAUGE_MODE_DEFAULT",
+    "CELL_GAUGE_MODE_GLOBAL",
+    "CELL_GAUGE_MODE_PER_CELL",
+]
+
+# ---------------------------------------------------------------------------
+# ZM-CELL-PHOTOMETRY-R34B — per-Cell photometric gauge MODE (opt-in)
+# ---------------------------------------------------------------------------
+#
+# ``compute_global_gauge`` (above) is the R11/R12 production gauge: ONE reference
+# frame + per-frame coefficients computed over the frame's FULL canvas footprint,
+# then subset per Cell via ``canonical_streaming.subset_fixed_normalization``.
+# That subset is deliberately a NO-RE-ANCHOR operation (R11 F1), so a Cell whose
+# contributor frames have NO globally-active frame raises ``cell gauge has no
+# active frame`` (84 such geometrically-populated Cells on the Caldwell corpus).
+#
+# R34b adds the opt-in ``per_cell`` MODE: instead of subsetting the global gauge,
+# EVERY geometrical Cell computes its OWN self-anchored gauge from its own aligned
+# frames (reference = the Cell's greatest-valid-support frame, ties to the lowest
+# sorted FrameId), reusing the FROZEN estimator verbatim. The DEFAULT stays
+# ``global`` so the production path (M106) is bit-for-bit unchanged.
+CELL_GAUGE_MODE_GLOBAL = "global"
+CELL_GAUGE_MODE_PER_CELL = "per_cell"
+CELL_GAUGE_MODES = (CELL_GAUGE_MODE_GLOBAL, CELL_GAUGE_MODE_PER_CELL)
+CELL_GAUGE_MODE_DEFAULT = CELL_GAUGE_MODE_GLOBAL
+
+# ``compute_cell_gauge`` statuses (explicit, never a silent fabrication).
+CELL_GAUGE_STATUS_OK = "ok"
+CELL_GAUGE_STATUS_EMPTY = "empty"
+
+
+def resolve_cell_gauge_mode(mode) -> str:
+    """Validate/resolve the per-Cell gauge mode token (``None`` -> default).
+
+    Accepts ``"global"`` (default; R11 production path) or ``"per_cell"``
+    (R34b opt-in). An unknown token raises ``ValueError`` (never a silent
+    fallback), so a typo cannot silently change the photometric strategy.
+    """
+    if mode is None:
+        return CELL_GAUGE_MODE_DEFAULT
+    if not isinstance(mode, str):
+        raise ValueError(
+            f"cell_gauge_mode must be a string, got {type(mode).__name__}"
+        )
+    token = mode.strip().lower()
+    if token not in CELL_GAUGE_MODES:
+        raise ValueError(
+            f"unknown cell_gauge_mode {mode!r}; expected one of "
+            f"{'/'.join(CELL_GAUGE_MODES)}"
+        )
+    return token
+
+
+@dataclass(frozen=True)
+class CellGaugeResult:
+    """Result of ONE Cell's self-anchored (per-Cell) photometric gauge (R34b).
+
+    Fields
+    ------
+    status:
+        ``"ok"`` (a valid gauge was produced) or ``"empty"`` (the Cell's frames
+        carry ZERO finite support; ``gauge`` is then ``None``). Explicit and
+        deterministic — never a fabricated gauge.
+    gauge:
+        The :class:`FixedNormalization` for this Cell (``None`` when empty).
+    mode:
+        The mode token this result was produced under (always ``"per_cell"``).
+    frame_ids:
+        The Cell's frame order this gauge covers (when the provider exposes it).
+    reference_index:
+        The Cell-LOCAL index of the Cell's own reference frame (``None`` empty).
+    total_valid_support:
+        Sum of the Cell's per-frame valid support pixels.
+    active_frames:
+        Number of frames surviving to the weighting level in the Cell gauge.
+    detail:
+        Deterministic reason for an ``empty`` result (else ``None``).
+    """
+
+    status: str
+    gauge: FixedNormalization | None
+    mode: str
+    frame_ids: tuple | None
+    reference_index: int | None
+    total_valid_support: int
+    active_frames: int
+    detail: str | None = None
 
 # Canvas-pixel margin around a frame's projected-footprint bbox. This makes the
 # bbox a SUPERSET of the reprojected support (bilinear kernel + SIP margin), so
@@ -1061,3 +1156,93 @@ def _gauge_instrumentation(
             ),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# ZM-CELL-PHOTOMETRY-R34B — per-Cell self-anchored gauge
+# ---------------------------------------------------------------------------
+
+def _provider_valid_counts(provider) -> np.ndarray:
+    """Per-frame valid support counts over the provider's OWN domain.
+
+    Reuses the FROZEN ``prepare_canonical_inputs`` (one 1-frame batch per frame, the
+    exact count basis ``canonical_streaming._phase1`` uses), so the per-Cell
+    reference selection is computed on the same footing as the global gauge.
+    """
+    n = provider.n_frames
+    counts = np.zeros(n, dtype=np.int64)
+    for i in range(n):
+        raw, sup = provider.get_raw_frame(i)
+        counts[i] = int(prepare_canonical_inputs([raw], [sup]).frame_valid_counts[0])
+    return counts
+
+
+def compute_cell_gauge(provider, request) -> "CellGaugeResult":
+    """Compute ONE Cell's SELF-ANCHORED photometric gauge (R34B, opt-in per_cell).
+
+    Unlike ``subset_fixed_normalization`` (which subsets the R11 global gauge and
+    deliberately does NOT re-anchor — so a Cell with no globally-active frame
+    raises ``cell gauge has no active frame``), this computes the Cell's OWN gauge
+    from the Cell's OWN aligned frames:
+
+    * the reference is the Cell's greatest-valid-support frame (ties resolved to
+      the lowest sorted FrameId index — mirroring ``select_canonical_reference``,
+      which the frozen estimator invokes internally);
+    * every other contributor gets its normalization offset against that LOCAL
+      reference.
+
+    The offsets are produced by the FROZEN estimator verbatim
+    (``canonical_streaming.compute_fixed_normalization`` -> ``_phase1`` ->
+    ``prepare_canonical_inputs`` / ``normalize_canonical_images`` /
+    ``compute_canonical_quality_weights``); this function does NOT re-implement
+    any science.
+
+    ``provider`` is a :class:`~zemosaic.core.canonical_streaming.CanonicalFrameProvider`
+    over the Cell's aligned frames (e.g. the Cell's
+    :class:`~zemosaic.core.zegrid.file_provider.MemmapCanonicalProvider`), and
+    ``request`` is the ``CanonicalStackRequest`` carrying the science tokens.
+    ``request.reference_index`` should be ``None`` (auto) so the Cell selects its
+    own reference; an explicit index is honoured (frozen semantics).
+
+    A Cell with ZERO finite support is returned as an EXPLICIT, deterministic
+    ``status="empty"`` result (``gauge=None``) — never a fabricated gauge and
+    never an exception; a Cell with positive support always yields a valid
+    ``FixedNormalization`` with at least one active frame (else it raises loudly,
+    it does not fabricate).
+    """
+    counts = _provider_valid_counts(provider)
+    total = int(counts.sum())
+    frame_ids = tuple(getattr(provider, "frame_ids", ())) or None
+    if total <= 0:
+        # Zero finite support across the Cell's frames: explicit + deterministic.
+        return CellGaugeResult(
+            status=CELL_GAUGE_STATUS_EMPTY,
+            gauge=None,
+            mode=CELL_GAUGE_MODE_PER_CELL,
+            frame_ids=frame_ids,
+            reference_index=None,
+            total_valid_support=0,
+            active_frames=0,
+            detail="zero_valid_support",
+        )
+
+    # FROZEN estimator, reused verbatim: reference = greatest valid support
+    # (tie -> lowest sorted index), per-frame offsets against that local reference.
+    gauge = compute_fixed_normalization(provider, request)
+    active = int(np.count_nonzero(gauge.weight_active))
+    if active <= 0:
+        # Positive support but nothing survives weighting: fail loudly, never
+        # fabricate a gauge. This is not the zero-support case.
+        raise CanonicalStackFailure(
+            "per-cell gauge has no active frame despite positive valid support"
+        )
+    return CellGaugeResult(
+        status=CELL_GAUGE_STATUS_OK,
+        gauge=gauge,
+        mode=CELL_GAUGE_MODE_PER_CELL,
+        frame_ids=frame_ids,
+        reference_index=int(gauge.reference_index),
+        total_valid_support=total,
+        active_frames=active,
+        detail=None,
+    )

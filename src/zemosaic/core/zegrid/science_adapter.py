@@ -82,6 +82,11 @@ class MiniTileScienceConfig:
     sigma_high: float = DEFAULT_SIGMA_HIGH
     winsor_limit_low: float = DEFAULT_WINSOR_LOW
     winsor_limit_high: float = DEFAULT_WINSOR_HIGH
+    # ZM-CELL-PHOTOMETRY-R34B: per-Cell photometric gauge strategy. "global"
+    # (default) reuses the R11 global gauge subset; "per_cell" makes every Cell
+    # self-anchor on its OWN best frame. Never a silent default change: the field
+    # defaults to "global" and is only changed by an explicit config/keyword.
+    cell_gauge_mode: str = "global"
 
 
 def build_request(
