@@ -162,7 +162,14 @@ def edge_offset_observation(
         uc = u[:, :, c]
         vc = v[:, :, c]
         sel = valid & np.isfinite(uc) & np.isfinite(vc)
-        diff = (uc[sel] - vc[sel]) if sel.any() else np.empty(0, dtype=np.float64)
+        diff_all = (uc[sel] - vc[sel]) if sel.any() else np.empty(0, dtype=np.float64)
+        # ZM-CELL-PHOTOMETRY-R34D (Nono I1): the returned count/weight is the RAW
+        # number of SHARED VALID pixels (support / "area") — NOT the surviving
+        # percentile-band size (which was the R34c behaviour and is 40% of the
+        # support by construction). This makes the least-squares weight an honest
+        # overlap-area weight (mirrors legacy `intertile_prune_weight_mode=area`).
+        n_support = int(diff_all.size)
+        diff = diff_all
         if reject is not None and diff.size >= 8:
             # One robust pre-clip of the difference cloud (outlier pixels).
             med = float(np.median(diff))
@@ -170,11 +177,11 @@ def edge_offset_observation(
             sigma = MAD_SCALE * mad
             if sigma > 0.0:
                 diff = diff[np.abs(diff - med) <= float(reject) * sigma]
-        delta, n = robust_sky_level(
+        delta, _band_n = robust_sky_level(
             diff, percentile=percentile, clip_sigma=clip_sigma
         )
         deltas[c] = delta
-        counts[c] = n
+        counts[c] = n_support
 
     if channels == 1:
         n_total = int(counts[0])
@@ -377,43 +384,47 @@ def solve_additive_offsets(
                 f"{len(missing)} cell(s) unreachable from anchor {anchor!r}: "
                 f"{missing[:8]}{'...' if len(missing) > 8 else ''}"
             )
-        # Explicit placeholder: unreachable nodes keep offset 0 (only used by
-        # callers that opt into tolerant behaviour).
+        # Tolerant mode: solve ONLY the anchor's connected component; every
+        # unreachable node keeps offset 0 (its own level). No fabricated bridge.
         missing = sorted(node_set - reachable)
+        active_nodes = [n for n in nodes if n in reachable]
+        active_edges = [e for e in norm_edges if e[0] in reachable and e[1] in reachable]
     else:
         missing = []
+        active_nodes = list(nodes)
+        active_edges = norm_edges
 
     # --- weighted least squares, anchor eliminated (o_anchor == 0) ---
     index = {n: i for i, n in enumerate(nodes)}
-    free = [n for n in nodes if n != anchor]
+    free = [n for n in active_nodes if n != anchor]
     free_index = {n: j for j, n in enumerate(free)}
     nf = len(free)
     offsets = np.zeros((len(nodes), channels), dtype=np.float64)
 
     if nf == 0:
-        # Single-cell graph: the anchor is the only Cell.
+        # Single-cell (or single-component) graph: only the anchor qualifies.
         return CellOffsetSolution(
             anchor=anchor,
             cell_ids=tuple(nodes),
             offsets=offsets,
             channels=channels,
-            channel_offsets={anchor: offsets[index[anchor]].copy()},
+            channel_offsets={n: offsets[index[n]].copy() for n in nodes},
             weighted_residual_rms=np.zeros(channels, dtype=np.float64),
             edges_used=0,
             components=1,
         )
 
-    n_edges = len(norm_edges)
+    n_edges = len(active_edges)
     # Build the sparse structure once; weights are per (edge, channel).
     rows = np.empty((n_edges, 2), dtype=np.int64)
-    for r, (u, v, _d, _w) in enumerate(norm_edges):
+    for r, (u, v, _d, _w) in enumerate(active_edges):
         rows[r, 0] = -1 if u == anchor else free_index[u]
         rows[r, 1] = -1 if v == anchor else free_index[v]
 
     residual_rms = np.zeros(channels, dtype=np.float64)
     for c in range(channels):
-        delta_c = np.array([d[c] for (_u, _v, d, _w) in norm_edges], dtype=np.float64)
-        w_c = np.array([w[c] for (_u, _v, _d, w) in norm_edges], dtype=np.float64)
+        delta_c = np.array([d[c] for (_u, _v, d, _w) in active_edges], dtype=np.float64)
+        w_c = np.array([w[c] for (_u, _v, _d, w) in active_edges], dtype=np.float64)
         a = np.zeros((n_edges, nf), dtype=np.float64)
         for r in range(n_edges):
             cu = rows[r, 0]

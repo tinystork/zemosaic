@@ -79,6 +79,8 @@ from .core.canonical_streaming import (
 )
 from .core.zegrid import assembly as za
 from .core.zegrid import auto_layout as zal
+from .core.zegrid import cell_feather as zcf
+from .core.zegrid import cell_offset as zco
 from .core.zegrid import execution as zxe
 from .core.zegrid import file_provider as zfp
 from .core.zegrid import final_mosaic_finishing as zfin
@@ -1153,6 +1155,99 @@ def _resolve_cell_normalization(mode, global_gauge, global_frame_ids, provider, 
     return fixed, zphot.CELL_GAUGE_STATUS_OK, None
 
 
+def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None, emit=None):
+    """R34D: apply inter-cell additive offsets + FEATHERED assembly (opt-in).
+
+    Builds :class:`cell_feather.CellPatch` objects from the per-cell worker results
+    (patch planes), solves the inter-cell additive offset graph (R34c, central
+    anchor, support-count weights, pinned per-cell references), applies the
+    per-channel additive offsets (additive-only), and assembles the canvas with a
+    weighted feather blend (weights sum to 1).
+
+    Disconnected policy (Nono I3): ``on_disconnected="zero"`` — Cells unreachable
+    from the anchor keep offset 0 (their own self-anchored level, recorded); NO
+    local re-anchor, NO fabricated bridge. A WARN lists them.
+    """
+    halo_px = int(zsw.HALO_PX if halo_px is None else halo_px)
+    patches: dict = {}
+    for cid, r in result_by_cid.items():
+        if r.get("status") != "complete":
+            continue
+        p = r.get("patch")
+        if not p:
+            continue
+        patches[cid] = zcf.CellPatch(
+            cell_id=cid,
+            bounds=tuple(int(v) for v in p["bounds"]),
+            core_slice=tuple(int(v) for v in p["core_slice"]),
+            science=p["science"],
+            valid_mask=p["valid_mask"],
+            surviving=p.get("surviving"),
+        )
+    if not patches:
+        raise RuntimeError(
+            "per_cell feather assembly: no complete cell patches were produced"
+        )
+
+    graph = zcf.build_cell_offset_graph(
+        canvas, nx, ny, patches, on_disconnected=zcf.FEATHER_DISCONNECTED_POLICY
+    )
+    if graph.disconnected and emit is not None:
+        try:
+            emit(
+                "ZeGrid: per_cell offset graph — "
+                f"{len(graph.disconnected)} disconnected cell(s) keep offset 0 "
+                f"(policy={graph.policy}): {list(graph.disconnected[:8])}"
+                f"{'...' if len(graph.disconnected) > 8 else ''}",
+                "WARN",
+            )
+        except Exception:
+            pass
+    offsets = {cid: graph.offsets[i] for i, cid in enumerate(graph.cell_ids)}
+    if emit is not None:
+        try:
+            emit(
+                f"ZeGrid: per_cell offsets solved — anchor={graph.anchor} "
+                f"edges={graph.edges_used}/{graph.edges_built} "
+                f"cells={len(graph.cell_ids)} channels={graph.channels} "
+                f"resid_rms={[round(float(x), 6) for x in graph.weighted_residual_rms]}",
+                "INFO",
+            )
+        except Exception:
+            pass
+    assembled = zcf.assemble_canvas_feathered(
+        canvas, nx, ny, patches, offsets, halo_px=halo_px
+    )
+    info = {
+        "anchor": graph.anchor,
+        "cell_ids": list(graph.cell_ids),
+        "channels": int(graph.channels),
+        "edges_used": int(graph.edges_used),
+        "edges_built": int(graph.edges_built),
+        "weighted_residual_rms": [float(x) for x in graph.weighted_residual_rms],
+        "disconnected": list(graph.disconnected),
+        "policy": graph.policy,
+        "offsets": {cid: [float(v) for v in offsets[cid]] for cid in offsets},
+        "halo_px": halo_px,
+    }
+    return assembled, info
+
+
+def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None, emit=None):
+    """Dispatch assembly by cell gauge mode (ZM-CELL-PHOTOMETRY-R34D).
+
+    Returns ``(assembled, feather_info)``. ``"global"`` (default) -> the
+    UNCHANGED one-owner :func:`mosaic.assemble_canvas` (``feather_info`` is None);
+    ``"per_cell"`` (opt-in) -> inter-cell additive offsets + feathered assembly.
+    """
+    resolved = zphot.resolve_cell_gauge_mode(mode)
+    if resolved == zphot.CELL_GAUGE_MODE_PER_CELL:
+        return _assemble_per_cell_feathered(
+            canvas, nx, ny, result_by_cid, halo_px=halo_px, emit=emit
+        )
+    return zmosaic.assemble_canvas(canvas, nx, ny, cores), None
+
+
 def _stack_cell(task):
     """Module-level (picklable) worker: build cache + stack ONE cell (R20).
 
@@ -1270,6 +1365,23 @@ def _stack_cell(task):
         "peak_rss_kib": peak_rss, "cleanup_failed": cleanup_failed,
         "reproject": zxe.get_reproject_path_stats().to_dict(),
         "cache_dir": str(cache_dir),
+        # R34D: in per_cell mode the parent needs the PATCH planes (core + halo)
+        # to measure the inter-cell overlaps and to feather-blend. Global mode
+        # returns only the core (byte-unchanged payload).
+        "patch": (
+            {
+                "bounds": (patch.patch.y0, patch.patch.y1, patch.patch.x0, patch.patch.x1),
+                "core_slice": (
+                    patch.core_slice.y0, patch.core_slice.y1,
+                    patch.core_slice.x0, patch.core_slice.x1,
+                ),
+                "science": mt.science,
+                "valid_mask": mt.valid_mask,
+                "surviving": mt.surviving_sample_count,
+            }
+            if cell_gauge_mode == zphot.CELL_GAUGE_MODE_PER_CELL
+            else None
+        ),
     }
 
 
@@ -2246,11 +2358,24 @@ def _run_single(
     global_eta.phase_completed("per_cell_stack", timings.get("per_cell_stack"))
 
     # ASSEMBLY.
-    _emit("ZeGrid: assembly (R3 assemble_canvas)", callback=progress_callback)
+    _gauge_mode = getattr(science_config, "cell_gauge_mode", "global")
+    feather_info = None
+    if _gauge_mode == zphot.CELL_GAUGE_MODE_PER_CELL:
+        # R34D opt-in path: solve inter-cell additive offsets on the stacked
+        # cells' halo overlaps, apply them (additive-only), then feather-blend.
+        _emit(
+            "ZeGrid: assembly (R34D per_cell feather: offsets + weighted blend)",
+            callback=progress_callback,
+        )
+    else:
+        _emit("ZeGrid: assembly (R3 assemble_canvas)", callback=progress_callback)
     _assembly_rep = _reporter()
     _assembly_rep.start("assembly")
     with timings.timed("assembly"):
-        assembled = zmosaic.assemble_canvas(canvas, nx, ny, cores)
+        assembled, feather_info = _assemble_cells(
+            canvas, nx, ny, _gauge_mode, cores, result_by_cid,
+            halo_px=zsw.HALO_PX, emit=_emit_live,
+        )
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
     # ZM-ZEGRID-R22 honesty fix: peak_rss_kib is a SINGLE process's peak. Report
     # the batch aggregate (parent + all cell workers) as a clearly-labelled UPPER
@@ -2351,6 +2476,7 @@ def _run_single(
         ignored_run_args=ignored_run_args,
         gauge_diagnostics=gauge_diagnostics,
         per_cell_diagnostics=per_cell_diagnostics,
+        cell_feather_info=feather_info,
         finished_science=finished_science, finishing_info=finishing_info,
         fin_uint16=fin_uint16,
         gpu_context=gpu_ctx,
@@ -2717,6 +2843,7 @@ def _write_outputs(
     timings=None, gpu_used=False, ignored_settings=None, ignored_run_args=None,
     gauge_diagnostics=None,
     per_cell_diagnostics=None,
+    cell_feather_info=None,
     finished_science=None, finishing_info=None, fin_uint16=None,
     gpu_context=None,
     aggregate_peak_rss_kib=None,
@@ -2946,6 +3073,30 @@ def _write_outputs(
                 )
             ),
         },
+        # ZM-CELL-PHOTOMETRY-R34D: inter-cell additive offset + feather diagnostics
+        # (present only when the opt-in per_cell feather path ran).
+        "cell_feather": (
+            {
+                "enabled": True,
+                "anchor_cell": cell_feather_info.get("anchor"),
+                "channels": cell_feather_info.get("channels"),
+                "halo_px": cell_feather_info.get("halo_px"),
+                "edges_used": cell_feather_info.get("edges_used"),
+                "edges_built": cell_feather_info.get("edges_built"),
+                "weighted_residual_rms": cell_feather_info.get("weighted_residual_rms"),
+                "disconnected_cells": cell_feather_info.get("disconnected"),
+                "disconnected_policy": cell_feather_info.get("policy"),
+                "offsets": cell_feather_info.get("offsets"),
+                "note": (
+                    "ADDITIVE-ONLY per-channel offsets (one scalar per Cell), global "
+                    "least-squares anchored on the central Cell; disconnected Cells "
+                    "keep offset 0 (recorded, no re-anchor, no bridge). Science is "
+                    "weighted-feather blended (weights sum to 1); no gain/plane."
+                ),
+            }
+            if cell_feather_info is not None
+            else {"enabled": False}
+        ),
         "n_frames": len(descs),
         "frame_ids": [d.frame_id.logical_path for d in descs],
         "sip_mode": sip_mode,
