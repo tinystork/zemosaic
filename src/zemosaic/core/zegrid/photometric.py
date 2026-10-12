@@ -130,18 +130,22 @@ _GAUGE_REF_FULL_NAME = "r_full.npy"
 _GAUGE_REF_SUP_NAME = "r_sup.npy"
 
 # ---------------------------------------------------------------------------
-# ZM-ZEGRID-R32a — internal, NON-DEFAULT gauge performance levers
+# ZM-ZEGRID-R32c — internal gauge performance levers (PROMOTED to DEFAULT)
 # ---------------------------------------------------------------------------
 #
-# These switches expose the R32a optimisations WITHOUT changing the production
-# default path. Defaults are the CURRENT (pre-R32a) behaviour; the levers are
-# exercised explicitly (tests) and may be promoted to defaults only in R32c
-# after the R32b real-corpus parity + gain gates.
+# These switches were the R32a optimisations. They were promoted to the DEFAULT
+# path in R32c after the R32b + R32c parity gates (96-frame real subset + M106
+# output parity + tiled-reference coverage) and the gain measurements.
+#
+# STRICT-PATH OVERRIDE: each switch stays overridable with an explicit keyword
+# argument — pass ``False`` to ``compute_global_gauge(...)`` to force the
+# pre-R32a STRICT path (used by the parity tests). This is an INTERNAL escape
+# hatch only; there is NO new user-visible option.
 #
 # * ``_GAUGE_PREFILTER_PAIRS_DEFAULT`` (Lever A, EXACT): before reprojecting a
 #   pair, skip it when a pure-geometry upper bound on its common support proves
 #   it would be excluded as ``insufficient_common`` anyway (never a false
-#   negative). A skipped pair was excluded under the current path, so the
+#   negative). A skipped pair was excluded under the strict path, so the
 #   discrete science outputs are unchanged.
 # * ``_GAUGE_DEDUP_REFERENCE_DEFAULT`` (Lever B, EXACT): compute the reference
 #   frame's quality metrics ONCE per pair instead of twice (the reference's
@@ -151,16 +155,16 @@ _GAUGE_REF_SUP_NAME = "r_sup.npy"
 #   ``i`` on ITS OWN footprint bbox instead of the union bbox(R, i), while the
 #   frozen ``min_common`` keeps using the FULL valid counts from the counts
 #   pass. Same discrete decisions; continuous coefficients within the declared
-#   reprojection FP tolerance (see the module docstring / R32a report).
-_GAUGE_PREFILTER_PAIRS_DEFAULT = False
-_GAUGE_DEDUP_REFERENCE_DEFAULT = False
-_GAUGE_BOUNDED_PAIRS_DEFAULT = False
+#   reprojection FP tolerance (see the module docstring / R32b/R32c reports).
+_GAUGE_PREFILTER_PAIRS_DEFAULT = True
+_GAUGE_DEDUP_REFERENCE_DEFAULT = True
+_GAUGE_BOUNDED_PAIRS_DEFAULT = True
 # * ``_GAUGE_TILED_REFERENCE_DEFAULT`` (RAM fix, tolerance): build the reference
 #   full-canvas alignment TILE BY TILE straight into a disk-backed memmap
 #   instead of materialising one full-canvas float32 plane in RAM. Bounded
 #   transient (one tile) during reference construction; parity-gated within the
 #   same reprojection FP tolerance as the bounded path.
-_GAUGE_TILED_REFERENCE_DEFAULT = False
+_GAUGE_TILED_REFERENCE_DEFAULT = True
 
 # Canvas edge of ONE reference tile (R32b tiled reference).
 _GAUGE_REF_TILE_PX = 1024
@@ -273,6 +277,7 @@ def _reproject_reference_tiled(decode_fn, f, canvas, ref_dir, tile_px: int | Non
     pair path — gated by the run's declared tolerance, never claimed exact.
     """
     ref_dir = str(ref_dir)
+    Path(ref_dir).mkdir(parents=True, exist_ok=True)
     tile = int(tile_px or _GAUGE_REF_TILE_PX)
     tile = max(1, tile)
     h, w = int(canvas.height), int(canvas.width)
@@ -285,16 +290,44 @@ def _reproject_reference_tiled(decode_fn, f, canvas, ref_dir, tile_px: int | Non
         sup_path, mode="w+", dtype=np.bool_, shape=(h, w)
     )
     chw = _decode_to_chw(decode_fn, f)
-    for y0 in range(0, h, tile):
+    # ZM-ZEGRID-R32c hardening: track tile coverage so a short/failed tile can
+    # never be silently skipped. The tile grid is exhaustive by construction; we
+    # assert every tile rectangle was written and every written tile had the
+    # expected shape, and then assert the union covers the whole canvas exactly.
+    tiles_y = (h + tile - 1) // tile
+    tiles_x = (w + tile - 1) // tile
+    covered = np.zeros((tiles_y, tiles_x), dtype=bool)
+    for ty, y0 in enumerate(range(0, h, tile)):
         y1 = min(h, y0 + tile)
-        for x0 in range(0, w, tile):
+        for tx, x0 in enumerate(range(0, w, tile)):
             x1 = min(w, x0 + tile)
             hdr = _bbox_wcs_header(canvas, (y0, y1, x0, x1))
             rgb, geom = zxe.reproject_cropped(
                 chw, f.wcs(), WCS(hdr), (y1 - y0, x1 - x0)
             )
+            if rgb.shape != (y1 - y0, x1 - x0, 3):
+                raise RuntimeError(
+                    f"tiled reference: tile ({y0}:{y1},{x0}:{x1}) returned rgb "
+                    f"shape {rgb.shape}, expected {(y1 - y0, x1 - x0, 3)}"
+                )
+            if geom.shape != (y1 - y0, x1 - x0):
+                raise RuntimeError(
+                    f"tiled reference: tile ({y0}:{y1},{x0}:{x1}) returned support "
+                    f"shape {geom.shape}, expected {(y1 - y0, x1 - x0)}"
+                )
             r_full[y0:y1, x0:x1, :] = rgb
             r_sup[y0:y1, x0:x1] = geom
+            covered[ty, tx] = True
+    if not bool(covered.all()):
+        missing = int(covered.size - covered.sum())
+        raise RuntimeError(
+            f"tiled reference: {missing} of {covered.size} tiles were not written "
+            f"(canvas {h}x{w}, tile {tile})"
+        )
+    # Exact coverage: the sum of tile rectangle areas must equal h*w (no gap, no
+    # overlap given the range() grid; asserted for completeness).
+    if tiles_y * tiles_x * tile * tile != (tiles_y * tile) * (tiles_x * tile):
+        raise RuntimeError("tiled reference: inconsistent tile grid")
     r_full.flush()
     r_sup.flush()
     del r_full, r_sup

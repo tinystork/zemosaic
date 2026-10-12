@@ -2,7 +2,8 @@
 
 Fast, synthetic (no gated corpora). Covers the R32a deliverables:
 
-* the internal levers DEFAULT OFF (the production default path is unchanged);
+* the internal levers are PROMOTED to DEFAULT ON (R32c) with an explicit
+  keyword override to force the STRICT path;
 * EXACT Lever A (geometric prefilter) — never a false negative, and the
   prefiltered path reproduces the strict path's discrete outputs exactly;
 * EXACT Lever B (reference dedup) — bit-identical coefficients/weights;
@@ -152,11 +153,36 @@ def _disjoint_corpus():
 
 
 def _run(descs, canvas, config, **kw):
+    """Run the gauge with an EXPLICIT lever configuration.
+
+    R32c: the module defaults are now all ON. To keep every parity test
+    unambiguous, ``_run`` starts from the STRICT pre-R32a configuration and
+    applies any lever keyword on top, so ``_run(...)`` == strict and
+    ``_run(..., tiled_reference=True)`` == only that lever on.
+    """
+    params = {**_STRICT, **kw}
     diag: dict = {}
     g, ids = zphot.compute_global_gauge(
-        descs, canvas, _decode, config, None, workers=1, diagnostics=diag, **kw
+        descs, canvas, _decode, config, None, workers=1, diagnostics=diag, **params
     )
     return g, ids, diag
+
+
+def _run_default(descs, canvas, config):
+    """Run the gauge using the MODULE defaults (promoted/all-ON in R32c)."""
+    diag: dict = {}
+    g, ids = zphot.compute_global_gauge(
+        descs, canvas, _decode, config, None, workers=1, diagnostics=diag
+    )
+    return g, ids, diag
+
+
+_STRICT = {
+    "prefilter_pairs": False,
+    "dedup_reference": False,
+    "bounded_pairs": False,
+    "tiled_reference": False,
+}
 
 
 def _excl_id(gauge):
@@ -196,11 +222,37 @@ def _assert_parity(strict, opt, *, exact: bool):
 # Defaults unchanged + instrumentation schema
 # ---------------------------------------------------------------------------
 
-def test_levers_default_off():
-    assert zphot._GAUGE_PREFILTER_PAIRS_DEFAULT is False
-    assert zphot._GAUGE_DEDUP_REFERENCE_DEFAULT is False
-    assert zphot._GAUGE_BOUNDED_PAIRS_DEFAULT is False
-    assert zphot._GAUGE_TILED_REFERENCE_DEFAULT is False
+def test_levers_promoted_default_on():
+    assert zphot._GAUGE_PREFILTER_PAIRS_DEFAULT is True
+    assert zphot._GAUGE_DEDUP_REFERENCE_DEFAULT is True
+    assert zphot._GAUGE_BOUNDED_PAIRS_DEFAULT is True
+    assert zphot._GAUGE_TILED_REFERENCE_DEFAULT is True
+
+
+def test_strict_override_reachable_and_default_on():
+    """R32c: the defaults are ON, and an explicit all-False override forces the
+    strict path (documented internal escape hatch)."""
+    descs, _ = _dithered_corpus()
+    canvas = zg.build_canvas(descs)
+    cfg = ExecutorConfig().science_config()
+    _, _, diag_on = _run_default(descs, canvas, cfg)
+    assert diag_on["instrumentation"]["levers"] == {
+        "prefilter_pairs": True,
+        "dedup_reference": True,
+        "bounded_pairs": True,
+        "tiled_reference": True,
+    }
+    _, _, diag_off = _run(
+        descs, canvas, cfg,
+        prefilter_pairs=False, dedup_reference=False,
+        bounded_pairs=False, tiled_reference=False,
+    )
+    assert diag_off["instrumentation"]["levers"] == {
+        "prefilter_pairs": False,
+        "dedup_reference": False,
+        "bounded_pairs": False,
+        "tiled_reference": False,
+    }
 
 
 @pytest.mark.parametrize("sip", [False, True])
@@ -217,14 +269,59 @@ def test_tiled_reference_within_tolerance(sip):
     assert diag["instrumentation"]["reference"]["tiled"] is True
 
 
-def test_default_path_equals_all_levers_off():
+def test_tiled_reference_full_coverage_no_gap(tmp_path):
+    """R32c (c): every tile is written (no gap/overlap), file shapes complete,
+    support identical, values within tolerance, even with a non-dividing tile."""
+    from zemosaic.core.zegrid import execution as zxe  # noqa: F401
+
+    descs = _full_overlap_corpus(h=48, w=48)
+    canvas = zg.build_canvas(descs)
+    r_full, r_sup = zphot._reproject_full(_decode, descs[0], canvas)
+    ref_dir = tmp_path / "ref"
+    ref_dir.mkdir()
+    zphot._reproject_reference_tiled(
+        _decode, descs[0], canvas, str(ref_dir), tile_px=17
+    )
+    rt = np.asarray(np.load(ref_dir / zphot._GAUGE_REF_FULL_NAME, mmap_mode="r"))
+    st = np.asarray(np.load(ref_dir / zphot._GAUGE_REF_SUP_NAME, mmap_mode="r"))
+    assert rt.shape == r_full.shape
+    assert st.shape == r_sup.shape
+    assert np.array_equal(st, np.asarray(r_sup))
+    assert np.allclose(rt, r_full, rtol=1e-4, atol=1e-4, equal_nan=True)
+
+
+def test_tiled_reference_tile_failure_propagates(tmp_path, monkeypatch):
+    """R32c (c): a failing tile must NOT be silently skipped."""
+    from zemosaic.core.zegrid import execution as zxe
+
+    descs = _full_overlap_corpus(h=48, w=48)
+    canvas = zg.build_canvas(descs)
+    calls = {"n": 0}
+    orig = zxe.reproject_cropped
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("tile boom")
+        return orig(*a, **k)
+
+    monkeypatch.setattr(zxe, "reproject_cropped", boom)
+    with pytest.raises(RuntimeError):
+        zphot._reproject_reference_tiled(
+            _decode, descs[0], canvas, str(tmp_path / "r"), tile_px=17
+        )
+
+
+def test_default_path_equals_all_levers_on():
+    """R32c: the module default path IS the all-levers-ON path."""
     descs, _ = _dithered_corpus()
     canvas = zg.build_canvas(descs)
     cfg = ExecutorConfig().science_config()
     g0, _ = zphot.compute_global_gauge(descs, canvas, _decode, cfg, None, workers=1)
     g1, _, _ = _run(
         descs, canvas, cfg,
-        prefilter_pairs=False, dedup_reference=False, bounded_pairs=False,
+        prefilter_pairs=True, dedup_reference=True, bounded_pairs=True,
+        tiled_reference=True,
     )
     _assert_parity(g0, g1, exact=True)
 
