@@ -443,19 +443,34 @@ def test_manifest_cpu_streaming_block_contract(tmp_path, routine_corpus, monkeyp
 _FakeCupyOOM = type("OutOfMemoryError", (Exception,), {"__module__": "cupy.cuda.memory"})
 
 
-def _force_gpu_selection(monkeypatch):
+def _force_gpu_selection(monkeypatch, gpu_tile=128):
     from zemosaic.core.zegrid import gpu as zgpu
     monkeypatch.setattr(zgpu, "probe_gpu_backend", lambda: {
         "available": True, "device": "FakeGPU", "cupy_version": "fake",
         "vram_total_bytes": 8 * GB, "vram_free_bytes": int(7.5 * GB), "reason": None,
     })
     monkeypatch.setattr(zgpu, "vram_budget_bytes", lambda probe: 4 * GB)
-    monkeypatch.setattr(zgpu, "choose_gpu_tile_size", lambda *a, **k: 128)
+    monkeypatch.setattr(zgpu, "choose_gpu_tile_size", lambda *a, **k: gpu_tile)
+
+
+def _force_gpu_runtime_tiles(monkeypatch):
+    """CPU tile 64; EFFECTIVE GPU tile 48 (< CPU tile, both host-RAM-feasible)."""
+    budget = 8192
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: int(budget / zpar.RAM_SAFETY_FRACTION))
+    monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(10 ** 12))  # inmem fails
+    table = {128: 100000, 112: 100000, 96: 100000, 80: 100000,
+             64: 4096, 48: 1000, 32: 500}
+    monkeypatch.setattr(zz, "_estimate_streaming_bytes",
+                        lambda n, hw, tile=zz.STREAM_TILE_SIZE, channels=3: int(
+                            table.get(int(tile) if tile is not None else 128, 100000)))
+    monkeypatch.setattr(zpar, "cells_in_flight", lambda *a, **k: 1)
+    _force_gpu_selection(monkeypatch, gpu_tile=48)
 
 
 def test_gpu_runtime_fallback_uses_selected_cpu_tile(tmp_path, routine_corpus, monkeypatch):
-    _force_cpu_tile_64(monkeypatch)
-    _force_gpu_selection(monkeypatch)
+    """A valid GPU plan (effective GPU tile 48) + runtime GPU OOM -> CPU rerun at the
+    SELECTED CPU tile 64 (never a re-coded 128, never the GPU tile)."""
+    _force_gpu_runtime_tiles(monkeypatch)
     calls = []
     real = zz.run_canonical_stack_streaming
 
@@ -471,14 +486,15 @@ def test_gpu_runtime_fallback_uses_selected_cpu_tile(tmp_path, routine_corpus, m
     _prepare_input(inp, routine_corpus)
     zz.run_zegrid_mode(str(inp), str(out), use_gpu=True)
 
-    # GPU attempt used the GPU tile (policy unchanged)...
-    assert any(b == "gpu" and t == 128 for b, t in calls), calls
-    # ...and the CPU rerun used the selected CPU tile 64 — NEVER a re-coded 128.
+    # GPU was attempted at its EFFECTIVE tile (48), not 128 and not the CPU 64.
+    assert any(b == "gpu" and t == 48 for b, t in calls), calls
+    # The CPU rerun used the selected CPU tile 64.
     cpu_tiles = {t for b, t in calls if b == "cpu"}
     assert cpu_tiles == {64}, calls
     m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
     assert m["gpu"]["cpu_streaming_tile"] == 64
-    assert m["gpu"]["gpu_streaming_tile"] == 128
+    assert m["gpu"]["gpu_streaming_tile"] == 48
+    assert m["gpu"]["runtime_fallback"] is not None
 
 
 def test_gpu_vram_infeasible_uses_selected_cpu_tile(tmp_path, routine_corpus, monkeypatch):
@@ -535,8 +551,9 @@ def test_f2_gpu_ram_infeasible_degrades_to_cpu_inmem_before_execution(tmp_path, 
     m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
     assert m["gpu"]["used"] is False
     assert m["gpu"]["final_backend"] == "cpu"
-    assert m["gpu"]["fallback_reason"] == "gpu_stream_ram_infeasible"
-    assert m["gpu"]["pre_execution_fallback"]["reason"] == "gpu_stream_ram_infeasible"
+    assert m["gpu"]["fallback_reason"] == "gpu_stream_host_ram_infeasible"
+    assert m["gpu"]["pre_execution_fallback"]["reason"] == "gpu_stream_host_ram_infeasible"
+    assert m["gpu"]["gpu_streaming_tile"] is None
     assert m["per_cell_diagnostics"]["mode"] == "inmem"
 
 
@@ -560,3 +577,74 @@ def test_f2_both_infeasible_fails_loud_no_gpu_attempt(tmp_path, routine_corpus, 
     with pytest.raises(zal.LayoutInfeasible):
         zz.run_zegrid_mode(str(inp), str(out), use_gpu=True)
     assert backends == [], backends
+
+
+# --- rework-2 F-M1: GPU gate at the GPU's OWN tile -------------------------------
+
+def test_fm1_gpu_tile128_host_infeasible_refuses_gpu_uses_cpu64(tmp_path, routine_corpus, monkeypatch):
+    """F-M1: CPU tile 64 fits host RAM but the GPU's OWN tile 128 does NOT.
+
+    The GPU must be refused BEFORE execution (zero GPU executor call), the CPU is
+    re-planned and EXECUTED at the selected CPU tile 64, and the manifest records
+    the exact GPU tile/bound + reason.
+    """
+    _force_cpu_tile_64(monkeypatch)              # CPU tile 64; stream@128 infeasible
+    _force_gpu_selection(monkeypatch, gpu_tile=128)
+    calls = []
+    real = zz.run_canonical_stack_streaming
+
+    def spy(provider, request, tile_size=None, fixed=None):
+        calls.append((getattr(request, "backend", "cpu"),
+                      int(tile_size) if tile_size is not None else None))
+        return real(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
+    inp, out = tmp_path / "in", tmp_path / "out"
+    _prepare_input(inp, routine_corpus)
+    zz.run_zegrid_mode(str(inp), str(out), use_gpu=True)
+
+    assert "gpu" not in {b for b, _t in calls}, calls      # zero GPU executor call
+    assert {t for b, t in calls if b == "cpu"} == {64}, calls
+    m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
+    assert m["gpu"]["used"] is False
+    assert m["gpu"]["final_backend"] == "cpu"
+    assert m["gpu"]["attempted"] is False
+    assert m["gpu"]["fallback_reason"] == "gpu_stream_host_ram_infeasible"
+    pef = m["gpu"]["pre_execution_fallback"]
+    assert pef["reason"] == "gpu_stream_host_ram_infeasible"
+    assert pef["gpu_streaming_tile"] == 128
+    assert pef["gpu_streaming_host_peak_bytes"] == 8192 * 4
+    assert pef["ram_budget_bytes"] == 8192
+    assert m["gpu"]["gpu_streaming_tile"] is None
+    assert m["per_cell_diagnostics"]["cpu_streaming_tile"] == 64
+
+
+def test_fm1_gpu_effective_tile_fits_is_attempted_single_owner(tmp_path, routine_corpus, monkeypatch):
+    """F-M1: the GPU's OWN tile (48) host bound fits -> GPU IS attempted at 48
+    (single owner), and a runtime OOM then reruns CPU at the selected tile 64."""
+    _force_gpu_runtime_tiles(monkeypatch)   # CPU tile 64, GPU tile 48
+    calls = []
+    real = zz.run_canonical_stack_streaming
+
+    def spy(provider, request, tile_size=None, fixed=None):
+        backend = getattr(request, "backend", "cpu")
+        calls.append((backend, int(tile_size) if tile_size is not None else None))
+        if backend == "gpu":
+            raise _FakeCupyOOM("simulated runtime OOM")
+        return real(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
+    inp, out = tmp_path / "in", tmp_path / "out"
+    _prepare_input(inp, routine_corpus)
+    zz.run_zegrid_mode(str(inp), str(out), use_gpu=True)
+
+    assert any(b == "gpu" and t == 48 for b, t in calls), calls
+    # The gate used the GPU tile 48 bound (1000), NOT the 128 bound (100000).
+    m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
+    assert m["gpu"]["gpu_streaming_tile"] == 48
+    assert m["gpu"]["gpu_streaming_host_peak_bytes"] == 1000
+    assert m["per_cell_diagnostics"]["gpu_streaming_tile"] == 48
+    assert m["per_cell_diagnostics"]["gpu_streaming_host_peak_bytes"] == 1000
+    assert m["per_cell_diagnostics"]["gpu_serialized"] is True
+    assert m["per_cell_diagnostics"]["cells_in_flight"] == 1      # single-owner
+    assert m["gpu"]["pre_execution_fallback"] is None

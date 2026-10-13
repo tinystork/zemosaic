@@ -82,6 +82,14 @@ Mission: `ZM-ZEGRID-R36` (implementation). Repo `zemosaic`, branch `beta`.
     streaming bound is kept SEPARATELY (and NOT called the plan's predicted bound)
     in `cpu_streaming.preferred_stream_bound_bytes`; the CHOSEN log prints
     `predicted bound ... ; CPU streaming tile <t> (stream@<t>=...)`.
+11. **F-M1 (rework-2) — the GPU gate uses the GPU's OWN tile.** The VRAM-aware
+    GPU tile is determined BEFORE the joint plan and the GPU RAM-feasibility gate
+    uses the published estimator at that EFFECTIVE tile. A CPU@48 fit does NOT
+    imply a GPU@128 fit (the canonical GPU materialises host-side buffers that
+    scale with the real tile). When the GPU's effective-tile host bound exceeds the
+    budget the GPU is refused BEFORE execution (zero GPU attempt) and the CPU is
+    re-planned and executed at the adaptive `cpu_streaming_tile`. `per_cell_footprint`
+    and the GPU candidate reflect the GPU-tile bound when the GPU actually runs.
 
 ## MEMORY MODEL
 
@@ -147,12 +155,27 @@ that clamp as feasibility, and its docstring now says so explicitly.
 ## GPU
 
 - `core/zegrid/gpu.py::choose_gpu_tile_size()` NOT modified; VRAM policy NOT modified.
-- GPU success: `_run_cell_batch(science_config, gpu_tile_size, gpu_attempt=True)`.
-- Pre-run VRAM-infeasible (`_gpu_ts is None`): `gpu_used=False`, then the CPU
-  batch runs with `cpu_streaming_tile`.
-- Classified runtime GPU error: one-shot whole-batch CPU rerun with
-  `cpu_streaming_tile` (never a re-coded 128).
-- Manifest: `gpu.cpu_streaming_tile` and `gpu.gpu_streaming_tile`.
+- **F-M1 (rework-2):** the VRAM-aware GPU tile is determined BEFORE the joint
+  plan, and the GPU RAM-feasibility gate is evaluated with the published estimator
+  at the GPU's OWN effective tile (`_estimate_streaming_bytes(n, patch_hw,
+  gpu_tile_size)`), not at the CPU tile. A GPU whose effective-tile host bound
+  exceeds `per_cell_budget` is refused BEFORE execution (zero GPU attempt).
+- GPU success: `_run_cell_batch(science_config, gpu_tile_size, gpu_attempt=True)`;
+  single-owner (`cells_in_flight == 1`).
+- Pre-run VRAM-infeasible (`choose_gpu_tile_size() is None`): `gpu_used=False`
+  BEFORE the plan, `pre_execution_fallback.reason="vram_tile_infeasible"`, then the
+  CPU plan/batch runs with `cpu_streaming_tile`.
+- GPU effective-tile host-RAM-infeasible: `gpu_used=False` BEFORE the plan,
+  `pre_execution_fallback.reason="gpu_stream_host_ram_infeasible"` (with
+  `gpu_streaming_tile`/`gpu_streaming_host_peak_bytes`/`ram_budget_bytes`), then a
+  CPU re-plan (inmem/stream/`ModeInfeasible`).
+- Classified runtime GPU error after a VALID GPU plan: one-shot whole-batch CPU
+  rerun with `cpu_streaming_tile` (never a re-coded 128, never the GPU tile).
+- Manifest/log: `gpu.cpu_streaming_tile`, `gpu.gpu_streaming_tile`,
+  `gpu.gpu_streaming_host_peak_bytes`, `gpu.pre_execution_fallback`; when the GPU
+  is not attempted for host RAM, `attempted=false`, `final_backend=cpu`, explicit
+  reason. `per_cell_diagnostics.gpu_streaming_host_peak_bytes` reflects the
+  EXECUTED GPU bound (not the CPU bound).
 
 ## SCIENCE
 
@@ -184,11 +207,12 @@ Scratch: `.a2a-reports/ZM-ZEGRID-R36-scratch/` (nothing written under
   legacy preferred stream@128 `4266.6 MiB` (kept as
   `cpu_streaming.preferred_stream_bound_bytes`, NOT the predicted bound).
   Tiles `128/112/96/80/64` exceed the budget; `48` and `32` fit.
-- **Dynamic (informational, single capture `2026-10-13T18:47:15Z`):** the host's
-  `avail*0.8` was `1369.5 MiB` → **FIT**, layout `24x15` (360 cells, maxN 539),
-  CPU tile **32**, predicted bound `1260.2 MiB`. This block is INFORMATIONAL only
-  (the host budget varies); the FIXED 2514.4 MiB witness above is authoritative.
-  Both blocks come from the SAME capture
+- **Dynamic (informational, single capture `2026-10-13T19:09:42Z`):** the host's
+  `avail*0.8` was `987.4 MiB` → **NO FIT** (the finest floor-feasible layout
+  `26x16` needs `1191.8 MiB` even at the minimum tile 32; in-memory worst
+  `4597.0 MiB`). This block is INFORMATIONAL only — the host's free memory varies
+  between captures, which is exactly why only the FIXED 2514.4 MiB witness is
+  authoritative. Both blocks come from the SAME capture
   (`.a2a-reports/ZM-ZEGRID-R36-scratch/witness_planning_result.json`,
   `_captured_at`).
 
@@ -219,8 +243,8 @@ buys depth); no new parallelism was added.
 Commands actually executed (repo root, `python -m pytest`):
 
 - `tests/test_zegrid_layout_performance_r28.py tests/test_zegrid_layout_observability_r27.py tests/test_zegrid_r20_percell_parallel.py tests/test_zegrid_r22_gpu_contract.py` → **49 passed** (r0) / **44 passed** for R27+R28+R22 after the rework (R20 re-run green in the rework set).
-- `tests/test_zegrid_r36_adaptive_cpu_tile.py` → **26 passed** (r0 file had 20; rework-1 added F1/F2/F3 direct tests and two GPU-RAM-infeasibility integration tests).
-- Targeted regression set `test_zegrid_r20_percell_parallel.py test_zegrid_r22_runtime_fallback.py test_zegrid_r6_file_provider.py test_sci05_canonical_streaming.py test_zegrid_r4_auto_layout.py test_zegrid_layout_performance_r28.py test_zegrid_layout_observability_r27.py -m "not slow"` → **99 passed, 1 skipped**.
+- **`tests/test_zegrid_r36_adaptive_cpu_tile.py`** → **28 passed** (r0: 20; rework-1 added F1/F2/F3 direct + GPU-RAM-infeasibility integration tests; rework-2 added the two F-M1 GPU-effective-tile tests).
+- Targeted regression set `test_zegrid_r20_percell_parallel.py test_zegrid_r22_runtime_fallback.py test_zegrid_r22_gpu_contract.py test_zegrid_r6_file_provider.py test_zegrid_r4_auto_layout.py test_zegrid_layout_performance_r28.py test_zegrid_layout_observability_r27.py test_sci05_canonical_streaming.py -m "not slow"` → **117 passed, 1 skipped** (rework-2).
 - Pre-existing environmental failure (CuPy+GPU present):
   `test_sci05_canonical_streaming::TestValidation::test_gpu_backend_raises` —
   unrelated to R36, not forced green.
@@ -231,6 +255,15 @@ candidates are coherent; F3 predicted bound == selected bound (<= budget) with t
 legacy bound kept separately; F2 product-path GPU-RAM-infeasible → CPU inmem with
 NO GPU executor attempt and an honest manifest; both-infeasible fails loud with no
 executor attempt.
+
+Rework-2 (F-M1) tests: CPU tile 64 fits + GPU chooser 128 with `estimate@128` >
+budget → zero GPU executor call, WARN + `pre_execution_fallback`
+(`gpu_stream_host_ram_infeasible`, `gpu_streaming_tile=128`,
+`gpu_streaming_host_peak_bytes`), CPU re-plan + EXECUTION at tile 64; GPU effective
+tile 48 (host bound fits) → GPU IS attempted at 48 (single-owner) with the 48
+bound gating, then a runtime OOM reruns CPU at tile 64; GPU VRAM tile `None` →
+CPU re-plan before execution; runtime GPU failure after a valid plan → CPU rerun at
+the selected CPU tile.
 
 ## OPEN ISSUES
 

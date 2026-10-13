@@ -105,8 +105,8 @@ CACHE_DIR_NAME = "__zegrid_cache__"
 # Run-log filename written into the run's output folder (the user reported it absent).
 RUN_LOG_NAME = "zegrid_run.log"
 # Streaming tile size for the R6 executor (safe, memory-bounded default).
-STREAM_TILE_SIZE = 128# Fraction of available memory the R4 in-memory bound must fit within to select
-# the in-memory path (headroom for decode/cache transients + allocator variance).
+STREAM_TILE_SIZE = 128
+
 # ZM-ZEGRID-R36: deterministic CPU streaming-tile ladder, ordered
 # performance -> economy. The planner picks the LARGEST tile whose worst-cell
 # streaming bound fits the RAM budget. ``128`` is the historical/preferred tile;
@@ -117,6 +117,8 @@ CPU_STREAMING_TILE_LADDER = (128, 112, 96, 80, 64, 48, 32)
 CPU_STREAMING_TILE_PREFERRED = 128
 CPU_STREAMING_TILE_MINIMUM = 32
 
+# Fraction of available memory the R4 in-memory bound must fit within to select
+# the in-memory path (headroom for decode/cache transients + allocator variance).
 INMEM_AVAILABLE_FRAC = 0.80
 # Normalization token for the ZeGrid engine when none is explicitly requested.
 DEFAULT_NORMALIZATION = "sky_mean"
@@ -1752,6 +1754,7 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
         # GPU->CPU fallback) and the GPU streaming tile (the GPU success path).
         "cpu_streaming_tile": ctx.get("cpu_streaming_tile"),
         "gpu_streaming_tile": ctx.get("gpu_streaming_tile"),
+        "gpu_streaming_host_peak_bytes": ctx.get("gpu_streaming_host_peak_bytes"),
         "backend": {
             "gauge_rejection": "cpu",
             "gauge_combine": "cpu",
@@ -2388,25 +2391,86 @@ def _run_single(
     # degrades to the serial loop via pmap's fail-safe (never crash, never silent).
     available_now = available_memory_bytes()
     per_cell_budget = int(available_now * zpar.RAM_SAFETY_FRACTION)
-    cell_specs = []          # (cell, patch, mem, cache_dir, inmem_b | None, stream_b)
-    cell_bound_pairs = []    # (inmem_b, stream_b) for the joint planner (non-empty)
+
+    # ZM-ZEGRID-R22/R36: VRAM-bounded GPU tile size for the stack phase, determined
+    # BEFORE the joint plan (ZM-ZEGRID-R36 F-M1) so the GPU RAM-feasibility gate is
+    # evaluated at the GPU's OWN execution tile. The canonical GPU materialises
+    # host-side buffers that scale with the REAL tile, so "CPU@48 fits" does NOT
+    # imply "GPU@128 fits". Single GPU owner => stack tasks serialise; the tile is a
+    # pure function of (max N, worst patch, VRAM budget) (gpu.py untouched). A
+    # degenerate (None) tile degrades LOUDLY to exact CPU (no silent fallback).
+    gpu_tile_size = STREAM_TILE_SIZE
+    gpu_streaming_tile = None
+    gpu_streaming_host_peak_bytes = None
+    if gpu_used:
+        max_n = max((len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids), default=1)
+        worst_hw = (1, 1)
+        worst_area = -1
+        for (_r, _c, _ce, _p, m) in cell_ctxs:
+            if m.patch_ids:
+                hw = _p.patch_shape_hw
+                area = hw[0] * hw[1]
+                if area > worst_area:
+                    worst_area = area
+                    worst_hw = hw
+        _gpu_ts = zgpu.choose_gpu_tile_size(max_n, 3, worst_hw, gpu_ctx.get("vram_budget_bytes"))
+        if _gpu_ts is None:
+            _emit(
+                "ZeGrid: VRAM budget cannot hold even a minimum GPU tile for the "
+                "heaviest cell; degrading to exact CPU before execution "
+                "(no GPU attempt, no silent fallback)",
+                lvl="WARN", callback=progress_callback,
+            )
+            gpu_used = False
+            science_config = replace(science_config, backend="cpu")
+            gpu_ctx = dict(gpu_ctx)
+            gpu_ctx["effective"] = False
+            gpu_ctx["attempted"] = False
+            gpu_ctx["final_effective"] = False
+            gpu_ctx["actually_used"] = False
+            gpu_ctx["final_backend"] = "cpu"
+            gpu_ctx["fallback_reason"] = gpu_ctx.get("fallback_reason") or "vram_tile_infeasible"
+            gpu_ctx["pre_execution_fallback"] = {
+                "reason": "vram_tile_infeasible",
+                "detail": "choose_gpu_tile_size returned None (VRAM budget too small)",
+            }
+            ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
+        else:
+            gpu_tile_size = _gpu_ts
+            gpu_streaming_tile = _gpu_ts
+
+    cell_specs = []          # (cell, patch, mem, cache_dir, inmem_b|None, cpustream_b, gpustream_b|None)
+    cell_bound_pairs = []    # (inmem_b, cpustream_b) — CPU plan (adaptive CPU tile)
+    gpu_bound_pairs = []     # (inmem_b, gpustream_b) — GPU plan (EFFECTIVE GPU tile)
     for (row, col, cell, patch, mem) in cell_ctxs:
         cid = cell.cell_id
         idx = row * nx + col
         if not mem.patch_ids:
-            cell_specs.append((cell, patch, mem, str(cache_root / cid), None, 0))
+            cell_specs.append((cell, patch, mem, str(cache_root / cid), None, 0, None))
             continue
         n = len(mem.patch_ids)
         area = patch.patch.width * patch.patch.height
         inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
         stream_b = _estimate_streaming_bytes(n, patch.patch_shape_hw, cpu_streaming_tile)
+        gpu_stream_b = (
+            _estimate_streaming_bytes(n, patch.patch_shape_hw, gpu_tile_size) if gpu_used else None
+        )
         cell_bound_pairs.append((inmem_b, stream_b))
-        cell_specs.append((cell, patch, mem, str(cache_root / cid), inmem_b, stream_b))
+        if gpu_stream_b is not None:
+            gpu_bound_pairs.append((inmem_b, gpu_stream_b))
+        cell_specs.append((cell, patch, mem, str(cache_root / cid), inmem_b, stream_b, gpu_stream_b))
         _emit(
             f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) N={n} area={area}px "
-            f"inmem={inmem_b / 2**20:.1f}MiB stream={stream_b / 2**20:.1f}MiB",
+            f"inmem={inmem_b / 2**20:.1f}MiB stream(cpu{cpu_streaming_tile})={stream_b / 2**20:.1f}MiB"
+            + (
+                f" stream(gpu{gpu_tile_size})={gpu_stream_b / 2**20:.1f}MiB"
+                if gpu_stream_b is not None else ""
+            ),
             callback=progress_callback,
         )
+
+    if gpu_used:
+        gpu_streaming_host_peak_bytes = int(max((b for _a, b in gpu_bound_pairs), default=0))
 
     # ZM-ZEGRID-R22: JOINT mode + concurrency planner (replaces the R20 two-step
     # trap: 'pick inmem per cell, then discover concurrency=1'). One explicit
@@ -2414,25 +2478,30 @@ def _run_single(
     # the CPU RAM AND (when GPU) the single-device owner constraint, and the
     # chosen concurrency is recorded verbatim in the manifest (never a silent
     # serial surprise).
-    # ZM-ZEGRID-R36 (F2): if the GPU backend was selected but its ONLY (stream)
-    # mode is RAM-infeasible, do NOT pretend the GPU is executable. Degrade
-    # LOUDLY to exact CPU BEFORE any execution, then re-plan on CPU (which picks
-    # inmem if only inmem fits, stream if only stream fits, or raises if neither).
+    # ZM-ZEGRID-R36 (F-M1): when the GPU is effective the plan is evaluated on the
+    # GPU-TILE host bounds; if that mode is RAM-infeasible the GPU is refused and
+    # the product degrades to exact CPU BEFORE execution, then re-plans on CPU
+    # (inmem if only inmem fits, stream if only stream fits, else ModeInfeasible).
+    _plan_pairs = gpu_bound_pairs if gpu_used else cell_bound_pairs
     try:
         _plan = zpar.plan_cell_concurrency(
-            cell_bound_pairs, os.cpu_count(), per_cell_budget,
+            _plan_pairs, os.cpu_count(), per_cell_budget,
             gpu_backend=gpu_used, cache_build_workers=cache_build_workers,
         )
     except zpar.ModeInfeasible as _exc:
         if not gpu_used:
             raise
+        _gpu_host_peak = int(gpu_streaming_host_peak_bytes or 0)
         _emit(
-            f"ZeGrid: GPU requested but its RAM-bounded streaming mode is "
-            f"INFEASIBLE ({_exc}); degrading to exact CPU BEFORE execution "
-            f"(no GPU attempt, no silent fallback)",
+            f"ZeGrid: GPU tile {gpu_tile_size} host-RAM streaming bound "
+            f"{_gpu_host_peak / 2**20:.1f} MiB is INFEASIBLE under budget "
+            f"{per_cell_budget / 2**20:.1f} MiB ({_exc}); degrading to exact CPU "
+            f"BEFORE execution (no GPU attempt, no silent fallback)",
             lvl="WARN", callback=progress_callback,
         )
         gpu_used = False
+        gpu_streaming_tile = None
+        gpu_streaming_host_peak_bytes = None
         science_config = replace(science_config, backend="cpu")
         gpu_ctx = dict(gpu_ctx)
         gpu_ctx["effective"] = False
@@ -2440,9 +2509,15 @@ def _run_single(
         gpu_ctx["final_effective"] = False
         gpu_ctx["actually_used"] = False
         gpu_ctx["final_backend"] = "cpu"
-        gpu_ctx["fallback_reason"] = gpu_ctx.get("fallback_reason") or "gpu_stream_ram_infeasible"
+        gpu_ctx["fallback_reason"] = (
+            gpu_ctx.get("fallback_reason") or "gpu_stream_host_ram_infeasible"
+        )
         gpu_ctx["pre_execution_fallback"] = {
-            "reason": "gpu_stream_ram_infeasible", "detail": str(_exc),
+            "reason": "gpu_stream_host_ram_infeasible",
+            "gpu_streaming_tile": int(gpu_tile_size),
+            "gpu_streaming_host_peak_bytes": int(_gpu_host_peak),
+            "ram_budget_bytes": int(per_cell_budget),
+            "detail": str(_exc),
         }
         ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
         _plan = zpar.plan_cell_concurrency(
@@ -2471,58 +2546,26 @@ def _run_single(
 
     # Build the final cell tasks with the CHOSEN uniform mode + its bound.
     cell_tasks = []
-    for (cell, patch, mem, cache_dir, inmem_b, stream_b) in cell_specs:
+    for (cell, patch, mem, cache_dir, inmem_b, stream_b, gpu_stream_b) in cell_specs:
         if inmem_b is None:
             cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
         elif chosen_mode == "inmem":
             cell_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
         else:
-            cell_tasks.append((cell, patch, mem, cache_dir, "stream", stream_b))
+            # On an EXECUTED GPU the stream bound is the GPU-tile host bound (F-M1).
+            bound_b = gpu_stream_b if (gpu_used and gpu_stream_b is not None) else stream_b
+            cell_tasks.append((cell, patch, mem, cache_dir, "stream", bound_b))
 
-    per_cell_footprint = max((t[5] for t in cell_tasks if t[4] is not None), default=0)
+    if gpu_used and gpu_streaming_host_peak_bytes is not None:
+        per_cell_footprint = int(gpu_streaming_host_peak_bytes)
+    else:
+        per_cell_footprint = max((t[5] for t in cell_tasks if t[4] is not None), default=0)
 
-    # ZM-ZEGRID-R22: VRAM-bounded GPU tile size for the stack phase (when the GPU
-    # backend is effective). Single GPU owner => stack tasks are serialised; the
-    # tile size is a pure function of (max N, worst patch, VRAM budget) so the
-    # device never materialises N x full-cell. A degenerate (None) tile degrades
-    # LOUDLY to exact CPU (no silent fallback).
-    gpu_tile_size = STREAM_TILE_SIZE
-    gpu_streaming_tile = None  # tile the GPU success path actually used (R36 manifest)
-    if gpu_used:
-        max_n = max((len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids), default=1)
-        worst_hw = (1, 1)
-        worst_area = -1
-        for (_r, _c, _ce, _p, m) in cell_ctxs:
-            if m.patch_ids:
-                hw = _p.patch_shape_hw
-                area = hw[0] * hw[1]
-                if area > worst_area:
-                    worst_area = area
-                    worst_hw = hw
-        _gpu_ts = zgpu.choose_gpu_tile_size(max_n, 3, worst_hw, gpu_ctx.get("vram_budget_bytes"))
-        if _gpu_ts is None:
-            _emit(
-                "ZeGrid: VRAM budget cannot hold even a minimum GPU tile for the "
-                "heaviest cell; degrading to exact CPU (no silent fallback)",
-                lvl="WARN", callback=progress_callback,
-            )
-            gpu_used = False
-            science_config = replace(science_config, backend="cpu")
-            gpu_ctx = dict(gpu_ctx)
-            gpu_ctx["effective"] = False
-            gpu_ctx["attempted"] = False
-            gpu_ctx["final_effective"] = False
-            gpu_ctx["actually_used"] = False
-            gpu_ctx["final_backend"] = "cpu"
-            gpu_ctx["fallback_reason"] = gpu_ctx.get("fallback_reason") or "vram_tile_infeasible"
-            ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
-        else:
-            gpu_tile_size = _gpu_ts
-            gpu_streaming_tile = _gpu_ts
     _emit(
         f"ZeGrid: stack tiles — CPU streaming tile={cpu_streaming_tile} "
         f"(selected={_cs_selected}, preferred={CPU_STREAMING_TILE_PREFERRED}, "
         f"minimum={CPU_STREAMING_TILE_MINIMUM}) gpu_streaming_tile={gpu_streaming_tile} "
+        f"gpu_streaming_host_peak_bytes={gpu_streaming_host_peak_bytes} "
         f"backend={science_config.backend}",
         callback=progress_callback,
     )
@@ -2553,6 +2596,9 @@ def _run_single(
         "cpu_streaming_tile": int(cpu_streaming_tile),
         "cpu_streaming_tile_selected": _cs_selected,
         "gpu_streaming_tile": (int(gpu_streaming_tile) if gpu_streaming_tile is not None else None),
+        "gpu_streaming_host_peak_bytes": (
+            int(gpu_streaming_host_peak_bytes) if gpu_streaming_host_peak_bytes is not None else None
+        ),
         "cpu_streaming": dict(cpu_streaming),
     }
     per_cell_meta = {}
@@ -2646,6 +2692,9 @@ def _run_single(
     gpu_ctx["cpu_streaming_tile"] = int(cpu_streaming_tile)
     gpu_ctx["gpu_streaming_tile"] = (
         int(gpu_streaming_tile) if gpu_streaming_tile is not None else None
+    )
+    gpu_ctx["gpu_streaming_host_peak_bytes"] = (
+        int(gpu_streaming_host_peak_bytes) if gpu_streaming_host_peak_bytes is not None else None
     )
     gpu_used = bool(actually_used_gpu)
 
