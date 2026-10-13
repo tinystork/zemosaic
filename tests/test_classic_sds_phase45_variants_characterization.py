@@ -590,23 +590,45 @@ def test_sds_choose_reference_index_contracts():
 
 
 def test_normalize_sds_megatiles_photometry_contracts():
-    t_ref = np.full((2, 2, 1), 2.0, dtype=np.float32)
-    t_bright = np.full((2, 2, 1), 4.0, dtype=np.float32)
-    out = zw._normalize_sds_megatiles_photometry(
-        [t_ref, t_bright], [None, None], ref_index=0
+    # Lot C3: the legacy multiplicative |median_ref|/|median_tile| gain computed on
+    # already background-subtracted (near-zero) medians is replaced by a robust
+    # COMMON-level alignment. ``none`` is a true no-op; ``sky_mean`` applies an
+    # ADDITIVE per-channel level offset (a == 1) derived from the canonical sky_mean
+    # statistic on the valid COMMON overlap -- never a multiplier from subtracted
+    # background levels.
+    rng = np.random.default_rng(20261013)
+    base = rng.normal(0.0, 5.0, (24, 24, 1)).astype(np.float32)  # 576 common px >= min
+    ref = base.copy()
+    shifted = (base + 50.0).astype(np.float32)  # +50 ADU background offset, SAME scale
+
+    out = zw._normalize_sds_megatiles_photometry([ref, shifted], [None, None], ref_index=0)
+    assert out[0].dtype == np.float32 and out[1].dtype == np.float32
+    assert out[0] is not ref  # returns new arrays
+    # the +50 offset is removed and the structure (hence scale) is preserved
+    residual = out[1] - base
+    assert abs(float(np.mean(residual))) < 1e-3
+    assert float(np.std(residual)) < 1e-3
+    assert float(np.std(out[1])) == pytest.approx(float(np.std(base)), rel=0.05)
+    # reference tile returned untouched
+    assert np.array_equal(out[0], ref)
+
+    # none -> genuinely neutral (no coefficient applied)
+    out_none = zw._normalize_sds_megatiles_photometry(
+        [ref, shifted], [None, None], ref_index=0, method="none"
     )
-    # reference untouched; bright tile scaled by ref_median/tile_median = 2/4 = 0.5
-    assert out[0][0, 0, 0] == 2.0
-    assert out[1][0, 0, 0] == pytest.approx(2.0)
-    assert out[1].dtype == np.float32
+    assert np.array_equal(out_none[1], shifted)
+
     # empty -> []
     assert zw._normalize_sds_megatiles_photometry([], None) == []
-    # zero-median tile -> gain non-finite/<=0 -> 1.0 (untouched)
-    t_zero = np.zeros((2, 2, 1), dtype=np.float32)
-    out2 = zw._normalize_sds_megatiles_photometry(
-        [t_ref, t_zero], [None, None], ref_index=0
-    )
-    assert out2[1][0, 0, 0] == 0.0
+
+    # unsupported method is explicit -- never a silent no-op
+    with pytest.raises(ValueError):
+        zw._normalize_sds_megatiles_photometry([ref], [None], method="linear_fit")
+
+    # null/negative medians must not be converted into an abs()-driven multiplier
+    neg = (-base).astype(np.float32)
+    out_neg = zw._normalize_sds_megatiles_photometry([base, neg], [None, None], ref_index=0)
+    assert float(np.std(out_neg[1])) == pytest.approx(float(np.std(neg)), rel=0.05)
 
 
 # ---------------------------------------------------------------------------

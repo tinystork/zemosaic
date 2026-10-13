@@ -1,6 +1,6 @@
 # ZM-SDS-R35C — M106 : diagnostic et plan isolé SDS
 
-Date : 2026-10-13. Statut : **DIAGNOSTIC CONFIRMÉ / PLAN PROPOSÉ** ; **Lots C1 et C2 IMPLÉMENTÉS** (interop FITS des intermédiaires SDS ; finition SDS : origine de niveau, fusion insensible au signe, unité de couverture, ALPHA réintersecté), lots C3–C6 non implémentés.
+Date : 2026-10-13. Statut : **DIAGNOSTIC CONFIRMÉ / PLAN PROPOSÉ** ; **Lots C1, C2 et C3 IMPLÉMENTÉS** (interop FITS des intermédiaires SDS ; finition SDS : origine de niveau, fusion insensible au signe, unité de couverture, ALPHA réintersecté ; C3 : calibration inter-mégatuile robuste sur origine de niveau commune + options honnêtes requested/effective), lots C4–C6 non implémentés.
 Demande : comparer SDS et ZeGrid, expliquer les niveaux/histogrammes et les intermédiaires noirs sous Linux, proposer une voie streaming/GPU sans modifier les autres modes.
 
 ## Périmètre et baseline
@@ -166,6 +166,32 @@ Cette preuve est locale et CPU ; ce n'est ni une qualification TAN/SIP complète
 - Gates : cas signé traversant zéro, piédestal RGB par canal, second pass ON/OFF, CPU/GPU, absence de ruptures dépendantes du signe, coverage d'unité stable et alpha cohérent. Rejouer les vrais témoins ci-dessus puis M106 complet en nouvelle sortie scratch.
 
 ### Lot C3 — stabiliser la normalisation SDS et rendre les options honnêtes
+
+> **Statut C3 (2026-10-13) : IMPLÉMENTÉ (mission ZM-SDS-R35C-C3).** Mesure
+> préalable sur les vraies mégatuiles M106 (lecture seule) : après retrait des
+> décalages d'export, les médianes signées valent ≈ ±1,3 ADU alors que le fond
+> par brute avant soustraction vaut ≈ 1040–1609 ADU. Le recouvrement commun
+> valide des mégatuiles (toutes sur la même grille) montre des **échelles
+> relatives réalisées de ≈ 1,0× à ≈ 5,0×** (ratios de flux de sources brillantes),
+> et ces mêmes facteurs expliquent les rapports de bruit par tuile : signature
+> d'un facteur multiplicatif par tuile, c.-à-d. le gain `|médiane_ref|/|médiane_|
+> tuile|` calculé sur des médianes quasi nulles. Le défaut est donc démontré et
+> matériel. Correctif **dans le périmètre SDS uniquement** :
+> `_normalize_sds_megatiles_photometry` ne dérive plus aucun multiplicateur de
+> fonds déjà soustraits ; `method="none"` est un vrai no-op neutre, et
+> `method="sky_mean"` applique un **décalage additif de niveau** par canal aligné
+> sur une référence partagée explicite, sur le **recouvrement commun valide**,
+> en réutilisant la statistique canonique `_sky_mean_channel` (a == 1). Un mode
+> non supporté lève explicitement (jamais de no-op silencieux). La méthode
+> inter-mégatuile effective est dérivée de la normalisation **demandée**
+> (`stack_norm_method`) et journalisée requested/effective pour les deux étages
+> SDS (brutes→mégatuile, mégatuiles→final), y compris l'écart d'égalisation RGB
+> (`use_align_helpers` applique `equalize_rgb_medians_inplace` alors que
+> `poststack_equalize_rgb` est demandé désactivé) — l'écart est journalisé
+> explicitement, sans changer le sens de l'option. Tests :
+> `tests/test_sds_robust_photometry_c3.py` (10 cas) + mise à jour des
+> caractérisations F6/Phase4.5. Aucun rerun M106 lourd ; Classic/ZeGrid/canonical
+> non touchés. Détail et preuves : rapport `ZM-SDS-R35C-C3.coco.r0.md`.
 
 - Remplacer le ratio de médianes quasi nulles par un contrat SDS de calibration **avant centrage**, avec référence explicite et statistiques sur recouvrements communs valides. Réutiliser les fonctions canoniques existantes, ne pas inventer un gain depuis des fonds déjà soustraits.
 - Premier candidat : `sky_mean` avec référence partagée, comme l'intention GUI ; `none` doit être réellement neutre. Ne pas introduire un nouveau modèle affine spatial ou étendre le chantier scientifique Caldwell.

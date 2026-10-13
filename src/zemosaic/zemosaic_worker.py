@@ -5183,22 +5183,169 @@ def _sds_choose_reference_index(
     return 0
 
 
+_SDS_PHOTOMETRY_METHODS = ("none", "sky_mean")
+_SDS_MIN_COMMON_LEVEL_PX = 256
+
+
+def _sds_megatile_valid_mask(
+    tile_arr: np.ndarray,
+    coverage_arr: np.ndarray | None = None,
+) -> np.ndarray:
+    """Boolean HW mask of finite samples inside the megatile's explicit valid support."""
+
+    arr = np.asarray(tile_arr)
+    finite = np.isfinite(arr)
+    valid = np.all(finite, axis=-1) if arr.ndim == 3 else finite
+    if coverage_arr is not None:
+        try:
+            cov = np.asarray(coverage_arr, dtype=np.float32)
+            if cov.ndim > 2:
+                cov = np.squeeze(cov)
+            if cov.shape == valid.shape:
+                valid = valid & np.isfinite(cov) & (cov > 0.0)
+        except Exception:
+            pass
+    return valid
+
+
+def _sds_common_level_offset(
+    ref_channel: np.ndarray,
+    src_channel: np.ndarray,
+    common_mask: np.ndarray,
+) -> tuple[float | None, str | None]:
+    """Additive level offset aligning ``src`` to ``ref`` on the valid COMMON overlap.
+
+    Lot C3: reuses the canonical ``sky_mean`` channel statistic (a == 1) from
+    ``zemosaic.core.canonical_stacking`` instead of inventing a multiplier from
+    already-background-subtracted mega-tile medians. Returns ``(offset, reason)``;
+    ``reason`` is ``None`` on success.
+    """
+
+    try:
+        from zemosaic.core.canonical_stacking import _sky_mean_channel
+    except Exception:
+        return None, "canonical_unavailable"
+    try:
+        offset, reason = _sky_mean_channel(
+            np.asarray(ref_channel, dtype=np.float64),
+            np.asarray(src_channel, dtype=np.float64),
+            common_mask,
+        )
+    except Exception:
+        return None, "sky_mean_exception"
+    if reason is not None or offset is None:
+        return None, (str(reason) if reason is not None else "nonfinite_offset")
+    try:
+        offset_f = float(offset)
+    except Exception:
+        return None, "nonfinite_offset"
+    if not math.isfinite(offset_f):
+        return None, "nonfinite_offset"
+    return offset_f, None
+
+
+def _resolve_sds_megatile_photometry_method(
+    stack_params: dict[str, Any] | None,
+    pcb: Callable | None = None,
+) -> str:
+    """Map the REQUESTED SDS normalization to the robust inter-megatile method.
+
+    Lot C3 (honest options): ``none`` stays genuinely neutral; ``sky_mean`` maps to the
+    additive common-level alignment. Any other requested method is unsupported for this
+    SDS inter-megatile stage and is reported explicitly (never a silent no-op); the
+    requested/effective divergence is emitted to the durable log.
+    """
+
+    raw = None
+    if isinstance(stack_params, dict):
+        raw = stack_params.get("stack_norm_method")
+    token = "" if raw is None else str(raw).strip().lower()
+    if token == "none":
+        effective = "none"
+        reason = None
+    elif token == "sky_mean":
+        effective = "sky_mean"
+        reason = None
+    elif token == "":
+        effective = "sky_mean"
+        reason = "requested_empty_default_sky_mean"
+    else:
+        # Lot C3 (honest options): a method unsupported for the SDS inter-megatile stage
+        # must SAY so explicitly instead of silently applying a different operation.
+        effective = "none"
+        reason = f"unsupported_requested_norm_{token}_neutral_recorded"
+    if pcb:
+        try:
+            pcb(
+                "sds_megatile_photometry_method",
+                prog=None,
+                lvl="INFO",
+                requested=(raw if raw is not None else "<unset>"),
+                effective=effective,
+                note=reason,
+            )
+        except Exception:
+            pass
+    return effective
+
+
+def _emit_sds_option_contract(
+    pcb: Callable | None,
+    *,
+    stage: str,
+    requested: dict[str, Any],
+    effective: dict[str, Any],
+    deviations: dict[str, Any] | None = None,
+) -> None:
+    """Lot C3 (honest options): durable requested/effective record for one SDS stage.
+
+    Records normalization, weighting, rejection and RGB equalization as REQUESTED by the
+    configuration versus what is EFFECTIVELY executed by the SDS path, plus any explicit
+    deviation. Best-effort: never raises into the pipeline.
+    """
+
+    if not pcb:
+        return
+    try:
+        pcb(
+            "sds_option_contract",
+            prog=None,
+            lvl="INFO",
+            stage=str(stage),
+            requested=dict(requested or {}),
+            effective=dict(effective or {}),
+            deviations=dict(deviations or {}),
+        )
+    except Exception:
+        pass
+
+
 def _normalize_sds_megatiles_photometry(
     mega_tiles: list[np.ndarray],
     coverages: list[np.ndarray | None] | None = None,
     *,
     ref_index: int | None = None,
+    method: str = "sky_mean",
     pcb: Callable | None = None,
 ) -> list[np.ndarray]:
-    """
-    Inter-master photometric gain (EXPLICIT inter-master operation, not canonical normalization).
+    """SDS inter-megatile photometric LEVEL alignment on a COMMON level origin.
 
-    F6 (D1): applies a per-tile photometric gain ``gain = ref_median / tile_median`` (median
-    scaling) to align inter-master megatiles. This is a DISTINCT inter-master operation, NOT the
-    canonical per-frame ``stacking_normalize_method`` (none/linear_fit/sky_mean): converting it to
-    affine ``linear_fit`` would add an intercept and change SDS photometry. Deferred pending
-    real-data validation; non-silent and recorded.
+    Lot C3: replaces the legacy multiplicative gain ``|ref_median| / |tile_median|``.
+    That legacy gain was computed on mega-tiles that had ALREADY been background
+    subtracted, so its denominator was a near-zero noise/background residual; a tiny
+    perturbation of the numerator/denominator rescaled a whole mega-tile by an arbitrary
+    factor (real-data evidence: realized relative mega-tile scales spanned ~1x-5x). This
+    contract never derives a multiplier from already-subtracted background levels.
 
+    ``method``:
+
+      * ``"none"``     -> true no-op (neutral). Tiles are returned untouched as float32
+                           copies; no coefficient is applied.
+      * ``"sky_mean"`` -> additive per-channel LEVEL offset aligning each mega-tile to an
+                           explicit shared reference on the valid COMMON overlap, reusing
+                           the canonical ``sky_mean`` channel statistic (a == 1).
+
+    Any other method is explicit (``ValueError``) and is never a silent no-op.
     Returns a new list of float32 mega-tiles.
     """
 
@@ -5212,9 +5359,19 @@ def _normalize_sds_megatiles_photometry(
 
     selected_ref = _sds_choose_reference_index(payloads, ref_index)
     selected_ref = max(0, min(selected_ref, len(payloads) - 1))
-    _, ref_median, ref_stats = payloads[selected_ref]
-    if not math.isfinite(ref_median) or ref_median <= 0.0:
-        ref_median = 1.0
+
+    method_norm = "" if method is None else str(method).strip().lower()
+    if method_norm == "":
+        method_norm = "sky_mean"
+    if method_norm not in _SDS_PHOTOMETRY_METHODS:
+        raise ValueError(
+            f"unsupported SDS megatile photometry method {method!r}; "
+            f"expected one of {_SDS_PHOTOMETRY_METHODS}"
+        )
+
+    ref_arr = payloads[selected_ref][0]
+    ref_cov = coverages[selected_ref] if coverages and selected_ref < len(coverages) else None
+    ref_valid = _sds_megatile_valid_mask(ref_arr, ref_cov)
 
     if pcb:
         try:
@@ -5223,43 +5380,70 @@ def _normalize_sds_megatiles_photometry(
                 prog=None,
                 lvl="INFO_DETAIL",
                 ref_index=int(selected_ref),
-                ref_median=float(ref_median),
-                ref_cov_weight=float(ref_stats.get("coverage_weight", 0.0)),
-                ref_cov_pixels=int(ref_stats.get("coverage_pixels", 0)),
+                method=method_norm,
+                ref_median=float(payloads[selected_ref][1]),
+                ref_cov_pixels=int(payloads[selected_ref][2].get("coverage_pixels", 0)),
             )
         except Exception:
             pass
 
-    normalized_tiles: list[np.ndarray] = []
-    log_indices = {0, len(payloads) - 1, selected_ref}
+    aligned_tiles: list[np.ndarray] = []
     for idx, (tile_arr, tile_median, stats) in enumerate(payloads):
-        gain = 1.0
-        if idx != selected_ref and tile_median > 0.0:
-            gain = ref_median / tile_median
-        if not math.isfinite(gain) or gain <= 0.0:
-            gain = 1.0
-        if idx == selected_ref:
-            normalized_tiles.append(np.asarray(tile_arr, dtype=np.float32, order="C"))
-        else:
-            normalized_tiles.append((tile_arr * np.float32(gain)).astype(np.float32, copy=False))
-        if pcb and idx in log_indices:
+        src = np.asarray(tile_arr, dtype=np.float32, order="C")
+        out = np.array(src, dtype=np.float32, copy=True)
+        offsets: list[float] | None = None
+        offset_reasons: list[str] = []
+        if idx != selected_ref and method_norm == "sky_mean":
+            cov = coverages[idx] if coverages and idx < len(coverages) else None
+            common = ref_valid & _sds_megatile_valid_mask(src, cov)
+            n_common = int(np.count_nonzero(common))
+            offsets = [0.0] * (src.shape[-1] if src.ndim == 3 else 1)
+            if n_common >= _SDS_MIN_COMMON_LEVEL_PX:
+                if src.ndim == 3:
+                    for ch in range(src.shape[-1]):
+                        off, reason = _sds_common_level_offset(ref_arr[..., ch], src[..., ch], common)
+                        if off is None:
+                            offset_reasons.append(str(reason))
+                            continue
+                        offsets[ch] = float(off)
+                        if off != 0.0:
+                            out[..., ch] = (src[..., ch] + np.float32(off)).astype(np.float32, copy=False)
+                else:
+                    off, reason = _sds_common_level_offset(ref_arr, src, common)
+                    if off is None:
+                        offset_reasons.append(str(reason))
+                    else:
+                        offsets[0] = float(off)
+                        if off != 0.0:
+                            out = (src + np.float32(off)).astype(np.float32, copy=False)
+            else:
+                offset_reasons.append(f"insufficient_common({n_common})")
+        aligned_tiles.append(np.asarray(out, dtype=np.float32, order="C"))
+        if pcb:
+            try:
+                sample = out[::4, ::4] if out.ndim >= 2 else out
+                finite_sample = np.asarray(sample)[np.isfinite(sample)]
+                med_after = float(np.median(finite_sample)) if finite_sample.size else float("nan")
+            except Exception:
+                med_after = float("nan")
             try:
                 pcb(
-                    "[SDS] sds_megatile_gain",
+                    "[SDS] sds_megatile_level_align",
                     prog=None,
                     lvl="INFO_DETAIL",
                     tile_index=int(idx),
                     ref_index=int(selected_ref),
-                    gain=float(gain),
-                    ref_median=float(ref_median),
-                    tile_median=float(tile_median),
-                    coverage_weight=float(stats.get("coverage_weight", 0.0)),
+                    method=method_norm,
+                    offsets=([float(o) for o in offsets] if offsets is not None else [1.0] * 0),
+                    median_before=float(np.abs(tile_median)),
+                    median_after=med_after,
                     coverage_pixels=int(stats.get("coverage_pixels", 0)),
+                    notes=(";".join(offset_reasons) if offset_reasons else ""),
                 )
             except Exception:
                 pass
 
-    return normalized_tiles
+    return aligned_tiles
 
 
 def _finalize_sds_global_mosaic(
@@ -27194,6 +27378,64 @@ def run_hierarchical_mosaic_classic_legacy(
             pcb("sds_off_classic_mastertile_pipeline", prog=None, lvl="INFO")
         else:
             pcb("sds_on_mega_tile_pipeline", prog=None, lvl="INFO")
+            # Lot C3 (honest options): durable requested/effective record for BOTH SDS stages.
+            _sds_requested_options = {
+                "normalization": stack_norm_method,
+                "weighting": stack_weight_method,
+                "rejection": stack_reject_algo,
+                "combine": stack_final_combine,
+                "rgb_equalize": bool(poststack_equalize_rgb_config),
+            }
+            _emit_sds_option_contract(
+                pcb,
+                stage="brutes_to_megatile",
+                requested=_sds_requested_options,
+                effective={
+                    "normalization": "none",
+                    "weighting": "none",
+                    "rejection": "winsorized_sigma_clip",
+                    "combine": "mean",
+                    "rgb_equalize": True,
+                },
+                deviations={
+                    "normalization": "sds_batch_canonical_imposes_none",
+                    "weighting": "sds_batch_canonical_imposes_none",
+                    "rgb_equalize": (
+                        "requested_disabled_but_use_align_helpers_applies_per_frame_equalize_rgb_medians_inplace"
+                        if not bool(poststack_equalize_rgb_config)
+                        else "none"
+                    ),
+                },
+            )
+            _emit_sds_option_contract(
+                pcb,
+                stage="megatiles_to_final",
+                requested=_sds_requested_options,
+                effective={
+                    "normalization": _resolve_sds_megatile_photometry_method(sds_stack_params, None),
+                    "weighting": "none",
+                    "rejection": "winsorized_sigma_clip",
+                    "combine": "mean",
+                    "rgb_equalize": False,
+                },
+                deviations={
+                    "normalization": "sds_inter_megatile_robust_common_level_align",
+                    "weighting": "sds_final_canonical_imposes_none",
+                },
+            )
+            if not bool(poststack_equalize_rgb_config):
+                try:
+                    pcb(
+                        "sds_rgb_equalize_requested_vs_effective",
+                        prog=None,
+                        lvl="WARN",
+                        requested_poststack_equalize_rgb=False,
+                        effective_per_frame_equalize=True,
+                        reason="use_align_helpers",
+                        recorded=True,
+                    )
+                except Exception:
+                    pass
             (
                 sds_mosaic_data_HWC,
                 sds_coverage_HW,
@@ -33404,6 +33646,64 @@ def run_hierarchical_mosaic(
             pcb("sds_off_classic_mastertile_pipeline", prog=None, lvl="INFO")
         else:
             pcb("sds_on_mega_tile_pipeline", prog=None, lvl="INFO")
+            # Lot C3 (honest options): durable requested/effective record for BOTH SDS stages.
+            _sds_requested_options = {
+                "normalization": stack_norm_method,
+                "weighting": stack_weight_method,
+                "rejection": stack_reject_algo,
+                "combine": stack_final_combine,
+                "rgb_equalize": bool(poststack_equalize_rgb_config),
+            }
+            _emit_sds_option_contract(
+                pcb,
+                stage="brutes_to_megatile",
+                requested=_sds_requested_options,
+                effective={
+                    "normalization": "none",
+                    "weighting": "none",
+                    "rejection": "winsorized_sigma_clip",
+                    "combine": "mean",
+                    "rgb_equalize": True,
+                },
+                deviations={
+                    "normalization": "sds_batch_canonical_imposes_none",
+                    "weighting": "sds_batch_canonical_imposes_none",
+                    "rgb_equalize": (
+                        "requested_disabled_but_use_align_helpers_applies_per_frame_equalize_rgb_medians_inplace"
+                        if not bool(poststack_equalize_rgb_config)
+                        else "none"
+                    ),
+                },
+            )
+            _emit_sds_option_contract(
+                pcb,
+                stage="megatiles_to_final",
+                requested=_sds_requested_options,
+                effective={
+                    "normalization": _resolve_sds_megatile_photometry_method(sds_stack_params, None),
+                    "weighting": "none",
+                    "rejection": "winsorized_sigma_clip",
+                    "combine": "mean",
+                    "rgb_equalize": False,
+                },
+                deviations={
+                    "normalization": "sds_inter_megatile_robust_common_level_align",
+                    "weighting": "sds_final_canonical_imposes_none",
+                },
+            )
+            if not bool(poststack_equalize_rgb_config):
+                try:
+                    pcb(
+                        "sds_rgb_equalize_requested_vs_effective",
+                        prog=None,
+                        lvl="WARN",
+                        requested_poststack_equalize_rgb=False,
+                        effective_per_frame_equalize=True,
+                        reason="use_align_helpers",
+                        recorded=True,
+                    )
+                except Exception:
+                    pass
             (
                 sds_mosaic_data_HWC,
                 sds_coverage_HW,
@@ -38808,10 +39108,12 @@ def assemble_global_mosaic_sds(
         pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
         return None, None, None
 
+    sds_photometry_method = _resolve_sds_megatile_photometry_method(stack_params, pcb)
     mosaics = _normalize_sds_megatiles_photometry(
         mosaics,
         coverages,
         ref_index=0,
+        method=sds_photometry_method,
         pcb=pcb,
     )
     if len(pending_tile_payloads) == len(mosaics):

@@ -19,8 +19,10 @@ _WORKER_SRC = Path(zw.__file__).read_text(encoding="utf-8-sig")
 
 class TestSDSConvergence:
     def test_d1_inter_master_gain_documented(self):
-        assert "Inter-master photometric gain" in _WORKER_SRC
-        assert "DISTINCT inter-master operation" in _WORKER_SRC
+        # Lot C3: D1 is now documented as a robust COMMON-level alignment (not the legacy
+        # multiplicative |median_ref|/|median_tile| gain on already-subtracted medians).
+        assert "inter-megatile photometric LEVEL alignment on a COMMON level origin" in _WORKER_SRC
+        assert "never derives a multiplier from already-subtracted background levels" in _WORKER_SRC
 
     def test_d2_reference_max_valid_support(self):
         # canonical N1 auto: max VALID SUPPORT COUNT (coverage_pixels), not coverage_weight/central.
