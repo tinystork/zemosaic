@@ -113,9 +113,12 @@ def _cluster_corpus(h=48, w=48, n_a=3, n_b=3, seed=11, rgb=False):
 # ---------------------------------------------------------------------------
 
 def test_resolve_cell_gauge_mode_and_default():
-    assert zphot.CELL_GAUGE_MODE_DEFAULT == "global"
-    assert set(zphot.CELL_GAUGE_MODES) == {"global", "per_cell"}
-    assert zphot.resolve_cell_gauge_mode(None) == "global"
+    # ZM-CELL-PHOTOMETRY-R34F: the PRODUCTION DEFAULT is now "auto".
+    assert zphot.CELL_GAUGE_MODE_DEFAULT == "auto"
+    assert set(zphot.CELL_GAUGE_MODES) == {"global", "per_cell", "auto"}
+    assert zphot.resolve_cell_gauge_mode(None) == "auto"
+    assert zphot.resolve_cell_gauge_mode("auto") == "auto"
+    assert zphot.resolve_cell_gauge_mode(" AUTO ") == "auto"
     assert zphot.resolve_cell_gauge_mode("global") == "global"
     assert zphot.resolve_cell_gauge_mode("per_cell") == "per_cell"
     assert zphot.resolve_cell_gauge_mode(" PER_CELL ") == "per_cell"
@@ -124,9 +127,9 @@ def test_resolve_cell_gauge_mode_and_default():
             zphot.resolve_cell_gauge_mode(bad)
 
 
-def test_science_config_default_mode_is_global():
-    assert zs.MiniTileScienceConfig().cell_gauge_mode == "global"
-    assert ExecutorConfig().science_config().cell_gauge_mode == "global"
+def test_science_config_default_mode_is_auto():
+    assert zs.MiniTileScienceConfig().cell_gauge_mode == "auto"
+    assert ExecutorConfig().science_config().cell_gauge_mode == "auto"
 
 
 # ---------------------------------------------------------------------------

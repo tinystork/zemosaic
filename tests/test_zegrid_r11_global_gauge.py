@@ -304,9 +304,16 @@ def test_r10_i1_reconciliation_in_manifest(tmp_path):
     rejected = [{"path": "bad.fits", "reason": "WCS has no celestial component"}]
     layout = {"nx": 1, "ny": 1, "ram_budget_bytes": 0, "available_bytes": 0,
               "max_contributors": 1, "predicted_bound_bytes": 0}
+    # ZM-CELL-PHOTOMETRY-R34F: the production DEFAULT is now "auto", which is
+    # RESOLVED (to "global" here) by run_zegrid_mode before _write_outputs is ever
+    # called. This test exercises the global-gauge manifest fields directly, so pin
+    # the effective mode it intends to record (production never records "auto").
+    from dataclasses import replace
     _, _, manifest_path = zz._write_outputs(
         _Assembled(), w, 1, 1, tmp_path, descs, {}, [],
-        layout, zz.ExecutorConfig().science_config(), 0, {}, None,
+        layout,
+        replace(zz.ExecutorConfig().science_config(), cell_gauge_mode="global"),
+        0, {}, None,
         rejected=rejected, sip_mode="keep", frames_loaded=2,
         global_reference_frame_id="a.fits",
     )

@@ -2052,6 +2052,63 @@ def _run_single(
         f"exclusions={len(global_gauge.exclusions)}",
         callback=progress_callback,
     )
+
+    # ZM-CELL-PHOTOMETRY-R34F: "auto" resolves HERE — after the global gauge exists
+    # (it already does, for progress/ETA) and the layout membership is known. It
+    # picks "global" iff the global gauge serves EVERY non-empty Cell; otherwise it
+    # switches the WHOLE run to "per_cell" (R34b gauges + R34c offsets + R34d
+    # feather) — ONE coherent mode, never a mix of references. The DECIDED mode is
+    # written back into ``science_config`` so every downstream consumer (cell
+    # workers, assembly, manifest) sees the resolved effective mode, never "auto".
+    auto_gauge_info = None
+    if getattr(science_config, "cell_gauge_mode", None) == zphot.CELL_GAUGE_MODE_AUTO:
+        _auto_membership = [
+            (cell.cell_id, list(mem.patch_ids))
+            for (_row, _col, cell, _patch, mem) in cell_ctxs
+            if mem.patch_ids
+        ]
+        _auto_effective, _auto_trigger = zphot.select_auto_gauge_mode(
+            global_gauge, global_frame_ids, _auto_membership
+        )
+        science_config = replace(science_config, cell_gauge_mode=_auto_effective)
+        if _auto_trigger is None:
+            auto_gauge_info = {
+                "requested": zphot.CELL_GAUGE_MODE_AUTO,
+                "resolved": _auto_effective,
+                "fallback_fired": False,
+                "cells_checked": len(_auto_membership),
+                "trigger_count": 0,
+                "first_cell": None,
+                "reason": None,
+                "cells": [],
+            }
+            _auto_msg = (
+                "ZeGrid: cell_gauge_mode=auto -> global (all "
+                f"{len(_auto_membership)} non-empty cell(s) have a globally-active frame)"
+            )
+        else:
+            auto_gauge_info = {
+                "requested": zphot.CELL_GAUGE_MODE_AUTO,
+                "resolved": _auto_effective,
+                "fallback_fired": True,
+                "cells_checked": len(_auto_membership),
+                "trigger_count": int(_auto_trigger["trigger_count"]),
+                "first_cell": _auto_trigger["first_cell"],
+                "reason": _auto_trigger["reason"],
+                "cells": list(_auto_trigger["cells"]),
+            }
+            _auto_msg = (
+                "ZeGrid: cell_gauge_mode=auto -> per_cell (global would fail for "
+                f"{_auto_trigger['trigger_count']} cell(s); first="
+                f"{_auto_trigger['first_cell']!r} reason={_auto_trigger['reason']!r}) "
+                "— switching the WHOLE run to per_cell + offsets + feather"
+            )
+        _emit(
+            _auto_msg,
+            lvl=("WARN" if _auto_trigger is not None else "INFO"),
+            callback=progress_callback,
+        )
+        _log_line(_auto_msg)
     if gauge_cache_dir.exists():
         if not _safe_rmtree(gauge_cache_dir, progress_callback):
             cleanup_failures.append(str(gauge_cache_dir))
@@ -2476,6 +2533,7 @@ def _run_single(
         ignored_run_args=ignored_run_args,
         gauge_diagnostics=gauge_diagnostics,
         per_cell_diagnostics=per_cell_diagnostics,
+        auto_gauge_info=auto_gauge_info,
         cell_feather_info=feather_info,
         finished_science=finished_science, finishing_info=finishing_info,
         fin_uint16=fin_uint16,
@@ -2843,6 +2901,7 @@ def _write_outputs(
     timings=None, gpu_used=False, ignored_settings=None, ignored_run_args=None,
     gauge_diagnostics=None,
     per_cell_diagnostics=None,
+    auto_gauge_info=None,
     cell_feather_info=None,
     finished_science=None, finishing_info=None, fin_uint16=None,
     gpu_context=None,
@@ -3040,6 +3099,16 @@ def _write_outputs(
         ),
         "photometric_gauge": {
             "mode": getattr(science_config, "cell_gauge_mode", "global"),
+            "requested_mode": (
+                (auto_gauge_info or {}).get("requested")
+                or getattr(science_config, "cell_gauge_mode", "global")
+            ),
+            # ZM-CELL-PHOTOMETRY-R34F: the run-level "auto" decision (resolved
+            # effective mode + trigger), or {"enabled": False} when "auto" was
+            # not requested. This is the audit trail of the self-healing default.
+            "auto_selection": (
+                auto_gauge_info if auto_gauge_info is not None else {"enabled": False}
+            ),
             "global_reference_frame_id": global_reference_frame_id,
             "note": (
                 "one reference frame + per-frame sky_mean coefficients computed once "
@@ -3336,12 +3405,24 @@ def run_zegrid_mode(
     except ValueError as exc:
         _emit(f"ZeGrid: {exc}", lvl="ERROR", callback=progress_callback)
         raise
-    if resolved_cell_gauge_mode != zphot.CELL_GAUGE_MODE_DEFAULT:
+    if resolved_cell_gauge_mode == zphot.CELL_GAUGE_MODE_PER_CELL:
         _emit(
             "ZeGrid: cell_gauge_mode=per_cell (OPT-IN) — every Cell self-anchors on "
             "its own greatest-support frame via the frozen estimator; inter-cell "
-            "coherence/feathering are NOT part of this mode (R34c/R34d).",
+            "coherence/feathering are part of this mode (R34c/R34d).",
             lvl="WARN", callback=progress_callback,
+        )
+    elif resolved_cell_gauge_mode == zphot.CELL_GAUGE_MODE_AUTO:
+        _emit(
+            "ZeGrid: cell_gauge_mode=auto — the run uses the global gauge when it "
+            "serves EVERY non-empty Cell, else falls back to per_cell+offsets+feather "
+            "(resolved AFTER the global gauge is computed).",
+            callback=progress_callback,
+        )
+    else:
+        _emit(
+            "ZeGrid: cell_gauge_mode=global (explicit) — R11 global gauge path.",
+            callback=progress_callback,
         )
 
     science_config = replace(

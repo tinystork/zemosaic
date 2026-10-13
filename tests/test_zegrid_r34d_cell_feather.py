@@ -280,14 +280,17 @@ def test_global_mode_assembly_is_byte_identical():
     np.testing.assert_array_equal(ref.science, got.science)
     np.testing.assert_array_equal(ref.stack_depth, got.stack_depth)
     np.testing.assert_array_equal(ref.valid_fraction, got.valid_fraction)
-    # Default mode resolves to global.
-    assert zz.zphot.CELL_GAUGE_MODE_DEFAULT == "global"
+    # Default mode resolves to "auto" (ZM-CELL-PHOTOMETRY-R34F); "auto" is only a
+    # run-level token and never reaches the per-cell dispatcher as-is.
+    assert zz.zphot.CELL_GAUGE_MODE_DEFAULT == "auto"
 
 
-def test_global_mode_unchanged_by_default_config():
+def test_default_config_does_not_silently_enable_per_cell():
     from zemosaic.core.zegrid.executor import ExecutorConfig
 
-    assert ExecutorConfig().science_config().cell_gauge_mode == "global"
+    # The default config resolves to "auto" (which picks "global" on a compact
+    # corpus), never straight to per_cell.
+    assert ExecutorConfig().science_config().cell_gauge_mode == "auto"
 
 
 # ---------------------------------------------------------------------------

@@ -116,12 +116,14 @@ __all__ = [
     "compute_global_gauge",
     "compute_cell_gauge",
     "resolve_cell_gauge_mode",
+    "select_auto_gauge_mode",
     "CellGaugeResult",
     "CellReferencePin",
     "CELL_GAUGE_MODES",
     "CELL_GAUGE_MODE_DEFAULT",
     "CELL_GAUGE_MODE_GLOBAL",
     "CELL_GAUGE_MODE_PER_CELL",
+    "CELL_GAUGE_MODE_AUTO",
 ]
 
 # ---------------------------------------------------------------------------
@@ -138,12 +140,17 @@ __all__ = [
 # R34b adds the opt-in ``per_cell`` MODE: instead of subsetting the global gauge,
 # EVERY geometrical Cell computes its OWN self-anchored gauge from its own aligned
 # frames (reference = the Cell's greatest-valid-support frame, ties to the lowest
-# sorted FrameId), reusing the FROZEN estimator verbatim. The DEFAULT stays
-# ``global`` so the production path (M106) is bit-for-bit unchanged.
+# sorted FrameId), reusing the FROZEN estimator verbatim.
+#
+# ZM-CELL-PHOTOMETRY-R34F — ``auto`` (the PRODUCTION DEFAULT): resolve to
+# ``"global"`` when the global gauge serves EVERY non-empty Cell (the R11 path,
+# byte-identical, no offsets/feather), else switch the WHOLE run to ``"per_cell"``
+# (R34b gauges + R34c additive offsets + R34d feather). The user does nothing.
 CELL_GAUGE_MODE_GLOBAL = "global"
 CELL_GAUGE_MODE_PER_CELL = "per_cell"
-CELL_GAUGE_MODES = (CELL_GAUGE_MODE_GLOBAL, CELL_GAUGE_MODE_PER_CELL)
-CELL_GAUGE_MODE_DEFAULT = CELL_GAUGE_MODE_GLOBAL
+CELL_GAUGE_MODE_AUTO = "auto"
+CELL_GAUGE_MODES = (CELL_GAUGE_MODE_GLOBAL, CELL_GAUGE_MODE_PER_CELL, CELL_GAUGE_MODE_AUTO)
+CELL_GAUGE_MODE_DEFAULT = CELL_GAUGE_MODE_AUTO
 
 # ``compute_cell_gauge`` statuses (explicit, never a silent fabrication).
 CELL_GAUGE_STATUS_OK = "ok"
@@ -153,9 +160,11 @@ CELL_GAUGE_STATUS_EMPTY = "empty"
 def resolve_cell_gauge_mode(mode) -> str:
     """Validate/resolve the per-Cell gauge mode token (``None`` -> default).
 
-    Accepts ``"global"`` (default; R11 production path) or ``"per_cell"``
-    (R34b opt-in). An unknown token raises ``ValueError`` (never a silent
-    fallback), so a typo cannot silently change the photometric strategy.
+    Accepts ``"auto"`` (default; ZM-CELL-PHOTOMETRY-R34F), ``"global"`` (R11
+    production path) or ``"per_cell"`` (R34b opt-in). An unknown token raises
+    ``ValueError`` (never a silent fallback), so a typo cannot silently change the
+    photometric strategy. The caller owns the resolution ORDER: explicit keyword
+    > config key > this default.
     """
     if mode is None:
         return CELL_GAUGE_MODE_DEFAULT
@@ -170,6 +179,73 @@ def resolve_cell_gauge_mode(mode) -> str:
             f"{'/'.join(CELL_GAUGE_MODES)}"
         )
     return token
+
+
+def select_auto_gauge_mode(
+    global_gauge: "FixedNormalization",
+    global_frame_ids,
+    cell_membership,
+):
+    """Resolve the effective gauge mode for ``"auto"`` (ZM-CELL-PHOTOMETRY-R34F).
+
+    ``"auto"`` is a RUN-LEVEL decision made AFTER the global gauge exists: if the
+    global gauge serves EVERY non-empty Cell it returns ``"global"`` (the R11
+    production path, byte-identical, no offsets/feather); otherwise it returns
+    ``"per_cell"`` (R34b gauges + R34c offsets + R34d feather) so the WHOLE run
+    uses ONE coherent mode (never a mix of references).
+
+    The predicate mirrors :func:`canonical_streaming.subset_fixed_normalization`
+    EXACTLY — the only raise it can produce for a populated Cell. For a Cell whose
+    frame list is a non-empty subset of ``global_frame_ids``, the subset raises
+    iff the global reference is NOT among the Cell's frames AND no Cell frame is
+    ``weight_active`` (the ``cell gauge has no active frame`` condition). This
+    helper returns the SAME verdict, so ``auto`` never falsely picks ``global``
+    (no crash) and never falsely picks ``per_cell`` when ``global`` would work.
+
+    ``cell_membership`` is an iterable of ``(cell_id, cell_frame_ids)`` pairs (the
+    layout membership). A cell with an EMPTY frame list is a geometrically-empty
+    (zero-contributor) Cell: the executor short-circuits it to ``status="empty"``
+    and NEVER calls the subset, so it is NOT a trigger by itself.
+
+    Returns ``(effective_mode, info)``. ``info`` is ``None`` for a clean
+    ``"global"`` verdict, else a DETERMINISTIC trigger record
+    ``{"trigger_count", "first_cell", "reason", "cells"}`` (cells in the input
+    order).
+    """
+    gidx = {fid: i for i, fid in enumerate(global_frame_ids)}
+    ref = int(global_gauge.reference_index)
+    weight_active = np.asarray(global_gauge.weight_active, dtype=bool)
+    failing = []
+    for cell_id, cell_frame_ids in cell_membership:
+        ids = list(cell_frame_ids)
+        if not ids:
+            # Zero-contributor Cell: the executor returns status="empty" without
+            # ever calling subset_fixed_normalization -> never a trigger here.
+            continue
+        try:
+            idx = [gidx[fid] for fid in ids]
+        except KeyError as exc:
+            # subset_fixed_normalization would ALSO raise (frame not in the global
+            # gauge order) -> conservative trigger (never a false "global").
+            failing.append(
+                (cell_id, f"frame {exc.args[0]!r} not in the global gauge frame order")
+            )
+            continue
+        if ref in set(idx):
+            # The Cell contains the global reference -> the subset never raises
+            # (the identity-coefficient path), regardless of weight_active.
+            continue
+        if not bool(weight_active[idx].any()):
+            failing.append((cell_id, "no globally weight-active frame"))
+    if failing:
+        info = {
+            "trigger_count": len(failing),
+            "first_cell": failing[0][0],
+            "reason": failing[0][1],
+            "cells": [cid for cid, _reason in failing],
+        }
+        return CELL_GAUGE_MODE_PER_CELL, info
+    return CELL_GAUGE_MODE_GLOBAL, None
 
 
 @dataclass(frozen=True)
