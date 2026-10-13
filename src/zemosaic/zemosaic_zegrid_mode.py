@@ -822,10 +822,32 @@ def _cpu_streaming_block(selected_tile, trials, reason, stream_worst_by_tile, in
         "ram_budget_bytes": (int(ram_budget) if ram_budget is not None else None),
         "inmem_bound_bytes": int(inmem_worst),
         "stream_bound_bytes": int(stream_bound),
+        # The legacy preferred-tile (128) streaming bound, kept SEPARATELY for
+        # diagnostics/compat — it is NOT the plan's predicted bound (ZM-ZEGRID-R36 F3).
+        "preferred_stream_bound_bytes": int(
+            stream_worst_by_tile.get(CPU_STREAMING_TILE_PREFERRED, 0) or 0
+        ),
         "estimate_tile_size": int(est_tile),
         "ladder": [int(t) for t in CPU_STREAMING_TILE_LADDER],
         "trials": list(trials),
     }
+
+
+def _selected_admissible_bound(inmem_ok, inmem_worst, selected_tile, stream_worst_by_tile, legacy_fallback):
+    """Bound the layout was ACTUALLY admitted with (ZM-ZEGRID-R36, F3).
+
+    ``min`` over the ADMITTED modes' worst-cell bounds: the in-memory bound when
+    it fits, and/or the selected streaming tile's bound when a tile fits. For an
+    ACCEPTED layout at least one of them fits, so the result is ``<= ram_budget``.
+    Falls back to ``legacy_fallback`` (the pre-R36 cheaper bound) only when
+    neither is available (no-budget / degenerate).
+    """
+    bounds = []
+    if inmem_ok:
+        bounds.append(int(inmem_worst))
+    if selected_tile is not None:
+        bounds.append(int(stream_worst_by_tile.get(int(selected_tile), 0) or 0))
+    return min(bounds) if bounds else int(legacy_fallback)
 
 
 def _choose_layout_mode_aware(
@@ -976,8 +998,12 @@ def _choose_layout_mode_aware(
             )
         _log(
             f"layout scan: CHOSEN {nx}x{ny} ({nx * ny} cells, source=pinned) "
-            f"CPU streaming tile {selected_tile}; in-memory worst "
-            f"{inmem_worst / 2**20:.1f} MiB; {sel_reason}"
+            f"CPU streaming tile {selected_tile} "
+            f"(stream@{selected_tile}={int(stream_worst_by_tile.get(int(selected_tile), 0) if selected_tile is not None else CPU_STREAMING_TILE_MINIMUM) / 2**20:.1f} MiB); "
+            f"in-memory worst {inmem_worst / 2**20:.1f} MiB; {sel_reason}"
+        )
+        _predicted_bound = _selected_admissible_bound(
+            inmem_ok, inmem_worst, selected_tile, stream_worst_by_tile, worst_bound
         )
         return {
             "nx": nx, "ny": ny,
@@ -986,7 +1012,7 @@ def _choose_layout_mode_aware(
             "available_bytes": available_bytes if available_bytes is not None else ram_budget,
             "max_contributors": max_n,
             "refinement_factor": None,
-            "predicted_bound_bytes": int(worst_bound),
+            "predicted_bound_bytes": int(_predicted_bound),
             "max_patch_area": max((c["patch_area"] for c in cells), default=0),
             "budget_bound_choice": False,
             "warnings": tuple(warnings),
@@ -1141,12 +1167,23 @@ def _choose_layout_mode_aware(
                 constrained = True
                 break
 
+    _predicted_bound = _selected_admissible_bound(
+        chosen["inmem_ok"], chosen["worst_cell"]["inmem_worst_bytes"],
+        chosen["selected_tile"], chosen["worst_cell"]["stream_worst_by_tile"],
+        chosen["bound"],
+    )
+    _sel_tile = chosen["selected_tile"]
+    _sel_stream = int(
+        chosen["worst_cell"]["stream_worst_by_tile"].get(
+            int(_sel_tile) if _sel_tile is not None else CPU_STREAMING_TILE_MINIMUM, 0
+        )
+    )
     _log(
         f"layout scan: CHOSEN {chosen['nx']}x{chosen['ny']} "
         f"({chosen['nx'] * chosen['ny']} cells, mode-aware, source=auto) "
-        f"cheaper-mode bound {chosen['bound'] / 2**20:.1f} MiB; "
+        f"predicted bound {_predicted_bound / 2**20:.1f} MiB; "
         f"in-memory worst {chosen['worst_cell'].get('inmem_worst_bytes', 0) / 2**20:.1f} MiB; "
-        f"CPU streaming tile {chosen['selected_tile']} "
+        f"CPU streaming tile {_sel_tile} (stream@{_sel_tile}={_sel_stream / 2**20:.1f} MiB) "
         f"({chosen['selection_reason']})"
     )
 
@@ -1157,7 +1194,7 @@ def _choose_layout_mode_aware(
         "available_bytes": available_bytes if available_bytes is not None else ram_budget,
         "max_contributors": max_n,
         "refinement_factor": chosen["factor"],
-        "predicted_bound_bytes": int(chosen["bound"]),
+        "predicted_bound_bytes": int(_predicted_bound),
         "max_patch_area": chosen["worst_cell"]["patch_area"],
         "budget_bound_choice": constrained,
         "warnings": tuple(warnings),
@@ -1708,6 +1745,9 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
         "vram_budget_bytes": ctx.get("vram_budget_bytes"),
         "fallback_reason": ctx.get("fallback_reason"),
         "runtime_fallback": ctx.get("runtime_fallback"),
+        # ZM-ZEGRID-R36 (F2): a GPU selected at start but RAM-infeasible is caught
+        # BEFORE execution and degraded to exact CPU (recorded, never hidden).
+        "pre_execution_fallback": ctx.get("pre_execution_fallback"),
         # ZM-ZEGRID-R36: the CPU streaming tile (RAM-adaptive; used verbatim by any
         # GPU->CPU fallback) and the GPU streaming tile (the GPU success path).
         "cpu_streaming_tile": ctx.get("cpu_streaming_tile"),
@@ -2159,7 +2199,7 @@ def _run_single(
     _emit(
         f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells, "
         f"source={layout.get('layout_source', 'auto')}) from RAM budget "
-        f"{available / 2**30:.2f} GiB; worst-cell cheaper-mode bound "
+        f"{available / 2**30:.2f} GiB; predicted bound "
         f"{layout['predicted_bound_bytes'] / 2**20:.1f} MiB (maxN={layout['max_contributors']}); "
         f"CPU streaming tile={_cs_selected}",
         callback=progress_callback,
@@ -2374,10 +2414,41 @@ def _run_single(
     # the CPU RAM AND (when GPU) the single-device owner constraint, and the
     # chosen concurrency is recorded verbatim in the manifest (never a silent
     # serial surprise).
-    _plan = zpar.plan_cell_concurrency(
-        cell_bound_pairs, os.cpu_count(), per_cell_budget,
-        gpu_backend=gpu_used, cache_build_workers=cache_build_workers,
-    )
+    # ZM-ZEGRID-R36 (F2): if the GPU backend was selected but its ONLY (stream)
+    # mode is RAM-infeasible, do NOT pretend the GPU is executable. Degrade
+    # LOUDLY to exact CPU BEFORE any execution, then re-plan on CPU (which picks
+    # inmem if only inmem fits, stream if only stream fits, or raises if neither).
+    try:
+        _plan = zpar.plan_cell_concurrency(
+            cell_bound_pairs, os.cpu_count(), per_cell_budget,
+            gpu_backend=gpu_used, cache_build_workers=cache_build_workers,
+        )
+    except zpar.ModeInfeasible as _exc:
+        if not gpu_used:
+            raise
+        _emit(
+            f"ZeGrid: GPU requested but its RAM-bounded streaming mode is "
+            f"INFEASIBLE ({_exc}); degrading to exact CPU BEFORE execution "
+            f"(no GPU attempt, no silent fallback)",
+            lvl="WARN", callback=progress_callback,
+        )
+        gpu_used = False
+        science_config = replace(science_config, backend="cpu")
+        gpu_ctx = dict(gpu_ctx)
+        gpu_ctx["effective"] = False
+        gpu_ctx["attempted"] = False
+        gpu_ctx["final_effective"] = False
+        gpu_ctx["actually_used"] = False
+        gpu_ctx["final_backend"] = "cpu"
+        gpu_ctx["fallback_reason"] = gpu_ctx.get("fallback_reason") or "gpu_stream_ram_infeasible"
+        gpu_ctx["pre_execution_fallback"] = {
+            "reason": "gpu_stream_ram_infeasible", "detail": str(_exc),
+        }
+        ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
+        _plan = zpar.plan_cell_concurrency(
+            cell_bound_pairs, os.cpu_count(), per_cell_budget,
+            gpu_backend=False, cache_build_workers=cache_build_workers,
+        )
     chosen_mode = _plan["mode"]
     cells_in_flight = int(_plan["cells_in_flight"])
     cache_workers_per_cell = int(_plan["cache_workers_per_cell"])

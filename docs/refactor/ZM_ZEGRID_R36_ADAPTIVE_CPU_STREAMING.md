@@ -21,7 +21,9 @@ Mission: `ZM-ZEGRID-R36` (implementation). Repo `zemosaic`, branch `beta`.
    whose worst-cell bound exceeded the RAM budget could still be reported as a
    valid plan because `cells_in_flight()` clamps a zero RAM quotient to `1`
    (the "clamp-to-1 rescue"). The plan could then return `inmem` even after the
-   in-memory bound was known to exceed the budget.
+   in-memory bound was known to exceed the budget. Two further bugs (fixed in
+   rework-1, see below): the inmem-only branch formatted an absent stream
+   makespan (`TypeError`), and the GPU branch ignored the RAM gate entirely.
 3. **GPU→CPU fallback**: both the pre-run VRAM-infeasible path and the classified
    runtime-error rerun re-coded the CPU tile to `STREAM_TILE_SIZE` (128),
    regardless of what the CPU could actually hold.
@@ -57,6 +59,30 @@ Mission: `ZM-ZEGRID-R36` (implementation). Repo `zemosaic`, branch `beta`.
    success uses its GPU tile; a GPU→CPU degradation always uses the selected CPU
    tile. The manifest distinguishes `cpu_streaming_tile` and `gpu_streaming_tile`.
 
+### Rework-1 corrections
+
+8. **F1 — in-memory-only is a VALID plan.** When in-memory fits and streaming
+   does not, the planner returns `mode=inmem`, a stream candidate with
+   `feasible=False`/`cells_in_flight=0`/`infeasible_reason`, and an explicit
+   reason — never a `TypeError` on the absent stream makespan.
+9. **F2 — the GPU branch is RAM-bounded.** The GPU path still considers only its
+   single stream mode and keeps the existing single-owner policy, but that stream
+   is now `feasible = (no budget) or (max_stream <= ram_budget)`; GPU candidates
+   carry coherent `feasible`/`infeasible_reason`. When the GPU stream is
+   RAM-infeasible the planner refuses to pretend it is executable (raises
+   `ModeInfeasible`, candidates attached for audit) and the PRODUCT path degrades
+   LOUDLY to exact CPU BEFORE execution, then re-plans with `gpu_backend=False`
+   (inmem if only inmem fits, stream if only stream fits, `ModeInfeasible` if
+   neither). `science_config`, `gpu_used`, `gpu_ctx` and the manifest/log record
+   the real pre-execution fallback; the GPU tile/VRAM computation is untouched.
+10. **F3 — the predicted bound is the SELECTED bound.**
+    `layout.predicted_bound_bytes` is now `min` over the ADMITTED modes' worst-cell
+    bounds (in-memory if it fits and/or the selected streaming tile if it fits), so
+    it is `<= ram_budget` for an ACCEPTED layout. The legacy preferred-tile (128)
+    streaming bound is kept SEPARATELY (and NOT called the plan's predicted bound)
+    in `cpu_streaming.preferred_stream_bound_bytes`; the CHOSEN log prints
+    `predicted bound ... ; CPU streaming tile <t> (stream@<t>=...)`.
+
 ## MEMORY MODEL
 
 R36 reuses the FROZEN estimator exclusively: `core/zegrid/streaming.py::
@@ -90,10 +116,13 @@ executor   run_canonical_stack_streaming(provider, request, tile_size=...)
 GPU->CPU   _run_cell_batch(science_config, cpu_streaming_tile, gpu_attempt=False)
 ```
 
-`layout["predicted_bound_bytes"]` is kept with its pre-R36 meaning (the
-cheaper-mode bound at `STREAM_TILE_SIZE`) for backward/schema compatibility;
-the R36 budgeted bound is `layout["cpu_streaming"]["predicted_peak_bytes"]`
-(the worst-cell streaming bound at the selected tile).
+`layout["predicted_bound_bytes"]` is the bound the layout was ACTUALLY admitted
+with: `min` over the admitted modes' worst-cell bounds (in-memory if it fits
+and/or the selected streaming tile if it fits), so it is `<= ram_budget` for an
+ACCEPTED layout (rework-1 F3). The legacy preferred-tile (128) streaming bound is
+kept separately as `layout["cpu_streaming"]["preferred_stream_bound_bytes"]` and
+is NOT the plan's predicted bound. The R36 budgeted streaming bound is still
+`layout["cpu_streaming"]["predicted_peak_bytes"]`.
 
 ## CONCURRENCY
 
@@ -102,12 +131,18 @@ the R36 budgeted bound is `layout["cpu_streaming"]["predicted_peak_bytes"]`
 - `max_bound > budget` ⇒ candidate `feasible=False`, `infeasible_reason` set,
   `cells_in_flight=0`, `makespan_rel=None`; the mode is excluded from the choice.
 - in-memory infeasible + streaming feasible ⇒ `mode="stream"` (never inmem).
+- in-memory feasible + streaming infeasible ⇒ `mode="inmem"` (VALID; F1).
 - neither feasible ⇒ `ModeInfeasible` (explicit; no silent serial plan).
 - `ram_budget` falsy ⇒ every mode feasible (historical behaviour preserved).
 
+GPU (F2): the GPU branch considers only its stream mode, marked
+`feasible = (no budget) or (max_stream <= ram_budget)` with coherent
+`feasible`/`infeasible_reason`; a RAM-infeasible GPU stream raises `ModeInfeasible`
+(candidates attached) so the product path degrades to exact CPU BEFORE execution.
+
 The `cells_in_flight()` seam itself is unchanged (its zero-quotient→1 clamp
 remains unit-tested as a pure function); R36 forbids the *planner* from treating
-that clamp as feasibility.
+that clamp as feasibility, and its docstring now says so explicitly.
 
 ## GPU
 
@@ -144,17 +179,27 @@ Scratch: `.a2a-reports/ZM-ZEGRID-R36-scratch/` (nothing written under
   The population differs (653 → 816) because the input inventory grew; the NEW
   witness is NOT a strictly identical comparison to the OLD frozen 653 run.
 - **NEW @ the SAME budget (2514.4 MiB):** **FIT** — layout `15x9` (135 cells,
-  maxN 571), CPU streaming tile **48**, stream worst bound `2351.1 MiB` ≤ budget
-  (in-memory worst `13383.1 MiB`). Tiles `128/112/96/80/64` exceed the budget.
-- **NEW @ current machine budget (`avail*0.8 = 1329.2 MiB`):** **FIT** — layout
-  `24x15` (360 cells, maxN 539), CPU tile **32**, stream bound `1260.2 MiB` ≤ budget
-  (in-memory worst `5260.9 MiB`).
+  maxN 571), CPU streaming tile **48**, `predicted_bound_bytes` **2351.1 MiB**
+  (<= budget; this is the accepted bound, F3), in-memory worst `13383.1 MiB`,
+  legacy preferred stream@128 `4266.6 MiB` (kept as
+  `cpu_streaming.preferred_stream_bound_bytes`, NOT the predicted bound).
+  Tiles `128/112/96/80/64` exceed the budget; `48` and `32` fit.
+- **Dynamic (informational, single capture `2026-10-13T18:47:15Z`):** the host's
+  `avail*0.8` was `1369.5 MiB` → **FIT**, layout `24x15` (360 cells, maxN 539),
+  CPU tile **32**, predicted bound `1260.2 MiB`. This block is INFORMATIONAL only
+  (the host budget varies); the FIXED 2514.4 MiB witness above is authoritative.
+  Both blocks come from the SAME capture
+  (`.a2a-reports/ZM-ZEGRID-R36-scratch/witness_planning_result.json`,
+  `_captured_at`).
 
 Observation to be explicit about: with the R36 admissibility rule, the coarsest
 admissible layout can be *coarser* than pre-R36 (Caldwell: `15x9` vs the pre-R36
 finest `24x14`), because the auto path keeps its first/coarsest rule while the
 admissibility predicate widened. This is the frozen policy as specified; it is
 flagged under OPEN ISSUES because it changes the production `(nx, ny)`.
+The accepted layout's `predicted_bound_bytes` is now the SELECTED bound
+(`2351.1 MiB <= 2514.4 MiB`), no longer the legacy `4266.6` cheaper@128 bound
+(F3).
 
 ## PERFORMANCE (micro-witness)
 
@@ -173,16 +218,19 @@ buys depth); no new parallelism was added.
 
 Commands actually executed (repo root, `python -m pytest`):
 
-- `tests/test_zegrid_layout_performance_r28.py tests/test_zegrid_layout_observability_r27.py tests/test_zegrid_r20_percell_parallel.py tests/test_zegrid_r22_gpu_contract.py` → **49 passed**.
-- `tests/test_zegrid_r36_adaptive_cpu_tile.py -k "not plan_equals and not manifest_cpu and not gpu_"` → **16 passed** (planner + SCI-05 ladder).
-- `tests/test_zegrid_r36_adaptive_cpu_tile.py -k "manifest_cpu"` → **1 passed**.
-- `tests/test_zegrid_r36_adaptive_cpu_tile.py -k "plan_equals or manifest_cpu or gpu_"` → **3 passed, 1 failed** (a buggy assertion in the manifest test itself, since fixed and re-run green).
-- `tests/test_zegrid_r6_file_provider.py tests/test_sci05_canonical_streaming.py tests/test_zegrid_r4_auto_layout.py -m "not slow"` → **66 passed, 1 skipped** (pre-existing env skip).
-- Full `tests/test_zegrid_r36_adaptive_cpu_tile.py` → **20 passed**.
+- `tests/test_zegrid_layout_performance_r28.py tests/test_zegrid_layout_observability_r27.py tests/test_zegrid_r20_percell_parallel.py tests/test_zegrid_r22_gpu_contract.py` → **49 passed** (r0) / **44 passed** for R27+R28+R22 after the rework (R20 re-run green in the rework set).
+- `tests/test_zegrid_r36_adaptive_cpu_tile.py` → **26 passed** (r0 file had 20; rework-1 added F1/F2/F3 direct tests and two GPU-RAM-infeasibility integration tests).
+- Targeted regression set `test_zegrid_r20_percell_parallel.py test_zegrid_r22_runtime_fallback.py test_zegrid_r6_file_provider.py test_sci05_canonical_streaming.py test_zegrid_r4_auto_layout.py test_zegrid_layout_performance_r28.py test_zegrid_layout_observability_r27.py -m "not slow"` → **99 passed, 1 skipped**.
+- Pre-existing environmental failure (CuPy+GPU present):
+  `test_sci05_canonical_streaming::TestValidation::test_gpu_backend_raises` —
+  unrelated to R36, not forced green.
 
-Pre-existing environmental failure noted by the mission
-(`test_sci05_canonical_streaming::TestValidation::test_gpu_backend_raises`,
-because CuPy+GPU are present) is unrelated to R36 and was not forced green.
+Rework-1 direct tests: F1 inmem-only plan (no TypeError, stream candidate
+infeasible); F2 GPU over-budget raises (candidates attached) and GPU feasible
+candidates are coherent; F3 predicted bound == selected bound (<= budget) with the
+legacy bound kept separately; F2 product-path GPU-RAM-infeasible → CPU inmem with
+NO GPU executor attempt and an honest manifest; both-infeasible fails loud with no
+executor attempt.
 
 ## OPEN ISSUES
 
@@ -192,16 +240,11 @@ because CuPy+GPU are present) is unrelated to R36 and was not forced green.
    policy but is an observable production-geometry change. If the intent was to
    keep the pre-R36 layout and only shrink the tile, the admissibility widening
    must be scoped so the coarse→fine scan keeps the pre-R36 predicate.
-2. **`layout.predicted_bound_bytes` vs budget.** For a layout admitted only via
-   a small streaming tile, the legacy `predicted_bound_bytes` (cheaper@128) can
-   exceed the budget while the run succeeds. The R36 budgeted bound lives in
-   `cpu_streaming.predicted_peak_bytes`; the legacy key is retained for
-   R28/schema compatibility.
-3. **Estimator extrapolation.** The ladder reuses the frozen estimator calibrated
+2. **Estimator extrapolation.** The ladder reuses the frozen estimator calibrated
    at 128/256; tiles below 128 are extrapolated (its per-tile fixed overhead
    dominates small patches). No new calibration was added (out of scope).
-4. **`32` is a performance floor**, not a science floor; a machine needing a
-   smaller tile is not served by R36.
+3. **`32` is a performance floor**, not a science floor; a machine needing a
+   smaller tile is not served by R36. Deeper disk-backed streaming = R37.
 
 ## NEXT STEP
 

@@ -192,6 +192,12 @@ def cells_in_flight(
 
     Never exceeds the RAM budget; degrades to 1 when RAM is tight. Deterministic
     (pure function) so the concurrency bound can be unit-checked.
+
+    NOTE (ZM-ZEGRID-R36): this is a PURE clamping seam. A zero RAM quotient
+    (budget < one cell footprint) legally degrades to ``1`` here, so this function
+    alone does NOT prove a mode is runnable — a mode whose ``max_bound`` exceeds
+    the budget is INFEASIBLE and is excluded by :func:`plan_cell_concurrency`
+    (which never treats this clamp as a feasible serial plan).
     """
     cpu = int(cpu or 1)
     cpu_budget = max(1, cpu - _CPU_OS_RESERVE)
@@ -280,21 +286,31 @@ def plan_cell_concurrency(
         waves = (n_cells + in_flight - 1) // in_flight
         return waves * per_cell_cost
 
-    def _makespan(in_flight: int, per_cell_cost: float) -> float:
-        waves = (n_cells + in_flight - 1) // in_flight
-        return waves * per_cell_cost
-
     if gpu_backend:
         # Single GPU owner + bounded device memory: the STACK phase serialises
         # (cells_in_flight == 1) regardless of RAM, AND the mode is forced to
         # stream (the memmap provider + VRAM-bounded tiles never materialise
         # N x full-cell on the device, so the in-memory provider's RAM footprint
         # buys nothing). This is stated explicitly, not hidden.
+        #
+        # ZM-ZEGRID-R36 (F2): the GPU path only considers its single stream mode,
+        # BUT that mode is still RAM-bounded — a Cell whose streaming bound
+        # exceeds the budget is NOT executable (the RAM budget must hold the
+        # stream's host-side footprint). ``ram_budget <= 0`` (no budget) keeps the
+        # historical unconditional behaviour. When the GPU stream is RAM-infeasible
+        # the planner refuses to pretend the GPU is executable: it raises so the
+        # PRODUCT path degrades loudly to exact CPU BEFORE execution and re-plans
+        # with ``gpu_backend=False``.
         cache_workers_per_cell = max(1, int(cache_build_workers))
+        gpu_stream_feasible = (ram_budget <= 0) or (int(max_stream) <= ram_budget)
         candidates = [
             {
-                "mode": "inmem", "cells_in_flight": 1,
+                "mode": "inmem", "cells_in_flight": 0,
                 "max_bound_bytes": int(max_inmem),
+                "feasible": False,
+                "infeasible_reason": (
+                    "not considered on the GPU backend (single-owner stream)"
+                ),
                 "per_cell_cost_rel": _PLANNER_INMEM_COST,
                 "makespan_rel": _makespan(1, _PLANNER_INMEM_COST),
                 "gpu_serialized": True,
@@ -302,16 +318,31 @@ def plan_cell_concurrency(
             {
                 "mode": "stream", "cells_in_flight": 1,
                 "max_bound_bytes": int(max_stream),
+                "feasible": bool(gpu_stream_feasible),
+                "infeasible_reason": (
+                    None if gpu_stream_feasible
+                    else f"worst-cell stream bound {max_stream / 2**20:.1f} MiB > ram_budget"
+                ),
                 "per_cell_cost_rel": _PLANNER_STREAM_COST,
                 "makespan_rel": _makespan(1, _PLANNER_STREAM_COST),
                 "gpu_serialized": True,
             },
         ]
+        if not gpu_stream_feasible:
+            exc = ModeInfeasible(
+                "GPU backend requested but its RAM-bounded streaming mode is "
+                f"INFEASIBLE: worst-cell streaming bound {max_stream / 2**20:.1f} MiB "
+                f"> RAM budget {ram_budget / 2**20:.1f} MiB (n_cells={n_cells}). The "
+                "product path must degrade to exact CPU before execution."
+            )
+            exc.candidates = candidates  # audit trail on the raised signal
+            raise exc
         return {
             "mode": "stream",
             "cells_in_flight": 1,
             "cache_workers_per_cell": int(cache_workers_per_cell),
             "gpu_serialized": True,
+            "feasible": True,
             "cpu": cpu,
             "ram_budget_bytes": ram_budget,
             "n_cells": n_cells,
@@ -322,10 +353,6 @@ def plan_cell_concurrency(
             ),
             "candidates": candidates,
         }
-
-    def _makespan(in_flight: int, per_cell_cost: float) -> float:
-        waves = (n_cells + in_flight - 1) // in_flight
-        return waves * per_cell_cost
 
     # ZM-ZEGRID-R36: a mode whose worst-cell bound exceeds the RAM budget is
     # INFEASIBLE — it must NOT be rescued by a concurrency of 1 (the
@@ -374,6 +401,15 @@ def plan_cell_concurrency(
         chosen_in_flight = inmem_in_flight
         if not inmem_feasible:  # pragma: no cover - guarded by the raise above
             chosen_reason = "in-memory selected (only feasible mode)"
+        elif not stream_feasible:
+            # ZM-ZEGRID-R36 (F1): in-memory fits and streaming does NOT — a VALID
+            # plan, never a formatting crash on the absent stream makespan.
+            chosen_reason = (
+                f"in-memory selected (cells_in_flight={inmem_in_flight}, "
+                f"makespan {inmem_makespan:.3f}); streaming INFEASIBLE "
+                f"(worst-cell bound {max_stream / 2**20:.1f} MiB > budget "
+                f"{ram_budget / 2**20:.1f} MiB)"
+            )
         else:
             chosen_reason = (
                 f"in-memory estimated makespan {inmem_makespan:.3f} (cells_in_flight="

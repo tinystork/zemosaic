@@ -248,6 +248,57 @@ def test_single_cell_over_budget_raises():
         zpar.plan_cell_concurrency([(GB, GB)], 8, GB // 2)
 
 
+# --- Rework-1 F1/F2/F3 direct ----------------
+
+def test_f1_inmem_only_is_a_valid_plan_not_a_crash():
+    """F1: in-memory fits + streaming does NOT -> a VALID inmem plan (no TypeError)."""
+    plan = zpar.plan_cell_concurrency([(50, 150)], cpu=8, ram_budget_bytes=100, gpu_backend=False)
+    assert plan["mode"] == "inmem"
+    assert plan["cells_in_flight"] == 1
+    cands = {c["mode"]: c for c in plan["candidates"]}
+    assert cands["stream"]["feasible"] is False
+    assert cands["stream"]["cells_in_flight"] == 0
+    assert cands["stream"]["infeasible_reason"]
+    assert cands["inmem"]["feasible"] is True
+    assert "INFEASIBLE" in plan["chosen_reason"]
+
+
+def test_f2_gpu_over_budget_refuses_to_pretend():
+    """F2: GPU requested + stream RAM-infeasible -> explicit ModeInfeasible (audited)."""
+    with pytest.raises(zpar.ModeInfeasible) as exc:
+        zpar.plan_cell_concurrency([(50, 150)], cpu=8, ram_budget_bytes=100, gpu_backend=True)
+    assert "RAM" in str(exc.value)
+    cands = {c["mode"]: c for c in getattr(exc.value, "candidates", [])}
+    assert cands["stream"]["feasible"] is False
+    assert cands["stream"]["infeasible_reason"]
+
+
+def test_f2_gpu_feasible_candidates_are_coherent():
+    plan = zpar.plan_cell_concurrency([(50, 150)], cpu=8, ram_budget_bytes=200, gpu_backend=True)
+    assert plan["mode"] == "stream" and plan["feasible"] is True
+    cands = {c["mode"]: c for c in plan["candidates"]}
+    assert cands["stream"]["feasible"] is True
+    assert cands["inmem"]["feasible"] is False
+    # No-budget keeps the historical unconditional GPU behaviour.
+    p0 = zpar.plan_cell_concurrency([(50, 150)], cpu=8, ram_budget_bytes=None, gpu_backend=True)
+    assert p0["mode"] == "stream" and p0["feasible"] is True
+
+
+def test_f3_predicted_bound_is_the_selected_admissible_bound(monkeypatch):
+    """F3: an ACCEPTED layout reports the SELECTED bound (<= budget), and the
+    legacy preferred-tile (128) bound is kept separately."""
+    descs = _build_tan_corpus()
+    canvas = zg.build_canvas(descs)
+    _patch_bounds(monkeypatch, {128: 900, 112: 900, 96: 900, 80: 900, 64: 300, 48: 500, 32: 700}, 10 ** 12)
+    layout = zz._choose_layout_mode_aware(
+        canvas, descs, ram_budget=400, floors=_tiny_floors(), footprints_out=[],
+    )
+    assert layout["cpu_streaming"]["selected_tile_size"] == 64
+    assert layout["predicted_bound_bytes"] == 300, layout["predicted_bound_bytes"]
+    assert layout["predicted_bound_bytes"] <= 400
+    assert layout["cpu_streaming"]["preferred_stream_bound_bytes"] == 900
+
+
 # ---------------------------------------------------------------------------
 # 3. SCI-05 canonical executor — bit-exact across the planner ladder
 # ---------------------------------------------------------------------------
@@ -451,3 +502,61 @@ def test_gpu_vram_infeasible_uses_selected_cpu_tile(tmp_path, routine_corpus, mo
     assert m["gpu"]["used"] is False
     assert m["gpu"]["cpu_streaming_tile"] == 64
     assert m["gpu"]["gpu_streaming_tile"] is None
+
+
+def _force_gpu_stream_ram_infeasible_inmem_ok(monkeypatch):
+    """GPU stream never fits the RAM budget; in-memory does."""
+    budget = 8192
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: int(budget / zpar.RAM_SAFETY_FRACTION))
+    monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(budget // 4))  # inmem fits
+    monkeypatch.setattr(zz, "_estimate_streaming_bytes",
+                        lambda n, hw, tile=zz.STREAM_TILE_SIZE, channels=3: 10 ** 9)
+    monkeypatch.setattr(zpar, "cells_in_flight", lambda *a, **k: 1)
+
+
+def test_f2_gpu_ram_infeasible_degrades_to_cpu_inmem_before_execution(tmp_path, routine_corpus, monkeypatch):
+    """F2 product path: GPU requested but its stream is RAM-infeasible -> loud CPU
+    inmem fallback BEFORE any GPU execution; manifest honest; no GPU attempt."""
+    _force_gpu_stream_ram_infeasible_inmem_ok(monkeypatch)
+    _force_gpu_selection(monkeypatch)
+    backends = []
+    real = zz.run_canonical_stack_streaming
+
+    def spy(provider, request, tile_size=None, fixed=None):
+        backends.append(getattr(request, "backend", "cpu"))
+        return real(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
+    inp, out = tmp_path / "in", tmp_path / "out"
+    _prepare_input(inp, routine_corpus)
+    zz.run_zegrid_mode(str(inp), str(out), use_gpu=True)
+
+    assert "gpu" not in backends, backends  # NO GPU executor attempt
+    m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
+    assert m["gpu"]["used"] is False
+    assert m["gpu"]["final_backend"] == "cpu"
+    assert m["gpu"]["fallback_reason"] == "gpu_stream_ram_infeasible"
+    assert m["gpu"]["pre_execution_fallback"]["reason"] == "gpu_stream_ram_infeasible"
+    assert m["per_cell_diagnostics"]["mode"] == "inmem"
+
+
+def test_f2_both_infeasible_fails_loud_no_gpu_attempt(tmp_path, routine_corpus, monkeypatch):
+    budget = 8192
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: int(budget / zpar.RAM_SAFETY_FRACTION))
+    monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(10 ** 12))
+    monkeypatch.setattr(zz, "_estimate_streaming_bytes", lambda *a, **k: 10 ** 9)
+    monkeypatch.setattr(zpar, "cells_in_flight", lambda *a, **k: 1)
+    _force_gpu_selection(monkeypatch)
+    backends = []
+    real = zz.run_canonical_stack_streaming
+
+    def spy(provider, request, tile_size=None, fixed=None):
+        backends.append(getattr(request, "backend", "cpu"))
+        return real(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
+    inp, out = tmp_path / "in", tmp_path / "out"
+    _prepare_input(inp, routine_corpus)
+    with pytest.raises(zal.LayoutInfeasible):
+        zz.run_zegrid_mode(str(inp), str(out), use_gpu=True)
+    assert backends == [], backends
