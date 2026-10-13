@@ -1,221 +1,210 @@
-# R37 — Model comparison (Gate B, isolated pure prototype)
+# R37 — Model comparison (Gate B, isolated pure prototype) — rework-1
 
-**Mission:** ZM-ZEGRID-R37-B
-**Phase:** implementation (Gate B)
+**Mission:** ZM-ZEGRID-R37-B · **Phase:** implementation (Gate B) · **Rework:** r1
 **Status:** pure prototype, UNWIRED. No production import, no default/GUI/config
 change, no real run.
-**Inputs (frozen):** `docs/refactor/R37_ARCHAEOLOGY_AND_RISKS.md`,
-`docs/refactor/R37_BACKGROUND_MODEL_CONTRACT.md` (Gate A, ratified).
-**Decision authority:** Junior (this document PROPOSES; it does not decide).
+**Inputs (frozen, unchanged):** `docs/refactor/R37_ARCHAEOLOGY_AND_RISKS.md`,
+`docs/refactor/R37_BACKGROUND_MODEL_CONTRACT.md`.
+**Independent review:** `…R37-B.nono.r0.md` (FINDINGS → REWORK). Junior ratified.
+**Decision authority:** Junior (this document PROPOSES).
 
-Prototype module: `src/zemosaic/core/zegrid/background_model.py`
-Focused tests: `tests/test_zegrid_r37_background_model.py` (39 tests).
-Benchmark + JSON: `.a2a-reports/ZM-ZEGRID-R37-B-scratch/` (`bench.py`,
-`R37_bench.json`, `R37_bench.stdout.txt`; outside the repo).
+Prototype: `src/zemosaic/core/zegrid/background_model.py`
+Tests: `tests/test_zegrid_r37_background_model.py` (57 tests).
+Benchmark: `.a2a-reports/ZM-ZEGRID-R37-B-scratch/` (`bench.py`, `R37_bench.json`,
+`R37_bench.stdout.txt`, `nono_repro.py`, `nono_repro.out.txt`).
 
 ---
 
-## 1. What was built
-
-Two additive inter-Cell models evaluated on the **same** synthetic corpora:
+## 1. Models
 
 | | Model | Form | Solver |
 |---|---|---|---|
-| **M0** | `OFFSET_ONLY` (R34 baseline) | `science += o_i,c` | reused **UNCHANGED** `cell_offset.solve_additive_offsets` (central anchor) |
-| **M1** | `ROBUST_PLAN` (candidate) | `science += a_i,c + b_i,c·x + d_i,c·y` | whitened **sparse LSQR** on `scipy.sparse`, slopes-only ridge |
+| **M0** | `OFFSET_ONLY` | `science += o_i,c` | reused **UNCHANGED** `cell_offset.solve_additive_offsets` (per channel) |
+| **M1** | `ROBUST_PLAN` | `science += a + b·x + d·y` | whitened **sparse LSQR**, slopes-only ridge, information cap + bounded graph IRLS + rejection |
 
-`x,y ∈ [-1,1]` are **global canvas** normalized coordinates. Both are strictly
-**additive-only**: no gain, colour matrix, rescaling or hidden multiply anywhere.
-The central deterministic anchor Cell has `(a,b,d) = 0` (gauge only — it does not
-itself prove identifiability).
-
-Observation is a **same-global-pixel pair difference** on shared-valid / finite
-pixels. Measurement band width is a parameter **separate** from the assembly
-feather width. Split is a deterministic **75/25** train/holdout by fixed global
-block parity. The edge fit is robust Huber (`1.345·MAD·1.4826`), float64, no RNG.
-
-Because additive plane errors cancel in differences, the fitted correction is the
-**negative** of the Cell's own plane error (`P_i = -(plane_i - plane_anchor)`).
-
-### 1.1 Decision states
-
-`OFFSET_ONLY | ROBUST_PLAN | INSUFFICIENT_EVIDENCE | ILL_CONDITIONED |
-MODEL_MISMATCH | DISCONNECTED`. Precedence:
-
-```
-DISCONNECTED > INSUFFICIENT_EVIDENCE (support/leverage) > MODEL_MISMATCH
-           > OFFSET_ONLY (plan offers no held-out gain) > ILL_CONDITIONED
-           > ROBUST_PLAN (all §6 gates PASS)
-```
-
-`NONLINEAR_CANDIDATE` exists only as a **research note** — there is no spline
-engine (see §5).
+`x,y ∈ [-1,1]` global normalized. Strictly additive-only. Central anchor
+`(a,b,d)=0`. The recovered correction is `P_i = -(plane_i - plane_anchor)`.
 
 ---
 
-## 2. Gate results (contract §6)
+## 2. Rework-1 corrections (finding → fix → test)
 
-The §6 thresholds were applied verbatim, data-only rank/condition being computed
-separately from the regularized solve so regularization never hides absent
-evidence.
+### HIGH
 
-| Contract gate | Prototype implementation | Result |
-|---|---|---|
-| §6.1.1 data-only full rank after anchoring | exact rank of whitened design | PASS on connected full-rank corpora (e.g. 6×4: 69/69) |
-| §6.1.2 whitened `cond(A) ≤ 1e4` | `cond(A)` of whitened design (never `cond(AᵀA)`) | PASS wide band (cond 78–300); reported honestly |
-| §6.1.3 ≥256 effective train samples/edge | Huber-weighted effective count | PASS for band ≥ 16 px with §2-sized Cells |
-| §6.1.4 ≥8 tangent / 3 normal blocks | occupancy from block indices | PASS band ≥ 16 px |
-| §6.1.5 finite coefficient uncertainties | covariance from regularized normal matrix | PASS where computable |
-| §6.1.6 corner uncertainty ≤ `0.5σΔ` or ≤50% correction | per-corner information form | **FAIL at 16 px**; PASS at 32–64 px |
-| §6.1.7 connected graph | BFS from anchor | PASS / DISCONNECTED otherwise |
-| §6.1.8 order invariance ≤ `1e-10` | grid-order rebuild | PASS (exact) |
-| §6.2.1 global held-out `R_plan ≤ 0.80 R_offset` | pooled robust sigma | PASS wide band (ratio ≈ 0.41) |
-| §6.2.2 `R_plan ≤ 1.25 σΔ` | vs robust difference scale | PASS wide band |
-| §6.2.3 per-edge p90 not worsening >5% | per-edge holdout p90 | PASS on accepted corpora |
-| §6.2.4 improvement in both orientations | per-orientation ratio | PASS |
-| §6.2.5 no train-only improvement | holdout governs | enforced |
-| §6.3.1 recovery ≤ `1e-8` (noise-free) | gauge-fixed truth error | PASS (≤1e-8 on noise-free corpora) |
-| §6.3.2 noisy correction `RMSE ≤ 0.25σ_pixel` | held-out residuals | PASS wide band |
-| §6.3.3 celestial-gradient amplitude ratio ∈ [0.99,1.01] | per-pixel regression slope | PASS |
-| §6.3.4 IFN bias ≤ `0.10σ`, ratio ∈ [0.99,1.01] | median bias + slope | PASS |
-| §6.3.5 stellar flux median ≤0.1%, p95 ≤0.5% | annulus background-subtracted aperture | PASS |
-| §6.3.6 identity exact ≤1e-10; noisy identity keeps M0 | coefficients / decision | PASS |
-| §6.3.7 NaN/holes/dimensions preserved | application contract | PASS |
-| §6.3.8 coverage/weights unchanged | science-only mutation | PASS |
+**H1 — measurement band was not separable from the overlap (crashed on band 8).**
+The band filter now applies **consistently** to planes, validity masks and
+coordinate arrays (single 2-D global-coordinate mask). A requested band wider
+than the overlap is reported as `band_clamped` (+ `band_used_px`, `overlap_px`,
+`measurement_px`) — never silently claimed.
+*Tests:* `test_h1_band_independent_of_overlap_no_crash[4/8/16/32]`,
+`test_h1_band_narrower_than_overlap_band_used_le_buget`,
+`test_h1_band_wider_than_overlap_is_reported_clamped`. *Closure probe:* prod-like
+`halo=8, band=8` → decision returned (no `IndexError`), `band_used_px ≤ 8`.
 
----
+**H2 — fragmented per-channel support crashed the M0 baseline.**
+M0 is now solved **one channel at a time** with only that channel's observed
+relations, `raise_on_disconnected=False`; the R34c singular-cut exception can no
+longer escape `compare_models`. An explicit refusal state is returned.
+*Tests:* `test_h2_channel_hole_returns_refusal_not_exception`.
 
-## 3. Synthetic matrix results (contract §7)
+**H3 — per-channel rank collapsed to a MAX.**
+Connectivity, rank, condition and uncertainty are computed **per channel**; the
+global gate takes the **worst** channel (min rank / max cond); an
+under-determined or disconnected channel gets **NaN** coefficients and an
+explicit refusal — never a silent zero. `per_channel` diagnostics are in the
+payload.
+*Tests:* `test_h3_per_channel_diagnostics_and_no_silent_zero`,
+`test_h3_worst_channel_governs_rank_and_condition`.
 
-Benchmark: `.a2a-reports/ZM-ZEGRID-R37-B-scratch/R37_bench.json`. Measured
-single-shot on the dev host (8 vCPU, ~7 GiB RAM, SciPy 1.15.3 / NumPy 2.2.4).
+### MEDIUM
 
-| Corpus | Decision | held-out ratio | cond(A) | Notes |
-|---|---|---:|---:|---|
-| identity, noise-free | `OFFSET_ONLY` | — | 300 | correction ≤1e-10 |
-| identity, noisy | `OFFSET_ONLY` | 1.00 | 296 | no gratuitous plan |
-| known offsets | `OFFSET_ONLY` | 0.995 | 306 | offsets already suffice |
-| known planes, noise-free | `OFFSET_ONLY` | ~0 | 78 | recovery ≤1e-8 |
-| **known planes, wide band (64 px)** | **`ROBUST_PLAN`** | 0.414 | 78 | all gates PASS |
-| known planes, 16 px band | `ILL_CONDITIONED` | 0.438 | 297 | corner-unc certain gate FAIL |
-| common celestial gradient | `ROBUST_PLAN` | 0.417 | 79 | amplitude preserved |
-| diffuse IFN / nebulosity | `ROBUST_PLAN` | 0.416 | 78 | bias ≤0.10σ, ratio∈[0.99,1.01] |
-| bright stars (common) | `OFFSET_ONLY` | ~0 | 78 | Huber uninterfered, flux preserved |
-| independent instrumental gradients | `OFFSET_ONLY` | ~0 | 78 | recovery ≤1e-8 |
-| nonlinear, non-representable | **`MODEL_MISMATCH`** | 0.419 | 297 | not repaired by a plane |
-| multiplicative gain/spectral mismatch | **`MODEL_MISMATCH`** | 0.713 | 1256 | detected |
-| additive source-field control | `ILL_CONDITIONED` | 0.447 | 302 | **no** false mismatch |
-| disconnected (6×1 gap) | `DISCONNECTED` | — | — | no fabricated bridge |
-| weak/fragmented support | refusal | — | — | `INSUFFICIENT_EVIDENCE`/`DISCONNECTED` |
-| layouts 1×4 / 4×1 / 2×2 / 6×4 | `ROBUST_PLAN` | 0.21 / 0.21 / 0.33 / 0.41 | 20 / 20 / 7 / 79 | wide band |
-| RGB (3 channels) | all states reachable | — | — | per-channel solve |
+**M1 — §6.2.3 p90 gate relaxed + asymmetric.** Gate metrics are now **RMS around
+zero** (bias-preserving) with a single symmetric operator for M0 and M1; p90 is
+`percentile(abs(residual), 90)`; the undeclared `0.05·σΔ` floor is removed; the
+frozen `cfg.per_edge_p90_worsen_max` is used. A non-finite orientation ratio is a
+**FAIL**.
+*Tests:* `test_m1_const_bias_is_visible_to_gate`,
+`test_m1_p90_gate_is_strict_five_percent`, `test_l2_nonfinite_orientation_ratio_fails`.
 
-Additional coverage: measurement bands 8/16/32/64 px; permutation determinism
-(`≤1e-10`); pixel outliers; contradictory edge in a 2×2 cycle; low/high SNR;
-NaN/hole/coverage preservation; JSON-safe provenance.
+**M2 — §6.1.6 corner uncertainty from the regularized system.** The gate now uses
+the **data-only** design covariance (dense SVD of the design, explicitly
+densified, ≤1500 cols; `NOT_RUN` above). The regularized covariance is reported
+separately. The gate is invariant to λ.
+*Tests:* `test_m2_corner_uncertainty_independent_of_lambda`; probe shows
+`λ=0 vs λ=1` corner-σ difference `0.0`.
 
-### 3.1 Key scientific findings
+**M3 — no relational robustification / mislabelled test.** Added a deterministic
+per-edge **information cap** (`EDGE_INFO_CAP_MULT=100`) and a bounded
+**graph-level IRLS** plus a connectivity-safe, leave-one-out **relational
+rejection** (`EDGE_REJECT_Z=8`, ≤25% of relations, must materially halve the
+robust loss). A genuine contradictory relation is now tested at observation level.
+*Tests:* `test_m3_huge_edge_cannot_dominate`,
+`test_m3_true_contradictory_relation_in_cycle`,
+`test_m3_graph_consistent_cell_shift_is_not_a_contradiction`,
+`test_m3_corrupted_overlap_does_not_yield_confident_plan`,
+`test_m3_chain_has_no_cycle_evidence`. *Closure probe:* σ=1e-6 contradictory edge
+→ `max|coef| = 0.0` (was 50), capped 1, rejected 1.
 
-1. **A 16 px band cannot robustly identify the normal slope.** With a 16 px
-   measurement band the corner-uncertainty gate fails (`ILL_CONDITIONED`) even
-   for a clean synthetic plane truth, exactly as Gate A predicted
-   (`cond(A)≈2430` ideal). Widening the measurement band to 32–64 px restores
-   `ROBUST_PLAN`. The normal baseline — not the sample count — is the limiter.
-2. **Common sky (gradient, IFN) is not a problem.** It cancels in same-pixel
-   differences, so M1 neither absorbs nor biases it: amplitude ratios stay in
-   `[0.99,1.01]` and IFN bias stays ≤`0.10σ`.
-3. **Multiplicative mismatch is only conditionally detectable.** A per-Cell gain
-   mismatch on a *locally planar* sky is mathematically indistinguishable from an
-   additive plane shift (Montage's documented limit). It becomes detectable when
-   the band carries **non-planar** structure (compact sources, high-frequency
-   sky). The prototype flags it as `MODEL_MISMATCH`; when unobservable it stays
-   silent rather than fabricating a verdict. This limitation is explicit.
-4. **The correction is additive-only and background-neutral.** Additive
-   application preserves NaN/support/holes/dimensions and leaves
-   background-subtracted stellar flux unchanged (≤0.1%).
+**M4 — no cycle residuals / refusal reasons.** Per-edge `refusal_reason` is now
+computed (band clamp etc.); an explicit **dropped-relation inventory** is
+returned; **cycle residuals** are computed per elementary grid cycle and channel
+(offset residual, σ-scale, z). `refusal_reason=None` is gone.
+*Tests:* `test_m4_payload_has_cycles_dropped_and_reasons`.
 
----
+**M5 — M0 comparison not truly held out.** M0's offset observation now uses the
+**TRAIN-only** local difference (`local_offset_train`); M0 and M1 use the same
+split. *Tests:* `test_m5_m0_uses_train_only_local_offset`.
 
-## 4. Scalability (contract §9)
+**M6 — incoherent decision at σΔ→0.** A degenerate (non-estimable) noise scale now
+returns **`INSUFFICIENT_EVIDENCE`** with an explicit reason, while still verifying
+truth recovery — never a fake `OFFSET_ONLY` from 0/0, never an automatic
+`ROBUST_PLAN`. *Tests:* `test_m6_noisefree_is_insufficient_evidence_with_recovery`.
 
-Pure sparse witness on synthetic **compact** observations (no images, no FITS, no
-`N_frames×canvas`) — `sparse_scale_witness`:
+**M7 — mismatch thresholds not in the frozen contract.** The detector thresholds
+are labelled **PROVISIONAL** in provenance and payload
+(`mismatch_thresholds_status = PROVISIONAL_NOT_IN_FROZEN_CONTRACT`); the state is
+experimental and documented as such. *Tests:*
+`test_m7_mismatch_thresholds_provisional`.
 
-| Grid | Cells | Edges | Unknowns | Rows | Rank | cond(A) | solve | RSS Δ | RSS peak |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 20×20 | 400 | 760 | 1,197 | 3,078 | 1,197 | 82 | 6.9 s* | 32 MiB | 195 MiB |
-| 50×50 | 2,500 | 4,900 | 7,497 | 19,698 | NOT_RUN | NOT_RUN | 1.1 s* | <1 MiB | 195 MiB |
-| 100×100 | **10,000** | 19,800 | 29,997 | 79,398 | NOT_RUN | NOT_RUN | 5.7 s* | 49 MiB | 244 MiB |
+### LOW
 
-\* wall-clock includes host contention; values are indicative, not calibrated.
+**L1 — `densified` was a hard-coded literal.** Replaced by measured flags:
+`global_solve_densified` (always false — LSQR) and `diagnostics_densified` (true
+when a dense design SVD/covariance was actually used, ≤1500 cols). *Tests:*
+`test_l1_densification_flags_are_measured`.
 
-A dense design for 10,000 Cells would be ≈19 GB; the sparse path stays at
-**~0.24 GiB peak** and never densifies. Exact rank/condition is reported only
-when the column count is small enough for a dense SVD (`≤1500`); larger systems
-report `NOT_RUN` honestly (structural O(cells+edges) construction is what is
-claimed, not an O(1) condition estimate).
+**L2 — orientation inf skipped.** See M1. *Test:*
+`test_l2_nonfinite_orientation_ratio_fails`.
+
+**L3 — weak/tautological assertions.** `or True`, the always-true enum assertion
+and broad `in ALLOWED` were replaced by expected-outcome assertions where the
+contract determines the result.
+
+**L4 — matrix incomplete.** Added heterogeneous
+nights/cameras/noise/exposure/spectral tests, alternate-layout-same-physical-truth
+tests, a genuine contradictory-relation/cycle test, and an
+application-invariant (NaN/dims/inputs-unmutated) test.
 
 ---
 
-## 5. B3 — nonlinear / spline study (documentation only)
+## 3. Contract §6 conformance (post-rework)
 
-No engine was written. References (methodological only, **no code copied**):
-
-- **Montage** (Caltech/IPAC) — assumes calibrated brightness; models
-  non-sky low-frequency discrepancies with offsets/slopes; explicitly warns that
-  generalized matching cannot separate sky from background when assumptions fail.
-- **PhotometricMosaic** (John Murphy) — photometric scale matching plus a surface
-  spline for relative gradients.
-
-Position: a per-Cell spline could absorb real sky/IFN and is only identifiable
-with independent calibration. It is therefore **not executable here**: any
-nonlinear residual observed by the additive prototype is reported as
-`MODEL_MISMATCH` needing research/upstream calibration, never repaired by a
-plane. Proposed credits if R37 ever ships: PhotometricMosaic — John Murphy;
-Montage — Caltech/IPAC.
-
----
-
-## 6. Limits (explicit, not hidden)
-
-- **No real-data qualification.** The exact 816-frame pre-feather product is
-  `NOT AVAILABLE` locally (Gate A). Every number above is synthetic. A
-  synthetic-perfect M1 still leaves real validation missing.
-- **Narrow-band normal slope** is weakly constrained; the honest decision is
-  `ILL_CONDITIONED` unless a wider measurement band is justified.
-- **Multiplicative detection is conditional** (§3.1.3); a locally planar sky
-  hides a pure gain mismatch.
-- **Wide-band corpora use 64 px Cells–to–band geometry**; real Cells (~680–1000 px
-  tangent) would give far better normal leverage, but that is an expectation, not
-  a measurement.
-- Regularized coefficient uncertainties are exact for the small corpora here; at
-  scale only O(E) compact statistics are retained (no global posterior).
-- Wall-clock/RSS are single-run and host-loaded.
+| Gate | Verdict |
+|---|---|
+| §6.1.1 data-only full rank (per channel) | PASS (worst channel; NaN + refusal otherwise) |
+| §6.1.2 whitened cond ≤ 1e4 | PASS (reported; never `cond(AᵀA)`) |
+| §6.1.3 ≥256 effective train | PASS band ≥16 px |
+| §6.1.4 ≥8 tangent / ≥3 normal blocks | PASS band ≥16 px |
+| §6.1.5 finite uncertainties | PASS where computable (data-only); `NOT_RUN` at scale |
+| §6.1.6 corner unc ≤0.5σΔ or ≤50% corr | PASS wide band; FAIL 16 px — on **data-only** covariance |
+| §6.1.7 connectivity (per channel) | PASS / DISCONNECTED |
+| §6.1.8 order invariance ≤1e-10 | PASS (exact) |
+| §6.2.1 R_plan ≤ 0.80 R_offset | PASS wide band (≈0.43) |
+| §6.2.2 R_plan ≤ 1.25 σΔ | PASS wide band |
+| §6.2.3 per-edge p90 ≤ +5% | frozen 5%, symmetric, no floor |
+| §6.2.4 both orientations | present non-finite ratio → FAIL |
+| §6.2.5 no train-only improvement | enforced |
+| §6.3.1..8 fidelity/astronomy/NaN | PASS (noise-free exactness ≤1e-8; IFN/star preservation; application invariants) |
 
 ---
 
-## 7. Future diagnostic artifact (proposal only)
+## 4. Synthetic matrix (post-rework, `R37_bench.json`)
 
-Produced **while patches coexist** during assembly, O(edges×channels×const),
-no extra source pass: per edge/channel — endpoint ids + orientation, normalized
-coordinate definition, raw & effective support, tangent/normal occupancy,
-train/holdout counts, robust noise, fitted coefficients, compact information/rhs,
-covariance/condition/leverage, held-out residual metrics, rejection fraction,
-cycle contribution, refusal reason. This is what would allow a future authorized
-real-data qualification.
+| Corpus | Decision | ratio | cond(A) |
+|---|---|---:|---:|
+| identity, noise-free | `INSUFFICIENT_EVIDENCE` (degenerate σΔ) | — | 300 |
+| identity, noisy | `OFFSET_ONLY` | 1.001 | 296 |
+| known offsets | `OFFSET_ONLY` | 1.001 | 306 |
+| known planes, noise-free | `INSUFFICIENT_EVIDENCE` (degenerate) | ~0 | 78 |
+| **known planes, wide band** | **`ROBUST_PLAN`** | 0.430 | 78 |
+| known planes, 16 px | `ILL_CONDITIONED` | 0.466 | 297 |
+| common celestial gradient | `ROBUST_PLAN` | 0.429 | 79 |
+| diffuse IFN | `ROBUST_PLAN` | 0.429 | 78 |
+| bright stars (common) | `INSUFFICIENT_EVIDENCE` (degenerate) | ~0 | 78 |
+| independent instr. gradients | `INSUFFICIENT_EVIDENCE` (degenerate) | ~0 | 78 |
+| nonlinear non-representable | `MODEL_MISMATCH` | 0.398 | 297 |
+| multiplicative gain mismatch | `MODEL_MISMATCH` | 0.793 | 1256 |
+| additive source control | `ILL_CONDITIONED` | 0.477 | 302 |
+| disconnected 6×1 | `DISCONNECTED` | — | — |
+| layouts 1×4 / 4×1 / 2×2 / 6×4 | `ROBUST_PLAN` | .22/.22/.35/.43 | 20/20/7/79 |
+
+Noise-free corpora now honestly report `INSUFFICIENT_EVIDENCE` (M6) instead of the
+previous misleading `OFFSET_ONLY`; their recovery is still verified ≤1e-8.
 
 ---
 
-## 8. Proposed scientific decision (Junior arbitrates)
+## 5. Scalability (contract §9)
 
-- Prototype fidelity/evidence gates: **PASS on synthetic corpora when the
-  measurement band is wide enough**; **explicit refusals** where it is not.
-- Architecture: sparse, O(Cells+edges), no dense design, no images — suitable for
-  a future compact diagnostic.
-- **Proposed outcome: `NEEDS RESEARCH`.** Rationale: (a) the real 816-frame
-  pre-feather observations are unavailable, so no production change can be
-  qualified; (b) the normal slope is weakly identifiable in a narrow band and
-  multiplicative mismatch is only conditionally detectable. A successful
-  synthetic `ROBUST_PLAN` is **not** authorization to change production.
+| Grid | Cells | Edges | Unknowns | Rank | cond | solve (s)* | RSS peak | global densified | diag densified |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 20×20 | 400 | 760 | 1,197 | 1,197 | 82 | 5.3 | 196 MiB | false | **true** (≤1500) |
+| 50×50 | 2,500 | 4,900 | 7,497 | NOT_RUN | NOT_RUN | 3.9 | 196 MiB | false | false |
+| 100×100 | **10,000** | 19,800 | 29,997 | NOT_RUN | NOT_RUN | 26.0 | 267 MiB | false | false |
 
-**No production wiring is proposed or performed.**
+\* host-loaded single run. Dense design for 10,000 Cells ≈ 4.8 GB; the sparse path
+never densifies and does **no** dense diagnostic/covariance at scale.
+
+---
+
+## 6. Limits (explicit)
+
+- **No real-data qualification** (the 816-frame pre-feather product is absent).
+- **Narrow band**: 16 px normal slope weakly identifiable → `ILL_CONDITIONED`.
+- **Multiplicative mismatch conditionally detectable** (locally-planar sky hides a
+  pure gain mismatch) — documented, never fabricated.
+- **Contradictory relations**: with low graph redundancy a bounded IRLS downweights
+  but cannot fully eliminate a bad relation (a chain cannot identify a
+  contradiction at all — reported as absence of cycle/evidence).
+- Mismatch thresholds are **provisional**, not frozen contract.
+- Wall-clock/RSS single-run, host-loaded.
+
+---
+
+## 7. Proposed scientific decision (Junior arbitrates)
+
+All synthetic fidelity/evidence gates pass when the measurement band is wide
+enough, with explicit refusals otherwise; the architecture is sparse and suitable
+for a future compact diagnostic. Because the real pre-feather observations are
+unavailable and narrow-band/multiplicative identifiability is limited, the
+proposed outcome remains **NEEDS RESEARCH**. **No production wiring is proposed
+or performed.**
