@@ -648,3 +648,132 @@ def test_fm1_gpu_effective_tile_fits_is_attempted_single_owner(tmp_path, routine
     assert m["per_cell_diagnostics"]["gpu_serialized"] is True
     assert m["per_cell_diagnostics"]["cells_in_flight"] == 1      # single-owner
     assert m["gpu"]["pre_execution_fallback"] is None
+
+
+# --- rework-3 F-M2: CPU fallback revalidated at the CURRENT per-cell budget ---------
+
+def _force_asymmetric_budget(monkeypatch, *, available=10240, inmem=10 ** 12, table=None,
+                             gpu_tile=48):
+    """Model the F-M2 asymmetry: the LAYOUT budget is `available` while the per-cell
+    budget is `0.8*available` (RAM can shrink between layout and per-cell time)."""
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: available)
+    monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(inmem))
+    monkeypatch.setattr(zz, "_estimate_streaming_bytes",
+                        lambda n, hw, tile=zz.STREAM_TILE_SIZE, channels=3: int(
+                            (table or {}).get(int(tile) if tile is not None else 128, 10 ** 9)))
+    monkeypatch.setattr(zpar, "cells_in_flight", lambda *a, **k: 1)
+    _force_gpu_selection(monkeypatch, gpu_tile=gpu_tile)
+
+
+def test_fm2_a_no_cpu_fallback_fails_loud_zero_cpu_attempt(tmp_path, routine_corpus, monkeypatch):
+    """F-M2 (A): CPU tile 64 fits the LAYOUT budget but NOT the current per-cell
+    budget and inmem does not fit -> NO CPU fallback; GPU (tile 48) is attempted,
+    a GPU OOM must FAIL LOUD with ModeInfeasible and ZERO CPU executor call."""
+    # Layout budget 10240 -> tile 64 (bound 10000); per-cell budget 8192 -> CPU fails.
+    _force_asymmetric_budget(
+        monkeypatch, available=10240, inmem=10 ** 12,
+        table={128: 100000, 112: 100000, 96: 100000, 80: 100000,
+               64: 10000, 48: 1000, 32: 500},
+        gpu_tile=48,
+    )
+    calls = []
+    real = zz.run_canonical_stack_streaming
+
+    def spy(provider, request, tile_size=None, fixed=None):
+        backend = getattr(request, "backend", "cpu")
+        calls.append((backend, int(tile_size) if tile_size is not None else None))
+        if backend == "gpu":
+            raise _FakeCupyOOM("simulated runtime OOM")
+        return real(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
+    msgs = []
+
+    def cb(msg, prog, lvl, **kw):
+        msgs.append((msg, lvl))
+
+    inp, out = tmp_path / "in", tmp_path / "out"
+    _prepare_input(inp, routine_corpus)
+    with pytest.raises(zpar.ModeInfeasible):
+        zz.run_zegrid_mode(str(inp), str(out), use_gpu=True, progress_callback=cb)
+
+    # GPU WAS attempted at its effective tile 48; ZERO CPU executor call.
+    assert any(b == "gpu" and t == 48 for b, t in calls), calls
+    assert not any(b == "cpu" for b, _t in calls), calls
+    # A loud explanation was emitted (run fails, so no manifest is expected).
+    assert any("refusing an over-budget CPU" in m for m, _l in msgs), msgs[-5:]
+
+
+def test_fm2_b_cpu_fallback_inmem_is_honoured(tmp_path, routine_corpus, monkeypatch):
+    """F-M2 (B): same asymmetry but inmem FITS the current budget -> the CPU fallback
+    plan chooses inmem, and after the GPU OOM the rerun actually runs inmem (never an
+    over-budget stream tile)."""
+    _force_asymmetric_budget(
+        monkeypatch, available=10240, inmem=4000,
+        table={128: 100000, 112: 100000, 96: 100000, 80: 100000,
+               64: 10000, 48: 1000, 32: 500},
+        gpu_tile=48,
+    )
+    calls = []
+    real = zz.run_canonical_stack_streaming
+
+    def spy(provider, request, tile_size=None, fixed=None):
+        backend = getattr(request, "backend", "cpu")
+        calls.append((backend, int(tile_size) if tile_size is not None else None))
+        if backend == "gpu":
+            raise _FakeCupyOOM("simulated runtime OOM")
+        return real(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
+    inp, out = tmp_path / "in", tmp_path / "out"
+    _prepare_input(inp, routine_corpus)
+    zz.run_zegrid_mode(str(inp), str(out), use_gpu=True)
+
+    m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
+    fb = m["per_cell_diagnostics"]["cpu_fallback_plan"]
+    assert fb["applicable"] is True and fb["feasible"] is True
+    assert fb["mode"] == "inmem"
+    assert fb["used"] is True
+    # The enacted CPU mode/concurrency is honest (inmem, not stream64).
+    assert m["per_cell_diagnostics"]["mode"] == "inmem"
+    assert m["per_cell_diagnostics"]["cpu_fallback_used"] is True
+    assert all(r["mode"] == "inmem" for r in m["cells"] if r.get("status") == "complete")
+    # The CPU rerun used the inmem path (tile None for CPU inmem).
+    cpu_tiles = [t for b, t in calls if b == "cpu"]
+    assert cpu_tiles and all(t is None for t in cpu_tiles), calls
+
+
+def test_fm2_d_gpu_success_with_cpu_fallback_unavailable(tmp_path, routine_corpus, monkeypatch):
+    """F-M2 (D): GPU success is ALLOWED even when no CPU fallback fits the current
+    budget; the manifest states the CPU fallback is unavailable (no fake failure)."""
+    import dataclasses
+    _force_asymmetric_budget(
+        monkeypatch, available=10240, inmem=10 ** 12,
+        table={128: 100000, 112: 100000, 96: 100000, 80: 100000,
+               64: 10000, 48: 1000, 32: 500},
+        gpu_tile=48,
+    )
+    calls = []
+    real = zz.run_canonical_stack_streaming
+
+    def spy(provider, request, tile_size=None, fixed=None):
+        backend = getattr(request, "backend", "cpu")
+        calls.append((backend, int(tile_size) if tile_size is not None else None))
+        if backend == "gpu":
+            # Simulate a GPU SUCCESS: run the canonical on the swapped request.
+            return real(provider, dataclasses.replace(request, backend="cpu"),
+                        tile_size=tile_size, fixed=fixed)
+        return real(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
+    inp, out = tmp_path / "in", tmp_path / "out"
+    _prepare_input(inp, routine_corpus)
+    zz.run_zegrid_mode(str(inp), str(out), use_gpu=True)
+
+    m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
+    assert any(b == "gpu" for b, _t in calls), calls
+    assert m["gpu"]["used"] is True
+    assert m["gpu"]["final_backend"] == "gpu"
+    assert m["gpu"]["runtime_fallback"] is None      # no fake failure
+    assert m["per_cell_diagnostics"]["cpu_fallback_plan"]["feasible"] is False
+    assert m["per_cell_diagnostics"]["cpu_fallback_used"] is False

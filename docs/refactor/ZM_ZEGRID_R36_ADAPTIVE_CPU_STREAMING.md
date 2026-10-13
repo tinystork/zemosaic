@@ -90,6 +90,16 @@ Mission: `ZM-ZEGRID-R36` (implementation). Repo `zemosaic`, branch `beta`.
     budget the GPU is refused BEFORE execution (zero GPU attempt) and the CPU is
     re-planned and executed at the adaptive `cpu_streaming_tile`. `per_cell_footprint`
     and the GPU candidate reflect the GPU-tile bound when the GPU actually runs.
+12. **F-M2 (rework-3) — the CPU fallback is RAM-validated at the CURRENT budget.**
+    The layout picks `cpu_streaming_tile` against a layout-time RAM snapshot, but
+    `per_cell_budget = 0.8 x available_now` is recomputed at per-cell time; RAM can
+    drop in between. When the GPU is the primary plan, an independent
+    `cpu_fallback_plan = plan_cell_concurrency(cell_bound_pairs, ..., gpu_backend=False)`
+    is computed at the current budget. The runtime GPU rerun HONORS it (exact
+    mode/tasks/bounds/concurrency/cache workers + `cpu_streaming_tile`); if no CPU
+    mode fits, a GPU runtime failure raises `ModeInfeasible` BEFORE any CPU
+    executor (never an over-budget rerun). Pre-execution degradations keep
+    re-planning the CPU and fail loud when no CPU mode fits.
 
 ## MEMORY MODEL
 
@@ -122,6 +132,9 @@ worker     _init_stack_worker(..., tile_size=cpu_streaming_tile, ...)  -> _STACK
 stream     _run_cell_stream(..., tile_size=_STACK_TILE_SIZE, ...)
 executor   run_canonical_stack_streaming(provider, request, tile_size=...)
 GPU->CPU   _run_cell_batch(science_config, cpu_streaming_tile, gpu_attempt=False)
+fallback   cpu_fallback_plan = plan_cell_concurrency(cell_bound_pairs, ..., gpu_backend=False)
+           (at the CURRENT budget; a runtime GPU error honors its mode/tasks/
+            concurrency/cache workers, or raises ModeInfeasible if no CPU mode fits)
 ```
 
 `layout["predicted_bound_bytes"]` is the bound the layout was ACTUALLY admitted
@@ -176,6 +189,19 @@ that clamp as feasibility, and its docstring now says so explicitly.
   is not attempted for host RAM, `attempted=false`, `final_backend=cpu`, explicit
   reason. `per_cell_diagnostics.gpu_streaming_host_peak_bytes` reflects the
   EXECUTED GPU bound (not the CPU bound).
+- **F-M2 (rework-3):** when the GPU is the primary plan, a REAL CPU fallback plan
+  is computed independently at the CURRENT per-cell budget
+  (`plan_cell_concurrency(cell_bound_pairs, ..., gpu_backend=False)`). A GPU
+  runtime failure reruns EXACTLY that plan (mode / tasks / bounds / concurrency /
+  cache workers) with `cpu_streaming_tile` — never an unchecked CPU tile. When NO
+  CPU mode fits the current budget the GPU may still run if its OWN mode fits, but
+  a GPU runtime failure FAILS LOUD (`ModeInfeasible`) BEFORE any CPU attempt (no
+  over-budget CPU executor). `per_cell_diagnostics.cpu_fallback_plan =
+  {applicable, feasible, mode, max_bound_bytes, ram_budget_bytes, tile,
+  cells_in_flight, cache_workers_per_cell, reason, used}` and
+  `gpu.cpu_fallback_plan`; after a runtime fallback the effective
+  mode/concurrency are the CPU plan's (the manifest never still claims the GPU
+  plan as final).
 
 ## SCIENCE
 
@@ -243,8 +269,15 @@ buys depth); no new parallelism was added.
 Commands actually executed (repo root, `python -m pytest`):
 
 - `tests/test_zegrid_layout_performance_r28.py tests/test_zegrid_layout_observability_r27.py tests/test_zegrid_r20_percell_parallel.py tests/test_zegrid_r22_gpu_contract.py` → **49 passed** (r0) / **44 passed** for R27+R28+R22 after the rework (R20 re-run green in the rework set).
-- **`tests/test_zegrid_r36_adaptive_cpu_tile.py`** → **28 passed** (r0: 20; rework-1 added F1/F2/F3 direct + GPU-RAM-infeasibility integration tests; rework-2 added the two F-M1 GPU-effective-tile tests).
-- Targeted regression set `test_zegrid_r20_percell_parallel.py test_zegrid_r22_runtime_fallback.py test_zegrid_r22_gpu_contract.py test_zegrid_r6_file_provider.py test_zegrid_r4_auto_layout.py test_zegrid_layout_performance_r28.py test_zegrid_layout_observability_r27.py test_sci05_canonical_streaming.py -m "not slow"` → **117 passed, 1 skipped** (rework-2).
+- **`tests/test_zegrid_r36_adaptive_cpu_tile.py`** → **31 passed** (r0: 20;
+  rework-1 added F1/F2/F3; rework-2 added the two F-M1 tests; rework-3 added the
+  F-M2 A/B/D tests).
+- Targeted regression set (rework-3) `test_zegrid_r36_adaptive_cpu_tile.py
+  test_zegrid_r20_percell_parallel.py test_zegrid_r22_runtime_fallback.py
+  test_zegrid_r22_gpu_contract.py test_zegrid_r6_file_provider.py
+  test_zegrid_r4_auto_layout.py test_zegrid_layout_performance_r28.py
+  test_zegrid_layout_observability_r27.py -m "not slow"` → **92 passed, 15 deselected**
+  (the deselected 15 are the `slow`-marked heavy/multi-corpus cases).
 - Pre-existing environmental failure (CuPy+GPU present):
   `test_sci05_canonical_streaming::TestValidation::test_gpu_backend_raises` —
   unrelated to R36, not forced green.

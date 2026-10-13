@@ -1755,6 +1755,7 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
         "cpu_streaming_tile": ctx.get("cpu_streaming_tile"),
         "gpu_streaming_tile": ctx.get("gpu_streaming_tile"),
         "gpu_streaming_host_peak_bytes": ctx.get("gpu_streaming_host_peak_bytes"),
+        "cpu_fallback_plan": ctx.get("cpu_fallback_plan"),
         "backend": {
             "gauge_rejection": "cpu",
             "gauge_combine": "cpu",
@@ -2561,6 +2562,63 @@ def _run_single(
     else:
         per_cell_footprint = max((t[5] for t in cell_tasks if t[4] is not None), default=0)
 
+    # ZM-ZEGRID-R36 (F-M2): when the GPU is the primary plan, ALSO compute a real
+    # CPU fallback plan at the CURRENT per-cell budget (independent of the GPU
+    # plan). A GPU runtime failure then reruns EXACTLY that CPU plan (mode, tasks,
+    # bounds, concurrency, cache workers) — never an unchecked CPU tile. If NO CPU
+    # mode fits the current budget the GPU may still run if its OWN mode fits, but
+    # a GPU runtime failure must FAIL LOUD before any CPU attempt (no over-budget
+    # rerun). The layout-selected `cpu_streaming_tile` is re-validated here.
+    cpu_fallback_info = {
+        "applicable": False, "feasible": False, "mode": None,
+        "max_bound_bytes": None, "ram_budget_bytes": int(per_cell_budget),
+        "tile": int(cpu_streaming_tile), "cells_in_flight": None,
+        "cache_workers_per_cell": None, "reason": None, "used": False,
+    }
+    cpu_fallback_plan = None
+    cpu_fallback_tasks = None
+    if gpu_used:
+        cpu_fallback_info["applicable"] = True
+        try:
+            cpu_fallback_plan = zpar.plan_cell_concurrency(
+                cell_bound_pairs, os.cpu_count(), per_cell_budget,
+                gpu_backend=False, cache_build_workers=cache_build_workers,
+            )
+        except zpar.ModeInfeasible as _fexc:
+            cpu_fallback_plan = None
+            cpu_fallback_info["feasible"] = False
+            cpu_fallback_info["reason"] = str(_fexc)
+        else:
+            fb_mode = cpu_fallback_plan["mode"]
+            cpu_fallback_tasks = []
+            for (cell, patch, mem, cache_dir, inmem_b, stream_b, gpu_stream_b) in cell_specs:
+                if inmem_b is None:
+                    cpu_fallback_tasks.append((cell, patch, mem, cache_dir, None, 0))
+                elif fb_mode == "inmem":
+                    cpu_fallback_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
+                else:
+                    cpu_fallback_tasks.append((cell, patch, mem, cache_dir, "stream", stream_b))
+            fb_bound = max(
+                (c["max_bound_bytes"] for c in cpu_fallback_plan["candidates"]
+                 if c["mode"] == fb_mode),
+                default=0,
+            )
+            cpu_fallback_info.update({
+                "feasible": True, "mode": fb_mode, "max_bound_bytes": int(fb_bound),
+                "cells_in_flight": int(cpu_fallback_plan["cells_in_flight"]),
+                "cache_workers_per_cell": int(cpu_fallback_plan["cache_workers_per_cell"]),
+                "reason": cpu_fallback_plan.get("chosen_reason"),
+            })
+        _emit(
+            f"ZeGrid: CPU fallback plan — feasible={cpu_fallback_info['feasible']} "
+            f"mode={cpu_fallback_info['mode']} "
+            f"max_bound={(cpu_fallback_info['max_bound_bytes'] or 0) / 2**20:.1f} MiB "
+            f"budget={per_cell_budget / 2**20:.1f} MiB tile={cpu_streaming_tile} "
+            f"cells_in_flight={cpu_fallback_info['cells_in_flight']} "
+            f"reason={cpu_fallback_info['reason']}",
+            callback=progress_callback,
+        )
+
     _emit(
         f"ZeGrid: stack tiles — CPU streaming tile={cpu_streaming_tile} "
         f"(selected={_cs_selected}, preferred={CPU_STREAMING_TILE_PREFERRED}, "
@@ -2600,30 +2658,42 @@ def _run_single(
             int(gpu_streaming_host_peak_bytes) if gpu_streaming_host_peak_bytes is not None else None
         ),
         "cpu_streaming": dict(cpu_streaming),
+        "cpu_fallback_used": False,
+        "cpu_fallback_plan": dict(cpu_fallback_info),
     }
     per_cell_meta = {}
 
-    def _cell_progress(done, total):
-        cid = task_cids[int(done) - 1] if 0 < int(done) <= len(task_cids) else None
-        _stack_rep.progress(int(done), item_id=cid)
+    def _cell_progress_for(tasks):
+        def _cb(done, total):
+            cid = task_cids[int(done) - 1] if 0 < int(done) <= len(task_cids) else None
+            _stack_rep.progress(int(done), item_id=cid)
+        return _cb
 
     t_block0 = time.perf_counter()
 
-    def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt):
+    def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt,
+                        tasks=None, workers=None, cache_workers=None):
         """Run the WHOLE per-cell batch once; returns (results, meta).
 
         ``gpu_attempt=True`` disables pmap's SAME-config serial retry (serial_fallback
         False) so a CuPy OOM/driver error propagates here for a one-shot CPU rerun
         instead of being retried with the same GPU config (which would repeat the
         error and crash).
+
+        ``tasks``/``workers``/``cache_workers`` (ZM-ZEGRID-R36 F-M2) let the CPU
+        fallback rerun HONOR an independently-computed CPU plan instead of the
+        primary GPU plan (exact mode/tasks/bounds + safe concurrency/cache workers).
         """
+        _tasks = cell_tasks if tasks is None else tasks
+        _workers = cells_in_flight if workers is None else int(workers)
+        _cache_workers = cache_workers_per_cell if cache_workers is None else int(cache_workers)
         _meta = {}
         _res = zpar.pmap(
-            _stack_cell, cell_tasks, workers=cells_in_flight,
-            progress_callback=_cell_progress, emit=_emit_live, meta=_meta,
+            _stack_cell, _tasks, workers=_workers,
+            progress_callback=_cell_progress_for(_tasks), emit=_emit_live, meta=_meta,
             initializer=_init_stack_worker,
             initargs=(descs, canvas, science_cfg, global_gauge, global_frame_ids,
-                      global_reference_frame_id, tile_size, cache_workers_per_cell),
+                      global_reference_frame_id, tile_size, _cache_workers),
             serial_fallback=not gpu_attempt,
         )
         return _res, _meta
@@ -2636,12 +2706,30 @@ def _run_single(
             )
         except Exception as exc:
             if zgpu.is_gpu_runtime_error(exc):
-                # H1: classified GPU runtime failure -> one-shot exact-CPU
-                # whole-batch rerun (WARN, recorded; no recursion).
+                if not cpu_fallback_info["feasible"]:
+                    # F-M2: NO CPU mode fits the CURRENT per-cell budget -> refuse an
+                    # over-budget CPU rerun and fail LOUD before any CPU attempt.
+                    _emit(
+                        f"ZeGrid: GPU RUNTIME failure ({type(exc).__name__}) and NO CPU "
+                        f"fallback mode fits the current per-cell budget "
+                        f"{per_cell_budget / 2**20:.1f} MiB — refusing an over-budget CPU "
+                        f"rerun (loud failure): {exc}",
+                        lvl="ERROR", callback=progress_callback,
+                    )
+                    raise zpar.ModeInfeasible(
+                        "GPU runtime failure and no CPU fallback mode fits the current "
+                        f"per-cell RAM budget {per_cell_budget / 2**20:.1f} MiB "
+                        f"({cpu_fallback_info['reason']}); refusing an over-budget CPU rerun"
+                    ) from exc
+                # H1: classified GPU runtime failure -> one-shot CPU whole-batch
+                # rerun HONORING the validated CPU fallback plan (F-M2).
                 runtime_gpu_fallback = {"reason": repr(exc), "type": type(exc).__name__}
                 _emit(
                     f"ZeGrid: GPU RUNTIME failure ({type(exc).__name__}); "
-                    f"degrading to exact CPU whole-batch rerun (no silent fallback): {exc}",
+                    f"degrading to the validated CPU fallback plan "
+                    f"(mode={cpu_fallback_info['mode']}, "
+                    f"cells_in_flight={cpu_fallback_info['cells_in_flight']}, "
+                    f"tile={cpu_streaming_tile}) — no silent fallback: {exc}",
                     lvl="WARN", callback=progress_callback,
                 )
                 gpu_used = False
@@ -2659,11 +2747,23 @@ def _run_single(
                 for _t in cell_tasks:
                     if _t[4] is not None:
                         _safe_rmtree(_t[3], None)
-                # Rerun the WHOLE batch exactly once on CPU (no recursion). The
-                # CPU rerun uses the R36-adaptive CPU streaming tile (never a
-                # re-coded 128).
+                # Rerun the WHOLE batch exactly once on CPU, HONORING the validated
+                # CPU fallback plan (mode/tasks/concurrency/cache workers) with the
+                # selected CPU streaming tile (never a re-coded 128 / GPU tile).
+                cpu_fallback_info["used"] = True
+                chosen_mode = cpu_fallback_info["mode"]
+                cells_in_flight = int(cpu_fallback_info["cells_in_flight"] or 1)
+                cache_workers_per_cell = int(cpu_fallback_info["cache_workers_per_cell"] or 1)
+                per_cell_diagnostics["mode"] = chosen_mode
+                per_cell_diagnostics["cells_in_flight"] = cells_in_flight
+                per_cell_diagnostics["cache_workers_per_cell"] = cache_workers_per_cell
+                per_cell_diagnostics["cpu_fallback_used"] = True
+                if isinstance(per_cell_diagnostics.get("cpu_fallback_plan"), dict):
+                    per_cell_diagnostics["cpu_fallback_plan"]["used"] = True
                 results, per_cell_meta = _run_cell_batch(
-                    science_config, cpu_streaming_tile, gpu_attempt=False
+                    science_config, cpu_streaming_tile, gpu_attempt=False,
+                    tasks=cpu_fallback_tasks, workers=cells_in_flight,
+                    cache_workers=cache_workers_per_cell,
                 )
             else:
                 raise  # arbitrary science/programming error propagates (never swallowed)
@@ -2696,6 +2796,7 @@ def _run_single(
     gpu_ctx["gpu_streaming_host_peak_bytes"] = (
         int(gpu_streaming_host_peak_bytes) if gpu_streaming_host_peak_bytes is not None else None
     )
+    gpu_ctx["cpu_fallback_plan"] = dict(cpu_fallback_info)
     gpu_used = bool(actually_used_gpu)
 
     # R20 diagnostics (mirrors the R19 gauge diagnostics): effective executor,
