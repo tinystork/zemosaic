@@ -105,9 +105,18 @@ CACHE_DIR_NAME = "__zegrid_cache__"
 # Run-log filename written into the run's output folder (the user reported it absent).
 RUN_LOG_NAME = "zegrid_run.log"
 # Streaming tile size for the R6 executor (safe, memory-bounded default).
-STREAM_TILE_SIZE = 128
-# Fraction of available memory the R4 in-memory bound must fit within to select
+STREAM_TILE_SIZE = 128# Fraction of available memory the R4 in-memory bound must fit within to select
 # the in-memory path (headroom for decode/cache transients + allocator variance).
+# ZM-ZEGRID-R36: deterministic CPU streaming-tile ladder, ordered
+# performance -> economy. The planner picks the LARGEST tile whose worst-cell
+# streaming bound fits the RAM budget. ``128`` is the historical/preferred tile;
+# ``32`` is the documented PERFORMANCE FLOOR (never a science floor — geometry,
+# Cell/ProcessingPatch/MiniTile, halo, gauge, weights, rejection and combine are
+# UNCHANGED). R36 never goes below 32.
+CPU_STREAMING_TILE_LADDER = (128, 112, 96, 80, 64, 48, 32)
+CPU_STREAMING_TILE_PREFERRED = 128
+CPU_STREAMING_TILE_MINIMUM = 32
+
 INMEM_AVAILABLE_FRAC = 0.80
 # Normalization token for the ZeGrid engine when none is explicitly requested.
 DEFAULT_NORMALIZATION = "sky_mean"
@@ -716,14 +725,107 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
 
     For every Cell, takes the CHEAPER of the in-memory and streaming bounds and
     maximises over Cells (mirrors ``auto_layout._scan_layout`` but mode-aware).
+
+    ZM-ZEGRID-R36 augments the returned worst-cell dict (in ONE membership pass)
+    with the RAM-adaptive CPU-tile inputs consumed by
+    :func:`_select_cpu_streaming_tile`:
+
+    * ``inmem_worst_bytes`` — worst in-memory bound over the Cells;
+    * ``stream_worst_by_tile`` — worst streaming bound for EACH ladder tile.
+
+    The primary ``cheaper_bound_bytes`` (at the passed ``tile_size``) is
+    UNCHANGED, so existing consumers (R28 parity, ``predicted_bound_bytes``)
+    keep their exact semantics.
     """
     worst = None
+    inmem_worst = 0
+    stream_worst_by_tile = {int(t): 0 for t in CPU_STREAMING_TILE_LADDER}
     for c in _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
         cheaper = min(c["inmem_bound_bytes"], c["stream_bound_bytes"])
         if worst is None or cheaper > worst["cheaper_bound_bytes"]:
             worst = dict(c)
             worst["cheaper_bound_bytes"] = cheaper
+        if c["inmem_bound_bytes"] > inmem_worst:
+            inmem_worst = int(c["inmem_bound_bytes"])
+        hw = tuple(c["patch_hw"])
+        n = c["n"]
+        for t in CPU_STREAMING_TILE_LADDER:
+            b = int(_estimate_streaming_bytes(n, hw, int(t)))
+            if b > stream_worst_by_tile[int(t)]:
+                stream_worst_by_tile[int(t)] = b
+    worst = worst or {}
+    worst["inmem_worst_bytes"] = int(inmem_worst)
+    worst["stream_worst_by_tile"] = stream_worst_by_tile
     return worst
+
+
+def _select_cpu_streaming_tile(stream_worst_by_tile, ram_budget):
+    """Largest ladder tile whose worst-cell streaming bound fits ``ram_budget``.
+
+    Returns ``(selected_tile, trials, reason)``:
+
+    * ``selected_tile`` — the largest tile in :data:`CPU_STREAMING_TILE_LADDER`
+      whose ``stream_worst_by_tile`` bound is ``<= ram_budget`` (or the largest
+      tile at all when ``ram_budget is None``); ``None`` when NO ladder tile fits
+      (then the layout is admissible only via the in-memory bound).
+    * ``trials`` — ordered ``[{"tile": t, "worst_bound_bytes": b, "fits": f}]``
+      (descending tile order) so the log/manifest can show why 128 dropped.
+    * ``reason`` — a compact human string.
+
+    ``stream_worst_by_tile`` is the dict produced by :func:`_scan_layout_mode_aware`.
+    """
+    trials = []
+    selected = None
+    for tile in CPU_STREAMING_TILE_LADDER:
+        bound = int(stream_worst_by_tile.get(int(tile), 0) or 0)
+        fits = (ram_budget is None) or (bound <= int(ram_budget))
+        trials.append({"tile": int(tile), "worst_bound_bytes": bound, "fits": bool(fits)})
+        if fits and selected is None:
+            selected = int(tile)
+    if selected is None:
+        reason = (
+            "no CPU streaming tile fits the budget "
+            f"(minimum tile {CPU_STREAMING_TILE_MINIMUM} bound "
+            f"{int(stream_worst_by_tile.get(CPU_STREAMING_TILE_MINIMUM, 0)) / 2**20:.1f} MiB"
+            + (f" > budget {int(ram_budget) / 2**20:.1f} MiB" if ram_budget is not None else "")
+            + "); streaming not viable — in-memory only"
+        )
+    elif selected == CPU_STREAMING_TILE_PREFERRED:
+        reason = "preferred CPU streaming tile 128 fits the budget"
+    else:
+        # Explain why 128 dropped: list the coarser tiles that did not fit.
+        dropped = [t["tile"] for t in trials if not t["fits"]]
+        reason = (
+            f"CPU streaming tile reduced from {CPU_STREAMING_TILE_PREFERRED} to "
+            f"{selected} to fit the budget (tile(s) {dropped} exceed "
+            + (f"{int(ram_budget) / 2**20:.1f} MiB" if ram_budget is not None else "budget")
+            + ")"
+        )
+    return selected, trials, reason
+
+
+def _cpu_streaming_block(selected_tile, trials, reason, stream_worst_by_tile, inmem_worst, ram_budget):
+    """Build the public ``cpu_streaming`` provenance block (ZM-ZEGRID-R36).
+
+    Carries the adaptive CPU streaming-tile decision WITHOUT a bare ``tile_size``
+    name (the selected/preferred/minimum tiles are named explicitly). JSON-safe.
+    """
+    est_tile = int(selected_tile) if selected_tile is not None else int(CPU_STREAMING_TILE_MINIMUM)
+    stream_bound = int(stream_worst_by_tile.get(int(est_tile), 0) or 0)
+    return {
+        "adaptive": True,
+        "preferred_tile_size": int(CPU_STREAMING_TILE_PREFERRED),
+        "selected_tile_size": (int(selected_tile) if selected_tile is not None else None),
+        "minimum_tile_size": int(CPU_STREAMING_TILE_MINIMUM),
+        "selection_reason": str(reason),
+        "predicted_peak_bytes": int(stream_bound),
+        "ram_budget_bytes": (int(ram_budget) if ram_budget is not None else None),
+        "inmem_bound_bytes": int(inmem_worst),
+        "stream_bound_bytes": int(stream_bound),
+        "estimate_tile_size": int(est_tile),
+        "ladder": [int(t) for t in CPU_STREAMING_TILE_LADDER],
+        "trials": list(trials),
+    }
 
 
 def _choose_layout_mode_aware(
@@ -838,11 +940,29 @@ def _choose_layout_mode_aware(
         cells = list(_iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size))
         max_n = max((c["n"] for c in cells), default=0)
         worst_bound = max((min(c["inmem_bound_bytes"], c["stream_bound_bytes"]) for c in cells), default=0)
-        if ram_budget is not None and worst_bound > ram_budget:
+        inmem_worst = max((c["inmem_bound_bytes"] for c in cells), default=0)
+        stream_worst_by_tile = {int(t): 0 for t in CPU_STREAMING_TILE_LADDER}
+        for c in cells:
+            hw = tuple(c["patch_hw"])
+            for t in CPU_STREAMING_TILE_LADDER:
+                b = int(_estimate_streaming_bytes(c["n"], hw, int(t)))
+                if b > stream_worst_by_tile[int(t)]:
+                    stream_worst_by_tile[int(t)] = b
+        # ZM-ZEGRID-R36: geometry stays EXACTLY the pinned (nx, ny); only the CPU
+        # streaming tile adapts. Admissible iff the in-memory bound fits OR some
+        # ladder tile's worst-cell streaming bound fits; fail loud otherwise.
+        selected_tile, trials, sel_reason = _select_cpu_streaming_tile(stream_worst_by_tile, ram_budget)
+        inmem_ok = (ram_budget is None) or (inmem_worst <= ram_budget)
+        if not inmem_ok and selected_tile is None:
+            min_bound = int(stream_worst_by_tile.get(CPU_STREAMING_TILE_MINIMUM, 0))
             msg = (
-                f"pinned layout {nx}x{ny} cannot fit any mode within budget: "
-                f"cheaper bound {worst_bound / 2**20:.1f} MiB > budget {ram_budget / 2**20:.1f} MiB. "
-                "Suggest increasing available RAM or pinning a coarser layout via the "
+                f"pinned layout {nx}x{ny} cannot fit any mode within budget "
+                f"{ram_budget / 2**20:.1f} MiB: in-memory worst-cell bound "
+                f"{inmem_worst / 2**20:.1f} MiB and the finest streaming tile "
+                f"(minimum tile {CPU_STREAMING_TILE_MINIMUM}) worst-cell bound "
+                f"{min_bound / 2**20:.1f} MiB both exceed it. The next step would be "
+                "a deeper disk-backed streaming executor (not available in R36). Suggest "
+                "increasing available RAM or pinning a coarser layout via the "
                 "'zegrid_layout' config key."
             )
             _log(msg, "ERROR")
@@ -854,6 +974,11 @@ def _choose_layout_mode_aware(
                 f"deepest cell has {max_n} contributors < min_contributors "
                 f"({floors.min_contributors}); the layout may be scientifically degraded"
             )
+        _log(
+            f"layout scan: CHOSEN {nx}x{ny} ({nx * ny} cells, source=pinned) "
+            f"CPU streaming tile {selected_tile}; in-memory worst "
+            f"{inmem_worst / 2**20:.1f} MiB; {sel_reason}"
+        )
         return {
             "nx": nx, "ny": ny,
             "cell_count": nx * ny,
@@ -867,6 +992,9 @@ def _choose_layout_mode_aware(
             "warnings": tuple(warnings),
             "cells": cells,
             "layout_source": "pinned",
+            "cpu_streaming": _cpu_streaming_block(
+                selected_tile, trials, sel_reason, stream_worst_by_tile, inmem_worst, ram_budget
+            ),
             "floors": {
                 "min_patch_area_px": {"value": geom["min_patch_area"],
                                        "limit": floors.min_patch_area_px, "ok": patch_ok},
@@ -911,24 +1039,38 @@ def _choose_layout_mode_aware(
             _log("layout scan: floors are monotonic in refinement — stopping")
             break  # floors are monotonic in refinement
         worst = _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
-        memory_ok = (ram_budget is None) or (worst["cheaper_bound_bytes"] <= ram_budget)
+        selected_tile, trials, sel_reason = _select_cpu_streaming_tile(
+            worst["stream_worst_by_tile"], ram_budget
+        )
+        inmem_ok = (ram_budget is None) or (worst["inmem_worst_bytes"] <= ram_budget)
+        # ZM-ZEGRID-R36 admissibility: the in-memory bound fits OR some (>= minimum)
+        # CPU streaming tile fits. This strictly widens the pre-R36 rule
+        # (min(inmem, stream@preferred) <= budget) whenever a smaller tile helps.
+        memory_ok = inmem_ok or (selected_tile is not None)
         bound_mib = worst["cheaper_bound_bytes"] / 2**20
+        inmem_mib = worst["inmem_worst_bytes"] / 2**20
+        min_tile_mib = worst["stream_worst_by_tile"].get(CPU_STREAMING_TILE_MINIMUM, 0) / 2**20
         budget_mib = (ram_budget / 2**20) if ram_budget is not None else None
         if memory_ok:
             _log(
                 f"layout scan: candidate {nx}x{ny} ACCEPTED "
-                f"(cheaper-mode bound {bound_mib:.1f} MiB"
-                + (f" <= budget {budget_mib:.1f} MiB" if budget_mib is not None else "") + ")"
+                f"(in-memory worst {inmem_mib:.1f} MiB"
+                f"{'; CPU streaming tile ' + str(selected_tile) + ' fits' if selected_tile is not None else ''}"
+                + (f"; budget {budget_mib:.1f} MiB" if budget_mib is not None else "") + ")"
             )
         else:
             _log(
                 f"layout scan: candidate {nx}x{ny} REJECTED — "
-                f"cheaper-mode bound {bound_mib:.1f} MiB > budget {budget_mib:.1f} MiB"
+                f"cheaper-mode bound {bound_mib:.1f} MiB > budget {budget_mib:.1f} MiB "
+                f"(in-memory worst {inmem_mib:.1f} MiB; no CPU streaming tile fits down "
+                f"to minimum {CPU_STREAMING_TILE_MINIMUM}, bound {min_tile_mib:.1f} MiB)"
             )
         candidates.append({
             "factor": factor, "nx": nx, "ny": ny,
             "bound": worst["cheaper_bound_bytes"], "worst_cell": worst,
             "memory_ok": memory_ok, "geom": geom,
+            "inmem_ok": inmem_ok, "selected_tile": selected_tile,
+            "trials": trials, "selection_reason": sel_reason,
         })
         if memory_ok:
             # ZM-ZEGRID-R28: the returned choice is the FIRST floor-feasible +
@@ -952,22 +1094,30 @@ def _choose_layout_mode_aware(
     if chosen is None:
         finest = candidates[-1] if candidates else None
         reasons = []
-        if ram_budget is not None and finest is not None and finest["bound"] > ram_budget:
+        if ram_budget is not None and finest is not None:
+            wc = finest["worst_cell"]
+            min_tile_bound = wc.get("stream_worst_by_tile", {}).get(CPU_STREAMING_TILE_MINIMUM, 0)
             reasons.append(
-                f"even the finest floor-feasible layout ({finest['nx']}x{finest['ny']}) "
-                f"cheaper-mode bound {finest['bound'] / 2**20:.1f} MiB exceeds budget "
-                f"{ram_budget / 2**20:.1f} MiB"
+                f"even the finest floor-feasible layout ({finest['nx']}x{finest['ny']}) is "
+                f"infeasible: in-memory worst-cell bound "
+                f"{wc.get('inmem_worst_bytes', 0) / 2**20:.1f} MiB and the finest CPU "
+                f"streaming tile (minimum tile {CPU_STREAMING_TILE_MINIMUM}) worst-cell "
+                f"bound {min_tile_bound / 2**20:.1f} MiB both exceed budget "
+                f"{ram_budget / 2**20:.1f} MiB (cheaper-mode bound "
+                f"{finest['bound'] / 2**20:.1f} MiB)"
             )
         reasons.append(
             f"min_patch_area floor ({floors.min_patch_area_px} px) / "
             f"max_halo_overhead floor ({floors.max_halo_overhead}) cannot be satisfied "
-            f"together with the budget (mode-aware)"
+            f"together with the budget (mode-aware, adaptive CPU streaming tile down to "
+            f"{CPU_STREAMING_TILE_MINIMUM})"
         )
         msg = (
             "RAM budget cannot satisfy scientific floors (mode-aware): "
             + "; ".join(reasons)
-            + ". Suggest either increasing available RAM or pinning the layout via "
-            "the 'zegrid_layout' config key."
+            + ". The next step would be a deeper disk-backed streaming executor "
+            "(not available in R36). Suggest either increasing available RAM or "
+            "pinning the layout via the 'zegrid_layout' config key."
         )
         _log(msg, "ERROR")
         raise zal.LayoutInfeasible(msg)
@@ -994,7 +1144,10 @@ def _choose_layout_mode_aware(
     _log(
         f"layout scan: CHOSEN {chosen['nx']}x{chosen['ny']} "
         f"({chosen['nx'] * chosen['ny']} cells, mode-aware, source=auto) "
-        f"cheaper-mode bound {chosen['bound'] / 2**20:.1f} MiB"
+        f"cheaper-mode bound {chosen['bound'] / 2**20:.1f} MiB; "
+        f"in-memory worst {chosen['worst_cell'].get('inmem_worst_bytes', 0) / 2**20:.1f} MiB; "
+        f"CPU streaming tile {chosen['selected_tile']} "
+        f"({chosen['selection_reason']})"
     )
 
     return {
@@ -1010,6 +1163,11 @@ def _choose_layout_mode_aware(
         "warnings": tuple(warnings),
         "cells": cells,
         "layout_source": "auto",
+        "cpu_streaming": _cpu_streaming_block(
+            chosen["selected_tile"], chosen["trials"], chosen["selection_reason"],
+            chosen["worst_cell"]["stream_worst_by_tile"],
+            chosen["worst_cell"]["inmem_worst_bytes"], ram_budget,
+        ),
         "floors": {
             "min_patch_area_px": {"value": chosen["geom"]["min_patch_area"],
                                    "limit": floors.min_patch_area_px,
@@ -1550,6 +1708,10 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
         "vram_budget_bytes": ctx.get("vram_budget_bytes"),
         "fallback_reason": ctx.get("fallback_reason"),
         "runtime_fallback": ctx.get("runtime_fallback"),
+        # ZM-ZEGRID-R36: the CPU streaming tile (RAM-adaptive; used verbatim by any
+        # GPU->CPU fallback) and the GPU streaming tile (the GPU success path).
+        "cpu_streaming_tile": ctx.get("cpu_streaming_tile"),
+        "gpu_streaming_tile": ctx.get("gpu_streaming_tile"),
         "backend": {
             "gauge_rejection": "cpu",
             "gauge_combine": "cpu",
@@ -1966,6 +2128,25 @@ def _run_single(
         # ``build_cell_context`` pass (previously a silent 170-cell loop that
         # re-projected every frame's WCS for every cell).
         cell_ctxs = _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep)
+    # ZM-ZEGRID-R36: the RAM-adaptive CPU streaming tile chosen by the layout
+    # planner. ``selected_tile_size is None`` means NO ladder tile fits the
+    # budget (the layout is admissible via the in-memory bound only); in that case
+    # the streaming estimate uses the documented minimum so the joint planner
+    # correctly marks streaming INFEASIBLE. The SAME tile is propagated verbatim
+    # to the per-cell estimates, the joint planner, the workers and the GPU->CPU
+    # fallback (never a re-coded 128).
+    cpu_streaming = layout.get("cpu_streaming") or {}
+    _cs_selected = cpu_streaming.get("selected_tile_size")
+    cpu_streaming_tile = int(_cs_selected) if _cs_selected is not None else int(CPU_STREAMING_TILE_MINIMUM)
+    _emit(
+        f"ZeGrid: CPU streaming tile — selected={_cs_selected} "
+        f"(preferred={cpu_streaming.get('preferred_tile_size')}, "
+        f"minimum={cpu_streaming.get('minimum_tile_size')}) "
+        f"predicted={cpu_streaming.get('predicted_peak_bytes', 0) / 2**20:.1f} MiB "
+        f"budget={(cpu_streaming.get('ram_budget_bytes') or 0) / 2**20:.1f} MiB — "
+        f"{cpu_streaming.get('selection_reason')}",
+        callback=progress_callback,
+    )
     # Record the layout sub-step timings as SUBORDINATE to the layout phase (they
     # appear in the manifest/run-log but never become new top-level phases for the
     # global ETA).
@@ -1979,7 +2160,8 @@ def _run_single(
         f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells, "
         f"source={layout.get('layout_source', 'auto')}) from RAM budget "
         f"{available / 2**30:.2f} GiB; worst-cell cheaper-mode bound "
-        f"{layout['predicted_bound_bytes'] / 2**20:.1f} MiB (maxN={layout['max_contributors']})",
+        f"{layout['predicted_bound_bytes'] / 2**20:.1f} MiB (maxN={layout['max_contributors']}); "
+        f"CPU streaming tile={_cs_selected}",
         callback=progress_callback,
     )
     for w in layout["warnings"]:
@@ -2177,7 +2359,7 @@ def _run_single(
         n = len(mem.patch_ids)
         area = patch.patch.width * patch.patch.height
         inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
-        stream_b = _estimate_streaming_bytes(n, patch.patch_shape_hw, STREAM_TILE_SIZE)
+        stream_b = _estimate_streaming_bytes(n, patch.patch_shape_hw, cpu_streaming_tile)
         cell_bound_pairs.append((inmem_b, stream_b))
         cell_specs.append((cell, patch, mem, str(cache_root / cid), inmem_b, stream_b))
         _emit(
@@ -2206,10 +2388,13 @@ def _run_single(
         callback=progress_callback,
     )
     for c in _plan["candidates"]:
+        _mk = c.get("makespan_rel")
+        _feas = c.get("feasible", True)
         _emit(
             f"ZeGrid: plan candidate mode={c['mode']} cells_in_flight={c['cells_in_flight']} "
             f"max_bound={c['max_bound_bytes'] / 2**20:.1f}MiB "
-            f"makespan_rel={c['makespan_rel']:.3f}",
+            f"feasible={_feas}"
+            + (f" makespan_rel={_mk:.3f}" if _mk is not None else f" ({c.get('infeasible_reason', 'infeasible')})"),
             callback=progress_callback,
         )
 
@@ -2231,6 +2416,7 @@ def _run_single(
     # device never materialises N x full-cell. A degenerate (None) tile degrades
     # LOUDLY to exact CPU (no silent fallback).
     gpu_tile_size = STREAM_TILE_SIZE
+    gpu_streaming_tile = None  # tile the GPU success path actually used (R36 manifest)
     if gpu_used:
         max_n = max((len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids), default=1)
         worst_hw = (1, 1)
@@ -2261,8 +2447,12 @@ def _run_single(
             ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
         else:
             gpu_tile_size = _gpu_ts
+            gpu_streaming_tile = _gpu_ts
     _emit(
-        f"ZeGrid: stack tile size={gpu_tile_size} backend={science_config.backend}",
+        f"ZeGrid: stack tiles — CPU streaming tile={cpu_streaming_tile} "
+        f"(selected={_cs_selected}, preferred={CPU_STREAMING_TILE_PREFERRED}, "
+        f"minimum={CPU_STREAMING_TILE_MINIMUM}) gpu_streaming_tile={gpu_streaming_tile} "
+        f"backend={science_config.backend}",
         callback=progress_callback,
     )
 
@@ -2289,6 +2479,10 @@ def _run_single(
         "gpu_serialized": bool(_plan.get("gpu_serialized")),
         "plan_chosen_reason": _plan.get("chosen_reason"),
         "plan_candidates": _plan.get("candidates"),
+        "cpu_streaming_tile": int(cpu_streaming_tile),
+        "cpu_streaming_tile_selected": _cs_selected,
+        "gpu_streaming_tile": (int(gpu_streaming_tile) if gpu_streaming_tile is not None else None),
+        "cpu_streaming": dict(cpu_streaming),
     }
     per_cell_meta = {}
 
@@ -2348,15 +2542,17 @@ def _run_single(
                 for _t in cell_tasks:
                     if _t[4] is not None:
                         _safe_rmtree(_t[3], None)
-                # Rerun the WHOLE batch exactly once on CPU (no recursion).
+                # Rerun the WHOLE batch exactly once on CPU (no recursion). The
+                # CPU rerun uses the R36-adaptive CPU streaming tile (never a
+                # re-coded 128).
                 results, per_cell_meta = _run_cell_batch(
-                    science_config, STREAM_TILE_SIZE, gpu_attempt=False
+                    science_config, cpu_streaming_tile, gpu_attempt=False
                 )
             else:
                 raise  # arbitrary science/programming error propagates (never swallowed)
     else:
         results, per_cell_meta = _run_cell_batch(
-            science_config, gpu_tile_size, gpu_attempt=False
+            science_config, cpu_streaming_tile, gpu_attempt=False
         )
 
     block_wall = time.perf_counter() - t_block0
@@ -2374,6 +2570,12 @@ def _run_single(
     gpu_ctx["actually_used"] = bool(actually_used_gpu)
     gpu_ctx["final_backend"] = "gpu" if actually_used_gpu else "cpu"
     gpu_ctx["final_effective"] = bool(actually_used_gpu)
+    # ZM-ZEGRID-R36: distinguish the GPU streaming tile from the CPU streaming
+    # tile (the GPU->CPU fallback uses the CPU tile, never a re-coded 128).
+    gpu_ctx["cpu_streaming_tile"] = int(cpu_streaming_tile)
+    gpu_ctx["gpu_streaming_tile"] = (
+        int(gpu_streaming_tile) if gpu_streaming_tile is not None else None
+    )
     gpu_used = bool(actually_used_gpu)
 
     # R20 diagnostics (mirrors the R19 gauge diagnostics): effective executor,
@@ -3240,6 +3442,22 @@ def _write_outputs(
         ),
         "gauge_diagnostics": (gauge_diagnostics or {}),
         "per_cell_diagnostics": (per_cell_diagnostics or {}),
+        # ZM-ZEGRID-R36: the RAM-adaptive CPU streaming-tile decision (clear,
+        # auditable block; on a comfortable machine selected_tile_size=128 with an
+        # explicit reason). NEVER a bare ``tile_size``.
+        "cpu_streaming": (
+            layout.get("cpu_streaming")
+            if isinstance(layout, dict) and layout.get("cpu_streaming")
+            else {
+                "adaptive": False,
+                "preferred_tile_size": int(CPU_STREAMING_TILE_PREFERRED),
+                "selected_tile_size": None,
+                "minimum_tile_size": int(CPU_STREAMING_TILE_MINIMUM),
+                "selection_reason": "no CPU streaming decision recorded for this run",
+                "predicted_peak_bytes": None,
+                "ram_budget_bytes": None,
+            }
+        ),
         "finishing": (finishing_info or {}),
         "peak_rss_kib": peak_rss_kib,
         "peak_rss_kib_note": (

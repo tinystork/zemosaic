@@ -218,6 +218,16 @@ _PLANNER_INMEM_COST = 1.0
 _PLANNER_STREAM_COST = 1.2
 
 
+class ModeInfeasible(RuntimeError):
+    """Raised when NO stacking mode fits the RAM budget (ZM-ZEGRID-R36).
+
+    A mode whose worst-cell bound exceeds the budget is INFEASIBLE: it cannot be
+    rescued by a concurrency of 1 (``cells_in_flight`` clamping the zero quotient
+    to 1). The joint planner excludes such modes from the choice and raises this
+    instead of silently reporting a plan the machine cannot hold.
+    """
+
+
 def plan_cell_concurrency(
     cell_bounds,
     cpu: int,
@@ -270,8 +280,9 @@ def plan_cell_concurrency(
         waves = (n_cells + in_flight - 1) // in_flight
         return waves * per_cell_cost
 
-    inmem_in_flight = _in_flight(max_inmem)
-    stream_in_flight = _in_flight(max_stream)
+    def _makespan(in_flight: int, per_cell_cost: float) -> float:
+        waves = (n_cells + in_flight - 1) // in_flight
+        return waves * per_cell_cost
 
     if gpu_backend:
         # Single GPU owner + bounded device memory: the STACK phase serialises
@@ -316,26 +327,59 @@ def plan_cell_concurrency(
         waves = (n_cells + in_flight - 1) // in_flight
         return waves * per_cell_cost
 
-    inmem_makespan = _makespan(inmem_in_flight, _PLANNER_INMEM_COST)
-    stream_makespan = _makespan(stream_in_flight, _PLANNER_STREAM_COST)
+    # ZM-ZEGRID-R36: a mode whose worst-cell bound exceeds the RAM budget is
+    # INFEASIBLE — it must NOT be rescued by a concurrency of 1 (the
+    # ``cells_in_flight`` seam clamps the zero quotient to 1, which previously
+    # made an over-budget mode look like a valid serial plan). ``ram_budget <= 0``
+    # (no budget) keeps the historical behaviour: every mode is feasible.
+    def _mode_feasible(footprint: int) -> bool:
+        return ram_budget <= 0 or int(footprint) <= ram_budget
 
-    # Choose the lower estimated makespan; break ties toward inmem (faster/cell).
-    if stream_makespan < inmem_makespan - 1e-9:
+    inmem_feasible = _mode_feasible(max_inmem)
+    stream_feasible = _mode_feasible(max_stream)
+
+    if not inmem_feasible and not stream_feasible:
+        raise ModeInfeasible(
+            "no stacking mode fits the RAM budget "
+            f"{ram_budget / 2**20:.1f} MiB: in-memory worst-cell bound "
+            f"{max_inmem / 2**20:.1f} MiB and streaming worst-cell bound "
+            f"{max_stream / 2**20:.1f} MiB both exceed it (n_cells={n_cells})"
+        )
+
+    inmem_in_flight = _in_flight(max_inmem) if inmem_feasible else 0
+    stream_in_flight = _in_flight(max_stream) if stream_feasible else 0
+    inmem_makespan = _makespan(inmem_in_flight, _PLANNER_INMEM_COST) if inmem_feasible else None
+    stream_makespan = _makespan(stream_in_flight, _PLANNER_STREAM_COST) if stream_feasible else None
+
+    # Choose the lower estimated makespan among the FEASIBLE modes; break ties
+    # toward inmem (faster/cell). An infeasible mode is never chosen (R36).
+    if stream_feasible and (not inmem_feasible or stream_makespan < inmem_makespan - 1e-9):
         mode = "stream"
         chosen_in_flight = stream_in_flight
-        chosen_reason = (
-            f"streaming estimated makespan {stream_makespan:.3f} (cells_in_flight="
-            f"{stream_in_flight}) < in-memory {inmem_makespan:.3f} "
-            f"(cells_in_flight={inmem_in_flight})"
-        )
+        if not inmem_feasible:
+            chosen_reason = (
+                f"in-memory mode INFEASIBLE (worst-cell bound "
+                f"{max_inmem / 2**20:.1f} MiB > budget {ram_budget / 2**20:.1f} MiB); "
+                f"streaming selected (cells_in_flight={stream_in_flight}, "
+                f"makespan {stream_makespan:.3f})"
+            )
+        else:
+            chosen_reason = (
+                f"streaming estimated makespan {stream_makespan:.3f} (cells_in_flight="
+                f"{stream_in_flight}) < in-memory {inmem_makespan:.3f} "
+                f"(cells_in_flight={inmem_in_flight})"
+            )
     else:
         mode = "inmem"
         chosen_in_flight = inmem_in_flight
-        chosen_reason = (
-            f"in-memory estimated makespan {inmem_makespan:.3f} (cells_in_flight="
-            f"{inmem_in_flight}) <= streaming {stream_makespan:.3f} "
-            f"(cells_in_flight={stream_in_flight})"
-        )
+        if not inmem_feasible:  # pragma: no cover - guarded by the raise above
+            chosen_reason = "in-memory selected (only feasible mode)"
+        else:
+            chosen_reason = (
+                f"in-memory estimated makespan {inmem_makespan:.3f} (cells_in_flight="
+                f"{inmem_in_flight}) <= streaming {stream_makespan:.3f} "
+                f"(cells_in_flight={stream_in_flight})"
+            )
 
     # Bounded cache-build parallelism: full budget when one cell is active, else
     # cpu // K so the total workers never explode to K x cache_build_workers.
@@ -348,16 +392,26 @@ def plan_cell_concurrency(
             "mode": "inmem",
             "cells_in_flight": int(inmem_in_flight),
             "max_bound_bytes": int(max_inmem),
+            "feasible": bool(inmem_feasible),
+            "infeasible_reason": (
+                None if inmem_feasible
+                else f"worst-cell bound {max_inmem / 2**20:.1f} MiB > ram_budget"
+            ),
             "per_cell_cost_rel": _PLANNER_INMEM_COST,
-            "makespan_rel": float(inmem_makespan),
+            "makespan_rel": (float(inmem_makespan) if inmem_makespan is not None else None),
             "gpu_serialized": bool(gpu_backend),
         },
         {
             "mode": "stream",
             "cells_in_flight": int(stream_in_flight),
             "max_bound_bytes": int(max_stream),
+            "feasible": bool(stream_feasible),
+            "infeasible_reason": (
+                None if stream_feasible
+                else f"worst-cell bound {max_stream / 2**20:.1f} MiB > ram_budget"
+            ),
             "per_cell_cost_rel": _PLANNER_STREAM_COST,
-            "makespan_rel": float(stream_makespan),
+            "makespan_rel": (float(stream_makespan) if stream_makespan is not None else None),
             "gpu_serialized": bool(gpu_backend),
         },
     ]
