@@ -6250,6 +6250,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
 
         sds_phase = bool(payload_dict.get("sds_phase"))
+        # Defensive default: the SDS branch below does not necessarily assign a
+        # label, and the trailing `if isinstance(stage_label, str)` must never
+        # raise UnboundLocalError (SDS runs hit this path on every phase change).
+        stage_label: str | None = None
         if sds_phase:
             current_val = payload_dict.get("current")
             total_val = payload_dict.get("total")

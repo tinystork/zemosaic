@@ -34383,6 +34383,11 @@ def run_hierarchical_mosaic(
                     len(cache_refcount),
                 )
 
+            # FIX (SDS/global path): dbg_tile_ids was referenced at the Phase-3
+            # submit below but never initialised on the SDS/grid path (NameError),
+            # unlike the classic path. Mirror the classic initialisation.
+            dbg_tile_ids = _select_debug_tile_ids(tile_id_order)
+
             def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int, processing_rank: int | None = None) -> None:
                 if cache_retention_mode == "per_tile" and assigned_tile_id not in tile_cache_paths_unique:
                     _register_tile_cache_paths(assigned_tile_id, group_info_list)
@@ -36473,6 +36478,28 @@ if __name__ == "__main__":
     run_hierarchical_mosaic(**final_kwargs)
 
 
+def _reduce_sds_weight_maps(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce a canonical estimator-weight array to per-pixel SDS maps.
+
+    ``CanonicalStackResult.estimator_weight_sum`` has the SAME shape as the
+    science array, i.e. ``(H, W, C)`` for RGB (or ``(H, W)`` for mono). The
+    chunked global-coadd assembly needs a per-pixel validity mask and a
+    per-pixel coverage map (``(H, W)``), so this reduces over the channel axis
+    (``any(weight > 0)`` for validity, ``max(weight)`` for coverage — the
+    established "per-pixel stack depth (max over channels)" convention).
+
+    Returns ``(valid_hw, coverage_hw_float32)``.
+    """
+    w = np.asarray(weight)
+    if w.ndim >= 3:
+        valid = np.any(w > 0, axis=-1)
+        cov = np.max(w, axis=-1)
+    else:
+        valid = w > 0
+        cov = w
+    return valid, np.asarray(cov, dtype=np.float32)
+
+
 def _assemble_global_mosaic_first_impl(
     raw_groups: list[list[dict]],
     *,
@@ -37750,14 +37777,17 @@ def _assemble_global_mosaic_first_impl(
                     chunk_weight = res.estimator_weight_sum
                     chunk_result = np.asarray(chunk_result, dtype=np.float32)
                     chunk_result[~np.isfinite(chunk_result)] = np.nan
-                    chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0).astype(
-                        np.float32, copy=False
-                    )
-                    invalid = chunk_weight <= 0
-                    if np.any(invalid):
-                        chunk_result = np.where(invalid[..., None], np.nan, chunk_result)
+                    chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0)
+                    # estimator_weight_sum shares the SCIENCE shape (H,W,C for RGB),
+                    # so reduce to per-pixel valid/coverage maps before use.
+                    chunk_valid, chunk_cov = _reduce_sds_weight_maps(chunk_weight)
+                    if not np.all(chunk_valid):
+                        if chunk_result.ndim >= 3:
+                            chunk_result = np.where(chunk_valid[..., None], chunk_result, np.nan)
+                        else:
+                            chunk_result = np.where(chunk_valid, chunk_result, np.nan)
                     final[y0:y1, :, :] = chunk_result
-                    coverage[y0:y1, :] = chunk_weight
+                    coverage[y0:y1, :] = chunk_cov
                     y0 = y1
                 except MemoryError as exc:
                     if logger:
