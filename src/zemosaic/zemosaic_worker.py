@@ -37930,6 +37930,102 @@ def _build_sds_batches_runtime(
     return batches
 
 
+def _write_sds_tile_fits(
+    tile_data: np.ndarray,
+    alpha_tile: np.ndarray | None,
+    header: Any,
+    tile_path: Path | str,
+    progress_callback: callable | None = None,
+) -> bool:
+    """Serialize one SDS intermediate tile to FITS (ZM-SDS-R35C-C1).
+
+    SDS intermediate ``sds_tile_*.fits`` files must open in ASIFitsView /
+    Gwenview Linux. This is a FINAL SERIALIZATION boundary only: non-finite
+    float32 samples (NaN/+Inf/-Inf) are replaced with 0.0 in a copy of the
+    export buffer. In-memory science arrays are never mutated and the
+    canonical / ZeGrid / Legacy paths are untouched.
+
+    No-data keeps its ALPHA representation: a primary ``0`` is never treated
+    as proof of absence. Returns True on success, False on failure (best-effort
+    cleanup of a partial file).
+    """
+    tile_path = Path(tile_path)
+    try:
+        if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, "save_fits_image"):
+            # Reuse the R26 helper at the SDS export boundary (opt-in sanitize).
+            zemosaic_utils.save_fits_image(
+                image_data=np.ascontiguousarray(tile_data),
+                output_path=str(tile_path),
+                header=header,
+                overwrite=True,
+                save_as_float=True,
+                legacy_rgb_cube=False,
+                progress_callback=None,
+                axis_order="HWC",
+                alpha_mask=alpha_tile,
+                sanitize_nonfinite=True,
+            )
+        else:
+            primary_data = np.moveaxis(tile_data, -1, 0) if tile_data.ndim == 3 else tile_data
+            primary_data = np.asarray(primary_data, dtype=np.float32)
+            finite_mask = np.isfinite(primary_data)
+            nf_replaced = int(primary_data.size - int(np.count_nonzero(finite_mask)))
+            if nf_replaced:
+                # Copy before zero-fill: the in-memory science array stays signed.
+                primary_data = primary_data.copy()
+                primary_data[~finite_mask] = np.float32(0.0)
+            write_header = None
+            if header is not None:
+                try:
+                    write_header = header.copy()
+                except Exception:
+                    write_header = header
+            if nf_replaced:
+                if write_header is None:
+                    try:
+                        write_header = fits.Header()
+                    except Exception:
+                        write_header = None
+                if write_header is not None:
+                    try:
+                        write_header["ZNFILL"] = (0.0, "non-finite samples replaced with this value")
+                        write_header["ZNFREPL"] = (
+                            int(nf_replaced),
+                            "number of non-finite samples replaced",
+                        )
+                        write_header.add_history(
+                            "FITS Linux interop: replaced "
+                            f"{int(nf_replaced)} non-finite sample(s) with 0"
+                        )
+                    except Exception:
+                        pass
+            hdu = fits.PrimaryHDU(primary_data, header=write_header)
+            hdus = [hdu]
+            if alpha_tile is not None:
+                alpha_hdu = fits.ImageHDU(np.asarray(alpha_tile, dtype=np.uint8), name="ALPHA")
+                hdus.append(alpha_hdu)
+            fits.HDUList(hdus).writeto(str(tile_path), overwrite=True)
+        return True
+    except Exception as exc:
+        try:
+            if callable(progress_callback):
+                progress_callback(
+                    "sds_warn_tile_save_failed",
+                    prog=None,
+                    lvl="WARN",
+                    error=str(exc),
+                    filename=str(tile_path),
+                )
+        except Exception:
+            pass
+        try:
+            if tile_path.exists():
+                tile_path.unlink()
+        except Exception:
+            pass
+        return False
+
+
 def assemble_global_mosaic_sds(
     seastar_groups: list[list[dict]],
     *,
@@ -38132,34 +38228,7 @@ def assemble_global_mosaic_sds(
                 header = tile_wcs.to_header(relax=True)
             except Exception:
                 header = None
-        try:
-            if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, "save_fits_image"):
-                zemosaic_utils.save_fits_image(
-                    image_data=np.ascontiguousarray(tile_data),
-                    output_path=str(tile_path),
-                    header=header,
-                    overwrite=True,
-                    save_as_float=True,
-                    legacy_rgb_cube=False,
-                    progress_callback=None,
-                    axis_order="HWC",
-                    alpha_mask=alpha_tile,
-                )
-            else:
-                primary_data = np.moveaxis(tile_data, -1, 0) if tile_data.ndim == 3 else tile_data
-                hdu = fits.PrimaryHDU(primary_data, header=header)
-                hdus = [hdu]
-                if alpha_tile is not None:
-                    alpha_hdu = fits.ImageHDU(alpha_tile.astype(np.uint8, copy=False), name="ALPHA")
-                    hdus.append(alpha_hdu)
-                fits.HDUList(hdus).writeto(str(tile_path), overwrite=True)
-        except Exception as exc:
-            pcb("sds_warn_tile_save_failed", prog=None, lvl="WARN", error=str(exc), filename=str(tile_path))
-            try:
-                if tile_path.exists():
-                    tile_path.unlink()
-            except Exception:
-                pass
+        if not _write_sds_tile_fits(tile_data, alpha_tile, header, tile_path, progress_callback=pcb):
             return None
         return str(tile_path), tile_wcs
 
