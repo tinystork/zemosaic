@@ -81,6 +81,31 @@ def test_apply_mode_to_flags_is_coherent():
     assert cfg["input_dir"] == "x"
 
 
+def test_both_arbiters_agree_on_every_conflict_pair():
+    """R35A F1 regression: the config migration and the runtime resolver MUST
+    arbitrate an incoherent legacy state identically (documented precedence)."""
+    import itertools
+
+    from zemosaic import zemosaic_config as zc
+
+    keys = {
+        "existing_master_tiles": "use_existing_master_tiles",
+        "sds": "sds_mode_default",
+        "zegrid": "zegrid_mode_enabled",
+    }
+    names = list(keys)
+    for n in (2, 3):
+        for combo in itertools.combinations(names, n):
+            cfg = {keys[m]: True for m in combo}
+            runtime_mode = pmodes.resolve_processing_mode(dict(cfg))[0]
+            migrated = dict(cfg)
+            zc._normalize_processing_mode(migrated)
+            assert runtime_mode == migrated["processing_mode"], (
+                f"arbiters disagree for {sorted(combo)}: "
+                f"{runtime_mode!r} vs {migrated['processing_mode']!r}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # 2. Inventory: full FITS dataset, stack_plan has no effect
 # ---------------------------------------------------------------------------

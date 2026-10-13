@@ -655,11 +655,13 @@ def _normalize_processing_mode(config: dict) -> None:
     arbitrate ONCE with the documented precedence and record the arbitration in
     a load note, so the state that reaches the worker is never ambiguous.
 
-    The user's raw boolean values are preserved verbatim in the returned config
-    (``sticky`` guard is unnecessary because the arbitration is deterministic),
-    but the three booleans plus ``processing_mode`` are made coherent.
+    The three booleans are REWRITTEN to a coherent, mutually-exclusive state
+    (exactly one true, or all false) plus ``processing_mode``; the arbitration is
+    deterministic and matches :data:`zemosaic.processing_modes.CONFLICT_PRECEDENCE`
+    so both arbiters always agree on the same input.
     """
-    modes = ("existing_master_tiles", "sds", "zegrid")
+    # MUST stay identical to zemosaic.processing_modes.CONFLICT_PRECEDENCE.
+    modes = ("existing_master_tiles", "zegrid", "sds")
     keys = {
         "existing_master_tiles": "use_existing_master_tiles",
         "sds": "sds_mode_default",
