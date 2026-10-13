@@ -203,6 +203,25 @@ Cette preuve est locale et CPU ; ce n'est ni une qualification TAN/SIP complète
 
 ### Lot C4 — streaming CPU exact et mémoire bornée
 
+> **Statut C4 (2026-10-13) : IMPLÉMENTÉ (mission ZM-SDS-R35C-C4).** Nouveau module
+> `core/sds_streaming.py` (aucun `core/canonical_*` modifié) : provider SDS
+> fichier/memmap des deux étages — `SdsMegatileFileProvider` (mégatuiles -> final)
+> et `SdsPatchBandProvider` (brutes -> mégatuile, bandes horizontales sur les
+> patches memmappés existants) — réutilisant tel quel
+> `run_canonical_stack_streaming`. Les DEUX étages SDS passent par l'exécuteur
+> streaming (stack final plein-canvas en priorité), avec tuilage SPATIAL
+> uniquement (aucune fragmentation de N), statistiques globales calculées une
+> fois (invariance à la taille de bloc), supports/no-data exacts, fermeture
+> explicite des memmaps (Windows) et repli in-memory explicite (WARN) en cas
+> d'échec. Parité CPU **bit à bit** vs le moteur canonique in-memory prouvée pour
+> plusieurs tailles de blocs et ordres de scheduling. Mémoire bornée **mesurée**
+> (pic RSS ajouté 1,72 Gio in-memory -> 420/362 Mio streaming à 1280², ×4,2–4,9).
+> Plan de concurrence borné par backend **effectif** (CPU) + RAM, pas par la
+> préférence GPU. Témoin réel I1 : sur `sds_fixed` (pré-C3), l'alignement additif
+> C3 laisse un résidu **multiplicatif** inter-mégatuiles (facteurs par tuile
+> 1,00–4,95×, span 4,95×) → documenté candidat **C5**, non corrigé ici. Détail et
+> preuves : rapport `ZM-SDS-R35C-C4.coco.r0.md`. Constats C5–C6 non modifiés.
+
 - Ajouter un provider **spécifique SDS** (patches/mégatuiles memmappés), réutilisant `run_canonical_stack_streaming` sans modifier les formules `canonical_*` ni les dispatchs ZeGrid/Classic.
 - Streamer les deux étages, surtout le stack final actuellement full-canvas. Toutes les images du lot contribuent à chaque tuile spatiale pertinente : ne pas fractionner scientifiquement N, ni moyenner des sous-stacks de rejet.
 - Calculer les statistiques globales une fois, indépendamment de la taille des blocs ; provider exact pour les supports et le no-data. Fermer les memmaps explicitement pour Windows.

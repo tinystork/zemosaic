@@ -36974,8 +36974,15 @@ def _assemble_global_mosaic_first_impl(
     start_time_total_run: float | None,
     cache_root: str | None,
     parallel_plan: ParallelPlan | None = None,
+    sds_stream_band: bool = False,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Best-effort implementation of the Mosaic-First reprojection+coadd workflow."""
+    """Best-effort implementation of the Mosaic-First reprojection+coadd workflow.
+
+    ``sds_stream_band`` (ZM-SDS-R35C-C4): when True, the brutes -> megatile band
+    stack is executed through the bounded-memory SDS streaming provider instead of
+    the in-memory canonical engine. Default False so the NON-SDS callers (Classic
+    global coadd) are byte-for-byte unaffected; only the SDS caller opts in.
+    """
 
     start_time = time.monotonic()
     pcb = lambda key, prog=None, lvl="INFO", **kwargs: _log_and_callback(
@@ -38178,6 +38185,27 @@ def _assemble_global_mosaic_first_impl(
                 chunk_h = min(height, 128)
             final = np.zeros((height, width, channel_count), dtype=np.float32)
             coverage = np.zeros((height, width), dtype=np.float32)
+
+            def _apply_chunk_outputs(chunk_result, chunk_weight, row0: int, row1: int) -> None:
+                """Store one canonical band result into the canvas (logic unchanged).
+
+                Shared verbatim by the in-memory and the ZM-SDS-R35C-C4 streaming
+                band paths so both do identical science/coverage post-processing.
+                """
+                chunk_result = np.asarray(chunk_result, dtype=np.float32)
+                chunk_result[~np.isfinite(chunk_result)] = np.nan
+                chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0)
+                # estimator_weight_sum shares the SCIENCE shape (H,W,C for RGB),
+                # so reduce to per-pixel valid/coverage maps before use.
+                chunk_valid, chunk_cov = _reduce_sds_weight_maps(chunk_weight)
+                if not np.all(chunk_valid):
+                    if chunk_result.ndim >= 3:
+                        chunk_result = np.where(chunk_valid[..., None], chunk_result, np.nan)
+                    else:
+                        chunk_result = np.where(chunk_valid, chunk_result, np.nan)
+                final[row0:row1, :, :] = chunk_result
+                coverage[row0:row1] = chunk_cov
+
             y0 = 0
             while y0 < height:
                 y1 = min(height, y0 + chunk_h)
@@ -38193,6 +38221,36 @@ def _assemble_global_mosaic_first_impl(
                 stack = None
                 weight_stack = None
                 try:
+                    if sds_stream_band:
+                        # ZM-SDS-R35C-C4: bounded-memory streaming of this
+                        # brutes -> megatile band through the SDS file/memmap
+                        # provider. Every entry contributes to every tile it
+                        # covers; global stats are computed once; N is never
+                        # fragmented (spatial tiling only).
+                        from zemosaic.core.sds_streaming import (
+                            plan_sds_streaming_tile,
+                            run_sds_band_stack_streaming,
+                            sds_band_reference_index,
+                        )
+                        _band_ch = max(1, int(channel_count or 1))
+                        _band_tile = plan_sds_streaming_tile(
+                            len(overlaps), (y1 - y0, width), _band_ch
+                        )
+                        _band_ref = sds_band_reference_index(overlaps, y0, y1, width, _band_ch)
+                        chunk_result, chunk_weight = run_sds_band_stack_streaming(
+                            overlaps,
+                            y0,
+                            y1,
+                            width,
+                            _band_ch,
+                            rejection=_rejection,
+                            combine=_combine,
+                            reference_index=_band_ref,
+                            tile_size=_band_tile,
+                        )
+                        _apply_chunk_outputs(chunk_result, chunk_weight, y0, y1)
+                        y0 = y1
+                        continue
                     stack = np.full(
                         (len(overlaps), y1 - y0, width, channel_count),
                         np.nan,
@@ -38236,21 +38294,7 @@ def _assemble_global_mosaic_first_impl(
                         backend="cpu",
                     )
                     res = run_canonical_stack(req)
-                    chunk_result = res.science
-                    chunk_weight = res.estimator_weight_sum
-                    chunk_result = np.asarray(chunk_result, dtype=np.float32)
-                    chunk_result[~np.isfinite(chunk_result)] = np.nan
-                    chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0)
-                    # estimator_weight_sum shares the SCIENCE shape (H,W,C for RGB),
-                    # so reduce to per-pixel valid/coverage maps before use.
-                    chunk_valid, chunk_cov = _reduce_sds_weight_maps(chunk_weight)
-                    if not np.all(chunk_valid):
-                        if chunk_result.ndim >= 3:
-                            chunk_result = np.where(chunk_valid[..., None], chunk_result, np.nan)
-                        else:
-                            chunk_result = np.where(chunk_valid, chunk_result, np.nan)
-                    final[y0:y1, :, :] = chunk_result
-                    coverage[y0:y1, :] = chunk_cov
+                    _apply_chunk_outputs(res.science, res.estimator_weight_sum, y0, y1)
                     y0 = y1
                 except MemoryError as exc:
                     if logger:
@@ -38971,6 +39015,28 @@ def assemble_global_mosaic_sds(
     if max_parallel_megatiles <= 0:
         max_parallel_megatiles = 1
 
+    # ZM-SDS-R35C-C4: bound the mega-tile production parallelism on the EFFECTIVE
+    # backend (always CPU for SDS stacking) and the RAM actually available — never
+    # on the GPU preference alone. This only ever LOWERS the requested parallelism.
+    _sds_ram_cap = None
+    try:
+        from zemosaic.core.sds_streaming import plan_sds_megatile_parallelism
+
+        _sds_ram_cap = plan_sds_megatile_parallelism(
+            int(total_batches or 1),
+            requested_use_gpu=bool(getattr(parallel_plan, "use_gpu", False))
+            if parallel_plan is not None
+            else False,
+            est_bytes_per_megatile=max(1, int(_estimate_megatile_bytes())) * 4,
+            cpu_workers_hint=int(getattr(parallel_plan, "cpu_workers", 0) or 0)
+            if parallel_plan is not None
+            else 0,
+        )
+        if 0 < _sds_ram_cap < max_parallel_megatiles:
+            max_parallel_megatiles = int(_sds_ram_cap)
+    except Exception:
+        _sds_ram_cap = None
+
     try:
         pcb(
             "sds_parallel_batch_plan",
@@ -38978,10 +39044,47 @@ def assemble_global_mosaic_sds(
             lvl="INFO_DETAIL",
             workers=int(max_parallel_megatiles),
             total_batches=int(total_batches),
+            ram_cap=("n/a" if _sds_ram_cap is None else int(_sds_ram_cap)),
+            effective_backend="cpu",
             plan_cpu_workers=int(getattr(parallel_plan, "cpu_workers", 0) or 0)
             if parallel_plan is not None
             else 0,
             plan_use_gpu=bool(getattr(parallel_plan, "use_gpu", False)) if parallel_plan is not None else False,
+        )
+    except Exception:
+        pass
+
+    def _sds_stream_flag(key: str, default: bool = True) -> bool:
+        """Resolve a C4 SDS streaming flag from stack_params (default ON for SDS).
+
+        ZM-SDS-R35C-C4: the SDS stages default to the bounded-memory streaming
+        executor (bit-identical science). An explicit ``False`` in stack_params
+        forces the historical in-memory engine. Non-bool values are coerced
+        explicitly; unknown keys default to ``default``.
+        """
+        if not isinstance(stack_params, dict) or key not in stack_params:
+            return bool(default)
+        raw = stack_params.get(key)
+        if raw is None:
+            return bool(default)
+        if isinstance(raw, bool):
+            return raw
+        try:
+            return bool(int(raw))
+        except Exception:
+            return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+    _sds_stream_band_enabled = _sds_stream_flag("sds_band_stack_streaming", True)
+    _sds_stream_final_enabled = _sds_stream_flag("sds_final_stack_streaming", True)
+    try:
+        pcb(
+            "sds_streaming_plan",
+            prog=None,
+            lvl="INFO",
+            band_streaming=bool(_sds_stream_band_enabled),
+            final_streaming=bool(_sds_stream_final_enabled),
+            effective_backend="cpu",
+            note="effective_backend_is_cpu_for_sds_stacking",
         )
     except Exception:
         pass
@@ -39002,6 +39105,7 @@ def assemble_global_mosaic_sds(
             "start_time_total_run": start_time_total_run,
             "cache_root": cache_root,
             "parallel_plan": parallel_plan,
+            "sds_stream_band": _sds_stream_band_enabled,
         }
 
     def _process_sds_batch(idx: int, batch: list[dict]) -> dict[str, Any]:
@@ -39235,6 +39339,58 @@ def assemble_global_mosaic_sds(
             return np.full(mosaics[0].shape, np.nan, dtype=np.float32)
 
         ref_idx = 0 if np.any(supports[0]) else None
+
+        if _sds_stream_final_enabled:
+            # ZM-SDS-R35C-C4: bounded-memory streaming of the FINAL full-canvas
+            # stack through the SDS memmap provider, reusing the frozen
+            # run_canonical_stack_streaming (bit-identical science). The canonical
+            # engine's O(N x patch_area) float64 intermediates are replaced by an
+            # O(N x tile_area) workspace served from disk. Falls back to the
+            # in-memory engine on any failure (explicit WARN, non-silent).
+            try:
+                from zemosaic.core.sds_streaming import (
+                    SdsMegatileFileProvider,
+                    plan_sds_streaming_tile,
+                    run_sds_final_stack_streaming,
+                    write_sds_megatile_cache,
+                )
+
+                _ch = mosaics[0].shape[-1] if mosaics[0].ndim >= 3 else 1
+                _tile = plan_sds_streaming_tile(len(mosaics), reference_shape, _ch)
+                _base = cache_root or get_runtime_temp_dir()
+                cache_dir = tempfile.mkdtemp(prefix="sds_megatile_cache_", dir=str(_base))
+                try:
+                    write_sds_megatile_cache(
+                        cache_dir,
+                        [f"megatile_{i:04d}" for i in range(len(mosaics))],
+                        [np.asarray(m, dtype=np.float32) for m in mosaics],
+                        supports,
+                    )
+                    with SdsMegatileFileProvider(cache_dir) as provider:
+                        science_std = run_sds_final_stack_streaming(
+                            provider, stack_params, tile_size=_tile
+                        )
+                finally:
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                pcb(
+                    "sds_final_stack_streaming",
+                    prog=None,
+                    lvl="INFO",
+                    mode="streaming",
+                    frames=int(len(mosaics)),
+                    tile=int(_tile),
+                    channels=int(_ch),
+                )
+                return np.asarray(science_std, dtype=np.float32)
+            except Exception as exc:
+                pcb(
+                    "sds_final_stack_streaming_fallback",
+                    prog=None,
+                    lvl="WARN",
+                    error=str(exc),
+                    reason="streaming_unavailable_falling_back_in_memory",
+                )
+
         req = CanonicalStackRequest(
             images=[np.asarray(m, dtype=np.float32) for m in mosaics],
             geometric_support=supports,
