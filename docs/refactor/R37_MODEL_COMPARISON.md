@@ -1,17 +1,17 @@
-# R37 — Model comparison (Gate B, isolated pure prototype) — rework-2
+# R37 — Model comparison (Gate B, isolated pure prototype) — rework-3 (final)
 
-**Mission:** ZM-ZEGRID-R37-B · **Phase:** implementation (Gate B) · **Rework:** r2
+**Mission:** ZM-ZEGRID-R37-B · **Phase:** implementation (Gate B) · **Rework:** r3
 **Status:** pure prototype, UNWIRED. No production import, no default/GUI/config
 change, no real run.
 **Inputs (frozen, unchanged):** `docs/refactor/R37_ARCHAEOLOGY_AND_RISKS.md`,
 `docs/refactor/R37_BACKGROUND_MODEL_CONTRACT.md`.
-**Reviews:** `…R37-B.nono.r0.md`, `…R37-B.nono.r1.md` (FINDINGS → REWORK r2).
+**Reviews:** `…R37-B.nono.r0.md`, `…r1.md`, `…r2.md` (FINDINGS → REWORK r3).
 **Decision authority:** Junior (this document PROPOSES).
 
 Prototype: `src/zemosaic/core/zegrid/background_model.py`
-Tests: `tests/test_zegrid_r37_background_model.py` (67 tests).
-Benchmark: `.a2a-reports/ZM-ZEGRID-R37-B-scratch/` (`bench.py`, `R37_bench.json`,
-`R37_bench.stdout.txt`, `nono_repro*.py`).
+Tests: `tests/test_zegrid_r37_background_model.py` (72 tests).
+Benchmark: `.a2a-reports/ZM-ZEGRID-R37-B-scratch/` (`bench.py`, `R37_bench.json`
+strict, `R37_bench.stdout.txt`, `nono_repro*.py`).
 
 ---
 
@@ -54,7 +54,22 @@ M7 provisional mismatch thresholds, L4 matrix.
 
 ---
 
-## 3. Synthetic matrix (rework-2, `R37_bench.json`)
+## 2b. Rework-3 corrections (R2-1–R2-4)
+
+| # | Finding | Fix | Test |
+|---|---|---|---|
+| **R2-1** | `to_json_dict()` not strictly JSON-safe (NaN/inf leaked in `heldout.per_edge`, `cycles.sigma_scale`, `per_channel.cond`) | single recursive `_sanitize` applied to the ENTIRE payload (Mapping/list/tuple/ndarray/numpy scalar/float; NaN/±Inf → `null`; numpy int/bool → Python). `json.dumps(payload, allow_nan=False)` always succeeds. Benchmark regenerated strict. | `test_result_is_json_safe_multi_corpus` (nominal / noise-free / holed / refused / rank-deficient) |
+| **R2-2** | cycle-redundancy gate passed on the cyclomatic number while no approved cycle residual was measured | deterministic **fundamental cycle basis** on the accepted graph per channel; per cycle: signed sum of `theta_global` → `coefficient_residual[3]`, plane residual at the cycle centroid → `offset_residual`, `sigma_scale`, `z`; gate requires per admissible channel `evaluated_cycles ≥ 1` and `evaluated_cycles == cyclomatic_cycles` else explicit `cycle_diagnostic_incomplete` refusal | `test_r2_2_cycle_basis_equals_cyclomatic_on_grid`, `test_r2_2_coefficient_sum_consistent_vs_contradictory`, `test_r2_2_ladder_middle_rung_rejected_gate_uses_measured_cycle`, `test_r2_2_gate_requires_measured_cycles_not_just_cyclomatic` |
+| **R2-3** | residual broad/vacuous assertions | expected-outcome assertions where the contract fixes the result; measurable post-rejection values; strict multi-corpus JSON test | see the above + tightened identity/RGB/fragmented/M5 tests |
+| **R2-4** | no-cycle rule not marked provisional | `no_cycle_redundancy_rule_status = PROVISIONAL_RESEARCH_ONLY_NOT_FROZEN_CONTRACT`, `cycle_redundancy_method`, `cycle_redundancy_requirement` | `test_r2_4_provenance_cycle_rule_marked_provisional` |
+
+Cycle evaluation covers elementary 2×2 squares **and** large cycles (e.g. the 2×3
+ladder outer ring after the middle rung is rejected: accepted cyclomatic 1,
+evaluated 1). Raw vs accepted cycles remain separate (`cycles`, `cycles_raw`).
+
+---
+
+## 3. Synthetic matrix (rework-3, `R37_bench.json`)
 
 | Corpus | Decision | ratio | cond(A) |
 |---|---|---:|---:|
@@ -89,7 +104,11 @@ train ✓ · ≥8 tangent/≥3 normal ✓ · finite uncertainties ✓ (NaN for r
 §6.1.6 corner unc on the **data-only** system ✓ · connectivity per channel ✓ ·
 order invariance exact ✓ · §6.2.1/2 ✓ (σΔ=0 → refusal) · §6.2.3 frozen 5%,
 relative-only ✓ · §6.2.4 present non-finite → FAIL ✓ · §6.2.5 train-only forbidden ✓
-· **cycle-redundancy gate** (new) ✓ · §6.3.1–8 fidelity/astronomy/NaN ✓.
+· **cycle-redundancy gate on MEASURED fundamental cycles** ✓ · §6.3.1–8
+fidelity/astronomy/NaN ✓.
+
+JSON: every payload is strictly serialisable (`allow_nan=False`); `null` means
+non-measured/non-finite, never zero.
 
 ---
 
@@ -117,10 +136,12 @@ only ≤1500 columns and are flagged.
 - **Narrow band**: 16 px normal slope weakly identifiable → `ILL_CONDITIONED`.
 - **Chains / acyclic graphs** are refused (`no_cycle_redundancy`): relational
   contradictions cannot be qualified without cycle redundancy; no false confidence.
+  The cycle gate acts only on cycles actually **evaluated** on the accepted set.
 - **Contradictory relations** with low redundancy are downweighted/rejected by the
   bounded mechanism; a chain cannot identify one at all (reported).
 - **Multiplicative mismatch conditionally detectable** (locally-planar sky).
-- Robust/rejection knobs are PROVISIONAL, research-only (not frozen contract).
+- Robust/rejection knobs and the no-cycle rule are PROVISIONAL, research-only
+  (not frozen contract).
 - Wall-clock/RSS single-run, host-loaded.
 
 ---

@@ -6,6 +6,7 @@ matrix of ``docs/refactor/R37_BACKGROUND_MODEL_CONTRACT.md`` §7.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import numpy as np
@@ -482,19 +483,16 @@ def test_m4_payload_has_cycles_dropped_and_reasons():
 # ===========================================================================
 
 def test_m5_m0_uses_train_only_local_offset():
-    # a band with a strong tangent trend: median(train) != median(all)
-    def sky(XX, YY, ch):
-        return 40.0 * XX
-    cells, cw = build_grid(4, 2, core=64, halo=16, plane=plane_fn(), sky=sky, noise=0.0)
+    # M0 must be completely insensitive to HOLDOUT samples (train-only fit).
+    plane = plane_fn()
+    cells, cw = build_grid(4, 2, core=64, halo=16, plane=plane, noise=0.2, seed=25)
     obs, _ = bm.build_observations(cells, 4, 2, cw, measurement_px=None)
-    for o in obs:
-        # reconstruct train/holdout medians from the stored arrays
-        xy = o.holdout_xy
-        assert o.local_offset_train is not None
-    # direct check: M0 offsets equal those from train-only local offsets
     ids = tuple(f"r{r:04d}c{c:04d}" for r in range(2) for c in range(4))
-    m0 = bm.solve_offset_baseline(obs, ids, bm.select_central_cell(4, 2), 1)
-    assert np.all(np.isfinite(m0))
+    anchor = bm.select_central_cell(4, 2)
+    m0 = bm.solve_offset_baseline(obs, ids, anchor, 1)
+    obs2 = [dataclasses.replace(o, holdout_diff=o.holdout_diff + 999.0) for o in obs]
+    m0b = bm.solve_offset_baseline(obs2, ids, anchor, 1)
+    assert np.allclose(m0, m0b, atol=1e-12, equal_nan=True)
 
 
 # ===========================================================================
@@ -557,7 +555,8 @@ def test_l2_nonfinite_orientation_ratio_is_fail():
 def test_identity_flat_noisefree_correction_zero():
     cells, cw = build_grid(6, 4, plane=lambda cid: (0.0, 0.0, 0.0), noise=0.0)
     res = bm.compare_models(cells, 6, 4, cw)
-    assert res.decision in ALLOWED
+    # noise-free => degenerate sigma_delta => explicit refusal (contract outcome)
+    assert res.decision == bm.STATE_INSUFFICIENT_EVIDENCE
     assert np.max(np.abs(res.plan_coefficients)) <= 1e-10
     assert np.max(np.abs(res.offset_offsets)) <= 1e-10
 
@@ -744,8 +743,7 @@ def test_weak_fragmented_support_is_refused():
         mask[:3, :3] = True
         cells[cid] = bm.PlanCell(cid, cell.bounds, cell.science, valid_mask=mask)
     res = bm.compare_models(cells, 6, 4, cw)
-    assert res.decision in (bm.STATE_INSUFFICIENT_EVIDENCE, bm.STATE_DISCONNECTED,
-                            bm.STATE_ILL_CONDITIONED, bm.STATE_OFFSET_ONLY)
+    assert res.decision == bm.STATE_DISCONNECTED
 
 
 @pytest.mark.parametrize("noise,expect", [(0.02, "plan"), (3.0, "refuse")])
@@ -836,7 +834,8 @@ def test_rgb_channels_supported():
     res = bm.compare_models(cells, 4, 2, cw, channels=3, measurement_px=64)
     assert res.channels == 3
     assert res.plan_coefficients.shape[1] == 3
-    assert res.decision in ALLOWED
+    assert res.decision == bm.STATE_ROBUST_PLAN
+    assert res.gates["cycle_redundancy"] == "PASS"
 
 
 # ===========================================================================
@@ -883,11 +882,46 @@ def test_nonlinear_study_is_documentation_only():
     assert bm.PROVENANCE["no_third_party_code_copied"] is True
 
 
-def test_result_is_json_safe():
+def _assert_strict_payload(payload):
+    text = json.dumps(payload, allow_nan=False)   # raises on NaN/Infinity
+
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                walk(v)
+        elif isinstance(x, float):
+            assert np.isfinite(x)
+    walk(payload)
+    json.loads(text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    return text
+
+
+def test_result_is_json_safe_multi_corpus():
     plane = plane_fn()
+    # nominal noisy
     cells, cw = build_grid(4, 2, plane=plane, noise=0.2, seed=24)
-    res = bm.compare_models(cells, 4, 2, cw, measurement_px=None)
-    json.dumps(res.to_json_dict())
+    _assert_strict_payload(bm.compare_models(cells, 4, 2, cw, measurement_px=None).to_json_dict())
+    # noise-free (sigma_delta == 0, NaN ratios/robust sigmas)
+    cells, cw = build_grid(6, 4, core=64, halo=32, plane=plane, noise=0.0)
+    _assert_strict_payload(bm.compare_models(cells, 6, 4, cw, measurement_px=64).to_json_dict())
+    # holed
+    cells, cw = build_grid(3, 3, plane=plane, noise=0.2, seed=26, hole=(_cid(1, 1),))
+    _assert_strict_payload(bm.compare_models(cells, 3, 3, cw, measurement_px=None).to_json_dict())
+    # refused multi-channel
+    def plane2(cid):
+        p = np.asarray(plane(cid), dtype=np.float64)
+        return np.vstack([p, p * 0.5])
+    cells, cw = build_grid(6, 1, channels=2, plane=plane2, noise=0.2, seed=27)
+    arr = cells[_cid(0, 3)].science.copy()
+    arr[:, :, 1] = np.nan
+    cells[_cid(0, 3)] = bm.PlanCell(_cid(0, 3), cells[_cid(0, 3)].bounds, arr)
+    _assert_strict_payload(bm.compare_models(cells, 6, 1, cw, channels=2).to_json_dict())
+    # rank-deficient (sanitiser on an ad-hoc non-finite structure)
+    _assert_strict_payload(bm._sanitize({"a": float("nan"), "b": [float("inf"), {"c": np.float64(-np.inf)}],
+                                         "d": np.int64(3), "e": np.bool_(True)}))
 
 
 # ===========================================================================
@@ -961,8 +995,8 @@ def test_n3_rejected_identities_persisted_and_post_reject_diagnostics():
     accepted = {(u, v, 0) for (u, v) in ch["accepted_keys"]}
     rejected = {(d["u"], d["v"], d["channel"]) for d in ch["rejected_edges"]}
     assert accepted.isdisjoint(rejected)
-    # post-rejection diagnostics exist and are coherent
-    assert ch["rank"] is not None and ch["rows"] > 0 and ch["cycles"] >= 0
+    # post-rejection diagnostics are exact and coherent
+    assert ch["rank"] == 9 and ch["rows"] == 15 and ch["cycles"] == 0
     assert bm._accepted_key_set(plan) == accepted
 
 
@@ -1040,3 +1074,88 @@ def test_n8_provenance_declares_robust_knobs():
     assert rk["max_reject_fraction"] == bm.MAX_REJECT_FRACTION
     assert "reject_acceptance_rule" in rk
     assert rk["edge_information_cap"] == bm.EDGE_INFO_CAP_MULT
+
+
+# ===========================================================================
+# Rework-3 — R2-2 fundamental cycle basis
+# ===========================================================================
+
+def _grid_obs(nx, ny, *, bad=None, val=30.0, jitter=0.4):
+    """Crafted ladder observations: one relation per grid edge (uniform info)."""
+    obs = []
+    for i, (u, v) in enumerate(bm.grid_adjacency(nx, ny)):
+        t0 = val if (bad is not None and (u, v) == bad) else jitter * ((i % 3) - 1)
+        info = np.diag([16.0, 16.0, 4.0])
+        th = np.array([t0, 0.0, 0.0])
+        obs.append(bm.EdgeObservation(
+            u=u, v=v, channel=0, orientation="h", n_train=256, n_holdout=0,
+            effective_train=256.0, tangent_blocks=8, normal_blocks=4, robust_sigma=1.0,
+            rejection_fraction=0.0, theta_global=th, information=info, rhs=info @ th,
+            level_z=0.0, curvature_z=0.0, level_mean=0.0, local_offset_train=t0,
+            measurement_px=None, overlap_px=8, band_used_px=8, band_clamped=False,
+            holdout_xy=np.zeros((0, 2)), holdout_diff=np.zeros(0)))
+    return obs
+
+
+def test_r2_2_cycle_basis_equals_cyclomatic_on_grid():
+    for nx, ny in ((2, 2), (3, 2), (6, 4)):
+        ids = tuple(f"r{r:04d}c{c:04d}" for r in range(ny) for c in range(nx))
+        edges = bm.grid_adjacency(nx, ny)
+        cycles = bm._fundamental_cycles(ids, edges)
+        assert len(cycles) == (nx - 1) * (ny - 1)
+
+
+def test_r2_2_coefficient_sum_consistent_vs_contradictory():
+    A, B, D, E = _cid(0, 0), _cid(0, 1), _cid(1, 0), _cid(1, 1)
+    obs_ok = _cycle_obs({})
+    cy_ok = bm._cycle_residuals(obs_ok, (A, B, D, E), 2, 2, (128, 128), 1)
+    assert cy_ok and all(abs(c["coefficient_residual"][0]) < 1e-9 for c in cy_ok)
+    obs_bad = _cycle_obs({(A, B): 30.0})
+    cy_bad = bm._cycle_residuals(obs_bad, (A, B, D, E), 2, 2, (128, 128), 1)
+    assert max(abs(c["coefficient_residual"][0]) for c in cy_bad) > 10.0
+
+
+def test_r2_2_ladder_middle_rung_rejected_gate_uses_measured_cycle():
+    ids = tuple(f"r{r:04d}c{c:04d}" for r in range(2) for c in range(3))
+    bad = (_cid(0, 1), _cid(1, 1))  # middle rung
+    obs = _grid_obs(3, 2, bad=bad)
+    anchor = _cid(0, 0)
+    plan = bm.solve_plan_sparse(obs, ids, anchor, 1, reg_lambda=1e-3, with_uncertainty=False)
+    ch = plan.per_channel[0]
+    assert ch["rejected"] == 1
+    assert {(d["u"], d["v"]) for d in ch["rejected_edges"]} == {bad}
+    assert ch["accepted"] == 6
+    acc = bm._accepted_key_set(plan)
+    obs_acc = [o for o in obs if o.key() in acc]
+    # the accepted graph still has exactly ONE fundamental cycle (the outer ring)
+    cyclomatic = bm._independent_cycles(ids, [(o.u, o.v) for o in obs_acc], anchor)
+    evaluated = bm._cycle_residuals(obs_acc, ids, 3, 2, (128, 192), 1)
+    assert cyclomatic == 1 and len(evaluated) == 1
+    # the measured cycle is the outer hexagon (does NOT contain the rejected rung)
+    ring = set(evaluated[0]["nodes"])
+    assert ring == {_cid(0, 0), _cid(0, 1), _cid(0, 2), _cid(1, 0), _cid(1, 1), _cid(1, 2)}
+    assert [bad[0], bad[1]] != evaluated[0]["edges"][0][:2]
+    # raw basis still exposes the contradiction as a second (broken) cycle
+    raw = bm._cycle_residuals(obs, ids, 3, 2, (128, 192), 1)
+    assert len(raw) == 2
+
+
+def test_r2_2_gate_requires_measured_cycles_not_just_cyclomatic():
+    # a chain yields zero evaluated and zero cyclomatic -> cycle gate FAIL
+    plane = plane_fn()
+    cells, cw = build_grid(1, 4, core=64, halo=32, plane=plane, noise=0.2, seed=41)
+    res = bm.compare_models(cells, 1, 4, cw, measurement_px=64)
+    assert res.gates["cycle_redundancy"] == "FAIL"
+    assert res.provenance["evaluated_cycles_total"] == 0
+    # a 2x2 qualifies only because a cycle is actually evaluated
+    cells, cw = build_grid(2, 2, core=64, halo=32, plane=plane, noise=0.2, seed=42)
+    res = bm.compare_models(cells, 2, 2, cw, measurement_px=64)
+    assert res.gates["cycle_redundancy"] == "PASS"
+    assert res.provenance["evaluated_cycles_total"] >= 1
+    assert res.per_channel[0]["evaluated_cycles"] == res.per_channel[0]["cyclomatic_cycles"]
+
+
+def test_r2_4_provenance_cycle_rule_marked_provisional():
+    assert bm.PROVENANCE["no_cycle_redundancy_rule_status"] == "PROVISIONAL_RESEARCH_ONLY_NOT_FROZEN_CONTRACT"
+    assert bm.PROVENANCE["cycle_redundancy_method"] == "deterministic_fundamental_cycle_basis_on_accepted_set"
+    assert "evaluated_cycles == cyclomatic_cycles" in bm.PROVENANCE["cycle_redundancy_requirement"]

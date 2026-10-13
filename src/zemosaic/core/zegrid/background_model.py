@@ -124,6 +124,13 @@ PROVENANCE = {
     "per_channel_diagnostics": True,
     "accepted_set_is_source_of_truth": True,
     "no_promotion_without_cycle_redundancy": True,
+    "no_cycle_redundancy_rule_status": "PROVISIONAL_RESEARCH_ONLY_NOT_FROZEN_CONTRACT",
+    "cycle_redundancy_method": "deterministic_fundamental_cycle_basis_on_accepted_set",
+    "cycle_redundancy_requirement": (
+        "per admissible channel: evaluated accepted cycle residuals >= 1 and "
+        "evaluated_cycles == cyclomatic_cycles; else explicit cycle_diagnostic_incomplete refusal"
+    ),
+    "json_non_finite_policy": "all non-finite scalars serialise to null (never 0)",
     "robust_knobs_status": "PROVISIONAL_RESEARCH_ONLY_NOT_FROZEN_CONTRACT",
     "robust_knobs": {
         "edge_information_cap": EDGE_INFO_CAP_MULT,
@@ -959,39 +966,138 @@ def detect_mismatch(observations, cfg, *, coeffs=None, index=None):
 # Cycle residuals
 # ---------------------------------------------------------------------------
 
+def _tree_path(adj, start, goal):
+    """Deterministic BFS path (list of nodes) in the spanning tree."""
+    prev = {start: None}
+    queue = [start]
+    while queue:
+        cur = queue.pop(0)
+        if cur == goal:
+            break
+        for nb in sorted(adj.get(cur, [])):
+            if nb not in prev:
+                prev[nb] = cur
+                queue.append(nb)
+    if goal not in prev:
+        return []
+    path = []
+    node = goal
+    while node is not None:
+        path.append(node)
+        node = prev[node]
+    return path[::-1]
+
+
+def _fundamental_cycles(nodes, edges):
+    """Deterministic fundamental cycle basis over a simple graph.
+
+    A lexical spanning forest is grown (union-find, edges processed in lexical
+    order); each non-tree edge closes exactly one fundamental cycle. The number of
+    cycles returned equals the cyclomatic number ``E - V + C``.
+
+    Returns a list of cycles, each a list of directed steps ``(a, b)`` meaning the
+    traversal goes from ``a`` to ``b``.
+    """
+    nodes = list(nodes)
+    canonical = sorted({(u, v) if u <= v else (v, u) for (u, v) in edges})
+    parent = {n: n for n in nodes}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    tree_adj: dict = {n: [] for n in nodes}
+    cycles = []
+    for (u, v) in canonical:
+        ru, rv = find(u), find(v)
+        if ru != rv:
+            parent[ru] = rv
+            tree_adj.setdefault(u, []).append(v)
+            tree_adj.setdefault(v, []).append(u)
+        else:
+            path = _tree_path(tree_adj, u, v)
+            steps = [(path[i], path[i + 1]) for i in range(len(path) - 1)]
+            steps.append((v, u))
+            cycles.append(steps)
+    return cycles
+
+
+def _edge_signed_theta(obs_by_key, a, b, channel):
+    """Return ``(theta, sign)`` for a directed step a->b (p_b - p_a)."""
+    o = obs_by_key.get((a, b, channel))
+    if o is not None:
+        return np.asarray(o.theta_global, dtype=np.float64), +1, o
+    o = obs_by_key.get((b, a, channel))
+    if o is not None:
+        return np.asarray(o.theta_global, dtype=np.float64), -1, o
+    return None, 0, None
+
+
 def _cycle_residuals(observations, cell_ids, nx, ny, canvas_hw, channels):
+    """Cycle residuals on a DETERMINISTIC FUNDAMENTAL CYCLE BASIS (accepted set).
+
+    For every fundamental cycle of each channel's accepted relation graph, traverse
+    with native ``u->v`` signs and sum the edge coefficient vectors
+    ``theta_global = [a, b, d]``: ``coefficient_residual[3]``. The plane residual is
+    evaluated at the deterministic cycle centroid (mean of the member-Cell centres,
+    global normalized coords) -> ``offset_residual``. ``sigma_scale`` is
+    ``sqrt(sum edge robust_sigma^2)``; ``z = |offset_residual| / sigma_scale``.
+
+    This covers elementary 2x2 squares AND large cycles (e.g. a ladder outer ring).
+    """
     h, w = int(canvas_hw[0]), int(canvas_hw[1])
     cell_w, cell_h = w / float(nx), h / float(ny)
-    have = {}
+    obs_by_key = {}
     for o in observations:
-        have[(o.u, o.v, o.channel)] = o
-        have[(o.v, o.u, o.channel)] = o
+        obs_by_key[(o.u, o.v, o.channel)] = o
+
+    def centre(cid):
+        r, c = _parse_rc(cid)
+        return 2.0 * (c + 0.5) * cell_w / w - 1.0, 2.0 * (r + 0.5) * cell_h / h - 1.0
+
     out = []
-    for r in range(ny - 1):
-        for c in range(nx - 1):
-            A, B = f"r{r:04d}c{c:04d}", f"r{r:04d}c{c + 1:04d}"
-            D, E = f"r{r + 1:04d}c{c:04d}", f"r{r + 1:04d}c{c + 1:04d}"
-            cx, cy = (c + 1) * cell_w, (r + 1) * cell_h
-            for chn in range(channels):
-                e_ab, e_be = have.get((A, B, chn)), have.get((B, E, chn))
-                e_de, e_ad = have.get((D, E, chn)), have.get((A, D, chn))
-                if not all(x is not None for x in (e_ab, e_be, e_de, e_ad)):
-                    continue
-                x = 2.0 * cx / w - 1.0
-                y = 2.0 * cy / h - 1.0
-
-                def val(o, sign):
-                    t = o.theta_global
-                    return sign * float(t[0] + t[1] * x + t[2] * y)
-
-                resid = val(e_ab, +1) + val(e_be, +1) + val(e_de, -1) + val(e_ad, -1)
-                sumsq = sum(float(o.robust_sigma) ** 2 for o in (e_ab, e_be, e_de, e_ad))
-                denom = float(np.sqrt(sumsq)) if sumsq > 0 else float("nan")
-                out.append({
-                    "cycle": [A, B, E, D], "channel": chn, "offset_residual": float(resid),
-                    "sigma_scale": denom,
-                    "z": (abs(resid) / denom) if (np.isfinite(denom) and denom > 0) else None,
-                })
+    cell_set = set(cell_ids)
+    for chn in range(channels):
+        edges = [(o.u, o.v) for o in observations if o.channel == chn]
+        present = sorted({n for e in edges for n in e})
+        if not present:
+            continue
+        for steps in _fundamental_cycles(present, edges):
+            coeff_res = np.zeros(3, dtype=np.float64)
+            sumsq = 0.0
+            nodes = []
+            edges_meta = []
+            ok = True
+            for (a, b) in steps:
+                theta, sign, o = _edge_signed_theta(obs_by_key, a, b, chn)
+                if theta is None or o is None:
+                    ok = False
+                    break
+                coeff_res = coeff_res + sign * theta
+                sumsq += float(o.robust_sigma) ** 2
+                edges_meta.append([a, b, int(sign)])
+                if a not in nodes:
+                    nodes.append(a)
+                if b not in nodes:
+                    nodes.append(b)
+            if not ok:
+                continue
+            pts = [centre(n) for n in nodes if n in cell_set]
+            xc = float(np.mean([p[0] for p in pts]))
+            yc = float(np.mean([p[1] for p in pts]))
+            offset_residual = float(coeff_res[0] + coeff_res[1] * xc + coeff_res[2] * yc)
+            denom = float(np.sqrt(sumsq)) if sumsq > 0 else float("nan")
+            out.append({
+                "cycle": nodes, "nodes": nodes, "channel": chn, "edges": edges_meta,
+                "coefficient_residual": coeff_res.tolist(),
+                "offset_residual": offset_residual,
+                "centroid": [xc, yc],
+                "sigma_scale": denom,
+                "z": (abs(offset_residual) / denom) if (np.isfinite(denom) and denom > 0) else None,
+                "method": "fundamental_cycle_basis",
+            })
     return out
 
 
@@ -1123,25 +1229,19 @@ class ModelComparisonResult:
     notes: tuple = ()
 
     def to_json_dict(self):
-        def _f(x):
-            try:
-                return None if not np.isfinite(x) else float(x)
-            except TypeError:
-                return x
-
-        return {
+        payload = {
             "decision": self.decision, "model": self.model, "anchor": self.anchor,
             "channels": self.channels, "cell_ids": list(self.cell_ids),
-            "reg_lambda": _f(self.reg_lambda),
+            "reg_lambda": self.reg_lambda,
             "regularization_ladder": list(self.regularization_ladder),
             "rank_data": self.rank_data,
-            "cond_data": None if self.cond_data is None else _f(self.cond_data),
-            "sigma_delta": _f(self.sigma_delta),
+            "cond_data": self.cond_data,
+            "sigma_delta": self.sigma_delta,
             "heldout": {
-                "r_plan": _f(self.heldout.get("r_plan")),
-                "r_offset": _f(self.heldout.get("r_offset")),
-                "ratio": _f(self.heldout.get("ratio")),
-                "orientation_ratio": {k: _f(v) for k, v in self.heldout.get("orientation_ratio", {}).items()},
+                "r_plan": self.heldout.get("r_plan"),
+                "r_offset": self.heldout.get("r_offset"),
+                "ratio": self.heldout.get("ratio"),
+                "orientation_ratio": dict(self.heldout.get("orientation_ratio", {})),
                 "per_edge": self.heldout.get("per_edge", []),
             },
             "gates": dict(self.gates), "mismatch": self.mismatch,
@@ -1151,23 +1251,49 @@ class ModelComparisonResult:
             "refusal_reasons": list(self.refusal_reasons),
             "disconnected": list(self.disconnected),
             "truth_diagnostics": self.truth_diagnostics,
-            "offset_offsets": _nan_list(self.offset_offsets),
-            "plan_coefficients": _nan_list(self.plan_coefficients),
+            "offset_offsets": self.offset_offsets,
+            "plan_coefficients": self.plan_coefficients,
             "nonlinear_study": self.nonlinear_study, "provenance": dict(self.provenance),
             "notes": list(self.notes),
         }
+        return _sanitize(payload)
+
+
+def _sanitize(obj):
+    """Recursive JSON sanitiser: any non-finite float/scalar -> ``None``.
+
+    Handles Mapping/list/tuple/ndarray/numpy scalar/float at any depth; numpy
+    bools/ints become Python bool/int. Strings and ``None`` are preserved (never
+    masked). Applied to the ENTIRE payload, so ``json.dumps(..., allow_nan=False)``
+    always succeeds.
+    """
+    if obj is None or isinstance(obj, str):
+        return obj
+    if isinstance(obj, Mapping):
+        return {_sanitize(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _sanitize(obj.tolist())
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        f = float(obj)
+        return None if not np.isfinite(f) else f
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        return None if not np.isfinite(obj) else obj
+    return obj
 
 
 def _nan_list(a):
-    """Recursively convert an array (any ndim) to JSON-safe nested lists (NaN->null)."""
-    arr = np.asarray(a, dtype=np.float64)
-
-    def conv(x):
-        if isinstance(x, np.ndarray):
-            return [conv(e) for e in x]
-        return None if not np.isfinite(x) else float(x)
-
-    return conv(arr)
+    """JSON-safe nested lists for an array (any ndim), non-finite -> null."""
+    return _sanitize(np.asarray(a, dtype=np.float64))
 
 
 def _edge_stats_json(o: EdgeObservation) -> dict:
@@ -1267,13 +1393,29 @@ def compare_models(cells, nx, ny, canvas_hw, *, channels=None, anchor=None,
     cycles = _cycle_residuals(obs, cell_ids, nx, ny, canvas_hw, channels)
     cycles_raw = _cycle_residuals(obs_raw, cell_ids, nx, ny, canvas_hw, channels)
 
-    # Per-channel accepted cycles (worst governs).
-    cycle_counts = [d["cycles"] for d in plan.per_channel.values() if d["accepted"] > 0]
-    min_cycles = min(cycle_counts) if cycle_counts else 0
+    # Evaluated accepted cycles vs the cyclomatic number, per channel (R2-2).
+    evaluated_cycles: dict = {}
+    for cy in cycles:
+        evaluated_cycles[cy["channel"]] = evaluated_cycles.get(cy["channel"], 0) + 1
+    cyclomatic_cycles: dict = {}
+    for c, d in plan.per_channel.items():
+        edges_c = [(o.u, o.v) for o in obs if o.channel == c]
+        cyclomatic_cycles[c] = _independent_cycles(cell_ids, edges_c, anchor)
+
+    admissible = [c for c, d in plan.per_channel.items() if d["accepted"] > 0]
+    min_cycles = min((evaluated_cycles.get(c, 0) for c in admissible), default=0)
+    cycle_ok = bool(admissible)
 
     refusal_reasons = []
     for c in disconnected_channels:
         refusal_reasons.append(f"channel {c} disconnected on the accepted relation set")
+    for c in admissible:
+        ev = evaluated_cycles.get(c, 0)
+        cy = cyclomatic_cycles.get(c, 0)
+        if ev < 1 or ev != cy:
+            cycle_ok = False
+            refusal_reasons.append(
+                f"cycle_diagnostic_incomplete: channel {c} evaluated {ev} vs cyclomatic {cy}")
 
     eff_ok = bool(obs) and all(o.effective_train >= cfg.min_effective_train for o in obs)
     blocks_ok = bool(obs) and all(
@@ -1284,9 +1426,10 @@ def compare_models(cells, nx, ny, canvas_hw, *, channels=None, anchor=None,
         refusal_reasons.append("no accepted relations")
     elif not any(d["connected"] for d in plan.per_channel.values()):
         evidence = "FAIL"
-    elif min_cycles < 1:
+    elif not cycle_ok:
         evidence = "FAIL"
-        refusal_reasons.append("no_cycle_redundancy: accepted graph acyclic (chain)")
+        if min_cycles < 1 and not any(r.startswith("no_cycle_redundancy") for r in refusal_reasons):
+            refusal_reasons.append("no_cycle_redundancy: accepted graph acyclic (chain)")
     elif not noise_estimable:
         evidence = "FAIL"
         refusal_reasons.append("degenerate: noise/uncertainty scale not estimable (sigma_delta==0)")
@@ -1314,7 +1457,7 @@ def compare_models(cells, nx, ny, canvas_hw, *, channels=None, anchor=None,
         "rank": "PASS" if rank_ok else ("NOT_RUN" if plan.rank_data is None else "FAIL"),
         "condition": "PASS" if cond_ok else ("NOT_RUN" if plan.cond_data is None else "FAIL"),
         "corner_uncertainty": corner,
-        "cycle_redundancy": "PASS" if min_cycles >= 1 else "FAIL",
+        "cycle_redundancy": "PASS" if cycle_ok else "FAIL",
     }
 
     truth_diag = {}
@@ -1332,6 +1475,8 @@ def compare_models(cells, nx, ny, canvas_hw, *, channels=None, anchor=None,
     for c in per_channel:
         per_channel[c]["m0_applicable"] = bool(c not in disconnected_channels
                                                and per_channel[c]["accepted"] > 0)
+        per_channel[c]["cyclomatic_cycles"] = int(cyclomatic_cycles.get(c, 0))
+        per_channel[c]["evaluated_cycles"] = int(evaluated_cycles.get(c, 0))
 
     provenance = dict(PROVENANCE)
     provenance.update({
@@ -1347,6 +1492,8 @@ def compare_models(cells, nx, ny, canvas_hw, *, channels=None, anchor=None,
         "diagnostics_dense_limit": _DENSE_DIAG_LIMIT,
         "design_rows_total": int(plan.rows),
         "min_cycle_redundancy": int(min_cycles),
+        "evaluated_cycles_total": int(sum(evaluated_cycles.values())),
+        "cyclomatic_cycles_total": int(sum(cyclomatic_cycles.values())),
     })
 
     return ModelComparisonResult(
