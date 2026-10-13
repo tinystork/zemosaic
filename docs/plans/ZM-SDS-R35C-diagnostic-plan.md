@@ -1,6 +1,6 @@
 # ZM-SDS-R35C — M106 : diagnostic et plan isolé SDS
 
-Date : 2026-10-13. Statut : **DIAGNOSTIC CONFIRMÉ / PLAN PROPOSÉ** ; **Lot C1 IMPLÉMENTÉ** (interop FITS des intermédiaires SDS), lots C2–C6 non implémentés.
+Date : 2026-10-13. Statut : **DIAGNOSTIC CONFIRMÉ / PLAN PROPOSÉ** ; **Lots C1 et C2 IMPLÉMENTÉS** (interop FITS des intermédiaires SDS ; finition SDS : origine de niveau, fusion insensible au signe, unité de couverture, ALPHA réintersecté), lots C3–C6 non implémentés.
 Demande : comparer SDS et ZeGrid, expliquer les niveaux/histogrammes et les intermédiaires noirs sous Linux, proposer une voie streaming/GPU sans modifier les autres modes.
 
 ## Périmètre et baseline
@@ -145,6 +145,17 @@ Cette preuve est locale et CPU ; ce n'est ni une qualification TAN/SIP complète
 - Gates : roundtrip RGB/mono, NaN/Inf/zéros/négatifs valides, input non muté, fallback testé, témoin ASIFitsView Linux et Windows. Résultat nominal calculé avant/après export identique.
 
 ### Lot C2 — corriger la finition SDS, les deux origines et les unités (prioritaire)
+
+> **Statut C2 (2026-10-13) : IMPLÉMENTÉ (mission ZM-SDS-R35C-C2).** Le correctif
+> est **opt-in** (`sds_level_origin_fix`, défaut `False`) et n'est activé que par
+> `_finalize_sds_global_mosaic` (voie SDS). Il (a) aligne l'origine de niveau de
+> la 2e passe sur celle de la 1re avant toute décision, (b) remplace la décision
+> `lum2/(lum1+eps)>=0.4` (piloteé par le signe) par une décision de support
+> insensible au signe, (c) conserve une carte de couverture à unité unique
+> (couverture de 1re passe), et (d) réintersecte l'ALPHA final avec le support
+> final (`coverage<=0 => ALPHA==0`). Classic/ZeGrid/canonical non touchés : le
+> chemin par défaut des fonctions partagées est inchangé. Détail et preuves :
+> rapport `ZM-SDS-R35C-C2.coco.r0.md`. Constats C3–C6 ci-dessous non modifiés.
 
 - Sauvegarder un témoin SDS scientifique **avant finition**, plus les étapes after-polish/export, pour une ablation reproductible.
 - Ne jamais mélanger une passe signée et une passe relevée au percentile. Garder les décalages de visionneuse uniquement à l'export/preview.

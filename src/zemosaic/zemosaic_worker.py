@@ -2615,6 +2615,136 @@ def _estimate_eta_prior_total_seconds(
     high = max(300.0, 3.0 * prior_from_frames)
     return float(min(high, max(low, prior)))
 
+
+def _merge_two_pass_aligned_level_origin(
+    base_data: np.ndarray,
+    base_coverage: np.ndarray,
+    second_pass_data: np.ndarray,
+    second_pass_coverage: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """SDS-only merge of the first and second coverage passes (Lot C2).
+
+    The first SDS pass is *signed* and centred near zero (per-channel median
+    subtraction in ``_reproject_frame`` when ``match_background=True``), while
+    the historical second pass carries a per-channel percentile pedestal added
+    by ``_finalize_match_background`` in ``zemosaic_utils``.  Merging those two
+    passes with the Classic ``lum2 / (lum1 + eps) >= 0.4`` rule therefore
+    selects pixels according to the *sign* of a near-zero luminance.
+
+    This helper replaces that decision for the SDS route only:
+
+    * it aligns the second pass onto the first pass level origin (per channel,
+      robust median of the difference over the common valid support) BEFORE any
+      merge decision, so a signed pass and a pedestal-shifted pass are never
+      mixed as-is;
+    * it merges with a purely support-based, sign-insensitive rule: the aligned
+      second pass supersedes the first on the common valid support, while the
+      first pass is kept where the second pass has no support;
+    * it keeps a single, coherent coverage unit: the first-pass coverage map is
+      returned unchanged and the second-pass (megatile-count) support is never
+      substituted into the coverage FITS.
+
+    Returns ``(merged_data, merged_coverage, info)``.  Callers that do not opt
+    in get the historical behaviour and never reach this helper.
+    """
+
+    info: dict[str, Any] = {
+        "applied": False,
+        "level_offsets": [],
+        "use_two_pass_fraction": 0.0,
+    }
+    try:
+        base = np.asarray(base_data, dtype=np.float32)
+        base_cov = np.asarray(base_coverage, dtype=np.float32)
+        pass2 = np.asarray(second_pass_data, dtype=np.float32)
+        pass2_cov = np.asarray(second_pass_coverage, dtype=np.float32)
+    except Exception:
+        return base_data, base_coverage, info
+    if base.ndim < 2 or pass2.ndim < 2 or base.shape[:2] != pass2.shape[:2]:
+        return base_data, base_coverage, info
+    if base_cov.shape[:2] != base.shape[:2] or pass2_cov.shape[:2] != base.shape[:2]:
+        return base_data, base_coverage, info
+
+    mask_valid = (base_cov > 0.0) & (pass2_cov > 0.0)
+    if not np.any(mask_valid):
+        return base_data, base_coverage, info
+
+    ndim = base.ndim
+    n_channels = base.shape[-1] if ndim == 3 else 1
+    aligned = np.array(pass2, dtype=np.float32, copy=True)
+    offsets: list[float] = []
+    for ch in range(n_channels):
+        if ndim == 3:
+            first = base[..., ch][mask_valid]
+            second = pass2[..., ch][mask_valid]
+        else:
+            first = base[mask_valid]
+            second = pass2[mask_valid]
+        offset = 0.0
+        if first.size:
+            with np.errstate(invalid="ignore"):
+                diff = second - first
+            finite = diff[np.isfinite(diff)]
+            if finite.size:
+                offset = float(np.median(finite))
+        if np.isfinite(offset) and offset != 0.0:
+            if ndim == 3:
+                aligned[..., ch] = aligned[..., ch] - np.float32(offset)
+            else:
+                aligned = aligned - np.float32(offset)
+        offsets.append(offset)
+
+    # Sign-insensitive decision: support only, never the signed luminance ratio.
+    mask_use_two_pass = mask_valid
+    if ndim == 3:
+        merged_data = np.where(mask_use_two_pass[..., None], aligned, base)
+    else:
+        merged_data = np.where(mask_use_two_pass, aligned, base)
+    merged_data = np.asarray(merged_data, dtype=np.float32)
+    # Single coverage unit: preserve the first-pass coverage map as-is.
+    merged_coverage = np.array(base_cov, dtype=np.float32, copy=True)
+    info.update(
+        applied=True,
+        level_offsets=offsets,
+        use_two_pass_fraction=float(np.count_nonzero(mask_use_two_pass))
+        / float(mask_use_two_pass.size),
+        coverage_unit="first_pass",
+    )
+    return merged_data, merged_coverage, info
+
+
+def _intersect_alpha_with_support(
+    alpha_u8: np.ndarray | None,
+    coverage_hw: np.ndarray | None,
+) -> np.ndarray | None:
+    """Force ``ALPHA == 0`` wherever the final support is empty (Lot C2).
+
+    SDS finalises ALPHA from an upstream map that may be a uniform 255 mask and
+    is not always re-intersected with the final validity.  This helper enforces
+    the invariant ``coverage <= 0  =>  ALPHA == 0`` without ever promoting an
+    existing ``ALPHA == 0`` back to 255, and without mutating the input array.
+    """
+
+    if alpha_u8 is None or coverage_hw is None:
+        return alpha_u8
+    try:
+        alpha = np.asarray(alpha_u8)
+        cov = np.asarray(coverage_hw)
+    except Exception:
+        return alpha_u8
+    if alpha.ndim == 3 and alpha.shape[-1] == 1:
+        alpha = alpha[..., 0]
+    if alpha.ndim != 2 or cov.ndim != 2 or alpha.shape[:2] != cov.shape[:2]:
+        return alpha_u8
+    with np.errstate(invalid="ignore"):
+        invalid = ~np.isfinite(cov) | (cov <= 0.0)
+    if not bool(np.any(invalid)):
+        return alpha_u8
+    out = np.array(alpha, dtype=np.uint8, copy=True)
+    out[invalid] = 0
+    return out
+
+
 def _apply_two_pass_coverage_renorm_if_requested(
     final_mosaic_data: np.ndarray | None,
     final_mosaic_coverage: np.ndarray | None,
@@ -2630,8 +2760,15 @@ def _apply_two_pass_coverage_renorm_if_requested(
     fallback_tile_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
     parallel_plan: ParallelPlan | None = None,
     telemetry_ctrl: ResourceTelemetryController | None = None,
+    sds_level_origin_fix: bool = False,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Run the coverage renormalization second pass if configured."""
+    """Run the coverage renormalization second pass if configured.
+
+    ``sds_level_origin_fix`` is an SDS-only opt-in (default off): when enabled the
+    merge aligns the level origin of the second pass onto the first pass and uses
+    a sign-insensitive support decision, preserving a single coverage unit.  The
+    default path is the historical Classic behaviour, bit-identical.
+    """
 
     if (
         not two_pass_enabled
@@ -2798,6 +2935,22 @@ def _apply_two_pass_coverage_renorm_if_requested(
                             logger.warning(
                                 "[TwoPass] no overlapping coverage between passes "
                                 "→ keeping first-pass outputs"
+                            )
+                    elif sds_level_origin_fix:
+                        (
+                            final_mosaic_data,
+                            final_mosaic_coverage,
+                            _merge_info,
+                        ) = _merge_two_pass_aligned_level_origin(
+                            base_data, base_cov, mosaic2, coverage2
+                        )
+                        if logger:
+                            logger.info(
+                                "[TwoPass] SDS level-origin aligned merge: offsets=%s "
+                                "use_two_pass_fraction=%.4f coverage_unit=%s",
+                                [round(float(o), 6) for o in _merge_info.get("level_offsets", []) or []],
+                                float(_merge_info.get("use_two_pass_fraction", 0.0) or 0.0),
+                                _merge_info.get("coverage_unit", "first_pass"),
                             )
                     else:
                         if base_data.ndim == 3:
@@ -4460,8 +4613,14 @@ def _apply_phase5_post_stack_pipeline(
     patchwork_suppressor_max_delta: float = 0.20,
     patchwork_suppressor_protect_stars: bool = True,
     patchwork_suppressor_only_near_seams: bool = True,
+    sds_level_origin_fix: bool = False,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Run the reusable Phase 5 post-stack operations."""
+    """Run the reusable Phase 5 post-stack operations.
+
+    ``sds_level_origin_fix`` is a keyword-only SDS opt-in (default off) forwarded
+    to the two-pass coverage renormalization; Classic callers keep the historical
+    behaviour unchanged.
+    """
 
     if enable_lecropper_pipeline:
         (
@@ -4501,6 +4660,7 @@ def _apply_phase5_post_stack_pipeline(
         fallback_tile_loader=fallback_two_pass_loader,
         parallel_plan=parallel_plan,
         telemetry_ctrl=telemetry_ctrl,
+        sds_level_origin_fix=sds_level_origin_fix,
     )
 
     if patchwork_suppressor_enabled:
@@ -5202,6 +5362,7 @@ def _finalize_sds_global_mosaic(
         collected_tiles=collected_tiles,
         fallback_two_pass_loader=fallback_two_pass_loader,
         parallel_plan=parallel_plan,
+        sds_level_origin_fix=True,
     )
 
     autocrop_meta: dict[str, int] | None = None
@@ -5218,6 +5379,8 @@ def _finalize_sds_global_mosaic(
             _apply_autocrop_to_global_plan(global_plan, autocrop_meta)
 
     final_alpha_u8 = _derive_final_alpha_mask(final_alpha_map, mosaic_arr, coverage_arr, logger)
+    # Lot C2: never advertise data where the final support is empty.
+    final_alpha_u8 = _intersect_alpha_with_support(final_alpha_u8, coverage_arr)
     if coverage_arr is not None:
         coverage_arr = np.where(np.isfinite(coverage_arr), coverage_arr, 0.0).astype(np.float32, copy=False)
     if mosaic_arr is not None and coverage_arr is not None:
