@@ -223,6 +223,190 @@ def test_band_reference_index_rule():
 
 
 # ---------------------------------------------------------------------------
+# 2b. F1 (rework-0): band streaming fallback is explicit, non-silent, bit-exact
+# ---------------------------------------------------------------------------
+
+class _WarnCapture:
+    def __init__(self):
+        self.events = []
+
+    def __call__(self, key, prog=None, lvl="INFO", **kwargs):
+        self.events.append((key, lvl, kwargs))
+
+
+def test_band_fallback_monkeypatched_is_bit_identical_and_warns(monkeypatch):
+    """F1: a forced band-streaming failure must fall back in-memory, byte-identical."""
+    with tempfile.TemporaryDirectory() as td:
+        entries, h, w, c = _write_patch_entries(td, n=4)
+        ref_idx = ss.sds_band_reference_index(entries, 0, h, w, c)
+        # Reference = the SAME in-memory algorithm the worker's non-stream path uses.
+        ref_sci, ref_w = ss._inmemory_band_stack(
+            entries, 0, h, w, c, rejection="winsorized_sigma_clip", combine="mean"
+        )
+
+        def _boom(*a, **k):
+            raise RuntimeError("forced band streaming failure")
+
+        monkeypatch.setattr(ss, "run_sds_band_stack_streaming", _boom)
+        cap = _WarnCapture()
+        sci, wsum = ss.run_sds_band_stack_with_fallback(
+            entries, 0, h, w, c,
+            rejection="winsorized_sigma_clip", combine="mean",
+            reference_index=ref_idx, tile_size=32, pcb=cap,
+        )
+        # Byte-identical to the in-memory path (no tile lost, no science change).
+        assert np.array_equal(ref_sci, sci, equal_nan=True)
+        assert np.array_equal(ref_w, wsum)
+        keys = [(k, lvl) for (k, lvl, _kw) in cap.events]
+        assert ("sds_band_stack_streaming_fallback", "WARN") in keys
+        warn_kw = [kw for (k, lvl, kw) in cap.events if k == "sds_band_stack_streaming_fallback"][0]
+        assert warn_kw["reason"] == "streaming_unavailable_falling_back_in_memory"
+
+
+def test_band_fallback_not_triggered_when_streaming_succeeds():
+    with tempfile.TemporaryDirectory() as td:
+        entries, h, w, c = _write_patch_entries(td, n=3)
+        ref_idx = ss.sds_band_reference_index(entries, 0, h, w, c)
+        cap = _WarnCapture()
+        sci, wsum = ss.run_sds_band_stack_with_fallback(
+            entries, 0, h, w, c,
+            rejection="kappa_sigma", combine="mean",
+            reference_index=ref_idx, tile_size=32, pcb=cap,
+        )
+        assert not any(k == "sds_band_stack_streaming_fallback" for (k, _l, _kw) in cap.events)
+        # Still bit-equal to the in-memory reference.
+        ref_sci, ref_w = ss._inmemory_band_stack(
+            entries, 0, h, w, c, rejection="kappa_sigma", combine="mean"
+        )
+        assert np.array_equal(ref_sci, sci, equal_nan=True)
+        assert np.array_equal(ref_w, wsum)
+
+
+def test_band_fallback_memoryerror_is_reraised():
+    """MemoryError must reach the caller's band-height reduction (not be swallowed)."""
+    with tempfile.TemporaryDirectory() as td:
+        entries, h, w, c = _write_patch_entries(td, n=3)
+
+        def _oom(*a, **k):
+            raise MemoryError("forced")
+
+        import pytest as _pytest
+
+        orig = ss.run_sds_band_stack_streaming
+        ss.run_sds_band_stack_streaming = _oom
+        try:
+            with _pytest.raises(MemoryError):
+                ss.run_sds_band_stack_with_fallback(
+                    entries, 0, h, w, c, rejection="none", combine="mean",
+                    reference_index=None, tile_size=32,
+                )
+        finally:
+            ss.run_sds_band_stack_streaming = orig
+
+
+# ---------------------------------------------------------------------------
+# 2c. I1 (rework-0): mono / HW=1 parity (band + final) + empty-support band
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tile", [None, 16, 7])
+def test_band_mono_bit_parity(tile):
+    with tempfile.TemporaryDirectory() as td:
+        entries, h, w, c = _write_patch_entries(td, n=4, c=1)
+        assert c == 1
+        ref_idx = ss.sds_band_reference_index(entries, 0, h, w, c)
+        ref = _inmem_band(entries, 0, h, w, c, "winsorized_sigma_clip", "mean", ref_idx)
+        ref_sci = np.where(np.isfinite(ref.science), ref.science, np.nan).astype(np.float32)
+        ref_w = np.where(np.isfinite(ref.estimator_weight_sum), ref.estimator_weight_sum, 0.0)
+        sci, wsum = ss.run_sds_band_stack_streaming(
+            entries, 0, h, w, c,
+            rejection="winsorized_sigma_clip", combine="mean", reference_index=ref_idx,
+            tile_size=tile,
+        )
+        assert np.array_equal(ref_sci, sci, equal_nan=True)
+        assert np.array_equal(ref_w, wsum)
+
+
+def test_final_stack_mono_bit_parity():
+    rng = np.random.default_rng(23)
+    n, h, w = 5, 48, 40
+    mosaics, covs = [], []
+    for i in range(n):
+        m = rng.normal(500.0 + 8.0 * i, 3.0, (h, w)).astype(np.float32)  # 2-D mono
+        cov = np.ones((h, w), np.float32)
+        cov[:, : i * 6] = 0.0
+        m[cov <= 0] = np.nan
+        mosaics.append(m)
+        covs.append(cov)
+    supports = [(np.asarray(c, np.float32) > 0) for c in covs]
+    ref_idx = 0 if np.any(supports[0]) else None
+    req = CanonicalStackRequest(
+        images=mosaics, geometric_support=supports, normalization="none", weighting="none",
+        rejection="winsorized_sigma_clip", combine="mean", reference_index=ref_idx,
+        taper="none", backend="cpu",
+    )
+    ref = run_canonical_stack(req).science
+    assert ref.ndim == 2
+    with tempfile.TemporaryDirectory() as td:
+        ss.write_sds_megatile_cache(td, [f"m{i}" for i in range(n)], mosaics, supports)
+        with ss.SdsMegatileFileProvider(td) as provider:
+            assert provider.original_mono is True
+            got = ss.run_sds_final_stack_streaming(
+                provider, {"stack_reject_algo": "winsorized_sigma_clip"}, tile_size=13
+            )
+    assert got.ndim == 2
+    assert np.array_equal(ref, got, equal_nan=True)
+
+
+def test_band_empty_common_support_matches_inmemory():
+    """A band with NO support in any entry is refused IDENTICALLY by both paths.
+
+    The frozen canonical engine raises ``CanonicalStackFailure`` when every frame
+    has zero valid support, for the in-memory AND the streaming executor. The C4
+    requirement is that the streaming path does not diverge: same failure, and the
+    fallback helper does not mask it.
+    """
+    from zemosaic.core.canonical_stacking import CanonicalStackFailure
+
+    with tempfile.TemporaryDirectory() as td:
+        entries, h, w, c = _write_patch_entries(td, n=3)
+        top = max(e["bbox"][1] for e in entries)
+        band_y0, band_y1 = top + 10, top + 40
+        ref_idx = ss.sds_band_reference_index(entries, band_y0, band_y1, w, c)
+        assert ref_idx is None
+        with pytest.raises(CanonicalStackFailure):
+            _inmem_band(entries, band_y0, band_y1, w, c, "none", "mean", ref_idx)
+        with pytest.raises(CanonicalStackFailure):
+            ss.run_sds_band_stack_streaming(
+                entries, band_y0, band_y1, w, c,
+                rejection="none", combine="mean", reference_index=ref_idx, tile_size=16,
+            )
+        # The fallback helper re-raises the SAME failure (no silent success).
+        cap = _WarnCapture()
+        with pytest.raises(CanonicalStackFailure):
+            ss.run_sds_band_stack_with_fallback(
+                entries, band_y0, band_y1, w, c,
+                rejection="none", combine="mean", reference_index=ref_idx,
+                tile_size=16, pcb=cap,
+            )
+
+
+def test_band_provider_taper_guard():
+    """I2: the band provider refuses any taper != 'none' explicitly."""
+    from zemosaic.core.canonical_stacking import CanonicalStackValidationError
+
+    with pytest.raises(CanonicalStackValidationError):
+        ss.SdsPatchBandProvider([], 0, 1, 4, 3, taper="footprint")
+    # And the runner forwards the guard.
+    with tempfile.TemporaryDirectory() as td:
+        entries, h, w, c = _write_patch_entries(td, n=2)
+        with pytest.raises(CanonicalStackValidationError):
+            ss.run_sds_band_stack_streaming(
+                entries, 0, h, w, c, rejection="none", combine="mean",
+                reference_index=None, tile_size=16, taper="footprint",
+            )
+
+
+# ---------------------------------------------------------------------------
 # 3. Cache round-trip exactness + explicit memmap close
 # ---------------------------------------------------------------------------
 
@@ -313,7 +497,7 @@ def test_worker_wires_both_sds_stages_to_streaming_and_is_gated():
     # Both stages import/call the SDS streaming module.
     assert "zemosaic.core.sds_streaming" in src
     assert "run_sds_final_stack_streaming" in src
-    assert "run_sds_band_stack_streaming" in src
+    assert "run_sds_band_stack_with_fallback" in src  # F1: fallback-aware band call
     # Stage-1 streaming is gated on a flag (Classic path stays byte-identical).
     assert "sds_stream_band" in src
     assert "sds_stream_band: bool = False" in src
@@ -326,8 +510,19 @@ def test_worker_wires_both_sds_stages_to_streaming_and_is_gated():
 
 def test_worker_does_not_silently_swallow_streaming_errors():
     src = _worker_source()
-    assert "sds_final_stack_streaming_fallback" in src  # explicit WARN fallback
+    # Stage 2 (megatiles -> final): explicit WARN fallback.
+    assert "sds_final_stack_streaming_fallback" in src
     assert "streaming_unavailable_falling_back_in_memory" in src
+    # Stage 1 (brutes -> megatile): F1 fix — the worker routes through the
+    # fallback-aware helper (which owns the WARN + in-memory re-run).
+    assert "run_sds_band_stack_with_fallback" in src
+    band_src = (
+        Path(__file__).resolve().parents[1] / "src" / "zemosaic" / "core" / "sds_streaming.py"
+    ).read_text()
+    assert "sds_band_stack_streaming_fallback" in band_src
+    assert "streaming_unavailable_falling_back_in_memory" in band_src
+    assert "def run_sds_band_stack_with_fallback" in band_src
+    assert "except MemoryError:\n        raise" in band_src  # OOM still reaches chunk reduction
 
 
 # ---------------------------------------------------------------------------

@@ -72,6 +72,7 @@ __all__ = [
     "build_sds_final_stack_request",
     "run_sds_final_stack_streaming",
     "run_sds_band_stack_streaming",
+    "run_sds_band_stack_with_fallback",
     "sds_band_reference_index",
     "plan_sds_streaming_tile",
     "plan_sds_megatile_parallelism",
@@ -310,12 +311,31 @@ class SdsPatchBandProvider:
     Consequence: phase 2 only ever materialises a tile, and phase 1 only one band
     frame at a time — the ``O(N x band_area)`` stack is never built.
 
-    ``taper`` must be ``"none"`` for this provider (the SDS band path uses no
-    footprint taper) and is not accepted otherwise, so a silent semantic change
-    is impossible.
+    The band provider always serves 3-D ``(rows, width, C)`` frames, EXACTLY like
+    the in-memory ``_finalize_chunked`` band stack (``np.full((N, band, width,
+    channel_count))``), so the streaming and in-memory intermediates are the same
+    shape class (``C == 1`` included).
+
+    Only ``taper="none"`` is accepted (the SDS band path uses no footprint
+    taper); any other value raises explicitly, so a silent semantic change is
+    impossible.
     """
 
-    def __init__(self, entries, band_y0: int, band_y1: int, width: int, channels: int) -> None:
+    def __init__(
+        self,
+        entries,
+        band_y0: int,
+        band_y1: int,
+        width: int,
+        channels: int,
+        *,
+        taper: str = "none",
+    ) -> None:
+        if str(taper).strip().lower() != "none":
+            raise CanonicalStackValidationError(
+                f"SdsPatchBandProvider only supports taper='none' (the SDS band "
+                f"path has no footprint taper), got {taper!r}"
+            )
         self._entries = list(entries)
         self.n_frames = len(self._entries)
         self.band_y0 = int(band_y0)
@@ -323,11 +343,10 @@ class SdsPatchBandProvider:
         self.height = int(band_y1 - band_y0)
         self.width = int(width)
         self.channels = int(channels)
-        self.original_mono = self.channels == 1
-        self.original_ndim = 2 if self.original_mono else 3
-        self.original_shape = (
-            (self.height, self.width) if self.original_mono else (self.height, self.width, self.channels)
-        )
+        # Always HWC (matches the in-memory band stack exactly, C == 1 included).
+        self.original_mono = False
+        self.original_ndim = 3
+        self.original_shape = (self.height, self.width, self.channels)
         self.frame_ids = tuple(
             str(e.get("frame_id") or f"patch_{i:04d}") for i, e in enumerate(self._entries)
         )
@@ -377,8 +396,6 @@ class SdsPatchBandProvider:
             w = np.asarray(weight[local_y0:local_y1, :], dtype=np.float32)
             frame[g_y0:g_y1, x_start:x_end, :] = d
             sup[g_y0:g_y1, x_start:x_end] = w > 0
-        if self.original_mono:
-            return frame[..., 0], sup
         return frame, sup
 
     def get_raw_frame(self, i: int):
@@ -410,8 +427,6 @@ class SdsPatchBandProvider:
             w = np.asarray(weight[local_y0:local_y1, local_x0:local_x1], dtype=np.float32)
             tile[ty0:ty1, tx0:tx1, :] = d
             sup_tile[ty0:ty1, tx0:tx1] = w > 0
-        if self.original_mono:
-            tile = tile[..., 0]
         batch = prepare_canonical_inputs([tile], [sup_tile])
         return batch.images[0], batch.valid_mask[0]
 
@@ -503,6 +518,108 @@ def run_sds_final_stack_streaming(
     return np.asarray(result.science, dtype=np.float32)
 
 
+def _inmemory_band_stack(
+    entries, band_y0: int, band_y1: int, width: int, channels: int, *, rejection: str, combine: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Historical in-memory band stack (EXACT mirror of the worker's band block).
+
+    Builds the ``(N, band, width, C)`` stack from the memmapped patches + the
+    in-memory canonical engine. Used as the F1 fallback when the streaming band
+    fails, so the megatile is never dropped and the science stays bit-identical.
+    """
+    stack = np.full((len(entries), band_y1 - band_y0, width, channels), np.nan, dtype=np.float32)
+    weight_stack = np.zeros((len(entries), band_y1 - band_y0, width), dtype=np.float32)
+    for idx, entry in enumerate(entries):
+        data_mm = np.load(entry["data_path"], mmap_mode="r")
+        weight_mm = np.load(entry["weight_path"], mmap_mode="r")
+        y_start, y_end, x_start, x_end = entry["bbox"]
+        sub_y0 = max(band_y0, y_start)
+        sub_y1 = min(band_y1, y_end)
+        if sub_y0 >= sub_y1:
+            continue
+        local_y0 = sub_y0 - y_start
+        local_y1 = sub_y1 - y_start
+        global_y0 = sub_y0 - band_y0
+        global_y1 = sub_y1 - band_y0
+        stack[idx, global_y0:global_y1, x_start:x_end, :] = data_mm[local_y0:local_y1, :, :]
+        weight_stack[idx, global_y0:global_y1, x_start:x_end] = weight_mm[local_y0:local_y1, :]
+    n_frames = stack.shape[0]
+    frames = [stack[i] for i in range(n_frames)]
+    supports = [(weight_stack[i] > 0) for i in range(n_frames)]
+    ref_idx = 0 if (n_frames > 0 and np.any(supports[0])) else None
+    request = CanonicalStackRequest(
+        images=frames,
+        geometric_support=supports,
+        normalization="none",
+        weighting="none",
+        rejection=rejection,
+        combine=combine,
+        reference_index=ref_idx,
+        taper="none",
+        backend="cpu",
+    )
+    result = run_canonical_stack(request)
+    return result.science, result.estimator_weight_sum
+
+
+def run_sds_band_stack_with_fallback(
+    entries,
+    band_y0: int,
+    band_y1: int,
+    width: int,
+    channels: int,
+    *,
+    rejection: str,
+    combine: str,
+    reference_index: int | None,
+    tile_size=None,
+    taper: str = "none",
+    pcb=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Band stack with an EXPLICIT, non-silent in-memory fallback (F1 fix).
+
+    Tries :func:`run_sds_band_stack_streaming`; on ANY non-``MemoryError``
+    failure it emits the same-family WARN (``sds_band_stack_streaming_fallback``
+    / ``streaming_unavailable_falling_back_in_memory``) and re-runs the
+    historical in-memory band stack, so the megatile is NEVER dropped and the
+    science is bit-identical to the in-memory path. A ``MemoryError`` is
+    re-raised so the caller's band-height reduction still applies.
+    """
+    try:
+        return run_sds_band_stack_streaming(
+            entries,
+            band_y0,
+            band_y1,
+            width,
+            channels,
+            rejection=rejection,
+            combine=combine,
+            reference_index=reference_index,
+            tile_size=tile_size,
+            taper=taper,
+        )
+    except MemoryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - explicit non-silent fallback by design
+        if callable(pcb):
+            try:
+                pcb(
+                    "sds_band_stack_streaming_fallback",
+                    prog=None,
+                    lvl="WARN",
+                    error=str(exc),
+                    reason="streaming_unavailable_falling_back_in_memory",
+                    rows=[int(band_y0), int(band_y1)],
+                    frames=int(len(entries)),
+                )
+            except Exception:
+                pass
+        return _inmemory_band_stack(
+            entries, band_y0, band_y1, width, channels,
+            rejection=rejection, combine=combine,
+        )
+
+
 def sds_band_reference_index(
     entries, band_y0: int, band_y1: int, width: int, channels: int
 ) -> int | None:
@@ -533,6 +650,7 @@ def run_sds_band_stack_streaming(
     combine: str,
     reference_index: int | None,
     tile_size=None,
+    taper: str = "none",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run one SDS band of the brutes -> megatile stage via the streaming executor.
 
@@ -547,7 +665,9 @@ def run_sds_band_stack_streaming(
     contributes to every spatial tile it covers (spatial tiling only, never N
     fragmentation).
     """
-    provider = SdsPatchBandProvider(entries, band_y0, band_y1, width, channels)
+    provider = SdsPatchBandProvider(
+        entries, band_y0, band_y1, width, channels, taper=taper
+    )
     try:
         request = CanonicalStackRequest(
             images=[None] * provider.n_frames,

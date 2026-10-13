@@ -38226,10 +38226,13 @@ def _assemble_global_mosaic_first_impl(
                         # brutes -> megatile band through the SDS file/memmap
                         # provider. Every entry contributes to every tile it
                         # covers; global stats are computed once; N is never
-                        # fragmented (spatial tiling only).
+                        # fragmented (spatial tiling only). F1 (rework-0): the
+                        # helper falls back EXPLICITLY (WARN) to the historical
+                        # in-memory band stack on any non-MemoryError failure, so
+                        # the megatile is NEVER dropped and science is identical.
                         from zemosaic.core.sds_streaming import (
                             plan_sds_streaming_tile,
-                            run_sds_band_stack_streaming,
+                            run_sds_band_stack_with_fallback,
                             sds_band_reference_index,
                         )
                         _band_ch = max(1, int(channel_count or 1))
@@ -38237,7 +38240,7 @@ def _assemble_global_mosaic_first_impl(
                             len(overlaps), (y1 - y0, width), _band_ch
                         )
                         _band_ref = sds_band_reference_index(overlaps, y0, y1, width, _band_ch)
-                        chunk_result, chunk_weight = run_sds_band_stack_streaming(
+                        chunk_result, chunk_weight = run_sds_band_stack_with_fallback(
                             overlaps,
                             y0,
                             y1,
@@ -38247,6 +38250,7 @@ def _assemble_global_mosaic_first_impl(
                             combine=_combine,
                             reference_index=_band_ref,
                             tile_size=_band_tile,
+                            pcb=pcb,
                         )
                         _apply_chunk_outputs(chunk_result, chunk_weight, y0, y1)
                         y0 = y1
