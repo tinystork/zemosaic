@@ -231,6 +231,32 @@ Cette preuve est locale et CPU ; ce n'est ni une qualification TAN/SIP complète
 
 ### Lot C5 — accélération reprojection CPU puis GPU canonique optionnel
 
+> **Statut C5 (2026-10-13) : IMPLÉMENTÉ PARTIELLEMENT (mission ZM-SDS-R35C-C5).**
+> **Partie A (CPU) IMPLÉMENTÉE** : nouveau module `core/sds_reproject.py`
+> (aucun `core/canonical_*` modifié) qui réutilise le fast path CPU **existant**
+> `zemosaic.core.zegrid.execution.reproject_cropped` (R21) dans le chemin de
+> reprojection/estimation SDS (`zemosaic_worker._reproject_frame`, gaté sur
+> `plan["mode"] == "sds"`). Le fast path n'est pris que pour des WCS **plans
+> TAN** (CD et PC+CDELT) ; `reproject_interp` reste le repli **verbatim** dans le
+> worker (SIP/distorsion/non-TAN/cas dégradé). Parité **bit à bit** prouvée
+> (poids/support identiques + science exacte sur les pixels communs, `max_abs=0`)
+> sur la matrice TAN synthétique (translation/rotation/échelle/débordement/NaN/
+> mono C=1), un cas **adversarial SIP** (repli enregistré) et une vraie frame M106
+> TAN 512×512. Gain micro-benchmark **médian ×2,86** (n=5) sur la frame réelle
+> (`0,518 s` → `0,181 s` par patch) ; portée = reprojection d'un patch, **pas** un
+> gain bout-en-bout (le poste reprojection ≈17 % du run SDS conservé).
+> **Partie B (GPU) NON ACTIVÉE — décision motivée** : le backend streaming GPU
+> canonique (R22) + le planificateur VRAM + la classification d'erreurs existants
+> ont été **évalués** : sur le MX150 ~2 Gio, la parité CPU/GPU est bit-exacte mais
+> le GPU est **plus lent** (×0,60 et ×0,72 selon la charge) ; le budget VRAM sûr
+> (0,95 Gio) impose des tuiles petites (693² final / 213 bande). Gain non prouvé
+> ⇒ **reste OFF**, aucun chantier GPU ouvert (cf. rapport C5).
+> **Témoin réel I1 (résidu multiplicatif APRÈS C3)** : **NON CONCLU** — seules des
+> sorties **pré-C3** existent (`sds_fixed`, aucun run C3 disponible) ; re-mesure
+> lecture seule = span de facteurs par mégatuile ≈ **4,95×** inchangé (reproduit
+> C3/C4). Conclusion reportée au smoke test ZeAlfie côté propriétaire.
+> Détail et preuves : rapport `ZM-SDS-R35C-C5.coco.r0.md`. Constats C6 non modifiés.
+
 - CPU : réutiliser R21, grille de coordonnées partagée RGB, travail borné aux empreintes et aux blocs. Fast path uniquement WCS qualifiés ; conserver reproject_interp pour SIP/distorsions et cas non qualifiés. Ne pas retirer les distorsions ni remplacer pixel_to_pixel par une approximation.
 - Empilement GPU : réutiliser le backend **streaming canonique** déjà présent depuis R22 (l'ancien docstring CPU-only de canonical_streaming est périmé ; le code accepte bien cpu/gpu). Réutiliser le planificateur VRAM et la classification d'erreurs existants via un adaptateur SDS.
 - Un propriétaire GPU, VRAM réelle bornée, réexécution entière de l'unité concernée sur CPU en cas d'erreur CUDA qualifiée, aucun assemblage de morceaux issus de deux backends. Tracer le backend réellement exécuté par étape.

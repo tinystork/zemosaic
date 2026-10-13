@@ -37038,6 +37038,17 @@ def _assemble_global_mosaic_first_impl(
     plan_mode = str(global_plan.get("mode") or "").strip().lower()
     is_sds_plan = plan_mode == "sds"
     sds_backend_logged = False
+    # ZM-SDS-R35C-C5 (part A): SDS-only fast CPU reprojection, reusing the frozen
+    # R21 path (bit-exact on plain TAN, loud reproject_interp fallback for
+    # SIP/distorted/non-TAN). Default ON for the SDS path, opt-out-able through
+    # ``sds_fast_reproject`` in the plan and the SDS_REPROJECT_FORCE_FALLBACK env.
+    from zemosaic.core.sds_reproject import (
+        reproject_frame_patch_fast,
+        resolve_sds_fast_reproject,
+        sds_reproject_stats_payload,
+    )
+    sds_fast_reproject_enabled = bool(is_sds_plan) and resolve_sds_fast_reproject(global_plan)
+    sds_reproject_log_state = {"logged": False}
     plan_meta = global_plan.get("meta") if isinstance(global_plan.get("meta"), dict) else {}
     plan_meta = _coerce_to_builtin(plan_meta) if plan_meta else {}
     descriptor_payload = {
@@ -37511,38 +37522,55 @@ def _assemble_global_mosaic_first_impl(
             ]
         except Exception:
             pass
-        planes: list[np.ndarray] = []
-        footprint = None
-        for ch in range(frame.shape[-1]):
-            plane = frame[..., ch]
+        # ZM-SDS-R35C-C5 (part A): fast CPU reprojection for qualified plain-TAN
+        # WCS, reusing the frozen R21 path. `None` (non-qualified WCS / fast-path
+        # error / unexpected layout) falls through to the UNCHANGED historical
+        # reproject_interp loop below, which stays the exact fallback.
+        patch: np.ndarray | None = None
+        weight: np.ndarray | None = None
+        if sds_fast_reproject_enabled:
+            fast_result = reproject_frame_patch_fast(
+                frame,
+                local_wcs,
+                sub_wcs,
+                (h_patch, w_patch),
+                emit=lambda msg, lvl="INFO": pcb(msg, prog=None, lvl=lvl),
+            )
+            if fast_result is not None:
+                patch, weight = fast_result
+        if patch is None:
+            planes: list[np.ndarray] = []
+            footprint = None
+            for ch in range(frame.shape[-1]):
+                plane = frame[..., ch]
+                if footprint is None:
+                    reproj_plane, footprint = reproject_interp(
+                        (plane, local_wcs),
+                        sub_wcs,
+                        shape_out=(h_patch, w_patch),
+                        return_footprint=True,
+                        order="bilinear",
+                        parallel=False,
+                    )
+                else:
+                    reproj_plane = reproject_interp(
+                        (plane, local_wcs),
+                        sub_wcs,
+                        shape_out=(h_patch, w_patch),
+                        return_footprint=False,
+                        order="bilinear",
+                        parallel=False,
+                    )
+                planes.append(np.asarray(reproj_plane, dtype=np.float32))
             if footprint is None:
-                reproj_plane, footprint = reproject_interp(
-                    (plane, local_wcs),
-                    sub_wcs,
-                    shape_out=(h_patch, w_patch),
-                    return_footprint=True,
-                    order="bilinear",
-                    parallel=False,
-                )
-            else:
-                reproj_plane = reproject_interp(
-                    (plane, local_wcs),
-                    sub_wcs,
-                    shape_out=(h_patch, w_patch),
-                    return_footprint=False,
-                    order="bilinear",
-                    parallel=False,
-                )
-            planes.append(np.asarray(reproj_plane, dtype=np.float32))
-        if footprint is None:
-            return None
-        weight = np.clip(np.nan_to_num(footprint, nan=0.0), 0.0, 1.0).astype(np.float32, copy=False)
-        patch = np.stack(planes, axis=-1)
-        finite_mask = np.all(np.isfinite(patch), axis=-1)
-        weight = np.where(finite_mask, weight, 0.0)
+                return None
+            weight = np.clip(np.nan_to_num(footprint, nan=0.0), 0.0, 1.0).astype(np.float32, copy=False)
+            patch = np.stack(planes, axis=-1)
+            finite_mask = np.all(np.isfinite(patch), axis=-1)
+            weight = np.where(finite_mask, weight, 0.0)
+            patch = np.nan_to_num(patch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         if not np.any(weight > 0):
             return None
-        patch = np.nan_to_num(patch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         if match_background:
             try:
                 valid_mask = weight > 0
@@ -38371,6 +38399,20 @@ def _assemble_global_mosaic_first_impl(
             base_payload=_payload(route="cpu"),
             label="cpu",
         )
+        # ZM-SDS-R35C-C5 (part A): surface the SDS reprojection path actually used
+        # (fast vs reproject_interp fallback) + cumulative seconds, once per run.
+        if is_sds_plan and not sds_reproject_log_state["logged"]:
+            sds_reproject_log_state["logged"] = True
+            try:
+                pcb(
+                    "sds_fast_reproject_summary",
+                    prog=None,
+                    lvl="INFO",
+                    enabled=bool(sds_fast_reproject_enabled),
+                    **sds_reproject_stats_payload(),
+                )
+            except Exception:
+                pass
         return final_image.astype(np.float32, copy=False), coverage_map.astype(np.float32, copy=False), alpha_map
     finally:
         _cleanup_temp()
