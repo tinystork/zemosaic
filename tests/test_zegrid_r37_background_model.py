@@ -331,13 +331,18 @@ def test_m1_const_bias_is_visible_to_gate():
     assert e["p90_m0"] == pytest.approx(0.0, abs=1e-9)
 
 
-def test_m1_p90_gate_is_strict_five_percent():
+def test_m1_p90_gate_is_strict_five_percent_relative_only():
     assert bm.GateConfig().per_edge_p90_worsen_max == 0.05
+    # direct, relative-only unit test of the gate (no trivial absolute clause)
+    assert bm._p90_ok([{"p90_plan": 1.04, "p90_m0": 1.0}], 0.05) is True
+    assert bm._p90_ok([{"p90_plan": 1.06, "p90_m0": 1.0}], 0.05) is False
+    assert bm._p90_ok([{"p90_plan": float("nan"), "p90_m0": 1.0}], 0.05) is False
+    # and on a real corpus every accepted edge must satisfy the relative rule
     plane = plane_fn()
     cells, cw = build_grid(6, 4, core=64, halo=32, plane=plane, noise=0.2, seed=5)
     res = bm.compare_models(cells, 6, 4, cw, measurement_px=64)
     for e in res.heldout["per_edge"]:
-        assert e["p90_plan"] <= 1.0 + 0.05 + 1e-9 or e["p90_plan"] <= (1.05 * e["p90_m0"])
+        assert e["p90_plan"] <= (1.0 + 0.05) * e["p90_m0"] + 1e-12
 
 
 # ===========================================================================
@@ -442,7 +447,8 @@ def test_m3_corrupted_overlap_does_not_yield_confident_plan():
     res = bm.compare_models(cells, 2, 2, cw, measurement_px=None,
                             truth_planes=truth_of(cells, plane))
     assert res.decision != bm.STATE_ROBUST_PLAN
-    assert res.cycles
+    # the rejected relation breaks the accepted cycle -> raw diagnostic retained
+    assert res.cycles_raw
 
 
 def test_m3_chain_has_no_cycle_evidence():
@@ -537,17 +543,11 @@ def test_l1_densification_flags_are_measured():
 # L2 — an existing orientation with a non-finite ratio is a FAIL
 # ===========================================================================
 
-def test_l2_nonfinite_orientation_ratio_fails():
-    # planes depend only on the column -> vertical neighbours share offsets
-    def plane(cid):
-        c = int(cid[6:10])
-        return (5.0 * ((c % 4) - 1), 1.0, 0.0)
-    cells, cw = build_grid(6, 4, core=64, halo=32, plane=plane, noise=0.2, seed=12)
-    res = bm.compare_models(cells, 6, 4, cw, measurement_px=64)
-    # the 'v' orientation has M0 essentially perfect -> non-finite ratio -> FAIL
-    v = res.heldout["orientation_ratio"].get("v")
-    if v is not None and not np.isfinite(v):
-        assert res.gates["heldout"] == "FAIL"
+def test_l2_nonfinite_orientation_ratio_is_fail():
+    # direct, non-vacuous unit test: a PRESENT orientation with non-finite ratio FAILs
+    assert bm._orientation_ok({"h": 0.5, "v": float("inf")}, 0.80) is False
+    assert bm._orientation_ok({"h": 0.5}, 0.80) is True
+    assert bm._orientation_ok({}, 0.80) is True
 
 
 # ===========================================================================
@@ -769,6 +769,12 @@ def test_layouts_and_truth(nx, ny):
     expected_a = np.array([np.asarray(plane(cid), dtype=float)[0] for cid in res.cell_ids])
     a_anchor = np.asarray(plane(res.anchor), dtype=float)[0]
     assert np.max(np.abs(res.plan_coefficients[:, 0, 0] - (a_anchor - expected_a))) <= 0.5
+    # N2: a chain has NO cycle redundancy -> never promoted to ROBUST_PLAN
+    if nx == 1 or ny == 1:
+        assert res.decision == bm.STATE_INSUFFICIENT_EVIDENCE
+        assert any("no_cycle_redundancy" in r for r in res.refusal_reasons)
+    else:
+        assert res.gates["cycle_redundancy"] == "PASS"
 
 
 @pytest.mark.parametrize("nx,ny", [(2, 3), (3, 2)])
@@ -882,3 +888,155 @@ def test_result_is_json_safe():
     cells, cw = build_grid(4, 2, plane=plane, noise=0.2, seed=24)
     res = bm.compare_models(cells, 4, 2, cw, measurement_px=None)
     json.dumps(res.to_json_dict())
+
+
+# ===========================================================================
+# Rework-2 — N1 rows/bytes, N2 cycle redundancy, N3/N11 accepted set,
+#            N4 M0 refusal, N5 uncertainty, N10 refusal wording
+# ===========================================================================
+
+def test_n1_rows_equal_final_design_shape_6x4():
+    plane = plane_fn()
+    cells, cw = build_grid(6, 4, core=64, halo=32, plane=plane, noise=0.2, seed=30)
+    obs, _ = bm.build_observations(cells, 6, 4, cw, measurement_px=64)
+    ids = tuple(f"r{r:04d}c{c:04d}" for r in range(4) for c in range(6))
+    anchor = bm.select_central_cell(6, 4)
+    plan = bm.solve_plan_sparse(obs, ids, anchor, 1, reg_lambda=1e-3, with_uncertainty=False)
+    # analytic: 38 edges x 3 data rows + 2 ridge x 23 free cells = 114 + 46 = 160
+    assert plan.rows == 160
+    assert plan.rows == sum(d["rows"] for d in plan.per_channel.values())
+    assert plan.per_channel[0]["data_rows"] == 114
+    # and equals the actually assembled final design shape
+    cell_slot = {cid: i for i, cid in enumerate(c for c in ids if c != anchor)}
+    base = []
+    for o in obs:
+        r, _tr = bm._edge_whitening(o.information)
+        base.append((o, r, np.asarray(o.theta_global, dtype=np.float64)))
+    scales = [1.0] * len(base)
+    w = np.ones(len(base))
+    a_final, _b, _nd = bm._assemble(base, scales, w, anchor, cell_slot, reg_lambda=1e-3)
+    assert plan.rows == a_final.shape[0]
+
+
+def test_n1_scale_witness_counts():
+    w = bm.sparse_scale_witness(100)
+    assert w["regularized_rows"] == 19800 * 3 + 2 * 9999  # 79398
+    assert w["dense_design_bytes_estimate"] == 79398 * 29997 * 8
+    assert w["dense_design_bytes_estimate"] / 1e9 > 19.0
+    assert w["global_solve_densified"] is False
+    assert "channels=1" in w["rows_semantics"]
+
+
+def test_n2_chain_no_redundancy_is_refused():
+    plane = plane_fn()
+    for nx, ny in ((1, 4), (4, 1)):
+        cells, cw = build_grid(nx, ny, core=64, halo=32, plane=plane, noise=0.2, seed=31)
+        res = bm.compare_models(cells, nx, ny, cw, measurement_px=64)
+        assert res.decision == bm.STATE_INSUFFICIENT_EVIDENCE
+        assert res.gates["cycle_redundancy"] == "FAIL"
+        assert any("no_cycle_redundancy" in r for r in res.refusal_reasons)
+        assert res.decision != bm.STATE_ROBUST_PLAN
+
+
+def test_n2_chain_contradiction_is_not_robust_plan():
+    plane = plane_fn()
+    A, B = _cid(0, 0), _cid(0, 1)
+    cells, cw = build_grid(4, 1, core=64, halo=32, plane=plane, noise=0.2, seed=32,
+                           contradict_edge=(A, B, 200.0))
+    res = bm.compare_models(cells, 4, 1, cw, measurement_px=64,
+                            truth_planes=truth_of(cells, plane))
+    assert res.decision != bm.STATE_ROBUST_PLAN
+    assert res.cycles == []
+
+
+def test_n3_rejected_identities_persisted_and_post_reject_diagnostics():
+    A, B, D, E = _cid(0, 0), _cid(0, 1), _cid(1, 0), _cid(1, 1)
+    obs = _cycle_obs({(A, B): 30.0})
+    plan = bm.solve_plan_sparse(obs, (A, B, D, E), A, 1, reg_lambda=1e-3, with_uncertainty=True)
+    ch = plan.per_channel[0]
+    assert ch["rejected"] >= 1
+    assert ch["accepted"] < ch["observations"]
+    assert ch["rejected_edges"] and ch["rejected_edges"][0]["reason"] == "relational_rejection"
+    # the rejected edge is excluded from the accepted set
+    accepted = {(u, v, 0) for (u, v) in ch["accepted_keys"]}
+    rejected = {(d["u"], d["v"], d["channel"]) for d in ch["rejected_edges"]}
+    assert accepted.isdisjoint(rejected)
+    # post-rejection diagnostics exist and are coherent
+    assert ch["rank"] is not None and ch["rows"] > 0 and ch["cycles"] >= 0
+    assert bm._accepted_key_set(plan) == accepted
+
+
+def test_n3_compare_models_reports_accepted_subset():
+    plane = plane_fn()
+    cells, cw = build_grid(6, 4, core=64, halo=32, plane=plane, noise=0.2, seed=33)
+    res = bm.compare_models(cells, 6, 4, cw, measurement_px=64)
+    assert res.provenance["n_edges_accepted"] <= res.provenance["n_edges_raw"]
+    assert len(res.accepted_keys) == res.provenance["n_edges_accepted"]
+    assert len(res.heldout["per_edge"]) == res.provenance["n_edges_accepted"]
+    # cycles are computed on the accepted set; raw cycles kept separately
+    assert isinstance(res.cycles_raw, list)
+
+
+def test_n4_refused_channel_m0_is_nan_not_zero():
+    plane = plane_fn()
+    def plane2(cid):
+        p = np.asarray(plane(cid), dtype=np.float64)
+        return np.vstack([p, p * 0.5])
+    cells, cw = build_grid(6, 1, channels=2, plane=plane2, noise=0.2, seed=34)
+    mid = _cid(0, 3)
+    arr = cells[mid].science.copy()
+    arr[:, :, 1] = np.nan
+    cells[mid] = bm.PlanCell(mid, cells[mid].bounds, arr)
+    res = bm.compare_models(cells, 6, 1, cw, channels=2)
+    assert np.all(np.isnan(res.offset_offsets[:, 1]))
+    assert res.per_channel[1]["m0_applicable"] is False
+    assert res.per_channel[0]["m0_applicable"] is True
+    # JSON-safe: NaN -> null, never a fabricated zero
+    payload = res.to_json_dict()
+    assert all(row[1] is None for row in payload["offset_offsets"])
+
+
+def test_n5_rank_deficient_channel_uncertainty_is_nan():
+    # a single edge whose information is rank 1 (only the offset direction)
+    info = np.zeros((3, 3))
+    info[0, 0] = 16.0
+    o = bm.EdgeObservation(
+        u="r0000c0000", v="r0000c0001", channel=0, orientation="h", n_train=256,
+        n_holdout=0, effective_train=256.0, tangent_blocks=8, normal_blocks=4,
+        robust_sigma=1.0, rejection_fraction=0.0, theta_global=np.array([0.0, 0.0, 0.0]),
+        information=info, rhs=np.zeros(3), level_z=0.0, curvature_z=0.0, level_mean=0.0,
+        local_offset_train=0.0, measurement_px=None, overlap_px=8, band_used_px=8,
+        band_clamped=False, holdout_xy=np.zeros((0, 2)), holdout_diff=np.zeros(0),
+    )
+    ids = ("r0000c0000", "r0000c0001")
+    plan = bm.solve_plan_sparse([o], ids, ids[0], 1, reg_lambda=1e-3, with_uncertainty=True)
+    assert plan.per_channel[0]["under_determined"] is True
+    assert np.all(np.isnan(plan.coefficients[:, 0, :]))
+    # never a confident-looking zero variance for a refused (non-anchor) cell
+    assert plan.corner_uncertainty is not None
+    assert np.all(np.isnan(plan.corner_uncertainty[1:, 0, :]))
+    assert np.all(np.isnan(plan.coef_uncertainty[1:, 0, :]))
+
+
+def test_n10_refusal_reason_semantics():
+    plane = plane_fn()
+    cells, cw = build_grid(6, 4, core=64, halo=8, plane=plane, noise=0.2, seed=35)
+    # accepted (non-clamped) edges: refusal_reason None == accepted
+    res_ok = bm.compare_models(cells, 6, 4, cw, measurement_px=8)
+    assert all(e["refusal_reason"] is None for e in res_ok.edge_stats if not e["band_clamped"])
+    # clamped edges carry an explicit reason
+    res_cl = bm.compare_models(cells, 6, 4, cw, measurement_px=64)
+    assert all(e["refusal_reason"] == "band_clamped_to_overlap" for e in res_cl.edge_stats)
+    # dropped relations carry a reason
+    cells2, cw2 = build_grid(3, 3, plane=plane, noise=0.2, seed=36, hole=(_cid(1, 1),))
+    res_dr = bm.compare_models(cells2, 3, 3, cw2, measurement_px=None)
+    assert res_dr.dropped and all(d["reason"] for d in res_dr.dropped)
+
+
+def test_n8_provenance_declares_robust_knobs():
+    p = bm.PROVENANCE
+    assert p["robust_knobs_status"] == "PROVISIONAL_RESEARCH_ONLY_NOT_FROZEN_CONTRACT"
+    rk = p["robust_knobs"]
+    assert rk["max_reject_fraction"] == bm.MAX_REJECT_FRACTION
+    assert "reject_acceptance_rule" in rk
+    assert rk["edge_information_cap"] == bm.EDGE_INFO_CAP_MULT
