@@ -1694,7 +1694,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             layout,
             self._tr(
                 "qt_use_existing_master_tiles_label",
-                "I'm using master tiles (skip clustering & master tile creation)",
+                "I'm using master tiles",
             ),
         )
         master_tiles_checkbox.setToolTip(
@@ -1706,13 +1706,104 @@ class ZeMosaicQtMainWindow(QMainWindow):
             )
         )
         self._existing_master_tiles_checkbox = master_tiles_checkbox
-        master_tiles_checkbox.toggled.connect(self._on_existing_master_tiles_toggled)  # type: ignore[arg-type]
-        self._register_line_edit(
-            "global_wcs_output_path",
+
+        # ZM-ZEGRID-R35A: the pipeline choices are promoted to the top group so
+        # they are IMMEDIATELY visible and mutually exclusive. SDS used to live
+        # deep in the Instrument group where it could be invisible at the normal
+        # window size.
+        sds_checkbox = self._register_checkbox(
+            "sds_mode_default",
             layout,
-            self._tr("qt_field_global_wcs_output", "Global WCS output path"),
+            self._tr("qt_field_sds_mode_short", "Enable ZeSupaDupStack (SDS)"),
         )
+        sds_checkbox.setToolTip(
+            self._tr(
+                "qt_field_sds_mode_tip",
+                "Stack redundant short exposures into coverage batches before the final mosaic.",
+            )
+        )
+        self._sds_mode_checkbox = sds_checkbox
+
+        zegrid_checkbox = self._register_checkbox(
+            "zegrid_mode_enabled",
+            layout,
+            self._tr("qt_field_zegrid_mode", "Let me use ZeGrid"),
+        )
+        zegrid_checkbox.setToolTip(
+            self._tr(
+                "qt_field_zegrid_mode_tip",
+                "Process the FITS folder with the ZeGrid engine (disk-backed, large-dataset oriented).",
+            )
+        )
+        self._zegrid_mode_checkbox = zegrid_checkbox
+
+        # One logical state, three mutually exclusive checkboxes.
+        self._mode_checkboxes = {
+            "existing_master_tiles": master_tiles_checkbox,
+            "sds": sds_checkbox,
+            "zegrid": zegrid_checkbox,
+        }
+        self._mode_sync_guard = False
+        for _mode_name, _cb in self._mode_checkboxes.items():
+            _cb.toggled.connect(
+                lambda checked, m=_mode_name: self._on_processing_mode_toggled(m, bool(checked))
+            )  # type: ignore[arg-type]
+        self._sync_mode_config_keys()
+        self._apply_existing_master_tiles_mode()
         return group
+
+    def _selected_processing_mode(self) -> str:
+        """Return the single selected pipeline mode (classic when none)."""
+        for mode_name, checkbox in getattr(self, "_mode_checkboxes", {}).items():
+            try:
+                if checkbox.isChecked():
+                    return mode_name
+            except Exception:
+                continue
+        return "classic"
+
+    def _sync_mode_config_keys(self) -> None:
+        """Keep the three booleans + ``processing_mode`` coherent (single state)."""
+        if getattr(self, "_mode_sync_guard", False):
+            return
+        self._mode_sync_guard = True
+        try:
+            mode = self._selected_processing_mode()
+            for mode_name, checkbox in self._mode_checkboxes.items():
+                key = {
+                    "existing_master_tiles": "use_existing_master_tiles",
+                    "sds": "sds_mode_default",
+                    "zegrid": "zegrid_mode_enabled",
+                }[mode_name]
+                self.config[key] = mode == mode_name
+                try:
+                    if checkbox.isChecked() != (mode == mode_name):
+                        checkbox.blockSignals(True)
+                        checkbox.setChecked(mode == mode_name)
+                        checkbox.blockSignals(False)
+                except Exception:
+                    pass
+            self.config["processing_mode"] = mode
+        finally:
+            self._mode_sync_guard = False
+
+    def _on_processing_mode_toggled(self, mode_name: str, checked: bool) -> None:
+        """Enforce mutual exclusion between master tiles / SDS / ZeGrid."""
+        if getattr(self, "_mode_sync_guard", False):
+            return
+        if checked:
+            for other_name, other_cb in self._mode_checkboxes.items():
+                if other_name == mode_name:
+                    continue
+                try:
+                    if other_cb.isChecked():
+                        other_cb.blockSignals(True)
+                        other_cb.setChecked(False)
+                        other_cb.blockSignals(False)
+                except Exception:
+                    pass
+        self._sync_mode_config_keys()
+        self._apply_existing_master_tiles_mode()
 
     def _existing_master_tiles_enabled(self) -> bool:
         enabled = self._normalize_config_bool(
@@ -1732,6 +1823,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _on_existing_master_tiles_toggled(self, checked: bool) -> None:
         self._apply_existing_master_tiles_mode(bool(checked))
 
+    def _postprocess_cleanup_temp_artifacts(self, value: Any) -> bool:
+        """Drive the legacy ``coadd_cleanup_memmap`` flag from the single
+        user-visible 'delete temporary working files' intention (R35A)."""
+        try:
+            enabled = bool(value)
+        except Exception:
+            enabled = True
+        self.config["coadd_cleanup_memmap"] = enabled
+        return enabled
+
     def _create_instrument_group(self) -> QGroupBox:
         group = QGroupBox(
             self._tr("qt_group_instrument", "Instrument / Seestar"),
@@ -1750,11 +1851,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             layout,
             self._tr("qt_field_force_seestar", "Force Seestar workflow"),
         )
-        self._register_checkbox(
-            "sds_mode_default",
-            layout,
-            self._tr("qt_field_sds_mode", "Enable SDS mode by default"),
-        )
+        # ZM-ZEGRID-R35A: the SDS pipeline choice moved up to the Folders group
+        # (next to the other pipeline modes). Only genuinely INSTRUMENTAL settings
+        # remain here.
         self._register_double_spinbox(
             "sds_coverage_threshold",
             layout,
@@ -3294,39 +3393,64 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _create_system_resources_group(self) -> QGroupBox:
         group = QGroupBox(
-            self._tr("qt_group_system_resources", "System resources & cache"),
+            self._tr(
+                "qt_group_system_resources",
+                "System resources & temporary storage",
+            ),
             self,
         )
         layout = QFormLayout(group)
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
+        # ZM-ZEGRID-R35A: plain-language storage UX (implementation jargon such as
+        # "memmap"/"coadd intermediates" is hidden; the engine still uses memmap).
         self._register_checkbox(
             "coadd_use_memmap",
             layout,
-            self._tr("qt_field_coadd_use_memmap", "Use memory-mapped coadd intermediates"),
-        )
-        self._register_checkbox(
-            "coadd_cleanup_memmap",
-            layout,
-            self._tr("qt_field_coadd_cleanup", "Clean up memmap files after run"),
-        )
-        self._register_directory_picker(
-            "coadd_memmap_dir",
-            layout,
-            self._tr("qt_field_coadd_memmap_dir", "Memmap directory"),
-            dialog_title=self._tr(
-                "qt_dialog_select_memmap_dir", "Select memmap directory"
+            self._tr(
+                "qt_field_use_disk_backed",
+                "Use disk-backed intermediates to reduce RAM usage",
             ),
         )
 
-        self._register_checkbox(
+        self._register_directory_picker(
+            "temporary_work_dir",
+            layout,
+            self._tr("qt_field_temporary_work_dir", "Temporary working directory"),
+            dialog_title=self._tr(
+                "qt_dialog_select_temporary_work_dir", "Select temporary working directory"
+            ),
+        )
+        try:
+            _temp_hint = QLabel(
+                self._tr(
+                    "qt_hint_temporary_work_dir",
+                    "Leave empty to use the output folder. Large temporary files go here; "
+                    "final results always stay in the output folder.",
+                )
+            )
+            _temp_hint.setWordWrap(True)
+            layout.addRow(_temp_hint)
+        except Exception:
+            pass
+
+        cleanup_cb = self._register_checkbox(
             "cleanup_temp_artifacts",
             layout,
             self._tr(
                 "qt_field_cleanup_temp_artifacts",
-                "Delete temporary processing files after run",
+                "Delete temporary working files after the run",
             ),
         )
+        # The historical ``coadd_cleanup_memmap`` intent is driven by the SAME
+        # user-visible checkbox so no capability is lost.
+        try:
+            self._config_fields["cleanup_temp_artifacts"]["postprocess"] = (
+                self._postprocess_cleanup_temp_artifacts
+            )
+            self.config["coadd_cleanup_memmap"] = bool(self.config.get("cleanup_temp_artifacts", True))
+        except Exception:
+            pass
 
         telemetry_box = QGroupBox(
             self._tr("qt_resource_telemetry_group_title", "Resource Telemetry"),
@@ -4305,9 +4429,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         fallback_defaults: Dict[str, Any] = {
             "input_dir": "",
             "output_dir": "",
+            "processing_mode": "auto",
             "use_existing_master_tiles": False,
+            "zegrid_mode_enabled": False,
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
+            "temporary_work_dir": "",
             "coadd_use_memmap": True,
             "coadd_cleanup_memmap": True,
             "auto_detect_seestar": True,
@@ -7462,6 +7589,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "cluster_orientation_split_deg": float(self.config.get("cluster_orientation_split_deg", 0.0)),
                 # Synchroniser l’état de la case "Enable SDS mode by default" vers le Filter Qt
                 "sds_mode": bool(self.config.get("sds_mode_default", False)),
+                # ZM-ZEGRID-R35A: same single logical state for the ZeGrid choice.
+                "zegrid_mode": bool(self.config.get("zegrid_mode_enabled", False)),
             }
         except Exception:
             initial_overrides = None
@@ -7486,6 +7615,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "auto_detect_seestar": bool(self.config.get("auto_detect_seestar", True)),
             "force_seestar_mode": bool(self.config.get("force_seestar_mode", False)),
             "sds_mode_default": bool(self.config.get("sds_mode_default", False)),
+            "zegrid_mode_enabled": bool(self.config.get("zegrid_mode_enabled", False)),
             "global_coadd_method": str(self.config.get("global_coadd_method", "kappa_sigma") or "kappa_sigma"),
             "global_coadd_k": global_coadd_k_value,
             "global_wcs_output_path": str(
@@ -7622,9 +7752,25 @@ class ZeMosaicQtMainWindow(QMainWindow):
             if key in overrides:
                 self._update_widget_from_config(key, overrides[key])
 
-        # Synchroniser le choix SDS du Filter Qt avec la case "Enable SDS mode by default"
+        # ZM-ZEGRID-R35A: the Filter's SDS/ZeGrid choice is the SAME single logical
+        # state as the main window's checkboxes (never an independent copy).
+        if "zegrid_mode" in overrides:
+            _zegrid_enabled = bool(overrides["zegrid_mode"])
+            self._update_widget_from_config("zegrid_mode_enabled", _zegrid_enabled)
+            if _zegrid_enabled:
+                self._update_widget_from_config("sds_mode_default", False)
+                self._update_widget_from_config("use_existing_master_tiles", False)
         if "sds_mode" in overrides:
-            self._update_widget_from_config("sds_mode_default", overrides["sds_mode"])
+            _sds_enabled = bool(overrides["sds_mode"])
+            self._update_widget_from_config("sds_mode_default", _sds_enabled)
+            if _sds_enabled:
+                self._update_widget_from_config("zegrid_mode_enabled", False)
+                self._update_widget_from_config("use_existing_master_tiles", False)
+        try:
+            self._sync_mode_config_keys()
+            self._apply_existing_master_tiles_mode()
+        except Exception:
+            pass
 
         if "astap_max_instances" in overrides:
             self._update_widget_from_config("astap_max_instances", overrides["astap_max_instances"])

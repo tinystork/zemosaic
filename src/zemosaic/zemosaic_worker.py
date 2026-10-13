@@ -707,6 +707,30 @@ def detect_grid_mode(input_folder: str | os.PathLike | None) -> bool:
     return zemosaic_stack_plan.detect_grid_mode(input_folder)
 
 
+def _zegrid_selection_paths(filtered_header_items) -> list[str] | None:
+    """Extract the explicit Filter selection paths for ZeGrid (ZM-ZEGRID-R35A).
+
+    Returns ``None`` when the Filter did not run (ZeGrid then uses the FULL FITS
+    inventory) or the selected paths when the user made an explicit per-frame
+    choice. ``stack_plan.csv`` never contributes here.
+    """
+    if not isinstance(filtered_header_items, list) or not filtered_header_items:
+        return None
+    paths: list[str] = []
+    for item in filtered_header_items:
+        if isinstance(item, dict):
+            value = item.get("path") or item.get("file_path")
+        else:
+            value = item
+        if not value:
+            continue
+        try:
+            paths.append(str(value))
+        except Exception:
+            continue
+    return paths or None
+
+
 def _resolve_zegrid_normalization(worker_config_cache, stack_norm_method) -> str:
     """Resolve the ZeGrid normalization token (sky_mean default).
 
@@ -11624,7 +11648,14 @@ def _run_shared_phase45_phase5_pipeline(
                 crop_percent=master_tile_crop_percent_config,
                 use_gpu=effective_use_gpu,
                 use_memmap=bool(coadd_use_memmap_config),
-                memmap_dir=(coadd_memmap_dir_config or output_folder),
+                # ZM-ZEGRID-R35A: large disk-backed intermediates honour the user's
+                # Temporary Working Directory (explicit legacy dir > temp work root
+                # > output folder). Final outputs never move.
+                memmap_dir=(
+                    coadd_memmap_dir_config
+                    or str(getattr(zconfig, "temporary_work_dir", "") or "")
+                    or output_folder
+                ),
                 cleanup_memmap=False,
                 base_progress_phase5=base_progress_phase5,
                 progress_weight_phase5=progress_weight_phase5,
@@ -30733,8 +30764,45 @@ def run_hierarchical_mosaic(
     setattr(zconfig, "final_mosaic_black_point_percentile", final_mosaic_black_point_percentile)
 
     stack_plan_detected = detect_grid_mode(input_folder)
-    if stack_plan_detected:
-        # ZeGrid engine (stack_plan.csv). No silent fallback: any failure raises.
+    # ZM-ZEGRID-R35A: the mode is now EXPLICIT. ``stack_plan.csv`` no longer
+    # activates ZeGrid (nor truncates its input) — the mode is resolved once from
+    # the config (plus any explicit Filter selection), and ZeGrid is fed from the
+    # FITS inventory of the input folder.
+    from . import processing_modes as _pmodes
+
+    _mode_config = dict(worker_config_cache or {})
+    if isinstance(filter_overrides, dict) and (
+        "sds_mode" in filter_overrides or "zegrid_mode" in filter_overrides
+    ):
+        # The Filter's explicit choice is authoritative for this run.
+        _mode_config["sds_mode_default"] = _pmodes.coerce_bool(
+            filter_overrides.get("sds_mode"), False
+        )
+        _mode_config["zegrid_mode_enabled"] = _pmodes.coerce_bool(
+            filter_overrides.get("zegrid_mode"), False
+        )
+        _mode_config["processing_mode"] = "auto"
+    if isinstance(filter_overrides, dict) and "processing_mode" in filter_overrides:
+        _mode_config["processing_mode"] = filter_overrides["processing_mode"]
+
+    processing_mode, mode_info = _pmodes.resolve_processing_mode(_mode_config)
+    if mode_info.get("conflict"):
+        logger.warning(
+            "[MODE] incoherent processing selection %s -> resolved to %r (%s)",
+            mode_info.get("conflict"),
+            processing_mode,
+            mode_info.get("resolution") or "explicit_mode_wins",
+        )
+    logger.info(
+        "[MODE] processing_mode=%s (source=%s, requested=%s%s)",
+        processing_mode,
+        mode_info.get("source"),
+        mode_info.get("requested"),
+        f", conflict={mode_info['conflict']}" if mode_info.get("conflict") else "",
+    )
+
+    if processing_mode == _pmodes.ZEGRID:
+        # ZeGrid engine (explicit selection). No silent fallback: any failure raises.
         try:
             from .zemosaic_zegrid_mode import resolve_gpu_preference, run_zegrid_mode
         except Exception as exc:
@@ -30763,6 +30831,10 @@ def run_hierarchical_mosaic(
                 input_folder=input_folder,
                 output_folder=output_folder,
                 progress_callback=progress_callback,
+                selection_paths=_zegrid_selection_paths(filtered_header_items),
+                global_wcs_output_path=(worker_config_cache or {}).get(
+                    "global_wcs_output_path"
+                ),
                 stack_norm_method=zegrid_norm,
                 stack_weight_method=stack_weight_method,
                 stack_reject_algo=stack_reject_algo,
@@ -30794,31 +30866,15 @@ def run_hierarchical_mosaic(
         filter_overrides,
     )
 
-    config_sds_default = _coerce_bool_flag(worker_config_cache.get("sds_mode_default"))
-    override_flag = None
-    override_defined = False
-    plan_override_flag = None
-    plan_override_defined = False
-    plan_override = None
-    if isinstance(filter_overrides, dict):
-        if "sds_mode" in filter_overrides:
-            override_flag = _coerce_bool_flag(filter_overrides.get("sds_mode"))
-            override_defined = override_flag is not None
-        plan_override = filter_overrides.get("global_wcs_plan_override")
-    if isinstance(plan_override, dict) and "sds_mode" in plan_override:
-        plan_override_flag = _coerce_bool_flag(plan_override.get("sds_mode"))
-        plan_override_defined = plan_override_flag is not None
-    if override_defined:
-        sds_mode_flag = override_flag
-    elif plan_override_defined:
-        sds_mode_flag = plan_override_flag
-    elif config_sds_default is not None:
-        sds_mode_flag = config_sds_default
-    else:
-        sds_mode_flag = False
+    # ZM-ZEGRID-R35A: SDS is derived from the resolved explicit mode (the Filter's
+    # override was folded into that resolution above). No stack_plan presence test.
+    plan_override = filter_overrides.get("global_wcs_plan_override") if isinstance(filter_overrides, dict) else None
+    sds_mode_flag = processing_mode == _pmodes.SDS
+    use_existing_master_tiles_config = processing_mode == _pmodes.EXISTING_MASTER_TILES
     global_wcs_plan["sds_mode"] = bool(sds_mode_flag)
+    global_wcs_plan["processing_mode"] = processing_mode
 
-    if (not stack_plan_detected) and (not sds_mode_flag):
+    if processing_mode in (_pmodes.CLASSIC, _pmodes.EXISTING_MASTER_TILES):
         # Keep prune parameters explicit in classic path (fallback to config cache).
         # This avoids accidental fallback to legacy defaults (K=8, mode=area).
         try:

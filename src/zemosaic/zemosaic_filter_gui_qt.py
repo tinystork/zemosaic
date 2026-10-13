@@ -2711,6 +2711,20 @@ class FilterQtDialog(QDialog):
                 bool(DEFAULT_FILTER_CONFIG.get("sds_mode_default", False)),
             ),
         )
+        # ZM-ZEGRID-R35A: ZeGrid is a sibling pipeline choice of SDS; the Filter
+        # shows the SAME single logical state as the main window and they are
+        # mutually exclusive.
+        self._zegrid_mode_initial = self._coerce_bool(
+            (initial_overrides or {}).get("zegrid_mode")
+            if isinstance(initial_overrides, dict)
+            else None,
+            self._coerce_bool(
+                (config_overrides or {}).get("zegrid_mode_enabled")
+                if isinstance(config_overrides, dict)
+                else None,
+                bool(DEFAULT_FILTER_CONFIG.get("zegrid_mode_enabled", False)),
+            ),
+        )
         self._cache_csv_path: str | None = None
         if self._stream_scan:
             candidate_dir = _expand_to_path(raw_files_with_wcs_or_dir)
@@ -3135,6 +3149,23 @@ class FilterQtDialog(QDialog):
         except Exception:
             pass
         layout.addWidget(self._sds_checkbox, 10, 0, 1, 2)
+
+        self._zegrid_checkbox = QCheckBox(
+            self._localizer.get("filter_chk_zegrid_mode", "Use ZeGrid"),
+            box,
+        )
+        self._zegrid_checkbox.setChecked(bool(self._zegrid_mode_initial))
+        try:
+            self._zegrid_checkbox.toggled.connect(self._on_zegrid_toggled)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        layout.addWidget(self._zegrid_checkbox, 11, 0, 1, 2)
+        # Mutual exclusion: SDS and ZeGrid cannot both be active.
+        try:
+            if self._sds_checkbox.isChecked() and self._zegrid_checkbox.isChecked():
+                self._zegrid_checkbox.setChecked(False)
+        except Exception:
+            pass
 
         return box
 
@@ -7232,7 +7263,36 @@ class FilterQtDialog(QDialog):
         self._group_outline_bounds = []
         if not self._auto_group_running:
             self._set_group_buttons_enabled(True)
+        # ZM-ZEGRID-R35A: SDS and ZeGrid are mutually exclusive pipeline choices.
+        if checked:
+            zc = getattr(self, "_zegrid_checkbox", None)
+            try:
+                if zc is not None and zc.isChecked():
+                    zc.blockSignals(True)
+                    zc.setChecked(False)
+                    zc.blockSignals(False)
+            except Exception:
+                pass
         # Refresh cluster and preview so the UI reflects the new mode.
+        self._schedule_cluster_refresh()
+        self._update_summary_label()
+        self._schedule_preview_refresh()
+
+    def _on_zegrid_toggled(self, checked: bool) -> None:
+        """ZeGrid toggle (R35A) with SDS mutual exclusion."""
+        self._auto_group_override_groups = None
+        self._group_outline_bounds = []
+        if not self._auto_group_running:
+            self._set_group_buttons_enabled(True)
+        if checked:
+            sc = getattr(self, "_sds_checkbox", None)
+            try:
+                if sc is not None and sc.isChecked():
+                    sc.blockSignals(True)
+                    sc.setChecked(False)
+                    sc.blockSignals(False)
+            except Exception:
+                pass
         self._schedule_cluster_refresh()
         self._update_summary_label()
         self._schedule_preview_refresh()
@@ -9335,6 +9395,13 @@ class FilterQtDialog(QDialog):
 
         if self._sds_checkbox is not None:
             overrides["sds_mode"] = bool(self._sds_checkbox.isChecked())
+        if self._zegrid_checkbox is not None:
+            overrides["zegrid_mode"] = bool(self._zegrid_checkbox.isChecked())
+        # ZM-ZEGRID-R35A: never return two active special pipelines.
+        if overrides.get("zegrid_mode"):
+            overrides["sds_mode"] = False
+        elif overrides.get("sds_mode"):
+            overrides["zegrid_mode"] = False
         overrides["filter_overcap_allowance_pct"] = int(self._resolve_overcap_percent())
         overrides["batch_overlap_pct"] = int(self._resolve_overlap_percent())
         overrides["allow_batch_duplication"] = bool(self._config_value("allow_batch_duplication", True))

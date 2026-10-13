@@ -240,6 +240,85 @@ def get_runtime_temp_dir() -> Path:
     return base
 
 
+def resolve_temporary_work_dir(
+    output_dir: str | Path | None,
+    configured_work_dir: str | Path | None = None,
+    *,
+    create: bool = True,
+    probe: bool = True,
+) -> Path:
+    """Resolve the ONE user-chosen root for LARGE temporary working files (R35A).
+
+    Contract:
+
+    * ``configured_work_dir`` non-empty  -> that explicit directory is the
+      temporary work root; it is created if needed and validated (a clear
+      ``RuntimeError`` is raised when it is unusable — NEVER a silent fallback
+      to another disk);
+    * ``configured_work_dir`` empty/None -> ``output_dir`` is used as the work
+      root (the historical "write temporaries next to the outputs" behaviour).
+
+    Scientific outputs are NEVER relocated by this helper: only callers that
+    create large intermediates should use it, and they must still publish final
+    artifacts under ``output_dir``.
+    """
+    configured_text = ""
+    if configured_work_dir is not None:
+        try:
+            configured_text = str(configured_work_dir).strip()
+        except Exception:
+            configured_text = ""
+
+    if not configured_text:
+        base = Path(output_dir).expanduser() if output_dir else Path(tempfile.gettempdir())
+        if create:
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        return base
+
+    root = Path(configured_text).expanduser()
+    if create:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "Temporary working directory is not usable: "
+                f"could not create '{root}' ({exc}). Choose an existing, "
+                "writable directory or leave the field empty to use the output folder."
+            ) from exc
+
+    try:
+        is_dir = root.is_dir()
+    except Exception:
+        is_dir = False
+    if not is_dir:
+        raise RuntimeError(
+            "Temporary working directory is not usable: "
+            f"'{root}' is not a directory. Choose an existing, writable directory "
+            "or leave the field empty to use the output folder."
+        )
+
+    if probe:
+        probe_path = root / ".zemosaic_tempdir_probe"
+        try:
+            with probe_path.open("w", encoding="utf-8") as handle:
+                handle.write("ok")
+            try:
+                probe_path.unlink()
+            except Exception:
+                pass
+        except Exception as exc:
+            raise RuntimeError(
+                "Temporary working directory is not writable: "
+                f"'{root}' ({exc}). Choose a writable directory or leave the field "
+                "empty to use the output folder."
+            ) from exc
+
+    return root
+
+
 def is_path_excluded(path: Path | str, excluded_dirs: Iterable[str] | None = None) -> bool:
     """Return True when *path* is located inside a known excluded directory."""
 

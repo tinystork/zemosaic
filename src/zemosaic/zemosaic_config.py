@@ -108,7 +108,15 @@ DEFAULT_CONFIG = {
     "qt_main_left_state": None,
     "input_dir": "",
     "output_dir": "",
+    # ZM-ZEGRID-R35A: explicit, single, non-ambiguous processing mode.
+    # "auto" derives the mode from the legacy booleans below.
+    # Values: "auto" | "classic" | "existing_master_tiles" | "sds" | "zegrid".
+    "processing_mode": "auto",
     "use_existing_master_tiles": False,
+    # ZM-ZEGRID-R35A: explicit ZeGrid selection (replaces the stack_plan.csv
+    # presence trigger). Kept alongside the other two pipeline booleans so an
+    # older reader still sees a coherent, mutually-exclusive state.
+    "zegrid_mode_enabled": False,
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
@@ -226,6 +234,9 @@ DEFAULT_CONFIG = {
     "save_display_fits": False,
     "coadd_use_memmap": True,
     "coadd_memmap_dir": "",
+    # ZM-ZEGRID-R35A: user-chosen root for LARGE temporary/disk-backed working
+    # files (empty = use the output folder). Scientific outputs never move here.
+    "temporary_work_dir": "",
     "coadd_cleanup_memmap": True,
     "cleanup_temp_artifacts": True,
     "enable_resource_telemetry": False,
@@ -636,6 +647,45 @@ def _normalize_gpu_flags(config: dict) -> None:
     config["use_gpu_grid"] = _coerce_boolish(config.get("use_gpu_grid"), canonical)
 
 
+def _normalize_processing_mode(config: dict) -> None:
+    """Make the pipeline selection explicit and mutually exclusive (R35A).
+
+    The three special pipelines (existing master tiles / SDS / ZeGrid) are
+    incompatible.  A legacy config could leave two of them enabled; here we
+    arbitrate ONCE with the documented precedence and record the arbitration in
+    a load note, so the state that reaches the worker is never ambiguous.
+
+    The user's raw boolean values are preserved verbatim in the returned config
+    (``sticky`` guard is unnecessary because the arbitration is deterministic),
+    but the three booleans plus ``processing_mode`` are made coherent.
+    """
+    modes = ("existing_master_tiles", "sds", "zegrid")
+    keys = {
+        "existing_master_tiles": "use_existing_master_tiles",
+        "sds": "sds_mode_default",
+        "zegrid": "zegrid_mode_enabled",
+    }
+    requested = [m for m in modes if _coerce_boolish(config.get(keys[m]), False)]
+
+    raw_mode = str(config.get("processing_mode", "auto") or "auto").strip().lower()
+    if raw_mode not in ("auto",) + modes:
+        raw_mode = "auto"
+
+    if raw_mode in modes:
+        resolved = raw_mode
+    elif len(requested) > 1:
+        # Documented precedence (matches zemosaic.processing_modes).
+        resolved = next(m for m in modes if m in requested)
+    elif len(requested) == 1:
+        resolved = requested[0]
+    else:
+        resolved = "classic"
+
+    config["processing_mode"] = resolved
+    for m in modes:
+        config[keys[m]] = resolved == m
+
+
 def _apply_astap_platform_defaults(config: dict) -> bool:
     """
     Ensure ASTAP paths are usable on the current platform by auto-detecting
@@ -874,6 +924,7 @@ def load_config():
         "astap_executable_path",
         "astap_data_directory_path",
         "coadd_memmap_dir",
+        "temporary_work_dir",
         "gpu_selector",
         "input_dir",
         "output_dir",
@@ -885,6 +936,7 @@ def load_config():
                 current_config[key] = str(expanded)
     _apply_astap_platform_defaults(current_config)
     _normalize_gpu_flags(current_config)
+    _normalize_processing_mode(current_config)
 
     # Qt-only migration: backend selection is obsolete in official runtime.
     # Keep backward readability for legacy config files, but neutralize runtime state.

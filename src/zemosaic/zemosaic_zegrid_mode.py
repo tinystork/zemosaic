@@ -57,7 +57,7 @@ import shutil
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import psutil
@@ -1845,6 +1845,7 @@ def _run_single(
     ignored_run_args=None,
     finishing_config=None,
     gpu_context=None,
+    pass_label="single",
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1917,6 +1918,18 @@ def _run_single(
             frames_info, input_folder, progress_callback, sip_mode=sip_mode
         )
         canvas = zg.build_canvas(descs)
+    # ZM-ZEGRID-R35A: explicit inventory invariant (no silent drop).
+    _cand = len(frames_info)
+    _inc = len(descs)
+    _rej = len(rejected)
+    _extra = _cand - _inc - _rej
+    _msg = (
+        f"ZeGrid inventory (pass={pass_label}): candidates={_cand} "
+        f"included={_inc} rejected_wcs={_rej}"
+    )
+    if _extra:
+        _msg += f" (unaccounted={_extra})"
+    _emit(_msg, callback=progress_callback)
     _setup_rep.end(
         throughput=_fmt_throughput(len(frames_info), timings.get("setup"), "frames/s")
     )
@@ -2009,8 +2022,21 @@ def _run_single(
     else:
         cache_build_workers = workers
 
-    cache_root = output_dir / CACHE_DIR_NAME
+    # ZM-ZEGRID-R35A: large disk-backed intermediates follow the user's
+    # Temporary Working Directory (empty -> the output folder, historical
+    # behaviour). Scientific outputs STAY under output_dir.
+    from .zemosaic_utils import resolve_temporary_work_dir as _resolve_temp_root
+
+    _temp_root = _resolve_temp_root(
+        output_dir, getattr(zconfig, "temporary_work_dir", "") if zconfig is not None else ""
+    )
+    cache_root = Path(_temp_root) / CACHE_DIR_NAME
     cache_root.mkdir(parents=True, exist_ok=True)
+    if str(Path(_temp_root)) != str(Path(output_dir)):
+        _emit(
+            f"ZeGrid: temporary work root = {_temp_root} (outputs stay in {output_dir})",
+            callback=progress_callback,
+        )
 
     # R15 (rework-1 L3): track cache cleanup failures (auditable in the manifest).
     cleanup_failures: list[str] = []
@@ -3274,13 +3300,21 @@ def run_zegrid_mode(
     zconfig: object | None = None,
     workers: int | None = None,
     cell_gauge_mode: str | None = None,
+    frames_info: Sequence | None = None,
+    selection_paths: Sequence[str] | None = None,
+    global_wcs_output_path: str | None = None,
 ) -> None:
-    """Run the NEW ZeGrid engine over a ``stack_plan.csv`` (production entry).
+    """Run the NEW ZeGrid engine over the input folder's FITS inventory.
+
+    ZM-ZEGRID-R35A: ZeGrid is an EXPLICIT mode and is fed by the eligible FITS
+    inventory of ``input_folder`` (optionally narrowed by an explicit Filter
+    ``selection_paths``); ``stack_plan.csv`` no longer activates or feeds it.
+    ``frames_info`` may be supplied directly (worker-built) to avoid a rescan.
 
     Normalization defaults to ``sky_mean``;
     weighting/rejection/combine/taper use the frozen ZeGrid science config.
     """
-    _emit("ZeGrid engine activated (stack_plan.csv detected)", callback=progress_callback)
+    _emit("ZeGrid engine activated (explicit ZeGrid mode)", callback=progress_callback)
 
     # ZM-ZEGRID-R22: resolve ONE canonical GPU preference and decide the backend
     # HONESTLY (requested -> available -> effective). ``use_gpu`` is now honoured
@@ -3388,10 +3422,41 @@ def run_zegrid_mode(
             callback=progress_callback,
         )
 
-    csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
-    frames_info = _stack_plan.load_stack_plan(csv_path, progress_callback=progress_callback)
+    # ZM-ZEGRID-R35A: ZeGrid input is the eligible FITS inventory of the input
+    # folder (optionally narrowed by an EXPLICIT Filter selection). stack_plan.csv
+    # neither activates ZeGrid nor truncates its dataset.
+    inventory_info: dict = {}
+    if frames_info is None:
+        from . import input_inventory as _zinv
+
+        frames_info, inventory_info = _zinv.build_zegrid_frames(
+            input_folder,
+            output_folder,
+            global_wcs_output_path=global_wcs_output_path,
+            selection_paths=selection_paths,
+        )
+    _emit(
+        f"ZeGrid input discovery: {inventory_info.get('discovered', len(frames_info))} FITS candidate(s)",
+        callback=progress_callback,
+    )
+    if inventory_info.get("selection_applied"):
+        _emit(
+            f"ZeGrid input selection: explicit Filter selection -> "
+            f"{inventory_info.get('selected')} of {inventory_info.get('discovered')} frame(s); "
+            f"using {len(frames_info)}",
+            callback=progress_callback,
+        )
+    if inventory_info.get("selection_unmatched"):
+        _emit(
+            "ZeGrid: explicit Filter selection matched no inventory FITS; "
+            "using the FULL inventory (WARN)",
+            lvl="WARN",
+            callback=progress_callback,
+        )
     if not frames_info:
-        raise RuntimeError("ZeGrid failed: no frames loaded from stack_plan.csv")
+        raise RuntimeError(
+            "ZeGrid failed: no eligible FITS frame found in the input folder"
+        )
 
     # Per-Cell photometric gauge mode (ZM-CELL-PHOTOMETRY-R34B): opt-in, default
     # "global" (unchanged production path). Resolution order: explicit keyword >
@@ -3499,7 +3564,7 @@ def run_zegrid_mode(
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                         ignored_run_args=ignored_run_args,
                         finishing_config=finishing_config,
-                        gpu_context=gpu_context)
+                        gpu_context=gpu_context, pass_label="EQ")
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
@@ -3507,7 +3572,7 @@ def run_zegrid_mode(
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                         ignored_run_args=ignored_run_args,
                         finishing_config=finishing_config,
-                        gpu_context=gpu_context)
+                        gpu_context=gpu_context, pass_label="ALTZ")
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -3517,4 +3582,4 @@ def run_zegrid_mode(
                     pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                     ignored_run_args=ignored_run_args,
                     finishing_config=finishing_config,
-                    gpu_context=gpu_context)
+                    gpu_context=gpu_context, pass_label="single")

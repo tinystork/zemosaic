@@ -103,7 +103,8 @@ def test_worker_propagates_use_gpu_into_run_zegrid_mode(monkeypatch):
         captured.update(kwargs)
         return None
 
-    monkeypatch.setattr(zw, "detect_grid_mode", lambda folder: True)
+    # ZM-ZEGRID-R35A: ZeGrid is now an EXPLICIT mode selection (no longer
+    # triggered by the mere presence of stack_plan.csv).
     # Patch the module import inside run_hierarchical_mosaic to return our fake.
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -115,7 +116,10 @@ def test_worker_propagates_use_gpu_into_run_zegrid_mode(monkeypatch):
     )
     # Inject a config cache with the GUI GPU aliases all true.
     monkeypatch.setattr(zw, "ZEMOSAIC_CONFIG_AVAILABLE", True)
-    fake_config = SimpleNamespace(load_config=lambda: {"stack_use_gpu": True, "use_gpu_stack": True, "use_gpu_grid": True})
+    fake_config = SimpleNamespace(load_config=lambda: {
+        "stack_use_gpu": True, "use_gpu_stack": True, "use_gpu_grid": True,
+        "zegrid_mode_enabled": True,
+    })
     monkeypatch.setattr(zw, "zemosaic_config", fake_config)
 
     def fake_progress(*a, **k):

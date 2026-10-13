@@ -323,6 +323,17 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
         _emit(f"Failed to open FITS {frame.path}: {exc}", lvl="ERROR", callback=progress_callback)
         return False
 
+    # ZM-ZEGRID-R35A: mount metadata (EQ / ALTZ) is now read from the FITS header
+    # itself (EQMODE), replacing the stack_plan ``mount`` column while preserving
+    # the exact same EQ/ALTZ semantics downstream.
+    try:
+        if getattr(frame, "mount", None) is None:
+            from .input_inventory import mount_from_header as _mount_from_header
+
+            frame.mount = _mount_from_header(header)
+    except Exception:
+        pass
+
 
     try:
         frame.wcs = WCS(header)
