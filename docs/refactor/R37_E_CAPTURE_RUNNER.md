@@ -45,7 +45,7 @@ python tools/r37_capture_runner.py \
     [--holdout-cap N]           # default 1000000 (exact-heldout target)
     [--gpu {auto,on,off}]       # default auto (prefers baseline use_gpu_grid)
     [--execute]                 # required for any write / full run
-    [--skip-memory-preflight]   # LOUD, explicit; never hides an infeasible host
+    [--skip-memory-preflight]   # inspection dry-run ONLY (refused with --execute)
 ```
 
 Exit codes: `0` ok · `1` validation/other error · `2` memory preflight FAIL ·
@@ -56,8 +56,15 @@ Exit codes: `0` ok · `1` validation/other error · `2` memory preflight FAIL ·
   writes **nothing** — not in the input dir, not in the baseline dir, not in the
   output dir.
 * **`--execute`.** Additionally requires a new/empty output dir that cannot
-  overwrite the input or the baseline, and a PASSing preflight. On success it
-  verifies the artifact↔manifest linkage and writes a compact verification report.
+  overwrite the input or the baseline, and a **successful real memory preflight**.
+  On success it verifies the artifact↔manifest linkage and writes a compact
+  verification report. If the atomic report write fails, the run returns nonzero
+  and never prints `VERIFICATION PASS`.
+* **Memory-safety contract.** `--execute` **must** have a PASSing preflight.
+  `--skip-memory-preflight` is an **inspection-only** affordance: it reports
+  `preflight SKIPPED` (never `PASS`), is refused outright when combined with
+  `--execute` (before any engine work), and there is deliberately **no
+  `--force-infeasible`**.
 
 ### Examples
 
@@ -130,8 +137,9 @@ bound, the GPU probe summary, and **PASS/FAIL**.
 If the pinned layout cannot fit, the runner returns exit code `2` and creates no
 output. `--execute` refuses on a failed preflight. There is deliberately **no
 `--force-infeasible`**: forcing a pinned layout that cannot fit only invites
-swap-thrash/OOM. `--skip-memory-preflight` exists only as an explicit, loud
-opt-out; it does not force an infeasible execution.
+swap-thrash/OOM. `--skip-memory-preflight` is an inspection-only affordance and
+is **refused with `--execute`** before any engine work; on a skip dry-run the
+verdict is reported as `SKIPPED`, never `PASS`.
 
 Measured on the current weak host (dry-run, real baseline, no writes):
 
@@ -152,42 +160,60 @@ the console.
 
 ### 4.4 Post-run verification
 
-After a successful run the runner strict-loads the artifact + the completed
-manifest (in the base and any mount-pass `grid_EQ`/`grid_ALTZ` dirs) and checks:
+After a successful run the runner strict-loads the artifacts + manifests (in the
+base and any mount-pass `grid_EQ`/`grid_ALTZ` dirs) and checks:
 
 * `manifest_links_artifact` on all four identity keys (`capture_id`, `filename`,
-  `sha256`, `bytes`);
+  `sha256`, `bytes`) — fed with **disk/artifact-derived** `sha256`/`bytes`, never
+  values copied from the same manifest (non-tautological); the explicit
+  disk-equality checks are kept too;
 * capture id / filename / on-disk sha256 / on-disk bytes agreement;
 * artifact provenance truthfulness: `mission == "ZM-ZEGRID-R37-D"`,
   `capture_stage == "pre_offset_pre_feather"`, `production_wired is True`,
   `correction_applied is False`, effective gauge `per_cell`;
-* layout and frame facts: manifest and artifact `nx×ny` equal the baseline, the
-  manifest frame set matches the resolved selection, and the artifact/manifest
-  source-frame counts equal the selection count;
-* qualification is reported and stated as **EXACT** or **CAPPED** (never claimed
-  exact before verifying).
+* **independent exact/capped/qualification truth** derived from the strict-loaded
+  artifact (`heldout_capped`, `heldout_exact()`, expected qualification) and
+  compared against all three manifest capture claims; any mismatch fails;
+* layout facts: manifest and artifact `nx×ny` equal the baseline;
+* frame accounting:
+  * single pass — the manifest frame set must equal the exact selection
+    (count + digest);
+  * multi-pass (`grid_EQ`/`grid_ALTZ`) — each pass must be internally consistent
+    (`n_frames == len(unique manifest frame_ids)`, artifact source count == that
+    pass count), pass frame sets must be **disjoint**, and their **union** must
+    equal the exact selected set (count + digest). An unknown pass dir carrying a
+    manifest fails; no silent extra/missing/duplicate frame may pass.
 
 It writes `r37_capture_verification.json` **atomically** into the output dir with
 the command parameters, invocation parameters, preflight summary, the linkage
-verdict, the artifact digest/bytes/qualification, and the repo HEAD / package
-version when available. The report carries **basenames, counts and digests only**
-— no credentials and no private absolute input paths. Any post-run verification
-failure is a nonzero exit.
+verdict, the artifact-derived qualification/digest/bytes, and the repo HEAD /
+package version when available. The report carries **basenames, counts and
+digests only**: absolute source/temp/report paths are scrubbed at the durable
+report boundary (execution may still use the real paths). Any post-run
+verification failure — or a failed atomic report write — is a nonzero exit (and
+a failed write never prints `VERIFICATION PASS`).
 
 ## 5. Tests
 
-`tests/test_zegrid_r37e_capture_runner.py` (45 tests, run under `-W error`)
-covers: baseline manifest/config validation (engine / cell_feather / frame_ids /
-canvas / layout / effective `per_cell`, strict JSON), exact subset resolution on
-small fixtures with missing / ambiguous-basename / path-traversal / Windows-like
-ids, strict winsor+sigma parsing, copy-without-mutation pinned config, dry-run
-performs no writes and never calls the engine, failed preflight returns nonzero
-and creates no output, output-safety refusals, execution argument reconstruction
-via monkeypatch, post-run linkage PASS/FAIL (missing / tampered manifest / tampered
-artifact bytes), atomic verification report (no temp residue), and a **small real
-synthetic run** end-to-end through the CLI. A top-level import audit asserts the
-tool imports no `zemosaic` module at module scope (all lazy), so importing the
-runner never activates a capture or a run.
+`tests/test_zegrid_r37e_capture_runner.py` (run under `-W error`) covers: baseline
+manifest/config validation (engine / cell_feather / frame_ids / canvas / layout /
+effective `per_cell`, strict JSON), exact subset resolution on small fixtures with
+missing / ambiguous-basename / path-traversal / Windows-like (incl. drive-absolute
+and UNC) ids, strict winsor+sigma parsing, copy-without-mutation pinned config,
+dry-run performs no writes and never calls the engine, failed preflight returns
+nonzero and creates no output, `--skip-memory-preflight --execute` is refused
+without ever running the engine, output-safety refusals, execution argument
+reconstruction via monkeypatch, artifact-derived exact/capped/qualification
+verification with manifest-tamper regressions (all three fields), a failed
+verification-report write returning nonzero without a `PASS` claim, report
+sanitization (rejected-WCS detail basename-only; absolute input/temp/output paths
+absent; strict JSON), multi-pass verification (valid 2-pass PASS plus
+missing/extra/duplicate/tampered/unknown-pass-dir failures), relative `.git`
+`gitdir:` resolution, non-tautological linkage (manifest `sha256`/`bytes` tamper
+fails), atomic verification report (no temp residue), and a **small real synthetic
+run** end-to-end through the CLI. A top-level import audit asserts the tool
+imports no `zemosaic` module at module scope (all lazy), so importing the runner
+never activates a capture or a run.
 
 ## 6. Limits / non-goals
 

@@ -22,9 +22,11 @@ the runner imports no ``zemosaic`` module at module scope (all lazy).
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import pathlib
+import shutil
 import sys
 from types import SimpleNamespace
 
@@ -486,13 +488,18 @@ def test_verify_outputs_linkage_pass(tiny_baseline):
     sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
     ver = runner.verify_outputs(tiny_baseline["base"], baseline=info, selection=sel)
     assert ver["verdict"] == "PASS", ver["failures"]
+    assert ver["multi_pass"] is False
     entry = ver["passes"][0]
     assert entry["pass_ok"] is True
-    assert entry["heldout_exact"] is True
-    assert entry["qualification"] == "EXACT"
+    assert entry["artifact_heldout_exact"] is True
+    assert entry["artifact_qualification"] == "EXACT"
+    assert entry["artifact_heldout_capped"] is False
     assert entry["production_wired"] is True
     assert entry["correction_applied"] is False
     assert entry["mission"] == runner.CAPTURE_MISSION
+    # non-tautological linkage: fed disk-derived sha/bytes
+    assert entry["checks"]["manifest_links_artifact"] is True
+    assert entry["checks"]["sha256_matches_disk"] is True
 
 
 def test_verify_outputs_missing_artifact_fails(tiny_baseline):
@@ -509,7 +516,6 @@ def test_verify_outputs_missing_artifact_fails(tiny_baseline):
 
 
 def test_verify_outputs_tampered_manifest_fails(tiny_baseline):
-    import shutil
     info = runner.load_baseline(tiny_baseline["base"])
     sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
     work = tiny_baseline["root"] / "tamper_manifest"
@@ -520,6 +526,10 @@ def test_verify_outputs_tampered_manifest_fails(tiny_baseline):
     man_path.write_text(json.dumps(man))
     ver = runner.verify_outputs(work, baseline=info, selection=sel)
     assert ver["verdict"] == "FAIL"
+    # the linkage check is MEANINGFUL: disk-derived sha vs manifest claim
+    entry = ver["passes"][0]
+    assert entry["checks"]["manifest_links_artifact"] is False
+    assert entry["checks"]["sha256_matches_disk"] is False
     assert any("manifest_links_artifact" in f or "sha256" in f for f in ver["failures"])
 
 
@@ -563,3 +573,286 @@ def test_full_cli_execute_end_to_end(tiny_baseline, tmp_path):
     # no private absolute input paths leak into the compact report
     blob = json.dumps(report)
     assert str(tiny_baseline["inp"]) not in blob
+
+
+# ---------------------------------------------------------------------------
+# 9. Rework-1 regressions
+# ---------------------------------------------------------------------------
+
+def test_skip_preflight_with_execute_is_refused_before_engine(tmp_path, monkeypatch):
+    ids = ["a.fit", "b.fit"]
+    base = _write_baseline(tmp_path / "base", ids)
+    inp = _write_input(tmp_path / "in", ids)
+    out = tmp_path / "out"
+
+    def _boom(*a, **k):  # pragma: no cover
+        raise AssertionError("engine must not run for skip+execute")
+
+    def _pf_boom(*a, **k):  # pragma: no cover
+        raise AssertionError("preflight must not run for skip+execute")
+
+    monkeypatch.setattr(runner, "_call_run_zegrid_mode", _boom)
+    monkeypatch.setattr(runner, "preflight", _pf_boom)
+    rc = runner.main(_main_args(tmp_path, base, inp, out)
+                     + ["--execute", "--skip-memory-preflight"])
+    assert rc == runner._EXIT_PREFLIGHT_FAIL
+    assert not out.exists()
+
+
+def test_skip_preflight_dry_run_reports_skipped_not_pass(tmp_path, monkeypatch, capsys):
+    ids = ["a.fit", "b.fit"]
+    base = _write_baseline(tmp_path / "base", ids)
+    inp = _write_input(tmp_path / "in", ids)
+    out = tmp_path / "out"
+
+    def _boom(*a, **k):  # pragma: no cover
+        raise AssertionError("engine must not run in a skip dry-run")
+
+    def _pf_boom(*a, **k):  # pragma: no cover
+        raise AssertionError("real preflight must not run when skipped")
+
+    monkeypatch.setattr(runner, "_call_run_zegrid_mode", _boom)
+    monkeypatch.setattr(runner, "preflight", _pf_boom)
+    rc = runner.main(_main_args(tmp_path, base, inp, out) + ["--skip-memory-preflight"])
+    text = capsys.readouterr().out
+    assert rc == runner._EXIT_OK
+    assert "SKIPPED" in text
+    assert "preflight PASS" not in text
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("bad", [
+    "C:\\abs.fit", "C:/abs.fit", "c:\\abs.fit", "c:/abs.fit",
+    "\\\\srv\\share\\f.fit", "//srv/share/f.fit", "/abs.fit",
+])
+def test_selection_rejects_drive_unc_and_posix_absolute(tmp_path, bad):
+    inp = _write_input(tmp_path / "in", ["f.fit"])
+    with pytest.raises(runner.SelectionError):
+        runner.resolve_selection(inp, [bad])
+
+
+def test_selection_allows_relative_names_with_colon(tmp_path):
+    inp = _write_input(tmp_path / "in", ["a:b.fit", "C:foo.fit"])
+    sel = runner.resolve_selection(inp, ["a:b.fit", "C:foo.fit"])
+    assert sel.count == 2
+
+
+def test_scrub_absolute_paths():
+    data = {
+        "a": "/home/x/s.txt", "b": "C:\\Users\\t\\f.fit",
+        "c": ["/tmp/y", "rel.z"], "d": 4, "e": None,
+    }
+    out = runner._scrub_absolute_paths(data)
+    assert out["a"] == "s.txt"
+    assert out["b"] == "f.fit"
+    assert out["c"] == ["y", "rel.z"]
+    assert out["d"] == 4 and out["e"] is None
+
+
+def test_verification_report_boundary_scrubs_absolute_paths(tmp_path):
+    temp = tmp_path / "work"
+    temp.mkdir()
+    input_dir = tmp_path / "input lights"
+    input_dir.mkdir()
+    base = tmp_path / "base_run"
+    baseline = _write_min_baseline_info(base, ["a.fit", "b.fit"])
+    sel = runner.SelectionResolution(
+        input_dir=input_dir, paths=(input_dir / "a.fit",),
+        basenames=("a.fit",), digest=runner._digest_names(["a.fit"]),
+        matched_by_relative=1, matched_by_basename=0,
+    )
+    inv = runner.Invocation(
+        input_dir=input_dir, output_dir=tmp_path / "out", kwargs={},
+        params_report={"temporary_work_dir": str(temp), "pinned_layout": "2x2"},
+    )
+    preflight_report = {
+        "verdict": "PASS",
+        "rejected_wcs_detail": [{"basename": "bad.fit", "reason": "not celestial"}],
+        "temporary_work_dir": str(temp),
+    }
+    verification = {"verdict": "PASS", "passes": [{"artifact_exists": False,
+                    "pass_ok": True}], "failures": [], "multi_pass": False}
+    report = runner.build_verification_report(
+        invocation=inv, baseline=baseline, selection=sel, verification=verification,
+        preflight_report=preflight_report, pinned_layout="2x2", holdout_cap=10, gpu_mode="auto",
+    )
+    blob = json.dumps(report)
+    assert str(temp) not in blob
+    assert str(input_dir) not in blob
+    assert str(tmp_path) not in blob
+    # strict JSON survives the scrub
+    assert json.loads(blob)["verification_verdict"] == "PASS"
+
+
+def test_preflight_rejection_detail_is_basename_only(tiny_baseline):
+    import numpy as np
+    from astropy.io import fits
+    from astropy.wcs import WCS
+
+    info = runner.load_baseline(tiny_baseline["base"])
+    corpus = tiny_baseline["root"] / "in_with_bad"
+    corpus.mkdir(exist_ok=True)
+    names = []
+    for i in range(4):
+        shutil.copyfile(tiny_baseline["inp"] / f"f{i}.fit", corpus / f"f{i}.fit")
+        names.append(f"f{i}.fit")
+    # a 2-D frame with a NON-celestial WCS -> rejected by qualify_wcs
+    w = WCS(naxis=2)
+    w.wcs.ctype = ["LINEAR", "LINEAR"]
+    w.wcs.crval = [10.0, 30.0]
+    w.wcs.crpix = [10, 10]
+    w.wcs.cd = np.array([[-1, 0], [0, 1]]) * 0.001
+    w.array_shape = (60, 60)
+    fits.PrimaryHDU(np.zeros((60, 60), dtype=np.float32), header=w.to_header()).writeto(
+        corpus / "bad.fit", overwrite=True)
+    names.append("bad.fit")
+    sel = runner.resolve_selection(corpus, names)
+    cfg = runner.build_pinned_config(info.snapshot, info.nx, info.ny)
+    cfg.temporary_work_dir = str(corpus)  # non-empty temp dir
+    pf = runner.preflight(corpus, sel, info, cfg)
+    assert pf.report["rejected_wcs"] == 1
+    detail = pf.report["rejected_wcs_detail"][0]
+    assert detail["basename"] == "bad.fit"
+    assert str(corpus) not in json.dumps(pf.report)
+
+
+def test_report_write_failure_returns_nonzero_and_no_pass(tmp_path, monkeypatch, capsys):
+    ids = ["a.fit", "b.fit"]
+    base = _write_baseline(tmp_path / "base", ids)
+    inp = _write_input(tmp_path / "in", ids)
+    out = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "preflight",
+                        lambda *a, **k: runner.PreflightResult("PASS", {"verdict": "PASS"}))
+    monkeypatch.setattr(runner, "_call_run_zegrid_mode", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "verify_outputs",
+                        lambda *a, **k: {"verdict": "PASS", "passes": [{"pass_ok": True,
+                                         "artifact_exists": True}], "failures": []})
+
+    def _boom(path, payload):
+        raise OSError("simulated disk-full")
+
+    monkeypatch.setattr(runner, "_atomic_write_json", _boom)
+    rc = runner.main(_main_args(tmp_path, base, inp, out) + ["--execute"])
+    captured = capsys.readouterr()
+    assert rc == runner._EXIT_ERROR
+    assert "VERIFICATION PASS" not in (captured.out + captured.err)
+    assert not (out / runner.REPORT_NAME).exists()
+
+
+# --- multi-pass helpers ----------------------------------------------------
+
+def _write_min_baseline_info(dirpath, frame_ids, nx=2, ny=2):
+    base = _write_baseline(dirpath, frame_ids, nx=nx, ny=ny, width=600, height=600)
+    return runner.load_baseline(base)
+
+
+def _fabricate_pass(pass_dir, src_artifact, frame_ids, src_manifest):
+    bgd = runner._load_bgd()
+    payload = json.loads(pathlib.Path(src_artifact).read_text())
+    payload["provenance"]["capture"]["n_source_frames"] = len(frame_ids)
+    data = bgd.dumps(payload).encode("utf-8")
+    pass_dir.mkdir(parents=True, exist_ok=True)
+    (pass_dir / runner.CAPTURE_ARTIFACT_BASENAME).write_bytes(data)
+    man = json.loads(pathlib.Path(src_manifest).read_text())
+    man["frame_ids"] = list(frame_ids)
+    man["n_frames"] = len(frame_ids)
+    cap = dict(man["cell_feather"]["r37_diagnostic_capture"])
+    cap.update({
+        "filename": runner.CAPTURE_ARTIFACT_BASENAME,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+    })
+    man["cell_feather"]["r37_diagnostic_capture"] = cap
+    (pass_dir / runner.MANIFEST_NAME).write_text(json.dumps(man))
+
+
+def _make_two_pass(tmp_path, tiny_baseline, eq_ids, altz_ids):
+    info = runner.load_baseline(tiny_baseline["base"])
+    out = tmp_path / "out"
+    src_art = tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME
+    src_man = tiny_baseline["base"] / runner.MANIFEST_NAME
+    _fabricate_pass(out / "grid_EQ", src_art, eq_ids, src_man)
+    _fabricate_pass(out / "grid_ALTZ", src_art, altz_ids, src_man)
+    sel = runner.resolve_selection(
+        tiny_baseline["inp"], ["f0.fit", "f1.fit", "f2.fit", "f3.fit"])
+    return info, out, sel
+
+
+def test_verify_outputs_valid_two_pass(tmp_path, tiny_baseline):
+    info, out, sel = _make_two_pass(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"],
+                                    ["f2.fit", "f3.fit"])
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "PASS", ver["failures"]
+    assert ver["multi_pass"] is True
+    assert ver["selection_accounting"]["pass_frame_sets_disjoint"] is True
+    assert ver["selection_accounting"]["union_matches_selection_digest"] is True
+
+
+def test_verify_outputs_two_pass_missing_frames_fails(tmp_path, tiny_baseline):
+    info, out, sel = _make_two_pass(tmp_path, tiny_baseline, ["f0.fit"], ["f1.fit"])
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("union_matches_selection" in f for f in ver["failures"])
+
+
+def test_verify_outputs_two_pass_extra_frame_fails(tmp_path, tiny_baseline):
+    info, out, sel = _make_two_pass(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"],
+                                    ["f2.fit", "f3.fit", "ghost.fit"])
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+
+
+def test_verify_outputs_two_pass_duplicate_frame_fails(tmp_path, tiny_baseline):
+    info, out, sel = _make_two_pass(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"],
+                                    ["f1.fit", "f2.fit"])
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert ver["selection_accounting"]["pass_frame_sets_disjoint"] is False
+
+
+def test_verify_outputs_two_pass_tampered_fails(tmp_path, tiny_baseline):
+    info, out, sel = _make_two_pass(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"],
+                                    ["f2.fit", "f3.fit"])
+    man_path = out / "grid_ALTZ" / runner.MANIFEST_NAME
+    man = json.loads(man_path.read_text())
+    man["cell_feather"]["r37_diagnostic_capture"]["sha256"] = "0" * 64
+    man_path.write_text(json.dumps(man))
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+
+
+def test_verify_outputs_unknown_pass_dir_fails(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    out = tmp_path / "out"
+    _fabricate_pass(out / "grid_EQ",
+                    tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f0.fit", "f1.fit"],
+                    tiny_baseline["base"] / runner.MANIFEST_NAME)
+    unknown = out / "grid_XYZ"
+    unknown.mkdir(parents=True)
+    (unknown / runner.MANIFEST_NAME).write_text(
+        (tiny_baseline["base"] / runner.MANIFEST_NAME).read_text())
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert any("unknown pass dir" in f for f in ver["failures"])
+
+
+def test_git_head_relative_gitdir(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    real = tmp_path / "realgit"
+    real.mkdir()
+    (real / "HEAD").write_text("abc123\n")
+    (wt / ".git").write_text("gitdir: ../realgit\n")
+    assert runner._git_head(wt) == "abc123"
+
+
+def test_git_head_absolute_gitdir(tmp_path):
+    wt = tmp_path / "wt2"
+    wt.mkdir()
+    real = tmp_path / "realgit2"
+    real.mkdir()
+    (real / "HEAD").write_text("def456\n")
+    (wt / ".git").write_text(f"gitdir: {real}\n")
+    assert runner._git_head(wt) == "def456"

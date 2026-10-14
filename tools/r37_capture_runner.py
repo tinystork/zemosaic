@@ -25,11 +25,15 @@ SAFETY MODEL (read this)
 * ``--execute`` additionally refuses unless the output dir is a **new/empty**
   destination that cannot overwrite the input or the baseline run (no equality,
   no containment either way).
-* ``--execute`` refuses on a FAILED memory preflight. There is deliberately NO
-  ``--force-infeasible``: forcing a pinned layout that cannot fit only invites
-  swap-thrash/OOM. (If you truly need to bypass the preflight you may pass
-  ``--skip-memory-preflight`` explicitly and loudly, but nothing forces an
-  infeasible execution.)
+* ``--execute`` REQUIRES a successful real memory preflight. ``--force-infeasible``
+  does not exist by design (forcing an infeasible pinned layout only invites
+  swap-thrash/OOM), and ``--skip-memory-preflight --execute`` is refused BEFORE
+  any engine work. ``--skip-memory-preflight`` is a metadata/selection inspection
+  dry-run only: it reports ``preflight SKIPPED`` (never ``PASS``) and never
+  executes.
+* Multi-pass runs (mount-segregated ``grid_EQ`` / ``grid_ALTZ``) are verified as a
+  whole: every pass must be internally consistent, the pass frame sets must be
+  disjoint, and their union must equal the exact selected frame set.
 * No shell interpolation, no hidden subprocess, no GUI/config activation, no
   correction application. It calls ``run_zegrid_mode`` directly with explicit
   parameters and the explicit, default-OFF ``r37_diagnostic_capture=True`` seam.
@@ -233,6 +237,16 @@ def _as_posix(value: str) -> str:
     return str(value).strip().replace("\\", "/")
 
 
+#: Windows drive-absolute syntax (``C:/`` or ``C:\``) after separator
+#: normalisation. A relative name that merely CONTAINS a colon (e.g.
+#: ``a:b.fit`` or ``C:foo``) is NOT drive-absolute and stays allowed.
+_DRIVE_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _is_drive_absolute(norm: str) -> bool:
+    return bool(_DRIVE_ABSOLUTE_RE.match(norm))
+
+
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -248,7 +262,12 @@ def _git_head(repo_root: Path) -> str | None:
         if git.is_file():  # worktree / submodule pointer file
             text = git.read_text(encoding="utf-8").strip()
             if text.lower().startswith("gitdir:"):
-                git = Path(text.split(":", 1)[1].strip())
+                target = Path(text.split(":", 1)[1].strip())
+                # A relative gitdir is relative to the worktree root (the
+                # directory CONTAINING the .git pointer file), not the CWD.
+                if not target.is_absolute():
+                    target = git.parent / target
+                git = target
         head = (git / "HEAD").read_text(encoding="utf-8").strip()
         if head.startswith("ref:"):
             ref = head.split(" ", 1)[1].strip()
@@ -453,8 +472,16 @@ def resolve_selection(input_dir: str | os.PathLike[str],
             problems.append(f"frame_ids[{idx}]: empty id")
             continue
         pp = PurePosixPath(norm)
-        if norm.startswith("/") or pp.is_absolute():
-            problems.append(f"frame_id {raw!r}: absolute paths are not allowed")
+        if _is_drive_absolute(norm):
+            problems.append(
+                f"frame_id {raw!r}: drive-absolute paths (e.g. 'C:\\path' or "
+                "'C:/path') are not allowed"
+            )
+            continue
+        if norm.startswith("/") or norm.startswith("//") or pp.is_absolute():
+            problems.append(
+                f"frame_id {raw!r}: POSIX-absolute/UNC paths are not allowed"
+            )
             continue
         if any(part == ".." for part in pp.parts):
             problems.append(f"frame_id {raw!r}: path traversal ('..') is not allowed")
@@ -807,7 +834,11 @@ def preflight(
         "candidate_frames": len(frames_info),
         "descriptors_built": len(descs),
         "rejected_wcs": len(rejected),
-        "rejected_wcs_detail": list(rejected[:20]),
+        # Basename-only: never persist a private absolute source path.
+        "rejected_wcs_detail": [
+            {"basename": Path(str(r.get("path", ""))).name, "reason": r.get("reason")}
+            for r in list(rejected[:20])
+        ],
         "sip_mode": sip_mode,
         "canvas": {
             "width": int(canvas.width),
@@ -912,7 +943,14 @@ def verify_outputs(
     baseline: BaselineInfo,
     selection: SelectionResolution,
 ) -> dict:
-    """Strict-load artifact+manifest and verify full linkage/identity/frame facts."""
+    """Strict-load artifact+manifest and verify full linkage/identity/frame facts.
+
+    Multi-pass aware: mount-segregated ``grid_EQ`` / ``grid_ALTZ`` pass dirs are
+    verified individually (each internally consistent, artifact source count ==
+    that pass's frame count) AND as a whole (pass frame sets disjoint, their union
+    == the exact selected frame set). Exact/capped/qualification truth is derived
+    independently from the strict-loaded artifact, not from manifest claims.
+    """
     bgd = _load_bgd()
     if CAPTURE_ARTIFACT_BASENAME != bgd.CAPTURE_ARTIFACT_BASENAME:  # pragma: no cover
         raise RunnerError(
@@ -920,43 +958,79 @@ def verify_outputs(
             f"{CAPTURE_ARTIFACT_BASENAME!r} but the engine declares "
             f"{bgd.CAPTURE_ARTIFACT_BASENAME!r}"
         )
-    passes: list[dict] = []
+    q_exact = str(bgd.QUALIFICATION_EXACT)
+    q_capped = str(bgd.QUALIFICATION_RESEARCH_ONLY_CAPPED)
+
     failures: list[str] = []
+    passes: list[dict] = []
+
+    # Unknown pass dir == a sub-directory carrying a manifest that is NOT one of
+    # the known mount-pass names. Never silently accept it.
+    try:
+        for child in sorted(p for p in output_dir.iterdir() if p.is_dir()):
+            if child.name in MOUNT_PASS_DIRS:
+                continue
+            if (child / MANIFEST_NAME).is_file():
+                failures.append(f"unknown pass dir with manifest: {child.name}")
+    except OSError:
+        pass
+
+    pass_sets: list[set] = []
     for run_dir in _iter_run_dirs(output_dir):
         manifest_path = run_dir / MANIFEST_NAME
         if not manifest_path.is_file():
             continue
         manifest = load_json_strict(manifest_path)
-        cap = None
-        try:
-            cap = manifest["cell_feather"]["r37_diagnostic_capture"]
-        except Exception:
-            cap = None
+        frame_ids_raw = [str(f) for f in (manifest.get("frame_ids") or [])]
+        pass_basenames = [Path(f).name for f in frame_ids_raw]
+        pass_set = set(pass_basenames)
+        pass_sets.append(pass_set)
         artifact_path = run_dir / bgd.CAPTURE_ARTIFACT_BASENAME
         entry: dict = {
             "pass_dir": run_dir.name,
             "artifact_basename": artifact_path.name,
             "artifact_exists": artifact_path.is_file(),
+            "pass_frame_count": len(pass_set),
+            "manifest_n_frames": manifest.get("n_frames"),
         }
         checks: dict[str, bool] = {}
+        try:
+            cap = manifest["cell_feather"]["r37_diagnostic_capture"]
+        except Exception:
+            cap = None
         if cap is None:
             failures.append(f"{run_dir.name}: manifest has no r37_diagnostic_capture block")
             checks["manifest_capture_block"] = False
         else:
             checks["manifest_capture_block"] = True
 
+        checks["pass_frames_unique"] = len(frame_ids_raw) == len(pass_set)
+        checks["pass_n_frames_consistent"] = (
+            _is_int(manifest.get("n_frames")) and int(manifest["n_frames"]) == len(pass_set)
+        )
+        if not checks["pass_frames_unique"]:
+            failures.append(f"{run_dir.name}: duplicate frame_ids within the pass")
+        if not checks["pass_n_frames_consistent"]:
+            failures.append(
+                f"{run_dir.name}: manifest n_frames != unique frame_ids count"
+            )
+
         if not artifact_path.is_file():
             failures.append(f"{run_dir.name}: capture artifact missing ({artifact_path.name})")
+            checks["artifact_exists"] = False
             entry["checks"] = checks
+            entry["pass_ok"] = False
             passes.append(entry)
             continue
+        checks["artifact_exists"] = True
 
         try:
             artifact = bgd.load_file(artifact_path)
         except Exception as exc:
             failures.append(f"{run_dir.name}: artifact failed strict load ({exc})")
-            entry["checks"] = checks
             checks["artifact_strict_load"] = False
+            entry["checks"] = checks
+            entry["pass_ok"] = False
             passes.append(entry)
             continue
         checks["artifact_strict_load"] = True
@@ -964,15 +1038,25 @@ def verify_outputs(
         disk_digest, disk_bytes = _sha256_file(artifact_path)
         prov = dict(artifact.provenance)
         capture_block = dict(prov.get("capture") or {})
+
+        # --- artifact-DERIVED truth (independent of manifest claims) ---------
+        art_capped = bool(artifact.heldout_capped)
+        art_exact = bool(artifact.heldout_exact())
+        art_qualification = q_capped if art_capped else q_exact
+        art_source_count = capture_block.get("n_source_frames")
+
         entry.update({
             "capture_id": capture_block.get("capture_id"),
             "run_label": capture_block.get("run_label"),
-            "n_source_frames": capture_block.get("n_source_frames"),
+            "n_source_frames": art_source_count,
             "sha256": disk_digest,
             "bytes": disk_bytes,
-            "qualification": (cap or {}).get("qualification"),
-            "heldout_capped": (cap or {}).get("holdout_capped"),
-            "heldout_exact": (cap or {}).get("holdout_exact"),
+            "artifact_qualification": art_qualification,
+            "artifact_heldout_capped": art_capped,
+            "artifact_heldout_exact": art_exact,
+            "manifest_qualification": (cap or {}).get("qualification"),
+            "manifest_heldout_capped": (cap or {}).get("holdout_capped"),
+            "manifest_heldout_exact": (cap or {}).get("holdout_exact"),
             "n_relations": len(artifact.observations),
             "n_dropped": len(artifact.dropped),
             "artifact_meta_nx": int(artifact.meta["nx"]),
@@ -983,11 +1067,12 @@ def verify_outputs(
             "correction_applied": prov.get("correction_applied"),
         })
 
+        # --- linkage: feed ARTIFACT/DISK-derived values, never manifest copies --
         linkage_meta = {
             "capture_id": capture_block.get("capture_id"),
             "filename": artifact_path.name,
-            "sha256": (cap or {}).get("sha256"),
-            "bytes": (cap or {}).get("bytes"),
+            "sha256": disk_digest,
+            "bytes": disk_bytes,
         }
         checks["manifest_links_artifact"] = bool(
             bgd.manifest_links_artifact(linkage_meta, cap)
@@ -1016,13 +1101,21 @@ def verify_outputs(
         checks["manifest_gauge_per_cell"] = (
             manifest.get("photometric_gauge", {}).get("mode") == CELL_GAUGE_MODE_PER_CELL
         )
-        checks["manifest_frame_count"] = int(manifest.get("n_frames", -1)) == selection.count
-        checks["artifact_source_frame_count"] = (
-            int(capture_block.get("n_source_frames", -1)) == selection.count
+        checks["artifact_source_count_matches_pass"] = (
+            _is_int(art_source_count) and int(art_source_count) == len(pass_set)
         )
-        checks["manifest_frame_set_matches_selection"] = (
-            _digest_names([Path(str(f)).name for f in (manifest.get("frame_ids") or [])])
-            == selection.digest
+        # artifact-derived qualification vs manifest claims (all three)
+        checks["artifact_qualification_matches_manifest"] = (
+            (cap or {}).get("qualification") == art_qualification
+        )
+        checks["artifact_heldout_capped_matches_manifest"] = (
+            (cap or {}).get("holdout_capped") == art_capped
+        )
+        checks["artifact_heldout_exact_matches_manifest"] = (
+            (cap or {}).get("holdout_exact") == art_exact
+        )
+        checks["manifest_qualification_consistent"] = (
+            (cap or {}).get("qualification") == (q_capped if (cap or {}).get("holdout_capped") else q_exact)
         )
 
         for key, val in checks.items():
@@ -1034,8 +1127,64 @@ def verify_outputs(
 
     if not passes:
         failures.append("no zegrid_manifest.json found under the output dir")
-    verdict = "PASS" if (passes and not failures and all(p.get("pass_ok") for p in passes)) else "FAIL"
-    return {"verdict": verdict, "passes": passes, "failures": failures}
+        return {"verdict": "FAIL", "passes": [], "failures": failures, "multi_pass": False}
+
+    multi_pass = len(passes) > 1
+    union: set = set()
+    disjoint = True
+    for s in pass_sets:
+        if union & s:
+            disjoint = False
+        union |= s
+    if multi_pass:
+        accounting = {
+            "pass_frame_sets_disjoint": disjoint,
+            "union_matches_selection_count": len(union) == selection.count,
+            "union_matches_selection_digest": _digest_names(union) == selection.digest,
+        }
+    else:
+        accounting = {
+            "single_pass_matches_selection_count": len(union) == selection.count,
+            "single_pass_matches_selection_digest": _digest_names(union) == selection.digest,
+        }
+    for key, val in accounting.items():
+        if not val:
+            failures.append(f"selection accounting: check failed: {key}")
+
+    verdict = "PASS" if (not failures and all(p.get("pass_ok") for p in passes)) else "FAIL"
+    return {
+        "verdict": verdict,
+        "passes": passes,
+        "failures": failures,
+        "multi_pass": multi_pass,
+        "selection_accounting": accounting,
+        "union_frame_count": len(union),
+    }
+
+
+def _scrub_absolute_paths(obj: Any) -> Any:
+    """Recursively replace absolute-path-looking strings with their basename.
+
+    Defense-in-depth at the durable-report boundary: the runner may use real
+    absolute paths during execution, but the persisted verification report must
+    carry only non-sensitive basename/count/digest/boolean facts.
+    """
+    if isinstance(obj, str):
+        if re.match(r"^(/|[A-Za-z]:[\\/]|\\\\)", obj):
+            try:
+                # Backslashes are not separators on POSIX; normalise first.
+                base = PurePosixPath(obj.replace("\\", "/")).name
+            except Exception:
+                base = ""
+            return base or "<abs-path>"
+        return obj
+    if isinstance(obj, list):
+        return [_scrub_absolute_paths(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_scrub_absolute_paths(v) for v in obj]
+    if isinstance(obj, Mapping):
+        return {k: _scrub_absolute_paths(v) for k, v in obj.items()}
+    return obj
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1070,10 +1219,26 @@ def build_verification_report(
     holdout_cap: int,
     gpu_mode: str,
 ) -> dict:
-    """Compact verification report — basenames/counts/digests only (no private abs paths)."""
+    """Compact verification report — basenames/counts/digests only (no private abs paths).
+
+    The exact/capped/qualification facts come from the artifact-DERIVED truth on
+    the verification entries, never from manifest claims. Absolute paths are
+    scrubbed at this durable-report boundary.
+    """
     artifact = None
+    pass_summaries = []
     for p in verification.get("passes", ()):
-        if p.get("artifact_exists"):
+        pass_summaries.append({
+            "pass_dir": p.get("pass_dir"),
+            "frames": p.get("pass_frame_count"),
+            "artifact_exists": bool(p.get("artifact_exists")),
+            "artifact_sha256": p.get("sha256"),
+            "artifact_bytes": p.get("bytes"),
+            "artifact_qualification": p.get("artifact_qualification"),
+            "artifact_heldout_exact": p.get("artifact_heldout_exact"),
+            "pass_ok": bool(p.get("pass_ok")),
+        })
+        if artifact is None and p.get("artifact_exists"):
             artifact = {
                 "pass_dir": p.get("pass_dir"),
                 "basename": p.get("artifact_basename"),
@@ -1084,16 +1249,16 @@ def build_verification_report(
                 "n_source_frames": p.get("n_source_frames"),
                 "n_relations": p.get("n_relations"),
                 "n_dropped": p.get("n_dropped"),
-                "qualification": p.get("qualification"),
-                "heldout_capped": p.get("heldout_capped"),
-                "heldout_exact": p.get("heldout_exact"),
+                # artifact-DERIVED truth:
+                "qualification": p.get("artifact_qualification"),
+                "heldout_capped": p.get("artifact_heldout_capped"),
+                "heldout_exact": p.get("artifact_heldout_exact"),
                 "capture_stage": p.get("capture_stage"),
                 "mission": p.get("mission"),
                 "production_wired": p.get("production_wired"),
                 "correction_applied": p.get("correction_applied"),
             }
-            break
-    return {
+    report = {
         "schema": VERIFICATION_SCHEMA,
         "version": VERIFICATION_VERSION,
         "mission": "ZM-ZEGRID-R37-E",
@@ -1103,6 +1268,7 @@ def build_verification_report(
         "repo_head": _git_head(_repo_root()),
         "verification_verdict": verification.get("verdict"),
         "exact_heldout": bool(artifact and artifact.get("heldout_exact")),
+        "multi_pass": bool(verification.get("multi_pass")),
         "command_parameters": {
             "input_dir_basename": invocation.input_dir.name,
             "baseline_run_dir_name": baseline.run_dir.name,
@@ -1117,13 +1283,17 @@ def build_verification_report(
         "invocation_parameters": dict(invocation.params_report),
         "preflight": dict(preflight_report) if preflight_report is not None else {"skipped": True},
         "artifact": artifact,
+        "passes": pass_summaries,
+        "selection_accounting": dict(verification.get("selection_accounting") or {}),
         "linkage": {
             "verdict": verification.get("verdict"),
-            "passes": verification.get("passes"),
-            "failures": list(verification.get("failures") or []),
+            "failure_count": len(list(verification.get("failures") or [])),
         },
         "failures": list(verification.get("failures") or []),
     }
+    # Durable-report boundary: strip any absolute-path-looking string that slipped
+    # through (private source/temp/output paths must never be persisted).
+    return _scrub_absolute_paths(report)
 
 
 # ---------------------------------------------------------------------------
@@ -1162,7 +1332,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--execute", action="store_true",
                         help="perform the real capture (required for any write/full run)")
     parser.add_argument("--skip-memory-preflight", action="store_true",
-                        help="LOUD: skip the real memory preflight (unsafe on a weak host)")
+                        help=("inspection dry-run ONLY: skip the real memory preflight "
+                              "and report 'preflight SKIPPED' (never PASS). Refused with "
+                              "--execute."))
     return parser
 
 
@@ -1219,18 +1391,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     _print_block("EFFECTIVE INVOCATION PARAMETERS", invocation.params_report)
 
     preflight_report: dict | None = None
+    preflight_verdict = "SKIPPED"
+
+    # M1 (hard memory-safety contract): --execute REQUIRES a real successful
+    # preflight. Skipping it is an inspection-only affordance and is refused
+    # before ANY engine work — it is not a force-infeasible escape hatch.
+    if args.skip_memory_preflight and args.execute:
+        print(
+            "[r37-runner] REFUSED: --skip-memory-preflight cannot be combined with "
+            "--execute. A real memory preflight is REQUIRED before any engine work "
+            "(no --force-infeasible escape hatch by design).",
+            file=sys.stderr, flush=True,
+        )
+        return _EXIT_PREFLIGHT_FAIL
+
     if args.skip_memory_preflight:
         print(
             "[r37-runner] WARNING: --skip-memory-preflight given — the real memory "
-            "preflight is SKIPPED. On an undersized host the pinned layout may "
-            "swap-thrash or OOM. Proceeding only because you asked explicitly.",
+            "preflight is SKIPPED (inspection dry-run only; NO execution). The pinned "
+            "layout's feasibility is NOT established on this host.",
             file=sys.stderr, flush=True,
         )
+        preflight_report = {"verdict": "SKIPPED", "skipped": True}
+        preflight_verdict = "SKIPPED"
     else:
         print("[r37-runner] running memory/capability preflight (no stacking, no writes)…",
               flush=True)
         pf = preflight(args.input_dir, selection, baseline, cfg, progress=_console_progress)
         preflight_report = pf.report
+        preflight_verdict = pf.verdict
         _print_block("PREFLIGHT", preflight_report)
         if not pf.ok:
             print(
@@ -1248,16 +1437,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not args.execute:
         print(
-            "[r37-runner] DRY-RUN complete: preflight PASS, nothing written. "
-            "Re-run with --execute to perform the capture.",
+            f"[r37-runner] DRY-RUN complete: preflight {preflight_verdict}, nothing "
+            "written. Re-run with --execute to perform the capture.",
             flush=True,
         )
         return _EXIT_OK
 
-    # --- execute -----------------------------------------------------------
-    if not preflight_report and not args.skip_memory_preflight:  # pragma: no cover
-        return _EXIT_PREFLIGHT_FAIL
-
+    # --- execute (a real preflight PASS is guaranteed above) ----------------
     print(f"[r37-runner] EXECUTE → {out_dir}", flush=True)
     try:
         _call_run_zegrid_mode(
@@ -1277,12 +1463,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         pinned_layout=f"{baseline.nx}x{baseline.ny}", holdout_cap=args.holdout_cap,
         gpu_mode=args.gpu,
     )
+    # M5: the durable verification report is part of the contract — a failed
+    # atomic write is a failure, and must never be followed by a PASS claim.
     try:
         _atomic_write_json(out_dir / REPORT_NAME, report)
         print(f"[r37-runner] wrote {REPORT_NAME}", flush=True)
     except Exception as exc:  # noqa: BLE001
-        print(f"[r37-runner] could not write verification report: {exc}",
-              file=sys.stderr, flush=True)
+        print(
+            f"[r37-runner] FAILED to write verification report {REPORT_NAME}: {exc} "
+            "— aborting (nonzero).",
+            file=sys.stderr, flush=True,
+        )
+        return _EXIT_ERROR
 
     if verification.get("verdict") != "PASS":
         print("[r37-runner] POST-RUN VERIFICATION FAILED:", file=sys.stderr, flush=True)
