@@ -168,14 +168,45 @@ ne jamais appeler cette dernière option une réparation du FITS science.
 ## 8. État et prochaine action
 
 Réalisé : inspection du code et des preuves R33/R37 ; ce plan uniquement.
-R38-A implémenté (harness + tests + note `R38_A_CAUSAL_PROBE.md`) et exécuté sur
-l'artefact Windows 816 exact dans les limites bornées de l'hôte ; rework-1 (revue
-Nono) : conclusion au niveau relation, assainissement des sorties durables,
-résolveur fail-closed, fidélité des facteurs, liaison du cache. Voir
-`.a2a-reports/ZM-ZEGRID-R38-A-CAUSAL.coco.r1.md`. Aucun changement production,
-aucune correction, aucun câblage.
+R38-A implémenté (harness + tests + note `R38_A_CAUSAL_PROBE.md`), puis R38-A
+**exécuté sur le panneau DEV figé complet** contre l'artefact Windows 816 exact
+(HEAD `beta` `ff3803b3`). Détail et résultats : §7 de `R38_A_CAUSAL_PROBE.md` et
+rapport `.a2a-reports/ZM-ZEGRID-R38-A-CAUSAL.extended-full-result.md`. Aucun
+changement production, aucune correction, aucun câblage.
 
-Prochain lot recommandé : R38-A est soumis à la revue Junior/Nono. R38-B reste
-interdit tant que le diagnostic A n'établit pas un mécanisme précis et que les
-cellules `NOT_RUN` (restack complet) ne sont pas exécutées sur un hôte capable.
-Aucun changement aux FITS utilisateur, aucun run lourd, commit local autorisé.
+Résultat final R38-A (vérifié sur l'artefact strict-JSON) :
+
+- artefact `r38a_factors_extended_full.json` : 1 168 958 octets, sha256
+  `218187eb1ebb3bf806735cf160fca1580472b164acf0e411af137934bb2685e0` ;
+- `status = PASS` (technique : toutes les relations prévues exécutées),
+  `qualification = DEV_NOT_QUALIFICATION`, `scientific_acceptance = false`,
+  `r38b_authorized = false`, `conclusion = PARTIAL_CAUSE` ;
+- 6/6 relations du panneau exécutées, deux orientations ; 5/6 qualifient un
+  mécanisme de **niveau additif quasi constant par cellule** (ratio jauge/observé
+  entre 0,994589 et 1,002271) ; seul le contrôle vertical à très faible pas observé
+  (~0,44/0,66/2,11 ADU, cohérence MAD/pas 1,63–3,23) ne qualifie pas ;
+- aucun `NOT_RUN`, fuites de chemins privés = 0 ; déterminisme = aller-retour JSON
+  dans le même processus, **pas** une répétition indépendante sur données réelles ;
+- le `PASS` technique n'est **pas** une acceptation scientifique.
+
+Note : la règle gelée du harness (§4.7 de la note R38-A) distingue quatre états ;
+le résultat est `PARTIAL_CAUSE` — mécanisme qualifié sur 5/6 relations dans les deux
+orientations, mais aucune preuve de dominance (indisponible dans un harness borné).
+
+Décision : **R38 est CLOS — arrêté à Gate A.**
+
+- R38-B/C/D/E = **NOT_RUN / NON AUTORISÉS** : non exécutés, et ce résultat ne les
+  ouvre pas. Aucune reprise automatique vers R38-B.
+- Le mécanisme mesuré est un niveau additif par cellule **avant** offset, déjà
+  estimé/retiré par le graphe accepté R34c ; il n'explique pas le **résidu spatial
+  POST-OFFSET / POST-FEATHER** et n'autorise donc pas un solveur de calibration
+  partagé (R38-B).
+
+Prochain lot recommandé — un **nouveau diagnostic pré-enregistré** (données de
+validation indépendantes) ciblant directement le résidu spatial post-offset :
+constant vs pente/courbure, biais d'estimation d'offset vs structure de ciel,
+support/géométrie/taper, à plusieurs distances et dans les deux orientations.
+
+Aucun changement de comportement produit/runtime/défaut/GUI/FITS dans R38-A.
+Aucun changement aux FITS utilisateur, aucun run lourd. Ce lot est
+**documentation seulement** : aucun commit/push, diff de travail laissé pour revue.

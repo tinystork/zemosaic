@@ -2,7 +2,8 @@
 
 **Mission:** ZM-ZEGRID-R38-A-CAUSAL · **Phase:** implementation
 **Baseline:** `beta` @ `e13d52d7ebc80ef40b1aa9d64681aefa79bffe4e` (R38 plan committed).
-**Status:** IMPLEMENTED. New standalone offline tool + focused tests + this note.
+**Final execution HEAD:** `beta` @ `ff3803b303864cac854d0bad756eada42da79f38`.
+**Status:** IMPLEMENTED and EXECUTED on the full frozen DEV panel; **R38-A is CLOSED at Gate A** (§7).
 **No** production wiring, default, config, GUI, manifest or FITS change.
 
 Authoritative architecture/gates: `R38_LAYOUT_INDEPENDENT_CALIBRATION_PLAN.md`.
@@ -251,3 +252,87 @@ JSON / digest / identity / ROI / conclusion unit tests from r0.
   bounded and reports `NOT_RUN` instead of approximating.
 * Not a qualification corpus: the panel is biased DEV and the R37 held-out has
   already been consumed for the R37 model decision.
+
+---
+
+## 7. Gate-A outcome — final full frozen DEV panel (R38-A closed)
+
+This section records the FINAL R38-A execution and closes the diagnostic at Gate A.
+It supersedes any earlier "pending / to be rerun" wording: there is no remaining
+`NOT_RUN` relation and no outstanding step that would authorize R38-B.
+
+### 7.1 Execution facts (independently verified)
+
+* The complete frozen R38-A DEV panel ran over the exact Windows-816 R37E capture and
+  the read-only original 816 IRCUT source frames.
+* **6/6** panel relations executed, covering **both** orientations (`h` and `v`);
+  `executed_fraction = 1.0`; **no** relation is `NOT_RUN` (`not_run[0].relations = []`).
+* Durable artifact `r38a_factors_extended_full.json`: **1,168,958 bytes**, sha256
+  `218187eb1ebb3bf806735cf160fca1580472b164acf0e411af137934bb2685e0`.
+* Recorded `repo_head`: `ff3803b303864cac854d0bad756eada42da79f38`.
+* Top-level `status = PASS` with `status_reason = "every planned relation executed"`.
+* `runtime.seconds = 875.233`, `runtime.peak_rss_kib = 3,907,984`.
+* `privacy.leaks = 0` (recursive boundary scan after known-root scrub).
+* `evidence_scope`: `kind = diagnostic_dev_bounded`, `correction_applied = false`,
+  `panel_relations_total = 6`, `relations_executed = 6`, `r37_heldout_consumed = true`.
+* Determinism: `same_process_json_roundtrip_recompute`, `roundtrip_equivalent = true`,
+  `independent_real_data_repeat = false` — this is **not** an independent real-data rerun.
+
+### 7.2 Technical PASS vs scientific acceptance
+
+These are different things and must not be conflated:
+
+* `status = PASS` is a **technical** fact: the harness ran every planned relation and
+  emitted a valid, strict-JSON, privacy-clean artifact.
+* `qualification = DEV_NOT_QUALIFICATION`: the panel is a biased DEV diagnostic frozen
+  before the results; it is not a qualification corpus.
+* `scientific_acceptance = false` and `r38b_authorized = false`: no scientific claim is
+  accepted by this run and no follow-up lot is authorized by it.
+
+### 7.3 Conclusion and coverage
+
+The pre-registered relation-level rule (§4.7) yields `conclusion.state = PARTIAL_CAUSE`:
+**5 of 6** relations qualify a stable, near-constant local-gauge additive level
+mechanism, across **both** orientations (gauge-step / observed ratio, per channel):
+
+| relation | orientation | ratio |
+|---|---|---|
+| `r0003c0000|r0003c0001` | h | 0.999995–1.002271 |
+| `r0001c0005|r0002c0005` | v | 0.994589–0.997655 |
+| `r0003c0002|r0003c0003` | h (declared worst) | 0.999258–0.999496 |
+| `r0000c0001|r0000c0002` | h (median burden) | 1.000713–1.001538 |
+| `r0002c0004|r0002c0005` | h (high burden) | 1.000121–1.000305 |
+
+The sole non-qualifying relation is the **minimum-burden vertical control**
+`r0002c0000|r0003c0000`: its absolute observed pair step is nearly zero
+(about **0.44 / 0.66 / 2.11 ADU**) and its MAD-to-step consistency is **1.63–3.23**, so
+its ratio is not stable. Qualifying ratios span **0.994589–1.002271**.
+`DOMINANT_CAUSE_CONFIRMED` is unreachable in this bounded harness (no pre-registered
+restack-dominance criterion exists), so `PARTIAL_CAUSE` is the honest maximum here.
+
+### 7.4 Why this does not authorize R38-B
+
+* The measured mechanism is an almost **constant per-Cell additive level step** applied
+  *before* offset. The accepted R34c graph already **estimates and removes additive Cell
+  offsets**, so a new shared photometric calibration solver risks replacing an
+  already-handled level term.
+* This result does **not** explain the unresolved **POST-OFFSET, POST-FEATHER spatial
+  residual** (the original inter-Cell disagreement); no dominant cause is demonstrated.
+* Consequently `r38b_authorized = false`: R38-B is not scientifically justified by R38-A.
+
+### 7.5 Closure at Gate A and next research question
+
+* **R38 is CLOSED / STOPPED at Gate A.** B/C/D/E are **NOT_RUN / NOT_AUTHORIZED**, not
+  "pending": they were not executed, and this evidence does not open them. Any future
+  effort must be a **separately pre-registered diagnostic**, never an automatic
+  continuation to R38-B.
+* Next research question, to target directly: the **post-offset spatial residual** —
+  constant vs slope/curvature; offset-estimation bias vs sky structure; support /
+  geometry / taper; at **multiple distances** and in **both orientations** — evaluated
+  on independent validation data.
+
+### 7.6 No product impact
+
+R38-A is a **diagnostic only**: no product/runtime/default/GUI/manifest/FITS behavior
+was changed. No correction is applied anywhere (`correction_applied = false`); no
+`canonical_*` / Legacy / SDS code path, threshold, default or user FITS was modified.
