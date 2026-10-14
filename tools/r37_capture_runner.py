@@ -1,0 +1,1304 @@
+#!/usr/bin/env python3
+"""ZM-ZEGRID-R37-E — reproducible cross-platform R37 diagnostic-capture runner (CLI).
+
+WHY THIS EXISTS
+---------------
+The canonical R37 diagnostic capture (ZM-ZEGRID-R37-D seam) must be produced at
+the real pre-offset/pre-feather per-Cell assembly point of a *specific* baseline
+run (the accepted `R34F`: 653 selected frames out of 816, a 6x4 layout, effective
+`per_cell` gauge). Reproducing that run by hand is error-prone: the exact frame
+subset, the pinned layout, the gauge mode and the capture opt-in all have to be
+reconstructed coherently from a previous run's ``zegrid_manifest.json`` +
+``run_config_snapshot.json``.
+
+The originally capable host was a Windows machine (RTX 3070, ~16 GiB). This tool
+lets that machine — or any capable machine — reproduce the exact baseline frame
+subset/layout and produce an exact-heldout R37 artifact with ONE documented
+command, WITHOUT any GUI/config wiring.
+
+SAFETY MODEL (read this)
+------------------------
+* The tool is **dry-run by default**. Without ``--execute`` it performs the real
+  descriptor/canvas/pinned-layout memory preflight (using the SAME accepted
+  ZeGrid functions as a production run) and writes **nothing** — not in the input
+  dir, not in the baseline dir, not in the output dir.
+* ``--execute`` additionally refuses unless the output dir is a **new/empty**
+  destination that cannot overwrite the input or the baseline run (no equality,
+  no containment either way).
+* ``--execute`` refuses on a FAILED memory preflight. There is deliberately NO
+  ``--force-infeasible``: forcing a pinned layout that cannot fit only invites
+  swap-thrash/OOM. (If you truly need to bypass the preflight you may pass
+  ``--skip-memory-preflight`` explicitly and loudly, but nothing forces an
+  infeasible execution.)
+* No shell interpolation, no hidden subprocess, no GUI/config activation, no
+  correction application. It calls ``run_zegrid_mode`` directly with explicit
+  parameters and the explicit, default-OFF ``r37_diagnostic_capture=True`` seam.
+
+EXAMPLES
+--------
+bash (Linux/macOS)::
+
+    python tools/r37_capture_runner.py \\
+        --input-dir "/path/to/lights organized/EQ/IRCUT" \\
+        --baseline-run-dir "/path/to/zegrid_out/R34F" \\
+        --output-dir "/path/to/zegrid_out/R37E_CAPTURE" \\
+        --gpu auto --holdout-cap 1000000            # dry-run / preflight
+
+    python tools/r37_capture_runner.py \\
+        --input-dir "/path/to/lights organized/EQ/IRCUT" \\
+        --baseline-run-dir "/path/to/zegrid_out/R34F" \\
+        --output-dir "/path/to/zegrid_out/R37E_CAPTURE" \\
+        --gpu auto --holdout-cap 1000000 --execute  # real capture + verify
+
+PowerShell (Windows; adjust the example drives/paths to your checkout/data)::
+
+    python .\\tools\\r37_capture_runner.py `
+        --input-dir "C:\\Users\\TRISTAN\\Desktop\\astrophoto\\caldwell_11\\lights organized\\EQ\\IRCUT" `
+        --baseline-run-dir "C:\\Users\\TRISTAN\\Desktop\\astrophoto\\caldwell_11\\OUT\\R34F" `
+        --output-dir "C:\\Users\\TRISTAN\\Desktop\\astrophoto\\caldwell_11\\OUT\\R37E_CAPTURE" `
+        --gpu auto --holdout-cap 1000000
+
+    python .\\tools\\r37_capture_runner.py `
+        --input-dir "C:\\Users\\TRISTAN\\Desktop\\astrophoto\\caldwell_11\\lights organized\\EQ\\IRCUT" `
+        --baseline-run-dir "C:\\Users\\TRISTAN\\Desktop\\astrophoto\\caldwell_11\\OUT\\R34F" `
+        --output-dir "C:\\Users\\TRISTAN\\Desktop\\astrophoto\\caldwell_11\\OUT\\R37E_CAPTURE" `
+        --gpu auto --holdout-cap 1000000 --execute
+
+Exit codes: ``0`` ok, ``1`` validation/other error, ``2`` memory preflight FAIL,
+``3`` unsafe output destination.
+
+The import of this module is intentionally side-effect-free: the ZeMosaic engine
+modules are imported lazily, inside the functions that need them, so importing
+the runner never activates a capture or a run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+from typing import Any, Mapping, Sequence
+
+# ---------------------------------------------------------------------------
+# Fixed names / defaults
+# ---------------------------------------------------------------------------
+
+MANIFEST_NAME = "zegrid_manifest.json"
+SNAPSHOT_NAME = "run_config_snapshot.json"
+#: Mirror of ``zemosaic.core.zegrid.background_diagnostics.CAPTURE_ARTIFACT_BASENAME``.
+#: Cross-checked against the real constant when the diagnostic module is loaded.
+CAPTURE_ARTIFACT_BASENAME = "zegrid_r37_pre_feather.json"
+REPORT_NAME = "r37_capture_verification.json"
+VERIFICATION_SCHEMA = "zemosaic.zegrid.r37e.capture_verification"
+VERIFICATION_VERSION = 1
+
+DEFAULT_HOLDOUT_CAP = 1_000_000
+
+FITS_SUFFIXES = (".fit", ".fits")
+#: Known mount-segregated output sub-directories of a ZeGrid run.
+MOUNT_PASS_DIRS = ("grid_EQ", "grid_ALTZ")
+
+CAPTURE_MISSION = "ZM-ZEGRID-R37-D"
+CAPTURE_STAGE = "pre_offset_pre_feather"
+CELL_GAUGE_MODE_PER_CELL = "per_cell"
+
+_EXIT_OK = 0
+_EXIT_ERROR = 1
+_EXIT_PREFLIGHT_FAIL = 2
+_EXIT_UNSAFE_OUTPUT = 3
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class RunnerError(RuntimeError):
+    """Base class for runner failures (message is user-facing)."""
+
+
+class BaselineError(RunnerError):
+    """The baseline run directory / manifest / snapshot is invalid."""
+
+
+class SelectionError(RunnerError):
+    """A manifest frame_id cannot be resolved unambiguously to a source file."""
+
+
+class ConfigError(RunnerError):
+    """A reconstructed config value could not be parsed strictly."""
+
+
+class OutputSafetyError(RunnerError):
+    """The requested output destination is not a safe new/empty directory."""
+
+
+# ---------------------------------------------------------------------------
+# Lazy engine access (import side-effect freedom)
+# ---------------------------------------------------------------------------
+
+_ZEGRID_CACHE: dict[str, Any] = {}
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _ensure_src_on_path() -> None:
+    """Make a src-layout checkout importable when run as a plain script."""
+    src = _repo_root() / "src"
+    if src.is_dir():
+        s = str(src)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+
+
+def _load_zegrid():
+    """Import (once) and return ``zemosaic.zemosaic_zegrid_mode``."""
+    mod = _ZEGRID_CACHE.get("zz")
+    if mod is None:
+        _ensure_src_on_path()
+        from zemosaic import zemosaic_zegrid_mode as mod  # local import: intentional
+
+        _ZEGRID_CACHE["zz"] = mod
+    return mod
+
+
+def _load_bgd():
+    """Import (once) and return the accepted background-diagnostics module."""
+    mod = _ZEGRID_CACHE.get("bgd")
+    if mod is None:
+        _ensure_src_on_path()
+        from zemosaic.core.zegrid import background_diagnostics as mod  # local import
+
+        _ZEGRID_CACHE["bgd"] = mod
+    return mod
+
+
+# ---------------------------------------------------------------------------
+# Small pure helpers
+# ---------------------------------------------------------------------------
+
+def _reject_json_constant(name: str):
+    raise BaselineError(f"strict JSON: literal {name!r} is not allowed")
+
+
+def load_json_strict(path: Path) -> Any:
+    """Load JSON rejecting NaN/Infinity (strict, byte-honest)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh, parse_constant=_reject_json_constant)
+    except BaselineError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise BaselineError(f"{path}: invalid JSON ({exc})") from exc
+    except OSError as exc:
+        raise BaselineError(f"{path}: cannot read ({exc})") from exc
+
+
+def _sha256_file(path: Path) -> tuple[str, int]:
+    h = hashlib.sha256()
+    n = 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+            n += len(chunk)
+    return h.hexdigest(), int(n)
+
+
+def _digest_names(names: Sequence[str]) -> str:
+    h = hashlib.sha256()
+    for name in sorted({str(n) for n in names}):
+        h.update(name.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _norm_key(value: Any) -> str:
+    """Platform-aware comparison key (forward slashes + os.path.normcase)."""
+    try:
+        return os.path.normcase(str(value).replace("\\", "/"))
+    except Exception:
+        return str(value)
+
+
+def _as_posix(value: str) -> str:
+    return str(value).strip().replace("\\", "/")
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _git_head(repo_root: Path) -> str | None:
+    """Best-effort HEAD sha WITHOUT invoking a subprocess."""
+    try:
+        git = repo_root / ".git"
+        if git.is_file():  # worktree / submodule pointer file
+            text = git.read_text(encoding="utf-8").strip()
+            if text.lower().startswith("gitdir:"):
+                git = Path(text.split(":", 1)[1].strip())
+        head = (git / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            ref_file = git / ref
+            if ref_file.is_file():
+                return ref_file.read_text(encoding="utf-8").strip()
+            packed = git / "packed-refs"
+            if packed.is_file():
+                for line in packed.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith(("#", "^")):
+                        continue
+                    sha, _, name = line.partition(" ")
+                    if name.strip() == ref:
+                        return sha.strip()
+            return None
+        return head
+    except Exception:
+        return None
+
+
+def _package_version() -> str | None:
+    try:
+        _ensure_src_on_path()
+        import zemosaic  # local import
+
+        return str(getattr(zemosaic, "__version__", "")) or None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 1. Baseline reconstruction — strict manifest/snapshot load + validation
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BaselineInfo:
+    run_dir: Path
+    manifest_path: Path
+    snapshot_path: Path
+    manifest: Mapping[str, Any]
+    snapshot: Mapping[str, Any]
+    frame_ids: tuple[str, ...]
+    nx: int
+    ny: int
+    canvas_width: int
+    canvas_height: int
+    normalization: str
+    gauge_mode: str
+
+
+def _require(cond: bool, message: str) -> None:
+    if not cond:
+        raise BaselineError(message)
+
+
+def load_baseline(baseline_run_dir: str | os.PathLike[str]) -> BaselineInfo:
+    """Strictly load + validate a baseline run's manifest and config snapshot."""
+    base = Path(baseline_run_dir).expanduser()
+    _require(base.is_dir(), f"baseline run dir is not a directory: {base}")
+    manifest_path = base / MANIFEST_NAME
+    snapshot_path = base / SNAPSHOT_NAME
+    _require(manifest_path.is_file(), f"baseline manifest missing: {manifest_path}")
+    _require(snapshot_path.is_file(), f"baseline config snapshot missing: {snapshot_path}")
+
+    manifest = load_json_strict(manifest_path)
+    snapshot = load_json_strict(snapshot_path)
+    _require(isinstance(manifest, Mapping), "baseline manifest is not a JSON object")
+    _require(isinstance(snapshot, Mapping), "baseline config snapshot is not a JSON object")
+
+    _require(manifest.get("engine") == "zegrid",
+             f"baseline engine must be 'zegrid', got {manifest.get('engine')!r}")
+
+    cf = manifest.get("cell_feather")
+    _require(isinstance(cf, Mapping) and cf.get("enabled") is True,
+             "baseline cell_feather must be enabled (per_cell feather path)")
+
+    fids = manifest.get("frame_ids")
+    _require(isinstance(fids, list) and len(fids) > 0, "baseline frame_ids must be a non-empty list")
+    for i, fid in enumerate(fids):
+        _require(isinstance(fid, str) and fid.strip() != "",
+                 f"baseline frame_ids[{i}] must be a non-empty string")
+    _require(len(set(fids)) == len(fids), "baseline frame_ids must be unique")
+    n_frames = manifest.get("n_frames")
+    _require(_is_int(n_frames) and int(n_frames) == len(fids),
+             f"baseline n_frames ({n_frames!r}) must equal len(frame_ids) ({len(fids)})")
+
+    canvas = manifest.get("canvas")
+    _require(isinstance(canvas, Mapping), "baseline canvas must be an object")
+    width = canvas.get("width")
+    height = canvas.get("height")
+    _require(_is_int(width) and int(width) > 0, f"baseline canvas.width invalid: {width!r}")
+    _require(_is_int(height) and int(height) > 0, f"baseline canvas.height invalid: {height!r}")
+
+    layout = manifest.get("layout")
+    _require(isinstance(layout, Mapping), "baseline layout must be an object")
+    nx = layout.get("nx")
+    ny = layout.get("ny")
+    _require(_is_int(nx) and int(nx) > 0, f"baseline layout.nx invalid: {nx!r}")
+    _require(_is_int(ny) and int(ny) > 0, f"baseline layout.ny invalid: {ny!r}")
+    _require(int(nx) <= int(width) and int(ny) <= int(height),
+             f"baseline layout {nx}x{ny} exceeds canvas {width}x{height}")
+
+    gauge = manifest.get("photometric_gauge")
+    _require(isinstance(gauge, Mapping), "baseline photometric_gauge must be an object")
+    gauge_mode = gauge.get("mode")
+    _require(gauge_mode == CELL_GAUGE_MODE_PER_CELL,
+             f"baseline effective gauge must be 'per_cell', got {gauge_mode!r}")
+
+    normalization = manifest.get("normalization") or "sky_mean"
+    _require(isinstance(normalization, str) and normalization.strip() != "",
+             f"baseline normalization invalid: {normalization!r}")
+
+    return BaselineInfo(
+        run_dir=base,
+        manifest_path=manifest_path,
+        snapshot_path=snapshot_path,
+        manifest=manifest,
+        snapshot=snapshot,
+        frame_ids=tuple(str(f) for f in fids),
+        nx=int(nx),
+        ny=int(ny),
+        canvas_width=int(width),
+        canvas_height=int(height),
+        normalization=str(normalization),
+        gauge_mode=str(gauge_mode),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Exact source-frame resolution
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SelectionResolution:
+    input_dir: Path
+    paths: tuple[Path, ...]
+    basenames: tuple[str, ...]
+    digest: str
+    matched_by_relative: int
+    matched_by_basename: int
+
+    @property
+    def count(self) -> int:
+        return len(self.paths)
+
+    def to_dict(self) -> dict:
+        return {
+            "requested": self.count,
+            "resolved": self.count,
+            "matched_by_relative_path": self.matched_by_relative,
+            "matched_by_basename": self.matched_by_basename,
+            "basenames_digest_sha256": self.digest,
+        }
+
+
+def _scan_fits(root: Path) -> list[Path]:
+    out: list[Path] = []
+    for p in root.rglob("*"):
+        try:
+            if p.is_file() and p.suffix.lower() in FITS_SUFFIXES:
+                out.append(p)
+        except OSError:
+            continue
+    out.sort(key=lambda p: p.as_posix().lower())
+    return out
+
+
+def resolve_selection(input_dir: str | os.PathLike[str],
+                      frame_ids: Sequence[str]) -> SelectionResolution:
+    """Resolve each manifest frame_id to EXACTLY one source file under input_dir.
+
+    Deterministic; preserves the manifest frame_id order. Rejects path traversal,
+    absolute ids, missing ids, ambiguous basenames and duplicate resolution. No
+    basename ambiguity is tolerated and no path may escape the input dir.
+    """
+    root = Path(input_dir).expanduser()
+    if not root.is_dir():
+        raise SelectionError(f"input dir is not a directory: {root}")
+    root_res = root.resolve()
+    files = _scan_fits(root)
+
+    by_rel: dict[str, Path] = {}
+    by_base: dict[str, list[Path]] = {}
+    for f in files:
+        rel = f.relative_to(root).as_posix()
+        by_rel.setdefault(_norm_key(rel), f)
+        by_base.setdefault(_norm_key(f.name), []).append(f)
+
+    resolved: list[Path] = []
+    basenames: list[str] = []
+    seen: set[Path] = set()
+    n_rel = 0
+    n_base = 0
+    problems: list[str] = []
+    fids = list(frame_ids)
+    n_frames = len(fids)
+    for idx, fid in enumerate(fids):
+        raw = str(fid)
+        norm = _as_posix(raw)
+        if norm == "":
+            problems.append(f"frame_ids[{idx}]: empty id")
+            continue
+        pp = PurePosixPath(norm)
+        if norm.startswith("/") or pp.is_absolute():
+            problems.append(f"frame_id {raw!r}: absolute paths are not allowed")
+            continue
+        if any(part == ".." for part in pp.parts):
+            problems.append(f"frame_id {raw!r}: path traversal ('..') is not allowed")
+            continue
+        if any(part == "" for part in pp.parts):
+            problems.append(f"frame_id {raw!r}: empty path component")
+            continue
+
+        chosen = by_rel.get(_norm_key(norm))
+        mode = "relative"
+        if chosen is None:
+            matches = by_base.get(_norm_key(pp.name), [])
+            if len(matches) == 1:
+                chosen = matches[0]
+                mode = "basename"
+            elif len(matches) > 1:
+                problems.append(
+                    f"frame_id {raw!r}: ambiguous basename — "
+                    f"{len(matches)} files match ({', '.join(sorted(m.as_posix() for m in matches))})"
+                )
+                continue
+            else:
+                problems.append(f"frame_id {raw!r}: not found under input dir")
+                continue
+        try:
+            chosen.resolve().relative_to(root_res)
+        except ValueError:
+            problems.append(f"frame_id {raw!r}: resolved path escapes the input dir")
+            continue
+        if chosen in seen:
+            problems.append(f"frame_id {raw!r}: resolves to an already-selected file")
+            continue
+        seen.add(chosen)
+        resolved.append(chosen)
+        basenames.append(chosen.name)
+        if mode == "relative":
+            n_rel += 1
+        else:
+            n_base += 1
+
+    if problems:
+        head = problems[:20]
+        more = "" if len(problems) <= 20 else f" (+{len(problems) - 20} more)"
+        raise SelectionError(
+            f"could not resolve {len(problems)} frame_id(s) of {n_frames}:\n  - "
+            + "\n  - ".join(head) + more
+        )
+
+    if len(resolved) != n_frames:
+        raise SelectionError(
+            f"resolved {len(resolved)} frames but manifest declares {n_frames}"
+        )
+    if not resolved:
+        raise SelectionError("selection resolved zero frames")
+
+    return SelectionResolution(
+        input_dir=root,
+        paths=tuple(resolved),
+        basenames=tuple(basenames),
+        digest=_digest_names(basenames),
+        matched_by_relative=n_rel,
+        matched_by_basename=n_base,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. Strict config parsing + pinned-layout config copy
+# ---------------------------------------------------------------------------
+
+def parse_winsor_limits(value: Any) -> tuple[float, float] | None:
+    """Strictly parse a winsor-limits config value into ``(low, high)`` or None.
+
+    Accepts the Classic string form ``"0.05,0.05"`` (also ``;``/``x`` separators)
+    or a 2-element list/tuple. Each value must be finite with ``0 <= v < 0.5`` and
+    ``low + high < 1`` (the canonical engine's validity domain). A non-empty but
+    unparseable/out-of-domain value is a LOUD error, never silently defaulted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        parts = [p for p in re.split(r"[,;x]", text) if p.strip() != ""]
+        if len(parts) != 2:
+            raise ConfigError(f"invalid stacking_winsor_limits {value!r} (expected 'low,high')")
+        raw = parts
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        raw = [value[0], value[1]]
+    else:
+        raise ConfigError(f"invalid stacking_winsor_limits {value!r} (expected 'low,high')")
+    try:
+        low, high = float(raw[0]), float(raw[1])
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"invalid stacking_winsor_limits {value!r}") from exc
+    import math
+
+    if not (math.isfinite(low) and math.isfinite(high)):
+        raise ConfigError(f"stacking_winsor_limits must be finite, got {value!r}")
+    if not (0.0 <= low < 0.5 and 0.0 <= high < 0.5 and low + high < 1.0):
+        raise ConfigError(f"stacking_winsor_limits out of domain [0,0.5)^2: {value!r}")
+    return (low, high)
+
+
+def _parse_sigma(snapshot: Mapping[str, Any], key: str, default: float) -> float:
+    import math
+
+    if key not in snapshot or snapshot.get(key) is None:
+        return float(default)
+    value = snapshot.get(key)
+    if not _is_number(value):
+        raise ConfigError(f"{key} must be a number, got {value!r}")
+    f = float(value)
+    if not math.isfinite(f) or f <= 0.0:
+        raise ConfigError(f"{key} must be finite and > 0, got {value!r}")
+    return f
+
+
+def _portable_temp_dir(value: Any) -> str:
+    """Return a usable temporary-work dir, or "" (fall back to the output dir).
+
+    A baseline snapshot recorded on another OS may carry an absolute temp path
+    that does not exist here; using it would create a stray directory. Only an
+    existing directory is honoured.
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        p = Path(text).expanduser()
+        if p.is_dir():
+            return str(p)
+    except Exception:
+        pass
+    return ""
+
+
+def build_pinned_config(snapshot: Mapping[str, Any], nx: int, ny: int) -> SimpleNamespace:
+    """Build a COPIED ``SimpleNamespace`` config pinning the baseline layout.
+
+    The source snapshot mapping is never mutated. ``zegrid_layout`` is pinned to
+    the baseline ``nx x ny`` so the RAM-adaptive search is bypassed and the exact
+    baseline geometry is reproduced (floors are still enforced by the engine).
+    """
+    cfg = SimpleNamespace(**dict(snapshot))
+    cfg.zegrid_layout = f"{int(nx)}x{int(ny)}"
+    cfg.temporary_work_dir = _portable_temp_dir(snapshot.get("temporary_work_dir"))
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# 4. Invocation reconstruction (explicit parameters, no hidden defaults)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Invocation:
+    input_dir: Path
+    output_dir: Path
+    kwargs: dict
+    params_report: dict
+
+
+def build_invocation(
+    baseline: BaselineInfo,
+    selection: SelectionResolution,
+    snapshot: Mapping[str, Any],
+    cfg: SimpleNamespace,
+    *,
+    gpu_mode: str,
+    holdout_cap: int,
+) -> Invocation:
+    """Reconstruct the exact ``run_zegrid_mode`` keyword arguments.
+
+    ``--gpu auto`` omits ``use_gpu`` so the engine resolves it from the baseline
+    config (``use_gpu_grid`` -> ... -> default); ``on``/``off`` pass an explicit
+    bool. Everything else is reconstructed from the baseline manifest/snapshot
+    with strict parsing.
+    """
+    if gpu_mode not in ("auto", "on", "off"):
+        raise ConfigError(f"invalid --gpu {gpu_mode!r} (expected auto|on|off)")
+    if not _is_int(holdout_cap) or int(holdout_cap) < 4:
+        raise ConfigError(f"--holdout-cap must be an int >= 4, got {holdout_cap!r}")
+
+    reject_algo = snapshot.get("stacking_rejection_algorithm", "kappa_sigma")
+    if not isinstance(reject_algo, str) or reject_algo.strip() == "":
+        raise ConfigError(f"stacking_rejection_algorithm invalid: {reject_algo!r}")
+    reject_algo = reject_algo.strip().lower()
+
+    kappa_low = _parse_sigma(snapshot, "stacking_kappa_low", 3.0)
+    kappa_high = _parse_sigma(snapshot, "stacking_kappa_high", 3.0)
+    winsor = parse_winsor_limits(snapshot.get("stacking_winsor_limits"))
+    if winsor is None:
+        winsor = (0.05, 0.05)
+
+    use_gpu_arg: bool | None = None
+    if gpu_mode == "on":
+        use_gpu_arg = True
+    elif gpu_mode == "off":
+        use_gpu_arg = False
+
+    kwargs: dict = {
+        "stack_norm_method": baseline.normalization,
+        "stack_reject_algo": reject_algo,
+        "stack_kappa_low": kappa_low,
+        "stack_kappa_high": kappa_high,
+        "winsor_limits": (float(winsor[0]), float(winsor[1])),
+        "cell_gauge_mode": CELL_GAUGE_MODE_PER_CELL,
+        "selection_paths": [str(p) for p in selection.paths],
+        "zconfig": cfg,
+        "r37_diagnostic_capture": True,
+        "r37_diagnostic_holdout_cap": int(holdout_cap),
+    }
+    if use_gpu_arg is not None:
+        kwargs["use_gpu"] = use_gpu_arg
+
+    params_report = {
+        "normalization": kwargs["stack_norm_method"],
+        "stack_reject_algo": kwargs["stack_reject_algo"],
+        "stack_kappa_low": kwargs["stack_kappa_low"],
+        "stack_kappa_high": kwargs["stack_kappa_high"],
+        "winsor_limits": list(kwargs["winsor_limits"]),
+        "cell_gauge_mode": kwargs["cell_gauge_mode"],
+        "r37_diagnostic_capture": True,
+        "r37_diagnostic_holdout_cap": int(holdout_cap),
+        "gpu_mode": gpu_mode,
+        "use_gpu_arg": use_gpu_arg,
+        "selection_frames": selection.count,
+        "selection_basenames_digest_sha256": selection.digest,
+        "pinned_layout": f"{baseline.nx}x{baseline.ny}",
+        "zegrid_layout_config": cfg.zegrid_layout,
+        "temporary_work_dir": cfg.temporary_work_dir,
+    }
+    return Invocation(input_dir=selection.input_dir, output_dir=Path("."), kwargs=kwargs,
+                      params_report=params_report)
+
+
+# ---------------------------------------------------------------------------
+# 5. Memory / capability preflight (real, no stacking, no writes)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PreflightResult:
+    verdict: str  # "PASS" | "FAIL"
+    report: dict
+    failure: str | None = None
+    skipped: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.verdict == "PASS"
+
+
+def _cpu_ladder(zz, canvas, footprints, nx: int, ny: int, ram_budget: int | None) -> dict:
+    """Compute the R36 CPU streaming-tile ladder report (accepted functions only)."""
+    halo = int(zz.zsw.HALO_PX)
+    tile = int(zz.STREAM_TILE_SIZE)
+    cells = list(zz._iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo, tile))
+    inmem_worst = max((int(c["inmem_bound_bytes"]) for c in cells), default=0)
+    stream_worst_by_tile = {int(t): 0 for t in zz.CPU_STREAMING_TILE_LADDER}
+    for c in cells:
+        hw = tuple(c["patch_hw"])
+        n = int(c["n"])
+        for t in zz.CPU_STREAMING_TILE_LADDER:
+            b = int(zz._estimate_streaming_bytes(n, hw, int(t)))
+            if b > stream_worst_by_tile[int(t)]:
+                stream_worst_by_tile[int(t)] = b
+    selected, trials, reason = zz._select_cpu_streaming_tile(stream_worst_by_tile, ram_budget)
+    min_tile = int(zz.CPU_STREAMING_TILE_MINIMUM)
+    return {
+        "cell_count": len(cells),
+        "max_contributors": max((int(c["n"]) for c in cells), default=0),
+        "inmem_worst_bytes": int(inmem_worst),
+        "stream_worst_by_tile": {str(k): int(v) for k, v in stream_worst_by_tile.items()},
+        "trials": trials,
+        "selected_tile_size": selected,
+        "minimum_tile_size": min_tile,
+        "minimum_tile_worst_bound_bytes": int(stream_worst_by_tile.get(min_tile, 0)),
+        "reason": reason,
+        "ladder": [int(t) for t in zz.CPU_STREAMING_TILE_LADDER],
+    }
+
+
+def preflight(
+    input_dir: str | os.PathLike[str],
+    selection: SelectionResolution,
+    baseline: BaselineInfo,
+    cfg: SimpleNamespace,
+    *,
+    progress=None,
+) -> PreflightResult:
+    """Real descriptor/canvas/pinned-layout memory preflight (no stacking/writes)."""
+    zz = _load_zegrid()
+    zal = zz.zal
+    zg = zz.zg
+    _ensure_src_on_path()
+    from zemosaic.zemosaic_stack_plan import FrameInfo  # local import
+
+    def _p(msg: str) -> None:
+        if progress is not None:
+            try:
+                progress(msg)
+            except Exception:
+                pass
+
+    sip_mode = "keep"
+    try:
+        cand = str(getattr(cfg, "zegrid_sip_mode", "keep") or "keep").strip().lower()
+        if cand in ("keep", "strip"):
+            sip_mode = cand
+    except Exception:
+        sip_mode = "keep"
+
+    frames_info = [FrameInfo(path=Path(p), order=i) for i, p in enumerate(selection.paths)]
+    descs, rejected = zz._build_frame_descriptors(
+        frames_info, str(input_dir), None, sip_mode=sip_mode
+    )
+    canvas = zg.build_canvas(descs)
+
+    available = int(zz.available_memory_bytes())
+    ram_budget = available
+
+    footprints_out: list = []
+    verdict = "PASS"
+    failure = None
+    layout = None
+    emit = (lambda msg, lvl="INFO": _p(str(msg))) if progress is not None else None
+    try:
+        layout = zz._choose_layout_mode_aware(
+            canvas, descs, ram_budget=ram_budget, available_bytes=available,
+            tile_size=int(zz.STREAM_TILE_SIZE), pinned_layout=(baseline.nx, baseline.ny),
+            emit=emit, footprints_out=footprints_out,
+        )
+    except (zal.LayoutInfeasible, ValueError) as exc:
+        verdict = "FAIL"
+        failure = f"{type(exc).__name__}: {exc}"
+
+    footprints = footprints_out[0] if footprints_out else zal.project_footprints(descs, canvas)
+    ladder = _cpu_ladder(zz, canvas, footprints, baseline.nx, baseline.ny, ram_budget)
+
+    gpu = {}
+    try:
+        gpu = dict(zz.zgpu.probe_gpu_backend())
+    except Exception as exc:  # pragma: no cover - defensive
+        gpu = {"available": False, "reason": f"probe_failed: {type(exc).__name__}"}
+
+    report = {
+        "requested_frames": selection.count,
+        "candidate_frames": len(frames_info),
+        "descriptors_built": len(descs),
+        "rejected_wcs": len(rejected),
+        "rejected_wcs_detail": list(rejected[:20]),
+        "sip_mode": sip_mode,
+        "canvas": {
+            "width": int(canvas.width),
+            "height": int(canvas.height),
+            "resolution_deg": float(canvas.resolution_deg),
+            "id": str(canvas.canvas_id),
+        },
+        "baseline_canvas": {"width": baseline.canvas_width, "height": baseline.canvas_height},
+        "pinned_layout": {"nx": baseline.nx, "ny": baseline.ny},
+        "available_bytes": ram_budget,
+        "ram_budget_bytes": ram_budget,
+        "cpu_streaming": ladder,
+        "gpu": {
+            "available": bool(gpu.get("available")),
+            "device": gpu.get("device"),
+            "vram_total_bytes": gpu.get("vram_total_bytes"),
+            "vram_free_bytes": gpu.get("vram_free_bytes"),
+            "reason": gpu.get("reason"),
+        },
+        "verdict": verdict,
+        "failure": failure,
+    }
+    if layout is not None:
+        report["layout_decision"] = {
+            "nx": int(layout["nx"]),
+            "ny": int(layout["ny"]),
+            "predicted_bound_bytes": int(layout["predicted_bound_bytes"]),
+            "max_contributors": int(layout["max_contributors"]),
+            "layout_source": layout.get("layout_source"),
+            "budget_bound_choice": bool(layout.get("budget_bound_choice")),
+            "warnings": list(layout.get("warnings") or ()),
+        }
+    return PreflightResult(verdict=verdict, report=report, failure=failure)
+
+
+# ---------------------------------------------------------------------------
+# 6. Output safety
+# ---------------------------------------------------------------------------
+
+def _is_same_or_nested(a: Path, b: Path) -> bool:
+    try:
+        ar = a.expanduser().resolve(strict=False)
+        br = b.expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    return ar == br or ar in br.parents or br in ar.parents
+
+
+def validate_output_safety(
+    output_dir: str | os.PathLike[str],
+    *,
+    baseline_run_dir: str | os.PathLike[str],
+    input_dir: str | os.PathLike[str],
+) -> Path:
+    """Require a NEW/empty output dir that cannot overwrite input or baseline."""
+    out = Path(output_dir).expanduser()
+    for label, other in (("baseline run dir", baseline_run_dir), ("input dir", input_dir)):
+        if _is_same_or_nested(out, Path(other)):
+            raise OutputSafetyError(
+                f"output dir {out} overlaps the {label} {Path(other)} — refusing to run"
+            )
+    if out.exists():
+        if not out.is_dir():
+            raise OutputSafetyError(f"output path exists and is not a directory: {out}")
+        try:
+            entries = list(out.iterdir())
+        except OSError as exc:
+            raise OutputSafetyError(f"cannot inspect output dir {out}: {exc}") from exc
+        if entries:
+            raise OutputSafetyError(
+                f"output dir {out} exists and is not empty ({len(entries)} entries); "
+                "refusing to run (use a new/empty destination)"
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7. Execute + post-run verification
+# ---------------------------------------------------------------------------
+
+def _call_run_zegrid_mode(input_folder: str, output_folder: str, *,
+                          progress_callback=None, **kwargs):
+    """Single call seam: calls ``run_zegrid_mode`` directly (no shell/subprocess)."""
+    zz = _load_zegrid()
+    return zz.run_zegrid_mode(
+        input_folder, output_folder, progress_callback=progress_callback, **kwargs
+    )
+
+
+def _iter_run_dirs(output_dir: Path) -> list[Path]:
+    dirs = [output_dir]
+    for name in MOUNT_PASS_DIRS:
+        cand = output_dir / name
+        if cand.is_dir():
+            dirs.append(cand)
+    return dirs
+
+
+def verify_outputs(
+    output_dir: Path,
+    *,
+    baseline: BaselineInfo,
+    selection: SelectionResolution,
+) -> dict:
+    """Strict-load artifact+manifest and verify full linkage/identity/frame facts."""
+    bgd = _load_bgd()
+    if CAPTURE_ARTIFACT_BASENAME != bgd.CAPTURE_ARTIFACT_BASENAME:  # pragma: no cover
+        raise RunnerError(
+            "capture artifact basename drift: runner mirrors "
+            f"{CAPTURE_ARTIFACT_BASENAME!r} but the engine declares "
+            f"{bgd.CAPTURE_ARTIFACT_BASENAME!r}"
+        )
+    passes: list[dict] = []
+    failures: list[str] = []
+    for run_dir in _iter_run_dirs(output_dir):
+        manifest_path = run_dir / MANIFEST_NAME
+        if not manifest_path.is_file():
+            continue
+        manifest = load_json_strict(manifest_path)
+        cap = None
+        try:
+            cap = manifest["cell_feather"]["r37_diagnostic_capture"]
+        except Exception:
+            cap = None
+        artifact_path = run_dir / bgd.CAPTURE_ARTIFACT_BASENAME
+        entry: dict = {
+            "pass_dir": run_dir.name,
+            "artifact_basename": artifact_path.name,
+            "artifact_exists": artifact_path.is_file(),
+        }
+        checks: dict[str, bool] = {}
+        if cap is None:
+            failures.append(f"{run_dir.name}: manifest has no r37_diagnostic_capture block")
+            checks["manifest_capture_block"] = False
+        else:
+            checks["manifest_capture_block"] = True
+
+        if not artifact_path.is_file():
+            failures.append(f"{run_dir.name}: capture artifact missing ({artifact_path.name})")
+            entry["checks"] = checks
+            passes.append(entry)
+            continue
+
+        try:
+            artifact = bgd.load_file(artifact_path)
+        except Exception as exc:
+            failures.append(f"{run_dir.name}: artifact failed strict load ({exc})")
+            entry["checks"] = checks
+            checks["artifact_strict_load"] = False
+            passes.append(entry)
+            continue
+        checks["artifact_strict_load"] = True
+
+        disk_digest, disk_bytes = _sha256_file(artifact_path)
+        prov = dict(artifact.provenance)
+        capture_block = dict(prov.get("capture") or {})
+        entry.update({
+            "capture_id": capture_block.get("capture_id"),
+            "run_label": capture_block.get("run_label"),
+            "n_source_frames": capture_block.get("n_source_frames"),
+            "sha256": disk_digest,
+            "bytes": disk_bytes,
+            "qualification": (cap or {}).get("qualification"),
+            "heldout_capped": (cap or {}).get("holdout_capped"),
+            "heldout_exact": (cap or {}).get("holdout_exact"),
+            "n_relations": len(artifact.observations),
+            "n_dropped": len(artifact.dropped),
+            "artifact_meta_nx": int(artifact.meta["nx"]),
+            "artifact_meta_ny": int(artifact.meta["ny"]),
+            "capture_stage": prov.get("capture_stage"),
+            "mission": prov.get("mission"),
+            "production_wired": prov.get("production_wired"),
+            "correction_applied": prov.get("correction_applied"),
+        })
+
+        linkage_meta = {
+            "capture_id": capture_block.get("capture_id"),
+            "filename": artifact_path.name,
+            "sha256": (cap or {}).get("sha256"),
+            "bytes": (cap or {}).get("bytes"),
+        }
+        checks["manifest_links_artifact"] = bool(
+            bgd.manifest_links_artifact(linkage_meta, cap)
+        )
+        checks["capture_id_matches_manifest"] = (
+            capture_block.get("capture_id") is not None
+            and capture_block.get("capture_id") == (cap or {}).get("capture_id")
+        )
+        checks["filename_matches_manifest"] = (cap or {}).get("filename") == artifact_path.name
+        checks["sha256_matches_disk"] = (cap or {}).get("sha256") == disk_digest
+        checks["bytes_matches_disk"] = (cap or {}).get("bytes") == disk_bytes
+        checks["mission_truthful"] = prov.get("mission") == CAPTURE_MISSION
+        checks["stage_truthful"] = prov.get("capture_stage") == CAPTURE_STAGE
+        checks["production_wired_true"] = prov.get("production_wired") is True
+        checks["correction_not_applied"] = prov.get("correction_applied") is False
+        checks["gauge_mode_per_cell"] = (
+            capture_block.get("effective_cell_gauge_mode") == CELL_GAUGE_MODE_PER_CELL
+        )
+        checks["layout_matches_baseline"] = (
+            int(artifact.meta["nx"]) == baseline.nx and int(artifact.meta["ny"]) == baseline.ny
+        )
+        checks["manifest_layout_matches_baseline"] = (
+            int(manifest.get("layout", {}).get("nx", -1)) == baseline.nx
+            and int(manifest.get("layout", {}).get("ny", -1)) == baseline.ny
+        )
+        checks["manifest_gauge_per_cell"] = (
+            manifest.get("photometric_gauge", {}).get("mode") == CELL_GAUGE_MODE_PER_CELL
+        )
+        checks["manifest_frame_count"] = int(manifest.get("n_frames", -1)) == selection.count
+        checks["artifact_source_frame_count"] = (
+            int(capture_block.get("n_source_frames", -1)) == selection.count
+        )
+        checks["manifest_frame_set_matches_selection"] = (
+            _digest_names([Path(str(f)).name for f in (manifest.get("frame_ids") or [])])
+            == selection.digest
+        )
+
+        for key, val in checks.items():
+            if not val:
+                failures.append(f"{run_dir.name}: check failed: {key}")
+        entry["checks"] = checks
+        entry["pass_ok"] = all(checks.values())
+        passes.append(entry)
+
+    if not passes:
+        failures.append("no zegrid_manifest.json found under the output dir")
+    verdict = "PASS" if (passes and not failures and all(p.get("pass_ok") for p in passes)) else "FAIL"
+    return {"verdict": verdict, "passes": passes, "failures": failures}
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Atomic same-directory JSON write (temp + fsync + os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def build_verification_report(
+    *,
+    invocation: Invocation,
+    baseline: BaselineInfo,
+    selection: SelectionResolution,
+    verification: Mapping[str, Any],
+    preflight_report: Mapping[str, Any] | None,
+    pinned_layout: str,
+    holdout_cap: int,
+    gpu_mode: str,
+) -> dict:
+    """Compact verification report — basenames/counts/digests only (no private abs paths)."""
+    artifact = None
+    for p in verification.get("passes", ()):
+        if p.get("artifact_exists"):
+            artifact = {
+                "pass_dir": p.get("pass_dir"),
+                "basename": p.get("artifact_basename"),
+                "sha256": p.get("sha256"),
+                "bytes": p.get("bytes"),
+                "capture_id": p.get("capture_id"),
+                "run_label": p.get("run_label"),
+                "n_source_frames": p.get("n_source_frames"),
+                "n_relations": p.get("n_relations"),
+                "n_dropped": p.get("n_dropped"),
+                "qualification": p.get("qualification"),
+                "heldout_capped": p.get("heldout_capped"),
+                "heldout_exact": p.get("heldout_exact"),
+                "capture_stage": p.get("capture_stage"),
+                "mission": p.get("mission"),
+                "production_wired": p.get("production_wired"),
+                "correction_applied": p.get("correction_applied"),
+            }
+            break
+    return {
+        "schema": VERIFICATION_SCHEMA,
+        "version": VERIFICATION_VERSION,
+        "mission": "ZM-ZEGRID-R37-E",
+        "runner": "tools/r37_capture_runner.py",
+        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "package_version": _package_version(),
+        "repo_head": _git_head(_repo_root()),
+        "verification_verdict": verification.get("verdict"),
+        "exact_heldout": bool(artifact and artifact.get("heldout_exact")),
+        "command_parameters": {
+            "input_dir_basename": invocation.input_dir.name,
+            "baseline_run_dir_name": baseline.run_dir.name,
+            "output_dir_name": invocation.output_dir.name,
+            "pinned_layout": pinned_layout,
+            "cell_gauge_mode": CELL_GAUGE_MODE_PER_CELL,
+            "holdout_cap": int(holdout_cap),
+            "gpu_mode": gpu_mode,
+            "r37_diagnostic_capture": True,
+            "selection": selection.to_dict(),
+        },
+        "invocation_parameters": dict(invocation.params_report),
+        "preflight": dict(preflight_report) if preflight_report is not None else {"skipped": True},
+        "artifact": artifact,
+        "linkage": {
+            "verdict": verification.get("verdict"),
+            "passes": verification.get("passes"),
+            "failures": list(verification.get("failures") or []),
+        },
+        "failures": list(verification.get("failures") or []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI
+# ---------------------------------------------------------------------------
+
+def _console_progress(*args, **kwargs) -> None:
+    parts = [str(a) for a in args if a is not None]
+    if parts:
+        print("[r37-runner] " + " ".join(parts), flush=True)
+
+
+def _print_block(title: str, payload: Mapping[str, Any]) -> None:
+    print(f"--- {title} ---", flush=True)
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str), flush=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="r37_capture_runner",
+        description=(
+            "Reproducible, dry-run-by-default CLI runner for the R37-D diagnostic "
+            "capture seam (ZM-ZEGRID-R37-E)."
+        ),
+    )
+    parser.add_argument("--input-dir", required=True,
+                        help="folder containing the source FITS frames")
+    parser.add_argument("--baseline-run-dir", required=True,
+                        help="run dir containing zegrid_manifest.json + run_config_snapshot.json")
+    parser.add_argument("--output-dir", required=True,
+                        help="NEW/empty destination for the capture run (never the baseline dir)")
+    parser.add_argument("--holdout-cap", type=int, default=DEFAULT_HOLDOUT_CAP,
+                        help=f"exact-heldout target (default {DEFAULT_HOLDOUT_CAP})")
+    parser.add_argument("--gpu", choices=("auto", "on", "off"), default="auto",
+                        help="GPU preference; 'auto' prefers the baseline config (use_gpu_grid)")
+    parser.add_argument("--execute", action="store_true",
+                        help="perform the real capture (required for any write/full run)")
+    parser.add_argument("--skip-memory-preflight", action="store_true",
+                        help="LOUD: skip the real memory preflight (unsafe on a weak host)")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        baseline = load_baseline(args.baseline_run_dir)
+    except BaselineError as exc:
+        print(f"[r37-runner] BASELINE ERROR: {exc}", file=sys.stderr, flush=True)
+        return _EXIT_ERROR
+
+    try:
+        selection = resolve_selection(args.input_dir, baseline.frame_ids)
+    except SelectionError as exc:
+        print(f"[r37-runner] SELECTION ERROR: {exc}", file=sys.stderr, flush=True)
+        return _EXIT_ERROR
+
+    try:
+        cfg = build_pinned_config(baseline.snapshot, baseline.nx, baseline.ny)
+        invocation = build_invocation(
+            baseline, selection, baseline.snapshot, cfg,
+            gpu_mode=args.gpu, holdout_cap=args.holdout_cap,
+        )
+    except ConfigError as exc:
+        print(f"[r37-runner] CONFIG ERROR: {exc}", file=sys.stderr, flush=True)
+        return _EXIT_ERROR
+
+    try:
+        out_dir = validate_output_safety(
+            args.output_dir,
+            baseline_run_dir=baseline.run_dir,
+            input_dir=args.input_dir,
+        )
+    except OutputSafetyError as exc:
+        print(f"[r37-runner] UNSAFE OUTPUT: {exc}", file=sys.stderr, flush=True)
+        return _EXIT_UNSAFE_OUTPUT
+    invocation.output_dir = out_dir
+
+    print(
+        f"[r37-runner] baseline {baseline.run_dir.name}: {len(baseline.frame_ids)} frame_ids, "
+        f"layout {baseline.nx}x{baseline.ny}, canvas {baseline.canvas_width}x"
+        f"{baseline.canvas_height}, gauge {baseline.gauge_mode}",
+        flush=True,
+    )
+    print(
+        f"[r37-runner] resolved {selection.count} source frame(s) under "
+        f"{selection.input_dir.name} (relative={selection.matched_by_relative}, "
+        f"basename={selection.matched_by_basename}), digest "
+        f"{selection.digest[:16]}…",
+        flush=True,
+    )
+    _print_block("EFFECTIVE INVOCATION PARAMETERS", invocation.params_report)
+
+    preflight_report: dict | None = None
+    if args.skip_memory_preflight:
+        print(
+            "[r37-runner] WARNING: --skip-memory-preflight given — the real memory "
+            "preflight is SKIPPED. On an undersized host the pinned layout may "
+            "swap-thrash or OOM. Proceeding only because you asked explicitly.",
+            file=sys.stderr, flush=True,
+        )
+    else:
+        print("[r37-runner] running memory/capability preflight (no stacking, no writes)…",
+              flush=True)
+        pf = preflight(args.input_dir, selection, baseline, cfg, progress=_console_progress)
+        preflight_report = pf.report
+        _print_block("PREFLIGHT", preflight_report)
+        if not pf.ok:
+            print(
+                f"[r37-runner] PREFLIGHT FAIL: pinned layout {baseline.nx}x{baseline.ny} "
+                f"cannot fit on this host. {pf.failure}",
+                file=sys.stderr, flush=True,
+            )
+            if args.execute:
+                print(
+                    "[r37-runner] refusing --execute on a failed preflight "
+                    "(no --force-infeasible by design).",
+                    file=sys.stderr, flush=True,
+                )
+            return _EXIT_PREFLIGHT_FAIL
+
+    if not args.execute:
+        print(
+            "[r37-runner] DRY-RUN complete: preflight PASS, nothing written. "
+            "Re-run with --execute to perform the capture.",
+            flush=True,
+        )
+        return _EXIT_OK
+
+    # --- execute -----------------------------------------------------------
+    if not preflight_report and not args.skip_memory_preflight:  # pragma: no cover
+        return _EXIT_PREFLIGHT_FAIL
+
+    print(f"[r37-runner] EXECUTE → {out_dir}", flush=True)
+    try:
+        _call_run_zegrid_mode(
+            str(selection.input_dir), str(out_dir),
+            progress_callback=_console_progress, **invocation.kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface the real failure verbatim
+        print(f"[r37-runner] CAPTURE RUN FAILED: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+        return _EXIT_ERROR
+
+    print("[r37-runner] run finished — verifying artifact↔manifest linkage…", flush=True)
+    verification = verify_outputs(out_dir, baseline=baseline, selection=selection)
+    report = build_verification_report(
+        invocation=invocation, baseline=baseline, selection=selection,
+        verification=verification, preflight_report=preflight_report,
+        pinned_layout=f"{baseline.nx}x{baseline.ny}", holdout_cap=args.holdout_cap,
+        gpu_mode=args.gpu,
+    )
+    try:
+        _atomic_write_json(out_dir / REPORT_NAME, report)
+        print(f"[r37-runner] wrote {REPORT_NAME}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[r37-runner] could not write verification report: {exc}",
+              file=sys.stderr, flush=True)
+
+    if verification.get("verdict") != "PASS":
+        print("[r37-runner] POST-RUN VERIFICATION FAILED:", file=sys.stderr, flush=True)
+        for item in verification.get("failures", ())[:20]:
+            print(f"  - {item}", file=sys.stderr, flush=True)
+        return _EXIT_ERROR
+
+    art = report.get("artifact") or {}
+    exact = "EXACT" if report.get("exact_heldout") else "CAPPED (not exact)"
+    print(
+        f"[r37-runner] VERIFICATION PASS — qualification {art.get('qualification')} "
+        f"({exact}); sha256={art.get('sha256')} bytes={art.get('bytes')}",
+        flush=True,
+    )
+    return _EXIT_OK
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

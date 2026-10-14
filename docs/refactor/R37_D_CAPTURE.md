@@ -223,6 +223,16 @@ equality, pure-assembler equality, strict validation, and no config/GUI activati
 
 ---
 
+## 7b. Reproducible runner (ZM-ZEGRID-R37-E)
+
+A separate, dry-run-by-default CLI (`tools/r37_capture_runner.py`) reproduces this
+capture on a capable machine from a prior run directory (manifest + config
+snapshot) and an input folder, with a hard memory preflight and post-run
+artifact↔manifest verification. See
+[R37_E_CAPTURE_RUNNER.md](R37_E_CAPTURE_RUNNER.md). It calls `run_zegrid_mode`
+directly with the explicit, default-OFF `r37_diagnostic_capture=True` seam and
+changes nothing in this document's contract.
+
 ## 8. Limits / non-goals
 
 * No R37 correction application / no `apply_plane_correction` wiring.
