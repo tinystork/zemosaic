@@ -171,6 +171,23 @@ the cache build and between cells/settings, so a single canonical
 decode/reproject/restack call cannot be interrupted and a run may overshoot by at
 most one such call. This is stated in the artifact (`budgets.max_seconds_semantics`).
 
+**Protected roots (write policy).** The run's own capture and source roots are
+always protected. A `--expect-identity checked` run additionally derives the
+nearest common ancestor of capture and source as a MANDATORY protected root
+(refusing a filesystem/drive root, a too-shallow path, or home/its ancestors); the
+path is never persisted — the artifact records only
+`write_policy.dataset_root_protection` and a one-way identity hash. A generic
+`--expect-identity any` run protects capture/source plus `R38A_FORBIDDEN_ROOTS`
+(additive, `os.pathsep`-separated) only, and says so explicitly.
+
+**Failure contract.** If preparation fails before output safety is established, the
+tool writes NO report file anywhere (the configured output may live in a refused
+tree); it emits only a compact, path-free status on stdout and returns nonzero.
+The output is re-validated before parent creation, after the parent exists and
+immediately before `os.replace`; the temporary file is created with
+`tempfile.mkstemp` in the destination directory (`O_EXCL`, no following of a
+pre-existing `.tmp` symlink, 0600 perms) and removed on failure.
+
 The durable artifact carries NO absolute/private path: input/scratch paths are
 replaced by stable logical labels (basenames / `cells/<cell_id>` keys), and a
 recursive fail-closed boundary validator recognises POSIX-absolute, Windows

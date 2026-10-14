@@ -129,14 +129,10 @@ REPORT_DIR_DEFAULT = Path(
 SCRATCH_DIR_DEFAULT = Path(os.environ.get("R38A_SCRATCH_DIR")
                            or (Path(tempfile.gettempdir()) / "openclaw-r38a"))
 
-# Read-only trees the tool must never write into (defence in depth). EMPTY by
-# default: the RUN's own capture/source roots are always passed as
-# ``extra_forbidden``, and extra roots can be supplied via the
-# ``R38A_FORBIDDEN_ROOTS`` environment variable (os.pathsep-separated). No private
-# absolute path is hard-coded here.
-FORBIDDEN_WRITE_ROOTS = tuple(
-    Path(p) for p in os.environ.get("R38A_FORBIDDEN_ROOTS", "").split(os.pathsep) if p.strip()
-)
+# Read-only trees: the RUN's own capture/source roots are always protected, a
+# checked run additionally derives a mandatory dataset root, and extra roots can be
+# supplied via the ``R38A_FORBIDDEN_ROOTS`` environment variable (os.pathsep
+# -separated, additive). No private absolute path is hard-coded here.
 
 
 # ---------------------------------------------------------------------------
@@ -384,8 +380,92 @@ def enforce_privacy_boundary(payload: Any, roots: Sequence[Path]) -> tuple[Any, 
     scrubbed = scrub_paths(payload, roots)
     redacted = redact_path_leaks(scrubbed)
     return redacted, scan_path_leaks(redacted)
-    """True for Windows drive-absolute ids (drive letter + ``/`` or ``\\``)."""
-    return bool(re.match(r"^[A-Za-z]:[\\/]", str(raw).strip()))
+
+
+def one_way_path_identity(tag: str, path) -> str:
+    """Domain-separated one-way identity of a NORMALIZED resolved path.
+
+    The raw path is never persisted; two different locations never collide here.
+    """
+    try:
+        norm = str(Path(path).expanduser().resolve())
+    except Exception:
+        norm = str(path)
+    h = hashlib.sha256()
+    h.update((str(tag) + "\n").encode("utf-8"))
+    h.update(norm.encode("utf-8"))
+    return h.hexdigest()
+
+
+def derive_dataset_root(capture_dir: Path, source_dir: Path) -> Path:
+    """Nearest common ancestor of the resolved capture and source dirs (fail closed).
+
+    Refuses a too-broad derivation (filesystem/drive root, the user's home or any
+    ancestor of it, or a single-component path) instead of silently weakening the
+    no-writes-under-the-dataset invariant.
+    """
+    try:
+        common = Path(os.path.commonpath([str(Path(capture_dir).resolve()),
+                                          str(Path(source_dir).resolve())]))
+    except ValueError as exc:
+        raise ResolutionError(f"cannot derive a dataset root: {type(exc).__name__}") from exc
+    try:
+        common = common.resolve()
+    except OSError as exc:
+        raise ResolutionError(f"cannot resolve the derived dataset root: {type(exc).__name__}") from exc
+    if common == Path(common.anchor):
+        raise ResolutionError("derived dataset root is a filesystem/drive root; refusing (too broad)")
+    if len(common.parts) < 2:
+        raise ResolutionError("derived dataset root is too shallow; refusing (too broad)")
+    home = Path.home().resolve()
+    if common == home or common in home.parents:
+        raise ResolutionError("derived dataset root is home or an ancestor of home; refusing (too broad)")
+    return common
+
+
+def build_write_policy(*, capture_dir: Path, source_dir: Path, expect: str,
+                       env_roots: Sequence[Path] = ()) -> dict:
+    """Immutable write policy: the protected read-only roots for this run.
+
+    ``expect == "checked"`` derives a MANDATORY dataset root (nearest common
+    ancestor of capture and source) and refuses an unsafe derivation. Generic
+    ``expect == "any"`` protects only the capture/source roots plus ``env_roots``
+    and says so explicitly (``mode = generic_capture_source_only``); the path is
+    never persisted — only the mode and a one-way identity hash.
+    """
+    capture_dir = Path(capture_dir).resolve()
+    source_dir = Path(source_dir).resolve()
+    protected = [capture_dir, source_dir] + [Path(p).expanduser().resolve() for p in env_roots]
+    policy = {
+        "mode": "generic_capture_source_only",
+        "protected_roots": tuple(protected),
+        "dataset_root_identity_sha256": None,
+        "env_roots_count": len(list(env_roots)),
+    }
+    if expect == "checked":
+        dataset_root = derive_dataset_root(capture_dir, source_dir)
+        policy["protected_roots"] = tuple(protected + [dataset_root])
+        policy["mode"] = "derived_common_ancestor"
+        policy["dataset_root_identity_sha256"] = one_way_path_identity(
+            "zemosaic.zegrid.r38a.dataset_root.v1", dataset_root)
+    elif expect != "any":
+        raise ProbeError(f"unknown expect {expect!r}")
+    return policy
+
+
+def _assert_write_allowed(path: Path, *, label: str, policy: Mapping | None = None,
+                          extra_forbidden: Sequence[Path] = ()) -> Path:
+    """Refuse an output/scratch/report path inside any protected read-only root."""
+    p = Path(path).expanduser()
+    rp = p.resolve()
+    roots = list(extra_forbidden)
+    if policy is not None:
+        roots.extend(policy.get("protected_roots") or ())
+    for root in roots:
+        rr = Path(root).expanduser().resolve()
+        if rp == rr or rr in rp.parents:
+            raise BudgetError(f"{label} is inside a protected read-only tree; refusing")
+    return p
 
 
 def _is_drive_absolute(raw: str) -> bool:
@@ -1137,7 +1217,9 @@ def compute_cache_binding(cell_id: str, ctx: Mapping, identity: Mapping,
         "guarantee": (
             "rejects a different resolved source root and in-place source "
             "replacement/touch (stat fingerprint + descriptor facts); NOT a "
-            "cryptographic pixel-content proof"
+            "cryptographic pixel-content proof. CAVEAT: mtime_ns granularity is "
+            "filesystem-dependent, so a touch that does not change the recorded "
+            "stat values cannot be detected"
         ),
     }
 
@@ -1952,16 +2034,6 @@ def conclude(gauge_results: Sequence[Mapping], factor_results: Sequence[Mapping]
 # 8. Budgets + CLI
 # ---------------------------------------------------------------------------
 
-def _assert_write_allowed(path: Path, *, label: str, extra_forbidden: Sequence[Path] = ()) -> Path:
-    p = Path(path).expanduser()
-    rp = p.resolve()
-    for root in tuple(FORBIDDEN_WRITE_ROOTS) + tuple(extra_forbidden):
-        rr = Path(root).expanduser().resolve()
-        if rp == rr or rr in rp.parents:
-            raise BudgetError(f"{label} {p} is inside a read-only tree ({root}); refusing")
-    return p
-
-
 def estimate_costs(panel, cells, *, max_cell_contributors, max_frames_total) -> dict:
     """Bounded execution plan: orientation coverage first, then ascending cost."""
     order = sorted(panel["relations"], key=lambda r: (r["membership_cost"], r["u"], r["v"]))
@@ -2046,13 +2118,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _write_report(out_path: Path, report: Mapping) -> int:
-    """Atomic strict-JSON write (the caller has already scrubbed/validated paths)."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def _write_report(out_path: Path, report: Mapping, policy: Mapping) -> int:
+    """Atomic strict-JSON write under an IMMUTABLE validated write policy.
+
+    Hardened against a check-then-write hole: the output path is re-validated
+    (a) before creating the parent, (b) AFTER the parent exists, and (c) immediately
+    before ``os.replace``. The temporary file is created with ``tempfile.mkstemp``
+    next to the destination (``O_EXCL``, no following of an attacker-controlled
+    ``.tmp`` symlink, 0600 perms) and is removed on any failure.
+    """
+    out_path = _assert_write_allowed(out_path, label="report file", policy=policy)
+    parent = out_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise BudgetError("report parent is a symlink; refusing")
+    out_path = _assert_write_allowed(out_path, label="report file", policy=policy)
     text = dumps_strict(report)
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, out_path)
+    fd, tmp_name = tempfile.mkstemp(prefix=out_path.name + ".", suffix=".tmp",
+                                    dir=str(parent), text=True)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # final re-validation immediately before the replace
+        _assert_write_allowed(out_path, label="report file", policy=policy)
+        if tmp.is_symlink() or out_path.is_symlink():
+            raise BudgetError("report destination or temp is a symlink; refusing")
+        os.replace(tmp, out_path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return len(text)
 
 
@@ -2071,17 +2171,18 @@ def _prepare_run(args):
             raise ResolutionError(f"{label} is a symlink; refusing (fail-closed)")
     capture_dir = raw_capture.resolve()
     source_dir = raw_source.resolve()
-    scratch = _assert_write_allowed(args.scratch_dir, label="scratch dir",
-                                    extra_forbidden=(capture_dir, source_dir))
-    report_dir = _assert_write_allowed(args.report_dir, label="report dir",
-                                       extra_forbidden=(capture_dir, source_dir))
+    env_roots = [Path(p) for p in os.environ.get("R38A_FORBIDDEN_ROOTS", "").split(os.pathsep) if p.strip()]
+    policy = build_write_policy(capture_dir=capture_dir, source_dir=source_dir,
+                                expect=args.expect_identity, env_roots=env_roots)
+    scratch = _assert_write_allowed(args.scratch_dir, label="scratch dir", policy=policy)
+    report_dir = _assert_write_allowed(args.report_dir, label="report dir", policy=policy)
     out_path = Path(args.out).expanduser() if args.out else (report_dir / f"r38a_{args.mode}.json")
-    _assert_write_allowed(out_path, label="report file", extra_forbidden=(capture_dir, source_dir))
+    _assert_write_allowed(out_path, label="report file", policy=policy)
     identity = validate_identity(capture_dir, expect=args.expect_identity)
     resolution = resolve_sources(source_dir, identity["frame_ids"])
     geometry = reconstruct_geometry(resolution["paths"], source_dir)
     return (capture_dir, source_dir, scratch, report_dir, out_path,
-            identity, resolution, geometry)
+            identity, resolution, geometry, policy)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2092,24 +2193,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         (capture_dir, source_dir, scratch, report_dir, out_path,
-         identity, resolution, geometry) = _prepare_run(args)
+         identity, resolution, geometry, policy) = _prepare_run(args)
     except _not_run_exceptions() as exc:
-        out_path = Path(args.out).expanduser() if args.out else (
-            Path(args.report_dir).expanduser() / f"r38a_{args.mode}.json")
-        record = {
-            "schema": SCHEMA_NAME, "schema_version": SCHEMA_VERSION, "mission": MISSION,
-            "mode": args.mode, "status": "FAILED",
-            "status_reason": f"{type(exc).__name__}: {exc}",
-            "qualification": "DEV_NOT_QUALIFICATION", "scientific_acceptance": False,
-            "r38b_authorized": False,
-        }
-        safe, leaks = enforce_privacy_boundary(record, (Path(args.source_dir).expanduser(),
-                                                       Path(args.capture_dir).expanduser()))
-        if leaks:
-            safe = minimal_failure_record(stage="prepare", leak_locations=leaks)
-        _write_report(out_path, safe)
-        print(json.dumps({"status": "FAILED", "mode": args.mode,
-                          "reason": type(exc).__name__, "out": str(out_path)}, sort_keys=True))
+        # M1n (fail closed): preparation failed BEFORE output safety was
+        # established. Write NOTHING anywhere (the configured output may live in a
+        # refused tree), emit only a compact, path-free status, and return nonzero.
+        print(json.dumps({"status": "FAILED", "mode": args.mode, "stage": "prepare",
+                          "reason": type(exc).__name__,
+                          "wrote_report": False}, sort_keys=True))
         return 1
 
     report: dict = {
@@ -2122,6 +2213,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "qualification": "DEV_NOT_QUALIFICATION",
         "scientific_acceptance": False,
         "r38b_authorized": False,
+        "write_policy": {
+            "dataset_root_protection": policy["mode"],
+            "dataset_root_identity_sha256": policy["dataset_root_identity_sha256"],
+            "protected_roots_count": len(policy["protected_roots"]),
+            "env_roots_count": policy["env_roots_count"],
+            "note": (
+                "checked runs derive the nearest common ancestor of capture and source as a "
+                "MANDATORY protected root (never persisted); generic 'any' runs protect only "
+                "capture/source plus R38A_FORBIDDEN_ROOTS and are labelled accordingly"
+            ),
+        },
         "evidence_scope": {
             "kind": "diagnostic_dev_bounded",
             "panel": "biased DEV panel frozen BEFORE results; NOT a qualification corpus",
@@ -2289,7 +2391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps({"status": "FAILED", "mode": args.mode,
                                   "reason": "privacy_scan_unwritable"}, sort_keys=True))
                 return 3
-        size = _write_report(out_path, safe)
+        size = _write_report(out_path, safe, policy)
         print(f"R38A {args.mode}: FAILED privacy scan; wrote minimal safe record ({size} bytes)")
         print(json.dumps({"status": "FAILED", "mode": args.mode,
                           "reason": "privacy_scan", "out": str(out_path)}, sort_keys=True))
@@ -2308,7 +2410,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                           "reason": "privacy_scan_postcheck"}, sort_keys=True))
         return 3
 
-    size = _write_report(out_path, scrubbed)
+    size = _write_report(out_path, scrubbed, policy)
     print(f"R38A {args.mode}: wrote {out_path} ({size} bytes)")
     print(json.dumps({"status": scrubbed["status"], "mode": args.mode,
                       "conclusion": (scrubbed.get("conclusion") or {}).get("state"),

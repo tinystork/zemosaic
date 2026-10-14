@@ -824,12 +824,25 @@ def test_resolve_sources_accepts_canonical_nested(tmp_path):
     assert got["n_resolved"] == 1
 
 
+def _tree_snapshot(root: pathlib.Path) -> dict:
+    snap = {}
+    for p in sorted(root.rglob("*")):
+        try:
+            st = p.stat()
+            snap[str(p)] = (int(st.st_size), int(st.st_mtime_ns))
+        except OSError:
+            snap[str(p)] = (-1, -1)
+    return snap
+
+
 def test_main_cli_refuses_symlinked_source_root(tmp_path):
     capture, src, man, art_path, art = _make_capture(tmp_path, n_frames=6)
     _finalise_capture(capture, src, man, art)
     link = tmp_path / "src_link"
     link.symlink_to(src)
     out = tmp_path / "out" / "inv.json"
+    before_src = _tree_snapshot(src)
+    before_cap = _tree_snapshot(capture)
     rc = probe.main([
         "--capture-dir", str(capture), "--source-dir", str(link),
         "--mode", "inventory", "--expect-identity", "any",
@@ -837,10 +850,140 @@ def test_main_cli_refuses_symlinked_source_root(tmp_path):
         "--report-dir", str(tmp_path / "out"), "--out", str(out),
     ])
     assert rc == 1
-    report = json.loads(out.read_text())
-    assert report["status"] == "FAILED"
-    assert "symlink" in report["status_reason"]
-    assert probe.scan_path_leaks(report) == []
+    # M1n: preparation failure writes NOTHING at all
+    assert not out.exists()
+    assert _tree_snapshot(src) == before_src
+    assert _tree_snapshot(capture) == before_cap
+
+
+@pytest.mark.parametrize("bad_out", ["in_source", "in_capture", "report_dir_in_source"])
+def test_prepare_failure_writes_nothing(tmp_path, bad_out):
+    capture, src, man, art_path, art = _make_capture(tmp_path, n_frames=6)
+    _finalise_capture(capture, src, man, art)
+    out = tmp_path / "out" / "inv.json"
+    argv = ["--capture-dir", str(capture), "--source-dir", str(src),
+            "--mode", "inventory", "--expect-identity", "any",
+            "--scratch-dir", str(tmp_path / "scratch"),
+            "--report-dir", str(tmp_path / "out"), "--out", str(out)]
+    forbidden_targets = []
+    if bad_out == "in_source":
+        argv[argv.index("--out") + 1] = str(src / "SHOULD_NOT_WRITE.json")
+        forbidden_targets.append(src / "SHOULD_NOT_WRITE.json")
+    elif bad_out == "in_capture":
+        argv[argv.index("--out") + 1] = str(capture / "SHOULD_NOT_WRITE.json")
+        forbidden_targets.append(capture / "SHOULD_NOT_WRITE.json")
+    else:
+        rd = src / "sub_out"
+        argv[argv.index("--report-dir") + 1] = str(rd)
+        forbidden_targets.append(rd)
+    before_src = _tree_snapshot(src)
+    before_cap = _tree_snapshot(capture)
+    rc = probe.main(argv)
+    assert rc != 0
+    for t in forbidden_targets:
+        assert not t.exists()
+    assert _tree_snapshot(src) == before_src
+    assert _tree_snapshot(capture) == before_cap
+    assert not out.exists()
+
+
+def test_prepare_failure_does_not_overwrite_preexisting_output(tmp_path):
+    capture, src, man, art_path, art = _make_capture(tmp_path, n_frames=6)
+    _finalise_capture(capture, src, man, art)
+    out = tmp_path / "out" / "inv.json"
+    out.parent.mkdir(parents=True)
+    out.write_text("PRE-EXISTING")
+    # malformed identity -> IdentityError during preparation
+    art["provenance"]["correction_applied"] = True
+    (capture / probe.CAPTURE_ARTIFACT_BASENAME).write_text(json.dumps(art))
+    rc = probe.main([
+        "--capture-dir", str(capture), "--source-dir", str(src),
+        "--mode", "inventory", "--expect-identity", "any",
+        "--scratch-dir", str(tmp_path / "scratch"),
+        "--report-dir", str(tmp_path / "out"), "--out", str(out),
+    ])
+    assert rc == 1
+    assert out.read_text() == "PRE-EXISTING"
+
+
+# ---- M2n dataset-root protection ----
+
+def test_derive_dataset_root_refuses_unsafe_shallow(tmp_path):
+    with pytest.raises(probe.ResolutionError):
+        probe.derive_dataset_root(pathlib.Path("/a"), pathlib.Path("/b"))
+
+
+def test_checked_policy_protects_common_ancestor_and_generic_does_not(tmp_path):
+    capture = tmp_path / "dataset" / "capture"
+    src = tmp_path / "dataset" / "lights" / "IRCUT"
+    capture.mkdir(parents=True)
+    src.mkdir(parents=True)
+    sibling = tmp_path / "dataset" / "SIBLING" / "x.json"
+    checked = probe.build_write_policy(capture_dir=capture, source_dir=src, expect="checked")
+    assert checked["mode"] == "derived_common_ancestor"
+    assert checked["dataset_root_identity_sha256"]
+    with pytest.raises(probe.BudgetError):
+        probe._assert_write_allowed(sibling, label="report file", policy=checked)
+    # a safe path OUTSIDE the common ancestor is accepted
+    outside = tmp_path / "outside" / "ok.json"
+    assert probe._assert_write_allowed(outside, label="report file", policy=checked)
+    # generic mode protects only capture/source (+env) and says so
+    generic = probe.build_write_policy(capture_dir=capture, source_dir=src, expect="any")
+    assert generic["mode"] == "generic_capture_source_only"
+    assert generic["dataset_root_identity_sha256"] is None
+    assert probe._assert_write_allowed(sibling, label="report file", policy=generic)
+
+
+def test_env_forbidden_roots_are_additive(tmp_path):
+    capture = tmp_path / "dataset" / "capture"
+    src = tmp_path / "dataset" / "lights"
+    capture.mkdir(parents=True)
+    src.mkdir(parents=True)
+    extra = tmp_path / "extra_protected"
+    extra.mkdir()
+    policy = probe.build_write_policy(capture_dir=capture, source_dir=src, expect="any",
+                                      env_roots=[extra])
+    assert policy["env_roots_count"] == 1
+    with pytest.raises(probe.BudgetError):
+        probe._assert_write_allowed(extra / "x.json", label="report file", policy=policy)
+
+
+# ---- write/TOCTOU hardening ----
+
+def test_write_report_refuses_destination_symlink_into_protected(tmp_path):
+    protected = tmp_path / "dataset"
+    protected.mkdir()
+    (protected / "victim.json").write_text("KEEP")
+    policy = {"protected_roots": (protected,)}
+    link = tmp_path / "out.json"
+    link.symlink_to(protected / "victim.json")
+    with pytest.raises(probe.BudgetError):
+        probe._write_report(link, {"a": 1}, policy)
+    assert (protected / "victim.json").read_text() == "KEEP"
+
+
+def test_write_report_ignores_preexisting_tmp_symlink(tmp_path):
+    protected = tmp_path / "dataset"
+    protected.mkdir()
+    (protected / "victim.json").write_text("KEEP")
+    policy = {"protected_roots": (protected,)}
+    out = tmp_path / "out" / "report.json"
+    out.parent.mkdir()
+    # a pre-existing attacker-controlled temp symlink must not be followed
+    (out.parent / "report.json.tmp").symlink_to(protected / "victim.json")
+    size = probe._write_report(out, {"a": 1}, policy)
+    assert size > 0 and out.is_file()
+    assert json.loads(out.read_text()) == {"a": 1}
+    assert (protected / "victim.json").read_text() == "KEEP"
+
+
+def test_write_report_revalidates_after_parent_creation(tmp_path):
+    protected = tmp_path / "dataset"
+    protected.mkdir()
+    policy = {"protected_roots": (protected,)}
+    with pytest.raises(probe.BudgetError):
+        probe._write_report(protected / "deep" / "report.json", {"a": 1}, policy)
+    assert not (protected / "deep").exists()
 
 
 def test_compute_cache_binding_is_private_root_free(tmp_path):
@@ -866,12 +1009,11 @@ def test_compute_cache_binding_is_private_root_free(tmp_path):
 # Output safety
 # ---------------------------------------------------------------------------
 
-def test_write_safety_refuses_read_only_tree(tmp_path, monkeypatch):
-    monkeypatch.setattr(probe, "FORBIDDEN_WRITE_ROOTS",
-                        (pathlib.Path("/srv/private-readonly"),))
+def test_write_safety_refuses_read_only_tree(tmp_path):
+    policy = {"protected_roots": (pathlib.Path("/srv/private-readonly"),)}
     with pytest.raises(probe.BudgetError):
         probe._assert_write_allowed(pathlib.Path("/srv/private-readonly/x/y.json"),
-                                    label="report file")
+                                    label="report file", policy=policy)
     with pytest.raises(probe.BudgetError):
         probe._assert_write_allowed(tmp_path / "ok.json", label="report file",
                                     extra_forbidden=(tmp_path,))
