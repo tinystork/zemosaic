@@ -1,8 +1,8 @@
 # R37 — Background model contract (Gate B, pure prototype only)
 
-**Status:** frozen input contract for the isolated prototype.  
-**Production wiring:** forbidden.  
-**Default/config/GUI change:** forbidden.  
+**Status:** frozen input contract for the isolated prototype.
+**Production wiring:** forbidden.
+**Default/config/GUI change:** forbidden.
 **Decision authority:** Junior after independent Nono review.
 
 ## 1. Scope
@@ -167,4 +167,10 @@ Do not combine them into one visual score.
 - `NEEDS RESEARCH`: promising synthetic result but real pre-feather diagnostics or identifiability evidence missing.
 - `NO GO`: protected signal is biased, model is systematically ill-conditioned, or cost is unjustified.
 
-Because the exact 816-frame pre-feather observations are unavailable, Gate B cannot by itself qualify a production change. Its strongest expected scientifically honest conclusion is normally `NEEDS RESEARCH` plus a future diagnostic-artifact proposal.
+The canonical final R34F product is available at
+`/home/tristan/caldwell11/zegrid_out/R34F/` and its manifest contains 653 frames.
+The separate pre-feather Cell observations required by this contract are not
+persisted there. Gate B therefore cannot by itself qualify a production change;
+its strongest scientifically honest conclusion remains `NEEDS RESEARCH` plus a
+future diagnostic-artifact proposal. This factual correction does not change any
+frozen threshold.

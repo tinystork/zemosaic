@@ -132,7 +132,9 @@ only ≤1500 columns and are flagged.
 
 ## 6. Limits (explicit)
 
-- **No real-data qualification** (816-frame pre-feather product absent).
+- **No real-data qualification.** The canonical final R34F product is available
+  at `/home/tristan/caldwell11/zegrid_out/R34F/` and contains 653 frames, but its
+  separate pre-feather Cell observations were not persisted.
 - **Narrow band**: 16 px normal slope weakly identifiable → `ILL_CONDITIONED`.
 - **Chains / acyclic graphs** are refused (`no_cycle_redundancy`): relational
   contradictions cannot be qualified without cycle redundancy; no false confidence.
@@ -151,6 +153,7 @@ only ≤1500 columns and are flagged.
 All synthetic fidelity/evidence gates pass **only where the measurement band is
 wide enough and the accepted graph carries cycle redundancy**; otherwise the
 system returns an explicit refusal. The architecture is sparse and suitable for a
-future compact diagnostic. The real pre-feather observations remain unavailable,
+future compact diagnostic. The canonical final FITS has been measured, but the
+real pre-feather pair observations remain unavailable,
 so the proposed outcome is **NEEDS RESEARCH**. **No production wiring is proposed
 or performed.**

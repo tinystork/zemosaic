@@ -1,9 +1,9 @@
 # R37 — Archaeology and risks: inter-Cell gradient harmonization
 
-**Mission:** ZM-ZEGRID-R37  
-**Gate:** A — Junior archaeology, before any delegated prototype  
-**Base inspected:** `beta` / `739f1e8d9f30b265dc36f62eaa21e377dc461473`  
-**Date:** 2026-10-14  
+**Mission:** ZM-ZEGRID-R37
+**Gate:** A — Junior archaeology, before any delegated prototype
+**Base inspected:** `beta` / `739f1e8d9f30b265dc36f62eaa21e377dc461473`
+**Date:** 2026-10-14
 **Recommendation:** **PROCEED TO AN ISOLATED PURE PROTOTYPE ONLY**. No production wiring is scientifically justified by the available real artefacts.
 
 ## 1. Baseline and evidence status
@@ -23,15 +23,15 @@ Evidence labels used below:
 - **NOT RUN:** not executed and not inferred as a pass;
 - **NOT AVAILABLE:** required source artefact absent.
 
-## 2. The supplied run description does not match the local artefact
+## 2. Canonical R34F path and manifest authority
 
-The only complete local Caldwell R34F result is:
+Tristan identified the run in question at:
 
-`/home/tristan/caldwell11/zegrid_out/R34F_WIN/`
+`/home/tristan/caldwell11/zegrid_out/R34F/`
 
-Its manifest/log state:
+Its manifest/log state is authoritative for the artefact:
 
-| Field | Mission description | Local R34F_WIN | Status |
+| Field | Initial mission narrative | Canonical local R34F | Status |
 |---|---:|---:|---|
 | included frames | 816 | **653** | mismatch |
 | canvas | 4117×4377 | **4117×4075** | mismatch |
@@ -41,7 +41,15 @@ Its manifest/log state:
 | offset residual RMS RGB | ~33.90 / 30.43 / 34.18 | **15.756 / 15.172 / 6.876** | mismatch |
 | duration | ~10945 s | **8499.144 s** + finalize 30.356 s | mismatch |
 
-A recursive search found no local `zegrid_manifest.json` for an 816-frame complete run. The mission's exact 816-frame product is therefore **NOT AVAILABLE**. No value from that claimed run is converted into a measured fact. Dynamic Gate A measurements below apply only to the local 653-frame `R34F_WIN` product.
+The canonical `R34F` manifest contains 653 frames, not 816. The earlier
+`R34F_WIN` path is a byte-identical copy of the same result: manifest, run log,
+science FITS, aesthetic FITS and coverage FITS have identical SHA-256 hashes.
+Therefore the original dynamic measurements were performed on the correct pixel
+data, but the path/provenance statement was wrong and is corrected here.
+
+No local complete manifest matching the initial 816-frame narrative was found.
+That narrative is not used as measured evidence. Dynamic Gate-A measurements
+below were rerun directly from the canonical 653-frame `R34F` path.
 
 ## 3. Current R34 path
 
@@ -103,9 +111,10 @@ Therefore the final FITS can quantify a residual boundary signature, but **canno
 
 Read-only script/artifacts:
 
-- `.a2a-reports/ZM-ZEGRID-R37-gateA/analyze_r34f_boundaries.py`
-- `.a2a-reports/ZM-ZEGRID-R37-gateA/r34f_boundary_profiles.json`
-- `.a2a-reports/ZM-ZEGRID-R37-gateA/boundary_vs_control.json`
+- `.a2a-reports/ZM-ZEGRID-R37-gateA-r34f-canonical/analyze_r34f_boundaries.py`
+- `.a2a-reports/ZM-ZEGRID-R37-gateA-r34f-canonical/r34f_boundary_profiles.json`
+- `.a2a-reports/ZM-ZEGRID-R37-gateA-r34f-canonical/boundary_vs_control.json`
+- `.a2a-reports/ZM-ZEGRID-R37-gateA-r34f-canonical/canonical_run_summary.json`
 
 Method:
 
@@ -220,7 +229,7 @@ No third-party code was copied. README currently credits Tinystork, J.A.R.V.I.S.
 |---|---|---|---|
 | Absorb real common sky/IFN | HIGH | scientific identifiability limit | same-pixel pair differences, protected-scene tests, held-out metrics, refuse weak model |
 | 16 px normal slope weakly constrained | HIGH | cond(A)≈2430 ideal | covariance/leverage gate, slope regularization, `ILL_CONDITIONED` |
-| Exact 816-frame artefact absent | HIGH | local search | no real-data qualification claim; future compact diagnostic run required |
+| Canonical final product lacks pre-feather pair observations | HIGH | canonical R34F lifecycle/files | no real-data qualification claim; future compact diagnostic run required |
 | Final FITS cannot recover Cell pairs | HIGH | lifecycle inspection | collect compact observations while patches coexist |
 | Graph connected but weak/contradictory | HIGH | current diagnostics absent | rank, condition, uncertainty, cycles, robust edge IRLS |
 | Stars/PSF/depth contaminate differences | HIGH | narrow overlap + heterogeneous stacks | robust masks/weights, block holdout, noise/depth diagnostics |
