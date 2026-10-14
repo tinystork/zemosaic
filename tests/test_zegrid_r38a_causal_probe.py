@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 
@@ -701,6 +702,147 @@ def test_read_cache_binding_none_and_stale_mismatch(tmp_path):
     assert probe.read_cache_binding(cache) is None
 
 
+def test_path_leak_unknown_root_embedded_and_no_false_positives():
+    # rework-2 M1r(b): unknown-root embedded absolute paths are caught
+    assert probe.path_leak_category("see /custom/mount/x for details") == "posix_absolute_embedded"
+    assert probe.path_leak_category("boom /data/secret.json") == "posix_absolute_embedded"
+    # ... while ratios / relative ids / URL schemes are NOT flagged
+    assert probe.path_leak_category("ratio 0.5/0.25") is None
+    assert probe.path_leak_category("cells/r0000c0000") is None
+    assert probe.path_leak_category("https://docs.openclaw.ai/gateway") is None
+    assert probe.path_leak_category("pre_offset_pre_feather") is None
+    assert probe.path_leak_category("a|b") is None
+
+
+def test_enforce_privacy_boundary_redacts_and_rescans():
+    secret = "FileNotFoundError: [Errno 2] No such file: '/custom/mount/secret-tree/Acquisition_0042.fit'"
+    payload = {"not_run": [{"item": "x", "reason": secret}], "ok": "fine"}
+    safe, leaks = probe.enforce_privacy_boundary(payload, ())
+    assert leaks == []
+    assert "secret-tree" not in json.dumps(safe)
+    assert "Acquisition_0042.fit" not in json.dumps(safe)
+    assert safe["not_run"][0]["reason"] == probe.REDACTED_PATH
+    assert safe["ok"] == "fine"
+
+
+def test_minimal_failure_record_is_always_scannable():
+    rec = probe.minimal_failure_record(stage="privacy_scan", leak_locations=[
+        {"json_path": "$.failed.message", "category": "posix_absolute_embedded",
+         "value": "/custom/mount/x"}])
+    assert rec["status"] == "FAILED"
+    assert probe.scan_path_leaks(rec) == []
+    assert "/custom/mount" not in json.dumps(rec)
+
+
+def test_e2e_leak_write_path_is_fail_closed(tmp_path, monkeypatch):
+    capture, src, man, art_path, art = _make_capture(tmp_path, n_frames=6)
+    _finalise_capture(capture, src, man, art)
+    secret = "/custom/mount/secret-tree/Acquisition_0042.fit"
+
+    def _boom(*a, **k):
+        raise RuntimeError(f"unexpected probe failure naming {secret}")
+
+    monkeypatch.setattr(probe, "_run_real_probe", _boom)
+    out = tmp_path / "out" / "leak.json"
+    rc = probe.main([
+        "--capture-dir", str(capture), "--source-dir", str(src),
+        "--mode", "gauge", "--execute-real", "--expect-identity", "any",
+        "--scratch-dir", str(tmp_path / "scratch"),
+        "--report-dir", str(tmp_path / "out"), "--out", str(out),
+    ])
+    assert rc == 2
+    text = out.read_text()
+    assert secret not in text and "secret-tree" not in text and "/custom/mount" not in text
+    report = json.loads(text)
+    assert report["status"] == "FAILED"
+    assert probe.scan_path_leaks(report) == []
+
+
+# ---- cache binding v2 (rework-2 M5r) ----
+
+def _binding_fixture(tmp_path):
+    capture, src, man, art_path, art = _make_capture(tmp_path, n_frames=6)
+    _finalise_capture(capture, src, man, art)
+    res = probe.resolve_sources(src, man["frame_ids"])
+    geo = probe.reconstruct_geometry(res["paths"], src)
+    probe._all_descs_by_id.clear()
+    for d in geo["_descs"]:
+        probe._all_descs_by_id[d.frame_id.logical_path] = d
+    ident = probe.validate_identity(capture, expect="any")["computed"]
+    cid = sorted(geo["_cell_ctx"])[0]
+    return capture, src, geo, ident, cid
+
+
+def test_binding_v2_two_roots_same_basename_differ(tmp_path):
+    capture, src, geo, ident, cid = _binding_fixture(tmp_path)
+    other = tmp_path / "elsewhere" / src.name
+    other.mkdir(parents=True)
+    b_a = probe.compute_cache_binding(cid, geo["_cell_ctx"][cid], ident, src, 6, {})
+    b_b = probe.compute_cache_binding(cid, geo["_cell_ctx"][cid], ident, other, 6, {})
+    assert b_a["schema_version"] == 2
+    assert b_a["source_root_identity_sha256"] != b_b["source_root_identity_sha256"]
+    assert b_a != b_b, "same basename/metadata but a different root must not collide"
+
+
+def test_binding_v2_stat_invalidation_on_touch(tmp_path):
+    capture, src, geo, ident, cid = _binding_fixture(tmp_path)
+    before = probe.compute_cache_binding(cid, geo["_cell_ctx"][cid], ident, src, 6, {})
+    target = geo["_descs"][0].source_path
+    os.utime(target, ns=(0, 2_000_000_000))
+    after = probe.compute_cache_binding(cid, geo["_cell_ctx"][cid], ident, src, 6, {})
+    assert before["descriptors_digest"] != after["descriptors_digest"]
+    assert before != after
+    # a legacy v1 (no schema_version / no root identity) NEVER matches a v2 binding
+    legacy = {k: v for k, v in before.items() if k not in ("schema_version", "source_root_identity_sha256")}
+    assert legacy != before
+
+
+def test_binding_v2_exposes_no_raw_root(tmp_path):
+    capture, src, geo, ident, cid = _binding_fixture(tmp_path)
+    b = probe.compute_cache_binding(cid, geo["_cell_ctx"][cid], ident, src, 6, {})
+    assert probe.scan_path_leaks(b) == []
+    assert str(src) not in json.dumps(b)
+    assert b["source_root_label"] == src.name
+
+
+# ---- resolver canonicality + CLI root symlink (rework-2 L3r/L4r) ----
+
+@pytest.mark.parametrize("bad", ["a//f.fit", "a/./f.fit", "./f.fit", "a\\f.fit", "sub\\f.fit"])
+def test_resolve_sources_rejects_noncanonical_ids(tmp_path, bad):
+    root = tmp_path / "src"
+    root.mkdir()
+    _touch(root, ["f.fit", "a/f.fit"])
+    with pytest.raises(probe.ResolutionError):
+        probe.resolve_sources(root, [bad])
+
+
+def test_resolve_sources_accepts_canonical_nested(tmp_path):
+    root = tmp_path / "src"
+    root.mkdir()
+    _touch(root, ["sub/f.fit"])
+    got = probe.resolve_sources(root, ["sub/f.fit"])
+    assert got["n_resolved"] == 1
+
+
+def test_main_cli_refuses_symlinked_source_root(tmp_path):
+    capture, src, man, art_path, art = _make_capture(tmp_path, n_frames=6)
+    _finalise_capture(capture, src, man, art)
+    link = tmp_path / "src_link"
+    link.symlink_to(src)
+    out = tmp_path / "out" / "inv.json"
+    rc = probe.main([
+        "--capture-dir", str(capture), "--source-dir", str(link),
+        "--mode", "inventory", "--expect-identity", "any",
+        "--scratch-dir", str(tmp_path / "scratch"),
+        "--report-dir", str(tmp_path / "out"), "--out", str(out),
+    ])
+    assert rc == 1
+    report = json.loads(out.read_text())
+    assert report["status"] == "FAILED"
+    assert "symlink" in report["status_reason"]
+    assert probe.scan_path_leaks(report) == []
+
+
 def test_compute_cache_binding_is_private_root_free(tmp_path):
     capture, src, man, art_path, art = _make_capture(tmp_path, n_frames=6)
     _finalise_capture(capture, src, man, art)
@@ -711,9 +853,11 @@ def test_compute_cache_binding_is_private_root_free(tmp_path):
         probe._all_descs_by_id[d.frame_id.logical_path] = d
     ident = probe.validate_identity(capture, expect="any")["computed"]
     cid = sorted(geo["_cell_ctx"])[0]
-    binding = probe.compute_cache_binding(cid, geo["_cell_ctx"][cid], ident, src.name,
+    binding = probe.compute_cache_binding(cid, geo["_cell_ctx"][cid], ident, src,
                                           res["n_files_on_disk"], {"normalization": "sky_mean"})
     assert binding["source_root_label"] == src.name
+    assert binding["schema_version"] == 2
+    assert "source_root_identity_sha256" in binding
     assert "source_path" not in json.dumps(binding)
     assert not probe.scan_path_leaks(binding)
 
@@ -722,13 +866,17 @@ def test_compute_cache_binding_is_private_root_free(tmp_path):
 # Output safety
 # ---------------------------------------------------------------------------
 
-def test_write_safety_refuses_read_only_tree(tmp_path):
-    forbidden = pathlib.Path("/home/tristan/caldwell11")
+def test_write_safety_refuses_read_only_tree(tmp_path, monkeypatch):
+    monkeypatch.setattr(probe, "FORBIDDEN_WRITE_ROOTS",
+                        (pathlib.Path("/srv/private-readonly"),))
     with pytest.raises(probe.BudgetError):
-        probe._assert_write_allowed(forbidden / "x" / "y.json", label="report file")
+        probe._assert_write_allowed(pathlib.Path("/srv/private-readonly/x/y.json"),
+                                    label="report file")
     with pytest.raises(probe.BudgetError):
         probe._assert_write_allowed(tmp_path / "ok.json", label="report file",
                                     extra_forbidden=(tmp_path,))
+    # a normal path is allowed
+    assert probe._assert_write_allowed(tmp_path / "ok.json", label="report file")
 
 
 # ---------------------------------------------------------------------------

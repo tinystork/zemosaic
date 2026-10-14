@@ -56,9 +56,10 @@ Modes and their writes:
 | `gauge` | yes (banded, capped) | report + scratch aligned cache | never |
 | `factors` | yes (gauge + bounded ROI) | report + scratch aligned cache | never |
 
-Any `--out`, `--report-dir` or `--scratch-dir` inside a read-only tree
-(`/home/tristan/caldwell11`, the capture dir, the source dir) is REFUSED before
-any work.
+Any `--out`, `--report-dir` or `--scratch-dir` inside a read-only input tree (the
+capture directory or the lights root passed to the tool, plus any root named in
+`R38A_FORBIDDEN_ROOTS`) is REFUSED before any work. A symlinked capture or source
+root passed on the command line is refused as well.
 
 ## 4. Behaviour
 

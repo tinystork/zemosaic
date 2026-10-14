@@ -63,6 +63,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
@@ -122,13 +123,19 @@ GAUGE_STEP_CONSISTENCY_MAX = 0.25    # mad(|step|) / |step| <= 25% -> stable ste
 MIN_PROBED_RELATIONS = 2             # fewer probed relations -> INCONCLUSIVE
 
 REPORT_DIR_DEFAULT = Path(
-    "/home/tristan/.openclaw/workspace/.a2a-reports/ZM-ZEGRID-R38-A-CAUSAL"
+    os.environ.get("R38A_REPORT_DIR")
+    or (Path.home() / ".openclaw" / "workspace" / ".a2a-reports" / "ZM-ZEGRID-R38-A-CAUSAL")
 )
-SCRATCH_DIR_DEFAULT = Path("/var/tmp/openclaw-tristan/r38a")
+SCRATCH_DIR_DEFAULT = Path(os.environ.get("R38A_SCRATCH_DIR")
+                           or (Path(tempfile.gettempdir()) / "openclaw-r38a"))
 
-# Read-only trees the tool must never write into (defence in depth).
-FORBIDDEN_WRITE_ROOTS = (
-    Path("/home/tristan/caldwell11"),
+# Read-only trees the tool must never write into (defence in depth). EMPTY by
+# default: the RUN's own capture/source roots are always passed as
+# ``extra_forbidden``, and extra roots can be supplied via the
+# ``R38A_FORBIDDEN_ROOTS`` environment variable (os.pathsep-separated). No private
+# absolute path is hard-coded here.
+FORBIDDEN_WRITE_ROOTS = tuple(
+    Path(p) for p in os.environ.get("R38A_FORBIDDEN_ROOTS", "").split(os.pathsep) if p.strip()
 )
 
 
@@ -243,16 +250,22 @@ def source_set_digest(identifiers) -> str:
 _WIN_DRIVE_RE = re.compile(r"(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]")
 _UNC_RE = re.compile(r"(?:^|[^\\])\\\\[A-Za-z0-9._$-]+[\\]")
 _FILE_URI_RE = re.compile(r"file://", re.IGNORECASE)
-_POSIX_EMBEDDED_RE = re.compile(
-    r"(?:^|[\s'\"=(,:\[])/(?:home|root|var|tmp|mnt|media|opt|usr|srv|etc|proc|dev|run)(?:/|$)"
+# Generalized EMBEDDED POSIX absolute path: a single leading '/' (not a URL scheme
+# separator, not a fraction/ratio, not a Windows drive) followed by at least one
+# path-like component. Deliberately NOT limited to a fixed root allowlist, so an
+# unknown mount ('see /custom/mount/x') is still caught.
+_POSIX_ABS_EMBEDDED_RE = re.compile(
+    r"(?<![\w:/])(?:/(?:[A-Za-z0-9._~+\-]+/)+[A-Za-z0-9._~+\-]*|/[A-Za-z0-9._~+\-]+)"
 )
+REDACTED_PATH = "<redacted:absolute-path>"
 
 
 def path_leak_category(value: str) -> str | None:
     """Return a leak category when ``value`` carries an absolute/private path.
 
-    Recognises POSIX-absolute, Windows drive-absolute, UNC and ``file://`` URI
-    forms, both as a whole value and embedded in free text.
+    Recognises POSIX-absolute (whole value OR embedded under ANY root), Windows
+    drive-absolute, UNC and ``file://`` URI forms. Ratios (``1/2``), relative
+    ids (``a/b.fit``) and URL schemes (``https://x/y``) are not flagged.
     """
     if not isinstance(value, str) or not value:
         return None
@@ -264,7 +277,7 @@ def path_leak_category(value: str) -> str | None:
         return "unc"
     if value.startswith("/"):
         return "posix_absolute"
-    if _POSIX_EMBEDDED_RE.search(value):
+    if _POSIX_ABS_EMBEDDED_RE.search(value):
         return "posix_absolute_embedded"
     return None
 
@@ -321,8 +334,62 @@ def scrub_paths(payload: Any, roots: Sequence[Path]) -> Any:
     return _walk(payload)
 
 
-def _is_drive_absolute(raw: str) -> bool:
+def redact_path_leaks(payload: Any) -> Any:
+    """Recursively REPLACE every value carrying a detected absolute path.
+
+    Unlike :func:`scrub_paths` (which only rewrites KNOWN roots), this is
+    unconditional: any offending value becomes ``<redacted:absolute-path>`` so the
+    final bytes can never persist the leak. Applied before every write, including
+    the FAILED path.
+    """
+    if isinstance(payload, Mapping):
+        return {k: redact_path_leaks(v) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [redact_path_leaks(v) for v in payload]
+    if isinstance(payload, tuple):
+        return tuple(redact_path_leaks(v) for v in payload)
+    if isinstance(payload, str) and path_leak_category(payload) is not None:
+        return REDACTED_PATH
+    return payload
+
+
+def minimal_failure_record(*, stage: str, leak_locations: Sequence[Mapping]) -> dict:
+    """Smallest SAFE failure record (never contains the offending values)."""
+    return {
+        "schema": SCHEMA_NAME,
+        "schema_version": SCHEMA_VERSION,
+        "mission": MISSION,
+        "status": "FAILED",
+        "status_reason": "durable report failed the privacy boundary",
+        "qualification": "DEV_NOT_QUALIFICATION",
+        "scientific_acceptance": False,
+        "r38b_authorized": False,
+        "failed": {
+            "stage": str(stage),
+            "leak_count": int(len(leak_locations)),
+            "categories": sorted({str(l.get("category")) for l in leak_locations}),
+            "json_paths": sorted({str(l.get("json_path")) for l in leak_locations}),
+        },
+        "privacy": {"policy": "no absolute/private path may appear in the durable artifact",
+                    "leaks": int(len(leak_locations))},
+    }
+
+
+def enforce_privacy_boundary(payload: Any, roots: Sequence[Path]) -> tuple[Any, list[dict]]:
+    """Scrub known roots, redact ANY remaining leak, then rescan (fail closed).
+
+    Returns ``(safe_payload, remaining_leaks)``. The caller MUST refuse to write
+    when ``remaining_leaks`` is non-empty.
+    """
+    scrubbed = scrub_paths(payload, roots)
+    redacted = redact_path_leaks(scrubbed)
+    return redacted, scan_path_leaks(redacted)
     """True for Windows drive-absolute ids (drive letter + ``/`` or ``\\``)."""
+    return bool(re.match(r"^[A-Za-z]:[\\/]", str(raw).strip()))
+
+
+def _is_drive_absolute(raw: str) -> bool:
+    """True for Windows drive-absolute ids (drive letter + ``/`` or backslash)."""
     return bool(re.match(r"^[A-Za-z]:[\\/]", str(raw).strip()))
 
 
@@ -667,16 +734,23 @@ def resolve_sources(source_dir: Path, frame_ids: Sequence[str]) -> dict:
         if raw.strip().lower().startswith("file://"):
             problems.append(f"frame_ids[{idx}]: file:// URI id refused")
             continue
-        norm = raw.replace("\\", "/")
+        if "\\" in raw:
+            problems.append(f"frame_ids[{idx}]: noncanonical backslash separator refused")
+            continue
+        norm = raw
+        segs = norm.split("/")
+        if any(s == "" for s in segs):
+            problems.append(f"frame_ids[{idx}]: noncanonical empty path segment refused")
+            continue
+        if any(s == "." for s in segs):
+            problems.append(f"frame_ids[{idx}]: noncanonical '.' path segment refused")
+            continue
         pp = PurePosixPath(norm)
-        if norm == "" or norm.startswith("/") or norm.startswith("//") or pp.is_absolute():
+        if norm == "" or norm.startswith("/") or pp.is_absolute():
             problems.append(f"frame_ids[{idx}]: absolute/empty id refused")
             continue
         if any(part == ".." for part in pp.parts):
             problems.append(f"frame_ids[{idx}]: traversal refused")
-            continue
-        if any(part == "" for part in pp.parts):
-            problems.append(f"frame_ids[{idx}]: empty path component refused")
             continue
         chosen = by_rel.get(norm)
         if chosen is None:
@@ -985,36 +1059,68 @@ def _binding_path(cache_dir: Path) -> Path:
     return Path(cache_dir) / "r38a_binding.json"
 
 
-def compute_cache_binding(cell_id: str, ctx: Mapping, identity: Mapping,
-                          source_root_label: str, source_files_on_disk: int,
-                          cfg_tokens: Mapping) -> dict:
-    """Bounded, private-root-free binding describing WHICH run a cache belongs to.
+def source_root_identity(source_root: Path) -> str:
+    """One-way, domain-separated identity of the NORMALIZED resolved source root.
 
-    Rejects a stale cache from a different capture / source set / source tree /
-    WCS / layout / patch / config. The private source root is NOT persisted (only
-    its basename label); per-frame source file size + descriptor header digest are
-    bounded fingerprints that change when the underlying tree changes.
+    The raw path is never persisted. Two different roots collide here only if they
+    resolve to the same absolute path; two roots with the same
+    basename but different locations produce DIFFERENT identities.
+    """
+    try:
+        norm = str(Path(source_root).expanduser().resolve())
+    except Exception:
+        norm = str(source_root)
+    h = hashlib.sha256()
+    h.update(b"zemosaic.zegrid.r38a.source_root.v1\n")
+    h.update(norm.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _stat_identity(path: str) -> tuple:
+    """Deterministic stat fingerprint (size, mtime_ns, dev, ino where supported)."""
+    try:
+        st = os.stat(path)
+        return (int(st.st_size), int(getattr(st, "st_mtime_ns", 0)),
+                int(getattr(st, "st_dev", 0)), int(getattr(st, "st_ino", 0)))
+    except OSError:
+        return (-1, -1, -1, -1)
+
+
+def compute_cache_binding(cell_id: str, ctx: Mapping, identity: Mapping,
+                          source_root: Path, source_files_on_disk: int,
+                          cfg_tokens: Mapping) -> dict:
+    """Bounded, private-root-free binding (SCHEMA v2) describing WHICH run a cache
+    belongs to. Rejects a stale cache from a different capture / source set /
+    source TREE / WCS / layout / patch / config.
+
+    PRIVACY: only ``source_root_identity_sha256`` (one-way) and the root BASENAME
+    label are persisted — never the path.
+
+    GUARANTEE (honest): the binding rejects a *different tree* (different resolved
+    root) and ordinary IN-PLACE replacement/touch of a source frame (stat
+    fingerprint + descriptor facts). It is NOT a cryptographic content-identity
+    proof: the source bytes are not hashed (unbounded I/O would be needed), so a
+    byte-identical-size/different-content substitution that also preserves
+    size+mtime_ns+dev+ino could in principle collide (an adversarial case that
+    requires reproducing inode identity, not the ordinary stale-tree class).
     """
     cell, patch, mem = ctx
     ids = list(mem.patch_ids)
     rows = []
     for fid in ids:
         d = _all_descs_by_id[fid]
-        try:
-            size = int(os.stat(d.source_path).st_size)
-        except OSError:
-            size = -1
-        rows.append((fid, size, d.header_sha256 or ""))
-    frames_blob = "\n".join(f"{a}\t{b}\t{c}" for a, b, c in rows)
-    names_sizes = "\n".join(f"{a}\t{b}" for a, b, _c in rows)
+        size, mtime_ns, dev, ino = _stat_identity(d.source_path)
+        rows.append((fid, size, mtime_ns, dev, ino, d.header_sha256 or ""))
+    frames_blob = "\n".join("\t".join(str(v) for v in row) for row in rows)
     return {
-        "version": 1,
+        "schema_version": 2,
         "cell_id": cell_id,
         "capture_id": identity["capture_id"],
         "artifact_sha256": identity["artifact_sha256"],
         "source_set_digest": identity["source_set_digest"],
         "n_source_frames": int(identity["n_source_frames"]),
-        "source_root_label": source_root_label,
+        "source_root_label": Path(source_root).name,
+        "source_root_identity_sha256": source_root_identity(source_root),
         "n_source_files_on_disk": int(source_files_on_disk),
         "canvas_id": identity["canvas_id"],
         "layout": {"nx": int(identity["nx"]), "ny": int(identity["ny"]),
@@ -1025,7 +1131,14 @@ def compute_cache_binding(cell_id: str, ctx: Mapping, identity: Mapping,
         "n_frames": len(ids),
         "frame_ids_digest": hashlib.sha256("\n".join(ids).encode()).hexdigest(),
         "descriptors_digest": hashlib.sha256(frames_blob.encode()).hexdigest(),
-        "source_fingerprint": hashlib.sha256(names_sizes.encode()).hexdigest(),
+        "source_fingerprint": hashlib.sha256(frames_blob.encode()).hexdigest(),
+        "stat_identity_included": True,
+        "content_bytes_hashed": False,
+        "guarantee": (
+            "rejects a different resolved source root and in-place source "
+            "replacement/touch (stat fingerprint + descriptor facts); NOT a "
+            "cryptographic pixel-content proof"
+        ),
     }
 
 
@@ -1943,24 +2056,61 @@ def _write_report(out_path: Path, report: Mapping) -> int:
     return len(text)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    _quiet()
-    t_start = time.perf_counter()
-    deadline = t_start + float(args.max_seconds)
+def _prepare_run(args):
+    """Validate the RAW arguments (symlinks included) then resolve and prepare.
 
-    capture_dir = Path(args.capture_dir).expanduser().resolve()
-    source_dir = Path(args.source_dir).expanduser().resolve()
+    L3r: the RAW expanded argument is checked for a symlink BEFORE ``.resolve()``,
+    so a symlinked source/capture root is refused by the real CLI path (not only by
+    the ``resolve_sources`` unit entry point). Output/scratch roots are still
+    resolved and compared against the read-only trees by ``_assert_write_allowed``.
+    """
+    raw_capture = Path(args.capture_dir).expanduser()
+    raw_source = Path(args.source_dir).expanduser()
+    for label, raw in (("capture dir", raw_capture), ("source dir", raw_source)):
+        if raw.is_symlink():
+            raise ResolutionError(f"{label} is a symlink; refusing (fail-closed)")
+    capture_dir = raw_capture.resolve()
+    source_dir = raw_source.resolve()
     scratch = _assert_write_allowed(args.scratch_dir, label="scratch dir",
                                     extra_forbidden=(capture_dir, source_dir))
     report_dir = _assert_write_allowed(args.report_dir, label="report dir",
                                        extra_forbidden=(capture_dir, source_dir))
     out_path = Path(args.out).expanduser() if args.out else (report_dir / f"r38a_{args.mode}.json")
     _assert_write_allowed(out_path, label="report file", extra_forbidden=(capture_dir, source_dir))
-
     identity = validate_identity(capture_dir, expect=args.expect_identity)
     resolution = resolve_sources(source_dir, identity["frame_ids"])
     geometry = reconstruct_geometry(resolution["paths"], source_dir)
+    return (capture_dir, source_dir, scratch, report_dir, out_path,
+            identity, resolution, geometry)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    _quiet()
+    t_start = time.perf_counter()
+    deadline = t_start + float(args.max_seconds)
+
+    try:
+        (capture_dir, source_dir, scratch, report_dir, out_path,
+         identity, resolution, geometry) = _prepare_run(args)
+    except _not_run_exceptions() as exc:
+        out_path = Path(args.out).expanduser() if args.out else (
+            Path(args.report_dir).expanduser() / f"r38a_{args.mode}.json")
+        record = {
+            "schema": SCHEMA_NAME, "schema_version": SCHEMA_VERSION, "mission": MISSION,
+            "mode": args.mode, "status": "FAILED",
+            "status_reason": f"{type(exc).__name__}: {exc}",
+            "qualification": "DEV_NOT_QUALIFICATION", "scientific_acceptance": False,
+            "r38b_authorized": False,
+        }
+        safe, leaks = enforce_privacy_boundary(record, (Path(args.source_dir).expanduser(),
+                                                       Path(args.capture_dir).expanduser()))
+        if leaks:
+            safe = minimal_failure_record(stage="prepare", leak_locations=leaks)
+        _write_report(out_path, safe)
+        print(json.dumps({"status": "FAILED", "mode": args.mode,
+                          "reason": type(exc).__name__, "out": str(out_path)}, sort_keys=True))
+        return 1
 
     report: dict = {
         "schema": SCHEMA_NAME,
@@ -2124,25 +2274,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         "repo_head": _git_head(),
     }
 
-    # --- durable-report privacy boundary (fail closed) ---------------------
-    scrubbed = scrub_paths(report, (capture_dir, source_dir, scratch, report_dir))
-    leaks = scan_path_leaks(scrubbed)
-    scrubbed["privacy"] = {
-        "scan": "recursive over every persisted value",
-        "categories": ["posix_absolute", "windows_drive_absolute", "unc", "file_uri",
-                       "posix_absolute_embedded"],
-        "leaks": len(leaks),
-        "leak_locations": [{"json_path": l["json_path"], "category": l["category"]} for l in leaks],
-        "policy": "no absolute/private path may appear in the durable artifact",
-    }
+    # --- durable-report privacy boundary (truly fail closed) ----------------
+    scrubbed, leaks = enforce_privacy_boundary(report, (capture_dir, source_dir, scratch,
+                                                        report_dir))
     if leaks:
-        scrubbed["status"] = "FAILED"
-        scrubbed["status_reason"] = f"privacy leak scan found {len(leaks)} absolute/private path value(s)"
-        scrubbed["failed"] = {"stage": "privacy_scan", "leak_count": len(leaks)}
-        size = _write_report(out_path, scrubbed)
-        print(f"R38A {args.mode}: FAILED privacy scan; wrote {out_path} ({size} bytes)")
+        # redaction still left a leak: write ONLY a minimal safe failure record
+        safe = minimal_failure_record(stage="privacy_scan", leak_locations=leaks)
+        safe_leaks = scan_path_leaks(safe)
+        if safe_leaks:  # paranoia: never write an unverified record
+            safe = {"schema": SCHEMA_NAME, "schema_version": SCHEMA_VERSION, "mission": MISSION,
+                    "status": "FAILED", "failed": {"stage": "privacy_scan"},
+                    "privacy": {"policy": "no absolute/private path may appear in the durable artifact"}}
+            if scan_path_leaks(safe):
+                print(json.dumps({"status": "FAILED", "mode": args.mode,
+                                  "reason": "privacy_scan_unwritable"}, sort_keys=True))
+                return 3
+        size = _write_report(out_path, safe)
+        print(f"R38A {args.mode}: FAILED privacy scan; wrote minimal safe record ({size} bytes)")
         print(json.dumps({"status": "FAILED", "mode": args.mode,
                           "reason": "privacy_scan", "out": str(out_path)}, sort_keys=True))
+        return 3
+
+    scrubbed["privacy"] = {
+        "scan": "recursive over every persisted value (after known-root scrub + redaction)",
+        "categories": ["posix_absolute", "windows_drive_absolute", "unc", "file_uri",
+                       "posix_absolute_embedded"],
+        "leaks": 0,
+        "policy": "no absolute/private path may appear in the durable artifact",
+    }
+    final_leaks = scan_path_leaks(scrubbed)
+    if final_leaks:  # the annotated record itself must always pass the scanner
+        print(json.dumps({"status": "FAILED", "mode": args.mode,
+                          "reason": "privacy_scan_postcheck"}, sort_keys=True))
         return 3
 
     size = _write_report(out_path, scrubbed)
@@ -2186,8 +2349,8 @@ def _run_real_probe(args, report, geometry, panel, costs, scratch, t_start, dead
         "taper": cfg.taper, "taper_px": cfg.taper_px, "backend": cfg.backend,
     }
     ident = report["identity"]["computed"]
-    src_label = report["resolution"]["source_root_label"]
     n_files = report["resolution"]["n_files_on_disk"]
+    source_root = Path(args.source_dir).expanduser().resolve()
     selected_cells = list(costs["selected_cells"])
     report["probe_plan"]["executed_cells"] = selected_cells
     gauge_results: list[dict] = []
@@ -2201,7 +2364,7 @@ def _run_real_probe(args, report, geometry, panel, costs, scratch, t_start, dead
             continue
         try:
             ctx = geometry["_cell_ctx"][cid]
-            binding = compute_cache_binding(cid, ctx, ident, src_label, n_files, cfg_tokens)
+            binding = compute_cache_binding(cid, ctx, ident, source_root, n_files, cfg_tokens)
             if gauge_reuse is not None:
                 cdir = gauge_reuse / "cells" / cid
                 if not (cdir / "manifest.json").is_file():
