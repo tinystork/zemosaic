@@ -405,7 +405,9 @@ def load_baseline(baseline_run_dir: str | os.PathLike[str]) -> BaselineInfo:
 class SelectionResolution:
     input_dir: Path
     paths: tuple[Path, ...]
-    basenames: tuple[str, ...]
+    #: Canonical POSIX relative logical ids under ``input_dir`` — the SAME
+    #: identity the engine emits as ``FrameId.logical_path`` (NEVER a basename).
+    logical_ids: tuple[str, ...]
     digest: str
     matched_by_relative: int
     matched_by_basename: int
@@ -414,13 +416,17 @@ class SelectionResolution:
     def count(self) -> int:
         return len(self.paths)
 
+    @property
+    def basenames(self) -> tuple[str, ...]:
+        return tuple(PurePosixPath(i).name for i in self.logical_ids)
+
     def to_dict(self) -> dict:
         return {
             "requested": self.count,
             "resolved": self.count,
             "matched_by_relative_path": self.matched_by_relative,
             "matched_by_basename": self.matched_by_basename,
-            "basenames_digest_sha256": self.digest,
+            "logical_ids_digest_sha256": self.digest,
         }
 
 
@@ -458,7 +464,6 @@ def resolve_selection(input_dir: str | os.PathLike[str],
         by_base.setdefault(_norm_key(f.name), []).append(f)
 
     resolved: list[Path] = []
-    basenames: list[str] = []
     seen: set[Path] = set()
     n_rel = 0
     n_base = 0
@@ -516,7 +521,6 @@ def resolve_selection(input_dir: str | os.PathLike[str],
             continue
         seen.add(chosen)
         resolved.append(chosen)
-        basenames.append(chosen.name)
         if mode == "relative":
             n_rel += 1
         else:
@@ -537,11 +541,12 @@ def resolve_selection(input_dir: str | os.PathLike[str],
     if not resolved:
         raise SelectionError("selection resolved zero frames")
 
+    logical_ids = [p.relative_to(root).as_posix() for p in resolved]
     return SelectionResolution(
         input_dir=root,
         paths=tuple(resolved),
-        basenames=tuple(basenames),
-        digest=_digest_names(basenames),
+        logical_ids=tuple(logical_ids),
+        digest=_digest_names(logical_ids),
         matched_by_relative=n_rel,
         matched_by_basename=n_base,
     )
@@ -928,6 +933,73 @@ def _call_run_zegrid_mode(input_folder: str, output_folder: str, *,
     )
 
 
+def _canonical_manifest_id(fid: Any) -> str:
+    """Return a manifest frame id as a canonical POSIX relative logical path.
+
+    Fails CLOSED (raises ``ValueError``) on any id that is not a canonical
+    relative logical path: empty, absolute, drive-absolute, UNC, traversal,
+    empty/'.' components, or a non-canonical spelling (``a//b``, ``./a``). The
+    engine emits POSIX relative logical paths; separators are normalised
+    explicitly and anything ambiguous is rejected rather than basename-normalised.
+    """
+    raw = str(fid)
+    if raw.strip() == "":
+        raise ValueError("empty frame id")
+    norm = raw.strip().replace("\\", "/")
+    if _is_drive_absolute(norm):
+        raise ValueError(f"drive-absolute frame id {raw!r}")
+    if norm.startswith("/"):
+        raise ValueError(f"absolute/UNC frame id {raw!r}")
+    pp = PurePosixPath(norm)
+    if any(part == ".." for part in pp.parts):
+        raise ValueError(f"traversal frame id {raw!r}")
+    if any(part == "" for part in pp.parts):
+        raise ValueError(f"empty path component in frame id {raw!r}")
+    if any(part == "." for part in pp.parts):
+        raise ValueError(f"non-canonical frame id {raw!r}")
+    if pp.as_posix() != norm:
+        raise ValueError(f"non-canonical frame id {raw!r}")
+    if pp.name in ("", ".", ".."):
+        raise ValueError(f"non-canonical frame id {raw!r}")
+    return norm
+
+
+def _discover_unknown_manifests(output_dir: Path) -> list[str]:
+    """Any manifest under ``output_dir`` outside the recognized topology dirs.
+
+    Bounded recursion that NEVER follows symlinked directory trees, so a symlink
+    to an external manifest tree cannot be used to smuggle a pass in (or to
+    traverse outside the output dir). Returns POSIX relative dir names.
+    """
+    known: set = set()
+    try:
+        known.add(output_dir.resolve(strict=False))
+    except Exception:
+        known.add(output_dir)
+    for name in MOUNT_PASS_DIRS:
+        try:
+            known.add((output_dir / name).resolve(strict=False))
+        except Exception:
+            known.add(output_dir / name)
+    unknown: list[str] = []
+    for root, dirs, files in os.walk(output_dir, followlinks=False):
+        rp = Path(root)
+        # never descend through symlinked directories
+        dirs[:] = [d for d in dirs if not (rp / d).is_symlink()]
+        if MANIFEST_NAME in files:
+            try:
+                key = rp.resolve(strict=False)
+            except Exception:
+                key = rp
+            if key not in known:
+                try:
+                    rel = rp.relative_to(output_dir).as_posix()
+                except Exception:
+                    rel = rp.name
+                unknown.append(rel or ".")
+    return sorted(set(unknown))
+
+
 def _iter_run_dirs(output_dir: Path) -> list[Path]:
     dirs = [output_dir]
     for name in MOUNT_PASS_DIRS:
@@ -943,13 +1015,20 @@ def verify_outputs(
     baseline: BaselineInfo,
     selection: SelectionResolution,
 ) -> dict:
-    """Strict-load artifact+manifest and verify full linkage/identity/frame facts.
+    """Strict-load artifacts+manifests and verify linkage/identity/provenance.
 
-    Multi-pass aware: mount-segregated ``grid_EQ`` / ``grid_ALTZ`` pass dirs are
-    verified individually (each internally consistent, artifact source count ==
-    that pass's frame count) AND as a whole (pass frame sets disjoint, their union
-    == the exact selected frame set). Exact/capped/qualification truth is derived
-    independently from the strict-loaded artifact, not from manifest claims.
+    Topology (fail-closed): exactly ONE of
+      (a) a single root ``zegrid_manifest.json``, or
+      (b) recognized ``grid_EQ`` + ``grid_ALTZ`` pass manifests with NO root
+          manifest.
+    Any other manifest under the output dir (any depth, symlink-safe) is unknown;
+    root+passes coexistence is stale/ambiguous; a missing mount peer fails.
+
+    Identity/accounting uses canonical POSIX relative logical ids. The
+    run-level qualification is the AGGREGATE across every pass (EXACT iff every
+    pass is exact), never the first pass. Source-set provenance
+    (``source_set_digest`` / algo / counts) is recomputed per pass via the
+    accepted ``background_diagnostics`` helper.
     """
     bgd = _load_bgd()
     if CAPTURE_ARTIFACT_BASENAME != bgd.CAPTURE_ARTIFACT_BASENAME:  # pragma: no cover
@@ -960,40 +1039,88 @@ def verify_outputs(
         )
     q_exact = str(bgd.QUALIFICATION_EXACT)
     q_capped = str(bgd.QUALIFICATION_RESEARCH_ONLY_CAPPED)
+    digest_algo = str(bgd.SOURCE_SET_DIGEST_ALGO)
 
     failures: list[str] = []
     passes: list[dict] = []
 
-    # Unknown pass dir == a sub-directory carrying a manifest that is NOT one of
-    # the known mount-pass names. Never silently accept it.
-    try:
-        for child in sorted(p for p in output_dir.iterdir() if p.is_dir()):
-            if child.name in MOUNT_PASS_DIRS:
-                continue
-            if (child / MANIFEST_NAME).is_file():
-                failures.append(f"unknown pass dir with manifest: {child.name}")
-    except OSError:
-        pass
+    root_has = (output_dir / MANIFEST_NAME).is_file()
+    eq_has = (output_dir / "grid_EQ" / MANIFEST_NAME).is_file()
+    altz_has = (output_dir / "grid_ALTZ" / MANIFEST_NAME).is_file()
+
+    for unknown in _discover_unknown_manifests(output_dir):
+        failures.append(f"unknown manifest under output dir: {unknown}")
+
+    topology_ok = True
+    if root_has and (eq_has or altz_has):
+        failures.append(
+            "ambiguous topology: a root manifest coexists with mount-pass "
+            "manifests (stale/ambiguous)"
+        )
+        topology_ok = False
+    if not root_has and not (eq_has or altz_has):
+        failures.append("no zegrid_manifest.json found under the output dir")
+        topology_ok = False
+    if eq_has != altz_has:
+        failures.append("incomplete mount pair: grid_EQ and grid_ALTZ must both exist")
+        topology_ok = False
+
+    if root_has and not (eq_has or altz_has):
+        pass_dirs = [output_dir]
+    elif eq_has and altz_has and not root_has:
+        pass_dirs = [output_dir / "grid_EQ", output_dir / "grid_ALTZ"]
+    else:
+        pass_dirs = []
+
+    if not topology_ok or not pass_dirs:
+        return {
+            "verdict": "FAIL", "passes": [], "failures": failures,
+            "multi_pass": False, "aggregate_heldout_exact": False,
+            "aggregate_heldout_capped": True,
+            "aggregate_qualification": q_capped,
+            "selection_accounting": {},
+        }
 
     pass_sets: list[set] = []
-    for run_dir in _iter_run_dirs(output_dir):
+    for run_dir in pass_dirs:
         manifest_path = run_dir / MANIFEST_NAME
-        if not manifest_path.is_file():
-            continue
         manifest = load_json_strict(manifest_path)
         frame_ids_raw = [str(f) for f in (manifest.get("frame_ids") or [])]
-        pass_basenames = [Path(f).name for f in frame_ids_raw]
-        pass_set = set(pass_basenames)
-        pass_sets.append(pass_set)
         artifact_path = run_dir / bgd.CAPTURE_ARTIFACT_BASENAME
         entry: dict = {
             "pass_dir": run_dir.name,
             "artifact_basename": artifact_path.name,
             "artifact_exists": artifact_path.is_file(),
-            "pass_frame_count": len(pass_set),
             "manifest_n_frames": manifest.get("n_frames"),
         }
         checks: dict[str, bool] = {}
+
+        # canonical logical ids (fail closed on any malformed id)
+        pass_ids: list[str] = []
+        malformed: list[str] = []
+        for fid in frame_ids_raw:
+            try:
+                pass_ids.append(_canonical_manifest_id(fid))
+            except ValueError as exc:
+                malformed.append(str(exc))
+        pass_set = set(pass_ids)
+        pass_sets.append(pass_set)
+        entry["pass_frame_count"] = len(pass_set)
+        checks["manifest_ids_canonical"] = not malformed
+        if malformed:
+            failures.append(
+                f"{run_dir.name}: malformed manifest logical frame id(s): "
+                + "; ".join(malformed[:5])
+            )
+        checks["pass_frames_unique"] = len(pass_ids) == len(pass_set)
+        checks["pass_n_frames_consistent"] = (
+            _is_int(manifest.get("n_frames")) and int(manifest["n_frames"]) == len(pass_set)
+        )
+        if not checks["pass_frames_unique"]:
+            failures.append(f"{run_dir.name}: duplicate logical frame_ids within the pass")
+        if not checks["pass_n_frames_consistent"]:
+            failures.append(f"{run_dir.name}: manifest n_frames != unique logical frame_ids")
+
         try:
             cap = manifest["cell_feather"]["r37_diagnostic_capture"]
         except Exception:
@@ -1003,17 +1130,6 @@ def verify_outputs(
             checks["manifest_capture_block"] = False
         else:
             checks["manifest_capture_block"] = True
-
-        checks["pass_frames_unique"] = len(frame_ids_raw) == len(pass_set)
-        checks["pass_n_frames_consistent"] = (
-            _is_int(manifest.get("n_frames")) and int(manifest["n_frames"]) == len(pass_set)
-        )
-        if not checks["pass_frames_unique"]:
-            failures.append(f"{run_dir.name}: duplicate frame_ids within the pass")
-        if not checks["pass_n_frames_consistent"]:
-            failures.append(
-                f"{run_dir.name}: manifest n_frames != unique frame_ids count"
-            )
 
         if not artifact_path.is_file():
             failures.append(f"{run_dir.name}: capture artifact missing ({artifact_path.name})")
@@ -1027,7 +1143,12 @@ def verify_outputs(
         try:
             artifact = bgd.load_file(artifact_path)
         except Exception as exc:
-            failures.append(f"{run_dir.name}: artifact failed strict load ({exc})")
+            # category + basename only: never echo raw exception text (it may
+            # embed an absolute path).
+            failures.append(
+                f"{run_dir.name}: artifact failed strict load "
+                f"({type(exc).__name__}, {artifact_path.name})"
+            )
             checks["artifact_strict_load"] = False
             entry["checks"] = checks
             entry["pass_ok"] = False
@@ -1044,6 +1165,7 @@ def verify_outputs(
         art_exact = bool(artifact.heldout_exact())
         art_qualification = q_capped if art_capped else q_exact
         art_source_count = capture_block.get("n_source_frames")
+        recomputed_digest = str(bgd.source_set_digest(pass_ids))
 
         entry.update({
             "capture_id": capture_block.get("capture_id"),
@@ -1057,6 +1179,8 @@ def verify_outputs(
             "manifest_qualification": (cap or {}).get("qualification"),
             "manifest_heldout_capped": (cap or {}).get("holdout_capped"),
             "manifest_heldout_exact": (cap or {}).get("holdout_exact"),
+            "recomputed_source_set_digest": recomputed_digest,
+            "source_set_digest_algo": digest_algo,
             "n_relations": len(artifact.observations),
             "n_dropped": len(artifact.dropped),
             "artifact_meta_nx": int(artifact.meta["nx"]),
@@ -1074,9 +1198,7 @@ def verify_outputs(
             "sha256": disk_digest,
             "bytes": disk_bytes,
         }
-        checks["manifest_links_artifact"] = bool(
-            bgd.manifest_links_artifact(linkage_meta, cap)
-        )
+        checks["manifest_links_artifact"] = bool(bgd.manifest_links_artifact(linkage_meta, cap))
         checks["capture_id_matches_manifest"] = (
             capture_block.get("capture_id") is not None
             and capture_block.get("capture_id") == (cap or {}).get("capture_id")
@@ -1101,8 +1223,24 @@ def verify_outputs(
         checks["manifest_gauge_per_cell"] = (
             manifest.get("photometric_gauge", {}).get("mode") == CELL_GAUGE_MODE_PER_CELL
         )
+        # source-set provenance (independent recomputation)
+        checks["artifact_source_set_digest_matches"] = (
+            capture_block.get("source_set_digest") == recomputed_digest
+        )
+        checks["artifact_source_set_digest_algo_matches"] = (
+            capture_block.get("source_set_digest_algo") == digest_algo
+        )
+        checks["manifest_source_set_digest_matches"] = (
+            (cap or {}).get("source_set_digest") == recomputed_digest
+        )
+        checks["manifest_source_set_digest_algo_matches"] = (
+            (cap or {}).get("source_set_digest_algo") == digest_algo
+        )
         checks["artifact_source_count_matches_pass"] = (
             _is_int(art_source_count) and int(art_source_count) == len(pass_set)
+        )
+        checks["manifest_source_count_matches_pass"] = (
+            (cap or {}).get("n_source_frames") == len(pass_set)
         )
         # artifact-derived qualification vs manifest claims (all three)
         checks["artifact_qualification_matches_manifest"] = (
@@ -1115,7 +1253,8 @@ def verify_outputs(
             (cap or {}).get("holdout_exact") == art_exact
         )
         checks["manifest_qualification_consistent"] = (
-            (cap or {}).get("qualification") == (q_capped if (cap or {}).get("holdout_capped") else q_exact)
+            (cap or {}).get("qualification")
+            == (q_capped if (cap or {}).get("holdout_capped") else q_exact)
         )
 
         for key, val in checks.items():
@@ -1125,11 +1264,7 @@ def verify_outputs(
         entry["pass_ok"] = all(checks.values())
         passes.append(entry)
 
-    if not passes:
-        failures.append("no zegrid_manifest.json found under the output dir")
-        return {"verdict": "FAIL", "passes": [], "failures": failures, "multi_pass": False}
-
-    multi_pass = len(passes) > 1
+    multi_pass = len(pass_dirs) > 1
     union: set = set()
     disjoint = True
     for s in pass_sets:
@@ -1151,6 +1286,11 @@ def verify_outputs(
         if not val:
             failures.append(f"selection accounting: check failed: {key}")
 
+    # HIGH: run-level qualification is the AGGREGATE across every pass.
+    aggregate_exact = bool(passes) and all(bool(p.get("artifact_heldout_exact")) for p in passes)
+    aggregate_capped = any(bool(p.get("artifact_heldout_capped")) for p in passes)
+    aggregate_qualification = q_exact if aggregate_exact else q_capped
+
     verdict = "PASS" if (not failures and all(p.get("pass_ok") for p in passes)) else "FAIL"
     return {
         "verdict": verdict,
@@ -1159,31 +1299,62 @@ def verify_outputs(
         "multi_pass": multi_pass,
         "selection_accounting": accounting,
         "union_frame_count": len(union),
+        "aggregate_heldout_exact": aggregate_exact,
+        "aggregate_heldout_capped": aggregate_capped,
+        "aggregate_qualification": aggregate_qualification,
     }
 
 
-def _scrub_absolute_paths(obj: Any) -> Any:
-    """Recursively replace absolute-path-looking strings with their basename.
+#: Embedded absolute-path tokens (as opposed to start-anchored whole strings).
+#: The POSIX form requires >= 2 separators so ordinary prose (``WCS/shape``)
+#: is NOT mangled. Known absolute roots are handled separately (they may embed
+#: spaces, which regexes cannot capture reliably).
+_EMBEDDED_UNC_RE = re.compile(r"\\\\[^\s'\"<>()\[\]]+")
+_EMBEDDED_WIN_RE = re.compile(r"[A-Za-z]:[\\/][^\s'\"<>()\[\]]+")
+_EMBEDDED_POSIX_RE = re.compile(r"/(?:[^\s'\"<>()\[\]]+/)+[^\s'\"<>()\[\]]*")
+
+
+def _basename_of_token(token: str) -> str:
+    t = str(token).replace("\\", "/").rstrip("/")
+    base = t.rsplit("/", 1)[-1]
+    return base or "<abs-path>"
+
+
+def _scrub_string(value: str, roots: Sequence[str]) -> str:
+    out = value
+    # 1) known absolute roots (robust to embedded spaces), replaced by basename.
+    for root in roots:
+        if not root:
+            continue
+        try:
+            base = PurePosixPath(str(root).replace("\\", "/")).name or "<root>"
+        except Exception:
+            base = "<root>"
+        out = out.replace(str(root), base)
+    # 2) embedded generic absolute tokens anywhere in the text.
+    out = _EMBEDDED_UNC_RE.sub(lambda m: _basename_of_token(m.group(0)), out)
+    out = _EMBEDDED_WIN_RE.sub(lambda m: _basename_of_token(m.group(0)), out)
+    out = _EMBEDDED_POSIX_RE.sub(lambda m: _basename_of_token(m.group(0)), out)
+    return out
+
+
+def _scrub_absolute_paths(obj: Any, roots: Sequence[str] = ()) -> Any:
+    """Recursively remove private absolute paths from a durable-report structure.
 
     Defense-in-depth at the durable-report boundary: the runner may use real
     absolute paths during execution, but the persisted verification report must
-    carry only non-sensitive basename/count/digest/boolean facts.
+    carry only non-sensitive basename/count/digest/boolean facts. Removes BOTH
+    whole-value paths AND paths embedded after text (POSIX / Windows / UNC,
+    including paths with spaces via the known ``roots``).
     """
     if isinstance(obj, str):
-        if re.match(r"^(/|[A-Za-z]:[\\/]|\\\\)", obj):
-            try:
-                # Backslashes are not separators on POSIX; normalise first.
-                base = PurePosixPath(obj.replace("\\", "/")).name
-            except Exception:
-                base = ""
-            return base or "<abs-path>"
-        return obj
+        return _scrub_string(obj, roots)
     if isinstance(obj, list):
-        return [_scrub_absolute_paths(v) for v in obj]
+        return [_scrub_absolute_paths(v, roots) for v in obj]
     if isinstance(obj, tuple):
-        return [_scrub_absolute_paths(v) for v in obj]
+        return [_scrub_absolute_paths(v, roots) for v in obj]
     if isinstance(obj, Mapping):
-        return {k: _scrub_absolute_paths(v) for k, v in obj.items()}
+        return {k: _scrub_absolute_paths(v, roots) for k, v in obj.items()}
     return obj
 
 
@@ -1225,8 +1396,13 @@ def build_verification_report(
     the verification entries, never from manifest claims. Absolute paths are
     scrubbed at this durable-report boundary.
     """
-    artifact = None
+    multi_pass = bool(verification.get("multi_pass"))
+    aggregate_exact = bool(verification.get("aggregate_heldout_exact"))
+    aggregate_capped = bool(verification.get("aggregate_heldout_capped"))
+    aggregate_qualification = verification.get("aggregate_qualification")
+
     pass_summaries = []
+    artifact = None
     for p in verification.get("passes", ()):
         pass_summaries.append({
             "pass_dir": p.get("pass_dir"),
@@ -1234,11 +1410,16 @@ def build_verification_report(
             "artifact_exists": bool(p.get("artifact_exists")),
             "artifact_sha256": p.get("sha256"),
             "artifact_bytes": p.get("bytes"),
+            "capture_id": p.get("capture_id"),
             "artifact_qualification": p.get("artifact_qualification"),
             "artifact_heldout_exact": p.get("artifact_heldout_exact"),
+            "artifact_heldout_capped": p.get("artifact_heldout_capped"),
+            "recomputed_source_set_digest": p.get("recomputed_source_set_digest"),
             "pass_ok": bool(p.get("pass_ok")),
         })
-        if artifact is None and p.get("artifact_exists"):
+        # A single pass may present its full artifact; a MULTI-pass run must NOT
+        # present one pass's sha/capture id as if it were the whole run.
+        if (not multi_pass) and artifact is None and p.get("artifact_exists"):
             artifact = {
                 "pass_dir": p.get("pass_dir"),
                 "basename": p.get("artifact_basename"),
@@ -1258,6 +1439,27 @@ def build_verification_report(
                 "production_wired": p.get("production_wired"),
                 "correction_applied": p.get("correction_applied"),
             }
+    if multi_pass:
+        artifact = {
+            "multi_pass": True,
+            "n_passes": len(pass_summaries),
+            "aggregate_qualification": aggregate_qualification,
+            "aggregate_heldout_exact": aggregate_exact,
+            "aggregate_heldout_capped": aggregate_capped,
+            "union_frame_count": verification.get("union_frame_count"),
+            "per_pass_artifacts": [
+                {"pass_dir": s["pass_dir"], "sha256": s["artifact_sha256"],
+                 "bytes": s["artifact_bytes"], "capture_id": s["capture_id"],
+                 "qualification": s["artifact_qualification"],
+                 "heldout_exact": s["artifact_heldout_exact"]}
+                for s in pass_summaries
+            ],
+        }
+
+    temp_dir = str(invocation.params_report.get("temporary_work_dir") or "")
+    roots = [str(invocation.input_dir), str(baseline.run_dir),
+             str(invocation.output_dir), temp_dir]
+
     report = {
         "schema": VERIFICATION_SCHEMA,
         "version": VERIFICATION_VERSION,
@@ -1267,8 +1469,11 @@ def build_verification_report(
         "package_version": _package_version(),
         "repo_head": _git_head(_repo_root()),
         "verification_verdict": verification.get("verdict"),
-        "exact_heldout": bool(artifact and artifact.get("heldout_exact")),
-        "multi_pass": bool(verification.get("multi_pass")),
+        # run-level AGGREGATE truth (never the first pass):
+        "qualification": aggregate_qualification,
+        "exact_heldout": aggregate_exact,
+        "heldout_capped": aggregate_capped,
+        "multi_pass": multi_pass,
         "command_parameters": {
             "input_dir_basename": invocation.input_dir.name,
             "baseline_run_dir_name": baseline.run_dir.name,
@@ -1291,9 +1496,9 @@ def build_verification_report(
         },
         "failures": list(verification.get("failures") or []),
     }
-    # Durable-report boundary: strip any absolute-path-looking string that slipped
-    # through (private source/temp/output paths must never be persisted).
-    return _scrub_absolute_paths(report)
+    # Durable-report boundary: strip private absolute paths (whole-value or
+    # embedded after text) via known roots + generic patterns.
+    return _scrub_absolute_paths(report, roots)
 
 
 # ---------------------------------------------------------------------------
@@ -1482,11 +1687,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"  - {item}", file=sys.stderr, flush=True)
         return _EXIT_ERROR
 
-    art = report.get("artifact") or {}
-    exact = "EXACT" if report.get("exact_heldout") else "CAPPED (not exact)"
+    exactly = bool(report.get("exact_heldout"))
+    exact_label = "EXACT" if exactly else "CAPPED (not exact)"
+    if report.get("multi_pass"):
+        detail = f"passes={len(report.get('passes') or [])}"
+    else:
+        art = report.get("artifact") or {}
+        detail = f"sha256={art.get('sha256')} bytes={art.get('bytes')}"
     print(
-        f"[r37-runner] VERIFICATION PASS — qualification {art.get('qualification')} "
-        f"({exact}); sha256={art.get('sha256')} bytes={art.get('bytes')}",
+        f"[r37-runner] VERIFICATION PASS — aggregate qualification "
+        f"{report.get('qualification')} ({exact_label}); {detail}",
         flush=True,
     )
     return _EXIT_OK

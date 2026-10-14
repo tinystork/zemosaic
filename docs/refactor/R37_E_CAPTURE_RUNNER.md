@@ -27,7 +27,7 @@ safely on a capable machine, with a hard preflight that refuses an infeasible ho
 ## 2. What this adds
 
 * `tools/r37_capture_runner.py` — a generic, dry-run-by-default CLI.
-* `tests/test_zegrid_r37e_capture_runner.py` — focused tests (45).
+* `tests/test_zegrid_r37e_capture_runner.py` — focused suite.
 * this document.
 
 **No** production module, default, GUI wiring, correction application, new
@@ -160,8 +160,15 @@ the console.
 
 ### 4.4 Post-run verification
 
-After a successful run the runner strict-loads the artifacts + manifests (in the
-base and any mount-pass `grid_EQ`/`grid_ALTZ` dirs) and checks:
+**Topology (fail-closed).** Exactly one of these is accepted: (a) a single root
+`zegrid_manifest.json`, or (b) recognized `grid_EQ` + `grid_ALTZ` pass manifests
+with **no** root manifest. Any other `zegrid_manifest.json` anywhere under the
+output dir (any depth, symlink-safe — external symlink trees are never followed)
+is reported as an unknown manifest and fails; root+passes coexistence is
+stale/ambiguous; a missing half of the mount pair fails.
+
+After a successful run the runner strict-loads the artifacts + manifests and
+checks, per pass:
 
 * `manifest_links_artifact` on all four identity keys (`capture_id`, `filename`,
   `sha256`, `bytes`) — fed with **disk/artifact-derived** `sha256`/`bytes`, never
@@ -174,24 +181,42 @@ base and any mount-pass `grid_EQ`/`grid_ALTZ` dirs) and checks:
 * **independent exact/capped/qualification truth** derived from the strict-loaded
   artifact (`heldout_capped`, `heldout_exact()`, expected qualification) and
   compared against all three manifest capture claims; any mismatch fails;
-* layout facts: manifest and artifact `nx×ny` equal the baseline;
-* frame accounting:
-  * single pass — the manifest frame set must equal the exact selection
-    (count + digest);
-  * multi-pass (`grid_EQ`/`grid_ALTZ`) — each pass must be internally consistent
-    (`n_frames == len(unique manifest frame_ids)`, artifact source count == that
-    pass count), pass frame sets must be **disjoint**, and their **union** must
-    equal the exact selected set (count + digest). An unknown pass dir carrying a
-    manifest fails; no silent extra/missing/duplicate frame may pass.
+* **source-set provenance**: `background_diagnostics.source_set_digest()` is
+  recomputed from that pass's canonical relative logical ids and required to
+  match BOTH the artifact `provenance.capture.source_set_digest` AND the manifest
+  capture-block `source_set_digest`; both source-set-digest **algos** must equal
+  `SOURCE_SET_DIGEST_ALGO`; the artifact and manifest source counts must equal the
+  pass's unique logical-id count. Count-only or same-basename substitution fails;
+* layout facts: manifest and artifact `nx×ny` equal the baseline.
+
+**Identity** is the canonical POSIX relative logical path under the input root
+(the same id the engine emits), never a basename; malformed out-manifest ids
+(absolute / drive-absolute / UNC / traversal / empty / `.` components /
+non-canonical spelling) are rejected rather than basename-normalised.
+
+**Frame accounting:** single pass — the manifest logical-id set must equal the
+exact selection (count + digest); multi-pass — each pass is internally consistent
+(`n_frames == len(unique logical ids)`, artifact source count == that pass count),
+the pass sets are **disjoint**, and their **union** equals the exact selected set.
+
+**Run-level qualification is the aggregate over EVERY pass**: `heldout_exact =
+all(pass artifact exact)` and `heldout_capped = any(pass capped)`; the run is
+`EXACT` iff every pass is exact, otherwise `RESEARCH_ONLY_HELDOUT_CAPPED`. Per-pass
+qualification/digest detail is retained, and a multi-pass run never presents a
+single pass's sha/capture id as if it were the whole run (an explicit aggregate
+summary + per-pass list is used instead).
 
 It writes `r37_capture_verification.json` **atomically** into the output dir with
 the command parameters, invocation parameters, preflight summary, the linkage
-verdict, the artifact-derived qualification/digest/bytes, and the repo HEAD /
-package version when available. The report carries **basenames, counts and
-digests only**: absolute source/temp/report paths are scrubbed at the durable
-report boundary (execution may still use the real paths). Any post-run
-verification failure — or a failed atomic report write — is a nonzero exit (and
-a failed write never prints `VERIFICATION PASS`).
+verdict, the aggregate qualification, the artifact digest/bytes (single pass) or
+per-pass digests (multi-pass), and the repo HEAD / package version when available.
+The report carries **basenames, counts and digests only**: absolute
+source/temp/report paths — whole-value **and embedded after text**, POSIX /
+Windows / UNC, including paths with spaces — are scrubbed at the durable report
+boundary via the known roots (input, baseline, output, temporary work dir) plus
+generic patterns (execution may still use the real paths). Any post-run
+verification failure — or a failed atomic report write — is a nonzero exit (and a
+failed write never prints `VERIFICATION PASS`).
 
 ## 5. Tests
 
@@ -204,16 +229,20 @@ dry-run performs no writes and never calls the engine, failed preflight returns
 nonzero and creates no output, `--skip-memory-preflight --execute` is refused
 without ever running the engine, output-safety refusals, execution argument
 reconstruction via monkeypatch, artifact-derived exact/capped/qualification
-verification with manifest-tamper regressions (all three fields), a failed
-verification-report write returning nonzero without a `PASS` claim, report
-sanitization (rejected-WCS detail basename-only; absolute input/temp/output paths
-absent; strict JSON), multi-pass verification (valid 2-pass PASS plus
-missing/extra/duplicate/tampered/unknown-pass-dir failures), relative `.git`
-`gitdir:` resolution, non-tautological linkage (manifest `sha256`/`bytes` tamper
-fails), atomic verification report (no temp residue), and a **small real synthetic
-run** end-to-end through the CLI. A top-level import audit asserts the tool
-imports no `zemosaic` module at module scope (all lazy), so importing the runner
-never activates a capture or a run.
+verification with manifest-tamper regressions (all three fields), source-set
+provenance (digest/algo/count tamper, independently), canonical relative logical
+identity (valid nested same-basename single- and multi-pass; substitution /
+missing / extra / duplicate / malformed-id failures), the aggregate qualification
+(one EXACT pass + one CAPPED pass ⇒ linkable but overall capped/not-exact),
+topology fail-closed (nested unknown, root+passes, missing peer, symlink),
+a failed verification-report write returning nonzero without a `PASS` claim,
+report sanitization (rejected-WCS detail basename-only; embedded POSIX/Windows/UNC
+text and paths with spaces scrubbed; strict JSON), relative `.git` `gitdir:`
+resolution, non-tautological linkage (manifest `sha256`/`bytes` tamper fails),
+atomic verification report (no temp residue), and a **small real synthetic run**
+end-to-end through the CLI. A top-level import audit asserts the tool imports no
+`zemosaic` module at module scope (all lazy), so importing the runner never
+activates a capture or a run.
 
 ## 6. Limits / non-goals
 

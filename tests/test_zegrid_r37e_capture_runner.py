@@ -658,7 +658,7 @@ def test_verification_report_boundary_scrubs_absolute_paths(tmp_path):
     baseline = _write_min_baseline_info(base, ["a.fit", "b.fit"])
     sel = runner.SelectionResolution(
         input_dir=input_dir, paths=(input_dir / "a.fit",),
-        basenames=("a.fit",), digest=runner._digest_names(["a.fit"]),
+        logical_ids=("a.fit",), digest=runner._digest_names(["a.fit"]),
         matched_by_relative=1, matched_by_basename=0,
     )
     inv = runner.Invocation(
@@ -671,7 +671,10 @@ def test_verification_report_boundary_scrubs_absolute_paths(tmp_path):
         "temporary_work_dir": str(temp),
     }
     verification = {"verdict": "PASS", "passes": [{"artifact_exists": False,
-                    "pass_ok": True}], "failures": [], "multi_pass": False}
+                    "pass_ok": True}], "failures": [], "multi_pass": False,
+                    "aggregate_heldout_exact": True,
+                    "aggregate_heldout_capped": False,
+                    "aggregate_qualification": "EXACT"}
     report = runner.build_verification_report(
         invocation=inv, baseline=baseline, selection=sel, verification=verification,
         preflight_report=preflight_report, pinned_layout="2x2", holdout_cap=10, gpu_mode="auto",
@@ -749,22 +752,53 @@ def _write_min_baseline_info(dirpath, frame_ids, nx=2, ny=2):
 
 def _fabricate_pass(pass_dir, src_artifact, frame_ids, src_manifest):
     bgd = runner._load_bgd()
+    ids = [str(f) for f in frame_ids]
+    digest = bgd.source_set_digest(ids)
     payload = json.loads(pathlib.Path(src_artifact).read_text())
-    payload["provenance"]["capture"]["n_source_frames"] = len(frame_ids)
+    cap_prov = payload["provenance"]["capture"]
+    cap_prov["n_source_frames"] = len(ids)
+    cap_prov["source_set_digest"] = digest
+    cap_prov["source_set_digest_algo"] = bgd.SOURCE_SET_DIGEST_ALGO
     data = bgd.dumps(payload).encode("utf-8")
     pass_dir.mkdir(parents=True, exist_ok=True)
     (pass_dir / runner.CAPTURE_ARTIFACT_BASENAME).write_bytes(data)
     man = json.loads(pathlib.Path(src_manifest).read_text())
-    man["frame_ids"] = list(frame_ids)
-    man["n_frames"] = len(frame_ids)
+    man["frame_ids"] = list(ids)
+    man["n_frames"] = len(ids)
     cap = dict(man["cell_feather"]["r37_diagnostic_capture"])
     cap.update({
         "filename": runner.CAPTURE_ARTIFACT_BASENAME,
         "sha256": hashlib.sha256(data).hexdigest(),
         "bytes": len(data),
+        "n_source_frames": len(ids),
+        "source_set_digest": digest,
+        "source_set_digest_algo": bgd.SOURCE_SET_DIGEST_ALGO,
     })
     man["cell_feather"]["r37_diagnostic_capture"] = cap
     (pass_dir / runner.MANIFEST_NAME).write_text(json.dumps(man))
+
+
+def _patch_manifest_capture(pass_dir, **fields):
+    p = pass_dir / runner.MANIFEST_NAME
+    man = json.loads(p.read_text())
+    man["cell_feather"]["r37_diagnostic_capture"].update(fields)
+    p.write_text(json.dumps(man))
+
+
+def _patch_artifact_capture(pass_dir, **fields):
+    """Patch artifact provenance.capture AND re-sync manifest sha/bytes."""
+    bgd = runner._load_bgd()
+    ap = pass_dir / runner.CAPTURE_ARTIFACT_BASENAME
+    payload = json.loads(ap.read_text())
+    payload["provenance"]["capture"].update(fields)
+    data = bgd.dumps(payload).encode("utf-8")
+    ap.write_bytes(data)
+    mp = pass_dir / runner.MANIFEST_NAME
+    man = json.loads(mp.read_text())
+    cap = man["cell_feather"]["r37_diagnostic_capture"]
+    cap["sha256"] = hashlib.sha256(data).hexdigest()
+    cap["bytes"] = len(data)
+    mp.write_text(json.dumps(man))
 
 
 def _make_two_pass(tmp_path, tiny_baseline, eq_ids, altz_ids):
@@ -835,7 +869,7 @@ def test_verify_outputs_unknown_pass_dir_fails(tmp_path, tiny_baseline):
     (unknown / runner.MANIFEST_NAME).write_text(
         (tiny_baseline["base"] / runner.MANIFEST_NAME).read_text())
     ver = runner.verify_outputs(out, baseline=info, selection=sel)
-    assert any("unknown pass dir" in f for f in ver["failures"])
+    assert any("unknown manifest" in f for f in ver["failures"])
 
 
 def test_git_head_relative_gitdir(tmp_path):
@@ -856,3 +890,371 @@ def test_git_head_absolute_gitdir(tmp_path):
     (real / "HEAD").write_text("def456\n")
     (wt / ".git").write_text(f"gitdir: {real}\n")
     assert runner._git_head(wt) == "def456"
+
+
+# ---------------------------------------------------------------------------
+# 10. Rework-2 regressions
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def tiny_baseline_capped(tmp_path_factory, tiny_baseline):
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    base = tmp_path_factory.mktemp("r37e_capped") / "baseline"
+    zz.run_zegrid_mode(
+        str(tiny_baseline["inp"]), str(base), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
+        r37_diagnostic_holdout_cap=4,
+    )
+    (base / runner.SNAPSHOT_NAME).write_text(
+        json.dumps(_min_snapshot(stacking_rejection_algorithm="kappa_sigma")), encoding="utf-8")
+    return {"root": base.parent, "inp": tiny_baseline["inp"], "base": base}
+
+
+def test_capped_fixture_artifact_is_capped_and_not_exact(tiny_baseline_capped):
+    info = runner.load_baseline(tiny_baseline_capped["base"])
+    sel = runner.resolve_selection(tiny_baseline_capped["inp"], info.frame_ids)
+    ver = runner.verify_outputs(tiny_baseline_capped["base"], baseline=info, selection=sel)
+    assert ver["verdict"] == "PASS", ver["failures"]
+    assert ver["aggregate_heldout_exact"] is False
+    assert ver["aggregate_heldout_capped"] is True
+    assert ver["aggregate_qualification"] == "RESEARCH_ONLY_HELDOUT_CAPPED"
+
+
+def test_aggregate_one_exact_one_capped_is_not_overall_exact(tmp_path, tiny_baseline,
+                                                             tiny_baseline_capped):
+    # EQ pass: EXACT artifact; ALTZ pass: CAPPED artifact. Linkage may PASS, but
+    # the run-level aggregate is capped/not-exact.
+    info = runner.load_baseline(tiny_baseline["base"])
+    out = tmp_path / "out"
+    _fabricate_pass(out / "grid_EQ",
+                    tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f0.fit", "f1.fit"],
+                    tiny_baseline["base"] / runner.MANIFEST_NAME)
+    _fabricate_pass(out / "grid_ALTZ",
+                    tiny_baseline_capped["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f2.fit", "f3.fit"],
+                    tiny_baseline_capped["base"] / runner.MANIFEST_NAME)
+    sel = runner.resolve_selection(tiny_baseline["inp"],
+                                   ["f0.fit", "f1.fit", "f2.fit", "f3.fit"])
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "PASS", (ver["failures"], "linkage may pass")
+    assert ver["multi_pass"] is True
+    assert ver["aggregate_heldout_exact"] is False
+    assert ver["aggregate_heldout_capped"] is True
+    assert ver["aggregate_qualification"] == "RESEARCH_ONLY_HELDOUT_CAPPED"
+    # per-pass detail retained
+    quals = sorted(p["artifact_qualification"] for p in ver["passes"])
+    assert quals == ["EXACT", "RESEARCH_ONLY_HELDOUT_CAPPED"]
+
+    inv = runner.Invocation(input_dir=sel.input_dir, output_dir=out, kwargs={},
+                            params_report={"temporary_work_dir": ""})
+    report = runner.build_verification_report(
+        invocation=inv, baseline=info, selection=sel, verification=ver,
+        preflight_report={"verdict": "PASS"}, pinned_layout="2x2",
+        holdout_cap=10 ** 6, gpu_mode="off",
+    )
+    assert report["exact_heldout"] is False
+    assert report["qualification"] == "RESEARCH_ONLY_HELDOUT_CAPPED"
+    assert report["artifact"]["multi_pass"] is True
+    blob = json.dumps(report)
+    assert '"exact_heldout": true' not in blob
+    # no single pass's sha presented as the whole run
+    assert "per_pass_artifacts" in blob
+    assert "sha256" not in report["artifact"]
+
+
+def test_scrub_embedded_absolute_paths():
+    roots = ["/tmp/pytest-of-x/input lights", "C:\\Users\\t\\data"]
+    cases = {
+        "posix_embedded": ("failed: /home/u/lights/x.fit not readable", "x.fit"),
+        "windows_embedded": ("error C:\\Users\\t\\f.fit denied", "f.fit"),
+        "unc_embedded": ("error \\\\srv\\share\\f.fit denied", "f.fit"),
+        "root_with_space": (f"cannot read {roots[0]}/deep/g.fit", "g.fit"),
+        "prose_slash": ("no usable celestial WCS/shape", "WCS/shape"),
+    }
+    for name, (text, expected) in cases.items():
+        out = runner._scrub_string(text, roots)
+        assert expected in out, (name, out)
+        assert "/home/" not in out
+        assert "C:" + chr(92) not in out
+        assert chr(92) not in out
+
+
+def test_scrub_accepts_plain_text():
+    assert runner._scrub_string("plain message with 12 numbers", []) == \
+        "plain message with 12 numbers"
+
+
+def test_report_boundary_scrubs_embedded_paths_in_failures(tmp_path):
+    temp = tmp_path / "work dir"
+    temp.mkdir()
+    input_dir = tmp_path / "input lights"
+    input_dir.mkdir()
+    baseline = _write_min_baseline_info(tmp_path / "base_run", ["a.fit", "b.fit"])
+    sel = runner.SelectionResolution(
+        input_dir=input_dir, paths=(input_dir / "a.fit",),
+        logical_ids=("a.fit",), digest=runner._digest_names(["a.fit"]),
+        matched_by_relative=1, matched_by_basename=0,
+    )
+    inv = runner.Invocation(
+        input_dir=input_dir, output_dir=tmp_path / "out", kwargs={},
+        params_report={"temporary_work_dir": str(temp)},
+    )
+    verification = {
+        "verdict": "FAIL", "passes": [], "multi_pass": False,
+        "aggregate_heldout_exact": False, "aggregate_heldout_capped": True,
+        "aggregate_qualification": "RESEARCH_ONLY_HELDOUT_CAPPED",
+        "failures": [
+            f"grid_EQ: artifact failed strict load (PermissionError: {temp}/zegrid_r37_pre_feather.json)",
+            f"grid_EQ: cannot read {input_dir}/a.fit",
+            "grid_EQ: error at C:\\Users\\t\\f.fit",
+            "grid_EQ: error at \\\\srv\\share\\f.fit",
+        ],
+    }
+    report = runner.build_verification_report(
+        invocation=inv, baseline=baseline, selection=sel, verification=verification,
+        preflight_report={"verdict": "PASS"}, pinned_layout="2x2",
+        holdout_cap=10, gpu_mode="auto",
+    )
+    blob = json.dumps(report)
+    assert str(temp) not in blob
+    assert str(input_dir) not in blob
+    assert str(tmp_path) not in blob
+    assert "C:\\Users" not in blob
+    assert "\\\\srv" not in blob
+    # useful category retained
+    assert "PermissionError" in blob
+    assert json.loads(blob)["verification_verdict"] == "FAIL"
+
+
+def test_reachable_strict_load_error_embeds_no_absolute_path(tmp_path, tiny_baseline,
+                                                               monkeypatch):
+    import shutil
+    bgd = runner._load_bgd()
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    work = tmp_path / "out"
+    shutil.copytree(tiny_baseline["base"], work)
+    abs_artifact = work / runner.CAPTURE_ARTIFACT_BASENAME
+
+    def _raise(path, *a, **k):
+        raise PermissionError(f"permission denied: {abs_artifact}")
+
+    monkeypatch.setattr(bgd, "load_file", _raise)
+    ver = runner.verify_outputs(work, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("strict load" in f for f in ver["failures"])
+    report = runner.build_verification_report(
+        invocation=runner.Invocation(input_dir=sel.input_dir, output_dir=work, kwargs={},
+                                     params_report={"temporary_work_dir": ""}),
+        baseline=info, selection=sel, verification=ver,
+        preflight_report={"verdict": "PASS"}, pinned_layout="2x2",
+        holdout_cap=10 ** 6, gpu_mode="off",
+    )
+    blob = json.dumps(report)
+    assert str(work) not in blob
+    assert str(abs_artifact) not in blob
+    assert str(sel.input_dir) not in blob
+
+
+# --- canonical logical-id identity ---------------------------------------
+
+def _nested_selection(tmp_path, ids):
+    inp = tmp_path / "nested_in"
+    for i in ids:
+        p = inp / i
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"")
+    return runner.resolve_selection(inp, ids)
+
+
+def test_single_pass_same_basename_nested_relative(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    ids = ["a/f.fit", "b/f.fit"]
+    sel = _nested_selection(tmp_path, ids)
+    assert len(set(sel.logical_ids)) == 2 and sel.count == 2
+    out = tmp_path / "out"
+    _fabricate_pass(out, tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME, ids,
+                    tiny_baseline["base"] / runner.MANIFEST_NAME)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "PASS", ver["failures"]
+
+
+def test_multi_pass_same_basename_nested_relative(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    ids = ["a/f.fit", "b/f.fit", "c/f.fit", "d/f.fit"]
+    sel = _nested_selection(tmp_path, ids)
+    out = tmp_path / "out"
+    src_art = tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME
+    src_man = tiny_baseline["base"] / runner.MANIFEST_NAME
+    _fabricate_pass(out / "grid_EQ", src_art, ["a/f.fit", "b/f.fit"], src_man)
+    _fabricate_pass(out / "grid_ALTZ", src_art, ["c/f.fit", "d/f.fit"], src_man)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "PASS", ver["failures"]
+
+
+def test_same_basename_substitution_fails(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = _nested_selection(tmp_path, ["a/f.fit"])
+    out = tmp_path / "out"
+    # same COUNT and same BASENAME, different relative id -> must fail
+    _fabricate_pass(out, tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["b/f.fit"], tiny_baseline["base"] / runner.MANIFEST_NAME)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("single_pass_matches_selection" in f for f in ver["failures"])
+
+
+@pytest.mark.parametrize("bad", ["../evil.fit", "/abs.fit", "C:/abs.fit", "a//b.fit", "./a.fit"])
+def test_malformed_manifest_logical_ids_fail(tmp_path, tiny_baseline, bad):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], ["f0.fit", "f1.fit"])
+    out = tmp_path / "out"
+    _fabricate_pass(out, tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f0.fit", "f1.fit"], tiny_baseline["base"] / runner.MANIFEST_NAME)
+    man_path = out / runner.MANIFEST_NAME
+    man = json.loads(man_path.read_text())
+    man["frame_ids"] = [bad]
+    man["n_frames"] = 1
+    man_path.write_text(json.dumps(man))
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("malformed" in f or "canonical" in f for f in ver["failures"])
+
+
+# --- source-set provenance end-to-end ------------------------------------
+
+def test_source_set_provenance_consistent(tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    ver = runner.verify_outputs(tiny_baseline["base"], baseline=info, selection=sel)
+    entry = ver["passes"][0]
+    bgd = runner._load_bgd()
+    assert entry["recomputed_source_set_digest"] == bgd.source_set_digest(
+        list(info.frame_ids))
+    for k in ("artifact_source_set_digest_matches", "artifact_source_set_digest_algo_matches",
+              "manifest_source_set_digest_matches", "manifest_source_set_digest_algo_matches",
+              "artifact_source_count_matches_pass", "manifest_source_count_matches_pass"):
+        assert entry["checks"][k] is True, k
+
+
+def _single_pass_out(tmp_path, tiny_baseline, frame_ids):
+    out = tmp_path / "out"
+    _fabricate_pass(out, tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    frame_ids, tiny_baseline["base"] / runner.MANIFEST_NAME)
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], frame_ids)
+    return info, sel, out
+
+
+def test_provenance_manifest_digest_mismatch_fails(tmp_path, tiny_baseline):
+    info, sel, out = _single_pass_out(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"])
+    _patch_manifest_capture(out, source_set_digest="0" * 64)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("manifest_source_set_digest_matches" in f for f in ver["failures"])
+
+
+def test_provenance_manifest_algo_mismatch_fails(tmp_path, tiny_baseline):
+    info, sel, out = _single_pass_out(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"])
+    _patch_manifest_capture(out, source_set_digest_algo="not_the_algo")
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("manifest_source_set_digest_algo_matches" in f for f in ver["failures"])
+
+
+def test_provenance_artifact_digest_mismatch_fails(tmp_path, tiny_baseline):
+    info, sel, out = _single_pass_out(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"])
+    _patch_artifact_capture(out, source_set_digest="0" * 64)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("artifact_source_set_digest_matches" in f for f in ver["failures"])
+
+
+def test_provenance_artifact_algo_mismatch_fails(tmp_path, tiny_baseline):
+    info, sel, out = _single_pass_out(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"])
+    _patch_artifact_capture(out, source_set_digest_algo="not_the_algo")
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("artifact_source_set_digest_algo_matches" in f for f in ver["failures"])
+
+
+def test_provenance_artifact_count_mismatch_fails(tmp_path, tiny_baseline):
+    info, sel, out = _single_pass_out(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"])
+    _patch_artifact_capture(out, n_source_frames=3)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("artifact_source_count_matches_pass" in f for f in ver["failures"])
+
+
+def test_provenance_manifest_count_mismatch_fails(tmp_path, tiny_baseline):
+    info, sel, out = _single_pass_out(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"])
+    _patch_manifest_capture(out, n_source_frames=3)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("manifest_source_count_matches_pass" in f for f in ver["failures"])
+
+
+# --- topology -------------------------------------------------------------
+
+def test_topology_nested_unknown_manifest_fails(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    out = tmp_path / "out"
+    _fabricate_pass(out, tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    info.frame_ids, tiny_baseline["base"] / runner.MANIFEST_NAME)
+    nested = out / "sub" / "deep"
+    nested.mkdir(parents=True)
+    (nested / runner.MANIFEST_NAME).write_text(
+        (tiny_baseline["base"] / runner.MANIFEST_NAME).read_text())
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("unknown manifest" in f for f in ver["failures"])
+
+
+def test_topology_root_plus_passes_fails(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    out = tmp_path / "out"
+    src_art = tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME
+    src_man = tiny_baseline["base"] / runner.MANIFEST_NAME
+    _fabricate_pass(out, src_art, info.frame_ids, src_man)
+    _fabricate_pass(out / "grid_EQ", src_art, ["f0.fit", "f1.fit"], src_man)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("ambiguous topology" in f for f in ver["failures"])
+
+
+def test_topology_missing_peer_fails(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    out = tmp_path / "out"
+    _fabricate_pass(out / "grid_EQ",
+                    tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f0.fit", "f1.fit"],
+                    tiny_baseline["base"] / runner.MANIFEST_NAME)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("incomplete mount pair" in f for f in ver["failures"])
+
+
+def test_topology_symlinked_manifest_dir_not_followed(tmp_path, tiny_baseline):
+    import os as _os
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    out = tmp_path / "out"
+    _fabricate_pass(out, tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    info.frame_ids, tiny_baseline["base"] / runner.MANIFEST_NAME)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / runner.MANIFEST_NAME).write_text("{")
+    link = out / "linked"
+    try:
+        _os.symlink(external, link, target_is_directory=True)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("symlinks not supported on this platform")
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    # the symlinked external tree must not be traversed or flagged
+    assert not any("linked" in f for f in ver["failures"])
+    assert ver["verdict"] == "PASS", ver["failures"]
