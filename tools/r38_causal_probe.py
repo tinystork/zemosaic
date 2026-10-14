@@ -61,6 +61,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path, PurePosixPath
@@ -236,6 +237,113 @@ def source_set_digest(identifiers) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Path privacy: logical labels + recursive fail-closed scan/scrub
+# ---------------------------------------------------------------------------
+
+_WIN_DRIVE_RE = re.compile(r"(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]")
+_UNC_RE = re.compile(r"(?:^|[^\\])\\\\[A-Za-z0-9._$-]+[\\]")
+_FILE_URI_RE = re.compile(r"file://", re.IGNORECASE)
+_POSIX_EMBEDDED_RE = re.compile(
+    r"(?:^|[\s'\"=(,:\[])/(?:home|root|var|tmp|mnt|media|opt|usr|srv|etc|proc|dev|run)(?:/|$)"
+)
+
+
+def path_leak_category(value: str) -> str | None:
+    """Return a leak category when ``value`` carries an absolute/private path.
+
+    Recognises POSIX-absolute, Windows drive-absolute, UNC and ``file://`` URI
+    forms, both as a whole value and embedded in free text.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if _FILE_URI_RE.search(value):
+        return "file_uri"
+    if _WIN_DRIVE_RE.search(value):
+        return "windows_drive_absolute"
+    if _UNC_RE.search(value) or value.startswith("\\\\"):
+        return "unc"
+    if value.startswith("/"):
+        return "posix_absolute"
+    if _POSIX_EMBEDDED_RE.search(value):
+        return "posix_absolute_embedded"
+    return None
+
+
+def scan_path_leaks(payload: Any, prefix: str = "$") -> list[dict]:
+    """Recursively scan a JSON-like payload for absolute/private paths (fail closed)."""
+    found: list[dict] = []
+    if isinstance(payload, Mapping):
+        for key in sorted(payload):
+            found.extend(scan_path_leaks(payload[key], f"{prefix}.{key}"))
+    elif isinstance(payload, (list, tuple)):
+        for i, item in enumerate(payload):
+            found.extend(scan_path_leaks(item, f"{prefix}[{i}]"))
+    elif isinstance(payload, str):
+        cat = path_leak_category(payload)
+        if cat is not None:
+            found.append({"json_path": prefix, "category": cat, "value": payload})
+    return found
+
+
+def scrub_paths(payload: Any, roots: Sequence[Path]) -> Any:
+    """Recursively replace every known private root with a stable logical label.
+
+    Defence in depth on top of never emitting absolute paths: any occurrence of a
+    known root (whole value or embedded in text) becomes ``<root:LABEL>``.
+    """
+    pairs = []
+    for i, root in enumerate(roots):
+        if root is None:
+            continue
+        label = f"<root:{Path(root).name or 'root'}>"
+        try:
+            pairs.append((str(Path(root).expanduser().resolve()), label))
+        except Exception:
+            pairs.append((str(root), label))
+        pairs.append((str(root), label))
+    pairs.sort(key=lambda kv: -len(kv[0]))
+
+    def _walk(obj):
+        if isinstance(obj, Mapping):
+            return {k: _walk(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_walk(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(_walk(v) for v in obj)
+        if isinstance(obj, str):
+            out = obj
+            for raw, label in pairs:
+                if raw and raw in out:
+                    out = out.replace(raw, label)
+            return out
+        return obj
+
+    return _walk(payload)
+
+
+def _is_drive_absolute(raw: str) -> bool:
+    """True for Windows drive-absolute ids (drive letter + ``/`` or ``\\``)."""
+    return bool(re.match(r"^[A-Za-z]:[\\/]", str(raw).strip()))
+
+
+def _symlink_component(path: Path, root: Path) -> bool:
+    """True when any component of ``path`` relative to ``root`` is a symlink."""
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return True
+    cur = root
+    for part in rel.parts:
+        cur = cur / part
+        try:
+            if cur.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Lazy engine access
 # ---------------------------------------------------------------------------
 
@@ -275,6 +383,32 @@ def _lazy_zemosaic():
 def _quiet() -> None:
     """Silence the product's verbose loader logging (stdout noise only)."""
     logging.disable(logging.INFO)
+
+
+def _not_run_exceptions() -> tuple:
+    """Exception types that may honestly map to a NOT_RUN decision.
+
+    ONLY documented domain/budget failures. A programming error (TypeError,
+    AttributeError, IndexError, broadcast ValueError, ...) is deliberately NOT in
+    this tuple so it fails the run instead of being disguised as scientific
+    NOT_RUN.
+    """
+    z = _lazy_zemosaic()
+    from zemosaic.core.canonical_stacking import (
+        CanonicalStackFailure,
+        CanonicalStackValidationError,
+    )
+
+    return (
+        BudgetError,
+        ProbeError,
+        ResolutionError,
+        IdentityError,
+        CanonicalStackFailure,
+        CanonicalStackValidationError,
+        FileNotFoundError,
+        MemoryError,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +586,7 @@ def validate_identity(
         },
     }
     return {
-        "capture_dir": str(capture_dir),
+        "capture_dir_label": capture_dir.name,
         "artifact": {
             "basename": CAPTURE_ARTIFACT_BASENAME,
             "sha256": art_sha,
@@ -484,20 +618,35 @@ def validate_identity(
 # ---------------------------------------------------------------------------
 
 def _scan_fits(root: Path) -> list[Path]:
-    return sorted(
-        p for p in root.rglob("*")
-        if p.suffix.lower() in (".fit", ".fits", ".fts") and p.is_file() and not p.is_symlink()
-    )
+    """Read-only FITS inventory under ``root`` (fail-closed on symlinks)."""
+    out = []
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in (".fit", ".fits", ".fts"):
+            continue
+        try:
+            if not p.is_file() or p.is_symlink():
+                continue
+        except OSError:
+            continue
+        if _symlink_component(p, root):
+            continue
+        out.append(p)
+    return out
 
 
 def resolve_sources(source_dir: Path, frame_ids: Sequence[str]) -> dict:
     """Resolve each manifest id to exactly one file under ``source_dir``.
 
-    Deterministic; relative-path match first, then unique basename. Rejects
-    absolute ids, traversal, missing/ambiguous basenames and duplicate
-    resolution. Never writes anything.
+    Deterministic; relative-path match first, then unique basename. Fail-closed:
+    rejects absolute ids (POSIX/UNC/Windows drive-absolute, incl. slash, backslash
+    and case variants), ``file://`` URIs, traversal, missing/ambiguous basenames,
+    duplicate resolution, symlinked candidates (and any symlinked path component),
+    and any resolved path escaping the source root. A symlinked source root is
+    refused. Never writes anything.
     """
-    _require(source_dir.is_dir(), f"source dir is not a directory: {source_dir}", ResolutionError)
+    _require(source_dir.is_dir(), f"source dir is not a directory: {source_dir.name}", ResolutionError)
+    if source_dir.is_symlink():
+        raise ResolutionError("source dir is a symlink; refusing (fail-closed)")
     root = source_dir
     root_res = root.resolve()
     files = _scan_fits(root)
@@ -512,13 +661,22 @@ def resolve_sources(source_dir: Path, frame_ids: Sequence[str]) -> dict:
     problems: list[str] = []
     for idx, fid in enumerate(frame_ids):
         raw = str(fid)
+        if _is_drive_absolute(raw):
+            problems.append(f"frame_ids[{idx}]: Windows drive-absolute id refused")
+            continue
+        if raw.strip().lower().startswith("file://"):
+            problems.append(f"frame_ids[{idx}]: file:// URI id refused")
+            continue
         norm = raw.replace("\\", "/")
         pp = PurePosixPath(norm)
         if norm == "" or norm.startswith("/") or norm.startswith("//") or pp.is_absolute():
-            problems.append(f"frame_ids[{idx}]: absolute/empty id {raw!r}")
+            problems.append(f"frame_ids[{idx}]: absolute/empty id refused")
             continue
         if any(part == ".." for part in pp.parts):
-            problems.append(f"frame_ids[{idx}]: traversal in {raw!r}")
+            problems.append(f"frame_ids[{idx}]: traversal refused")
+            continue
+        if any(part == "" for part in pp.parts):
+            problems.append(f"frame_ids[{idx}]: empty path component refused")
             continue
         chosen = by_rel.get(norm)
         if chosen is None:
@@ -529,12 +687,15 @@ def resolve_sources(source_dir: Path, frame_ids: Sequence[str]) -> dict:
                 problems.append(f"frame_ids[{idx}]: ambiguous basename {pp.name!r}")
                 continue
             else:
-                problems.append(f"frame_ids[{idx}]: not found {raw!r}")
+                problems.append(f"frame_ids[{idx}]: not found under the source root")
                 continue
         try:
             chosen.resolve().relative_to(root_res)
         except ValueError:
-            problems.append(f"frame_ids[{idx}]: escapes source dir")
+            problems.append(f"frame_ids[{idx}]: resolves outside the source root")
+            continue
+        if chosen.is_symlink():
+            problems.append(f"frame_ids[{idx}]: symlinked candidate refused")
             continue
         if chosen in seen:
             problems.append(f"frame_ids[{idx}]: duplicate resolution")
@@ -547,7 +708,7 @@ def resolve_sources(source_dir: Path, frame_ids: Sequence[str]) -> dict:
         )
     _require(len(resolved) == len(frame_ids), "resolution count mismatch", ResolutionError)
     return {
-        "source_dir": str(root),
+        "source_root_label": root.name,
         "n_files_on_disk": len(files),
         "n_resolved": len(resolved),
         "paths": tuple(resolved),
@@ -770,42 +931,130 @@ def freeze_panel(artifact: Mapping, cells: Mapping[str, Mapping], nx: int, ny: i
 # ---------------------------------------------------------------------------
 
 def _subset_fixed_by_ids(fixed, ids_all: Sequence[str], keep: Sequence[str]):
-    """Subset a FixedNormalization to ``keep`` (in the given order) by identity."""
+    """Subset a FixedNormalization to ``keep`` (order-preserving), FAITHFULLY.
+
+    Returns ``(subset, remap)``. ``remap`` truthfully records what happened to the
+    source gauge's recorded exclusions: every exclusion whose frame is inside the
+    subset is REMAPPED to its new index and carried into the subset; exclusions of
+    frames outside the subset are recorded as ``dropped_out_of_subset`` (they are
+    metadata about frames the subset no longer contains). Nothing is silently
+    discarded.
+    """
     z = _lazy_zemosaic()
+    from zemosaic.core.canonical_stacking import FrameExclusion
     from zemosaic.core.canonical_streaming import FixedNormalization
 
     gidx = {fid: i for i, fid in enumerate(ids_all)}
     idx = [gidx[f] for f in keep]
+    pos = {orig: new for new, orig in enumerate(idx)}
     ref = int(fixed.reference_index)
-    keep_ref = idx.index(ref) if ref in idx else -1
+    keep_ref = pos.get(ref, -1)
     if keep_ref < 0:
         # No silent re-anchor: refuse (the caller must supply a gauge that covers
         # the reference, e.g. the shared gauge anchored on side u).
         raise ProbeError("gauge subset does not contain its reference frame")
-    return FixedNormalization(
+    kept_exc = []
+    dropped = []
+    for e in fixed.exclusions:
+        ei = int(e.index)
+        if ei in pos:
+            kept_exc.append(FrameExclusion(index=pos[ei], stage=e.stage, reason=e.reason,
+                                           detail=e.detail))
+        else:
+            dropped.append({"index": ei, "stage": str(e.stage), "reason": str(e.reason)})
+    subset = FixedNormalization(
         reference_index=keep_ref,
         coefficients=np.asarray(fixed.coefficients)[idx],
         norm_active=np.asarray(fixed.norm_active)[idx],
         weights=np.asarray(fixed.weights)[idx],
         weight_active=np.asarray(fixed.weight_active)[idx],
-        exclusions=tuple(
-            e for e in fixed.exclusions if idx.count(int(e.index)) == 0
-        ),
+        exclusions=tuple(kept_exc),
         frame_ids=tuple(keep),
     )
+    remap = {
+        "n_frames_in": int(len(ids_all)),
+        "n_frames_out": int(len(keep)),
+        "reference_kept": True,
+        "exclusions_remapped": len(kept_exc),
+        "exclusions_dropped_out_of_subset": dropped,
+    }
+    return subset, remap
+
+
+def _binding_path(cache_dir: Path) -> Path:
+    return Path(cache_dir) / "r38a_binding.json"
+
+
+def compute_cache_binding(cell_id: str, ctx: Mapping, identity: Mapping,
+                          source_root_label: str, source_files_on_disk: int,
+                          cfg_tokens: Mapping) -> dict:
+    """Bounded, private-root-free binding describing WHICH run a cache belongs to.
+
+    Rejects a stale cache from a different capture / source set / source tree /
+    WCS / layout / patch / config. The private source root is NOT persisted (only
+    its basename label); per-frame source file size + descriptor header digest are
+    bounded fingerprints that change when the underlying tree changes.
+    """
+    cell, patch, mem = ctx
+    ids = list(mem.patch_ids)
+    rows = []
+    for fid in ids:
+        d = _all_descs_by_id[fid]
+        try:
+            size = int(os.stat(d.source_path).st_size)
+        except OSError:
+            size = -1
+        rows.append((fid, size, d.header_sha256 or ""))
+    frames_blob = "\n".join(f"{a}\t{b}\t{c}" for a, b, c in rows)
+    names_sizes = "\n".join(f"{a}\t{b}" for a, b, _c in rows)
+    return {
+        "version": 1,
+        "cell_id": cell_id,
+        "capture_id": identity["capture_id"],
+        "artifact_sha256": identity["artifact_sha256"],
+        "source_set_digest": identity["source_set_digest"],
+        "n_source_frames": int(identity["n_source_frames"]),
+        "source_root_label": source_root_label,
+        "n_source_files_on_disk": int(source_files_on_disk),
+        "canvas_id": identity["canvas_id"],
+        "layout": {"nx": int(identity["nx"]), "ny": int(identity["ny"]),
+                   "halo_px": int(identity["halo_px"])},
+        "patch": [int(patch.patch.x0), int(patch.patch.y0), int(patch.patch.x1), int(patch.patch.y1)],
+        "patch_hw": [int(v) for v in patch.patch_shape_hw],
+        "config_tokens": {str(k): str(v) for k, v in sorted(cfg_tokens.items())},
+        "n_frames": len(ids),
+        "frame_ids_digest": hashlib.sha256("\n".join(ids).encode()).hexdigest(),
+        "descriptors_digest": hashlib.sha256(frames_blob.encode()).hexdigest(),
+        "source_fingerprint": hashlib.sha256(names_sizes.encode()).hexdigest(),
+    }
+
+
+def read_cache_binding(cache_dir: Path) -> dict | None:
+    p = _binding_path(cache_dir)
+    if not p.is_file():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            return json.load(fh, parse_constant=_reject_constant)
+    except Exception:
+        return None
 
 
 def build_cell_cache(cell_id: str, ctx: Mapping, source_paths_index: Mapping[str, Path],
-                     scratch_dir: Path, *, max_frames: int) -> dict:
+                     scratch_dir: Path, *, max_frames: int, binding: Mapping,
+                     deadline: float | None = None) -> dict:
     """Stream one Cell's FULL accepted patch domain to a scratch aligned cache.
 
     Reuses the production primitives verbatim (product decoder, source-ROI plan,
     ``slice_wcs``, ``reproject_cropped``, ``AlignedCacheBuilder``) so the aligned
     values are bit-identical to the production per-Cell cache. One frame resident.
 
-    RESUMABLE: a scratch cache that is already COMPLETE for the SAME ordered
-    frame-id list (the accepted R6 ``cache_is_complete`` predicate) is reused
-    instead of rebuilt, so a long bounded probe can resume after an interruption.
+    RESUMABLE and BOUND: a cache is reused ONLY when the accepted R6
+    ``cache_is_complete`` predicate holds AND the persisted ``r38a_binding.json``
+    equals the current binding (capture id, source-set digest, canvas/layout/patch,
+    config tokens, per-frame source fingerprints). Otherwise it is rebuilt within
+    the caller's caps. ``deadline`` is a SOFT wall-clock budget checked between
+    frames (a single decode/reproject calls cannot be interrupted).
     """
     z = _lazy_zemosaic()
     zg, zfp, zz, zsw = z["zg"], z["zfp"], z["zz"], z["zsw"]
@@ -814,22 +1063,29 @@ def build_cell_cache(cell_id: str, ctx: Mapping, source_paths_index: Mapping[str
     _require(len(ids) <= max_frames,
              f"cell {cell_id}: {len(ids)} contributors exceed cap {max_frames}", BudgetError)
     cache_dir = scratch_dir / "cells" / cell_id
-    if zfp.cache_is_complete(cache_dir, ids):
+    if (zfp.cache_is_complete(cache_dir, ids)
+            and read_cache_binding(cache_dir) == dict(binding)):
         return {
             "cell_id": cell_id,
-            "cache_dir": str(cache_dir),
+            "cache_key": f"cells/{cell_id}",
             "n_contributors": len(ids),
             "reused": True,
+            "binding_validated": True,
             "bytes": 0,
             "seconds": 0.0,
         }
     builder = zfp.AlignedCacheBuilder(cache_dir)
     t0 = time.perf_counter()
     bytes_written = 0
-    for fid in ids:
+    for n, fid in enumerate(ids, 1):
+        if deadline is not None and time.perf_counter() > deadline:
+            raise BudgetError(
+                f"soft wall-clock budget exhausted while building {cell_id} "
+                f"(frame {n}/{len(ids)}); cache left incomplete and will be rebuilt"
+            )
         desc = _all_descs_by_id[fid]
         plan = zg.plan_source_roi(desc, _canvas_ref[0], patch)
-        _require(plan is not None, f"cell {cell_id}: no source ROI for {fid}", ResolutionError)
+        _require(plan is not None, f"cell {cell_id}: no source ROI for a contributor", ResolutionError)
         sb = plan.source_bounds
         hwc = zz._decode_frame_hwc(desc, None)
         crop = hwc[sb.y0:sb.y1, sb.x0:sb.x1]
@@ -842,11 +1098,13 @@ def build_cell_cache(cell_id: str, ctx: Mapping, source_paths_index: Mapping[str
         del hwc, crop, crop_chw, rgb, geom
     manifest = builder.finish()
     bytes_written = int(manifest["total_bytes"])
+    _binding_path(cache_dir).write_text(dumps_strict(dict(binding)), encoding="utf-8")
     return {
         "cell_id": cell_id,
-        "cache_dir": str(cache_dir),
+        "cache_key": f"cells/{cell_id}",
         "n_contributors": len(ids),
         "reused": False,
+        "binding_validated": True,
         "bytes": bytes_written,
         "seconds": round(time.perf_counter() - t0, 3),
     }
@@ -877,7 +1135,8 @@ def probe_cell_gauge(cell_id: str, cache_dir: Path, cfg) -> dict:
     norm_active = np.asarray(g.norm_active, dtype=bool)
     a_vals = sorted({round(float(v), 12) for v in coef[active, :, 0].ravel()})
     exclusions = [
-        {"frame_id": ids[int(e.index)], "stage": str(e.stage), "reason": str(e.reason)}
+        {"index": int(e.index), "frame_id": ids[int(e.index)], "stage": str(e.stage),
+         "reason": str(e.reason), "detail": (None if e.detail is None else str(e.detail))}
         for e in g.exclusions
     ]
     return {
@@ -1210,6 +1469,62 @@ def _block_spread(gx, gy, d, block=32):
     return float(np.percentile(meds, 90) - np.percentile(meds, 10))
 
 
+def _cache_dir_of(entry):
+    """Accept a real scratch Path OR a ``{"cache_dir": ...}`` mapping (tests)."""
+    if isinstance(entry, Mapping):
+        return entry.get("cache_dir")
+    return entry
+
+
+def _uniform_weights_only(shared):
+    """Return a FixedNormalization identical to ``shared`` EXCEPT the numeric
+    weights of the active frames, which become uniform 1.0.
+
+    Everything else is preserved byte-for-byte: coefficients, reference index,
+    frame order, ``norm_active``, ``weight_active`` membership and ``exclusions``.
+    This is what makes the ``W`` factor step genuinely weights-only.
+    """
+    from zemosaic.core.canonical_streaming import FixedNormalization
+
+    w = np.asarray(shared.weights, dtype=np.float64).copy()
+    active = np.asarray(shared.weight_active, dtype=bool)
+    w[active] = 1.0
+    return FixedNormalization(
+        reference_index=int(shared.reference_index),
+        coefficients=np.asarray(shared.coefficients, dtype=np.float64).copy(),
+        norm_active=np.asarray(shared.norm_active, dtype=bool).copy(),
+        weights=w,
+        weight_active=active.copy(),
+        exclusions=tuple(shared.exclusions),
+        frame_ids=(None if shared.frame_ids is None else tuple(shared.frame_ids)),
+    )
+
+
+def _factor_contract() -> dict:
+    """The frozen factor-ladder contract (single source of truth for docs/tests)."""
+    return {
+        "baseline": "BASE: own frames + own local gauge + own weights + declared rejection",
+        "A": "BASE -> FRAME SET only (common intersection; each side keeps its OWN gauge, faithfully subset)",
+        "G": "A -> GAUGE only (both sides use side u's gauge over the common frames)",
+        "W": "G -> WEIGHTS only (identical coefficients/reference/order/active masks/exclusions; only active weights -> 1.0)",
+        "D": "G -> REJECTION only (none; DIAGNOSTIC ONLY, never a correction)",
+        "B0": "CONTROL (multi-variable): identity gauge a=1,b=0 AND uniform weights; NOT part of the one-variable ladder",
+        "chain": "BASE -(frame set)-> A -(gauge)-> G -(weights)-> W ; G -(rejection)-> D",
+        "single_variable": {
+            "A": "frame_set only", "G": "gauge only", "W": "weights only", "D": "rejection only",
+        },
+        "backend": "cpu (fixed)",
+        "non_additivity": "the frame set, gauge and weights interact: per-setting metrics are reported, never summed into percentages",
+        "tautology": {
+            "G": (
+                "both sides recombine the SAME common frames with the SAME gauge over the SAME global "
+                "ROI, so a near-zero difference is an EXPECTED IDENTITY sanity check, NOT independent "
+                "causal evidence"
+            ),
+        },
+    }
+
+
 def run_factor_probe(relation, gauges, caches, roi_cfg, cfg) -> dict:
     """One-variable-at-a-time factor evidence for ONE probed relation.
 
@@ -1227,6 +1542,9 @@ def run_factor_probe(relation, gauges, caches, roi_cfg, cfg) -> dict:
         return {"status": "NOT_RUN", "reason": "gauge_facts_unavailable"}
     cu, cv = caches.get(u), caches.get(v)
     if not cu or not cv:
+        return {"status": "NOT_RUN", "reason": "cell_cache_unavailable"}
+    du_dir, dv_dir = _cache_dir_of(cu), _cache_dir_of(cv)
+    if du_dir is None or dv_dir is None:
         return {"status": "NOT_RUN", "reason": "cell_cache_unavailable"}
     cap = int(roi_cfg["max_cell_contributors"])
     if gu["n_contributors"] > cap or gv["n_contributors"] > cap:
@@ -1270,41 +1588,45 @@ def run_factor_probe(relation, gauges, caches, roi_cfg, cfg) -> dict:
     if not common or gu["reference_frame_id"] not in common:
         return {"status": "NOT_RUN", "reason": "no_common_active_frames_covering_reference_u"}
 
+    from zemosaic.core.canonical_stacking import FrameExclusion
     from zemosaic.core.canonical_streaming import FixedNormalization
-    full_u = FixedNormalization(
-        reference_index=ids_u.index(gu["reference_frame_id"]),
-        coefficients=np.asarray(gu["coefficients"], dtype=np.float64),
-        norm_active=np.asarray(gu["norm_active"], dtype=bool),
-        weights=np.asarray(gu["weights"], dtype=np.float64),
-        weight_active=np.asarray(gu["weight_active"], dtype=bool),
-        exclusions=(), frame_ids=tuple(ids_u),
-    )
-    shared = _subset_fixed_by_ids(full_u, ids_u, common)
 
-    def _sub_or_none(full, ids, name):
-        try:
-            return _subset_fixed_by_ids(full, ids, common)
-        except ProbeError as exc:
-            return None
+    def _full(gauge, ids):
+        """Faithful FixedNormalization from the recorded gauge facts (incl. exclusions)."""
+        return FixedNormalization(
+            reference_index=ids.index(gauge["reference_frame_id"]),
+            coefficients=np.asarray(gauge["coefficients"], dtype=np.float64),
+            norm_active=np.asarray(gauge["norm_active"], dtype=bool),
+            weights=np.asarray(gauge["weights"], dtype=np.float64),
+            weight_active=np.asarray(gauge["weight_active"], dtype=bool),
+            exclusions=tuple(
+                FrameExclusion(
+                    index=int(e["index"]), stage=str(e["stage"]), reason=str(e["reason"]),
+                    detail=(None if e.get("detail") is None else str(e["detail"])),
+                )
+                for e in gauge.get("excluded", [])
+            ),
+            frame_ids=tuple(ids),
+        )
 
-    full_v = FixedNormalization(
-        reference_index=ids_v.index(gv["reference_frame_id"]),
-        coefficients=np.asarray(gv["coefficients"], dtype=np.float64),
-        norm_active=np.asarray(gv["norm_active"], dtype=bool),
-        weights=np.asarray(gv["weights"], dtype=np.float64),
-        weight_active=np.asarray(gv["weight_active"], dtype=bool),
-        exclusions=(), frame_ids=tuple(ids_v),
-    )
-    own_u = shared                       # side u's OWN gauge restricted to common
-    own_v = _sub_or_none(full_v, ids_v, "own_v")   # side v's OWN gauge restricted to common
-    uniform = FixedNormalization(
-        reference_index=0,
-        coefficients=np.asarray(shared.coefficients, dtype=np.float64).copy(),
-        norm_active=np.ones(len(common), dtype=bool),
-        weights=np.ones(len(common), dtype=np.float64),
-        weight_active=np.ones(len(common), dtype=bool),
-        exclusions=(), frame_ids=tuple(common),
-    )
+    full_u = _full(gu, ids_u)
+    full_v = _full(gv, ids_v)
+    shared, remap_u = _subset_fixed_by_ids(full_u, ids_u, common)
+    own_u = shared
+    own_v = None
+    remap_v = None
+    try:
+        own_v, remap_v = _subset_fixed_by_ids(full_v, ids_v, common)
+    except ProbeError:
+        own_v = None
+
+    # W is GENUINELY weights-only relative to G: identical coefficients,
+    # reference, frame order, norm_active, weight_active AND exclusions; ONLY the
+    # numeric weights of the active frames change (uniform 1.0, inactive kept).
+    _w = np.asarray(shared.weights, dtype=np.float64).copy()
+    _wa = np.asarray(shared.weight_active, dtype=bool)
+    _w[_wa] = 1.0
+    uniform = _uniform_weights_only(shared)
     identity = FixedNormalization(
         reference_index=0,
         coefficients=np.zeros((len(common), 3, 2), dtype=np.float64) + np.array([1.0, 0.0]),
@@ -1318,50 +1640,55 @@ def run_factor_probe(relation, gauges, caches, roi_cfg, cfg) -> dict:
 
     def _run(setting):
         if setting == "BASE":  # own frames + own gauge + own weights + declared rejection
-            du = _restack_roi(cu["cache_dir"], ids_u, roi_u, full_u, cfg, cfg.rejection)
-            dv = _restack_roi(cv["cache_dir"], ids_v, roi_v, full_v, cfg, cfg.rejection)
+            du = _restack_roi(du_dir, ids_u, roi_u, full_u, cfg, cfg.rejection)
+            dv = _restack_roi(dv_dir, ids_v, roi_v, full_v, cfg, cfg.rejection)
         elif setting == "A":  # variable: FRAME SET -> common intersection, own gauges kept
             if own_v is None:
                 raise ProbeError("side-v reference not in the common frame set")
-            du = _restack_roi(cu["cache_dir"], common, roi_u, own_u, cfg, cfg.rejection)
-            dv = _restack_roi(cv["cache_dir"], common, roi_v, own_v, cfg, cfg.rejection)
+            du = _restack_roi(du_dir, common, roi_u, own_u, cfg, cfg.rejection)
+            dv = _restack_roi(dv_dir, common, roi_v, own_v, cfg, cfg.rejection)
         elif setting == "G":  # variable: GAUGE -> side v aligned to side u's gauge
-            du = _restack_roi(cu["cache_dir"], common, roi_u, shared, cfg, cfg.rejection)
-            dv = _restack_roi(cv["cache_dir"], common, roi_v, shared, cfg, cfg.rejection)
-        elif setting == "W":  # variable: WEIGHTS -> uniform weights (coefficients unchanged)
-            du = _restack_roi(cu["cache_dir"], common, roi_u, uniform, cfg, cfg.rejection)
-            dv = _restack_roi(cv["cache_dir"], common, roi_v, uniform, cfg, cfg.rejection)
+            du = _restack_roi(du_dir, common, roi_u, shared, cfg, cfg.rejection)
+            dv = _restack_roi(dv_dir, common, roi_v, shared, cfg, cfg.rejection)
+        elif setting == "W":  # variable: WEIGHTS -> uniform active weights (everything else kept)
+            du = _restack_roi(du_dir, common, roi_u, uniform, cfg, cfg.rejection)
+            dv = _restack_roi(dv_dir, common, roi_v, uniform, cfg, cfg.rejection)
         elif setting == "D":  # variable: REJECTION -> none (DIAGNOSTIC ONLY)
-            du = _restack_roi(cu["cache_dir"], common, roi_u, shared, cfg, "none")
-            dv = _restack_roi(cv["cache_dir"], common, roi_v, shared, cfg, "none")
-        elif setting == "B0":  # control: layout-independent identity gauge (not presumed right)
-            du = _restack_roi(cu["cache_dir"], common, roi_u, identity, cfg, cfg.rejection)
-            dv = _restack_roi(cv["cache_dir"], common, roi_v, identity, cfg, cfg.rejection)
+            du = _restack_roi(du_dir, common, roi_u, shared, cfg, "none")
+            dv = _restack_roi(dv_dir, common, roi_v, shared, cfg, "none")
+        elif setting == "B0":  # CONTROL: identity gauge AND uniform weights (multi-variable)
+            du = _restack_roi(du_dir, common, roi_u, identity, cfg, cfg.rejection)
+            dv = _restack_roi(dv_dir, common, roi_v, identity, cfg, cfg.rejection)
         else:
             raise ProbeError(setting)
         return du, dv
 
+    variables = {
+        "BASE": ["baseline"],
+        "A": ["frame_set"],
+        "G": ["gauge"],
+        "W": ["weights"],
+        "D": ["rejection"],
+        "B0": ["gauge_choice", "weights"],
+    }
     for setting in ("BASE", "A", "G", "W", "D", "B0"):
         try:
             du, dv = _run(setting)
-            results[setting] = {"status": "RUN", "metrics": _roi_metrics(du, dv),
+            results[setting] = {"status": "RUN", "variables_changed": variables[setting],
+                                "metrics": _roi_metrics(du, dv),
                                 "frames_u": du["n_frames"], "frames_v": dv["n_frames"]}
-        except Exception as exc:  # never hide a failing factor, never fake a zero
-            results[setting] = {"status": "NOT_RUN", "reason": f"{type(exc).__name__}: {exc}"}
+        except _not_run_exceptions() as exc:  # expected domain/budget refusal
+            results[setting] = {"status": "NOT_RUN", "variables_changed": variables[setting],
+                                "reason": f"{type(exc).__name__}: {exc}"}
 
     return {
         "status": "RUN",
-        "contract": {
-            "baseline": "BASE: own frames + own local gauge + own weights + declared rejection",
-            "A": "BASE -> FRAME SET only (common intersection; each side keeps its OWN gauge, subset)",
-            "G": "A -> GAUGE only (both sides use side u's gauge over the common frames)",
-            "W": "G -> WEIGHTS only (coefficients kept, weights set uniform 1)",
-            "D": "G -> REJECTION only (none; DIAGNOSTIC ONLY, never a correction)",
-            "B0": "A -> GAUGE choice (identity a=1,b=0) + uniform weights; layout-independent CONTROL, not presumed right",
-            "chain": "BASE -(frame set)-> A -(gauge)-> G -(weights)-> W ; G -(rejection)-> D ; B0 is an extra control",
-            "single_variable": "every chain step changes exactly ONE variable from its predecessor",
-            "backend": "cpu (fixed)",
-            "non_additivity": "the frame set, gauge and weights interact: per-setting metrics are reported, never summed into percentages",
+        "contract": _factor_contract(),
+        "gauge_reconstruction": {
+            "u": remap_u,
+            "v": remap_v,
+            "reference_kept_u": True,
+            "reference_kept_v": (own_v is not None),
         },
         "limitations": [
             "the ROI is restacked with the accepted streaming executor on a bounded sub-window; "
@@ -1382,47 +1709,101 @@ _ctx_ref: dict[str, tuple] = {}
 # 7. Conclusion (pre-registered decision rule)
 # ---------------------------------------------------------------------------
 
-def conclude(gauge_results: Sequence[Mapping], factor_results: Sequence[Mapping]) -> dict:
-    """Apply the frozen conclusion rule; never overclaim."""
-    steps = []
-    n_comparable = 0
+MIN_QUALIFYING_RELATIONS = 2   # PARTIAL_CAUSE needs >= 2 distinct QUALIFYING relations
+REQUIRED_ORIENTATIONS = ("h", "v")  # ... and BOTH orientations
+
+
+def conclude(gauge_results: Sequence[Mapping], factor_results: Sequence[Mapping], *,
+             executed_relations: Sequence[Mapping] = (), panel_total: int | None = None) -> dict:
+    """Apply the frozen RELATION-LEVEL decision rule; never overclaim.
+
+    Channels are aggregated INSIDE each relation first: a relation QUALIFIES when
+    at least one of its channels has a stable gauge step explaining >= ``partial_frac``
+    of the observed pair difference (and is not negligible). ``PARTIAL_CAUSE``
+    requires >= ``MIN_QUALIFYING_RELATIONS`` distinct qualifying relations AND both
+    orientations among them; one relation's correlated channels can never satisfy
+    it. ``DOMINANT_CAUSE_CONFIRMED`` is NOT reachable in this bounded A harness (no
+    restack-dominance criterion exists), by construction.
+    """
+    per_relation: dict[str, dict] = {}
     for g in gauge_results:
         cmp = g.get("comparison") or g
         if not cmp.get("comparable"):
             continue
-        n_comparable += 1
-        for ch, vals in (cmp.get("per_channel") or {}).items():
+        u, v = str(cmp.get("u")), str(cmp.get("v"))
+        orientation = None
+        rel = cmp.get("relation")
+        if isinstance(rel, Mapping):
+            orientation = rel.get("orientation")
+        if orientation not in REQUIRED_ORIENTATIONS and u.startswith("r") and v.startswith("r"):
+            orientation = _relation_orientation(u, v)
+        chans: dict[str, dict] = {}
+        for ch, vals in sorted((cmp.get("per_channel") or {}).items()):
             ratio = vals.get("gauge_step_over_observed")
             cons = vals.get("consistency_mad_over_abs_median")
             obs = vals.get("observed_pair_diff_adu")
             if ratio is None or obs is None:
+                chans[str(ch)] = {"ratio_abs": None, "consistency": cons,
+                                  "qualifying": False, "negligible": False}
                 continue
-            steps.append({
-                "relation": f"{cmp['u']}|{cmp['v']}", "channel": int(ch),
-                "ratio": abs(float(ratio)), "consistency": cons,
-            })
-    n_probed = n_comparable
+            r = abs(float(ratio))
+            stable = (cons is None or float(cons) <= GAUGE_STEP_CONSISTENCY_MAX)
+            chans[str(ch)] = {
+                "ratio_abs": r, "consistency": cons,
+                "qualifying": bool(stable and r >= GAUGE_STEP_PARTIAL_FRAC),
+                "negligible": bool(r <= GAUGE_STEP_NEGLIGIBLE_FRAC),
+            }
+        key = f"{u}|{v}"
+        per_relation[key] = {
+            "u": u, "v": v, "orientation": orientation, "channels": chans,
+            "qualifying": bool(any(c["qualifying"] for c in chans.values())),
+            "all_negligible": bool(chans) and all(c["negligible"] for c in chans.values()),
+        }
+
+    n_comparable = len(per_relation)
+    qualifying = sorted(k for k, d in per_relation.items() if d["qualifying"])
+    qualifying_orientations = sorted({per_relation[k]["orientation"] for k in qualifying
+                                      if per_relation[k]["orientation"] in REQUIRED_ORIENTATIONS})
+    negligible_relations = sorted(k for k, d in per_relation.items() if d["all_negligible"])
+    executed_orientations = sorted({d["orientation"] for d in per_relation.values()
+                                   if d["orientation"] in REQUIRED_ORIENTATIONS})
     factors_executed = [f for f in factor_results if f.get("status") == "RUN"]
 
-    partial = [s for s in steps if s["ratio"] >= GAUGE_STEP_PARTIAL_FRAC
-               and (s["consistency"] is None or s["consistency"] <= GAUGE_STEP_CONSISTENCY_MAX)]
-    negligible = [s for s in steps if s["ratio"] <= GAUGE_STEP_NEGLIGIBLE_FRAC]
-
-    if n_probed < MIN_PROBED_RELATIONS:
-        state, why = "INCONCLUSIVE", f"only {n_probed} comparable probed relation(s) < {MIN_PROBED_RELATIONS}"
-    elif not steps:
+    if n_comparable < MIN_PROBED_RELATIONS:
+        state = "INCONCLUSIVE"
+        why = (f"only {n_comparable} comparable probed relation(s) < {MIN_PROBED_RELATIONS}; "
+               "the state cannot be decided from a single relation")
+    elif not per_relation:
         state, why = "INCONCLUSIVE", "no comparable gauge-step observation"
-    elif len(negligible) == len(steps):
-        state, why = "CAUSE_FALSIFIED", "gauge-induced level step is negligible on every probed relation/channel"
-    elif partial and len(partial) >= max(1, len(steps) // 2):
+    elif len(negligible_relations) == n_comparable:
+        state = "CAUSE_FALSIFIED"
+        why = "the gauge-induced level step is negligible on every probed relation/channel"
+    elif len(qualifying) >= MIN_QUALIFYING_RELATIONS and set(qualifying_orientations) == set(REQUIRED_ORIENTATIONS):
         state = "PARTIAL_CAUSE"
-        why = (f"{len(partial)}/{len(steps)} probed relation/channel gauge steps explain >= "
-               f"{GAUGE_STEP_PARTIAL_FRAC:.0%} of the observed pair difference with stable sign; "
-               "no restack-based dominance proof was executed on this host")
+        why = (f"{len(qualifying)} distinct relations qualify (>= {GAUGE_STEP_PARTIAL_FRAC:.0%} of the "
+               f"observed pair difference with a stable gauge step) across BOTH orientations "
+               f"({', '.join(qualifying)}); no restack-dominance proof exists on this host")
         if factors_executed:
             why += "; factor probe executed (see factor_evidence), dominance not established"
     else:
-        state, why = "INCONCLUSIVE", "gauge-step evidence is mixed across probed relation/channel"
+        state = "INCONCLUSIVE"
+        why = (f"{len(qualifying)} qualifying relation(s) / orientations "
+               f"{qualifying_orientations or '[]'}; PARTIAL_CAUSE needs >= {MIN_QUALIFYING_RELATIONS} "
+               "distinct relations covering both orientations")
+
+    executed = [{"u": r.get("u"), "v": r.get("v"), "orientation": r.get("orientation")}
+                for r in executed_relations]
+    coverage = {
+        "executed_relations": len(per_relation),
+        "executed_relations_detail": executed,
+        "panel_relations_total": int(panel_total) if panel_total is not None else None,
+        "executed_fraction": _fin(len(per_relation) / panel_total) if panel_total else None,
+        "executed_orientations": executed_orientations,
+        "qualifying_relations": qualifying,
+        "qualifying_orientations": qualifying_orientations,
+        "negligible_relations": negligible_relations,
+        "channel_summaries": {k: v["channels"] for k, v in sorted(per_relation.items())},
+    }
 
     return {
         "state": state,
@@ -1433,14 +1814,22 @@ def conclude(gauge_results: Sequence[Mapping], factor_results: Sequence[Mapping]
             "negligible_frac": GAUGE_STEP_NEGLIGIBLE_FRAC,
             "consistency_max": GAUGE_STEP_CONSISTENCY_MAX,
             "min_probed_relations": MIN_PROBED_RELATIONS,
+            "min_qualifying_relations": MIN_QUALIFYING_RELATIONS,
+            "required_orientations": list(REQUIRED_ORIENTATIONS),
         },
-        "n_probed_relations": n_probed,
-        "n_ratio_observations": len(steps),
-        "ratio_observations": steps,
+        "aggregation": "channels aggregated INSIDE each relation, then relations aggregated",
+        "n_probed_relations": n_comparable,
+        "coverage": coverage,
         "dominant_cause_confirmed": False,
+        "dominant_cause_available": False,
+        "dominant_cause_note": (
+            "DOMINANT_CAUSE_CONFIRMED is not reachable in this bounded R38-A harness: it would "
+            "require a pre-registered restack-dominance criterion that does not exist here"
+        ),
         "claim_limits": [
             "no correction is applied anywhere",
             "a small-band or single-worst-edge result alone is never treated as causal",
+            "channels of the same relation are correlated and are never counted as separate relations",
             "factor interactions are reported, never summed into an additive attribution",
         ],
     }
@@ -1544,11 +1933,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _write_report(out_path: Path, report: Mapping) -> int:
+    """Atomic strict-JSON write (the caller has already scrubbed/validated paths)."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    text = dumps_strict(report)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, out_path)
+    return len(text)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    global expect_checked_hint
     args = build_arg_parser().parse_args(argv)
     _quiet()
     t_start = time.perf_counter()
+    deadline = t_start + float(args.max_seconds)
 
     capture_dir = Path(args.capture_dir).expanduser().resolve()
     source_dir = Path(args.source_dir).expanduser().resolve()
@@ -1559,7 +1958,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_path = Path(args.out).expanduser() if args.out else (report_dir / f"r38a_{args.mode}.json")
     _assert_write_allowed(out_path, label="report file", extra_forbidden=(capture_dir, source_dir))
 
-    expect_checked_hint = args.expect_identity == "checked"
     identity = validate_identity(capture_dir, expect=args.expect_identity)
     resolution = resolve_sources(source_dir, identity["frame_ids"])
     geometry = reconstruct_geometry(resolution["paths"], source_dir)
@@ -1569,8 +1967,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema_version": SCHEMA_VERSION,
         "mission": MISSION,
         "mode": args.mode,
+        "status": "PARTIAL",
+        "status_reason": "set at the end of the run",
+        "qualification": "DEV_NOT_QUALIFICATION",
+        "scientific_acceptance": False,
+        "r38b_authorized": False,
+        "evidence_scope": {
+            "kind": "diagnostic_dev_bounded",
+            "panel": "biased DEV panel frozen BEFORE results; NOT a qualification corpus",
+            "conclusion_aggregation": "relation-level (channels aggregated inside a relation)",
+            "r37_heldout_consumed": True,
+            "correction_applied": False,
+            "dominant_cause_available": False,
+        },
         "identity": {k: v for k, v in identity.items() if k != "artifact"},
-        "resolution": {"n_resolved": resolution["n_resolved"],
+        "resolution": {"source_root_label": resolution["source_root_label"],
+                       "n_resolved": resolution["n_resolved"],
                        "n_files_on_disk": resolution["n_files_on_disk"]},
         "geometry": {k: v for k, v in geometry.items() if not k.startswith("_")},
         "import_audit": import_audit(),
@@ -1578,6 +1990,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "max_cell_contributors": int(args.max_cell_contributors),
             "max_frames_total": int(args.max_frames_total),
             "max_seconds": _fin(args.max_seconds),
+            "max_seconds_semantics": (
+                "SOFT wall-clock budget: checked between frames and between settings; a single "
+                "canonical decode/reproject/restack call cannot be interrupted, so a run may "
+                "overshoot by at most one such call"
+            ),
             "factor_max_contributors": int(args.factor_max_contributors),
         },
         "not_run": [],
@@ -1614,18 +2031,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     comparisons = []
     executed = []
     factor_results: list = []
+    unexpected: dict | None = None
     if args.mode in ("gauge", "factors"):
         if not args.execute_real:
             report["not_run"].append({"item": "real_gauge_probe",
                                       "reason": "--execute-real not given"})
         else:
-            comparisons, executed, factor_results = _run_real_probe(
-                args, report, geometry, panel, costs, scratch, t_start
+            try:
+                comparisons, executed, factor_results = _run_real_probe(
+                    args, report, geometry, panel, costs, scratch, t_start, deadline
+                )
+            except _not_run_exceptions() as exc:  # expected domain/budget refusal
+                report["not_run"].append({"item": "real_gauge_probe",
+                                          "reason": f"{type(exc).__name__}: {exc}"})
+            except Exception as exc:  # programming error: FAIL the run, never hide it
+                unexpected = {"stage": "real_probe", "type": type(exc).__name__,
+                              "message": str(exc)}
+
+    if unexpected is None and args.mode in ("gauge", "factors") and args.execute_real:
+        report["conclusion"] = conclude(comparisons, factor_results,
+                                        executed_relations=executed,
+                                        panel_total=len(panel["relations"]))
+
+    planned = len(costs["selected_relations"])
+    done = len(executed)
+    if unexpected is not None:
+        report["status"] = "FAILED"
+        report["status_reason"] = f"unexpected {unexpected['type']} during the real probe"
+        report["failed"] = unexpected
+    elif args.mode in ("gauge", "factors") and args.execute_real:
+        if done < planned or done < len(panel["relations"]):
+            report["status"] = "PARTIAL"
+            report["status_reason"] = (
+                f"executed {done}/{planned} planned relations and {done}/{len(panel['relations'])} "
+                "panel relations; the remainder is NOT_RUN (bounded host)"
             )
+        else:
+            report["status"] = "PASS"
+            report["status_reason"] = "every planned relation executed"
+    else:
+        report["status"] = "PASS"
+        report["status_reason"] = "inventory-only run (no pixel probe requested)"
+    report["evidence_scope"].update({
+        "panel_relations_total": len(panel["relations"]),
+        "relations_executed": done,
+        "orientations_executed": sorted({r["orientation"] for r in executed}),
+    })
 
-    if args.mode in ("gauge", "factors") and args.execute_real:
-        report["conclusion"] = conclude(comparisons, factor_results)
-
+    det: dict = {}
     if args.determinism_check:
         # Real repeat: rebuild the identity checks and the panel from the raw
         # artifact/capture independently and compare the canonical JSON.
@@ -1636,8 +2089,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                           "panel": panel})
         b = dumps_strict({"identity": {k: v for k, v in identity2.items() if k != "artifact"},
                           "panel": panel2})
-        report["determinism"] = {"canonical_sha256": hashlib.sha256(a.encode()).hexdigest(),
-                                 "stable": a == b}
+        det["identity_panel_recompute"] = {
+            "canonical_sha256": hashlib.sha256(a.encode()).hexdigest(),
+            "stable": a == b,
+            "kind": "same_process_recompute_of_identity_and_panel",
+        }
+    if comparisons or factor_results:
+        # Canonical hash of the CONCLUSION-DRIVING evidence, plus a strict-JSON
+        # round-trip recomputation of the decision from the serialized copy.
+        ev = {"gauge_comparison": comparisons, "factor_evidence": factor_results}
+        blob = dumps_strict(ev)
+        rt = json.loads(blob)
+        concl_rt = conclude(rt["gauge_comparison"], rt["factor_evidence"],
+                            executed_relations=executed,
+                            panel_total=len(panel["relations"]))
+        det["conclusion_driving"] = {
+            "canonical_sha256": hashlib.sha256(blob.encode()).hexdigest(),
+            "kind": "same_process_json_roundtrip_recompute",
+            "independent_real_data_repeat": False,
+            "roundtrip_state": concl_rt.get("state"),
+            "roundtrip_equivalent": bool(
+                concl_rt.get("state") == (report.get("conclusion") or {}).get("state")
+            ),
+            "note": ("this is a repeatability check of the deterministic payload, NOT an "
+                     "independent real-data rerun"),
+        }
+    report["determinism"] = det
 
     report["runtime"] = {
         "seconds": round(time.perf_counter() - t_start, 3),
@@ -1647,15 +2124,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         "repo_head": _git_head(),
     }
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    text = dumps_strict(report)
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, out_path)
-    print(f"R38A {args.mode}: wrote {out_path} ({len(text)} bytes)")
-    print(json.dumps({"status": "ok", "mode": args.mode, "conclusion": report.get("conclusion", {}).get("state"),
+    # --- durable-report privacy boundary (fail closed) ---------------------
+    scrubbed = scrub_paths(report, (capture_dir, source_dir, scratch, report_dir))
+    leaks = scan_path_leaks(scrubbed)
+    scrubbed["privacy"] = {
+        "scan": "recursive over every persisted value",
+        "categories": ["posix_absolute", "windows_drive_absolute", "unc", "file_uri",
+                       "posix_absolute_embedded"],
+        "leaks": len(leaks),
+        "leak_locations": [{"json_path": l["json_path"], "category": l["category"]} for l in leaks],
+        "policy": "no absolute/private path may appear in the durable artifact",
+    }
+    if leaks:
+        scrubbed["status"] = "FAILED"
+        scrubbed["status_reason"] = f"privacy leak scan found {len(leaks)} absolute/private path value(s)"
+        scrubbed["failed"] = {"stage": "privacy_scan", "leak_count": len(leaks)}
+        size = _write_report(out_path, scrubbed)
+        print(f"R38A {args.mode}: FAILED privacy scan; wrote {out_path} ({size} bytes)")
+        print(json.dumps({"status": "FAILED", "mode": args.mode,
+                          "reason": "privacy_scan", "out": str(out_path)}, sort_keys=True))
+        return 3
+
+    size = _write_report(out_path, scrubbed)
+    print(f"R38A {args.mode}: wrote {out_path} ({size} bytes)")
+    print(json.dumps({"status": scrubbed["status"], "mode": args.mode,
+                      "conclusion": (scrubbed.get("conclusion") or {}).get("state"),
                       "out": str(out_path)}, sort_keys=True))
-    return 0
+    return 2 if scrubbed["status"] == "FAILED" else 0
 
 
 def _peak_rss_kib() -> int:
@@ -1677,7 +2172,7 @@ def _git_head() -> str | None:
         return None
 
 
-def _run_real_probe(args, report, geometry, panel, costs, scratch, t_start):
+def _run_real_probe(args, report, geometry, panel, costs, scratch, t_start, deadline):
     """Execute the bounded real-data probe; returns (comparisons, executed, factors)."""
     z = _lazy_zemosaic()
     cfg = z["cfg_cls"](
@@ -1685,37 +2180,58 @@ def _run_real_probe(args, report, geometry, panel, costs, scratch, t_start):
         rejection="winsorized_sigma_clip", combine="mean",
         taper="footprint", taper_px=8.0, backend="cpu",
     )
-    cells = geometry["cells"]
+    cfg_tokens = {
+        "normalization": cfg.normalization, "weighting": cfg.weighting,
+        "rejection": cfg.rejection, "combine": cfg.combine,
+        "taper": cfg.taper, "taper_px": cfg.taper_px, "backend": cfg.backend,
+    }
+    ident = report["identity"]["computed"]
+    src_label = report["resolution"]["source_root_label"]
+    n_files = report["resolution"]["n_files_on_disk"]
     selected_cells = list(costs["selected_cells"])
     report["probe_plan"]["executed_cells"] = selected_cells
-    gauge_results = []
-    caches: dict[str, dict] = {}
+    gauge_results: list[dict] = []
+    cache_dirs: dict[str, Path] = {}
+    cache_info: dict[str, dict] = {}
     gauge_reuse = Path(args.gauge_cache).expanduser() if args.gauge_cache else None
     for cid in selected_cells:
-        if time.perf_counter() - t_start > args.max_seconds:
-            report["not_run"].append({"item": f"cell_gauge:{cid}", "reason": "wall-clock budget exhausted"})
+        if time.perf_counter() > deadline:
+            report["not_run"].append({"item": f"cell_gauge:{cid}",
+                                      "reason": "soft wall-clock budget exhausted before this cell"})
             continue
         try:
+            ctx = geometry["_cell_ctx"][cid]
+            binding = compute_cache_binding(cid, ctx, ident, src_label, n_files, cfg_tokens)
             if gauge_reuse is not None:
                 cdir = gauge_reuse / "cells" / cid
                 if not (cdir / "manifest.json").is_file():
-                    raise ProbeError(f"reused gauge cache missing for {cid}")
-                caches[cid] = {"cell_id": cid, "cache_dir": str(cdir), "reused": True}
-                report.setdefault("reused_caches", []).append(cid)
+                    raise ProbeError(f"reused gauge cache missing for cell {cid}")
+                if read_cache_binding(cdir) != binding:
+                    raise ProbeError(f"reused gauge cache binding mismatch for cell {cid}")
+                cache_info[cid] = {"cell_id": cid, "cache_key": f"cells/{cid}", "reused": True,
+                                   "binding_validated": True}
             else:
-                info = build_cell_cache(cid, geometry["_cell_ctx"][cid], None, scratch,
-                                        max_frames=args.max_cell_contributors)
-                caches[cid] = info
-                cdir = Path(info["cache_dir"])
+                info = build_cell_cache(cid, ctx, None, scratch,
+                                        max_frames=args.max_cell_contributors,
+                                        binding=binding, deadline=deadline)
+                cache_info[cid] = info
+                cdir = scratch / "cells" / cid
+            cache_dirs[cid] = cdir
             facts = probe_cell_gauge(cid, cdir, cfg)
-            facts["cache"] = caches.get(cid)
+            facts["cache"] = cache_info.get(cid)
             gauge_results.append(facts)
-        except BudgetError as exc:
-            report["not_run"].append({"item": f"cell_gauge:{cid}", "reason": str(exc)})
-        except Exception as exc:  # honest failure, never a fabricated result
+        except _not_run_exceptions() as exc:  # expected domain/budget refusal
             report["not_run"].append({"item": f"cell_gauge:{cid}",
                                       "reason": f"{type(exc).__name__}: {exc}"})
     by_id = {g["cell_id"]: g for g in gauge_results}
+
+    report["cache_binding"] = {
+        "cells": {cid: cache_info[cid] for cid in sorted(cache_info)},
+        "validated": [cid for cid in sorted(cache_info) if cache_info[cid].get("binding_validated")],
+        "note": ("a resumable scratch cache is reused ONLY when the accepted R6 completeness "
+                 "predicate holds AND the persisted r38a_binding.json equals the current "
+                 "capture/source/layout/patch/config/fingerprint binding"),
+    }
 
     report["gauge_facts"] = [
         {k: v for k, v in g.items() if k not in ("coefficients", "weights", "norm_active", "weight_active")}
@@ -1742,8 +2258,13 @@ def _run_real_probe(args, report, geometry, panel, costs, scratch, t_start):
         roi_cfg = {"max_cell_contributors": args.factor_max_contributors,
                    "band_px": args.factor_band_px, "max_tangent_px": args.factor_max_tangent_px}
         for rel in executed:
+            if time.perf_counter() > deadline:
+                factor_results.append({"relation": rel, "status": "NOT_RUN",
+                                       "reason": "soft wall-clock budget exhausted before this relation"})
+                continue
             factor_results.append({
-                "relation": rel, **run_factor_probe(rel, by_id, caches, roi_cfg, cfg),
+                "relation": rel,
+                **run_factor_probe(rel, by_id, cache_dirs, roi_cfg, cfg),
             })
         report["factor_evidence"] = factor_results
 

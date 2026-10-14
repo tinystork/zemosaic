@@ -123,7 +123,7 @@ by exactly `b_u - b_v`; the median of that difference is the gauge-induced
 per-Cell **level step**, and its MAD measures how frame/mask-dependent it is.
 Non-additive (`a != 1`) or empty-common comparisons ABSTAIN (never approximated).
 
-### 4.5 Factor probe A/B/C/D (bounded ROI, fixed CPU backend)
+### 4.5 Factor probe A/G/W/D (bounded ROI, fixed CPU backend)
 
 On the shared global-pixel ROI along the relation's boundary (measurement band ±
 `band_px`, capped tangent extent) each side is restacked with the accepted
@@ -131,12 +131,20 @@ streaming executor through a read-only ROI provider, holding a fixed gauge. The
 ladder is a CHAIN in which every step changes exactly ONE variable:
 
 * `BASE` own frames + own local gauge + own weights + declared rejection;
-* `A` FRAME SET only (common intersection; each side keeps its OWN gauge subset);
+* `A` FRAME SET only (common intersection; each side keeps its OWN gauge,
+  faithfully subset with remapped exclusions);
 * `G` GAUGE only (both sides use side-u's gauge over the common frames);
-* `W` WEIGHTS only (coefficients kept, weights set uniform);
+* `W` WEIGHTS only (identical coefficients/reference/frame order/`norm_active`/
+  `weight_active`/exclusions; ONLY the active numeric weights become uniform);
 * `D` REJECTION only (`none`; DIAGNOSTIC ONLY);
-* `B0` control: identity gauge (a=1,b=0) + uniform weights (a layout-independent
-  gauge choice; **not presumed right**).
+* `B0` CONTROL (multi-variable): identity gauge (a=1,b=0) AND uniform weights.
+  It is NOT part of the one-variable ladder.
+
+`G` is an EXPECTED IDENTITY sanity check, **not** independent causal evidence:
+both sides recombine the SAME common frames with the SAME gauge over the SAME
+global ROI, so a near-zero difference is expected by construction. The JSON
+`contract.tautology.G` says so explicitly, and the conclusion rule does not
+consume `factor_evidence`.
 
 Metrics per channel: median/RMS/p90/MAD of the pair difference, tangent and
 normal slopes, level correlation, block-median spread, contributors before and
@@ -144,40 +152,77 @@ after rejection, rejected fractions. A setting that cannot run returns `NOT_RUN`
 with a reason — never a fabricated zero. ROI restacks reuse the executor on a
 sub-window, so the footprint taper is computed within the ROI (documented edge
 effect) and the gauge coefficients/weights come from the FULL domain.
-Note: with `sky_mean` and a shared gauge the two sides are recombined from the
-same frames, so a residual of numerical magnitude is the expected outcome; the
-metric therefore isolates the LEVEL/gauge term and cannot, on its own, quantify a
-spatial model. Interactions are reported per setting, never summed.
+Interactions are reported per setting, never summed.
 
-### 4.6 Bounded resources + strict output
+Only DOCUMENTED domain/budget failures map to `NOT_RUN`; an unexpected exception
+(programming error) FAILS the run with top-level `status=FAILED` instead of being
+disguised as a scientific `NOT_RUN`.
+
+### 4.6 Bounded resources, strict output, privacy boundary
 
 Explicit caps (`--max-cell-contributors`, `--max-frames-total`, `--max-seconds`,
 `--factor-*`); deterministic sorted order everywhere; no `N_frames x canvas`
 cube; strict JSON with `allow_nan=False` and non-finite values emitted as `null`.
 Panel relations that cannot fit the caps are listed explicitly under `not_run`.
 
-### 4.7 Conclusion (pre-registered)
+`--max-seconds` is a **SOFT** wall-clock budget: it is checked between frames in
+the cache build and between cells/settings, so a single canonical
+decode/reproject/restack call cannot be interrupted and a run may overshoot by at
+most one such call. This is stated in the artifact (`budgets.max_seconds_semantics`).
+
+The durable artifact carries NO absolute/private path: input/scratch paths are
+replaced by stable logical labels (basenames / `cells/<cell_id>` keys), and a
+recursive fail-closed boundary validator recognises POSIX-absolute, Windows
+drive-absolute, UNC and `file://` forms (whole value and embedded). A surviving
+leak sets `status=FAILED` and the report records only the offending JSON paths and
+categories (never the values).
+
+Every report carries a top-level `status` (`PASS`/`PARTIAL`/`FAILED`),
+`qualification = DEV_NOT_QUALIFICATION`, `scientific_acceptance: false`,
+`r38b_authorized: false` and an `evidence_scope` block (panel/relations/
+orientations actually executed, relation-level aggregation, `correction_applied:
+false`). `PASS` means "the harness ran every planned relation", never scientific
+acceptance.
+
+Resumable scratch caches are bound to the run by a persisted
+`r38a_binding.json` (capture id, artifact sha256, source-set digest, source-root
+LABEL, source file count, canvas/layout/patch facts, config tokens, ordered frame
+ids + per-frame source fingerprints). A cache is reused only when the accepted R6
+completeness predicate holds AND the binding matches exactly; otherwise it is
+rebuilt within the same caps.
+
+### 4.7 Conclusion (pre-registered, RELATION-LEVEL)
 
 Exactly one of `DOMINANT_CAUSE_CONFIRMED`, `PARTIAL_CAUSE`, `CAUSE_FALSIFIED`,
-`INCONCLUSIVE`, from frozen thresholds on the ratio `gauge_step / observed_step`,
-its consistency, and the number of comparable probed relations. A small-band or
-single-worst-edge result is never treated as causal; interactions are reported,
-never summed into an additive attribution.
+`INCONCLUSIVE`. Channels are aggregated INSIDE each relation first (a relation
+QUALIFIES when >= 1 channel has a stable step explaining >= 50 % of the observed
+pair difference and is not negligible); `PARTIAL_CAUSE` then requires at least TWO
+distinct qualifying relations covering BOTH orientations. One relation's
+correlated channels can never satisfy it, and `DOMINANT_CAUSE_CONFIRMED` is
+unreachable in this bounded harness (no restack-dominance criterion exists).
+`INCONCLUSIVE` is the expected state when fewer than two relations (or only one
+orientation) qualify. The report also exposes the executed/total panel fraction,
+the qualifying relations/orientations and per-relation channel summaries. A
+small-band or single-edge result is never treated as causal; interactions are
+reported, never summed.
 
 ## 5. Tests
 
-`tests/test_zegrid_r38a_causal_probe.py` (run under `-W error`) covers: the
-module-scope import audit (fresh-interpreter check that importing the tool pulls
-no `zemosaic` module), strict JSON (NaN/Infinity rejected, canonical dump,
-non-finite → `None`), the digest's byte-compatibility with the accepted
-algorithm, identity PASS/tamper (sha256, bytes, capture id, digest, capped
-holdout, dropped relations, correction flag, gauge mode, engine), source
-resolution refusals, panel determinism/slots (both orientations, corner,
-declared worst edge), bounded planning, gauge cross-comparison (constant step
-recovered; non-additive abstention), ROI metrics vs a hand-computed difference,
-the read-only ROI provider over a real R6 aligned cache, factor-probe `NOT_RUN`
-refusals, the conclusion rule, output safety, and an end-to-end synthetic
-`inventory` run (strict JSON, capture tree untouched, deterministic repeat).
+`tests/test_zegrid_r38a_causal_probe.py` (run under `-W error`) covers, beyond the
+r0 set: the privacy boundary (path-leak categories incl. POSIX/Windows-drive/UNC/
+`file://`/embedded, recursive scan, scrub), the resolver fail-closed cases
+(Windows drive-absolute with slash/backslash/case variants, `file://`, symlinked
+root and symlinked candidate), exclusion remap fidelity in the gauge subset
+(in-subset remap + explicit out-of-subset record + refusal when the reference is
+absent), the `W` single-variable invariant (only active weights change;
+coefficients/reference/order/active masks/exclusions preserved),
+`_uniform_weights_only`, the `G` tautology and `B0` multi-variable labelling, the
+cache binding (absent / matching / stale mismatch / malformed, and a real binding
+that is private-root-free), relation-level conclusion cases (one relation's three
+channels insufficient; two relations in the same orientation insufficient; two
+relations across h+v sufficient; falsified; too few), the gate
+status/qualification/privacy block in the end-to-end inventory, and the resolver /
+JSON / digest / identity / ROI / conclusion unit tests from r0.
 
 ## 6. Limits / non-goals
 

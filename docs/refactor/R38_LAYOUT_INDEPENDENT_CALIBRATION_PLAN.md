@@ -169,8 +169,10 @@ ne jamais appeler cette dernière option une réparation du FITS science.
 
 Réalisé : inspection du code et des preuves R33/R37 ; ce plan uniquement.
 R38-A implémenté (harness + tests + note `R38_A_CAUSAL_PROBE.md`) et exécuté sur
-l'artefact Windows 816 exact dans les limites bornées de l'hôte : voir
-`.a2a-reports/ZM-ZEGRID-R38-A-CAUSAL.coco.r0.md`. Aucun changement production,
+l'artefact Windows 816 exact dans les limites bornées de l'hôte ; rework-1 (revue
+Nono) : conclusion au niveau relation, assainissement des sorties durables,
+résolveur fail-closed, fidélité des facteurs, liaison du cache. Voir
+`.a2a-reports/ZM-ZEGRID-R38-A-CAUSAL.coco.r1.md`. Aucun changement production,
 aucune correction, aucun câblage.
 
 Prochain lot recommandé : R38-A est soumis à la revue Junior/Nono. R38-B reste

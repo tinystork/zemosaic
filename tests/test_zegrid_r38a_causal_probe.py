@@ -515,32 +515,211 @@ def test_factor_probe_not_run_over_cap():
 # 9. Conclusion rule
 # ---------------------------------------------------------------------------
 
-def _cmp(u, v, ratios, consistency=0.05):
+def _cmp(u, v, ratios, consistency=0.05, orientation=None):
     return {"comparable": True, "u": u, "v": v,
+            "relation": {"u": u, "v": v, "orientation": orientation},
             "per_channel": {str(i): {"gauge_step_over_observed": r,
                                      "consistency_mad_over_abs_median": consistency,
                                      "observed_pair_diff_adu": 100.0}
                             for i, r in enumerate(ratios)}}
 
 
-def test_conclude_partial_cause():
-    res = probe.conclude([_cmp("a", "b", [0.9, 0.8]), _cmp("c", "d", [0.7, 0.6])], [])
+def test_conclude_partial_cause_needs_two_relations_and_both_orientations():
+    # one HORIZONTAL relation + one VERTICAL relation, both stable -> PARTIAL_CAUSE
+    res = probe.conclude([_cmp("r0000c0000", "r0000c0001", [0.9, 0.8]),
+                          _cmp("r0000c0000", "r0001c0000", [0.7, 0.6])], [],
+                         panel_total=6)
     assert res["state"] == "PARTIAL_CAUSE"
     assert res["dominant_cause_confirmed"] is False
+    assert res["dominant_cause_available"] is False
+    assert res["coverage"]["panel_relations_total"] == 6
+    assert res["coverage"]["qualifying_orientations"] == ["h", "v"]
+
+
+def test_conclude_three_channels_of_one_relation_cannot_qualify():
+    # three correlated channels of ONE horizontal relation must NOT satisfy the rule
+    res = probe.conclude([_cmp("r0000c0000", "r0000c0001", [0.99, 0.98, 0.97])], [],
+                         panel_total=6)
+    assert res["state"] == "INCONCLUSIVE"
+    assert res["coverage"]["qualifying_relations"] == ["r0000c0000|r0000c0001"]
+    assert res["coverage"]["qualifying_orientations"] == ["h"]
+
+
+def test_conclude_two_relations_same_orientation_insufficient():
+    res = probe.conclude([_cmp("r0000c0000", "r0000c0001", [0.9, 0.8]),
+                          _cmp("r0000c0001", "r0000c0002", [0.9, 0.8])], [])
+    assert res["state"] == "INCONCLUSIVE"
+    assert res["coverage"]["qualifying_orientations"] == ["h"]
 
 
 def test_conclude_falsified():
-    res = probe.conclude([_cmp("a", "b", [0.01, 0.02]), _cmp("c", "d", [0.0, 0.03])], [])
+    res = probe.conclude([_cmp("r0000c0000", "r0000c0001", [0.01, 0.02]),
+                          _cmp("r0000c0000", "r0001c0000", [0.0, 0.03])], [])
     assert res["state"] == "CAUSE_FALSIFIED"
 
 
 def test_conclude_inconclusive_when_too_few():
-    res = probe.conclude([_cmp("a", "b", [0.9])], [])
+    res = probe.conclude([_cmp("r0000c0000", "r0000c0001", [0.9])], [])
     assert res["state"] == "INCONCLUSIVE"
 
 
 # ---------------------------------------------------------------------------
-# 10. Output safety
+# Privacy boundary (rework-1 M1)
+# ---------------------------------------------------------------------------
+
+def test_path_leak_categories_detected():
+    assert probe.path_leak_category("/home/u/x.fit") == "posix_absolute"
+    assert probe.path_leak_category("C:\\Users\\u\\x.fit") == "windows_drive_absolute"
+    assert probe.path_leak_category("C:/Users/u/x.fit") == "windows_drive_absolute"
+    assert probe.path_leak_category("\\\\srv\\share\\x.fit") == "unc"
+    assert probe.path_leak_category("file:///home/u/x.fit") == "file_uri"
+    assert probe.path_leak_category("see /var/tmp/scratch for details") == "posix_absolute_embedded"
+    assert probe.path_leak_category("cells/r0000c0000") is None
+    assert probe.path_leak_category("a|b") is None
+
+
+def test_scan_and_scrub_recursive():
+    payload = {"a": ["ok", {"b": "/home/u/secret.fit"}], "c": "C:/Users/u/x.fit"}
+    found = probe.scan_path_leaks(payload)
+    assert {f["category"] for f in found} == {"posix_absolute", "windows_drive_absolute"}
+    assert {f["json_path"] for f in found} == {"$.a[1].b", "$.c"}
+    scrubbed = probe.scrub_paths(payload, [pathlib.Path("/home/u")])
+    assert "/home/u" not in json.dumps(scrubbed)
+    # a non-known absolute path is NOT scrubbed -> the scan still fails closed
+    assert probe.scan_path_leaks(scrubbed) != []
+
+
+# ---------------------------------------------------------------------------
+# Source resolver fail-closed (rework-1 M3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [
+    "C:\\Users\\t\\f.fit", "C:/Users/t/f.fit", "c:/Users/t/f.fit",
+    "\\\\srv\\share\\f.fit", "//srv/share/f.fit", "/abs/f.fit", "../evil.fit",
+    "file:///home/u/f.fit",
+])
+def test_resolve_sources_rejects_absolute_variants(tmp_path, bad):
+    root = tmp_path / "src"
+    root.mkdir()
+    _touch(root, ["f.fit"])
+    with pytest.raises(probe.ResolutionError):
+        probe.resolve_sources(root, [bad])
+
+
+def test_resolve_sources_rejects_symlinked_root_and_candidate(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    _touch(real, ["f.fit"])
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    with pytest.raises(probe.ResolutionError):
+        probe.resolve_sources(link, ["f.fit"])
+    # a symlinked candidate file is refused, never basename-matched
+    (real / "g.fit").symlink_to(real / "f.fit")
+    with pytest.raises(probe.ResolutionError):
+        probe.resolve_sources(real, ["g.fit"])
+
+
+# ---------------------------------------------------------------------------
+# Factor fidelity (rework-1 L1/L6/L7)
+# ---------------------------------------------------------------------------
+
+def _fixed(ids, exclusions=(), weights=None, weight_active=None, ref=0):
+    from zemosaic.core.canonical_streaming import FixedNormalization
+    n = len(ids)
+    wa = np.ones(n, dtype=bool) if weight_active is None else np.asarray(weight_active, bool)
+    return FixedNormalization(
+        reference_index=ref,
+        coefficients=np.tile(np.array([1.0, 5.0]), (n, 3, 1)),
+        norm_active=np.ones(n, dtype=bool),
+        weights=np.ones(n) if weights is None else np.asarray(weights, float),
+        weight_active=wa, exclusions=tuple(exclusions), frame_ids=tuple(ids),
+    )
+
+
+def test_subset_remaps_exclusions_faithfully():
+    from zemosaic.core.canonical_stacking import FrameExclusion
+    ids = ["a.fit", "b.fit", "c.fit", "d.fit"]
+    exc = (FrameExclusion(index=0, stage="normalization", reason="insufficient_common", detail=None),
+           FrameExclusion(index=3, stage="normalization", reason="zero_valid_support", detail=None))
+    fixed = _fixed(ids, exclusions=exc)
+    subset, remap = probe._subset_fixed_by_ids(fixed, ids, ["a.fit", "b.fit", "c.fit"])
+    # in-subset exclusion remapped to its new index; out-of-subset recorded, not hidden
+    assert [(e.index, e.reason) for e in subset.exclusions] == [(0, "insufficient_common")]
+    assert remap["exclusions_remapped"] == 1
+    assert remap["exclusions_dropped_out_of_subset"] == [
+        {"index": 3, "stage": "normalization", "reason": "zero_valid_support"}]
+    assert subset.frame_ids == ("a.fit", "b.fit", "c.fit")
+    # reference not in the subset -> explicit refusal (no silent re-anchor)
+    with pytest.raises(probe.ProbeError):
+        probe._subset_fixed_by_ids(_fixed(ids, ref=3), ids, ["a.fit"])
+
+
+def test_uniform_weights_only_preserves_everything_else():
+    from zemosaic.core.canonical_stacking import FrameExclusion
+    ids = ["a.fit", "b.fit", "c.fit"]
+    exc = (FrameExclusion(index=2, stage="weighting", reason="quality_metric_failed", detail=None),)
+    shared = _fixed(ids, exclusions=exc, weights=[0.25, 0.5, 0.0],
+                    weight_active=[True, True, False], ref=1)
+    w = probe._uniform_weights_only(shared)
+    np.testing.assert_array_equal(w.coefficients, shared.coefficients)
+    np.testing.assert_array_equal(w.norm_active, shared.norm_active)
+    np.testing.assert_array_equal(w.weight_active, shared.weight_active)
+    assert w.reference_index == shared.reference_index
+    assert w.frame_ids == shared.frame_ids
+    assert [e.index for e in w.exclusions] == [e.index for e in shared.exclusions]
+    # ONLY the active weights changed (uniform 1.0); inactive weight untouched
+    np.testing.assert_allclose(w.weights, [1.0, 1.0, 0.0])
+    assert w.weights[2] == shared.weights[2]
+
+
+def test_factor_contract_labels_g_tautological_and_b0_multivariable():
+    c = probe._factor_contract()
+    assert "G" in c["tautology"]
+    assert "IDENTITY sanity check" in c["tautology"]["G"]
+    assert "NOT independent" in c["tautology"]["G"]
+    assert "multi-variable" in c["B0"]
+    assert "NOT part of the one-variable ladder" in c["B0"]
+    assert set(c["single_variable"]) == {"A", "G", "W", "D"}
+
+
+# ---------------------------------------------------------------------------
+# Cache binding (rework-1 L3)
+# ---------------------------------------------------------------------------
+
+def test_read_cache_binding_none_and_stale_mismatch(tmp_path):
+    cache = tmp_path / "cells" / "r0000c0000"
+    cache.mkdir(parents=True)
+    assert probe.read_cache_binding(cache) is None
+    good = {"version": 1, "cell_id": "r0000c0000", "n_frames": 3}
+    (cache / "r38a_binding.json").write_text(json.dumps(good))
+    assert probe.read_cache_binding(cache) == good
+    changed = dict(good)
+    changed["source_set_digest"] = "other"
+    assert probe.read_cache_binding(cache) != changed
+    (cache / "r38a_binding.json").write_text("{not json")
+    assert probe.read_cache_binding(cache) is None
+
+
+def test_compute_cache_binding_is_private_root_free(tmp_path):
+    capture, src, man, art_path, art = _make_capture(tmp_path, n_frames=6)
+    _finalise_capture(capture, src, man, art)
+    res = probe.resolve_sources(src, man["frame_ids"])
+    geo = probe.reconstruct_geometry(res["paths"], src)
+    probe._all_descs_by_id.clear()
+    for d in geo["_descs"]:
+        probe._all_descs_by_id[d.frame_id.logical_path] = d
+    ident = probe.validate_identity(capture, expect="any")["computed"]
+    cid = sorted(geo["_cell_ctx"])[0]
+    binding = probe.compute_cache_binding(cid, geo["_cell_ctx"][cid], ident, src.name,
+                                          res["n_files_on_disk"], {"normalization": "sky_mean"})
+    assert binding["source_root_label"] == src.name
+    assert "source_path" not in json.dumps(binding)
+    assert not probe.scan_path_leaks(binding)
+
+
+# ---------------------------------------------------------------------------
+# Output safety
 # ---------------------------------------------------------------------------
 
 def test_write_safety_refuses_read_only_tree(tmp_path):
@@ -575,7 +754,15 @@ def test_inventory_end_to_end_synthetic(tmp_path):
     assert report["panel"]["label"] == "NOT_QUALIFICATION"
     assert len(report["panel"]["relations"]) == 6
     assert report["import_audit"]["engine_access_is_lazy"] is True
-    assert report["determinism"]["stable"] is True
+    assert report["determinism"]["identity_panel_recompute"]["stable"] is True
+    # rework-1: gate status / qualification / privacy boundary
+    assert report["status"] in ("PASS", "PARTIAL")
+    assert report["qualification"] == "DEV_NOT_QUALIFICATION"
+    assert report["r38b_authorized"] is False
+    assert report["scientific_acceptance"] is False
+    assert "evidence_scope" in report
+    assert report["privacy"]["leaks"] == 0
+    assert probe.scan_path_leaks(report) == []
     # strict JSON: no NaN tokens
     assert "NaN" not in out.read_text()
     # read-only: the capture tree is byte-identical (only the synthetic source
