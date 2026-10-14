@@ -1,8 +1,11 @@
 # R37 — Offline pre-feather diagnostic artifact (R37-C design)
 
-**Mission:** ZM-ZEGRID-R37-C-DIAGNOSTIC · **Phase:** implementation · **Iteration:** r0
+**Mission:** ZM-ZEGRID-R37-C-DIAGNOSTIC · **Phase:** implementation · **Iteration:** r1 (rework-1)
 **Status:** PURE / OFFLINE / UNWIRED. No production import, no correction applied,
 no default/config/GUI change, no R34/R36 semantic change.
+**Rework-1 (after Nono r0):** closes M1 (capping transparency + conservative
+qualification), M2 (relation identity + information symmetry/PSD), L1 (tolerance
+reframed + cap-set tests) and sensible L2 (ranges/cross-consistency).
 **Inputs:** `docs/refactor/R37_ARCHAEOLOGY_AND_RISKS.md`,
 `docs/refactor/R37_BACKGROUND_MODEL_CONTRACT.md`,
 `docs/refactor/R37_MODEL_COMPARISON.md`.
@@ -78,6 +81,11 @@ It is **never an order-biased prefix**. `holdout_capped` records when the subset
 is a subsample. If capping ever mattered to a decision, the artifact says so
 rather than hiding it.
 
+The loader enforces the capping fact exactly: `holdout_capped == (n_holdout_kept <
+n_holdout)`, `n_holdout_kept <= meta.holdout_cap`, `n_holdout_kept == 0` only when
+`n_holdout == 0`, and `n_holdout_kept > 0` whenever `n_holdout > 0`. A payload may
+not claim exactness while being subsampled (or vice versa).
+
 ---
 
 ## 4. Round-trip and offline decision reuse
@@ -94,7 +102,16 @@ Declared tolerances:
 |---|---|---|
 | M1 coefficients, M0 offsets | always | `COEF_ROUNDTRIP_ATOL = 1e-10` (observed: bit-exact) |
 | held-out `r_plan` | no capping | exact (`1e-12` rel) |
-| held-out `r_plan` | capping active | `HELDOUT_RMS_REL_TOL = 0.10` relative |
+| held-out `r_plan` | capping active | approximate; see below |
+
+**The held-out tolerance is a measured reference, not an invariant.**
+`HELDOUT_RMS_REFERENCE_REL_TOL = 0.10` is declared for the single configuration
+`HELDOUT_RMS_REFERENCE_CONFIG` (`2x2/2x3, seed=7, band 16 px, cap=16`). It is NOT
+a universal bound: measured relative deltas exceed 10% at several supported caps
+and are non-monotone in the cap (2×2: cap 4 ≈ 0.24, cap 8 ≈ 0.10, cap 16 ≈ 0.05,
+cap 32 ≈ 0.11, cap 64 ≈ 0.01). A test explicitly refutes the universal-bound
+reading at cap 4. `HELDOUT_RMS_REL_TOL` is kept only as an alias for the
+configuration-scoped reference value.
 
 Measured on the synthetic 2×2 / 2×3 cases (seed 7, measurement band 16 px):
 
@@ -107,6 +124,25 @@ Measured on the synthetic 2×2 / 2×3 cases (seed 7, measurement band 16 px):
 M1 coefficients are unaffected by capping (they depend only on the sufficient
 statistics); the held-out metric is the only quantity that moves, and it is
 quantified by the tests, never claimed exact.
+
+### 4b. Conservative qualification at the decision surface
+
+A capped artifact is **research-only / non-qualifying** and cannot silently
+present `ROBUST_PLAN` as exact evidence. `recompute_decision` surfaces the
+aggregate capping fact on BOTH `result.gates` and `result.provenance`:
+
+* `diagnostic_heldout_capped` (bool), `diagnostic_heldout_exact` (bool),
+  `diagnostic_n_capped_relations` (int), and a machine-readable
+  `diagnostic_qualification` marker (`EXACT` | `RESEARCH_ONLY_HELDOUT_CAPPED`).
+* `to_json_dict()` preserves all of them (they ride on the copied dicts).
+
+If a capped rerun would have returned `ROBUST_PLAN`, the diagnostic layer
+withholds it: the surfaced `decision` becomes `INSUFFICIENT_EVIDENCE`, `model`
+becomes `OFFSET_ONLY`, `provenance.diagnostic_downgraded_from` records
+`ROBUST_PLAN`, `provenance.diagnostic_downgrade_reason` records
+`heldout_capped_not_exact`, and an explicit refusal reason is appended. Other
+(non-qualifying) decisions are returned unchanged. This policy lives ONLY in the
+diagnostic layer — the accepted `background_model` decision logic is untouched.
 
 ---
 
@@ -123,9 +159,36 @@ inapplicable. `loads` also rejects the JSON `NaN`/`Infinity` literals through a
 strict `parse_constant`.
 
 The loader validates: schema/version, exact key sets, integer/boolean/float types
-(booleans are not integers), `information` shape `(3,3)`, vector lengths, held-out
-length consistency, `channel ∈ [0, channels)`, `anchor ∈ cell_ids`, unique
-`cell_ids`, and the relation/dropped counts against the metadata.
+(booleans are not integers, floats are not accepted where integers are required),
+`information` shape `(3,3)`, vector lengths, held-out length consistency,
+`channel ∈ [0, channels)`, `anchor ∈ cell_ids`, unique `cell_ids`, and the
+relation/dropped counts against the metadata.
+
+Rework-1 adds scientific-consistency and range/cross-consistency gates:
+
+* **Relation identity** — every endpoint `u`/`v` must be a **canonical** cell id of
+the declared `nx × ny` grid (``rRRRRcCCCC``, in range) and present in
+`meta.cell_ids`; `u != v`; each `(u, v, channel)` unique; the relation must be the
+canonical 4-neighbour edge (right neighbour → `h`, or down neighbour → `v`).
+Reversed / diagonal / non-adjacent / unknown identities are rejected (r37c-1
+prefers rejection over canonicalisation). Dropped relations are validated the
+same way against the declared grid.
+* **Information matrix** — finite, symmetric within `SYMMETRY_RTOL = 1e-9` and PSD
+within `PSD_RTOL = 1e-9` (scale-aware, relative to `max(1, max|information|)`).
+Materially asymmetric or indefinite matrices are rejected. **Zero/absent
+information is rejected** — a relation carrying no constraint must be dropped,
+never stored with fabricated confidence.
+* **rhs/theta consistency** — `rhs == information @ theta_global` is enforced
+within `RHS_THETA_RTOL = 1e-6` (relative). This identity holds exactly for a
+least-squares solution and was verified to ~1e-13 relative on honest payloads,
+including zero-noise corpora.
+* **Ranges / cross-consistency** — positive integer `canvas_hw`, integer
+`holdout_strata`, `block_px > 0`, `feather_px >= 0`, positive `measurement_px`
+(or null), nonnegative support/block/width counts, `n_holdout_kept <= cap`,
+relation `measurement_px == meta.measurement_px`, `band_used_px <= overlap_px`,
+`rejection_fraction ∈ [0,1]`, `robust_sigma >= 0`, `level_z`/`curvature_z >= 0`,
+and `cell_ids` canonical (row-major) grid membership. Missing Cells remain
+permitted — `nx*ny == len(cell_ids)` is deliberately NOT required.
 
 ---
 

@@ -35,6 +35,7 @@ Discipline (frozen by the delegated mission ZM-ZEGRID-R37-C-DIAGNOSTIC)
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -44,6 +45,9 @@ from .background_model import (
     BLOCK_PX,
     DEFAULT_FEATHER_PX,
     DEFAULT_MEASUREMENT_PX,
+    MODEL_OFFSET_ONLY,
+    STATE_INSUFFICIENT_EVIDENCE,
+    STATE_ROBUST_PLAN,
     EdgeObservation,
     PlanCell,
     build_observations,
@@ -58,7 +62,14 @@ __all__ = [
     "STRATA_TANGENT",
     "STRATA_NORMAL",
     "COEF_ROUNDTRIP_ATOL",
+    "HELDOUT_RMS_REFERENCE_REL_TOL",
+    "HELDOUT_RMS_REFERENCE_CONFIG",
     "HELDOUT_RMS_REL_TOL",
+    "SYMMETRY_RTOL",
+    "PSD_RTOL",
+    "RHS_THETA_RTOL",
+    "QUALIFICATION_EXACT",
+    "QUALIFICATION_RESEARCH_ONLY_CAPPED",
     "DIAGNOSTIC_PROVENANCE",
     "DiagnosticSchemaError",
     "DiagnosticArtifact",
@@ -89,10 +100,28 @@ STRATA_TANGENT = 4
 STRATA_NORMAL = 4
 #: Declared round-trip tolerance for model coefficients (float64).
 COEF_ROUNDTRIP_ATOL = 1e-10
-#: Declared relative tolerance for held-out RMS when the cap actually bites
-#: (measured on the synthetic 2x2 / 2x3 cases; capping changes held-out metrics,
-#: it is never claimed exact).
-HELDOUT_RMS_REL_TOL = 0.10
+#: MEASURED REFERENCE tolerance for held-out RMS when the cap bites, for the ONE
+#: declared configuration below. It is NOT an invariant bound: measured values
+#: exceed 10% at several supported caps (e.g. 2x2 cap 4 -> ~0.24, cap 8 -> ~0.10,
+#: cap 32 -> ~0.11) and are non-monotone in the cap. Never cite it as a global
+#: guarantee; a capped held-out metric is approximate, full stop.
+HELDOUT_RMS_REFERENCE_REL_TOL = 0.10
+#: The exact configuration the reference tolerance was measured on.
+HELDOUT_RMS_REFERENCE_CONFIG = "2x2 and 2x3 layouts, seed=7, measurement band 16 px, cap=16"
+#: Backwards-compatible alias. Use ONLY as the reference tolerance for
+#: ``HELDOUT_RMS_REFERENCE_CONFIG`` -- never as a universal bound.
+HELDOUT_RMS_REL_TOL = HELDOUT_RMS_REFERENCE_REL_TOL
+
+#: Documented float64 tolerances for the loader's scientific-consistency gates.
+#: Relative to the matrix scale max(1, max|information|) (symmetry/PSD) or to
+#: max(1, max|information|) (rhs/theta residual).
+SYMMETRY_RTOL = 1e-9
+PSD_RTOL = 1e-9
+RHS_THETA_RTOL = 1e-6
+
+#: Qualification markers surfaced on the offline decision result.
+QUALIFICATION_EXACT = "EXACT"
+QUALIFICATION_RESEARCH_ONLY_CAPPED = "RESEARCH_ONLY_HELDOUT_CAPPED"
 #: Declared average byte width of one serialised JSON number, used ONLY by the
 #: analytic size estimate (a documented model, not a measurement).
 _JSON_SCALAR_WIDTH = 20
@@ -515,18 +544,100 @@ def _finite_vec_list(x, where: str) -> list[float]:
     return [_num(v, f"{where}[{i}]") for i, v in enumerate(x)]
 
 
-def _reconstruct_observation(rel: Mapping, i: int, channels: int) -> EdgeObservation:
+_CELL_ID_RE = re.compile(r"^r(\d{4})c(\d{4})$")
+
+
+def _parse_cell_id(cid: str, where: str):
+    m = _CELL_ID_RE.match(cid)
+    if m is None:
+        raise DiagnosticSchemaError(f"{where}: cell id {cid!r} is not of the form rRRRRcCCCC")
+    return int(m.group(1)), int(m.group(2))
+
+
+def _grid_member(cid: str, nx: int, ny: int, where: str):
+    r, c = _parse_cell_id(cid, where)
+    if not (0 <= r < ny and 0 <= c < nx):
+        raise DiagnosticSchemaError(f"{where}: cell id {cid!r} is outside the {nx}x{ny} grid")
+    return r, c
+
+
+def _canonical_edge(u: str, v: str, orientation: str, nx: int, ny: int, where: str):
+    """Enforce a canonical declared layout relation (u -> right OR u -> down).
+
+    ``build_observations`` only ever emits ``grid_adjacency`` edges: the right
+    neighbour (same row, ``c+1``, orientation ``h``) or the down neighbour
+    (``r+1``, same column, orientation ``v``). Reversed / diagonal / non-adjacent
+    identities are rejected (r37c-1 prefers rejection over canonicalisation).
+    """
+    ur, uc = _grid_member(u, nx, ny, f"{where}.u")
+    vr, vc = _grid_member(v, nx, ny, f"{where}.v")
+    if (ur, uc) == (vr, vc):
+        raise DiagnosticSchemaError(f"{where}: self relation {u!r}")
+    dr, dc = vr - ur, vc - uc
+    if (dr, dc) == (0, 1):
+        expected = "h"
+    elif (dr, dc) == (1, 0):
+        expected = "v"
+    else:
+        raise DiagnosticSchemaError(
+            f"{where}: relation {u}->{v} is not a canonical 4-neighbour edge "
+            "(expected the right or down neighbour)"
+        )
+    if orientation is not None and orientation != expected:
+        raise DiagnosticSchemaError(
+            f"{where}: orientation {orientation!r} inconsistent with {u}->{v} "
+            f"(expected {expected!r})"
+        )
+    return expected
+
+
+def _validate_information(info: np.ndarray, where: str):
+    """Finite + symmetric + PSD (within documented float64 tolerances).
+
+    Zero information is rejected: a relation carrying no constraint must be
+    dropped, never stored with fabricated confidence.
+    """
+    scale = max(1.0, float(np.max(np.abs(info))))
+    asym = float(np.max(np.abs(info - info.T)))
+    if asym > SYMMETRY_RTOL * scale:
+        raise DiagnosticSchemaError(
+            f"{where}.information: not symmetric (asym={asym:.3e}, tol={SYMMETRY_RTOL * scale:.3e})"
+        )
+    evals = np.linalg.eigvalsh(0.5 * (info + info.T))
+    if float(np.max(evals)) <= SYMMETRY_RTOL * scale:
+        raise DiagnosticSchemaError(f"{where}.information: zero/absent information is not a valid relation")
+    if float(np.min(evals)) < -PSD_RTOL * scale:
+        raise DiagnosticSchemaError(
+            f"{where}.information: not positive semi-definite (min eig={evals.min():.3e})"
+        )
+
+
+def _reconstruct_observation(rel: Mapping, i: int, *, channels: int, nx: int, ny: int,
+                             cell_id_set: set, meta_measurement_px, cap: int,
+                             ) -> EdgeObservation:
     where = f"relations[{i}]"
     _req_mapping(rel, where)
     _exact_keys(rel, _REL_KEYS, where)
     u = _str(rel["u"], f"{where}.u")
     v = _str(rel["v"], f"{where}.v")
-    channel = _int(rel["channel"], f"{where}.channel")
-    if not (0 <= channel < channels):
-        raise DiagnosticSchemaError(f"{where}.channel: {channel} outside [0,{channels})")
+    if u not in cell_id_set or v not in cell_id_set:
+        raise DiagnosticSchemaError(f"{where}: endpoints {u!r}/{v!r} are not in meta.cell_ids")
     orientation = _str(rel["orientation"], f"{where}.orientation")
     if orientation not in ("h", "v"):
         raise DiagnosticSchemaError(f"{where}.orientation: expected 'h' or 'v'")
+    _canonical_edge(u, v, orientation, nx, ny, where)
+
+    channel = _int(rel["channel"], f"{where}.channel")
+    if not (0 <= channel < channels):
+        raise DiagnosticSchemaError(f"{where}.channel: {channel} outside [0,{channels})")
+    measurement_px = _optional_int(rel["measurement_px"], f"{where}.measurement_px")
+    if measurement_px is not None and measurement_px < 1:
+        raise DiagnosticSchemaError(f"{where}.measurement_px: must be positive when set")
+    if measurement_px != meta_measurement_px:
+        raise DiagnosticSchemaError(
+            f"{where}.measurement_px: {measurement_px} inconsistent with meta.measurement_px "
+            f"{meta_measurement_px}"
+        )
 
     info_raw = rel["information"]
     if not isinstance(info_raw, (list, tuple)) or len(info_raw) != 3:
@@ -535,6 +646,19 @@ def _reconstruct_observation(rel: Mapping, i: int, channels: int) -> EdgeObserva
         [_finite_vec(row, 3, f"{where}.information[{r}]") for r, row in enumerate(info_raw)],
         dtype=np.float64,
     )
+    theta = np.asarray(_finite_vec(rel["theta_global"], 3, f"{where}.theta_global"),
+                       dtype=np.float64)
+    rhs = np.asarray(_finite_vec(rel["rhs"], 3, f"{where}.rhs"), dtype=np.float64)
+    _validate_information(information, where)
+    # rhs == information @ theta_global holds exactly for a least-squares solution
+    # (verified to ~1e-13 relative on honest payloads, incl. zero-noise).
+    prod = information @ theta
+    vscale = max(1.0, float(np.max(np.abs(prod))), float(np.max(np.abs(rhs))))
+    if float(np.max(np.abs(prod - rhs))) > RHS_THETA_RTOL * vscale:
+        raise DiagnosticSchemaError(
+            f"{where}: rhs is inconsistent with information@theta_global"
+        )
+
     holdout_xy = rel["holdout_xy"]
     if not isinstance(holdout_xy, (list, tuple)):
         raise DiagnosticSchemaError(f"{where}.holdout_xy: expected a list of [x, y] pairs")
@@ -542,37 +666,79 @@ def _reconstruct_observation(rel: Mapping, i: int, channels: int) -> EdgeObserva
                    for k, p in enumerate(holdout_xy)], dtype=np.float64).reshape(-1, 2)
     diff = np.asarray(_finite_vec_list(rel["holdout_diff"], f"{where}.holdout_diff"),
                       dtype=np.float64)
+
     n_kept = _int(rel["n_holdout_kept"], f"{where}.n_holdout_kept")
+    n_holdout = _int(rel["n_holdout"], f"{where}.n_holdout")
+    n_train = _int(rel["n_train"], f"{where}.n_train")
+    if n_kept < 0 or n_holdout < 0 or n_train < 0:
+        raise DiagnosticSchemaError(f"{where}: negative support count")
+    if n_holdout > 0 and n_kept == 0:
+        raise DiagnosticSchemaError(
+            f"{where}: n_holdout_kept==0 while n_holdout>0 (evidence silently dropped)"
+        )
+    if n_holdout == 0 and n_kept != 0:
+        raise DiagnosticSchemaError(f"{where}: n_holdout_kept>0 while n_holdout==0")
+    if n_kept > n_holdout:
+        raise DiagnosticSchemaError(f"{where}: kept {n_kept} > full holdout {n_holdout}")
+    if n_kept > cap:
+        raise DiagnosticSchemaError(f"{where}: kept {n_kept} exceeds meta.holdout_cap {cap}")
+    capped_flag = _bool(rel["holdout_capped"], f"{where}.holdout_capped")
+    if capped_flag != (n_kept < n_holdout):
+        raise DiagnosticSchemaError(
+            f"{where}.holdout_capped: {capped_flag} inconsistent with "
+            f"n_holdout_kept={n_kept} / n_holdout={n_holdout}"
+        )
     if xy.shape[0] != diff.shape[0] or xy.shape[0] != n_kept:
         raise DiagnosticSchemaError(
             f"{where}: holdout length mismatch (xy={xy.shape[0]}, diff={diff.shape[0]}, "
             f"n_holdout_kept={n_kept})"
         )
-    n_holdout = _int(rel["n_holdout"], f"{where}.n_holdout")
-    if n_kept > n_holdout:
-        raise DiagnosticSchemaError(f"{where}: kept {n_kept} > full holdout {n_holdout}")
-    _bool(rel["holdout_capped"], f"{where}.holdout_capped")
+
+    effective_train = _num(rel["effective_train"], f"{where}.effective_train")
+    if effective_train < 0.0:
+        raise DiagnosticSchemaError(f"{where}.effective_train: must be >= 0")
+    tangent_blocks = _int(rel["tangent_blocks"], f"{where}.tangent_blocks")
+    normal_blocks = _int(rel["normal_blocks"], f"{where}.normal_blocks")
+    if tangent_blocks < 0 or normal_blocks < 0:
+        raise DiagnosticSchemaError(f"{where}: negative block occupancy")
+    robust_sigma = _num(rel["robust_sigma"], f"{where}.robust_sigma")
+    if robust_sigma < 0.0:
+        raise DiagnosticSchemaError(f"{where}.robust_sigma: must be >= 0")
+    rejection_fraction = _num(rel["rejection_fraction"], f"{where}.rejection_fraction")
+    if not (0.0 <= rejection_fraction <= 1.0):
+        raise DiagnosticSchemaError(f"{where}.rejection_fraction: outside [0,1]")
+    level_z = _num(rel["level_z"], f"{where}.level_z")
+    curvature_z = _num(rel["curvature_z"], f"{where}.curvature_z")
+    if level_z < 0.0 or curvature_z < 0.0:
+        raise DiagnosticSchemaError(f"{where}: level_z/curvature_z must be >= 0 (absolute z)")
+    overlap_px = _int(rel["overlap_px"], f"{where}.overlap_px")
+    band_used_px = _int(rel["band_used_px"], f"{where}.band_used_px")
+    if overlap_px <= 0 or band_used_px < 0:
+        raise DiagnosticSchemaError(f"{where}: overlap/band widths must be positive/nonnegative")
+    if band_used_px > overlap_px:
+        raise DiagnosticSchemaError(
+            f"{where}: band_used_px {band_used_px} > overlap_px {overlap_px}"
+        )
 
     return EdgeObservation(
         u=u, v=v, channel=channel, orientation=orientation,
-        n_train=_int(rel["n_train"], f"{where}.n_train"),
+        n_train=n_train,
         n_holdout=n_holdout,
-        effective_train=_num(rel["effective_train"], f"{where}.effective_train"),
-        tangent_blocks=_int(rel["tangent_blocks"], f"{where}.tangent_blocks"),
-        normal_blocks=_int(rel["normal_blocks"], f"{where}.normal_blocks"),
-        robust_sigma=_num(rel["robust_sigma"], f"{where}.robust_sigma"),
-        rejection_fraction=_num(rel["rejection_fraction"], f"{where}.rejection_fraction"),
-        theta_global=np.asarray(_finite_vec(rel["theta_global"], 3, f"{where}.theta_global"),
-                                dtype=np.float64),
+        effective_train=effective_train,
+        tangent_blocks=tangent_blocks,
+        normal_blocks=normal_blocks,
+        robust_sigma=robust_sigma,
+        rejection_fraction=rejection_fraction,
+        theta_global=theta,
         information=information,
-        rhs=np.asarray(_finite_vec(rel["rhs"], 3, f"{where}.rhs"), dtype=np.float64),
-        level_z=_num(rel["level_z"], f"{where}.level_z"),
-        curvature_z=_num(rel["curvature_z"], f"{where}.curvature_z"),
+        rhs=rhs,
+        level_z=level_z,
+        curvature_z=curvature_z,
         level_mean=_num(rel["level_mean"], f"{where}.level_mean"),
         local_offset_train=_num(rel["local_offset_train"], f"{where}.local_offset_train"),
-        measurement_px=_optional_int(rel["measurement_px"], f"{where}.measurement_px"),
-        overlap_px=_int(rel["overlap_px"], f"{where}.overlap_px"),
-        band_used_px=_int(rel["band_used_px"], f"{where}.band_used_px"),
+        measurement_px=measurement_px,
+        overlap_px=overlap_px,
+        band_used_px=band_used_px,
         band_clamped=_bool(rel["band_clamped"], f"{where}.band_clamped"),
         holdout_xy=xy,
         holdout_diff=diff,
@@ -581,13 +747,19 @@ def _reconstruct_observation(rel: Mapping, i: int, channels: int) -> EdgeObserva
 
 @dataclass(frozen=True)
 class DiagnosticArtifact:
-    """Validated offline artifact: reconstructed observations + provenance."""
+    """Validated offline artifact: reconstructed observations + provenance.
+
+    ``heldout_capped`` / ``n_capped_relations`` preserve the capping fact so no
+    downstream consumer has to re-derive it from the raw relations.
+    """
 
     payload: dict
     meta: dict
     provenance: dict
     dropped: tuple
     observations: tuple
+    heldout_capped: bool = False
+    n_capped_relations: int = 0
 
     def cell_ids(self) -> tuple:
         return tuple(self.meta["cell_ids"])
@@ -600,6 +772,9 @@ class DiagnosticArtifact:
 
     def canvas_hw(self) -> tuple:
         return (int(self.meta["canvas_hw"][0]), int(self.meta["canvas_hw"][1]))
+
+    def heldout_exact(self) -> bool:
+        return not self.heldout_capped
 
 
 def load_artifact(payload) -> DiagnosticArtifact:
@@ -621,27 +796,51 @@ def load_artifact(payload) -> DiagnosticArtifact:
     ny = _int(meta["ny"], "meta.ny")
     if nx < 1 or ny < 1:
         raise DiagnosticSchemaError("meta.nx/meta.ny: must be >= 1")
-    canvas_hw = _finite_vec(meta["canvas_hw"], 2, "meta.canvas_hw")
-    if canvas_hw[0] <= 0 or canvas_hw[1] <= 0:
-        raise DiagnosticSchemaError("meta.canvas_hw: must be positive")
-    cell_ids = meta["cell_ids"]
-    if not isinstance(cell_ids, (list, tuple)) or not cell_ids:
+
+    canvas_hw = meta["canvas_hw"]
+    if not isinstance(canvas_hw, (list, tuple)) or len(canvas_hw) != 2:
+        raise DiagnosticSchemaError("meta.canvas_hw: expected [H, W]")
+    canvas_h = _int(canvas_hw[0], "meta.canvas_hw[0]")
+    canvas_w = _int(canvas_hw[1], "meta.canvas_hw[1]")
+    if canvas_h <= 0 or canvas_w <= 0:
+        raise DiagnosticSchemaError("meta.canvas_hw: dimensions must be positive integers")
+
+    cell_ids_raw = meta["cell_ids"]
+    if not isinstance(cell_ids_raw, (list, tuple)) or not cell_ids_raw:
         raise DiagnosticSchemaError("meta.cell_ids: expected a non-empty list")
-    cell_ids = [_str(c, f"meta.cell_ids[{i}]") for i, c in enumerate(cell_ids)]
+    cell_ids = [_str(c, f"meta.cell_ids[{i}]") for i, c in enumerate(cell_ids_raw)]
     if len(set(cell_ids)) != len(cell_ids):
         raise DiagnosticSchemaError("meta.cell_ids: duplicates are not allowed")
+    order = []
+    for i, cid in enumerate(cell_ids):
+        order.append(_grid_member(cid, nx, ny, f"meta.cell_ids[{i}]"))
+    if order != sorted(order):
+        raise DiagnosticSchemaError("meta.cell_ids: must be in canonical row-major order")
+    cell_id_set = set(cell_ids)
     anchor = _str(meta["anchor"], "meta.anchor")
-    if anchor not in set(cell_ids):
+    if anchor not in cell_id_set:
         raise DiagnosticSchemaError("meta.anchor: not among meta.cell_ids")
-    if _int(meta["holdout_cap"], "meta.holdout_cap") < 4:
+
+    cap = _int(meta["holdout_cap"], "meta.holdout_cap")
+    if cap < 4:
         raise DiagnosticSchemaError("meta.holdout_cap: must be >= 4")
-    strata = _finite_vec(meta["holdout_strata"], 2, "meta.holdout_strata")
-    if strata[0] < 1 or strata[1] < 1:
-        raise DiagnosticSchemaError("meta.holdout_strata: must be >= 1")
-    # Non-nullable scalars are validated for type/positivity.
-    _int(meta["block_px"], "meta.block_px")
-    _int(meta["feather_px"], "meta.feather_px")
-    _optional_int(meta["measurement_px"], "meta.measurement_px")
+    strata_raw = meta["holdout_strata"]
+    if not isinstance(strata_raw, (list, tuple)) or len(strata_raw) != 2:
+        raise DiagnosticSchemaError("meta.holdout_strata: expected [tangent, normal]")
+    strata_t = _int(strata_raw[0], "meta.holdout_strata[0]")
+    strata_n = _int(strata_raw[1], "meta.holdout_strata[1]")
+    if strata_t < 1 or strata_n < 1:
+        raise DiagnosticSchemaError("meta.holdout_strata: must be integers >= 1")
+
+    block_px = _int(meta["block_px"], "meta.block_px")
+    if block_px < 1:
+        raise DiagnosticSchemaError("meta.block_px: must be positive")
+    feather_px = _int(meta["feather_px"], "meta.feather_px")
+    if feather_px < 0:
+        raise DiagnosticSchemaError("meta.feather_px: must be nonnegative")
+    meta_measurement_px = _optional_int(meta["measurement_px"], "meta.measurement_px")
+    if meta_measurement_px is not None and meta_measurement_px < 1:
+        raise DiagnosticSchemaError("meta.measurement_px: must be positive when set")
     _str(meta["normalization"], "meta.normalization")
     _str(meta["coordinate_convention"], "meta.coordinate_convention")
     _int(meta["n_relations"], "meta.n_relations")
@@ -657,6 +856,7 @@ def load_artifact(payload) -> DiagnosticArtifact:
         _exact_keys(d, _DROP_KEYS, where)
         u = _str(d["u"], f"{where}.u")
         v = _str(d["v"], f"{where}.v")
+        _canonical_edge(u, v, None, nx, ny, where)
         ch = _optional_int(d["channel"], f"{where}.channel")
         if ch is not None and not (0 <= ch < channels):
             raise DiagnosticSchemaError(f"{where}.channel: {ch} outside [0,{channels})")
@@ -665,8 +865,21 @@ def load_artifact(payload) -> DiagnosticArtifact:
     rel_raw = obj["relations"]
     if not isinstance(rel_raw, (list, tuple)):
         raise DiagnosticSchemaError("relations: expected a list")
-    observations = tuple(_reconstruct_observation(rel, i, channels)
-                         for i, rel in enumerate(rel_raw))
+    observations = []
+    seen_keys: set = set()
+    n_capped = 0
+    for i, rel in enumerate(rel_raw):
+        obs = _reconstruct_observation(rel, i, channels=channels, nx=nx, ny=ny,
+                                       cell_id_set=cell_id_set,
+                                       meta_measurement_px=meta_measurement_px, cap=cap)
+        if obs.key() in seen_keys:
+            raise DiagnosticSchemaError(
+                f"relations[{i}]: duplicate relation key {obs.key()}"
+            )
+        seen_keys.add(obs.key())
+        if bool(rel["holdout_capped"]):
+            n_capped += 1
+        observations.append(obs)
     if _int(meta["n_relations"], "meta.n_relations") != len(observations):
         raise DiagnosticSchemaError("meta.n_relations: does not match len(relations)")
     if _int(meta["n_dropped"], "meta.n_dropped") != len(dropped):
@@ -676,7 +889,9 @@ def load_artifact(payload) -> DiagnosticArtifact:
         meta=meta,
         provenance=dict(_req_mapping(obj["provenance"], "provenance")),
         dropped=tuple(dropped),
-        observations=observations,
+        observations=tuple(observations),
+        heldout_capped=bool(n_capped > 0),
+        n_capped_relations=int(n_capped),
     )
 
 
@@ -729,10 +944,23 @@ def recompute_decision(artifact: DiagnosticArtifact, *, cfg=None):
     Delegates to ``background_model.compare_models_from_observations`` (the
     behaviour-preserving extraction of ``compare_models``) so gates, thresholds
     and the solver are exactly the accepted ones. Held-out metrics use the capped
-    evidence subset and are therefore approximate (see ``HELDOUT_RMS_REL_TOL``).
+    evidence subset and are therefore approximate.
+
+    Qualification semantics (diagnostic layer ONLY; the accepted ``background_model``
+    decision logic is untouched):
+
+    * The aggregate capping fact is surfaced on BOTH ``result.gates`` and
+      ``result.provenance`` as ``diagnostic_heldout_capped`` / ``diagnostic_heldout_exact``
+      plus a machine-readable ``diagnostic_qualification`` marker
+      (``EXACT`` | ``RESEARCH_ONLY_HELDOUT_CAPPED``).
+    * A CAPPED artifact can never qualify ``ROBUST_PLAN``: if the capped rerun would
+      have returned ``ROBUST_PLAN`` it is withheld and downgraded to
+      ``INSUFFICIENT_EVIDENCE`` (with ``diagnostic_downgraded_from`` recorded and
+      an explicit refusal reason). Other non-qualifying decisions are returned
+      unchanged. This never silently presents capped held-out evidence as exact.
     """
     meta = artifact.meta
-    return compare_models_from_observations(
+    result = compare_models_from_observations(
         list(artifact.observations), list(artifact.dropped),
         cell_ids=tuple(meta["cell_ids"]), nx=int(meta["nx"]), ny=int(meta["ny"]),
         canvas_hw=(int(meta["canvas_hw"][0]), int(meta["canvas_hw"][1])),
@@ -740,6 +968,24 @@ def recompute_decision(artifact: DiagnosticArtifact, *, cfg=None):
         measurement_px=meta["measurement_px"], feather_px=int(meta["feather_px"]),
         block_px=int(meta["block_px"]), cfg=cfg,
     )
+    capped = bool(artifact.heldout_capped)
+    qualification = QUALIFICATION_RESEARCH_ONLY_CAPPED if capped else QUALIFICATION_EXACT
+    result.provenance["diagnostic_heldout_capped"] = capped
+    result.provenance["diagnostic_heldout_exact"] = (not capped)
+    result.provenance["diagnostic_n_capped_relations"] = int(artifact.n_capped_relations)
+    result.provenance["diagnostic_qualification"] = qualification
+    result.gates["diagnostic_heldout_capped"] = capped
+    result.gates["diagnostic_heldout_exact"] = (not capped)
+    result.gates["diagnostic_qualification"] = qualification
+    if capped and result.decision == STATE_ROBUST_PLAN:
+        result.provenance["diagnostic_downgraded_from"] = STATE_ROBUST_PLAN
+        result.provenance["diagnostic_downgrade_reason"] = "heldout_capped_not_exact"
+        result.decision = STATE_INSUFFICIENT_EVIDENCE
+        result.model = MODEL_OFFSET_ONLY
+        result.refusal_reasons.append(
+            "diagnostic_heldout_capped: capped held-out evidence cannot qualify ROBUST_PLAN"
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -81,6 +81,12 @@ def _base_payload():
     return bgd.build_payload(cells, 3, 2, cw)
 
 
+def _base_payload_exact():
+    """A payload captured with a cap large enough that nothing is capped."""
+    cells, cw = _grid(3, 2, plane=plane_fn(), noise=0.2, seed=1)
+    return bgd.build_payload(cells, 3, 2, cw, holdout_cap=10 ** 6)
+
+
 # ===========================================================================
 # 1. Strict JSON, byte stability, insertion-order independence
 # ===========================================================================
@@ -129,10 +135,14 @@ def test_roundtrip_reconstructs_sufficient_statistics():
 # 3. Schema rejection
 # ===========================================================================
 
-def _mutate(fn):
-    payload = copy.deepcopy(_base_payload())
+def _mutate(fn, base=None):
+    payload = copy.deepcopy(base if base is not None else _base_payload())
     fn(payload)
     return payload
+
+
+def _mutate_exact(fn):
+    return _mutate(fn, base=_base_payload_exact())
 
 
 _REJECTIONS = {
@@ -150,6 +160,39 @@ _REJECTIONS = {
     "reason_empty": lambda p: p.__setitem__("dropped", [{"u": "a", "v": "b", "channel": None, "reason": ""}]),
     "n_relations_mismatch": lambda p: p["meta"].__setitem__("n_relations", 12345),
     "nonfinite_level_z": lambda p: p["relations"][0].__setitem__("level_z", float("inf")),
+    # --- M2: relation identity / scientific consistency ---
+    "unknown_endpoint": lambda p: p["relations"][0].__setitem__("u", "r9999c9999"),
+    "self_relation": lambda p: p["relations"][0].__setitem__("v", p["relations"][0]["u"]),
+    "reversed_relation": lambda p: p["relations"][0].update(
+        {"u": p["relations"][0]["v"], "v": p["relations"][0]["u"]}),
+    "nonadjacent_relation": lambda p: p["relations"][0].__setitem__("v", "r0000c0002"),
+    "asymmetric_information": lambda p: p["relations"][0].__setitem__(
+        "information", [[1.0, 5.0, 0.0], [-3.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+    "indefinite_information": lambda p: p["relations"][0].__setitem__(
+        "information", [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]),
+    "zero_information": lambda p: p["relations"][0].__setitem__(
+        "information", [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+    "rhs_inconsistent": lambda p: p["relations"][0].__setitem__("rhs", [1000.0, 0.0, 0.0]),
+    # --- L2: ranges / cross-consistency ---
+    "float_canvas": lambda p: p["meta"].__setitem__("canvas_hw", [256.0, 384.0]),
+    "float_nx": lambda p: p["meta"].__setitem__("nx", 2.0),
+    "float_channels": lambda p: p["meta"].__setitem__("channels", 1.0),
+    "float_strata": lambda p: p["meta"].__setitem__("holdout_strata", [4.0, 4.0]),
+    "negative_block_px": lambda p: p["meta"].__setitem__("block_px", -1),
+    "negative_feather_px": lambda p: p["meta"].__setitem__("feather_px", -1),
+    "zero_measurement_px": lambda p: p["meta"].__setitem__("measurement_px", 0),
+    "relation_measurement_mismatch": lambda p: p["relations"][0].__setitem__("measurement_px", 999),
+    "negative_overlap": lambda p: p["relations"][0].__setitem__("overlap_px", -1),
+    "band_exceeds_overlap": lambda p: p["relations"][0].__setitem__("band_used_px", 10 ** 6),
+    "cell_outside_grid": lambda p: p["meta"]["cell_ids"].__setitem__(0, "r9999c9999"),
+    "noncanonical_cell_order": lambda p: p["meta"].__setitem__(
+        "cell_ids", list(reversed(p["meta"]["cell_ids"]))),
+    "duplicate_cell_id": lambda p: p["meta"]["cell_ids"].append(p["meta"]["cell_ids"][0]),
+    "negative_rejection_fraction": lambda p: p["relations"][0].__setitem__("rejection_fraction", -0.1),
+    "rejection_fraction_gt_one": lambda p: p["relations"][0].__setitem__("rejection_fraction", 1.5),
+    "negative_sigma": lambda p: p["relations"][0].__setitem__("robust_sigma", -1.0),
+    "negative_level_z": lambda p: p["relations"][0].__setitem__("level_z", -1.0),
+    "negative_n_train": lambda p: p["relations"][0].__setitem__("n_train", -1),
 }
 
 
@@ -164,6 +207,58 @@ def test_schema_rejection(name):
 def test_base_payload_loads_cleanly():
     art = bgd.load_artifact(_base_payload())
     assert art.meta["n_relations"] == len(art.observations)
+
+
+def test_exact_base_payload_loads_cleanly():
+    art = bgd.load_artifact(_base_payload_exact())
+    assert art.heldout_capped is False
+    assert all(not r["holdout_capped"] for r in art.payload["relations"])
+
+
+def test_loader_rejects_capped_flag_false_while_subsampled():
+    def fn(p):
+        r = p["relations"][0]
+        r["n_holdout_kept"] = 1
+        r["holdout_xy"] = r["holdout_xy"][:1]
+        r["holdout_diff"] = r["holdout_diff"][:1]
+        r["holdout_capped"] = False
+    with pytest.raises(bgd.DiagnosticSchemaError):
+        bgd.load_artifact(_mutate_exact(fn))
+
+
+def test_loader_rejects_capped_flag_true_while_full():
+    def fn(p):
+        p["relations"][0]["holdout_capped"] = True
+    with pytest.raises(bgd.DiagnosticSchemaError):
+        bgd.load_artifact(_mutate_exact(fn))
+
+
+def test_loader_rejects_zero_kept_with_nonzero_full():
+    def fn(p):
+        r = p["relations"][0]
+        assert r["n_holdout"] > 0
+        r["n_holdout_kept"] = 0
+        r["holdout_xy"] = []
+        r["holdout_diff"] = []
+        r["holdout_capped"] = True
+    with pytest.raises(bgd.DiagnosticSchemaError):
+        bgd.load_artifact(_mutate_exact(fn))
+
+
+def test_loader_rejects_kept_exceeding_declared_cap():
+    def fn(p):
+        p["meta"]["holdout_cap"] = 64          # exact base keeps the full ~256
+        assert all(r["n_holdout_kept"] > 64 for r in p["relations"])
+    with pytest.raises(bgd.DiagnosticSchemaError):
+        bgd.load_artifact(_mutate_exact(fn))
+
+
+def test_loader_rejects_duplicate_relation_key():
+    def fn(p):
+        p["relations"].append(copy.deepcopy(p["relations"][0]))
+        p["meta"]["n_relations"] = len(p["relations"])
+    with pytest.raises(bgd.DiagnosticSchemaError):
+        bgd.load_artifact(_mutate(fn))
 
 
 def test_dropped_nan_relation_array_rejected_after_strict_dump():
@@ -322,19 +417,78 @@ def test_roundtrip_coefficients_and_holdout_exact_without_capping(nx, ny):
 
 
 @pytest.mark.parametrize("nx,ny", [(2, 2), (2, 3)])
-def test_capped_holdout_metrics_quantified_within_declared_tolerance(nx, ny):
+def test_capped_holdout_quantified_and_conservatively_qualified(nx, ny):
     cells, cw = _grid(nx, ny, plane=plane_fn(), noise=0.2, seed=7)
     src = bm.compare_models(cells, nx, ny, cw)
-
     payload = bgd.build_payload(cells, nx, ny, cw, holdout_cap=16)
     assert any(r["holdout_capped"] for r in payload["relations"])
-    assert all(r["n_holdout_kept"] <= 16 for r in payload["relations"])
     art = bgd.load_artifact(payload)
+    assert art.heldout_capped is True and art.heldout_exact() is False
+    assert art.n_capped_relations == sum(1 for r in payload["relations"] if r["holdout_capped"])
     res = bgd.recompute_decision(art)
-
+    # transparency at the decision surface
+    assert res.gates["diagnostic_heldout_capped"] is True
+    assert res.gates["diagnostic_heldout_exact"] is False
+    assert res.provenance["diagnostic_heldout_capped"] is True
+    assert res.provenance["diagnostic_qualification"] == bgd.QUALIFICATION_RESEARCH_ONLY_CAPPED
+    # conservative: a capped artifact can never qualify ROBUST_PLAN
+    assert res.decision != bm.STATE_ROBUST_PLAN
+    if src.decision == bm.STATE_ROBUST_PLAN:
+        assert res.decision == bm.STATE_INSUFFICIENT_EVIDENCE
+        assert res.provenance.get("diagnostic_downgraded_from") == bm.STATE_ROBUST_PLAN
+        assert any("diagnostic_heldout_capped" in r for r in res.refusal_reasons)
+    # the delta is *recorded*, never asserted against a universal bound
     delta = abs(res.heldout["r_plan"] - src.heldout["r_plan"]) / abs(src.heldout["r_plan"])
-    assert delta <= bgd.HELDOUT_RMS_REL_TOL          # quantified + bounded
-    assert res.decision == src.decision
+    assert np.isfinite(delta)
+
+
+def test_exact_artifact_qualification_markers_and_to_json_dict():
+    cells, cw = _grid(2, 2, plane=plane_fn(), noise=0.2, seed=7)
+    art = bgd.load_artifact(bgd.build_payload(cells, 2, 2, cw, holdout_cap=10 ** 6))
+    assert art.heldout_capped is False and art.heldout_exact() is True
+    assert art.n_capped_relations == 0
+    res = bgd.recompute_decision(art)
+    assert res.gates["diagnostic_heldout_capped"] is False
+    assert res.gates["diagnostic_heldout_exact"] is True
+    assert res.provenance["diagnostic_qualification"] == bgd.QUALIFICATION_EXACT
+    # to_json_dict must preserve the qualification markers on BOTH surfaces
+    j = res.to_json_dict()
+    assert j["gates"]["diagnostic_heldout_capped"] is False
+    assert j["gates"]["diagnostic_heldout_exact"] is True
+    assert j["provenance"]["diagnostic_heldout_capped"] is False
+    assert j["provenance"]["diagnostic_qualification"] == bgd.QUALIFICATION_EXACT
+
+
+@pytest.mark.parametrize("cap", [4, 8, 16, 32, 64])
+@pytest.mark.parametrize("nx,ny", [(2, 2), (2, 3)])
+def test_supported_caps_transparency_and_conservative_policy(nx, ny, cap):
+    """No metric bound is claimed; transparency + non-qualification are."""
+    cells, cw = _grid(nx, ny, plane=plane_fn(), noise=0.2, seed=7)
+    payload = bgd.build_payload(cells, nx, ny, cw, holdout_cap=cap)
+    capped = any(r["holdout_capped"] for r in payload["relations"])
+    for r in payload["relations"]:
+        assert r["n_holdout_kept"] <= cap
+        assert r["holdout_capped"] is (r["n_holdout_kept"] < r["n_holdout"])
+    art = bgd.load_artifact(payload)
+    assert art.heldout_capped is capped
+    res = bgd.recompute_decision(art)
+    assert res.gates["diagnostic_heldout_capped"] is capped
+    assert res.provenance["diagnostic_heldout_exact"] is (not capped)
+    if capped:
+        assert res.decision != bm.STATE_ROBUST_PLAN
+
+
+def test_committed_reference_tolerance_is_config_scoped_not_universal():
+    # The declared reference tolerance is documented for one configuration and is
+    # NOT an invariant: measured values at cap 4 exceed it.
+    assert bgd.HELDOUT_RMS_REL_TOL == bgd.HELDOUT_RMS_REFERENCE_REL_TOL
+    assert "cap=16" in bgd.HELDOUT_RMS_REFERENCE_CONFIG
+    cells, cw = _grid(2, 2, plane=plane_fn(), noise=0.2, seed=7)
+    src = bm.compare_models(cells, 2, 2, cw)
+    res = bgd.recompute_decision(bgd.load_artifact(
+        bgd.build_payload(cells, 2, 2, cw, holdout_cap=4)))
+    delta = abs(res.heldout["r_plan"] - src.heldout["r_plan"]) / abs(src.heldout["r_plan"])
+    assert delta > bgd.HELDOUT_RMS_REFERENCE_REL_TOL   # refutes any universal-bound claim
 
 
 def test_capped_holdout_does_not_change_plan_solve_at_fixed_lambda():
