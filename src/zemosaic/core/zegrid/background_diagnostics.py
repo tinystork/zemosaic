@@ -34,9 +34,13 @@ Discipline (frozen by the delegated mission ZM-ZEGRID-R37-C-DIAGNOSTIC)
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -70,6 +74,8 @@ __all__ = [
     "RHS_THETA_RTOL",
     "QUALIFICATION_EXACT",
     "QUALIFICATION_RESEARCH_ONLY_CAPPED",
+    "CAPTURE_ARTIFACT_BASENAME",
+    "CAPTURE_STAGE",
     "DIAGNOSTIC_PROVENANCE",
     "DiagnosticSchemaError",
     "DiagnosticArtifact",
@@ -81,6 +87,7 @@ __all__ = [
     "loads",
     "dump_file",
     "load_file",
+    "publish_artifact",
     "recompute_decision",
     "estimate_footprint",
     "canonical_witness_estimates",
@@ -122,6 +129,15 @@ RHS_THETA_RTOL = 1e-6
 #: Qualification markers surfaced on the offline decision result.
 QUALIFICATION_EXACT = "EXACT"
 QUALIFICATION_RESEARCH_ONLY_CAPPED = "RESEARCH_ONLY_HELDOUT_CAPPED"
+
+#: ZM-ZEGRID-R37-D: the FIXED basename of the published capture artifact inside a
+#: run's actual output directory. It is never caller-controlled, so no path
+#: traversal is possible (only the directory is chosen by the caller).
+CAPTURE_ARTIFACT_BASENAME = "zegrid_r37_pre_feather.json"
+#: The exact provenance stage the captured evidence corresponds to: the payload is
+#: built AFTER the complete per-Cell patches coexist but BEFORE the inter-cell
+#: offset graph, additive offsets and feather assembly run.
+CAPTURE_STAGE = "pre_offset_pre_feather"
 #: Declared average byte width of one serialised JSON number, used ONLY by the
 #: analytic size estimate (a documented model, not a measurement).
 _JSON_SCALAR_WIDTH = 20
@@ -934,6 +950,91 @@ def load_file(path) -> DiagnosticArtifact:
         return loads(fh.read())
 
 
+def publish_artifact(output_dir, payload, *, basename: str = CAPTURE_ARTIFACT_BASENAME) -> dict:
+    """Validate + atomically publish a capture artifact into ``output_dir``.
+
+    ZM-ZEGRID-R37-D: the ONLY supported way to persist a capture artifact. It
+
+    1. runs the STRICT loader (``load_artifact``) on the in-memory payload BEFORE
+       anything touches the filesystem, so a malformed payload is never published;
+    2. writes the canonical strict JSON to a SAME-DIRECTORY temp file, flushes and
+       fsyncs it, then atomically renames it onto the fixed ``basename`` (the temp
+       is always removed on failure, no partial file and no residue);
+    3. re-reads the published bytes and computes their SHA-256 AFTER publication.
+
+    ``output_dir`` only selects the directory; ``basename`` is FIXED and never
+    caller-controlled, so there is no path-traversal surface. Returns the compact
+    capture metadata recorded in the manifest / run log.
+    """
+    out = Path(output_dir).expanduser()
+    name = str(basename)
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError(f"capture artifact basename must be a plain filename, got {basename!r}")
+    # 1. STRICT validation BEFORE publication (fail closed; nothing written).
+    artifact = load_artifact(payload)
+    text = dumps(payload)
+    data = text.encode("utf-8")
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / name
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=str(out))
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, target)
+        tmp_path = None
+        # Best-effort directory fsync so the rename is durable on POSIX hosts.
+        try:
+            dfd = os.open(str(out), os.O_RDONLY)
+        except OSError:
+            dfd = None
+        if dfd is not None:
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    # 3. SHA-256 + byte count AFTER publication (from the on-disk bytes).
+    digest = hashlib.sha256()
+    n_bytes = 0
+    with open(target, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+            n_bytes += len(chunk)
+    return {
+        "status": "written",
+        "filename": name,
+        "capture_stage": CAPTURE_STAGE,
+        "schema": artifact.payload["schema"],
+        "schema_version": artifact.payload["schema_version"],
+        "bytes": int(n_bytes),
+        "sha256": digest.hexdigest(),
+        "n_cells": int(len(artifact.meta["cell_ids"])),
+        "n_relations": int(len(artifact.observations)),
+        "n_dropped": int(len(artifact.dropped)),
+        "holdout_cap": int(artifact.meta["holdout_cap"]),
+        "holdout_capped": bool(artifact.heldout_capped),
+        "holdout_exact": bool(artifact.heldout_exact()),
+        "qualification": (
+            QUALIFICATION_RESEARCH_ONLY_CAPPED if artifact.heldout_capped else QUALIFICATION_EXACT
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Offline decision rerun (delegates to the accepted comparison path)
 # ---------------------------------------------------------------------------
@@ -970,21 +1071,50 @@ def recompute_decision(artifact: DiagnosticArtifact, *, cfg=None):
     )
     capped = bool(artifact.heldout_capped)
     qualification = QUALIFICATION_RESEARCH_ONLY_CAPPED if capped else QUALIFICATION_EXACT
-    result.provenance["diagnostic_heldout_capped"] = capped
-    result.provenance["diagnostic_heldout_exact"] = (not capped)
-    result.provenance["diagnostic_n_capped_relations"] = int(artifact.n_capped_relations)
-    result.provenance["diagnostic_qualification"] = qualification
-    result.gates["diagnostic_heldout_capped"] = capped
-    result.gates["diagnostic_heldout_exact"] = (not capped)
-    result.gates["diagnostic_qualification"] = qualification
+    accepted_decision = str(result.decision)
+    accepted_model = str(result.model)
+    downgraded_from = None
+    downgrade_reason = None
+    # LOW-1 cleanup (ZM-ZEGRID-R37-D): the accepted scientific ``gates`` mapping is
+    # left STRICTLY intact (only its own PASS/FAIL/... values). Diagnostic
+    # qualification is surfaced in the dedicated, namespaced
+    # ``result.provenance["diagnostic"]`` block, so:
+    #   * ``all(v == "PASS" for v in gates.values())`` keeps its ACCEPTED meaning
+    #     (no bool/str diagnostic entry is injected into the gate map), and
+    #   * ``decision`` / ``qualification`` are internally unambiguous: the block
+    #     records the accepted decision, the effective (conservatively downgraded)
+    #     decision, the exact qualification and the downgrade reason.
+    # The conservative policy is NOT weakened: a capped artifact still cannot
+    # qualify ``ROBUST_PLAN`` (it is downgraded, with an explicit refusal reason).
     if capped and result.decision == STATE_ROBUST_PLAN:
-        result.provenance["diagnostic_downgraded_from"] = STATE_ROBUST_PLAN
-        result.provenance["diagnostic_downgrade_reason"] = "heldout_capped_not_exact"
+        downgraded_from = STATE_ROBUST_PLAN
+        downgrade_reason = "heldout_capped_not_exact"
         result.decision = STATE_INSUFFICIENT_EVIDENCE
         result.model = MODEL_OFFSET_ONLY
         result.refusal_reasons.append(
             "diagnostic_heldout_capped: capped held-out evidence cannot qualify ROBUST_PLAN"
         )
+    result.provenance["diagnostic"] = {
+        "qualified": qualification == QUALIFICATION_EXACT,
+        "qualification": qualification,
+        "heldout_capped": capped,
+        "heldout_exact": (not capped),
+        "n_capped_relations": int(artifact.n_capped_relations),
+        "accepted_decision": accepted_decision,
+        "accepted_model": accepted_model,
+        "effective_decision": str(result.decision),
+        "effective_model": str(result.model),
+        "downgraded_from": downgraded_from,
+        "downgrade_reason": downgrade_reason,
+        "downgrade_policy": "heldout_capped_cannot_qualify_robust_plan",
+        "note": (
+            "Diagnostic-only qualification: 'accepted_decision' is what the accepted "
+            "M0/M1 logic returned from the reconstructed evidence; 'effective_decision' "
+            "is the conservative decision this offline layer surfaces (capped held-out "
+            "evidence is research-only and cannot qualify ROBUST_PLAN). The accepted "
+            "scientific 'gates' mapping is left untouched by this layer."
+        ),
+    }
     return result
 
 

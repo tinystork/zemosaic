@@ -12,7 +12,6 @@ from __future__ import annotations
 import copy
 import json
 import pathlib
-import sys
 
 import numpy as np
 import pytest
@@ -426,16 +425,22 @@ def test_capped_holdout_quantified_and_conservatively_qualified(nx, ny):
     assert art.heldout_capped is True and art.heldout_exact() is False
     assert art.n_capped_relations == sum(1 for r in payload["relations"] if r["holdout_capped"])
     res = bgd.recompute_decision(art)
-    # transparency at the decision surface
-    assert res.gates["diagnostic_heldout_capped"] is True
-    assert res.gates["diagnostic_heldout_exact"] is False
-    assert res.provenance["diagnostic_heldout_capped"] is True
-    assert res.provenance["diagnostic_qualification"] == bgd.QUALIFICATION_RESEARCH_ONLY_CAPPED
+    # transparency at the decision surface (dedicated, namespaced diagnostic block;
+    # the ACCEPTED scientific ``gates`` mapping is left strictly intact)
+    assert res.provenance["diagnostic"]["heldout_capped"] is True
+    assert res.provenance["diagnostic"]["heldout_exact"] is False
+    assert res.provenance["diagnostic"]["qualified"] is False
+    assert res.provenance["diagnostic"]["qualification"] == bgd.QUALIFICATION_RESEARCH_ONLY_CAPPED
+    assert not any(k.startswith("diagnostic") for k in res.gates)
     # conservative: a capped artifact can never qualify ROBUST_PLAN
     assert res.decision != bm.STATE_ROBUST_PLAN
     if src.decision == bm.STATE_ROBUST_PLAN:
         assert res.decision == bm.STATE_INSUFFICIENT_EVIDENCE
-        assert res.provenance.get("diagnostic_downgraded_from") == bm.STATE_ROBUST_PLAN
+        assert res.provenance["diagnostic"]["downgraded_from"] == bm.STATE_ROBUST_PLAN
+        assert res.provenance["diagnostic"]["accepted_decision"] == bm.STATE_ROBUST_PLAN
+        assert res.provenance["diagnostic"]["effective_decision"] == bm.STATE_INSUFFICIENT_EVIDENCE
+        # the ACCEPTED scientific gates are untouched -> evidence/heldout stay PASS
+        assert res.gates["evidence"] == "PASS"
         assert any("diagnostic_heldout_capped" in r for r in res.refusal_reasons)
     # the delta is *recorded*, never asserted against a universal bound
     delta = abs(res.heldout["r_plan"] - src.heldout["r_plan"]) / abs(src.heldout["r_plan"])
@@ -448,15 +453,17 @@ def test_exact_artifact_qualification_markers_and_to_json_dict():
     assert art.heldout_capped is False and art.heldout_exact() is True
     assert art.n_capped_relations == 0
     res = bgd.recompute_decision(art)
-    assert res.gates["diagnostic_heldout_capped"] is False
-    assert res.gates["diagnostic_heldout_exact"] is True
-    assert res.provenance["diagnostic_qualification"] == bgd.QUALIFICATION_EXACT
-    # to_json_dict must preserve the qualification markers on BOTH surfaces
+    assert res.provenance["diagnostic"]["heldout_capped"] is False
+    assert res.provenance["diagnostic"]["heldout_exact"] is True
+    assert res.provenance["diagnostic"]["qualified"] is True
+    assert res.provenance["diagnostic"]["qualification"] == bgd.QUALIFICATION_EXACT
+    # to_json_dict must preserve the namespaced qualification markers
     j = res.to_json_dict()
-    assert j["gates"]["diagnostic_heldout_capped"] is False
-    assert j["gates"]["diagnostic_heldout_exact"] is True
-    assert j["provenance"]["diagnostic_heldout_capped"] is False
-    assert j["provenance"]["diagnostic_qualification"] == bgd.QUALIFICATION_EXACT
+    assert j["provenance"]["diagnostic"]["heldout_capped"] is False
+    assert j["provenance"]["diagnostic"]["heldout_exact"] is True
+    assert j["provenance"]["diagnostic"]["qualification"] == bgd.QUALIFICATION_EXACT
+    # ...and must NOT inject diagnostic keys into the accepted gates mapping
+    assert not any(k.startswith("diagnostic") for k in j["gates"])
 
 
 @pytest.mark.parametrize("cap", [4, 8, 16, 32, 64])
@@ -472,8 +479,8 @@ def test_supported_caps_transparency_and_conservative_policy(nx, ny, cap):
     art = bgd.load_artifact(payload)
     assert art.heldout_capped is capped
     res = bgd.recompute_decision(art)
-    assert res.gates["diagnostic_heldout_capped"] is capped
-    assert res.provenance["diagnostic_heldout_exact"] is (not capped)
+    assert res.provenance["diagnostic"]["heldout_capped"] is capped
+    assert res.provenance["diagnostic"]["heldout_exact"] is (not capped)
     if capped:
         assert res.decision != bm.STATE_ROBUST_PLAN
 
@@ -511,14 +518,27 @@ def test_capped_holdout_does_not_change_plan_solve_at_fixed_lambda():
 # ===========================================================================
 
 def test_no_production_import_or_wiring():
-    assert "zemosaic.zemosaic_zegrid_mode" not in sys.modules
+    """ZM-ZEGRID-R37-D: the diagnostic module must never be imported at module
+    import time by any production module (the disabled run path stays free of it).
+
+    A LAZY import inside the explicit capture branch is the R37-D seam, so the
+    check is on the AST (no module-level import statement), not a raw grep.
+    """
+    import ast
+
     src_root = pathlib.Path(bm.__file__).resolve().parents[1]
     offenders = []
     for path in src_root.rglob("*.py"):
         if path.name == "background_diagnostics.py":
             continue
-        if "background_diagnostics" in path.read_text(encoding="utf-8", errors="ignore"):
-            offenders.append(str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"), filename=str(path))
+        for node in tree.body:  # module top-level statements only
+            if isinstance(node, ast.Import):
+                if any("background_diagnostics" in a.name for a in node.names):
+                    offenders.append(f"{path}:{node.lineno}")
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and "background_diagnostics" in node.module:
+                    offenders.append(f"{path}:{node.lineno}")
     assert offenders == []
 
 

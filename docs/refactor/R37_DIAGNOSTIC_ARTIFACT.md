@@ -128,21 +128,33 @@ quantified by the tests, never claimed exact.
 ### 4b. Conservative qualification at the decision surface
 
 A capped artifact is **research-only / non-qualifying** and cannot silently
-present `ROBUST_PLAN` as exact evidence. `recompute_decision` surfaces the
-aggregate capping fact on BOTH `result.gates` and `result.provenance`:
+present `ROBUST_PLAN` as exact evidence. The aggregate capping fact and the
+qualification live in a **dedicated, namespaced `result.provenance["diagnostic"]`
+block** (ZM-ZEGRID-R37-D LOW-1 cleanup); the accepted scientific `gates` mapping
+is left **strictly intact** (no non-`PASS` diagnostic entry is injected into it):
 
-* `diagnostic_heldout_capped` (bool), `diagnostic_heldout_exact` (bool),
-  `diagnostic_n_capped_relations` (int), and a machine-readable
-  `diagnostic_qualification` marker (`EXACT` | `RESEARCH_ONLY_HELDOUT_CAPPED`).
-* `to_json_dict()` preserves all of them (they ride on the copied dicts).
+* `qualified` (bool), `qualification` (`EXACT` | `RESEARCH_ONLY_HELDOUT_CAPPED`),
+  `heldout_capped` / `heldout_exact` (bool), `n_capped_relations` (int),
+  `accepted_decision` / `accepted_model`, `effective_decision` /
+  `effective_model`, `downgraded_from`, `downgrade_reason`, `downgrade_policy`,
+  and a `note`.
+* `to_json_dict()` preserves the whole block; the block is unambiguous about the
+  accepted vs the conservative (effective) decision.
 
 If a capped rerun would have returned `ROBUST_PLAN`, the diagnostic layer
 withholds it: the surfaced `decision` becomes `INSUFFICIENT_EVIDENCE`, `model`
-becomes `OFFSET_ONLY`, `provenance.diagnostic_downgraded_from` records
-`ROBUST_PLAN`, `provenance.diagnostic_downgrade_reason` records
+becomes `OFFSET_ONLY`, `provenance.diagnostic.downgraded_from` records
+`ROBUST_PLAN`, `provenance.diagnostic.downgrade_reason` records
 `heldout_capped_not_exact`, and an explicit refusal reason is appended. Other
 (non-qualifying) decisions are returned unchanged. This policy lives ONLY in the
 diagnostic layer — the accepted `background_model` decision logic is untouched.
+
+> **R37-D update (LOW-1).** Earlier (R37-C rework-1) this block was also copied
+> into `result.gates` and the flat `provenance["diagnostic_*"]` keys, which broke
+> the accepted meaning of the gates map. R37-D moves the whole qualification into
+> the namespaced `provenance["diagnostic"]` block and leaves `gates` untouched;
+> the conservative non-qualification is unchanged. See
+> `docs/refactor/R37_D_CAPTURE.md` §5.
 
 ---
 
@@ -277,6 +289,8 @@ Gate-A snapshots plus the arXiv identifiers above are the recorded basis.
 - No write under `/home/tristan/caldwell11` or M106. No Caldwell run.
 - float64 scientific math; deterministic output.
 - The artifact is sufficient **given** a future harness that can emit pre-feather
-  `PlanCell`/`CellPatch` objects. Producing that capture in a real run (and
-  therefore a real R37 evaluation) is out of scope here and remains the next
-  step.
+  `PlanCell`/`CellPatch` objects. Producing that capture in a real run **is now
+  implemented as the default-OFF R37-D seam** (`run_zegrid_mode(...
+  r37_diagnostic_capture=True)` on a `per_cell` run) — see
+  `docs/refactor/R37_D_CAPTURE.md`; running the real Caldwell/M106 corpus remains
+  the next step.

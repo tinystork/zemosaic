@@ -107,6 +107,15 @@ RUN_LOG_NAME = "zegrid_run.log"
 # Streaming tile size for the R6 executor (safe, memory-bounded default).
 STREAM_TILE_SIZE = 128
 
+# ZM-ZEGRID-R37-D: fixed diagnostic-capture contract. The capture artifact is a
+# diagnostic-only, default-OFF pre-offset/pre-feather snapshot; its basename is
+# FIXED (no caller-controlled path) and its stage is explicit. The default
+# held-out cap mirrors ``background_diagnostics.HOLDOUT_CAP`` (a test pins the
+# equality) WITHOUT importing the diagnostic module on the disabled path.
+R37_CAPTURE_STAGE = "pre_offset_pre_feather"
+R37_CAPTURE_FILENAME = "zegrid_r37_pre_feather.json"
+R37_CAPTURE_HOLDOUT_CAP_DEFAULT = 64
+
 # ZM-ZEGRID-R36: deterministic CPU streaming-tile ladder, ordered
 # performance -> economy. The planner picks the LARGEST tile whose worst-cell
 # streaming bound fits the RAM budget. ``128`` is the historical/preferred tile;
@@ -1352,7 +1361,32 @@ def _resolve_cell_normalization(mode, global_gauge, global_frame_ids, provider, 
     return fixed, zphot.CELL_GAUGE_STATUS_OK, None
 
 
-def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None, emit=None):
+def _validate_r37_diagnostic_capture(capture, holdout_cap):
+    """Strict validation of the R37-D capture opt-in (no silent coercion).
+
+    Returns the normalised ``(capture, holdout_cap)``. ``capture`` must be a real
+    ``bool`` (not 0/1/"true"); ``holdout_cap`` must be a real ``int`` (not a bool)
+    and ``>= 4`` WHEN capture is enabled (the accepted artifact refuses a smaller
+    cap). A disabled request never activates or touches the diagnostic module.
+    """
+    if not isinstance(capture, bool):
+        raise ValueError(
+            f"r37_diagnostic_capture must be a bool, got {type(capture).__name__}"
+        )
+    if isinstance(holdout_cap, bool) or not isinstance(holdout_cap, (int, np.integer)):
+        raise ValueError(
+            f"r37_diagnostic_holdout_cap must be an int, got {type(holdout_cap).__name__}"
+        )
+    cap = int(holdout_cap)
+    if capture and cap < 4:
+        raise ValueError(
+            f"r37_diagnostic_holdout_cap must be >= 4 when capture is enabled, got {cap}"
+        )
+    return capture, cap
+
+
+def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None, emit=None,
+                                 capture=False, holdout_cap=None, output_dir=None):
     """R34D: apply inter-cell additive offsets + FEATHERED assembly (opt-in).
 
     Builds :class:`cell_feather.CellPatch` objects from the per-cell worker results
@@ -1385,6 +1419,64 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
         raise RuntimeError(
             "per_cell feather assembly: no complete cell patches were produced"
         )
+
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-R37-D: explicit, default-OFF diagnostic capture at the EXACT
+    # pre-offset/pre-feather point. The complete CellPatch objects coexist here but
+    # the inter-cell offset graph, the additive offsets and the feather weights do
+    # not exist yet. The payload is the ACCEPTED R37-C strict-JSON artifact built
+    # by the UNCHANGED ``background_diagnostics.build_payload`` (no duplicate
+    # pixel/difference math) and published atomically into THIS run's actual
+    # output directory. Diagnostic-only: the patches, graph, offsets, feather
+    # weights and every science/aesthetic/coverage array are left untouched.
+    # ------------------------------------------------------------------
+    capture_info = None
+    if capture:
+        from .core.zegrid import background_diagnostics as _bgd
+
+        if output_dir is None:
+            raise RuntimeError(
+                "R37 diagnostic capture requested but no output directory was "
+                "provided; refusing to run without publishing the artifact"
+            )
+        cap = R37_CAPTURE_HOLDOUT_CAP_DEFAULT if holdout_cap is None else int(holdout_cap)
+        # Measurement band explicit and consistent with the real halo overlap
+        # (normally 2*halo = 16 px; a halo-less patch falls back to the accepted
+        # default band). Recorded in the provenance + manifest.
+        measurement_px = int(2 * halo_px) if int(halo_px) > 0 else int(_bgd.DEFAULT_MEASUREMENT_PX)
+        payload = _bgd.build_payload(
+            patches, nx, ny, (int(canvas.height), int(canvas.width)),
+            measurement_px=measurement_px, holdout_cap=cap,
+        )
+        payload["provenance"]["capture_stage"] = R37_CAPTURE_STAGE
+        payload["provenance"]["capture"] = {
+            "capture_stage": R37_CAPTURE_STAGE,
+            "effective_cell_gauge_mode": zphot.CELL_GAUGE_MODE_PER_CELL,
+            "halo_px": int(halo_px),
+            "measurement_px": int(measurement_px),
+            "production_wired": True,
+            "correction_applied": False,
+        }
+        capture_info = _bgd.publish_artifact(
+            output_dir, payload, basename=R37_CAPTURE_FILENAME
+        )
+        capture_info["effective_cell_gauge_mode"] = zphot.CELL_GAUGE_MODE_PER_CELL
+        capture_info["halo_px"] = int(halo_px)
+        capture_info["measurement_px"] = int(measurement_px)
+        if emit is not None:
+            try:
+                emit(
+                    "ZeGrid R37-D diagnostic capture: "
+                    f"file={capture_info['filename']} stage={capture_info['capture_stage']} "
+                    f"schema={capture_info['schema']}/{capture_info['schema_version']} "
+                    f"relations={capture_info['n_relations']} dropped={capture_info['n_dropped']} "
+                    f"capped={capture_info['holdout_capped']} "
+                    f"qualification={capture_info['qualification']} "
+                    f"bytes={capture_info['bytes']} sha256={capture_info['sha256']}",
+                    "INFO",
+                )
+            except Exception:
+                pass
 
     graph = zcf.build_cell_offset_graph(
         canvas, nx, ny, patches, on_disconnected=zcf.FEATHER_DISCONNECTED_POLICY
@@ -1427,20 +1519,27 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
         "offsets": {cid: [float(v) for v in offsets[cid]] for cid in offsets},
         "halo_px": halo_px,
     }
+    if capture_info is not None:
+        info["r37_diagnostic_capture"] = capture_info
     return assembled, info
 
 
-def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None, emit=None):
+def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None, emit=None,
+                    capture=False, holdout_cap=None, output_dir=None):
     """Dispatch assembly by cell gauge mode (ZM-CELL-PHOTOMETRY-R34D).
 
     Returns ``(assembled, feather_info)``. ``"global"`` (default) -> the
     UNCHANGED one-owner :func:`mosaic.assemble_canvas` (``feather_info`` is None);
     ``"per_cell"`` (opt-in) -> inter-cell additive offsets + feathered assembly.
+    ZM-ZEGRID-R37-D: the diagnostic-capture opt-in is forwarded ONLY to the
+    per_cell path (the only point where pre-feather CellPatches exist); the
+    global path never captures.
     """
     resolved = zphot.resolve_cell_gauge_mode(mode)
     if resolved == zphot.CELL_GAUGE_MODE_PER_CELL:
         return _assemble_per_cell_feathered(
-            canvas, nx, ny, result_by_cid, halo_px=halo_px, emit=emit
+            canvas, nx, ny, result_by_cid, halo_px=halo_px, emit=emit,
+            capture=capture, holdout_cap=holdout_cap, output_dir=output_dir,
         )
     return zmosaic.assemble_canvas(canvas, nx, ny, cores), None
 
@@ -2052,6 +2151,8 @@ def _run_single(
     finishing_config=None,
     gpu_context=None,
     pass_label="single",
+    r37_diagnostic_capture=False,
+    r37_diagnostic_holdout_cap=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2361,6 +2462,22 @@ def _run_single(
             callback=progress_callback,
         )
         _log_line(_auto_msg)
+
+    # ZM-ZEGRID-R37-D: the capture seam only exists on the per_cell path (the only
+    # point where complete pre-offset/pre-feather CellPatches coexist). Fail LOUDLY
+    # here — after the effective mode is resolved (incl. auto->global) and BEFORE
+    # any per-Cell stacking — rather than silently skipping the requested capture.
+    if r37_diagnostic_capture and getattr(
+        science_config, "cell_gauge_mode", None
+    ) != zphot.CELL_GAUGE_MODE_PER_CELL:
+        raise RuntimeError(
+            "R37 diagnostic capture requested but the effective cell_gauge_mode is "
+            f"{getattr(science_config, 'cell_gauge_mode', None)!r}, not 'per_cell'; "
+            "there is no pre-offset/pre-feather per-Cell assembly point, so no "
+            "artifact can be captured. Refusing to run rather than silently not "
+            "capturing (use cell_gauge_mode='per_cell', or 'auto' on a corpus that "
+            "resolves to per_cell)."
+        )
     if gauge_cache_dir.exists():
         if not _safe_rmtree(gauge_cache_dir, progress_callback):
             cleanup_failures.append(str(gauge_cache_dir))
@@ -2881,6 +2998,9 @@ def _run_single(
         assembled, feather_info = _assemble_cells(
             canvas, nx, ny, _gauge_mode, cores, result_by_cid,
             halo_px=zsw.HALO_PX, emit=_emit_live,
+            capture=r37_diagnostic_capture,
+            holdout_cap=r37_diagnostic_holdout_cap,
+            output_dir=output_dir,
         )
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
     # ZM-ZEGRID-R22 honesty fix: peak_rss_kib is a SINGLE process's peak. Report
@@ -3611,6 +3731,14 @@ def _write_outputs(
                     "keep offset 0 (recorded, no re-anchor, no bridge). Science is "
                     "weighted-feather blended (weights sum to 1); no gain/plane."
                 ),
+                # ZM-ZEGRID-R37-D: compact diagnostic-capture metadata, present
+                # ONLY when the explicit capture opt-in ran (disabled runs keep
+                # the exact previous manifest shape).
+                **(
+                    {"r37_diagnostic_capture": cell_feather_info["r37_diagnostic_capture"]}
+                    if cell_feather_info.get("r37_diagnostic_capture") is not None
+                    else {}
+                ),
             }
             if cell_feather_info is not None
             else {"enabled": False}
@@ -3742,6 +3870,8 @@ def run_zegrid_mode(
     frames_info: Sequence | None = None,
     selection_paths: Sequence[str] | None = None,
     global_wcs_output_path: str | None = None,
+    r37_diagnostic_capture: bool = False,
+    r37_diagnostic_holdout_cap: int = R37_CAPTURE_HOLDOUT_CAP_DEFAULT,
 ) -> None:
     """Run the NEW ZeGrid engine over the input folder's FITS inventory.
 
@@ -3752,8 +3882,23 @@ def run_zegrid_mode(
 
     Normalization defaults to ``sky_mean``;
     weighting/rejection/combine/taper use the frozen ZeGrid science config.
+
+    ZM-ZEGRID-R37-D: ``r37_diagnostic_capture`` (default ``False``) is an explicit,
+    diagnostic-only opt-in. When requested it publishes the accepted R37-C strict
+    JSON pre-offset/pre-feather artifact into EACH actual output directory and
+    records compact capture metadata in the manifest/run log. It never applies a
+    correction and never changes the science/aesthetic/coverage outputs; the
+    disabled path never imports, builds or writes the diagnostic. Capture requires
+    the effective ``cell_gauge_mode`` to be ``per_cell`` (``auto`` is honoured when
+    it resolves to per_cell; a global resolution fails loudly).
     """
     _emit("ZeGrid engine activated (explicit ZeGrid mode)", callback=progress_callback)
+
+    # ZM-ZEGRID-R37-D: validate the capture opt-in strictly and up front so a
+    # mistyped request fails before any work.
+    r37_diagnostic_capture, r37_diagnostic_holdout_cap = _validate_r37_diagnostic_capture(
+        r37_diagnostic_capture, r37_diagnostic_holdout_cap
+    )
 
     # ZM-ZEGRID-R22: resolve ONE canonical GPU preference and decide the backend
     # HONESTLY (requested -> available -> effective). ``use_gpu`` is now honoured
@@ -3929,6 +4074,21 @@ def run_zegrid_mode(
             callback=progress_callback,
         )
 
+    # ZM-ZEGRID-R37-D: an EXPLICIT global mode has no pre-feather per-Cell assembly
+    # point, so a capture request can never be satisfied — fail loudly and early
+    # (before input discovery) rather than claim a capture that will not happen.
+    # ``auto`` is deferred to the run-level resolution in ``_run_single``.
+    if (
+        r37_diagnostic_capture
+        and resolved_cell_gauge_mode == zphot.CELL_GAUGE_MODE_GLOBAL
+    ):
+        raise RuntimeError(
+            "R37 diagnostic capture requested but cell_gauge_mode is 'global' (no "
+            "pre-offset/pre-feather per-Cell assembly point exists). Refusing to run "
+            "rather than silently not capturing; use cell_gauge_mode='per_cell' or "
+            "'auto'."
+        )
+
     science_config = replace(
         ExecutorConfig().science_config(),
         normalization=_resolve_normalization(stack_norm_method),
@@ -4003,7 +4163,9 @@ def run_zegrid_mode(
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                         ignored_run_args=ignored_run_args,
                         finishing_config=finishing_config,
-                        gpu_context=gpu_context, pass_label="EQ")
+                        gpu_context=gpu_context, pass_label="EQ",
+                        r37_diagnostic_capture=r37_diagnostic_capture,
+                        r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
@@ -4011,7 +4173,9 @@ def run_zegrid_mode(
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                         ignored_run_args=ignored_run_args,
                         finishing_config=finishing_config,
-                        gpu_context=gpu_context, pass_label="ALTZ")
+                        gpu_context=gpu_context, pass_label="ALTZ",
+                        r37_diagnostic_capture=r37_diagnostic_capture,
+                        r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -4021,4 +4185,6 @@ def run_zegrid_mode(
                     pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
                     ignored_run_args=ignored_run_args,
                     finishing_config=finishing_config,
-                    gpu_context=gpu_context, pass_label="single")
+                    gpu_context=gpu_context, pass_label="single",
+                    r37_diagnostic_capture=r37_diagnostic_capture,
+                    r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap)
