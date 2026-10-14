@@ -257,8 +257,12 @@ assert 0 <= p < dim
 ```
 
 Recover `col` from `X` (`dim = W`) and `row` from `Y` (`dim = H`). Block ids are
-`col // 4` and `row // 4` (`block_px = 4`, frozen). The **tangent block index** used by
-§5.1/§8 is `col // 4` for `h` relations and `row // 4` for `v` relations.
+`col // 4` and `row // 4` (`block_px = 4`, frozen). **R39-A rework-1 (normative
+revision; made BEFORE any real R39 outcome).** The **tangent block index** used by
+§5.1/§8 is the block of the *tangent coordinate* of §3.2: `row // 4` for `h` relations
+and `col // 4` for `v` relations (the earlier `col // 4`/`row // 4` wording was the
+transpose of §3.2 and of the accepted production `tangent_blocks`, and it is degenerate
+here — see §8). The **normal block index** is `col // 4` for `h` and `row // 4` for `v`.
 
 Mandatory fixtures (fail-closed, before any metric):
 
@@ -324,15 +328,20 @@ Block-selection reuse: the held-out points are the artifact's deterministic
 block-parity subsample (`bx % 2 == 1 & by % 2 == 1`, `block_px = 4`) recovered by §3.4,
 so the split is already deterministic and reproducible.
 
-### 5.1 Block bootstrap (frozen)
+### 5.1 Block bootstrap (frozen; R39-A rework-1 correction)
 
-Group held-out samples by **tangent block index** recovered via §3.4 (`col // 4` for `h`,
-`row // 4` for `v`). Resample whole tangent blocks with replacement using a fixed seed
-(`seed = 0`) and `B = 2000` replicates. The bootstrap **estimates the uncertainty of the
-out-of-fold (OOF) coefficient and metric estimates of §8** (it re-fits on the resampled
-training blocks and scores the resampled test blocks within the frozen fold structure);
-it is an uncertainty estimate only and **never selects the model**. Block resampling
-(not per-sample) is mandatory because samples within a block are spatially correlated.
+Group held-out samples by **tangent block index** recovered via §3.4 (`row // 4` for `h`,
+`col // 4` for `v`). Resample whole tangent blocks with replacement using a fixed seed
+(`seed = 0`) and `B = 2000` replicates. **R39-A rework-1 (normative revision; made BEFORE
+any real R39 outcome):** each replicate performs **four separate fold fits** — for every
+fold `k` the model is fit on a whole-block resample of the folds `!= k` and scored on a
+whole-block resample of fold `k` only, and the four fold-local OOF vectors are then
+concatenated. **No fit may contain one of its own scored test blocks.** Coefficient draws
+are aggregated across folds by a documented deterministic **fold aggregate** (the MEAN of
+the finite fold coefficients) before the SE is taken. The bootstrap **estimates the
+uncertainty of the OOF coefficient and metric estimates of §8**; it is an uncertainty
+estimate only and **never selects the model**. Block resampling (not per-sample) is
+mandatory because samples within a block are spatially correlated.
 
 ### 5.2 Honest limitations of same-global-pixel pairs (must be stated)
 
@@ -453,51 +462,70 @@ kernels, and any model whose parameter count grows with the band size.
 Robust fitting: Huber with transition `1.345 × MAD_sigma` (same convention as
 `background_model.HUBER_DELTA_FACTOR`), deterministic, no hidden RNG.
 
-**Cross-validation mechanics (frozen; L3).** Train/test discipline is enforced
-**inside** the held-out set, with no leakage:
+**Cross-validation mechanics (frozen; L3; corrected R39-A rework-1 BEFORE any real
+outcome).** Train/test discipline is enforced **inside** the held-out set, with no leakage:
 
-- `K = 4` deterministic tangent-block folds: `fold = (tangent_block_index) % K`
-  (§3.4).
-- For each fold `k`, fit the model on the **other `K-1` folds only**; the training
-  subset's design must pass every identifiability gate below; then score the **untouched
-  fold** (out-of-fold, OOF). No test-fold point is ever used for fitting.
-- **Per-fold admission:** a model is admitted in fold `k` iff the fold's training design
-  passes all gates below **and** every fitted coefficient is finite.
-- **Model/axis admission (frozen per model and per axis, R4):**
-  - `C1` admits on the **tangent** axis only: `b_t` must be finite, pass the gates, and
-    have the **same nonzero sign** in ≥ 3 of 4 folds.
-  - `C2` admits on the **normal** axis only: `b_n` likewise.
-  - `C3` is scored as one model, but its two axes are evaluated **separately**: `b_t`
-    counts only if its own coefficient passes uncertainty and has the same nonzero sign
-    in ≥ 3 of 4 folds, and `b_n` likewise. A relation reports its **qualifying axis set**
-    and, per qualifying axis, the sign (the **sign tuple**). **At least one axis** must
-    qualify for C3 to count as a spatial model; a coefficient that does not qualify
-    **cannot inherit** the other axis's sign or admission.
-  - `C4` additionally requires the `q_n` term's own uncertainty/sign test **and** the
-    relative improvement beyond C3 (below); the curvature family is reported
-    **distinctly** from the linear axes.
+- `K = 4` deterministic tangent-block folds. **R39-A rework-1:** because the odd/odd
+  hold-out predicate makes every held-out raw tangent block id ODD, the literal
+  `fold = (tangent_block_index) % K` populates only `{1,3}` and folds 0/2 are always
+  empty; folds are therefore assigned by the **ordinal of the sorted unique tangent
+  block** (`0,1,2,…`) modulo `K`.
+- For each fold `k`, fit the model on a **whole-block** subset drawn only from the
+  **other `K-1` folds**; the training design must pass every identifiability gate below;
+  then score the **untouched fold** (out-of-fold, OOF). **No test-fold point (or block)
+  is ever used for fitting.**
+- **Per-fold status (M2).** Each fold records an explicit status (gate ok / exact reason /
+  finite coefficient / finite predictions). A model is admitted only with **≥ 3 of 4
+gate-passing folds** AND **complete OOF coverage** (every held-out sample receives a
+  finite fold-local prediction). A model that cannot produce complete OOF coverage is
+  refused rather than silently scored on hard data. **Failed folds never contribute sign
+  counts or coefficient aggregates.**
+- **Model/axis admission (frozen per model and per axis, R4 + rework-1):**
+  - `C1` admits on the **tangent** axis only; `C2` on the **normal** axis only.
+  - `C3` is scored as one model, its two axes evaluated **separately**; a relation reports
+    its **qualifying axis set** and, per qualifying axis, the sign (the **sign tuple**).
+    **At least one axis** must qualify; a non-qualifying coefficient cannot inherit the
+    other axis's sign or admission.
+  - Axis significance (exact, rework-1): the axis qualifies iff (a) **≥ 3 admitted folds**
+    have a finite coefficient with the **same nonzero sign**, (b) the full/reporting
+    coefficient is finite and has that **same sign**, and (c) `|full coef| ≥ 3 × bootstrap
+    SE` where the SE is the **leak-free** whole-block bootstrap of §5.1.
+  - `C4` additionally requires C3 to be admitted/valid, the overall reduction below, and
+    the relative improvement beyond C3 (below).
 - **Pooled OOF reduction** `red_sigma`: pool the OOF residuals of all folds; with the
   robust sigma (`MAD_SCALE*MAD`), `red_sigma = (sigma_oof(C0) - sigma_oof(model)) /
-  sigma_oof(C0)`; require `red_sigma ≥ 0.20` **[NEW]** and a finite, strictly positive
-  `sigma_oof(C0)` (otherwise refusal).
+sigma_oof(C0)`; require a finite, strictly positive `sigma_oof(C0)` (otherwise refusal).
+  **H1 (rework-1): `red_sigma ≥ 0.20` is a MANDATORY admission condition for `C1`/`C2`/
+  `C3`, in addition to the axis/sign/significance/leverage gates.** §9.1 re-checks it
+  fail-closed before any `SPATIAL_STABLE`/`CURVATURE` classification.
 - The **full-data** fit (all held-out points) is **reporting only** and can never
-  substitute for the OOF evidence **[NEW]**.
+  substitute for the OOF evidence.
 
-Identifiability / refusal gates (mandatory; evaluated on each fold's training design):
+Identifiability / refusal gates (mandatory):
 
-- full-rank design after centring; no rank deficiency;
-- whitened condition number `cond(A) ≤ 1e4` **[FROZEN-INHERITED (INH), R37 contract §6.1]**;
-- finite coefficient uncertainties; a term counts only if `|coef| ≥ 3 × bootstrap SE`
-  **[NEW]**;
-- leverage reported; predicted term uncertainty at the band edge must not exceed
-  `0.5 σ_ref` **[INH, R37 contract §6.1]** or the term is refused;
-- minimum support `effective_train ≥ 256`, `tangent_blocks ≥ 8`, `normal_blocks ≥ 3`
-  **[INH, R37 contract §6.1]**;
-- **C4 relative rule (L2):** `q_n` is admitted only if it passes the gates above **and**
-  the OOF relative robust-sigma reduction **beyond C3** satisfies
-  `(sigma_oof(C3) - sigma_oof(C4)) / sigma_oof(C3) ≥ 0.20` with a finite strictly
-  positive `sigma_oof(C3)` (zero/nonfinite denominator ⇒ refusal) **[NEW]**; otherwise it
-  is reported `NOT_IDENTIFIABLE`.
+- per fold, on that fold's **training** design: full-rank design after centring; and
+- **whitened condition number** `cond(A) ≤ 1e4`. **R39-A rework-1 (normativity marked
+  honestly):** this is a **NEW / RE-DERIVED** definition for this coordinate system, **not**
+  the raw weighted R37 condition number. It is evaluated on the Huber-weighted design
+  whose **non-constant columns are centred and scaled to unit population standard
+  deviation** (a scale-free whitening), and is computed as `cond(A)` — **never** only
+  `cond(AᵀA)`. Scale-sensitive raw conditioning would make the frozen C4 `n²` column
+  permanently un-identifiable.
+- finite coefficient uncertainties; a term counts only if `|coef| ≥ 3 × bootstrap SE` (SE
+  from the leak-free bootstrap of §5.1);
+- leverage: **each admitted fold** passes rank/condition/finite predictions; **and** the
+  global leak-free bootstrap band-edge prediction uncertainty must not exceed `0.5 σ_ref`;
+  model admission requires **both** (rework-1, exact);
+- minimum support, applied to the **artifact's production-computed relation scalars**
+  (relation pre-gates): `effective_train ≥ 256`, `tangent_blocks ≥ 8`, `normal_blocks ≥ 3`
+  **[INH, R37 contract §6.1]**. These are NOT per-fold counts; the per-fold requirement is
+  the ≥ 3/4 gate-passing-fold condition above.
+- **C4 admission (M3, rework-1):** `q_n` is admitted only if **C3 is admitted/valid**, the
+  C4 base gates pass, the **overall** OOF reduction vs C0 satisfies `red_sigma ≥ 0.20`,
+  **and** the relative robust-sigma reduction **beyond C3** satisfies
+  `(sigma_oof(C3) - sigma_oof(C4)) / sigma_oof(C3) ≥ 0.20` with a finite strictly positive
+  `sigma_oof(C3)` (zero/nonfinite denominator ⇒ refusal); otherwise it is reported
+  `NOT_IDENTIFIABLE` / `NOT_ADMITTED`.
 
 **No threshold may be changed after observing the real outcome.** Any post-hoc change
 requires a new pre-registration and a new (unconsumed) corpus.
@@ -532,9 +560,11 @@ Evaluated in this strict order; the **first** matching state wins:
    reported alongside as the non-promoting diagnostic flag `SPATIAL_STRUCTURE_PARTIAL`
    (diagnostic explanation only; never a correction qualification).
 3. **`CURVATURE`** — C4 admitted per §8 (≥3/4 folds, consistent sign, `|q_n| ≥ 3 ×
-   bootstrap SE`, relative reduction beyond C3 ≥ 0.20) **and** `rms0_resid_model ≤
-   1.25 × σ_ref`.
-4. **`SPATIAL_STABLE`** — C1–C3 admitted per §8 **and** `rms0_resid_model ≤ 1.25 × σ_ref`.
+   bootstrap SE`, overall `red_sigma ≥ 0.20` vs C0 and relative reduction beyond C3
+   ≥ 0.20) **and** `red_sigma ≥ 0.20` re-checked fail-closed **and** `rms0_resid_model
+   ≤ 1.25 × σ_ref`.
+4. **`SPATIAL_STABLE`** — C1–C3 admitted per §8 **and** `red_sigma ≥ 0.20` re-checked
+   fail-closed **and** `rms0_resid_model ≤ 1.25 × σ_ref`.
 5. **`CONSTANT_ONLY`** — no spatial model admitted (`red_sigma < 0.20`), `sig_const`
    true, **and** the residual is noise-consistent after constant removal:
    `RMS0(e_post − c0) ≤ 1.25 × σ_ref` **[INH statistic]**.
@@ -815,3 +845,26 @@ A standalone, offline, **read-only** tool under `tools/` (working name
 One documentation-only pre-registration that is implementable, falsifiable, bounded,
 scientifically conservative, keeps R38 closed, and gives clear A → B0/B1 → C → D stop/go
 gates — with **no real outcome peek**.
+
+---
+
+## 19. R39-A normative-revision history (pointer)
+
+This section is a **revision-history pointer**, not a source of authority. The
+R39-A implementation (ZM-ZEGRID-R39-A-SPATIAL-DIAG, rework-1) made the following
+**normative** corrections **directly in the frozen sections above, BEFORE any real
+R39 metric or outcome was computed** (so the pre-registration integrity is
+preserved; no threshold, model-family, state or conclusion rule was changed):
+
+| Section | Revision (rework-1) |
+|---|---|
+| §3.4 | tangent block runs ALONG the boundary (`row // 4` for `h`, `col // 4` for `v`), matching §3.2 and production `tangent_blocks`; the earlier parenthetical was transposed. `normal` block defined explicitly. |
+| §5.1 | leak-free bootstrap: four separate fold fits per replicate (train blocks only from folds `!= k`, scored blocks only from fold `k`); documented deterministic fold aggregate for coefficient SE. |
+| §8 | folds by the ORDINAL of the sorted unique tangent block (raw `block_id % K` is degenerate under odd/odd hold-out); `≥ 3/4` gate-passing folds with per-fold status and complete OOF coverage; failed folds contribute nothing; `red_sigma ≥ 0.20` mandatory for C1/C2/C3 (H1); exact axis-significance rule (≥ 3 admitted same-sign folds + full coefficient sign match + `|coef| ≥ 3 ×` leak-free bootstrap SE); leverage = per-admitted-fold gates AND global leak-free bootstrap band-edge SE `≤ 0.5 σ_ref`; whitened `cond(A)` re-defined as weighted + column-standardised and honestly marked NEW/RE-DERIVED (not inherited R37 raw weighted cond); support gates sourced from the artifact's production scalars (relation pre-gates, not per-fold); C4 requires C3 admitted/valid + overall reduction ≥ 0.20 + relative beyond C3 ≥ 0.20. |
+| §9.1 | `SPATIAL_STABLE`/`CURVATURE` re-check `red_sigma ≥ 0.20` fail-closed. |
+| §15 | `expect_identity` recorded in the durable identity; `any` is labelled `DEV_GENERIC` and can never set `scientific_acceptance`/`r39b_authorized` true; resumable-checkpoint mechanics (soft `--max-seconds`, atomic checkpoint between fully completed records, stale/malformed/mismatch/symlink/protected-root refusal, no final report while partial). |
+
+Normative mechanics that remain implementation-level (unchanged in intent) live in the
+tool: see the module docstring of `tools/r39a_spatial_residual.py`.
+
+**Revision performed before any real R39 outcome; no real capture was executed.**
