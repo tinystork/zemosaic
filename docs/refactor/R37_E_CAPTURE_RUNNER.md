@@ -160,12 +160,22 @@ the console.
 
 ### 4.4 Post-run verification
 
-**Topology (fail-closed).** Exactly one of these is accepted: (a) a single root
-`zegrid_manifest.json`, or (b) recognized `grid_EQ` + `grid_ALTZ` pass manifests
-with **no** root manifest. Any other `zegrid_manifest.json` anywhere under the
-output dir (any depth, symlink-safe — external symlink trees are never followed)
-is reported as an unknown manifest and fails; root+passes coexistence is
-stale/ambiguous; a missing half of the mount pair fails.
+**Topology (fail-closed, path-level).** Exactly one of these is accepted: (a) a
+single root `zegrid_manifest.json`, or (b) recognized `grid_EQ` + `grid_ALTZ` pass
+manifests with **no** root manifest. A recognized pass directory must be a REAL
+non-symlink directory physically inside the resolved output root; a recognized
+pass path that is a symlink (even to a valid external or in-tree target, or
+dangling) is rejected BEFORE any manifest/artifact read. Every consumed manifest
+and capture artifact (root and pass) must be a regular non-symlink file whose
+resolved path remains under the resolved output root — symlinked files, dangling
+links and resolved escapes are rejected before strict-load/hash. Any other
+`zegrid_manifest.json` under the output dir (any depth) is reported as unknown;
+symlinked trees are never followed. Root+passes coexistence is stale/ambiguous; a
+missing mount peer fails. This is **path-level fail-closed validation, not
+sandboxing**, and makes no TOCTOU guarantee beyond the path checked at that moment.
+A malformed manifest (invalid JSON, non-object root, wrong-typed `frame_ids`) is a
+clean verification FAIL with a basename/category-only reason (no traceback, no
+`VERIFICATION PASS`), and the durable report is still written when safe.
 
 After a successful run the runner strict-loads the artifacts + manifests and
 checks, per pass:
@@ -234,7 +244,11 @@ provenance (digest/algo/count tamper, independently), canonical relative logical
 identity (valid nested same-basename single- and multi-pass; substitution /
 missing / extra / duplicate / malformed-id failures), the aggregate qualification
 (one EXACT pass + one CAPPED pass ⇒ linkable but overall capped/not-exact),
-topology fail-closed (nested unknown, root+passes, missing peer, symlink),
+topology fail-closed (nested unknown, root+passes, missing peer, symlinked
+recognized pass dirs to external/in-tree/dangling targets, symlinked root
+manifest, symlinked pass artifact), clean malformed-manifest failures (invalid
+JSON, non-object root, wrong-typed `frame_ids`; no traceback, no `PASS`, report
+still written),
 a failed verification-report write returning nonzero without a `PASS` claim,
 report sanitization (rejected-WCS detail basename-only; embedded POSIX/Windows/UNC
 text and paths with spaces scrubbed; strict JSON), relative `.git` `gitdir:`

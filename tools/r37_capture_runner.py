@@ -982,21 +982,25 @@ def _discover_unknown_manifests(output_dir: Path) -> list[str]:
         except Exception:
             known.add(output_dir / name)
     unknown: list[str] = []
-    for root, dirs, files in os.walk(output_dir, followlinks=False):
-        rp = Path(root)
-        # never descend through symlinked directories
-        dirs[:] = [d for d in dirs if not (rp / d).is_symlink()]
-        if MANIFEST_NAME in files:
-            try:
-                key = rp.resolve(strict=False)
-            except Exception:
-                key = rp
-            if key not in known:
+    try:
+        walk = os.walk(output_dir, followlinks=False)
+        for root, dirs, files in walk:
+            rp = Path(root)
+            # never descend through symlinked directories
+            dirs[:] = [d for d in dirs if not (rp / d).is_symlink()]
+            if MANIFEST_NAME in files:
                 try:
-                    rel = rp.relative_to(output_dir).as_posix()
+                    key = rp.resolve(strict=False)
                 except Exception:
-                    rel = rp.name
-                unknown.append(rel or ".")
+                    key = rp
+                if key not in known:
+                    try:
+                        rel = rp.relative_to(output_dir).as_posix()
+                    except Exception:
+                        rel = rp.name
+                    unknown.append(rel or ".")
+    except OSError:
+        pass
     return sorted(set(unknown))
 
 
@@ -1007,6 +1011,60 @@ def _iter_run_dirs(output_dir: Path) -> list[Path]:
         if cand.is_dir():
             dirs.append(cand)
     return dirs
+
+
+def _safe_regular_file(path: Path, root_res: Path) -> tuple[bool, str | None]:
+    """Fail-closed path-level check for a file we are about to read.
+
+    A consumed manifest/artifact must be a regular NON-symlink file whose
+    resolved path stays under the resolved output root. This is path-level
+    validation, NOT sandboxing, and makes no TOCTOU guarantee beyond the checked
+    path at this moment: a symlinked file, a dangling link, a non-regular file or
+    a resolved escape is rejected before strict-load/hash.
+    """
+    try:
+        if path.is_symlink():
+            return False, "is a symlink"
+        if not path.is_file():
+            return False, "not a regular file"
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        return False, f"unresolvable ({type(exc).__name__})"
+    try:
+        resolved.relative_to(root_res)
+    except ValueError:
+        return False, "resolves outside the output root"
+    return True, None
+
+
+def _pass_dir_is_symlink(output_dir: Path, name: str) -> bool:
+    """True when a recognized pass path exists as a symlink (incl. dangling)."""
+    try:
+        return (output_dir / name).is_symlink()
+    except OSError:
+        return False
+
+
+def _safe_manifest(path: Path) -> tuple[Mapping | None, str | None]:
+    """Strict-load a manifest, returning ``(manifest, None)`` or ``(None, reason)``.
+
+    Any invalid JSON, non-object root, or wrong-typed ``frame_ids`` (not a list, or
+    with non-string items) is a CLEAN verification failure: the caller records a
+    basename/category-only reason and never raises a traceback.
+    """
+    try:
+        obj = load_json_strict(path)
+    except BaselineError as exc:
+        return None, f"invalid JSON ({type(exc).__name__})"
+    if not isinstance(obj, Mapping):
+        return None, "manifest root is not an object"
+    fids = obj.get("frame_ids")
+    if not isinstance(fids, (list, tuple)):
+        return None, "frame_ids is not a list"
+    for i, f in enumerate(fids):
+        if not isinstance(f, str):
+            return None, f"frame_ids[{i}] is not a string"
+    return obj, None
 
 
 def verify_outputs(
@@ -1041,17 +1099,61 @@ def verify_outputs(
     q_capped = str(bgd.QUALIFICATION_RESEARCH_ONLY_CAPPED)
     digest_algo = str(bgd.SOURCE_SET_DIGEST_ALGO)
 
+    out_res = output_dir.resolve(strict=False)
     failures: list[str] = []
     passes: list[dict] = []
 
-    root_has = (output_dir / MANIFEST_NAME).is_file()
-    eq_has = (output_dir / "grid_EQ" / MANIFEST_NAME).is_file()
-    altz_has = (output_dir / "grid_ALTZ" / MANIFEST_NAME).is_file()
+    root_manifest_path = output_dir / MANIFEST_NAME
+    root_symlink = root_manifest_path.is_symlink()
+    if root_symlink:
+        failures.append("root manifest is a symlink (rejected)")
+    root_ok, root_reason = (True, None) if root_symlink else _safe_regular_file(
+        root_manifest_path, out_res)
+    root_has = root_symlink is False and root_ok and root_manifest_path.is_file()
+    if not root_symlink and root_manifest_path.exists() and not root_ok:
+        failures.append(f"root manifest rejected ({root_reason})")
+
+    pass_state: dict[str, str] = {}
+    present: dict[str, bool] = {}
+    for name in MOUNT_PASS_DIRS:
+        p = output_dir / name
+        if _pass_dir_is_symlink(output_dir, name):
+            # A recognized pass PATH that is a symlink is rejected BEFORE any
+            # manifest/artifact read — even when dangling or without a manifest.
+            failures.append(f"recognized pass dir {name} is a symlink (rejected)")
+            pass_state[name] = "symlink"
+            present[name] = False
+            continue
+        if p.exists() and not p.is_dir():
+            failures.append(f"recognized pass path {name} is not a directory (rejected)")
+            pass_state[name] = "notdir"
+            present[name] = False
+            continue
+        if p.is_dir():
+            pass_state[name] = "dir"
+            mf = p / MANIFEST_NAME
+            ok, reason = _safe_regular_file(mf, out_res) if mf.exists() or mf.is_symlink() \
+                else (False, None)
+            if ok:
+                present[name] = True
+            else:
+                present[name] = False
+                if mf.is_symlink() or (mf.exists() and reason):
+                    failures.append(f"{name} manifest rejected ({reason})")
+        else:
+            pass_state[name] = "absent"
+            present[name] = False
+
+    eq_has = present.get("grid_EQ", False)
+    altz_has = present.get("grid_ALTZ", False)
 
     for unknown in _discover_unknown_manifests(output_dir):
         failures.append(f"unknown manifest under output dir: {unknown}")
 
     topology_ok = True
+    symlink_fail = any(s == "symlink" for s in pass_state.values())
+    if symlink_fail or root_symlink:
+        topology_ok = False
     if root_has and (eq_has or altz_has):
         failures.append(
             "ambiguous topology: a root manifest coexists with mount-pass "
@@ -1084,16 +1186,44 @@ def verify_outputs(
     pass_sets: list[set] = []
     for run_dir in pass_dirs:
         manifest_path = run_dir / MANIFEST_NAME
-        manifest = load_json_strict(manifest_path)
-        frame_ids_raw = [str(f) for f in (manifest.get("frame_ids") or [])]
         artifact_path = run_dir / bgd.CAPTURE_ARTIFACT_BASENAME
         entry: dict = {
             "pass_dir": run_dir.name,
             "artifact_basename": artifact_path.name,
-            "artifact_exists": artifact_path.is_file(),
-            "manifest_n_frames": manifest.get("n_frames"),
+            "artifact_exists": False,
         }
         checks: dict[str, bool] = {}
+
+        # The manifest we are about to read must itself be a regular non-symlink
+        # file under the output root.
+        m_ok, m_reason = _safe_regular_file(manifest_path, out_res)
+        if not m_ok:
+            failures.append(f"{run_dir.name}: manifest rejected ({m_reason})")
+            checks["manifest_safe"] = False
+            entry["checks"] = checks
+            entry["pass_ok"] = False
+            passes.append(entry)
+            pass_sets.append(set())
+            continue
+        checks["manifest_safe"] = True
+
+        manifest, m_err = _safe_manifest(manifest_path)
+        if manifest is None:
+            failures.append(f"{run_dir.name}: manifest rejected ({m_err})")
+            checks["manifest_valid"] = False
+            entry["checks"] = checks
+            entry["pass_ok"] = False
+            passes.append(entry)
+            pass_sets.append(set())
+            continue
+        checks["manifest_valid"] = True
+        entry["manifest_n_frames"] = manifest.get("n_frames")
+        frame_ids_raw = [str(f) for f in (manifest.get("frame_ids") or [])]
+        layout = manifest.get("layout") if isinstance(manifest.get("layout"), Mapping) else {}
+        gauge = (manifest.get("photometric_gauge")
+                 if isinstance(manifest.get("photometric_gauge"), Mapping) else {})
+        cf = (manifest.get("cell_feather")
+              if isinstance(manifest.get("cell_feather"), Mapping) else {})
 
         # canonical logical ids (fail closed on any malformed id)
         pass_ids: list[str] = []
@@ -1121,9 +1251,8 @@ def verify_outputs(
         if not checks["pass_n_frames_consistent"]:
             failures.append(f"{run_dir.name}: manifest n_frames != unique logical frame_ids")
 
-        try:
-            cap = manifest["cell_feather"]["r37_diagnostic_capture"]
-        except Exception:
+        cap = cf.get("r37_diagnostic_capture") if isinstance(cf, Mapping) else None
+        if not isinstance(cap, Mapping):
             cap = None
         if cap is None:
             failures.append(f"{run_dir.name}: manifest has no r37_diagnostic_capture block")
@@ -1131,14 +1260,33 @@ def verify_outputs(
         else:
             checks["manifest_capture_block"] = True
 
-        if not artifact_path.is_file():
+        # The artifact must be a regular non-symlink file under the output root.
+        if artifact_path.is_symlink():
+            failures.append(f"{run_dir.name}: capture artifact is a symlink (rejected)")
+            checks["artifact_safe"] = False
+            checks["artifact_exists"] = False
+            entry["checks"] = checks
+            entry["pass_ok"] = False
+            passes.append(entry)
+            continue
+        if not artifact_path.exists():
             failures.append(f"{run_dir.name}: capture artifact missing ({artifact_path.name})")
             checks["artifact_exists"] = False
             entry["checks"] = checks
             entry["pass_ok"] = False
             passes.append(entry)
             continue
+        a_ok, a_reason = _safe_regular_file(artifact_path, out_res)
+        if not a_ok:
+            failures.append(f"{run_dir.name}: capture artifact rejected ({a_reason})")
+            checks["artifact_safe"] = False
+            entry["checks"] = checks
+            entry["pass_ok"] = False
+            passes.append(entry)
+            continue
+        checks["artifact_safe"] = True
         checks["artifact_exists"] = True
+        entry["artifact_exists"] = True
 
         try:
             artifact = bgd.load_file(artifact_path)
@@ -1217,11 +1365,11 @@ def verify_outputs(
             int(artifact.meta["nx"]) == baseline.nx and int(artifact.meta["ny"]) == baseline.ny
         )
         checks["manifest_layout_matches_baseline"] = (
-            int(manifest.get("layout", {}).get("nx", -1)) == baseline.nx
-            and int(manifest.get("layout", {}).get("ny", -1)) == baseline.ny
+            int(layout.get("nx", -1)) == baseline.nx
+            and int(layout.get("ny", -1)) == baseline.ny
         )
         checks["manifest_gauge_per_cell"] = (
-            manifest.get("photometric_gauge", {}).get("mode") == CELL_GAUGE_MODE_PER_CELL
+            gauge.get("mode") == CELL_GAUGE_MODE_PER_CELL
         )
         # source-set provenance (independent recomputation)
         checks["artifact_source_set_digest_matches"] = (
@@ -1661,7 +1809,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _EXIT_ERROR
 
     print("[r37-runner] run finished — verifying artifact↔manifest linkage…", flush=True)
-    verification = verify_outputs(out_dir, baseline=baseline, selection=selection)
+    try:
+        verification = verify_outputs(out_dir, baseline=baseline, selection=selection)
+    except Exception as exc:  # noqa: BLE001 - structured failure, no traceback
+        print(
+            f"[r37-runner] verification error ({type(exc).__name__}); recording a "
+            "structured FAIL.",
+            file=sys.stderr, flush=True,
+        )
+        verification = {
+            "verdict": "FAIL", "passes": [], "multi_pass": False,
+            "failures": [f"verification error ({type(exc).__name__})"],
+            "aggregate_heldout_exact": False, "aggregate_heldout_capped": True,
+            "aggregate_qualification": "RESEARCH_ONLY_HELDOUT_CAPPED",
+            "selection_accounting": {},
+        }
     report = build_verification_report(
         invocation=invocation, baseline=baseline, selection=selection,
         verification=verification, preflight_report=preflight_report,

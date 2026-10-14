@@ -1258,3 +1258,162 @@ def test_topology_symlinked_manifest_dir_not_followed(tmp_path, tiny_baseline):
     # the symlinked external tree must not be traversed or flagged
     assert not any("linked" in f for f in ver["failures"])
     assert ver["verdict"] == "PASS", ver["failures"]
+
+
+# ---------------------------------------------------------------------------
+# 11. Rework-3 regressions (final)
+# ---------------------------------------------------------------------------
+
+def _try_symlink(target, link, *, target_is_directory=False):
+    import os as _os
+    try:
+        _os.symlink(target, link, target_is_directory=target_is_directory)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("symlinks not supported on this platform")
+
+
+def _external_pair(tmp_path, tiny_baseline, eq_ids, altz_ids):
+    src_art = tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME
+    src_man = tiny_baseline["base"] / runner.MANIFEST_NAME
+    ext = tmp_path / "external"
+    _fabricate_pass(ext / "grid_EQ", src_art, eq_ids, src_man)
+    _fabricate_pass(ext / "grid_ALTZ", src_art, altz_ids, src_man)
+    return ext
+
+
+def test_symlink_paired_external_passes_rejected(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"],
+                                   ["f0.fit", "f1.fit", "f2.fit", "f3.fit"])
+    ext = _external_pair(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"],
+                         ["f2.fit", "f3.fit"])
+    out = tmp_path / "out"
+    out.mkdir()
+    _try_symlink(ext / "grid_EQ", out / "grid_EQ", target_is_directory=True)
+    _try_symlink(ext / "grid_ALTZ", out / "grid_ALTZ", target_is_directory=True)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("symlink" in f for f in ver["failures"])
+    # external content must NOT be accepted as a valid pass
+    assert ver["passes"] == []
+
+
+def test_symlink_one_recognized_pass_rejected(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"],
+                                   ["f0.fit", "f1.fit", "f2.fit", "f3.fit"])
+    ext = _external_pair(tmp_path, tiny_baseline, ["f0.fit", "f1.fit"],
+                         ["f2.fit", "f3.fit"])
+    out = tmp_path / "out"
+    _fabricate_pass(out / "grid_ALTZ",
+                    tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f2.fit", "f3.fit"], tiny_baseline["base"] / runner.MANIFEST_NAME)
+    _try_symlink(ext / "grid_EQ", out / "grid_EQ", target_is_directory=True)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("symlink" in f for f in ver["failures"])
+
+
+def test_symlink_in_tree_pass_rejected(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"],
+                                   ["f0.fit", "f1.fit", "f2.fit", "f3.fit"])
+    out = tmp_path / "out"
+    _fabricate_pass(out / "real_eq",
+                    tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f0.fit", "f1.fit"], tiny_baseline["base"] / runner.MANIFEST_NAME)
+    _fabricate_pass(out / "grid_ALTZ",
+                    tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f2.fit", "f3.fit"], tiny_baseline["base"] / runner.MANIFEST_NAME)
+    _try_symlink(out / "real_eq", out / "grid_EQ", target_is_directory=True)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("symlink" in f for f in ver["failures"])
+
+
+def test_symlink_root_manifest_rejected(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    ext = tmp_path / "external"
+    _fabricate_pass(ext, tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    info.frame_ids, tiny_baseline["base"] / runner.MANIFEST_NAME)
+    out = tmp_path / "out"
+    out.mkdir()
+    _try_symlink(ext / runner.MANIFEST_NAME, out / runner.MANIFEST_NAME)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("root manifest is a symlink" in f for f in ver["failures"])
+
+
+def test_symlink_pass_artifact_rejected(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], ["f0.fit", "f1.fit"])
+    out = tmp_path / "out"
+    _fabricate_pass(out, tiny_baseline["base"] / runner.CAPTURE_ARTIFACT_BASENAME,
+                    ["f0.fit", "f1.fit"], tiny_baseline["base"] / runner.MANIFEST_NAME)
+    ext_art = tmp_path / "ext_art.json"
+    ext_art.write_bytes((out / runner.CAPTURE_ARTIFACT_BASENAME).read_bytes())
+    (out / runner.CAPTURE_ARTIFACT_BASENAME).unlink()
+    _try_symlink(ext_art, out / runner.CAPTURE_ARTIFACT_BASENAME)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("artifact is a symlink" in f for f in ver["failures"])
+
+
+def test_symlink_dangling_recognized_pass_rejected(tmp_path, tiny_baseline):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], info.frame_ids)
+    out = tmp_path / "out"
+    out.mkdir()
+    _try_symlink(out / "does_not_exist", out / "grid_EQ", target_is_directory=True)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)
+    assert ver["verdict"] == "FAIL"
+    assert any("symlink" in f for f in ver["failures"])
+
+
+# --- malformed manifest handling (LOW) -----------------------------------
+
+@pytest.mark.parametrize("text,match", [
+    ("{not json", "invalid JSON"),
+    ("[1, 2, 3]", "not an object"),
+    ('"just a string"', "not an object"),
+    ('{"frame_ids": "not-a-list"}', "frame_ids is not a list"),
+    ('{"frame_ids": {"a": 1}}', "frame_ids is not a list"),
+    ('{"frame_ids": [1, 2]}', "frame_ids[0] is not a string"),
+    ('{"frame_ids": [NaN]}', "invalid JSON"),
+])
+def test_malformed_manifest_is_clean_fail(tmp_path, tiny_baseline, text, match):
+    info = runner.load_baseline(tiny_baseline["base"])
+    sel = runner.resolve_selection(tiny_baseline["inp"], ["f0.fit"])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / runner.MANIFEST_NAME).write_text(text)
+    ver = runner.verify_outputs(out, baseline=info, selection=sel)  # must not raise
+    assert ver["verdict"] == "FAIL"
+    assert any(match in f for f in ver["failures"]), (match, ver["failures"])
+
+
+def test_cli_malformed_manifest_nonzero_no_pass(tmp_path, monkeypatch, capsys):
+    ids = ["a.fit", "b.fit"]
+    base = _write_baseline(tmp_path / "base", ids)
+    inp = _write_input(tmp_path / "in", ids)
+    out = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "preflight",
+                        lambda *a, **k: runner.PreflightResult("PASS", {"verdict": "PASS"}))
+
+    def _engine(input_folder, output_folder, *, progress_callback=None, **kw):
+        p = pathlib.Path(output_folder)
+        p.mkdir(parents=True, exist_ok=True)
+        (p / runner.MANIFEST_NAME).write_text("{not json")
+
+    monkeypatch.setattr(runner, "_call_run_zegrid_mode", _engine)
+    rc = runner.main(_main_args(tmp_path, base, inp, out) + ["--execute"])
+    captured = capsys.readouterr()
+    assert rc == runner._EXIT_ERROR
+    assert "VERIFICATION PASS" not in (captured.out + captured.err)
+    report_path = out / runner.REPORT_NAME
+    assert report_path.is_file()  # durable structured failure still written
+    report = json.loads(report_path.read_text())
+    assert report["verification_verdict"] == "FAIL"
+    assert report["exact_heldout"] is False
