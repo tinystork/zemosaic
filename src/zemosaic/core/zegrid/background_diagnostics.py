@@ -1,4 +1,5 @@
-"""ZM-ZEGRID-R37-C — OFFLINE pre-feather Cell-pair diagnostic artifact (PURE, UNWIRED).
+"""ZM-ZEGRID-R37-C/D — pre-feather Cell-pair diagnostic artifact (PURE math/artifact code;
+OPT-IN production capture seam).
 
 Mission objective
 -----------------
@@ -9,11 +10,17 @@ assembly time. This module is the smallest PURE, deterministic, OFFLINE layer
 that captures that evidence from in-memory pre-feather ``PlanCell`` / ``CellPatch``
 objects and round-trips it back into the accepted M0/M1 machinery.
 
-Discipline (frozen by the delegated mission ZM-ZEGRID-R37-C-DIAGNOSTIC)
-----------------------------------------------------------------------
-* **No production wiring.** Never imported by ``zemosaic_zegrid_mode``,
-  ``cell_feather``, config, GUI, dispatcher or manifests. Research/diagnostic
-  artifact only. No default change, no corrected mosaic, no correction applied.
+Discipline
+----------
+* **Pure math/artifact code, lazily imported by the explicit OPT-IN capture seam.**
+  This module is NOT imported at production module-import time and is NEVER touched
+  by the default (capture-disabled) run path. Since ZM-ZEGRID-R37-D it IS imported
+  *lazily inside the explicit, default-OFF* ``run_zegrid_mode(
+  r37_diagnostic_capture=True)`` capture branch, which publishes the artifact into
+  that run's actual output directory. The functions here remain pure/offline for
+  standalone use; the capture seam REPLACES the pure default provenance with
+  truthful production-capture values (see :func:`capture_provenance`). No default
+  change, no corrected mosaic, no correction applied anywhere.
 * **Same scientific math.** Pair differences and the coordinate convention are
   produced by the UNCHANGED ``background_model.observe_edge`` via
   ``build_observations``; no duplicate pixel/difference math lives here.
@@ -76,12 +83,19 @@ __all__ = [
     "QUALIFICATION_RESEARCH_ONLY_CAPPED",
     "CAPTURE_ARTIFACT_BASENAME",
     "CAPTURE_STAGE",
+    "CAPTURE_MISSION",
+    "CAPTURE_PROVENANCE_STATUS",
+    "SOURCE_SET_DIGEST_ALGO",
     "DIAGNOSTIC_PROVENANCE",
     "DiagnosticSchemaError",
     "DiagnosticArtifact",
     "select_capped_holdout",
     "serialise_observation",
     "build_payload",
+    "source_set_digest",
+    "capture_run_id",
+    "capture_provenance",
+    "manifest_links_artifact",
     "load_artifact",
     "dumps",
     "loads",
@@ -131,13 +145,20 @@ QUALIFICATION_EXACT = "EXACT"
 QUALIFICATION_RESEARCH_ONLY_CAPPED = "RESEARCH_ONLY_HELDOUT_CAPPED"
 
 #: ZM-ZEGRID-R37-D: the FIXED basename of the published capture artifact inside a
-#: run's actual output directory. It is never caller-controlled, so no path
-#: traversal is possible (only the directory is chosen by the caller).
+#: run's actual output directory. It is never caller-controlled (``publish_artifact``
+#: exposes NO basename override), so no path traversal is possible.
 CAPTURE_ARTIFACT_BASENAME = "zegrid_r37_pre_feather.json"
 #: The exact provenance stage the captured evidence corresponds to: the payload is
 #: built AFTER the complete per-Cell patches coexist but BEFORE the inter-cell
 #: offset graph, additive offsets and feather assembly run.
 CAPTURE_STAGE = "pre_offset_pre_feather"
+#: ZM-ZEGRID-R37-D production-capture provenance facts.
+CAPTURE_MISSION = "ZM-ZEGRID-R37-D"
+CAPTURE_PROVENANCE_STATUS = "production_capture_uncommitted_until_manifest"
+#: Declared algorithm for the deterministic source-frame-set digest.
+SOURCE_SET_DIGEST_ALGO = "sha256_sorted_unique_relative_logical_paths_v1"
+#: Keys that must MATCH for a manifest to "commit" an artifact (M2 cross-link).
+CAPTURE_LINKAGE_KEYS = ("capture_id", "filename", "sha256", "bytes")
 #: Declared average byte width of one serialised JSON number, used ONLY by the
 #: analytic size estimate (a documented model, not a measurement).
 _JSON_SCALAR_WIDTH = 20
@@ -177,6 +198,110 @@ DIAGNOSTIC_PROVENANCE = {
         "partially blocked (connection refused / HTTP 429) at run time."
     ),
 }
+
+# NOTE (ZM-ZEGRID-R37-D): the dict above is the **pure/standalone default** shipped
+# by ``build_payload`` when it is used on its own (it truthfully describes an
+# offline prototype artifact). The explicit production capture seam does NOT ship
+# it: it replaces the top-level provenance with :func:`capture_provenance`
+# (``production_wired=True``, mission R37-D, capture stage), so a published
+# production artifact is never internally contradictory about wiring.
+
+
+def source_set_digest(identifiers) -> str:
+    """Deterministic, order-invariant digest of a source FRAME SET.
+
+    WHAT IS HASHED: the :data:`SOURCE_SET_DIGEST_ALGO` tag followed by the
+    SORTED, DE-DUPLICATED set of canonical *relative logical* identifiers (frame
+    ``logical_path`` strings — never absolute private paths), each NUL-free and
+    newline-terminated. Because the set is sorted and de-duplicated, the digest is
+    stable across path object types (``str()``) and across input ORDER, and it
+    changes iff the underlying set of identifiers changes.
+    """
+    uniq = sorted({str(x) for x in identifiers if str(x)})
+    h = hashlib.sha256()
+    h.update((SOURCE_SET_DIGEST_ALGO + "\n").encode("utf-8"))
+    for item in uniq:
+        h.update(item.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def capture_run_id(*, start_ts, pass_label, n_frames, source_set_digest_value: str) -> str:
+    """Stable opaque capture identity (deterministic hash, NO hidden RNG).
+
+    A sha256 over a version tag, the run start timestamp, the pass label
+    (``single`` / ``EQ`` / ``ALTZ``), the source frame count and the frame-set
+    digest. Same inputs -> same id; distinct passes -> distinct ids. Returned as a
+    plain hex string (strict-JSON friendly).
+    """
+    h = hashlib.sha256()
+    for part in (
+        "zemosaic.zegrid.r37d.capture.v1",
+        str(start_ts),
+        str(pass_label),
+        str(int(n_frames)),
+        str(source_set_digest_value),
+    ):
+        h.update(part.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def capture_provenance(*, capture_id, run_label, n_source_frames, source_set_digest_value,
+                       source_set_digest_algo=SOURCE_SET_DIGEST_ALGO,
+                       halo_px, measurement_px, feather_px,
+                       effective_cell_gauge_mode="per_cell") -> dict:
+    """Truthful, SINGLE-VALUED provenance for a PUBLISHED production capture.
+
+    Reuses the reference/coordinate context of the pure default but overrides the
+    wiring facts so the artifact never simultaneously claims ``production_wired``
+    both false and true. The nested ``capture`` block agrees with the top level
+    (it carries the run identity + measured widths, not a second wiring claim).
+    """
+    prov = dict(DIAGNOSTIC_PROVENANCE)
+    prov.update({
+        "mission": CAPTURE_MISSION,
+        "status": CAPTURE_PROVENANCE_STATUS,
+        "artifact_kind": "production_capture",
+        "production_wired": True,
+        "capture_stage": CAPTURE_STAGE,
+        "correction_applied": False,
+        "committed_requirement": (
+            "UNCOMMITTED unless a completed zegrid_manifest.json cross-links the SAME "
+            "capture_id + filename + sha256 + bytes; a missing or mismatching manifest "
+            "is non-qualifying ({})".format(", ".join(CAPTURE_LINKAGE_KEYS))
+        ),
+        "capture": {
+            "capture_stage": CAPTURE_STAGE,
+            "capture_id": str(capture_id),
+            "run_label": str(run_label),
+            "n_source_frames": int(n_source_frames),
+            "source_set_digest": str(source_set_digest_value),
+            "source_set_digest_algo": str(source_set_digest_algo),
+            "effective_cell_gauge_mode": str(effective_cell_gauge_mode),
+            "halo_px": int(halo_px),
+            "measurement_px": int(measurement_px),
+            "feather_px": int(feather_px),
+        },
+    })
+    return prov
+
+
+def manifest_links_artifact(capture_meta, manifest_capture_meta) -> bool:
+    """True iff a COMPLETED manifest commits this artifact (M2 cross-link rule).
+
+    An artifact is *uncommitted* unless a manifest's capture metadata matches it on
+    every :data:`CAPTURE_LINKAGE_KEYS` field (``capture_id``, ``filename``,
+    ``sha256``, ``bytes``). A missing manifest block -> False (non-qualifying).
+    """
+    if not isinstance(manifest_capture_meta, Mapping):
+        return False
+    if not isinstance(capture_meta, Mapping):
+        return False
+    for key in CAPTURE_LINKAGE_KEYS:
+        if capture_meta.get(key) != manifest_capture_meta.get(key):
+            return False
+    return True
 
 
 class DiagnosticSchemaError(ValueError):
@@ -950,32 +1075,47 @@ def load_file(path) -> DiagnosticArtifact:
         return loads(fh.read())
 
 
-def publish_artifact(output_dir, payload, *, basename: str = CAPTURE_ARTIFACT_BASENAME) -> dict:
+def publish_artifact(output_dir, payload) -> dict:
     """Validate + atomically publish a capture artifact into ``output_dir``.
 
-    ZM-ZEGRID-R37-D: the ONLY supported way to persist a capture artifact. It
+    ZM-ZEGRID-R37-D: the ONLY supported way to persist a capture artifact. The
+    basename is FIXED (:data:`CAPTURE_ARTIFACT_BASENAME`) and there is NO caller
+    override, so there is no path-traversal surface (only the directory is chosen
+    by the caller). It
 
+    0. FAIL-CLOSED INVALIDATION: removes any pre-existing fixed target BEFORE
+       validating/writing, so a stale artifact from a previous run can never be
+       left looking like the current requested capture;
     1. runs the STRICT loader (``load_artifact``) on the in-memory payload BEFORE
-       anything touches the filesystem, so a malformed payload is never published;
+       writing, so a malformed payload is never published;
     2. writes the canonical strict JSON to a SAME-DIRECTORY temp file, flushes and
-       fsyncs it, then atomically renames it onto the fixed ``basename`` (the temp
-       is always removed on failure, no partial file and no residue);
+       fsyncs it, then atomically renames it onto the fixed target (the temp is
+       always removed on failure);
     3. re-reads the published bytes and computes their SHA-256 AFTER publication.
 
-    ``output_dir`` only selects the directory; ``basename`` is FIXED and never
-    caller-controlled, so there is no path-traversal surface. Returns the compact
-    capture metadata recorded in the manifest / run log.
+    On ANY failure the fixed target is ABSENT and no temp residue remains.
     """
     out = Path(output_dir).expanduser()
-    name = str(basename)
-    if not name or "/" in name or "\\" in name or name in (".", ".."):
-        raise ValueError(f"capture artifact basename must be a plain filename, got {basename!r}")
-    # 1. STRICT validation BEFORE publication (fail closed; nothing written).
-    artifact = load_artifact(payload)
-    text = dumps(payload)
-    data = text.encode("utf-8")
+    name = CAPTURE_ARTIFACT_BASENAME
     out.mkdir(parents=True, exist_ok=True)
     target = out / name
+
+    # 0. Fail-closed invalidation of any pre-existing target FIRST.
+    try:
+        if target.exists():
+            os.unlink(target)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(
+            f"capture artifact: cannot invalidate existing target {target}: {exc}"
+        ) from exc
+    _fsync_dir_best_effort(out)
+
+    # 1. STRICT validation AFTER invalidation (a malformed payload leaves no target).
+    artifact = load_artifact(payload)
+    data = dumps(payload).encode("utf-8")
+
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=str(out))
@@ -992,16 +1132,7 @@ def publish_artifact(output_dir, payload, *, basename: str = CAPTURE_ARTIFACT_BA
             raise
         os.replace(tmp_path, target)
         tmp_path = None
-        # Best-effort directory fsync so the rename is durable on POSIX hosts.
-        try:
-            dfd = os.open(str(out), os.O_RDONLY)
-        except OSError:
-            dfd = None
-        if dfd is not None:
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+        _fsync_dir_best_effort(out)
     finally:
         if tmp_path is not None:
             try:
@@ -1033,6 +1164,20 @@ def publish_artifact(output_dir, payload, *, basename: str = CAPTURE_ARTIFACT_BA
             QUALIFICATION_RESEARCH_ONLY_CAPPED if artifact.heldout_capped else QUALIFICATION_EXACT
         ),
     }
+
+
+def _fsync_dir_best_effort(path) -> None:
+    """Best-effort directory fsync (durability of create/unlink/rename)."""
+    try:
+        dfd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
 
 
 # ---------------------------------------------------------------------------

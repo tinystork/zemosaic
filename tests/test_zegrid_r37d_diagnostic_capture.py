@@ -258,9 +258,43 @@ def test_publish_artifact_write_failure_is_loud_and_no_partial(tmp_path, monkeyp
     assert list(tmp_path.glob("*.tmp")) == [] and list(tmp_path.glob(".*tmp")) == []
 
 
-def test_publish_artifact_rejects_path_traversal_basename(tmp_path):
-    with pytest.raises(ValueError):
-        bgd.publish_artifact(tmp_path, _valid_payload(), basename="../evil.json")
+def test_publish_artifact_has_no_basename_override(tmp_path):
+    # L2: the fixed production filename is not caller-controllable.
+    import inspect
+    params = inspect.signature(bgd.publish_artifact).parameters
+    assert "basename" not in params
+    assert list(params) == ["output_dir", "payload"]
+    bgd.publish_artifact(tmp_path, _valid_payload())
+    assert (tmp_path / bgd.CAPTURE_ARTIFACT_BASENAME).is_file()
+
+
+def test_publish_invalidates_existing_target_on_validation_failure(tmp_path):
+    # M2.3: a pre-existing valid target must NOT survive a failed (re)publication.
+    bgd.publish_artifact(tmp_path, _valid_payload())
+    target = tmp_path / bgd.CAPTURE_ARTIFACT_BASENAME
+    assert target.is_file()
+    bad = _valid_payload()
+    bad["relations"][0]["information"] = None
+    with pytest.raises(bgd.DiagnosticSchemaError):
+        bgd.publish_artifact(tmp_path, bad)
+    assert not target.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_publish_invalidates_existing_target_on_replace_failure(tmp_path, monkeypatch):
+    # M2.3: os.replace failure must leave NO fixed target (old invalidated).
+    bgd.publish_artifact(tmp_path, _valid_payload())
+    target = tmp_path / bgd.CAPTURE_ARTIFACT_BASENAME
+    assert target.is_file()
+
+    def _boom(*a, **k):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(bgd.os, "replace", _boom)
+    with pytest.raises(OSError):
+        bgd.publish_artifact(tmp_path, _valid_payload())
+    assert not target.exists()
+    assert list(tmp_path.glob("*.tmp")) == [] and list(tmp_path.glob(".*tmp")) == []
 
 
 # ---------------------------------------------------------------------------
@@ -281,11 +315,14 @@ def test_pure_assemble_capture_on_off_arrays_equal(tmp_path):
     # info equal once the capture metadata is set aside
     assert info_on.pop("r37_diagnostic_capture")
     assert info_on == info_off
-    cap = json.loads((tmp_path / zz.R37_CAPTURE_FILENAME).read_text())["provenance"]["capture"]
-    assert cap["capture_stage"] == "pre_offset_pre_feather"
-    assert cap["effective_cell_gauge_mode"] == "per_cell"
-    assert cap["correction_applied"] is False
-    assert cap["halo_px"] == HALO and cap["measurement_px"] == 2 * HALO
+    prov = json.loads((tmp_path / zz.R37_CAPTURE_FILENAME).read_text())["provenance"]
+    assert prov["capture_stage"] == "pre_offset_pre_feather"
+    assert prov["correction_applied"] is False
+    assert prov["capture"]["capture_stage"] == "pre_offset_pre_feather"
+    assert prov["capture"]["effective_cell_gauge_mode"] == "per_cell"
+    assert prov["capture"]["halo_px"] == HALO
+    assert prov["capture"]["measurement_px"] == 2 * HALO
+    assert prov["capture"]["feather_px"] == HALO
 
 
 def test_pure_assemble_capture_disabled_writes_nothing(tmp_path):
@@ -309,6 +346,87 @@ def test_pure_assemble_payload_relations_match_fresh_build(tmp_path):
     assert {o.key() for o in art.observations} == {o.key() for o in fresh.observations}
     assert len(art.dropped) == len(fresh.dropped)
     assert tuple(art.cell_ids()) == tuple(fresh.cell_ids())
+
+
+# ---------------------------------------------------------------------------
+# 3b. M1 — published provenance is truthful + single-valued (read alone)
+# ---------------------------------------------------------------------------
+
+def test_published_provenance_truthful_and_single_valued(tmp_path):
+    canvas, patches = _make_patches(2, 2, _levels_2x2())
+    results = _results_from_patches(patches)
+    zz._assemble_per_cell_feathered(canvas, 2, 2, results, capture=True, output_dir=tmp_path)
+    prov = bgd.load_file(tmp_path / zz.R37_CAPTURE_FILENAME).provenance
+    # single-valued wiring facts
+    assert prov["production_wired"] is True
+    assert prov["mission"] == bgd.CAPTURE_MISSION == "ZM-ZEGRID-R37-D"
+    assert prov["status"] == bgd.CAPTURE_PROVENANCE_STATUS
+    assert prov["capture_stage"] == "pre_offset_pre_feather"
+    assert prov["correction_applied"] is False
+    assert prov["artifact_kind"] == "production_capture"
+    # NO contradictory duplicate inside the nested block
+    assert "production_wired" not in prov["capture"]
+    assert "correction_applied" not in prov["capture"]
+    assert prov["capture"]["capture_stage"] == prov["capture_stage"]
+    # the pure default still says research-only for standalone build_payload use
+    standalone = bgd.build_payload(patches, 2, 2, (canvas.height, canvas.width),
+                                   measurement_px=2 * HALO, holdout_cap=16)
+    assert standalone["provenance"]["production_wired"] is False
+    assert standalone["provenance"]["mission"] == "ZM-ZEGRID-R37-C"
+
+
+# ---------------------------------------------------------------------------
+# 3c. M2/L1 identity, digest, linkage, widths
+# ---------------------------------------------------------------------------
+
+def test_source_set_digest_stable_and_sensitive():
+    a = ["a.fit", "b.fit", "c.fit"]
+    assert bgd.source_set_digest(a) == bgd.source_set_digest(list(reversed(a)))
+    assert bgd.source_set_digest(a) == bgd.source_set_digest(a + ["a.fit"])  # dedup
+    # path-object types do not matter
+    assert bgd.source_set_digest(["a.fit", "b.fit"]) == bgd.source_set_digest(
+        [pathlib.Path("a.fit"), pathlib.Path("b.fit")]
+    )
+    assert bgd.source_set_digest(a) != bgd.source_set_digest(["a.fit", "b.fit", "d.fit"])
+    assert bgd.source_set_digest(a) != bgd.source_set_digest(["a.fit", "b.fit"])
+
+
+def test_capture_run_id_distinct_per_pass():
+    d = bgd.source_set_digest(["a.fit"])
+    base = bgd.capture_run_id(start_ts="t", pass_label="single", n_frames=1,
+                              source_set_digest_value=d)
+    assert base == bgd.capture_run_id(start_ts="t", pass_label="single", n_frames=1,
+                                      source_set_digest_value=d)
+    assert base != bgd.capture_run_id(start_ts="t", pass_label="EQ", n_frames=1,
+                                      source_set_digest_value=d)
+    assert base != bgd.capture_run_id(start_ts="t2", pass_label="single", n_frames=1,
+                                      source_set_digest_value=d)
+    assert base != bgd.capture_run_id(start_ts="t", pass_label="single", n_frames=2,
+                                      source_set_digest_value=d)
+
+
+def test_manifest_links_artifact_rule():
+    art = {"capture_id": "id1", "filename": "f.json", "sha256": "aa", "bytes": 10}
+    assert bgd.manifest_links_artifact(art, dict(art)) is True
+    assert bgd.manifest_links_artifact(art, None) is False
+    assert bgd.manifest_links_artifact(art, {"capture_id": "id1"}) is False
+    assert bgd.manifest_links_artifact(art, {**art, "sha256": "bb"}) is False
+    assert bgd.manifest_links_artifact(art, {**art, "capture_id": "id2"}) is False
+    assert bgd.manifest_links_artifact(art, {**art, "bytes": 11}) is False
+
+
+def test_nondefault_halo_widths_consistent(tmp_path):
+    # L1: halo 4 -> measurement 8, feather 4, in both provenance capture and meta.
+    canvas, patches = _make_patches(2, 2, _levels_2x2(), halo=4)
+    results = _results_from_patches(patches)
+    zz._assemble_per_cell_feathered(
+        canvas, 2, 2, results, halo_px=4, capture=True, output_dir=tmp_path,
+    )
+    art = bgd.load_file(tmp_path / zz.R37_CAPTURE_FILENAME)
+    cap = art.provenance["capture"]
+    assert cap["halo_px"] == 4 and cap["measurement_px"] == 8 and cap["feather_px"] == 4
+    assert art.meta["measurement_px"] == 8
+    assert art.meta["feather_px"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +467,17 @@ def test_e2e_per_cell_capture_publishes_validated_artifact(tmp_path):
     target = out / zz.R37_CAPTURE_FILENAME
     assert target.is_file()
     art = bgd.load_file(target)
-    assert art.provenance["capture_stage"] == "pre_offset_pre_feather"
-    assert art.provenance["capture"]["effective_cell_gauge_mode"] == "per_cell"
-    assert art.provenance["correction_applied"] is False
+    prov = art.provenance
+    assert prov["capture_stage"] == "pre_offset_pre_feather"
+    assert prov["production_wired"] is True and prov["correction_applied"] is False
+    assert prov["capture"]["effective_cell_gauge_mode"] == "per_cell"
+    # M2 identity generated in _run_single, present in the artifact alone
+    ident = prov["capture"]
+    assert len(ident["capture_id"]) == 64
+    assert ident["run_label"] == "single"
+    assert ident["n_source_frames"] == 4
+    assert len(ident["source_set_digest"]) == 64
+    assert ident["source_set_digest_algo"] == bgd.SOURCE_SET_DIGEST_ALGO
 
     man = json.loads((out / "zegrid_manifest.json").read_text())
     cap = man["cell_feather"]["r37_diagnostic_capture"]
@@ -366,10 +492,48 @@ def test_e2e_per_cell_capture_publishes_validated_artifact(tmp_path):
     assert cap["n_dropped"] == len(art.dropped)
     assert cap["holdout_cap"] == zz.R37_CAPTURE_HOLDOUT_CAP_DEFAULT
     assert cap["measurement_px"] == 2 * zz.zsw.HALO_PX
-    assert cap["halo_px"] == zz.zsw.HALO_PX
+    assert cap["halo_px"] == zz.zsw.HALO_PX and cap["feather_px"] == zz.zsw.HALO_PX
     assert cap["effective_cell_gauge_mode"] == "per_cell"
+    # M2.4: the manifest cross-links the SAME artifact (all four keys match)
+    assert bgd.manifest_links_artifact(
+        {"capture_id": prov["capture"]["capture_id"], "filename": target.name,
+         "sha256": cap["sha256"], "bytes": cap["bytes"]}, cap) is True
+    assert cap["capture_id"] == ident["capture_id"]
+    assert cap["source_set_digest"] == ident["source_set_digest"]
+    # the capture identity is recorded in the run log BEFORE stacking outcomes
+    run_log = (out / "zegrid_run.log").read_text()
+    assert "R37-D capture identity" in run_log
+    assert ident["capture_id"] in run_log
     # no temp residue in the output directory
     assert list(out.glob("*.tmp")) == [] and list(out.glob(".*tmp")) == []
+
+
+def test_e2e_capture_survives_later_failure_as_uncommitted(tmp_path, monkeypatch):
+    # M2.4: a later run failure after a successful pre-feather capture leaves the
+    # artifact as (uncommitted) evidence; with no/old manifest it does not qualify.
+    inp = tmp_path / "in"
+    _write_corpus(inp, DISJOINT_CENTERS)
+    out = tmp_path / "out"
+
+    def _boom(*a, **k):
+        raise RuntimeError("simulated later failure (post-capture)")
+
+    monkeypatch.setattr(zz, "_write_outputs", _boom)
+    with pytest.raises(RuntimeError):
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
+        )
+    target = out / zz.R37_CAPTURE_FILENAME
+    assert target.is_file()  # capture evidence survives
+    assert not (out / "zegrid_manifest.json").exists()  # no manifest
+    art = bgd.load_file(target)
+    capture_meta = {
+        "capture_id": art.provenance["capture"]["capture_id"],
+        "filename": target.name,
+    }
+    # no manifest -> uncommitted / non-qualifying
+    assert bgd.manifest_links_artifact(capture_meta, None) is False
 
 
 def test_e2e_cap_large_exact_and_small_capped(tmp_path):

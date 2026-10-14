@@ -1386,7 +1386,8 @@ def _validate_r37_diagnostic_capture(capture, holdout_cap):
 
 
 def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None, emit=None,
-                                 capture=False, holdout_cap=None, output_dir=None):
+                                 capture=False, holdout_cap=None, output_dir=None,
+                                 capture_identity=None):
     """R34D: apply inter-cell additive offsets + FEATHERED assembly (opt-in).
 
     Builds :class:`cell_feather.CellPatch` objects from the per-cell worker results
@@ -1440,33 +1441,62 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
                 "provided; refusing to run without publishing the artifact"
             )
         cap = R37_CAPTURE_HOLDOUT_CAP_DEFAULT if holdout_cap is None else int(holdout_cap)
-        # Measurement band explicit and consistent with the real halo overlap
-        # (normally 2*halo = 16 px; a halo-less patch falls back to the accepted
-        # default band). Recorded in the provenance + manifest.
-        measurement_px = int(2 * halo_px) if int(halo_px) > 0 else int(_bgd.DEFAULT_MEASUREMENT_PX)
+        # Measurement + feather widths explicit and consistent with the real halo
+        # overlap (normally halo=8 -> measurement band 2*halo=16, feather=halo=8;
+        # a halo-less patch falls back to the accepted default band). Recorded in
+        # the provenance + manifest (L1).
+        halo_i = int(halo_px)
+        measurement_px = int(2 * halo_i) if halo_i > 0 else int(_bgd.DEFAULT_MEASUREMENT_PX)
+        feather_px = halo_i if halo_i > 0 else int(_bgd.DEFAULT_FEATHER_PX)
         payload = _bgd.build_payload(
             patches, nx, ny, (int(canvas.height), int(canvas.width)),
-            measurement_px=measurement_px, holdout_cap=cap,
+            measurement_px=measurement_px, feather_px=feather_px, holdout_cap=cap,
         )
-        payload["provenance"]["capture_stage"] = R37_CAPTURE_STAGE
-        payload["provenance"]["capture"] = {
-            "capture_stage": R37_CAPTURE_STAGE,
+        # M1: REPLACE the pure/offline default provenance with truthful,
+        # single-valued production-capture provenance (never "production_wired"
+        # both false and true). Identity is generated once in ``_run_single``; a
+        # direct/pure call without identity falls back to a deterministic
+        # content-derived id (no hidden RNG).
+        ident = dict(capture_identity or {})
+        if not ident.get("capture_id"):
+            ident = {
+                "capture_id": _bgd.capture_run_id(
+                    start_ts="direct", pass_label="direct", n_frames=int(nx * ny),
+                    source_set_digest_value=_bgd.source_set_digest(sorted(patches)),
+                ),
+                "run_label": "direct",
+                "n_source_frames": int(nx * ny),
+                "source_set_digest": _bgd.source_set_digest(sorted(patches)),
+                "source_set_digest_algo": _bgd.SOURCE_SET_DIGEST_ALGO,
+            }
+        payload["provenance"] = _bgd.capture_provenance(
+            capture_id=ident.get("capture_id"),
+            run_label=ident.get("run_label"),
+            n_source_frames=ident.get("n_source_frames", 0),
+            source_set_digest_value=ident.get("source_set_digest"),
+            source_set_digest_algo=ident.get("source_set_digest_algo", _bgd.SOURCE_SET_DIGEST_ALGO),
+            halo_px=halo_i, measurement_px=measurement_px, feather_px=feather_px,
+            effective_cell_gauge_mode=zphot.CELL_GAUGE_MODE_PER_CELL,
+        )
+        capture_info = _bgd.publish_artifact(output_dir, payload)
+        capture_info.update({
+            "capture_id": str(ident.get("capture_id")),
+            "run_label": str(ident.get("run_label")),
+            "n_source_frames": int(ident.get("n_source_frames", 0)),
+            "source_set_digest": str(ident.get("source_set_digest")),
+            "source_set_digest_algo": str(
+                ident.get("source_set_digest_algo", _bgd.SOURCE_SET_DIGEST_ALGO)
+            ),
             "effective_cell_gauge_mode": zphot.CELL_GAUGE_MODE_PER_CELL,
-            "halo_px": int(halo_px),
+            "halo_px": halo_i,
             "measurement_px": int(measurement_px),
-            "production_wired": True,
-            "correction_applied": False,
-        }
-        capture_info = _bgd.publish_artifact(
-            output_dir, payload, basename=R37_CAPTURE_FILENAME
-        )
-        capture_info["effective_cell_gauge_mode"] = zphot.CELL_GAUGE_MODE_PER_CELL
-        capture_info["halo_px"] = int(halo_px)
-        capture_info["measurement_px"] = int(measurement_px)
+            "feather_px": int(feather_px),
+        })
         if emit is not None:
             try:
                 emit(
                     "ZeGrid R37-D diagnostic capture: "
+                    f"capture_id={capture_info['capture_id']} "
                     f"file={capture_info['filename']} stage={capture_info['capture_stage']} "
                     f"schema={capture_info['schema']}/{capture_info['schema_version']} "
                     f"relations={capture_info['n_relations']} dropped={capture_info['n_dropped']} "
@@ -1525,7 +1555,7 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
 
 
 def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None, emit=None,
-                    capture=False, holdout_cap=None, output_dir=None):
+                    capture=False, holdout_cap=None, output_dir=None, capture_identity=None):
     """Dispatch assembly by cell gauge mode (ZM-CELL-PHOTOMETRY-R34D).
 
     Returns ``(assembled, feather_info)``. ``"global"`` (default) -> the
@@ -1540,6 +1570,7 @@ def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None,
         return _assemble_per_cell_feathered(
             canvas, nx, ny, result_by_cid, halo_px=halo_px, emit=emit,
             capture=capture, holdout_cap=holdout_cap, output_dir=output_dir,
+            capture_identity=capture_identity,
         )
     return zmosaic.assemble_canvas(canvas, nx, ny, cores), None
 
@@ -2246,6 +2277,39 @@ def _run_single(
         f"(resolution {canvas.resolution_deg:.3g} deg/px)",
         callback=progress_callback,
     )
+
+    # ZM-ZEGRID-R37-D (M2): when the explicit capture is requested, generate ONE
+    # stable opaque capture identity for THIS pass (single / EQ / ALTZ distinct)
+    # BEFORE per-Cell stacking, and record it in the run log. The synthetic digest
+    # hashes the canonical ordered RELATIVE logical frame identifiers (never
+    # absolute private paths). Lazy import: the disabled path imports nothing.
+    r37_capture_identity = None
+    if r37_diagnostic_capture:
+        from .core.zegrid import background_diagnostics as _bgd
+
+        _ids = [d.frame_id.logical_path for d in descs]
+        _src_digest = _bgd.source_set_digest(_ids)
+        _capture_id = _bgd.capture_run_id(
+            start_ts=start_ts, pass_label=pass_label,
+            n_frames=len(descs), source_set_digest_value=_src_digest,
+        )
+        r37_capture_identity = {
+            "capture_id": _capture_id,
+            "run_label": str(pass_label),
+            "n_source_frames": int(len(descs)),
+            "source_set_digest": _src_digest,
+            "source_set_digest_algo": _bgd.SOURCE_SET_DIGEST_ALGO,
+        }
+        _log_line(
+            "ZeGrid R37-D capture identity: "
+            + json.dumps(r37_capture_identity, sort_keys=True)
+        )
+        _emit(
+            f"ZeGrid R37-D capture requested — capture_id={_capture_id} "
+            f"pass={pass_label} source_frames={len(descs)} "
+            f"source_set_digest={_src_digest}",
+            callback=progress_callback,
+        )
 
     # LAYOUT — MODE-AWARE RAM-aware Auto layout (in-memory OR streaming bound),
     # budgeted from psutil (portable). Pinnable via ``zegrid_layout``.
@@ -3001,6 +3065,7 @@ def _run_single(
             capture=r37_diagnostic_capture,
             holdout_cap=r37_diagnostic_holdout_cap,
             output_dir=output_dir,
+            capture_identity=r37_capture_identity,
         )
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
     # ZM-ZEGRID-R22 honesty fix: peak_rss_kib is a SINGLE process's peak. Report
