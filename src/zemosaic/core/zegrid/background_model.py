@@ -59,6 +59,7 @@ __all__ = [
     "GateConfig", "PlanCell", "EdgeObservation", "ModelComparisonResult",
     "normalized_coords", "observe_edge", "build_observations",
     "solve_offset_baseline", "solve_plan_sparse", "decide_state", "compare_models",
+    "compare_models_from_observations",
     "gauge_truth_error", "apply_plane_correction", "plane_field",
     "sparse_scale_witness", "nonlinear_study",
 ]
@@ -1341,7 +1342,6 @@ def compare_models(cells, nx, ny, canvas_hw, *, channels=None, anchor=None,
                    measurement_px=DEFAULT_MEASUREMENT_PX, feather_px=DEFAULT_FEATHER_PX,
                    block_px=BLOCK_PX, cfg=None, truth_planes=None):
     """Evaluate M0 vs M1. The ACCEPTED relation set is the source of all gates."""
-    cfg = cfg or GateConfig()
     if channels is None:
         channels = cells[next(iter(cells))].channels()
     cell_ids = tuple(f"r{r:04d}c{c:04d}" for r in range(ny) for c in range(nx)
@@ -1352,10 +1352,33 @@ def compare_models(cells, nx, ny, canvas_hw, *, channels=None, anchor=None,
         anchor = select_central_cell(nx, ny)
         if anchor not in cells:
             anchor = cell_ids[0]
-    index = {cid: i for i, cid in enumerate(cell_ids)}
 
     obs_raw, dropped = build_observations(cells, nx, ny, canvas_hw, channels=channels,
                                           block_px=block_px, measurement_px=measurement_px)
+    return compare_models_from_observations(
+        obs_raw, dropped, cell_ids=cell_ids, nx=nx, ny=ny, canvas_hw=canvas_hw,
+        channels=channels, anchor=anchor, measurement_px=measurement_px,
+        feather_px=feather_px, block_px=block_px, cfg=cfg, truth_planes=truth_planes,
+    )
+
+
+def compare_models_from_observations(
+        obs_raw, dropped, *, cell_ids, nx, ny, canvas_hw, channels, anchor,
+        measurement_px=DEFAULT_MEASUREMENT_PX, feather_px=DEFAULT_FEATHER_PX,
+        block_px=BLOCK_PX, cfg=None, truth_planes=None):
+    """Evaluate M0 vs M1 from ALREADY-BUILT observations (ZM-ZEGRID-R37-C).
+
+    Behaviour-preserving extraction of the tail of :func:`compare_models`: the
+    only difference is that the caller supplies ``obs_raw``/``dropped`` (and the
+    layout metadata) directly instead of source ``cells``. This is the pure
+    conversion helper that lets the OFFLINE diagnostic artifact rerun the
+    accepted M0/M1 decisions without source FITS. Gates/thresholds/solver are
+    unchanged; ``truth_planes`` is optional exactly as in :func:`compare_models`.
+    """
+    cfg = cfg or GateConfig()
+    if not cell_ids:
+        raise ValueError("no cells provided")
+    index = {cid: i for i, cid in enumerate(cell_ids)}
 
     def _filter(plan):
         acc = _accepted_key_set(plan)
