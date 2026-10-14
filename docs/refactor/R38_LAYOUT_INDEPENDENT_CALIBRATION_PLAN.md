@@ -168,6 +168,12 @@ ne jamais appeler cette dernière option une réparation du FITS science.
 ## 8. État et prochaine action
 
 Réalisé : inspection du code et des preuves R33/R37 ; ce plan uniquement.
-Non réalisé : nouveau prototype, mesures causales, tests, modification scientifique.
-Prochain lot recommandé : R38-A seul, runner offline + rapport causal.
-Aucun changement aux FITS utilisateur, aucun run lourd, aucun commit/push.
+R38-A implémenté (harness + tests + note `R38_A_CAUSAL_PROBE.md`) et exécuté sur
+l'artefact Windows 816 exact dans les limites bornées de l'hôte : voir
+`.a2a-reports/ZM-ZEGRID-R38-A-CAUSAL.coco.r0.md`. Aucun changement production,
+aucune correction, aucun câblage.
+
+Prochain lot recommandé : R38-A est soumis à la revue Junior/Nono. R38-B reste
+interdit tant que le diagnostic A n'établit pas un mécanisme précis et que les
+cellules `NOT_RUN` (restack complet) ne sont pas exécutées sur un hôte capable.
+Aucun changement aux FITS utilisateur, aucun run lourd, commit local autorisé.
