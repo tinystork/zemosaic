@@ -28,6 +28,7 @@ import hashlib
 import inspect
 import json
 import pathlib
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -40,6 +41,7 @@ from zemosaic.core.zegrid import background_diagnostics as bgd
 from zemosaic.core.zegrid import background_model as bm
 from zemosaic.core.zegrid import cell_feather as zcf
 from zemosaic.core.zegrid import geometry as zg
+from zemosaic.core.zegrid.executor import ExecutorConfig
 from zemosaic.zemosaic_stack_plan import FrameInfo
 
 # The end-to-end runs write FITS via the production path, which emits astropy's
@@ -413,6 +415,170 @@ def test_manifest_links_artifact_rule():
     assert bgd.manifest_links_artifact(art, {**art, "sha256": "bb"}) is False
     assert bgd.manifest_links_artifact(art, {**art, "capture_id": "id2"}) is False
     assert bgd.manifest_links_artifact(art, {**art, "bytes": 11}) is False
+
+
+# ---------------------------------------------------------------------------
+# 3d. F1/F2/F3 — start-of-run invalidation, readback cleanup, distinct ids
+# ---------------------------------------------------------------------------
+
+def test_invalidate_capture_target_idempotent(tmp_path):
+    assert bgd.invalidate_capture_target(tmp_path) is False   # nothing to remove
+    bgd.publish_artifact(tmp_path, _valid_payload())
+    target = tmp_path / bgd.CAPTURE_ARTIFACT_BASENAME
+    assert target.is_file()
+    assert bgd.invalidate_capture_target(tmp_path) is True
+    assert not target.exists()
+    assert bgd.invalidate_capture_target(tmp_path) is False   # idempotent
+
+
+def test_invalidate_capture_target_loud_when_cannot_remove(tmp_path, monkeypatch):
+    bgd.publish_artifact(tmp_path, _valid_payload())
+
+    def _boom(*a, **k):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(bgd.os, "unlink", _boom)
+    with pytest.raises(RuntimeError):
+        bgd.invalidate_capture_target(tmp_path)
+
+
+def test_publish_readback_failure_removes_target(tmp_path, monkeypatch):
+    # F2: a post-replace readback failure must leave NO fixed target.
+    def _boom(*a, **k):
+        raise OSError("simulated readback failure")
+
+    monkeypatch.setattr(bgd, "_readback_digest", _boom)
+    with pytest.raises(OSError):
+        bgd.publish_artifact(tmp_path, _valid_payload())
+    assert not (tmp_path / bgd.CAPTURE_ARTIFACT_BASENAME).exists()
+    assert list(tmp_path.glob("*.tmp")) == [] and list(tmp_path.glob(".*tmp")) == []
+
+
+def test_capture_run_id_nonce_distinct_same_second():
+    d = bgd.source_set_digest(["a.fit"])
+    kw = dict(start_ts="2026-10-14T12:00:01+0200", pass_label="single",
+              n_frames=2, source_set_digest_value=d)
+    a = bgd.capture_run_id(**kw, nonce=1)
+    assert a == bgd.capture_run_id(**kw, nonce=1)          # deterministic for inputs+nonce
+    assert a != bgd.capture_run_id(**kw, nonce=2)           # distinct nonce -> distinct id
+    assert a != bgd.capture_run_id(**kw, nonce=1_000_000)
+
+
+# ---------------------------------------------------------------------------
+# 3e. F1 end-to-end: requested-capture failure phases invalidate prior pair
+# ---------------------------------------------------------------------------
+
+def _run_per_cell_capture(inp, out):
+    zz.run_zegrid_mode(
+        str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
+    )
+
+
+def _assert_committed(out):
+    target = out / zz.R37_CAPTURE_FILENAME
+    assert target.is_file()
+    man = json.loads((out / "zegrid_manifest.json").read_text())
+    cap = man["cell_feather"]["r37_diagnostic_capture"]
+    assert bgd.manifest_links_artifact(
+        {"capture_id": cap["capture_id"], "filename": cap["filename"],
+         "sha256": cap["sha256"], "bytes": cap["bytes"]}, cap) is True
+    return target
+
+
+def test_e2e_f1_global_refusal_invalidates_prior_pair(tmp_path):
+    inp = tmp_path / "in"
+    _write_corpus(inp, DISJOINT_CENTERS)
+    out = tmp_path / "out"
+    _run_per_cell_capture(inp, out)
+    target = _assert_committed(out)
+    # refused capture run on the SAME output dir
+    with pytest.raises(RuntimeError):
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            cell_gauge_mode="global", r37_diagnostic_capture=True,
+        )
+    assert not target.exists()  # old fixed artifact invalidated at run start
+    with pytest.raises(FileNotFoundError):
+        bgd.load_file(target)
+
+
+def test_e2e_f1_auto_global_refusal_invalidates_prior_pair(tmp_path):
+    inp_disjoint = tmp_path / "in_disjoint"
+    _write_corpus(inp_disjoint, DISJOINT_CENTERS)
+    out = tmp_path / "out"
+    _run_per_cell_capture(inp_disjoint, out)
+    target = _assert_committed(out)
+    # auto on a fully-connected corpus resolves to global -> refused
+    inp_connected = tmp_path / "in_connected"
+    _write_corpus(inp_connected, [(10.0, 30.0)] * 4)
+    with pytest.raises(RuntimeError):
+        zz.run_zegrid_mode(
+            str(inp_connected), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            r37_diagnostic_capture=True,
+        )
+    assert not target.exists()
+
+
+def test_e2e_f1_early_layout_failure_invalidates_prior_pair(tmp_path, monkeypatch):
+    inp = tmp_path / "in"
+    _write_corpus(inp, DISJOINT_CENTERS)
+    out = tmp_path / "out"
+    _run_per_cell_capture(inp, out)
+    target = _assert_committed(out)
+
+    def _boom(*a, **k):
+        raise RuntimeError("simulated early layout failure")
+
+    monkeypatch.setattr(zz, "_choose_layout_mode_aware", _boom)
+    with pytest.raises(RuntimeError):
+        _run_per_cell_capture(inp, out)
+    assert not target.exists()
+
+
+def test_run_single_invalidates_output_dir_at_start(tmp_path, monkeypatch):
+    # Directly exercise _run_single's own start-of-run invalidation (F1).
+    out = tmp_path / "out"
+    out.mkdir(parents=True)
+    target = out / zz.R37_CAPTURE_FILENAME
+    target.write_text("{\n}\n", encoding="utf-8")
+
+    def _boom(*a, **k):
+        raise RuntimeError("simulated descriptor failure")
+
+    monkeypatch.setattr(zz, "_build_frame_descriptors", _boom)
+    science_config = replace(ExecutorConfig().science_config(), cell_gauge_mode="per_cell")
+    with pytest.raises(RuntimeError):
+        zz._run_single(
+            [], str(tmp_path), str(out), progress_callback=None,
+            science_config=science_config, zconfig=SimpleNamespace(),
+            r37_diagnostic_capture=True,
+        )
+    assert not target.exists()
+
+
+def test_e2e_f1_mount_pass_dirs_invalidated(tmp_path):
+    inp = tmp_path / "in"
+    eq_paths = _write_corpus(inp / "eq", DISJOINT_CENTERS, eqmode=1)
+    altz_paths = _write_corpus(inp / "altz", DISJOINT_CENTERS, eqmode=0)
+    frames = _frame_infos(eq_paths, "EQ") + _frame_infos(altz_paths, "ALTZ")
+    out = tmp_path / "out"
+    zz.run_zegrid_mode(
+        str(inp), str(out), frames_info=frames,
+        zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
+    )
+    eq_art = out / "grid_EQ" / zz.R37_CAPTURE_FILENAME
+    assert eq_art.is_file()
+    # refused run (explicit global) on the same base -> mount pass dirs invalidated
+    with pytest.raises(RuntimeError):
+        zz.run_zegrid_mode(
+            str(inp), str(out), frames_info=frames,
+            zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            cell_gauge_mode="global", r37_diagnostic_capture=True,
+        )
+    assert not eq_art.exists()
+    assert not (out / "grid_ALTZ" / zz.R37_CAPTURE_FILENAME).exists()
 
 
 def test_nondefault_halo_widths_consistent(tmp_path):

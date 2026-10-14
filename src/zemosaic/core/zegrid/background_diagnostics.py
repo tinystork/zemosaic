@@ -95,6 +95,7 @@ __all__ = [
     "source_set_digest",
     "capture_run_id",
     "capture_provenance",
+    "invalidate_capture_target",
     "manifest_links_artifact",
     "load_artifact",
     "dumps",
@@ -226,25 +227,66 @@ def source_set_digest(identifiers) -> str:
     return h.hexdigest()
 
 
-def capture_run_id(*, start_ts, pass_label, n_frames, source_set_digest_value: str) -> str:
-    """Stable opaque capture identity (deterministic hash, NO hidden RNG).
+def capture_run_id(*, start_ts, pass_label, n_frames, source_set_digest_value, nonce=0) -> str:
+    """Stable opaque capture identity (deterministic hash; provenance-only nonce).
 
     A sha256 over a version tag, the run start timestamp, the pass label
-    (``single`` / ``EQ`` / ``ALTZ``), the source frame count and the frame-set
-    digest. Same inputs -> same id; distinct passes -> distinct ids. Returned as a
-    plain hex string (strict-JSON friendly).
+    (``single`` / ``EQ`` / ``ALTZ``), the source frame count, the frame-set digest
+    and a high-resolution ``nonce`` (F3: ``time.time_ns()`` generated once per
+    ``_run_single`` invocation). Same inputs+nonce -> same id; distinct passes OR
+    distinct invocations -> distinct ids even within the same wall-clock second.
+    The nonce is provenance only, NEVER scientific RNG. Returned as a plain hex
+    string (strict-JSON friendly).
     """
     h = hashlib.sha256()
     for part in (
-        "zemosaic.zegrid.r37d.capture.v1",
+        "zemosaic.zegrid.r37d.capture.v2",
         str(start_ts),
         str(pass_label),
         str(int(n_frames)),
         str(source_set_digest_value),
+        str(nonce),
     ):
         h.update(part.encode("utf-8"))
         h.update(b"\n")
     return h.hexdigest()
+
+
+def invalidate_capture_target(output_dir) -> bool:
+    """Fail-closed invalidation of the FIXED capture target inside ``output_dir``.
+
+    ZM-ZEGRID-R37-D (F1): removes ONLY :data:`CAPTURE_ARTIFACT_BASENAME` (never any
+    caller-supplied filename), is IDEMPOTENT (missing target -> no-op, returns
+    False), fsyncs the parent directory best-effort, and raises a clear
+    :class:`RuntimeError` if an EXISTING fixed target cannot be invalidated. Used
+    at requested-run START so a pre-publication abort cannot leave a stale, still
+    committed-looking artifact. Returns True iff an existing target was removed.
+    """
+    out = Path(output_dir).expanduser()
+    target = out / CAPTURE_ARTIFACT_BASENAME
+    if not target.exists():
+        return False
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError(
+            f"capture artifact: cannot invalidate existing fixed target {target}: {exc}"
+        ) from exc
+    _fsync_dir_best_effort(out)
+    return True
+
+
+def _readback_digest(path):
+    """SHA-256 + byte count of the on-disk published file (post-publication)."""
+    digest = hashlib.sha256()
+    n_bytes = 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+            n_bytes += len(chunk)
+    return digest.hexdigest(), int(n_bytes)
 
 
 def capture_provenance(*, capture_id, run_label, n_source_frames, source_set_digest_value,
@@ -1101,16 +1143,7 @@ def publish_artifact(output_dir, payload) -> dict:
     target = out / name
 
     # 0. Fail-closed invalidation of any pre-existing target FIRST.
-    try:
-        if target.exists():
-            os.unlink(target)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise RuntimeError(
-            f"capture artifact: cannot invalidate existing target {target}: {exc}"
-        ) from exc
-    _fsync_dir_best_effort(out)
+    invalidate_capture_target(out)
 
     # 1. STRICT validation AFTER invalidation (a malformed payload leaves no target).
     artifact = load_artifact(payload)
@@ -1139,13 +1172,18 @@ def publish_artifact(output_dir, payload) -> dict:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-    # 3. SHA-256 + byte count AFTER publication (from the on-disk bytes).
-    digest = hashlib.sha256()
-    n_bytes = 0
-    with open(target, "rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            digest.update(chunk)
-            n_bytes += len(chunk)
+    # 3. SHA-256 + byte count AFTER publication (from the on-disk bytes). F2: if the
+    # readback fails, remove the just-published target so "ANY failure => target
+    # absent" stays truthful.
+    try:
+        digest_hex, n_bytes = _readback_digest(target)
+    except BaseException:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        _fsync_dir_best_effort(out)
+        raise
     return {
         "status": "written",
         "filename": name,
@@ -1153,7 +1191,7 @@ def publish_artifact(output_dir, payload) -> dict:
         "schema": artifact.payload["schema"],
         "schema_version": artifact.payload["schema_version"],
         "bytes": int(n_bytes),
-        "sha256": digest.hexdigest(),
+        "sha256": digest_hex,
         "n_cells": int(len(artifact.meta["cell_ids"])),
         "n_relations": int(len(artifact.observations)),
         "n_dropped": int(len(artifact.dropped)),

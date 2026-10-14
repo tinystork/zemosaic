@@ -2187,6 +2187,14 @@ def _run_single(
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    # ZM-ZEGRID-R37-D (F1): when a capture is requested, fail-closed invalidate the
+    # fixed target in THIS run's actual output dir IMMEDIATELY at run start (before
+    # descriptors/layout/gauge). Idempotent with the outer invalidation; protects
+    # direct/internal calls and every pre-assembly failure phase (incl. auto->global).
+    if r37_diagnostic_capture:
+        from .core.zegrid import background_diagnostics as _bgd
+
+        _bgd.invalidate_capture_target(output_dir)
     timings = zin.Timings()
     start_ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     # ZM-ETA-SERVICE-R30 F4: honest actual wall duration for the history record
@@ -2289,9 +2297,13 @@ def _run_single(
 
         _ids = [d.frame_id.logical_path for d in descs]
         _src_digest = _bgd.source_set_digest(_ids)
+        # F3: one high-resolution invocation nonce per pass (provenance only, never
+        # scientific RNG) so same-second retries get DISTINCT capture ids.
+        _nonce = time.time_ns()
         _capture_id = _bgd.capture_run_id(
             start_ts=start_ts, pass_label=pass_label,
             n_frames=len(descs), source_set_digest_value=_src_digest,
+            nonce=_nonce,
         )
         r37_capture_identity = {
             "capture_id": _capture_id,
@@ -2299,6 +2311,8 @@ def _run_single(
             "n_source_frames": int(len(descs)),
             "source_set_digest": _src_digest,
             "source_set_digest_algo": _bgd.SOURCE_SET_DIGEST_ALGO,
+            "invocation_nonce_algo": "time.time_ns",
+            "invocation_nonce": int(_nonce),
         }
         _log_line(
             "ZeGrid R37-D capture identity: "
@@ -3964,6 +3978,22 @@ def run_zegrid_mode(
     r37_diagnostic_capture, r37_diagnostic_holdout_cap = _validate_r37_diagnostic_capture(
         r37_diagnostic_capture, r37_diagnostic_holdout_cap
     )
+
+    # ZM-ZEGRID-R37-D (F1): when a capture is REQUESTED, fail-closed invalidate any
+    # stale fixed artifact at run START — in the base output dir AND the known
+    # mount-pass dirs (grid_EQ / grid_ALTZ) if they exist — BEFORE explicit-global
+    # refusal, input discovery, descriptors, layout or gauge work. A pre-publication
+    # abort therefore cannot leave a previous committed-looking artifact. The
+    # DISABLED path touches nothing.
+    if r37_diagnostic_capture:
+        from .core.zegrid import background_diagnostics as _bgd
+
+        _base_out = Path(output_folder).expanduser()
+        _bgd.invalidate_capture_target(_base_out)
+        for _pass_dir in ("grid_EQ", "grid_ALTZ"):
+            _candidate = _base_out / _pass_dir
+            if _candidate.is_dir():
+                _bgd.invalidate_capture_target(_candidate)
 
     # ZM-ZEGRID-R22: resolve ONE canonical GPU preference and decide the backend
     # HONESTLY (requested -> available -> effective). ``use_gpu`` is now honoured

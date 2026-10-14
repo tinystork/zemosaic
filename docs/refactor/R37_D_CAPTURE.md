@@ -75,8 +75,23 @@ directory is chosen by the caller:
    unlink and the rename.
 3. **SHA-256 / byte count AFTER publication**, from the on-disk bytes.
 
-On **any** failure the fixed target is **absent** and no temp residue remains. An
-**explicit** request fails **loudly** — there is no silent missing/corrupt artifact.
+On **any** failure the fixed target is **absent** and no temp residue remains. A
+post-`os.replace` readback failure also removes the just-published target (F2), so
+the "absent on any failure" contract is truthful for every phase.
+
+**Start-of-run invalidation (F1).** Because the build happens at assembly (late),
+the fail-closed invalidation is ALSO applied at the START of any requested-capture
+run: `run_zegrid_mode` invalidates the fixed target in the base output dir and the
+known mount-pass dirs (`grid_EQ` / `grid_ALTZ`, if present) right after argument
+validation, and `_run_single` invalidates its own actual output dir immediately at
+run start — both BEFORE explicit-global refusal, input discovery, descriptors,
+layout and gauge. So a pre-publication abort (global / auto→global refusal,
+descriptor/layout/gauge failure) cannot leave a previous artifact+manifest looking
+like a committed pair. The helper `invalidate_capture_target` is idempotent, only
+ever touches the fixed basename, fsyncs the parent best-effort and raises clearly
+if an existing fixed target cannot be removed. Old manifests/FITS are never
+deleted, and the disabled path invalidates nothing.
+
 The **disabled** path never imports, builds, invalidates or writes anything.
 
 Compact capture metadata is recorded in `cell_feather_info` → manifest
@@ -92,8 +107,12 @@ the manifest keeps its exact previous shape.
 * **Identity** — `_run_single` generates ONE stable opaque identity per requested
   capture pass *before* per-Cell stacking (single / EQ / ALTZ each distinct) and
   records it in the run log first:
-  * `capture_id = capture_run_id(start_ts, pass_label, n_frames, source_set_digest)`
-    — a deterministic sha256 (hex, strict-JSON friendly), **no hidden RNG**;
+  * `capture_id = capture_run_id(start_ts, pass_label, n_frames, source_set_digest,
+    nonce)` — a deterministic sha256 (hex, strict-JSON friendly) mixing a
+    high-resolution invocation `nonce` (F3: `time.time_ns()` generated once at
+    `_run_single` start; provenance only, never scientific RNG) so same-second
+    retries get **distinct** ids while the function stays deterministic for fixed
+    inputs+nonce;
   * `source_set_digest = source_set_digest([frame_id.logical_path ...])` — a
     deterministic, order-invariant, de-duplicated sha256 of the SORTED canonical
     **relative logical** frame identifiers (never absolute private paths); the
@@ -183,7 +202,7 @@ downgraded away from `ROBUST_PLAN` with an explicit refusal reason.
 
 ## 7. Tests
 
-`tests/test_zegrid_r37d_diagnostic_capture.py` (27 tests): default OFF (no
+`tests/test_zegrid_r37d_diagnostic_capture.py` (36 tests): default OFF (no
 artifact, module never called), explicit `per_cell` ON (strict-loadable artifact,
 truthful single-valued provenance, run identity in artifact+manifest+run log,
 relations match a fresh build, no temp residue, digest/bytes metadata), cap large →
