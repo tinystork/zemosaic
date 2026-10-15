@@ -401,10 +401,11 @@ tolerance exactly `0`**, on the **f64** helper result with **no f32 downcast**. 
 *separate* algebraically reordered cross-expression is calibrated and frozen as a
 **scale-aware ULP bound**
 `|(sci_u+off_u) − (sci_v+off_v) − ((sci_u−sci_v) + (off_u−off_v))| ≤ ulp_k · ε_f64 · scale`
-with `scale = max(|sci_u|,|sci_v|,|post_u|,|post_v|,|off_u|,|off_v|)` and **`ulp_k = 4`**
-(calibration max ratio `0.6122`, so `4` is the conservative floor-derived bound; the raw
-absolute error is scale-dependent — `1.11e-16` at unit scale, `1.41e14` at scale `1e30` —
-which is exactly why the bound is expressed scale-aware). **Both rules are scoped to the M3
+with `scale = max(|sci_u|,|sci_v|,|post_u|,|post_v|,|off_u|,|off_v|)` and **`ulp_k = 5`**
+(calibration max scale-ratio `0.6338271846408026`; `5` is an explicit IEEE rounding count
+`(2+3)` — **not** a fabricated floor-derived bound; the raw absolute error is scale-dependent
+— `1.11e-16` at unit scale, `1.41e14` at scale `1e30` — which is exactly why the bound is
+expressed scale-aware). **Both rules are scoped to the M3
 identity/cross-expression ONLY** and are **never** applied to the OFF/ON arrays/FITS
 identity, which stays exact byte identity at tolerance `0`.
 
@@ -654,10 +655,10 @@ emitted while any relation is incomplete.
 | coordinate inversion `INV_TOL = 1e-9` | `1e-9` | **INHERITED** — **coordinate inversion only**; never reused for science values |
 | relation-first cohort `≥ 8` distinct relations for any cross-relation report | `8` | **INHERITED** (R39 §5.3 contextual cohort minimum) |
 | same axis family + sign tuple in `≥ 2` distinct relations per orientation | `2` | **INHERITED** (R39 §9.3 mechanics) |
-| M3 identity tolerance | **`0` (bit identity)** | **FROZEN by R40-B1** (§15): bit-identical helper-output recomputation was achievable on every synthetic calibration/validation case, so no tolerance is used; the *separate* algebraic cross-expression uses `ulp_k = 4` scale-aware (`|Δ| ≤ 4·ε_f64·scale`). **Both are scoped to the M3 identity ONLY** — they **never** apply to the OFF/ON array/FITS identity |
+| M3 identity tolerance | **`0` (bit identity)** | **FROZEN by R40-B1** (§15): bit-identical helper-output recomputation was achievable on every synthetic calibration/validation case, so no tolerance is used; the *separate* algebraic cross-expression uses `ulp_k = 5` scale-aware (`|Δ| ≤ 5·ε_f64·scale`, an explicit IEEE rounding count `(2+3)`). **Both are scoped to the M3 identity ONLY** — they **never** apply to the OFF/ON array/FITS identity |
 | **OFF/ON science/coverage/aesthetic array + FITS identity** | **exact byte-identity — tolerance ZERO** | **FROZEN NOW (§8.2)** — a mandatory safety gate; **never** calibrated, widened or relaxed in R40-B1/B2 or anywhere else |
-| injected-effect recovery criterion (synthetic) | `reduction_rms ≥ 0.20` (inherited), `p90` worsening `≤ 5%` (inherited), `RMS0 ≤ 1.25·σ_ref` (inherited), `≥ 2` relations/orientation, `≥ 1` isolated family, min injected amplitude `0.75·σ_ref`, recovered-Δ abs tol `1e-12` | **FROZEN by R40-B1** (§15) — calibrated on disjoint synthetic calibration/validation groups, validated **once** on the independent validation group; inherited gates reused verbatim, **no** threshold derived from R39 observed values |
-| controlled-effect admission criteria for H4 (identity-proven intervention + residual-structure reproduction, relation-first, ≥2/orientation, sign-consistent) | see §15 (`h4_controlled_effect_admission`) | **FROZEN by R40-B1** (§15): identity + parity gates, complete 38-relation panel, same global pixels / same fixed stack, exactly **one** isolated intervention family, both orientations with a consistent sign/axis signature, and the inherited `RMS0`/`20%`/`p90 5%` gates on `delta_d_post` after the same frozen offsets; RGB pseudo-replication, per-frame-delta-only and sign-match-only are hard refusals |
+| injected-effect recovery criterion (synthetic) | `reduction_rms ≥ 0.20` (inherited), `p90` worsening `≤ 5%` (inherited), `RMS0 ≤ 1.25·σ_ref` (inherited), `≥ 2` relations/orientation, `≥ 1` isolated family | **FROZEN by R40-B1** (§15.5) — calibrated on disjoint synthetic calibration/validation groups, validated **once** on the independent validation group; inherited gates reused verbatim, **no** threshold derived from R39 observed values. The synthetic injection amplitude is **generator metadata only** — there is **no** amplitude-promotion gate. The recovered/common-support delta is **`ORCHESTRATION_ONLY_NON_GATING`** (a structurally expected orchestration diagnostic) and gates **nothing**; the earlier `1e-12` recovered-Δ tolerance framing is **withdrawn** and appears nowhere in the frozen v2 criteria |
+| controlled-effect admission criteria for H4 (identity-proven intervention + residual-structure reproduction, relation-first, ≥2/orientation, sign-consistent) | see §15 (`h4_controlled_effect_admission`) | **FROZEN by R40-B1** (§15): identity + parity gates, complete 38-relation panel, same global pixels / same fixed stack, exactly **one** isolated intervention family, both orientations with a consistent sign/axis signature, and the inherited `RMS0`/`20%`/`p90 5%` gates on `delta_d_post` after the same frozen offsets; RGB pseudo-replication, per-frame-delta-only, sign-match-only and amplitude-only are hard refusals; there is **no** amplitude-promotion gate |
 
 **REFUSED (must never appear).** Any threshold derived from the observed R39 values
 (`2.180`, `1.253–12.945`, `1.100`, `0.539`); any post-hoc relaxation/narrowing of the
@@ -723,8 +724,9 @@ claim the whole product RAM is `O(records)`.
 | Gate | Content | Authorized now? |
 |---|---|---|
 | **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
-| **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; v2 prevalidation re-issued `READY_FOR_NEW_VALIDATION` (freeze-closure, after Nono review-0/1/2/3), non-final across a future commit; the v2 reserved cohort is NOT evaluated here** (§15). | v1 invalidated; v2 prevalidation re-issued (local, unpushed) — **R40-B2 remains NOT authorized** |
-| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation. | NO — separate bounded mission, after R40-B1 |
+| **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; the v2 reserved cohort was evaluated EXACTLY ONCE by the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission → terminal **ACCEPT** (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`** (§15.7). | **DONE / terminal ACCEPT** (v1 invalidation history preserved byte-for-byte, §15.1) |
+| **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; **acceptance NOT achieved** — production seam wiring, the OFF/ON byte identity, the injected-effect recovery re-proof and the product ROI parity are `NOT_RUN` |
 | **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
 | **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
 | **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
@@ -880,15 +882,18 @@ return `NOT_IDENTIFIABLE`. **None may silently become a correction.**
 9. `git diff --check` is clean; `git status` shows only the new untracked/added document;
    no commit and no push are made.
 
-**Next single step.** R40-B1 is **`B1_FAIL_PROTOCOL_INVALID` / `READY_FOR_NEW_VALIDATION`** (§15):
-the invalid v1 outcome is withdrawn and a content-addressed **v2** prevalidation package
-(protocol + deep-frozen criteria + reserved fresh validation cohort + audited, complete product-tree
-code-identity binding, no outcomes) exists, and is **non-final across a future commit**. The next bounded action
-is **new architect/Nono review of that package, then (only if authorized) a local commit, then
-re-issue of the prevalidation bundle against the new HEAD, then a new mission that executes the
-reserved v2 cohort exactly once**. **R40-B2 is NOT authorized** and may only be considered after
-that fresh cohort validates. No real capture, no model fit, and no product change is authorized.
-Acceptance authority remains Jarvis Junior's.
+**Next single step.** R40-B1 is now **terminal ACCEPT** (§15.7): the v2 reserved cohort was
+executed **exactly once** by `ZM-ZEGRID-R40-B1V-ONE-SHOT` (`B1_PASS`, 18/18, claim
+`COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`, and the v1 invalidation history is
+preserved byte-for-byte (§15.1). **R40-B2 implementation is authorized**; its bounded **task A**
+(the default-OFF capture data contract + atomic shard-generation core, §15.8) is **DONE** on
+synthetic / in-memory fixtures. **B2 is NOT accepted by that shard core**: the production seam
+wiring (sparse worker→parent extraction into `_assemble_per_cell_feathered`), the **exact OFF/ON
+science/coverage/aesthetic array + FITS byte identity (tolerance 0)**, the synthetic
+injected-effect recovery re-proof and the **real product ROI parity** are all `NOT_RUN` and
+remain `B2_MANDATORY`. **R40-C / R40-D / HUMAN_GATE / LP341 remain `NOT_RUN` /
+`NOT_AUTHORIZED`.** No real capture, no model fit, no FITS/pixel read, and no product change is
+authorized. Acceptance authority remains Jarvis Junior's.
 
 **Vocabulary (frozen, to prevent conflation).**
 
@@ -919,10 +924,13 @@ is implied by any R40 gate.
 
 ## 12. Local commit / publication status
 
-The local `beta` implementation commit (`597c6dbb…`, "feat: add R39 spatial residual
-diagnostic") is **1 commit ahead of `origin/beta` and is not pushed**. This documentation
-mission adds **no commit and no push**. No publication, release, tag, deploy or remote
-resource is created or implied by R40.
+The local `beta` line now carries **four** local commits ahead of `origin/beta` and is **not
+pushed**: `597c6db` (R39 spatial residual diagnostic), `50b30eb` (R40 pre-registration),
+`c8f2fd3` (R40 synthetic calibration) and `61c4aa5` (R40 bundle verification against the current
+HEAD = the terminal B1 v2 `repo_head`). The bounded `ZM-ZEGRID-R40-B2-A-SHARD-CORE` mission adds
+**two new untracked files** (`src/zemosaic/core/zegrid/r40_capture.py` and
+`tests/test_zegrid_r40_capture_core.py`) and **no** commit and **no** push. No publication,
+release, tag, deploy or remote resource is created or implied by R40.
 
 ---
 
@@ -988,7 +996,8 @@ This section is a pointer, not a source of authority.
   a 2-of-3 rule and hard override; real I1a/I1b/I2 arms on the production primitives with the
   actual canonical stack; analytic (non-floor) bounds; family-level split disjointness) and
   publishes a **v2 prevalidation bundle** `READY_FOR_NEW_VALIDATION`. **No v2 validation
-  outcome is computed, no PASS is claimed, and R40-B2 is NOT authorized** (§15).
+  outcome is computed, no PASS is claimed, and R40-B2 is NOT authorized** — *historical record of the
+  rework-5 state; superseded by the terminal v2 ACCEPT (§15.7)*.
 - **rework-6 (R40-B1 rework-2: prevalidation-package repair), before any real R40 outcome:**
   after Nono review-1 (2 HIGH / 4 MEDIUM / 2 LOW, all code-level — the v2 reserved cohort was
   never evaluated and stays fresh), rework-2 closes: the deep-freeze **binding gap** (the
@@ -1030,6 +1039,30 @@ This section is a pointer, not a source of authority.
   prevalidation bundle is **re-issued deterministically, non-final across a future commit**; the
   v1 artifact and invalidation remain byte-for-byte; **no PASS, no B2 authorization, no v2
   validation outcome** (§15).
+- **rework-9 (R40-B1V one-shot: the v2 reserved cohort is evaluated exactly once), before any real
+  R40 outcome:** the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission executed the reserved v2 cohort
+  **exactly once** against the accepted freeze-closure bundle and returned a **terminal ACCEPT**
+  (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`; the v2 cohort is
+  now **CONSUMED** and must **never** be re-invoked, and the v1 invalidation/artifact stay
+  byte-for-byte (§15.7). **B2 implementation is thereby authorized; B2 acceptance is not.**
+- **rework-10 (R40-B2-A capture-core, bounded task A), before any real R40-C outcome:** the
+  default-OFF capture data contract + the bounded atomic shard-generation core are implemented and
+  tested on **synthetic / in-memory fixtures only** (frozen schema/dtype, sample identity, hard disk
+  budget, path safety, privacy, fail-closed identity, stale/resume, additive manifest link, sparse
+  payload + deterministic parent join) with **no** production seam wired (§15.8). The shard core
+  **does not accept B2**; the OFF/ON byte-identity gate and the 38-relation panel remain untested
+  here and unchanged at tolerance zero. No criterion was changed by this revision — only stale
+  threshold prose (`ulp_k = 4`, the recovered-Δ `1e-12` framing and an amplitude-promotion gate) was
+  reconciled to the already-accepted frozen **v2** criteria (§15.5).
+
+- **rework-11 (R40-B2-A capture-core rework-1, bounded task A), before any real R40-C outcome:**
+  after Junior reproduced five defects against the r0 core (R1 HIGH fail-open disk budget; R2 MEDIUM
+  un-verified COMMIT; R3 MEDIUM finite-input silent `inf`; R4 LOW `production_wired` semantics; R5 LOW
+  generation-integrity gaps), the core is repaired: the exact final COMMIT/total is computed before any
+  publish decision, the verifier rebuilds and checks the COMMIT + index identity + shard set, float/int
+  representability is enforced on the encoded array, and `production_wired` is an explicit default-strict
+  parameter (§15.8). Re-run: focused **128 passed**, combined regressions **417 passed**. The shard core
+  still **does not accept B2**; no criterion was changed and the OFF/ON zero-tolerance gate was untouched.
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -1054,9 +1087,13 @@ package closes. Every review round was
 code-level: the v2 reserved cohort has **never** been evaluated and is still fresh.
 **The freeze-closure package does not evaluate the v2 cohort and does not authorize R40-B2.**
 
-> **R40-B2 is NOT authorized.** Nothing here authorizes B2, C, D, Windows/Zealfie, LP341, any
-> correction, or any product/GUI/config/default change. The OFF/ON byte-identity gate is
-> preserved **verbatim** and was not calibrated, widened or reinterpreted.
+> **R40-B2 implementation is authorized by the terminal v2 accept (§15.7); nothing else here is.**
+> The freeze-closure revision below authorized no B2 (it evaluated no v2 outcome). The separate
+> `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission has since executed the reserved v2 cohort exactly once and
+> returned **ACCEPT** (`r40b2_implementation_authorized=true`). Nothing here (or there) authorizes
+> C, D, Windows/Zealfie, LP341, any correction, or any product/GUI/config/default change. The
+> OFF/ON byte-identity gate is preserved **verbatim** and was never calibrated, widened or
+> reinterpreted.
 
 > **Non-final artifact notice.** Prevalidation artifact bindings include the repository HEAD and
 > the code identity. **Committing the current working tree moves HEAD**, so this artifact is
@@ -1184,11 +1221,126 @@ regenerations.
   It is **not** a Windows816 causal claim and no R39 observed value was used as a target.
 - The I1b arm uses bounded synthetic patches as a two-cell proxy for the relation geometry; the
   product ROI path remains **`B2_MANDATORY`** and unproven until B2.
-- The v2 reserved cohort is **fresh and unconsumed** (`generator_invoked=false`,
-  `outcomes_present=false`, `validation_runs=0`, no claim/completed marker anywhere) and must be
-  validated **exactly once** by a new, separately preregistered mission.
+- The v2 reserved cohort was **fresh and unconsumed** (`generator_invoked=false`,
+  `outcomes_present=false`, `validation_runs=0`, no claim/completed marker anywhere) **at the
+  freeze-closure revision**. It has since been evaluated **exactly once** by `ZM-ZEGRID-R40-B1V-ONE-SHOT`
+  → terminal **ACCEPT** (§15.7). The cohort is now **CONSUMED / `COMPLETED`** and **must never be
+  re-invoked**; its bundle, result and markers are immutable.
 - **R40-C/R40-D remain `NOT_RUN` / `NOT_AUTHORIZED`** and still require the HUMAN_GATE.
-- **Next safe sequence:** accept the repaired tool/tests/doc → (only if authorized) commit
-  locally (HEAD moves) → **re-issue the prevalidation bundle against the new HEAD and re-verify**
-  → independent review of that artifact → **only then** open the separate one-shot validation
-  mission. **No B2 authorization is granted here.**
+- **Next safe sequence:** the freeze-closure tool/tests/doc were accepted and committed; the
+  prevalidation bundle was re-issued against the new HEAD; the separate one-shot validation mission
+  executed the reserved v2 cohort exactly once → **terminal ACCEPT** (§15.7). **R40-B2
+  implementation is authorized** and its bounded task A is **DONE** (§15.8); **B2 acceptance still
+  requires** the production seam wiring + the exact OFF/ON byte identity + the injected-effect
+  recovery re-proof + the real product ROI parity.
+
+### 15.7 R40-B1 v2 one-shot validation — terminal ACCEPT (cohort CONSUMED)
+
+**Mission** `ZM-ZEGRID-R40-B1V-ONE-SHOT` · **phase** `review-0` · **status**
+**`B1_VALIDATION_ACCEPTED`** · **`r40b2_implementation_authorized = true`** · **branch** `beta` ·
+**HEAD** `61c4aa50f18881ad624b0ecf55df9b049eb56ecb` (4 local commits ahead of `origin/beta`, **not pushed**).
+
+The v2 reserved cohort was executed **exactly once** against the accepted freeze-closure bundle
+(`r40b1_v2_prevalidation.json`, unchanged) and returned **18/18 `observed == expected`**, 0 failures.
+The independent review (`ZM-ZEGRID-R40-B1V-ONE-SHOT.nono.r0.md`) returned **ACCEPT — 0 HIGH, 0 MEDIUM,
+0 blocking LOW**. The cohort is **CONSUMED / `COMPLETED`** and is **never** re-invoked; its bundle,
+result, claim/completed markers and state directory are **immutable**.
+
+| Frozen terminal identity | Value |
+|---|---|
+| result artifact | `.a2a-reports/ZM-ZEGRID-R40-B1-SYNTH-CALIB/r40b1_v2_validation_result.json` |
+| result bytes / SHA-256 | `40 965` / `d597cd1d67b0cd91593e1da777ed2dde4ff0105864cecd63fbfe259d327ab474` |
+| result `content_sha256` | `4d206188788d42605fca7bd235680992ff794e1378099de6425ef6728c4cf3df` |
+| `b1_status` / `status` / `runs` | `B1_PASS` / `VALIDATED` / `1` |
+| claim id / state | `c965187cd826ade68c556a59e1f9373d5a4dc500` / `COMPLETED` (result sha = file sha) |
+| protocol SHA-256 | `d689b2d78cebebad0222f503f804a8d6c9a2bf60316c88067b1851e1a447ffa7` |
+| criteria SHA-256 | `67be63e4423f782646f71bc350be5ff5a33a2007b67f0999a76a841154da92b9` |
+| cohort SHA-256 | `8e2ffe7026a5468546c23cc77b3ab3acb03fe62bb2383ab0316a60127b4a3743` |
+| `code_identity_sha256` | `10416290fd4d699d92a94c9be518283d5f97b26e33a14aaa36673d682063ec64` |
+| `baseline_head` / `repo_head` | `50b30ebd7909a246160b59ff1111794b903c796c` / `61c4aa50f18881ad624b0ecf55df9b049eb56ecb` |
+| `admission_router` | `h4_admit with the bound frozen snapshots` |
+
+**Limits carried forward (unchanged).** This is a **synthetic-only** validation of the instrument and
+the frozen rules — it is **not** evidence of any Windows816 mechanism, product or product causality.
+**Product ROI parity** and the **exact OFF/ON science/coverage/aesthetic array + FITS byte-identity
+gate** remain **`B2_MANDATORY`** and are **not** proven by it.
+
+### 15.8 R40-B2-A capture-core — implementation status (bounded task A)
+
+**Mission** `ZM-ZEGRID-R40-B2-A-SHARD-CORE` · **phase** `implementation` · **branch** `beta` · **HEAD**
+`61c4aa50f18881ad624b0ecf55df9b049eb56ecb` (unchanged) · **commit created** `NO` · **push** `NO`.
+
+Bounded task A implements the reusable **default-OFF** capture data contract and the **bounded atomic
+shard-generation core** on **synthetic / in-memory fixtures only**, without wiring the production seam.
+
+| Added (untracked, no commit) | Purpose |
+|---|---|
+| `src/zemosaic/core/zegrid/r40_capture.py` | capture core (§3/§6/§8 mechanics; not imported by the package init) |
+| `tests/test_zegrid_r40_capture_core.py` | focused synthetic tests |
+
+**Implemented contract coverage (task-A items 1–11).** (1) explicit default-OFF config with strict-bool
+validation and zero-I/O construction/import; (2) versioned little-endian fixed-width C-order record
+dtype + relation headers (M3 pre `f32`/post `f64`, M6 `int64`, coordinates `int32`, bool validity, `f64`
+support/weights/ramps), no pickle/object dtype; (3) the frozen §3 sample key and domain-tagged pair-set /
+candidate-set digests; (4) atomic bounded generation writer (fresh generation dir, one shard per
+relation, strict-JSON index, per-shard count/bytes/SHA-256, per-shard fsync, **COMMIT last**, dir fsync);
+(5) conservative hard disk budget checked before **and** during writes, refusal leaves no COMMIT, partial
+cleaned or quarantined, committed generations never overwritten; (6) fail-closed path safety (traversal,
+symlinked components/targets, protected roots, non-fresh destination) and a non-mutating, prose-aware
+privacy boundary that fires **before** COMMIT; (7) strict finite JSON, NaN/Inf refused (never coerced);
+(8) fail-closed identity checker over every §6.2/§8.7 field incl. the terminal B1 v2 protocol/criteria/
+result/claim bindings; (9) stale-invalidation / exact-resume primitive (checkpoint between completed
+relation shards only; mismatch ⇒ `STALE_INVALIDATED`; no final COMMIT while partial); (10) additive
+`r40_diagnostic_capture` manifest-link builder proving all pre-existing fields canonical-identical
+ON/OFF (never a whole-manifest byte-identity claim); (11) validated sparse worker-payload structures and
+pure deterministic parent-join helpers (no full E7–E9 plane retention) — **`_assemble_per_cell_feathered`
+is NOT wired**.
+
+**rework-1 (corrective iteration 1, `ZM-ZEGRID-R40-B2-A-SHARD-CORE`).** Junior reproduced five
+defects against the r0 core (synthetic fixtures only); all are fixed and covered by focused tests:
+
+- **R1 (HIGH) — disk budget was fail-open.** The final `check_disk_budget` used the *pre-final* COMMIT
+  bytes while the COMMIT payload was then mutated (adding `index_sha256`), so a published generation
+  could exceed `disk_budget_bytes` yet return `COMMITTED`. **Fixed:** the FINAL COMMIT bytes (with the
+  bound index digest) and the exact final published total are computed **before any publish/layout
+  decision**; the exact total is refused before anything is written, the mid-write checks are exact, and
+  the writer asserts the published total ≤ budget. Observed before: budget `6320` → published `6406`,
+  `COMMITTED` (exceeded). After: exact-fit publishes, one byte under refuses with **no COMMIT**.
+- **R2 (MEDIUM) — `verify_generation` did not verify COMMIT contents.** A tampered COMMIT verified
+  `ok=True`. **Fixed:** the verifier rebuilds the expected COMMIT from the index and refuses any
+  mismatch of `schema`/`schema_version`/`mission`/`capture_id`/`capture_stage`/`identity_digest`/
+  `n_shards`/`n_records`/`shard_bytes`/`index_sha256`, and rejects unknown/extra COMMIT fields.
+- **R3 (MEDIUM) — a finite input could be stored non-finite.** `<f4`/`<f8` inputs were validated as
+  finite Python floats, so a finite out-of-range double (e.g. `sci_u_pre=1e300`) was silently downcast to
+  `inf`, and an int out of int64 range raised a raw `OverflowError`. **Fixed:** every float field is
+  refused (typed) when it cannot be represented finitely in the frozen dtype; int fields are range-checked
+  (typed refusal, no silent wrap/narrow); the ENCODED structured array is re-checked with
+  `assert_finite_array` (extended to structured dtypes) before returning.
+- **R4 (LOW) — `production_wired` semantics.** `check_capture_identity` hard-required `False`. **Fixed
+  without weakening:** the expected value is now an explicit, documented, default-strict parameter
+  `expected_production_wired=EXPECTED_PRODUCTION_WIRED (False)`, threaded through the digest, writer,
+  checkpoint/resume and verifier. The default-OFF core stays strict; the later wired seam must pass
+  `True` explicitly (nothing is wired here).
+- **R5 (LOW) — generation-level integrity gaps.** **Fixed:** the verifier re-checks the index's own
+  identity digest (`sha256_payload(identity, IDENTITY_TAG)`), the capture-id/production-wired consistency,
+  the shard set (`n_shards`/`n_records`/`shard_bytes` vs the listed entries), and flags any file present
+  in the committed generation dir that the index does not list.
+
+**Validation (executed, observed; rework-1 re-run).**
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest tests/test_zegrid_r40_capture_core.py -W error -q -p no:cacheprovider` | **128 passed** |
+| `python3 -m pytest tests/test_zegrid_r37d_diagnostic_capture.py tests/test_zegrid_r37e_capture_runner.py tests/test_zegrid_r38a_causal_probe.py tests/test_zegrid_r39a_spatial_residual.py tests/test_zegrid_r40b1_synthetic_calibration.py -W error -q -p no:cacheprovider` | **417 passed** |
+| `python3 -m py_compile src/zemosaic/core/zegrid/r40_capture.py tests/test_zegrid_r40_capture_core.py` | OK |
+| `git diff --check` | clean |
+
+*(The r0 run reported the same five regression files as two groups; a first combined re-run showed
+4 failed / 47 errors, which did **not** involve the unreferenced capture core and did **not** recur on a
+clean re-run — the final observed combined result is **417 passed**.)*
+
+> **The shard core alone does NOT accept B2.** Production seam wiring (sparse worker→parent extraction),
+the **exact OFF/ON science/coverage/aesthetic array + FITS byte identity (tolerance exactly `0`)** and the
+38-relation panel OFF/ON qualification, the injected-effect recovery re-proof and the **real product ROI
+parity** are all **`NOT_RUN`** in task A and remain **`B2_MANDATORY`**. The OFF/ON gate is untouched at
+tolerance zero. `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.
