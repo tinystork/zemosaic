@@ -64,7 +64,8 @@ conditioning must never reach intervention-level `CONTROLLED_EFFECT`), the recor
 dimension inconsistency (one coherent `relation × channel × global-pixel` unit), the
 reprojection-oracle defect (exact existing production/oracle symbols only, no
 higher-order kernel), the zero-influence/manifest contradiction (one additive
-`r40_diagnostic_capture` block with all pre-existing fields canonical-identical), the
+`r40_diagnostic_capture` block; pre-existing manifest fields canonical-identical **for
+plan-independent product/metadata** — later scoped by rework-16, §8 clause 3), the
 unsupported `≤1e-12` threshold (bit-identical recomputation or a synthetic-calibrated
 tolerance frozen in a pre-real revision), and factual/wording fixes (uncapped R37E
 illustration, read-only source roots vs writable fresh output, split R40-B stage, H3/H5
@@ -771,15 +772,42 @@ A future R40-B2 capture must satisfy, and prove, all of:
    for the same inputs and seeds — **tolerance exactly `0`, frozen now in this section, and
    never calibrated, widened or relaxed** (this safety gate is **not** a synthetic-calibrated
    threshold).
-3. **Manifest scheme (one truthful design, used consistently).** The diagnostic is
-   recorded as **exactly one additive block** `r40_diagnostic_capture` (mirroring the
-   accepted R37-D `r37_diagnostic_capture` cross-link), and **all pre-existing manifest
-   fields must be canonical-identical** (same keys, same values, same serialisation) ON vs
-   OFF. The capture artifact is cross-linked to the manifest on the frozen identity keys
-   (`capture_id`, `filename`, `sha256`, `bytes`) exactly as the accepted R38/R39
-   `manifest_links_artifact` rule requires. **The manifest must never be claimed
-   byte-identical**; only the science/coverage/aesthetic arrays and FITS are byte-identical,
-   and only the pre-existing manifest fields are canonical-identical. (Alternative, if ever
+3. **Manifest scheme (one truthful design, used consistently; wording scoped by rework-16,
+   no obligation or tolerance changed).** The diagnostic is recorded as **exactly one
+   additive block** `r40_diagnostic_capture` (mirroring the accepted R37-D
+   `r37_diagnostic_capture` cross-link) **ON and NONE OFF**; **the manifest is never claimed
+   byte-identical** — not as a whole, not as a claim of any kind. The **load-bearing
+   obligation is UNCHANGED and EXACT** (identical to clause 2): the science, coverage and
+   aesthetic **arrays**, the science/coverage/aesthetic **FITS bytes**, and **any other
+   product array artifact emitted** must be **exactly byte-identical** ON vs OFF at
+   **tolerance exactly `0`** — **never** calibrated, widened, relaxed or reinterpreted, here
+   or anywhere else. The capture artifact is cross-linked to the manifest on the frozen
+   identity keys (`capture_id`, `filename`, `sha256`, `bytes`) exactly as the accepted
+   R38/R39 `manifest_links_artifact` rule requires. **Canonical projection.** Every
+   pre-existing manifest field that is **plan-independent product/metadata** must be
+   **canonical-identical** (same keys, same values, same serialisation) ON vs OFF. The
+   manifest's inherently **run-volatile observability** fields are **exactly enumerated and
+   excluded** from that canonical projection: **(a)** wall timing and **RSS** measurement
+   leaves; and **(b)** the **environment-driven scheduler plan** — per-cell `mode`, per-cell
+   footprint bytes (`per_cell_footprint_bytes`), concurrency / plan candidates
+   (`cells_in_flight`, `plan_candidates`), executor and worker counts (`executor`, `workers`,
+   `cache_build_workers`, `cache_workers_per_cell`), the reprojection path/counters, and the
+   RAM-budget / available-memory figures (`available_bytes`, `ram_budget_bytes`) — **plus the
+   per-cell `mode` / `bound_bytes` the planner stamps into each cell record**. These are pure
+   functions of the free RAM sampled at plan time, so they differ between **any** two
+   sequential runs (even OFF vs OFF); that is a **measured** fact, not an exemption. Nothing
+   else is run-volatile, and **nothing in this list may be widened by assertion**.
+   **Completeness is evidence-backed, never assumed.** The exclusion set is complete **only**
+   as proven by measurement: **every** leaf that differs between **two capture-OFF runs** AND
+   between runs with **forced different plans** must be **classified** volatile, and a focused
+   test **MUST fail loudly** on any **unclassified** differing leaf (it may **never** silently
+   normalise). Measured ON vs OFF, the **only** manifest difference beyond the single additive
+   block must lie in the enumeration above.
+   **No product field may ever be excluded.** The classifier may **never** cover a product
+   field — science / coverage / aesthetic / uint8-uint16 render, contract, layout, cell
+   product fields, or offsets. The `.cells` subtree is **never** blanket-excluded: under a
+   plan flip **only** the two plan-metadata leaf names `mode` / `bound_bytes` differ, and every
+   science/index/status/provenance per-cell field stays identical. (Alternative, if ever
    preferred: an external sidecar cross-link with **no** manifest mutation — but exactly one
    of the two designs is used, and it is stated in the capture provenance.)
 4. **Atomic, strict output (frozen shard contract).** Fixed basename; temp file in the
@@ -957,7 +985,9 @@ This section is a pointer, not a source of authority.
   correction (conditioning ≠ intervention); record-unit/dimension coherence; reprojection
   intervention restricted to existing production/oracle symbols; zero-influence/manifest
   scheme fixed to one additive `r40_diagnostic_capture` block with canonical-identical
-  pre-existing fields; `≤1e-12` removed in favour of bit-identical recomputation or a
+  pre-existing fields (**scoped by rework-16**, §8 clause 3, to plan-independent
+  product/metadata fields — the run-volatile observability fields are excluded);
+  `≤1e-12` removed in favour of bit-identical recomputation or a
   synthetic-calibrated tolerance frozen in R40-B1; factual/wording fixes; R40-B split into
   B1 (calibration/freeze) and B2 (implementation/acceptance).
 - **rework-2 (after Nono review-0: 0 HIGH / 4 MEDIUM / 3 LOW), before any real R40 outcome:**
@@ -1125,6 +1155,31 @@ This section is a pointer, not a source of authority.
   for reproducibility: focused **20 passed** (twice), combined **176 passed** (twice), regressions **417
   passed**. **No production code was changed** and no criterion was altered. **B2 acceptance is NOT
   claimed**; the OFF/ON gate stays at exactly zero.
+
+- **rework-16 (R40-B2-E contract-clarity amendment, bounded task E), before any real R40
+  outcome (and before any real R40-C outcome):** section 8 clause 3 (the manifest scheme) is
+  amended so the frozen text is **truthful and mechanically checkable**. This is a
+  **wording/contract-only** change: **no code, no test expectation and NO tolerance** is
+  touched. The literal "all pre-existing manifest fields canonical-identical ON vs OFF" claim
+  was **unsatisfiable by construction**: the pre-existing manifest embeds inherently
+  run-unstable observability fields (wall timing, RSS and the environment-driven scheduler
+  plan) that differ between **any** two sequential runs — even OFF vs OFF — as measured in
+  §15.11. It is replaced by a **scoped** statement: **(i)** the load-bearing product obligation
+  is restated **unchanged and exact** (science/coverage/aesthetic arrays + FITS bytes, plus any
+  other product array artifact emitted, exactly byte-identical ON vs OFF at **tolerance exactly
+  `0`**, never calibrated/widened/relaxed/reinterpreted); **(ii)** exactly one additive
+  `r40_diagnostic_capture` block ON and none OFF, with **no** whole-manifest byte-identity
+  claim; **(iii)** every **plan-independent product/metadata** pre-existing field
+  canonical-identical ON vs OFF; and **(iv)** the explicitly enumerated **run-volatile
+  observability** fields (wall timing; RSS; environment-driven scheduler plan: per-cell `mode`,
+  per-cell footprint bytes, concurrency/plan candidates, executor/worker counts, reprojection
+  path/counters, RAM-budget and available-memory figures, and the per-cell `mode`/`bound_bytes`
+  the planner stamps) excluded from the canonical projection, with completeness
+  **evidence-backed by measurement** (two OFF runs and a forced plan flip) and a focused test
+  that **fails loudly** on any unclassified differing leaf; **no product field may ever be
+  excluded**. Cross-references (§0 rework-1; §14 rework-1; §15.8; §15.9; §15.11) are
+  reconciled to the scoped wording. **No tolerance was changed** anywhere; the OFF/ON gate
+  stays at exactly `0`. **B2 acceptance is NOT claimed**; `R40-C`/`R40-D` remain `NOT_RUN`.
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -1353,8 +1408,9 @@ privacy boundary that fires **before** COMMIT; (7) strict finite JSON, NaN/Inf r
 (8) fail-closed identity checker over every §6.2/§8.7 field incl. the terminal B1 v2 protocol/criteria/
 result/claim bindings; (9) stale-invalidation / exact-resume primitive (checkpoint between completed
 relation shards only; mismatch ⇒ `STALE_INVALIDATED`; no final COMMIT while partial); (10) additive
-`r40_diagnostic_capture` manifest-link builder proving all pre-existing fields canonical-identical
-ON/OFF (never a whole-manifest byte-identity claim); (11) validated sparse worker-payload structures and
+`r40_diagnostic_capture` manifest-link builder proving pre-existing fields canonical-identical
+ON/OFF **for plan-independent product/metadata** (run-volatile observability excluded — scoped by
+rework-16, §8 clause 3; never a whole-manifest byte-identity claim); (11) validated sparse worker-payload structures and
 pure deterministic parent-join helpers (no full E7–E9 plane retention) — **`_assemble_per_cell_feathered`
 is NOT wired**.
 
@@ -1431,7 +1487,8 @@ final-product FITS read) and reuses the production `shared_valid_mask` / `apply_
 semantically unchanged and the two captures are independent; (4) fail-closed identity / mandatory-observable
 / budget / privacy / path / write refusals publish NO artifact and never alter the assembly result;
 (5) exactly ONE additive `r40_diagnostic_capture` manifest block cross-linked on the frozen identity keys
-(`capture_id`, `filename`, `sha256`, `bytes`), all pre-existing manifest fields canonical-identical ON/OFF,
+(`capture_id`, `filename`, `sha256`, `bytes`), all plan-independent product/metadata pre-existing manifest
+fields canonical-identical ON/OFF (run-volatile observability excluded — scoped by rework-16, §8 clause 3),
 and **no** new field when OFF (never a whole-manifest byte-identity claim); (6) bounded RAM/disk through the
 accepted core.
 
@@ -1628,7 +1685,8 @@ STREAM and a pinned INMEM budget) the **only** pre-existing manifest fields that
 genuine wall-timing / RSS measurement leaves; no science, coverage, aesthetic, contract, cell, layout or
 offset field changes.
 
-**Corrected, narrower claim (rework-1).** The §8.2 clause-3 phrase "all pre-existing manifest fields
+**Corrected, narrower claim (rework-1; now formally amended into the frozen clause by rework-16, §8
+clause 3).** The §8 clause-3 phrase "all pre-existing manifest fields
 canonical-identical" is NOT literally satisfiable on a shared host, because the manifest's pre-existing
 *observability* fields are functions of the environment and change between ANY two sequential runs. The
 honest, proven claim is: **(i)** the load-bearing science/coverage/aesthetic/uint16 ARRAY + FITS BYTES are
