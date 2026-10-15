@@ -738,7 +738,7 @@ claim the whole product RAM is `O(records)`.
 | **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
 | **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; the v2 reserved cohort was evaluated EXACTLY ONCE by the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission → terminal **ACCEPT** (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`** (§15.7). | **DONE / terminal ACCEPT** (v1 invalidation history preserved byte-for-byte, §15.1) |
 | **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
-| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); **acceptance NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run remain `NOT_RUN`. The **run-volatile-classifier completeness proven by measurement** is now a **frozen B2 acceptance criterion** (§8 clause 12); the synthetic 38-relation panel OFF/ON qualification is **MEASURED** (§15.12); the **exact §1.3 held-out intersection is now IMPLEMENTED and MEASURED** and the **injected-effect recovery is RE-PROVEN under the accepted frozen B1 v2 criteria snapshot** on fresh disposable fixtures, with BOTH the candidate-set and pair-set digests bound to the frozen rule (`ZM-ZEGRID-R40-B2-G`, §15.13) — but the **real product ROI parity** and a **real Windows run** remain `NOT_RUN`, so B2 is still **NOT accepted** |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); **acceptance NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run remain `NOT_RUN`. The **run-volatile-classifier completeness proven by measurement** is now a **frozen B2 acceptance criterion** (§8 clause 12); the synthetic 38-relation panel OFF/ON qualification is **MEASURED** (§15.12); the **exact §1.3 held-out intersection is now IMPLEMENTED and MEASURED** and the **injected-effect recovery is RE-PROVEN under the accepted frozen B1 v2 criteria snapshot** on fresh disposable fixtures, with BOTH the candidate-set and pair-set digests bound to the frozen rule (`ZM-ZEGRID-R40-B2-G`, §15.13) — and the **real product ROI parity (I1a/I1b/I2) is now PROVEN on the real product ROI path** under the frozen criteria on synthetic prepared-source fixtures (`ZM-ZEGRID-R40-B2-H`, §15.14) — but a **real Windows run** remains `NOT_RUN`, so B2 is still **NOT accepted** |
 | **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
 | **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
 | **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
@@ -1241,6 +1241,29 @@ This section is a pointer, not a source of authority.
   clause-2 zero-tolerance OFF/ON gate stays at exactly `0`; the capture stays **default-OFF**.
   **B2 acceptance is NOT claimed** and the real product ROI parity, a real Windows run, R40-C/D
   and HUMAN_GATE remain **`NOT_RUN`**.
+- **rework-19 (R40-B2-H real-product-ROI-path parity, bounded task H), before any real R40
+  outcome (and before any real R40-C outcome):** the frozen §15.5-4 / §5.2-§5.3
+  reprojection-intervention parity is re-proven **on the product's ACTUAL source-ROI reprojection
+  code path** rather than on a tool-side arm: the crop arm is
+  `execution.build_patch_contributors` -> `execution._read_section_chw` (real prepared-FITS section
+  read) -> `execution.slice_wcs` -> `execution.reproject_cropped`, the reference arm is the
+  §5.2-named `execution.reproject_full_source`, the I2 fast arm is
+  `execution.reproject_cropped_fast`, and the I1b coverage delta is propagated through the REAL
+  product canonical stack (`canonical_engine.run_canonical_stack`) plus the frozen R34c additive
+  offsets. Measured (synthetic prepared-source fixtures only, no real data): **I1a** common-support
+  parity **BIT-IDENTICAL, tolerance exactly `0`** on TAN and non-TAN, with the crop byte-identical
+  to the same prepared source's section; **I2** same-array fast-vs-reference parity **BIT-IDENTICAL,
+  tolerance exactly `0`**, and the **ineligible non-TAN case reported `NOT_APPLICABLE` and NEVER
+  counted as a pass**; **I1b** coverage delta through the real canonical stack with
+  **`min reduction ≥ 0.20`** on TAN and non-TAN with **independent** relations (production support a
+  strict subset of the full-source support), with refusal paths (insufficient patches / insufficient
+  independent relations / non-subset support / below-gate reduction) that return
+  `NOT_IDENTIFIABLE` and never a default pass. This **discharges the `product_roi_parity =
+  B2_MANDATORY` obligation by measurement**; the status is recorded truthfully in §15.5-3, the §7
+  `R40-B2` row and §15.14. **No tolerance, threshold or gate is changed** (the §8 clause-2 OFF/ON
+  gate stays at exactly `0`), **no production source file is changed** (one new test file only) and
+  the capture stays **default-OFF**. **B2 acceptance is NOT claimed**: a real Windows run, `R40-C`,
+  `R40-D` and `HUMAN_GATE` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -1371,6 +1394,13 @@ regenerations.
 3. **ROI-shadow parity** — pointwise/local frozen inputs = **BIT_IDENTICAL, tolerance `0`**; any
    ROI-recomputed Cell-global quantity = **`NOT_IDENTIFIABLE`**. `ORCHESTRATION_ONLY`: **product
    ROI parity remains `B2_MANDATORY`**.
+   *Status note added by bounded task H (§15.14); the criterion above is UNCHANGED and was NOT
+   relaxed, widened or reinterpreted.* The `B2_MANDATORY` product-ROI obligation is now
+   **DISCHARGED BY MEASUREMENT on the real product ROI path** (product symbols only, synthetic
+   inputs): I1a common-support `tolerance 0` **BIT-IDENTICAL**, I2 same-array `tolerance 0`
+   **BIT-IDENTICAL** with ineligible cases **`NOT_APPLICABLE`** (never counted as a pass), I1b
+   coverage delta through the **real canonical stack** with `min reduction ≥ 0.20` on TAN and
+   non-TAN with independent relations. A **real Windows run** and `R40-C`/`R40-D` remain `NOT_RUN`.
 4. **Reprojection intervention** — I1a parity `tolerance 0`; I2 same-array parity `tolerance 0`;
    **I1b coverage delta through the real canonical stack with `min reduction ≥ 0.20` on TAN and
    non-TAN, requiring independent relations**; only I2's fast path may be `NOT_APPLICABLE`.
@@ -1398,7 +1428,9 @@ regenerations.
 - Synthetic qualification validates the instrument, the frozen rules and the real primitive arms.
   It is **not** a Windows816 causal claim and no R39 observed value was used as a target.
 - The I1b arm uses bounded synthetic patches as a two-cell proxy for the relation geometry; the
-  product ROI path remains **`B2_MANDATORY`** and unproven until B2.
+  product ROI path remains **`B2_MANDATORY`** and unproven until B2. *(Bounded task H (§15.14) later
+  DISCHARGED that obligation by measurement: I1a/I1b/I2 are now proven on the real product ROI path
+  under synthetic inputs. The B1 arm's proxy statement is left as the historical B1 record.)*
 - The v2 reserved cohort was **fresh and unconsumed** (`generator_invoked=false`,
   `outcomes_present=false`, `validation_runs=0`, no claim/completed marker anywhere) **at the
   freeze-closure revision**. It has since been evaluated **exactly once** by `ZM-ZEGRID-R40-B1V-ONE-SHOT`
@@ -1944,3 +1976,49 @@ digests to the frozen rule, and RE-PROVES the injected-effect recovery under the
 criteria digest on fresh disposable data. The **real product ROI parity (I1a/I1b/I2 through the real ROI
 path)**, a **real Windows run**, `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` and **B2 acceptance** remain
 **`NOT_RUN` / `NOT_AUTHORIZED`**.
+
+### 15.14 R40-B2-H real-product-ROI-path parity I1a/I1b/I2 — implementation status (bounded task H)
+
+**Mission** `ZM-ZEGRID-R40-B2-H-ROI-PARITY` · **phase** `implementation` · **branch** `beta` ·
+**baseline HEAD** `2fc006374d80fb4f8871b50a8c961fe7fab6712d` · **commit created** `NO` · **push** `NO`.
+
+**Feasibility verdict: PROVEN (not `NOT_RUN`).** The real product ROI path CAN be genuinely
+exercised without the real corpus: the §5.2-named product symbols take geometric/WCS inputs and
+prepared-source FITS; a SYNTHETIC prepared RGB FITS (primary HDU, float32, `NAXIS=3` CHW, plain
+2-D celestial WCS on axes 1-2) is sufficient, so no real FITS / real layout input is required. The
+verified path is the product's own code: `execution.build_patch_contributors` ->
+`execution._read_section_chw` (real section read, never a full `.data`) -> `execution.slice_wcs` ->
+`execution.reproject_cropped` (production fast/fallback dispatcher), the §5.2 full-source oracle
+`execution.reproject_full_source`, the I2 product fast primitive
+`execution.reproject_cropped_fast`, and the REAL product canonical stack
+(`canonical_engine.run_canonical_stack`) with the frozen R34c offsets
+(`cell_feather.apply_additive_offsets`). **No production source file was changed** (one new test
+file only); the capture stays **default-OFF**.
+
+**Per-arm evidence (measured; synthetic inputs only).**
+
+| Arm | Frozen rule | Observed on the product ROI path |
+|---|---|---|
+| **I1a** | common-support parity, `tolerance = 0` | **BIT-IDENTICAL** (max abs diff `0.0`) for every product contributor on **TAN** and **non-TAN**; the crop is **byte-identical to the same prepared source's section** (independent re-read); every source read is a **strict sub-rectangle** (locality) |
+| **I2** | same-array fast-vs-reference parity, `tolerance = 0` | TAN: product path `fast`; product `reproject_cropped_fast` vs `reproject_interp` on the **identical** cropped array/WCS/target/mask → **BIT-IDENTICAL** (max abs diff `0.0`). **non-TAN: `NOT_APPLICABLE`** (fallback, never counted as a pass) |
+| **I1b** | coverage delta through the real canonical stack, `min reduction ≥ 0.20`, independent relations | **RECOVERED**: `min reduction ≈ 0.567 ≥ 0.20` on **TAN** and **non-TAN**, ≥2 independent `h` and ≥2 independent `v` relations, production support a **strict subset** of the full-source support |
+
+**Ineligible / refusal paths (explicit, never a pass).** The I2 non-TAN fast-ineligibility is
+reported `NOT_APPLICABLE` with `counted_as_parity_pass = false` and produces no parity statistic;
+I1b refuses as `NOT_IDENTIFIABLE` for insufficient independent patches, for fewer than 2
+independent relations in an orientation, for a non-subset production support, and for a
+below-gate reduction. A **negative control** (a single-ULP perturbation at one common pixel) is
+**detected** (`max_abs_diff > 0`, decision `NOT_IDENTIFIABLE`), so the zero-tolerance gate is not
+vacuous. The `reduction_min = 0.20` and `relations_per_orientation_min = 2` gates are **bound in
+test to the accepted frozen source** (`INHERITED_GATES`, §6.4/§15.5-4) — never a local number.
+
+The **`product_roi_parity = B2_MANDATORY`** obligation is therefore **DISCHARGED BY MEASUREMENT**
+on the real product ROI path, and the status is recorded truthfully here, in §15.5-3 and in the §7
+`R40-B2` row. **No tolerance, threshold, gate or criterion was changed or widened**: the §8
+clause-2 OFF/ON byte identity stays at exactly `0`. The recovered/common-support diagnostic keeps
+its `ORCHESTRATION_ONLY_NON_GATING` labelling and gates nothing.
+
+> **Task H does NOT accept B2.** It proves I1a/I1b/I2 parity on the real product ROI path under the
+> frozen criteria using **SYNTHETIC** prepared-source fixtures. The **real Windows816 run**, the
+> **real-corpus layout**, `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` and **B2 acceptance** remain
+> **`NOT_RUN` / `NOT_AUTHORIZED`**.
