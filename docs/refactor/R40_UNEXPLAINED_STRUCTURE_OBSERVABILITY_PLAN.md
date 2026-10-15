@@ -738,9 +738,9 @@ claim the whole product RAM is `O(records)`.
 | **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
 | **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; the v2 reserved cohort was evaluated EXACTLY ONCE by the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission → terminal **ACCEPT** (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`** (§15.7). | **DONE / terminal ACCEPT** (v1 invalidation history preserved byte-for-byte, §15.1) |
 | **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
-| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); **acceptance NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run remain `NOT_RUN`. The **run-volatile-classifier completeness proven by measurement** is now a **frozen B2 acceptance criterion** (§8 clause 12); the synthetic 38-relation panel OFF/ON qualification is **MEASURED** (§15.12); the **exact §1.3 held-out intersection is now IMPLEMENTED and MEASURED** and the **injected-effect recovery is RE-PROVEN under the accepted frozen B1 v2 criteria snapshot** on fresh disposable fixtures, with BOTH the candidate-set and pair-set digests bound to the frozen rule (`ZM-ZEGRID-R40-B2-G`, §15.13) — and the **real product ROI parity (I1a/I1b/I2) is now PROVEN on the real product ROI path** under the frozen criteria on synthetic prepared-source fixtures (`ZM-ZEGRID-R40-B2-H`, §15.14) — but a **real Windows run** remains `NOT_RUN`, so B2 is still **NOT accepted** |
-| **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
-| **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); at that point **acceptance was NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run were still `NOT_RUN` (the first four were subsequently closed by tasks F/G/H, below). The **run-volatile-classifier completeness proven by measurement** is now a **frozen B2 acceptance criterion** (§8 clause 12); the synthetic 38-relation panel OFF/ON qualification is **MEASURED** (§15.12); the **exact §1.3 held-out intersection is now IMPLEMENTED and MEASURED** and the **injected-effect recovery is RE-PROVEN under the accepted frozen B1 v2 criteria snapshot** on fresh disposable fixtures, with BOTH the candidate-set and pair-set digests bound to the frozen rule (`ZM-ZEGRID-R40-B2-G`, §15.13) — and the **real product ROI parity (I1a/I1b/I2) is now PROVEN on the real product ROI path** under the frozen criteria on synthetic prepared-source fixtures (`ZM-ZEGRID-R40-B2-H`, §15.14) — and the **real Windows run** remains `NOT_RUN`; **R40-B2 is ACCEPTED by the product owner (Tristan) on 2026-10-15** on the basis of these §7 criteria, as **SYNTHETIC-ONLY** (no Windows/product causality claimed, no tolerance/threshold/gate changed) — §15.15 |
+| **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | **AUTHORIZED** (2026-10-15): ONE DEV Windows816 diagnostic capture on the EXACT commit `222a624c6bf9d3de7533d030242f26fa2a5c2d60`, with the EXACT commands (dry-run + execute) and a FRESH output path on the Windows host (§15.15) |
+| **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | **AUTHORIZED now** (human gate granted 2026-10-15, §15.15); runnable via the reviewed `tools/r40_capture_runner.py` on the exact commit `222a624`; offline interpretation only follows afterwards |
 | **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
 
 **Staging rule (unambiguous).** R40-B is **split**: **R40-B1 must produce frozen criteria
@@ -976,6 +976,16 @@ and a **capable host**. Until that authorization exists, R40-C is `NOT_RUN /
 NOT_AUTHORIZED` — the same status as R39-B/C/D. No full product run, release, tag or push
 is implied by any R40 gate.
 
+**2026-10-15 update (scoped).** That HUMAN_GATE has now been **granted by Tristan** for
+exactly **ONE** DEV Windows816 diagnostic capture (`DEV_NOT_QUALIFICATION`) on the exact
+commit `222a624c6bf9d3de7533d030242f26fa2a5c2d60`, with the EXACT commands (dry-run then
+execute) in §15.15, a FRESH output path on the Windows host, the source frames and the
+dataset roots read-only, and the capture **default-OFF** everywhere else. The standing
+prohibition is otherwise untouched: **no Zealfie update, no full product run**, no
+correction, no GUI/config/default change, and offline interpretation of the captured
+evidence only follows afterwards. `LP341` remains reserved and **unconsumed**; no LP pixel
+may be read in R40-C.
+
 ---
 
 ## 12. Local commit / publication status
@@ -985,8 +995,17 @@ pushed**: `597c6db` (R39 spatial residual diagnostic), `50b30eb` (R40 pre-regist
 `c8f2fd3` (R40 synthetic calibration) and `61c4aa5` (R40 bundle verification against the current
 HEAD = the terminal B1 v2 `repo_head`). The bounded `ZM-ZEGRID-R40-B2-A-SHARD-CORE` mission adds
 **two new untracked files** (`src/zemosaic/core/zegrid/r40_capture.py` and
-`tests/test_zegrid_r40_capture_core.py`) and **no** commit and **no** push. No publication,
-release, tag, deploy or remote resource is created or implied by R40.
+`tests/test_zegrid_r40_capture_core.py`) and **no** commit and **no** push. The bounded
+`ZM-ZEGRID-R40-C-PREREG-RUNNER` mission (task J) adds **two further untracked files**
+(`tools/r40_capture_runner.py` and `tests/test_zegrid_r40c_capture_runner.py`) and refreshes this
+document (§7 rows, §11, §15.15, the revision history) — again **no** commit and **no** push.
+
+**2026-10-15 status correction.** The `beta` line is no longer only-local: it has been
+**pushed**, and `origin/beta == 222a624c6bf9d3de7533d030242f26fa2a5c2d60` (verified with
+`git status -sb` / `git rev-parse`, `origin/beta..HEAD` = 0 commits). The four commits named
+above plus the later R40-B2 commits (`2f3ee77`, `5edb9d1`, `f6cbc02`, `190ab56`, `14252ff`,
+`2fc0063`, `9f51a01`, `222a624`) are all published. No publication, release, tag, deploy or
+remote resource beyond that push is created or implied by R40.
 
 ---
 
@@ -1296,6 +1315,22 @@ This section is a pointer, not a source of authority.
   tolerance, threshold or gate is changed** (the §8 clause-2 OFF/ON gate stays at exactly `0`);
   the capture stays **default-OFF**. **B2 acceptance is NOT claimed**: a real Windows run,
   `R40-C`, `R40-D`, `HUMAN_GATE` and `LP341` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.
+
+- **rework-21 (R40-C pre-registration + reviewed capture runner, bounded task J), before any real
+  R40-C outcome:** records the **product-owner ACCEPTANCE of R40-B2 (2026-10-15)** on the basis of
+  the §7 `R40-B2` acceptance criteria (A–I commits `b23fbdc`/`2f3ee77`/`5edb9d1`/`f6cbc02`/`190ab56`/
+  `14252ff`/`2fc0063`/`9f51a01`/`222a624`, plus the independent review reports), explicitly
+  **SYNTHETIC-ONLY** (no Windows/product causality, no tolerance/threshold/gate changed); and the
+  **R40-C HUMAN_GATE AUTHORIZATION** (Tristan, 2026-10-15) for **ONE** DEV Windows816 diagnostic
+  capture (`DEV_NOT_QUALIFICATION`) on the exact commit `222a624`, with the EXACT dry-run + execute
+  commands, a FRESH output path, the source frames and dataset roots read-only, the capture
+  default-OFF everywhere else, and offline interpretation only afterwards. It also adds the reviewed,
+  dry-run-by-default runner `tools/r40_capture_runner.py` (+ focused tests) that makes R40-C runnable
+  without weakening any frozen gate. **No tolerance, threshold or gate is changed** (the §8 clause-2
+  OFF/ON byte-identity gate stays exactly `0`); the capture stays **default-OFF**; `LP341` remains
+  reserved and **unconsumed**, no LP pixel may be read in R40-C, no correction/product/GUI/config
+  change is authorized, **R38 stays closed** and **R39-A remains the terminal STOP**. No R40-C outcome
+  is claimed and no Windows execution was performed. See §15.15 and the refreshed §7 rows.
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -2076,3 +2111,69 @@ threshold or gate was changed.
 > frozen criteria using **SYNTHETIC** prepared-source fixtures. The **real Windows816 run**, the
 > **real-corpus layout**, `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` and **B2 acceptance** remain
 > **`NOT_RUN` / `NOT_AUTHORIZED`**.
+
+---
+
+### 15.15 R40-B2 ACCEPTANCE + R40-C HUMAN_GATE authorization + reviewed R40-C capture runner (bounded task J)
+
+**Mission** `ZM-ZEGRID-R40-C-PREREG-RUNNER` · **phase** `implementation` · **branch** `beta` ·
+**baseline HEAD** `222a624c6bf9d3de7533d030242f26fa2a5c2d60` · **commit created** `NO` · **push** `NO`.
+
+**R40-B2 is ACCEPTED by the product owner (Tristan) on 2026-10-15**, on the basis of the plan's §7
+`R40-B2` acceptance criteria. The accepted A–I implementation commits are `b23fbdc` (B2-A default-OFF
+capture core / shard contract), `2f3ee77` (B2-B per-cell seam wiring), `5edb9d1` (B2-C real pooled
+worker→parent sparse transport), `f6cbc02` (B2-D OFF/ON product byte-identity), `190ab56` (B2-E
+contract-clarity manifest-identity scope), `14252ff` (B2-F 38-relation panel qualification + frozen
+acceptance criterion), `2fc0063` (B2-G exact §1.3 held-out selection + frozen-criteria re-proof),
+`9f51a01` (B2-H real product ROI parity I1a/I1b/I2) and `222a624` (B2-I bounded hardening). The
+independent review reports (Nono review rounds over B2-A…B2-I, including the B2-H L2/L4 and the
+B2-G LOW advisories closed by task I) are the review evidence of record.
+
+**B2 acceptance is SYNTHETIC-ONLY.** It claims **NO** Windows/product causality — the real Windows816
+run was `NOT_RUN` at acceptance time — and **no tolerance, threshold, criterion or gate is changed**
+by the acceptance: the §8 clause-2 OFF/ON byte-identity gate stays at exactly `0`, and the frozen
+§8 clause-12 run-volatile-classifier completeness criterion and the inherited §6.4/§15.5-4 support
+gates stand unchanged.
+
+**R40-C HUMAN_GATE — AUTHORIZED (Tristan, 2026-10-15).** Exactly **ONE** DEV Windows816 diagnostic
+capture (`DEV_NOT_QUALIFICATION`), on the EXACT commit `222a624c6bf9d3de7533d030242f26fa2a5c2d60`,
+with the EXACT commands (dry-run then execute) below, a **FRESH** output path on the Windows host,
+the source frames AND the dataset roots **read-only**, the capture **default-OFF** everywhere else,
+and **offline interpretation only afterwards**. Publication of the captured evidence is authorized.
+
+**Reviewed runner (this task J).** `tools/r40_capture_runner.py` (new) makes the R40 DEV capture
+runnable with EXACT, safely-validated commands, mirroring the accepted `tools/r37_capture_runner.py`
+(the R37-E runner) safety/CLI philosophy: dry-run by default (writes **nothing**); an explicit
+`--execute` gate; a **NEW/EMPTY** output dir that must not overlap the input or any baseline
+(refusing symlinks / parent traversal / non-empty destinations); `cell_gauge_mode="per_cell"`
+REQUIRED (it is the only seam carrying the R40 capture); the explicit, default-OFF seam
+`r40_seam_capture=True` / `r40_output_root=<fresh capture output path>` /
+`r40_seam_capture_disk_budget_bytes=<int>`, called DIRECTLY (no shell, no subprocess); an
+independent post-run `verify_generation(..., expected_production_wired=True)` that FAILS (non-zero)
+unless `ok is True` and `problems == []`; a strict-JSON provenance report (basenames only,
+`allow_nan=False`); and fail-closed refusal of any capped/degraded selection (`--holdout-cap`
+accepts only the UNCAPPED sentinel; the frozen gates are never weakened). It never reads the final
+product FITS (science/aesthetic/coverage) and opens no source frame. Focused tests:
+`tests/test_zegrid_r40c_capture_runner.py`.
+
+**EXACT Windows PowerShell commands** (dry-run then execute; `cd` to an ancestor of the output path
+first — the frozen capture core refuses drive-absolute capture roots, so the output path is given
+relative; adjust the drives/relative paths to the real checkout, the real Windows816 dataset root
+and a FRESH, never-reused output path):
+
+```powershell
+cd C:\Users\TRISTAN\Desktop\astrophoto
+python C:\Users\TRISTAN\zemosaic\tools\r40_capture_runner.py `
+    --input-dir "lights organized\EQ\IRCUT" `
+    --output-dir "OUT\R40C_CAPTURE_222a624"
+
+python C:\Users\TRISTAN\zemosaic\tools\r40_capture_runner.py `
+    --input-dir "lights organized\EQ\IRCUT" `
+    --output-dir "OUT\R40C_CAPTURE_222a624" `
+    --execute
+```
+
+**Invariants (unchanged).** `LP341` remains reserved and **unconsumed**; **no LP pixel may be read
+in R40-C**; **no correction/product/GUI/config change**; **R38 closed**; **R39-A terminal STOP**.
+No R40-C outcome is claimed by this task, and no Windows execution was performed. Task J creates
+**no commit and no push** (Jarvis commits and publishes after review).
