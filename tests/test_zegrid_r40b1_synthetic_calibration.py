@@ -836,7 +836,8 @@ def _preflight(bundle, specs=_DISP):
 def test_r3_preflight_accepts_a_clean_bundle(disp_bundle):
     out = _preflight(disp_bundle)
     assert out["protocol_snapshot"].verify() is None
-    assert out["code_identity"]["repo_head"] == r.BASELINE_HEAD
+    assert out["code_identity"]["repo_head"] == r._probe_repo_head()
+    assert out["code_identity"]["baseline_head"] == r.BASELINE_HEAD
 
 
 def test_r3_preflight_refuses_content_hash_tamper(disp_bundle):
@@ -1110,7 +1111,8 @@ def test_rm1_runtime_versions_are_bound_and_never_unavailable(bundle):
         assert key in vers and str(vers[key]).strip()
         assert str(vers[key]).lower() != "unavailable"
     assert vers == r.compute_runtime_versions()
-    assert bundle["code_identity"]["repo_head"] == r.BASELINE_HEAD
+    assert bundle["code_identity"]["repo_head"] == r._probe_repo_head()
+    assert bundle["code_identity"]["baseline_head"] == r.BASELINE_HEAD
     assert bundle["code_identity"]["repo_head"].lower() != "unavailable"
 
 
