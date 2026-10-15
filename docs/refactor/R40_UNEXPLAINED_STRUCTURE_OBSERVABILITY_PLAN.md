@@ -1,0 +1,942 @@
+# R40 — UNEXPLAINED_STRUCTURE observability: pre-registration (R40-A design gate)
+
+**Mission:** ZM-ZEGRID-R40-A-OBSERVABILITY-PREREG · **Phase:** implementation (docs-only)
+**Repository / branch:** `projects/zemosaic` · `beta`
+**Baseline HEAD:** `597c6dbbaca6193e6f6e75b7dc9d982ab4f4de76` (1 local commit ahead of `origin/beta`,
+not pushed)
+**Status:** PRE-REGISTRATION / DOCUMENTATION ONLY. No R40 capture, instrument, prototype,
+qualification or product change is implemented or authorized by this document.
+**Decision authority:** Jarvis Junior (architect/reviewer) after independent review;
+Tristan is the product owner and final human authority.
+
+**Relation to prior gates (stated once, unambiguously).**
+
+- R38 is **CLOSED / STOPPED** at Gate A. R38-B/C/D/E remain **NOT_RUN / NOT_AUTHORIZED**.
+- R39-A remains **terminal** at panel `UNEXPLAINED_STRUCTURE` with
+  `r39b_authorized = false`, `r39b_track = NONE`, `qualification = DEV_NOT_QUALIFICATION`,
+  `scientific_acceptance = false`. This document **does not** reopen, rename, relax or
+  relabel that hard STOP. R39-B0/B1, R39-C and R39-D remain **NOT_RUN** and are **not**
+  retroactively opened by anything below.
+- R40 is a **new, separately pre-registered sequence**. It investigates the *same*
+  `UNEXPLAINED_STRUCTURE` outcome as an honest, unexplained fact of R39 — using
+  **genuinely new observables** acquired at the in-memory pre-feather/feather boundary —
+  with its own gates. R40 does **not** claim R39 was wrong, does not tune C0–C4 post hoc,
+  and does not convert any R39 relation scalar into a causal claim.
+- **LP341 remains reserved and unconsumed.** No LP pixel may be read in any R40-A/B/C/D
+  step defined here.
+
+This document must be committed/reviewed **before** any new R40 observable is captured
+and **before** any new R40 outcome metric is computed.
+
+Label discipline (as in `R37_ARCHAEOLOGY_AND_RISKS.md` / the R39 plan): **STATIC**
+(source/contract/artifact inspection) · **DYNAMIC** (a read-only measurement actually
+executed) · **PREDICTED** (a derived quantity that is not an observation) ·
+**NOT RUN / NOT AVAILABLE** (not executed and not inferred as a pass).
+
+---
+
+## 0. Purpose and non-authorization
+
+R39-A executed the complete frozen 114/114 relation-channel panel on the exact Windows816
+DEV capture. Its best admitted bounded models (C0–C4) left **75/114 channels** and
+**31/38 relations** above the inherited `RMS0 ≤ 1.25 × σ_ref` gate, so the panel is
+`UNEXPLAINED_STRUCTURE` and the sequence is a hard STOP. The compact artifact that R39-A
+consumed persists, per relation/channel, only *sufficient statistics and paired
+held-out differences* — it carries **no per-sample nuisance covariates and no PSF data**.
+The accepted R39-A record is therefore honest but *causally blind*: it can detect and
+localize a residual, and it cannot attribute it.
+
+R40-A exists to close exactly that gap **on paper first**: it freezes, before any new
+outcome, (i) the minimal *new* observables that must be captured at the in-memory
+pre-feather/feather boundary, (ii) the controlled tests that may separate mechanism
+hypotheses without fitting any correction, (iii) a causal-attribution ladder whose top
+rung is reachable only by an exact same-input **intervention**, (iv) the sampling/split/
+hash rules, (v) the staged gates and exact STOP outcomes, and (vi) the safety contract for
+a future default-OFF, zero-influence diagnostic capture.
+
+Nothing in this document authorizes: any source/tool/test/config/GUI/manifest/FITS
+change; any correction application; any new photometric or spatial solver; any product
+run; any write under a dataset root; any Windows or Zealfie update/run; any commit,
+push, tag, release or deploy.
+
+**Rework-1 (after Junior review-0).** Corrects the causal-ladder defect (observational
+conditioning must never reach intervention-level `CONTROLLED_EFFECT`), the record-schema/
+dimension inconsistency (one coherent `relation × channel × global-pixel` unit), the
+reprojection-oracle defect (exact existing production/oracle symbols only, no
+higher-order kernel), the zero-influence/manifest contradiction (one additive
+`r40_diagnostic_capture` block with all pre-existing fields canonical-identical), the
+unsupported `≤1e-12` threshold (bit-identical recomputation or a synthetic-calibrated
+tolerance frozen in a pre-real revision), and factual/wording fixes (uncapped R37E
+illustration, read-only source roots vs writable fresh output, split R40-B stage, H3/H5
+scoping). No fact about R39 changes; documentation-only.
+
+**Rework-2 (after Nono review-0: 0 HIGH, 4 MEDIUM, 3 LOW).** Closes the four MEDIUM
+defects and folds in the three LOW advisories: (R1) per-intervention identity — I1's
+local-crop vs full-source arrays are **not** identical by construction, so I1 is split into
+fixed-common-mask numeric parity and an intended support/coverage delta, and the blanket
+"identical arrays/masks" rule is removed; (R2) M3 dtype — pre-offset `f32`, post-offset
+`f64` (the production helper casts to float64 and returns float64), identity verified on the
+f64 result with no f32 downcast, and M6 corrected to the canonical `int64`; (R3) H4 now has
+a frozen **bounded end-to-end shadow propagation** contract (per-frame delta → frozen stack
+→ same production R34c offsets → `delta_d_post`), not a raw per-frame delta claim; (R4) the
+false "read by reference at the parent seam" claim is corrected (`_stack_cell` runs in
+workers) and a frozen **sparse worker→parent IPC** design replaces full-plane forwarding.
+LOW: R40-B1 gains disjoint synthetic calibration/validation sets; the shard contract is
+specified (schema/version, dtype/endianness/order, per-shard hash, atomic multi-file
+publication, cleanup/quarantine, fail-closed paths); M1–M11 completeness applies to the core
+association capture, with the §5 H4 intervention evidence a separate conditional block. No
+fact about R39 changes; documentation-only.
+
+---
+
+## 1. Problem statement and immutable lineage
+
+### 1.1 The R39-A terminal fact this document must respect (STATIC + DYNAMIC)
+
+| Fact | Frozen value |
+|---|---|
+| R39-A implementation HEAD | `597c6dbbaca6193e6f6e75b7dc9d982ab4f4de76` |
+| R39-A durable artifact (rel. name) | `r39a_windows816.json` |
+| R39-A artifact sha256 | `a4f29611f270532f8da0a67689f6284750f740cd7324e7189d5ef59d114e6423` |
+| R39-A canonical metrics sha256 | `8a2c26e65d14a6bc44977a609a45bfccec917bc391197888b0bfbf94823a9636` |
+| tool execution status | `PASS` (operational only — every planned compact relation executed) |
+| execution completeness | `114/114`, bootstrap `B = 2000`, seed `0`, leak-free per fold |
+| `qualification` | `DEV_NOT_QUALIFICATION` |
+| `scientific_acceptance` | `false` |
+| `panel_state` | `UNEXPLAINED_STRUCTURE` |
+| `r39b_authorized` / `r39b_track` | `false` / `NONE` |
+| `causal_attribution_state` | `NOT_AVAILABLE` (every relation) |
+| `SUPPORT_NOT_AVAILABLE` | universal non-promoting caveat |
+
+Descriptive counts (reported as facts of the R39-A outcome, **never** as targets):
+
+- channels: `75/114` `UNEXPLAINED_STRUCTURE`, `39/114` `SPATIAL_STABLE`, no
+  `CURVATURE`/`CONSTANT_ONLY`/`NEGLIGIBLE`/`INCONCLUSIVE`;
+- relations (relation-first, hard single-channel override): `31/38`
+  `UNEXPLAINED_STRUCTURE` (`16 h`, `15 v`), `7/38` `SPATIAL_STABLE` (`4 h`, `3 v`);
+- among unexplained channels, best-model OOF RMS-to-`σ_ref` ratio median `2.180`,
+  range `1.253–12.945`;
+- among unexplained channels, `37/75` select `C0`; `38/75` select an **admitted**
+  `C1`/`C3` and still remain above `RMS0 ≤ 1.25 × σ_ref`; `C2`/`C4` never win or admit.
+
+**Mandatory honesty rule.** These numbers are *descriptive evidence to be explained*, not
+inputs to be tuned against. No threshold, sampling rule, cohort minimum or admission
+rule in this document may be derived from, or calibrated to, the values above.
+
+### 1.2 Immutable input lineage (the DEV corpus)
+
+The only real R39-A input, and the only real input contemplated for a future R40-C step,
+is the accepted R37E pre-offset/pre-feather capture and its manifest cross-link:
+
+| Fact | Frozen value |
+|---|---|
+| capture artifact basename | `zegrid_r37_pre_feather.json` |
+| artifact schema / version | `zemosaic.zegrid.background_diagnostics` / `r37c-1` |
+| artifact sha256 | `a260b3309c39fbfc5264cacc60ba3048c678f83cf8bf6bf9f39c94a134a84032` |
+| artifact bytes | `23 252 804` |
+| `capture_stage` | `pre_offset_pre_feather` |
+| `correction_applied` / `production_wired` | `false` / `true` |
+| source frames | `816` |
+| canvas (W×H) | `4117 × 4377` (id `e8f1877f16f8cca4`) |
+| layout | `nx = 6`, `ny = 4`, `24` cells |
+| channels / geometric relations / records | `3` / `38` (`20 h`, `18 v`) / `114` |
+| `measurement_px` / `feather_px` / `halo_px` / `block_px` | `16` / `8` / `8` / `4` |
+| `holdout_capped` | `false` (**uncapped**, `EXACT` held-out; the schema *supports* a documented per-relation cap, but **this artifact is uncapped** — its held-out evidence must never be called "capped") |
+| anchor | `r0001c0002` |
+| per-relation `n_holdout` | min `1792`, median `2857`, max `4448` |
+
+The Windows816-IRCUT evidence is **DEV / diagnostic** and its held-out support was
+**already consumed** by the R37 M0/M1 decision and again by R37/R38/R39 diagnostics. A new
+split of the *same* pixels is **not** independent qualification. R40-C can therefore only
+**diagnose** on this corpus; independent real qualification would require a new,
+independent corpus and a separate pre-registration (a reserved real corpus, LP341, remains
+untouched).
+
+### 1.3 The frozen evaluation lineage this document inherits
+
+Reused verbatim from the accepted R39 plan (no re-derivation, no re-tuning):
+
+- coordinate convention `global_canvas_normalized_[-1,1]` /
+  `pixel_centre_+0.5_global_x_from_col_y_from_row`, `X = 2(c+0.5)/W − 1`,
+  `Y = 2(r+0.5)/H − 1`;
+- relation geometry from the frozen layout (never from images): `h` boundary column
+  `b_c = (col(u)+1)·cell_w`, tangent coordinate `t = Y`, normal coordinate `n = X − X_b`;
+  `v` transposed; physical normal distance `s = n·(W/2)` for `h`, `s = n·(H/2)` for `v`;
+  measurement band `|s| ≤ 8 px`;
+- the exact integer/block inverse (round-half-up, `INV_TOL = 1e-9`, **coordinate inversion
+  only**) and the block-parity held-out predicate `bx % 2 == 1 AND by % 2 == 1`,
+  `block_px = 4`, tangent block `row // 4` for `h` / `col // 4` for `v`;
+- the post-offset paired residual sign rule
+  `d_post = holdout_diff + off_u − off_v` (per channel, from the production
+  `cell_feather.apply_additive_offsets` `science_cell += offset_cell`);
+- the inherited statistics: `σ_ref = robust_sigma` (immutable), `RMS0(e) = sqrt(mean(e²))`,
+  the `1.25 × σ_ref` absolute gate **[INH]**, `K = 4` tangent-block folds, leak-free OOF
+  bootstrap `B = 2000` seed `0`, `red_sigma ≥ 0.20` **[NEW, frozen in R39]**, support gates
+  `effective_train ≥ 256`, `tangent_blocks ≥ 8`, `normal_blocks ≥ 3` **[INH R37]**.
+
+---
+
+## 2. Evidence-availability matrix
+
+Causality here means: *is there, in the currently persisted evidence, a quantity that can
+distinguish two mechanism hypotheses at the same global pixel under a controlled
+comparison?* "→ causal?" answers only that question.
+
+| # | Observable / covariate | Currently exists? | Exact location (symbol) | → causal? |
+|---|---|---|---|---|
+| E1 | Same-global-pixel paired Cell science difference `holdout_diff` | YES (held-out subsample only) | capture `relations[*].holdout_diff` | no |
+| E2 | Paired global-pixel coordinates `holdout_xy` (normalized) | YES | capture `relations[*].holdout_xy` | no |
+| E3 | Relation scalars (`robust_sigma`, `level_mean`, `rejection_fraction`, `effective_train`, `tangent_blocks`, `normal_blocks`, `band_used_px`, `overlap_px`, `n_train`, `n_holdout`) | YES (relation level) | capture `relations[*]` | no |
+| E4 | Sufficient statistics `theta_global` / `information` / `rhs`, `local_offset_train` | YES | capture `relations[*]` | no (train side, not per-sample) |
+| E5 | Per-Cell R34c additive offsets (scalar, per cell × channel) | YES | manifest `cell_feather.offsets` | no |
+| E6 | Per-Cell `valid_mask` (bool, patch-shaped, per channel) | **NO** (dropped at capture) | in-memory only: `MiniTile.valid_mask`, `CanonicalStackResult.valid_mask` | no (absent) |
+| E7 | Per-Cell `estimator_weight_sum` (E1 pre-rejection weight sum, science-shaped) | **NO** | in-memory only: `MiniTile.estimator_weight_sum` | no (absent) |
+| E8 | Per-Cell `surviving_sample_count` (per-channel stack depth) | **NO** | in-memory only: `MiniTile.surviving_sample_count` | no (absent) |
+| E9 | Per-Cell `support_w1`, `support_w2`, `n_eff_support` (`(H,W)`, channel-invariant) | **NO** | in-memory only: `MiniTile.support_w1/2`, `n_eff_support` | no (absent) |
+| E10 | Exact deterministic per-Cell feather ramp | RECONSTRUCTIBLE (no pixels needed) | `cell_feather.feather_weight_field` (from layout/bounds/core_slice/halo) | no (predicted only) |
+| E11 | Per-Cell aggregate reprojection-path stats | YES (cell aggregate) | worker `"reproject"` ← `execution.get_reproject_path_stats()` | no |
+| E12 | Per-(frame,cell) reprojection path identity (crop vs full-source sufficiency; fast vs `reproject_interp` parity) | **measurement realizable**, not persisted | `execution.reproject_cropped` / `reproject_cropped_fast` / `reproject_full_source` / `reproject_interp` | **yes, via the §5 same-input interventions** |
+| E13 | Per-sample PSF / star-contamination diagnostics | **NO** (no PSF data at all) | absent | no (absent) |
+| E14 | Per-Cell post-feather contribution to the final pixel | **NO** (unrecoverable) | `assemble_canvas_feathered` divides out `wsum` per pixel | no (absent) |
+| E15 | Final science/coverage FITS | present in the exact run dir | `mosaic_grid_science.fits` etc. | no (feather-collapsed) |
+
+### 2.1 Why the persisted artifacts are insufficient
+
+- **Final science/coverage FITS cannot identify causality.** The feathered canvas stores
+  `Σ_c w_c · (s_c + off_c) / Σ_c w_c` per pixel; the per-Cell numerators and the exact
+  per-cell weights are **divided out and discarded**. Two different mechanisms (a support
+  edge vs a weight edge vs a true scene structure) map to the same blended pixel, and the
+  final FITS cannot recover separate Cell values — so it cannot form a same-pixel paired
+  contrast with covariate conditioning. Reading it can only ever be
+  `CONTEXTUAL_NON_CAUSAL` (as frozen in R39 §9.5).
+- **The R37/R39 compact artifacts are insufficient.** They persist relation-level scalars
+  plus a held-out paired-difference subsample (E1/E2/E3/E4). They carry **no per-sample**
+  `valid_mask`, weight sum, stack depth, support maps, or PSF (E6–E9, E13). A per-sample
+  `|e|` vs covariate contrast — the only thing that could separate "the residual tracks
+  support/weights" from "the residual is independent of support/weights" — is therefore
+  **undefined** on the existing evidence. R39 §5.3 already froze this as the universal
+  `SUPPORT_NOT_AVAILABLE` caveat; R40-A must not pretend it away.
+- **The `__zegrid_cache__` is empty** at the exact run directory, and the aligned per-frame
+  per-cell arrays were deleted after stacking (bounded-disk cleanup). So the missing
+  observables cannot be *recovered*; they must be *captured* at the moment they exist.
+
+### 2.2 What actually exists in memory at the capture point (STATIC archaeology)
+
+At the pre-offset/pre-feather assembly boundary the accepted production path already holds
+every mandatory covariate, in these exact symbols:
+
+- `zemosaic.core.canonical_engine.CanonicalStackResult`
+  (`science`, `estimator_weight_sum`, `valid_mask`, `surviving_sample_count`,
+  `support_w1`, `support_w2`, `n_eff_support`, `rejection_mask`, `provenance`) — each with
+  the documented shapes (science `(H,W,C)`; `estimator_weight_sum` science-shaped;
+  `support_w1/2`, `n_eff_support` `(H,W)` float64; `surviving_sample_count` `(H,W,C)`
+  int64);
+- `zemosaic.core.zegrid.assembly.MiniTile` — the same plane set, per Cell, with
+  `core_slice`, `reference_frame_id`, `excluded`, `frame_order`, `provenance`;
+- `zemosaic.core.zegrid.science_adapter.MiniTileScienceConfig` /
+  `MiniTileScienceResult` — the frozen stack tokens (normalization/weighting/rejection/
+  combine/taper/taper_px/taper_floor/equalize_rgb/sigma_low/sigma_high/winsor/cell_gauge_mode)
+  and the FrameId-resolved reference/exclusions;
+- `zemosaic.core.zegrid.cell_feather.feather_weight_field` — the **exact, deterministic**
+  per-Cell ramp (a pure function of `bounds`, `core_slice`, `halo_px`, `canvas_hw`; no
+  pixels);
+- `zemosaic.core.zegrid.execution` reprojection primitives — `reproject_cropped` (the
+  production entry point: fast path when eligible, `reproject_interp` fallback otherwise),
+  `reproject_cropped_fast` (bit-exact fast bilinear path), `reproject_full_source` (the
+  existing full-source **oracle reference**, used only by the oracle test), `REPROJECT_ORDER
+  = "bilinear"`, and `ReprojectPathStats`
+  (+ `reset_/get_/merge_reproject_stats`).
+
+**Cross-checked gap (must be stated, not glossed):** the feather-stage
+`cell_feather.CellPatch` currently propagates only `science`, `valid_mask` and
+`surviving` from the per-cell worker result (`zemosaic_zegrid_mode._assemble_per_cell_feathered`
+re-builds `CellPatch` from `result_by_cid[...]["patch"]`, which itself exposes only
+`science`/`valid_mask`/`surviving`). The remaining planes (E7–E9) exist **upstream** on the
+`MiniTile`/`CanonicalStackResult` but are **not** currently forwarded to the feather stage.
+A future R40-B capture therefore must **not** claim these planes are parent-visible or read
+"by reference at the seam": `_stack_cell` runs in worker processes (`zparallel.pmap` →
+`ProcessPoolExecutor`) and the parent receives only the pickled `patch` dict
+(`science`/`valid_mask`/`surviving`). The E7–E9 covariates must be **extracted sparsely
+inside the worker before IPC** (§3.1.1); forwarding the full f64 E7–E9 patch planes would
+be `O(full patch area)` of IPC and parent retention and is forbidden.
+
+---
+
+## 3. Frozen NEW observable / capture contract
+
+The capture is defined **only** at the in-memory pre-feather/feather boundary — the same
+seam as the accepted R37-D capture (inside `_assemble_per_cell_feathered`, after the
+complete `CellPatch` objects coexist and before `build_cell_offset_graph` /
+`assemble_canvas_feathered`). No capture may occur after blending (E14 is unrecoverable).
+
+**FITS / pixel scope (frozen, explicit).** R40-A and the **core association capture path**
+consume **in-memory arrays only** and perform **no** extra FITS/image read; they **never**
+read the final product FITS (`mosaic_grid_science.fits` / aesthetic / coverage). The single
+future exception is the **separately gated H4 shadow intervention** (§5.1), which
+necessarily reads only the **prepared source FITS** (`fits.open(..., memmap=True)`,
+read-only) through the existing `execution.reproject_full_source` — and **never** the final
+science/aesthetic/coverage FITS. That H4 path is `NOT_RUN`/`NOT_AUTHORIZED` now and requires
+R40-B1 + R40-B2 + the human gate (§11). **No R40-A read of any FITS/pixel has occurred.**
+
+**Record unit (frozen, one coherent unit).** The primary record is
+**`(relation, channel, global-pixel)`** — i.e. `38 relations × 3 channels × n_holdout`
+records ≈ `114 × n_holdout` pairs. Channel-dependent values are stored **per channel**;
+channel-invariant values (`support_w1/2`, `n_eff_support`, ramps) are stored **repeated per
+channel by default**, and may be factored into a `(relation, pixel)` sidecar **only if** the
+capture proves, fail-closed, that the three channels of a relation share the identical
+sample pixel set *and* identical channel-invariant plane values. Per-channel coordinates
+**can differ** across channels (each channel has its own validity/rejection and hence its
+own held-out pixels); the capture must **not** assume channel supports are identical
+without that proof. Identity/calibration items (M9–M11) are **headers** (once per relation),
+never repeated per sample.
+
+**Sample set (frozen).** For each relation × channel, the **exact** sample set already used
+by the accepted paired evidence — the deterministic block-parity held-out subsample
+(`bx % 2 == 1 AND by % 2 == 1`, `block_px = 4`) recovered by the frozen §1.3 inverse. No new
+split, no random draw, no per-pixel raster. This guarantees "same global pixels" and makes
+the capture directly comparable to `holdout_diff`.
+
+**Sample key (frozen).** A record is keyed by
+`key = sha256("zemosaic.zegrid.r40.pair.v1\n" + relation_id + "\n" + channel + "\n" + gx + "\n" + gy)`,
+where `(gx, gy)` are the recovered **global integer** pixel coordinates. Ordering is
+`(orientation, u, v, channel, gy, gx)`, strictly deterministic.
+
+### 3.1 Mandatory observables (M)
+
+Each mandatory item is required for at least one controlled test of §4; a capture missing
+any mandatory item is refused (no partial "best effort" capture is accepted as evidence).
+
+| ID | Observable | Unit / shape | Why mandatory |
+|---|---|---|---|
+| M1 | `relation_id (u,v)`, `orientation`, `channel` | header / record id | relation-first discipline; the unit of evidence is the relation, not the channel |
+| M2 | global integers `gx`, `gy` | record, int32 ×2 (per channel) | same-global-pixel pairing is the only non-tautological pairing |
+| M3 | per-Cell science at the pixel, **pre-offset** and **post-frozen-R34c-offset**, both Cells | record, pre = **f32** (original), post = **f64** (×2 stages ×2 Cells, per channel) | post-offset is the frozen residual basis; pre-offset lets the identity `d_post = diff + off_u − off_v` be re-verified fail-closed, not assumed |
+| M4 | per-Cell `valid_mask` at the pixel | record, bool ×2 Cells (per channel) | support/validity-discontinuity hypothesis (**H1**) |
+| M5 | per-Cell `estimator_weight_sum` | record, f64 ×2 Cells (per channel) | estimator-weight/survivor-discontinuity hypothesis (**H2**) |
+| M6 | per-Cell `surviving_sample_count` | record, **int64** ×2 Cells (per channel) — the canonical result dtype (narrowing is not assumed safe) | stack-depth discontinuity (**H2**) |
+| M7 | per-Cell `support_w1`, `support_w2`, `n_eff_support` | record (channel-invariant planes; repeated per channel by default, or factored to a `(relation,pixel)` sidecar once channel-identity is proven) | effective-support discontinuities (**H1/H2**); the E1 support maps the R39 artifact lacks |
+| M8 | exact feather ramp value for both Cells at the pixel (`w_u`, `w_v`) | sidecar / record, f64 ×2 | feather interaction (**H3**); from the accepted `feather_weight_field`, never re-derived |
+| M9 | reference / frame identity: `reference_frame_id` per Cell, a digest of `frame_order`, the `excluded` list | **header** (per relation) | identity + cross-link; guarantees inputs are the accepted ones |
+| M10 | frozen stack + calibration identity: `cell_gauge_mode`, normalization/weighting/rejection/combine/taper tokens, `sigma_low/high`, winsor limits, `measurement_px`/`feather_px`/`halo_px`/`block_px` | **header** (per relation / capture) | identity of coefficients/weights/exclusions; a mismatch is a hard refusal |
+| M11 | provenance binding: capture-contract version, artifact sha256/bytes, `capture_id`, source-set digest/algo, repo HEAD | **header** (capture) | fail-closed cross-link to §1.1/§1.2 |
+
+Inside the worker the covariate planes live on the in-memory `MiniTile`
+(`estimator_weight_sum`, `valid_mask`, `surviving_sample_count`, `support_w1/w2`,
+`n_eff_support`); they are never recomputed. They are **not** parent-visible (§2.2), so the
+future capture must read them **in the worker** and emit only the sparse samples of §3.1.1.
+`observe_edge` copies to float64 for its own maths, so capturing must not mutate patches,
+graph, offsets or any science array.
+
+#### 3.1.1 Sparse worker→parent IPC (frozen)
+
+- **Static geometry first.** The relation geometry and the **candidate** global coordinates
+  (per relation: the odd-block/relation-band superset that can contain the exact R37
+  held-out keys) are computed deterministically from the frozen layout **before** the
+  workers start, and passed to each worker.
+- **Per-worker extraction.** Before IPC, each worker extracts **only** the sparse candidate
+  samples of its adjacent relations from E7–E9 (and the other new planes of M3–M8) — never
+  a full f64 patch plane — and returns a **versioned sparse payload** tagged with the
+  worker's cell id and candidate-set digest.
+- **Parent join.** The parent joins the `u`/`v` payloads, applies the exact R37 held-out
+  validity/sample selection, the frozen R34c offsets and the `feather_weight_field` ramps.
+  **The exact held-out selection is recovered only through the §1.3 integer/block
+  inverse/parity fixtures, fail-closed** (never a raw floor of normalized floats); the
+  candidate-set and final pair-set digests are tied to that same frozen rule. If exact
+  held-out keys require **both** Cells, workers may return the deterministic geometry
+  **superset**; the parent fail-closed intersects/joins to the exact **uncapped** R37 keys
+  (no cap assumption).
+- **Digests.** The candidate-set digest and the final pair-set digest (§6.2) are both stored
+  and verified; a mismatch is refuse/`IDENTITY_MISMATCH`.
+- **Bounds (honest).** The existing baseline full-`science`/`valid`/`surviving` patch IPC
+  is acknowledged **product behavior** and is unchanged by R40. The **R40 incremental**
+  overhead is `O(candidate records)` (sparse samples), **not** `O(full patch E7–E9)`. The
+  plan makes no claim that the whole product RAM is `O(records)`.
+- **Synthetic tests (mandatory, R40-B2).** Windows spawn/pickling parity and the
+  deterministic parent join are exercised on the synthetic corpus: the joined sparse
+  output must equal, at the selected coordinates, a reference extraction computed
+  in-process.
+
+### 3.2 Contextual observables (C) — no promotion role
+
+| ID | Observable | Why contextual |
+|---|---|---|
+| C1 | `owner` / multi-Cell corner flag at the pixel (`assemble_canvas_feathered` `owner`) | multi-Cell corners need ≥3 contributors and are out of scope for the two-Cell tests; recorded so they can be excluded (`NOT_APPLICABLE`), never approximated |
+| C2 | per-Cell **aggregate** `ReprojectPathStats` (E11) | aggregate per cell, not per sample; usable only as a coarse covariate, never as a per-sample path identity |
+| C3 | distance `|s|` and side (`n<0`/`n>0`), tangent block id | geometric context already implied by M2; never mislabelled as support/PSF evidence |
+| C4 | `rejection_fraction`, `effective_train`, block counts | relation-level context, cohort-gated (§6), never causal |
+
+### 3.3 Explicitly excluded from the contract (not captured)
+
+- **Per-sample PSF / star diagnostics (E13)** — no PSF data exists; the scene/PSF
+  hypothesis (**H5**) is `NOT_AVAILABLE` unless a separately pre-registered, bounded
+  instrument is authorized. The capture must **not** fabricate a PSF or a star mask, and
+  distance/tangent proxies **do not** test PSF/scene causality (they are context only).
+- **Any pixel raster / cutout (E14, E15)** — refused by default. A raster would only be
+  justified to test H3 against observed post-feather pixels, which the current prohibition
+  on pixel reads and the feather-collapse (E14) both block; if ever needed it requires its
+  own pre-registration, an explicit justification, a bounded region and a bounded size.
+
+### 3.4 Deterministic offsets applied at capture (frozen)
+
+M3's pre-offset stage stores the **original float32** Cell science. M3's post-offset stage
+applies the **frozen** manifest `cell_feather.offsets` (additive-only, per channel) via the
+accepted production helper `zemosaic.core.zegrid.cell_feather.apply_additive_offsets`.
+That helper **casts its input to float64 and returns float64**
+(`a = np.asarray(science, dtype=np.float64); return a + off…`), so **post-offset science is
+f64** per Cell/channel. The capture re-verifies the identity
+`(sci_u + off_u) − (sci_v + off_v) == holdout_diff + off_u − off_v` **fail-closed**, using
+the **exact f64 helper result and operation order** — **no f32 downcast** of the post-offset
+value: it must either (a) be **bit-identical** in f64, or (b) use an explicit **ULP /
+absolute tolerance calibrated on synthetic fixtures and frozen in a pre-real revision
+(R40-B1, §7)** before any real capture. `INV_TOL = 1e-9` is a coordinate-inversion tolerance
+and **must not** be reused for science values without justification. No offset is
+re-estimated, smoothed, refined or replaced, and **no unsupported numeric tolerance may be
+smuggled in**.
+
+---
+
+## 4. Mechanism hypotheses, controlled tests, causal-attribution ladder
+
+All tests are **same-global-pixel paired**, **relation-first**, **both orientations**, and
+**do not fit any correction**. No test may add, average, normalize, smooth or model away a
+mechanism; each test only *conditions* (observational), *stratifies* (observational), or
+*intervenes* (exact same-input manipulation) on the recorded mandatories.
+
+### 4.1 Hypotheses
+
+- **H1 — support/validity discontinuity.** The residual is associated with a systematic
+  difference in `valid_mask` / `n_eff_support` across the boundary.
+- **H2 — estimator-weight / survivor discontinuity.** The residual is associated with a
+  systematic difference in `estimator_weight_sum` / `surviving_sample_count` (a
+  depth/weight edge, not a sky edge).
+- **H3 — feather-ramp interaction.** The residual is an artifact of the blend. **This
+  contract holds no observed separate post-feather Cell contribution and no final seam
+  measurement** (E14/E15), so the only available H3 quantity is the **PREDICTED**
+  arithmetic `w_u(x)·d_post(x)`; it is **association/context only** and cannot reach
+  `CONTROLLED_EFFECT`.
+- **H4 — reprojection / interpolation.** The residual is generated by the
+  crop→`slice_wcs`→`reproject_cropped` path (crop/slice coverage or fast-path numerics)
+  differing between the two Cells at the same global pixel. **This is the one hypothesis
+  with a realizable same-input intervention (§5).**
+- **H5 — scene / PSF / star contamination.** The residual is real scene structure. With no
+  PSF/star data this is `NOT_AVAILABLE`; distance/tangent proxies cannot establish it.
+
+### 4.2 Tests and their exact reach
+
+| Test | Kind | Inputs | Operation | Max reach |
+|---|---|---|---|---|
+| **T1 (H1)** | **observational conditioning** | M3, M4, M7 | paired indicator contrast, then restrict to both-valid pixels (`valid_u ∧ valid_v`) | `DETECTED_ASSOCIATION` **only** — conditioning is not an intervention |
+| **T2 (H2)** | **observational stratification** | M3, M5, M6 | stratify by `estimator_weight_sum` / `surviving_sample_count` strata fixed **before** outcome; contrast within the both-Cells-same-class stratum | `DETECTED_ASSOCIATION` **only** |
+| **T3 (H3)** | **predicted arithmetic** | M3, M8 | compare the paired residual against the **PREDICTED** imprint `w_u·d_post`; **no** post-feather pixel read | association/context **only** |
+| **T4 (H4)** | **exact same-input intervention** | §5 + §5.1 | production-vs-oracle same-input reprojection comparisons (I1a parity / I1b coverage delta; I2 fast-path parity) **propagated end-to-end through the frozen stack and the same R34c offsets** (bounded shadow, §5.1) | may reach `CONTROLLED_EFFECT` **if** the intervention is identity-proven, the propagation holds, and `delta_d_post` removes/reduces the residual under the R40-B1-frozen criteria |
+| **T5 (H5)** | context proxy | M3, C3 | residual vs distance-bin / tangent-block profile | context only; cannot exclude a mechanism |
+
+**Observational vs interventional rule (frozen).** T1/T2/T3/T5 are observational or
+predicted: however strong an association survives conditioning, it reaches **at most
+`DETECTED_ASSOCIATION`**. Survival or disappearance of an association under conditioning
+may **prioritize** hypotheses (an ordered shortlist) and must **never** be reported as an
+established cause. Only an **exact same-input intervention** (T4, §5) that changes exactly
+one target mechanism while holding every other input array / order / WCS / mask / shape
+fixed — with synthetic validation and effect criteria **frozen before** the real outcome —
+may reach `CONTROLLED_EFFECT`. A **per-frame or per-ROI reprojection difference alone is
+not** comparable to the paired residual: T4 must propagate the intervention end-to-end
+through the frozen stack and the **same** R34c offsets (§5.1) before any comparison with
+`d_post`.
+
+### 4.3 Causal-attribution ladder (frozen names, exclusive by precedence)
+
+Per relation × channel, per hypothesis, the causal state is exactly one of:
+
+1. **`NOT_IDENTIFIABLE`** — the hypothesis cannot be separated from its confounders with
+   the acquired evidence (required observable absent, or two hypotheses predict the same
+   pattern, or no same-input intervention is technically possible/bounded). *Default when in
+   doubt; also the state when a mandatory observable is missing or `NOT_AVAILABLE`.*
+2. **`DETECTED_ASSOCIATION`** — a repeatable association exists between the residual and
+   the candidate observable, **relation-first** (≥2 distinct geometric relations per
+   orientation, same explicit axis family + sign tuple), with the deterministic
+   block-bootstrap band excluding zero. **Correlation — and every observational
+   conditioning/stratification result — stops here.**
+3. **`CONTROLLED_EFFECT`** — the association is produced/removed by an **exact same-input
+   intervention/ablation** that changes **exactly one target mechanism** while every other
+   input array, order, WCS, mask and shape is held fixed, with the same relation-first /
+   ≥2-per-orientation / sign-tuple rule, and with **frozen effect criteria** (calibrated on
+   synthetic truth **before** the real outcome). On real Windows816 data this is reachable
+   **only** through T4/§5-style interventions.
+
+**Precedence / reachability rules (frozen).**
+
+- A correlation, an observational conditioning/stratification result, a predicted feather
+  imprint, a relation scalar, or a final-FITS pattern **cannot** reach `CONTROLLED_EFFECT`.
+- **A synthetic injected effect validates the instrument; it is not causal localization on
+  Windows816.** Synthetic recovery may only qualify the capture/tool (R40-B), never a
+  Windows816 mechanism.
+- A **shared-frame / shared-gauge** control is a **tautological** control (both Cells share
+  the same reference/weight frame by construction); it can never be independent causal
+  proof, and its agreement may not be counted as an intervention.
+- The three correlated channels of one relation are **never** independent relations;
+  orientation/panel aggregation counts **distinct geometric relations** only.
+- `CONTROLLED_EFFECT` localizes **one** mechanism; it is **not** a correction, not a
+  qualification, and not an authorization for any product change (§7).
+
+---
+
+## 5. Exact same-input reprojection interventions (H4)
+
+Only the **existing production/oracle symbols** are used; **no new or higher-order
+interpolation kernel** may be introduced as an oracle (a different kernel is a different
+estimator and cannot prove production causality). Identity is stated **per intervention** —
+there is **no** blanket "identical arrays/masks" rule (such a rule would make I1 impossible,
+since I1's whole point is that the local crop and the full source are different arrays).
+
+### 5.1 Bounded end-to-end shadow propagation (frozen)
+
+A per-(frame,cell) target-grid delta is **not** a Cell-stack residual, so it can never by
+itself reach `CONTROLLED_EFFECT`. The intervention must be propagated end-to-end under this
+exact contract:
+
+1. **Fixed full panel for any panel-level claim.** Use the fixed full **38-relation DEV
+   panel**. A partial subset may report **per-relation** results only and forces
+   `INCOMPLETE_PANEL` / **no panel-level `CONTROLLED_EFFECT`**.
+2. **Bounded ROIs, streaming.** Operate only on preregistered **relation-band ROIs / sample
+   tiles**, streaming the frames; **never** materialize full oracle Cells/canvas nor an
+   `N_frames × canvas` array.
+3. **One changed operation.** For every affected Cell/frame/ROI, compute the **production**
+   reprojection and the I1/I2 **oracle variant** from identity-proven the same source (as
+   applicable to the chosen intervention).
+4. **Same frozen stack.** Pass **both** variants through the **same** frozen canonical-stack
+   path/config: same frame order/reference, fixed production normalization coefficients,
+   `weight_active`/`norm_active`, frame scalar weights and exclusions. Any downstream
+   per-pixel rejection/support consequence caused by the one changed reprojection operation
+   is a **treatment mediator** and must be **reported**, not silently held equal.
+5. **Synthetic ROI-shadow proof (mandatory).** Prove on synthetic fixtures that the ROI
+   shadow output equals the corresponding **full-Cell production** output at the selected
+   coordinates **before** any real use, under an **explicit B1-frozen numerical parity
+   tolerance** (or exact bit-identity if achievable — no implicit tolerance, no silent
+   default); a parity failure is `NOT_IDENTIFIABLE`.
+6. **Same offsets, never recomputed.** Apply the **same frozen production R34c offsets** to
+   both production and shadow Cell science (offsets are **never** recomputed for the
+   oracle), then form `d_post_prod` and `d_post_shadow` on the **same global pixels** and
+   evaluate `delta_d_post` and whether the shadow **removes/reduces** the residual under the
+   **R40-B1-frozen criteria**.
+7. **No shortcut to causality.** A per-frame difference alone **cannot** reach
+   `CONTROLLED_EFFECT`; a mere matching sign/axis is **insufficient**.
+8. **Fail-closed.** Any input/ROI/stack parity failure or incomplete propagation ⇒ H4
+   `NOT_IDENTIFIABLE`/`NOT_AVAILABLE`.
+9. **Bounds measured, not asserted.** Practical runtime/disk bounds must be **measured** and
+   accepted **synthetically** (R40-B2) **before** the human gate. **No actual intervention
+   is run now.**
+
+### 5.2 I1 — crop/slice sufficiency (split into two sub-comparisons)
+
+I1 compares the **local production path** `execution.reproject_cropped` (fast path when
+eligible, `reproject_interp` fallback otherwise) against the existing full-source **oracle
+reference** `execution.reproject_full_source`.
+
+- **Per-intervention identity (I1).** The **cropped** array must be **byte-identical to the
+  corresponding section of the same prepared full source** (same source file/section, exact
+  source digest, the exact `slice_wcs` mapping the crop bounds, same **target WCS/shape**,
+  frozen `REPROJECT_ORDER = "bilinear"`). The cropped and full arrays are **not** identical
+  **by construction** — that difference is the intervention, not a violation.
+- **I1a — common-valid-support numeric parity.** With a **fixed common valid mask** (the
+  intersection of the two paths' valid supports, computed once and frozen), require the
+  bilinear outputs to agree on that mask within the R40-B1-frozen tolerance. The mask is
+  **held fixed** here; this is a pure numeric-parity test.
+- **I1b — support/coverage delta (the intended intervention).** Report the **mask
+  difference** itself: where the crop path marks a target pixel invalid (or valid) while the
+  full-source path differs, and whether that coverage delta is the mechanism. Here the mask
+  difference is the **treatment**, not a violation. Pixels outside the common support are
+  `NOT_APPLICABLE`.
+
+### 5.3 I2 — fast-path numerical parity (where applicable)
+
+Compare `execution.reproject_cropped_fast` against `reproject_interp` on the **exact same
+cropped array**, the **same WCS**, `order = REPROJECT_ORDER`, the **same target shape**, and
+the **same mask** (identity is fully required here — only the code path varies). This
+isolates the R21 fast-path numerics (bit-exact by design on plain undistorted TAN).
+SIP/distorted/non-TAN cases for which the fast path is ineligible are reported **separately
+as `NOT_APPLICABLE`/fallback**, never merged into the parity statistic.
+
+### 5.4 What each intervention isolates / constraints
+
+- I1a isolates **numeric parity** on the common support; I1b isolates the **crop/slice
+  coverage** delta (the intervention).
+- I2 isolates the **fast-path vs `reproject_interp`** numerical difference only.
+- Neither isolates a **true scene** difference (H5) or a **blend** difference (H3); those
+  remain context/`NOT_AVAILABLE`.
+- **Input identity that *can* be required** (same prepared source bytes/section, exact
+  source digest, same `slice_wcs`) must be proven **fail-closed**. Only the quantity the
+  intervention intentionally varies may differ (crop extent for I1; code path for I2). If
+  identity cannot be proven, return **`NOT_IDENTIFIABLE`/`NOT_AVAILABLE`** — never a soft
+  pass.
+- The comparison is **read-only** and offline; nothing in the production path is modified,
+  the oracle result is never blended, never written into product output, and never becomes a
+  correction. The I1 oracle (`reproject_full_source`) reads only the **prepared source FITS**
+  (`memmap`, read-only) — **never** the final product FITS — and this H4 path is
+  `NOT_RUN`/`NOT_AUTHORIZED` now (§3, §11).
+- `CONTROLLED_EFFECT` for H4 requires §5.1 to hold (identity-proven intervention, bounded
+  end-to-end propagation, same offsets, `delta_d_post` removing/reducing the residual under
+  the R40-B1-frozen criteria, relation-first ≥2 distinct relations per orientation, sign
+  consistent). A mere amplitude difference does not qualify.
+- **A sensitivity experiment with a different interpolation kernel, if ever mentioned, is
+  contextual only and is never an oracle and never `CONTROLLED_EFFECT`.**
+
+---
+
+## 6. Sampling, splits, thresholds, hash binding, size
+
+### 6.1 Split freeze (before any new outcome)
+
+- **Relation-first.** The panel is the `38` geometric relations (not `114` records).
+- **Whole spatial blocks.** Any resampling is by whole tangent blocks (`block_px = 4`,
+  `row // 4` for `h`, `col // 4` for `v`), reusing the frozen §1.3 mechanics — no
+  pixel-level mixing.
+- **Both orientations.** `h` and `v` are reported separately; a claim needs the same
+  sign tuple in ≥2 distinct relations in **each** orientation.
+- **No RGB pseudo-replication.** The three channels are correlated measurements of one
+  boundary and are aggregated relation-first.
+- **Same global pixels.** Only the frozen §3 sample set.
+- **DEV consumed status.** The corpus is exhausted for qualification; R40-C is
+  `DEV_NOT_QUALIFICATION` diagnosis only.
+
+### 6.2 Deterministic binding
+
+A durable R40 capture must bind and fail-closed on: capture-contract version; artifact
+sha256/bytes; `capture_id`; source-set digest/algo and frame count; layout/canvas;
+`measurement_px`/`feather_px`/`halo_px`/`block_px`; `holdout_capped == false` and
+`qualification == EXACT`; the §1.3 integer/block inverse fixtures; and the repo HEAD
+`597c6dbb…` (or a later **explicitly re-blessed** HEAD recorded in the capture). The
+canonical sample-set digest is
+`sha256("zemosaic.zegrid.r40.pairset.v1\n" + sorted(sample keys))`; it is stored and
+compared on every resume.
+
+### 6.3 Stale invalidation and resumability
+
+A checkpoint is valid only if every bound identity above matches; otherwise it is
+**stale-invalidated** (discarded, recomputed) — never partially reused. No final report is
+emitted while any relation is incomplete.
+
+### 6.4 Threshold policy (INHERITED vs NEW vs REFUSED)
+
+| Threshold | Value | Provenance |
+|---|---|---|
+| `RMS0 ≤ 1.25 × σ_ref` | `1.25` | **INHERITED** (R37 absolute RMS-around-zero gate, applied to the statistic it was frozen for) |
+| support gates `effective_train ≥ 256`, `tangent_blocks ≥ 8`, `normal_blocks ≥ 3` | as stated | **INHERITED** (R37 contract) |
+| `K = 4` folds, bootstrap `B = 2000`, seed `0` | as stated | **INHERITED** (R39 plan) |
+| coordinate inversion `INV_TOL = 1e-9` | `1e-9` | **INHERITED** — **coordinate inversion only**; never reused for science values |
+| relation-first cohort `≥ 8` distinct relations for any cross-relation report | `8` | **INHERITED** (R39 §5.3 contextual cohort minimum) |
+| same axis family + sign tuple in `≥ 2` distinct relations per orientation | `2` | **INHERITED** (R39 §9.3 mechanics) |
+| M3 identity tolerance | **none yet** | **NEW** — bit-identical recomputation if achievable; otherwise a ULP/absolute tolerance **calibrated on synthetic fixtures and frozen in the R40-B1 pre-real revision** (§3.4, §7). **This tolerance is scoped to the M3 pre/post algebraic identity ONLY** — it **never** applies to the OFF/ON array/FITS identity |
+| **OFF/ON science/coverage/aesthetic array + FITS identity** | **exact byte-identity — tolerance ZERO** | **FROZEN NOW (§8.2)** — a mandatory safety gate; **never** calibrated, widened or relaxed in R40-B1/B2 or anywhere else |
+| injected-effect recovery criterion (synthetic) | **none yet** | **NEW** — calibrated on disjoint synthetic calibration/validation groups and frozen in R40-B1 **before** any real R40-C outcome |
+| controlled-effect admission criteria for H4 (identity-proven intervention + residual-structure reproduction, relation-first, ≥2/orientation, sign-consistent) | **none yet** | **NEW** — frozen in R40-B1 **before** any real R40-C outcome |
+
+**REFUSED (must never appear).** Any threshold derived from the observed R39 values
+(`2.180`, `1.253–12.945`, `1.100`, `0.539`); any post-hoc relaxation/narrowing of the
+`1.25 × σ_ref` gate; any threshold tuned so a predicted imprint or a conditioning result
+becomes significant; any unsupported numeric tolerance presented as inherited; **any non-zero
+"zero-influence tolerance" — the OFF/ON array/FITS identity is exact byte-identity at
+tolerance `0` (§8.2) and may never be relaxed**; any "explained fraction" summing unrelated
+proxies. A threshold that cannot be justified from synthetic calibration or an already-accepted
+frozen requirement is **refused**, and the corresponding test returns `NOT_IDENTIFIABLE`.
+The M3 ULP/absolute tolerance, if needed, applies **only** to the M3 pre/post algebraic
+identity — never to the OFF/ON arrays/FITS.
+
+### 6.5 Size / runtime estimate (ESTIMATE — from dimensions/counts, no pixels read)
+
+Record unit is `relation × channel × global-pixel` (§3). Sample count ≈
+`114 relation-channels × n_holdout` with `n_holdout ∈ [1792, 4448]`, median `2857` →
+**≈ 3.3 × 10⁵ records** (ESTIMATE).
+
+Per-record bytes (per channel, one Cell pair), conservative **repeated-per-channel** form;
+M3 is stored as pre-`f32` + post-`f64`, M6 as the canonical `int64` (§3.1):
+
+| Field group | Bytes |
+|---|---|
+| `gx`, `gy` int32 ×2 | 8 |
+| `sci_u/sci_v` **pre f32** | 8 |
+| `sci_u/sci_v` **post f64** | 16 |
+| `valid_u/valid_v` bool | 2 (pad 4) |
+| `estimator_weight_sum_u/v` f64 | 16 |
+| `surviving_sample_count_u/v` **int64** | 16 |
+| `support_w1/w2/n_eff` u/v f64 (repeated, channel-invariant) | 48 |
+| `ramp_u/ramp_v` f64 | 16 |
+| corner flag / padding | ~2 |
+| **≈ total** | **≈ 136 B** |
+
+If (and only if) channel-identical pixel sets and channel-invariant planes are **proven**
+per relation, `support_w1/w2/n_eff` and `ramp` factor into a `(relation, pixel)` sidecar →
+per-record ≈ **≈ 70 B** plus sidecar ≈ **≈ 74 B/pixel**.
+
+- **Packed binary shard:** ≈ `3.3e5 × 136 B` ≈ **45 MB** (conservative) / ≈ `3.3e5 × 70 B`
+  + `≈1.1e5 × 74 B` ≈ **31 MB** (factored) → order **30–75 MB** with index/overhead
+  (ESTIMATE).
+- **Strict JSON per-sample:** ≈ 5–8× → order **0.2–0.6 GB** (ESTIMATE) — **not**
+  recommended for the per-sample block.
+
+**Recommendation (frozen):** a **bounded shard** format — one fixed-width binary/`npy`
+shard per relation plus a strict-JSON index/header (§8) — with a **hard disk budget** and
+**fail-closed refusal** if exceeded. Only the run's own fresh output directory is written;
+no absolute private paths in any durable artifact.
+
+**Runtime (ESTIMATE):** the capture is write-only instrumentation over an already-computed
+stack; cost is `O(candidate records)` serialization on top of the normal assembly. Expected
+**minutes**, not the multi-hour stack; measured on the synthetic corpus in **R40-B1/B2** and
+on the single R40-C run. **Honest bound:** the existing baseline full-patch
+`science`/`valid`/`surviving` IPC is product behavior and is **not** changed by R40; the
+**R40 incremental** overhead is `O(candidate records)` (sparse samples, §3.1.1), **not**
+`O(full patch E7–E9)` and **not** an `N_frames × canvas` accumulation. This plan does **not**
+claim the whole product RAM is `O(records)`.
+
+---
+
+## 7. Staged gates
+
+| Gate | Content | Authorized now? |
+|---|---|---|
+| **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
+| **R40-B1** | **Synthetic calibration stage:** build a synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on the independent validation group). B1 may calibrate **only**: the M3 pre/post algebraic identity tolerance (if bit-identity is not achievable), the §5.1 ROI-shadow numerical parity tolerance, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **freeze them in a pre-real document revision**. B1 does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. | NO — separate bounded mission |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation. | NO — separate bounded mission, after R40-B1 |
+| **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
+| **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
+| **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
+
+**Staging rule (unambiguous).** R40-B is **split**: **R40-B1 must produce frozen criteria
+and a document revision BEFORE R40-B2 acceptance, and both must complete BEFORE any real
+R40-C outcome.** No criterion may remain "to be frozen" at the human gate. R40-B1's
+calibration and validation sets/groups must be **disjoint** (criteria derived on the
+calibration group, validated **once** independently on the validation group) and must use
+**no R39 observed values**.
+
+**Hard rule.** No diagnostic detection at any gate authorizes a correction, a prototype, a
+qualification, a product default, a GUI change, or product integration. A correction would
+require a **separate future plan** and an **independent real corpus**; R40 by itself
+produces evidence, not a fix.
+
+**Interface boundaries (so the plan stays bounded and implementable):**
+
+- **DRY (implementation):** the capture lives in a new default-OFF seam plus a new
+  standalone offline tool under `tools/`, reusing `MiniTile`/`CanonicalStackResult`,
+  `cell_feather.feather_weight_field`, `apply_additive_offsets`, the `execution.reproject_*`
+  primitives and the R39-A identity/inverse/strict-JSON/privacy machinery — **no
+  duplicated pixel or difference maths**.
+- **DRY (offline analysis):** R40-C interpretation reuses the R39-A relation-first,
+  leak-free bootstrap and state machinery (as frozen) wherever a statistic is shared; new
+  logic is limited to the covariate conditioning/stratification of §4 and the §5
+  interventions.
+- **YAGNI:** **no** new model family, **no** correction, **no** GUI, **no** production
+  default; the capture is a bounded, removable, default-OFF instrument.
+- **Deterministic:** all sampling/keys/hashes are deterministic; no hidden RNG.
+
+---
+
+## 8. Future capture safety contract
+
+A future R40-B2 capture must satisfy, and prove, all of:
+
+1. **Default OFF.** Not enabled unless explicitly requested; normal runs unchanged.
+2. **Zero influence proven (tolerance exactly ZERO, frozen now).** With the capture ON but
+   its output discarded, every **science, coverage and aesthetic array and the
+   science/coverage/aesthetic FITS bytes** must be **exact byte-identical** to capture-OFF
+   for the same inputs and seeds — **tolerance exactly `0`, frozen now in this section, and
+   never calibrated, widened or relaxed** (this safety gate is **not** a synthetic-calibrated
+   threshold).
+3. **Manifest scheme (one truthful design, used consistently).** The diagnostic is
+   recorded as **exactly one additive block** `r40_diagnostic_capture` (mirroring the
+   accepted R37-D `r37_diagnostic_capture` cross-link), and **all pre-existing manifest
+   fields must be canonical-identical** (same keys, same values, same serialisation) ON vs
+   OFF. The capture artifact is cross-linked to the manifest on the frozen identity keys
+   (`capture_id`, `filename`, `sha256`, `bytes`) exactly as the accepted R38/R39
+   `manifest_links_artifact` rule requires. **The manifest must never be claimed
+   byte-identical**; only the science/coverage/aesthetic arrays and FITS are byte-identical,
+   and only the pre-existing manifest fields are canonical-identical. (Alternative, if ever
+   preferred: an external sidecar cross-link with **no** manifest mutation — but exactly one
+   of the two designs is used, and it is stated in the capture provenance.)
+4. **Atomic, strict output (frozen shard contract).** Fixed basename; temp file in the
+   destination directory + `flush` + `fsync` + `os.replace`; temp removed on failure;
+   `json.dumps(..., allow_nan=False)` must succeed; non-finite values refused, never degraded
+   to `0`; deterministic ordering everywhere. The bounded shard format is frozen as:
+   explicit **schema name/version** and dtype field list; **little-endian** (or the exact
+   chosen endianness, declared); **C-order**; a **record ordering/sample key** (§3); a
+   per-shard **count + byte length + SHA-256**; a **strict-JSON index** describing the
+   shards; **atomic multi-file generation** written into a fresh generation directory with
+   the **index/COMMIT marker written last**; `fsync` on every shard; **partial-shard cleanup
+   / quarantine** and **stale-generation refusal** on any failure; **symlink / path-traversal
+   / protected-root** failures closed. **No pickle, no object dtype.**
+5. **No absolute private paths** in any durable artifact/report (whole value and embedded;
+   POSIX/Windows-drive/UNC/`file://`); a surviving leak sets `status = FAILED` (same
+   fail-closed privacy boundary as R38-A/R39-A).
+6. **Source/dataset read-only, fresh output writable.** The 816 source frames **and the
+   source/dataset roots** are opened strictly **read-only** and are never written. The
+   **explicitly provided, fresh output directory** is the **only** writable target; the
+   capture refuses any target inside the source/dataset trees or a previously-existing
+   protected root (same policy as R39-A `derive_dataset_root` / protected-roots refusal).
+   Calling the authorized fresh output a "dataset root" is forbidden — it is the run's own
+   writable output.
+7. **Fail-closed identity / cross-link.** Refuse (no metrics, no partial artifact) unless
+   every §6.2 binding matches on schema/version, `capture_stage`, `correction_applied is
+   False`, `production_wired is True`, artifact sha256/bytes == manifest == on-disk,
+   `capture_id`, source-set digest/algo/count, `n_frames`, layout, canvas, gauge mode,
+   `measurement_px`/`feather_px`/`halo_px`, `holdout_capped is False`, `qualification ==
+   EXACT`, `n_dropped == 0` — and the §1.3 inverse/parity fixtures pass.
+8. **Bounded RAM / disk.** `O(relations × samples)` scalars only; a hard disk budget with
+   fail-closed refusal; no `N_frames × canvas` accumulation.
+9. **Resumable / stale-invalidated.** Atomic checkpoint between fully completed records;
+   any identity mismatch → stale invalidation; no final report while partial.
+10. **No retained pixel cutouts** unless explicitly justified in a separate
+    pre-registration with a bounded region and size (default: refused).
+11. **Completeness scope (M1–M11 vs H4).** The "a capture missing any mandatory item is
+    refused" rule of §3.1 applies to the **core association capture** (M1–M11 → T1/T2/T3/T5
+    evidence). The §5 H4 intervention evidence is a **separate, optional/conditional
+    block**: its absence yields H4 `NOT_IDENTIFIABLE`/`NOT_AVAILABLE` **only** and does
+    **not** invalidate the T1/T2/T3/T5 association evidence; conversely, a present H4 block
+    can never silently become "complete H4"; it must independently satisfy §5/§5.1.
+
+---
+
+## 9. Exact STOP outcomes
+
+Each is terminal for the affected step and **must never silently become a correction**:
+
+| STOP | Trigger |
+|---|---|
+| `EVIDENCE_UNAVAILABLE` | a mandatory observable (M1–M11) is absent, unavailable, or a required input identity cannot be proven |
+| `INCOMPLETE_PANEL` | any planned relation is `NOT_RUN` or the relation panel is not `114/114` for the captured set |
+| `IDENTITY_MISMATCH` | any §6.2 binding fails (schema, sha, bytes, capture_id, digest, HEAD, layout, gauge, widths, `holdout_capped`/`qualification`) |
+| `UNSUPPORTED_CONFOUNDER` | a hypothesis cannot be tested without a confounder the evidence cannot hold fixed |
+| `ASSOCIATION_ONLY` | only `DETECTED_ASSOCIATION` is reached (correlation or observational conditioning only, no identity-proven intervention) — **no** promotion, never `CONTROLLED_EFFECT` |
+| `NUISANCE_LINKED` | the residual is attributed to a nuisance (support/weight/depth/reprojection/PSF/mask) rather than an unexplained mechanism |
+| `NO_EFFECT` | the controlled test/intervention finds no repeatable association in either orientation |
+
+`ASSOCIATION_ONLY` / `NUISANCE_LINKED` / `NO_EFFECT` all block any correction/qualification
+path; `EVIDENCE_UNAVAILABLE` / `UNSUPPORTED_CONFOUNDER` block the affected hypothesis and
+return `NOT_IDENTIFIABLE`. **None may silently become a correction.**
+
+---
+
+## 10. Acceptance criteria (this documentation task) and next single step
+
+**Acceptance criteria for ZM-ZEGRID-R40-A-OBSERVABILITY-PREREG (rework-3):**
+
+1. Exactly one new document is added:
+   `docs/refactor/R40_UNEXPLAINED_STRUCTURE_OBSERVABILITY_PLAN.md`; no other file changes.
+2. It states the immutable lineage (§1) with the exact R39 artifact/metrics SHAs, the
+   implementation HEAD, status and counts, and the uncapped R37E illustration.
+3. It contains the evidence-availability matrix and the explicit insufficiency argument
+   (§2), cross-checked against real production symbols (no invented arrays).
+4. It freezes a mandatory-vs-contextual NEW observable contract at the pre-feather/feather
+   boundary (§3) with **one coherent `relation × channel × global-pixel` unit**, correct
+   dtypes (M3 pre `f32`/post `f64`, M6 `int64`), and a frozen **sparse worker→parent IPC**
+   design (§3.1.1); it states the seam/propagation gap honestly and makes no false
+   parent-seam or whole-product-RAM claim.
+5. It separates hypotheses and tests (§4) and defines the ladder so that **observational
+   conditioning/stratification reaches at most `DETECTED_ASSOCIATION`**, and
+   `CONTROLLED_EFFECT` requires an exact same-input intervention with frozen criteria;
+   synthetic validation is not Windows816 causal localization.
+6. It specifies **only existing production/oracle reprojection symbols** (§5), states
+   identity **per intervention** (I1a fixed-common-mask parity vs I1b intended coverage
+   delta; I2 full identity), freezes the **bounded end-to-end shadow propagation** (§5.1),
+   and fails `NOT_IDENTIFIABLE`/`NOT_AVAILABLE` when identity cannot be proven; no
+   higher-order kernel as oracle, no raw per-frame delta claim.
+7. It freezes sampling/splits/binding/size and the INHERITED/NEW/REFUSED threshold policy
+   (§6), with no unsupported `≤1e-12`, refusing thresholds derived from observed R39 values,
+   and states that the **OFF/ON byte-identity gate is zero-tolerance, frozen now**, and that
+   the M3 ULP/absolute tolerance applies only to the M3 identity, never to OFF/ON arrays/FITS.
+   It scopes FITS access explicitly (core capture = in-memory only; the future H4 oracle reads
+   only prepared source FITS; never final product FITS — §3).
+8. It defines the **split** R40-B1/B2 stages (§7, disjoint synthetic calibration/validation),
+   the capture-safety contract (§8, with the additive `r40_diagnostic_capture` manifest block,
+   the frozen shard contract §8.4 and the M1–M11 vs H4 completeness scope §8.11), exact STOP
+   outcomes (§9), the Windows-prohibition reconciliation (§11) and the un-pushed/local status
+   (§12).
+9. `git diff --check` is clean; `git status` shows only the new untracked/added document;
+   no commit and no push are made.
+
+**Next single step.** Jarvis Junior reviews this rework; if accepted, the next bounded
+mission is **R40-B1** (synthetic calibration + criteria freeze + document revision) —
+**not** a real capture, **not** a model fit, and **not** any product change.
+
+**Vocabulary (frozen, to prevent conflation).**
+
+- *DEV diagnosis*: R40-C on the consumed Windows816 corpus → `DEV_NOT_QUALIFICATION`.
+- *Causal localization*: reaching `CONTROLLED_EFFECT` for exactly one mechanism via an
+  identity-proven same-input intervention on DEV.
+- *Synthetic qualification*: R40-B1/B2 proving OFF/ON zero influence and injected-effect
+  recovery on a synthetic truth corpus (validates the instrument, not a Windows816 cause).
+- *Independent real qualification*: a future, separately pre-registered corpus (LP341
+  reserved) — **not** part of R40-A/B/C/D as defined here.
+
+---
+
+## 11. Windows / Zealfie prohibition reconciliation
+
+The standing prohibition is absolute and remains so: **no Zealfie update, no Windows run,
+no TinyDebian full stack** is performed or authorized by this task, and R40-A does not
+run any product code.
+
+This document may **describe** the future HUMAN_GATE, but it does **not** authorize it:
+any single R40-C diagnostic capture is an explicit HUMAN_GATE requiring **Tristan's**
+authorization, with the **exact commit**, the **exact commands**, a **fresh output path**,
+and a **capable host**. Until that authorization exists, R40-C is `NOT_RUN /
+NOT_AUTHORIZED` — the same status as R39-B/C/D. No full product run, release, tag or push
+is implied by any R40 gate.
+
+---
+
+## 12. Local commit / publication status
+
+The local `beta` implementation commit (`597c6dbb…`, "feat: add R39 spatial residual
+diagnostic") is **1 commit ahead of `origin/beta` and is not pushed**. This documentation
+mission adds **no commit and no push**. No publication, release, tag, deploy or remote
+resource is created or implied by R40.
+
+---
+
+## 13. Validation of this document (R40-A design gate)
+
+- `git diff --check` clean; `git status --porcelain=v1` shows only the new document.
+- Scan for private absolute paths (none) and for contradictory authorization claims
+  (no claim that R38-B/C/D/E or R39-B/C/D ran or is authorized; a single, consistent
+  statement that R39-A remains terminal and R40-A authorizes nothing beyond this doc).
+- Re-verify every cited immutable fact of §1 against the existing capture/manifest/schema
+  and source **without** computing any new outcome; cross-check every production symbol in
+  §2.2/§3/§5 against the real modules.
+- Confirm the conclusion ladder is mutually exclusive by precedence, that observational
+  conditioning cannot reach `CONTROLLED_EFFECT`, that no p90/RMS statistic is mislabelled,
+  and that no LP pixel and no FITS pixel is read.
+
+---
+
+## 14. Revision-history pointer
+
+This section is a pointer, not a source of authority.
+
+- **rework-1 (after Junior review-0), before any real R40 outcome:** causal-ladder
+  correction (conditioning ≠ intervention); record-unit/dimension coherence; reprojection
+  intervention restricted to existing production/oracle symbols; zero-influence/manifest
+  scheme fixed to one additive `r40_diagnostic_capture` block with canonical-identical
+  pre-existing fields; `≤1e-12` removed in favour of bit-identical recomputation or a
+  synthetic-calibrated tolerance frozen in R40-B1; factual/wording fixes; R40-B split into
+  B1 (calibration/freeze) and B2 (implementation/acceptance).
+- **rework-2 (after Nono review-0: 0 HIGH / 4 MEDIUM / 3 LOW), before any real R40 outcome:**
+  R1 per-intervention identity (I1 split into I1a fixed-common-mask parity and I1b intended
+  coverage delta; blanket identical-arrays/masks rule removed); R2 M3 dtype (pre `f32`, post
+  `f64`, identity on the f64 helper with no f32 downcast; M6 corrected to `int64`; size table
+  corrected); R3 H4 bounded end-to-end shadow propagation contract (§5.1); R4 corrected seam
+  claim + frozen sparse worker→parent IPC (§3.1.1); LOW: R40-B1 disjoint synthetic
+  calibration/validation sets, frozen shard contract (§8.4), M1–M11 vs H4 completeness scope
+  (§8.11).
+
+- **rework-3 (after Nono review-1: 0 HIGH / 2 MEDIUM / 3 LOW), before any real R40 outcome:**
+  M1 split the §6.4 zero-influence row — OFF/ON science/coverage/aesthetic array + FITS
+  identity is **exact byte-identity, tolerance ZERO, frozen now** (§8.2), never calibrated or
+  relaxed, while B1 calibrates only the injected-effect recovery criterion (and, if needed,
+  the M3 identity tolerance and the ROI-shadow parity tolerance); M2 added the explicit
+  FITS-scope carve-out (§3/§5.4: core capture = in-memory only, never final product FITS;
+  the future H4 oracle reads only prepared source FITS, `NOT_RUN`/`NOT_AUTHORIZED` now).
+  LOW: M3 tolerance scoped to M3 only; §5.1 ROI-shadow parity tolerance named as B1-frozen;
+  §3.1.1 parent exact selection tied fail-closed to the §1.3 inverse/parity fixtures.
+
+Any further normative change before the first real R40-C outcome must be recorded directly
+in the frozen sections above **and** logged here, with the explicit note that it happened
+**before any real R40 outcome**. No real R40 capture, metric or outcome was computed for
+this document.
