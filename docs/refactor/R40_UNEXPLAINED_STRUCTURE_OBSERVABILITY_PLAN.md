@@ -726,7 +726,7 @@ claim the whole product RAM is `O(records)`.
 | **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
 | **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; the v2 reserved cohort was evaluated EXACTLY ONCE by the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission → terminal **ACCEPT** (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`** (§15.7). | **DONE / terminal ACCEPT** (v1 invalidation history preserved byte-for-byte, §15.1) |
 | **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
-| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9); **acceptance NOT achieved** — the OFF/ON FITS byte identity, the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and the real pooled worker→parent transport are `NOT_RUN` |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); **acceptance NOT achieved** — the OFF/ON FITS byte identity, the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity and the exact §1.3 held-out intersection remain `NOT_RUN` |
 | **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
 | **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
 | **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
@@ -1077,6 +1077,21 @@ This section is a pointer, not a source of authority.
   transport on a pooled run and R40-C/D remain **`NOT_RUN`**. No criterion was changed and the OFF/ON
   zero-tolerance gate was untouched.
 
+- **rework-13 (R40-B2-C real pooled transport, bounded task C), before any real R40-C outcome:** the REAL
+  pooled worker→parent sparse transport is implemented behind the SAME default-OFF opt-in (§15.10). With the
+  capture ON the parent computes the deterministic per-cell candidate geometry (reusing the sealed
+  `_r40_candidate_coords`) and passes it to every pooling worker via the pool initargs; each worker
+  (`_stack_cell`) returns ONLY the sparse candidate samples of its own cell(s) from the worker-local MiniTile
+  planes (delegating every single-pixel read to the B2-B extractor — no duplicated pixel/difference maths,
+  no full f64 patch plane, no raster/cutout, no FITS read). With the capture OFF the transport is completely
+  absent: the worker initargs tuple stays the pre-R40 8-tuple, no `r40_sparse` key is added, the core is not
+  imported and there is no retention or measurable behaviour change. Observed: focused **156 passed**
+  (`r40b2_pooled` + seam + core), combined regressions **316 passed**; the payload bound is
+  `O(candidate records)`. **B2 acceptance is NOT claimed**: the exact OFF/ON FITS byte identity, the
+  38-relation panel qualification, the injected-effect recovery re-proof, the real product ROI parity, the
+  exact §1.3 held-out-key intersection, a real Windows run and R40-C/D remain **`NOT_RUN`**. No criterion was
+  changed and the OFF/ON zero-tolerance gate was untouched.
+
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
 **before any real R40 outcome**. No real R40 capture, metric or outcome was computed for
@@ -1409,8 +1424,8 @@ accepted core.
 - **M5/M7 sourcing.** At this seam the parent cannot see the worker-local MiniTile covariate planes
   (`estimator_weight_sum`, `support_w1`/`support_w2`/`n_eff_support`; plan §2.2). The seam therefore takes
   them from the picklable worker→parent transport and **refuses fail-closed** when it is absent. The
-  **real pooled-run** transport is **`NOT_RUN`** (the parity proof exercises the transport through the
-  `spawn` context on synthetic fixtures).
+  **real pooled-run** transport was **`NOT_RUN`** at task B (**superseded: implemented by
+  `ZM-ZEGRID-R40-B2-C`, §15.10**).
 - **Exact §1.3 held-out intersection.** The captured sample set is the deterministic block-parity
   **candidate geometry** in the shared halo band, filtered by the frozen `shared_valid_mask`; the exact
   R37 held-out-key inverse/parity intersection is **`NOT_RUN`**.
@@ -1424,3 +1439,69 @@ accepted core.
 the **real product ROI parity**, the real pooled worker→parent transport and the exact §1.3 held-out
 intersection remain **`NOT_RUN`** / **`B2_MANDATORY`**. The OFF/ON gate is untouched at tolerance zero.
 `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.
+
+### 15.10 R40-B2-C real pooled worker→parent sparse transport — implementation status (bounded task C)
+
+**Mission** `ZM-ZEGRID-R40-B2-C-POOLED-TRANSPORT` · **phase** `implementation` · **branch** `beta` ·
+**baseline HEAD** `2f3ee778177195b7a55f0115b4f4c4620b772dab` · **commit created** `NO` · **push** `NO`.
+
+Bounded task C closes the honest gap flagged in B2-B: the REAL pooled worker→parent sparse transport.
+Before this task the seam consumed `result_by_cid[cid]['r40_sparse']`, a key only synthetic fixtures
+provided; a real pooled run carried nothing. Now the production pooling worker (`_stack_cell`, run by
+`zpar.pmap`) computes and returns ONLY the sparse per-relation candidate samples of its OWN cell(s) from
+the worker-local MiniTile planes.
+
+| Added / changed (no commit) | Purpose |
+|---|---|
+| `src/zemosaic/zemosaic_zegrid_mode.py` (modified) | parent-side per-cell candidate geometry (`_r40_worker_candidate_coords`, reusing the sealed `_r40_candidate_coords`); picklable worker entry point `_r40_worker_transport_sparse` (delegates every single-pixel read to the B2-B extractor); `_r40_maybe_worker_sparse` (armed only when the parent supplied coords); transport armed through `_init_stack_worker(..., r40_worker_coords=None)` and the `_run_cell_batch` initargs (appended ONLY when the capture is ON) |
+| `tests/test_zegrid_r40b2_pooled.py` (new) | focused transport tests incl. proofs (e)–(g) |
+
+**Implemented (bounded task C).** (1) With the capture ON the parent computes the deterministic per-cell
+candidate geometry **before** any worker starts (plan §3.1.1) and hands it to every worker through the
+pool initargs; each worker returns only the sparse candidates of its own cell(s) for M5
+(`estimator_weight_sum`), M7 (`support_w1`/`support_w2`/`n_eff_support`), M6
+(`surviving_sample_count`), M4 (`valid_mask`) and M3-pre (`sci_pre`) — never a full f64 patch plane, never
+a raster/cutout, never a FITS read; `_r40_worker_extract_covariates` and the sealed candidate geometry are
+reused (no duplicated pixel/difference maths). (2) With the capture OFF the transport is COMPLETELY absent:
+the worker initargs tuple stays the pre-R40 8-tuple (no extra IPC payload), no `r40_sparse` key is added to
+any worker result, the capture core is never imported and there is no retention or measurable behaviour
+change. (3) Fail-closed: capture ON but the transport missing/incomplete/wrongly shaped → the seam refuses
+and publishes NOTHING, leaving the input planes byte-unchanged. (4) Bounded: the transported payload is
+`O(candidate records)` (`len(coords) × channels`), never `O(full patch area)` and never `N_frames × canvas`.
+(5) The R37-D path and the assembly result semantics are unchanged; the capture is default-OFF.
+
+**Mandatory proofs — measured on synthetic fixtures (never asserted).**
+
+| Proof | Result |
+|---|---|
+| (e1) REAL production pooled run (`zpar.pmap` real process pool, `executor=process`, `workers=3`) on a synthetic 2×2 corpus with the capture ON → every complete cell returns its own `r40_sparse` payload; the published generation verifies (`verify_generation(..., expected_production_wired=True)` → `ok=True`, `problems=[]`) and is cross-linked in the manifest | **MEASURED** |
+| (e2) worker→parent payload == the in-process reference extraction (`_r40_worker_extract_covariates`) at the same coordinates, transported through a genuine `multiprocessing.get_context('spawn')` pool, then driving a verifying seam capture | **MEASURED — Linux-side spawn parity ONLY (NOT a Windows run)** |
+| (f) the same REAL pooled run with the capture OFF → NO `r40_sparse` key on any worker result, the worker result key set exactly the pre-R40 set, the worker initargs tuple unchanged (8), NO artifact and NO manifest field, OFF science byte-identical across two identical runs and the OFF assembly byte-identical to the INDEPENDENT frozen-primitive baseline | **MEASURED** |
+| (g) fault injection (transport dropped / truncated / an endpoint's samples lost, plus a worker that emits no transport at all) → refuse, NO artifact and input planes byte-unchanged | **MEASURED** |
+
+**Validation (executed, observed).**
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest tests/test_zegrid_r40b2_pooled.py tests/test_zegrid_r40b2_seam.py tests/test_zegrid_r40_capture_core.py -W error -q -p no:cacheprovider` | **156 passed** |
+| `python3 -m pytest tests/test_zegrid_r37d_diagnostic_capture.py tests/test_zegrid_r37e_capture_runner.py tests/test_zegrid_r38a_causal_probe.py tests/test_zegrid_r39a_spatial_residual.py tests/test_zegrid_r40b1_synthetic_calibration.py -W error -q -p no:cacheprovider` | **417 passed** (the earlier 316 count was the 4-file subset; corrected after independent re-run) |
+| `python3 -m py_compile src/zemosaic/zemosaic_zegrid_mode.py tests/test_zegrid_r40b2_pooled.py` | OK |
+| `git diff --check` | clean |
+
+**Known limits carried forward (architect-visible, NOT_RUN).**
+
+- **Windows spawn.** The pooled production run uses the production `zpar.pmap` executor (fork on Linux); the
+  explicit `spawn` pool parity is proven on the transport entry point only. A real **Windows** run is
+  **`NOT_RUN`** (Windows is not exercised).
+- **Exact §1.3 held-out intersection.** The captured sample set is the deterministic block-parity
+  **candidate geometry** in the shared halo band, filtered by the frozen `shared_valid_mask`; the exact R37
+  held-out-key inverse/parity intersection is **`NOT_RUN`**.
+- **Payload bound is per-run measured, not a global claim.** No claim is made that the whole product RAM is
+  `O(records)`; the pre-existing full `science`/`valid`/`surviving` patch IPC is acknowledged product
+  behaviour and is unchanged.
+
+> **Task C does NOT accept B2.** The exact OFF/ON science/coverage/aesthetic array + FITS byte identity
+(tolerance exactly `0`), the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof,
+the **real product ROI parity** and the exact §1.3 held-out intersection remain **`NOT_RUN`** /
+**`B2_MANDATORY`**. The OFF/ON gate is untouched at tolerance zero. `R40-C` / `R40-D` / `HUMAN_GATE` /
+`LP341` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.

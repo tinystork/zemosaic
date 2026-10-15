@@ -1314,13 +1314,26 @@ _STACK_GLOBAL_FRAME_IDS = None
 _STACK_GLOBAL_REF = None
 _STACK_TILE_SIZE = STREAM_TILE_SIZE
 _STACK_CACHE_WORKERS = 1
+# ZM-ZEGRID-R40-B2-C: the worker-local R40 sparse transport is armed ONLY when the
+# parent hands this mapping ({cell_id: candidate coords}) to the worker
+# initializer. ``None`` (the default and the only value the capture-OFF path ever
+# sets) means "transport absent": no extra IPC payload, no retention, no key on a
+# worker result, no measurable behaviour change.
+_STACK_R40_WORKER_COORDS = None
 
 
-def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id, tile_size=STREAM_TILE_SIZE, cache_workers=1):
-    """Child/parent initializer: publish the read-only per-cell stack inputs."""
+def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id, tile_size=STREAM_TILE_SIZE, cache_workers=1, r40_worker_coords=None):
+    """Child/parent initializer: publish the read-only per-cell stack inputs.
+
+    ``r40_worker_coords`` (ZM-ZEGRID-R40-B2-C) is the OPTIONAL parent-computed
+    per-cell candidate geometry for the R40 worker→parent sparse transport. It is
+    appended to ``initargs`` by the caller ONLY when the capture is ON; with the
+    capture OFF the initargs tuple is byte-identical to the pre-R40 transport and
+    this parameter stays ``None`` (transport fully absent).
+    """
     global _STACK_DESCS, _STACK_CANVAS, _STACK_CONFIG, _STACK_GAUGE
     global _STACK_GLOBAL_FRAME_IDS, _STACK_GLOBAL_REF, _STACK_TILE_SIZE
-    global _STACK_CACHE_WORKERS
+    global _STACK_CACHE_WORKERS, _STACK_R40_WORKER_COORDS
     _STACK_DESCS = descs
     _STACK_CANVAS = canvas
     _STACK_CONFIG = science_config
@@ -1329,6 +1342,7 @@ def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame
     _STACK_GLOBAL_REF = global_reference_frame_id
     _STACK_TILE_SIZE = tile_size
     _STACK_CACHE_WORKERS = cache_workers
+    _STACK_R40_WORKER_COORDS = r40_worker_coords
 
 
 def _resolve_cell_normalization(mode, global_gauge, global_frame_ids, provider, science_config):
@@ -1574,6 +1588,101 @@ def _r40_worker_extract_covariates(task):
             "n_eff_support": float(_r40_plane_at(neff, ly, lx, channel)),
         })
     return out
+
+
+class _R40BoundsProxy:
+    """Minimal ``.bounds`` carrier for the parent-side candidate geometry.
+
+    The sealed per-relation candidate geometry (``_r40_candidate_coords``) reads
+    only ``patch.bounds``; this proxy lets the PARENT reuse that exact geometry on
+    the worker task bounds without duplicating any block/parity maths and without
+    materialising a ``CellPatch`` (or any pixel plane).
+    """
+
+    __slots__ = ("bounds",)
+
+    def __init__(self, bounds):
+        self.bounds = tuple(int(v) for v in bounds)
+
+
+def _r40_worker_candidate_coords(bounds_by_cell, nx, ny, *, block_px):
+    """Parent-side per-cell candidate coords for the worker→parent transport.
+
+    For every complete adjacent Cell relation of the FROZEN ``grid_adjacency``
+    grid this returns, for EACH endpoint, the deterministic block-parity candidate
+    coordinates of the relation's shared halo band — computed by the SAME sealed
+    ``_r40_candidate_coords`` helper the seam uses (no duplicated geometry or
+    pixel/difference maths). The per-cell union is deduplicated and deterministically
+    ordered by ``(gy, gx)`` so the pooled worker and the in-process reference agree
+    exactly.
+
+    Size is ``O(candidate records)`` — never ``O(full patch area)`` and never
+    ``N_frames x canvas``.
+    """
+    proxy = {
+        str(cid): _R40BoundsProxy(bounds)
+        for cid, bounds in (bounds_by_cell or {}).items()
+    }
+    per_cell: dict = {}
+    for (u, v) in zcf.grid_adjacency(int(nx), int(ny)):
+        if u not in proxy or v not in proxy:
+            continue
+        for (gx, gy) in _r40_candidate_coords(proxy, u, v, block_px=int(block_px)):
+            per_cell.setdefault(str(u), {})[(int(gx), int(gy))] = None
+            per_cell.setdefault(str(v), {})[(int(gx), int(gy))] = None
+    return {
+        str(cid): tuple(sorted(coords, key=lambda k: (k[1], k[0])))
+        for cid, coords in per_cell.items()
+    }
+
+
+def _r40_worker_transport_sparse(cell_id, coords, planes):
+    """Worker-side R40 sparse transport entry point (module-level, PICKLABLE).
+
+    Called by the pooling worker :func:`_stack_cell` with the WORKER-LOCAL MiniTile
+    planes; also the exact entry point exercised through a real ``spawn`` pool by
+    the B2-C proof (e) test. Loops the channels and delegates every single-pixel
+    read to the B2-B extractor :func:`_r40_worker_extract_covariates` (no duplicated
+    maths). Returns a plain, picklable list of samples — ``O(len(coords) x
+    channels)``, never a full f64 patch plane, never a raster/cutout, never a FITS
+    read.
+    """
+    sci = np.asarray(planes["science"])
+    n_channels = int(sci.shape[2]) if sci.ndim == 3 else 1
+    out: list = []
+    for channel in range(n_channels):
+        planes_ch = dict(planes)
+        planes_ch["channel"] = int(channel)
+        out.extend(_r40_worker_extract_covariates((str(cell_id), tuple(coords or ()), planes_ch)))
+    return out
+
+
+def _r40_maybe_worker_sparse(cell_id, minitile, patch):
+    """Worker-side R40 transport, armed ONLY when the parent supplied coords.
+
+    Returns ``None`` when the capture is OFF: the caller then adds NO key and keeps
+    NO payload, so the worker result stays byte-identical to the pre-R40 transport.
+    When armed, builds the plane mapping from the in-memory MiniTile planes (never
+    a FITS read, never a raster, never a full f64 patch plane) and returns the
+    sparse per-candidate samples of THIS cell only.
+    """
+    coords_by_cell = _STACK_R40_WORKER_COORDS
+    if coords_by_cell is None:
+        return None
+    coords = coords_by_cell.get(str(cell_id))
+    if not coords:
+        return ()
+    planes = {
+        "bounds": (patch.patch.y0, patch.patch.y1, patch.patch.x0, patch.patch.x1),
+        "science": minitile.science,
+        "valid_mask": minitile.valid_mask,
+        "surviving_sample_count": minitile.surviving_sample_count,
+        "estimator_weight_sum": minitile.estimator_weight_sum,
+        "support_w1": minitile.support_w1,
+        "support_w2": minitile.support_w2,
+        "n_eff_support": minitile.n_eff_support,
+    }
+    return _r40_worker_transport_sparse(str(cell_id), coords, planes)
 
 
 def _r40_index_worker_sparse(result_by_cid):
@@ -2320,7 +2429,7 @@ def _stack_cell(task):
     # best-effort; a failure is reported so the parent can WARN + record.
     cleanup_failed = not _safe_rmtree(cache_dir, None)
 
-    return {
+    result = {
         "cell_id": cid, "status": "complete", "core": core, "record": record,
         "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
         "n_frames": int(manifest.get("n_frames", 0)),
@@ -2347,6 +2456,14 @@ def _stack_cell(task):
             else None
         ),
     }
+
+    # ZM-ZEGRID-R40-B2-C: attach the sparse covariate transport ONLY when the
+    # parent armed it (capture ON). When OFF this adds NO key, keeps NO payload and
+    # leaves the result byte-identical to the pre-R40 transport.
+    _r40_sparse = _r40_maybe_worker_sparse(cid, mt, patch)
+    if _r40_sparse is not None:
+        result[R40_SPARSE_RESULT_KEY] = _r40_sparse
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3527,6 +3644,27 @@ def _run_single(
 
     t_block0 = time.perf_counter()
 
+    # ZM-ZEGRID-R40-B2-C: when the seam capture is ON, the deterministic candidate
+    # geometry is computed HERE in the parent (before any worker starts) from the
+    # task Cell bounds and handed to every pooling worker so each worker returns
+    # ONLY the sparse covariate samples of its OWN cell(s) from its worker-local
+    # MiniTile planes. When the capture is OFF this stays ``None`` and the pool
+    # initargs are byte-identical to the pre-R40 transport (no extra IPC payload).
+    _r40_coords_by_cell = None
+    if r40_seam_capture:
+        from .core.zegrid import background_model as _r40bm
+
+        _r40_bounds = {
+            str(t[0].cell_id): (
+                int(t[1].patch.y0), int(t[1].patch.y1),
+                int(t[1].patch.x0), int(t[1].patch.x1),
+            )
+            for t in cell_tasks
+        }
+        _r40_coords_by_cell = _r40_worker_candidate_coords(
+            _r40_bounds, nx, ny, block_px=int(_r40bm.BLOCK_PX)
+        )
+
     def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt,
                         tasks=None, workers=None, cache_workers=None):
         """Run the WHOLE per-cell batch once; returns (results, meta).
@@ -3544,12 +3682,19 @@ def _run_single(
         _workers = cells_in_flight if workers is None else int(workers)
         _cache_workers = cache_workers_per_cell if cache_workers is None else int(cache_workers)
         _meta = {}
+        # ZM-ZEGRID-R40-B2-C: the worker initargs are byte-identical to the
+        # pre-R40 transport when the capture is OFF (the extra transport arg is
+        # appended ONLY when the parent armed the capture and pre-computed the
+        # candidate geometry).
+        _initargs = (descs, canvas, science_cfg, global_gauge, global_frame_ids,
+                     global_reference_frame_id, tile_size, _cache_workers)
+        if _r40_coords_by_cell is not None:
+            _initargs = _initargs + (_r40_coords_by_cell,)
         _res = zpar.pmap(
             _stack_cell, _tasks, workers=_workers,
             progress_callback=_cell_progress_for(_tasks), emit=_emit_live, meta=_meta,
             initializer=_init_stack_worker,
-            initargs=(descs, canvas, science_cfg, global_gauge, global_frame_ids,
-                      global_reference_frame_id, tile_size, _cache_workers),
+            initargs=_initargs,
             serial_fallback=not gpu_attempt,
         )
         return _res, _meta
