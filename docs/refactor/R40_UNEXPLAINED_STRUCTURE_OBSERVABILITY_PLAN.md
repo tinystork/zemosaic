@@ -1264,6 +1264,38 @@ This section is a pointer, not a source of authority.
   gate stays at exactly `0`), **no production source file is changed** (one new test file only) and
   the capture stays **default-OFF**. **B2 acceptance is NOT claimed**: a real Windows run, `R40-C`,
   `R40-D` and `HUMAN_GATE` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.
+- **rework-20 (R40-B2-I bounded hardening I, before the B2 acceptance decision), before any
+  real R40 outcome:** closes the residual non-blocking advisories flagged by the independent
+  B2-H / B2-G reviews WITHOUT changing any tolerance, threshold, criterion or product
+  behaviour. (1) **SIP / distorted-WCS coverage of the ROI-parity gate (Nono B2-H L2):** the
+  production ROI/reprojection path CAN receive a SIP/polynomial (distorted) WCS —
+  `geometry.qualify_wcs` accepts `RA---TAN-SIP`/`DEC--TAN-SIP`, the production frame builder
+  `zemosaic_zegrid_mode._build_frame_descriptors` defaults to `sip_mode="keep"`, `slice_wcs`
+  is SIP-aware (`WCS.slice`), the planner has an explicit `_sip_source_polygon` branch, and
+  the product fast path is ineligible for SIP (so `reproject_cropped` takes the pre-R21
+  `reproject_interp` fallback). A **GENUINE** SIP fixture (real `A`/`B` terms) was therefore
+  ADDED to `tests/test_zegrid_r40b2_roi_parity.py` and MEASURED: **I1a** common-support parity
+  stays **BIT-IDENTICAL at tolerance exactly `0`**; **I2** is reported **`NOT_APPLICABLE`**
+  (never counted as a pass) while the SIP fallback arm still matches the reference at tolerance
+  `0`; **I1b** reaches **`RECOVERED`** (`min reduction >= 0.20`, independent relations, subset
+  support) through the real canonical stack. The SIP reachability verdict is recorded in §15.5-3
+  and §15.14. (2) **Host-RAM flakiness (Nono B2-H L4):** the memory seam
+  (`zz.available_memory_bytes`) is now **pinned via monkeypatch** in the e2e fixtures of
+  `tests/test_zegrid_r40b2_panel.py` and `tests/test_zegrid_r40b2_offon_identity.py` (the
+  B2-D/B2-G technique), so host free RAM can no longer flake them; the real production process
+  pool still runs and no assertion is skipped, weakened or deleted. (3) **B2-G LOWs:** (a) the
+  write path (`r40_capture._build_generation_payloads`) now **RE-DERIVES** the frozen
+  `candidate_set_digest` from the declared geometry (refusing an empty/duplicated geometry, a
+  digest that does not re-derive, or a recorded pair outside the declared geometry) instead of
+  merely storing it, and `_r40_seam_capture` re-derives the sealed `_r40_candidate_coords`
+  digest before writing; (b) `verify_generation` now **REFUSES explicitly** when a
+  declared-candidate-geometry shard's header omits a usable `block_px`, instead of silently
+  skipping the frozen block-parity re-check; (c) the seam write path now **asserts** that a
+  `production_wired=True` generation ALWAYS declares the candidate geometry for every shard, so
+  a future seam regression cannot silently fall back to the weaker verification level. **No
+  tolerance, threshold or gate is changed** (the §8 clause-2 OFF/ON gate stays at exactly `0`);
+  the capture stays **default-OFF**. **B2 acceptance is NOT claimed**: a real Windows run,
+  `R40-C`, `R40-D`, `HUMAN_GATE` and `LP341` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -1401,6 +1433,13 @@ regenerations.
    **BIT-IDENTICAL** with ineligible cases **`NOT_APPLICABLE`** (never counted as a pass), I1b
    coverage delta through the **real canonical stack** with `min reduction ≥ 0.20` on TAN and
    non-TAN with independent relations. A **real Windows run** and `R40-C`/`R40-D` remain `NOT_RUN`.
+   *SIP / distorted-WCS scope note added by bounded task I (§14 rework-20).* The **same** parity
+   was re-measured on a **GENUINE** SIP (`RA---TAN-SIP`/`DEC--TAN-SIP`, real `A`/`B` terms)
+   source WCS, which the production ROI path **CAN** receive (`qualify_wcs` accepts SIP TAN;
+   `_build_frame_descriptors` defaults to `sip_mode="keep"`; `slice_wcs` is SIP-aware; the fast
+   path is ineligible so `reproject_cropped` takes the `reproject_interp` fallback): I1a stays
+   `tolerance 0` **BIT-IDENTICAL**, I2 is **`NOT_APPLICABLE`** (never a pass), I1b is
+   **`RECOVERED`** (`min reduction >= 0.20`, independent relations).
 4. **Reprojection intervention** — I1a parity `tolerance 0`; I2 same-array parity `tolerance 0`;
    **I1b coverage delta through the real canonical stack with `min reduction ≥ 0.20` on TAN and
    non-TAN, requiring independent relations**; only I2's fast path may be `NOT_APPLICABLE`.
@@ -2017,6 +2056,21 @@ on the real product ROI path, and the status is recorded truthfully here, in §1
 `R40-B2` row. **No tolerance, threshold, gate or criterion was changed or widened**: the §8
 clause-2 OFF/ON byte identity stays at exactly `0`. The recovered/common-support diagnostic keeps
 its `ORCHESTRATION_ONLY_NON_GATING` labelling and gates nothing.
+
+**SIP / distorted-WCS coverage (Nono B2-H L2, closed by bounded task I; §14 rework-20).** A
+GENUINE SIP (`RA---TAN-SIP`/`DEC--TAN-SIP`, real `A`/`B` terms) source WCS is now exercised on the
+same real product ROI path, on top of TAN/non-TAN. **Reachability verdict (read from the code AND
+measured): the production ROI/reprojection path CAN receive a SIP/polynomial WCS** —
+`geometry.qualify_wcs` accepts SIP TAN, the production frame builder
+`zemosaic_zegrid_mode._build_frame_descriptors` defaults to `sip_mode="keep"` (no strip),
+`slice_wcs` is the SIP-aware `WCS.slice` crop, the planner has an explicit `_sip_source_polygon`
+branch, and the product fast path is ineligible for SIP (so `reproject_cropped` takes the pre-R21
+`reproject_interp` fallback). Measured on the SIP fixture: **I1a** common-support parity
+**BIT-IDENTICAL at tolerance exactly `0`** (the SIP frame planned from its OWN WCS); **I2**
+**`NOT_APPLICABLE`** (fast path ineligible, never counted as a pass) while the SIP fallback arm
+still matches the reference at tolerance `0`; **I1b** **`RECOVERED`** through the real canonical
+stack (`min reduction >= 0.20`, independent relations, strict-subset support). No tolerance,
+threshold or gate was changed.
 
 > **Task H does NOT accept B2.** It proves I1a/I1b/I2 parity on the real product ROI path under the
 > frozen criteria using **SYNTHETIC** prepared-source fixtures. The **real Windows816 run**, the

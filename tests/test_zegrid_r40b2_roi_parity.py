@@ -33,6 +33,21 @@ dispatcher, the real full-source oracle and the real canonical stack — on
 **SYNTHETIC inputs only**. This proves the *code path* parity; it is **not** a claim
 about the real Windows816 corpus, which is a **HUMAN GATE**.
 
+SIP / DISTORTED-WCS COVERAGE (Nono B2-H L2, closed by bounded task I). The production
+ROI/reprojection path **CAN** receive a SIP/polynomial (distorted) WCS: the production
+WCS gate ``geometry.qualify_wcs`` accepts ``RA---TAN-SIP``/``DEC--TAN-SIP`` on a pure TAN
+base; the production frame builder ``zemosaic_zegrid_mode._build_frame_descriptors``
+defaults to ``sip_mode="keep"`` (no strip); ``slice_wcs`` is the SIP-aware crop
+(``WCS.slice``); the planner has an explicit ``_sip_source_polygon`` branch; and the
+product fast path is ineligible for SIP, so ``reproject_cropped`` takes the pre-R21
+``reproject_interp`` fallback. A **GENUINE** SIP fixture (real ``A``/``B`` terms) is
+therefore exercised here on top of TAN/non-TAN: **I1a** common-support parity stays
+**BIT-IDENTICAL at tolerance exactly 0**; **I2** is reported **``NOT_APPLICABLE``**
+(fast path ineligible) and is **never counted as a pass**, while the SIP fallback arm
+still matches the reference at tolerance exactly 0; **I1b** reaches the frozen
+**``RECOVERED``** decision (``min reduction >= 0.20``, independent relations, subset
+support) through the real canonical stack. No tolerance/threshold/gate was changed.
+
 Explicit NON-CLAIMS (all ``NOT_RUN``): this suite does NOT claim R40-B2 acceptance, the
 real Windows run, R40-C/R40-D or HUMAN_GATE. No real data; no FITS/pixel/image/dataset
 traversal of the real corpus; no Windows816/Zealfie/LP341; no product default/GUI/config
@@ -42,13 +57,14 @@ was changed for this task (default-OFF, behaviour-neutral by construction: none)
 
 from __future__ import annotations
 
+import inspect
 import math
 from pathlib import Path
 
 import numpy as np
 import pytest
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import Sip, WCS
 from reproject import reproject_interp
 
 from zemosaic.core.canonical_engine import CanonicalStackRequest, run_canonical_stack
@@ -66,6 +82,7 @@ FROZEN_OFFSETS = np.array([0.013, -0.027, 0.041], dtype=np.float64)
 
 TAN = ("RA---TAN", "DEC--TAN")
 SIN = ("RA---SIN", "DEC--SIN")
+SIP = ("RA---TAN-SIP", "DEC--TAN-SIP")
 
 SRC_SHAPE_HW = (48, 64)
 PATCH_HW = (32, 32)
@@ -83,6 +100,27 @@ def _make_wcs(ctype, crpix, *, crval=(150.0, 2.0), cdelt=(-0.001, 0.001),
     w.wcs.crval = [float(crval[0]), float(crval[1])]
     w.wcs.cdelt = [float(cdelt[0]), float(cdelt[1])]
     w.array_shape = shape_hw
+    return w
+
+
+def _make_sip_wcs(ctype, crpix, *, crval=(150.0, 2.0), cdelt=(-0.001, 0.001),
+                  shape_hw=SRC_SHAPE_HW) -> WCS:
+    """A GENUINE 2-D celestial TAN+SIP WCS (real, non-zero ``A``/``B`` terms).
+
+    ``_make_wcs`` merely *names* the ``-SIP`` ctype; astropy only carries SIP when a
+    :class:`~astropy.wcs.Sip` object is attached AND the base ctype ends in ``-SIP``.
+    The coefficients below are a mild (sub-pixel over this small field) quadratic
+    distortion so the whole ROI path exercises the SIP branch — the production
+    ``qualify_wcs`` accepts ``RA---TAN-SIP``/``DEC--TAN-SIP`` on a pure TAN base.
+    """
+    w = _make_wcs(("RA---TAN", "DEC--TAN"), crpix, crval=crval, cdelt=cdelt,
+                  shape_hw=shape_hw)
+    w.wcs.ctype = [str(c) for c in ctype]
+    a = np.zeros((3, 3))
+    b = np.zeros((3, 3))
+    a[2, 0], a[0, 2], a[1, 1] = 5e-5, -3e-5, 2e-5
+    b[2, 0], b[0, 2], b[1, 1] = 4e-5, 3e-5, -2e-5
+    w.sip = Sip(a, b, None, None, [float(crpix[0]), float(crpix[1])])
     return w
 
 
@@ -188,7 +226,9 @@ def _product_contributors(tmp: Path, ctype, seed_base: int):
     Returns ``(contribs, tracker, by_id, paths, canvas, patch)``. For non-TAN source
     WCS the canvas/patch are the product TAN target geometry (the product canvas is
     always TAN by construction) and the crop bounds come from the TAN geometry twins;
-    the target WCS/shape are identical for both arms.
+    the target WCS/shape are identical for both arms. For a SIP source WCS the crop
+    plan is computed from the SIP frame ITSELF (the production planner's
+    ``_sip_source_polygon`` branch), so no TAN twin stands in for the source.
     """
     facts = [("f0.fits", 0.0, 0.0), ("f1.fits", 0.004, 0.003)]
     tan_frames, paths, frames = [], {}, []
@@ -199,8 +239,10 @@ def _product_contributors(tmp: Path, ctype, seed_base: int):
         if ctype == TAN:
             frames.append(fd)
         else:
-            w2 = _make_wcs(ctype, (SRC_SHAPE_HW[1] / 2.0, SRC_SHAPE_HW[0] / 2.0),
-                           crval=(150.0 + dra, 2.0 + ddec))
+            crpix = (SRC_SHAPE_HW[1] / 2.0, SRC_SHAPE_HW[0] / 2.0)
+            crval = (150.0 + dra, 2.0 + ddec)
+            w2 = (_make_sip_wcs(SIP, crpix, crval=crval) if ctype == SIP
+                  else _make_wcs(ctype, crpix, crval=crval))
             # Same data file/WCS centre; only the projection differs (source side).
             frames.append(_frame(key, w2))
 
@@ -216,7 +258,10 @@ def _product_contributors(tmp: Path, ctype, seed_base: int):
     crop_plans = {}
     for f in patch_frames:
         key = f.frame_id.logical_path
-        plan = zg.plan_source_roi(tan_by_id[key], canvas, patch)
+        # A SIP source is planned from its OWN WCS (the production SIP branch); a
+        # plain non-TAN source reuses the TAN twin's crop rectangle.
+        planning_frame = f if ctype == SIP else tan_by_id[key]
+        plan = zg.plan_source_roi(planning_frame, canvas, patch)
         crop_plans[key] = zg.SourceCropPlan(
             frame_id=key, cell_id=patch.cell_id,
             source_bounds=plan.source_bounds, margin_px=plan.margin_px,
@@ -253,6 +298,42 @@ def test_i1a_common_support_bit_identical_tolerance_zero(tmp_path, ctype, label)
         assert rec.n_pixels_read < rec.full_frame_pixels
         assert rec.axis_layout == "CHW"
     assert all(r["n_common"] > 0 for r in path_stats)
+
+
+def test_i1a_sip_source_wcs_bit_identical_tolerance_zero(tmp_path):
+    """I1a on the REAL product ROI path with a GENUINE SIP (distorted) source WCS.
+
+    Production CAN receive a SIP TAN WCS: ``qualify_wcs`` accepts
+    ``RA---TAN-SIP``/``DEC--TAN-SIP`` and the production frame builder defaults to
+    ``sip_mode="keep"``, so the SIP branch of the planner (``_sip_source_polygon``),
+    the SIP-aware ``slice_wcs`` (``WCS.slice``) and the ``reproject_cropped`` SIP
+    fallback are genuinely reached. The frozen I1a criterion (common-support parity,
+    tolerance exactly ``0``) must therefore hold here too — measured, never assumed;
+    the SIP frame is planned from its OWN WCS (no TAN twin stands in).
+    """
+    contribs, tracker, by_id, paths, _canvas, patch = _product_contributors(
+        tmp_path, SIP, 41500
+    )
+    assert contribs, "no product contributor produced for a SIP source"
+    patch_wcs = patch.patch_wcs()
+    checked = 0
+    for c in contribs:
+        fd = by_id[c.frame_id]
+        assert zg._has_sip(fd.wcs()), "the source WCS must genuinely carry SIP terms"
+        full_rgb, full_geom = zx.reproject_full_source(
+            fd, paths[c.frame_id], patch_wcs, patch.patch_shape_hw
+        )
+        res = _common_support_parity(c.rgb, c.geometric_support, full_rgb, full_geom)
+        assert res["decision"] == "PARITY_BIT_IDENTICAL", (c.frame_id, res)
+        assert res["max_abs_diff"] == 0.0, (c.frame_id, res)
+        assert res["n_common"] > 0, (c.frame_id, res)
+        checked += 1
+    assert checked == len(contribs) > 0
+    # Locality still holds for the SIP branch: every read is a strict sub-rectangle.
+    assert len(tracker.records) == len(contribs)
+    for rec in tracker.records:
+        assert rec.n_pixels_read < rec.full_frame_pixels
+        assert rec.axis_layout == "CHW"
 
 
 def test_i1a_crop_array_is_byte_identical_to_full_source_section(tmp_path):
@@ -308,10 +389,11 @@ def test_i1a_parity_gate_is_not_vacuous(tmp_path):
 # I2 — same-array fast vs reference parity (product symbols), non-TAN refused
 # ---------------------------------------------------------------------------
 
-def _i2_case(tmp_path, ctype, seed):
+def _i2_case(tmp_path, ctype, seed, *, sip: bool = False):
     src = _synthetic_plane(seed)
-    full_wcs = _make_wcs(ctype, (32.0, 32.0))
-    patch_wcs = _make_wcs(ctype, (32.0, 32.0))
+    make = _make_sip_wcs if sip else _make_wcs
+    full_wcs = make(ctype, (32.0, 32.0))
+    patch_wcs = make(ctype, (32.0, 32.0))
     path = _write_prepared(tmp_path / "i2_prep.fits", src, full_wcs)
     bounds = zg.SourceBounds(x0=4, y0=4, x1=52, y1=52)
 
@@ -372,6 +454,67 @@ def test_i2_non_tan_fast_ineligible_refused_not_counted_as_pass(tmp_path):
     assert "pass" not in decision
 
 
+def test_i2_sip_distorted_fast_ineligible_refused_not_counted_as_pass(tmp_path):
+    """A GENUINE SIP (distorted) WCS is fast-path INELIGIBLE -> refused explicitly.
+
+    The product fast path is only bit-exact for plain undistorted TAN, so a SIP
+    source takes the SIP fallback; the case is reported ``NOT_APPLICABLE`` and is
+    NEVER counted as a fast-path parity pass. The fallback arm itself is still
+    bit-identical to the reference on the SAME cropped array (tolerance ``0``).
+    """
+    case = _i2_case(tmp_path, SIP, 42003, sip=True)
+    assert zg._has_sip(case["crop_wcs"]) is True, "the cropped WCS must carry SIP terms"
+    assert case["path_used"] == "fallback", "SIP must take the product fallback"
+    assert zx._plain_tan_wcs(case["crop_wcs"]) is False
+    decision = {
+        "arm": "i2", "kind": "sip_distorted", "path": case["path_used"],
+        "fast_path_eligible": False, "counted_as_parity_pass": False,
+        "decision": "NOT_APPLICABLE",
+        "reason": ("fast path ineligible for a SIP/distorted WCS; reported separately "
+                   "and never merged into the fast-path parity statistic"),
+    }
+    assert decision["decision"] == "NOT_APPLICABLE"
+    assert decision["counted_as_parity_pass"] is False
+    assert "pass" not in decision
+    # The fallback (the pre-R21 ``reproject_interp`` path) still matches the
+    # reference on the identical array at tolerance exactly 0.
+    res = _common_support_parity(case["prod"], case["geom"], case["reference"],
+                                 np.isfinite(case["reference"]).all(axis=-1))
+    assert res["decision"] == "PARITY_BIT_IDENTICAL", res
+    assert res["max_abs_diff"] == 0.0
+
+
+def test_sip_wcs_is_reachable_in_production_and_reaches_the_roi_path(tmp_path):
+    """Reachability evidence (Nono B2-H L2): the product ROI path CAN receive SIP.
+
+    Read from the production code AND measured: the production WCS gate
+    (``geometry.qualify_wcs``) accepts a SIP TAN WCS; the production frame builder
+    defaults to ``sip_mode="keep"`` (so SIP frames reach the ROI path unchanged);
+    ``slice_wcs`` is the SIP-aware crop; and the product dispatcher's fast path is
+    ineligible for SIP, so ``reproject_cropped`` takes the pre-R21
+    ``reproject_interp`` fallback. Therefore a SIP fixture is a REAL production case,
+    not a hypothetical one.
+    """
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    sip = _make_sip_wcs(SIP, (32.0, 32.0))
+    assert zg._has_sip(sip) is True
+    assert zg.qualify_wcs(sip) is None, "production must accept a SIP TAN WCS"
+    assert zx._plain_tan_wcs(sip) is False, "SIP is ineligible for the product fast path"
+    assert inspect.signature(zz._build_frame_descriptors).parameters["sip_mode"].default == \
+        "keep", "production keeps SIP by default"
+
+    src = _synthetic_plane(45001)
+    path = _write_prepared(tmp_path / "sip_reach.fits", src, sip)
+    bounds = zg.SourceBounds(x0=4, y0=4, x1=52, y1=52)
+    crop = zx._read_section_chw(path, bounds)
+    crop_wcs = zx.slice_wcs(sip, bounds)
+    assert zg._has_sip(crop_wcs) is True
+    zx.reset_reproject_path_stats()
+    zx.reproject_cropped(crop, crop_wcs, _make_sip_wcs(SIP, (32.0, 32.0)), PATCH_HW)
+    assert zx.get_reproject_path_stats().to_dict()["path"] == "fallback"
+
+
 # ---------------------------------------------------------------------------
 # I1b — coverage delta through the REAL product canonical stack
 # ---------------------------------------------------------------------------
@@ -398,7 +541,7 @@ def _i1b_tight_bounds(frame_idx: int, taper: int) -> zg.SourceBounds:
 
 
 def _i1b_patch(tmp_path, ctype, patch_index: int, seed: int, *, taper: int = 2,
-               n_frames: int = 3) -> dict:
+               n_frames: int = 3, sip: bool = False) -> dict:
     """One bounded synthetic patch through the product ROI path.
 
     Production/crop arm  = ``_read_section_chw`` + ``slice_wcs`` + ``reproject_cropped``
@@ -407,9 +550,11 @@ def _i1b_patch(tmp_path, ctype, patch_index: int, seed: int, *, taper: int = 2,
     Truth arm            = reference restricted to the crop arm's identical support loss.
     All three are stacked with the REAL product canonical stack and the same offsets.
     """
-    full_wcs = _make_wcs(ctype, (32.0, 32.0))
+    full_wcs = (_make_sip_wcs(ctype, (32.0, 32.0)) if sip
+                else _make_wcs(ctype, (32.0, 32.0)))
     shift = 3 * patch_index
-    patch_wcs = _make_wcs(ctype, (32.0 + shift, 32.0 + shift))
+    patch_wcs = (_make_sip_wcs(ctype, (32.0 + shift, 32.0 + shift)) if sip
+                 else _make_wcs(ctype, (32.0 + shift, 32.0 + shift)))
 
     src = _synthetic_source(seed, SRC_SHAPE_HW, n_frames)
     prod_imgs, prod_sup, ref_imgs, ref_sup = [], [], [], []
@@ -521,6 +666,29 @@ def test_i1b_coverage_delta_through_product_canonical_stack(tmp_path, ctype, lab
     verdict = _i1b_verdict(patches, n_patches_expected=2)
     assert verdict["decision"] == "RECOVERED", (label, verdict)
     assert verdict["min_reduction"] >= REDUCTION_MIN, (label, verdict)
+    assert verdict["h_relations"] >= RELATIONS_PER_ORIENTATION_MIN
+    assert verdict["v_relations"] >= RELATIONS_PER_ORIENTATION_MIN
+    assert all(p["support_subset_ok"] for p in patches)
+    for r in verdict["relation_stats"]:
+        assert r["reduction"] >= REDUCTION_MIN
+        assert r["independent_relation"] is True
+        assert r["diagnostic_label"] == "ORCHESTRATION_ONLY_NON_GATING"
+
+
+def test_i1b_sip_distorted_coverage_delta_through_product_canonical_stack(tmp_path):
+    """I1b with a GENUINE SIP (distorted) WCS: same frozen gate, measured.
+
+    The coverage delta is propagated through the REAL product canonical stack and the
+    frozen additive offsets exactly as for TAN/non-TAN; the SIP arm must reach the
+    frozen ``RECOVERED`` decision (``min reduction >= 0.20``) with independent
+    relations and a production support that is a strict subset of the full-source
+    support — never a default pass.
+    """
+    seed = 44500
+    patches = [_i1b_patch(tmp_path, SIP, i, seed + 101 * i, sip=True) for i in range(2)]
+    verdict = _i1b_verdict(patches, n_patches_expected=2)
+    assert verdict["decision"] == "RECOVERED", verdict
+    assert verdict["min_reduction"] >= REDUCTION_MIN, verdict
     assert verdict["h_relations"] >= RELATIONS_PER_ORIENTATION_MIN
     assert verdict["v_relations"] >= RELATIONS_PER_ORIENTATION_MIN
     assert all(p["support_subset_ok"] for p in patches)

@@ -543,6 +543,62 @@ def test_manifest_off_has_no_new_field(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Declared candidate geometry is MANDATORY on the write path (Nono B2-G LOW a+c)
+# ---------------------------------------------------------------------------
+
+
+def test_seam_refuses_a_generation_that_omits_the_candidate_geometry(tmp_path, monkeypatch):
+    """A production-wired seam generation MUST declare the candidate geometry for
+    every shard (Nono B2-G LOW c). A future seam regression that dropped it is
+    REFUSED instead of silently falling back to the weaker verification level."""
+    from zemosaic.core.zegrid import r40_capture as rc
+
+    canvas, patches = _make_patches(2, 2, _levels_2x2())
+    results_on = _with_sparse(_results_from_patches(patches), patches, 2, 2)
+    ctx = _context(tmp_path, canvas, 2, 2, results_on)
+
+    real_shard = rc.RelationShard
+
+    class _NoGeomShard(real_shard):  # simulate a seam regression: geometry dropped
+        def __init__(self, *a, **k):
+            k.pop("candidate_coords", None)
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(rc, "RelationShard", _NoGeomShard)
+    with pytest.raises(rc.SchemaError):
+        zz._assemble_per_cell_feathered(
+            canvas, 2, 2, results_on, r40_capture=True, r40_context=ctx,
+        )
+    # fail-closed: NOTHING was published
+    assert _generations(tmp_path) == []
+
+
+def test_seam_declared_geometry_re_derives_the_sealed_candidate_set(tmp_path, monkeypatch):
+    """The declared geometry MUST re-derive the SEALED ``_r40_candidate_coords`` set
+    (Nono B2-G LOW a): a shard declared with a DIFFERENT geometry is REFUSED."""
+    from zemosaic.core.zegrid import r40_capture as rc
+
+    canvas, patches = _make_patches(2, 2, _levels_2x2())
+    results_on = _with_sparse(_results_from_patches(patches), patches, 2, 2)
+    ctx = _context(tmp_path, canvas, 2, 2, results_on)
+
+    real_shard = rc.RelationShard
+
+    class _WrongGeomShard(real_shard):
+        def __init__(self, *a, **k):
+            coords = k.get("candidate_coords") or ()
+            k["candidate_coords"] = tuple(coords) + ((123456, 123456),)
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(rc, "RelationShard", _WrongGeomShard)
+    with pytest.raises(rc.SchemaError):
+        zz._assemble_per_cell_feathered(
+            canvas, 2, 2, results_on, r40_capture=True, r40_context=ctx,
+        )
+    assert _generations(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
 # Independence from the accepted R37-D capture
 # ---------------------------------------------------------------------------
 

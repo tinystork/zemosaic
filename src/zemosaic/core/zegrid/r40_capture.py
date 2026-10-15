@@ -1243,6 +1243,40 @@ def _build_generation_payloads(
         digest = sha256_bytes(data)
         header = shard.header_payload()
         keys = shard.sample_keys()
+        # ZM-ZEGRID-R40-B2-I (Nono B2-G LOW a): the frozen ``candidate_set_digest``
+        # must be RE-DERIVED from the declared geometry on the WRITE side, not merely
+        # stored. A declared candidate geometry is refused when it is empty, carries
+        # duplicate coordinates, fails to re-derive its own frozen digest, or does not
+        # cover every coordinate actually recorded in the shard (the geometry the
+        # sparse transport was built from must be a superset of the captured pairs).
+        candidate_digest = shard.candidate_digest()
+        n_candidates = int(shard.n_candidates())
+        if shard.candidate_coords:
+            coords = tuple((int(gx), int(gy)) for gx, gy in shard.candidate_coords)
+            _require(
+                len(coords) > 0,
+                f"declared candidate geometry is empty for {shard.relation_id}",
+            )
+            _require(
+                len(coords) == len(set(coords)),
+                f"declared candidate geometry has duplicate coordinates for {shard.relation_id}",
+            )
+            _require(
+                candidate_set_digest(coords) == candidate_digest,
+                "candidate_set_digest does not re-derive from the declared geometry "
+                f"for {shard.relation_id}",
+            )
+            _require(
+                n_candidates == len(set(coords)),
+                f"declared n_candidates disagrees with the candidate geometry for {shard.relation_id}",
+            )
+            geometry = set(coords)
+            recorded = {(int(r["gx"]), int(r["gy"])) for r in shard.records}
+            _require(
+                recorded <= geometry,
+                "recorded pair coordinate lies outside the declared candidate geometry "
+                f"for {shard.relation_id}",
+            )
         shard_blobs.append({
             "relation_id": shard.relation_id,
             "u": shard.u,
@@ -1253,8 +1287,8 @@ def _build_generation_payloads(
             "bytes": int(len(data)),
             "sha256": digest,
             "pairset_digest": pairset_digest(keys),
-            "candidate_set_digest": shard.candidate_digest(),
-            "n_candidates": int(shard.n_candidates()),
+            "candidate_set_digest": candidate_digest,
+            "n_candidates": n_candidates,
             "header": header,
             "_data": data,
         })
@@ -1542,6 +1576,22 @@ def verify_generation(gen_dir: Any, *, expected_production_wired: bool = EXPECTE
                     block_px = int(header["block_px"])
                 except (TypeError, ValueError):
                     block_px = None
+            # ZM-ZEGRID-R40-B2-I (Nono B2-G LOW b): a shard that DECLARES its frozen
+            # candidate geometry must expose a usable ``block_px`` so the odd/odd
+            # block-parity predicate can be re-checked from the bytes. Silently
+            # skipping the re-check because ``block_px`` is absent would restore the
+            # weaker verification level the declared geometry exists to prevent, so it
+            # is REFUSED explicitly instead.
+            if block_px is None:
+                problems.append(
+                    "declared candidate geometry without a usable 'block_px' header "
+                    f"field; refusing to skip the frozen block-parity re-check {filename}"
+                )
+            elif block_px <= 0:
+                problems.append(
+                    f"declared candidate geometry with non-positive 'block_px' {filename}"
+                )
+                block_px = None
             keys: list[str] = []
             coord_seen: set[tuple[int, int]] = set()
             for row in array:

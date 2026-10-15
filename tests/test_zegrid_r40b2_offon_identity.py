@@ -87,6 +87,12 @@ _PIN_HIGH = 4 * 1024 ** 3
 _PLAN_KEYS = ("mode", "cells_in_flight", "per_cell_footprint_bytes",
               "cache_build_workers", "cache_workers_per_cell", "executor", "workers")
 
+# ZM-ZEGRID-R40-B2-I (Nono B2-H L4): the memory seam is PINNED in the uncontrolled
+# product runs too, so the scheduler plan is a deterministic function of a CONSTANT
+# and host free RAM can no longer flake them (the B2-D/B2-G technique). The real
+# production process pool still runs; no assertion is skipped, weakened or deleted.
+_PIN_PRODUCT = 4 * 1024 ** 3
+
 
 # ---------------------------------------------------------------------------
 # Synthetic corpus + production run harness (NO real data)
@@ -133,18 +139,22 @@ def _run(inp, out, *, r40_root=None):
 
 @pytest.fixture(scope="module")
 def product_runs(tmp_path_factory):
-    """Uncontrolled, faithful product runs: OFF twice (OFF determinism) and ON
-    once, on the SAME synthetic inputs and seeds.
+    """Faithful product runs: OFF twice (OFF determinism) and ON once, on the SAME
+    synthetic inputs and seeds.
 
-    Only the accepted B2-C concurrency seam (``zpar.cells_in_flight``) is pinned
-    to 3 so the production PROCESS pool runs and the real worker->parent sparse
-    transport is exercised with the capture ON. The environment (free RAM) is NOT
-    pinned, so the scheduler may legitimately plan differently between runs.
+    The accepted B2-C concurrency seam (``zpar.cells_in_flight``) is pinned to 3 so
+    the production PROCESS pool runs and the real worker->parent sparse transport is
+    exercised with the capture ON. The memory seam (``zz.available_memory_bytes``) is
+    ALSO pinned to a CONSTANT (Nono B2-H L4) so the scheduler plan is deterministic
+    and host free RAM can no longer flake the runs; the real production process pool
+    still runs and no assertion is skipped, weakened or deleted.
     """
     base = tmp_path_factory.mktemp("r40b2_offon")
     inp = _write_corpus(base / "in")
     real_cif = zpar.cells_in_flight
     real_coords = zz._STACK_R40_WORKER_COORDS
+    mp = pytest.MonkeyPatch()
+    mp.setattr(zz, "available_memory_bytes", lambda: _PIN_PRODUCT)
     zpar.cells_in_flight = lambda *a, **k: 3
     try:
         off1 = base / "off1"
@@ -158,6 +168,7 @@ def product_runs(tmp_path_factory):
         # the R40 worker transport global may be armed in-process by a serial
         # fallback; restore it so this suite leaks NO module state to others.
         zz._STACK_R40_WORKER_COORDS = real_coords
+        mp.undo()
     return SimpleNamespace(base=base, inp=inp, off1=off1, off2=off2, on=on,
                            r40_root=base / "r40gen")
 

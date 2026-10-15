@@ -364,6 +364,90 @@ def test_verify_generation_detects_tampering(out_root):
 
 
 # ---------------------------------------------------------------------------
+# 4b. Declared candidate geometry: write-side re-derivation + verify refusal
+#     (ZM-ZEGRID-R40-B2-I, Nono B2-G LOW a/b)
+# ---------------------------------------------------------------------------
+
+
+def _geom_shard(records, coords, **header_overrides):
+    return c.RelationShard(
+        u="c0001", v="c0002", orientation="h",
+        header=make_header("c0001", "c0002", "h", **header_overrides),
+        records=tuple(records), candidate_coords=tuple(coords),
+    )
+
+
+def test_declared_candidate_geometry_writes_and_re_derives(out_root):
+    """Positive control: a well-formed declared geometry is stored AND re-derived."""
+    shard = _geom_shard((make_record(0, 5, 6),), ((5, 6), (9, 10)))
+    report = c.write_capture_generation(
+        out_root, shards=[shard], identity=make_identity(), config=enabled_config(out_root)
+    )
+    gen = out_root / report["generation_dir"]
+    index = json.loads((gen / c.GENERATION_INDEX_BASENAME).read_text(encoding="utf-8"))
+    entry = index["shards"][0]
+    assert entry["candidate_set_digest"] == c.candidate_set_digest(((5, 6), (9, 10)))
+    assert entry["n_candidates"] == 2
+    assert c.verify_generation(gen)["ok"] is True
+
+
+def test_write_refuses_declared_geometry_with_duplicate_coordinates(out_root):
+    shard = _geom_shard((make_record(0, 5, 6),), ((5, 6), (5, 6)))
+    with pytest.raises(c.SchemaError, match="duplicate coordinates"):
+        c.write_capture_generation(
+            out_root, shards=[shard], identity=make_identity(),
+            config=enabled_config(out_root),
+        )
+    assert not out_root.exists() or not list(out_root.glob("r40_capture_*"))
+
+
+def test_write_refuses_empty_declared_candidate_geometry(out_root):
+    shard = _geom_shard((make_record(0, 5, 6),), ())
+    # an EMPTY geometry is falsy -> treated as "no geometry" by RelationShard; the
+    # write path must therefore not claim to have re-derived a digest for it.
+    assert shard.candidate_digest() is None
+    report = c.write_capture_generation(
+        out_root, shards=[shard], identity=make_identity(), config=enabled_config(out_root)
+    )
+    gen = out_root / report["generation_dir"]
+    index = json.loads((gen / c.GENERATION_INDEX_BASENAME).read_text(encoding="utf-8"))
+    assert index["shards"][0]["candidate_set_digest"] is None
+
+
+def test_write_refuses_recorded_pair_outside_declared_candidate_geometry(out_root):
+    shard = _geom_shard((make_record(0, 5, 6),), ((1, 2), (3, 4)))
+    with pytest.raises(c.SchemaError, match="outside the declared candidate geometry"):
+        c.write_capture_generation(
+            out_root, shards=[shard], identity=make_identity(),
+            config=enabled_config(out_root),
+        )
+
+
+def test_verify_generation_refuses_declared_geometry_without_block_px(out_root):
+    """A declared-geometry shard whose header omits ``block_px`` is REFUSED, not
+    silently verified at the weaker level (Nono B2-G LOW b)."""
+    shard = _geom_shard((make_record(0, 5, 6),), ((5, 6),))
+    report = c.write_capture_generation(
+        out_root, shards=[shard], identity=make_identity(), config=enabled_config(out_root)
+    )
+    gen = out_root / report["generation_dir"]
+    assert c.verify_generation(gen)["ok"] is True
+
+    index = json.loads((gen / c.GENERATION_INDEX_BASENAME).read_text(encoding="utf-8"))
+    assert "block_px" in index["shards"][0]["header"]
+    del index["shards"][0]["header"]["block_px"]
+    index_bytes = c.dumps_strict(index).encode("utf-8")
+    (gen / c.GENERATION_INDEX_BASENAME).write_bytes(index_bytes)
+    commit = json.loads((gen / c.GENERATION_COMMIT_BASENAME).read_text(encoding="utf-8"))
+    commit["index_sha256"] = c.sha256_bytes(index_bytes)
+    (gen / c.GENERATION_COMMIT_BASENAME).write_bytes(c.dumps_strict(commit).encode("utf-8"))
+
+    verified = c.verify_generation(gen)
+    assert verified["ok"] is False
+    assert any("block_px" in p for p in verified["problems"]), verified["problems"]
+
+
+# ---------------------------------------------------------------------------
 # 5. Budget boundary and overflow refusal
 # ---------------------------------------------------------------------------
 

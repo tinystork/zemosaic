@@ -1917,6 +1917,31 @@ def _r40_seam_capture(patches, nx, ny, result_by_cid, *, context):
     if not shards:
         raise rc.SchemaError("R40 seam capture produced no relation shard (no exact held-out samples)")
 
+    # ZM-ZEGRID-R40-B2-I (Nono B2-G LOW a + c). A production-wired seam generation
+    # MUST declare the frozen candidate geometry for EVERY shard (a future seam
+    # regression must not silently fall back to the weaker, no-declared-geometry
+    # verification level), and the declared geometry MUST re-derive the frozen
+    # candidate-set digest from the SEALED ``_r40_candidate_coords`` set — so the
+    # digest is re-derived on the write side, never merely stored.
+    for shard in shards:
+        if shard.candidate_coords is None:
+            raise rc.SchemaError(
+                "R40 seam capture: a production-wired generation must declare the "
+                f"candidate geometry for every shard ({shard.relation_id})"
+            )
+        sealed = tuple(
+            (int(gx), int(gy))
+            for (gx, gy) in _r40_candidate_coords(
+                patches, str(shard.u), str(shard.v), block_px=block_px
+            )
+        )
+        declared = tuple((int(gx), int(gy)) for gx, gy in shard.candidate_coords)
+        if rc.candidate_set_digest(declared) != rc.candidate_set_digest(sealed):
+            raise rc.SchemaError(
+                "R40 seam capture: declared candidate geometry does not re-derive the "
+                f"sealed frozen geometry for {shard.relation_id}"
+            )
+
     identity = rc.make_capture_identity(
         capture_id=str(ctx["capture_id"]),
         source_set_digest=str(ctx["source_set_digest"]),
