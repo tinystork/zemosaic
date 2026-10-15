@@ -1517,9 +1517,11 @@ def _r40_candidate_coords(patches, u, v, *, block_px):
 
     Reuses the frozen §1.3 block-parity rule (``bx % 2 == 1 AND by % 2 == 1``,
     ``bx = gx // block_px``, ``by = gy // block_px``) over the shared halo band,
-    ordered deterministically by ``(gy, gx)``. This is the geometry SUPERSET that
-    can contain the accepted R37 held-out keys; the exact §1.3 held-out
-    intersection/parity fixtures are NOT applied here (declared NOT_RUN).
+    ordered deterministically by ``(gy, gx)``. This is the geometry SUPERSET the
+    worker→parent transport is built from. It is NOT the capture's sample set:
+    the parent intersects it with the EXACT §1.3 held-out selection recovered by
+    :func:`_r40_exact_heldout_keys` (``observe_edge`` + the frozen integer/block
+    inverse), fail-closed — see R40-B2-G, plan §15.13.
     """
     y0, y1, x0, x1 = _r40_overlap_band(patches[u], patches[v])
     if y1 <= y0 or x1 <= x0:
@@ -1530,6 +1532,43 @@ def _r40_candidate_coords(patches, u, v, *, block_px):
     keep_x = ((gx // int(block_px)) % 2) == 1
     return tuple(
         (int(x), int(y)) for y in gy[keep_y] for x in gx[keep_x]
+    )
+
+
+def _r40_exact_heldout_keys(patches, u, v, channel, *, canvas_width, canvas_height,
+                            nx, ny, block_px, measurement_px):
+    """EXACT frozen-rule held-out keys for ONE relation/channel (fail-closed).
+
+    The capture's sample set must BE the accepted R37 held-out sample set, not
+    merely its candidate geometry superset. The exact set is therefore the
+    accepted evidence itself: the FROZEN production observation
+    (``background_model.observe_edge``) is evaluated on the two patches with the
+    frozen measurement band and the frozen relation normal boundary (reused from
+    ``background_model.relation_normal_boundary`` — never re-derived), and its
+    normalized ``holdout_xy`` is recovered to EXACT global INTEGER keys through
+    the frozen §1.3 integer/block inverse (round-half-up, ``INV_TOL``, parity
+    verified) — never a raw floor of normalized floats.
+
+    Returns ``None`` when the frozen observation itself refuses (that
+    relation/channel carries no R37 held-out evidence, exactly as the accepted
+    artifact drops it); any malformed/ambiguous recovery REFUSES.
+    """
+    from .core.zegrid import background_diagnostics as _bgd
+    from .core.zegrid import background_model as zbm
+
+    rc = _r40_lazy_core()
+    canvas_hw = (int(canvas_height), int(canvas_width))
+    boundary = zbm.relation_normal_boundary(u, v, int(nx), int(ny), canvas_hw)
+    obs, _reason = zbm.observe_edge(
+        _bgd._as_plan_cell(patches[u]), _bgd._as_plan_cell(patches[v]), canvas_hw,
+        int(channel), block_px=int(block_px), measurement_px=int(measurement_px),
+        normal_boundary=float(boundary),
+    )
+    if obs is None:
+        return None
+    return rc.heldout_keys_from_xy(
+        obs.holdout_xy, canvas_width=int(canvas_width),
+        canvas_height=int(canvas_height), block_px=int(block_px),
     )
 
 
@@ -1777,21 +1816,35 @@ def _r40_seam_capture(patches, nx, ny, result_by_cid, *, context):
         pu, pv = patches[u], patches[v]
         uy0, _, ux0, _ = pu.bounds
         vy0, _, vx0, _ = pv.bounds
-        y0, y1, x0, x1 = _r40_overlap_band(pu, pv)
         candidates = _r40_candidate_coords(patches, u, v, block_px=block_px)
+        candidates_set = set(candidates)
         records = []
         for channel in range(channels):
-            # Shared-valid selection reuses the FROZEN production helper
-            # (``shared_valid_mask``): no duplicated validity maths.
-            su = np.asarray(pu.science)[y0 - uy0:y1 - uy0, x0 - ux0:x1 - ux0, channel:channel + 1]
-            sv = np.asarray(pv.science)[y0 - vy0:y1 - vy0, x0 - vx0:x1 - vx0, channel:channel + 1]
-            vu = np.asarray(pu.valid_mask)[y0 - uy0:y1 - uy0, x0 - ux0:x1 - ux0, channel:channel + 1]
-            vv = np.asarray(pv.valid_mask)[y0 - vy0:y1 - vy0, x0 - vx0:x1 - vx0, channel:channel + 1]
-            shared = zcf.shared_valid_mask(su, vu, sv, vv)
-            keys = [
-                (gx, gy) for (gx, gy) in candidates
-                if bool(shared[int(gy) - y0, int(gx) - x0])
-            ]
+            # EXACT held-out selection (frozen §1.3): the accepted R37 held-out
+            # evidence itself, recovered through the frozen integer/block inverse —
+            # never the raw candidate geometry superset and never a box/validity
+            # approximation thereof.
+            keys = _r40_exact_heldout_keys(
+                patches, u, v, channel,
+                canvas_width=int(ctx["canvas_width"]),
+                canvas_height=int(ctx["canvas_height"]),
+                nx=int(nx), ny=int(ny), block_px=block_px,
+                measurement_px=int(ctx["measurement_px"]),
+            )
+            if keys is None:
+                # The frozen observation refuses: no R37 held-out evidence for
+                # this relation/channel (the accepted artifact drops it too).
+                continue
+            # Fail-closed: every EXACT key must lie in the candidate geometry the
+            # workers transported; a missing candidate means an incomplete
+            # transport and REFUSES the capture (never a silent drop).
+            missing = [k for k in keys if k not in candidates_set]
+            if missing:
+                raise rc.SchemaError(
+                    "R40 seam capture: exact held-out key(s) absent from the "
+                    f"candidate geometry for {u!r}/{v!r} channel {channel}: "
+                    f"{missing[:4]}"
+                )
             if not keys:
                 continue
             samples_u, samples_v = [], []
@@ -1858,10 +1911,11 @@ def _r40_seam_capture(patches, nx, ny, result_by_cid, *, context):
         shards.append(rc.RelationShard(
             u=str(u), v=str(v), orientation=orientation, header=header,
             records=tuple(records),
+            candidate_coords=tuple((int(gx), int(gy)) for (gx, gy) in candidates),
         ))
 
     if not shards:
-        raise rc.SchemaError("R40 seam capture produced no relation shard (no shared-valid candidates)")
+        raise rc.SchemaError("R40 seam capture produced no relation shard (no exact held-out samples)")
 
     identity = rc.make_capture_identity(
         capture_id=str(ctx["capture_id"]),

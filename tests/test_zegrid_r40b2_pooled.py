@@ -61,6 +61,14 @@ BLOCK_PX = 4
 CORE = 32
 HALO = 8
 CHANNELS = 3
+# The scheduler plan is a pure function of the free RAM measured at plan time, so
+# the host's actual free RAM makes a run's plan — and therefore the manifest's
+# run-volatile plan leaves — host-dependent (a pre-existing property, not R40).
+# Pinning the memory seam to a CONSTANT makes the plan deterministic (exactly the
+# technique the B2-D suite uses). It does NOT weaken the test: the real process
+# pool still runs and the pre-R40 transport / byte-identity obligations are
+# unchanged — it only removes the host-RAM sensitivity (Nono B2-F L3).
+_PIN_MEM_BYTES = 4 * 1024 ** 3
 # Pre-R40 worker result key set for a COMPLETE cell (captured from the accepted
 # B2-B wiring): the transport must add NO key when the capture is OFF.
 _PRE_R40_COMPLETE_KEYS = frozenset({
@@ -434,6 +442,9 @@ def test_proof_e2_spawn_pool_payload_identity_and_bound(tmp_path):
 
 
 def test_proof_f_real_pooled_run_capture_off_no_transport(tmp_path, monkeypatch):
+    # pin the memory seam so the scheduler plan is a deterministic function of a
+    # CONSTANT (B2-D technique); the real production process pool still runs.
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: _PIN_MEM_BYTES)
     inp = _write_corpus(tmp_path / "in")
     out = tmp_path / "out"
     seen = _run_pooled(inp, out, monkeypatch, r40=False)

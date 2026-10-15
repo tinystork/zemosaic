@@ -379,13 +379,25 @@ def _parse_rc(cell_id):
     return int(cell_id[1:5]), int(cell_id[6:10])
 
 
+def relation_normal_boundary(u, v, nx, ny, canvas_hw) -> float:
+    """Frozen relation normal boundary in GLOBAL PIXEL units (§3.2/§1.3).
+
+    ``b = (col(u)+1) * W/nx`` for an ``h`` relation and ``(row(u)+1) * H/ny`` for
+    a ``v`` relation, with ``(W, H) = (canvas_hw[1], canvas_hw[0])``. This is the
+    EXACT arithmetic the accepted ``build_observations`` has always used, factored
+    out so no other caller has to duplicate (and drift from) it.
+    """
+    w, h = int(canvas_hw[1]), int(canvas_hw[0])
+    cell_w, cell_h = w / float(nx), h / float(ny)
+    (ur, uc), (vr, vc) = _parse_rc(u), _parse_rc(v)
+    return float((ur + 1) * cell_h) if vr > ur else float((uc + 1) * cell_w)
+
+
 def build_observations(cells, nx, ny, canvas_hw, *, channels=None,
                        block_px=BLOCK_PX, measurement_px=DEFAULT_MEASUREMENT_PX):
     """Returns ``(observations, dropped)``; ``dropped`` is an explicit inventory."""
     if channels is None:
         channels = cells[next(iter(cells))].channels()
-    w, h = int(canvas_hw[1]), int(canvas_hw[0])
-    cell_w, cell_h = w / float(nx), h / float(ny)
     out: list[EdgeObservation] = []
     dropped: list[dict] = []
     for (u, v) in grid_adjacency(nx, ny):
@@ -393,8 +405,7 @@ def build_observations(cells, nx, ny, canvas_hw, *, channels=None,
             dropped.append({"u": u, "v": v, "channel": None, "reason": "cell_absent"})
             continue
         cu, cv = cells[u], cells[v]
-        (ur, uc), (vr, vc) = _parse_rc(u), _parse_rc(v)
-        boundary = float((ur + 1) * cell_h) if vr > ur else float((uc + 1) * cell_w)
+        boundary = relation_normal_boundary(u, v, nx, ny, canvas_hw)
         for c in range(channels):
             obs, reason = observe_edge(cu, cv, canvas_hw, c, block_px=block_px,
                                        measurement_px=measurement_px, normal_boundary=boundary)

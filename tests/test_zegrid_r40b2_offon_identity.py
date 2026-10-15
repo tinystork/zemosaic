@@ -259,74 +259,17 @@ def _manifest(out_dir):
     return json.loads((pathlib.Path(out_dir) / "zegrid_manifest.json").read_text())
 
 
-def _segments(path):
-    return [s for s in path.split(".") if s]
-
-
-# --- (a) PRE-EXISTING measurement fields: wall seconds / per-unit, RSS. --------
-_MEASUREMENT_SUFFIXES = ("_s", "_seconds", "_sum_s", "_per_unit", "_unit")
-_MEASUREMENT_SUBSTRINGS = ("rss_kib", "seconds", "reproject_s")
-_MEASUREMENT_EXACT = {"seconds", "phase_seconds", "peak_rss_kib", "aggregate_peak_rss_kib"}
-
-
-def _is_measurement_volatile(path):
-    segs = _segments(path)
-    if segs and segs[0] == "timings":
-        return True
-    for seg in segs:
-        if seg.endswith(_MEASUREMENT_SUFFIXES) or seg in _MEASUREMENT_EXACT:
-            return True
-        if any(h in seg for h in _MEASUREMENT_SUBSTRINGS):
-            return True
-    return False
-
-
-# --- (a)+(b) run-VOLATILE = measurement + environment-driven scheduler plan. ---
-# The plan subtrees are the joint per-cell plan machinery; the extra leaves are
-# the RAM-budget / concurrency / reprojection-path / executor values it produces,
-# including the per-cell `mode` and `bound_bytes` it stamps into each cell record.
-# ALL of these are pure functions of the free RAM measured at plan time. PROVEN
-# complete for plan differences (with the capture absent) by
-# ``test_run_volatile_classifier_covers_plan_differences``.
-_VOLATILE_PREFIXES = (
-    ".timings",
-    ".gauge_diagnostics.instrumentation",
-    ".gauge_diagnostics.phases",
-    ".gauge_diagnostics.reprojection",
-    ".reprojection",
-    ".cpu_streaming",
-    ".gpu.cpu_fallback_plan",
-    ".per_cell_diagnostics.plan_candidates",
-    ".per_cell_diagnostics.cpu_streaming",
-    ".per_cell_diagnostics.cpu_fallback_plan",
-    ".per_cell_diagnostics.reprojection",
+# The run-volatile classifier (measurement + environment-driven scheduler plan) is
+# NOT defined here any more: it lives in exactly ONE place —
+# ``tests/r40b2_run_volatile.py`` — imported by BOTH this suite and the panel
+# suite, so the two copies can no longer drift (Nono B2-F L1). PROVEN complete for
+# plan differences (with the capture absent) by
+# ``test_run_volatile_classifier_covers_plan_differences`` below.
+from r40b2_run_volatile import (  # noqa: E402
+    is_measurement_volatile as _is_measurement_volatile,
+    is_run_volatile as _is_run_volatile,
+    segments as _segments,
 )
-_VOLATILE_LEAF_EXACT = {
-    "mode", "bound_bytes", "per_cell_footprint_bytes", "available_bytes",
-    "ram_budget_bytes", "plan_chosen_reason", "cells_in_flight", "workers",
-    "cache_build_workers", "cache_workers_per_cell", "executor", "seconds",
-    "phase_seconds", "fast_calls", "path", "cpu_streaming_tile",
-    "cpu_streaming_tile_selected", "gpu_streaming_tile",
-    "gpu_streaming_host_peak_bytes", "peak_rss_kib", "aggregate_peak_rss_kib",
-}
-_VOLATILE_SUFFIXES = ("_s", "_seconds", "_sum_s", "_per_unit", "_unit")
-_VOLATILE_SUBSTRINGS = ("rss_kib", "seconds", "reproject_s", "trials")
-
-
-def _prefix_hit(path):
-    return any(path == p or path.startswith(p + ".") or path.startswith(p + "[")
-               for p in _VOLATILE_PREFIXES)
-
-
-def _is_run_volatile(path):
-    if _prefix_hit(path):
-        return True
-    for seg in _segments(path):
-        if seg.endswith(_VOLATILE_SUFFIXES) or seg in _VOLATILE_LEAF_EXACT:
-            return True
-        if any(h in seg for h in _VOLATILE_SUBSTRINGS):
-            return True
-    return False
 
 
 def _is_r40_leaf(path):

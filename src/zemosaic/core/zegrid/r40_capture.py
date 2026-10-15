@@ -393,6 +393,73 @@ def relation_id_for(u: str, v: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Frozen §1.3 integer/block inverse (normalized -> EXACT global integer pixel)
+# ---------------------------------------------------------------------------
+
+INV_TOL = 1e-9
+
+
+def forward_coord(index, dim: int) -> float:
+    """Frozen §1.3 forward coordinate ``X = 2(c+0.5)/W - 1`` (``dim`` = W or H)."""
+    return 2.0 * (float(index) + 0.5) / float(dim) - 1.0
+
+
+def inverse_index(coord: float, dim: int) -> int:
+    """Frozen §1.3 normalized->integer inverse (round-half-up, ``INV_TOL``).
+
+    NEVER a raw floor of a normalized float: the recovered index must sit within
+    ``INV_TOL`` of an integer and inside ``[0, dim)``, else the recovery REFUSES.
+    """
+    p_float = ((float(coord) + 1.0) * float(dim) / 2.0) - 0.5
+    if not math.isfinite(p_float):
+        raise IdentityError("inverse_index: non-finite recovered coordinate")
+    nearest = math.floor(p_float + 0.5)
+    if abs(p_float - nearest) > INV_TOL:
+        raise IdentityError(
+            f"inverse_index: recovered index {p_float!r} is not within INV_TOL of an integer"
+        )
+    p = int(nearest)
+    if not (0 <= p < int(dim)):
+        raise IdentityError(f"inverse_index: recovered index {p} out of range [0,{dim})")
+    return p
+
+
+def assert_block_parity(gx: int, gy: int, block_px: int) -> None:
+    """Frozen §1.3 block-parity held-out predicate (BOTH block ids ODD)."""
+    if (int(gx) // int(block_px)) % 2 != 1 or (int(gy) // int(block_px)) % 2 != 1:
+        raise IdentityError(
+            f"held-out key ({int(gx)},{int(gy)}) does not satisfy the odd/odd "
+            f"block-parity predicate at block_px={int(block_px)}"
+        )
+
+
+def heldout_keys_from_xy(xy, *, canvas_width: int, canvas_height: int,
+                         block_px: int) -> tuple[tuple[int, int], ...]:
+    """Recover the EXACT held-out global integer keys from normalized ``holdout_xy``.
+
+    Applies the frozen §1.3 inverse (round-half-up, ``INV_TOL``) on ``X`` (dim = W)
+    and ``Y`` (dim = H), verifies each key reproduces its stored normalized
+    coordinates within ``INV_TOL`` and satisfies the odd/odd block-parity
+    predicate, then returns the deterministically ordered unique ``(gx, gy)``
+    tuple. Any ambiguity REFUSES (``IdentityError``): the selection is never
+    approximated and never a raw floor of normalized floats.
+    """
+    rows = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    out: set[tuple[int, int]] = set()
+    for x, y in rows:
+        gx = inverse_index(float(x), int(canvas_width))
+        gy = inverse_index(float(y), int(canvas_height))
+        if (abs(forward_coord(gx, int(canvas_width)) - float(x)) > INV_TOL
+                or abs(forward_coord(gy, int(canvas_height)) - float(y)) > INV_TOL):
+            raise IdentityError(
+                "held-out sample does not reproduce its stored X/Y within INV_TOL"
+            )
+        assert_block_parity(gx, gy, int(block_px))
+        out.add((gx, gy))
+    return tuple(sorted(out))
+
+
+# ---------------------------------------------------------------------------
 # Frozen record dtype (little-endian, fixed width, C order, no object)
 # ---------------------------------------------------------------------------
 
@@ -692,17 +759,38 @@ def encode_records(records: Sequence[Mapping], *, relation_id: str) -> np.ndarra
 
 @dataclass(frozen=True)
 class RelationShard:
-    """One relation's sparse shard: frozen header (M9/M10) + validated records."""
+    """One relation's sparse shard: frozen header (M9/M10) + validated records.
+
+    ``candidate_coords`` is the deterministic block-parity candidate geometry
+    (``_r40_candidate_coords``) the worker→parent transport was built from, when
+    the writer supplies it. The production seam ALWAYS supplies it, so the frozen
+    candidate-set digest is bound into the generation index together with the
+    final pair-set digest. It is optional so a purely synthetic shard can be built
+    without a transported geometry.
+    """
 
     u: str
     v: str
     orientation: str
     header: Mapping
     records: tuple
+    candidate_coords: tuple | None = None
 
     @property
     def relation_id(self) -> str:
         return relation_id_for(self.u, self.v)
+
+    def n_candidates(self) -> int:
+        """Distinct candidate coordinates (0 when no geometry was supplied)."""
+        if not self.candidate_coords:
+            return 0
+        return len({(int(gx), int(gy)) for gx, gy in self.candidate_coords})
+
+    def candidate_digest(self) -> str | None:
+        """Frozen candidate-set digest (``None`` when no geometry was supplied)."""
+        if not self.candidate_coords:
+            return None
+        return candidate_set_digest(self.candidate_coords)
 
     def order_key(self) -> tuple:
         return (self.orientation, self.u, self.v)
@@ -1045,6 +1133,10 @@ def _index_bytes_for_estimate(shards: Sequence[RelationShard]) -> bytes:
                 "bytes": len(s.records) * R40_RECORD_ITEMSIZE,
                 "sha256": "0" * 64,
                 "pairset_digest": "0" * 64,
+                "candidate_set_digest": (
+                    None if s.candidate_digest() is None else "0" * 64
+                ),
+                "n_candidates": int(s.n_candidates()),
                 "header": s.header_payload(),
             }
             for s in sorted(shards, key=lambda s: s.order_key())
@@ -1161,6 +1253,8 @@ def _build_generation_payloads(
             "bytes": int(len(data)),
             "sha256": digest,
             "pairset_digest": pairset_digest(keys),
+            "candidate_set_digest": shard.candidate_digest(),
+            "n_candidates": int(shard.n_candidates()),
             "header": header,
             "_data": data,
         })
@@ -1433,6 +1527,41 @@ def verify_generation(gen_dir: Any, *, expected_production_wired: bool = EXPECTE
             problems.append(f"shard byte mismatch {filename}")
         if entry.get("count") is not None and entry["count"] * R40_RECORD_ITEMSIZE != entry.get("bytes"):
             problems.append(f"shard count/itemsize mismatch {filename}")
+        # --- frozen-rule binding (present on every PRODUCTION-seam generation) ----
+        # When the writer declared the transported candidate geometry, the pair set
+        # must be recoverable from the bytes AND every captured key must satisfy
+        # the frozen §1.3 odd/odd block-parity predicate, with the pair-set digest
+        # re-derived from those very bytes. A generation built without a declared
+        # geometry (purely synthetic shards) is verified exactly as before.
+        if entry.get("candidate_set_digest") is not None:
+            array = np.frombuffer(data, dtype=R40_RECORD_DTYPE)
+            header = entry.get("header")
+            block_px = None
+            if isinstance(header, Mapping) and "block_px" in header:
+                try:
+                    block_px = int(header["block_px"])
+                except (TypeError, ValueError):
+                    block_px = None
+            keys: list[str] = []
+            coord_seen: set[tuple[int, int]] = set()
+            for row in array:
+                gx, gy = int(row["gx"]), int(row["gy"])
+                coord_seen.add((gx, gy))
+                if block_px is not None:
+                    try:
+                        assert_block_parity(gx, gy, block_px)
+                    except IdentityError:
+                        problems.append(
+                            f"captured key ({gx},{gy}) violates the frozen odd/odd "
+                            f"block-parity predicate {filename}"
+                        )
+                keys.append(row["sample_key"].decode("ascii"))
+            if len(keys) != len(set(keys)):
+                problems.append(f"duplicate sample key in shard {filename}")
+            if pairset_digest(keys) != entry.get("pairset_digest"):
+                problems.append(f"pairset digest mismatch {filename}")
+            if len(coord_seen) > int(entry.get("n_candidates") or 0):
+                problems.append(f"pairset larger than the candidate geometry {filename}")
         checked_records += int(entry.get("count", 0))
         total_bytes += int(entry.get("bytes", 0))
     if checked_records != index.get("n_records"):
@@ -1838,6 +1967,11 @@ __all__ = [
     "pairset_digest",
     "candidate_set_digest",
     "relation_id_for",
+    "INV_TOL",
+    "forward_coord",
+    "inverse_index",
+    "assert_block_parity",
+    "heldout_keys_from_xy",
     "record_dtype_descriptor",
     "assert_record_dtype_frozen",
     "validate_relation_header",

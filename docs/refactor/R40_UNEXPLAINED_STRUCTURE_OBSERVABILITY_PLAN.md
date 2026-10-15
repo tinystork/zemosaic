@@ -166,7 +166,10 @@ Reused verbatim from the accepted R39 plan (no re-derivation, no re-tuning):
   measurement band `|s| ≤ 8 px`;
 - the exact integer/block inverse (round-half-up, `INV_TOL = 1e-9`, **coordinate inversion
   only**) and the block-parity held-out predicate `bx % 2 == 1 AND by % 2 == 1`,
-  `block_px = 4`, tangent block `row // 4` for `h` / `col // 4` for `v`;
+  `block_px = 4`, tangent block `row // 4` for `h` / `col // 4` for `v`
+  (**IMPLEMENTED in R40-B2-G**: `core/zegrid/r40_capture.inverse_index` /
+  `heldout_keys_from_xy` are the frozen inverse, and the capture's sample set IS the exact
+  held-out set recovered through it — see §15.13);
 - the post-offset paired residual sign rule
   `d_post = holdout_diff + off_u − off_v` (per channel, from the production
   `cell_feather.apply_additive_offsets` `science_cell += offset_cell`);
@@ -295,7 +298,11 @@ never repeated per sample.
 by the accepted paired evidence — the deterministic block-parity held-out subsample
 (`bx % 2 == 1 AND by % 2 == 1`, `block_px = 4`) recovered by the frozen §1.3 inverse. No new
 split, no random draw, no per-pixel raster. This guarantees "same global pixels" and makes
-the capture directly comparable to `holdout_diff`.
+the capture directly comparable to `holdout_diff`. **IMPLEMENTED in R40-B2-G (§15.13):** the
+seam recovers the exact held-out keys with the frozen production observation
+(`background_model.observe_edge`, frozen band + frozen normal boundary) through the frozen
+§1.3 integer/block inverse, and REFUSES on an incomplete candidate transport — the sample set
+is the exact held-out set, never the candidate geometry.
 
 **Sample key (frozen).** A record is keyed by
 `key = sha256("zemosaic.zegrid.r40.pair.v1\n" + relation_id + "\n" + channel + "\n" + gx + "\n" + gy)`,
@@ -342,7 +349,11 @@ graph, offsets or any science array.
   validity/sample selection, the frozen R34c offsets and the `feather_weight_field` ramps.
   **The exact held-out selection is recovered only through the §1.3 integer/block
   inverse/parity fixtures, fail-closed** (never a raw floor of normalized floats); the
-  candidate-set and final pair-set digests are tied to that same frozen rule. If exact
+  candidate-set and final pair-set digests are tied to that same frozen rule. **IMPLEMENTED in
+  R40-B2-G (§15.13):** the index binds the frozen candidate-set digest (block-parity geometry)
+  AND the final pair-set digest (exact held-out keys) per shard, and `verify_generation`
+  re-derives the pair-set digest from the raw bytes and re-checks every key against the frozen
+  odd/odd parity predicate. If exact
   held-out keys require **both** Cells, workers may return the deterministic geometry
   **superset**; the parent fail-closed intersects/joins to the exact **uncapped** R37 keys
   (no cap assumption).
@@ -727,7 +738,7 @@ claim the whole product RAM is `O(records)`.
 | **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
 | **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; the v2 reserved cohort was evaluated EXACTLY ONCE by the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission → terminal **ACCEPT** (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`** (§15.7). | **DONE / terminal ACCEPT** (v1 invalidation history preserved byte-for-byte, §15.1) |
 | **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
-| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); **acceptance NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run remain `NOT_RUN`. The **run-volatile-classifier completeness proven by measurement** is now a **frozen B2 acceptance criterion** (§8 clause 12); the synthetic 38-relation panel OFF/ON qualification is **MEASURED** (§15.12) but B2 is still **NOT accepted** |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); **acceptance NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run remain `NOT_RUN`. The **run-volatile-classifier completeness proven by measurement** is now a **frozen B2 acceptance criterion** (§8 clause 12); the synthetic 38-relation panel OFF/ON qualification is **MEASURED** (§15.12); the **exact §1.3 held-out intersection is now IMPLEMENTED and MEASURED** and the **injected-effect recovery is RE-PROVEN under the accepted frozen B1 v2 criteria snapshot** on fresh disposable fixtures, with BOTH the candidate-set and pair-set digests bound to the frozen rule (`ZM-ZEGRID-R40-B2-G`, §15.13) — but the **real product ROI parity** and a **real Windows run** remain `NOT_RUN`, so B2 is still **NOT accepted** |
 | **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
 | **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
 | **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
@@ -1212,6 +1223,24 @@ This section is a pointer, not a source of authority.
   manifest carries **exactly one** additive block (none OFF). This is a **SYNTHETIC** panel
   qualification: the real **Windows816 38-relation layout is NOT exercised** and the real
   Windows run remains a **HUMAN GATE**. **B2 acceptance is NOT claimed.**
+- **rework-18 (R40-B2-G exact §1.3 selection + recovery re-proof, bounded task G), before any
+  real R40 outcome (and before any real R40-C outcome):** the §3 frozen *sample set* and the
+  §3.1.1 frozen *parent join* are now **IMPLEMENTED**: the capture's sample set is the EXACT
+  accepted R37 held-out sample set — the frozen production observation
+  (`background_model.observe_edge`, frozen measurement band + frozen relation normal boundary)
+  recovered through the frozen **§1.3 integer/block inverse** (round-half-up, `INV_TOL = 1e-9`,
+  odd/odd parity verified; never a raw floor of normalized floats, never the candidate-geometry
+  approximation) — fail-closed on an incomplete transport. The **candidate-set digest** (frozen
+  block-parity geometry) and the **final pair-set digest** (exact held-out keys) are now BOTH
+  bound into the generation index and re-derived from bytes by `verify_generation`.
+  Measured on a synthetic end-to-end run against TWO independent references; the injected-effect
+  recovery is re-proved under the ACCEPTED frozen B1 v2 criteria snapshot (`B1_CRITERIA_SHA256`)
+  on FRESH disposable fixtures only (the CONSUMED v2 cohort is never touched or re-evaluated).
+  Two non-blocking B2-F hygiene items are closed (pinned memory seam in the pooled proof-f test;
+  ONE shared run-volatile classifier). **No tolerance, threshold or gate is changed**; the §8
+  clause-2 zero-tolerance OFF/ON gate stays at exactly `0`; the capture stays **default-OFF**.
+  **B2 acceptance is NOT claimed** and the real product ROI parity, a real Windows run, R40-C/D
+  and HUMAN_GATE remain **`NOT_RUN`**.
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -1838,4 +1867,80 @@ promoted, and exactly one additive ON manifest block. This is a **SYNTHETIC** qu
 **Windows816 38-relation layout is NOT exercised** and the real Windows run remains a **HUMAN GATE**. The
 injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and
 a real Windows run remain **`NOT_RUN`**. `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` remain
+**`NOT_RUN` / `NOT_AUTHORIZED`**.
+
+---
+
+### 15.13 R40-B2-G exact §1.3 held-out selection + recovery re-proof — implementation status (bounded task G)
+
+**Mission** `ZM-ZEGRID-R40-B2-G-SELECTION-REPROOF` · **phase** `implementation` · **branch** `beta` ·
+**baseline HEAD** `14252ffb0383499ccb8fd3a2165cf0a2cb663325` · **commit created** `NO` · **push** `NO`.
+
+Bounded task G (1) **IMPLEMENTS** the exact §1.3 R37 held-out-key integer/block inverse/parity
+intersection, (2) **RE-PROVES** the injected-effect recovery under the ACCEPTED frozen B1 v2 criteria
+snapshot on FRESH disposable fixtures only, and (3) closes the two **non-blocking** B2-F hygiene items
+(Nono `ZM-ZEGRID-R40-B2-F-PANEL-QUALIFICATION.nono.r0.md` §4 L1/L3). **No tolerance, threshold or gate
+was changed**; the capture stays **default-OFF**; **no real data** was read.
+
+**(1) The exact §1.3 intersection is now implemented — measured, not assumed.** The seam no longer
+samples the candidate geometry: for every relation/channel the EXACT held-out keys are recovered by the
+FROZEN rule — the production observation `background_model.observe_edge` (frozen measurement band, frozen
+relation normal boundary, reused from the new `background_model.relation_normal_boundary` so nothing is
+re-derived) whose normalized `holdout_xy` is inverted through the frozen **§1.3 integer/block inverse**
+(new `r40_capture.inverse_index` / `heldout_keys_from_xy`: round-half-up, `INV_TOL = 1e-9`, round-trip and
+odd/odd parity verified, `IdentityError` on any ambiguity — never a raw floor of normalized floats). The
+parent then **fail-closes**: an exact key absent from the candidate geometry the workers transported
+REFUSES the whole capture (`SchemaError`, nothing published) instead of silently dropping it.
+
+**Digest binding (both digests tied to the frozen rule).** `RelationShard` now carries the frozen
+candidate geometry, and the generation index binds per shard **both** the `candidate_set_digest`
+(recomputed over the frozen block-parity geometry) and the `pairset_digest` (recomputed over the exact
+held-out sample keys; both were already computed, now both are stored and verified).
+`verify_generation` re-derives the pair-set digest from the raw shard bytes, re-checks every captured key
+against the frozen odd/odd block-parity predicate, and refuses a pair set larger than the declared
+candidate geometry.
+
+**Measured (synthetic, in-memory CellPatch level, 2x2 grid, `measurement_px = 8 < 2*halo`).** The frozen
+band alone removes half the candidates, so the exact set is STRICTLY smaller than the candidate geometry
+for **every** relation-channel (12/12 measured); the capture's on-disk pair set equals, exactly, an
+INDEPENDENT dense-raster reference recomputed from the frozen primitives (and equals, independently, the
+`observe_edge` + frozen-inverse reference) — the channel-dependent case (NaN science in ONE channel)
+is exercised, so the selection is genuinely per-channel. A negative control proves the failure mode is
+closed: dropping ONE candidate that IS an exact held-out key makes the capture REFUSE and publish nothing.
+
+**(2) Injected-effect recovery re-proof (frozen criteria snapshot, fresh disposable data).** The accepted
+B1 v2 criteria snapshot is **re-derived in-process** (`run_calibration` + `derive_frozen_criteria` +
+`freeze_snapshot`) and its digest is asserted equal to the frozen
+`r40_capture.B1_CRITERIA_SHA256` = `67be63e4423f782646f71bc350be5ff5a33a2007b67f0999a76a841154da92b9`.
+The CONSUMED v2 cohort / bundle / result / markers are **never** read, invoked or re-evaluated and the
+reserved-cohort evaluator is never called. The frozen relation-first **2-of-3** rule (the frozen
+`simulate_panel` implementation) is applied to **fresh, disposable** fixtures (new group ids + seeds
+`910001..910004`), gated by the frozen `injected_effect_recovery` values: the injected effect is
+**`RECOVERED`** (`reduction_rms >= 0.20`, p90 worsening `<= 5%`, `RMS0 <= 1.25*sigma_ref`, `>= 2` distinct
+relations per orientation) and the fresh **null** fixture is **`NO_EFFECT`** (no default pass). The
+`ORCHESTRATION_ONLY_NON_GATING` labelling is asserted **exactly** (label, `recovered_delta_is_gating =
+false`, `injected_amplitude_is_generator_metadata_only = true`, `consumed_by_h4_admission = false`,
+`authority = ORCHESTRATION_ONLY`). The synthetic injection amplitude remains generator metadata only.
+
+**(3) Hygiene — both B2-F items closed.** (L3) `tests/test_zegrid_r40b2_pooled.py::test_proof_f_...` now
+pins the memory seam (`zz.available_memory_bytes`) to a CONSTANT (the B2-D technique) so the scheduler
+plan is deterministic and the test no longer depends on host free RAM — it is **not** skipped, weakened or
+deleted, and the real process pool still runs. (L1) the run-volatile classifier (measurement + scheduler
+plan) now lives in exactly ONE shared helper, `tests/r40b2_run_volatile.py`, imported by BOTH the panel
+suite and the B2-D suite; a guard test asserts that neither suite re-defines it and that both bind the
+IDENTICAL function object.
+
+**Validation (executed, observed).**
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest tests/test_zegrid_r40b2_selection.py -W error -q -p no:cacheprovider` | **11 passed** |
+| `python3 -m pytest tests/test_zegrid_r40b2_pooled.py -W error -q -p no:cacheprovider` | see the task-G report |
+| `python3 -m py_compile` (all touched files) | OK |
+| `git diff --check` | clean |
+
+> **Task G does NOT accept B2.** It IMPLEMENTS + MEASURES the exact §1.3 held-out intersection, binds both
+digests to the frozen rule, and RE-PROVES the injected-effect recovery under the accepted frozen B1 v2
+criteria digest on fresh disposable data. The **real product ROI parity (I1a/I1b/I2 through the real ROI
+path)**, a **real Windows run**, `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` and **B2 acceptance** remain
 **`NOT_RUN` / `NOT_AUTHORIZED`**.
