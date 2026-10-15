@@ -726,7 +726,7 @@ claim the whole product RAM is `O(records)`.
 | **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
 | **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; the v2 reserved cohort was evaluated EXACTLY ONCE by the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission → terminal **ACCEPT** (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`** (§15.7). | **DONE / terminal ACCEPT** (v1 invalidation history preserved byte-for-byte, §15.1) |
 | **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
-| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; **acceptance NOT achieved** — production seam wiring, the OFF/ON byte identity, the injected-effect recovery re-proof and the product ROI parity are `NOT_RUN` |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9); **acceptance NOT achieved** — the OFF/ON FITS byte identity, the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and the real pooled worker→parent transport are `NOT_RUN` |
 | **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
 | **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
 | **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
@@ -1064,6 +1064,19 @@ This section is a pointer, not a source of authority.
   parameter (§15.8). Re-run: focused **128 passed**, combined regressions **417 passed**. The shard core
   still **does not accept B2**; no criterion was changed and the OFF/ON zero-tolerance gate was untouched.
 
+- **rework-12 (R40-B2-B seam wiring, bounded task B), before any real R40-C outcome:** the accepted
+  default-OFF capture core is wired into the PRODUCTION per-cell assembly seam
+  (`_assemble_per_cell_feathered`, at the pinned pre-offset/pre-feather point, before
+  `build_cell_offset_graph` / `assemble_canvas_feathered`) behind a strictly default-OFF opt-in
+  (`r40_seam_capture`, strict `bool`), with the lazy-import guarantee kept (§15.9). The seam reuses the
+  core (frozen dtype/identity/budget/privacy/path-safety/atomic COMMIT-last writer/additive manifest
+  block) and duplicates no pixel/difference maths. Observed: focused **145 passed**
+  (`r40_capture_core` + seam), combined regressions **417 passed**. **B2 acceptance is NOT claimed**: the
+  exact OFF/ON FITS byte-identity gate, the 38-relation panel qualification, the injected-effect recovery
+  re-proof, the real product ROI parity, the exact §1.3 held-out-key intersection, the real worker→parent
+  transport on a pooled run and R40-C/D remain **`NOT_RUN`**. No criterion was changed and the OFF/ON
+  zero-tolerance gate was untouched.
+
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
 **before any real R40 outcome**. No real R40 capture, metric or outcome was computed for
@@ -1344,3 +1357,70 @@ the **exact OFF/ON science/coverage/aesthetic array + FITS byte identity (tolera
 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof and the **real product ROI
 parity** are all **`NOT_RUN`** in task A and remain **`B2_MANDATORY`**. The OFF/ON gate is untouched at
 tolerance zero. `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.
+
+### 15.9 R40-B2-B production seam wiring — implementation status (bounded task B)
+
+**Mission** `ZM-ZEGRID-R40-B2-B-SEAM-WIRING` · **phase** `implementation` · **branch** `beta` · **baseline
+HEAD** `b23fbdc3a8ef6709f1891d355a4e083e62dbd5f6` · **commit created** `NO` · **push** `NO`.
+
+Bounded task B wires the accepted default-OFF capture core into the PRODUCTION per-cell assembly seam
+at the pinned pre-offset/pre-feather point (inside `_assemble_per_cell_feathered`, after the complete
+`CellPatch` objects coexist and BEFORE `build_cell_offset_graph` / `assemble_canvas_feathered`) behind a
+strictly default-OFF opt-in.
+
+| Added / changed (no commit) | Purpose |
+|---|---|
+| `src/zemosaic/zemosaic_zegrid_mode.py` (modified) | seam opt-in (`r40_seam_capture`, strict `bool`, default `False`), threaded `run_zegrid_mode` → `_run_single` → `_assemble_cells` → `_assemble_per_cell_feathered`; the pinned seam capture (reuses `core/zegrid/r40_capture`); the additive `r40_diagnostic_capture` manifest block; picklable worker→parent sparse extractor |
+| `tests/test_zegrid_r40b2_seam.py` (new) | focused seam tests incl. the four mandatory proofs (a)–(d) |
+
+**Implemented (bounded task B).** (1) strictly default-OFF opt-in with strict-`bool` refusal and a required
+non-empty output root when enabled; importing the module and running with the capture OFF does **not**
+import the core and changes nothing; (2) at the seam the capture reads ONLY the sparse per-relation
+candidate pixels from the in-memory planes (no full f64 patch plane, no raster/cutout, no
+final-product FITS read) and reuses the production `shared_valid_mask` / `apply_additive_offsets` /
+`feather_weight_field` primitives — no duplicated pixel/difference maths; (3) the R37-D capture path is
+semantically unchanged and the two captures are independent; (4) fail-closed identity / mandatory-observable
+/ budget / privacy / path / write refusals publish NO artifact and never alter the assembly result;
+(5) exactly ONE additive `r40_diagnostic_capture` manifest block cross-linked on the frozen identity keys
+(`capture_id`, `filename`, `sha256`, `bytes`), all pre-existing manifest fields canonical-identical ON/OFF,
+and **no** new field when OFF (never a whole-manifest byte-identity claim); (6) bounded RAM/disk through the
+accepted core.
+
+**Mandatory proofs — measured on synthetic in-memory fixtures (never asserted).**
+
+| Proof | Result |
+|---|---|
+| (a) capture OFF = an INDEPENDENT baseline rebuilt from the frozen primitives (`build_cell_offset_graph` + `assemble_canvas_feathered`) | **MEASURED — byte-identical** |
+| (b) capture ON, output discarded → science/coverage/aesthetic-equivalent arrays byte-identical to OFF (tolerance exactly `0`); only the additive manifest block differs | **MEASURED — byte-identical** |
+| (c) worker→parent sparse payload + deterministic parent join == in-process reference at the selected coordinates, transported through the `spawn` context | **MEASURED — Linux-side spawn parity ONLY (NOT a Windows run)** |
+| (d) injected identity / budget / privacy / path / write failure → assembly result byte-identical to OFF and **no** artifact published | **MEASURED** |
+
+**Validation (executed, observed).**
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest tests/test_zegrid_r40_capture_core.py tests/test_zegrid_r40b2_seam.py -W error -q -p no:cacheprovider` | **145 passed** |
+| `python3 -m pytest tests/test_zegrid_r37d_diagnostic_capture.py tests/test_zegrid_r37e_capture_runner.py tests/test_zegrid_r38a_causal_probe.py tests/test_zegrid_r39a_spatial_residual.py tests/test_zegrid_r40b1_synthetic_calibration.py -W error -q -p no:cacheprovider` | **417 passed** |
+| `python3 -m py_compile src/zemosaic/zemosaic_zegrid_mode.py tests/test_zegrid_r40b2_seam.py` | OK |
+| `git diff --check` | clean |
+
+**Known limits carried forward (architect-visible, NOT_RUN).**
+
+- **M5/M7 sourcing.** At this seam the parent cannot see the worker-local MiniTile covariate planes
+  (`estimator_weight_sum`, `support_w1`/`support_w2`/`n_eff_support`; plan §2.2). The seam therefore takes
+  them from the picklable worker→parent transport and **refuses fail-closed** when it is absent. The
+  **real pooled-run** transport is **`NOT_RUN`** (the parity proof exercises the transport through the
+  `spawn` context on synthetic fixtures).
+- **Exact §1.3 held-out intersection.** The captured sample set is the deterministic block-parity
+  **candidate geometry** in the shared halo band, filtered by the frozen `shared_valid_mask`; the exact
+  R37 held-out-key inverse/parity intersection is **`NOT_RUN`**.
+- **Frozen R34c offsets.** The pinned capture point precedes the assembly's own graph solve, so the seam
+  obtains the frozen offsets by calling the SAME production solver (pure/read-only/deterministic) before
+  the assembly's unchanged solve. This is a declared bounded decision (an extra deterministic solve when
+  the capture is ON); it does not alter the assembly result.
+
+> **Task B does NOT accept B2.** The exact OFF/ON science/coverage/aesthetic array + FITS byte identity
+(tolerance exactly `0`), the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof,
+the **real product ROI parity**, the real pooled worker→parent transport and the exact §1.3 held-out
+intersection remain **`NOT_RUN`** / **`B2_MANDATORY`**. The OFF/ON gate is untouched at tolerance zero.
+`R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.

@@ -1361,6 +1361,586 @@ def _resolve_cell_normalization(mode, global_gauge, global_frame_ids, provider, 
     return fixed, zphot.CELL_GAUGE_STATUS_OK, None
 
 
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R40-B2-B — default-OFF diagnostic seam capture (reuses r40_capture)
+# ---------------------------------------------------------------------------
+#
+# The R40 capture is wired at the SAME pinned pre-offset/pre-feather seam as the
+# accepted R37-D capture: inside ``_assemble_per_cell_feathered``, after the
+# complete ``CellPatch`` objects coexist and BEFORE the inter-cell offset graph /
+# the feather assembly are built. It REUSES the accepted, already-reviewed core
+# ``core/zegrid/r40_capture`` (frozen dtype, fail-closed identity, hard disk
+# budget, privacy, path safety, atomic COMMIT-last generation, additive manifest
+# block) and duplicates NO pixel/difference maths.
+#
+# Hard invariants:
+#   * strictly default OFF (strict ``bool``); the core is imported LAZILY and
+#     ONLY when the capture is explicitly enabled — importing this module and
+#     running with the capture OFF must not import the core nor change behaviour;
+#   * diagnostic-only: nothing on this path mutates a CellPatch, the offset
+#     graph, the additive offsets, the feather weights or any science / coverage
+#     / aesthetic array;
+#   * fail-closed: any identity / mandatory-observable / budget / privacy / path
+#     failure refuses WITHOUT publishing a partial artifact and WITHOUT altering
+#     the assembly result;
+#   * sparse only: only the per-relation candidate pixels are read from the
+#     in-memory planes — never a full f64 patch plane, never a raster/cutout,
+#     never a final-product FITS (``mosaic_grid_science``/aesthetic/coverage).
+#
+# Explicit NON-CLAIMS (see the mission report): this seam wiring alone does NOT
+# accept R40-B2. The OFF/ON FITS byte-identity gate, the exact §1.3 R37
+# held-out-key inverse/parity intersection, the 38-relation panel qualification,
+# the injected-effect recovery re-proof and the real product ROI parity remain
+# NOT_RUN / B2_MANDATORY. R40-C / R40-D / HUMAN_GATE stay NOT_AUTHORIZED.
+R40_CAPTURE_STAGE = "pre_offset_pre_feather"
+R40_SEAM_CAPTURE_DISK_BUDGET_BYTES = 256 * 1024 * 1024
+# Result-dict key carrying a worker's sparse covariate samples. The M5
+# (``estimator_weight_sum``) and M7 (``support_w1`` / ``support_w2`` /
+# ``n_eff_support``) planes live on the in-memory MiniTile INSIDE the worker and
+# are never parent-visible (plan §2.2); the parent seam therefore takes them from
+# this transport and REFUSES (fail-closed) rather than inventing them.
+R40_SPARSE_RESULT_KEY = "r40_sparse"
+
+
+_R40_CONTEXT_REQUIRED_KEYS = (
+    "output_root",
+    "disk_budget_bytes",
+    "capture_id",
+    "source_set_digest",
+    "source_set_count",
+    "n_frames",
+    "repo_head",
+    "gauge_mode",
+    "stack_tokens",
+    "canvas_id",
+    "canvas_width",
+    "canvas_height",
+    "channels",
+    "measurement_px",
+    "feather_px",
+    "halo_px",
+    "block_px",
+    "reference_frame_id",
+    "frame_order_digest",
+    "excluded",
+)
+
+
+def _r40_lazy_core():
+    """Import the accepted R40 capture core LAZILY (never on the OFF path)."""
+    from .core.zegrid import r40_capture as _rc
+
+    return _rc
+
+
+def _validate_r40_seam_capture(enabled, output_root, disk_budget_bytes):
+    """Strict validation of the R40 seam-capture opt-in (no silent coercion).
+
+    Returns the normalised ``(enabled, output_root, disk_budget_bytes)``.
+    ``enabled`` must be a real ``bool`` (not 0/1/"true"); when it is True an
+    explicit, non-empty output root is REQUIRED (a capture that cannot publish is
+    refused up front). The budget must be a real positive ``int``.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            f"r40_seam_capture must be a bool, got {type(enabled).__name__}"
+        )
+    root = None
+    if enabled:
+        if not isinstance(output_root, (str, os.PathLike)):
+            raise ValueError(
+                "r40_seam_capture requires an explicit output root "
+                f"(str/PathLike), got {type(output_root).__name__}"
+            )
+        root = str(output_root)
+        if not root.strip():
+            raise ValueError("r40_seam_capture output root must be non-empty")
+    budget = (
+        R40_SEAM_CAPTURE_DISK_BUDGET_BYTES
+        if disk_budget_bytes is None
+        else disk_budget_bytes
+    )
+    if isinstance(budget, bool) or not isinstance(budget, (int, np.integer)):
+        raise ValueError(
+            "r40_seam_capture_disk_budget_bytes must be an int, got "
+            f"{type(budget).__name__}"
+        )
+    if int(budget) <= 0:
+        raise ValueError(
+            f"r40_seam_capture_disk_budget_bytes must be positive, got {int(budget)}"
+        )
+    return enabled, root, int(budget)
+
+
+def _r40_cell_index(cid):
+    """Parse a ZeGrid cell id ``r%04dc%04d`` into ``(row, col)`` (else ``None``)."""
+    s = str(cid)
+    if not s.startswith("r") or "c" not in s[1:]:
+        return None
+    rpart, _, cpart = s[1:].partition("c")
+    if not rpart.isdigit() or not cpart.isdigit():
+        return None
+    return int(rpart), int(cpart)
+
+
+def _r40_orientation(u, v):
+    """Relation orientation (``h``/``v``) from two adjacent cell ids (else None)."""
+    iu, iv = _r40_cell_index(u), _r40_cell_index(v)
+    if iu is None or iv is None:
+        return None
+    return "h" if iu[0] == iv[0] else "v"
+
+
+def _r40_overlap_band(patch_u, patch_v):
+    """Global ``(y0, y1, x0, x1)`` intersection of two Cell patches."""
+    uy0, uy1, ux0, ux1 = patch_u.bounds
+    vy0, vy1, vx0, vx1 = patch_v.bounds
+    return (max(uy0, vy0), min(uy1, vy1), max(ux0, vx0), min(ux1, vx1))
+
+
+def _r40_candidate_coords(patches, u, v, *, block_px):
+    """Deterministic block-parity candidate GLOBAL coords in the u/v overlap band.
+
+    Reuses the frozen §1.3 block-parity rule (``bx % 2 == 1 AND by % 2 == 1``,
+    ``bx = gx // block_px``, ``by = gy // block_px``) over the shared halo band,
+    ordered deterministically by ``(gy, gx)``. This is the geometry SUPERSET that
+    can contain the accepted R37 held-out keys; the exact §1.3 held-out
+    intersection/parity fixtures are NOT applied here (declared NOT_RUN).
+    """
+    y0, y1, x0, x1 = _r40_overlap_band(patches[u], patches[v])
+    if y1 <= y0 or x1 <= x0:
+        return ()
+    gy = np.arange(int(y0), int(y1), dtype=np.int64)
+    gx = np.arange(int(x0), int(x1), dtype=np.int64)
+    keep_y = ((gy // int(block_px)) % 2) == 1
+    keep_x = ((gx // int(block_px)) % 2) == 1
+    return tuple(
+        (int(x), int(y)) for y in gy[keep_y] for x in gx[keep_x]
+    )
+
+
+def _r40_plane_at(plane, ly, lx, channel):
+    """Read ONE pixel from a 2-D or 3-D plane (never a full plane)."""
+    arr = np.asarray(plane)
+    if arr.ndim == 3:
+        return arr[ly, lx, channel]
+    return arr[ly, lx]
+
+
+def _r40_post_offset_value(science, ly, lx, channel, offsets):
+    """M3 post-offset value via the FROZEN production helper (§3.4, f64 order)."""
+    off = np.asarray(offsets, dtype=np.float64).ravel()
+    pix = np.asarray(science)[ly:ly + 1, lx:lx + 1, channel:channel + 1]
+    post = zcf.apply_additive_offsets(pix, off[channel:channel + 1])
+    return float(np.asarray(post, dtype=np.float64)[0, 0, 0])
+
+
+def _r40_worker_extract_covariates(task):
+    """Module-level PICKLABLE worker-side sparse covariate extraction.
+
+    ``task = (cell_id, coords, planes)`` where ``planes`` is a plain mapping of
+    plane name -> array plus the scalar ``bounds``/``channel`` entries. Returns a
+    plain, picklable list of sparse covariate samples (M5/M7 + M6 + M4) carrying
+    ONLY the candidate coordinates — never a full f64 patch plane, never a raster,
+    never a cutout, never a FITS read. This is the worker→parent transport used by
+    the seam (via ``result_by_cid[cid]['r40_sparse']``) and by the spawn/pickling
+    parity proof.
+    """
+    cell_id, coords, planes = task
+    y0 = int(planes["bounds"][0])
+    x0 = int(planes["bounds"][2])
+    channel = int(planes["channel"])
+    sci = np.asarray(planes["science"])
+    val = np.asarray(planes["valid_mask"])
+    surv = np.asarray(planes["surviving_sample_count"])
+    ews = np.asarray(planes["estimator_weight_sum"])
+    w1 = np.asarray(planes["support_w1"])
+    w2 = np.asarray(planes["support_w2"])
+    neff = np.asarray(planes["n_eff_support"])
+    out = []
+    for gx, gy in coords:
+        ly, lx = int(gy) - y0, int(gx) - x0
+        out.append({
+            "cell_id": str(cell_id),
+            "gx": int(gx),
+            "gy": int(gy),
+            "channel": channel,
+            "sci_pre": float(_r40_plane_at(sci, ly, lx, channel)),
+            "valid": bool(_r40_plane_at(val, ly, lx, channel)),
+            "surviving_sample_count": int(_r40_plane_at(surv, ly, lx, channel)),
+            "estimator_weight_sum": float(_r40_plane_at(ews, ly, lx, channel)),
+            "support_w1": float(_r40_plane_at(w1, ly, lx, channel)),
+            "support_w2": float(_r40_plane_at(w2, ly, lx, channel)),
+            "n_eff_support": float(_r40_plane_at(neff, ly, lx, channel)),
+        })
+    return out
+
+
+def _r40_index_worker_sparse(result_by_cid):
+    """Index the worker→parent sparse covariate samples by (cid, relation, ch)."""
+    frames: dict = {}
+    for cid, result in (result_by_cid or {}).items():
+        if not isinstance(result, dict):
+            continue
+        samples = result.get(R40_SPARSE_RESULT_KEY)
+        if not samples:
+            continue
+        for sample in samples:
+            key = (str(cid), int(sample["channel"]), int(sample["gx"]), int(sample["gy"]))
+            frames[key] = sample
+    return frames
+
+
+def _r40_relation_header(*, u, v, orientation, gauge_mode, stack_tokens,
+                         reference_frame_id, frame_order_digest, excluded,
+                         measurement_px, feather_px, halo_px, block_px):
+    """Build the frozen M9/M10 relation header (validated by the accepted core)."""
+    return {
+        "gauge_mode": str(gauge_mode),
+        "stack_tokens": dict(stack_tokens),
+        "reference_frame_id": {u: str(reference_frame_id[u]), v: str(reference_frame_id[v])},
+        "frame_order_digest": {u: str(frame_order_digest[u]), v: str(frame_order_digest[v])},
+        "excluded": {u: list(excluded[u]), v: list(excluded[v])},
+        "measurement_px": int(measurement_px),
+        "feather_px": int(feather_px),
+        "halo_px": int(halo_px),
+        "block_px": int(block_px),
+    }
+
+
+def _r40_seam_capture(patches, nx, ny, result_by_cid, *, context):
+    """Build ONE bounded R40 diagnostic generation at the pinned seam (default OFF).
+
+    ``context`` carries the run-level identity/tokens the seam cannot invent.
+    Any missing mandatory observable, identity, budget, privacy or path failure
+    REFUSES (raising) before anything is published; the assembly inputs are never
+    mutated.
+    """
+    rc = _r40_lazy_core()
+    ctx = dict(context or {})
+    missing = [k for k in _R40_CONTEXT_REQUIRED_KEYS if k not in ctx]
+    if missing:
+        raise rc.SchemaError(
+            "R40 seam capture context is missing required keys: " + ", ".join(sorted(missing))
+        )
+    channels = int(ctx["channels"])
+    if channels != int(rc.N_CHANNELS):
+        raise rc.SchemaError(
+            f"R40 seam capture expects {rc.N_CHANNELS} channels, got {channels}"
+        )
+    block_px = int(ctx["block_px"])
+    covariance = _r40_index_worker_sparse(result_by_cid)
+
+    present = [cid for cid in patches]
+    edges = [
+        (u, v) for (u, v) in zcf.grid_adjacency(int(nx), int(ny))
+        if u in patches and v in patches
+    ]
+    if not edges:
+        raise rc.SchemaError("R40 seam capture found no complete adjacent Cell relation")
+
+    # The frozen R34c additive offsets. They are supplied by the caller (the
+    # assembly's own ``build_cell_offset_graph`` solve is left byte-for-byte
+    # unchanged, so the capture cannot influence the assembly); no pixel /
+    # difference maths is duplicated here.
+    offsets = ctx.get("offsets")
+    if offsets is None:
+        raise rc.SchemaError(
+            "R40 seam capture requires the frozen R34c offsets (context['offsets'])"
+        )
+    offsets_by_cell = {str(k): np.asarray(v, dtype=np.float64) for k, v in offsets.items()}
+
+    shards = []
+    for (u, v) in edges:
+        orientation = _r40_orientation(u, v)
+        if orientation is None:
+            raise rc.SchemaError(f"R40 seam capture: cannot resolve orientation of {u!r}/{v!r}")
+        relation_id = rc.relation_id_for(u, v)
+        header = _r40_relation_header(
+            u=u, v=v, orientation=orientation,
+            gauge_mode=ctx["gauge_mode"], stack_tokens=ctx["stack_tokens"],
+            reference_frame_id=ctx["reference_frame_id"],
+            frame_order_digest=ctx["frame_order_digest"],
+            excluded=ctx["excluded"],
+            measurement_px=ctx["measurement_px"], feather_px=ctx["feather_px"],
+            halo_px=ctx["halo_px"], block_px=block_px,
+        )
+        pu, pv = patches[u], patches[v]
+        uy0, _, ux0, _ = pu.bounds
+        vy0, _, vx0, _ = pv.bounds
+        y0, y1, x0, x1 = _r40_overlap_band(pu, pv)
+        candidates = _r40_candidate_coords(patches, u, v, block_px=block_px)
+        records = []
+        for channel in range(channels):
+            # Shared-valid selection reuses the FROZEN production helper
+            # (``shared_valid_mask``): no duplicated validity maths.
+            su = np.asarray(pu.science)[y0 - uy0:y1 - uy0, x0 - ux0:x1 - ux0, channel:channel + 1]
+            sv = np.asarray(pv.science)[y0 - vy0:y1 - vy0, x0 - vx0:x1 - vx0, channel:channel + 1]
+            vu = np.asarray(pu.valid_mask)[y0 - uy0:y1 - uy0, x0 - ux0:x1 - ux0, channel:channel + 1]
+            vv = np.asarray(pv.valid_mask)[y0 - vy0:y1 - vy0, x0 - vx0:x1 - vx0, channel:channel + 1]
+            shared = zcf.shared_valid_mask(su, vu, sv, vv)
+            keys = [
+                (gx, gy) for (gx, gy) in candidates
+                if bool(shared[int(gy) - y0, int(gx) - x0])
+            ]
+            if not keys:
+                continue
+            samples_u, samples_v = [], []
+            for (gx, gy) in keys:
+                lyu, lxu = int(gy) - uy0, int(gx) - ux0
+                lyv, lxv = int(gy) - vy0, int(gx) - vx0
+                cov_u = covariance.get((str(u), channel, int(gx), int(gy)))
+                cov_v = covariance.get((str(v), channel, int(gx), int(gy)))
+                if cov_u is None or cov_v is None:
+                    raise rc.SchemaError(
+                        "R40 seam capture: mandatory observable M5/M7 "
+                        "(estimator_weight_sum / support_w1 / support_w2 / "
+                        f"n_eff_support) unavailable for cell {u!r}/{v!r} "
+                        f"channel {channel} at ({int(gx)},{int(gy)}); refusing "
+                        "rather than fabricating it"
+                    )
+                ramp_u = float(zcf.feather_weight_field(
+                    np.asarray(pu.science).shape[:2], pu.core_slice, int(ctx["halo_px"]),
+                    bounds=pu.bounds, canvas_hw=(int(ctx["canvas_height"]),
+                                                 int(ctx["canvas_width"])),
+                )[lyu, lxu])
+                ramp_v = float(zcf.feather_weight_field(
+                    np.asarray(pv.science).shape[:2], pv.core_slice, int(ctx["halo_px"]),
+                    bounds=pv.bounds, canvas_hw=(int(ctx["canvas_height"]),
+                                                 int(ctx["canvas_width"])),
+                )[lyv, lxv])
+                samples_u.append({
+                    "gx": int(gx), "gy": int(gy),
+                    "sci_u_pre": float(cov_u["sci_pre"]),
+                    "sci_u_post": _r40_post_offset_value(
+                        pu.science, lyu, lxu, channel, offsets_by_cell[str(u)]),
+                    "valid_u": bool(cov_u["valid"]),
+                    "estimator_weight_sum_u": float(cov_u["estimator_weight_sum"]),
+                    "surviving_sample_count_u": int(cov_u["surviving_sample_count"]),
+                    "support_w1_u": float(cov_u["support_w1"]),
+                    "support_w2_u": float(cov_u["support_w2"]),
+                    "n_eff_support_u": float(cov_u["n_eff_support"]),
+                    "ramp_u": ramp_u,
+                })
+                samples_v.append({
+                    "gx": int(gx), "gy": int(gy),
+                    "sci_v_pre": float(cov_v["sci_pre"]),
+                    "sci_v_post": _r40_post_offset_value(
+                        pv.science, lyv, lxv, channel, offsets_by_cell[str(v)]),
+                    "valid_v": bool(cov_v["valid"]),
+                    "estimator_weight_sum_v": float(cov_v["estimator_weight_sum"]),
+                    "surviving_sample_count_v": int(cov_v["surviving_sample_count"]),
+                    "support_w1_v": float(cov_v["support_w1"]),
+                    "support_w2_v": float(cov_v["support_w2"]),
+                    "n_eff_support_v": float(cov_v["n_eff_support"]),
+                    "ramp_v": ramp_v,
+                })
+            pay_u = rc.build_sparse_payload(
+                cell_id=str(u), role="u", relation_id=relation_id,
+                channel=channel, samples=samples_u,
+            )
+            pay_v = rc.build_sparse_payload(
+                cell_id=str(v), role="v", relation_id=relation_id,
+                channel=channel, samples=samples_v,
+            )
+            records.extend(rc.parent_join_records(pay_u, pay_v, keys=keys))
+        if not records:
+            continue
+        shards.append(rc.RelationShard(
+            u=str(u), v=str(v), orientation=orientation, header=header,
+            records=tuple(records),
+        ))
+
+    if not shards:
+        raise rc.SchemaError("R40 seam capture produced no relation shard (no shared-valid candidates)")
+
+    identity = rc.make_capture_identity(
+        capture_id=str(ctx["capture_id"]),
+        source_set_digest=str(ctx["source_set_digest"]),
+        source_set_count=int(ctx["source_set_count"]),
+        n_frames=int(ctx["n_frames"]),
+        layout={"nx": int(nx), "ny": int(ny)},
+        canvas={
+            "width": int(ctx["canvas_width"]),
+            "height": int(ctx["canvas_height"]),
+            "id": str(ctx["canvas_id"]),
+        },
+        gauge_mode=str(ctx["gauge_mode"]),
+        measurement_px=int(ctx["measurement_px"]),
+        feather_px=int(ctx["feather_px"]),
+        halo_px=int(ctx["halo_px"]),
+        block_px=block_px,
+        repo_head=str(ctx["repo_head"]),
+        production_wired=True,
+    )
+    config = rc.R40CaptureConfig(
+        enabled=True,
+        output_root=str(ctx["output_root"]),
+        disk_budget_bytes=int(ctx["disk_budget_bytes"]),
+        protected_roots=tuple(ctx.get("protected_roots") or ()),
+    )
+    written = rc.write_capture_generation(
+        ctx["output_root"], shards=shards, identity=identity, config=config,
+        protected_roots=tuple(ctx.get("protected_roots") or ()),
+        expected_production_wired=True,
+    )
+    # §8.3 cross-link block: exactly the frozen identity keys. ``filename`` is the
+    # generation directory basename, ``sha256``/``bytes`` are the strict-JSON index
+    # that describes (and binds) every shard.
+    index_path = None
+    gen_dir = Path(str(ctx["output_root"])) / str(written["generation_dir"])
+    index_path = gen_dir / str(written["index_filename"])
+    return {
+        "capture_id": str(identity["capture_id"]),
+        "filename": str(written["generation_dir"]),
+        "sha256": str(written["index_sha256"]),
+        "bytes": int(index_path.stat().st_size) if index_path.exists() else 0,
+        "index_filename": str(written["index_filename"]),
+        "commit_sha256": str(written["commit_sha256"]),
+        "n_shards": int(written["n_shards"]),
+        "n_records": int(written["n_records"]),
+        "shard_bytes": int(written["shard_bytes"]),
+        "total_bytes": int(written["total_bytes"]),
+        "disk_budget_bytes": int(written["disk_budget_bytes"]),
+        "capture_stage": R40_CAPTURE_STAGE,
+    }
+
+
+def _r40_repo_head(start=None):
+    """Best-effort 40-hex git HEAD of this checkout (else ``None``; never invented)."""
+    try:
+        root = Path(start or __file__).resolve()
+    except OSError:  # pragma: no cover - defensive
+        return None
+    for base in [root, *root.parents]:
+        head = base / ".git" / "HEAD"
+        if not head.is_file():
+            continue
+        try:
+            text = head.read_text(encoding="utf-8").strip()
+        except OSError:  # pragma: no cover - defensive
+            return None
+        sha = text
+        if text.startswith("ref:"):
+            ref_name = text.split(":", 1)[1].strip()
+            ref = base / ".git" / ref_name
+            if ref.is_file():
+                try:
+                    sha = ref.read_text(encoding="utf-8").strip()
+                except OSError:  # pragma: no cover - defensive
+                    return None
+            else:
+                packed = base / ".git" / "packed-refs"
+                sha = None
+                if packed.is_file():
+                    try:
+                        for line in packed.read_text(encoding="utf-8").splitlines():
+                            if not line or line.startswith(("#", "^")):
+                                continue
+                            parts = line.split()
+                            if len(parts) == 2 and parts[1] == ref_name:
+                                sha = parts[0]
+                                break
+                    except OSError:  # pragma: no cover - defensive
+                        sha = None
+        if isinstance(sha, str) and len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
+            return sha
+    return None
+
+
+def _r40_capture_id(*, start_ts, pass_label, n_frames, source_set_digest_value, nonce):
+    """Stable opaque R40 capture identity (deterministic hash; nonce = provenance only)."""
+    h = hashlib.sha256()
+    for part in (
+        "zemosaic.zegrid.r40.seam.capture.v1",
+        str(start_ts), str(pass_label), str(int(n_frames)),
+        str(source_set_digest_value), str(nonce),
+    ):
+        h.update(part.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _r40_build_seam_context(*, output_root, disk_budget_bytes, capture_id, descs,
+                            science_config, canvas, nx, ny, result_by_cid, halo_px,
+                            measurement_px, feather_px, block_px, channels,
+                            protected_roots=(), repo_head=None, worker_sparse=None):
+    """Build the run-level R40 seam-capture context (caller owned; nothing invented).
+
+    Raises (fail-closed) when a mandatory identity/provenance input is missing.
+    Only called on the explicitly-enabled path.
+    """
+    rc = _r40_lazy_core()
+    head = repo_head or _r40_repo_head()
+    if not head:
+        raise rc.IdentityError(
+            "R40 seam capture: cannot resolve a 40-hex repo HEAD; refusing to publish"
+        )
+    logical = [str(d.frame_id.logical_path) for d in (descs or [])]
+    # Source-set digest: the SAME frozen algorithm as the accepted R37-D capture
+    # (reused, never re-defined), so the two captures bind the identical input set.
+    from .core.zegrid import background_diagnostics as _bgd
+
+    src_digest = _bgd.source_set_digest(logical)
+    frame_order_digest_value = hashlib.sha256(
+        ("zemosaic.zegrid.r40.frame_order.v1\n" + "\n".join(logical)).encode("utf-8")
+    ).hexdigest()
+    reference_frame_id, excluded = {}, {}
+    for cid, result in (result_by_cid or {}).items():
+        record = (result or {}).get("record") or {}
+        ref = record.get("reference_frame_id")
+        if not ref:
+            raise rc.IdentityError(
+                f"R40 seam capture: cell {cid!r} carries no reference_frame_id (M9); refusing"
+            )
+        reference_frame_id[str(cid)] = str(ref)
+        excluded[str(cid)] = [
+            ":".join(str(x) for x in (item if isinstance(item, (list, tuple)) else [item]))
+            for item in (record.get("excluded") or [])
+        ]
+    rejection = str(science_config.rejection)
+    tokens = {
+        "normalization": str(science_config.normalization),
+        "weighting": str(science_config.weighting),
+        "rejection": rejection,
+        "combine": str(science_config.combine),
+        "taper": str(science_config.taper),
+        "taper_px": float(science_config.taper_px),
+        "taper_floor": float(science_config.taper_floor),
+        "equalize_rgb": bool(science_config.equalize_rgb),
+        "sigma_low": float(science_config.sigma_low),
+        "sigma_high": float(science_config.sigma_high),
+        "winsor": (
+            float(max(science_config.winsor_limit_low, science_config.winsor_limit_high))
+            if "winsor" in rejection.lower() else None
+        ),
+    }
+    return {
+        "output_root": str(output_root),
+        "disk_budget_bytes": int(disk_budget_bytes),
+        "protected_roots": tuple(protected_roots or ()),
+        "capture_id": str(capture_id),
+        "source_set_digest": src_digest,
+        "source_set_count": int(len(logical)),
+        "n_frames": int(len(logical)),
+        "repo_head": head,
+        "gauge_mode": str(getattr(science_config, "cell_gauge_mode", None)),
+        "stack_tokens": tokens,
+        "canvas_id": str(canvas.canvas_id),
+        "canvas_width": int(canvas.width),
+        "canvas_height": int(canvas.height),
+        "channels": int(channels),
+        "measurement_px": int(measurement_px),
+        "feather_px": int(feather_px),
+        "halo_px": int(halo_px),
+        "block_px": int(block_px),
+        "reference_frame_id": reference_frame_id,
+        "frame_order_digest": {str(c): frame_order_digest_value for c in reference_frame_id},
+        "excluded": excluded,
+        "worker_sparse_cells": tuple(sorted((worker_sparse or {}).keys())),
+    }
+
+
 def _validate_r37_diagnostic_capture(capture, holdout_cap):
     """Strict validation of the R37-D capture opt-in (no silent coercion).
 
@@ -1387,7 +1967,8 @@ def _validate_r37_diagnostic_capture(capture, holdout_cap):
 
 def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None, emit=None,
                                  capture=False, holdout_cap=None, output_dir=None,
-                                 capture_identity=None):
+                                 capture_identity=None,
+                                 r40_capture=False, r40_context=None):
     """R34D: apply inter-cell additive offsets + FEATHERED assembly (opt-in).
 
     Builds :class:`cell_feather.CellPatch` objects from the per-cell worker results
@@ -1508,6 +2089,58 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-R40-B2-B: explicit, default-OFF R40 diagnostic capture at the
+    # SAME pinned pre-offset/pre-feather point. The complete CellPatch objects
+    # coexist here; the inter-cell offset graph, the additive offsets applied to
+    # the patches and the feather blend do not exist yet. The capture reuses the
+    # accepted default-OFF ``core/zegrid/r40_capture`` shard core (NO duplicated
+    # pixel/difference maths) and is diagnostic-only: the patches, graph,
+    # offsets, feather weights and every science/aesthetic/coverage array are
+    # left untouched. Fail-closed: a refusal publishes NOTHING and leaves the
+    # assembly result byte-identical.
+    # ------------------------------------------------------------------
+    r40_info = None
+    if r40_capture:
+        if r40_context is None:
+            raise RuntimeError(
+                "R40 diagnostic seam capture requested but no capture context was "
+                "provided; refusing to run without a publishable identity"
+            )
+        _r40_ctx = dict(r40_context)
+        _r40_ctx.setdefault("canvas_width", int(canvas.width))
+        _r40_ctx.setdefault("canvas_height", int(canvas.height))
+        _r40_ctx.setdefault("channels", 3)
+        if _r40_ctx.get("offsets") is None:
+            # The frozen R34c offsets are obtained from the SAME production solver
+            # the assembly uses below (pure, read-only, deterministic). The
+            # assembly's own solve is left byte-for-byte unchanged, so the capture
+            # cannot influence it.
+            _r40_graph = zcf.build_cell_offset_graph(
+                canvas, nx, ny, patches,
+                on_disconnected=zcf.FEATHER_DISCONNECTED_POLICY,
+            )
+            _r40_ctx["offsets"] = {
+                cid: np.asarray(_r40_graph.offsets[i], dtype=np.float64)
+                for i, cid in enumerate(_r40_graph.cell_ids)
+            }
+        r40_info = _r40_seam_capture(patches, nx, ny, result_by_cid, context=_r40_ctx)
+        if emit is not None:
+            try:
+                emit(
+                    "ZeGrid R40-B2-B diagnostic seam capture: "
+                    f"capture_id={r40_info['capture_id']} "
+                    f"generation={r40_info['filename']} "
+                    f"shards={r40_info['n_shards']} records={r40_info['n_records']} "
+                    f"shard_bytes={r40_info['shard_bytes']} "
+                    f"total_bytes={r40_info['total_bytes']} "
+                    f"budget={r40_info['disk_budget_bytes']} "
+                    f"index_sha256={r40_info['sha256']}",
+                    "INFO",
+                )
+            except Exception:
+                pass
+
     graph = zcf.build_cell_offset_graph(
         canvas, nx, ny, patches, on_disconnected=zcf.FEATHER_DISCONNECTED_POLICY
     )
@@ -1551,11 +2184,14 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
     }
     if capture_info is not None:
         info["r37_diagnostic_capture"] = capture_info
+    if r40_info is not None:
+        info["r40_diagnostic_capture"] = r40_info
     return assembled, info
 
 
 def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None, emit=None,
-                    capture=False, holdout_cap=None, output_dir=None, capture_identity=None):
+                    capture=False, holdout_cap=None, output_dir=None, capture_identity=None,
+                    r40_capture=False, r40_context=None):
     """Dispatch assembly by cell gauge mode (ZM-CELL-PHOTOMETRY-R34D).
 
     Returns ``(assembled, feather_info)``. ``"global"`` (default) -> the
@@ -1571,6 +2207,7 @@ def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None,
             canvas, nx, ny, result_by_cid, halo_px=halo_px, emit=emit,
             capture=capture, holdout_cap=holdout_cap, output_dir=output_dir,
             capture_identity=capture_identity,
+            r40_capture=r40_capture, r40_context=r40_context,
         )
     return zmosaic.assemble_canvas(canvas, nx, ny, cores), None
 
@@ -2184,6 +2821,9 @@ def _run_single(
     pass_label="single",
     r37_diagnostic_capture=False,
     r37_diagnostic_holdout_cap=None,
+    r40_seam_capture=False,
+    r40_output_root=None,
+    r40_seam_capture_disk_budget_bytes=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2322,6 +2962,27 @@ def _run_single(
             f"ZeGrid R37-D capture requested — capture_id={_capture_id} "
             f"pass={pass_label} source_frames={len(descs)} "
             f"source_set_digest={_src_digest}",
+            callback=progress_callback,
+        )
+
+    # ZM-ZEGRID-R40-B2-B: ONE stable opaque capture identity for THIS pass when the
+    # R40 seam capture is explicitly requested (provenance-only nonce; never
+    # scientific RNG). The disabled path imports/invents nothing.
+    r40_capture_id = None
+    r40_capture_source_digest = None
+    if r40_seam_capture:
+        from .core.zegrid import background_diagnostics as _bgd
+
+        _r40_ids = [d.frame_id.logical_path for d in descs]
+        r40_capture_source_digest = _bgd.source_set_digest(_r40_ids)
+        r40_capture_id = _r40_capture_id(
+            start_ts=start_ts, pass_label=pass_label, n_frames=len(descs),
+            source_set_digest_value=r40_capture_source_digest, nonce=time.time_ns(),
+        )
+        _emit(
+            f"ZeGrid R40-B2-B seam capture requested — capture_id={r40_capture_id} "
+            f"pass={pass_label} source_frames={len(descs)} "
+            f"source_set_digest={r40_capture_source_digest}",
             callback=progress_callback,
         )
 
@@ -3073,6 +3734,24 @@ def _run_single(
     _assembly_rep = _reporter()
     _assembly_rep.start("assembly")
     with timings.timed("assembly"):
+        _r40_context = None
+        if r40_seam_capture:
+            from .core.zegrid import background_diagnostics as _bgd
+            from .core.zegrid import background_model as _zbm
+
+            _halo_i = int(zsw.HALO_PX)
+            _meas_px = int(2 * _halo_i) if _halo_i > 0 else int(_bgd.DEFAULT_MEASUREMENT_PX)
+            _feath_px = int(_halo_i) if _halo_i > 0 else int(_bgd.DEFAULT_FEATHER_PX)
+            _r40_context = _r40_build_seam_context(
+                output_root=(r40_output_root or output_dir),
+                disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
+                capture_id=r40_capture_id,
+                descs=descs, science_config=science_config, canvas=canvas,
+                nx=nx, ny=ny, result_by_cid=result_by_cid,
+                halo_px=_halo_i, measurement_px=_meas_px, feather_px=_feath_px,
+                block_px=int(_zbm.BLOCK_PX), channels=3,
+                protected_roots=(), repo_head=None,
+            )
         assembled, feather_info = _assemble_cells(
             canvas, nx, ny, _gauge_mode, cores, result_by_cid,
             halo_px=zsw.HALO_PX, emit=_emit_live,
@@ -3080,6 +3759,8 @@ def _run_single(
             holdout_cap=r37_diagnostic_holdout_cap,
             output_dir=output_dir,
             capture_identity=r37_capture_identity,
+            r40_capture=r40_seam_capture,
+            r40_context=_r40_context,
         )
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
     # ZM-ZEGRID-R22 honesty fix: peak_rss_kib is a SINGLE process's peak. Report
@@ -3915,6 +4596,21 @@ def _write_outputs(
         "science_output_contract": science_output_contract,
         "stale_cleanup": stale_cleanup,
     }
+    # ZM-ZEGRID-R40-B2-B: exactly ONE additive ``r40_diagnostic_capture`` manifest
+    # block, produced by the accepted core (pre-existing fields canonical-identical
+    # ON/OFF; NEVER a whole-manifest byte-identity claim). OFF -> no new field at
+    # all, so a disabled run keeps the exact previous manifest shape.
+    _r40_block = (cell_feather_info or {}).get("r40_diagnostic_capture")
+    if _r40_block is not None:
+        from .core.zegrid import r40_capture as _r40c
+
+        manifest = _r40c.build_manifest_link(
+            manifest,
+            capture_id=str(_r40_block["capture_id"]),
+            filename=str(_r40_block["filename"]),
+            sha256=str(_r40_block["sha256"]),
+            nbytes=int(_r40_block["bytes"]),
+        )
     manifest_path = output_dir / "zegrid_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     return sci_path, cov_path, manifest_path
@@ -3951,6 +4647,9 @@ def run_zegrid_mode(
     global_wcs_output_path: str | None = None,
     r37_diagnostic_capture: bool = False,
     r37_diagnostic_holdout_cap: int = R37_CAPTURE_HOLDOUT_CAP_DEFAULT,
+    r40_seam_capture: bool = False,
+    r40_output_root: str | None = None,
+    r40_seam_capture_disk_budget_bytes: int | None = None,
 ) -> None:
     """Run the NEW ZeGrid engine over the input folder's FITS inventory.
 
@@ -3978,6 +4677,17 @@ def run_zegrid_mode(
     r37_diagnostic_capture, r37_diagnostic_holdout_cap = _validate_r37_diagnostic_capture(
         r37_diagnostic_capture, r37_diagnostic_holdout_cap
     )
+
+    # ZM-ZEGRID-R40-B2-B: validate the R40 seam-capture opt-in strictly and up
+    # front (no silent coercion; a capture that cannot publish is refused before
+    # any work). The core is imported lazily, ONLY when the capture is enabled.
+    (
+        r40_seam_capture, r40_output_root, r40_seam_capture_disk_budget_bytes,
+    ) = _validate_r40_seam_capture(
+        r40_seam_capture, r40_output_root, r40_seam_capture_disk_budget_bytes
+    )
+    if r40_seam_capture and not r40_output_root:
+        r40_output_root = output_folder
 
     # ZM-ZEGRID-R37-D (F1): when a capture is REQUESTED, fail-closed invalidate any
     # stale fixed artifact at run START — in the base output dir AND the known
@@ -4184,6 +4894,20 @@ def run_zegrid_mode(
             "'auto'."
         )
 
+    # ZM-ZEGRID-R40-B2-B: the R40 seam capture only exists on the per_cell path
+    # (the only point where complete pre-offset/pre-feather CellPatches coexist).
+    # An explicit global mode can never satisfy the request -> fail loudly and early.
+    if (
+        r40_seam_capture
+        and resolved_cell_gauge_mode == zphot.CELL_GAUGE_MODE_GLOBAL
+    ):
+        raise RuntimeError(
+            "R40 seam capture requested but cell_gauge_mode is 'global' (no "
+            "pre-offset/pre-feather per-Cell assembly point exists). Refusing to run "
+            "rather than silently not capturing; use cell_gauge_mode='per_cell' or "
+            "'auto'."
+        )
+
     science_config = replace(
         ExecutorConfig().science_config(),
         normalization=_resolve_normalization(stack_norm_method),
@@ -4260,7 +4984,10 @@ def run_zegrid_mode(
                         finishing_config=finishing_config,
                         gpu_context=gpu_context, pass_label="EQ",
                         r37_diagnostic_capture=r37_diagnostic_capture,
-                        r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap)
+                        r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
+                        r40_seam_capture=r40_seam_capture,
+                        r40_output_root=r40_output_root,
+                        r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
@@ -4270,7 +4997,10 @@ def run_zegrid_mode(
                         finishing_config=finishing_config,
                         gpu_context=gpu_context, pass_label="ALTZ",
                         r37_diagnostic_capture=r37_diagnostic_capture,
-                        r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap)
+                        r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
+                        r40_seam_capture=r40_seam_capture,
+                        r40_output_root=r40_output_root,
+                        r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -4282,4 +5012,7 @@ def run_zegrid_mode(
                     finishing_config=finishing_config,
                     gpu_context=gpu_context, pass_label="single",
                     r37_diagnostic_capture=r37_diagnostic_capture,
-                    r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap)
+                    r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
+                    r40_seam_capture=r40_seam_capture,
+                    r40_output_root=r40_output_root,
+                    r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes)
