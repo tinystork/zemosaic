@@ -727,7 +727,7 @@ claim the whole product RAM is `O(records)`.
 | **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
 | **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; the v2 reserved cohort was evaluated EXACTLY ONCE by the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission → terminal **ACCEPT** (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`** (§15.7). | **DONE / terminal ACCEPT** (v1 invalidation history preserved byte-for-byte, §15.1) |
 | **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
-| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); **acceptance NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run remain `NOT_RUN` |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); **acceptance NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run remain `NOT_RUN`. The **run-volatile-classifier completeness proven by measurement** is now a **frozen B2 acceptance criterion** (§8 clause 12); the synthetic 38-relation panel OFF/ON qualification is **MEASURED** (§15.12) but B2 is still **NOT accepted** |
 | **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
 | **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
 | **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
@@ -849,6 +849,23 @@ A future R40-B2 capture must satisfy, and prove, all of:
     block**: its absence yields H4 `NOT_IDENTIFIABLE`/`NOT_AVAILABLE` **only** and does
     **not** invalidate the T1/T2/T3/T5 association evidence; conversely, a present H4 block
     can never silently become "complete H4"; it must independently satisfy §5/§5.1.
+12. **B2 ACCEPTANCE CRITERION (frozen) — run-volatile-classifier completeness, proven
+    by measurement.** B2 acceptance **MUST** prove the completeness of the run-volatile
+    classifier **by measurement** (frozen here per the Nono `ZM-ZEGRID-R40-B2-E-CONTRACT-CLARITY`
+    review-0 §3 recommendation, **before any real R40 outcome** and with **no** obligation,
+    tolerance, threshold or measured fact changed): **(i)** the exclusions are **limited to the
+    enumerated run-volatile set** of clause 3 — nothing else may be excluded, and the list may
+    **never** be widened by assertion; **(ii)** a focused test demonstrates `_diffs` is **empty**
+    **(a)** between two **capture-OFF** runs **and (b)** between runs with **forced different
+    plans** (capture OFF **and** ON), and **fails loudly** on any **unclassified** differing
+    leaf (it may **never** silently normalise); **(iii)** the canonical projection excludes
+    **only** the enumerated leaves and **never** a product field (science / coverage /
+    aesthetic / uint8-uint16 render, contract, layout, cell product fields, offsets);
+    **(iv)** the `.cells` subtree is **never** blanket-excluded — only the plan-metadata leaf
+    **names** `mode` / `bound_bytes` may differ. A B2 "pass" may **not** rely on a widened
+    classifier: an unclassified differing leaf is a **failure**, not a normalisation. This
+    criterion is **additive** to clause 2 (the zero-tolerance product byte-identity gate): it
+    neither relaxes, replaces nor re-scopes it.
 
 ---
 
@@ -1180,6 +1197,21 @@ This section is a pointer, not a source of authority.
   excluded**. Cross-references (§0 rework-1; §14 rework-1; §15.8; §15.9; §15.11) are
   reconciled to the scoped wording. **No tolerance was changed** anywhere; the OFF/ON gate
   stays at exactly `0`. **B2 acceptance is NOT claimed**; `R40-C`/`R40-D` remain `NOT_RUN`.
+
+- **rework-17 (R40-B2-F panel-qualification, bounded task F), before any real R40
+  outcome (and before any real R40-C outcome):** the run-volatile-classifier completeness
+  obligation recommended by the Nono `R40-B2-E` review-0 (§3) is **frozen as an explicit B2
+  acceptance criterion** in §8 (**new clause 12**), with the §7 `R40-B2` row pointing to it
+  and the measured task-F result recorded in §15.12. The freeze is **additive and purely
+  normative**: **no code, no test expectation, no threshold and NO tolerance is changed**;
+  the zero-tolerance OFF/ON gate of §8 clause 2 stays at exactly `0`. The bounded task F also
+  MEASURES, on a synthetic end-to-end capture, the full **38-relation panel** OFF/ON: the
+  product ARRAYS + FITS stay **exactly byte-identical** (tolerance `0`), all 38 relations are
+  captured, complete (114/114 relation-channels) and independently verifiable, an
+  **INCOMPLETE** panel (one relation removed) is **refused and not promoted**, and the ON
+  manifest carries **exactly one** additive block (none OFF). This is a **SYNTHETIC** panel
+  qualification: the real **Windows816 38-relation layout is NOT exercised** and the real
+  Windows run remains a **HUMAN GATE**. **B2 acceptance is NOT claimed.**
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -1719,4 +1751,91 @@ single additive manifest block, the measured environment-vs-capture causality of
 evidence-backed isolation of the pre-existing run-observable fields. The 38-relation panel qualification,
 the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection
 and a real Windows run remain **`NOT_RUN`**. `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` remain
+**`NOT_RUN` / `NOT_AUTHORIZED`**.
+
+---
+
+### 15.12 R40-B2-F 38-relation PANEL OFF/ON qualification — implementation status (bounded task F)
+
+**Mission** `ZM-ZEGRID-R40-B2-F-PANEL-QUALIFICATION` · **phase** `implementation` · **branch** `beta` ·
+**baseline HEAD** `190ab56426e22d7e395af79f095d6e28210611ea` · **commit created** `NO` · **push** `NO`.
+
+Bounded task F (a) **FREEZES** the run-volatile-classifier completeness obligation as an explicit B2
+acceptance criterion (**§8 clause 12**, rework-17) and (b) **MEASURES** the full **38-relation panel**
+OFF/ON qualification on a **synthetic end-to-end** capture. **Zero production code was changed**; one new
+focused test file (`tests/test_zegrid_r40b2_panel.py`) was added and the plan document updated.
+
+**Synthetic corpus (NEVER the real corpus).** Ten synthetic FITS frames (5 RA x 2 DEC centres,
+`400x600` at `1e-3` deg/px) tiling the field, so that a **pinned 6x4 Cell grid** covers every one of the
+24 Cells with an `M9` reference frame; the per-cell gauge + feather path (the only seam carrying the R40
+capture) is exercised, and the full finishing set is enabled so all four product FITS are emitted. Only
+the accepted B2-C concurrency seam is pinned (`cells_in_flight = 3`) so the production **process pool**
+runs; the environment (free RAM) is NOT pinned.
+
+**Measured — the exact frozen 38-relation panel.** The frozen adjacency rule (`grid_adjacency`) over a
+6x4 grid yields exactly **38** relations = **20 horizontal + 18 vertical**, asserted explicitly in the
+suite (not assumed); the end-to-end run produced exactly that set: `n_shards = 38`, `n_records =
+127440`, `shard_bytes = 24850800`, record itemsize `195`, `production_wired = True`, identity layout
+`{'nx': 6, 'ny': 4}`, i.e. the **114/114** relation-channel panel (38 relations x 3 channels), each
+relation complete on all 3 channels.
+
+**Measured — product array + FITS byte identity (tolerance exactly `0`).** Representative durable
+evidence run (identical under the test harness): OFF run 1, OFF run 2 and ON produced the **same size and
+SHA-256** per product artifact.
+
+| Product FITS | bytes | SHA-256 (identical OFF1 = OFF2 = ON) | pass |
+|---|---|---|---|
+| `mosaic_grid_science.fits` (SCI) | 13821120 | `0843292fff5e5e63d368e4285bcca819e2a53d138cc63011657c6bd2652bcdbf` | **PASS** |
+| `mosaic_grid_aesthetic.fits` (AESTH) | 13821120 | `bf64ec0fa07a8d5650c31898a0c8f4ecf5a9beebcffcb5884046255a5b8a31e2` | **PASS** |
+| `mosaic_grid_coverage.fits` (COV) | 4610880 | `fc5ffb7f6050ac0c28f78a0bb2c4d67228fcb16a96c064f035702da379bdacfc` | **PASS** |
+| `mosaic_grid_uint16.fits` (U16) | 6912000 | `95d1f3aa77777f15beb039df6a5520d1ef55df2c9aec59432c87ab72846aaa75` | **PASS** |
+| in-array equality (`fits[0].data`) | — | identical per artifact | **PASS** |
+| single-byte / single-ULP negative control | — | detected | **PASS** |
+
+A representative durable run's single-generation capture: `capture_id` / generation name
+`r40_capture_ea63071963a84bf5b0f45c7dbe7e92696d7c43d2ba7d939a020bf335a5ac2ff3`, index `sha256`
+`8534a4f3cce17663513b0a8785d01737232f9650d33aac16e7225a04ade9ad0d`, index `bytes` `61862`.
+
+**Measured — every relation independently verifiable.** `verify_generation(..., expected_production_wired=True)`
+-> `ok = True`, `problems = []`, `n_shards = 38`. Independently from on-disk bytes the suite re-derives,
+per relation: shard `sha256` / `bytes` / `count` (`count x itemsize == bytes`), the frozen structured-array
+decode and `(channel, gy, gx)` ordering, the frozen per-record sample key, the pairset digest, the frozen
+`M9`/`M10` header validation, the relation id and the orientation — none of it trusted from the index.
+
+**Measured — INCOMPLETE panel REFUSED and NEVER promoted.** Dropping ONE relation from the captured
+panel: the frozen completeness gate `assert_checkpoint_complete(..., expected_relation_ids=<38 ids>)`
+**raises `INCOMPLETE_PANEL`** and **names the missing relation**; the exact-resume primitive reports the
+panel `RESUMABLE` with `remaining == [<missing id>]` and `n_completed == 37` — **never `COMPLETE`**. A
+**physically written 37-shard generation** is internally self-consistent on disk (`verify_generation`
+`ok = True`, `n_shards = 37`) **yet the panel gate still refuses it** — a partial panel is **not
+promotable**. The complete 38-relation checkpoint PASSES and reports `COMPLETE`.
+
+**Measured — additive manifest block + classifier obligation re-stated on the panel.** The ON manifest
+carries **exactly one** additive `r40_diagnostic_capture` block and the OFF manifest **none**; the only
+added leaves are the four frozen identity leaves, and the block cross-links the published generation
+(`filename` == generation dir; `sha256` / `bytes` == the on-disk `index.json`). Measured ON vs OFF and
+OFF vs OFF, every manifest difference beyond that single block lies in the declared run-volatile
+classifier (`_diffs == []`), the canonical projection is identical, the `.cells` subtree is **not**
+blanket-excluded, and a negative control proves the check **fails loudly** on an unclassified differing
+leaf (while a classified plan-metadata leaf is ignored). The **forced-different-plans** completeness
+measurement (capture absent) is the existing focused test
+`tests/test_zegrid_r40b2_offon_identity.py::test_run_volatile_classifier_covers_plan_differences`
+(§15.11).
+
+**Validation (executed, observed).**
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest tests/test_zegrid_r40b2_panel.py -W error -q -p no:cacheprovider` | **19 passed** |
+| `python3 -m py_compile tests/test_zegrid_r40b2_panel.py` | OK |
+| `git diff --check` | clean (`git status` shows only the intended 2 files) |
+
+> **Task F does NOT accept B2.** It FREEZES the run-volatile-classifier completeness obligation as an
+explicit B2 acceptance criterion (§8 clause 12) and MEASURES the synthetic 38-relation panel OFF/ON
+qualification: exact 38-relation count (20 h + 18 v), product array + FITS byte identity at tolerance
+`0`, all 38 relations complete and independently verifiable, an incomplete panel refused and not
+promoted, and exactly one additive ON manifest block. This is a **SYNTHETIC** qualification: the real
+**Windows816 38-relation layout is NOT exercised** and the real Windows run remains a **HUMAN GATE**. The
+injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and
+a real Windows run remain **`NOT_RUN`**. `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` remain
 **`NOT_RUN` / `NOT_AUTHORIZED`**.
