@@ -726,7 +726,7 @@ claim the whole product RAM is `O(records)`.
 | **R40-A** | This pre-registration + read-only code/artifact archaeology (docs-only). | YES (this task only) |
 | **R40-B1** | **Synthetic calibration stage:** synthetic truth corpus with **disjoint calibration and validation groups** (criteria derived on the calibration group, validated once on an independent validation group at family/parameter/event level). Calibrates **only**: the M3 pre/post algebraic identity rule (bit-identity achieved), the §5.1 ROI-shadow numerical parity rule, the injected-effect recovery criterion, and the H4 controlled-effect criteria; **frozen in a pre-real document revision** (§15). Does **not** calibrate, and may **not** touch, the OFF/ON byte-identity gate (frozen at zero in §8.2). No real data. **STATUS: v1 `B1_PASS` WITHDRAWN as `B1_FAIL_PROTOCOL_INVALID`; the v2 reserved cohort was evaluated EXACTLY ONCE by the separate `ZM-ZEGRID-R40-B1V-ONE-SHOT` mission → terminal **ACCEPT** (`B1_PASS`, 18/18, claim `COMPLETED`, `r40b2_authorized=true`) at HEAD `61c4aa5`** (§15.7). | **DONE / terminal ACCEPT** (v1 invalidation history preserved byte-for-byte, §15.1) |
 | **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
-| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); **acceptance NOT achieved** — the OFF/ON FITS byte identity, the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity and the exact §1.3 held-out intersection remain `NOT_RUN` |
+| **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); **acceptance NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run remain `NOT_RUN` |
 | **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | NO — not authorized now (§11) |
 | **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | NO — after R40-B2 + HUMAN_GATE |
 | **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
@@ -1091,6 +1091,40 @@ This section is a pointer, not a source of authority.
   38-relation panel qualification, the injected-effect recovery re-proof, the real product ROI parity, the
   exact §1.3 held-out-key intersection, a real Windows run and R40-C/D remain **`NOT_RUN`**. No criterion was
   changed and the OFF/ON zero-tolerance gate was untouched.
+
+- **rework-14 (R40-B2-D OFF/ON product byte-identity measurement, bounded task D), before any
+  real R40-C outcome:** the frozen §8.2 zero-tolerance gate is **measured** (never re-calibrated) on
+  real synthetic end-to-end product runs (§15.11). The R40 capture ON (output discarded) produces
+  **byte-identical** science/coverage/aesthetic/uint16 product FITS (full file bytes, tolerance
+  exactly `0`) versus capture-OFF, with OFF shown deterministic and a controlled, environment-pinned
+  run removing the scheduler confound; the manifest gains **exactly one** additive
+  `r40_diagnostic_capture` block ON and none OFF, with every pre-existing run-stable field
+  canonical-identical. **Zero production code was changed** (one new test file only). Observed:
+  focused **172 passed** (new `r40b2_offon_identity` + pooled + seam + core), combined regressions
+  **417 passed**. **B2 acceptance is NOT claimed**: the 38-relation panel qualification, the
+  injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out-key
+  intersection, a real Windows run and R40-C/D remain **`NOT_RUN`**. No criterion was changed and the
+  OFF/ON zero-tolerance gate was left at exactly zero.
+
+- **rework-15 (R40-B2-D rework-1: corrective iteration after an independent reproduction), before any real
+  R40-C outcome:** Junior independently reproduced a **contradiction** of the r0 manifest narrative — in
+  their environment the ON run chose `mode=inmem` while both OFF runs chose `mode=stream`, so the r0
+  classifier was incomplete and the r0 claim over-stated (the §8.2 BYTE gate held regardless). Repairs:
+  (R1) the plan/environment causality is now MEASURED and stated — the joint per-cell plan is a pure
+  function of the free RAM sampled at plan time and is computed strictly BEFORE any capture work; with the
+  memory seam pinned the plan is **identical** OFF vs ON at both a STREAM and an INMEM budget, and the
+  memory input **alone** flips the plan with the capture ABSENT (so the wild flips are environment RAM
+  fluctuation, **not** a capture effect). (R2) the run-volatile classifier is broadened to the full
+  environment-driven scheduler plan and its completeness is **evidence-backed** against two capture-OFF
+  runs with DIFFERENT plans; the strong canonical-identity claim is now scoped to the same-plan pinned
+  pairs, and the uncontrolled-fixture claim is restated honestly (product bytes identical; every ON-vs-OFF
+  difference confined to the classifier + the single additive block). (R3) a sensitivity negative control
+  proves the byte gate detects a single-byte / single-ULP change (not vacuous). (R4) `.cells` is stated
+  precisely (per-cell records; under a plan flip ONLY the plan-metadata leaves `mode`/`bound_bytes` differ,
+  and only those two leaf NAMES are excluded — the subtree is never blanket-excluded). Observed, run twice
+  for reproducibility: focused **20 passed** (twice), combined **176 passed** (twice), regressions **417
+  passed**. **No production code was changed** and no criterion was altered. **B2 acceptance is NOT
+  claimed**; the OFF/ON gate stays at exactly zero.
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -1505,3 +1539,126 @@ and publishes NOTHING, leaving the input planes byte-unchanged. (4) Bounded: the
 the **real product ROI parity** and the exact §1.3 held-out intersection remain **`NOT_RUN`** /
 **`B2_MANDATORY`**. The OFF/ON gate is untouched at tolerance zero. `R40-C` / `R40-D` / `HUMAN_GATE` /
 `LP341` remain **`NOT_RUN` / `NOT_AUTHORIZED`**.
+
+---
+
+### 15.11 R40-B2-D OFF/ON product byte-identity measurement — implementation status (bounded task D)
+
+**Mission** `ZM-ZEGRID-R40-B2-D-OFFON-IDENTITY` · **phase** `implementation` · **branch** `beta` ·
+**baseline HEAD** `5edb9d19aacded082f7b53129e9fc2df6d78f32a` · **commit created** `NO` · **push** `NO`.
+
+Bounded task D MEASURES — it does not calibrate or relax — the frozen §8.2 zero-tolerance gate on
+**real synthetic end-to-end product runs**. **Zero production code was changed**; one new focused test
+file (`tests/test_zegrid_r40b2_offon_identity.py`) was added. The pipeline is fed by a synthetic 2×2
+disjoint corpus synthesized in `tmp_path` only (**never** the real corpus), with the *full* finishing set
+enabled so all four product FITS are emitted; the accepted B2-C concurrency seam is pinned so the real
+production **process pool** runs with the capture ON.
+
+**Measured — product FITS byte identity (tolerance exactly `0`; full file bytes, not headers only).**
+Representative durable evidence run (identical under the test harness): OFF run 1, OFF run 2 and ON run
+all produced the **same size and SHA-256** per artifact.
+
+| Product FITS | bytes | SHA-256 (identical OFF1 = OFF2 = ON) | pass |
+|---|---|---|---|
+| `mosaic_grid_science.fits` (SCI) | 12170880 | `f66b3a2738ff5489e401f7520dbd305481e52f04d09ffbfe9f88298b5840e4f5` | **PASS** |
+| `mosaic_grid_aesthetic.fits` (AESTH) | 12170880 | `423f71f3803a2a8ed48f7303e093fed99165b80b5896458455bc4c90c669efe0` | **PASS** |
+| `mosaic_grid_coverage.fits` | 4060800 | `69f0356eea1a0941b12a37b3e0c2208a9d02d82015a348bd41d376544ad60cbb` | **PASS** |
+| `mosaic_grid_uint16.fits` | 6088320 | `47744bbd1a22eb125756571fe386c945b2f5b03dc17be5c88098e5e0c3dead21` | **PASS** |
+| in-array equality (`fits[0].data`) | — | identical per artifact | **PASS** |
+| embedded `SCIHASH`/`SCIROLE` header | — | identical OFF vs ON | **PASS** |
+
+The two non-product durable outputs are explicitly **not** byte-compared: `zegrid_run.log` embeds
+wall-clock timestamps by construction, and `__zegrid_cache__` is a transient retention-cleaned
+intermediate.
+
+**Measured — manifest (NO whole-manifest byte-identity claim).** The ON manifest carries **exactly one**
+additive top-level block and the OFF manifest none; the block's four frozen identity keys cross-link the
+published generation to the manifest exactly (`sha256`/`bytes` == the on-disk `index.json`):
+`capture_id`/`filename` `63f5472962ac9d3a2ea65f6cf7ee7f47bd62632d507242eec64d33094d7682e8`,
+`sha256` `c19990ceeaf0e902aafedbc9b31a5d7e525d1a0acf2c96592fb07cc4491789e6`, `bytes` `7293`.
+`verify_generation(..., expected_production_wired=True)` → `ok=True`, `problems=[]`, `n_shards=2`,
+`n_records=15432`, `checked_bytes=3009240`, with `index_sha256` self-consistent.
+
+**Measured — CAUSALITY of the plan: environment-driven, NOT capture-driven (R40-B2-D rework-1).**
+The joint per-cell plan (`mode`, `per_cell_footprint_bytes`, `plan_candidates`, executor, worker counts)
+is a pure function of the free RAM sampled at plan time (`budget = 0.8 × available`), CPU count and cell
+bounds. Three independent measurements establish the causality:
+
+1. **Structural.** Within a run, the plan is computed strictly BEFORE any R40 capture work exists — the
+   capture candidate geometry is computed only after the plan, and every capture write happens at
+   assembly (after the per-cell stack). The capture therefore cannot influence the plan of its own run.
+2. **Held-fixed environment → identical plan.** With the memory seam pinned to a constant, capture-ON and
+   capture-OFF produce the **byte-identical plan** at BOTH a pinned STREAM budget and a pinned INMEM
+   budget (asserted directly).
+3. **Memory input ALONE flips the plan, capture ABSENT.** Two capture-OFF runs whose pinned memory
+differs produce DIFFERENT plans (`stream` vs `inmem`); an interleaved OFF/ON/OFF/ON/OFF/ON sequence
+showed the plan-time `available_bytes` drifting ~±10% run-to-run with the capture-ON runs bracketed by
+capture-OFF runs and **no systematic ON-vs-OFF offset**. The plan flips observed in the wild are
+environment RAM fluctuation, **not** a capture effect.
+
+**Measured — manifest (NO whole-manifest byte-identity claim).** The ON manifest carries **exactly one**
+additive top-level block and the OFF manifest none; the block's four frozen identity keys cross-link the
+published generation to the manifest exactly (`sha256`/`bytes` == the on-disk `index.json`):
+`capture_id`/`filename` `63f5472962ac9d3a2ea65f6cf7ee7f47bd62632d507242eec64d33094d7682e8`,
+`sha256` `c19990ceeaf0e902aafedbc9b31a5d7e525d1a0acf2c96592fb07cc4491789e6`, `bytes` `7293`.
+`verify_generation(..., expected_production_wired=True)` → `ok=True`, `problems=[]`, `n_shards=2`,
+`n_records=15432`, `checked_bytes=3009240`, with `index_sha256` self-consistent.
+
+**Measured — the manifest confound is ISOLATED by an evidence-backed classifier, never widened.** The
+manifest embeds PRE-EXISTING *run-observability* fields that are not product science, in two families:
+(a) wall-timing / RSS measurements and (b) the environment-driven scheduler plan (mode, footprint,
+concurrency, plan candidates, choson reason, reprojection path/call counters, executor/worker counts,
+RAM-budget/available-memory figures, and the per-cell `mode` / `bound_bytes` the planner stamps into each
+cell record). A declared classifier excludes exactly these; its COMPLETENESS is proven by measurement
+(capture absent) and asserted in the suite:
+
+1. **Plan differences covered.** Two capture-OFF runs with different plans (pinned STREAM vs pinned INMEM)
+have differing leaves that are **entirely** in the classifier (same for the capture-ON variant of the same
+plan flip).
+2. **`.cells` is NOT blanket-excluded.** `.cells` holds the PER-CELL records (cell_id, row, col, status,
+chosen `mode`, `n_contributors`, `cell_gauge_mode`, `backend_used`, the reference-frame provenance fields,
+`excluded`, `bound_bytes`). Under a plan flip the ONLY differing per-cell leaves are the two PLAN-METADATA
+leaves `mode` / `bound_bytes` (asserted); every science/index per-cell field is identical, so the
+classifier excludes only those two leaf NAMES, never the subtree.
+3. **Uncontrolled, faithful run.** The three runs' product FITS are byte-identical *even though the plans
+may differ*, and every ON-vs-OFF manifest difference beyond the single block lies in the classifier; the
+classifier also covers every OFF-vs-OFF difference.
+4. **Same-plan capture pair (strong claim).** With the plan held FIXED (memory pinned; at BOTH a pinned
+STREAM and a pinned INMEM budget) the **only** pre-existing manifest fields that differ ON vs OFF are
+genuine wall-timing / RSS measurement leaves; no science, coverage, aesthetic, contract, cell, layout or
+offset field changes.
+
+**Corrected, narrower claim (rework-1).** The §8.2 clause-3 phrase "all pre-existing manifest fields
+canonical-identical" is NOT literally satisfiable on a shared host, because the manifest's pre-existing
+*observability* fields are functions of the environment and change between ANY two sequential runs. The
+honest, proven claim is: **(i)** the load-bearing science/coverage/aesthetic/uint16 ARRAY + FITS BYTES are
+exactly byte-identical ON vs OFF (tolerance `0`), both uncontrolled and with the plan pinned; **(ii)** the
+manifest gains exactly one additive `r40_diagnostic_capture` block ON and none OFF; **(iii)** every
+pre-existing manifest difference ON vs OFF is confined to the declared, evidence-backed run-volatile
+classifier (measurement + environment-driven plan), never a product field.
+
+**Explicit NON-CLAIMS on this platform.** This measurement does **not** claim B2 acceptance, the 38-relation
+panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact
+§1.3 held-out-key intersection, or a real **Windows** run — all remain **`NOT_RUN`**. No real data and no
+FITS/pixel/image/dataset traversal of the real corpus; no Windows816/Zealfie/LP341; no product
+default/GUI/config change; no correction/model fitting. The zero tolerance applies to the
+science/coverage/aesthetic array + FITS bytes (where it is met exactly) and was **not** widened anywhere.
+
+**Validation (executed, observed).** Run twice for reproducibility on this host (the plan can legitimately
+vary when free RAM drifts).
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest tests/test_zegrid_r40b2_offon_identity.py -W error -q -p no:cacheprovider` | **20 passed** (twice) |
+| `python3 -m pytest tests/test_zegrid_r40b2_offon_identity.py tests/test_zegrid_r40b2_pooled.py tests/test_zegrid_r40b2_seam.py tests/test_zegrid_r40_capture_core.py -W error -q -p no:cacheprovider` | **176 passed** (twice: 176/176) |
+| `python3 -m pytest tests/test_zegrid_r37d_diagnostic_capture.py tests/test_zegrid_r37e_capture_runner.py tests/test_zegrid_r38a_causal_probe.py tests/test_zegrid_r39a_spatial_residual.py tests/test_zegrid_r40b1_synthetic_calibration.py -W error -q -p no:cacheprovider` | **417 passed** |
+| `python3 -m py_compile tests/test_zegrid_r40b2_offon_identity.py` | OK |
+| `git diff --check` | clean (`git status` shows only the intended 2 files) |
+
+> **Task D does NOT accept B2.** It proves the frozen §8.2 product byte-identity (tolerance exactly `0`)
+on real synthetic end-to-end product runs — uncontrolled and with the plan pinned — together with the
+single additive manifest block, the measured environment-vs-capture causality of the plan, and the
+evidence-backed isolation of the pre-existing run-observable fields. The 38-relation panel qualification,
+the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection
+and a real Windows run remain **`NOT_RUN`**. `R40-C` / `R40-D` / `HUMAN_GATE` / `LP341` remain
+**`NOT_RUN` / `NOT_AUTHORIZED`**.
