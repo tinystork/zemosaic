@@ -1332,6 +1332,23 @@ This section is a pointer, not a source of authority.
   change is authorized, **R38 stays closed** and **R39-A remains the terminal STOP**. No R40-C outcome
   is claimed and no Windows execution was performed. See §15.15 and the refreshed §7 rows.
 
+- **rework-22 (R40-C real DEV capture + offline interpretation, bounded task K) — the first real
+  R40-C outcome:** the authorized ONE Windows816 DEV diagnostic capture was executed once at the
+  capture-bound `repo_head` `b15591b…` (826 → 816 FITS) and independently re-verified by Junior
+  (`verify_generation(..., expected_production_wired=True)` → `ok`, `problems=[]`, `38` shards,
+  `388887` records, `114/114` relation-channels, `EXACT`/uncapped/`n_dropped=0`; `capture_id`
+  `5dcef7b9…848ec5`, `index.json` sha256 `d4681ae9…b4799f89`, bytes `89913`). The offline
+  interpretation (new `tools/r40c_interpret.py` + focused tests) ran under the frozen
+  §3/§4/§6.4/§15.5-4/§9 criteria and reached the exact §9 STOP **`NUISANCE_LINKED`** — T1
+  (H1 support/`n_eff_support`) and T2 (H2 depth-within-same-weight-class) both `DETECTED_ASSOCIATION`
+  relation-first in both orientations; T2 weight `NO_EFFECT`; T3/T5 `CONTEXT_ONLY`; T4 (H4
+  same-input intervention) `NOT_IDENTIFIABLE`/`NOT_AVAILABLE` (never proxied). Panel complete
+  `114/114`. **No normative change**: no tolerance, threshold or gate was changed (the §8 clause-2
+  OFF/ON byte-identity gate stays exactly `0`), no correction/product/GUI/config change, and **no
+  Windows816 mechanism or prototype is established** (`DEV_NOT_QUALIFICATION`). **No B2/B1
+  re-acceptance is claimed**; `LP341` remains reserved and **unconsumed**. Task K creates **no commit
+  and no push** (Jarvis commits after review). See §15.16.
+
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
 **before any real R40 outcome**. No real R40 capture, metric or outcome was computed for
@@ -2185,3 +2202,60 @@ capture binds `repo_head` at run time, so the Windows checkout **must** be at `c
 in R40-C**; **no correction/product/GUI/config change**; **R38 closed**; **R39-A terminal STOP**.
 No R40-C outcome is claimed by this task, and no Windows execution was performed. Task J creates
 **no commit and no push** (Jarvis commits and publishes after review).
+
+### 15.16 R40-C real DEV capture + offline interpretation — bounded task K
+
+**Mission** `ZM-ZEGRID-R40-C-INTERPRET` · **phase** `implementation` · **branch** `beta` ·
+**baseline HEAD** `b15591b2ec9c1184033dfde39bd0cd1aca31883f` · **commit created** `NO` · **push** `NO`.
+
+**The real R40-C DEV capture was executed ONCE** on the Windows816 host (826 → 816 FITS) at the
+capture-bound `repo_head` `b15591b…` and its **capture artifact is the evidence of record** (read-only
+from here on). The capture was independently verified by Junior
+(`verify_generation(..., expected_production_wired=True)` → `ok=True`, `problems=[]`,
+`n_shards=38`, `checked_records=388887`).
+
+| Frozen capture identity | Value |
+|---|---|
+| capture output root | `R40C_CAPTURE_b15591b` (fresh Windows host path; read-only for interpretation) |
+| generation dirname | `r40_capture_5dcef7b90a2eb109685e7f81fcc714c8ceb07e1ab562ab6747fd31b295848ec5` |
+| `capture_id` | `5dcef7b90a2eb109685e7f81fcc714c8ceb07e1ab562ab6747fd31b295848ec5` |
+| `index.json` sha256 / bytes | `d4681ae937b3c8b0e1785010af669024496c7758106d15fe6f11a9fcb4799f89` / `89913` (== manifest cross-link == verification report) |
+| `n_shards` / `n_records` | `38` (20 h + 18 v) / `388887` |
+| record itemsize | `195` |
+| relation panel | `114/114` relation-channels |
+| `qualification` / `holdout_capped` / `n_dropped` | `EXACT` / `false` / `0` |
+| `production_wired` / `correction_applied` / `capture_stage` | `true` / `false` / `pre_offset_pre_feather` |
+
+**Offline interpretation (this task K).** New read-only tool `tools/r40c_interpret.py` (+ focused
+tests `tests/test_zegrid_r40c_interpret.py`) interprets the capture under the frozen
+§3/§4/§6.4/§15.5-4/§9 criteria, relation-first, **without any pixel / FITS read, model fit,
+correction, or new capture**. It reuses the accepted R39-A relation-first / leak-free-bootstrap /
+strict-JSON / privacy machinery and the capture-core identity/verification primitives (DRY). Durable
+strict-JSON report (no absolute private path in any value):
+`.a2a-reports/ZM-ZEGRID-R40-C-INTERPRET/r40c_interpretation.json`
+(sha256 `c73a07375e00f3a62e3e89f4d8363ccff543cbdcdf55cd09fc134912f999cb58`).
+
+**Result (`DEV_NOT_QUALIFICATION`; truthful, no promotion).** Panel complete `114/114`. Per-test
+outcomes under the frozen ladder:
+
+| Test | Hypothesis | Frozen reach | Outcome (real capture) |
+|---|---|---|---|
+| T1 | H1 support/validity — `n_eff_support` (M3/M4/M7) | ≤ `DETECTED_ASSOCIATION` | **`DETECTED_ASSOCIATION`** (both orientations; h 12 / v 8 relations promoted by the 2-of-3 same-sign rule; 62/114 channel contrasts with band excluding 0) |
+| T2 | H2 estimator-weight / survivor (M3/M5/M6) | ≤ `DETECTED_ASSOCIATION` | weight-within-same-depth **`NO_EFFECT`**; depth-within-same-weight-class **`DETECTED_ASSOCIATION`** (both orientations; 11 relations; 36/114 channel contrasts) |
+| T3 | H3 PREDICTED feather-ramp (M3/M8) | context only | **`CONTEXT_ONLY`** (PREDICTED arithmetic; 5/114 channel contrasts significant, neither orientation reaching ≥2 relations) |
+| T4 | H4 exact same-input intervention (§5/§5.1) | `CONTROLLED_EFFECT` if realizable | **`NOT_IDENTIFIABLE` / `NOT_AVAILABLE`** — the core capture (M1–M11) carries **no** §5 intervention block; never proxied, never faked |
+| T5 | H5 scene/PSF context proxy (M3/C3) | context only | **`CONTEXT_ONLY`** (distance/tangent profile; 0/114 channel contrasts significant) |
+
+Exact **§9 STOP: `NUISANCE_LINKED`** — a relation-first, both-orientation association with the
+support/depth **nuisance** covariates survives, which blocks any correction and is strictly below
+`CONTROLLED_EFFECT`. H4 (the only intervention route) is `NOT_AVAILABLE`, so **no
+`CONTROLLED_EFFECT` is reachable**. `ASSOCIATION_ONLY` / `NUISANCE_LINKED` / `NO_EFFECT` all block
+any correction/qualification path; **no correction, no product/GUI/config change, no qualification**
+is authorized or claimed, and a **Windows816 mechanism or prototype is NOT established**.
+`LP341` remains reserved and **unconsumed**; no LP pixel, no source frame and **no final product
+FITS** was read.
+
+**No B2/B1 re-acceptance is claimed.** This task does not re-run the capture, does not modify the
+capture artifact, does not read/invoke the CONSUMED B1 v2 cohort, does not run `validate`, and
+creates **no commit and no push** (Jarvis commits after review). No tolerance, threshold or gate was
+changed (the §8 clause-2 OFF/ON byte-identity gate stays exactly `0`).
