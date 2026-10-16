@@ -254,6 +254,7 @@ def _plan_cell_concurrency_phases(
     process_baseline_bytes: int | None,
     cache_worker_footprint_bytes: int | None,
     cache_worker_px: int | None,
+    max_cells_in_flight: int | None = None,
 ) -> dict:
     """ZM-ZEGRID-R41 opt-in phase accounting for :func:`plan_cell_concurrency`.
 
@@ -386,12 +387,24 @@ def _plan_cell_concurrency_phases(
 
     cpu_budget = max(1, cpu - _CPU_OS_RESERVE)
     max_k = max(1, min(cpu_budget, n_cells))
+    if max_cells_in_flight is not None:
+        # ZM-ZEGRID-R41-B: a bounded replan may NEVER grow the concurrency, even
+        # when a later observation finds MORE RAM than the plan budget assumed.
+        _cap = rcontract.require_nonneg_int(max_cells_in_flight, "max_cells_in_flight")
+        max_k = max(1, min(max_k, max(1, int(_cap))))
 
     def _makespan(k: int, cost: float) -> float:
         waves = (n_cells + k - 1) // k
         return waves * cost
 
     def _search(bound: int) -> dict:
+        # ZM-ZEGRID-R41-B (rework-2): REUSE the established per-mode concurrency
+        # seam as a conservative INITIAL cap (so an existing
+        # ``zpar.cells_in_flight`` monkeypatch keeps governing K), then let the
+        # simultaneous phase accounting REDUCE K further. K can only go DOWN.
+        _seam_budget = ram_budget if (ram_budget or 0) > 0 else None
+        _seam_cap = cells_in_flight(cpu, _seam_budget, int(bound))
+        mode_max_k = max(1, min(int(max_k), int(_seam_cap), n_cells))
         k, st, ct, agg, cpc, w = rcontract.feasible_concurrency(
             budget_bytes=ram_budget,
             shared_bytes=shared,
@@ -399,7 +412,7 @@ def _plan_cell_concurrency_phases(
             process_baseline_bytes=pb,
             cache_worker_footprint_bytes=cwf,
             cache_workers_for_k=_cache_workers_for_k,
-            max_k=max_k,
+            max_k=mode_max_k,
         )
         return {"k": int(k), "stack_total": st, "cache_total": ct, "aggregate": agg,
                 "cache_per_cell": cpc, "cache_workers": w, "bound": int(bound)}
@@ -581,6 +594,7 @@ def plan_cell_concurrency(
     cache_worker_footprint_bytes: int | None = None,
     cache_worker_px: int | None = None,
     process_baseline_bytes: int | None = None,
+    max_cells_in_flight: int | None = None,
 ) -> dict:
     """Joint mode + concurrency planner (replaces the R20 two-step trap).
 
@@ -616,6 +630,12 @@ def plan_cell_concurrency(
     accounts for the SIMULTANEOUS stack/cache phase totals (see
     :func:`_plan_cell_concurrency_phases`) and adds explicit per-phase keys to the
     result; otherwise it runs the legacy path verbatim (no new keys).
+
+    ``max_cells_in_flight`` (ZM-ZEGRID-R41-B, opt-in, default ``None``) is a
+    hard UPPER BOUND on the chosen concurrency, applied on BOTH branches. It is
+    used by a bounded replan so a later (larger) observation can never buy a
+    HIGHER concurrency than the plan already had (the accepted no-growth
+    invariant). ``None`` keeps the exact historical behaviour.
     """
     if (
         shared_bytes is not None
@@ -635,6 +655,7 @@ def plan_cell_concurrency(
             process_baseline_bytes=process_baseline_bytes,
             cache_worker_footprint_bytes=cache_worker_footprint_bytes,
             cache_worker_px=cache_worker_px,
+            max_cells_in_flight=max_cells_in_flight,
         )
     bounds = [(int(a), int(b)) for a, b in cell_bounds]
     n_cells = len(bounds)
@@ -655,6 +676,9 @@ def plan_cell_concurrency(
         # Reuse the existing cells_in_flight seam (so tests can force a fixed
         # concurrency), then cap at n_cells (never more concurrent than cells).
         n = cells_in_flight(cpu, ram_budget if ram_budget > 0 else None, footprint)
+        if max_cells_in_flight is not None:
+            # R41-B bounded replan: never grow past the previous concurrency.
+            n = min(n, max(1, int(max_cells_in_flight)))
         return max(1, min(n, n_cells))
 
     def _makespan(in_flight: int, per_cell_cost: float) -> float:

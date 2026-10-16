@@ -358,6 +358,12 @@ def test_parent_candidate_coords_reuses_sealed_geometry():
 
 def test_proof_e1_real_pooled_run_capture_on_verifies(tmp_path, monkeypatch):
     """Fork-pooled PRODUCTION run (``zpar.pmap`` real process pool) with capture ON."""
+    # ZM-ZEGRID-R41-B: unlike its sibling ``test_proof_f`` this test did NOT pin the
+    # memory seam, so it read LIVE free RAM (~525 MiB on a starved host) -> B_plan
+    # 419.8 MiB -> the pinned 2x2 layout legitimately could not fit any mode. The
+    # objective here is the POOLED capture transport, not memory: pin a stable,
+    # sufficient RAW observation (same controlled-RAM technique as ``test_proof_f``).
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: _PIN_MEM_BYTES)
     inp = _write_corpus(tmp_path / "in")
     out = tmp_path / "out"
     seen = _run_pooled(inp, out, monkeypatch, r40=True)

@@ -33,6 +33,14 @@ VOLATILE_PREFIXES = (
     ".per_cell_diagnostics.cpu_streaming",
     ".per_cell_diagnostics.cpu_fallback_plan",
     ".per_cell_diagnostics.reprojection",
+    # ZM-ZEGRID-R41-B: the host-RAM contract trail is BY CONSTRUCTION a function of
+    # the (pinned) memory observations and of the joint plan/cache footprint, so it
+    # is run-volatile in exactly the same way the scheduler plan already was. The
+    # classifier must COVER it (this keeps the completeness test strict, not weaker).
+    ".ram_contract",
+    ".per_cell_diagnostics.ram_contract",
+    ".per_cell_diagnostics.gpu_attempt_ram_contract",
+    ".per_cell_diagnostics.runtime_cpu_fallback_contract",
 )
 VOLATILE_LEAF_EXACT = {
     "mode", "bound_bytes", "per_cell_footprint_bytes", "available_bytes",
@@ -41,6 +49,13 @@ VOLATILE_LEAF_EXACT = {
     "phase_seconds", "fast_calls", "path", "cpu_streaming_tile",
     "cpu_streaming_tile_selected", "gpu_streaming_tile",
     "gpu_streaming_host_peak_bytes", "peak_rss_kib", "aggregate_peak_rss_kib",
+    # ZM-ZEGRID-R41-B (Junior independent verification): the GPU/VRAM probe is a
+    # LIVE environment measurement, exactly like the RAM observation above — the
+    # manifest records it per run and it drifts between runs on a shared/starved
+    # host. Evidence: two OFF runs of the same pinned corpus differed ONLY on
+    # `.gpu.vram_free_bytes` / `.gpu.vram_budget_bytes`. These are NOT product or
+    # science fields (the VRAM-driven GPU tile is already volatile below).
+    "vram_free_bytes", "vram_budget_bytes", "vram_total_bytes",
 }
 VOLATILE_SUFFIXES = ("_s", "_seconds", "_sum_s", "_per_unit", "_unit")
 VOLATILE_SUBSTRINGS = ("rss_kib", "seconds", "reproject_s", "trials")

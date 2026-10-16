@@ -38,6 +38,17 @@ from zemosaic.core.zegrid import parallel as zpar  # noqa: E402
 TOOL = REPO_ROOT / "tools" / "zegrid_routine" / "make_routine_corpus.py"
 
 
+@pytest.fixture(autouse=True)
+def _controlled_ram(monkeypatch):
+    """ZM-ZEGRID-R41-B (rework-2): these tests are about CONCURRENCY, not live host
+    RAM. Pin one stable, sufficient RAW observation so the product planner
+    (80 % plan / 90 % admit) is deterministic and never refuses for RAM reasons.
+    The established ``zpar.cells_in_flight`` monkeypatch seam still governs K
+    (it is reused as a conservative initial per-mode cap and can only be reduced).
+    """
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: 8 * 1024 ** 3)
+
+
 # ---------------------------------------------------------------------------
 # Decision function (deterministic unit check)
 # ---------------------------------------------------------------------------

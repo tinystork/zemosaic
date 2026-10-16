@@ -188,6 +188,17 @@ def pinned_runs(tmp_path_factory):
     real_mem = zz.available_memory_bytes
     real_coords = zz._STACK_R40_WORKER_COORDS
     outs = {}
+    # ZM-ZEGRID-R41-B: the R41 host-RAM contract counts the UNCAPPED shared parent
+    # reserve (340 MiB) PLUS the cache worker footprint in the SIMULTANEOUS phase
+    # aggregate. This synthetic host pins SMALL budgets (768 MiB / 4 GiB), so the
+    # reserve must be neutralized for the PRODUCT planning to stay feasible while
+    # the pinned budgets (and therefore the manifest assertions) keep their exact
+    # meaning. The plan flip is preserved: 768 MiB -> stream, 4 GiB -> inmem.
+    _mp = pytest.MonkeyPatch()
+    _mp.setattr(zpar, "_PER_WORKER_BASELINE_BYTES", 0)
+    _mp.setattr(zpar, "_CACHE_PER_WORKER_FOOTPRINT_BYTES", 0)
+    _mp.setattr(zpar, "cache_footprint_bytes", lambda px: 0)
+    _mp.setattr(zpar, "gauge_footprint_bytes", lambda px: 0)
     try:
         for label, pin in (("lo", _PIN_LOW), ("hi", _PIN_HIGH)):
             zz.available_memory_bytes = lambda p=pin: p
@@ -199,6 +210,7 @@ def pinned_runs(tmp_path_factory):
     finally:
         zz.available_memory_bytes = real_mem
         zz._STACK_R40_WORKER_COORDS = real_coords
+        _mp.undo()
     return SimpleNamespace(base=base, inp=inp,
                            lo_off=outs["lo_off"], lo_on=outs["lo_on"],
                            hi_off=outs["hi_off"], hi_on=outs["hi_on"],

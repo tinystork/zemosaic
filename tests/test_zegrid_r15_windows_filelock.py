@@ -458,6 +458,12 @@ def test_end_to_end_delete_failure_non_fatal_and_bit_equal(tmp_path, monkeypatch
 
     zconfig = SimpleNamespace(zegrid_layout="2x2", zegrid_sip_mode="keep")
 
+    # ZM-ZEGRID-R41-B: this test's objective is FILE-LOCK cleanup, NOT memory. The
+    # R41 host-RAM contract counts the uncapped shared reserve + cache footprint in
+    # the simultaneous phase aggregate, so a tight synthetic host would refuse the
+    # plan for RAM reasons. Pin a stable, sufficient RAW observation.
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: 4 * 1024 ** 3)
+
     def _run(out, progress_callback=None):
         zz.run_zegrid_mode(
             str(input_dir), str(out), progress_callback=progress_callback,

@@ -809,30 +809,101 @@ def preflight(
 
     available = int(zz.available_memory_bytes())
     ram_budget = available
+    plan_budget = None
 
     footprints_out: list = []
     verdict = "PASS"
     failure = None
     layout = None
+    ladder = {}
+    joint_plan = None
+    envelope_dict = None
+    gpu_joint_plan = None
     emit = (lambda msg, lvl="INFO": _p(str(msg))) if progress is not None else None
-    try:
-        layout = zz._choose_layout_mode_aware(
-            canvas, descs, ram_budget=ram_budget, available_bytes=available,
-            tile_size=int(zz.STREAM_TILE_SIZE), pinned_layout=(baseline.nx, baseline.ny),
-            emit=emit, footprints_out=footprints_out,
-        )
-    except (zal.LayoutInfeasible, ValueError) as exc:
+
+    # ZM-ZEGRID-R41-B: the preflight uses the SAME host-RAM contract and the SAME
+    # product bundle/planner seam as the runtime, at the 80 % PLAN budget (a
+    # preflight never promises future availability).
+    if available <= 0:
         verdict = "FAIL"
-        failure = f"{type(exc).__name__}: {exc}"
+        failure = (
+            f"nonpositive raw available-RAM observation ({available} bytes); "
+            "cannot plan (fail closed)"
+        )
+    else:
+        try:
+            plan_budget = int(zz.rcontract.plan_budget_bytes(available))
+        except Exception as exc:  # pragma: no cover - defensive
+            verdict = "FAIL"
+            failure = f"{type(exc).__name__}: {exc}"
+
+    if verdict == "PASS":
+        try:
+            layout = zz._choose_layout_mode_aware(
+                canvas, descs, ram_budget=plan_budget, available_bytes=available,
+                tile_size=int(zz.STREAM_TILE_SIZE),
+                pinned_layout=(baseline.nx, baseline.ny),
+                emit=emit, footprints_out=footprints_out,
+            )
+        except (zal.LayoutInfeasible, ValueError) as exc:
+            verdict = "FAIL"
+            failure = f"{type(exc).__name__}: {exc}"
 
     footprints = footprints_out[0] if footprints_out else zal.project_footprints(descs, canvas)
-    ladder = _cpu_ladder(zz, canvas, footprints, baseline.nx, baseline.ny, ram_budget)
+    ladder = _cpu_ladder(zz, canvas, footprints, baseline.nx, baseline.ny, plan_budget)
+
+    # Joint (simultaneous-phase) feasibility through the PRODUCT bundle seam.
+    if verdict == "PASS":
+        try:
+            bundle = zz._build_execution_bundle(
+                canvas, descs, footprints,
+                raw_available_bytes=available, budget_bytes=plan_budget,
+                pinned_layout=(baseline.nx, baseline.ny),
+                gpu_used=False,
+                cpu_count=os.cpu_count(),
+                cache_root=None,
+                emit=emit, log_line=None,
+            )
+        except Exception as exc:
+            verdict = "FAIL"
+            failure = f"{type(exc).__name__}: {exc}"
+        else:
+            joint_plan = dict(bundle.plan)
+            envelope_dict = bundle.envelope.to_dict()
+            ladder = dict(ladder)
+            ladder["selected_tile_size"] = int(bundle.cpu_streaming_tile)
 
     gpu = {}
     try:
         gpu = dict(zz.zgpu.probe_gpu_backend())
     except Exception as exc:  # pragma: no cover - defensive
         gpu = {"available": False, "reason": f"probe_failed: {type(exc).__name__}"}
+    vram_budget = None
+    if gpu.get("available"):
+        try:
+            vram_budget = zz.zgpu.vram_budget_bytes(gpu)
+        except Exception:  # pragma: no cover - defensive
+            vram_budget = None
+    if verdict == "PASS" and gpu.get("available") and vram_budget is not None:
+        try:
+            gpu_bundle = zz._build_execution_bundle(
+                canvas, descs, footprints,
+                raw_available_bytes=available, budget_bytes=plan_budget,
+                pinned_layout=(baseline.nx, baseline.ny),
+                gpu_used=True, vram_budget_bytes=vram_budget,
+                cpu_count=os.cpu_count(),
+                cache_root=None,
+                emit=emit, log_line=None,
+            )
+        except Exception as exc:
+            gpu_joint_plan = {"feasible": False, "failure": f"{type(exc).__name__}: {exc}"}
+        else:
+            gpu_joint_plan = {
+                "feasible": True,
+                "gpu_used": bool(gpu_bundle.gpu_used),
+                "pre_execution_fallback": gpu_bundle.gpu_pre_execution_fallback,
+                "envelope": gpu_bundle.envelope.to_dict(),
+            }
 
     report = {
         "requested_frames": selection.count,
@@ -853,14 +924,38 @@ def preflight(
         },
         "baseline_canvas": {"width": baseline.canvas_width, "height": baseline.canvas_height},
         "pinned_layout": {"nx": baseline.nx, "ny": baseline.ny},
-        "available_bytes": ram_budget,
-        "ram_budget_bytes": ram_budget,
+        # ZM-ZEGRID-R41-B: RAW observed available RAM and the EXACT plan budget.
+        "available_bytes": int(available),
+        "ram_budget_bytes": (int(plan_budget) if plan_budget is not None else None),
+        "plan_factor": {"num": int(zz.rcontract.PLAN_FACTOR_NUM),
+                            "den": int(zz.rcontract.PLAN_FACTOR_DEN)},
+        "admit_factor": {"num": int(zz.rcontract.ADMIT_FACTOR_NUM),
+                             "den": int(zz.rcontract.ADMIT_FACTOR_DEN)},
         "cpu_streaming": ladder,
+        "ram_contract": {
+            "schema": "zemosaic-zegrid-r41-ram-contract-v1",
+            "raw_available_bytes": int(available),
+            "plan_budget_bytes": (int(plan_budget) if plan_budget is not None else None),
+            "plan_factor_num": int(zz.rcontract.PLAN_FACTOR_NUM),
+            "plan_factor_den": int(zz.rcontract.PLAN_FACTOR_DEN),
+            "joint_plan": joint_plan,
+            "plan_envelope": envelope_dict,
+            "gpu_joint_plan": gpu_joint_plan,
+            "note": (
+                "preflight plans at B_plan = floor(4/5 * RAW available); it does "
+                "NOT promise future availability. The runtime re-validates the "
+                "same plan at B_admit = floor(9/10 * a fresh observation) before "
+                "launching cell workers."
+            ),
+        },
         "gpu": {
             "available": bool(gpu.get("available")),
             "device": gpu.get("device"),
             "vram_total_bytes": gpu.get("vram_total_bytes"),
             "vram_free_bytes": gpu.get("vram_free_bytes"),
+            "vram_budget_bytes": (
+                int(vram_budget) if vram_budget is not None else None
+            ),
             "reason": gpu.get("reason"),
         },
         "verdict": verdict,

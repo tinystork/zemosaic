@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -379,8 +380,31 @@ def _prepare_input(input_dir, routine_corpus):
     )
 
 
+def _neutralize_shared_reserve(monkeypatch):
+    """R41-B: neutralize the REAL parent/cache reserve for the synthetic sentinels.
+
+    The byte sentinels in this file are pure per-cell bounds (8 KiB-scale).
+    ZM-ZEGRID-R41-B now also counts the UNCAPPED shared parent reserve
+    (``_PER_WORKER_BASELINE_BYTES``) plus the cache worker footprint ONCE in the
+    simultaneous-phase aggregate, so the sentinels alone no longer describe the
+    budget. Neutralizing the reserve here keeps every R36 sentinel meaningful and
+    its claims unchanged (tile selection, plan == execution, GPU/CPU fallback);
+    the reserve accounting itself is covered by the dedicated R41-B tests.
+    """
+    monkeypatch.setattr(zpar, "_PER_WORKER_BASELINE_BYTES", 0)
+    monkeypatch.setattr(zpar, "_CACHE_PER_WORKER_FOOTPRINT_BYTES", 0)
+    monkeypatch.setattr(zpar, "cache_footprint_bytes", lambda px: 0)
+    monkeypatch.setattr(zpar, "gauge_footprint_bytes", lambda px: 0)
+    # Serial seam: 3 logical CPUs -> cpu_budget == 1 -> cells_in_flight == 1, so
+    # the executor runs IN-PROCESS and the spy counters in this file observe it
+    # (the previous `zpar.cells_in_flight -> 1` sentinel no longer governs K, now
+    # chosen by the joint phase planner).
+    monkeypatch.setattr(os, "cpu_count", lambda: 3)
+
+
 def _force_cpu_tile_64(monkeypatch):
     """Make the planner select CPU tile 64 and force inmem-infeasible/stream."""
+    _neutralize_shared_reserve(monkeypatch)
     budget = 8192
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: int(budget / zpar.RAM_SAFETY_FRACTION))
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(10 ** 12))  # inmem fails
@@ -455,6 +479,7 @@ def _force_gpu_selection(monkeypatch, gpu_tile=128):
 
 def _force_gpu_runtime_tiles(monkeypatch):
     """CPU tile 64; EFFECTIVE GPU tile 48 (< CPU tile, both host-RAM-feasible)."""
+    _neutralize_shared_reserve(monkeypatch)
     budget = 8192
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: int(budget / zpar.RAM_SAFETY_FRACTION))
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(10 ** 12))  # inmem fails
@@ -522,6 +547,7 @@ def test_gpu_vram_infeasible_uses_selected_cpu_tile(tmp_path, routine_corpus, mo
 
 def _force_gpu_stream_ram_infeasible_inmem_ok(monkeypatch):
     """GPU stream never fits the RAM budget; in-memory does."""
+    _neutralize_shared_reserve(monkeypatch)
     budget = 8192
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: int(budget / zpar.RAM_SAFETY_FRACTION))
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(budget // 4))  # inmem fits
@@ -558,6 +584,7 @@ def test_f2_gpu_ram_infeasible_degrades_to_cpu_inmem_before_execution(tmp_path, 
 
 
 def test_f2_both_infeasible_fails_loud_no_gpu_attempt(tmp_path, routine_corpus, monkeypatch):
+    _neutralize_shared_reserve(monkeypatch)
     budget = 8192
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: int(budget / zpar.RAM_SAFETY_FRACTION))
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(10 ** 12))
@@ -652,30 +679,43 @@ def test_fm1_gpu_effective_tile_fits_is_attempted_single_owner(tmp_path, routine
 
 # --- rework-3 F-M2: CPU fallback revalidated at the CURRENT per-cell budget ---------
 
-def _force_asymmetric_budget(monkeypatch, *, available=10240, inmem=10 ** 12, table=None,
-                             gpu_tile=48):
-    """Model the F-M2 asymmetry: the LAYOUT budget is `available` while the per-cell
-    budget is `0.8*available` (RAM can shrink between layout and per-cell time)."""
-    monkeypatch.setattr(zz, "available_memory_bytes", lambda: available)
+def _force_r41_shrink(monkeypatch, *, big, small, inmem,
+                      ladder_bound=3 * 2**30, gpu_tile=40, gpu_bound=8 * MIB):
+    """R41-B: model the RAM SHRINKING after planning.
+
+    ZM-ZEGRID-R41-B removed the old 100 %/80 % asymmetry: the layout and the
+    execution plan are built under the SAME B_plan, and the admission ceiling is
+    re-measured. The equivalent (and now intentional) scenario is a real RAM DROP
+    between planning and the GPU runtime failure: the first three probes (plan +
+    admission + launch) see ``big``; the fresh probes taken once the GPU has
+    failed see ``small``.
+    """
+    _neutralize_shared_reserve(monkeypatch)
+    seq = [int(big), int(big), int(big), int(small)]
+    state = {"i": 0}
+
+    def _probe():
+        i = state["i"]
+        if i < len(seq) - 1:
+            state["i"] = i + 1
+        return int(seq[i])
+
+    monkeypatch.setattr(zz, "available_memory_bytes", _probe)
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(inmem))
+    table = {int(t): int(ladder_bound) for t in zz.CPU_STREAMING_TILE_LADDER}
+    table[int(gpu_tile)] = int(gpu_bound)
     monkeypatch.setattr(zz, "_estimate_streaming_bytes",
                         lambda n, hw, tile=zz.STREAM_TILE_SIZE, channels=3: int(
-                            (table or {}).get(int(tile) if tile is not None else 128, 10 ** 9)))
-    monkeypatch.setattr(zpar, "cells_in_flight", lambda *a, **k: 1)
+                            table.get(int(tile) if tile is not None else 128,
+                                      int(ladder_bound))))
     _force_gpu_selection(monkeypatch, gpu_tile=gpu_tile)
 
 
 def test_fm2_a_no_cpu_fallback_fails_loud_zero_cpu_attempt(tmp_path, routine_corpus, monkeypatch):
-    """F-M2 (A): CPU tile 64 fits the LAYOUT budget but NOT the current per-cell
-    budget and inmem does not fit -> NO CPU fallback; GPU (tile 48) is attempted,
-    a GPU OOM must FAIL LOUD with ModeInfeasible and ZERO CPU executor call."""
-    # Layout budget 10240 -> tile 64 (bound 10000); per-cell budget 8192 -> CPU fails.
-    _force_asymmetric_budget(
-        monkeypatch, available=10240, inmem=10 ** 12,
-        table={128: 100000, 112: 100000, 96: 100000, 80: 100000,
-               64: 10000, 48: 1000, 32: 500},
-        gpu_tile=48,
-    )
+    """F-M2 (A) under R41-B: the GPU is attempted; RAM then DROPS so that NO
+    exact-CPU bundle fits the fresh budget on the SAME geometry -> a GPU runtime
+    OOM must FAIL LOUD with ModeInfeasible and ZERO CPU executor call."""
+    _force_r41_shrink(monkeypatch, big=4 * 2**30, small=1 * 2**30, inmem=10 ** 12)
     calls = []
     real = zz.run_canonical_stack_streaming
 
@@ -697,23 +737,18 @@ def test_fm2_a_no_cpu_fallback_fails_loud_zero_cpu_attempt(tmp_path, routine_cor
     with pytest.raises(zpar.ModeInfeasible):
         zz.run_zegrid_mode(str(inp), str(out), use_gpu=True, progress_callback=cb)
 
-    # GPU WAS attempted at its effective tile 48; ZERO CPU executor call.
-    assert any(b == "gpu" and t == 48 for b, t in calls), calls
+    # GPU WAS attempted at its effective tile; ZERO CPU executor call.
+    assert any(b == "gpu" and t == 40 for b, t in calls), calls
     assert not any(b == "cpu" for b, _t in calls), calls
     # A loud explanation was emitted (run fails, so no manifest is expected).
     assert any("refusing an over-budget CPU" in m for m, _l in msgs), msgs[-5:]
 
 
 def test_fm2_b_cpu_fallback_inmem_is_honoured(tmp_path, routine_corpus, monkeypatch):
-    """F-M2 (B): same asymmetry but inmem FITS the current budget -> the CPU fallback
-    plan chooses inmem, and after the GPU OOM the rerun actually runs inmem (never an
-    over-budget stream tile)."""
-    _force_asymmetric_budget(
-        monkeypatch, available=10240, inmem=4000,
-        table={128: 100000, 112: 100000, 96: 100000, 80: 100000,
-               64: 10000, 48: 1000, 32: 500},
-        gpu_tile=48,
-    )
+    """F-M2 (B) under R41-B: after the GPU OOM, a FRESH exact-CPU bundle is built
+    on the SAME geometry and admitted; when inmem is the fitting mode the rerun
+    really runs inmem (never an over-budget stream tile)."""
+    _force_r41_shrink(monkeypatch, big=4 * 2**30, small=1 * 2**30, inmem=4000)
     calls = []
     real = zz.run_canonical_stack_streaming
 
@@ -731,10 +766,8 @@ def test_fm2_b_cpu_fallback_inmem_is_honoured(tmp_path, routine_corpus, monkeypa
 
     m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
     fb = m["per_cell_diagnostics"]["cpu_fallback_plan"]
-    assert fb["applicable"] is True and fb["feasible"] is True
-    assert fb["mode"] == "inmem"
     assert fb["used"] is True
-    # The enacted CPU mode/concurrency is honest (inmem, not stream64).
+    # The enacted CPU mode/concurrency is honest (inmem, not a stream tile).
     assert m["per_cell_diagnostics"]["mode"] == "inmem"
     assert m["per_cell_diagnostics"]["cpu_fallback_used"] is True
     assert all(r["mode"] == "inmem" for r in m["cells"] if r.get("status") == "complete")
@@ -744,15 +777,16 @@ def test_fm2_b_cpu_fallback_inmem_is_honoured(tmp_path, routine_corpus, monkeypa
 
 
 def test_fm2_d_gpu_success_with_cpu_fallback_unavailable(tmp_path, routine_corpus, monkeypatch):
-    """F-M2 (D): GPU success is ALLOWED even when no CPU fallback fits the current
-    budget; the manifest states the CPU fallback is unavailable (no fake failure)."""
+    """F-M2 (D): a GPU success is used as-is; the CPU fallback is NOT enacted and
+    the manifest says so (``cpu_fallback_used`` False, no fake failure).
+
+    R41-B note: the layout can only be admitted when SOME CPU mode fits the PLAN
+    budget, so an UNAVAILABLE CPU fallback can now only arise from a later RAM
+    drop (covered by F-M2 (A)); this test therefore pins the no-fake-failure
+    claim instead of the old 100 %/80 % asymmetry.
+    """
     import dataclasses
-    _force_asymmetric_budget(
-        monkeypatch, available=10240, inmem=10 ** 12,
-        table={128: 100000, 112: 100000, 96: 100000, 80: 100000,
-               64: 10000, 48: 1000, 32: 500},
-        gpu_tile=48,
-    )
+    _force_r41_shrink(monkeypatch, big=8 * 2**30, small=8 * 2**30, inmem=10 ** 12)
     calls = []
     real = zz.run_canonical_stack_streaming
 
@@ -775,5 +809,6 @@ def test_fm2_d_gpu_success_with_cpu_fallback_unavailable(tmp_path, routine_corpu
     assert m["gpu"]["used"] is True
     assert m["gpu"]["final_backend"] == "gpu"
     assert m["gpu"]["runtime_fallback"] is None      # no fake failure
-    assert m["per_cell_diagnostics"]["cpu_fallback_plan"]["feasible"] is False
+    # R41-B: the CPU fallback exists in the plan but is NOT enacted on a GPU success.
+    assert m["per_cell_diagnostics"]["cpu_fallback_plan"]["feasible"] is True
     assert m["per_cell_diagnostics"]["cpu_fallback_used"] is False

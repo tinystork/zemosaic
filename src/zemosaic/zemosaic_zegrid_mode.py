@@ -55,7 +55,7 @@ import math
 import os
 import shutil
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -91,6 +91,7 @@ from .core.zegrid import mosaic as zmosaic
 from .core.zegrid import observability as zobs
 from .core.zegrid import parallel as zpar
 from .core.zegrid import photometric as zphot
+from .core.zegrid import ram_contract as rcontract
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
 from .core.zegrid import sweep as zsw
@@ -131,6 +132,12 @@ CPU_STREAMING_TILE_MINIMUM = 32
 INMEM_AVAILABLE_FRAC = 0.80
 # Normalization token for the ZeGrid engine when none is explicitly requested.
 DEFAULT_NORMALIZATION = "sky_mean"
+
+# ZM-ZEGRID-R41-B: the bounded admission replan budget. At most this many
+# replans (each caused by a RAM observation change) before an explicit,
+# quantitative refusal — never an unbounded retry loop.
+R41_ADMISSION_MAX_REPLANS = 2
+R41_RAM_CONTRACT_SCHEMA = "zemosaic-zegrid-r41-ram-contract-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +882,9 @@ def _choose_layout_mode_aware(
     log_line=None,
     observer=None,
     footprints_out=None,
+    footprints_in=None,
+    min_refinement_rank=None,
+    max_refinement_rank=None,
 ):
     """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
 
@@ -907,6 +917,21 @@ def _choose_layout_mode_aware(
     build the final chosen-cell contexts from the SAME polygons without
     re-projecting WCS. The artifact is never placed in the returned public
     layout dict. ``None`` (default) keeps the exact previous behaviour.
+
+    ZM-ZEGRID-R41-B (bounded replanning seams; ALL default-``None`` so every
+    existing caller keeps the exact previous behaviour):
+
+    * ``footprints_in`` — a previously projected footprint artifact to REUSE
+      instead of re-projecting the WCS (projection is layout-independent, so a
+      bounded replan reuses the once-projected polygons);
+    * ``min_refinement_rank`` — skip candidates COARSER than this cell-count rank
+      (a replan may never coarsen);
+    * ``max_refinement_rank`` — skip candidates FINER than this cell-count rank
+      (used to pin the exact geometry of an already-started run).
+
+    A bounded refinement can therefore only move the chosen layout toward FINER
+    candidates, in the existing deterministic ``REFINEMENT_FACTORS`` order with
+    the scientific floors unchanged.
     """
 
     def _log(msg, lvl="INFO"):
@@ -923,7 +948,7 @@ def _choose_layout_mode_aware(
 
     floors = floors or zal.ScientificFloors()
     n_frames = len(frames)
-    if observer is not None:
+    if footprints_in is None and observer is not None:
         observer.start(
             zobs.LAYOUT_SUBSTEP_FOOTPRINTS,
             "WCS footprints / layout inputs",
@@ -938,13 +963,19 @@ def _choose_layout_mode_aware(
 
     # ZM-ZEGRID-R28: project each frame footprint EXACTLY ONCE and derive the
     # median width/height from those SAME polygons (no second projection pass).
-    footprints = zal.project_footprints(frames, canvas, progress=_fp_progress())
+    # ZM-ZEGRID-R41-B: a bounded replan REUSES the already-projected artifact
+    # (``footprints_in``) — projection is layout-independent, so no second
+    # expensive WCS pass is needed.
+    if footprints_in is not None:
+        footprints = footprints_in
+    else:
+        footprints = zal.project_footprints(frames, canvas, progress=_fp_progress())
     mw, mh = footprints.median_w, footprints.median_h
     if not (mw > 0 and mh > 0):
-        if observer is not None:
+        if footprints_in is None and observer is not None:
             observer.end()
         raise zal.LayoutInfeasible("median projected footprint is degenerate")
-    if observer is not None:
+    if footprints_in is None and observer is not None:
         observer.end()
     if footprints_out is not None:
         # Private artifact channel: the caller reuses these exact polygons for
@@ -965,7 +996,7 @@ def _choose_layout_mode_aware(
                 f"pinned layout {nx}x{ny} violates scientific floors: "
                 f"min_patch_area={geom['min_patch_area']} (limit {floors.min_patch_area_px}), "
                 f"halo_overhead={geom['halo_overhead']:.4f} (limit {floors.max_halo_overhead}). "
-                "Suggest increasing available RAM or pinning a coarser layout via the "
+                "Suggest increasing available RAM or pinning a FINER layout via the "
                 "'zegrid_layout' config key."
             )
             _log(msg, "ERROR")
@@ -995,7 +1026,7 @@ def _choose_layout_mode_aware(
                 f"(minimum tile {CPU_STREAMING_TILE_MINIMUM}) worst-cell bound "
                 f"{min_bound / 2**20:.1f} MiB both exceed it. The next step would be "
                 "a deeper disk-backed streaming executor (not available in R36). Suggest "
-                "increasing available RAM or pinning a coarser layout via the "
+                "increasing available RAM or pinning a FINER layout via the "
                 "'zegrid_layout' config key."
             )
             _log(msg, "ERROR")
@@ -1057,6 +1088,15 @@ def _choose_layout_mode_aware(
         if (nx, ny) in seen:
             continue
         seen.add((nx, ny))
+        # ZM-ZEGRID-R41-B: bounded refinement rank filter. Candidates are
+        # enumerated coarse -> fine, so candidates coarser than the floor are
+        # SKIPPED and candidates finer than the ceiling BREAK the scan (all later
+        # candidates are finer still). ``None`` keeps the exact previous scan.
+        _rank = int(nx) * int(ny)
+        if min_refinement_rank is not None and _rank < int(min_refinement_rank):
+            continue
+        if max_refinement_rank is not None and _rank > int(max_refinement_rank):
+            break
         geom = zal._nominal_geometry(canvas, nx, ny, halo_px)
         if not (geom["min_patch_area"] >= floors.min_patch_area_px and
                 geom["halo_overhead"] <= floors.max_halo_overhead):
@@ -1128,6 +1168,23 @@ def _choose_layout_mode_aware(
     if observer is not None:
         observer.end()
 
+    if chosen is None and not candidates and (
+        min_refinement_rank is not None or max_refinement_rank is not None
+    ):
+        # ZM-ZEGRID-R41-B: the bounded refinement-rank window admitted NO candidate
+        # (all candidates were excluded by the coarse/fine rank bounds). Refuse
+        # explicitly and point at the FINER direction only. This is the pinned /
+        # exact-geometry refusal: no silent geometry change.
+        msg = (
+            "no layout candidate lies inside the requested refinement-rank window "
+            f"(min={min_refinement_rank}, max={max_refinement_rank}, cell-count rank): "
+            "the exact/pinned geometry cannot be re-planned under the current RAM "
+            "budget. Refusing rather than changing the layout. A FINER layout "
+            "(more cells) or more available RAM would be required."
+        )
+        _log(msg, "ERROR")
+        raise zal.LayoutInfeasible(msg)
+
     if chosen is None:
         finest = candidates[-1] if candidates else None
         reasons = []
@@ -1152,9 +1209,11 @@ def _choose_layout_mode_aware(
         msg = (
             "RAM budget cannot satisfy scientific floors (mode-aware): "
             + "; ".join(reasons)
-            + ". The next step would be a deeper disk-backed streaming executor "
-            "(not available in R36). Suggest either increasing available RAM or "
-            "pinning the layout via the 'zegrid_layout' config key."
+            + ". A FINER layout (more cells) is the direction that lowers the "
+            "per-cell footprint; a deeper disk-backed streaming executor is not "
+            "available in R36. Suggest either increasing available RAM, choosing a "
+            "finer layout, or pinning an explicit layout via the 'zegrid_layout' "
+            "config key when reproducible geometry is required."
         )
         _log(msg, "ERROR")
         raise zal.LayoutInfeasible(msg)
@@ -3000,6 +3059,607 @@ def _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep=None)
     return cell_ctxs
 
 
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R41-B — ONE executable bundle built under the PLAN budget (80 %)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecutionBundle:
+    """The COMPLETE executable plan built under ONE raw-observation budget.
+
+    This is the SINGLE source of truth for the per-cell execution: layout,
+    memberships, CPU streaming tile, GPU effective tile/host bound, per-cell
+    bounds/specs, the joint mode/concurrency/cache-worker decision, the tasks
+    the executor really runs, the CPU fallback bundle, and the auditable
+    :class:`ram_contract.PlanEnvelope`. No second, independent plan exists.
+    """
+
+    layout: dict
+    cell_ctxs: list
+    footprints: object
+    cpu_streaming: dict
+    cpu_streaming_tile: int
+    gpu_tile_size: int | None
+    gpu_streaming_tile: int | None
+    gpu_streaming_host_peak_bytes: int | None
+    gpu_used: bool
+    gpu_pre_execution_fallback: dict | None
+    cell_specs: list
+    cell_tasks: list
+    plan: dict
+    chosen_mode: str
+    cells_in_flight: int
+    cache_workers_per_cell: int
+    per_cell_footprint: int
+    cpu_fallback_info: dict
+    cpu_fallback_plan: dict | None
+    cpu_fallback_tasks: list | None
+    envelope: object
+    shared_bytes: int
+    cache_worker_footprint_bytes: int
+    worst_patch_px: int
+    gauge_workers: int
+    cache_build_workers: int
+    worker_budget_bytes: int
+    attempts: list
+
+
+def _build_execution_bundle(
+    canvas,
+    descs,
+    footprints,
+    *,
+    raw_available_bytes,
+    budget_bytes,
+    pinned_layout=None,
+    gpu_used=False,
+    vram_budget_bytes=None,
+    cpu_count=None,
+    cache_build_workers=None,
+    gauge_workers=None,
+    cache_root=None,
+    emit=None,
+    log_line=None,
+    layout_substep=None,
+    min_refinement_rank=None,
+    max_refinement_rank=None,
+    max_cpu_tile=None,
+    max_gpu_tile=None,
+    max_cells_in_flight=None,
+):
+    """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
+
+    Reuses ONLY accepted seams: :func:`_choose_layout_mode_aware` (scientific
+    floors + candidate enumeration), :func:`_build_chosen_cell_contexts` (R28
+    memberships), :func:`zgpu.choose_gpu_tile_size` (VRAM tile) and the opt-in
+    joint planner ``zpar.plan_cell_concurrency`` with phase accounting. All the
+    budget arithmetic lives in :mod:`ram_contract` — this function NEVER recomputes
+    a budget from a float factor.
+
+    ``raw_available_bytes`` is the RAW observation ``budget_bytes`` was derived
+    from (``budget_bytes == rcontract.plan_budget_bytes(raw_available_bytes)``);
+    it is carried verbatim into the envelope so the admission controller can
+    re-validate the candidate against the exact miss raw.
+
+    Bounded refinement (never coarser, never a growth):
+
+    * ``min_refinement_rank`` — never pick a layout coarser than this cell count;
+    * ``max_refinement_rank`` — fix the exact geometry (used once scientific work
+      has started, so a GPU→CPU fallback cannot relayout the mosaic);
+    * ``max_cpu_tile`` / ``max_cells_in_flight`` — the previous envelope's tile /
+      concurrency are upper bounds, so a bounded replan can only shrink them
+      (the accepted ``assert_no_growth`` invariant).
+
+    Raises :class:`auto_layout.LayoutInfeasible` when the pinned / exact geometry
+    cannot be planned, and :class:`parallel.ModeInfeasible` when even one cell
+    cannot fit under the PLAN budget (never a clamp-to-1 rescue).
+    """
+    budget_bytes = int(budget_bytes)
+    raw_available_bytes = int(raw_available_bytes)
+    cpu_count = int(cpu_count or os.cpu_count() or 1)
+    shared_bytes = int(zpar._PER_WORKER_BASELINE_BYTES)
+    attempts: list = []
+    rank_floor = None if min_refinement_rank is None else int(min_refinement_rank)
+    rank_ceiling = None if max_refinement_rank is None else int(max_refinement_rank)
+    # A pinned / exact-geometry request can NEVER relocate the layout, so the
+    # refinement loop below must refuse instead of going finer.
+    exact_geometry = pinned_layout is not None or rank_ceiling is not None
+
+    while True:
+        _fp_out = []
+        layout = _choose_layout_mode_aware(
+            canvas, descs, ram_budget=budget_bytes,
+            available_bytes=raw_available_bytes, tile_size=STREAM_TILE_SIZE,
+            pinned_layout=pinned_layout, emit=emit, log_line=log_line,
+            observer=layout_substep, footprints_out=_fp_out,
+            footprints_in=footprints,
+            min_refinement_rank=rank_floor, max_refinement_rank=rank_ceiling,
+        )
+        if footprints is None:
+            footprints = _fp_out[0] if _fp_out else None
+        nx, ny = int(layout["nx"]), int(layout["ny"])
+        cell_ctxs = _build_chosen_cell_contexts(
+            footprints, canvas, nx, ny, layout_substep
+        )
+        worst_patch_px = 0
+        patch_px_for_workers = 0
+        for _row, _col, _cell, _patch, _mem in cell_ctxs:
+            try:
+                _ph, _pw = _patch.patch_shape_hw
+                _px = int(_ph) * int(_pw)
+            except Exception:
+                continue
+            patch_px_for_workers = max(patch_px_for_workers, _px)
+            if _mem.patch_ids:
+                worst_patch_px = max(worst_patch_px, _px)
+        cache_worker_footprint_bytes = int(zpar.cache_footprint_bytes(worst_patch_px))
+        # Workers are budgeted from the SAME PLAN budget (no second float factor).
+        worker_budget = int(budget_bytes)
+        canvas_px = int(canvas.width) * int(canvas.height)
+        _gauge_fp = zpar.gauge_footprint_bytes(canvas_px)
+        _cache_fp = zpar.cache_footprint_bytes(patch_px_for_workers or canvas_px)
+        _gauge_workers = (
+            zpar.choose_workers(None, worker_budget, _gauge_fp)
+            if gauge_workers is None else int(gauge_workers)
+        )
+        _cache_workers = (
+            zpar.choose_workers(None, worker_budget, _cache_fp)
+            if cache_build_workers is None else int(cache_build_workers)
+        )
+
+        # ZM-ZEGRID-R22/R36: VRAM-bounded GPU tile, determined BEFORE the joint
+        # plan so the GPU RAM gate is evaluated at the GPU's OWN execution tile.
+        effective_gpu = bool(gpu_used)
+        gpu_tile_size = None
+        gpu_pre_execution_fallback = None
+        _cache_root = None if cache_root is None else Path(cache_root)
+        if effective_gpu:
+            max_n = max(
+                (len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids),
+                default=1,
+            )
+            worst_hw = (1, 1)
+            worst_area = -1
+            for (_r, _c, _ce, _p, m) in cell_ctxs:
+                if m.patch_ids:
+                    hw = _p.patch_shape_hw
+                    area = hw[0] * hw[1]
+                    if area > worst_area:
+                        worst_area = area
+                        worst_hw = hw
+            _gpu_ts = zgpu.choose_gpu_tile_size(
+                max_n, 3, worst_hw, vram_budget_bytes
+            )
+            if _gpu_ts is None:
+                gpu_pre_execution_fallback = {
+                    "reason": "vram_tile_infeasible",
+                    "detail": "choose_gpu_tile_size returned None (VRAM budget too small)",
+                }
+                effective_gpu = False
+            else:
+                gpu_tile_size = int(_gpu_ts)
+                if max_gpu_tile is not None:
+                    # Never grow the GPU tile either (accepted no-growth invariant).
+                    gpu_tile_size = min(int(gpu_tile_size), int(max_gpu_tile))
+
+        # ---- CPU streaming tile: select across the ACTUAL permitted ladder ----
+        # ZM-ZEGRID-R41-B (rework-1): the per-cell streaming estimate is NOT
+        # monotone in tile size, so a numeric clamp is wrong. EVERY ladder tile
+        # permitted by ``max_cpu_tile`` is evaluated against its REAL bound and the
+        # budget — a smaller tile may be the only feasible one (and 64 can beat 32).
+        permitted_tiles = [
+            int(t) for t in CPU_STREAMING_TILE_LADDER
+            if max_cpu_tile is None or int(t) <= int(max_cpu_tile)
+        ]
+        if not permitted_tiles:
+            permitted_tiles = [int(CPU_STREAMING_TILE_MINIMUM)]
+
+        active = [
+            (idx, len(mem.patch_ids), tuple(patch.patch_shape_hw),
+             int(patch.patch.width) * int(patch.patch.height))
+            for idx, (row, col, cell, patch, mem) in enumerate(cell_ctxs)
+            if mem.patch_ids
+        ]
+        inmem_by_idx = {
+            idx: int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
+            for idx, n, hw, area in active
+        }
+
+        def _stream_by_idx(tile):
+            return {
+                idx: int(_estimate_streaming_bytes(n, hw, int(tile)))
+                for idx, n, hw, area in active
+            }
+
+        gpu_stream_by_idx = (
+            _stream_by_idx(gpu_tile_size) if effective_gpu else None
+        )
+
+        def _plan_for(pairs, backend_gpu, cells_in_flight_cap):
+            return zpar.plan_cell_concurrency(
+                pairs, cpu_count, budget_bytes,
+                gpu_backend=bool(backend_gpu),
+                cache_build_workers=int(_cache_workers),
+                shared_bytes=shared_bytes,
+                cache_worker_px=int(worst_patch_px),
+                max_cells_in_flight=cells_in_flight_cap,
+            )
+
+        plan = None
+        chosen_tile = int(CPU_STREAMING_TILE_MINIMUM)
+        cpu_fallback_plan = None
+        gpu_fallback_reason = None
+        cpu_refusal = None
+        tile_trials = []
+
+        if effective_gpu:
+            gpu_pairs = [
+                (inmem_by_idx[i], gpu_stream_by_idx[i]) for i, _n, _hw, _a in active
+            ]
+            try:
+                plan = _plan_for(gpu_pairs, True, max_cells_in_flight)
+            except zpar.ModeInfeasible as exc:
+                gpu_fallback_reason = {
+                    "reason": "gpu_stream_host_ram_infeasible",
+                    "gpu_streaming_tile": int(gpu_tile_size),
+                    "gpu_streaming_host_peak_bytes": int(
+                        max((b for _a, b in gpu_pairs), default=0)
+                    ),
+                    "ram_budget_bytes": int(budget_bytes),
+                    "detail": str(exc),
+                }
+                effective_gpu = False
+                gpu_tile_size = None
+                gpu_stream_by_idx = None
+
+        if plan is None:
+            # CPU: walk the PERMITTED ladder (largest first) and keep the first
+            # jointly feasible tile. Never a numeric clamp, never a stale report.
+            for t in permitted_tiles:
+                stream_by_idx = _stream_by_idx(t)
+                pairs = [(inmem_by_idx[i], stream_by_idx[i]) for i, _n, _hw, _a in active]
+                worst_stream = int(max((b for _a, b in pairs), default=0))
+                try:
+                    candidate = _plan_for(pairs, False, max_cells_in_flight)
+                except zpar.ModeInfeasible as exc:
+                    cpu_refusal = exc
+                    tile_trials.append({
+                        "tile": int(t), "bound_bytes": worst_stream,
+                        "worst_bound_bytes": worst_stream, "fits": False,
+                    })
+                    continue
+                # R41-B (rework-2): the trial's ``fits`` describes whether THIS
+                # tile's STREAM mode is the plan actually used — never claim a
+                # stream tile fits when the plan passed via in-memory.
+                fits_stream = (candidate["mode"] == "stream")
+                tile_trials.append({
+                    "tile": int(t), "bound_bytes": worst_stream,
+                    "worst_bound_bytes": worst_stream, "fits": bool(fits_stream),
+                })
+                plan = candidate
+                chosen_tile = int(t)
+                break
+        else:
+            # GPU plan accepted: still plan the CPU fallback bundle across the
+            # ladder, but NEVER abort the (feasible) GPU plan when no CPU mode
+            # fits (R36 F-M2 D: a GPU success is allowed with no CPU fallback).
+            for t in permitted_tiles:
+                stream_by_idx = _stream_by_idx(t)
+                pairs = [(inmem_by_idx[i], stream_by_idx[i]) for i, _n, _hw, _a in active]
+                worst_stream = int(max((b for _a, b in pairs), default=0))
+                try:
+                    cpu_fallback_plan = _plan_for(pairs, False, max_cells_in_flight)
+                except zpar.ModeInfeasible as exc:
+                    cpu_refusal = exc
+                    tile_trials.append({
+                        "tile": int(t), "bound_bytes": worst_stream,
+                        "worst_bound_bytes": worst_stream, "fits": False,
+                    })
+                    continue
+                tile_trials.append({
+                    "tile": int(t), "bound_bytes": worst_stream,
+                    "worst_bound_bytes": worst_stream,
+                    "fits": bool(cpu_fallback_plan.get("mode") == "stream"),
+                })
+                chosen_tile = int(t)
+                break
+
+        if plan is None:
+            attempts.append({
+                "layout": [nx, ny], "refinement_rank": nx * ny,
+                "permitted_tiles": list(permitted_tiles),
+                "tile_trials": list(tile_trials),
+                "reason": str(cpu_refusal),
+            })
+            if exact_geometry:
+                raise zpar.ModeInfeasible(
+                    "exact/pinned geometry "
+                    f"{nx}x{ny} is JOINTLY infeasible under the PLAN budget "
+                    f"{budget_bytes / 2**20:.1f} MiB (shared "
+                    f"{shared_bytes / 2**20:.1f} MiB counted once, worst patch "
+                    f"{worst_patch_px} px) even after the FULL permitted CPU tile "
+                    f"ladder {permitted_tiles}: {cpu_refusal}. Refusing to change the "
+                    "geometry of an already-committed run."
+                )
+            # Auto: the full ladder is exhausted -> move to the NEXT FINER
+            # candidate (never coarser).
+            rank_floor = (nx * ny) + 1
+            if rank_floor > canvas.width * canvas.height:
+                raise zpar.ModeInfeasible(
+                    "no layout (even the finest) is jointly feasible under the PLAN "
+                    f"budget {budget_bytes / 2**20:.1f} MiB after the full CPU tile "
+                    f"ladder {permitted_tiles}: {cpu_refusal}"
+                )
+            continue
+
+        cpu_streaming_tile = int(chosen_tile)
+        chosen_mode = plan["mode"]
+        # R41-B (rework-2): the REPORTED stream tile is the one that will actually
+        # execute a CPU stream plan — None when the CPU plan is in-memory only or
+        # when no CPU fallback exists on a GPU plan (never a fake tile).
+        if (not effective_gpu) and chosen_mode == "stream":
+            selected_cpu_tile = int(chosen_tile)
+        elif cpu_fallback_plan is not None and cpu_fallback_plan.get("mode") == "stream":
+            selected_cpu_tile = int(chosen_tile)
+        else:
+            selected_cpu_tile = None
+        # The reported block must describe EXACTLY what will execute. Integer keys
+        # (``_cpu_streaming_block`` reads ``stream_worst_by_tile[int(tile)]``).
+        _stream_worst_by_tile = {
+            int(t): int(max(_stream_by_idx(t).values(), default=0))
+            for t in permitted_tiles
+        }
+        _inmem_worst = int(max(inmem_by_idx.values(), default=0))
+        _cs_reason = (
+            f"joint tile selection over the permitted ladder {permitted_tiles}: "
+            + (
+                f"tile {selected_cpu_tile} is the largest jointly feasible stream tile"
+                if selected_cpu_tile is not None
+                else "no CPU stream tile is used (in-memory plan or no CPU fallback)"
+            )
+        )
+        layout["cpu_streaming"] = _cpu_streaming_block(
+            selected_cpu_tile,
+            [dict(tr) for tr in tile_trials],
+            _cs_reason,
+            _stream_worst_by_tile,
+            _inmem_worst,
+            budget_bytes,
+        )
+        cpu_streaming = layout.get("cpu_streaming") or {}
+        _cs_selected = cpu_streaming.get("selected_tile_size")
+        cells_in_flight = int(plan["cells_in_flight"])
+        cache_workers_per_cell = int(plan["cache_workers_per_cell"])
+        gpu_streaming_tile = int(gpu_tile_size) if effective_gpu else None
+        gpu_streaming_host_peak_bytes = (
+            int(max(gpu_stream_by_idx.values(), default=0))
+            if effective_gpu else None
+        )
+
+        cell_specs = []
+        for (row, col, cell, patch, mem) in cell_ctxs:
+            cid = cell.cell_id
+            if not mem.patch_ids:
+                cell_specs.append((
+                    cell, patch, mem,
+                    (None if _cache_root is None else str(_cache_root / cid)),
+                    None, 0, None,
+                ))
+                continue
+            n = len(mem.patch_ids)
+            area = patch.patch.width * patch.patch.height
+            inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
+            stream_b = _estimate_streaming_bytes(
+                n, patch.patch_shape_hw, cpu_streaming_tile
+            )
+            gpu_stream_b = (
+                _estimate_streaming_bytes(n, patch.patch_shape_hw, gpu_tile_size)
+                if effective_gpu else None
+            )
+            cell_specs.append(
+                (cell, patch, mem,
+                 (str(_cache_root / cid) if _cache_root is not None else cid),
+                 inmem_b, stream_b, gpu_stream_b)
+            )
+
+        cell_tasks = []
+        for (cell, patch, mem, cache_dir, inmem_b, stream_b, gpu_stream_b) in cell_specs:
+            if inmem_b is None:
+                cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
+            elif chosen_mode == "inmem":
+                cell_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
+            else:
+                bound_b = (
+                    gpu_stream_b
+                    if (effective_gpu and gpu_stream_b is not None) else stream_b
+                )
+                cell_tasks.append((cell, patch, mem, cache_dir, "stream", bound_b))
+
+        if effective_gpu and gpu_streaming_host_peak_bytes is not None:
+            per_cell_footprint = int(gpu_streaming_host_peak_bytes)
+        else:
+            per_cell_footprint = max(
+                (t[5] for t in cell_tasks if t[4] is not None), default=0
+            )
+
+        cpu_fallback_info = {
+            "applicable": bool(effective_gpu), "feasible": False, "mode": None,
+            "max_bound_bytes": None, "ram_budget_bytes": int(budget_bytes),
+            "tile": int(chosen_tile),
+            "cells_in_flight": None,
+            "cache_workers_per_cell": None, "reason": None, "used": False,
+            "raw_available_bytes": int(raw_available_bytes),
+            "plan_budget_bytes": int(budget_bytes),
+        }
+        cpu_fallback_tasks = None
+        if effective_gpu:
+            if cpu_fallback_plan is None:
+                # R36 F-M2 (D): the GPU is still allowed to run when no CPU mode
+                # fits — recorded honestly as UNAVAILABLE (never a fake tile).
+                cpu_fallback_info["feasible"] = False
+                cpu_fallback_info["tile"] = None
+                cpu_fallback_info["reason"] = (
+                    None if cpu_refusal is None else str(cpu_refusal)
+                )
+            else:
+                _fb_mode = cpu_fallback_plan["mode"]
+                # An in-memory fallback does NOT use a streaming tile.
+                cpu_fallback_info["tile"] = (
+                    int(chosen_tile) if _fb_mode == "stream" else None
+                )
+                cpu_fallback_tasks = []
+                for (cell, patch, mem, cache_dir, inmem_b, stream_b, _gpu_b) in cell_specs:
+                    if inmem_b is None:
+                        cpu_fallback_tasks.append((cell, patch, mem, cache_dir, None, 0))
+                    elif _fb_mode == "inmem":
+                        cpu_fallback_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
+                    else:
+                        cpu_fallback_tasks.append((cell, patch, mem, cache_dir, "stream", stream_b))
+                _fb_bound = max(
+                    (c["max_bound_bytes"] for c in cpu_fallback_plan["candidates"]
+                     if c["mode"] == _fb_mode), default=0,
+                )
+                cpu_fallback_info.update({
+                    "feasible": True, "mode": _fb_mode,
+                    "max_bound_bytes": int(_fb_bound),
+                    "cells_in_flight": int(cpu_fallback_plan["cells_in_flight"]),
+                    "cache_workers_per_cell": int(cpu_fallback_plan["cache_workers_per_cell"]),
+                    "reason": cpu_fallback_plan.get("chosen_reason"),
+                })
+
+        envelope = rcontract.PlanEnvelope(
+            phase=rcontract.PHASE_PLAN,
+            raw_available_bytes=int(raw_available_bytes),
+            factor_num=rcontract.PLAN_FACTOR_NUM,
+            factor_den=rcontract.PLAN_FACTOR_DEN,
+            budget_bytes=int(budget_bytes),
+            layout=(nx, ny),
+            refinement_rank=int(nx * ny),
+            cpu_tile=int(cpu_streaming_tile),
+            gpu_tile=gpu_streaming_tile,
+            backend=(rcontract.BACKEND_GPU if effective_gpu else rcontract.BACKEND_CPU),
+            cells_in_flight=int(cells_in_flight),
+            cache_workers_per_cell=int(cache_workers_per_cell),
+            shared_bytes=int(shared_bytes),
+            stack_total_bytes=int(plan["stack_total_bytes"]),
+            cache_total_bytes=int(plan["cache_total_bytes"]),
+            aggregate_bytes=int(plan["aggregate_bytes"]),
+            pinned=bool(pinned_layout is not None),
+            reason=str(plan.get("chosen_reason") or ""),
+        )
+        rcontract.validate_envelope(envelope)
+        if int(envelope.aggregate_bytes) > int(budget_bytes):
+            raise zpar.ModeInfeasible(
+                f"built bundle aggregate {envelope.aggregate_bytes} exceeds its PLAN "
+                f"budget {budget_bytes}"
+            )
+
+        return ExecutionBundle(
+            layout=layout,
+            cell_ctxs=cell_ctxs,
+            footprints=footprints,
+            cpu_streaming=dict(cpu_streaming),
+            cpu_streaming_tile=int(cpu_streaming_tile),
+            gpu_tile_size=(int(gpu_tile_size) if effective_gpu else None),
+            gpu_streaming_tile=gpu_streaming_tile,
+            gpu_streaming_host_peak_bytes=gpu_streaming_host_peak_bytes,
+            gpu_used=bool(effective_gpu),
+            gpu_pre_execution_fallback=(
+                gpu_pre_execution_fallback or gpu_fallback_reason
+            ),
+            cell_specs=cell_specs,
+            cell_tasks=cell_tasks,
+            plan=plan,
+            chosen_mode=chosen_mode,
+            cells_in_flight=cells_in_flight,
+            cache_workers_per_cell=cache_workers_per_cell,
+            per_cell_footprint=int(per_cell_footprint),
+            cpu_fallback_info=cpu_fallback_info,
+            cpu_fallback_plan=cpu_fallback_plan,
+            cpu_fallback_tasks=cpu_fallback_tasks,
+            envelope=envelope,
+            shared_bytes=int(shared_bytes),
+            cache_worker_footprint_bytes=int(cache_worker_footprint_bytes),
+            worst_patch_px=int(worst_patch_px),
+            gauge_workers=int(_gauge_workers),
+            cache_build_workers=int(_cache_workers),
+            worker_budget_bytes=int(worker_budget),
+            attempts=attempts,
+        )
+
+
+def _build_execution_bundle_infeasible_message(exc) -> str:
+    """Quantitative, FINER-direction refusal text (never coarser advice)."""
+    return (
+        "ZeGrid refused BEFORE any gauge/stack work: no executable bundle fits the "
+        f"PLAN budget. {exc}"
+    )
+
+
+def _ram_contract_diagnostics(outcome, bundle, initial_bundle) -> dict:
+    """JSON-safe R41-B manifest/log trail of the 80 %-plan / 90 %-admit contract.
+
+    Records BOTH raw observations and their OWN factors/budgets (never a
+    serialized float factor, never ``0.9 * B_plan``), the initial and final
+    layouts, the admitted envelope, the replan count and the tolerance flag.
+    """
+    plan_env = bundle.envelope
+    return {
+        "schema": R41_RAM_CONTRACT_SCHEMA,
+        "plan_factor": {
+            "num": int(rcontract.PLAN_FACTOR_NUM),
+            "den": int(rcontract.PLAN_FACTOR_DEN),
+        },
+        "admit_factor": {
+            "num": int(rcontract.ADMIT_FACTOR_NUM),
+            "den": int(rcontract.ADMIT_FACTOR_DEN),
+        },
+        "plan_observation": {
+            "raw_available_bytes": int(plan_env.raw_available_bytes),
+            "factor_num": int(plan_env.factor_num),
+            "factor_den": int(plan_env.factor_den),
+            "budget_bytes": int(plan_env.budget_bytes),
+        },
+        "admission_observations": [o.to_dict() for o in outcome.observations],
+        "admission_history": [p.to_dict() for p in outcome.history],
+        "launch_observation": outcome.final_observation.to_dict(),
+        "replans": int(outcome.replans),
+        "tolerance": bool(outcome.tolerance),
+        "initial_layout": [
+            int(initial_bundle.envelope.layout[0]),
+            int(initial_bundle.envelope.layout[1]),
+        ],
+        "final_layout": [int(plan_env.layout[0]), int(plan_env.layout[1])],
+        "final_envelope": plan_env.to_dict(),
+        "shared_bytes": int(plan_env.shared_bytes),
+        "stack_total_bytes": int(plan_env.stack_total_bytes),
+        "cache_total_bytes": int(plan_env.cache_total_bytes),
+        "aggregate_bytes": int(plan_env.aggregate_bytes),
+        "cache_worker_footprint_bytes": int(bundle.cache_worker_footprint_bytes),
+        "worst_patch_px": int(bundle.worst_patch_px),
+        "worker_budget_bytes": int(bundle.worker_budget_bytes),
+        "gauge_workers": int(bundle.gauge_workers),
+        "cache_build_workers": int(bundle.cache_build_workers),
+        "backend": str(plan_env.backend),
+        "mode": str(bundle.chosen_mode),
+        "cpu_streaming_tile": int(bundle.cpu_streaming_tile),
+        "gpu_streaming_tile": (
+            int(bundle.gpu_streaming_tile)
+            if bundle.gpu_streaming_tile is not None else None
+        ),
+        "gpu_pre_execution_fallback": bundle.gpu_pre_execution_fallback,
+        "refinement_attempts": list(bundle.attempts),
+        "note": (
+            "B_plan = floor(4/5 * raw plan observation); B_admit = "
+            "floor(9/10 * a FRESH raw observation taken before every admission "
+            "attempt and again immediately before launch. Each factor is applied "
+            "ONCE to its own raw observation. The 90 % ceiling is admission-only: "
+            "it never enlarges a layout, a tile or the concurrency. Host RAM only; "
+            "the VRAM reserve policy is unchanged."
+        ),
+    }
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -3182,42 +3842,96 @@ def _run_single(
             callback=progress_callback,
         )
 
-    # LAYOUT — MODE-AWARE RAM-aware Auto layout (in-memory OR streaming bound),
-    # budgeted from psutil (portable). Pinnable via ``zegrid_layout``.
-    available = available_memory_bytes()
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-R41-B — PLAN PHASE. Observe the RAW available RAM and derive the
+    # EXACT plan budget ONCE with the shared contract (integer arithmetic only,
+    # never a float factor). A nonpositive observation fails CLOSED here, before
+    # any gauge/cache work.
+    # ------------------------------------------------------------------
+    plan_raw_bytes = int(available_memory_bytes())
+    try:
+        plan_budget_bytes = int(rcontract.plan_budget_bytes(plan_raw_bytes))
+    except rcontract.InvalidObservation as _plan_exc:
+        raise RuntimeError(
+            "ZeGrid refusing to plan: the RAW available-RAM observation "
+            f"({plan_raw_bytes} bytes) is nonpositive/unusable ({_plan_exc}); a real "
+            "positive observation is required before any layout or stack work "
+            "(fail closed, no unbounded fallback)."
+        ) from _plan_exc
+    available = int(plan_raw_bytes)
+    _emit(
+        f"ZeGrid: RAM plan observation — raw available {plan_raw_bytes / 2**20:.1f} MiB "
+        f"-> B_plan {plan_budget_bytes / 2**20:.1f} MiB "
+        f"(factor {rcontract.PLAN_FACTOR_NUM}/{rcontract.PLAN_FACTOR_DEN}); the admission "
+        f"ceiling is re-measured at {rcontract.ADMIT_FACTOR_NUM}/"
+        f"{rcontract.ADMIT_FACTOR_DEN} right before the cell workers start",
+        callback=progress_callback,
+    )
+
+    # ZM-ZEGRID-R35A: large disk-backed intermediates follow the user's
+    # Temporary Working Directory (empty -> the output folder, historical
+    # behaviour). Scientific outputs STAY under output_dir. Resolved BEFORE the
+    # plan so the bundle carries the REAL per-cell cache directories.
+    from .zemosaic_utils import resolve_temporary_work_dir as _resolve_temp_root
+
+    _temp_root = _resolve_temp_root(
+        output_dir, getattr(zconfig, "temporary_work_dir", "") if zconfig is not None else ""
+    )
+    cache_root = Path(_temp_root) / CACHE_DIR_NAME
+    cache_root.mkdir(parents=True, exist_ok=True)
+    if str(Path(_temp_root)) != str(Path(output_dir)):
+        _emit(
+            f"ZeGrid: temporary work root = {_temp_root} (outputs stay in {output_dir})",
+            callback=progress_callback,
+        )
+
+    # LAYOUT + COMPLETE EXECUTABLE BUNDLE, built under B_plan BEFORE the gauge.
+    # The bundle is the SINGLE source of truth downstream (layout, memberships,
+    # CPU/GPU tiles, per-cell bounds, joint mode/concurrency/cache workers, tasks,
+    # CPU fallback bundle and validated PlanEnvelope). No second independent plan
+    # is computed later.
     _layout_rep = _reporter()
     _layout_rep.start("layout")
     # ZM-ZEGRID-R27: layout sub-step observability — a bounded, throttled reporter
-    # for the three stable layout sub-steps (footprints, candidate scan, chosen
-    # cells). It emits ONLY log/durable-detail events (never GUI stage/percent),
-    # so the current GUI cannot misinterpret a sub-step as a global phase.
+    # for the stable layout sub-steps (footprints, candidate scan, chosen cells).
+    # It emits ONLY log/durable-detail events (never GUI stage/percent).
     layout_substep = zobs.SubstepReporter(_emit_live, log_line=_log_line)
-    with timings.timed("layout"):
-        footprints_out = []
-        layout = _choose_layout_mode_aware(
-            canvas, descs, ram_budget=available, available_bytes=available,
-            tile_size=STREAM_TILE_SIZE, pinned_layout=pinned_layout,
-            emit=_emit_live, log_line=_log_line, observer=layout_substep,
-            footprints_out=footprints_out,
+    _bundle_common = dict(
+        cpu_count=os.cpu_count(),
+        gpu_used=bool(gpu_used),
+        vram_budget_bytes=(gpu_ctx or {}).get("vram_budget_bytes"),
+        cache_root=cache_root,
+        emit=_emit_live,
+        log_line=_log_line,
+    )
+    try:
+        with timings.timed("layout"):
+            _initial_bundle = _build_execution_bundle(
+                canvas, descs, None,
+                raw_available_bytes=plan_raw_bytes, budget_bytes=plan_budget_bytes,
+                pinned_layout=pinned_layout,
+                gauge_workers=workers,
+                cache_build_workers=(workers if workers is not None else None),
+                layout_substep=layout_substep,
+                **_bundle_common,
+            )
+    except (zal.LayoutInfeasible, zpar.ModeInfeasible) as _plan_exc:
+        _emit(
+            "ZeGrid: NO executable plan fits the PLAN budget — refusing BEFORE the "
+            f"gauge/stack: {_plan_exc}",
+            lvl="ERROR", callback=progress_callback,
         )
-        # ZM-ZEGRID-R28: reuse the once-projected footprint set for the final
-        # chosen-cell memberships (no per-cell WCS re-projection).
-        footprints = footprints_out[0] if footprints_out else None
-        nx, ny = layout["nx"], layout["ny"]
-        # Chosen-cell membership/context preparation — the final
-        # ``build_cell_context`` pass (previously a silent 170-cell loop that
-        # re-projected every frame's WCS for every cell).
-        cell_ctxs = _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep)
-    # ZM-ZEGRID-R36: the RAM-adaptive CPU streaming tile chosen by the layout
-    # planner. ``selected_tile_size is None`` means NO ladder tile fits the
-    # budget (the layout is admissible via the in-memory bound only); in that case
-    # the streaming estimate uses the documented minimum so the joint planner
-    # correctly marks streaming INFEASIBLE. The SAME tile is propagated verbatim
-    # to the per-cell estimates, the joint planner, the workers and the GPU->CPU
-    # fallback (never a re-coded 128).
-    cpu_streaming = layout.get("cpu_streaming") or {}
+        raise
+
+    layout = _initial_bundle.layout
+    footprints = _initial_bundle.footprints
+    cell_ctxs = _initial_bundle.cell_ctxs
+    nx, ny = int(layout["nx"]), int(layout["ny"])
+    cpu_streaming = _initial_bundle.cpu_streaming
     _cs_selected = cpu_streaming.get("selected_tile_size")
-    cpu_streaming_tile = int(_cs_selected) if _cs_selected is not None else int(CPU_STREAMING_TILE_MINIMUM)
+    cpu_streaming_tile = int(_initial_bundle.cpu_streaming_tile)
+    workers = int(_initial_bundle.gauge_workers)
+    cache_build_workers = int(_initial_bundle.cache_build_workers)
     _emit(
         f"ZeGrid: CPU streaming tile — selected={_cs_selected} "
         f"(preferred={cpu_streaming.get('preferred_tile_size')}, "
@@ -3238,8 +3952,8 @@ def _run_single(
     global_eta.phase_completed("layout", timings.get("layout"))
     _emit(
         f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells, "
-        f"source={layout.get('layout_source', 'auto')}) from RAM budget "
-        f"{available / 2**30:.2f} GiB; predicted bound "
+        f"source={layout.get('layout_source', 'auto')}) from RAM plan budget "
+        f"{plan_budget_bytes / 2**30:.2f} GiB; predicted bound "
         f"{layout['predicted_bound_bytes'] / 2**20:.1f} MiB (maxN={layout['max_contributors']}); "
         f"CPU streaming tile={_cs_selected}",
         callback=progress_callback,
@@ -3247,58 +3961,18 @@ def _run_single(
     for w in layout["warnings"]:
         _emit(f"ZeGrid: layout warning — {w}", lvl="WARN", callback=progress_callback)
 
-    # Parallel workers (ZM-ZEGRID-R16 adaptive rule: clamp(min(cpu-2, RAM//footprint), 2, 14),
-    # per-phase footprint — the gauge reprojects full-canvas frames so it is heavier
-    # than the per-cell cache build).
-    if workers is None:
-        # ZM-ZEGRID-R17 (R16-M1 fix): derive the per-worker footprint from the ACTUAL
-        # pixel areas rather than a static estimate. The gauge's pairs pass unions
-        # the reference's and the frame's bboxes, which can approach the CANVAS
-        # area; the cache build reprojects one cell patch. Using the real areas
-        # prevents over-spawning (OOM) on a large mosaic.
-        canvas_px = int(canvas.width) * int(canvas.height)
-        patch_px = 0
-        for _row, _col, _cell, _patch, _mem in cell_ctxs:
-            try:
-                _ph, _pw = _patch.patch_shape_hw
-                patch_px = max(patch_px, int(_ph) * int(_pw))
-            except Exception:
-                pass
-        gauge_footprint = zpar.gauge_footprint_bytes(canvas_px)
-        cache_footprint = zpar.cache_footprint_bytes(patch_px or canvas_px)
-        # ZM-ZEGRID-R17 (R16-M1): budget on a FRACTION of the available RAM (the
-        # workers' peak sits on top of the main process + the product) so the rule
-        # cannot admit more workers than the machine can hold.
-        worker_budget = int(available_memory_bytes() * zpar.RAM_SAFETY_FRACTION)
-        gauge_workers = zpar.choose_workers(None, worker_budget, gauge_footprint)
-        cache_workers = zpar.choose_workers(None, worker_budget, cache_footprint)
-        _emit(
-            f"ZeGrid: parallel workers — gauge={gauge_workers} "
-            f"(CPU={os.cpu_count()}, avail={available / 2**30:.2f}GiB, "
-            f"budget={worker_budget / 2**30:.2f}GiB, footprint={gauge_footprint / 2**20:.0f}MiB), "
-            f"cache_build={cache_workers} (footprint={cache_footprint / 2**20:.0f}MiB)",
-            callback=progress_callback,
-        )
-        workers = gauge_workers
-        cache_build_workers = cache_workers
-    else:
-        cache_build_workers = workers
-
-    # ZM-ZEGRID-R35A: large disk-backed intermediates follow the user's
-    # Temporary Working Directory (empty -> the output folder, historical
-    # behaviour). Scientific outputs STAY under output_dir.
-    from .zemosaic_utils import resolve_temporary_work_dir as _resolve_temp_root
-
-    _temp_root = _resolve_temp_root(
-        output_dir, getattr(zconfig, "temporary_work_dir", "") if zconfig is not None else ""
+    canvas_px = int(canvas.width) * int(canvas.height)
+    _gauge_fp = zpar.gauge_footprint_bytes(canvas_px)
+    _cache_fp = zpar.cache_footprint_bytes(
+        _initial_bundle.worst_patch_px or canvas_px
     )
-    cache_root = Path(_temp_root) / CACHE_DIR_NAME
-    cache_root.mkdir(parents=True, exist_ok=True)
-    if str(Path(_temp_root)) != str(Path(output_dir)):
-        _emit(
-            f"ZeGrid: temporary work root = {_temp_root} (outputs stay in {output_dir})",
-            callback=progress_callback,
-        )
+    _emit(
+        f"ZeGrid: parallel workers — gauge={workers} "
+        f"(CPU={os.cpu_count()}, raw={plan_raw_bytes / 2**30:.2f}GiB, "
+        f"B_plan={plan_budget_bytes / 2**30:.2f}GiB, footprint={_gauge_fp / 2**20:.0f}MiB), "
+        f"cache_build={cache_build_workers} (footprint={_cache_fp / 2**20:.0f}MiB)",
+        callback=progress_callback,
+    )
 
     # R15 (rework-1 L3): track cache cleanup failures (auditable in the manifest).
     cleanup_failures: list[str] = []
@@ -3340,6 +4014,124 @@ def _run_single(
         f"exclusions={len(global_gauge.exclusions)}",
         callback=progress_callback,
     )
+
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-R41-B — ADMISSION PHASE. A FRESH raw observation is taken for
+    # EVERY admission attempt at the 90 % ceiling, immediately before the cell
+    # workers. On a miss the bundle is REBUILT under the SAME observation's
+    # exact 80 % B_plan (never 0.9 * B_plan, never a stale raw), bounded to
+    # never coarsen the layout, grow the CPU/GPU tile or grow the concurrency.
+    # ------------------------------------------------------------------
+    requested_cell_gauge_mode = getattr(science_config, "cell_gauge_mode", None)
+
+    def _admit(initial_bundle, *, fix_rank=None, backend_gpu=None,
+               pinned_override=None):
+        """Run ONE bounded admission cycle; return ``(outcome, final_bundle)``.
+
+        ``fix_rank`` pins the EXACT geometry (cell-count rank) — used by the
+        GPU->CPU runtime fallback so a started mosaic is never re-sliced.
+        ``pinned_override`` pins the EXACT ``(nx, ny)`` tuple for every build in
+        the cycle (a same rank is NOT proof of the same geometry).
+        ``backend_gpu`` overrides the requested backend for the whole cycle.
+        """
+        _pin = pinned_layout if pinned_override is None else tuple(pinned_override)
+        state = {"last_raw": None, "bundle": None, "attempts": []}
+
+        def _measure():
+            # The measurement-recorder closure: the admission controller calls
+            # this before every attempt, so ``state["last_raw"]`` is EXACTLY the
+            # raw that triggered the (possible) miss. The rebuild callback reuses
+            # it verbatim instead of inverting B_plan back into a guessed raw.
+            raw = int(available_memory_bytes())
+            state["last_raw"] = raw
+            return raw
+
+        def _rebuild(b_plan, previous):
+            raw = state["last_raw"]
+            kw = dict(_bundle_common)
+            if backend_gpu is not None:
+                kw["gpu_used"] = bool(backend_gpu)
+            bundle = _build_execution_bundle(
+                canvas, descs, footprints,
+                raw_available_bytes=int(raw), budget_bytes=int(b_plan),
+                pinned_layout=_pin,
+                min_refinement_rank=int(previous.refinement_rank),
+                max_refinement_rank=(None if fix_rank is None else int(fix_rank)),
+                max_cpu_tile=int(previous.cpu_tile),
+                max_gpu_tile=(
+                    int(previous.gpu_tile) if previous.gpu_tile is not None else None
+                ),
+                max_cells_in_flight=int(previous.cells_in_flight),
+                gauge_workers=int(workers),
+                layout_substep=None,
+                **kw,
+            )
+            state["bundle"] = bundle
+            state["attempts"].append(bundle)
+            return bundle.envelope
+
+        outcome = rcontract.AdmissionController(
+            max_replans=R41_ADMISSION_MAX_REPLANS
+        ).run(initial_bundle.envelope, _measure, _rebuild)
+        final = initial_bundle if outcome.replans == 0 else state["bundle"]
+        if final is None:  # defensive: a replan always records its bundle
+            final = initial_bundle
+        if final.envelope != outcome.plan:
+            raise RuntimeError(
+                "internal R41-B inconsistency: the accepted envelope is not the "
+                "final bundle's envelope"
+            )
+        return outcome, final
+
+    try:
+        _adm, _final = _admit(_initial_bundle)
+    except rcontract.AdmissionExhausted as _adm_exc:
+        _emit(
+            "ZeGrid refused: the executable plan could not be admitted under "
+            f"{rcontract.ADMIT_FACTOR_NUM}/{rcontract.ADMIT_FACTOR_DEN} of the freshly "
+            f"measured available RAM after {R41_ADMISSION_MAX_REPLANS} bounded "
+            f"replan(s): {_adm_exc}",
+            lvl="ERROR", callback=progress_callback,
+        )
+        raise zpar.ModeInfeasible(
+            "ZeGrid admission refused (fresh RAM ceilings): " + str(_adm_exc)
+        ) from _adm_exc
+    if _adm.replans:
+        _emit(
+            f"ZeGrid: admitted after {_adm.replans} bounded replan(s) — layout "
+            f"{_initial_bundle.envelope.layout[0]}x{_initial_bundle.envelope.layout[1]} "
+            f"-> {_final.envelope.layout[0]}x{_final.envelope.layout[1]}, "
+            f"aggregate {_final.envelope.aggregate_bytes / 2**20:.1f} MiB <= B_admit "
+            f"{_adm.final_observation.budget_bytes / 2**20:.1f} MiB",
+            lvl="WARN", callback=progress_callback,
+        )
+        _log_line(
+            "ZeGrid RAM contract admission: replans="
+            + json.dumps(_adm.to_dict(), sort_keys=True)
+        )
+
+    # The FINAL admitted bundle now owns every downstream decision.
+    layout = _final.layout
+    footprints = _final.footprints
+    cell_ctxs = _final.cell_ctxs
+    nx, ny = int(layout["nx"]), int(layout["ny"])
+    cpu_streaming = _final.cpu_streaming
+    _cs_selected = cpu_streaming.get("selected_tile_size")
+    cpu_streaming_tile = int(_final.cpu_streaming_tile)
+    cell_specs = _final.cell_specs
+    cell_tasks = _final.cell_tasks
+    chosen_mode = _final.chosen_mode
+    cells_in_flight = int(_final.cells_in_flight)
+    cache_workers_per_cell = int(_final.cache_workers_per_cell)
+    per_cell_footprint = int(_final.per_cell_footprint)
+    gpu_tile_size = _final.gpu_tile_size
+    gpu_streaming_tile = _final.gpu_streaming_tile
+    gpu_streaming_host_peak_bytes = _final.gpu_streaming_host_peak_bytes
+    cpu_fallback_info = dict(_final.cpu_fallback_info)
+    cpu_fallback_plan = _final.cpu_fallback_plan
+    cpu_fallback_tasks = _final.cpu_fallback_tasks
+    cache_build_workers = int(_final.cache_build_workers)
+    total_cells = int(nx * ny)
 
     # ZM-CELL-PHOTOMETRY-R34F: "auto" resolves HERE — after the global gauge exists
     # (it already does, for progress/ETA) and the layout membership is known. It
@@ -3436,125 +4228,28 @@ def _run_single(
     _stack_rep = _reporter()
     _cache_rep.start("cache_build", total=cache_total_frames, unit="frames")
     _stack_rep.start("per_cell_stack", total=total_cells, unit="cells")
-    # ZM-ZEGRID-R20: per-cell STACKING runs several cells CONCURRENTLY, bounded
-    # adaptively by the available RAM. Each cell worker builds its aligned cache
-    # SERIALISED (no nested pool), stacks, and deletes its cache — preserving the
-    # per-cell temp reuse + bounded-disk behaviour (peak disk is `cells_in_flight`
-    # x the largest cell, not the sum). A concurrent-path failure WARNs loudly and
-    # degrades to the serial loop via pmap's fail-safe (never crash, never silent).
-    available_now = available_memory_bytes()
-    per_cell_budget = int(available_now * zpar.RAM_SAFETY_FRACTION)
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-R41-B — the FINAL admitted bundle is the ONLY source for the
+    # tasks / executor / diagnostics / log / manifest (no second plan, no stale
+    # per-cell budget). ``available_now`` / ``per_cell_budget`` below are the
+    # FINAL PLAN observation and its exact 80 % budget (never a float factor).
+    # ------------------------------------------------------------------
+    _plan = _final.plan
+    available_now = int(_final.envelope.raw_available_bytes)
+    per_cell_budget = int(_final.envelope.budget_bytes)
 
-    # ZM-ZEGRID-R22/R36: VRAM-bounded GPU tile size for the stack phase, determined
-    # BEFORE the joint plan (ZM-ZEGRID-R36 F-M1) so the GPU RAM-feasibility gate is
-    # evaluated at the GPU's OWN execution tile. The canonical GPU materialises
-    # host-side buffers that scale with the REAL tile, so "CPU@48 fits" does NOT
-    # imply "GPU@128 fits". Single GPU owner => stack tasks serialise; the tile is a
-    # pure function of (max N, worst patch, VRAM budget) (gpu.py untouched). A
-    # degenerate (None) tile degrades LOUDLY to exact CPU (no silent fallback).
-    gpu_tile_size = STREAM_TILE_SIZE
-    gpu_streaming_tile = None
-    gpu_streaming_host_peak_bytes = None
-    if gpu_used:
-        max_n = max((len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids), default=1)
-        worst_hw = (1, 1)
-        worst_area = -1
-        for (_r, _c, _ce, _p, m) in cell_ctxs:
-            if m.patch_ids:
-                hw = _p.patch_shape_hw
-                area = hw[0] * hw[1]
-                if area > worst_area:
-                    worst_area = area
-                    worst_hw = hw
-        _gpu_ts = zgpu.choose_gpu_tile_size(max_n, 3, worst_hw, gpu_ctx.get("vram_budget_bytes"))
-        if _gpu_ts is None:
-            _emit(
-                "ZeGrid: VRAM budget cannot hold even a minimum GPU tile for the "
-                "heaviest cell; degrading to exact CPU before execution "
-                "(no GPU attempt, no silent fallback)",
-                lvl="WARN", callback=progress_callback,
-            )
-            gpu_used = False
-            science_config = replace(science_config, backend="cpu")
-            gpu_ctx = dict(gpu_ctx)
-            gpu_ctx["effective"] = False
-            gpu_ctx["attempted"] = False
-            gpu_ctx["final_effective"] = False
-            gpu_ctx["actually_used"] = False
-            gpu_ctx["final_backend"] = "cpu"
-            gpu_ctx["fallback_reason"] = gpu_ctx.get("fallback_reason") or "vram_tile_infeasible"
-            gpu_ctx["pre_execution_fallback"] = {
-                "reason": "vram_tile_infeasible",
-                "detail": "choose_gpu_tile_size returned None (VRAM budget too small)",
-            }
-            ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
-        else:
-            gpu_tile_size = _gpu_ts
-            gpu_streaming_tile = _gpu_ts
-
-    cell_specs = []          # (cell, patch, mem, cache_dir, inmem_b|None, cpustream_b, gpustream_b|None)
-    cell_bound_pairs = []    # (inmem_b, cpustream_b) — CPU plan (adaptive CPU tile)
-    gpu_bound_pairs = []     # (inmem_b, gpustream_b) — GPU plan (EFFECTIVE GPU tile)
-    for (row, col, cell, patch, mem) in cell_ctxs:
-        cid = cell.cell_id
-        idx = row * nx + col
-        if not mem.patch_ids:
-            cell_specs.append((cell, patch, mem, str(cache_root / cid), None, 0, None))
-            continue
-        n = len(mem.patch_ids)
-        area = patch.patch.width * patch.patch.height
-        inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
-        stream_b = _estimate_streaming_bytes(n, patch.patch_shape_hw, cpu_streaming_tile)
-        gpu_stream_b = (
-            _estimate_streaming_bytes(n, patch.patch_shape_hw, gpu_tile_size) if gpu_used else None
-        )
-        cell_bound_pairs.append((inmem_b, stream_b))
-        if gpu_stream_b is not None:
-            gpu_bound_pairs.append((inmem_b, gpu_stream_b))
-        cell_specs.append((cell, patch, mem, str(cache_root / cid), inmem_b, stream_b, gpu_stream_b))
+    # ZM-ZEGRID-R36 (F-M1/M2): the GPU degradation decided by the bundle executor
+    # is applied ONCE here (pre-execution), loudly, before any task is built.
+    if bool(gpu_used) and not bool(_final.gpu_used):
+        _pf = dict(_final.gpu_pre_execution_fallback or {})
         _emit(
-            f"ZeGrid: cell {cid} ({idx + 1}/{total_cells}) N={n} area={area}px "
-            f"inmem={inmem_b / 2**20:.1f}MiB stream(cpu{cpu_streaming_tile})={stream_b / 2**20:.1f}MiB"
-            + (
-                f" stream(gpu{gpu_tile_size})={gpu_stream_b / 2**20:.1f}MiB"
-                if gpu_stream_b is not None else ""
-            ),
-            callback=progress_callback,
-        )
-
-    if gpu_used:
-        gpu_streaming_host_peak_bytes = int(max((b for _a, b in gpu_bound_pairs), default=0))
-
-    # ZM-ZEGRID-R22: JOINT mode + concurrency planner (replaces the R20 two-step
-    # trap: 'pick inmem per cell, then discover concurrency=1'). One explicit
-    # candidate plan compares safe in-memory vs safe streaming concurrency against
-    # the CPU RAM AND (when GPU) the single-device owner constraint, and the
-    # chosen concurrency is recorded verbatim in the manifest (never a silent
-    # serial surprise).
-    # ZM-ZEGRID-R36 (F-M1): when the GPU is effective the plan is evaluated on the
-    # GPU-TILE host bounds; if that mode is RAM-infeasible the GPU is refused and
-    # the product degrades to exact CPU BEFORE execution, then re-plans on CPU
-    # (inmem if only inmem fits, stream if only stream fits, else ModeInfeasible).
-    _plan_pairs = gpu_bound_pairs if gpu_used else cell_bound_pairs
-    try:
-        _plan = zpar.plan_cell_concurrency(
-            _plan_pairs, os.cpu_count(), per_cell_budget,
-            gpu_backend=gpu_used, cache_build_workers=cache_build_workers,
-        )
-    except zpar.ModeInfeasible as _exc:
-        if not gpu_used:
-            raise
-        _gpu_host_peak = int(gpu_streaming_host_peak_bytes or 0)
-        _emit(
-            f"ZeGrid: GPU tile {gpu_tile_size} host-RAM streaming bound "
-            f"{_gpu_host_peak / 2**20:.1f} MiB is INFEASIBLE under budget "
-            f"{per_cell_budget / 2**20:.1f} MiB ({_exc}); degrading to exact CPU "
-            f"BEFORE execution (no GPU attempt, no silent fallback)",
+            f"ZeGrid: GPU cannot execute this bundle ({_pf.get('reason')}) — "
+            "degrading to exact CPU BEFORE execution (no GPU attempt, no silent "
+            "fallback)",
             lvl="WARN", callback=progress_callback,
         )
-        gpu_used = False
-        gpu_streaming_tile = None
-        gpu_streaming_host_peak_bytes = None
+    gpu_used = bool(_final.gpu_used)
+    if bool(gpu_used) is False and _final.gpu_pre_execution_fallback is not None:
         science_config = replace(science_config, backend="cpu")
         gpu_ctx = dict(gpu_ctx)
         gpu_ctx["effective"] = False
@@ -3562,26 +4257,16 @@ def _run_single(
         gpu_ctx["final_effective"] = False
         gpu_ctx["actually_used"] = False
         gpu_ctx["final_backend"] = "cpu"
+        gpu_ctx["pre_execution_fallback"] = dict(_final.gpu_pre_execution_fallback)
         gpu_ctx["fallback_reason"] = (
-            gpu_ctx.get("fallback_reason") or "gpu_stream_host_ram_infeasible"
+            gpu_ctx.get("fallback_reason")
+            or str(_final.gpu_pre_execution_fallback.get("reason"))
         )
-        gpu_ctx["pre_execution_fallback"] = {
-            "reason": "gpu_stream_host_ram_infeasible",
-            "gpu_streaming_tile": int(gpu_tile_size),
-            "gpu_streaming_host_peak_bytes": int(_gpu_host_peak),
-            "ram_budget_bytes": int(per_cell_budget),
-            "detail": str(_exc),
-        }
         ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
-        _plan = zpar.plan_cell_concurrency(
-            cell_bound_pairs, os.cpu_count(), per_cell_budget,
-            gpu_backend=False, cache_build_workers=cache_build_workers,
-        )
-    chosen_mode = _plan["mode"]
-    cells_in_flight = int(_plan["cells_in_flight"])
-    cache_workers_per_cell = int(_plan["cache_workers_per_cell"])
+
     _emit(
-        f"ZeGrid: joint plan — mode={chosen_mode} cells_in_flight={cells_in_flight} "
+        f"ZeGrid: joint plan (ADMITTED, final) — mode={chosen_mode} "
+        f"cells_in_flight={cells_in_flight} "
         f"cache_workers_per_cell={cache_workers_per_cell} "
         f"gpu_serialized={_plan['gpu_serialized']} — {_plan['chosen_reason']}",
         callback=progress_callback,
@@ -3597,80 +4282,34 @@ def _run_single(
             callback=progress_callback,
         )
 
-    # Build the final cell tasks with the CHOSEN uniform mode + its bound.
-    cell_tasks = []
-    for (cell, patch, mem, cache_dir, inmem_b, stream_b, gpu_stream_b) in cell_specs:
-        if inmem_b is None:
-            cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
-        elif chosen_mode == "inmem":
-            cell_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
-        else:
-            # On an EXECUTED GPU the stream bound is the GPU-tile host bound (F-M1).
-            bound_b = gpu_stream_b if (gpu_used and gpu_stream_b is not None) else stream_b
-            cell_tasks.append((cell, patch, mem, cache_dir, "stream", bound_b))
-
-    if gpu_used and gpu_streaming_host_peak_bytes is not None:
-        per_cell_footprint = int(gpu_streaming_host_peak_bytes)
-    else:
-        per_cell_footprint = max((t[5] for t in cell_tasks if t[4] is not None), default=0)
-
-    # ZM-ZEGRID-R36 (F-M2): when the GPU is the primary plan, ALSO compute a real
-    # CPU fallback plan at the CURRENT per-cell budget (independent of the GPU
-    # plan). A GPU runtime failure then reruns EXACTLY that CPU plan (mode, tasks,
-    # bounds, concurrency, cache workers) — never an unchecked CPU tile. If NO CPU
-    # mode fits the current budget the GPU may still run if its OWN mode fits, but
-    # a GPU runtime failure must FAIL LOUD before any CPU attempt (no over-budget
-    # rerun). The layout-selected `cpu_streaming_tile` is re-validated here.
-    cpu_fallback_info = {
-        "applicable": False, "feasible": False, "mode": None,
-        "max_bound_bytes": None, "ram_budget_bytes": int(per_cell_budget),
-        "tile": int(cpu_streaming_tile), "cells_in_flight": None,
-        "cache_workers_per_cell": None, "reason": None, "used": False,
-    }
-    cpu_fallback_plan = None
-    cpu_fallback_tasks = None
-    if gpu_used:
-        cpu_fallback_info["applicable"] = True
-        try:
-            cpu_fallback_plan = zpar.plan_cell_concurrency(
-                cell_bound_pairs, os.cpu_count(), per_cell_budget,
-                gpu_backend=False, cache_build_workers=cache_build_workers,
-            )
-        except zpar.ModeInfeasible as _fexc:
-            cpu_fallback_plan = None
-            cpu_fallback_info["feasible"] = False
-            cpu_fallback_info["reason"] = str(_fexc)
-        else:
-            fb_mode = cpu_fallback_plan["mode"]
-            cpu_fallback_tasks = []
-            for (cell, patch, mem, cache_dir, inmem_b, stream_b, gpu_stream_b) in cell_specs:
-                if inmem_b is None:
-                    cpu_fallback_tasks.append((cell, patch, mem, cache_dir, None, 0))
-                elif fb_mode == "inmem":
-                    cpu_fallback_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
-                else:
-                    cpu_fallback_tasks.append((cell, patch, mem, cache_dir, "stream", stream_b))
-            fb_bound = max(
-                (c["max_bound_bytes"] for c in cpu_fallback_plan["candidates"]
-                 if c["mode"] == fb_mode),
-                default=0,
-            )
-            cpu_fallback_info.update({
-                "feasible": True, "mode": fb_mode, "max_bound_bytes": int(fb_bound),
-                "cells_in_flight": int(cpu_fallback_plan["cells_in_flight"]),
-                "cache_workers_per_cell": int(cpu_fallback_plan["cache_workers_per_cell"]),
-                "reason": cpu_fallback_plan.get("chosen_reason"),
-            })
+    # Per-cell bounds of the FINAL bundle (the values the workers really use).
+    for (_row, _col, _cell, _patch, _mem), _spec in zip(cell_ctxs, _final.cell_specs):
+        _inmem_b, _stream_b, _gpu_b = _spec[4], _spec[5], _spec[6]
+        if _inmem_b is None:
+            continue
+        _idx = int(_row) * nx + int(_col)
+        _n = len(_mem.patch_ids)
+        _area = _patch.patch.width * _patch.patch.height
         _emit(
-            f"ZeGrid: CPU fallback plan — feasible={cpu_fallback_info['feasible']} "
-            f"mode={cpu_fallback_info['mode']} "
-            f"max_bound={(cpu_fallback_info['max_bound_bytes'] or 0) / 2**20:.1f} MiB "
-            f"budget={per_cell_budget / 2**20:.1f} MiB tile={cpu_streaming_tile} "
-            f"cells_in_flight={cpu_fallback_info['cells_in_flight']} "
-            f"reason={cpu_fallback_info['reason']}",
+            f"ZeGrid: cell {_cell.cell_id} ({_idx + 1}/{total_cells}) N={_n} area={_area}px "
+            f"inmem={_inmem_b / 2**20:.1f}MiB "
+            f"stream(cpu{cpu_streaming_tile})={_stream_b / 2**20:.1f}MiB"
+            + (
+                f" stream(gpu{gpu_tile_size})={_gpu_b / 2**20:.1f}MiB"
+                if _gpu_b is not None else ""
+            ),
             callback=progress_callback,
         )
 
+    _emit(
+        f"ZeGrid: CPU fallback plan — feasible={cpu_fallback_info['feasible']} "
+        f"mode={cpu_fallback_info['mode']} "
+        f"max_bound={(cpu_fallback_info['max_bound_bytes'] or 0) / 2**20:.1f} MiB "
+        f"budget={per_cell_budget / 2**20:.1f} MiB tile={cpu_streaming_tile} "
+        f"cells_in_flight={cpu_fallback_info['cells_in_flight']} "
+        f"reason={cpu_fallback_info['reason']}",
+        callback=progress_callback,
+    )
     _emit(
         f"ZeGrid: stack tiles — CPU streaming tile={cpu_streaming_tile} "
         f"(selected={_cs_selected}, preferred={CPU_STREAMING_TILE_PREFERRED}, "
@@ -3679,13 +4318,28 @@ def _run_single(
         f"backend={science_config.backend}",
         callback=progress_callback,
     )
-
     _emit(
         f"ZeGrid: per-cell concurrency — cells_in_flight={cells_in_flight} "
-        f"(cpu={os.cpu_count()}, avail={available_now / 2**30:.2f}GiB, "
-        f"budget={per_cell_budget / 2**30:.2f}GiB, "
+        f"(cpu={os.cpu_count()}, plan_raw={available_now / 2**30:.2f}GiB, "
+        f"B_plan={per_cell_budget / 2**30:.2f}GiB, "
         f"footprint={per_cell_footprint / 2**20:.0f}MiB, "
         f"cache_build_workers={cache_build_workers})",
+        callback=progress_callback,
+    )
+    _emit(
+        f"ZeGrid: RAM contract — plan raw {_final.envelope.raw_available_bytes / 2**20:.1f} MiB "
+        f"-> B_plan {_final.envelope.budget_bytes / 2**20:.1f} MiB "
+        f"({rcontract.PLAN_FACTOR_NUM}/{rcontract.PLAN_FACTOR_DEN}); "
+        f"admit raw {_adm.final_observation.raw_available_bytes / 2**20:.1f} MiB "
+        f"-> B_admit {_adm.final_observation.budget_bytes / 2**20:.1f} MiB "
+        f"({rcontract.ADMIT_FACTOR_NUM}/{rcontract.ADMIT_FACTOR_DEN}); "
+        f"aggregate {_final.envelope.aggregate_bytes / 2**20:.1f} MiB "
+        f"(shared {_final.envelope.shared_bytes / 2**20:.1f} MiB + stack "
+        f"{_final.envelope.stack_total_bytes / 2**20:.1f} / cache "
+        f"{_final.envelope.cache_total_bytes / 2**20:.1f}); "
+        f"replans={_adm.replans} tolerance={_adm.tolerance}; "
+        f"layout {_initial_bundle.envelope.layout[0]}x{_initial_bundle.envelope.layout[1]} "
+        f"-> {_final.envelope.layout[0]}x{_final.envelope.layout[1]}",
         callback=progress_callback,
     )
 
@@ -3712,6 +4366,9 @@ def _run_single(
         "cpu_streaming": dict(cpu_streaming),
         "cpu_fallback_used": False,
         "cpu_fallback_plan": dict(cpu_fallback_info),
+        # ZM-ZEGRID-R41-B: the full 80 %-plan / 90 %-admit contract trail.
+        "ram_contract": _ram_contract_diagnostics(_adm, _final, _initial_bundle),
+        "requested_cell_gauge_mode": requested_cell_gauge_mode,
     }
     per_cell_meta = {}
 
@@ -3786,36 +4443,25 @@ def _run_single(
             )
         except Exception as exc:
             if zgpu.is_gpu_runtime_error(exc):
-                if not cpu_fallback_info["feasible"]:
-                    # F-M2: NO CPU mode fits the CURRENT per-cell budget -> refuse an
-                    # over-budget CPU rerun and fail LOUD before any CPU attempt.
-                    _emit(
-                        f"ZeGrid: GPU RUNTIME failure ({type(exc).__name__}) and NO CPU "
-                        f"fallback mode fits the current per-cell budget "
-                        f"{per_cell_budget / 2**20:.1f} MiB — refusing an over-budget CPU "
-                        f"rerun (loud failure): {exc}",
-                        lvl="ERROR", callback=progress_callback,
-                    )
-                    raise zpar.ModeInfeasible(
-                        "GPU runtime failure and no CPU fallback mode fits the current "
-                        f"per-cell RAM budget {per_cell_budget / 2**20:.1f} MiB "
-                        f"({cpu_fallback_info['reason']}); refusing an over-budget CPU rerun"
-                    ) from exc
-                # H1: classified GPU runtime failure -> one-shot CPU whole-batch
-                # rerun HONORING the validated CPU fallback plan (F-M2).
+                # H1 / R36 F-M2 / R41-B: classified GPU runtime failure -> ONE
+                # bounded, FULLY re-planned CPU admission cycle on the SAME final
+                # geometry (a mosaic whose scientific cells may already have been
+                # stacked is NEVER re-sliced), under a FRESH 80 % raw observation
+                # and admitted against a FRESH 90 % observation. No stale CPU
+                # budget is reused and no unchecked CPU rerun is possible.
                 runtime_gpu_fallback = {"reason": repr(exc), "type": type(exc).__name__}
                 _emit(
-                    f"ZeGrid: GPU RUNTIME failure ({type(exc).__name__}); "
-                    f"degrading to the validated CPU fallback plan "
-                    f"(mode={cpu_fallback_info['mode']}, "
-                    f"cells_in_flight={cpu_fallback_info['cells_in_flight']}, "
-                    f"tile={cpu_streaming_tile}) — no silent fallback: {exc}",
+                    f"ZeGrid: GPU RUNTIME failure ({type(exc).__name__}); the failed "
+                    "worker pool is no longer active (pmap closed it before re-raising) "
+                    "and partial per-cell caches are removed BEFORE re-measuring RAM — "
+                    f"no silent fallback: {exc}",
                     lvl="WARN", callback=progress_callback,
                 )
                 gpu_used = False
                 science_config = replace(science_config, backend="cpu")
                 gpu_ctx = dict(gpu_ctx)
                 gpu_ctx["effective"] = False
+                gpu_ctx["attempted"] = False
                 gpu_ctx["final_effective"] = False
                 gpu_ctx["actually_used"] = False
                 gpu_ctx["final_backend"] = "cpu"
@@ -3827,24 +4473,116 @@ def _run_single(
                 for _t in cell_tasks:
                     if _t[4] is not None:
                         _safe_rmtree(_t[3], None)
-                # Rerun the WHOLE batch exactly once on CPU, HONORING the validated
-                # CPU fallback plan (mode/tasks/concurrency/cache workers) with the
-                # selected CPU streaming tile (never a re-coded 128 / GPU tile).
+
+                _fix_rank = int(_final.envelope.refinement_rank)
+                # R41-B (rework-1): EXACT geometry. A same-cell-count rank is NOT
+                # proof of the same (nx, ny); pin the final admitted tuple so every
+                # fallback build keeps the same nx/ny, memberships and cell IDs.
+                _fix_layout = tuple(int(v) for v in _final.envelope.layout)
+                _fb_raw = int(available_memory_bytes())
+                try:
+                    _fb_budget = int(rcontract.plan_budget_bytes(_fb_raw))
+                except rcontract.InvalidObservation as _fb_exc:
+                    raise zpar.ModeInfeasible(
+                        "GPU runtime failure and the fresh RAM observation is "
+                        f"nonpositive/unusable ({_fb_exc}); refusing any CPU rerun"
+                    ) from exc
+                _emit(
+                    f"ZeGrid: rebuilding an exact-CPU fallback bundle on the SAME "
+                    f"{_final.envelope.layout[0]}x{_final.envelope.layout[1]} geometry "
+                    f"under a FRESH plan budget {_fb_budget / 2**20:.1f} MiB "
+                    f"(raw {_fb_raw / 2**20:.1f} MiB)",
+                    lvl="WARN", callback=progress_callback,
+                )
+                try:
+                    _fb_seed = _build_execution_bundle(
+                        canvas, descs, footprints,
+                        raw_available_bytes=_fb_raw, budget_bytes=_fb_budget,
+                        pinned_layout=_fix_layout,
+                        min_refinement_rank=_fix_rank,
+                        max_refinement_rank=_fix_rank,
+                        layout_substep=None,
+                        **{**_bundle_common, "gpu_used": False},
+                    )
+                    _fb_adm, _fb_final = _admit(
+                        _fb_seed, fix_rank=_fix_rank, backend_gpu=False,
+                        pinned_override=_fix_layout,
+                    )
+                except (zal.LayoutInfeasible, zpar.ModeInfeasible) as _fb_exc:
+                    _emit(
+                        "ZeGrid: GPU runtime failure and NO exact-CPU bundle fits the "
+                        f"fresh RAM budget on the SAME geometry — refusing an "
+                        f"over-budget CPU rerun (loud failure): {_fb_exc}",
+                        lvl="ERROR", callback=progress_callback,
+                    )
+                    raise zpar.ModeInfeasible(
+                        "GPU runtime failure and no exact-CPU bundle fits the fresh RAM "
+                        f"budget on the same geometry ({_fb_exc}); refusing an "
+                        "over-budget CPU rerun"
+                    ) from exc
+                except rcontract.AdmissionExhausted as _fb_exc:
+                    _emit(
+                        "ZeGrid: GPU runtime failure and the exact-CPU bundle could not "
+                        f"be admitted under a fresh 90 % ceiling — refusing an "
+                        f"over-budget CPU rerun (loud failure): {_fb_exc}",
+                        lvl="ERROR", callback=progress_callback,
+                    )
+                    raise zpar.ModeInfeasible(
+                        "GPU runtime failure and the exact-CPU bundle could not be "
+                        f"admitted under a fresh RAM ceiling ({_fb_exc})"
+                    ) from exc
+                # Adopt the freshly admitted CPU bundle as the ONLY source of truth.
+                _gpu_attempt_contract = dict(_ram_contract_diagnostics(
+                    _adm, _final, _initial_bundle
+                ))
+                _final = _fb_final
+                _adm = _fb_adm
+                cell_specs = _final.cell_specs
+                cell_tasks = _final.cell_tasks
+                cpu_streaming = _final.cpu_streaming
+                cpu_streaming_tile = int(_final.cpu_streaming_tile)
+                chosen_mode = _final.chosen_mode
+                cells_in_flight = int(_final.cells_in_flight)
+                cache_workers_per_cell = int(_final.cache_workers_per_cell)
+                per_cell_footprint = int(_final.per_cell_footprint)
+                # Provenance: KEEP the ATTEMPTED GPU tile/bound (what the GPU really
+                # tried) — the CPU rerun has its own tile below.
+                cpu_fallback_plan = _final.cpu_fallback_plan
+                cpu_fallback_tasks = _final.cpu_fallback_tasks
+                cache_build_workers = int(_final.cache_build_workers)
+                cpu_fallback_info = dict(_final.cpu_fallback_info)
                 cpu_fallback_info["used"] = True
-                chosen_mode = cpu_fallback_info["mode"]
-                cells_in_flight = int(cpu_fallback_info["cells_in_flight"] or 1)
-                cache_workers_per_cell = int(cpu_fallback_info["cache_workers_per_cell"] or 1)
+                cpu_fallback_info["runtime_refresh"] = True
                 per_cell_diagnostics["mode"] = chosen_mode
                 per_cell_diagnostics["cells_in_flight"] = cells_in_flight
                 per_cell_diagnostics["cache_workers_per_cell"] = cache_workers_per_cell
+                per_cell_diagnostics["cpu_streaming_tile"] = int(cpu_streaming_tile)
                 per_cell_diagnostics["cpu_fallback_used"] = True
-                if isinstance(per_cell_diagnostics.get("cpu_fallback_plan"), dict):
-                    per_cell_diagnostics["cpu_fallback_plan"]["used"] = True
+                per_cell_diagnostics["cpu_fallback_plan"] = dict(cpu_fallback_info)
+                per_cell_diagnostics["cpu_streaming"] = dict(cpu_streaming)
+                per_cell_diagnostics["ram_contract"] = _ram_contract_diagnostics(
+                    _adm, _final, _initial_bundle
+                )
+                # The GPU attempt's own contract history is retained SEPARATELY so a
+                # runtime fallback never overwrites the only recorded evidence.
+                per_cell_diagnostics["gpu_attempt_ram_contract"] = _gpu_attempt_contract
+                per_cell_diagnostics["runtime_cpu_fallback_contract"] = (
+                    _ram_contract_diagnostics(_adm, _final, _fb_seed)
+                )
+                _emit(
+                    f"ZeGrid: exact-CPU fallback ADMITTED on the same geometry — "
+                    f"mode={chosen_mode} cells_in_flight={cells_in_flight} "
+                    f"tile={cpu_streaming_tile} replans={_adm.replans} "
+                    f"tolerance={_adm.tolerance}",
+                    lvl="WARN", callback=progress_callback,
+                )
                 results, per_cell_meta = _run_cell_batch(
                     science_config, cpu_streaming_tile, gpu_attempt=False,
-                    tasks=cpu_fallback_tasks, workers=cells_in_flight,
+                    tasks=cell_tasks, workers=cells_in_flight,
                     cache_workers=cache_workers_per_cell,
                 )
+                task_cids = [t[0].cell_id for t in cell_tasks]
+                per_cell_diagnostics["cells"] = int(len(cell_tasks))
             else:
                 raise  # arbitrary science/programming error propagates (never swallowed)
     else:
@@ -4775,6 +5513,13 @@ def _write_outputs(
         ),
         "gauge_diagnostics": (gauge_diagnostics or {}),
         "per_cell_diagnostics": (per_cell_diagnostics or {}),
+        # ZM-ZEGRID-R41-B: the 80 %-plan / 90 %-admit host-RAM contract trail is
+        # ALSO published at TOP LEVEL (the per_cell_diagnostics copy is retained
+        # for backward compatibility).
+        "ram_contract": (
+            (per_cell_diagnostics or {}).get("ram_contract")
+            if isinstance(per_cell_diagnostics, dict) else None
+        ),
         # ZM-ZEGRID-R36: the RAM-adaptive CPU streaming-tile decision (clear,
         # auditable block; on a comfortable machine selected_tile_size=128 with an
         # explicit reason). NEVER a bare ``tile_size``.

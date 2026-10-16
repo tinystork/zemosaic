@@ -206,3 +206,33 @@ amendement 80 % planning / 90 % admission approuvé par Tristan. Les nouveaux ca
 Non réalisé : patch produit, tests de correctif, commit/push, nouveau run Windows.
 Prochaine action : implémenter Lots 1-3 comme un correctif de planning borné,
 puis revue et validation courte. Aucun nouveau run utilisateur demandé à ce stade.
+
+## 6. État d'implémentation (ZM-ZEGRID-R41-B, 2026-10-16)
+
+Implémenté (non commité — Coco ne commit pas) :
+
+- `ram_contract` branché dans le chemin produit réel (`zemosaic_zegrid_mode`) :
+  observation BRUTE au démarrage, `B_plan = plan_budget_bytes(raw)`, refus si
+  non positive ; construction du bundle COMPLET exécutable sous `B_plan` AVANT la
+  jauge (layout, memberships, échelle complète des blocs CPU, tuile GPU réelle,
+  bornes par cellule, agrégat simultané partagé/cache, enveloppe validée) ;
+  admission `AdmissionController(max_replans=2)` juste avant les workers avec
+  mesures brutes fraîches et closure d'enregistrement (le rebuild reçoit le raw
+  exact, jamais `0.9 * B_plan`) ; le bundle FINAL admis est la seule source des
+  tâches/executor/diagnostics/log/manifeste — l'ancien second plan indépendant et
+  `per_cell_budget = 0.8 * available_now` sont supprimés.
+- Replanification bornée : concurrence d'abord, échelle CPU complète, tuile
+  GPU effectivement choisie, épinglé = même `nx/ny` uniquement, auto = même
+  géométrie ou plus FINE, jamais plus grossière ; pas de relayout après travail.
+- Refus quantitatifs orientés FINER ; réserve partagée non plafonnée comptée une
+  fois (`_PER_WORKER_BASELINE_BYTES`) ; empreinte cache dérivée du pire patch réel.
+- `tools/r37_capture_runner.preflight` : raw + `B_plan` explicites, faisabilité
+  jointe via le MÊME seam produit (`_build_execution_bundle`), rapport des
+  facteurs totaux de phase.
+- Tests : nouveau `tests/test_zegrid_r41b_product_wiring.py` (13 cas) + scellés
+  R36 neutralisés (réserve partagée / seam série) là où les sentinelles
+  d'octets perdaient leur sens.
+
+Non terminé à ce stade : 3 cas du fichier de tests R41-B restent rouges
+(conflit d'épinglage dans le corpus synthétique, harnais préflight), et la
+campagne de non-régression complète n'a pas été rejouée. Aucun commit/push.
