@@ -404,6 +404,33 @@ def test_t3_and_t5_are_context_only(capture):
 
 
 # ---------------------------------------------------------------------------
+# 5b. L1 / L2 — explicit T1 scope label + co-existing lower state
+# ---------------------------------------------------------------------------
+
+def test_t1_scope_label_is_support_conditioning_only(capture):
+    analysis = r40c.analyse_capture(capture["root"], n_boot=100, seed=0)
+    t1 = analysis["tests"]["T1"]
+    scope = t1["scope"]
+    assert scope["label"] == "SUPPORT_CONDITIONING_ONLY"
+    assert scope["m4_validity_contrast"] == "DEGENERATE_EMPTY"
+    assert scope["m4_validity_discordant_pairs"] == 0
+    assert scope["tests_observable"] == "M7 n_eff_support"
+    assert "CANNOT test the M4 validity hypothesis" in scope["statement"]
+    # the label must never change the outcome
+    assert t1["state"] == r40c.STATE_DETECTED_ASSOCIATION
+
+
+def test_stop_surfaces_coexisting_lower_association_only(capture):
+    analysis = r40c.analyse_capture(capture["root"], n_boot=100, seed=0)
+    stop = analysis["stop"]
+    assert stop["stop"] == r40c.STOP_NUISANCE_LINKED
+    assert stop["association_present"] is True
+    assert stop["coexisting_lower_states"] == [r40c.STOP_ASSOCIATION_ONLY]
+    assert any(r40c.STOP_ASSOCIATION_ONLY in r for r in stop["reasons"])
+    assert "NOT mean 'no association'" in stop["read_as"]
+
+
+# ---------------------------------------------------------------------------
 # 6. CLI / report writing
 # ---------------------------------------------------------------------------
 
@@ -419,6 +446,9 @@ def test_cli_writes_strict_json_report(capture, tmp_path, capsys):
     assert payload["scientific_acceptance"] is False
     assert payload["correction_applied"] is False
     assert payload["stop_outcome"] == r40c.STOP_NUISANCE_LINKED
+    assert payload["t1_scope"]["label"] == "SUPPORT_CONDITIONING_ONLY"
+    assert payload["stop"]["coexisting_lower_states"] == [r40c.STOP_ASSOCIATION_ONLY]
+    assert payload["content_sha256"] == r40c.report_content_sha256(payload)
     text = out.read_text(encoding="utf-8")
     assert "NaN" not in text and "Infinity" not in text
     stdout = capsys.readouterr().out.strip().splitlines()[-1]
@@ -444,6 +474,35 @@ def test_report_has_no_absolute_private_path(capture, tmp_path):
     assert str(capture["root"]) not in text
     leaks = r40c._load_r39a().scan_path_leaks(json.loads(text))
     assert leaks == []
+
+
+def test_content_sha256_is_stable_and_runtime_excluded(capture, tmp_path):
+    out1 = tmp_path / "r1.json"
+    out2 = tmp_path / "r2.json"
+    for out in (out1, out2):
+        assert r40c.main(["--capture-root", str(capture["root"]), "--out", str(out),
+                          "--bootstrap-b", "50"]) == 0
+    r1 = json.loads(out1.read_text(encoding="utf-8"))
+    r2 = json.loads(out2.read_text(encoding="utf-8"))
+    # the stable content identity is identical across runs
+    assert r1["content_sha256"] == r2["content_sha256"]
+    assert len(r1["content_sha256"]) == 64
+    # the ONLY allowed run-to-run difference is the informational /runtime block
+    strip = lambda d: {k: v for k, v in d.items() if k != "runtime"}
+    assert strip(r1) == strip(r2)
+    assert r1["runtime"]["excluded_from_content_identity"] is True
+    assert r1["content_identity"]["excludes"] == ["runtime", "content_sha256"]
+    # self-consistent digest, and /runtime never enters it
+    assert r40c.report_content_sha256(r1) == r1["content_sha256"]
+    mutated = json.loads(json.dumps(r1))
+    runtime = dict(mutated["runtime"])
+    runtime["seconds"] = (runtime["seconds"] or 0.0) + 123.0
+    mutated["runtime"] = runtime
+    assert r40c.report_content_sha256(mutated) == r1["content_sha256"]
+    # ANY scientific change changes the content identity
+    tampered = json.loads(json.dumps(r1))
+    tampered["stop_outcome"] = "NO_EFFECT"
+    assert r40c.report_content_sha256(tampered) != r1["content_sha256"]
 
 
 # ---------------------------------------------------------------------------

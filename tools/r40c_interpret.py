@@ -46,6 +46,25 @@ frozen aggregation rule or a frozen STOP outcome.
 * **T4 is not fabricated.** The capture artifact is the *core association* capture
   (M1–M11). It carries **no** §5 same-input-intervention evidence, so T4 is reported
   ``NOT_AVAILABLE`` / H4 ``NOT_IDENTIFIABLE`` — never proxied, never faked.
+* **L1 — T1 scope label (explicit).** On this capture T1 is a **SUPPORT-conditioning** test
+  only: every captured sample is ``valid_u ∧ valid_v`` (the capture seam samples only the
+  shared-valid band), so the M4 valid-mask contrast is **degenerate/empty** (0 discordant
+  pairs) and T1 tests the **M7 ``n_eff_support``** hypothesis and **cannot** test the M4
+  validity hypothesis here. The durable report states this explicitly
+  (``tests.T1.scope`` + a report-level ``t1_scope``). No scientific outcome changes.
+* **L2 — co-existing lower state.** When the STOP is ``NUISANCE_LINKED`` the stop block also
+  surfaces that the lower ``ASSOCIATION_ONLY`` state **also holds**
+  (``coexisting_lower_states``), so the classification is not misread as "no association".
+* **L3 — stable content identity.** The durable report carries a ``content_sha256`` computed
+  over the strict-JSON report with the informational ``/runtime`` block (and the
+  ``content_sha256`` field itself, to avoid self-reference) **excluded**, so the durable
+  interpretation has a run-to-run **stable identity** while the file sha256 may differ on
+  ``/runtime`` alone. ``/runtime`` is kept for information and **never** enters the content
+  identity.
+* **L4 — frozen STOP precedence.** The §9 precedence ``IDENTITY_MISMATCH →
+  EVIDENCE_UNAVAILABLE → INCOMPLETE_PANEL → UNSUPPORTED_CONFOUNDER → NUISANCE_LINKED →
+  ASSOCIATION_ONLY → NO_EFFECT`` was a documented interpretation decision and is now
+  **FROZEN** in the plan (§9 / §15.17). It changes **no** §6.4/§15.5 threshold.
 * **DRY.** Relation-first aggregation, leak-free whole-block resampling, strict-JSON,
   the path-privacy boundary and the post-offset difference maths are **reused** from the
   accepted ``tools/r39a_spatial_residual.py`` (loaded by path); no pixel or difference
@@ -59,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import importlib.util
 import json
 import math
@@ -121,6 +141,10 @@ MANIFEST_BLOCK_FIELDS = ("capture_id", "filename", "sha256", "bytes")
 REPORT_DIR_DEFAULT = Path(
     "/home/tristan/.openclaw/workspace/.a2a-reports/ZM-ZEGRID-R40-C-INTERPRET"
 )
+
+# L3 — the informational /runtime block and the content digest field itself are excluded
+# from the STABLE content identity (no self-reference, no wall-timing dependence).
+CONTENT_IDENTITY_EXCLUDES = ("runtime", "content_sha256")
 
 # Ladder / STOP vocabulary (frozen §4.3 / §9).
 STATE_NOT_IDENTIFIABLE = "NOT_IDENTIFIABLE"
@@ -755,6 +779,39 @@ def _t1_support(sample: Mapping, *, n_boot: int, seed: int) -> dict:
     }
 
 
+def _t1_scope(t1_test: Mapping) -> dict:
+    """L1 — explicit T1 scope label for THIS capture (support-conditioning only).
+
+    The R40-C capture seam samples only the shared-valid band, so every captured sample is
+    ``valid_u ∧ valid_v`` and the M4 valid-mask contrast is empty (0 discordant pairs).
+    T1 therefore tests ONLY the M7 ``n_eff_support`` hypothesis and **cannot** test the M4
+    validity hypothesis here. This is a structural consequence of the frozen capture
+    contract; it is labelled, never hidden, and changes no outcome, threshold or gate.
+    """
+    detail = t1_test.get("detail") or {}
+    discordant = int(detail.get("validity_discordant_total", 0))
+    applicable = int(detail.get("validity_applicable_relations", 0))
+    degenerate = bool(discordant == 0 and applicable == 0)
+    return {
+        "label": "SUPPORT_CONDITIONING_ONLY",
+        "statement": (
+            "On THIS capture T1 is a SUPPORT-conditioning test ONLY: every captured sample "
+            "is valid_u AND valid_v, so the M4 valid-mask contrast is degenerate/empty "
+            "(0 discordant pairs). T1 tests the M7 n_eff_support hypothesis and CANNOT "
+            "test the M4 validity hypothesis here."
+        ),
+        "m4_validity_contrast": "DEGENERATE_EMPTY" if degenerate else "AVAILABLE",
+        "m4_validity_discordant_pairs": discordant,
+        "m4_validity_applicable_relations": applicable,
+        "tests_observable": "M7 n_eff_support",
+        "cannot_test_observable": "M4 valid-mask discordance (structurally absent here)",
+        "structural_reason": (
+            "the capture seam samples only the shared-valid band (valid_u AND valid_v), "
+            "so no discordant pair can be captured by construction"
+        ),
+    }
+
+
 def _t2_weight_depth(sample: Mapping, *, n_boot: int, seed: int) -> dict:
     """T2 (H2) estimator-weight/survivor stratification on M3/M5/M6.
 
@@ -903,6 +960,7 @@ def analyse_capture(capture_root: Path, *, n_boot: int = BOOTSTRAP_B, seed: int 
                              int(sum(r["detail"]["validity_discordant_samples"] for r in t1_ch)),
                              "validity_applicable_relations":
                              int(sum(1 for r in t1_ch if r["detail"]["validity_applicable"]))}
+    tests["T1"]["scope"] = _t1_scope(tests["T1"])
 
     # T2
     for axis in ("weight_within_same_depth", "depth_within_same_weight_class"):
@@ -1003,12 +1061,20 @@ def _stop_outcome(tests: Mapping, panel: Mapping) -> dict:
     if nuisance_families:
         reasons.append("relation-first associations detected with support/weight/depth nuisances")
         reasons.append("observational linkage only: no identity-proven same-input intervention (T4) exists")
+        reasons.append(
+            "the co-existing lower state ASSOCIATION_ONLY ALSO holds: the surviving relations "
+            "are observational-only (association without an identity-proven same-input "
+            "intervention), so this STOP does NOT mean 'no association'")
         return {"stop": STOP_NUISANCE_LINKED, "reasons": reasons,
                 "nuisance_families": nuisance_families,
                 "association_families": association_families,
                 "observational_states": observational,
                 "observational_only": True,
                 "causal_attribution": False,
+                "association_present": True,
+                "coexisting_lower_states": [STOP_ASSOCIATION_ONLY],
+                "read_as": ("NUISANCE_LINKED does NOT mean 'no association': the lower "
+                            "ASSOCIATION_ONLY state also holds"),
                 "precedence_note": ("NUISANCE_LINKED takes precedence over ASSOCIATION_ONLY when the "
                                     "surviving relation-first association is with a nuisance "
                                     "covariate family (support/weight/depth); both block any "
@@ -1029,6 +1095,35 @@ def _stop_outcome(tests: Mapping, panel: Mapping) -> dict:
 # ---------------------------------------------------------------------------
 # Report building / writing
 # ---------------------------------------------------------------------------
+
+def report_content_sha256(report: Mapping) -> str:
+    """L3 — STABLE content identity of the durable report.
+
+    ``sha256`` over the strict-JSON canonicalisation of the report with the informational
+    ``/runtime`` block EXCLUDED (and the ``content_sha256`` field itself, to avoid
+    self-reference). Any scientific / identity / criterion change changes the digest;
+    wall-timing (``seconds``, ``peak_rss_kib``) never does.
+    """
+    payload = {k: v for k, v in report.items() if k not in CONTENT_IDENTITY_EXCLUDES}
+    return hashlib.sha256(dumps_strict(payload).encode("utf-8")).hexdigest()
+
+
+def attach_content_identity(report: dict) -> dict:
+    """Attach the L3 content-identity descriptor + the stable ``content_sha256``.
+
+    MUST be called AFTER the privacy boundary has finalised every durable value, so the
+    digest is taken over exactly what is written.
+    """
+    report["content_identity"] = {
+        "algorithm": "sha256",
+        "canonicalisation": "strict-json (sort_keys, allow_nan=False, indent=2, ascii)",
+        "excludes": list(CONTENT_IDENTITY_EXCLUDES),
+        "note": ("the runtime block is informational only and NEVER enters the content "
+                 "identity; the content_sha256 field is excluded to avoid self-reference"),
+    }
+    report["content_sha256"] = report_content_sha256(report)
+    return report
+
 
 def _ladder(analysis: Mapping) -> dict:
     tests = analysis["tests"]
@@ -1119,6 +1214,7 @@ def build_report(analysis: Mapping, *, n_boot: int, seed: int, t_start: float,
         "stop": analysis["stop"],
         "stop_outcome": analysis["stop"]["stop"],
         "ladder": _ladder(analysis),
+        "t1_scope": _t1_scope(analysis["tests"]["T1"]),
         "tests": {name: tests for name, tests in analysis["tests"].items()},
         "causal_attribution_state": analysis["stop"]["stop"],
         "component_checks": {
@@ -1134,6 +1230,8 @@ def build_report(analysis: Mapping, *, n_boot: int, seed: int, t_start: float,
             "seed": int(seed),
             "peak_rss_kib": _peak_rss_kib(),
             "privacy_policy_mode": policy.get("mode"),
+            "informational": True,
+            "excluded_from_content_identity": True,
         },
         "import_audit": import_audit(),
     }
@@ -1225,6 +1323,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if leaks:  # pragma: no cover - defensive
         safe = r39.minimal_failure_record(stage="privacy", leak_locations=leaks)
         safe["status"] = "FAILED"
+    # L3 — the stable content identity is taken AFTER the privacy boundary finalises values
+    safe = attach_content_identity(safe)
     try:
         write_report(out_path, safe, policy)
     except Exception as exc:
@@ -1232,7 +1332,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                           "reason": type(exc).__name__, "wrote_report": False}, sort_keys=True))
         return 1
     print(json.dumps({"status": str(safe.get("status")), "stop": safe.get("stop_outcome"),
-                      "wrote_report": True, "out_sha256": sha256_file(out_path)}, sort_keys=True))
+                      "wrote_report": True, "out_sha256": sha256_file(out_path),
+                      "content_sha256": safe.get("content_sha256")}, sort_keys=True))
     return 0
 
 

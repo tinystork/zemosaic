@@ -683,6 +683,13 @@ frozen requirement is **refused**, and the corresponding test returns `NOT_IDENT
 The M3 ULP/absolute tolerance, if needed, applies **only** to the M3 pre/post algebraic
 identity — never to the OFF/ON arrays/FITS.
 
+**Stop-precedence is frozen, and changes no threshold.** The §9 STOP precedence listing
+(`IDENTITY_MISMATCH → EVIDENCE_UNAVAILABLE → INCOMPLETE_PANEL → UNSUPPORTED_CONFOUNDER →
+NUISANCE_LINKED → ASSOCIATION_ONLY → NO_EFFECT`) is now a **FROZEN interpretation rule**
+(§9.1). It is an **ordering over the §9 outcomes only** and changes **no** number in the
+§6.4 table above — no threshold, no aggregation rule, no gate (the §8 clause-2 OFF/ON
+byte-identity gate stays exactly `0`).
+
 ### 6.5 Size / runtime estimate (ESTIMATE — from dimensions/counts, no pixels read)
 
 Record unit is `relation × channel × global-pixel` (§3). Sample count ≈
@@ -740,8 +747,8 @@ claim the whole product RAM is `O(records)`.
 | **R40-B2-A** | **Capture-core stage (bounded task A):** the reusable default-OFF capture data contract + the bounded atomic shard-generation core (frozen dtype/schema, sample identity, hard disk budget, path safety, privacy, fail-closed identity, stale/resume, manifest link, sparse payload/parent join) implemented and tested on **synthetic / in-memory fixtures only**, with **no** production seam wired. | **DONE** (`ZM-ZEGRID-R40-B2-A-SHARD-CORE`, §15.8) — the shard core alone does **NOT** accept B2 |
 | **R40-B2** | **Implementation + acceptance stage:** default-OFF diagnostic-capture implementation + synthetic qualification, **using the R40-B1-frozen criteria**, and **proving the exact OFF/ON byte-identity (zero tolerance, §8.2)**; prove bounded RAM/disk, fail-closed identity, stale invalidation and the **real product ROI parity**. | **Implementation AUTHORIZED** by the terminal B1 v2 ACCEPT; seam wiring is **DONE** (`ZM-ZEGRID-R40-B2-B`, §15.9) and the **real pooled worker→parent sparse transport is DONE** (`ZM-ZEGRID-R40-B2-C`, §15.10); the **zero-tolerance OFF/ON product byte-identity is now MEASURED on real synthetic end-to-end product runs** (`ZM-ZEGRID-R40-B2-D`, §15.11); at that point **acceptance was NOT achieved** — the 38-relation panel OFF/ON qualification, the injected-effect recovery re-proof, the real product ROI parity, the exact §1.3 held-out intersection and a real Windows run were still `NOT_RUN` (the first four were subsequently closed by tasks F/G/H, below). The **run-volatile-classifier completeness proven by measurement** is now a **frozen B2 acceptance criterion** (§8 clause 12); the synthetic 38-relation panel OFF/ON qualification is **MEASURED** (§15.12); the **exact §1.3 held-out intersection is now IMPLEMENTED and MEASURED** and the **injected-effect recovery is RE-PROVEN under the accepted frozen B1 v2 criteria snapshot** on fresh disposable fixtures, with BOTH the candidate-set and pair-set digests bound to the frozen rule (`ZM-ZEGRID-R40-B2-G`, §15.13) — and the **real product ROI parity (I1a/I1b/I2) is now PROVEN on the real product ROI path** under the frozen criteria on synthetic prepared-source fixtures (`ZM-ZEGRID-R40-B2-H`, §15.14) — and the **real Windows run** remains `NOT_RUN`; **R40-B2 is ACCEPTED by the product owner (Tristan) on 2026-10-15** on the basis of these §7 criteria, as **SYNTHETIC-ONLY** (no Windows/product causality claimed, no tolerance/threshold/gate changed) — §15.15 |
 | **HUMAN_GATE** | Explicit **Tristan** authorization of the exact commit, exact commands and a **fresh output path** on a **capable (Windows)** host. | **AUTHORIZED** (2026-10-15): ONE DEV Windows816 diagnostic capture on the EXACT commit `c7cccb5da048415e989f035ba880c49c4ffad94c` (the commit that **introduces the reviewed runner**; `222a624` is the pre-runner baseline and does **not** contain `tools/r40_capture_runner.py`), with the EXACT commands (dry-run + execute) and a FRESH output path on the Windows host (§15.15) |
-| **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | **AUTHORIZED now** (human gate granted 2026-10-15, §15.15); runnable via the reviewed `tools/r40_capture_runner.py` on the exact commit `c7cccb5`; offline interpretation only follows afterwards |
-| **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | NO — conditional |
+| **R40-C** | **One** exact Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`), then offline interpretation of the controlled tests under the R40-B1-frozen criteria. | **DONE / CLOSED** — the ONE authorized real capture was executed (bounded task K, §15.16) and interpreted offline; the terminal interpretation STOP is **`NUISANCE_LINKED`** (strictly below `CONTROLLED_EFFECT`), no correction/qualification authorized. R40-C closure/publication is recorded in §15.17. |
+| **R40-D** | Interpretation/decision **only if** an identity-proven same-input intervention yields `CONTROLLED_EFFECT` for exactly one mechanism. | **NOT_RUN** — the R40-C STOP is `NUISANCE_LINKED`, so the R40-D condition (identity-proven same-input intervention reaching `CONTROLLED_EFFECT`) is **NOT met**. No correction, qualification or product change is authorized. |
 
 **Staging rule (unambiguous).** R40-B is **split**: **R40-B1 must produce frozen criteria
 and a document revision BEFORE R40-B2 acceptance, and both must complete BEFORE any real
@@ -897,6 +904,29 @@ Each is terminal for the affected step and **must never silently become a correc
 `ASSOCIATION_ONLY` / `NUISANCE_LINKED` / `NO_EFFECT` all block any correction/qualification
 path; `EVIDENCE_UNAVAILABLE` / `UNSUPPORTED_CONFOUNDER` block the affected hypothesis and
 return `NOT_IDENTIFIABLE`. **None may silently become a correction.**
+
+### 9.1 FROZEN stop precedence (interpretation rule — frozen 2026-10-16)
+
+When more than one §9 STOP outcome is applicable, exactly **ONE** is returned, by this
+**FROZEN** precedence order (highest first):
+
+`IDENTITY_MISMATCH` → `EVIDENCE_UNAVAILABLE` → `INCOMPLETE_PANEL` → `UNSUPPORTED_CONFOUNDER`
+→ `NUISANCE_LINKED` → `ASSOCIATION_ONLY` → `NO_EFFECT`.
+
+- This order was previously a **documented interpretation decision** (recorded by the R40-C
+  offline interpretation and Nono review-0 §2.5 / LOW-L2) and is **now FROZEN as an
+  interpretation rule** — it is no longer re-litigated per capture.
+- `NUISANCE_LINKED` outranks `ASSOCIATION_ONLY` because the surviving relation-first
+  association is with a **nuisance covariate family** (support / weight / depth): the more
+  specific, more conservative label. Both are strictly below `CONTROLLED_EFFECT` and both
+  block any correction or qualification.
+- The lower state is **never suppressed**: when `NUISANCE_LINKED` is returned, the
+  co-existing `ASSOCIATION_ONLY` state is surfaced in the stop reasons and in an explicit
+  `coexisting_lower_states` field, so the classification is never read as
+  "no association".
+- **This rule changes NO threshold.** It is an ordering rule over the §9 outcomes only:
+  every §6.4 / §15.5-4 threshold, aggregation rule and gate is unchanged, and the §8
+  clause-2 OFF/ON byte-identity gate stays exactly `0`.
 
 ---
 
@@ -1348,6 +1378,26 @@ This section is a pointer, not a source of authority.
   Windows816 mechanism or prototype is established** (`DEV_NOT_QUALIFICATION`). **No B2/B1
   re-acceptance is claimed**; `LP341` remains reserved and **unconsumed**. Task K creates **no commit
   and no push** (Jarvis commits after review). See §15.16.
+
+- **rework-23 (R40-C hardening + closure/publication, bounded task L) — the R40 closure record:**
+  applies the four LOW hardenings from the accepted R40-C interpretation review (Nono review-0 on
+  `ZM-ZEGRID-R40-C-INTERPRET`: 0 HIGH / 0 MEDIUM / 4 LOW) **without changing any scientific
+  outcome, threshold, criterion or gate**. L1 labels T1 explicitly as a **SUPPORT-conditioning**
+  test only on this capture (the M4 valid-mask contrast is degenerate: every captured sample is
+  `valid_u ∧ valid_v`, 0 discordant pairs), so T1 tests the M7 `n_eff_support` hypothesis and
+  **cannot** test the M4 validity hypothesis here. L2 surfaces the co-existing lower
+  `ASSOCIATION_ONLY` state whenever the STOP is `NUISANCE_LINKED` (`coexisting_lower_states`), so
+  the classification is never read as "no association". L3 publishes a **stable** `content_sha256`
+  over the report with the informational `/runtime` block excluded (run-to-run identical, while the
+  file sha256 may differ on `/runtime` alone). L4 **FROZEN** the §9 STOP precedence
+  (`IDENTITY_MISMATCH → EVIDENCE_UNAVAILABLE → INCOMPLETE_PANEL → UNSUPPORTED_CONFOUNDER →
+  NUISANCE_LINKED → ASSOCIATION_ONLY → NO_EFFECT`) as an **interpretation rule** (§9.1) — previously
+  a documented decision, now frozen, and it changes **no** §6.4/§15.5 threshold. This revision also
+  records the **R40 closure** (§15.17): R40-C **DONE / CLOSED** at the terminal STOP
+  `NUISANCE_LINKED`, R40-D **NOT_RUN** (condition not met), no correction/qualification/product
+  change authorized, `LP341` reserved and unconsumed, no LP pixel read. **No threshold, criterion or
+  gate is changed** and the captured scientific outcomes / STOP are **identical** to §15.16. Task L
+  creates **no commit and no push** (Jarvis commits and publishes after review). See §15.17.
 
 Any further normative change before the first real R40-C outcome must be recorded directly
 in the frozen sections above **and** logged here, with the explicit note that it happened
@@ -2259,3 +2309,69 @@ FITS** was read.
 capture artifact, does not read/invoke the CONSUMED B1 v2 cohort, does not run `validate`, and
 creates **no commit and no push** (Jarvis commits after review). No tolerance, threshold or gate was
 changed (the §8 clause-2 OFF/ON byte-identity gate stays exactly `0`).
+
+### 15.17 R40 closure record — R40-C DONE/CLOSED, R40-D NOT_RUN (bounded task L)
+
+**Mission** `ZM-ZEGRID-R40-C-HARDEN-CLOSEOUT` · **phase** `implementation` · **branch** `beta` ·
+**baseline HEAD** `0ea851d9f6e150e227bcb1546818092a7b7f8895` · **commit created** `NO` · **push** `NO`.
+
+**L — the four LOW hardenings applied (Nono review-0 on `ZM-ZEGRID-R40-C-INTERPRET`, 0 HIGH /
+0 MEDIUM / 4 LOW).** All four are **labels / report-identity / plan-record only**: they change **no
+scientific outcome, threshold, criterion, aggregation rule or gate**.
+
+| ID | Hardening | Where |
+|---|---|---|
+| **L1** | Explicit **T1 scope label**: on THIS capture T1 is a **SUPPORT-conditioning test only** — the M4 valid-mask contrast is **degenerate** (every captured sample is `valid_u ∧ valid_v`; **0 discordant pairs**), so T1 tests the **M7 `n_eff_support`** hypothesis and **CANNOT** test the M4 validity hypothesis here | durable report `tests.T1.scope` + report-level `t1_scope` (`label = SUPPORT_CONDITIONING_ONLY`) |
+| **L2** | When the STOP is `NUISANCE_LINKED`, the stop block/reasons **explicitly surface the co-existing lower state** (`ASSOCIATION_ONLY` also holds), so the classification is never read as "no association" | durable report `stop.coexisting_lower_states = ["ASSOCIATION_ONLY"]`, `stop.association_present = true`, `stop.read_as`, plus an added `stop.reasons` entry |
+| **L3** | **Stable content identity**: a `content_sha256` computed over the report with the informational `/runtime` block **EXCLUDED** (and the digest field itself, to avoid self-reference); the file sha256 may differ only on `/runtime` | durable report `content_sha256` + `content_identity` descriptor |
+| **L4** | The §9 STOP precedence is **FROZEN** as an interpretation rule (previously a documented decision): `IDENTITY_MISMATCH → EVIDENCE_UNAVAILABLE → INCOMPLETE_PANEL → UNSUPPORTED_CONFOUNDER → NUISANCE_LINKED → ASSOCIATION_ONLY → NO_EFFECT`. It changes **no** §6.4/§15.5 threshold | §9.1 (frozen rule), §6.4 (explicit no-threshold note) |
+
+**Stable content identity of record (L3).** The hardened interpretation tool was run **three times**
+on the same **read-only** capture artifact. The **`content_sha256` is identical across runs** while
+the **file sha256 differs only through `/runtime`**:
+
+```
+run A  file sha256 d5143de74791d49fc336ef2db5ea455ccbece53fc1f3ab6183028363b65045ca
+run B  file sha256 41b00792abf447f09dc26e9f30d6ee053ec063ce01e12aaa626ae8db8ddd764b
+run C  file sha256 32b622377254c9ccf6312558a37d6a469d4167c70ef90929f6c936dcac21d0af (durable report)
+       content_sha256 8cf4f2ff8a18a89aa38b7b776c1ef7bde3db91311015446172e52e5e050ae0af   (A == B == C)
+```
+
+The **durable interpretation report** is re-issued at
+`.a2a-reports/ZM-ZEGRID-R40-C-INTERPRET/r40c_interpretation.json` carrying the stable
+`content_sha256` above. (The pre-hardening report sha256 `c73a0737…f999cb58` is superseded; it had
+**no** content identity and varied run-to-run on `/runtime` alone.)
+
+**Outcomes of record — IDENTICAL to §15.16 (asserted by direct comparison of the pre- and
+post-hardening reports produced from the same artifact).** `STOP = NUISANCE_LINKED`; T1
+`DETECTED_ASSOCIATION` (support/`n_eff` conditioning only, see L1); T2 depth-within-same-weight-class
+`DETECTED_ASSOCIATION`; T2 weight-within-same-depth `NO_EFFECT`; T3 `CONTEXT_ONLY`; T5
+`CONTEXT_ONLY`; T4 / H4 `NOT_IDENTIFIABLE` / `NOT_AVAILABLE` (never proxied). Panel complete
+`114/114`. **`threshold_changes: "NONE"` and no observed `frozen_criteria` value changed.**
+
+**R40-C closure.** R40-C is **DONE / CLOSED** at this STOP:
+
+- **ONE** real Windows816 DEV diagnostic capture (`DEV_NOT_QUALIFICATION`); capture artifact of
+  record `R40C_CAPTURE_b15591b` (read-only), generation
+  `r40_capture_5dcef7b90a2eb109685e7f81fcc714c8ceb07e1ab562ab6747fd31b295848ec5`, `capture_id`
+  `5dcef7b9…848ec5`, `index.json` sha256
+  `d4681ae937b3c8b0e1785010af669024496c7758106d15fe6f11a9fcb4799f89` / `89913` bytes, **38 shards** /
+  **114 relation-channels**, **388887 records**, record itemsize **195**, `qualification=EXACT`,
+  `holdout_capped=false`, `n_dropped=0`, `production_wired=true`, capture-bound `repo_head`
+  `b15591b…`.
+- **Interpretation result of record:** relation-first **`STOP = NUISANCE_LINKED`** at
+  `DETECTED_ASSOCIATION` level (T1 support, T2 depth); T2 weight `NO_EFFECT`; T3/T5 `CONTEXT_ONLY`;
+  T4/H4 `NOT_IDENTIFIABLE`–`NOT_AVAILABLE` (never proxied); `observational_only=true`,
+  `causal_attribution=false`; **no correction, no causal attribution, and no Windows816 mechanism,
+  prototype, qualification or product change.**
+- **R40-D is `NOT_RUN`:** its condition (**no** identity-proven same-input intervention reaching
+  `CONTROLLED_EFFECT`) is **NOT met**, so **no** correction/qualification/product change is
+  authorized.
+- **R40 is CLOSED at this STOP on `beta`.** An **in-situ qualification on ANOTHER dataset** is the
+  product owner's **separate next step** and requires its **OWN pre-registration** (a new corpus
+  yields a **new capture identity**). `LP341` remains reserved and **unconsumed**; **no LP pixel was
+  read**; no source frame and **no final product FITS** was read; the capture artifact was **not
+  modified**; the CONSUMED B1 v2 cohort was **not** read/invoked and `validate` was **not** run.
+- **No B1/B2 re-acceptance is claimed**; **no** threshold, criterion or gate was changed (the §8
+  clause-2 OFF/ON byte-identity gate stays exactly `0`). Task L creates **no commit and no push**
+  (Jarvis commits and publishes after review).
