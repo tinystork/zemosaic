@@ -32,11 +32,20 @@ import multiprocessing
 import os
 import time
 
+# ZM-ZEGRID-R41: pure host-RAM contract + phase-accounting math. Imported as a
+# submodule (no psutil, no product mode) so the opt-in planner branch below can
+# account for SIMULTANEOUS phase totals without duplicating the arithmetic.
+from . import ram_contract as rcontract
+
 log = logging.getLogger(__name__)
 
 # Fixed per-worker baseline (bytes): numpy/astropy/reproject/shapely import
 # footprint (~330 MiB, matching the R6 STREAMING_BASELINE_KIB measurement).
-_PER_WORKER_BASELINE_BYTES = 340 * 1024 * 1024
+# ZM-ZEGRID-R41 (L3): a SINGLE authoritative process-baseline source. The
+# contract constant owns the value; this name is assigned FROM it so the two can
+# never drift. The numerical value is unchanged (340 MiB), so the default
+# product behaviour is identical.
+_PER_WORKER_BASELINE_BYTES = rcontract.PROCESS_BASELINE_BYTES
 
 # ZM-ZEGRID-R16 adaptive worker rule. ``cpu - 2`` leaves ~2 cores for the OS (the
 # user's suggestion); the memory side divides the available RAM by the per-worker
@@ -234,6 +243,333 @@ class ModeInfeasible(RuntimeError):
     """
 
 
+def _plan_cell_concurrency_phases(
+    cell_bounds,
+    cpu: int,
+    ram_budget_bytes: int | None,
+    *,
+    gpu_backend: bool,
+    cache_build_workers: int,
+    shared_bytes: int | None,
+    process_baseline_bytes: int | None,
+    cache_worker_footprint_bytes: int | None,
+    cache_worker_px: int | None,
+) -> dict:
+    """ZM-ZEGRID-R41 opt-in phase accounting for :func:`plan_cell_concurrency`.
+
+    Unlike the legacy branch (which bounds ONE cell's footprint by the budget and
+    lets the concurrency clamp derive itself), this branch accounts for the
+    SIMULTANEOUS host footprint of the whole in-flight batch, per phase::
+
+        stack_total = shared + K * stack_per_cell_bound
+        cache_per_cell = PROCESS_BASELINE + W * max(0, cache_worker_footprint - PROCESS_BASELINE)
+        cache_total = shared + K * cache_per_cell
+        aggregate   = max(stack_total, cache_total)
+
+    ``shared`` is uncapped and counted ONCE. K is REDUCED from the CPU bound until
+    the aggregate fits the budget; a mode whose ``K == 1`` aggregate still exceeds
+    the budget is INFEASIBLE (one-cell refusal — never clamp-to-1). The GPU backend
+    keeps its single-owner K == 1 and is checked with the SAME phase aggregate.
+
+    The returned dict is the legacy schema PLUS explicit per-phase totals (only in
+    this opt-in mode, so the default path stays byte-for-byte identical).
+    """
+    bounds = [
+        (
+            rcontract.require_nonneg_int(a, "cell inmem_bound_bytes"),
+            rcontract.require_nonneg_int(b, "cell stream_bound_bytes"),
+        )
+        for a, b in cell_bounds
+    ]
+    n_cells = len(bounds)
+    # M-1: validate the RAW values BEFORE any int()/max() coercion. ``cpu=None`` is
+    # the only tolerated sentinel (os.cpu_count robustness) and conservatively
+    # becomes 1; otherwise CPU must be a non-negative int (bool refused), with an
+    # effective floor of 1.
+    if cpu is None:
+        cpu = 1
+    else:
+        cpu = rcontract.require_nonneg_int(cpu, "cpu")
+    cpu = max(1, cpu)
+    # ``cache_build_workers`` must be a NON-NEGATIVE int (bool refused); a negative
+    # value is REFUSED (never masked), and the effective floor of 1 is applied
+    # only AFTER validation (0 -> 1 conservative).
+    cache_build_workers = max(
+        1, rcontract.require_nonneg_int(cache_build_workers, "cache_build_workers")
+    )
+    # Explicit UNBOUNDED is ONLY ``ram_budget_bytes=None`` (M1). A finite 0 is a
+    # real, empty budget that refuses any positive aggregate; a negative finite
+    # budget is refused outright.
+    ram_budget = (
+        None
+        if ram_budget_bytes is None
+        else rcontract.require_nonneg_int(ram_budget_bytes, "ram_budget_bytes")
+    )
+    # ``shared_bytes`` is optional (default 0); when SUPPLIED it is validated raw.
+    shared = (
+        0
+        if shared_bytes is None
+        else rcontract.require_nonneg_int(shared_bytes, "shared_bytes")
+    )
+    # ``process_baseline_bytes`` is optional (defaults to the single-source module
+    # baseline); when SUPPLIED it is validated raw.
+    pb = (
+        int(_PER_WORKER_BASELINE_BYTES)
+        if process_baseline_bytes is None
+        else rcontract.require_nonneg_int(process_baseline_bytes, "process_baseline_bytes")
+    )
+
+    if cache_worker_footprint_bytes is not None:
+        cwf = rcontract.require_nonneg_int(
+            cache_worker_footprint_bytes, "cache_worker_footprint_bytes"
+        )
+        cwf_source = "explicit"
+    elif cache_worker_px is not None:
+        cwf = int(
+            cache_footprint_bytes(
+                rcontract.require_nonneg_int(cache_worker_px, "cache_worker_px")
+            )
+        )
+        cwf_source = "derived(cache_footprint_bytes)"
+    else:
+        cwf = int(_CACHE_PER_WORKER_FOOTPRINT_BYTES)
+        cwf_source = "default(_CACHE_PER_WORKER_FOOTPRINT_BYTES)"
+
+    def _budget_txt() -> str:
+        return "unbounded" if ram_budget is None else f"{ram_budget / 2**20:.1f} MiB"
+
+    def _cache_workers_for_k(k: int) -> int:
+        if k <= 1:
+            return max(1, int(cache_build_workers))
+        return max(1, min(int(cache_build_workers), max(1, cpu // int(k))))
+
+    def _phase_keys(*, k, w, cpc, st, ct, agg) -> dict:
+        return {
+            "phase_accounting": True,
+            "shared_bytes": shared,
+            "process_baseline_bytes": pb,
+            "cache_worker_footprint_bytes": cwf,
+            "cache_worker_footprint_source": cwf_source,
+            "cache_per_cell_bytes": int(cpc),
+            "stack_total_bytes": int(st),
+            "cache_total_bytes": int(ct),
+            "aggregate_bytes": int(agg),
+            "budget_bytes": (None if ram_budget is None else int(ram_budget)),
+            "cells_in_flight": int(k),
+        }
+
+    if n_cells == 0:
+        # Coherent empty schema: nothing runs, only ``shared`` is resident. A
+        # finite budget smaller than ``shared`` must refuse (never silently pass).
+        if ram_budget is not None and shared > ram_budget:
+            raise ModeInfeasible(
+                f"empty plan refused: shared {shared / 2**20:.1f} MiB > finite "
+                f"budget {ram_budget / 2**20:.1f} MiB"
+            )
+        cpc = rcontract.cache_per_cell_bytes(pb, 0, cwf)
+        return {
+            "mode": "stream",
+            "cells_in_flight": 0,
+            "cache_workers_per_cell": 0,
+            "gpu_serialized": bool(gpu_backend),
+            "candidates": [],
+            "n_cells": 0,
+            "feasible": True,
+            "cpu": cpu,
+            "ram_budget_bytes": (None if ram_budget is None else ram_budget),
+            "chosen_reason": "no cells to schedule (empty plan)",
+            **_phase_keys(k=0, w=0, cpc=cpc, st=shared, ct=shared, agg=shared),
+        }
+
+    max_inmem = max(a for a, _b in bounds)
+    max_stream = max(b for _a, b in bounds)
+
+    cpu_budget = max(1, cpu - _CPU_OS_RESERVE)
+    max_k = max(1, min(cpu_budget, n_cells))
+
+    def _makespan(k: int, cost: float) -> float:
+        waves = (n_cells + k - 1) // k
+        return waves * cost
+
+    def _search(bound: int) -> dict:
+        k, st, ct, agg, cpc, w = rcontract.feasible_concurrency(
+            budget_bytes=ram_budget,
+            shared_bytes=shared,
+            stack_per_cell_bound_bytes=int(bound),
+            process_baseline_bytes=pb,
+            cache_worker_footprint_bytes=cwf,
+            cache_workers_for_k=_cache_workers_for_k,
+            max_k=max_k,
+        )
+        return {"k": int(k), "stack_total": st, "cache_total": ct, "aggregate": agg,
+                "cache_per_cell": cpc, "cache_workers": w, "bound": int(bound)}
+
+    def _candidate(mode: str, res: dict, cost: float) -> dict:
+        feasible = res["k"] >= 1
+        entry = {
+            "mode": mode,
+            "cells_in_flight": int(res["k"]),
+            "max_bound_bytes": int(res["bound"]),
+            "feasible": bool(feasible),
+            "infeasible_reason": (
+                None if feasible else (
+                    f"one-cell {mode} aggregate {res['bound'] / 2**20:.1f} MiB + "
+                    f"shared exceeds budget {_budget_txt()} (K==1 refused)"
+                )
+            ),
+            "per_cell_cost_rel": cost,
+            "makespan_rel": (_makespan(res["k"], cost) if feasible else None),
+            "gpu_serialized": bool(gpu_backend),
+        }
+        if feasible:
+            entry.update({
+                "cache_workers_per_cell": int(res["cache_workers"]),
+                "cache_per_cell_bytes": int(res["cache_per_cell"]),
+                "stack_total_bytes": int(res["stack_total"]),
+                "cache_total_bytes": int(res["cache_total"]),
+                "aggregate_bytes": int(res["aggregate"]),
+            })
+        return entry
+
+    if gpu_backend:
+        # Single GPU owner: the stack phase is K == 1, but the host footprint of
+        # that single wave is STILL accounted with the same phase math.
+        w = max(1, int(cache_build_workers))
+        cpc = rcontract.cache_per_cell_bytes(pb, w, cwf)
+        st = rcontract.stack_phase_total_bytes(shared, 1, max_stream)
+        ct = rcontract.cache_phase_total_bytes(shared, 1, cpc)
+        agg = rcontract.aggregate_phase_bytes(st, ct)
+        gpu_feasible = (ram_budget is None) or (agg <= ram_budget)
+        candidates = [
+            {
+                "mode": "inmem", "cells_in_flight": 0,
+                "max_bound_bytes": int(max_inmem), "feasible": False,
+                "infeasible_reason": (
+                    "not considered on the GPU backend (single-owner stream)"
+                ),
+                "per_cell_cost_rel": _PLANNER_INMEM_COST,
+                "makespan_rel": _makespan(1, _PLANNER_INMEM_COST),
+                "gpu_serialized": True,
+            },
+            {
+                "mode": "stream", "cells_in_flight": 1,
+                "max_bound_bytes": int(max_stream), "feasible": bool(gpu_feasible),
+                "infeasible_reason": (
+                    None if gpu_feasible else (
+                        f"single-owner stream host aggregate {agg / 2**20:.1f} MiB "
+                        f"> ram_budget {_budget_txt()}"
+                    )
+                ),
+                "per_cell_cost_rel": _PLANNER_STREAM_COST,
+                "makespan_rel": _makespan(1, _PLANNER_STREAM_COST),
+                "gpu_serialized": True,
+                "cache_workers_per_cell": int(w),
+                "cache_per_cell_bytes": int(cpc),
+                "stack_total_bytes": int(st),
+                "cache_total_bytes": int(ct),
+                "aggregate_bytes": int(agg),
+            },
+        ]
+        if not gpu_feasible:
+            exc = ModeInfeasible(
+                "GPU backend requested but its host-RAM phase aggregate is "
+                f"INFEASIBLE: stack_total {st / 2**20:.1f} MiB / cache_total "
+                f"{ct / 2**20:.1f} MiB (aggregate {agg / 2**20:.1f} MiB) > RAM "
+                f"budget {_budget_txt()} (n_cells={n_cells}). The "
+                "product path must degrade to exact CPU before execution."
+            )
+            exc.candidates = candidates
+            raise exc
+        return {
+            "mode": "stream",
+            "cache_workers_per_cell": int(w),
+            "gpu_serialized": True,
+            "feasible": True,
+            "cpu": cpu,
+            "ram_budget_bytes": ram_budget,
+            "n_cells": n_cells,
+            "chosen_reason": (
+                "GPU backend: single-device owner serialises the stack phase and "
+                "forces stream mode; host phase aggregate (stack/cache) checked with "
+                "shared counted once"
+            ),
+            "candidates": candidates,
+            **_phase_keys(k=1, w=w, cpc=cpc, st=st, ct=ct, agg=agg),
+        }
+
+    inmem = _search(max_inmem)
+    stream = _search(max_stream)
+    inmem_feasible = inmem["k"] >= 1
+    stream_feasible = stream["k"] >= 1
+
+    if not inmem_feasible and not stream_feasible:
+        raise ModeInfeasible(
+            "no stacking mode fits the host phase aggregate budget "
+            f"{_budget_txt()}: in-memory one-cell aggregate "
+            f">= {(shared + max_inmem) / 2**20:.1f} MiB and streaming one-cell "
+            f"aggregate >= {(shared + max_stream) / 2**20:.1f} MiB both exceed it "
+            f"(n_cells={n_cells})"
+        )
+
+    inmem_ms = _makespan(inmem["k"], _PLANNER_INMEM_COST) if inmem_feasible else None
+    stream_ms = _makespan(stream["k"], _PLANNER_STREAM_COST) if stream_feasible else None
+
+    if stream_feasible and (not inmem_feasible or stream_ms < inmem_ms - 1e-9):
+        mode = "stream"
+        res = stream
+        if not inmem_feasible:
+            chosen_reason = (
+                f"in-memory one-cell aggregate INFEASIBLE (>= "
+                f"{(shared + max_inmem) / 2**20:.1f} MiB > budget "
+                f"{_budget_txt()}); streaming selected (K={stream['k']}, "
+                f"aggregate {(stream['aggregate'] or 0) / 2**20:.1f} MiB, makespan "
+                f"{stream_ms:.3f})"
+            )
+        else:
+            chosen_reason = (
+                f"streaming host aggregate makespan {stream_ms:.3f} (K={stream['k']}, "
+                f"aggregate {(stream['aggregate'] or 0) / 2**20:.1f} MiB) < in-memory "
+                f"{inmem_ms:.3f} (K={inmem['k']}, aggregate "
+                f"{(inmem['aggregate'] or 0) / 2**20:.1f} MiB)"
+            )
+    else:
+        mode = "inmem"
+        res = inmem
+        if not stream_feasible:
+            chosen_reason = (
+                f"in-memory selected (K={inmem['k']}, aggregate "
+                f"{(inmem['aggregate'] or 0) / 2**20:.1f} MiB, makespan "
+                f"{inmem_ms:.3f}); streaming INFEASIBLE (one-cell aggregate >= "
+                f"{(shared + max_stream) / 2**20:.1f} MiB > budget "
+                f"{_budget_txt()})"
+            )
+        else:
+            chosen_reason = (
+                f"in-memory host aggregate makespan {inmem_ms:.3f} (K={inmem['k']}, "
+                f"aggregate {(inmem['aggregate'] or 0) / 2**20:.1f} MiB) <= streaming "
+                f"{stream_ms:.3f} (K={stream['k']})"
+            )
+
+    return {
+        "mode": mode,
+        "cache_workers_per_cell": int(res["cache_workers"]),
+        "gpu_serialized": bool(gpu_backend),
+        "feasible": True,
+        "cpu": cpu,
+        "ram_budget_bytes": ram_budget,
+        "n_cells": n_cells,
+        "chosen_reason": chosen_reason,
+        "candidates": [
+            _candidate("inmem", inmem, _PLANNER_INMEM_COST),
+            _candidate("stream", stream, _PLANNER_STREAM_COST),
+        ],
+        **_phase_keys(
+            k=res["k"], w=res["cache_workers"], cpc=res["cache_per_cell"],
+            st=res["stack_total"], ct=res["cache_total"], agg=res["aggregate"],
+        ),
+    }
+
+
 def plan_cell_concurrency(
     cell_bounds,
     cpu: int,
@@ -241,6 +577,10 @@ def plan_cell_concurrency(
     *,
     gpu_backend: bool = False,
     cache_build_workers: int = _WORKERS_MIN,
+    shared_bytes: int | None = None,
+    cache_worker_footprint_bytes: int | None = None,
+    cache_worker_px: int | None = None,
+    process_baseline_bytes: int | None = None,
 ) -> dict:
     """Joint mode + concurrency planner (replaces the R20 two-step trap).
 
@@ -260,7 +600,42 @@ def plan_cell_concurrency(
 
     Returns a dict (JSON-serialisable) with ``mode``, ``cells_in_flight``,
     ``cache_workers_per_cell``, ``gpu_serialized`` and the ``candidates`` list.
+
+    ZM-ZEGRID-R41 OPT-IN phase accounting (added kwargs, ALL defaulting to the
+    historical behaviour so every existing caller/result is byte-for-byte
+    unchanged):
+
+    * ``shared_bytes`` — host footprint counted ONCE (passed at all);
+    * ``cache_worker_footprint_bytes`` — explicit cache-worker footprint;
+    * ``cache_worker_px`` — derive it via :func:`cache_footprint_bytes`;
+    * ``process_baseline_bytes`` — per-process floor (defaults to the module
+      baseline).
+
+    When ANY of ``shared_bytes`` / ``cache_worker_footprint_bytes`` /
+    ``cache_worker_px`` / ``process_baseline_bytes`` is supplied, the planner
+    accounts for the SIMULTANEOUS stack/cache phase totals (see
+    :func:`_plan_cell_concurrency_phases`) and adds explicit per-phase keys to the
+    result; otherwise it runs the legacy path verbatim (no new keys).
     """
+    if (
+        shared_bytes is not None
+        or cache_worker_footprint_bytes is not None
+        or cache_worker_px is not None
+        or process_baseline_bytes is not None  # L-1: supplied alone MUST activate
+    ):
+        # M-1: hand the RAW arguments to the strict helper (no int()/max()
+        # pre-coercion in the outer hand-off).
+        return _plan_cell_concurrency_phases(
+            cell_bounds,
+            cpu,
+            ram_budget_bytes,
+            gpu_backend=bool(gpu_backend),
+            cache_build_workers=cache_build_workers,
+            shared_bytes=shared_bytes,
+            process_baseline_bytes=process_baseline_bytes,
+            cache_worker_footprint_bytes=cache_worker_footprint_bytes,
+            cache_worker_px=cache_worker_px,
+        )
     bounds = [(int(a), int(b)) for a, b in cell_bounds]
     n_cells = len(bounds)
     if n_cells == 0:
