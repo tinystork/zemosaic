@@ -2772,6 +2772,70 @@ def _halo_provenance_for_pass(
     }
 
 
+def _validate_halo_provenance_consistency(
+    halo_provenance, science_config, cell_feather_info
+):
+    """Cross-check the pass provenance against the EXISTING gauge/feather facts.
+
+    Pure, side-effect-free helper: it never reads config and never writes. It is
+    called in ``_run_single`` BEFORE the raw science FITS (or any current-run
+    output) is published, and defensively again in ``_write_outputs``. One
+    implementation, one source of checks.
+    """
+    if halo_provenance is None:
+        return
+    _hp_mode = str(halo_provenance.get("effective_gauge_mode"))
+    _cfg_mode = str(getattr(science_config, "cell_gauge_mode", "global"))
+    if _hp_mode != _cfg_mode:
+        raise RuntimeError(
+            "ZeGrid halo provenance contradiction: provenance gauge "
+            f"{_hp_mode!r} != science_config {_cfg_mode!r}"
+        )
+    _feather_ran = cell_feather_info is not None
+    if bool(halo_provenance.get("feather_applied")) != bool(_feather_ran):
+        raise RuntimeError(
+            "ZeGrid halo provenance contradiction: feather_applied="
+            f"{halo_provenance.get('feather_applied')} but cell_feather "
+            f"present={_feather_ran}"
+        )
+    if _feather_ran:
+        if int(cell_feather_info.get("halo_px")) != int(
+            halo_provenance["effective_px"]
+        ):
+            raise RuntimeError(
+                "ZeGrid halo provenance contradiction: cell_feather.halo_px="
+                f"{cell_feather_info.get('halo_px')} != effective "
+                f"{halo_provenance['effective_px']}"
+            )
+        if _hp_mode != "per_cell":
+            raise RuntimeError(
+                "ZeGrid halo provenance contradiction: feather ran in "
+                f"non-per_cell mode {_hp_mode!r}"
+            )
+
+
+def _reproducibility_note(effective_gauge_mode):
+    """Mode-conditional reproducibility wording (no contradictory claim)."""
+    if str(effective_gauge_mode) == "per_cell":
+        return (
+            "output science uses the OPT-IN per-Cell gauge: every Cell "
+            "self-anchors on its own greatest-support frame; inter-Cell "
+            "additive offsets and the feathered assembly are applied by the "
+            "per_cell path (see photometric_gauge and zegrid_halo). The "
+            "global-gauge layout-independence statement does NOT apply in "
+            "this mode."
+        )
+    return (
+        "output science is GLOBAL-gauge normalized (one reference frame + "
+        "per-frame coefficients computed over the full canvas), so the science "
+        "is layout-INDEPENDENT under the corrected global gauge "
+        "(ZM-ZEGRID-R11 rework-1: Cells lacking the global reference keep its "
+        "level, not a re-anchored local level). Pin the layout via the "
+        "'zegrid_layout' config key (e.g. '6x5') for reproducible output; "
+        "coverage (stack depth) is pure geometry."
+    )
+
+
 def _record_halo_cards(header, provenance):
     """Add the documented compact ZeGrid halo cards to a FITS primary header.
 
@@ -4983,6 +5047,12 @@ def _run_single(
         effective_gauge_mode=_gauge_mode,
         feather_info=feather_info,
     )
+    # F-2: validate BEFORE the immutable raw science FITS, finishing, or any
+    # current-run output is published. A contradiction therefore cannot leave a
+    # current-run partial output behind.
+    _validate_halo_provenance_consistency(
+        _halo_provenance_pass, science_config, feather_info
+    )
 
     cache_report = {
         "reused": [],
@@ -5619,38 +5689,17 @@ def _write_outputs(
     cache_peak_bytes = (cache_report or {}).get("peak_cell_bytes", cache_total_bytes)
     cache_retention = (cache_report or {}).get("retention")
 
-    # ZM-ZEGRID-R53b: cross-check the pass provenance against the EXISTING
-    # gauge/feather facts before publishing anything. These are the same facts,
-    # never a second resolution; a contradiction is a hard error.
-    if halo_provenance is not None:
-        _hp_mode = str(halo_provenance.get("effective_gauge_mode"))
-        _cfg_mode = str(getattr(science_config, "cell_gauge_mode", "global"))
-        if _hp_mode != _cfg_mode:
-            raise RuntimeError(
-                "ZeGrid halo provenance contradiction: provenance gauge "
-                f"{_hp_mode!r} != science_config {_cfg_mode!r}"
-            )
-        _feather_ran = cell_feather_info is not None
-        if bool(halo_provenance.get("feather_applied")) != bool(_feather_ran):
-            raise RuntimeError(
-                "ZeGrid halo provenance contradiction: feather_applied="
-                f"{halo_provenance.get('feather_applied')} but cell_feather "
-                f"present={_feather_ran}"
-            )
-        if _feather_ran:
-            if int(cell_feather_info.get("halo_px")) != int(
-                halo_provenance["effective_px"]
-            ):
-                raise RuntimeError(
-                    "ZeGrid halo provenance contradiction: cell_feather.halo_px="
-                    f"{cell_feather_info.get('halo_px')} != effective "
-                    f"{halo_provenance['effective_px']}"
-                )
-            if _hp_mode != "per_cell":
-                raise RuntimeError(
-                    "ZeGrid halo provenance contradiction: feather ran in "
-                    f"non-per_cell mode {_hp_mode!r}"
-                )
+    # ZM-ZEGRID-R53b F-2: defensive cross-check at manifest publication. The
+    # primary pre-publication check runs in ``_run_single`` BEFORE raw science.
+    _validate_halo_provenance_consistency(
+        halo_provenance, science_config, cell_feather_info
+    )
+
+    _effective_gauge_mode = (
+        str(halo_provenance.get("effective_gauge_mode"))
+        if halo_provenance is not None
+        else str(getattr(science_config, "cell_gauge_mode", "global"))
+    )
 
     manifest = {
         "schema": "zemosaic-zegrid-r7-manifest-v1",
@@ -5672,15 +5721,7 @@ def _write_outputs(
             {"zegrid_halo": dict(halo_provenance)}
             if halo_provenance is not None else {}
         ),
-        "reproducibility_note": (
-            "output science is GLOBAL-gauge normalized (one reference frame + "
-            "per-frame coefficients computed over the full canvas), so the science "
-            "is layout-INDEPENDENT under the corrected global gauge "
-            "(ZM-ZEGRID-R11 rework-1: Cells lacking the global reference keep its "
-            "level, not a re-anchored local level). Pin the layout via the "
-            "'zegrid_layout' config key (e.g. '6x5') for reproducible output; "
-            "coverage (stack depth) is pure geometry."
-        ),
+        "reproducibility_note": _reproducibility_note(_effective_gauge_mode),
         "photometric_gauge": {
             "mode": getattr(science_config, "cell_gauge_mode", "global"),
             "requested_mode": (

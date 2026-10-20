@@ -8,6 +8,7 @@ free memory; the science/geometry/assembly code is the production code.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -221,6 +222,10 @@ def test_real_global_run_outputs_cards_manifest_and_log(tmp_path):
     assert halo["measurement_px"] is None
     assert "does NOT remove gradients" in halo["note"]
     assert m["cell_feather"] == {"enabled": False}
+    note = m["reproducibility_note"]
+    assert "GLOBAL-gauge normalized" in note
+    assert "layout-INDEPENDENT" in note
+    assert "per-Cell gauge" not in note
     _assert_cell_audit(m)
     assert m["cache"]["reuse_identity"]["bound_to"] == [
         "patch_shape_hw", "patch_bounds", "patch_wcs",
@@ -259,6 +264,11 @@ def test_real_per_cell_run_outputs_cards_manifest_and_log(tmp_path):
     assert m["cell_feather"]["enabled"] is True
     assert m["cell_feather"]["halo_px"] == 8
     _assert_cell_audit(m)
+    note = m["reproducibility_note"]
+    assert "GLOBAL-gauge normalized" not in note
+    assert "OPT-IN per-Cell gauge" in note
+    assert "additive offsets" in note
+    assert "does NOT apply" in note
 
     raw = out / "mosaic_grid.fits"
     coverage = out / "mosaic_grid_coverage.fits"
@@ -349,3 +359,241 @@ def test_mount_split_both_passes_carry_identical_provenance(tmp_path):
         _assert_cards(d / "mosaic_grid_coverage.fits", halo=8, feather=False, mode="global")
         manifests[label] = h
     assert manifests["EQ"] == manifests["ALTZ"]
+
+
+# ---------------------------------------------------------------------------
+# F-1 — mode-conditional reproducibility note
+# ---------------------------------------------------------------------------
+
+def _crafted_provenance(mode, *, feather):
+    return {
+        "requested_px": 8,
+        "effective_px": 8,
+        "source": "explicit_argument",
+        "units": "output_canvas_px",
+        "controls_patch_geometry": True,
+        "controls_contributor_membership": True,
+        "controls_gauge_patch_domain": mode == "per_cell",
+        "requested_gauge_mode": mode,
+        "effective_gauge_mode": mode,
+        "feather_applied": bool(feather),
+        "feather_px": 8 if feather else None,
+        "measurement_px": 16 if feather else None,
+        "note": zz.HALO_PROVENANCE_NOTE,
+    }
+
+
+@pytest.mark.parametrize(
+    "prov_overrides,config_mode,feather_info",
+    [
+        # Gauge mode disagrees with the resolved science config.
+        ({"effective_gauge_mode": "per_cell", "feather_applied": False,
+          "feather_px": None, "measurement_px": None}, "global", None),
+        # Feather claimed but no feather assembly ran.
+        ({"feather_applied": True, "feather_px": 8, "measurement_px": 16},
+         "global", None),
+        # Feather assembly ran but provenance says it did not.
+        ({"feather_applied": False, "feather_px": None, "measurement_px": None},
+         "per_cell", {"halo_px": 8}),
+        # Feather halo width disagrees with the effective H.
+        ({"feather_applied": True, "feather_px": 8, "measurement_px": 16},
+         "per_cell", {"halo_px": 16}),
+        # Feather assembly present in a non-per_cell mode.
+        ({"feather_applied": True, "feather_px": 8, "measurement_px": 16},
+         "global", {"halo_px": 8}),
+    ],
+)
+def test_halo_consistency_helper_rejects_each_material_contradiction(
+    prov_overrides, config_mode, feather_info
+):
+    prov = _crafted_provenance(config_mode, feather=config_mode == "per_cell")
+    prov.update(prov_overrides)
+    science_config = SimpleNamespace(cell_gauge_mode=config_mode)
+    with pytest.raises(RuntimeError):
+        zz._validate_halo_provenance_consistency(
+            prov, science_config, feather_info
+        )
+
+
+def _sentinel_outputs(out: Path):
+    out.mkdir(parents=True, exist_ok=True)
+    names = [
+        "mosaic_grid_science.fits",
+        "mosaic_grid_aesthetic.fits",
+        "mosaic_grid_coverage.fits",
+        "mosaic_grid_uint16.fits",
+        "zegrid_manifest.json",
+    ]
+    payload = {}
+    for name in names:
+        data = f"SENTINEL-{name}".encode("ascii")
+        (out / name).write_bytes(data)
+        payload[name] = data
+    return payload
+
+
+@pytest.mark.parametrize(
+    "case,actual_mode,inject_info",
+    [
+        ("gauge_mismatch", "global", False),
+        ("feather_true_no_info", "global", False),
+        ("feather_false_with_info", "per_cell", False),
+        ("halo_mismatch", "per_cell", True),
+        ("feather_in_global", "global", True),
+    ],
+)
+def test_contradictions_fail_before_any_current_run_output(
+    tmp_path, monkeypatch, case, actual_mode, inject_info
+):
+    """F-2: the pre-publication guard must leave all prior outputs untouched."""
+    inp = _corpus(tmp_path / case / "in", SAME_SKY)
+    out = tmp_path / case / "out"
+    sentinels = _sentinel_outputs(out)
+
+    if case == "gauge_mismatch":
+        crafted = _crafted_provenance("global", feather=False)
+        crafted["effective_gauge_mode"] = "per_cell"
+    elif case == "feather_false_with_info":
+        crafted = _crafted_provenance("per_cell", feather=False)
+    else:
+        crafted = _crafted_provenance(actual_mode, feather=True)
+
+    monkeypatch.setattr(zz, "_halo_provenance_for_pass", lambda *a, **k: dict(crafted))
+    if inject_info:
+        real_assemble = zz._assemble_cells
+
+        def _assemble_with_bad_info(*a, **k):
+            assembled, info = real_assemble(*a, **k)
+            if case == "halo_mismatch":
+                info = {"halo_px": 16}
+            else:  # feather_in_global: global normally has no feather info
+                info = {"halo_px": 8}
+            return assembled, info
+
+        monkeypatch.setattr(zz, "_assemble_cells", _assemble_with_bad_info)
+
+    zconfig = SimpleNamespace(
+        zegrid_layout="2x2", export_aesthetic_fits=True,
+        final_mosaic_dbe_enabled=False,
+    )
+    with pytest.raises(RuntimeError):
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=zconfig, zegrid_halo_px=8,
+            cell_gauge_mode=actual_mode, save_final_as_uint16=True,
+            grid_rgb_equalize=False,
+        )
+
+    # No current-run FITS/manifest was created or replaced.
+    for name, data in sentinels.items():
+        assert (out / name).read_bytes() == data, name
+    assert sorted(p.name for p in out.glob("*.fits")) == sorted(
+        n for n in sentinels if n.endswith(".fits")
+    )
+    assert not (out / "mosaic_grid.fits").exists()
+
+
+# ---------------------------------------------------------------------------
+# F-3 — committed explicit-H=8 array parity with accepted R53a
+# ---------------------------------------------------------------------------
+
+# These constants were produced by running the ACCEPTED base a8fe8df on this
+# exact deterministic fixture (2 x 512x512 TAN frames, seeds 0/1, pinned 2x2,
+# H=8, finishing disabled). Do NOT regenerate them from current code.
+_R53A_PARITY = {
+    "global": (
+        "410eced6618d06283d7f842079fe6c2cfd33b72a5c7e1be644d20d224b66c768",
+        "ebfda7867fd779a5500a057596ca74890fbd01ca5f17804833c35d26cfe86580",
+    ),
+    "per_cell": (
+        "7c2626e548c63ae47bc00273f2f4e6672b8d80a9459b3364fc5bab32a413dd63",
+        "ebfda7867fd779a5500a057596ca74890fbd01ca5f17804833c35d26cfe86580",
+    ),
+}
+
+
+@pytest.mark.parametrize("mode", ["global", "per_cell"])
+def test_explicit_h8_array_parity_with_accepted_r53a(tmp_path, mode):
+    out = _run(
+        tmp_path, SAME_SKY, name=f"parity_{mode}", layout="2x2",
+        export_aesthetic=False, save_uint16=False,
+        zegrid_halo_px=8, cell_gauge_mode=mode,
+    )
+    raw = np.ascontiguousarray(fits.getdata(out / "mosaic_grid.fits"))
+    cov = np.ascontiguousarray(fits.getdata(out / "mosaic_grid_coverage.fits"))
+    expected_raw, expected_cov = _R53A_PARITY[mode]
+    assert hashlib.sha256(raw.tobytes()).hexdigest() == expected_raw
+    assert hashlib.sha256(cov.tobytes()).hexdigest() == expected_cov
+    m = _manifest(out)
+    assert m["zegrid_halo"]["effective_px"] == 8
+    assert m["zegrid_halo"]["effective_gauge_mode"] == mode
+
+
+# ---------------------------------------------------------------------------
+# F-4 — real empty cell + gauge-zero-support direct seam
+# ---------------------------------------------------------------------------
+
+def test_real_sparse_layout_records_empty_cell(tmp_path):
+    """A real product run with a genuinely empty Cell keeps the audit keys."""
+    specs = [
+        (10.0, 30.0, None), (10.5, 30.0, None), (10.0, 29.5, None),
+    ]
+    out = _run(
+        tmp_path, specs, name="sparse", layout="3x3", export_aesthetic=False,
+        save_uint16=False, zegrid_halo_px=8, cell_gauge_mode="per_cell",
+    )
+    m = _manifest(out)
+    empties = [rec for rec in m["cells"] if rec["status"] == "empty"]
+    assert empties, "expected the L-shaped fixture to leave at least one empty Cell"
+    for rec in empties:
+        assert rec["n_contributors"] == 0
+        assert rec["n_patch_contributors"] == 0
+        assert len(rec["patch_bounds"]) == 4
+        assert all(isinstance(v, int) for v in rec["patch_bounds"])
+        assert len(rec["patch_shape_hw"]) == 2
+        assert all(isinstance(v, int) and v > 0 for v in rec["patch_shape_hw"])
+    halo = m["zegrid_halo"]
+    assert halo["effective_gauge_mode"] == "per_cell"
+    assert halo["controls_patch_geometry"] is True
+    assert halo["feather_applied"] is True
+    assert halo["feather_px"] == 8
+    assert halo["measurement_px"] == 16
+
+
+def test_stack_cell_zero_support_record_keeps_patch_fields(tmp_path, monkeypatch):
+    """Focused seam: a populated Cell whose gauge has zero support."""
+    from zemosaic.core.zegrid import auto_layout as zal
+    from zemosaic.core.zegrid import geometry as zg
+
+    inp = _corpus(tmp_path / "zero" / "in", SAME_SKY)
+    descs, rejected = zg.read_manifest(inp)
+    assert not rejected
+    canvas = zg.build_canvas(descs)
+    fps = zal.project_footprints(descs, canvas)
+    ctxs = zz._build_chosen_cell_contexts(fps, canvas, 2, 2, halo_px=8)
+    cell, patch, mem = next(
+        (cell, patch, mem)
+        for (_r, _c, cell, patch, mem) in ctxs
+        if mem.patch_ids
+    )
+    science_config = zz.ExecutorConfig().science_config()
+    zz._init_stack_worker(
+        descs, canvas, science_config, None, [], None, cache_workers=1
+    )
+    monkeypatch.setattr(
+        zz, "_resolve_cell_normalization",
+        lambda *a, **k: (None, "empty", "synthetic zero support"),
+    )
+    cache_dir = tmp_path / "zero" / "cache" / cell.cell_id
+    result = zz._stack_cell((cell, patch, mem, cache_dir, "inmem", 0))
+    assert result["status"] == "empty"
+    rec = result["record"]
+    assert rec["status"] == "empty"
+    assert rec["n_contributors"] == len(mem.patch_ids) > 0
+    assert rec["n_patch_contributors"] == len(mem.patch_ids)
+    assert rec["patch_bounds"] == [
+        patch.patch.x0, patch.patch.y0, patch.patch.x1, patch.patch.y1,
+    ]
+    assert rec["patch_shape_hw"] == [
+        patch.patch.height, patch.patch.width,
+    ]
+    assert rec["gauge_status"] == "empty"
