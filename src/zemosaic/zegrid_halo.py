@@ -35,13 +35,38 @@ __all__ = [
     "ZEGRID_HALO_ALLOWED_PX",
     "ZEGRID_HALO_CONFIG_KEY",
     "ZEGRID_HALO_DEFAULT_PX",
+    "ZEGRID_HALO_SOURCE_CONFIG",
+    "ZEGRID_HALO_SOURCE_EXPLICIT",
+    "ZEGRID_HALO_SOURCE_INTERNAL_ONLY",
+    "ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT",
+    "ZEGRID_HALO_UNITS",
     "ZeGridHaloError",
+    "build_halo_provenance",
     "resolve_zegrid_halo_px",
+    "resolve_run_halo_provenance",
 ]
 
 ZEGRID_HALO_ALLOWED_PX: tuple[int, ...] = (8, 16, 32, 64, 128, 256)
 ZEGRID_HALO_DEFAULT_PX: int = 64
 ZEGRID_HALO_CONFIG_KEY: str = "zegrid_halo_px"
+ZEGRID_HALO_UNITS: str = "output_canvas_px"
+
+# Stable machine tokens for provenance (never localized, never re-worded).
+ZEGRID_HALO_SOURCE_EXPLICIT: str = "explicit_argument"
+ZEGRID_HALO_SOURCE_CONFIG: str = "config"
+ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT: str = "product_default"
+# Only for direct/internal ``_run_single`` calls that predate the product
+# provenance object; never emitted by the product entry point.
+ZEGRID_HALO_SOURCE_INTERNAL_ONLY: str = "internal_default"
+
+_HALO_SOURCES = frozenset(
+    {
+        ZEGRID_HALO_SOURCE_EXPLICIT,
+        ZEGRID_HALO_SOURCE_CONFIG,
+        ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT,
+        ZEGRID_HALO_SOURCE_INTERNAL_ONLY,
+    }
+)
 
 
 class ZeGridHaloError(ValueError):
@@ -92,3 +117,61 @@ def resolve_zegrid_halo_px(value=None) -> int:
             f"allowed values are {ZEGRID_HALO_ALLOWED_PX}"
         )
     return resolved
+
+
+def build_halo_provenance(
+    requested_px: int | None,
+    effective_px: int,
+    source: str,
+) -> dict:
+    """Build the compact, immutable-by-convention provenance object.
+
+    ``requested_px`` is ``None`` ONLY when the product default was used; when a
+    caller/config supplied a value it is the NORMALIZED allowed integer (a legacy
+    numeric string never leaks into the manifest). ``effective_px`` is the
+    validated integer that drives the real geometry.
+    """
+    effective = resolve_zegrid_halo_px(effective_px)
+    if requested_px is not None:
+        requested = resolve_zegrid_halo_px(requested_px)
+    else:
+        requested = None
+    if source not in _HALO_SOURCES:
+        raise ZeGridHaloError(
+            f"unknown halo provenance source {source!r}; expected one of "
+            f"{sorted(_HALO_SOURCES)}"
+        )
+    if source == ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT and requested is not None:
+        raise ZeGridHaloError(
+            "product_default provenance must carry requested_px=None (the product "
+            "default was not a user request)"
+        )
+    return {
+        "requested_px": requested,
+        "effective_px": int(effective),
+        "source": str(source),
+        "units": ZEGRID_HALO_UNITS,
+    }
+
+
+def resolve_run_halo_provenance(explicit_value, config_value) -> dict:
+    """Resolve the ONE run-level provenance from explicit > config > default.
+
+    ``explicit_value is None`` means "not supplied". ``config_value`` is the raw
+    value read ONCE from the effective config object by the caller (never re-read
+    later). No mutable global is written.
+    """
+    if explicit_value is not None:
+        effective = resolve_zegrid_halo_px(explicit_value)
+        return build_halo_provenance(
+            effective, effective, ZEGRID_HALO_SOURCE_EXPLICIT
+        )
+    if config_value is not None:
+        effective = resolve_zegrid_halo_px(config_value)
+        return build_halo_provenance(
+            effective, effective, ZEGRID_HALO_SOURCE_CONFIG
+        )
+    effective = resolve_zegrid_halo_px(None)
+    return build_halo_provenance(
+        None, effective, ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT
+    )

@@ -164,13 +164,13 @@ def test_resolution_precedence_is_explicit_arg_then_config_then_default():
         )
     joined = "\n".join(messages)
     assert "effective=8 px" in joined
-    assert "source=explicit argument" in joined
+    assert "source=explicit_argument" in joined
 
 
 def test_run_zegrid_mode_absent_uses_config_then_default():
     for zconfig, expected, source in [
-        (SimpleNamespace(zegrid_halo_px=32), 32, "zegrid_halo_px config"),
-        (SimpleNamespace(), 64, "product default"),
+        (SimpleNamespace(zegrid_halo_px=32), 32, "config"),
+        (SimpleNamespace(), 64, "product_default"),
     ]:
         messages = []
         with pytest.raises(RuntimeError):

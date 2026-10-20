@@ -69,7 +69,12 @@ from . import zemosaic_stack_plan as _stack_plan
 from .zegrid_halo import (
     ZEGRID_HALO_CONFIG_KEY,
     ZEGRID_HALO_DEFAULT_PX,
+    ZEGRID_HALO_SOURCE_EXPLICIT,
+    ZEGRID_HALO_SOURCE_INTERNAL_ONLY,
+    ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT,
     ZeGridHaloError,
+    build_halo_provenance,
+    resolve_run_halo_provenance,
     resolve_zegrid_halo_px,
 )
 from .zemosaic_utils import (
@@ -2519,9 +2524,18 @@ def _stack_cell(task):
     """
     (cell, patch, mem, cache_dir, mode, bound) = task
     cid = cell.cell_id
+    _patch_bounds = [int(patch.patch.x0), int(patch.patch.y0),
+                     int(patch.patch.x1), int(patch.patch.y1)]
+    _patch_shape_hw = [int(patch.patch.height), int(patch.patch.width)]
     if not mem.patch_ids:
         return {"cell_id": cid, "status": "empty",
-                "record": {"cell_id": cid, "status": "empty", "mode": None},
+                "record": {
+                    "cell_id": cid, "status": "empty", "mode": None,
+                    "n_contributors": 0,
+                    "n_patch_contributors": 0,
+                    "patch_bounds": _patch_bounds,
+                    "patch_shape_hw": _patch_shape_hw,
+                },
                 "reproject": None}
     cache_dir = Path(cache_dir)
 
@@ -2571,6 +2585,9 @@ def _stack_cell(task):
                 "cell_id": cid, "row": cell.row, "col": cell.col,
                 "status": "empty", "mode": mode,
                 "n_contributors": len(mem.patch_ids),
+                "n_patch_contributors": len(mem.patch_ids),
+                "patch_bounds": _patch_bounds,
+                "patch_shape_hw": _patch_shape_hw,
                 "cell_gauge_mode": cell_gauge_mode,
                 "gauge_status": gauge_status, "gauge_detail": gauge_detail,
             },
@@ -2599,6 +2616,9 @@ def _stack_cell(task):
     record = {
         "cell_id": cid, "row": cell.row, "col": cell.col, "status": "complete",
         "mode": mode, "n_contributors": len(mem.patch_ids),
+        "n_patch_contributors": len(mem.patch_ids),
+        "patch_bounds": _patch_bounds,
+        "patch_shape_hw": _patch_shape_hw,
         "cell_gauge_mode": cell_gauge_mode,
         "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
         "reference_frame_id": sres.reference_frame_id,
@@ -2668,6 +2688,133 @@ def _array_sha256(data: np.ndarray) -> str:
     """SHA-256 of a float32 array's raw bytes (contiguous, deterministic)."""
     arr = np.ascontiguousarray(data)
     return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+HALO_PROVENANCE_NOTE = (
+    "H is an output-canvas geometric/feather width. It softens transitions "
+    "between Cells but does NOT remove gradients present in the input images. "
+    "In global gauge mode the one-owner assembly is used and the "
+    "anti-checkerboard feather is not applied; H still drives patch geometry, "
+    "contributor membership and stacking."
+)
+
+
+def _halo_provenance_for_pass(
+    base_provenance,
+    *,
+    effective_px,
+    cell_ctxs,
+    requested_gauge_mode,
+    effective_gauge_mode,
+    feather_info,
+):
+    """Add the PASS-local truthful facts to the run-level halo provenance.
+
+    ``base_provenance`` is the compact object resolved ONCE by
+    :func:`run_zegrid_mode` (requested/effective/source/units). This function never
+    re-reads configuration. It fails loudly if the effective width or the
+    feather/state facts contradict each other, so the manifest, FITS cards and
+    run log can never publish incompatible claims.
+    """
+    eff = int(effective_px)
+    if base_provenance is None:
+        base = build_halo_provenance(None, eff, ZEGRID_HALO_SOURCE_INTERNAL_ONLY)
+    else:
+        base = dict(base_provenance)
+        if int(base["effective_px"]) != eff:
+            raise RuntimeError(
+                "ZeGrid halo provenance contradiction: run-level effective "
+                f"{base['effective_px']} != pass effective {eff}"
+            )
+    if int(base.get("effective_px", eff)) != eff:
+        raise RuntimeError(
+            "ZeGrid halo provenance contradiction: run-level effective "
+            f"{base.get('effective_px')} != pass effective {eff}"
+        )
+
+    contexts = list(cell_ctxs or [])
+    geometry_ok = bool(contexts) and all(
+        int(patch.halo_px) == eff for (_r, _c, _cell, patch, _mem) in contexts
+    )
+    mode = str(effective_gauge_mode)
+    if mode not in ("global", "per_cell"):
+        raise RuntimeError(f"ZeGrid halo provenance: unresolved gauge mode {mode!r}")
+    feather_applied = bool(mode == "per_cell" and feather_info is not None)
+    if mode == "per_cell" and feather_info is None:
+        raise RuntimeError(
+            "ZeGrid halo provenance contradiction: per_cell mode ran without "
+            "feather assembly"
+        )
+    if mode != "per_cell" and feather_info is not None:
+        raise RuntimeError(
+            "ZeGrid halo provenance contradiction: feather assembly ran in "
+            f"{mode} gauge mode"
+        )
+    if feather_applied:
+        got = int((feather_info or {}).get("halo_px", -1))
+        if got != eff:
+            raise RuntimeError(
+                "ZeGrid halo provenance contradiction: feather halo "
+                f"{got} != effective {eff}"
+            )
+
+    return {
+        **base,
+        "controls_patch_geometry": bool(geometry_ok),
+        "controls_contributor_membership": bool(geometry_ok),
+        "controls_gauge_patch_domain": bool(mode == "per_cell"),
+        "requested_gauge_mode": str(requested_gauge_mode),
+        "effective_gauge_mode": mode,
+        "feather_applied": bool(feather_applied),
+        "feather_px": int(eff) if feather_applied else None,
+        "measurement_px": int(2 * eff) if mode == "per_cell" else None,
+        "note": HALO_PROVENANCE_NOTE,
+    }
+
+
+def _record_halo_cards(header, provenance):
+    """Add the documented compact ZeGrid halo cards to a FITS primary header.
+
+    Applied to EVERY emitted ZeGrid FITS (raw science, aesthetic float, coverage,
+    optional uint16). Card names stay short/standard (<= 8 chars) and carry only
+    scalar provenance; array content/dtype/axis order are untouched.
+    """
+    if provenance is None:
+        return header
+    header["ZGHALO"] = (
+        int(provenance["effective_px"]),
+        "ZeGrid halo width, output canvas px",
+    )
+    header["ZGFEATH"] = (
+        bool(provenance["feather_applied"]),
+        "anti-checkerboard feather applied",
+    )
+    header["ZGGMODE"] = (
+        str(provenance["effective_gauge_mode"]),
+        "effective ZeGrid cell gauge mode",
+    )
+    return header
+
+
+def _format_halo_provenance(provenance) -> str:
+    """ONE stable run-log line for the halo provenance (requested->effective)."""
+    p = provenance or {}
+    req = "absent" if p.get("requested_px") is None else f"{p['requested_px']} px"
+    feather = "yes" if p.get("feather_applied") else "no"
+    feather_px = "n/a" if p.get("feather_px") is None else f"{p['feather_px']} px"
+    meas_px = "n/a" if p.get("measurement_px") is None else f"{p['measurement_px']} px"
+    return (
+        "ZeGrid halo provenance: "
+        f"requested={req} (source={p.get('source')}) -> "
+        f"effective={p.get('effective_px')} px ({p.get('units')}); "
+        f"gauge requested={p.get('requested_gauge_mode')} -> "
+        f"effective={p.get('effective_gauge_mode')}; "
+        f"patch_geometry={'true' if p.get('controls_patch_geometry') else 'false'} "
+        f"contributors={'true' if p.get('controls_contributor_membership') else 'false'} "
+        f"gauge_patch_domain={'true' if p.get('controls_gauge_patch_domain') else 'false'}; "
+        f"feather_applied={feather} feather={feather_px} measurement={meas_px}; "
+        f"{HALO_PROVENANCE_NOTE}"
+    )
 
 
 def _science_header(
@@ -2854,6 +3001,7 @@ def _write_run_log(
     finishing_info=None,
     gpu_context=None,
     aggregate_peak_rss_kib=None,
+    halo_provenance=None,
 ):
     """Append the run-log SUMMARY into the output folder.
 
@@ -2869,6 +3017,7 @@ def _write_run_log(
         f"frames_loaded: {frames_loaded}  included: {n_included}  rejected_wcs: {n_rejected}",
         f"canvas: {canvas.width}x{canvas.height} (resolution {canvas.resolution_deg:.3g} deg/px)",
         f"layout: {layout['nx']}x{layout['ny']} (source={layout.get('layout_source', 'auto')})",
+        _format_halo_provenance(halo_provenance),
         "",
         "Timings (wall-clock):",
     ]
@@ -3740,6 +3889,7 @@ def _run_single(
     r40_output_root=None,
     r40_seam_capture_disk_budget_bytes=None,
     halo_px=ZEGRID_HALO_DEFAULT_PX,
+    halo_provenance=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3752,6 +3902,13 @@ def _run_single(
     except ZeGridHaloError as exc:
         _emit(f"ZeGrid: {exc}", lvl="ERROR", callback=progress_callback)
         raise
+    if halo_provenance is not None and int(
+        halo_provenance["effective_px"]
+    ) != int(halo_px):
+        raise RuntimeError(
+            "ZeGrid halo provenance contradiction: run-level effective "
+            f"{halo_provenance['effective_px']} != pass halo {halo_px}"
+        )
     # ZM-ZEGRID-R37-D (F1): when a capture is requested, fail-closed invalidate the
     # fixed target in THIS run's actual output dir IMMEDIATELY at run start (before
     # descriptors/layout/gauge). Idempotent with the outer invalidation; protects
@@ -4815,6 +4972,18 @@ def _run_single(
         )
         raise RuntimeError("ZeGrid: no covered pixels; cannot assemble a mosaic")
 
+    _halo_provenance_pass = _halo_provenance_for_pass(
+        halo_provenance,
+        effective_px=int(halo_px),
+        cell_ctxs=cell_ctxs,
+        requested_gauge_mode=(
+            (auto_gauge_info or {}).get("requested")
+            or getattr(science_config, "cell_gauge_mode", "global")
+        ),
+        effective_gauge_mode=_gauge_mode,
+        feather_info=feather_info,
+    )
+
     cache_report = {
         "reused": [],
         "rebuilt": assembled.complete_cells,
@@ -4843,6 +5012,7 @@ def _run_single(
     _write_raw_science_fits(
         assembled, canvas, raw_science_path,
         related_file=(aesthetic_path.name if aesthetic_path is not None else None),
+        halo_provenance=_halo_provenance_pass,
     )
 
     # ZM-ZEGRID-R18: FINAL-MOSAIC FINISHING (post-assembly, before outputs).
@@ -4907,6 +5077,7 @@ def _run_single(
         scientific_fits_suffix=(finishing_config or {}).get(
             "scientific_fits_suffix", "_science"
         ),
+        halo_provenance=_halo_provenance_pass,
     )
 
     _write_run_log(
@@ -4929,6 +5100,7 @@ def _run_single(
         finishing_info=finishing_info,
         gpu_context=gpu_ctx,
         aggregate_peak_rss_kib=aggregate_peak_rss_kib,
+        halo_provenance=_halo_provenance_pass,
     )
 
     # ZM-PROGRESS-CONTRACT-R29: the finalize seam completes (1/1) only now that
@@ -5018,7 +5190,10 @@ def _resolve_output_paths(output_dir, finishing_config):
     return raw_path, aest_path
 
 
-def _write_raw_science_fits(assembled, canvas, raw_science_path, role="SCI", related_file=None):
+def _write_raw_science_fits(
+    assembled, canvas, raw_science_path, role="SCI", related_file=None,
+    halo_provenance=None,
+):
     """Write the immutable pre-finishing assembled science FITS.
 
     Written BEFORE finishing runs so a finishing exception can never destroy the
@@ -5042,6 +5217,7 @@ def _write_raw_science_fits(assembled, canvas, raw_science_path, role="SCI", rel
         sha256=_array_sha256(raw_data),
         related_file=related_file,
     )
+    _record_halo_cards(raw_header, halo_provenance)
     record_nonfinite_fill(raw_header, nf_replaced)
     _atomic_writeto(fits.PrimaryHDU(raw_data, header=raw_header), raw_science_path)
     return raw_science_path
@@ -5272,6 +5448,7 @@ def _write_outputs(
     aesthetic_path=None,
     export_aesthetic_fits=False,
     scientific_fits_suffix=None,
+    halo_provenance=None,
 ):
     output_dir = Path(output_dir)
     # ZM-ZEGRID-R18: use the finished (aesthetic) science when provided (bit-equal
@@ -5306,7 +5483,10 @@ def _write_outputs(
     # float32 (AESTH role), written only when ``export_aesthetic_fits``.
     if raw_science_path is None:
         raw_science_path = output_dir / "mosaic_grid.fits"
-        _write_raw_science_fits(assembled, canvas, raw_science_path)
+        _write_raw_science_fits(
+            assembled, canvas, raw_science_path,
+            halo_provenance=halo_provenance,
+        )
     raw_science_path = Path(raw_science_path)
 
     if aesthetic_path is not None:
@@ -5337,6 +5517,7 @@ def _write_outputs(
             sha256=_array_sha256(sci_data),
             related_file=raw_science_path.name,
         )
+        _record_halo_cards(sci_header, halo_provenance)
         record_nonfinite_fill(sci_header, _sci_nf_replaced)
         _atomic_writeto(fits.PrimaryHDU(sci_data, header=sci_header), aesthetic_path)
     elif export_aesthetic_fits:
@@ -5351,6 +5532,7 @@ def _write_outputs(
         u16_header = _canvas_header(canvas, ndim=3, channels=3)
         u16_header["BUNIT"] = ("adu16", "uint16 render (see finishing.uint16)")
         u16_header["SCIROLE"] = ("uint16_render", "derived render, NOT a science reference")
+        _record_halo_cards(u16_header, halo_provenance)
         _u16_info = (finishing_info or {}).get("uint16", {})
         if "vmin" in _u16_info:
             u16_header["U16VMIN"] = (float(_u16_info["vmin"]), "scaling vmin (float ADU)")
@@ -5365,6 +5547,7 @@ def _write_outputs(
 
     cov_header = _canvas_header(canvas, ndim=2)
     cov_header["BUNIT"] = ("count", "per-pixel stack depth (max over channels)")
+    _record_halo_cards(cov_header, halo_provenance)
     cov_path = output_dir / "mosaic_grid_coverage.fits"
     _atomic_writeto(fits.PrimaryHDU(stack_depth, header=cov_header), cov_path)
 
@@ -5436,6 +5619,39 @@ def _write_outputs(
     cache_peak_bytes = (cache_report or {}).get("peak_cell_bytes", cache_total_bytes)
     cache_retention = (cache_report or {}).get("retention")
 
+    # ZM-ZEGRID-R53b: cross-check the pass provenance against the EXISTING
+    # gauge/feather facts before publishing anything. These are the same facts,
+    # never a second resolution; a contradiction is a hard error.
+    if halo_provenance is not None:
+        _hp_mode = str(halo_provenance.get("effective_gauge_mode"))
+        _cfg_mode = str(getattr(science_config, "cell_gauge_mode", "global"))
+        if _hp_mode != _cfg_mode:
+            raise RuntimeError(
+                "ZeGrid halo provenance contradiction: provenance gauge "
+                f"{_hp_mode!r} != science_config {_cfg_mode!r}"
+            )
+        _feather_ran = cell_feather_info is not None
+        if bool(halo_provenance.get("feather_applied")) != bool(_feather_ran):
+            raise RuntimeError(
+                "ZeGrid halo provenance contradiction: feather_applied="
+                f"{halo_provenance.get('feather_applied')} but cell_feather "
+                f"present={_feather_ran}"
+            )
+        if _feather_ran:
+            if int(cell_feather_info.get("halo_px")) != int(
+                halo_provenance["effective_px"]
+            ):
+                raise RuntimeError(
+                    "ZeGrid halo provenance contradiction: cell_feather.halo_px="
+                    f"{cell_feather_info.get('halo_px')} != effective "
+                    f"{halo_provenance['effective_px']}"
+                )
+            if _hp_mode != "per_cell":
+                raise RuntimeError(
+                    "ZeGrid halo provenance contradiction: feather ran in "
+                    f"non-per_cell mode {_hp_mode!r}"
+                )
+
     manifest = {
         "schema": "zemosaic-zegrid-r7-manifest-v1",
         "engine": "zegrid",
@@ -5449,6 +5665,13 @@ def _write_outputs(
                    "max_contributors": layout["max_contributors"],
                    "predicted_bound_bytes": layout["predicted_bound_bytes"]},
         "layout_source": layout.get("layout_source", "auto"),
+        # ZM-ZEGRID-R53b: ONE stable top-level provenance block (same shape for
+        # global / per_cell / auto outcomes). It is resolved once at the product
+        # entry and threaded here explicitly; it never re-reads config.
+        **(
+            {"zegrid_halo": dict(halo_provenance)}
+            if halo_provenance is not None else {}
+        ),
         "reproducibility_note": (
             "output science is GLOBAL-gauge normalized (one reference frame + "
             "per-frame coefficients computed over the full canvas), so the science "
@@ -5567,6 +5790,16 @@ def _write_outputs(
                   "peak_cell_bytes": int(cache_peak_bytes),
                   "retention": cache_retention,
                   "n_frame_entries": int(cache_files),
+                  "reuse_identity": {
+                      "bound_to": ["patch_shape_hw", "patch_bounds", "patch_wcs"],
+                      "note": (
+                          "R53a cache reuse is GEOMETRY-BOUND: a cell cache is "
+                          "reusable only when its patch shape (HW), global patch "
+                          "bounds and patch WCS identity match the current patch. "
+                          "A cache without this identity (or with a different one) "
+                          "is never reused under the product expectation."
+                      ),
+                  },
                   "cleanup_failures": {
                       "count": len((cache_report or {}).get("cleanup_failures", [])),
                       "paths": list((cache_report or {}).get("cleanup_failures", [])),
@@ -5716,24 +5949,28 @@ def run_zegrid_mode(
     # request fails before descriptors, layouts, gauge work or any output. The
     # precedence matches ``cell_gauge_mode``: explicit keyword > config key >
     # product default. No global is mutated; the validated int is threaded down.
-    _halo_requested = zegrid_halo_px
-    _halo_source = "explicit argument"
-    if _halo_requested is None and zconfig is not None:
-        _halo_requested = getattr(zconfig, ZEGRID_HALO_CONFIG_KEY, None)
-        _halo_source = f"{ZEGRID_HALO_CONFIG_KEY} config"
-    if _halo_requested is None:
-        _halo_source = "product default"
+    _halo_config_value = (
+        getattr(zconfig, ZEGRID_HALO_CONFIG_KEY, None)
+        if zconfig is not None else None
+    )
     try:
-        resolved_halo_px = resolve_zegrid_halo_px(_halo_requested)
+        halo_provenance = resolve_run_halo_provenance(
+            zegrid_halo_px, _halo_config_value
+        )
     except ZeGridHaloError as exc:
         _emit(f"ZeGrid: {exc}", lvl="ERROR", callback=progress_callback)
         raise
+    resolved_halo_px = int(halo_provenance["effective_px"])
+    _requested_for_log = (
+        "absent" if halo_provenance["requested_px"] is None
+        else str(halo_provenance["requested_px"])
+    )
     _emit(
         "ZeGrid: anti-checkerboard halo — requested="
-        f"{resolved_halo_px if _halo_requested is None else _halo_requested!r} "
-        f"-> effective={resolved_halo_px} px (source={_halo_source}); this width "
-        "drives patch geometry, contributors, gauge domain, measurement "
-        "band=2H and feather=H",
+        f"{_requested_for_log} -> effective={resolved_halo_px} px "
+        f"(source={halo_provenance['source']}); this width drives patch geometry, "
+        "contributor membership, gauge patch domain, measurement band=2H and "
+        "feather=H in per_cell mode",
         callback=progress_callback,
     )
 
@@ -6049,6 +6286,7 @@ def run_zegrid_mode(
                         finishing_config=finishing_config,
                         gpu_context=gpu_context, pass_label="EQ",
                         halo_px=resolved_halo_px,
+                        halo_provenance=halo_provenance,
                         r37_diagnostic_capture=r37_diagnostic_capture,
                         r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                         r40_seam_capture=r40_seam_capture,
@@ -6063,6 +6301,7 @@ def run_zegrid_mode(
                         finishing_config=finishing_config,
                         gpu_context=gpu_context, pass_label="ALTZ",
                         halo_px=resolved_halo_px,
+                        halo_provenance=halo_provenance,
                         r37_diagnostic_capture=r37_diagnostic_capture,
                         r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                         r40_seam_capture=r40_seam_capture,
@@ -6079,6 +6318,7 @@ def run_zegrid_mode(
                     finishing_config=finishing_config,
                     gpu_context=gpu_context, pass_label="single",
                     halo_px=resolved_halo_px,
+                    halo_provenance=halo_provenance,
                     r37_diagnostic_capture=r37_diagnostic_capture,
                     r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                     r40_seam_capture=r40_seam_capture,
