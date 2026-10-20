@@ -856,5 +856,14 @@
     "qt_field_use_disk_backed": "Use disk-backed intermediates to reduce RAM usage",
     "qt_field_temporary_work_dir": "Temporary working directory",
     "qt_dialog_select_temporary_work_dir": "Select temporary working directory",
-    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder."
+    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder.",
+    "qt_field_zegrid_halo_label": "Mýking gegn skákborðsmynstri",
+    "qt_field_zegrid_halo_tip": "Hærri gildi gera skiptingar milli reita mýkri við misleitar myndatökur, en auka vinnslutíma, diskpláss og minni. Þau fjarlægja ekki halla sem þegar er í myndunum. Gildin eru punktar á úttaksstriga. 64 px er ráðlagt sjálfgefið gildi; 256 px er tilraunakennt.",
+    "qt_zegrid_halo_opt_8": "Hratt / samhæfni",
+    "qt_zegrid_halo_opt_16": "Létt",
+    "qt_zegrid_halo_opt_32": "Miðlungs",
+    "qt_zegrid_halo_opt_64": "Mælt með (sjálfgefið)",
+    "qt_zegrid_halo_opt_128": "Mikill munur / mjög misleit gögn",
+    "qt_zegrid_halo_opt_256": "Tilraunakennt",
+    "qt_zegrid_halo_invalid_value": "Ógilt gildi fyrir mýkingu ZeGrid gegn skákborðsmynstri: {value}. Leyfð gildi: {allowed}. Veldu gilt gildi áður en keyrsla hefst."
 }

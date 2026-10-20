@@ -78,6 +78,11 @@ from ._resources import resource_path_optional
 from . import progress_contract as zprogress
 from . import eta_service as zeta
 from .zegrid_halo import ZEGRID_HALO_DEFAULT_PX
+from .zegrid_halo import (
+    ZEGRID_HALO_ALLOWED_PX,
+    ZeGridHaloError,
+    resolve_zegrid_halo_px,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1738,6 +1743,42 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
         self._zegrid_mode_checkbox = zegrid_checkbox
 
+        # ZM-ZEGRID-R53C: non-editable halo selector directly below the ZeGrid
+        # checkbox. Items are built from the shared engine contract; Qt item data
+        # stays an int, localized labels are display-only.
+        zegrid_halo_label = QLabel(
+            self._tr("qt_field_zegrid_halo_label", "Anti-checkerboard smoothing")
+        )
+        zegrid_halo_combo = QComboBox()
+        zegrid_halo_combo.setEditable(False)
+        zegrid_halo_combo.setInsertPolicy(QComboBox.NoInsert)
+        zegrid_halo_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        zegrid_halo_combo.setMinimumContentsLength(18)
+        for _halo_px in ZEGRID_HALO_ALLOWED_PX:
+            zegrid_halo_combo.addItem(
+                self._zegrid_halo_item_label(int(_halo_px)), int(_halo_px)
+            )
+        self._zegrid_halo_label = zegrid_halo_label
+        self._zegrid_halo_combo = zegrid_halo_combo
+        halo_tip = self._zegrid_halo_tooltip()
+        zegrid_halo_label.setToolTip(halo_tip)
+        zegrid_halo_combo.setToolTip(halo_tip)
+        try:
+            zegrid_halo_label.setBuddy(zegrid_halo_combo)
+        except Exception:
+            pass
+        layout.addRow(zegrid_halo_label, zegrid_halo_combo)
+        self._config_fields["zegrid_halo_px"] = {
+            "kind": "combobox",
+            "widget": zegrid_halo_combo,
+            "type": int,
+            "value_getter": self._zegrid_halo_combo_value,
+        }
+        self._sync_zegrid_halo_combo_from_config()
+        zegrid_halo_combo.currentIndexChanged.connect(
+            lambda _=None: self._on_zegrid_halo_selection_changed()
+        )
+
         # One logical state, three mutually exclusive checkboxes.
         self._mode_checkboxes = {
             "existing_master_tiles": master_tiles_checkbox,
@@ -1751,7 +1792,158 @@ class ZeMosaicQtMainWindow(QMainWindow):
             )  # type: ignore[arg-type]
         self._sync_mode_config_keys()
         self._apply_existing_master_tiles_mode()
+        self._apply_zegrid_halo_control_state()
         return group
+
+    # ------------------------------------------------------------------
+    # ZeGrid anti-checkerboard smoothing (ZM-ZEGRID-R53C)
+    # ------------------------------------------------------------------
+    _ZEGRID_HALO_ITEM_FALLBACKS = {
+        8: "Fast / compatibility",
+        16: "Light",
+        32: "Moderate",
+        64: "Recommended (default)",
+        128: "Large gaps / very heterogeneous data",
+        256: "Experimental",
+    }
+
+    def _zegrid_halo_item_label(self, value: int) -> str:
+        fallback = self._ZEGRID_HALO_ITEM_FALLBACKS.get(value, str(value))
+        text = self._tr(f"qt_zegrid_halo_opt_{int(value)}", fallback)
+        return f"{int(value)} px — {text}"
+
+    def _zegrid_halo_tooltip(self) -> str:
+        return self._tr(
+            "qt_field_zegrid_halo_tip",
+            "Larger values make Cell transitions more progressive on "
+            "heterogeneous acquisitions, but they raise processing time, disk "
+            "and memory use. They do NOT remove gradients already present in "
+            "the images. Values are output-canvas pixels. 64 px is the "
+            "recommended default; 256 px is experimental.",
+        )
+
+    def _zegrid_halo_invalid_message(self, raw_value: Any) -> str:
+        template = self._tr(
+            "qt_zegrid_halo_invalid_value",
+            "Invalid ZeGrid anti-checkerboard smoothing value {value}. "
+            "Allowed values: {allowed}. Select a valid value before starting a run.",
+        )
+        try:
+            return template.format(
+                value=repr(raw_value),
+                allowed=", ".join(str(v) for v in ZEGRID_HALO_ALLOWED_PX),
+            )
+        except Exception:
+            return str(template)
+
+    def _zegrid_halo_combo_value(self) -> Any:
+        """Return the valid integer item data, or preserve an invalid config value."""
+        combo = getattr(self, "_zegrid_halo_combo", None)
+        if combo is not None:
+            data = combo.currentData()
+            if data is not None and not isinstance(data, bool):
+                try:
+                    return int(resolve_zegrid_halo_px(data))
+                except (ZeGridHaloError, TypeError, ValueError):
+                    pass
+        return self.config.get("zegrid_halo_px", ZEGRID_HALO_DEFAULT_PX)
+
+    def _sync_zegrid_halo_combo_from_config(self) -> bool:
+        """Select the config value when valid; keep an invalid value untouched."""
+        combo = getattr(self, "_zegrid_halo_combo", None)
+        if combo is None:
+            return False
+        raw_value = self.config.get("zegrid_halo_px", ZEGRID_HALO_DEFAULT_PX)
+        try:
+            value = resolve_zegrid_halo_px(raw_value)
+        except (ZeGridHaloError, TypeError, ValueError):
+            combo.blockSignals(True)
+            try:
+                combo.setCurrentIndex(-1)
+            finally:
+                combo.blockSignals(False)
+            combo.setProperty("zegrid_halo_invalid", True)
+            return False
+        index = combo.findData(int(value))
+        combo.blockSignals(True)
+        try:
+            combo.setCurrentIndex(index if index >= 0 else -1)
+        finally:
+            combo.blockSignals(False)
+        combo.setProperty("zegrid_halo_invalid", False)
+        self.config["zegrid_halo_px"] = int(value)
+        return True
+
+    def _on_zegrid_halo_selection_changed(self) -> None:
+        combo = getattr(self, "_zegrid_halo_combo", None)
+        if combo is None:
+            return
+        data = combo.currentData()
+        if data is None or isinstance(data, bool):
+            # The transient "invalid" index (-1) must not overwrite the raw
+            # invalid config value; a real selection is required to clear it.
+            return
+        try:
+            value = resolve_zegrid_halo_px(data)
+        except (ZeGridHaloError, TypeError, ValueError):
+            return
+        self.config["zegrid_halo_px"] = int(value)
+        combo.setProperty("zegrid_halo_invalid", False)
+        self._apply_zegrid_halo_control_state()
+
+    def _apply_zegrid_halo_control_state(self, running: bool | None = None) -> None:
+        """Single source of truth for the combo/label enabled state.
+
+        Enabled iff the effective selected mode is ZeGrid and no processing is
+        running. A disabled combo keeps its selected value.
+        """
+        combo = getattr(self, "_zegrid_halo_combo", None)
+        label = getattr(self, "_zegrid_halo_label", None)
+        if combo is None:
+            return
+        if running is None:
+            running = bool(getattr(self, "is_processing", False))
+        enabled = self._selected_processing_mode() == "zegrid" and not bool(running)
+        try:
+            combo.setEnabled(enabled)
+        except Exception:
+            pass
+        if label is not None:
+            try:
+                label.setEnabled(enabled)
+            except Exception:
+                pass
+
+    def _validate_zegrid_halo_for_start(self) -> bool:
+        """Sync the current combo and refuse an invalid value before worker spawn."""
+        combo = getattr(self, "_zegrid_halo_combo", None)
+        if combo is not None:
+            data = combo.currentData()
+            if data is not None and not isinstance(data, bool):
+                try:
+                    value = resolve_zegrid_halo_px(data)
+                except (ZeGridHaloError, TypeError, ValueError):
+                    pass
+                else:
+                    self.config["zegrid_halo_px"] = int(value)
+                    combo.setProperty("zegrid_halo_invalid", False)
+        raw_value = self.config.get("zegrid_halo_px", ZEGRID_HALO_DEFAULT_PX)
+        try:
+            value = resolve_zegrid_halo_px(raw_value)
+        except (ZeGridHaloError, TypeError, ValueError):
+            message = self._zegrid_halo_invalid_message(raw_value)
+            self._append_log(message, level="warning")
+            QMessageBox.warning(
+                self,
+                self._tr(
+                    "qt_error_invalid_config_title",
+                    "Invalid configuration",
+                ),
+                message,
+            )
+            return False
+        self.config["zegrid_halo_px"] = int(value)
+        return True
 
     def _selected_processing_mode(self) -> str:
         """Return the single selected pipeline mode (classic when none)."""
@@ -1805,6 +1997,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     pass
         self._sync_mode_config_keys()
         self._apply_existing_master_tiles_mode()
+        self._apply_zegrid_halo_control_state()
 
     def _existing_master_tiles_enabled(self) -> bool:
         enabled = self._normalize_config_bool(
@@ -4658,6 +4851,31 @@ class ZeMosaicQtMainWindow(QMainWindow):
         merged_config.update(config_data)
         merged_config.setdefault("language", "en")
 
+        # ZM-ZEGRID-R53C migration: absent -> shared default 64; a valid
+        # explicit value (including a legacy numeric string) -> normalized int;
+        # anything invalid stays visible as-is and blocks a start until fixed.
+        try:
+            merged_config["zegrid_halo_px"] = int(
+                resolve_zegrid_halo_px(merged_config.get("zegrid_halo_px"))
+            )
+        except (ZeGridHaloError, TypeError, ValueError):
+            _halo_raw = merged_config.get("zegrid_halo_px")
+            merged_config["zegrid_halo_px"] = _halo_raw
+            notes.append(
+                (
+                    "warning",
+                    "qt_zegrid_halo_invalid_value",
+                    "Invalid ZeGrid anti-checkerboard smoothing value {value}. "
+                    "Allowed values: {allowed}. Select a valid value before starting a run.",
+                    {
+                        "value": repr(_halo_raw),
+                        "allowed": ", ".join(
+                            str(v) for v in ZEGRID_HALO_ALLOWED_PX
+                        ),
+                    },
+                )
+            )
+
         canonical_gpu_pref: Any = merged_config.get("use_gpu_phase5")
         if canonical_gpu_pref in (None, ""):
             for legacy_key in ("stack_use_gpu", "use_gpu_stack"):
@@ -5594,6 +5812,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._reset_progress_tracking()
         if self.language_combo is not None:
             self.language_combo.setEnabled(not running)
+        self._apply_zegrid_halo_control_state(running=running)
 
     def _normalize_log_level(self, level: str | None) -> str:
         if not level:
@@ -7207,6 +7426,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
 
         self._collect_config_from_widgets()
+        if not self._validate_zegrid_halo_for_start():
+            return
         use_existing_master_tiles = self._existing_master_tiles_enabled()
 
         skip_filter_ui_for_run = bool(predecided_skip_filter_ui) if predecided_skip_filter_ui is not None else False
@@ -7622,6 +7843,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "force_seestar_mode": bool(self.config.get("force_seestar_mode", False)),
             "sds_mode_default": bool(self.config.get("sds_mode_default", False)),
             "zegrid_mode_enabled": bool(self.config.get("zegrid_mode_enabled", False)),
+            # Read-only transport of the single main-window value: the Filter has
+            # no duplicate halo control and must never become a second authority.
+            "zegrid_halo_px": self._json_safe_config_value(
+                self.config.get("zegrid_halo_px", ZEGRID_HALO_DEFAULT_PX)
+            ),
             "global_coadd_method": str(self.config.get("global_coadd_method", "kappa_sigma") or "kappa_sigma"),
             "global_coadd_k": global_coadd_k_value,
             "global_wcs_output_path": str(
@@ -7775,6 +8001,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         try:
             self._sync_mode_config_keys()
             self._apply_existing_master_tiles_mode()
+            self._apply_zegrid_halo_control_state()
         except Exception:
             pass
 
@@ -7810,6 +8037,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 widget.setText(str(value))
         except Exception:
             pass
+        if key == "zegrid_halo_px":
+            self._sync_zegrid_halo_combo_from_config()
+            self._apply_zegrid_halo_control_state()
 
     def _clear_filter_results(self) -> None:
         self._last_filter_overrides = None

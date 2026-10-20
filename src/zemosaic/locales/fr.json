@@ -915,5 +915,14 @@
   "qt_field_use_disk_backed": "Utiliser des intermédiaires sur disque pour économiser la RAM",
   "qt_field_temporary_work_dir": "Dossier de travail temporaire",
   "qt_dialog_select_temporary_work_dir": "Sélectionner le dossier de travail temporaire",
-  "qt_hint_temporary_work_dir": "Laisser vide pour utiliser le dossier de sortie. Les gros fichiers temporaires iront ici ; les résultats finaux restent toujours dans le dossier de sortie."
+  "qt_hint_temporary_work_dir": "Laisser vide pour utiliser le dossier de sortie. Les gros fichiers temporaires iront ici ; les résultats finaux restent toujours dans le dossier de sortie.",
+  "qt_field_zegrid_halo_label": "Lissage anti-damier",
+  "qt_field_zegrid_halo_tip": "Une valeur élevée adoucit davantage les transitions entre cellules, notamment sur les acquisitions hétérogènes. Elle augmente le temps de traitement, l’espace disque et la mémoire, et ne supprime pas les gradients déjà présents dans les images. Les valeurs sont en pixels du canevas de sortie. 64 px est la valeur recommandée par défaut ; 256 px est expérimental.",
+  "qt_zegrid_halo_opt_8": "Rapide / compatibilité",
+  "qt_zegrid_halo_opt_16": "Léger",
+  "qt_zegrid_halo_opt_32": "Modéré",
+  "qt_zegrid_halo_opt_64": "Recommandé (défaut)",
+  "qt_zegrid_halo_opt_128": "Forts écarts / données très hétérogènes",
+  "qt_zegrid_halo_opt_256": "Expérimental",
+  "qt_zegrid_halo_invalid_value": "Valeur de lissage anti-damier ZeGrid invalide : {value}. Valeurs autorisées : {allowed}. Sélectionnez une valeur valide avant de lancer un traitement."
 }

@@ -856,5 +856,14 @@
     "qt_field_use_disk_backed": "Use disk-backed intermediates to reduce RAM usage",
     "qt_field_temporary_work_dir": "Temporary working directory",
     "qt_dialog_select_temporary_work_dir": "Select temporary working directory",
-    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder."
+    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder.",
+    "qt_field_zegrid_halo_label": "Anti-dambord-vervaging",
+    "qt_field_zegrid_halo_tip": "Grotere waarden maken celovergangen geleidelijker bij heterogene opnames, maar verhogen de verwerkingstijd, schijfruimte en het geheugengebruik. Ze verwijderen geen gradiënten die al in de beelden aanwezig zijn. De waarden zijn pixels van het uitvoerdoek. 64 px is de aanbevolen standaard; 256 px is experimenteel.",
+    "qt_zegrid_halo_opt_8": "Snel / compatibiliteit",
+    "qt_zegrid_halo_opt_16": "Licht",
+    "qt_zegrid_halo_opt_32": "Matig",
+    "qt_zegrid_halo_opt_64": "Aanbevolen (standaard)",
+    "qt_zegrid_halo_opt_128": "Grote verschillen / zeer heterogene data",
+    "qt_zegrid_halo_opt_256": "Experimenteel",
+    "qt_zegrid_halo_invalid_value": "Ongeldige waarde voor ZeGrid anti-dambord-vervaging: {value}. Toegestane waarden: {allowed}. Selecteer een geldige waarde voordat u een run start."
 }

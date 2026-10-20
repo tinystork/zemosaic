@@ -856,5 +856,14 @@
     "qt_field_use_disk_backed": "Use disk-backed intermediates to reduce RAM usage",
     "qt_field_temporary_work_dir": "Temporary working directory",
     "qt_dialog_select_temporary_work_dir": "Select temporary working directory",
-    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder."
+    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder.",
+    "qt_field_zegrid_halo_label": "Suavizado anti-damero",
+    "qt_field_zegrid_halo_tip": "Los valores altos suavizan más las transiciones entre celdas en adquisiciones heterogéneas, pero aumentan el tiempo de procesamiento, el disco y la memoria. No eliminan los gradientes ya presentes en las imágenes. Los valores son píxeles del lienzo de salida. 64 px es el valor recomendado por defecto; 256 px es experimental.",
+    "qt_zegrid_halo_opt_8": "Rápido / compatibilidad",
+    "qt_zegrid_halo_opt_16": "Ligero",
+    "qt_zegrid_halo_opt_32": "Moderado",
+    "qt_zegrid_halo_opt_64": "Recomendado (predeterminado)",
+    "qt_zegrid_halo_opt_128": "Grandes diferencias / datos muy heterogéneos",
+    "qt_zegrid_halo_opt_256": "Experimental",
+    "qt_zegrid_halo_invalid_value": "Valor no válido de suavizado anti-damero de ZeGrid: {value}. Valores permitidos: {allowed}. Seleccione un valor válido antes de iniciar un procesamiento."
 }

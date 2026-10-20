@@ -31045,6 +31045,10 @@ def run_hierarchical_mosaic(
     solver_settings: dict | None = None,
     skip_filter_ui: bool = False,
     use_existing_master_tiles_config: bool = False,
+    # ZM-ZEGRID-R53C: explicit GUI -> worker transport. Optional so existing
+    # callers keep their current behavior; the value still comes from the
+    # persisted config when this argument is absent.
+    zegrid_halo_px: int | str | None = None,
     # New optional integration points when filter ran in GUI
     filter_invoked: bool = False,
     filter_overrides: dict | None = None,
@@ -31077,6 +31081,15 @@ def run_hierarchical_mosaic(
         zconfig = SimpleNamespace(**worker_config_cache)
     except Exception:
         zconfig = SimpleNamespace()
+
+    # ZM-ZEGRID-R53C: the GUI value crosses the worker boundary explicitly.
+    # Keep the persisted-config fallback for callers that do not pass it.
+    if zegrid_halo_px is not None:
+        worker_config_cache["zegrid_halo_px"] = zegrid_halo_px
+        try:
+            setattr(zconfig, "zegrid_halo_px", zegrid_halo_px)
+        except Exception:
+            pass
 
     _apply_safe_dynamic_chunk_profile(worker_config_cache, zconfig, pcb=None)
 

@@ -856,5 +856,14 @@
     "qt_field_use_disk_backed": "Use disk-backed intermediates to reduce RAM usage",
     "qt_field_temporary_work_dir": "Temporary working directory",
     "qt_dialog_select_temporary_work_dir": "Select temporary working directory",
-    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder."
+    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder.",
+    "qt_field_zegrid_halo_label": "Wygładzanie anty-szachownicowe",
+    "qt_field_zegrid_halo_tip": "Większe wartości łagodniej przechodzą między komórkami przy niejednorodnych akwizycjach, ale zwiększają czas przetwarzania, zużycie dysku i pamięci. Nie usuwają gradientów już obecnych na obrazach. Wartości są w pikselach kanwy wyjściowej. 64 px to zalecana wartość domyślna; 256 px jest eksperymentalne.",
+    "qt_zegrid_halo_opt_8": "Szybko / zgodność",
+    "qt_zegrid_halo_opt_16": "Lekkie",
+    "qt_zegrid_halo_opt_32": "Umiarkowane",
+    "qt_zegrid_halo_opt_64": "Zalecane (domyślne)",
+    "qt_zegrid_halo_opt_128": "Duże różnice / bardzo niejednorodne dane",
+    "qt_zegrid_halo_opt_256": "Eksperymentalne",
+    "qt_zegrid_halo_invalid_value": "Nieprawidłowa wartość wygładzania anty-szachownicowego ZeGrid: {value}. Dozwolone wartości: {allowed}. Wybierz prawidłową wartość przed uruchomieniem."
 }

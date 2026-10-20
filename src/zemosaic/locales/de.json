@@ -856,5 +856,14 @@
     "qt_field_use_disk_backed": "Use disk-backed intermediates to reduce RAM usage",
     "qt_field_temporary_work_dir": "Temporary working directory",
     "qt_dialog_select_temporary_work_dir": "Select temporary working directory",
-    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder."
+    "qt_hint_temporary_work_dir": "Leave empty to use the output folder. Large temporary files go here; final results always stay in the output folder.",
+    "qt_field_zegrid_halo_label": "Anti-Kachelmuster-Glättung",
+    "qt_field_zegrid_halo_tip": "Größere Werte machen Zellübergänge bei heterogenen Aufnahmen allmählicher, erhöhen aber Rechenzeit, Speicherplatz und Arbeitsspeicher. Sie entfernen keine bereits in den Bildern vorhandenen Gradienten. Die Werte sind Pixel der Ausgabe-Leinwand. 64 px ist der empfohlene Standard; 256 px ist experimentell.",
+    "qt_zegrid_halo_opt_8": "Schnell / Kompatibilität",
+    "qt_zegrid_halo_opt_16": "Leicht",
+    "qt_zegrid_halo_opt_32": "Mäßig",
+    "qt_zegrid_halo_opt_64": "Empfohlen (Standard)",
+    "qt_zegrid_halo_opt_128": "Große Abweichungen / sehr heterogene Daten",
+    "qt_zegrid_halo_opt_256": "Experimentell",
+    "qt_zegrid_halo_invalid_value": "Ungültiger Wert für die ZeGrid-Anti-Kachelmuster-Glättung: {value}. Zulässige Werte: {allowed}. Wählen Sie vor dem Start einen gültigen Wert."
 }
