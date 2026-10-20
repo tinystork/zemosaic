@@ -212,6 +212,103 @@ def test_c_invalid_values_are_surfaced_not_rounded(tmp_path, monkeypatch, bad):
     assert win._validate_zegrid_halo_for_start() is True
 
 
+def _install_start_capture(win, monkeypatch):
+    import zemosaic.zemosaic_gui_qt as gui
+
+    warnings: list[str] = []
+    started: list[object] = []
+    monkeypatch.setattr(gui, "run_hierarchical_mosaic_process", object())
+    monkeypatch.setattr(
+        gui.QMessageBox, "warning", lambda *a, **k: warnings.append(str(a[2]))
+    )
+    monkeypatch.setattr(
+        win, "_begin_async_worker_start", lambda *a, **k: started.append((a, k))
+    )
+    return warnings, started
+
+
+@pytest.mark.parametrize("mode_key", [None, "sds", "existing_master_tiles"])
+def test_c_invalid_halo_does_not_block_unrelated_pipelines(
+    tmp_path, monkeypatch, mode_key
+):
+    config = {"zegrid_halo_px": "bad"}
+    if mode_key == "sds":
+        config["sds_mode_default"] = True
+    elif mode_key == "existing_master_tiles":
+        config["use_existing_master_tiles"] = True
+    win = _make_window(tmp_path, monkeypatch, config)
+    if mode_key is not None:
+        win._mode_checkboxes[mode_key].setChecked(True)
+    assert win._selected_processing_mode() == (mode_key or "classic")
+    win._clear_log()
+
+    warnings, started = _install_start_capture(win, monkeypatch)
+    win._start_processing(skip_filter_prompt=True, predecided_skip_filter_ui=True)
+
+    assert len(started) == 1, "the unrelated pipeline must still reach spawn"
+    assert warnings == []
+    assert win.config["zegrid_halo_px"] == "bad"  # never repaired or saved over
+    log_text = win.log_output.toPlainText()
+    assert log_text.count("Invalid ZeGrid anti-checkerboard smoothing value") == 1
+
+
+def test_c_invalid_halo_blocks_zegrid_before_spawn(tmp_path, monkeypatch):
+    win = _make_window(
+        tmp_path,
+        monkeypatch,
+        {"zegrid_halo_px": "bad", "zegrid_mode_enabled": True},
+    )
+    win._clear_log()
+    warnings, started = _install_start_capture(win, monkeypatch)
+    win._start_processing(skip_filter_prompt=True, predecided_skip_filter_ui=True)
+    assert started == []
+    assert warnings and "Invalid" in warnings[-1]
+    assert win.config["zegrid_halo_px"] == "bad"
+    assert win.log_output.toPlainText().count(
+        "Invalid ZeGrid anti-checkerboard smoothing value"
+    ) == 1
+
+
+def test_c_filter_mode_change_to_zegrid_blocks_invalid_halo(tmp_path, monkeypatch):
+    import zemosaic.zemosaic_gui_qt as gui
+
+    win = _make_window(tmp_path, monkeypatch, {"zegrid_halo_px": "bad"})
+    assert win._selected_processing_mode() == "classic"
+    win._clear_log()
+    warnings, started = _install_start_capture(win, monkeypatch)
+    monkeypatch.setattr(gui.QMessageBox, "question", lambda *a, **k: gui.QMessageBox.Yes)
+
+    def _filter_switches_to_zegrid() -> bool:
+        win._mode_checkboxes["zegrid"].setChecked(True)
+        return True
+
+    monkeypatch.setattr(win, "_launch_filter_dialog", _filter_switches_to_zegrid)
+    win._start_processing(skip_filter_prompt=False, predecided_skip_filter_ui=None)
+
+    assert win._selected_processing_mode() == "zegrid"
+    assert started == [], "no worker may be spawned with an invalid ZeGrid halo"
+    assert warnings and "Invalid" in warnings[-1]
+    assert win.config["zegrid_halo_px"] == "bad"
+    assert win.log_output.toPlainText().count(
+        "Invalid ZeGrid anti-checkerboard smoothing value"
+    ) == 1
+
+
+def test_c_valid_zegrid_halo_starts_normally(tmp_path, monkeypatch):
+    win = _make_window(
+        tmp_path,
+        monkeypatch,
+        {"zegrid_halo_px": 32, "zegrid_mode_enabled": True},
+    )
+    win._clear_log()
+    warnings, started = _install_start_capture(win, monkeypatch)
+    win._start_processing(skip_filter_prompt=True, predecided_skip_filter_ui=True)
+    assert len(started) == 1
+    assert warnings == []
+    assert win.config["zegrid_halo_px"] == 32
+    assert "Invalid ZeGrid anti-checkerboard smoothing value" not in win.log_output.toPlainText()
+
+
 # ---------------------------------------------------------------------------
 # D. Filter round-trip
 # ---------------------------------------------------------------------------
@@ -402,8 +499,11 @@ def test_f_gui_halo_reaches_worker_and_real_engine_output(tmp_path, monkeypatch)
         parsed_winsor_limits=(0.05, 0.05),
         stack_kappa_low=3.0,
         stack_kappa_high=3.0,
-        zegrid_halo_px=32,
     )
+    # S-2: the worker/engine must consume ONLY the value captured from the real
+    # GUI-generated payload after real wrapper signature filtering.
+    assert "zegrid_halo_px" in full_kwargs
+    assert full_kwargs["zegrid_halo_px"] == 32
     monkeypatch.setattr(
         zw,
         "zemosaic_config",

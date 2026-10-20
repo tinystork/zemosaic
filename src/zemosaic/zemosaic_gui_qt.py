@@ -1915,7 +1915,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 pass
 
     def _validate_zegrid_halo_for_start(self) -> bool:
-        """Sync the current combo and refuse an invalid value before worker spawn."""
+        """Sync/validate the halo and block only an effective ZeGrid run.
+
+        An invalid raw value is never repaired or saved over. It blocks a
+        ZeGrid spawn, but an unrelated Classic/SDS/master-tiles run still
+        starts and merely keeps the warning in the log. Callers invoke this
+        again after Filter/mode handling, immediately before snapshot/save.
+        """
         combo = getattr(self, "_zegrid_halo_combo", None)
         if combo is not None:
             data = combo.currentData()
@@ -1932,7 +1938,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             value = resolve_zegrid_halo_px(raw_value)
         except (ZeGridHaloError, TypeError, ValueError):
             message = self._zegrid_halo_invalid_message(raw_value)
-            self._append_log(message, level="warning")
+            if not getattr(self, "_zegrid_halo_start_warning_logged", False):
+                self._append_log(message, level="warning")
+                self._zegrid_halo_start_warning_logged = True
+            if self._selected_processing_mode() != "zegrid":
+                return True
             QMessageBox.warning(
                 self,
                 self._tr(
@@ -7426,6 +7436,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
 
         self._collect_config_from_widgets()
+        # One warning per start attempt; the dialog is shown only when the
+        # effective mode actually needs the ZeGrid halo.
+        self._zegrid_halo_start_warning_logged = False
         if not self._validate_zegrid_halo_for_start():
             return
         use_existing_master_tiles = self._existing_master_tiles_enabled()
@@ -7458,6 +7471,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     return
                 else:
                     skip_filter_ui_for_run = True
+
+        # The Filter or a mode override can change the effective mode after
+        # the first preflight. Revalidate unconditionally at the last point
+        # before snapshot/save/spawn.
+        if not self._validate_zegrid_halo_for_start():
+            return
 
         run_snapshot = self._serialize_config_for_save()
         self._log_run_config_snapshot(run_snapshot)
