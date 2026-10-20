@@ -77,6 +77,7 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 from ._resources import resource_path_optional
 from . import progress_contract as zprogress
 from . import eta_service as zeta
+from .zegrid_halo import ZEGRID_HALO_DEFAULT_PX
 
 logger = logging.getLogger(__name__)
 
@@ -4432,7 +4433,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "processing_mode": "auto",
             "use_existing_master_tiles": False,
             "zegrid_mode_enabled": False,
-            "zegrid_halo_px": 64,
+            "zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX,
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
             "temporary_work_dir": "",

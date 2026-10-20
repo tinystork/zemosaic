@@ -470,7 +470,7 @@ def test_capture_run_id_nonce_distinct_same_second():
 
 def _run_per_cell_capture(inp, out):
     zz.run_zegrid_mode(
-        str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
         cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
     )
 
@@ -495,7 +495,7 @@ def test_e2e_f1_global_refusal_invalidates_prior_pair(tmp_path):
     # refused capture run on the SAME output dir
     with pytest.raises(RuntimeError):
         zz.run_zegrid_mode(
-            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
             cell_gauge_mode="global", r37_diagnostic_capture=True,
         )
     assert not target.exists()  # old fixed artifact invalidated at run start
@@ -514,7 +514,7 @@ def test_e2e_f1_auto_global_refusal_invalidates_prior_pair(tmp_path):
     _write_corpus(inp_connected, [(10.0, 30.0)] * 4)
     with pytest.raises(RuntimeError):
         zz.run_zegrid_mode(
-            str(inp_connected), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            str(inp_connected), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
             r37_diagnostic_capture=True,
         )
     assert not target.exists()
@@ -565,7 +565,7 @@ def test_e2e_f1_mount_pass_dirs_invalidated(tmp_path):
     out = tmp_path / "out"
     zz.run_zegrid_mode(
         str(inp), str(out), frames_info=frames,
-        zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
         cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
     )
     eq_art = out / "grid_EQ" / zz.R37_CAPTURE_FILENAME
@@ -574,7 +574,7 @@ def test_e2e_f1_mount_pass_dirs_invalidated(tmp_path):
     with pytest.raises(RuntimeError):
         zz.run_zegrid_mode(
             str(inp), str(out), frames_info=frames,
-            zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
             cell_gauge_mode="global", r37_diagnostic_capture=True,
         )
     assert not eq_art.exists()
@@ -609,7 +609,7 @@ def test_e2e_default_off_no_artifact_and_no_diagnostic_call(tmp_path, monkeypatc
 
     monkeypatch.setattr(bgd, "build_payload", _boom)
     monkeypatch.setattr(bgd, "publish_artifact", _boom)
-    zz.run_zegrid_mode(str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"))
+    zz.run_zegrid_mode(str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8))
 
     man = json.loads((out / "zegrid_manifest.json").read_text())
     assert man["cell_feather"]["enabled"] is True          # auto self-healed to per_cell
@@ -627,7 +627,7 @@ def test_e2e_per_cell_capture_publishes_validated_artifact(tmp_path):
     _write_corpus(inp, DISJOINT_CENTERS)
     out = tmp_path / "out"
     zz.run_zegrid_mode(
-        str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
         cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
     )
     target = out / zz.R37_CAPTURE_FILENAME
@@ -687,7 +687,7 @@ def test_e2e_capture_survives_later_failure_as_uncommitted(tmp_path, monkeypatch
     monkeypatch.setattr(zz, "_write_outputs", _boom)
     with pytest.raises(RuntimeError):
         zz.run_zegrid_mode(
-            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
             cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
         )
     target = out / zz.R37_CAPTURE_FILENAME
@@ -708,7 +708,7 @@ def test_e2e_cap_large_exact_and_small_capped(tmp_path):
 
     out_exact = tmp_path / "out_exact"
     zz.run_zegrid_mode(
-        str(inp), str(out_exact), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        str(inp), str(out_exact), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
         cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
         r37_diagnostic_holdout_cap=10 ** 6,
     )
@@ -720,7 +720,7 @@ def test_e2e_cap_large_exact_and_small_capped(tmp_path):
 
     out_capped = tmp_path / "out_capped"
     zz.run_zegrid_mode(
-        str(inp), str(out_capped), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        str(inp), str(out_capped), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
         cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
         r37_diagnostic_holdout_cap=4,
     )
@@ -746,7 +746,7 @@ def test_e2e_auto_resolves_per_cell_and_captures(tmp_path):
     _write_corpus(inp, DISJOINT_CENTERS)
     out = tmp_path / "out"
     zz.run_zegrid_mode(
-        str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
         r37_diagnostic_capture=True,  # auto (default)
     )
     man = json.loads((out / "zegrid_manifest.json").read_text())
@@ -760,7 +760,7 @@ def test_e2e_explicit_global_capture_fails_loud_and_early(tmp_path):
     out = tmp_path / "out"
     with pytest.raises(RuntimeError):
         zz.run_zegrid_mode(
-            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
             cell_gauge_mode="global", r37_diagnostic_capture=True,
         )
     assert not (out / zz.R37_CAPTURE_FILENAME).exists()
@@ -773,7 +773,7 @@ def test_e2e_auto_to_global_capture_fails_loud(tmp_path):
     out = tmp_path / "out"
     with pytest.raises(RuntimeError):
         zz.run_zegrid_mode(
-            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"),
+            str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
             r37_diagnostic_capture=True,  # auto resolves to global
         )
     assert not (out / zz.R37_CAPTURE_FILENAME).exists()
@@ -791,7 +791,7 @@ def test_e2e_mount_segregation_one_artifact_per_output_dir(tmp_path):
     out = tmp_path / "out"
     zz.run_zegrid_mode(
         str(inp), str(out), frames_info=frames,
-        zconfig=SimpleNamespace(zegrid_layout="2x2"),
+        zconfig=SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8),
         cell_gauge_mode="per_cell", r37_diagnostic_capture=True,
     )
     eq_art = out / "grid_EQ" / zz.R37_CAPTURE_FILENAME
@@ -817,8 +817,8 @@ def test_e2e_capture_on_off_outputs_and_offsets_identical(tmp_path):
     out_on = tmp_path / "on"
     # export the aesthetic float too, so the invariant covers science + aesthetic +
     # coverage (the aesthetic FITS is written only when requested).
-    cfg_off = SimpleNamespace(zegrid_layout="2x2", export_aesthetic_fits=True)
-    cfg_on = SimpleNamespace(zegrid_layout="2x2", export_aesthetic_fits=True)
+    cfg_off = SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8, export_aesthetic_fits=True)
+    cfg_on = SimpleNamespace(zegrid_layout="2x2", zegrid_halo_px=8, export_aesthetic_fits=True)
     zz.run_zegrid_mode(str(inp), str(out_off), zconfig=cfg_off, cell_gauge_mode="per_cell")
     zz.run_zegrid_mode(str(inp), str(out_on), zconfig=cfg_on, cell_gauge_mode="per_cell",
                        r37_diagnostic_capture=True)

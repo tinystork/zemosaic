@@ -58,6 +58,7 @@ Scope / non-goals
 from __future__ import annotations
 
 import hashlib
+import numbers
 import json
 import logging
 import shutil
@@ -89,6 +90,7 @@ __all__ = [
     "write_aligned_cache_from_arrays",
     "cache_manifest_path",
     "cache_is_complete",
+    "patch_geometry_identity",
     "load_cache_manifest",
 ]
 
@@ -179,7 +181,23 @@ def _meta_from_hwc(h: int, w: int, c: int = 3):
     return h, w, c, False, 3, (h, w, c)
 
 
-def _write_manifest(cache_dir, meta, frames, frame_ids, total_bytes) -> dict:
+def patch_geometry_identity(patch) -> str:
+    """Deterministic identity of a :class:`ProcessingPatch` spatial geometry.
+
+    ZM-ZEGRID-R53 F-1: a cache directory is keyed by cell id only. Two runs with
+    the same cell id and frame-id list can still build patches that have the
+    SAME shape but different global bounds / WCS (a different layout, or a
+    shifted canvas). Shape equality alone is therefore not sufficient for safe
+    reuse. This identity binds the patch bounds and its patch-WCS header.
+    """
+    b = patch.patch
+    header = str(getattr(patch, "patch_wcs_header", "") or "")
+    wcs_digest = hashlib.sha256(header.encode("utf-8")).hexdigest()
+    return f"{int(b.x0)},{int(b.y0)},{int(b.x1)},{int(b.y1)}|{wcs_digest}"
+
+
+def _write_manifest(cache_dir, meta, frames, frame_ids, total_bytes, *,
+                    patch_identity=None) -> dict:
     """Write the aligned-cache manifest from pre-collected frame metadata.
 
     Shared by the serial :class:`AlignedCacheBuilder` and the parallel build path
@@ -199,6 +217,8 @@ def _write_manifest(cache_dir, meta, frames, frame_ids, total_bytes) -> dict:
         "frames": list(frames),
         "total_bytes": int(total_bytes),
     }
+    if patch_identity is not None:
+        manifest["patch_identity"] = str(patch_identity)
     cache_manifest_path(cache_dir).write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -215,11 +235,44 @@ def load_cache_manifest(cache_dir) -> dict:
     return manifest
 
 
-def cache_is_complete(cache_dir, frame_ids: list[str]) -> bool:
+def _normalize_expected_hw(expected_hw):
+    """Strictly normalize an optional expected ``(height, width)``.
+
+    Returns ``None`` when no expectation was supplied, ``False`` when the
+    supplied expectation is malformed, or a positive ``(int, int)`` tuple.
+    """
+    if expected_hw is None:
+        return None
+    try:
+        if isinstance(expected_hw, (str, bytes)) or len(expected_hw) != 2:
+            return False
+        h, w = expected_hw
+        if isinstance(h, bool) or isinstance(w, bool):
+            return False
+        if not isinstance(h, numbers.Integral) or not isinstance(w, numbers.Integral):
+            return False
+        h, w = int(h), int(w)
+        if h <= 0 or w <= 0:
+            return False
+        return (h, w)
+    except Exception:
+        return False
+
+
+def cache_is_complete(cache_dir, frame_ids: list[str], *, expected_hw=None,
+                      expected_patch_identity=None) -> bool:
     """True if the cache dir holds a matching, complete manifest + all files.
 
-    Resumability check: rebuild is skipped only when the frame-id list matches
-    AND every declared file exists (and matches its recorded sha256).
+    Resumability check: rebuild is skipped only when the frame-id list matches,
+    every declared file exists (and matches its recorded sha256), and — when
+    supplied — the expected patch identity matches exactly.
+
+    ZM-ZEGRID-R53 F-1: ``expected_hw`` is the patch ``(height, width)`` the
+    caller is about to use. ``expected_patch_identity`` additionally binds the
+    global patch bounds and patch WCS (see :func:`patch_geometry_identity`),
+    because same-shaped patches can differ spatially across layouts. Missing,
+    malformed or mismatched expected values return ``False`` — this predicate
+    is a resumability test and MUST NOT raise.
     """
     mp = cache_manifest_path(cache_dir)
     if not mp.exists():
@@ -230,6 +283,22 @@ def cache_is_complete(cache_dir, frame_ids: list[str]) -> bool:
         return False
     if list(manifest.get("frame_ids", [])) != list(frame_ids):
         return False
+    if expected_hw is not None:
+        want_hw = _normalize_expected_hw(expected_hw)
+        if want_hw is False:
+            return False
+        try:
+            got_hw = (int(manifest["height"]), int(manifest["width"]))
+        except Exception:
+            return False
+        if got_hw != want_hw:
+            return False
+    if expected_patch_identity is not None:
+        if not isinstance(expected_patch_identity, str) or not expected_patch_identity:
+            return False
+        got_identity = manifest.get("patch_identity")
+        if not isinstance(got_identity, str) or got_identity != expected_patch_identity:
+            return False
     for i, fr in enumerate(manifest["frames"]):
         rp = Path(cache_dir) / fr["rgb"]
         sp = Path(cache_dir) / fr["support"]
@@ -255,7 +324,7 @@ class AlignedCacheBuilder:
     single-use object.
     """
 
-    def __init__(self, cache_dir) -> None:
+    def __init__(self, cache_dir, *, patch_identity=None) -> None:
         self.cache_dir = Path(cache_dir)
         safe_rmtree(self.cache_dir)  # ZM-ZEGRID-R15: best-effort wipe (never fatal)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -264,6 +333,9 @@ class AlignedCacheBuilder:
         self._frame_ids: list[str] = []
         self._total_bytes = 0
         self._n = 0
+        self._patch_identity = (
+            None if patch_identity is None else str(patch_identity)
+        )
 
     def add(self, frame_id: str, rgb: np.ndarray, support: np.ndarray) -> None:
         rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
@@ -307,7 +379,8 @@ class AlignedCacheBuilder:
         if self._meta is None:
             raise CanonicalStackValidationError("empty aligned cache (no frames written)")
         return _write_manifest(
-            self.cache_dir, self._meta, self._frames, self._frame_ids, self._total_bytes
+            self.cache_dir, self._meta, self._frames, self._frame_ids,
+            self._total_bytes, patch_identity=self._patch_identity,
         )
 
 
@@ -370,10 +443,15 @@ def build_aligned_cache_from_sources(
         ordered.append((f, plan, prep))
 
     frame_ids = [f.frame_id.logical_path for f, _p, _q in ordered]
-    if reuse_cache and cache_is_complete(cache_dir, frame_ids):
+    patch_identity = patch_geometry_identity(patch)
+    if reuse_cache and cache_is_complete(
+        cache_dir, frame_ids,
+        expected_hw=patch.patch_shape_hw,
+        expected_patch_identity=patch_identity,
+    ):
         return load_cache_manifest(cache_dir)
 
-    builder = AlignedCacheBuilder(cache_dir)
+    builder = AlignedCacheBuilder(cache_dir, patch_identity=patch_identity)
     for f, plan, prep in ordered:
         cropped = zxe._read_section_chw(prep, plan.source_bounds, tracker=tracker)
         cropped_wcs = zxe.slice_wcs(f.wcs(), plan.source_bounds)

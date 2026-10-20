@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from astropy.wcs import WCS
+from astropy.io import fits
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
@@ -41,6 +42,7 @@ from zemosaic import zegrid_halo as zhalo  # noqa: E402
 from zemosaic.core.zegrid import auto_layout as zal  # noqa: E402
 from zemosaic.core.zegrid import background_diagnostics as bgd  # noqa: E402
 from zemosaic.core.zegrid import cell_feather as zcf  # noqa: E402
+from zemosaic.core.zegrid import file_provider as zfp  # noqa: E402
 from zemosaic.core.zegrid import geometry as zg  # noqa: E402
 from zemosaic.core.zegrid import mosaic as zmosaic  # noqa: E402
 from zemosaic.core.zegrid import parallel as zpar  # noqa: E402
@@ -125,7 +127,9 @@ def test_config_defaults_and_qt_fallback_carry_64():
     src = (REPO_ROOT / "src" / "zemosaic" / "zemosaic_gui_qt.py").read_text(
         encoding="utf-8"
     )
-    assert '"zegrid_halo_px": 64' in src
+    assert "from .zegrid_halo import ZEGRID_HALO_DEFAULT_PX" in src
+    assert '"zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX' in src
+    assert '"zegrid_halo_px": 64' not in src
 
 
 def test_resolution_precedence_is_explicit_arg_then_config_then_default():
@@ -593,3 +597,176 @@ def test_auto_self_heals_to_per_cell_and_uses_H(tmp_path):
     assert pg["auto_selection"]["fallback_fired"] is True
     assert m["cell_feather"]["enabled"] is True
     assert m["cell_feather"]["halo_px"] == 16
+
+
+# ---------------------------------------------------------------------------
+# F-1 — cache geometry identity
+# ---------------------------------------------------------------------------
+
+def _write_aligned_cache(cache_dir, *, n=20, patch_identity=None, frame_ids=("f0",)):
+    builder = zfp.AlignedCacheBuilder(cache_dir, patch_identity=patch_identity)
+    rng = np.random.default_rng(1)
+    for fid in frame_ids:
+        rgb = rng.normal(0.0, 1.0, (n, n, 3)).astype(np.float32)
+        sup = np.ones((n, n), dtype=bool)
+        builder.add(fid, rgb, sup)
+    return builder.finish()
+
+
+def test_cache_is_complete_expected_hw_and_identity(tmp_path):
+    ids = ["f0"]
+    cache = tmp_path / "cache"
+    _write_aligned_cache(cache, patch_identity="bounds|wcs")
+
+    assert zfp.cache_is_complete(cache, ids) is True
+    assert zfp.cache_is_complete(cache, ids, expected_hw=(20, 20)) is True
+    for bad in [(21, 20), (20, 21), (20, 0), (0, 20), (20,), (20, 20, 3),
+                "20x20", (20.0, 20.0), (True, 20)]:
+        assert zfp.cache_is_complete(cache, ids, expected_hw=bad) is False, bad
+
+    assert zfp.cache_is_complete(
+        cache, ids, expected_patch_identity="bounds|wcs"
+    ) is True
+    assert zfp.cache_is_complete(
+        cache, ids, expected_patch_identity="other|wcs"
+    ) is False
+    assert zfp.cache_is_complete(cache, ids, expected_patch_identity="") is False
+
+    # A manifest without patch_identity cannot satisfy an identity expectation.
+    manifest = json.loads(zfp.cache_manifest_path(cache).read_text())
+    manifest.pop("patch_identity")
+    zfp.cache_manifest_path(cache).write_text(json.dumps(manifest))
+    assert zfp.cache_is_complete(
+        cache, ids, expected_patch_identity="bounds|wcs"
+    ) is False
+
+    # Missing/invalid manifest dimensions never raise, and fail the expectation.
+    manifest.pop("height", None)
+    zfp.cache_manifest_path(cache).write_text(json.dumps(manifest))
+    assert zfp.cache_is_complete(cache, ids, expected_hw=(20, 20)) is False
+    manifest["height"] = "not-an-int"
+    zfp.cache_manifest_path(cache).write_text(json.dumps(manifest))
+    assert zfp.cache_is_complete(cache, ids, expected_hw=(20, 20)) is False
+
+
+def test_cache_is_complete_checks_hashes_after_geometry_match(tmp_path):
+    ids = ["f0"]
+    cache = tmp_path / "cache"
+    _write_aligned_cache(cache, patch_identity="bounds|wcs")
+    manifest = zfp.load_cache_manifest(cache)
+    frame_file = cache / manifest["frames"][0]["rgb"]
+    with open(frame_file, "ab") as fh:
+        fh.write(b"corruption")
+    assert zfp.cache_is_complete(
+        cache, ids, expected_hw=(20, 20),
+        expected_patch_identity="bounds|wcs",
+    ) is False
+
+
+def _write_single_frame_corpus(root: Path, h=400, w=400):
+    root.mkdir(parents=True, exist_ok=True)
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.crval = [10.0, 30.0]
+    wcs.wcs.crpix = [w / 2.0, h / 2.0]
+    wcs.wcs.cd = np.array([[-1.0, 0.0], [0.0, 1.0]]) * 0.001
+    wcs.array_shape = (h, w)
+    rng = np.random.default_rng(5)
+    data = (100.0 + rng.normal(0, 1, (h, w))).astype(np.float32)
+    fits.PrimaryHDU(data, header=wcs.to_header(relax=True)).writeto(
+        root / "single.fit", overwrite=True
+    )
+    descs, _rejected = zg.read_manifest(root)
+    return descs
+
+
+def test_production_cache_never_reuses_inter_halo_geometry(tmp_path):
+    descs = _write_single_frame_corpus(tmp_path / "frames")
+    canvas = zg.build_canvas(descs)
+    fps = zal.project_footprints(descs, canvas)
+    nx = ny = 3
+    ctx64 = _contexts(fps, canvas, nx, ny, 64)
+    ctx8 = _contexts(fps, canvas, nx, ny, 8)
+    cache_root = tmp_path / "cache"
+
+    # One frame covers every patch: the ordered frame-id lists are identical, so
+    # only the new geometry identity can reject the stale cache.
+    assert all(
+        list(m64.patch_ids) == list(m8.patch_ids)
+        for (_r, _c, _ce, _p64, m64), (_r2, _c2, _ce2, _p8, m8)
+        in zip(ctx64, ctx8)
+    )
+
+    _dirs64, _m64, rep64 = zz._build_aligned_cache_frame_major(
+        descs, canvas, ctx64, cache_root, None
+    )
+    assert rep64["reused"] == []
+    assert set(rep64["rebuilt"]) == {c.cell_id for (_r, _c, c, _p, _m) in ctx64}
+
+    # H=8 against a complete H=64 cache with the SAME frame ids MUST rebuild.
+    _dirs8, _m8, rep8 = zz._build_aligned_cache_frame_major(
+        descs, canvas, ctx8, cache_root, None
+    )
+    assert rep8["reused"] == []
+    assert set(rep8["rebuilt"]) == set(rep64["rebuilt"])
+
+    # Provider shape follows the ACTUAL H=8 patch, and the core slice fits.
+    for (_r, _c, cell, patch, _mem) in ctx8:
+        provider = zfp.MemmapCanonicalProvider(cache_root / cell.cell_id)
+        try:
+            assert (provider.height, provider.width) == patch.patch_shape_hw
+            cs = patch.core_slice
+            assert cs.y0 >= 0 and cs.x0 >= 0
+            assert cs.y1 <= provider.height and cs.x1 <= provider.width
+        finally:
+            provider.close()
+
+    # Same-H resume still reuses; hashes are still verified by the predicate.
+    _dirs8b, _m8b, rep8b = zz._build_aligned_cache_frame_major(
+        descs, canvas, ctx8, cache_root, None
+    )
+    assert rep8b["rebuilt"] == []
+    assert set(rep8b["reused"]) == set(rep8["rebuilt"])
+
+
+# ---------------------------------------------------------------------------
+# F-3 — membership witness across H=8 / H=64
+# ---------------------------------------------------------------------------
+
+def _tan_descriptor(fid, crval, crpix, shape, scale=0.001):
+    h, w = shape
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.crval = [float(crval[0]), float(crval[1])]
+    wcs.wcs.crpix = [float(crpix[0]), float(crpix[1])]
+    wcs.wcs.cd = np.array([[-1.0, 0.0], [0.0, 1.0]]) * scale
+    wcs.array_shape = (h, w)
+    return zg.FrameDescriptor(
+        frame_id=zg.FrameId(fid), source_path=f"/x/{fid}", shape_hw=(h, w),
+        wcs_header=wcs.to_header(relax=True).tostring(),
+        header_sha256="", instrument="",
+    )
+
+
+def test_membership_includes_frame_only_beyond_h8_annulus():
+    # 300x300 canvas -> 3x3 cores of 100 px. Cell r0001c0001 covers
+    # x/y 100..200; its H=8 patch reaches 92..208, its H=64 patch 36..264.
+    # The small frame sits at x 210..240, y 150..180: inside H=64, outside H=8.
+    base = _tan_descriptor("base.fit", (10.0, 30.0), (150.0, 150.0), (300, 300))
+    annulus = _tan_descriptor("annulus.fit", (9.914, 30.015), (15.0, 15.0), (30, 30))
+    descs = [base, annulus]
+    canvas = zg.build_canvas(descs)
+    assert 300 <= canvas.width <= 301 and 300 <= canvas.height <= 301
+    fps = zal.project_footprints(descs, canvas)
+
+    ctx8 = _contexts(fps, canvas, 3, 3, 8)
+    ctx64 = _contexts(fps, canvas, 3, 3, 64)
+    by_id8 = {c.cell_id: m for (_r, _c, c, _p, m) in ctx8}
+    by_id64 = {c.cell_id: m for (_r, _c, c, _p, m) in ctx64}
+
+    m8 = by_id8["r0001c0001"]
+    m64 = by_id64["r0001c0001"]
+    assert "annulus.fit" not in m8.core_ids
+    assert "annulus.fit" not in m64.core_ids
+    assert "annulus.fit" not in m8.patch_ids
+    assert "annulus.fit" in m64.patch_ids

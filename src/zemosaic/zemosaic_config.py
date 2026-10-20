@@ -55,8 +55,8 @@ logger = logging.getLogger(__name__)
 
 try:
     from .zegrid_halo import ZEGRID_HALO_DEFAULT_PX
-except Exception:  # pragma: no cover - direct-module execution fallback
-    ZEGRID_HALO_DEFAULT_PX = 64
+except ImportError:  # pragma: no cover - `python zemosaic_config.py` (no package)
+    from zegrid_halo import ZEGRID_HALO_DEFAULT_PX
 
 try:
     from .zemosaic_utils import ensure_user_config_dir, get_user_config_dir

@@ -566,7 +566,12 @@ def _build_one_cell_cache(
     frame_ids = [f.frame_id.logical_path for f, _p in planned]
 
     cache_dir = Path(cache_dir)
-    if reuse_cache and zfp.cache_is_complete(str(cache_dir), frame_ids):
+    patch_identity = zfp.patch_geometry_identity(patch)
+    if reuse_cache and zfp.cache_is_complete(
+        str(cache_dir), frame_ids,
+        expected_hw=patch.patch_shape_hw,
+        expected_patch_identity=patch_identity,
+    ):
         return zfp.load_cache_manifest(str(cache_dir))
     # R15: rebuild wipe is best-effort (Windows WinError 32 on open handles).
     _safe_rmtree(cache_dir, progress_callback)
@@ -591,6 +596,7 @@ def _build_one_cell_cache(
     return zfp._write_manifest(
         cache_dir, meta, results, frame_ids,
         sum(r["rgb_bytes"] + r["support_bytes"] for r in results),
+        patch_identity=patch_identity,
     )
 
 
@@ -626,10 +632,17 @@ def _build_aligned_cache_frame_major(descs, canvas, cell_ctxs, cache_root, progr
         cache_dir = cache_root / cid
         cache_dirs[cid] = cache_dir
         patch_id_sets[cid] = set(mem.patch_ids)
-        if zfp.cache_is_complete(cache_dir, list(mem.patch_ids)):
+        patch_identity = zfp.patch_geometry_identity(patch)
+        if zfp.cache_is_complete(
+            cache_dir, list(mem.patch_ids),
+            expected_hw=patch.patch_shape_hw,
+            expected_patch_identity=patch_identity,
+        ):
             reused.append(cid)
             continue  # reuse: no wipe, no decode
-        builders[cid] = zfp.AlignedCacheBuilder(cache_dir)  # wipes THIS cell dir only
+        builders[cid] = zfp.AlignedCacheBuilder(
+            cache_dir, patch_identity=patch_identity
+        )  # wipes THIS cell dir only
         rebuilt.append(cid)
         active.append((cell, patch, mem))
 
