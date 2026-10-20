@@ -353,7 +353,12 @@ def test_e2e_auto_self_heals_to_per_cell_on_disjoint_corpus(tmp_path):
     out = tmp_path / "out"
     # Pin the layout: the auto-layout scientific floors are calibrated for real
     # frames; a synthetic tiny corpus needs an explicit partition.
-    zz.run_zegrid_mode(str(inp), str(out), zconfig=SimpleNamespace(zegrid_layout="2x2"))
+    # Pin the layout AND the pre-R53 halo (8 px): this test asserts the R34F
+    # auto->per_cell decision, whose synthetic 2x2 floors were calibrated with the
+    # historical 8 px patch extension. R53's product default 64 px is covered by
+    # ``tests/test_zegrid_r53_halo_engine.py``.
+    zz.run_zegrid_mode(str(inp), str(out), zegrid_halo_px=8,
+                       zconfig=SimpleNamespace(zegrid_layout="2x2"))
 
     m = json.loads((out / "zegrid_manifest.json").read_text())
     pg = m["photometric_gauge"]

@@ -54,6 +54,11 @@ from typing import Any, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from .zegrid_halo import ZEGRID_HALO_DEFAULT_PX
+except Exception:  # pragma: no cover - direct-module execution fallback
+    ZEGRID_HALO_DEFAULT_PX = 64
+
+try:
     from .zemosaic_utils import ensure_user_config_dir, get_user_config_dir
 except Exception:  # pragma: no cover - fallback when utils unavailable
     def get_user_config_dir() -> Path:
@@ -117,6 +122,10 @@ DEFAULT_CONFIG = {
     # presence trigger). Kept alongside the other two pipeline booleans so an
     # older reader still sees a coherent, mutually-exclusive state.
     "zegrid_mode_enabled": False,
+    # ZM-ZEGRID-R53: anti-checkerboard transition halo, in output canvas pixels.
+    # Product default 64 (256 is experimental). The engine validates this value
+    # strictly (see zemosaic/zegrid_halo.py); it is not a mutable global.
+    "zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX,
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",

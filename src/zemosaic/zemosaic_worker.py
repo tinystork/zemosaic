@@ -31254,6 +31254,7 @@ def run_hierarchical_mosaic(
                 legacy_rgb_cube=legacy_rgb_cube_config,
                 grid_rgb_equalize=grid_rgb_equalize_flag,
                 use_gpu=_grid_gpu_requested,
+                zegrid_halo_px=(worker_config_cache or {}).get("zegrid_halo_px"),
                 zconfig=zconfig,
             )
             return

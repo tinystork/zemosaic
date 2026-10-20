@@ -126,7 +126,7 @@ def _zconfig():
 
 
 def _run(inp, out, *, r40_root=None):
-    kwargs = dict(zconfig=_zconfig(), cell_gauge_mode="per_cell")
+    kwargs = dict(zconfig=_zconfig(), cell_gauge_mode="per_cell", zegrid_halo_px=8)
     if r40_root is not None:
         kwargs.update(r40_seam_capture=True, r40_output_root=str(r40_root))
     zz.run_zegrid_mode(str(inp), str(out), **kwargs)

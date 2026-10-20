@@ -299,7 +299,7 @@ def _run_pooled(inp, out, monkeypatch, *, r40):
 
     monkeypatch.setattr(zz, "_assemble_cells", _spy_assemble)
 
-    kwargs = dict(zconfig=SimpleNamespace(zegrid_layout="2x2"), cell_gauge_mode="per_cell")
+    kwargs = dict(zconfig=SimpleNamespace(zegrid_layout="2x2"), cell_gauge_mode="per_cell", zegrid_halo_px=8)
     if r40:
         kwargs.update(r40_seam_capture=True, r40_output_root=str(out))
     zz.run_zegrid_mode(str(inp), str(out), **kwargs)

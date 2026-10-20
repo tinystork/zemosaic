@@ -66,6 +66,12 @@ from astropy.wcs import WCS
 
 from . import eta_service as zeta
 from . import zemosaic_stack_plan as _stack_plan
+from .zegrid_halo import (
+    ZEGRID_HALO_CONFIG_KEY,
+    ZEGRID_HALO_DEFAULT_PX,
+    ZeGridHaloError,
+    resolve_zegrid_halo_px,
+)
 from .zemosaic_utils import (
     NONFINITE_FILL_VALUE,
     load_image_with_optional_alpha,
@@ -896,6 +902,12 @@ def _choose_layout_mode_aware(
     ``pinned_layout`` (``(nx, ny)`` or ``None``) BYPASSES the RAM-adaptive search
     and uses exactly that layout (scientific floors still enforced; an infeasible
     pinned layout raises). ``layout_source`` records ``"pinned"`` vs ``"auto"``.
+
+    ``halo_px`` (ZM-ZEGRID-R53) is the patch extension used for candidate
+    geometry, floors and per-cell contributor/area predictions. The product path
+    passes the validated effective value explicitly; the default (``sweep.
+    HALO_PX``) is only the historical low-level helper default for direct/unit
+    calls, never a product default.
 
     ``emit`` (optional) is ``callable(message, lvl="INFO")``: when supplied, the
     scan is EXPLAINED live (ZM-ZEGRID-R14) — each candidate ``(nx, ny)``, why it
@@ -2227,6 +2239,11 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
     Disconnected policy (Nono I3): ``on_disconnected="zero"`` — Cells unreachable
     from the anchor keep offset 0 (their own self-anchored level, recorded); NO
     local re-anchor, NO fabricated bridge. A WARN lists them.
+
+    ``halo_px`` (ZM-ZEGRID-R53) is the EFFECTIVE feather width (and drives the
+    diagnostic measurement band ``2H``). The product path always passes it; the
+    ``None`` fallback is only the historical low-level helper default for direct
+    calls.
     """
     halo_px = int(zsw.HALO_PX if halo_px is None else halo_px)
     patches: dict = {}
@@ -2456,6 +2473,21 @@ def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None,
             capture_identity=capture_identity,
             r40_capture=r40_capture, r40_context=r40_context,
         )
+    # ZM-ZEGRID-R53: make the mode semantics explicit. The halo still drives the
+    # REAL patch geometry/resources, but the anti-checkerboard feather is only
+    # applied by the per_cell assembly (one-owner global assembly is unchanged).
+    _halo_for_log = int(zsw.HALO_PX if halo_px is None else halo_px)
+    if emit is not None:
+        try:
+            emit(
+                "ZeGrid: cell_gauge_mode=global — anti-checkerboard feather NOT "
+                "applied (single-owner assembly); requested "
+                f"zegrid_halo_px={_halo_for_log} still defines the patch/gauge "
+                "geometry",
+                "INFO",
+            )
+        except Exception:
+            pass
     return zmosaic.assemble_canvas(canvas, nx, ny, cores), None
 
 
@@ -3028,7 +3060,7 @@ def _write_run_log(
     return text
 
 
-def _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep=None):
+def _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep=None, *, halo_px=None):
     """Build the final chosen-cell contexts from the cached footprints (R28).
 
     Brackets the work with the ``layout:chosen_cells`` sub-step (START + throttled
@@ -3037,7 +3069,12 @@ def _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep=None)
     to skip observability). This is the production seam for the chosen-cell
     membership/context preparation (no per-cell WCS re-projection — it reuses the
     once-projected footprint set).
+
+    ``halo_px`` (ZM-ZEGRID-R53) is the EFFECTIVE product halo width. The product
+    path always passes it; ``None`` keeps the historical low-level helper default
+    (``sweep.HALO_PX``) for direct/unit calls only.
     """
+    _halo = int(zsw.HALO_PX if halo_px is None else halo_px)
     cell_total = nx * ny
     if layout_substep is not None:
         layout_substep.start(
@@ -3048,7 +3085,7 @@ def _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep=None)
     cell_ctxs = []
     done = 0
     for row, col, cell, patch, mem in zsw.build_cell_contexts_from_footprints(
-        footprints, canvas, nx, ny
+        footprints, canvas, nx, ny, halo_px=_halo
     ):
         cell_ctxs.append((row, col, cell, patch, mem))
         done += 1
@@ -3126,6 +3163,7 @@ def _build_execution_bundle(
     max_cpu_tile=None,
     max_gpu_tile=None,
     max_cells_in_flight=None,
+    halo_px=None,
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -3153,7 +3191,14 @@ def _build_execution_bundle(
     Raises :class:`auto_layout.LayoutInfeasible` when the pinned / exact geometry
     cannot be planned, and :class:`parallel.ModeInfeasible` when even one cell
     cannot fit under the PLAN budget (never a clamp-to-1 rescue).
+
+    ``halo_px`` (ZM-ZEGRID-R53) is the SAME effective width for the layout, the
+    memberships, the resource arithmetic and every bounded replan / fallback /
+    worker payload of ONE run. ``None`` keeps the historical low-level helper
+    default (``sweep.HALO_PX``) for direct/unit calls only; the product path
+    always passes the validated value.
     """
+    _halo = int(zsw.HALO_PX if halo_px is None else halo_px)
     budget_bytes = int(budget_bytes)
     raw_available_bytes = int(raw_available_bytes)
     cpu_count = int(cpu_count or os.cpu_count() or 1)
@@ -3174,12 +3219,13 @@ def _build_execution_bundle(
             observer=layout_substep, footprints_out=_fp_out,
             footprints_in=footprints,
             min_refinement_rank=rank_floor, max_refinement_rank=rank_ceiling,
+            halo_px=_halo,
         )
         if footprints is None:
             footprints = _fp_out[0] if _fp_out else None
         nx, ny = int(layout["nx"]), int(layout["ny"])
         cell_ctxs = _build_chosen_cell_contexts(
-            footprints, canvas, nx, ny, layout_substep
+            footprints, canvas, nx, ny, layout_substep, halo_px=_halo
         )
         worst_patch_px = 0
         patch_px_for_workers = 0
@@ -3680,9 +3726,19 @@ def _run_single(
     r40_seam_capture=False,
     r40_output_root=None,
     r40_seam_capture_disk_budget_bytes=None,
+    halo_px=ZEGRID_HALO_DEFAULT_PX,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    # ZM-ZEGRID-R53: ONE validated effective halo width for this run. The product
+    # entry (``run_zegrid_mode``) resolves and validates it BEFORE any expensive
+    # work and passes it explicitly; this defensive re-validation never changes a
+    # valid value and keeps direct/internal calls on the same strict contract.
+    try:
+        halo_px = resolve_zegrid_halo_px(halo_px)
+    except ZeGridHaloError as exc:
+        _emit(f"ZeGrid: {exc}", lvl="ERROR", callback=progress_callback)
+        raise
     # ZM-ZEGRID-R37-D (F1): when a capture is requested, fail-closed invalidate the
     # fixed target in THIS run's actual output dir IMMEDIATELY at run start (before
     # descriptors/layout/gauge). Idempotent with the outer invalidation; protects
@@ -3901,6 +3957,7 @@ def _run_single(
         gpu_used=bool(gpu_used),
         vram_budget_bytes=(gpu_ctx or {}).get("vram_budget_bytes"),
         cache_root=cache_root,
+        halo_px=int(halo_px),
         emit=_emit_live,
         log_line=_log_line,
     )
@@ -4701,7 +4758,7 @@ def _run_single(
             from .core.zegrid import background_diagnostics as _bgd
             from .core.zegrid import background_model as _zbm
 
-            _halo_i = int(zsw.HALO_PX)
+            _halo_i = int(halo_px)
             _meas_px = int(2 * _halo_i) if _halo_i > 0 else int(_bgd.DEFAULT_MEASUREMENT_PX)
             _feath_px = int(_halo_i) if _halo_i > 0 else int(_bgd.DEFAULT_FEATHER_PX)
             _r40_context = _r40_build_seam_context(
@@ -4716,7 +4773,7 @@ def _run_single(
             )
         assembled, feather_info = _assemble_cells(
             canvas, nx, ny, _gauge_mode, cores, result_by_cid,
-            halo_px=zsw.HALO_PX, emit=_emit_live,
+            halo_px=int(halo_px), emit=_emit_live,
             capture=r37_diagnostic_capture,
             holdout_cap=r37_diagnostic_holdout_cap,
             output_dir=output_dir,
@@ -5611,6 +5668,7 @@ def run_zegrid_mode(
     zconfig: object | None = None,
     workers: int | None = None,
     cell_gauge_mode: str | None = None,
+    zegrid_halo_px: int | str | None = None,
     frames_info: Sequence | None = None,
     selection_paths: Sequence[str] | None = None,
     global_wcs_output_path: str | None = None,
@@ -5640,6 +5698,31 @@ def run_zegrid_mode(
     it resolves to per_cell; a global resolution fails loudly).
     """
     _emit("ZeGrid engine activated (explicit ZeGrid mode)", callback=progress_callback)
+
+    # ZM-ZEGRID-R53: resolve the anti-checkerboard halo width FIRST, so an invalid
+    # request fails before descriptors, layouts, gauge work or any output. The
+    # precedence matches ``cell_gauge_mode``: explicit keyword > config key >
+    # product default. No global is mutated; the validated int is threaded down.
+    _halo_requested = zegrid_halo_px
+    _halo_source = "explicit argument"
+    if _halo_requested is None and zconfig is not None:
+        _halo_requested = getattr(zconfig, ZEGRID_HALO_CONFIG_KEY, None)
+        _halo_source = f"{ZEGRID_HALO_CONFIG_KEY} config"
+    if _halo_requested is None:
+        _halo_source = "product default"
+    try:
+        resolved_halo_px = resolve_zegrid_halo_px(_halo_requested)
+    except ZeGridHaloError as exc:
+        _emit(f"ZeGrid: {exc}", lvl="ERROR", callback=progress_callback)
+        raise
+    _emit(
+        "ZeGrid: anti-checkerboard halo — requested="
+        f"{resolved_halo_px if _halo_requested is None else _halo_requested!r} "
+        f"-> effective={resolved_halo_px} px (source={_halo_source}); this width "
+        "drives patch geometry, contributors, gauge domain, measurement "
+        "band=2H and feather=H",
+        callback=progress_callback,
+    )
 
     # ZM-ZEGRID-R37-D: validate the capture opt-in strictly and up front so a
     # mistyped request fails before any work.
@@ -5952,6 +6035,7 @@ def run_zegrid_mode(
                         ignored_run_args=ignored_run_args,
                         finishing_config=finishing_config,
                         gpu_context=gpu_context, pass_label="EQ",
+                        halo_px=resolved_halo_px,
                         r37_diagnostic_capture=r37_diagnostic_capture,
                         r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                         r40_seam_capture=r40_seam_capture,
@@ -5965,6 +6049,7 @@ def run_zegrid_mode(
                         ignored_run_args=ignored_run_args,
                         finishing_config=finishing_config,
                         gpu_context=gpu_context, pass_label="ALTZ",
+                        halo_px=resolved_halo_px,
                         r37_diagnostic_capture=r37_diagnostic_capture,
                         r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                         r40_seam_capture=r40_seam_capture,
@@ -5980,6 +6065,7 @@ def run_zegrid_mode(
                     ignored_run_args=ignored_run_args,
                     finishing_config=finishing_config,
                     gpu_context=gpu_context, pass_label="single",
+                    halo_px=resolved_halo_px,
                     r37_diagnostic_capture=r37_diagnostic_capture,
                     r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                     r40_seam_capture=r40_seam_capture,
