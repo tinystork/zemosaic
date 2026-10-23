@@ -56,6 +56,7 @@ from .resource_envelope import (
     REASON_CODES,
     REASON_DEFAULT_OFF,
     REASON_GPU_UNAVAILABLE,
+    REASON_INTERNAL_ERROR,
     REASON_OK,
     REASON_PARITY_FAIL,
     REASON_REFUSE_DISK,
@@ -66,6 +67,7 @@ from .resource_envelope import (
     REASON_SHRINK_TILE,
     REASON_SHRINK_WORKERS,
     REASON_UNCALIBRATED,
+    REASON_UNKNOWN_BACKEND,
     REQUIRED_PLAN_PHASES,
     ResourceEnvelope,
     aggregate_device_peak_bytes,
@@ -87,7 +89,16 @@ __all__ = [
     "MODES",
     "MODE_LEGACY",
     "MODE_OBSERVE",
+    "MODE_ACTIVE",
     "DEFAULT_MODE",
+    "ACTIVE_MANIFEST_SCHEMA",
+    "ACTIVE_MAPPING_SCHEMA",
+    "ACTIVE_EXECUTABLE_PHASES",
+    "ActivePlanRejected",
+    "active_cpu_phase",
+    "active_mapping_for_candidate",
+    "map_active_cpu_candidate",
+    "active_manifest_dict",
     "MIN_TILE_PX",
     "PRODUCT_TILE_LADDER",
     "PREFETCH_LADDER",
@@ -143,8 +154,19 @@ JOINT_SCHEDULER_VERSION = "r55-d1"
 
 MODE_LEGACY = "legacy"
 MODE_OBSERVE = "observe"
-MODES = (MODE_LEGACY, MODE_OBSERVE)
+MODE_ACTIVE = "active"
+MODES = (MODE_LEGACY, MODE_OBSERVE, MODE_ACTIVE)
 DEFAULT_MODE = MODE_LEGACY
+
+# R55-D2 active CPU manifest/mapping schemas. These are ADDITIVE: the R55-B
+# manifest schema/version is deliberately unchanged so legacy/observe bytes stay
+# identical.
+ACTIVE_MANIFEST_SCHEMA = "zemosaic-r55d2-active-manifest-v1"
+ACTIVE_MAPPING_SCHEMA = "zemosaic-r55d2-active-mapping-v1"
+ACTIVE_EXECUTABLE_PHASES = (
+    PHASE_CELL_STACK_INMEM,
+    PHASE_CELL_STACK_STREAM,
+)
 
 MIN_TILE_PX = 32
 # The PRODUCT ladder, in the product's preferred (descending) order. R54's
@@ -225,17 +247,18 @@ def normalize_scheduler_mode(value, *, default: str = DEFAULT_MODE) -> str:
     """Resolve ``zegrid_scheduler_mode``.
 
     ``None`` (absent) means ``legacy``. An explicit value must be the exact
-    lowercase string ``legacy`` or ``observe``. Anything else — including
-    ``True``, ``"LEGACY"``, ``"auto"`` or ``""`` — raises
+    lowercase string ``legacy``, ``observe`` or ``active``. Anything else —
+    including ``True``, ``"LEGACY"``, ``"auto"`` or ``""`` — raises
     :class:`InvalidSchedulerMode` so an unknown value can never be silently
-    coerced to the default.
+    coerced to the default. R55-D2 adds ``active`` additively; the default and
+    every observe/legacy semantic are unchanged.
     """
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, str):
         raise InvalidSchedulerMode(
             "zegrid_scheduler_mode must be a string "
-            f"({MODE_LEGACY!r} or {MODE_OBSERVE!r}), got "
+            f"({MODE_LEGACY!r}, {MODE_OBSERVE!r} or {MODE_ACTIVE!r}), got "
             f"{type(value).__name__}={value!r}"
         )
     if value not in MODES:
@@ -2696,6 +2719,264 @@ def joint_evidence_hash(
 # ---------------------------------------------------------------------------
 # Shrink-only API (contract only; R55-B never mutates a RUN)
 # ---------------------------------------------------------------------------
+
+class ActivePlanRejected(SchedulerError):
+    """An ``active`` plan cannot be executed by the product's CPU knobs.
+
+    R55-D2 grants execution authority ONLY to a deterministic, fully mappable
+    CPU winner. Every unsupported backend/phase/tile/concurrency/worker or
+    prefetch-positive winner is rejected here (fail closed) instead of being
+    silently coerced to the legacy plan.
+    """
+
+    def __init__(
+        self,
+        reason_code: str,
+        detail: str,
+        *,
+        candidate: Candidate | None = None,
+        mapping: Mapping | None = None,
+    ):
+        super().__init__(f"{reason_code}: {detail}")
+        if reason_code not in REASON_CODES:
+            raise SchedulerConfigError(
+                f"reason_code {reason_code!r} outside the closed set"
+            )
+        self.reason_code = str(reason_code)
+        self.detail = str(detail)
+        self.candidate = candidate
+        self.mapping = None if mapping is None else dict(mapping)
+
+    def refusal_manifest_dict(
+        self, *, mode: str = MODE_ACTIVE, run_id: str = ""
+    ) -> dict:
+        block = {
+            "schema": ACTIVE_MANIFEST_SCHEMA,
+            "scheduler_version": SCHEDULER_VERSION,
+            "mode": "active",
+            "requested_mode": mode,
+            "run_id": str(run_id),
+            "status": "refused",
+            "refused": True,
+            "reason_code": self.reason_code,
+            "detail": self.detail,
+            "candidate": (
+                None if self.candidate is None else self.candidate.to_dict()
+            ),
+            "mapping": self.mapping,
+            "observed_metrics": None,
+        }
+        return _stamp_active_hash(block)
+
+
+def active_cpu_phase(candidate: Candidate) -> str:
+    """Return the executable CPU stack phase for ``candidate`` (or reject).
+
+    ``tile_px is None`` is EXACTLY the in-memory stack; any tile is the
+    streaming stack. A GPU or otherwise unsupported candidate is refused.
+    """
+    if not isinstance(candidate, Candidate):
+        raise SchedulerConfigError(
+            f"expected Candidate, got {type(candidate).__name__}"
+        )
+    if candidate.backend != BACKEND_CPU:
+        raise ActivePlanRejected(
+            REASON_UNKNOWN_BACKEND,
+            "R55-D2 active grants execution authority to the CPU backend only; "
+            f"winner backend={candidate.backend!r}",
+            candidate=candidate,
+        )
+    return (
+        PHASE_CELL_STACK_INMEM
+        if candidate.tile_px is None
+        else PHASE_CELL_STACK_STREAM
+    )
+
+
+def active_mapping_for_candidate(
+    candidate: Candidate,
+    *,
+    tile_ladder: Sequence[int] = PRODUCT_TILE_LADDER,
+    workers_ladder: Sequence[int] = WORKERS_LADDER,
+) -> dict:
+    """Map ONE candidate onto the existing CPU execution knobs (fail closed).
+
+    This is the single mapping implementation shared by the initial active
+    winner and every scheduler-produced shrink step, so a pressure correction
+    can never drift from the accepted mapping contract.
+    """
+    if not isinstance(candidate, Candidate):
+        raise SchedulerConfigError(
+            f"expected Candidate, got {type(candidate).__name__}"
+        )
+    phase = active_cpu_phase(candidate)
+    if int(candidate.prefetch_units) != 0:
+        raise ActivePlanRejected(
+            REASON_SHRINK_PREFETCH,
+            "R55-D2 active refuses a prefetch-positive winner "
+            f"(prefetch_units={candidate.prefetch_units}); R55-E owns prefetch "
+            "execution",
+            candidate=candidate,
+        )
+    if phase == PHASE_CELL_STACK_STREAM:
+        allowed_tiles = tuple(int(t) for t in tile_ladder)
+        if candidate.tile_px is None or int(candidate.tile_px) not in allowed_tiles:
+            raise ActivePlanRejected(
+                REASON_SHRINK_TILE,
+                "stream winner tile "
+                f"{candidate.tile_px!r} is outside the product ladder "
+                f"{allowed_tiles}",
+                candidate=candidate,
+            )
+        mapped_tile = int(candidate.tile_px)
+    else:
+        mapped_tile = None
+    units = int(candidate.units_in_flight)
+    if units < 1:
+        raise ActivePlanRejected(
+            REASON_REFUSE_HOST_RAM,
+            f"units_in_flight must be >= 1, got {candidate.units_in_flight}",
+            candidate=candidate,
+        )
+    allowed_workers = tuple(int(w) for w in workers_ladder)
+    workers = int(candidate.workers_per_unit)
+    if workers < 1 or (allowed_workers and workers not in allowed_workers):
+        raise ActivePlanRejected(
+            REASON_SHRINK_WORKERS,
+            "workers_per_unit "
+            f"{candidate.workers_per_unit!r} is not an existing executable "
+            f"cache-worker value {allowed_workers}",
+            candidate=candidate,
+        )
+    return {
+        "schema": ACTIVE_MAPPING_SCHEMA,
+        "backend": BACKEND_CPU,
+        "phase": phase,
+        "cell_task_mode": (
+            "inmem" if phase == PHASE_CELL_STACK_INMEM else "stream"
+        ),
+        "cpu_streaming_tile": mapped_tile,
+        "units_in_flight": units,
+        "workers_per_unit": workers,
+        "prefetch_units": 0,
+    }
+
+
+def map_active_cpu_candidate(
+    plan_set: PlanSet,
+    *,
+    tile_ladder: Sequence[int] = PRODUCT_TILE_LADDER,
+    workers_ladder: Sequence[int] = WORKERS_LADDER,
+) -> dict:
+    """Map an ``active`` CPU winner EXACTLY onto the product's existing knobs.
+
+    Contract (all fail closed):
+
+    * the PlanSet was produced in ``active`` mode and carries a stable hash;
+    * backend is ``cpu``;
+    * phase is ``cell_stack_inmem`` (``tile_px is None``) or
+      ``cell_stack_stream`` (tile on the canonical PRODUCT ladder);
+    * ``prefetch_units == 0`` (R55-E owns prefetch execution);
+    * ``units_in_flight`` maps to the cell-stack pool and ``workers_per_unit``
+      to the existing per-cell cache-worker knob. No new executor/pool exists.
+
+    The returned mapping is the object recorded in the active manifest; the
+    caller must apply exactly these values (no second unreported plan).
+    """
+    if not isinstance(plan_set, PlanSet):
+        raise SchedulerConfigError(
+            f"expected PlanSet, got {type(plan_set).__name__}"
+        )
+    if plan_set.mode != MODE_ACTIVE:
+        raise ActivePlanRejected(
+            REASON_UNKNOWN_BACKEND,
+            f"active mapping requires mode={MODE_ACTIVE!r}, got {plan_set.mode!r}",
+            candidate=plan_set.chosen,
+        )
+    if not isinstance(plan_set.plan_hash, str) or not plan_set.plan_hash:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "active plan has no stable plan hash",
+            candidate=plan_set.chosen,
+        )
+    return active_mapping_for_candidate(
+        plan_set.chosen,
+        tile_ladder=tile_ladder,
+        workers_ladder=workers_ladder,
+    )
+
+
+def _canonical_active_json(block: Mapping) -> bytes:
+    """Canonical ASCII JSON for the active manifest hash."""
+    return json.dumps(
+        block,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+
+
+def _stamp_active_hash(block: Mapping) -> dict:
+    """Return ``dict(block)`` plus a deterministic ``evidence_hash``."""
+    payload = {k: v for k, v in dict(block).items() if k != "evidence_hash"}
+    stamped = dict(payload)
+    stamped["evidence_hash"] = "sha256:" + hashlib.sha256(
+        _canonical_active_json(payload)
+    ).hexdigest()
+    return stamped
+
+
+def active_manifest_dict(
+    plan_set: PlanSet,
+    *,
+    mapping: Mapping,
+    status: str,
+    execution: Mapping | None = None,
+    plan_observation: Mapping | None = None,
+    admission: Mapping | None = None,
+    shrink_trail: Sequence[Mapping] = (),
+    refusal: Mapping | None = None,
+    note: str = "",
+) -> dict:
+    """Build the deterministic R55-D2 active manifest block.
+
+    The block describes the plan that ACTUALLY governs execution: the chosen
+    candidate, its exact knob mapping, the PLAN/ADMIT observations and the
+    shrink-only correction trail. It never fabricates an observed metric.
+    ``evidence_hash`` is SHA-256 over the canonical block bytes without the
+    hash itself, so two identical plans produce identical evidence.
+    """
+    if not isinstance(plan_set, PlanSet):
+        raise SchedulerConfigError(
+            f"expected PlanSet, got {type(plan_set).__name__}"
+        )
+    if not isinstance(mapping, Mapping):
+        raise SchedulerConfigError("active manifest mapping must be a mapping")
+    if not isinstance(status, str) or not status:
+        raise SchedulerConfigError("active manifest status must be non-empty")
+    block = {
+        "schema": ACTIVE_MANIFEST_SCHEMA,
+        "scheduler_version": str(plan_set.scheduler_version),
+        "mode": "active",
+        "requested_mode": MODE_ACTIVE,
+        "status": str(status),
+        "run_id": str(plan_set.run_id),
+        "plan_hash": str(plan_set.plan_hash),
+        "chosen_candidate": plan_set.chosen.to_dict(),
+        "mapping": dict(mapping),
+        "execution": None if execution is None else dict(execution),
+        "plan_observation": (
+            None if plan_observation is None else dict(plan_observation)
+        ),
+        "admission": None if admission is None else dict(admission),
+        "shrink_trail": [dict(item) for item in shrink_trail],
+        "refusal": None if refusal is None else dict(refusal),
+        "identity": plan_set.identity.to_dict(),
+        "observed_metrics": None,
+        "note": str(note),
+    }
+    return _stamp_active_hash(block)
+
 
 def next_shrink(
     candidate: Candidate, context: PlanContext

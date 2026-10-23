@@ -4207,6 +4207,739 @@ def _build_r55_observe_block(
     )
 
 
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R55-D2 — ACTIVE CPU integration. Legacy and observe paths are
+# byte-unchanged; ``active`` is the ONLY mode that can grant execution
+# authority, and only to a deterministic, fully mappable CPU winner.
+# ---------------------------------------------------------------------------
+
+_R55D2_ACTIVE_MISSION = "ZM-ZEGRID-R55-D2-CPU-ACTIVE-20261023"
+
+
+@dataclass(frozen=True)
+class _R55ActiveDecision:
+    """The frozen active decision built BEFORE any gauge/stack work."""
+
+    plan_set: object
+    mapping: dict
+    facts: dict
+    inmem_context: object
+    stream_context: object
+    phase: str
+
+
+def _r55_active_facts(
+    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
+) -> dict:
+    """Derive the integer facts the accepted scheduler needs (no probe).
+
+    Everything is computed from the INITIAL bundle's frozen layout,
+    memberships, frames and halo. No global and no solver state is mutated.
+    """
+    active = [
+        (cell, patch, mem)
+        for (_row, _col, cell, patch, mem) in cell_ctxs
+        if mem.patch_ids
+    ]
+    if not active:
+        raise zsched.SchedulerConfigError(
+            "R55-D2 active requires at least one non-empty cell"
+        )
+    units_total = len(active)
+    worst_patch_px = 0
+    worst_patch_hw = (1, 1)
+    core_area_px = 0
+    patch_area_px = 0
+    max_n_frames = 1
+    inmem_worst = 0
+    stream_worst_by_tile = {
+        int(t): 0 for t in CPU_STREAMING_TILE_LADDER
+    }
+    for cell, patch, mem in active:
+        patch_area = int(patch.patch.width) * int(patch.patch.height)
+        core = cell.core
+        core_area = max(0, int(core.x1) - int(core.x0)) * max(
+            0, int(core.y1) - int(core.y0)
+        )
+        if patch_area > worst_patch_px:
+            worst_patch_px = patch_area
+            worst_patch_hw = (
+                int(patch.patch.height), int(patch.patch.width)
+            )
+        patch_area_px += patch_area
+        core_area_px += core_area
+        n = len(mem.patch_ids)
+        max_n_frames = max(max_n_frames, n)
+        area = int(patch.patch.width) * int(patch.patch.height)
+        inmem_worst = max(
+            inmem_worst,
+            int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area)),
+        )
+        hw = tuple(int(v) for v in patch.patch_shape_hw)
+        for tile in CPU_STREAMING_TILE_LADDER:
+            stream_worst_by_tile[int(tile)] = max(
+                stream_worst_by_tile[int(tile)],
+                int(_estimate_streaming_bytes(n, hw, int(tile))),
+            )
+
+    channels = 3
+    per_unit_cache = (
+        int(worst_patch_px) * channels * 4 * int(max_n_frames)
+    )
+    _disk_root = Path(cache_root) if cache_root is not None else Path(output_dir)
+    try:
+        disk_free = int(shutil.disk_usage(str(_disk_root)).free)
+    except Exception:
+        disk_free = 0
+
+    canvas_px = int(canvas.width) * int(canvas.height)
+    gauge_workers = max(1, int(bundle.gauge_workers))
+    cache_workers = max(1, int(bundle.cache_build_workers))
+    gauge_worker_bytes = (
+        int(zpar.gauge_footprint_bytes(canvas_px)) * gauge_workers
+    )
+    cache_worker_bytes = (
+        int(zpar.cache_footprint_bytes(worst_patch_px)) * cache_workers
+    )
+    bytes_per_px = 4 * 4
+    halo_band_bytes = max(
+        0, int(patch_area_px) - int(core_area_px)
+    ) * bytes_per_px
+    retained_core_bytes = int(canvas_px) * bytes_per_px
+
+    requests = (
+        zsched.PhaseRequest(
+            phase=renv.PHASE_GAUGE,
+            components={"gauge_worker_footprint_bytes": gauge_worker_bytes},
+            units=gauge_workers,
+            units_in_flight=gauge_workers,
+            workers_per_unit=1,
+        ),
+        zsched.PhaseRequest(
+            phase=renv.PHASE_CACHE_BUILD,
+            components={"cache_build_worker_footprint_bytes": cache_worker_bytes},
+            units=cache_workers,
+            units_in_flight=cache_workers,
+            workers_per_unit=1,
+            disk_bytes=0,
+        ),
+        zsched.PhaseRequest(
+            phase=renv.PHASE_ASSEMBLY,
+            components={
+                "halo_band_bytes": halo_band_bytes,
+                "retained_core_bytes": retained_core_bytes,
+            },
+            units=1,
+            units_in_flight=1,
+            workers_per_unit=1,
+            # Rewritten to the CHOSEN stack phase by the joint builder.
+            overlaps_with=(),
+        ),
+        zsched.PhaseRequest(
+            phase=renv.PHASE_EXPORT,
+            components={
+                "coverage_plane_bytes": canvas_px * 4,
+                "science_planes_bytes": canvas_px * channels * 4,
+            },
+            units=1,
+            units_in_flight=1,
+            workers_per_unit=1,
+        ),
+    )
+    return {
+        "active": active,
+        "units_total": int(units_total),
+        "worst_patch_px": int(worst_patch_px),
+        "worst_patch_hw": (int(worst_patch_hw[0]), int(worst_patch_hw[1])),
+        "per_unit_cache": int(per_unit_cache),
+        "inmem_worst": int(max(1, inmem_worst)),
+        "stream_worst_by_tile": dict(stream_worst_by_tile),
+        "stream_worst": int(max(1, max(stream_worst_by_tile.values()))),
+        "disk_free": int(disk_free),
+        "requests": requests,
+        "cell_ids": tuple(cell.cell_id for cell, _p, _m in active),
+        "frame_ids": tuple(str(f) for f in (frame_ids or ())),
+        "channels": int(channels),
+        "max_n_frames": int(max_n_frames),
+        "layout": (
+            int(bundle.layout["nx"]), int(bundle.layout["ny"])
+        ),
+        "refinement_rank": int(bundle.envelope.refinement_rank),
+        "halo_px": int(halo_px),
+        "pinned": bool(bundle.envelope.pinned),
+        "run_id": str(canvas.canvas_id),
+    }
+
+
+def _r55_active_context(facts, *, phase, per_unit_stack, per_unit_cache,
+                        per_unit_prefetch, bundle) -> object:
+    env = bundle.envelope
+    return zsched.PlanContext(
+        phase=phase,
+        backend=renv.BACKEND_CPU,
+        budget_bytes=int(env.budget_bytes),
+        raw_available_bytes=int(env.raw_available_bytes),
+        factor_num=int(env.factor_num),
+        factor_den=int(env.factor_den),
+        cpu_logical=int(os.cpu_count() or 1),
+        units_total=int(facts["units_total"]),
+        shared_bytes=int(bundle.shared_bytes),
+        per_unit_stack_bytes=int(per_unit_stack),
+        per_unit_cache_bytes=int(per_unit_cache),
+        per_unit_prefetch_bytes=int(per_unit_prefetch),
+        disk_free_bytes=int(facts["disk_free"]),
+        layout=tuple(facts["layout"]),
+        refinement_rank=int(facts["refinement_rank"]),
+        patch_hw=tuple(facts["worst_patch_hw"]),
+        halo_px=int(facts["halo_px"]),
+        channels=int(facts["channels"]),
+        n_frames=int(facts["max_n_frames"]),
+        tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+        # D2 executable prefetch is EXACTLY zero; R55-E owns prefetch.
+        prefetch_ladder=(0,),
+        workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+        margin_num=int(renv.DEFAULT_MARGIN_NUM),
+        margin_den=int(renv.DEFAULT_MARGIN_DEN),
+        cell_ids=tuple(facts["cell_ids"]),
+        frame_ids=tuple(facts["frame_ids"]),
+        observation_source="plan.available_bytes",
+        run_id=str(facts["run_id"]),
+        pinned=bool(facts["pinned"]),
+    )
+
+
+def _r55_active_decide(
+    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
+) -> _R55ActiveDecision:
+    """Build the deterministic CPU inmem+stream decision BEFORE gauge/stack."""
+    facts = _r55_active_facts(
+        bundle=bundle,
+        cell_ctxs=cell_ctxs,
+        canvas=canvas,
+        halo_px=halo_px,
+        cache_root=cache_root,
+        output_dir=output_dir,
+        frame_ids=frame_ids,
+    )
+    inmem_context = _r55_active_context(
+        facts,
+        phase=renv.PHASE_CELL_STACK_INMEM,
+        per_unit_stack=int(facts["inmem_worst"]),
+        per_unit_cache=0,
+        per_unit_prefetch=0,
+        bundle=bundle,
+    )
+    stream_context = _r55_active_context(
+        facts,
+        phase=renv.PHASE_CELL_STACK_STREAM,
+        per_unit_stack=int(facts["stream_worst"]),
+        per_unit_cache=int(facts["per_unit_cache"]),
+        per_unit_prefetch=int(facts["per_unit_cache"]),
+        bundle=bundle,
+    )
+    joint = zsched.JointPlanInput(
+        contexts=(inmem_context, stream_context)
+    )
+    plan_set = zsched.plan_joint(
+        joint,
+        phase_requests=facts["requests"],
+        mode=zsched.MODE_ACTIVE,
+    )
+    mapping = zsched.map_active_cpu_candidate(
+        plan_set,
+        tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+        workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+    )
+    expected_identity = zsched.FrozenIdentity(
+        layout=tuple(facts["layout"]),
+        cell_ids=tuple(sorted(facts["cell_ids"])),
+        frame_ids=tuple(sorted(facts["frame_ids"])),
+        halo_px=int(facts["halo_px"]),
+        refinement_rank=int(facts["refinement_rank"]),
+    )
+    zsched.assert_same_identity(expected_identity, plan_set.identity)
+    # Structural exactness: the mapped values ARE the winner's values.
+    candidate = plan_set.chosen
+    if mapping["units_in_flight"] != int(candidate.units_in_flight):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_REFUSE_HOST_RAM,
+            "mapped units_in_flight does not equal the winner",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    if mapping["workers_per_unit"] != int(candidate.workers_per_unit):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_SHRINK_WORKERS,
+            "mapped workers_per_unit does not equal the winner",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    if mapping["cpu_streaming_tile"] != (
+        None if candidate.tile_px is None else int(candidate.tile_px)
+    ):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_SHRINK_TILE,
+            "mapped tile does not equal the winner tile",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    return _R55ActiveDecision(
+        plan_set=plan_set,
+        mapping=mapping,
+        facts=facts,
+        inmem_context=inmem_context,
+        stream_context=stream_context,
+        phase=zsched.active_cpu_phase(candidate),
+    )
+
+
+def _r55_active_apply(
+    bundle, *, mapping, facts
+):
+    """Apply an EXACT mapping to the frozen bundle's existing execution knobs.
+
+    Only the values that actually execute are changed: the cell task mode, the
+    streaming tile, the cell-pool concurrency and the per-cell cache workers.
+    Layout, memberships, frames, halo and science identity are untouched.
+    """
+    mode = mapping["cell_task_mode"]
+    tile = mapping["cpu_streaming_tile"]
+    units = int(mapping["units_in_flight"])
+    workers = int(mapping["workers_per_unit"])
+    if int(mapping["prefetch_units"]) != 0:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_SHRINK_PREFETCH,
+            "active execution refuses prefetch_units != 0",
+            mapping=mapping,
+        )
+    if mode not in ("inmem", "stream"):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_UNKNOWN_BACKEND,
+            f"unknown cell task mode {mode!r}",
+            mapping=mapping,
+        )
+    if mode == "inmem" and tile is not None:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_SHRINK_TILE,
+            f"inmem mapping must not carry a tile, got {tile!r}",
+            mapping=mapping,
+        )
+    if mode == "stream" and tile not in tuple(CPU_STREAMING_TILE_LADDER):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_SHRINK_TILE,
+            f"stream tile {tile!r} is outside the canonical product ladder",
+            mapping=mapping,
+        )
+    if units < 1 or workers < 1:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_REFUSE_HOST_RAM,
+            "active execution requires units_in_flight >= 1 and "
+            "workers_per_unit >= 1",
+            mapping=mapping,
+        )
+
+    cell_specs = []
+    cell_tasks = []
+    for (cell, patch, mem, cache_dir, _old_inmem, _old_stream, _old_gpu) in bundle.cell_specs:
+        if not mem.patch_ids:
+            cell_specs.append((cell, patch, mem, cache_dir, None, 0, None))
+            cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
+            continue
+        n = len(mem.patch_ids)
+        area = int(patch.patch.width) * int(patch.patch.height)
+        inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
+        stream_b = (
+            int(_estimate_streaming_bytes(n, patch.patch_shape_hw, int(tile)))
+            if tile is not None else 0
+        )
+        cell_specs.append(
+            (cell, patch, mem, cache_dir, inmem_b, stream_b, None)
+        )
+        if mode == "inmem":
+            cell_tasks.append(
+                (cell, patch, mem, cache_dir, "inmem", inmem_b)
+            )
+        else:
+            cell_tasks.append(
+                (cell, patch, mem, cache_dir, "stream", stream_b)
+            )
+
+    per_cell_footprint = max(
+        (int(t[5]) for t in cell_tasks if t[4] is not None), default=0
+    )
+    base_env = bundle.envelope
+    cache_per_cell = int(rcontract.cache_per_cell_bytes(
+        rcontract.PROCESS_BASELINE_BYTES,
+        workers,
+        int(bundle.cache_worker_footprint_bytes),
+    ))
+    stack_total = int(rcontract.stack_phase_total_bytes(
+        int(bundle.shared_bytes), units, int(per_cell_footprint)
+    ))
+    cache_total = int(rcontract.cache_phase_total_bytes(
+        int(bundle.shared_bytes), units, cache_per_cell
+    ))
+    aggregate = int(rcontract.aggregate_phase_bytes(stack_total, cache_total))
+    reason = (
+        "R55-D2 active CPU mapping: "
+        f"phase={mapping['phase']} tile={tile!r} units_in_flight={units} "
+        f"workers_per_unit={workers} prefetch_units=0"
+    )
+    envelope = rcontract.PlanEnvelope(
+        phase=rcontract.PHASE_PLAN,
+        raw_available_bytes=int(base_env.raw_available_bytes),
+        factor_num=int(base_env.factor_num),
+        factor_den=int(base_env.factor_den),
+        budget_bytes=int(base_env.budget_bytes),
+        layout=(int(base_env.layout[0]), int(base_env.layout[1])),
+        refinement_rank=int(base_env.refinement_rank),
+        cpu_tile=(0 if tile is None else int(tile)),
+        gpu_tile=None,
+        backend=rcontract.BACKEND_CPU,
+        cells_in_flight=int(units),
+        cache_workers_per_cell=int(workers),
+        shared_bytes=int(bundle.shared_bytes),
+        stack_total_bytes=int(stack_total),
+        cache_total_bytes=int(cache_total),
+        aggregate_bytes=int(aggregate),
+        pinned=bool(base_env.pinned),
+        reason=reason,
+    )
+    rcontract.validate_envelope(envelope)
+
+    stream_worst_by_tile = {
+        int(k): int(v) for k, v in facts["stream_worst_by_tile"].items()
+    }
+    cpu_streaming = _cpu_streaming_block(
+        tile,
+        [],
+        reason,
+        stream_worst_by_tile,
+        int(facts["inmem_worst"]),
+        int(base_env.budget_bytes),
+    )
+    if tile is None:
+        cpu_streaming["predicted_peak_bytes"] = int(facts["inmem_worst"])
+        cpu_streaming["stream_bound_bytes"] = 0
+    plan = {
+        "mode": mode,
+        "cells_in_flight": int(units),
+        "cache_workers_per_cell": int(workers),
+        "gpu_serialized": False,
+        "chosen_reason": reason,
+        "candidates": [
+            {
+                "mode": mode,
+                "cells_in_flight": int(units),
+                "max_bound_bytes": int(per_cell_footprint),
+                "feasible": True,
+                "makespan_rel": None,
+                "infeasible_reason": None,
+            }
+        ],
+        "stack_total_bytes": int(stack_total),
+        "cache_total_bytes": int(cache_total),
+        "aggregate_bytes": int(aggregate),
+    }
+    cpu_fallback_info = {
+        "applicable": False,
+        "feasible": True,
+        "mode": mode,
+        "max_bound_bytes": int(per_cell_footprint),
+        "ram_budget_bytes": int(base_env.budget_bytes),
+        "tile": (None if tile is None else int(tile)),
+        "cells_in_flight": int(units),
+        "cache_workers_per_cell": int(workers),
+        "reason": "R55-D2 active CPU plan",
+        "used": False,
+        "raw_available_bytes": int(base_env.raw_available_bytes),
+        "plan_budget_bytes": int(base_env.budget_bytes),
+    }
+    attempts = list(bundle.attempts)
+    attempts.append(
+        {
+            "active_mapping": True,
+            "phase": mapping["phase"],
+            "cpu_streaming_tile": (None if tile is None else int(tile)),
+            "units_in_flight": int(units),
+            "workers_per_unit": int(workers),
+            "prefetch_units": 0,
+            "aggregate_bytes": int(aggregate),
+            "budget_bytes": int(base_env.budget_bytes),
+        }
+    )
+    return replace(
+        bundle,
+        cpu_streaming=dict(cpu_streaming),
+        cpu_streaming_tile=(0 if tile is None else int(tile)),
+        gpu_tile_size=None,
+        gpu_streaming_tile=None,
+        gpu_streaming_host_peak_bytes=None,
+        gpu_used=False,
+        # Preserve the legacy pre-execution fallback provenance. If the product
+        # had requested GPU but the bundle already degraded to CPU, the caller's
+        # post-gauge block still needs this reason to reconcile science_config
+        # and gpu_context truthfully. A pure CPU bundle carries None here.
+        gpu_pre_execution_fallback=bundle.gpu_pre_execution_fallback,
+        cell_specs=cell_specs,
+        cell_tasks=cell_tasks,
+        plan=plan,
+        chosen_mode=mode,
+        cells_in_flight=int(units),
+        cache_workers_per_cell=int(workers),
+        per_cell_footprint=int(per_cell_footprint),
+        cpu_fallback_info=cpu_fallback_info,
+        cpu_fallback_plan=None,
+        cpu_fallback_tasks=None,
+        envelope=envelope,
+        attempts=attempts,
+    )
+
+
+def _r55_active_shrink_context(decision, candidate):
+    return (
+        decision.inmem_context
+        if candidate.tile_px is None
+        else decision.stream_context
+    )
+
+
+def _r55_active_admit(
+    *, initial_bundle, decision
+):
+    """Fit + admit the active plan BEFORE gauge/stack (fresh 90 % observations).
+
+    Every correction is a scheduler-produced :func:`scheduler.next_shrink` step
+    on the SAME frozen identity; growth is refused. Returns
+    ``(bundle, mapping, admission_outcome, trail)``.
+    """
+    candidate = decision.plan_set.chosen
+    mapping = decision.mapping
+    # Defensive exactness: the decision object cannot be tampered into an
+    # execution that differs from the accepted scheduler winner.
+    if decision.plan_set.mode != zsched.MODE_ACTIVE:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_UNKNOWN_BACKEND,
+            "active admission requires an active PlanSet",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    _expected_mapping = zsched.active_mapping_for_candidate(
+        candidate,
+        tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+        workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+    )
+    if dict(mapping) != _expected_mapping:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_INTERNAL_ERROR,
+            "active mapping does not exactly match the scheduler winner "
+            f"(mapping={mapping!r}, expected={_expected_mapping!r})",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    bundle = _r55_active_apply(
+        initial_bundle, mapping=mapping, facts=decision.facts
+    )
+    trail = []
+
+    # 1) The mapped product envelope must still fit the INITIAL 80 % B_plan.
+    #    (The scheduler's host model does not include the product's cache
+    #    phase, so an honest exact mapping is re-checked here.)
+    while bundle.envelope.aggregate_bytes > bundle.envelope.budget_bytes:
+        name, nxt = zsched.next_shrink(
+            candidate, _r55_active_shrink_context(decision, candidate)
+        )
+        if name is None or nxt is None:
+            raise rcontract.AdmissionExhausted(
+                "R55-D2 active plan cannot fit its own B_plan and has no legal "
+                f"shrink step left (aggregate {bundle.envelope.aggregate_bytes} > "
+                f"B_plan {bundle.envelope.budget_bytes})"
+            )
+        zsched.assert_shrink_only(candidate, nxt)
+        trail.append(
+            {
+                "at": "plan_fit",
+                "step": name,
+                "from": {
+                    "tile_px": candidate.tile_px,
+                    "units_in_flight": int(candidate.units_in_flight),
+                    "workers_per_unit": int(candidate.workers_per_unit),
+                    "prefetch_units": int(candidate.prefetch_units),
+                },
+                "to": {
+                    "tile_px": nxt.tile_px,
+                    "units_in_flight": int(nxt.units_in_flight),
+                    "workers_per_unit": int(nxt.workers_per_unit),
+                    "prefetch_units": int(nxt.prefetch_units),
+                },
+                "aggregate_bytes_before": int(bundle.envelope.aggregate_bytes),
+                "b_plan_bytes": int(bundle.envelope.budget_bytes),
+            }
+        )
+        candidate = nxt
+        mapping = zsched.active_mapping_for_candidate(
+            candidate,
+            tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+            workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+        )
+        bundle = _r55_active_apply(
+            initial_bundle, mapping=mapping, facts=decision.facts
+        )
+
+    def _measure():
+        raw = int(available_memory_bytes())
+        if raw <= 0:
+            raise rcontract.InvalidObservation(
+                "R55-D2 active admission requires a strictly positive raw "
+                f"observation, got {raw}"
+            )
+        return raw
+
+    observations = []
+    history = [bundle.envelope]
+    replans = 0
+    while True:
+        admit_obs = rcontract.Observation.admit(_measure())
+        observations.append(admit_obs)
+        if bundle.envelope.aggregate_bytes <= admit_obs.budget_bytes:
+            launch_obs = rcontract.Observation.launch(_measure())
+            observations.append(launch_obs)
+            if bundle.envelope.aggregate_bytes <= launch_obs.budget_bytes:
+                outcome = rcontract.AdmissionOutcome(
+                    plan=bundle.envelope,
+                    observations=tuple(observations),
+                    history=tuple(history),
+                    replans=int(replans),
+                    tolerance=rcontract.requires_tolerance(
+                        bundle.envelope.aggregate_bytes,
+                        launch_obs.raw_available_bytes,
+                    ),
+                    final_observation=launch_obs,
+                )
+                return bundle, mapping, outcome, trail
+            miss_obs = launch_obs
+        else:
+            miss_obs = admit_obs
+
+        if replans >= R41_ADMISSION_MAX_REPLANS:
+            raise rcontract.AdmissionExhausted(
+                "R55-D2 active plan still exceeds the fresh admission ceiling "
+                f"after {R41_ADMISSION_MAX_REPLANS} scheduler shrink(s): "
+                f"aggregate {bundle.envelope.aggregate_bytes / 2**20:.1f} MiB > "
+                f"B_admit {miss_obs.budget_bytes / 2**20:.1f} MiB",
+                attempts=tuple(observations),
+            )
+        plan_obs = rcontract.Observation.plan(miss_obs.raw_available_bytes)
+        observations.append(plan_obs)
+        # Shrink under the SAME observation's B_plan, exactly like a rebuild,
+        # but with scheduler-produced shrink-only choices.
+        while True:
+            name, nxt = zsched.next_shrink(
+                candidate, _r55_active_shrink_context(decision, candidate)
+            )
+            if name is None or nxt is None:
+                raise rcontract.AdmissionExhausted(
+                    "R55-D2 active admission miss and no legal shrink step "
+                    f"remains (aggregate {bundle.envelope.aggregate_bytes} > "
+                    f"B_admit {miss_obs.budget_bytes})",
+                    attempts=tuple(observations),
+                )
+            zsched.assert_shrink_only(candidate, nxt)
+            trail.append(
+                {
+                    "at": "admission_pressure",
+                    "step": name,
+                    "from": {
+                        "tile_px": candidate.tile_px,
+                        "units_in_flight": int(candidate.units_in_flight),
+                        "workers_per_unit": int(candidate.workers_per_unit),
+                        "prefetch_units": int(candidate.prefetch_units),
+                    },
+                    "to": {
+                        "tile_px": nxt.tile_px,
+                        "units_in_flight": int(nxt.units_in_flight),
+                        "workers_per_unit": int(nxt.workers_per_unit),
+                        "prefetch_units": int(nxt.prefetch_units),
+                    },
+                    "admit_raw_bytes": int(miss_obs.raw_available_bytes),
+                    "b_admit_bytes": int(miss_obs.budget_bytes),
+                    "b_plan_bytes": int(plan_obs.budget_bytes),
+                    "aggregate_bytes_before": int(
+                        bundle.envelope.aggregate_bytes
+                    ),
+                }
+            )
+            candidate = nxt
+            mapping = zsched.active_mapping_for_candidate(
+                candidate,
+                tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+                workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+            )
+            bundle = _r55_active_apply(
+                initial_bundle, mapping=mapping, facts=decision.facts
+            )
+            if bundle.envelope.aggregate_bytes <= plan_obs.budget_bytes:
+                break
+        replans += 1
+        history.append(bundle.envelope)
+
+
+def _r55_active_plan_observation(bundle) -> dict:
+    env = bundle.envelope
+    return {
+        "raw_available_bytes": int(env.raw_available_bytes),
+        "factor_num": int(env.factor_num),
+        "factor_den": int(env.factor_den),
+        "budget_bytes": int(env.budget_bytes),
+    }
+
+
+def _r55_active_execution(bundle, mapping) -> dict:
+    env = bundle.envelope
+    return {
+        "backend": "cpu",
+        "cell_task_mode": str(bundle.chosen_mode),
+        "cpu_streaming_tile": mapping["cpu_streaming_tile"],
+        "units_in_flight": int(bundle.cells_in_flight),
+        "workers_per_unit": int(bundle.cache_workers_per_cell),
+        "prefetch_units": 0,
+        "aggregate_bytes": int(env.aggregate_bytes),
+        "stack_total_bytes": int(env.stack_total_bytes),
+        "cache_total_bytes": int(env.cache_total_bytes),
+        "shared_bytes": int(env.shared_bytes),
+        "layout": [int(env.layout[0]), int(env.layout[1])],
+        "refinement_rank": int(env.refinement_rank),
+    }
+
+
+def _r55_build_active_block(
+    *, plan_set, mapping, bundle, admission, trail, status
+) -> dict:
+    """Deterministic active manifest block (no fabricated observed metric)."""
+    admission_dict = {
+        "observations": [o.to_dict() for o in admission.observations],
+        "launch_observation": admission.final_observation.to_dict(),
+        "replans": int(admission.replans),
+        "tolerance": bool(admission.tolerance),
+        "history": [env.to_dict() for env in admission.history],
+    }
+    return zsched.active_manifest_dict(
+        plan_set,
+        mapping=mapping,
+        status=status,
+        execution=_r55_active_execution(bundle, mapping),
+        plan_observation=_r55_active_plan_observation(bundle),
+        admission=admission_dict,
+        shrink_trail=trail,
+        note=(
+            "R55-D2 active: this CPU plan granted execution authority BEFORE "
+            "the global gauge. The mapped tile/K/workers are the values that "
+            "actually ran; no observed metric is fabricated and no second "
+            "unreported plan exists."
+        ),
+    )
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -4541,6 +5274,68 @@ def _run_single(
         callback=progress_callback,
     )
 
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-R55-D2 — ACTIVE decision. The initial bundle has frozen the
+    # layout, memberships, frame set, halo and science identity. Decide and
+    # admit the CPU plan NOW, before any global gauge or stack work. Any
+    # refusal/error is FATAL (no legacy fallback) and leaves no science output.
+    # ------------------------------------------------------------------
+    _r55_active_decision = None
+    _r55_active_mapping = None
+    _r55_active_adm = None
+    _r55_active_trail = []
+    _r55_active_bundle = None
+    if scheduler_mode == zsched.MODE_ACTIVE:
+        if bool(_initial_bundle.gpu_used):
+            raise RuntimeError(
+                "R55-D2 active refuses to execute on the GPU: the product bundle "
+                "selected GPU execution, and active D2 grants authority only to a "
+                "fully mappable CPU plan. Refused BEFORE the gauge/stack (no "
+                "silent CPU coercion)."
+            )
+        _r55_frame_ids = tuple(
+            getattr(getattr(f, "frame_id", None), "logical_path", str(f))
+            for f in (descs or ())
+        )
+        try:
+            _r55_active_decision = _r55_active_decide(
+                bundle=_initial_bundle,
+                cell_ctxs=cell_ctxs,
+                canvas=canvas,
+                halo_px=halo_px,
+                cache_root=cache_root,
+                output_dir=output_dir,
+                frame_ids=_r55_frame_ids,
+            )
+            (
+                _r55_active_bundle,
+                _r55_active_mapping,
+                _r55_active_adm,
+                _r55_active_trail,
+            ) = _r55_active_admit(
+                initial_bundle=_initial_bundle,
+                decision=_r55_active_decision,
+            )
+        except (zsched.SchedulerError, rcontract.RamContractError) as _r55_exc:
+            _emit(
+                "ZeGrid: R55-D2 active REFUSED before the gauge/stack — "
+                f"{_r55_exc}",
+                lvl="ERROR", callback=progress_callback,
+            )
+            raise RuntimeError(
+                "R55-D2 active refused before the gauge/stack: " + str(_r55_exc)
+            ) from _r55_exc
+        _emit(
+            "ZeGrid: R55-D2 active plan ADMITTED before the gauge — "
+            f"phase={_r55_active_mapping['phase']} "
+            f"tile={_r55_active_mapping['cpu_streaming_tile']} "
+            f"units_in_flight={_r55_active_mapping['units_in_flight']} "
+            f"workers_per_unit={_r55_active_mapping['workers_per_unit']} "
+            f"prefetch_units=0 plan_hash={_r55_active_decision.plan_set.plan_hash} "
+            f"shrink_steps={len(_r55_active_trail)}",
+            callback=progress_callback,
+        )
+
     # R15 (rework-1 L3): track cache cleanup failures (auditable in the manifest).
     cleanup_failures: list[str] = []
 
@@ -4650,19 +5445,24 @@ def _run_single(
             )
         return outcome, final
 
-    try:
-        _adm, _final = _admit(_initial_bundle)
-    except rcontract.AdmissionExhausted as _adm_exc:
-        _emit(
-            "ZeGrid refused: the executable plan could not be admitted under "
-            f"{rcontract.ADMIT_FACTOR_NUM}/{rcontract.ADMIT_FACTOR_DEN} of the freshly "
-            f"measured available RAM after {R41_ADMISSION_MAX_REPLANS} bounded "
-            f"replan(s): {_adm_exc}",
-            lvl="ERROR", callback=progress_callback,
-        )
-        raise zpar.ModeInfeasible(
-            "ZeGrid admission refused (fresh RAM ceilings): " + str(_adm_exc)
-        ) from _adm_exc
+    if scheduler_mode == zsched.MODE_ACTIVE:
+        # R55-D2: the active plan was already fitted and admitted BEFORE the
+        # gauge. Do NOT run the legacy admission controller (no second plan).
+        _adm, _final = _r55_active_adm, _r55_active_bundle
+    else:
+        try:
+            _adm, _final = _admit(_initial_bundle)
+        except rcontract.AdmissionExhausted as _adm_exc:
+            _emit(
+                "ZeGrid refused: the executable plan could not be admitted under "
+                f"{rcontract.ADMIT_FACTOR_NUM}/{rcontract.ADMIT_FACTOR_DEN} of the freshly "
+                f"measured available RAM after {R41_ADMISSION_MAX_REPLANS} bounded "
+                f"replan(s): {_adm_exc}",
+                lvl="ERROR", callback=progress_callback,
+            )
+            raise zpar.ModeInfeasible(
+                "ZeGrid admission refused (fresh RAM ceilings): " + str(_adm_exc)
+            ) from _adm_exc
     if _adm.replans:
         _emit(
             f"ZeGrid: admitted after {_adm.replans} bounded replan(s) — layout "
@@ -5487,6 +6287,22 @@ def _run_single(
             "failure_reason": repr(exc),
         }
         fin_uint16 = None
+
+    # R55-D2: build the active block AFTER execution so its status and final
+    # values are the ones that actually ran. It is deterministic (no timing or
+    # observed metric) and is the ONLY scheduler block in active mode.
+    if scheduler_mode == zsched.MODE_ACTIVE and _r55_active_decision is not None:
+        _r55_active_ok = all(
+            r.get("status") in ("complete", "empty") for r in results
+        )
+        _r55_scheduler_block = _r55_build_active_block(
+            plan_set=_r55_active_decision.plan_set,
+            mapping=_r55_active_mapping,
+            bundle=_final,
+            admission=_r55_active_adm,
+            trail=_r55_active_trail,
+            status=("executed" if _r55_active_ok else "partial"),
+        )
 
     # R55-C rework-2: the observe block was built from the SELECTED backend.
     # Reconcile its nested readiness provenance with the backend that actually
@@ -6412,7 +7228,12 @@ def run_zegrid_mode(
             "(R55 observe-only: records a predicted plan; execution remains the "
             "legacy path)"
             if _scheduler_mode == zsched.MODE_OBSERVE
-            else "(legacy default: R55 scheduler disabled)"
+            else (
+                "(R55-D2 active: a deterministic mapped CPU plan grants "
+                "execution authority before the gauge)"
+                if _scheduler_mode == zsched.MODE_ACTIVE
+                else "(legacy default: R55 scheduler disabled)"
+            )
         ),
         callback=progress_callback,
     )
