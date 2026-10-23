@@ -378,6 +378,26 @@ def test_active_mapping_rejects_gpu_prefetch_off_ladder_and_bad_workers():
         zs.active_mapping_for_candidate(_candidate(units_in_flight=0))
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"tile_ladder": (128.5,)},
+        {"tile_ladder": (True, 128)},
+        {"tile_ladder": ()},
+        {"tile_ladder": (128, 128)},
+        {"workers_ladder": (4.5,)},
+        {"workers_ladder": (True, 4)},
+        {"workers_ladder": ()},
+        {"workers_ladder": (4, 4)},
+    ],
+)
+def test_active_mapping_rejects_malformed_custom_ladders(kwargs):
+    with pytest.raises(zs.ActivePlanRejected):
+        zs.active_mapping_for_candidate(
+            _candidate(tile_px=128, workers_per_unit=4), **kwargs
+        )
+
+
 def test_stale_or_tampered_candidate_is_refused_by_the_joint_builder():
     plan = _stream_wins_plan()
     tampered = dataclasses.replace(

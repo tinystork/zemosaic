@@ -2794,6 +2794,30 @@ def _active_strict_int(value, name: str, *, minimum: int = 0) -> int:
         ) from exc
 
 
+def _active_strict_ladder(values, name: str) -> tuple[int, ...]:
+    """Validate an active execution ladder without coercing its entries."""
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            f"{name} must be a non-empty sequence of strict positive ints",
+        )
+    if not values:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            f"{name} must not be empty",
+        )
+    out = tuple(
+        _active_strict_int(value, f"{name}[{index}]", minimum=1)
+        for index, value in enumerate(values)
+    )
+    if len(set(out)) != len(out):
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            f"{name} entries must be unique, got {out!r}",
+        )
+    return out
+
+
 def _validate_active_candidate_fields(
     candidate: Candidate, *, require_feasible: bool
 ) -> None:
@@ -3046,6 +3070,10 @@ def active_mapping_for_candidate(
     can never drift from the accepted mapping contract.
     """
     _validate_active_candidate_fields(candidate, require_feasible=True)
+    allowed_tiles = _active_strict_ladder(tile_ladder, "tile_ladder")
+    allowed_workers = _active_strict_ladder(
+        workers_ladder, "workers_ladder"
+    )
     phase = active_cpu_phase(candidate)
     if int(candidate.prefetch_units) != 0:
         raise ActivePlanRejected(
@@ -3056,7 +3084,6 @@ def active_mapping_for_candidate(
             candidate=candidate,
         )
     if phase == PHASE_CELL_STACK_STREAM:
-        allowed_tiles = tuple(int(t) for t in tile_ladder)
         if candidate.tile_px is None or int(candidate.tile_px) not in allowed_tiles:
             raise ActivePlanRejected(
                 REASON_SHRINK_TILE,
@@ -3075,7 +3102,6 @@ def active_mapping_for_candidate(
             f"units_in_flight must be >= 1, got {candidate.units_in_flight}",
             candidate=candidate,
         )
-    allowed_workers = tuple(int(w) for w in workers_ladder)
     workers = int(candidate.workers_per_unit)
     if workers < 1 or (allowed_workers and workers not in allowed_workers):
         raise ActivePlanRejected(
