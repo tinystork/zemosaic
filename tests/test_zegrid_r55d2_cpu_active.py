@@ -66,6 +66,39 @@ class _SeqMemory:
         return self.first if self.calls == 1 else self.then
 
 
+class _ScheduleMemory:
+    """Explicit per-call RAM schedule, then a fixed default."""
+
+    def __init__(self, values, *, default):
+        self.values = [int(v) for v in values]
+        self.default = int(default)
+        self.calls = 0
+
+    def __call__(self):
+        idx = self.calls
+        self.calls += 1
+        return self.values[idx] if idx < len(self.values) else self.default
+
+
+def _recompute_final_hash(block) -> str:
+    """Recompute the primary active plan hash from the manifest's own fields."""
+    candidate = zs.Candidate(**block["chosen_candidate"])
+    ident = block["identity"]
+    identity = zs.FrozenIdentity(
+        layout=tuple(ident["layout"]),
+        cell_ids=tuple(ident["cell_ids"]),
+        frame_ids=tuple(ident["frame_ids"]),
+        halo_px=int(ident["halo_px"]),
+        refinement_rank=int(ident["refinement_rank"]),
+    )
+    return zs.active_final_plan_hash(
+        candidate=candidate,
+        mapping=block["mapping"],
+        identity=identity,
+        envelope=block["final_envelope"],
+    )
+
+
 def _run_product(inp, out, mode, *, memory=WITNESS_AVAILABLE_BYTES):
     if not callable(memory):
         _constant = int(memory)
@@ -134,6 +167,24 @@ def _spy_gauge_and_stack(monkeypatch):
     def _stack(*_a, **_k):
         calls["stack"] += 1
         raise AssertionError("cell stack must not run for an active refusal")
+
+    monkeypatch.setattr(zz.zphot, "compute_global_gauge", _gauge)
+    monkeypatch.setattr(zz, "_stack_cell", _stack)
+    return calls
+
+
+def _spy_gauge_call_through_and_stack(monkeypatch):
+    """Let the gauge run and count it; forbid any stack worker."""
+    calls = {"gauge": 0, "stack": 0}
+    real_gauge = zz.zphot.compute_global_gauge
+
+    def _gauge(*args, **kwargs):
+        calls["gauge"] += 1
+        return real_gauge(*args, **kwargs)
+
+    def _stack(*_a, **_k):
+        calls["stack"] += 1
+        raise AssertionError("cell stack must not run for a launch refusal")
 
     monkeypatch.setattr(zz.zphot, "compute_global_gauge", _gauge)
     monkeypatch.setattr(zz, "_stack_cell", _stack)
@@ -415,6 +466,11 @@ def test_active_manifest_is_deterministic_and_fabricates_nothing():
     assert block["requested_mode"] == "active"
     assert block["status"] == "executed"
     assert block["plan_hash"] == plan.plan_hash
+    assert block["initial_plan_hash"] == plan.plan_hash
+    assert block["initial_candidate"] == plan.chosen.to_dict()
+    assert block["chosen_candidate"] == plan.chosen.to_dict()
+    assert block["final_envelope"] is None
+    assert block["plan_hash_schema"].startswith("scheduler_plan_set:")
     assert block["mapping"] == mapping
     assert block["observed_metrics"] is None
     assert block["evidence_hash"].startswith("sha256:")
@@ -457,6 +513,25 @@ def test_active_vs_legacy_byte_identical_with_truthful_active_evidence(parity_ru
     assert block["observed_metrics"] is None
     assert block["plan_hash"].startswith("sha256:")
     assert block["evidence_hash"].startswith("sha256:")
+    assert block["plan_hash_schema"] == zs.ACTIVE_FINAL_PLAN_SCHEMA
+    # Distinct concepts by design: the D1 scheduler PlanSet hash vs the final
+    # executable-plan hash. No pressure means the same candidate ran.
+    assert block["initial_plan_hash"].startswith("sha256:")
+    assert block["initial_plan_hash"] != block["plan_hash"]
+    assert block["chosen_candidate"] == block["initial_candidate"]
+    assert block["final_envelope"] is not None
+    assert _recompute_final_hash(block) == block["plan_hash"]
+    assert block["preflight_admission"]["replans"] == 0
+    assert block["launch_revalidation"]["replans"] == 0
+    assert block["admission"] == block["launch_revalidation"]
+    assert (
+        block["initial_plan_observation"]["raw_available_bytes"]
+        == WITNESS_AVAILABLE_BYTES
+    )
+    assert (
+        block["plan_observation"]["raw_available_bytes"]
+        == WITNESS_AVAILABLE_BYTES
+    )
 
     mapping = block["mapping"]
     execution = block["execution"]
@@ -632,15 +707,23 @@ def test_fresh_pressure_shrinks_only_the_scheduler_plan(
         return max(int(real_cache_fp(px)), 600 * MIB)
 
     monkeypatch.setattr(zz.zpar, "cache_footprint_bytes", _inflated_cache_fp)
-    memory = _SeqMemory(WITNESS_AVAILABLE_BYTES, 2900 * MIB)
+    # Call 1 = PLAN at 12 GiB; calls 2-3 = PREFLIGHT admit+launch at 2.9 GiB
+    # (preflight shrink); calls 4+ = POST-GAUGE launch at 12 GiB (no further
+    # correction). This isolates the preflight pressure path.
+    memory = _ScheduleMemory(
+        [WITNESS_AVAILABLE_BYTES, 2900 * MIB, 2900 * MIB, WITNESS_AVAILABLE_BYTES],
+        default=WITNESS_AVAILABLE_BYTES,
+    )
     out = tmp_path / "shrunk"
     _run_product(routine_input, out, "active", memory=memory)
     block = _manifest(out)["r55_scheduler"]
     assert block["status"] == "executed"
-    assert block["admission"]["replans"] >= 1
+    assert block["preflight_admission"]["replans"] >= 1
+    assert block["launch_revalidation"]["replans"] == 0
     assert block["shrink_trail"], "a fresh admission miss must record shrink steps"
     steps = block["shrink_trail"]
     assert all(item["at"] == "admission_pressure" for item in steps)
+    assert all(item["stage"] == "preflight" for item in steps)
     # The trail is shrink-only in the fixed order.
     order = ["prefetch_units", "workers_per_unit", "units_in_flight", "tile_px", "backend"]
     positions = [order.index(item["step"]) for item in steps]
@@ -665,6 +748,131 @@ def test_fresh_pressure_shrinks_only_the_scheduler_plan(
     assert final["units_in_flight"] == diag["cells_in_flight"]
     assert final["workers_per_unit"] == diag["cache_workers_per_cell"]
     assert final["cpu_streaming_tile"] == diag["cpu_streaming_tile"]
+    # rework-1: the final candidate/hash are truthful, and the window that
+    # admitted the correction is the fresh 4/5 observation (not the stale one).
+    assert block["plan_hash_schema"] == zs.ACTIVE_FINAL_PLAN_SCHEMA
+    assert block["plan_hash"] != block["initial_plan_hash"]
+    assert (
+        block["chosen_candidate"]["units_in_flight"]
+        == block["mapping"]["units_in_flight"]
+    )
+    assert (
+        block["chosen_candidate"]["workers_per_unit"]
+        == block["mapping"]["workers_per_unit"]
+    )
+    assert block["chosen_candidate"]["workers_per_unit"] == final["workers_per_unit"]
+    assert (
+        block["chosen_candidate"]["workers_per_unit"]
+        < block["initial_candidate"]["workers_per_unit"]
+    )
+    assert block["plan_observation"]["raw_available_bytes"] == 2900 * MIB
+    assert block["initial_plan_observation"]["raw_available_bytes"] == WITNESS_AVAILABLE_BYTES
+    assert block["final_envelope"]["raw_available_bytes"] == 2900 * MIB
+    assert block["final_envelope"]["factor_num"] == 4
+    assert block["final_envelope"]["factor_den"] == 5
+    assert block["final_envelope"]["budget_bytes"] == (4 * (2900 * MIB)) // 5
+    assert (
+        block["final_envelope"]["aggregate_bytes"]
+        <= block["plan_observation"]["budget_bytes"]
+    )
+    assert _recompute_final_hash(block) == block["plan_hash"]
+
+
+# ---------------------------------------------------------------------------
+# Post-gauge launch revalidation (rework-1)
+# ---------------------------------------------------------------------------
+
+def test_post_gauge_ram_collapse_refuses_before_stack(
+    routine_input, tmp_path, monkeypatch
+):
+    """PLAN + preflight are high; RAM collapses AFTER the gauge.
+
+    The gauge must run exactly once, the launch revalidation must refuse, the
+    stack must never start, and no science/manifest may be committed.
+    """
+    calls = _spy_gauge_call_through_and_stack(monkeypatch)
+    memory = _ScheduleMemory(
+        [
+            WITNESS_AVAILABLE_BYTES,  # PLAN
+            WITNESS_AVAILABLE_BYTES,  # preflight admit
+            WITNESS_AVAILABLE_BYTES,  # preflight launch
+            1,                        # post-gauge admit (collapse)
+        ],
+        default=1,
+    )
+    out = tmp_path / "post_gauge_refused"
+    with pytest.raises(
+        RuntimeError, match="launch revalidation refused before the stack"
+    ):
+        _run_product(routine_input, out, "active", memory=memory)
+    assert calls == {"gauge": 1, "stack": 0}
+    _no_science_output(out)
+
+
+def test_post_gauge_pressure_shrinks_the_actual_stack_knobs(
+    routine_input, tmp_path, monkeypatch
+):
+    """PLAN + preflight are high; post-gauge pressure permits one shrink.
+
+    The final stack must use the shrunk W, the final candidate/hash must be
+    truthful, and the final envelope must be bound to the fresh 4/5 observation.
+    """
+    real_cache_fp = zz.zpar.cache_footprint_bytes
+
+    def _inflated_cache_fp(px):
+        return max(int(real_cache_fp(px)), 600 * MIB)
+
+    monkeypatch.setattr(zz.zpar, "cache_footprint_bytes", _inflated_cache_fp)
+    memory = _ScheduleMemory(
+        [
+            WITNESS_AVAILABLE_BYTES,  # PLAN
+            WITNESS_AVAILABLE_BYTES,  # preflight admit
+            WITNESS_AVAILABLE_BYTES,  # preflight launch
+            2900 * MIB,               # post-gauge admit (miss -> shrink)
+        ],
+        default=2900 * MIB,
+    )
+    out = tmp_path / "post_gauge_shrunk"
+    _run_product(routine_input, out, "active", memory=memory)
+    manifest = _manifest(out)
+    block = manifest["r55_scheduler"]
+    diag = manifest["per_cell_diagnostics"]
+    assert block["status"] == "executed"
+    assert block["preflight_admission"]["replans"] == 0
+    assert block["launch_revalidation"]["replans"] >= 1
+    steps = block["shrink_trail"]
+    assert steps and all(item["stage"] == "launch" for item in steps)
+    assert all(item["at"] == "admission_pressure" for item in steps)
+    # Final candidate, mapping, execution and diagnostics agree.
+    final = block["execution"]
+    assert block["chosen_candidate"]["workers_per_unit"] == final["workers_per_unit"]
+    assert block["mapping"]["workers_per_unit"] == final["workers_per_unit"]
+    assert diag["cache_workers_per_cell"] == final["workers_per_unit"]
+    assert block["mapping"]["units_in_flight"] == final["units_in_flight"]
+    assert diag["cells_in_flight"] == final["units_in_flight"]
+    assert diag["mode"] == final["cell_task_mode"]
+    # The correction is a real shrink and the final hash is not the initial one.
+    assert (
+        block["chosen_candidate"]["workers_per_unit"]
+        < block["initial_candidate"]["workers_per_unit"]
+    )
+    assert block["plan_hash"] != block["initial_plan_hash"]
+    assert block["plan_hash_schema"] == zs.ACTIVE_FINAL_PLAN_SCHEMA
+    assert _recompute_final_hash(block) == block["plan_hash"]
+    # The final envelope is bound to the POST-GAUGE 4/5 observation.
+    assert block["plan_observation"]["raw_available_bytes"] == 2900 * MIB
+    assert block["initial_plan_observation"]["raw_available_bytes"] == WITNESS_AVAILABLE_BYTES
+    assert block["final_envelope"]["raw_available_bytes"] == 2900 * MIB
+    assert block["final_envelope"]["factor_num"] == 4
+    assert block["final_envelope"]["factor_den"] == 5
+    assert block["final_envelope"]["budget_bytes"] == (4 * (2900 * MIB)) // 5
+    assert (
+        block["final_envelope"]["aggregate_bytes"]
+        <= block["plan_observation"]["budget_bytes"]
+    )
+    # Frozen identity survives the post-gauge correction.
+    assert final["layout"] == block["identity"]["layout"]
+    assert final["refinement_rank"] == block["identity"]["refinement_rank"]
 
 
 # ---------------------------------------------------------------------------

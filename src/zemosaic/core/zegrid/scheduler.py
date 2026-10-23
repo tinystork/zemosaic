@@ -93,11 +93,13 @@ __all__ = [
     "DEFAULT_MODE",
     "ACTIVE_MANIFEST_SCHEMA",
     "ACTIVE_MAPPING_SCHEMA",
+    "ACTIVE_FINAL_PLAN_SCHEMA",
     "ACTIVE_EXECUTABLE_PHASES",
     "ActivePlanRejected",
     "active_cpu_phase",
     "active_mapping_for_candidate",
     "map_active_cpu_candidate",
+    "active_final_plan_hash",
     "active_manifest_dict",
     "MIN_TILE_PX",
     "PRODUCT_TILE_LADDER",
@@ -163,6 +165,11 @@ DEFAULT_MODE = MODE_LEGACY
 # identical.
 ACTIVE_MANIFEST_SCHEMA = "zemosaic-r55d2-active-manifest-v1"
 ACTIVE_MAPPING_SCHEMA = "zemosaic-r55d2-active-mapping-v1"
+# R55-D2 rework-1: the PRIMARY active plan hash identifies the FINAL
+# EXECUTABLE decision (final candidate + exact mapping + frozen identity +
+# validated product PlanEnvelope). It is deliberately schema-labelled so it is
+# never mistaken for the D1 scheduler-envelope hash.
+ACTIVE_FINAL_PLAN_SCHEMA = "zemosaic-r55d2-final-executable-plan-v1"
 ACTIVE_EXECUTABLE_PHASES = (
     PHASE_CELL_STACK_INMEM,
     PHASE_CELL_STACK_STREAM,
@@ -2906,6 +2913,57 @@ def map_active_cpu_candidate(
     )
 
 
+def active_final_plan_hash(
+    *,
+    candidate: Candidate,
+    mapping: Mapping,
+    identity: FrozenIdentity,
+    envelope,
+) -> str:
+    """Deterministic hash of the FINAL executable active decision.
+
+    The payload is schema-labelled and covers the final candidate, its exact
+    mapping, the frozen identity and the final validated product PlanEnvelope.
+    It is NOT the D1 scheduler PlanSet hash; that hash is preserved separately as
+    ``initial_plan_hash`` when a pressure correction changed the plan.
+    """
+    if not isinstance(candidate, Candidate):
+        raise SchedulerConfigError(
+            f"expected Candidate, got {type(candidate).__name__}"
+        )
+    if not isinstance(identity, FrozenIdentity):
+        raise SchedulerConfigError(
+            f"expected FrozenIdentity, got {type(identity).__name__}"
+        )
+    expected = active_mapping_for_candidate(candidate)
+    if dict(mapping) != expected:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "final plan hash mapping does not exactly match the final candidate "
+            f"(mapping={mapping!r}, expected={expected!r})",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    if hasattr(envelope, "to_dict"):
+        env = envelope.to_dict()
+    elif isinstance(envelope, Mapping):
+        env = dict(envelope)
+    else:
+        raise SchedulerConfigError(
+            "final plan hash requires a PlanEnvelope or its mapping"
+        )
+    payload = {
+        "schema": ACTIVE_FINAL_PLAN_SCHEMA,
+        "candidate": candidate.to_dict(),
+        "mapping": dict(mapping),
+        "identity": identity.to_dict(),
+        "product_envelope": env,
+    }
+    return "sha256:" + hashlib.sha256(
+        _canonical_active_json(payload)
+    ).hexdigest()
+
+
 def _canonical_active_json(block: Mapping) -> bytes:
     """Canonical ASCII JSON for the active manifest hash."""
     return json.dumps(
@@ -2933,10 +2991,19 @@ def active_manifest_dict(
     status: str,
     execution: Mapping | None = None,
     plan_observation: Mapping | None = None,
+    initial_plan_observation: Mapping | None = None,
     admission: Mapping | None = None,
+    preflight_admission: Mapping | None = None,
+    launch_revalidation: Mapping | None = None,
     shrink_trail: Sequence[Mapping] = (),
     refusal: Mapping | None = None,
     note: str = "",
+    final_candidate: Candidate | None = None,
+    initial_candidate: Candidate | None = None,
+    initial_plan_hash: str | None = None,
+    final_envelope=None,
+    plan_hash: str | None = None,
+    plan_hash_schema: str | None = None,
 ) -> dict:
     """Build the deterministic R55-D2 active manifest block.
 
@@ -2954,6 +3021,36 @@ def active_manifest_dict(
         raise SchedulerConfigError("active manifest mapping must be a mapping")
     if not isinstance(status, str) or not status:
         raise SchedulerConfigError("active manifest status must be non-empty")
+    final_candidate = (
+        plan_set.chosen if final_candidate is None else final_candidate
+    )
+    initial_candidate = (
+        plan_set.chosen if initial_candidate is None else initial_candidate
+    )
+    if not isinstance(final_candidate, Candidate) or not isinstance(
+        initial_candidate, Candidate
+    ):
+        raise SchedulerConfigError(
+            "active manifest candidates must be Candidate values"
+        )
+    if initial_plan_hash is None:
+        initial_plan_hash = plan_set.plan_hash
+    if plan_hash is None:
+        if final_envelope is not None:
+            plan_hash = active_final_plan_hash(
+                candidate=final_candidate,
+                mapping=mapping,
+                identity=plan_set.identity,
+                envelope=final_envelope,
+            )
+        else:
+            plan_hash = plan_set.plan_hash
+    if plan_hash_schema is None:
+        plan_hash_schema = (
+            ACTIVE_FINAL_PLAN_SCHEMA
+            if final_envelope is not None
+            else "scheduler_plan_set:" + str(plan_set.scheduler_version)
+        )
     block = {
         "schema": ACTIVE_MANIFEST_SCHEMA,
         "scheduler_version": str(plan_set.scheduler_version),
@@ -2961,14 +3058,32 @@ def active_manifest_dict(
         "requested_mode": MODE_ACTIVE,
         "status": str(status),
         "run_id": str(plan_set.run_id),
-        "plan_hash": str(plan_set.plan_hash),
-        "chosen_candidate": plan_set.chosen.to_dict(),
+        "plan_hash": str(plan_hash),
+        "plan_hash_schema": str(plan_hash_schema),
+        "initial_plan_hash": str(initial_plan_hash),
+        "initial_candidate": initial_candidate.to_dict(),
+        "chosen_candidate": final_candidate.to_dict(),
         "mapping": dict(mapping),
         "execution": None if execution is None else dict(execution),
+        "final_envelope": (
+            final_envelope.to_dict()
+            if hasattr(final_envelope, "to_dict")
+            else (None if final_envelope is None else dict(final_envelope))
+        ),
         "plan_observation": (
             None if plan_observation is None else dict(plan_observation)
         ),
+        "initial_plan_observation": (
+            None if initial_plan_observation is None
+            else dict(initial_plan_observation)
+        ),
         "admission": None if admission is None else dict(admission),
+        "preflight_admission": (
+            None if preflight_admission is None else dict(preflight_admission)
+        ),
+        "launch_revalidation": (
+            None if launch_revalidation is None else dict(launch_revalidation)
+        ),
         "shrink_trail": [dict(item) for item in shrink_trail],
         "refusal": None if refusal is None else dict(refusal),
         "identity": plan_set.identity.to_dict(),

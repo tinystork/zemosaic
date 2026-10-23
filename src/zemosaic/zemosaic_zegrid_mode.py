@@ -4494,13 +4494,27 @@ def _r55_active_decide(
 
 
 def _r55_active_apply(
-    bundle, *, mapping, facts
+    bundle,
+    *,
+    mapping,
+    facts,
+    plan_raw_available_bytes=None,
+    plan_factor_num=None,
+    plan_factor_den=None,
+    plan_budget_bytes=None,
+    stage="preflight",
 ):
     """Apply an EXACT mapping to the frozen bundle's existing execution knobs.
 
     Only the values that actually execute are changed: the cell task mode, the
     streaming tile, the cell-pool concurrency and the per-cell cache workers.
     Layout, memberships, frames, halo and science identity are untouched.
+
+    ``plan_raw_available_bytes`` / ``plan_factor_*`` / ``plan_budget_bytes``
+    rebind the returned PlanEnvelope to the observation that actually governs a
+    pressure correction (the fresh 4/5 PLAN observation). When omitted the base
+    envelope's own observation is preserved (initial plan or an unchanged
+    preflight decision).
     """
     mode = mapping["cell_task_mode"]
     tile = mapping["cpu_streaming_tile"]
@@ -4568,6 +4582,32 @@ def _r55_active_apply(
         (int(t[5]) for t in cell_tasks if t[4] is not None), default=0
     )
     base_env = bundle.envelope
+    bound_raw = (
+        int(base_env.raw_available_bytes)
+        if plan_raw_available_bytes is None
+        else int(plan_raw_available_bytes)
+    )
+    bound_fnum = (
+        int(base_env.factor_num)
+        if plan_factor_num is None else int(plan_factor_num)
+    )
+    bound_fden = (
+        int(base_env.factor_den)
+        if plan_factor_den is None else int(plan_factor_den)
+    )
+    bound_budget = (
+        int(base_env.budget_bytes)
+        if plan_budget_bytes is None else int(plan_budget_bytes)
+    )
+    if bound_fnum < 1 or bound_fden < 1:
+        raise rcontract.InvalidEnvelope(
+            f"invalid plan factor {bound_fnum}/{bound_fden}"
+        )
+    if bound_budget != (bound_fnum * bound_raw) // bound_fden:
+        raise rcontract.InvalidEnvelope(
+            "rebound plan budget does not equal (factor*raw)//den: "
+            f"{bound_budget} != ({bound_fnum}*{bound_raw})//{bound_fden}"
+        )
     cache_per_cell = int(rcontract.cache_per_cell_bytes(
         rcontract.PROCESS_BASELINE_BYTES,
         workers,
@@ -4587,10 +4627,10 @@ def _r55_active_apply(
     )
     envelope = rcontract.PlanEnvelope(
         phase=rcontract.PHASE_PLAN,
-        raw_available_bytes=int(base_env.raw_available_bytes),
-        factor_num=int(base_env.factor_num),
-        factor_den=int(base_env.factor_den),
-        budget_bytes=int(base_env.budget_bytes),
+        raw_available_bytes=int(bound_raw),
+        factor_num=int(bound_fnum),
+        factor_den=int(bound_fden),
+        budget_bytes=int(bound_budget),
         layout=(int(base_env.layout[0]), int(base_env.layout[1])),
         refinement_rank=int(base_env.refinement_rank),
         cpu_tile=(0 if tile is None else int(tile)),
@@ -4616,7 +4656,7 @@ def _r55_active_apply(
         reason,
         stream_worst_by_tile,
         int(facts["inmem_worst"]),
-        int(base_env.budget_bytes),
+        int(bound_budget),
     )
     if tile is None:
         cpu_streaming["predicted_peak_bytes"] = int(facts["inmem_worst"])
@@ -4652,20 +4692,24 @@ def _r55_active_apply(
         "cache_workers_per_cell": int(workers),
         "reason": "R55-D2 active CPU plan",
         "used": False,
-        "raw_available_bytes": int(base_env.raw_available_bytes),
-        "plan_budget_bytes": int(base_env.budget_bytes),
+        "raw_available_bytes": int(bound_raw),
+        "plan_budget_bytes": int(bound_budget),
     }
     attempts = list(bundle.attempts)
     attempts.append(
         {
             "active_mapping": True,
+            "stage": str(stage),
             "phase": mapping["phase"],
             "cpu_streaming_tile": (None if tile is None else int(tile)),
             "units_in_flight": int(units),
             "workers_per_unit": int(workers),
             "prefetch_units": 0,
             "aggregate_bytes": int(aggregate),
-            "budget_bytes": int(base_env.budget_bytes),
+            "raw_available_bytes": int(bound_raw),
+            "factor_num": int(bound_fnum),
+            "factor_den": int(bound_fden),
+            "budget_bytes": int(bound_budget),
         }
     )
     return replace(
@@ -4759,6 +4803,7 @@ def _r55_active_admit(
         trail.append(
             {
                 "at": "plan_fit",
+                "stage": "preflight",
                 "step": name,
                 "from": {
                     "tile_px": candidate.tile_px,
@@ -4783,7 +4828,10 @@ def _r55_active_admit(
             workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
         )
         bundle = _r55_active_apply(
-            initial_bundle, mapping=mapping, facts=decision.facts
+            initial_bundle,
+            mapping=mapping,
+            facts=decision.facts,
+            stage="preflight",
         )
 
     def _measure():
@@ -4816,7 +4864,7 @@ def _r55_active_admit(
                     ),
                     final_observation=launch_obs,
                 )
-                return bundle, mapping, outcome, trail
+                return bundle, candidate, mapping, outcome, trail
             miss_obs = launch_obs
         else:
             miss_obs = admit_obs
@@ -4832,7 +4880,9 @@ def _r55_active_admit(
         plan_obs = rcontract.Observation.plan(miss_obs.raw_available_bytes)
         observations.append(plan_obs)
         # Shrink under the SAME observation's B_plan, exactly like a rebuild,
-        # but with scheduler-produced shrink-only choices.
+        # but with scheduler-produced shrink-only choices. The resulting
+        # PlanEnvelope is REBOUND to that fresh 4/5 observation so the final
+        # manifest never reports a stale PLAN observation.
         while True:
             name, nxt = zsched.next_shrink(
                 candidate, _r55_active_shrink_context(decision, candidate)
@@ -4848,6 +4898,7 @@ def _r55_active_admit(
             trail.append(
                 {
                     "at": "admission_pressure",
+                    "stage": "preflight",
                     "step": name,
                     "from": {
                         "tile_px": candidate.tile_px,
@@ -4876,12 +4927,150 @@ def _r55_active_admit(
                 workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
             )
             bundle = _r55_active_apply(
-                initial_bundle, mapping=mapping, facts=decision.facts
+                initial_bundle,
+                mapping=mapping,
+                facts=decision.facts,
+                plan_raw_available_bytes=plan_obs.raw_available_bytes,
+                plan_factor_num=rcontract.PLAN_FACTOR_NUM,
+                plan_factor_den=rcontract.PLAN_FACTOR_DEN,
+                plan_budget_bytes=plan_obs.budget_bytes,
+                stage="preflight",
             )
             if bundle.envelope.aggregate_bytes <= plan_obs.budget_bytes:
                 break
         replans += 1
         history.append(bundle.envelope)
+
+
+def _r55_active_revalidate_launch(
+    *, bundle, candidate, mapping, decision
+):
+    """Fresh 90 % launch/admission revalidation immediately before the stack.
+
+    Starts from the ALREADY pre-gauge-admitted final bundle/candidate/mapping
+    (never the original winner), so a post-gauge correction can only shrink.
+    The gauge may already have run; exhaustion here is fatal with zero stack
+    calls and no committed science/manifest output.
+
+    Returns ``(bundle, candidate, mapping, admission_outcome, launch_trail)``.
+    """
+    trail = []
+
+    def _measure():
+        raw = int(available_memory_bytes())
+        if raw <= 0:
+            raise rcontract.InvalidObservation(
+                "R55-D2 active launch revalidation requires a strictly positive "
+                f"raw observation, got {raw}"
+            )
+        return raw
+
+    observations = []
+    history = [bundle.envelope]
+    replans = 0
+    while True:
+        admit_obs = rcontract.Observation.admit(_measure())
+        observations.append(admit_obs)
+        if bundle.envelope.aggregate_bytes <= admit_obs.budget_bytes:
+            launch_obs = rcontract.Observation.launch(_measure())
+            observations.append(launch_obs)
+            if bundle.envelope.aggregate_bytes <= launch_obs.budget_bytes:
+                outcome = rcontract.AdmissionOutcome(
+                    plan=bundle.envelope,
+                    observations=tuple(observations),
+                    history=tuple(history),
+                    replans=int(replans),
+                    tolerance=rcontract.requires_tolerance(
+                        bundle.envelope.aggregate_bytes,
+                        launch_obs.raw_available_bytes,
+                    ),
+                    final_observation=launch_obs,
+                )
+                return bundle, candidate, mapping, outcome, trail
+            miss_obs = launch_obs
+        else:
+            miss_obs = admit_obs
+
+        if replans >= R41_ADMISSION_MAX_REPLANS:
+            raise rcontract.AdmissionExhausted(
+                "R55-D2 active launch revalidation still exceeds the fresh "
+                f"admission ceiling after {R41_ADMISSION_MAX_REPLANS} "
+                "scheduler shrink(s): aggregate "
+                f"{bundle.envelope.aggregate_bytes / 2**20:.1f} MiB > B_admit "
+                f"{miss_obs.budget_bytes / 2**20:.1f} MiB",
+                attempts=tuple(observations),
+            )
+        plan_obs = rcontract.Observation.plan(miss_obs.raw_available_bytes)
+        observations.append(plan_obs)
+        while True:
+            name, nxt = zsched.next_shrink(
+                candidate, _r55_active_shrink_context(decision, candidate)
+            )
+            if name is None or nxt is None:
+                raise rcontract.AdmissionExhausted(
+                    "R55-D2 active launch revalidation miss and no legal "
+                    f"shrink step remains (aggregate "
+                    f"{bundle.envelope.aggregate_bytes} > B_admit "
+                    f"{miss_obs.budget_bytes})",
+                    attempts=tuple(observations),
+                )
+            zsched.assert_shrink_only(candidate, nxt)
+            trail.append(
+                {
+                    "at": "admission_pressure",
+                    "stage": "launch",
+                    "step": name,
+                    "from": {
+                        "tile_px": candidate.tile_px,
+                        "units_in_flight": int(candidate.units_in_flight),
+                        "workers_per_unit": int(candidate.workers_per_unit),
+                        "prefetch_units": int(candidate.prefetch_units),
+                    },
+                    "to": {
+                        "tile_px": nxt.tile_px,
+                        "units_in_flight": int(nxt.units_in_flight),
+                        "workers_per_unit": int(nxt.workers_per_unit),
+                        "prefetch_units": int(nxt.prefetch_units),
+                    },
+                    "admit_raw_bytes": int(miss_obs.raw_available_bytes),
+                    "b_admit_bytes": int(miss_obs.budget_bytes),
+                    "b_plan_bytes": int(plan_obs.budget_bytes),
+                    "aggregate_bytes_before": int(
+                        bundle.envelope.aggregate_bytes
+                    ),
+                }
+            )
+            candidate = nxt
+            mapping = zsched.active_mapping_for_candidate(
+                candidate,
+                tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+                workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+            )
+            bundle = _r55_active_apply(
+                bundle,
+                mapping=mapping,
+                facts=decision.facts,
+                plan_raw_available_bytes=plan_obs.raw_available_bytes,
+                plan_factor_num=rcontract.PLAN_FACTOR_NUM,
+                plan_factor_den=rcontract.PLAN_FACTOR_DEN,
+                plan_budget_bytes=plan_obs.budget_bytes,
+                stage="launch",
+            )
+            if bundle.envelope.aggregate_bytes <= plan_obs.budget_bytes:
+                break
+        replans += 1
+        history.append(bundle.envelope)
+
+
+def _r55_admission_dict(outcome) -> dict:
+    """JSON-safe admission record for the active manifest."""
+    return {
+        "observations": [o.to_dict() for o in outcome.observations],
+        "launch_observation": outcome.final_observation.to_dict(),
+        "replans": int(outcome.replans),
+        "tolerance": bool(outcome.tolerance),
+        "history": [env.to_dict() for env in outcome.history],
+    }
 
 
 def _r55_active_plan_observation(bundle) -> dict:
@@ -4913,29 +5102,70 @@ def _r55_active_execution(bundle, mapping) -> dict:
 
 
 def _r55_build_active_block(
-    *, plan_set, mapping, bundle, admission, trail, status
+    *,
+    plan_set,
+    final_candidate,
+    mapping,
+    bundle,
+    initial_bundle,
+    preflight_admission,
+    launch_admission,
+    preflight_trail,
+    launch_trail,
+    status,
 ) -> dict:
-    """Deterministic active manifest block (no fabricated observed metric)."""
-    admission_dict = {
-        "observations": [o.to_dict() for o in admission.observations],
-        "launch_observation": admission.final_observation.to_dict(),
-        "replans": int(admission.replans),
-        "tolerance": bool(admission.tolerance),
-        "history": [env.to_dict() for env in admission.history],
-    }
+    """Deterministic active manifest block (no fabricated observed metric).
+
+    The PRIMARY ``plan_hash`` identifies the FINAL executable decision
+    (``zsched.active_final_plan_hash``): final candidate + exact mapping +
+    frozen identity + final validated PlanEnvelope. The D1 scheduler PlanSet
+    hash is preserved separately as ``initial_plan_hash``.
+    """
+    final_hash = zsched.active_final_plan_hash(
+        candidate=final_candidate,
+        mapping=mapping,
+        identity=plan_set.identity,
+        envelope=bundle.envelope,
+    )
+    combined_trail = []
+    for item in preflight_trail:
+        entry = dict(item)
+        entry.setdefault("stage", "preflight")
+        combined_trail.append(entry)
+    for item in launch_trail:
+        entry = dict(item)
+        entry.setdefault("stage", "launch")
+        combined_trail.append(entry)
+    preflight_dict = _r55_admission_dict(preflight_admission)
+    launch_dict = (
+        None if launch_admission is None
+        else _r55_admission_dict(launch_admission)
+    )
     return zsched.active_manifest_dict(
         plan_set,
         mapping=mapping,
         status=status,
         execution=_r55_active_execution(bundle, mapping),
         plan_observation=_r55_active_plan_observation(bundle),
-        admission=admission_dict,
-        shrink_trail=trail,
+        initial_plan_observation=_r55_active_plan_observation(initial_bundle),
+        admission=launch_dict if launch_dict is not None else preflight_dict,
+        preflight_admission=preflight_dict,
+        launch_revalidation=launch_dict,
+        shrink_trail=combined_trail,
+        final_candidate=final_candidate,
+        initial_candidate=plan_set.chosen,
+        initial_plan_hash=plan_set.plan_hash,
+        final_envelope=bundle.envelope,
+        plan_hash=final_hash,
+        plan_hash_schema=zsched.ACTIVE_FINAL_PLAN_SCHEMA,
         note=(
-            "R55-D2 active: this CPU plan granted execution authority BEFORE "
-            "the global gauge. The mapped tile/K/workers are the values that "
-            "actually ran; no observed metric is fabricated and no second "
-            "unreported plan exists."
+            "R55-D2 active: a CPU plan was preflight-admitted BEFORE the gauge "
+            "for zero-gauge refusals, then freshly revalidated at the 90 % "
+            "launch ceiling immediately before the stack. Pressure corrections "
+            "are scheduler-produced shrink-only CPU steps on the frozen "
+            "identity; PLAN/ADMIT observations and the rebound final envelope "
+            "are recorded truthfully. No observed metric is fabricated and no "
+            "second unreported plan exists."
         ),
     )
 
@@ -5281,10 +5511,15 @@ def _run_single(
     # refusal/error is FATAL (no legacy fallback) and leaves no science output.
     # ------------------------------------------------------------------
     _r55_active_decision = None
+    _r55_active_candidate = None
     _r55_active_mapping = None
     _r55_active_adm = None
     _r55_active_trail = []
     _r55_active_bundle = None
+    _r55_active_preflight_adm = None
+    _r55_active_preflight_trail = []
+    _r55_active_launch_adm = None
+    _r55_active_launch_trail = []
     if scheduler_mode == zsched.MODE_ACTIVE:
         if bool(_initial_bundle.gpu_used):
             raise RuntimeError(
@@ -5309,6 +5544,7 @@ def _run_single(
             )
             (
                 _r55_active_bundle,
+                _r55_active_candidate,
                 _r55_active_mapping,
                 _r55_active_adm,
                 _r55_active_trail,
@@ -5316,6 +5552,8 @@ def _run_single(
                 initial_bundle=_initial_bundle,
                 decision=_r55_active_decision,
             )
+            _r55_active_preflight_adm = _r55_active_adm
+            _r55_active_preflight_trail = list(_r55_active_trail)
         except (zsched.SchedulerError, rcontract.RamContractError) as _r55_exc:
             _emit(
                 "ZeGrid: R55-D2 active REFUSED before the gauge/stack — "
@@ -5331,8 +5569,9 @@ def _run_single(
             f"tile={_r55_active_mapping['cpu_streaming_tile']} "
             f"units_in_flight={_r55_active_mapping['units_in_flight']} "
             f"workers_per_unit={_r55_active_mapping['workers_per_unit']} "
-            f"prefetch_units=0 plan_hash={_r55_active_decision.plan_set.plan_hash} "
-            f"shrink_steps={len(_r55_active_trail)}",
+            f"prefetch_units=0 "
+            f"scheduler_plan_hash={_r55_active_decision.plan_set.plan_hash} "
+            f"preflight_shrink_steps={len(_r55_active_preflight_trail)}",
             callback=progress_callback,
         )
 
@@ -5575,6 +5814,77 @@ def _run_single(
     if gauge_cache_dir.exists():
         if not _safe_rmtree(gauge_cache_dir, progress_callback):
             cleanup_failures.append(str(gauge_cache_dir))
+
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-R55-D2 rework-1 — FRESH 90 % LAUNCH REVALIDATION.
+    # The gauge and its cleanup may have changed available RAM. Immediately
+    # before any stack worker starts, re-observe and re-validate the ALREADY
+    # preflight-admitted final candidate/mapping/bundle. A correction may only
+    # be a scheduler-produced shrink step on the frozen identity. Exhaustion here
+    # is fatal: the gauge may have run, but zero stack calls and no committed
+    # science/manifest output occur.
+    # ------------------------------------------------------------------
+    if scheduler_mode == zsched.MODE_ACTIVE and _r55_active_decision is not None:
+        try:
+            (
+                _r55_active_bundle,
+                _r55_active_candidate,
+                _r55_active_mapping,
+                _r55_active_launch_adm,
+                _r55_active_launch_trail,
+            ) = _r55_active_revalidate_launch(
+                bundle=_r55_active_bundle,
+                candidate=_r55_active_candidate,
+                mapping=_r55_active_mapping,
+                decision=_r55_active_decision,
+            )
+        except (zsched.SchedulerError, rcontract.RamContractError) as _r55_exc:
+            _emit(
+                "ZeGrid: R55-D2 active LAUNCH REVALIDATION REFUSED before the "
+                f"stack — {_r55_exc}",
+                lvl="ERROR", callback=progress_callback,
+            )
+            raise RuntimeError(
+                "R55-D2 active launch revalidation refused before the stack: "
+                + str(_r55_exc)
+            ) from _r55_exc
+        _r55_active_adm = _r55_active_launch_adm
+        _r55_active_trail = (
+            list(_r55_active_preflight_trail)
+            + list(_r55_active_launch_trail)
+        )
+        _final = _r55_active_bundle
+        # Re-adopt the freshly revalidated bundle as the ONLY execution source.
+        layout = _final.layout
+        footprints = _final.footprints
+        cell_ctxs = _final.cell_ctxs
+        nx, ny = int(layout["nx"]), int(layout["ny"])
+        cpu_streaming = _final.cpu_streaming
+        _cs_selected = cpu_streaming.get("selected_tile_size")
+        cpu_streaming_tile = int(_final.cpu_streaming_tile)
+        cell_specs = _final.cell_specs
+        cell_tasks = _final.cell_tasks
+        chosen_mode = _final.chosen_mode
+        cells_in_flight = int(_final.cells_in_flight)
+        cache_workers_per_cell = int(_final.cache_workers_per_cell)
+        per_cell_footprint = int(_final.per_cell_footprint)
+        gpu_tile_size = _final.gpu_tile_size
+        gpu_streaming_tile = _final.gpu_streaming_tile
+        gpu_streaming_host_peak_bytes = _final.gpu_streaming_host_peak_bytes
+        cpu_fallback_info = dict(_final.cpu_fallback_info)
+        cpu_fallback_plan = _final.cpu_fallback_plan
+        cpu_fallback_tasks = _final.cpu_fallback_tasks
+        cache_build_workers = int(_final.cache_build_workers)
+        total_cells = int(nx * ny)
+        _emit(
+            "ZeGrid: R55-D2 active launch revalidation ADMITTED — "
+            f"tile={_r55_active_mapping['cpu_streaming_tile']} "
+            f"units_in_flight={_r55_active_mapping['units_in_flight']} "
+            f"workers_per_unit={_r55_active_mapping['workers_per_unit']} "
+            f"launch_replans={_r55_active_launch_adm.replans} "
+            f"aggregate={_final.envelope.aggregate_bytes / 2**20:.1f} MiB",
+            callback=progress_callback,
+        )
 
     # PER-CELL: build aligned cache (parallel reproject) -> stack -> DELETE cache
     # (per-cell temp reuse: peak disk is the LARGEST single cell, not the sum).
@@ -6297,10 +6607,14 @@ def _run_single(
         )
         _r55_scheduler_block = _r55_build_active_block(
             plan_set=_r55_active_decision.plan_set,
+            final_candidate=_r55_active_candidate,
             mapping=_r55_active_mapping,
             bundle=_final,
-            admission=_r55_active_adm,
-            trail=_r55_active_trail,
+            initial_bundle=_initial_bundle,
+            preflight_admission=_r55_active_preflight_adm,
+            launch_admission=_r55_active_launch_adm,
+            preflight_trail=_r55_active_preflight_trail,
+            launch_trail=_r55_active_launch_trail,
             status=("executed" if _r55_active_ok else "partial"),
         )
 
