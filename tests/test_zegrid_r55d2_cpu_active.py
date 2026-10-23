@@ -23,11 +23,13 @@ import json
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 from zemosaic import zemosaic_zegrid_mode as zz
+from zemosaic.core.zegrid import ram_contract as rcontract
 from zemosaic.core.zegrid import resource_envelope as re
 from zemosaic.core.zegrid import scheduler as zs
 
@@ -522,6 +524,161 @@ def test_materialized_shrink_rebinds_and_enforces_fresh_feasibility():
             factor_den=5,
             budget_bytes=tight_budget + 1,
         )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {
+            "raw_available_bytes": 1000.9,
+            "factor_num": 4.2,
+            "factor_den": 5.7,
+            "budget_bytes": 800.1,
+        },
+        {
+            "raw_available_bytes": True,
+            "factor_num": True,
+            "factor_den": True,
+            "budget_bytes": True,
+        },
+        {
+            "raw_available_bytes": 1000,
+            "factor_num": 4,
+            "factor_den": 5,
+            "budget_bytes": 800.0,
+        },
+        {
+            "raw_available_bytes": -1,
+            "factor_num": 4,
+            "factor_den": 5,
+            "budget_bytes": 800,
+        },
+        {
+            "raw_available_bytes": 1000,
+            "factor_num": 0,
+            "factor_den": 5,
+            "budget_bytes": 800,
+        },
+        {
+            "raw_available_bytes": 1000,
+            "factor_num": 4,
+            "factor_den": 5,
+            "budget_bytes": -1,
+        },
+        {
+            "raw_available_bytes": 1000,
+            "factor_num": 4,
+            "factor_den": 5,
+            "budget_bytes": 801,
+        },
+    ],
+)
+def test_materialize_rejects_non_integer_or_mismatched_rebound_values(kwargs):
+    ctx = _context()
+    candidate = _enumerated(ctx, tile=128, k=2)
+    with pytest.raises((zs.ActivePlanRejected, zs.SchedulerConfigError)):
+        zs.materialize_active_candidate(ctx, candidate, **kwargs)
+
+
+def test_materialize_accepts_consistent_integer_rebound_values():
+    ctx = _context()
+    candidate = _enumerated(ctx, tile=128, k=2)
+    raw = 2 * GIB
+    budget = (4 * raw) // 5
+    out = zs.materialize_active_candidate(
+        ctx,
+        candidate,
+        raw_available_bytes=raw,
+        factor_num=4,
+        factor_den=5,
+        budget_bytes=budget,
+    )
+    assert isinstance(out, zs.Candidate)
+    assert out.feasible is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"tile_px": True},
+        {"tile_px": 128.0},
+        {"tile_px": -32},
+        {"units_in_flight": True},
+        {"units_in_flight": 1.5},
+        {"units_in_flight": 0},
+        {"prefetch_units": True},
+        {"prefetch_units": 1.0},
+        {"prefetch_units": -1},
+        {"prefetch_units": 1},
+        {"workers_per_unit": True},
+        {"workers_per_unit": 4.0},
+        {"workers_per_unit": 0},
+        {"host_peak_bytes": True},
+        {"host_peak_bytes": 1.5},
+        {"host_peak_bytes": -1},
+        {"disk_bytes": True},
+        {"disk_bytes": 1.5},
+        {"disk_bytes": -1},
+        {"device_peak_bytes": True},
+        {"device_peak_bytes": -1},
+        {"device_peak_bytes": 1},
+        {"feasible": 0},
+        {"feasible": False},
+        {"backend": re.BACKEND_GPU},
+        {"reason_code": "BOGUS"},
+        {"predicted_makespan_ns": True},
+        {"predicted_makespan_ns": -1},
+        {"predicted_makespan_ns": 1.5},
+    ],
+)
+def test_active_mapping_and_hash_reject_malformed_or_infeasible_candidates(change):
+    candidate = _enumerated(_context(), tile=128, k=2)
+    broken = dataclasses.replace(candidate, **change)
+    with pytest.raises((zs.ActivePlanRejected, zs.SchedulerConfigError)):
+        zs.active_mapping_for_candidate(broken)
+    mapping = zs.active_mapping_for_candidate(candidate)
+    identity = zs.FrozenIdentity(
+        layout=(3, 2),
+        cell_ids=CELLS,
+        frame_ids=FRAMES,
+        halo_px=32,
+        refinement_rank=6,
+    )
+    with pytest.raises((zs.ActivePlanRejected, zs.SchedulerConfigError)):
+        zs.active_final_plan_hash(
+            candidate=broken,
+            mapping=mapping,
+            identity=identity,
+            envelope={"schema": "test-envelope"},
+        )
+
+
+def test_skipped_infeasible_shrink_trail_is_complete_and_adjacent():
+    ctx = _context()
+    k3 = _enumerated(ctx, tile=128, k=3)
+    decision = types.SimpleNamespace(
+        stream_context=ctx, inmem_context=ctx
+    )
+    # Tight fresh 4/5 window: K=2 is infeasible, K=1 is feasible.
+    plan_obs = rcontract.Observation.plan(1 * GIB)
+    name, accepted, examined = zz._r55_next_materialized_shrink(
+        decision=decision, candidate=k3, plan_obs=plan_obs
+    )
+    assert name == "units_in_flight"
+    assert accepted.units_in_flight == 1
+    assert accepted.feasible is True
+    assert len(examined) == 2
+    first, second = examined
+    assert first["step"] == second["step"] == "units_in_flight"
+    assert first["accepted"] is False
+    assert first["to"]["units_in_flight"] == 2
+    assert first["reason_code"] == re.REASON_REFUSE_HOST_RAM
+    assert first["detail"]
+    assert second["accepted"] is True
+    assert second["to"]["units_in_flight"] == 1
+    # Adjacent, complete trail: no compressed K=3 -> K=1 jump.
+    assert first["from"]["units_in_flight"] == 3
+    assert second["from"] == first["to"]
 
 
 # ---------------------------------------------------------------------------

@@ -97,6 +97,7 @@ __all__ = [
     "ACTIVE_EXECUTABLE_PHASES",
     "ActivePlanRejected",
     "active_cpu_phase",
+    "active_candidate_tuple",
     "materialize_active_candidate",
     "active_mapping_for_candidate",
     "map_active_cpu_candidate",
@@ -2777,12 +2778,26 @@ class ActivePlanRejected(SchedulerError):
         return _stamp_active_hash(block)
 
 
-def active_cpu_phase(candidate: Candidate) -> str:
-    """Return the executable CPU stack phase for ``candidate`` (or reject).
+def _active_strict_int(value, name: str, *, minimum: int = 0) -> int:
+    """Strict active integer boundary: no bool, float, or out-of-range value.
 
-    ``tile_px is None`` is EXACTLY the in-memory stack; any tile is the
-    streaming stack. A GPU or otherwise unsupported candidate is refused.
+    Delegates to the accepted resource-envelope validator and maps its failure
+    to a closed-reason active refusal. This is used for the rebound PLAN facts
+    and for every active candidate tuple/projection field BEFORE any conversion.
     """
+    try:
+        return require_int(value, name, minimum=minimum)
+    except InvalidEnvelope as exc:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            f"{name}: {exc}",
+        ) from exc
+
+
+def _validate_active_candidate_fields(
+    candidate: Candidate, *, require_feasible: bool
+) -> None:
+    """Validate the active trust boundary without normalizing malformed values."""
     if not isinstance(candidate, Candidate):
         raise SchedulerConfigError(
             f"expected Candidate, got {type(candidate).__name__}"
@@ -2794,6 +2809,124 @@ def active_cpu_phase(candidate: Candidate) -> str:
             f"winner backend={candidate.backend!r}",
             candidate=candidate,
         )
+    if candidate.tile_px is not None:
+        # Generic active boundary: exact non-negative int (no bool/float/negative).
+        # The product ladder is enforced by active_mapping_for_candidate so an
+        # off-ladder-but-valid int keeps the specific R55_SHRINK_TILE reason.
+        _active_strict_int(candidate.tile_px, "tile_px", minimum=0)
+    _active_strict_int(
+        candidate.units_in_flight, "units_in_flight", minimum=1
+    )
+    _active_strict_int(
+        candidate.prefetch_units, "prefetch_units", minimum=0
+    )
+    _active_strict_int(
+        candidate.workers_per_unit, "workers_per_unit", minimum=1
+    )
+    _active_strict_int(
+        candidate.host_peak_bytes, "host_peak_bytes", minimum=0
+    )
+    _active_strict_int(candidate.disk_bytes, "disk_bytes", minimum=0)
+    device = _active_strict_int(
+        candidate.device_peak_bytes, "device_peak_bytes", minimum=0
+    )
+    if device != 0:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "active CPU candidate must have device_peak_bytes == 0, got "
+            f"{device}",
+            candidate=candidate,
+        )
+    if not isinstance(candidate.feasible, bool):
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "candidate.feasible must be a bool, got "
+            f"{type(candidate.feasible).__name__}={candidate.feasible!r}",
+            candidate=candidate,
+        )
+    if require_feasible and candidate.feasible is not True:
+        reason = candidate.reason_code
+        if (
+            reason not in REASON_CODES
+            or reason in (REASON_OK, REASON_UNCALIBRATED)
+        ):
+            reason = REASON_REFUSE_HOST_RAM
+        raise ActivePlanRejected(
+            reason,
+            "active candidate is infeasible: "
+            f"{candidate.infeasible_reason!r}",
+            candidate=candidate,
+        )
+    if (
+        not isinstance(candidate.reason_code, str)
+        or candidate.reason_code not in REASON_CODES
+    ):
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "candidate.reason_code "
+            f"{candidate.reason_code!r} is outside the closed set",
+            candidate=candidate,
+        )
+    if candidate.predicted_makespan_ns is not None:
+        _active_strict_int(
+            candidate.predicted_makespan_ns,
+            "predicted_makespan_ns",
+            minimum=0,
+        )
+    if candidate.feasible and candidate.infeasible_reason is not None:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "feasible candidate must not carry an infeasible_reason",
+            candidate=candidate,
+        )
+
+
+def _validate_active_identity(identity: FrozenIdentity) -> None:
+    """Strict frozen-identity fields for the active final hash."""
+    layout = identity.layout
+    if not isinstance(layout, (tuple, list)) or len(layout) != 2:
+        raise SchedulerConfigError(
+            f"identity.layout must be two ints, got {layout!r}"
+        )
+    _active_strict_int(layout[0], "identity.layout[0]", minimum=1)
+    _active_strict_int(layout[1], "identity.layout[1]", minimum=1)
+    _active_strict_int(identity.halo_px, "identity.halo_px", minimum=0)
+    _active_strict_int(
+        identity.refinement_rank, "identity.refinement_rank", minimum=0
+    )
+    for name in ("cell_ids", "frame_ids"):
+        values = getattr(identity, name)
+        if not isinstance(values, (tuple, list)) or any(
+            not isinstance(value, str) for value in values
+        ):
+            raise SchedulerConfigError(
+                f"identity.{name} must be a sequence of strings"
+            )
+
+
+def active_candidate_tuple(candidate: Candidate) -> dict:
+    """JSON-safe adjacent-shrink tuple for the deterministic audit trail."""
+    _validate_active_candidate_fields(candidate, require_feasible=False)
+    return {
+        "backend": candidate.backend,
+        "tile_px": (
+            None if candidate.tile_px is None else int(candidate.tile_px)
+        ),
+        "units_in_flight": int(candidate.units_in_flight),
+        "prefetch_units": int(candidate.prefetch_units),
+        "workers_per_unit": int(candidate.workers_per_unit),
+    }
+
+
+def active_cpu_phase(candidate: Candidate) -> str:
+    """Return the executable CPU stack phase for ``candidate`` (or reject).
+
+    ``tile_px is None`` is EXACTLY the in-memory stack; any tile is the
+    streaming stack. Malformed/GPU candidates are refused; feasibility is a
+    separate gate enforced by :func:`active_mapping_for_candidate` and
+    :func:`active_final_plan_hash`.
+    """
+    _validate_active_candidate_fields(candidate, require_feasible=False)
     return (
         PHASE_CELL_STACK_INMEM
         if candidate.tile_px is None
@@ -2831,31 +2964,34 @@ def materialize_active_candidate(
         raise SchedulerConfigError(
             f"expected Candidate, got {type(candidate).__name__}"
         )
+    _validate_active_candidate_fields(candidate, require_feasible=False)
     bound = context
     if any(
         value is not None
         for value in (raw_available_bytes, factor_num, factor_den, budget_bytes)
     ):
-        raw = (
-            int(context.raw_available_bytes)
-            if raw_available_bytes is None else int(raw_available_bytes)
+        # STRICT boundary: reject bool/float/out-of-range BEFORE any conversion.
+        raw = _active_strict_int(
+            context.raw_available_bytes
+            if raw_available_bytes is None else raw_available_bytes,
+            "raw_available_bytes",
+            minimum=1,
         )
-        fnum = (
-            int(context.factor_num)
-            if factor_num is None else int(factor_num)
+        fnum = _active_strict_int(
+            context.factor_num if factor_num is None else factor_num,
+            "factor_num",
+            minimum=1,
         )
-        fden = (
-            int(context.factor_den)
-            if factor_den is None else int(factor_den)
+        fden = _active_strict_int(
+            context.factor_den if factor_den is None else factor_den,
+            "factor_den",
+            minimum=1,
         )
-        budget = (
-            int(context.budget_bytes)
-            if budget_bytes is None else int(budget_bytes)
+        budget = _active_strict_int(
+            context.budget_bytes if budget_bytes is None else budget_bytes,
+            "budget_bytes",
+            minimum=0,
         )
-        if fnum < 1 or fden < 1:
-            raise SchedulerConfigError(
-                f"invalid rebound factor {fnum}/{fden}"
-            )
         if budget != (fnum * raw) // fden:
             raise SchedulerConfigError(
                 "rebound budget does not equal (factor*raw)//den: "
@@ -2872,9 +3008,9 @@ def materialize_active_candidate(
     key = (
         candidate.backend,
         candidate.tile_px,
-        int(candidate.units_in_flight),
-        int(candidate.prefetch_units),
-        int(candidate.workers_per_unit),
+        candidate.units_in_flight,
+        candidate.prefetch_units,
+        candidate.workers_per_unit,
     )
     matches = [
         item for item in enumerated
@@ -2909,10 +3045,7 @@ def active_mapping_for_candidate(
     winner and every scheduler-produced shrink step, so a pressure correction
     can never drift from the accepted mapping contract.
     """
-    if not isinstance(candidate, Candidate):
-        raise SchedulerConfigError(
-            f"expected Candidate, got {type(candidate).__name__}"
-        )
+    _validate_active_candidate_fields(candidate, require_feasible=True)
     phase = active_cpu_phase(candidate)
     if int(candidate.prefetch_units) != 0:
         raise ActivePlanRejected(
@@ -3024,13 +3157,15 @@ def active_final_plan_hash(
     It is NOT the D1 scheduler PlanSet hash; that hash is preserved separately as
     ``initial_plan_hash`` when a pressure correction changed the plan.
     """
-    if not isinstance(candidate, Candidate):
-        raise SchedulerConfigError(
-            f"expected Candidate, got {type(candidate).__name__}"
-        )
+    _validate_active_candidate_fields(candidate, require_feasible=True)
     if not isinstance(identity, FrozenIdentity):
         raise SchedulerConfigError(
             f"expected FrozenIdentity, got {type(identity).__name__}"
+        )
+    _validate_active_identity(identity)
+    if not isinstance(mapping, Mapping):
+        raise SchedulerConfigError(
+            f"expected mapping, got {type(mapping).__name__}"
         )
     expected = active_mapping_for_candidate(candidate)
     if dict(mapping) != expected:

@@ -4768,17 +4768,32 @@ def _r55_next_materialized_shrink(*, decision, candidate, plan_obs=None):
             factor_den=rcontract.PLAN_FACTOR_DEN,
             budget_bytes=int(plan_obs.budget_bytes),
         )
+    examined = []
     current = candidate
     while True:
         name, nxt = zsched.next_shrink(current, context)
         if name is None or nxt is None:
-            return None, None
+            return None, None, examined
         materialized = zsched.materialize_active_candidate(context, nxt)
         zsched.assert_shrink_only(current, materialized)
-        if materialized.feasible:
-            return name, materialized
-        # Scheduler-infeasible under the CURRENT window: continue shrinking.
+        examined.append(
+            {
+                "step": name,
+                "from": zsched.active_candidate_tuple(current),
+                "to": zsched.active_candidate_tuple(materialized),
+                "accepted": bool(materialized.feasible),
+                "reason_code": materialized.reason_code,
+                "detail": materialized.infeasible_reason,
+                "projections": {
+                    "host_peak_bytes": int(materialized.host_peak_bytes),
+                    "disk_bytes": int(materialized.disk_bytes),
+                    "device_peak_bytes": int(materialized.device_peak_bytes),
+                },
+            }
+        )
         current = materialized
+        if materialized.feasible:
+            return name, materialized, examined
 
 
 def _r55_active_admit(
@@ -4836,9 +4851,21 @@ def _r55_active_admit(
     #    (The scheduler's host model does not include the product's cache
     #    phase, so an honest exact mapping is re-checked here.)
     while bundle.envelope.aggregate_bytes > bundle.envelope.budget_bytes:
-        name, nxt = _r55_next_materialized_shrink(
+        name, nxt, examined = _r55_next_materialized_shrink(
             decision=decision, candidate=candidate, plan_obs=None
         )
+        for entry in examined:
+            trail.append(
+                {
+                    **entry,
+                    "at": "plan_fit",
+                    "stage": "preflight",
+                    "aggregate_bytes_before": int(
+                        bundle.envelope.aggregate_bytes
+                    ),
+                    "b_plan_bytes": int(bundle.envelope.budget_bytes),
+                }
+            )
         if name is None or nxt is None:
             raise rcontract.AdmissionExhausted(
                 "R55-D2 active plan cannot fit its own B_plan and has no legal "
@@ -4846,27 +4873,6 @@ def _r55_active_admit(
                 f"{bundle.envelope.aggregate_bytes} > "
                 f"B_plan {bundle.envelope.budget_bytes})"
             )
-        trail.append(
-            {
-                "at": "plan_fit",
-                "stage": "preflight",
-                "step": name,
-                "from": {
-                    "tile_px": candidate.tile_px,
-                    "units_in_flight": int(candidate.units_in_flight),
-                    "workers_per_unit": int(candidate.workers_per_unit),
-                    "prefetch_units": int(candidate.prefetch_units),
-                },
-                "to": {
-                    "tile_px": nxt.tile_px,
-                    "units_in_flight": int(nxt.units_in_flight),
-                    "workers_per_unit": int(nxt.workers_per_unit),
-                    "prefetch_units": int(nxt.prefetch_units),
-                },
-                "aggregate_bytes_before": int(bundle.envelope.aggregate_bytes),
-                "b_plan_bytes": int(bundle.envelope.budget_bytes),
-            }
-        )
         candidate = nxt
         mapping = zsched.active_mapping_for_candidate(
             candidate,
@@ -4930,42 +4936,33 @@ def _r55_active_admit(
         # PlanEnvelope is REBOUND to that fresh 4/5 observation so the final
         # manifest never reports a stale PLAN observation.
         while True:
-            name, nxt = _r55_next_materialized_shrink(
+            name, nxt, examined = _r55_next_materialized_shrink(
                 decision=decision, candidate=candidate, plan_obs=plan_obs
             )
+            for entry in examined:
+                trail.append(
+                    {
+                        **entry,
+                        "at": "admission_pressure",
+                        "stage": "preflight",
+                        "admit_raw_bytes": int(
+                            miss_obs.raw_available_bytes
+                        ),
+                        "b_admit_bytes": int(miss_obs.budget_bytes),
+                        "b_plan_bytes": int(plan_obs.budget_bytes),
+                        "aggregate_bytes_before": int(
+                            bundle.envelope.aggregate_bytes
+                        ),
+                    }
+                )
             if name is None or nxt is None:
                 raise rcontract.AdmissionExhausted(
                     "R55-D2 active admission miss and no legal FEASIBLE "
-                    f"shrink step remains (aggregate "
+                    "shrink step remains (aggregate "
                     f"{bundle.envelope.aggregate_bytes} > "
                     f"B_admit {miss_obs.budget_bytes})",
                     attempts=tuple(observations),
                 )
-            trail.append(
-                {
-                    "at": "admission_pressure",
-                    "stage": "preflight",
-                    "step": name,
-                    "from": {
-                        "tile_px": candidate.tile_px,
-                        "units_in_flight": int(candidate.units_in_flight),
-                        "workers_per_unit": int(candidate.workers_per_unit),
-                        "prefetch_units": int(candidate.prefetch_units),
-                    },
-                    "to": {
-                        "tile_px": nxt.tile_px,
-                        "units_in_flight": int(nxt.units_in_flight),
-                        "workers_per_unit": int(nxt.workers_per_unit),
-                        "prefetch_units": int(nxt.prefetch_units),
-                    },
-                    "admit_raw_bytes": int(miss_obs.raw_available_bytes),
-                    "b_admit_bytes": int(miss_obs.budget_bytes),
-                    "b_plan_bytes": int(plan_obs.budget_bytes),
-                    "aggregate_bytes_before": int(
-                        bundle.envelope.aggregate_bytes
-                    ),
-                }
-            )
             candidate = nxt
             mapping = zsched.active_mapping_for_candidate(
                 candidate,
@@ -5049,9 +5046,25 @@ def _r55_active_revalidate_launch(
         plan_obs = rcontract.Observation.plan(miss_obs.raw_available_bytes)
         observations.append(plan_obs)
         while True:
-            name, nxt = _r55_next_materialized_shrink(
+            name, nxt, examined = _r55_next_materialized_shrink(
                 decision=decision, candidate=candidate, plan_obs=plan_obs
             )
+            for entry in examined:
+                trail.append(
+                    {
+                        **entry,
+                        "at": "admission_pressure",
+                        "stage": "launch",
+                        "admit_raw_bytes": int(
+                            miss_obs.raw_available_bytes
+                        ),
+                        "b_admit_bytes": int(miss_obs.budget_bytes),
+                        "b_plan_bytes": int(plan_obs.budget_bytes),
+                        "aggregate_bytes_before": int(
+                            bundle.envelope.aggregate_bytes
+                        ),
+                    }
+                )
             if name is None or nxt is None:
                 raise rcontract.AdmissionExhausted(
                     "R55-D2 active launch revalidation miss and no legal "
@@ -5060,31 +5073,6 @@ def _r55_active_revalidate_launch(
                     f"{miss_obs.budget_bytes})",
                     attempts=tuple(observations),
                 )
-            trail.append(
-                {
-                    "at": "admission_pressure",
-                    "stage": "launch",
-                    "step": name,
-                    "from": {
-                        "tile_px": candidate.tile_px,
-                        "units_in_flight": int(candidate.units_in_flight),
-                        "workers_per_unit": int(candidate.workers_per_unit),
-                        "prefetch_units": int(candidate.prefetch_units),
-                    },
-                    "to": {
-                        "tile_px": nxt.tile_px,
-                        "units_in_flight": int(nxt.units_in_flight),
-                        "workers_per_unit": int(nxt.workers_per_unit),
-                        "prefetch_units": int(nxt.prefetch_units),
-                    },
-                    "admit_raw_bytes": int(miss_obs.raw_available_bytes),
-                    "b_admit_bytes": int(miss_obs.budget_bytes),
-                    "b_plan_bytes": int(plan_obs.budget_bytes),
-                    "aggregate_bytes_before": int(
-                        bundle.envelope.aggregate_bytes
-                    ),
-                }
-            )
             candidate = nxt
             mapping = zsched.active_mapping_for_candidate(
                 candidate,
