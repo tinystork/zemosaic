@@ -206,6 +206,29 @@ def test_manifest_gpu_block_truth():
     assert block2["backend"]["per_cell_rejection"] == "cpu"
 
 
+def test_manifest_gpu_block_runtime_fallback_keeps_attempted():
+    """R22 test-debt: a classified RUNTIME failure clears used/effective but must
+    keep ``attempted`` True because the GPU was selected and execution started.
+
+    This is the counterpart of the pre-execution case above (``attempted=False``).
+    """
+    ctx = {
+        "requested": True, "available": True, "attempted": True,
+        "final_effective": False, "actually_used": False, "final_backend": "cpu",
+        "gpu_executed_cells": 0,
+        "runtime_fallback": {"type": "OutOfMemoryError", "reason": "runtime oom"},
+    }
+    block = zz._manifest_gpu_block(False, ctx)
+    assert block["requested"] is True
+    assert block["attempted"] is True
+    assert block["effective"] is False
+    assert block["used"] is False
+    assert block["actually_used"] is False
+    assert block["final_backend"] == "cpu"
+    assert block["runtime_fallback"]["type"] == "OutOfMemoryError"
+    assert block["backend"]["per_cell_rejection"] == "cpu"
+
+
 def test_manifest_gpu_block_empty_run_cannot_claim_used():
     """H2: attempted-but-empty (no GPU cells executed) => used=false."""
     ctx = {

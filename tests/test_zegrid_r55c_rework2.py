@@ -98,9 +98,11 @@ def test_runtime_gpu_oom_fallback_reports_cpu_effective_in_observe(
     manifest = json.loads((g_out / "zegrid_manifest.json").read_text())
     gpu = manifest["gpu"]
     assert gpu["requested"] is True
-    # NOTE: ``attempted`` is reset to False by the existing runtime-fallback
-    # finalization (pre-existing R22 behaviour); the meaningful post-execution
-    # fields are ``actually_used``/``final_backend``/``runtime_fallback``.
+    # The GPU was selected and execution genuinely started; a runtime failure
+    # then forced the exact whole-batch CPU rerun. ``attempted`` must stay True
+    # while the post-execution fields prove the CPU outcome.
+    assert gpu["attempted"] is True
+    assert gpu["effective"] is False
     assert gpu["used"] is False
     assert gpu["actually_used"] is False
     assert gpu["final_backend"] == "cpu"

@@ -5113,8 +5113,12 @@ def _run_single(
                 gpu_used = False
                 science_config = replace(science_config, backend="cpu")
                 gpu_ctx = dict(gpu_ctx)
+                # R22 test-debt: ``attempted`` records the START-TIME selection
+                # and the genuine execution attempt, NOT its outcome. A runtime
+                # GPU failure means the GPU WAS attempted; only the pre-execution
+                # admission fallback resets it to False. Keep it True so the
+                # manifest never contradicts the runtime fallback evidence.
                 gpu_ctx["effective"] = False
-                gpu_ctx["attempted"] = False
                 gpu_ctx["final_effective"] = False
                 gpu_ctx["actually_used"] = False
                 gpu_ctx["final_backend"] = "cpu"

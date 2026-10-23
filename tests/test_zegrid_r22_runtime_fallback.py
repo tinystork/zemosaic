@@ -26,8 +26,19 @@ if str(SRC) not in sys.path:
 
 from zemosaic import zemosaic_zegrid_mode as zz  # noqa: E402
 from zemosaic.core.zegrid import gpu as zgpu  # noqa: E402
+from zemosaic.core.zegrid import sweep as zsw  # noqa: E402
 
 TOOL = REPO_ROOT / "tools" / "zegrid_routine" / "make_routine_corpus.py"
+
+# ZM-ZEGRID-R22 test-debt (R55-D pre-work): this suite verifies the R22 runtime
+# GPU->CPU fallback, not a later product default. R53 raised the product halo to
+# 64 px, which makes the 384 px routine corpus unable to satisfy the frozen
+# ``min_patch_area=50000`` + ``max_halo_overhead=0.5`` scientific floors before
+# any R22 assertion runs. Pin the HISTORICAL 32 px geometry the suite was born
+# with, and pin a deterministic sufficient RAM observation so the tests never
+# depend on the live host's memory. Product defaults/floors are untouched.
+WITNESS_HALO_PX = 32
+WITNESS_AVAILABLE_BYTES = 12 * 2 ** 30
 
 # A classified CuPy OOM (module "cupy.*", name "OutOfMemoryError") so
 # zgpu.is_gpu_runtime_error() classifies it as a runtime GPU failure.
@@ -51,6 +62,17 @@ def _prepare_input(input_dir, routine_corpus):
     (input_dir / "stack_plan.csv").write_text(
         (routine_corpus / "stack_plan.csv").read_text(), encoding="utf-8"
     )
+
+
+def _pin_historical_runtime(monkeypatch):
+    """Hermetic R22 harness: pinned 32 px geometry + fixed 12 GiB observation.
+
+    Both probes are pinned: ``zz.available_memory_bytes`` drives planning and the
+    runtime fallback re-plan, while ``zsw.read_available_memory`` feeds the layout
+    provenance and the executor/streaming gates. Neither may depend on the host.
+    """
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: WITNESS_AVAILABLE_BYTES)
+    monkeypatch.setattr(zsw, "read_available_memory", lambda: WITNESS_AVAILABLE_BYTES)
 
 
 def _science_sha256(out_dir):
@@ -87,10 +109,11 @@ def _inject_oom_at_stack_seam(monkeypatch):
 
 
 def test_runtime_gpu_oom_falls_back_to_cpu_whole_batch(tmp_path, routine_corpus, monkeypatch):
+    _pin_historical_runtime(monkeypatch)
     # Forced-CPU baseline (GPU never selected).
     cpu_in, cpu_out = tmp_path / "in_cpu", tmp_path / "out_cpu"
     _prepare_input(cpu_in, routine_corpus)
-    zz.run_zegrid_mode(str(cpu_in), str(cpu_out))
+    zz.run_zegrid_mode(str(cpu_in), str(cpu_out), zegrid_halo_px=WITNESS_HALO_PX)
     hash_cpu = _science_sha256(cpu_out)
 
     # GPU selected at start, then a classified OOM mid-batch -> CPU whole-batch rerun.
@@ -103,7 +126,10 @@ def test_runtime_gpu_oom_falls_back_to_cpu_whole_batch(tmp_path, routine_corpus,
 
     g_in, g_out = tmp_path / "in_g", tmp_path / "out_g"
     _prepare_input(g_in, routine_corpus)
-    zz.run_zegrid_mode(str(g_in), str(g_out), use_gpu=True, progress_callback=cb)
+    zz.run_zegrid_mode(
+        str(g_in), str(g_out),
+        zegrid_halo_px=WITNESS_HALO_PX, use_gpu=True, progress_callback=cb,
+    )
 
     # 1. bit-identical to the forced-CPU baseline.
     assert _science_sha256(g_out) == hash_cpu
@@ -116,7 +142,11 @@ def test_runtime_gpu_oom_falls_back_to_cpu_whole_batch(tmp_path, routine_corpus,
     manifest = json.loads((g_out / "zegrid_manifest.json").read_text(encoding="utf-8"))
     gpu = manifest["gpu"]
     assert gpu["requested"] is True
+    assert gpu["available"] is True
+    # Attempted means the GPU WAS selected and execution genuinely started,
+    # even though a runtime failure forced the whole-batch CPU rerun.
     assert gpu["attempted"] is True
+    assert gpu["effective"] is False
     assert gpu["used"] is False
     assert gpu["actually_used"] is False
     assert gpu["final_backend"] == "cpu"
@@ -138,6 +168,7 @@ def test_runtime_gpu_oom_falls_back_to_cpu_whole_batch(tmp_path, routine_corpus,
 def test_arbitrary_error_not_swallowed(tmp_path, routine_corpus, monkeypatch):
     """H1 boundary: a non-GPU error in the GPU batch must FAIL, not silently
     fall back to CPU (only classified CuPy errors trigger the rerun)."""
+    _pin_historical_runtime(monkeypatch)
     _force_gpu_selection(monkeypatch)
     real_run = zz.run_canonical_stack_streaming
 
@@ -151,4 +182,6 @@ def test_arbitrary_error_not_swallowed(tmp_path, routine_corpus, monkeypatch):
     g_in, g_out = tmp_path / "in_g", tmp_path / "out_g"
     _prepare_input(g_in, routine_corpus)
     with pytest.raises(ValueError):
-        zz.run_zegrid_mode(str(g_in), str(g_out), use_gpu=True)
+        zz.run_zegrid_mode(
+            str(g_in), str(g_out), zegrid_halo_px=WITNESS_HALO_PX, use_gpu=True
+        )
