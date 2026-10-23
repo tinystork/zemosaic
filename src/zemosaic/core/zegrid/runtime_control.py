@@ -494,8 +494,13 @@ class PressureLatch:
         self._count = 0
         self._fatal_errors: list[str] = []
 
-    def record(self, sample: Mapping[str, Any]) -> None:
-        """Record one in-wave sample; malformed facts become fatal latches."""
+    def record(self, sample: Mapping[str, Any]) -> bool:
+        """Record one in-wave sample and return whether it was valid.
+
+        A malformed admission fact is preserved as a pending fatal latch and
+        reported as ``False`` so the caller can surface the failed heartbeat
+        honestly. A later valid sample does not erase the fatal latch.
+        """
         try:
             if not isinstance(sample, Mapping):
                 raise RuntimeControlError(
@@ -513,7 +518,7 @@ class PressureLatch:
             )
         except Exception as exc:  # noqa: BLE001 - preserved as a fatal latch
             self.record_error(exc)
-            return
+            return False
         with self._lock:
             self._count += 1
             if (
@@ -522,6 +527,7 @@ class PressureLatch:
                 < int(self._sample["raw_available_bytes"])
             ):
                 self._sample = entry
+        return True
 
     def record_error(self, exc: BaseException | str) -> None:
         """Preserve a fatal in-wave admission/collection error for the boundary."""
@@ -634,12 +640,18 @@ class RunSampler:
                 started = float(self._clock())
                 try:
                     sample = self._sample_fn()
-                    self._latch.record(sample)
-                    self.samples += 1
                 except Exception as exc:  # noqa: BLE001 - fatal at the boundary
                     self.errors += 1
                     self.last_error = f"{type(exc).__name__}: {exc}"
                     self._latch.record_error(exc)
+                else:
+                    if self._latch.record(sample):
+                        self.samples += 1
+                    else:
+                        self.errors += 1
+                        self.last_error = (
+                            "malformed in-wave RUN fact (latched fatal)"
+                        )
                 elapsed = float(self._clock()) - started
                 delay = max(0.0, self._interval_s - elapsed)
                 if self._wait(delay):

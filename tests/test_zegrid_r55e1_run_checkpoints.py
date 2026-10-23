@@ -614,17 +614,17 @@ def test_latch_is_consumed_exactly_once_and_malformed_fails_closed():
 def test_public_record_malformed_fact_is_fatal_and_survives_valid_sample():
     latch = zrt.PressureLatch()
     # This is the exact public path the in-wave heartbeat uses.
-    latch.record(
+    assert latch.record(
         {
             "host": {"raw_available_bytes": True, "budget_bytes": 1},
             "sampled_monotonic_ns": 1,
         }
-    )
+    ) is False
     snapshot = latch.snapshot()
     assert snapshot["pending_fatal"] is True
     assert snapshot["fatal_errors"]
     # A later valid sample must NOT erase the pending malformed admission fact.
-    latch.record(_facts(WITNESS_AVAILABLE_BYTES))
+    assert latch.record(_facts(WITNESS_AVAILABLE_BYTES)) is True
     with pytest.raises(zrt.RuntimeControlError, match="pending latched"):
         latch.consume_validated()
     # The consumed generation (error + valid sample) is cleared exactly once.
@@ -635,10 +635,31 @@ def test_public_record_malformed_fact_is_fatal_and_survives_valid_sample():
 def test_collector_failure_is_a_pending_fatal_latch():
     latch = zrt.PressureLatch()
     latch.record_error(RuntimeError("MemAvailable collection failed"))
-    latch.record(_facts(WITNESS_AVAILABLE_BYTES))
+    assert latch.record(_facts(WITNESS_AVAILABLE_BYTES)) is True
     with pytest.raises(zrt.RuntimeControlError, match="collection failed"):
         latch.consume_validated()
     assert latch.consume_validated() is None
+
+
+def test_run_sampler_malformed_fact_counts_as_error():
+    latch = zrt.PressureLatch()
+    sampler = zrt.RunSampler(
+        lambda: {
+            "host": {"raw_available_bytes": True, "budget_bytes": 1},
+            "sampled_monotonic_ns": 1,
+        },
+        latch=latch,
+        interval_s=0.01,
+        wait=lambda _delay: True,
+    )
+    sampler.start()
+    sampler.stop_and_join()
+    assert sampler.samples == 0
+    assert sampler.errors >= 1
+    assert "malformed" in (sampler.last_error or "").lower()
+    assert latch.snapshot()["pending_fatal"] is True
+    with pytest.raises(zrt.RuntimeControlError):
+        latch.consume_validated()
 
 
 def test_checkpoint_malformed_latched_fact_fails_closed(monkeypatch):
@@ -703,6 +724,37 @@ def test_pmap_serial_heartbeat_cadence_and_cleanup():
     assert all(name == "r55e1-heartbeat" for name in calls)
     assert meta["heartbeat_mode"] == "serial_thread"
     assert meta["heartbeat_calls"] >= 1
+    assert meta["heartbeat_errors"] == 0
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
+
+
+def test_pmap_serial_heartbeat_start_failure_is_fatal_before_work(monkeypatch):
+    worker_calls = []
+    heartbeat_calls = []
+
+    def worker(value):
+        worker_calls.append(value)
+        return value
+
+    def heartbeat():
+        heartbeat_calls.append(1)
+
+    def _fail_start(self):
+        raise RuntimeError("cannot start monitor")
+
+    monkeypatch.setattr(zpar._HeartbeatMonitor, "start", _fail_start)
+    with pytest.raises(RuntimeError, match="could not start"):
+        zpar.pmap(
+            worker,
+            [1, 2],
+            workers=1,
+            heartbeat=heartbeat,
+            heartbeat_interval_s=0.02,
+        )
+    assert worker_calls == []
+    assert heartbeat_calls == []
     assert not any(
         thread.name.startswith("r55e1") for thread in threading.enumerate()
     )
@@ -743,6 +795,8 @@ def test_pmap_process_heartbeat_uses_parent_no_e1_thread(monkeypatch):
     assert out == [3, 1, 2, 4]
     assert progress == [1, 2, 3, 4]
     assert meta["heartbeat_mode"] == "parent_wait"
+    assert meta["heartbeat_calls"] >= 1
+    assert meta["heartbeat_errors"] == 0
     assert calls and all(name == "MainThread" for name in calls)
     assert not any(name.startswith("r55e1") for name in seen["init"])
     assert not any(name.startswith("r55e1") for name in seen["submit"])
@@ -960,6 +1014,8 @@ def test_real_multi_wave_active_vs_legacy_byte_identity(parity_runs):
     assert telemetry["metrics"]["checkpoint_count"] == len(run["checkpoints"])
     assert telemetry["metrics"]["shrink_count"] == 0
     assert telemetry["metrics"]["refusal_count"] == 0
+    assert telemetry["metrics"]["heartbeat_errors"] == 0
+    assert telemetry["metrics"]["heartbeat_calls"] >= 1
     # Exact per-wave candidate/mapping/facts + volatile metrics.
     assert telemetry["waves"]
     offset = 0
@@ -1152,6 +1208,50 @@ def test_malformed_in_wave_sample_refuses_at_next_boundary(routine_input, tmp_pa
     assert "latched" in ei.value.detail
     assert ei.value.record["publication"]["fits"] is False
     assert ei.value.record["publication"]["manifest"] is False
+    telemetry = ei.value.record["telemetry"]
+    assert telemetry["metrics"]["heartbeat_errors"] >= 1
+    assert any(
+        wave["heartbeat"].get("heartbeat_last_error")
+        for wave in telemetry["waves"]
+    )
+    assert not (out / "mosaic_grid.fits").exists()
+    assert not (out / "zegrid_manifest.json").exists()
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
+
+
+def test_heartbeat_collection_exception_refuses_at_next_boundary(
+    routine_input, tmp_path
+):
+    out = tmp_path / "refused_collection"
+    calls = {"n": 0}
+
+    def pressure(_root):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("MemAvailable collection failed")
+        return _facts(WITNESS_AVAILABLE_BYTES)
+
+    with pytest.raises(zz._R55RunRefused) as ei:
+        _run_product(
+            routine_input,
+            out,
+            "active",
+            sample=_ScheduleSample([WITNESS_AVAILABLE_BYTES] * 10),
+            decide=_force_k3_decide(zz._r55_active_decide),
+            pressure=pressure,
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+    telemetry = ei.value.record["telemetry"]
+    assert telemetry["metrics"]["heartbeat_errors"] >= 1
+    assert any(
+        "MemAvailable collection failed"
+        in str(wave["heartbeat"].get("heartbeat_last_error"))
+        for wave in telemetry["waves"]
+    )
+    assert ei.value.record["publication"]["fits"] is False
+    assert ei.value.record["publication"]["manifest"] is False
     assert not (out / "mosaic_grid.fits").exists()
     assert not (out / "zegrid_manifest.json").exists()
     assert not any(
@@ -1182,6 +1282,12 @@ def test_terminal_pending_malformed_fact_refuses_publication(
     assert "terminal" in ei.value.detail
     assert ei.value.record["publication"]["fits"] is False
     assert ei.value.record["publication"]["manifest"] is False
+    telemetry = ei.value.record["telemetry"]
+    assert telemetry["metrics"]["heartbeat_errors"] >= 1
+    assert any(
+        wave["heartbeat"].get("heartbeat_last_error")
+        for wave in telemetry["waves"]
+    )
     assert not (out / "mosaic_grid.fits").exists()
     assert not (out / "zegrid_manifest.json").exists()
     assert not any(

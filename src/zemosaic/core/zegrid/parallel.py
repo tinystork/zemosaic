@@ -898,7 +898,7 @@ class _HeartbeatMonitor:
         try:
             self._heartbeat()
             self.calls += 1
-        except Exception as exc:  # noqa: BLE001 - diagnostic only
+        except Exception as exc:  # noqa: BLE001 - fatal at the RUN boundary
             self.errors += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
 
@@ -1038,16 +1038,13 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
             monitor = _HeartbeatMonitor(heartbeat, interval_s)
             try:
                 monitor.start()
-            except Exception as exc:  # noqa: BLE001 - optional diagnostic
-                if meta is not None:
-                    meta["heartbeat_mode"] = "unavailable"
-                    meta["heartbeat_last_error"] = (
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                monitor = None
-            else:
-                if meta is not None:
-                    meta["heartbeat_mode"] = "serial_thread"
+            except Exception as exc:  # noqa: BLE001 - active control must fail closed
+                raise RuntimeError(
+                    "R55-E1 active heartbeat monitor could not start; "
+                    "refusing to run the wave unsampled"
+                ) from exc
+            if meta is not None:
+                meta["heartbeat_mode"] = "serial_thread"
         out = []
         try:
             for i, t in enumerate(tasks):
@@ -1114,7 +1111,7 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                     meta["heartbeat_calls"] = int(
                         meta.get("heartbeat_calls", 0)
                     ) + 1
-            except Exception as exc:  # noqa: BLE001 - diagnostic only
+            except Exception as exc:  # noqa: BLE001 - fatal at the RUN boundary
                 if meta is not None:
                     meta["heartbeat_errors"] = int(
                         meta.get("heartbeat_errors", 0)

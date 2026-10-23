@@ -6692,14 +6692,19 @@ def _run_single(
 
         def _heartbeat():
             # Any collection failure is an admission-fact failure: latch it as
-            # fatal for the next safe boundary (never downgrade to optional
-            # diagnostic telemetry).
+            # fatal for the next safe boundary AND re-raise so the pmap
+            # heartbeat wrapper records an honest error counter. A malformed
+            # returned fact is latched fatal by record() and also reported as
+            # a failed callback (no double fatal record, no lost latch).
             try:
                 sample = _r55_sample_pressure(disk_root)
-            except Exception as exc:  # noqa: BLE001 - carried to boundary
+            except Exception as exc:  # noqa: BLE001 - fatal at the boundary
                 latch.record_error(exc)
-                return
-            latch.record(sample)
+                raise
+            if not latch.record(sample):
+                raise zrt.RuntimeControlError(
+                    "malformed in-wave RUN pressure fact (latched fatal)"
+                )
 
         def _wave_progress(base_offset):
             def _cb(done, _total):
