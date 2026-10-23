@@ -4637,6 +4637,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "use_existing_master_tiles": False,
             "zegrid_mode_enabled": False,
             "zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX,
+            "zegrid_scheduler_mode": "legacy",
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
             "temporary_work_dir": "",

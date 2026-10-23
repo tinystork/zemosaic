@@ -31049,6 +31049,9 @@ def run_hierarchical_mosaic(
     # callers keep their current behavior; the value still comes from the
     # persisted config when this argument is absent.
     zegrid_halo_px: int | str | None = None,
+    # ZM-ZEGRID-R55-B: explicit GUI/settings -> engine transport of the scheduler
+    # mode. Absent -> the persisted config value; ``None`` there -> legacy.
+    zegrid_scheduler_mode: str | None = None,
     # New optional integration points when filter ran in GUI
     filter_invoked: bool = False,
     filter_overrides: dict | None = None,
@@ -31088,6 +31091,15 @@ def run_hierarchical_mosaic(
         worker_config_cache["zegrid_halo_px"] = zegrid_halo_px
         try:
             setattr(zconfig, "zegrid_halo_px", zegrid_halo_px)
+        except Exception:
+            pass
+
+    # ZM-ZEGRID-R55-B: same explicit transport for the scheduler mode. An unknown
+    # value is NOT validated here — the engine's single validator fails visibly.
+    if zegrid_scheduler_mode is not None:
+        worker_config_cache["zegrid_scheduler_mode"] = zegrid_scheduler_mode
+        try:
+            setattr(zconfig, "zegrid_scheduler_mode", zegrid_scheduler_mode)
         except Exception:
             pass
 
@@ -31268,6 +31280,9 @@ def run_hierarchical_mosaic(
                 grid_rgb_equalize=grid_rgb_equalize_flag,
                 use_gpu=_grid_gpu_requested,
                 zegrid_halo_px=(worker_config_cache or {}).get("zegrid_halo_px"),
+                zegrid_scheduler_mode=(worker_config_cache or {}).get(
+                    "zegrid_scheduler_mode"
+                ),
                 zconfig=zconfig,
             )
             return

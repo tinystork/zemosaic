@@ -126,6 +126,10 @@ DEFAULT_CONFIG = {
     # Product default 64 (256 is experimental). The engine validates this value
     # strictly (see zemosaic/zegrid_halo.py); it is not a mutable global.
     "zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX,
+    # ZM-ZEGRID-R55-B: "legacy" (default, historical execution) or "observe"
+    # (records a predicted R55 plan in the manifest; execution unchanged).
+    # Unknown values fail visibly in the engine and are never coerced.
+    "zegrid_scheduler_mode": "legacy",
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",

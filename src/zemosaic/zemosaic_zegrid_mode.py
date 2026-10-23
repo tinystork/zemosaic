@@ -103,6 +103,8 @@ from .core.zegrid import observability as zobs
 from .core.zegrid import parallel as zpar
 from .core.zegrid import photometric as zphot
 from .core.zegrid import ram_contract as rcontract
+from .core.zegrid import resource_envelope as renv
+from .core.zegrid import scheduler as zsched
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
 from .core.zegrid import sweep as zsw
@@ -3932,6 +3934,178 @@ def _ram_contract_diagnostics(outcome, bundle, initial_bundle) -> dict:
     }
 
 
+def _build_r55_observe_block(
+    *,
+    bundle,
+    chosen_mode,
+    cell_ctxs,
+    canvas,
+    halo_px,
+    output_dir,
+    cache_root=None,
+    frame_ids,
+    scheduler_mode="observe",
+):
+    """Build the ADDITIVE R55 observe-only manifest block (ZM-ZEGRID-R55-B).
+
+    Observe mode records what R55 WOULD choose; it never controls execution. The
+    numbers below are the product's OWN declared bounds (per-cell streaming
+    footprint, phase worker footprints, canvas-sized assembly/export buffers) —
+    no empirical coefficient is invented and no observed metric is fabricated.
+
+    Returns ``None`` in ``legacy`` mode. Raises :class:`scheduler.PlanRefused` when
+    no candidate fits; the caller records the refusal and keeps executing legacy.
+    """
+    if scheduler_mode == zsched.MODE_LEGACY:
+        return None
+    if scheduler_mode != zsched.MODE_OBSERVE:
+        # Validated at the product entry; never silently coerce here.
+        raise zsched.InvalidSchedulerMode(
+            f"unknown zegrid_scheduler_mode {scheduler_mode!r}"
+        )
+
+    active = [
+        (cell, patch, mem)
+        for (_row, _col, cell, patch, mem) in cell_ctxs
+        if mem.patch_ids
+    ]
+    if not active:
+        raise ValueError("R55 observe plan requires at least one non-empty cell")
+
+    units_total = len(active)
+    worst_patch_px = 0
+    worst_patch_hw = (1, 1)
+    core_area_px = 0
+    patch_area_px = 0
+    max_n_frames = 1
+    for cell, patch, mem in active:
+        patch_area = int(patch.patch.width) * int(patch.patch.height)
+        core = cell.core
+        core_area = max(0, int(core.x1) - int(core.x0)) * max(
+            0, int(core.y1) - int(core.y0)
+        )
+        if patch_area > worst_patch_px:
+            worst_patch_px = patch_area
+            worst_patch_hw = (int(patch.patch.height), int(patch.patch.width))
+        patch_area_px += patch_area
+        core_area_px += core_area
+        max_n_frames = max(max_n_frames, len(mem.patch_ids))
+
+    phase = (
+        renv.PHASE_CELL_STACK_INMEM
+        if str(chosen_mode) == "inmem"
+        else renv.PHASE_CELL_STACK_STREAM
+    )
+    channels = 3
+    # Aligned-cache static bound: one float32 plane per channel per frame at the
+    # WORST patch size. This is a dtype decomposition, not an empirical constant.
+    if phase == renv.PHASE_CELL_STACK_STREAM:
+        per_unit_cache = int(worst_patch_px) * channels * 4 * int(max_n_frames)
+        per_unit_prefetch = int(per_unit_cache)
+    else:
+        per_unit_cache = 0
+        per_unit_prefetch = 0
+
+    per_unit_stack = int(bundle.per_cell_footprint)
+    if per_unit_stack <= 0:
+        per_unit_stack = max(
+            (int(t[5]) for t in bundle.cell_tasks if t[4] is not None), default=1
+        )
+
+    # The aligned cache lives under the resolved temporary work root, which may
+    # be a DIFFERENT mount from the output directory. D3 must observe the volume
+    # that actually holds the cache (fall back to the output dir only when the
+    # caller did not supply one).
+    _disk_root = Path(cache_root) if cache_root is not None else Path(output_dir)
+    try:
+        disk_free = int(shutil.disk_usage(str(_disk_root)).free)
+    except Exception:
+        disk_free = 0
+
+    canvas_px = int(canvas.width) * int(canvas.height)
+    gauge_workers = max(1, int(bundle.gauge_workers))
+    cache_workers = max(1, int(bundle.cache_build_workers))
+    gauge_worker_bytes = int(zpar.gauge_footprint_bytes(canvas_px)) * gauge_workers
+    cache_worker_bytes = int(zpar.cache_footprint_bytes(worst_patch_px)) * cache_workers
+
+    # Assembly is retained cell cores + the halo band, never a blind per-phase add.
+    bytes_per_px = 4 * 4  # science RGB float32 + stack_depth float32
+    halo_band_bytes = max(0, int(patch_area_px) - int(core_area_px)) * bytes_per_px
+    retained_core_bytes = int(canvas_px) * bytes_per_px
+
+    requests = (
+        zsched.PhaseRequest(
+            phase=renv.PHASE_GAUGE,
+            components={"gauge_worker_footprint_bytes": gauge_worker_bytes},
+            units=gauge_workers,
+            units_in_flight=gauge_workers,
+            workers_per_unit=1,
+        ),
+        zsched.PhaseRequest(
+            phase=renv.PHASE_CACHE_BUILD,
+            components={"cache_build_worker_footprint_bytes": cache_worker_bytes},
+            units=cache_workers,
+            units_in_flight=cache_workers,
+            workers_per_unit=1,
+            disk_bytes=0,
+        ),
+        zsched.PhaseRequest(
+            phase=renv.PHASE_ASSEMBLY,
+            components={
+                "halo_band_bytes": halo_band_bytes,
+                "retained_core_bytes": retained_core_bytes,
+            },
+            units=1,
+            units_in_flight=1,
+            workers_per_unit=1,
+        ),
+        zsched.PhaseRequest(
+            phase=renv.PHASE_EXPORT,
+            components={
+                "coverage_plane_bytes": canvas_px * 4,
+                "science_planes_bytes": canvas_px * channels * 4,
+            },
+            units=1,
+            units_in_flight=1,
+            workers_per_unit=1,
+        ),
+    )
+
+    envelope = bundle.envelope
+    plan = zsched.build_observe_plan(
+        phase=phase,
+        backend=renv.BACKEND_CPU,
+        budget_bytes=int(envelope.budget_bytes),
+        raw_available_bytes=int(envelope.raw_available_bytes),
+        factor_num=int(envelope.factor_num),
+        factor_den=int(envelope.factor_den),
+        cpu_logical=int(os.cpu_count() or 1),
+        units_total=int(units_total),
+        shared_bytes=int(bundle.shared_bytes),
+        per_unit_stack_bytes=int(per_unit_stack),
+        per_unit_cache_bytes=int(per_unit_cache),
+        per_unit_prefetch_bytes=int(per_unit_prefetch),
+        disk_free_bytes=int(disk_free),
+        layout=(int(bundle.layout["nx"]), int(bundle.layout["ny"])),
+        refinement_rank=int(envelope.refinement_rank),
+        patch_hw=worst_patch_hw,
+        halo_px=int(halo_px),
+        channels=channels,
+        n_frames=int(max_n_frames),
+        phase_requests=requests,
+        cell_ids=tuple(cell.cell_id for cell, _p, _m in active),
+        frame_ids=tuple(frame_ids or ()),
+        mode=zsched.MODE_OBSERVE,
+        run_id=str(canvas.canvas_id),
+        observation_source="plan.available_bytes",
+        disk_fraction_num=1,
+        disk_fraction_den=2,
+        margin_num=renv.DEFAULT_MARGIN_NUM,
+        margin_den=renv.DEFAULT_MARGIN_DEN,
+    )
+    return plan.to_manifest_dict()
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -3954,6 +4128,7 @@ def _run_single(
     r40_seam_capture_disk_budget_bytes=None,
     halo_px=ZEGRID_HALO_DEFAULT_PX,
     halo_provenance=None,
+    scheduler_mode=zsched.MODE_LEGACY,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -4661,6 +4836,85 @@ def _run_single(
         "ram_contract": _ram_contract_diagnostics(_adm, _final, _initial_bundle),
         "requested_cell_gauge_mode": requested_cell_gauge_mode,
     }
+
+    # ZM-ZEGRID-R55-B — OBSERVE-ONLY scheduler integration. The admitted legacy
+    # bundle remains the ONLY execution authority: this block records what R55
+    # WOULD choose, additively, in the manifest. It is built after admission and
+    # before stacking, never mutates the bundle, and its failure never aborts the
+    # run (a refused/erroring observe plan is recorded verbatim).
+    _r55_scheduler_block = None
+    if scheduler_mode == zsched.MODE_OBSERVE:
+        if getattr(_final, "gpu_used", False):
+            # R55-B plans the CPU backend only. Record the refusal honestly
+            # instead of planning from a GPU-shaped bundle (GPU behaviour is
+            # explicitly out of scope for this mission).
+            _r55_scheduler_block = {
+                "schema": zsched.MANIFEST_SCHEMA,
+                "scheduler_version": zsched.SCHEDULER_VERSION,
+                "mode": "observe_only",
+                "requested_mode": zsched.MODE_OBSERVE,
+                "status": "not_supported_cpu_only",
+                "reason_code": renv.REASON_UNKNOWN_BACKEND,
+                "note": (
+                    "R55-B is CPU-only; no GPU plan is predicted and the GPU "
+                    "execution path is unchanged."
+                ),
+            }
+        else:
+            _r55_frame_ids = tuple(
+                getattr(getattr(f, "frame_id", None), "logical_path", str(f))
+                for f in (descs or ())
+            )
+            try:
+                _r55_scheduler_block = _build_r55_observe_block(
+                    bundle=_final,
+                    chosen_mode=chosen_mode,
+                    cell_ctxs=cell_ctxs,
+                    canvas=canvas,
+                    halo_px=halo_px,
+                    output_dir=output_dir,
+                    cache_root=cache_root,
+                    frame_ids=_r55_frame_ids,
+                    scheduler_mode=scheduler_mode,
+                )
+                _emit(
+                    "ZeGrid: R55 observe-only plan recorded — "
+                    f"plan_hash={_r55_scheduler_block.get('plan_hash')} "
+                    f"mode={_r55_scheduler_block.get('mode')} "
+                    "(execution remains legacy)",
+                    callback=progress_callback,
+                )
+            except zsched.PlanRefused as _r55_exc:
+                _r55_scheduler_block = _r55_exc.refusal_manifest_dict(
+                    mode=zsched.MODE_OBSERVE,
+                    run_id=str(getattr(canvas, "canvas_id", "")),
+                )
+                _emit(
+                    "ZeGrid: R55 observe-only plan REFUSED "
+                    f"({_r55_exc.reason_code}); execution continues on the legacy plan",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+            except Exception as _r55_exc:  # observe must never control execution
+                _r55_scheduler_block = {
+                    "schema": zsched.MANIFEST_SCHEMA,
+                    "scheduler_version": zsched.SCHEDULER_VERSION,
+                    "mode": "observe_only",
+                    "requested_mode": zsched.MODE_OBSERVE,
+                    "status": "error",
+                    "error": repr(_r55_exc),
+                    "reason_code": None,
+                    "note": (
+                        "observe-only plan construction failed; execution is "
+                        "unchanged. No observed metric is fabricated."
+                    ),
+                }
+                _emit(
+                    f"ZeGrid: R55 observe-only plan ERROR ({_r55_exc!r}); "
+                    "execution continues on the legacy plan",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
     per_cell_meta = {}
 
     def _cell_progress_for(tasks):
@@ -5148,6 +5402,7 @@ def _run_single(
             "scientific_fits_suffix", "_science"
         ),
         halo_provenance=_halo_provenance_pass,
+        r55_scheduler=_r55_scheduler_block,
     )
 
     _write_run_log(
@@ -5519,6 +5774,7 @@ def _write_outputs(
     export_aesthetic_fits=False,
     scientific_fits_suffix=None,
     halo_provenance=None,
+    r55_scheduler=None,
 ):
     output_dir = Path(output_dir)
     # ZM-ZEGRID-R18: use the finished (aesthetic) science when provided (bit-equal
@@ -5908,6 +6164,9 @@ def _write_outputs(
         ),
         "science_output_contract": science_output_contract,
         "stale_cleanup": stale_cleanup,
+        # ZM-ZEGRID-R55-B: ADDITIVE observe-only scheduler block. ``None`` in
+        # legacy mode -> the exact pre-R55 manifest shape is preserved.
+        **({"r55_scheduler": dict(r55_scheduler)} if r55_scheduler is not None else {}),
     }
     # ZM-ZEGRID-R40-B2-B: exactly ONE additive ``r40_diagnostic_capture`` manifest
     # block, produced by the accepted core (pre-existing fields canonical-identical
@@ -5956,6 +6215,7 @@ def run_zegrid_mode(
     workers: int | None = None,
     cell_gauge_mode: str | None = None,
     zegrid_halo_px: int | str | None = None,
+    zegrid_scheduler_mode: str | None = None,
     frames_info: Sequence | None = None,
     selection_paths: Sequence[str] | None = None,
     global_wcs_output_path: str | None = None,
@@ -6012,6 +6272,28 @@ def run_zegrid_mode(
         f"(source={halo_provenance['source']}); this width drives patch geometry, "
         "contributor membership, gauge patch domain, measurement band=2H and "
         "feather=H in per_cell mode",
+        callback=progress_callback,
+    )
+
+    # ZM-ZEGRID-R55-B: resolve the scheduler mode ONCE at the product entry.
+    # Absent -> legacy (the historical behaviour). An explicit unknown value
+    # fails visibly; it is never silently coerced to the default.
+    _scheduler_config_value = (
+        getattr(zconfig, "zegrid_scheduler_mode", None)
+        if zconfig is not None else None
+    )
+    _scheduler_mode = zsched.normalize_scheduler_mode(
+        zegrid_scheduler_mode
+        if zegrid_scheduler_mode is not None else _scheduler_config_value
+    )
+    _emit(
+        f"ZeGrid: scheduler mode = {_scheduler_mode} "
+        + (
+            "(R55 observe-only: records a predicted plan; execution remains the "
+            "legacy path)"
+            if _scheduler_mode == zsched.MODE_OBSERVE
+            else "(legacy default: R55 scheduler disabled)"
+        ),
         callback=progress_callback,
     )
 
@@ -6326,6 +6608,7 @@ def run_zegrid_mode(
                         ignored_run_args=ignored_run_args,
                         finishing_config=finishing_config,
                         gpu_context=gpu_context, pass_label="EQ",
+                        scheduler_mode=_scheduler_mode,
                         halo_px=resolved_halo_px,
                         halo_provenance=halo_provenance,
                         r37_diagnostic_capture=r37_diagnostic_capture,
@@ -6341,6 +6624,7 @@ def run_zegrid_mode(
                         ignored_run_args=ignored_run_args,
                         finishing_config=finishing_config,
                         gpu_context=gpu_context, pass_label="ALTZ",
+                        scheduler_mode=_scheduler_mode,
                         halo_px=resolved_halo_px,
                         halo_provenance=halo_provenance,
                         r37_diagnostic_capture=r37_diagnostic_capture,
@@ -6358,6 +6642,7 @@ def run_zegrid_mode(
                     ignored_run_args=ignored_run_args,
                     finishing_config=finishing_config,
                     gpu_context=gpu_context, pass_label="single",
+                    scheduler_mode=_scheduler_mode,
                     halo_px=resolved_halo_px,
                     halo_provenance=halo_provenance,
                     r37_diagnostic_capture=r37_diagnostic_capture,
