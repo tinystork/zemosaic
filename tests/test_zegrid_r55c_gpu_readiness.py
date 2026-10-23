@@ -93,26 +93,90 @@ _FakeCUDARTError.__name__ = "CUDARTError"
 _FakeCUDARTError.__module__ = "cupy.cuda.cudart"
 
 
+class _FakeDevice:
+    def __init__(self, runtime, index):
+        self._runtime = runtime
+        self.index = int(index)
+        self.previous = None
+
+    def __enter__(self):
+        self.previous = self._runtime.getDevice()
+        self._runtime.setDevice(self.index)
+        self._runtime.entered.append(self.index)
+        return self
+
+    def __exit__(self, *exc):
+        self._runtime.setDevice(self.previous)
+        return False
+
+
+class _FakeRuntime:
+    def __init__(self, count, names, mem_by_device, pool_by_device):
+        self._count = int(count)
+        self._names = list(names)
+        self._mem = dict(mem_by_device)
+        self._pool = dict(pool_by_device)
+        self.current = 0
+        self.entered = []
+
+    def getDeviceCount(self):
+        return self._count
+
+    def getDevice(self):
+        return self.current
+
+    def setDevice(self, index):
+        self.current = int(index)
+
+    def getDeviceProperties(self, index):
+        index = int(index)
+        if index >= self._count:
+            raise IndexError(f"invalid device {index}")
+        return {"name": self._names[index]}
+
+    def memGetInfo(self):
+        return self._mem[self.current]
+
+    def driverGetVersion(self):
+        return 12040
+
+    def runtimeGetVersion(self):
+        return 12090
+
+    def pool(self):
+        return self._pool[self.current]
+
+
 def _fake_cupy(
     *,
     count=1,
     name=b"GeForce MX150",
+    names=None,
     mem=(2 * 2 ** 30, 4 * 2 ** 30),
+    mem_by_device=None,
     pool=(10, 20),
+    pool_by_device=None,
     pinned=None,
 ):
-    runtime = types.SimpleNamespace(
-        getDeviceCount=lambda: count,
-        getDeviceProperties=lambda idx: {"name": name},
-        memGetInfo=lambda: mem,
-        driverGetVersion=lambda: 12040,
-        runtimeGetVersion=lambda: 12090,
-    )
+    names = list(names) if names is not None else [name] * max(1, int(count))
+    if mem_by_device is None:
+        mem_by_device = {0: tuple(mem)}
+        for idx in range(1, int(count)):
+            mem_by_device[idx] = (1 * 2 ** 30, 8 * 2 ** 30)
+    if pool_by_device is None:
+        pool_by_device = {0: tuple(pool)}
+        for idx in range(1, int(count)):
+            pool_by_device[idx] = (30, 40)
+    runtime = _FakeRuntime(count, names, mem_by_device, pool_by_device)
     cupy = types.SimpleNamespace(
         __version__="14.1.1",
-        cuda=types.SimpleNamespace(runtime=runtime),
+        cuda=types.SimpleNamespace(
+            runtime=runtime,
+            Device=lambda index: _FakeDevice(runtime, index),
+        ),
         get_default_memory_pool=lambda: types.SimpleNamespace(
-            used_bytes=lambda: pool[0], total_bytes=lambda: pool[1]
+            used_bytes=lambda: runtime.pool()[0],
+            total_bytes=lambda: runtime.pool()[1],
         ),
     )
     if pinned is not None:
@@ -180,7 +244,13 @@ def test_driver_probe_error_is_classified_without_crashing(monkeypatch):
 
 
 def test_multi_device_metadata_is_safe(monkeypatch):
-    cupy = _fake_cupy(count=2, name=b"GeForce MX150", pinned=(0, 0))
+    cupy = _fake_cupy(
+        count=2,
+        names=[b"GPU-ZERO", b"GeForce MX150"],
+        mem_by_device={0: (2 * 2 ** 30, 4 * 2 ** 30), 1: (1 * 2 ** 30, 8 * 2 ** 30)},
+        pool_by_device={0: (10, 20), 1: (30, 40)},
+        pinned=(0, 0),
+    )
     _patch_probe(monkeypatch, cupy=cupy, canonical=True)
     snap = gr.probe_gpu_readiness(device_index=1)
     assert snap.status == gr.STATUS_USABLE
@@ -188,12 +258,16 @@ def test_multi_device_metadata_is_safe(monkeypatch):
     assert snap.device_count == 2
     assert snap.device_index == 1
     assert snap.device_name == "GeForce MX150"
+    # Device-specific facts come from device 1, not the previously-current device 0.
+    assert snap.vram_free_bytes == 1 * 2 ** 30
+    assert snap.vram_total_bytes == 8 * 2 ** 30
+    assert snap.pool_used_bytes == 30 and snap.pool_total_bytes == 40
+    # The probe entered the requested device and restored the previous one.
+    assert cupy.cuda.runtime.entered == [1]
+    assert cupy.cuda.runtime.getDevice() == 0
     assert snap.cupy_version == "14.1.1"
     assert snap.driver_version == 12040
     assert snap.runtime_version == 12090
-    assert snap.vram_total_bytes == 4 * 2 ** 30
-    assert snap.vram_free_bytes == 2 * 2 ** 30
-    assert snap.pool_used_bytes == 10 and snap.pool_total_bytes == 20
     assert snap.pinned_pool_used_bytes == 0
 
 
@@ -387,6 +461,7 @@ def test_manifest_is_deterministic_and_default_off():
         "observe_only",
         "execution_authority",
         "readiness",
+        "product",
         "policy",
         "initial_candidate",
         "candidates",

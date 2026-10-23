@@ -97,6 +97,7 @@ from .core.zegrid import file_provider as zfp
 from .core.zegrid import final_mosaic_finishing as zfin
 from .core.zegrid import geometry as zg
 from .core.zegrid import gpu as zgpu
+from .core.zegrid import gpu_readiness as zgr
 from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
 from .core.zegrid import observability as zobs
@@ -3934,13 +3935,15 @@ def _ram_contract_diagnostics(outcome, bundle, initial_bundle) -> dict:
     }
 
 
-def _r55_observe_error_block(exc) -> dict:
+def _r55_observe_error_block(exc, *, gpu_readiness=None) -> dict:
     """Honest fallback when observe construction fails (never aborts the run).
 
     Carries the closed ``R55_INTERNAL_ERROR`` code; no metric or plan is
-    fabricated and execution stays on the legacy path.
+    fabricated and execution stays on the legacy path. The additive GPU
+    readiness block, when supplied, is recorded truthfully (including an
+    unavailable/error state).
     """
-    return {
+    block = {
         "schema": zsched.MANIFEST_SCHEMA,
         "scheduler_version": zsched.SCHEDULER_VERSION,
         "mode": "observe_only",
@@ -3953,6 +3956,30 @@ def _r55_observe_error_block(exc) -> dict:
             "No observed metric is fabricated and no RUN decision was taken."
         ),
     }
+    if gpu_readiness is not None:
+        block["gpu_readiness"] = gpu_readiness
+    return block
+
+
+def _r55_gpu_readiness_observe_block(
+    gpu_context, gpu_used, readiness=None
+) -> dict:
+    """Additive R55-C readiness block; observe-only, never controls execution.
+
+    ``requested`` comes from the product GPU preference, ``effective`` from the
+    actually executed backend, and ``available`` from ONE explicit readiness
+    probe (which delegates to the canonical availability definition). The three
+    are recorded separately and are never conflated.
+    """
+    ctx = gpu_context or {}
+    snapshot = (
+        zgr.probe_gpu_readiness_safe() if readiness is None else readiness
+    )
+    return zgr.readiness_manifest_dict(
+        snapshot,
+        requested_backend="gpu" if bool(ctx.get("requested")) else "cpu",
+        effective_backend="gpu" if bool(gpu_used) else "cpu",
+    )
 
 
 def _build_r55_observe_block(
@@ -3966,6 +3993,9 @@ def _build_r55_observe_block(
     cache_root=None,
     frame_ids,
     scheduler_mode="observe",
+    gpu_readiness=None,
+    requested_backend=None,
+    effective_backend=None,
 ):
     """Build the ADDITIVE R55 observe-only manifest block (ZM-ZEGRID-R55-B).
 
@@ -4127,7 +4157,12 @@ def _build_r55_observe_block(
         margin_num=renv.DEFAULT_MARGIN_NUM,
         margin_den=renv.DEFAULT_MARGIN_DEN,
     )
-    return plan.to_manifest_dict()
+    return plan.to_manifest_dict(
+        include_gpu_readiness=gpu_readiness is not None,
+        gpu_readiness=gpu_readiness,
+        requested_backend=requested_backend,
+        effective_backend=effective_backend,
+    )
 
 
 def _run_single(
@@ -4868,6 +4903,18 @@ def _run_single(
     # run (a refused/erroring observe plan is recorded verbatim).
     _r55_scheduler_block = None
     if scheduler_mode == zsched.MODE_OBSERVE:
+        # R55-C: ONE explicit, contained readiness probe, observe mode only.
+        # It never changes execution authority and never aborts CPU work.
+        _r55_gpu_snap = zgr.probe_gpu_readiness_safe()
+        _r55_gpu_readiness_block = _r55_gpu_readiness_observe_block(
+            gpu_ctx, getattr(_final, "gpu_used", False), _r55_gpu_snap
+        )
+        _r55_requested_backend = _r55_gpu_readiness_block["product"][
+            "requested_backend"
+        ]
+        _r55_effective_backend = _r55_gpu_readiness_block["product"][
+            "effective_backend"
+        ]
         if getattr(_final, "gpu_used", False):
             # R55-B plans the CPU backend only. Record the refusal honestly
             # instead of planning from a GPU-shaped bundle (GPU behaviour is
@@ -4883,6 +4930,7 @@ def _run_single(
                     "R55-B is CPU-only; no GPU plan is predicted and the GPU "
                     "execution path is unchanged."
                 ),
+                "gpu_readiness": _r55_gpu_readiness_block,
             }
         else:
             _r55_frame_ids = tuple(
@@ -4900,6 +4948,9 @@ def _run_single(
                     cache_root=cache_root,
                     frame_ids=_r55_frame_ids,
                     scheduler_mode=scheduler_mode,
+                    gpu_readiness=_r55_gpu_snap,
+                    requested_backend=_r55_requested_backend,
+                    effective_backend=_r55_effective_backend,
                 )
                 _emit(
                     "ZeGrid: R55 observe-only plan recorded — "
@@ -4913,6 +4964,7 @@ def _run_single(
                     mode=zsched.MODE_OBSERVE,
                     run_id=str(getattr(canvas, "canvas_id", "")),
                 )
+                _r55_scheduler_block["gpu_readiness"] = _r55_gpu_readiness_block
                 _emit(
                     "ZeGrid: R55 observe-only plan REFUSED "
                     f"({_r55_exc.reason_code}); execution continues on the legacy plan",
@@ -4920,7 +4972,9 @@ def _run_single(
                     callback=progress_callback,
                 )
             except Exception as _r55_exc:  # observe must never control execution
-                _r55_scheduler_block = _r55_observe_error_block(_r55_exc)
+                _r55_scheduler_block = _r55_observe_error_block(
+                    _r55_exc, gpu_readiness=_r55_gpu_readiness_block
+                )
                 _emit(
                     f"ZeGrid: R55 observe-only plan ERROR ({_r55_exc!r}); "
                     "execution continues on the legacy plan",

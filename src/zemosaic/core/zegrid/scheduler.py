@@ -184,6 +184,7 @@ class PlanRefused(SchedulerError):
                 c.to_dict() for c in self.candidates if isinstance(c, Candidate)
             ],
         }
+        return block
 
 
 def normalize_scheduler_mode(value, *, default: str = DEFAULT_MODE) -> str:
@@ -436,6 +437,8 @@ class PlanSet:
         *,
         include_gpu_readiness: bool = False,
         gpu_readiness=None,
+        requested_backend: str | None = None,
+        effective_backend: str | None = None,
     ) -> dict:
         """Additive, deterministic ``r55_scheduler`` manifest block.
 
@@ -458,7 +461,7 @@ class PlanSet:
                 if e.estimate.calibration_id
             }
         )
-        return {
+        block = {
             "schema": MANIFEST_SCHEMA,
             "scheduler_version": self.scheduler_version,
             "mode": "observe_only" if self.mode == MODE_OBSERVE else "active",
@@ -491,7 +494,11 @@ class PlanSet:
         if include_gpu_readiness:
             from .gpu_readiness import readiness_manifest_dict
 
-            block["gpu_readiness"] = readiness_manifest_dict(gpu_readiness)
+            block["gpu_readiness"] = readiness_manifest_dict(
+                gpu_readiness,
+                requested_backend=requested_backend,
+                effective_backend=effective_backend,
+            )
         return block
 
 

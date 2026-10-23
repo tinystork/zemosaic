@@ -31,7 +31,6 @@ from astropy import units as u
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
-from reproject.mosaicking import find_optimal_celestial_wcs
 from shapely.geometry import Polygon, box
 
 # Geometry policy version — bumped only on a breaking coordinate/partition change.
@@ -471,6 +470,11 @@ def build_canvas(frames: Sequence[FrameDescriptor]) -> GlobalCanvas:
     )
     if not np.isfinite(resolution) or resolution <= 0:
         raise ValueError("invalid scale")
+
+    # R55-C: import ``reproject.mosaicking`` lazily. Importing it at module
+    # scope pulled in ``reproject.adaptive`` -> ``dask.array`` -> CuPy on hosts
+    # where CuPy is installed, defeating CPU-module import laziness.
+    from reproject.mosaicking import find_optimal_celestial_wcs
 
     optimal, _ = find_optimal_celestial_wcs(
         [(f.shape_hw, w) for f, w in zip(frames, wcs_list)],

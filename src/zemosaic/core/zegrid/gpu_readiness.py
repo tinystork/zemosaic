@@ -35,6 +35,7 @@ import importlib.metadata
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable, Mapping
 from typing import Sequence
 
 try:  # Python 3.11+; the project also supports 3.10
@@ -81,6 +82,7 @@ __all__ = [
     "InvalidVramObservation",
     "GrowthRejected",
     "probe_gpu_readiness",
+    "probe_gpu_readiness_safe",
     "gpu_extra_declared",
     "policy_budget_bytes",
     "policy_residual_reserve_bytes",
@@ -421,19 +423,37 @@ def _probe_device_fields(cupy, device_index: int) -> tuple[dict, list[str]]:
     except Exception as exc:
         errors.append(_classify_error_token("getDeviceProperties", exc))
 
+    # Device-specific facts MUST be read with the requested device current;
+    # the context restores the previous device on exit (and we belt-and-braces
+    # restore it in ``finally``). Properties/count above may remain global.
+    previous_device = None
     try:
-        free_bytes, total_bytes = runtime.memGetInfo()
-        facts["vram_free_bytes"] = int(free_bytes)
-        facts["vram_total_bytes"] = int(total_bytes)
-    except Exception as exc:
-        errors.append(_classify_error_token("memGetInfo", exc))
-
+        previous_device = int(runtime.getDevice())
+    except Exception as exc:  # defensive; restore becomes best-effort
+        errors.append(_classify_error_token("getDevice", exc))
     try:
-        pool = cupy.get_default_memory_pool()
-        facts["pool_used_bytes"] = int(pool.used_bytes())
-        facts["pool_total_bytes"] = int(pool.total_bytes())
+        with cupy.cuda.Device(int(device_index)):
+            try:
+                free_bytes, total_bytes = runtime.memGetInfo()
+                facts["vram_free_bytes"] = int(free_bytes)
+                facts["vram_total_bytes"] = int(total_bytes)
+            except Exception as exc:
+                errors.append(_classify_error_token("memGetInfo", exc))
+            try:
+                pool = cupy.get_default_memory_pool()
+                facts["pool_used_bytes"] = int(pool.used_bytes())
+                facts["pool_total_bytes"] = int(pool.total_bytes())
+            except Exception as exc:
+                errors.append(_classify_error_token("default_pool", exc))
     except Exception as exc:
-        errors.append(_classify_error_token("default_pool", exc))
+        errors.append(_classify_error_token("device_context", exc))
+    finally:
+        if previous_device is not None:
+            try:
+                if int(runtime.getDevice()) != previous_device:
+                    runtime.setDevice(previous_device)
+            except Exception as exc:
+                errors.append(_classify_error_token("restore_device", exc))
 
     try:
         pinned_factory = getattr(cupy, "get_default_pinned_memory_pool", None)
@@ -559,6 +579,31 @@ def probe_gpu_readiness(
         pinned_pool_total_bytes=facts.get("pinned_pool_total_bytes"),
         errors=tuple(errors),
     )
+
+
+def probe_gpu_readiness_safe(*, device_index: int = 0, declared: bool | None = None) -> GpuReadiness:
+    """Contained readiness probe: never raises, always returns a closed snapshot.
+
+    Any unexpected failure (including an invalid ``device_index`` or a broken
+    packaging lookup) is reported as ``device_probe_error``/``R55_GPU_PROBE_ERROR``
+    so an observe path can record it without aborting CPU work.
+    """
+    try:
+        return probe_gpu_readiness(device_index=device_index, declared=declared)
+    except Exception as exc:  # defensive containment boundary
+        declared_value: bool | None
+        try:
+            declared_value = gpu_extra_declared() if declared is None else bool(declared)
+        except Exception:
+            declared_value = None
+        return GpuReadiness(
+            status=STATUS_DEVICE_PROBE_ERROR,
+            reason_code=REASON_GPU_PROBE_ERROR,
+            available=False,
+            dependency_declared=declared_value,
+            dependency_importable=False,
+            errors=(_classify_error_token("probe_gpu_readiness", exc),),
+        )
 
 
 def _looks_like_driver_error_token(token: str) -> bool:
@@ -781,12 +826,28 @@ def revalidate_for_unit(
     *,
     device_usable: bool = True,
     required_bytes: int | None = None,
+    required_bytes_by_percent: Mapping[int, int] | Callable[[int], int] | None = None,
 ) -> RunGpuDecision:
     """Pure RUN revalidation: fresh observation, shrink-only, whole-batch fallback.
 
     ``free_bytes`` MUST be a fresh integer observation (no cached/stale value,
-    no ``None``, no float/bool). The decision never grows a budget; when no rung
-    remains eligible the whole batch falls back to exact CPU.
+    no ``None``, no float/bool). The decision never grows a budget.
+
+    Requirement modes (mutually exclusive):
+
+    * ``required_bytes_by_percent`` — the correct shrink model: a mapping (or
+      callable) giving the SMALLER tile/workspace requirement at each rung. Each
+      rung is evaluated against its own requirement, so a lower rung can succeed
+      precisely because its workspace requirement shrank.
+    * ``required_bytes`` — one fixed requirement. Descending percent only reduces
+      the budget, so a miss CANNOT be fixed by a lower rung: the decision is an
+      immediate whole-batch CPU fallback, never a misleading ``shrink``.
+    * neither — reserve-only mode: descending percent can restore eligibility
+      only through the reserve floor (and the minimum budget), never through a
+      workspace requirement.
+
+    When no rung works the whole batch falls back to exact CPU with no mixed
+    partial result.
     """
     if not isinstance(policy, VramPolicy):
         raise GpuReadinessError("policy must be a VramPolicy")
@@ -796,13 +857,40 @@ def revalidate_for_unit(
     free = _require_plain_int(free_bytes, "free_bytes")  # fresh observation required
     if not isinstance(device_usable, bool):
         raise GpuReadinessError("device_usable must be a bool")
-    required = (
-        None
-        if required_bytes is None
-        else _require_plain_int(required_bytes, "required_bytes", minimum=1)
-    )
+    if required_bytes is not None and required_bytes_by_percent is not None:
+        raise GpuReadinessError(
+            "supply either required_bytes or required_bytes_by_percent, not both"
+        )
 
-    def _works(candidate) -> bool:
+    fixed: int | None = None
+    if required_bytes is not None:
+        fixed = _require_plain_int(required_bytes, "required_bytes", minimum=1)
+
+    def _req(percent: int) -> int | None:
+        spec = required_bytes_by_percent
+        if spec is None:
+            return fixed
+        if isinstance(spec, Mapping):
+            if set(spec.keys()) != set(policy.ladder):
+                raise GpuReadinessError(
+                    "required_bytes_by_percent must map every ladder rung exactly"
+                )
+            return _require_plain_int(
+                spec[percent], f"required_bytes_by_percent[{percent}]", minimum=1
+            )
+        if callable(spec):
+            return _require_plain_int(
+                spec(percent), f"required_bytes_by_percent({percent})", minimum=1
+            )
+        raise GpuReadinessError(
+            "required_bytes_by_percent must be a mapping or a callable"
+        )
+
+    # Validate the full requirement spec up-front (fail closed, not mid-walk).
+    for p in policy.ladder:
+        _req(p)
+
+    def _works(candidate, required: int | None) -> bool:
         if not candidate.eligible:
             return False
         if required is not None and candidate.budget_bytes < required:
@@ -819,7 +907,7 @@ def revalidate_for_unit(
         )
 
     candidate = policy.candidate(free, current)
-    if _works(candidate):
+    if _works(candidate, _req(current)):
         return RunGpuDecision(
             action=_ACTION_CONTINUE,
             percent=candidate.percent,
@@ -828,9 +916,19 @@ def revalidate_for_unit(
             reason_code=REASON_VRAM_CONTINUE,
         )
 
+    # A fixed workspace requirement cannot be rescued by a smaller budget.
+    if fixed is not None:
+        return RunGpuDecision(
+            action=_ACTION_FALLBACK_CPU,
+            percent=None,
+            budget_bytes=None,
+            free_bytes=free,
+            reason_code=REASON_REFUSE_VRAM,
+        )
+
     for p in sorted((x for x in policy.ladder if x < current), reverse=True):
         lower = policy.candidate(free, p)
-        if _works(lower):
+        if _works(lower, _req(p)):
             return RunGpuDecision(
                 action=_ACTION_SHRINK,
                 percent=lower.percent,
@@ -879,6 +977,8 @@ def readiness_manifest_dict(
     *,
     policy: VramPolicy | None = None,
     free_bytes: int | None = None,
+    requested_backend: str | None = None,
+    effective_backend: str | None = None,
 ) -> dict:
     """Deterministic, additive observe-only GPU block.
 
@@ -891,6 +991,13 @@ def readiness_manifest_dict(
         raise GpuReadinessError("policy must be a VramPolicy")
     if readiness is not None and not isinstance(readiness, GpuReadiness):
         raise GpuReadinessError("readiness must be a GpuReadiness or None")
+    for name, value in (
+        ("requested_backend", requested_backend),
+        ("effective_backend", effective_backend),
+    ):
+        if value is not None and value not in ("cpu", "gpu"):
+            raise GpuReadinessError(f"{name} must be 'cpu', 'gpu' or None")
+    available = bool(readiness.available) if readiness is not None else False
 
     if readiness is None:
         readiness_block: dict = {
@@ -919,6 +1026,12 @@ def readiness_manifest_dict(
         "observe_only": True,
         "execution_authority": False,
         "readiness": readiness_block,
+        "product": {
+            "requested_backend": requested_backend,
+            "available": available,
+            "effective_backend": effective_backend,
+            "policy_applied": False,
+        },
         "policy": _policy_contract_dict(pol),
         "initial_candidate": initial,
         "candidates": candidates,
