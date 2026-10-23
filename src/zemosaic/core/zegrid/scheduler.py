@@ -171,7 +171,7 @@ class PlanRefused(SchedulerError):
     def refusal_manifest_dict(
         self, *, mode: str = MODE_OBSERVE, run_id: str = ""
     ) -> dict:
-        return {
+        block = {
             "schema": MANIFEST_SCHEMA,
             "scheduler_version": SCHEDULER_VERSION,
             "mode": "observe_only" if mode == MODE_OBSERVE else "active",
@@ -431,11 +431,21 @@ class PlanSet:
     def phase_map(self) -> dict[str, ResourceEnvelope]:
         return {e.phase: e for e in self.phases}
 
-    def to_manifest_dict(self) -> dict:
+    def to_manifest_dict(
+        self,
+        *,
+        include_gpu_readiness: bool = False,
+        gpu_readiness=None,
+    ) -> dict:
         """Additive, deterministic ``r55_scheduler`` manifest block.
 
         No observed metric is fabricated: predicted envelopes only. The legacy
         ``ram_contract``/``cpu_streaming``/``cache``/``gpu`` blocks are untouched.
+
+        ``include_gpu_readiness`` is DEFAULT-OFF so every R55-B caller keeps a
+        byte-identical output. When explicitly enabled it appends the additive
+        ``gpu_readiness`` observe-only block (R55-C); it never probes hardware
+        and never changes execution authority.
         """
         order = {p: i for i, p in enumerate(PHASES)}
         phases = {}
@@ -478,6 +488,11 @@ class PlanSet:
                 "and no RUN decision was taken."
             ),
         }
+        if include_gpu_readiness:
+            from .gpu_readiness import readiness_manifest_dict
+
+            block["gpu_readiness"] = readiness_manifest_dict(gpu_readiness)
+        return block
 
 
 # ---------------------------------------------------------------------------
