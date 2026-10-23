@@ -5539,6 +5539,12 @@ def _r55_build_active_block(
         run_payload = dict(run)
         block["run"] = run_payload
         block["run_hash"] = zrt.sha256_payload(run_payload)
+        # The deterministic RUN structure is part of the auditable active
+        # evidence. Re-stamp the block hash so it covers the RUN decisions too;
+        # volatile telemetry lives in a separate ``r55_run_telemetry`` block and
+        # is never part of this hash.
+        payload = {k: v for k, v in block.items() if k != "evidence_hash"}
+        block["evidence_hash"] = zrt.sha256_payload(payload)
     return block
 
 
