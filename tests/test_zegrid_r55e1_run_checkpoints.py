@@ -1,0 +1,963 @@
+"""ZM-ZEGRID-R55-E1 — CPU RUN checkpoints, deterministic waves and telemetry.
+
+Acceptance exercised here:
+
+* strict malformed RUN snapshots fail closed (bool/float/negative/missing);
+* a mandatory fresh 90 % checkpoint precedes every wave;
+* canonical contiguous waves are bounded by the accepted K and preserve
+  result order/progress accounting;
+* scheduler-produced adjacent shrink-only corrections in the fixed global
+  order (prefetch -> workers -> K -> tile -> backend), with frozen endpoints
+  recorded as unavailable;
+* a changed mapping applies only to the next wave; recovery never grows;
+* host exhaustion and disk shortfall refuse BEFORE the next wave and publish
+  no FITS/manifest/science, with best-effort temp cleanup recorded;
+* truthful CPU telemetry (parent RSS/VmHWM, worker peaks with an honest
+  aggregate label, raw/90 % host budget, cgroup v2 and OS I/O availability,
+  disk free, wave wall/remaining/shrink/refusal counts);
+* deterministic RUN decision structure is separated from volatile telemetry;
+* real hermetic active-vs-legacy parity for multi-wave and multi-wave-shrink
+  product witnesses;
+* CPU import laziness (no CuPy / CUDA initialisation).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+from zemosaic import zemosaic_zegrid_mode as zz
+from zemosaic.core.zegrid import ram_contract as rcontract
+from zemosaic.core.zegrid import resource_envelope as re
+from zemosaic.core.zegrid import runtime_control as zrt
+from zemosaic.core.zegrid import scheduler as zs
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TOOL = REPO_ROOT / "tools" / "zegrid_routine" / "make_routine_corpus.py"
+WITNESS_HALO_PX = 32
+WITNESS_AVAILABLE_BYTES = 12 * 2 ** 30
+MIB = 2 ** 20
+GIB = 2 ** 30
+FITS_NAMES = ("mosaic_grid.fits", "mosaic_grid_coverage.fits")
+
+
+# ---------------------------------------------------------------------------
+# Helpers / fixtures
+# ---------------------------------------------------------------------------
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _manifest(out: Path) -> dict:
+    return json.loads((out / "zegrid_manifest.json").read_text())
+
+
+def _facts(raw, *, disk_free=100 * GIB, source="injected"):
+    raw = int(raw)
+    return {
+        "schema": zrt.RUN_CONTROL_SCHEMA,
+        "host": {
+            "raw_available_bytes": raw,
+            "budget_bytes": (rcontract.ADMIT_FACTOR_NUM * raw)
+            // rcontract.ADMIT_FACTOR_DEN,
+            "factor_num": rcontract.ADMIT_FACTOR_NUM,
+            "factor_den": rcontract.ADMIT_FACTOR_DEN,
+            "source": source,
+        },
+        "disk": {
+            "free_bytes": int(disk_free),
+            "io_read_bytes": None,
+            "io_write_bytes": None,
+            "unavailable_reason": None,
+        },
+        "parent": {
+            "current_rss_bytes": None,
+            "peak_rss_bytes": None,
+            "unavailable_reason": "unit-test",
+        },
+        "cgroup": {
+            "current_bytes": None,
+            "peak_bytes": None,
+            "unavailable_reason": "unit-test",
+        },
+    }
+
+
+class _ScheduleSample:
+    def __init__(self, schedule, *, disk_free=100 * GIB):
+        self.schedule = list(schedule)
+        self.disk_free = int(disk_free)
+        self.calls = 0
+
+    def __call__(self, _root):
+        raw = (
+            self.schedule[self.calls]
+            if self.calls < len(self.schedule)
+            else self.schedule[-1]
+        )
+        self.calls += 1
+        return _facts(raw, disk_free=self.disk_free)
+
+
+class _FakeEnvelope:
+    def __init__(self, aggregate_bytes=1):
+        self.aggregate_bytes = int(aggregate_bytes)
+
+
+class _FakeBundle:
+    def __init__(self, aggregate_bytes=1):
+        self.envelope = _FakeEnvelope(aggregate_bytes)
+        self.cell_tasks = []
+        self.attempts = []
+        self.layout = {"nx": 3, "ny": 2}
+        self.footprints = {}
+        self.cell_ctxs = []
+        self.cpu_streaming = {}
+        self.cpu_streaming_tile = 128
+        self.cell_specs = []
+        self.chosen_mode = "stream"
+        self.cells_in_flight = 1
+        self.cache_workers_per_cell = 1
+        self.per_cell_footprint = 0
+        self.gpu_tile_size = None
+        self.gpu_streaming_tile = None
+        self.gpu_streaming_host_peak_bytes = None
+        self.gpu_used = False
+        self.gpu_pre_execution_fallback = None
+        self.cpu_fallback_info = {}
+        self.cpu_fallback_plan = None
+        self.cpu_fallback_tasks = None
+        self.cache_build_workers = 1
+        self.worst_patch_px = 1
+
+
+def _synthetic_context(*, k_target=3, raw=WITNESS_AVAILABLE_BYTES):
+    cells = tuple(f"c{i}" for i in range(6))
+    frames = tuple(f"f{i}" for i in range(12))
+    return zs.PlanContext(
+        phase=re.PHASE_CELL_STACK_STREAM,
+        backend=re.BACKEND_CPU,
+        budget_bytes=(rcontract.PLAN_FACTOR_NUM * int(raw))
+        // rcontract.PLAN_FACTOR_DEN,
+        raw_available_bytes=int(raw),
+        factor_num=rcontract.PLAN_FACTOR_NUM,
+        factor_den=rcontract.PLAN_FACTOR_DEN,
+        cpu_logical=8,
+        units_total=len(cells),
+        shared_bytes=256 * MIB,
+        per_unit_stack_bytes=256 * MIB,
+        per_unit_cache_bytes=128 * MIB,
+        per_unit_prefetch_bytes=0,
+        disk_free_bytes=100 * GIB,
+        layout=(3, 2),
+        refinement_rank=6,
+        patch_hw=(512, 512),
+        halo_px=WITNESS_HALO_PX,
+        channels=3,
+        n_frames=12,
+        tile_ladder=zs.PRODUCT_TILE_LADDER,
+        prefetch_ladder=(0,),
+        workers_ladder=zs.WORKERS_LADDER,
+        cell_ids=cells,
+        frame_ids=frames,
+        run_id="r55e1-unit",
+    )
+
+
+def _synthetic_decision(*, k_target=3):
+    ctx = _synthetic_context()
+    reqs = (
+        zs.PhaseRequest(
+            phase=re.PHASE_GAUGE,
+            components={"gauge_worker_footprint_bytes": 0},
+            units=1,
+            units_in_flight=1,
+        ),
+        zs.PhaseRequest(
+            phase=re.PHASE_CACHE_BUILD,
+            components={"cache_build_worker_footprint_bytes": 0},
+            units=1,
+            units_in_flight=1,
+        ),
+        zs.PhaseRequest(
+            phase=re.PHASE_ASSEMBLY,
+            components={"halo_band_bytes": 0, "retained_core_bytes": 0},
+            units=1,
+            units_in_flight=1,
+        ),
+        zs.PhaseRequest(
+            phase=re.PHASE_EXPORT,
+            components={"coverage_plane_bytes": 0, "science_planes_bytes": 0},
+            units=1,
+            units_in_flight=1,
+        ),
+    )
+    plan = zs.plan_joint(
+        zs.JointPlanInput(contexts=(ctx,)),
+        phase_requests=reqs,
+        mode=zs.MODE_ACTIVE,
+    )
+    target = next(
+        c
+        for c in zs.enumerate_candidates(ctx)
+        if c.tile_px == 128
+        and c.units_in_flight == k_target
+        and c.workers_per_unit == 1
+        and c.prefetch_units == 0
+        and c.feasible
+    )
+    plan = dataclasses.replace(plan, chosen=target)
+    facts = {
+        "cell_ids": ctx.cell_ids,
+        "stream_worst_by_tile": {
+            int(t): int(ctx.per_unit_stack_bytes) for t in zs.PRODUCT_TILE_LADDER
+        },
+        "inmem_worst": int(ctx.per_unit_stack_bytes),
+        "units_total": int(ctx.units_total),
+    }
+    return zz._R55ActiveDecision(
+        plan_set=plan,
+        mapping=zs.active_mapping_for_candidate(target),
+        facts=facts,
+        inmem_context=ctx,
+        stream_context=ctx,
+        phase=zs.active_cpu_phase(target),
+    )
+
+
+def _force_k3_decide(_real_decide):
+    def patched(**kwargs):
+        decision = _real_decide(**kwargs)
+        target = next(
+            c
+            for c in zs.enumerate_candidates(decision.stream_context)
+            if c.tile_px == 128
+            and c.units_in_flight == 3
+            and c.workers_per_unit == 1
+            and c.prefetch_units == 0
+            and c.feasible
+        )
+        return dataclasses.replace(
+            decision,
+            plan_set=dataclasses.replace(decision.plan_set, chosen=target),
+            mapping=zs.active_mapping_for_candidate(target),
+            phase=zs.active_cpu_phase(target),
+        )
+
+    return patched
+
+
+def _run_product(
+    inp,
+    out,
+    mode,
+    *,
+    memory=WITNESS_AVAILABLE_BYTES,
+    sample=None,
+    decide=None,
+):
+    if not callable(memory):
+        _constant = int(memory)
+        memory = lambda: _constant
+    patch = pytest.MonkeyPatch()
+    try:
+        patch.setattr(zz, "available_memory_bytes", memory)
+        if sample is not None:
+            patch.setattr(zz, "_r55_run_checkpoint_sample", sample)
+        if decide is not None:
+            patch.setattr(zz, "_r55_active_decide", decide)
+        zz.run_zegrid_mode(
+            str(inp),
+            str(out),
+            zegrid_halo_px=WITNESS_HALO_PX,
+            zegrid_scheduler_mode=mode,
+        )
+    finally:
+        patch.undo()
+
+
+def _recompute_final_hash(block) -> str:
+    candidate = zs.Candidate(**block["chosen_candidate"])
+    ident = block["identity"]
+    identity = zs.FrozenIdentity(
+        layout=tuple(ident["layout"]),
+        cell_ids=tuple(ident["cell_ids"]),
+        frame_ids=tuple(ident["frame_ids"]),
+        halo_px=int(ident["halo_px"]),
+        refinement_rank=int(ident["refinement_rank"]),
+    )
+    return zs.active_final_plan_hash(
+        candidate=candidate,
+        mapping=block["mapping"],
+        identity=identity,
+        envelope=block["final_envelope"],
+    )
+
+
+@pytest.fixture(scope="module")
+def routine_input(tmp_path_factory):
+    root = tmp_path_factory.mktemp("r55e1_routine")
+    corpus = root / "corpus"
+    proc = subprocess.run(
+        [sys.executable, str(TOOL), str(corpus)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    inp = root / "input"
+    inp.mkdir()
+    for path in sorted(corpus.glob("*.fits")):
+        shutil.copy2(path, inp / path.name)
+    plan_csv = corpus / "stack_plan.csv"
+    if plan_csv.exists():
+        shutil.copy2(plan_csv, inp / "stack_plan.csv")
+    return inp
+
+
+@pytest.fixture(scope="module")
+def parity_runs(routine_input, tmp_path_factory):
+    root = tmp_path_factory.mktemp("r55e1_parity")
+    legacy = root / "legacy"
+    active = root / "active"
+    active2 = root / "active2"
+    _run_product(routine_input, legacy, "legacy")
+    _run_product(routine_input, active, "active")
+    _run_product(routine_input, active2, "active")
+    return {"legacy": legacy, "active": active, "active2": active2}
+
+
+@pytest.fixture(scope="module")
+def shrink_runs(routine_input, tmp_path_factory):
+    root = tmp_path_factory.mktemp("r55e1_shrink")
+    legacy = root / "legacy"
+    active = root / "active"
+    active2 = root / "active2"
+    _run_product(routine_input, legacy, "legacy")
+    decide = _force_k3_decide(zz._r55_active_decide)
+    # K=3 host peak ~2.89 GiB; a 2.5 GiB raw (2.25 GiB budget) admits K=2
+    # (~2.05 GiB) but not K=3, producing a real adjacent pressure shrink.
+    schedule = [WITNESS_AVAILABLE_BYTES, 5 * GIB // 2,
+                WITNESS_AVAILABLE_BYTES, WITNESS_AVAILABLE_BYTES]
+    _run_product(
+        routine_input,
+        active,
+        "active",
+        sample=_ScheduleSample(schedule),
+        decide=decide,
+    )
+    _run_product(
+        routine_input,
+        active2,
+        "active",
+        sample=_ScheduleSample(schedule),
+        decide=_force_k3_decide(zz._r55_active_decide),
+    )
+    return {"legacy": legacy, "active": active, "active2": active2}
+
+
+# ---------------------------------------------------------------------------
+# Strict RUN facts / refusal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        True,
+        1.5,
+        -1,
+        0,
+        None,
+        "123",
+    ],
+)
+def test_malformed_raw_observation_fails_closed(monkeypatch, bad):
+    decision = _synthetic_decision()
+    monkeypatch.setattr(zz, "_r55_active_apply", lambda *a, **k: _FakeBundle())
+    with pytest.raises(zz._R55RunRefused) as ei:
+        zz._r55_run_checkpoint(
+            decision=decision,
+            candidate=decision.plan_set.chosen,
+            mapping=decision.mapping,
+            bundle=_FakeBundle(),
+            remaining_units=6,
+            wave_index=0,
+            facts={
+                "host": {
+                    "raw_available_bytes": bad,
+                    "budget_bytes": 1,
+                    "factor_num": 9,
+                    "factor_den": 10,
+                },
+                "disk": {"free_bytes": 1},
+            },
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+    assert "malformed RUN checkpoint" in ei.value.detail
+
+
+@pytest.mark.parametrize(
+    "bad_budget",
+    [
+        True,
+        -1,
+        1.0,
+        (9 * WITNESS_AVAILABLE_BYTES) // 10 + 1,
+    ],
+)
+def test_malformed_or_fabricated_budget_fails_closed(monkeypatch, bad_budget):
+    decision = _synthetic_decision()
+    monkeypatch.setattr(zz, "_r55_active_apply", lambda *a, **k: _FakeBundle())
+    facts = _facts(WITNESS_AVAILABLE_BYTES)
+    facts["host"]["budget_bytes"] = bad_budget
+    with pytest.raises(zz._R55RunRefused) as ei:
+        zz._r55_run_checkpoint(
+            decision=decision,
+            candidate=decision.plan_set.chosen,
+            mapping=decision.mapping,
+            bundle=_FakeBundle(),
+            remaining_units=6,
+            wave_index=0,
+            facts=facts,
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+
+
+# ---------------------------------------------------------------------------
+# Adjacent shrink-only corrections / no growth
+# ---------------------------------------------------------------------------
+
+
+def test_pressure_shrinks_adjacent_then_recovery_never_grows(monkeypatch):
+    decision = _synthetic_decision(k_target=3)
+    calls = {"n": 0}
+
+    def apply(bundle, *, mapping, **_kwargs):
+        calls["n"] += 1
+        return _FakeBundle(aggregate_bytes=1)
+
+    monkeypatch.setattr(zz, "_r55_active_apply", apply)
+    # K=3 host peak is 1 GiB; a 1 GiB raw -> 921 MiB budget admits K=2 only.
+    shrunk = zz._r55_run_checkpoint(
+        decision=decision,
+        candidate=decision.plan_set.chosen,
+        mapping=decision.mapping,
+        bundle=_FakeBundle(aggregate_bytes=1),
+        remaining_units=6,
+        wave_index=1,
+        facts=_facts(1 * GIB),
+    )
+    assert shrunk["record"]["changed"] is True
+    assert shrunk["candidate"].units_in_flight == 2
+    assert shrunk["mapping"]["units_in_flight"] == 2
+    steps = shrunk["record"]["shrink_steps"]
+    assert [s["step"] for s in steps] == ["units_in_flight"]
+    assert steps[0]["from"]["units_in_flight"] == 3
+    assert steps[0]["to"]["units_in_flight"] == 2
+    assert steps[0]["accepted"] is True
+    # Frozen endpoints are recorded, never invented.
+    unavailable = {x["step"]: x for x in shrunk["record"]["unavailable_shrinks"]}
+    assert unavailable["prefetch_units"]["available"] is False
+    assert unavailable["backend"]["available"] is False
+
+    before = len(shrunk["record"]["shrink_steps"])
+    recovered = zz._r55_run_checkpoint(
+        decision=decision,
+        candidate=shrunk["candidate"],
+        mapping=shrunk["mapping"],
+        bundle=shrunk["bundle"],
+        remaining_units=4,
+        wave_index=2,
+        facts=_facts(WITNESS_AVAILABLE_BYTES),
+    )
+    assert recovered["record"]["changed"] is False
+    assert recovered["record"]["shrink_steps"] == []
+    assert recovered["candidate"].units_in_flight == 2
+    assert recovered["mapping"]["units_in_flight"] == 2
+    assert before == 1
+    assert calls["n"] == 1  # only the shrink wave re-applied the mapping
+
+
+def test_exhaustion_refuses_before_the_wave(monkeypatch):
+    decision = _synthetic_decision(k_target=3)
+    monkeypatch.setattr(zz, "_r55_active_apply", lambda *a, **k: _FakeBundle())
+    with pytest.raises(zz._R55RunRefused) as ei:
+        zz._r55_run_checkpoint(
+            decision=decision,
+            candidate=decision.plan_set.chosen,
+            mapping=decision.mapping,
+            bundle=_FakeBundle(),
+            remaining_units=6,
+            wave_index=1,
+            facts=_facts(200 * MIB),
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+    record = ei.value.record
+    assert record["status"] == "refused"
+    assert record["publication"] if "publication" in record else True
+    # Adjacent examination is complete and ordered until the dead end.
+    assert record["shrink_steps"]
+    for item in record["shrink_steps"]:
+        assert item["accepted"] is False
+        assert item["step"] in (
+            "prefetch_units",
+            "workers_per_unit",
+            "units_in_flight",
+            "tile_px",
+            "backend",
+        )
+
+
+def test_disk_shortfall_refuses_with_disk_reason(monkeypatch):
+    decision = _synthetic_decision(k_target=3)
+    monkeypatch.setattr(zz, "_r55_active_apply", lambda *a, **k: _FakeBundle())
+    with pytest.raises(zz._R55RunRefused) as ei:
+        zz._r55_run_checkpoint(
+            decision=decision,
+            candidate=decision.plan_set.chosen,
+            mapping=decision.mapping,
+            bundle=_FakeBundle(),
+            remaining_units=6,
+            wave_index=1,
+            facts=_facts(WITNESS_AVAILABLE_BYTES, disk_free=1),
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_DISK
+    assert any(
+        item["reason_code"] == re.REASON_REFUSE_DISK
+        for item in ei.value.record["shrink_steps"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave partition / canonical order
+# ---------------------------------------------------------------------------
+
+
+def test_wave_partition_is_canonical_contiguous_and_bounded():
+    assert zrt.plan_wave_bounds(7, 3) == ((0, 3), (3, 6), (6, 7))
+    assert zrt.plan_wave_bounds(6, 1) == ((0, 1), (1, 2), (2, 3), (3, 4),
+                                          (4, 5), (5, 6))
+    assert zrt.next_wave_bound(3, 6, 2) == (3, 5)
+    assert zrt.next_wave_bound(5, 6, 2) == (5, 6)
+    for bad in (True, 1.5, -1):
+        with pytest.raises(zrt.RuntimeControlError):
+            zrt.plan_wave_bounds(6, bad)
+
+
+def test_sampler_cadence_at_most_five_seconds_and_latches(monkeypatch):
+    latch = zrt.PressureLatch()
+    samples = [_facts(100 * MIB), _facts(50 * MIB), _facts(80 * MIB)]
+    state = {"i": 0}
+
+    def sample_fn():
+        value = samples[min(state["i"], len(samples) - 1)]
+        state["i"] += 1
+        return value
+
+    fake_clock = {"t": 0.0}
+
+    def clock():
+        return fake_clock["t"]
+
+    wait_calls = {"n": 0}
+
+    def wait(delay):
+        wait_calls["n"] += 1
+        assert delay <= zrt.RUN_MAX_SAMPLE_INTERVAL_S
+        fake_clock["t"] += max(0.0, float(delay))
+        return wait_calls["n"] >= 3
+
+    sampler = zrt.RunSampler(
+        sample_fn, latch=latch, interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
+        clock=clock, wait=wait,
+    )
+    sampler.start()
+    sampler.join(timeout=5)
+    assert sampler.samples == 3
+    assert sampler.errors == 0
+    assert all(
+        0.0 <= value <= zrt.RUN_MAX_SAMPLE_INTERVAL_S
+        for value in sampler.requested_waits
+    )
+    lowest = latch.peek()
+    assert lowest["raw_available_bytes"] == 50 * MIB
+    assert lowest["budget_bytes"] == (9 * 50 * MIB) // 10
+
+
+# ---------------------------------------------------------------------------
+# Telemetry availability / aggregation / deterministic projection
+# ---------------------------------------------------------------------------
+
+
+def test_parent_memory_reads_strict_integers(tmp_path):
+    status = tmp_path / "status"
+    status.write_text(
+        "Name:\tpython\nVmPeak:\t  2048 kB\nVmRSS:\t  1024 kB\n"
+        "VmHWM:\t  1536 kB\n",
+        encoding="ascii",
+    )
+    result = zrt.read_parent_memory(status)
+    assert result["current_rss_bytes"] == 1024 * 1024
+    assert result["peak_rss_bytes"] == 1536 * 1024
+    assert result["unavailable_reason"] is None
+
+
+def test_optional_metrics_are_null_plus_reason_never_fabricated_zero(tmp_path):
+    assert zrt.read_parent_memory(tmp_path / "missing")["current_rss_bytes"] is None
+    assert (
+        zrt.read_parent_memory(tmp_path / "missing")["unavailable_reason"]
+    )
+    cgroup = zrt.read_cgroup_memory(tmp_path / "missing_cgroup")
+    assert cgroup["current_bytes"] is None
+    assert cgroup["peak_bytes"] is None
+    assert cgroup["unavailable_reason"]
+    io = zrt.read_disk_io(tmp_path / "missing_io")
+    assert io["read_bytes"] is None
+    assert io["write_bytes"] is None
+    assert io["unavailable_reason"]
+    missing = tmp_path / "missing_meminfo"
+    with pytest.raises(zrt.RuntimeControlError):
+        zrt.read_meminfo(missing)
+
+
+def test_collect_run_facts_available_and_unavailable(tmp_path):
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       1000 kB\nMemAvailable:    500 kB\n", encoding="ascii"
+    )
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "memory.current").write_text("1234\n", encoding="ascii")
+    (cgroup / "memory.peak").write_text("4321\n", encoding="ascii")
+    proc_io = tmp_path / "io"
+    proc_io.write_text("read_bytes: 11\nwrite_bytes: 22\n", encoding="ascii")
+    facts = zrt.collect_run_facts(
+        root=tmp_path,
+        meminfo_path=meminfo,
+        cgroup_root=cgroup,
+        proc_io_path=proc_io,
+        proc_status_path=tmp_path / "missing_status",
+    )
+    assert facts["host"]["raw_available_bytes"] == 500 * 1024
+    assert facts["host"]["budget_bytes"] == (9 * 500 * 1024) // 10
+    assert facts["disk"]["free_bytes"] >= 0
+    assert facts["cgroup"]["current_bytes"] == 1234
+    assert facts["cgroup"]["peak_bytes"] == 4321
+    assert facts["disk"]["io_read_bytes"] == 11
+    assert facts["disk"]["io_write_bytes"] == 22
+    assert facts["parent"]["current_rss_bytes"] is None
+    assert facts["parent"]["unavailable_reason"]
+
+
+def test_worker_peak_aggregate_label_and_normalized_projection():
+    results = [
+        {"peak_rss_kib": 10},
+        {"peak_rss_kib": 20},
+        {"no_peak": True},
+    ]
+    agg = zrt.aggregate_worker_peaks(results)
+    assert agg["values_kib"] == [10, 20]
+    assert agg["sum_kib"] == 30
+    assert agg["max_kib"] == 20
+    assert agg["current_available"] is False
+    assert agg["current_unavailable_reason"]
+    assert "no_dedup" in agg["label"]
+    payload = {
+        "wave": 1,
+        "wall_s": 3.5,
+        "parent_rss_bytes": 123,
+        "cgroup_current_bytes": 456,
+        "decision": {"candidate": {"units_in_flight": 2}},
+    }
+    normalized = zrt.normalized_projection(payload)
+    assert "wall_s" not in normalized
+    assert "parent_rss_bytes" not in normalized
+    assert normalized["decision"]["candidate"]["units_in_flight"] == 2
+    assert zrt.deterministic_hash(payload) == zrt.deterministic_hash(
+        {**payload, "wall_s": 99.0, "parent_rss_bytes": 999}
+    )
+
+
+# ---------------------------------------------------------------------------
+# REAL product-path parity witnesses
+# ---------------------------------------------------------------------------
+
+
+def test_real_multi_wave_active_vs_legacy_byte_identity(parity_runs):
+    legacy = parity_runs["legacy"]
+    active = parity_runs["active"]
+    for name in FITS_NAMES:
+        assert _digest(legacy / name) == _digest(active / name), name
+
+    llm = _manifest(legacy)
+    am = _manifest(active)
+    assert "r55_run_telemetry" not in llm
+    block = am["r55_scheduler"]
+    run = block["run"]
+    telemetry = am["r55_run_telemetry"]
+    assert run["schema"] == zrt.RUN_DECISION_SCHEMA
+    assert run["policy"]["checkpoint"] == "mandatory_before_every_wave"
+    assert run["policy"]["shrink_order"] == [
+        "prefetch_units",
+        "workers_per_unit",
+        "units_in_flight",
+        "tile_px",
+        "backend",
+    ]
+    assert telemetry["schema"] == zrt.RUN_TELEMETRY_SCHEMA
+    assert telemetry["metrics"]["wave_count"] == len(run["waves"])
+    assert len(run["checkpoints"]) == len(run["waves"]) >= 2
+    assert telemetry["metrics"]["checkpoint_count"] == len(run["checkpoints"])
+    assert telemetry["metrics"]["shrink_count"] == 0
+    assert telemetry["metrics"]["refusal_count"] == 0
+    # Exact per-wave candidate/mapping/facts + volatile metrics.
+    assert telemetry["waves"]
+    offset = 0
+    for index, wave in enumerate(run["waves"]):
+        assert wave["index"] == index
+        assert wave["offset"] == offset
+        assert wave["wave_units"] <= wave["mapping"]["units_in_flight"]
+        assert wave["mapping"] == run["checkpoints"][index]["mapping"]
+        assert wave["candidate"] == run["checkpoints"][index]["candidate"]
+        offset += wave["wave_units"]
+    assert offset == am["per_cell_diagnostics"]["cells"]
+    assert telemetry["waves"][-1]["units_remaining_after"] == 0
+    for wave in telemetry["waves"]:
+        assert isinstance(wave["facts"]["host"]["raw_available_bytes"], int)
+        assert isinstance(wave["facts"]["host"]["budget_bytes"], int)
+        assert wave["facts"]["disk"]["free_bytes"] >= 0
+        assert "worker_peaks" in wave
+        assert wave["worker_peaks"]["current_available"] is False
+        assert wave["wall_s"] is not None
+    # Deterministic RUN structure has NO volatile observation keys.
+    text = json.dumps(run, sort_keys=True)
+    for forbidden in (
+        "wall_s",
+        "parent_rss_bytes",
+        "cgroup_current_bytes",
+        "disk_io_read_bytes",
+        "disk_free_bytes",
+        "sampled_monotonic_ns",
+    ):
+        assert forbidden not in text
+    assert block["run_hash"].startswith("sha256:")
+    assert block["plan_hash"] == _recompute_final_hash(block)
+    diag = am["per_cell_diagnostics"]
+    assert diag["r55_run_waves"] == len(run["waves"])
+    assert diag["r55_run_shrink_steps"] == 0
+    assert diag["cells_in_flight"] == block["mapping"]["units_in_flight"]
+    assert diag["cache_workers_per_cell"] == block["mapping"]["workers_per_unit"]
+    assert diag["cpu_streaming_tile"] == (
+        block["mapping"]["cpu_streaming_tile"] or 0
+    )
+
+
+def test_real_multi_wave_shrink_parity_and_no_growth(shrink_runs):
+    legacy = shrink_runs["legacy"]
+    active = shrink_runs["active"]
+    active2 = shrink_runs["active2"]
+    for name in FITS_NAMES:
+        assert _digest(legacy / name) == _digest(active / name), name
+        assert _digest(active / name) == _digest(active2 / name), name
+
+    first = _manifest(active)
+    second = _manifest(active2)
+    block = first["r55_scheduler"]
+    run = block["run"]
+    telemetry = first["r55_run_telemetry"]
+    assert run["shrink_count"] >= 1
+    assert telemetry["metrics"]["shrink_count"] == run["shrink_count"]
+    assert telemetry["metrics"]["refusal_count"] == 0
+    # At least one adjacent accepted shrink; every transition is ordered.
+    accepted = [
+        step
+        for cp in run["checkpoints"]
+        for step in cp["shrink_steps"]
+        if step["accepted"]
+    ]
+    assert accepted
+    for step in accepted:
+        assert step["to"]["units_in_flight"] <= step["from"]["units_in_flight"]
+    # Initial K=3, final K=2, and recovery never grows back to 3.
+    assert block["initial_candidate"]["units_in_flight"] == 3
+    assert block["chosen_candidate"]["units_in_flight"] == 2
+    assert block["mapping"]["units_in_flight"] == 2
+    assert block["execution"]["units_in_flight"] == 2
+    assert run["final_execution"]["units_in_flight"] == 2
+    assert not any(
+        cp["changed"] and cp["candidate"]["units_in_flight"] > 2
+        for cp in run["checkpoints"]
+    )
+    # A later high-memory checkpoint is unchanged (no growth after recovery).
+    assert any(
+        (not cp["changed"])
+        and cp["host"]["raw_available_bytes"] == WITNESS_AVAILABLE_BYTES
+        for cp in run["checkpoints"][1:]
+    )
+    # Wave bounds/offsets remain exact after the shrink.
+    offset = 0
+    for index, wave in enumerate(run["waves"]):
+        assert wave["index"] == index
+        assert wave["offset"] == offset
+        assert wave["wave_units"] <= wave["mapping"]["units_in_flight"]
+        offset += wave["wave_units"]
+    assert offset == first["per_cell_diagnostics"]["cells"]
+    # Deterministic decision structure identical across two builds; volatile
+    # telemetry is intentionally NOT part of that comparison.
+    assert json.dumps(block, sort_keys=True) == json.dumps(
+        second["r55_scheduler"], sort_keys=True
+    )
+    assert block["run_hash"] == second["r55_scheduler"]["run_hash"]
+    assert block["plan_hash"] == _recompute_final_hash(block)
+    # Exact injected facts are auditable in telemetry, including the drop.
+    raws = [
+        w["facts"]["host"]["raw_available_bytes"] for w in telemetry["waves"]
+    ]
+    assert raws[0] == WITNESS_AVAILABLE_BYTES
+    assert 5 * GIB // 2 in raws
+    assert raws[-1] == WITNESS_AVAILABLE_BYTES
+
+
+def test_host_exhaustion_refuses_and_publishes_nothing(routine_input, tmp_path):
+    out = tmp_path / "refused_host"
+    decide = _force_k3_decide(zz._r55_active_decide)
+    sample = _ScheduleSample(
+        [WITNESS_AVAILABLE_BYTES, 200 * MIB], disk_free=100 * GIB
+    )
+    with pytest.raises(zz._R55RunRefused) as ei:
+        _run_product(
+            routine_input, out, "active", sample=sample, decide=decide
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+    record = ei.value.record
+    assert record["publication"] == {
+        "fits": False,
+        "manifest": False,
+        "assembly": False,
+    }
+    assert record["cleanup"]
+    assert all("cell_id" in item and "removed" in item for item in record["cleanup"])
+    assert record["telemetry"]["metrics"]["refusal_count"] == 1
+    assert not (out / "mosaic_grid.fits").exists()
+    assert not (out / "mosaic_grid_coverage.fits").exists()
+    assert not (out / "zegrid_manifest.json").exists()
+
+
+def test_disk_shortfall_refuses_and_publishes_nothing(routine_input, tmp_path):
+    out = tmp_path / "refused_disk"
+    decide = _force_k3_decide(zz._r55_active_decide)
+    sample = _ScheduleSample(
+        [WITNESS_AVAILABLE_BYTES, WITNESS_AVAILABLE_BYTES], disk_free=1
+    )
+    # First wave is accepted under the real disk; the second checkpoint injects
+    # a predictable 1-byte disk shortfall.
+    sample.calls = 0
+    original = sample.schedule
+
+    def two_phase(_root):
+        if sample.calls == 0:
+            sample.calls += 1
+            return _facts(WITNESS_AVAILABLE_BYTES, disk_free=100 * GIB)
+        sample.calls += 1
+        return _facts(WITNESS_AVAILABLE_BYTES, disk_free=1)
+
+    with pytest.raises(zz._R55RunRefused) as ei:
+        _run_product(
+            routine_input, out, "active", sample=two_phase, decide=decide
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_DISK
+    assert ei.value.record["publication"]["fits"] is False
+    assert ei.value.record["publication"]["manifest"] is False
+    assert not (out / "mosaic_grid.fits").exists()
+    assert not (out / "zegrid_manifest.json").exists()
+
+
+def test_malformed_injected_product_checkpoint_refuses(routine_input, tmp_path):
+    out = tmp_path / "refused_malformed"
+    decide = _force_k3_decide(zz._r55_active_decide)
+    calls = {"n": 0}
+
+    def malformed(_root):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _facts(WITNESS_AVAILABLE_BYTES, disk_free=100 * GIB)
+        facts = _facts(WITNESS_AVAILABLE_BYTES, disk_free=100 * GIB)
+        facts["host"]["raw_available_bytes"] = True
+        return facts
+
+    with pytest.raises(zz._R55RunRefused) as ei:
+        _run_product(
+            routine_input, out, "active", sample=malformed, decide=decide
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+    assert "malformed RUN checkpoint" in ei.value.detail
+    assert not (out / "zegrid_manifest.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Import laziness
+# ---------------------------------------------------------------------------
+
+
+def _import_laziness_script() -> str:
+    return (
+        "import sys\n"
+        "import zemosaic.core.zegrid.runtime_control as rc\n"
+        "import zemosaic.zemosaic_zegrid_mode as zz\n"
+        "assert 'cupy' not in sys.modules, 'cupy imported on the CPU path'\n"
+        "assert 'cupy.cuda' not in sys.modules, 'cupy.cuda imported'\n"
+        "assert rc.RUN_MAX_SAMPLE_INTERVAL_S == 5.0\n"
+        "print('LAZY_OK')\n"
+    )
+
+
+def test_cpu_run_control_import_is_lazy():
+    import os
+
+    env = dict(os.environ)
+    src = str(REPO_ROOT / "src")
+    env["PYTHONPATH"] = (
+        src + os.pathsep + env.get("PYTHONPATH", "")
+        if env.get("PYTHONPATH") else src
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", _import_laziness_script()],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "LAZY_OK" in proc.stdout
+
+
+def test_no_top_level_cupy_import_in_new_module():
+    import ast
+
+    tree = ast.parse(
+        (REPO_ROOT / "src/zemosaic/core/zegrid/runtime_control.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [getattr(node, "module", "") or ""]
+            )
+            assert not any(
+                n == "cupy" or n.startswith("cupy.") for n in names
+            )

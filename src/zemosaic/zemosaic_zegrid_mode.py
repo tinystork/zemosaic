@@ -105,6 +105,7 @@ from .core.zegrid import parallel as zpar
 from .core.zegrid import photometric as zphot
 from .core.zegrid import ram_contract as rcontract
 from .core.zegrid import resource_envelope as renv
+from .core.zegrid import runtime_control as zrt
 from .core.zegrid import scheduler as zsched
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
@@ -5134,6 +5135,334 @@ def _r55_active_execution(bundle, mapping) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R55-E1 — CPU RUN checkpoints, deterministic waves and telemetry.
+# Active CPU is the ONLY path partitioned into waves. Legacy/observe keep the
+# whole-batch executor untouched.
+# ---------------------------------------------------------------------------
+
+_R55E1_RUN_MISSION = "ZM-ZEGRID-R55-E1-RUN-CHECKPOINTS-20261023"
+_R55E1_RUN_STAGE = "run"
+_R55E1_UNAVAILABLE_SHRINKS = (
+    {
+        "step": "prefetch_units",
+        "available": False,
+        "reason": "E1_PREFETCH_FROZEN_ZERO",
+        "detail": (
+            "E1 keeps prefetch_units=0 by contract; E2 owns producer/consumer "
+            "prefetch execution"
+        ),
+    },
+    {
+        "step": "backend",
+        "available": False,
+        "reason": "E1_BACKEND_FROZEN_CPU",
+        "detail": (
+            "E1 keeps backend=cpu by contract; GPU selection/VRAM rungs are "
+            "out of scope"
+        ),
+    },
+)
+
+
+class _R55RunRefused(RuntimeError):
+    """A RUN checkpoint refused BEFORE the next wave (fail closed)."""
+
+    def __init__(self, reason_code, detail, *, record):
+        super().__init__(f"{reason_code}: {detail}")
+        self.reason_code = str(reason_code)
+        self.detail = str(detail)
+        self.record = dict(record)
+
+
+def _r55_run_disk_root(cache_root, output_dir) -> Path:
+    return Path(cache_root) if cache_root is not None else Path(output_dir)
+
+
+def _r55_run_checkpoint_sample(disk_root):
+    """One fresh RUN checkpoint fact set (strict 90 % host + disk + optional)."""
+    return zrt.collect_run_facts(
+        root=disk_root, available_fn=available_memory_bytes
+    )
+
+
+def _r55_sample_pressure(disk_root):
+    """Lightweight in-wave pressure sample (never a decision by itself)."""
+    return zrt.collect_run_facts(root=disk_root, include_diagnostics=False)
+
+
+def _r55_active_run_context(
+    decision, candidate, *, units_total, raw, budget, disk_free
+):
+    """Rebind the owning scheduler context to fresh RUN facts.
+
+    ``units_total`` stays the FROZEN active-unit count (the scheduler context
+    identity must remain exactly the accepted one). The remaining-unit
+    projection is recorded and enforced by the wave bound, not by mutating the
+    frozen identity.
+    """
+    base = _r55_active_shrink_context(decision, candidate)
+    return replace(
+        base,
+        units_total=int(units_total),
+        raw_available_bytes=int(raw),
+        factor_num=int(rcontract.ADMIT_FACTOR_NUM),
+        factor_den=int(rcontract.ADMIT_FACTOR_DEN),
+        budget_bytes=int(budget),
+        disk_free_bytes=int(disk_free),
+    )
+
+
+def _r55_run_checkpoint(
+    *, decision, candidate, mapping, bundle, remaining_units, wave_index, facts
+):
+    """Mandatory fresh checkpoint before one wave.
+
+    The current candidate is an UPPER BOUND. Corrections are only the
+    scheduler-produced adjacent shrink steps in the fixed global order
+    ``prefetch -> workers -> K -> tile -> backend``. E1 records the frozen
+    prefetch/backend endpoints as unavailable instead of inventing them.
+    """
+    try:
+        facts = zrt.validate_checkpoint_facts(facts)
+    except zrt.RuntimeControlError as exc:
+        raise _R55RunRefused(
+            renv.REASON_REFUSE_HOST_RAM,
+            f"malformed RUN checkpoint facts: {exc}",
+            record={
+                "schema": zrt.RUN_CONTROL_SCHEMA,
+                "status": "refused",
+                "reason_code": renv.REASON_REFUSE_HOST_RAM,
+                "detail": f"malformed RUN checkpoint facts: {exc}",
+                "wave_index": int(wave_index),
+                "remaining_units": int(max(0, remaining_units)),
+                "shrink_steps": [],
+                "unavailable_shrinks": [dict(x) for x in _R55E1_UNAVAILABLE_SHRINKS],
+            },
+        ) from exc
+    raw = int(facts["host"]["raw_available_bytes"])
+    budget = int(facts["host"]["budget_bytes"])
+    disk_free = int(facts["disk"]["free_bytes"])
+    remaining_units = zrt.strict_int(
+        remaining_units, "remaining_units", minimum=0
+    )
+    # The frozen identity (layout/cells/frames/halo/rank) must not be mutated:
+    # keep the accepted active-unit total so the context stays valid. The wave
+    # itself is bounded by K and by the actual remaining task count.
+    ctx_units = max(1, len(decision.facts["cell_ids"]))
+    ctx = _r55_active_run_context(
+        decision,
+        candidate,
+        units_total=ctx_units,
+        raw=raw,
+        budget=budget,
+        disk_free=disk_free,
+    )
+
+    def _record(status, chosen_candidate, chosen_mapping, steps, changed):
+        return {
+            "schema": zrt.RUN_CONTROL_SCHEMA,
+            "stage": _R55E1_RUN_STAGE,
+            "wave_index": int(wave_index),
+            "status": str(status),
+            "remaining_units": int(remaining_units),
+            "changed": bool(changed),
+            "host": {
+                "raw_available_bytes": int(raw),
+                "budget_bytes": int(budget),
+                "factor_num": int(rcontract.ADMIT_FACTOR_NUM),
+                "factor_den": int(rcontract.ADMIT_FACTOR_DEN),
+            },
+            "disk": {"free_bytes": int(disk_free)},
+            "candidate": zsched.active_candidate_tuple(chosen_candidate),
+            "mapping": dict(chosen_mapping),
+            "shrink_steps": [dict(step) for step in steps],
+            "unavailable_shrinks": [
+                dict(x) for x in _R55E1_UNAVAILABLE_SHRINKS
+            ],
+        }
+
+    def _deterministic(record):
+        return {
+            key: record[key]
+            for key in (
+                "schema",
+                "stage",
+                "wave_index",
+                "status",
+                "remaining_units",
+                "changed",
+                "host",
+                "candidate",
+                "mapping",
+                "shrink_steps",
+                "unavailable_shrinks",
+            )
+        }
+
+    # Fast path: the accepted candidate still fits the fresh 90 % budget and the
+    # already-admitted product envelope still fits too. No mapping change.
+    try:
+        materialized = zsched.materialize_active_candidate(ctx, candidate)
+    except (zsched.SchedulerError, rcontract.RamContractError) as exc:
+        raise _R55RunRefused(
+            renv.REASON_INTERNAL_ERROR,
+            f"cannot materialize the current RUN candidate: {exc}",
+            record=_record("refused", candidate, mapping, [], False),
+        ) from exc
+    if (
+        materialized.feasible
+        and int(materialized.disk_bytes) <= int(disk_free)
+        and int(bundle.envelope.aggregate_bytes) <= int(budget)
+    ):
+        record = _record("accepted", candidate, mapping, [], False)
+        return {
+            "record": record,
+            "deterministic_record": _deterministic(record),
+            "bundle": bundle,
+            "candidate": candidate,
+            "mapping": mapping,
+        }
+
+    examined = []
+    saw_disk = False
+    current = candidate
+    while True:
+        step_name, nxt = zsched.next_shrink(current, ctx)
+        if step_name is None or nxt is None:
+            reason = (
+                renv.REASON_REFUSE_DISK
+                if saw_disk
+                else renv.REASON_REFUSE_HOST_RAM
+            )
+            detail = (
+                "no feasible adjacent CPU shrink remains for RUN wave "
+                f"{wave_index} (remaining_units={remaining_units}, raw={raw}, "
+                f"budget={budget}, disk_free={disk_free})"
+            )
+            record = _record("refused", candidate, mapping, examined, False)
+            record["reason_code"] = reason
+            record["detail"] = detail
+            record["last_candidate"] = zsched.active_candidate_tuple(current)
+            raise _R55RunRefused(reason, detail, record=record)
+        try:
+            zsched.assert_shrink_only(current, nxt)
+            materialized = zsched.materialize_active_candidate(ctx, nxt)
+        except (zsched.SchedulerError, rcontract.RamContractError) as exc:
+            reason = renv.REASON_INTERNAL_ERROR
+            detail = f"scheduler could not materialize an adjacent shrink: {exc}"
+            record = _record("refused", candidate, mapping, examined, False)
+            record["reason_code"] = reason
+            record["detail"] = detail
+            record["last_candidate"] = zsched.active_candidate_tuple(current)
+            raise _R55RunRefused(reason, detail, record=record) from exc
+        entry = {
+            "step": step_name,
+            "from": zsched.active_candidate_tuple(current),
+            "to": zsched.active_candidate_tuple(materialized),
+            "accepted": False,
+            "reason_code": materialized.reason_code,
+            "detail": materialized.infeasible_reason,
+            "projections": {
+                "host_peak_bytes": int(materialized.host_peak_bytes),
+                "disk_bytes": int(materialized.disk_bytes),
+                "device_peak_bytes": int(materialized.device_peak_bytes),
+            },
+        }
+        if materialized.reason_code == renv.REASON_REFUSE_DISK:
+            saw_disk = True
+        disk_ok = int(materialized.disk_bytes) <= int(disk_free)
+        if not disk_ok:
+            saw_disk = True
+            entry["reason_code"] = renv.REASON_REFUSE_DISK
+            entry["detail"] = (
+                f"disk residency {materialized.disk_bytes} B > observed free "
+                f"{disk_free} B"
+            )
+        if materialized.feasible and disk_ok:
+            try:
+                trial_mapping = zsched.active_mapping_for_candidate(
+                    materialized,
+                    tile_ladder=tuple(
+                        int(t) for t in CPU_STREAMING_TILE_LADDER
+                    ),
+                    workers_ladder=tuple(
+                        int(w) for w in zsched.WORKERS_LADDER
+                    ),
+                )
+                trial_bundle = _r55_active_apply(
+                    bundle,
+                    mapping=trial_mapping,
+                    facts=decision.facts,
+                    plan_raw_available_bytes=raw,
+                    plan_factor_num=rcontract.ADMIT_FACTOR_NUM,
+                    plan_factor_den=rcontract.ADMIT_FACTOR_DEN,
+                    plan_budget_bytes=budget,
+                    stage=f"run_wave_{wave_index}",
+                )
+            except (zsched.SchedulerError, rcontract.RamContractError) as exc:
+                entry["reason_code"] = renv.REASON_INTERNAL_ERROR
+                entry["detail"] = (
+                    "product envelope replay failed for the scheduler shrink: "
+                    f"{exc}"
+                )
+            else:
+                if trial_bundle.envelope.aggregate_bytes <= budget:
+                    entry["accepted"] = True
+                    entry["aggregate_bytes"] = int(
+                        trial_bundle.envelope.aggregate_bytes
+                    )
+                    examined.append(entry)
+                    record = _record(
+                        "accepted", materialized, trial_mapping, examined, True
+                    )
+                    return {
+                        "record": record,
+                        "deterministic_record": _deterministic(record),
+                        "bundle": trial_bundle,
+                        "candidate": materialized,
+                        "mapping": trial_mapping,
+                    }
+                entry["reason_code"] = renv.REASON_REFUSE_HOST_RAM
+                entry["detail"] = (
+                    "product aggregate "
+                    f"{trial_bundle.envelope.aggregate_bytes} B > RUN budget "
+                    f"{budget} B"
+                )
+        examined.append(entry)
+        current = materialized
+
+
+def _r55_merge_wave_meta(metas, *, total_tasks, wave_count) -> dict:
+    executors = []
+    fallback_reasons = []
+    for meta in metas:
+        kind = str(meta.get("executor", "serial"))
+        if kind not in executors:
+            executors.append(kind)
+        if meta.get("fallback_reason"):
+            fallback_reasons.append(str(meta["fallback_reason"]))
+    seconds = sum(float(meta.get("seconds", 0.0)) for meta in metas)
+    return {
+        "executor": (
+            "wave:" + "+".join(executors) if executors else "serial"
+        ),
+        "wave_executors": list(executors),
+        "parent_daemon": any(bool(meta.get("parent_daemon")) for meta in metas),
+        "workers": max(
+            (int(meta.get("workers", 1)) for meta in metas), default=1
+        ),
+        "tasks": int(total_tasks),
+        "fallback": any(bool(meta.get("fallback")) for meta in metas),
+        "fallback_reason": (
+            "; ".join(fallback_reasons) if fallback_reasons else None
+        ),
+        "seconds": float(seconds),
+        "seconds_per_unit": float(seconds) / max(1, int(total_tasks)),
+        "waves": int(wave_count),
+    }
+
+
 def _r55_build_active_block(
     *,
     plan_set,
@@ -5146,6 +5475,7 @@ def _r55_build_active_block(
     preflight_trail,
     launch_trail,
     status,
+    run=None,
 ) -> dict:
     """Deterministic active manifest block (no fabricated observed metric).
 
@@ -5174,7 +5504,7 @@ def _r55_build_active_block(
         None if launch_admission is None
         else _r55_admission_dict(launch_admission)
     )
-    return zsched.active_manifest_dict(
+    block = zsched.active_manifest_dict(
         plan_set,
         mapping=mapping,
         status=status,
@@ -5192,15 +5522,24 @@ def _r55_build_active_block(
         plan_hash=final_hash,
         plan_hash_schema=zsched.ACTIVE_FINAL_PLAN_SCHEMA,
         note=(
-            "R55-D2 active: a CPU plan was preflight-admitted BEFORE the gauge "
-            "for zero-gauge refusals, then freshly revalidated at the 90 % "
-            "launch ceiling immediately before the stack. Pressure corrections "
-            "are scheduler-produced shrink-only CPU steps on the frozen "
-            "identity; PLAN/ADMIT observations and the rebound final envelope "
-            "are recorded truthfully. No observed metric is fabricated and no "
-            "second unreported plan exists."
+            "R55-D2/E1 active: a CPU plan was preflight-admitted BEFORE the "
+            "gauge for zero-gauge refusals, then freshly revalidated at the "
+            "90 % launch ceiling immediately before the stack. RUN waves are "
+            "deterministic contiguous slices bounded by the accepted K; a "
+            "mandatory fresh 90 % checkpoint precedes every wave. Pressure "
+            "corrections are scheduler-produced shrink-only CPU steps on the "
+            "frozen identity; PLAN/ADMIT/RUN observations and the rebound "
+            "final envelope are recorded truthfully. The deterministic RUN "
+            "decision structure is separated from observational telemetry "
+            "(wall/RSS/cgroup/IO/disk free). No observed metric is fabricated "
+            "and no second unreported plan exists."
         ),
     )
+    if run is not None:
+        run_payload = dict(run)
+        block["run"] = run_payload
+        block["run_hash"] = zrt.sha256_payload(run_payload)
+    return block
 
 
 def _run_single(
@@ -6198,7 +6537,8 @@ def _run_single(
         )
 
     def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt,
-                        tasks=None, workers=None, cache_workers=None):
+                        tasks=None, workers=None, cache_workers=None,
+                        progress_callback=None):
         """Run the WHOLE per-cell batch once; returns (results, meta).
 
         ``gpu_attempt=True`` disables pmap's SAME-config serial retry (serial_fallback
@@ -6222,17 +6562,333 @@ def _run_single(
                      global_reference_frame_id, tile_size, _cache_workers)
         if _r40_coords_by_cell is not None:
             _initargs = _initargs + (_r40_coords_by_cell,)
+        _progress = (
+            _cell_progress_for(_tasks)
+            if progress_callback is None else progress_callback
+        )
         _res = zpar.pmap(
             _stack_cell, _tasks, workers=_workers,
-            progress_callback=_cell_progress_for(_tasks), emit=_emit_live, meta=_meta,
+            progress_callback=_progress, emit=_emit_live, meta=_meta,
             initializer=_init_stack_worker,
             initargs=_initargs,
             serial_fallback=not gpu_attempt,
         )
         return _res, _meta
 
+    def _run_r55_active_cpu_waves(*, science_cfg, start_bundle,
+                                  start_candidate, start_mapping):
+        """E1: deterministic bounded waves + a fresh checkpoint before EACH.
+
+        Only the active CPU path reaches this closure. Legacy/observe keep the
+        whole-batch executor. Canonical task/result order is preserved because
+        waves are contiguous slices of the canonical task list.
+        """
+        disk_root = _r55_run_disk_root(cache_root, output_dir)
+        bundle = start_bundle
+        candidate = start_candidate
+        mapping = start_mapping
+        all_tasks = list(start_bundle.cell_tasks)
+        total_tasks = len(all_tasks)
+        canonical_cids = [t[0].cell_id for t in all_tasks]
+        offset = 0
+        wave_index = 0
+        results_local = []
+        metas = []
+        wave_records = []
+        wave_telemetry = []
+        checkpoints = []
+        deterministic_checkpoints = []
+        shrink_count = 0
+        run_t0 = time.perf_counter()
+
+        def _wave_progress(base_offset):
+            def _cb(done, _total):
+                idx = int(base_offset) + int(done)
+                cid = (
+                    canonical_cids[idx - 1]
+                    if 0 < idx <= len(canonical_cids) else None
+                )
+                _stack_rep.progress(idx, item_id=cid)
+            return _cb
+
+        while offset < total_tasks:
+            remaining_units = sum(
+                1 for t in all_tasks[offset:] if t[4] is not None
+            )
+            facts = _r55_run_checkpoint_sample(disk_root)
+            try:
+                checkpoint = _r55_run_checkpoint(
+                    decision=_r55_active_decision,
+                    candidate=candidate,
+                    mapping=mapping,
+                    bundle=bundle,
+                    remaining_units=remaining_units,
+                    wave_index=wave_index,
+                    facts=facts,
+                )
+            except _R55RunRefused as exc:
+                cleanup = []
+                for task in all_tasks[:offset]:
+                    if task[4] is None:
+                        continue
+                    cache_dir = Path(task[3])
+                    existed = bool(cache_dir.exists())
+                    removed = bool(_safe_rmtree(task[3], None))
+                    cleanup.append(
+                        {
+                            "cell_id": str(task[0].cell_id),
+                            "existed": bool(existed),
+                            "removed": bool(removed),
+                        }
+                    )
+                exc.record["cleanup"] = cleanup
+                exc.record["waves_completed"] = int(wave_index)
+                exc.record["publication"] = {
+                    "fits": False,
+                    "manifest": False,
+                    "assembly": False,
+                }
+                exc.record["telemetry"] = zrt.build_run_telemetry(
+                    waves=wave_telemetry,
+                    checkpoints=checkpoints,
+                    shrink_count=shrink_count,
+                    refusal=exc.record,
+                    parent_end=zrt.read_parent_memory(),
+                )
+                _emit(
+                    "ZeGrid: R55-E1 RUN REFUSED before wave "
+                    f"{wave_index} — {exc.reason_code}: {exc.detail}. No FITS, "
+                    "manifest or science publication; completed per-cell temp "
+                    f"outputs cleaned best-effort ({len(cleanup)} task(s)).",
+                    lvl="ERROR", callback=progress_callback,
+                )
+                raise
+
+            bundle = checkpoint["bundle"]
+            candidate = checkpoint["candidate"]
+            mapping = checkpoint["mapping"]
+            record = checkpoint["record"]
+            checkpoints.append(record)
+            deterministic_checkpoints.append(
+                checkpoint["deterministic_record"]
+            )
+            if record["changed"]:
+                shrink_count += sum(
+                    1 for step in record["shrink_steps"] if step["accepted"]
+                )
+
+            units_bound = int(mapping["units_in_flight"])
+            start, end = zrt.next_wave_bound(
+                offset, total_tasks, units_bound
+            )
+            wave_tasks = bundle.cell_tasks[start:end]
+            wave_units = int(len(wave_tasks))
+            latch = zrt.PressureLatch()
+            # Optional, bounded and observational: only a genuinely concurrent
+            # wave needs an in-wave monitor. It never mutates/kills a unit and
+            # is always joined before the wave returns.
+            sampler = (
+                zrt.RunSampler(
+                    lambda: _r55_sample_pressure(disk_root), latch=latch
+                )
+                if (wave_units > 1 and units_bound > 1)
+                else None
+            )
+            sampler_start_error = None
+            if sampler is not None:
+                try:
+                    sampler.start()
+                except Exception as exc:  # noqa: BLE001 - optional diagnostic
+                    sampler_start_error = f"{type(exc).__name__}: {exc}"
+            wave_t0 = time.perf_counter()
+            try:
+                wave_results, wave_meta = _run_cell_batch(
+                    science_cfg,
+                    int(bundle.cpu_streaming_tile),
+                    gpu_attempt=False,
+                    tasks=wave_tasks,
+                    workers=units_bound,
+                    cache_workers=int(bundle.cache_workers_per_cell),
+                    progress_callback=_wave_progress(start),
+                )
+            finally:
+                if sampler is not None:
+                    sampler.stop()
+                    sampler.join(
+                        timeout=float(zrt.RUN_MAX_SAMPLE_INTERVAL_S)
+                    )
+            wave_wall = time.perf_counter() - wave_t0
+            results_local.extend(wave_results)
+            metas.append(wave_meta)
+            remaining_after = sum(
+                1 for t in all_tasks[end:] if t[4] is not None
+            )
+            sampler_dict = (
+                None if sampler is None else sampler.to_dict()
+            )
+            if sampler_start_error is not None:
+                sampler_dict = {"start_error": sampler_start_error}
+            wave_telemetry.append(
+                zrt.build_wave_record(
+                    index=wave_index,
+                    offset=start,
+                    wave_units=wave_units,
+                    total_tasks=total_tasks,
+                    remaining_units_after=remaining_after,
+                    candidate=record["candidate"],
+                    mapping=record["mapping"],
+                    facts={**facts, "remaining_units": remaining_units},
+                    shrink_steps=record["shrink_steps"],
+                    latched=latch.peek(),
+                    results=wave_results,
+                    wall_s=wave_wall,
+                    parent=facts.get("parent"),
+                    cgroup=facts.get("cgroup"),
+                    sampler=sampler_dict,
+                )
+            )
+            wave_records.append(
+                {
+                    "index": int(wave_index),
+                    "offset": int(start),
+                    "wave_units": int(wave_units),
+                    "units_remaining_after": int(remaining_after),
+                    "changed": bool(record["changed"]),
+                    "candidate": dict(record["candidate"]),
+                    "mapping": dict(record["mapping"]),
+                }
+            )
+            offset = end
+            wave_index += 1
+
+        total_run_wall = time.perf_counter() - run_t0
+        meta = _r55_merge_wave_meta(
+            metas, total_tasks=total_tasks, wave_count=wave_index
+        )
+        meta["seconds"] = float(total_run_wall)
+        meta["seconds_per_unit"] = float(total_run_wall) / max(1, total_tasks)
+        run_block = {
+            "schema": zrt.RUN_DECISION_SCHEMA,
+            "mission": _R55E1_RUN_MISSION,
+            "policy": {
+                "wave_partition": "canonical_contiguous_slices",
+                "wave_bound": "units_in_flight",
+                "checkpoint": "mandatory_before_every_wave",
+                "run_budget": {
+                    "factor_num": int(rcontract.ADMIT_FACTOR_NUM),
+                    "factor_den": int(rcontract.ADMIT_FACTOR_DEN),
+                },
+                "shrink_order": [
+                    "prefetch_units",
+                    "workers_per_unit",
+                    "units_in_flight",
+                    "tile_px",
+                    "backend",
+                ],
+                "prefetch_units": 0,
+                "backend": "cpu",
+                "recovery_growth": "forbidden",
+                "in_wave_sampler_max_interval_s": float(
+                    zrt.RUN_MAX_SAMPLE_INTERVAL_S
+                ),
+            },
+            "checkpoints": deterministic_checkpoints,
+            "waves": wave_records,
+            "final_execution": _r55_active_execution(bundle, mapping),
+            "shrink_count": int(shrink_count),
+            "examined_shrink_steps": int(
+                sum(len(cp["shrink_steps"]) for cp in deterministic_checkpoints)
+            ),
+            "refusal_count": 0,
+            "note": (
+                "Deterministic RUN decision structure only. Exact volatile "
+                "observations (wall/RSS/cgroup/IO/disk free) live in "
+                "r55_run_telemetry and never enter a deterministic plan hash."
+            ),
+        }
+        telemetry = zrt.build_run_telemetry(
+            waves=wave_telemetry,
+            checkpoints=checkpoints,
+            shrink_count=shrink_count,
+            refusal=None,
+            parent_end=zrt.read_parent_memory(),
+            deterministic_ref=zrt.sha256_payload(run_block),
+        )
+        return (
+            results_local,
+            meta,
+            run_block,
+            telemetry,
+            bundle,
+            candidate,
+            mapping,
+            shrink_count,
+            wave_index,
+        )
+
     runtime_gpu_fallback = None
-    if gpu_used:
+    _r55_run_block = None
+    _r55_run_telemetry = None
+    _r55_run_wave_count = 0
+    _r55_run_shrink_count = 0
+    if scheduler_mode == zsched.MODE_ACTIVE and _r55_active_decision is not None:
+        (
+            results,
+            per_cell_meta,
+            _r55_run_block,
+            _r55_run_telemetry,
+            _r55_active_bundle,
+            _r55_active_candidate,
+            _r55_active_mapping,
+            _r55_run_shrink_count,
+            _r55_run_wave_count,
+        ) = _run_r55_active_cpu_waves(
+            science_cfg=science_config,
+            start_bundle=_final,
+            start_candidate=_r55_active_candidate,
+            start_mapping=_r55_active_mapping,
+        )
+        # The RUN-final bundle is the ONLY source for assembly, diagnostics and
+        # the manifest. A changed mapping applied only to the NEXT wave.
+        _final = _r55_active_bundle
+        layout = _final.layout
+        footprints = _final.footprints
+        cell_ctxs = _final.cell_ctxs
+        nx, ny = int(layout["nx"]), int(layout["ny"])
+        cpu_streaming = _final.cpu_streaming
+        _cs_selected = cpu_streaming.get("selected_tile_size")
+        cpu_streaming_tile = int(_final.cpu_streaming_tile)
+        cell_specs = _final.cell_specs
+        cell_tasks = _final.cell_tasks
+        chosen_mode = _final.chosen_mode
+        cells_in_flight = int(_final.cells_in_flight)
+        cache_workers_per_cell = int(_final.cache_workers_per_cell)
+        per_cell_footprint = int(_final.per_cell_footprint)
+        gpu_tile_size = _final.gpu_tile_size
+        gpu_streaming_tile = _final.gpu_streaming_tile
+        gpu_streaming_host_peak_bytes = _final.gpu_streaming_host_peak_bytes
+        cpu_fallback_info = dict(_final.cpu_fallback_info)
+        cpu_fallback_plan = _final.cpu_fallback_plan
+        cpu_fallback_tasks = _final.cpu_fallback_tasks
+        cache_build_workers = int(_final.cache_build_workers)
+        total_cells = int(nx * ny)
+        per_cell_diagnostics["mode"] = chosen_mode
+        per_cell_diagnostics["cells_in_flight"] = int(cells_in_flight)
+        per_cell_diagnostics["cache_workers_per_cell"] = int(
+            cache_workers_per_cell
+        )
+        per_cell_diagnostics["cpu_streaming_tile"] = int(cpu_streaming_tile)
+        per_cell_diagnostics["cpu_streaming"] = dict(cpu_streaming)
+        per_cell_diagnostics["cpu_fallback_plan"] = dict(cpu_fallback_info)
+        per_cell_diagnostics["ram_contract"] = _ram_contract_diagnostics(
+            _adm, _final, _initial_bundle
+        )
+        per_cell_diagnostics["r55_run_waves"] = int(_r55_run_wave_count)
+        per_cell_diagnostics["r55_run_shrink_steps"] = int(
+            _r55_run_shrink_count
+        )
+        task_cids = [t[0].cell_id for t in cell_tasks]
+    elif gpu_used:
         try:
             results, per_cell_meta = _run_cell_batch(
                 science_config, gpu_tile_size, gpu_attempt=True
@@ -6649,6 +7305,7 @@ def _run_single(
             preflight_trail=_r55_active_preflight_trail,
             launch_trail=_r55_active_launch_trail,
             status=("executed" if _r55_active_ok else "partial"),
+            run=_r55_run_block,
         )
 
     # R55-C rework-2: the observe block was built from the SELECTED backend.
@@ -6686,6 +7343,7 @@ def _run_single(
         ),
         halo_provenance=_halo_provenance_pass,
         r55_scheduler=_r55_scheduler_block,
+        r55_run_telemetry=_r55_run_telemetry,
     )
 
     _write_run_log(
@@ -7058,6 +7716,7 @@ def _write_outputs(
     scientific_fits_suffix=None,
     halo_provenance=None,
     r55_scheduler=None,
+    r55_run_telemetry=None,
 ):
     output_dir = Path(output_dir)
     # ZM-ZEGRID-R18: use the finished (aesthetic) science when provided (bit-equal
@@ -7450,6 +8109,12 @@ def _write_outputs(
         # ZM-ZEGRID-R55-B: ADDITIVE observe-only scheduler block. ``None`` in
         # legacy mode -> the exact pre-R55 manifest shape is preserved.
         **({"r55_scheduler": dict(r55_scheduler)} if r55_scheduler is not None else {}),
+        # ZM-ZEGRID-R55-E1: ADDITIVE observational RUN telemetry. ``None`` in
+        # legacy/observe -> the exact pre-E1 manifest shape is preserved.
+        **(
+            {"r55_run_telemetry": dict(r55_run_telemetry)}
+            if r55_run_telemetry is not None else {}
+        ),
     }
     # ZM-ZEGRID-R40-B2-B: exactly ONE additive ``r40_diagnostic_capture`` manifest
     # block, produced by the accepted core (pre-existing fields canonical-identical
