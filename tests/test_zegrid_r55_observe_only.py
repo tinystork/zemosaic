@@ -105,6 +105,7 @@ def _manifest_block():
             components={"halo_band_bytes": 10, "retained_core_bytes": 100},
             units=1,
             units_in_flight=1,
+            overlaps_with=(re.PHASE_CELL_STACK_STREAM,),
         ),
         zs.PhaseRequest(
             phase=re.PHASE_EXPORT,
@@ -162,12 +163,37 @@ def test_manifest_has_one_envelope_per_required_phase_and_no_metrics():
         d["reason_code"] in re.REASON_CODES for d in block["decisions"]
     )
     assert block["margin"]["applied_once_at"] == "aggregate"
+    stack_env = block["phases"]["cell_stack_stream"]["envelope"]
+    assembly_env = block["phases"]["assembly"]["envelope"]
+    assert stack_env["overlaps_with"] == ["assembly"]
+    assert assembly_env["overlaps_with"] == ["cell_stack_stream"]
+    stack_peak = stack_env["estimate"]["peak_bytes"]
+    assembly_peak = assembly_env["estimate"]["peak_bytes"]
+    raw = block["aggregate_host_peak_bytes_raw"]
+    assert raw == max(
+        block["phases"]["gauge"]["envelope"]["estimate"]["peak_bytes"],
+        block["phases"]["cache_build"]["envelope"]["estimate"]["peak_bytes"],
+        stack_peak + assembly_peak,
+        block["phases"]["export"]["envelope"]["estimate"]["peak_bytes"],
+    )
+    assert block["aggregate_host_peak_bytes"] == re.ceil_margin_div(raw, 15, 100)
+    assert stack_peak == stack_env["estimate"]["subtotal_bytes"]
+    assert assembly_peak == assembly_env["estimate"]["subtotal_bytes"]
     # Predicted peaks only: no RSS/VRAM/disk "observed" keys exist.
     text = json.dumps(block, sort_keys=True)
     for forbidden in ("observed_rss", "observed_vram", "observed_peak", "throughput_units_per_s"):
         assert forbidden not in text
     # Deterministic JSON serialization.
     assert json.dumps(block, sort_keys=True) == json.dumps(_manifest_block(), sort_keys=True)
+
+
+def test_internal_error_block_uses_the_closed_reason_code():
+    block = zz._r55_observe_error_block(RuntimeError("synthetic failure"))
+    assert block["status"] == "error"
+    assert block["reason_code"] == re.REASON_INTERNAL_ERROR
+    assert block["reason_code"] in re.REASON_CODES
+    assert "observed_metrics" not in block
+    assert "plan_hash" not in block
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +314,22 @@ def test_legacy_and_observe_are_byte_identical_with_only_an_additive_block(
     }
     assert block["plan_hash"].startswith("sha256:")
     assert block["decisions"][0]["reason_code"] in re.REASON_CODES
+    stack_name = next(
+        p for p in block["phases"] if p in ("cell_stack_inmem", "cell_stack_stream")
+    )
+    stack_env = block["phases"][stack_name]["envelope"]
+    assembly_env = block["phases"]["assembly"]["envelope"]
+    assert stack_env["overlaps_with"] == ["assembly"]
+    assert assembly_env["overlaps_with"] == [stack_name]
+    assert block["aggregate_host_peak_bytes_raw"] >= (
+        stack_env["estimate"]["peak_bytes"] + assembly_env["estimate"]["peak_bytes"]
+    )
+    assert block["aggregate_host_peak_bytes"] == re.ceil_margin_div(
+        block["aggregate_host_peak_bytes_raw"], 15, 100
+    )
+    # Multi-cell retained cores are counted ONCE in the assembly envelope.
+    assert assembly_env["estimate"]["components"]["retained_core_bytes"] > 0
+    assert len(block["identity"]["cell_ids"]) > 1
 
     observe_without_block = dict(observe)
     observe_without_block.pop("r55_scheduler", None)
@@ -299,3 +341,30 @@ def test_legacy_and_observe_are_byte_identical_with_only_an_additive_block(
     # Structural science fields are preserved exactly.
     for key in ("complete_cells", "incomplete_cells", "coverage_pixels", "layout"):
         assert legacy[key] == observe_without_block[key]
+
+
+def test_generic_observe_error_is_contained_and_coded(routine_input, tmp_path, monkeypatch):
+    """A generic observe failure must not abort or alter legacy execution."""
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: WITNESS_AVAILABLE_BYTES)
+
+    def boom(**_kwargs):
+        raise RuntimeError("synthetic observe failure")
+
+    legacy_out = tmp_path / "legacy"
+    observe_out = tmp_path / "observe"
+    zz.run_zegrid_mode(
+        str(routine_input), str(legacy_out),
+        zegrid_halo_px=WITNESS_HALO_PX, zegrid_scheduler_mode="legacy",
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(zz, "_build_r55_observe_block", boom)
+        zz.run_zegrid_mode(
+            str(routine_input), str(observe_out),
+            zegrid_halo_px=WITNESS_HALO_PX, zegrid_scheduler_mode="observe",
+        )
+    for name in ("mosaic_grid.fits", "mosaic_grid_coverage.fits"):
+        assert _digest(legacy_out / name) == _digest(observe_out / name), name
+    block = json.loads((observe_out / "zegrid_manifest.json").read_text())["r55_scheduler"]
+    assert block["status"] == "error"
+    assert block["reason_code"] == re.REASON_INTERNAL_ERROR
+    assert "observed_metrics" not in block

@@ -55,7 +55,7 @@ def _ctx(**overrides):
     return zs.PlanContext(**data)
 
 
-def _requests():
+def _requests(phase=re.PHASE_CELL_STACK_STREAM):
     return (
         zs.PhaseRequest(
             phase=re.PHASE_GAUGE,
@@ -77,6 +77,7 @@ def _requests():
             },
             units=1,
             units_in_flight=1,
+            overlaps_with=(phase,),
         ),
         zs.PhaseRequest(
             phase=re.PHASE_EXPORT,
@@ -415,6 +416,196 @@ def test_gpu_backend_is_out_of_scope_and_fails_visibly():
 
 
 # ---------------------------------------------------------------------------
+# D1 — assembly is summed with the ACTIVE stack phase (one stack only)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "phase", [re.PHASE_CELL_STACK_STREAM, re.PHASE_CELL_STACK_INMEM]
+)
+def test_assembly_overlap_is_symmetric_and_summed(phase):
+    ctx = _ctx(phase=phase, per_unit_cache_bytes=0, per_unit_prefetch_bytes=0)
+    plan = zs.plan(ctx, phase_requests=_requests(phase))
+    stack = plan.phase_map()[phase]
+    assembly = plan.phase_map()[re.PHASE_ASSEMBLY]
+    # Symmetric closed-set pair, exactly one stack phase.
+    assert stack.overlaps_with == (re.PHASE_ASSEMBLY,)
+    assert assembly.overlaps_with == (phase,)
+    stack_peak = stack.estimate.peak_bytes
+    assembly_peak = assembly.estimate.peak_bytes
+    raw = plan.aggregate_host_peak_bytes_raw
+    assert raw >= stack_peak + assembly_peak
+    assert raw > max(stack_peak, assembly_peak)
+    # Margin applied ONCE at the aggregate; no phase peak contains it.
+    assert stack_peak == stack.estimate.subtotal_bytes
+    assert assembly_peak == assembly.estimate.subtotal_bytes
+    assert plan.aggregate_host_peak_bytes == re.ceil_margin_div(raw, 15, 100)
+
+
+def test_multi_cell_retained_core_is_counted_once_in_the_group():
+    import dataclasses
+
+    four_cells = 4 * 100 * MIB
+    reqs = list(_requests(re.PHASE_CELL_STACK_STREAM))
+    reqs[2] = dataclasses.replace(
+        reqs[2],
+        components={
+            "halo_band_bytes": 4 * MIB,
+            "retained_core_bytes": four_cells,
+        },
+    )
+    plan = zs.plan(_ctx(), phase_requests=tuple(reqs))
+    stack = plan.phase_map()[re.PHASE_CELL_STACK_STREAM]
+    assembly = plan.phase_map()[re.PHASE_ASSEMBLY]
+    assert assembly.estimate.components_dict()["retained_core_bytes"] == four_cells
+    assert plan.aggregate_host_peak_bytes_raw == (
+        stack.estimate.peak_bytes + four_cells + 4 * MIB
+    )
+
+
+def test_assembly_request_must_declare_the_active_stack_overlap():
+    import dataclasses
+
+    reqs = list(_requests())
+    reqs[2] = dataclasses.replace(reqs[2], overlaps_with=())
+    with pytest.raises(zs.SchedulerConfigError, match="assembly PhaseRequest"):
+        zs.plan(_ctx(), phase_requests=tuple(reqs))
+
+
+# ---------------------------------------------------------------------------
+# Strict integer public adapter boundary
+# ---------------------------------------------------------------------------
+
+def _adapter_kwargs(**overrides):
+    data = dict(
+        phase=re.PHASE_CELL_STACK_STREAM,
+        backend=re.BACKEND_CPU,
+        budget_bytes=(4 * 8 * GIB) // 5,
+        raw_available_bytes=8 * GIB,
+        factor_num=4,
+        factor_den=5,
+        cpu_logical=8,
+        units_total=4,
+        shared_bytes=340 * MIB,
+        per_unit_stack_bytes=200 * MIB,
+        per_unit_cache_bytes=10 * MIB,
+        per_unit_prefetch_bytes=10 * MIB,
+        disk_free_bytes=100 * GIB,
+        layout=(2, 2),
+        refinement_rank=4,
+        patch_hw=(300, 300),
+        halo_px=32,
+        channels=3,
+        n_frames=20,
+        phase_requests=_requests(),
+        cell_ids=("a", "b", "c", "d"),
+        frame_ids=("f0", "f1"),
+    )
+    data.update(overrides)
+    return data
+
+
+def test_strict_adapter_accepts_only_real_ints():
+    plan = zs.build_observe_plan(**_adapter_kwargs())
+    assert plan.chosen.units_in_flight >= 1
+
+
+_BAD_SCALARS = [
+    "budget_bytes",
+    "raw_available_bytes",
+    "factor_num",
+    "factor_den",
+    "cpu_logical",
+    "shared_bytes",
+    "per_unit_stack_bytes",
+    "per_unit_cache_bytes",
+    "per_unit_prefetch_bytes",
+    "disk_free_bytes",
+    "refinement_rank",
+    "halo_px",
+    "channels",
+    "n_frames",
+    "disk_fraction_num",
+    "disk_fraction_den",
+    "margin_num",
+    "margin_den",
+    "units_total",
+]
+
+
+@pytest.mark.parametrize("field", _BAD_SCALARS)
+@pytest.mark.parametrize("bad", [True, 64.0, "64"])
+def test_strict_adapter_rejects_non_int_scalars(field, bad):
+    kwargs = _adapter_kwargs(**{field: bad})
+    with pytest.raises(zs.SchedulerConfigError, match=field):
+        zs.build_observe_plan(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("budget_bytes", -1),
+        ("raw_available_bytes", -1),
+        ("cpu_logical", 0),
+        ("shared_bytes", -1),
+        ("per_unit_stack_bytes", 0),
+        ("per_unit_cache_bytes", -1),
+        ("per_unit_prefetch_bytes", -1),
+        ("disk_free_bytes", -1),
+        ("refinement_rank", -1),
+        ("halo_px", -1),
+        ("channels", 0),
+        ("n_frames", 0),
+        ("disk_fraction_num", 0),
+        ("disk_fraction_den", 0),
+        ("margin_num", -1),
+        ("margin_den", 0),
+        ("units_total", 0),
+    ],
+)
+def test_strict_adapter_rejects_negative_or_zero_where_invalid(field, bad):
+    with pytest.raises(zs.SchedulerConfigError, match=field):
+        zs.build_observe_plan(**_adapter_kwargs(**{field: bad}))
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("layout", (True, 2)),
+        ("layout", (2.0, 2)),
+        ("layout", ("2", 2)),
+        ("layout", (2,)),
+        ("layout", (2, 2, 2)),
+        ("layout", "22"),
+        ("patch_hw", (True, 10)),
+        ("patch_hw", (10.0, 10)),
+        ("patch_hw", ("10", 10)),
+        ("patch_hw", (10,)),
+        ("tile_ladder", (128.0, 64)),
+        ("tile_ladder", "128"),
+        ("tile_ladder", (True,)),
+        ("prefetch_ladder", (0.0,)),
+        ("prefetch_ladder", "01"),
+        ("prefetch_ladder", (True,)),
+        ("workers_ladder", (True,)),
+        ("workers_ladder", "1"),
+        ("workers_ladder", (0,)),
+        ("workers_cap", True),
+        ("workers_cap", 1.0),
+        ("workers_cap", "1"),
+        ("workers_cap", 0),
+        ("cell_ids", "abc"),
+        ("cell_ids", (1, 2)),
+        ("cell_ids", ("",)),
+        ("frame_ids", "abc"),
+        ("frame_ids", (1,)),
+    ],
+)
+def test_strict_adapter_rejects_malformed_sequences(field, bad):
+    with pytest.raises(zs.SchedulerConfigError, match=field.split("[")[0]):
+        zs.build_observe_plan(**_adapter_kwargs(**{field: bad}))
+
+
+# ---------------------------------------------------------------------------
 # Shrink-only API
 # ---------------------------------------------------------------------------
 
@@ -527,6 +718,7 @@ def test_frozen_identity_rejects_every_scientific_change():
 def test_reason_codes_are_unique_and_every_emission_is_closed():
     assert len(re.REASON_CODES) == len(set(re.REASON_CODES))
     assert all(code.startswith("R55_") for code in re.REASON_CODES)
+    assert re.REASON_INTERNAL_ERROR in re.REASON_CODES
     ctx = _ctx()
     for c in zs.enumerate_candidates(ctx):
         assert c.reason_code in re.REASON_CODES

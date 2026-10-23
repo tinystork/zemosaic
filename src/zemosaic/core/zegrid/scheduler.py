@@ -41,6 +41,7 @@ from .resource_envelope import (
     InvalidEnvelope,
     InvalidOverlap,
     AccountingEnvelope,
+    PHASE_ASSEMBLY,
     PHASE_CELL_STACK_INMEM,
     PHASE_CELL_STACK_STREAM,
     PHASE_GUI_PREVIEW,
@@ -519,19 +520,25 @@ def _validate_context(context: PlanContext) -> None:
     require_int(context.per_unit_cache_bytes, "per_unit_cache_bytes")
     require_int(context.per_unit_prefetch_bytes, "per_unit_prefetch_bytes")
     require_int(context.disk_free_bytes, "disk_free_bytes")
-    lx, ly = context.layout
-    if int(lx) <= 0 or int(ly) <= 0:
-        raise SchedulerConfigError(f"layout must be positive, got {context.layout!r}")
+    if isinstance(context.layout, (str, bytes)) or not isinstance(
+        context.layout, (tuple, list)
+    ) or len(context.layout) != 2:
+        raise SchedulerConfigError(f"layout must be two ints, got {context.layout!r}")
+    lx = require_int(context.layout[0], "layout[0]", minimum=1)
+    ly = require_int(context.layout[1], "layout[1]", minimum=1)
     require_int(context.refinement_rank, "refinement_rank")
     require_int(context.halo_px, "halo_px")
     require_int(context.channels, "channels", minimum=1)
     require_int(context.n_frames, "n_frames", minimum=1)
     if context.patch_hw is not None:
-        ph, pw = context.patch_hw
-        if int(ph) <= 0 or int(pw) <= 0:
+        if isinstance(context.patch_hw, (str, bytes)) or not isinstance(
+            context.patch_hw, (tuple, list)
+        ) or len(context.patch_hw) != 2:
             raise SchedulerConfigError(
-                f"patch_hw must be positive, got {context.patch_hw!r}"
+                f"patch_hw must be two ints, got {context.patch_hw!r}"
             )
+        require_int(context.patch_hw[0], "patch_hw[0]", minimum=1)
+        require_int(context.patch_hw[1], "patch_hw[1]", minimum=1)
     dfn = require_int(context.disk_fraction_num, "disk_fraction_num", minimum=1)
     dfd = require_int(context.disk_fraction_den, "disk_fraction_den", minimum=1)
     if dfn > dfd:
@@ -855,7 +862,10 @@ def _stack_envelope(context: PlanContext, candidate: Candidate) -> ResourceEnvel
             disk_bytes=int(candidate.disk_bytes),
             transfer_bytes=0,
         ),
-        overlaps_with=(),
+        # D1: the active stack phase is simultaneous with assembly (retained
+        # cores + halo). Exactly one stack phase exists, so the pair is declared
+        # symmetrically with the assembly PhaseRequest and never both stacks.
+        overlaps_with=(PHASE_ASSEMBLY,),
         identity=IdentityEnvelope(run_id=context.run_id, plan_hash="", pinned=bool(context.pinned)),
         reason_code=candidate.reason_code,
     )
@@ -940,6 +950,16 @@ def build_plan_set(
     if stacks:
         raise SchedulerConfigError(
             f"phase_requests must contain no cell_stack_* phase, got {stacks}"
+        )
+    # D1: assembly must declare the ACTIVE stack phase as a symmetric overlap.
+    # The stack envelope declares assembly in turn; validate_envelope_set then
+    # proves the pair. Only one stack phase exists in a plan.
+    assembly_req = next(r for r in requests if r.phase == PHASE_ASSEMBLY)
+    if tuple(assembly_req.overlaps_with) != (context.phase,):
+        raise SchedulerConfigError(
+            "the assembly PhaseRequest must declare overlaps_with="
+            f"({context.phase!r},) so simultaneous retained cores + active stack "
+            f"are summed, got {tuple(assembly_req.overlaps_with)!r}"
         )
 
     envelopes = [_request_envelope(context, r) for r in requests]
@@ -1066,6 +1086,57 @@ def plan(
     raise last
 
 
+def _strict_int(value, name: str, *, minimum: int = 0) -> int:
+    """Strict adapter-boundary integer check (no bool/float/string coercion)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SchedulerConfigError(
+            f"{name} must be an int, got {type(value).__name__}={value!r}"
+        )
+    if value < minimum:
+        raise SchedulerConfigError(f"{name} must be >= {minimum}, got {value}")
+    return int(value)
+
+
+def _strict_pair(value, name: str, *, positive: bool = False) -> tuple[int, int]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
+        raise SchedulerConfigError(
+            f"{name} must be a 2-sequence of ints, got {type(value).__name__}={value!r}"
+        )
+    if len(value) != 2:
+        raise SchedulerConfigError(f"{name} must have exactly 2 entries, got {value!r}")
+    pair = (
+        _strict_int(value[0], f"{name}[0]", minimum=(1 if positive else 0)),
+        _strict_int(value[1], f"{name}[1]", minimum=(1 if positive else 0)),
+    )
+    return pair
+
+
+def _strict_seq(value, name: str, *, minimum: int = 0) -> tuple[int, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
+        raise SchedulerConfigError(
+            f"{name} must be a sequence of ints, got {type(value).__name__}={value!r}"
+        )
+    return tuple(
+        _strict_int(item, f"{name}[{i}]", minimum=minimum)
+        for i, item in enumerate(value)
+    )
+
+
+def _strict_str_seq(value, name: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
+        raise SchedulerConfigError(
+            f"{name} must be a sequence of strings, got {type(value).__name__}={value!r}"
+        )
+    out = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str) or not item:
+            raise SchedulerConfigError(
+                f"{name}[{i}] must be a non-empty string, got {item!r}"
+            )
+        out.append(item)
+    return tuple(out)
+
+
 def build_observe_plan(
     *,
     phase: str,
@@ -1108,48 +1179,88 @@ def build_observe_plan(
     """Product adapter: build the PlanContext and choose a plan in one call."""
     if mode not in MODES:
         raise InvalidSchedulerMode(f"unknown plan mode {mode!r}")
-    cells = tuple(str(c) for c in cell_ids)
+    # Strict integer boundary: every numeric public argument is type-proved
+    # BEFORE any conversion. ``True``/``64.0``/``'64'`` must never silently
+    # become an int budget or tile.
+    strict_budget = _strict_int(budget_bytes, "budget_bytes")
+    strict_raw = _strict_int(raw_available_bytes, "raw_available_bytes", minimum=1)
+    strict_fnum = _strict_int(factor_num, "factor_num", minimum=1)
+    strict_fden = _strict_int(factor_den, "factor_den", minimum=1)
+    strict_cpu = _strict_int(cpu_logical, "cpu_logical", minimum=1)
+    strict_shared = _strict_int(shared_bytes, "shared_bytes")
+    strict_stack = _strict_int(per_unit_stack_bytes, "per_unit_stack_bytes", minimum=1)
+    strict_cache = _strict_int(per_unit_cache_bytes, "per_unit_cache_bytes")
+    strict_prefetch = _strict_int(per_unit_prefetch_bytes, "per_unit_prefetch_bytes")
+    strict_disk = _strict_int(disk_free_bytes, "disk_free_bytes")
+    strict_layout = _strict_pair(layout, "layout", positive=True)
+    strict_rank = _strict_int(refinement_rank, "refinement_rank")
+    strict_patch = (
+        None if patch_hw is None else _strict_pair(patch_hw, "patch_hw", positive=True)
+    )
+    strict_halo = _strict_int(halo_px, "halo_px")
+    strict_channels = _strict_int(channels, "channels", minimum=1)
+    strict_frames = _strict_int(n_frames, "n_frames", minimum=1)
+    strict_dfn = _strict_int(disk_fraction_num, "disk_fraction_num", minimum=1)
+    strict_dfd = _strict_int(disk_fraction_den, "disk_fraction_den", minimum=1)
+    strict_mnum = _strict_int(margin_num, "margin_num")
+    strict_mden = _strict_int(margin_den, "margin_den", minimum=1)
+    strict_tiles = _strict_seq(tile_ladder, "tile_ladder", minimum=1)
+    strict_prefetches = _strict_seq(prefetch_ladder, "prefetch_ladder", minimum=0)
+    strict_workers = _strict_seq(workers_ladder, "workers_ladder", minimum=1)
+    strict_cap = (
+        None if workers_cap is None else _strict_int(workers_cap, "workers_cap", minimum=1)
+    )
+    cells = _strict_str_seq(cell_ids, "cell_ids")
+    frames = _strict_str_seq(frame_ids, "frame_ids")
+    if not isinstance(observation_source, str) or not observation_source:
+        raise SchedulerConfigError("observation_source must be a non-empty string")
+    if not isinstance(run_id, str):
+        raise SchedulerConfigError(f"run_id must be a string, got {run_id!r}")
+    if not isinstance(pinned, bool):
+        raise SchedulerConfigError(f"pinned must be a bool, got {pinned!r}")
     if units_total is None:
         if not cells:
             raise SchedulerConfigError(
                 "units_total is required when cell_ids is not supplied"
             )
-        units_total = len(cells)
+        strict_units = len(cells)
+    else:
+        strict_units = _strict_int(units_total, "units_total", minimum=1)
     context = PlanContext(
         phase=phase,
         backend=backend,
-        budget_bytes=int(budget_bytes),
-        raw_available_bytes=int(raw_available_bytes),
-        factor_num=int(factor_num),
-        factor_den=int(factor_den),
-        cpu_logical=int(cpu_logical),
-        units_total=int(units_total),
-        shared_bytes=int(shared_bytes),
-        per_unit_stack_bytes=int(per_unit_stack_bytes),
-        per_unit_cache_bytes=int(per_unit_cache_bytes),
-        per_unit_prefetch_bytes=int(per_unit_prefetch_bytes),
-        disk_free_bytes=int(disk_free_bytes),
-        layout=tuple(int(v) for v in layout),
-        refinement_rank=int(refinement_rank),
-        patch_hw=(None if patch_hw is None else tuple(int(v) for v in patch_hw)),
-        halo_px=int(halo_px),
-        channels=int(channels),
-        n_frames=int(n_frames),
-        disk_fraction_num=int(disk_fraction_num),
-        disk_fraction_den=int(disk_fraction_den),
-        tile_ladder=tuple(int(t) for t in tile_ladder),
-        prefetch_ladder=tuple(int(p) for p in prefetch_ladder),
-        workers_ladder=tuple(int(w) for w in workers_ladder),
-        workers_cap=workers_cap,
-        margin_num=int(margin_num),
-        margin_den=int(margin_den),
+        budget_bytes=strict_budget,
+        raw_available_bytes=strict_raw,
+        factor_num=strict_fnum,
+        factor_den=strict_fden,
+        cpu_logical=strict_cpu,
+        units_total=strict_units,
+        shared_bytes=strict_shared,
+        per_unit_stack_bytes=strict_stack,
+        per_unit_cache_bytes=strict_cache,
+        per_unit_prefetch_bytes=strict_prefetch,
+        disk_free_bytes=strict_disk,
+        layout=strict_layout,
+        refinement_rank=strict_rank,
+        patch_hw=strict_patch,
+        halo_px=strict_halo,
+        channels=strict_channels,
+        n_frames=strict_frames,
+        disk_fraction_num=strict_dfn,
+        disk_fraction_den=strict_dfd,
+        tile_ladder=strict_tiles,
+        prefetch_ladder=strict_prefetches,
+        workers_ladder=strict_workers,
+        workers_cap=strict_cap,
+        margin_num=strict_mnum,
+        margin_den=strict_mden,
         profile=profile,
         time_model=time_model,
         cell_ids=cells,
-        frame_ids=tuple(str(f) for f in frame_ids),
-        observation_source=str(observation_source),
-        run_id=str(run_id),
-        pinned=bool(pinned),
+        frame_ids=frames,
+        observation_source=observation_source,
+        run_id=run_id,
+        pinned=pinned,
     )
     return plan(context, phase_requests=phase_requests, mode=mode)
 

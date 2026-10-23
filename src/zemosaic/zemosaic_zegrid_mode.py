@@ -3934,6 +3934,27 @@ def _ram_contract_diagnostics(outcome, bundle, initial_bundle) -> dict:
     }
 
 
+def _r55_observe_error_block(exc) -> dict:
+    """Honest fallback when observe construction fails (never aborts the run).
+
+    Carries the closed ``R55_INTERNAL_ERROR`` code; no metric or plan is
+    fabricated and execution stays on the legacy path.
+    """
+    return {
+        "schema": zsched.MANIFEST_SCHEMA,
+        "scheduler_version": zsched.SCHEDULER_VERSION,
+        "mode": "observe_only",
+        "requested_mode": zsched.MODE_OBSERVE,
+        "status": "error",
+        "error": repr(exc),
+        "reason_code": renv.REASON_INTERNAL_ERROR,
+        "note": (
+            "observe-only plan construction failed; execution is unchanged. "
+            "No observed metric is fabricated and no RUN decision was taken."
+        ),
+    }
+
+
 def _build_r55_observe_block(
     *,
     bundle,
@@ -4058,6 +4079,9 @@ def _build_r55_observe_block(
             units=1,
             units_in_flight=1,
             workers_per_unit=1,
+            # D1: assembly's retained cores + halo coexist with the ACTIVE stack
+            # phase (stream or inmem). Exactly one stack phase exists.
+            overlaps_with=(phase,),
         ),
         zsched.PhaseRequest(
             phase=renv.PHASE_EXPORT,
@@ -4896,19 +4920,7 @@ def _run_single(
                     callback=progress_callback,
                 )
             except Exception as _r55_exc:  # observe must never control execution
-                _r55_scheduler_block = {
-                    "schema": zsched.MANIFEST_SCHEMA,
-                    "scheduler_version": zsched.SCHEDULER_VERSION,
-                    "mode": "observe_only",
-                    "requested_mode": zsched.MODE_OBSERVE,
-                    "status": "error",
-                    "error": repr(_r55_exc),
-                    "reason_code": None,
-                    "note": (
-                        "observe-only plan construction failed; execution is "
-                        "unchanged. No observed metric is fabricated."
-                    ),
-                }
+                _r55_scheduler_block = _r55_observe_error_block(_r55_exc)
                 _emit(
                     f"ZeGrid: R55 observe-only plan ERROR ({_r55_exc!r}); "
                     "execution continues on the legacy plan",
