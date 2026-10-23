@@ -441,6 +441,39 @@ def validate_checkpoint_facts(facts: Mapping[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def validate_latched_fact(sample: Any) -> dict:
+    """Strictly validate one latched fact; malformed facts fail closed.
+
+    The stored budget is checked against the exact 90 % contract rather than
+    trusted. This is the single validation used by both the latch and the RUN
+    checkpoint (an injected malformed latch must refuse, not slip through).
+    """
+    if not isinstance(sample, Mapping):
+        raise RuntimeControlError(
+            "latched RUN fact must be a mapping, got "
+            f"{type(sample).__name__}"
+        )
+    raw = strict_int(
+        sample.get("raw_available_bytes"),
+        "latched MemAvailable",
+        minimum=1,
+    )
+    expected = run_budget_bytes(raw)
+    stored = sample.get("budget_bytes")
+    if stored is not None:
+        stored_int = strict_int(stored, "latched RUN budget", minimum=0)
+        if stored_int != expected:
+            raise RuntimeControlError(
+                "latched RUN budget "
+                f"{stored_int} != exact 90% budget {expected} for raw {raw}"
+            )
+    return {
+        "raw_available_bytes": int(raw),
+        "budget_bytes": int(expected),
+        "monotonic_ns": int(sample.get("monotonic_ns", 0) or 0),
+    }
+
+
 class PressureLatch:
     """Thread-safe one-slot latch of the LOWEST valid pressure observation.
 
@@ -488,6 +521,13 @@ class PressureLatch:
             sample = self._sample
             self._sample = None
             return None if sample is None else dict(sample)
+
+    def consume_validated(self) -> dict | None:
+        """Consume exactly once, strict-validating the latched facts."""
+        sample = self.consume()
+        if sample is None:
+            return None
+        return validate_latched_fact(sample)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -577,6 +617,21 @@ class RunSampler:
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
             self._thread.join(timeout)
+
+    def stop_and_join(self, timeout: float | None = None) -> None:
+        """Stop and PROVE termination; a live monitor is a hard error."""
+        self.stop()
+        if self._thread is None:
+            return
+        wait_s = (
+            max(1.0, self._interval_s * 2.0)
+            if timeout is None else float(timeout)
+        )
+        self._thread.join(timeout=wait_s)
+        if self._thread.is_alive():
+            raise RuntimeControlError(
+                "R55-E1 RUN sampler did not terminate before return"
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -679,11 +734,14 @@ def build_wave_record(
     facts: Mapping[str, Any],
     shrink_steps: Sequence[Mapping[str, Any]] = (),
     latched: Mapping[str, Any] | None = None,
+    decision_latched: Mapping[str, Any] | None = None,
+    pending_latched: Mapping[str, Any] | None = None,
     results: Sequence[Mapping[str, Any]] = (),
     wall_s: float | None = None,
     parent: Mapping[str, Any] | None = None,
     cgroup: Mapping[str, Any] | None = None,
     sampler: Mapping[str, Any] | None = None,
+    heartbeat: Mapping[str, Any] | None = None,
 ) -> dict:
     """Build one truthful wave telemetry record."""
     det_facts = {
@@ -707,7 +765,16 @@ def build_wave_record(
         "facts": dict(facts),
         "deterministic_facts": det_facts,
         "shrink_steps": [dict(step) for step in shrink_steps],
-        "latched": None if latched is None else dict(latched),
+        "latched": (
+            None if latched is None else dict(latched)
+        ),
+        "decision_latched": (
+            None if decision_latched is None else dict(decision_latched)
+        ),
+        "pending_latched": (
+            None if pending_latched is None else dict(pending_latched)
+        ),
+        "heartbeat": dict(heartbeat or {}),
         "worker_peaks": aggregate_worker_peaks(results),
         "wall_s": None if wall_s is None else float(wall_s),
         "parent": dict(parent or {}),
@@ -743,6 +810,22 @@ def build_run_telemetry(
             ),
             "refusal_count": int(0 if refusal is None else 1),
             "total_wall_s": float(total_wall),
+            "heartbeat_calls": int(
+                sum(
+                    int((wave.get("heartbeat") or {}).get(
+                        "heartbeat_calls", 0
+                    ))
+                    for wave in waves
+                )
+            ),
+            "heartbeat_errors": int(
+                sum(
+                    int((wave.get("heartbeat") or {}).get(
+                        "heartbeat_errors", 0
+                    ))
+                    for wave in waves
+                )
+            ),
             "parent_end": dict(parent_end or {}),
         },
         "refusal": None if refusal is None else dict(refusal),
@@ -809,6 +892,7 @@ __all__ = [
     "read_disk_free",
     "collect_run_facts",
     "validate_checkpoint_facts",
+    "validate_latched_fact",
     "PressureLatch",
     "RunSampler",
     "plan_wave_bounds",

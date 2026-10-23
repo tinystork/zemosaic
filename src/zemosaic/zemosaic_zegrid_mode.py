@@ -5187,8 +5187,17 @@ def _r55_run_checkpoint_sample(disk_root):
 
 
 def _r55_sample_pressure(disk_root):
-    """Lightweight in-wave pressure sample (never a decision by itself)."""
-    return zrt.collect_run_facts(root=disk_root, include_diagnostics=False)
+    """Lightweight in-wave pressure sample (never a decision by itself).
+
+    Uses the SAME strict available-memory source as the checkpoint so tests
+    that inject the host observation also control the in-wave latch. The
+    sample is only a candidate for the NEXT boundary.
+    """
+    return zrt.collect_run_facts(
+        root=disk_root,
+        available_fn=available_memory_bytes,
+        include_diagnostics=False,
+    )
 
 
 def _r55_active_run_context(
@@ -5214,7 +5223,8 @@ def _r55_active_run_context(
 
 
 def _r55_run_checkpoint(
-    *, decision, candidate, mapping, bundle, remaining_units, wave_index, facts
+    *, decision, candidate, mapping, bundle, remaining_units, wave_index, facts,
+    latched=None
 ):
     """Mandatory fresh checkpoint before one wave.
 
@@ -5240,8 +5250,42 @@ def _r55_run_checkpoint(
                 "unavailable_shrinks": [dict(x) for x in _R55E1_UNAVAILABLE_SHRINKS],
             },
         ) from exc
-    raw = int(facts["host"]["raw_available_bytes"])
-    budget = int(facts["host"]["budget_bytes"])
+    fresh_raw = int(facts["host"]["raw_available_bytes"])
+    fresh_budget = int(facts["host"]["budget_bytes"])
+    latched_host = None
+    if latched is not None:
+        try:
+            latched_host = zrt.validate_latched_fact(latched)
+        except zrt.RuntimeControlError as exc:
+            raise _R55RunRefused(
+                renv.REASON_REFUSE_HOST_RAM,
+                f"malformed latched RUN fact: {exc}",
+                record={
+                    "schema": zrt.RUN_CONTROL_SCHEMA,
+                    "status": "refused",
+                    "reason_code": renv.REASON_REFUSE_HOST_RAM,
+                    "detail": f"malformed latched RUN fact: {exc}",
+                    "wave_index": int(wave_index),
+                    "remaining_units": int(max(0, remaining_units)),
+                    "shrink_steps": [],
+                    "unavailable_shrinks": [
+                        dict(x) for x in _R55E1_UNAVAILABLE_SHRINKS
+                    ],
+                },
+            ) from exc
+    # Consume the pending mid-wave low-pressure fact exactly once and combine
+    # it CONSERVATIVELY with the fresh sample. A transient drop that recovered
+    # before this boundary still governs the next wave; it never mutates the
+    # already-running wave.
+    effective_raw = int(fresh_raw)
+    host_source = "fresh"
+    if latched_host is not None and int(
+        latched_host["raw_available_bytes"]
+    ) < int(fresh_raw):
+        effective_raw = int(latched_host["raw_available_bytes"])
+        host_source = "fresh+latched"
+    raw = int(effective_raw)
+    budget = int(zrt.run_budget_bytes(raw))
     disk_free = int(facts["disk"]["free_bytes"])
     remaining_units = zrt.strict_int(
         remaining_units, "remaining_units", minimum=0
@@ -5273,6 +5317,16 @@ def _r55_run_checkpoint(
                 "factor_num": int(rcontract.ADMIT_FACTOR_NUM),
                 "factor_den": int(rcontract.ADMIT_FACTOR_DEN),
             },
+            "fresh_host": {
+                "raw_available_bytes": int(fresh_raw),
+                "budget_bytes": int(fresh_budget),
+                "factor_num": int(rcontract.ADMIT_FACTOR_NUM),
+                "factor_den": int(rcontract.ADMIT_FACTOR_DEN),
+            },
+            "latched_host": (
+                None if latched_host is None else dict(latched_host)
+            ),
+            "host_source": str(host_source),
             "disk": {"free_bytes": int(disk_free)},
             "candidate": zsched.active_candidate_tuple(chosen_candidate),
             "mapping": dict(chosen_mapping),
@@ -5283,6 +5337,14 @@ def _r55_run_checkpoint(
         }
 
     def _deterministic(record):
+        # Include the latched fact ONLY when it actually governed the decision.
+        # The presence/timing of an equal-pressure sample is observational and
+        # must not make two otherwise identical runs differ.
+        latched_for_decision = (
+            record["latched_host"]
+            if record.get("host_source") == "fresh+latched"
+            else None
+        )
         return {
             key: record[key]
             for key in (
@@ -5293,12 +5355,14 @@ def _r55_run_checkpoint(
                 "remaining_units",
                 "changed",
                 "host",
+                "fresh_host",
+                "host_source",
                 "candidate",
                 "mapping",
                 "shrink_steps",
                 "unavailable_shrinks",
             )
-        }
+        } | {"latched_host": latched_for_decision}
 
     # Fast path: the accepted candidate still fits the fresh 90 % budget and the
     # already-admitted product envelope still fits too. No mapping change.
@@ -5460,6 +5524,19 @@ def _r55_merge_wave_meta(metas, *, total_tasks, wave_count) -> dict:
         "seconds": float(seconds),
         "seconds_per_unit": float(seconds) / max(1, int(total_tasks)),
         "waves": int(wave_count),
+        "heartbeat_calls": int(
+            sum(int(meta.get("heartbeat_calls", 0)) for meta in metas)
+        ),
+        "heartbeat_errors": int(
+            sum(int(meta.get("heartbeat_errors", 0)) for meta in metas)
+        ),
+        "heartbeat_modes": sorted(
+            {
+                str(meta.get("heartbeat_mode", "none"))
+                for meta in metas
+            }
+        ),
+        "heartbeat_interval_s": float(zrt.RUN_MAX_SAMPLE_INTERVAL_S),
     }
 
 
@@ -6544,7 +6621,8 @@ def _run_single(
 
     def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt,
                         tasks=None, workers=None, cache_workers=None,
-                        progress_callback=None):
+                        progress_callback=None, heartbeat=None,
+                        heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S):
         """Run the WHOLE per-cell batch once; returns (results, meta).
 
         ``gpu_attempt=True`` disables pmap's SAME-config serial retry (serial_fallback
@@ -6578,6 +6656,8 @@ def _run_single(
             initializer=_init_stack_worker,
             initargs=_initargs,
             serial_fallback=not gpu_attempt,
+            heartbeat=heartbeat,
+            heartbeat_interval_s=heartbeat_interval_s,
         )
         return _res, _meta
 
@@ -6606,6 +6686,12 @@ def _run_single(
         deterministic_checkpoints = []
         shrink_count = 0
         run_t0 = time.perf_counter()
+        # ONE persistent latch for the whole RUN. A mid-wave sample is only a
+        # candidate for the NEXT safe boundary; it never mutates this wave.
+        latch = zrt.PressureLatch()
+
+        def _heartbeat():
+            latch.record(_r55_sample_pressure(disk_root))
 
         def _wave_progress(base_offset):
             def _cb(done, _total):
@@ -6623,6 +6709,28 @@ def _run_single(
             )
             facts = _r55_run_checkpoint_sample(disk_root)
             try:
+                try:
+                    latched_fact = latch.consume_validated()
+                except zrt.RuntimeControlError as exc:
+                    raise _R55RunRefused(
+                        renv.REASON_REFUSE_HOST_RAM,
+                        f"malformed latched RUN fact: {exc}",
+                        record={
+                            "schema": zrt.RUN_CONTROL_SCHEMA,
+                            "status": "refused",
+                            "reason_code": renv.REASON_REFUSE_HOST_RAM,
+                            "detail": (
+                                f"malformed latched RUN fact: {exc}"
+                            ),
+                            "wave_index": int(wave_index),
+                            "remaining_units": int(remaining_units),
+                            "shrink_steps": [],
+                            "unavailable_shrinks": [
+                                dict(x)
+                                for x in _R55E1_UNAVAILABLE_SHRINKS
+                            ],
+                        },
+                    ) from exc
                 checkpoint = _r55_run_checkpoint(
                     decision=_r55_active_decision,
                     candidate=candidate,
@@ -6631,6 +6739,7 @@ def _run_single(
                     remaining_units=remaining_units,
                     wave_index=wave_index,
                     facts=facts,
+                    latched=latched_fact,
                 )
             except _R55RunRefused as exc:
                 cleanup = []
@@ -6689,51 +6798,35 @@ def _run_single(
             )
             wave_tasks = bundle.cell_tasks[start:end]
             wave_units = int(len(wave_tasks))
-            latch = zrt.PressureLatch()
-            # Optional, bounded and observational: only a genuinely concurrent
-            # wave needs an in-wave monitor. It never mutates/kills a unit and
-            # is always joined before the wave returns.
-            sampler = (
-                zrt.RunSampler(
-                    lambda: _r55_sample_pressure(disk_root), latch=latch
-                )
-                if (wave_units > 1 and units_bound > 1)
-                else None
-            )
-            sampler_start_error = None
-            if sampler is not None:
-                try:
-                    sampler.start()
-                except Exception as exc:  # noqa: BLE001 - optional diagnostic
-                    sampler_start_error = f"{type(exc).__name__}: {exc}"
             wave_t0 = time.perf_counter()
-            try:
-                wave_results, wave_meta = _run_cell_batch(
-                    science_cfg,
-                    int(bundle.cpu_streaming_tile),
-                    gpu_attempt=False,
-                    tasks=wave_tasks,
-                    workers=units_bound,
-                    cache_workers=int(bundle.cache_workers_per_cell),
-                    progress_callback=_wave_progress(start),
-                )
-            finally:
-                if sampler is not None:
-                    sampler.stop()
-                    sampler.join(
-                        timeout=float(zrt.RUN_MAX_SAMPLE_INTERVAL_S)
-                    )
+            wave_results, wave_meta = _run_cell_batch(
+                science_cfg,
+                int(bundle.cpu_streaming_tile),
+                gpu_attempt=False,
+                tasks=wave_tasks,
+                workers=units_bound,
+                cache_workers=int(bundle.cache_workers_per_cell),
+                progress_callback=_wave_progress(start),
+                heartbeat=_heartbeat,
+                heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
+            )
             wave_wall = time.perf_counter() - wave_t0
             results_local.extend(wave_results)
             metas.append(wave_meta)
             remaining_after = sum(
                 1 for t in all_tasks[end:] if t[4] is not None
             )
-            sampler_dict = (
-                None if sampler is None else sampler.to_dict()
-            )
-            if sampler_start_error is not None:
-                sampler_dict = {"start_error": sampler_start_error}
+            heartbeat_dict = {
+                key: wave_meta.get(key)
+                for key in (
+                    "heartbeat_mode",
+                    "heartbeat_calls",
+                    "heartbeat_errors",
+                    "heartbeat_last_error",
+                    "heartbeat_interval_s",
+                )
+                if key in wave_meta
+            }
             wave_telemetry.append(
                 zrt.build_wave_record(
                     index=wave_index,
@@ -6743,14 +6836,20 @@ def _run_single(
                     remaining_units_after=remaining_after,
                     candidate=record["candidate"],
                     mapping=record["mapping"],
-                    facts={**facts, "remaining_units": remaining_units},
+                    facts={
+                        "host": record["host"],
+                        "fresh_host": record["fresh_host"],
+                        "disk": facts["disk"],
+                        "remaining_units": remaining_units,
+                    },
                     shrink_steps=record["shrink_steps"],
-                    latched=latch.peek(),
+                    decision_latched=record.get("latched_host"),
+                    pending_latched=latch.snapshot(),
                     results=wave_results,
                     wall_s=wave_wall,
                     parent=facts.get("parent"),
                     cgroup=facts.get("cgroup"),
-                    sampler=sampler_dict,
+                    heartbeat=heartbeat_dict,
                 )
             )
             wave_records.append(
@@ -6760,6 +6859,7 @@ def _run_single(
                     "wave_units": int(wave_units),
                     "units_remaining_after": int(remaining_after),
                     "changed": bool(record["changed"]),
+                    "host_source": str(record.get("host_source", "fresh")),
                     "candidate": dict(record["candidate"]),
                     "mapping": dict(record["mapping"]),
                 }
@@ -6794,6 +6894,12 @@ def _run_single(
                 "prefetch_units": 0,
                 "backend": "cpu",
                 "recovery_growth": "forbidden",
+                "latched_pressure": (
+                    "consumed_once_at_next_boundary_min_combined"
+                ),
+                "in_wave_monitor": (
+                    "parent_side_heartbeat_no_thread_before_fork"
+                ),
                 "in_wave_sampler_max_interval_s": float(
                     zrt.RUN_MAX_SAMPLE_INTERVAL_S
                 ),

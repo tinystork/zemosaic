@@ -23,18 +23,21 @@ Acceptance exercised here:
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import hashlib
 import json
 import shutil
 import subprocess
 import sys
-import types
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from zemosaic import zemosaic_zegrid_mode as zz
+from zemosaic.core.zegrid import parallel as zpar
 from zemosaic.core.zegrid import ram_contract as rcontract
 from zemosaic.core.zegrid import resource_envelope as re
 from zemosaic.core.zegrid import runtime_control as zrt
@@ -47,6 +50,21 @@ WITNESS_AVAILABLE_BYTES = 12 * 2 ** 30
 MIB = 2 ** 20
 GIB = 2 ** 30
 FITS_NAMES = ("mosaic_grid.fits", "mosaic_grid_coverage.fits")
+
+
+def _echo_task(value):
+    return value
+
+
+def _slow_echo_task(value):
+    time.sleep(0.02)
+    return value
+
+
+def _fail_task(value):
+    if int(value) == 2:
+        raise RuntimeError("intentional worker failure")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +283,7 @@ def _run_product(
     memory=WITNESS_AVAILABLE_BYTES,
     sample=None,
     decide=None,
+    pressure=None,
 ):
     if not callable(memory):
         _constant = int(memory)
@@ -276,6 +295,8 @@ def _run_product(
             patch.setattr(zz, "_r55_run_checkpoint_sample", sample)
         if decide is not None:
             patch.setattr(zz, "_r55_active_decide", decide)
+        if pressure is not None:
+            patch.setattr(zz, "_r55_sample_pressure", pressure)
         zz.run_zegrid_mode(
             str(inp),
             str(out),
@@ -540,6 +561,71 @@ def test_disk_shortfall_refuses_with_disk_reason(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Persistent latch: consumed once at the NEXT boundary, min-combined
+# ---------------------------------------------------------------------------
+
+
+def test_transient_latched_drop_governs_the_next_boundary(monkeypatch):
+    decision = _synthetic_decision(k_target=3)
+    monkeypatch.setattr(zz, "_r55_active_apply", lambda *a, **k: _FakeBundle())
+    checkpoint = zz._r55_run_checkpoint(
+        decision=decision,
+        candidate=decision.plan_set.chosen,
+        mapping=decision.mapping,
+        bundle=_FakeBundle(),
+        remaining_units=6,
+        wave_index=1,
+        facts=_facts(WITNESS_AVAILABLE_BYTES),
+        latched=_facts(1 * GIB)["host"],
+    )
+    record = checkpoint["record"]
+    assert record["changed"] is True
+    assert checkpoint["candidate"].units_in_flight == 2
+    assert record["host_source"] == "fresh+latched"
+    assert record["host"]["raw_available_bytes"] == 1 * GIB
+    assert record["host"]["budget_bytes"] == (9 * GIB) // 10
+    assert record["fresh_host"]["raw_available_bytes"] == WITNESS_AVAILABLE_BYTES
+    assert record["latched_host"]["raw_available_bytes"] == 1 * GIB
+    assert record["latched_host"]["budget_bytes"] == (9 * GIB) // 10
+
+
+def test_latch_is_consumed_exactly_once_and_malformed_fails_closed():
+    latch = zrt.PressureLatch()
+    latch.record(_facts(100 * MIB))
+    first = latch.consume_validated()
+    assert first is not None
+    assert first["raw_available_bytes"] == 100 * MIB
+    assert first["budget_bytes"] == (9 * 100 * MIB) // 10
+    assert latch.consume_validated() is None
+    # A malformed stored fact never slips through the boundary.
+    latch._sample = {
+        "raw_available_bytes": True,
+        "budget_bytes": 1,
+        "monotonic_ns": 0,
+    }
+    with pytest.raises(zrt.RuntimeControlError):
+        latch.consume_validated()
+
+
+def test_checkpoint_malformed_latched_fact_fails_closed(monkeypatch):
+    decision = _synthetic_decision(k_target=3)
+    monkeypatch.setattr(zz, "_r55_active_apply", lambda *a, **k: _FakeBundle())
+    with pytest.raises(zz._R55RunRefused) as ei:
+        zz._r55_run_checkpoint(
+            decision=decision,
+            candidate=decision.plan_set.chosen,
+            mapping=decision.mapping,
+            bundle=_FakeBundle(),
+            remaining_units=6,
+            wave_index=1,
+            facts=_facts(WITNESS_AVAILABLE_BYTES),
+            latched={"raw_available_bytes": True, "budget_bytes": 1},
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+    assert "malformed latched" in ei.value.detail
+
+
+# ---------------------------------------------------------------------------
 # Wave partition / canonical order
 # ---------------------------------------------------------------------------
 
@@ -553,6 +639,125 @@ def test_wave_partition_is_canonical_contiguous_and_bounded():
     for bad in (True, 1.5, -1):
         with pytest.raises(zrt.RuntimeControlError):
             zrt.plan_wave_bounds(6, bad)
+
+
+# ---------------------------------------------------------------------------
+# Parent-side heartbeat seam: no E1 thread before process creation
+# ---------------------------------------------------------------------------
+
+
+def test_pmap_serial_heartbeat_cadence_and_cleanup():
+    calls = []
+    progress = []
+
+    def heartbeat():
+        calls.append(threading.current_thread().name)
+
+    meta = {}
+    out = zpar.pmap(
+        _slow_echo_task,
+        [1, 2, 3],
+        workers=1,
+        heartbeat=heartbeat,
+        heartbeat_interval_s=0.02,
+        progress_callback=lambda done, total: progress.append(done),
+        meta=meta,
+    )
+    assert out == [1, 2, 3]
+    assert progress == [1, 2, 3]
+    assert calls
+    assert all(name == "r55e1-heartbeat" for name in calls)
+    assert meta["heartbeat_mode"] == "serial_thread"
+    assert meta["heartbeat_calls"] >= 1
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
+
+
+def test_pmap_process_heartbeat_uses_parent_no_e1_thread(monkeypatch):
+    seen = {"init": [], "submit": []}
+    calls = []
+    progress = []
+    real_executor = concurrent.futures.ProcessPoolExecutor
+
+    class _TracedExecutor(real_executor):
+        def __init__(self, *args, **kwargs):
+            seen["init"] = [t.name for t in threading.enumerate()]
+            super().__init__(*args, **kwargs)
+
+        def submit(self, *args, **kwargs):
+            seen["submit"] = [t.name for t in threading.enumerate()]
+            return super().submit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        concurrent.futures, "ProcessPoolExecutor", _TracedExecutor
+    )
+
+    def heartbeat():
+        calls.append(threading.current_thread().name)
+
+    meta = {}
+    out = zpar.pmap(
+        _echo_task,
+        [3, 1, 2, 4],
+        workers=2,
+        heartbeat=heartbeat,
+        heartbeat_interval_s=0.02,
+        progress_callback=lambda done, total: progress.append(done),
+        meta=meta,
+    )
+    assert out == [3, 1, 2, 4]
+    assert progress == [1, 2, 3, 4]
+    assert meta["heartbeat_mode"] == "parent_wait"
+    assert calls and all(name == "MainThread" for name in calls)
+    assert not any(name.startswith("r55e1") for name in seen["init"])
+    assert not any(name.startswith("r55e1") for name in seen["submit"])
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
+
+
+def test_pmap_monitor_terminates_on_worker_exception():
+    calls = []
+
+    def heartbeat():
+        calls.append(threading.current_thread().name)
+
+    with pytest.raises(RuntimeError, match="intentional worker failure"):
+        zpar.pmap(
+            _fail_task,
+            [1, 2, 3],
+            workers=1,
+            heartbeat=heartbeat,
+            heartbeat_interval_s=0.02,
+        )
+    assert calls
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
+
+
+def test_pmap_process_heartbeat_terminates_on_exception(monkeypatch):
+    calls = []
+
+    def heartbeat():
+        calls.append(threading.current_thread().name)
+
+    with pytest.raises(RuntimeError, match="intentional worker failure"):
+        zpar.pmap(
+            _fail_task,
+            [1, 2, 3],
+            workers=2,
+            heartbeat=heartbeat,
+            heartbeat_interval_s=0.02,
+            # The process path itself must terminate the E1 monitor; do not
+            # exercise the historical same-config serial fallback here.
+            serial_fallback=False,
+        )
+    assert calls and all(name == "MainThread" for name in calls)
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
 
 
 def test_sampler_cadence_at_most_five_seconds_and_latches(monkeypatch):
@@ -583,7 +788,7 @@ def test_sampler_cadence_at_most_five_seconds_and_latches(monkeypatch):
         clock=clock, wait=wait,
     )
     sampler.start()
-    sampler.join(timeout=5)
+    sampler.stop_and_join()
     assert sampler.samples == 3
     assert sampler.errors == 0
     assert all(
@@ -740,6 +945,14 @@ def test_real_multi_wave_active_vs_legacy_byte_identity(parity_runs):
         assert "worker_peaks" in wave
         assert wave["worker_peaks"]["current_available"] is False
         assert wave["wall_s"] is not None
+        # Natural K=1 waves run the serial path; the heartbeat seam must be
+        # active there too (<= 5 s cadence) and the thread must be joined.
+        assert wave["heartbeat"]["heartbeat_mode"] == "serial_thread"
+        assert wave["heartbeat"]["heartbeat_calls"] >= 1
+        assert wave["heartbeat"]["heartbeat_errors"] == 0
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
     # Deterministic RUN structure has NO volatile observation keys.
     text = json.dumps(run, sort_keys=True)
     for forbidden in (
@@ -827,6 +1040,57 @@ def test_real_multi_wave_shrink_parity_and_no_growth(shrink_runs):
     assert raws[0] == WITNESS_AVAILABLE_BYTES
     assert 5 * GIB // 2 in raws
     assert raws[-1] == WITNESS_AVAILABLE_BYTES
+    modes = {
+        wave["heartbeat"]["heartbeat_mode"]
+        for wave in telemetry["waves"]
+    }
+    assert "parent_wait" in modes
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
+
+
+def test_transient_mid_wave_drop_is_consumed_at_next_boundary(
+    routine_input, tmp_path
+):
+    """A drop that recovers before the next fresh sample still shrinks."""
+    out = tmp_path / "active_transient"
+    legacy = tmp_path / "legacy_transient"
+    _run_product(routine_input, legacy, "legacy")
+    pressure_calls = {"n": 0}
+
+    def pressure(_root):
+        raw = 5 * GIB // 2 if pressure_calls["n"] == 0 else WITNESS_AVAILABLE_BYTES
+        pressure_calls["n"] += 1
+        return _facts(raw)
+
+    _run_product(
+        routine_input,
+        out,
+        "active",
+        sample=_ScheduleSample([WITNESS_AVAILABLE_BYTES] * 10),
+        decide=_force_k3_decide(zz._r55_active_decide),
+        pressure=pressure,
+    )
+    for name in FITS_NAMES:
+        assert _digest(legacy / name) == _digest(out / name), name
+    block = _manifest(out)["r55_scheduler"]
+    run = block["run"]
+    assert run["shrink_count"] >= 1
+    assert run["checkpoints"][1]["host_source"] == "fresh+latched"
+    assert run["checkpoints"][1]["host"]["raw_available_bytes"] == 5 * GIB // 2
+    assert (
+        run["checkpoints"][1]["fresh_host"]["raw_available_bytes"]
+        == WITNESS_AVAILABLE_BYTES
+    )
+    assert (
+        run["checkpoints"][1]["latched_host"]["raw_available_bytes"]
+        == 5 * GIB // 2
+    )
+    assert block["mapping"]["units_in_flight"] == 2
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
 
 
 def test_host_exhaustion_refuses_and_publishes_nothing(routine_input, tmp_path):
@@ -911,13 +1175,26 @@ def test_malformed_injected_product_checkpoint_refuses(routine_input, tmp_path):
 
 
 def _import_laziness_script() -> str:
+    """Import the E1 CPU seam with an IMPORTABLE exploding fake CuPy.
+
+    The full product module has a pre-existing Dask/chunk-types CuPy edge when
+    CuPy is installed; E1 must not assert that invariant. This proof targets
+    the E1 modules only (runtime_control + scheduler).
+    """
     return (
         "import sys\n"
+        "class _ExplodingCupy:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'cupy' or name.startswith('cupy.'):\n"
+        "            raise AssertionError('CuPy import attempted by E1 CPU seam')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _ExplodingCupy())\n"
         "import zemosaic.core.zegrid.runtime_control as rc\n"
-        "import zemosaic.zemosaic_zegrid_mode as zz\n"
+        "import zemosaic.core.zegrid.scheduler as zs\n"
         "assert 'cupy' not in sys.modules, 'cupy imported on the CPU path'\n"
         "assert 'cupy.cuda' not in sys.modules, 'cupy.cuda imported'\n"
         "assert rc.RUN_MAX_SAMPLE_INTERVAL_S == 5.0\n"
+        "assert zs.MODE_ACTIVE == 'active'\n"
         "print('LAZY_OK')\n"
     )
 

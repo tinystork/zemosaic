@@ -27,9 +27,11 @@ their task and ``pool.map`` still preserves input order.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import multiprocessing
 import os
+import threading
 import time
 
 # ZM-ZEGRID-R41: pure host-RAM contract + phase-accounting math. Imported as a
@@ -872,7 +874,64 @@ def _parent_is_daemonic() -> bool:
         return False
 
 
-def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, initargs=(), emit=None, meta=None, serial_fallback: bool = True):
+class _HeartbeatMonitor:
+    """Serial-path heartbeat thread (NO process is forked in this path).
+
+    Runnable only when the caller is executing the plain serial loop (or the
+    serial fallback after a pool has already failed). It is always stopped and
+    joined before the wave returns; a live monitor after the join is a hard
+    error (no daemon escape).
+    """
+
+    def __init__(self, heartbeat, interval_s: float):
+        self._heartbeat = heartbeat
+        self._interval_s = float(interval_s)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="r55e1-heartbeat", daemon=True
+        )
+        self.calls = 0
+        self.errors = 0
+        self.last_error = None
+
+    def _call(self):
+        try:
+            self._heartbeat()
+            self.calls += 1
+        except Exception as exc:  # noqa: BLE001 - diagnostic only
+            self.errors += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._call()
+            if self._stop.wait(self._interval_s):
+                break
+
+    def start(self):
+        self._thread.start()
+
+    def stop_and_join(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self._interval_s * 2.0))
+        if self._thread.is_alive():
+            raise RuntimeError(
+                "R55-E1 heartbeat monitor did not terminate before wave return"
+            )
+
+
+def _heartbeat_interval(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"heartbeat interval must be a number, got {value!r}")
+    interval = float(value)
+    if not (0.0 < interval <= 5.0):
+        raise ValueError(
+            f"heartbeat interval must be in (0, 5.0], got {value!r}"
+        )
+    return interval
+
+
+def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, initargs=(), emit=None, meta=None, serial_fallback: bool = True, heartbeat=None, heartbeat_interval_s: float = 5.0):
     """Run ``worker`` over ``tasks`` in order; returns a list of results.
 
     ``worker`` must be a module-level (picklable-by-reference) pure function of
@@ -923,6 +982,16 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
     """
     tasks = list(tasks)
     total = len(tasks)
+    interval_s = (
+        _heartbeat_interval(heartbeat_interval_s)
+        if heartbeat is not None else None
+    )
+
+    if meta is not None:
+        meta["heartbeat_calls"] = 0
+        meta["heartbeat_errors"] = 0
+        meta["heartbeat_mode"] = "none" if heartbeat is None else "pending"
+        meta["heartbeat_interval_s"] = interval_s
 
     def _report(done):
         if progress_callback is not None:
@@ -963,14 +1032,41 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
 
     t0 = time.perf_counter()
 
+    def _run_serial():
+        monitor = None
+        if heartbeat is not None:
+            monitor = _HeartbeatMonitor(heartbeat, interval_s)
+            try:
+                monitor.start()
+            except Exception as exc:  # noqa: BLE001 - optional diagnostic
+                if meta is not None:
+                    meta["heartbeat_mode"] = "unavailable"
+                    meta["heartbeat_last_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                monitor = None
+            else:
+                if meta is not None:
+                    meta["heartbeat_mode"] = "serial_thread"
+        out = []
+        try:
+            for i, t in enumerate(tasks):
+                out.append(worker(t))
+                _report(i + 1)
+        finally:
+            if monitor is not None:
+                monitor.stop_and_join()
+                if meta is not None:
+                    meta["heartbeat_calls"] = int(monitor.calls)
+                    meta["heartbeat_errors"] = int(monitor.errors)
+                    meta["heartbeat_last_error"] = monitor.last_error
+        return out
+
     if workers <= 1 or total < 2:
         if meta is not None:
             meta["executor"] = "serial"
         _surf(f"[ZEGRID] pmap: serial (workers={workers}, tasks={total})")
-        out = []
-        for i, t in enumerate(tasks):
-            out.append(worker(t))
-            _report(i + 1)
+        out = _run_serial()
         _finish(meta, t0, total)
         return out
 
@@ -999,24 +1095,99 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         f"[ZEGRID] pmap: {kind} pool, workers={workers}, daemon={parent_daemon}, tasks={total}"
     )
 
+    def _run_pool(pool):
+        """Ordered results with a parent-side heartbeat wait loop (no thread).
+
+        The heartbeat is called by the PARENT while futures run. No sampler
+        thread exists when ProcessPoolExecutor forks/spawns its workers.
+        """
+        out = [None] * total
+        recorded = set()
+        reported = 0
+        last_call = None
+
+        def _call_heartbeat(now):
+            nonlocal last_call
+            try:
+                heartbeat()
+                if meta is not None:
+                    meta["heartbeat_calls"] = int(
+                        meta.get("heartbeat_calls", 0)
+                    ) + 1
+            except Exception as exc:  # noqa: BLE001 - diagnostic only
+                if meta is not None:
+                    meta["heartbeat_errors"] = int(
+                        meta.get("heartbeat_errors", 0)
+                    ) + 1
+                    meta["heartbeat_last_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                _surf(
+                    f"[ZEGRID] heartbeat sample failed ({type(exc).__name__}: "
+                    f"{exc}); the next checkpoint still fails closed on its "
+                    "fresh strict facts",
+                    lvl="WARN",
+                )
+            last_call = now
+
+        # Sample once BEFORE submitting (no worker is forked yet, no E1
+        # thread exists), then keep a parent-side cadence while futures run.
+        now = time.monotonic()
+        _call_heartbeat(now)
+        futures = [pool.submit(worker, task) for task in tasks]
+        pending = set(futures)
+        while pending:
+            now = time.monotonic()
+            timeout = max(0.0, interval_s - (now - last_call))
+            done, pending = concurrent.futures.wait(
+                pending, timeout=timeout
+            )
+            for index, future in enumerate(futures):
+                if index in recorded or future not in done:
+                    continue
+                out[index] = future.result()
+                recorded.add(index)
+            while reported < total and reported in recorded:
+                reported += 1
+                _report(reported)
+            now = time.monotonic()
+            if now - last_call >= interval_s:
+                _call_heartbeat(now)
+        for index, future in enumerate(futures):
+            if index not in recorded:
+                out[index] = future.result()
+                recorded.add(index)
+        while reported < total and reported in recorded:
+            reported += 1
+            _report(reported)
+        if meta is not None:
+            meta["heartbeat_mode"] = "parent_wait"
+        return out
+
     try:
         if kind == "thread":
             # ThreadPoolExecutor has no initializer; the parent already called it.
             with Executor(max_workers=workers) as pool:
-                out = []
-                for i, res in enumerate(pool.map(worker, tasks)):
-                    out.append(res)
-                    _report(i + 1)
+                if heartbeat is None:
+                    out = []
+                    for i, res in enumerate(pool.map(worker, tasks)):
+                        out.append(res)
+                        _report(i + 1)
+                else:
+                    out = _run_pool(pool)
         else:
             with Executor(
                 max_workers=workers,
                 initializer=initializer,
                 initargs=tuple(initargs),
             ) as pool:
-                out = []
-                for i, res in enumerate(pool.map(worker, tasks)):
-                    out.append(res)
-                    _report(i + 1)
+                if heartbeat is None:
+                    out = []
+                    for i, res in enumerate(pool.map(worker, tasks)):
+                        out.append(res)
+                        _report(i + 1)
+                else:
+                    out = _run_pool(pool)
         _finish(meta, t0, total)
         return out
     except Exception as exc:  # noqa: BLE001 - fail-safe: never let parallelism crash
@@ -1038,9 +1209,6 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
             meta["executor"] = "serial"
             meta["fallback"] = True
             meta["fallback_reason"] = f"{type(exc).__name__}: {exc}"
-        out = []
-        for i, t in enumerate(tasks):
-            out.append(worker(t))
-            _report(i + 1)
+        out = _run_serial()
         _finish(meta, t0, total)
         return out
