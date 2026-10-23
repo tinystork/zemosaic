@@ -162,14 +162,38 @@ def _joint(*, cpu=None, gpu=None, gpu_facts=None):
 
 
 def _evidence_fixture():
-    cpu = _ctx()
+    # Canonical evidence covers all three D1 families: CPU in-memory, CPU
+    # streaming and GPU streaming. The calibrated GPU wins on throughput.
+    cpu_inmem = _ctx(
+        phase=re.PHASE_CELL_STACK_INMEM,
+        per_unit_stack_bytes=50 * MIB,
+    )
+    cpu_stream = _ctx(per_unit_stack_bytes=50 * MIB)
     gpu = _gpu_ctx(
+        per_unit_stack_bytes=50 * MIB,
         profile=_profile(re.BACKEND_GPU),
         time_model=lambda tile, k, prefetch: (
             1000 * (129 - int(tile)) + 50 * int(prefetch)
         ),
     )
-    return zs.JointPlanInput((gpu, cpu), _gpu_facts()), _requests()
+    return (
+        zs.JointPlanInput((gpu, cpu_stream, cpu_inmem), _gpu_facts()),
+        _requests(),
+    )
+
+
+def _mode_joint(inmem_bytes, stream_bytes, gpu_bytes):
+    return zs.JointPlanInput(
+        (
+            _gpu_ctx(per_unit_stack_bytes=gpu_bytes),
+            _ctx(per_unit_stack_bytes=stream_bytes),
+            _ctx(
+                phase=re.PHASE_CELL_STACK_INMEM,
+                per_unit_stack_bytes=inmem_bytes,
+            ),
+        ),
+        _gpu_facts(),
+    )
 
 
 def _find_gpu(joint, **criteria):
@@ -230,6 +254,7 @@ def test_cpu_behavior_unchanged_when_gpu_is_blocked():
         time_model=lambda tile, k, prefetch: 5000 * (129 - int(tile)),
     )
     legacy = zs.plan(cpu, phase_requests=_requests())
+    legacy_manifest = legacy.to_manifest_dict()
     for facts in (
         _gpu_facts(requested=False),
         _gpu_facts(available=False),
@@ -237,9 +262,131 @@ def test_cpu_behavior_unchanged_when_gpu_is_blocked():
     ):
         joint = zs.JointPlanInput((cpu, _gpu_ctx()), facts)
         planned = zs.plan_joint(joint, phase_requests=_requests())
+        # The CPU candidate, winner and plan bytes are unchanged.
         assert planned.plan_hash == legacy.plan_hash
         assert planned.chosen == legacy.chosen
-        assert planned.to_manifest_dict() == legacy.to_manifest_dict()
+        # A present (even blocked) GPU context makes this a multi-context joint
+        # call, so the additive wrapper is schema-versioned. Execution-relevant
+        # fields remain byte-identical.
+        manifest = planned.to_manifest_dict()
+        assert manifest["joint_schema"] == zs.JOINT_SCHEMA
+        assert manifest["scheduler_version"] == zs.JOINT_SCHEDULER_VERSION
+        for key in (
+            "plan_hash",
+            "budget_bytes",
+            "raw_available_bytes",
+            "aggregate_host_peak_bytes",
+            "aggregate_host_peak_bytes_raw",
+            "aggregate_device_peak_bytes",
+            "aggregate_disk_bytes",
+            "margin",
+            "calibrations",
+            "phases",
+            "fallbacks",
+            "identity",
+            "observed_metrics",
+        ):
+            assert manifest[key] == legacy_manifest[key]
+
+
+def test_cpu_joint_unmeasured_prefetch_is_not_credited():
+    cpu = _ctx(
+        profile=_profile(re.BACKEND_CPU),
+        time_model=lambda tile, k, prefetch: 1000 - 900 * int(prefetch),
+    )
+    # Direct R55-B APIs keep their accepted semantics.
+    legacy = zs.enumerate_candidates(cpu)
+    legacy_zero = next(
+        candidate
+        for candidate in legacy
+        if candidate.tile_px == 128
+        and candidate.units_in_flight == 1
+        and candidate.prefetch_units == 0
+        and candidate.workers_per_unit == 1
+        and candidate.feasible
+    )
+    legacy_one = next(
+        candidate
+        for candidate in legacy
+        if candidate.tile_px == 128
+        and candidate.units_in_flight == 1
+        and candidate.prefetch_units == 1
+        and candidate.workers_per_unit == 1
+        and candidate.feasible
+    )
+    assert legacy_one.predicted_makespan_ns < legacy_zero.predicted_makespan_ns
+
+    # The additive joint wrapper normalizes unmeasured CPU prefetch to depth 0.
+    joint = zs.JointPlanInput((cpu,))
+    zero = _find_cpu(
+        joint,
+        tile_px=128,
+        units_in_flight=1,
+        prefetch_units=0,
+        workers_per_unit=1,
+    )
+    one = _find_cpu(
+        joint,
+        tile_px=128,
+        units_in_flight=1,
+        prefetch_units=1,
+        workers_per_unit=1,
+    )
+    assert one.predicted_makespan_ns == zero.predicted_makespan_ns
+    assert one.predicted_makespan_ns == legacy_zero.predicted_makespan_ns
+    assert zs.select_joint_candidate(joint).prefetch_units == 0
+    assert (
+        zs.plan_joint(joint, phase_requests=_requests()).chosen.prefetch_units
+        == 0
+    )
+
+    # Explicit measured overlap is the only proof that may pass real depth.
+    measured = zs.JointPlanInput(
+        (cpu,), cpu_prefetch_overlap_measured=True
+    )
+    measured_zero = _find_cpu(
+        measured,
+        tile_px=128,
+        units_in_flight=1,
+        prefetch_units=0,
+        workers_per_unit=1,
+    )
+    measured_one = _find_cpu(
+        measured,
+        tile_px=128,
+        units_in_flight=1,
+        prefetch_units=1,
+        workers_per_unit=1,
+    )
+    assert (
+        measured_one.predicted_makespan_ns
+        < measured_zero.predicted_makespan_ns
+    )
+    assert zs.select_joint_candidate(measured).prefetch_units == 1
+
+    assert (
+        zs.joint_input_payload(joint)["cpu_prefetch_overlap_measured"]
+        is False
+    )
+    assert (
+        zs.joint_input_payload(measured)["cpu_prefetch_overlap_measured"]
+        is True
+    )
+    assert zs.joint_evidence_json(joint) != zs.joint_evidence_json(measured)
+
+
+def test_single_context_cpu_joint_with_profile_remains_byte_identical():
+    cpu = _ctx(
+        profile=_profile(re.BACKEND_CPU),
+        time_model=lambda tile, k, prefetch: 5000 * (129 - int(tile)),
+    )
+    legacy = zs.plan(cpu, phase_requests=_requests())
+    joint = zs.plan_joint(
+        zs.JointPlanInput((cpu,)), phase_requests=_requests()
+    )
+    assert joint.plan_hash == legacy.plan_hash
+    assert joint.chosen == legacy.chosen
+    assert joint.to_manifest_dict() == legacy.to_manifest_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +434,139 @@ def test_gpu_is_single_owner_for_every_gpu_candidate():
     ]
     assert gpu_candidates
     assert {candidate.units_in_flight for candidate in gpu_candidates} == {1}
+
+
+def test_joint_supports_inmem_stream_and_gpu_families():
+    cpu_inmem = _ctx(
+        phase=re.PHASE_CELL_STACK_INMEM,
+        per_unit_stack_bytes=50 * MIB,
+    )
+    cpu_stream = _ctx(per_unit_stack_bytes=50 * MIB)
+    gpu = _gpu_ctx(per_unit_stack_bytes=50 * MIB)
+    joint = zs.JointPlanInput((gpu, cpu_stream, cpu_inmem), _gpu_facts())
+    candidates = zs.enumerate_joint_candidates(joint)
+
+    assert any(
+        candidate.backend == re.BACKEND_CPU
+        and candidate.tile_px is None
+        for candidate in candidates
+    )
+    assert any(
+        candidate.backend == re.BACKEND_CPU
+        and candidate.tile_px is not None
+        for candidate in candidates
+    )
+    assert any(
+        candidate.backend == re.BACKEND_GPU
+        and candidate.tile_px is not None
+        and candidate.units_in_flight == 1
+        for candidate in candidates
+    )
+    keys = [candidate.ordering_key() for candidate in candidates]
+    assert len(set(keys)) == len(keys)
+
+    expected_cpu = len(zs.enumerate_candidates(cpu_inmem)) + len(
+        zs.enumerate_candidates(cpu_stream)
+    )
+    gpu_count = sum(
+        1 for candidate in candidates if candidate.backend == re.BACKEND_GPU
+    )
+    assert len(candidates) == expected_cpu + gpu_count
+    assert joint.cpu_context_count == 2
+    assert joint.contexts == (cpu_inmem, cpu_stream, gpu)
+
+    shuffled = zs.JointPlanInput(
+        (cpu_inmem, gpu, cpu_stream), _gpu_facts()
+    )
+    assert zs.enumerate_joint_candidates(shuffled) == candidates
+    assert zs.joint_evidence_json(joint) == zs.joint_evidence_json(shuffled)
+    payload = zs.joint_enumeration_payload(joint)
+    assert payload["cpu_context_count"] == 2
+    assert payload["schema"] == zs.JOINT_SCHEMA
+    assert payload["scheduler_version"] == zs.JOINT_SCHEDULER_VERSION
+
+
+def test_duplicate_backend_phase_contexts_are_rejected():
+    cpu_stream = _ctx()
+    cpu_inmem = _ctx(phase=re.PHASE_CELL_STACK_INMEM)
+    with pytest.raises(zs.SchedulerConfigError):
+        zs.JointPlanInput((cpu_stream, _ctx()), None)
+    with pytest.raises(zs.SchedulerConfigError):
+        zs.JointPlanInput(
+            (cpu_inmem, _ctx(phase=re.PHASE_CELL_STACK_INMEM)), None
+        )
+    with pytest.raises(zs.SchedulerConfigError):
+        zs.JointPlanInput(
+            (cpu_stream, _gpu_ctx(), _gpu_ctx()), _gpu_facts()
+        )
+
+
+@pytest.mark.parametrize(
+    "label,inmem_bytes,stream_bytes,gpu_bytes",
+    [
+        ("inmem", 50 * MIB, 200 * MIB, 200 * MIB),
+        ("stream", 200 * MIB, 50 * MIB, 200 * MIB),
+        ("gpu", 200 * MIB, 200 * MIB, 50 * MIB),
+    ],
+)
+def test_each_cpu_mode_and_gpu_can_win_with_truthful_plan(
+    label, inmem_bytes, stream_bytes, gpu_bytes
+):
+    joint = _mode_joint(inmem_bytes, stream_bytes, gpu_bytes)
+    winner = zs.select_joint_candidate(joint)
+    if label == "inmem":
+        assert winner.backend == re.BACKEND_CPU
+        assert winner.tile_px is None
+        expected_phase = re.PHASE_CELL_STACK_INMEM
+    elif label == "stream":
+        assert winner.backend == re.BACKEND_CPU
+        assert winner.tile_px is not None
+        expected_phase = re.PHASE_CELL_STACK_STREAM
+    else:
+        assert winner.backend == re.BACKEND_GPU
+        assert winner.units_in_flight == 1
+        expected_phase = re.PHASE_CELL_STACK_STREAM
+
+    plan = zs.plan_joint(joint, phase_requests=_requests())
+    assert plan.chosen.ordering_key() == winner.ordering_key()
+    assert plan.scheduler_version == zs.JOINT_SCHEDULER_VERSION
+    assert plan.to_manifest_dict()["joint_schema"] == zs.JOINT_SCHEMA
+    phases = {envelope.phase: envelope for envelope in plan.phases}
+    stack = phases[expected_phase]
+    assert stack.backend == winner.backend
+    assert stack.overlaps_with == (re.PHASE_ASSEMBLY,)
+    assert phases[re.PHASE_ASSEMBLY].overlaps_with == (expected_phase,)
+    if winner.backend == re.BACKEND_GPU:
+        assert stack.device is not None
+        for phase in (
+            re.PHASE_GAUGE,
+            re.PHASE_CACHE_BUILD,
+            re.PHASE_ASSEMBLY,
+            re.PHASE_EXPORT,
+        ):
+            assert phases[phase].backend == re.BACKEND_CPU
+            assert phases[phase].device is None
+    else:
+        assert stack.device is None
+
+
+def test_multi_context_cpu_only_joint_is_schema_versioned():
+    cpu_inmem = _ctx(
+        phase=re.PHASE_CELL_STACK_INMEM,
+        per_unit_stack_bytes=50 * MIB,
+    )
+    cpu_stream = _ctx(per_unit_stack_bytes=200 * MIB)
+    joint = zs.JointPlanInput((cpu_stream, cpu_inmem), None)
+    plan = zs.plan_joint(joint, phase_requests=_requests())
+    assert plan.chosen.backend == re.BACKEND_CPU
+    assert plan.chosen.tile_px is None
+    assert plan.scheduler_version == zs.JOINT_SCHEDULER_VERSION
+    assert plan.to_manifest_dict()["joint_schema"] == zs.JOINT_SCHEMA
+    phases = {envelope.phase: envelope for envelope in plan.phases}
+    assert phases[re.PHASE_CELL_STACK_INMEM].backend == re.BACKEND_CPU
+    assert phases[re.PHASE_ASSEMBLY].overlaps_with == (
+        re.PHASE_CELL_STACK_INMEM,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +798,7 @@ def test_gpu_device_peak_map_must_cover_exactly_the_declared_tiles():
         _joint(gpu_facts=_gpu_facts(device_peak_bytes_by_tile=extra))
 
 
-def test_joint_context_requires_exactly_one_cpu_and_sequence():
+def test_joint_context_requires_at_least_one_cpu_and_sequence():
     with pytest.raises(zs.SchedulerConfigError):
         zs.JointPlanInput((), None)
     with pytest.raises(zs.SchedulerConfigError):
@@ -808,7 +1088,12 @@ def test_gpu_to_cpu_is_refused_when_it_would_grow_host_bytes():
     # bound. "GPU->CPU only" is the allowed backend direction, but it is still
     # bound by the no-resource-growth invariant: a fallback must rebuild and
     # re-validate instead of being offered as a legal shrink.
-    joint, _requests_value = _evidence_fixture()
+    cpu_stream = _ctx(per_unit_stack_bytes=200 * MIB)
+    gpu = _gpu_ctx(
+        profile=_profile(re.BACKEND_GPU),
+        time_model=lambda tile, k, prefetch: 1000 * (129 - int(tile)),
+    )
+    joint = zs.JointPlanInput((cpu_stream, gpu), _gpu_facts())
     gpu = _find_gpu(
         joint,
         tile_px=128,

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Sequence
 
 from . import calibration as zcal
@@ -137,9 +137,9 @@ SCHEDULER_VERSION = "r55-b0"
 MANIFEST_SCHEMA = "zemosaic-r55-manifest-v1"
 # R55-D additive joint planner/evidence schema. The R55-B SCHEDULER_VERSION
 # is deliberately NOT bumped: CPU-only manifests must stay byte-identical.
-JOINT_SCHEMA = "zemosaic-r55d-joint-planner-v1"
-JOINT_EVIDENCE_SCHEMA = "zemosaic-r55d-joint-evidence-v1"
-JOINT_SCHEDULER_VERSION = "r55-d0"
+JOINT_SCHEMA = "zemosaic-r55d-joint-planner-v2"
+JOINT_EVIDENCE_SCHEMA = "zemosaic-r55d-joint-evidence-v2"
+JOINT_SCHEDULER_VERSION = "r55-d1"
 
 MODE_LEGACY = "legacy"
 MODE_OBSERVE = "observe"
@@ -1012,11 +1012,12 @@ class GpuFacts:
 
 @dataclass(frozen=True)
 class JointRefusal:
-    """One deterministic backend-level refusal/eligibility entry."""
+    """One deterministic backend/phase-level refusal/eligibility entry."""
 
     backend: str
     reason_code: str
     detail: str
+    phase: str | None = None
 
     def __post_init__(self) -> None:
         if self.backend not in BACKENDS:
@@ -1031,10 +1032,15 @@ class JointRefusal:
             raise SchedulerConfigError(
                 "refusal detail must be a non-empty string"
             )
+        if self.phase is not None and self.phase not in PHASES:
+            raise SchedulerConfigError(
+                f"refusal phase {self.phase!r} is outside the closed phase set"
+            )
 
     def to_dict(self) -> dict:
         return {
             "backend": self.backend,
+            "phase": self.phase,
             "reason_code": self.reason_code,
             "detail": self.detail,
         }
@@ -1044,14 +1050,18 @@ class JointRefusal:
 class JointPlanInput:
     """Explicit immutable input to the R55-D joint planner.
 
-    ``contexts`` is normalised CPU-first, so callers may pass backend contexts in
-    any order. Exactly one CPU context is required; a GPU context is optional and
-    requires explicit :class:`GpuFacts`. Both contexts must describe the same
-    host budget and the same frozen scientific identity.
+    ``contexts`` may contain at most one CPU ``cell_stack_inmem``, at most one
+    CPU ``cell_stack_stream`` and at most one GPU ``cell_stack_stream``; at
+    least one CPU context is required. Contexts are normalised canonically
+    independent of caller order. All contexts share the host budget/factors and
+    the frozen scientific identity; the stack phase may differ between inmem and
+    stream. A GPU context requires explicit facts. CPU prefetch-overlap is an
+    explicit serializable fact and defaults to unmeasured.
     """
 
     contexts: tuple[PlanContext, ...]
     gpu_facts: GpuFacts | None = None
+    cpu_prefetch_overlap_measured: bool = False
 
     def __post_init__(self) -> None:
         raw = self.contexts
@@ -1068,32 +1078,43 @@ class JointPlanInput:
                     "joint contexts entries must be PlanContext, got "
                     f"{type(context).__name__}"
                 )
-        cpu = [c for c in contexts if c.backend == BACKEND_CPU]
-        gpu = [c for c in contexts if c.backend == BACKEND_GPU]
-        unknown = [c for c in contexts if c.backend not in BACKENDS]
-        if unknown:
+        seen: set[tuple[str, str]] = set()
+        cpu_contexts: list[PlanContext] = []
+        gpu_contexts: list[PlanContext] = []
+        for context in contexts:
+            if context.backend not in BACKENDS:
+                raise SchedulerConfigError(
+                    f"joint context has unknown backend {context.backend!r}"
+                )
+            key = (context.backend, context.phase)
+            if key in seen:
+                raise SchedulerConfigError(
+                    "duplicate joint context for "
+                    f"(backend={context.backend!r}, phase={context.phase!r})"
+                )
+            seen.add(key)
+            if context.backend == BACKEND_CPU:
+                cpu_contexts.append(context)
+            else:
+                gpu_contexts.append(context)
+        if not cpu_contexts:
             raise SchedulerConfigError(
-                "joint contexts contain unknown backend(s): "
-                f"{[c.backend for c in unknown]}"
+                "joint planner requires at least one CPU context"
             )
-        if len(cpu) != 1:
-            raise SchedulerConfigError(
-                "joint planner requires exactly one CPU context, got "
-                f"{len(cpu)}"
-            )
-        if len(gpu) > 1:
+        if len(gpu_contexts) > 1:
             raise SchedulerConfigError(
                 "joint planner accepts at most one GPU context, got "
-                f"{len(gpu)}"
+                f"{len(gpu_contexts)}"
             )
-        _validate_context(cpu[0])
-        if gpu:
-            _validate_gpu_context(gpu[0])
-        if gpu and self.gpu_facts is None:
+        for context in cpu_contexts:
+            _validate_context(context)
+        if gpu_contexts:
+            _validate_gpu_context(gpu_contexts[0])
+        if gpu_contexts and self.gpu_facts is None:
             raise SchedulerConfigError(
                 "a GPU PlanContext requires explicit gpu_facts (never probed)"
             )
-        if not gpu and self.gpu_facts is not None:
+        if not gpu_contexts and self.gpu_facts is not None:
             raise SchedulerConfigError(
                 "gpu_facts supplied without a GPU PlanContext"
             )
@@ -1104,20 +1125,82 @@ class JointPlanInput:
                 f"gpu_facts must be GpuFacts, got "
                 f"{type(self.gpu_facts).__name__}"
             )
-        normalized = (cpu[0],) if not gpu else (cpu[0], gpu[0])
+        measured = _joint_bool(
+            self.cpu_prefetch_overlap_measured,
+            "cpu_prefetch_overlap_measured",
+        )
+        object.__setattr__(
+            self, "cpu_prefetch_overlap_measured", measured
+        )
+        normalized = tuple(
+            sorted(cpu_contexts + gpu_contexts, key=_context_rank)
+        )
         object.__setattr__(self, "contexts", normalized)
-        if gpu:
-            _validate_joint_consistency(cpu[0], gpu[0])
+        reference = next(
+            context
+            for context in normalized
+            if context.backend == BACKEND_CPU
+        )
+        for context in normalized:
+            if context is reference:
+                continue
+            _validate_joint_consistency(reference, context)
+        if gpu_contexts:
             assert self.gpu_facts is not None
-            _validate_device_peak_coverage(gpu[0], self.gpu_facts)
+            _validate_device_peak_coverage(gpu_contexts[0], self.gpu_facts)
+
+    @property
+    def cpu_contexts(self) -> tuple[PlanContext, ...]:
+        return tuple(
+            context
+            for context in self.contexts
+            if context.backend == BACKEND_CPU
+        )
 
     @property
     def cpu_context(self) -> PlanContext:
-        return self.contexts[0]
+        """Canonical first CPU context (inmem before stream)."""
+        return self.cpu_contexts[0]
+
+    @property
+    def cpu_context_count(self) -> int:
+        return len(self.cpu_contexts)
 
     @property
     def gpu_context(self) -> PlanContext | None:
-        return self.contexts[1] if len(self.contexts) > 1 else None
+        for context in self.contexts:
+            if context.backend == BACKEND_GPU:
+                return context
+        return None
+
+    def cpu_context_for_phase(self, phase: str) -> PlanContext | None:
+        for context in self.cpu_contexts:
+            if context.phase == phase:
+                return context
+        return None
+
+    def stack_context_for(self, candidate: Candidate) -> PlanContext | None:
+        if not isinstance(candidate, Candidate):
+            raise SchedulerConfigError(
+                "stack_context_for expects a Candidate"
+            )
+        if candidate.backend == BACKEND_GPU:
+            return self.gpu_context
+        if candidate.tile_px is None:
+            return self.cpu_context_for_phase(PHASE_CELL_STACK_INMEM)
+        return self.cpu_context_for_phase(PHASE_CELL_STACK_STREAM)
+
+    def host_context_for(self, phase: str | None = None) -> PlanContext:
+        if phase is not None:
+            context = self.cpu_context_for_phase(phase)
+            if context is not None:
+                return context
+        return self.cpu_context
+
+
+def _context_rank(context: PlanContext) -> tuple[int, int]:
+    backend_rank = 0 if context.backend == BACKEND_CPU else 1
+    return (backend_rank, PHASES.index(context.phase))
 
 
 def _validate_gpu_context(context: PlanContext) -> None:
@@ -1130,10 +1213,10 @@ def _validate_gpu_context(context: PlanContext) -> None:
         )
 
 
-def _validate_joint_consistency(cpu: PlanContext, gpu: PlanContext) -> None:
+def _validate_joint_consistency(
+    reference: PlanContext, other: PlanContext
+) -> None:
     problems: list[str] = []
-    if cpu.phase != gpu.phase:
-        problems.append(f"phase differs {cpu.phase!r} != {gpu.phase!r}")
     for name in (
         "raw_available_bytes",
         "factor_num",
@@ -1147,24 +1230,27 @@ def _validate_joint_consistency(cpu: PlanContext, gpu: PlanContext) -> None:
         "refinement_rank",
         "run_id",
     ):
-        if getattr(cpu, name) != getattr(gpu, name):
+        if getattr(reference, name) != getattr(other, name):
             problems.append(f"host/science fact {name} differs")
-    if (cpu.margin_num, cpu.margin_den) != (gpu.margin_num, gpu.margin_den):
-        problems.append("margin differs between CPU and GPU contexts")
-    if tuple(cpu.layout) != tuple(gpu.layout):
+    if (
+        reference.margin_num,
+        reference.margin_den,
+    ) != (other.margin_num, other.margin_den):
+        problems.append("margin differs between joint contexts")
+    if tuple(reference.layout) != tuple(other.layout):
         problems.append("layout differs")
-    if cpu.patch_hw != gpu.patch_hw:
+    if reference.patch_hw != other.patch_hw:
         problems.append("patch_hw differs")
-    if cpu.identity != gpu.identity:
+    if reference.identity != other.identity:
         problems.append(
             "frozen identity (layout/cells/frames/halo/rank) differs"
         )
-    if bool(cpu.pinned) != bool(gpu.pinned):
+    if bool(reference.pinned) != bool(other.pinned):
         problems.append("pinned differs")
     if problems:
         raise SchedulerConfigError(
-            "CPU/GPU joint contexts must describe the same host and science "
-            "identity: " + "; ".join(problems)
+            "joint contexts must describe the same host and science identity: "
+            + "; ".join(problems)
         )
 
 
@@ -1357,21 +1443,74 @@ def _enumerate_gpu_candidates(
     return tuple(out)
 
 
+def _enumerate_cpu_joint(
+    context: PlanContext, *, measured: bool
+) -> tuple[Candidate, ...]:
+    """R55-B CPU candidates with joint-only prefetch-credit normalization.
+
+    The legacy :func:`enumerate_candidates` API is untouched. In the additive
+    joint layer, an unmeasured CPU prefetch depth may remain feasible but must
+    receive the SAME time-model result as prefetch=0. Only an explicit measured
+    overlap fact may pass the real prefetch depth to the CPU time model.
+    """
+    candidates = enumerate_candidates(context)
+    if measured or context.time_model is None:
+        return tuple(candidates)
+    out: list[Candidate] = []
+    for candidate in candidates:
+        if (
+            candidate.prefetch_units <= 0
+            or candidate.predicted_makespan_ns is None
+        ):
+            out.append(candidate)
+            continue
+        wave = (
+            int(context.units_total) + int(candidate.units_in_flight) - 1
+        ) // int(candidate.units_in_flight)
+        per_unit_ns = int(
+            context.time_model(
+                candidate.tile_px,
+                int(candidate.units_in_flight),
+                0,
+            )
+        )
+        if per_unit_ns < 0:
+            raise SchedulerConfigError(
+                "time_model returned a negative duration"
+            )
+        out.append(
+            replace(
+                candidate,
+                predicted_makespan_ns=wave * per_unit_ns,
+            )
+        )
+    out.sort(key=lambda candidate: candidate.ordering_key())
+    return tuple(out)
+
+
 def enumerate_joint_candidates(
     joint: JointPlanInput,
 ) -> tuple[Candidate, ...]:
     """Exhaustive canonical CPU-first joint enumeration.
 
-    CPU candidates are exactly R55-B's accepted list. GPU candidates are added
-    only when the caller explicitly supplies a requested, available,
-    parity-qualified context with valid complete device facts. The result is
-    independent of backend-context order, mapping order and cell order.
+    The union covers CPU in-memory (tile=None), CPU streaming (integer product
+    tiles) and GPU streaming (K=1). GPU candidates are added only when the
+    caller explicitly supplies a requested, available, parity-qualified context
+    with valid complete device facts. The result is independent of
+    backend-context order, mapping order and cell order.
     """
     if not isinstance(joint, JointPlanInput):
         raise SchedulerConfigError(
             f"expected JointPlanInput, got {type(joint).__name__}"
         )
-    cpu_candidates = enumerate_candidates(joint.cpu_context)
+    cpu_candidates: list[Candidate] = []
+    for context in joint.cpu_contexts:
+        cpu_candidates.extend(
+            _enumerate_cpu_joint(
+                context,
+                measured=joint.cpu_prefetch_overlap_measured,
+            )
+        )
     gpu_candidates: tuple[Candidate, ...] = ()
     if joint.gpu_context is not None and _gpu_blocking_refusal(joint) is None:
         gpu_candidates = _enumerate_gpu_candidates(joint)
@@ -1396,7 +1535,13 @@ def joint_refusal_trail(joint: JointPlanInput) -> tuple[JointRefusal, ...]:
             f"expected JointPlanInput, got {type(joint).__name__}"
         )
     entries = [
-        JointRefusal(BACKEND_CPU, REASON_OK, "cpu context accepted")
+        JointRefusal(
+            BACKEND_CPU,
+            REASON_OK,
+            f"cpu context accepted ({context.phase})",
+            phase=context.phase,
+        )
+        for context in joint.cpu_contexts
     ]
     if joint.gpu_context is None:
         entries.append(
@@ -1408,13 +1553,19 @@ def joint_refusal_trail(joint: JointPlanInput) -> tuple[JointRefusal, ...]:
         )
     else:
         blocked = _gpu_blocking_refusal(joint)
-        entries.append(
-            blocked
-            if blocked is not None
-            else JointRefusal(
-                BACKEND_GPU, REASON_OK, "gpu context eligible"
+        if blocked is not None:
+            entries.append(
+                replace(blocked, phase=joint.gpu_context.phase)
             )
-        )
+        else:
+            entries.append(
+                JointRefusal(
+                    BACKEND_GPU,
+                    REASON_OK,
+                    "gpu context eligible",
+                    phase=joint.gpu_context.phase,
+                )
+            )
     return tuple(entries)
 
 
@@ -1777,6 +1928,36 @@ def plan(
     raise last
 
 
+def _joint_phase_requests(
+    requests: Sequence[PhaseRequest], phase: str
+) -> tuple[PhaseRequest, ...]:
+    """Rewrite the assembly overlap to the CHOSEN stack phase.
+
+    Multi-context joint plans cannot know the winner when the caller builds the
+    requests. The joint builder derives the truthful assembly overlap from the
+    chosen context. A single-context CPU call whose assembly request already
+    names its stack phase is returned unchanged, preserving R55-B bytes.
+    """
+    out: list[PhaseRequest] = []
+    for request in requests:
+        if not isinstance(request, PhaseRequest):
+            raise SchedulerConfigError(
+                "phase_requests entries must be PhaseRequest"
+            )
+        if request.phase == PHASE_ASSEMBLY:
+            for other in request.overlaps_with:
+                if other not in CELL_STACK_PHASES:
+                    raise SchedulerConfigError(
+                        "joint assembly overlaps_with may only name "
+                        "cell_stack_* phases or be empty, got "
+                        f"{request.overlaps_with!r}"
+                    )
+            if tuple(request.overlaps_with) != (phase,):
+                request = replace(request, overlaps_with=(phase,))
+        out.append(request)
+    return tuple(out)
+
+
 def _gpu_stack_envelope(
     joint: JointPlanInput, candidate: Candidate
 ) -> ResourceEnvelope:
@@ -1885,13 +2066,37 @@ def build_joint_plan_set(
             "candidate does not match the joint enumeration "
             "(stale or tampered plan)"
         )
+    stack_context = joint.stack_context_for(match)
+    if stack_context is None:
+        raise SchedulerConfigError(
+            "no joint context corresponds to the chosen stack candidate"
+        )
     if candidate.backend == BACKEND_CPU:
-        return build_plan_set(
-            joint.cpu_context,
+        plan_set = build_plan_set(
+            stack_context,
             candidate=match,
-            phase_requests=phase_requests,
+            phase_requests=_joint_phase_requests(
+                phase_requests, stack_context.phase
+            ),
             mode=mode,
         )
+        if len(joint.contexts) > 1:
+            # Multi-context joint calls are schema-versioned additive behavior.
+            # A single-context CPU call is returned byte-identically.
+            decisions = tuple(
+                {
+                    **dict(decision),
+                    "at": "plan_joint",
+                    "joint_context_count": len(joint.contexts),
+                }
+                for decision in plan_set.decisions
+            )
+            plan_set = replace(
+                plan_set,
+                decisions=decisions,
+                scheduler_version=JOINT_SCHEDULER_VERSION,
+            )
+        return plan_set
 
     gpu = joint.gpu_context
     facts = joint.gpu_facts
@@ -1917,7 +2122,8 @@ def build_joint_plan_set(
             "candidate device peak does not match the explicit device model"
         )
 
-    requests = tuple(phase_requests)
+    host_context = joint.host_context_for(gpu.phase)
+    requests = _joint_phase_requests(phase_requests, gpu.phase)
     phases_present = {request.phase for request in requests}
     missing = [p for p in REQUIRED_PLAN_PHASES if p not in phases_present]
     if missing:
@@ -1945,19 +2151,19 @@ def build_joint_plan_set(
         )
 
     envelopes = [
-        _request_envelope(joint.cpu_context, request)
+        _request_envelope(host_context, request)
         for request in requests
     ]
     envelopes.append(_gpu_stack_envelope(joint, match))
     validated = validate_envelope_set(envelopes, headless=True)
     raw_peak, peak = aggregate_host_peak_bytes(validated)
-    if peak > int(joint.cpu_context.budget_bytes):
+    if peak > int(host_context.budget_bytes):
         raise PlanRefused(
             REASON_REFUSE_HOST_RAM,
             f"aggregate host peak {peak} B (raw {raw_peak} B + margin "
-            f"{joint.cpu_context.margin_num}/"
-            f"{joint.cpu_context.margin_den}) > budget "
-            f"{joint.cpu_context.budget_bytes} B",
+            f"{host_context.margin_num}/"
+            f"{host_context.margin_den}) > budget "
+            f"{host_context.budget_bytes} B",
             candidates=[match],
         )
     device_raw, _device_margin_applied = aggregate_device_peak_bytes(
@@ -2003,6 +2209,8 @@ def build_joint_plan_set(
     decision = {
         "at": "plan_joint",
         "chosen": chosen_env.envelope_id,
+        "stack_phase": gpu.phase,
+        "host_phase": host_context.phase,
         "reason_code": match.reason_code,
         "candidate": {
             "backend": match.backend,
@@ -2014,7 +2222,7 @@ def build_joint_plan_set(
         "host_peak_bytes": int(match.host_peak_bytes),
         "device_peak_bytes": int(match.device_peak_bytes),
         "disk_bytes": int(match.disk_bytes),
-        "budget_bytes": int(joint.cpu_context.budget_bytes),
+        "budget_bytes": int(host_context.budget_bytes),
         "device_budget_bytes": int(facts.vram_budget_bytes),
         "aggregate_host_peak_bytes": int(peak),
         "aggregate_device_peak_bytes": int(device_raw_stamped),
@@ -2026,8 +2234,8 @@ def build_joint_plan_set(
         )
     return PlanSet(
         mode=mode,
-        budget_bytes=int(joint.cpu_context.budget_bytes),
-        raw_available_bytes=int(joint.cpu_context.raw_available_bytes),
+        budget_bytes=int(host_context.budget_bytes),
+        raw_available_bytes=int(host_context.raw_available_bytes),
         aggregate_host_peak_bytes=int(peak),
         aggregate_host_peak_bytes_raw=int(raw_peak),
         aggregate_device_peak_bytes=int(device_raw_stamped),
@@ -2036,8 +2244,8 @@ def build_joint_plan_set(
         phases=stamped,
         decisions=(decision,),
         plan_hash=plan_hash,
-        identity=joint.cpu_context.identity,
-        run_id=joint.cpu_context.run_id,
+        identity=host_context.identity,
+        run_id=host_context.run_id,
         scheduler_version=JOINT_SCHEDULER_VERSION,
     )
 
@@ -2346,6 +2554,10 @@ def joint_input_payload(joint: JointPlanInput) -> dict:
         "contexts": [
             _joint_context_payload(context) for context in joint.contexts
         ],
+        "cpu_context_count": len(joint.cpu_contexts),
+        "cpu_prefetch_overlap_measured": bool(
+            joint.cpu_prefetch_overlap_measured
+        ),
         "gpu_facts": (
             None if joint.gpu_facts is None else joint.gpu_facts.to_dict()
         ),
@@ -2360,6 +2572,7 @@ def joint_enumeration_payload(joint: JointPlanInput) -> dict:
         "schema": JOINT_SCHEMA,
         "scheduler_version": JOINT_SCHEDULER_VERSION,
         "input": joint_input_payload(joint),
+        "cpu_context_count": len(joint.cpu_contexts),
         "refusals": [entry.to_dict() for entry in refusals],
         "candidate_count": len(candidates),
         "feasible_count": sum(
@@ -2400,10 +2613,11 @@ def joint_evidence_payload(
     payload = {
         "schema": JOINT_EVIDENCE_SCHEMA,
         "mission": "ZM-ZEGRID-R55-D-JOINT-PLANNER-20261023",
-        "phase": "D1-core",
+        "phase": "D1-rework-1",
         "joint_schema": JOINT_SCHEMA,
         "scheduler_version": JOINT_SCHEDULER_VERSION,
         "input": enumeration["input"],
+        "cpu_context_count": enumeration["cpu_context_count"],
         "refusals": enumeration["refusals"],
         "candidate_count": enumeration["candidate_count"],
         "feasible_count": enumeration["feasible_count"],
