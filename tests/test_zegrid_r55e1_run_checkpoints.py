@@ -253,14 +253,14 @@ def _synthetic_decision(*, k_target=3):
     )
 
 
-def _force_k3_decide(_real_decide):
+def _force_k_decide(_real_decide, k):
     def patched(**kwargs):
         decision = _real_decide(**kwargs)
         target = next(
             c
             for c in zs.enumerate_candidates(decision.stream_context)
             if c.tile_px == 128
-            and c.units_in_flight == 3
+            and c.units_in_flight == int(k)
             and c.workers_per_unit == 1
             and c.prefetch_units == 0
             and c.feasible
@@ -273,6 +273,10 @@ def _force_k3_decide(_real_decide):
         )
 
     return patched
+
+
+def _force_k3_decide(_real_decide):
+    return _force_k_decide(_real_decide, 3)
 
 
 def _run_product(
@@ -605,6 +609,36 @@ def test_latch_is_consumed_exactly_once_and_malformed_fails_closed():
     }
     with pytest.raises(zrt.RuntimeControlError):
         latch.consume_validated()
+
+
+def test_public_record_malformed_fact_is_fatal_and_survives_valid_sample():
+    latch = zrt.PressureLatch()
+    # This is the exact public path the in-wave heartbeat uses.
+    latch.record(
+        {
+            "host": {"raw_available_bytes": True, "budget_bytes": 1},
+            "sampled_monotonic_ns": 1,
+        }
+    )
+    snapshot = latch.snapshot()
+    assert snapshot["pending_fatal"] is True
+    assert snapshot["fatal_errors"]
+    # A later valid sample must NOT erase the pending malformed admission fact.
+    latch.record(_facts(WITNESS_AVAILABLE_BYTES))
+    with pytest.raises(zrt.RuntimeControlError, match="pending latched"):
+        latch.consume_validated()
+    # The consumed generation (error + valid sample) is cleared exactly once.
+    assert latch.consume_validated() is None
+    assert latch.snapshot()["pending_fatal"] is False
+
+
+def test_collector_failure_is_a_pending_fatal_latch():
+    latch = zrt.PressureLatch()
+    latch.record_error(RuntimeError("MemAvailable collection failed"))
+    latch.record(_facts(WITNESS_AVAILABLE_BYTES))
+    with pytest.raises(zrt.RuntimeControlError, match="collection failed"):
+        latch.consume_validated()
+    assert latch.consume_validated() is None
 
 
 def test_checkpoint_malformed_latched_fact_fails_closed(monkeypatch):
@@ -1091,6 +1125,96 @@ def test_transient_mid_wave_drop_is_consumed_at_next_boundary(
     assert not any(
         thread.name.startswith("r55e1") for thread in threading.enumerate()
     )
+
+
+def test_malformed_in_wave_sample_refuses_at_next_boundary(routine_input, tmp_path):
+    out = tmp_path / "refused_latched"
+    calls = {"n": 0}
+
+    def pressure(_root):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            facts = _facts(WITNESS_AVAILABLE_BYTES)
+            facts["host"]["raw_available_bytes"] = True
+            return facts
+        return _facts(WITNESS_AVAILABLE_BYTES)
+
+    with pytest.raises(zz._R55RunRefused) as ei:
+        _run_product(
+            routine_input,
+            out,
+            "active",
+            sample=_ScheduleSample([WITNESS_AVAILABLE_BYTES] * 10),
+            decide=_force_k3_decide(zz._r55_active_decide),
+            pressure=pressure,
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+    assert "latched" in ei.value.detail
+    assert ei.value.record["publication"]["fits"] is False
+    assert ei.value.record["publication"]["manifest"] is False
+    assert not (out / "mosaic_grid.fits").exists()
+    assert not (out / "zegrid_manifest.json").exists()
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
+
+
+def test_terminal_pending_malformed_fact_refuses_publication(
+    routine_input, tmp_path
+):
+    out = tmp_path / "refused_terminal"
+
+    def pressure(_root):
+        facts = _facts(WITNESS_AVAILABLE_BYTES)
+        facts["host"]["raw_available_bytes"] = True
+        return facts
+
+    with pytest.raises(zz._R55RunRefused) as ei:
+        _run_product(
+            routine_input,
+            out,
+            "active",
+            sample=_ScheduleSample([WITNESS_AVAILABLE_BYTES] * 10),
+            decide=_force_k_decide(zz._r55_active_decide, 6),
+            pressure=pressure,
+        )
+    assert ei.value.reason_code == re.REASON_REFUSE_HOST_RAM
+    assert "terminal" in ei.value.detail
+    assert ei.value.record["publication"]["fits"] is False
+    assert ei.value.record["publication"]["manifest"] is False
+    assert not (out / "mosaic_grid.fits").exists()
+    assert not (out / "zegrid_manifest.json").exists()
+    assert not any(
+        thread.name.startswith("r55e1") for thread in threading.enumerate()
+    )
+
+
+def test_terminal_valid_low_pressure_is_recorded_not_applied(
+    routine_input, tmp_path
+):
+    out = tmp_path / "terminal_valid"
+    legacy = tmp_path / "terminal_valid_legacy"
+    _run_product(routine_input, legacy, "legacy")
+    _run_product(
+        routine_input,
+        out,
+        "active",
+        sample=_ScheduleSample([WITNESS_AVAILABLE_BYTES] * 10),
+        decide=_force_k_decide(zz._r55_active_decide, 6),
+        pressure=lambda _root: _facts(5 * GIB // 2),
+    )
+    for name in FITS_NAMES:
+        assert _digest(legacy / name) == _digest(out / name), name
+    manifest = _manifest(out)
+    terminal = manifest["r55_run_telemetry"]["terminal"]
+    assert terminal is not None
+    assert terminal["latched"]["raw_available_bytes"] == 5 * GIB // 2
+    assert terminal["pressure_observed"] is True
+    assert "recorded_only" in terminal["action"]
+    block = manifest["r55_scheduler"]
+    # No post-execution shrink or mapping rewrite was invented.
+    assert block["mapping"]["units_in_flight"] == 6
+    assert block["run"]["shrink_count"] == 0
 
 
 def test_host_exhaustion_refuses_and_publishes_nothing(routine_input, tmp_path):

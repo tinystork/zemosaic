@@ -6691,7 +6691,15 @@ def _run_single(
         latch = zrt.PressureLatch()
 
         def _heartbeat():
-            latch.record(_r55_sample_pressure(disk_root))
+            # Any collection failure is an admission-fact failure: latch it as
+            # fatal for the next safe boundary (never downgrade to optional
+            # diagnostic telemetry).
+            try:
+                sample = _r55_sample_pressure(disk_root)
+            except Exception as exc:  # noqa: BLE001 - carried to boundary
+                latch.record_error(exc)
+                return
+            latch.record(sample)
 
         def _wave_progress(base_offset):
             def _cb(done, _total):
@@ -6867,6 +6875,77 @@ def _run_single(
             offset = end
             wave_index += 1
 
+        # TERMINAL safe boundary: the final wave may have latched a malformed
+        # admission fact (or a collector failure) with no next wave. Never
+        # silently drop it before assembly/publication. A valid low-pressure
+        # terminal sample is recorded conservatively; we do NOT invent a
+        # post-execution shrink or rewrite the final mapping.
+        terminal_fact = None
+        try:
+            terminal_fact = latch.consume_validated()
+        except zrt.RuntimeControlError as exc:
+            cleanup = []
+            for task in all_tasks:
+                if task[4] is None:
+                    continue
+                cache_dir = Path(task[3])
+                existed = bool(cache_dir.exists())
+                removed = bool(_safe_rmtree(task[3], None))
+                cleanup.append(
+                    {
+                        "cell_id": str(task[0].cell_id),
+                        "existed": bool(existed),
+                        "removed": bool(removed),
+                    }
+                )
+            detail = (
+                "malformed pending in-wave fact at terminal boundary: "
+                f"{exc}"
+            )
+            record = {
+                "schema": zrt.RUN_CONTROL_SCHEMA,
+                "status": "refused",
+                "reason_code": renv.REASON_REFUSE_HOST_RAM,
+                "detail": detail,
+                "wave_index": int(wave_index),
+                "remaining_units": 0,
+                "shrink_steps": [],
+                "unavailable_shrinks": [
+                    dict(x) for x in _R55E1_UNAVAILABLE_SHRINKS
+                ],
+                "cleanup": cleanup,
+                "waves_completed": int(wave_index),
+                "publication": {
+                    "fits": False,
+                    "manifest": False,
+                    "assembly": False,
+                },
+            }
+            record["telemetry"] = zrt.build_run_telemetry(
+                waves=wave_telemetry,
+                checkpoints=checkpoints,
+                shrink_count=shrink_count,
+                refusal=record,
+                parent_end=zrt.read_parent_memory(),
+            )
+            _emit(
+                "ZeGrid: R55-E1 RUN REFUSED at the terminal safe boundary — "
+                f"{detail}. No FITS, manifest or science publication.",
+                lvl="ERROR", callback=progress_callback,
+            )
+            raise _R55RunRefused(
+                renv.REASON_REFUSE_HOST_RAM, detail, record=record
+            ) from exc
+        terminal_info = None
+        if terminal_fact is not None:
+            terminal_info = {
+                "latched": dict(terminal_fact),
+                "pressure_observed": True,
+                "action": (
+                    "recorded_only_no_post_execution_shrink_or_mapping_rewrite"
+                ),
+            }
+
         total_run_wall = time.perf_counter() - run_t0
         meta = _r55_merge_wave_meta(
             metas, total_tasks=total_tasks, wave_count=wave_index
@@ -6925,6 +7004,7 @@ def _run_single(
             refusal=None,
             parent_end=zrt.read_parent_memory(),
             deterministic_ref=zrt.sha256_payload(run_block),
+            terminal=terminal_info,
         )
         return (
             results_local,

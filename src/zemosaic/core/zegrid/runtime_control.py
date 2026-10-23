@@ -459,14 +459,16 @@ def validate_latched_fact(sample: Any) -> dict:
         minimum=1,
     )
     expected = run_budget_bytes(raw)
-    stored = sample.get("budget_bytes")
-    if stored is not None:
-        stored_int = strict_int(stored, "latched RUN budget", minimum=0)
-        if stored_int != expected:
-            raise RuntimeControlError(
-                "latched RUN budget "
-                f"{stored_int} != exact 90% budget {expected} for raw {raw}"
-            )
+    if "budget_bytes" not in sample or sample.get("budget_bytes") is None:
+        raise RuntimeControlError(
+            "latched RUN fact is missing the exact 90% budget"
+        )
+    stored_int = strict_int(sample.get("budget_bytes"), "latched RUN budget", minimum=0)
+    if stored_int != expected:
+        raise RuntimeControlError(
+            "latched RUN budget "
+            f"{stored_int} != exact 90% budget {expected} for raw {raw}"
+        )
     return {
         "raw_available_bytes": int(raw),
         "budget_bytes": int(expected),
@@ -478,53 +480,84 @@ class PressureLatch:
     """Thread-safe one-slot latch of the LOWEST valid pressure observation.
 
     The sampler may write during a wave; the caller consumes only at the next
-    wave boundary. Nothing here can mutate a task, a result or a science array.
+    wave boundary. A malformed admission fact (or a collector failure) is a
+    PENDING FATAL latch error: a later valid sample does NOT erase it. The
+    consumer atomically takes the lowest valid sample and any pending error,
+    raising on the error and clearing that consumed generation.
+
+    Nothing here can mutate a task, a result or a science array.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sample: dict | None = None
         self._count = 0
-        self._errors: list[str] = []
+        self._fatal_errors: list[str] = []
 
     def record(self, sample: Mapping[str, Any]) -> None:
+        """Record one in-wave sample; malformed facts become fatal latches."""
         try:
-            host = sample["host"]
-            raw = strict_int(
-                host["raw_available_bytes"], "latched MemAvailable", minimum=1
+            if not isinstance(sample, Mapping):
+                raise RuntimeControlError(
+                    "latched sample must be a mapping, got "
+                    f"{type(sample).__name__}"
+                )
+            host = sample.get("host", sample)
+            if not isinstance(host, Mapping):
+                raise RuntimeControlError(
+                    "latched sample.host must be a mapping"
+                )
+            entry = validate_latched_fact(host)
+            entry["monotonic_ns"] = int(
+                sample.get("sampled_monotonic_ns", 0) or 0
             )
-            budget = strict_int(
-                host["budget_bytes"], "latched RUN budget", minimum=0
-            )
-        except Exception as exc:  # noqa: BLE001 - a malformed sample is only a diagnostic
-            with self._lock:
-                self._count += 1
-                if len(self._errors) < 8:
-                    self._errors.append(f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - preserved as a fatal latch
+            self.record_error(exc)
             return
-        entry = {
-            "raw_available_bytes": int(raw),
-            "budget_bytes": int(budget),
-            "monotonic_ns": int(sample.get("sampled_monotonic_ns", 0)),
-        }
         with self._lock:
             self._count += 1
-            if self._sample is None or raw < self._sample["raw_available_bytes"]:
+            if (
+                self._sample is None
+                or int(entry["raw_available_bytes"])
+                < int(self._sample["raw_available_bytes"])
+            ):
                 self._sample = entry
+
+    def record_error(self, exc: BaseException | str) -> None:
+        """Preserve a fatal in-wave admission/collection error for the boundary."""
+        message = (
+            exc if isinstance(exc, str)
+            else f"{type(exc).__name__}: {exc}"
+        )
+        with self._lock:
+            self._count += 1
+            if len(self._fatal_errors) < 8:
+                self._fatal_errors.append(str(message))
 
     def peek(self) -> dict | None:
         with self._lock:
             return None if self._sample is None else dict(self._sample)
 
-    def consume(self) -> dict | None:
+    def has_pending_error(self) -> bool:
         with self._lock:
-            sample = self._sample
-            self._sample = None
-            return None if sample is None else dict(sample)
+            return bool(self._fatal_errors)
 
     def consume_validated(self) -> dict | None:
-        """Consume exactly once, strict-validating the latched facts."""
-        sample = self.consume()
+        """Atomically consume the lowest valid sample AND pending fatal errors.
+
+        If a pending malformed/admission error exists, raise
+        :class:`RuntimeControlError` and clear that consumed generation. The
+        following consume returns ``None`` absent new samples/errors.
+        """
+        with self._lock:
+            sample = self._sample
+            errors = list(self._fatal_errors)
+            self._sample = None
+            self._fatal_errors = []
+        if errors:
+            raise RuntimeControlError(
+                "pending latched RUN fact error: " + "; ".join(errors)
+            )
         if sample is None:
             return None
         return validate_latched_fact(sample)
@@ -534,7 +567,9 @@ class PressureLatch:
             return {
                 "samples": int(self._count),
                 "lowest": None if self._sample is None else dict(self._sample),
-                "errors": list(self._errors),
+                "errors": list(self._fatal_errors),
+                "fatal_errors": list(self._fatal_errors),
+                "pending_fatal": bool(self._fatal_errors),
             }
 
 
@@ -601,9 +636,10 @@ class RunSampler:
                     sample = self._sample_fn()
                     self._latch.record(sample)
                     self.samples += 1
-                except Exception as exc:  # noqa: BLE001 - diagnostics only
+                except Exception as exc:  # noqa: BLE001 - fatal at the boundary
                     self.errors += 1
                     self.last_error = f"{type(exc).__name__}: {exc}"
+                    self._latch.record_error(exc)
                 elapsed = float(self._clock()) - started
                 delay = max(0.0, self._interval_s - elapsed)
                 if self._wait(delay):
@@ -791,6 +827,7 @@ def build_run_telemetry(
     refusal: Mapping[str, Any] | None = None,
     parent_end: Mapping[str, Any] | None = None,
     deterministic_ref: str | None = None,
+    terminal: Mapping[str, Any] | None = None,
 ) -> dict:
     """Observational RUN telemetry block (never used as a decision hash)."""
     total_wall = 0.0
@@ -829,6 +866,7 @@ def build_run_telemetry(
             "parent_end": dict(parent_end or {}),
         },
         "refusal": None if refusal is None else dict(refusal),
+        "terminal": None if terminal is None else dict(terminal),
         "deterministic_ref": deterministic_ref,
         "note": (
             "R55-E1 RUN telemetry: observational only. Wall times, RSS, "
