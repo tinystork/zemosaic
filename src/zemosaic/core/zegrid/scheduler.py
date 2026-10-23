@@ -97,6 +97,7 @@ __all__ = [
     "ACTIVE_EXECUTABLE_PHASES",
     "ActivePlanRejected",
     "active_cpu_phase",
+    "materialize_active_candidate",
     "active_mapping_for_candidate",
     "map_active_cpu_candidate",
     "active_final_plan_hash",
@@ -2798,6 +2799,102 @@ def active_cpu_phase(candidate: Candidate) -> str:
         if candidate.tile_px is None
         else PHASE_CELL_STACK_STREAM
     )
+
+
+def materialize_active_candidate(
+    context: PlanContext,
+    candidate: Candidate,
+    *,
+    raw_available_bytes: int | None = None,
+    factor_num: int | None = None,
+    factor_den: int | None = None,
+    budget_bytes: int | None = None,
+) -> Candidate:
+    """Rebuild a candidate from the canonical scheduler enumeration.
+
+    ``next_shrink`` deliberately changes only the tuple fields (backend, tile,
+    K, prefetch, workers) and preserves the previous projections. D2 must never
+    serialize those stale projections as the FINAL executable candidate. This
+    helper re-enumerates the owning context (optionally rebound to a fresh
+    4/5 PLAN observation) and returns the UNIQUE candidate with the exact same
+    tuple, carrying truthful recomputed host/disk/device projections,
+    feasibility/reason, estimate method/calibration and timing metadata.
+
+    A missing or duplicate tuple fails closed. An infeasible materialized
+    candidate is returned as-is; the caller must not accept it as final.
+    """
+    if not isinstance(context, PlanContext):
+        raise SchedulerConfigError(
+            f"expected PlanContext, got {type(context).__name__}"
+        )
+    if not isinstance(candidate, Candidate):
+        raise SchedulerConfigError(
+            f"expected Candidate, got {type(candidate).__name__}"
+        )
+    bound = context
+    if any(
+        value is not None
+        for value in (raw_available_bytes, factor_num, factor_den, budget_bytes)
+    ):
+        raw = (
+            int(context.raw_available_bytes)
+            if raw_available_bytes is None else int(raw_available_bytes)
+        )
+        fnum = (
+            int(context.factor_num)
+            if factor_num is None else int(factor_num)
+        )
+        fden = (
+            int(context.factor_den)
+            if factor_den is None else int(factor_den)
+        )
+        budget = (
+            int(context.budget_bytes)
+            if budget_bytes is None else int(budget_bytes)
+        )
+        if fnum < 1 or fden < 1:
+            raise SchedulerConfigError(
+                f"invalid rebound factor {fnum}/{fden}"
+            )
+        if budget != (fnum * raw) // fden:
+            raise SchedulerConfigError(
+                "rebound budget does not equal (factor*raw)//den: "
+                f"{budget} != ({fnum}*{raw})//{fden}"
+            )
+        bound = replace(
+            context,
+            raw_available_bytes=raw,
+            factor_num=fnum,
+            factor_den=fden,
+            budget_bytes=budget,
+        )
+    enumerated = enumerate_candidates(bound)
+    key = (
+        candidate.backend,
+        candidate.tile_px,
+        int(candidate.units_in_flight),
+        int(candidate.prefetch_units),
+        int(candidate.workers_per_unit),
+    )
+    matches = [
+        item for item in enumerated
+        if (
+            item.backend,
+            item.tile_px,
+            int(item.units_in_flight),
+            int(item.prefetch_units),
+            int(item.workers_per_unit),
+        ) == key
+    ]
+    if len(matches) != 1:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "candidate tuple "
+            f"{key!r} is not uniquely present in the canonical enumeration "
+            f"(matches={len(matches)})",
+            candidate=candidate,
+        )
+    return matches[0]
 
 
 def active_mapping_for_candidate(

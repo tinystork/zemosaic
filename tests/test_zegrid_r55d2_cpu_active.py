@@ -446,6 +446,85 @@ def test_identity_change_is_rejected():
 
 
 # ---------------------------------------------------------------------------
+# Candidate materialization (rework-2)
+# ---------------------------------------------------------------------------
+
+def _enumerated(ctx, *, tile, k, workers=1):
+    return next(
+        c for c in zs.enumerate_candidates(ctx)
+        if c.tile_px == tile
+        and c.units_in_flight == k
+        and c.prefetch_units == 0
+        and c.workers_per_unit == workers
+    )
+
+
+def test_materialized_k_shrink_recomputes_canonical_projections():
+    ctx = _context()
+    orig = _enumerated(ctx, tile=128, k=3)
+    name, stale = zs.next_shrink(orig, ctx)
+    assert name == "units_in_flight"
+    # next_shrink preserves the ORIGINAL projections (the defect D2 must not
+    # serialize as the final candidate).
+    assert stale.host_peak_bytes == orig.host_peak_bytes
+    assert stale.disk_bytes == orig.disk_bytes
+
+    canonical_k2 = _enumerated(ctx, tile=128, k=2)
+    materialized = zs.materialize_active_candidate(ctx, stale)
+    assert materialized == canonical_k2
+    assert materialized.feasible is True
+    assert materialized.host_peak_bytes == (
+        ctx.shared_bytes + 2 * ctx.per_unit_stack_bytes
+    )
+    assert materialized.host_peak_bytes < stale.host_peak_bytes
+    assert materialized.disk_bytes < stale.disk_bytes
+    assert materialized.host_peak_bytes != stale.host_peak_bytes
+    assert materialized.disk_bytes != stale.disk_bytes
+
+
+def test_materialized_shrink_rebinds_and_enforces_fresh_feasibility():
+    ctx = _context()
+    k2 = _enumerated(ctx, tile=128, k=2)
+    k1 = _enumerated(ctx, tile=128, k=1)
+    tight_raw = 1 * GIB
+    tight_budget = (4 * tight_raw) // 5
+
+    infeasible = zs.materialize_active_candidate(
+        ctx,
+        k2,
+        raw_available_bytes=tight_raw,
+        factor_num=4,
+        factor_den=5,
+        budget_bytes=tight_budget,
+    )
+    assert infeasible.feasible is False
+    assert infeasible.reason_code == re.REASON_REFUSE_HOST_RAM
+
+    feasible = zs.materialize_active_candidate(
+        ctx,
+        k1,
+        raw_available_bytes=tight_raw,
+        factor_num=4,
+        factor_den=5,
+        budget_bytes=tight_budget,
+    )
+    assert feasible.feasible is True
+    assert feasible.host_peak_bytes == (
+        ctx.shared_bytes + ctx.per_unit_stack_bytes
+    )
+    # A mismatched rebound budget is refused, not guessed.
+    with pytest.raises(zs.SchedulerConfigError):
+        zs.materialize_active_candidate(
+            ctx,
+            k1,
+            raw_available_bytes=tight_raw,
+            factor_num=4,
+            factor_den=5,
+            budget_bytes=tight_budget + 1,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Active manifest contract (unit)
 # ---------------------------------------------------------------------------
 
@@ -748,6 +827,12 @@ def test_fresh_pressure_shrinks_only_the_scheduler_plan(
     assert final["units_in_flight"] == diag["cells_in_flight"]
     assert final["workers_per_unit"] == diag["cache_workers_per_cell"]
     assert final["cpu_streaming_tile"] == diag["cpu_streaming_tile"]
+    # rework-2: the exposed fallback diagnostic is rebound to the FINAL
+    # envelope, not the stale base budget.
+    fallback = diag["cpu_fallback_plan"]
+    assert fallback["ram_budget_bytes"] == block["final_envelope"]["budget_bytes"]
+    assert fallback["raw_available_bytes"] == block["final_envelope"]["raw_available_bytes"]
+    assert fallback["plan_budget_bytes"] == block["final_envelope"]["budget_bytes"]
     # rework-1: the final candidate/hash are truthful, and the window that
     # admitted the correction is the fresh 4/5 observation (not the stale one).
     assert block["plan_hash_schema"] == zs.ACTIVE_FINAL_PLAN_SCHEMA
@@ -851,6 +936,10 @@ def test_post_gauge_pressure_shrinks_the_actual_stack_knobs(
     assert block["mapping"]["units_in_flight"] == final["units_in_flight"]
     assert diag["cells_in_flight"] == final["units_in_flight"]
     assert diag["mode"] == final["cell_task_mode"]
+    fallback = diag["cpu_fallback_plan"]
+    assert fallback["ram_budget_bytes"] == block["final_envelope"]["budget_bytes"]
+    assert fallback["raw_available_bytes"] == block["final_envelope"]["raw_available_bytes"]
+    assert fallback["plan_budget_bytes"] == block["final_envelope"]["budget_bytes"]
     # The correction is a real shrink and the final hash is not the initial one.
     assert (
         block["chosen_candidate"]["workers_per_unit"]

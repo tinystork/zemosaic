@@ -4686,7 +4686,7 @@ def _r55_active_apply(
         "feasible": True,
         "mode": mode,
         "max_bound_bytes": int(per_cell_footprint),
-        "ram_budget_bytes": int(base_env.budget_bytes),
+        "ram_budget_bytes": int(bound_budget),
         "tile": (None if tile is None else int(tile)),
         "cells_in_flight": int(units),
         "cache_workers_per_cell": int(workers),
@@ -4748,6 +4748,39 @@ def _r55_active_shrink_context(decision, candidate):
     )
 
 
+def _r55_next_materialized_shrink(*, decision, candidate, plan_obs=None):
+    """Advance one legal tuple shrink and MATERIALIZE it canonically.
+
+    ``next_shrink`` only changes tuple fields and preserves stale projections.
+    This helper re-enumerates the owning context (rebound to the fresh 4/5 PLAN
+    observation when pressure created one), skips scheduler-infeasible tuples
+    (still monotone), and returns the first FEASIBLE materialized candidate.
+
+    Returns ``(step_name, candidate)`` or ``(None, None)`` when no legal
+    feasible shrink remains.
+    """
+    context = _r55_active_shrink_context(decision, candidate)
+    if plan_obs is not None:
+        context = replace(
+            context,
+            raw_available_bytes=int(plan_obs.raw_available_bytes),
+            factor_num=rcontract.PLAN_FACTOR_NUM,
+            factor_den=rcontract.PLAN_FACTOR_DEN,
+            budget_bytes=int(plan_obs.budget_bytes),
+        )
+    current = candidate
+    while True:
+        name, nxt = zsched.next_shrink(current, context)
+        if name is None or nxt is None:
+            return None, None
+        materialized = zsched.materialize_active_candidate(context, nxt)
+        zsched.assert_shrink_only(current, materialized)
+        if materialized.feasible:
+            return name, materialized
+        # Scheduler-infeasible under the CURRENT window: continue shrinking.
+        current = materialized
+
+
 def _r55_active_admit(
     *, initial_bundle, decision
 ):
@@ -4781,8 +4814,21 @@ def _r55_active_admit(
             candidate=candidate,
             mapping=mapping,
         )
+    # Materialize the accepted initial winner from canonical enumeration so the
+    # final manifest never inherits stale projections, even with no shrink.
+    candidate = zsched.materialize_active_candidate(
+        _r55_active_shrink_context(decision, candidate), candidate
+    )
+    mapping = zsched.active_mapping_for_candidate(
+        candidate,
+        tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+        workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+    )
     bundle = _r55_active_apply(
-        initial_bundle, mapping=mapping, facts=decision.facts
+        initial_bundle,
+        mapping=mapping,
+        facts=decision.facts,
+        stage="preflight",
     )
     trail = []
 
@@ -4790,16 +4836,16 @@ def _r55_active_admit(
     #    (The scheduler's host model does not include the product's cache
     #    phase, so an honest exact mapping is re-checked here.)
     while bundle.envelope.aggregate_bytes > bundle.envelope.budget_bytes:
-        name, nxt = zsched.next_shrink(
-            candidate, _r55_active_shrink_context(decision, candidate)
+        name, nxt = _r55_next_materialized_shrink(
+            decision=decision, candidate=candidate, plan_obs=None
         )
         if name is None or nxt is None:
             raise rcontract.AdmissionExhausted(
                 "R55-D2 active plan cannot fit its own B_plan and has no legal "
-                f"shrink step left (aggregate {bundle.envelope.aggregate_bytes} > "
+                "feasible shrink step left (aggregate "
+                f"{bundle.envelope.aggregate_bytes} > "
                 f"B_plan {bundle.envelope.budget_bytes})"
             )
-        zsched.assert_shrink_only(candidate, nxt)
         trail.append(
             {
                 "at": "plan_fit",
@@ -4884,17 +4930,17 @@ def _r55_active_admit(
         # PlanEnvelope is REBOUND to that fresh 4/5 observation so the final
         # manifest never reports a stale PLAN observation.
         while True:
-            name, nxt = zsched.next_shrink(
-                candidate, _r55_active_shrink_context(decision, candidate)
+            name, nxt = _r55_next_materialized_shrink(
+                decision=decision, candidate=candidate, plan_obs=plan_obs
             )
             if name is None or nxt is None:
                 raise rcontract.AdmissionExhausted(
-                    "R55-D2 active admission miss and no legal shrink step "
-                    f"remains (aggregate {bundle.envelope.aggregate_bytes} > "
+                    "R55-D2 active admission miss and no legal FEASIBLE "
+                    f"shrink step remains (aggregate "
+                    f"{bundle.envelope.aggregate_bytes} > "
                     f"B_admit {miss_obs.budget_bytes})",
                     attempts=tuple(observations),
                 )
-            zsched.assert_shrink_only(candidate, nxt)
             trail.append(
                 {
                     "at": "admission_pressure",
@@ -5003,18 +5049,17 @@ def _r55_active_revalidate_launch(
         plan_obs = rcontract.Observation.plan(miss_obs.raw_available_bytes)
         observations.append(plan_obs)
         while True:
-            name, nxt = zsched.next_shrink(
-                candidate, _r55_active_shrink_context(decision, candidate)
+            name, nxt = _r55_next_materialized_shrink(
+                decision=decision, candidate=candidate, plan_obs=plan_obs
             )
             if name is None or nxt is None:
                 raise rcontract.AdmissionExhausted(
                     "R55-D2 active launch revalidation miss and no legal "
-                    f"shrink step remains (aggregate "
+                    "FEASIBLE shrink step remains (aggregate "
                     f"{bundle.envelope.aggregate_bytes} > B_admit "
                     f"{miss_obs.budget_bytes})",
                     attempts=tuple(observations),
                 )
-            zsched.assert_shrink_only(candidate, nxt)
             trail.append(
                 {
                     "at": "admission_pressure",
