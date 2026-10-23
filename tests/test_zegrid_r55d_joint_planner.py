@@ -871,3 +871,34 @@ def test_normal_import_does_not_load_cupy_or_cuda_readiness():
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert proc.stdout.strip().splitlines() == ["False", "False"]
+
+
+def test_normal_import_is_lazy_even_when_cupy_is_importable(tmp_path):
+    # Simulate an installed CuPy: a fake importable module that EXPLODES if the
+    # scheduler imports it. The scheduler must stay lazy (it never probes).
+    fake = tmp_path / "cupy.py"
+    fake.write_text(
+        "raise AssertionError('scheduler imported CuPy during normal import')\n",
+        encoding="utf-8",
+    )
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import zemosaic.core.zegrid.scheduler\n"
+        "print('cupy' in sys.modules)\n"
+        "print('zemosaic.core.zegrid.gpu_readiness' in sys.modules)\n"
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(tmp_path) + os.pathsep + str(SRC),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(SRC)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.strip().splitlines() == ["False", "False"]
