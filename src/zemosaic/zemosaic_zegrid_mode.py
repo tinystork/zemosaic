@@ -3982,6 +3982,48 @@ def _r55_gpu_readiness_observe_block(
     )
 
 
+def _r55_reconcile_gpu_readiness(block, gpu_ctx) -> dict:
+    """Reconcile the additive R55-C provenance with the ACTUAL final backend.
+
+    The observe block is built before stack execution, when only the selected
+    backend is known. A classified runtime GPU failure can later perform an exact
+    whole-batch CPU rerun. Immediately before any manifest/output write this
+    helper copies only the nested ``gpu_readiness`` chain and updates
+    ``product.effective_backend`` to the backend that actually produced the
+    successful output (``gpu`` only when ``actually_used`` AND ``final_backend``
+    prove GPU execution, otherwise ``cpu``).
+
+    ``requested_backend`` is never changed. The helper never raises and never
+    fabricates a missing block, so legacy mode and malformed shapes are preserved.
+    """
+    try:
+        if not isinstance(block, dict):
+            return block
+        gpu_readiness = block.get("gpu_readiness")
+        if not isinstance(gpu_readiness, dict):
+            return block
+        product = gpu_readiness.get("product")
+        if not isinstance(product, dict):
+            return block
+        ctx = gpu_ctx if isinstance(gpu_ctx, dict) else {}
+        executed_gpu = bool(
+            ctx.get("actually_used") is True and ctx.get("final_backend") == "gpu"
+        )
+        effective = "gpu" if executed_gpu else "cpu"
+        if product.get("effective_backend") == effective:
+            return block
+        new_block = dict(block)
+        new_gpu = dict(gpu_readiness)
+        new_product = dict(product)
+        new_product["effective_backend"] = effective
+        new_gpu["product"] = new_product
+        new_block["gpu_readiness"] = new_gpu
+        return new_block
+    except Exception:
+        # Provenance reconciliation must never abort a successful run.
+        return block
+
+
 def _build_r55_observe_block(
     *,
     bundle,
@@ -5441,6 +5483,14 @@ def _run_single(
             "failure_reason": repr(exc),
         }
         fin_uint16 = None
+
+    # R55-C rework-2: the observe block was built from the SELECTED backend.
+    # Reconcile its nested readiness provenance with the backend that actually
+    # produced the whole-batch output (runtime GPU->CPU fallback included) before
+    # any manifest/output write. Never changes requested_backend or execution.
+    _r55_scheduler_block = _r55_reconcile_gpu_readiness(
+        _r55_scheduler_block, gpu_ctx
+    )
 
     # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
     export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
