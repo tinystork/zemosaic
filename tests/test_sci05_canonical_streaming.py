@@ -264,15 +264,37 @@ def test_provider_no_input_mutation():
 # ---------------------------------------------------------------------------
 
 class TestValidation:
-    def test_gpu_backend_raises(self):
+    def test_gpu_backend_raises(self, monkeypatch):
+        # Hermetic unavailable-GPU guard: the contract under test is the
+        # validation boundary, NOT the host's CuPy installation. On a machine
+        # with a usable GPU the unpatched test would execute the valid backend
+        # and never raise; simulate the unavailable condition at the exact
+        # symbol the streaming executor imported. monkeypatch restores it.
+        import zemosaic.core.canonical_streaming as streaming
+
+        original_available = streaming.canonical_gpu_available
         arrays, masks = _corpus()
         req = CanonicalStackRequest(
             images=arrays, geometric_support=masks,
             normalization="none", weighting="none", rejection="none",
             combine="mean", taper="none", backend="gpu",
         )
-        with pytest.raises(cs.CanonicalStackValidationError):
-            run_canonical_stack_streaming(InMemoryCanonicalProvider(arrays, masks), req, tile_size=16)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                streaming, "canonical_gpu_available", lambda: False
+            )
+            with pytest.raises(
+                cs.CanonicalStackValidationError,
+                match="backend 'gpu' requested but CuPy/GPU is unavailable",
+            ):
+                run_canonical_stack_streaming(
+                    InMemoryCanonicalProvider(arrays, masks),
+                    req,
+                    tile_size=16,
+                )
+        # No leakage: the exact module symbol is restored after the context, so
+        # the real GPU path (exercised by the *_gpu suite) is untouched.
+        assert streaming.canonical_gpu_available is original_available
 
     def test_explicit_taper_raises(self):
         arrays, masks = _corpus()
