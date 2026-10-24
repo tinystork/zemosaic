@@ -1224,7 +1224,11 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
 #
 # Contract (enforced here):
 #
-#   * ONE producer thread and ONE consumer (GPU owner) thread (K == 1).
+#   * ONE bounded asynchronous CPU producer thread and ONE consumer (GPU
+#     owner), K == 1. The consumer is the CALLER thread (``run`` consumes
+#     synchronously), so a long healthy GPU unit is never mistaken for a
+#     deadlock by a fixed join budget. Only the producer is a thread, and it is
+#     joined with a finite bound after a terminal state.
 #   * an EXPLICIT bounded queue ``prefetch_units + 1`` plus explicit host and
 #     device byte budgets. The producer blocks (backpressure) when either is
 #     exhausted; it never drops, duplicates or grows a buffer after pressure.
@@ -1234,7 +1238,9 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
 #     is asserted before ``run`` returns.
 #   * deterministic canonical result order (input task order).
 #   * cancellation is a one-way latch: a cancelled pipeline publishes nothing,
-#     drains the queue, releases every staged unit and joins both threads.
+#     drains the queue, releases every staged unit and joins the producer.
+#     An in-flight uninterruptible ``consume`` call cannot be pre-empted; the
+#     latch is honoured at the next unit/task boundary (documented, not hidden).
 #
 # No CuPy import, no CUDA initialisation: ``consume`` is the caller's callback.
 
@@ -1392,10 +1398,19 @@ class BufferLedger:
 class BoundedPipeline:
     """Bounded, single-owner CPU -> GPU producer/consumer runner.
 
-    Exactly one producer thread and one consumer thread are started. The queue
-    capacity is explicit (``prefetch_units + 1``): ``prefetch_units`` complete
-    units may wait ahead of the one being consumed. Both byte budgets are hard
-    caps enforced by :class:`BufferLedger`.
+    Exactly one producer thread is started; the consumer (GPU owner) runs on
+    the thread that calls :meth:`run`. The queue capacity is explicit
+    (``prefetch_units + 1``): ``prefetch_units`` complete units may wait ahead
+    of the one being consumed. Both byte budgets are hard caps enforced by
+    :class:`BufferLedger`.
+
+    Long healthy work is therefore the normal case: ``run`` waits for the next
+    unit (checking cancellation every poll) instead of imposing a wall-clock
+    budget on a unit. A finite join bound is used only once a terminal state is
+    reached (sentinel, error or cancellation), where a surviving producer is a
+    genuine stuck-thread failure. An optional ``stall_timeout_s`` (disabled by
+    default) can additionally fail closed when the producer makes no progress
+    at all; it is never a per-unit work budget.
     """
 
     def __init__(
@@ -1412,6 +1427,7 @@ class BoundedPipeline:
         device_bytes=lambda payload: 0,
         clock=time.monotonic,
         thread_join_s: float = 30.0,
+        stall_timeout_s=None,
     ) -> None:
         if not callable(produce) or not callable(consume) or not callable(release):
             raise PipelineError("produce/consume/release must be callables")
@@ -1423,6 +1439,12 @@ class BoundedPipeline:
             or not (0 < float(thread_join_s) <= 600.0)
         ):
             raise PipelineError("thread_join_s must be in (0, 600]")
+        if stall_timeout_s is not None and (
+            isinstance(stall_timeout_s, bool)
+            or not isinstance(stall_timeout_s, (int, float))
+            or not (0 < float(stall_timeout_s) <= 600.0)
+        ):
+            raise PipelineError("stall_timeout_s must be None or in (0, 600]")
         self._tasks = tuple(tasks)
         self._produce = produce
         self._consume = consume
@@ -1435,6 +1457,9 @@ class BoundedPipeline:
         self._queue_max = int(self._prefetch_units) + 1
         self._clock = clock
         self._thread_join_s = float(thread_join_s)
+        self._stall_timeout_s = (
+            None if stall_timeout_s is None else float(stall_timeout_s)
+        )
         self._ledger = BufferLedger(
             host_budget_bytes=host_budget_bytes,
             device_budget_bytes=device_budget_bytes,
@@ -1459,7 +1484,14 @@ class BoundedPipeline:
         self._producer_backpressure_events = 0
         self._producer_backpressure_s = 0.0
         self._producer_thread: threading.Thread | None = None
-        self._consumer_thread: threading.Thread | None = None
+        self._owner_thread_name: str | None = None
+        self._owner_thread_ident: int | None = None
+        self._active_unit_index: int | None = None
+        self._producer_task_index: int | None = None
+        self._producer_task_started_at: float | None = None
+        self._last_progress_at: float | None = None
+        self._stalled = False
+        self._interrupt: str | None = None
         self._finished = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -1551,7 +1583,12 @@ class BoundedPipeline:
             for index, task in enumerate(self._tasks):
                 if self._cancelled():
                     return
+                self._producer_task_index = int(index)
+                self._producer_task_started_at = float(self._clock())
                 payload = self._produce(task)
+                self._producer_task_index = None
+                self._producer_task_started_at = None
+                self._last_progress_at = float(self._clock())
                 host_need = _pipeline_int(
                     self._host_bytes_fn(payload), "host_bytes", minimum=0
                 )
@@ -1579,10 +1616,45 @@ class BoundedPipeline:
             self._producer_error = exc
             self.cancel(f"producer_error:{type(exc).__name__}")
             self._put_sentinel()
+        finally:
+            self._producer_task_index = None
+            self._producer_task_started_at = None
+            self._last_progress_at = float(self._clock())
 
-    # -- consumer ----------------------------------------------------------
+    # -- consumer (caller thread owns the GPU) ------------------------------
 
-    def _consumer_run(self) -> None:
+    def _age_s(self, started) -> float | None:
+        if started is None:
+            return None
+        return max(0.0, float(self._clock()) - float(started))
+
+    def _producer_stalled(self) -> bool:
+        """Optional no-progress watchdog (disabled by default).
+
+        This is deliberately NOT a per-unit work budget: it only fires when the
+        producer has made no observable progress at all for the configured
+        window. A healthy long cell keeps updating ``_last_progress_at``.
+        """
+        if self._stall_timeout_s is None:
+            return False
+        if self._last_progress_at is None:
+            return False
+        if (
+            float(self._clock()) - float(self._last_progress_at)
+            <= float(self._stall_timeout_s)
+        ):
+            return False
+        self._stalled = True
+        self.cancel("stall_timeout")
+        return True
+
+    def _consume_loop(self) -> None:
+        """Consume units on the CALLING thread until a terminal state.
+
+        A healthy GPU unit may take arbitrarily long; waiting for the next unit
+        is bounded only by cancellation/producer liveness, never by a wall-clock
+        budget on the unit itself.
+        """
         while True:
             if self._cancelled():
                 return
@@ -1590,11 +1662,28 @@ class BoundedPipeline:
             try:
                 unit = self._queue.get(timeout=0.05)
             except queue.Empty:
+                if self._producer_stalled():
+                    return
+                if (
+                    self._producer_thread is not None
+                    and not self._producer_thread.is_alive()
+                ):
+                    # The producer is gone and no sentinel/unit is left: this is
+                    # a genuine terminal anomaly, never a slow healthy unit.
+                    if self._producer_error is None and not self._cancelled():
+                        self._producer_error = PipelineError(
+                            "producer thread exited without a terminal sentinel"
+                        )
+                    if not self._cancelled():
+                        self.cancel("producer_exited")
+                    return
                 continue
             self._consumer_idle_s += max(0.0, float(self._clock()) - started)
             self._sample_queue()
             if isinstance(unit, dict) and unit.get("sentinel"):
                 return
+            self._active_unit_index = int(unit["index"])
+            self._last_progress_at = float(self._clock())
             try:
                 unit["device_lease"] = self._ledger.reserve(
                     "device",
@@ -1604,17 +1693,19 @@ class BoundedPipeline:
                 result = self._consume(unit["payload"])
                 self._transfers += 1
             except PipelineCancelled:
-                self._release_unit(unit)
                 return
+            except (KeyboardInterrupt, SystemExit):
+                raise
             except BaseException as exc:  # noqa: BLE001 - re-raised by run()
                 self._consumer_error = exc
                 self.cancel(f"consumer_error:{type(exc).__name__}")
-                self._release_unit(unit)
                 return
             else:
                 self._results[int(unit["index"])] = result
                 self._consumed += 1
             finally:
+                self._active_unit_index = None
+                self._last_progress_at = float(self._clock())
                 self._release_unit(unit)
 
     # -- run ---------------------------------------------------------------
@@ -1634,59 +1725,72 @@ class BoundedPipeline:
                     f"drain_release:{type(exc).__name__}:{exc}"
                 )
 
+    def _join_producer(self) -> bool:
+        """Finite-bound join used ONLY after a terminal state."""
+        thread = self._producer_thread
+        if thread is None:
+            return False
+        thread.join(self._thread_join_s)
+        if thread.is_alive():
+            self.cancel("producer_join_timeout")
+            thread.join(max(1.0, self._thread_join_s / 6))
+        alive = bool(thread.is_alive())
+        if alive:
+            self._cleanup_failures.append(
+                "producer_thread_alive_after_join:"
+                f"{self._thread_join_s:.3f}s"
+            )
+        return alive
+
     def run(self):
         """Run the pipeline; return canonical-order results or raise.
 
-        On any failure the pipeline is cancelled, every staged unit is released,
-        both threads are joined, and the PRIMARY error is re-raised (type
-        preserved so a CuPy OOM stays classified). Partial GPU results are never
-        returned.
+        The consumer runs on the calling thread, so a long healthy GPU unit
+        cannot be mistaken for a deadlock. On any failure the pipeline is
+        cancelled, every staged unit is released, the producer is joined with a
+        finite bound, and the PRIMARY error is re-raised (type preserved so a
+        CuPy OOM stays classified). Partial GPU results are never returned.
         """
         if self._finished:
             raise PipelineError("a BoundedPipeline instance runs at most once")
         self._finished = True
+        self._owner_thread_name = threading.current_thread().name
+        self._owner_thread_ident = threading.get_ident()
+        self._last_progress_at = float(self._clock())
         self._producer_thread = threading.Thread(
             target=self._producer_run,
             name="r55e2-pipeline-producer",
             daemon=True,
         )
-        self._consumer_thread = threading.Thread(
-            target=self._consumer_run,
-            name="r55e2-pipeline-gpu-owner",
-            daemon=True,
-        )
-        self._consumer_thread.start()
         self._producer_thread.start()
 
-        join_error: BaseException | None = None
+        interrupt: BaseException | None = None
         try:
-            self._producer_thread.join(self._thread_join_s)
-            self._consumer_thread.join(self._thread_join_s)
-        except BaseException as exc:  # noqa: BLE001
-            join_error = exc
-        if self._producer_thread.is_alive() or self._consumer_thread.is_alive():
-            self.cancel("thread_join_timeout")
-            self._producer_thread.join(max(1.0, self._thread_join_s / 6))
-            self._consumer_thread.join(max(1.0, self._thread_join_s / 6))
-        alive = (
-            self._producer_thread.is_alive()
-            or self._consumer_thread.is_alive()
-        )
+            self._consume_loop()
+        except BaseException as exc:  # noqa: BLE001 - caller interrupt wins
+            interrupt = exc
+            self._interrupt = f"{type(exc).__name__}: {exc}"
+            self.cancel(f"caller_interrupt:{type(exc).__name__}")
+
+        try:
+            producer_alive = self._join_producer()
+        except BaseException as exc:  # noqa: BLE001 - interrupt during join
+            if interrupt is None:
+                interrupt = exc
+                self._interrupt = f"{type(exc).__name__}: {exc}"
+                self.cancel(f"caller_interrupt:{type(exc).__name__}")
+            producer_alive = bool(
+                self._producer_thread is not None
+                and self._producer_thread.is_alive()
+            )
         self._drain()
         ledger = self._ledger.snapshot()
-        if join_error is not None:
-            raise PipelineError(
-                f"pipeline join failed: {type(join_error).__name__}: {join_error}"
-            ) from join_error
-        if alive:
-            raise PipelineError(
-                "bounded pipeline thread did not terminate "
-                f"(producer_alive={self._producer_thread.is_alive()}, "
-                f"consumer_alive={self._consumer_thread.is_alive()})"
-            )
+
+        if interrupt is not None:
+            raise interrupt
         if self._consumer_error is not None:
-            if isinstance(self._consumer_error, PipelineAccountingError):
-                raise self._consumer_error
+            # Primary consumer classification wins (e.g. a CuPy OOM must stay a
+            # CuPy OOM); a surviving producer is recorded as cleanup telemetry.
             raise self._consumer_error
         if self._producer_error is not None:
             if isinstance(self._producer_error, PipelineAccountingError):
@@ -1695,6 +1799,16 @@ class BoundedPipeline:
                 "producer failed: "
                 f"{type(self._producer_error).__name__}: {self._producer_error}"
             ) from self._producer_error
+        if self._stalled:
+            raise PipelineError(
+                "bounded pipeline made no producer progress for "
+                f"{self._stall_timeout_s}s (stall_timeout)"
+            )
+        if producer_alive:
+            raise PipelineError(
+                "bounded pipeline producer thread did not terminate "
+                f"(producer_alive=True, owner_thread={self._owner_thread_name})"
+            )
         if self._cancelled():
             raise PipelineCancelled(
                 f"pipeline cancelled ({self._cancel_reason or 'unknown'})"
@@ -1721,10 +1835,31 @@ class BoundedPipeline:
             "units_produced": int(self._produced),
             "units_consumed": int(self._consumed),
             "units_released": int(self._released),
+            "lifecycle": "caller_owned_consumer",
+            "consumer_owner": "caller_thread",
+            "owner_thread_name": self._owner_thread_name,
+            "owner_thread_ident": self._owner_thread_ident,
+            "active_unit_index": self._active_unit_index,
+            "producer_thread_name": (
+                None
+                if self._producer_thread is None
+                else str(self._producer_thread.name)
+            ),
+            "producer_alive": (
+                self._producer_thread is not None
+                and self._producer_thread.is_alive()
+            ),
+            "producer_task_index": self._producer_task_index,
+            "producer_task_age_s": self._age_s(self._producer_task_started_at),
+            "last_progress_age_s": self._age_s(self._last_progress_at),
+            "stall_timeout_s": self._stall_timeout_s,
+            "stalled": bool(self._stalled),
+            "interrupt": self._interrupt,
             "queue_max": int(self._queue_max),
             "prefetch_units": int(self._prefetch_units),
             "queue_depth_max": int(self._queue_depth_max),
             "queue_depth_last": int(self._queue_depth_last),
+            "queue_depth_final": int(self._queue.qsize()),
             "queue_depth_samples": int(self._queue_depth_samples),
             "queue_depth_mean": (
                 None
@@ -1757,7 +1892,5 @@ class BoundedPipeline:
             "threads_joined": (
                 self._producer_thread is not None
                 and not self._producer_thread.is_alive()
-                and self._consumer_thread is not None
-                and not self._consumer_thread.is_alive()
             ),
         }

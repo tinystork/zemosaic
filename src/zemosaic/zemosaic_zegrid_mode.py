@@ -4558,6 +4558,12 @@ def _r55_active_decide(
 _R55E2_GPU_MISSION = "ZM-ZEGRID-R55-E2-ACTIVE-GPU-PREFETCH-20261024"
 _R55E2_PREFETCH_LADDER = (0, 1, 2, 3, 4)
 _R55E2_PREFETCH_DEFAULT = 2
+# Finite bound for joining the ASYNC PRODUCER once the pipeline has reached a
+# terminal state (sentinel, error or cancellation). It is NOT a per-unit work
+# budget: the GPU consumer runs on the calling thread, so a healthy cell that
+# legitimately takes minutes is never cancelled by a fixed join window (the
+# real RTX 3070 false-timeout witnessed at 15ada5c). A producer still alive
+# after this bound is a genuine stuck thread and fails closed.
 _R55E2_PIPELINE_JOIN_S = 60.0
 
 
@@ -7982,6 +7988,11 @@ def _run_single(
             host_bytes=_host_bytes,
             device_bytes=_device_bytes,
             thread_join_s=float(_R55E2_PIPELINE_JOIN_S),
+            # No internal per-unit stall budget: honest liveness for a long
+            # healthy GPU cell is "the caller is still inside consume". Only a
+            # caller/process cancellation (or a producer that never progresses
+            # and is explicitly watched) ends it early.
+            stall_timeout_s=None,
         )
         t0 = time.perf_counter()
         try:
