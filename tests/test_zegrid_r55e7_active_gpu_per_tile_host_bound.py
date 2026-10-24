@@ -435,7 +435,15 @@ def test_product_decision_is_tile128_k1_prefetch1_with_exact_bytes(tmp_path):
     assert chosen.tile_px == 128
     assert chosen.units_in_flight == 1
     assert chosen.prefetch_units == 1
-    assert chosen.host_peak_bytes == shared + bounds[128] + cache
+    # R55-E8: the streaming estimate ALREADY includes the 340 MiB process
+    # baseline that ``shared`` counts once, so the scheduler consumes the ADDED
+    # bound (the same contract as ``check_streaming_gate``). Exact integer
+    # equality is still asserted, never a range.
+    assert chosen.host_peak_bytes == (
+        shared
+        + (bounds[128] - int(zz.rcontract.PROCESS_BASELINE_BYTES))
+        + cache
+    )
     assert chosen.host_peak_bytes != shared + max(bounds.values()) + cache
 
     gpu_phase = next(
@@ -453,8 +461,12 @@ def test_product_decision_is_tile128_k1_prefetch1_with_exact_bytes(tmp_path):
     assert decision.plan_set.aggregate_device_peak_bytes <= decision.gpu_facts.vram_budget_bytes
 
     # The per-tile contract is explicit and complete for the declared ladder.
+    # R55-E8 product decision consumes the ADDED bounds (baseline counted once
+    # by ``shared_bytes``); the scheduler-only tests above still use raw maps.
     expected_map = {
-        int(tile): int(bounds[int(tile)]) for tile in TILES
+        int(tile): int(bounds[int(tile)])
+        - int(zz.rcontract.PROCESS_BASELINE_BYTES)
+        for tile in TILES
     }
     actual_map = decision.gpu_context.per_tile_stack_map
     assert {t: v for t, v in actual_map.items() if t in TILES} == expected_map
@@ -774,7 +786,10 @@ def test_m106_descriptor_planning_probe_admits_tile128(tmp_path):
     assert decision.mapping["prefetch_units"] == 1
     assert decision.plan_set.chosen.host_peak_bytes == (
         int(WITNESS_SHARED_MIB * MIB)
-        + _witness_bounds()[128]
+        + (
+            _witness_bounds()[128]
+            - int(zz.rcontract.PROCESS_BASELINE_BYTES)
+        )
         + int(decision.facts["per_unit_cache"])
     )
     assert decision.plan_set.aggregate_host_peak_bytes <= budget

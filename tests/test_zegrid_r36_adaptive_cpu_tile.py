@@ -608,42 +608,44 @@ def test_f2_both_infeasible_fails_loud_no_gpu_attempt(tmp_path, routine_corpus, 
 
 # --- rework-2 F-M1: GPU gate at the GPU's OWN tile -------------------------------
 
-def test_fm1_gpu_tile128_host_infeasible_refuses_gpu_uses_cpu64(tmp_path, routine_corpus, monkeypatch):
-    """F-M1: CPU tile 64 fits host RAM but the GPU's OWN tile 128 does NOT.
-
-    The GPU must be refused BEFORE execution (zero GPU executor call), the CPU is
-    re-planned and EXECUTED at the selected CPU tile 64, and the manifest records
-    the exact GPU tile/bound + reason.
+def test_fm1_gpu_tile128_host_infeasible_walks_to_smaller_gpu_tile64(
+    tmp_path, routine_corpus, monkeypatch
+):
+    """F-M1 (R55-E8): CPU tile 64 fits host RAM and the GPU's OWN tile 128 does
+    NOT. The finite GPU ladder must now keep the feasible smaller GPU tile 64
+    instead of discarding a feasible GPU merely because tile128 failed. The GPU
+    host gate still uses the GPU's own bound (4096), never the tile128 bound.
     """
     _force_cpu_tile_64(monkeypatch)              # CPU tile 64; stream@128 infeasible
     _force_gpu_selection(monkeypatch, gpu_tile=128)
-    calls = []
-    real = zz.run_canonical_stack_streaming
-
-    def spy(provider, request, tile_size=None, fixed=None):
-        calls.append((getattr(request, "backend", "cpu"),
-                      int(tile_size) if tile_size is not None else None))
-        return real(provider, request, tile_size=tile_size, fixed=fixed)
-
-    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
-    inp, out = tmp_path / "in", tmp_path / "out"
+    inp = tmp_path / "in"
     _prepare_input(inp, routine_corpus)
-    zz.run_zegrid_mode(str(inp), str(out), zegrid_halo_px=8, use_gpu=True)
-
-    assert "gpu" not in {b for b, _t in calls}, calls      # zero GPU executor call
-    assert {t for b, t in calls if b == "cpu"} == {64}, calls
-    m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
-    assert m["gpu"]["used"] is False
-    assert m["gpu"]["final_backend"] == "cpu"
-    assert m["gpu"]["attempted"] is False
-    assert m["gpu"]["fallback_reason"] == "gpu_stream_host_ram_infeasible"
-    pef = m["gpu"]["pre_execution_fallback"]
-    assert pef["reason"] == "gpu_stream_host_ram_infeasible"
-    assert pef["gpu_streaming_tile"] == 128
-    assert pef["gpu_streaming_host_peak_bytes"] == 8192 * 4
-    assert pef["ram_budget_bytes"] == 8192
-    assert m["gpu"]["gpu_streaming_tile"] is None
-    assert m["per_cell_diagnostics"]["cpu_streaming_tile"] == 64
+    frames, _rejected = zg.read_manifest(inp)
+    canvas = zg.build_canvas(frames)
+    b = zz._build_execution_bundle(
+        canvas,
+        frames,
+        None,
+        raw_available_bytes=int(8192 / zpar.RAM_SAFETY_FRACTION),
+        budget_bytes=8192,
+        halo_px=8,
+        cpu_count=3,
+        gpu_used=True,
+        vram_budget_bytes=4 * GB,
+        cache_root=tmp_path,
+    )
+    assert b.envelope.backend == "gpu"
+    assert b.gpu_used is True
+    assert b.gpu_tile_size == 64
+    assert b.gpu_pre_execution_fallback is None
+    # The selected GPU host bound is the tile64 bound, not tile128's.
+    assert b.gpu_streaming_host_peak_bytes <= 8192
+    trials = b.gpu_tile_trials or []
+    assert any(int(t["tile"]) == 128 and t["fits"] is False for t in trials), trials
+    assert any(int(t["tile"]) == 64 and t["fits"] is True for t in trials), trials
+    # The exact CPU fallback remains planned at tile 64.
+    assert b.cpu_fallback_info["feasible"] is True
+    assert int(b.cpu_fallback_info["tile"]) == 64
 
 
 def test_fm1_gpu_effective_tile_fits_is_attempted_single_owner(tmp_path, routine_corpus, monkeypatch):

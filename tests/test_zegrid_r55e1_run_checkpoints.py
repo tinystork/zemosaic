@@ -370,9 +370,9 @@ def shrink_runs(routine_input, tmp_path_factory):
     active2 = root / "active2"
     _run_product(routine_input, legacy, "legacy")
     decide = _force_k3_decide(zz._r55_active_decide)
-    # K=3 host peak ~2.89 GiB; a 2.5 GiB raw (2.25 GiB budget) admits K=2
+    # R55-E8 consumes the ADDED streaming bound (the 340 MiB process baseline is counted once by shared_bytes), so K=3 is ~2.21 GiB; a 2.0 GiB raw (1.8 GiB budget) admits K=2 but not K=3, producing a real adjacent pressure shrink.
     # (~2.05 GiB) but not K=3, producing a real adjacent pressure shrink.
-    schedule = [WITNESS_AVAILABLE_BYTES, 5 * GIB // 2,
+    schedule = [WITNESS_AVAILABLE_BYTES, 7 * GIB // 4,
                 WITNESS_AVAILABLE_BYTES, WITNESS_AVAILABLE_BYTES]
     _run_product(
         routine_input,
@@ -1128,7 +1128,7 @@ def test_real_multi_wave_shrink_parity_and_no_growth(shrink_runs):
         w["facts"]["host"]["raw_available_bytes"] for w in telemetry["waves"]
     ]
     assert raws[0] == WITNESS_AVAILABLE_BYTES
-    assert 5 * GIB // 2 in raws
+    assert 7 * GIB // 4 in raws
     assert raws[-1] == WITNESS_AVAILABLE_BYTES
     modes = {
         wave["heartbeat"]["heartbeat_mode"]
@@ -1150,7 +1150,7 @@ def test_transient_mid_wave_drop_is_consumed_at_next_boundary(
     pressure_calls = {"n": 0}
 
     def pressure(_root):
-        raw = 5 * GIB // 2 if pressure_calls["n"] == 0 else WITNESS_AVAILABLE_BYTES
+        raw = 7 * GIB // 4 if pressure_calls["n"] == 0 else WITNESS_AVAILABLE_BYTES
         pressure_calls["n"] += 1
         return _facts(raw)
 
@@ -1168,14 +1168,14 @@ def test_transient_mid_wave_drop_is_consumed_at_next_boundary(
     run = block["run"]
     assert run["shrink_count"] >= 1
     assert run["checkpoints"][1]["host_source"] == "fresh+latched"
-    assert run["checkpoints"][1]["host"]["raw_available_bytes"] == 5 * GIB // 2
+    assert run["checkpoints"][1]["host"]["raw_available_bytes"] == 7 * GIB // 4
     assert (
         run["checkpoints"][1]["fresh_host"]["raw_available_bytes"]
         == WITNESS_AVAILABLE_BYTES
     )
     assert (
         run["checkpoints"][1]["latched_host"]["raw_available_bytes"]
-        == 5 * GIB // 2
+        == 7 * GIB // 4
     )
     assert block["mapping"]["units_in_flight"] == 2
     assert not any(

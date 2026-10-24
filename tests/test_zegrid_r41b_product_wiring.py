@@ -603,7 +603,8 @@ def test_h_gpu_host_bound_pre_execution_fallback(monkeypatch):
     monkeypatch.setattr(zal, "ScientificFloors", _tiny_floors)
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(10 ** 12))
     table = {128: 4000, 112: 4000, 96: 4000, 80: 4000, 64: 4000, 48: 4000, 32: 4000}
-    table[48] = 90000            # the GPU's own tile is the ONLY one that busts
+    table[48] = 90000            # the GPU's own tile busts...
+    table[32] = 90000            # ...and so does the only smaller GPU ladder tile
     monkeypatch.setattr(zz, "_estimate_streaming_bytes",
                         lambda n, hw, tile=zz.STREAM_TILE_SIZE, channels=3:
                         int(table.get(int(tile) if tile is not None else 128, 90000)))

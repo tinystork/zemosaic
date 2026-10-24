@@ -955,8 +955,11 @@ def test_fresh_pressure_shrinks_only_the_scheduler_plan(
     # shrink workers by inflating the declared cache-worker footprint. That
     # makes the CACHE phase the mapped envelope's dominant term without touching
     # science, layout, geometry or the executor. PLAN stays at 12 GiB; fresh
-    # ADMIT is 2.9 GiB, so the initial W=8 mapped plan misses and the scheduler's
-    # fixed workers-first shrink must admit W=6 on the SAME frozen identity.
+    # ADMIT is 2.4 GiB. R55-E8 now selects gauge/cache workers under the SAME
+    # B_plan and margin, so the coherent mapped plan is already tighter than the
+    # old W=8 witness; 2.4 GiB still crosses the threshold and the scheduler's
+    # fixed workers-first shrink must admit the next legal W on the SAME frozen
+    # identity.
     real_cache_fp = zz.zpar.cache_footprint_bytes
 
     def _inflated_cache_fp(px):
@@ -967,7 +970,7 @@ def test_fresh_pressure_shrinks_only_the_scheduler_plan(
     # (preflight shrink); calls 4+ = POST-GAUGE launch at 12 GiB (no further
     # correction). This isolates the preflight pressure path.
     memory = _ScheduleMemory(
-        [WITNESS_AVAILABLE_BYTES, 2900 * MIB, 2900 * MIB, WITNESS_AVAILABLE_BYTES],
+        [WITNESS_AVAILABLE_BYTES, 2400 * MIB, 2400 * MIB, WITNESS_AVAILABLE_BYTES],
         default=WITNESS_AVAILABLE_BYTES,
     )
     out = tmp_path / "shrunk"
@@ -1027,12 +1030,12 @@ def test_fresh_pressure_shrinks_only_the_scheduler_plan(
         block["chosen_candidate"]["workers_per_unit"]
         < block["initial_candidate"]["workers_per_unit"]
     )
-    assert block["plan_observation"]["raw_available_bytes"] == 2900 * MIB
+    assert block["plan_observation"]["raw_available_bytes"] == 2400 * MIB
     assert block["initial_plan_observation"]["raw_available_bytes"] == WITNESS_AVAILABLE_BYTES
-    assert block["final_envelope"]["raw_available_bytes"] == 2900 * MIB
+    assert block["final_envelope"]["raw_available_bytes"] == 2400 * MIB
     assert block["final_envelope"]["factor_num"] == 4
     assert block["final_envelope"]["factor_den"] == 5
-    assert block["final_envelope"]["budget_bytes"] == (4 * (2900 * MIB)) // 5
+    assert block["final_envelope"]["budget_bytes"] == (4 * (2400 * MIB)) // 5
     assert (
         block["final_envelope"]["aggregate_bytes"]
         <= block["plan_observation"]["budget_bytes"]
@@ -1090,9 +1093,9 @@ def test_post_gauge_pressure_shrinks_the_actual_stack_knobs(
             WITNESS_AVAILABLE_BYTES,  # PLAN
             WITNESS_AVAILABLE_BYTES,  # preflight admit
             WITNESS_AVAILABLE_BYTES,  # preflight launch
-            2900 * MIB,               # post-gauge admit (miss -> shrink)
+            2400 * MIB,               # post-gauge admit (miss -> shrink)
         ],
-        default=2900 * MIB,
+        default=2400 * MIB,
     )
     out = tmp_path / "post_gauge_shrunk"
     _run_product(routine_input, out, "active", memory=memory)
@@ -1126,12 +1129,12 @@ def test_post_gauge_pressure_shrinks_the_actual_stack_knobs(
     assert block["plan_hash_schema"] == zs.ACTIVE_FINAL_PLAN_SCHEMA
     assert _recompute_final_hash(block) == block["plan_hash"]
     # The final envelope is bound to the POST-GAUGE 4/5 observation.
-    assert block["plan_observation"]["raw_available_bytes"] == 2900 * MIB
+    assert block["plan_observation"]["raw_available_bytes"] == 2400 * MIB
     assert block["initial_plan_observation"]["raw_available_bytes"] == WITNESS_AVAILABLE_BYTES
-    assert block["final_envelope"]["raw_available_bytes"] == 2900 * MIB
+    assert block["final_envelope"]["raw_available_bytes"] == 2400 * MIB
     assert block["final_envelope"]["factor_num"] == 4
     assert block["final_envelope"]["factor_den"] == 5
-    assert block["final_envelope"]["budget_bytes"] == (4 * (2900 * MIB)) // 5
+    assert block["final_envelope"]["budget_bytes"] == (4 * (2400 * MIB)) // 5
     assert (
         block["final_envelope"]["aggregate_bytes"]
         <= block["plan_observation"]["budget_bytes"]

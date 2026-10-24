@@ -3668,6 +3668,35 @@ def _build_chosen_cell_contexts(footprints, canvas, nx, ny, layout_substep=None,
 
 
 # ---------------------------------------------------------------------------
+# R55-E8 — GPU authority resolution (NO probe when the product says OFF)
+# ---------------------------------------------------------------------------
+
+def _r55_resolve_gpu_probe(use_gpu, zconfig):
+    """Resolve GPU preference and probe ONLY when the product requests GPU.
+
+    GPU OFF must make all four authority flags false and must NOT import CuPy,
+    query the CUDA runtime or read VRAM. The returned probe dict is explicitly
+    ``reason=gpu_not_requested`` so downstream manifests never imply a device
+    observation that was forbidden.
+    """
+    requested, source = resolve_gpu_preference(use_gpu, zconfig)
+    if requested:
+        probe = zgpu.probe_gpu_backend()
+        budget = zgpu.vram_budget_bytes(probe)
+    else:
+        probe = {
+            "available": False,
+            "device": None,
+            "cupy_version": None,
+            "vram_total_bytes": None,
+            "vram_free_bytes": None,
+            "reason": "gpu_not_requested",
+        }
+        budget = None
+    return bool(requested), str(source), probe, budget
+
+
+# ---------------------------------------------------------------------------
 # ZM-ZEGRID-R41-B — ONE executable bundle built under the PLAN budget (80 %)
 # ---------------------------------------------------------------------------
 
@@ -3710,6 +3739,112 @@ class ExecutionBundle:
     cache_build_workers: int
     worker_budget_bytes: int
     attempts: list
+    # R55-E8: exact device workspace of the selected GPU tile and the bounded
+    # per-tile host/device trial trail used by the shared GPU ladder. ``None``
+    # for pure CPU bundles so every existing consumer keeps its semantics.
+    gpu_device_workspace_bytes: int | None = None
+    gpu_tile_trials: list | None = None
+
+
+def _r55_margin_raw_ceiling(
+    budget_bytes: int,
+    *,
+    margin_num: int = renv.DEFAULT_MARGIN_NUM,
+    margin_den: int = renv.DEFAULT_MARGIN_DEN,
+) -> int:
+    """Largest raw phase peak whose margin-applied value still fits ``budget``.
+
+    This is the inverse of :func:`resource_envelope.ceil_margin_div` in integer
+    arithmetic: ``ceil(raw * (den+num)/den) <= budget`` iff
+    ``raw <= (budget*den)//(den+num)``. It is the SAME margin the global envelope
+    validation applies, so the gauge/cache worker choice can never be made under
+    a looser budget than the one that will validate it.
+    """
+    num = int(margin_num)
+    den = int(margin_den)
+    if num < 0 or den < 1 or num > den:
+        raise ValueError(
+            f"invalid margin {num}/{den}: expected 0 <= num <= den, den >= 1"
+        )
+    return (int(budget_bytes) * den) // (den + num)
+
+
+def _r55_coherent_worker_count(
+    requested,
+    worker_budget_bytes: int,
+    per_worker_footprint_bytes: int,
+) -> int:
+    """Worker count selected under the SAME budget/margin that validates it.
+
+    Reuses :func:`parallel.choose_workers` (the existing R16 rule) but adds the
+    hard integer ceiling implied by the margin-aware phase budget, allowing a
+    genuine 1-worker floor when even 2 workers cannot fit. Never grows past the
+    existing CPU/RAM decision.
+    """
+    footprint = max(1, int(per_worker_footprint_bytes))
+    budget = max(0, int(worker_budget_bytes))
+    selected = int(
+        zpar.choose_workers(
+            requested, budget if budget > 0 else None, footprint
+        )
+    )
+    hard_ceiling = max(1, budget // footprint) if budget > 0 else 1
+    return max(1, min(selected, hard_ceiling))
+
+
+def _r55_worker_ladder(start: int) -> tuple[int, ...]:
+    """Bounded descending worker ladder down to 1 (deterministic)."""
+    top = max(1, int(start))
+    return tuple(range(top, 0, -1))
+
+
+def _r55_gpu_tile_ladder(
+    max_n: int,
+    worst_hw: tuple[int, int],
+    vram_budget_bytes: int,
+    *,
+    max_gpu_tile: int | None = None,
+) -> tuple[tuple[tuple[int, int], ...], int | None]:
+    """Finite explicit GPU tile ladder with EXACT device workspace per tile.
+
+    The ladder always contains the VRAM-derived maximum and every permitted
+    product tile <= it, in descending order. Each entry is
+    ``(tile_px, device_workspace_bytes)``; a tile whose exact device workspace
+    exceeds the explicit VRAM budget is dropped rather than guessed.
+    ``max_gpu_tile`` is the accepted no-growth cap (a replan may only shrink the
+    GPU tile).
+    """
+    max_tile = zgpu.choose_gpu_tile_size(
+        int(max_n), 3, tuple(int(v) for v in worst_hw), int(vram_budget_bytes)
+    )
+    if max_tile is None:
+        return (), None
+    max_tile = int(max_tile)
+    tiles = sorted(
+        {max_tile}
+        | {
+            int(t)
+            for t in CPU_STREAMING_TILE_LADDER
+            if int(t) < max_tile
+        },
+        reverse=True,
+    )
+    if max_gpu_tile is not None:
+        tiles = [int(t) for t in tiles if int(t) <= int(max_gpu_tile)]
+    out: list[tuple[int, int]] = []
+    taper = 2 * int(zgpu.GPU_TAPER_HALO_PX)
+    for tile in tiles:
+        device = int(
+            zgpu.gpu_tile_workspace_bytes(
+                int(max_n),
+                int(tile) + taper,
+                int(tile) + taper,
+                3,
+            )
+        )
+        if device <= int(vram_budget_bytes):
+            out.append((int(tile), int(device)))
+    return tuple(out), max_tile
 
 
 def _build_execution_bundle(
@@ -3810,24 +3945,30 @@ def _build_execution_bundle(
             if _mem.patch_ids:
                 worst_patch_px = max(worst_patch_px, _px)
         cache_worker_footprint_bytes = int(zpar.cache_footprint_bytes(worst_patch_px))
-        # Workers are budgeted from the SAME PLAN budget (no second float factor).
-        worker_budget = int(budget_bytes)
+        # R55-E8: workers are budgeted from the SAME PLAN budget AND the SAME
+        # 15 % margin the global envelope validation will apply. The previous
+        # un-margined division filled the budget exactly and then froze values
+        # the validator had to refuse (Windows halo128 gauge=14).
+        worker_budget = int(
+            _r55_margin_raw_ceiling(int(budget_bytes))
+        )
         canvas_px = int(canvas.width) * int(canvas.height)
         _gauge_fp = zpar.gauge_footprint_bytes(canvas_px)
         _cache_fp = zpar.cache_footprint_bytes(patch_px_for_workers or canvas_px)
-        _gauge_workers = (
-            zpar.choose_workers(None, worker_budget, _gauge_fp)
-            if gauge_workers is None else int(gauge_workers)
+        _gauge_workers = _r55_coherent_worker_count(
+            gauge_workers, worker_budget, _gauge_fp
         )
-        _cache_workers = (
-            zpar.choose_workers(None, worker_budget, _cache_fp)
-            if cache_build_workers is None else int(cache_build_workers)
+        _cache_workers = _r55_coherent_worker_count(
+            cache_build_workers, worker_budget, _cache_fp
         )
 
         # ZM-ZEGRID-R22/R36: VRAM-bounded GPU tile, determined BEFORE the joint
         # plan so the GPU RAM gate is evaluated at the GPU's OWN execution tile.
         effective_gpu = bool(gpu_used)
         gpu_tile_size = None
+        gpu_device_workspace_bytes = None
+        gpu_tile_candidates: tuple[tuple[int, int], ...] = ()
+        gpu_tile_trials: list = []
         gpu_pre_execution_fallback = None
         _cache_root = None if cache_root is None else Path(cache_root)
         if effective_gpu:
@@ -3844,20 +3985,34 @@ def _build_execution_bundle(
                     if area > worst_area:
                         worst_area = area
                         worst_hw = hw
-            _gpu_ts = zgpu.choose_gpu_tile_size(
-                max_n, 3, worst_hw, vram_budget_bytes
+            # R55-E8: a finite GPU tile ladder (VRAM maximum + every permitted
+            # product tile <= it), each with its EXACT device workspace. The
+            # host streaming bound is evaluated per tile below. A tile is never
+            # dropped because a LARGER tile failed host RAM.
+            gpu_tile_candidates, _vram_max_tile = _r55_gpu_tile_ladder(
+                max_n,
+                (int(worst_hw[0]), int(worst_hw[1])),
+                int(vram_budget_bytes or 0),
+                max_gpu_tile=max_gpu_tile,
             )
-            if _gpu_ts is None:
+            if not gpu_tile_candidates:
                 gpu_pre_execution_fallback = {
                     "reason": "vram_tile_infeasible",
-                    "detail": "choose_gpu_tile_size returned None (VRAM budget too small)",
+                    "detail": (
+                        "no GPU streaming tile fits the explicit VRAM budget "
+                        f"{vram_budget_bytes} B "
+                        f"(VRAM-derived max tile={_vram_max_tile!r})"
+                    ),
+                    "vram_budget_bytes": (
+                        None if vram_budget_bytes is None
+                        else int(vram_budget_bytes)
+                    ),
+                    "vram_max_tile": _vram_max_tile,
                 }
                 effective_gpu = False
             else:
-                gpu_tile_size = int(_gpu_ts)
-                if max_gpu_tile is not None:
-                    # Never grow the GPU tile either (accepted no-growth invariant).
-                    gpu_tile_size = min(int(gpu_tile_size), int(max_gpu_tile))
+                gpu_tile_size = int(gpu_tile_candidates[0][0])
+                gpu_device_workspace_bytes = int(gpu_tile_candidates[0][1])
 
         # ---- CPU streaming tile: select across the ACTUAL permitted ladder ----
         # ZM-ZEGRID-R41-B (rework-1): the per-cell streaming estimate is NOT
@@ -3891,6 +4046,8 @@ def _build_execution_bundle(
         gpu_stream_by_idx = (
             _stream_by_idx(gpu_tile_size) if effective_gpu else None
         )
+        if effective_gpu:
+            gpu_stream_by_idx = None
 
         def _plan_for(pairs, backend_gpu, cells_in_flight_cap):
             return zpar.plan_cell_concurrency(
@@ -3910,23 +4067,64 @@ def _build_execution_bundle(
         tile_trials = []
 
         if effective_gpu:
-            gpu_pairs = [
-                (inmem_by_idx[i], gpu_stream_by_idx[i]) for i, _n, _hw, _a in active
-            ]
-            try:
-                plan = _plan_for(gpu_pairs, True, max_cells_in_flight)
-            except zpar.ModeInfeasible as exc:
+            # R55-E8: evaluate each tile with its EXACT host streaming bound AND
+            # its exact device workspace before exact CPU fallback. The first
+            # (largest) jointly feasible tile wins; a smaller GPU tile is not
+            # discarded because the VRAM-max tile missed host RAM
+            # (Linux halo16: 213 failed, 128 passes).
+            for _tile, _device in gpu_tile_candidates:
+                _streams = _stream_by_idx(int(_tile))
+                gpu_pairs = [
+                    (inmem_by_idx[i], _streams[i])
+                    for i, _n, _hw, _a in active
+                ]
+                _host_peak = int(
+                    max((b for _a, b in gpu_pairs), default=0)
+                )
+                try:
+                    _gpu_plan = _plan_for(
+                        gpu_pairs, True, max_cells_in_flight
+                    )
+                except zpar.ModeInfeasible as exc:
+                    gpu_tile_trials.append(
+                        {
+                            "tile": int(_tile),
+                            "host_stream_bound_bytes": int(_host_peak),
+                            "device_workspace_bytes": int(_device),
+                            "fits": False,
+                            "detail": str(exc),
+                        }
+                    )
+                    continue
+                gpu_tile_trials.append(
+                    {
+                        "tile": int(_tile),
+                        "host_stream_bound_bytes": int(_host_peak),
+                        "device_workspace_bytes": int(_device),
+                        "fits": True,
+                        "aggregate_bytes": int(
+                            _gpu_plan.get("aggregate_bytes", 0)
+                        ),
+                    }
+                )
+                plan = _gpu_plan
+                gpu_tile_size = int(_tile)
+                gpu_device_workspace_bytes = int(_device)
+                gpu_stream_by_idx = _streams
+                break
+            if plan is None:
                 gpu_fallback_reason = {
                     "reason": "gpu_stream_host_ram_infeasible",
-                    "gpu_streaming_tile": int(gpu_tile_size),
-                    "gpu_streaming_host_peak_bytes": int(
-                        max((b for _a, b in gpu_pairs), default=0)
-                    ),
+                    "gpu_tile_trials": [dict(t) for t in gpu_tile_trials],
                     "ram_budget_bytes": int(budget_bytes),
-                    "detail": str(exc),
+                    "detail": (
+                        "no GPU tile in the finite ladder is jointly feasible "
+                        "under host RAM + explicit device budget"
+                    ),
                 }
                 effective_gpu = False
                 gpu_tile_size = None
+                gpu_device_workspace_bytes = None
                 gpu_stream_by_idx = None
 
         if plan is None:
@@ -4202,6 +4400,12 @@ def _build_execution_bundle(
             cache_build_workers=int(_cache_workers),
             worker_budget_bytes=int(worker_budget),
             attempts=attempts,
+            gpu_device_workspace_bytes=(
+                None
+                if gpu_device_workspace_bytes is None
+                else int(gpu_device_workspace_bytes)
+            ),
+            gpu_tile_trials=[dict(t) for t in gpu_tile_trials],
         )
 
 
@@ -4568,10 +4772,24 @@ class _R55ActiveDecision:
     inmem_context: object
     stream_context: object
     phase: str
+    # R55-E8: the coherent gauge/cache worker values that actually execute and
+    # the bounded trail of every larger pair the same PLAN/margin refused.
+    gauge_workers: int = 0
+    cache_workers: int = 0
+    worker_trail: tuple = ()
 
 
 def _r55_active_facts(
-    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
+    *,
+    bundle,
+    cell_ctxs,
+    canvas,
+    halo_px,
+    cache_root,
+    output_dir,
+    frame_ids,
+    gauge_workers=None,
+    cache_workers=None,
 ) -> dict:
     """Derive the integer facts the accepted scheduler needs (no probe).
 
@@ -4635,13 +4853,26 @@ def _r55_active_facts(
         disk_free = 0
 
     canvas_px = int(canvas.width) * int(canvas.height)
-    gauge_workers = max(1, int(bundle.gauge_workers))
-    cache_workers = max(1, int(bundle.cache_build_workers))
-    gauge_worker_bytes = (
-        int(zpar.gauge_footprint_bytes(canvas_px)) * gauge_workers
+    gauge_footprint = int(zpar.gauge_footprint_bytes(canvas_px))
+    cache_footprint = int(zpar.cache_footprint_bytes(worst_patch_px))
+    _worker_raw_ceiling = _r55_margin_raw_ceiling(
+        int(bundle.envelope.budget_bytes),
+        margin_num=int(renv.DEFAULT_MARGIN_NUM),
+        margin_den=int(renv.DEFAULT_MARGIN_DEN),
     )
-    cache_worker_bytes = (
-        int(zpar.cache_footprint_bytes(worst_patch_px)) * cache_workers
+    # NEVER grow past the bundle's frozen value: the override (or the bundle
+    # value) is an upper bound, and the margin-aware ceiling may only shrink it.
+    _gauge_start = int(bundle.gauge_workers) if gauge_workers is None else int(gauge_workers)
+    _cache_start = (
+        int(bundle.cache_build_workers)
+        if cache_workers is None
+        else int(cache_workers)
+    )
+    gauge_workers = _r55_coherent_worker_count(
+        _gauge_start, _worker_raw_ceiling, gauge_footprint
+    )
+    cache_workers = _r55_coherent_worker_count(
+        _cache_start, _worker_raw_ceiling, cache_footprint
     )
     bytes_per_px = 4 * 4
     halo_band_bytes = max(
@@ -4649,7 +4880,76 @@ def _r55_active_facts(
     ) * bytes_per_px
     retained_core_bytes = int(canvas_px) * bytes_per_px
 
-    requests = (
+    facts = {
+        "active": active,
+        "units_total": int(units_total),
+        "worst_patch_px": int(worst_patch_px),
+        "worst_patch_hw": (int(worst_patch_hw[0]), int(worst_patch_hw[1])),
+        "per_unit_cache": int(per_unit_cache),
+        "inmem_worst": int(max(1, inmem_worst)),
+        "stream_worst_by_tile": dict(stream_worst_by_tile),
+        "stream_worst": int(max(1, max(stream_worst_by_tile.values()))),
+        # R55-E8: ``_estimate_streaming_bytes`` returns the TOTAL streaming peak,
+        # which ALREADY includes the 340 MiB process baseline (the same value as
+        # ``shared_bytes``). The scheduler counts ``shared_bytes`` once, so the
+        # per-cell host bound it consumes must be the ADDED peak above that
+        # baseline (the same contract as ``check_streaming_gate``). Passing the
+        # total double-counted the baseline and made a valid tile128 plan fail
+        # the 15 % margin on the Linux halo16 budgets. Static/in-memory callers
+        # are unchanged.
+        "stream_added_by_tile": {
+            int(t): max(1, int(v) - int(rcontract.PROCESS_BASELINE_BYTES))
+            for t, v in stream_worst_by_tile.items()
+        },
+        "stream_added_worst": int(
+            max(
+                1,
+                max(stream_worst_by_tile.values())
+                - int(rcontract.PROCESS_BASELINE_BYTES),
+            )
+        ),
+        "disk_free": int(disk_free),
+        "canvas_px": int(canvas_px),
+        "channels": int(channels),
+        "gauge_footprint_bytes": int(gauge_footprint),
+        "cache_footprint_bytes": int(cache_footprint),
+        "gauge_workers": int(gauge_workers),
+        "cache_workers": int(cache_workers),
+        "halo_band_bytes": int(halo_band_bytes),
+        "retained_core_bytes": int(retained_core_bytes),
+        # B_plan and the ONE margin the global envelope validation applies.
+        "budget_bytes": int(bundle.envelope.budget_bytes),
+        "margin_num": int(renv.DEFAULT_MARGIN_NUM),
+        "margin_den": int(renv.DEFAULT_MARGIN_DEN),
+        "requests": (),
+        "cell_ids": tuple(cell.cell_id for cell, _p, _m in active),
+        "frame_ids": tuple(str(f) for f in (frame_ids or ())),
+        "max_n_frames": int(max_n_frames),
+        "layout": (
+            int(bundle.layout["nx"]), int(bundle.layout["ny"])
+        ),
+        "refinement_rank": int(bundle.envelope.refinement_rank),
+        "halo_px": int(halo_px),
+        "pinned": bool(bundle.envelope.pinned),
+        "run_id": str(canvas.canvas_id),
+    }
+    facts["requests"] = _r55_active_phase_requests(facts)
+    return facts
+
+
+def _r55_active_phase_requests(facts) -> tuple:
+    """Build the non-stack phase requests for the CURRENT gauge/cache workers.
+
+    Only the two non-overlapping concurrency phases (gauge, cache_build) vary;
+    assembly/export are invariant in the frozen layout. Keeping this in ONE
+    helper is what lets selection and global validation use the same numbers.
+    """
+    gauge_workers = max(1, int(facts["gauge_workers"]))
+    cache_workers = max(1, int(facts["cache_workers"]))
+    gauge_worker_bytes = int(facts["gauge_footprint_bytes"]) * gauge_workers
+    cache_worker_bytes = int(facts["cache_footprint_bytes"]) * cache_workers
+    canvas_px = int(facts["canvas_px"])
+    return (
         zsched.PhaseRequest(
             phase=renv.PHASE_GAUGE,
             components={"gauge_worker_footprint_bytes": gauge_worker_bytes},
@@ -4668,8 +4968,8 @@ def _r55_active_facts(
         zsched.PhaseRequest(
             phase=renv.PHASE_ASSEMBLY,
             components={
-                "halo_band_bytes": halo_band_bytes,
-                "retained_core_bytes": retained_core_bytes,
+                "halo_band_bytes": int(facts["halo_band_bytes"]),
+                "retained_core_bytes": int(facts["retained_core_bytes"]),
             },
             units=1,
             units_in_flight=1,
@@ -4681,41 +4981,31 @@ def _r55_active_facts(
             phase=renv.PHASE_EXPORT,
             components={
                 "coverage_plane_bytes": canvas_px * 4,
-                "science_planes_bytes": canvas_px * channels * 4,
+                "science_planes_bytes": canvas_px * int(facts["channels"]) * 4,
             },
             units=1,
             units_in_flight=1,
             workers_per_unit=1,
         ),
     )
-    return {
-        "active": active,
-        "units_total": int(units_total),
-        "worst_patch_px": int(worst_patch_px),
-        "worst_patch_hw": (int(worst_patch_hw[0]), int(worst_patch_hw[1])),
-        "per_unit_cache": int(per_unit_cache),
-        "inmem_worst": int(max(1, inmem_worst)),
-        "stream_worst_by_tile": dict(stream_worst_by_tile),
-        "stream_worst": int(max(1, max(stream_worst_by_tile.values()))),
-        "disk_free": int(disk_free),
-        "requests": requests,
-        "cell_ids": tuple(cell.cell_id for cell, _p, _m in active),
-        "frame_ids": tuple(str(f) for f in (frame_ids or ())),
-        "channels": int(channels),
-        "max_n_frames": int(max_n_frames),
-        "layout": (
-            int(bundle.layout["nx"]), int(bundle.layout["ny"])
-        ),
-        "refinement_rank": int(bundle.envelope.refinement_rank),
-        "halo_px": int(halo_px),
-        "pinned": bool(bundle.envelope.pinned),
-        "run_id": str(canvas.canvas_id),
-    }
 
 
-def _r55_active_context(facts, *, phase, per_unit_stack, per_unit_cache,
-                        per_unit_prefetch, bundle) -> object:
+def _r55_active_context(
+    facts,
+    *,
+    phase,
+    per_unit_stack,
+    per_unit_cache,
+    per_unit_prefetch,
+    bundle,
+    per_tile_stack_bytes=None,
+    cache_workers_cap=None,
+) -> object:
     env = bundle.envelope
+    workers_ladder = tuple(int(w) for w in zsched.WORKERS_LADDER)
+    if cache_workers_cap is not None:
+        cap = max(1, int(cache_workers_cap))
+        workers_ladder = tuple(w for w in workers_ladder if w <= cap) or (1,)
     return zsched.PlanContext(
         phase=phase,
         backend=renv.BACKEND_CPU,
@@ -4739,7 +5029,11 @@ def _r55_active_context(facts, *, phase, per_unit_stack, per_unit_cache,
         tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
         # D2 executable prefetch is EXACTLY zero; R55-E owns prefetch.
         prefetch_ladder=(0,),
-        workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+        workers_ladder=workers_ladder,
+        # R55-E8: when a per-tile host map is supplied, every streaming
+        # candidate uses its OWN exact bound (E7 contract), never the static
+        # ladder maximum. The in-memory phase keeps its own bound.
+        per_tile_stack_bytes=per_tile_stack_bytes,
         margin_num=int(renv.DEFAULT_MARGIN_NUM),
         margin_den=int(renv.DEFAULT_MARGIN_DEN),
         cell_ids=tuple(facts["cell_ids"]),
@@ -4750,19 +5044,15 @@ def _r55_active_context(facts, *, phase, per_unit_stack, per_unit_cache,
     )
 
 
-def _r55_active_decide(
-    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
-) -> _R55ActiveDecision:
-    """Build the deterministic CPU inmem+stream decision BEFORE gauge/stack."""
-    facts = _r55_active_facts(
-        bundle=bundle,
-        cell_ctxs=cell_ctxs,
-        canvas=canvas,
-        halo_px=halo_px,
-        cache_root=cache_root,
-        output_dir=output_dir,
-        frame_ids=frame_ids,
-    )
+def _r55_active_cpu_contexts(facts, bundle, cache_workers_cap):
+    """Build the CPU inmem+stream contexts for ONE cache-worker ceiling.
+
+    R55-E8: the stream context carries the EXACT per-tile host map so every
+    streaming candidate is bounded by its own tile (Linux halo16 t128
+    1 909 342 208 B vs the old static t32 4 012 813 312 B). The cache-worker
+    ceiling keeps the stack's per-cell cache workers within the cache phase
+    value that was globally validated.
+    """
     inmem_context = _r55_active_context(
         facts,
         phase=renv.PHASE_CELL_STACK_INMEM,
@@ -4774,19 +5064,127 @@ def _r55_active_decide(
     stream_context = _r55_active_context(
         facts,
         phase=renv.PHASE_CELL_STACK_STREAM,
-        per_unit_stack=int(facts["stream_worst"]),
+        per_unit_stack=int(facts["stream_added_worst"]),
         per_unit_cache=int(facts["per_unit_cache"]),
         per_unit_prefetch=int(facts["per_unit_cache"]),
         bundle=bundle,
+        per_tile_stack_bytes=dict(facts["stream_added_by_tile"]),
+        cache_workers_cap=int(cache_workers_cap),
     )
-    joint = zsched.JointPlanInput(
-        contexts=(inmem_context, stream_context)
+    return inmem_context, stream_context
+
+
+def _r55_worker_adaptation_detail(facts, trail):
+    return {
+        "schema": "zemosaic-r55e8-worker-adaptation-v1",
+        "budget_bytes": int(facts["budget_bytes"]),
+        "margin": [int(facts["margin_num"]), int(facts["margin_den"])],
+        "gauge_footprint_bytes": int(facts["gauge_footprint_bytes"]),
+        "cache_footprint_bytes": int(facts["cache_footprint_bytes"]),
+        "gauge_ladder": list(_r55_worker_ladder(int(facts["gauge_workers"]))),
+        "cache_ladder": list(_r55_worker_ladder(int(facts["cache_workers"]))),
+        "selected_gauge_workers": int(facts["gauge_workers"]),
+        "selected_cache_workers": int(facts["cache_workers"]),
+        "trail": [dict(entry) for entry in trail],
+    }
+
+
+def _r55_active_decide(
+    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
+) -> _R55ActiveDecision:
+    """Build the deterministic CPU inmem+stream decision BEFORE gauge/stack.
+
+    R55-E8: gauge and cache_build are non-overlapping concurrency phases. The
+    pair is selected from bounded deterministic descending ladders down to 1
+    under the SAME B_plan and 15 % margin that :func:`build_plan_set` will apply,
+    so a larger pair can never be frozen and then refused by the validator.
+    """
+    facts = _r55_active_facts(
+        bundle=bundle,
+        cell_ctxs=cell_ctxs,
+        canvas=canvas,
+        halo_px=halo_px,
+        cache_root=cache_root,
+        output_dir=output_dir,
+        frame_ids=frame_ids,
     )
-    plan_set = zsched.plan_joint(
-        joint,
-        phase_requests=facts["requests"],
-        mode=zsched.MODE_ACTIVE,
-    )
+    trail: list[dict] = []
+    last_exc = None
+    plan_set = None
+    inmem_context = None
+    stream_context = None
+    for gauge in _r55_worker_ladder(int(facts["gauge_workers"])):
+        for cache in _r55_worker_ladder(int(facts["cache_workers"])):
+            trial = dict(facts)
+            trial["gauge_workers"] = int(gauge)
+            trial["cache_workers"] = int(cache)
+            requests = _r55_active_phase_requests(trial)
+            inmem_context, stream_context = _r55_active_cpu_contexts(
+                trial, bundle, int(cache)
+            )
+            joint = zsched.JointPlanInput(
+                contexts=(inmem_context, stream_context)
+            )
+            try:
+                candidate_plan = zsched.plan_joint(
+                    joint,
+                    phase_requests=requests,
+                    mode=zsched.MODE_ACTIVE,
+                )
+            except zsched.PlanRefused as exc:
+                last_exc = exc
+                trail.append(
+                    {
+                        "at": "worker_selection",
+                        "gauge_workers": int(gauge),
+                        "cache_workers": int(cache),
+                        "accepted": False,
+                        "reason_code": exc.reason_code,
+                        "detail": exc.detail,
+                        "gauge_phase_bytes": (
+                            int(trial["gauge_footprint_bytes"]) * int(gauge)
+                        ),
+                        "cache_phase_bytes": (
+                            int(trial["cache_footprint_bytes"]) * int(cache)
+                        ),
+                    }
+                )
+                continue
+            plan_set = candidate_plan
+            facts = trial
+            trail.append(
+                {
+                    "at": "worker_selection",
+                    "gauge_workers": int(gauge),
+                    "cache_workers": int(cache),
+                    "accepted": True,
+                    "reason_code": "R55_OK",
+                    "aggregate_host_peak_bytes": int(
+                        plan_set.aggregate_host_peak_bytes
+                    ),
+                }
+            )
+            break
+        if plan_set is not None:
+            break
+    if plan_set is None:
+        reason = (
+            zsched.REASON_REFUSE_HOST_RAM
+            if last_exc is None
+            else last_exc.reason_code
+        )
+        detail = (
+            "no coherent gauge/cache worker configuration fits B_plan with the "
+            f"{facts['margin_num']}/{facts['margin_den']} margin after the full "
+            f"bounded ladders (gauge {list(_r55_worker_ladder(int(facts['gauge_workers'])))}"
+            f" x cache {list(_r55_worker_ladder(int(facts['cache_workers'])))}): "
+            + ("" if last_exc is None else str(last_exc.detail))
+        )
+        raise zsched.PlanRefused(
+            reason,
+            detail,
+            candidates=() if last_exc is None else last_exc.candidates,
+        )
     mapping = zsched.map_active_cpu_candidate(
         plan_set,
         tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
@@ -4832,6 +5230,9 @@ def _r55_active_decide(
         inmem_context=inmem_context,
         stream_context=stream_context,
         phase=zsched.active_cpu_phase(candidate),
+        gauge_workers=int(facts["gauge_workers"]),
+        cache_workers=int(facts["cache_workers"]),
+        worker_trail=tuple(dict(entry) for entry in trail),
     )
 
 
@@ -4888,6 +5289,10 @@ class _R55GpuActiveDecision:
     inmem_context: object
     stream_context: object
     device_peak_bytes_by_tile: dict
+    # R55-E8: coherent gauge/cache workers + bounded adaptation trail.
+    gauge_workers: int = 0
+    cache_workers: int = 0
+    worker_trail: tuple = ()
 
 
 def _r55_active_gpu_decide(
@@ -4951,16 +5356,22 @@ def _r55_active_gpu_decide(
             f"({budget} B); refusing rather than extrapolating",
         )
     max_tile = int(max_tile)
+    # R55-E8: the EXECUTABLE ACTIVE GPU ladder is the permitted product ladder
+    # capped by the VRAM-derived maximum. The legacy product (R22/R36) keeps the
+    # non-product VRAM maximum because it executes that tile directly; the R55
+    # ACTIVE mapping contract maps only permitted product tiles onto the bounded
+    # pipeline. ``max_tile`` (the VRAM maximum) is retained in diagnostics.
     gpu_tiles = tuple(
-        sorted(
-            {max_tile}
-            | {
-                int(t) for t in CPU_STREAMING_TILE_LADDER
-                if int(t) < max_tile
-            },
-            reverse=True,
-        )
+        int(t)
+        for t in CPU_STREAMING_TILE_LADDER
+        if int(t) <= int(max_tile)
     )
+    if not gpu_tiles:
+        raise _R55GpuRefused(
+            zgr.REASON_REFUSE_VRAM,
+            "no permitted product GPU tile is <= the VRAM-derived maximum "
+            f"({max_tile}); refusing rather than extrapolating",
+        )
     device_peaks = {
         int(t): int(
             zgpu.gpu_tile_workspace_bytes(
@@ -4972,8 +5383,14 @@ def _r55_active_gpu_decide(
         )
         for t in gpu_tiles
     }
+    # R55-E8: the GPU host bound is the ADDED streaming peak (baseline already
+    # counted once as ``shared_bytes``), never the total that double-counts it.
     gpu_host_bound_by_tile = {
-        int(t): int(_estimate_streaming_bytes(max_n, worst_hw, int(t)))
+        int(t): max(
+            1,
+            int(_estimate_streaming_bytes(max_n, worst_hw, int(t)))
+            - int(rcontract.PROCESS_BASELINE_BYTES),
+        )
         for t in gpu_tiles
     }
 
@@ -4995,40 +5412,6 @@ def _r55_active_gpu_decide(
             record={"qualification": qualification.to_dict()},
         )
 
-    inmem_context = _r55_active_context(
-        base,
-        phase=renv.PHASE_CELL_STACK_INMEM,
-        per_unit_stack=int(base["inmem_worst"]),
-        per_unit_cache=0,
-        per_unit_prefetch=0,
-        bundle=bundle,
-    )
-    stream_context = _r55_active_context(
-        base,
-        phase=renv.PHASE_CELL_STACK_STREAM,
-        per_unit_stack=int(base["stream_worst"]),
-        per_unit_cache=int(base["per_unit_cache"]),
-        per_unit_prefetch=int(base["per_unit_cache"]),
-        bundle=bundle,
-    )
-    gpu_context = replace(
-        stream_context,
-        backend=zsched.BACKEND_GPU,
-        tile_ladder=tuple(int(t) for t in gpu_tiles),
-        prefetch_ladder=tuple(int(p) for p in _R55E2_PREFETCH_LADDER),
-        # R55-E7: ``per_unit_stack_bytes`` is a schema-required placeholder
-        # only; the explicit per-tile map below is the SOLE host bound every
-        # candidate consults. An incomplete/extra map is rejected by the
-        # scheduler, so there is no static fallback for a GPU tile.
-        per_unit_stack_bytes=int(gpu_host_bound_by_tile[int(max_tile)]),
-        per_tile_stack_bytes=tuple(
-            (int(t), int(gpu_host_bound_by_tile[int(t)]))
-            for t in gpu_tiles
-        ),
-        per_unit_prefetch_bytes=int(base["per_unit_cache"]),
-        time_model=None,
-        profile=None,
-    )
     gpu_facts = zsched.GpuFacts(
         requested=True,
         available=bool(gpu_probe.get("available")),
@@ -5042,19 +5425,53 @@ def _r55_active_gpu_decide(
         ),
         prefetch_overlap_measured=False,
     )
-    joint = zsched.JointPlanInput(
-        contexts=(inmem_context, stream_context, gpu_context),
+
+    def _gpu_pair_contexts(gauge_workers, cache_workers, trial_facts):
+        """Build CPU inmem/stream + GPU contexts for ONE worker pair."""
+        in_c, st_c = _r55_active_cpu_contexts(
+            trial_facts, bundle, int(cache_workers)
+        )
+        gpu_c = replace(
+            st_c,
+            backend=zsched.BACKEND_GPU,
+            tile_ladder=tuple(int(t) for t in gpu_tiles),
+            prefetch_ladder=tuple(int(p) for p in _R55E2_PREFETCH_LADDER),
+            # R55-E7: ``per_unit_stack_bytes`` is a schema-required placeholder
+            # only; the explicit per-tile map below is the SOLE host bound every
+            # candidate consults. An incomplete/extra map is rejected by the
+            # scheduler, so there is no static fallback for a GPU tile.
+            # Schema-required placeholder only; the per-tile map is the sole
+            # host bound. Use the largest EXECUTABLE ladder tile.
+            per_unit_stack_bytes=int(gpu_host_bound_by_tile[int(gpu_tiles[0])]),
+            per_tile_stack_bytes=tuple(
+                (int(t), int(gpu_host_bound_by_tile[int(t)]))
+                for t in gpu_tiles
+            ),
+            per_unit_prefetch_bytes=int(base["per_unit_cache"]),
+            time_model=None,
+            profile=None,
+        )
+        return in_c, st_c, gpu_c
+
+    # Initial GPU feasibility is independent of the gauge/cache worker pair
+    # (workers do not change the exact host/device peaks). Determine it once,
+    # then adapt only the non-overlapping concurrency phases.
+    _init_in, _init_st, _init_gpu = _gpu_pair_contexts(
+        base["gauge_workers"], base["cache_workers"], base
+    )
+    _init_joint = zsched.JointPlanInput(
+        contexts=(_init_in, _init_st, _init_gpu),
         gpu_facts=gpu_facts,
     )
-    enumerated = zsched.enumerate_joint_candidates(joint)
+    enumerated = zsched.enumerate_joint_candidates(_init_joint)
     feasible_gpu = [
         candidate for candidate in enumerated
         if candidate.backend == zsched.BACKEND_GPU and candidate.feasible
     ]
     if not feasible_gpu:
-        trail = zsched.joint_refusal_trail(joint)
+        trail = zsched.joint_refusal_trail(_init_joint)
         reason, detail, exhaustion = zsched.gpu_exhaustion_reason(
-            joint, enumerated
+            _init_joint, enumerated
         )
         raise _R55GpuRefused(
             reason,
@@ -5073,24 +5490,134 @@ def _r55_active_gpu_decide(
                 "vram_budget_bytes": int(budget),
             },
         )
-    target = min(
-        _R55E2_PREFETCH_DEFAULT,
-        max(int(c.prefetch_units) for c in feasible_gpu),
-    )
-    chosen = min(
-        feasible_gpu,
-        key=lambda c: (
-            0 if int(c.prefetch_units) == int(target) else 1,
-            -int(c.prefetch_units),
-            zsched.objective_key(c),
-        ),
-    )
-    plan_set = zsched.build_joint_plan_set(
-        joint,
-        candidate=chosen,
-        phase_requests=base["requests"],
-        mode=zsched.MODE_ACTIVE,
-    )
+
+    # R55-E8: adapt gauge/cache under the SAME B_plan + margin that
+    # build_joint_plan_set validates. Prefer the largest safe pair.
+    worker_trail: list[dict] = []
+    last_exc = None
+    plan_set = None
+    joint = None
+    inmem_context = None
+    stream_context = None
+    gpu_context = None
+    for gauge in _r55_worker_ladder(int(base["gauge_workers"])):
+        for cache in _r55_worker_ladder(int(base["cache_workers"])):
+            trial = dict(base)
+            trial["gauge_workers"] = int(gauge)
+            trial["cache_workers"] = int(cache)
+            requests = _r55_active_phase_requests(trial)
+            in_c, st_c, gpu_c = _gpu_pair_contexts(
+                int(gauge), int(cache), trial
+            )
+            trial_joint = zsched.JointPlanInput(
+                contexts=(in_c, st_c, gpu_c),
+                gpu_facts=gpu_facts,
+            )
+            trial_enumerated = zsched.enumerate_joint_candidates(trial_joint)
+            trial_feasible = [
+                candidate
+                for candidate in trial_enumerated
+                if candidate.backend == zsched.BACKEND_GPU
+                and candidate.feasible
+            ]
+            if not trial_feasible:
+                worker_trail.append(
+                    {
+                        "at": "worker_selection",
+                        "gauge_workers": int(gauge),
+                        "cache_workers": int(cache),
+                        "accepted": False,
+                        "reason_code": zsched.REASON_REFUSE_HOST_RAM,
+                        "detail": "no feasible GPU candidate under this "
+                        "worker ceiling",
+                    }
+                )
+                continue
+            target = min(
+                _R55E2_PREFETCH_DEFAULT,
+                max(int(c.prefetch_units) for c in trial_feasible),
+            )
+            # R55-E8: the GPU ladder is walked largest-first, exactly like the
+            # legacy product's finite tile ladder. Among jointly feasible tiles
+            # the LARGEST wins (the corrected exact bounds are non-monotone, so
+            # tile96 can have a marginally lower host peak than tile128); then
+            # the bounded prefetch target, then the scheduler objective.
+            chosen = min(
+                trial_feasible,
+                key=lambda c: (
+                    -int(c.tile_px),
+                    0 if int(c.prefetch_units) == int(target) else 1,
+                    -int(c.prefetch_units),
+                    zsched.objective_key(c),
+                ),
+            )
+            try:
+                candidate_plan = zsched.build_joint_plan_set(
+                    trial_joint,
+                    candidate=chosen,
+                    phase_requests=requests,
+                    mode=zsched.MODE_ACTIVE,
+                )
+            except zsched.PlanRefused as exc:
+                last_exc = exc
+                worker_trail.append(
+                    {
+                        "at": "worker_selection",
+                        "gauge_workers": int(gauge),
+                        "cache_workers": int(cache),
+                        "accepted": False,
+                        "reason_code": exc.reason_code,
+                        "detail": exc.detail,
+                        "gauge_phase_bytes": (
+                            int(trial["gauge_footprint_bytes"]) * int(gauge)
+                        ),
+                        "cache_phase_bytes": (
+                            int(trial["cache_footprint_bytes"]) * int(cache)
+                        ),
+                    }
+                )
+                continue
+            plan_set = candidate_plan
+            base = trial
+            joint = trial_joint
+            inmem_context, stream_context, gpu_context = in_c, st_c, gpu_c
+            worker_trail.append(
+                {
+                    "at": "worker_selection",
+                    "gauge_workers": int(gauge),
+                    "cache_workers": int(cache),
+                    "accepted": True,
+                    "reason_code": "R55_OK",
+                    "aggregate_host_peak_bytes": int(
+                        plan_set.aggregate_host_peak_bytes
+                    ),
+                    "aggregate_device_peak_bytes": int(
+                        plan_set.aggregate_device_peak_bytes
+                    ),
+                }
+            )
+            break
+        if plan_set is not None:
+            break
+    if plan_set is None:
+        detail = (
+            "no coherent gauge/cache worker configuration fits the SAME B_plan "
+            f"with the {base['margin_num']}/{base['margin_den']} margin after "
+            "the full bounded ladders"
+        )
+        if last_exc is not None:
+            detail = detail + ": " + str(last_exc.detail)
+        raise _R55GpuRefused(
+            zsched.REASON_REFUSE_HOST_RAM,
+            detail,
+            record={
+                "worker_adaptation": _r55_worker_adaptation_detail(
+                    base, worker_trail
+                ),
+                "b_plan_bytes": int(bundle.envelope.budget_bytes),
+                "vram_budget_bytes": int(budget),
+            },
+        )
     mapping = zsched.map_active_gpu_candidate(
         plan_set,
         tile_ladder=tuple(int(t) for t in gpu_tiles),
@@ -5130,6 +5657,9 @@ def _r55_active_gpu_decide(
         inmem_context=inmem_context,
         stream_context=stream_context,
         device_peak_bytes_by_tile=dict(device_peaks),
+        gauge_workers=int(base["gauge_workers"]),
+        cache_workers=int(base["cache_workers"]),
+        worker_trail=tuple(dict(entry) for entry in worker_trail),
     )
 
 
@@ -5362,6 +5892,12 @@ def _r55_active_gpu_apply(
         },
         envelope=envelope,
         attempts=attempts,
+        # R55-E8: the coherent gauge/cache workers selected under the same
+        # B_plan/margin are the values that execute.
+        gauge_workers=int(decision.gauge_workers or bundle.gauge_workers),
+        cache_build_workers=int(
+            decision.cache_workers or bundle.cache_build_workers
+        ),
     )
 
 
@@ -5743,6 +6279,11 @@ def _r55_active_apply(
         cpu_fallback_tasks=None,
         envelope=envelope,
         attempts=attempts,
+        # R55-E8: the coherent gauge/cache workers selected under the same
+        # B_plan/margin are the values that execute (never the pre-adaptation
+        # bundle values).
+        gauge_workers=int(facts["gauge_workers"]),
+        cache_build_workers=int(facts["cache_workers"]),
     )
 
 
@@ -6576,6 +7117,7 @@ def _r55_build_active_block(
     launch_trail,
     status,
     run=None,
+    worker_adaptation=None,
 ) -> dict:
     """Deterministic active manifest block (no fabricated observed metric).
 
@@ -6650,6 +7192,10 @@ def _r55_build_active_block(
             )
         ),
     )
+    if worker_adaptation is not None:
+        # R55-E8: deterministic bounded decision trail of the non-overlapping
+        # gauge/cache concurrency phases actually selected under this B_plan.
+        block["worker_adaptation"] = dict(worker_adaptation)
     if run is not None:
         run_payload = dict(run)
         block["run"] = run_payload
@@ -7020,9 +7566,13 @@ def _run_single(
             getattr(getattr(f, "frame_id", None), "logical_path", str(f))
             for f in (descs or ())
         )
-        _r55_gpu_active_requested = bool(
-            _initial_bundle.gpu_used and gpu_used
-        )
+        # R55-E8: the PRODUCT GPU authority decides whether the richer ACTIVE
+        # planner is entered. Requiring an already-host-feasible single-tile
+        # GPU bundle would discard a feasible tile128 merely because the
+        # VRAM-max tile213 missed host RAM (Linux halo16 legacy pre-fallback).
+        # The bundle consistency check below still fails closed the inverse
+        # case (GPU-shaped bundle while the product backend is CPU).
+        _r55_gpu_active_requested = bool(gpu_used)
         if bool(_initial_bundle.gpu_used) and not _r55_gpu_active_requested:
             # Fail closed on an INCONSISTENT bundle (GPU-shaped but the product
             # GPU backend is not selected): never silently execute it on CPU.
@@ -7257,6 +7807,27 @@ def _run_single(
         # R55-D2: the active plan was already fitted and admitted BEFORE the
         # gauge. Do NOT run the legacy admission controller (no second plan).
         _adm, _final = _r55_active_adm, _r55_active_bundle
+        # R55-E8: the global gauge executes with the COHERENT worker value the
+        # same B_plan/margin admitted, never the pre-adaptation bundle value.
+        workers = int(_final.gauge_workers)
+        cache_build_workers = int(_final.cache_build_workers)
+        _r55_worker_selection = (
+            _r55_active_gpu_decision
+            if _r55_active_gpu_decision is not None
+            else _r55_active_decision
+        )
+        if _r55_worker_selection is not None:
+            _emit(
+                "ZeGrid: R55-E8 coherent workers — gauge="
+                f"{int(_r55_worker_selection.gauge_workers)} "
+                f"(from {int(_initial_bundle.gauge_workers)}), cache_build="
+                f"{int(_r55_worker_selection.cache_workers)} "
+                f"(from {int(_initial_bundle.cache_build_workers)}), "
+                f"B_plan={int(_final.envelope.budget_bytes)} B, margin="
+                f"{int(renv.DEFAULT_MARGIN_NUM)}/{int(renv.DEFAULT_MARGIN_DEN)}, "
+                f"trail_steps={len(_r55_worker_selection.worker_trail)}",
+                callback=progress_callback,
+            )
     else:
         try:
             _adm, _final = _admit(_initial_bundle)
@@ -9078,6 +9649,18 @@ def _run_single(
             launch_trail=_r55_active_launch_trail,
             status=("executed" if _r55_active_ok else "partial"),
             run=_r55_run_block,
+            worker_adaptation=_r55_worker_adaptation_detail(
+                (
+                    _r55_active_gpu_decision
+                    if _r55_active_gpu_decision is not None
+                    else _r55_active_decision
+                ).facts,
+                (
+                    _r55_active_gpu_decision
+                    if _r55_active_gpu_decision is not None
+                    else _r55_active_decision
+                ).worker_trail,
+            ),
         )
         if _r55_active_gpu_decision is not None:
             _r55_scheduler_block["gpu_execution"] = dict(
@@ -10074,9 +10657,9 @@ def run_zegrid_mode(
     # HONESTLY (requested -> available -> effective). ``use_gpu`` is now honoured
     # (never silently dropped); an unavailable/undersized GPU degrades loudly to
     # exact CPU with a recorded reason.
-    gpu_requested, gpu_source = resolve_gpu_preference(use_gpu, zconfig)
-    gpu_probe = zgpu.probe_gpu_backend()
-    vram_budget = zgpu.vram_budget_bytes(gpu_probe)
+    gpu_requested, gpu_source, gpu_probe, vram_budget = _r55_resolve_gpu_probe(
+        use_gpu, zconfig
+    )
     gpu_effective = False
     gpu_fallback_reason = None
     if gpu_requested:
