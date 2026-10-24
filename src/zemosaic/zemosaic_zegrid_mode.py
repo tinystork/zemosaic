@@ -973,6 +973,20 @@ def _choose_layout_mode_aware(
     A bounded refinement can therefore only move the chosen layout toward FINER
     candidates, in the existing deterministic ``REFINEMENT_FACTORS`` order with
     the scientific floors unchanged.
+
+    ZM-ZEGRID-R55-E6 — bounded COARSER rescue for a large user-selected halo:
+    the factor-1 candidate can be rejected SOLELY by ``max_halo_overhead``
+    because finer Cells pay proportionally MORE halo. In that exact case (and
+    ONLY that case: no earlier rank-admitted candidate, no pinned layout, no
+    refinement-rank window), a deterministic, finite family of COARSER grids
+    (:func:`auto_layout.coarser_rescue_grids`, nearest coarser first) is
+    evaluated: scientific floors are re-checked, then the candidate's EXACT
+    mode-aware RAM bound is computed. Coarsening is monotonically better for the
+    halo floor every coarser grid has a non-increasing halo overhead) but NOT
+    for memory, so a memory-rejected rescue stops the scan and is reported
+    truthfully (no "coarser uses less RAM" claim). The chosen layout records
+    ``layout_origin="auto_coarser_rescue"`` plus a ``layout_rescue`` provenance
+    block; ordinary runs keep ``layout_origin="auto_refinement"`` byte-for-byte.
     """
 
     def _log(msg, lvl="INFO"):
@@ -1033,12 +1047,32 @@ def _choose_layout_mode_aware(
         patch_ok = geom["min_patch_area"] >= floors.min_patch_area_px
         halo_ok = geom["halo_overhead"] <= floors.max_halo_overhead
         if not (patch_ok and halo_ok):
+            # ZM-ZEGRID-R55-E6: the pinned geometry is NEVER changed, but the
+            # advice must be truthful. Halo overhead grows with refinement, so
+            # "pin FINER" is the wrong direction for a halo-floor conflict.
+            if not halo_ok and patch_ok:
+                _dir = (
+                    "Lower the anti-checkerboard halo (e.g. "
+                    f"{halo_px} -> {max(1, int(halo_px) // 2)} px) or increase the "
+                    "core/cell size; a FINER layout raises halo overhead and cannot "
+                    "fix this."
+                )
+            elif not patch_ok and halo_ok:
+                _dir = (
+                    "Increase the core/cell size (coarser layout) or the halo-free "
+                    "core geometry; a FINER layout reduces patch area and cannot fix "
+                    "this."
+                )
+            else:
+                _dir = (
+                    "Both floors are violated: increase the core/cell size and/or "
+                    "lower the anti-checkerboard halo."
+                )
             msg = (
                 f"pinned layout {nx}x{ny} violates scientific floors: "
                 f"min_patch_area={geom['min_patch_area']} (limit {floors.min_patch_area_px}), "
                 f"halo_overhead={geom['halo_overhead']:.4f} (limit {floors.max_halo_overhead}). "
-                "Suggest increasing available RAM or pinning a FINER layout via the "
-                "'zegrid_layout' config key."
+                + _dir
             )
             _log(msg, "ERROR")
             raise zal.LayoutInfeasible(msg)
@@ -1101,6 +1135,7 @@ def _choose_layout_mode_aware(
             "warnings": tuple(warnings),
             "cells": cells,
             "layout_source": "pinned",
+            "layout_origin": "pinned",
             "cpu_streaming": _cpu_streaming_block(
                 selected_tile, trials, sel_reason, stream_worst_by_tile, inmem_worst, ram_budget
             ),
@@ -1121,6 +1156,11 @@ def _choose_layout_mode_aware(
         )
     candidates = []
     seen = set()
+    # ZM-ZEGRID-R55-E6: set ONLY when the FIRST rank-admitted auto candidate is
+    # rejected solely by max_halo_overhead (patch floor OK). This is the sole
+    # trigger for the bounded coarser rescue; every ordinary run leaves it None.
+    halo_conflict = None
+    halo_floor_stopped = None
     for factor in zal.REFINEMENT_FACTORS:
         nx = max(1, int(math.ceil(canvas.width / (mw / factor))))
         ny = max(1, int(math.ceil(canvas.height / (mh / factor))))
@@ -1154,6 +1194,17 @@ def _choose_layout_mode_aware(
                     f"max_halo_overhead floor: {geom['halo_overhead']:.4f} > "
                     f"{floors.max_halo_overhead}"
                 )
+                halo_floor_stopped = {
+                    "nx": nx, "ny": ny, "factor": factor, "geom": geom,
+                }
+            if (
+                not candidates
+                and geom["min_patch_area"] >= floors.min_patch_area_px
+                and geom["halo_overhead"] > floors.max_halo_overhead
+            ):
+                halo_conflict = {
+                    "nx": nx, "ny": ny, "factor": factor, "geom": geom,
+                }
             _log("layout scan: floors are monotonic in refinement — stopping")
             break  # floors are monotonic in refinement
         worst = _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
@@ -1209,7 +1260,7 @@ def _choose_layout_mode_aware(
     if observer is not None:
         observer.end()
 
-    if chosen is None and not candidates and (
+    if chosen is None and not candidates and halo_conflict is None and (
         min_refinement_rank is not None or max_refinement_rank is not None
     ):
         # ZM-ZEGRID-R41-B: the bounded refinement-rank window admitted NO candidate
@@ -1222,6 +1273,222 @@ def _choose_layout_mode_aware(
             "the exact/pinned geometry cannot be re-planned under the current RAM "
             "budget. Refusing rather than changing the layout. A FINER layout "
             "(more cells) or more available RAM would be required."
+        )
+        _log(msg, "ERROR")
+        raise zal.LayoutInfeasible(msg)
+
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-R55-E6 — bounded COARSER rescue (large user-selected halo)
+    # ------------------------------------------------------------------
+    # Trigger is deliberately narrow: the FIRST rank-admitted auto candidate was
+    # rejected SOLELY by max_halo_overhead, so no memory candidate was ever
+    # evaluated, and no pinned/refinement-rank contract is in force. Coarsening
+    # monotonically REDUCES halo overhead (fixed-width halo band vs a larger
+    # core), which is the only monotonic claim made here; memory is evaluated
+    # exactly per candidate and is never assumed to fall.
+    rescue_record = None
+    rescue_memory_failure = None
+    rescue_trials: list = []
+    rescue_grids: tuple = ()
+    if chosen is None and halo_conflict is not None:
+        _rescue_allowed = (min_refinement_rank is None and max_refinement_rank is None)
+        if _rescue_allowed:
+            rescue_grids = zal.coarser_rescue_grids(
+                canvas, mw, mh, halo_conflict["nx"], halo_conflict["ny"]
+            )
+            _log(
+                f"layout scan: candidate {halo_conflict['nx']}x{halo_conflict['ny']} "
+                f"REJECTED SOLELY by max_halo_overhead "
+                f"({halo_conflict['geom']['halo_overhead']:.4f} > "
+                f"{floors.max_halo_overhead}); attempting bounded COARSER rescue — "
+                f"{len(rescue_grids)} deterministic candidate(s), nearest coarser "
+                "first (coarsening monotonically lowers halo overhead)"
+            )
+            if not rescue_grids:
+                _log(
+                    "layout rescue: no coarser grid exists "
+                    f"(rejected candidate is already {halo_conflict['nx']}x"
+                    f"{halo_conflict['ny']})"
+                )
+            for rnx, rny in rescue_grids:
+                rgeom = zal._nominal_geometry(canvas, rnx, rny, halo_px)
+                rpatch_ok = rgeom["min_patch_area"] >= floors.min_patch_area_px
+                rhalo_ok = rgeom["halo_overhead"] <= floors.max_halo_overhead
+                if not (rpatch_ok and rhalo_ok):
+                    _log(
+                        f"layout rescue: candidate {rnx}x{rny} REJECTED — floors "
+                        f"(min_patch_area {rgeom['min_patch_area']} px vs "
+                        f"{floors.min_patch_area_px}; halo_overhead "
+                        f"{rgeom['halo_overhead']:.4f} vs {floors.max_halo_overhead}); "
+                        "coarsening further only relaxes these floors"
+                    )
+                    rescue_trials.append({
+                        "nx": rnx, "ny": rny, "cell_count": rnx * rny,
+                        "floors_ok": False,
+                        "min_patch_area": int(rgeom["min_patch_area"]),
+                        "halo_overhead": round(float(rgeom["halo_overhead"]), 6),
+                        "memory_ok": None,
+                    })
+                    continue
+                rworst = _scan_layout_mode_aware(
+                    canvas, footprints, rnx, rny, halo_px, tile_size
+                )
+                rselected, rtrials, rreason = _select_cpu_streaming_tile(
+                    rworst["stream_worst_by_tile"], ram_budget
+                )
+                rinmem_ok = (ram_budget is None) or (
+                    rworst["inmem_worst_bytes"] <= ram_budget
+                )
+                rmemory_ok = rinmem_ok or (rselected is not None)
+                _rbound = int(_selected_admissible_bound(
+                    rinmem_ok, rworst["inmem_worst_bytes"], rselected,
+                    rworst["stream_worst_by_tile"], rworst.get("cheaper_bound_bytes", 0),
+                ))
+                _rtrial = {
+                    "nx": rnx, "ny": rny, "cell_count": rnx * rny,
+                    "floors_ok": True,
+                    "min_patch_area": int(rgeom["min_patch_area"]),
+                    "halo_overhead": round(float(rgeom["halo_overhead"]), 6),
+                    "inmem_worst_bytes": int(rworst["inmem_worst_bytes"]),
+                    "stream_worst_by_tile": {
+                        int(k): int(v) for k, v in rworst["stream_worst_by_tile"].items()
+                    },
+                    "selected_tile": (int(rselected) if rselected is not None else None),
+                    "admissible_bound_bytes": _rbound,
+                    "memory_ok": bool(rmemory_ok),
+                }
+                rescue_trials.append(_rtrial)
+                if rmemory_ok:
+                    # Nearest coarser candidate that satisfies BOTH the floors and
+                    # the actual mode-aware RAM budget.
+                    rf = round(float(mw) * float(rnx) / float(canvas.width), 6)
+                    chosen = {
+                        "factor": rf, "nx": rnx, "ny": rny,
+                        "bound": _rbound, "worst_cell": rworst,
+                        "memory_ok": True, "geom": rgeom,
+                        "inmem_ok": bool(rinmem_ok),
+                        "selected_tile": rselected,
+                        "trials": rtrials, "selection_reason": rreason,
+                    }
+                    rescue_record = {
+                        "applied": True,
+                        "kind": "coarser_rescue",
+                        "reason": "max_halo_overhead",
+                        "trigger": {
+                            "nx": halo_conflict["nx"], "ny": halo_conflict["ny"],
+                            "refinement_factor": halo_conflict["factor"],
+                            "halo_overhead": round(
+                                float(halo_conflict["geom"]["halo_overhead"]), 6
+                            ),
+                            "max_halo_overhead": float(floors.max_halo_overhead),
+                            "memory_evaluated": False,
+                        },
+                        "chosen": {
+                            "nx": rnx, "ny": rny, "cell_count": rnx * rny,
+                            "effective_coarsening_factor": rf,
+                        },
+                        "candidates_evaluated": [dict(t) for t in rescue_trials],
+                        "monotonic_note": (
+                            "coarsening monotonically lowers halo_overhead and raises "
+                            "min_patch_area; memory is NOT monotone in coarsening and "
+                            "was evaluated exactly for this candidate"
+                        ),
+                    }
+                    _log(
+                        f"layout rescue: candidate {rnx}x{rny} "
+                        f"({rnx * rny} cells) ACCEPTED — floors ok "
+                        f"(halo_overhead {rgeom['halo_overhead']:.4f} <= "
+                        f"{floors.max_halo_overhead}); admissible bound "
+                        f"{_rbound / 2**20:.1f} MiB"
+                        + (f" <= budget {ram_budget / 2**20:.1f} MiB"
+                           if ram_budget is not None else "")
+                        + f"; CPU streaming tile {rselected} ({rreason})"
+                    )
+                    break
+                # Nearest floor-feasible coarser candidate does not fit. Patch
+                # area is non-decreasing under coarsening and the fitted model is
+                # increasing in it, so the remaining (coarser) family is NOT
+                # assumed to lower memory -> stop, never claim otherwise.
+                rescue_memory_failure = dict(_rtrial)
+                _log(
+                    f"layout rescue: candidate {rnx}x{rny} REJECTED — admissible "
+                    f"bound {_rbound / 2**20:.1f} MiB > budget "
+                    f"{(ram_budget / 2**20) if ram_budget is not None else 0:.1f} MiB "
+                    f"(in-memory worst {rworst['inmem_worst_bytes'] / 2**20:.1f} MiB; "
+                    f"best CPU streaming tile {rselected}). Coarsening further "
+                    "enlarges per-cell patch area, so it is NOT assumed to lower "
+                    "memory — stopping the rescue scan (no further candidates)"
+                )
+                break
+        else:
+            _log(
+                "layout rescue: NOT attempted — a bounded refinement-rank window "
+                f"(min={min_refinement_rank}, max={max_refinement_rank}) forbids "
+                "coarsening; refusing rather than changing the exact geometry"
+            )
+
+    if chosen is None and halo_conflict is not None:
+        _half = max(1, int(halo_px) // 2)
+        _conflict = (
+            f"requested halo {halo_px}px conflicts with the max_halo_overhead floor "
+            f"({halo_conflict['geom']['halo_overhead']:.4f} > "
+            f"{floors.max_halo_overhead}) at the "
+            f"{halo_conflict['nx']}x{halo_conflict['ny']} factor-"
+            f"{halo_conflict['factor']:g} layout"
+        )
+        _direction = (
+            f"Lower the anti-checkerboard halo (e.g. {halo_px} -> {_half} px) or "
+            "increase the core/cell size. A FINER layout is NOT the fix: finer Cells "
+            "raise halo overhead, which is the floor that rejected this candidate."
+        )
+        if rescue_memory_failure is not None:
+            msg = (
+                f"{_conflict}, and the nearest floor-feasible COARSER rescue "
+                f"{rescue_memory_failure['nx']}x{rescue_memory_failure['ny']} needs "
+                f"{rescue_memory_failure['admissible_bound_bytes'] / 2**20:.1f} MiB "
+                f"> budget {ram_budget / 2**20:.1f} MiB "
+                f"(in-memory worst "
+                f"{rescue_memory_failure['inmem_worst_bytes'] / 2**20:.1f} MiB; best "
+                f"CPU streaming tile {rescue_memory_failure['selected_tile']}). "
+                "Coarsening further enlarges the per-cell patch area, so no coarser "
+                "candidate is assumed to fit and the rescue is not scanned further. "
+                f"{_direction}"
+            )
+        elif not _rescue_allowed:
+            msg = (
+                f"{_conflict}. A COARSER layout would be needed to satisfy the halo "
+                "floor, but the bounded replan refinement-rank window "
+                f"(min={min_refinement_rank}, max={max_refinement_rank}) forbids "
+                "coarsening; the exact geometry is preserved and the plan is refused. "
+                f"{_direction}"
+            )
+        elif not rescue_grids:
+            msg = (
+                f"{_conflict}, and no COARSER layout exists "
+                f"(the grid is already {halo_conflict['nx']}x{halo_conflict['ny']}). "
+                f"This is a halo-floor conflict, not a RAM-budget conflict. {_direction}"
+            )
+        else:
+            msg = (
+                f"{_conflict}, and none of the {len(rescue_grids)} deterministic "
+                "COARSER rescue candidates satisfies both scientific floors. This is "
+                f"a halo-floor conflict, not a RAM-budget conflict. {_direction}"
+            )
+        _log(msg, "ERROR")
+        raise zal.LayoutInfeasible(msg)
+
+    if chosen is None and not candidates:
+        # No candidate was ever memory-evaluated and the halo-only case above did
+        # not apply: the forward scan stopped at the min_patch_area floor. Do not
+        # emit a bogus "RAM budget" headline and do not point at FINER (finer
+        # Cells have LESS patch area).
+        msg = (
+            "no layout candidate satisfies the min_patch_area floor "
+            f"({floors.min_patch_area_px} px): the coarsest enumerated candidate is "
+            "below it. This is a patch-area floor conflict, not a RAM-budget "
+            "conflict (no memory candidate was evaluated). A COARSER layout (fewer, "
+            "larger Cells) or a larger core geometry is the direction that raises "
+            "patch area; a FINER layout reduces it and cannot help."
         )
         _log(msg, "ERROR")
         raise zal.LayoutInfeasible(msg)
@@ -1247,14 +1514,29 @@ def _choose_layout_mode_aware(
             f"together with the budget (mode-aware, adaptive CPU streaming tile down to "
             f"{CPU_STREAMING_TILE_MINIMUM})"
         )
+        if halo_floor_stopped is not None:
+            # The finer direction is blocked by the halo floor, so never advise it.
+            _finest_dir = (
+                "Further refinement is BLOCKED by max_halo_overhead "
+                f"({halo_floor_stopped['geom']['halo_overhead']:.4f} > "
+                f"{floors.max_halo_overhead}) at "
+                f"{halo_floor_stopped['nx']}x{halo_floor_stopped['ny']}; lower the "
+                f"anti-checkerboard halo (e.g. {halo_px} -> {max(1, int(halo_px) // 2)} "
+                "px) to allow finer layouts, or increase available RAM."
+            )
+        else:
+            _finest_dir = (
+                "A FINER layout (more cells) is the direction that lowers the "
+                "per-cell footprint; a deeper disk-backed streaming executor is not "
+                "available in R36. Suggest either increasing available RAM, choosing "
+                "a finer layout, or pinning an explicit layout via the 'zegrid_layout' "
+                "config key when reproducible geometry is required."
+            )
         msg = (
             "RAM budget cannot satisfy scientific floors (mode-aware): "
             + "; ".join(reasons)
-            + ". A FINER layout (more cells) is the direction that lowers the "
-            "per-cell footprint; a deeper disk-backed streaming executor is not "
-            "available in R36. Suggest either increasing available RAM, choosing a "
-            "finer layout, or pinning an explicit layout via the 'zegrid_layout' "
-            "config key when reproducible geometry is required."
+            + ". "
+            + _finest_dir
         )
         _log(msg, "ERROR")
         raise zal.LayoutInfeasible(msg)
@@ -1289,9 +1571,11 @@ def _choose_layout_mode_aware(
             int(_sel_tile) if _sel_tile is not None else CPU_STREAMING_TILE_MINIMUM, 0
         )
     )
+    _origin = "auto_coarser_rescue" if rescue_record is not None else "auto_refinement"
     _log(
         f"layout scan: CHOSEN {chosen['nx']}x{chosen['ny']} "
-        f"({chosen['nx'] * chosen['ny']} cells, mode-aware, source=auto) "
+        f"({chosen['nx'] * chosen['ny']} cells, mode-aware, source=auto, "
+        f"origin={_origin}) "
         f"predicted bound {_predicted_bound / 2**20:.1f} MiB; "
         f"in-memory worst {chosen['worst_cell'].get('inmem_worst_bytes', 0) / 2**20:.1f} MiB; "
         f"CPU streaming tile {_sel_tile} (stream@{_sel_tile}={_sel_stream / 2**20:.1f} MiB) "
@@ -1311,6 +1595,7 @@ def _choose_layout_mode_aware(
         "warnings": tuple(warnings),
         "cells": cells,
         "layout_source": "auto",
+        "layout_origin": _origin,
         "cpu_streaming": _cpu_streaming_block(
             chosen["selected_tile"], chosen["trials"], chosen["selection_reason"],
             chosen["worst_cell"]["stream_worst_by_tile"],
@@ -1325,6 +1610,7 @@ def _choose_layout_mode_aware(
                                    "ok": chosen["geom"]["halo_overhead"] <= floors.max_halo_overhead},
             "min_contributors": {"value": max_n, "limit": floors.min_contributors, "ok": contrib_ok},
         },
+        **({"layout_rescue": rescue_record} if rescue_record is not None else {}),
     }
 
 
@@ -9396,7 +9682,10 @@ def _write_outputs(
                    "ram_budget_bytes": layout["ram_budget_bytes"],
                    "available_bytes": layout["available_bytes"],
                    "max_contributors": layout["max_contributors"],
-                   "predicted_bound_bytes": layout["predicted_bound_bytes"]},
+                   "predicted_bound_bytes": layout["predicted_bound_bytes"],
+                   "layout_origin": layout.get("layout_origin", "auto_refinement"),
+                   **({"layout_rescue": layout["layout_rescue"]}
+                      if layout.get("layout_rescue") else {})},
         "layout_source": layout.get("layout_source", "auto"),
         # ZM-ZEGRID-R53b: ONE stable top-level provenance block (same shape for
         # global / per_cell / auto outcomes). It is resolved once at the product

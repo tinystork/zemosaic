@@ -295,6 +295,92 @@ REFINEMENT_FACTORS = (
     40.0, 48.0, 64.0,
 )
 
+# ZM-ZEGRID-R55-E6 — bounded COARSER rescue ladder.
+#
+# ``REFINEMENT_FACTORS`` is (and stays) a REFINEMENT ladder: it starts at
+# factor 1.0 (Cell ~= one median projected source footprint) and only ever goes
+# FINER, because finer Cells reduce the per-Cell peak. Halo overhead moves the
+# OTHER way: coarser Cells pay proportionally LESS halo, so a user-selected
+# large (valid) halo can make the factor-1 candidate violate
+# ``max_halo_overhead`` even though a slightly COARSER layout is floor-feasible
+# and fits RAM. The rescue therefore needs factors BELOW 1.0.
+#
+# ``COARSER_RESCUE_FACTORS`` is the EXACT reciprocal of the refinement ladder
+# (1/1.25, 1/1.5, ... 1/64), i.e. the same deterministic geometric sequence
+# traversed in the opposite direction. It is a SEPARATE constant: nothing is
+# prepended to ``REFINEMENT_FACTORS``, so ordinary auto runs are byte-for-byte
+# unchanged. The rescue is only consulted when the FIRST rank-admitted auto
+# candidate is rejected SOLELY by ``max_halo_overhead`` (see the mode-aware
+# chooser); it is never part of the normal forward scan.
+COARSER_RESCUE_FACTORS = tuple(
+    round(1.0 / float(f), 6) for f in REFINEMENT_FACTORS if float(f) > 1.0
+)
+
+
+def coarser_rescue_grids(
+    canvas: zg.GlobalCanvas,
+    median_w: float,
+    median_h: float,
+    rejected_nx: int,
+    rejected_ny: int,
+) -> tuple[tuple[int, int], ...]:
+    """Deterministic, FINITE coarser candidate family, nearest coarser first.
+
+    The family is the union of:
+
+    * the immediate grid-space coarsenings of the rejected layout — decrement
+      either axis (or both) by one, clipped to ``>= 1``; and
+    * the reciprocal refinement ladder (:data:`COARSER_RESCUE_FACTORS`) applied
+      with the SAME ``target = median / factor`` convention as the forward scan,
+      which covers larger jumps when a single-axis decrement is not enough.
+
+    Only grids with STRICTLY fewer cells than the rejected one are returned
+    (the rejected grid itself was already floor-rejected, so re-testing it is
+    pointless). Ordering is deterministic:
+
+    1. largest cell count first (nearest coarser),
+    2. then most balanced grid (smallest ``|nx - ny|``),
+    3. then larger ``nx``,
+    4. then larger ``ny``.
+
+    Monotonic argument for the whole family: under coarsening, ``ceil(W/nx)``
+    and ``ceil(H/ny)`` are non-decreasing, so the halo-overhead ratio is
+    NON-INCREASING (the core grows faster than the fixed-width halo band). A
+    halo-floor rejection at a finer candidate is therefore not evidence against
+    a coarser one; conversely a halo-floor rejection at a coarser candidate
+    would imply every finer candidate also fails. Memory is NOT monotone in
+    coarsening (larger Cells mean larger patches), so the caller must evaluate
+    each candidate's exact mode-aware bound and must never claim coarsening
+    lowers memory.
+    """
+    rejected_rank = int(rejected_nx) * int(rejected_ny)
+    cands: set[tuple[int, int]] = set()
+
+    # 1. Immediate grid-space coarsenings (nearest coarser grids).
+    for nx in (int(rejected_nx) - 1, int(rejected_nx)):
+        for ny in (int(rejected_ny) - 1, int(rejected_ny)):
+            if nx < 1 or ny < 1:
+                continue
+            nx_c = min(nx, canvas.width)
+            ny_c = min(ny, canvas.height)
+            if nx_c * ny_c < rejected_rank:
+                cands.add((nx_c, ny_c))
+
+    # 2. Reciprocal geometric ladder (bounded, deterministic).
+    for factor in COARSER_RESCUE_FACTORS:
+        nx = max(1, int(math.ceil(canvas.width / (median_w / factor))))
+        ny = max(1, int(math.ceil(canvas.height / (median_h / factor))))
+        nx = min(nx, canvas.width)
+        ny = min(ny, canvas.height)
+        if nx * ny < rejected_rank:
+            cands.add((nx, ny))
+
+    def _order(grid: tuple[int, int]) -> tuple:
+        nx, ny = grid
+        return (-(nx * ny), abs(nx - ny), -nx, -ny)
+
+    return tuple(sorted(cands, key=_order))
+
 
 def median_projected_footprint(
     frames: Sequence[zg.FrameDescriptor],
