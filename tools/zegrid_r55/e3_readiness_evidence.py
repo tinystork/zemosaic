@@ -40,6 +40,7 @@ SOURCE_FILES = (
     "src/zemosaic/core/zegrid/parallel.py",
     "src/zemosaic/locales/en.json",
     "tests/test_zegrid_r55e3_windows_beta.py",
+    "tests/_r55e3_spawn_probe.py",
     "tools/zegrid_r55/windows_result_check.py",
     "tools/zegrid_r55/e3_readiness_evidence.py",
     "docs/beta/ZEGRID_WINDOWS_BETA_WITNESS.md",
