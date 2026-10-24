@@ -965,3 +965,43 @@ def test_e11_product_gpu_pipeline_prefetch0_reaches_consume(
     assert telemetry["gpu_pipeline"]["threads_joined"] is True
     # The failure-only diagnostics file must NOT exist on a healthy run.
     assert not (out / "zegrid_gpu_failure.json").exists()
+
+
+def test_e11_exact_r55f_scale_credit_mismatch_and_prefetch0():
+    """Exact R55F magnitude, no 2 GB file writes.
+
+    The recorded R55F credit was 1,861,287,120 B (RGB-only, 66 frames of
+    1767x1330x3 float32) while the produced payload was ~2,014,895,190 B. The
+    unified contract includes support bool + both 128-byte .npy headers.
+    """
+    px = 1767 * 1330
+    frames = 66
+    rgb_only = px * 3 * 4 * frames
+    contract = zz._r55_cache_unit_bytes(px, frames)
+    recorded_payload = 2_014_895_190
+    assert rgb_only == 1_861_287_120
+    assert contract == 2_016_411_276
+    assert rgb_only < recorded_payload < contract
+
+    payload = {
+        "name": "r55f_scale",
+        "manifest": {"total_bytes": recorded_payload},
+    }
+    # Legacy RGB-only credit: the first unit is refused BEFORE consume.
+    bad, released_bad = _real_pipeline([payload], budget=rgb_only, prefetch=0)
+    with pytest.raises(zpar.PipelineAccountingError):
+        bad.run()
+    bad_telemetry = bad.telemetry()
+    assert bad_telemetry["units_consumed"] == 0
+    assert bad_telemetry["units_released"] == 1
+    assert bad_telemetry["ledger"]["balanced"] is True
+    assert released_bad == ["r55f_scale"]
+
+    # Unified contract: prefetch=0 stages and consumes the same unit.
+    good, released_good = _real_pipeline([payload], budget=contract, prefetch=0)
+    assert good.run() == ["r55f_scale"]
+    good_telemetry = good.telemetry()
+    assert good_telemetry["units_consumed"] == 1
+    assert good_telemetry["units_released"] == 1
+    assert good_telemetry["ledger"]["balanced"] is True
+    assert released_good == ["r55f_scale"]
