@@ -537,7 +537,20 @@ def test_c_cpu_path_is_independent_of_a_preexisting_cupy_module(
 def test_c_active_gpu_reaches_the_e2_pipeline(
     routine_input, legacy_run, tmp_path, monkeypatch
 ):
+    """R55-E9 routing proof: the SELECTED (>128) tile reaches the runner.
+
+    The GPU math is a CPU-backed deterministic success double (no CuPy on this
+    host): this proves ROUTING only and makes no CUDA/performance claim.
+    """
     _fake_gpu_available(monkeypatch)
+    seen_tiles = []
+    real_stream = zz.run_canonical_stack_streaming
+
+    def spy_stream(provider, request, *, tile_size=None, fixed=None):
+        seen_tiles.append(None if tile_size is None else int(tile_size))
+        return real_stream(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy_stream)
     real_consume = zz._consume_stack_cell
 
     def fake_gpu_consume(prepared):
@@ -563,6 +576,20 @@ def test_c_active_gpu_reaches_the_e2_pipeline(
     assert block["mapping"]["backend"] == "gpu"
     assert block["mapping"]["units_in_flight"] == 1
     assert block["gpu_execution"]["qualified"] is True
+
+    # R55-E9: the dynamic ladder selection is what actually reaches execution.
+    tile = int(block["mapping"]["gpu_streaming_tile"])
+    assert tile > 128
+    assert block["gpu_tile_decision"]["selected_tile_px"] == tile
+    assert block["gpu_tile_decision"]["max_tile_px"] >= tile
+    assert tile in block["gpu_tile_decision"]["declared_ladder"]
+    assert block["execution"]["gpu_streaming_tile"] == tile
+    assert manifest["gpu"]["gpu_streaming_tile"] == tile
+    # The product seam handed EXACTLY that tile to the existing streaming runner.
+    assert seen_tiles
+    assert set(seen_tiles) == {tile}
+    wave_mapping = manifest["r55_run_telemetry"]["waves"][0]["mapping"]
+    assert wave_mapping["gpu_streaming_tile"] == tile
     telemetry = manifest["r55_run_telemetry"]["gpu_pipeline"]
     assert telemetry["queue_max"] == block["mapping"]["prefetch_units"] + 1
     assert telemetry["ledger"]["balanced"] is True

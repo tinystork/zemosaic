@@ -415,81 +415,93 @@ def _decide(tmp_path, *, raw_mib=WITNESS_RAW_MIB, probe_free=7 * GIB):
     )
 
 
-def test_product_decision_is_tile128_k1_prefetch1_with_exact_bytes(tmp_path):
-    bounds = _witness_bounds()
+def _total_bound(tile: int) -> int:
+    """Exact TOTAL streaming bound for ANY (including >128) witness tile."""
+    return int(
+        zz._estimate_streaming_bytes(WITNESS_MAX_N, WITNESS_PATCH_HW, int(tile))
+    )
+
+
+def test_product_decision_is_largest_feasible_dynamic_tile(tmp_path):
+    """R55-E9: the E7 witness keeps its largest jointly feasible GPU tile.
+
+    The E7 budgets were originally pinned to tile128 because the ACTIVE path
+    intersected the VRAM maximum with the CPU ladder. That artificial cap is
+    gone: the exact same witness now selects the largest jointly feasible
+    declared GPU rung (448 at prefetch 0), with every bound still exact.
+    """
     shared = int(WITNESS_SHARED_MIB * MIB)
     _raw, budget = _witness_budget()
     decision = _decide(tmp_path)
-    # The product derives per_unit_cache from the exact integer patch area; use
-    # that exact fact (not the rounded MiB witness constant).
-    cache = int(decision.facts["per_unit_cache"])
+    tile = 448
 
     mapping = decision.mapping
     assert mapping["backend"] == "gpu"
-    assert mapping["gpu_streaming_tile"] == 128
+    assert mapping["gpu_streaming_tile"] == tile
+    assert tile > 128
+    assert int(decision.gpu_tile_max) == 507
+    assert tile in decision.gpu_tile_ladder
+    assert any(int(t) > 128 for t in decision.gpu_tile_ladder)
     assert mapping["units_in_flight"] == 1
-    assert mapping["prefetch_units"] == 1
+    assert mapping["prefetch_units"] == 0
     assert mapping["single_owner"] is True
 
     chosen = decision.plan_set.chosen
-    assert chosen.tile_px == 128
+    assert chosen.tile_px == tile
     assert chosen.units_in_flight == 1
-    assert chosen.prefetch_units == 1
+    assert chosen.prefetch_units == 0
     # R55-E8: the streaming estimate ALREADY includes the 340 MiB process
     # baseline that ``shared`` counts once, so the scheduler consumes the ADDED
     # bound (the same contract as ``check_streaming_gate``). Exact integer
     # equality is still asserted, never a range.
-    assert chosen.host_peak_bytes == (
-        shared
-        + (bounds[128] - int(zz.rcontract.PROCESS_BASELINE_BYTES))
-        + cache
-    )
-    assert chosen.host_peak_bytes != shared + max(bounds.values()) + cache
+    added = _total_bound(tile) - int(zz.rcontract.PROCESS_BASELINE_BYTES)
+    assert chosen.host_peak_bytes == shared + added
+    assert chosen.host_peak_bytes != shared + max(_witness_bounds().values())
 
     gpu_phase = next(
         env for env in decision.plan_set.phases if env.backend == zs.BACKEND_GPU
     )
-    assert gpu_phase.geometry.tile_px == 128
+    assert gpu_phase.geometry.tile_px == tile
     assert gpu_phase.estimate.peak_bytes == chosen.host_peak_bytes
     assert gpu_phase.accounting.host_peak_bytes == chosen.host_peak_bytes
 
     device_peaks = decision.device_peak_bytes_by_tile
-    assert chosen.device_peak_bytes == device_peaks[128]
-    assert chosen.device_peak_bytes == _device_peaks()[128]
+    assert chosen.device_peak_bytes == device_peaks[tile]
+    assert chosen.device_peak_bytes == _device_peaks((tile,))[tile]
     assert chosen.device_peak_bytes <= decision.gpu_facts.vram_budget_bytes
     assert decision.plan_set.aggregate_host_peak_bytes <= budget
     assert decision.plan_set.aggregate_device_peak_bytes <= decision.gpu_facts.vram_budget_bytes
 
-    # The per-tile contract is explicit and complete for the declared ladder.
-    # R55-E8 product decision consumes the ADDED bounds (baseline counted once
-    # by ``shared_bytes``); the scheduler-only tests above still use raw maps.
-    expected_map = {
-        int(tile): int(bounds[int(tile)])
-        - int(zz.rcontract.PROCESS_BASELINE_BYTES)
-        for tile in TILES
-    }
+    # The per-tile contract is explicit and COMPLETE for every declared rung:
+    # no interpolation, no shared/static bound reused for another tile.
     actual_map = decision.gpu_context.per_tile_stack_map
-    assert {t: v for t, v in actual_map.items() if t in TILES} == expected_map
-    assert set(actual_map) >= set(TILES)
+    assert set(actual_map) == set(decision.gpu_tile_ladder)
+    for ladder_tile in decision.gpu_tile_ladder:
+        assert actual_map[int(ladder_tile)] == (
+            _total_bound(ladder_tile)
+            - int(zz.rcontract.PROCESS_BASELINE_BYTES)
+        )
 
 
 def test_product_apply_uses_the_selected_tile_envelope(tmp_path):
-    bounds = _witness_bounds()
     shared = int(WITNESS_SHARED_MIB * MIB)
     _cells, _cell_ctxs, bundle, _canvas = _witness_bundle()
     decision = _decide(tmp_path)
+    tile = int(decision.mapping["gpu_streaming_tile"])
     applied = zz._r55_active_gpu_apply(
         bundle, mapping=decision.mapping, decision=decision, stage="preflight"
     )
-    assert applied.envelope.gpu_tile == 128
+    assert applied.envelope.gpu_tile == tile
     assert applied.envelope.backend == "gpu"
     assert applied.envelope.cells_in_flight == 1
     assert applied.envelope.cache_workers_per_cell == decision.mapping[
         "workers_per_unit"
     ]
-    assert applied.envelope.stack_total_bytes == shared + bounds[128]
-    assert applied.envelope.stack_total_bytes != shared + max(bounds.values())
+    assert applied.envelope.stack_total_bytes == shared + _total_bound(tile)
+    assert applied.envelope.stack_total_bytes != shared + max(_witness_bounds().values())
     assert applied.envelope.aggregate_bytes <= applied.envelope.budget_bytes
+    assert applied.gpu_streaming_tile == tile
+    assert applied.gpu_tile_size == tile
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +715,7 @@ def test_plan_hash_is_deterministic_for_identical_maps():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not LIGHTS.is_dir(), reason="M106 lights directory absent")
-def test_m106_descriptor_planning_probe_admits_tile128(tmp_path):
+def test_m106_descriptor_planning_probe_admits_dynamic_tile(tmp_path):
     frames, _rejected = zg.read_manifest(LIGHTS)
     canvas = zg.build_canvas(frames)
     assert len(frames) == 66
@@ -781,16 +793,16 @@ def test_m106_descriptor_planning_probe_admits_tile128(tmp_path):
         gpu_probe=_probe(),
         readiness=_readiness(),
     )
-    assert decision.mapping["gpu_streaming_tile"] == 128
+    tile = int(decision.mapping["gpu_streaming_tile"])
+    assert tile == 448
+    assert tile > 128
     assert decision.mapping["units_in_flight"] == 1
-    assert decision.mapping["prefetch_units"] == 1
+    assert decision.mapping["prefetch_units"] == 0
+    # prefetch_units == 0, so the only host terms are shared + this tile's
+    # exact ADDED streaming bound.
     assert decision.plan_set.chosen.host_peak_bytes == (
         int(WITNESS_SHARED_MIB * MIB)
-        + (
-            _witness_bounds()[128]
-            - int(zz.rcontract.PROCESS_BASELINE_BYTES)
-        )
-        + int(decision.facts["per_unit_cache"])
+        + (_total_bound(tile) - int(zz.rcontract.PROCESS_BASELINE_BYTES))
     )
     assert decision.plan_set.aggregate_host_peak_bytes <= budget
     assert decision.plan_set.aggregate_device_peak_bytes <= decision.gpu_facts.vram_budget_bytes

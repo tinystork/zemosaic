@@ -5274,6 +5274,38 @@ class _R55GpuFallback(RuntimeError):
         self.telemetry = dict(telemetry or {})
 
 
+def _r55_active_gpu_tile_ladder(max_tile):
+    """R55-E9: deterministic descending GPU streaming-tile ladder.
+
+    ``max_tile`` is the EXACT interior side already derived from the fresh VRAM
+    budget (and clamped to the patch geometry) by
+    :func:`zemosaic.core.zegrid.gpu.choose_gpu_tile_size`. The ladder keeps that
+    exact maximum as its top rung, then walks coarse 64-px-aligned rungs down to
+    128, then the canonical CPU tail (<= 128, which the streaming executor
+    already supports). It is device-agnostic (no model name, no fixed device
+    ceiling) and finite: the rung count is bounded by ``max_tile // 64 +
+    len(CPU_STREAMING_TILE_LADDER) + 1``.
+
+    The result is STRICTLY descending and deduplicated so the existing scheduler
+    contracts (declared-ladder membership, no growth, no duplicates) apply
+    unchanged. Bounds are never interpolated here: the caller builds the exact
+    per-tile host/device maps for EVERY returned rung.
+    """
+    top = zrt.strict_int(max_tile, "max_tile", minimum=1)
+    if top < int(CPU_STREAMING_TILE_MINIMUM):
+        return ()
+    rungs = [int(top)]
+    coarse = (int(top) // 64) * 64
+    while coarse >= 128:
+        if coarse < rungs[-1]:
+            rungs.append(int(coarse))
+        coarse -= 64
+    for tail_tile in CPU_STREAMING_TILE_LADDER:
+        if int(tail_tile) < rungs[-1]:
+            rungs.append(int(tail_tile))
+    return tuple(rungs)
+
+
 @dataclass(frozen=True)
 class _R55GpuActiveDecision:
     """The frozen ACTIVE GPU decision built before any gauge/stack work."""
@@ -5293,6 +5325,10 @@ class _R55GpuActiveDecision:
     gauge_workers: int = 0
     cache_workers: int = 0
     worker_trail: tuple = ()
+    # R55-E9: VRAM-derived max, declared GPU ladder and exact per-tile bounds.
+    gpu_tile_max: int = 0
+    gpu_tile_ladder: tuple = ()
+    gpu_host_bound_by_tile: tuple = ()
 
 
 def _r55_active_gpu_decide(
@@ -5356,20 +5392,20 @@ def _r55_active_gpu_decide(
             f"({budget} B); refusing rather than extrapolating",
         )
     max_tile = int(max_tile)
-    # R55-E8: the EXECUTABLE ACTIVE GPU ladder is the permitted product ladder
-    # capped by the VRAM-derived maximum. The legacy product (R22/R36) keeps the
-    # non-product VRAM maximum because it executes that tile directly; the R55
-    # ACTIVE mapping contract maps only permitted product tiles onto the bounded
-    # pipeline. ``max_tile`` (the VRAM maximum) is retained in diagnostics.
-    gpu_tiles = tuple(
-        int(t)
-        for t in CPU_STREAMING_TILE_LADDER
-        if int(t) <= int(max_tile)
-    )
+    # R55-E9: the EXECUTABLE ACTIVE GPU ladder is GPU-specific and derives its
+    # top rung from the FRESH-VRAM maximum (already clamped to the patch
+    # geometry). The historical max128 intersection with the CPU streaming
+    # ladder discarded that capacity on every device; it is deliberately gone.
+    # Coarse 64-px-aligned rungs down to 128 plus the canonical CPU tail keep
+    # the ladder finite, strictly descending and device-agnostic. The existing
+    # scheduler still decides feasibility (host PLAN/margin + device budget)
+    # and may only shrink along these declared rungs.
+    gpu_tiles = _r55_active_gpu_tile_ladder(max_tile)
     if not gpu_tiles:
         raise _R55GpuRefused(
             zgr.REASON_REFUSE_VRAM,
-            "no permitted product GPU tile is <= the VRAM-derived maximum "
+            "no GPU streaming tile is >= the minimum tile "
+            f"({CPU_STREAMING_TILE_MINIMUM}) within the VRAM-derived maximum "
             f"({max_tile}); refusing rather than extrapolating",
         )
     device_peaks = {
@@ -5542,7 +5578,12 @@ def _r55_active_gpu_decide(
             # the LARGEST wins (the corrected exact bounds are non-monotone, so
             # tile96 can have a marginally lower host peak than tile128); then
             # the bounded prefetch target, then the scheduler objective.
-            chosen = min(
+            # R55-E9: a candidate that fits the scheduler's OWN peak can still
+            # miss the SAME B_plan once the non-overlapping gauge/cache phases
+            # are added. Walk the ordered candidates and keep the FIRST whose
+            # exact joint plan admits, instead of refusing the whole GPU plan
+            # because the top candidate's preferred prefetch missed.
+            ordered = sorted(
                 trial_feasible,
                 key=lambda c: (
                     -int(c.tile_px),
@@ -5551,23 +5592,38 @@ def _r55_active_gpu_decide(
                     zsched.objective_key(c),
                 ),
             )
-            try:
-                candidate_plan = zsched.build_joint_plan_set(
-                    trial_joint,
-                    candidate=chosen,
-                    phase_requests=requests,
-                    mode=zsched.MODE_ACTIVE,
-                )
-            except zsched.PlanRefused as exc:
-                last_exc = exc
+            candidate_plan = None
+            chosen = None
+            for option in ordered:
+                try:
+                    candidate_plan = zsched.build_joint_plan_set(
+                        trial_joint,
+                        candidate=option,
+                        phase_requests=requests,
+                        mode=zsched.MODE_ACTIVE,
+                    )
+                except zsched.PlanRefused as exc:
+                    last_exc = exc
+                    continue
+                chosen = option
+                break
+            if candidate_plan is None:
                 worker_trail.append(
                     {
                         "at": "worker_selection",
                         "gauge_workers": int(gauge),
                         "cache_workers": int(cache),
                         "accepted": False,
-                        "reason_code": exc.reason_code,
-                        "detail": exc.detail,
+                        "reason_code": (
+                            last_exc.reason_code
+                            if last_exc is not None
+                            else zsched.REASON_REFUSE_HOST_RAM
+                        ),
+                        "detail": (
+                            last_exc.detail
+                            if last_exc is not None
+                            else "no jointly feasible GPU candidate"
+                        ),
                         "gauge_phase_bytes": (
                             int(trial["gauge_footprint_bytes"]) * int(gauge)
                         ),
@@ -5660,6 +5716,11 @@ def _r55_active_gpu_decide(
         gauge_workers=int(base["gauge_workers"]),
         cache_workers=int(base["cache_workers"]),
         worker_trail=tuple(dict(entry) for entry in worker_trail),
+        gpu_tile_max=int(max_tile),
+        gpu_tile_ladder=tuple(int(t) for t in gpu_tiles),
+        gpu_host_bound_by_tile=tuple(
+            (int(t), int(gpu_host_bound_by_tile[int(t)])) for t in gpu_tiles
+        ),
     )
 
 
@@ -5690,6 +5751,43 @@ def _r55_next_gpu_shrink(decision, candidate, context):
         if materialized.feasible:
             return name, materialized
         current = materialized
+
+
+def _r55_next_gpu_vram_shrink(decision, candidate, *, free_bytes, percent):
+    """R55-E9: next lower DECLARED GPU tile whose exact device peak fits.
+
+    Walks the ladder frozen at planning time strictly DOWNWARD from the current
+    tile (never up, never off-ladder, even if VRAM has recovered meanwhile) and
+    returns the first rung that is jointly feasible AND a legal shrink. The
+    fresh VRAM budget is evaluated with the SAME policy percent the run
+    revalidation uses, against each rung's OWN exact
+    ``gpu_tile_workspace_bytes`` — no interpolated or shared bound. ``None``
+    means no lower rung fits, so the caller performs the qualified whole-batch
+    CPU fallback.
+    """
+    ladder = tuple(int(t) for t in decision.gpu_context.tile_ladder)
+    current_tile = int(candidate.tile_px)
+    if current_tile not in ladder:
+        return None
+    budget = int(
+        decision.policy.candidate(int(free_bytes), int(percent)).budget_bytes
+    )
+    for tile in ladder[ladder.index(current_tile) + 1:]:
+        tile = int(tile)
+        peak = int(decision.device_peak_bytes_by_tile[int(tile)])
+        if peak > budget:
+            continue
+        probe = replace(candidate, tile_px=tile)
+        materialized = _r55_gpu_candidate_lookup(decision, probe)
+        try:
+            zsched.assert_joint_shrink_only(candidate, materialized)
+        except zsched.GrowthRejected:
+            # A lower tile whose exact host bound is marginally higher (the
+            # corrected bounds are not monotone) is not a legal shrink.
+            continue
+        if materialized.feasible:
+            return materialized
+    return None
 
 
 def _r55_active_gpu_apply(
@@ -5988,7 +6086,20 @@ def _r55_active_gpu_admit(
             factor_den=int(rcontract.PLAN_FACTOR_DEN),
             budget_bytes=int(plan_obs.budget_bytes),
         )
-        name, nxt = _r55_next_gpu_shrink(decision, candidate, context)
+        if gpu_decision.action == "fallback_cpu":
+            # R55-E9: a fresh-VRAM miss shrinks the GPU STREAMING TILE along the
+            # frozen declared ladder (largest jointly feasible lower rung)
+            # instead of discarding the qualified GPU plan. Host pressure still
+            # follows the fixed global shrink order below.
+            nxt = _r55_next_gpu_vram_shrink(
+                decision,
+                candidate,
+                free_bytes=int(free_vram),
+                percent=int(decision.qualification["percent"]),
+            )
+            name = "tile_px" if nxt is not None else None
+        else:
+            name, nxt = _r55_next_gpu_shrink(decision, candidate, context)
         if name is None or nxt is None:
             raise _R55GpuFallback(
                 gpu_decision.reason_code
@@ -6663,6 +6774,43 @@ def _r55_active_plan_observation(bundle) -> dict:
     }
 
 
+def _r55_gpu_tile_decision_dict(decision, mapping, bundle) -> dict:
+    """R55-E9: deterministic diagnostics for the auto GPU streaming tile.
+
+    Reports the VRAM-derived maximum, the frozen declared ladder, the selected
+    tile/prefetch and BOTH peaks that were actually validated: the exact ADDED
+    host bound of the selected tile and the exact device workspace. Every rung's
+    exact bounds are included so the numbers can be audited without re-running.
+    """
+    tile = int(mapping["gpu_streaming_tile"])
+    host_by_tile = {
+        int(t): int(b) for t, b in decision.gpu_host_bound_by_tile
+    }
+    device_by_tile = {
+        int(t): int(b) for t, b in decision.device_peak_bytes_by_tile.items()
+    }
+    return {
+        "schema": "zemosaic-r55e9-gpu-tile-ladder-v1",
+        "max_tile_px": int(decision.gpu_tile_max),
+        "declared_ladder": [int(t) for t in decision.gpu_tile_ladder],
+        "selected_tile_px": int(tile),
+        "selected_prefetch_units": int(mapping["prefetch_units"]),
+        "selected_host_added_bound_bytes": int(host_by_tile[tile]),
+        "selected_host_aggregate_bytes": int(bundle.envelope.aggregate_bytes),
+        "selected_device_peak_bytes": int(device_by_tile[tile]),
+        "host_added_bound_bytes_by_tile": {
+            str(int(t)): int(host_by_tile[int(t)])
+            for t in decision.gpu_tile_ladder
+        },
+        "device_peak_bytes_by_tile": {
+            str(int(t)): int(device_by_tile[int(t)])
+            for t in decision.gpu_tile_ladder
+        },
+        "vram_budget_bytes": int(decision.qualification["budget_bytes"]),
+        "vram_percent": int(decision.qualification["percent"]),
+    }
+
+
 def _r55_active_execution(bundle, mapping) -> dict:
     env = bundle.envelope
     if mapping.get("backend") == renv.BACKEND_GPU:
@@ -7118,6 +7266,7 @@ def _r55_build_active_block(
     status,
     run=None,
     worker_adaptation=None,
+    tile_ladder=None,
 ) -> dict:
     """Deterministic active manifest block (no fabricated observed metric).
 
@@ -7126,11 +7275,15 @@ def _r55_build_active_block(
     frozen identity + final validated PlanEnvelope. The D1 scheduler PlanSet
     hash is preserved separately as ``initial_plan_hash``.
     """
+    hash_kwargs = {}
+    if tile_ladder is not None:
+        hash_kwargs["tile_ladder"] = tuple(int(t) for t in tile_ladder)
     final_hash = zsched.active_final_plan_hash(
         candidate=final_candidate,
         mapping=mapping,
         identity=plan_set.identity,
         envelope=bundle.envelope,
+        **hash_kwargs,
     )
     combined_trail = []
     for item in preflight_trail:
@@ -7612,12 +7765,18 @@ def _run_single(
                 _r55_active_preflight_adm = _r55_active_adm
                 _r55_active_preflight_trail = list(_r55_active_trail)
                 _emit(
-                    "ZeGrid: R55-E2 active GPU plan ADMITTED before the gauge — "
+                    "ZeGrid: R55-E2/E9 active GPU plan ADMITTED before the gauge — "
                     f"tile={_r55_active_mapping['gpu_streaming_tile']} "
+                    f"(auto max={_r55_active_gpu_decision.gpu_tile_max}, "
+                    f"declared ladder={list(_r55_active_gpu_decision.gpu_tile_ladder)}) "
                     f"K={_r55_active_mapping['units_in_flight']} "
                     f"workers_per_unit={_r55_active_mapping['workers_per_unit']} "
                     f"prefetch_units={_r55_active_mapping['prefetch_units']} "
                     f"queue_max={_r55_active_mapping['prefetch_units'] + 1} "
+                    f"host_aggregate="
+                    f"{_r55_active_bundle.envelope.aggregate_bytes} "
+                    f"device_peak="
+                    f"{_r55_active_gpu_decision.device_peak_bytes_by_tile[int(_r55_active_mapping['gpu_streaming_tile'])]} "
                     f"vram_percent={_r55_active_gpu_decision.qualification['percent']} "
                     f"scheduler_plan_hash="
                     f"{_r55_active_gpu_decision.plan_set.plan_hash}",
@@ -9661,10 +9820,20 @@ def _run_single(
                     else _r55_active_decision
                 ).worker_trail,
             ),
+            tile_ladder=(
+                _r55_active_gpu_decision.gpu_tile_ladder
+                if _r55_active_gpu_decision is not None
+                else None
+            ),
         )
         if _r55_active_gpu_decision is not None:
             _r55_scheduler_block["gpu_execution"] = dict(
                 _r55_active_gpu_decision.qualification
+            )
+            _r55_scheduler_block["gpu_tile_decision"] = (
+                _r55_gpu_tile_decision_dict(
+                    _r55_active_gpu_decision, _r55_active_mapping, _final
+                )
             )
         if _r55_gpu_run_fallback is not None:
             _r55_scheduler_block["gpu_fallback"] = dict(

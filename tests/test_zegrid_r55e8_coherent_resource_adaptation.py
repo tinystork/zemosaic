@@ -146,8 +146,18 @@ def _active_cpu_decide(m106, bundle, *, halo, cpu):
 # Gate A — Windows CPU16, halo128, automatic workers, ACTIVE GPU
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("free_gib", [2, 4, 7])
-def test_gate_a_windows_automatic_gauge_and_gpu_plan(m106, free_gib):
+@pytest.mark.parametrize(
+    "free_gib,expected_tile,expected_prefetch",
+    [
+        # R55-E9: the ACTIVE GPU tile is the VRAM-derived maximum, not max128.
+        (2, 262, 1),
+        (4, 379, 1),
+        (7, 507, 0),
+    ],
+)
+def test_gate_a_windows_automatic_gauge_and_gpu_plan(
+    m106, free_gib, expected_tile, expected_prefetch
+):
     free = free_gib * GIB
     total = 8 * GIB
     vram = zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": free})
@@ -173,9 +183,14 @@ def test_gate_a_windows_automatic_gauge_and_gpu_plan(m106, free_gib):
     assert decision.facts["layout"] == (2, 2)
     assert decision.facts["halo_px"] == 128
     assert decision.mapping["backend"] == "gpu"
-    assert decision.mapping["gpu_streaming_tile"] == 128
+    tile = int(decision.mapping["gpu_streaming_tile"])
+    assert tile == expected_tile
+    assert tile > 128
+    assert int(decision.gpu_tile_max) >= tile
+    assert tile in decision.gpu_tile_ladder
+    assert any(int(t) > 128 for t in decision.gpu_tile_ladder)
     assert decision.mapping["units_in_flight"] == 1
-    assert decision.mapping["prefetch_units"] in (1, 2)
+    assert decision.mapping["prefetch_units"] == expected_prefetch
     assert decision.plan_set.aggregate_host_peak_bytes <= WINDOWS_B_PLAN
     assert (
         decision.plan_set.aggregate_device_peak_bytes
@@ -183,7 +198,7 @@ def test_gate_a_windows_automatic_gauge_and_gpu_plan(m106, free_gib):
     )
     # The exact selected tile bound reaches the candidate AND the envelope.
     chosen = decision.plan_set.chosen
-    added = decision.facts["stream_added_by_tile"][128]
+    added = dict(decision.gpu_host_bound_by_tile)[tile]
     envelope = next(
         env for env in decision.plan_set.phases if env.backend == "gpu"
     )
@@ -191,7 +206,7 @@ def test_gate_a_windows_automatic_gauge_and_gpu_plan(m106, free_gib):
         bundle.shared_bytes + added + decision.facts["per_unit_cache"]
         * chosen.prefetch_units
     )
-    assert envelope.geometry.tile_px == 128
+    assert envelope.geometry.tile_px == tile
     assert envelope.estimate.peak_bytes == chosen.host_peak_bytes
     # All 66 frame identities survive unchanged (identity gate).
     assert len(decision.facts["frame_ids"]) == 66

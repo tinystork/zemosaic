@@ -3580,6 +3580,7 @@ def active_final_plan_hash(
     mapping: Mapping,
     identity: FrozenIdentity,
     envelope,
+    tile_ladder: Sequence[int] = PRODUCT_TILE_LADDER,
 ) -> str:
     """Deterministic hash of the FINAL executable active decision.
 
@@ -3587,6 +3588,11 @@ def active_final_plan_hash(
     mapping, the frozen identity and the final validated product PlanEnvelope.
     It is NOT the D1 scheduler PlanSet hash; that hash is preserved separately as
     ``initial_plan_hash`` when a pressure correction changed the plan.
+
+    ``tile_ladder`` is the DECLARED execution ladder the caller already used to
+    map the candidate (R55-E9 passes the product's own GPU ladder). It defaults
+    to the historical product ladder, so every existing CPU/GPU caller keeps its
+    exact behaviour; the strict membership check is never skipped.
     """
     if candidate.backend == BACKEND_GPU:
         _validate_active_candidate_fields(
@@ -3604,7 +3610,9 @@ def active_final_plan_hash(
             f"expected mapping, got {type(mapping).__name__}"
         )
     expected = (
-        active_gpu_mapping_for_candidate(candidate)
+        active_gpu_mapping_for_candidate(
+            candidate, tile_ladder=tile_ladder
+        )
         if candidate.backend == BACKEND_GPU
         else active_mapping_for_candidate(candidate)
     )
