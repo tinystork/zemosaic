@@ -40,6 +40,7 @@ from zemosaic.core.canonical_streaming import (
 from zemosaic.core.zegrid import gpu as zgpu
 from zemosaic.core.zegrid import gpu_memory as zgm
 from zemosaic.core.zegrid import gpu_readiness as zgr
+from zemosaic.core.zegrid import parallel as zpar
 from zemosaic.core.zegrid import ram_contract as rcontract
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -674,7 +675,7 @@ def _failure_diag(out: Path) -> dict:
 
 
 def test_e11_producer_failure_diagnostics_survive_without_manifest(
-    routine_input, tmp_path_factory, monkeypatch, caplog
+    routine_input, tmp_path_factory, monkeypatch
 ):
     _patch_gpu(monkeypatch, _sequence([2 * GIB]))
     seen_tiles: list[int] = []
@@ -685,9 +686,28 @@ def test_e11_producer_failure_diagnostics_survive_without_manifest(
 
     monkeypatch.setattr(zz, "_prepare_stack_cell", boom)
     out = tmp_path_factory.mktemp("r55e11_producer_fail")
-    with caplog.at_level(logging.WARNING):
+    # Capture the emission independently of pytest's caplog state (a previous
+    # suite can change logger propagation/levels). The product uses the module
+    # logger; a local handler observes exactly what the GUI/run-log receives.
+    emitted_lines: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            try:
+                emitted_lines.append(str(record.getMessage()))
+            except Exception:
+                pass
+
+    handler = _Capture()
+    old_level = zz.logger.level
+    zz.logger.addHandler(handler)
+    zz.logger.setLevel(logging.WARNING)
+    try:
         with pytest.raises(RuntimeError):
             _run(routine_input, out)
+    finally:
+        zz.logger.removeHandler(handler)
+        zz.logger.setLevel(old_level)
 
     # The run aborted after the fallback and wrote NO manifest...
     assert not (out / "zegrid_manifest.json").exists()
@@ -707,7 +727,7 @@ def test_e11_producer_failure_diagnostics_survive_without_manifest(
     assert diag["device"] is not None
     assert diag["host"]["parent_memory"] is not None
     # The useful reason reached the GUI/run-log line, not just a reason_code.
-    emitted = "\n".join(str(record.message) for record in caplog.records)
+    emitted = "\n".join(emitted_lines)
     assert "producer boom" in emitted
     assert "zegrid_gpu_failure.json" in emitted
 
@@ -748,3 +768,200 @@ def test_e11_producer_accounting_failure_is_distinct_and_durable(
     assert diag["extra"]["producer_error"]
     assert diag["pipeline"]["ledger"]["balanced"] is True
     assert diag["pipeline"]["threads_joined"] is True
+
+
+# ---------------------------------------------------------------------------
+# H. Host-credit cache-byte contract (R55F confirmed defect).
+#
+# The aligned cache is charged to the pipeline as manifest.total_bytes: RGB
+# float32 + support bool + one 128-byte .npy header per file. The historical
+# estimate counted RGB data only, so a prefetch=0 run could not stage its own
+# first cell. These tests use REAL .npy files and the REAL BoundedPipeline
+# ledger, and prove consume is reached at prefetch 0/1/2.
+# ---------------------------------------------------------------------------
+
+def _real_cache_payload(root: Path, name: str, side: int, frames: int) -> dict:
+    import numpy as np
+
+    cache = Path(root) / name
+    cache.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for index in range(int(frames)):
+        rgb_path = cache / f"frame_{index:04d}_rgb.npy"
+        sup_path = cache / f"frame_{index:04d}_support.npy"
+        np.save(rgb_path, np.zeros((int(side), int(side), 3), dtype=np.float32))
+        np.save(sup_path, np.zeros((int(side), int(side)), dtype=bool))
+        total += int(rgb_path.stat().st_size) + int(sup_path.stat().st_size)
+    return {
+        "name": str(name),
+        "manifest": {"total_bytes": int(total)},
+        "cache_dir": str(cache),
+    }
+
+
+def _real_pipeline(payloads, *, budget: int, prefetch: int):
+    released = []
+
+    def release(payload):
+        released.append(payload["name"])
+
+    pipeline = zpar.BoundedPipeline(
+        tasks=list(payloads),
+        produce=lambda payload: payload,
+        consume=lambda payload: payload["name"],
+        release=release,
+        prefetch_units=int(prefetch),
+        host_budget_bytes=int(budget),
+        device_budget_bytes=1,  # zero device bytes charged, explicit >=1 cap
+        host_bytes=lambda payload: int(payload["manifest"]["total_bytes"]),
+        device_bytes=lambda payload: 0,
+    )
+    return pipeline, released
+
+
+@pytest.mark.parametrize(
+    "side,frames",
+    [(3, 1), (17, 2), (48, 4), (384, 3), (512, 2)],
+)
+def test_e11_cache_unit_contract_matches_real_npy_files(side, frames, tmp_path):
+    payload = _real_cache_payload(tmp_path, "c", side, frames)
+    estimated = zz._r55_cache_unit_bytes(side * side, frames)
+    # Exact equality for a worst-shape cell: support + both headers included.
+    assert estimated == payload["manifest"]["total_bytes"]
+    # The old RGB-only estimate is strictly too small (regression witness).
+    assert side * side * 3 * 4 * frames < estimated
+
+
+def test_e11_prefetch0_real_manifest_ledger_reaches_consume(tmp_path):
+    payloads = [
+        _real_cache_payload(tmp_path, "cell_a", 48, 4),
+        _real_cache_payload(tmp_path, "cell_b", 40, 3),
+        _real_cache_payload(tmp_path, "cell_c", 17, 2),  # small/header-heavy
+    ]
+    worst_px = 48 * 48
+    max_frames = 4
+    contract = zz._r55_cache_unit_bytes(worst_px, max_frames)
+    rgb_only = worst_px * 3 * 4 * max_frames
+    assert rgb_only < contract
+
+    # Historical defect: the RGB-only budget rejects the first real payload
+    # BEFORE consume (exactly the reproduced R55F class).
+    bad, bad_released = _real_pipeline(
+        payloads, budget=rgb_only, prefetch=0
+    )
+    with pytest.raises(zpar.PipelineAccountingError):
+        bad.run()
+    bad_telemetry = bad.telemetry()
+    assert bad_telemetry["units_consumed"] == 0
+    assert bad_telemetry["units_produced"] >= 1
+    assert bad_telemetry["units_released"] == bad_telemetry["units_produced"]
+    assert bad_telemetry["ledger"]["balanced"] is True
+
+    # Fixed contract: prefetch=0 reaches consume for EVERY cell.
+    good, good_released = _real_pipeline(
+        payloads, budget=contract, prefetch=0
+    )
+    assert good.run() == ["cell_a", "cell_b", "cell_c"]
+    telemetry = good.telemetry()
+    assert telemetry["units_consumed"] == 3
+    assert telemetry["units_released"] == 3
+    assert telemetry["ledger"]["balanced"] is True
+    assert sorted(good_released) == ["cell_a", "cell_b", "cell_c"]
+
+
+@pytest.mark.parametrize("prefetch", [1, 2])
+def test_e11_prefetch_one_and_two_use_the_same_contract(tmp_path, prefetch):
+    payloads = [_real_cache_payload(tmp_path, f"c{i}", 32, 3) for i in range(3)]
+    per_unit = zz._r55_cache_unit_bytes(32 * 32, 3)
+    budget = per_unit * (int(prefetch) + 1)
+    pipeline, released = _real_pipeline(
+        payloads, budget=budget, prefetch=prefetch
+    )
+    assert pipeline.run() == ["c0", "c1", "c2"]
+    telemetry = pipeline.telemetry()
+    assert telemetry["units_consumed"] == 3
+    assert telemetry["ledger"]["balanced"] is True
+    assert sorted(released) == ["c0", "c1", "c2"]
+
+
+def test_e11_genuinely_insufficient_host_fails_before_consume(tmp_path):
+    payload = _real_cache_payload(tmp_path, "worst", 48, 4)
+    contract = zz._r55_cache_unit_bytes(48 * 48, 4)
+    pipeline, released = _real_pipeline(
+        [payload], budget=contract - 1, prefetch=0
+    )
+    with pytest.raises(zpar.PipelineAccountingError):
+        pipeline.run()
+    telemetry = pipeline.telemetry()
+    assert telemetry["units_consumed"] == 0
+    assert telemetry["units_produced"] == 1
+    assert telemetry["units_released"] == 1
+    assert telemetry["ledger"]["balanced"] is True
+    assert released == ["worst"]
+
+
+def test_e11_cancelled_prefetch0_pipeline_releases_everything(tmp_path):
+    payload = _real_cache_payload(tmp_path, "cancelled", 32, 2)
+    contract = zz._r55_cache_unit_bytes(32 * 32, 2)
+    released = []
+    holder = {}
+
+    def produce(item):
+        # Cancel AFTER producing the first owned unit, before it can be consumed:
+        # the pipeline must release it exactly once and stay balanced.
+        holder["pipeline"].cancel("test_cancel")
+        return item
+
+    pipeline = zpar.BoundedPipeline(
+        tasks=[payload],
+        produce=produce,
+        consume=lambda item: item["name"],
+        release=lambda item: released.append(item["name"]),
+        prefetch_units=0,
+        host_budget_bytes=contract,
+        device_budget_bytes=1,
+        host_bytes=lambda item: int(item["manifest"]["total_bytes"]),
+        device_bytes=lambda item: 0,
+    )
+    holder["pipeline"] = pipeline
+    try:
+        pipeline.run()
+    except Exception:
+        pass
+    telemetry = pipeline.telemetry()
+    assert telemetry["units_consumed"] == 0
+    assert telemetry["units_produced"] == 1
+    assert telemetry["units_released"] == 1
+    assert telemetry["ledger"]["balanced"] is True
+    assert released == ["cancelled"]
+
+
+def test_e11_product_gpu_pipeline_prefetch0_reaches_consume(
+    routine_input, tmp_path_factory, monkeypatch
+):
+    """Product-level witness: force prefetch=0 and let the real GPU pipeline run.
+
+    This is the exact R55F shape (queue_max=1). The unified cache contract must
+    let the first prepared cell be staged and consumed.
+    """
+    monkeypatch.setattr(zz, "_R55E2_PREFETCH_LADDER", (0,))
+    monkeypatch.setattr(zz, "_R55E2_PREFETCH_DEFAULT", 0)
+    _patch_gpu(monkeypatch, _sequence([2 * GIB]))
+    seen_tiles: list[int] = []
+    _fake_gpu_consumer(monkeypatch, seen_tiles)
+    out = tmp_path_factory.mktemp("r55e11_prefetch0")
+    _run(routine_input, out)
+
+    manifest = _manifest(out)
+    block = manifest["r55_scheduler"]
+    assert block["status"] == "executed"
+    assert block["mapping"]["prefetch_units"] == 0
+    assert block["gpu_execution"]["queue_max"] == 1
+    assert "gpu_fallback" not in block
+    telemetry = manifest["r55_run_telemetry"]
+    assert telemetry["gpu_pipeline"]["units_consumed"] == len(seen_tiles)
+    assert telemetry["gpu_pipeline"]["units_consumed"] > 0
+    assert telemetry["gpu_pipeline"]["ledger"]["balanced"] is True
+    assert telemetry["gpu_pipeline"]["threads_joined"] is True
+    # The failure-only diagnostics file must NOT exist on a healthy run.
+    assert not (out / "zegrid_gpu_failure.json").exists()

@@ -152,7 +152,10 @@ def _active_cpu_decide(m106, bundle, *, halo, cpu):
         # R55-E10: the ACTIVE GPU tile is the VRAM-derived maximum PRUNED to the
         # selection headroom (85 % of the fresh 70 % budget), never max128 and
         # never the razor-edge top rung.
-        (2, 192, 2),
+        # R55-E11 cache-byte contract: at this host budget the corrected
+        # per-unit cache bound makes prefetch=1 the largest exact feasible
+        # depth (prefetch=2 no longer fits the same B_plan); tile is unchanged.
+        (2, 192, 1),
         (4, 320, 1),
         (7, 448, 0),
     ],

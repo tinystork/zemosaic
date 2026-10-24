@@ -752,6 +752,54 @@ def _estimate_streaming_bytes(n_contributors, patch_hw, tile_size=STREAM_TILE_SI
     return int(zstream.estimate_streaming_peak_kib(n_contributors, patch_hw, tile_size, channels) * 1024)
 
 
+# ---------------------------------------------------------------------------
+# R55-E11 (host-credit correction) — ONE aligned-cache bytes contract.
+#
+# The aligned cache is a set of .npy files: one float32 RGB cube and one bool
+# support plane per frame. ``manifest.total_bytes`` is the sum of the ACTUAL
+# file sizes, i.e. data + the 128-byte .npy header of EACH file. The pipeline
+# charges exactly that value to its host-staging credit (``_host_bytes``).
+# Estimating only RGB DATA under-counted support + headers by ~8.3 % and made a
+# prefetch=0 run fail its own first unit before any GPU work (R55F repro).
+#
+# This single helper is the contract used by the OBSERVE facts, the ACTIVE facts,
+# admission, prefetch/disk residency and the runtime ledger. It models the
+# ON-DISK cache file bytes (the staging domain); it is NOT a resident-RAM model
+# and must not be added to ``cache_worker_footprint_bytes`` (worker RAM domain).
+# ---------------------------------------------------------------------------
+
+_R55_CACHE_CHANNELS = 3
+_R55_CACHE_RGB_DTYPE_BYTES = 4  # float32
+_R55_CACHE_SUPPORT_DTYPE_BYTES = 1  # bool
+_R55_CACHE_NPY_HEADER_BYTES = 128  # exact for every supported shape (tested)
+_R55_CACHE_BYTES_CONTRACT = (
+    "aligned_cache_files__rgb_f32+support_bool+npy_header128__per_frame"
+)
+
+
+def _r55_cache_unit_bytes(
+    worst_patch_px, max_n_frames, *, channels: int = _R55_CACHE_CHANNELS
+) -> int:
+    """Exact upper bound of ONE cell's aligned-cache bytes (manifest contract).
+
+    ``worst_patch_px`` is the worst patch AREA and ``max_n_frames`` the maximum
+    contributor count, so every cell's real payload is <= this value. Includes
+    the support plane and BOTH .npy headers, matching ``manifest.total_bytes``
+    bit-for-bit for a worst-shape cell (verified by test against real files).
+    """
+    px = max(0, int(worst_patch_px))
+    frames = max(0, int(max_n_frames))
+    per_frame = (
+        int(px)
+        * (
+            int(channels) * _R55_CACHE_RGB_DTYPE_BYTES
+            + _R55_CACHE_SUPPORT_DTYPE_BYTES
+        )
+        + 2 * _R55_CACHE_NPY_HEADER_BYTES
+    )
+    return int(per_frame) * int(frames)
+
+
 def _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
     """Yield per-Cell dicts with BOTH in-memory and streaming peak bounds.
 
@@ -4672,7 +4720,9 @@ def _build_r55_observe_block(
     # Aligned-cache static bound: one float32 plane per channel per frame at the
     # WORST patch size. This is a dtype decomposition, not an empirical constant.
     if phase == renv.PHASE_CELL_STACK_STREAM:
-        per_unit_cache = int(worst_patch_px) * channels * 4 * int(max_n_frames)
+        per_unit_cache = _r55_cache_unit_bytes(
+            worst_patch_px, max_n_frames, channels=channels
+        )
         per_unit_prefetch = int(per_unit_cache)
     else:
         per_unit_cache = 0
@@ -4876,8 +4926,8 @@ def _r55_active_facts(
             )
 
     channels = 3
-    per_unit_cache = (
-        int(worst_patch_px) * channels * 4 * int(max_n_frames)
+    per_unit_cache = _r55_cache_unit_bytes(
+        worst_patch_px, max_n_frames, channels=channels
     )
     _disk_root = Path(cache_root) if cache_root is not None else Path(output_dir)
     try:
@@ -6902,6 +6952,7 @@ def _r55_engine_provenance() -> dict:
         "readiness_schema": str(zgr.SCHEMA),
         "run_control_schema": str(zrt.RUN_CONTROL_SCHEMA),
         "tile_runtime_schema": _R55E11_TILE_RUNTIME_SCHEMA,
+        "cache_bytes_contract": _R55_CACHE_BYTES_CONTRACT,
         "active_vram_percent": int(zgr.INITIAL_TARGET_PERCENT),
         "legacy_probe_percent": 50,
         "selection_headroom_percent": int(
@@ -10239,6 +10290,15 @@ def _run_single(
                 "disk": {
                     "residency_bytes": int(
                         per_unit_cache * (int(prefetch) + 1)
+                    ),
+                    "bytes_contract": _R55_CACHE_BYTES_CONTRACT,
+                    "domain": (
+                        "on_disk_aligned_cache_files_used_as_host_staging_credit"
+                    ),
+                    "note": (
+                        "Exact RGB float32 + support bool + one 128-byte .npy "
+                        "header per file; equal to manifest.total_bytes. Not a "
+                        "resident-RAM model; never added to worker footprints."
                     ),
                     "free_bytes": int(
                         gpu_decision.facts.get("disk_free", 0)
