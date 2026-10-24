@@ -104,6 +104,7 @@ from zemosaic.core.canonical_stacking import (
     canonical_gpu_available,
 )
 from zemosaic.core.canonical_support import make_footprint_taper
+from zemosaic.core.zegrid import gpu_memory
 from zemosaic.core.canonical_engine import (
     CanonicalStackRequest,
     CanonicalStackResult,
@@ -131,24 +132,24 @@ _REJECT_TOKEN_REMOVED = "unsupported_removed_sci05"
 _COMBINE_METHODS = ("mean", "median")
 
 
-def _release_gpu_workspace(xp) -> None:
-    """Best-effort release of the CuPy allocator pool between tiles (never raises).
+def _release_gpu_workspace(xp, *, reason: str = "tile_boundary") -> None:
+    """Best-effort device boundary cleanup between tiles/cells (never raises).
 
-    CuPy's default memory pool does not return freed blocks to the device, so the
-    device high-water can grow across a tile loop. Freeing the pool's unused blocks
-    (and syncing the default stream) bounds the high-water by a small number of
-    tiles. A no-op for NumPy.
+    ZM-ZEGRID-R55-E11: the historical order was wrong. ``free_all_blocks()`` was
+    called *before* the null-stream synchronisation and while the tile's device
+    temporaries were still bound as locals, so (a) blocks still referenced by an
+    in-flight kernel could be considered for release, and (b) the arrays that had
+    just finished could not be returned to the pool until the NEXT tile, leaving
+    the last tile's buffers retained across the inter-cell boundary.
+
+    :func:`zemosaic.core.zegrid.gpu_memory.gpu_cell_boundary_cleanup` enforces the
+    correct order (snapshot -> synchronise -> free only unused blocks -> snapshot)
+    and never raises. Callers must invoke it only AFTER the device temporaries
+    have left their bounded scope. A no-op for NumPy.
     """
     if xp is np:
         return
-    try:
-        xp.get_default_memory_pool().free_all_blocks()
-    except Exception:
-        pass
-    try:
-        xp.cuda.Stream.null.synchronize()
-    except Exception:
-        pass
+    gpu_memory.gpu_cell_boundary_cleanup(xp, reason=str(reason))
 
 
 # ---------------------------------------------------------------------------
@@ -844,78 +845,95 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
                     wmap[i] = q[i] * m * a_map[i]
                 wmap[i] = np.where(valid_t[i], wmap[i], 0.0)
 
-        # --- rejection (reused step primitives on (N, tile_cells)) ---
-        n_cells_t = th * tw * c
-        initial = active[:, None, None, None] & valid_t[..., None] & np.isfinite(images64)
-        orig2_host = images64.reshape(n, n_cells_t)
-        survivor2_host = initial.reshape(n, n_cells_t)
-        degenerate_seen_host = np.zeros(n_cells_t, dtype=bool)
-        tile_iters = 0
-        if reject_token == "none":
-            survivor = initial.copy()
-        else:
-            # xp-generic rejection; the step primitives use the bit-exact
-            # host-side mean/std reductions (see canonical_stacking), so the
-            # survivor mask is bit-identical CPU vs GPU.
-            orig2 = xp.asarray(orig2_host)
-            survivor2 = xp.asarray(survivor2_host)
-            degenerate_seen = xp.zeros(n_cells_t, dtype=bool)
-            for _ in range(iters):
-                count = survivor2.sum(axis=0)
-                if reject_token == "kappa_sigma":
-                    new_survivor2, degenerate = _kappa_sigma_step(
-                        orig2, survivor2, count, s_low, s_high, xp
-                    )
-                else:
-                    new_survivor2, degenerate = _winsorized_sigma_clip_step(
-                        orig2, survivor2, count, s_low, s_high, w_low, w_high, xp
-                    )
-                tile_iters += 1
-                degenerate_seen |= degenerate
-                if bool(xp.array_equal(new_survivor2, survivor2)):
+        # --- rejection + combine in a BOUNDED scope --------------------------
+        # ZM-ZEGRID-R55-E11: every device temporary is created and dropped inside
+        # this helper. When it returns, nothing but host arrays is reachable, so
+        # the caller can synchronise and purge the pool WITHOUT holding live
+        # blocks. Purging while these arrays were still bound was the retention
+        # defect behind the observed inter-cell VRAM drop.
+        def _reject_and_combine():
+            # --- rejection (reused step primitives on (N, tile_cells)) ---
+            n_cells_t = th * tw * c
+            initial = active[:, None, None, None] & valid_t[..., None] & np.isfinite(images64)
+            orig2_host = images64.reshape(n, n_cells_t)
+            survivor2_host = initial.reshape(n, n_cells_t)
+            degenerate_seen_host = np.zeros(n_cells_t, dtype=bool)
+            tile_iters = 0
+            if reject_token == "none":
+                survivor = initial.copy()
+            else:
+                # xp-generic rejection; the step primitives use the bit-exact
+                # host-side mean/std reductions (see canonical_stacking), so the
+                # survivor mask is bit-identical CPU vs GPU.
+                orig2 = xp.asarray(orig2_host)
+                survivor2 = xp.asarray(survivor2_host)
+                degenerate_seen = xp.zeros(n_cells_t, dtype=bool)
+                for _ in range(iters):
+                    count = survivor2.sum(axis=0)
+                    if reject_token == "kappa_sigma":
+                        new_survivor2, degenerate = _kappa_sigma_step(
+                            orig2, survivor2, count, s_low, s_high, xp
+                        )
+                    else:
+                        new_survivor2, degenerate = _winsorized_sigma_clip_step(
+                            orig2, survivor2, count, s_low, s_high, w_low, w_high, xp
+                        )
+                    tile_iters += 1
+                    degenerate_seen |= degenerate
+                    if bool(xp.array_equal(new_survivor2, survivor2)):
+                        survivor2 = new_survivor2
+                        break
                     survivor2 = new_survivor2
-                    break
-                survivor2 = new_survivor2
-            survivor = _as_host_numpy(survivor2, xp).reshape(n, th, tw, c)
-            degenerate_seen_host = _as_host_numpy(degenerate_seen, xp)
-            iterations_used = max(iterations_used, tile_iters)
+                survivor = _as_host_numpy(survivor2, xp).reshape(n, th, tw, c)
+                degenerate_seen_host = _as_host_numpy(degenerate_seen, xp)
 
-        rejection_t = initial & ~survivor
+            rejection_t = initial & ~survivor
 
-        # --- combine (reused reductions on the N axis, bit-exact across backends) ---
-        w_positive = wmap[:, :, :, None] > 0.0
-        eligible = survivor & w_positive & np.isfinite(images64)
-        images64_xp = xp.asarray(images64)
-        wmap_xp = xp.asarray(wmap[:, :, :, None])
-        eligible_xp = xp.asarray(eligible)
-        if combine_token == "mean":
-            masked_images = xp.where(eligible_xp, images64_xp, 0.0)
-            w_contrib = xp.where(eligible_xp, wmap_xp, 0.0)
-            # bit-exact float64 reductions: _axis_sum_f64 reduces on the host for
-            # the GPU backend (matching np.sum), so science is bit-identical.
-            numerator = _axis_sum_f64(masked_images * w_contrib, xp)
-            denominator = _axis_sum_f64(w_contrib, xp)
-            den_valid = denominator > 0.0
-            estimate64 = _safe_divide(numerator, denominator, np)
-            science32 = _astype_float32(estimate64, np)
-            final_finite = np.isfinite(estimate64) & np.isfinite(science32)
-            valid_out = den_valid & final_finite
-            science_t = np.where(valid_out, science32, np.nan)
-            weight_sum_t = np.where(valid_out, denominator, 0.0)
-        else:  # median
-            masked = xp.where(eligible_xp, images64_xp, xp.nan)
-            median64_xp = _nan_axis_median(masked, xp)
-            median64 = _as_host_numpy(median64_xp, xp)
-            science32 = _astype_float32(median64, np)
-            count = eligible.sum(axis=0).astype(np.float64)
-            den_valid = count > 0.0
-            final_finite = np.isfinite(median64) & np.isfinite(science32)
-            valid_out = den_valid & final_finite
-            science_t = np.where(valid_out, science32, np.nan)
-            weight_sum_t = np.where(valid_out, count, 0.0)
+            # --- combine (reused reductions on the N axis, bit-exact across backends) ---
+            w_positive = wmap[:, :, :, None] > 0.0
+            eligible = survivor & w_positive & np.isfinite(images64)
+            images64_xp = xp.asarray(images64)
+            wmap_xp = xp.asarray(wmap[:, :, :, None])
+            eligible_xp = xp.asarray(eligible)
+            if combine_token == "mean":
+                masked_images = xp.where(eligible_xp, images64_xp, 0.0)
+                w_contrib = xp.where(eligible_xp, wmap_xp, 0.0)
+                # bit-exact float64 reductions: _axis_sum_f64 reduces on the host for
+                # the GPU backend (matching np.sum), so science is bit-identical.
+                numerator = _axis_sum_f64(masked_images * w_contrib, xp)
+                denominator = _axis_sum_f64(w_contrib, xp)
+                den_valid = denominator > 0.0
+                estimate64 = _safe_divide(numerator, denominator, np)
+                science32 = _astype_float32(estimate64, np)
+                final_finite = np.isfinite(estimate64) & np.isfinite(science32)
+                valid_out = den_valid & final_finite
+                science_t = np.where(valid_out, science32, np.nan)
+                weight_sum_t = np.where(valid_out, denominator, 0.0)
+            else:  # median
+                masked = xp.where(eligible_xp, images64_xp, xp.nan)
+                median64_xp = _nan_axis_median(masked, xp)
+                median64 = _as_host_numpy(median64_xp, xp)
+                science32 = _astype_float32(median64, np)
+                count = eligible.sum(axis=0).astype(np.float64)
+                den_valid = count > 0.0
+                final_finite = np.isfinite(median64) & np.isfinite(science32)
+                valid_out = den_valid & final_finite
+                science_t = np.where(valid_out, science32, np.nan)
+                weight_sum_t = np.where(valid_out, count, 0.0)
 
-        surviving_t = eligible.sum(axis=0).astype(np.int64)
-        valid_mask_t = weight_sum_t > 0.0
+            surviving_t = eligible.sum(axis=0).astype(np.int64)
+            valid_mask_t = weight_sum_t > 0.0
+
+            return (
+                science_t, weight_sum_t, surviving_t, valid_mask_t,
+                rejection_t, initial, degenerate_seen_host, tile_iters,
+            )
+
+        (
+            science_t, weight_sum_t, surviving_t, valid_mask_t,
+            rejection_t, initial, degenerate_seen_host, tile_iters,
+        ) = _reject_and_combine()
+        iterations_used = max(iterations_used, tile_iters)
 
         # --- support accumulation (per frame in order, interior written below) ---
         w1_tile = np.zeros((th, tw), dtype=np.float64)
@@ -947,13 +965,19 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         low_n_count += int((init_int.sum(axis=0) < 3).sum())
         degenerate_count += int(degenerate_seen_host.reshape(th, tw, c)[iy0:iy1, ix0:ix1, :].sum())
 
-        # ZM-ZEGRID-R22 (H3 rework-1): release per-tile device workspace between
-        # tiles. CuPy's default allocator pool does not return freed blocks to the
-        # device, so without this the high-water would grow across the whole patch
-        # (N x full-cell equivalent). free_all_blocks() + a null-stream sync bounds
-        # the device high-water by a small number of tiles, never the patch.
+        # ZM-ZEGRID-R22 (H3 rework-1) / R55-E11: release the per-tile device
+        # workspace between tiles. The temporaries are unreachable now (bounded
+        # helper above), so the boundary helper can synchronise and return only
+        # genuinely unused blocks to the allocator. Never a global gc, never a
+        # live-array free.
         if xp is not np:
-            _release_gpu_workspace(xp)
+            _release_gpu_workspace(xp, reason="tile_boundary")
+
+    # ZM-ZEGRID-R55-E11: CELL boundary. Every device temporary from the tile
+    # loop is out of scope here; purge the pool before the orchestrator reads
+    # fresh VRAM for the NEXT cell. Best-effort, never raises.
+    if xp is not np:
+        _release_gpu_workspace(xp, reason="cell_boundary")
 
     # --- restore shapes + n_eff + diagnostics ---
     rejected_fraction = (rejected_count / initial_count) if initial_count > 0 else 0.0

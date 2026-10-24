@@ -99,6 +99,7 @@ from .core.zegrid import final_mosaic_finishing as zfin
 from .core.zegrid import geometry as zg
 from .core.zegrid import gpu as zgpu
 from .core.zegrid import gpu_readiness as zgr
+from .core.zegrid import gpu_memory as zgm
 from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
 from .core.zegrid import observability as zobs
@@ -2909,8 +2910,21 @@ def _prepare_stack_cell(task):
     }
 
 
-def _consume_stack_cell(prepared):
-    """GPU/CPU owner-side consumption of ONE prepared cell (stack + crop)."""
+def _consume_stack_cell(prepared, *, tile_size=None):
+    """GPU/CPU owner-side consumption of ONE prepared cell (stack + crop).
+
+    ``tile_size`` (ZM-ZEGRID-R55-E11) is the EXACT streaming tile this unit must
+    run with. The GPU pipeline carries the current RUN-adapted tile in the
+    per-unit payload under ``"_stack_tile_size"`` so a mid-run shrink never
+    depends on mutating the worker-global ``_STACK_TILE_SIZE`` (and never leaves
+    a stale global behind). An explicit ``tile_size`` argument wins; otherwise the
+    payload key is used; otherwise the historical worker-global behaviour is
+    preserved for every existing caller.
+    """
+    if tile_size is None and isinstance(prepared, dict):
+        _payload_tile = prepared.get("_stack_tile_size")
+        if _payload_tile is not None:
+            tile_size = int(_payload_tile)
     if isinstance(prepared, dict) and "empty_result" in prepared:
         return prepared["empty_result"]
     cell = prepared["cell"]
@@ -2934,12 +2948,22 @@ def _consume_stack_cell(prepared):
         # ZM-ZEGRID-R22: when the cell runs on the GPU, use the VRAM-bounded tile
         # size (never a single N x full-cell tile); CPU keeps the legacy
         # single-tile full-patch behaviour.
-        inmem_tile = _STACK_TILE_SIZE if getattr(_STACK_CONFIG, "backend", "cpu") == "gpu" else None
+        _effective_tile = int(
+            _STACK_TILE_SIZE if tile_size is None else tile_size
+        )
+        inmem_tile = (
+            _effective_tile
+            if getattr(_STACK_CONFIG, "backend", "cpu") == "gpu"
+            else None
+        )
         mt, sres = _run_cell_inmem(cache_dir, patch, _STACK_CONFIG, None,
                                    fixed=cell_fixed, tile_size=inmem_tile)
     else:
-        mt, sres = _run_cell_stream(cache_dir, patch, _STACK_CONFIG, None,
-                                    tile_size=_STACK_TILE_SIZE, fixed=cell_fixed)
+        mt, sres = _run_cell_stream(
+            cache_dir, patch, _STACK_CONFIG, None,
+            tile_size=int(_STACK_TILE_SIZE if tile_size is None else tile_size),
+            fixed=cell_fixed,
+        )
     stack_s = time.perf_counter() - t0
 
     core = za.crop_all_planes_to_core(mt)
@@ -3368,6 +3392,13 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
         "vram_total_bytes": ctx.get("vram_total_bytes"),
         "vram_free_bytes": ctx.get("vram_free_bytes"),
         "vram_budget_bytes": ctx.get("vram_budget_bytes"),
+        "vram_budget_source": ctx.get("vram_budget_source"),
+        "legacy_probe_vram_budget_bytes": ctx.get(
+            "legacy_probe_vram_budget_bytes"
+        ),
+        "gpu_initial_streaming_tile": ctx.get("gpu_initial_streaming_tile"),
+        "gpu_tile_adaptation": ctx.get("gpu_tile_adaptation"),
+        "engine_provenance": ctx.get("engine_provenance"),
         "fallback_reason": ctx.get("fallback_reason"),
         "runtime_fallback": ctx.get("runtime_fallback"),
         # ZM-ZEGRID-R36 (F2): a GPU selected at start but RAM-infeasible is caught
@@ -5350,6 +5381,11 @@ class _R55GpuActiveDecision:
     gpu_host_bound_by_tile: tuple = ()
     # R55-E10: the headroom-bounded budget the ladder was pruned against.
     gpu_selection_budget_bytes: int = 0
+    # R55-E11: the exact facts the per-tile host bound is a function of. Persisted
+    # so a RUN-time shrink can recompute the SAME bound for a smaller rung
+    # instead of interpolating, guessing, or consulting a second planner.
+    gpu_max_contributors: int = 1
+    gpu_worst_patch_hw: tuple = (1, 1)
 
 
 def _r55_active_gpu_decide(
@@ -5769,6 +5805,8 @@ def _r55_active_gpu_decide(
         gpu_host_bound_by_tile=tuple(
             (int(t), int(gpu_host_bound_by_tile[int(t)])) for t in gpu_tiles
         ),
+        gpu_max_contributors=int(max_n),
+        gpu_worst_patch_hw=(int(worst_hw[0]), int(worst_hw[1])),
     )
 
 
@@ -6822,13 +6860,215 @@ def _r55_active_plan_observation(bundle) -> dict:
     }
 
 
-def _r55_gpu_tile_decision_dict(decision, mapping, bundle) -> dict:
-    """R55-E9: deterministic diagnostics for the auto GPU streaming tile.
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R55-E11 — RUN-time, shrink-only GPU tile adaptation.
+#
+# R55-E9/E10 choose an admissible GPU tile ONCE and revalidate it unchanged
+# before every cell. When fresh VRAM no longer fits that exact workspace the old
+# path discarded the whole GPU batch. R55-E11 walks the SAME declared/pruned
+# ladder strictly downward at the inter-cell checkpoint and hands the smaller
+# tile to the runner. No growth, no new planner, no interpolated bound.
+# ---------------------------------------------------------------------------
+
+_R55E11_TILE_RUNTIME_SCHEMA = "zemosaic-r55e11-gpu-tile-runtime-v1"
+_R55E11_ENGINE_PROVENANCE_SCHEMA = "zemosaic-r55e11-engine-provenance-v1"
+
+
+def _r55_engine_provenance() -> dict:
+    """Static engine provenance for the RUN record (no git subprocess).
+
+    The installed-binary SHA is not known here; that gap is made VISIBLE rather
+    than guessed. Package version + module path + the exact policy/schema
+    constants are enough to tell which engine and which policy produced a run.
+    """
+    try:
+        from importlib import metadata as _metadata
+
+        package_version = str(_metadata.version("ZeMosaic"))
+    except Exception:
+        try:
+            from . import __version__ as _pkg_version
+
+            package_version = str(_pkg_version)
+        except Exception:
+            package_version = None
+    return {
+        "schema": _R55E11_ENGINE_PROVENANCE_SCHEMA,
+        "package_version": package_version,
+        "engine_module": str(Path(__file__).resolve()),
+        "policy_schema": str(zgr.POLICY_SCHEMA),
+        "readiness_schema": str(zgr.SCHEMA),
+        "run_control_schema": str(zrt.RUN_CONTROL_SCHEMA),
+        "tile_runtime_schema": _R55E11_TILE_RUNTIME_SCHEMA,
+        "active_vram_percent": int(zgr.INITIAL_TARGET_PERCENT),
+        "legacy_probe_percent": 50,
+        "selection_headroom_percent": int(
+            _R55E10_VRAM_SELECTION_HEADROOM_PERCENT
+        ),
+        "binary_sha_known": False,
+        "binary_sha_note": (
+            "The executed frozen binary SHA is not recorded by this build; "
+            "package_version + module path are the available provenance."
+        ),
+    }
+
+
+def _r55_gpu_host_aggregate_for_tile(decision, bundle, tile: int) -> int:
+    """Exact aggregate host bytes for ONE declared tile (same math as apply)."""
+    per_cell = int(
+        _estimate_streaming_bytes(
+            int(getattr(decision, "gpu_max_contributors", 1)),
+            (
+                int(getattr(decision, "gpu_worst_patch_hw", (1, 1))[0]),
+                int(getattr(decision, "gpu_worst_patch_hw", (1, 1))[1]),
+            ),
+            int(tile),
+        )
+    )
+    workers = int(bundle.cache_workers_per_cell)
+    stack_total = int(
+        rcontract.stack_phase_total_bytes(
+            int(bundle.shared_bytes), 1, int(per_cell)
+        )
+    )
+    cache_per_cell = int(
+        rcontract.cache_per_cell_bytes(
+            rcontract.PROCESS_BASELINE_BYTES,
+            workers,
+            int(bundle.cache_worker_footprint_bytes),
+        )
+    )
+    cache_total = int(
+        rcontract.cache_phase_total_bytes(
+            int(bundle.shared_bytes), 1, cache_per_cell
+        )
+    )
+    return int(rcontract.aggregate_phase_bytes(stack_total, cache_total))
+
+
+def _r55_runtime_tile_check(
+    decision,
+    *,
+    tile: int,
+    free_bytes: int,
+    host_budget_bytes: int,
+    bundle,
+) -> dict:
+    """Evaluate ONE tile against the CURRENT facts (device AND exact host)."""
+    tile = int(tile)
+    peer = decision.device_peak_bytes_by_tile
+    peak = int(peer[tile])
+    vram = zgr.fresh_vram_revalidation(
+        policy=decision.policy,
+        current_percent=int(decision.qualification["percent"]),
+        free_bytes=int(free_bytes),
+        device_peak_bytes=peak,
+    )
+    aggregate = int(_r55_gpu_host_aggregate_for_tile(decision, bundle, tile))
+    device_ok = vram.action != "fallback_cpu"
+    host_ok = aggregate <= int(host_budget_bytes)
+    return {
+        "tile_px": int(tile),
+        "device_peak_bytes": peak,
+        "vram_budget_bytes": int(vram.budget_bytes or 0),
+        "vram_free_bytes": int(free_bytes),
+        "vram_action": str(vram.action),
+        "vram_reason_code": str(vram.reason_code),
+        "host_aggregate_bytes": aggregate,
+        "host_budget_bytes": int(host_budget_bytes),
+        "device_ok": bool(device_ok),
+        "host_ok": bool(host_ok),
+        "eligible": bool(device_ok and host_ok),
+    }
+
+
+def _r55_runtime_tile_walk(
+    decision,
+    *,
+    current_tile: int,
+    free_bytes: int,
+    host_budget_bytes: int,
+    bundle,
+) -> tuple[list[dict], int | None]:
+    """Strictly SMALLER rungs of the admitted ladder, descending.
+
+    Finite: at most ``len(gpu_tile_ladder) - 1`` candidates. Never grows, never
+    leaves the declared/pruned ladder, never consults a second planner. Every
+    candidate is checked against its OWN exact device workspace and exact host
+    aggregate on the CURRENT observations.
+    """
+    ladder = tuple(int(t) for t in decision.gpu_tile_ladder)
+    current = int(current_tile)
+    if current not in ladder:
+        return [], None
+    attempts: list[dict] = []
+    for tile in ladder[ladder.index(current) + 1:]:
+        attempt = _r55_runtime_tile_check(
+            decision,
+            tile=int(tile),
+            free_bytes=int(free_bytes),
+            host_budget_bytes=int(host_budget_bytes),
+            bundle=bundle,
+        )
+        attempts.append(attempt)
+        if attempt["eligible"]:
+            return attempts, int(tile)
+    return attempts, None
+
+
+_R55E11_MISSION = "ZM-ZEGRID-R55-E11-RUNTIME-VRAM-ADAPTATION-20261024"
+
+
+def _r55_tile_adaptation_from_state(tile_state, decision, initial_tile) -> dict:
+    """Deterministic R55-E11 RUN tile-adaptation record (never volatile peaks)."""
+    history = [dict(item) for item in tile_state.get("shrink_history", [])]
+    units = []
+    for record in tile_state.get("units", []):
+        units.append(
+            {
+                "unit_index": int(record.get("unit_index", -1)),
+                "tile_px": record.get("tile_px"),
+                "status": record.get("status"),
+                "action": record.get("action"),
+                "attempted": bool(record.get("attempted")),
+                "completed": bool(record.get("completed")),
+                "discarded": bool(record.get("discarded")),
+            }
+        )
+    return {
+        "schema": _R55E11_TILE_RUNTIME_SCHEMA,
+        "mission": _R55E11_MISSION,
+        "initial_tile_px": int(initial_tile),
+        "effective_tile_px": int(tile_state.get("tile", initial_tile)),
+        "declared_ladder": [int(t) for t in decision.gpu_tile_ladder],
+        "scale": "gpu_tile_px",
+        "growth": "forbidden",
+        "walk": "strictly_smaller_declared_rungs_descending",
+        "final_cause": tile_state.get("final_cause"),
+        "shrink_count": int(len(history)),
+        "shrink_history": history,
+        "attempts": [dict(item) for item in tile_state.get("attempts", [])],
+        "units": units,
+        "intra_cell_oom_supported": False,
+        "intra_cell_policy": (
+            "Pressure/OOM INSIDE a cell is not adapted here. Any in-cell failure "
+            "cancels the pipeline, releases every staged unit, discards all GPU "
+            "results and performs exactly ONE whole-batch exact CPU retry."
+        ),
+    }
+
+
+def _r55_gpu_tile_decision_dict(
+    decision, mapping, bundle, *, runtime=None, legacy_probe_budget_bytes=None
+) -> dict:
+    """R55-E9/E10/E11: deterministic diagnostics for the GPU streaming tile.
 
     Reports the VRAM-derived maximum, the frozen declared ladder, the selected
     tile/prefetch and BOTH peaks that were actually validated: the exact ADDED
-    host bound of the selected tile and the exact device workspace. Every rung's
-    exact bounds are included so the numbers can be audited without re-running.
+    host bound of the selected tile and the exact device workspace. R55-E11 adds
+    the INITIAL vs EFFECTIVE tile, the runtime shrink history (when supplied)
+    and an explicit distinction between the ACTIVE 70 % budget and the legacy
+    50 % probe budget, so neither can be read as the other.
     """
     tile = int(mapping["gpu_streaming_tile"])
     host_by_tile = {
@@ -6842,6 +7082,8 @@ def _r55_gpu_tile_decision_dict(decision, mapping, bundle) -> dict:
         "max_tile_px": int(decision.gpu_tile_max),
         "declared_ladder": [int(t) for t in decision.gpu_tile_ladder],
         "selected_tile_px": int(tile),
+        "initial_tile_px": int(decision.mapping["gpu_streaming_tile"]),
+        "effective_tile_px": int(tile),
         "selected_prefetch_units": int(mapping["prefetch_units"]),
         "selected_host_added_bound_bytes": int(host_by_tile[tile]),
         "selected_host_aggregate_bytes": int(bundle.envelope.aggregate_bytes),
@@ -6866,6 +7108,20 @@ def _r55_gpu_tile_decision_dict(decision, mapping, bundle) -> dict:
         "selected_device_selection_margin_bytes": int(
             decision.gpu_selection_budget_bytes - device_by_tile[tile]
         ),
+        # R55-E11: budget provenance is explicit. ``vram_budget_bytes`` above is
+        # the ACTIVE policy budget (70 %); the legacy probe budget is 50 % and is
+        # reported separately so the two can never be confused.
+        "vram_budget_source": "active_r55_policy_70",
+        "legacy_probe_percent": 50,
+        "legacy_probe_vram_budget_bytes": (
+            None
+            if legacy_probe_budget_bytes is None
+            else int(legacy_probe_budget_bytes)
+        ),
+        "runtime_adaptation": (
+            None if runtime is None else dict(runtime)
+        ),
+        "engine_provenance": _r55_engine_provenance(),
     }
 
 
@@ -8552,6 +8808,17 @@ def _run_single(
             _cell_progress_for(_tasks)
             if progress_callback is None else progress_callback
         )
+        # ZM-ZEGRID-R55-E11: pmap's SERIAL path calls the worker directly and
+        # never runs the initializer. After a GPU attempt the module globals hold
+        # the GPU science config, so a single-worker CPU fallback would silently
+        # re-request the GPU (and fail). Publish the batch's OWN config in the
+        # parent too; parallel children are still initialised by pmap exactly as
+        # before, so this changes no parallel behaviour or science.
+        _init_stack_worker(
+            descs, canvas, science_cfg, global_gauge, global_frame_ids,
+            global_reference_frame_id, tile_size, _cache_workers,
+            _r40_coords_by_cell,
+        )
         _res = zpar.pmap(
             _stack_cell, _tasks, workers=_workers,
             progress_callback=_progress, emit=_emit_live, meta=_meta,
@@ -8925,7 +9192,9 @@ def _run_single(
             wave_index,
         )
 
-    def _run_r55_active_gpu_units(*, gpu_bundle, gpu_mapping, gpu_decision):
+    def _run_r55_active_gpu_units(
+        *, gpu_bundle, gpu_mapping, gpu_decision, gpu_candidate=None
+    ):
         """R55-E2: bounded CPU->GPU producer/consumer pipeline (single owner).
 
         Producer: CPU cache build + cell gauge, at most ``prefetch_units + 1``
@@ -8964,6 +9233,35 @@ def _run_single(
         deterministic_checkpoints = []
         revalid_lock = threading.Lock()
 
+        # R55-E11: ONE mutable tile state shared by the producer's credit callback
+        # and the single-owner consumer. The consumer is the only writer; the
+        # producer only reads the CURRENT peak when it stages a unit, so a shrink
+        # can never race a credit acquisition. The pipeline's device budget stays
+        # the admitted 70 % qualification budget (a hard, never-raised ceiling);
+        # each unit's lease records the exact peak it was staged for, and each
+        # unit's execution records the tile it ACTUALLY ran with.
+        tile_state = {
+            "tile": int(tile),
+            "device_peak": int(device_peak),
+            "mapping": dict(gpu_mapping),
+            "bundle": gpu_bundle,
+            "shrink_history": [],
+            "units": [],
+            "attempts": [],
+            "last_host_facts": None,
+        }
+        tile_lock = threading.Lock()
+        initial_tile = int(tile)
+        initial_device_peak = int(device_peak)
+
+        def _current_tile() -> int:
+            with tile_lock:
+                return int(tile_state["tile"])
+
+        def _current_peak() -> int:
+            with tile_lock:
+                return int(tile_state["device_peak"])
+
         def _produce(task):
             prepared = _prepare_stack_cell(task)
             if "empty_result" in prepared:
@@ -8976,7 +9274,12 @@ def _run_single(
             return int(payload["manifest"].get("total_bytes", 0))
 
         def _device_bytes(payload):
-            return 0 if payload.get("_empty_unit") else int(device_peak)
+            if payload.get("_empty_unit"):
+                return 0
+            # The lease follows the tile current at STAGING time. A later shrink
+            # only ever lowers the executing peak, so a lease is a conservative
+            # upper bound for the unit it covers (never an oversubscription).
+            return int(_current_peak())
 
         def _release(payload):
             if payload.get("_empty_unit"):
@@ -8986,8 +9289,301 @@ def _run_single(
                 _safe_rmtree(cache_dir, None)
 
         def _consume(payload):
+            unit_index = int(payload.get("_unit_index", 0))
             if payload.get("_empty_unit"):
                 return _consume_stack_cell(payload)
+
+            # --- R55-E11 inter-cell boundary -------------------------------
+            # The previous unit's canonical stack has already purged its own
+            # device temporaries at the cell boundary (bounded helper scope).
+            # Synchronise + purge again here so consumer-side allocations from
+            # the crop/pack step cannot masquerade as external pressure, THEN
+            # read fresh VRAM. Snapshot, never a claimed high-water mark.
+            boundary = zgm.gpu_cell_boundary_cleanup(
+                reason="inter_cell_boundary"
+            )
+            facts = _r55_run_checkpoint_sample(disk_root)
+            fresh = zrt.validate_checkpoint_facts(facts)
+            raw = int(fresh["host"]["raw_available_bytes"])
+            budget = int(fresh["host"]["budget_bytes"])
+            host_facts = {
+                "raw_available_bytes": int(raw),
+                "budget_bytes": int(budget),
+                "factor_num": int(rcontract.ADMIT_FACTOR_NUM),
+                "factor_den": int(rcontract.ADMIT_FACTOR_DEN),
+            }
+            try:
+                free_vram = int(zgr.read_vram_free_bytes(0))
+            except zgr.InvalidVramObservation as exc:
+                refused = {
+                    "schema": zrt.RUN_CONTROL_SCHEMA,
+                    "stage": "run",
+                    "unit_index": int(unit_index),
+                    "status": "refused",
+                    "action": "fallback_cpu",
+                    "attempted": True,
+                    "completed": False,
+                    "discarded": True,
+                    "tile_px": int(_current_tile()),
+                    "initial_tile_px": int(initial_tile),
+                    "reason_code": str(zgr.REASON_GPU_OBSERVATION_FAILED),
+                    "detail": f"fresh VRAM observation failed: {exc}",
+                    "host": dict(host_facts),
+                    "gpu_memory": {
+                        "boundary": boundary,
+                        "label": zgm.GPU_MEMORY_SNAPSHOT_LABEL,
+                    },
+                }
+                tile_state["units"].append(refused)
+                with revalid_lock:
+                    run_checkpoints.append(refused)
+                raise _R55GpuFallback(
+                    zgr.REASON_GPU_OBSERVATION_FAILED,
+                    f"fresh VRAM observation failed: {exc}",
+                    telemetry={
+                        "runtime_tile": _r55_tile_adaptation_from_state(
+                            tile_state, gpu_decision, initial_tile
+                        )
+                    },
+                ) from exc
+
+            tile_now = _current_tile()
+            check = _r55_runtime_tile_check(
+                gpu_decision,
+                tile=int(tile_now),
+                free_bytes=int(free_vram),
+                host_budget_bytes=int(budget),
+                bundle=gpu_bundle,
+            )
+            shrink_attempts: list[dict] = []
+            action = "continue"
+            if not check["eligible"]:
+                # RUN-time pressure: walk the SAME admitted ladder strictly down.
+                shrink_attempts, chosen = _r55_runtime_tile_walk(
+                    gpu_decision,
+                    current_tile=int(tile_now),
+                    free_bytes=int(free_vram),
+                    host_budget_bytes=int(budget),
+                    bundle=gpu_bundle,
+                )
+                if chosen is None:
+                    refused = {
+                        "schema": zrt.RUN_CONTROL_SCHEMA,
+                        "stage": "run",
+                        "unit_index": int(unit_index),
+                        "status": "refused",
+                        "action": "fallback_cpu",
+                        "attempted": True,
+                        "completed": False,
+                        "discarded": True,
+                        "tile_px": int(tile_now),
+                        "initial_tile_px": int(initial_tile),
+                        "reason_code": (
+                            str(check["vram_reason_code"])
+                            if not check["device_ok"]
+                            else str(renv.REASON_REFUSE_HOST_RAM)
+                        ),
+                        "detail": (
+                            "no smaller declared GPU tile is admissible on the "
+                            "fresh facts"
+                        ),
+                        "host": dict(host_facts),
+                        "vram": {
+                            "free_bytes": int(free_vram),
+                            "percent": int(vram_percent),
+                            "budget_bytes": int(check["vram_budget_bytes"]),
+                            "device_peak_bytes": int(
+                                check["device_peak_bytes"]
+                            ),
+                            "action": "fallback_cpu",
+                            "reason_code": str(check["vram_reason_code"]),
+                        },
+                        "aggregate_bytes": int(check["host_aggregate_bytes"]),
+                        "shrink_attempts": [dict(a) for a in shrink_attempts],
+                        "gpu_memory": {
+                            "boundary": boundary,
+                            "label": zgm.GPU_MEMORY_SNAPSHOT_LABEL,
+                        },
+                    }
+                    tile_state["units"].append(refused)
+                    with revalid_lock:
+                        revalidations.append(refused)
+                        run_checkpoints.append(refused)
+                    _refuse_reason = (
+                        str(check["vram_reason_code"])
+                        if not check["device_ok"]
+                        else str(renv.REASON_REFUSE_HOST_RAM)
+                    )
+                    with tile_lock:
+                        tile_state["final_cause"] = str(_refuse_reason)
+                    raise _R55GpuFallback(
+                        _refuse_reason,
+                        "fresh VRAM/host revalidation refused the GPU unit and "
+                        "no smaller declared GPU tile fits "
+                        f"(free={free_vram} B, tile={tile_now})",
+                        telemetry={
+                            "runtime_tile": _r55_tile_adaptation_from_state(
+                                tile_state, gpu_decision, initial_tile
+                            ),
+                            "attempts": [dict(a) for a in shrink_attempts],
+                        },
+                    )
+                # Apply the shrink coherently: mapping -> bundle -> peak -> state.
+                probe = replace(
+                    gpu_decision.plan_set.chosen, tile_px=int(chosen)
+                )
+                materialized = _r55_gpu_candidate_lookup(gpu_decision, probe)
+                mapping_new = zsched.active_gpu_mapping_for_candidate(
+                    materialized,
+                    tile_ladder=tuple(
+                        int(t) for t in gpu_decision.gpu_context.tile_ladder
+                    ),
+                    workers_ladder=tuple(
+                        int(w) for w in zsched.WORKERS_LADDER
+                    ),
+                    prefetch_cap=int(_R55E2_PREFETCH_LADDER[-1]),
+                )
+                bundle_new = _r55_active_gpu_apply(
+                    gpu_bundle,
+                    mapping=mapping_new,
+                    decision=gpu_decision,
+                    stage="runtime_tile_shrink",
+                    plan_raw_available_bytes=int(raw),
+                    plan_factor_num=int(rcontract.ADMIT_FACTOR_NUM),
+                    plan_factor_den=int(rcontract.ADMIT_FACTOR_DEN),
+                    plan_budget_bytes=int(budget),
+                )
+                with tile_lock:
+                    tile_state["tile"] = int(chosen)
+                    tile_state["device_peak"] = int(
+                        gpu_decision.device_peak_bytes_by_tile[int(chosen)]
+                    )
+                    tile_state["mapping"] = dict(mapping_new)
+                    tile_state["bundle"] = bundle_new
+                    tile_state["attempts"].extend(
+                        [dict(a) for a in shrink_attempts]
+                    )
+                    tile_state["shrink_history"].append(
+                        {
+                            "schema": _R55E11_TILE_RUNTIME_SCHEMA,
+                            "unit_index": int(unit_index),
+                            "from_tile_px": int(tile_now),
+                            "to_tile_px": int(chosen),
+                            "from_device_peak_bytes": int(
+                                gpu_decision.device_peak_bytes_by_tile[
+                                    int(tile_now)
+                                ]
+                            ),
+                            "to_device_peak_bytes": int(
+                                gpu_decision.device_peak_bytes_by_tile[
+                                    int(chosen)
+                                ]
+                            ),
+                            "vram_free_bytes": int(free_vram),
+                            "vram_percent": int(vram_percent),
+                            "host_budget_bytes": int(budget),
+                            "host_aggregate_bytes": int(
+                                _r55_gpu_host_aggregate_for_tile(
+                                    gpu_decision, gpu_bundle, int(chosen)
+                                )
+                            ),
+                            "attempts": [dict(a) for a in shrink_attempts],
+                        }
+                    )
+                tile_now = int(chosen)
+                action = "shrink"
+                check = _r55_runtime_tile_check(
+                    gpu_decision,
+                    tile=int(tile_now),
+                    free_bytes=int(free_vram),
+                    host_budget_bytes=int(budget),
+                    bundle=gpu_bundle,
+                )
+
+            peak_used = int(gpu_decision.device_peak_bytes_by_tile[int(tile_now)])
+            reserved_peak = int(_device_bytes(payload))
+            # Keep the per-cell record's bound truthful for the EXECUTED tile.
+            try:
+                payload["bound"] = int(
+                    _estimate_streaming_bytes(
+                        len(payload["mem"].patch_ids),
+                        payload["patch_shape_hw"],
+                        int(tile_now),
+                    )
+                )
+            except Exception:
+                pass
+            record = {
+                "schema": zrt.RUN_CONTROL_SCHEMA,
+                "stage": "run",
+                "unit_index": int(unit_index),
+                "status": "executing",
+                "action": str(action),
+                "attempted": True,
+                "completed": False,
+                "discarded": False,
+                "tile_px": int(tile_now),
+                "initial_tile_px": int(initial_tile),
+                "host": dict(host_facts),
+                "vram": {
+                    "free_bytes": int(free_vram),
+                    "percent": int(vram_percent),
+                    "budget_bytes": int(check["vram_budget_bytes"]),
+                    "device_peak_bytes": int(peak_used),
+                    "reserved_device_peak_bytes": int(reserved_peak),
+                    "action": str(action),
+                    "reason_code": str(check["vram_reason_code"]),
+                    "device_ok": bool(check["device_ok"]),
+                    "host_ok": bool(check["host_ok"]),
+                },
+                "aggregate_bytes": int(check["host_aggregate_bytes"]),
+                "shrink_attempts": [dict(a) for a in shrink_attempts],
+                "gpu_memory": {
+                    "label": zgm.GPU_MEMORY_SNAPSHOT_LABEL,
+                    "boundary": boundary,
+                    "after_unit": None,
+                },
+            }
+            with revalid_lock:
+                revalidations.append(record)
+                run_checkpoints.append(record)
+                deterministic_checkpoints.append(
+                    {
+                        "stage": "run",
+                        "unit_index": int(record["unit_index"]),
+                        "host": dict(record["host"]),
+                        "vram": {
+                            "percent": int(vram_percent),
+                            "device_peak_bytes": int(peak_used),
+                            "reason_code": str(check["vram_reason_code"]),
+                        },
+                        "tile_px": int(tile_now),
+                        "action": str(action),
+                        "aggregate_bytes": int(record["aggregate_bytes"]),
+                    }
+                )
+            t_unit = time.perf_counter()
+            payload["_stack_tile_size"] = int(tile_now)
+            try:
+                result = _consume_stack_cell(payload)
+            except BaseException:
+                record["status"] = "failed"
+                record["action"] = "fallback_cpu"
+                record["discarded"] = True
+                raise
+            finally:
+                # BEST-EFFORT boundary cleanup AFTER the unit, never masking the
+                # original exception (the helper itself cannot raise).
+                record["gpu_memory"]["after_unit"] = zgm.gpu_cell_boundary_cleanup(
+                    reason="post_unit"
+                )
+            record["status"] = "completed"
+            record["completed"] = True
+            record["stack_seconds"] = float(time.perf_counter() - t_unit)
+            with tile_lock:
+                tile_state["units"].append(record)
+                tile_state["last_host_facts"] = dict(host_facts)
+            return result
             facts = _r55_run_checkpoint_sample(disk_root)
             fresh = zrt.validate_checkpoint_facts(facts)
             raw = int(fresh["host"]["raw_available_bytes"])
@@ -9070,7 +9666,7 @@ def _run_single(
             release=_release,
             prefetch_units=prefetch,
             host_budget_bytes=int(host_budget_val),
-            device_budget_bytes=int(max(device_budget, device_peak)),
+            device_budget_bytes=int(max(device_budget, initial_device_peak)),
             host_bytes=_host_bytes,
             device_bytes=_device_bytes,
             thread_join_s=float(_R55E2_PIPELINE_JOIN_S),
@@ -9084,10 +9680,25 @@ def _run_single(
         try:
             results = pipeline.run()
         except _R55GpuFallback as _fallback_exc:
+            with tile_lock:
+                if tile_state.get("final_cause") in (None, "gpu_completed"):
+                    tile_state["final_cause"] = str(
+                        _fallback_exc.reason_code
+                    )
+                for _record in tile_state["units"]:
+                    if _record.get("completed"):
+                        _record["discarded"] = True
+                    elif _record.get("status") == "executing":
+                        _record["status"] = "failed"
+                        _record["action"] = "fallback_cpu"
+                        _record["discarded"] = True
             _fallback_exc.telemetry = {
                 **_fallback_exc.telemetry,
                 "pipeline": pipeline.telemetry(),
                 "revalidations": list(revalidations),
+                "runtime_tile": _r55_tile_adaptation_from_state(
+                    tile_state, gpu_decision, initial_tile
+                ),
             }
             raise
         except BaseException as exc:  # noqa: BLE001 - exactly one CPU fallback
@@ -9096,20 +9707,127 @@ def _run_single(
             for _t in tasks:
                 if _t[4] is not None:
                     _safe_rmtree(_t[3], None)
+            with tile_lock:
+                for _record in tile_state["units"]:
+                    if _record.get("completed"):
+                        _record["discarded"] = True
+                    elif _record.get("status") == "executing":
+                        _record["status"] = "failed"
+                        _record["action"] = "fallback_cpu"
+                        _record["discarded"] = True
+            _generic_reason = (
+                "R55_GPU_RUNTIME"
+                if zgpu.is_gpu_runtime_error(exc)
+                else "R55_GPU_PIPELINE_FAILED"
+            )
+            with tile_lock:
+                tile_state["final_cause"] = str(_generic_reason)
             raise _R55GpuFallback(
-                (
-                    "R55_GPU_RUNTIME"
-                    if zgpu.is_gpu_runtime_error(exc)
-                    else "R55_GPU_PIPELINE_FAILED"
-                ),
+                _generic_reason,
                 f"{type(exc).__name__}: {exc}",
                 telemetry={
                     "pipeline": pipeline.telemetry(),
                     "revalidations": list(revalidations),
+                    "runtime_tile": _r55_tile_adaptation_from_state(
+                        tile_state, gpu_decision, initial_tile
+                    ),
                 },
             ) from exc
         wall = time.perf_counter() - t0
         pipeline_telemetry = pipeline.telemetry()
+        with tile_lock:
+            tile_state["final_cause"] = "gpu_completed"
+        # --- R55-E11 effective execution -------------------------------------
+        # The runner may have shrunk between cells. Rebuild the EXECUTABLE
+        # bundle/mapping for the final tile so the manifest, envelope and
+        # final_execution describe what actually ran (never the initial tile).
+        effective_tile = int(_current_tile())
+        effective_peak = int(_current_peak())
+        with tile_lock:
+            effective_mapping = dict(tile_state["mapping"])
+            host_facts_last = (
+                dict(tile_state["last_host_facts"])
+                if tile_state["last_host_facts"] is not None
+                else None
+            )
+            runtime_units = [dict(r) for r in tile_state["units"]]
+        if effective_tile != initial_tile and host_facts_last is not None:
+            effective_bundle = _r55_active_gpu_apply(
+                gpu_bundle,
+                mapping=effective_mapping,
+                decision=gpu_decision,
+                stage="runtime_effective",
+                plan_raw_available_bytes=int(
+                    host_facts_last["raw_available_bytes"]
+                ),
+                plan_factor_num=int(host_facts_last["factor_num"]),
+                plan_factor_den=int(host_facts_last["factor_den"]),
+                plan_budget_bytes=int(host_facts_last["budget_bytes"]),
+            )
+            effective_candidate = _r55_gpu_candidate_lookup(
+                gpu_decision,
+                replace(
+                    gpu_decision.plan_set.chosen, tile_px=int(effective_tile)
+                ),
+            )
+        else:
+            effective_bundle = gpu_bundle
+            effective_candidate = gpu_decision.plan_set.chosen
+        runtime_tile = _r55_tile_adaptation_from_state(
+            tile_state, gpu_decision, initial_tile
+        )
+        runtime_by_index = {
+            int(r["unit_index"]): r
+            for r in runtime_units
+            if r.get("unit_index") is not None
+        }
+        units_block = []
+        for index in range(len(results)):
+            record = runtime_by_index.get(int(index))
+            if record is None:
+                units_block.append(
+                    {
+                        "index": int(index),
+                        "offset": int(index),
+                        "unit_units": 1,
+                        "tile": None,
+                        "status": "empty",
+                        "action": "none",
+                        "attempted": False,
+                        "completed": False,
+                        "discarded": False,
+                        "prefetch_units": int(prefetch),
+                        "device_peak_bytes": 0,
+                    }
+                )
+                continue
+            units_block.append(
+                {
+                    "index": int(index),
+                    "offset": int(index),
+                    "unit_units": 1,
+                    "tile": record.get("tile_px"),
+                    "status": str(record.get("status")),
+                    "action": str(record.get("action")),
+                    "attempted": bool(record.get("attempted")),
+                    "completed": bool(record.get("completed")),
+                    "discarded": bool(record.get("discarded")),
+                    "prefetch_units": int(prefetch),
+                    "device_peak_bytes": int(
+                        (record.get("vram") or {}).get(
+                            "device_peak_bytes", effective_peak
+                        )
+                    ),
+                    "reserved_device_peak_bytes": int(
+                        (record.get("vram") or {}).get(
+                            "reserved_device_peak_bytes",
+                            (record.get("vram") or {}).get(
+                                "device_peak_bytes", effective_peak
+                            ),
+                        )
+                    ),
+                }
+            )
         meta = {
             "executor": "gpu_pipeline_single_owner",
             "wave_executors": ["gpu_pipeline"],
@@ -9139,6 +9857,15 @@ def _run_single(
                 "queue_max": int(queue_max),
                 "vram_percent": int(vram_percent),
                 "vram_budget_bytes": int(device_budget),
+                "vram_budget_source": "active_r55_policy_70",
+                "legacy_probe_vram_budget_bytes": (
+                    None
+                    if gpu_ctx.get("vram_budget_bytes") is None
+                    else int(gpu_ctx["vram_budget_bytes"])
+                ),
+                "initial_tile_px": int(initial_tile),
+                "effective_tile_px": int(effective_tile),
+                "tile_growth": "forbidden",
                 "disk": {
                     "residency_bytes": int(
                         per_unit_cache * (int(prefetch) + 1)
@@ -9160,22 +9887,20 @@ def _run_single(
                 "fallback": "whole_batch_cpu_once",
             },
             "checkpoints": deterministic_checkpoints,
-            "units": [
-                {
-                    "index": int(index),
-                    "offset": int(index),
-                    "unit_units": 1,
-                    "tile": int(tile),
-                    "prefetch_units": int(prefetch),
-                    "device_peak_bytes": int(device_peak),
-                }
-                for index in range(len(results))
-            ],
-            "final_execution": _r55_active_execution(
+            "units": units_block,
+            "initial_execution": _r55_active_execution(
                 gpu_bundle, gpu_mapping
             ),
+            "final_execution": _r55_active_execution(
+                effective_bundle, effective_mapping
+            ),
+            "tile_adaptation": runtime_tile,
+            "engine_provenance": _r55_engine_provenance(),
             "shrink_count": int(len(_r55_active_trail)),
-            "examined_shrink_steps": int(len(_r55_active_trail)),
+            "runtime_shrink_count": int(len(runtime_tile["shrink_history"])),
+            "examined_shrink_steps": int(
+                len(_r55_active_trail) + len(runtime_tile["attempts"])
+            ),
             "refusal_count": 0,
             "note": (
                 "Deterministic ACTIVE GPU RUN structure only. Wall/RSS/VRAM/"
@@ -9190,9 +9915,9 @@ def _run_single(
                 "total_tasks": int(len(results)),
                 "units_remaining_after": 0,
                 "candidate": zsched.active_candidate_tuple(
-                    gpu_decision.plan_set.chosen, allow_gpu=True
+                    effective_candidate, allow_gpu=True
                 ),
-                "mapping": dict(gpu_mapping),
+                "mapping": dict(effective_mapping),
                 "facts": {
                     "host": {
                         "raw_available_bytes": int(
@@ -9234,14 +9959,22 @@ def _run_single(
         telemetry["gpu_qualification"] = dict(
             gpu_decision.qualification
         )
+        telemetry["gpu_tile_adaptation"] = dict(runtime_tile)
+        telemetry["gpu_runtime_units"] = list(runtime_units)
+        telemetry["gpu_memory_boundaries"] = [
+            dict(record.get("gpu_memory") or {})
+            for record in runtime_units
+            if record.get("gpu_memory")
+        ]
+        telemetry["gpu_engine_provenance"] = _r55_engine_provenance()
         return (
             results,
             meta,
             run_block,
             telemetry,
-            gpu_bundle,
-            gpu_decision.plan_set.chosen,
-            gpu_mapping,
+            effective_bundle,
+            effective_candidate,
+            effective_mapping,
             int(len(_r55_active_trail)),
             1,
         )
@@ -9252,6 +9985,11 @@ def _run_single(
     _r55_run_wave_count = 0
     _r55_run_shrink_count = 0
     _r55_gpu_run_fallback = None
+    # R55-E11: the ORIGINAL GPU selection/decision survives a runtime fallback.
+    # The control-flow variable is cleared (the CPU path owns execution), but the
+    # decision, its effective mapping and its runtime adaptation are retained so
+    # the manifest can report what the GPU actually attempted.
+    _r55_gpu_retained = None
     if scheduler_mode == zsched.MODE_ACTIVE and _r55_active_gpu_decision is not None:
         try:
             (
@@ -9268,12 +10006,22 @@ def _run_single(
                 gpu_bundle=_r55_active_bundle,
                 gpu_mapping=_r55_active_mapping,
                 gpu_decision=_r55_active_gpu_decision,
+                gpu_candidate=_r55_active_candidate,
             )
         except _R55GpuFallback as _gpu_exc:
             # EXACT whole-batch CPU fallback from a CLEAN state. Every GPU
             # result is discarded (none were returned) and every per-cell
             # cache is removed before re-observation; the CPU plan is admitted
             # fresh under the same geometry and identity.
+            _r55_gpu_retained = {
+                "decision": _r55_active_gpu_decision,
+                "mapping": dict(_r55_active_mapping),
+                "bundle": _r55_active_bundle,
+                "runtime_tile": dict(
+                    (_gpu_exc.telemetry or {}).get("runtime_tile") or {}
+                ),
+                "telemetry": dict(_gpu_exc.telemetry or {}),
+            }
             _r55_gpu_run_fallback = {
                 "stage": "run",
                 "reason_code": _gpu_exc.reason_code,
@@ -9613,15 +10361,56 @@ def _run_single(
     gpu_ctx["actually_used"] = bool(actually_used_gpu)
     gpu_ctx["final_backend"] = "gpu" if actually_used_gpu else "cpu"
     gpu_ctx["final_effective"] = bool(actually_used_gpu)
+    # R55-E11: keep BOTH budgets distinguishable forever. Up to R55-E10 the
+    # manifest's ``gpu.vram_budget_bytes`` was the legacy 50 % probe value even
+    # when the ACTIVE 70 % policy executed the GPU. The legacy value is retained
+    # under its own explicit key; ``vram_budget_bytes`` now reports the ACTIVE
+    # budget whenever an ACTIVE GPU plan exists (executed or attempted).
+    _legacy_probe_budget = gpu_ctx.get("vram_budget_bytes")
+    gpu_ctx["legacy_probe_vram_budget_bytes"] = (
+        None if _legacy_probe_budget is None else int(_legacy_probe_budget)
+    )
+    gpu_ctx["vram_budget_source"] = "legacy_probe_50"
+    gpu_ctx["engine_provenance"] = _r55_engine_provenance()
+    if _r55_gpu_retained is not None:
+        _ret = _r55_gpu_retained
+        _rt = dict(_ret.get("runtime_tile") or {})
+        gpu_ctx["gpu_initial_streaming_tile"] = int(
+            _ret["mapping"]["gpu_streaming_tile"]
+        )
+        gpu_ctx["gpu_streaming_tile"] = int(
+            _rt.get("effective_tile_px")
+            if _rt.get("effective_tile_px") is not None
+            else _ret["mapping"]["gpu_streaming_tile"]
+        )
+        gpu_ctx["gpu_streaming_host_peak_bytes"] = int(
+            _ret["bundle"].gpu_streaming_host_peak_bytes
+        )
+        gpu_ctx["gpu_tile_adaptation"] = _rt
+        gpu_ctx["vram_budget_bytes"] = int(
+            _ret["decision"].qualification["budget_bytes"]
+        )
+        gpu_ctx["vram_budget_source"] = "active_r55_policy_70"
+    elif _r55_active_gpu_decision is not None:
+        gpu_ctx["vram_budget_bytes"] = int(
+            _r55_active_gpu_decision.qualification["budget_bytes"]
+        )
+        gpu_ctx["vram_budget_source"] = "active_r55_policy_70"
+        gpu_ctx["gpu_initial_streaming_tile"] = int(gpu_streaming_tile)
     # ZM-ZEGRID-R36: distinguish the GPU streaming tile from the CPU streaming
     # tile (the GPU->CPU fallback uses the CPU tile, never a re-coded 128).
     gpu_ctx["cpu_streaming_tile"] = int(cpu_streaming_tile)
-    gpu_ctx["gpu_streaming_tile"] = (
-        int(gpu_streaming_tile) if gpu_streaming_tile is not None else None
-    )
-    gpu_ctx["gpu_streaming_host_peak_bytes"] = (
-        int(gpu_streaming_host_peak_bytes) if gpu_streaming_host_peak_bytes is not None else None
-    )
+    if _r55_gpu_retained is None:
+        gpu_ctx["gpu_streaming_tile"] = (
+            int(gpu_streaming_tile) if gpu_streaming_tile is not None else None
+        )
+        gpu_ctx["gpu_streaming_host_peak_bytes"] = (
+            int(gpu_streaming_host_peak_bytes)
+            if gpu_streaming_host_peak_bytes is not None
+            else None
+        )
+    # else: R55-E11 retained the EFFECTIVE attempted GPU tile above; the CPU
+    # bundle's ``None`` must not erase the evidence of what the GPU ran.
     gpu_ctx["cpu_fallback_plan"] = dict(cpu_fallback_info)
     gpu_used = bool(actually_used_gpu)
 
@@ -9881,7 +10670,11 @@ def _run_single(
             tile_ladder=(
                 _r55_active_gpu_decision.gpu_tile_ladder
                 if _r55_active_gpu_decision is not None
-                else None
+                else (
+                    _r55_gpu_retained["decision"].gpu_tile_ladder
+                    if _r55_gpu_retained is not None
+                    else None
+                )
             ),
         )
         if _r55_active_gpu_decision is not None:
@@ -9890,9 +10683,70 @@ def _run_single(
             )
             _r55_scheduler_block["gpu_tile_decision"] = (
                 _r55_gpu_tile_decision_dict(
-                    _r55_active_gpu_decision, _r55_active_mapping, _final
+                    _r55_active_gpu_decision,
+                    _r55_active_mapping,
+                    _final,
+                    runtime=(_r55_run_telemetry or {}).get(
+                        "gpu_tile_adaptation"
+                    ),
+                    legacy_probe_budget_bytes=gpu_ctx.get(
+                        "legacy_probe_vram_budget_bytes"
+                    ),
                 )
             )
+            if _r55_run_telemetry and _r55_run_telemetry.get(
+                "gpu_tile_adaptation"
+            ):
+                _r55_scheduler_block["gpu_tile_runtime"] = dict(
+                    _r55_run_telemetry["gpu_tile_adaptation"]
+                )
+        if (
+            _r55_active_gpu_decision is None
+            and _r55_gpu_retained is not None
+        ):
+            # R55-E11: the ORIGINAL GPU decision survives the runtime fallback.
+            # Its absence after a fallback was previously unreadable (None meant
+            # both "never selected" and "selected then abandoned").
+            _ret = _r55_gpu_retained
+            _ret_runtime = dict(_ret.get("runtime_tile") or {})
+            _r55_scheduler_block["gpu_tile_decision"] = (
+                _r55_gpu_tile_decision_dict(
+                    _ret["decision"],
+                    _ret["mapping"],
+                    _ret["bundle"],
+                    runtime=(_ret_runtime or None),
+                    legacy_probe_budget_bytes=gpu_ctx.get(
+                        "legacy_probe_vram_budget_bytes"
+                    ),
+                )
+            )
+            _r55_scheduler_block["gpu_original_decision"] = {
+                "schema": _R55E11_TILE_RUNTIME_SCHEMA,
+                "reason": "runtime_fallback_preserved_selection",
+                "selected_tile_px": int(
+                    _ret["mapping"]["gpu_streaming_tile"]
+                ),
+                "effective_tile_px": _ret_runtime.get("effective_tile_px"),
+                "declared_ladder": [
+                    int(t) for t in _ret["decision"].gpu_tile_ladder
+                ],
+                "vram_percent": int(
+                    _ret["decision"].qualification["percent"]
+                ),
+                "vram_budget_bytes": int(
+                    _ret["decision"].qualification["budget_bytes"]
+                ),
+                "legacy_probe_vram_budget_bytes": gpu_ctx.get(
+                    "legacy_probe_vram_budget_bytes"
+                ),
+                "engine_provenance": _r55_engine_provenance(),
+            }
+            _r55_scheduler_block["gpu_tile_runtime"] = _ret_runtime
+            _ret_pipeline = (_ret.get("telemetry") or {}).get("pipeline")
+            if _ret_pipeline:
+                _r55_scheduler_block["gpu_fallback_pipeline"] = dict(
+                    _ret_pipeline
+                )
         if _r55_gpu_run_fallback is not None:
             _r55_scheduler_block["gpu_fallback"] = dict(
                 _r55_gpu_run_fallback
