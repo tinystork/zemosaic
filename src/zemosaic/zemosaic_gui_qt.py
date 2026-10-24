@@ -4720,7 +4720,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # equivalent of this priority.
         canonical_value: Any = target.get("use_gpu_phase5")
         if canonical_value in (None, ""):
-            for legacy_key in ("stack_use_gpu", "use_gpu_stack", "use_gpu_grid"):
+            # Same legacy order as `_normalize_gpu_flags` and the ZeGrid engine:
+            # grid alias first, then the stacking aliases.
+            for legacy_key in ("use_gpu_grid", "stack_use_gpu", "use_gpu_stack"):
                 legacy_val = target.get(legacy_key)
                 if legacy_val not in (None, ""):
                     canonical_value = legacy_val
@@ -5130,7 +5132,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         canonical_gpu_pref: Any = merged_config.get("use_gpu_phase5")
         if canonical_gpu_pref in (None, ""):
-            for legacy_key in ("stack_use_gpu", "use_gpu_stack"):
+            for legacy_key in ("use_gpu_grid", "stack_use_gpu", "use_gpu_stack"):
                 if legacy_key in merged_config:
                     canonical_gpu_pref = merged_config[legacy_key]
                     break

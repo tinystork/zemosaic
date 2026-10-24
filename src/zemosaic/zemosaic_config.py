@@ -646,29 +646,48 @@ def _coerce_boolish(value: Any, default: Optional[bool] = False) -> Optional[boo
     return default
 
 
-def _normalize_gpu_flags(config: dict) -> None:
+def _normalize_gpu_flags(config: dict, *, explicit_keys: set[str] | None = None) -> None:
     """Ensure GPU toggles are synchronised across legacy keys.
 
     Priority (first explicit value wins):
       1. ``use_gpu_phase5`` — the canonical Qt checkbox / phase-5 intent;
-      2. ``stack_use_gpu`` — legacy stacking alias;
-      3. ``use_gpu_stack`` — legacy stacking alias;
-      4. ``use_gpu_grid`` — legacy grid alias.
+      2. ``use_gpu_grid`` — legacy grid alias;
+      3. ``stack_use_gpu`` — legacy stacking alias;
+      4. ``use_gpu_stack`` — legacy stacking alias.
 
     Once the canonical value is known, ALL four keys are rewritten to it, so an
     obsolete ``use_gpu_grid`` value can never contradict the checkbox. A legacy
-    config that only carries ``use_gpu_grid`` still keeps its intent by acting
-    as the last-resort fallback when the canonical key is absent.
+    config that only carries ``use_gpu_grid`` (or a stack alias) still keeps its
+    intent by acting as a fallback when the canonical key is genuinely absent.
+
+    ``explicit_keys`` is the set of keys the *source* actually persisted (for
+    ``load_config``: the keys present in the JSON file). This presence tracking
+    is essential because ``load_config`` merges ``DEFAULT_CONFIG`` first: a
+    default ``use_gpu_phase5=True`` would otherwise mask a legacy-only
+    false/off intent. When ``explicit_keys`` is None (an in-memory/raw dict),
+    every key present in ``config`` is treated as explicit.
     """
 
-    canonical = _coerce_boolish(config.get("use_gpu_phase5"), None)
+    if explicit_keys is None:
+        explicit_keys = set(config.keys())
+
+    canonical = None
+    if "use_gpu_phase5" in explicit_keys:
+        canonical = _coerce_boolish(config.get("use_gpu_phase5"), None)
     if canonical is None:
-        for key in ("stack_use_gpu", "use_gpu_stack", "use_gpu_grid"):
+        for key in ("use_gpu_grid", "stack_use_gpu", "use_gpu_stack"):
+            if key not in explicit_keys:
+                continue
             canonical = _coerce_boolish(config.get(key), None)
             if canonical is not None:
                 break
     if canonical is None:
-        canonical = False
+        # No explicit GPU intent in the source: preserve the current/default
+        # canonical value (a fresh/default config keeps GPU enabled); never
+        # force GPU off merely because the source omitted the keys.
+        canonical = _coerce_boolish(config.get("use_gpu_phase5"), False)
+        if canonical is None:
+            canonical = False
     for key in ("use_gpu_phase5", "use_gpu_grid", "stack_use_gpu", "use_gpu_stack"):
         config[key] = canonical
 
@@ -924,10 +943,17 @@ def load_config():
     except Exception:
         pass
     current_config = DEFAULT_CONFIG.copy()
+    # Presence information from the persisted JSON: ``load_config`` merges
+    # defaults before normalization, so we must remember which GPU keys the user
+    # actually persisted. Without this, DEFAULT_CONFIG's canonical True would
+    # mask an explicit legacy-only false/off intent (R55-E4 rework-1).
+    loaded_keys: set[str] = set()
     if config_path.exists():
         try:
             with config_path.open("r", encoding="utf-8") as f:  # Spécifier encoding
                 loaded_config = json.load(f)
+                if isinstance(loaded_config, dict):
+                    loaded_keys = set(loaded_config.keys())
                 for key, default_value in DEFAULT_CONFIG.items():
                     current_config[key] = loaded_config.get(key, default_value)
                 # Preserve power-user / hidden keys that are present in JSON but not
@@ -963,7 +989,7 @@ def load_config():
             if expanded:
                 current_config[key] = str(expanded)
     _apply_astap_platform_defaults(current_config)
-    _normalize_gpu_flags(current_config)
+    _normalize_gpu_flags(current_config, explicit_keys=loaded_keys)
     _normalize_processing_mode(current_config)
 
     # Qt-only migration: backend selection is obsolete in official runtime.
