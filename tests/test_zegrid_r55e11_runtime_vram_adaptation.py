@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import shutil
 import subprocess
 import sys
@@ -648,3 +649,102 @@ def test_e11_no_admissible_tile_falls_back_once_and_preserves_decision(
     assert pipe["ledger"]["balanced"] is True
     assert pipe["threads_joined"] is True
     assert pipe["producer_alive"] is False
+    # The immediate failure record distinguishes a VRAM refusal from a generic
+    # producer/accounting failure (R55F's unresolved class).
+    diag = _failure_diag(out)
+    assert diag["category"] == "vram_refusal"
+    assert diag["reason_code"] == zgr.REASON_REFUSE_VRAM
+    assert diag["pipeline"]["ledger"]["balanced"] is True
+    assert diag["tile_state"]["tile_px"] == runtime["initial_tile_px"]
+
+
+# ---------------------------------------------------------------------------
+# G. Immediate failure diagnostics (R55-E11 addendum).
+#
+# R55F (Windows, 19:27:12) stopped with R55_GPU_PIPELINE_FAILED, no manifest and
+# no detailed exception in the accessible artifacts. These tests pin the
+# correction: the ORIGINAL exception (type/message/chain/traceback) plus
+# producer/consumer/ledger/unit context is persisted BEFORE the whole-batch CPU
+# retry, and survives a run that never reaches finalize. Generic producer and
+# accounting failures are tested SEPARATELY from VRAM refusal / CUDA OOM.
+# ---------------------------------------------------------------------------
+
+def _failure_diag(out: Path) -> dict:
+    return json.loads((out / "zegrid_gpu_failure.json").read_text())
+
+
+def test_e11_producer_failure_diagnostics_survive_without_manifest(
+    routine_input, tmp_path_factory, monkeypatch, caplog
+):
+    _patch_gpu(monkeypatch, _sequence([2 * GIB]))
+    seen_tiles: list[int] = []
+    _fake_gpu_consumer(monkeypatch, seen_tiles)
+
+    def boom(task):
+        raise RuntimeError("producer boom")
+
+    monkeypatch.setattr(zz, "_prepare_stack_cell", boom)
+    out = tmp_path_factory.mktemp("r55e11_producer_fail")
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError):
+            _run(routine_input, out)
+
+    # The run aborted after the fallback and wrote NO manifest...
+    assert not (out / "zegrid_manifest.json").exists()
+    # ...but the original cause was persisted immediately.
+    diag = _failure_diag(out)
+    assert diag["schema"] == zz._R55E11_FAILURE_SCHEMA
+    assert diag["category"] == "producer_error"
+    assert diag["stage"] == "pipeline"
+    assert diag["exception"]["type"] == "RuntimeError"
+    assert "producer boom" in diag["exception"]["message"]
+    assert "producer boom" in diag["exception"]["traceback"]
+    assert diag["exception_chain"]
+    assert diag["pipeline"]["ledger"]["balanced"] is True
+    assert diag["pipeline"]["threads_joined"] is True
+    assert diag["pipeline"]["producer_alive"] is False
+    assert diag["pipeline"]["producer_error"]
+    assert diag["device"] is not None
+    assert diag["host"]["parent_memory"] is not None
+    # The useful reason reached the GUI/run-log line, not just a reason_code.
+    emitted = "\n".join(str(record.message) for record in caplog.records)
+    assert "producer boom" in emitted
+    assert "zegrid_gpu_failure.json" in emitted
+
+
+def test_e11_producer_accounting_failure_is_distinct_and_durable(
+    routine_input, tmp_path_factory, monkeypatch
+):
+    _patch_gpu(monkeypatch, _sequence([2 * GIB]))
+    seen_tiles: list[int] = []
+    _fake_gpu_consumer(monkeypatch, seen_tiles)
+    real_prepare = zz._prepare_stack_cell
+
+    def bad_accounting(task):
+        prepared = real_prepare(task)
+        if "empty_result" in prepared:
+            return prepared
+        prepared = dict(prepared)
+        prepared["manifest"] = dict(prepared["manifest"])
+        # A real post-produce byte-callback/accounting failure (not VRAM/OOM).
+        prepared["manifest"]["total_bytes"] = "not-an-int"
+        return prepared
+
+    monkeypatch.setattr(zz, "_prepare_stack_cell", bad_accounting)
+    out = tmp_path_factory.mktemp("r55e11_accounting_fail")
+    with pytest.raises(Exception):
+        _run(routine_input, out)
+
+    assert not (out / "zegrid_manifest.json").exists()
+    diag = _failure_diag(out)
+    assert diag["category"] == "producer_accounting_error"
+    assert diag["exception"]["type"] == "PipelineError"
+    assert "producer failed" in diag["exception"]["message"]
+    # The ORIGINAL cause is preserved through the wrapper chain.
+    assert any(
+        entry["type"] in ("ValueError", "TypeError")
+        for entry in diag["exception_chain"]
+    )
+    assert diag["extra"]["producer_error"]
+    assert diag["pipeline"]["ledger"]["balanced"] is True
+    assert diag["pipeline"]["threads_joined"] is True

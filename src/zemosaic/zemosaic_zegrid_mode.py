@@ -56,6 +56,8 @@ import os
 import shutil
 import threading
 import time
+import traceback
+from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -7018,6 +7020,191 @@ def _r55_runtime_tile_walk(
 
 _R55E11_MISSION = "ZM-ZEGRID-R55-E11-RUNTIME-VRAM-ADAPTATION-20261024"
 
+_R55E11_FAILURE_SCHEMA = "zemosaic-r55e11-gpu-failure-v1"
+_R55E11_FAILURE_FILENAME = "zegrid_gpu_failure.json"
+_R55E11_FAILURE_JSONL = "zegrid_gpu_failure.jsonl"
+_R55E11_FAILURE_MAX_CHAIN = 8
+_R55E11_FAILURE_MAX_TEXT = 16 * 1024
+_R55E11_FAILURE_MAX_REVALIDATIONS = 32
+
+
+def _r55_bounded_text(value, limit: int = _R55E11_FAILURE_MAX_TEXT) -> str:
+    """Bound a diagnostic string WITHOUT changing the original exception."""
+    text = str(value)
+    if len(text) <= int(limit):
+        return text
+    return text[: int(limit)] + f"... [truncated {len(text) - int(limit)} chars]"
+
+
+def _r55_exception_chain(exc) -> list[dict]:
+    """Bounded type/module/message/repr + formatted traceback for exc and its
+    ``__cause__``/``__context__`` chain (never raises)."""
+    chain: list[dict] = []
+    seen: set[int] = set()
+    current = exc
+    while (
+        current is not None
+        and id(current) not in seen
+        and len(chain) < _R55E11_FAILURE_MAX_CHAIN
+    ):
+        seen.add(id(current))
+        entry = {
+            "type": type(current).__name__,
+            "module": str(type(current).__module__),
+            "message": _r55_bounded_text(current, 4096),
+            "repr": _r55_bounded_text(repr(current), 4096),
+            "traceback": "",
+        }
+        try:
+            entry["traceback"] = _r55_bounded_text(
+                "".join(
+                    traceback.format_exception(
+                        type(current), current, current.__traceback__
+                    )
+                )
+            )
+        except Exception as fmt_exc:  # defensive: never mask the original
+            entry["traceback"] = f"<traceback_format_failed:{type(fmt_exc).__name__}>"
+        chain.append(entry)
+        nxt = (
+            current.__cause__
+            if current.__cause__ is not None
+            else current.__context__
+        )
+        if nxt is exc:
+            break
+        current = nxt
+    return chain
+
+
+def _r55_gpu_failure_record(
+    *,
+    stage: str,
+    category: str,
+    reason_code,
+    detail,
+    exc=None,
+    pipeline=None,
+    tile_state=None,
+    revalidations=None,
+    unit=None,
+    host_facts=None,
+    device_snapshot=None,
+    parent_memory=None,
+    extra=None,
+) -> dict:
+    """One bounded, JSON-safe GPU failure record.
+
+    Written IMMEDIATELY on the failure path (before the whole-batch CPU retry)
+    so the original cause survives even when the run never reaches finalize and
+    never writes a manifest.
+    """
+    chain = _r55_exception_chain(exc) if exc is not None else []
+    revalidations = list(revalidations or [])
+    tile_view = {}
+    if isinstance(tile_state, dict):
+        tile_view = {
+            "tile_px": tile_state.get("tile"),
+            "device_peak_bytes": tile_state.get("device_peak"),
+            "final_cause": tile_state.get("final_cause"),
+            "shrink_history": [
+                dict(item)
+                for item in (tile_state.get("shrink_history") or [])
+            ],
+            "attempts": [
+                dict(item) for item in (tile_state.get("attempts") or [])
+            ],
+            "units": [
+                {
+                    "unit_index": record.get("unit_index"),
+                    "tile_px": record.get("tile_px"),
+                    "status": record.get("status"),
+                    "action": record.get("action"),
+                    "attempted": bool(record.get("attempted")),
+                    "completed": bool(record.get("completed")),
+                    "discarded": bool(record.get("discarded")),
+                }
+                for record in (tile_state.get("units") or [])
+            ],
+        }
+    record = {
+        "schema": _R55E11_FAILURE_SCHEMA,
+        "mission": _R55E11_MISSION,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "stage": str(stage),
+        "category": str(category),
+        "reason_code": None if reason_code is None else str(reason_code),
+        "detail": None if detail is None else _r55_bounded_text(detail, 4096),
+        "exception": (
+            None
+            if not chain
+            else {
+                "type": chain[0]["type"],
+                "module": chain[0]["module"],
+                "message": chain[0]["message"],
+                "repr": chain[0]["repr"],
+                "traceback": chain[0]["traceback"],
+            }
+        ),
+        "exception_chain": chain,
+        "pipeline": None if pipeline is None else dict(pipeline),
+        "unit": None if unit is None else dict(unit),
+        "tile_state": tile_view,
+        "host": {
+            "last_checkpoint_facts": (
+                None if host_facts is None else dict(host_facts)
+            ),
+            "parent_memory": (
+                None if parent_memory is None else dict(parent_memory)
+            ),
+        },
+        "device": (
+            None if device_snapshot is None else dict(device_snapshot)
+        ),
+        "revalidations_total": int(len(revalidations)),
+        "revalidations_tail": [
+            dict(item)
+            for item in revalidations[-_R55E11_FAILURE_MAX_REVALIDATIONS:]
+        ],
+        "extra": {} if extra is None else dict(extra),
+        "note": (
+            "Immediate GPU failure diagnostics. Written before the whole-batch "
+            "CPU retry and independent of the final manifest."
+        ),
+    }
+    return record
+
+
+def _r55_write_gpu_failure_diagnostics(output_dir, record: dict) -> str | None:
+    """Atomically persist one failure record; NEVER raises (best effort).
+
+    Writes ``zegrid_gpu_failure.json`` (atomic replace) plus an append-only
+    ``zegrid_gpu_failure.jsonl``. A write failure returns ``None`` and must not
+    mask the original science/pipeline error.
+    """
+    try:
+        root = Path(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(record, ensure_ascii=False, indent=2, default=str)
+        target = root / _R55E11_FAILURE_FILENAME
+        tmp = root / (_R55E11_FAILURE_FILENAME + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, target)
+        try:
+            with (root / _R55E11_FAILURE_JSONL).open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(
+                    json.dumps(record, ensure_ascii=False, default=str) + "\n"
+                )
+        except Exception:
+            pass
+        return str(target)
+    except Exception:
+        return None
+
+
+
 
 def _r55_tile_adaptation_from_state(tile_state, decision, initial_tile) -> dict:
     """Deterministic R55-E11 RUN tile-adaptation record (never volatile peaks)."""
@@ -9232,6 +9419,47 @@ def _run_single(
         run_checkpoints = []
         deterministic_checkpoints = []
         revalid_lock = threading.Lock()
+        # R55-E11 addendum: capture the ORIGINAL exception at raise time (before
+        # the pipeline's cleanup unwinds) so the durable record is not a
+        # post-hoc generic wrapper.
+        failure_lock = threading.Lock()
+        failure_capture: dict = {}
+
+        def _capture_failure(stage, exc, *, payload=None, task=None):
+            try:
+                with failure_lock:
+                    if failure_capture:
+                        return
+                    unit = None
+                    if isinstance(payload, dict):
+                        unit = {
+                            "unit_index": payload.get("_unit_index"),
+                            "cell_id": str(
+                                getattr(payload.get("cell"), "cell_id", "")
+                            ),
+                            "tile_px": payload.get("_stack_tile_size"),
+                        }
+                    elif task is not None:
+                        try:
+                            unit = {
+                                "producer_task_index": task[0],
+                                "cell_id": str(getattr(task[0], "cell_id", "")),
+                            }
+                        except Exception:
+                            unit = None
+                    failure_capture.update(
+                        {
+                            "stage": str(stage),
+                            "exception": exc,
+                            "unit": unit,
+                            "captured_at": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                        }
+                    )
+            except Exception:
+                # Diagnostics capture must NEVER interfere with the failure path.
+                pass
 
         # R55-E11: ONE mutable tile state shared by the producer's credit callback
         # and the single-owner consumer. The consumer is the only writer; the
@@ -9263,7 +9491,11 @@ def _run_single(
                 return int(tile_state["device_peak"])
 
         def _produce(task):
-            prepared = _prepare_stack_cell(task)
+            try:
+                prepared = _prepare_stack_cell(task)
+            except BaseException as exc:
+                _capture_failure("producer", exc, task=task)
+                raise
             if "empty_result" in prepared:
                 prepared["_empty_unit"] = True
             return prepared
@@ -9287,6 +9519,13 @@ def _run_single(
             cache_dir = payload.get("cache_dir")
             if cache_dir is not None:
                 _safe_rmtree(cache_dir, None)
+
+        def _consume_guarded(payload):
+            try:
+                return _consume(payload)
+            except BaseException as exc:
+                _capture_failure("consumer", exc, payload=payload)
+                raise
 
         def _consume(payload):
             unit_index = int(payload.get("_unit_index", 0))
@@ -9416,6 +9655,39 @@ def _run_single(
                     )
                     with tile_lock:
                         tile_state["final_cause"] = str(_refuse_reason)
+                    _refusal_diag = _r55_gpu_failure_record(
+                        stage="checkpoint",
+                        category=(
+                            "vram_refusal"
+                            if not check["device_ok"]
+                            else "host_refusal"
+                        ),
+                        reason_code=_refuse_reason,
+                        detail=(
+                            "fresh VRAM/host revalidation refused the GPU "
+                            "unit and no smaller declared GPU tile fits"
+                        ),
+                        exc=None,
+                        pipeline=None,
+                        tile_state=tile_state,
+                        revalidations=revalidations,
+                        unit={
+                            "unit_index": int(unit_index),
+                            "tile_px": int(tile_now),
+                            "initial_tile_px": int(initial_tile),
+                        },
+                        host_facts=host_facts,
+                        device_snapshot=boundary.get("after"),
+                        extra={
+                            "check": dict(check),
+                            "shrink_attempts": [
+                                dict(a) for a in shrink_attempts
+                            ],
+                        },
+                    )
+                    _refusal_path = _r55_write_gpu_failure_diagnostics(
+                        output_dir, _refusal_diag
+                    )
                     raise _R55GpuFallback(
                         _refuse_reason,
                         "fresh VRAM/host revalidation refused the GPU unit and "
@@ -9426,6 +9698,7 @@ def _run_single(
                                 tile_state, gpu_decision, initial_tile
                             ),
                             "attempts": [dict(a) for a in shrink_attempts],
+                            "diagnostics_path": _refusal_path,
                         },
                     )
                 # Apply the shrink coherently: mapping -> bundle -> peak -> state.
@@ -9662,7 +9935,7 @@ def _run_single(
         pipeline = zpar.BoundedPipeline(
             tasks=indexed,
             produce=lambda item: dict(_produce(item[1]), _unit_index=int(item[0])),
-            consume=_consume,
+            consume=_consume_guarded,
             release=_release,
             prefetch_units=prefetch,
             host_budget_bytes=int(host_budget_val),
@@ -9692,13 +9965,47 @@ def _run_single(
                         _record["status"] = "failed"
                         _record["action"] = "fallback_cpu"
                         _record["discarded"] = True
+            _fallback_pipeline = pipeline.telemetry()
+            if str(_fallback_exc.reason_code) == str(zgr.REASON_REFUSE_VRAM):
+                _fallback_category = "vram_refusal"
+            elif str(_fallback_exc.reason_code) == str(
+                renv.REASON_REFUSE_HOST_RAM
+            ):
+                _fallback_category = "host_refusal"
+            else:
+                _fallback_category = "gpu_fallback"
+            _fallback_diag = _r55_gpu_failure_record(
+                stage="pipeline",
+                category=_fallback_category,
+                reason_code=_fallback_exc.reason_code,
+                detail=_fallback_exc.detail,
+                exc=_fallback_exc,
+                pipeline=_fallback_pipeline,
+                tile_state=tile_state,
+                revalidations=revalidations,
+                unit={
+                    "active_unit_index": _fallback_pipeline.get(
+                        "active_unit_index"
+                    ),
+                    "producer_task_index": _fallback_pipeline.get(
+                        "producer_task_index"
+                    ),
+                },
+                host_facts=tile_state.get("last_host_facts"),
+                device_snapshot=zgm.device_memory_snapshot(),
+                parent_memory=zrt.read_parent_memory(),
+            )
+            _fallback_path = _r55_write_gpu_failure_diagnostics(
+                output_dir, _fallback_diag
+            )
             _fallback_exc.telemetry = {
                 **_fallback_exc.telemetry,
-                "pipeline": pipeline.telemetry(),
+                "pipeline": _fallback_pipeline,
                 "revalidations": list(revalidations),
                 "runtime_tile": _r55_tile_adaptation_from_state(
                     tile_state, gpu_decision, initial_tile
                 ),
+                "diagnostics_path": _fallback_path,
             }
             raise
         except BaseException as exc:  # noqa: BLE001 - exactly one CPU fallback
@@ -9722,15 +10029,78 @@ def _run_single(
             )
             with tile_lock:
                 tile_state["final_cause"] = str(_generic_reason)
+            _generic_pipeline = pipeline.telemetry()
+            with failure_lock:
+                _captured = dict(failure_capture)
+            if _captured.get("stage") == "producer":
+                _category = "producer_error"
+            elif _captured.get("stage") == "consumer":
+                _category = "consumer_error"
+            elif _generic_pipeline.get("producer_error"):
+                # The pipeline raised after produce (byte callback / credit /
+                # accounting), i.e. the producer thread failed AFTER a payload
+                # was owned. Distinct from a producer's own science exception.
+                _category = "producer_accounting_error"
+            elif _generic_pipeline.get("consumer_error"):
+                _category = "consumer_error"
+            else:
+                _category = "pipeline_error"
+            # The ORIGINAL exception captured at raise time is the primary
+            # record. The pipeline's generic wrapper (when one exists) is kept
+            # as ``surfaced_exception`` so both layers remain auditable.
+            _primary_exc = _captured.get("exception") or exc
+            _surfaced = None
+            if _primary_exc is not exc:
+                _surfaced = _r55_exception_chain(exc)
+            _generic_diag = _r55_gpu_failure_record(
+                stage="pipeline",
+                category=_category,
+                reason_code=_generic_reason,
+                detail=f"{type(_primary_exc).__name__}: {_primary_exc}",
+                exc=_primary_exc,
+                pipeline=_generic_pipeline,
+                tile_state=tile_state,
+                revalidations=revalidations,
+                unit=(
+                    _captured.get("unit")
+                    or {
+                        "active_unit_index": _generic_pipeline.get(
+                            "active_unit_index"
+                        ),
+                        "producer_task_index": _generic_pipeline.get(
+                            "producer_task_index"
+                        ),
+                    }
+                ),
+                host_facts=tile_state.get("last_host_facts"),
+                device_snapshot=zgm.device_memory_snapshot(),
+                parent_memory=zrt.read_parent_memory(),
+                extra={
+                    "capture_stage": _captured.get("stage"),
+                    "capture_timestamp": _captured.get("captured_at"),
+                    "surfaced_exception": _surfaced,
+                    "producer_error": _generic_pipeline.get(
+                        "producer_error"
+                    ),
+                    "consumer_error": _generic_pipeline.get(
+                        "consumer_error"
+                    ),
+                    "ledger": _generic_pipeline.get("ledger"),
+                },
+            )
+            _generic_path = _r55_write_gpu_failure_diagnostics(
+                output_dir, _generic_diag
+            )
             raise _R55GpuFallback(
                 _generic_reason,
-                f"{type(exc).__name__}: {exc}",
+                f"{type(_primary_exc).__name__}: {_primary_exc}",
                 telemetry={
-                    "pipeline": pipeline.telemetry(),
+                    "pipeline": _generic_pipeline,
                     "revalidations": list(revalidations),
                     "runtime_tile": _r55_tile_adaptation_from_state(
                         tile_state, gpu_decision, initial_tile
                     ),
+                    "diagnostics_path": _generic_path,
                 },
             ) from exc
         wall = time.perf_counter() - t0
@@ -10045,11 +10415,21 @@ def _run_single(
             ignored_settings = zin.ignored_settings_present(
                 zconfig, gpu_honoured=False
             )
+            _diag_path = None
+            try:
+                _diag_path = (dict(_gpu_exc.telemetry or {})).get(
+                    "diagnostics_path"
+                )
+            except Exception:
+                _diag_path = None
             _emit(
                 "ZeGrid: R55-E2 ACTIVE GPU RUN failed "
-                f"({_gpu_exc.reason_code}); all GPU buffers/results were "
-                "discarded and cleaned. Retrying the WHOLE batch exactly once "
-                "on CPU from a fresh admission (no mixed result).",
+                f"({_gpu_exc.reason_code}: "
+                f"{_r55_bounded_text(_gpu_exc.detail, 600)}); all GPU "
+                "buffers/results were discarded and cleaned. Retrying the "
+                "WHOLE batch exactly once on CPU from a fresh admission (no "
+                "mixed result). Immediate diagnostics: "
+                f"{_diag_path or 'unavailable'}",
                 lvl="WARN", callback=progress_callback,
             )
             _r55_active_gpu_decision = None
