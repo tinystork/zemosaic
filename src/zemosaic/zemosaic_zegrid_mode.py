@@ -5245,6 +5245,7 @@ def _r55_active_decide(
 _R55E2_GPU_MISSION = "ZM-ZEGRID-R55-E2-ACTIVE-GPU-PREFETCH-20261024"
 _R55E2_PREFETCH_LADDER = (0, 1, 2, 3, 4)
 _R55E2_PREFETCH_DEFAULT = 2
+
 # Finite bound for joining the ASYNC PRODUCER once the pipeline has reached a
 # terminal state (sentinel, error or cancellation). It is NOT a per-unit work
 # budget: the GPU consumer runs on the calling thread, so a healthy cell that
@@ -5252,6 +5253,24 @@ _R55E2_PREFETCH_DEFAULT = 2
 # real RTX 3070 false-timeout witnessed at 15ada5c). A producer still alive
 # after this bound is a genuine stuck thread and fails closed.
 _R55E2_PIPELINE_JOIN_S = 60.0
+
+# R55-E10: SELECTION-TIME VRAM headroom for the ACTIVE GPU streaming tile.
+#
+# R55-E9 derived the ladder top from the full fresh 70 % VRAM budget, so the
+# SELECTED tile filled that budget almost exactly (recorded M106 witness: 1.2 MiB
+# of margin). The device workspace is only an ESTIMATE (worst-case per-cell bytes
+# over the halo-expanded tile area plus a fixed overhead), free VRAM fluctuates
+# while the CuPy context/allocator warms up, and a miss is not recoverable in
+# place: an OOM forces a whole-batch CPU retry. RUN-time revalidation re-reads
+# fresh free VRAM once the CuPy context is live and saw a ~2 MiB drop on the
+# recorded run, which was enough to reject the razor-edge tile. The selected
+# tile must therefore fit only 85 % of that 70 % budget (~60 % of fresh free
+# VRAM), leaving a real safety margin on every device.
+#
+# This constant bounds SELECTION only. The 70 % qualification, the frozen policy
+# ladder and the RUN-time ``fresh_vram_revalidation`` are unchanged and remain
+# the hard backstop.
+_R55E10_VRAM_SELECTION_HEADROOM_PERCENT = 85
 
 
 class _R55GpuRefused(RuntimeError):
@@ -5329,6 +5348,8 @@ class _R55GpuActiveDecision:
     gpu_tile_max: int = 0
     gpu_tile_ladder: tuple = ()
     gpu_host_bound_by_tile: tuple = ()
+    # R55-E10: the headroom-bounded budget the ladder was pruned against.
+    gpu_selection_budget_bytes: int = 0
 
 
 def _r55_active_gpu_decide(
@@ -5371,6 +5392,11 @@ def _r55_active_gpu_decide(
     policy = zgr.VramPolicy()
     initial = policy.candidate(free, policy.initial_percent)
     budget = int(initial.budget_bytes)
+    # R55-E10: the tile ladder is bounded by a budget that already reserves the
+    # selection headroom. The 70 % policy budget itself is untouched.
+    selection_budget = (
+        budget * _R55E10_VRAM_SELECTION_HEADROOM_PERCENT
+    ) // 100
 
     max_n = 1
     worst_hw = (1, 1)
@@ -5400,15 +5426,15 @@ def _r55_active_gpu_decide(
     # the ladder finite, strictly descending and device-agnostic. The existing
     # scheduler still decides feasibility (host PLAN/margin + device budget)
     # and may only shrink along these declared rungs.
-    gpu_tiles = _r55_active_gpu_tile_ladder(max_tile)
-    if not gpu_tiles:
+    declared_tiles = _r55_active_gpu_tile_ladder(max_tile)
+    if not declared_tiles:
         raise _R55GpuRefused(
             zgr.REASON_REFUSE_VRAM,
             "no GPU streaming tile is >= the minimum tile "
             f"({CPU_STREAMING_TILE_MINIMUM}) within the VRAM-derived maximum "
             f"({max_tile}); refusing rather than extrapolating",
         )
-    device_peaks = {
+    declared_device_peaks = {
         int(t): int(
             zgpu.gpu_tile_workspace_bytes(
                 max_n,
@@ -5417,7 +5443,28 @@ def _r55_active_gpu_decide(
                 3,
             )
         )
-        for t in gpu_tiles
+        for t in declared_tiles
+    }
+    # R55-E10: keep only rungs whose EXACT device workspace fits the headroom
+    # budget. Rungs are never interpolated or resized: the declared ladder is a
+    # pruned subset of the R55-E9 ladder, so the scheduler may still only shrink
+    # along declared rungs and every rung keeps its own exact host/device bounds.
+    gpu_tiles = tuple(
+        int(t)
+        for t in declared_tiles
+        if int(declared_device_peaks[int(t)]) <= int(selection_budget)
+    )
+    if not gpu_tiles:
+        raise _R55GpuRefused(
+            zgr.REASON_REFUSE_VRAM,
+            "no GPU streaming tile leaves the R55-E10 selection headroom "
+            f"({_R55E10_VRAM_SELECTION_HEADROOM_PERCENT}% of the fresh "
+            f"{policy.initial_percent}% VRAM budget = {selection_budget} B) "
+            f"within the VRAM-derived maximum ({max_tile}); refusing rather "
+            "than extrapolating",
+        )
+    device_peaks = {
+        int(t): int(declared_device_peaks[int(t)]) for t in gpu_tiles
     }
     # R55-E8: the GPU host bound is the ADDED streaming peak (baseline already
     # counted once as ``shared_bytes``), never the total that double-counts it.
@@ -5718,6 +5765,7 @@ def _r55_active_gpu_decide(
         worker_trail=tuple(dict(entry) for entry in worker_trail),
         gpu_tile_max=int(max_tile),
         gpu_tile_ladder=tuple(int(t) for t in gpu_tiles),
+        gpu_selection_budget_bytes=int(selection_budget),
         gpu_host_bound_by_tile=tuple(
             (int(t), int(gpu_host_bound_by_tile[int(t)])) for t in gpu_tiles
         ),
@@ -6808,6 +6856,16 @@ def _r55_gpu_tile_decision_dict(decision, mapping, bundle) -> dict:
         },
         "vram_budget_bytes": int(decision.qualification["budget_bytes"]),
         "vram_percent": int(decision.qualification["percent"]),
+        "selection_headroom_percent": int(
+            _R55E10_VRAM_SELECTION_HEADROOM_PERCENT
+        ),
+        "selection_headroom_fraction": (
+            _R55E10_VRAM_SELECTION_HEADROOM_PERCENT / 100.0
+        ),
+        "selection_budget_bytes": int(decision.gpu_selection_budget_bytes),
+        "selected_device_selection_margin_bytes": int(
+            decision.gpu_selection_budget_bytes - device_by_tile[tile]
+        ),
     }
 
 

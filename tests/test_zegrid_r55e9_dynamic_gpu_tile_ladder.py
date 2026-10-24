@@ -11,8 +11,9 @@ used tile128. These tests pin the corrected contract:
   device ceiling.
 * every rung carries its OWN exact device workspace and ADDED host bound; maps
   are complete and are never interpolated or reused across tiles;
-* the recorded Windows M106 facts select tile 506 (prefetch 0) only because the
-  existing scheduler says it is jointly feasible under B_plan and the fresh 70 %
+* the recorded Windows M106 facts select tile 448 (prefetch 1): R55-E10 prunes
+  the razor-edge 506 rung to reserve selection headroom, while the existing
+  scheduler still bounds the plan under B_plan and the UNCHANGED fresh 70 %
   VRAM budget — no performance claim is made;
 * small/large synthetic device budgets behave monotonically, and small-VRAM
   cases refuse honestly instead of extrapolating;
@@ -64,18 +65,25 @@ WITNESS_HALO = 128
 WITNESS_VRAM_BUDGET = 5224634777  # floor(free * 70 / 100)
 
 # Exact R55-E9 model outcomes (bytes/px), used as equality assertions.
-WITNESS_MAX_TILE = 506
+WITNESS_MAX_TILE = 506  # unfiltered E9 maximum from the fresh 70 % budget
 WITNESS_LADDER = (506, 448, 384, 320, 256, 192, 128, 112, 96, 80, 64, 48, 32)
-WITNESS_SELECTED_TILE = 506
-WITNESS_SELECTED_PREFETCH = 0
+# R55-E10 prunes the declared ladder to rungs whose exact device workspace fits
+# the selection headroom (85 % of the 70 % budget), so the razor-edge 506 rung
+# is no longer selectable.
+WITNESS_DECLARED_LADDER = (
+    448, 384, 320, 256, 192, 128, 112, 96, 80, 64, 48, 32
+)
+WITNESS_SELECTION_BUDGET = 4440939560  # floor(5224634777 * 85 / 100)
+WITNESS_SELECTED_TILE = 448
+WITNESS_SELECTED_PREFETCH = 1
 WITNESS_SELECTED_WORKERS = 14
 WITNESS_SHARED = 356515840
-WITNESS_ADDED_506 = 6795085824
-WITNESS_HOST_506 = 7151601664
-WITNESS_DEVICE_506 = 5223334912
+WITNESS_ADDED_448 = 5942398976
+WITNESS_HOST_448 = 8160201936
+WITNESS_DEVICE_448 = 4131895552
 WITNESS_AGGREGATE_HOST = 10305433931
-WITNESS_AGGREGATE_DEVICE = 5223334912
-WITNESS_ENVELOPE_AGGREGATE = 7508117504
+WITNESS_AGGREGATE_DEVICE = 4131895552
+WITNESS_ENVELOPE_AGGREGATE = 6655430656
 
 # Canonical CPU tail (unchanged by R55-E9).
 CPU_TAIL = (128, 112, 96, 80, 64, 48, 32)
@@ -218,10 +226,14 @@ def test_e9_windows_m106_witness_uses_the_vram_max_tile(m106):
     assert decision.facts["layout"] == (2, 2)
     assert decision.facts["halo_px"] == WITNESS_HALO
     assert int(decision.gpu_tile_max) == WITNESS_MAX_TILE
-    assert tuple(int(t) for t in decision.gpu_tile_ladder) == WITNESS_LADDER
+    assert (
+        tuple(int(t) for t in decision.gpu_tile_ladder)
+        == WITNESS_DECLARED_LADDER
+    )
+    assert int(decision.gpu_selection_budget_bytes) == WITNESS_SELECTION_BUDGET
     # Meaningful intermediates strictly above the old cap, plus the canonical tail.
     assert [t for t in decision.gpu_tile_ladder if t > 128] == [
-        506, 448, 384, 320, 256, 192
+        448, 384, 320, 256, 192
     ]
     assert tuple(decision.gpu_tile_ladder[-len(CPU_TAIL):]) == CPU_TAIL
 
@@ -240,7 +252,7 @@ def test_e9_windows_m106_witness_uses_the_vram_max_tile(m106):
             int(zz._estimate_streaming_bytes(WITNESS_FRAMES, WITNESS_PATCH_HW, t))
             - int(zz.rcontract.PROCESS_BASELINE_BYTES),
         )
-        for t in WITNESS_LADDER
+        for t in WITNESS_DECLARED_LADDER
     }
     assert dict(decision.device_peak_bytes_by_tile) == {
         t: int(
@@ -251,19 +263,17 @@ def test_e9_windows_m106_witness_uses_the_vram_max_tile(m106):
                 3,
             )
         )
-        for t in WITNESS_LADDER
+        for t in WITNESS_DECLARED_LADDER
     }
 
     chosen = decision.plan_set.chosen
     assert chosen.tile_px == WITNESS_SELECTED_TILE
     assert chosen.prefetch_units == WITNESS_SELECTED_PREFETCH
     assert chosen.units_in_flight == 1
-    assert chosen.host_peak_bytes == WITNESS_HOST_506 == (
-        WITNESS_SHARED + WITNESS_ADDED_506
-    )
-    assert chosen.device_peak_bytes == WITNESS_DEVICE_506
+    assert chosen.host_peak_bytes == WITNESS_HOST_448
+    assert chosen.device_peak_bytes == WITNESS_DEVICE_448
     assert dict(decision.gpu_host_bound_by_tile)[WITNESS_SELECTED_TILE] == (
-        WITNESS_ADDED_506
+        WITNESS_ADDED_448
     )
 
     # Host margin is applied exactly ONCE at the plan boundary.
@@ -628,13 +638,13 @@ def test_e9_diagnostics_report_exact_tile_and_peaks(m106):
     )
     block = zz._r55_gpu_tile_decision_dict(decision, decision.mapping, applied)
     assert block["max_tile_px"] == WITNESS_MAX_TILE
-    assert block["declared_ladder"] == list(WITNESS_LADDER)
+    assert block["declared_ladder"] == list(WITNESS_DECLARED_LADDER)
     assert block["selected_tile_px"] == WITNESS_SELECTED_TILE
     assert block["selected_prefetch_units"] == WITNESS_SELECTED_PREFETCH
-    assert block["selected_host_added_bound_bytes"] == WITNESS_ADDED_506
+    assert block["selected_host_added_bound_bytes"] == WITNESS_ADDED_448
     assert block["selected_host_aggregate_bytes"] == WITNESS_ENVELOPE_AGGREGATE
-    assert block["selected_device_peak_bytes"] == WITNESS_DEVICE_506
-    assert block["device_peak_bytes_by_tile"]["506"] == WITNESS_DEVICE_506
-    assert block["host_added_bound_bytes_by_tile"]["506"] == WITNESS_ADDED_506
+    assert block["selected_device_peak_bytes"] == WITNESS_DEVICE_448
+    assert block["device_peak_bytes_by_tile"]["448"] == WITNESS_DEVICE_448
+    assert block["host_added_bound_bytes_by_tile"]["448"] == WITNESS_ADDED_448
     assert block["vram_budget_bytes"] == WITNESS_VRAM_BUDGET
     assert block["vram_percent"] == 70

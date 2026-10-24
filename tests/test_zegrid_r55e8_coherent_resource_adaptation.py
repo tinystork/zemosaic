@@ -149,10 +149,12 @@ def _active_cpu_decide(m106, bundle, *, halo, cpu):
 @pytest.mark.parametrize(
     "free_gib,expected_tile,expected_prefetch",
     [
-        # R55-E9: the ACTIVE GPU tile is the VRAM-derived maximum, not max128.
-        (2, 262, 1),
-        (4, 379, 1),
-        (7, 507, 0),
+        # R55-E10: the ACTIVE GPU tile is the VRAM-derived maximum PRUNED to the
+        # selection headroom (85 % of the fresh 70 % budget), never max128 and
+        # never the razor-edge top rung.
+        (2, 192, 2),
+        (4, 320, 1),
+        (7, 448, 0),
     ],
 )
 def test_gate_a_windows_automatic_gauge_and_gpu_plan(
