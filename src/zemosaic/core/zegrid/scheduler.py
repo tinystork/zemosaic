@@ -391,6 +391,12 @@ class PlanContext:
     observation_source: str = "plan.available_bytes"
     run_id: str = ""
     pinned: bool = False
+    # R55-E7: explicit per-tile host streaming bound. When supplied, EVERY
+    # tile candidate uses its own exact integer bound; the static
+    # ``per_unit_stack_bytes`` is never substituted for another tile. ``None``
+    # (the default) preserves the historical static-bound behavior byte for
+    # byte for every existing caller.
+    per_tile_stack_bytes: object | None = None
 
     @property
     def patch_area_px(self) -> int:
@@ -407,6 +413,13 @@ class PlanContext:
             halo_px=int(self.halo_px),
             refinement_rank=int(self.refinement_rank),
         )
+
+    @property
+    def per_tile_stack_map(self) -> dict[int, int] | None:
+        """Normalized per-tile host bound, or ``None`` for the static path."""
+        if self.per_tile_stack_bytes is None:
+            return None
+        return _normalize_per_tile_stack_bytes(self.per_tile_stack_bytes)
 
 
 @dataclass(frozen=True)
@@ -701,6 +714,81 @@ def _validate_context(context: PlanContext, *, allow_gpu: bool = False) -> None:
                 f"profile backend {context.profile.backend!r} != context backend "
                 f"{context.backend!r}"
             )
+    per_tile = context.per_tile_stack_map
+    if per_tile is not None:
+        if context.profile is not None:
+            raise SchedulerConfigError(
+                "per_tile_stack_bytes and a calibrated profile are mutually "
+                "exclusive host models (contradictory bounds)"
+            )
+        if context.phase == PHASE_CELL_STACK_INMEM:
+            raise SchedulerConfigError(
+                "per_tile_stack_bytes is only valid for a streaming stack "
+                "phase, not cell_stack_inmem"
+            )
+        declared = tuple(int(tile) for tile in context.tile_ladder)
+        missing = sorted(set(declared) - set(per_tile))
+        extra = sorted(set(per_tile) - set(declared))
+        if missing:
+            raise SchedulerConfigError(
+                "per_tile_stack_bytes is incomplete; missing declared "
+                f"tile(s) {missing}"
+            )
+        if extra:
+            raise SchedulerConfigError(
+                "per_tile_stack_bytes declares tile(s) outside the ladder: "
+                f"{extra}"
+            )
+
+
+def _normalize_per_tile_stack_bytes(value) -> dict[int, int]:
+    """Strictly normalize an explicit per-tile host-bound map.
+
+    Accepts a mapping or a sequence of ``(tile_px, bytes)`` pairs. Rejects
+    bool/float/negative entries, malformed pairs, empty maps, duplicates and
+    contradictory duplicate keys. Never guesses or fills a missing tile.
+    """
+    if isinstance(value, Mapping):
+        items = tuple(value.items())
+    elif isinstance(value, (tuple, list)):
+        items = tuple(value)
+    else:
+        raise SchedulerConfigError(
+            "per_tile_stack_bytes must be a mapping or a sequence of "
+            f"(tile_px, bytes) pairs, got {type(value).__name__}"
+        )
+    out: dict[int, int] = {}
+    for index, item in enumerate(items):
+        if (
+            isinstance(item, (str, bytes))
+            or not isinstance(item, (tuple, list))
+            or len(item) != 2
+        ):
+            raise SchedulerConfigError(
+                "per_tile_stack_bytes entries must be (tile_px, bytes) "
+                f"pairs, got {item!r} at index {index}"
+            )
+        tile = _joint_int(
+            item[0],
+            f"per_tile_stack_bytes[{index}].tile_px",
+            minimum=MIN_TILE_PX,
+        )
+        bound = _joint_int(
+            item[1],
+            f"per_tile_stack_bytes[{index}].bytes",
+            minimum=1,
+        )
+        if tile in out:
+            raise SchedulerConfigError(
+                "per_tile_stack_bytes contains a duplicate/contradictory "
+                f"tile {tile}"
+            )
+        out[tile] = bound
+    if not out:
+        raise SchedulerConfigError(
+            "per_tile_stack_bytes must declare at least one tile"
+        )
+    return dict(sorted(out.items()))
 
 
 def _candidate_stack_bytes(
@@ -712,7 +800,23 @@ def _candidate_stack_bytes(
     tile. Outside ``valid_ranges`` the scheduler never extrapolates: it uses the
     caller's declared static bound and marks the candidate ``R55_UNCALIBRATED``
     (the caller then makes the out-of-range candidate ineligible).
+
+    R55-E7: when the context supplies an explicit per-tile host-bound map, the
+    candidate for that tile uses EXACTLY its own integer bound. The static
+    minimum/maximum/another tile's bound is never substituted.
     """
+    per_tile = context.per_tile_stack_map
+    if per_tile is not None:
+        if tile_px is None:
+            raise SchedulerConfigError(
+                "per_tile_stack_bytes requires a streaming tile candidate"
+            )
+        tile = int(tile_px)
+        if tile not in per_tile:
+            raise SchedulerConfigError(
+                f"per_tile_stack_bytes has no bound for tile {tile}"
+            )
+        return int(per_tile[tile]), "static_bound", None
     if context.profile is None or not calibrated:
         return int(context.per_unit_stack_bytes), "static_bound", None
     assert tile_px is not None
@@ -1637,6 +1741,132 @@ def _joint_no_winner_reason(
     )
 
 
+def gpu_exhaustion_reason(
+    joint: JointPlanInput,
+    candidates: Sequence[Candidate] | None = None,
+) -> tuple[str, str, dict]:
+    """Classify WHY no GPU candidate is feasible, truthfully and deterministically.
+
+    The backend-level :func:`joint_refusal_trail` only says the GPU context is
+    *eligible*; it cannot distinguish host exhaustion from device exhaustion.
+    This helper derives the closed reason from the enumerated GPU candidates
+    themselves. Host-only exhaustion reports ``R55_REFUSE_HOST_RAM`` with the
+    quantitative budget/peak evidence; genuine device exhaustion reports
+    ``R55_REFUSE_VRAM``; disk-only and calibration-only cases keep their own
+    truthful codes. A mixed set with no single universal constraint falls back
+    to ``R55_REFUSE_HOST_RAM`` (the conservative closed default) but retains the
+    per-reason counts in the evidence.
+    """
+    gpu = joint.gpu_context
+    facts = joint.gpu_facts
+    if gpu is None:
+        return REASON_DEFAULT_OFF, "no GPU PlanContext supplied", {}
+    if facts is None:
+        raise SchedulerConfigError("GPU context without gpu_facts")
+    blocked = _gpu_blocking_refusal(joint)
+    if blocked is not None:
+        return blocked.reason_code, blocked.detail, {}
+    if candidates is None:
+        candidates = _enumerate_gpu_candidates(joint)
+    gpu_candidates = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.backend == BACKEND_GPU
+    )
+    if not gpu_candidates:
+        return (
+            REASON_REFUSE_HOST_RAM,
+            "GPU enumeration produced no candidate for the declared ladder",
+            {"gpu_candidate_count": 0},
+        )
+    counts: dict[str, int] = {}
+    for candidate in gpu_candidates:
+        counts[candidate.reason_code] = counts.get(candidate.reason_code, 0) + 1
+    reasons = set(counts)
+
+    disk_cap = (
+        int(gpu.disk_free_bytes) * int(gpu.disk_fraction_num)
+    ) // int(gpu.disk_fraction_den)
+    vram_budget = int(facts.vram_budget_bytes)
+    host_margined = [
+        int(ceil_margin_div(
+            int(candidate.host_peak_bytes),
+            int(gpu.margin_num),
+            int(gpu.margin_den),
+        ))
+        for candidate in gpu_candidates
+    ]
+    all_host = all(
+        peak > int(gpu.budget_bytes) for peak in host_margined
+    )
+    all_device = all(
+        int(candidate.device_peak_bytes) > vram_budget
+        for candidate in gpu_candidates
+    )
+    all_disk = all(
+        int(candidate.disk_bytes) > disk_cap for candidate in gpu_candidates
+    )
+
+    if reasons == {REASON_REFUSE_HOST_RAM} or all_host:
+        reason = REASON_REFUSE_HOST_RAM
+        detail = (
+            "no feasible ACTIVE GPU candidate: host RAM is exhausted for "
+            f"every GPU candidate ({len(gpu_candidates)} enumerated); "
+            f"minimum margin-applied host peak {min(host_margined)} B > "
+            f"host budget {int(gpu.budget_bytes)} B"
+        )
+    elif (
+        reasons == {REASON_REFUSE_VRAM}
+        or (REASON_REFUSE_VRAM in reasons and reasons <= {REASON_REFUSE_VRAM, REASON_UNCALIBRATED})
+        or all_device
+    ):
+        reason = REASON_REFUSE_VRAM
+        detail = (
+            "no feasible ACTIVE GPU candidate: device VRAM is exhausted for "
+            f"every GPU candidate ({len(gpu_candidates)} enumerated); "
+            "minimum device peak "
+            f"{min(int(c.device_peak_bytes) for c in gpu_candidates)} B > "
+            f"device budget {vram_budget} B"
+        )
+    elif reasons == {REASON_REFUSE_DISK} or all_disk:
+        reason = REASON_REFUSE_DISK
+        detail = (
+            "no feasible ACTIVE GPU candidate: disk residency is exhausted "
+            f"for every GPU candidate ({len(gpu_candidates)} enumerated); "
+            "minimum disk residency "
+            f"{min(int(c.disk_bytes) for c in gpu_candidates)} B > "
+            f"disk cap {disk_cap} B"
+        )
+    elif reasons == {REASON_UNCALIBRATED}:
+        reason = REASON_UNCALIBRATED
+        detail = (
+            "no feasible ACTIVE GPU candidate: every candidate is outside "
+            "the declared calibration range"
+        )
+    else:
+        reason = REASON_REFUSE_HOST_RAM
+        detail = (
+            "no feasible ACTIVE GPU candidate: mixed hard-constraint "
+            f"exhaustion over {len(gpu_candidates)} candidates "
+            f"{dict(sorted(counts.items()))}"
+        )
+    evidence = {
+        "gpu_candidate_count": len(gpu_candidates),
+        "gpu_candidate_reason_counts": dict(sorted(counts.items())),
+        "host_budget_bytes": int(gpu.budget_bytes),
+        "host_min_margin_applied_peak_bytes": int(min(host_margined)),
+        "device_budget_bytes": int(vram_budget),
+        "device_min_peak_bytes": int(
+            min(int(c.device_peak_bytes) for c in gpu_candidates)
+        ),
+        "disk_cap_bytes": int(disk_cap),
+        "disk_min_bytes": int(
+            min(int(c.disk_bytes) for c in gpu_candidates)
+        ),
+    }
+    return reason, detail, evidence
+
+
 def select_joint_candidate(
     joint: JointPlanInput,
     *,
@@ -1697,21 +1927,17 @@ def _bound(context: PlanContext, method: str) -> BoundEnvelope:
 
 
 def _stack_envelope(context: PlanContext, candidate: Candidate) -> ResourceEnvelope:
+    per_unit, _method, _cal_id = _candidate_stack_bytes(
+        context,
+        candidate.tile_px,
+        calibrated=(candidate.estimate_method == "calibrated"),
+    )
     components = {
         "prefetch_residency_bytes": (
             int(candidate.prefetch_units) * int(context.per_unit_prefetch_bytes)
         ),
         "shared_bytes": int(context.shared_bytes),
-        "stack_in_flight_bytes": (
-            int(candidate.units_in_flight) * int(context.per_unit_stack_bytes)
-            if candidate.estimate_method == "static_bound"
-            else int(candidate.units_in_flight)
-            * _candidate_stack_bytes(
-                context,
-                candidate.tile_px,
-                calibrated=(candidate.estimate_method == "calibrated"),
-            )[0]
-        ),
+        "stack_in_flight_bytes": int(candidate.units_in_flight) * int(per_unit),
     }
     estimate = make_estimate(
         components,
@@ -2521,6 +2747,21 @@ def _joint_context_payload(context: PlanContext) -> dict:
         "per_unit_stack_bytes": int(context.per_unit_stack_bytes),
         "per_unit_cache_bytes": int(context.per_unit_cache_bytes),
         "per_unit_prefetch_bytes": int(context.per_unit_prefetch_bytes),
+        # R55-E7: only emitted when the caller supplied the explicit per-tile
+        # host contract, so every existing (static-bound) payload/hash is
+        # byte-identical.
+        **(
+            {}
+            if context.per_tile_stack_bytes is None
+            else {
+                "per_tile_stack_bytes": [
+                    [int(tile), int(bound)]
+                    for tile, bound in sorted(
+                        context.per_tile_stack_map.items()
+                    )
+                ]
+            }
+        ),
         "disk_free_bytes": int(context.disk_free_bytes),
         "disk_fraction_num": int(context.disk_fraction_num),
         "disk_fraction_den": int(context.disk_fraction_den),

@@ -4972,12 +4972,10 @@ def _r55_active_gpu_decide(
         )
         for t in gpu_tiles
     }
-    gpu_stack_worst = int(
-        max(
-            _estimate_streaming_bytes(max_n, worst_hw, int(t))
-            for t in gpu_tiles
-        )
-    )
+    gpu_host_bound_by_tile = {
+        int(t): int(_estimate_streaming_bytes(max_n, worst_hw, int(t)))
+        for t in gpu_tiles
+    }
 
     qualification = zgr.qualify_gpu_execution(
         requested=True,
@@ -5018,7 +5016,15 @@ def _r55_active_gpu_decide(
         backend=zsched.BACKEND_GPU,
         tile_ladder=tuple(int(t) for t in gpu_tiles),
         prefetch_ladder=tuple(int(p) for p in _R55E2_PREFETCH_LADDER),
-        per_unit_stack_bytes=int(gpu_stack_worst),
+        # R55-E7: ``per_unit_stack_bytes`` is a schema-required placeholder
+        # only; the explicit per-tile map below is the SOLE host bound every
+        # candidate consults. An incomplete/extra map is rejected by the
+        # scheduler, so there is no static fallback for a GPU tile.
+        per_unit_stack_bytes=int(gpu_host_bound_by_tile[int(max_tile)]),
+        per_tile_stack_bytes=tuple(
+            (int(t), int(gpu_host_bound_by_tile[int(t)]))
+            for t in gpu_tiles
+        ),
         per_unit_prefetch_bytes=int(base["per_unit_cache"]),
         time_model=None,
         profile=None,
@@ -5047,19 +5053,25 @@ def _r55_active_gpu_decide(
     ]
     if not feasible_gpu:
         trail = zsched.joint_refusal_trail(joint)
-        reason = next(
-            (
-                entry.reason_code for entry in trail
-                if entry.backend == zsched.BACKEND_GPU
-                and entry.reason_code != zsched.REASON_OK
-            ),
-            renv.REASON_REFUSE_VRAM,
+        reason, detail, exhaustion = zsched.gpu_exhaustion_reason(
+            joint, enumerated
         )
         raise _R55GpuRefused(
             reason,
-            "no feasible ACTIVE GPU candidate exists under the fresh VRAM "
-            "budget and the frozen identity",
-            record={"refusal_trail": [e.to_dict() for e in trail]},
+            detail,
+            record={
+                "refusal_trail": [e.to_dict() for e in trail],
+                "gpu_exhaustion": dict(exhaustion),
+                "gpu_host_bound_bytes_by_tile": {
+                    int(t): int(gpu_host_bound_by_tile[int(t)])
+                    for t in gpu_tiles
+                },
+                "device_peak_bytes_by_tile": {
+                    int(t): int(device_peaks[int(t)]) for t in gpu_tiles
+                },
+                "b_plan_bytes": int(bundle.envelope.budget_bytes),
+                "vram_budget_bytes": int(budget),
+            },
         )
     target = min(
         _R55E2_PREFETCH_DEFAULT,
