@@ -10,7 +10,9 @@ and RTX remain **unqualified** until a real result is imported and reviewed.
 - Windows 10/11 x64, ZeMosaic beta build (CPU-only build is supported).
 - Optional GPU run: NVIDIA GPU (e.g. RTX 3070) with a current driver, plus a
   ZeMosaic build that includes the optional CuPy extra. CuPy is never a base
-  dependency and is not required for CPU runs.
+  dependency and is not required for CPU runs. If CuPy is installed, the
+  historical `parallel_utils` module may import it even on a CPU run; that is
+  pre-existing and does not by itself activate GPU execution.
 - A bounded corpus: roughly 8–30 FITS frames with a small canvas. Do not start
   with a full night or a multi-gigabyte dataset.
 - Free disk for outputs, cache and logs. Close other GPU-heavy applications.

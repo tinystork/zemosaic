@@ -8,10 +8,14 @@ Acceptance coverage:
 * GUI -> config/handoff -> worker -> ``run_zegrid_mode`` propagates the token
   without remapping, and every kwargs crossing the worker boundary is either
   accepted or explicitly filtered;
-* the CPU matrix never imports CuPy; active+GPU reaches the E2 pipeline;
-  missing CuPy/device refuses or degrades honestly (no silent crash);
+* CPU legacy/observe/active paths trigger no NEW R55 readiness/VRAM probe and
+  no GPU execution call (the historical engine startup probe is unchanged);
+  active+GPU reaches the E2 pipeline; missing CuPy/device refuses or degrades
+  honestly (no silent crash);
 * the spawn/thread lifecycle is hermetic and never requires ``fork``;
-* packaging keeps CuPy optional, ships every R55 module, and imports CPU-only;
+* packaging keeps CuPy optional, ships every R55 module, and starts CPU-only
+  with CuPy genuinely unavailable (historical CuPy import when installed is
+  pre-existing and is not claimed otherwise);
 * the E3 evidence is byte-deterministic with a standard ``sha256sum -c``
   sidecar, and the Windows checker is fail-closed and read-only.
 
@@ -38,8 +42,13 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
+TESTS_DIR = REPO_ROOT / "tests"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+from _r55e3_spawn_probe import probe as _spawn_engine_probe  # noqa: E402
 
 from zemosaic import zemosaic_config  # noqa: E402
 from zemosaic import zemosaic_worker as zw  # noqa: E402
@@ -443,17 +452,50 @@ def test_b_absent_token_keeps_legacy_default():
 # C. CPU/GPU matrix and honest CuPy/device absence
 # ---------------------------------------------------------------------------
 
-def test_c_cpu_matrix_is_byte_identical_and_never_imports_cupy(
+def test_c_cpu_matrix_is_byte_identical_and_triggers_no_r55_gpu_work(
     routine_input, legacy_run, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: 12 * GIB)
-    assert "cupy" not in sys.modules
+
+    # The historical engine startup probe is pre-existing; this test proves the
+    # R55/E3 CPU paths add no NEW readiness/VRAM probe and no GPU execution.
+    probe_calls = {"readiness": 0, "vram": 0}
+    real_readiness = zz.zgr.probe_gpu_readiness_safe
+
+    def readiness_probe(**kwargs):
+        probe_calls["readiness"] += 1
+        return real_readiness(**kwargs)
+
+    def vram_probe(device_index=0):
+        probe_calls["vram"] += 1
+        raise AssertionError("R55 VRAM probe must not run on a CPU path")
+
+    monkeypatch.setattr(zz.zgr, "probe_gpu_readiness_safe", readiness_probe)
+    monkeypatch.setattr(zz.zgr, "read_vram_free_bytes", vram_probe)
+
+    real_consume = zz._consume_stack_cell
+
+    def assert_cpu_consume(prepared):
+        if isinstance(prepared, dict) and "empty_result" in prepared:
+            return real_consume(prepared)
+        assert getattr(zz._STACK_CONFIG, "backend", "cpu") == "cpu"
+        return real_consume(prepared)
+
+    monkeypatch.setattr(zz, "_consume_stack_cell", assert_cpu_consume)
 
     outputs = {}
     for mode in ("observe", "active"):
+        before = dict(probe_calls)
         out = tmp_path / mode
         _run_engine(routine_input, out, mode)
         outputs[mode] = out
+        delta_readiness = probe_calls["readiness"] - before["readiness"]
+        delta_vram = probe_calls["vram"] - before["vram"]
+        # Observe records one readiness snapshot by design (R55-C); active CPU
+        # must not probe readiness at all. Neither may probe VRAM.
+        assert delta_readiness == (1 if mode == "observe" else 0)
+        assert delta_vram == 0
+
         block = _manifest(out)["r55_scheduler"]
         if mode == "observe":
             assert block["mode"] == "observe_only"
@@ -465,8 +507,31 @@ def test_c_cpu_matrix_is_byte_identical_and_never_imports_cupy(
         for name in FITS_NAMES:
             assert _digest(out / name) == _digest(legacy_run / name), name
 
-    assert "cupy" not in sys.modules
     assert _manifest(outputs["active"])["gpu"]["actually_used"] is False
+
+
+def test_c_cpu_path_is_independent_of_a_preexisting_cupy_module(
+    routine_input, legacy_run, tmp_path, monkeypatch
+):
+    """Regression for the old order-dependent ``cupy not in sys.modules`` claim.
+
+    A product environment with CuPy installed may already have it imported
+    (historical ``parallel_utils`` behaviour). The CPU path must still be exact
+    and must not execute GPU work.
+    """
+    import types
+
+    monkeypatch.setitem(sys.modules, "cupy", types.ModuleType("cupy"))
+    _fake_gpu_missing(monkeypatch)
+    out = tmp_path / "active_with_cupy_preloaded"
+    _run_engine(routine_input, out, "active", use_gpu=True)
+    manifest = _manifest(out)
+    assert manifest["gpu"]["requested"] is True
+    assert manifest["gpu"]["available"] is False
+    assert manifest["gpu"]["actually_used"] is False
+    assert manifest["gpu"]["final_backend"] == "cpu"
+    for name in FITS_NAMES:
+        assert _digest(out / name) == _digest(legacy_run / name), name
 
 
 def test_c_active_gpu_reaches_the_e2_pipeline(
@@ -530,29 +595,6 @@ def test_c_missing_cupy_or_device_degrades_honestly(
 # D. Windows / spawn / thread lifecycle (hermetic)
 # ---------------------------------------------------------------------------
 
-def _spawn_engine_probe(queue):
-    import multiprocessing as mp
-
-    result = {
-        "start_method": mp.get_start_method(),
-        "cupy_imported": "cupy" in sys.modules,
-        "tokens": [],
-    }
-    from zemosaic import zemosaic_zegrid_mode as child_zz
-    from zemosaic.core.zegrid import scheduler as child_zs
-
-    for token in child_zs.MODES:
-        result["tokens"].append(child_zs.normalize_scheduler_mode(token))
-    try:
-        child_zs.normalize_scheduler_mode("BOGUS")
-    except child_zs.InvalidSchedulerMode:
-        result["invalid_refused"] = True
-    else:
-        result["invalid_refused"] = False
-    result["cupy_imported_after_import"] = "cupy" in sys.modules
-    queue.put(result)
-
-
 def test_d_spawn_path_imports_engine_without_cupy_or_fork():
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
@@ -564,8 +606,8 @@ def test_d_spawn_path_imports_engine_without_cupy_or_fork():
     assert result["start_method"] == "spawn"
     assert result["tokens"] == list(zsched.MODES)
     assert result["invalid_refused"] is True
-    assert result["cupy_imported"] is False
-    assert result["cupy_imported_after_import"] is False
+    assert result["cupy_after_r55_import"] is False
+    assert result["engine_import_ok"] is True
 
 
 def test_d_pipeline_threads_join_on_every_run():
@@ -709,15 +751,24 @@ def _imported_modules(path: Path, root: Path) -> set[str]:
 
 
 def test_e_r55_modules_are_discoverable_and_shipped_by_packaging_rules():
-    from setuptools import find_packages
+    """Read the packaging RULES without importing setuptools at test runtime.
 
-    packages = set(find_packages(where=str(SRC), include=["zemosaic*"]))
-    assert "zemosaic.core.zegrid" in packages
+    ``setuptools`` is a build-system dependency, not a runtime dependency; the
+    product venv intentionally does not provide it.
+    """
+    import tomllib
+
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    find_cfg = payload["tool"]["setuptools"]["packages"]["find"]
+    assert find_cfg["where"] == ["src"]
+    assert "zemosaic*" in find_cfg["include"]
+    assert "locales/*.json" in payload["tool"]["setuptools"]["package-data"]["zemosaic"]
+
+    # Every R55 package has a package marker and every module sits under it, so
+    # the declared ``zemosaic*`` discovery rule ships it in a wheel.
+    assert (SRC / "zemosaic/core/zegrid/__init__.py").is_file()
     for path in sorted((SRC / "zemosaic/core/zegrid").glob("*.py")):
-        if path.name == "__init__.py":
-            continue
-        module = _module_name(path, SRC)
-        assert module in packages or "zemosaic.core.zegrid" in packages
+        assert path.is_file()
     assert (SRC / "zemosaic/zemosaic_zegrid_mode.py").is_file()
 
 
@@ -793,17 +844,27 @@ def test_e_static_import_closure_covers_lazy_r55_modules_and_keeps_cupy_lazy():
         )
 
 
-def test_e_cpu_only_import_smoke_has_no_cupy_and_no_base_dependency():
+def test_e_cpu_only_import_smoke_with_cupy_genuinely_unavailable():
+    """Hermetic CPU-only start: CuPy is blocked in the child, not merely unused.
+
+    The historical engine import may import CuPy when it IS installed; this test
+    proves the package still starts when it is genuinely unavailable.
+    """
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     base, optional = pyproject.split("[project.optional-dependencies]", 1)
     assert "cupy" not in base.lower().split("dependencies = [", 1)[1]
     assert '"cupy-cuda12x"' in optional
 
     code = (
-        "import sys; import zemosaic.zemosaic_worker, zemosaic.zemosaic_zegrid_mode; "
+        "import sys; "
+        "sys.modules['cupy'] = None; sys.modules['cupyx'] = None; "
+        "import zemosaic._app; "
+        "import zemosaic.zemosaic_worker; "
+        "import zemosaic.zemosaic_zegrid_mode; "
         "from zemosaic.core.zegrid import scheduler, gpu_readiness, parallel; "
-        "assert 'cupy' not in sys.modules, 'cupy imported on CPU-only path'; "
-        "assert scheduler.normalize_scheduler_mode(None) == 'legacy'; print('OK')"
+        "assert scheduler.normalize_scheduler_mode(None) == 'legacy'; "
+        "assert sys.modules.get('cupy') is None; "
+        "print('OK')"
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(SRC)

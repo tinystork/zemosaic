@@ -93,7 +93,11 @@ def _packaging_audit(repo: Path) -> dict:
         "cupy_in_base_dependencies": '"cupy' in base,
         "cupy_optional_extra_declared": '"cupy-cuda12x"' in optional,
         "r55_modules_importable": True,
-        "note": "Verified by the hermetic E3 packaging/import test; CuPy stays optional.",
+        "note": (
+            "R55 modules stay CuPy-lazy and the package starts when CuPy is "
+            "genuinely unavailable. Historical parallel_utils imports CuPy when "
+            "it IS installed; that behaviour is pre-existing and unchanged by E3."
+        ),
     }
 
 
