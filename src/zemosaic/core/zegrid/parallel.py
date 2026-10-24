@@ -1589,26 +1589,48 @@ class BoundedPipeline:
                 self._producer_task_index = None
                 self._producer_task_started_at = None
                 self._last_progress_at = float(self._clock())
-                host_need = _pipeline_int(
-                    self._host_bytes_fn(payload), "host_bytes", minimum=0
-                )
-                device_need = _pipeline_int(
-                    self._device_bytes_fn(payload), "device_bytes", minimum=0
-                )
+                # OWNERSHIP BEGINS HERE. Once ``produce`` returns, the payload
+                # belongs to the pipeline: every path that does NOT hand it to
+                # the consumer (byte-callback failure, host-credit cancel, an
+                # accounting refusal, cancellation detected after a blocked
+                # ``produce`` returns, or a downstream ``_put`` cancel) MUST
+                # release it exactly once. ``_release_unit`` is idempotent, so
+                # the ``_put`` release plus this guard can never double-release.
                 unit = {
                     "index": int(index),
                     "payload": payload,
-                    "host_bytes": int(host_need),
-                    "device_bytes": int(device_need),
+                    "host_bytes": None,
+                    "device_bytes": None,
                     "host_lease": None,
                     "device_lease": None,
                     "released": False,
                 }
-                unit["host_lease"] = self._ledger.reserve(
-                    "host", host_need, cancel_event=self._cancel
-                )
+                # ``units_produced`` counts OWNED payloads (produce returned),
+                # not successful enqueues: every owned payload is released, so
+                # produced == released on any terminal path that finishes.
                 self._produced += 1
-                self._put(unit)
+                if self._cancelled():
+                    self._release_unit(unit)
+                    return
+                try:
+                    host_need = _pipeline_int(
+                        self._host_bytes_fn(payload), "host_bytes", minimum=0
+                    )
+                    device_need = _pipeline_int(
+                        self._device_bytes_fn(payload), "device_bytes", minimum=0
+                    )
+                    unit["host_bytes"] = int(host_need)
+                    unit["device_bytes"] = int(device_need)
+                    unit["host_lease"] = self._ledger.reserve(
+                        "host", host_need, cancel_event=self._cancel
+                    )
+                    self._put(unit)
+                except BaseException:
+                    # Covers host-credit cancellation, accounting refusal and
+                    # byte-callback errors: the payload is ours, release it and
+                    # re-raise so the PRIMARY classification is preserved.
+                    self._release_unit(unit)
+                    raise
             self._put_sentinel()
         except PipelineCancelled:
             return
@@ -1827,7 +1849,15 @@ class BoundedPipeline:
     # -- telemetry ---------------------------------------------------------
 
     def telemetry(self) -> dict:
-        """Truthful observational telemetry (never part of a plan hash)."""
+        """Truthful observational telemetry (never part of a plan hash).
+
+        ``units_produced`` counts payloads the pipeline TOOK OWNERSHIP of (i.e.
+        ``produce`` returned): a produced payload that is cancelled before
+        enqueue or refused by the ledger is included. ``units_released`` counts
+        payloads whose release callback and any leases were reconciled exactly
+        once. On every terminal path that finishes cleanup the two are equal;
+        neither count claims a GPU transfer (``transfers`` does that).
+        """
         ledger = self._ledger.snapshot()
         return {
             "schema": PIPELINE_SCHEMA,

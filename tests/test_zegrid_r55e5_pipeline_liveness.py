@@ -261,6 +261,202 @@ def test_accounting_error_is_not_wrapped_as_a_producer_failure():
 
 
 # ---------------------------------------------------------------------------
+# 3b. Payload ownership: a produced payload is released even before handoff
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_while_waiting_for_host_credit_releases_both_payloads():
+    """REWORK-1 regression: the second payload is owned before its host lease.
+
+    tasks=[1,2], host budget fits exactly one unit. While unit 1 is consumed,
+    the producer stages unit 2 and blocks on host credit; cancelling there must
+    release BOTH payloads exactly once (the pre-rework code leaked unit 2 and
+    reported a balanced ledger because it had no lease).
+    """
+    released: list[int] = []
+    payload2_ready = threading.Event()
+    entered_consume = threading.Event()
+
+    def produce(task):
+        if task == 2:
+            payload2_ready.set()
+        return {"value": int(task)}
+
+    def consume(payload):
+        entered_consume.set()
+        assert payload2_ready.wait(5.0)  # unit 2 is staged and credit-blocked
+        pipe.cancel("host_credit_cancel")
+        return payload["value"]
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[1, 2],
+        produce=produce,
+        consume=consume,
+        release=lambda payload: released.append(payload["value"]),
+        prefetch_units=1,
+        host_budget_bytes=10,
+        device_budget_bytes=64,
+        host_bytes=lambda payload: 10,
+        device_bytes=lambda payload: 8,
+        thread_join_s=1.0,
+    )
+    with pytest.raises(zpar.PipelineCancelled, match="host_credit_cancel"):
+        pipe.run()
+    assert entered_consume.is_set()
+    tel = pipe.telemetry()
+    assert sorted(released) == [1, 2]
+    assert len(released) == len(set(released))  # exactly once each
+    # Ownership semantics: both payloads were produced (owned) and both were
+    # released; the cancel-before-enqueue payload never took a lease.
+    assert tel["units_produced"] == 2
+    assert tel["units_released"] == 2
+    assert tel["ledger"]["host_leases"] == 0
+    assert tel["ledger"]["device_leases"] == 0
+    assert tel["ledger"]["balanced"] is True
+    assert tel["queue_depth_final"] == 0
+    assert tel["threads_joined"] is True
+
+
+def test_host_request_over_budget_releases_payload_and_keeps_accounting_error():
+    """A payload refused by the ledger is still ours and must be released."""
+    released: list[int] = []
+    pipe = zpar.BoundedPipeline(
+        tasks=[5],
+        produce=lambda task: {"value": int(task)},
+        consume=lambda payload: payload["value"],
+        release=lambda payload: released.append(payload["value"]),
+        prefetch_units=0,
+        host_budget_bytes=4,
+        device_budget_bytes=64,
+        host_bytes=lambda payload: 8,
+        device_bytes=lambda payload: 8,
+    )
+    with pytest.raises(zpar.PipelineAccountingError):
+        pipe.run()
+    tel = pipe.telemetry()
+    assert released == [5]
+    assert tel["units_produced"] == 1
+    assert tel["units_released"] == 1
+    assert tel["ledger"]["balanced"] is True
+    assert tel["ledger"]["host_leases"] == 0
+    assert tel["threads_joined"] is True
+
+
+@pytest.mark.parametrize("failing", ["host_bytes", "device_bytes"])
+def test_byte_callback_failure_releases_payload_and_preserves_primary(failing):
+    released: list[int] = []
+
+    def boom(payload):
+        raise ValueError(f"{failing} exploded")
+
+    callbacks = dict(
+        host_bytes=lambda payload: 8,
+        device_bytes=lambda payload: 8,
+    )
+    callbacks[failing] = boom
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[9],
+        produce=lambda task: {"value": int(task)},
+        consume=lambda payload: payload["value"],
+        release=lambda payload: released.append(payload["value"]),
+        prefetch_units=0,
+        host_budget_bytes=64,
+        device_budget_bytes=64,
+        **callbacks,
+    )
+    with pytest.raises(zpar.PipelineError, match="producer failed") as exc:
+        pipe.run()
+    assert isinstance(exc.value.__cause__, ValueError)
+    assert failing in str(exc.value.__cause__)
+    tel = pipe.telemetry()
+    assert released == [9]
+    assert tel["units_produced"] == 1
+    assert tel["units_released"] == 1
+    assert tel["ledger"]["balanced"] is True
+    assert tel["ledger"]["host_leases"] == 0
+    assert tel["threads_joined"] is True
+
+
+def test_cleanup_failure_on_owned_payload_does_not_mask_primary():
+    def rel(payload):
+        raise OSError("cannot remove staged cache")
+
+    def boom(payload):
+        raise ValueError("host bytes exploded")
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[4],
+        produce=lambda task: {"value": int(task)},
+        consume=lambda payload: payload["value"],
+        release=rel,
+        prefetch_units=0,
+        host_budget_bytes=64,
+        device_budget_bytes=64,
+        host_bytes=boom,
+        device_bytes=lambda payload: 8,
+    )
+    with pytest.raises(zpar.PipelineError, match="producer failed") as exc:
+        pipe.run()
+    assert isinstance(exc.value.__cause__, ValueError)
+    tel = pipe.telemetry()
+    assert tel["cleanup_failures"]
+    assert tel["units_produced"] == 1
+    assert tel["units_released"] == 1
+    assert tel["ledger"]["balanced"] is True
+
+
+def test_payload_returned_after_terminal_join_is_released_exactly_once():
+    """A blocked ``produce`` that returns after run() failed must still clean up."""
+    released: list[int] = []
+    gate = threading.Event()
+    produce_entered = threading.Event()
+
+    def produce(task):
+        produce_entered.set()
+        gate.wait(10.0)
+        return {"value": int(task)}
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[3],
+        produce=produce,
+        consume=lambda payload: payload["value"],
+        release=lambda payload: released.append(payload["value"]),
+        prefetch_units=0,
+        host_budget_bytes=64,
+        device_budget_bytes=64,
+        host_bytes=lambda payload: 8,
+        device_bytes=lambda payload: 8,
+        thread_join_s=0.2,
+        stall_timeout_s=0.2,
+    )
+    try:
+        with pytest.raises(zpar.PipelineError, match="no producer progress"):
+            pipe.run()
+        tel = pipe.telemetry()
+        assert tel["producer_alive"] is True
+        assert tel["units_produced"] == 0  # never owned: produce had not returned
+        assert released == []
+    finally:
+        gate.set()
+
+    assert produce_entered.is_set()
+    producer = pipe._producer_thread
+    producer.join(10.0)
+    assert not producer.is_alive()
+
+    tel = pipe.telemetry()
+    assert released == [3]
+    assert tel["units_produced"] == 1
+    assert tel["units_released"] == 1
+    # No orphan: nothing was enqueued or leased after the terminal report.
+    assert tel["queue_depth_final"] == 0
+    assert tel["ledger"]["host_leases"] == 0
+    assert tel["ledger"]["device_leases"] == 0
+    assert tel["ledger"]["balanced"] is True
+
+
+# ---------------------------------------------------------------------------
 # 4. Cancellation stays effective, joins stay finite
 # ---------------------------------------------------------------------------
 
