@@ -90,6 +90,14 @@ __all__ = [
     "revalidate_for_unit",
     "readiness_manifest_dict",
     "canonical_contract_dict",
+    "REASON_GPU_PARITY_NOT_QUALIFIED",
+    "REASON_GPU_PREFETCH_UNBOUNDED",
+    "REASON_GPU_OBSERVATION_FAILED",
+    "REASON_GPU_DEVICE_PEAK_UNKNOWN",
+    "read_vram_free_bytes",
+    "GpuQualification",
+    "qualify_gpu_execution",
+    "fresh_vram_revalidation",
 ]
 
 SCHEMA = "zemosaic-r55-gpu-readiness-v1"
@@ -136,6 +144,11 @@ REASON_VRAM_SHRINK = "R55_VRAM_SHRINK"
 REASON_GPU_FALLBACK_PRE = "R55_GPU_FALLBACK_PRE"
 REASON_REFUSE_VRAM = "R55_REFUSE_VRAM"
 REASON_VRAM_GROWTH_REJECTED = "R55_VRAM_GROWTH_REJECTED"
+# R55-E2 — GPU ACTIVE execution qualification / fresh revalidation.
+REASON_GPU_PARITY_NOT_QUALIFIED = "R55_GPU_PARITY_NOT_QUALIFIED"
+REASON_GPU_PREFETCH_UNBOUNDED = "R55_GPU_PREFETCH_UNBOUNDED"
+REASON_GPU_OBSERVATION_FAILED = "R55_GPU_OBSERVATION_FAILED"
+REASON_GPU_DEVICE_PEAK_UNKNOWN = "R55_GPU_DEVICE_PEAK_UNKNOWN"
 
 REASONS = frozenset(
     {
@@ -153,6 +166,10 @@ REASONS = frozenset(
         REASON_GPU_FALLBACK_PRE,
         REASON_REFUSE_VRAM,
         REASON_VRAM_GROWTH_REJECTED,
+        REASON_GPU_PARITY_NOT_QUALIFIED,
+        REASON_GPU_PREFETCH_UNBOUNDED,
+        REASON_GPU_OBSERVATION_FAILED,
+        REASON_GPU_DEVICE_PEAK_UNKNOWN,
     }
 )
 
@@ -943,6 +960,256 @@ def revalidate_for_unit(
         budget_bytes=None,
         free_bytes=free,
         reason_code=REASON_REFUSE_VRAM,
+    )
+
+
+# ---------------------------------------------------------------------------
+# R55-E2 — ACTIVE GPU execution qualification + fresh observation
+# ---------------------------------------------------------------------------
+
+
+def read_vram_free_bytes(device_index: int = 0) -> int:
+    """Fresh, strict free-VRAM observation (lazy CuPy import, never cached).
+
+    Raises :class:`InvalidVramObservation` with a closed reason on any failure.
+    Importing this module never imports CuPy; only an explicit call does.
+    """
+    if isinstance(device_index, bool) or not isinstance(device_index, int):
+        raise InvalidVramObservation(
+            f"device_index must be a plain int, got {device_index!r}"
+        )
+    if int(device_index) < 0:
+        raise InvalidVramObservation("device_index must be >= 0")
+    try:
+        import cupy as _cp  # noqa: PLC0415 - lazy by contract
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise InvalidVramObservation(
+            f"{REASON_GPU_DEP_UNIMPORTABLE}: {type(exc).__name__}"
+        ) from exc
+    try:
+        with _cp.cuda.Device(int(device_index)):
+            free_bytes, total_bytes = _cp.cuda.runtime.memGetInfo()
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise InvalidVramObservation(
+            f"{REASON_GPU_OBSERVATION_FAILED}: {type(exc).__name__}"
+        ) from exc
+    free = _require_plain_int(int(free_bytes), "vram_free_bytes")
+    total = _require_plain_int(int(total_bytes), "vram_total_bytes")
+    if free > total:
+        raise InvalidVramObservation(
+            f"vram_free_bytes {free} > vram_total_bytes {total}"
+        )
+    return int(free)
+
+
+@dataclass(frozen=True)
+class GpuQualification:
+    """Closed qualification of ONE active GPU candidate for execution.
+
+    ``qualified`` is True ONLY for an explicitly requested, usable, parity
+    qualified device with a positive explicit device peak that fits the current
+    VRAM policy budget, a bounded prefetch depth and K == 1.
+    """
+
+    qualified: bool
+    reason_code: str
+    detail: str
+    free_bytes: int
+    budget_bytes: int | None
+    percent: int | None
+    prefetch_units: int
+    queue_max: int
+    units_in_flight: int
+    device_peak_bytes: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.qualified, bool):
+            raise GpuReadinessError("qualified must be a bool")
+        if self.reason_code not in REASONS:
+            raise GpuReadinessError(
+                f"unknown reason code {self.reason_code!r}"
+            )
+        if not isinstance(self.detail, str) or not self.detail:
+            raise GpuReadinessError("detail must be a non-empty string")
+        _require_plain_int(self.free_bytes, "free_bytes")
+        if self.budget_bytes is not None:
+            _require_plain_int(self.budget_bytes, "budget_bytes")
+        _require_plain_int(self.prefetch_units, "prefetch_units")
+        _require_plain_int(self.queue_max, "queue_max", minimum=1)
+        _require_plain_int(self.units_in_flight, "units_in_flight", minimum=1)
+        if self.qualified:
+            if self.reason_code != REASON_VRAM_CANDIDATE_OK:
+                raise GpuReadinessError(
+                    "a qualified GPU must carry R55_VRAM_CANDIDATE_OK"
+                )
+            if self.budget_bytes is None or self.percent is None:
+                raise GpuReadinessError(
+                    "a qualified GPU must carry a budget and a percent"
+                )
+            if self.units_in_flight != 1:
+                raise GpuReadinessError(
+                    "a qualified GPU is single-owner (units_in_flight == 1)"
+                )
+            if self.device_peak_bytes is None or self.device_peak_bytes <= 0:
+                raise GpuReadinessError(
+                    "a qualified GPU must carry a positive device peak"
+                )
+        else:
+            if self.reason_code == REASON_VRAM_CANDIDATE_OK:
+                raise GpuReadinessError(
+                    "an unqualified GPU cannot claim R55_VRAM_CANDIDATE_OK"
+                )
+
+    def to_dict(self) -> dict:
+        return {
+            "qualified": bool(self.qualified),
+            "reason_code": self.reason_code,
+            "detail": self.detail,
+            "free_bytes": int(self.free_bytes),
+            "budget_bytes": self.budget_bytes,
+            "percent": self.percent,
+            "prefetch_units": int(self.prefetch_units),
+            "queue_max": int(self.queue_max),
+            "units_in_flight": int(self.units_in_flight),
+            "device_peak_bytes": self.device_peak_bytes,
+        }
+
+
+def qualify_gpu_execution(
+    *,
+    requested: bool,
+    readiness: "GpuReadiness",
+    parity_qualified: bool,
+    free_bytes: int,
+    policy: VramPolicy,
+    device_peak_bytes: int | None,
+    prefetch_units: int,
+    queue_max: int,
+    units_in_flight: int = 1,
+) -> GpuQualification:
+    """Pure qualification of an ACTIVE GPU candidate (closed reasons).
+
+    Never probes hardware and never imports CuPy: the caller supplies the fresh
+    integer observation. An unqualified candidate is REFUSED with a closed
+    reason instead of being silently coerced to CPU here.
+    """
+    if not isinstance(readiness, GpuReadiness):
+        raise GpuReadinessError("readiness must be a GpuReadiness")
+    if not isinstance(policy, VramPolicy):
+        raise GpuReadinessError("policy must be a VramPolicy")
+    if not isinstance(requested, bool) or not isinstance(parity_qualified, bool):
+        raise GpuReadinessError("requested/parity_qualified must be bools")
+    free = _require_plain_int(free_bytes, "free_bytes")
+    prefetch = _require_plain_int(prefetch_units, "prefetch_units")
+    qmax = _require_plain_int(queue_max, "queue_max", minimum=1)
+    k = _require_plain_int(units_in_flight, "units_in_flight", minimum=1)
+    peak = (
+        None
+        if device_peak_bytes is None
+        else _require_plain_int(device_peak_bytes, "device_peak_bytes")
+    )
+
+    def refuse(reason, detail):
+        return GpuQualification(
+            qualified=False,
+            reason_code=reason,
+            detail=detail,
+            free_bytes=free,
+            budget_bytes=None,
+            percent=None,
+            prefetch_units=prefetch,
+            queue_max=qmax,
+            units_in_flight=k,
+            device_peak_bytes=peak,
+        )
+
+    if not requested:
+        return refuse(REASON_GPU_NOT_PROBED, "GPU was not explicitly requested")
+    if not readiness.available:
+        if readiness.status == STATUS_DEPENDENCY_MISSING:
+            reason = REASON_GPU_DEP_MISSING
+        elif readiness.status == STATUS_DEPENDENCY_UNIMPORTABLE:
+            reason = REASON_GPU_DEP_UNIMPORTABLE
+        elif readiness.status == STATUS_NO_DEVICE:
+            reason = REASON_GPU_NO_DEVICE
+        elif readiness.status == STATUS_DEVICE_PROBE_ERROR:
+            reason = REASON_GPU_PROBE_ERROR
+        else:
+            reason = REASON_GPU_NOT_PROBED
+        return refuse(
+            reason,
+            f"GPU readiness status is {readiness.status!r}",
+        )
+    if not parity_qualified:
+        return refuse(
+            REASON_GPU_PARITY_NOT_QUALIFIED,
+            "GPU parity qualification evidence is absent",
+        )
+    if k != 1:
+        return refuse(
+            REASON_GPU_PREFETCH_UNBOUNDED,
+            f"active GPU execution is single-owner, got units_in_flight={k}",
+        )
+    if prefetch + 1 > qmax:
+        return refuse(
+            REASON_GPU_PREFETCH_UNBOUNDED,
+            f"prefetch_units={prefetch} requires queue_max >= {prefetch + 1}, "
+            f"got {qmax}",
+        )
+    if peak is None or peak <= 0:
+        return refuse(
+            REASON_GPU_DEVICE_PEAK_UNKNOWN,
+            "a positive explicit device peak is required",
+        )
+    candidate = policy.candidate(free, policy.initial_percent)
+    if not candidate.eligible or candidate.budget_bytes < peak:
+        return refuse(
+            REASON_REFUSE_VRAM,
+            f"device peak {peak} B does not fit the fresh "
+            f"{policy.initial_percent}% VRAM budget "
+            f"({candidate.budget_bytes} B)",
+        )
+    return GpuQualification(
+        qualified=True,
+        reason_code=REASON_VRAM_CANDIDATE_OK,
+        detail=(
+            f"qualified at {candidate.percent}% of fresh free VRAM "
+            f"({free} B)"
+        ),
+        free_bytes=free,
+        budget_bytes=int(candidate.budget_bytes),
+        percent=int(candidate.percent),
+        prefetch_units=prefetch,
+        queue_max=qmax,
+        units_in_flight=1,
+        device_peak_bytes=int(peak),
+    )
+
+
+def fresh_vram_revalidation(
+    *,
+    policy: VramPolicy,
+    current_percent: int,
+    free_bytes: int,
+    device_peak_bytes: int,
+) -> RunGpuDecision:
+    """Fresh RUN revalidation of ONE GPU unit against its exact device peak.
+
+    A fixed device peak cannot be rescued by a smaller budget: the decision is
+    either continue, or one whole-batch CPU fallback with a closed reason. No
+    mixed partial result is ever represented.
+    """
+    if isinstance(device_peak_bytes, bool) or not isinstance(
+        device_peak_bytes, int
+    ) or device_peak_bytes <= 0:
+        raise InvalidVramObservation(
+            "device_peak_bytes must be a strictly positive plain int"
+        )
+    return revalidate_for_unit(
+        policy,
+        current_percent,
+        free_bytes,
+        required_bytes=int(device_peak_bytes),
     )
 
 

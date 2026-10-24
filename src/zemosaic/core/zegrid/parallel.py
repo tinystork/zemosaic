@@ -31,6 +31,7 @@ import concurrent.futures
 import logging
 import multiprocessing
 import os
+import queue
 import threading
 import time
 
@@ -1209,3 +1210,554 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         out = _run_serial()
         _finish(meta, t0, total)
         return out
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R55-E2 — bounded CPU -> GPU producer/consumer pipeline
+# ---------------------------------------------------------------------------
+#
+# Execution primitive only: no plan, no science, no scheduler authority.
+#
+#   * ``produce(task)``  — CPU-side staging of ONE canonical unit;
+#   * ``consume(unit)``  — single-owner GPU work for that unit;
+#   * ``release(unit)``  — deterministic release/cleanup of the staged unit.
+#
+# Contract (enforced here):
+#
+#   * ONE producer thread and ONE consumer (GPU owner) thread (K == 1).
+#   * an EXPLICIT bounded queue ``prefetch_units + 1`` plus explicit host and
+#     device byte budgets. The producer blocks (backpressure) when either is
+#     exhausted; it never drops, duplicates or grows a buffer after pressure.
+#   * every staged unit takes exactly one host lease; the consumed unit takes
+#     exactly one device lease. Both are released EXACTLY once on success,
+#     cancellation, producer/consumer exception and fallback. A balanced ledger
+#     is asserted before ``run`` returns.
+#   * deterministic canonical result order (input task order).
+#   * cancellation is a one-way latch: a cancelled pipeline publishes nothing,
+#     drains the queue, releases every staged unit and joins both threads.
+#
+# No CuPy import, no CUDA initialisation: ``consume`` is the caller's callback.
+
+PIPELINE_SCHEMA = "zemosaic-r55e2-bounded-pipeline-v1"
+
+
+class PipelineError(RuntimeError):
+    """Base class for bounded pipeline contract/execution failures."""
+
+
+class PipelineCancelled(PipelineError):
+    """The pipeline was cancelled; no result may be published."""
+
+
+class PipelineAccountingError(PipelineError):
+    """The buffer ledger or a byte budget is inconsistent (fail closed)."""
+
+
+def _pipeline_int(value, name: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PipelineError(
+            f"{name} must be a strict int, got {type(value).__name__}={value!r}"
+        )
+    if int(value) < int(minimum):
+        raise PipelineError(f"{name} must be >= {minimum}, got {value}")
+    return int(value)
+
+
+class BufferLedger:
+    """Exact host/device byte accounting with blocking reservation.
+
+    ``reserve`` blocks until the requested bytes fit the explicit budget, so a
+    caller can never exceed the envelope. A request larger than the whole budget
+    fails closed immediately (it could never complete).
+    """
+
+    def __init__(
+        self,
+        *,
+        host_budget_bytes: int,
+        device_budget_bytes: int,
+        clock=time.monotonic,
+    ) -> None:
+        self.host_budget_bytes = _pipeline_int(
+            host_budget_bytes, "host_budget_bytes", minimum=1
+        )
+        self.device_budget_bytes = _pipeline_int(
+            device_budget_bytes, "device_budget_bytes", minimum=1
+        )
+        self._clock = clock
+        self._cond = threading.Condition()
+        self._host_used = 0
+        self._device_used = 0
+        self._host_peak = 0
+        self._device_peak = 0
+        self._host_leases: dict[int, int] = {}
+        self._device_leases: dict[int, int] = {}
+        self._next_lease = 1
+        self._wait_events = 0
+        self._wait_s = 0.0
+
+    def _capacity(self, kind: str) -> int:
+        if kind == "host":
+            return int(self.host_budget_bytes)
+        if kind == "device":
+            return int(self.device_budget_bytes)
+        raise PipelineAccountingError(f"unknown lease kind {kind!r}")
+
+    def _used(self, kind: str) -> int:
+        return int(self._host_used if kind == "host" else self._device_used)
+
+    def _set_used(self, kind: str, value: int) -> None:
+        if kind == "host":
+            self._host_used = int(value)
+            self._host_peak = max(self._host_peak, int(value))
+        else:
+            self._device_used = int(value)
+            self._device_peak = max(self._device_peak, int(value))
+
+    def _leases(self, kind: str) -> dict[int, int]:
+        return self._host_leases if kind == "host" else self._device_leases
+
+    def reserve(
+        self,
+        kind: str,
+        nbytes: int,
+        *,
+        cancel_event: threading.Event | None = None,
+        poll_s: float = 0.05,
+    ) -> int:
+        """Reserve ``nbytes`` and return a unique lease id (blocking)."""
+        want = _pipeline_int(nbytes, f"{kind}_bytes", minimum=0)
+        capacity = self._capacity(kind)
+        if want > capacity:
+            raise PipelineAccountingError(
+                f"{kind} request {want} B exceeds the explicit budget "
+                f"{capacity} B"
+            )
+        waited = False
+        started = 0.0
+        with self._cond:
+            while self._capacity(kind) - self._used(kind) < want:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PipelineCancelled(
+                        f"cancelled while waiting for {kind} credit"
+                    )
+                if not waited:
+                    waited = True
+                    started = float(self._clock())
+                self._cond.wait(poll_s)
+            if waited:
+                self._wait_events += 1
+                self._wait_s += max(0.0, float(self._clock()) - started)
+            lease = self._next_lease
+            self._next_lease += 1
+            self._leases(kind)[lease] = want
+            self._set_used(kind, self._used(kind) + want)
+            return lease
+
+    def release(self, kind: str, lease: int) -> int:
+        """Release exactly one outstanding lease; double release fails closed."""
+        leases = self._leases(kind)
+        with self._cond:
+            if lease not in leases:
+                raise PipelineAccountingError(
+                    f"unknown or already released {kind} lease {lease}"
+                )
+            amount = leases.pop(lease)
+            used = self._used(kind) - amount
+            if used < 0:
+                raise PipelineAccountingError(
+                    f"{kind} ledger underflow after releasing {amount} B"
+                )
+            self._set_used(kind, used)
+            self._cond.notify_all()
+            return int(amount)
+
+    def snapshot(self) -> dict:
+        with self._cond:
+            return {
+                "host_budget_bytes": int(self.host_budget_bytes),
+                "device_budget_bytes": int(self.device_budget_bytes),
+                "host_used_bytes": int(self._host_used),
+                "host_peak_bytes": int(self._host_peak),
+                "device_used_bytes": int(self._device_used),
+                "device_peak_bytes": int(self._device_peak),
+                "host_leases": len(self._host_leases),
+                "device_leases": len(self._device_leases),
+                "credit_wait_events": int(self._wait_events),
+                "credit_wait_s": float(self._wait_s),
+                "balanced": not self._host_leases and not self._device_leases,
+            }
+
+
+class BoundedPipeline:
+    """Bounded, single-owner CPU -> GPU producer/consumer runner.
+
+    Exactly one producer thread and one consumer thread are started. The queue
+    capacity is explicit (``prefetch_units + 1``): ``prefetch_units`` complete
+    units may wait ahead of the one being consumed. Both byte budgets are hard
+    caps enforced by :class:`BufferLedger`.
+    """
+
+    def __init__(
+        self,
+        *,
+        tasks,
+        produce,
+        consume,
+        release,
+        prefetch_units: int,
+        host_budget_bytes: int,
+        device_budget_bytes: int,
+        host_bytes=lambda payload: 0,
+        device_bytes=lambda payload: 0,
+        clock=time.monotonic,
+        thread_join_s: float = 30.0,
+    ) -> None:
+        if not callable(produce) or not callable(consume) or not callable(release):
+            raise PipelineError("produce/consume/release must be callables")
+        if not callable(host_bytes) or not callable(device_bytes):
+            raise PipelineError("host_bytes/device_bytes must be callables")
+        if (
+            isinstance(thread_join_s, bool)
+            or not isinstance(thread_join_s, (int, float))
+            or not (0 < float(thread_join_s) <= 600.0)
+        ):
+            raise PipelineError("thread_join_s must be in (0, 600]")
+        self._tasks = tuple(tasks)
+        self._produce = produce
+        self._consume = consume
+        self._release_payload = release
+        self._host_bytes_fn = host_bytes
+        self._device_bytes_fn = device_bytes
+        self._prefetch_units = _pipeline_int(
+            prefetch_units, "prefetch_units", minimum=0
+        )
+        self._queue_max = int(self._prefetch_units) + 1
+        self._clock = clock
+        self._thread_join_s = float(thread_join_s)
+        self._ledger = BufferLedger(
+            host_budget_bytes=host_budget_bytes,
+            device_budget_bytes=device_budget_bytes,
+            clock=clock,
+        )
+        self._queue: "queue.Queue" = queue.Queue(maxsize=self._queue_max)
+        self._cancel = threading.Event()
+        self._producer_error: BaseException | None = None
+        self._consumer_error: BaseException | None = None
+        self._cleanup_failures: list[str] = []
+        self._cancel_reason: str | None = None
+        self._results: list = [None] * len(self._tasks)
+        self._produced = 0
+        self._consumed = 0
+        self._released = 0
+        self._transfers = 0
+        self._queue_depth_max = 0
+        self._queue_depth_last = 0
+        self._queue_depth_samples = 0
+        self._queue_depth_sum = 0
+        self._consumer_idle_s = 0.0
+        self._producer_backpressure_events = 0
+        self._producer_backpressure_s = 0.0
+        self._producer_thread: threading.Thread | None = None
+        self._consumer_thread: threading.Thread | None = None
+        self._finished = False
+
+    # -- lifecycle ---------------------------------------------------------
+
+    @property
+    def queue_max(self) -> int:
+        return int(self._queue_max)
+
+    @property
+    def prefetch_units(self) -> int:
+        return int(self._prefetch_units)
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        """One-way cancellation latch (idempotent)."""
+        if not self._cancel.is_set():
+            self._cancel_reason = str(reason)
+            self._cancel.set()
+        with self._ledger._cond:  # noqa: SLF001 - same-module primitive
+            self._ledger._cond.notify_all()  # noqa: SLF001
+
+    def _cancelled(self) -> bool:
+        return bool(self._cancel.is_set())
+
+    def _sample_queue(self) -> int:
+        depth = int(self._queue.qsize())
+        self._queue_depth_last = depth
+        self._queue_depth_max = max(self._queue_depth_max, depth)
+        self._queue_depth_samples += 1
+        self._queue_depth_sum += depth
+        return depth
+
+    # -- unit cleanup ------------------------------------------------------
+
+    def _release_unit(self, unit) -> None:
+        """Release ledger leases and the caller payload exactly once."""
+        if not isinstance(unit, dict) or unit.get("released"):
+            return
+        try:
+            self._release_payload(unit["payload"])
+        except BaseException as exc:  # noqa: BLE001 - best effort, never masks cause
+            self._cleanup_failures.append(
+                f"unit[{unit.get('index')}]:{type(exc).__name__}:{exc}"
+            )
+        try:
+            if unit.get("device_lease") is not None:
+                self._ledger.release("device", int(unit["device_lease"]))
+            if unit.get("host_lease") is not None:
+                self._ledger.release("host", int(unit["host_lease"]))
+        finally:
+            unit["released"] = True
+            self._released += 1
+
+    # -- producer ----------------------------------------------------------
+
+    def _put(self, unit) -> None:
+        """Bounded put that honours cancellation (no unbounded blocking)."""
+        while True:
+            if self._cancelled():
+                self._release_unit(unit)
+                raise PipelineCancelled("producer cancelled before enqueue")
+            started = float(self._clock())
+            try:
+                self._queue.put(unit, timeout=0.05)
+            except queue.Full:
+                self._producer_backpressure_events += 1
+                self._producer_backpressure_s += max(
+                    0.0, float(self._clock()) - started
+                )
+                continue
+            # A bounded put that had to wait for QUEUE SPACE is backpressure
+            # even when it completed before the 50 ms poll timeout.
+            waited = max(0.0, float(self._clock()) - started)
+            if waited >= 0.0005:
+                self._producer_backpressure_events += 1
+                self._producer_backpressure_s += waited
+            self._sample_queue()
+            return
+
+    def _put_sentinel(self) -> None:
+        while not self._cancelled():
+            try:
+                self._queue.put({"sentinel": True}, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def _producer_run(self) -> None:
+        try:
+            for index, task in enumerate(self._tasks):
+                if self._cancelled():
+                    return
+                payload = self._produce(task)
+                host_need = _pipeline_int(
+                    self._host_bytes_fn(payload), "host_bytes", minimum=0
+                )
+                device_need = _pipeline_int(
+                    self._device_bytes_fn(payload), "device_bytes", minimum=0
+                )
+                unit = {
+                    "index": int(index),
+                    "payload": payload,
+                    "host_bytes": int(host_need),
+                    "device_bytes": int(device_need),
+                    "host_lease": None,
+                    "device_lease": None,
+                    "released": False,
+                }
+                unit["host_lease"] = self._ledger.reserve(
+                    "host", host_need, cancel_event=self._cancel
+                )
+                self._produced += 1
+                self._put(unit)
+            self._put_sentinel()
+        except PipelineCancelled:
+            return
+        except BaseException as exc:  # noqa: BLE001 - re-raised by run()
+            self._producer_error = exc
+            self.cancel(f"producer_error:{type(exc).__name__}")
+            self._put_sentinel()
+
+    # -- consumer ----------------------------------------------------------
+
+    def _consumer_run(self) -> None:
+        while True:
+            if self._cancelled():
+                return
+            started = float(self._clock())
+            try:
+                unit = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            self._consumer_idle_s += max(0.0, float(self._clock()) - started)
+            self._sample_queue()
+            if isinstance(unit, dict) and unit.get("sentinel"):
+                return
+            try:
+                unit["device_lease"] = self._ledger.reserve(
+                    "device",
+                    int(unit["device_bytes"]),
+                    cancel_event=self._cancel,
+                )
+                result = self._consume(unit["payload"])
+                self._transfers += 1
+            except PipelineCancelled:
+                self._release_unit(unit)
+                return
+            except BaseException as exc:  # noqa: BLE001 - re-raised by run()
+                self._consumer_error = exc
+                self.cancel(f"consumer_error:{type(exc).__name__}")
+                self._release_unit(unit)
+                return
+            else:
+                self._results[int(unit["index"])] = result
+                self._consumed += 1
+            finally:
+                self._release_unit(unit)
+
+    # -- run ---------------------------------------------------------------
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                unit = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(unit, dict) and unit.get("sentinel"):
+                continue
+            try:
+                self._release_unit(unit)
+            except BaseException as exc:  # noqa: BLE001
+                self._cleanup_failures.append(
+                    f"drain_release:{type(exc).__name__}:{exc}"
+                )
+
+    def run(self):
+        """Run the pipeline; return canonical-order results or raise.
+
+        On any failure the pipeline is cancelled, every staged unit is released,
+        both threads are joined, and the PRIMARY error is re-raised (type
+        preserved so a CuPy OOM stays classified). Partial GPU results are never
+        returned.
+        """
+        if self._finished:
+            raise PipelineError("a BoundedPipeline instance runs at most once")
+        self._finished = True
+        self._producer_thread = threading.Thread(
+            target=self._producer_run,
+            name="r55e2-pipeline-producer",
+            daemon=True,
+        )
+        self._consumer_thread = threading.Thread(
+            target=self._consumer_run,
+            name="r55e2-pipeline-gpu-owner",
+            daemon=True,
+        )
+        self._consumer_thread.start()
+        self._producer_thread.start()
+
+        join_error: BaseException | None = None
+        try:
+            self._producer_thread.join(self._thread_join_s)
+            self._consumer_thread.join(self._thread_join_s)
+        except BaseException as exc:  # noqa: BLE001
+            join_error = exc
+        if self._producer_thread.is_alive() or self._consumer_thread.is_alive():
+            self.cancel("thread_join_timeout")
+            self._producer_thread.join(max(1.0, self._thread_join_s / 6))
+            self._consumer_thread.join(max(1.0, self._thread_join_s / 6))
+        alive = (
+            self._producer_thread.is_alive()
+            or self._consumer_thread.is_alive()
+        )
+        self._drain()
+        ledger = self._ledger.snapshot()
+        if join_error is not None:
+            raise PipelineError(
+                f"pipeline join failed: {type(join_error).__name__}: {join_error}"
+            ) from join_error
+        if alive:
+            raise PipelineError(
+                "bounded pipeline thread did not terminate "
+                f"(producer_alive={self._producer_thread.is_alive()}, "
+                f"consumer_alive={self._consumer_thread.is_alive()})"
+            )
+        if self._consumer_error is not None:
+            if isinstance(self._consumer_error, PipelineAccountingError):
+                raise self._consumer_error
+            raise self._consumer_error
+        if self._producer_error is not None:
+            if isinstance(self._producer_error, PipelineAccountingError):
+                raise self._producer_error
+            raise PipelineError(
+                "producer failed: "
+                f"{type(self._producer_error).__name__}: {self._producer_error}"
+            ) from self._producer_error
+        if self._cancelled():
+            raise PipelineCancelled(
+                f"pipeline cancelled ({self._cancel_reason or 'unknown'})"
+            )
+        if not ledger["balanced"]:
+            raise PipelineAccountingError(
+                "bounded pipeline buffer ledger is not balanced: "
+                f"{ledger!r}"
+            )
+        if self._consumed != len(self._tasks):
+            raise PipelineError(
+                f"pipeline consumed {self._consumed}/{len(self._tasks)} units"
+            )
+        return list(self._results)
+
+    # -- telemetry ---------------------------------------------------------
+
+    def telemetry(self) -> dict:
+        """Truthful observational telemetry (never part of a plan hash)."""
+        ledger = self._ledger.snapshot()
+        return {
+            "schema": PIPELINE_SCHEMA,
+            "units_total": int(len(self._tasks)),
+            "units_produced": int(self._produced),
+            "units_consumed": int(self._consumed),
+            "units_released": int(self._released),
+            "queue_max": int(self._queue_max),
+            "prefetch_units": int(self._prefetch_units),
+            "queue_depth_max": int(self._queue_depth_max),
+            "queue_depth_last": int(self._queue_depth_last),
+            "queue_depth_samples": int(self._queue_depth_samples),
+            "queue_depth_mean": (
+                None
+                if not self._queue_depth_samples
+                else float(self._queue_depth_sum)
+                / float(self._queue_depth_samples)
+            ),
+            "ledger": ledger,
+            "transfers": int(self._transfers),
+            "consumer_idle_s": float(self._consumer_idle_s),
+            "producer_backpressure_events": int(
+                self._producer_backpressure_events
+            ),
+            "producer_backpressure_s": float(
+                self._producer_backpressure_s
+            ),
+            "cancelled": bool(self._cancelled()),
+            "cancel_reason": self._cancel_reason,
+            "producer_error": (
+                None
+                if self._producer_error is None
+                else f"{type(self._producer_error).__name__}: {self._producer_error}"
+            ),
+            "consumer_error": (
+                None
+                if self._consumer_error is None
+                else f"{type(self._consumer_error).__name__}: {self._consumer_error}"
+            ),
+            "cleanup_failures": list(self._cleanup_failures),
+            "threads_joined": (
+                self._producer_thread is not None
+                and not self._producer_thread.is_alive()
+                and self._consumer_thread is not None
+                and not self._consumer_thread.is_alive()
+            ),
+        }

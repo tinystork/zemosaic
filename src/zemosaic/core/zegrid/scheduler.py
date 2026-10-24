@@ -95,6 +95,10 @@ __all__ = [
     "ACTIVE_MAPPING_SCHEMA",
     "ACTIVE_FINAL_PLAN_SCHEMA",
     "ACTIVE_EXECUTABLE_PHASES",
+    "E2_GPU_MAPPING_SCHEMA",
+    "active_gpu_phase",
+    "active_gpu_mapping_for_candidate",
+    "map_active_gpu_candidate",
     "ActivePlanRejected",
     "active_cpu_phase",
     "active_candidate_tuple",
@@ -2819,14 +2823,24 @@ def _active_strict_ladder(values, name: str) -> tuple[int, ...]:
 
 
 def _validate_active_candidate_fields(
-    candidate: Candidate, *, require_feasible: bool
+    candidate: Candidate,
+    *,
+    require_feasible: bool,
+    allow_gpu: bool = False,
 ) -> None:
-    """Validate the active trust boundary without normalizing malformed values."""
+    """Validate the active trust boundary without normalizing malformed values.
+
+    ``allow_gpu`` is DEFAULT-OFF so every R55-D2 CPU caller keeps its exact
+    behaviour. R55-E2 passes ``allow_gpu=True`` ONLY for the explicit GPU
+    execution contract (single owner, streaming tile, positive device peak).
+    """
     if not isinstance(candidate, Candidate):
         raise SchedulerConfigError(
             f"expected Candidate, got {type(candidate).__name__}"
         )
-    if candidate.backend != BACKEND_CPU:
+    if candidate.backend != BACKEND_CPU and not (
+        allow_gpu and candidate.backend == BACKEND_GPU
+    ):
         raise ActivePlanRejected(
             REASON_UNKNOWN_BACKEND,
             "R55-D2 active grants execution authority to the CPU backend only; "
@@ -2854,7 +2868,21 @@ def _validate_active_candidate_fields(
     device = _active_strict_int(
         candidate.device_peak_bytes, "device_peak_bytes", minimum=0
     )
-    if device != 0:
+    if not allow_gpu and device != 0:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "active CPU candidate must have device_peak_bytes == 0, got "
+            f"{device}",
+            candidate=candidate,
+        )
+    if allow_gpu and candidate.backend == BACKEND_GPU and device <= 0:
+        raise ActivePlanRejected(
+            REASON_REFUSE_VRAM,
+            "active GPU candidate must carry a strictly positive device peak, "
+            f"got {device}",
+            candidate=candidate,
+        )
+    if allow_gpu and candidate.backend == BACKEND_CPU and device != 0:
         raise ActivePlanRejected(
             REASON_INTERNAL_ERROR,
             "active CPU candidate must have device_peak_bytes == 0, got "
@@ -2928,9 +2956,13 @@ def _validate_active_identity(identity: FrozenIdentity) -> None:
             )
 
 
-def active_candidate_tuple(candidate: Candidate) -> dict:
+def active_candidate_tuple(
+    candidate: Candidate, *, allow_gpu: bool = False
+) -> dict:
     """JSON-safe adjacent-shrink tuple for the deterministic audit trail."""
-    _validate_active_candidate_fields(candidate, require_feasible=False)
+    _validate_active_candidate_fields(
+        candidate, require_feasible=False, allow_gpu=allow_gpu
+    )
     return {
         "backend": candidate.backend,
         "tile_px": (
@@ -3125,6 +3157,138 @@ def active_mapping_for_candidate(
     }
 
 
+E2_GPU_MAPPING_SCHEMA = "zemosaic-r55e2-active-gpu-mapping-v1"
+
+
+def active_gpu_phase(candidate: Candidate) -> str:
+    """Return the executable GPU stack phase (streaming only) or reject."""
+    _validate_active_candidate_fields(
+        candidate, require_feasible=False, allow_gpu=True
+    )
+    if candidate.backend != BACKEND_GPU:
+        raise ActivePlanRejected(
+            REASON_UNKNOWN_BACKEND,
+            f"expected a GPU candidate, got backend={candidate.backend!r}",
+            candidate=candidate,
+        )
+    if candidate.tile_px is None:
+        raise ActivePlanRejected(
+            REASON_SHRINK_TILE,
+            "R55-E2 active GPU execution requires a bounded streaming tile, "
+            "got tile_px=None",
+            candidate=candidate,
+        )
+    return PHASE_CELL_STACK_STREAM
+
+
+def active_gpu_mapping_for_candidate(
+    candidate: Candidate,
+    *,
+    tile_ladder: Sequence[int] = PRODUCT_TILE_LADDER,
+    workers_ladder: Sequence[int] = WORKERS_LADDER,
+    prefetch_cap: int | None = None,
+) -> dict:
+    """Map ONE qualified GPU candidate onto the bounded pipeline knobs.
+
+    Contract (fail closed): GPU streaming backend, a tile on the explicit
+    product ladder, EXACTLY one unit in flight (single device owner), a worker
+    value on the existing cache-worker ladder, and a non-negative prefetch depth
+    (optionally capped by an explicit pipeline limit).
+    """
+    _validate_active_candidate_fields(
+        candidate, require_feasible=True, allow_gpu=True
+    )
+    phase = active_gpu_phase(candidate)
+    allowed_tiles = _active_strict_ladder(tile_ladder, "tile_ladder")
+    allowed_workers = _active_strict_ladder(
+        workers_ladder, "workers_ladder"
+    )
+    if int(candidate.tile_px) not in allowed_tiles:
+        raise ActivePlanRejected(
+            REASON_SHRINK_TILE,
+            "GPU winner tile "
+            f"{candidate.tile_px!r} is outside the product ladder "
+            f"{allowed_tiles}",
+            candidate=candidate,
+        )
+    if int(candidate.units_in_flight) != 1:
+        raise ActivePlanRejected(
+            REASON_REFUSE_HOST_RAM,
+            "R55-E2 active GPU execution is single-owner (K == 1), got "
+            f"units_in_flight={candidate.units_in_flight}",
+            candidate=candidate,
+        )
+    workers = int(candidate.workers_per_unit)
+    if workers >= 1 and allowed_workers and workers not in allowed_workers:
+        raise ActivePlanRejected(
+            REASON_SHRINK_WORKERS,
+            "GPU workers_per_unit "
+            f"{candidate.workers_per_unit!r} is not an existing executable "
+            f"cache-worker value {allowed_workers}",
+            candidate=candidate,
+        )
+    prefetch = int(candidate.prefetch_units)
+    if prefetch < 0:
+        raise ActivePlanRejected(
+            REASON_SHRINK_PREFETCH,
+            f"GPU prefetch_units must be >= 0, got {prefetch}",
+            candidate=candidate,
+        )
+    if prefetch_cap is not None:
+        cap = _active_strict_int(prefetch_cap, "prefetch_cap", minimum=0)
+        if prefetch > cap:
+            raise ActivePlanRejected(
+                REASON_SHRINK_PREFETCH,
+                f"GPU prefetch_units {prefetch} exceeds the pipeline cap {cap}",
+                candidate=candidate,
+            )
+    return {
+        "schema": E2_GPU_MAPPING_SCHEMA,
+        "backend": BACKEND_GPU,
+        "phase": phase,
+        "cell_task_mode": "stream",
+        "gpu_streaming_tile": int(candidate.tile_px),
+        "cpu_streaming_tile": None,
+        "units_in_flight": 1,
+        "workers_per_unit": workers,
+        "prefetch_units": prefetch,
+        "single_owner": True,
+    }
+
+
+def map_active_gpu_candidate(
+    plan_set: PlanSet,
+    *,
+    tile_ladder: Sequence[int] = PRODUCT_TILE_LADDER,
+    workers_ladder: Sequence[int] = WORKERS_LADDER,
+    prefetch_cap: int | None = None,
+) -> dict:
+    """Map an ``active`` GPU winner onto the bounded CPU->GPU pipeline."""
+    if not isinstance(plan_set, PlanSet):
+        raise SchedulerConfigError(
+            f"expected PlanSet, got {type(plan_set).__name__}"
+        )
+    if plan_set.mode != MODE_ACTIVE:
+        raise ActivePlanRejected(
+            REASON_UNKNOWN_BACKEND,
+            f"active GPU mapping requires mode={MODE_ACTIVE!r}, got "
+            f"{plan_set.mode!r}",
+            candidate=plan_set.chosen,
+        )
+    if not isinstance(plan_set.plan_hash, str) or not plan_set.plan_hash:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            "active GPU plan has no stable plan hash",
+            candidate=plan_set.chosen,
+        )
+    return active_gpu_mapping_for_candidate(
+        plan_set.chosen,
+        tile_ladder=tile_ladder,
+        workers_ladder=workers_ladder,
+        prefetch_cap=prefetch_cap,
+    )
+
+
 def map_active_cpu_candidate(
     plan_set: PlanSet,
     *,
@@ -3183,7 +3347,12 @@ def active_final_plan_hash(
     It is NOT the D1 scheduler PlanSet hash; that hash is preserved separately as
     ``initial_plan_hash`` when a pressure correction changed the plan.
     """
-    _validate_active_candidate_fields(candidate, require_feasible=True)
+    if candidate.backend == BACKEND_GPU:
+        _validate_active_candidate_fields(
+            candidate, require_feasible=True, allow_gpu=True
+        )
+    else:
+        _validate_active_candidate_fields(candidate, require_feasible=True)
     if not isinstance(identity, FrozenIdentity):
         raise SchedulerConfigError(
             f"expected FrozenIdentity, got {type(identity).__name__}"
@@ -3193,7 +3362,11 @@ def active_final_plan_hash(
         raise SchedulerConfigError(
             f"expected mapping, got {type(mapping).__name__}"
         )
-    expected = active_mapping_for_candidate(candidate)
+    expected = (
+        active_gpu_mapping_for_candidate(candidate)
+        if candidate.backend == BACKEND_GPU
+        else active_mapping_for_candidate(candidate)
+    )
     if dict(mapping) != expected:
         raise ActivePlanRejected(
             REASON_INTERNAL_ERROR,
