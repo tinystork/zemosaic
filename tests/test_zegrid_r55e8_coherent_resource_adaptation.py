@@ -468,3 +468,42 @@ def test_gpu_off_performs_no_cuda_or_vram_probe(monkeypatch):
     assert probe["vram_total_bytes"] is None
     assert probe["vram_free_bytes"] is None
     assert probe["reason"] == "gpu_not_requested"
+
+
+def test_explicit_gpu_off_beats_realistic_legacy_aliases_without_probing(monkeypatch):
+    """Explicit/product OFF must outrank legacy aliases that say True.
+
+    This is the realistic zconfig shape (canonical + legacy keys all True) and
+    the R55-E4 precedence contract: ``use_gpu=False`` is authoritative, so the
+    E8 resolver returns immediately and performs NO backend/VRAM/readiness probe.
+    """
+    class _LegacyConfig:
+        use_gpu_phase5 = True
+        use_gpu_grid = True
+        stack_use_gpu = True
+        use_gpu_stack = True
+
+    calls = []
+
+    def _record(name):
+        def _fn(*_a, **_kw):
+            calls.append(name)
+            return {"available": True, "vram_free_bytes": 4 * GIB,
+                    "vram_total_bytes": 8 * GIB, "device": "must-not-run"}
+        return _fn
+
+    monkeypatch.setattr(zz.zgpu, "probe_gpu_backend", _record("backend"))
+    monkeypatch.setattr(
+        zz.zgpu, "probe_gpu_readiness_safe", _record("readiness"), raising=False
+    )
+    requested, source, probe, budget = zz._r55_resolve_gpu_probe(
+        False, _LegacyConfig()
+    )
+    assert requested is False
+    assert source == "argument"
+    assert budget is None
+    assert calls == []
+    assert probe["available"] is False
+    assert probe["reason"] == "gpu_not_requested"
+    # Sanity: the same aliases WOULD request GPU when no explicit argument wins.
+    assert zz.resolve_gpu_preference(None, _LegacyConfig())[0] is True

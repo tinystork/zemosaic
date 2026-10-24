@@ -28,6 +28,7 @@ Covers the R36 deliverables WITHOUT a full M16/M106 pipeline run:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -55,6 +56,7 @@ from zemosaic.core.canonical_streaming import (  # noqa: E402
 from zemosaic.core.zegrid import auto_layout as zal  # noqa: E402
 from zemosaic.core.zegrid import geometry as zg  # noqa: E402
 from zemosaic.core.zegrid import parallel as zpar  # noqa: E402
+from zemosaic.core.zegrid import streaming as zstream  # noqa: E402
 
 TOOL = REPO_ROOT / "tools" / "zegrid_routine" / "make_routine_corpus.py"
 GB = 2 ** 30
@@ -646,6 +648,76 @@ def test_fm1_gpu_tile128_host_infeasible_walks_to_smaller_gpu_tile64(
     # The exact CPU fallback remains planned at tile 64.
     assert b.cpu_fallback_info["feasible"] is True
     assert int(b.cpu_fallback_info["tile"]) == 64
+
+
+def test_fm1_gpu_legacy_executes_the_recovered_tile64_end_to_end(
+    tmp_path, routine_corpus, monkeypatch
+):
+    """R55-E8 product witness: the RECOVERED smaller legacy GPU tile executes.
+
+    Deterministic table: GPU tile128 (the forced VRAM-max selection) busts host
+    RAM, the next legal smaller tile64 fits. The product must call the EXISTING
+    legacy stack runner at 64 (never at 128), the successful GPU execution must
+    be recorded honestly, and the CPU fallback must remain planned at the same
+    CPU tile 64. A GPU success is simulated by running the real CPU consumer
+    under a CPU config while the product's GPU config remains authoritative for
+    ``backend_used`` — no CuPy and no CUDA math are altered.
+    """
+    _force_cpu_tile_64(monkeypatch)              # CPU tile 64; stream@128 infeasible
+    _force_gpu_selection(monkeypatch, gpu_tile=128)
+    calls = []
+    real = zz.run_canonical_stack_streaming
+
+    def spy(provider, request, tile_size=None, fixed=None):
+        backend = getattr(request, "backend", "cpu")
+        calls.append((backend, int(tile_size) if tile_size is not None else None))
+        if backend == "gpu":
+            # Deterministic test double: run the REAL canonical consumer with a
+            # CPU request. `_STACK_CONFIG` stays GPU, so the product records the
+            # successful GPU attempt truthfully; the science bytes are the
+            # canonical CPU bytes (same as the parity witness).
+            cpu_cfg = dataclasses.replace(zz._STACK_CONFIG, backend="cpu")
+            cpu_req = zstream.build_streaming_request(
+                cpu_cfg, provider.n_frames
+            )
+            return real(provider, cpu_req, tile_size=tile_size, fixed=fixed)
+        return real(provider, request, tile_size=tile_size, fixed=fixed)
+
+    monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy)
+    inp, out = tmp_path / "in", tmp_path / "out"
+    _prepare_input(inp, routine_corpus)
+    zz.run_zegrid_mode(str(inp), str(out), zegrid_halo_px=8, use_gpu=True)
+
+    # The existing legacy runner was reached at the RECOVERED tile, never 128.
+    assert calls, "the stack runner was never called"
+    gpu_calls = {t for backend, t in calls if backend == "gpu"}
+    assert gpu_calls == {64}, calls
+    assert all(t != 128 for _backend, t in calls), calls
+
+    m = json.loads((out / "zegrid_manifest.json").read_text(encoding="utf-8"))
+    gpu = m["gpu"]
+    assert gpu["requested"] is True
+    assert gpu["available"] is True
+    assert gpu["attempted"] is True
+    assert gpu["effective"] is True
+    assert gpu["actually_used"] is True
+    assert gpu["used"] is True
+    assert gpu["final_backend"] == "gpu"
+    assert gpu["gpu_executed_cells"] > 0
+    assert gpu["gpu_streaming_tile"] == 64
+    assert gpu["gpu_streaming_host_peak_bytes"] == 4096
+    assert gpu["pre_execution_fallback"] is None
+    assert gpu.get("runtime_fallback") is None
+
+    diag = m["per_cell_diagnostics"]
+    assert diag["gpu_streaming_tile"] == 64
+    assert diag["gpu_streaming_host_peak_bytes"] == 4096
+    assert diag["cells_in_flight"] == 1
+    assert diag["gpu_serialized"] is True
+    assert diag["cpu_streaming_tile"] == 64
+    assert diag["cpu_fallback_plan"]["feasible"] is True
+    assert int(diag["cpu_fallback_plan"]["tile"]) == 64
+    assert diag["cpu_fallback_used"] is False
 
 
 def test_fm1_gpu_effective_tile_fits_is_attempted_single_owner(tmp_path, routine_corpus, monkeypatch):
