@@ -497,7 +497,12 @@ def test_product_apply_uses_the_selected_tile_envelope(tmp_path):
     assert applied.envelope.cache_workers_per_cell == decision.mapping[
         "workers_per_unit"
     ]
-    assert applied.envelope.stack_total_bytes == shared + _total_bound(tile)
+    # R55-E11 rework-3: the envelope consumes the ADDED bound (shared carries the
+    # baseline once); the TOTAL estimate remains the execution diagnostic.
+    added = _total_bound(tile) - int(zz.rcontract.PROCESS_BASELINE_BYTES)
+    assert applied.envelope.stack_total_bytes == shared + added
+    assert applied.plan["per_cell_stack_total_bytes"] == _total_bound(tile)
+    assert applied.envelope.stack_total_bytes != shared + _total_bound(tile)
     assert applied.envelope.stack_total_bytes != shared + max(_witness_bounds().values())
     assert applied.envelope.aggregate_bytes <= applied.envelope.budget_bytes
     assert applied.gpu_streaming_tile == tile

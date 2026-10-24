@@ -5977,13 +5977,24 @@ def _r55_active_gpu_apply(
             cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
             continue
         n = len(mem.patch_ids)
+        # TOTAL per-cell estimate: an execution/manifest input (includes the
+        # process baseline). It is NOT the scheduler's host increment.
         gpu_b = int(_estimate_streaming_bytes(n, patch.patch_shape_hw, tile))
         cell_specs.append((cell, patch, mem, cache_dir, None, 0, gpu_b))
         cell_tasks.append((cell, patch, mem, cache_dir, "stream", gpu_b))
 
-    per_cell_footprint = max(
+    # R55-E11 rework-3: planning uses the ADDED stack bound (estimate minus
+    # PROCESS_BASELINE) because ``shared_bytes`` already carries that baseline
+    # once. Using the TOTAL here added the baseline a second time (exactly
+    # +356,515,840 B on the M106 witness). Keep the total for the execution
+    # task above; use the authoritative added bound for every envelope / plan /
+    # aggregate field that claims scheduler consistency.
+    added_per_cell_stack = _r55_gpu_added_host_bound(decision, tile)
+    per_cell_total = max(
         (int(t[5]) for t in cell_tasks if t[4] is not None), default=0
     )
+    # Diagnostic/execution total; the envelope below uses the ADDED bound.
+    per_cell_footprint = int(per_cell_total)
     base_env = bundle.envelope
     bound_raw = (
         int(base_env.raw_available_bytes)
@@ -6012,7 +6023,7 @@ def _r55_active_gpu_apply(
         )
     stack_total = int(
         rcontract.stack_phase_total_bytes(
-            int(bundle.shared_bytes), units, int(per_cell_footprint)
+            int(bundle.shared_bytes), units, int(added_per_cell_stack)
         )
     )
     cache_per_cell = int(
@@ -6066,7 +6077,7 @@ def _r55_active_gpu_apply(
             {
                 "mode": "stream",
                 "cells_in_flight": 1,
-                "max_bound_bytes": int(per_cell_footprint),
+                "max_bound_bytes": int(added_per_cell_stack),
                 "feasible": True,
                 "makespan_rel": None,
                 "infeasible_reason": None,
@@ -6075,6 +6086,9 @@ def _r55_active_gpu_apply(
         "stack_total_bytes": int(stack_total),
         "cache_total_bytes": int(cache_total),
         "aggregate_bytes": int(aggregate),
+        "per_cell_stack_total_bytes": int(per_cell_total),
+        "per_cell_stack_added_bytes": int(added_per_cell_stack),
+        "baseline_counted": "once_via_shared_bytes",
     }
     attempts = list(bundle.attempts)
     attempts.append(
@@ -6099,7 +6113,7 @@ def _r55_active_gpu_apply(
         cpu_streaming_tile=0,
         gpu_tile_size=int(tile),
         gpu_streaming_tile=int(tile),
-        gpu_streaming_host_peak_bytes=int(per_cell_footprint),
+        gpu_streaming_host_peak_bytes=int(per_cell_total),
         gpu_used=True,
         gpu_pre_execution_fallback=None,
         cell_specs=cell_specs,
@@ -6966,22 +6980,72 @@ def _r55_engine_provenance() -> dict:
     }
 
 
+def _r55_gpu_added_host_bound(decision, tile: int) -> int:
+    """The authoritative ADDED per-cell stack bound for one declared tile.
+
+    ``decision.gpu_host_bound_by_tile`` is frozen at planning time as
+    ``estimate_streaming_bytes(...) - PROCESS_BASELINE_BYTES``; the scheduler's
+    host peak is ``shared_bytes + that added bound`` (baseline counted ONCE via
+    ``shared_bytes``). This accessor is the single source of truth for the
+    apply/plan envelope and the RUN-time host aggregate. Missing, duplicate or
+    malformed entries fail closed; no incompatible total is ever recomputed.
+    """
+    raw = getattr(decision, "gpu_host_bound_by_tile", None)
+    if isinstance(raw, dict):
+        items = tuple(raw.items())
+    elif isinstance(raw, (tuple, list)):
+        items = tuple(raw)
+    else:
+        raise ValueError(
+            "decision.gpu_host_bound_by_tile is missing or not a mapping/sequence"
+        )
+    bounds: dict[int, int] = {}
+    for index, item in enumerate(items):
+        if (
+            isinstance(item, (str, bytes))
+            or not isinstance(item, (tuple, list))
+            or len(item) != 2
+        ):
+            raise ValueError(
+                "gpu_host_bound_by_tile entries must be (tile_px, bytes) pairs "
+                f"(bad entry at index {index}: {item!r})"
+            )
+        tile_px, bound = item
+        if isinstance(tile_px, bool) or not isinstance(tile_px, int):
+            raise ValueError(
+                f"gpu_host_bound_by_tile tile must be a plain int, got {tile_px!r}"
+            )
+        if isinstance(bound, bool) or not isinstance(bound, int):
+            raise ValueError(
+                f"gpu_host_bound_by_tile bytes must be a plain int, got {bound!r}"
+            )
+        if int(tile_px) <= 0 or int(bound) <= 0:
+            raise ValueError(
+                "gpu_host_bound_by_tile tile/bytes must be strictly positive, "
+                f"got ({tile_px}, {bound})"
+            )
+        if int(tile_px) in bounds:
+            raise ValueError(
+                f"gpu_host_bound_by_tile has duplicate tile {int(tile_px)}"
+            )
+        bounds[int(tile_px)] = int(bound)
+    wanted = int(tile)
+    if wanted not in bounds:
+        raise ValueError(
+            f"gpu_host_bound_by_tile has no authoritative bound for tile {wanted}"
+        )
+    return int(bounds[wanted])
+
+
 def _r55_gpu_host_aggregate_for_tile(decision, bundle, tile: int) -> int:
     """Exact aggregate host bytes for ONE declared tile (same math as apply)."""
-    per_cell = int(
-        _estimate_streaming_bytes(
-            int(getattr(decision, "gpu_max_contributors", 1)),
-            (
-                int(getattr(decision, "gpu_worst_patch_hw", (1, 1))[0]),
-                int(getattr(decision, "gpu_worst_patch_hw", (1, 1))[1]),
-            ),
-            int(tile),
-        )
-    )
+    # Authoritative ADDED stack bound: baseline counted ONCE via shared_bytes.
+    # (The TOTAL estimate remains in the execution task/manifest only.)
+    added_per_cell_stack = _r55_gpu_added_host_bound(decision, tile)
     workers = int(bundle.cache_workers_per_cell)
     stack_total = int(
         rcontract.stack_phase_total_bytes(
-            int(bundle.shared_bytes), 1, int(per_cell)
+            int(bundle.shared_bytes), 1, int(added_per_cell_stack)
         )
     )
     cache_per_cell = int(

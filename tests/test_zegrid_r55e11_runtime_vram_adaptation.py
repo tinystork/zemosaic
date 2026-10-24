@@ -68,11 +68,28 @@ def _decision(tiles=(506, 448, 384), peaks=None):
         448: WITNESS_PEAK_448,
         384: WITNESS_PEAK_384,
     })
+    ladder = tuple(int(t) for t in tiles)
+    added_bounds = tuple(
+        (
+            tile,
+            max(
+                1,
+                int(
+                    zz._estimate_streaming_bytes(
+                        WITNESS_FRAMES, WITNESS_PATCH_HW, tile
+                    )
+                )
+                - int(rcontract.PROCESS_BASELINE_BYTES),
+            ),
+        )
+        for tile in ladder
+    )
     return SimpleNamespace(
         policy=zgr.VramPolicy(),
         qualification={"percent": 70, "budget_bytes": 5_224_634_777},
         device_peak_bytes_by_tile=peaks,
-        gpu_tile_ladder=tuple(int(t) for t in tiles),
+        gpu_tile_ladder=ladder,
+        gpu_host_bound_by_tile=added_bounds,
         gpu_max_contributors=WITNESS_FRAMES,
         gpu_worst_patch_hw=WITNESS_PATCH_HW,
     )
@@ -1005,3 +1022,197 @@ def test_e11_exact_r55f_scale_credit_mismatch_and_prefetch0():
     assert good_telemetry["units_released"] == 1
     assert good_telemetry["ledger"]["balanced"] is True
     assert released_good == ["r55f_scale"]
+
+
+# ---------------------------------------------------------------------------
+# I. Rework-3: stack host baseline counted ONCE (planning/apply/runtime).
+#
+# Planning freezes decision.gpu_host_bound_by_tile[tile] as the ADDED bound
+# (estimate - PROCESS_BASELINE); shared_bytes already carries the baseline once.
+# The apply envelope and the RUN aggregate must both use that authoritative
+# value, never the TOTAL estimate (which added +356,515,840 B on the witness).
+# The cache phase contract is intentionally left unchanged (active cell process
+# baseline + shared parent process).
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class _ApplyBundle:
+    envelope: object
+    shared_bytes: int
+    cache_worker_footprint_bytes: int
+    cache_workers_per_cell: int
+    cell_specs: list
+    cell_tasks: list
+    cpu_fallback_info: dict
+    attempts: list
+    gauge_workers: int
+    cache_build_workers: int
+    cpu_streaming: dict = dataclasses.field(default_factory=dict)
+    cpu_streaming_tile: int = 0
+    gpu_tile_size: int | None = None
+    gpu_streaming_tile: int | None = None
+    gpu_streaming_host_peak_bytes: int | None = None
+    gpu_used: bool = False
+    gpu_pre_execution_fallback: dict | None = None
+    plan: dict = dataclasses.field(default_factory=dict)
+    chosen_mode: str = "stream"
+    cells_in_flight: int = 1
+    per_cell_footprint: int = 0
+
+
+def _apply_fixture():
+    raw = 13_102_166_016
+    factor_num, factor_den = rcontract.ADMIT_FACTOR_NUM, rcontract.ADMIT_FACTOR_DEN
+    envelope = SimpleNamespace(
+        raw_available_bytes=int(raw),
+        factor_num=int(factor_num),
+        factor_den=int(factor_den),
+        budget_bytes=(int(factor_num) * int(raw)) // int(factor_den),
+        layout=(2, 2),
+        refinement_rank=0,
+        pinned=False,
+    )
+    n_frames, patch_hw = 66, (1767, 1330)
+    thresholds = {}
+    for tile in (448, 384):
+        total = int(zz._estimate_streaming_bytes(n_frames, patch_hw, tile))
+        thresholds[int(tile)] = max(
+            1, total - int(rcontract.PROCESS_BASELINE_BYTES)
+        )
+    decision = SimpleNamespace(
+        gpu_context=SimpleNamespace(tile_ladder=(448, 384)),
+        gpu_host_bound_by_tile=tuple(
+            (int(t), int(thresholds[int(t)])) for t in (448, 384)
+        ),
+        gauge_workers=1,
+        cache_workers=14,
+        gpu_max_contributors=n_frames,
+        gpu_worst_patch_hw=patch_hw,
+        device_peak_bytes_by_tile={
+            448: 120_000_000,
+            384: 100_000_000,
+        },
+        policy=zgr.VramPolicy(),
+        qualification={"percent": 70, "budget_bytes": 5_000_000_000},
+        gpu_tile_ladder=(448, 384),
+    )
+    cell = SimpleNamespace(cell_id="c0", row=0, col=0)
+    patch = SimpleNamespace(patch_shape_hw=patch_hw)
+    mem = SimpleNamespace(patch_ids=[f"f{i}" for i in range(n_frames)])
+    bundle = _ApplyBundle(
+        envelope=envelope,
+        shared_bytes=int(rcontract.PROCESS_BASELINE_BYTES),
+        cache_worker_footprint_bytes=(
+            int(rcontract.PROCESS_BASELINE_BYTES) + 64 * MIB
+        ),
+        cache_workers_per_cell=14,
+        cell_specs=[(cell, patch, mem, "/tmp/c0", None, 0, 0)],
+        cell_tasks=[(cell, patch, mem, "/tmp/c0", None, 0)],
+        cpu_fallback_info={},
+        attempts=[],
+        gauge_workers=1,
+        cache_build_workers=14,
+    )
+    return bundle, decision
+
+
+def _apply_mapping(tile: int) -> dict:
+    return {
+        "backend": "gpu",
+        "phase": "cell_stack_stream",
+        "gpu_streaming_tile": int(tile),
+        "workers_per_unit": 14,
+        "units_in_flight": 1,
+        "prefetch_units": 1,
+    }
+
+
+def test_e11_apply_uses_the_added_stack_bound_and_counts_baseline_once():
+    bundle, decision = _apply_fixture()
+    applied = zz._r55_active_gpu_apply(
+        bundle, mapping=_apply_mapping(448), decision=decision
+    )
+    added = dict(decision.gpu_host_bound_by_tile)[448]
+    total = int(zz._estimate_streaming_bytes(66, (1767, 1330), 448))
+    assert applied.envelope.stack_total_bytes == bundle.shared_bytes + added
+    assert applied.plan["stack_total_bytes"] == bundle.shared_bytes + added
+    assert applied.plan["candidates"][0]["max_bound_bytes"] == added
+    assert applied.plan["per_cell_stack_added_bytes"] == added
+    assert applied.plan["per_cell_stack_total_bytes"] == total
+    # Bundle-level total remains the diagnostic/execution value; the envelope
+    # and plan max-bound use the authoritative ADDED bound.
+    assert applied.per_cell_footprint == total
+    assert applied.gpu_streaming_host_peak_bytes == total
+    assert applied.envelope.stack_total_bytes == bundle.shared_bytes + added
+    # Old formula used the TOTAL estimate on top of shared -> +one baseline.
+    old_stack = rcontract.stack_phase_total_bytes(bundle.shared_bytes, 1, total)
+    assert old_stack - applied.envelope.stack_total_bytes == (
+        rcontract.PROCESS_BASELINE_BYTES
+    )
+
+
+@pytest.mark.parametrize("tile", [448, 384])
+def test_e11_runtime_aggregate_equals_apply_and_does_not_double_count(tile):
+    bundle, _decision_fixture = _apply_fixture()
+    # One shared decision object (avoid rebuilding maps with a different object).
+    decision = _decision_fixture
+    applied = zz._r55_active_gpu_apply(
+        bundle, mapping=_apply_mapping(tile), decision=decision
+    )
+    runtime = zz._r55_gpu_host_aggregate_for_tile(decision, bundle, tile)
+    assert runtime == applied.envelope.aggregate_bytes
+    added = dict(decision.gpu_host_bound_by_tile)[tile]
+    assert applied.envelope.stack_total_bytes == bundle.shared_bytes + added
+
+    total = int(zz._estimate_streaming_bytes(66, (1767, 1330), tile))
+    old_stack = rcontract.stack_phase_total_bytes(bundle.shared_bytes, 1, total)
+    old_aggregate = max(old_stack, applied.envelope.cache_total_bytes)
+    assert old_aggregate - runtime == rcontract.PROCESS_BASELINE_BYTES
+    # The OLD aggregate would reject a budget that the corrected one accepts:
+    # this is the artificial-baseline shrink/fallback the rework removes.
+    assert old_aggregate > runtime
+    check = zz._r55_runtime_tile_check(
+        decision,
+        tile=tile,
+        free_bytes=10 * GIB,
+        host_budget_bytes=runtime,
+        bundle=bundle,
+    )
+    assert check["host_ok"] is True
+    assert check["eligible"] is True
+
+
+def test_e11_cache_phase_contract_is_unchanged_by_the_stack_fix():
+    bundle, decision = _apply_fixture()
+    applied = zz._r55_active_gpu_apply(
+        bundle, mapping=_apply_mapping(448), decision=decision
+    )
+    cache_per_cell = rcontract.cache_per_cell_bytes(
+        rcontract.PROCESS_BASELINE_BYTES,
+        bundle.cache_workers_per_cell,
+        bundle.cache_worker_footprint_bytes,
+    )
+    expected_cache_total = rcontract.cache_phase_total_bytes(
+        bundle.shared_bytes, 1, cache_per_cell
+    )
+    # Cache deliberately counts the active cell process baseline AND shared
+    # (parent) process; only the stack double-count was corrected.
+    assert applied.envelope.cache_total_bytes == expected_cache_total
+
+
+def test_e11_added_host_bound_map_is_fail_closed():
+    _bundle, _decision = _apply_fixture()
+    duplicate = SimpleNamespace(
+        gpu_host_bound_by_tile=((448, 1), (448, 2))
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        zz._r55_gpu_added_host_bound(duplicate, 448)
+    missing = SimpleNamespace(gpu_host_bound_by_tile=((448, 1),))
+    with pytest.raises(ValueError, match="no authoritative bound"):
+        zz._r55_gpu_added_host_bound(missing, 384)
+    negative = SimpleNamespace(gpu_host_bound_by_tile=((448, -1),))
+    with pytest.raises(ValueError, match="strictly positive"):
+        zz._r55_gpu_added_host_bound(negative, 448)
+    absent = SimpleNamespace()
+    with pytest.raises(ValueError, match="missing"):
+        zz._r55_gpu_added_host_bound(absent, 448)
