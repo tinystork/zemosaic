@@ -252,11 +252,12 @@ def resolve_normalization(stack_norm_method) -> str:
 # user asked for GPU in the ZeGrid engine.
 # ---------------------------------------------------------------------------
 
-# Resolution order (first non-None wins) for the zconfig GPU flags. ``use_gpu_grid``
-# is the grid-specific flag (most direct for the ZeGrid engine); ``stack_use_gpu`` /
-# ``use_gpu_stack`` are the stacking flags; ``use_gpu_phase5`` is the GUI canonical
-# phase-5 checkbox that ``_normalize_gpu_flags`` synchronises the others onto.
-_GPU_PREFERENCE_KEYS = ("use_gpu_grid", "stack_use_gpu", "use_gpu_stack", "use_gpu_phase5")
+# Resolution order (first non-None wins) for the zconfig GPU flags.
+# ``use_gpu_phase5`` is the canonical Qt checkbox and deliberately comes first so
+# an obsolete ``use_gpu_grid`` value cannot contradict it. The remaining keys are
+# legacy fallbacks used only when the canonical key is absent; their historical
+# relative order is preserved.
+_GPU_PREFERENCE_KEYS = ("use_gpu_phase5", "use_gpu_grid", "stack_use_gpu", "use_gpu_stack")
 
 
 def _coerce_bool_pref(value):
@@ -289,10 +290,15 @@ def resolve_gpu_preference(use_gpu=None, zconfig=None):
 
     Precedence (first explicit, non-None value wins):
       1. the generic ``use_gpu`` argument (explicit caller intent);
-      2. ``use_gpu_grid`` (grid-specific GUI flag);
-      3. ``stack_use_gpu`` (stacking GPU flag);
-      4. ``use_gpu_stack`` (legacy alias);
-      5. ``use_gpu_phase5`` (GUI canonical phase-5 flag).
+      2. ``use_gpu_phase5`` (GUI canonical checkbox / phase-5 flag);
+      3. ``use_gpu_grid`` (legacy grid-specific alias);
+      4. ``stack_use_gpu`` (legacy stacking alias);
+      5. ``use_gpu_stack`` (legacy alias).
+
+    The canonical ``use_gpu_phase5`` key deliberately outranks the legacy
+    ``use_gpu_grid`` alias: an obsolete grid key must never contradict the Qt
+    checkbox. When the canonical key is absent, the historical relative order of
+    the legacy aliases is preserved.
 
     Returns ``(requested: bool, source: str)``. Unparseable/absent values are
     treated as unset (fall through); the default is ``(False, "default")``.

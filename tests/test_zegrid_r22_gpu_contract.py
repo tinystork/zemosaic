@@ -157,7 +157,9 @@ def test_worker_propagates_use_gpu_into_run_zegrid_mode(monkeypatch):
         auto_limit_frames_per_master_tile_config=False,
         winsor_max_frames_per_pass_config=0, winsor_worker_limit_config=1,
         max_raw_per_master_tile_config=100,
-        use_gpu_phase5=False, gpu_id_phase5=None,
+        # R55-E4: the explicit GUI handoff is authoritative; a positive intent
+        # must still reach the engine as use_gpu=True.
+        use_gpu_phase5=True, gpu_id_phase5=None,
     )
     try:
         zw.run_hierarchical_mosaic(**args)

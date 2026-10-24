@@ -450,7 +450,7 @@ def _ensure_legacy_gpu_defaults_on_config_module() -> None:
 
     defaults["use_gpu_phase5"] = _coerce_gpu_bool(defaults.get("use_gpu_phase5"), False)
     canonical = defaults["use_gpu_phase5"]
-    for key in ("stack_use_gpu", "use_gpu_stack"):
+    for key in ("use_gpu_grid", "stack_use_gpu", "use_gpu_stack"):
         defaults[key] = _coerce_gpu_bool(defaults.get(key, canonical), canonical)
 
 
@@ -4712,9 +4712,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if target is None:
             return False
 
+        # ``use_gpu_phase5`` is the canonical Qt checkbox value and is
+        # authoritative whenever it is present. Only a genuinely absent
+        # canonical key falls back to the legacy aliases (never the reverse):
+        # an obsolete grid/stack key can therefore never contradict the
+        # checkbox. See ``_normalize_gpu_flags`` for the persisted-config
+        # equivalent of this priority.
         canonical_value: Any = target.get("use_gpu_phase5")
         if canonical_value in (None, ""):
-            for legacy_key in ("stack_use_gpu", "use_gpu_stack"):
+            for legacy_key in ("stack_use_gpu", "use_gpu_stack", "use_gpu_grid"):
                 legacy_val = target.get(legacy_key)
                 if legacy_val not in (None, ""):
                     canonical_value = legacy_val
@@ -4722,7 +4728,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         gpu_enabled = self._normalize_config_bool(canonical_value, False)
         changed = False
-        for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
+        for key in ("use_gpu_phase5", "use_gpu_grid", "stack_use_gpu", "use_gpu_stack"):
             previous = target.get(key)
             if previous != gpu_enabled or not isinstance(previous, bool):
                 changed = True
@@ -4794,7 +4800,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     raw_value = self.config.get(key, raw_value)
 
             self.config[key] = raw_value
-            if key in {"use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"}:
+            if key in {
+                "use_gpu_phase5",
+                "use_gpu_grid",
+                "stack_use_gpu",
+                "use_gpu_stack",
+            }:
                 self._synchronize_gpu_config_keys()
         except Exception:
             self.config[key] = self.config.get(key)
@@ -5000,6 +5011,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "winsor_worker_limit": 0,
             "max_raw_per_master_tile": 0,
             "use_gpu_phase5": False,
+            "use_gpu_grid": False,
             "stack_use_gpu": False,
             "use_gpu_stack": False,
             "gpu_selector": "CPU (no GPU)",

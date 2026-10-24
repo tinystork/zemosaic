@@ -31037,7 +31037,10 @@ def run_hierarchical_mosaic(
     poststack_anchor_median_clip_sigma_config: float = 3.5,
     poststack_anchor_min_improvement_config: float = 0.12,
     poststack_anchor_use_overlap_affine_config: bool = True,
-    use_gpu_phase5: bool = False,
+    # ZM-ZEGRID-R55-E4: explicit GUI -> worker transport of the canonical GPU
+    # toggle. ``None`` keeps the historical persisted-config behavior for
+    # callers that do not pass it.
+    use_gpu_phase5: bool | None = None,
     gpu_id_phase5: int | None = None,
     enable_tile_weighting_config: bool | None = None,
     tile_weight_mode_config: str = "n_frames",
@@ -31129,6 +31132,24 @@ def run_hierarchical_mosaic(
             return bool(value)
         except Exception:
             return None
+
+    # ZM-ZEGRID-R55-E4: the transported GUI toggle is authoritative for this
+    # run. A False checkbox must switch the legacy grid/stack aliases OFF too;
+    # otherwise the engine would still see an obsolete ``use_gpu_grid=True``.
+    # An absent argument (None) leaves the persisted config untouched.
+    _explicit_gpu_pref = _coerce_bool_flag(use_gpu_phase5)
+    if _explicit_gpu_pref is not None:
+        for _gpu_key in (
+            "use_gpu_phase5",
+            "use_gpu_grid",
+            "stack_use_gpu",
+            "use_gpu_stack",
+        ):
+            worker_config_cache[_gpu_key] = _explicit_gpu_pref
+            try:
+                setattr(zconfig, _gpu_key, _explicit_gpu_pref)
+            except Exception:
+                pass
 
     grid_rgb_equalize_source = "argument"
     grid_rgb_equalize_flag = _coerce_bool_flag(poststack_equalize_rgb_config)

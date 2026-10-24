@@ -647,20 +647,30 @@ def _coerce_boolish(value: Any, default: Optional[bool] = False) -> Optional[boo
 
 
 def _normalize_gpu_flags(config: dict) -> None:
-    """Ensure GPU toggles are synchronised across legacy keys."""
+    """Ensure GPU toggles are synchronised across legacy keys.
+
+    Priority (first explicit value wins):
+      1. ``use_gpu_phase5`` — the canonical Qt checkbox / phase-5 intent;
+      2. ``stack_use_gpu`` — legacy stacking alias;
+      3. ``use_gpu_stack`` — legacy stacking alias;
+      4. ``use_gpu_grid`` — legacy grid alias.
+
+    Once the canonical value is known, ALL four keys are rewritten to it, so an
+    obsolete ``use_gpu_grid`` value can never contradict the checkbox. A legacy
+    config that only carries ``use_gpu_grid`` still keeps its intent by acting
+    as the last-resort fallback when the canonical key is absent.
+    """
 
     canonical = _coerce_boolish(config.get("use_gpu_phase5"), None)
     if canonical is None:
-        for key in ("stack_use_gpu", "use_gpu_stack"):
+        for key in ("stack_use_gpu", "use_gpu_stack", "use_gpu_grid"):
             canonical = _coerce_boolish(config.get(key), None)
             if canonical is not None:
                 break
     if canonical is None:
         canonical = False
-    config["use_gpu_phase5"] = canonical
-    for key in ("stack_use_gpu", "use_gpu_stack"):
-        config[key] = _coerce_boolish(config.get(key), canonical)
-    config["use_gpu_grid"] = _coerce_boolish(config.get("use_gpu_grid"), canonical)
+    for key in ("use_gpu_phase5", "use_gpu_grid", "stack_use_gpu", "use_gpu_stack"):
+        config[key] = canonical
 
 
 def _normalize_processing_mode(config: dict) -> None:
