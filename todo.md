@@ -396,6 +396,22 @@ FOLLOW-UP SCIENCE. Pas de fusion Classic/SDS simplement parce qu'ils se ressembl
 Pour toute découverte ajouter : ID, SHA, chemin/caller, attendu vs observé,
 commande/témoin/artefacts, impact, raison de non-correction, prochain pas unique.
 
+## R55 — état (2026-10-24)
+
+- **E2 — accepté.** Pipeline active GPU borné (producteur/consommateur, K=1,
+  prefetch borné, ledger/threads déterministes, fallback CPU whole-batch unique),
+  témoin MX150 accepté. Ce n'est pas une qualification Windows/RTX.
+- **E3 — readiness d'intégration seulement.** Sélecteur Qt persistant
+  `legacy`/`observe`/`active` (défaut legacy, `active` expérimental et sans
+  activation GPU implicite), propagation GUI -> config -> worker ->
+  `run_zegrid_mode` sans remap, matrice CPU/GPU simulée, tests spawn/lifecycle,
+  audit packaging/wheel (CuPy toujours optionnel), checker de résultat Windows
+  read-only fail-closed, guide `docs/beta/ZEGRID_WINDOWS_BETA_WITNESS.md`.
+- **Validation Windows/RTX 3070 — `WINDOWS_NOT_RUN`.** Aucune promesse de
+  performance ni qualification avant import d'un résultat Windows réel revu.
+- **Publication beta — non effectuée dans E3.** Autorisation produit distincte ;
+  vérifier le fast-forward vers `origin/beta` au moment de publier.
+
 ## 11. Orchestration et discipline Git (lors du lancement seulement)
 
 Junior dirige et accepte; Coco implémente des lots bornés, Nono révise indépendamment.

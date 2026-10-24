@@ -126,9 +126,12 @@ DEFAULT_CONFIG = {
     # Product default 64 (256 is experimental). The engine validates this value
     # strictly (see zemosaic/zegrid_halo.py); it is not a mutable global.
     "zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX,
-    # ZM-ZEGRID-R55-B: "legacy" (default, historical execution) or "observe"
-    # (records a predicted R55 plan in the manifest; execution unchanged).
-    # Unknown values fail visibly in the engine and are never coerced.
+    # ZM-ZEGRID-R55-B/E3: "legacy" (default, historical execution), "observe"
+    # (records a predicted R55 plan in the manifest; execution unchanged) or
+    # "active" (opt-in experimental beta: the R55 plan grants execution
+    # authority; GPU still requires the separate GPU toggle). Unknown values
+    # fail visibly in the engine and are never coerced. Configs without this
+    # key remain legacy.
     "zegrid_scheduler_mode": "legacy",
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto

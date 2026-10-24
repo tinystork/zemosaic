@@ -83,6 +83,7 @@ from .zegrid_halo import (
     ZeGridHaloError,
     resolve_zegrid_halo_px,
 )
+from .core.zegrid import scheduler as zsched
 
 logger = logging.getLogger(__name__)
 
@@ -1779,6 +1780,63 @@ class ZeMosaicQtMainWindow(QMainWindow):
             lambda _=None: self._on_zegrid_halo_selection_changed()
         )
 
+        # ZM-ZEGRID-R55-E3: explicit, persistent scheduler selector. Item data is
+        # the EXACT engine token (``legacy``/``observe``/``active``); localized
+        # text is display-only. ``legacy`` is the default and the only
+        # non-opt-in choice. ``active`` is experimental beta and does NOT enable
+        # the GPU by itself: the existing GPU toggle remains necessary.
+        zegrid_scheduler_label = QLabel(
+            self._tr(
+                "qt_field_zegrid_scheduler_label",
+                "ZeGrid scheduler (advanced)",
+            )
+        )
+        zegrid_scheduler_combo = QComboBox()
+        zegrid_scheduler_combo.setEditable(False)
+        zegrid_scheduler_combo.setInsertPolicy(QComboBox.NoInsert)
+        zegrid_scheduler_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        zegrid_scheduler_combo.setMinimumContentsLength(24)
+        for _scheduler_mode in zsched.MODES:
+            zegrid_scheduler_combo.addItem(
+                self._zegrid_scheduler_item_label(_scheduler_mode),
+                _scheduler_mode,
+            )
+        self._zegrid_scheduler_label = zegrid_scheduler_label
+        self._zegrid_scheduler_combo = zegrid_scheduler_combo
+        scheduler_tip = self._zegrid_scheduler_tooltip()
+        zegrid_scheduler_label.setToolTip(scheduler_tip)
+        zegrid_scheduler_combo.setToolTip(scheduler_tip)
+        try:
+            zegrid_scheduler_label.setBuddy(zegrid_scheduler_combo)
+        except Exception:
+            pass
+        layout.addRow(zegrid_scheduler_label, zegrid_scheduler_combo)
+
+        zegrid_scheduler_warning = QLabel(
+            self._tr(
+                "qt_zegrid_scheduler_active_warning",
+                "Experimental beta: 'active' changes scheduling and is NOT "
+                "qualified on Windows/RTX yet. The GPU toggle is still required "
+                "for GPU execution. No performance promise is made.",
+            )
+        )
+        zegrid_scheduler_warning.setWordWrap(True)
+        zegrid_scheduler_warning.setStyleSheet("color: #b36b00; font-size: 11px;")
+        zegrid_scheduler_warning.setVisible(False)
+        self._zegrid_scheduler_warning = zegrid_scheduler_warning
+        layout.addRow(QLabel(""), zegrid_scheduler_warning)
+
+        self._config_fields["zegrid_scheduler_mode"] = {
+            "kind": "combobox",
+            "widget": zegrid_scheduler_combo,
+            "type": str,
+            "value_getter": self._zegrid_scheduler_combo_value,
+        }
+        self._sync_zegrid_scheduler_combo_from_config()
+        zegrid_scheduler_combo.currentIndexChanged.connect(
+            lambda _=None: self._on_zegrid_scheduler_selection_changed()
+        )
+
         # One logical state, three mutually exclusive checkboxes.
         self._mode_checkboxes = {
             "existing_master_tiles": master_tiles_checkbox,
@@ -1835,6 +1893,164 @@ class ZeMosaicQtMainWindow(QMainWindow):
             )
         except Exception:
             return str(template)
+
+    # ------------------------------------------------------------------
+    # ZeGrid scheduler mode (ZM-ZEGRID-R55-E3)
+    # ------------------------------------------------------------------
+    _ZEGRID_SCHEDULER_ITEM_FALLBACKS = {
+        "legacy": "Standard (legacy)",
+        "observe": "Observe only (records predictions)",
+        "active": "Active — experimental beta",
+    }
+
+    def _zegrid_scheduler_item_label(self, mode: str) -> str:
+        fallback = self._ZEGRID_SCHEDULER_ITEM_FALLBACKS.get(str(mode), str(mode))
+        return self._tr(f"qt_zegrid_scheduler_opt_{mode}", fallback)
+
+    def _zegrid_scheduler_tooltip(self) -> str:
+        return self._tr(
+            "qt_field_zegrid_scheduler_tip",
+            "Choose how the ZeGrid engine schedules cell stacking. "
+            "'Standard (legacy)' is the historical, fully supported path. "
+            "'Observe only' records a predicted R55 plan without changing "
+            "execution. 'Active' is an experimental beta path that grants "
+            "execution authority to the R55 plan; it does NOT enable the GPU "
+            "by itself — the GPU toggle must also be enabled. Active is not "
+            "yet qualified on Windows or RTX hardware and makes no speed "
+            "promise.",
+        )
+
+    def _zegrid_scheduler_invalid_message(self, raw_value: Any) -> str:
+        template = self._tr(
+            "qt_zegrid_scheduler_invalid_value",
+            "Invalid ZeGrid scheduler value {value}. Allowed values: {allowed}. "
+            "Select a valid value before starting a run.",
+        )
+        try:
+            return template.format(
+                value=repr(raw_value),
+                allowed=", ".join(zsched.MODES),
+            )
+        except Exception:
+            return str(template)
+
+    def _zegrid_scheduler_combo_value(self) -> Any:
+        """Return the exact valid token, or preserve an invalid raw config value."""
+        combo = getattr(self, "_zegrid_scheduler_combo", None)
+        if combo is not None:
+            data = combo.currentData()
+            if isinstance(data, str):
+                try:
+                    return zsched.normalize_scheduler_mode(data)
+                except zsched.InvalidSchedulerMode:
+                    pass
+        return self.config.get("zegrid_scheduler_mode", zsched.DEFAULT_MODE)
+
+    def _sync_zegrid_scheduler_combo_from_config(self) -> bool:
+        """Select the config value when valid; keep an invalid value untouched."""
+        combo = getattr(self, "_zegrid_scheduler_combo", None)
+        if combo is None:
+            return False
+        raw_value = self.config.get("zegrid_scheduler_mode", zsched.DEFAULT_MODE)
+        try:
+            value = zsched.normalize_scheduler_mode(raw_value)
+        except (zsched.InvalidSchedulerMode, TypeError, ValueError):
+            combo.blockSignals(True)
+            try:
+                combo.setCurrentIndex(-1)
+            finally:
+                combo.blockSignals(False)
+            combo.setProperty("zegrid_scheduler_invalid", True)
+            self._update_zegrid_scheduler_warning()
+            return False
+        index = combo.findData(value)
+        combo.blockSignals(True)
+        try:
+            combo.setCurrentIndex(index if index >= 0 else -1)
+        finally:
+            combo.blockSignals(False)
+        combo.setProperty("zegrid_scheduler_invalid", False)
+        self.config["zegrid_scheduler_mode"] = str(value)
+        self._update_zegrid_scheduler_warning()
+        return True
+
+    def _on_zegrid_scheduler_selection_changed(self) -> None:
+        combo = getattr(self, "_zegrid_scheduler_combo", None)
+        if combo is None:
+            return
+        data = combo.currentData()
+        if not isinstance(data, str):
+            # The transient "invalid" index (-1) must not overwrite the raw
+            # invalid config value; a real selection is required to clear it.
+            return
+        try:
+            value = zsched.normalize_scheduler_mode(data)
+        except zsched.InvalidSchedulerMode:
+            return
+        self.config["zegrid_scheduler_mode"] = str(value)
+        combo.setProperty("zegrid_scheduler_invalid", False)
+        self._update_zegrid_scheduler_warning()
+
+    def _update_zegrid_scheduler_warning(self) -> None:
+        warning = getattr(self, "_zegrid_scheduler_warning", None)
+        if warning is None:
+            return
+        combo = getattr(self, "_zegrid_scheduler_combo", None)
+        selected = combo.currentData() if combo is not None else None
+        try:
+            warning.setVisible(selected == zsched.MODE_ACTIVE)
+        except Exception:
+            pass
+
+    def _validate_zegrid_scheduler_for_start(self) -> bool:
+        """Sync/validate the scheduler mode and block only an effective ZeGrid run.
+
+        An invalid raw value is never repaired or saved over. It blocks a
+        ZeGrid spawn, while an unrelated Classic/SDS/master-tiles run still
+        starts and merely keeps the warning in the log.
+        """
+        combo = getattr(self, "_zegrid_scheduler_combo", None)
+        if combo is not None:
+            data = combo.currentData()
+            if isinstance(data, str):
+                try:
+                    value = zsched.normalize_scheduler_mode(data)
+                except zsched.InvalidSchedulerMode:
+                    pass
+                else:
+                    self.config["zegrid_scheduler_mode"] = str(value)
+                    combo.setProperty("zegrid_scheduler_invalid", False)
+        raw_value = self.config.get("zegrid_scheduler_mode", zsched.DEFAULT_MODE)
+        try:
+            value = zsched.normalize_scheduler_mode(raw_value)
+        except (zsched.InvalidSchedulerMode, TypeError, ValueError):
+            message = self._zegrid_scheduler_invalid_message(raw_value)
+            if not getattr(self, "_zegrid_scheduler_start_warning_logged", False):
+                self._append_log(message, level="warning")
+                self._zegrid_scheduler_start_warning_logged = True
+            if self._selected_processing_mode() != "zegrid":
+                return True
+            QMessageBox.warning(
+                self,
+                self._tr("qt_error_invalid_config_title", "Invalid configuration"),
+                message,
+            )
+            return False
+        self.config["zegrid_scheduler_mode"] = str(value)
+        if value == zsched.MODE_ACTIVE and self._selected_processing_mode() == "zegrid":
+            if not getattr(self, "_zegrid_scheduler_start_warning_logged", False):
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_scheduler_active_run_warning",
+                        "ZeGrid scheduler 'active' is an experimental beta path. "
+                        "It is not qualified on Windows/RTX and makes no "
+                        "performance promise. Keep the GPU toggle off to run on CPU.",
+                    ),
+                    level="warning",
+                )
+                self._zegrid_scheduler_start_warning_logged = True
+        self._update_zegrid_scheduler_warning()
+        return True
 
     def _zegrid_halo_combo_value(self) -> Any:
         """Return the valid integer item data, or preserve an invalid config value."""
@@ -1913,6 +2129,19 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 label.setEnabled(enabled)
             except Exception:
                 pass
+        scheduler_combo = getattr(self, "_zegrid_scheduler_combo", None)
+        scheduler_label = getattr(self, "_zegrid_scheduler_label", None)
+        if scheduler_combo is not None:
+            try:
+                scheduler_combo.setEnabled(enabled)
+            except Exception:
+                pass
+        if scheduler_label is not None:
+            try:
+                scheduler_label.setEnabled(enabled)
+            except Exception:
+                pass
+        self._update_zegrid_scheduler_warning()
 
     def _validate_zegrid_halo_for_start(self) -> bool:
         """Sync/validate the halo and block only an effective ZeGrid run.
@@ -7440,7 +7669,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # One warning per start attempt; the dialog is shown only when the
         # effective mode actually needs the ZeGrid halo.
         self._zegrid_halo_start_warning_logged = False
+        self._zegrid_scheduler_start_warning_logged = False
         if not self._validate_zegrid_halo_for_start():
+            return
+        if not self._validate_zegrid_scheduler_for_start():
             return
         use_existing_master_tiles = self._existing_master_tiles_enabled()
 
@@ -7477,6 +7709,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # the first preflight. Revalidate unconditionally at the last point
         # before snapshot/save/spawn.
         if not self._validate_zegrid_halo_for_start():
+            return
+        if not self._validate_zegrid_scheduler_for_start():
             return
 
         run_snapshot = self._serialize_config_for_save()
