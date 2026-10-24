@@ -508,6 +508,17 @@ def _patch_gpu(monkeypatch, free_vram_reader):
     )
     monkeypatch.setattr(zz.zgr, "read_vram_free_bytes", free_vram_reader)
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: 12 * GIB)
+    # ``_r55_active_gpu_admit`` captures ``available_memory_bytes`` in its
+    # default argument at definition time, so patching the module attribute
+    # alone does not isolate admission from the host's current free RAM.
+    # Inject the same deterministic observation explicitly for these model-only
+    # witnesses; RUN-time checkpoints still consume the patched module function.
+    real_admit = zz._r55_active_gpu_admit
+
+    def admit_with_fixed_host_observation(**kwargs):
+        return real_admit(**kwargs, available_fn=lambda: 12 * GIB)
+
+    monkeypatch.setattr(zz, "_r55_active_gpu_admit", admit_with_fixed_host_observation)
 
 
 def _sequence(values):
