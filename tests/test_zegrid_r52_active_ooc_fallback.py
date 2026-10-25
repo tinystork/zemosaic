@@ -316,6 +316,26 @@ def _pressure_env(tmp_path, monkeypatch, *, dense_mib, bounded_mib, raw):
     return inp, out, holder
 
 
+def test_runtime_governing_budget_refuses_both_profiles(tmp_path, monkeypatch):
+    """The governing (latched) budget is too low for dense AND bounded."""
+    inp, out, _h = _pressure_env(
+        tmp_path, monkeypatch, dense_mib=1024, bounded_mib=4,
+        raw=_DENSE_OK_RAW,
+    )
+    _inject_wave1_latched(monkeypatch, 8 * MIB)
+    with pytest.raises(zz._R55RunRefused) as ei:
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=_active_zconfig("active"),
+            zegrid_halo_px=8,
+        )
+    assert ei.value.reason_code == zz.renv.REASON_REFUSE_HOST_RAM
+    assert ei.value.storage_fallback_eligible is True
+    assert zz._STORAGE_EFFECTIVE == "bounded"
+    assert zz._STORAGE_FALLBACK_COUNT == 1
+    assert not (out / "mosaic_grid.fits").exists()
+    assert not (out / "zegrid_manifest.json").exists()
+
+
 def _eligible_refusal(raw, *, wave_index=1, remaining_units=3):
     return zz._R55RunRefused(
         zz.renv.REASON_REFUSE_HOST_RAM,
