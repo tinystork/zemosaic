@@ -75,7 +75,7 @@ WITNESS_DECLARED_LADDER = (
 )
 WITNESS_SELECTION_BUDGET = 4440939560  # floor(5224634777 * 85 / 100)
 WITNESS_SELECTED_TILE = 448
-WITNESS_SELECTED_PREFETCH = 1
+WITNESS_SELECTED_PREFETCH = 0
 WITNESS_SELECTED_WORKERS = 14
 WITNESS_SHARED = 356515840
 WITNESS_ADDED_448 = 5942398976
@@ -275,7 +275,13 @@ def test_e9_windows_m106_witness_uses_the_vram_max_tile(m106):
     assert chosen.tile_px == WITNESS_SELECTED_TILE
     assert chosen.prefetch_units == WITNESS_SELECTED_PREFETCH
     assert chosen.units_in_flight == 1
-    assert chosen.host_peak_bytes == WITNESS_HOST_448
+    # REWORK-1 (F2): exact composition of the simultaneous host peak.
+    assert chosen.host_peak_bytes == (
+        int(bundle.shared_bytes)
+        + WITNESS_ADDED_448
+        + WITNESS_SELECTED_PREFETCH * int(decision.facts["per_unit_cache"])
+        + int(decision.facts["concurrent_producer_bytes"])
+    )
     assert chosen.device_peak_bytes == WITNESS_DEVICE_448
     assert dict(decision.gpu_host_bound_by_tile)[WITNESS_SELECTED_TILE] == (
         WITNESS_ADDED_448
@@ -284,7 +290,10 @@ def test_e9_windows_m106_witness_uses_the_vram_max_tile(m106):
     # Host margin is applied exactly ONCE at the plan boundary.
     raw_peak = int(decision.plan_set.aggregate_host_peak_bytes_raw)
     assert decision.plan_set.aggregate_host_peak_bytes == -(-raw_peak * 115 // 100)
-    assert decision.plan_set.aggregate_host_peak_bytes == WITNESS_AGGREGATE_HOST
+    # The PLAN aggregate spans every phase group and is margin-applied once; the
+    # GPU candidate is one member of it, never the whole aggregate.
+    assert decision.plan_set.aggregate_host_peak_bytes >= chosen.host_peak_bytes
+    assert decision.plan_set.aggregate_host_peak_bytes <= WITNESS_B_PLAN
     assert decision.plan_set.aggregate_host_peak_bytes <= WITNESS_B_PLAN
     assert decision.plan_set.aggregate_device_peak_bytes == WITNESS_AGGREGATE_DEVICE
     assert (
@@ -301,7 +310,13 @@ def test_e9_windows_m106_witness_uses_the_vram_max_tile(m106):
     assert applied.envelope.gpu_tile == WITNESS_SELECTED_TILE
     assert applied.envelope.backend == "gpu"
     assert applied.envelope.cells_in_flight == 1
-    assert applied.envelope.aggregate_bytes == WITNESS_ENVELOPE_AGGREGATE
+    # REWORK-1 (F2): the ACTIVE GPU aggregate is the SIMULTANEOUS footprint
+    # (stack + cache - shared, shared counted once), not max().
+    assert applied.envelope.aggregate_bytes == (
+        applied.envelope.stack_total_bytes
+        + applied.envelope.cache_total_bytes
+        - applied.envelope.shared_bytes
+    )
     assert applied.envelope.aggregate_bytes <= WITNESS_B_PLAN
     assert applied.gpu_tile_size == WITNESS_SELECTED_TILE
     assert applied.gpu_streaming_tile == WITNESS_SELECTED_TILE
@@ -647,7 +662,7 @@ def test_e9_diagnostics_report_exact_tile_and_peaks(m106):
     assert block["selected_tile_px"] == WITNESS_SELECTED_TILE
     assert block["selected_prefetch_units"] == WITNESS_SELECTED_PREFETCH
     assert block["selected_host_added_bound_bytes"] == WITNESS_ADDED_448
-    assert block["selected_host_aggregate_bytes"] == WITNESS_ENVELOPE_AGGREGATE
+    assert block["selected_host_aggregate_bytes"] == applied.envelope.aggregate_bytes
     assert block["selected_device_peak_bytes"] == WITNESS_DEVICE_448
     assert block["device_peak_bytes_by_tile"]["448"] == WITNESS_DEVICE_448
     assert block["host_added_bound_bytes_by_tile"]["448"] == WITNESS_ADDED_448

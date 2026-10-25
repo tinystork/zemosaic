@@ -761,11 +761,21 @@ def test_run_credit_model_is_coherent_and_publishes_disk_and_overlap(
     ledger = pipe["ledger"]
     assert ledger["schema"] == zpar.PIPELINE_SCHEMA_V2
     assert ledger["balanced"] is True
-    assert ledger["disk_budget_bytes"] == credit["disk_budget_bytes"]
+    assert ledger["disk_budget_bytes"] <= credit["disk_budget_bytes"]
     assert ledger["host_budget_bytes"] == credit["host_budget_bytes"]
     # The on-disk peak is a real, positive observation of the queued caches.
     assert ledger["disk_peak_bytes"] > 0
     assert ledger["disk_peak_bytes"] <= policy["disk"]["required_bytes"]
+    # F1: the product pre-acquires and reconciles; F4 may shrink the disk budget
+    # from a fresh observation, but never grow it.
+    assert pipe["credit_accounting"]["mode"] == "pre_acquire"
+    assert ledger["reconciliations"] > 0
+    # F4 reductions are OPTIONAL: the fresh volume may be large enough that the
+    # shrink-only budget is unchanged. If present, they may only shrink.
+    assert all(
+        entry["to_bytes"] <= entry["from_bytes"]
+        for entry in ledger["budget_reductions"]
+    )
 
     overlap = run_block["overlap"]
     assert overlap["clock"] == "time.monotonic"

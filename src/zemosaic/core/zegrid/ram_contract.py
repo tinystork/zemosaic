@@ -86,6 +86,14 @@ PLAN_FACTOR_DEN = 5
 ADMIT_FACTOR_NUM = 9
 ADMIT_FACTOR_DEN = 10
 
+# ZM-ZEGRID-R56 REWORK-1 (F2): explicit aggregation rules for the plan envelope.
+AGGREGATE_RULE_MAX_OVER_PHASES = "max_over_phases"
+AGGREGATE_RULE_STACK_PLUS_CACHE = "simultaneous_stack_plus_cache_minus_shared"
+AGGREGATE_RULES = (
+    AGGREGATE_RULE_MAX_OVER_PHASES,
+    AGGREGATE_RULE_STACK_PLUS_CACHE,
+)
+
 # The SINGLE authoritative process floor shared by the host phase accounting.
 # ``parallel._PER_WORKER_BASELINE_BYTES`` is assigned FROM this constant so the
 # two can never drift (L3).
@@ -300,6 +308,10 @@ class PlanEnvelope:
     aggregate_bytes: int
     pinned: bool
     reason: str
+    # ZM-ZEGRID-R56 REWORK-1 (F2): which aggregation rule produced
+    # ``aggregate_bytes``. The default preserves every existing envelope; only
+    # the ACTIVE GPU bundle declares the simultaneous rule.
+    aggregate_rule: str = AGGREGATE_RULE_MAX_OVER_PHASES
 
     @property
     def layout_identity(self) -> tuple:
@@ -323,6 +335,7 @@ class PlanEnvelope:
             "stack_total_bytes": int(self.stack_total_bytes),
             "cache_total_bytes": int(self.cache_total_bytes),
             "aggregate_bytes": int(self.aggregate_bytes),
+            "aggregate_rule": str(self.aggregate_rule),
             "pinned": bool(self.pinned),
             "reason": str(self.reason),
         }
@@ -408,12 +421,27 @@ def validate_envelope(envelope: PlanEnvelope) -> None:
         _require_nonneg_int(getattr(envelope, name), name)
     if envelope.gpu_tile is not None:
         _require_nonneg_int(envelope.gpu_tile, "gpu_tile")
-    if int(envelope.aggregate_bytes) != max(
-        int(envelope.stack_total_bytes), int(envelope.cache_total_bytes)
-    ):
+    if envelope.aggregate_rule not in AGGREGATE_RULES:
         raise InvalidEnvelope(
-            f"aggregate_bytes {envelope.aggregate_bytes} != max(stack_total "
-            f"{envelope.stack_total_bytes}, cache_total {envelope.cache_total_bytes})"
+            f"unknown aggregate_rule {envelope.aggregate_rule!r} "
+            f"(expected {AGGREGATE_RULES})"
+        )
+    if envelope.aggregate_rule == AGGREGATE_RULE_MAX_OVER_PHASES:
+        expected_aggregate = max(
+            int(envelope.stack_total_bytes), int(envelope.cache_total_bytes)
+        )
+    else:
+        expected_aggregate = simultaneous_stack_and_cache_bytes(
+            int(envelope.stack_total_bytes),
+            int(envelope.cache_total_bytes),
+            int(envelope.shared_bytes),
+        )
+    if int(envelope.aggregate_bytes) != int(expected_aggregate):
+        raise InvalidEnvelope(
+            f"aggregate_bytes {envelope.aggregate_bytes} != {expected_aggregate} "
+            f"under aggregate_rule {envelope.aggregate_rule!r} "
+            f"(stack_total {envelope.stack_total_bytes}, cache_total "
+            f"{envelope.cache_total_bytes}, shared {envelope.shared_bytes})"
         )
     if int(envelope.stack_total_bytes) < int(envelope.shared_bytes):
         raise InvalidEnvelope("stack_total_bytes < shared_bytes")
@@ -596,6 +624,33 @@ def aggregate_phase_bytes(stack_total_bytes: int, cache_total_bytes: int) -> int
     st = _require_nonneg_int(stack_total_bytes, "stack_total_bytes")
     ct = _require_nonneg_int(cache_total_bytes, "cache_total_bytes")
     return max(st, ct)
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R56 REWORK-1 (F2): true simultaneous ownership
+# ---------------------------------------------------------------------------
+
+
+def simultaneous_stack_and_cache_bytes(
+    stack_total_bytes: int, cache_total_bytes: int, shared_bytes: int
+) -> int:
+    """Host bytes when the stack and the cache-build set COEXIST.
+
+    Both phase totals already count ``shared_bytes`` once, so the simultaneous
+    total is ``stack + cache - shared`` (shared counted exactly once). This is
+    the ACTIVE GPU pipeline case: the producer's cache-build worker set runs
+    while the consumer stacks the previous Cell. It is NOT a blanket sum of all
+    phases: only owners that genuinely coexist are added here.
+    """
+    st = _require_nonneg_int(stack_total_bytes, "stack_total_bytes")
+    ct = _require_nonneg_int(cache_total_bytes, "cache_total_bytes")
+    sh = _require_nonneg_int(shared_bytes, "shared_bytes")
+    if st < sh or ct < sh:
+        raise InvalidEnvelope(
+            "simultaneous aggregate requires stack_total and cache_total >= "
+            f"shared (stack={st}, cache={ct}, shared={sh})"
+        )
+    return int(st) + int(ct) - int(sh)
 
 
 def feasible_concurrency(

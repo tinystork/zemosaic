@@ -423,17 +423,18 @@ def _total_bound(tile: int) -> int:
 
 
 def test_product_decision_is_largest_feasible_dynamic_tile(tmp_path):
-    """R55-E9: the E7 witness keeps its largest jointly feasible GPU tile.
+    """R55-E9 + REWORK-1 F2: largest jointly feasible GPU tile.
 
     The E7 budgets were originally pinned to tile128 because the ACTIVE path
     intersected the VRAM maximum with the CPU ladder. That artificial cap is
-    gone: the exact same witness now selects the largest jointly feasible
-    declared GPU rung (448 at prefetch 0), with every bound still exact.
+    gone. REWORK-1 (F2) additionally accounts for the producer cache worker set
+    that COEXISTS with the GPU consumer, so the largest feasible rung on this
+    witness is 384 (448 now exceeds the simultaneous host bound).
     """
     shared = int(WITNESS_SHARED_MIB * MIB)
     _raw, budget = _witness_budget()
     decision = _decide(tmp_path)
-    tile = 448
+    tile = 384
 
     mapping = decision.mapping
     assert mapping["backend"] == "gpu"
@@ -455,7 +456,11 @@ def test_product_decision_is_largest_feasible_dynamic_tile(tmp_path):
     # bound (the same contract as ``check_streaming_gate``). Exact integer
     # equality is still asserted, never a range.
     added = _total_bound(tile) - int(zz.rcontract.PROCESS_BASELINE_BYTES)
-    assert chosen.host_peak_bytes == shared + added
+    # REWORK-1 (F2): the coexisting producer owner is part of the simultaneous
+    # host peak and is published in the same envelope estimate.
+    assert chosen.host_peak_bytes == (
+        shared + added + int(decision.facts["concurrent_producer_bytes"])
+    )
     assert chosen.host_peak_bytes != shared + max(_witness_bounds().values())
 
     gpu_phase = next(
@@ -799,15 +804,17 @@ def test_m106_descriptor_planning_probe_admits_dynamic_tile(tmp_path):
         readiness=_readiness(),
     )
     tile = int(decision.mapping["gpu_streaming_tile"])
-    assert tile == 448
+    assert tile == 384
     assert tile > 128
     assert decision.mapping["units_in_flight"] == 1
     assert decision.mapping["prefetch_units"] == 0
-    # prefetch_units == 0, so the only host terms are shared + this tile's
-    # exact ADDED streaming bound.
+    # prefetch_units == 0: the host terms are shared + this tile's exact ADDED
+    # streaming bound + the COEXISTING producer owner (REWORK-1 F2).
     assert decision.plan_set.chosen.host_peak_bytes == (
         int(WITNESS_SHARED_MIB * MIB)
         + (_total_bound(tile) - int(zz.rcontract.PROCESS_BASELINE_BYTES))
+        + int(decision.facts["concurrent_producer_bytes"])
     )
+    assert int(decision.facts["concurrent_producer_bytes"]) > 0
     assert decision.plan_set.aggregate_host_peak_bytes <= budget
     assert decision.plan_set.aggregate_device_peak_bytes <= decision.gpu_facts.vram_budget_bytes

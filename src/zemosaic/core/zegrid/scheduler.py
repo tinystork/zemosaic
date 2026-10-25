@@ -408,6 +408,14 @@ class PlanContext:
     # When supplied, ``per_unit_prefetch_bytes`` means RESIDENT host memory per
     # prefetch slot and this field means the EXACT aligned-cache bytes on disk.
     per_unit_prefetch_disk_bytes: int | None = None
+    # ZM-ZEGRID-R56 REWORK-1 (F2): the RESIDENT bytes of the ONE producer phase
+    # that genuinely coexists with the consumer in the bounded pipeline
+    # (max(cache-build worker set, cell-normalization working set)). ``0`` (the
+    # default) preserves every existing caller/hash; the ACTIVE GPU pipeline sets
+    # it explicitly so PLAN/ADMIT/RUN share ONE simultaneous-ownership model.
+    # This is ADDITIVE to the stack term: it is a concurrent owner, not an
+    # alternative phase.
+    concurrent_producer_bytes: int = 0
     # ZM-ZEGRID-R52-OOC Lot B: the ONE storage model this plan is admitted
     # against. ``dense`` keeps the historical model byte-for-byte; ``bounded``
     # removes only the terms the bounded provider/sink eliminate. The profile is
@@ -674,6 +682,7 @@ def _validate_context(context: PlanContext, *, allow_gpu: bool = False) -> None:
             context.per_unit_prefetch_disk_bytes,
             "per_unit_prefetch_disk_bytes",
         )
+    require_int(context.concurrent_producer_bytes, "concurrent_producer_bytes")
     require_int(context.disk_free_bytes, "disk_free_bytes")
     if isinstance(context.layout, (str, bytes)) or not isinstance(
         context.layout, (tuple, list)
@@ -914,6 +923,7 @@ def enumerate_candidates(context: PlanContext) -> tuple[Candidate, ...]:
                         int(context.shared_bytes)
                         + k * per_unit
                         + int(prefetch) * int(context.per_unit_prefetch_bytes)
+                        + int(context.concurrent_producer_bytes)
                     )
                     disk = disk_residency_bytes(
                         units_in_flight=k,
@@ -1538,6 +1548,7 @@ def _enumerate_gpu_candidates(
                     int(gpu.shared_bytes)
                     + k * per_unit
                     + int(prefetch) * int(gpu.per_unit_prefetch_bytes)
+                    + int(gpu.concurrent_producer_bytes)
                 )
                 disk = disk_residency_bytes(
                     units_in_flight=k,
@@ -1990,6 +2001,15 @@ def _stack_envelope(context: PlanContext, candidate: Candidate) -> ResourceEnvel
         ),
         "shared_bytes": int(context.shared_bytes),
         "stack_in_flight_bytes": int(candidate.units_in_flight) * int(per_unit),
+        **(
+            {}
+            if not int(context.concurrent_producer_bytes)
+            else {
+                "concurrent_producer_bytes": int(
+                    context.concurrent_producer_bytes
+                )
+            }
+        ),
     }
     estimate = make_estimate(
         components,
@@ -2291,6 +2311,15 @@ def _gpu_stack_envelope(
         "shared_bytes": int(gpu.shared_bytes),
         "stack_in_flight_bytes": (
             int(candidate.units_in_flight) * int(per_unit)
+        ),
+        **(
+            {}
+            if not int(gpu.concurrent_producer_bytes)
+            else {
+                "concurrent_producer_bytes": int(
+                    gpu.concurrent_producer_bytes
+                )
+            }
         ),
     }
     estimate = make_estimate(
@@ -2799,6 +2828,17 @@ def _joint_context_payload(context: PlanContext) -> dict:
         "per_unit_stack_bytes": int(context.per_unit_stack_bytes),
         "per_unit_cache_bytes": int(context.per_unit_cache_bytes),
         "per_unit_prefetch_bytes": int(context.per_unit_prefetch_bytes),
+        # ZM-ZEGRID-R56 REWORK-1: only emitted when the caller declared the
+        # concurrent producer owner, so existing payloads/hashes are unchanged.
+        **(
+            {}
+            if not int(context.concurrent_producer_bytes)
+            else {
+                "concurrent_producer_bytes": int(
+                    context.concurrent_producer_bytes
+                )
+            }
+        ),
         # ZM-ZEGRID-R56: only emitted when the caller separated disk from
         # resident host, so existing payloads/hashes stay byte-identical.
         **(

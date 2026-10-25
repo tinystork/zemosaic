@@ -5600,6 +5600,26 @@ def _r55_active_facts(
         "cache_footprint_bytes": int(cache_footprint),
         "gauge_workers": int(gauge_workers),
         "cache_workers": int(cache_workers),
+        # ZM-ZEGRID-R56 REWORK-1 (F2): the ONE producer phase that genuinely
+        # coexists with the GPU consumer in the bounded pipeline. Cache-build
+        # workers and cell normalization run SEQUENTIALLY on the producer, so we
+        # take their MAX (never the sum); the initial global gauge is a separate
+        # pre-pipeline phase and is NOT added here.
+        "concurrent_producer_bytes": int(
+            max(
+                int(
+                    rcontract.cache_per_cell_bytes(
+                        rcontract.PROCESS_BASELINE_BYTES,
+                        int(cache_workers),
+                        int(cache_footprint),
+                    )
+                ),
+                # Cell normalization working set: at most two owned provider
+                # copies (current frame + one reference/accumulator plane), each
+                # one worst-patch RGB float32 plane + its bool support plane.
+                2 * int(worst_patch_px) * (int(channels) * 4 + 1),
+            )
+        ),
         "halo_band_bytes": int(halo_band_bytes),
         "retained_core_bytes": int(retained_core_bytes),
         # B_plan and the ONE margin the global envelope validation applies.
@@ -6253,6 +6273,9 @@ def _r55_active_gpu_decide(
             # ZM-ZEGRID-R56: the ON-DISK bytes of a prefetch slot, accounted in
             # the scheduler's separate disk-residency term (never host RAM).
             per_unit_prefetch_disk_bytes=int(base["per_unit_prefetch_disk"]),
+            # F2: the concurrent producer owner is added to the SIMULTANEOUS
+            # host peak, so PLAN/ADMIT inspect the same coexistence RUN uses.
+            concurrent_producer_bytes=int(base["concurrent_producer_bytes"]),
             time_model=None,
             profile=None,
         )
@@ -6676,7 +6699,9 @@ def _r55_active_gpu_apply(
         )
     )
     aggregate = int(
-        rcontract.aggregate_phase_bytes(stack_total, cache_total)
+        rcontract.simultaneous_stack_and_cache_bytes(
+            stack_total, cache_total, int(bundle.shared_bytes)
+        )
     )
     reason = (
         "R55-E2 active GPU mapping: "
@@ -6700,6 +6725,7 @@ def _r55_active_gpu_apply(
         stack_total_bytes=int(stack_total),
         cache_total_bytes=int(cache_total),
         aggregate_bytes=int(aggregate),
+        aggregate_rule=rcontract.AGGREGATE_RULE_STACK_PLUS_CACHE,
         pinned=bool(base_env.pinned),
         reason=reason,
     )
@@ -7701,7 +7727,14 @@ def _r55_gpu_host_aggregate_for_tile(decision, bundle, tile: int) -> int:
             int(bundle.shared_bytes), 1, cache_per_cell
         )
     )
-    return int(rcontract.aggregate_phase_bytes(stack_total, cache_total))
+    # F2: the producer's cache-build set COEXISTS with the GPU consumer, so the
+    # simultaneous footprint is stack + cache - shared (shared once). The old
+    # max() model is exactly what hid the concurrent producer.
+    return int(
+        rcontract.simultaneous_stack_and_cache_bytes(
+            stack_total, cache_total, int(bundle.shared_bytes)
+        )
+    )
 
 
 def _r55_runtime_tile_check(
@@ -11280,6 +11313,61 @@ def _run_single(
         # thread-shared mutable state. Wrap each canonical task once.
         tasks = list(gpu_bundle.cell_tasks)
         indexed = list(enumerate(tasks))
+        def _host_reserve(task):
+            """F1: PREDICTED resident staging bytes, from the PLAN bound only.
+
+            Reserved BEFORE ``_prepare_stack_cell`` allocates or writes anything.
+            Dense keeps the worst-shape cache bound (conservative); bounded uses
+            the derived one-access resident bound. The actual payload is then
+            reconciled DOWN, never up.
+            """
+            return int(unit_host)
+
+        def _disk_reserve(task):
+            """F1: PREDICTED on-disk bytes, the worst-shape cache upper bound."""
+            return int(unit_disk)
+
+        disk_fresh_refusal: dict = {}
+
+        def _before_produce(task, ledger):
+            """F4: fresh disk observation BEFORE staging, shrink-only.
+
+            Own retained cache bytes are ADDED BACK to the free space before the
+            half-free policy is applied (they are already allocated, so counting
+            them twice would double-subtract). The ledger may only shrink here.
+            A volume that cannot hold the next staging step refuses BEFORE any
+            production. The OS can still change between this observation and the
+            write (documented race window); the static ledger cannot detect it.
+            """
+            try:
+                fresh_free = int(
+                    shutil.disk_usage(str(disk_root)).free
+                )
+            except Exception:
+                return
+            snap = ledger.snapshot()
+            own = int(snap["disk_used_bytes"])
+            capacity = max(0, (fresh_free + own) // 2)
+            allowed = min(int(ledger.disk_budget_bytes), int(capacity))
+            ledger.reduce_budget("disk", int(allowed))
+            if int(own) + int(unit_disk) > int(ledger.disk_budget_bytes):
+                disk_fresh_refusal.update(
+                    {
+                        "reason_code": str(renv.REASON_REFUSE_DISK),
+                        "fresh_free_bytes": int(fresh_free),
+                        "own_retained_bytes": int(own),
+                        "capacity_bytes": int(ledger.disk_budget_bytes),
+                        "next_reservation_bytes": int(unit_disk),
+                        "disk_root": str(disk_root),
+                    }
+                )
+                raise zpar.PipelineAccountingError(
+                    "fresh disk observation cannot hold the next staged cache: "
+                    f"free={fresh_free} own={own} "
+                    f"capacity={ledger.disk_budget_bytes} "
+                    f"next={unit_disk}"
+                )
+
         host_budget_val = int(host_budget)
         pipeline = zpar.BoundedPipeline(
             tasks=indexed,
@@ -11293,6 +11381,11 @@ def _run_single(
             host_bytes=_host_bytes,
             device_bytes=_device_bytes,
             disk_bytes=_disk_bytes,
+            # F1: credit BEFORE allocation, then reconcile down to the payload.
+            host_reserve_bytes=_host_reserve,
+            disk_reserve_bytes=_disk_reserve,
+            # F4: fresh, shrink-only disk revalidation before every staging.
+            before_produce=_before_produce,
             thread_join_s=float(_R55E2_PIPELINE_JOIN_S),
             # No internal per-unit stall budget: honest liveness for a long
             # healthy GPU cell is "the caller is still inside consume". Only a
@@ -11374,9 +11467,13 @@ def _run_single(
                         _record["action"] = "fallback_cpu"
                         _record["discarded"] = True
             _generic_reason = (
-                "R55_GPU_RUNTIME"
-                if zgpu.is_gpu_runtime_error(exc)
-                else "R55_GPU_PIPELINE_FAILED"
+                str(renv.REASON_REFUSE_DISK)
+                if disk_fresh_refusal
+                else (
+                    "R55_GPU_RUNTIME"
+                    if zgpu.is_gpu_runtime_error(exc)
+                    else "R55_GPU_PIPELINE_FAILED"
+                )
             )
             with tile_lock:
                 tile_state["final_cause"] = str(_generic_reason)

@@ -1177,11 +1177,23 @@ def test_e11_runtime_aggregate_equals_apply_and_does_not_double_count(tile):
 
     total = int(zz._estimate_streaming_bytes(66, (1767, 1330), tile))
     old_stack = rcontract.stack_phase_total_bytes(bundle.shared_bytes, 1, total)
-    old_aggregate = max(old_stack, applied.envelope.cache_total_bytes)
-    assert old_aggregate - runtime == rcontract.PROCESS_BASELINE_BYTES
-    # The OLD aggregate would reject a budget that the corrected one accepts:
-    # this is the artificial-baseline shrink/fallback the rework removes.
-    assert old_aggregate > runtime
+    # REWORK-1 (F2): the ACTIVE GPU producer coexists with the consumer, so the
+    # aggregate is stack + cache - shared (shared counted ONCE), never max().
+    assert runtime == (
+        applied.envelope.stack_total_bytes
+        + applied.envelope.cache_total_bytes
+        - bundle.shared_bytes
+    )
+    old_max = max(
+        applied.envelope.stack_total_bytes, applied.envelope.cache_total_bytes
+    )
+    assert runtime - old_max == (
+        min(applied.envelope.stack_total_bytes, applied.envelope.cache_total_bytes)
+        - bundle.shared_bytes
+    )
+    # The historical max() model UNDER-counts the coexisting producer owner.
+    assert runtime > old_max
+    assert old_stack >= applied.envelope.stack_total_bytes
     check = zz._r55_runtime_tile_check(
         decision,
         tile=tile,

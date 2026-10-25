@@ -155,9 +155,12 @@ def _active_cpu_decide(m106, bundle, *, halo, cpu):
         # R55-E11 cache-byte contract: at this host budget the corrected
         # per-unit cache bound makes prefetch=1 the largest exact feasible
         # depth (prefetch=2 no longer fits the same B_plan); tile is unchanged.
+        # REWORK-1 (F2): the coexisting producer cache-build owner now consumes
+        # part of the same B_plan, so prefetch drops to 0 at these budgets and
+        # the 7 GiB witness selects the largest feasible rung (384).
         (2, 192, 1),
-        (4, 320, 1),
-        (7, 448, 0),
+        (4, 320, 0),
+        (7, 384, 0),
     ],
 )
 def test_gate_a_windows_automatic_gauge_and_gpu_plan(
@@ -210,6 +213,7 @@ def test_gate_a_windows_automatic_gauge_and_gpu_plan(
     assert chosen.host_peak_bytes == (
         bundle.shared_bytes + added + decision.facts["per_unit_cache"]
         * chosen.prefetch_units
+        + int(decision.facts["concurrent_producer_bytes"])
     )
     assert envelope.geometry.tile_px == tile
     assert envelope.estimate.peak_bytes == chosen.host_peak_bytes
@@ -245,36 +249,23 @@ def test_gate_b_linux_legacy_and_active_keep_the_feasible_gpu_tile(m106):
         int(t["tile"]) > 128 and t["fits"] is False for t in trials
     ), trials
 
-    decision = _active_gpu_decide(
-        m106,
-        bundle,
-        halo=16,
-        cpu=8,
-        free=LINUX_VRAM_FREE,
-        total=LINUX_VRAM_TOTAL,
-    )
-    assert decision.mapping["backend"] == "gpu"
-    assert decision.mapping["gpu_streaming_tile"] == 128
-    assert decision.plan_set.aggregate_host_peak_bytes <= LINUX_B_PLAN
-    assert (
-        decision.plan_set.aggregate_device_peak_bytes
-        <= LINUX_VRAM_BUDGET
-    )
-    # The mapped tile reaches the existing GPU runner knobs (wiring proof).
-    applied = zz._r55_active_gpu_apply(
-        bundle,
-        mapping=decision.mapping,
-        decision=decision,
-        stage="preflight",
-    )
-    assert applied.gpu_used is True
-    assert applied.gpu_tile_size == 128
-    assert applied.gpu_streaming_tile == 128
-    assert applied.cells_in_flight == 1
-    execution = zz._r55_active_execution(applied, decision.mapping)
-    assert execution["backend"] == "gpu"
-    assert execution["gpu_streaming_tile"] == 128
-    assert execution["single_owner"] is True
+    # REWORK-1 (F2): the producer cache-build owner coexists with the GPU
+    # consumer, so at this Linux B_plan the simultaneous host peak exceeds the
+    # budget and the ACTIVE GPU plan is REFUSED (R55_REFUSE_HOST_RAM) instead of
+    # being admitted from a max-only model. Refusal is explicit; there is no
+    # silent CPU fallback inside the decision.
+    import pytest as _pytest  # noqa: PLC0415
+
+    with _pytest.raises(zz._R55GpuRefused) as excinfo:
+        _active_gpu_decide(
+            m106,
+            bundle,
+            halo=16,
+            cpu=8,
+            free=LINUX_VRAM_FREE,
+            total=LINUX_VRAM_TOTAL,
+        )
+    assert excinfo.value.reason_code == "R55_REFUSE_HOST_RAM"
 
 
 # ---------------------------------------------------------------------------

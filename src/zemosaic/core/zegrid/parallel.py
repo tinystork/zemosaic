@@ -1373,6 +1373,9 @@ class BufferLedger:
         self._next_lease = 1
         self._wait_events = 0
         self._wait_s = 0.0
+        self._reconciliations = 0
+        self._surplus_released_bytes = 0
+        self._budget_reductions: list[dict] = []
 
     def _capacity(self, kind: str) -> int:
         if kind == "host":
@@ -1413,6 +1416,78 @@ class BufferLedger:
         if kind == "disk":
             return self._disk_leases
         raise PipelineAccountingError(f"unknown lease kind {kind!r}")
+
+    def _set_capacity(self, kind: str, value: int) -> None:
+        if kind == "host":
+            self.host_budget_bytes = int(value)
+        elif kind == "device":
+            self.device_budget_bytes = int(value)
+        elif kind == "disk":
+            self.disk_budget_bytes = int(value)
+        else:
+            raise PipelineAccountingError(f"unknown lease kind {kind!r}")
+
+    def reconcile(self, kind: str, lease: int, actual_bytes: int) -> int:
+        """Shrink a PRE-ACQUIRED lease to the measured/actual payload size.
+
+        The producer reserves a conservative prediction BEFORE allocating. Once
+        the real payload exists its actual bytes must be <= that prediction:
+        an underestimate FAILS CLOSED here (the allocation already happened, so
+        approving it would silently break the budget). Surplus is released in
+        the same critical section, so there is never an uncredited gap between
+        the conservative reservation and the smaller actual payload.
+
+        Returns the surplus released.
+        """
+        actual = _pipeline_int(actual_bytes, f"{kind}_actual_bytes", minimum=0)
+        leases = self._leases(kind)
+        with self._cond:
+            if lease not in leases:
+                raise PipelineAccountingError(
+                    f"unknown or already released {kind} lease {lease}"
+                )
+            reserved = int(leases[lease])
+            if actual > reserved:
+                raise PipelineAccountingError(
+                    f"{kind} actual payload {actual} B exceeds the pre-acquired "
+                    f"reservation {reserved} B: the prediction was too small "
+                    "and the extra allocation cannot be approved"
+                )
+            surplus = int(reserved) - int(actual)
+            if surplus:
+                used = self._used(kind) - surplus
+                if used < 0:
+                    raise PipelineAccountingError(
+                        f"{kind} ledger underflow while reconciling {surplus} B"
+                    )
+                leases[lease] = int(actual)
+                self._set_used(kind, used)
+                self._reconciliations += 1
+                self._surplus_released_bytes += int(surplus)
+                self._cond.notify_all()
+            return int(surplus)
+
+    def reduce_budget(self, kind: str, new_capacity: int) -> int:
+        """SHRINK-ONLY budget reduction (fresh external observation).
+
+        Never grows a budget. Used by the RUN-time fresh-disk revalidation: the
+        caller re-observes the volume and may only lower the disk capacity.
+        Raises if the caller tries to raise it or passes a negative value.
+        """
+        new = _pipeline_int(new_capacity, f"{kind}_new_capacity", minimum=0)
+        with self._cond:
+            current = self._capacity(kind)
+            if new > current:
+                raise PipelineAccountingError(
+                    f"refusing to GROW the {kind} budget {current} -> {new}"
+                )
+            if new != current:
+                self._set_capacity(kind, new)
+                self._budget_reductions.append(
+                    {"kind": str(kind), "from_bytes": int(current), "to_bytes": int(new)}
+                )
+            self._cond.notify_all()
+            return int(new)
 
     def reserve(
         self,
@@ -1487,6 +1562,9 @@ class BufferLedger:
                 "disk_leases": len(self._disk_leases),
                 "credit_wait_events": int(self._wait_events),
                 "credit_wait_s": float(self._wait_s),
+                "reconciliations": int(self._reconciliations),
+                "surplus_released_bytes": int(self._surplus_released_bytes),
+                "budget_reductions": [dict(x) for x in self._budget_reductions],
                 "balanced": (
                     not self._host_leases
                     and not self._device_leases
@@ -1541,6 +1619,18 @@ class BoundedPipeline:
         host_bytes=lambda payload: 0,
         device_bytes=lambda payload: 0,
         disk_bytes=lambda payload: 0,
+        # ZM-ZEGRID-R56 REWORK-1 (F1): PREDICTED per-TASK reservations made
+        # BEFORE ``produce`` allocates or writes anything. When supplied the
+        # producer reserves ``host_reserve_bytes(task)`` / ``disk_reserve_bytes(task)``
+        # first, runs ``produce``, then reconciles down to the actual payload
+        # (an underestimate fails closed). Generic callers that omit them keep
+        # the legacy post-produce accounting.
+        host_reserve_bytes=None,
+        disk_reserve_bytes=None,
+        # F4: fresh external revalidation hook, called BEFORE the pre-acquired
+        # reservation for every task. It may only shrink a budget (the ledger
+        # refuses growth) and may raise to refuse the unit before any staging.
+        before_produce=None,
         clock=time.monotonic,
         thread_join_s: float = 30.0,
         stall_timeout_s=None,
@@ -1549,6 +1639,15 @@ class BoundedPipeline:
             raise PipelineError("produce/consume/release must be callables")
         if not callable(host_bytes) or not callable(device_bytes):
             raise PipelineError("host_bytes/device_bytes must be callables")
+        if not callable(disk_bytes):
+            raise PipelineError("disk_bytes must be callable")
+        for name, fn in (
+            ("host_reserve_bytes", host_reserve_bytes),
+            ("disk_reserve_bytes", disk_reserve_bytes),
+            ("before_produce", before_produce),
+        ):
+            if fn is not None and not callable(fn):
+                raise PipelineError(f"{name} must be callable or None")
         if (
             isinstance(thread_join_s, bool)
             or not isinstance(thread_join_s, (int, float))
@@ -1568,6 +1667,10 @@ class BoundedPipeline:
         self._host_bytes_fn = host_bytes
         self._device_bytes_fn = device_bytes
         self._disk_bytes_fn = disk_bytes
+        self._host_reserve_fn = host_reserve_bytes
+        self._disk_reserve_fn = disk_reserve_bytes
+        self._before_produce = before_produce
+        self._pre_acquired_units = 0
         self._prefetch_units = _pipeline_int(
             prefetch_units, "prefetch_units", minimum=0
         )
@@ -1707,6 +1810,66 @@ class BoundedPipeline:
             except queue.Full:
                 continue
 
+    def _release_pre(self, pre) -> None:
+        """Release pre-acquired leases exactly once (partial-produce path)."""
+        if not isinstance(pre, dict):
+            return
+        for kind in ("host", "disk"):
+            lease = pre.get(f"{kind}_lease")
+            if lease is None:
+                continue
+            try:
+                self._ledger.release(kind, int(lease))
+            except BaseException as exc:  # noqa: BLE001 - best effort
+                self._cleanup_failures.append(
+                    f"pre_release[{kind}]:{type(exc).__name__}:{exc}"
+                )
+            pre[f"{kind}_lease"] = None
+
+    def _pre_acquire(self, task):
+        """Reserve predicted host/disk credit BEFORE any produce allocation.
+
+        ZM-ZEGRID-R56 REWORK-1 (F1). The prediction comes from the PLAN/task
+        bounds (caller callbacks), never from a completed payload, so the ledger
+        observes the peak at ALLOCATION time. Returns a dict of leases (or None
+        when the callers did not opt in to pre-acquisition).
+        """
+        if self._host_reserve_fn is None and self._disk_reserve_fn is None:
+            return None
+        pre = {
+            "host_lease": None,
+            "disk_lease": None,
+            "host_reserved": None,
+            "disk_reserved": None,
+        }
+        try:
+            if self._before_produce is not None:
+                self._before_produce(task, self._ledger)
+            if self._host_reserve_fn is not None:
+                host_pred = _pipeline_int(
+                    self._host_reserve_fn(task), "host_reserve_bytes", minimum=0
+                )
+                pre["host_reserved"] = int(host_pred)
+                pre["host_lease"] = self._ledger.reserve(
+                    "host", host_pred, cancel_event=self._cancel
+                )
+            if (
+                self._disk_reserve_fn is not None
+                and int(self._ledger.disk_budget_bytes) > 0
+            ):
+                disk_pred = _pipeline_int(
+                    self._disk_reserve_fn(task), "disk_reserve_bytes", minimum=0
+                )
+                pre["disk_reserved"] = int(disk_pred)
+                pre["disk_lease"] = self._ledger.reserve(
+                    "disk", disk_pred, cancel_event=self._cancel
+                )
+        except BaseException:
+            self._release_pre(pre)
+            raise
+        self._pre_acquired_units += 1
+        return pre
+
     def _producer_run(self) -> None:
         try:
             for index, task in enumerate(self._tasks):
@@ -1714,9 +1877,15 @@ class BoundedPipeline:
                     return
                 self._producer_task_index = int(index)
                 self._producer_task_started_at = float(self._clock())
+                # F1: credit FIRST, allocation second. A refusal/cancel here
+                # happens before any cache write or buffer materialisation.
+                pre = self._pre_acquire(task)
                 _produce_started = float(self._clock())
                 try:
                     payload = self._produce(task)
+                except BaseException:
+                    self._release_pre(pre)
+                    raise
                 finally:
                     _produce_ended = float(self._clock())
                     self._producer_intervals.append(
@@ -1730,21 +1899,27 @@ class BoundedPipeline:
                 self._last_progress_at = float(self._clock())
                 # OWNERSHIP BEGINS HERE. Once ``produce`` returns, the payload
                 # belongs to the pipeline: every path that does NOT hand it to
-                # the consumer (byte-callback failure, host-credit cancel, an
-                # accounting refusal, cancellation detected after a blocked
-                # ``produce`` returns, or a downstream ``_put`` cancel) MUST
-                # release it exactly once. ``_release_unit`` is idempotent, so
-                # the ``_put`` release plus this guard can never double-release.
+                # the consumer MUST release it exactly once. ``_release_unit``
+                # is idempotent, so no path can double-release.
                 unit = {
                     "index": int(index),
                     "payload": payload,
                     "host_bytes": None,
                     "device_bytes": None,
-                    "host_lease": None,
+                    "disk_bytes": None,
+                    "host_lease": None if pre is None else pre["host_lease"],
                     "device_lease": None,
-                    "disk_lease": None,
+                    "disk_lease": None if pre is None else pre["disk_lease"],
+                    "host_reserved": None if pre is None else pre["host_reserved"],
+                    "disk_reserved": None if pre is None else pre["disk_reserved"],
+                    "reconciled": False,
                     "released": False,
                 }
+                if pre is not None:
+                    # The unit now owns the leases; a failure below must not
+                    # release them twice through the pre path.
+                    pre["host_lease"] = None
+                    pre["disk_lease"] = None
                 # ``units_produced`` counts OWNED payloads (produce returned),
                 # not successful enqueues: every owned payload is released, so
                 # produced == released on any terminal path that finishes.
@@ -1765,22 +1940,29 @@ class BoundedPipeline:
                     unit["host_bytes"] = int(host_need)
                     unit["device_bytes"] = int(device_need)
                     unit["disk_bytes"] = int(disk_need)
-                    unit["host_lease"] = self._ledger.reserve(
-                        "host", host_need, cancel_event=self._cancel
-                    )
-                    # Disk is a SEPARATE resource: a payload's bytes on the
-                    # aligned cache are not resident RAM. When no disk budget is
-                    # declared the dimension stays inert (zero-byte leases
-                    # only), preserving the historical v1 behaviour exactly.
-                    if int(self._ledger.disk_budget_bytes) > 0:
-                        unit["disk_lease"] = self._ledger.reserve(
-                            "disk", disk_need, cancel_event=self._cancel
+                    if unit["host_lease"] is not None:
+                        self._ledger.reconcile("host", int(unit["host_lease"]), host_need)
+                        unit["reconciled"] = True
+                    else:
+                        unit["host_lease"] = self._ledger.reserve(
+                            "host", host_need, cancel_event=self._cancel
                         )
+                    if int(self._ledger.disk_budget_bytes) > 0:
+                        if unit["disk_lease"] is not None:
+                            self._ledger.reconcile(
+                                "disk", int(unit["disk_lease"]), disk_need
+                            )
+                            unit["reconciled"] = True
+                        else:
+                            unit["disk_lease"] = self._ledger.reserve(
+                                "disk", disk_need, cancel_event=self._cancel
+                            )
                     self._put(unit)
                 except BaseException:
-                    # Covers host-credit cancellation, accounting refusal and
-                    # byte-callback errors: the payload is ours, release it and
-                    # re-raise so the PRIMARY classification is preserved.
+                    # Covers reconciliation refusal (prediction too small),
+                    # host-credit cancellation, accounting refusal and
+                    # byte-callback errors: release and re-raise so the PRIMARY
+                    # classification is preserved.
                     self._release_unit(unit)
                     raise
             self._put_sentinel()
@@ -2078,7 +2260,22 @@ class BoundedPipeline:
             "ledger": ledger,
             "transfers": int(self._transfers),
             "consumer_idle_s": float(self._consumer_idle_s),
-            # ZM-ZEGRID-R56: OBSERVED producer/consumer overlap witness.
+            "credit_accounting": {
+                "mode": (
+                    "pre_acquire"
+                    if self._host_reserve_fn is not None
+                    or self._disk_reserve_fn is not None
+                    else "post_produce_legacy"
+                ),
+                "pre_acquired_units": int(self._pre_acquired_units),
+                "reconciliations": int(ledger["reconciliations"]),
+                "surplus_released_bytes": int(ledger["surplus_released_bytes"]),
+                "note": (
+                    "pre_acquire reserves the PLAN prediction before produce() "
+                    "allocates; the lease is then reconciled DOWN to the actual "
+                    "payload and an underestimate fails closed."
+                ),
+            },
             "observed_overlap": {
                 "clock": "time.monotonic",
                 "producer_work_s": float(self._producer_work_s),

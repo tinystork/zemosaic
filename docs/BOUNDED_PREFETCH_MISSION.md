@@ -83,3 +83,31 @@ for the exact commands and results. Summary:
 Junior verifies diff/tests/artifacts, then requests Nono read-only review. If a
 capable Windows node is later available, run the recorder with `--halo 128` and
 the LP341 inputs for the before/after measurement.
+
+## REWORK-1 (2026-10-26) — corrected contract
+
+Starting HEAD 4c2ae77 -> 1b0faaa (local). Findings F1-F4 from Junior/Nono review-0.
+
+Checklist:
+- [x] F1 pre-acquisition BEFORE produce (predicted host/disk lease, reconcile down,
+      underestimate fails closed, partial-produce/cancel release once, balanced).
+- [x] F2 simultaneous ownership: sequential producer phases -> MAX(cache build,
+      cell normalization); initial global gauge NOT added; shared counted once;
+      concurrent_producer_bytes in scheduler host peak + envelope estimate;
+      GPU envelope aggregate_rule = simultaneous_stack_plus_cache_minus_shared.
+- [x] F3 campaign runner v2: fresh subprocess per arm, refuse occupied dirs,
+      downward-only RAM clamp, honest uncontrolled-OS-cache label, correct
+      pinned-pool bytes, non-null science/participation, candidate-only
+      GPU/prefetch>=1/overlap gates, exit status follows gates.
+- [x] F4 fresh disk observation before staging, own retained bytes added back,
+      half-free policy, SHRINK-ONLY budget, refuse before production.
+- [ ] Clean combined matrix: 438 passed, 1 skipped, 2 failed (E2 OOM + RUN
+      coherence). Cause unproven; leading hypothesis = RUN admission reads the
+      real 1.2-1.8 GiB host RAM. NOT hidden, not worked around.
+- [ ] Corrected A/B campaign executed end-to-end: NOT_RUN on this host.
+- [ ] LP341 H128 sky_mean runtime / Windows: NOT_RUN.
+- [ ] Re-derive LP341 prefetch>=1 under the F2 model at the real budget.
+
+Contract change is user-visible: tight budgets can now shrink tile/prefetch or
+refuse the GPU instead of admitting a max-only plan (E8 gate B now refuses).
+That is the intended honest outcome pending Junior's decision.
