@@ -469,6 +469,31 @@ def test_bounded_cell_closes_and_removes_its_cache(tmp_path):
     assert not cache.exists(), "bounded cell cache was not removed"
 
 
+def test_public_auto_double_refusal_is_loud(tmp_path, monkeypatch):
+    """AUTO dense fails AND bounded fails -> ONE loud error naming both."""
+    inp, out = _write_corpus(tmp_path)
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: _DENSE_OK_RAW)
+    monkeypatch.setattr(zal, "ScientificFloors", _tiny_floors)
+    monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _HugeModel())
+    # Both profiles are budget-infeasible; bounded does not magically fit.
+    monkeypatch.setattr(
+        zz, "_estimate_streaming_bytes",
+        lambda n, hw, tile_size=zz.STREAM_TILE_SIZE, channels=3,
+        storage_profile=None: 8192 * MIB,
+    )
+    with pytest.raises(zz.zpar.ModeInfeasible) as ei:
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=_active_zconfig("active"), zegrid_halo_px=8,
+        )
+    text = str(ei.value)
+    assert "in either storage profile" in text
+    assert "dense:" in text and "bounded:" in text
+    assert zz._STORAGE_EFFECTIVE == "bounded"
+    assert zz._STORAGE_FALLBACK_COUNT == 1
+    assert not (out / "zegrid_manifest.json").exists()
+    assert not (out / "mosaic_grid.fits").exists()
+
+
 # ---------------------------------------------------------------------------
 # Pre-gauge ACTIVE admission: typed eligibility + real public retry
 # ---------------------------------------------------------------------------
