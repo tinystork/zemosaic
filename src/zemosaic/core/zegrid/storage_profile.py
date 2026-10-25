@@ -13,17 +13,27 @@ the rejection diagnostics:
   scalar rejection diagnostics, not the full mask).
 
 The profile is selected BEFORE the first layout filter and is carried, unchanged,
-through PLAN / ADMIT / RUN / fallback. It is explicitly NOT a GUI/config knob in
-this lot: the product default is ``dense`` and ``bounded`` is reachable through
-the internal ``run_zegrid_mode(storage_profile=...)`` seam (tests/diagnosis).
+through PLAN / ADMIT / RUN / fallback.
+
+ZM-ZEGRID-ACTIVE-OOC-FALLBACK: the PRODUCT request is now ``auto`` (the default
+when no explicit ``storage_profile`` is supplied): the ACTIVE scheduler tries the
+historical ``dense`` model first and, ONLY on a qualified host-RAM refusal, retries
+exactly once with ``bounded``. A forceable internal request (``dense`` /
+``bounded``) keeps its exact value and NEVER silently falls back, so A/B witnesses
+stay honest. ``bounded`` is still not a GUI/config knob: there is no selector and
+no user-facing setting, only the automatic RAM-driven fallback (plus the internal
+``run_zegrid_mode(storage_profile=...)`` seam used by tests/diagnosis).
 """
 
 from __future__ import annotations
 
 __all__ = [
+    "STORAGE_PROFILE_AUTO",
     "STORAGE_PROFILE_DENSE",
     "STORAGE_PROFILE_BOUNDED",
     "STORAGE_PROFILES",
+    "STORAGE_REQUESTS",
+    "normalize_storage_request",
     "STORAGE_MODEL_DENSE",
     "STORAGE_MODEL_BOUNDED",
     "normalize_storage_profile",
@@ -31,14 +41,20 @@ __all__ = [
     "is_bounded",
 ]
 
+STORAGE_PROFILE_AUTO = "auto"
 STORAGE_PROFILE_DENSE = "dense"
 STORAGE_PROFILE_BOUNDED = "bounded"
 STORAGE_PROFILES = (STORAGE_PROFILE_DENSE, STORAGE_PROFILE_BOUNDED)
+#: Requested policies (what the caller asked for). ``auto`` is the product
+#: default and resolves to ``dense`` first, then ``bounded`` on a qualified
+#: host-RAM refusal. The effective profile is always one of STORAGE_PROFILES.
+STORAGE_REQUESTS = (STORAGE_PROFILE_AUTO, STORAGE_PROFILE_DENSE, STORAGE_PROFILE_BOUNDED)
 
 STORAGE_MODEL_DENSE = "dense-streaming-v1"
 STORAGE_MODEL_BOUNDED = "bounded-streaming-v1"
 
 _ALIASES = {
+    "auto": STORAGE_PROFILE_AUTO,
     "dense": STORAGE_PROFILE_DENSE,
     "bounded": STORAGE_PROFILE_BOUNDED,
     "ooc": STORAGE_PROFILE_BOUNDED,
@@ -64,6 +80,28 @@ def normalize_storage_profile(value, *, default: str = STORAGE_PROFILE_DENSE) ->
         return _ALIASES[token]
     raise ValueError(
         f"unknown storage_profile {value!r}; expected one of {STORAGE_PROFILES}"
+    )
+
+
+def normalize_storage_request(value) -> str:
+    """Normalize the REQUESTED policy; ``None`` -> ``auto`` (product default).
+
+    Unlike :func:`normalize_storage_profile` (which keeps ``None -> dense`` for
+    the run-scoped effective seam), a product call that does not name a profile
+    means "try dense, fall back to bounded on RAM pressure". An explicit
+    ``dense``/``bounded`` is FORCED and never falls back silently.
+    """
+    if value is None:
+        return STORAGE_PROFILE_AUTO
+    if not isinstance(value, str):
+        raise ValueError(
+            f"storage_profile must be a string, got {type(value).__name__}"
+        )
+    token = value.strip().lower()
+    if token in _ALIASES:
+        return _ALIASES[token]
+    raise ValueError(
+        f"unknown storage_profile {value!r}; expected one of {STORAGE_REQUESTS}"
     )
 
 

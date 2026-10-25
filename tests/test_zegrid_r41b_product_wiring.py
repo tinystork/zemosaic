@@ -470,7 +470,14 @@ def test_e_f_source_ordering_and_manifest_truth():
                 calls.append((node.lineno, name))
     line = {}
     for ln, name in calls:
-        line.setdefault(name, ln)
+        # ZM-ZEGRID-ACTIVE-OOC-FALLBACK: several call sites now share a name
+        # (initial build + bounded retries), so ordering must use the FIRST
+        # occurrence in SOURCE order, not the first one ast.walk happens to
+        # visit (breadth-first).
+        line[name] = min(ln, line.get(name, ln))
+    # The initial bundle is built by the wired AUTO helper (dense first, ONE
+    # bounded retry on a qualified RAM refusal) BEFORE the global gauge.
+    assert line["_plan_bundle_auto"] < line["compute_global_gauge"], line
     assert line["_build_execution_bundle"] < line["compute_global_gauge"], line
     assert line["compute_global_gauge"] < line["_admit"], line
     # R37 capture gate raises AFTER the auto resolution (it consumes the effective

@@ -1847,6 +1847,222 @@ _STACK_CACHE_WORKERS = 1
 # layout filtering and kept through PLAN/ADMIT/RUN/fallback. Default dense keeps
 # every historical byte and path unchanged; bounded is an explicit internal seam.
 _STACK_STORAGE_PROFILE = zsp.STORAGE_PROFILE_DENSE
+# ZM-ZEGRID-ACTIVE-OOC-FALLBACK: run-scoped storage POLICY (not a GUI knob).
+# ``requested`` is what the caller asked for ("auto" for every product call);
+# ``effective`` is the profile actually executing. ``auto`` means: try dense, and
+# switch to bounded ONCE on a QUALIFIED host-RAM refusal. An explicit
+# dense/bounded request keeps its forced value (A/B witnesses never fall back).
+_STORAGE_REQUESTED = zsp.STORAGE_PROFILE_AUTO
+_STORAGE_EFFECTIVE = zsp.STORAGE_PROFILE_DENSE
+_STORAGE_FALLBACK_COUNT = 0
+_STORAGE_TRANSITIONS: list = []
+_STORAGE_DENSE_REFUSAL = None
+# True only for the ACTIVE product path: legacy/observe keep their exact pre-R52
+# manifest shape (the storage provenance block is ACTIVE-only).
+_STORAGE_ACTIVE_MODE = False
+
+
+def _storage_policy_reset(requested):
+    """Select the REQUESTED policy once per run and reset the transition trail."""
+    global _STORAGE_REQUESTED, _STORAGE_EFFECTIVE
+    global _STORAGE_FALLBACK_COUNT, _STORAGE_TRANSITIONS, _STORAGE_DENSE_REFUSAL
+    _STORAGE_REQUESTED = zsp.normalize_storage_request(requested)
+    _STORAGE_EFFECTIVE = (
+        zsp.STORAGE_PROFILE_BOUNDED
+        if _STORAGE_REQUESTED == zsp.STORAGE_PROFILE_BOUNDED
+        else zsp.STORAGE_PROFILE_DENSE
+    )
+    _STORAGE_FALLBACK_COUNT = 0
+    _STORAGE_TRANSITIONS = []
+    _STORAGE_DENSE_REFUSAL = None
+    # The run-scoped effective seam must agree with the policy from the very
+    # first layout filter (no stale profile can survive a new run/reset).
+    _set_stack_storage_profile(_STORAGE_EFFECTIVE)
+    return _STORAGE_EFFECTIVE
+
+
+def _storage_policy_snapshot() -> dict:
+    """Readable provenance for the run log and the manifest."""
+    return {
+        "schema": "zemosaic-zegrid-storage-policy-v1",
+        "requested": str(_STORAGE_REQUESTED),
+        "effective": str(_STORAGE_EFFECTIVE),
+        "model": zsp.storage_model_id(_STORAGE_EFFECTIVE),
+        "fallback_count": int(_STORAGE_FALLBACK_COUNT),
+        "auto": bool(_STORAGE_REQUESTED == zsp.STORAGE_PROFILE_AUTO),
+        "forced": bool(_STORAGE_REQUESTED != zsp.STORAGE_PROFILE_AUTO),
+        "dense_refusal": (
+            None if _STORAGE_DENSE_REFUSAL is None
+            else dict(_STORAGE_DENSE_REFUSAL)
+        ),
+        "transitions": [dict(item) for item in _STORAGE_TRANSITIONS],
+    }
+
+
+def _storage_fallback_available() -> bool:
+    """True iff ONE dense->bounded fallback is still allowed this run."""
+    return bool(
+        _STORAGE_REQUESTED == zsp.STORAGE_PROFILE_AUTO
+        and _STORAGE_EFFECTIVE == zsp.STORAGE_PROFILE_DENSE
+        and int(_STORAGE_FALLBACK_COUNT) == 0
+    )
+
+
+def _activate_bounded_storage(*, phase, reason_code, detail, emit=None):
+    """Switch the run to the bounded profile ONCE; returns True on success.
+
+    The effective profile is published in the run-scoped seam BEFORE any rebuild,
+    so PLAN facts, layout arithmetic, task tuples and every cell payload agree.
+    """
+    global _STORAGE_EFFECTIVE, _STORAGE_FALLBACK_COUNT, _STORAGE_DENSE_REFUSAL
+    if not _storage_fallback_available():
+        return False
+    _STORAGE_DENSE_REFUSAL = {
+        "phase": str(phase),
+        "reason_code": str(reason_code),
+        "detail": str(detail),
+    }
+    _STORAGE_EFFECTIVE = zsp.STORAGE_PROFILE_BOUNDED
+    _STORAGE_FALLBACK_COUNT = 1
+    _STORAGE_TRANSITIONS.append(
+        {
+            "from": zsp.STORAGE_PROFILE_DENSE,
+            "to": zsp.STORAGE_PROFILE_BOUNDED,
+            "phase": str(phase),
+            "reason_code": str(reason_code),
+            "detail": str(detail),
+        }
+    )
+    _set_stack_storage_profile(zsp.STORAGE_PROFILE_BOUNDED)
+    if emit is not None:
+        try:
+            emit(
+                "ZeGrid: storage profile AUTO fell back to 'bounded' at "
+                f"phase={phase} after a qualified host-RAM refusal "
+                f"({reason_code}: {detail}); ONE bounded retry, same geometry/halo/"
+                "science; no further profile switch",
+                "WARN",
+            )
+        except Exception:
+            pass
+    return True
+
+
+def _set_stack_storage_profile(profile):
+    global _STACK_STORAGE_PROFILE
+    _STACK_STORAGE_PROFILE = zsp.normalize_storage_profile(profile)
+    return _STACK_STORAGE_PROFILE
+
+
+def _plan_bundle_auto(
+    *,
+    canvas,
+    descs,
+    footprints,
+    raw,
+    budget,
+    pinned_layout=None,
+    gauge_workers=None,
+    cache_build_workers=None,
+    layout_substep=None,
+    bundle_common=None,
+    active=False,
+    emit=None,
+):
+    """Build the initial bundle; in AUTO ACTIVE mode retry bounded ONCE.
+
+    This is the PRODUCTION wiring used by ``_run_single``: the FIRST layout
+    filter and the complete bundle are attempted with the currently effective
+    profile (dense for an AUTO request). Only a QUALIFIED host-RAM refusal
+    switches the run to bounded and rebuilds with the SAME request. A forced
+    profile, a non-ACTIVE scheduler mode or a non-memory floor failure raises
+    unchanged (never a silent retry).
+    """
+    kw = dict(bundle_common or {})
+
+    def _build():
+        return _build_execution_bundle(
+            canvas, descs, footprints,
+            raw_available_bytes=int(raw), budget_bytes=int(budget),
+            pinned_layout=pinned_layout,
+            gauge_workers=gauge_workers,
+            cache_build_workers=cache_build_workers,
+            layout_substep=layout_substep,
+            **kw,
+        )
+
+    try:
+        return _build()
+    except (zal.LayoutInfeasible, zpar.ModeInfeasible) as exc:
+        is_memory, code, detail = _storage_plan_refusal(exc)
+        if not (
+            active
+            and is_memory
+            and _activate_bounded_storage(
+                phase="plan_layout", reason_code=code, detail=detail,
+                emit=emit,
+            )
+        ):
+            raise
+        if emit is not None:
+            try:
+                emit(
+                    "ZeGrid: dense layout/bundle refused for RAM — retrying "
+                    "ONCE with the bounded storage profile (same layout "
+                    f"request, same halo/science): {detail}",
+                    "WARN",
+                )
+            except Exception:
+                pass
+        try:
+            return _build()
+        except (zal.LayoutInfeasible, zpar.ModeInfeasible) as exc2:
+            if emit is not None:
+                try:
+                    emit(
+                        "ZeGrid: NO executable plan fits the PLAN budget in "
+                        f"EITHER storage profile (dense: {detail}; bounded: "
+                        f"{exc2})",
+                        "ERROR",
+                    )
+                except Exception:
+                    pass
+            raise zpar.ModeInfeasible(
+                "no executable ZeGrid plan fits the PLAN budget in either "
+                f"storage profile (dense: {detail}; bounded: {exc2})"
+            ) from exc2
+
+
+def _storage_plan_refusal(exc):
+    """Classify a PLAN/ADMIT refusal as a QUALIFIED host-RAM memory refusal.
+
+    Only memory-qualified failures may trigger the bounded fallback. Scientific
+    floors, degenerate geometry, WCS/FITS, permissions, cache corruption, disk
+    full, programming errors and cancellation are NOT memory refusals and keep
+    propagating unchanged.
+
+    Returns ``(is_memory, reason_code, detail)``.
+    """
+    detail = str(exc)
+    if isinstance(exc, zpar.ModeInfeasible):
+        # ModeInfeasible means NO stacking mode/geometry fits the RAM budget.
+        return True, renv.REASON_REFUSE_HOST_RAM, detail
+    if isinstance(exc, zal.LayoutInfeasible):
+        # ``LayoutInfeasible`` also covers genuinely invalid scientific floors.
+        # Only the explicit budget-miss diagnosis is a real memory refusal: the
+        # wording is "...exceeds budget ..." or "...both exceed budget ...".
+        import re as _re
+        if _re.search(r"\bexceed(?:s)?\s+budget\b", detail):
+            return True, renv.REASON_REFUSE_HOST_RAM, detail
+        # After a memory-driven internal refinement, the bounded-rank window can
+        # admit NO candidate and the final message is the rank-window refusal.
+        # That is still a RAM/geometry-window miss (a bounded retry is the ONLY
+        # remaining storage lever); a genuine floor invalidity refuses again
+        # under bounded and surfaces as a loud double refusal.
+        if "refinement-rank window" in detail:
+            return True, renv.REASON_REFUSE_HOST_RAM, detail
+        return False, None, detail
+    return False, None, detail
 # ZM-ZEGRID-R40-B2-C: the worker-local R40 sparse transport is armed ONLY when the
 # parent hands this mapping ({cell_id: candidate coords}) to the worker
 # initializer. ``None`` (the default and the only value the capture-OFF path ever
@@ -8464,14 +8680,19 @@ def _run_single(
     )
     try:
         with timings.timed("layout"):
-            _initial_bundle = _build_execution_bundle(
-                canvas, descs, None,
-                raw_available_bytes=plan_raw_bytes, budget_bytes=plan_budget_bytes,
+            _initial_bundle = _plan_bundle_auto(
+                canvas=canvas,
+                descs=descs,
+                footprints=None,
+                raw=plan_raw_bytes,
+                budget=plan_budget_bytes,
                 pinned_layout=pinned_layout,
                 gauge_workers=workers,
                 cache_build_workers=(workers if workers is not None else None),
                 layout_substep=layout_substep,
-                **_bundle_common,
+                bundle_common=_bundle_common,
+                active=(scheduler_mode == zsched.MODE_ACTIVE),
+                emit=_emit_live,
             )
     except (zal.LayoutInfeasible, zpar.ModeInfeasible) as _plan_exc:
         _emit(
@@ -8646,37 +8867,101 @@ def _run_single(
                     lvl="WARN", callback=progress_callback,
                 )
         if _r55_active_gpu_decision is None:
-            try:
-                _r55_active_decision = _r55_active_decide(
-                    bundle=_initial_bundle,
-                    cell_ctxs=cell_ctxs,
+            def _r55_cpu_preflight(bundle):
+                decision = _r55_active_decide(
+                    bundle=bundle,
+                    cell_ctxs=bundle.cell_ctxs,
                     canvas=canvas,
                     halo_px=halo_px,
                     cache_root=cache_root,
                     output_dir=output_dir,
                     frame_ids=_r55_frame_ids,
                 )
+                return (decision, _r55_active_admit(
+                    initial_bundle=bundle,
+                    decision=decision,
+                ))
+
+            try:
                 (
-                    _r55_active_bundle,
-                    _r55_active_candidate,
-                    _r55_active_mapping,
-                    _r55_active_adm,
-                    _r55_active_trail,
-                ) = _r55_active_admit(
-                    initial_bundle=_initial_bundle,
-                    decision=_r55_active_decision,
-                )
-                _r55_active_preflight_adm = _r55_active_adm
-                _r55_active_preflight_trail = list(_r55_active_trail)
+                    _r55_active_decision,
+                    (
+                        _r55_active_bundle,
+                        _r55_active_candidate,
+                        _r55_active_mapping,
+                        _r55_active_adm,
+                        _r55_active_trail,
+                    ),
+                ) = _r55_cpu_preflight(_initial_bundle)
             except (zsched.SchedulerError, rcontract.RamContractError) as _r55_exc:
+                # ZM-ZEGRID-ACTIVE-OOC-FALLBACK: nothing has started yet (no
+                # gauge/stack), so a QUALIFIED host-RAM admission miss switches
+                # the run ONCE to bounded and re-plans on the SAME pinned
+                # geometry/halo/science. A forced profile never falls back.
+                if not _activate_bounded_storage(
+                    phase="admission_preflight",
+                    reason_code=renv.REASON_REFUSE_HOST_RAM,
+                    detail=str(_r55_exc), emit=_emit_live,
+                ):
+                    _emit(
+                        "ZeGrid: R55-D2 active REFUSED before the gauge/stack — "
+                        f"{_r55_exc}",
+                        lvl="ERROR", callback=progress_callback,
+                    )
+                    raise RuntimeError(
+                        "R55-D2 active refused before the gauge/stack: "
+                        + str(_r55_exc)
+                    ) from _r55_exc
                 _emit(
-                    "ZeGrid: R55-D2 active REFUSED before the gauge/stack — "
-                    f"{_r55_exc}",
-                    lvl="ERROR", callback=progress_callback,
+                    "ZeGrid: dense ACTIVE admission refused for RAM — retrying "
+                    "ONCE with the bounded storage profile on the SAME "
+                    f"{int(nx)}x{int(ny)} geometry: {_r55_exc}",
+                    lvl="WARN", callback=progress_callback,
                 )
-                raise RuntimeError(
-                    "R55-D2 active refused before the gauge/stack: " + str(_r55_exc)
-                ) from _r55_exc
+                try:
+                    _initial_bundle = _build_execution_bundle(
+                        canvas, descs, footprints,
+                        raw_available_bytes=plan_raw_bytes,
+                        budget_bytes=plan_budget_bytes,
+                        pinned_layout=(int(nx), int(ny)),
+                        min_refinement_rank=int(
+                            _initial_bundle.refinement_rank
+                        ),
+                        max_refinement_rank=int(
+                            _initial_bundle.refinement_rank
+                        ),
+                        layout_substep=None,
+                        **_bundle_common,
+                    )
+                    (
+                        _r55_active_decision,
+                        (
+                            _r55_active_bundle,
+                            _r55_active_candidate,
+                            _r55_active_mapping,
+                            _r55_active_adm,
+                            _r55_active_trail,
+                        ),
+                    ) = _r55_cpu_preflight(_initial_bundle)
+                except (
+                    zal.LayoutInfeasible, zpar.ModeInfeasible,
+                    zsched.SchedulerError, rcontract.RamContractError,
+                ) as _r55_exc2:
+                    _emit(
+                        "ZeGrid: NO ACTIVE plan can be admitted in EITHER "
+                        "storage profile before the gauge — refusing. dense: "
+                        f"{_r55_exc} | bounded: {_r55_exc2}",
+                        lvl="ERROR", callback=progress_callback,
+                    )
+                    raise RuntimeError(
+                        "R55-D2 active refused in both storage profiles "
+                        f"(dense: {_r55_exc}; bounded: {_r55_exc2})"
+                    ) from _r55_exc2
+                layout = _initial_bundle.layout
+                cell_ctxs = _initial_bundle.cell_ctxs
+                nx, ny = int(layout["nx"]), int(layout["ny"])
+            _r55_active_preflight_adm = _r55_active_adm
+            _r55_active_preflight_trail = list(_r55_active_trail)
             _emit(
                 "ZeGrid: R55-D2 active plan ADMITTED before the gauge — "
                 f"phase={_r55_active_mapping['phase']} "
@@ -9364,6 +9649,10 @@ def _run_single(
         bundle = start_bundle
         candidate = start_candidate
         mapping = start_mapping
+        # ZM-ZEGRID-ACTIVE-OOC-FALLBACK: the scheduler decision may be REPLACED
+        # once by a bounded recovery; keep it local to the RUN closure so no
+        # child/parent global is consulted.
+        run_decision = _r55_active_decision
         all_tasks = list(start_bundle.cell_tasks)
         total_tasks = len(all_tasks)
         canonical_cids = [t[0].cell_id for t in all_tasks]
@@ -9380,6 +9669,105 @@ def _run_single(
         # ONE persistent latch for the whole RUN. A mid-wave sample is only a
         # candidate for the NEXT safe boundary; it never mutates this wave.
         latch = zrt.PressureLatch()
+
+        def _bounded_run_recovery(*, wave_index, offset, remaining_units, record):
+            """ONE safe-boundary dense->bounded recovery; None when not allowed.
+
+            Only a QUALIFIED host-RAM checkpoint refusal can trigger it. The
+            EXACT geometry/halo/memberships/frames/science identity are pinned
+            (the gauge already ran), completed waves are kept, and every not-yet
+            started cell task is rebuilt with the bounded provider/sink profile.
+            No partial unit exists at a wave boundary, so nothing is reused from
+            a unit that will be re-executed.
+            """
+            nonlocal run_decision
+            if int(remaining_units) <= 0:
+                return None
+            if str(record.get("reason_code")) != renv.REASON_REFUSE_HOST_RAM:
+                return None
+            if not _storage_fallback_available():
+                return None
+            if not _activate_bounded_storage(
+                phase=f"run_wave_{int(wave_index)}",
+                reason_code=renv.REASON_REFUSE_HOST_RAM,
+                detail=str(record.get("detail", "")), emit=_emit_live,
+            ):
+                return None
+            _fixed_layout = tuple(int(v) for v in bundle.envelope.layout)
+            _fixed_rank = int(bundle.envelope.refinement_rank)
+            try:
+                _raw = int(available_memory_bytes())
+                _budget = int(rcontract.plan_budget_bytes(_raw))
+                _seed = _build_execution_bundle(
+                    canvas, descs, bundle.footprints,
+                    raw_available_bytes=_raw, budget_bytes=_budget,
+                    pinned_layout=_fixed_layout,
+                    min_refinement_rank=_fixed_rank,
+                    max_refinement_rank=_fixed_rank,
+                    layout_substep=None,
+                    **{**_bundle_common, "gpu_used": False},
+                )
+                _dec = _r55_active_decide(
+                    bundle=_seed, cell_ctxs=_seed.cell_ctxs, canvas=canvas,
+                    halo_px=halo_px, cache_root=cache_root,
+                    output_dir=output_dir, frame_ids=_r55_frame_ids,
+                )
+                (
+                    _bnd, _cand, _map, _adm2, _trail2,
+                ) = _r55_active_admit(
+                    initial_bundle=_seed, decision=_dec,
+                )
+            except (
+                zal.LayoutInfeasible, zpar.ModeInfeasible,
+                zsched.SchedulerError, rcontract.RamContractError,
+            ) as _rec_exc:
+                _emit(
+                    "ZeGrid: bounded RUN recovery is NOT feasible on the SAME "
+                    f"geometry — keeping the honest refusal: {_rec_exc}",
+                    lvl="ERROR", callback=progress_callback,
+                )
+                return None
+            if tuple(int(v) for v in _bnd.envelope.layout) != _fixed_layout:
+                _emit(
+                    "ZeGrid: bounded RUN recovery refused an inexact geometry "
+                    f"({_bnd.envelope.layout} != {_fixed_layout}); keeping the "
+                    "honest refusal",
+                    lvl="ERROR", callback=progress_callback,
+                )
+                return None
+            _new_tasks = list(_bnd.cell_tasks)
+            if len(_new_tasks) != len(all_tasks):
+                _emit(
+                    "ZeGrid: bounded RUN recovery produced a different cell "
+                    "set; keeping the honest refusal",
+                    lvl="ERROR", callback=progress_callback,
+                )
+                return None
+            for _a, _b in zip(all_tasks[:offset], _new_tasks[:offset]):
+                if _a[0].cell_id != _b[0].cell_id:
+                    _emit(
+                        "ZeGrid: bounded RUN recovery changed the completed "
+                        "cell prefix; keeping the honest refusal",
+                        lvl="ERROR", callback=progress_callback,
+                    )
+                    return None
+            run_decision = _dec
+            _emit(
+                "ZeGrid: storage profile AUTO switched to 'bounded' at the "
+                f"wave {int(wave_index)} safe boundary (completed waves kept, "
+                f"remaining units={int(remaining_units)}, geometry="
+                f"{_fixed_layout[0]}x{_fixed_layout[1]} unchanged); continuing "
+                "with the bounded provider/sink profile",
+                lvl="WARN", callback=progress_callback,
+            )
+            return {
+                "bundle": _bnd,
+                "candidate": _cand,
+                "mapping": _map,
+                "tasks": _new_tasks,
+                "admission": _adm2,
+                "trail": list(_trail2),
+            }
 
         def _heartbeat():
             # Any collection failure is an admission-fact failure: latch it as
@@ -9436,7 +9824,7 @@ def _run_single(
                         },
                     ) from exc
                 checkpoint = _r55_run_checkpoint(
-                    decision=_r55_active_decision,
+                    decision=run_decision,
                     candidate=candidate,
                     mapping=mapping,
                     bundle=bundle,
@@ -9446,6 +9834,39 @@ def _run_single(
                     latched=latched_fact,
                 )
             except _R55RunRefused as exc:
+                # ZM-ZEGRID-ACTIVE-OOC-FALLBACK: at a SAFE wave boundary a
+                # QUALIFIED host-RAM refusal may be recovered ONCE by switching
+                # to the bounded profile on the SAME frozen geometry. Completed
+                # waves/results are kept; no partial unit exists at a boundary.
+                _recovery = _bounded_run_recovery(
+                    wave_index=wave_index,
+                    offset=offset,
+                    remaining_units=remaining_units,
+                    record=exc.record,
+                )
+                if _recovery is not None:
+                    bundle = _recovery["bundle"]
+                    candidate = _recovery["candidate"]
+                    mapping = _recovery["mapping"]
+                    all_tasks = _recovery["tasks"]
+                    total_tasks = len(all_tasks)
+                    canonical_cids = [t[0].cell_id for t in all_tasks]
+                    checkpoints.append({
+                        "schema": zrt.RUN_CONTROL_SCHEMA,
+                        "stage": _R55E1_RUN_STAGE,
+                        "wave_index": int(wave_index),
+                        "status": "storage_fallback",
+                        "remaining_units": int(remaining_units),
+                        "reason_code": renv.REASON_REFUSE_HOST_RAM,
+                        "detail": (
+                            "dense RUN checkpoint refused; ONE bounded retry "
+                            "on the same geometry"
+                        ),
+                        "storage_profile": zsp.STORAGE_PROFILE_BOUNDED,
+                        "shrink_steps": [],
+                    })
+                    # Re-run the SAME checkpoint under the bounded profile.
+                    continue
                 cleanup = []
                 for task in all_tasks[:offset]:
                     if task[4] is None:
@@ -12095,6 +12516,14 @@ def _write_outputs(
             if halo_provenance is not None else {}
         ),
         "reproducibility_note": _reproducibility_note(_effective_gauge_mode),
+        # ZM-ZEGRID-ACTIVE-OOC-FALLBACK: explicit storage provenance for the
+        # ACTIVE product path (legacy/observe keep the pre-existing shape). It
+        # records what was REQUESTED, what actually EXECUTED, why dense was
+        # refused and which phase triggered the ONE fallback.
+        **(
+            {"storage": _storage_policy_snapshot()}
+            if _STORAGE_ACTIVE_MODE else {}
+        ),
         "photometric_gauge": {
             "mode": getattr(science_config, "cell_gauge_mode", "global"),
             "requested_mode": (
@@ -12377,8 +12806,21 @@ def run_zegrid_mode(
     it resolves to per_cell; a global resolution fails loudly).
     """
     global _STACK_STORAGE_PROFILE
-    _STACK_STORAGE_PROFILE = zsp.normalize_storage_profile(storage_profile)
+    _storage_policy_reset(storage_profile)
+    _STACK_STORAGE_PROFILE = _STORAGE_EFFECTIVE
     _emit("ZeGrid engine activated (explicit ZeGrid mode)", callback=progress_callback)
+    _emit(
+        "ZeGrid: storage policy — requested="
+        f"{_STORAGE_REQUESTED} effective={_STORAGE_EFFECTIVE} "
+        f"(model={zsp.storage_model_id(_STORAGE_EFFECTIVE)}); "
+        + (
+            "auto = dense first, ONE bounded retry only on a qualified "
+            "host-RAM refusal"
+            if _STORAGE_REQUESTED == zsp.STORAGE_PROFILE_AUTO
+            else "explicit profile is FORCED (no silent fallback)"
+        ),
+        callback=progress_callback,
+    )
 
     # ZM-ZEGRID-R53: resolve the anti-checkerboard halo width FIRST, so an invalid
     # request fails before descriptors, layouts, gauge work or any output. The
@@ -12420,6 +12862,10 @@ def run_zegrid_mode(
         zegrid_scheduler_mode
         if zegrid_scheduler_mode is not None else _scheduler_config_value
     )
+    # ZM-ZEGRID-ACTIVE-OOC-FALLBACK: the storage provenance block is published
+    # ONLY for the ACTIVE product path (legacy/observe keep their exact shape).
+    global _STORAGE_ACTIVE_MODE
+    _STORAGE_ACTIVE_MODE = (_scheduler_mode == zsched.MODE_ACTIVE)
     _emit(
         f"ZeGrid: scheduler mode = {_scheduler_mode} "
         + (
