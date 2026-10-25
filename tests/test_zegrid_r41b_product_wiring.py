@@ -69,6 +69,19 @@ TOOL = REPO_ROOT / "tools" / "zegrid_routine" / "make_routine_corpus.py"
 _REAL_FLOORS = zal.ScientificFloors
 
 
+@pytest.fixture(autouse=True)
+def _isolate_dense_storage_profile(monkeypatch):
+    """This suite asserts the historical DENSE planner.
+
+    Other suites in the same pytest process may legitimately leave the
+    run-scoped storage seam on 'bounded' (Lot B/C, product fallback). Isolate
+    THIS suite instead of depending on collection order.
+    """
+    monkeypatch.setattr(
+        zz, "_STACK_STORAGE_PROFILE", zz.zsp.STORAGE_PROFILE_DENSE
+    )
+
+
 def _tiny_floors(**_kw):
     # NB: capture the REAL class first — this function REPLACES ``zal.ScientificFloors``
     # in the tests below, so calling ``zal.ScientificFloors`` here would recurse.

@@ -8205,33 +8205,74 @@ def _r55_run_checkpoint(
         }
 
     examined = []
-    saw_disk = False
+    # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-2 (F5): classify the CURRENT candidate
+    # BEFORE any shrink exhaustion. A disk shortage (or a non-memory materialization
+    # failure) at the last rung must never be relabelled as host RAM.
+    _current_feasible = bool(materialized.feasible)
+    saw_disk = int(materialized.disk_bytes) > int(disk_free) or (
+        not _current_feasible
+        and materialized.reason_code == renv.REASON_REFUSE_DISK
+    )
+    saw_host_ram = (
+        int(bundle.envelope.aggregate_bytes) > int(budget)
+        or (
+            not _current_feasible
+            and materialized.reason_code == renv.REASON_REFUSE_HOST_RAM
+        )
+        or (
+            not _current_feasible
+            and int(materialized.host_peak_bytes) > int(budget)
+        )
+    )
+    _NON_MEMORY_REFUSALS = (
+        renv.REASON_INTERNAL_ERROR,
+        renv.REASON_UNKNOWN_BACKEND,
+        renv.REASON_REFUSE_VRAM,
+        renv.REASON_PINNED_GEOMETRY,
+        renv.REASON_PARITY_FAIL,
+    )
+    saw_non_memory = bool(
+        not _current_feasible
+        and materialized.reason_code in _NON_MEMORY_REFUSALS
+    )
     current = candidate
     while True:
         step_name, nxt = zsched.next_shrink(current, ctx)
         if step_name is None or nxt is None:
-            reason = (
-                renv.REASON_REFUSE_DISK
-                if saw_disk
-                else renv.REASON_REFUSE_HOST_RAM
-            )
+            # F5: only a REAL host-budget overshoot, with no disk or non-memory
+            # failure contributing, is a capacity refusal.
+            if saw_disk:
+                reason = renv.REASON_REFUSE_DISK
+            elif saw_non_memory or not saw_host_ram:
+                reason = renv.REASON_INTERNAL_ERROR
+            else:
+                reason = renv.REASON_REFUSE_HOST_RAM
             detail = (
                 "no feasible adjacent CPU shrink remains for RUN wave "
                 f"{wave_index} (remaining_units={remaining_units}, raw={raw}, "
-                f"budget={budget}, disk_free={disk_free})"
+                f"budget={budget}, disk_free={disk_free}; "
+                f"saw_disk={bool(saw_disk)}, "
+                f"saw_host_ram={bool(saw_host_ram)}, "
+                f"saw_non_memory={bool(saw_non_memory)})"
             )
             record = _record("refused", candidate, mapping, examined, False)
             record["reason_code"] = reason
             record["detail"] = detail
             record["last_candidate"] = zsched.active_candidate_tuple(current)
-            # ONLY a genuine measured host-RAM shortage (no disk miss, every
-            # adjacent shrink really examined) is eligible for the bounded
-            # storage fallback at the next safe boundary.
+            record["classification"] = {
+                "saw_disk": bool(saw_disk),
+                "saw_host_ram": bool(saw_host_ram),
+                "saw_non_memory": bool(saw_non_memory),
+            }
+            and_eligible = bool(
+                reason == renv.REASON_REFUSE_HOST_RAM
+                and saw_host_ram
+                and not saw_disk
+                and not saw_non_memory
+            )
             raise _R55RunRefused(
                 reason, detail, record=record,
-                storage_fallback_eligible=(
-                    reason == renv.REASON_REFUSE_HOST_RAM and not saw_disk
-                ),
+                storage_fallback_eligible=and_eligible,
             )
         try:
             zsched.assert_shrink_only(current, nxt)
@@ -8257,6 +8298,10 @@ def _r55_run_checkpoint(
                 "device_peak_bytes": int(materialized.device_peak_bytes),
             },
         }
+        if materialized.reason_code == renv.REASON_REFUSE_HOST_RAM:
+            saw_host_ram = True
+        elif materialized.reason_code in _NON_MEMORY_REFUSALS:
+            saw_non_memory = True
         if materialized.reason_code == renv.REASON_REFUSE_DISK:
             saw_disk = True
         disk_ok = int(materialized.disk_bytes) <= int(disk_free)
@@ -8317,6 +8362,7 @@ def _r55_run_checkpoint(
                     f"{trial_bundle.envelope.aggregate_bytes} B > RUN budget "
                     f"{budget} B"
                 )
+                saw_host_ram = True
         examined.append(entry)
         current = materialized
 
@@ -9741,15 +9787,18 @@ def _run_single(
         # candidate for the NEXT safe boundary; it never mutates this wave.
         latch = zrt.PressureLatch()
 
-        def _bounded_run_recovery(*, wave_index, offset, remaining_units, record):
+        def _bounded_run_recovery(*, wave_index, offset, remaining_units, record,
+                                  governing_fact, fresh_facts,
+                                  refused_candidate, refused_mapping):
             """ONE safe-boundary dense->bounded recovery; None when not allowed.
 
             Only a QUALIFIED host-RAM checkpoint refusal can trigger it. The
             EXACT geometry/halo/memberships/frames/science identity are pinned
             (the gauge already ran), completed waves are kept, and every not-yet
             started cell task is rebuilt with the bounded provider/sink profile.
-            No partial unit exists at a wave boundary, so nothing is reused from
-            a unit that will be re-executed.
+            The GOVERNING observation of the refused boundary (min of the valid
+            latched sample and the fresh sample) is carried through the whole
+            retry: a recovered machine never buys a bigger wave budget.
             """
             nonlocal run_decision
             if int(remaining_units) <= 0:
@@ -9766,6 +9815,14 @@ def _run_single(
                 return None
             if not _storage_fallback_available():
                 return None
+            # ---- F4: the governing fact survives the SAME boundary retry ----
+            _governing_raw = int(record["host"]["raw_available_bytes"])
+            _fresh_raw = int(fresh_facts["host"]["raw_available_bytes"])
+            _raw = min(_governing_raw, _fresh_raw)
+            if governing_fact is not None:
+                _latched_raw = int(governing_fact["raw_available_bytes"])
+                _raw = min(_raw, _latched_raw)
+            _budget = int(rcontract.plan_budget_bytes(_raw))
             if not _activate_bounded_storage(
                 phase=f"run_wave_{int(wave_index)}",
                 reason_code=renv.REASON_REFUSE_HOST_RAM,
@@ -9775,8 +9832,6 @@ def _run_single(
             _fixed_layout = tuple(int(v) for v in bundle.envelope.layout)
             _fixed_rank = int(bundle.envelope.refinement_rank)
             try:
-                _raw = int(available_memory_bytes())
-                _budget = int(rcontract.plan_budget_bytes(_raw))
                 _seed = _build_execution_bundle(
                     canvas, descs, bundle.footprints,
                     raw_available_bytes=_raw, budget_bytes=_budget,
@@ -9814,6 +9869,39 @@ def _run_single(
                     lvl="ERROR", callback=progress_callback,
                 )
                 return None
+            # F4: the bounded rebuild must be a SHRINK of the refused candidate
+            # (tile/K/workers/prefetch/backend), never a growth bought with a
+            # recovered observation.
+            try:
+                zsched.assert_shrink_only(refused_candidate, _cand)
+            except zsched.SchedulerError as _grow_exc:
+                _emit(
+                    "ZeGrid: bounded RUN recovery refused a NON-shrink rebuild "
+                    f"({_grow_exc}); keeping the honest refusal",
+                    lvl="ERROR", callback=progress_callback,
+                )
+                return None
+            for _key in ("units_in_flight", "workers_per_unit", "prefetch_units"):
+                if int(_map[_key]) > int(refused_mapping[_key]):
+                    _emit(
+                        "ZeGrid: bounded RUN recovery refused a grown mapping "
+                        f"({_key}: {_map[_key]} > {refused_mapping[_key]}); "
+                        "keeping the honest refusal",
+                        lvl="ERROR", callback=progress_callback,
+                    )
+                    return None
+            _old_tile = refused_mapping.get("cpu_streaming_tile")
+            _new_tile = _map.get("cpu_streaming_tile")
+            if (
+                _old_tile is not None and _new_tile is not None
+                and int(_new_tile) > int(_old_tile)
+            ):
+                _emit(
+                    "ZeGrid: bounded RUN recovery refused a grown tile "
+                    f"({_new_tile} > {_old_tile}); keeping the honest refusal",
+                    lvl="ERROR", callback=progress_callback,
+                )
+                return None
             _new_tasks = list(_bnd.cell_tasks)
             if len(_new_tasks) != len(all_tasks):
                 _emit(
@@ -9846,6 +9934,7 @@ def _run_single(
                 "tasks": _new_tasks,
                 "admission": _adm2,
                 "trail": list(_trail2),
+                "governing_raw": int(_raw),
             }
 
         def _heartbeat():
@@ -9874,11 +9963,55 @@ def _run_single(
                 _stack_rep.progress(idx, item_id=cid)
             return _cb
 
+        def _terminalize_refusal(exc, *, wave_index, offset):
+            """Record/clean the terminal refusal of the CURRENT boundary.
+
+            Used both when no recovery is allowed and when the bounded retry
+            under the governing observation also refuses: the original
+            structured reason/eligibility is preserved verbatim.
+            """
+            cleanup = []
+            for task in all_tasks[:offset]:
+                if task[4] is None:
+                    continue
+                cache_dir = Path(task[3])
+                existed = bool(cache_dir.exists())
+                removed = bool(_safe_rmtree(task[3], None))
+                cleanup.append(
+                    {
+                        "cell_id": str(task[0].cell_id),
+                        "existed": bool(existed),
+                        "removed": bool(removed),
+                    }
+                )
+            exc.record["cleanup"] = cleanup
+            exc.record["waves_completed"] = int(wave_index)
+            exc.record["publication"] = {
+                "fits": False,
+                "manifest": False,
+                "assembly": False,
+            }
+            exc.record["telemetry"] = zrt.build_run_telemetry(
+                waves=wave_telemetry,
+                checkpoints=checkpoints,
+                shrink_count=shrink_count,
+                refusal=exc.record,
+                parent_end=zrt.read_parent_memory(),
+            )
+            _emit(
+                "ZeGrid: R55-E1 RUN REFUSED before wave "
+                f"{wave_index} — {exc.reason_code}: {exc.detail}. No FITS, "
+                "manifest or science publication; completed per-cell temp "
+                f"outputs cleaned best-effort ({len(cleanup)} task(s)).",
+                lvl="ERROR", callback=progress_callback,
+            )
+
         while offset < total_tasks:
             remaining_units = sum(
                 1 for t in all_tasks[offset:] if t[4] is not None
             )
             facts = _r55_run_checkpoint_sample(disk_root)
+            latched_fact = None
             try:
                 try:
                     latched_fact = latch.consume_validated()
@@ -9913,75 +10046,65 @@ def _run_single(
                     latched=latched_fact,
                 )
             except _R55RunRefused as exc:
-                # ZM-ZEGRID-ACTIVE-OOC-FALLBACK: at a SAFE wave boundary a
-                # QUALIFIED host-RAM refusal may be recovered ONCE by switching
-                # to the bounded profile on the SAME frozen geometry. Completed
-                # waves/results are kept; no partial unit exists at a boundary.
+                # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-2 (F4): a bounded retry of
+                # the SAME boundary carries the GOVERNING observation (min of the
+                # valid latched sample and the fresh sample); it never re-samples
+                # nor re-consumes the latch, and completed waves are kept.
                 _recovery = _bounded_run_recovery(
                     wave_index=wave_index,
                     offset=offset,
                     remaining_units=remaining_units,
                     record=exc.record,
+                    governing_fact=latched_fact,
+                    fresh_facts=facts,
+                    refused_candidate=candidate,
+                    refused_mapping=mapping,
                 )
-                if _recovery is not None:
-                    bundle = _recovery["bundle"]
-                    candidate = _recovery["candidate"]
-                    mapping = _recovery["mapping"]
-                    all_tasks = _recovery["tasks"]
-                    total_tasks = len(all_tasks)
-                    canonical_cids = [t[0].cell_id for t in all_tasks]
-                    checkpoints.append({
-                        "schema": zrt.RUN_CONTROL_SCHEMA,
-                        "stage": _R55E1_RUN_STAGE,
-                        "wave_index": int(wave_index),
-                        "status": "storage_fallback",
-                        "remaining_units": int(remaining_units),
-                        "reason_code": renv.REASON_REFUSE_HOST_RAM,
-                        "detail": (
-                            "dense RUN checkpoint refused; ONE bounded retry "
-                            "on the same geometry"
-                        ),
-                        "storage_profile": zsp.STORAGE_PROFILE_BOUNDED,
-                        "shrink_steps": [],
-                    })
-                    # Re-run the SAME checkpoint under the bounded profile.
-                    continue
-                cleanup = []
-                for task in all_tasks[:offset]:
-                    if task[4] is None:
-                        continue
-                    cache_dir = Path(task[3])
-                    existed = bool(cache_dir.exists())
-                    removed = bool(_safe_rmtree(task[3], None))
-                    cleanup.append(
-                        {
-                            "cell_id": str(task[0].cell_id),
-                            "existed": bool(existed),
-                            "removed": bool(removed),
-                        }
+                if _recovery is None:
+                    _terminalize_refusal(
+                        exc, wave_index=wave_index, offset=offset
                     )
-                exc.record["cleanup"] = cleanup
-                exc.record["waves_completed"] = int(wave_index)
-                exc.record["publication"] = {
-                    "fits": False,
-                    "manifest": False,
-                    "assembly": False,
-                }
-                exc.record["telemetry"] = zrt.build_run_telemetry(
-                    waves=wave_telemetry,
-                    checkpoints=checkpoints,
-                    shrink_count=shrink_count,
-                    refusal=exc.record,
-                    parent_end=zrt.read_parent_memory(),
-                )
-                _emit(
-                    "ZeGrid: R55-E1 RUN REFUSED before wave "
-                    f"{wave_index} — {exc.reason_code}: {exc.detail}. No FITS, "
-                    "manifest or science publication; completed per-cell temp "
-                    f"outputs cleaned best-effort ({len(cleanup)} task(s)).",
-                    lvl="ERROR", callback=progress_callback,
-                )
-                raise
+                    raise
+                bundle = _recovery["bundle"]
+                candidate = _recovery["candidate"]
+                mapping = _recovery["mapping"]
+                all_tasks = _recovery["tasks"]
+                total_tasks = len(all_tasks)
+                canonical_cids = [t[0].cell_id for t in all_tasks]
+                checkpoints.append({
+                    "schema": zrt.RUN_CONTROL_SCHEMA,
+                    "stage": _R55E1_RUN_STAGE,
+                    "wave_index": int(wave_index),
+                    "status": "storage_fallback",
+                    "remaining_units": int(remaining_units),
+                    "reason_code": renv.REASON_REFUSE_HOST_RAM,
+                    "detail": (
+                        "dense RUN checkpoint refused; ONE bounded retry under "
+                        "the SAME governing observation (latched/min)"
+                    ),
+                    "storage_profile": zsp.STORAGE_PROFILE_BOUNDED,
+                    "governing_raw_available_bytes": int(
+                        _recovery["governing_raw"]
+                    ),
+                    "latched_governed": bool(latched_fact is not None),
+                    "shrink_steps": [],
+                })
+                try:
+                    checkpoint = _r55_run_checkpoint(
+                        decision=run_decision,
+                        candidate=candidate,
+                        mapping=mapping,
+                        bundle=bundle,
+                        remaining_units=remaining_units,
+                        wave_index=wave_index,
+                        facts=facts,
+                        latched=latched_fact,
+                    )
+                except _R55RunRefused as exc2:
+                    _terminalize_refusal(
+                        exc2, wave_index=wave_index, offset=offset
+                    )
+                    raise
 
             bundle = checkpoint["bundle"]
             candidate = checkpoint["candidate"]

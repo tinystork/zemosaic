@@ -193,3 +193,103 @@ def test_synthetic_multicell_dense_vs_auto_bounded_parity(
         storage = cell["storage"]
         assert storage["provider"] == "BoundedMemmapCanonicalProvider"
         assert storage["sink"]["type"] == "BoundedCountingRejectionSink"
+
+
+# ---------------------------------------------------------------------------
+# Per-cell SEVEN-plane parity + exact contributor IDs at the SAME pinned cells
+# ---------------------------------------------------------------------------
+
+CORE_PLANES = (
+    "science_core",
+    "estimator_weight_sum_core",
+    "support_w1_core",
+    "support_w2_core",
+    "n_eff_support_core",
+    "valid_mask_core",
+    "surviving_sample_count_core",
+)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("halo", [64, 128])
+def test_pinned_mosaic_cell_seven_planes_and_ids(tmp_path, monkeypatch, halo):
+    """Every pinned Cell of the synthetic mosaic: dense vs bounded, 7 planes.
+
+    Uses an aligned cache built with the EXACT contributor ID list and patch
+    shape of each pinned Cell, so the comparison is at the real mosaic cell
+    geometry/membership without re-running the full reprojection twice.
+    """
+    import numpy as np
+    from zemosaic.core.zegrid import assembly as za
+    from zemosaic.core.zegrid import file_provider as zfp
+    from zemosaic.core.zegrid import geometry as zg
+    from zemosaic.core.zegrid import science_adapter as zsa
+
+    inp = _write_corpus(tmp_path)
+    frames, rejected = zg.read_manifest(inp)
+    assert rejected == []
+    canvas = zg.build_canvas(frames)
+    nx, ny = (int(v) for v in HALO_LAYOUT[halo].split("x"))
+    raw = RAW
+    budget = rcontract.plan_budget_bytes(raw)
+
+    zz._storage_policy_reset("dense")
+    footprints = []
+    layout = zz._choose_layout_mode_aware(
+        canvas, frames, budget, halo_px=halo,
+        pinned_layout=(nx, ny), footprints_out=footprints,
+    )
+    assert (layout["nx"], layout["ny"]) == (nx, ny)
+    ctxs = zz._build_chosen_cell_contexts(
+        footprints[0], canvas, nx, ny, None, halo_px=halo
+    )
+    cfg = zsa.MiniTileScienceConfig(cell_gauge_mode="per_cell")
+    monkeypatch.setattr(zz, "_STACK_CONFIG", cfg)
+    monkeypatch.setattr(zz, "_STACK_GAUGE", None)
+    monkeypatch.setattr(zz, "_STACK_GLOBAL_FRAME_IDS", None)
+    monkeypatch.setattr(zz, "_STACK_GLOBAL_REF", None)
+    monkeypatch.setattr(zz, "_STACK_TILE_SIZE", 128)
+    monkeypatch.setattr(zz, "_STACK_CACHE_WORKERS", 1)
+
+    rng = np.random.default_rng(31 + halo)
+    checked = 0
+    for _row, _col, cell, patch, mem in ctxs:
+        if not mem.patch_ids:
+            continue
+        ids = list(mem.patch_ids)
+        ph, pw = (int(v) for v in patch.patch_shape_hw)
+        n = len(ids)
+        frames_arr = [
+            (rng.normal(0, 2, (ph, pw, 3)).astype(np.float32)
+             + np.float32(10 + i))
+            for i in range(n)
+        ]
+        masks = [np.ones((ph, pw), dtype=bool) for _ in range(n)]
+        cache = tmp_path / f"cell_{_row}_{_col}"
+        zfp.write_aligned_cache_from_arrays(cache, ids, frames_arr, masks)
+
+        dense_info, bounded_info = {}, {}
+        dense_mt, dense_sres = zz._run_cell_stream(
+            cache, patch, cfg, None, tile_size=128,
+            storage_profile="dense", storage_info=dense_info,
+        )
+        bounded_mt, bounded_sres = zz._run_cell_stream(
+            cache, patch, cfg, None, tile_size=128,
+            storage_profile="bounded", storage_info=bounded_info,
+        )
+        dense_core = za.crop_all_planes_to_core(dense_mt)
+        bounded_core = za.crop_all_planes_to_core(bounded_mt)
+        for name in CORE_PLANES:
+            np.testing.assert_array_equal(
+                dense_core[name], bounded_core[name],
+                err_msg=f"{cell.cell_id}:{name}",
+            )
+        # Exact contributor identity (same ordered list, no add/drop).
+        assert tuple(dense_sres.frame_order) == tuple(ids)
+        assert tuple(bounded_sres.frame_order) == tuple(ids)
+        assert bounded_info["provider"] == "BoundedMemmapCanonicalProvider"
+        assert bounded_info["sink"]["type"] == "BoundedCountingRejectionSink"
+        assert bounded_info["sink"]["written_cells"] == n * ph * pw * 3
+        assert dense_info["sink"] is None
+        checked += 1
+    assert checked == nx * ny

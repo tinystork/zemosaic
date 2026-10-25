@@ -32,6 +32,13 @@ A wave boundary has no in-flight unit, so no partial result can survive. There i
 ONE profile transition per run (`fallback_count <= 1`): no dense/bounded ping-pong and no
 recursive restart of the whole run.
 
+**Governing observation (rework-2).** The valid latched pressure fact that caused the refusal
+is consumed ONCE and carried into the bounded rebuild AND the retried checkpoint of the SAME
+boundary: both evaluate under `min(valid_latched, fresh)`. A recovered machine never gets a
+larger wave budget to bypass the shortage. The bounded rebuild must be a strict SHRINK of the
+refused candidate (backend/tile/K/workers/prefetch via `assert_shrink_only` plus an explicit
+mapping check); any growth is refused and the honest refusal propagates.
+
 At `run_wave_N`, a bounded rebuild that cannot reproduce the exact layout (or the completed
 cell prefix) is refused and the original honest refusal propagates. GPU→CPU runtime
 fallbacks keep the **effective** profile; the profile travels in the 7th task element and in
@@ -56,6 +63,17 @@ At the pre-gauge admission the eligibility is TYPED: only
 profile. At a RUN wave boundary a malformed/failed/missing observation is
 fail-closed: the refusal keeps its original code and is never relabelled into a
 bounded retry, so no FITS/manifest can be published after a failed measurement.
+
+The pre-gauge config-error path is wrapped by the product as
+`RuntimeError("R55-D2 active refused before the gauge/stack: ...")`; the original
+`SchedulerConfigError` is NOT re-raised as its own type, but it is also never
+reclassified as RAM and never changes the storage profile.
+
+**Disk vs RAM at the final CPU rung (F5).** `_r55_run_checkpoint` classifies the CURRENT
+candidate before exhaustion. A disk shortfall, a non-memory materialization failure, or the
+absence of any real host-budget overshoot yields `R55_REFUSE_DISK` or
+`R55_INTERNAL_ERROR` with `storage_fallback_eligible=False`. Only a proven host-RAM
+overshoot with no disk/non-memory contribution is eligible.
 
 NOT eligible and always propagated unchanged: scientific floors without a budget miss,
 WCS/FITS errors, permissions, cache corruption, disk full, programming errors,
