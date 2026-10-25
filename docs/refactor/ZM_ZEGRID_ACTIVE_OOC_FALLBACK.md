@@ -46,7 +46,16 @@ Only memory-qualified refusals:
 * `LayoutInfeasible` carrying an explicit budget miss (`... exceeds/exceed budget ...`);
 * the post-refinement rank-window refusal (the bounded window admitted no candidate after
   memory-driven refinement);
-* the RUN checkpoint `R55_REFUSE_HOST_RAM` reason.
+* the RUN checkpoint `R55_REFUSE_HOST_RAM` reason **with structured
+  `storage_fallback_eligible=True`** (emitted only when every adjacent shrink was
+  really examined against a valid measured host-RAM budget).
+
+At the pre-gauge admission the eligibility is TYPED: only
+`reason_code == R55_REFUSE_HOST_RAM` or `AdmissionExhausted`. `SchedulerConfigError`,
+`GrowthRejected`, invalid observations/envelopes and disk refusals never switch the
+profile. At a RUN wave boundary a malformed/failed/missing observation is
+fail-closed: the refusal keeps its original code and is never relabelled into a
+bounded retry, so no FITS/manifest can be published after a failed measurement.
 
 NOT eligible and always propagated unchanged: scientific floors without a budget miss,
 WCS/FITS errors, permissions, cache corruption, disk full, programming errors,
@@ -69,9 +78,16 @@ RAM 80/90, VRAM 70 % / headroom 85 % / legacy 50 %, `max_halo_overhead 50 %`, KG
 semantics, normalisation/rejection/weights/combine. No automatic H128 reduction, no raw
 loss, no swap counted as RAM. `linear_fit` is out of scope.
 
-## Not proven here
+## Evidence classes (do not conflate them)
 
-* Real CUDA execution and Windows spawn/close/remove smoke: **NOT RUN** in this mission
-  environment (unchanged from Lot C).
-* A full Caldwell/M106 mosaic dense-vs-bounded parity remains a host-RAM gate; this mission
-  proves the 816-header AUTO planner path and small complete synthetic mosaics instead.
+| Evidence | Status |
+|---|---|
+| Canonical GPU-only suite (`test_sci05_canonical_streaming_gpu.py`) | **RUN** on the real CUDA device (5 passed) |
+| COMBINED bounded provider + counting sink with `backend="gpu"` (same device kernels) | **RUN**: dense vs bounded seven-plane bit-parity, real sink writes and cache close/remove |
+| Small synthetic complete multi-cell mosaics, H64 (2x2) and H128 (2x1), forced dense vs AUTO→bounded at the same pin | **RUN**: bit-identical science/coverage, identical contributors and offsets/feather |
+| Real M106 single-Cell seven-plane parity (Lot C) | **REUSED** (provider/sink/streaming code unchanged) |
+| Real full M106 mosaic dense-vs-bounded | **NOT RUN** (host RAM) |
+| Real full Caldwell mosaic dense-vs-bounded | **NOT RUN** (host RAM; the 816-header AUTO planner/bundle replay IS run) |
+| Windows real execution (spawn/close/remove) | **NOT RUN** |
+
+No synthetic or single-cell witness is presented as a real full mosaic.

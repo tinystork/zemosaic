@@ -2033,6 +2033,23 @@ def _plan_bundle_auto(
             ) from exc2
 
 
+def _storage_admission_refusal(exc):
+    """Typed eligibility for the pre-gauge ACTIVE admission fallback.
+
+    Only a REAL capacity refusal may switch the storage profile. A config error,
+    a growth/freeze violation, an invalid observation/envelope, a disk refusal or
+    any programming error is NOT a memory shortage and is propagated unchanged.
+    """
+    code = getattr(exc, "reason_code", None)
+    if code == renv.REASON_REFUSE_HOST_RAM:
+        return True, str(code), str(exc)
+    if isinstance(exc, rcontract.AdmissionExhausted):
+        # The admission controller exhausted its bounded replans against a REAL
+        # measured ceiling: this is a capacity refusal, not an observation error.
+        return True, renv.REASON_REFUSE_HOST_RAM, str(exc)
+    return False, None, str(exc)
+
+
 def _storage_plan_refusal(exc):
     """Classify a PLAN/ADMIT refusal as a QUALIFIED host-RAM memory refusal.
 
@@ -2056,10 +2073,14 @@ def _storage_plan_refusal(exc):
             return True, renv.REASON_REFUSE_HOST_RAM, detail
         # After a memory-driven internal refinement, the bounded-rank window can
         # admit NO candidate and the final message is the rank-window refusal.
-        # That is still a RAM/geometry-window miss (a bounded retry is the ONLY
-        # remaining storage lever); a genuine floor invalidity refuses again
-        # under bounded and surfaces as a loud double refusal.
-        if "refinement-rank window" in detail:
+        # That is still a RAM/geometry-window miss ONLY when the builder recorded
+        # real memory exhaustion (`memory_exhausted`); a pinned/user window is
+        # not a capacity miss. A genuine floor invalidity refuses again under
+        # bounded and surfaces as a loud double refusal.
+        if (
+            "refinement-rank window" in detail
+            and getattr(exc, "memory_exhausted", False) is True
+        ):
             return True, renv.REASON_REFUSE_HOST_RAM, detail
         return False, None, detail
     return False, None, detail
@@ -4361,18 +4382,35 @@ def _build_execution_bundle(
     # A pinned / exact-geometry request can NEVER relocate the layout, so the
     # refinement loop below must refuse instead of going finer.
     exact_geometry = pinned_layout is not None or rank_ceiling is not None
+    # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-1 (MEDIUM): track a REAL memory-driven
+    # refinement. Only then may a final rank-window refusal be classified as a
+    # capacity miss for the bounded fallback.
+    _refinement_memory_pressure = False
 
     while True:
         _fp_out = []
-        layout = _choose_layout_mode_aware(
-            canvas, descs, ram_budget=budget_bytes,
-            available_bytes=raw_available_bytes, tile_size=STREAM_TILE_SIZE,
-            pinned_layout=pinned_layout, emit=emit, log_line=log_line,
-            observer=layout_substep, footprints_out=_fp_out,
-            footprints_in=footprints,
-            min_refinement_rank=rank_floor, max_refinement_rank=rank_ceiling,
-            halo_px=_halo,
-        )
+        try:
+            layout = _choose_layout_mode_aware(
+                canvas, descs, ram_budget=budget_bytes,
+                available_bytes=raw_available_bytes, tile_size=STREAM_TILE_SIZE,
+                pinned_layout=pinned_layout, emit=emit, log_line=log_line,
+                observer=layout_substep, footprints_out=_fp_out,
+                footprints_in=footprints,
+                min_refinement_rank=rank_floor,
+                max_refinement_rank=rank_ceiling,
+                halo_px=_halo,
+            )
+        except zal.LayoutInfeasible as _layout_exc:
+            # The final rank-window message only qualifies when THIS bundle build
+            # really exhausted a measured memory budget and moved finer. A
+            # pinned / user-requested window without memory pressure is NOT a
+            # capacity miss.
+            if (
+                _refinement_memory_pressure
+                and "refinement-rank window" in str(_layout_exc)
+            ):
+                _layout_exc.memory_exhausted = True
+            raise
         if footprints is None:
             footprints = _fp_out[0] if _fp_out else None
         nx, ny = int(layout["nx"]), int(layout["ny"])
@@ -4656,7 +4694,8 @@ def _build_execution_bundle(
                     "geometry of an already-committed run."
                 )
             # Auto: the full ladder is exhausted -> move to the NEXT FINER
-            # candidate (never coarser).
+            # candidate (never coarser). This is a REAL memory-driven refinement.
+            _refinement_memory_pressure = True
             rank_floor = (nx * ny) + 1
             if rank_floor > canvas.width * canvas.height:
                 raise zpar.ModeInfeasible(
@@ -7930,13 +7969,26 @@ _R55E1_UNAVAILABLE_SHRINKS = (
 
 
 class _R55RunRefused(RuntimeError):
-    """A RUN checkpoint refused BEFORE the next wave (fail closed)."""
+    """A RUN checkpoint refused BEFORE the next wave (fail closed).
 
-    def __init__(self, reason_code, detail, *, record):
+    ``storage_fallback_eligible`` is STRUCTURED evidence that the refusal comes
+    from a VALID, freshly measured capacity shortage (the scheduler exhausted
+    every adjacent shrink against a real host-RAM budget). A malformed / failed
+    / missing observation, a disk refusal, an internal error or a config error is
+    NEVER eligible: the bounded storage fallback must not turn a fail-closed
+    observation failure into a published mosaic.
+    """
+
+    def __init__(self, reason_code, detail, *, record,
+                 storage_fallback_eligible=False):
         super().__init__(f"{reason_code}: {detail}")
         self.reason_code = str(reason_code)
         self.detail = str(detail)
         self.record = dict(record)
+        self.storage_fallback_eligible = bool(storage_fallback_eligible)
+        self.record["storage_fallback_eligible"] = bool(
+            storage_fallback_eligible
+        )
 
 
 def _r55_run_disk_root(cache_root, output_dir) -> Path:
@@ -8172,7 +8224,15 @@ def _r55_run_checkpoint(
             record["reason_code"] = reason
             record["detail"] = detail
             record["last_candidate"] = zsched.active_candidate_tuple(current)
-            raise _R55RunRefused(reason, detail, record=record)
+            # ONLY a genuine measured host-RAM shortage (no disk miss, every
+            # adjacent shrink really examined) is eligible for the bounded
+            # storage fallback at the next safe boundary.
+            raise _R55RunRefused(
+                reason, detail, record=record,
+                storage_fallback_eligible=(
+                    reason == renv.REASON_REFUSE_HOST_RAM and not saw_disk
+                ),
+            )
         try:
             zsched.assert_shrink_only(current, nxt)
             materialized = zsched.materialize_active_candidate(ctx, nxt)
@@ -8894,14 +8954,20 @@ def _run_single(
                     ),
                 ) = _r55_cpu_preflight(_initial_bundle)
             except (zsched.SchedulerError, rcontract.RamContractError) as _r55_exc:
-                # ZM-ZEGRID-ACTIVE-OOC-FALLBACK: nothing has started yet (no
-                # gauge/stack), so a QUALIFIED host-RAM admission miss switches
-                # the run ONCE to bounded and re-plans on the SAME pinned
-                # geometry/halo/science. A forced profile never falls back.
-                if not _activate_bounded_storage(
-                    phase="admission_preflight",
-                    reason_code=renv.REASON_REFUSE_HOST_RAM,
-                    detail=str(_r55_exc), emit=_emit_live,
+                # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-1 (MEDIUM): only a TYPED
+                # capacity refusal is eligible. Nothing has started yet (no
+                # gauge/stack), so a qualified host-RAM miss switches the run
+                # ONCE to bounded on the SAME pinned geometry/halo/science.
+                _adm_mem, _adm_code, _adm_detail = _storage_admission_refusal(
+                    _r55_exc
+                )
+                if not (
+                    _adm_mem
+                    and _activate_bounded_storage(
+                        phase="admission_preflight",
+                        reason_code=_adm_code,
+                        detail=_adm_detail, emit=_emit_live,
+                    )
                 ):
                     _emit(
                         "ZeGrid: R55-D2 active REFUSED before the gauge/stack — "
@@ -8919,17 +8985,22 @@ def _run_single(
                     lvl="WARN", callback=progress_callback,
                 )
                 try:
+                    # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-1 (HIGH): the exact
+                    # admitted geometry/rank live on the VALIDATED envelope, not
+                    # on the bundle object.
+                    _pinned_layout = tuple(
+                        int(v) for v in _initial_bundle.envelope.layout
+                    )
+                    _pinned_rank = int(
+                        _initial_bundle.envelope.refinement_rank
+                    )
                     _initial_bundle = _build_execution_bundle(
                         canvas, descs, footprints,
                         raw_available_bytes=plan_raw_bytes,
                         budget_bytes=plan_budget_bytes,
-                        pinned_layout=(int(nx), int(ny)),
-                        min_refinement_rank=int(
-                            _initial_bundle.refinement_rank
-                        ),
-                        max_refinement_rank=int(
-                            _initial_bundle.refinement_rank
-                        ),
+                        pinned_layout=_pinned_layout,
+                        min_refinement_rank=_pinned_rank,
+                        max_refinement_rank=_pinned_rank,
                         layout_substep=None,
                         **_bundle_common,
                     )
@@ -9684,6 +9755,14 @@ def _run_single(
             if int(remaining_units) <= 0:
                 return None
             if str(record.get("reason_code")) != renv.REASON_REFUSE_HOST_RAM:
+                return None
+            # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-1 (HIGH): recover ONLY from a
+            # VALID measured capacity shortage. A malformed/failed/missing
+            # observation, a disk miss or an internal/config error is fail-CLOSED
+            # and must never be relabelled into a bounded retry.
+            if record.get("storage_fallback_eligible") is not True:
+                return None
+            if "last_candidate" not in record:
                 return None
             if not _storage_fallback_available():
                 return None

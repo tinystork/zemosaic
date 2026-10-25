@@ -271,60 +271,12 @@ def test_legacy_and_observe_never_gain_a_fallback(tmp_path, monkeypatch, mode):
 # ---------------------------------------------------------------------------
 
 def test_public_active_runtime_checkpoint_fallback(tmp_path, monkeypatch):
-    inp, out = _write_corpus(tmp_path)
-    monkeypatch.setattr(zz, "available_memory_bytes", lambda: _DENSE_OK_RAW)
-    monkeypatch.setattr(zal, "ScientificFloors", _tiny_floors)
-    # Dense plans exist (the run starts dense), but the first RUN checkpoint is
-    # refused for host RAM; the bounded retry (smaller stream bound) succeeds.
-    monkeypatch.setattr(
-        zz, "_estimate_streaming_bytes",
-        lambda n, hw, tile_size=zz.STREAM_TILE_SIZE, channels=3,
-        storage_profile=None: (
-            1 * MIB if storage_profile == "bounded" else 8 * MIB
-        ),
-    )
-    real_checkpoint = zz._r55_run_checkpoint
-    calls = {"n": 0}
+    """A REAL measured shortage at the wave-1 boundary recovers to bounded.
 
-    def _refuse_once(**kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise zz._R55RunRefused(
-                "R55_REFUSE_HOST_RAM",
-                "injected host-RAM pressure at the first safe boundary",
-                record={
-                    "schema": "test",
-                    "status": "refused",
-                    "reason_code": "R55_REFUSE_HOST_RAM",
-                    "detail": "injected host-RAM pressure",
-                    "wave_index": 0,
-                    "remaining_units": 1,
-                    "shrink_steps": [],
-                    "unavailable_shrinks": [],
-                },
-            )
-        return real_checkpoint(**kwargs)
-
-    monkeypatch.setattr(zz, "_r55_run_checkpoint", _refuse_once)
-
-    zz.run_zegrid_mode(
-        str(inp), str(out), zconfig=_active_zconfig("active"), zegrid_halo_px=8,
-    )
-    storage = _manifest(out)["storage"]
-    assert storage["requested"] == "auto"
-    assert storage["effective"] == "bounded"
-    assert storage["fallback_count"] == 1
-    assert storage["transitions"][0]["phase"].startswith("run_wave_")
-    # Proves the run continued after the recovery instead of aborting.
-    assert (out / "mosaic_grid.fits").exists()
-
-
-def test_runtime_fallback_keeps_geometry_and_task_profile(tmp_path, monkeypatch):
-    """A bounded recovery starts the remaining cells bounded at the SAME geometry.
-
-    Proven end-to-end by the manifest: the fallback is recorded at a RUN wave
-    phase and the final bundled cells still cover the whole canvas (same layout
-    and memberships, only the storage profile changed).
+    The checkpoint sample reports 8 MiB of available RAM before wave 1 (wave 0
+    already completed). The scheduler exhausts its shrinks with a valid measured
+    shortage, so the refusal is storage-fallback eligible; the bounded rebuild
+    runs under the fresh 4 GiB observation and keeps the SAME geometry.
     """
     inp, out = _write_corpus(tmp_path)
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: _DENSE_OK_RAW)
@@ -333,35 +285,55 @@ def test_runtime_fallback_keeps_geometry_and_task_profile(tmp_path, monkeypatch)
         zz, "_estimate_streaming_bytes",
         lambda n, hw, tile_size=zz.STREAM_TILE_SIZE, channels=3,
         storage_profile=None: (
-            1 * MIB if storage_profile == "bounded" else 8 * MIB
+            1 * MIB if storage_profile == "bounded" else 16 * MIB
         ),
     )
-    real_checkpoint = zz._r55_run_checkpoint
+    real_sample = zz._r55_run_checkpoint_sample
     calls = {"n": 0}
 
-    def _refuse_once(**kwargs):
+    def _sample(disk_root):
+        facts = real_sample(disk_root)
         calls["n"] += 1
-        if calls["n"] == 1:
-            raise zz._R55RunRefused(
-                "R55_REFUSE_HOST_RAM",
-                "injected host-RAM pressure",
-                record={
-                    "schema": "test", "status": "refused",
-                    "reason_code": "R55_REFUSE_HOST_RAM",
-                    "detail": "injected host-RAM pressure",
-                    "wave_index": 0, "remaining_units": 1,
-                    "shrink_steps": [], "unavailable_shrinks": [],
-                },
+        if calls["n"] == 2:
+            raw = 8 * MIB
+            facts["host"]["raw_available_bytes"] = raw
+            facts["host"]["budget_bytes"] = int(
+                zz.zrt.run_budget_bytes(raw)
             )
-        return real_checkpoint(**kwargs)
+        return facts
 
-    monkeypatch.setattr(zz, "_r55_run_checkpoint", _refuse_once)
-    zz.run_zegrid_mode(str(inp), str(out), zconfig=_active_zconfig("active"), zegrid_halo_px=8)
-
+    monkeypatch.setattr(zz, "_r55_run_checkpoint_sample", _sample)
+    # One task per wave so wave 0 is guaranteed completed before the shortage.
+    monkeypatch.setattr(
+        zz.zrt, "next_wave_bound",
+        lambda offset, total, units: (offset, min(total, offset + 1)),
+    )
+    zz.run_zegrid_mode(
+        str(inp), str(out), zconfig=_active_zconfig("active"), zegrid_halo_px=8,
+    )
     manifest = _manifest(out)
-    assert manifest["storage"]["transitions"][0]["phase"].startswith("run_wave_")
     assert manifest["storage"]["effective"] == "bounded"
+    assert manifest["storage"]["fallback_count"] == 1
+    assert manifest["storage"]["transitions"][0]["phase"] == "run_wave_1"
+    assert manifest["storage"]["transitions"][0]["reason_code"] == "R55_REFUSE_HOST_RAM"
     assert (out / "mosaic_grid.fits").exists()
+
+
+def test_runtime_recovery_requires_structured_eligibility():
+    """A bare R55_REFUSE_HOST_RAM is NOT enough to switch storage profiles."""
+    record = {
+        "schema": "test", "status": "refused",
+        "reason_code": "R55_REFUSE_HOST_RAM",
+        "detail": "malformed observation relabelled as RAM",
+        "wave_index": 0, "remaining_units": 3,
+        "shrink_steps": [], "unavailable_shrinks": [],
+    }
+    exc = zz._R55RunRefused(
+        "R55_REFUSE_HOST_RAM", "malformed observation", record=record,
+    )
+    assert exc.storage_fallback_eligible is False
+    assert exc.record["storage_fallback_eligible"] is False
+
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +416,263 @@ def test_prepared_payload_uses_task_profile_not_parent_global(monkeypatch):
     except Exception:
         pass
     assert seen.get("profile") == "bounded"
+
+
+# ---------------------------------------------------------------------------
+# Portable transport + cache close/remove
+# ---------------------------------------------------------------------------
+
+def test_bounded_task_tuple_is_pickle_portable():
+    import pickle
+
+    task = (
+        SimpleNamespace(cell_id="c0", row=0, col=0),
+        SimpleNamespace(patch_shape_hw=(8, 8)),
+        SimpleNamespace(patch_ids=["a", "b"]),
+        "/tmp/does-not-matter",
+        "stream",
+        123,
+        "bounded",
+    )
+    clone = pickle.loads(pickle.dumps(task))
+    assert len(clone) == 7
+    assert clone[6] == "bounded"
+    assert clone[4] == "stream"
+    assert clone[0].cell_id == "c0"
+    assert clone[2].patch_ids == ["a", "b"]
+
+
+def test_bounded_cell_closes_and_removes_its_cache(tmp_path):
+    """The product cell path closes the provider then deletes the cache."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "lot_b_helpers",
+        Path(__file__).resolve().parent / "test_zegrid_r52_ooc_storage_lot_b.py",
+    )
+    lotb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lotb)
+
+    cache = tmp_path / "cache_bounded_close"
+    frames, masks, ids = lotb._write_cache(cache)
+    cfg = lotb.zsa.MiniTileScienceConfig(cell_gauge_mode="per_cell")
+    with pytest.MonkeyPatch.context() as mp:
+        lotb._install_cell_globals(mp, cache, cfg)
+        task = (
+            lotb._FakeCell(), lotb._FakePatch(), lotb._FakeMem(ids),
+            str(cache), "stream", 123, "bounded",
+        )
+        prepared = zz._prepare_stack_cell(task)
+        result = zz._consume_stack_cell(prepared)
+    assert result["record"]["storage"]["open_failures"] == 0
+    assert result["record"]["storage"]["sink"]["type"] == "BoundedCountingRejectionSink"
+    assert not cache.exists(), "bounded cell cache was not removed"
+
+
+# ---------------------------------------------------------------------------
+# Pre-gauge ACTIVE admission: typed eligibility + real public retry
+# ---------------------------------------------------------------------------
+
+def test_preflight_admission_ram_refusal_falls_back_public(tmp_path, monkeypatch):
+    inp, out = _write_corpus(tmp_path)
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: _DENSE_OK_RAW)
+    monkeypatch.setattr(zal, "ScientificFloors", _tiny_floors)
+    monkeypatch.setattr(
+        zz, "_estimate_streaming_bytes",
+        lambda n, hw, tile_size=zz.STREAM_TILE_SIZE, channels=3,
+        storage_profile=None: (
+            1 * MIB if storage_profile == "bounded" else 16 * MIB
+        ),
+    )
+    real_admit = zz._r55_active_admit
+    state = {"injected": False}
+
+    def _admit(*args, **kwargs):
+        if not state["injected"] and zz._STORAGE_EFFECTIVE == "dense":
+            state["injected"] = True
+            raise zz.zsched.ActivePlanRejected(
+                zz.renv.REASON_REFUSE_HOST_RAM,
+                "injected capacity miss before the gauge",
+            )
+        return real_admit(*args, **kwargs)
+
+    monkeypatch.setattr(zz, "_r55_active_admit", _admit)
+    zz.run_zegrid_mode(
+        str(inp), str(out), zconfig=_active_zconfig("active"), zegrid_halo_px=8,
+    )
+    storage = _manifest(out)["storage"]
+    assert state["injected"] is True
+    assert storage["effective"] == "bounded"
+    assert storage["fallback_count"] == 1
+    assert storage["transitions"][0]["phase"] == "admission_preflight"
+    assert (out / "mosaic_grid.fits").exists()
+
+
+def test_preflight_non_memory_error_does_not_fall_back(tmp_path, monkeypatch):
+    inp, out = _write_corpus(tmp_path)
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: _DENSE_OK_RAW)
+    monkeypatch.setattr(zal, "ScientificFloors", _tiny_floors)
+    monkeypatch.setattr(
+        zz, "_estimate_streaming_bytes",
+        lambda n, hw, tile_size=zz.STREAM_TILE_SIZE, channels=3,
+        storage_profile=None: (
+            1 * MIB if storage_profile == "bounded" else 16 * MIB
+        ),
+    )
+
+    def _admit(*args, **kwargs):
+        raise zz.zsched.SchedulerConfigError(
+            "JUNIOR: invalid scheduler configuration, NOT memory pressure"
+        )
+
+    monkeypatch.setattr(zz, "_r55_active_admit", _admit)
+    with pytest.raises(RuntimeError):
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=_active_zconfig("active"),
+            zegrid_halo_px=8,
+        )
+    assert zz._STORAGE_EFFECTIVE == "dense"
+    assert zz._STORAGE_FALLBACK_COUNT == 0
+    assert not (out / "zegrid_manifest.json").exists()
+    assert not (out / "mosaic_grid.fits").exists()
+
+
+def test_observation_failure_is_fail_closed_public(tmp_path, monkeypatch):
+    inp, out = _write_corpus(tmp_path)
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: _DENSE_OK_RAW)
+    monkeypatch.setattr(zal, "ScientificFloors", _tiny_floors)
+    monkeypatch.setattr(
+        zz, "_estimate_streaming_bytes",
+        lambda n, hw, tile_size=zz.STREAM_TILE_SIZE, channels=3,
+        storage_profile=None: (
+            1 * MIB if storage_profile == "bounded" else 16 * MIB
+        ),
+    )
+    original = zz.zrt.PressureLatch.consume_validated
+    state = {"injected": False}
+
+    def _consume(self):
+        if not state["injected"]:
+            state["injected"] = True
+            self.record_error(RuntimeError("JUNIOR: MemAvailable collection failed"))
+        return original(self)
+
+    monkeypatch.setattr(zz.zrt.PressureLatch, "consume_validated", _consume)
+    with pytest.raises(zz._R55RunRefused) as ei:
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=_active_zconfig("active"),
+            zegrid_halo_px=8,
+        )
+    assert state["injected"] is True
+    assert ei.value.reason_code == zz.renv.REASON_REFUSE_HOST_RAM
+    assert ei.value.storage_fallback_eligible is False
+    assert zz._STORAGE_EFFECTIVE == "dense"
+    assert zz._STORAGE_FALLBACK_COUNT == 0
+    assert not (out / "zegrid_manifest.json").exists()
+    assert not (out / "mosaic_grid.fits").exists()
+
+
+# ---------------------------------------------------------------------------
+# REAL CUDA + bounded provider / counting sink combined path
+# ---------------------------------------------------------------------------
+
+CORE_PLANES = (
+    "science_core",
+    "estimator_weight_sum_core",
+    "support_w1_core",
+    "support_w2_core",
+    "n_eff_support_core",
+    "valid_mask_core",
+    "surviving_sample_count_core",
+)
+
+
+def test_real_cuda_dense_vs_bounded_provider_and_sink_parity(tmp_path, monkeypatch):
+    """The COMBINED path: CuPy backend + file-backed provider + counting sink.
+
+    Not a planner verdict and not the GPU-only canonical suite: the product
+    ``_run_cell_stream`` seam runs the canonical engine with ``backend="gpu"``
+    on BOTH profiles, so the same device kernels consume the dense memmap
+    provider and the bounded provider + fresh counting sink. The seven core
+    planes must be bit-identical and the bounded sink must count the whole
+    interior partition with real large writes.
+    """
+    pytest.importorskip("cupy")
+    import numpy as np
+    from zemosaic.core import canonical_stacking as csx
+    from zemosaic.core.zegrid import file_provider as zfp
+    from zemosaic.core.zegrid import science_adapter as zsa
+
+    if not csx.canonical_gpu_available():
+        pytest.skip("no CUDA device available")
+
+    n, h, w = 8, 64, 64
+    rng = np.random.default_rng(11)
+    frames, masks = [], []
+    for i in range(n):
+        f = (
+            rng.normal(0, 3, (h, w, 3)).astype(np.float32)
+            + np.array([50, 55, 60], np.float32)
+            + np.float32(2.0 * i)
+        )
+        f[0:2, :, :] = np.nan
+        frames.append(f)
+        m = np.ones((h, w), dtype=bool)
+        if i == 3:
+            m[:, 40:] = False
+        masks.append(m)
+    ids = [f"f{i}" for i in range(n)]
+    cache = tmp_path / "cache"
+    zfp.write_aligned_cache_from_arrays(cache, ids, frames, masks)
+
+    cfg = zsa.MiniTileScienceConfig(cell_gauge_mode="per_cell", backend="gpu")
+    monkeypatch.setattr(zz, "_STACK_CONFIG", cfg)
+    monkeypatch.setattr(zz, "_STACK_GAUGE", None)
+    monkeypatch.setattr(zz, "_STACK_GLOBAL_FRAME_IDS", None)
+    monkeypatch.setattr(zz, "_STACK_GLOBAL_REF", None)
+    monkeypatch.setattr(zz, "_STACK_TILE_SIZE", 64)
+    monkeypatch.setattr(zz, "_STACK_CACHE_WORKERS", 1)
+
+    class _Patch:
+        cell_id = "c"
+        patch_shape_hw = (h, w)
+        core_slice = SimpleNamespace(y0=0, y1=h, x0=0, x1=w)
+        patch = SimpleNamespace(x0=0, y0=0, x1=w, y1=h, height=h, width=w)
+
+    dense_info, bounded_info = {}, {}
+    dense_mt, dense_sres = zz._run_cell_stream(
+        cache, _Patch(), cfg, None, tile_size=64,
+        storage_profile="dense", storage_info=dense_info,
+    )
+    bounded_mt, bounded_sres = zz._run_cell_stream(
+        cache, _Patch(), cfg, None, tile_size=64,
+        storage_profile="bounded", storage_info=bounded_info,
+    )
+
+    # The device really executed the rejection/combine stages on BOTH runs.
+    for sres in (dense_sres, bounded_sres):
+        prov = sres.result.provenance
+        assert prov["backend"]["requested"] == "gpu", prov["backend"]
+        assert "gpu" in str(prov["backend"]).lower()
+
+    from zemosaic.core.zegrid import assembly as za
+    dense_core = za.crop_all_planes_to_core(dense_mt)
+    bounded_core = za.crop_all_planes_to_core(bounded_mt)
+    for name in CORE_PLANES:
+        np.testing.assert_array_equal(
+            dense_core[name], bounded_core[name], err_msg=name
+        )
+
+    assert dense_info["provider"] == "MemmapCanonicalProvider"
+    assert bounded_info["provider"] == "BoundedMemmapCanonicalProvider"
+    assert bounded_info["open_failures"] == 0
+    sink = bounded_info["sink"]
+    assert sink["type"] == "BoundedCountingRejectionSink"
+    assert sink["written_cells"] == n * h * w * 3
+    assert sink["writes"] > 0
+    assert sink["flush_count"] == sink["writes"]
+    assert sink["max_write_bytes"] > 0
+    assert bounded_info["rejection_mask_available"] is False
 
 
 # ---------------------------------------------------------------------------
