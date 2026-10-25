@@ -30,6 +30,11 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Sequence
 
 from . import calibration as zcal
+from .storage_profile import (
+    STORAGE_PROFILE_DENSE,
+    normalize_storage_profile,
+    storage_model_id,
+)
 from .resource_envelope import (
     AGGREGATE_RULE_MAX_OVER_PHASES,
     BACKEND_CPU,
@@ -397,6 +402,11 @@ class PlanContext:
     # (the default) preserves the historical static-bound behavior byte for
     # byte for every existing caller.
     per_tile_stack_bytes: object | None = None
+    # ZM-ZEGRID-R52-OOC Lot B: the ONE storage model this plan is admitted
+    # against. ``dense`` keeps the historical model byte-for-byte; ``bounded``
+    # removes only the terms the bounded provider/sink eliminate. The profile is
+    # selected BEFORE layout filtering and carried unchanged through the run.
+    storage_profile: str = STORAGE_PROFILE_DENSE
 
     @property
     def patch_area_px(self) -> int:
@@ -440,6 +450,7 @@ class Candidate:
     predicted_makespan_ns: int | None = None
     estimate_method: str = "static_bound"
     calibration_id: str | None = None
+    storage_profile: str = STORAGE_PROFILE_DENSE
 
     def ordering_key(self) -> tuple:
         """The documented lexicographic ENUMERATION key.
@@ -473,6 +484,11 @@ class Candidate:
             "predicted_makespan_ns": self.predicted_makespan_ns,
             "estimate_method": self.estimate_method,
             "calibration_id": self.calibration_id,
+            **(
+                {}
+                if self.storage_profile == STORAGE_PROFILE_DENSE
+                else {"storage_profile": self.storage_profile}
+            ),
         }
 
 
@@ -617,6 +633,10 @@ def _validate_context(context: PlanContext, *, allow_gpu: bool = False) -> None:
         raise SchedulerConfigError(
             f"R55-B plans a cell_stack_* phase, got {context.phase!r}"
         )
+    try:
+        normalize_storage_profile(context.storage_profile)
+    except ValueError as exc:
+        raise SchedulerConfigError(str(exc))
     if context.phase != PHASE_CELL_STACK_STREAM and context.profile is not None:
         raise SchedulerConfigError(
             "a calibrated profile is only modelled for cell_stack_stream in R55-B"
@@ -947,6 +967,7 @@ def enumerate_candidates(context: PlanContext) -> tuple[Candidate, ...]:
                             predicted_makespan_ns=makespan,
                             estimate_method=method,
                             calibration_id=cal_id,
+                            storage_profile=context.storage_profile,
                         )
                     )
 
@@ -1577,6 +1598,7 @@ def _enumerate_gpu_candidates(
                         predicted_makespan_ns=makespan,
                         estimate_method=method,
                         calibration_id=cal_id,
+                        storage_profile=gpu.storage_profile,
                     )
                 )
     out.sort(key=lambda candidate: candidate.ordering_key())
@@ -3160,6 +3182,14 @@ def _validate_active_candidate_fields(
             f"{candidate.reason_code!r} is outside the closed set",
             candidate=candidate,
         )
+    try:
+        normalize_storage_profile(candidate.storage_profile)
+    except ValueError as exc:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            str(exc),
+            candidate=candidate,
+        )
     if candidate.predicted_makespan_ns is not None:
         _active_strict_int(
             candidate.predicted_makespan_ns,
@@ -3384,7 +3414,7 @@ def active_mapping_for_candidate(
             f"cache-worker value {allowed_workers}",
             candidate=candidate,
         )
-    return {
+    mapping = {
         "schema": ACTIVE_MAPPING_SCHEMA,
         "backend": BACKEND_CPU,
         "phase": phase,
@@ -3396,6 +3426,12 @@ def active_mapping_for_candidate(
         "workers_per_unit": workers,
         "prefetch_units": 0,
     }
+    if candidate.storage_profile != STORAGE_PROFILE_DENSE:
+        mapping["storage"] = {
+            "profile": candidate.storage_profile,
+            "model": storage_model_id(candidate.storage_profile),
+        }
+    return mapping
 
 
 E2_GPU_MAPPING_SCHEMA = "zemosaic-r55e2-active-gpu-mapping-v1"
@@ -3483,7 +3519,7 @@ def active_gpu_mapping_for_candidate(
                 f"GPU prefetch_units {prefetch} exceeds the pipeline cap {cap}",
                 candidate=candidate,
             )
-    return {
+    mapping = {
         "schema": E2_GPU_MAPPING_SCHEMA,
         "backend": BACKEND_GPU,
         "phase": phase,
@@ -3495,6 +3531,12 @@ def active_gpu_mapping_for_candidate(
         "prefetch_units": prefetch,
         "single_owner": True,
     }
+    if candidate.storage_profile != STORAGE_PROFILE_DENSE:
+        mapping["storage"] = {
+            "profile": candidate.storage_profile,
+            "model": storage_model_id(candidate.storage_profile),
+        }
+    return mapping
 
 
 def map_active_gpu_candidate(
@@ -3831,6 +3873,7 @@ def _replace_candidate(candidate: Candidate, **changes) -> Candidate:
         "predicted_makespan_ns": candidate.predicted_makespan_ns,
         "estimate_method": candidate.estimate_method,
         "calibration_id": candidate.calibration_id,
+        "storage_profile": candidate.storage_profile,
     }
     data.update(changes)
     return Candidate(**data)

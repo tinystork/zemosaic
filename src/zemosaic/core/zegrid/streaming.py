@@ -181,7 +181,12 @@ def _num_tiles(h: int, w: int, tile_size) -> int:
 
 
 def estimate_streaming_peak_kib(
-    n_contributors: int, patch_hw: tuple[int, int], tile_size, channels: int = 3
+    n_contributors: int,
+    patch_hw: tuple[int, int],
+    tile_size,
+    channels: int = 3,
+    *,
+    storage_profile: str = "dense",
 ) -> int:
     """Streaming peak-RSS estimate (KiB) with the HONEST decomposition.
 
@@ -195,12 +200,29 @@ def estimate_streaming_peak_kib(
     * tile workspace: ``N x ext_tile_area x C x TILE_WORKSPACE_BYTES_PER_CELL
       + num_tiles x TILE_FIXED_OVERHEAD_KIB`` (the only term that scales with
       tile area; the extended tile includes the footprint-taper halo).
-    * aligned-input residency: ``N x H x W x (4*C + 1)`` bytes (float32 RGB + bool
-      support) — the file-backed cache pages phase 1/2 touch.
-    * rejection_mask: ``N x H x W x C`` bool output plane.
+    * aligned-input residency (dense): ``N x H x W x (4*C + 1)`` bytes (float32
+      RGB + bool support) — the file-backed cache pages phase 1/2 touch.
+    * rejection_mask (dense): ``N x H x W x C`` bool output plane.
     * output planes: ``H x W x (science f32*C + weight_sum f64*C + valid bool*C +
       surviving i64*C + support_w1/w2 f64 + n_eff f64)``.
+
+    ZM-ZEGRID-R52-OOC Lot B — ``storage_profile="bounded"`` removes EXACTLY the
+    two terms the bounded provider/sink eliminate, keeping the tile workspace as
+    the source of the bounded working set:
+
+    * rejection mask: the counting sink never allocates ``(N,H,W,C)`` bool -> 0;
+    * aligned-input residency: the bounded provider copies one frame per phase-1
+      access (reference + current = 2 frames) and one extended tile per phase-2
+      access, then closes the mapping. The 2-frame term dominates the tile copy,
+      so the residual is ``2 x H x W x (4*C + 1)`` — never ``N x``.
+
+    Nothing else is relaxed: baseline, tile workspace and output planes are the
+    SAME expressions as the dense model. This is a storage-lifetime correction,
+    not a new calibration.
     """
+    from .storage_profile import STORAGE_PROFILE_BOUNDED, normalize_storage_profile
+
+    profile = normalize_storage_profile(storage_profile)
     h, w = patch_hw
     th, tw = _extended_tile(h, w, tile_size, _TAPER_HALO_PX)
     ntiles = _num_tiles(h, w, tile_size)
@@ -210,12 +232,19 @@ def estimate_streaming_peak_kib(
     workspace_kib = int(workspace_bytes / 1024) + ntiles * TILE_FIXED_OVERHEAD_KIB
     # O(patch_area) output planes.
     out_bytes = h * w * (channels * (4 + 8 + 1 + 8) + 2 * 8 + 8)
-    # O(N x patch_area) x 1 byte: rejection_mask bool (N, H, W, C).
-    rej_bytes = n_contributors * h * w * channels * 1
-    # O(N x patch_area) x (4B/px float32 + 1B bool): aligned-input residency —
-    # the cache pages the provider serves (bit-exact to the aligned arrays, so
-    # identical in size to the on-disk cache).
-    input_bytes = n_contributors * h * w * (channels * 4 + 1)
+    if profile == STORAGE_PROFILE_BOUNDED:
+        # Dense rejection plane eliminated (bounded counting sink).
+        rej_bytes = 0
+        # Phase 1 holds the reference + one frame; phase 2 holds one extended
+        # tile at a time, smaller than two full frames. Count the larger term.
+        input_bytes = 2 * h * w * (channels * 4 + 1)
+    else:
+        # O(N x patch_area) x 1 byte: rejection_mask bool (N, H, W, C).
+        rej_bytes = n_contributors * h * w * channels * 1
+        # O(N x patch_area) x (4B/px float32 + 1B bool): aligned-input residency —
+        # the cache pages the provider serves (bit-exact to the aligned arrays, so
+        # identical in size to the on-disk cache).
+        input_bytes = n_contributors * h * w * (channels * 4 + 1)
 
     return STREAMING_BASELINE_KIB + workspace_kib + int(
         (out_bytes + rej_bytes + input_bytes) / 1024
@@ -223,7 +252,12 @@ def estimate_streaming_peak_kib(
 
 
 def estimate_streaming_delta_kib(
-    n_contributors: int, patch_hw: tuple[int, int], tile_size, channels: int = 3
+    n_contributors: int,
+    patch_hw: tuple[int, int],
+    tile_size,
+    channels: int = 3,
+    *,
+    storage_profile: str = "dense",
 ) -> int:
     """The streaming executor's ADDED peak above baseline (KiB).
 
@@ -232,7 +266,10 @@ def estimate_streaming_delta_kib(
     :func:`check_streaming_gate` so the gate admits a run only when available
     memory covers the measured added peak.
     """
-    return estimate_streaming_peak_kib(n_contributors, patch_hw, tile_size, channels) - STREAMING_BASELINE_KIB
+    return estimate_streaming_peak_kib(
+        n_contributors, patch_hw, tile_size, channels,
+        storage_profile=storage_profile,
+    ) - STREAMING_BASELINE_KIB
 
 
 def check_streaming_gate(

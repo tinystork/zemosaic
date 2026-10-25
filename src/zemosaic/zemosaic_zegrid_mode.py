@@ -101,6 +101,8 @@ from .core.zegrid import final_mosaic_finishing as zfin
 from .core.zegrid import geometry as zg
 from .core.zegrid import gpu as zgpu
 from .core.zegrid import gpu_readiness as zgr
+from .core.zegrid import storage_profile as zsp
+from .core.zegrid import rejection_sink as zrs
 from .core.zegrid import gpu_memory as zgm
 from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
@@ -736,10 +738,13 @@ def _pick_mode(n_contributors, patch_area_px, patch_hw, available_bytes, tile_si
     ``"inmem"``; R6 streaming bound for ``"stream"``), so the manifest reports the
     bound of the mode actually used (L2).
     """
+    profile = zsp.normalize_storage_profile(_STACK_STORAGE_PROFILE)
     inmem_bound = zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n_contributors, patch_area_px)
-    if inmem_bound <= available_bytes * INMEM_AVAILABLE_FRAC:
+    if not zsp.is_bounded(profile) and inmem_bound <= available_bytes * INMEM_AVAILABLE_FRAC:
         return "inmem", int(inmem_bound)
-    stream_bound = _estimate_streaming_bytes(n_contributors, patch_hw, tile_size)
+    stream_bound = _profile_stream_bytes(
+        n_contributors, patch_hw, tile_size, profile
+    )
     return "stream", int(stream_bound)
 
 
@@ -747,9 +752,32 @@ def _pick_mode(n_contributors, patch_area_px, patch_hw, available_bytes, tile_si
 # Mode-aware layout selection (R4 floors + in-memory OR streaming bound)
 # ---------------------------------------------------------------------------
 
-def _estimate_streaming_bytes(n_contributors, patch_hw, tile_size=STREAM_TILE_SIZE, channels=3):
-    """Streaming per-cell peak bound in BYTES (R6 estimate, KiB -> bytes)."""
-    return int(zstream.estimate_streaming_peak_kib(n_contributors, patch_hw, tile_size, channels) * 1024)
+def _estimate_streaming_bytes(
+    n_contributors, patch_hw, tile_size=STREAM_TILE_SIZE, channels=3,
+    storage_profile=zsp.STORAGE_PROFILE_DENSE,
+):
+    """Streaming per-cell peak bound in BYTES (R6/Lot B estimate, KiB -> bytes)."""
+    return int(
+        zstream.estimate_streaming_peak_kib(
+            n_contributors, patch_hw, tile_size, channels,
+            storage_profile=storage_profile,
+        ) * 1024
+    )
+
+
+def _profile_stream_bytes(n_contributors, patch_hw, tile_size, storage_profile):
+    """Dispatch to the dense estimator WITHOUT changing its call signature.
+
+    The dense path calls ``_estimate_streaming_bytes(n, hw, tile)`` exactly as
+    before (so every existing test monkeypatch keeps working); only the bounded
+    path passes the explicit keyword.
+    """
+    profile = zsp.normalize_storage_profile(storage_profile)
+    if zsp.is_bounded(profile):
+        return _estimate_streaming_bytes(
+            n_contributors, patch_hw, tile_size, storage_profile=profile
+        )
+    return _estimate_streaming_bytes(n_contributors, patch_hw, tile_size)
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +842,9 @@ def _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
         n = zal._cell_contributor_count(footprints, canvas, patch.patch)
         area = patch.patch.width * patch.patch.height
         inmem_b = zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area)
-        stream_b = _estimate_streaming_bytes(n, patch.patch_shape_hw, tile_size)
+        stream_b = _profile_stream_bytes(
+            n, patch.patch_shape_hw, tile_size, _STACK_STORAGE_PROFILE
+        )
         yield {
             "cell_id": cid, "row": row, "col": col, "n": n,
             "patch_area": area, "patch_hw": list(patch.patch_shape_hw),
@@ -854,7 +884,7 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
         hw = tuple(c["patch_hw"])
         n = c["n"]
         for t in CPU_STREAMING_TILE_LADDER:
-            b = int(_estimate_streaming_bytes(n, hw, int(t)))
+            b = int(_profile_stream_bytes(n, hw, int(t), _STACK_STORAGE_PROFILE))
             if b > stream_worst_by_tile[int(t)]:
                 stream_worst_by_tile[int(t)] = b
     worst = worst or {}
@@ -1262,7 +1292,9 @@ def _choose_layout_mode_aware(
         selected_tile, trials, sel_reason = _select_cpu_streaming_tile(
             worst["stream_worst_by_tile"], ram_budget
         )
-        inmem_ok = (ram_budget is None) or (worst["inmem_worst_bytes"] <= ram_budget)
+        inmem_ok = (not zsp.is_bounded(_STACK_STORAGE_PROFILE)) and (
+            (ram_budget is None) or (worst["inmem_worst_bytes"] <= ram_budget)
+        )
         # ZM-ZEGRID-R36 admissibility: the in-memory bound fits OR some (>= minimum)
         # CPU streaming tile fits. This strictly widens the pre-R36 rule
         # (min(inmem, stream@preferred) <= budget) whenever a smaller tile helps.
@@ -1682,7 +1714,21 @@ def _build_cell_sres(result, frame_ids):
     )
 
 
-def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, tile_size=None):
+def _make_cell_provider(cache_dir, storage_profile):
+    """Select the Cell provider for the admitted storage profile.
+
+    Dense returns the historical ``MemmapCanonicalProvider`` BY IDENTITY;
+    bounded returns the Lot A ``BoundedMemmapCanonicalProvider``. This is the
+    single seam Gate E instruments.
+    """
+    profile = zsp.normalize_storage_profile(storage_profile)
+    if zsp.is_bounded(profile):
+        return zfp.BoundedMemmapCanonicalProvider(cache_dir)
+    return zfp.MemmapCanonicalProvider(cache_dir)
+
+
+def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, tile_size=None,
+                    storage_profile=None):
     """In-memory cell run: aligned frames resident, single-tile streaming executor.
 
     ZM-ZEGRID-R11: the in-memory path now goes through
@@ -1696,7 +1742,15 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, til
     CPU behaviour; a bounded tile is passed when the cell runs on the GPU so the
     device never materialises ``N x full-cell`` (VRAM-bounded).
     """
-    provider = zfp.MemmapCanonicalProvider(cache_dir)
+    _profile = zsp.normalize_storage_profile(
+        storage_profile if storage_profile is not None else _STACK_STORAGE_PROFILE
+    )
+    if zsp.is_bounded(_profile):
+        raise RuntimeError(
+            "storage_profile='bounded' cannot run the in-memory cell path; "
+            "the bounded profile requires the file-backed streaming executor"
+        )
+    provider = _make_cell_provider(cache_dir, _profile)
     try:
         frame_ids = list(provider.frame_ids)
         images = []
@@ -1720,11 +1774,49 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, til
     return mt, sres
 
 
-def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STREAM_TILE_SIZE, fixed=None):
-    provider = zfp.MemmapCanonicalProvider(cache_dir)
+def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STREAM_TILE_SIZE,
+                     fixed=None, storage_profile=None, storage_info=None):
+    _profile = zsp.normalize_storage_profile(
+        storage_profile if storage_profile is not None else _STACK_STORAGE_PROFILE
+    )
+    provider = _make_cell_provider(cache_dir, _profile)
+    sink = None
     try:
         request = zstream.build_streaming_request(config, provider.n_frames)
-        result = run_canonical_stack_streaming(provider, request, tile_size=tile_size, fixed=fixed)
+        if zsp.is_bounded(_profile):
+            # FRESH sink for THIS cell run: never reused across cells/retries.
+            sink = zrs.BoundedCountingRejectionSink(
+                (provider.n_frames, provider.height, provider.width, provider.channels)
+            )
+            result = run_canonical_stack_streaming(
+                provider, request, tile_size=tile_size, fixed=fixed,
+                rejection_sink=sink,
+            )
+        else:
+            result = run_canonical_stack_streaming(
+                provider, request, tile_size=tile_size, fixed=fixed
+            )
+        if storage_info is not None:
+            storage_info.update({
+                "profile": _profile,
+                "model": zsp.storage_model_id(_profile),
+                "provider": type(provider).__name__,
+                "storage_domain": getattr(provider, "storage_domain", None),
+                "bytes_read": getattr(provider, "bytes_read", None),
+                "open_count": getattr(provider, "open_count", None),
+                "open_failures": getattr(provider, "open_failures", None),
+                "sink": None if sink is None else {
+                    "type": type(sink).__name__,
+                    "storage_domain": getattr(sink, "storage_domain", None),
+                    "true_count": int(sink.true_count),
+                    "written_cells": int(sink.written_cells),
+                    "writes": int(sink.writes),
+                    "flush_count": int(sink.flush_count),
+                    "max_write_bytes": int(sink.max_write_bytes),
+                    "max_block_bytes": int(sink.max_block_bytes),
+                },
+                "rejection_mask_available": result.rejection_mask is not None,
+            })
         sres = _build_cell_sres(result, list(provider.frame_ids))
         mt = za.extract_minitile(patch, sres)
         return mt, sres
@@ -1751,6 +1843,10 @@ _STACK_GLOBAL_FRAME_IDS = None
 _STACK_GLOBAL_REF = None
 _STACK_TILE_SIZE = STREAM_TILE_SIZE
 _STACK_CACHE_WORKERS = 1
+# ZM-ZEGRID-R52-OOC Lot B: the ONE storage profile for this run. Selected before
+# layout filtering and kept through PLAN/ADMIT/RUN/fallback. Default dense keeps
+# every historical byte and path unchanged; bounded is an explicit internal seam.
+_STACK_STORAGE_PROFILE = zsp.STORAGE_PROFILE_DENSE
 # ZM-ZEGRID-R40-B2-C: the worker-local R40 sparse transport is armed ONLY when the
 # parent hands this mapping ({cell_id: candidate coords}) to the worker
 # initializer. ``None`` (the default and the only value the capture-OFF path ever
@@ -2866,7 +2962,12 @@ def _prepare_stack_cell(task):
     returns either a prepared payload for :func:`_consume_stack_cell` or an
     already-final ``{"empty_result": ...}`` for an empty/zero-support cell.
     """
-    (cell, patch, mem, cache_dir, mode, bound) = task
+    if len(task) == 7:
+        (cell, patch, mem, cache_dir, mode, bound, storage_profile) = task
+    else:
+        (cell, patch, mem, cache_dir, mode, bound) = task
+        storage_profile = _STACK_STORAGE_PROFILE
+    storage_profile = zsp.normalize_storage_profile(storage_profile)
     cid = cell.cell_id
     _patch_bounds = [int(patch.patch.x0), int(patch.patch.y0),
                      int(patch.patch.x1), int(patch.patch.y1)]
@@ -2907,13 +3008,21 @@ def _prepare_stack_cell(task):
     cell_gauge_mode = zphot.resolve_cell_gauge_mode(
         getattr(_STACK_CONFIG, "cell_gauge_mode", None)
     )
-    cell_provider = zfp.MemmapCanonicalProvider(cache_dir)
+    cell_provider = _make_cell_provider(cache_dir, storage_profile)
+    _gauge_storage = None
     try:
         cell_frame_ids = list(cell_provider.frame_ids)
         cell_fixed, gauge_status, gauge_detail = _resolve_cell_normalization(
             cell_gauge_mode, _STACK_GAUGE, _STACK_GLOBAL_FRAME_IDS,
             cell_provider, _STACK_CONFIG,
         )
+        _gauge_storage = {
+            "provider": type(cell_provider).__name__,
+            "storage_domain": getattr(cell_provider, "storage_domain", None),
+            "bytes_read": getattr(cell_provider, "bytes_read", None),
+            "open_count": getattr(cell_provider, "open_count", None),
+            "open_failures": getattr(cell_provider, "open_failures", None),
+        }
     finally:
         cell_provider.close()
 
@@ -2957,6 +3066,8 @@ def _prepare_stack_cell(task):
         "cell_fixed": cell_fixed,
         "gauge_status": gauge_status,
         "gauge_detail": gauge_detail,
+        "storage_profile": storage_profile,
+        "gauge_storage": _gauge_storage,
     }
 
 
@@ -2983,6 +3094,9 @@ def _consume_stack_cell(prepared, *, tile_size=None):
     cache_dir = prepared["cache_dir"]
     mode = prepared["mode"]
     bound = prepared["bound"]
+    storage_profile = zsp.normalize_storage_profile(
+        prepared.get("storage_profile", _STACK_STORAGE_PROFILE)
+    )
     patch_bounds = prepared["patch_bounds"]
     patch_shape_hw = prepared["patch_shape_hw"]
     manifest = prepared["manifest"]
@@ -2994,6 +3108,12 @@ def _consume_stack_cell(prepared, *, tile_size=None):
     cid = cell.cell_id
 
     t0 = time.perf_counter()
+    storage_info = {}
+    if mode == "inmem" and zsp.is_bounded(storage_profile):
+        raise RuntimeError(
+            "storage_profile='bounded' received an in-memory cell task; the "
+            "admitted storage model requires the file-backed streaming path"
+        )
     if mode == "inmem":
         # ZM-ZEGRID-R22: when the cell runs on the GPU, use the VRAM-bounded tile
         # size (never a single N x full-cell tile); CPU keeps the legacy
@@ -3013,6 +3133,8 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             cache_dir, patch, _STACK_CONFIG, None,
             tile_size=int(_STACK_TILE_SIZE if tile_size is None else tile_size),
             fixed=cell_fixed,
+            storage_profile=storage_profile,
+            storage_info=storage_info,
         )
     stack_s = time.perf_counter() - t0
 
@@ -3037,6 +3159,9 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         "excluded": [list(e) for e in sres.excluded],
         "bound_bytes": int(bound),
     }
+    if zsp.is_bounded(storage_profile):
+        record["storage_profile"] = storage_profile
+        record["storage"] = dict(storage_info)
 
     # Per-cell temp reuse: delete the cache after stacking (bounded disk). R15
     # best-effort; a failure is reported so the parent can WARN + record.
@@ -3051,6 +3176,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         "peak_rss_kib": peak_rss, "cleanup_failed": cleanup_failed,
         "reproject": reproject,
         "cache_dir": str(cache_dir),
+        "storage_profile": storage_profile,
         # R34D: in per_cell mode the parent needs the PATCH planes (core + halo)
         # to measure the inter-cell overlaps and to feather-blend. Global mode
         # returns only the core (byte-unchanged payload).
@@ -3825,6 +3951,7 @@ class ExecutionBundle:
     # for pure CPU bundles so every existing consumer keeps its semantics.
     gpu_device_workspace_bytes: int | None = None
     gpu_tile_trials: list | None = None
+    storage_profile: str = zsp.STORAGE_PROFILE_DENSE
 
 
 def _r55_margin_raw_ceiling(
@@ -3926,6 +4053,19 @@ def _r55_gpu_tile_ladder(
         if device <= int(vram_budget_bytes):
             out.append((int(tile), int(device)))
     return tuple(out), max_tile
+
+
+def _cell_task(cell, patch, mem, cache_dir, mode, bound, storage_profile):
+    """Build ONE cell task; dense stays the historical 6-tuple EXACTLY.
+
+    The bounded profile appends a 7th element so the worker knows which provider
+    and sink to use without a second scheduler or a mutable global in the child.
+    """
+    profile = zsp.normalize_storage_profile(storage_profile)
+    task = (cell, patch, mem, cache_dir, mode, bound)
+    if zsp.is_bounded(profile):
+        return task + (profile,)
+    return task
 
 
 def _build_execution_bundle(
@@ -4118,11 +4258,24 @@ def _build_execution_bundle(
             for idx, n, hw, area in active
         }
 
+        _profile = zsp.normalize_storage_profile(_STACK_STORAGE_PROFILE)
+        _bounded = zsp.is_bounded(_profile)
+
         def _stream_by_idx(tile):
             return {
-                idx: int(_estimate_streaming_bytes(n, hw, int(tile)))
+                idx: int(_profile_stream_bytes(n, hw, int(tile), _profile))
                 for idx, n, hw, area in active
             }
+
+        # The bounded profile never executes the in-memory path: its provider is
+        # file-backed and its sink bounds the rejection diagnostics. Feed the
+        # planner an impossible in-memory bound so the chosen mode is ALWAYS
+        # stream (the real in-memory bound is still reported in cell_specs for
+        # diagnostics only).
+        planning_inmem_by_idx = (
+            {idx: (1 << 62) for idx, _n, _hw, _a in active}
+            if _bounded else inmem_by_idx
+        )
 
         gpu_stream_by_idx = (
             _stream_by_idx(gpu_tile_size) if effective_gpu else None
@@ -4156,7 +4309,7 @@ def _build_execution_bundle(
             for _tile, _device in gpu_tile_candidates:
                 _streams = _stream_by_idx(int(_tile))
                 gpu_pairs = [
-                    (inmem_by_idx[i], _streams[i])
+                    (planning_inmem_by_idx[i], _streams[i])
                     for i, _n, _hw, _a in active
                 ]
                 _host_peak = int(
@@ -4213,7 +4366,7 @@ def _build_execution_bundle(
             # jointly feasible tile. Never a numeric clamp, never a stale report.
             for t in permitted_tiles:
                 stream_by_idx = _stream_by_idx(t)
-                pairs = [(inmem_by_idx[i], stream_by_idx[i]) for i, _n, _hw, _a in active]
+                pairs = [(planning_inmem_by_idx[i], stream_by_idx[i]) for i, _n, _hw, _a in active]
                 worst_stream = int(max((b for _a, b in pairs), default=0))
                 try:
                     candidate = _plan_for(pairs, False, max_cells_in_flight)
@@ -4241,7 +4394,7 @@ def _build_execution_bundle(
             # fits (R36 F-M2 D: a GPU success is allowed with no CPU fallback).
             for t in permitted_tiles:
                 stream_by_idx = _stream_by_idx(t)
-                pairs = [(inmem_by_idx[i], stream_by_idx[i]) for i, _n, _hw, _a in active]
+                pairs = [(planning_inmem_by_idx[i], stream_by_idx[i]) for i, _n, _hw, _a in active]
                 worst_stream = int(max((b for _a, b in pairs), default=0))
                 try:
                     cpu_fallback_plan = _plan_for(pairs, False, max_cells_in_flight)
@@ -4290,6 +4443,22 @@ def _build_execution_bundle(
 
         cpu_streaming_tile = int(chosen_tile)
         chosen_mode = plan["mode"]
+        if _bounded and chosen_mode != "stream":
+            raise zpar.ModeInfeasible(
+                "storage_profile='bounded' requires the streaming executor, but "
+                f"the joint planner chose {chosen_mode!r}; refusing to admit a "
+                "bounded plan whose residency the in-memory path would exceed"
+            )
+        if _bounded:
+            layout["storage_profile"] = _profile
+            layout["storage_model"] = zsp.storage_model_id(_profile)
+            plan["storage"] = {
+                "profile": _profile,
+                "model": zsp.storage_model_id(_profile),
+                "provider": "BoundedMemmapCanonicalProvider",
+                "rejection": "BoundedCountingRejectionSink",
+                "fresh_sink_per_cell": True,
+            }
         # R41-B (rework-2): the REPORTED stream tile is the one that will actually
         # execute a CPU stream plan — None when the CPU plan is in-memory only or
         # when no CPU fallback exists on a GPU plan (never a fake tile).
@@ -4345,11 +4514,11 @@ def _build_execution_bundle(
             n = len(mem.patch_ids)
             area = patch.patch.width * patch.patch.height
             inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
-            stream_b = _estimate_streaming_bytes(
-                n, patch.patch_shape_hw, cpu_streaming_tile
+            stream_b = _profile_stream_bytes(
+                n, patch.patch_shape_hw, cpu_streaming_tile, _profile
             )
             gpu_stream_b = (
-                _estimate_streaming_bytes(n, patch.patch_shape_hw, gpu_tile_size)
+                _profile_stream_bytes(n, patch.patch_shape_hw, gpu_tile_size, _profile)
                 if effective_gpu else None
             )
             cell_specs.append(
@@ -4361,15 +4530,18 @@ def _build_execution_bundle(
         cell_tasks = []
         for (cell, patch, mem, cache_dir, inmem_b, stream_b, gpu_stream_b) in cell_specs:
             if inmem_b is None:
-                cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
+                cell_tasks.append(_cell_task(
+                    cell, patch, mem, cache_dir, None, 0, _profile))
             elif chosen_mode == "inmem":
-                cell_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
+                cell_tasks.append(_cell_task(
+                    cell, patch, mem, cache_dir, "inmem", inmem_b, _profile))
             else:
                 bound_b = (
                     gpu_stream_b
                     if (effective_gpu and gpu_stream_b is not None) else stream_b
                 )
-                cell_tasks.append((cell, patch, mem, cache_dir, "stream", bound_b))
+                cell_tasks.append(_cell_task(
+                    cell, patch, mem, cache_dir, "stream", bound_b, _profile))
 
         if effective_gpu and gpu_streaming_host_peak_bytes is not None:
             per_cell_footprint = int(gpu_streaming_host_peak_bytes)
@@ -4406,11 +4578,14 @@ def _build_execution_bundle(
                 cpu_fallback_tasks = []
                 for (cell, patch, mem, cache_dir, inmem_b, stream_b, _gpu_b) in cell_specs:
                     if inmem_b is None:
-                        cpu_fallback_tasks.append((cell, patch, mem, cache_dir, None, 0))
+                        cpu_fallback_tasks.append(_cell_task(
+                            cell, patch, mem, cache_dir, None, 0, _profile))
                     elif _fb_mode == "inmem":
-                        cpu_fallback_tasks.append((cell, patch, mem, cache_dir, "inmem", inmem_b))
+                        cpu_fallback_tasks.append(_cell_task(
+                            cell, patch, mem, cache_dir, "inmem", inmem_b, _profile))
                     else:
-                        cpu_fallback_tasks.append((cell, patch, mem, cache_dir, "stream", stream_b))
+                        cpu_fallback_tasks.append(_cell_task(
+                            cell, patch, mem, cache_dir, "stream", stream_b, _profile))
                 _fb_bound = max(
                     (c["max_bound_bytes"] for c in cpu_fallback_plan["candidates"]
                      if c["mode"] == _fb_mode), default=0,
@@ -4487,6 +4662,7 @@ def _build_execution_bundle(
                 else int(gpu_device_workspace_bytes)
             ),
             gpu_tile_trials=[dict(t) for t in gpu_tile_trials],
+            storage_profile=_profile,
         )
 
 
@@ -4860,6 +5036,7 @@ class _R55ActiveDecision:
     gauge_workers: int = 0
     cache_workers: int = 0
     worker_trail: tuple = ()
+    storage_profile: str = zsp.STORAGE_PROFILE_DENSE
 
 
 def _r55_active_facts(
@@ -4922,8 +5099,14 @@ def _r55_active_facts(
         for tile in CPU_STREAMING_TILE_LADDER:
             stream_worst_by_tile[int(tile)] = max(
                 stream_worst_by_tile[int(tile)],
-                int(_estimate_streaming_bytes(n, hw, int(tile))),
+                int(_profile_stream_bytes(n, hw, int(tile), _STACK_STORAGE_PROFILE)),
             )
+
+    _profile = zsp.normalize_storage_profile(_STACK_STORAGE_PROFILE)
+    if zsp.is_bounded(_profile):
+        # Bounded never executes in-memory; make that candidate impossible while
+        # keeping the historical value in the diagnostics.
+        inmem_worst = 1 << 62
 
     channels = 3
     per_unit_cache = _r55_cache_unit_bytes(
@@ -5015,6 +5198,7 @@ def _r55_active_facts(
         "halo_px": int(halo_px),
         "pinned": bool(bundle.envelope.pinned),
         "run_id": str(canvas.canvas_id),
+        "storage_profile": _profile,
     }
     facts["requests"] = _r55_active_phase_requests(facts)
     return facts
@@ -5124,6 +5308,7 @@ def _r55_active_context(
         observation_source="plan.available_bytes",
         run_id=str(facts["run_id"]),
         pinned=bool(facts["pinned"]),
+        storage_profile=str(facts.get("storage_profile", _STACK_STORAGE_PROFILE)),
     )
 
 
@@ -5316,6 +5501,7 @@ def _r55_active_decide(
         gauge_workers=int(facts["gauge_workers"]),
         cache_workers=int(facts["cache_workers"]),
         worker_trail=tuple(dict(entry) for entry in trail),
+        storage_profile=str(facts.get("storage_profile", _STACK_STORAGE_PROFILE)),
     )
 
 
@@ -5974,14 +6160,17 @@ def _r55_active_gpu_apply(
     for (cell, patch, mem, cache_dir, _i, _s, _g) in bundle.cell_specs:
         if not mem.patch_ids:
             cell_specs.append((cell, patch, mem, cache_dir, None, 0, 0))
-            cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
+            cell_tasks.append(_cell_task(
+                cell, patch, mem, cache_dir, None, 0, getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
             continue
         n = len(mem.patch_ids)
         # TOTAL per-cell estimate: an execution/manifest input (includes the
         # process baseline). It is NOT the scheduler's host increment.
-        gpu_b = int(_estimate_streaming_bytes(n, patch.patch_shape_hw, tile))
+        gpu_b = int(_profile_stream_bytes(
+            n, patch.patch_shape_hw, tile, getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
         cell_specs.append((cell, patch, mem, cache_dir, None, 0, gpu_b))
-        cell_tasks.append((cell, patch, mem, cache_dir, "stream", gpu_b))
+        cell_tasks.append(_cell_task(
+            cell, patch, mem, cache_dir, "stream", gpu_b, getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
 
     # R55-E11 rework-3: planning uses the ADDED stack bound (estimate minus
     # PROCESS_BASELINE) because ``shared_bytes`` already carries that baseline
@@ -6362,26 +6551,28 @@ def _r55_active_apply(
     for (cell, patch, mem, cache_dir, _old_inmem, _old_stream, _old_gpu) in bundle.cell_specs:
         if not mem.patch_ids:
             cell_specs.append((cell, patch, mem, cache_dir, None, 0, None))
-            cell_tasks.append((cell, patch, mem, cache_dir, None, 0))
+            cell_tasks.append(_cell_task(
+                cell, patch, mem, cache_dir, None, 0, getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
             continue
         n = len(mem.patch_ids)
         area = int(patch.patch.width) * int(patch.patch.height)
         inmem_b = int(zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area))
         stream_b = (
-            int(_estimate_streaming_bytes(n, patch.patch_shape_hw, int(tile)))
+            int(_profile_stream_bytes(
+                n, patch.patch_shape_hw, int(tile), getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
             if tile is not None else 0
         )
         cell_specs.append(
             (cell, patch, mem, cache_dir, inmem_b, stream_b, None)
         )
         if mode == "inmem":
-            cell_tasks.append(
-                (cell, patch, mem, cache_dir, "inmem", inmem_b)
-            )
+            cell_tasks.append(_cell_task(
+                cell, patch, mem, cache_dir, "inmem", inmem_b,
+                getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
         else:
-            cell_tasks.append(
-                (cell, patch, mem, cache_dir, "stream", stream_b)
-            )
+            cell_tasks.append(_cell_task(
+                cell, patch, mem, cache_dir, "stream", stream_b,
+                getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
 
     per_cell_footprint = max(
         (int(t[5]) for t in cell_tasks if t[4] is not None), default=0
@@ -12122,6 +12313,7 @@ def run_zegrid_mode(
     frames_info: Sequence | None = None,
     selection_paths: Sequence[str] | None = None,
     global_wcs_output_path: str | None = None,
+    storage_profile: str | None = None,
     r37_diagnostic_capture: bool = False,
     r37_diagnostic_holdout_cap: int = R37_CAPTURE_HOLDOUT_CAP_DEFAULT,
     r40_seam_capture: bool = False,
@@ -12147,6 +12339,8 @@ def run_zegrid_mode(
     the effective ``cell_gauge_mode`` to be ``per_cell`` (``auto`` is honoured when
     it resolves to per_cell; a global resolution fails loudly).
     """
+    global _STACK_STORAGE_PROFILE
+    _STACK_STORAGE_PROFILE = zsp.normalize_storage_profile(storage_profile)
     _emit("ZeGrid engine activated (explicit ZeGrid mode)", callback=progress_callback)
 
     # ZM-ZEGRID-R53: resolve the anti-checkerboard halo width FIRST, so an invalid
