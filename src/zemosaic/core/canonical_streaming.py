@@ -410,6 +410,42 @@ def _restore_shape(arr_c, original_mono):
     return np.ascontiguousarray(arr_c)
 
 
+def _validate_rejection_sink(sink, n: int, h: int, w: int, c: int) -> None:
+    """Validate a caller-supplied rejection sink (ZM-ZEGRID-R52-OOC Lot A).
+
+    The sink replaces the dense ``(N, H, W, C)`` bool diagnostic plane for a
+    caller that does not need the full mask. It must expose the same shape/dtype
+    contract and a ``flush_batch()`` boundary hook. Validation is explicit and
+    raises; there is no silent fallback to a dense mask (that would hide an
+    accidental O(N*H*W*C) allocation).
+    """
+    shape = getattr(sink, "shape", None)
+    try:
+        sink_shape = tuple(int(v) for v in shape)
+    except Exception:
+        raise CanonicalStackValidationError(
+            "rejection_sink must expose an integer shape tuple (N, H, W, C)"
+        )
+    if sink_shape != (int(n), int(h), int(w), int(c)):
+        raise CanonicalStackValidationError(
+            f"rejection_sink shape {sink_shape} != expected {(int(n), int(h), int(w), int(c))}"
+        )
+    try:
+        sink_dtype = np.dtype(getattr(sink, "dtype", None))
+    except Exception:
+        raise CanonicalStackValidationError(
+            "rejection_sink must expose a numpy dtype (bool)"
+        )
+    if sink_dtype != np.dtype(bool):
+        raise CanonicalStackValidationError(
+            f"rejection_sink dtype {sink_dtype} != bool"
+        )
+    if not callable(getattr(sink, "flush_batch", None)):
+        raise CanonicalStackValidationError(
+            "rejection_sink must provide a callable flush_batch()"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 — per-frame statistics via reused stage functions (<= 2 frames resident)
 # ---------------------------------------------------------------------------
@@ -719,7 +755,7 @@ def _fixed_phase1(
 # Phase 2 — per-tile rejection / combine / support
 # ---------------------------------------------------------------------------
 
-def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, backend="cpu") -> CanonicalStackResult:
+def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, backend="cpu", rejection_sink=None) -> CanonicalStackResult:
     n = p1.n_frames
     h = p1.height
     w = p1.width
@@ -785,7 +821,18 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
     rejected_count = 0
     low_n_count = 0
     degenerate_count = 0
-    rejection_mask = np.zeros((n, h, w, c), dtype=bool)
+    # ZM-ZEGRID-R52-OOC Lot A: the dense (N, H, W, C) bool diagnostic plane stays
+    # the DEFAULT, byte-for-byte. A caller that explicitly supplies a sink gets
+    # the same interior-block writes and flush boundaries without that residency;
+    # the returned result then carries rejection_mask=None (a count-only sink
+    # cannot honestly reproduce the full mask, and a fake ndarray is forbidden).
+    if rejection_sink is None:
+        rejection_mask = np.zeros((n, h, w, c), dtype=bool)
+        rejection_mask_out = rejection_mask
+    else:
+        _validate_rejection_sink(rejection_sink, n, h, w, c)
+        rejection_mask = rejection_sink
+        rejection_mask_out = None
 
     for (y0, y1, x0, x1) in _iter_tiles(h, w, tile_size):
         # Extended tile bounds (with halo, clipped to the patch).
@@ -957,6 +1004,8 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         support_w2[y0:y1, x0:x1] = w2_tile[iy0:iy1, ix0:ix1]
 
         rejection_mask[:, y0:y1, x0:x1, :] = rejection_t[:, iy0:iy1, ix0:ix1, :]
+        if rejection_sink is not None:
+            rejection_sink.flush_batch()
 
         init_int = initial[:, iy0:iy1, ix0:ix1, :]
         rej_int = rejection_t[:, iy0:iy1, ix0:ix1, :]
@@ -1005,7 +1054,7 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         "rejected_fraction": rejected_fraction,
         "low_n_cell_count": low_n_count,
         "degenerate_cell_count": degenerate_count,
-        "rejection_mask": rejection_mask,
+        "rejection_mask": rejection_mask_out,
     }
 
 
@@ -1019,6 +1068,7 @@ def run_canonical_stack_streaming(
     *,
     tile_size=None,
     fixed: "FixedNormalization | None" = None,
+    rejection_sink=None,
 ) -> CanonicalStackResult:
     """Bounded-memory canonical stack, bit-equivalent to ``run_canonical_stack``.
 
@@ -1032,6 +1082,17 @@ def run_canonical_stack_streaming(
     or a ``(th, tw)`` tuple. Results are identical across tile sizes (within the
     documented bit-exact contract). Backend ``"gpu"`` and explicit taper maps are
     not yet supported and raise clearly (never silently substituted).
+
+    ``rejection_sink`` (ZM-ZEGRID-R52-OOC Lot A): optional bounded sink with
+    ``shape == (N, H, W, C)``, bool ``dtype`` and a ``flush_batch()`` method.
+    When supplied, the dense rejection plane is NOT allocated; interior
+    rejection blocks are written to the sink exactly where the dense plane would
+    have been written, ``flush_batch()`` is called after each interior block, and
+    every scalar diagnostic (initial/surviving/rejected/low_n/degenerate/
+    iterations) plus science/support/valid-mask planes are bit-identical to the
+    dense run. The result then exposes ``rejection_mask=None`` because a
+    count-only sink cannot reproduce the full mask. Default ``None`` preserves
+    the existing dense behaviour exactly for every caller.
 
     ``fixed`` (ZM-ZEGRID-R11): an optional precomputed
     :class:`FixedNormalization` whose per-frame coefficients/weights/active flags
@@ -1081,10 +1142,19 @@ def run_canonical_stack_streaming(
             f"provider.n_frames {provider.n_frames} != request.images length {len(request.images)}"
         )
 
+    if rejection_sink is not None:
+        _validate_rejection_sink(
+            rejection_sink,
+            provider.n_frames,
+            provider.height,
+            provider.width,
+            provider.channels,
+        )
+
     p1 = _fixed_phase1(provider, request, fixed)
 
     (science, weight_sum, valid_mask, surviving, support_w1, support_w2, n_eff, agg) = _phase2(
-        provider, p1, request, tile_size, backend=token
+        provider, p1, request, tile_size, backend=token, rejection_sink=rejection_sink
     )
 
     # --- post-combine RGB equalization (out-of-place, spatial-only) ---

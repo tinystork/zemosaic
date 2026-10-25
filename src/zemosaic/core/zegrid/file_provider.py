@@ -85,6 +85,7 @@ CACHE_SCHEMA = "zemosaic-zegrid-r6-aligned-cache-v1"
 __all__ = [
     "CACHE_SCHEMA",
     "AlignedCacheBuilder",
+    "BoundedMemmapCanonicalProvider",
     "MemmapCanonicalProvider",
     "build_aligned_cache_from_sources",
     "write_aligned_cache_from_arrays",
@@ -163,6 +164,11 @@ def _close_memmap(arr) -> None:
                 obj.close()
         except Exception:
             pass
+
+
+def _load_memmap(path: Path):
+    """Open a read-only ``.npy`` mapping (single seam for tests/instrumentation)."""
+    return np.load(path, mmap_mode="r")
 
 
 def _array_meta(rgb: np.ndarray):
@@ -548,5 +554,155 @@ class MemmapCanonicalProvider:
         else:
             tile = raw[y0:y1, x0:x1, :]
         sup_tile = sup[y0:y1, x0:x1]
+        batch = prepare_canonical_inputs([tile], [sup_tile])
+        return batch.images[0], batch.valid_mask[0]
+
+
+# ---------------------------------------------------------------------------
+# Bounded-lifetime provider (ZM-ZEGRID-R52-OOC, Lot A)
+# ---------------------------------------------------------------------------
+
+#: Storage domain advertised by :class:`BoundedMemmapCanonicalProvider`.
+#: Honest label: the aligned cache stays on disk; only bounded owned copies are
+#: ever resident, and no mapping outlives a single access call.
+BOUNDED_STORAGE_DOMAIN = "aligned-npy-memmap-bounded"
+
+
+class BoundedMemmapCanonicalProvider:
+    """Bounded-lifetime file-backed provider over the same aligned NPY cache.
+
+    Same Protocol surface and the same served values as
+    :class:`MemmapCanonicalProvider`, but with a deliberately different
+    *lifetime* contract:
+
+    * every access opens the ``.npy`` mapping(s), copies exactly the requested
+      data into an **owned** ndarray, and closes the mapping(s) BEFORE returning;
+    * no mapping is kept between calls, so ``N`` frames cost no open handles and
+      the cache directory can be deleted/moved once the access returns
+      (Windows ``WinError 32`` avoidance that does not depend on a later
+      ``close()``);
+    * if opening the *support* file fails after the *RGB* file opened, the RGB
+      mapping is closed too (no leaked handle; Windows-safe error path);
+    * ``close()`` is idempotent and never raises; it records that the provider
+      was closed. Returned arrays are owned copies, so they stay valid after
+      ``close()`` (never a dangling memmap view);
+    * no ``madvise``/``MADV_DONTNEED`` is used (not a portable guarantee), and a
+      live memmap view is never exposed.
+
+    Diagnostics are truthful and monotonic for tests/provenance:
+    ``open_count`` (successful ``np.load`` mappings), ``open_failures`` (failed
+    open attempts) and ``bytes_read`` (bytes copied out of the cache into owned
+    arrays). ``storage_domain`` identifies the storage model.
+
+    This class is NOT wired into any product path yet (Lot A): the default
+    provider/dispatch is unchanged.
+    """
+
+    storage_domain = BOUNDED_STORAGE_DOMAIN
+
+    def __init__(self, cache_dir) -> None:
+        self.cache_dir = Path(cache_dir)
+        manifest = load_cache_manifest(self.cache_dir)
+        self._manifest = manifest
+        self.n_frames = int(manifest["n_frames"])
+        self.height = int(manifest["height"])
+        self.width = int(manifest["width"])
+        self.channels = int(manifest["channels"])
+        self.original_mono = bool(manifest["original_mono"])
+        self.original_ndim = int(manifest["original_ndim"])
+        self.original_shape = tuple(manifest["original_shape"])
+        self.frame_ids = tuple(manifest["frame_ids"])
+        self.bytes_read = 0
+        self.open_count = 0
+        self.open_failures = 0
+        self._closed = False
+
+    # -- lifecycle ----------------------------------------------------------
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Mark the provider closed (idempotent; never raises).
+
+        By construction no mapping is held between calls, so there is nothing to
+        release here; the flag only makes access-after-close fail loudly instead
+        of silently serving data from a provider the caller considers finished.
+        """
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError(
+                "BoundedMemmapCanonicalProvider is closed; no further access is allowed"
+            )
+
+    # -- metadata -----------------------------------------------------------
+    @property
+    def shape(self):
+        return (self.height, self.width)
+
+    @property
+    def manifest(self) -> dict:
+        return self._manifest
+
+    # -- bounded open/copy helpers -----------------------------------------
+    def _open_pair(self, i: int):
+        """Open ``(rgb, support)`` mappings with an all-or-nothing error path.
+
+        ZM-ZEGRID-R52-OOC: if the support open raises after the RGB open
+        succeeded, the RGB mapping is closed before re-raising, so a failed
+        access cannot leak a file handle (a Windows delete would otherwise fail).
+        """
+        rgb = _load_memmap(_frame_rgb_path(self.cache_dir, i))
+        self.open_count += 1
+        try:
+            sup = _load_memmap(_frame_sup_path(self.cache_dir, i))
+            self.open_count += 1
+        except BaseException:
+            self.open_failures += 1
+            _close_memmap(rgb)
+            raise
+        return rgb, sup
+
+    @staticmethod
+    def _owned_copy(arr) -> np.ndarray:
+        """Copy ``arr`` into a plain owned ndarray (never a memmap/view)."""
+        return np.array(arr, copy=True)
+
+    # -- phase 1 raw access -------------------------------------------------
+    def get_raw_frame(self, i: int):
+        self._check_open()
+        rgb, sup = self._open_pair(int(i))
+        try:
+            raw = self._owned_copy(rgb)
+            raw_support = self._owned_copy(sup)
+            self.bytes_read += int(raw.nbytes) + int(raw_support.nbytes)
+            return raw, raw_support
+        finally:
+            _close_memmap(rgb)
+            _close_memmap(sup)
+
+    # -- phase 2 prepared tile access (mirrors MemmapCanonicalProvider) -----
+    def get_tile(self, i: int, y0: int, y1: int, x0: int, x1: int):
+        self._check_open()
+        rgb, sup = self._open_pair(int(i))
+        try:
+            if self.original_mono:
+                tile = self._owned_copy(rgb[y0:y1, x0:x1])
+            else:
+                tile = self._owned_copy(rgb[y0:y1, x0:x1, :])
+            sup_tile = self._owned_copy(sup[y0:y1, x0:x1])
+            self.bytes_read += int(tile.nbytes) + int(sup_tile.nbytes)
+        finally:
+            _close_memmap(rgb)
+            _close_memmap(sup)
         batch = prepare_canonical_inputs([tile], [sup_tile])
         return batch.images[0], batch.valid_mask[0]
