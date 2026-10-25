@@ -95,6 +95,11 @@ def test_gate_a_dense_h128_refusal_and_bounded_bundle(caldwell_headers):
     assert bundle.plan["storage"]["provider"] == "BoundedMemmapCanonicalProvider"
     assert bundle.plan["storage"]["rejection"] == "BoundedCountingRejectionSink"
     assert bundle.plan["storage"]["fresh_sink_per_cell"] is True
+    # L-1: the real in-memory bound is published; the 1<<62 planner sentinel is
+    # never exposed as a diagnostic bound.
+    assert bundle.plan["storage"]["inmem_worst_actual"] < 1 << 40
+    import json as _json
+    assert str(1 << 62) not in _json.dumps(bundle.plan)
 
     # CPU admitted: every cell is a bounded streaming task.
     assert bundle.cpu_streaming_tile == 128

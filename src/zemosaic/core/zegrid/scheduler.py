@@ -904,7 +904,21 @@ def enumerate_candidates(context: PlanContext) -> tuple[Candidate, ...]:
                         per_unit_prefetch_bytes=int(context.per_unit_prefetch_bytes),
                     )
 
-                    if not in_range:
+                    if (
+                        context.storage_profile != STORAGE_PROFILE_DENSE
+                        and context.phase == PHASE_CELL_STACK_INMEM
+                    ):
+                        # ZM-ZEGRID-R52-OOC L-1: bounded forbids the in-memory
+                        # stack HONESTLY, with its REAL in-memory bound. No
+                        # synthetic sentinel is needed or published.
+                        feasible = False
+                        reason = REASON_REFUSE_HOST_RAM
+                        detail = (
+                            "storage_profile='bounded' does not admit the "
+                            "in-memory stack; the bounded provider/sink require "
+                            "the file-backed streaming phase"
+                        )
+                    elif not in_range:
                         feasible = False
                         reason = REASON_UNCALIBRATED
                         detail = (

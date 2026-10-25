@@ -3018,7 +3018,10 @@ def _prepare_stack_cell(task):
         )
         _gauge_storage = {
             "provider": type(cell_provider).__name__,
-            "storage_domain": getattr(cell_provider, "storage_domain", None),
+            "storage_domain": getattr(
+                cell_provider, "storage_domain", "aligned-npy-memmap-dense"
+            ),
+            "counters_available": hasattr(cell_provider, "bytes_read"),
             "bytes_read": getattr(cell_provider, "bytes_read", None),
             "open_count": getattr(cell_provider, "open_count", None),
             "open_failures": getattr(cell_provider, "open_failures", None),
@@ -3066,8 +3069,11 @@ def _prepare_stack_cell(task):
         "cell_fixed": cell_fixed,
         "gauge_status": gauge_status,
         "gauge_detail": gauge_detail,
-        "storage_profile": storage_profile,
         "gauge_storage": _gauge_storage,
+        **(
+            {"storage_profile": storage_profile}
+            if zsp.is_bounded(storage_profile) else {}
+        ),
     }
 
 
@@ -3176,7 +3182,10 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         "peak_rss_kib": peak_rss, "cleanup_failed": cleanup_failed,
         "reproject": reproject,
         "cache_dir": str(cache_dir),
-        "storage_profile": storage_profile,
+        **(
+            {"storage_profile": storage_profile}
+            if zsp.is_bounded(storage_profile) else {}
+        ),
         # R34D: in per_cell mode the parent needs the PATCH planes (core + halo)
         # to measure the inter-cell overlaps and to feather-blend. Global mode
         # returns only the core (byte-unchanged payload).
@@ -4450,6 +4459,19 @@ def _build_execution_bundle(
                 "bounded plan whose residency the in-memory path would exceed"
             )
         if _bounded:
+            # L-1: the bundle planner has no profile flag, so it is fed an
+            # impossible in-memory bound internally. Sanitize the PUBLISHED
+            # candidate trail back to the real bound; the infeasibility reason
+            # is the profile, not a fabricated 4.6 EiB number.
+            _inmem_real = int(max(inmem_by_idx.values(), default=0))
+            for _cand in plan.get("candidates", ()):
+                if _cand.get("mode") == "inmem":
+                    _cand["max_bound_bytes"] = _inmem_real
+                    _cand["infeasible_reason"] = (
+                        "in-memory mode is not admitted under "
+                        "storage_profile=bounded (the profile requires the "
+                        "file-backed streaming executor)"
+                    )
             layout["storage_profile"] = _profile
             layout["storage_model"] = zsp.storage_model_id(_profile)
             plan["storage"] = {
@@ -4458,6 +4480,11 @@ def _build_execution_bundle(
                 "provider": "BoundedMemmapCanonicalProvider",
                 "rejection": "BoundedCountingRejectionSink",
                 "fresh_sink_per_cell": True,
+                # L-1: honest real in-memory bound. The 1<<62 planner sentinel is
+                # NEVER published; this is the measured model value.
+                "inmem_worst_actual": int(
+                    max(inmem_by_idx.values(), default=0)
+                ),
             }
         # R41-B (rework-2): the REPORTED stream tile is the one that will actually
         # execute a CPU stream plan — None when the CPU plan is in-memory only or
@@ -5103,10 +5130,9 @@ def _r55_active_facts(
             )
 
     _profile = zsp.normalize_storage_profile(_STACK_STORAGE_PROFILE)
-    if zsp.is_bounded(_profile):
-        # Bounded never executes in-memory; make that candidate impossible while
-        # keeping the historical value in the diagnostics.
-        inmem_worst = 1 << 62
+    # L-1: bounded forbids the in-memory stack in the SCHEDULER (with this real
+    # bound), so no synthetic sentinel is needed anywhere in the facts.
+    inmem_worst_actual = int(max(1, inmem_worst))
 
     channels = 3
     per_unit_cache = _r55_cache_unit_bytes(
@@ -5153,6 +5179,7 @@ def _r55_active_facts(
         "worst_patch_hw": (int(worst_patch_hw[0]), int(worst_patch_hw[1])),
         "per_unit_cache": int(per_unit_cache),
         "inmem_worst": int(max(1, inmem_worst)),
+        "inmem_worst_actual": int(inmem_worst_actual),
         "stream_worst_by_tile": dict(stream_worst_by_tile),
         "stream_worst": int(max(1, max(stream_worst_by_tile.values()))),
         # R55-E8: ``_estimate_streaming_bytes`` returns the TOTAL streaming peak,
@@ -6651,11 +6678,13 @@ def _r55_active_apply(
         [],
         reason,
         stream_worst_by_tile,
-        int(facts["inmem_worst"]),
+        int(facts.get("inmem_worst_actual", facts["inmem_worst"])),
         int(bound_budget),
     )
     if tile is None:
-        cpu_streaming["predicted_peak_bytes"] = int(facts["inmem_worst"])
+        cpu_streaming["predicted_peak_bytes"] = int(
+            facts.get("inmem_worst_actual", facts["inmem_worst"])
+        )
         cpu_streaming["stream_bound_bytes"] = 0
     plan = {
         "mode": mode,
@@ -12329,6 +12358,14 @@ def run_zegrid_mode(
 
     Normalization defaults to ``sky_mean``;
     weighting/rejection/combine/taper use the frozen ZeGrid science config.
+
+    ZM-ZEGRID-R52-OOC Lot C (L-3): this entry point is ONE RUN PER PROCESS and is
+    NOT re-entrant. The storage profile is selected once (``storage_profile=``
+    else dense) into the run-scoped ``_STACK_STORAGE_PROFILE`` seam, like the
+    existing ``_STACK_CONFIG``/``_STACK_TILE_SIZE`` globals; a nested call would
+    overwrite its parent's profile. The profile itself is COPIED into every cell
+    task (7th element) and into the prepared/record payload, so a worker never
+    depends on the parent's global to know which provider/sink to use.
 
     ZM-ZEGRID-R37-D: ``r37_diagnostic_capture`` (default ``False``) is an explicit,
     diagnostic-only opt-in. When requested it publishes the accepted R37-C strict
