@@ -6273,9 +6273,22 @@ def _r55_active_gpu_decide(
             # ZM-ZEGRID-R56: the ON-DISK bytes of a prefetch slot, accounted in
             # the scheduler's separate disk-residency term (never host RAM).
             per_unit_prefetch_disk_bytes=int(base["per_unit_prefetch_disk"]),
-            # F2: the concurrent producer owner is added to the SIMULTANEOUS
-            # host peak, so PLAN/ADMIT inspect the same coexistence RUN uses.
-            concurrent_producer_bytes=int(base["concurrent_producer_bytes"]),
+            # F2/REWORK-2: the producer term depends on THIS trial's worker
+            # count, never on the initial base facts.
+            concurrent_producer_bytes=int(
+                max(
+                    int(
+                        rcontract.cache_per_cell_bytes(
+                            rcontract.PROCESS_BASELINE_BYTES,
+                            int(cache_workers),
+                            int(trial_facts["cache_footprint_bytes"]),
+                        )
+                    ),
+                    2
+                    * int(trial_facts["worst_patch_px"])
+                    * (int(trial_facts["channels"]) * 4 + 1),
+                )
+            ),
             time_model=None,
             profile=None,
         )
@@ -6296,6 +6309,31 @@ def _r55_active_gpu_decide(
         candidate for candidate in enumerated
         if candidate.backend == zsched.BACKEND_GPU and candidate.feasible
     ]
+    if not feasible_gpu:
+        # REWORK-2: producer memory depends on the TRIAL worker count, so the
+        # initial pair is not conclusive. Probe the declared worker ladder
+        # before any refusal; otherwise a valid 1-worker plan is lost.
+        for _g in _r55_worker_ladder(int(base["gauge_workers"])):
+            for _c in _r55_worker_ladder(int(base["cache_workers"])):
+                _trial = dict(base)
+                _trial["gauge_workers"] = int(_g)
+                _trial["cache_workers"] = int(_c)
+                _in, _st, _gp = _gpu_pair_contexts(int(_g), int(_c), _trial)
+                _en = zsched.enumerate_joint_candidates(
+                    zsched.JointPlanInput(
+                        contexts=(_in, _st, _gp), gpu_facts=gpu_facts
+                    )
+                )
+                _feasible = [
+                    c
+                    for c in _en
+                    if c.backend == zsched.BACKEND_GPU and c.feasible
+                ]
+                if _feasible:
+                    feasible_gpu = _feasible
+                    break
+            if feasible_gpu:
+                break
     if not feasible_gpu:
         trail = zsched.joint_refusal_trail(_init_joint)
         reason, detail, exhaustion = zsched.gpu_exhaustion_reason(
@@ -10774,11 +10812,13 @@ def _run_single(
         disk_free_run = int(gpu_decision.facts.get("disk_free", 0) or 0)
         disk_budget = int(disk_free_run) // 2
         disk_required = int(unit_disk) * int(queue_max)
-        if int(disk_budget) < int(disk_required):
+        if int(disk_budget) < int(unit_disk):
+            # A SINGLE staging step can never fit: structural refusal. Temporary
+            # queue saturation is handled (and waited out) in _before_produce.
             raise _R55GpuFallback(
                 renv.REASON_REFUSE_DISK,
-                "the ACTIVE GPU pipeline cannot retain the queued aligned cache "
-                f"within half the free volume ({disk_budget} B < {disk_required} B)",
+                "the ACTIVE GPU pipeline cannot stage even one cache within "
+                f"half the free volume ({disk_budget} B < {unit_disk} B)",
             )
         gpu_cfg = replace(science_config, backend="gpu")
         _init_stack_worker(
@@ -11329,44 +11369,73 @@ def _run_single(
 
         disk_fresh_refusal: dict = {}
 
-        def _before_produce(task, ledger):
-            """F4: fresh disk observation BEFORE staging, shrink-only.
+        def _before_produce(task, ledger, cancel_event):
+            """F4/REWORK-2: fresh disk evidence AFTER the host wait.
 
-            Own retained cache bytes are ADDED BACK to the free space before the
-            half-free policy is applied (they are already allocated, so counting
-            them twice would double-subtract). The ledger may only shrink here.
-            A volume that cannot hold the next staging step refuses BEFORE any
-            production. The OS can still change between this observation and the
-            write (documented race window); the static ledger cannot detect it.
+            * observation failure is a STRUCTURED refusal (never a silent stale
+              budget);
+            * our own already-leased bytes are added back before the half-free
+              policy (no double subtraction);
+            * a request that can never fit refuses;
+            * temporary saturation by our OWN queued/consumed units WAITS for a
+              release and re-observes; it is not an external shortage.
             """
+            waited_s = 0.0
+            while True:
+                try:
+                    fresh_free = int(shutil.disk_usage(str(disk_root)).free)
+                except Exception as exc:
+                    disk_fresh_refusal.update(
+                        {
+                            "reason_code": str(renv.REASON_REFUSE_DISK),
+                            "stage": "disk_observation_failed",
+                            "detail": f"{type(exc).__name__}: {exc}",
+                            "disk_root": str(disk_root),
+                        }
+                    )
+                    raise zpar.PipelineAccountingError(
+                        "fresh disk observation failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                snap = ledger.snapshot()
+                own = int(snap["disk_used_bytes"])
+                capacity = max(0, (fresh_free + own) // 2)
+                allowed = min(int(ledger.disk_budget_bytes), int(capacity))
+                ledger.reduce_budget("disk", int(allowed))
+                budget = int(ledger.disk_budget_bytes)
+                if int(unit_disk) > budget:
+                    disk_fresh_refusal.update(
+                        {
+                            "reason_code": str(renv.REASON_REFUSE_DISK),
+                            "stage": "disk_structural",
+                            "fresh_free_bytes": int(fresh_free),
+                            "own_retained_bytes": int(own),
+                            "capacity_bytes": int(budget),
+                            "next_reservation_bytes": int(unit_disk),
+                            "disk_root": str(disk_root),
+                        }
+                    )
+                    raise zpar.PipelineAccountingError(
+                        "fresh disk capacity cannot hold even one cache: "
+                        f"free={fresh_free} own={own} capacity={budget} "
+                        f"next={unit_disk}"
+                    )
+                if int(own) + int(unit_disk) <= budget:
+                    return
+                if cancel_event is not None and cancel_event.is_set():
+                    raise zpar.PipelineCancelled(
+                        "cancelled while waiting for own disk slots to release"
+                    )
+                time.sleep(0.01)
+                waited_s += 0.01
+
+        def _cleanup_task(task, payload):
+            """Partial-produce cleanup: remove the cell cache BEFORE credits."""
             try:
-                fresh_free = int(
-                    shutil.disk_usage(str(disk_root)).free
-                )
+                if len(task) >= 4 and task[3] is not None:
+                    _safe_rmtree(task[3], None)
             except Exception:
-                return
-            snap = ledger.snapshot()
-            own = int(snap["disk_used_bytes"])
-            capacity = max(0, (fresh_free + own) // 2)
-            allowed = min(int(ledger.disk_budget_bytes), int(capacity))
-            ledger.reduce_budget("disk", int(allowed))
-            if int(own) + int(unit_disk) > int(ledger.disk_budget_bytes):
-                disk_fresh_refusal.update(
-                    {
-                        "reason_code": str(renv.REASON_REFUSE_DISK),
-                        "fresh_free_bytes": int(fresh_free),
-                        "own_retained_bytes": int(own),
-                        "capacity_bytes": int(ledger.disk_budget_bytes),
-                        "next_reservation_bytes": int(unit_disk),
-                        "disk_root": str(disk_root),
-                    }
-                )
-                raise zpar.PipelineAccountingError(
-                    "fresh disk observation cannot hold the next staged cache: "
-                    f"free={fresh_free} own={own} "
-                    f"capacity={ledger.disk_budget_bytes} "
-                    f"next={unit_disk}"
-                )
+                pass
 
         host_budget_val = int(host_budget)
         pipeline = zpar.BoundedPipeline(
@@ -11378,6 +11447,7 @@ def _run_single(
             host_budget_bytes=int(host_budget_val),
             device_budget_bytes=int(max(device_budget, initial_device_peak)),
             disk_budget_bytes=int(disk_budget),
+            disk_enabled=True,
             host_bytes=_host_bytes,
             device_bytes=_device_bytes,
             disk_bytes=_disk_bytes,
@@ -11386,6 +11456,7 @@ def _run_single(
             disk_reserve_bytes=_disk_reserve,
             # F4: fresh, shrink-only disk revalidation before every staging.
             before_produce=_before_produce,
+            cleanup_task=_cleanup_task,
             thread_join_s=float(_R55E2_PIPELINE_JOIN_S),
             # No internal per-unit stall budget: honest liveness for a long
             # healthy GPU cell is "the caller is still inside consume". Only a

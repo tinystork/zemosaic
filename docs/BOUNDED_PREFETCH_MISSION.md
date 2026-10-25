@@ -111,3 +111,25 @@ Checklist:
 Contract change is user-visible: tight budgets can now shrink tile/prefetch or
 refuse the GPU instead of admitting a max-only plan (E8 gate B now refuses).
 That is the intended honest outcome pending Junior's decision.
+
+## REWORK-2 (2026-10-26) — partial, honest checklist
+
+- [x] A: disk liveness — host credit first, fresh disk observation AFTER the
+      host wait, temporary own saturation WAITS (cancellable) instead of a
+      terminal refusal, structural/impossible single request refuses, observation
+      failure is a structured refusal, explicit `disk_enabled` distinguishes
+      legacy-omitted from enabled-zero, `cleanup_task` runs BEFORE credit release.
+- [x] B(partial): `concurrent_producer_bytes` recomputed per TRIAL worker count;
+      early GPU feasibility now probes the whole worker ladder before refusing.
+- [ ] B(remaining): unify candidate vs apply/runtime projection (p0 serial under
+      pre-acquisition), faithful LP341 product wiring witness (current helper
+      still omits the producer term).
+- [x] C(partial): recorder accepts the REAL manifest schema (complete_cells list,
+      incomplete_cells []), downward-only FRESH RAM clamp with observer restore,
+      geometry-only comparability.
+- [ ] C(remaining): adapter integration test from a real manifest, final-backend /
+      consumed-cells gate, real feasible small bounded CUDA run.
+- [ ] D: combined-matrix failure root cause NOT established.
+- [ ] New required adversarial tests (ordinary full-slot wait, external decline,
+      shrink during wait, cancelled wait, zero enabled, real-file partial cleanup,
+      real-schema recorder adapter) NOT yet added.

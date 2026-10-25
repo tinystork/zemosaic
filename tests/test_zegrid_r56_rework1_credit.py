@@ -275,7 +275,7 @@ def test_fresh_disk_shrink_refuses_before_production():
         state["produced"] += 1
         return {"bytes": 100}
 
-    def before(task, ledger):
+    def before(task, ledger, cancel_event):
         # External consumption: the volume can no longer hold the next slot.
         ledger.reduce_budget("disk", 10)
         if ledger.snapshot()["disk_used_bytes"] + 100 > ledger.disk_budget_bytes:

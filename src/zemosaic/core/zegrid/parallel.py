@@ -1616,6 +1616,8 @@ class BoundedPipeline:
         host_budget_bytes: int,
         device_budget_bytes: int,
         disk_budget_bytes: int = 0,
+        disk_enabled: bool | None = None,
+        cleanup_task=None,
         host_bytes=lambda payload: 0,
         device_bytes=lambda payload: 0,
         disk_bytes=lambda payload: 0,
@@ -1645,9 +1647,12 @@ class BoundedPipeline:
             ("host_reserve_bytes", host_reserve_bytes),
             ("disk_reserve_bytes", disk_reserve_bytes),
             ("before_produce", before_produce),
+            ("cleanup_task", cleanup_task),
         ):
             if fn is not None and not callable(fn):
                 raise PipelineError(f"{name} must be callable or None")
+        if disk_enabled is not None and not isinstance(disk_enabled, bool):
+            raise PipelineError("disk_enabled must be a bool or None")
         if (
             isinstance(thread_join_s, bool)
             or not isinstance(thread_join_s, (int, float))
@@ -1670,6 +1675,12 @@ class BoundedPipeline:
         self._host_reserve_fn = host_reserve_bytes
         self._disk_reserve_fn = disk_reserve_bytes
         self._before_produce = before_produce
+        self._cleanup_task = cleanup_task
+        self._disk_enabled = (
+            bool(disk_budget_bytes) > 0
+            if disk_enabled is None
+            else bool(disk_enabled)
+        )
         self._pre_acquired_units = 0
         self._prefetch_units = _pipeline_int(
             prefetch_units, "prefetch_units", minimum=0
@@ -1843,8 +1854,9 @@ class BoundedPipeline:
             "disk_reserved": None,
         }
         try:
-            if self._before_produce is not None:
-                self._before_produce(task, self._ledger)
+            # REWORK-2 ordering: host credit first (its wait may be long), then a
+            # FRESH disk observation, then disk credit. Never a stale pre-wait
+            # observation admitted as fresh.
             if self._host_reserve_fn is not None:
                 host_pred = _pipeline_int(
                     self._host_reserve_fn(task), "host_reserve_bytes", minimum=0
@@ -1853,10 +1865,9 @@ class BoundedPipeline:
                 pre["host_lease"] = self._ledger.reserve(
                     "host", host_pred, cancel_event=self._cancel
                 )
-            if (
-                self._disk_reserve_fn is not None
-                and int(self._ledger.disk_budget_bytes) > 0
-            ):
+            if self._before_produce is not None:
+                self._before_produce(task, self._ledger, self._cancel)
+            if self._disk_reserve_fn is not None and self._disk_enabled:
                 disk_pred = _pipeline_int(
                     self._disk_reserve_fn(task), "disk_reserve_bytes", minimum=0
                 )
@@ -1884,6 +1895,16 @@ class BoundedPipeline:
                 try:
                     payload = self._produce(task)
                 except BaseException:
+                    # Cleanup BEFORE credits are released: a partial cache write
+                    # must not leave files behind while the ledger frees space.
+                    if self._cleanup_task is not None:
+                        try:
+                            self._cleanup_task(task, None)
+                        except BaseException as cleanup_exc:  # noqa: BLE001
+                            self._cleanup_failures.append(
+                                "cleanup_task:"
+                                f"{type(cleanup_exc).__name__}:{cleanup_exc}"
+                            )
                     self._release_pre(pre)
                     raise
                 finally:
@@ -1947,7 +1968,7 @@ class BoundedPipeline:
                         unit["host_lease"] = self._ledger.reserve(
                             "host", host_need, cancel_event=self._cancel
                         )
-                    if int(self._ledger.disk_budget_bytes) > 0:
+                    if self._disk_enabled:
                         if unit["disk_lease"] is not None:
                             self._ledger.reconcile(
                                 "disk", int(unit["disk_lease"]), disk_need

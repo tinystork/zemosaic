@@ -295,10 +295,16 @@ def _run_arm(
 
     out_dir.mkdir(parents=True, exist_ok=False)
     zz._R55E2_MEASURE_PREFETCH_CAP = prefetch_cap
+    original_observer = zz.available_memory_bytes
     if max_available_bytes is not None:
-        real = zz.available_memory_bytes()
-        effective = min(int(max_available_bytes), int(real))
-        zz.available_memory_bytes = lambda: int(effective)
+        cap = int(max_available_bytes)
+
+        def _clamped_observer():
+            # REWORK-2: FRESH real observation on every call, clamped DOWN only.
+            return min(int(cap), int(original_observer()))
+
+        zz.available_memory_bytes = _clamped_observer
+        effective = int(_clamped_observer())
     else:
         effective = None
     sampler = Sampler(sample_period_s)
@@ -320,6 +326,7 @@ def _run_arm(
     finally:
         wall_s = time.monotonic() - started
         zz._R55E2_MEASURE_PREFETCH_CAP = None
+        zz.available_memory_bytes = original_observer
         observation = sampler.stop()
 
     manifest = {}
@@ -376,9 +383,27 @@ def _arm_complete(arm: dict) -> bool:
     outputs = arm.get("outputs") or {}
     if any(not outputs.get(name) for name in OUTPUT_FILES):
         return False
-    if arm.get("complete_cells") is None:
+    # REAL product schema: complete_cells is a LIST, incomplete_cells is []
+    # (or 0). Missing/null stays NONQUALIFYING.
+    complete = arm.get("complete_cells")
+    if isinstance(complete, list):
+        if not complete:
+            return False
+    elif isinstance(complete, int) and not isinstance(complete, bool):
+        if complete <= 0:
+            return False
+    else:
         return False
-    if arm.get("incomplete_cells") not in (0, None):
+    incomplete = arm.get("incomplete_cells")
+    if incomplete is None:
+        return False
+    if isinstance(incomplete, list):
+        if incomplete:
+            return False
+    elif isinstance(incomplete, int) and not isinstance(incomplete, bool):
+        if incomplete != 0:
+            return False
+    else:
         return False
     frames = arm.get("frame_ids")
     if not isinstance(frames, list) or not frames:
@@ -400,10 +425,25 @@ def _arm_gpu_prefetch(arm: dict) -> bool:
 
 
 def evaluate(control: dict, candidate: dict) -> dict:
+    # Compare GEOMETRY/config identity, never the volatile RAM observation that a
+    # layout dictionary may carry.
+    def geometry(arm):
+        layout = arm.get("layout") or {}
+        if isinstance(layout, (list, tuple)):
+            nx = layout[0] if len(layout) > 0 else None
+            ny = layout[1] if len(layout) > 1 else None
+        else:
+            nx = layout.get("nx")
+            ny = layout.get("ny")
+        return {
+            "nx": nx,
+            "ny": ny,
+            "n_frames": arm.get("n_frames"),
+            "normalization": arm.get("normalization"),
+        }
+
     comparable = (
-        control.get("layout") == candidate.get("layout")
-        and control.get("n_frames") == candidate.get("n_frames")
-        and control.get("normalization") == candidate.get("normalization")
+        geometry(control) == geometry(candidate)
         and _arm_complete(control)
         and _arm_complete(candidate)
     )
