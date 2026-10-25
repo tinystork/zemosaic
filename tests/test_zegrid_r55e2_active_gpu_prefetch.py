@@ -715,3 +715,66 @@ def test_cpu_modules_do_not_import_cupy():
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "LAZY_OK" in proc.stdout
+
+
+def test_run_credit_model_is_coherent_and_publishes_disk_and_overlap(
+    routine_input, legacy_run, tmp_path_factory, monkeypatch
+):
+    """ZM-ZEGRID-R56: RUN agrees with PLAN and books disk separately.
+
+    The RUN block must publish the SAME separated credit model the planner used
+    (resident host staging vs exact on-disk bytes), the pipeline ledger must keep
+    both dimensions balanced, and the observed overlap witness must be present
+    (a boolean proof derived from real produce()/consume() intervals).
+    """
+    _fake_gpu_available(monkeypatch)
+    real_consume = zz._consume_stack_cell
+
+    def fake_gpu_consume(prepared):
+        if isinstance(prepared, dict) and "empty_result" in prepared:
+            return real_consume(prepared)
+        cfg = zz._STACK_CONFIG
+        zz._STACK_CONFIG = dataclasses.replace(cfg, backend="cpu")
+        try:
+            result = real_consume(prepared)
+        finally:
+            zz._STACK_CONFIG = cfg
+        result["backend_used"] = "gpu"
+        result["record"]["backend_used"] = "gpu"
+        return result
+
+    monkeypatch.setattr(zz, "_consume_stack_cell", fake_gpu_consume)
+    out = tmp_path_factory.mktemp("r55e2_r56_credit")
+    _run(routine_input, out, "active", use_gpu=True)
+
+    manifest = _manifest(out)
+    block = manifest["r55_scheduler"]
+    run_block = block["run"]
+    policy = run_block["policy"]
+    credit = policy["credit_model"]
+    assert credit["schema"] == zz._R55_PREFETCH_CREDIT_SCHEMA
+    assert credit["per_unit_prefetch_disk_bytes"] == credit["per_unit_cache_disk_bytes"]
+    assert credit["disk_budget_bytes"] >= credit["per_unit_cache_disk_bytes"]
+    assert policy["disk"]["ledger_dimension"] == "disk"
+
+    pipe = manifest["r55_run_telemetry"]["gpu_pipeline"]
+    ledger = pipe["ledger"]
+    assert ledger["schema"] == zpar.PIPELINE_SCHEMA_V2
+    assert ledger["balanced"] is True
+    assert ledger["disk_budget_bytes"] == credit["disk_budget_bytes"]
+    assert ledger["host_budget_bytes"] == credit["host_budget_bytes"]
+    # The on-disk peak is a real, positive observation of the queued caches.
+    assert ledger["disk_peak_bytes"] > 0
+    assert ledger["disk_peak_bytes"] <= policy["disk"]["required_bytes"]
+
+    overlap = run_block["overlap"]
+    assert overlap["clock"] == "time.monotonic"
+    assert isinstance(overlap["overlap_proved"], bool)
+    assert overlap["overlap_proved"] == (
+        overlap["intersection_s"] > 0 and overlap["overlap_units"] > 0
+    )
+    assert overlap["producer_work_s"] > 0
+    assert overlap["consumer_work_s"] > 0
+    assert overlap["intersection_s"] <= min(
+        overlap["producer_work_s"], overlap["consumer_work_s"]
+    )

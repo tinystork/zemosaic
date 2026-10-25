@@ -22,6 +22,29 @@ M106_LIGHTS = Path("/home/tristan/M106/lights")
 M16_LIGHTS = Path("/home/tristan/M16/quick")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_zegrid_storage_profile():
+    """Undo cross-test leakage of the module-level storage profile.
+
+    A few R52 witnesses assign ``zemosaic_zegrid_mode._STACK_STORAGE_PROFILE``
+    DIRECTLY (not through ``monkeypatch``). That value then survived into an
+    unrelated test and made R52 Lot B/C leak failures depend on collection
+    order. Snapshot/restore here so every test starts from the value it found,
+    without weakening any expectation.
+    """
+    try:
+        from zemosaic import zemosaic_zegrid_mode as _zz
+    except Exception:  # pragma: no cover - import-time platform guards
+        yield
+        return
+    saved = getattr(_zz, "_STACK_STORAGE_PROFILE", None)
+    try:
+        yield
+    finally:
+        if saved is not None:
+            _zz._STACK_STORAGE_PROFILE = saved
+
+
 @pytest.fixture(scope="session")
 def m106_corpus():
     """M106 manifest + canvas, read ONCE per session.

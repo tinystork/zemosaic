@@ -402,11 +402,24 @@ class PlanContext:
     # (the default) preserves the historical static-bound behavior byte for
     # byte for every existing caller.
     per_tile_stack_bytes: object | None = None
+    # ZM-ZEGRID-R56-BOUNDED-PREFETCH: the ON-DISK bytes a prefetch slot retains.
+    # ``None`` (the default) keeps the historical conflation of the prefetch
+    # term into a single number, so every existing plan/hash is byte-identical.
+    # When supplied, ``per_unit_prefetch_bytes`` means RESIDENT host memory per
+    # prefetch slot and this field means the EXACT aligned-cache bytes on disk.
+    per_unit_prefetch_disk_bytes: int | None = None
     # ZM-ZEGRID-R52-OOC Lot B: the ONE storage model this plan is admitted
     # against. ``dense`` keeps the historical model byte-for-byte; ``bounded``
     # removes only the terms the bounded provider/sink eliminate. The profile is
     # selected BEFORE layout filtering and carried unchanged through the run.
     storage_profile: str = STORAGE_PROFILE_DENSE
+
+    @property
+    def prefetch_disk_bytes(self) -> int:
+        """Bytes on disk retained per prefetch slot (defaults to the v1 value)."""
+        if self.per_unit_prefetch_disk_bytes is None:
+            return int(self.per_unit_prefetch_bytes)
+        return int(self.per_unit_prefetch_disk_bytes)
 
     @property
     def patch_area_px(self) -> int:
@@ -656,6 +669,11 @@ def _validate_context(context: PlanContext, *, allow_gpu: bool = False) -> None:
     require_int(context.per_unit_stack_bytes, "per_unit_stack_bytes", minimum=1)
     require_int(context.per_unit_cache_bytes, "per_unit_cache_bytes")
     require_int(context.per_unit_prefetch_bytes, "per_unit_prefetch_bytes")
+    if context.per_unit_prefetch_disk_bytes is not None:
+        require_int(
+            context.per_unit_prefetch_disk_bytes,
+            "per_unit_prefetch_disk_bytes",
+        )
     require_int(context.disk_free_bytes, "disk_free_bytes")
     if isinstance(context.layout, (str, bytes)) or not isinstance(
         context.layout, (tuple, list)
@@ -901,7 +919,7 @@ def enumerate_candidates(context: PlanContext) -> tuple[Candidate, ...]:
                         units_in_flight=k,
                         prefetch_units=int(prefetch),
                         per_unit_cache_bytes=int(context.per_unit_cache_bytes),
-                        per_unit_prefetch_bytes=int(context.per_unit_prefetch_bytes),
+                        per_unit_prefetch_bytes=int(context.prefetch_disk_bytes),
                     )
 
                     if (
@@ -1525,9 +1543,7 @@ def _enumerate_gpu_candidates(
                     units_in_flight=k,
                     prefetch_units=int(prefetch),
                     per_unit_cache_bytes=int(gpu.per_unit_cache_bytes),
-                    per_unit_prefetch_bytes=int(
-                        gpu.per_unit_prefetch_bytes
-                    ),
+                    per_unit_prefetch_bytes=int(gpu.prefetch_disk_bytes),
                 )
                 device_peak = int(peak_map[tile])
 
@@ -2783,6 +2799,17 @@ def _joint_context_payload(context: PlanContext) -> dict:
         "per_unit_stack_bytes": int(context.per_unit_stack_bytes),
         "per_unit_cache_bytes": int(context.per_unit_cache_bytes),
         "per_unit_prefetch_bytes": int(context.per_unit_prefetch_bytes),
+        # ZM-ZEGRID-R56: only emitted when the caller separated disk from
+        # resident host, so existing payloads/hashes stay byte-identical.
+        **(
+            {}
+            if context.per_unit_prefetch_disk_bytes is None
+            else {
+                "per_unit_prefetch_disk_bytes": int(
+                    context.per_unit_prefetch_disk_bytes
+                )
+            }
+        ),
         # R55-E7: only emitted when the caller supplied the explicit per-tile
         # host contract, so every existing (static-bound) payload/hash is
         # byte-identical.

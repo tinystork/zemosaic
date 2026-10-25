@@ -1,0 +1,372 @@
+{
+  "arms": [
+    {
+      "arm": "control",
+      "complete_cells": [
+        "r0000c0000",
+        "r0000c0001",
+        "r0000c0002",
+        "r0001c0000",
+        "r0001c0001",
+        "r0001c0002"
+      ],
+      "credit_model": {
+        "disk_budget_bytes": 1554853888,
+        "host_budget_bytes": 7817082,
+        "note": "A prefetch slot reserves RESIDENT host staging bytes (profile-aware) and EXACT on-disk cache bytes in independent ledgers. The two are never added.",
+        "per_unit_cache_disk_bytes": 93808056,
+        "per_unit_prefetch_disk_bytes": 93808056,
+        "per_unit_prefetch_host_bytes": 7817082,
+        "queue_max": 1,
+        "schema": "r56-bounded-prefetch-credit-v1",
+        "storage_profile": "bounded"
+      },
+      "disk_policy": {
+        "budget_bytes": 1554853888,
+        "bytes_contract": "aligned_cache_files__rgb_f32+support_bool+npy_header128__per_frame",
+        "domain": "on_disk_aligned_cache_files_exact_disk_ledger",
+        "free_bytes": 3109707776,
+        "ledger_dimension": "disk",
+        "note": "Exact RGB float32 + support bool + one 128-byte .npy header per file; equal to manifest.total_bytes. Accounted in the SEPARATE disk ledger dimension and never added to worker footprints or host RAM.",
+        "required_bytes": 93808056,
+        "residency_bytes": 93808056,
+        "strict_checkpoint": true
+      },
+      "error": null,
+      "frames_participating": null,
+      "incomplete_cells": [],
+      "ledger": {
+        "balanced": true,
+        "credit_wait_events": 5,
+        "credit_wait_s": 8.933474491961533,
+        "device_budget_bytes": 1435435008,
+        "device_leases": 0,
+        "device_peak_bytes": 974984704,
+        "device_used_bytes": 0,
+        "dimensions": {
+          "device": {
+            "budget_bytes": 1435435008,
+            "role": "gpu_workspace_reservation"
+          },
+          "disk": {
+            "budget_bytes": 1554853888,
+            "role": "on_disk_payload_bytes"
+          },
+          "host": {
+            "budget_bytes": 7817082,
+            "role": "resident_process_reservation"
+          }
+        },
+        "disk_budget_bytes": 1554853888,
+        "disk_leases": 0,
+        "disk_peak_bytes": 93808056,
+        "disk_used_bytes": 0,
+        "host_budget_bytes": 7817082,
+        "host_leases": 0,
+        "host_peak_bytes": 7817082,
+        "host_used_bytes": 0,
+        "schema": "zemosaic-r56-bounded-pipeline-v2"
+      },
+      "manifest_path": "/tmp/r56_big/ab_pinned/arm_control/zegrid_manifest.json",
+      "mapping": {
+        "backend": "gpu",
+        "cell_task_mode": "stream",
+        "cpu_streaming_tile": null,
+        "gpu_streaming_tile": 512,
+        "phase": "cell_stack_stream",
+        "prefetch_units": 2,
+        "schema": "zemosaic-r55e2-active-gpu-mapping-v1",
+        "single_owner": true,
+        "storage": {
+          "model": "bounded-streaming-v1",
+          "profile": "bounded"
+        },
+        "units_in_flight": 1,
+        "workers_per_unit": 6
+      },
+      "observation": {
+        "note": "These are OBSERVATIONS. They are never compared to the planner's reservation arithmetic as if they were the same quantity.",
+        "observation_caveat": "Peak-SAMPLED at the stated period, not an OS high-water mark. RSS is the sum over the sampled process tree (shared pages counted once per process); VRAM free/total is DEVICE-WIDE while pool_used is this process only.",
+        "process_tree_rss_peak_bytes": 5514735616,
+        "process_tree_rss_peak_per_process_bytes": {
+          "494054": 1003712512,
+          "494164": 770785280,
+          "494165": 741715968,
+          "494166": 768757760,
+          "494167": 739684352,
+          "494168": 744972288,
+          "494169": 745107456
+        },
+        "process_tree_rss_peak_sample_at_s": 22.836112110991962,
+        "process_tree_rss_samples": 276,
+        "process_tree_rss_scope": "runner process + recursive children",
+        "sampler_period_s": 0.1,
+        "sampler_source": "psutil process-tree RSS",
+        "schema": "zemosaic-r56-memory-observation-v1",
+        "system_ram": {
+          "source": "psutil.virtual_memory (SYSTEM-wide)",
+          "virtual_available_bytes": 1874399232,
+          "virtual_total_bytes": 8071180288,
+          "virtual_used_bytes": 6196781056
+        },
+        "vram_device_free_min_bytes": 1522139136,
+        "vram_last": {
+          "device_count": 1,
+          "device_free_bytes": 2048524288,
+          "device_index": 0,
+          "device_total_bytes": 2091253760,
+          "device_used_bytes": 42729472,
+          "pinned_pool_used_bytes": 0,
+          "pool_total_bytes": 0,
+          "pool_used_bytes": 0,
+          "scope": "device_wide_free_total; pool_used is THIS process",
+          "source": "cupy.cuda.runtime.memGetInfo + cupy default pool"
+        },
+        "vram_pool_used_peak_bytes": 444622848,
+        "vram_samples": 276,
+        "vram_unavailable_reason": null
+      },
+      "outputs": {
+        "mosaic_grid.fits": "d1a47319f35402834e989c8f4dfeab7a197ade606cc84aa3aa13e319f63351f8",
+        "mosaic_grid_coverage.fits": "0f01365c14ab36b3c74964fcef4c22a7ae304fdf6243675cd4e51114acfd0f31"
+      },
+      "overlap": {
+        "clock": "time.monotonic",
+        "consumer_units_timed": 6,
+        "consumer_work_s": 19.102790979057318,
+        "intersection_s": 8.856834848033031,
+        "note": "Intersection of the observed produce()/consume() CALL intervals only. Nonzero means both sides performed work concurrently; it is not a queue-capacity or thread-count claim.",
+        "overlap_proved": true,
+        "overlap_units": 5,
+        "producer_units_timed": 6,
+        "producer_work_s": 9.912174429977313,
+        "wall_s": 20.159670033986913
+      },
+      "prefetch_cap_requested": 0,
+      "run_policy": {
+        "prefetch_cap_override": 0,
+        "prefetch_units": 0,
+        "queue_max": 1
+      },
+      "storage_profile_requested": "bounded",
+      "timings": {
+        "checkpoint_count": 6,
+        "examined_shrink_steps": 0,
+        "heartbeat_calls": 0,
+        "heartbeat_errors": 0,
+        "parent_end": {
+          "current_rss_bytes": 1071362048,
+          "peak_rss_bytes": 1388716032,
+          "unavailable_reason": null
+        },
+        "refusal_count": 0,
+        "shrink_count": 0,
+        "total_wall_s": 20.159715620975476,
+        "wave_count": 1
+      },
+      "wall_s": 33.71034274098929
+    },
+    {
+      "arm": "candidate",
+      "complete_cells": [
+        "r0000c0000",
+        "r0000c0001",
+        "r0000c0002",
+        "r0001c0000",
+        "r0001c0001",
+        "r0001c0002"
+      ],
+      "credit_model": {
+        "disk_budget_bytes": 1532841984,
+        "host_budget_bytes": 23451246,
+        "note": "A prefetch slot reserves RESIDENT host staging bytes (profile-aware) and EXACT on-disk cache bytes in independent ledgers. The two are never added.",
+        "per_unit_cache_disk_bytes": 93808056,
+        "per_unit_prefetch_disk_bytes": 93808056,
+        "per_unit_prefetch_host_bytes": 7817082,
+        "queue_max": 3,
+        "schema": "r56-bounded-prefetch-credit-v1",
+        "storage_profile": "bounded"
+      },
+      "disk_policy": {
+        "budget_bytes": 1532841984,
+        "bytes_contract": "aligned_cache_files__rgb_f32+support_bool+npy_header128__per_frame",
+        "domain": "on_disk_aligned_cache_files_exact_disk_ledger",
+        "free_bytes": 3065683968,
+        "ledger_dimension": "disk",
+        "note": "Exact RGB float32 + support bool + one 128-byte .npy header per file; equal to manifest.total_bytes. Accounted in the SEPARATE disk ledger dimension and never added to worker footprints or host RAM.",
+        "required_bytes": 281424168,
+        "residency_bytes": 281424168,
+        "strict_checkpoint": true
+      },
+      "error": null,
+      "frames_participating": null,
+      "incomplete_cells": [],
+      "ledger": {
+        "balanced": true,
+        "credit_wait_events": 2,
+        "credit_wait_s": 2.754550190991722,
+        "device_budget_bytes": 1433967001,
+        "device_leases": 0,
+        "device_peak_bytes": 974984704,
+        "device_used_bytes": 0,
+        "dimensions": {
+          "device": {
+            "budget_bytes": 1433967001,
+            "role": "gpu_workspace_reservation"
+          },
+          "disk": {
+            "budget_bytes": 1532841984,
+            "role": "on_disk_payload_bytes"
+          },
+          "host": {
+            "budget_bytes": 23451246,
+            "role": "resident_process_reservation"
+          }
+        },
+        "disk_budget_bytes": 1532841984,
+        "disk_leases": 0,
+        "disk_peak_bytes": 179224404,
+        "disk_used_bytes": 0,
+        "host_budget_bytes": 23451246,
+        "host_leases": 0,
+        "host_peak_bytes": 23451246,
+        "host_used_bytes": 0,
+        "schema": "zemosaic-r56-bounded-pipeline-v2"
+      },
+      "manifest_path": "/tmp/r56_big/ab_pinned/arm_candidate/zegrid_manifest.json",
+      "mapping": {
+        "backend": "gpu",
+        "cell_task_mode": "stream",
+        "cpu_streaming_tile": null,
+        "gpu_streaming_tile": 512,
+        "phase": "cell_stack_stream",
+        "prefetch_units": 2,
+        "schema": "zemosaic-r55e2-active-gpu-mapping-v1",
+        "single_owner": true,
+        "storage": {
+          "model": "bounded-streaming-v1",
+          "profile": "bounded"
+        },
+        "units_in_flight": 1,
+        "workers_per_unit": 6
+      },
+      "observation": {
+        "note": "These are OBSERVATIONS. They are never compared to the planner's reservation arithmetic as if they were the same quantity.",
+        "observation_caveat": "Peak-SAMPLED at the stated period, not an OS high-water mark. RSS is the sum over the sampled process tree (shared pages counted once per process); VRAM free/total is DEVICE-WIDE while pool_used is this process only.",
+        "process_tree_rss_peak_bytes": 5312466944,
+        "process_tree_rss_peak_per_process_bytes": {
+          "494054": 1247252480,
+          "494285": 678756352,
+          "494286": 663347200,
+          "494287": 661438464,
+          "494288": 697700352,
+          "494289": 673513472,
+          "494290": 690458624
+        },
+        "process_tree_rss_peak_sample_at_s": 14.903500710002845,
+        "process_tree_rss_samples": 267,
+        "process_tree_rss_scope": "runner process + recursive children",
+        "sampler_period_s": 0.1,
+        "sampler_source": "psutil process-tree RSS",
+        "schema": "zemosaic-r56-memory-observation-v1",
+        "system_ram": {
+          "source": "psutil.virtual_memory (SYSTEM-wide)",
+          "virtual_available_bytes": 2025738240,
+          "virtual_total_bytes": 8071180288,
+          "virtual_used_bytes": 6045442048
+        },
+        "vram_device_free_min_bytes": 1522139136,
+        "vram_last": {
+          "device_count": 1,
+          "device_free_bytes": 2048524288,
+          "device_index": 0,
+          "device_total_bytes": 2091253760,
+          "device_used_bytes": 42729472,
+          "pinned_pool_used_bytes": 0,
+          "pool_total_bytes": 0,
+          "pool_used_bytes": 0,
+          "scope": "device_wide_free_total; pool_used is THIS process",
+          "source": "cupy.cuda.runtime.memGetInfo + cupy default pool"
+        },
+        "vram_pool_used_peak_bytes": 444622848,
+        "vram_samples": 267,
+        "vram_unavailable_reason": null
+      },
+      "outputs": {
+        "mosaic_grid.fits": "d1a47319f35402834e989c8f4dfeab7a197ade606cc84aa3aa13e319f63351f8",
+        "mosaic_grid_coverage.fits": "0f01365c14ab36b3c74964fcef4c22a7ae304fdf6243675cd4e51114acfd0f31"
+      },
+      "overlap": {
+        "clock": "time.monotonic",
+        "consumer_units_timed": 6,
+        "consumer_work_s": 18.404110033035977,
+        "intersection_s": 8.869288196059642,
+        "note": "Intersection of the observed produce()/consume() CALL intervals only. Nonzero means both sides performed work concurrently; it is not a queue-capacity or thread-count claim.",
+        "overlap_proved": true,
+        "overlap_units": 3,
+        "producer_units_timed": 6,
+        "producer_work_s": 10.02709228900494,
+        "wall_s": 19.56293401302537
+      },
+      "prefetch_cap_requested": null,
+      "run_policy": {
+        "prefetch_cap_override": null,
+        "prefetch_units": 2,
+        "queue_max": 3
+      },
+      "storage_profile_requested": "bounded",
+      "timings": {
+        "checkpoint_count": 6,
+        "examined_shrink_steps": 0,
+        "heartbeat_calls": 0,
+        "heartbeat_errors": 0,
+        "parent_end": {
+          "current_rss_bytes": 993157120,
+          "peak_rss_bytes": 1389903872,
+          "unavailable_reason": null
+        },
+        "refusal_count": 0,
+        "shrink_count": 0,
+        "total_wall_s": 19.562969887978397,
+        "wave_count": 1
+      },
+      "wall_s": 32.969936306006275
+    }
+  ],
+  "cache_policy": "cold",
+  "comparison": {
+    "complete_cells_identical": true,
+    "frames_identical": true,
+    "outputs_identical": true
+  },
+  "created_at": "2026-10-25T22:59:50Z",
+  "gates": {
+    "observed_memory_available": true,
+    "real_overlap_proved": true,
+    "scientific_outputs_identical": true,
+    "vram_observed": true
+  },
+  "halo_px": 64,
+  "input": "/tmp/r56_big/input",
+  "memory_observation_pinned_bytes": 4294967296,
+  "note": "Reservation numbers (credit_model/ledger) and sampled observations are different quantities and are reported separately. A sampled peak is not an OS high-water mark.",
+  "out": "/tmp/r56_big/ab_pinned",
+  "provenance": {
+    "cpu_count": 8,
+    "cupy_version": "14.1.1",
+    "git_branch": "perf/zegrid-bounded-prefetch",
+    "git_dirty": true,
+    "git_head": "3fa088cf3409f7d19978e28dee171df4bc50bfce",
+    "gpu": {
+      "name": "NVIDIA GeForce MX150",
+      "total_memory_bytes": 2091253760
+    },
+    "machine": "x86_64",
+    "package_version": "ZeMosaic 5.0.0\nWindows x64\nInstaller build\nCuPy CUDA 12.x bundle\nAutomatic CPU fallback enabled",
+    "platform": "Linux-6.12.113+deb13-amd64-x86_64-with-glibc2.41",
+    "python": "3.13.5 (main, Aug 10 2026, 12:06:59) [GCC 14.2.0]",
+    "repo": "/home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch"
+  },
+  "schema": "zemosaic-r56-prefetch-campaign-v1",
+  "use_gpu": true
+}

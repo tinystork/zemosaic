@@ -1245,6 +1245,61 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
 # No CuPy import, no CUDA initialisation: ``consume`` is the caller's callback.
 
 PIPELINE_SCHEMA = "zemosaic-r55e2-bounded-pipeline-v1"
+# ZM-ZEGRID-R56-BOUNDED-PREFETCH: the ledger gained an explicit DISK dimension so
+# that on-disk aligned-cache bytes are never again booked as resident host RAM.
+# The telemetry payload is a superset of v1; every v1 key is still emitted with
+# its historical meaning, so existing consumers stay valid.
+PIPELINE_SCHEMA_V2 = "zemosaic-r56-bounded-pipeline-v2"
+
+#: Kinds understood by :class:`BufferLedger`. ``disk`` exists so a queued
+#: payload's ON-DISK footprint is accounted exactly and separately from the
+#: resident host reservation it also carries.
+LEDGER_KINDS = ("host", "device", "disk")
+
+
+def _intervals_union_intersection_s(a, b) -> float:
+    """Length of the intersection of two unions of half-open intervals.
+
+    Intervals are ``(start, end)`` tuples in the SAME monotonic clock. Used to
+    prove real producer/consumer overlap from observed work intervals only: a
+    nonzero result means work genuinely ran concurrently, never that two
+    threads merely existed.
+    """
+
+    def _merge(items):
+        merged = []
+        for start, end in sorted(
+            (float(s), float(e)) for s, e in items if float(e) > float(s)
+        ):
+            if merged and start <= merged[-1][1]:
+                if end > merged[-1][1]:
+                    merged[-1] = (merged[-1][0], end)
+            else:
+                merged.append((start, end))
+        return merged
+
+    left = _merge(a)
+    right = _merge(b)
+    total = 0.0
+    i = j = 0
+    while i < len(left) and j < len(right):
+        lo = max(left[i][0], right[j][0])
+        hi = min(left[i][1], right[j][1])
+        if hi > lo:
+            total += hi - lo
+        if left[i][1] <= right[j][1]:
+            i += 1
+        else:
+            j += 1
+    return float(total)
+
+
+def _interval_hits_any(interval, others) -> bool:
+    start, end = float(interval[0]), float(interval[1])
+    for other_start, other_end in others:
+        if min(end, float(other_end)) > max(start, float(other_start)):
+            return True
+    return False
 
 
 class PipelineError(RuntimeError):
@@ -1270,11 +1325,21 @@ def _pipeline_int(value, name: str, *, minimum: int = 0) -> int:
 
 
 class BufferLedger:
-    """Exact host/device byte accounting with blocking reservation.
+    """Exact host/device/disk byte accounting with blocking reservation.
 
     ``reserve`` blocks until the requested bytes fit the explicit budget, so a
     caller can never exceed the envelope. A request larger than the whole budget
     fails closed immediately (it could never complete).
+
+    Three independent dimensions are tracked:
+
+    * ``host`` — RESIDENT process memory reserved by a queued/consumed payload;
+    * ``device`` — GPU workspace reserved by the consuming unit;
+    * ``disk`` — ON-DISK bytes retained for a queued/consumed payload.
+
+    ``disk`` is deliberately a separate ledger: billing aligned-cache FILE bytes
+    against the resident host budget conflated two different resources and is
+    what made ``prefetch >= 1`` look unaffordable (ZM-ZEGRID-R56).
     """
 
     def __init__(
@@ -1282,6 +1347,7 @@ class BufferLedger:
         *,
         host_budget_bytes: int,
         device_budget_bytes: int,
+        disk_budget_bytes: int = 0,
         clock=time.monotonic,
     ) -> None:
         self.host_budget_bytes = _pipeline_int(
@@ -1290,14 +1356,20 @@ class BufferLedger:
         self.device_budget_bytes = _pipeline_int(
             device_budget_bytes, "device_budget_bytes", minimum=1
         )
+        self.disk_budget_bytes = _pipeline_int(
+            disk_budget_bytes, "disk_budget_bytes", minimum=0
+        )
         self._clock = clock
         self._cond = threading.Condition()
         self._host_used = 0
         self._device_used = 0
+        self._disk_used = 0
         self._host_peak = 0
         self._device_peak = 0
+        self._disk_peak = 0
         self._host_leases: dict[int, int] = {}
         self._device_leases: dict[int, int] = {}
+        self._disk_leases: dict[int, int] = {}
         self._next_lease = 1
         self._wait_events = 0
         self._wait_s = 0.0
@@ -1307,21 +1379,40 @@ class BufferLedger:
             return int(self.host_budget_bytes)
         if kind == "device":
             return int(self.device_budget_bytes)
+        if kind == "disk":
+            return int(self.disk_budget_bytes)
         raise PipelineAccountingError(f"unknown lease kind {kind!r}")
 
     def _used(self, kind: str) -> int:
-        return int(self._host_used if kind == "host" else self._device_used)
+        if kind == "host":
+            return int(self._host_used)
+        if kind == "device":
+            return int(self._device_used)
+        if kind == "disk":
+            return int(self._disk_used)
+        raise PipelineAccountingError(f"unknown lease kind {kind!r}")
 
     def _set_used(self, kind: str, value: int) -> None:
         if kind == "host":
             self._host_used = int(value)
             self._host_peak = max(self._host_peak, int(value))
-        else:
+        elif kind == "device":
             self._device_used = int(value)
             self._device_peak = max(self._device_peak, int(value))
+        elif kind == "disk":
+            self._disk_used = int(value)
+            self._disk_peak = max(self._disk_peak, int(value))
+        else:
+            raise PipelineAccountingError(f"unknown lease kind {kind!r}")
 
     def _leases(self, kind: str) -> dict[int, int]:
-        return self._host_leases if kind == "host" else self._device_leases
+        if kind == "host":
+            return self._host_leases
+        if kind == "device":
+            return self._device_leases
+        if kind == "disk":
+            return self._disk_leases
+        raise PipelineAccountingError(f"unknown lease kind {kind!r}")
 
     def reserve(
         self,
@@ -1381,17 +1472,40 @@ class BufferLedger:
     def snapshot(self) -> dict:
         with self._cond:
             return {
+                "schema": PIPELINE_SCHEMA_V2,
                 "host_budget_bytes": int(self.host_budget_bytes),
                 "device_budget_bytes": int(self.device_budget_bytes),
+                "disk_budget_bytes": int(self.disk_budget_bytes),
                 "host_used_bytes": int(self._host_used),
                 "host_peak_bytes": int(self._host_peak),
                 "device_used_bytes": int(self._device_used),
                 "device_peak_bytes": int(self._device_peak),
+                "disk_used_bytes": int(self._disk_used),
+                "disk_peak_bytes": int(self._disk_peak),
                 "host_leases": len(self._host_leases),
                 "device_leases": len(self._device_leases),
+                "disk_leases": len(self._disk_leases),
                 "credit_wait_events": int(self._wait_events),
                 "credit_wait_s": float(self._wait_s),
-                "balanced": not self._host_leases and not self._device_leases,
+                "balanced": (
+                    not self._host_leases
+                    and not self._device_leases
+                    and not self._disk_leases
+                ),
+                "dimensions": {
+                    "host": {
+                        "budget_bytes": int(self.host_budget_bytes),
+                        "role": "resident_process_reservation",
+                    },
+                    "device": {
+                        "budget_bytes": int(self.device_budget_bytes),
+                        "role": "gpu_workspace_reservation",
+                    },
+                    "disk": {
+                        "budget_bytes": int(self.disk_budget_bytes),
+                        "role": "on_disk_payload_bytes",
+                    },
+                },
             }
 
 
@@ -1423,8 +1537,10 @@ class BoundedPipeline:
         prefetch_units: int,
         host_budget_bytes: int,
         device_budget_bytes: int,
+        disk_budget_bytes: int = 0,
         host_bytes=lambda payload: 0,
         device_bytes=lambda payload: 0,
+        disk_bytes=lambda payload: 0,
         clock=time.monotonic,
         thread_join_s: float = 30.0,
         stall_timeout_s=None,
@@ -1451,6 +1567,7 @@ class BoundedPipeline:
         self._release_payload = release
         self._host_bytes_fn = host_bytes
         self._device_bytes_fn = device_bytes
+        self._disk_bytes_fn = disk_bytes
         self._prefetch_units = _pipeline_int(
             prefetch_units, "prefetch_units", minimum=0
         )
@@ -1463,6 +1580,7 @@ class BoundedPipeline:
         self._ledger = BufferLedger(
             host_budget_bytes=host_budget_bytes,
             device_budget_bytes=device_budget_bytes,
+            disk_budget_bytes=disk_budget_bytes,
             clock=clock,
         )
         self._queue: "queue.Queue" = queue.Queue(maxsize=self._queue_max)
@@ -1481,6 +1599,15 @@ class BoundedPipeline:
         self._queue_depth_samples = 0
         self._queue_depth_sum = 0
         self._consumer_idle_s = 0.0
+        # ZM-ZEGRID-R56: observed work intervals (monotonic seconds). Only the
+        # produce() and consume() CALLS are timed, so an intersection is real
+        # concurrent work, never queue capacity or two live threads.
+        self._producer_intervals: list[tuple[float, float]] = []
+        self._consumer_intervals: list[tuple[float, float]] = []
+        self._producer_work_s = 0.0
+        self._consumer_work_s = 0.0
+        self._run_started_at: float | None = None
+        self._run_ended_at: float | None = None
         self._producer_backpressure_events = 0
         self._producer_backpressure_s = 0.0
         self._producer_thread: threading.Thread | None = None
@@ -1540,6 +1667,8 @@ class BoundedPipeline:
                 self._ledger.release("device", int(unit["device_lease"]))
             if unit.get("host_lease") is not None:
                 self._ledger.release("host", int(unit["host_lease"]))
+            if unit.get("disk_lease") is not None:
+                self._ledger.release("disk", int(unit["disk_lease"]))
         finally:
             unit["released"] = True
             self._released += 1
@@ -1585,7 +1714,17 @@ class BoundedPipeline:
                     return
                 self._producer_task_index = int(index)
                 self._producer_task_started_at = float(self._clock())
-                payload = self._produce(task)
+                _produce_started = float(self._clock())
+                try:
+                    payload = self._produce(task)
+                finally:
+                    _produce_ended = float(self._clock())
+                    self._producer_intervals.append(
+                        (_produce_started, _produce_ended)
+                    )
+                    self._producer_work_s += max(
+                        0.0, _produce_ended - _produce_started
+                    )
                 self._producer_task_index = None
                 self._producer_task_started_at = None
                 self._last_progress_at = float(self._clock())
@@ -1603,6 +1742,7 @@ class BoundedPipeline:
                     "device_bytes": None,
                     "host_lease": None,
                     "device_lease": None,
+                    "disk_lease": None,
                     "released": False,
                 }
                 # ``units_produced`` counts OWNED payloads (produce returned),
@@ -1619,11 +1759,23 @@ class BoundedPipeline:
                     device_need = _pipeline_int(
                         self._device_bytes_fn(payload), "device_bytes", minimum=0
                     )
+                    disk_need = _pipeline_int(
+                        self._disk_bytes_fn(payload), "disk_bytes", minimum=0
+                    )
                     unit["host_bytes"] = int(host_need)
                     unit["device_bytes"] = int(device_need)
+                    unit["disk_bytes"] = int(disk_need)
                     unit["host_lease"] = self._ledger.reserve(
                         "host", host_need, cancel_event=self._cancel
                     )
+                    # Disk is a SEPARATE resource: a payload's bytes on the
+                    # aligned cache are not resident RAM. When no disk budget is
+                    # declared the dimension stays inert (zero-byte leases
+                    # only), preserving the historical v1 behaviour exactly.
+                    if int(self._ledger.disk_budget_bytes) > 0:
+                        unit["disk_lease"] = self._ledger.reserve(
+                            "disk", disk_need, cancel_event=self._cancel
+                        )
                     self._put(unit)
                 except BaseException:
                     # Covers host-credit cancellation, accounting refusal and
@@ -1712,7 +1864,17 @@ class BoundedPipeline:
                     int(unit["device_bytes"]),
                     cancel_event=self._cancel,
                 )
-                result = self._consume(unit["payload"])
+                _consume_started = float(self._clock())
+                try:
+                    result = self._consume(unit["payload"])
+                finally:
+                    _consume_ended = float(self._clock())
+                    self._consumer_intervals.append(
+                        (_consume_started, _consume_ended)
+                    )
+                    self._consumer_work_s += max(
+                        0.0, _consume_ended - _consume_started
+                    )
                 self._transfers += 1
             except PipelineCancelled:
                 return
@@ -1779,6 +1941,7 @@ class BoundedPipeline:
         self._owner_thread_name = threading.current_thread().name
         self._owner_thread_ident = threading.get_ident()
         self._last_progress_at = float(self._clock())
+        self._run_started_at = float(self._clock())
         self._producer_thread = threading.Thread(
             target=self._producer_run,
             name="r55e2-pipeline-producer",
@@ -1806,6 +1969,7 @@ class BoundedPipeline:
                 and self._producer_thread.is_alive()
             )
         self._drain()
+        self._run_ended_at = float(self._clock())
         ledger = self._ledger.snapshot()
 
         if interrupt is not None:
@@ -1859,8 +2023,22 @@ class BoundedPipeline:
         neither count claims a GPU transfer (``transfers`` does that).
         """
         ledger = self._ledger.snapshot()
+        overlap_s = _intervals_union_intersection_s(
+            self._producer_intervals, self._consumer_intervals
+        )
+        overlap_units = sum(
+            1
+            for interval in self._consumer_intervals
+            if _interval_hits_any(interval, self._producer_intervals)
+        )
+        wall_s = (
+            None
+            if self._run_started_at is None or self._run_ended_at is None
+            else max(0.0, float(self._run_ended_at) - float(self._run_started_at))
+        )
         return {
             "schema": PIPELINE_SCHEMA,
+            "schema_v2": PIPELINE_SCHEMA_V2,
             "units_total": int(len(self._tasks)),
             "units_produced": int(self._produced),
             "units_consumed": int(self._consumed),
@@ -1900,6 +2078,24 @@ class BoundedPipeline:
             "ledger": ledger,
             "transfers": int(self._transfers),
             "consumer_idle_s": float(self._consumer_idle_s),
+            # ZM-ZEGRID-R56: OBSERVED producer/consumer overlap witness.
+            "observed_overlap": {
+                "clock": "time.monotonic",
+                "producer_work_s": float(self._producer_work_s),
+                "consumer_work_s": float(self._consumer_work_s),
+                "wall_s": wall_s,
+                "intersection_s": float(overlap_s),
+                "overlap_units": int(overlap_units),
+                "consumer_units_timed": int(len(self._consumer_intervals)),
+                "producer_units_timed": int(len(self._producer_intervals)),
+                "overlap_proved": bool(overlap_s > 0.0 and overlap_units > 0),
+                "note": (
+                    "Intersection of the observed produce()/consume() CALL "
+                    "intervals only. Nonzero means both sides performed work "
+                    "concurrently; it is not a queue-capacity or thread-count "
+                    "claim."
+                ),
+            },
             "producer_backpressure_events": int(
                 self._producer_backpressure_events
             ),

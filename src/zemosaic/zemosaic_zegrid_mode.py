@@ -828,6 +828,41 @@ def _r55_cache_unit_bytes(
     return int(per_frame) * int(frames)
 
 
+#: ZM-ZEGRID-R56-BOUNDED-PREFETCH: identity of the PLAN/ADMIT/RUN credit model.
+#: Versioned because the meaning of a prefetch credit CHANGED from "on-disk
+#: aligned-cache bytes billed as host RAM" to "resident host staging bytes",
+#: with the on-disk bytes moved to their own exact ledger dimension.
+_R55_PREFETCH_CREDIT_SCHEMA = "r56-bounded-prefetch-credit-v1"
+
+
+def _r55_prefetch_resident_bytes(
+    *, storage_profile, per_unit_cache_bytes, worst_patch_px, channels=3
+) -> int:
+    """RESIDENT host bytes reserved by ONE queued prefetch slot.
+
+    Before this mission a prefetch slot was billed the FULL aligned-cache byte
+    count as if it were resident RAM (``per_unit_prefetch_bytes ==
+    per_unit_cache``). That is only true for the DENSE provider, which keeps
+    ``2N`` memmaps (and their hot pages) alive for the whole Cell.
+
+    Under the BOUNDED provider no mapping outlives a single access: the cache
+    stays on disk and every access returns an OWNED copy. A queued slot therefore
+    retains metadata only; the largest transient owned copy the provider ever
+    makes for one access is ONE worst-patch RGB float32 plane plus its bool
+    support plane. Charging exactly that is a conservative, DERIVED reservation
+    -- it is neither zero nor a guessed tile slice, and the exact on-disk bytes
+    remain accounted in their own ``disk`` dimension.
+
+    ``dense`` returns the historical value byte for byte.
+    """
+    profile = zsp.normalize_storage_profile(storage_profile)
+    if not zsp.is_bounded(profile):
+        return int(per_unit_cache_bytes)
+    px = max(0, int(worst_patch_px))
+    return int(px) * (int(channels) * _R55_CACHE_RGB_DTYPE_BYTES
+                      + _R55_CACHE_SUPPORT_DTYPE_BYTES)
+
+
 def _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
     """Yield per-Cell dicts with BOTH in-memory and streaming peak bounds.
 
@@ -5523,6 +5558,18 @@ def _r55_active_facts(
         "worst_patch_px": int(worst_patch_px),
         "worst_patch_hw": (int(worst_patch_hw[0]), int(worst_patch_hw[1])),
         "per_unit_cache": int(per_unit_cache),
+        # ZM-ZEGRID-R56: the SEPARATED per-prefetch-slot model. ``per_unit_cache``
+        # stays the EXACT on-disk cache bound; these two are the RUN/PLAN credit.
+        "per_unit_prefetch_host": int(
+            _r55_prefetch_resident_bytes(
+                storage_profile=_STACK_STORAGE_PROFILE,
+                per_unit_cache_bytes=int(per_unit_cache),
+                worst_patch_px=int(worst_patch_px),
+                channels=int(channels),
+            )
+        ),
+        "per_unit_prefetch_disk": int(per_unit_cache),
+        "prefetch_credit_schema": _R55_PREFETCH_CREDIT_SCHEMA,
         "inmem_worst": int(max(1, inmem_worst)),
         "inmem_worst_actual": int(inmem_worst_actual),
         "stream_worst_by_tile": dict(stream_worst_by_tile),
@@ -5887,6 +5934,14 @@ _R55E2_GPU_MISSION = "ZM-ZEGRID-R55-E2-ACTIVE-GPU-PREFETCH-20261024"
 _R55E2_PREFETCH_LADDER = (0, 1, 2, 3, 4)
 _R55E2_PREFETCH_DEFAULT = 2
 
+#: ZM-ZEGRID-R56-BOUNDED-PREFETCH: MEASUREMENT-ONLY prefetch cap.
+#: ``None`` (the product default) changes nothing. A campaign runner may set an
+#: integer to force a SHRINK-ONLY cap (e.g. 0 for the credit control arm) so the
+#: before/after comparison runs the SAME binary with the SAME planner, and the
+#: A/B difference is ONLY the number of staged slots. It can never raise the
+#: admitted prefetch and is recorded in the RUN policy block.
+_R55E2_MEASURE_PREFETCH_CAP = None
+
 # Finite bound for joining the ASYNC PRODUCER once the pipeline has reached a
 # terminal state (sentinel, error or cancellation). It is NOT a per-unit work
 # budget: the GPU consumer runs on the calling thread, so a healthy cell that
@@ -6194,7 +6249,10 @@ def _r55_active_gpu_decide(
                 (int(t), int(gpu_host_bound_by_tile[int(t)]))
                 for t in gpu_tiles
             ),
-            per_unit_prefetch_bytes=int(base["per_unit_cache"]),
+            per_unit_prefetch_bytes=int(base["per_unit_prefetch_host"]),
+            # ZM-ZEGRID-R56: the ON-DISK bytes of a prefetch slot, accounted in
+            # the scheduler's separate disk-residency term (never host RAM).
+            per_unit_prefetch_disk_bytes=int(base["per_unit_prefetch_disk"]),
             time_model=None,
             profile=None,
         )
@@ -10642,11 +10700,30 @@ def _run_single(
         workers = int(gpu_mapping["workers_per_unit"])
         prefetch = int(gpu_mapping["prefetch_units"])
         queue_max = int(prefetch + 1)
+        _measure_cap = _R55E2_MEASURE_PREFETCH_CAP
+        if _measure_cap is not None:
+            # SHRINK-ONLY measurement seam: never raises the admitted depth.
+            prefetch = min(int(prefetch), max(0, int(_measure_cap)))
+            queue_max = int(prefetch + 1)
         device_peak = int(gpu_decision.device_peak_bytes_by_tile[tile])
         device_budget = int(gpu_decision.qualification["budget_bytes"])
         vram_percent = int(gpu_decision.qualification["percent"])
         per_unit_cache = int(gpu_decision.facts["per_unit_cache"])
-        unit_host = max(1, int(per_unit_cache))
+        # ZM-ZEGRID-R56-BOUNDED-PREFETCH: the RUN credit is the SAME separated
+        # model the PLAN/ADMIT used, so the three phases cannot disagree.
+        #   host  -> resident staging bytes for ONE queued slot (profile-aware)
+        #   disk  -> exact aligned-cache bytes for ONE queued slot
+        unit_host = max(1, int(gpu_decision.facts["per_unit_prefetch_host"]))
+        unit_disk = max(1, int(gpu_decision.facts["per_unit_prefetch_disk"]))
+        bounded_storage = bool(
+            zsp.is_bounded(
+                str(
+                    gpu_decision.facts.get("storage_profile")
+                    or getattr(gpu_decision, "storage_profile", None)
+                    or _STACK_STORAGE_PROFILE
+                )
+            )
+        )
         host_budget = min(
             int(gpu_bundle.envelope.budget_bytes),
             int(unit_host) * int(queue_max),
@@ -10656,6 +10733,19 @@ def _run_single(
                 renv.REASON_REFUSE_HOST_RAM,
                 "the ACTIVE GPU pipeline cannot stage even one unit within the "
                 f"fresh 90 % host budget ({host_budget} B < {unit_host} B)",
+            )
+        # Disk is its own exact dimension. The scheduler priced it as
+        # ``(prefetch + 1) * per_unit_cache`` against HALF the free volume; RUN
+        # re-declares that same budget and fails closed BEFORE staging if the
+        # volume can no longer hold the queue.
+        disk_free_run = int(gpu_decision.facts.get("disk_free", 0) or 0)
+        disk_budget = int(disk_free_run) // 2
+        disk_required = int(unit_disk) * int(queue_max)
+        if int(disk_budget) < int(disk_required):
+            raise _R55GpuFallback(
+                renv.REASON_REFUSE_DISK,
+                "the ACTIVE GPU pipeline cannot retain the queued aligned cache "
+                f"within half the free volume ({disk_budget} B < {disk_required} B)",
             )
         gpu_cfg = replace(science_config, backend="gpu")
         _init_stack_worker(
@@ -10751,6 +10841,17 @@ def _run_single(
         def _host_bytes(payload):
             if payload.get("_empty_unit"):
                 return 0
+            if bounded_storage:
+                # No mapping outlives an access: a queued slot reserves only its
+                # derived resident staging bound, never the on-disk payload.
+                return int(unit_host)
+            # dense: the historical contract, byte for byte (2N live memmaps).
+            return int(payload["manifest"].get("total_bytes", 0))
+
+        def _disk_bytes(payload):
+            if payload.get("_empty_unit"):
+                return 0
+            # EXACT on-disk aligned-cache bytes (== manifest.total_bytes).
             return int(payload["manifest"].get("total_bytes", 0))
 
         def _device_bytes(payload):
@@ -11188,8 +11289,10 @@ def _run_single(
             prefetch_units=prefetch,
             host_budget_bytes=int(host_budget_val),
             device_budget_bytes=int(max(device_budget, initial_device_peak)),
+            disk_budget_bytes=int(disk_budget),
             host_bytes=_host_bytes,
             device_bytes=_device_bytes,
+            disk_bytes=_disk_bytes,
             thread_join_s=float(_R55E2_PIPELINE_JOIN_S),
             # No internal per-unit stall budget: honest liveness for a long
             # healthy GPU cell is "the caller is still inside consume". Only a
@@ -11472,6 +11575,11 @@ def _run_single(
                 "units_in_flight": 1,
                 "prefetch_ladder": [int(p) for p in _R55E2_PREFETCH_LADDER],
                 "prefetch_units": int(prefetch),
+                "prefetch_cap_override": (
+                    None
+                    if _R55E2_MEASURE_PREFETCH_CAP is None
+                    else int(_R55E2_MEASURE_PREFETCH_CAP)
+                ),
                 "queue_max": int(queue_max),
                 "vram_percent": int(vram_percent),
                 "vram_budget_bytes": int(device_budget),
@@ -11489,18 +11597,37 @@ def _run_single(
                         per_unit_cache * (int(prefetch) + 1)
                     ),
                     "bytes_contract": _R55_CACHE_BYTES_CONTRACT,
-                    "domain": (
-                        "on_disk_aligned_cache_files_used_as_host_staging_credit"
-                    ),
+                    "domain": "on_disk_aligned_cache_files_exact_disk_ledger",
+                    "ledger_dimension": "disk",
+                    "budget_bytes": int(disk_budget),
+                    "required_bytes": int(disk_required),
                     "note": (
                         "Exact RGB float32 + support bool + one 128-byte .npy "
-                        "header per file; equal to manifest.total_bytes. Not a "
-                        "resident-RAM model; never added to worker footprints."
+                        "header per file; equal to manifest.total_bytes. "
+                        "Accounted in the SEPARATE disk ledger dimension and "
+                        "never added to worker footprints or host RAM."
                     ),
                     "free_bytes": int(
                         gpu_decision.facts.get("disk_free", 0)
                     ),
                     "strict_checkpoint": True,
+                },
+                "credit_model": {
+                    "schema": _R55_PREFETCH_CREDIT_SCHEMA,
+                    "storage_profile": (
+                        "bounded" if bounded_storage else "dense"
+                    ),
+                    "per_unit_prefetch_host_bytes": int(unit_host),
+                    "per_unit_prefetch_disk_bytes": int(unit_disk),
+                    "per_unit_cache_disk_bytes": int(per_unit_cache),
+                    "host_budget_bytes": int(host_budget),
+                    "disk_budget_bytes": int(disk_budget),
+                    "queue_max": int(queue_max),
+                    "note": (
+                        "A prefetch slot reserves RESIDENT host staging bytes "
+                        "(profile-aware) and EXACT on-disk cache bytes in "
+                        "independent ledgers. The two are never added."
+                    ),
                 },
                 "checkpoint": "mandatory_before_every_unit",
                 "shrink_order": [
@@ -11523,6 +11650,8 @@ def _run_single(
             ),
             "tile_adaptation": runtime_tile,
             "engine_provenance": _r55_engine_provenance(),
+            # ZM-ZEGRID-R56: OBSERVED overlap witness (never part of a plan hash).
+            "overlap": dict(pipeline_telemetry.get("observed_overlap") or {}),
             "shrink_count": int(len(_r55_active_trail)),
             "runtime_shrink_count": int(len(runtime_tile["shrink_history"])),
             "examined_shrink_steps": int(
