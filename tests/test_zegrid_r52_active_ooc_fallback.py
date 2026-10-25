@@ -316,20 +316,67 @@ def _pressure_env(tmp_path, monkeypatch, *, dense_mib, bounded_mib, raw):
     return inp, out, holder
 
 
-def test_runtime_governing_budget_refuses_both_profiles(tmp_path, monkeypatch):
-    """The governing (latched) budget is too low for dense AND bounded."""
+def _eligible_refusal(raw, *, wave_index=1, remaining_units=3):
+    return zz._R55RunRefused(
+        zz.renv.REASON_REFUSE_HOST_RAM,
+        "injected measured host-RAM shortage",
+        record={
+            "schema": zz.zrt.RUN_CONTROL_SCHEMA,
+            "status": "refused",
+            "stage": "run_checkpoint",
+            "reason_code": zz.renv.REASON_REFUSE_HOST_RAM,
+            "detail": "injected measured host-RAM shortage",
+            "wave_index": int(wave_index),
+            "remaining_units": int(remaining_units),
+            "host": {
+                "raw_available_bytes": int(raw),
+                "budget_bytes": int(zz.zrt.run_budget_bytes(int(raw))),
+                "factor_num": int(zz.rcontract.ADMIT_FACTOR_NUM),
+                "factor_den": int(zz.rcontract.ADMIT_FACTOR_DEN),
+            },
+            "last_candidate": {"injected": True},
+            "shrink_steps": [],
+            "unavailable_shrinks": [],
+        },
+        storage_fallback_eligible=True,
+    )
+
+
+def test_runtime_retry_terminal_refusal_clears_eligibility(
+    tmp_path, monkeypatch,
+):
+    """L-1: a bounded RETRY refusal is terminal (no second fallback)."""
     inp, out, _h = _pressure_env(
         tmp_path, monkeypatch, dense_mib=1024, bounded_mib=4,
         raw=_DENSE_OK_RAW,
     )
-    _inject_wave1_latched(monkeypatch, 8 * MIB)
+    governing = int(1.4 * 2 ** 30)
+    _inject_wave1_latched(monkeypatch, governing)
+    real_checkpoint = zz._r55_run_checkpoint
+    calls = {"n": 0}
+
+    def _checkpoint(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # Dense wave-1 refusal (valid measured shortage) -> recovery runs.
+            raise _eligible_refusal(governing, wave_index=1,
+                                    remaining_units=kwargs["remaining_units"])
+        if calls["n"] == 3:
+            # The bounded RETRY of the SAME boundary refuses as well.
+            raise _eligible_refusal(governing, wave_index=1,
+                                    remaining_units=kwargs["remaining_units"])
+        return real_checkpoint(**kwargs)
+
+    monkeypatch.setattr(zz, "_r55_run_checkpoint", _checkpoint)
     with pytest.raises(zz._R55RunRefused) as ei:
         zz.run_zegrid_mode(
             str(inp), str(out), zconfig=_active_zconfig("active"),
             zegrid_halo_px=8,
         )
-    assert ei.value.reason_code == zz.renv.REASON_REFUSE_HOST_RAM
-    assert ei.value.storage_fallback_eligible is True
+    assert calls["n"] >= 3
+    assert ei.value.storage_fallback_eligible is False
+    assert ei.value.record["storage_fallback_eligible"] is False
+    assert ei.value.record["fallback_exhausted"] is True
     assert zz._STORAGE_EFFECTIVE == "bounded"
     assert zz._STORAGE_FALLBACK_COUNT == 1
     assert not (out / "mosaic_grid.fits").exists()
@@ -403,6 +450,60 @@ def test_runtime_disk_shortage_never_falls_back_public(tmp_path, monkeypatch):
     assert ei.value.reason_code == zz.renv.REASON_REFUSE_DISK
     assert ei.value.storage_fallback_eligible is False
     assert ei.value.record["classification"]["saw_disk"] is True
+    assert zz._STORAGE_EFFECTIVE == "dense"
+    assert zz._STORAGE_FALLBACK_COUNT == 0
+    assert not (out / "mosaic_grid.fits").exists()
+    assert not (out / "zegrid_manifest.json").exists()
+
+
+def test_runtime_vram_refusal_stays_vram_and_never_eligible(
+    tmp_path, monkeypatch,
+):
+    """L-3: a VRAM refusal at the final rung keeps its code, never RAM."""
+    from dataclasses import replace
+
+    inp, out, _h = _pressure_env(
+        tmp_path, monkeypatch, dense_mib=1024, bounded_mib=4,
+        raw=_DENSE_OK_RAW,
+    )
+    real_materialize = zz.zsched.materialize_active_candidate
+    real_admit = zz._r55_active_admit
+    state = {"armed": False, "vram": 0}
+
+    def _admit(*args, **kwargs):
+        result = real_admit(*args, **kwargs)
+        state["armed"] = True
+        return result
+
+    def _materialize(context, candidate):
+        if state["armed"]:
+            state["vram"] += 1
+            return replace(
+                candidate,
+                feasible=False,
+                reason_code=zz.renv.REASON_REFUSE_VRAM,
+                infeasible_reason="injected VRAM shortfall at the last rung",
+            )
+        return real_materialize(context, candidate)
+
+    monkeypatch.setattr(zz, "_r55_active_admit", _admit)
+    monkeypatch.setattr(zz.zsched, "materialize_active_candidate", _materialize)
+    monkeypatch.setattr(
+        zz.zsched, "next_shrink", lambda current, ctx: (None, None)
+    )
+    with pytest.raises(zz._R55RunRefused) as ei:
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=_active_zconfig("active"),
+            zegrid_halo_px=8,
+        )
+    assert state["vram"] >= 1
+    assert ei.value.reason_code == zz.renv.REASON_REFUSE_VRAM
+    assert ei.value.storage_fallback_eligible is False
+    assert ei.value.record["classification"]["saw_non_memory"] is True
+    assert (
+        ei.value.record["classification"]["non_memory_reason"]
+        == zz.renv.REASON_REFUSE_VRAM
+    )
     assert zz._STORAGE_EFFECTIVE == "dense"
     assert zz._STORAGE_FALLBACK_COUNT == 0
     assert not (out / "mosaic_grid.fits").exists()

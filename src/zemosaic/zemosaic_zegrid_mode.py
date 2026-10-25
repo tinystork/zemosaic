@@ -8235,6 +8235,12 @@ def _r55_run_checkpoint(
         not _current_feasible
         and materialized.reason_code in _NON_MEMORY_REFUSALS
     )
+    # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-3 (L-3): keep the SPECIFIC non-memory
+    # refusal code for diagnostics (e.g. VRAM) instead of flattening everything
+    # to INTERNAL at exhaustion. Eligibility is unaffected (non-RAM => False).
+    non_memory_reason = (
+        materialized.reason_code if saw_non_memory else None
+    )
     current = candidate
     while True:
         step_name, nxt = zsched.next_shrink(current, ctx)
@@ -8244,7 +8250,13 @@ def _r55_run_checkpoint(
             if saw_disk:
                 reason = renv.REASON_REFUSE_DISK
             elif saw_non_memory or not saw_host_ram:
-                reason = renv.REASON_INTERNAL_ERROR
+                # Preserve a SPECIFIC non-memory refusal code (VRAM) when it is
+                # the cause; other non-memory causes stay INTERNAL_ERROR.
+                reason = (
+                    renv.REASON_REFUSE_VRAM
+                    if non_memory_reason == renv.REASON_REFUSE_VRAM
+                    else renv.REASON_INTERNAL_ERROR
+                )
             else:
                 reason = renv.REASON_REFUSE_HOST_RAM
             detail = (
@@ -8263,6 +8275,7 @@ def _r55_run_checkpoint(
                 "saw_disk": bool(saw_disk),
                 "saw_host_ram": bool(saw_host_ram),
                 "saw_non_memory": bool(saw_non_memory),
+                "non_memory_reason": non_memory_reason,
             }
             and_eligible = bool(
                 reason == renv.REASON_REFUSE_HOST_RAM
@@ -8302,6 +8315,7 @@ def _r55_run_checkpoint(
             saw_host_ram = True
         elif materialized.reason_code in _NON_MEMORY_REFUSALS:
             saw_non_memory = True
+            non_memory_reason = materialized.reason_code
         if materialized.reason_code == renv.REASON_REFUSE_DISK:
             saw_disk = True
         disk_ok = int(materialized.disk_bytes) <= int(disk_free)
@@ -9963,13 +9977,26 @@ def _run_single(
                 _stack_rep.progress(idx, item_id=cid)
             return _cb
 
-        def _terminalize_refusal(exc, *, wave_index, offset):
+        def _terminalize_refusal(exc, *, wave_index, offset,
+                                 fallback_exhausted=False):
             """Record/clean the terminal refusal of the CURRENT boundary.
 
-            Used both when no recovery is allowed and when the bounded retry
-            under the governing observation also refuses: the original
-            structured reason/eligibility is preserved verbatim.
+            Two distinct paths:
+
+            * ``fallback_exhausted=False`` — no recovery was permitted (or the
+              recovery refused before a bounded retry).  The DENSE refusal is
+              terminalized verbatim, keeping its structured reason/eligibility.
+            * ``fallback_exhausted=True`` — the bounded retry of the SAME
+              boundary refused.  The bounded refusal is terminalized, but the
+              single allowed profile fallback is already spent, so its
+              ``storage_fallback_eligible`` is forced to False and
+              ``fallback_exhausted=True`` is published.  This prevents a log
+              reader from assuming a second fallback remains available.
             """
+            if fallback_exhausted:
+                exc.storage_fallback_eligible = False
+                exc.record["storage_fallback_eligible"] = False
+                exc.record["fallback_exhausted"] = True
             cleanup = []
             for task in all_tasks[:offset]:
                 if task[4] is None:
@@ -10102,7 +10129,8 @@ def _run_single(
                     )
                 except _R55RunRefused as exc2:
                     _terminalize_refusal(
-                        exc2, wave_index=wave_index, offset=offset
+                        exc2, wave_index=wave_index, offset=offset,
+                        fallback_exhausted=True,
                     )
                     raise
 
