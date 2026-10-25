@@ -275,11 +275,21 @@ class ScientificFloors:
 
 
 class LayoutInfeasible(RuntimeError):
-    """Raised when no layout can honour the RAM budget AND the scientific floors."""
+    """Raised when no layout can honour the RAM budget AND the scientific floors.
 
-    def __init__(self, reason: str, floors_report: dict | None = None):
+    ``refusal`` (ZM-ZEGRID-PLAN-REFUSAL-CLASSIFICATION) is an OPTIONAL structured
+    diagnosis of WHY the plan was refused: ``{"kind": "host_ram" | "geometry",
+    "source": <str>, ...facts}``. It exists so downstream eligibility is decided
+    on FACTS rather than on the wording of the message. The parameter is
+    backwards compatible: callers that pass nothing get an empty dict, and the
+    message keeps its historical text.
+    """
+
+    def __init__(self, reason: str, floors_report: dict | None = None,
+                 refusal: dict | None = None):
         super().__init__(reason)
         self.floors_report = floors_report or {}
+        self.refusal = dict(refusal) if refusal else {}
 
 
 # ---------------------------------------------------------------------------

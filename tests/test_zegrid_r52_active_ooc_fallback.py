@@ -172,6 +172,104 @@ def test_memory_refusal_classification_does_not_hide_real_floors():
     assert zz._storage_plan_refusal(ValueError("WCS mismatch"))[0] is False
 
 
+def test_memory_refusal_classification_prefers_structured_payload():
+    """ZM-ZEGRID-PLAN-REFUSAL-CLASSIFICATION: facts decide, not prose."""
+    facts = {
+        "kind": "host_ram",
+        "source": "coarser_rescue",
+        "budget_bytes": int(12844.9 * MIB),
+        "required_bytes": int(14444.7 * MIB),
+        "candidate": {"nx": 1, "ny": 2},
+    }
+    # The REAL Caldwell-shaped message names no "exceeds budget" wording; the
+    # owner's payload alone must qualify it.
+    ram = zal.LayoutInfeasible(
+        "requested halo 128px conflicts with the max_halo_overhead floor "
+        "(0.5363 > 0.5) at the 4x3 factor-1 layout, and the nearest "
+        "floor-feasible COARSER rescue 3x3 needs 14444.7 MiB > budget "
+        "12844.9 MiB (in-memory worst 14444.7 MiB; best CPU streaming tile 128)",
+        refusal=facts,
+    )
+    is_memory, code, detail = zz._storage_plan_refusal(ram)
+    assert is_memory is True
+    assert code == zz.renv.REASON_REFUSE_HOST_RAM
+    assert "14444.7 MiB" in detail
+
+    # A geometry payload is NOT eligible even when the message text WOULD match
+    # the historical legacy regex.
+    geo = zal.LayoutInfeasible(
+        "even the finest floor-feasible layout is infeasible: 999.0 MiB "
+        "exceeds budget 10.0 MiB (legacy-looking text)",
+        refusal={"kind": "geometry", "source": "min_patch_area_floor"},
+    )
+    geo_is_memory, geo_code, _ = zz._storage_plan_refusal(geo)
+    assert geo_is_memory is False
+    assert geo_code is None
+
+
+def test_memory_refusal_classification_is_text_invariant_with_payload():
+    """Rewording a message must never change a payload-backed decision."""
+    facts = {
+        "kind": "host_ram",
+        "source": "finest_candidate",
+        "budget_bytes": 1 * MIB,
+        "required_bytes": 2 * MIB,
+        "candidate": {"nx": 4, "ny": 3},
+    }
+    verbose = zal.LayoutInfeasible(
+        "RAM budget cannot satisfy scientific floors: ... exceeds budget ...",
+        refusal=facts,
+    )
+    terse = zal.LayoutInfeasible(
+        "plan refused",
+        refusal=facts,
+    )
+    assert zz._storage_plan_refusal(verbose)[0] is True
+    assert zz._storage_plan_refusal(verbose)[0] == zz._storage_plan_refusal(terse)[0]
+    assert zz._storage_plan_refusal(terse)[1] == zz.renv.REASON_REFUSE_HOST_RAM
+
+    geo_facts = {"kind": "geometry", "source": "halo_conflict_no_coarser_grid"}
+    assert zz._storage_plan_refusal(
+        zal.LayoutInfeasible("needs 99.0 MiB > budget 1.0 MiB", refusal=geo_facts)
+    )[0] is zz._storage_plan_refusal(
+        zal.LayoutInfeasible("plan refused", refusal=geo_facts)
+    )[0] is False
+
+
+def test_memory_refusal_classification_legacy_messages_unchanged():
+    """No structured payload -> exact historical behaviour (regex + marker)."""
+    # Legacy budget wording still qualifies.
+    legacy_ram = zal.LayoutInfeasible(
+        "RAM budget cannot satisfy scientific floors: even the finest "
+        "floor-feasible layout (5x3) peak bound 28450.7 MiB exceeds budget "
+        "15315.8 MiB"
+    )
+    assert legacy_ram.refusal == {}
+    assert zz._storage_plan_refusal(legacy_ram)[0] is True
+    # Legacy floor wording still does not.
+    legacy_floors = zal.LayoutInfeasible(
+        "min_patch_area floor (4096 px) cannot be satisfied together with the "
+        "budget (search stopped at the floor boundary)"
+    )
+    assert zz._storage_plan_refusal(legacy_floors)[0] is False
+    # The historical memory_exhausted marker still qualifies a rank-window miss.
+    window = zal.LayoutInfeasible(
+        "no layout candidate lies inside the requested refinement-rank window "
+        "(min=12, max=None, cell-count rank)"
+    )
+    assert zz._storage_plan_refusal(window)[0] is False
+    window.memory_exhausted = True
+    assert zz._storage_plan_refusal(window)[0] is True
+
+
+def test_layout_infeasible_refusal_default_is_backwards_compatible():
+    exc = zal.LayoutInfeasible("plain reason")
+    assert exc.refusal == {}
+    assert exc.floors_report == {}
+    report = {"x": 1}
+    assert zal.LayoutInfeasible("plain", report).floors_report == report
+
+
 # ---------------------------------------------------------------------------
 # Public entry — dense success / auto fallback / forced profiles
 # ---------------------------------------------------------------------------
@@ -1102,3 +1200,103 @@ def test_caldwell_816_auto_wired_planner_falls_back_to_bounded(monkeypatch):
     assert len(covered) == 816
     assert covered == {f.frame_id.logical_path for f in frames}
     assert all(t[6] == "bounded" for t in bundle.cell_tasks if t[4] is not None)
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-PLAN-REFUSAL-CLASSIFICATION — mixed halo/memory witness
+# ---------------------------------------------------------------------------
+
+def _write_large_corpus(tmp_path, *, side=512):
+    """Deterministic 2x2 mosaic of ``side``-px TAN frames (no local corpus).
+
+    Large enough that the PRODUCT floors (min_patch_area 50000 px,
+    max_halo_overhead 0.5) are meaningful at halo 128, and small enough that the
+    planner-only witness runs in seconds.
+    """
+    import numpy as np
+    from astropy.io import fits
+    from astropy.wcs import WCS
+
+    scale = 0.001
+    inp = tmp_path / "large_in"
+    inp.mkdir()
+    names = []
+    for i in range(4):
+        col, row = i % 2, i // 2
+        ra = 10.0 + col * side * scale
+        dec = 30.0 - row * side * scale
+        wcs = WCS(naxis=2)
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        wcs.wcs.crval = [ra, dec]
+        wcs.wcs.crpix = [side / 2.0, side / 2.0]
+        wcs.wcs.cd = np.array([[-1.0, 0.0], [0.0, 1.0]]) * scale
+        wcs.array_shape = (side, side)
+        hdu = fits.PrimaryHDU(np.zeros((side, side), dtype=np.float32))
+        hdu.header.update(wcs.to_header(relax=True))
+        hdu.header["EXPTIME"] = 10.0
+        name = f"frame_{i:04d}.fits"
+        hdu.writeto(inp / name, overwrite=True)
+        names.append(name)
+    return inp
+
+
+def test_active_auto_halo_conflict_coarser_rescue_layout_refusal_falls_back_to_bounded(
+    tmp_path, monkeypatch
+):
+    """Halo conflict + coarser rescue over budget => AUTO switches ONCE.
+
+    This is the REAL product decision path (``_plan_bundle_auto``, the planner
+    used by ``run_zegrid_mode``) with the PRODUCT scientific floors untouched:
+    the factor-1 grid is rejected SOLELY by ``max_halo_overhead``, the nearest
+    floor-feasible coarser rescue (1x2) misses the DENSE budget, and the SAME
+    request succeeds under bounded. No science is executed (planner only).
+    """
+    from zemosaic.core.zegrid import geometry as zg
+
+    inp = _write_large_corpus(tmp_path)
+    frames, rejected = zg.read_manifest(inp)
+    assert len(frames) == 4
+    assert rejected == []
+    canvas = zg.build_canvas(frames)
+
+    # PRODUCT floors are used verbatim: no relaxation anywhere in this witness.
+    floors = zal.ScientificFloors()
+    assert floors.min_patch_area_px == 50000
+    assert floors.max_halo_overhead == 0.5
+
+    budget = 4096 * MIB
+    raw = budget * rcontract.PLAN_FACTOR_DEN // rcontract.PLAN_FACTOR_NUM
+
+    # Memory injection (accepted seam): in-memory never fits; the dense
+    # streaming estimate exceeds the budget while the bounded one fits.
+    monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _HugeModel())
+    monkeypatch.setattr(zz, "_estimate_streaming_bytes", _fake_stream_bytes)
+
+    zz._storage_policy_reset(None)
+    bundle = zz._plan_bundle_auto(
+        canvas=canvas, descs=frames, footprints=None,
+        raw=raw, budget=budget, active=True, emit=None,
+        bundle_common={"cpu_count": 2, "gpu_used": False, "cache_root": None,
+                       "halo_px": 128},
+        layout_substep=None,
+    )
+
+    storage = zz._storage_policy_snapshot()
+    assert storage["requested"] == "auto"
+    assert storage["effective"] == "bounded"
+    assert storage["fallback_count"] == 1
+    assert len(storage["transitions"]) == 1
+    assert storage["transitions"][0]["from"] == "dense"
+    assert storage["transitions"][0]["to"] == "bounded"
+    assert storage["dense_refusal"]["phase"] == "plan_layout"
+    assert storage["dense_refusal"]["reason_code"] == zz.renv.REASON_REFUSE_HOST_RAM
+    # Proof the witness exercised the COARSER-rescue memory branch (not a
+    # generic "finest candidate" refusal).
+    assert "nearest floor-feasible COARSER rescue" in storage["dense_refusal"]["detail"]
+    assert "needs 8192.0 MiB > budget 4096.0 MiB" in storage["dense_refusal"]["detail"]
+
+    assert bundle.storage_profile == "bounded"
+    assert (bundle.layout["nx"], bundle.layout["ny"]) == (1, 2)
+    assert bundle.layout["layout_origin"] == "auto_coarser_rescue"
+    assert all(t[6] == "bounded" for t in bundle.cell_tasks if t[4] is not None)
+    assert all(t[4] == "stream" for t in bundle.cell_tasks if t[4] is not None)

@@ -1110,7 +1110,10 @@ def _choose_layout_mode_aware(
     if not (mw > 0 and mh > 0):
         if footprints_in is None and observer is not None:
             observer.end()
-        raise zal.LayoutInfeasible("median projected footprint is degenerate")
+        raise zal.LayoutInfeasible(
+            "median projected footprint is degenerate",
+            refusal={"kind": "geometry", "source": "degenerate_footprint"},
+        )
     if footprints_in is None and observer is not None:
         observer.end()
     if footprints_out is not None:
@@ -1156,7 +1159,10 @@ def _choose_layout_mode_aware(
                 + _dir
             )
             _log(msg, "ERROR")
-            raise zal.LayoutInfeasible(msg)
+            raise zal.LayoutInfeasible(
+                msg,
+                refusal={"kind": "geometry", "source": "pinned_floors"},
+            )
         cells = list(_iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size))
         max_n = max((c["n"] for c in cells), default=0)
         worst_bound = max((min(c["inmem_bound_bytes"], c["stream_bound_bytes"]) for c in cells), default=0)
@@ -1358,7 +1364,18 @@ def _choose_layout_mode_aware(
             "(more cells) or more available RAM would be required."
         )
         _log(msg, "ERROR")
-        raise zal.LayoutInfeasible(msg)
+        raise zal.LayoutInfeasible(
+            msg,
+            refusal={
+                # Default diagnosis for a rank-window refusal. The bundle builder
+                # upgrades it to ``host_ram/refinement_window`` ONLY when a REAL
+                # memory-driven refinement preceded it (the historical
+                # ``memory_exhausted`` marker), so a pinned/user window stays a
+                # geometry refusal.
+                "kind": "geometry",
+                "source": "refinement_rank_window",
+            },
+        )
 
     # ------------------------------------------------------------------
     # ZM-ZEGRID-R55-E6 — bounded COARSER rescue (large user-selected halo)
@@ -1537,6 +1554,25 @@ def _choose_layout_mode_aware(
                 "candidate is assumed to fit and the rescue is not scanned further. "
                 f"{_direction}"
             )
+            _refusal = {
+                # A memory candidate WAS evaluated (the coarser rescue) and it
+                # missed the budget: this is a REAL host-RAM refusal even though
+                # the headline names the halo-floor conflict.
+                "kind": "host_ram",
+                "source": "coarser_rescue",
+                "budget_bytes": int(ram_budget) if ram_budget is not None else 0,
+                "required_bytes": int(
+                    rescue_memory_failure["admissible_bound_bytes"]
+                ),
+                "inmem_worst_bytes": int(
+                    rescue_memory_failure["inmem_worst_bytes"]
+                ),
+                "selected_tile": rescue_memory_failure["selected_tile"],
+                "candidate": {
+                    "nx": int(rescue_memory_failure["nx"]),
+                    "ny": int(rescue_memory_failure["ny"]),
+                },
+            }
         elif not _rescue_allowed:
             msg = (
                 f"{_conflict}. A COARSER layout would be needed to satisfy the halo "
@@ -1545,20 +1581,32 @@ def _choose_layout_mode_aware(
                 "coarsening; the exact geometry is preserved and the plan is refused. "
                 f"{_direction}"
             )
+            _refusal = {
+                "kind": "geometry",
+                "source": "halo_conflict_rank_window",
+            }
         elif not rescue_grids:
             msg = (
                 f"{_conflict}, and no COARSER layout exists "
                 f"(the grid is already {halo_conflict['nx']}x{halo_conflict['ny']}). "
                 f"This is a halo-floor conflict, not a RAM-budget conflict. {_direction}"
             )
+            _refusal = {
+                "kind": "geometry",
+                "source": "halo_conflict_no_coarser_grid",
+            }
         else:
             msg = (
                 f"{_conflict}, and none of the {len(rescue_grids)} deterministic "
                 "COARSER rescue candidates satisfies both scientific floors. This is "
                 f"a halo-floor conflict, not a RAM-budget conflict. {_direction}"
             )
+            _refusal = {
+                "kind": "geometry",
+                "source": "halo_conflict_no_feasible_rescue",
+            }
         _log(msg, "ERROR")
-        raise zal.LayoutInfeasible(msg)
+        raise zal.LayoutInfeasible(msg, refusal=_refusal)
 
     if chosen is None and not candidates:
         # No candidate was ever memory-evaluated and the halo-only case above did
@@ -1574,7 +1622,13 @@ def _choose_layout_mode_aware(
             "patch area; a FINER layout reduces it and cannot help."
         )
         _log(msg, "ERROR")
-        raise zal.LayoutInfeasible(msg)
+        raise zal.LayoutInfeasible(
+            msg,
+            refusal={
+                "kind": "geometry",
+                "source": "min_patch_area_floor",
+            },
+        )
 
     if chosen is None:
         finest = candidates[-1] if candidates else None
@@ -1622,7 +1676,20 @@ def _choose_layout_mode_aware(
             + _finest_dir
         )
         _log(msg, "ERROR")
-        raise zal.LayoutInfeasible(msg)
+        if finest is not None and ram_budget is not None:
+            _refusal = {
+                "kind": "host_ram",
+                "source": "finest_candidate",
+                "budget_bytes": int(ram_budget),
+                "required_bytes": int(finest["bound"]),
+                "inmem_worst_bytes": int(
+                    finest["worst_cell"].get("inmem_worst_bytes", 0)
+                ),
+                "candidate": {"nx": int(finest["nx"]), "ny": int(finest["ny"])},
+            }
+        else:
+            _refusal = {"kind": "geometry", "source": "no_budget_candidate"}
+        raise zal.LayoutInfeasible(msg, refusal=_refusal)
 
     cells = list(_iter_cell_bounds_mode_aware(
         canvas, footprints, chosen["nx"], chosen["ny"], halo_px, tile_size
@@ -2058,6 +2125,13 @@ def _storage_plan_refusal(exc):
     full, programming errors and cancellation are NOT memory refusals and keep
     propagating unchanged.
 
+    ZM-ZEGRID-PLAN-REFUSAL-CLASSIFICATION: eligibility is decided FIRST on the
+    structured ``refusal`` payload attached by the planner (``kind ==
+    "host_ram"`` -> eligible, any other explicit ``kind`` -> NOT eligible). The
+    historical wording regex is kept ONLY as a fallback for exceptions that
+    carry no structured payload (compatibility with older call sites), never as
+    the primary decision when a payload exists.
+
     Returns ``(is_memory, reason_code, detail)``.
     """
     detail = str(exc)
@@ -2065,6 +2139,13 @@ def _storage_plan_refusal(exc):
         # ModeInfeasible means NO stacking mode/geometry fits the RAM budget.
         return True, renv.REASON_REFUSE_HOST_RAM, detail
     if isinstance(exc, zal.LayoutInfeasible):
+        # Structured diagnosis first (facts, not prose).
+        refusal = getattr(exc, "refusal", None)
+        if isinstance(refusal, dict) and refusal.get("kind"):
+            if str(refusal.get("kind")) == "host_ram":
+                return True, renv.REASON_REFUSE_HOST_RAM, detail
+            return False, None, detail
+        # ---- legacy fallback: no structured payload on this exception ----
         # ``LayoutInfeasible`` also covers genuinely invalid scientific floors.
         # Only the explicit budget-miss diagnosis is a real memory refusal: the
         # wording is "...exceeds budget ..." or "...both exceed budget ...".
@@ -4410,6 +4491,15 @@ def _build_execution_bundle(
                 and "refinement-rank window" in str(_layout_exc)
             ):
                 _layout_exc.memory_exhausted = True
+                # Structured upgrade (ZM-ZEGRID-PLAN-REFUSAL-CLASSIFICATION): a
+                # refinement-rank window refusal that follows REAL memory
+                # pressure is a host-RAM refusal, not a geometry one. The
+                # classifier decides on this payload, never on the wording.
+                _layout_exc.refusal = {
+                    "kind": "host_ram",
+                    "source": "refinement_window",
+                    "budget_bytes": int(budget_bytes),
+                }
             raise
         if footprints is None:
             footprints = _fp_out[0] if _fp_out else None
