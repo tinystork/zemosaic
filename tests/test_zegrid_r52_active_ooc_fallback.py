@@ -125,6 +125,54 @@ def _manifest(out):
 # Policy primitives (requested vs effective)
 # ---------------------------------------------------------------------------
 
+
+def test_gpu_host_bound_uses_the_run_storage_profile(monkeypatch):
+    """R56: ACTIVE GPU admission must price the RUN's residency, not dense.
+
+    The dense estimator charges N resident frames; the bounded profile charges
+    ~2. Pricing dense for the GPU host bound refused every candidate on a
+    341-frame corpus (dense 14.03 GiB at tile 128) while the bounded bound is
+    2.15 GiB under the SAME PLAN budget.
+    """
+    n, hw, tiles = 341, (1767, 1330), (128, 256)
+    monkeypatch.setattr(
+        zz, "_STACK_STORAGE_PROFILE", zsp.STORAGE_PROFILE_BOUNDED
+    )
+    bounded = zz._r55_gpu_host_bound_by_tile(
+        max_n=n, worst_hw=hw, tiles=tiles
+    )
+    assert bounded[128] == max(
+        1,
+        zz._profile_stream_bytes(
+            n, hw, 128, zsp.STORAGE_PROFILE_BOUNDED
+        ) - zz.rcontract.PROCESS_BASELINE_BYTES,
+    )
+    assert all(v > 0 for v in bounded.values())
+    assert bounded[128] < bounded[256]
+
+
+def test_gpu_host_bound_dense_profile_stays_dense(monkeypatch):
+    """The dense profile must keep its historical (expensive) pricing."""
+    n, hw, tiles = 341, (1767, 1330), (128,)
+    monkeypatch.setattr(
+        zz, "_STACK_STORAGE_PROFILE", zsp.STORAGE_PROFILE_DENSE
+    )
+    dense = zz._r55_gpu_host_bound_by_tile(
+        max_n=n, worst_hw=hw, tiles=tiles
+    )
+    monkeypatch.setattr(
+        zz, "_STACK_STORAGE_PROFILE", zsp.STORAGE_PROFILE_BOUNDED
+    )
+    bounded = zz._r55_gpu_host_bound_by_tile(
+        max_n=n, worst_hw=hw, tiles=tiles
+    )
+    assert dense[128] > bounded[128]
+    assert dense[128] == max(
+        1,
+        zz._estimate_streaming_bytes(n, hw, 128)
+        - zz.rcontract.PROCESS_BASELINE_BYTES,
+    )
+
 def test_normalize_storage_request_semantics():
     assert zsp.normalize_storage_request(None) == "auto"
     assert zsp.normalize_storage_request("DENSE") == "dense"

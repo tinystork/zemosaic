@@ -5998,6 +5998,29 @@ class _R55GpuActiveDecision:
     gpu_worst_patch_hw: tuple = (1, 1)
 
 
+def _r55_gpu_host_bound_by_tile(*, max_n, worst_hw, tiles):
+    """EXACT per-tile host bound for ACTIVE GPU admission (ADDED peak).
+
+    ZM-ZEGRID-R56-GPU-HOST-BOUND: the bound MUST use the run's storage profile.
+    The dense estimator prices N resident frames; under the bounded profile the
+    real residency is ~2 frames, so pricing dense here refused every GPU
+    candidate on a 341-frame corpus (minimum dense bound 14.03 GiB vs a 13.5 GiB
+    PLAN budget) even though the bounded bound is 2.48 GiB at tile 128. The
+    value stays the ADDED peak above the process baseline (the scheduler counts
+    ``shared_bytes`` once).
+    """
+    return {
+        int(t): max(
+            1,
+            int(_profile_stream_bytes(
+                max_n, worst_hw, int(t), _STACK_STORAGE_PROFILE
+            ))
+            - int(rcontract.PROCESS_BASELINE_BYTES),
+        )
+        for t in tiles
+    }
+
+
 def _r55_active_gpu_decide(
     *,
     bundle,
@@ -6114,14 +6137,9 @@ def _r55_active_gpu_decide(
     }
     # R55-E8: the GPU host bound is the ADDED streaming peak (baseline already
     # counted once as ``shared_bytes``), never the total that double-counts it.
-    gpu_host_bound_by_tile = {
-        int(t): max(
-            1,
-            int(_estimate_streaming_bytes(max_n, worst_hw, int(t)))
-            - int(rcontract.PROCESS_BASELINE_BYTES),
-        )
-        for t in gpu_tiles
-    }
+    gpu_host_bound_by_tile = _r55_gpu_host_bound_by_tile(
+        max_n=max_n, worst_hw=worst_hw, tiles=gpu_tiles
+    )
 
     qualification = zgr.qualify_gpu_execution(
         requested=True,
