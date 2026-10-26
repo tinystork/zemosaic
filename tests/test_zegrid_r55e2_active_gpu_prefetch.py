@@ -887,7 +887,8 @@ def test_admission_p2_to_p0_survives_final_manifest(
     # The PLAN candidate may still be p2; the EXECUTED identity is p0 and the
     # final manifest must be internally coherent (the run would have raised
     # ActivePlanRejected otherwise).
-    assert int(block["initial_candidate"]["prefetch_units"]) >= 0
+    # The PLAN winner is p2; the EXECUTED identity is the admitted p0.
+    assert int(block["initial_candidate"]["prefetch_units"]) == 2
     assert int(block["mapping"]["prefetch_units"]) == 0
     assert int(block["run"]["final_execution"]["prefetch_units"]) == 0
     assert int(block["final_envelope"]["prefetch_units"]) == 0
@@ -899,9 +900,25 @@ def test_admission_p2_to_p0_survives_final_manifest(
         zz._R55_PREFETCH_CREDIT_SCHEMA
     )
     assert block["status"] == "executed"
+    # RUN checkpoints publish the SAME effective p0 projection as the envelope:
+    # at p0, projected == stack_total (shared + added, no producer owner).
+    effective_projection = int(block["final_envelope"]["stack_total_bytes"])
+    assert int(block["final_envelope"]["aggregate_bytes"]) == effective_projection
+    assert int(block["run"]["checkpoints"][-1]["aggregate_bytes"]) == (
+        effective_projection
+    )
+    assert int(
+        manifest["r55_run_telemetry"]["checkpoints"][-1]["aggregate_bytes"]
+    ) == effective_projection
+    assert all(
+        int(cp["aggregate_bytes"]) == effective_projection
+        for cp in block["run"]["checkpoints"]
+    )
     # Science/frames unchanged by the control-flow fix.
     assert len(manifest["frame_ids"]) == manifest["n_frames"]
     assert manifest["normalization"] == "sky_mean"
+    for name in FITS_NAMES:
+        assert _digest(out / name) == _digest(legacy_run / name)
 
 
 def test_admission_shrink_then_runtime_tile_shrink_keeps_reduced_identity(
@@ -949,9 +966,23 @@ def test_admission_shrink_then_runtime_tile_shrink_keeps_reduced_identity(
     block = manifest["r55_scheduler"]
     reduced = int(state["reduced"])
     assert reduced > 0
-    # Reduced prefetch/workers/K survive the tile reduction; nothing regrows.
+    # PLAN p2 -> actual admission p0 -> real runtime smaller rung.
+    assert int(block["initial_candidate"]["prefetch_units"]) == 2
     assert int(block["mapping"]["prefetch_units"]) == 0
     assert int(block["mapping"]["gpu_streaming_tile"]) == reduced
+    ladder = [int(t) for t in block["gpu_tile_decision"]["declared_ladder"]]
+    assert reduced in ladder
+    assert reduced < int(
+        block["run"]["initial_execution"]["gpu_streaming_tile"]
+    )
+    # K1 and the admitted workers are PRESERVED (never grew), even though the
+    # tile shrank; no resource is restored on recovered VRAM.
+    assert int(block["mapping"]["units_in_flight"]) == 1
+    assert int(block["run"]["final_execution"]["units_in_flight"]) == 1
+    assert int(block["run"]["final_execution"]["workers_per_unit"]) == int(
+        block["run"]["initial_execution"]["workers_per_unit"]
+    )
+    assert int(block["run"]["final_execution"]["workers_per_unit"]) >= 1
     assert int(block["run"]["final_execution"]["gpu_streaming_tile"]) == reduced
     assert int(block["run"]["final_execution"]["prefetch_units"]) == 0
     assert int(block["final_envelope"]["prefetch_units"]) == 0
@@ -963,4 +994,33 @@ def test_admission_shrink_then_runtime_tile_shrink_keeps_reduced_identity(
     assert block["gpu_tile_runtime"]["effective_tile_px"] == reduced
     assert block["status"] == "executed"
     # Recovery after the shrink cannot regrow the tile (observed final rung).
+    assert int(block["run"]["final_execution"]["gpu_streaming_tile"]) == reduced
     assert int(block["run"]["final_execution"]["gpu_streaming_tile"]) <= reduced
+    # POST-SHRINK published accounting agrees with the EFFECTIVE p0 projection:
+    # shrink history, RUN checkpoints and the effective envelope are identical.
+    effective_projection = int(block["final_envelope"]["stack_total_bytes"])
+    assert int(block["final_envelope"]["aggregate_bytes"]) == effective_projection
+    history = block["gpu_tile_runtime"]["shrink_history"]
+    assert len(history) == 1
+    assert int(history[0]["from_tile_px"]) > int(history[0]["to_tile_px"])
+    assert int(history[0]["to_tile_px"]) == reduced
+    assert int(history[0]["prefetch_units"]) == 0
+    assert int(history[0]["host_aggregate_bytes"]) == effective_projection
+    assert int(block["run"]["checkpoints"][-1]["aggregate_bytes"]) == (
+        effective_projection
+    )
+    assert int(
+        manifest["r55_run_telemetry"]["checkpoints"][-1]["aggregate_bytes"]
+    ) == effective_projection
+    assert all(
+        int(cp["aggregate_bytes"]) == effective_projection
+        for cp in block["run"]["checkpoints"]
+    )
+    # Exact science arrays/coverage and frame identities vs the established
+    # legacy control (the E2 module's own parity contract).
+    for name in FITS_NAMES:
+        assert _digest(out / name) == _digest(legacy_run / name)
+    legacy_manifest = _manifest(legacy_run)
+    assert manifest["frame_ids"] == legacy_manifest["frame_ids"]
+    assert manifest["complete_cells"] == legacy_manifest["complete_cells"]
+    assert manifest["incomplete_cells"] == legacy_manifest["incomplete_cells"]

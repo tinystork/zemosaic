@@ -442,6 +442,19 @@ def routine_corpus(tmp_path_factory):
     return out
 
 
+@pytest.fixture
+def stable_host_ram(monkeypatch):
+    """Pin the host observation for the end-to-end finishing tests.
+
+    These tests exercise FINISHING, not RAM planning. Without a pin they inherit
+    the ambient host pressure of the combined fast order; the layout plan can
+    then refuse on a low-RAM moment, which is unrelated to finishing and is
+    reproducible on beta 3fa088c under the same pressure. The pin is the same
+    generous value used by the E2 end-to-end tests and changes no product policy.
+    """
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: 12 * 2 ** 30)
+
+
 def _make_input(tmp_path, routine_corpus):
     input_dir = tmp_path / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -453,7 +466,7 @@ def _make_input(tmp_path, routine_corpus):
     return input_dir
 
 
-def test_end_to_end_finishing_applied(tmp_path, routine_corpus):
+def test_end_to_end_finishing_applied(tmp_path, routine_corpus, stable_host_ram):
     input_dir = _make_input(tmp_path, routine_corpus)
     out = tmp_path / "out"
     zconfig = SimpleNamespace(
@@ -474,7 +487,9 @@ def test_end_to_end_finishing_applied(tmp_path, routine_corpus):
     assert (out / "mosaic_grid_uint16.fits").exists()
 
 
-def test_forced_finishing_failure_warns_and_completes(tmp_path, routine_corpus, monkeypatch):
+def test_forced_finishing_failure_warns_and_completes(
+    tmp_path, routine_corpus, monkeypatch, stable_host_ram
+):
     import logging
 
     input_dir = _make_input(tmp_path, routine_corpus)

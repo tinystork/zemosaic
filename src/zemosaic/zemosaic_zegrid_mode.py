@@ -11230,6 +11230,19 @@ def _run_single(
                     plan_factor_den=int(rcontract.ADMIT_FACTOR_DEN),
                     plan_budget_bytes=int(budget),
                 )
+                # ARCH REWORK-2: materialize the EFFECTIVE projection once, from
+                # the reduced mapping/bundle, BEFORE taking tile_lock. The old
+                # calls omitted ``prefetch_units`` and fell back to the PLAN
+                # p2, publishing +435 565 168 B of stale host accounting.
+                _shrink_prefetch = int(mapping_new["prefetch_units"])
+                _shrink_aggregate = int(
+                    _r55_gpu_host_aggregate_for_tile(
+                        gpu_decision,
+                        bundle_new,
+                        int(chosen),
+                        prefetch_units=_shrink_prefetch,
+                    )
+                )
                 with tile_lock:
                     tile_state["tile"] = int(chosen)
                     tile_state["device_peak"] = int(
@@ -11260,11 +11273,8 @@ def _run_single(
                             "vram_free_bytes": int(free_vram),
                             "vram_percent": int(vram_percent),
                             "host_budget_bytes": int(budget),
-                            "host_aggregate_bytes": int(
-                                _r55_gpu_host_aggregate_for_tile(
-                                    gpu_decision, gpu_bundle, int(chosen)
-                                )
-                            ),
+                            "host_aggregate_bytes": int(_shrink_aggregate),
+                            "prefetch_units": int(_shrink_prefetch),
                             "attempts": [dict(a) for a in shrink_attempts],
                         }
                     )
@@ -11275,7 +11285,8 @@ def _run_single(
                     tile=int(tile_now),
                     free_bytes=int(free_vram),
                     host_budget_bytes=int(budget),
-                    bundle=gpu_bundle,
+                    bundle=bundle_new,
+                    prefetch_units=int(_shrink_prefetch),
                 )
 
             peak_used = int(gpu_decision.device_peak_bytes_by_tile[int(tile_now)])
