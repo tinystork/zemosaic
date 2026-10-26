@@ -1343,14 +1343,22 @@ def _choose_layout_mode_aware(
         for c in cells:
             hw = tuple(c["patch_hw"])
             for t in CPU_STREAMING_TILE_LADDER:
-                b = int(_estimate_streaming_bytes(c["n"], hw, int(t)))
+                # ZM-PINNED-LADDER-PROFILE: judge the ladder with the run's REAL
+                # storage profile, exactly like the adaptive branch
+                # (``_profile_stream_bytes`` keeps the dense call signature).
+                b = int(_profile_stream_bytes(c["n"], hw, int(t), _STACK_STORAGE_PROFILE))
                 if b > stream_worst_by_tile[int(t)]:
                     stream_worst_by_tile[int(t)] = b
         # ZM-ZEGRID-R36: geometry stays EXACTLY the pinned (nx, ny); only the CPU
         # streaming tile adapts. Admissible iff the in-memory bound fits OR some
         # ladder tile's worst-cell streaming bound fits; fail loud otherwise.
+        # ZM-PINNED-LADDER-PROFILE: under a BOUNDED storage profile the in-memory
+        # path is not executable, so its bound must not confer admissibility
+        # (mirrors the adaptive branch).
         selected_tile, trials, sel_reason = _select_cpu_streaming_tile(stream_worst_by_tile, ram_budget)
-        inmem_ok = (ram_budget is None) or (inmem_worst <= ram_budget)
+        inmem_ok = (not zsp.is_bounded(_STACK_STORAGE_PROFILE)) and (
+            (ram_budget is None) or (inmem_worst <= ram_budget)
+        )
         if not inmem_ok and selected_tile is None:
             min_bound = int(stream_worst_by_tile.get(CPU_STREAMING_TILE_MINIMUM, 0))
             msg = (
