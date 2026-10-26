@@ -1,9 +1,9 @@
 ........................................................................ [ 16%]
-..............s......................................................... [ 33%]
+...............s........................................................ [ 33%]
 ........................................................................ [ 50%]
-.......s...........s.................................................... [ 67%]
-........................................................................ [ 84%]
-....................................................................     [100%]
+........s...........s................................................... [ 67%]
+........................................................................ [ 83%]
+.....................................................................    [100%]
 =============================== warnings summary ===============================
 tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_simulated_active_gpu_executes_pipeline_and_publishes_exact_output
 tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_simulated_active_gpu_executes_pipeline_and_publishes_exact_output
@@ -16,9 +16,9 @@ tests/test_zegrid_r55e11_runtime_vram_adaptation.py::test_e11_product_gpu_pipeli
   /usr/lib/python3/dist-packages/astropy/io/fits/card.py:1038: VerifyWarning: Card is too long, comment will be truncated.
     warnings.warn(
 
-tests/test_zegrid_r55e2_active_gpu_prefetch.py: 174 warnings
+tests/test_zegrid_r55e2_active_gpu_prefetch.py: 168 warnings
 tests/test_zegrid_r55e11_runtime_vram_adaptation.py: 156 warnings
-  /usr/lib/python3.13/multiprocessing/popen_fork.py:67: DeprecationWarning: This process (pid=520756) is multi-threaded, use of fork() may lead to deadlocks in the child.
+  /usr/lib/python3.13/multiprocessing/popen_fork.py:67: DeprecationWarning: This process (pid=528966) is multi-threaded, use of fork() may lead to deadlocks in the child.
     self.pid = os.fork()
 
 tests/test_zegrid_r52_ooc_storage_lot_a.py: 24 warnings
@@ -26,4 +26,4 @@ tests/test_zegrid_r52_ooc_storage_lot_a.py: 24 warnings
     diff = v_hi - v_lo
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-425 passed, 3 skipped, 362 warnings in 303.98s (0:05:03)
+426 passed, 3 skipped, 356 warnings in 298.15s (0:04:58)

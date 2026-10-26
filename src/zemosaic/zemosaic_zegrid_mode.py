@@ -6872,7 +6872,7 @@ def _r55_active_gpu_admit(
     *,
     initial_bundle,
     decision,
-    available_fn=available_memory_bytes,
+    available_fn=None,
     vram_free_fn=None,
 ):
     """Fresh 90 % + fresh VRAM admission of the ACTIVE GPU plan.
@@ -6881,6 +6881,12 @@ def _r55_active_gpu_admit(
     whole-batch CPU fallback (raised as :class:`_R55GpuFallback`), never a mixed
     partial result and never a silent CPU coercion inside the GPU plan.
     """
+    # LATE BINDING: resolve the host observation at CALL time. A default of
+    # ``available_memory_bytes`` is captured at import time, so a test/session
+    # seam that replaces the module global would be silently bypassed and the
+    # admission would observe the REAL host instead (order-dependent shrink).
+    if available_fn is None:
+        available_fn = available_memory_bytes
     candidate = _r55_gpu_candidate_lookup(decision, decision.plan_set.chosen)
     mapping = dict(decision.mapping)
     bundle = _r55_active_gpu_apply(

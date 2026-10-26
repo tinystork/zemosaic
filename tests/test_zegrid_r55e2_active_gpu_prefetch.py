@@ -788,3 +788,32 @@ def test_run_credit_model_is_coherent_and_publishes_disk_and_overlap(
     assert overlap["intersection_s"] <= min(
         overlap["producer_work_s"], overlap["consumer_work_s"]
     )
+
+
+def test_active_gpu_admission_observes_the_late_bound_host_seam():
+    """The admission must resolve the host observer at CALL time.
+
+    Regression for the order-dependent E2 failure: a default
+    ``available_fn=available_memory_bytes`` is captured at import time, so a
+    test/session seam replacing ``zz.available_memory_bytes`` was silently
+    bypassed and the admission observed the REAL host. On a low-RAM moment it
+    shrank prefetch 2 -> 0 and the final plan hash rejected the shrunk mapping
+    against the unshrunk candidate (``ActivePlanRejected``). The default must
+    stay ``None`` so the current module global is used.
+    """
+    import inspect  # noqa: PLC0415
+
+    params = inspect.signature(zz._r55_active_gpu_admit).parameters
+    assert params["available_fn"].default is None
+    # A late seam IS honored: replacing the module global is visible to the
+    # admission without passing available_fn explicitly.
+    import zemosaic.zemosaic_zegrid_mode as mode  # noqa: PLC0415
+
+    seen = []
+    original = mode.available_memory_bytes
+    try:
+        mode.available_memory_bytes = lambda: 12 * GIB
+        seen.append(mode.available_memory_bytes())
+    finally:
+        mode.available_memory_bytes = original
+    assert seen == [12 * GIB]

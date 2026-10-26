@@ -95,13 +95,15 @@ This is an honest NEGATIVE result at H64, not an LP/Windows proof.
 
 ### `matrix-18-modules-final.txt` — combined matrix
 
-`425 passed, 3 skipped` in 303.98 s at HEAD `ffe75bc` (18 modules: R56 x2,
+`426 passed, 3 skipped` in 298.15 s at HEAD with the late-binding seam fix (18 modules: R56 x2,
 E2/E5/E7/E8/E9/E10/E11, R52 A/B/B-gateA/C, GPU admission fallback, R41b,
-planner determinism, envelope, E6 large-halo layout). The r1 reds
-(`test_gpu_oom_falls_back_to_exact_whole_batch_cpu`,
-`test_run_credit_model_is_coherent_and_publishes_disk_and_overlap`) did NOT
-reproduce; both tests pin `available_memory_bytes=12 GiB`, so the old
-host-capacity hypothesis is not supported by the test code (see the arch report).
+planner determinism, envelope, E6 large-halo layout). The r1 reds DID reproduce in a 7-module order and are now ROOT-CAUSED:
+`_r55_active_gpu_admit` captured `available_memory_bytes` as an IMPORT-TIME
+default, so the tests' 12 GiB pin was bypassed and the admission observed the
+REAL host. On a low-RAM moment it shrank prefetch 2 -> 0 and the final plan hash
+rejected the shrunk mapping against the unshrunk candidate. Fixed by late
+binding the observer at call time + a regression guard; the same 7-module order
+is green (146 passed, 1 skipped) and the full matrix is 426 passed, 3 skipped.
 
 ### LP341 faithful product witness (MODEL, not a Windows run)
 

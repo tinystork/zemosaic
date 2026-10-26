@@ -168,7 +168,11 @@ Real-memory bounded CUDA smoke (H64, MX150): GPU executed 6/6 cells with
 identical outputs, but the real ~2.27 GB observation admits `prefetch=0` only,
 so there is no overlap claim. See `docs/measurements/.../README.md`.
 
-Combined 18-module matrix at this HEAD: 425 passed, 3 skipped
-(`matrix-18-modules-final.txt`). The two r1 E2 reds did not reproduce; the old
-host-capacity hypothesis is unsupported (both tests pin 12 GiB) and remains an
-explicitly open, unproven root cause.
+Combined 18-module matrix at this HEAD: 426 passed, 3 skipped
+(`matrix-18-modules-final.txt`). The two r1 E2 reds DID reproduce in a 7-module
+order and are now root-caused and fixed: `_r55_active_gpu_admit` captured
+`available_memory_bytes` as an import-time default, bypassing the tests' 12 GiB
+pin; the admission then observed the REAL host, shrank prefetch 2 -> 0 on a
+low-RAM moment, and the final plan hash rejected the shrunk mapping against the
+unshrunk candidate. The observer is now late-bound at call time (same product
+behaviour) and a regression guard pins the seam.
