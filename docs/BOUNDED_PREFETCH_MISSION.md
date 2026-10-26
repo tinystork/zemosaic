@@ -206,3 +206,26 @@ Evidence corrections: the historical pinned-4 GiB smoke is superseded and is
 NOT p0 control proof; LP341 p2 is MODEL; the real H64 CUDA run is p0 only;
 Windows halo128 overlap is NOT_RUN. Logs are in
 `docs/measurements/ZM-ZEGRID-BOUNDED-PREFETCH-20261025/`.
+
+## ARCH REWORK-2 (2026-10-26) — post-shrink projection, HEAD ba38097
+
+The residual MEDIUM from the Nono review is fixed: after admission p2->p0 and a
+runtime tile reduction, the shrink history and the post-shrink RUN check now
+price the EFFECTIVE p0 mapping (`bundle_new` + explicit `prefetch_units`), not
+the PLAN p2. The stale calls published +435 565 168 B of host accounting on the
+tile-384 witness; the effective projection is now published everywhere
+(history, RUN checkpoints, deterministic checkpoints, effective envelope).
+Maintained regressions assert PLAN p2 vs admitted p0, the real smaller rung,
+K1/workers preserved, no regrowth, projection equality and exact science/frame
+parity. The external Junior post-shrink probe passes unchanged.
+
+R18 fast-gate attribution: the two finishing tests were failing because they
+inherited ambient host RAM pressure (real observer) in the combined order; they
+pass alone on both beta 3fa088c and the candidate when RAM suffices, and the
+same low-RAM failure is reproducible on beta. A test-only 12 GiB host pin fixes
+the isolation without changing product policy or assertions. The fast gate still
+times out at 51 % (exit 124) and shows pre-existing R37 diagnostic-capture
+host-pressure errors (176 passed/47 errors alone; 7/7 error reproducer on beta
+3fa088c). This remains an explicit publication-gate residual for Junior, not an
+all-green claim. No push/merge/tag/install; LP341 p2 MODEL, real H64 CUDA p0
+only, Windows overlap NOT_RUN.

@@ -1,0 +1,36 @@
+EEEEEEE                                                                  [100%]
+==================================== ERRORS ====================================
+_ ERROR at setup of test_malformed_manifest_is_clean_fail[{not json-invalid JSON] _
+E   zemosaic.core.zegrid.auto_layout.LayoutInfeasible: pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+------------------------------ Captured log setup ------------------------------
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID] ZeGrid accepts but IGNORES the following stack/final-mosaic arguments (ZeGrid uses the frozen science config and standard FITS outputs):
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - apply_radial_weight = False
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - legacy_rgb_cube = False
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - radial_feather_fraction = 0.8
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - radial_shape_power = 2.0
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - stack_final_combine = 'mean'
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - stack_weight_method = 'noise_variance'
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID] ZeGrid: cell_gauge_mode=per_cell (OPT-IN) — every Cell self-anchors on its own greatest-support frame via the frozen estimator; inter-cell coherence/feathering are part of this mode (R34c/R34d).
+ERROR    ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID] pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+ERROR    ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID] ZeGrid: NO executable plan fits the PLAN budget — refusing BEFORE the gauge/stack: pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+_ ERROR at setup of test_malformed_manifest_is_clean_fail[[1, 2, 3]-not an object] _
+E   zemosaic.core.zegrid.auto_layout.LayoutInfeasible: pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+_ ERROR at setup of test_malformed_manifest_is_clean_fail["just a string"-not an object] _
+E   zemosaic.core.zegrid.auto_layout.LayoutInfeasible: pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+_ ERROR at setup of test_malformed_manifest_is_clean_fail[{"frame_ids": "not-a-list"}-frame_ids is not a list] _
+E   zemosaic.core.zegrid.auto_layout.LayoutInfeasible: pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+_ ERROR at setup of test_malformed_manifest_is_clean_fail[{"frame_ids": {"a": 1}}-frame_ids is not a list] _
+E   zemosaic.core.zegrid.auto_layout.LayoutInfeasible: pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+_ ERROR at setup of test_malformed_manifest_is_clean_fail[{"frame_ids": [1, 2]}-frame_ids[0] is not a string] _
+E   zemosaic.core.zegrid.auto_layout.LayoutInfeasible: pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+_ ERROR at setup of test_malformed_manifest_is_clean_fail[{"frame_ids": [NaN]}-invalid JSON] _
+E   zemosaic.core.zegrid.auto_layout.LayoutInfeasible: pinned layout 2x2 violates scientific floors: min_patch_area=449438 (limit 50000), halo_overhead=0.7731 (limit 0.5). Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size; a FINER layout raises halo overhead and cannot fix this.
+=========================== short test summary info ============================
+ERROR tests/test_zegrid_r37e_capture_runner.py::test_malformed_manifest_is_clean_fail[{not json-invalid JSON]
+ERROR tests/test_zegrid_r37e_capture_runner.py::test_malformed_manifest_is_clean_fail[[1, 2, 3]-not an object]
+ERROR tests/test_zegrid_r37e_capture_runner.py::test_malformed_manifest_is_clean_fail["just a string"-not an object]
+ERROR tests/test_zegrid_r37e_capture_runner.py::test_malformed_manifest_is_clean_fail[{"frame_ids": "not-a-list"}-frame_ids is not a list]
+ERROR tests/test_zegrid_r37e_capture_runner.py::test_malformed_manifest_is_clean_fail[{"frame_ids": {"a": 1}}-frame_ids is not a list]
+ERROR tests/test_zegrid_r37e_capture_runner.py::test_malformed_manifest_is_clean_fail[{"frame_ids": [1, 2]}-frame_ids[0] is not a string]
+ERROR tests/test_zegrid_r37e_capture_runner.py::test_malformed_manifest_is_clean_fail[{"frame_ids": [NaN]}-invalid JSON]
+7 errors in 3.22s

@@ -1,0 +1,24 @@
+........................................................................ [ 16%]
+.................s...................................................... [ 33%]
+........................................................................ [ 50%]
+........................................................................ [ 66%]
+........................................................................ [ 83%]
+.......................................................................  [100%]
+=============================== warnings summary ===============================
+tests/test_zegrid_r55e2_active_gpu_prefetch.py: 336 warnings
+tests/test_zegrid_r55e11_runtime_vram_adaptation.py: 216 warnings
+tests/test_zegrid_r41b_product_wiring.py: 32 warnings
+  /usr/lib/python3.13/multiprocessing/popen_fork.py:67: DeprecationWarning: This process (pid=570010) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+tests/test_zegrid_r55e2_active_gpu_prefetch.py: 7 warnings
+tests/test_zegrid_r55e11_runtime_vram_adaptation.py: 3 warnings
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:1036: VerifyWarning: Card is too long, comment will be truncated.
+    warnings.warn(
+
+tests/test_zegrid_r52_ooc_storage_lot_a.py: 24 warnings
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/canonical_stacking.py:1405: RuntimeWarning: invalid value encountered in subtract
+    diff = v_hi - v_lo
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+430 passed, 1 skipped, 618 warnings in 354.05s (0:05:54)

@@ -1,0 +1,20 @@
+........................................................................ [ 48%]
+.................s...................................................... [ 96%]
+......                                                                   [100%]
+=============================== warnings summary ===============================
+tests/test_zegrid_r55e2_active_gpu_prefetch.py: 330 warnings
+  /usr/lib/python3.13/multiprocessing/popen_fork.py:67: DeprecationWarning: This process (pid=569130) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_simulated_active_gpu_executes_pipeline_and_publishes_exact_output
+tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_simulated_active_gpu_executes_pipeline_and_publishes_exact_output
+tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_gpu_oom_falls_back_to_exact_whole_batch_cpu
+tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_active_cpu_path_is_unchanged_by_e2
+tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_run_credit_model_is_coherent_and_publishes_disk_and_overlap
+tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_admission_p2_to_p0_survives_final_manifest
+tests/test_zegrid_r55e2_active_gpu_prefetch.py::test_admission_shrink_then_runtime_tile_shrink_keeps_reduced_identity
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:1036: VerifyWarning: Card is too long, comment will be truncated.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+149 passed, 1 skipped, 337 warnings in 100.62s (0:01:40)

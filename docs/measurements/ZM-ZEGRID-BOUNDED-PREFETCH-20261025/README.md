@@ -171,3 +171,63 @@ credit release, failure residue, cancellation).
 - The real-memory H64 CUDA artifact is real GPU execution but admitted **p0
   only**; no overlap was measured.
 - Windows/LP341 halo128 runtime overlap remains **NOT_RUN**.
+
+## ARCH REWORK-2 (2026-10-26) — post-shrink projection + fast-gate attribution
+
+HEAD: `ba38097` (on `303a6c2`), branch `perf/zegrid-bounded-prefetch`, local.
+
+### Post-shrink projection defect (MEDIUM, confirmed by Nono)
+
+After admission p2->p0 THEN a runtime tile reduction, the shrink history and the
+post-shrink `_r55_runtime_tile_check` still called
+`_r55_gpu_host_aggregate_for_tile(..., bundle=gpu_bundle)` WITHOUT
+`prefetch_units`, so the helper fell back to the PLAN p2. Tile 384 published
+1 228 748 400 B instead of the effective-p0 793 183 232 B (+435 565 168 B stale
+accounting). This was published telemetry, not a shrink decision (the decision
+used the corrected pre-shrink check/walk).
+
+Fix: materialize `_shrink_prefetch = mapping_new["prefetch_units"]` and
+`_shrink_aggregate = _r55_gpu_host_aggregate_for_tile(decision, bundle_new,
+tile, prefetch_units=_shrink_prefetch)` BEFORE `tile_lock`; use those locals in
+`shrink_history`; pass `bundle_new` + the explicit effective prefetch to the
+post-shrink check. No lock re-entry; no helper default from the PLAN.
+
+Maintained regressions now assert, in the same p2->p0->tile-shrink scenario:
+PLAN p2 vs admitted p0; the real smaller production rung; K1 and admitted
+workers preserved (no regrowth); `shrink_history.prefetch_units == 0` and
+`host_aggregate_bytes == final_envelope.stack_total_bytes`; RUN checkpoints and
+`r55_run_telemetry.checkpoints` equal the same effective projection; exact FITS
+digests, frame identities and complete/incomplete cells equal to the legacy
+control. The external Junior post-shrink probe passes unchanged.
+
+### Fast gate / R18 attribution
+
+R18 failures were reproduced as a REAL ambient host-pressure dependency: the
+two end-to-end finishing tests use the real `available_memory_bytes`; under the
+combined-order memory pressure the halo64 plan can refuse at layout. They pass
+alone on both `3fa088c` and the candidate when RAM is sufficient, and failed
+alone on both at a low-RAM moment. Fix: a test-only `stable_host_ram` fixture
+pins the observation to 12 GiB for these two FINISHING tests (no product policy
+change, no weakened assertion). The R18 failures no longer reproduce at 37 % in
+the fast gate.
+
+The fast gate still times out at 51 % (exit 124, 1200 s) and then shows an
+R37 diagnostic-capture order/host-pressure cluster: `arch-r2-fast-gate.txt`.
+Running the R37 modules alone gives `176 passed, 47 errors`; the errors are a
+pinned-2x2/layout-floor failure reproduced identically on beta `3fa088c`
+(`arch-r2-r37-alone.txt`, `arch-r2-r37e-beta.txt`). They are PRE-EXISTING and
+unrelated to F1/F2 (the 18-module matrix is green). This is an explicit
+publication-gate residual for Junior, not an all-green claim.
+
+### Validation (exact, logs here)
+
+- external probes (2 original + Junior post-shrink): **3 passed**
+  (`arch-r2-probes.txt`, `arch-r2-post-shrink-probe.txt`);
+- seven-module: **149 passed, 1 skipped** (`arch-r2-seven-modules.txt`);
+- 18-module matrix: **430 passed, 1 skipped** (`arch-r2-matrix-18.txt`);
+- fast gate: **timeout exit 124 at 51 %**, R18 fixed, R37 residual
+  (`arch-r2-fast-gate.txt`).
+
+Evidence limits unchanged: LP341 p2 is MODEL; real H64 CUDA is p0 only;
+Windows halo128 overlap is NOT_RUN; the pinned-4 GiB artifact remains
+SUPERSEDED and is not p0 control proof.
