@@ -194,28 +194,47 @@ def test_e11_walk_never_leaves_the_declared_ladder():
 # ---------------------------------------------------------------------------
 
 class _FakePool:
+    """Matches the REAL CuPy allocator API: byte counters are BOUND METHODS."""
+
     def __init__(self, log, *, fail=False):
         self.log = log
         self.fail = fail
-        self.used_bytes = 100
-        self.total_bytes = 200
-        self.free_bytes = 100
+        self._used = 100
+        self._total = 200
+        self._free = 100
+
+    def used_bytes(self):
+        return self._used
+
+    def total_bytes(self):
+        return self._total
+
+    def free_bytes(self):
+        return self._free
 
     def free_all_blocks(self):
         if self.fail:
             raise RuntimeError("pool boom")
         self.log.append("free_all_blocks")
-        self.used_bytes = 0
-        self.total_bytes = 100
-        self.free_bytes = 100
+        self._used = 0
+        self._total = 100
+        self._free = 100
 
 
 class _FakePinnedPool:
+    """Matches the REAL CuPy pinned pool: counters are BOUND METHODS."""
+
     def __init__(self, log, *, fail=False):
         self.log = log
         self.fail = fail
-        self.used_bytes = 10
-        self.total_bytes = 20
+        self._used = 10
+        self._total = 20
+
+    def used_bytes(self):
+        return self._used
+
+    def total_bytes(self):
+        return self._total
 
     def free_all_blocks(self):
         if self.fail:

@@ -88,11 +88,16 @@ def _read_pool(pool) -> tuple[dict, list[str]]:
         ("free_bytes", "pool_free_bytes"),
     ):
         try:
-            value = getattr(pool, attr)
+            member = getattr(pool, attr)
         except Exception as exc:  # defensive: property may raise
             errors.append(f"{key}:{type(exc).__name__}")
             continue
         try:
+            # CuPy exposes these counters as BOUND METHODS
+            # (``pool.used_bytes()``); doubles/future backends may expose plain
+            # attributes. Call when callable; never cast a bound method to int
+            # (that was the historical TypeError).
+            value = member() if callable(member) else member
             out[key] = int(value) if value is not None else None
         except Exception as exc:  # defensive
             errors.append(f"{key}:{type(exc).__name__}")
@@ -149,7 +154,8 @@ def device_memory_snapshot(xp=None, *, device_index: int = 0) -> dict:
             ("total_bytes", "pinned_pool_total_bytes"),
         ):
             try:
-                value = getattr(pinned, attr)
+                member = getattr(pinned, attr)
+                value = member() if callable(member) else member
                 record[key] = int(value) if value is not None else None
             except Exception as exc:
                 errors.append(f"{key}:{type(exc).__name__}")

@@ -86,6 +86,7 @@ from . import zemosaic_stack_plan
 from .zemosaic_resource_telemetry import (
     ResourceTelemetryController,
     _sample_runtime_resources_for_telemetry,
+    sample_gpu_via_nvml,
 )
 
 from .core.path_helpers import (
@@ -189,6 +190,8 @@ def _safe_runtime_snapshot() -> dict[str, Any]:
         psutil,
         zemosaic_utils,
         ZEMOSAIC_UTILS_AVAILABLE,
+        # CUDA-free NVML probe: safe on the heartbeat thread and when GPU is OFF.
+        gpu_probe=sample_gpu_via_nvml,
     )
 
 
@@ -31278,34 +31281,76 @@ def run_hierarchical_mosaic(
                 _grid_gpu_requested,
                 _grid_gpu_source,
             )
-            run_zegrid_mode(
-                input_folder=input_folder,
-                output_folder=output_folder,
-                progress_callback=progress_callback,
-                selection_paths=_zegrid_selection_paths(filtered_header_items),
-                global_wcs_output_path=(worker_config_cache or {}).get(
-                    "global_wcs_output_path"
-                ),
-                stack_norm_method=zegrid_norm,
-                stack_weight_method=stack_weight_method,
-                stack_reject_algo=stack_reject_algo,
-                stack_kappa_low=stack_kappa_low,
-                stack_kappa_high=stack_kappa_high,
-                winsor_limits=parsed_winsor_limits,
-                stack_final_combine=stack_final_combine,
-                apply_radial_weight=apply_radial_weight_config,
-                radial_feather_fraction=radial_feather_fraction_config,
-                radial_shape_power=radial_shape_power_config,
-                save_final_as_uint16=save_final_as_uint16_config,
-                legacy_rgb_cube=legacy_rgb_cube_config,
-                grid_rgb_equalize=grid_rgb_equalize_flag,
-                use_gpu=_grid_gpu_requested,
-                zegrid_halo_px=(worker_config_cache or {}).get("zegrid_halo_px"),
-                zegrid_scheduler_mode=(worker_config_cache or {}).get(
-                    "zegrid_scheduler_mode"
-                ),
-                zconfig=zconfig,
+            # ZM-WIN-OBSERVABILITY: the ZeGrid engine returns before the
+            # classic/SDS telemetry setup below, so the Resource monitor option
+            # was never wired for ZeGrid. Create the SAME controller/CSV here and
+            # pass it into the engine. OFF disables optional monitoring only;
+            # crash breadcrumbs stay independent and always active.
+            try:
+                _zg_telemetry_enabled = bool(
+                    getattr(zconfig, "enable_resource_telemetry", False)
+                )
+            except Exception:
+                _zg_telemetry_enabled = False
+            try:
+                _zg_telemetry_interval = float(
+                    getattr(zconfig, "resource_telemetry_interval_sec", 1.5) or 1.5
+                )
+            except Exception:
+                _zg_telemetry_interval = 1.5
+            try:
+                _zg_telemetry_csv = bool(
+                    getattr(zconfig, "resource_telemetry_log_to_csv", True)
+                )
+            except Exception:
+                _zg_telemetry_csv = True
+            _zg_csv_path = None
+            if _zg_telemetry_csv and output_folder:
+                try:
+                    _zg_csv_path = os.path.join(
+                        output_folder, "resource_telemetry.csv"
+                    )
+                except Exception:
+                    _zg_csv_path = None
+            _zg_telemetry = ResourceTelemetryController(
+                enabled=_zg_telemetry_enabled,
+                interval_sec=_zg_telemetry_interval,
+                callback=progress_callback,
+                csv_path=_zg_csv_path,
+                log_and_callback=_log_and_callback,
             )
+            try:
+                run_zegrid_mode(
+                        input_folder=input_folder,
+                    output_folder=output_folder,
+                    progress_callback=progress_callback,
+                    selection_paths=_zegrid_selection_paths(filtered_header_items),
+                    global_wcs_output_path=(worker_config_cache or {}).get(
+                        "global_wcs_output_path"
+                    ),
+                    stack_norm_method=zegrid_norm,
+                    stack_weight_method=stack_weight_method,
+                    stack_reject_algo=stack_reject_algo,
+                    stack_kappa_low=stack_kappa_low,
+                    stack_kappa_high=stack_kappa_high,
+                    winsor_limits=parsed_winsor_limits,
+                    stack_final_combine=stack_final_combine,
+                    apply_radial_weight=apply_radial_weight_config,
+                    radial_feather_fraction=radial_feather_fraction_config,
+                    radial_shape_power=radial_shape_power_config,
+                    save_final_as_uint16=save_final_as_uint16_config,
+                    legacy_rgb_cube=legacy_rgb_cube_config,
+                    grid_rgb_equalize=grid_rgb_equalize_flag,
+                    use_gpu=_grid_gpu_requested,
+                    zegrid_halo_px=(worker_config_cache or {}).get("zegrid_halo_px"),
+                    zegrid_scheduler_mode=(worker_config_cache or {}).get(
+                        "zegrid_scheduler_mode"
+                    ),
+                    zconfig=zconfig,
+                    telemetry=_zg_telemetry,
+                )
+            finally:
+                _zg_telemetry.close()
             return
         except Exception:
             logger.error("[GRID] ZeGrid engine failed; aborting.", exc_info=True)
@@ -36593,11 +36638,22 @@ def run_hierarchical_mosaic_process(
         "phase": "bootstrap",
         "operation": "worker_start",
         "stage": None,
+        # Structured stage events fill tile_progress with the real done/total.
         "tile_progress": None,
+        # These are NOT derivable from the progress contract. Keep them null
+        # with an explicit reason instead of publishing a requested value as if
+        # it were an observed one.
         "in_flight": None,
+        "in_flight_unavailable_reason": "not_reported_by_progress_contract",
         "cpu_workers": None,
+        "cpu_workers_requested": None,
+        "cpu_workers_unavailable_reason": (
+            "requested_value_is_not_an_effective_worker_count"
+        ),
         "gpu_rows_per_chunk": None,
         "max_chunk_bytes": None,
+        "gpu_rows_per_chunk_unavailable_reason": "not_reported_for_this_mode",
+        "max_chunk_bytes_unavailable_reason": "not_reported_for_this_mode",
         "winsor_workers": None,
     }
 
@@ -36627,10 +36683,22 @@ def run_hierarchical_mosaic_process(
             and isinstance(cb_args[2], int)
         ):
             stage, current, total = cb_args
-            _ctx_update(phase=str(stage), stage=str(stage), operation="stage_progress")
+            _ctx_update(
+                phase=str(stage),
+                stage=str(stage),
+                operation="stage_progress",
+                # REAL structured done/total (cells/frames for this stage).
+                tile_progress={
+                    "done": int(current),
+                    "total": int(total),
+                    "stage": str(stage),
+                },
+            )
             _emit_crash_breadcrumb(
                 "STAGE_PROGRESS",
                 phase=str(stage),
+                stage=str(stage),
+                tile_progress=dict(crash_ctx.get("tile_progress") or {}),
                 current=int(current),
                 total=int(total),
             )
@@ -36755,10 +36823,17 @@ def run_hierarchical_mosaic_process(
         str(output_for_breadcrumbs) if output_for_breadcrumbs else None,
         mode=crash_breadcrumbs_mode,
     )
+    _requested_workers = final_kwargs.get("num_base_workers_config")
     _ctx_update(
         operation="before_run",
         phase="run_hierarchical_mosaic",
-        cpu_workers=final_kwargs.get("num_base_workers_config"),
+        # Requested != effective. 0/None means "auto" (the product default).
+        cpu_workers_requested=(
+            "auto"
+            if _requested_workers in (None, 0, "", "0", "auto")
+            else _requested_workers
+        ),
+        cpu_workers=None,
         winsor_workers=final_kwargs.get("winsor_worker_limit_config") or final_kwargs.get("winsor_worker_limit"),
         gpu_rows_per_chunk=final_kwargs.get("gpu_rows_per_chunk_config"),
         max_chunk_bytes=final_kwargs.get("max_chunk_bytes_config"),

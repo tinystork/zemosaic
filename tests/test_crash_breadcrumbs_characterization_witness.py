@@ -270,32 +270,54 @@ def test_snapshot_ram_probe_failure_fail_open(monkeypatch: pytest.MonkeyPatch, _
 
 
 def test_snapshot_gpu_fields_absent_by_default(_isolated_env: None) -> None:
-    # At BASE, zemosaic_utils has no get_gpu_vram_info helper, so the GPU branch
-    # is skipped and no gpu_* keys appear.
+    # The historical zemosaic_utils.get_gpu_vram_info helper never existed. GPU
+    # data now comes from a CUDA-free injected probe; when none is available the
+    # fields stay null with an explicit reason (never fabricated 0, never CUDA).
     snap = zw._safe_runtime_snapshot()
     for key in ("gpu_used_mb", "gpu_total_mb", "gpu_free_mb"):
-        assert key not in snap
+        assert key in snap and snap[key] is None
+    assert snap["gpu_source"] is None
+    assert snap["gpu_unavailable_reason"]
 
 
-def test_snapshot_gpu_fields_when_helper_present(monkeypatch: pytest.MonkeyPatch, _isolated_env: None) -> None:
-    monkeypatch.setattr(zw, "ZEMOSAIC_UTILS_AVAILABLE", True)
-    monkeypatch.setattr(zw, "zemosaic_utils", _FakeUtils(vram=(100.0, 2048.0, 900.0)))
+def test_snapshot_gpu_fields_when_safe_probe_present(
+    monkeypatch: pytest.MonkeyPatch, _isolated_env: None
+) -> None:
+    # The worker injects a driver-level (NVML) probe; it must be used instead of
+    # the non-existent zemosaic_utils helper.
+    monkeypatch.setattr(
+        zw,
+        "sample_gpu_via_nvml",
+        lambda: {
+            "gpu_used_mb": 100.0,
+            "gpu_total_mb": 2048.0,
+            "gpu_free_mb": 900.0,
+            "gpu_source": "nvml",
+        },
+    )
 
     snap = zw._safe_runtime_snapshot()
 
     assert snap["gpu_used_mb"] == pytest.approx(100.0)
     assert snap["gpu_total_mb"] == pytest.approx(2048.0)
     assert snap["gpu_free_mb"] == pytest.approx(900.0)
+    assert snap["gpu_source"] == "nvml"
+    assert snap["gpu_unavailable_reason"] is None
 
 
-def test_snapshot_gpu_probe_failure_fail_open(monkeypatch: pytest.MonkeyPatch, _isolated_env: None) -> None:
-    monkeypatch.setattr(zw, "ZEMOSAIC_UTILS_AVAILABLE", True)
-    monkeypatch.setattr(zw, "zemosaic_utils", _FakeUtils(vram=(0.0, 0.0, 0.0), raise_on_gpu=True))
+def test_snapshot_gpu_probe_failure_fail_open(
+    monkeypatch: pytest.MonkeyPatch, _isolated_env: None
+) -> None:
+    def _boom() -> dict:
+        raise RuntimeError("nvml boom")
+
+    monkeypatch.setattr(zw, "sample_gpu_via_nvml", _boom)
 
     snap = zw._safe_runtime_snapshot()
 
     for key in ("gpu_used_mb", "gpu_total_mb", "gpu_free_mb"):
-        assert key not in snap
+        assert snap[key] is None
+    assert "gpu_probe_failed" in snap["gpu_unavailable_reason"]
 
 
 # ===========================================================================

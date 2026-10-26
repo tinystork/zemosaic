@@ -79,18 +79,121 @@ def compute_crash_breadcrumb_paths(
         return (None, None)
 
 
+def _process_memory_snapshot(psutil_module: Any) -> dict[str, Any]:
+    """Portable process/process-tree memory snapshot (best-effort, labelled).
+
+    The historical breadcrumb RAM fields were SYSTEM RAM, which made a worker
+    crash look like the whole machine. The keys below separate the system view
+    from the consuming process and its children. The tree value is an explicit
+    SAMPLED SUM (children are read one after another, never simultaneously), so
+    it is never presented as a true peak or a simultaneous footprint.
+    """
+    out: dict[str, Any] = {
+        "process_rss_mb": None,
+        "process_peak_rss_mb": None,
+        "process_peak_rss_source": None,
+        "process_tree_rss_sampled_sum_mb": None,
+        "process_tree_rss_sampled_sum_label": "sampled_sum_not_simultaneous",
+        "process_tree_sample_count": None,
+        "process_memory_unavailable_reason": None,
+    }
+    try:
+        proc = psutil_module.Process()
+        info = proc.memory_info()
+        out["process_rss_mb"] = float(getattr(info, "rss", 0.0)) / (1024.0 * 1024.0)
+        peak = getattr(info, "peak_wset", None)
+        if peak is not None:
+            out["process_peak_rss_mb"] = float(peak) / (1024.0 * 1024.0)
+            out["process_peak_rss_source"] = "psutil_peak_wset"
+        else:
+            # Linux exposes VmHWM; read it without a dependency or CUDA touch.
+            try:
+                with open("/proc/self/status", "r", encoding="ascii") as fh:
+                    for line in fh:
+                        if line.startswith("VmHWM:"):
+                            kib = float(line.split()[1])
+                            out["process_peak_rss_mb"] = kib / 1024.0
+                            out["process_peak_rss_source"] = "proc_status_VmHWM"
+                            break
+            except Exception:
+                pass
+        tree = float(getattr(info, "rss", 0.0))
+        count = 1
+        try:
+            for child in proc.children(recursive=True):
+                try:
+                    tree += float(child.memory_info().rss)
+                    count += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        out["process_tree_rss_sampled_sum_mb"] = tree / (1024.0 * 1024.0)
+        out["process_tree_sample_count"] = int(count)
+    except Exception as exc:
+        out["process_memory_unavailable_reason"] = (
+            f"psutil_process_unavailable: {type(exc).__name__}: {exc}"
+        )
+    return out
+
+
+def _gpu_snapshot(gpu_probe: Callable[[], dict[str, Any]] | None) -> dict[str, Any]:
+    """Best-effort GPU observation from an injected SAFE probe.
+
+    The probe must be a driver-level (NVML) or already-initialised backend
+    reader: it must never initialise CUDA. When absent, the fields stay null
+    with an explicit reason (GPU OFF / no safe probe), never a fabricated 0.
+    """
+    out: dict[str, Any] = {
+        "gpu_used_mb": None,
+        "gpu_total_mb": None,
+        "gpu_free_mb": None,
+        "gpu_source": None,
+        "gpu_unavailable_reason": "gpu_probe_not_enabled",
+    }
+    if gpu_probe is None:
+        return out
+    try:
+        sample = gpu_probe()
+    except Exception as exc:
+        out["gpu_unavailable_reason"] = f"gpu_probe_failed: {type(exc).__name__}"
+        return out
+    if not isinstance(sample, dict):
+        out["gpu_unavailable_reason"] = "gpu_probe_returned_non_dict"
+        return out
+    for key in ("gpu_used_mb", "gpu_total_mb", "gpu_free_mb", "gpu_source"):
+        if key in sample:
+            out[key] = sample.get(key)
+    if out["gpu_total_mb"] is None:
+        out["gpu_unavailable_reason"] = str(
+            sample.get("gpu_unavailable_reason")
+            or sample.get("gpu_sample_source")
+            or "gpu_probe_no_total"
+        )
+    else:
+        out["gpu_unavailable_reason"] = None
+        if out["gpu_source"] is None:
+            out["gpu_source"] = sample.get("gpu_sample_source") or sample.get(
+                "gpu_backend"
+            )
+    return out
+
+
 def build_runtime_snapshot(
     psutil_module: Any,
     zemosaic_utils_module: Any,
     zemosaic_utils_available: bool,
+    *,
+    gpu_probe: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Best-effort RAM/VRAM/pid snapshot for crash forensics.
 
-    ``psutil_module``, ``zemosaic_utils_module`` and ``zemosaic_utils_available``
-    are injected by the worker adapter so that monkeypatching the worker globals
-    still takes effect; pid/ppid/time use the standard library directly.
+    ``psutil_module`` and the legacy ``zemosaic_utils`` arguments are injected by
+    the worker adapter so monkeypatching still takes effect. The legacy GPU
+    helper ``get_gpu_vram_info`` never existed in ``zemosaic_utils`` (the probe
+    always failed), so GPU data now comes only from the injected, CUDA-free
+    ``gpu_probe``. Absent/unavailable GPU data is null + explicit reason.
     """
-
     snap: dict[str, Any] = {
         "pid": os.getpid(),
         "ppid": os.getppid(),
@@ -98,32 +201,26 @@ def build_runtime_snapshot(
     }
     try:
         vm = psutil_module.virtual_memory()
+        used_mb = float(getattr(vm, "used", 0.0)) / (1024.0 * 1024.0)
+        total_mb = float(getattr(vm, "total", 0.0)) / (1024.0 * 1024.0)
+        pct = float(getattr(vm, "percent", 0.0))
+        # Legacy keys kept for store compatibility (they are SYSTEM RAM).
         snap.update(
             {
-                "ram_used_mb": float(getattr(vm, "used", 0.0)) / (1024.0 * 1024.0),
-                "ram_total_mb": float(getattr(vm, "total", 0.0)) / (1024.0 * 1024.0),
-                "ram_pct": float(getattr(vm, "percent", 0.0)),
+                "ram_used_mb": used_mb,
+                "ram_total_mb": total_mb,
+                "ram_pct": pct,
+                # Explicit, unambiguous names for new consumers.
+                "system_ram_used_mb": used_mb,
+                "system_ram_total_mb": total_mb,
+                "system_ram_percent": pct,
             }
         )
     except Exception:
         pass
 
-    try:
-        if (
-            zemosaic_utils_available
-            and zemosaic_utils_module
-            and hasattr(zemosaic_utils_module, "get_gpu_vram_info")
-        ):
-            vram_used, vram_total, vram_free = zemosaic_utils_module.get_gpu_vram_info()
-            snap.update(
-                {
-                    "gpu_used_mb": float(vram_used) if vram_used is not None else None,
-                    "gpu_total_mb": float(vram_total) if vram_total is not None else None,
-                    "gpu_free_mb": float(vram_free) if vram_free is not None else None,
-                }
-            )
-    except Exception:
-        pass
+    snap.update(_process_memory_snapshot(psutil_module))
+    snap.update(_gpu_snapshot(gpu_probe))
     return snap
 
 

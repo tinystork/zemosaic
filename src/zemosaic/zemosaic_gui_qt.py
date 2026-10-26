@@ -6247,13 +6247,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         result = agg.on_stage(stage_name, current_val, total_val)
 
-        # Tiles/item counter remains separate from the global progress bar.
+        if not result.known:
+            # Unknown/diagnostic stage (e.g. the FRAME-counted cache_build): never
+            # map its local current/total to global progress, the tiles counter or
+            # the ETA. This is what kept a 0/1751 cache counter masquerading as
+            # 0/9 cells.
+            return
+
+        # Tiles/item counter remains separate from the global progress bar and
+        # only ever shows a CANONICAL stage's units (cells/frames of that phase).
         if total_val > 0:
             self.tiles_value_label.setText(f"{current_val} / {total_val}")
-
-        if not result.known:
-            # Unknown stage: never map local current/total to global progress.
-            return
 
         global_percent = float(result.global_percent)
         self._last_global_progress = global_percent

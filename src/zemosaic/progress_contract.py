@@ -239,20 +239,25 @@ SDS_PLAN = ModePlan(
     ),
 )
 
-# ZeGrid plan — the six honest phases of the ZeGrid run. ``cache_build`` is an
-# alias of ``per_cell_stack`` (merged reality since R20): the cache build is
-# fused into the per-cell batch and must NOT be presented as separate future
-# work. Weights are conservative UI shares only (NOT duration claims).
+# ZeGrid plan — the six honest phases of the ZeGrid run. ``cache_build`` is a
+# DIAGNOSTIC counter measured in FRAMES (cumulative reprojected frames across
+# cells); ``per_cell_stack`` is the canonical phase measured in CELLS. The two
+# units must never be mixed, so ``zegrid:cache_build`` is deliberately NOT an
+# alias of ``per_cell_stack``: it normalizes to itself, resolves to no plan
+# stage, and consumers therefore ignore it (never mapping 1751 frames onto 9
+# cells or feeding it to ETA). The cache build is fused into the per-cell batch
+# and is not separate future work. Weights are conservative UI shares only.
 _ZEGRID_STAGES = (
     StageDescriptor("zegrid:setup", "zegrid", 1, ZEGRID_PHASE_SETUP, 0, 5.0),
     StageDescriptor("zegrid:layout", "zegrid", 2, ZEGRID_PHASE_LAYOUT, 1, 15.0),
     StageDescriptor("zegrid:gauge", "zegrid", 3, ZEGRID_PHASE_GAUGE, 2, 25.0),
-    StageDescriptor("zegrid:per_cell_stack", "zegrid", 4, ZEGRID_PHASE_PER_CELL_STACK, 3, 30.0,
-                    frozenset({"zegrid:cache_build"})),
+    StageDescriptor("zegrid:per_cell_stack", "zegrid", 4, ZEGRID_PHASE_PER_CELL_STACK, 3, 30.0),
     StageDescriptor("zegrid:assembly", "zegrid", 5, ZEGRID_PHASE_ASSEMBLY, 4, 15.0),
     StageDescriptor("zegrid:finalize", "zegrid", 6, ZEGRID_PHASE_FINALIZE, 5, 10.0),
 )
-_ZEGRID_ALIASES = {"zegrid:cache_build": "zegrid:per_cell_stack"}
+#: Diagnostic-only producer ids (never canonical progress stages).
+ZEGRID_DIAGNOSTIC_STAGE_IDS = frozenset({"zegrid:cache_build"})
+_ZEGRID_ALIASES: dict[str, str] = {}
 ZEGRID_PLAN = ModePlan("zegrid", _ZEGRID_STAGES, _ZEGRID_ALIASES)
 
 _PLANS = (LEGACY_PLAN, SDS_PLAN, ZEGRID_PLAN)

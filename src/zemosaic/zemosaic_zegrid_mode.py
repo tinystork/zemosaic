@@ -8842,6 +8842,7 @@ def _run_single(
     halo_px=ZEGRID_HALO_DEFAULT_PX,
     halo_provenance=None,
     scheduler_mode=zsched.MODE_LEGACY,
+    telemetry=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -8896,13 +8897,70 @@ def _run_single(
     def _log_line(line):
         _append_run_log_line(output_dir, line)
 
-    def _reporter():
+    def _reporter(*, emit_stage: bool = True):
         return zobs.PhaseReporter(
             _emit_live,
-            stage=_stage_live,
+            stage=_stage_live if emit_stage else None,
             log_line=_log_line,
             global_eta=global_eta.estimate,
         )
+
+    # ZM-WIN-OBSERVABILITY: optional resource telemetry, driven by the SAME
+    # controller/CSV contract as classic/SDS. It is a pure observer: every call
+    # is guarded and it can never affect admission or execution.
+    _telemetry_state: dict = {
+        "phase_name": "Init",
+        "phase_index": 0,
+        "tiles_done": 0,
+        "tiles_total": None,
+        "use_gpu": None,
+    }
+
+    def _telemetry_stats(
+        *,
+        phase_name: str | None = None,
+        phase_index: int | None = None,
+        tiles_done: int | None = None,
+        tiles_total: int | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        if telemetry is None:
+            return
+        try:
+            if phase_name is not None:
+                _telemetry_state["phase_name"] = str(phase_name)
+            if phase_index is not None:
+                _telemetry_state["phase_index"] = int(phase_index)
+            if tiles_done is not None:
+                _telemetry_state["tiles_done"] = int(tiles_done)
+            if tiles_total is not None:
+                _telemetry_state["tiles_total"] = int(tiles_total)
+            ctx = {
+                "phase_name": _telemetry_state["phase_name"],
+                "phase_index": int(_telemetry_state["phase_index"]),
+                "tiles_done": int(_telemetry_state["tiles_done"]),
+                "tiles_total": _telemetry_state["tiles_total"],
+                # Requested vs effective is kept explicit: ``auto`` is not 0.
+                "cpu_workers": int(workers) if isinstance(workers, int) else None,
+                "cpu_workers_requested": (
+                    int(workers) if isinstance(workers, int) else "auto"
+                ),
+                # ZeGrid streams by tiles, not row chunks; null + reason is honest.
+                "gpu_rows_per_chunk": None,
+                "max_chunk_bytes": None,
+                "gpu_rows_per_chunk_unavailable_reason": (
+                    "zegrid_uses_streaming_tiles_not_row_chunks"
+                ),
+                "max_chunk_bytes_unavailable_reason": (
+                    "zegrid_uses_streaming_tiles_not_row_chunks"
+                ),
+                "use_gpu": _telemetry_state.get("use_gpu"),
+            }
+            if extra:
+                ctx.update(extra)
+            telemetry.maybe_emit_stats(ctx)
+        except Exception:
+            pass
 
     # ZM-ZEGRID-R22: explicit GPU-usage + ignored-settings surfacing (nothing
     # silently ignored). ``gpu_used`` is the EFFECTIVE GPU backend (never claimed
@@ -8910,6 +8968,7 @@ def _run_single(
     # available / effective / device / VRAM truth + fallback reason.
     gpu_ctx = gpu_context or {}
     gpu_used = bool(gpu_ctx.get("effective"))
+    _telemetry_state["use_gpu"] = bool(gpu_used)
     ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=gpu_used)
     if ignored_settings:
         for line in zin.ignored_settings_warning_lines(ignored_settings):
@@ -8954,6 +9013,10 @@ def _run_single(
         throughput=_fmt_throughput(len(frames_info), timings.get("setup"), "frames/s")
     )
     global_eta.phase_completed("setup", timings.get("setup"))
+    _telemetry_stats(
+        phase_name="Setup", phase_index=0, tiles_done=len(frames_info),
+        tiles_total=len(frames_info),
+    )
     _emit(
         f"ZeGrid: canvas {canvas.width}x{canvas.height} "
         f"(resolution {canvas.resolution_deg:.3g} deg/px)",
@@ -9138,6 +9201,9 @@ def _run_single(
         throughput=_fmt_throughput(nx * ny, timings.get("layout"), "cells/s")
     )
     global_eta.phase_completed("layout", timings.get("layout"))
+    _telemetry_stats(
+        phase_name="Layout", phase_index=1, tiles_done=0, tiles_total=nx * ny,
+    )
     _emit(
         f"ZeGrid: layout {nx}x{ny} ({layout['cell_count']} cells, "
         f"source={layout.get('layout_source', 'auto')}) from RAM plan budget "
@@ -9577,6 +9643,9 @@ def _run_single(
         throughput=_fmt_throughput(len(descs), timings.get("gauge"), "frames/s")
     )
     global_eta.phase_completed("gauge", timings.get("gauge"))
+    _telemetry_stats(
+        phase_name="Gauge", phase_index=2, tiles_done=0, tiles_total=nx * ny,
+    )
     global_reference_frame_id = global_frame_ids[int(global_gauge.reference_index)]
     _emit(
         f"ZeGrid: global photometric gauge — reference frame {global_reference_frame_id!r} "
@@ -9891,10 +9960,26 @@ def _run_single(
     # cells); per_cell_stack reports CELLS done/total.
     cache_total_frames = sum(len(mem.patch_ids) for (_r, _c, _ce, _p, mem) in cell_ctxs if mem.patch_ids)
     cache_frames_done = 0
-    _cache_rep = _reporter()
+    # cache_build counts FRAMES; per_cell_stack counts CELLS. Keep the cache
+    # reporter diagnostics-only so a 0/1751 frame counter can never be mapped
+    # onto the canonical 0/9 cell stage or fed to the ETA estimator.
+    _cache_rep = _reporter(emit_stage=False)
     _stack_rep = _reporter()
     _cache_rep.start("cache_build", total=cache_total_frames, unit="frames")
     _stack_rep.start("per_cell_stack", total=total_cells, unit="cells")
+
+    def _gpu_unit_progress(done: int, cid: str | None) -> None:
+        """Authoritative ACTIVE-GPU cell completion (actual cid, live)."""
+        try:
+            _stack_rep.progress(int(done), item_id=cid)
+        except Exception:
+            pass
+        _telemetry_stats(
+            phase_name="Per-cell stacking",
+            phase_index=3,
+            tiles_done=int(done),
+            tiles_total=int(total_cells),
+        )
     # ------------------------------------------------------------------
     # ZM-ZEGRID-R41-B — the FINAL admitted bundle is the ONLY source for the
     # tasks / executor / diagnostics / log / manifest (no second plan, no stale
@@ -10805,7 +10890,8 @@ def _run_single(
         )
 
     def _run_r55_active_gpu_units(
-        *, gpu_bundle, gpu_mapping, gpu_decision, gpu_candidate=None
+        *, gpu_bundle, gpu_mapping, gpu_decision, gpu_candidate=None,
+        unit_progress=None
     ):
         """R55-E2: bounded CPU->GPU producer/consumer pipeline (single owner).
 
@@ -11021,12 +11107,25 @@ def _run_single(
             if cache_dir is not None:
                 _safe_rmtree(cache_dir, None)
 
+        _unit_progress = {"done": 0}
+
         def _consume_guarded(payload):
             try:
-                return _consume(payload)
+                result = _consume(payload)
             except BaseException as exc:
                 _capture_failure("consumer", exc, payload=payload)
                 raise
+            # Report ONLY a successful, non-discarded unit. A later batch-level
+            # failure discards these results and the CPU rerun re-reports its own
+            # real cells; nothing is ever counted before ``_consume`` succeeds.
+            _unit_progress["done"] += 1
+            if unit_progress is not None:
+                try:
+                    cid = getattr(payload.get("cell"), "cell_id", None)
+                    unit_progress(int(_unit_progress["done"]), cid)
+                except Exception:
+                    pass
+            return result
 
         def _consume(payload):
             unit_index = int(payload.get("_unit_index", 0))
@@ -12054,6 +12153,7 @@ def _run_single(
                 gpu_mapping=_r55_active_mapping,
                 gpu_decision=_r55_active_gpu_decision,
                 gpu_candidate=_r55_active_candidate,
+                unit_progress=_gpu_unit_progress,
             )
         except _R55GpuFallback as _gpu_exc:
             # EXACT whole-batch CPU fallback from a CLEAN state. Every GPU
@@ -12089,6 +12189,13 @@ def _run_single(
                 "reason": f"{_gpu_exc.reason_code}: {_gpu_exc.detail}",
                 "type": "R55GpuFallback",
             }
+            # Discarded GPU units must not bias the CPU rerun's ETA: restart the
+            # pass sampling. The canonical UI counter stays monotonic by design
+            # and the CPU rerun re-reports the real cells.
+            try:
+                _stack_rep.new_pass("cpu_fallback_after_gpu_fallback")
+            except Exception:
+                pass
             ignored_settings = zin.ignored_settings_present(
                 zconfig, gpu_honoured=False
             )
@@ -12589,6 +12696,10 @@ def _run_single(
         throughput=_fmt_throughput(len(assembled.complete_cells), timings.get("assembly"), "cells/s")
     )
     global_eta.phase_completed("assembly", timings.get("assembly"))
+    _telemetry_stats(
+        phase_name="Assembly", phase_index=4, tiles_done=total_cells,
+        tiles_total=total_cells,
+    )
 
     # I2 — no covered pixels -> explicit abort (never an all-NaN mosaic).
     if assembled.coverage_pixels == 0:
@@ -13689,6 +13800,7 @@ def run_zegrid_mode(
     r40_seam_capture: bool = False,
     r40_output_root: str | None = None,
     r40_seam_capture_disk_budget_bytes: int | None = None,
+    telemetry: object | None = None,
 ) -> None:
     """Run the NEW ZeGrid engine over the input folder's FITS inventory.
 
@@ -14112,7 +14224,8 @@ def run_zegrid_mode(
                         r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                         r40_seam_capture=r40_seam_capture,
                         r40_output_root=r40_output_root,
-                        r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes)
+                        r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
+                        telemetry=telemetry)
         if altz_frames:
             _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
@@ -14128,7 +14241,8 @@ def run_zegrid_mode(
                         r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                         r40_seam_capture=r40_seam_capture,
                         r40_output_root=r40_output_root,
-                        r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes)
+                        r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
+                        telemetry=telemetry)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -14146,4 +14260,5 @@ def run_zegrid_mode(
                     r37_diagnostic_holdout_cap=r37_diagnostic_holdout_cap,
                     r40_seam_capture=r40_seam_capture,
                     r40_output_root=r40_output_root,
-                    r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes)
+                    r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
+                    telemetry=telemetry)

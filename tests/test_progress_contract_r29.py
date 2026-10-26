@@ -47,9 +47,11 @@ def test_zegrid_plan_has_six_phases_with_finalize_and_merged_cache_build():
         "zegrid:setup", "zegrid:layout", "zegrid:gauge",
         "zegrid:per_cell_stack", "zegrid:assembly", "zegrid:finalize",
     ]
-    # cache_build is an alias of per_cell_stack (merged reality), NOT a 7th stage.
-    assert plan.normalize_id("zegrid:cache_build") == "zegrid:per_cell_stack"
+    # cache_build is a FRAME diagnostic, NOT a cell stage and NOT a 7th stage.
+    # It must never contaminate the canonical per-cell (cells) totals/ETA.
+    assert plan.normalize_id("zegrid:cache_build") == "zegrid:cache_build"
     assert plan.stage("zegrid:cache_build") is None
+    assert "zegrid:cache_build" in z.ZEGRID_DIAGNOSTIC_STAGE_IDS
     assert plan.stage("zegrid:per_cell_stack") is not None
 
 
@@ -128,7 +130,7 @@ def test_normalize_new_stable_zegrid_ids_unchanged():
 
 def test_normalize_counter_embedded_alias_collapses_to_canonical():
     plan = z.ZEGRID_PLAN
-    assert plan.normalize_id("zegrid:cache_build:5/10") == "zegrid:per_cell_stack"
+    assert plan.normalize_id("zegrid:cache_build:5/10") == "zegrid:cache_build"
 
 
 def test_counters_never_part_of_canonical_id():

@@ -124,6 +124,22 @@ def _sample_gpu_via_cupy() -> dict[str, Any]:
     return info
 
 
+def sample_gpu_via_nvml() -> dict[str, Any]:
+    """Public CUDA-free GPU observation for crash breadcrumbs.
+
+    NVML queries the driver only; it never creates a CUDA context, so it is safe
+    from the breadcrumb heartbeat thread and on a GPU-OFF run. Absent NVML/driver
+    keeps the fields null and reports an explicit reason.
+    """
+    info = _sample_gpu_via_nvml()
+    info["gpu_source"] = info.get("gpu_sample_source")
+    if info.get("gpu_total_mb") is None:
+        info["gpu_unavailable_reason"] = (
+            _NVML_STATE.get("error") or "nvml_unavailable"
+        )
+    return info
+
+
 def _default_log_and_callback(
     message_key_or_raw,
     progress_value=None,

@@ -181,19 +181,90 @@ def read_meminfo(path: str | os.PathLike[str] = DEFAULT_MEMINFO_PATH) -> dict:
     return result
 
 
-def read_parent_memory(
-    path: str | os.PathLike[str] = DEFAULT_PROC_STATUS_PATH,
+def _read_parent_memory_psutil(
+    *, reason: str, process_factory: Any | None = None
 ) -> dict:
-    """Current RSS and VmHWM peak of the PARENT process (diagnostic)."""
+    """Portable parent-process RSS fallback (Windows/macOS), never CUDA-aware.
+
+    ``/proc/<pid>/status`` does not exist on Windows, so the historical helper
+    returned nulls with an explicit reason. psutil is already a product
+    dependency and gives the parent's CURRENT RSS portably. A true peak is only
+    reported when the platform exposes one (e.g. Windows ``peak_wset``); it is
+    never derived from a boundary sample.
+    """
+    try:
+        if process_factory is not None:
+            proc = process_factory()
+        else:
+            import psutil  # local import: this module stays cheap on import
+
+            proc = psutil.Process(os.getppid())
+    except Exception as exc:
+        return {
+            "current_rss_bytes": None,
+            "peak_rss_bytes": None,
+            "source": "unavailable",
+            "unavailable_reason": f"{reason}; psutil_parent_unavailable: {exc}",
+        }
+    current = None
+    peak = None
+    peak_reason = None
+    try:
+        info = proc.memory_info()
+        current = int(getattr(info, "rss", 0) or 0)
+        peak_raw = getattr(info, "peak_wset", None)
+        if peak_raw is not None:
+            peak = int(peak_raw)
+        else:
+            peak_reason = "parent_peak_not_exposed_by_platform"
+    except Exception as exc:
+        return {
+            "current_rss_bytes": None,
+            "peak_rss_bytes": None,
+            "source": "unavailable",
+            "unavailable_reason": f"{reason}; psutil_memory_info_failed: {exc}",
+        }
+    return {
+        "current_rss_bytes": current,
+        "peak_rss_bytes": peak,
+        "source": "psutil_parent",
+        "unavailable_reason": peak_reason,
+    }
+
+
+def read_parent_memory(
+    path: str | os.PathLike[str] | None = DEFAULT_PROC_STATUS_PATH,
+    *,
+    process_factory: Any | None = None,
+) -> dict:
+    """Current RSS and peak of the PARENT process (diagnostic).
+
+    ``path=None`` asks directly for the portable psutil view (used on Windows or
+    when the caller knows ``/proc`` is absent). With the DEFAULT path, a missing
+    ``/proc/self/status`` falls back to psutil (notably Windows). An EXPLICIT
+    non-default path keeps the historical strict behaviour: unavailable is null
+    + reason, which the diagnostic callers and their tests rely on.
+    """
+    if path is None:
+        return _read_parent_memory_psutil(
+            reason="proc_status_not_requested",
+            process_factory=process_factory,
+        )
     p = Path(path)
     try:
         lines = p.read_text(encoding="ascii").splitlines()
     except OSError as exc:
-        return {
-            "current_rss_bytes": None,
-            "peak_rss_bytes": None,
-            "unavailable_reason": f"proc_status_unavailable: {exc}",
-        }
+        if str(path) != str(DEFAULT_PROC_STATUS_PATH):
+            return {
+                "current_rss_bytes": None,
+                "peak_rss_bytes": None,
+                "source": "unavailable",
+                "unavailable_reason": f"proc_status_unavailable: {exc}",
+            }
+        return _read_parent_memory_psutil(
+            reason=f"proc_status_unavailable: {exc}",
+            process_factory=process_factory,
+        )
     raw: dict[str, int] = {}
     wanted = ("VmRSS", "VmHWM")
     for line in lines:
@@ -234,6 +305,7 @@ def read_parent_memory(
     result = {
         "current_rss_bytes": None if current is None else int(current),
         "peak_rss_bytes": None if peak is None else int(peak),
+        "source": f"proc:{p.name}",
         "unavailable_reason": (
             None
             if current is not None and peak is not None
