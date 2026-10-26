@@ -49,9 +49,54 @@ class _FakeStructure:
     _fields_: tuple = ()
 
 
-def _fake_ctypes(loader):
+class _PositionalStructure:
+    """ctypes.Structure look-alike that stores fields at ABI byte offsets.
+
+    A fake driver can then write the raw slots in the DRIVER header order,
+    independently of the field names declared by the production code. That is
+    what makes the field order load-bearing: swapping two declarations swaps
+    the values the probe reads.
+    """
+
+    _fields_: tuple = ()
+    _slot_size = 8  # c_ulonglong on both Windows (LLP64) and Linux (LP64)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        offsets = {}
+        offset = 0
+        for name, _ctype in getattr(cls, "_fields_", ()):
+            offsets[name] = offset
+            offset += cls._slot_size
+        cls._offsets = offsets
+        cls._raw_size = offset
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_raw", bytearray(type(self)._raw_size))
+
+    def __getattr__(self, name):
+        offsets = type(self).__dict__.get("_offsets", {})
+        if name in offsets:
+            offset = offsets[name]
+            return int.from_bytes(
+                self._raw[offset : offset + self._slot_size], "little", signed=False
+            )
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        offsets = getattr(type(self), "_offsets", {})
+        if name in offsets:
+            offset = offsets[name]
+            self._raw[offset : offset + self._slot_size] = int(value).to_bytes(
+                self._slot_size, "little", signed=False
+            )
+            return
+        object.__setattr__(self, name, value)
+
+
+def _fake_ctypes(loader, structure=_FakeStructure):
     return types.SimpleNamespace(
-        Structure=_FakeStructure,
+        Structure=structure,
         c_int=int,
         c_uint=int,
         c_ulonglong=int,
@@ -107,6 +152,50 @@ def _fake_nvml_lib(
     lib.nvmlDeviceGetName = get_name
     lib.nvmlShutdown = shutdown
     return lib, calls
+
+
+def _positional_nvml_lib(
+    *,
+    total_mib: int = 8192,
+    free_mib: int = 7527,
+    used_mib: int = 494,
+    name: bytes = b"NVIDIA GeForce GTX 1070",
+):
+    """Fake NVML driver writing nvmlMemory_t bytes in the C header order.
+
+    Header (nvml.h): ``total``, ``free``, ``used`` — this fake never sets
+    attributes by name, only raw slots at 0/8/16, mirroring the real ABI.
+    """
+    mib = 1024 * 1024
+    lib = types.SimpleNamespace()
+
+    def nvml_init():
+        return 0
+
+    def get_handle(index, out):
+        out.value = 1
+        return 0
+
+    def memory_info(handle, out):
+        raw = out._raw
+        raw[0:8] = int(total_mib * mib).to_bytes(8, "little")
+        raw[8:16] = int(free_mib * mib).to_bytes(8, "little")
+        raw[16:24] = int(used_mib * mib).to_bytes(8, "little")
+        return 0
+
+    def get_name(handle, buf, size):
+        buf.value = name
+        return 0
+
+    def shutdown():
+        return 0
+
+    lib.nvmlInit_v2 = nvml_init
+    lib.nvmlDeviceGetHandleByIndex_v2 = get_handle
+    lib.nvmlDeviceGetMemoryInfo = memory_info
+    lib.nvmlDeviceGetName = get_name
+    lib.nvmlShutdown = shutdown
+    return lib
 
 
 def _pynvml_down(monkeypatch: pytest.MonkeyPatch, token: str = "pynvml_unavailable"):
@@ -178,6 +267,54 @@ def test_probe_falls_back_to_ctypes_nvml(monkeypatch: pytest.MonkeyPatch) -> Non
     # The driver handle is released (no leaked NVML reference).
     assert calls["init"] == 1
     assert calls["shutdown"] == 1
+
+
+def test_ctypes_nvml_reads_header_field_order_positionally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ZM-WIN-NVML-ORDER: read values by ABI position, header order total/free/used.
+
+    The fake driver writes the raw slots in the real header order
+    (total=8192 MiB, free=7527 MiB, used=494 MiB). Declaring the struct in any
+    other order makes this test read 7527 as ``used`` and 494 as ``free``.
+    """
+    _pynvml_down(monkeypatch)
+    lib = _positional_nvml_lib(total_mib=8192, free_mib=7527, used_mib=494)
+    monkeypatch.setattr(
+        rt,
+        "_CTYPES",
+        _fake_ctypes(lambda _name: lib, structure=_PositionalStructure),
+    )
+
+    info = rt.sample_gpu_via_nvml()
+
+    assert info["gpu_source"] == "ctypes_nvml"
+    assert info["gpu_total_mb"] == pytest.approx(8192.0)
+    assert info["gpu_free_mb"] == pytest.approx(7527.0)
+    assert info["gpu_used_mb"] == pytest.approx(494.0)
+    assert info["gpu_unavailable_reason"] is None
+
+
+def test_sum_invariant_does_not_detect_a_swap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The used+free~=total guard is blind to a swap: document, don't rely on it."""
+    warnings: list[str] = []
+
+    def fake_warning(msg, *args):
+        warnings.append(msg % args if args else msg)
+
+    monkeypatch.setattr(rt, "logger", types.SimpleNamespace(warning=fake_warning))
+
+    # Real M106 observation (correct values): the sum is coarse, not exact.
+    assert rt._nvml_memory_drift_mb(494.0, 7527.0, 8192.0) == pytest.approx(171.0)
+    assert rt._check_nvml_memory_coherence(494.0, 7527.0, 8192.0) is True
+    # The swapped pair has the exact same sum, so the guard still says "fine".
+    assert rt._check_nvml_memory_coherence(7527.0, 494.0, 8192.0) is True
+    assert warnings == []
+    # A genuinely inconsistent triple is still reported (warning only).
+    assert rt._check_nvml_memory_coherence(7000.0, 7000.0, 8192.0) is False
+    assert len(warnings) == 1
+    assert "ctypes_nvml_memory_inconsistent" in warnings[0]
+    assert "used=7000.0MB" in warnings[0]
 
 
 def test_ctypes_nvml_dll_failure_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:

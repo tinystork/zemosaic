@@ -194,6 +194,44 @@ def _nvml_bind(lib: Any, names: tuple[str, ...], restype: Any, argtypes: Any) ->
     return None
 
 
+def _nvml_memory_drift_mb(used_mb: float, free_mb: float, total_mb: float) -> float:
+    """Byte-derived drift of the nvmlMemory_t triple."""
+    return abs((float(used_mb) + float(free_mb)) - float(total_mb))
+
+
+def _check_nvml_memory_coherence(used_mb: float, free_mb: float, total_mb: float) -> bool:
+    """Coherence guard on ``used + free ~= total`` (nvmlMemory_t, NVML v1).
+
+    LIMIT, stated explicitly: this guard does NOT detect a ``used``/``free``
+    field-order swap. Swapping two addends leaves the sum unchanged, which is
+    exactly why the real regression evidence had a consistent total while the
+    published numbers were inverted. The layout itself is pinned positionally by
+    ``test_ctypes_nvml_reads_header_field_order_positionally``; this guard only
+    catches genuinely inconsistent driver output (e.g. reserved memory excluded
+    from one slot by a future ABI).
+    """
+    drift_mb = _nvml_memory_drift_mb(used_mb, free_mb, total_mb)
+    # Coarse by design: reserved/driver overhead means real hardware does not
+    # report an exact equality (`nvidia-smi` showed 494 + 7527 for total=8192).
+    tolerance_mb = max(64.0, float(total_mb) * 0.05)
+    if drift_mb <= tolerance_mb:
+        return True
+    try:
+        logger.warning(
+            "ctypes_nvml_memory_inconsistent: used=%.1fMB free=%.1fMB "
+            "total=%.1fMB drift=%.1fMB (>%.1fMB tolerance); "
+            "note: a used/free swap is NOT detectable this way",
+            float(used_mb),
+            float(free_mb),
+            float(total_mb),
+            drift_mb,
+            tolerance_mb,
+        )
+    except Exception:
+        pass
+    return False
+
+
 def _sample_gpu_via_ctypes_nvml() -> tuple[dict[str, Any] | None, str | None]:
     """Query the NVML driver directly through ctypes (no Python binding).
 
@@ -217,10 +255,14 @@ def _sample_gpu_via_ctypes_nvml() -> tuple[dict[str, Any] | None, str | None]:
         return None, "ctypes_nvml_failed:handle_symbol"
 
     class _NvmlMemory(_CTYPES.Structure):
+        # ZM-WIN-NVML-ORDER: the driver header declares nvmlMemory_t as
+        # {total, free, used} (nvml.h), NOT {total, used, free}. Declaring the
+        # wrong order silently reports free as used and used as free; the sum
+        # stays correct, so only a positional test catches it.
         _fields_ = (
             ("total", _CTYPES.c_ulonglong),
-            ("used", _CTYPES.c_ulonglong),
             ("free", _CTYPES.c_ulonglong),
+            ("used", _CTYPES.c_ulonglong),
         )
 
     mem_fn = _nvml_bind(
@@ -256,6 +298,7 @@ def _sample_gpu_via_ctypes_nvml() -> tuple[dict[str, Any] | None, str | None]:
             if free_raw is not None
             else max(0.0, total_mb - used_mb)
         )
+        _check_nvml_memory_coherence(used_mb, free_mb, total_mb)
         info = _gpu_info_defaults()
         info.update(
             gpu_used_mb=used_mb,

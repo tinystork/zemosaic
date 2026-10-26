@@ -93,6 +93,81 @@ New consumers must use:
 Do not add new logic on top of `ram_used_mb`; treat it as a read-only legacy
 field.
 
+## Follow-up: `ZM-WIN-NVML-ORDER-20261026` (ctypes NVML field order)
+
+### Cause
+
+`nvmlMemory_t` is declared in `nvml.h` as:
+
+```c
+typedef struct nvmlMemory_st {
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+} nvmlMemory_t;
+```
+
+The ctypes fallback in `zemosaic_resource_telemetry.py` declared
+`(total, used, free)` instead, so `mem.used` read the **free** slot and
+`mem.free` read the **used** slot. Because the three values still summed to the
+same total, the defect was invisible to any "used + free == total" style check.
+
+### Field evidence (Windows, M106, `ce9517d`)
+
+- breadcrumb (`ctypes_nvml`): `used=7526.03`, `total=8192`, `free=665.97`
+- `nvidia-smi` at the same moment: `used=494`, `total=8192`, `free=7527`
+- `resource_telemetry.csv` (CuPy path): `used=1075.5`, `total=8191.5`,
+  `free=7116`
+
+The breadcrumb's `used` was carrying the **free** value (7526 ≈ 7527) and its
+`free` the **used** value (666 vs 494 — different instant, same magnitude). The
+pynvml and CuPy paths were always correct; they read typed attributes from their
+own bindings and are untouched by this fix.
+
+### Fix
+
+- `_NvmlMemory._fields_` is now `(total, free, used)`, matching the header.
+  `getattr(mem, "free")` therefore reads the free slot, and the existing
+  `total - used` fallback is only used when the field is absent.
+- No other code depends on the field order: the only consumers are `mem.total`,
+  `mem.used` and `mem.free` by name.
+
+### Coherence guard (deliberately not a swap detector)
+
+`_check_nvml_memory_coherence()` warns (`ctypes_nvml_memory_inconsistent`) when
+`|used + free - total|` exceeds `max(64 MB, 5 % of total)`. The tolerance is
+coarse on purpose: real hardware reserves memory, and the real M106
+`nvidia-smi` reading was `494 + 7527` for `total=8192` (171 MB gap).
+
+This guard **cannot detect a used/free swap**: swapping two addends leaves the
+sum unchanged. That is stated in the function docstring and pinned by a test.
+The real proof of the layout is the positional regression test below. The guard
+is a warning only; it never invalidates a published measurement.
+
+### NVML v2: not adopted (documented choice)
+
+`nvmlDeviceGetMemoryInfo_v2` / `nvmlMemory_v2_t` (`c_uint version`, 8-byte
+alignment, then `total`, `reserved`, `free`, `used`, with
+`NVML_STRUCT_VERSION(Memory, 2)`) was **not** implemented. It introduces a
+versioned-struct ABI and different semantics (`reserved`, `used` excluding
+reserved) that cannot be validated positionally against a real Windows driver
+in this environment. A correct v1 is preferable to an approximate v2; v2 stays
+a possible follow-up once it can be exercised on a real GPU host.
+
+### Tests (fakes only, no GPU)
+
+`tests/test_zegrid_windows_gpu_probe_fallback.py`:
+
+- `test_ctypes_nvml_reads_header_field_order_positionally` — the fake driver
+  writes raw slots at bytes 0/8/16 in the header order (`total=8192`,
+  `free=7527`, `used=494`) and never sets attributes by name; the assertion
+  demands `gpu_free_mb≈7527` and `gpu_used_mb≈494`. Swapping the two
+  declarations makes it fail (verified by mutation: `Obtained: 494.0,
+  Expected: 7527.0`).
+- `test_sum_invariant_does_not_detect_a_swap` — shows the guard accepts the
+  swapped pair (identical sum) and still reports a genuinely inconsistent
+  triple.
+
 ## Validation
 
 - `tests/test_zegrid_windows_observability_r1.py` (new, 11 tests): unit
@@ -103,12 +178,14 @@ field.
   telemetry, crash-breadcrumb witness, R55-E11 GPU adaptation, GPU admission
   fallback, R55-E2 prefetch, R55-D2 CPU active, ACTIVE OOC parity, layout
   observability, R55-E1 checkpoints.
-- `tests/test_zegrid_windows_gpu_probe_fallback.py` (new, 9 tests): ordered
+- `tests/test_zegrid_windows_gpu_probe_fallback.py` (now 11 tests): ordered
   `pynvml` -> `ctypes` NVML -> `nvidia-smi` cascade with fakes (no GPU), the
   5 s TTL cache, the aggregated all-sources-unavailable reason, a static guard
   that the probe never references CuPy/`memGetInfo`, the ZeGrid
   `in_flight = 1` publication, and a before/after proof that telemetry ON
-  changes neither the plan JSON nor the resource envelope.
+  changes neither the plan JSON nor the resource envelope. `ZM-WIN-NVML-ORDER`
+  added the positional `nvmlMemory_t` field-order pin and the guard-blindness
+  test.
 - Two `test_zegrid_r55d2_cpu_active.py` failures
   (`test_plan_refusal_...`, `test_admission_exhaustion_...`) reproduce at
   baseline `689e9c8` and are **pre-existing**, not regressions.
@@ -116,9 +193,13 @@ field.
 ## Limits / next step
 
 - Real Windows sampling was **NOT_RUN** (no Windows host here). The portable
-  paths are unit-tested with fakes only; in particular the real `nvml.dll`
-  struct layout and the real `nvidia-smi` output are exercised by fakes, not by
-  a Windows GPU.
+  paths are unit-tested with fakes only; in particular the real `nvidia-smi`
+  output is exercised by fakes, not by a Windows GPU. The `nvmlMemory_t` field
+  order is now pinned against the driver header *by position*, and the original
+  defect was confirmed by cross-checking a real Windows run against
+  `nvidia-smi` and the CuPy CSV, but the corrected ctypes path itself has not
+  been re-run on Windows (`ZM-WIN-NVML-ORDER` real-host validation:
+  **NOT_RUN**).
 - The end-to-end GUI -> worker flag -> ZeGrid lifecycle was validated at the
   controller/signature level and by phase/per-cell wiring, not by a full GUI run.
 - Next: run one short Windows ZeGrid ACTIVE GPU job with the Resource monitor ON
