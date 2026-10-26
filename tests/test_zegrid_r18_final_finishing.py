@@ -448,9 +448,12 @@ def stable_host_ram(monkeypatch):
 
     These tests exercise FINISHING, not RAM planning. Without a pin they inherit
     the ambient host pressure of the combined fast order; the layout plan can
-    then refuse on a low-RAM moment, which is unrelated to finishing and is
-    reproducible on beta 3fa088c under the same pressure. The pin is the same
-    generous value used by the E2 end-to-end tests and changes no product policy.
+    then refuse on a low-RAM moment, which is unrelated to finishing. That
+    low-RAM layout-floor refusal was reproduced on this candidate alone at a
+    low-RAM moment (a combined-order beta reproduction was NOT obtained: beta's
+    fast order is already red earlier at r15_windows_filelock). The pin is the
+    same generous value used by the E2 end-to-end tests and changes no product
+    policy.
     """
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: 12 * 2 ** 30)
 
