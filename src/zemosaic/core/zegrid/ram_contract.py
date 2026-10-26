@@ -74,6 +74,11 @@ __all__ = [
     "cache_per_cell_bytes",
     "cache_phase_total_bytes",
     "aggregate_phase_bytes",
+    "AGGREGATE_RULE_MAX_OVER_PHASES",
+    "AGGREGATE_RULE_STACK_PLUS_CACHE",
+    "AGGREGATE_RULE_PROJECTED_HOST_PEAK",
+    "AGGREGATE_RULES",
+    "projected_host_peak_bytes",
     "feasible_concurrency",
 ]
 
@@ -89,9 +94,13 @@ ADMIT_FACTOR_DEN = 10
 # ZM-ZEGRID-R56 REWORK-1 (F2): explicit aggregation rules for the plan envelope.
 AGGREGATE_RULE_MAX_OVER_PHASES = "max_over_phases"
 AGGREGATE_RULE_STACK_PLUS_CACHE = "simultaneous_stack_plus_cache_minus_shared"
+# ZM-ZEGRID-R56 UNIFIED PLAN/ADMIT/RUN projection: the ONE depth-aware host
+# peak (serial at p=0, exactly one overlapping producer at p>=1).
+AGGREGATE_RULE_PROJECTED_HOST_PEAK = "projected_host_peak_v1"
 AGGREGATE_RULES = (
     AGGREGATE_RULE_MAX_OVER_PHASES,
     AGGREGATE_RULE_STACK_PLUS_CACHE,
+    AGGREGATE_RULE_PROJECTED_HOST_PEAK,
 )
 
 # The SINGLE authoritative process floor shared by the host phase accounting.
@@ -310,8 +319,14 @@ class PlanEnvelope:
     reason: str
     # ZM-ZEGRID-R56 REWORK-1 (F2): which aggregation rule produced
     # ``aggregate_bytes``. The default preserves every existing envelope; only
-    # the ACTIVE GPU bundle declares the simultaneous rule.
+    # the ACTIVE GPU bundle declares the projected rule.
     aggregate_rule: str = AGGREGATE_RULE_MAX_OVER_PHASES
+    # ZM-ZEGRID-R56 UNIFIED PROJECTION: the published depth inputs of the ONE
+    # projected host peak (PLAN/ADMIT/RUN). They are only consumed by
+    # AGGREGATE_RULE_PROJECTED_HOST_PEAK; defaults keep older envelopes valid.
+    prefetch_units: int = 0
+    producer_owner_bytes: int = 0
+    prefetch_resident_per_slot_bytes: int = 0
 
     @property
     def layout_identity(self) -> tuple:
@@ -336,6 +351,11 @@ class PlanEnvelope:
             "cache_total_bytes": int(self.cache_total_bytes),
             "aggregate_bytes": int(self.aggregate_bytes),
             "aggregate_rule": str(self.aggregate_rule),
+            "prefetch_units": int(self.prefetch_units),
+            "producer_owner_bytes": int(self.producer_owner_bytes),
+            "prefetch_resident_per_slot_bytes": int(
+                self.prefetch_resident_per_slot_bytes
+            ),
             "pinned": bool(self.pinned),
             "reason": str(self.reason),
         }
@@ -416,7 +436,8 @@ def validate_envelope(envelope: PlanEnvelope) -> None:
     for name in (
         "refinement_rank", "cpu_tile", "cells_in_flight",
         "cache_workers_per_cell", "shared_bytes", "stack_total_bytes",
-        "cache_total_bytes", "aggregate_bytes",
+        "cache_total_bytes", "aggregate_bytes", "prefetch_units",
+        "producer_owner_bytes", "prefetch_resident_per_slot_bytes",
     ):
         _require_nonneg_int(getattr(envelope, name), name)
     if envelope.gpu_tile is not None:
@@ -426,9 +447,21 @@ def validate_envelope(envelope: PlanEnvelope) -> None:
             f"unknown aggregate_rule {envelope.aggregate_rule!r} "
             f"(expected {AGGREGATE_RULES})"
         )
+    if int(envelope.stack_total_bytes) < int(envelope.shared_bytes):
+        raise InvalidEnvelope("stack_total_bytes < shared_bytes")
+    if int(envelope.cache_total_bytes) < int(envelope.shared_bytes):
+        raise InvalidEnvelope("cache_total_bytes < shared_bytes")
     if envelope.aggregate_rule == AGGREGATE_RULE_MAX_OVER_PHASES:
         expected_aggregate = max(
             int(envelope.stack_total_bytes), int(envelope.cache_total_bytes)
+        )
+    elif envelope.aggregate_rule == AGGREGATE_RULE_PROJECTED_HOST_PEAK:
+        expected_aggregate = projected_host_peak_bytes(
+            int(envelope.shared_bytes),
+            int(envelope.stack_total_bytes) - int(envelope.shared_bytes),
+            int(envelope.producer_owner_bytes),
+            int(envelope.prefetch_units),
+            int(envelope.prefetch_resident_per_slot_bytes),
         )
     else:
         expected_aggregate = simultaneous_stack_and_cache_bytes(
@@ -441,12 +474,11 @@ def validate_envelope(envelope: PlanEnvelope) -> None:
             f"aggregate_bytes {envelope.aggregate_bytes} != {expected_aggregate} "
             f"under aggregate_rule {envelope.aggregate_rule!r} "
             f"(stack_total {envelope.stack_total_bytes}, cache_total "
-            f"{envelope.cache_total_bytes}, shared {envelope.shared_bytes})"
+            f"{envelope.cache_total_bytes}, shared {envelope.shared_bytes}, "
+            f"prefetch {envelope.prefetch_units}, owner "
+            f"{envelope.producer_owner_bytes}, resident/slot "
+            f"{envelope.prefetch_resident_per_slot_bytes})"
         )
-    if int(envelope.stack_total_bytes) < int(envelope.shared_bytes):
-        raise InvalidEnvelope("stack_total_bytes < shared_bytes")
-    if int(envelope.cache_total_bytes) < int(envelope.shared_bytes):
-        raise InvalidEnvelope("cache_total_bytes < shared_bytes")
     if envelope.backend not in _BACKENDS:
         raise InvalidEnvelope(f"unknown backend {envelope.backend!r} (expected {_BACKENDS})")
     if not isinstance(envelope.pinned, bool):
@@ -651,6 +683,54 @@ def simultaneous_stack_and_cache_bytes(
             f"shared (stack={st}, cache={ct}, shared={sh})"
         )
     return int(st) + int(ct) - int(sh)
+
+
+def projected_host_peak_bytes(
+    shared_bytes: int,
+    stack_added_bytes: int,
+    producer_owner_bytes: int,
+    prefetch_units: int,
+    prefetch_resident_per_slot_bytes: int,
+) -> int:
+    """THE single PLAN/ADMIT/RUN projected host peak (depth-aware).
+
+    ::
+
+        projected = shared
+                  + stack_added
+                  + (producer_owner if prefetch >= 1 else 0)
+                  + prefetch * prefetch_resident_per_slot
+
+    Semantics (established, not re-derived here):
+
+    * ``shared`` is ``PROCESS_BASELINE`` counted exactly ONCE — never per cell
+      and never twice.
+    * ``stack_added`` is the ADDED streaming bound above that baseline for the
+      active stack (``K * per-tile added bound``), NOT the total estimate.
+    * ``producer_owner`` is the ONE producer phase that genuinely coexists with
+      the consumer (``max(cache build set, cell normalization)``, already
+      reduced to one owner by the caller). It is charged ONLY at ``prefetch >=
+      1``: at ``prefetch == 0`` the queue is full during the stack, so the
+      producer is blocked and no concurrent owner exists.
+    * ``prefetch_resident_per_slot`` is the resident host credit of ONE queued
+      slot. The on-disk bytes stay in their own ledger dimension.
+    * the initial global gauge is a phase BEFORE the pipeline and is never
+      summed here.
+
+    Every input must be a non-negative plain int (bool refused); an invalid
+    input fails closed instead of producing an optimistic peak.
+    """
+    shared = _require_nonneg_int(shared_bytes, "shared_bytes")
+    added = _require_nonneg_int(stack_added_bytes, "stack_added_bytes")
+    owner = _require_nonneg_int(producer_owner_bytes, "producer_owner_bytes")
+    units = _require_nonneg_int(prefetch_units, "prefetch_units")
+    resident = _require_nonneg_int(
+        prefetch_resident_per_slot_bytes, "prefetch_resident_per_slot_bytes"
+    )
+    total = shared + added + units * resident
+    if units >= 1:
+        total += owner
+    return int(total)
 
 
 def feasible_concurrency(

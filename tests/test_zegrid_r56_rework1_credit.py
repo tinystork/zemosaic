@@ -375,6 +375,62 @@ def test_envelope_accepts_both_rules_and_refuses_mismatch():
             )
         )
 
+    # UNIFIED PROJECTION rule: shared + added + (owner if p>=1) + p*resident.
+    projected_zero = rcontract.PlanEnvelope(
+        aggregate_bytes=1000,
+        aggregate_rule=rcontract.AGGREGATE_RULE_PROJECTED_HOST_PEAK,
+        prefetch_units=0,
+        producer_owner_bytes=600,
+        prefetch_resident_per_slot_bytes=10,
+        **base,
+    )
+    rcontract.validate_envelope(projected_zero)  # p=0: owner NOT charged
+    projected_one = rcontract.PlanEnvelope(
+        aggregate_bytes=1000 + 600 + 10,
+        aggregate_rule=rcontract.AGGREGATE_RULE_PROJECTED_HOST_PEAK,
+        prefetch_units=1,
+        producer_owner_bytes=600,
+        prefetch_resident_per_slot_bytes=10,
+        **base,
+    )
+    rcontract.validate_envelope(projected_one)
+    with pytest.raises(rcontract.InvalidEnvelope):
+        rcontract.validate_envelope(
+            rcontract.PlanEnvelope(
+                aggregate_bytes=1000 + 600,
+                aggregate_rule=rcontract.AGGREGATE_RULE_PROJECTED_HOST_PEAK,
+                prefetch_units=1,
+                producer_owner_bytes=600,
+                prefetch_resident_per_slot_bytes=10,
+                **base,
+            )
+        )
+
+
+def test_projected_host_peak_is_one_function_for_every_depth():
+    """The published projection: serial at p=0, one owner + resident at p>=1."""
+    shared, added, owner, resident = 340 * MIB, 900 * MIB, 200 * MIB, 7 * MIB
+    assert rcontract.projected_host_peak_bytes(
+        shared, added, owner, 0, resident
+    ) == shared + added
+    for p in (1, 2, 3, 4):
+        assert rcontract.projected_host_peak_bytes(
+            shared, added, owner, p, resident
+        ) == shared + added + owner + p * resident
+    # Stack is NEVER re-billed per slot and the owner is charged exactly once.
+    assert rcontract.projected_host_peak_bytes(
+        shared, added, owner, 2, resident
+    ) - rcontract.projected_host_peak_bytes(
+        shared, added, owner, 1, resident
+    ) == resident
+    for bad in (-1, True, 1.5, None, "1"):
+        with pytest.raises(rcontract.RamContractError):
+            rcontract.projected_host_peak_bytes(
+                shared, added, owner, bad, resident
+            )
+    with pytest.raises(rcontract.RamContractError):
+        rcontract.projected_host_peak_bytes(shared, -1, owner, 0, resident)
+
 
 def _ctx(**over):
     data = dict(
@@ -406,34 +462,66 @@ def _ctx(**over):
     return zs.PlanContext(**data)
 
 
-def test_concurrent_producer_breaks_the_max_only_model():
-    """Each phase alone fits; the simultaneous sum must refuse/shrink.
+def test_p0_serial_does_not_charge_a_concurrent_producer():
+    """A prefetch-0 plan is SERIAL: the producer is blocked, so no owner.
 
-    stack(100+400) + prefetch(0) = 500 with margin 15% -> 575 <= 1000.
-    Adding a concurrent producer owner of 600 -> 1100 with margin -> 1265 > 1000,
-    so no candidate is feasible at prefetch 0: the honest model refuses instead
-    of publishing a max-only plan.
+    stack = shared(100) + per_unit(400) = 500 with the 15 % margin = 575 <=
+    1000. An owner of 600 is declared but must NOT be charged at p == 0.
     """
-    without = zs.enumerate_candidates(_ctx())
-    assert any(c.feasible for c in without)
-    with_owner = zs.enumerate_candidates(_ctx(concurrent_producer_bytes=600))
-    assert not any(c.feasible for c in with_owner)
-    reasons = {c.reason_code for c in with_owner if not c.feasible}
-    assert reasons == {zs.REASON_REFUSE_HOST_RAM}
-
-
-def test_concurrent_producer_is_added_not_maxed():
-    plain = _ctx(per_unit_stack_bytes=800, per_unit_prefetch_bytes=0,
-                 prefetch_ladder=(0,))
-    owner = _ctx(per_unit_stack_bytes=800, per_unit_prefetch_bytes=0,
-                 prefetch_ladder=(0,), concurrent_producer_bytes=250)
     def host(ctx):
+        candidates = zs.enumerate_candidates(ctx)
         return next(
-            c.host_peak_bytes for c in zs.enumerate_candidates(ctx) if c.feasible
-        ) if any(c.feasible for c in zs.enumerate_candidates(ctx)) else max(
-            c.host_peak_bytes for c in zs.enumerate_candidates(ctx)
+            c.host_peak_bytes for c in candidates
+            if c.feasible
+        ) if any(c.feasible for c in candidates) else max(
+            c.host_peak_bytes for c in candidates
         )
-    assert host(owner) - host(plain) == 250
+
+    plain = _ctx(
+        per_unit_stack_bytes=400, prefetch_ladder=(0,), units_total=1
+    )
+    owner = _ctx(
+        per_unit_stack_bytes=400,
+        prefetch_ladder=(0,),
+        units_total=1,
+        concurrent_producer_bytes=600,
+    )
+    assert host(plain) == 100 + 400
+    assert host(owner) == 100 + 400
+    assert all(c.feasible for c in zs.enumerate_candidates(owner))
+
+
+def test_p1_charges_exactly_one_producer_and_the_resident_credit():
+    """At p >= 1 the producer genuinely overlaps and is charged ONCE.
+
+    stack(100+400) + owner(600) + 1 * resident(10) = 1110 with 15 % margin ->
+    1277 > 1000, so the overlap candidate is honestly refused instead of being
+    approved from a max-only model.
+    """
+    def host(ctx):
+        candidates = zs.enumerate_candidates(ctx)
+        return max(c.host_peak_bytes for c in candidates)
+
+    plain = _ctx(
+        per_unit_stack_bytes=400,
+        per_unit_prefetch_bytes=10,
+        prefetch_ladder=(1,),
+        units_total=1,
+    )
+    owner = _ctx(
+        per_unit_stack_bytes=400,
+        per_unit_prefetch_bytes=10,
+        prefetch_ladder=(1,),
+        units_total=1,
+        concurrent_producer_bytes=600,
+    )
+    assert host(plain) == 100 + 400 + 1 * 10
+    assert host(owner) - host(plain) == 600
+    # Each phase alone fits (500*1.15=575); the overlap does NOT (1277 > 1000).
+    assert any(c.feasible for c in zs.enumerate_candidates(plain))
+    with_owner = zs.enumerate_candidates(owner)
+    assert not any(c.feasible for c in with_owner)
+    assert {c.reason_code for c in with_owner} == {zs.REASON_REFUSE_HOST_RAM}
 
 
 def test_n341_and_10k_descriptor_accounting():

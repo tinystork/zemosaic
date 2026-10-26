@@ -47,6 +47,7 @@ from zemosaic.core.canonical_streaming import (
 from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import gpu as zgpu
 from zemosaic.core.zegrid import gpu_readiness as zgr
+from zemosaic.core.zegrid import ram_contract as rcontract
 from zemosaic.core.zegrid import scheduler as zs
 
 MIB = 2 ** 20
@@ -79,10 +80,11 @@ WITNESS_SELECTED_PREFETCH = 0
 WITNESS_SELECTED_WORKERS = 14
 WITNESS_SHARED = 356515840
 WITNESS_ADDED_448 = 5942398976
-# R55-E11 host-credit correction: the per-unit cache contract is RGB f32
-# + support bool + one 128-byte .npy header per file (66 frames), so the
-# exact chosen host peak rises by 155124156 B vs the RGB-only estimate.
-WITNESS_HOST_448 = 8315326092
+# ZM-ZEGRID-R56 UNIFIED PROJECTION: the selected witness is p == 0 (serial
+# queue), so the producer is BLOCKED during the stack and is NOT charged.
+# The historical max-only model billed the concurrent producer owner
+# unconditionally (8 315 326 092 B); the honest p0 peak is shared + added.
+WITNESS_HOST_448 = WITNESS_SHARED + WITNESS_ADDED_448
 WITNESS_DEVICE_448 = 4131895552
 WITNESS_AGGREGATE_HOST = 10305433931
 WITNESS_AGGREGATE_DEVICE = 4131895552
@@ -275,13 +277,20 @@ def test_e9_windows_m106_witness_uses_the_vram_max_tile(m106):
     assert chosen.tile_px == WITNESS_SELECTED_TILE
     assert chosen.prefetch_units == WITNESS_SELECTED_PREFETCH
     assert chosen.units_in_flight == 1
-    # REWORK-1 (F2): exact composition of the simultaneous host peak.
+    # UNIFIED PROJECTION: shared + added + (owner if p>=1) + p*resident.
+    # At the selected p == 0 the producer is blocked and is NOT charged.
+    _p = int(WITNESS_SELECTED_PREFETCH)
+    if _p >= 1:
+        _owner = int(decision.facts["concurrent_producer_bytes"])
+    else:
+        _owner = 0
     assert chosen.host_peak_bytes == (
         int(bundle.shared_bytes)
         + WITNESS_ADDED_448
-        + WITNESS_SELECTED_PREFETCH * int(decision.facts["per_unit_cache"])
-        + int(decision.facts["concurrent_producer_bytes"])
+        + _owner
+        + _p * int(decision.facts["per_unit_prefetch_host"])
     )
+    assert chosen.host_peak_bytes == WITNESS_HOST_448
     assert chosen.device_peak_bytes == WITNESS_DEVICE_448
     assert dict(decision.gpu_host_bound_by_tile)[WITNESS_SELECTED_TILE] == (
         WITNESS_ADDED_448
@@ -310,12 +319,15 @@ def test_e9_windows_m106_witness_uses_the_vram_max_tile(m106):
     assert applied.envelope.gpu_tile == WITNESS_SELECTED_TILE
     assert applied.envelope.backend == "gpu"
     assert applied.envelope.cells_in_flight == 1
-    # REWORK-1 (F2): the ACTIVE GPU aggregate is the SIMULTANEOUS footprint
-    # (stack + cache - shared, shared counted once), not max().
+    # UNIFIED PROJECTION: at p == 0 the apply envelope publishes the serial
+    # projected peak (== stack_total, shared counted once); the producer owner
+    # is NOT part of it.
+    assert applied.envelope.aggregate_rule == (
+        rcontract.AGGREGATE_RULE_PROJECTED_HOST_PEAK
+    )
+    assert applied.envelope.prefetch_units == WITNESS_SELECTED_PREFETCH
     assert applied.envelope.aggregate_bytes == (
         applied.envelope.stack_total_bytes
-        + applied.envelope.cache_total_bytes
-        - applied.envelope.shared_bytes
     )
     assert applied.envelope.aggregate_bytes <= WITNESS_B_PLAN
     assert applied.gpu_tile_size == WITNESS_SELECTED_TILE

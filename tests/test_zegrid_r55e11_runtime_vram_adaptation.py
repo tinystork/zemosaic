@@ -1106,6 +1106,10 @@ def _apply_fixture():
         policy=zgr.VramPolicy(),
         qualification={"percent": 70, "budget_bytes": 5_000_000_000},
         gpu_tile_ladder=(448, 384),
+        facts={
+            "concurrent_producer_bytes": 123456,
+            "per_unit_prefetch_host": 7890,
+        },
     )
     cell = SimpleNamespace(cell_id="c0", row=0, col=0)
     patch = SimpleNamespace(patch_shape_hw=patch_hw)
@@ -1170,28 +1174,41 @@ def test_e11_runtime_aggregate_equals_apply_and_does_not_double_count(tile):
     applied = zz._r55_active_gpu_apply(
         bundle, mapping=_apply_mapping(tile), decision=decision
     )
-    runtime = zz._r55_gpu_host_aggregate_for_tile(decision, bundle, tile)
+    runtime = zz._r55_gpu_host_aggregate_for_tile(
+        decision, bundle, tile, prefetch_units=1
+    )
     assert runtime == applied.envelope.aggregate_bytes
     added = dict(decision.gpu_host_bound_by_tile)[tile]
     assert applied.envelope.stack_total_bytes == bundle.shared_bytes + added
 
     total = int(zz._estimate_streaming_bytes(66, (1767, 1330), tile))
     old_stack = rcontract.stack_phase_total_bytes(bundle.shared_bytes, 1, total)
-    # REWORK-1 (F2): the ACTIVE GPU producer coexists with the consumer, so the
-    # aggregate is stack + cache - shared (shared counted ONCE), never max().
-    assert runtime == (
+    # UNIFIED PROJECTION: the mapping's p == 1 charges exactly ONE producer
+    # owner plus the resident prefetch credit on top of the serial stack.
+    prefetch = int(_apply_mapping(tile)["prefetch_units"])
+    assert prefetch == 1
+    expected = (
         applied.envelope.stack_total_bytes
-        + applied.envelope.cache_total_bytes
-        - bundle.shared_bytes
+        + int(decision.facts["concurrent_producer_bytes"])
+        + prefetch * int(decision.facts["per_unit_prefetch_host"])
+    )
+    assert runtime == expected
+    assert applied.envelope.aggregate_bytes == expected
+    assert applied.envelope.aggregate_rule == (
+        rcontract.AGGREGATE_RULE_PROJECTED_HOST_PEAK
     )
     old_max = max(
         applied.envelope.stack_total_bytes, applied.envelope.cache_total_bytes
     )
+    # The historical max() model UNDER-counts the coexisting producer owner:
+    # under the unified projection the excess over max() is exactly the owner
+    # plus the resident credit, minus any cache phase that exceeded the stack.
     assert runtime - old_max == (
-        min(applied.envelope.stack_total_bytes, applied.envelope.cache_total_bytes)
-        - bundle.shared_bytes
+        int(decision.facts["concurrent_producer_bytes"])
+        + prefetch * int(decision.facts["per_unit_prefetch_host"])
+        + applied.envelope.stack_total_bytes
+        - old_max
     )
-    # The historical max() model UNDER-counts the coexisting producer owner.
     assert runtime > old_max
     assert old_stack >= applied.envelope.stack_total_bytes
     check = zz._r55_runtime_tile_check(

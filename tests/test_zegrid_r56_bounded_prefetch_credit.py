@@ -19,6 +19,7 @@ producer/consumer overlap from observed work intervals (never from queue depth).
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 
@@ -432,3 +433,241 @@ def test_no_overlap_claim_when_consumer_never_coincides():
     # The intervals MAY still touch for a fast producer; what must never happen
     # is a positive claim without a positive intersection.
     assert witness["overlap_proved"] == (witness["intersection_s"] > 0)
+
+
+# ---------------------------------------------------------------------------
+# 4. FAITHFUL LP341 product witness (real entry/decision, no helper shortcut)
+# ---------------------------------------------------------------------------
+#
+# The historical helper built a PlanContext with ``concurrent_producer_bytes=0``,
+# so it could not prove the corrected product planner. This witness drives the
+# REAL product decision (``_r55_active_facts`` + ``_r55_active_gpu_decide``) with
+# the published LP341 facts:
+#   * 341 frames, halo 128, 3x3 layout, sky_mean, bounded storage;
+#   * worst patch 1625x1415 px (core 1369x1159 + 2*128 halo);
+#   * VRAM free 7 463 763 968 B, B_plan 14 687 984 025 B / raw 18 359 980 032 B.
+# The geometry is reconstructed from the published patch/halo/layout (the Windows
+# corpus is not present on this host); every number below is produced by the
+# product code paths, never by a hand-built PlanContext.
+
+LP_CORE_HW = (1369, 1159)
+LP_CANVAS_HW = (LP_CORE_HW[1] * 3, LP_CORE_HW[0] * 3)
+
+
+def _lp341_cell_ctxs():
+    from types import SimpleNamespace
+
+    out = []
+    core_h, core_w = LP_CORE_HW
+    for row in range(3):
+        for col in range(3):
+            cell = SimpleNamespace(
+                cell_id=f"r{row:04d}c{col:04d}",
+                core=SimpleNamespace(
+                    x0=col * core_w,
+                    y0=row * core_h,
+                    x1=(col + 1) * core_w,
+                    y1=(row + 1) * core_h,
+                ),
+            )
+            patch = SimpleNamespace(
+                patch=SimpleNamespace(
+                    width=LP_WORST_PATCH_HW[1], height=LP_WORST_PATCH_HW[0]
+                ),
+                patch_shape_hw=LP_WORST_PATCH_HW,
+            )
+            mem = SimpleNamespace(
+                patch_ids=tuple(f"lp341_{i}" for i in range(LP_N_FRAMES))
+            )
+            out.append((row, col, cell, patch, mem))
+    return tuple(out)
+
+
+@dataclasses.dataclass
+class _LPBundle:
+    envelope: object
+    shared_bytes: int
+    cache_worker_footprint_bytes: int
+    gauge_worker_footprint_bytes: int
+    gauge_workers: int
+    cache_build_workers: int
+    layout: dict
+    storage_profile: str = "bounded"
+    cell_specs: list = dataclasses.field(default_factory=list)
+    cell_tasks: list = dataclasses.field(default_factory=list)
+    attempts: list = dataclasses.field(default_factory=list)
+    cpu_fallback_info: dict = dataclasses.field(default_factory=dict)
+    cpu_streaming: dict = dataclasses.field(default_factory=dict)
+    cpu_streaming_tile: int = 0
+    gpu_tile_size: int | None = None
+    gpu_streaming_tile: int | None = None
+    gpu_streaming_host_peak_bytes: int | None = None
+    gpu_used: bool = False
+    gpu_pre_execution_fallback: object = None
+    plan: dict = dataclasses.field(default_factory=dict)
+    chosen_mode: str = "stream"
+    cells_in_flight: int = 1
+    cache_workers_per_cell: int = 14
+    per_cell_footprint: int = 0
+
+
+def _lp341_bundle():
+    from types import SimpleNamespace
+
+    canvas_px = int(LP_CANVAS_HW[0]) * int(LP_CANVAS_HW[1])
+    return _LPBundle(
+        envelope=SimpleNamespace(
+            raw_available_bytes=int(LP_RAW),
+            factor_num=4,
+            factor_den=5,
+            budget_bytes=int(LP_B_PLAN),
+            layout=(3, 3),
+            refinement_rank=1,
+            pinned=False,
+        ),
+        shared_bytes=int(LP_SHARED),
+        cache_worker_footprint_bytes=int(
+            zz.zpar.cache_footprint_bytes(LP_WORST_PATCH_PX)
+        ),
+        gauge_worker_footprint_bytes=int(
+            zz.zpar.gauge_footprint_bytes(canvas_px)
+        ),
+        gauge_workers=14,
+        cache_build_workers=14,
+        layout={"nx": 3, "ny": 3},
+        storage_profile="bounded",
+    )
+
+
+def _lp341_decide(monkeypatch):
+    from types import SimpleNamespace
+
+    from zemosaic.core.zegrid import gpu_readiness as zgr
+
+    monkeypatch.setattr(zz, "_STACK_STORAGE_PROFILE", "bounded")
+    monkeypatch.setattr(zz.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(
+        zz.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=4 * 2 ** 40, used=0, free=4 * 2 ** 40),
+    )
+    readiness = zgr.GpuReadiness(
+        status=zgr.STATUS_USABLE,
+        reason_code=zgr.REASON_GPU_OK,
+        available=True,
+        dependency_declared=True,
+        dependency_importable=True,
+        cupy_version="model-only",
+        device_count=1,
+        device_index=0,
+        device_name="NVIDIA GeForce RTX 3070 Laptop GPU",
+        vram_total_bytes=8589410304,
+        vram_free_bytes=int(LP_VRAM_FREE),
+    )
+    canvas = SimpleNamespace(
+        width=int(LP_CANVAS_HW[1]),
+        height=int(LP_CANVAS_HW[0]),
+        canvas_id="lp341-faithful",
+    )
+    return zz._r55_active_gpu_decide(
+        bundle=_lp341_bundle(),
+        cell_ctxs=_lp341_cell_ctxs(),
+        canvas=canvas,
+        halo_px=128,
+        cache_root="/tmp",
+        output_dir="/tmp",
+        frame_ids=tuple(f"lp341_{i}" for i in range(LP_N_FRAMES)),
+        gpu_probe={
+            "available": True,
+            "device": "NVIDIA GeForce RTX 3070 Laptop GPU",
+            "vram_total_bytes": 8589410304,
+            "vram_free_bytes": int(LP_VRAM_FREE),
+        },
+        readiness=readiness,
+    )
+
+
+def test_lp341_faithful_product_witness_is_admitted_with_an_honest_depth(monkeypatch):
+    decision = _lp341_decide(monkeypatch)
+    chosen = decision.plan_set.chosen
+    assert decision.mapping["backend"] == "gpu"
+    # Honest depth from the REAL product decision (no forcing).
+    assert int(decision.mapping["gpu_streaming_tile"]) == 192
+    assert int(decision.mapping["units_in_flight"]) == 1
+    assert int(decision.mapping["workers_per_unit"]) == 14
+    assert int(decision.mapping["prefetch_units"]) == 2
+
+    facts = decision.facts
+    assert int(facts["per_unit_cache"]) == LP_PER_UNIT_CACHE
+    assert int(facts["per_unit_prefetch_disk"]) == LP_PER_UNIT_CACHE
+    assert int(facts["per_unit_prefetch_host"]) == LP_WORST_PATCH_PX * 13
+    added = int(dict(decision.gpu_host_bound_by_tile)[192])
+    assert int(facts["concurrent_producer_bytes"]) == max(
+        int(
+            rcontract.cache_per_cell_bytes(
+                rcontract.PROCESS_BASELINE_BYTES,
+                int(decision.cache_workers),
+                int(zz.zpar.cache_footprint_bytes(LP_WORST_PATCH_PX)),
+            )
+        ),
+        2 * LP_WORST_PATCH_PX * 13,
+    )
+    # The cache-build owner (a REAL ram_contract path) is the binding owner
+    # term; the N-independent normalization bound is NOT binding here.
+    owner = int(facts["concurrent_producer_bytes"])
+    assert owner == int(
+        rcontract.cache_per_cell_bytes(
+            rcontract.PROCESS_BASELINE_BYTES,
+            int(decision.cache_workers),
+            int(zz.zpar.cache_footprint_bytes(LP_WORST_PATCH_PX)),
+        )
+    )
+    assert 2 * LP_WORST_PATCH_PX * 13 < owner
+    # Parity PLAN == RUN: the chosen host peak is the unified projection.
+    assert int(chosen.host_peak_bytes) == (
+        int(zz.rcontract.PROCESS_BASELINE_BYTES)
+        + added
+        + owner
+        + 2 * int(facts["per_unit_prefetch_host"])
+    )
+    assert int(decision.plan_set.aggregate_host_peak_bytes) <= LP_B_PLAN
+    # The aggregate is 95.4 % of B_plan and its limiting term is the GAUGE
+    # phase (14 workers x gauge footprint), NOT the stack nor the prefetch.
+    assert int(decision.plan_set.aggregate_host_peak_bytes_raw) == (
+        int(decision.gauge_workers) * int(facts["gauge_footprint_bytes"])
+    )
+    assert int(decision.plan_set.aggregate_host_peak_bytes) == 14016615629
+    assert LP_B_PLAN - int(decision.plan_set.aggregate_host_peak_bytes) == 671368396
+    # p=2 is the declared E2 target, not a memory limit: p+1 and p+4 still fit
+    # the host candidate (disk holds 5 slots within the 4 TiB volume).
+    assert int(chosen.host_peak_bytes) + (4 - 2) * int(
+        facts["per_unit_prefetch_host"]
+    ) < LP_B_PLAN
+
+
+def test_lp341_plan_admit_run_publish_the_same_projected_host_peak(monkeypatch):
+    decision = _lp341_decide(monkeypatch)
+    mapping = dict(decision.mapping)
+    bundle = _lp341_bundle()
+    # Apply needs the frozen cell_specs; the geometry is irrelevant to the
+    # aggregate arithmetic, so an empty task list is honest here.
+    applied = zz._r55_active_gpu_apply(
+        bundle, mapping=mapping, decision=decision, stage="preflight"
+    )
+    chosen = decision.plan_set.chosen
+    assert applied.envelope.aggregate_rule == (
+        rcontract.AGGREGATE_RULE_PROJECTED_HOST_PEAK
+    )
+    assert applied.envelope.prefetch_units == 2
+    assert int(applied.envelope.aggregate_bytes) == int(chosen.host_peak_bytes)
+    runtime = zz._r55_gpu_host_aggregate_for_tile(
+        decision, bundle, 192, prefetch_units=2
+    )
+    assert int(runtime) == int(chosen.host_peak_bytes)
+    # The scheduler phase envelope publishes the same value.
+    phase_env = next(
+        env
+        for env in decision.plan_set.phases
+        if env.backend == "gpu" and env.phase == "cell_stack_stream"
+    )
+    assert int(phase_env.estimate.peak_bytes) == int(chosen.host_peak_bytes)

@@ -6736,9 +6736,22 @@ def _r55_active_gpu_apply(
             int(bundle.shared_bytes), units, cache_per_cell
         )
     )
+    # ZM-ZEGRID-R56 UNIFIED PROJECTION (PLAN == ADMIT == RUN): the ONE
+    # depth-aware host peak. At prefetch == 0 the producer is blocked while the
+    # consumer stacks (queue full) and is NOT charged; at p >= 1 exactly one
+    # producer owner plus the resident prefetch credit are added.
+    _apply_facts = getattr(decision, "facts", None) or {}
+    producer_owner = int(_apply_facts.get("concurrent_producer_bytes", 0) or 0)
+    resident_per_slot = int(
+        _apply_facts.get("per_unit_prefetch_host", 0) or 0
+    )
     aggregate = int(
-        rcontract.simultaneous_stack_and_cache_bytes(
-            stack_total, cache_total, int(bundle.shared_bytes)
+        rcontract.projected_host_peak_bytes(
+            int(bundle.shared_bytes),
+            int(added_per_cell_stack),
+            producer_owner,
+            int(prefetch),
+            resident_per_slot,
         )
     )
     reason = (
@@ -6763,7 +6776,10 @@ def _r55_active_gpu_apply(
         stack_total_bytes=int(stack_total),
         cache_total_bytes=int(cache_total),
         aggregate_bytes=int(aggregate),
-        aggregate_rule=rcontract.AGGREGATE_RULE_STACK_PLUS_CACHE,
+        aggregate_rule=rcontract.AGGREGATE_RULE_PROJECTED_HOST_PEAK,
+        prefetch_units=int(prefetch),
+        producer_owner_bytes=int(producer_owner),
+        prefetch_resident_per_slot_bytes=int(resident_per_slot),
         pinned=bool(base_env.pinned),
         reason=reason,
     )
@@ -7742,35 +7758,52 @@ def _r55_gpu_added_host_bound(decision, tile: int) -> int:
     return int(bounds[wanted])
 
 
-def _r55_gpu_host_aggregate_for_tile(decision, bundle, tile: int) -> int:
-    """Exact aggregate host bytes for ONE declared tile (same math as apply)."""
-    # Authoritative ADDED stack bound: baseline counted ONCE via shared_bytes.
-    # (The TOTAL estimate remains in the execution task/manifest only.)
+def _r55_decision_prefetch_units(decision) -> int:
+    """The admitted prefetch depth of a decision (0 when none is published)."""
+    for source in ("mapping", "facts"):
+        raw = getattr(decision, source, None)
+        if isinstance(raw, dict) and "prefetch_units" in raw:
+            try:
+                return max(0, int(raw["prefetch_units"]))
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _r55_gpu_host_aggregate_for_tile(
+    decision, bundle, tile: int, prefetch_units=None
+) -> int:
+    """Exact PROJECTED host bytes for ONE declared tile (same math as apply).
+
+    ZM-ZEGRID-R56 UNIFIED PROJECTION — the single function used by PLAN, ADMIT
+    and RUN::
+
+        shared + stack_added + (owner if p >= 1 else 0) + p * resident_per_slot
+
+    ``stack_added`` is the authoritative ADDED bound for the declared tile
+    (baseline counted ONCE via ``shared_bytes``); the TOTAL estimate stays an
+    execution/manifest input. ``owner`` and ``resident_per_slot`` come from the
+    decision facts (the same values the scheduler context was built with), so
+    the RUN revalidation cannot diverge from the ADMIT candidate.
+    """
     added_per_cell_stack = _r55_gpu_added_host_bound(decision, tile)
-    workers = int(bundle.cache_workers_per_cell)
-    stack_total = int(
-        rcontract.stack_phase_total_bytes(
-            int(bundle.shared_bytes), 1, int(added_per_cell_stack)
-        )
+    units = (
+        _r55_decision_prefetch_units(decision)
+        if prefetch_units is None
+        else int(prefetch_units)
     )
-    cache_per_cell = int(
-        rcontract.cache_per_cell_bytes(
-            rcontract.PROCESS_BASELINE_BYTES,
-            workers,
-            int(bundle.cache_worker_footprint_bytes),
-        )
+    facts = getattr(decision, "facts", None) or {}
+    producer_owner = int(facts.get("concurrent_producer_bytes", 0) or 0)
+    resident_per_slot = int(
+        facts.get("per_unit_prefetch_host", 0) or 0
     )
-    cache_total = int(
-        rcontract.cache_phase_total_bytes(
-            int(bundle.shared_bytes), 1, cache_per_cell
-        )
-    )
-    # F2: the producer's cache-build set COEXISTS with the GPU consumer, so the
-    # simultaneous footprint is stack + cache - shared (shared once). The old
-    # max() model is exactly what hid the concurrent producer.
     return int(
-        rcontract.simultaneous_stack_and_cache_bytes(
-            stack_total, cache_total, int(bundle.shared_bytes)
+        rcontract.projected_host_peak_bytes(
+            int(bundle.shared_bytes),
+            int(added_per_cell_stack),
+            int(producer_owner),
+            int(units),
+            int(resident_per_slot),
         )
     )
 
@@ -7782,6 +7815,7 @@ def _r55_runtime_tile_check(
     free_bytes: int,
     host_budget_bytes: int,
     bundle,
+    prefetch_units=None,
 ) -> dict:
     """Evaluate ONE tile against the CURRENT facts (device AND exact host)."""
     tile = int(tile)
@@ -7793,7 +7827,11 @@ def _r55_runtime_tile_check(
         free_bytes=int(free_bytes),
         device_peak_bytes=peak,
     )
-    aggregate = int(_r55_gpu_host_aggregate_for_tile(decision, bundle, tile))
+    aggregate = int(
+        _r55_gpu_host_aggregate_for_tile(
+            decision, bundle, tile, prefetch_units=prefetch_units
+        )
+    )
     device_ok = vram.action != "fallback_cpu"
     host_ok = aggregate <= int(host_budget_bytes)
     return {

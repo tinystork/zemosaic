@@ -155,12 +155,14 @@ def _active_cpu_decide(m106, bundle, *, halo, cpu):
         # R55-E11 cache-byte contract: at this host budget the corrected
         # per-unit cache bound makes prefetch=1 the largest exact feasible
         # depth (prefetch=2 no longer fits the same B_plan); tile is unchanged.
-        # REWORK-1 (F2): the coexisting producer cache-build owner now consumes
-        # part of the same B_plan, so prefetch drops to 0 at these budgets and
-        # the 7 GiB witness selects the largest feasible rung (384).
+        # UNIFIED PROJECTION: at p == 0 the queue is full during the stack, so
+        # the producer is BLOCKED and is NOT charged. The same B_plan therefore
+        # admits a larger rung at 7 GiB (448 instead of 384); at 4 GiB the rung
+        # is 320. At p == 1 exactly one producer owner plus the resident
+        # prefetch credit is charged (2 GiB witness unchanged).
         (2, 192, 1),
         (4, 320, 0),
-        (7, 384, 0),
+        (7, 448, 0),
     ],
 )
 def test_gate_a_windows_automatic_gauge_and_gpu_plan(
@@ -210,10 +212,17 @@ def test_gate_a_windows_automatic_gauge_and_gpu_plan(
     envelope = next(
         env for env in decision.plan_set.phases if env.backend == "gpu"
     )
+    # UNIFIED PROJECTION (PLAN == ADMIT == RUN):
+    #   shared + added + (owner if p>=1 else 0) + p*resident_per_slot
+    _p = int(chosen.prefetch_units)
+    _owner = (
+        int(decision.facts["concurrent_producer_bytes"]) if _p >= 1 else 0
+    )
     assert chosen.host_peak_bytes == (
-        bundle.shared_bytes + added + decision.facts["per_unit_cache"]
-        * chosen.prefetch_units
-        + int(decision.facts["concurrent_producer_bytes"])
+        bundle.shared_bytes
+        + added
+        + _owner
+        + _p * int(decision.facts["per_unit_prefetch_host"])
     )
     assert envelope.geometry.tile_px == tile
     assert envelope.estimate.peak_bytes == chosen.host_peak_bytes
@@ -249,23 +258,34 @@ def test_gate_b_linux_legacy_and_active_keep_the_feasible_gpu_tile(m106):
         int(t["tile"]) > 128 and t["fits"] is False for t in trials
     ), trials
 
-    # REWORK-1 (F2): the producer cache-build owner coexists with the GPU
-    # consumer, so at this Linux B_plan the simultaneous host peak exceeds the
-    # budget and the ACTIVE GPU plan is REFUSED (R55_REFUSE_HOST_RAM) instead of
-    # being admitted from a max-only model. Refusal is explicit; there is no
-    # silent CPU fallback inside the decision.
-    import pytest as _pytest  # noqa: PLC0415
-
-    with _pytest.raises(zz._R55GpuRefused) as excinfo:
-        _active_gpu_decide(
-            m106,
-            bundle,
-            halo=16,
-            cpu=8,
-            free=LINUX_VRAM_FREE,
-            total=LINUX_VRAM_TOTAL,
-        )
-    assert excinfo.value.reason_code == "R55_REFUSE_HOST_RAM"
+    # UNIFIED PROJECTION: at the admitted p == 0 the queue is full during the
+    # stack, the producer is BLOCKED and is NOT charged. The honest serial
+    # projection fits this B_plan (stack_total 1 909 342 208 B, aggregate
+    # 2 347 446 277 B <= 2 399 597 363 B), so ACTIVE GPU is admitted instead of
+    # being refused by an unconditional producer charge. The device budget is
+    # the unchanged fresh 70 % VRAM one; no policy was relaxed.
+    decision = _active_gpu_decide(
+        m106,
+        bundle,
+        halo=16,
+        cpu=8,
+        free=LINUX_VRAM_FREE,
+        total=LINUX_VRAM_TOTAL,
+    )
+    assert decision.mapping["backend"] == "gpu"
+    assert decision.mapping["gpu_streaming_tile"] == 128
+    assert decision.mapping["prefetch_units"] == 0
+    assert decision.mapping["units_in_flight"] == 1
+    chosen = decision.plan_set.chosen
+    added = dict(decision.gpu_host_bound_by_tile)[128]
+    assert chosen.host_peak_bytes == bundle.shared_bytes + added
+    assert chosen.host_peak_bytes == 1909342208
+    assert decision.plan_set.aggregate_host_peak_bytes == 2347446277
+    assert decision.plan_set.aggregate_host_peak_bytes <= LINUX_B_PLAN
+    envelope = next(
+        env for env in decision.plan_set.phases if env.backend == "gpu"
+    )
+    assert envelope.estimate.peak_bytes == chosen.host_peak_bytes
 
 
 # ---------------------------------------------------------------------------

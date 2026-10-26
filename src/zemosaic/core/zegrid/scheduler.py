@@ -30,6 +30,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Sequence
 
 from . import calibration as zcal
+from .ram_contract import projected_host_peak_bytes
 from .storage_profile import (
     STORAGE_PROFILE_DENSE,
     normalize_storage_profile,
@@ -919,11 +920,16 @@ def enumerate_candidates(context: PlanContext) -> tuple[Candidate, ...]:
                 for workers in context.workers_ladder:
                     if int(workers) > w_max:
                         continue
-                    host_peak = (
-                        int(context.shared_bytes)
-                        + k * per_unit
-                        + int(prefetch) * int(context.per_unit_prefetch_bytes)
-                        + int(context.concurrent_producer_bytes)
+                    # ONE projected host peak shared with ADMIT and RUN:
+                    # serial at p=0 (no producer charged), exactly one
+                    # overlapping producer plus the resident prefetch credit
+                    # at p>=1. A CPU context declares p == 0 only.
+                    host_peak = projected_host_peak_bytes(
+                        int(context.shared_bytes),
+                        int(k) * int(per_unit),
+                        int(context.concurrent_producer_bytes),
+                        int(prefetch),
+                        int(context.per_unit_prefetch_bytes),
                     )
                     disk = disk_residency_bytes(
                         units_in_flight=k,
@@ -1544,11 +1550,13 @@ def _enumerate_gpu_candidates(
             for workers in gpu.workers_ladder:
                 if int(workers) > w_max:
                     continue
-                host_peak = (
-                    int(gpu.shared_bytes)
-                    + k * per_unit
-                    + int(prefetch) * int(gpu.per_unit_prefetch_bytes)
-                    + int(gpu.concurrent_producer_bytes)
+                # THE SAME unified projection as the CPU path and RUN.
+                host_peak = projected_host_peak_bytes(
+                    int(gpu.shared_bytes),
+                    int(k) * int(per_unit),
+                    int(gpu.concurrent_producer_bytes),
+                    int(prefetch),
+                    int(gpu.per_unit_prefetch_bytes),
                 )
                 disk = disk_residency_bytes(
                     units_in_flight=k,
@@ -2312,9 +2320,12 @@ def _gpu_stack_envelope(
         "stack_in_flight_bytes": (
             int(candidate.units_in_flight) * int(per_unit)
         ),
+        # UNIFIED PROJECTION: at prefetch == 0 the queue is full while the
+        # consumer stacks, so the producer is blocked and is NOT charged.
         **(
             {}
             if not int(gpu.concurrent_producer_bytes)
+            or int(candidate.prefetch_units) < 1
             else {
                 "concurrent_producer_bytes": int(
                     gpu.concurrent_producer_bytes
