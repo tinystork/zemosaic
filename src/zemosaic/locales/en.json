@@ -434,6 +434,7 @@
   "q_quit_while_processing_msg": "Processing is currently in progress.\nQuitting now might interrupt the process abruptly.\n\nAre you sure you want to quit?",
   "qt_ansvr_hint": "ANSVR uses the local Ansvr service (Astrometry.net server).\nEnsure it is installed and running on your system.",
   "qt_button_browse": "Browse…",
+  "qt_button_analyse": "Analyse",
   "qt_button_clear_log": "Clear log",
   "qt_button_filter": "Filter…",
   "qt_button_start": "Start",

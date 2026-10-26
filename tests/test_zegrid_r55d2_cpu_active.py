@@ -908,7 +908,14 @@ def test_plan_refusal_is_fatal_before_gauge_and_stack(
 
     monkeypatch.setattr(zz, "_r55_active_decide", _refuse)
     out = tmp_path / "plan_refused"
-    with pytest.raises(RuntimeError, match="refused before the gauge/stack"):
+    # R55-D2 may report a single-profile refusal ("refused before the
+    # gauge/stack") or a dense+bounded refusal ("refused in both storage
+    # profiles"). Both are fatal before the gauge and the stack; the assertions
+    # below still prove that no gauge/stack work and no science output began.
+    with pytest.raises(
+        RuntimeError,
+        match=r"R55-D2 active refused (?:before the gauge/stack|in both storage profiles)",
+    ):
         _run_product(routine_input, out, "active")
     assert calls == {"gauge": 0, "stack": 0}
     _no_science_output(out)
@@ -928,7 +935,10 @@ def test_exact_mapping_mismatch_is_fatal_before_gauge_and_stack(
 
     monkeypatch.setattr(zz, "_r55_active_decide", _tampered_decide)
     out = tmp_path / "mapping_mismatch"
-    with pytest.raises(RuntimeError, match="refused before the gauge/stack"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"R55-D2 active refused (?:before the gauge/stack|in both storage profiles)",
+    ):
         _run_product(routine_input, out, "active")
     assert calls == {"gauge": 0, "stack": 0}
     _no_science_output(out)
@@ -941,7 +951,10 @@ def test_admission_exhaustion_is_fatal_before_gauge_and_stack(
     # PLAN succeeds at 12 GiB; every fresh ADMIT observation is unusable-small.
     memory = _SeqMemory(WITNESS_AVAILABLE_BYTES, 1)
     out = tmp_path / "admit_exhausted"
-    with pytest.raises(RuntimeError, match="refused before the gauge/stack"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"R55-D2 active refused (?:before the gauge/stack|in both storage profiles)",
+    ):
         _run_product(routine_input, out, "active", memory=memory)
     assert memory.calls >= 2
     assert calls == {"gauge": 0, "stack": 0}
