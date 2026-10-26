@@ -3,8 +3,9 @@
 Acceptance coverage:
 
 * the Qt selector persists the exact ``legacy``/``observe``/``active`` tokens,
-  defaults to legacy, refuses an invalid value, and warns that ``active`` is
-  experimental (it never enables the GPU by itself);
+  defaults to ``active`` (qualified on the 5,000-image bounded run), refuses an
+  invalid value, and warns that ``active`` is still beta (it never enables the
+  GPU by itself);
 * GUI -> config/handoff -> worker -> ``run_zegrid_mode`` propagates the token
   without remapping, and every kwargs crossing the worker boundary is either
   accepted or explicitly filtered;
@@ -227,17 +228,22 @@ def test_a_scheduler_combo_uses_exact_engine_tokens(tmp_path, monkeypatch):
     from PySide6.QtWidgets import QComboBox
 
     assert combo.insertPolicy() == QComboBox.NoInsert
-    assert combo.currentData() == "legacy"
-    assert win.config["zegrid_scheduler_mode"] == "legacy"
+    # R56: a fresh config has no explicit choice, so the product default is the
+    # qualified active path (5,000-image synthetic corpus, one cell, bounded
+    # profile, GPU, no fallback).
+    assert combo.currentData() == "active"
+    assert win.config["zegrid_scheduler_mode"] == "active"
     assert win._config_fields["zegrid_scheduler_mode"]["kind"] == "combobox"
     assert win._config_fields["zegrid_scheduler_mode"]["type"] is str
 
     label = win._zegrid_scheduler_label
     assert label.buddy() is combo
     assert "legacy" in combo.toolTip().lower()
-    assert "experimental" in combo.toolTip().lower()
+    assert "beta" in combo.toolTip().lower()
     assert "does not enable the gpu" in combo.toolTip().lower()
-    assert win._zegrid_scheduler_warning.isHidden() is True
+    # active is the default now, so the qualification warning is visible.
+    assert win._zegrid_scheduler_warning.isHidden() is False
+    assert "5,000-image" in win._zegrid_scheduler_warning.text()
 
 
 def test_a_round_trip_all_tokens_and_active_warning(tmp_path, monkeypatch):
@@ -260,7 +266,8 @@ def test_a_round_trip_all_tokens_and_active_warning(tmp_path, monkeypatch):
         win._zegrid_scheduler_combo.findData("active")
     )
     assert win._zegrid_scheduler_warning.isHidden() is False
-    assert "experimental" in win._zegrid_scheduler_warning.text().lower()
+    assert "qualified" in win._zegrid_scheduler_warning.text().lower()
+    assert "5,000-image" in win._zegrid_scheduler_warning.text()
     assert "gpu" in win._zegrid_scheduler_warning.text().lower()
 
     # Reload from the persisted token: exact round-trip, no remap.
@@ -439,10 +446,13 @@ def test_b_every_worker_boundary_kwarg_is_accepted_or_filtered(tmp_path, monkeyp
     assert "zegrid_scheduler_mode" in inspect.signature(zz.run_zegrid_mode).parameters
 
 
-def test_b_absent_token_keeps_legacy_default():
-    assert zemosaic_config.DEFAULT_CONFIG["zegrid_scheduler_mode"] == "legacy"
-    assert zsched.normalize_scheduler_mode(None) == "legacy"
-    assert zsched.DEFAULT_MODE == "legacy"
+def test_b_absent_token_uses_the_qualified_active_default():
+    # R56 product decision: "no explicit choice" means active. The engine was
+    # qualified on a synthetic 5,000-image corpus, one cell, bounded profile,
+    # GPU, 0 exclusions, 0 fallback (PASS_NO_FALLBACK, 2,501.8 s).
+    assert zemosaic_config.DEFAULT_CONFIG["zegrid_scheduler_mode"] == "active"
+    assert zsched.normalize_scheduler_mode(None) == "active"
+    assert zsched.DEFAULT_MODE == "active"
     for bad in ("", "auto", "ACTIVE", "OBSERVE", " legacy", True, 0, 1.0):
         with pytest.raises(zsched.InvalidSchedulerMode):
             zsched.normalize_scheduler_mode(bad)
@@ -889,7 +899,8 @@ def test_e_cpu_only_import_smoke_with_cupy_genuinely_unavailable():
         "import zemosaic.zemosaic_worker; "
         "import zemosaic.zemosaic_zegrid_mode; "
         "from zemosaic.core.zegrid import scheduler, gpu_readiness, parallel; "
-        "assert scheduler.normalize_scheduler_mode(None) == 'legacy'; "
+        # R56: absent means the qualified active default.
+        "assert scheduler.normalize_scheduler_mode(None) == 'active'; "
         "assert sys.modules.get('cupy') is None; "
         "print('OK')"
     )

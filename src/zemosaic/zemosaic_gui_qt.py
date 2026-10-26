@@ -1614,6 +1614,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         layout.addStretch(1)
 
     def _populate_advanced_tab(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(self._create_zegrid_scheduler_group())
         layout.addWidget(self._create_quality_group())
         layout.addWidget(self._create_stacking_group())
         layout.addWidget(self._create_aesthetic_output_group())
@@ -1780,11 +1781,43 @@ class ZeMosaicQtMainWindow(QMainWindow):
             lambda _=None: self._on_zegrid_halo_selection_changed()
         )
 
-        # ZM-ZEGRID-R55-E3: explicit, persistent scheduler selector. Item data is
-        # the EXACT engine token (``legacy``/``observe``/``active``); localized
-        # text is display-only. ``legacy`` is the default and the only
-        # non-opt-in choice. ``active`` is experimental beta and does NOT enable
-        # the GPU by itself: the existing GPU toggle remains necessary.
+        # One logical state, three mutually exclusive checkboxes.
+        self._mode_checkboxes = {
+            "existing_master_tiles": master_tiles_checkbox,
+            "sds": sds_checkbox,
+            "zegrid": zegrid_checkbox,
+        }
+        self._mode_sync_guard = False
+        for _mode_name, _cb in self._mode_checkboxes.items():
+            _cb.toggled.connect(
+                lambda checked, m=_mode_name: self._on_processing_mode_toggled(m, bool(checked))
+            )  # type: ignore[arg-type]
+        self._sync_mode_config_keys()
+        self._apply_existing_master_tiles_mode()
+        self._apply_zegrid_halo_control_state()
+        return group
+
+    def _create_zegrid_scheduler_group(self) -> QGroupBox:
+        # ZM-ZEGRID-R56: the scheduler selector moved from Main to Advanced
+        # (product decision). The anti-checkerboard halo stays in Main; the
+        # widget, its callbacks and its ``_config_fields`` key are unchanged.
+        # Item data is the EXACT engine token (``legacy``/``observe``/
+        # ``active``); localized text is display-only. ``active`` is the
+        # product default; an explicit ``legacy``/``observe`` token always
+        # wins. ``active`` does NOT enable the GPU by itself: the existing GPU
+        # toggle remains necessary.
+        group = QGroupBox(
+            self._tr("qt_group_zegrid_scheduler", "ZeGrid scheduler"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        # ZM-ZEGRID-R55-E3/R56: explicit, persistent scheduler selector. Item
+        # data is the EXACT engine token (``legacy``/``observe``/``active``);
+        # localized text is display-only. ``active`` is the product default and
+        # does NOT enable the GPU by itself: the existing GPU toggle remains
+        # necessary.
         zegrid_scheduler_label = QLabel(
             self._tr(
                 "qt_field_zegrid_scheduler_label",
@@ -1815,9 +1848,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         zegrid_scheduler_warning = QLabel(
             self._tr(
                 "qt_zegrid_scheduler_active_warning",
-                "Experimental beta: 'active' changes scheduling and is NOT "
-                "qualified on Windows/RTX yet. The GPU toggle is still required "
-                "for GPU execution. No performance promise is made.",
+                "Beta: 'active' grants the R55 plan execution authority. It was "
+                "qualified on a synthetic 5,000-image corpus, one cell, bounded "
+                "profile, on GPU, with no fallback. The GPU toggle is still "
+                "required for GPU execution. No performance promise is made "
+                "for real-world or Caldwell data.",
             )
         )
         zegrid_scheduler_warning.setWordWrap(True)
@@ -1837,19 +1872,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             lambda _=None: self._on_zegrid_scheduler_selection_changed()
         )
 
-        # One logical state, three mutually exclusive checkboxes.
-        self._mode_checkboxes = {
-            "existing_master_tiles": master_tiles_checkbox,
-            "sds": sds_checkbox,
-            "zegrid": zegrid_checkbox,
-        }
-        self._mode_sync_guard = False
-        for _mode_name, _cb in self._mode_checkboxes.items():
-            _cb.toggled.connect(
-                lambda checked, m=_mode_name: self._on_processing_mode_toggled(m, bool(checked))
-            )  # type: ignore[arg-type]
-        self._sync_mode_config_keys()
-        self._apply_existing_master_tiles_mode()
         self._apply_zegrid_halo_control_state()
         return group
 
@@ -1913,11 +1935,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "Choose how the ZeGrid engine schedules cell stacking. "
             "'Standard (legacy)' is the historical, fully supported path. "
             "'Observe only' records a predicted R55 plan without changing "
-            "execution. 'Active' is an experimental beta path that grants "
+            "execution. 'Active' is the default beta path that grants "
             "execution authority to the R55 plan; it does NOT enable the GPU "
-            "by itself — the GPU toggle must also be enabled. Active is not "
-            "yet qualified on Windows or RTX hardware and makes no speed "
-            "promise.",
+            "by itself — the GPU toggle must also be enabled. Active was "
+            "qualified on a synthetic 5,000-image corpus, one cell, bounded "
+            "profile, on GPU, with no fallback, and makes no speed promise.",
         )
 
     def _zegrid_scheduler_invalid_message(self, raw_value: Any) -> str:
@@ -2042,9 +2064,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 self._append_log(
                     self._tr(
                         "qt_zegrid_scheduler_active_run_warning",
-                        "ZeGrid scheduler 'active' is an experimental beta path. "
-                        "It is not qualified on Windows/RTX and makes no "
-                        "performance promise. Keep the GPU toggle off to run on CPU.",
+                        "ZeGrid scheduler 'active' grants execution authority to "
+                        "the R55 plan (qualified on a synthetic 5,000-image "
+                        "corpus, one cell, bounded profile, on GPU, with no "
+                        "fallback). No performance promise is made. Keep the "
+                        "GPU toggle off to run on CPU.",
                     ),
                     level="warning",
                 )
@@ -4879,7 +4903,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "use_existing_master_tiles": False,
             "zegrid_mode_enabled": False,
             "zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX,
-            "zegrid_scheduler_mode": "legacy",
+            "zegrid_scheduler_mode": zsched.DEFAULT_MODE,
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
             "temporary_work_dir": "",

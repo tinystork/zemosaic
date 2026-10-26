@@ -2,7 +2,7 @@
 
 Acceptance proven here:
 
-* ``zegrid_scheduler_mode`` defaults to ``legacy`` and unknown values fail
+* ``zegrid_scheduler_mode`` defaults to ``active`` (R56) and unknown values fail
   visibly (never silently coerced);
 * legacy and observe runs are byte-identical on the fixed routine corpus;
 * the only manifest delta is the additive ``r55_scheduler`` block, which carries
@@ -53,9 +53,11 @@ VOLATILE_MANIFEST_KEYS = (
 # Mode contract
 # ---------------------------------------------------------------------------
 
-def test_scheduler_mode_defaults_to_legacy_and_rejects_unknown_values():
-    assert zs.DEFAULT_MODE == "legacy"
-    assert zs.normalize_scheduler_mode(None) == "legacy"
+def test_scheduler_mode_defaults_to_active_and_rejects_unknown_values():
+    # R56: the product default is active, qualified on a synthetic
+    # 5,000-image corpus, one cell, bounded profile, GPU, no fallback.
+    assert zs.DEFAULT_MODE == "active"
+    assert zs.normalize_scheduler_mode(None) == "active"
     assert zs.normalize_scheduler_mode("legacy") == "legacy"
     assert zs.normalize_scheduler_mode("observe") == "observe"
     for bad in ("", "auto", "ACTIVE", "OBSERVE", " legacy", True, 0, 1.0):
@@ -74,12 +76,13 @@ def test_unknown_mode_fails_visibly_before_any_work(tmp_path):
     assert not (tmp_path / "out").exists()
 
 
-def test_engine_signature_defaults_to_none_and_config_default_is_legacy():
+def test_engine_signature_defaults_to_none_and_config_default_is_active():
     sig = inspect.signature(zz.run_zegrid_mode)
     assert sig.parameters["zegrid_scheduler_mode"].default is None
     from zemosaic import zemosaic_config
 
-    assert zemosaic_config.DEFAULT_CONFIG["zegrid_scheduler_mode"] == "legacy"
+    # R56 (5,000-image bounded qualification): no explicit choice -> active.
+    assert zemosaic_config.DEFAULT_CONFIG["zegrid_scheduler_mode"] == "active"
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 Acceptance exercised here:
 
-* strict mode normalization (``active`` additive, default still ``legacy``);
+* strict mode normalization (``active`` is the product default since R56);
 * exact CPU inmem/stream mapping onto the product's existing knobs;
 * GPU / prefetch-positive / off-ladder / stale-tampered winners fail closed;
 * PLAN 80 % + fresh ADMIT 90 % semantics with scheduler-produced shrink-only
@@ -203,21 +203,25 @@ def _no_science_output(out: Path) -> None:
 # Mode contract
 # ---------------------------------------------------------------------------
 
-def test_active_mode_is_additive_and_default_remains_legacy():
-    assert zs.DEFAULT_MODE == "legacy"
+def test_active_mode_is_additive_and_is_now_the_product_default():
+    # R56: "no explicit choice" now resolves to active, qualified on a
+    # synthetic 5,000-image corpus, one cell, bounded profile, GPU, 0
+    # exclusions, 0 fallback (PASS_NO_FALLBACK, 2,501.8 s). Explicit legacy
+    # and observe tokens are still honoured verbatim.
+    assert zs.DEFAULT_MODE == "active"
     assert zs.MODE_ACTIVE == "active"
     assert "active" in zs.MODES
-    assert zs.normalize_scheduler_mode(None) == "legacy"
+    assert zs.normalize_scheduler_mode(None) == "active"
     assert zs.normalize_scheduler_mode("legacy") == "legacy"
     assert zs.normalize_scheduler_mode("observe") == "observe"
     assert zs.normalize_scheduler_mode("active") == "active"
     for bad in ("", "auto", "ACTIVE", " active", True, 0, 1.0, []):
         with pytest.raises(zs.InvalidSchedulerMode):
             zs.normalize_scheduler_mode(bad)
-    # Default/config are untouched.
+    # The product default follows the R56 qualification.
     from zemosaic import zemosaic_config
 
-    assert zemosaic_config.DEFAULT_CONFIG["zegrid_scheduler_mode"] == "legacy"
+    assert zemosaic_config.DEFAULT_CONFIG["zegrid_scheduler_mode"] == "active"
     assert inspect.signature(zz.run_zegrid_mode).parameters[
         "zegrid_scheduler_mode"
     ].default is None
@@ -840,11 +844,12 @@ def test_active_vs_legacy_byte_identical_with_truthful_active_evidence(parity_ru
     assert active_manifest["incomplete_cells"] == legacy_manifest["incomplete_cells"]
     assert active_manifest["coverage_pixels"] == legacy_manifest["coverage_pixels"]
 
-    # Default config was not mutated by the active run.
+    # The product default was not mutated by this explicit active run
+    # (R56: it is already active after the 5,000-image qualification).
     from zemosaic import zemosaic_config
 
-    assert zemosaic_config.DEFAULT_CONFIG["zegrid_scheduler_mode"] == "legacy"
-    assert zs.DEFAULT_MODE == "legacy"
+    assert zemosaic_config.DEFAULT_CONFIG["zegrid_scheduler_mode"] == "active"
+    assert zs.DEFAULT_MODE == "active"
 
 
 def test_active_evidence_is_deterministic_across_two_builds(parity_runs):

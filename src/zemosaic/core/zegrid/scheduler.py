@@ -170,7 +170,10 @@ MODE_LEGACY = "legacy"
 MODE_OBSERVE = "observe"
 MODE_ACTIVE = "active"
 MODES = (MODE_LEGACY, MODE_OBSERVE, MODE_ACTIVE)
-DEFAULT_MODE = MODE_LEGACY
+# ZM-ZEGRID-R56: "no explicit choice" means the qualified active path
+# (5,000-image bounded Windows/GPU run, no fallback). An explicit
+# ``legacy``/``observe`` token still wins everywhere.
+DEFAULT_MODE = MODE_ACTIVE
 
 # R55-D2 active CPU manifest/mapping schemas. These are ADDITIVE: the R55-B
 # manifest schema/version is deliberately unchanged so legacy/observe bytes stay
@@ -265,12 +268,12 @@ class PlanRefused(SchedulerError):
 def normalize_scheduler_mode(value, *, default: str = DEFAULT_MODE) -> str:
     """Resolve ``zegrid_scheduler_mode``.
 
-    ``None`` (absent) means ``legacy``. An explicit value must be the exact
-    lowercase string ``legacy``, ``observe`` or ``active``. Anything else —
-    including ``True``, ``"LEGACY"``, ``"auto"`` or ``""`` — raises
-    :class:`InvalidSchedulerMode` so an unknown value can never be silently
-    coerced to the default. R55-D2 adds ``active`` additively; the default and
-    every observe/legacy semantic are unchanged.
+    ``None`` (absent) means the product default (``active`` since R56). An
+    explicit value must be the exact lowercase string ``legacy``, ``observe``
+    or ``active``. Anything else — including ``True``, ``"LEGACY"``, ``"auto"``
+    or ``""`` — raises :class:`InvalidSchedulerMode` so an unknown value can
+    never be silently coerced to the default. An explicit ``legacy`` or
+    ``observe`` token always wins over the default.
     """
     if value is None:
         return default
