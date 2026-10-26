@@ -113,6 +113,7 @@ from .core.zegrid import ram_contract as rcontract
 from .core.zegrid import resource_envelope as renv
 from .core.zegrid import runtime_control as zrt
 from .core.zegrid import scheduler as zsched
+from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
 from .core.zegrid import sweep as zsw
@@ -204,6 +205,97 @@ def runtime_concurrency_snapshot() -> dict:
         "source": source,
         "unavailable_reason": reason,
     }
+
+
+# ---------------------------------------------------------------------------
+# ZM-WIN-VRAM-HW — sampled VRAM high-water publication helpers
+# ---------------------------------------------------------------------------
+
+# The label is the honesty contract: this is a SAMPLED peak, not a driver counter.
+
+
+def _vram_reservation_bytes_from_plan(
+    retained, decision, mapping, fallback_tile
+):
+    """Device bytes the ADMITTED plan reserved for the executing GPU tile.
+
+    Purely observational: reads the already-computed decision/mapping and never
+    re-plans. ``None`` when no GPU plan exists (no fabricated value).
+    """
+    try:
+        chosen = decision
+        if chosen is None and isinstance(retained, dict):
+            chosen = retained.get("decision")
+        if chosen is None:
+            return None
+        tile = None
+        if isinstance(mapping, dict):
+            tile = mapping.get("gpu_streaming_tile")
+        if tile is None:
+            tile = fallback_tile
+        if tile is None:
+            return None
+        peaks = getattr(chosen, "device_peak_bytes_by_tile", None)
+        if peaks is None:
+            return None
+        return int(peaks[int(tile)])
+    except Exception:
+        return None
+
+
+def _vram_high_water_disabled_reason(telemetry, gpu_used, gpu_context):
+    """Return an explicit token when sampling is OFF, else ``None``."""
+    if telemetry is None:
+        return "resource_telemetry_disabled"
+    if not bool(gpu_used):
+        ctx = gpu_context or {}
+        if bool(ctx.get("requested")):
+            return "gpu_not_effective"
+        return "gpu_disabled"
+    return None
+
+
+def _vram_high_water_telemetry_fields(record, reservation_bytes):
+    """Compact telemetry delta for one sampled high-water record."""
+    rec = record or {}
+    reservation_mb = None
+    if reservation_bytes is not None:
+        try:
+            reservation_mb = round(float(reservation_bytes) / (1024.0 * 1024.0), 3)
+        except Exception:
+            reservation_mb = None
+    return {
+        "vram_high_water_sampled_mb": rec.get("vram_high_water_sampled_mb"),
+        "vram_high_water_label": rec.get("label") or zvh.VRAM_HIGH_WATER_LABEL,
+        "vram_high_water_sample_count": rec.get("vram_high_water_sample_count", 0),
+        "vram_high_water_interval_s": rec.get("vram_high_water_interval_s"),
+        "vram_reservation_mb": reservation_mb,
+        "vram_high_water_source": rec.get("vram_high_water_source"),
+        "vram_high_water_effective_cadence_degraded": rec.get(
+            "vram_high_water_effective_cadence_degraded"
+        ),
+        "vram_high_water_unavailable_reason": rec.get(
+            "vram_high_water_unavailable_reason"
+        ),
+    }
+
+
+def _finish_vram_high_water_record(sampler, disabled_reason, reservation_bytes):
+    """Stop the sampler (or build the explicit OFF record); add reservation."""
+    if sampler is None:
+        record = zvh.disabled_record(disabled_reason or "not_sampled")
+    else:
+        record = zvh.stop_vram_high_water_sampler(
+            sampler, reason="per_cell_stack_finished"
+        ) or zvh.disabled_record("sampler_record_unavailable")
+    reservation_mb = None
+    if reservation_bytes is not None:
+        try:
+            reservation_mb = round(float(reservation_bytes) / (1024.0 * 1024.0), 3)
+        except Exception:
+            reservation_mb = None
+    record["vram_reservation_mb"] = reservation_mb
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -10263,6 +10355,35 @@ def _run_single(
 
     t_block0 = time.perf_counter()
 
+    # ZM-WIN-VRAM-HW: periodic VRAM sampling DURING the per-cell stack.
+    # Pure observer: the record is never read by planning/admission/execution.
+    # Active only when a telemetry consumer exists AND the effective backend is
+    # GPU; every other case publishes null fields + an explicit reason.
+    _vram_hw_reservation_bytes = _vram_reservation_bytes_from_plan(
+        None, _r55_active_gpu_decision,
+        _r55_active_mapping, gpu_streaming_tile,
+    )
+    _vram_hw_disabled_reason = _vram_high_water_disabled_reason(
+        telemetry, gpu_used, gpu_ctx
+    )
+    _vram_hw_sampler = None
+    if _vram_hw_disabled_reason is None:
+        try:
+            _vram_hw_sampler = zvh.start_vram_high_water_sampler(
+                interval_sec=getattr(
+                    telemetry, "interval_sec", zvh.DEFAULT_INTERVAL_S
+                ),
+                on_sample=lambda _rec: _telemetry_stats(
+                    extra=_vram_high_water_telemetry_fields(
+                        _rec, _vram_hw_reservation_bytes
+                    )
+                ),
+            )
+        except Exception:
+            # Sampling is optional: a start failure must never abort the stack.
+            _vram_hw_sampler = None
+            _vram_hw_disabled_reason = "sampler_start_failed"
+
     # ZM-ZEGRID-R40-B2-C: when the seam capture is ON, the deterministic candidate
     # geometry is computed HERE in the parent (before any worker starts) from the
     # task Cell bounds and handed to every pooling worker so each worker returns
@@ -12577,6 +12698,31 @@ def _run_single(
 
     block_wall = time.perf_counter() - t_block0
 
+    # ZM-WIN-VRAM-HW: stop the sampler on the success path. Exception /
+    # cancellation paths are covered by the run-level ``finally`` safety net.
+    # The CPU fallback above deliberately KEEPS sampling: the peak of the whole
+    # per-cell phase (GPU attempt + CPU rerun) is what the user measured.
+    _vram_hw_reservation_final = _vram_reservation_bytes_from_plan(
+        _r55_gpu_retained, _r55_active_gpu_decision,
+        _r55_active_mapping, gpu_streaming_tile,
+    )
+    if _vram_hw_reservation_final is None:
+        _vram_hw_reservation_final = _vram_hw_reservation_bytes
+    _vram_hw_record = _finish_vram_high_water_record(
+        _vram_hw_sampler, _vram_hw_disabled_reason, _vram_hw_reservation_final
+    )
+    _vram_hw_sampler = None
+    per_cell_diagnostics["vram_high_water"] = dict(_vram_hw_record)
+    _telemetry_stats(
+        phase_name="Per-cell stacking",
+        phase_index=3,
+        tiles_done=total_cells,
+        tiles_total=total_cells,
+        extra=_vram_high_water_telemetry_fields(
+            _vram_hw_record, _vram_hw_reservation_final
+        ),
+    )
+
     # H2: actual backend EVIDENCE from the executed cells (never the selection).
     # `used=true` only when a successful cell actually ran the GPU canonical and
     # no whole-batch CPU rerun replaced it.
@@ -13747,6 +13893,34 @@ def _write_outputs(
         ),
         "gauge_diagnostics": (gauge_diagnostics or {}),
         "per_cell_diagnostics": (per_cell_diagnostics or {}),
+        # ZM-WIN-VRAM-HW: sampled VRAM high-water (MAX of gpu_used_mb observed
+        # DURING the per-cell stack), never a driver-counter claim. The block is
+        # always present; when sampling did not run every measurement is null
+        # and ``vram_high_water_unavailable_reason`` says why (GPU OFF or
+        # telemetry OFF). ``vram_reservation_mb`` is the admitted plan's device
+        # reservation for the executing tile, so the ratio is readable.
+        **(lambda _vhw: {
+            "vram_high_water": _vhw,
+            "vram_high_water_sampled_mb": _vhw.get(
+                "vram_high_water_sampled_mb"
+            ),
+            "vram_high_water_label": (
+                _vhw.get("label") or zvh.VRAM_HIGH_WATER_LABEL
+            ),
+            "vram_high_water_sample_count": _vhw.get(
+                "vram_high_water_sample_count", 0
+            ),
+            "vram_high_water_interval_s": _vhw.get(
+                "vram_high_water_interval_s"
+            ),
+            "vram_high_water_unavailable_reason": _vhw.get(
+                "vram_high_water_unavailable_reason"
+            ),
+            "vram_reservation_mb": _vhw.get("vram_reservation_mb"),
+        })(
+            (per_cell_diagnostics or {}).get("vram_high_water")
+            or zvh.disabled_record("not_sampled")
+        ),
         # ZM-ZEGRID-R41-B: the 80 %-plan / 90 %-admit host-RAM contract trail is
         # ALSO published at TOP LEVEL (the per_cell_diagnostics copy is retained
         # for backward compatibility).
@@ -14267,6 +14441,21 @@ def run_zegrid_mode(
     mount_values = {f.mount for f in known_mount_frames}
     base_out = Path(output_folder).expanduser()
 
+    def _run_single_guarded(*args, **kwargs):
+        """ZM-WIN-VRAM-HW: bounded sampler shutdown on EVERY outcome.
+
+        ``_run_single`` stops the sampled-VRAM thread on its success path;
+        this ``finally`` is the safety net for a science failure, a
+        cancellation (``BaseException``) or any unexpected escape.
+        """
+        try:
+            return _run_single(*args, **kwargs)
+        finally:
+            try:
+                zvh.stop_all_active_vram_samplers(reason="run_exit")
+            except Exception:
+                pass
+
     if len(known_mount_frames) == len(frames_info) and len(mount_values) >= 2:
         eq_frames = [f for f in frames_info if f.mount == "EQ"]
         altz_frames = [f for f in frames_info if f.mount == "ALTZ"]
@@ -14275,7 +14464,7 @@ def run_zegrid_mode(
             callback=progress_callback,
         )
         if eq_frames:
-            _run_single(eq_frames, input_folder, base_out / "grid_EQ",
+            _run_single_guarded(eq_frames, input_folder, base_out / "grid_EQ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
@@ -14292,7 +14481,7 @@ def run_zegrid_mode(
                         r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
                         telemetry=telemetry)
         if altz_frames:
-            _run_single(altz_frames, input_folder, base_out / "grid_ALTZ",
+            _run_single_guarded(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
                         science_config=science_config, zconfig=zconfig,
                         pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,
@@ -14311,7 +14500,7 @@ def run_zegrid_mode(
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
-        _run_single(frames_info, input_folder, base_out,
+        _run_single_guarded(frames_info, input_folder, base_out,
                     progress_callback=progress_callback,
                     science_config=science_config, zconfig=zconfig,
                     pinned_layout=pinned_layout, sip_mode=sip_mode, workers=workers,

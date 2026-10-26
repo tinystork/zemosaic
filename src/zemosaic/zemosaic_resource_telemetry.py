@@ -8,6 +8,7 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -591,6 +592,11 @@ class ResourceTelemetryController:
         self._csv_writer = None
         self._csv_header_written = False
         self._log_and_callback = log_and_callback or _default_log_and_callback
+        # ZM-WIN-VRAM-HW: the per-cell stack samples from a sampler THREAD while
+        # phase boundaries emit from the run thread. Serialise the throttle +
+        # resource probe + CSV write so two emitters cannot interleave a row or
+        # race the interval gate. RLock: a callback may re-enter harmlessly.
+        self._emit_lock = threading.RLock()
 
     def _open_csv_if_needed(self, fieldnames: list[str]) -> None:
         if not self._csv_path or self._csv_writer is not None:
@@ -616,6 +622,10 @@ class ResourceTelemetryController:
             return
         import time as _time
 
+        with self._emit_lock:
+            self._emit_stats_locked(context, force=force, _time=_time)
+
+    def _emit_stats_locked(self, context: dict | None, *, force: bool, _time) -> None:
         now = _time.monotonic()
         if (not force) and self._last_sample and (now - self._last_sample) < self.interval_sec:
             return
