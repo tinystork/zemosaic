@@ -114,3 +114,60 @@ tile 192, K=1, workers 14, **prefetch 2**, aggregate 14 016 615 629 B
 (95.4 % of B_plan) limited by the GAUGE phase (14 x 870 597 244 B); the
 cache-build owner (1 515 400 840 B) is charged at p>=1, the normalization bound
 is not binding. This is a model/contract result, not a runtime LP341 run.
+
+## ARCH REWORK-1 (2026-10-26) — publication blockers F1/F2 fixed
+
+HEAD: `4c703d9` (on `873abb1`), branch `perf/zegrid-bounded-prefetch`, local.
+
+### F1 — admitted GPU identity preserved
+
+`_run_r55_active_gpu_units` now carries the ADMITTED candidate/mapping
+(`gpu_candidate` from admission) through the whole run. A runtime tile shrink is
+materialized from the CURRENT candidate (preserving reduced prefetch/workers/K),
+and finalization uses the current candidate + current bundle. Previously both
+places rebuilt from `plan_set.chosen`, so an admission p2->p0 was lost and the
+final hash rejected `mapping prefetch 0` against `candidate prefetch 2`.
+Regressions: `test_admission_p2_to_p0_survives_final_manifest`,
+`test_admission_shrink_then_runtime_tile_shrink_keeps_reduced_identity` in
+`tests/test_zegrid_r55e2_active_gpu_prefetch.py`.
+
+### F2 — indexed cleanup task decoded
+
+The product pipeline task is `(index, cell_task)`; the nested cleanup callback
+read `item[3]` directly, saw a 2-tuple and silently skipped, so credits were
+released while the partial cache survived. It now unwraps the indexed item,
+deletes ONLY the failed cell's cache, and RAISES a reported failure when
+`_safe_rmtree` returns False (the pipeline records it in `cleanup_failures`
+while preserving the primary exception). Regressions:
+`tests/test_zegrid_r56_arch_rework1.py` (real partial file, cleanup BEFORE
+credit release, failure residue, cancellation).
+
+### Validation (exact, logs in this directory)
+
+- Reviewer probes (unchanged audit file):
+  `PYTHONPATH=src:tests <venv>/bin/python -m pytest -q -s
+  .a2a-reports/ZM-R56-AUDIT-20261026/test_review_probes.py`
+  -> **2 passed** (`arch-r1-reviewer-probes.txt`).
+- Seven-module order (R56 bounded, R56 rework1, E2, E5, E7, E8, E9)
+  -> **149 passed, 1 skipped** (`arch-r1-seven-modules.txt`).
+- 18-module matrix -> **430 passed, 1 skipped** (`arch-r1-matrix-18.txt`).
+- Fast gate `pytest -m 'not slow' -q`, 1200 s timeout -> **exit 124 at 49 %**
+  with 2 failures, both in `tests/test_zegrid_r18_final_finishing.py`
+  (`arch-r1-fast-gate-timeout.txt`, `arch-r1-fast-gate-first-failure.txt`,
+  `arch-r1-fast-gate-second-failure.txt`). Both tests pass alone. A clean
+  baseline archive of `873abb1` reproduces BOTH in the same fast-gate order
+  (first: 1 failed/1271 passed/2 skipped; second with the first deselected:
+  same counts) — `arch-r1-fast-gate-baseline-first.txt`,
+  `arch-r1-fast-gate-baseline-second.txt`. They are PRE-EXISTING
+  order-dependent failures, NOT regressions from F1/F2.
+
+### Evidence corrections (binding, supersede earlier wording)
+
+- The historical `linux-cuda-smoke-halo64-pinned.json` (pinned 4 GiB) is
+  **SUPERSEDED** and is **NOT** corrected-p0 control proof: in that run even the
+  cap-0 control overlapped, which contradicts the corrected p0-serial contract.
+  It must not be cited as p0 evidence or as a memory/performance win.
+- LP341 `tile192/p2/workers14` remains **MODEL** evidence, not a runtime result.
+- The real-memory H64 CUDA artifact is real GPU execution but admitted **p0
+  only**; no overlap was measured.
+- Windows/LP341 halo128 runtime overlap remains **NOT_RUN**.

@@ -1,0 +1,254 @@
+........................................................................ [  2%]
+........................................................................ [  4%]
+........................................................................ [  6%]
+........................................................................ [  8%]
+........................................................................ [ 10%]
+........................................................................ [ 12%]
+........................................................................ [ 14%]
+........................................................................ [ 16%]
+........................................................................ [ 18%]
+........................................................................ [ 20%]
+........................................................................ [ 22%]
+........s............................................................... [ 24%]
+........................................................................ [ 26%]
+................................................................s....... [ 28%]
+........................................................................ [ 30%]
+........................................................................ [ 32%]
+........................................................................ [ 35%]
+.................................................F
+=================================== FAILURES ===================================
+______________ test_forced_finishing_failure_warns_and_completes _______________
+tests/test_zegrid_r18_final_finishing.py:503: in test_forced_finishing_failure_warns_and_completes
+    zz.run_zegrid_mode(
+src/zemosaic/zemosaic_zegrid_mode.py:14124: in run_zegrid_mode
+    _run_single(frames_info, input_folder, base_out,
+src/zemosaic/zemosaic_zegrid_mode.py:9105: in _run_single
+    _initial_bundle = _plan_bundle_auto(**_plan_request)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/zemosaic/zemosaic_zegrid_mode.py:2097: in _plan_bundle_auto
+    return _build()
+           ^^^^^^^^
+src/zemosaic/zemosaic_zegrid_mode.py:2086: in _build
+    return _build_execution_bundle(
+src/zemosaic/zemosaic_zegrid_mode.py:4509: in _build_execution_bundle
+    layout = _choose_layout_mode_aware(
+src/zemosaic/zemosaic_zegrid_mode.py:1644: in _choose_layout_mode_aware
+    raise zal.LayoutInfeasible(msg, refusal=_refusal)
+E   zemosaic.core.zegrid.auto_layout.LayoutInfeasible: requested halo 64px conflicts with the max_halo_overhead floor (0.9087 > 0.5) at the 3x2 factor-1 layout. A COARSER layout would be needed to satisfy the halo floor, but the bounded replan refinement-rank window (min=4, max=None) forbids coarsening; the exact geometry is preserved and the plan is refused. Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size. A FINER layout is NOT the fix: finer Cells raise halo overhead, which is the floor that rejected this candidate.
+------------------------------ Captured log call -------------------------------
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID] ZeGrid accepts but IGNORES the following stack/final-mosaic arguments (ZeGrid uses the frozen science config and standard FITS outputs):
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - apply_radial_weight = False
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - legacy_rgb_cube = False
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - radial_feather_fraction = 0.8
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - radial_shape_power = 2.0
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - stack_final_combine = 'mean'
+WARNING  ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID]   - stack_weight_method = 'noise_variance'
+ERROR    ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID] requested halo 64px conflicts with the max_halo_overhead floor (0.9087 > 0.5) at the 3x2 factor-1 layout. A COARSER layout would be needed to satisfy the halo floor, but the bounded replan refinement-rank window (min=4, max=None) forbids coarsening; the exact geometry is preserved and the plan is refused. Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size. A FINER layout is NOT the fix: finer Cells raise halo overhead, which is the floor that rejected this candidate.
+ERROR    ZeMosaicWorker.zegrid_mode:zemosaic_zegrid_mode.py:172 [ZEGRID] ZeGrid: NO executable plan fits the PLAN budget — refusing BEFORE the gauge/stack: requested halo 64px conflicts with the max_halo_overhead floor (0.9087 > 0.5) at the 3x2 factor-1 layout. A COARSER layout would be needed to satisfy the halo floor, but the bounded replan refinement-rank window (min=4, max=None) forbids coarsening; the exact geometry is preserved and the plan is refused. Lower the anti-checkerboard halo (e.g. 64 -> 32 px) or increase the core/cell size. A FINER layout is NOT the fix: finer Cells raise halo overhead, which is the floor that rejected this candidate.
+=============================== warnings summary ===============================
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_roundtrip_contract
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_signature_schema_pipeline_rejection
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_expected_mismatches_rejected
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_missing_corrupt_invalid_mosaic_rejected
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_optional_arrays_degrade_to_none
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_optional_arrays_degrade_to_none
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_optional_arrays_degrade_to_none
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_singleton_trailing_channel_normalized
+tests/test_cache_resume_characterization_witness.py::test_phase5_checkpoint_no_tmp_files_after_success
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/zemosaic_worker.py:24808: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    "created_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+
+tests/test_cache_resume_characterization_witness.py::test_phase1_write_cache_manifest_and_marker
+tests/test_cache_resume_characterization_witness.py::test_phase1_resume_auto_exact_signature_ok
+tests/test_cache_resume_characterization_witness.py::test_phase1_resume_auto_mismatch_rejects_force_warns
+tests/test_cache_resume_characterization_witness.py::test_phase1_resume_partial_and_no_valid
+tests/test_cache_resume_characterization_witness.py::test_phase1_resume_reason_pins
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/zemosaic_worker.py:25072: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    "created_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+
+tests/test_classic_sds_phase45_variants_characterization.py::test_sds_compute_tile_payload_all_invalid_and_positive_abs
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/zemosaic_worker.py:5116: RuntimeWarning: All-NaN slice encountered
+    median_val = float(np.nanmedian(arr)) if arr.size else 1.0
+
+tests/test_classic_sds_phase45_variants_characterization.py::test_sds_compute_tile_payload_all_invalid_and_positive_abs
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/zemosaic_worker.py:5144: RuntimeWarning: All-NaN slice encountered
+    median_val = float(np.nanmedian(masked_vals))
+
+tests/test_classic_sds_phase45_variants_characterization.py::test_phase45_alpha_weighted_nan_to_num_and_clip
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/tests/test_classic_sds_phase45_variants_characterization.py:258: RuntimeWarning: invalid value encountered in divide
+    super_arr = np.where(den > 0, num / den, np.nan)
+
+tests/test_crash_breadcrumbs_characterization_witness.py: 229 warnings
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/crash_breadcrumbs.py:161: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    "iso": datetime.utcnow().isoformat() + "Z",
+
+tests/test_fits_linux_interop_r26.py: 6 warnings
+tests/test_zegrid_r10_sip_wcs_recovery.py: 1 warning
+tests/test_zegrid_r11_global_gauge.py: 1 warning
+tests/test_zegrid_r12_instrumentation.py: 2 warnings
+tests/test_zegrid_r15_windows_filelock.py: 1 warning
+tests/test_zegrid_r18_final_finishing.py: 3 warnings
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:1036: VerifyWarning: Card is too long, comment will be truncated.
+    warnings.warn(
+
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_adaptation_preserves_membership_and_modes
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_output_count_parity_baseline_vs_pressure
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:271: VerifyWarning: Keyword name 'ZMT_NALGN' is greater than 8 characters or contains characters not allowed by the FITS standard; a HIERARCH card will be created.
+    warnings.warn(
+
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_adaptation_preserves_membership_and_modes
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_output_count_parity_baseline_vs_pressure
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:271: VerifyWarning: Keyword name 'MT_NFRAMES' is greater than 8 characters or contains characters not allowed by the FITS standard; a HIERARCH card will be created.
+    warnings.warn(
+
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_adaptation_preserves_membership_and_modes
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_output_count_parity_baseline_vs_pressure
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:271: VerifyWarning: Keyword name 'ZMT_WINLO' is greater than 8 characters or contains characters not allowed by the FITS standard; a HIERARCH card will be created.
+    warnings.warn(
+
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_adaptation_preserves_membership_and_modes
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_output_count_parity_baseline_vs_pressure
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:271: VerifyWarning: Keyword name 'ZMT_WINHI' is greater than 8 characters or contains characters not allowed by the FITS standard; a HIERARCH card will be created.
+    warnings.warn(
+
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_adaptation_preserves_membership_and_modes
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_output_count_parity_baseline_vs_pressure
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:271: VerifyWarning: Keyword name 'ZMT_KAPLO' is greater than 8 characters or contains characters not allowed by the FITS standard; a HIERARCH card will be created.
+    warnings.warn(
+
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_adaptation_preserves_membership_and_modes
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_output_count_parity_baseline_vs_pressure
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:271: VerifyWarning: Keyword name 'ZMT_KAPHI' is greater than 8 characters or contains characters not allowed by the FITS standard; a HIERARCH card will be created.
+    warnings.warn(
+
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_adaptation_preserves_membership_and_modes
+tests/test_phase3_adaptive_invariants.py::test_create_master_tile_output_count_parity_baseline_vs_pressure
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/io/fits/card.py:271: VerifyWarning: Keyword name 'ZMT_AGAIN' is greater than 8 characters or contains characters not allowed by the FITS standard; a HIERARCH card will be created.
+    warnings.warn(
+
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/zemosaic_align_stack.py:3793: AstropyDeprecationWarning: 'npixels' was deprecated in version 3.0 and will be removed in version 4.0. Use argument 'n_pixels' instead.
+    segm_map = detect_sources(data_2d, threshold_seg_est, npixels=5) # npixels minimum pour une source
+
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/photutils/segmentation/detect.py:394: NoDetectionsWarning: No sources were found. Try lowering the threshold or pixels parameters.
+    warnings.warn(msg, NoDetectionsWarning)
+
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/photutils/detection/core.py:956: AstropyDeprecationWarning: The 'sharplo' and 'sharphi' parameters are deprecated and will be removed in a future version. Use 'sharpness_range=(lower, upper)' instead.
+    warnings.warn(msg, AstropyDeprecationWarning)
+
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/photutils/detection/core.py:956: AstropyDeprecationWarning: The 'roundlo' and 'roundhi' parameters are deprecated and will be removed in a future version. Use 'roundness_range=(lower, upper)' instead.
+    warnings.warn(msg, AstropyDeprecationWarning)
+
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/photutils/detection/daofinder.py:343: NoDetectionsWarning: No sources were found.
+    warnings.warn(msg, NoDetectionsWarning)
+
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/zemosaic_align_stack.py:4158: AstropyDeprecationWarning: 'npixels' was deprecated in version 3.0 and will be removed in version 4.0. Use argument 'n_pixels' instead.
+    segm_map_cat = detect_sources(data_subtracted, threshold_seg_val, npixels=7) # npixels un peu plus grand
+
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+tests/test_sci05_archaeology_characterization.py::TestNoiseFwhmBehavior::test_star_free_real_path_returns_no_weighting
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/zemosaic_align_stack.py:4160: AstropyDeprecationWarning: 'npixels' was deprecated in version 3.0 and will be removed in version 4.0. Use argument 'n_pixels' instead.
+    segm_map_cat = detect_sources(data_subtracted, threshold_seg_val * 0.6, npixels=5)
+
+tests/test_sci05_canonical_gpu_parity.py: 1 warning
+tests/test_sci05_canonical_quantile_exact.py: 9 warnings
+tests/test_sci05_canonical_streaming.py: 170 warnings
+tests/test_sci05_canonical_streaming_gpu.py: 10 warnings
+tests/test_sds_bounded_memory_streaming_c4.py: 188 warnings
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/canonical_stacking.py:1405: RuntimeWarning: invalid value encountered in subtract
+    diff = v_hi - v_lo
+
+tests/test_sci05_canonical_gpu_parity.py::TestQuantileBitExact::test_quantile_bit_exact_vs_numpy
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_adversarial
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_randomized_matrix
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_n_including_low_n_and_singleton
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/numpy/lib/_nanfunctions_impl.py:1593: RuntimeWarning: All-NaN slice encountered
+    return fnb._ureduce(a,
+
+tests/test_sci05_canonical_normalization.py::TestLinearFit::test_nonfinite_fit_reason_defensive
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/canonical_stacking.py:507: RuntimeWarning: invalid value encountered in subtract
+    yc = y - my
+
+tests/test_sci05_canonical_normalization.py::TestLinearFit::test_nonfinite_fit_reason_defensive
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/canonical_stacking.py:511: RuntimeWarning: invalid value encountered in dot
+    sxy = float(np.dot(xc, yc))
+
+tests/test_sci05_canonical_normalization.py::TestSkyMean::test_sky_mean_failed_reason_defensive
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/stats/sigma_clipping.py:395: AstropyUserWarning: Input data contains invalid values (NaNs or infs), which were automatically clipped.
+    warnings.warn(
+
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_adversarial
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_randomized_matrix
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/numpy/lib/_function_base_impl.py:4608: RuntimeWarning: invalid value encountered in scalar subtract
+    diff_b_a = b - a
+
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_adversarial
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_randomized_matrix
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/numpy/lib/_function_base_impl.py:4609: RuntimeWarning: invalid value encountered in scalar multiply
+    lerp_interpolation = add(a, diff_b_a * t, out=... if out is None else out)
+
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_adversarial
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_randomized_matrix
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/canonical_stacking.py:1408: RuntimeWarning: invalid value encountered in multiply
+    v_lo + diff * frac,
+
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_adversarial
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_randomized_matrix
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/numpy/lib/_function_base_impl.py:4609: RuntimeWarning: invalid value encountered in add
+    lerp_interpolation = add(a, diff_b_a * t, out=... if out is None else out)
+
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_adversarial
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_randomized_matrix
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_helper_identity_with_np_is_bit_exact
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/canonical_stacking.py:1408: RuntimeWarning: invalid value encountered in add
+    v_lo + diff * frac,
+
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_adversarial
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_randomized_matrix
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/numpy/lib/_function_base_impl.py:4610: RuntimeWarning: invalid value encountered in subtract
+    subtract(b, diff_b_a * (1 - t), out=lerp_interpolation, where=t >= 0.5,
+
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_adversarial
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_bit_exact_randomized_matrix
+tests/test_sci05_canonical_quantile_exact.py::test_quantile_helper_identity_with_np_is_bit_exact
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/canonical_stacking.py:1409: RuntimeWarning: invalid value encountered in subtract
+    v_hi - diff * (1.0 - frac),
+
+tests/test_sci05_canonical_streaming.py::test_parity_rgb
+tests/test_sci05_canonical_streaming.py::test_parity_rgb
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-bounded-prefetch/src/zemosaic/core/canonical_equalize.py:127: RuntimeWarning: All-NaN slice encountered
+    lum = np.nanmedian(result, axis=2)
+
+tests/test_sds_fast_reproject_c5.py::test_real_m106_tan_frame_parity
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/astropy/wcs/wcs.py:694: FITSFixedWarning: The WCS transformation has more axes (2) than the image it is associated with (0)
+    warnings.warn(
+
+tests/test_sds_intermediate_fits_interop_c1.py::test_helper_path_finite_bits_identical_after_sanitize
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/numpy/lib/_nanfunctions_impl.py:1845: RuntimeWarning: invalid value encountered in subtract
+    np.subtract(arr, avg, out=arr, casting='unsafe', where=where)
+
+tests/test_zegrid_r12_instrumentation.py: 2 warnings
+tests/test_zegrid_r13_daemon_safe.py: 2 warnings
+tests/test_zegrid_r14_observability.py: 2 warnings
+tests/test_zegrid_r16_parallel_nondaemon.py: 4 warnings
+  /usr/lib/python3.13/multiprocessing/popen_fork.py:67: DeprecationWarning: This process (pid=560447) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_zegrid_r18_final_finishing.py::test_forced_finishing_failure_warns_and_completes
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 1271 passed, 2 skipped, 64 deselected, 705 warnings in 232.19s (0:03:52)

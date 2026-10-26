@@ -176,3 +176,33 @@ pin; the admission then observed the REAL host, shrank prefetch 2 -> 0 on a
 low-RAM moment, and the final plan hash rejected the shrunk mapping against the
 unshrunk candidate. The observer is now late-bound at call time (same product
 behaviour) and a regression guard pins the seam.
+
+## ARCH REWORK-1 (2026-10-26) — F1/F2 fixed, HEAD 4c703d9
+
+Two publication blockers reproduced by the independent audit are fixed with
+maintained product regressions:
+
+1. **F1 (admitted identity).** `_run_r55_active_gpu_units` now uses the ADMITTED
+   candidate/mapping throughout (runtime tile shrink materialized from the
+   current candidate; finalization uses the current candidate + bundle). The
+   previous code rebuilt from `plan_set.chosen`, so admission p2->p0 was lost at
+   finalization and the exact-mapping hash rejected it. Regressions cover
+   admission p2->p0 with no tile change and admission shrink followed by a
+   runtime tile shrink (reduced prefetch/workers/K preserved, no regrowth).
+2. **F2 (cleanup adapter).** The nested cleanup callback now unwraps the indexed
+   `(index, cell_task)` pipeline item, deletes ONLY the failed cell's cache
+   BEFORE credit release, and raises a reported failure if `_safe_rmtree`
+   returns False. Regressions use a real partial file, observe the disk credit
+   still held during deletion, and cover failure residue + cancellation.
+
+Validation: reviewer probes 2 passed; seven-module 149 passed/1 skipped;
+18-module 430 passed/1 skipped. The project fast gate (1200 s) times out at 49 %
+with two order-dependent `test_zegrid_r18_final_finishing.py` failures; both
+pass alone and are reproduced identically on a clean `873abb1` archive in the
+same order, so they are PRE-EXISTING and not caused by this work. No push,
+merge, beta/main change, tag, install or GUI change.
+
+Evidence corrections: the historical pinned-4 GiB smoke is superseded and is
+NOT p0 control proof; LP341 p2 is MODEL; the real H64 CUDA run is p0 only;
+Windows halo128 overlap is NOT_RUN. Logs are in
+`docs/measurements/ZM-ZEGRID-BOUNDED-PREFETCH-20261025/`.
