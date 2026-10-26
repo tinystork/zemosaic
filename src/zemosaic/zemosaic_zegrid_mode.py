@@ -162,6 +162,51 @@ R41_RAM_CONTRACT_SCHEMA = "zemosaic-zegrid-r41-ram-contract-v1"
 
 
 # ---------------------------------------------------------------------------
+# ZM-WIN-GPUPROBE — observational-only concurrency publication
+# ---------------------------------------------------------------------------
+# The worker crash breadcrumb (~2 s heartbeat) runs in the SAME process as this
+# engine, so a tiny tuple hand-off is enough. It is PURE OBSERVABILITY: nothing
+# below is read by planning, admission, ETA or execution. The tuple is replaced
+# atomically (never mutated in place), so a heartbeat always sees a consistent
+# sample and can never observe a half-written state.
+_RUNTIME_CONCURRENCY: tuple[int | None, str | None, str | None] = (
+    None,
+    None,
+    "concurrency_not_published_for_this_plan",
+)
+
+
+def publish_runtime_concurrency(
+    units_in_flight: int | None,
+    *,
+    source: str | None,
+    unavailable_reason: str | None = None,
+) -> None:
+    """Publish the CURRENT units in flight for crash-breadcrumb observability.
+
+    Only values that are actually KNOWN are published (an ACTIVE GPU run is
+    single-owner: exactly one unit). Unknown stays ``None`` with an explicit
+    reason; no worker counter is ever invented.
+    """
+    global _RUNTIME_CONCURRENCY
+    try:
+        units = None if units_in_flight is None else max(0, int(units_in_flight))
+        _RUNTIME_CONCURRENCY = (units, source, unavailable_reason)
+    except Exception:
+        pass
+
+
+def runtime_concurrency_snapshot() -> dict:
+    """Return the last published concurrency sample (observational only)."""
+    units, source, reason = _RUNTIME_CONCURRENCY
+    return {
+        "units_in_flight": units,
+        "source": source,
+        "unavailable_reason": reason,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Emit + portable memory probe
 # ---------------------------------------------------------------------------
 
@@ -12137,6 +12182,12 @@ def _run_single(
     # the manifest can report what the GPU actually attempted.
     _r55_gpu_retained = None
     if scheduler_mode == zsched.MODE_ACTIVE and _r55_active_gpu_decision is not None:
+        # ZM-WIN-GPUPROBE: a qualified ACTIVE GPU run is SINGLE-OWNER, so the
+        # number of units in flight during the per-cell stack is exactly 1.
+        # Publish it honestly instead of a mute null (observability only).
+        publish_runtime_concurrency(
+            1, source="active_gpu_single_owner", unavailable_reason=None
+        )
         try:
             (
                 results,
@@ -12179,6 +12230,12 @@ def _run_single(
                 if _t[4] is not None:
                     _safe_rmtree(_t[3], None)
             gpu_used = False
+            # The GPU unit is no longer in flight: the CPU rerun owns execution.
+            publish_runtime_concurrency(
+                None,
+                source="active_gpu_single_owner",
+                unavailable_reason="gpu_run_fallback_to_cpu",
+            )
             science_config = replace(science_config, backend="cpu")
             gpu_ctx = dict(gpu_ctx)
             gpu_ctx["effective"] = False
@@ -12508,6 +12565,14 @@ def _run_single(
     else:
         results, per_cell_meta = _run_cell_batch(
             science_config, cpu_streaming_tile, gpu_attempt=False
+        )
+
+    # The per-cell phase is over: no GPU unit is executing any more.
+    if scheduler_mode == zsched.MODE_ACTIVE and _r55_active_gpu_decision is not None:
+        publish_runtime_concurrency(
+            None,
+            source="active_gpu_single_owner",
+            unavailable_reason="per_cell_stack_finished",
         )
 
     block_wall = time.perf_counter() - t_block0

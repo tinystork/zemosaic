@@ -1,6 +1,7 @@
 # ZeGrid Windows observability — 2026-10-26
 
 Mission: `ZM-WIN-OBSERVABILITY-20261026` (branch `fix/zegrid-windows-observability`).
+Follow-up: `ZM-WIN-GPUPROBE-20261026` (branch `fix/zegrid-gpu-probe-fallback`).
 
 ## Findings (from the supplied evidence)
 
@@ -48,13 +49,49 @@ Mission: `ZM-WIN-OBSERVABILITY-20261026` (branch `fix/zegrid-windows-observabili
   process-tree **sampled sum**; GPU data comes only from an injected CUDA-free
   probe (NVML), otherwise null + reason.
 - `src/zemosaic/zemosaic_resource_telemetry.py`: public `sample_gpu_via_nvml()`
-  (driver-only, no CUDA context) for breadcrumbs.
+  (driver-only, no CUDA context) for breadcrumbs. It now tries, in order,
+  `pynvml` -> direct NVML through `ctypes` (`nvml.dll` /
+  `libnvidia-ml.so.1`) -> `nvidia-smi --query-gpu=...` (2 s timeout, 5 s TTL
+  cache). The first source that answers publishes `gpu_source`
+  (`pynvml` | `ctypes_nvml` | `nvidia_smi`) and `gpu_backend`; if all fail the
+  fields stay null with an AGGREGATED reason
+  (e.g. `pynvml_unavailable;ctypes_nvml_failed:DLL;nvidia_smi_timeout`). The
+  probe never loads CuPy or calls `cuda.runtime.memGetInfo()`: that path stays
+  reserved for the telemetry owner thread.
+- `src/zemosaic/zemosaic_zegrid_mode.py`: an ACTIVE GPU run is single-owner, so
+  the crash breadcrumb now publishes `in_flight = 1`
+  (`in_flight_source = "active_gpu_single_owner"`) during `per_cell_stack`, and
+  clears it with an explicit reason on fallback/phase end. This is a pure
+  observability tuple; no plan, admission, ETA or execution path reads it.
+- `src/zemosaic/zemosaic_worker.py`: the breadcrumb context refreshes that
+  published value (without ever importing the ZeGrid engine from the heartbeat)
+  and explains `winsor_workers = null` with
+  `winsor_workers_unavailable_reason = "not_used_by_zegrid"`.
 - `src/zemosaic/core/zegrid/runtime_control.py`: `read_parent_memory(path=None)`
   uses a portable psutil fallback (Windows); explicit non-default paths keep the
   strict null+reason behaviour.
 - `src/zemosaic/core/zegrid/gpu_memory.py`: pool counters call bound methods when
   callable and keep supporting plain attributes; unavailable metrics are null +
   error token, never fabricated.
+
+## Deprecated breadcrumb keys
+
+`ram_used_mb` (and the legacy `ram_total_mb` / `ram_pct`) are **deprecated
+aliases for SYSTEM RAM**, kept only for store compatibility. A worker crash that
+reads `ram_used_mb` therefore describes the whole machine, not the process.
+New consumers must use:
+
+- `system_ram_used_mb`, `system_ram_total_mb`, `system_ram_percent` — the
+  system-wide view (same values as the legacy keys);
+- `process_rss_mb` — the worker process RSS;
+- `process_peak_rss_mb` + `process_peak_rss_source` — the process peak when the
+  platform exposes one (`psutil_peak_wset`, `proc_status_VmHWM`);
+- `process_tree_rss_sampled_sum_mb` (+ `..._label` and
+  `process_tree_sample_count`) — an explicit SAMPLED SUM over the process tree,
+  never a simultaneous footprint and never a peak.
+
+Do not add new logic on top of `ram_used_mb`; treat it as a read-only legacy
+field.
 
 ## Validation
 
@@ -66,6 +103,12 @@ Mission: `ZM-WIN-OBSERVABILITY-20261026` (branch `fix/zegrid-windows-observabili
   telemetry, crash-breadcrumb witness, R55-E11 GPU adaptation, GPU admission
   fallback, R55-E2 prefetch, R55-D2 CPU active, ACTIVE OOC parity, layout
   observability, R55-E1 checkpoints.
+- `tests/test_zegrid_windows_gpu_probe_fallback.py` (new, 9 tests): ordered
+  `pynvml` -> `ctypes` NVML -> `nvidia-smi` cascade with fakes (no GPU), the
+  5 s TTL cache, the aggregated all-sources-unavailable reason, a static guard
+  that the probe never references CuPy/`memGetInfo`, the ZeGrid
+  `in_flight = 1` publication, and a before/after proof that telemetry ON
+  changes neither the plan JSON nor the resource envelope.
 - Two `test_zegrid_r55d2_cpu_active.py` failures
   (`test_plan_refusal_...`, `test_admission_exhaustion_...`) reproduce at
   baseline `689e9c8` and are **pre-existing**, not regressions.
@@ -73,7 +116,9 @@ Mission: `ZM-WIN-OBSERVABILITY-20261026` (branch `fix/zegrid-windows-observabili
 ## Limits / next step
 
 - Real Windows sampling was **NOT_RUN** (no Windows host here). The portable
-  paths are unit-tested with fakes only.
+  paths are unit-tested with fakes only; in particular the real `nvml.dll`
+  struct layout and the real `nvidia-smi` output are exercised by fakes, not by
+  a Windows GPU.
 - The end-to-end GUI -> worker flag -> ZeGrid lifecycle was validated at the
   controller/signature level and by phase/per-cell wiring, not by a full GUI run.
 - Next: run one short Windows ZeGrid ACTIVE GPU job with the Resource monitor ON

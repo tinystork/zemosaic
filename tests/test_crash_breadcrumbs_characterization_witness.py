@@ -55,6 +55,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import zemosaic.zemosaic_worker as zw  # noqa: E402
+from zemosaic import zemosaic_resource_telemetry as ztelemetry  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -269,15 +270,32 @@ def test_snapshot_ram_probe_failure_fail_open(monkeypatch: pytest.MonkeyPatch, _
         assert key not in snap
 
 
-def test_snapshot_gpu_fields_absent_by_default(_isolated_env: None) -> None:
+def test_snapshot_gpu_fields_absent_by_default(
+    _isolated_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # The historical zemosaic_utils.get_gpu_vram_info helper never existed. GPU
-    # data now comes from a CUDA-free injected probe; when none is available the
-    # fields stay null with an explicit reason (never fabricated 0, never CUDA).
+    # data now comes from a CUDA-free injected probe; when NO driver source is
+    # available the fields stay null with an explicit aggregated reason (never a
+    # fabricated 0, never CUDA). The probe now also tries ctypes NVML and
+    # nvidia-smi, so unavailability is forced here instead of assumed from the
+    # absence of the optional pynvml binding.
+    ztelemetry.reset_gpu_probe_caches()
+    monkeypatch.setattr(
+        ztelemetry, "_sample_gpu_via_pynvml", lambda: ztelemetry._gpu_info_defaults()
+    )
+    monkeypatch.setattr(ztelemetry, "_pynvml_error_token", lambda: "pynvml_unavailable")
+    monkeypatch.setattr(
+        ztelemetry, "_load_nvml_library", lambda: (None, "ctypes_nvml_failed:DLL")
+    )
+    monkeypatch.setattr(ztelemetry, "_nvidia_smi_executable", lambda: None)
+
     snap = zw._safe_runtime_snapshot()
     for key in ("gpu_used_mb", "gpu_total_mb", "gpu_free_mb"):
         assert key in snap and snap[key] is None
     assert snap["gpu_source"] is None
-    assert snap["gpu_unavailable_reason"]
+    assert snap["gpu_unavailable_reason"] == (
+        "pynvml_unavailable;ctypes_nvml_failed:DLL;nvidia_smi_not_found"
+    )
 
 
 def test_snapshot_gpu_fields_when_safe_probe_present(

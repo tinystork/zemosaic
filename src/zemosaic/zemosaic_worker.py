@@ -195,6 +195,22 @@ def _safe_runtime_snapshot() -> dict[str, Any]:
     )
 
 
+def _zegrid_runtime_concurrency() -> dict[str, Any] | None:
+    """Observational-only ZeGrid concurrency sample, when the engine is loaded.
+
+    ``sys.modules`` is consulted deliberately: a classic/SDS run must never pull
+    the heavy ZeGrid engine into the heartbeat thread just to fill a breadcrumb.
+    """
+    try:
+        module = sys.modules.get("zemosaic.zemosaic_zegrid_mode")
+        if module is None:
+            return None
+        snapshot = module.runtime_concurrency_snapshot()
+        return snapshot if isinstance(snapshot, dict) else None
+    except Exception:
+        return None
+
+
 def _emit_crash_breadcrumb(event: str, **payload: Any) -> None:
     """Append one JSON line breadcrumb and refresh last-state JSON.
 
@@ -36644,6 +36660,7 @@ def run_hierarchical_mosaic_process(
         # with an explicit reason instead of publishing a requested value as if
         # it were an observed one.
         "in_flight": None,
+        "in_flight_source": None,
         "in_flight_unavailable_reason": "not_reported_by_progress_contract",
         "cpu_workers": None,
         "cpu_workers_requested": None,
@@ -36655,6 +36672,7 @@ def run_hierarchical_mosaic_process(
         "gpu_rows_per_chunk_unavailable_reason": "not_reported_for_this_mode",
         "max_chunk_bytes_unavailable_reason": "not_reported_for_this_mode",
         "winsor_workers": None,
+        "winsor_workers_unavailable_reason": None,
     }
 
     def _ctx_update(**items: Any) -> None:
@@ -36662,6 +36680,41 @@ def run_hierarchical_mosaic_process(
             crash_ctx.update(items)
         except Exception:
             pass
+
+    def _breadcrumb_context() -> dict[str, Any]:
+        """Refresh observational-only fields, then copy the crash context.
+
+        The ONLY live source is ZeGrid's own published concurrency tuple (same
+        process, atomically replaced). Unknown values stay null with an explicit
+        reason; no worker count is ever invented here.
+        """
+        hint = _zegrid_runtime_concurrency()
+        if hint is not None:
+            units = hint.get("units_in_flight")
+            if (
+                isinstance(units, int)
+                and not isinstance(units, bool)
+                and units >= 0
+            ):
+                _ctx_update(
+                    in_flight=int(units),
+                    in_flight_source=hint.get("source"),
+                    in_flight_unavailable_reason=None,
+                )
+            else:
+                _ctx_update(
+                    in_flight=None,
+                    in_flight_source=hint.get("source"),
+                    in_flight_unavailable_reason=(
+                        hint.get("unavailable_reason")
+                        or "not_reported_by_progress_contract"
+                    ),
+                )
+            # ZeGrid does not use the classic per-pass winsor worker pool: say
+            # so explicitly instead of publishing a mute null.
+            if crash_ctx.get("winsor_workers") is None:
+                _ctx_update(winsor_workers_unavailable_reason="not_used_by_zegrid")
+        return dict(crash_ctx)
 
     # progress_callback(stage: str, current: int, total: int)
 
@@ -36731,7 +36784,7 @@ def run_hierarchical_mosaic_process(
                 message=str(message_key_or_raw),
                 progress=progress_value,
                 payload=dict(cb_kwargs or {}),
-                context=dict(crash_ctx),
+                context=_breadcrumb_context(),
             )
         if lvl_str not in {"INFO", "WARN", "ERROR", "SUCCESS", "ETA_LEVEL", "CHRONO_LEVEL"}:
             return
@@ -36838,7 +36891,7 @@ def run_hierarchical_mosaic_process(
         gpu_rows_per_chunk=final_kwargs.get("gpu_rows_per_chunk_config"),
         max_chunk_bytes=final_kwargs.get("max_chunk_bytes_config"),
     )
-    _emit_crash_breadcrumb("WORKER_START", context=dict(crash_ctx))
+    _emit_crash_breadcrumb("WORKER_START", context=_breadcrumb_context())
 
     hb_stop_evt = threading.Event()
     graceful_stop_requested = False
@@ -36867,7 +36920,7 @@ def run_hierarchical_mosaic_process(
     def _heartbeat_writer() -> None:
         interval = max(0.5, float(crash_breadcrumbs_heartbeat_sec))
         while not hb_stop_evt.wait(interval):
-            _emit_crash_breadcrumb("WORKER_HEARTBEAT", context=dict(crash_ctx))
+            _emit_crash_breadcrumb("WORKER_HEARTBEAT", context=_breadcrumb_context())
 
     hb_thread = None
     if crash_breadcrumbs_mode == "always":
@@ -36884,7 +36937,7 @@ def run_hierarchical_mosaic_process(
         _ctx_update(operation="worker_cancelled", phase="run_hierarchical_mosaic")
         _emit_crash_breadcrumb(
             "WORKER_CANCELLED",
-            context=dict(crash_ctx),
+            context=_breadcrumb_context(),
         )
         try:
             progress_queue.put(("log_key_processing_cancelled", None, "WARN", {"reason": "quit_save"}))
@@ -36900,7 +36953,7 @@ def run_hierarchical_mosaic_process(
             "WORKER_EXCEPTION",
             error=str(e_proc),
             traceback=traceback.format_exc(),
-            context=dict(crash_ctx),
+            context=_breadcrumb_context(),
         )
         progress_queue.put((
             "PROCESS_ERROR",
@@ -36908,7 +36961,7 @@ def run_hierarchical_mosaic_process(
             "ERROR",
             {
                 "error": str(e_proc),
-                "crash_context": dict(crash_ctx),
+                "crash_context": _breadcrumb_context(),
                 "breadcrumb_path": str(_CRASH_BREADCRUMB_PATH) if _CRASH_BREADCRUMB_PATH else None,
                 "last_state_path": str(_CRASH_STATE_PATH) if _CRASH_STATE_PATH else None,
             },
@@ -36927,7 +36980,7 @@ def run_hierarchical_mosaic_process(
                 signal.signal(signal.SIGINT, _prev_sigint)
         except Exception:
             pass
-        _emit_crash_breadcrumb("WORKER_DONE", context=dict(crash_ctx), graceful_stop=bool(graceful_stop_requested))
+        _emit_crash_breadcrumb("WORKER_DONE", context=_breadcrumb_context(), graceful_stop=bool(graceful_stop_requested))
         progress_queue.put(("PROCESS_DONE", None, "INFO", {}))
 
 if __name__ == "__main__":
