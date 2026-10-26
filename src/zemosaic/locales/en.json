@@ -936,7 +936,7 @@
   "qt_field_zegrid_scheduler_tip": "Choose how the ZeGrid engine schedules cell stacking. 'Standard (legacy)' is the historical, fully supported path. 'Observe only' records a predicted R55 plan without changing execution. 'Active' is the default beta path that grants execution authority to the R55 plan; it does NOT enable the GPU by itself — the GPU toggle must also be enabled. Active was qualified on a synthetic 5,000-image corpus, one cell, bounded profile, on GPU, with no fallback, and makes no speed promise.",
   "qt_zegrid_scheduler_opt_legacy": "Standard (legacy)",
   "qt_zegrid_scheduler_opt_observe": "Observe only (records predictions)",
-  "qt_zegrid_scheduler_opt_active": "Active — experimental beta",
+  "qt_zegrid_scheduler_opt_active": "Active — beta (qualified, synthetic 5,000-image corpus)",
   "qt_zegrid_scheduler_active_warning": "Beta: 'active' grants the R55 plan execution authority. It was qualified on a synthetic 5,000-image corpus, one cell, bounded profile, on GPU, with no fallback. The GPU toggle is still required for GPU execution. No performance promise is made for real-world or Caldwell data.",
   "qt_zegrid_scheduler_active_run_warning": "ZeGrid scheduler 'active' grants execution authority to the R55 plan (qualified on a synthetic 5,000-image corpus, one cell, bounded profile, on GPU, with no fallback). No performance promise is made. Keep the GPU toggle off to run on CPU.",
   "qt_zegrid_scheduler_invalid_value": "Invalid ZeGrid scheduler value: {value}. Allowed values: {allowed}. Select a valid value before starting a run.",

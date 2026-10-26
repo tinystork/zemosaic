@@ -923,7 +923,7 @@
   "qt_field_zegrid_scheduler_tip": "Choisissez la façon dont le moteur ZeGrid ordonnance l’empilement des cellules. « Standard (historique) » est le chemin historique pleinement pris en charge. « Observer seulement » enregistre un plan R55 prédit sans modifier l’exécution. « Actif » est le chemin bêta par défaut qui donne autorité au plan R55 ; il n’active PAS le GPU à lui seul — l’interrupteur GPU doit aussi être activé. Actif a été qualifié sur un corpus synthétique de 5 000 images, une cellule, profil borné, sur GPU, sans repli, et ne promet aucune performance.",
   "qt_zegrid_scheduler_opt_legacy": "Standard (historique)",
   "qt_zegrid_scheduler_opt_observe": "Observer seulement (enregistre des prédictions)",
-  "qt_zegrid_scheduler_opt_active": "Actif — bêta expérimentale",
+  "qt_zegrid_scheduler_opt_active": "Actif — bêta (qualifié, corpus synthétique 5 000 images)",
   "qt_zegrid_scheduler_active_warning": "Bêta : « actif » donne autorité d’exécution au plan R55. Qualifié sur un corpus synthétique de 5 000 images, une cellule, profil borné, sur GPU, sans repli. L’interrupteur GPU reste nécessaire pour l’exécution GPU. Aucune promesse de performance pour des données réelles ou Caldwell.",
   "qt_zegrid_scheduler_active_run_warning": "L’ordonnanceur ZeGrid « actif » donne autorité d’exécution au plan R55 (qualifié sur un corpus synthétique de 5 000 images, une cellule, profil borné, sur GPU, sans repli). Aucune promesse de performance. Laissez l’interrupteur GPU désactivé pour exécuter sur CPU.",
   "qt_zegrid_scheduler_invalid_value": "Valeur d’ordonnanceur ZeGrid invalide : {value}. Valeurs autorisées : {allowed}. Sélectionnez une valeur valide avant de lancer.",

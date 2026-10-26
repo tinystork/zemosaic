@@ -864,7 +864,7 @@
     "qt_field_zegrid_scheduler_tip": "Kies hoe de ZeGrid-engine het stapelen van cellen plant. ‘Standaard (legacy)’ is het historische, volledig ondersteunde pad. ‘Alleen observeren’ registreert een voorspeld R55-plan zonder de uitvoering te wijzigen. ‘Actief’ is het standaard bètapad dat het R55-plan uitvoeringsautoriteit geeft; het schakelt de GPU NIET vanzelf in — de GPU-schakelaar moet ook aan staan. Actief is gekwalificeerd op een synthetisch corpus van 5.000 beelden, één cel, begrensd profiel, op GPU en zonder terugval, en belooft geen snelheid.",
     "qt_zegrid_scheduler_opt_legacy": "Standaard (legacy)",
     "qt_zegrid_scheduler_opt_observe": "Alleen observeren (registreert voorspellingen)",
-    "qt_zegrid_scheduler_opt_active": "Actief — experimentele bèta",
+    "qt_zegrid_scheduler_opt_active": "Actief — bèta (gekwalificeerd, synthetisch corpus 5.000 beelden)",
     "qt_zegrid_scheduler_active_warning": "Bèta: ‘actief’ geeft het R55-plan uitvoeringsautoriteit. Gekwalificeerd op een synthetisch corpus van 5.000 beelden, één cel, begrensd profiel, op GPU en zonder terugval. De GPU-schakelaar blijft nodig voor GPU-uitvoering. Er wordt geen prestatie beloofd voor echte of Caldwell-gegevens.",
     "qt_zegrid_scheduler_active_run_warning": "De ZeGrid-planner ‘actief’ geeft het R55-plan uitvoeringsautoriteit (gekwalificeerd op een synthetisch corpus van 5.000 beelden, één cel, begrensd profiel, op GPU en zonder terugval). Er wordt geen prestatie beloofd. Laat de GPU-schakelaar uit om op CPU te draaien.",
     "qt_zegrid_scheduler_invalid_value": "Ongeldige ZeGrid-plannerwaarde: {value}. Toegestane waarden: {allowed}. Selecteer een geldige waarde voordat u start.",

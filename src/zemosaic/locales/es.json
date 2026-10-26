@@ -864,7 +864,7 @@
     "qt_field_zegrid_scheduler_tip": "Elija cómo el motor ZeGrid planifica el apilado de celdas. «Estándar (heredado)» es la ruta histórica totalmente compatible. «Solo observar» registra un plan R55 previsto sin cambiar la ejecución. «Activo» es la ruta beta predeterminada que otorga autoridad de ejecución al plan R55; NO activa la GPU por sí sola — también debe activarse el interruptor de GPU. Activo se cualificó en un corpus sintético de 5 000 imágenes, una celda, perfil acotado, en GPU y sin repliegue, y no promete rendimiento.",
     "qt_zegrid_scheduler_opt_legacy": "Estándar (heredado)",
     "qt_zegrid_scheduler_opt_observe": "Solo observar (registra predicciones)",
-    "qt_zegrid_scheduler_opt_active": "Activo — beta experimental",
+    "qt_zegrid_scheduler_opt_active": "Activo — beta (cualificado, corpus sintético 5 000 imágenes)",
     "qt_zegrid_scheduler_active_warning": "Beta: «activo» otorga autoridad de ejecución al plan R55. Cualificado en un corpus sintético de 5 000 imágenes, una celda, perfil acotado, en GPU y sin repliegue. El interruptor de GPU sigue siendo necesario para la ejecución en GPU. No se promete rendimiento para datos reales o de Caldwell.",
     "qt_zegrid_scheduler_active_run_warning": "El planificador ZeGrid «activo» otorga autoridad de ejecución al plan R55 (cualificado en un corpus sintético de 5 000 imágenes, una celda, perfil acotado, en GPU y sin repliegue). No se promete rendimiento. Mantenga el interruptor de GPU desactivado para ejecutar en CPU.",
     "qt_zegrid_scheduler_invalid_value": "Valor de planificador ZeGrid no válido: {value}. Valores permitidos: {allowed}. Seleccione un valor válido antes de iniciar.",
