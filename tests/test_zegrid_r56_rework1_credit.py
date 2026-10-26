@@ -589,6 +589,10 @@ def _arm(**over):
         "outputs": {"mosaic_grid.fits": "a", "mosaic_grid_coverage.fits": "b"},
         "complete_cells": 4,
         "incomplete_cells": 0,
+        "final_backend": "gpu",
+        "consumed_cells": 4,
+        "complete_cell_count": 4,
+        "cells_complete": 4,
         "frame_ids": ["f1", "f2"],
         "n_frames": 2,
         "layout": [2, 2],
@@ -642,3 +646,326 @@ def test_campaign_accepts_a_complete_candidate_pair():
     mod = _campaign_module()
     gates = mod.evaluate(_arm(pid=2, run_policy={"prefetch_units": 0}), _arm())
     assert gates["all_passed"] is True, gates
+
+
+def test_campaign_adapter_reads_the_real_product_manifest_shape():
+    """Integration on the FORME RÉELLE of a successful Windows manifest.
+
+    source: /tmp/r56_big/ab_pinned/arm_candidate/zegrid_manifest.json
+    (complete_cells list of 6, incomplete_cells [], frame_ids 12,
+    r55_scheduler.run.final_execution.backend == "gpu",
+    6 completed gpu_runtime_units, 6 cells with status "complete").
+    """
+    import json  # noqa: PLC0415
+    import pathlib  # noqa: PLC0415
+
+    manifest_path = pathlib.Path(
+        "/tmp/r56_big/ab_pinned/arm_candidate/zegrid_manifest.json"
+    )
+    if not manifest_path.is_file():
+        pytest.skip(f"real product manifest absent: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    mod = _campaign_module()
+    fields = mod._arm_manifest_fields(manifest)
+    assert fields["final_backend"] == "gpu"
+    assert fields["consumed_cells"] == 6
+    assert fields["complete_cell_count"] == 6
+    assert fields["cells_complete"] == 6
+    assert fields["gpu_units_total"] == 6
+
+    arm = _arm(**fields)
+    arm["complete_cells"] = manifest["complete_cells"]
+    arm["incomplete_cells"] = manifest["incomplete_cells"]
+    arm["frame_ids"] = manifest["frame_ids"]
+    assert mod._arm_complete(arm) is True
+    assert mod._arm_gpu_prefetch(arm) is True
+
+    # A plan that qualified but never executed must NOT qualify.
+    not_executed = dict(arm)
+    not_executed["consumed_cells"] = 0
+    assert mod._arm_complete(not_executed) is False
+    assert mod._arm_gpu_prefetch(not_executed) is False
+
+    # A CPU fallback must NOT pass the GPU gate even with complete cells.
+    cpu_fallback = dict(arm)
+    cpu_fallback["final_backend"] = "cpu"
+    assert mod._arm_complete(cpu_fallback) is True
+    assert mod._arm_gpu_prefetch(cpu_fallback) is False
+
+    # complete_cells list longer/shorter than the consumed units is refused.
+    mismatched = dict(arm)
+    mismatched["complete_cells"] = list(manifest["complete_cells"])[:-1]
+    assert mod._arm_complete(mismatched) is False
+
+
+# ---------------------------------------------------------------------------
+# F4 adversarials — real pipeline behaviour (wait vs refuse vs cancel)
+# ---------------------------------------------------------------------------
+
+def _disk_hook(volume_bytes: int, *, external_delay=None, external_bytes=0):
+    """Fresh-volume hook: capacity = (fresh_free + own_retained) // 2."""
+
+    def _hook(task, ledger, cancel_event):
+        own = int(ledger.snapshot()["disk_used_bytes"])
+        used_external = 0
+        if external_delay is not None and int(task) >= int(external_delay):
+            used_external = int(external_bytes)
+        free = max(0, int(volume_bytes) - own - used_external)
+        ledger.reduce_budget("disk", (free + own) // 2)
+
+    return _hook
+
+
+def test_full_slots_with_unchanged_volume_wait_then_proceed():
+    """Own saturation is NOT a refusal: it waits for the consumer release.
+
+    Volume 400 B, policy capacity 200 B, ONE extra slot. The producer fills the
+    queue (200 B), then the third pre-acquisition would exceed 200 B: the ledger
+    must WAIT (unchanged volume) until the consumer releases the first file.
+    """
+    volume = 400
+    produced = []
+    released = []
+
+    def produce(task):
+        produced.append(int(task))
+        return {"task": int(task), "bytes": 100}
+
+    def consume(payload):
+        return payload["task"]
+
+    def release(payload):
+        released.append(payload["task"])
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[0, 1, 2],
+        produce=produce,
+        consume=consume,
+        release=release,
+        prefetch_units=1,
+        host_budget_bytes=1000,
+        device_budget_bytes=10,
+        disk_budget_bytes=200,
+        disk_enabled=True,
+        host_bytes=lambda _p: 10,
+        device_bytes=lambda _p: 0,
+        disk_bytes=lambda _p: 100,
+        host_reserve_bytes=lambda _t: 10,
+        disk_reserve_bytes=lambda _t: 100,
+        before_produce=_disk_hook(volume),
+    )
+    assert pipe.run() == [0, 1, 2]
+    ledger = pipe.telemetry()["ledger"]
+    assert ledger["balanced"] is True
+    assert ledger["credit_wait_events"] >= 1
+    assert sorted(produced) == [0, 1, 2]
+    assert sorted(released) == [0, 1, 2]
+    assert ledger["disk_peak_bytes"] == 200  # never exceeded the policy cap
+
+
+def test_external_volume_decline_refuses_before_staging():
+    """An EXTERNAL writer shrinks the fresh volume -> refuse (no wait forever)."""
+    volume = 400
+    produced = []
+
+    def produce(task):
+        produced.append(int(task))
+        return {"task": int(task), "bytes": 100}
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[0, 1, 2],
+        produce=produce,
+        consume=lambda p: p["task"],
+        release=lambda _p: None,
+        prefetch_units=1,
+        host_budget_bytes=1000,
+        device_budget_bytes=10,
+        disk_budget_bytes=200,
+        disk_enabled=True,
+        host_bytes=lambda _p: 10,
+        device_bytes=lambda _p: 0,
+        disk_bytes=lambda _p: 100,
+        host_reserve_bytes=lambda _t: 10,
+        disk_reserve_bytes=lambda _t: 100,
+        # From task 1 onward an external writer leaves only 200 B of volume:
+        # capacity = (200 - own + own)//2 = 100 while a single request is 100
+        # and the previous own=100 -> 200 > 100 -> refusal (not a wait).
+        before_produce=_disk_hook(
+            volume, external_delay=1, external_bytes=390
+        ),
+    )
+    with pytest.raises(zpar.PipelineAccountingError):
+        pipe.run()
+    assert produced == [0]  # the second unit never allocated
+    ledger = pipe.telemetry()["ledger"]
+    assert ledger["balanced"] is True
+
+
+def test_capacity_shrink_during_disk_wait_fails_closed():
+    """A shrink WHILE waiting must refuse instead of blocking forever."""
+    volume = 400
+    holder = {}
+
+    def before(task, ledger, cancel_event):
+        own = int(ledger.snapshot()["disk_used_bytes"])
+        ledger.reduce_budget("disk", (volume - own + own) // 2)
+        if int(task) == 2:
+            threading.Timer(
+                0.2, lambda: ledger.reduce_budget("disk", 50)
+            ).start()
+
+    def consume(payload):
+        # Hold the consumed unit so both queued slots stay leased while the
+        # producer waits for the third disk credit.
+        assert holder["p"]._cancel.wait(2.0)
+        return payload["task"]
+
+    def produce(task):
+        return {"task": int(task), "bytes": 100}
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[0, 1, 2],
+        produce=produce,
+        consume=consume,
+        release=lambda _p: None,
+        prefetch_units=1,
+        host_budget_bytes=1000,
+        device_budget_bytes=10,
+        disk_budget_bytes=200,
+        disk_enabled=True,
+        host_bytes=lambda _p: 10,
+        device_bytes=lambda _p: 0,
+        disk_bytes=lambda _p: 100,
+        host_reserve_bytes=lambda _t: 10,
+        disk_reserve_bytes=lambda _t: 100,
+        before_produce=before,
+        stall_timeout_s=None,
+    )
+    holder["p"] = pipe
+    with pytest.raises(zpar.PipelineAccountingError) as excinfo:
+        pipe.run()
+    assert "shrank" in str(excinfo.value)
+    ledger = pipe.telemetry()["ledger"]
+    assert ledger["budget_reductions"][-1]["to_bytes"] == 50
+    assert ledger["balanced"] is True
+
+
+def test_cancellation_during_disk_wait_is_clean():
+    volume = 400
+    holder = {}
+
+    def before(task, ledger, cancel_event):
+        own = int(ledger.snapshot()["disk_used_bytes"])
+        ledger.reduce_budget("disk", (volume - own + own) // 2)
+        if int(task) == 2:
+            threading.Timer(
+                0.2, lambda: holder["p"].cancel("test_cancel_disk_wait")
+            ).start()
+
+    def consume(payload):
+        # Hold the consumed unit so both queued slots stay leased while the
+        # producer waits for the third disk credit.
+        holder["p"]._cancel.wait(2.0)
+        return payload["task"]
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[0, 1, 2],
+        produce=lambda t: {"task": int(t), "bytes": 100},
+        consume=consume,
+        release=lambda _p: None,
+        prefetch_units=1,
+        host_budget_bytes=1000,
+        device_budget_bytes=10,
+        disk_budget_bytes=200,
+        disk_enabled=True,
+        host_bytes=lambda _p: 10,
+        device_bytes=lambda _p: 0,
+        disk_bytes=lambda _p: 100,
+        host_reserve_bytes=lambda _t: 10,
+        disk_reserve_bytes=lambda _t: 100,
+        before_produce=before,
+    )
+    holder["p"] = pipe
+    with pytest.raises(zpar.PipelineCancelled):
+        pipe.run()
+    ledger = pipe.telemetry()["ledger"]
+    assert ledger["balanced"] is True
+
+
+def test_enabled_zero_disk_capacity_refuses_a_nonzero_request():
+    produced = []
+
+    def produce(task):
+        produced.append(int(task))
+        return {"task": int(task), "bytes": 100}
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[0],
+        produce=produce,
+        consume=lambda p: p["task"],
+        release=lambda _p: None,
+        prefetch_units=0,
+        host_budget_bytes=100,
+        device_budget_bytes=10,
+        disk_budget_bytes=0,
+        disk_enabled=True,  # explicit: the dimension is ON with capacity 0
+        host_bytes=lambda _p: 10,
+        device_bytes=lambda _p: 0,
+        disk_bytes=lambda _p: 100,
+        host_reserve_bytes=lambda _t: 10,
+        disk_reserve_bytes=lambda _t: 100,
+    )
+    with pytest.raises(zpar.PipelineAccountingError):
+        pipe.run()
+    assert produced == []
+
+
+def test_partial_produce_cleanup_deletes_real_files_before_credit_release(
+    tmp_path,
+):
+    partial = tmp_path / "partial_cache.bin"
+    observed = {}
+    holder = {}
+
+    def produce(_task):
+        partial.write_bytes(b"x" * 100)
+        raise RuntimeError("cache build exploded mid-write")
+
+    def cleanup(_task, _payload):
+        # The partial file is still there AND its credit is STILL HELD: cleanup
+        # must delete BEFORE the lease is released, otherwise the ledger frees
+        # space while the bytes are still on the volume.
+        observed["exists"] = partial.exists()
+        observed["disk_used"] = int(
+            holder["p"].telemetry()["ledger"]["disk_used_bytes"]
+        )
+        partial.unlink()
+
+    pipe = zpar.BoundedPipeline(
+        tasks=[0],
+        produce=produce,
+        consume=lambda p: p,
+        release=lambda _p: None,
+        prefetch_units=0,
+        host_budget_bytes=100,
+        device_budget_bytes=10,
+        disk_budget_bytes=100,
+        disk_enabled=True,
+        cleanup_task=cleanup,
+        host_bytes=lambda _p: 10,
+        device_bytes=lambda _p: 0,
+        disk_bytes=lambda _p: 100,
+        host_reserve_bytes=lambda _t: 10,
+        disk_reserve_bytes=lambda _t: 100,
+    )
+    holder["p"] = pipe
+    with pytest.raises(zpar.PipelineError) as excinfo:
+        pipe.run()
+    # PRIMARY cause preserved (not replaced by an accounting error).
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "cache build exploded" in str(excinfo.value)
+    assert observed == {"exists": True, "disk_used": 100}
+    assert not partial.exists()
+    ledger = pipe.telemetry()["ledger"]
+    assert ledger["balanced"] is True
+    assert ledger["disk_used_bytes"] == 0

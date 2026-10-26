@@ -336,6 +336,7 @@ def _run_arm(
     block = manifest.get("r55_scheduler") or {}
     run_block = block.get("run") or {}
     pipeline = (manifest.get("r55_run_telemetry") or {}).get("gpu_pipeline") or {}
+    adapted = _arm_manifest_fields(manifest)
     return {
         "schema": ARM_SCHEMA,
         "arm": arm,
@@ -370,12 +371,72 @@ def _run_arm(
         "layout": manifest.get("layout"),
         "normalization": manifest.get("normalization"),
         "observation": observation,
+        **adapted,
     }
 
 
 # ---------------------------------------------------------------------------
 # Gates (non-null, candidate-specific, comparable)
 # ---------------------------------------------------------------------------
+
+def _arm_manifest_fields(manifest: dict) -> dict:
+    """Extract the FINAL backend and the CONSUMED cell count from the REAL
+    product manifest schema (``r55_scheduler.run.final_execution`` +
+    ``r55_run_telemetry.gpu_runtime_units`` + ``cells[].status``).
+
+    ``final_backend`` is the backend that actually executed (never the requested
+    one). ``consumed_cells`` counts units that were genuinely attempted AND
+    completed AND not discarded, so a qualification-only or fallback arm cannot
+    masquerade as a GPU run.
+    """
+    manifest = manifest or {}
+    scheduler = manifest.get("r55_scheduler") or {}
+    run_block = scheduler.get("run") or {}
+    final_exec = run_block.get("final_execution") or {}
+    execution = scheduler.get("execution") or {}
+    final_backend = final_exec.get("backend")
+    if final_backend is None:
+        final_backend = execution.get("backend")
+
+    telemetry = manifest.get("r55_run_telemetry") or {}
+    units = telemetry.get("gpu_runtime_units")
+    consumed = None
+    if isinstance(units, list):
+        consumed = sum(
+            1
+            for unit in units
+            if isinstance(unit, dict)
+            and bool(unit.get("attempted"))
+            and bool(unit.get("completed"))
+            and not bool(unit.get("discarded"))
+        )
+    cells = manifest.get("cells")
+    cells_complete = None
+    if isinstance(cells, list):
+        cells_complete = sum(
+            1
+            for cell in cells
+            if isinstance(cell, dict) and str(cell.get("status")) == "complete"
+        )
+    complete = manifest.get("complete_cells")
+    if isinstance(complete, list):
+        complete_count = len(complete)
+    elif isinstance(complete, int) and not isinstance(complete, bool):
+        complete_count = int(complete)
+    else:
+        complete_count = None
+    return {
+        "final_backend": (
+            None if final_backend is None else str(final_backend)
+        ),
+        "consumed_cells": consumed,
+        "cells_complete": cells_complete,
+        "complete_cell_count": complete_count,
+        "gpu_units_total": (
+            None if not isinstance(units, list) else len(units)
+        ),
+    }
+
 
 def _arm_complete(arm: dict) -> bool:
     if arm.get("error") is not None:
@@ -408,6 +469,29 @@ def _arm_complete(arm: dict) -> bool:
     frames = arm.get("frame_ids")
     if not isinstance(frames, list) or not frames:
         return False
+    # CONSUMED-CELL GATE: the arm must publish a real final backend and prove
+    # that every complete cell was actually consumed. A manifest that only
+    # qualified a plan, or that reports complete_cells without runtime units,
+    # is NONQUALIFYING.
+    if arm.get("final_backend") not in ("gpu", "cpu"):
+        return False
+    consumed = arm.get("consumed_cells")
+    # Derive the count from the MANIFEST FIELD itself (never from a cached
+    # summary that could drift from it).
+    complete_field = arm.get("complete_cells")
+    if isinstance(complete_field, list):
+        complete_count = len(complete_field)
+    elif isinstance(complete_field, int) and not isinstance(complete_field, bool):
+        complete_count = int(complete_field)
+    else:
+        return False
+    if not isinstance(consumed, int) or isinstance(consumed, bool):
+        return False
+    if consumed <= 0 or consumed != complete_count:
+        return False
+    cells_complete = arm.get("cells_complete")
+    if cells_complete is not None and int(cells_complete) != int(consumed):
+        return False
     return True
 
 
@@ -418,9 +502,14 @@ def _arm_gpu_prefetch(arm: dict) -> bool:
     fallback = arm.get("gpu_fallback")
     return (
         str(mapping.get("backend")) == "gpu"
+        # FINAL (executed) backend, not the requested/qualified one.
+        and str(arm.get("final_backend")) == "gpu"
         and bool(gpu_exec.get("qualified"))
         and fallback in (None, {})
         and (policy.get("prefetch_units") or 0) >= 1
+        and isinstance(arm.get("consumed_cells"), int)
+        and not isinstance(arm.get("consumed_cells"), bool)
+        and int(arm.get("consumed_cells")) > 0
     )
 
 

@@ -1509,6 +1509,14 @@ class BufferLedger:
         started = 0.0
         with self._cond:
             while self._capacity(kind) - self._used(kind) < want:
+                # A concurrent SHRINK can make the pending request structurally
+                # impossible. Fail closed instead of waiting forever for a
+                # capacity that can no longer cover it.
+                if self._capacity(kind) < want:
+                    raise PipelineAccountingError(
+                        f"{kind} capacity shrank to {self._capacity(kind)} B "
+                        f"during the wait, below the pending request {want} B"
+                    )
                 if cancel_event is not None and cancel_event.is_set():
                     raise PipelineCancelled(
                         f"cancelled while waiting for {kind} credit"
