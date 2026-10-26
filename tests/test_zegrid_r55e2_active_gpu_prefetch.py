@@ -817,3 +817,150 @@ def test_active_gpu_admission_observes_the_late_bound_host_seam():
     finally:
         mode.available_memory_bytes = original
     assert seen == [12 * GIB]
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R56 ARCH REWORK-1 — admission/current execution identity (F1)
+# ---------------------------------------------------------------------------
+
+def _install_fake_gpu_consume(monkeypatch):
+    real_consume = zz._consume_stack_cell
+
+    def fake_gpu_consume(prepared):
+        if isinstance(prepared, dict) and "empty_result" in prepared:
+            return real_consume(prepared)
+        cfg = zz._STACK_CONFIG
+        zz._STACK_CONFIG = dataclasses.replace(cfg, backend="cpu")
+        try:
+            result = real_consume(prepared)
+        finally:
+            zz._STACK_CONFIG = cfg
+        result["backend_used"] = "gpu"
+        result["record"]["backend_used"] = "gpu"
+        return result
+
+    monkeypatch.setattr(zz, "_consume_stack_cell", fake_gpu_consume)
+
+
+def _install_forced_admission_shrink(monkeypatch, *, prefetch_units=0):
+    """Force the REAL admission algorithm to reduce prefetch to p0.
+
+    Builds the p0 envelope, then hands the admission a raw observation just
+    below the 90 % ceiling of that envelope so the real shrink loop runs.
+    """
+    original = zz._r55_active_gpu_admit
+
+    def forced(*, initial_bundle, decision, **kwargs):
+        mapping0 = dict(decision.mapping)
+        mapping0["prefetch_units"] = int(prefetch_units)
+        mapping0["queue_max"] = int(prefetch_units) + 1
+        bundle0 = zz._r55_active_gpu_apply(
+            initial_bundle,
+            mapping=mapping0,
+            decision=decision,
+            stage="preflight",
+        )
+        raw = (int(bundle0.envelope.aggregate_bytes) * 100 + 78) // 79
+        return original(
+            initial_bundle=initial_bundle,
+            decision=decision,
+            available_fn=lambda: raw,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(zz, "_r55_active_gpu_admit", forced)
+    return original
+
+
+def test_admission_p2_to_p0_survives_final_manifest(
+    routine_input, legacy_run, tmp_path_factory, monkeypatch
+):
+    """F1: an admitted p2->p0 must survive finalization (no tile change)."""
+    _fake_gpu_available(monkeypatch)
+    _install_fake_gpu_consume(monkeypatch)
+    _install_forced_admission_shrink(monkeypatch)
+    out = tmp_path_factory.mktemp("r56_arch_admit_p0")
+    _run(routine_input, out, "active", use_gpu=True)
+
+    manifest = _manifest(out)
+    block = manifest["r55_scheduler"]
+    # The PLAN candidate may still be p2; the EXECUTED identity is p0 and the
+    # final manifest must be internally coherent (the run would have raised
+    # ActivePlanRejected otherwise).
+    assert int(block["initial_candidate"]["prefetch_units"]) >= 0
+    assert int(block["mapping"]["prefetch_units"]) == 0
+    assert int(block["run"]["final_execution"]["prefetch_units"]) == 0
+    assert int(block["final_envelope"]["prefetch_units"]) == 0
+    assert block["final_envelope"]["aggregate_rule"] == (
+        "projected_host_peak_v1"
+    )
+    assert int(block["run"]["policy"]["prefetch_units"]) == 0
+    assert block["run"]["policy"]["credit_model"]["schema"] == (
+        zz._R55_PREFETCH_CREDIT_SCHEMA
+    )
+    assert block["status"] == "executed"
+    # Science/frames unchanged by the control-flow fix.
+    assert len(manifest["frame_ids"]) == manifest["n_frames"]
+    assert manifest["normalization"] == "sky_mean"
+
+
+def test_admission_shrink_then_runtime_tile_shrink_keeps_reduced_identity(
+    routine_input, legacy_run, tmp_path_factory, monkeypatch
+):
+    """F1: admission p2->p0 followed by a runtime tile shrink stays coherent."""
+    _fake_gpu_available(monkeypatch)
+    _install_fake_gpu_consume(monkeypatch)
+    _install_forced_admission_shrink(monkeypatch)
+
+    real_check = zz._r55_runtime_tile_check
+    real_walk = zz._r55_runtime_tile_walk
+    state = {"forced": False, "reduced": None}
+    lock = __import__("threading").Lock()
+
+    def check(decision, *, tile, free_bytes, host_budget_bytes, bundle, prefetch_units=None):
+        result = real_check(
+            decision,
+            tile=tile,
+            free_bytes=free_bytes,
+            host_budget_bytes=host_budget_bytes,
+            bundle=bundle,
+            prefetch_units=prefetch_units,
+        )
+        with lock:
+            if not state["forced"]:
+                state["forced"] = True
+                result = dict(result)
+                result["eligible"] = False
+        return result
+
+    def walk(decision, *, current_tile, free_bytes, host_budget_bytes, bundle, prefetch_units=None):
+        ladder = tuple(int(t) for t in decision.gpu_tile_ladder)
+        smaller = ladder[ladder.index(int(current_tile)) + 1]
+        with lock:
+            state["reduced"] = int(smaller)
+        return ([{"tile_px": int(smaller), "eligible": True}], int(smaller))
+
+    monkeypatch.setattr(zz, "_r55_runtime_tile_check", check)
+    monkeypatch.setattr(zz, "_r55_runtime_tile_walk", walk)
+    out = tmp_path_factory.mktemp("r56_arch_admit_then_tile")
+    _run(routine_input, out, "active", use_gpu=True)
+
+    manifest = _manifest(out)
+    block = manifest["r55_scheduler"]
+    reduced = int(state["reduced"])
+    assert reduced > 0
+    # Reduced prefetch/workers/K survive the tile reduction; nothing regrows.
+    assert int(block["mapping"]["prefetch_units"]) == 0
+    assert int(block["mapping"]["gpu_streaming_tile"]) == reduced
+    assert int(block["run"]["final_execution"]["gpu_streaming_tile"]) == reduced
+    assert int(block["run"]["final_execution"]["prefetch_units"]) == 0
+    assert int(block["final_envelope"]["prefetch_units"]) == 0
+    assert int(block["final_envelope"]["gpu_tile"]) == reduced
+    assert block["final_envelope"]["aggregate_rule"] == (
+        "projected_host_peak_v1"
+    )
+    assert block["gpu_tile_runtime"]["shrink_count"] == 1
+    assert block["gpu_tile_runtime"]["effective_tile_px"] == reduced
+    assert block["status"] == "executed"
+    # Recovery after the shrink cannot regrow the tile (observed final rung).
+    assert int(block["run"]["final_execution"]["gpu_streaming_tile"]) <= reduced

@@ -7862,6 +7862,7 @@ def _r55_runtime_tile_walk(
     free_bytes: int,
     host_budget_bytes: int,
     bundle,
+    prefetch_units=None,
 ) -> tuple[list[dict], int | None]:
     """Strictly SMALLER rungs of the admitted ladder, descending.
 
@@ -7882,6 +7883,9 @@ def _r55_runtime_tile_walk(
             free_bytes=int(free_bytes),
             host_budget_bytes=int(host_budget_bytes),
             bundle=bundle,
+            # F1: the RUN check must price the ADMITTED depth (p0 after an
+            # admission shrink), never the original PLAN choice.
+            prefetch_units=prefetch_units,
         )
         attempts.append(attempt)
         if attempt["eligible"]:
@@ -10923,10 +10927,29 @@ def _run_single(
         # the admitted 70 % qualification budget (a hard, never-raised ceiling);
         # each unit's lease records the exact peak it was staged for, and each
         # unit's execution records the tile it ACTUALLY ran with.
+        # F1: the ADMITTED execution identity is the authority for the whole
+        # run. ``plan_set.chosen`` is the ORIGINAL PLAN winner and may differ
+        # (e.g. admission shrank prefetch 2 -> 0); using it at finalization or
+        # for a runtime tile shrink re-introduced stale resources and broke the
+        # exact-mapping final hash.
+        if gpu_candidate is not None:
+            _admitted_candidate = gpu_candidate
+        else:
+            _admitted_candidate = _r55_gpu_candidate_lookup(
+                gpu_decision,
+                replace(
+                    gpu_decision.plan_set.chosen,
+                    tile_px=int(gpu_mapping["gpu_streaming_tile"]),
+                    units_in_flight=int(gpu_mapping["units_in_flight"]),
+                    workers_per_unit=int(gpu_mapping["workers_per_unit"]),
+                    prefetch_units=int(gpu_mapping["prefetch_units"]),
+                ),
+            )
         tile_state = {
             "tile": int(tile),
             "device_peak": int(device_peak),
             "mapping": dict(gpu_mapping),
+            "candidate": _admitted_candidate,
             "bundle": gpu_bundle,
             "shrink_history": [],
             "units": [],
@@ -10944,6 +10967,18 @@ def _run_single(
         def _current_peak() -> int:
             with tile_lock:
                 return int(tile_state["device_peak"])
+
+        def _current_candidate():
+            with tile_lock:
+                return tile_state["candidate"]
+
+        def _current_mapping() -> dict:
+            with tile_lock:
+                return dict(tile_state["mapping"])
+
+        def _current_bundle():
+            with tile_lock:
+                return tile_state["bundle"]
 
         def _produce(task):
             try:
@@ -11053,12 +11088,14 @@ def _run_single(
                 ) from exc
 
             tile_now = _current_tile()
+            _run_mapping = _current_mapping()
             check = _r55_runtime_tile_check(
                 gpu_decision,
                 tile=int(tile_now),
                 free_bytes=int(free_vram),
                 host_budget_bytes=int(budget),
-                bundle=gpu_bundle,
+                bundle=_current_bundle(),
+                prefetch_units=int(_run_mapping["prefetch_units"]),
             )
             shrink_attempts: list[dict] = []
             action = "continue"
@@ -11069,7 +11106,8 @@ def _run_single(
                     current_tile=int(tile_now),
                     free_bytes=int(free_vram),
                     host_budget_bytes=int(budget),
-                    bundle=gpu_bundle,
+                    bundle=_current_bundle(),
+                    prefetch_units=int(_run_mapping["prefetch_units"]),
                 )
                 if chosen is None:
                     refused = {
@@ -11168,9 +11206,9 @@ def _run_single(
                         },
                     )
                 # Apply the shrink coherently: mapping -> bundle -> peak -> state.
-                probe = replace(
-                    gpu_decision.plan_set.chosen, tile_px=int(chosen)
-                )
+                # F1: derive the reduced rung from the CURRENT admitted
+                # candidate, preserving its reduced prefetch/workers/K.
+                probe = replace(_current_candidate(), tile_px=int(chosen))
                 materialized = _r55_gpu_candidate_lookup(gpu_decision, probe)
                 mapping_new = zsched.active_gpu_mapping_for_candidate(
                     materialized,
@@ -11198,6 +11236,7 @@ def _run_single(
                         gpu_decision.device_peak_bytes_by_tile[int(chosen)]
                     )
                     tile_state["mapping"] = dict(mapping_new)
+                    tile_state["candidate"] = materialized
                     tile_state["bundle"] = bundle_new
                     tile_state["attempts"].extend(
                         [dict(a) for a in shrink_attempts]
@@ -11473,13 +11512,35 @@ def _run_single(
                 time.sleep(0.01)
                 waited_s += 0.01
 
-        def _cleanup_task(task, payload):
-            """Partial-produce cleanup: remove the cell cache BEFORE credits."""
-            try:
-                if len(task) >= 4 and task[3] is not None:
-                    _safe_rmtree(task[3], None)
-            except Exception:
-                pass
+        def _cleanup_task(item, payload):
+            """Partial-produce cleanup: remove ONLY the failed cell's cache.
+
+            F2: the pipeline task is the INDEXED pair ``(index, cell_task)``.
+            The previous callback read ``item[3]`` directly, saw a 2-tuple and
+            silently skipped, so credits were released with the partial cache
+            still on disk. Report a failed deletion instead of claiming success;
+            the pipeline records it in ``cleanup_failures`` while preserving the
+            primary exception.
+            """
+            if (
+                isinstance(item, (tuple, list))
+                and len(item) == 2
+                and isinstance(item[0], int)
+                and not isinstance(item[0], bool)
+            ):
+                task = item[1]
+            else:
+                task = item
+            cache_dir = None
+            if isinstance(task, (tuple, list)) and len(task) >= 4:
+                cache_dir = task[3]
+            if cache_dir is None:
+                return
+            if _safe_rmtree(cache_dir, None) is False:
+                raise RuntimeError(
+                    "partial cache cleanup FAILED; residual cache remains at "
+                    f"{cache_dir!s}"
+                )
 
         host_budget_val = int(host_budget)
         pipeline = zpar.BoundedPipeline(
@@ -11684,7 +11745,21 @@ def _run_single(
                 else None
             )
             runtime_units = [dict(r) for r in tile_state["units"]]
-        if effective_tile != initial_tile and host_facts_last is not None:
+        # F1: the FINAL candidate is the CURRENT admitted/reduced one. The
+        # mapping, envelope, execution and final hash must all describe the same
+        # depth (an admission p2->p0 or a runtime tile shrink must survive here).
+        effective_candidate = _current_candidate()
+        if int(effective_candidate.tile_px) != int(effective_tile):
+            effective_candidate = _r55_gpu_candidate_lookup(
+                gpu_decision,
+                replace(
+                    effective_candidate, tile_px=int(effective_tile)
+                ),
+            )
+        if host_facts_last is not None and (
+            int(effective_tile) != initial_tile
+            or effective_mapping != dict(gpu_mapping)
+        ):
             effective_bundle = _r55_active_gpu_apply(
                 gpu_bundle,
                 mapping=effective_mapping,
@@ -11697,15 +11772,8 @@ def _run_single(
                 plan_factor_den=int(host_facts_last["factor_den"]),
                 plan_budget_bytes=int(host_facts_last["budget_bytes"]),
             )
-            effective_candidate = _r55_gpu_candidate_lookup(
-                gpu_decision,
-                replace(
-                    gpu_decision.plan_set.chosen, tile_px=int(effective_tile)
-                ),
-            )
         else:
-            effective_bundle = gpu_bundle
-            effective_candidate = gpu_decision.plan_set.chosen
+            effective_bundle = _current_bundle()
         runtime_tile = _r55_tile_adaptation_from_state(
             tile_state, gpu_decision, initial_tile
         )
