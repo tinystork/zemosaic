@@ -133,3 +133,42 @@ That is the intended honest outcome pending Junior's decision.
 - [ ] New required adversarial tests (ordinary full-slot wait, external decline,
       shrink during wait, cancelled wait, zero enabled, real-file partial cleanup,
       real-schema recorder adapter) NOT yet added.
+
+## ARCH iteration (2026-10-26, HEAD ffe75bc)
+
+The three PLAN/ADMIT/RUN host projections are now ONE published function
+(`ram_contract.projected_host_peak_bytes`):
+
+```
+shared + stack_added + (producer_owner if prefetch >= 1 else 0)
+       + prefetch * resident_per_slot
+```
+
+* `aggregate_rule = "projected_host_peak_v1"` is published on the ACTIVE GPU
+  envelope together with `prefetch_units`, `producer_owner_bytes` and
+  `prefetch_resident_per_slot_bytes`;
+* the scheduler CPU+GPU candidate, the GPU envelope aggregate and the RUN tile
+  revalidation all call it, so the three phases publish the SAME value;
+* at `prefetch == 0` the queue is full while the consumer stacks, the producer
+  is BLOCKED and is NOT charged (serial plan). At `p >= 1` exactly ONE producer
+  owner plus the resident prefetch credit are charged;
+* witnesses E7/E8/E9/E11 and the R56 F2 scheduler tests were reconciled in one
+  pass to this truth (p0 plans became cheaper, so E7/E8's largest rung moved
+  384 -> 448 and the Linux H16 ACTIVE plan is now ADMITTED at p0 instead of
+  being refused by an unconditional producer charge). Every delta is semantic;
+  no budget/policy (80/90, 70/85, legacy 50, K1, shrink-only, science, halo)
+  was relaxed.
+
+Faithful LP341 witness (`tests/test_zegrid_r56_bounded_prefetch_credit.py`):
+REAL product decision, published facts -> tile 192 / p2 / workers 14,
+aggregate 14 016 615 629 B < B_plan 14 687 984 025 B, limited by the gauge
+phase. MODEL result, not a runtime LP341 run.
+
+Real-memory bounded CUDA smoke (H64, MX150): GPU executed 6/6 cells with
+identical outputs, but the real ~2.27 GB observation admits `prefetch=0` only,
+so there is no overlap claim. See `docs/measurements/.../README.md`.
+
+Combined 18-module matrix at this HEAD: 425 passed, 3 skipped
+(`matrix-18-modules-final.txt`). The two r1 E2 reds did not reproduce; the old
+host-capacity hypothesis is unsupported (both tests pin 12 GiB) and remains an
+explicitly open, unproven root cause.

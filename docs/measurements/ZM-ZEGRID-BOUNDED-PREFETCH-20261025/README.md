@@ -68,3 +68,47 @@ Gates: `scientific_outputs_identical=true`, `frames_identical=true`,
   `tests/test_zegrid_r56_bounded_prefetch_credit.py` using the exact published
   Windows numbers (341 frames, patch 1625x1415, cache 10 193 216 671 B,
   B_plan 14 687 984 025 B).
+
+
+## ARCH iteration (ZM-ZEGRID-BOUNDED-PREFETCH-20261025, 2026-10-26)
+
+HEAD: `ffe75bc` (on top of the verified `d1ea296`). Branch
+`perf/zegrid-bounded-prefetch`, local only.
+
+### `linux-cuda-real-memory-halo64.json` — REAL-memory bounded CUDA smoke
+
+Reproduce:
+
+```
+PYTHONPATH=src <project-venv>/bin/python tools/zegrid_r56_prefetch_campaign.py \
+  --input /tmp/r56_big/input --out <fresh-scratch> \
+  --halo 64 --gpu --storage-profile bounded --sample-period 0.1
+```
+
+No `--max-available-bytes`: the host observation is the REAL 2 265 784 320 B
+re-observed per arm. Both arms executed on the GPU: `final_backend="gpu"`,
+6/6 consumed cells, identical scientific outputs and frame identities, VRAM
+observed. The planner admitted `prefetch=0` at this real budget (tile 384 after
+the RUN shrink, workers 3, aggregate 876 522 496 B), so there is NO overlap
+claim and `candidate_gpu_prefetch_ge1=false`, `candidate_overlap_proved=false`.
+This is an honest NEGATIVE result at H64, not an LP/Windows proof.
+
+### `matrix-18-modules-final.txt` — combined matrix
+
+`425 passed, 3 skipped` in 303.98 s at HEAD `ffe75bc` (18 modules: R56 x2,
+E2/E5/E7/E8/E9/E10/E11, R52 A/B/B-gateA/C, GPU admission fallback, R41b,
+planner determinism, envelope, E6 large-halo layout). The r1 reds
+(`test_gpu_oom_falls_back_to_exact_whole_batch_cpu`,
+`test_run_credit_model_is_coherent_and_publishes_disk_and_overlap`) did NOT
+reproduce; both tests pin `available_memory_bytes=12 GiB`, so the old
+host-capacity hypothesis is not supported by the test code (see the arch report).
+
+### LP341 faithful product witness (MODEL, not a Windows run)
+
+`tests/test_zegrid_r56_bounded_prefetch_credit.py` drives the REAL product
+decision with the published LP341 facts (341 frames, halo128, 3x3, worst patch
+1625x1415, bounded, VRAM free 7 463 763 968 B, B_plan 14 687 984 025 B):
+tile 192, K=1, workers 14, **prefetch 2**, aggregate 14 016 615 629 B
+(95.4 % of B_plan) limited by the GAUGE phase (14 x 870 597 244 B); the
+cache-build owner (1 515 400 840 B) is charged at p>=1, the normalization bound
+is not binding. This is a model/contract result, not a runtime LP341 run.
