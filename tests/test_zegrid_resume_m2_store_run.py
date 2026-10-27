@@ -244,10 +244,14 @@ def test_m2_real_cpu_run_commits_then_releases_and_reloads_identical_payloads(
         # registry holds receipts only (released bytes >= produced core bytes).
         last = run["store_reports"][-1]
         assert last["counts"]["cells"] == len(produced)
-        # Published science is unchanged by the seam.
+        # Published science is unchanged by the seam. The DEFAULT finishing
+        # config writes the raw science under ``mosaic_grid.fits`` (the
+        # ``*_science*`` companion only exists when export_aesthetic_fits is
+        # enabled), plus the coverage companion and the JSON manifest.
         manifest = out_dir / "zegrid_manifest.json"
         assert manifest.exists()
-        assert list(out_dir.glob("*_science*.fits"))
+        assert (out_dir / "mosaic_grid.fits").exists()
+        assert (out_dir / "mosaic_grid_coverage.fits").exists()
     finally:
         store.close()
 
