@@ -145,7 +145,17 @@ class StorePathError(StoreFormatError):
 
 
 class StoreLockError(RunStoreError):
-    """The single-writer lock is held by a live owner (or cannot be taken)."""
+    """The single-writer lock is held by a live owner (or cannot be taken).
+
+    ``attempts`` and ``last_error`` are populated when a bounded re-acquire loop
+    ran for a verifiably DEAD owner (Windows releases byte-range locks slightly
+    after process termination; POSIX ``flock`` does not).
+    """
+
+    def __init__(self, message, *, attempts=None, last_error=None):
+        super().__init__(message)
+        self.attempts = None if attempts is None else int(attempts)
+        self.last_error = last_error
 
 
 class StoreIntegrityError(RunStoreError):
@@ -357,6 +367,26 @@ def confined_path(root: Path, relative: Any, label: str = "path") -> Path:
 _IS_WINDOWS = os.name == "nt"
 
 
+def binary_flag() -> int:
+    """The platform's "binary mode" open flag (0 on POSIX).
+
+    Read at CALL time (never cached at import) so a Windows regression test can
+    inject a sentinel and prove that every ``os.open`` in this module ORs it.
+    """
+    return int(getattr(os, "O_BINARY", 0))
+
+
+def _open_binary(path, flags: int, mode: int = 0o600) -> int:
+    """``os.open`` with binary mode FORCED (both read and write paths).
+
+    Windows translates CRLF<->LF for descriptors opened without ``O_BINARY``.
+    That silently changes every stored byte pattern containing 0x0D/0x0A and
+    corrupts the sha256 of an array object. There is no text-mode open in this
+    module: manifests are bytes, arrays are bytes, the lock record is bytes.
+    """
+    return os.open(str(path), int(flags) | binary_flag(), int(mode))
+
+
 def fsync_file(fd: int) -> None:
     """Flush one file handle to the OS durable layer."""
     os.fsync(fd)
@@ -368,7 +398,7 @@ def fsync_dir(path: Path) -> None:
         return
     flag = getattr(os, "O_DIRECTORY", 0)
     try:
-        fd = os.open(str(path), os.O_RDONLY | flag)
+        fd = _open_binary(path, os.O_RDONLY | flag, 0)
     except OSError:
         return
     try:
@@ -425,7 +455,7 @@ def atomic_write_bytes(path: Path, data: bytes, *, tmp_dir: Path) -> None:
     tmp_dir = Path(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp = tmp_dir / f".tmp-{os.getpid()}-{uuid.uuid4().hex}"
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = _open_binary(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
     try:
         view = memoryview(data)
         while view:
@@ -582,6 +612,15 @@ def owner_is_live(owner: Mapping[str, Any]) -> bool:
 _LIVE_LOCKS: dict[str, Any] = {}
 _LIVE_LOCKS_GUARD = threading.Lock()
 
+#: Bounded re-acquire window, used ONLY when the recorded owner is provably dead
+#: (never for a live owner). Windows can release the byte-range lock a little
+#: after the process is gone; POSIX flock releases it synchronously.
+LOCK_REACQUIRE_TIMEOUT_S = 2.0
+LOCK_REACQUIRE_INTERVAL_S = 0.02
+#: Byte-exact placeholder written to an empty lock file before byte-range
+#: locking (with O_BINARY, so no CRLF translation can ever apply).
+LOCK_PLACEHOLDER = b"{}\n"
+
 
 class StoreLock:
     """Single-writer OS lock with an explicit owner identity.
@@ -603,6 +642,8 @@ class StoreLock:
         self.previous_owner: dict[str, Any] | None = None
         self.orphan_recovered = False
         self.acquired_unix_ns: int | None = None
+        self.last_acquire_attempts = 0
+        self.last_acquire_wait_s = 0.0
         self.reservation_mode = "os_lock"
 
     # -- OS primitive ---------------------------------------------------
@@ -656,6 +697,31 @@ class StoreLock:
             return None
         return value if isinstance(value, dict) else None
 
+    @staticmethod
+    def _owner_detail(previous: Mapping[str, Any] | None) -> str:
+        if previous is None:
+            return "no owner record; the OS lock is held"
+        return (
+            f"owner pid={previous.get('pid')} "
+            f"started={previous.get('started_unix_ns')} "
+            f"session={previous.get('session_id')} "
+            f"state={previous.get('state', 'held')}"
+        )
+
+    @staticmethod
+    def _provably_dead(previous: Mapping[str, Any] | None) -> bool:
+        """True only for a well-formed HELD record whose process is gone.
+
+        A missing record, a released record or a live process is never treated
+        as provably dead — so the bounded wait can never be used to steal (or
+        wait out) a live owner.
+        """
+        if previous is None:
+            return False
+        if str(previous.get("state", "held")) != "held":
+            return False
+        return not owner_is_live(previous)
+
     def acquire(self) -> dict[str, Any]:
         with _LIVE_LOCKS_GUARD:
             if self._key in _LIVE_LOCKS:
@@ -664,27 +730,55 @@ class StoreLock:
                     f"(instance {_LIVE_LOCKS[self._key].instance_id})"
                 )
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
-            if _IS_WINDOWS and os.fstat(fd).st_size == 0:
-                os.write(fd, b"{}\n")
+            fd = _open_binary(self.path, os.O_RDWR | os.O_CREAT)
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, LOCK_PLACEHOLDER)
                 os.lseek(fd, 0, os.SEEK_SET)
-            try:
-                self._lock_fd(fd)
-            except StoreLockError:
-                previous = self._read_owner_from_fd(fd)
-                if previous is not None and owner_is_live(previous):
-                    detail = (
-                        f"owner pid={previous.get('pid')} "
-                        f"started={previous.get('started_unix_ns')} "
-                        f"session={previous.get('session_id')}"
+            started_monotonic = time.monotonic()
+            attempts = 0
+            last_error: StoreLockError | None = None
+            while True:
+                attempts += 1
+                try:
+                    self._lock_fd(fd)
+                    break
+                except StoreLockError as exc:
+                    last_error = exc
+                    previous = self._read_owner_from_fd(fd)
+                    if not self._provably_dead(previous):
+                        waited = time.monotonic() - started_monotonic
+                        os.close(fd)
+                        raise StoreLockError(
+                            "refusing to write: single-writer lock "
+                            f"{self.path} is busy "
+                            f"({self._owner_detail(previous)}); "
+                            f"{attempts} attempt(s) in {waited:.3f}s "
+                            "(no retry: the owner is live or unproven)",
+                            attempts=attempts,
+                            last_error=str(exc),
+                        ) from exc
+                    remaining = (
+                        float(LOCK_REACQUIRE_TIMEOUT_S) - (
+                            time.monotonic() - started_monotonic
+                        )
                     )
-                else:
-                    detail = "owner unknown or dead, but the OS lock is held"
-                os.close(fd)
-                raise StoreLockError(
-                    f"refusing to write: single-writer lock {self.path} is "
-                    f"busy ({detail})"
-                )
+                    if remaining <= 0:
+                        waited = time.monotonic() - started_monotonic
+                        os.close(fd)
+                        raise StoreLockError(
+                            "refusing to write: single-writer lock "
+                            f"{self.path} is still held after {attempts} "
+                            f"attempt(s) in {waited:.3f}s while the owner is "
+                            f"verifiably dead ({self._owner_detail(previous)}); "
+                            f"last error: {exc}",
+                            attempts=attempts,
+                            last_error=str(exc),
+                        ) from exc
+                    time.sleep(
+                        min(float(LOCK_REACQUIRE_INTERVAL_S), remaining)
+                    )
+            self.last_acquire_attempts = int(attempts)
+            self.last_acquire_wait_s = time.monotonic() - started_monotonic
             previous = self._read_owner_from_fd(fd)
             previous_state = (
                 str(previous.get("state", "held")) if previous else None
@@ -748,6 +842,8 @@ class StoreLock:
                 "previous_owner": (
                     dict(self.previous_owner) if self.previous_owner else None
                 ),
+                "acquire_attempts": int(self.last_acquire_attempts),
+                "acquire_waited_s": round(float(self.last_acquire_wait_s), 6),
             }
 
     def release(self) -> bool:
@@ -2226,7 +2322,7 @@ class RunCellStore:
             object=entry["path"],
             nbytes=int(entry["nbytes"]),
         )
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = _open_binary(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         try:
             mode = _reserve_space(fd, int(entry["nbytes"]))
             entry_mode = mode

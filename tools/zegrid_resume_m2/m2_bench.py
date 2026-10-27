@@ -45,6 +45,7 @@ MAX_SECONDS = 3600
 
 SUITES = (
     ("m2_store_contract", "tests/test_zegrid_run_store_m2.py"),
+    ("m2_io_regression", "tests/test_zegrid_run_store_m2_io.py"),
     ("m2_kill_matrix", "tests/test_zegrid_run_store_m2_kill.py"),
     ("m2_real_store_run", "tests/test_zegrid_resume_m2_store_run.py"),
     ("m1_registry", "tests/test_zegrid_run_registry_m1.py"),
@@ -59,6 +60,7 @@ PROVENANCE_FILES = (
     "src/zemosaic/core/zegrid/run_registry.py",
     "src/zemosaic/zemosaic_zegrid_mode.py",
     "tests/test_zegrid_run_store_m2.py",
+    "tests/test_zegrid_run_store_m2_io.py",
     "tests/test_zegrid_run_store_m2_kill.py",
     "tests/test_zegrid_resume_m2_store_run.py",
 )
