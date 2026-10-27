@@ -134,6 +134,18 @@ DEFAULT_CONFIG = {
     # fail visibly in the engine and are never coerced. Configs without this
     # key follow the product default (active).
     "zegrid_scheduler_mode": "active",
+    # ZM-ZEGRID-RESILIENT-RUN-RESUME-M4: launch-time resume policy.
+    # "never" (default, safe) = a NEW run generation; existing generations are
+    # never overwritten and are never reused at launch (the new run is still
+    # durably checkpointed). "auto" = resume a COMPATIBLE existing run; an
+    # incompatible run stops explicitly, a complete run is a verified no-op.
+    "zegrid_resume_mode": "never",
+    # Explicit run generation selection when several runs exist. NEVER inferred
+    # from the newest directory ("last found" is forbidden).
+    "zegrid_resume_run_id": None,
+    # Root of the durable per-cell store. M4 treats it as a container that may
+    # hold several run_id generations (a legacy single-run layout still opens).
+    "zegrid_durable_store_dir": None,
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",

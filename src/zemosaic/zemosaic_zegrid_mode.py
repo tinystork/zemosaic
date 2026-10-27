@@ -115,6 +115,8 @@ from .core.zegrid import resource_envelope as renv
 from .core.zegrid import runtime_control as zrt
 from .core.zegrid import run_registry as zrr
 from .core.zegrid import run_store as zrs
+from .core.zegrid import run_resume as zres
+from .core.zegrid import run_artifacts as zart
 from .core.zegrid import resource_recovery as zrec
 from .core.zegrid import scheduler as zsched
 from .core.zegrid import vram_high_water as zvh
@@ -2205,6 +2207,44 @@ def _set_stack_storage_profile(profile):
     return _STACK_STORAGE_PROFILE
 
 
+def _restore_resume_storage_policy(policy):
+    """Restore the EFFECTIVE storage policy of a resumed run (plan §6.6).
+
+    A restart MUST NOT re-initialise a bounded run as dense nor reset the
+    one-shot dense->bounded fallback counter. The stored policy is validated by
+    ``run_resume`` before it reaches this seam; an explicit scientific policy
+    change is refused there, never silently applied here.
+    """
+    global _STORAGE_REQUESTED, _STORAGE_EFFECTIVE
+    global _STORAGE_FALLBACK_COUNT, _STORAGE_TRANSITIONS, _STORAGE_DENSE_REFUSAL
+    if policy is None:
+        return _storage_policy_snapshot()
+    _STORAGE_REQUESTED = str(policy["requested"])
+    _STORAGE_EFFECTIVE = str(policy["effective"])
+    _STORAGE_FALLBACK_COUNT = int(policy["fallback_count"])
+    _STORAGE_TRANSITIONS = [dict(item) for item in policy.get("transitions") or []]
+    _STORAGE_DENSE_REFUSAL = (
+        None
+        if policy.get("dense_refusal") is None
+        else dict(policy["dense_refusal"])
+    )
+    _set_stack_storage_profile(_STORAGE_EFFECTIVE)
+    return _storage_policy_snapshot()
+
+
+def _resume_store_budget(zconfig):
+    """DiskBudget for the durable store (same contract as M2)."""
+    budget_bytes = int(
+        getattr(zconfig, "zegrid_durable_store_budget_bytes", 0) or 0
+    )
+    return zrs.DiskBudget(
+        durable_cell_bytes=budget_bytes,
+        transactional_margin_bytes=zrs.default_transactional_margin(
+            budget_bytes or zrs.MIN_TRANSACTIONAL_MARGIN_BYTES
+        ),
+    )
+
+
 def _plan_bundle_auto(
     *,
     canvas,
@@ -2219,6 +2259,7 @@ def _plan_bundle_auto(
     bundle_common=None,
     active=False,
     emit=None,
+    restored_geometry=None,
 ):
     """Build the initial bundle; in AUTO ACTIVE mode retry bounded ONCE.
 
@@ -2230,6 +2271,11 @@ def _plan_bundle_auto(
     unchanged (never a silent retry).
     """
     kw = dict(bundle_common or {})
+    if restored_geometry is not None:
+        # REWORK-1: consume the frozen geometry; no layout search, no footprint
+        # projection, no membership recomputation. Identity validation already
+        # happened in ``run_artifacts.restore_geometry``.
+        kw["restored_geometry"] = restored_geometry
 
     def _build():
         return _build_execution_bundle(
@@ -4602,6 +4648,7 @@ def _build_execution_bundle(
     max_gpu_tile=None,
     max_cells_in_flight=None,
     halo_px=None,
+    restored_geometry=None,
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -4652,45 +4699,64 @@ def _build_execution_bundle(
     # capacity miss for the bounded fallback.
     _refinement_memory_pressure = False
 
+    _restored_pending = restored_geometry is not None
     while True:
         _fp_out = []
-        try:
-            layout = _choose_layout_mode_aware(
-                canvas, descs, ram_budget=budget_bytes,
-                available_bytes=raw_available_bytes, tile_size=STREAM_TILE_SIZE,
-                pinned_layout=pinned_layout, emit=emit, log_line=log_line,
-                observer=layout_substep, footprints_out=_fp_out,
-                footprints_in=footprints,
-                min_refinement_rank=rank_floor,
-                max_refinement_rank=rank_ceiling,
-                halo_px=_halo,
-            )
-        except zal.LayoutInfeasible as _layout_exc:
-            # The final rank-window message only qualifies when THIS bundle build
-            # really exhausted a measured memory budget and moved finer. A
-            # pinned / user-requested window without memory pressure is NOT a
-            # capacity miss.
+        if _restored_pending:
+            # REWORK-1: consume the frozen geometry. This branch NEVER calls
+            # the adaptive layout search nor the membership builder.
+            _restored_canvas, layout, cell_ctxs = restored_geometry
+            _restored_pending = False
             if (
-                _refinement_memory_pressure
-                and "refinement-rank window" in str(_layout_exc)
+                str(getattr(_restored_canvas, "wcs_header", ""))
+                != str(getattr(canvas, "wcs_header", ""))
+                or int(getattr(_restored_canvas, "width", 0)) != int(canvas.width)
+                or int(getattr(_restored_canvas, "height", 0)) != int(canvas.height)
             ):
-                _layout_exc.memory_exhausted = True
-                # Structured upgrade (ZM-ZEGRID-PLAN-REFUSAL-CLASSIFICATION): a
-                # refinement-rank window refusal that follows REAL memory
-                # pressure is a host-RAM refusal, not a geometry one. The
-                # classifier decides on this payload, never on the wording.
-                _layout_exc.refusal = {
-                    "kind": "host_ram",
-                    "source": "refinement_window",
-                    "budget_bytes": int(budget_bytes),
-                }
-            raise
-        if footprints is None:
-            footprints = _fp_out[0] if _fp_out else None
+                raise RuntimeError(
+                    "restored geometry canvas disagrees with the run canvas; "
+                    "refusing to execute a mixed geometry"
+                )
+            footprints = None
+        else:
+            try:
+                layout = _choose_layout_mode_aware(
+                    canvas, descs, ram_budget=budget_bytes,
+                    available_bytes=raw_available_bytes, tile_size=STREAM_TILE_SIZE,
+                    pinned_layout=pinned_layout, emit=emit, log_line=log_line,
+                    observer=layout_substep, footprints_out=_fp_out,
+                    footprints_in=footprints,
+                    min_refinement_rank=rank_floor,
+                    max_refinement_rank=rank_ceiling,
+                    halo_px=_halo,
+                )
+            except zal.LayoutInfeasible as _layout_exc:
+                # The final rank-window message only qualifies when THIS bundle build
+                # really exhausted a measured memory budget and moved finer. A
+                # pinned / user-requested window without memory pressure is NOT a
+                # capacity miss.
+                if (
+                    _refinement_memory_pressure
+                    and "refinement-rank window" in str(_layout_exc)
+                ):
+                    _layout_exc.memory_exhausted = True
+                    # Structured upgrade (ZM-ZEGRID-PLAN-REFUSAL-CLASSIFICATION): a
+                    # refinement-rank window refusal that follows REAL memory
+                    # pressure is a host-RAM refusal, not a geometry one. The
+                    # classifier decides on this payload, never on the wording.
+                    _layout_exc.refusal = {
+                        "kind": "host_ram",
+                        "source": "refinement_window",
+                        "budget_bytes": int(budget_bytes),
+                    }
+                raise
+            if footprints is None:
+                footprints = _fp_out[0] if _fp_out else None
+            nx, ny = int(layout["nx"]), int(layout["ny"])
+            cell_ctxs = _build_chosen_cell_contexts(
+                footprints, canvas, nx, ny, layout_substep, halo_px=_halo
+            )
         nx, ny = int(layout["nx"]), int(layout["ny"])
-        cell_ctxs = _build_chosen_cell_contexts(
-            footprints, canvas, nx, ny, layout_substep, halo_px=_halo
-        )
         worst_patch_px = 0
         patch_px_for_workers = 0
         for _row, _col, _cell, _patch, _mem in cell_ctxs:
@@ -9299,6 +9365,33 @@ def _r55_open_run_store(store_dir, *, identity, budget_bytes, session_id):
     return store, None
 
 
+def _resume_generation_root(store_dir, run_id):
+    """Return a NEW run root that NEVER overwrites an existing generation.
+
+    A store directory is a container: a legacy single run may live directly in
+    it (``run.json`` at the root), and M4 generations live in child directories.
+    ``zegrid_resume_mode=never`` always creates a fresh generation.
+    """
+    import re as _re
+
+    root = Path(store_dir)
+    if not (root / "run.json").exists():
+        return root
+    token = _re.sub(r"[^0-9A-Za-z._-]+", "-", str(run_id)).strip("-.")
+    token = token[:96] or "run"
+    candidate = root / f"run-{token}"
+    if not candidate.exists():
+        return candidate
+    for index in range(2, 10000):
+        alternative = root / f"run-{token}-{index}"
+        if not alternative.exists():
+            return alternative
+    raise RuntimeError(
+        f"cannot allocate a new run generation under {root}; refusing to "
+        "overwrite an existing run (no force)"
+    )
+
+
 class _M3RegistryStopEvent:
     """threading.Event-like view over the M1 cooperative stop channel.
 
@@ -9407,6 +9500,8 @@ def _run_single(
     halo_provenance=None,
     scheduler_mode=zsched.MODE_LEGACY,
     telemetry=None,
+    resume_mode=zres.RESUME_MODE_NEVER,
+    resume_run_id=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -9425,6 +9520,128 @@ def _run_single(
         raise RuntimeError(
             "ZeGrid halo provenance contradiction: run-level effective "
             f"{halo_provenance['effective_px']} != pass halo {halo_px}"
+        )
+    # ZM-ZEGRID-RESILIENT-RUN-RESUME-M4 (plan §6.6): the resume bootstrap runs
+    # BEFORE descriptors, layout, gauge or any admission. Order is imperative:
+    # choose/open the run -> lock -> read identity/state -> restore the effective
+    # storage policy. Geometry/gauge/memberships are validated against the
+    # frozen identity later (when they exist) BEFORE any cell is admitted.
+    _resume_mode = zres.normalize_resume_mode(resume_mode)
+    _resume_boot = None
+    _resume_plan = None
+    _resume_pending_ids = None
+    _resume_gauge = None
+    _resume_geometry = None
+    _resume_store_dir = (
+        getattr(zconfig, "zegrid_durable_store_dir", None)
+        if zconfig is not None
+        else None
+    )
+    _resume_runtime = {
+        "mode": _resume_mode,
+        "run_id_requested": (
+            None if resume_run_id is None else str(resume_run_id)
+        ),
+        "selected_run_id": None,
+        "store_root": (
+            None if not _resume_store_dir else str(_resume_store_dir)
+        ),
+        "resumed": False,
+        "finalized_noop": False,
+        "policy_restored": None,
+        "pending_cells": None,
+        "completed_cells": None,
+        "invalid_isolated": None,
+        "refusal": None,
+    }
+    if _resume_mode == zres.RESUME_MODE_AUTO:
+        if not _resume_store_dir:
+            _raise = RuntimeError(
+                "zegrid_resume_mode=auto requires an existing durable store "
+                "directory (zegrid_durable_store_dir); refusing to guess one"
+            )
+            _resume_runtime["refusal"] = str(_raise)
+            raise _raise
+        try:
+            _resume_boot = zres.ResumeBootstrap.open(
+                _resume_store_dir,
+                run_id=resume_run_id,
+                budget=_resume_store_budget(zconfig),
+                session_id=str(output_dir),
+            )
+        except zres.ResumeError as _resume_exc:
+            _resume_runtime["refusal"] = (
+                f"{type(_resume_exc).__name__}: {_resume_exc}"
+            )
+            _emit(
+                "ZeGrid: resume REFUSED — "
+                f"{_resume_runtime['refusal']}. No silent recomputation, no "
+                "best-effort recovery.",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise
+        if _resume_boot is not None:
+            _resume_runtime["resumed"] = True
+            _resume_runtime["selected_run_id"] = str(_resume_boot.store.run_id)
+            _resume_runtime["finalized_noop"] = bool(_resume_boot.finalized)
+            _resume_runtime["policy_restored"] = _resume_boot.restore_policy(
+                apply=_restore_resume_storage_policy
+            )
+            _emit(
+                "ZeGrid: resume bootstrap — run selected "
+                f"{_resume_boot.store.run_id} (explicit selection), lock "
+                "acquired, frozen identity read, effective storage policy "
+                f"restored ({_resume_runtime['policy_restored']}); "
+                f"finalized={bool(_resume_boot.finalized)}",
+                callback=progress_callback,
+            )
+            # REWORK-1: restore the COMPLETE gauge and the frozen geometry from
+            # their durable artifacts BEFORE descriptors/layout/gauge work. A
+            # missing or mismatched artifact is an explicit refusal. There is
+            # deliberately no fallback to compute_global_gauge here.
+            try:
+                _resume_gauge = _resume_boot.restore_gauge()
+                _resume_geometry = _resume_boot.restore_geometry()
+            except zres.ResumeError as _artifact_exc:
+                _resume_runtime["refusal"] = (
+                    f"{type(_artifact_exc).__name__}: {_artifact_exc}"
+                )
+                _emit(
+                    "ZeGrid: resume REFUSED — frozen gauge/geometry artifact "
+                    f"unusable: {_artifact_exc}. No re-derivation, no repair.",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
+                raise
+            _resume_runtime["artifacts_restored"] = {
+                "gauge": True,
+                "geometry": True,
+                "geometry_cells": int(len(_resume_geometry[2])),
+                "gauge_frames": int(len(_resume_gauge[1])),
+                "gauge_reference_frame_id": _resume_gauge[2],
+            }
+            _emit(
+                "ZeGrid: resume artifacts RESTORED — gauge "
+                f"({len(_resume_gauge[1])} frames, ref "
+                f"{_resume_gauge[2]!r}) and geometry "
+                f"({len(_resume_geometry[2])} cells, "
+                f"{_resume_geometry[1]['nx']}x{_resume_geometry[1]['ny']}); "
+                "the gauge and layout phases will NOT run",
+                callback=progress_callback,
+            )
+        else:
+            _emit(
+                "ZeGrid: resume mode=auto — no existing run under "
+                f"{_resume_store_dir}; starting a NEW durable generation",
+                callback=progress_callback,
+            )
+    elif _resume_mode == zres.RESUME_MODE_NEVER:
+        _emit(
+            "ZeGrid: resume mode=never — launch-time reuse disabled; a NEW "
+            "durable generation is created and existing generations are "
+            "never overwritten (safety checkpoints stay enabled)",
+            callback=progress_callback,
         )
     # ZM-ZEGRID-R37-D (F1): when a capture is requested, fail-closed invalidate the
     # fixed target in THIS run's actual output dir IMMEDIATELY at run start (before
@@ -9560,7 +9777,44 @@ def _run_single(
         descs, rejected = _build_frame_descriptors(
             frames_info, input_folder, progress_callback, sip_mode=sip_mode
         )
-        canvas = zg.build_canvas(descs)
+        if _resume_geometry is not None:
+            # REWORK-1: consume the stored canvas/WCS. The descriptors are only
+            # source handles; the scientific canvas is the frozen one.
+            canvas = _resume_geometry[0]
+        else:
+            canvas = zg.build_canvas(descs)
+    # M4 (plan §6.6): validate the frozen inventory by CONTENT before layout or
+    # gauge. A moved dataset is not a change; a changed byte is a refusal.
+    if _resume_boot is not None:
+        _resume_sources = {
+            str(desc.frame_id.logical_path): getattr(desc, "source_path", None)
+            for desc in descs
+        }
+        if any(path is None for path in _resume_sources.values()):
+            _resume_runtime["refusal"] = (
+                "resume refused: a descriptor exposes no source_path; the "
+                "input content cannot be certified"
+            )
+            raise zres.ResumeIncompatible(_resume_runtime["refusal"])
+        try:
+            _resume_inputs = _resume_boot.verify_inputs(_resume_sources)
+        except zres.ResumeIncompatible as _resume_exc:
+            _resume_runtime["refusal"] = (
+                f"{type(_resume_exc).__name__}: {_resume_exc}"
+            )
+            _emit(
+                "ZeGrid: resume REFUSED — input content does not match the "
+                f"frozen inventory: {_resume_exc}",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise
+        _emit(
+            "ZeGrid: resume input identity verified by content — "
+            f"{_resume_inputs['count']} frame(s) re-hashed, no name/mtime "
+            "shortcut",
+            callback=progress_callback,
+        )
     # ZM-ZEGRID-R35A: explicit inventory invariant (no silent drop).
     _cand = len(frames_info)
     _inc = len(descs)
@@ -9726,6 +9980,7 @@ def _run_single(
         bundle_common=_bundle_common,
         active=(scheduler_mode == zsched.MODE_ACTIVE),
         emit=_emit_live,
+        restored_geometry=_resume_geometry,
     )
     try:
         with timings.timed("layout"):
@@ -10196,27 +10451,62 @@ def _run_single(
         _gauge_rep.progress(done, item_id=item_id, total=total)
 
     gauge_diagnostics: dict = {}
-    with timings.timed("gauge"):
-        global_gauge, global_frame_ids = zphot.compute_global_gauge(
-            descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
-            progress_callback=_gauge_progress,
-            emit=_emit_live,
-            diagnostics=gauge_diagnostics,
+    if _resume_gauge is not None:
+        # REWORK-1: the complete gauge is RESTORED. compute_global_gauge is not
+        # called at all on this path (no hours-long re-derivation).
+        global_gauge, global_frame_ids, _restored_reference = _resume_gauge
+        _descs_ids = tuple(str(d.frame_id.logical_path) for d in descs)
+        if tuple(str(v) for v in global_frame_ids) != _descs_ids:
+            raise RuntimeError(
+                "resume refused: restored gauge frame order "
+                f"{tuple(global_frame_ids)!r} != current descriptor order "
+                f"{_descs_ids!r}"
+            )
+        global_reference_frame_id = (
+            _restored_reference
+            if _restored_reference is not None
+            else global_frame_ids[int(global_gauge.reference_index)]
         )
-    _gauge_rep.end(
-        throughput=_fmt_throughput(len(descs), timings.get("gauge"), "frames/s")
-    )
-    global_eta.phase_completed("gauge", timings.get("gauge"))
-    _telemetry_stats(
-        phase_name="Gauge", phase_index=2, tiles_done=0, tiles_total=nx * ny,
-    )
-    global_reference_frame_id = global_frame_ids[int(global_gauge.reference_index)]
-    _emit(
-        f"ZeGrid: global photometric gauge — reference frame {global_reference_frame_id!r} "
-        f"(index {global_gauge.reference_index} of {len(global_frame_ids)} frames); "
-        f"exclusions={len(global_gauge.exclusions)}",
-        callback=progress_callback,
-    )
+        gauge_diagnostics = {
+            "source": "restored_gauge_artifact",
+            "compute_global_gauge_executed": False,
+            "frame_count": int(len(global_frame_ids)),
+            "reference_index": int(global_gauge.reference_index),
+            "reference_frame_id": str(global_reference_frame_id),
+            "exclusions": int(len(global_gauge.exclusions)),
+        }
+        _gauge_rep.end(throughput=0.0)
+        global_eta.phase_completed("gauge", 0.0)
+        _emit(
+            "ZeGrid: global photometric gauge RESTORED from the durable artifact "
+            f"— reference {global_reference_frame_id!r} (index "
+            f"{global_gauge.reference_index} of {len(global_frame_ids)} frames), "
+            f"exclusions={len(global_gauge.exclusions)}; the gauge phase did NOT "
+            "execute",
+            callback=progress_callback,
+        )
+    else:
+        with timings.timed("gauge"):
+            global_gauge, global_frame_ids = zphot.compute_global_gauge(
+                descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
+                progress_callback=_gauge_progress,
+                emit=_emit_live,
+                diagnostics=gauge_diagnostics,
+            )
+        _gauge_rep.end(
+            throughput=_fmt_throughput(len(descs), timings.get("gauge"), "frames/s")
+        )
+        global_eta.phase_completed("gauge", timings.get("gauge"))
+        _telemetry_stats(
+            phase_name="Gauge", phase_index=2, tiles_done=0, tiles_total=nx * ny,
+        )
+        global_reference_frame_id = global_frame_ids[int(global_gauge.reference_index)]
+        _emit(
+            f"ZeGrid: global photometric gauge — reference frame {global_reference_frame_id!r} "
+            f"(index {global_gauge.reference_index} of {len(global_frame_ids)} frames); "
+            f"exclusions={len(global_gauge.exclusions)}",
+            callback=progress_callback,
+        )
 
     # ------------------------------------------------------------------
     # ZM-ZEGRID-R41-B — ADMISSION PHASE. A FRESH raw observation is taken for
@@ -10887,7 +11177,8 @@ def _run_single(
 
     def _run_r55_active_cpu_waves(*, science_cfg, start_bundle,
                                   start_candidate, start_mapping,
-                                  result_registry=None):
+                                  result_registry=None,
+                                  pending_cell_ids=None):
         """E1: deterministic bounded waves + a fresh checkpoint before EACH.
 
         Only the active CPU path reaches this closure. Legacy/observe keep the
@@ -10903,8 +11194,19 @@ def _run_single(
         # child/parent global is consulted.
         run_decision = _r55_active_decision
         all_tasks = list(start_bundle.cell_tasks)
-        total_tasks = len(all_tasks)
         canonical_cids = [t[0].cell_id for t in all_tasks]
+        # M4 resume: the canonical list stays COMPLETE (assembly must receive
+        # every expected cell) while execution is admitted ONLY for the sparse
+        # pending set. Never a prefix/offset shortcut.
+        if pending_cell_ids is None:
+            pending_tasks = list(all_tasks)
+        else:
+            _pending_set = {str(cid) for cid in pending_cell_ids}
+            pending_tasks = [
+                task for task in all_tasks
+                if str(task[0].cell_id) in _pending_set
+            ]
+        total_tasks = len(pending_tasks)
         offset = 0
         wave_index = 0
         results_local = []
@@ -11485,7 +11787,7 @@ def _run_single(
             start, end = zrt.next_wave_bound(
                 offset, total_tasks, units_bound
             )
-            wave_tasks = bundle.cell_tasks[start:end]
+            wave_tasks = pending_tasks[start:end]
             wave_units = int(len(wave_tasks))
             # M1 REWORK-2: capture the authorised generation BEFORE the wave is
             # dispatched. A transition that happens while the wave is in flight
@@ -11658,7 +11960,7 @@ def _run_single(
                 results_local.extend(wave_results)
             metas.append(wave_meta)
             remaining_after = sum(
-                1 for t in all_tasks[end:] if t[4] is not None
+                1 for t in pending_tasks[end:] if t[4] is not None
             )
             heartbeat_dict = {
                 key: wave_meta.get(key)
@@ -13267,7 +13569,9 @@ def _run_single(
             _expected_cids = []
         result_registry = zrr.RunResultRegistry(
             run_id=(
-                f"zegrid:{start_ts}:{pass_label}:"
+                str(_resume_boot.store.run_id)
+                if _resume_boot is not None
+                else f"zegrid:{start_ts}:{pass_label}:"
                 f"{int(time.time_ns())}"
             ),
             expected_cell_ids=_expected_cids,
@@ -13311,7 +13615,99 @@ def _run_single(
         if zconfig is not None
         else None
     )
-    if _store_dir and result_registry is not None:
+    if result_registry is not None and _resume_boot is not None:
+        # M4: the store was already selected/opened/LOCKED by the bootstrap
+        # before layout/gauge. Verify the freshly built identity against the
+        # frozen one, then admit ONLY the sparse remaining cells.
+        try:
+            _store_identity = _r55_build_run_store_identity(
+                run_id=str(result_registry.run_id),
+                descs=descs,
+                canvas=canvas,
+                bundle=_initial_bundle,
+                halo_px=int(halo_px),
+                halo_provenance=halo_provenance,
+                global_gauge=global_gauge,
+                global_frame_ids=global_frame_ids,
+                gauge_mode=str(
+                    getattr(science_config, "cell_gauge_mode", "global")
+                    or "global"
+                ),
+                science_config=science_config,
+                workers=workers,
+                prefetch_units=None,
+            )
+            _resume_boot.verify_identity(_store_identity)
+        except zres.ResumeIncompatible as _resume_exc:
+            _resume_runtime["refusal"] = (
+                f"{type(_resume_exc).__name__}: {_resume_exc}"
+            )
+            _emit(
+                "ZeGrid: resume REFUSED — geometry/gauge/memberships/science "
+                f"do not match the frozen identity: {_resume_exc}",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise
+        except Exception as _resume_exc:
+            _resume_runtime["refusal"] = (
+                f"{type(_resume_exc).__name__}: {_resume_exc}"
+            )
+            _emit(
+                "ZeGrid: resume REFUSED — the new process identity could not "
+                f"be validated: {_resume_exc}",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise
+        _store = _resume_boot.store
+        _store_state.update(
+            enabled=True, store=_store, publishing=True, resumed=True
+        )
+        _bundle_cids = sorted(
+            str(task[0].cell_id) for task in _initial_bundle.cell_tasks
+        )
+        try:
+            _resume_plan = _resume_boot.plan(_bundle_cids)
+        except zres.ResumeError as _resume_exc:
+            _resume_runtime["refusal"] = (
+                f"{type(_resume_exc).__name__}: {_resume_exc}"
+            )
+            _emit(
+                "ZeGrid: resume REFUSED — sparse plan failed: "
+                f"{_resume_exc}",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise
+        _resume_pending_ids = set(_resume_plan["pending"])
+        _resume_runtime.update(
+            pending_cells=int(_resume_plan["pending_count"]),
+            completed_cells=int(
+                _resume_plan["complete"] + _resume_plan["empty_validated"]
+            ),
+            invalid_isolated=list(_resume_plan["invalid_isolated"]),
+        )
+        _store_state["commits"] = int(
+            _resume_plan["complete"] + _resume_plan["empty_validated"]
+        )
+        _emit(
+            "ZeGrid: resume plan — expected="
+            f"{_resume_plan['expected']} complete={_resume_plan['complete']} "
+            f"empty_validated={_resume_plan['empty_validated']} "
+            f"pending={_resume_plan['pending_count']} "
+            f"isolated_invalid={len(_resume_plan['invalid_isolated'])} "
+            "(sparse cell_id set, never a 0..K prefix)",
+            callback=progress_callback,
+        )
+        if _resume_plan["is_complete"]:
+            _emit(
+                "ZeGrid: resumed run is ALREADY COMPLETE — verified no-op: no "
+                "cell will be recomputed; only the assembly/publication step "
+                "is replayed from the immutable commits",
+                callback=progress_callback,
+            )
+    elif _store_dir and result_registry is not None:
         _store_error = None
         _store_stage = "identity_build"
         try:
@@ -13336,8 +13732,13 @@ def _run_single(
             _store_budget_bytes = int(
                 getattr(zconfig, "zegrid_durable_store_budget_bytes", 0) or 0
             )
+            # M4: never overwrite an existing generation. A legacy single run
+            # may still live directly in the container; M4 creates a child.
+            _store_target = _resume_generation_root(
+                _store_dir, str(result_registry.run_id)
+            )
             _store, _store_error = _r55_open_run_store(
-                _store_dir,
+                _store_target,
                 identity=_store_identity,
                 budget_bytes=_store_budget_bytes,
                 session_id=str(result_registry.run_id),
@@ -13372,9 +13773,78 @@ def _run_single(
             _store_state.update(
                 enabled=True, store=_store, publishing=True
             )
+            # M4: freeze the expected cell set and the effective policy BEFORE
+            # any cell runs, so a restart resumes the EXACT sparse inventory.
+            try:
+                _state_cids = sorted(
+                    str(task[0].cell_id)
+                    for task in _initial_bundle.cell_tasks
+                )
+                zres.write_state(
+                    _store.root,
+                    run_id=str(_store.run_id),
+                    expected_cell_ids=_state_cids,
+                    policy=zres.policy_from_snapshot(
+                        _storage_policy_snapshot()
+                    ),
+                    plan_generation=0,
+                    finalized=False,
+                    gauge_sha256=str(
+                        _store_identity["science_contract"]["gauge"]["sha256"]
+                    ),
+                    note=(
+                        "M4 frozen run state: expected cell ids + effective "
+                        "storage policy; never re-discovered on resume"
+                    ),
+                )
+                _store_state["state_path"] = str(
+                    zres.state_path(_store.root)
+                )
+                # REWORK-1: persist the COMPLETE gauge and the frozen geometry
+                # BEFORE any cell is admitted. A restart then restores both and
+                # never re-runs compute_global_gauge or the layout search.
+                zart.write_gauge_artifact(
+                    _store.root,
+                    run_id=str(_store.run_id),
+                    identity=_store_identity,
+                    gauge=global_gauge,
+                    mode=str(
+                        getattr(science_config, "cell_gauge_mode", "global")
+                        or "global"
+                    ),
+                    frame_ids=[str(v) for v in global_frame_ids],
+                    reference_frame_id=global_reference_frame_id,
+                )
+                zart.write_geometry_artifact(
+                    _store.root,
+                    run_id=str(_store.run_id),
+                    identity=_store_identity,
+                    canvas=canvas,
+                    layout=layout,
+                    cell_ctxs=cell_ctxs,
+                    halo_px=int(halo_px),
+                )
+                _store_state["artifacts"] = {
+                    "gauge": str(_store.root / zart.GAUGE_FILENAME),
+                    "geometry": str(_store.root / zart.GEOMETRY_FILENAME),
+                }
+            except Exception as _state_exc:
+                _store_state["publishing"] = False
+                _store_state["degraded_reason"] = (
+                    "resume state write failed: "
+                    f"{type(_state_exc).__name__}: {_state_exc}"
+                )
+                _emit(
+                    "ZeGrid: durable store opened but the frozen resume state "
+                    f"could not be written ({_store_state['degraded_reason']}); "
+                    "durable commits are DISABLED for this run (no resumable "
+                    "claim). Prior generations are preserved.",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
             _emit(
                 "ZeGrid: durable run store ACTIVE — "
-                f"root={_store_dir} run_id={_store.run_id} "
+                f"root={_store.root} run_id={_store.run_id} "
                 f"budget={(_store.budget.to_dict() if _store.budget else None)} "
                 f"lock_orphan_recovered="
                 f"{bool((_store.report().get('lock_info') or {}).get('orphan_recovered'))}",
@@ -13384,6 +13854,24 @@ def _run_single(
     # The control-flow variable is cleared (the CPU path owns execution), but the
     # decision, its effective mapping and its runtime adaptation are retained so
     # the manifest can report what the GPU actually attempted.
+    if _resume_boot is not None and _resume_pending_ids is not None:
+        if not _resume_pending_ids:
+            # A COMPLETE run must resume ASSEMBLY without any GPU stack
+            # admission. No cell is admitted, so no GPU decision is needed.
+            _r55_active_gpu_decision = None
+        elif _r55_active_gpu_decision is not None:
+            _resume_runtime["refusal"] = (
+                "resume refused: a GPU backend was selected for a CPU-frozen "
+                "run; mixing backends without a qualified numeric parity "
+                "contract is forbidden (V1 conservative policy)"
+            )
+            _emit(
+                "ZeGrid: resume REFUSED — "
+                f"{_resume_runtime['refusal']}",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise RuntimeError(_resume_runtime["refusal"])
     _r55_gpu_retained = None
     if scheduler_mode == zsched.MODE_ACTIVE and _r55_active_gpu_decision is not None:
         # ZM-WIN-GPUPROBE: a qualified ACTIVE GPU run is SINGLE-OWNER, so the
@@ -13648,6 +14136,7 @@ def _run_single(
                 start_candidate=_r55_active_candidate,
                 start_mapping=_r55_active_mapping,
                 result_registry=result_registry,
+                pending_cell_ids=_resume_pending_ids,
             )
         _final = _r55_active_bundle
         layout = _final.layout
@@ -13708,6 +14197,7 @@ def _run_single(
             start_candidate=_r55_active_candidate,
             start_mapping=_r55_active_mapping,
             result_registry=result_registry,
+            pending_cell_ids=_resume_pending_ids,
         )
         # The RUN-final bundle is the ONLY source for assembly, diagnostics and
         # the manifest. A changed mapping applied only to the NEXT wave.
@@ -14386,6 +14876,9 @@ def _run_single(
             "released_bytes": int(_store_state["released_bytes"]),
             "store": (None if _store is None else _store.report()),
         }
+    # M4: resume audit (selected run, restored policy, sparse pending set).
+    # Never payloads, never arrays.
+    per_cell_diagnostics["r55_resume"] = dict(_resume_runtime)
 
     # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
     export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
@@ -14440,6 +14933,48 @@ def _run_single(
         halo_provenance=_halo_provenance_pass,
     )
 
+    # M4: finalize the durable run state ONLY after the complete publication
+    # (science + coverage + manifest) exists. A later auto-resume is then a
+    # verified no-op, never a recomputation of valid cells.
+    if _store_state["store"] is not None and _store_state.get("degraded_reason") is None:
+        try:
+            _run_root = _store_state["store"].root
+            _prev_state = zres.read_state(_run_root)
+            _outputs = {}
+            for _name, _path in (
+                ("science", sci_path),
+                ("coverage", cov_path),
+                ("manifest", manifest_path),
+            ):
+                if _path is not None and Path(_path).exists():
+                    _sha, _nbytes = zrs.content_sha256_file(_path)
+                    _outputs[_name] = {
+                        "sha256": _sha, "nbytes": int(_nbytes)
+                    }
+            zres.write_state(
+                _run_root,
+                run_id=_prev_state["run_id"],
+                expected_cell_ids=_prev_state["expected_cell_ids"],
+                policy=zres.policy_from_snapshot(_storage_policy_snapshot()),
+                plan_generation=int(_prev_state["plan_generation"]) + 1,
+                finalized=True,
+                gauge_sha256=_prev_state["gauge_sha256"],
+                outputs=_outputs,
+                created_unix_ns=_prev_state["created_unix_ns"],
+                note=_prev_state["note"],
+            )
+            _resume_runtime["finalized_noop"] = False
+            _resume_runtime["outputs"] = dict(_outputs)
+        except Exception as _fin_exc:
+            _emit(
+                "ZeGrid: durable run state could not be finalized "
+                f"({type(_fin_exc).__name__}: {_fin_exc}); the published "
+                "outputs stay valid but a later resume will re-verify the "
+                "commits instead of trusting a finalization flag.",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+
     # M1: the run published successfully. The registry's explicit release is the
     # single ownership hand-off; the transient ``results`` list is also dropped.
     # (On any earlier failure the registry stays reachable from the typed
@@ -14463,6 +14998,9 @@ def _run_single(
             f"{_store_state['released_bytes']} B released from RAM)",
             callback=progress_callback,
         )
+    elif _resume_boot is not None:
+        # A resumed run outside the ACTIVE registry path still holds the lock.
+        _resume_boot.close()
     results = []
 
     # ZM-PROGRESS-CONTRACT-R29: the finalize seam completes (1/1) only now that
@@ -15340,6 +15878,28 @@ def run_zegrid_mode(
     global _STACK_STORAGE_PROFILE
     _storage_policy_reset(storage_profile)
     _STACK_STORAGE_PROFILE = _STORAGE_EFFECTIVE
+    # ZM-ZEGRID-RESILIENT-RUN-RESUME-M4: resolve the launch-time resume policy
+    # ONCE, strictly. "never" is the safe default; "auto" resumes a compatible
+    # existing run and STOPS explicitly on incompatibility.
+    _resume_mode = zres.normalize_resume_mode(
+        getattr(zconfig, "zegrid_resume_mode", None)
+        if zconfig is not None
+        else None
+    )
+    _resume_run_id = (
+        getattr(zconfig, "zegrid_resume_run_id", None)
+        if zconfig is not None
+        else None
+    )
+    _emit(
+        f"ZeGrid: resume policy — mode={_resume_mode}"
+        + (
+            f" explicit_run_id={_resume_run_id}"
+            if _resume_run_id
+            else ""
+        ),
+        callback=progress_callback,
+    )
     _emit("ZeGrid engine activated (explicit ZeGrid mode)", callback=progress_callback)
     _emit(
         "ZeGrid: storage policy — requested="
@@ -15726,6 +16286,14 @@ def run_zegrid_mode(
                 pass
 
     if len(known_mount_frames) == len(frames_info) and len(mount_values) >= 2:
+        if _resume_mode == zres.RESUME_MODE_AUTO:
+            _refusal = (
+                "zegrid_resume_mode=auto is refused for a MOUNT-SEGREGATED "
+                "run (EQ+ALTZ): one durable run identity cannot be resumed "
+                "as two independent passes; use never or run a single mount"
+            )
+            _emit(f"ZeGrid: resume REFUSED — {_refusal}", lvl="ERROR", callback=progress_callback)
+            raise RuntimeError(_refusal)
         eq_frames = [f for f in frames_info if f.mount == "EQ"]
         altz_frames = [f for f in frames_info if f.mount == "ALTZ"]
         _emit(
@@ -15748,7 +16316,9 @@ def run_zegrid_mode(
                         r40_seam_capture=r40_seam_capture,
                         r40_output_root=r40_output_root,
                         r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
-                        telemetry=telemetry)
+                        telemetry=telemetry,
+                        resume_mode=_resume_mode,
+                        resume_run_id=_resume_run_id)
         if altz_frames:
             _run_single_guarded(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
@@ -15765,7 +16335,9 @@ def run_zegrid_mode(
                         r40_seam_capture=r40_seam_capture,
                         r40_output_root=r40_output_root,
                         r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
-                        telemetry=telemetry)
+                        telemetry=telemetry,
+                        resume_mode=_resume_mode,
+                        resume_run_id=_resume_run_id)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -15784,4 +16356,6 @@ def run_zegrid_mode(
                     r40_seam_capture=r40_seam_capture,
                     r40_output_root=r40_output_root,
                     r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
-                    telemetry=telemetry)
+                    telemetry=telemetry,
+                    resume_mode=_resume_mode,
+                    resume_run_id=_resume_run_id)

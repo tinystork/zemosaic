@@ -2407,18 +2407,26 @@ class RunCellStore:
         final = confined_path(self.root, entry["path"], "object path")
         if final.exists():
             actual = _file_sha256(final)
-            if actual != entry["sha256"]:
+            size_ok = int(final.stat().st_size) == int(entry["nbytes"])
+            if actual == entry["sha256"] and size_ok:
+                return
+            # M4 isolated-corruption repair: the path IS the content address
+            # of ``entry['sha256']``. Replacing on-disk CORRUPTION with the
+            # exact bytes that address denotes cannot contradict any valid
+            # commit (every commit referencing this path expects this digest).
+            # Anything else is still refused: never overwrite a DIFFERENT
+            # referenced artifact.
+            if entry["path"] != _object_relpath(str(entry["sha256"])):
                 raise StoreIntegrityError(
                     f"object {entry['path']} already exists with a different "
                     f"digest ({actual} != {entry['sha256']}); refusing to "
                     "overwrite a referenced immutable artifact"
                 )
-            if int(final.stat().st_size) != int(entry["nbytes"]):
+            if not size_ok and actual == entry["sha256"]:  # pragma: no cover
                 raise StoreIntegrityError(
                     f"object {entry['path']} has size {final.stat().st_size} "
                     f"!= declared {entry['nbytes']}"
                 )
-            return
         final.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._tmp_dir / f"obj-{uuid.uuid4().hex}.part"
         self._fault(
@@ -2800,9 +2808,12 @@ class RunCellStore:
         for cell_id in cell_ids:
             meta = registry.metadata(cell_id)
             if meta is None:
-                raise StoreNotFoundError(
-                    f"cell {cell_id!r} is absent from the registry and the store"
-                )
+                # M4 resume: a cell completed by a PREVIOUS process is not in
+                # this process' registry at all. It is reloaded from its
+                # verified durable commit instead of being recomputed.
+                payload = self.load_payload(cell_id)
+                out.append(payload)
+                continue
             if meta.get("released"):
                 payload = self.load_payload(
                     cell_id, meta.get("attempt_id")
