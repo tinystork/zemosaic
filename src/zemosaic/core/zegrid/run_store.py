@@ -450,6 +450,29 @@ def _get_osfhandle(fd: int) -> int:
     return msvcrt.get_osfhandle(fd)
 
 
+#: ``os.replace`` on Windows can fail with a sharing violation while another
+#: handle (a reader, an indexer, an AV scanner) still holds the target open.
+#: The retry is short and bounded; POSIX never needs it.
+REPLACE_RETRY_ATTEMPTS = 5
+REPLACE_RETRY_SLEEP_S = 0.02
+
+
+def _replace_with_retry(src: Any, dst: Any) -> None:
+    last: PermissionError | None = None
+    for attempt in range(int(REPLACE_RETRY_ATTEMPTS)):
+        try:
+            os.replace(str(src), str(dst))
+            return
+        except PermissionError as exc:  # Windows sharing violation
+            last = exc
+            if attempt + 1 >= int(REPLACE_RETRY_ATTEMPTS):
+                break
+            time.sleep(float(REPLACE_RETRY_SLEEP_S))
+    if last is not None:
+        raise last
+    raise OSError("os.replace failed without a recorded error")  # pragma: no cover
+
+
 def atomic_write_bytes(path: Path, data: bytes, *, tmp_dir: Path) -> None:
     """Write ``data`` to ``path`` atomically (tmp -> fsync -> rename -> dir fsync)."""
     tmp_dir = Path(tmp_dir)
@@ -467,7 +490,7 @@ def atomic_write_bytes(path: Path, data: bytes, *, tmp_dir: Path) -> None:
     finally:
         os.close(fd)
     try:
-        os.replace(str(tmp), str(path))
+        _replace_with_retry(tmp, path)
     except BaseException:
         try:
             os.unlink(str(tmp))
@@ -634,6 +657,11 @@ class StoreLock:
     def __init__(self, path: Path, *, session_id: str | None = None,
                  instance_id: str | None = None):
         self.path = Path(path)
+        # The OS lock lives in a DEDICATED lock file. The owner record is a
+        # separate, never-locked file: on Windows a byte-range lock blocks
+        # READS of the locked range from other handles, so co-locating the
+        # record with the lock made live-vs-dead undecidable.
+        self.owner_path = self.path.parent / "OWNER.json"
         self.session_id = session_id
         self.instance_id = instance_id or uuid.uuid4().hex
         self._fd: int | None = None
@@ -682,20 +710,55 @@ class StoreLock:
         except OSError:
             pass
 
-    # -- owner record ---------------------------------------------------
-    def _read_owner_from_fd(self, fd: int) -> dict[str, Any] | None:
+    # -- owner record (separate, unlocked file) --------------------------
+    @staticmethod
+    def owner_record_path(path_or_root) -> Path:
+        """Resolve the OWNER.json path for a lock path, owner path or run root."""
+        path = Path(path_or_root)
+        if path.name == "OWNER.json":
+            return path
+        if path.name == "LOCK":
+            return path.parent / "OWNER.json"
+        return path / "OWNER.json"
+
+    @classmethod
+    def peek_owner(cls, path_or_root) -> dict[str, Any] | None:
+        """Read-only accessor for the owner record. Never touches the lock file.
+
+        Safe while another process holds the lock (the record file is not part
+        of the locked byte range), and safe on a closed/foreign run directory.
+        """
+        path = cls.owner_record_path(path_or_root)
         try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            raw = os.read(fd, 65536)
-        except OSError:
-            return None
-        if not raw:
+            raw = path.read_bytes()
+        except (FileNotFoundError, PermissionError, OSError):
             return None
         try:
             value = json.loads(raw.decode("utf-8"))
         except Exception:
             return None
         return value if isinstance(value, dict) else None
+
+    def _read_owner_record(self) -> dict[str, Any] | None:
+        record = self.peek_owner(self.path)
+        if record is not None:
+            return record
+        # Legacy r0/r1 store: the record lived INSIDE the locked file. Best
+        # effort only (a held Windows range is unreadable by design).
+        try:
+            raw = Path(self.path).read_bytes()
+            value = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+        return value if isinstance(value, dict) and "schema" in value else None
+
+    def _write_owner_record(self, record: Mapping[str, Any]) -> None:
+        """Atomically publish the owner record OUTSIDE the locked range."""
+        atomic_write_bytes(
+            self.owner_path,
+            canonical_json(dict(record)),
+            tmp_dir=self.path.parent,
+        )
 
     @staticmethod
     def _owner_detail(previous: Mapping[str, Any] | None) -> str:
@@ -744,7 +807,7 @@ class StoreLock:
                     break
                 except StoreLockError as exc:
                     last_error = exc
-                    previous = self._read_owner_from_fd(fd)
+                    previous = self._read_owner_record()
                     if not self._provably_dead(previous):
                         waited = time.monotonic() - started_monotonic
                         os.close(fd)
@@ -779,7 +842,7 @@ class StoreLock:
                     )
             self.last_acquire_attempts = int(attempts)
             self.last_acquire_wait_s = time.monotonic() - started_monotonic
-            previous = self._read_owner_from_fd(fd)
+            previous = self._read_owner_record()
             previous_state = (
                 str(previous.get("state", "held")) if previous else None
             )
@@ -824,16 +887,7 @@ class StoreLock:
                 "started_unix_ns": int(self.acquired_unix_ns),
                 "platform": platform.platform(),
             }
-            payload = canonical_json(self.owner)
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.ftruncate(fd, 0)
-            view = memoryview(payload)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:  # pragma: no cover
-                    raise OSError("short lock write")
-                view = view[written:]
-            fsync_file(fd)
+            self._write_owner_record(self.owner)
             _LIVE_LOCKS[self._key] = self
             return {
                 "path": str(self.path),
@@ -859,11 +913,7 @@ class StoreLock:
             record = dict(self.owner or {})
             record["state"] = "released"
             record["released_unix_ns"] = int(time.time_ns())
-            payload = canonical_json(record)
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.ftruncate(fd, 0)
-            os.write(fd, payload)
-            fsync_file(fd)
+            self._write_owner_record(record)
         except Exception:
             pass
         try:
@@ -1501,6 +1551,30 @@ class RunCellStore:
     @property
     def lock_owner(self) -> dict | None:
         return dict(self._lock.owner) if self._lock and self._lock.owner else None
+
+    def lock_info(self) -> dict:
+        """Supported READ-ONLY view of the lock and its owner record.
+
+        Tests and diagnostics must use this (or ``StoreLock.peek_owner``)
+        instead of reading ``LOCK`` directly: on Windows a held byte range is
+        unreadable from another handle by design, while ``OWNER.json`` always is.
+        """
+        held = self._lock is not None and bool(self._lock.held)
+        owner = None
+        if held and self._lock is not None and self._lock.owner is not None:
+            owner = dict(self._lock.owner)
+        if owner is None:
+            owner = StoreLock.peek_owner(self.root)
+        return {
+            "schema": LOCK_SCHEMA,
+            "lock_path": str(self._p("LOCK")),
+            "owner_path": str(self._p("OWNER.json")),
+            "held_by_this_store": held,
+            "owner": owner,
+            "acquire": (
+                dict(self._lock_info) if self._lock_info is not None else None
+            ),
+        }
 
     # -- paths -----------------------------------------------------------
     def _p(self, *parts: str) -> Path:
@@ -2371,7 +2445,7 @@ class RunCellStore:
             raise StoreIntegrityError(
                 f"object {entry['path']} size mismatch after write"
             )
-        os.replace(str(tmp), str(final))
+        _replace_with_retry(tmp, final)
         fsync_dir(final.parent)
         # ``entry_mode`` documents the reservation strength; a weak mode is
         # still safe because the commit manifest is published last.

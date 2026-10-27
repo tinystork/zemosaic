@@ -198,6 +198,11 @@ def empty_result(cell_id="r0000c0001", *, mode="per_cell"):
     }
 
 
+def write_owner_record(root: Path, record: dict) -> None:
+    """Publish a fabricated OWNER.json (never the locked LOCK file)."""
+    (Path(root) / "OWNER.json").write_text(json.dumps(record), encoding="utf-8")
+
+
 @pytest.fixture
 def store(tmp_path):
     opened = zrs.RunCellStore.open(
@@ -483,7 +488,7 @@ def test_m2_orphan_lock_is_recovered(tmp_path):
         "started_unix_ns": 1,
         "platform": "test",
     }
-    (root / "LOCK").write_text(json.dumps(dead_owner))
+    write_owner_record(root, dead_owner)
     store = zrs.RunCellStore.open(root, identity=make_identity())
     info = store.report()["lock_info"]
     assert info["orphan_recovered"] is True
@@ -511,7 +516,7 @@ def test_m2_live_process_without_os_lock_is_never_stolen(tmp_path):
             "started_unix_ns": int(time.time_ns()),
             "platform": "test",
         }
-        (root / "LOCK").write_text(json.dumps(owner))
+        write_owner_record(root, owner)
         with pytest.raises(zrs.StoreLockError):
             zrs.RunCellStore.open(root, identity=make_identity())
     finally:

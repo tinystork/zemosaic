@@ -47,6 +47,7 @@ SUITES = (
     ("m2_store_contract", "tests/test_zegrid_run_store_m2.py"),
     ("m2_io_regression", "tests/test_zegrid_run_store_m2_io.py"),
     ("m2_kill_matrix", "tests/test_zegrid_run_store_m2_kill.py"),
+    ("m2_identity_seam", "tests/test_zegrid_resume_m2_identity.py"),
     ("m2_real_store_run", "tests/test_zegrid_resume_m2_store_run.py"),
     ("m1_registry", "tests/test_zegrid_run_registry_m1.py"),
     ("m1_conservation", "tests/test_zegrid_resume_m1_conservation.py"),
@@ -62,6 +63,7 @@ PROVENANCE_FILES = (
     "tests/test_zegrid_run_store_m2.py",
     "tests/test_zegrid_run_store_m2_io.py",
     "tests/test_zegrid_run_store_m2_kill.py",
+    "tests/test_zegrid_resume_m2_identity.py",
     "tests/test_zegrid_resume_m2_store_run.py",
 )
 
@@ -255,6 +257,37 @@ def run_pytest(
     }
 
 
+STORE_DIAGNOSTIC_KEYS = (
+    "r55_durable_store",
+    "durable store",
+    "open_error",
+    "degraded_reason",
+    "open_stage",
+)
+
+
+def collect_store_diagnostics(results: list[dict], limit: int = 15) -> list[str]:
+    """Surface the durable-store failure text recorded by the failing suite."""
+    hits: list[str] = []
+    for result in results:
+        log = result.get("log")
+        if not log or not result.get("failed") and not result.get("errors"):
+            continue
+        try:
+            text = Path(log).read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(key in stripped for key in STORE_DIAGNOSTIC_KEYS):
+                hits.append(f"{result['suite']}: {stripped[:400]}")
+                if len(hits) >= limit:
+                    return hits
+    return hits
+
+
 def decide(results: list[dict], *, cap_exceeded: bool) -> tuple[str, list[str]]:
     reasons: list[str] = []
     if cap_exceeded:
@@ -374,6 +407,12 @@ def main(argv=None) -> int:
     else:
         status, reasons = decide(results, cap_exceeded=cap_exceeded)
 
+    store_diagnostics = collect_store_diagnostics(results)
+    if store_diagnostics and status != "PASS":
+        reasons = list(reasons) + [
+            "durable store diagnostics: " + store_diagnostics[0]
+        ]
+
     summary = {
         "schema": SCHEMA,
         "mission": MISSION,
@@ -386,6 +425,7 @@ def main(argv=None) -> int:
             "CAP_EXCEEDED": 5,
         }[status],
         "reasons": reasons,
+        "store_diagnostics": store_diagnostics,
         "source_root": str(source),
         "output_root": str(output),
         "python": sys.executable,

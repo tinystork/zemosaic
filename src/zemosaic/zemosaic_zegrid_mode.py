@@ -60,6 +60,7 @@ import traceback
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Callable, Optional, Sequence
 
 import numpy as np
@@ -12948,7 +12949,9 @@ def _run_single(
         "commits": 0,
         "released_cells": 0,
         "released_bytes": 0,
+        "open_stage": None,
         "open_error": None,
+        "open_traceback": None,
         "degraded_reason": None,
         "commit_errors": [],
     }
@@ -12959,6 +12962,7 @@ def _run_single(
     )
     if _store_dir and result_registry is not None:
         _store_error = None
+        _store_stage = "identity_build"
         try:
             _store_identity = _r55_build_run_store_identity(
                 run_id=str(result_registry.run_id),
@@ -12977,6 +12981,7 @@ def _run_single(
                 workers=workers,
                 prefetch_units=None,
             )
+            _store_stage = "store_open"
             _store_budget_bytes = int(
                 getattr(zconfig, "zegrid_durable_store_budget_bytes", 0) or 0
             )
@@ -12989,11 +12994,24 @@ def _run_single(
         except Exception as exc:  # explicit refusal, never silent
             _store, _store_error = None, exc
         if _store is None:
+            # Diagnosability (M2 REWORK-2 F3): name the failing STAGE and keep a
+            # bounded traceback tail, so the Windows bench reports the real
+            # cause instead of a downstream "no run.json" symptom.
+            import traceback as _tb
+
+            _tb_tail = "".join(
+                _tb.format_exception(
+                    type(_store_error), _store_error, _store_error.__traceback__
+                )
+            )[-2000:]
+            _store_state["open_stage"] = _store_stage
             _store_state["open_error"] = (
                 f"{type(_store_error).__name__}: {_store_error}"
             )
+            _store_state["open_traceback"] = _tb_tail
             _emit(
                 "ZeGrid: durable run store UNAVAILABLE — "
+                f"stage={_store_stage} "
                 f"{_store_state['open_error']}. Continuing with in-memory "
                 "conservation only (no durable commit claimed).",
                 lvl="ERROR",
@@ -14007,7 +14025,9 @@ def _run_single(
             "schema": zrs.STORE_SCHEMA,
             "requested": True,
             "enabled": bool(_store_state["enabled"]),
+            "open_stage": _store_state.get("open_stage"),
             "open_error": _store_state["open_error"],
+            "open_traceback": _store_state.get("open_traceback"),
             "degraded_reason": _store_state["degraded_reason"],
             "commit_errors": list(_store_state["commit_errors"]),
             "commits": int(_store_state["commits"]),

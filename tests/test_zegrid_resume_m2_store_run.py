@@ -78,6 +78,53 @@ def _require_live_ram() -> int:
     return live
 
 
+def _store_diagnostics(out_dir: Path) -> dict:
+    """Read the product's durable-store diagnostics from the published manifest."""
+    manifest = Path(out_dir) / "zegrid_manifest.json"
+    if not manifest.exists():
+        return {}
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return (data.get("per_cell_diagnostics") or {}).get("r55_durable_store") or {}
+
+
+def _require_durable_store_active(out_dir: Path, store_dir: Path) -> dict:
+    """Fail with the REAL store failure text instead of a downstream symptom.
+
+    The product intentionally degrades to M1 conservation when the durable store
+    cannot open; a test must never report that as "no run.json". It must report
+    the recorded ``open_error``/``degraded_reason`` and the failing stage.
+    """
+    diag = _store_diagnostics(out_dir)
+    if not diag:
+        pytest.fail(
+            "the run published no r55_durable_store diagnostics although "
+            f"zegrid_durable_store_dir={store_dir} was configured"
+        )
+    if diag.get("open_error") or diag.get("degraded_reason"):
+        pytest.fail(
+            "durable store did not become active: "
+            f"stage={diag.get('open_stage')!r} "
+            f"open_error={diag.get('open_error')!r} "
+            f"degraded_reason={diag.get('degraded_reason')!r} "
+            f"commit_errors={diag.get('commit_errors')!r}\n"
+            f"traceback tail:\n{diag.get('open_traceback')}"
+        )
+    if not diag.get("enabled"):
+        pytest.fail(
+            "durable store was configured but never became active: "
+            f"{json.dumps(diag, sort_keys=True)[:1500]}"
+        )
+    if not (Path(store_dir) / "run.json").exists():
+        pytest.fail(
+            "durable store reports enabled but wrote no run.json: "
+            f"{json.dumps(diag, sort_keys=True)[:1500]}"
+        )
+    return diag
+
+
 def _digest(array) -> str:
     contiguous = np.ascontiguousarray(array)
     return zrs._sha256_bytes(contiguous.tobytes())
@@ -162,6 +209,10 @@ def test_m2_real_cpu_run_commits_then_releases_and_reloads_identical_payloads(
             pytest.skip(f"pre-case resource/setup unavailable ({exc})")
         pytest.fail(f"store-enabled real run failed: {type(exc).__name__}: {exc}")
 
+    # F3: surface the product's own store diagnostics BEFORE opening the store.
+    diag = _require_durable_store_active(out_dir, store_dir)
+    assert diag["commits"] == len(run["produced"]), diag
+
     produced = run["produced"]
     assert produced, "no COMPLETE cell was produced"
 
@@ -204,6 +255,7 @@ def test_m2_store_identity_refuses_a_changed_science_contract(tmp_path):
     run = _run_with_store(inp, out_dir, store_dir)
     if run["exception"] is not None:
         pytest.skip(f"pre-case setup unavailable ({run['exception']})")
+    _require_durable_store_active(out_dir, store_dir)
     stored = zrs.RunCellStore.open(store_dir, identity=None, read_only=True)
     identity = stored.identity
     stored.close()

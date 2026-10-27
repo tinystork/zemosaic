@@ -170,14 +170,21 @@ def test_m2_every_os_open_site_requests_binary_mode(tmp_path, monkeypatch):
         if not flags & BINARY_SENTINEL
     ]
     assert not missing, f"store os.open without O_BINARY: {missing}"
-    # Coverage of the four real sites: lock file, directory fsync, tmp write and
-    # the content-addressed object.
+    # Coverage of every site that EXISTS on this platform. ``fsync_dir`` is a
+    # deliberate no-op on Windows (no directory handle to fsync), so the
+    # directory-open site is POSIX-only. That must not weaken the flag
+    # assertion above, and the test is never skipped.
     assert any(path.endswith("LOCK") for path, _ in seen)
-    assert any(
-        os.path.isdir(path) for path, _ in seen
-    ), "directory fsync open was not exercised"
-    assert any(".part" in path for path, _ in seen)
+    assert any(".part" in path or ".tmp-" in path for path, _ in seen)
     assert any(os.sep + "objects" + os.sep in path for path, _ in seen)
+    if rs._IS_WINDOWS:  # pragma: no cover - exercised on the Windows bench
+        assert not any(
+            os.path.isdir(path) for path, _ in seen
+        ), "fsync_dir must stay a documented no-op on Windows"
+    else:
+        assert any(
+            os.path.isdir(path) for path, _ in seen
+        ), "directory fsync open was not exercised on POSIX"
     # And the store is still fully usable with the flag present.
     reopened = rs.RunCellStore.open(root, identity=None, read_only=True)
     assert reopened.verify_cell("r0000c0000")["valid"] is True
@@ -237,17 +244,24 @@ def test_m2_lock_record_and_placeholder_are_byte_exact(tmp_path):
 
     root = tmp_path / "run"
     store = rs.RunCellStore.open(root, identity=identity())
-    held = (root / "LOCK").read_bytes()
-    assert b"\r" not in held, "lock record was CRLF-translated"
-    record = json.loads(held.decode("utf-8"))
-    assert record["state"] == "held"
-    assert record["schema"] == rs.LOCK_SCHEMA
+    # LOCK is a dedicated lock target: byte-exact, never a record.
+    assert (root / "LOCK").read_bytes() == rs.LOCK_PLACEHOLDER
+    assert b"\r" not in (root / "LOCK").read_bytes()
+    # The owner record is separate and readable through the supported API.
+    info = store.lock_info()
+    assert info["held_by_this_store"] is True
+    assert info["owner"]["state"] == "held"
+    assert info["owner"]["schema"] == rs.LOCK_SCHEMA
+    assert b"\r" not in (root / "OWNER.json").read_bytes(), (
+        "owner record was CRLF-translated"
+    )
     store.commit_cell(payload(), attempt_id="a1")
     store.close()
 
-    released = (root / "LOCK").read_bytes()
-    assert b"\r" not in released
-    assert json.loads(released.decode("utf-8"))["state"] == "released"
+    assert (root / "LOCK").read_bytes() == rs.LOCK_PLACEHOLDER
+    released = rs.StoreLock.peek_owner(root)
+    assert released is not None and released["state"] == "released"
+    assert b"\r" not in (root / "OWNER.json").read_bytes()
     # Canonical JSON has no newlines at all: the index cannot have been translated.
     assert b"\r" not in (root / "index.json").read_bytes()
     assert b"\n" not in (root / "index.json").read_bytes()
@@ -259,7 +273,8 @@ def test_m2_lock_record_and_placeholder_are_byte_exact(tmp_path):
 
 
 def _write_owner(root: Path, *, pid: int, token: str, state: str = "held") -> None:
-    (root / "LOCK").write_text(
+    # The owner record is a SEPARATE, never-locked file (F1 of REWORK-2).
+    (root / "OWNER.json").write_text(
         json.dumps(
             {
                 "schema": rs.LOCK_SCHEMA,
@@ -368,6 +383,15 @@ def test_m2_live_owner_lock_is_never_retried_into_success(tmp_path, monkeypatch)
             time.sleep(0.02)
         assert ready.exists(), "holder never acquired the lock"
 
+        # F1 (REWORK-2): the owner record MUST be readable while another
+        # process holds the lock. It lives outside the locked byte range, so no
+        # PermissionError is possible here (that was the Windows defect).
+        peeked = rs.StoreLock.peek_owner(root)
+        assert peeked is not None, "owner record unreadable while the lock is held"
+        assert peeked["state"] == "held"
+        assert int(peeked["pid"]) == int(child.pid)
+        assert rs.StoreLock.peek_owner(root / "LOCK") == peeked
+
         started = time.monotonic()
         with pytest.raises(rs.StoreLockError) as err:
             rs.RunCellStore.open(root, identity=None)
@@ -387,3 +411,24 @@ def test_m2_live_owner_lock_is_never_retried_into_success(tmp_path, monkeypatch)
         assert store.report()["lock_info"]["orphan_recovered"] is True
     finally:
         store.close()
+
+
+def test_m2_peek_owner_never_reads_the_locked_file(tmp_path, monkeypatch):
+    root = tmp_path / "run"
+    rs.RunCellStore.open(root, identity=identity()).close()
+
+    real_read_bytes = Path.read_bytes
+    touched: list[str] = []
+
+    def guarded(self):
+        touched.append(str(self))
+        if self.name == "LOCK":
+            raise PermissionError(13, "simulated Windows locked range")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded)
+    record = rs.StoreLock.peek_owner(root)
+    assert record is not None and record["state"] == "released"
+    assert not [p for p in touched if Path(p).name == "LOCK"], (
+        "the supported accessor must never touch the locked LOCK file"
+    )
