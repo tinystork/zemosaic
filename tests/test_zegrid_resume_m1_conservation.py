@@ -158,6 +158,33 @@ def _require_expected(run: dict, expected, context: str):
     return exc
 
 
+def _is_cell_batch_worker(worker) -> bool:
+    return getattr(worker, "__name__", None) == "_stack_cell"
+
+
+def _advance_generation_on_cell_batch(
+    *, worker, counter, trigger_at, registry_instances, reason="mid_wave_test"
+) -> bool:
+    """Count CELL-BATCH pmap calls only; advance on the intended one.
+
+    The product also uses ``zpar.pmap`` for cache-frame work. Counting every
+    call made the mid-wave injection land on a non-wave/pre-registry call.
+    """
+    if not _is_cell_batch_worker(worker):
+        return False
+    counter["n"] += 1
+    if not trigger_at or counter["n"] != int(trigger_at):
+        return False
+    if not registry_instances:
+        raise AssertionError(
+            "mid-wave injection reached the intended cell-batch pmap but the "
+            "run registry does not exist yet"
+        )
+    for reg in registry_instances:
+        reg.advance_generation(reason=reason)
+    return True
+
+
 def _run_m1(
     *,
     base: Path,
@@ -188,6 +215,7 @@ def _run_m1(
     accept_attempts = {"n": 0}
     gpu_calls = {"n": 0}
     pmap_calls = {"n": 0}
+    cell_batch_pmap_calls = {"n": 0}
 
     live = int(live_available or _live_available_bytes())
     env_live = os.environ.get("ZEMOSAIC_M1_LIVE_AVAILABLE_BYTES")
@@ -260,15 +288,16 @@ def _run_m1(
         real_pmap = zz.zpar.pmap
 
         def _pmap(*args, **kwargs):
+            worker = args[0] if args else kwargs.get("worker")
             pmap_calls["n"] += 1
             out = real_pmap(*args, **kwargs)
-            if (
-                advance_after_pmap_call
-                and pmap_calls["n"] == int(advance_after_pmap_call)
-                and registry_instances
+            if advance_after_pmap_call and _advance_generation_on_cell_batch(
+                worker=worker,
+                counter=cell_batch_pmap_calls,
+                trigger_at=int(advance_after_pmap_call),
+                registry_instances=registry_instances,
+                reason="mid_wave_test",
             ):
-                for reg in registry_instances:
-                    reg.advance_generation(reason="mid_wave_test")
                 hits["generation"] = True
             return out
 
@@ -380,6 +409,7 @@ def _run_m1(
         "exception": exc,
         "out_dir": out_dir,
         "pmap_calls": int(pmap_calls["n"]),
+        "cell_batch_pmap_calls": int(cell_batch_pmap_calls["n"]),
         "effective_high": int(effective_high),
         "effective_low": int(effective_low),
     }
@@ -638,7 +668,13 @@ def test_m1_mid_wave_generation_transition_rejects_old_results(tmp_path):
     )
     # TEST-ONLY smaller waves make this deterministic on an adequate-memory
     # host; product workers/budget/scheduling are unchanged.
-    assert run["pmap_calls"] >= 2, run
+    if run["cell_batch_pmap_calls"] < 2:
+        pytest.fail(
+            "mid-wave injection did not arm: "
+            f"cell_batch_pmaps={run['cell_batch_pmap_calls']}, "
+            f"all_pmaps={run['pmap_calls']}, force_wave_size=2, "
+            f"accepted={run.get('accepted_cells')}, hits={run.get('hits')}"
+        )
     exc = run["exception"]
     _require_expected(
         run, zz._R55RunRefused, "the mid-wave generation transition"
@@ -732,3 +768,57 @@ def test_require_expected_accepts_only_the_expected_terminal():
         zz._R55RunConservedResults,
         "matched case",
     ) is expected
+
+
+def test_mid_wave_injection_counts_only_cell_batch_pmaps():
+    """The injection must ignore cache-frame pmap calls.
+
+    A fake interleaved sequence proves the trigger fires on the 2nd
+    ``_stack_cell`` batch, not on unrelated ``_cell_cache_frame_worker`` calls,
+    and fails closed if no registry exists when the trigger is reached.
+    """
+
+    class _FakeRegistry:
+        def __init__(self):
+            self.advanced = 0
+
+        def advance_generation(self, reason):
+            self.advanced += 1
+
+    def _stack_cell():
+        return None
+
+    def _cell_cache_frame_worker():
+        return None
+
+    counter = {"n": 0}
+    registry = _FakeRegistry()
+    fired = []
+    for worker in (
+        _cell_cache_frame_worker,
+        _stack_cell,
+        _cell_cache_frame_worker,
+        _cell_cache_frame_worker,
+        _stack_cell,
+        _stack_cell,
+    ):
+        if _advance_generation_on_cell_batch(
+            worker=worker,
+            counter=counter,
+            trigger_at=2,
+            registry_instances=[registry],
+            reason="unit",
+        ):
+            fired.append(counter["n"])
+
+    assert counter["n"] == 3  # three cell batches, three cache-frame calls ignored
+    assert fired == [2]  # fired exactly on the second cell batch
+    assert registry.advanced == 1
+    with pytest.raises(AssertionError):
+        _advance_generation_on_cell_batch(
+            worker=_stack_cell,
+            counter={"n": 0},
+            trigger_at=1,
+            registry_instances=[],
+            reason="unit",
+        )

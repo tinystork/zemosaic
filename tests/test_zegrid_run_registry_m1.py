@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import pickle
 import sys
+import time
 import weakref
 from pathlib import Path
 
@@ -24,6 +25,24 @@ for path in (SRC, TESTS):
         sys.path.insert(0, str(path))
 
 from zemosaic.core.zegrid import run_registry as zrr  # noqa: E402
+
+
+def _release_then_unlink(path: Path, *refs) -> None:
+    """Best-effort Windows teardown: drop local refs, collect, then unlink.
+
+    On Windows an open np.memmap mapping cannot be unlinked (WinError 32). The
+    assertions have already run; cleanup must never mask them. tmp_path cleanup
+    owns the file if it remains briefly mapped.
+    """
+    del refs
+    for _ in range(3):
+        gc.collect()
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+
 
 H, W = 8, 10
 CH = 3
@@ -253,8 +272,8 @@ def test_memmap_slice_counts_the_mapping_once(tmp_path):
     assert counts["retained_bytes"] >= mm.nbytes
     assert reg.metadata("r0000c0000")["retained_bytes"] >= mm.nbytes
     reg.dispose()
-    del first, second, mm
-    path.unlink(missing_ok=True)
+    del first, second, mm, res
+    _release_then_unlink(path)
 
 
 def test_memoryview_slice_follows_obj_to_full_owner():
@@ -461,8 +480,8 @@ def test_memmap_is_declared_and_counted_conservatively(tmp_path):
     assert counts["memmap_bytes"] >= mm.nbytes
     assert counts["retained_bytes"] >= mm.nbytes
     reg.dispose()
-    del mm
-    path.unlink(missing_ok=True)
+    del mm, res
+    _release_then_unlink(path)
 
 
 def test_out_of_order_acceptance_returns_canonical_payload_order():
