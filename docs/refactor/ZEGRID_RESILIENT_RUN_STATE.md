@@ -1,10 +1,12 @@
-## Current status — M2 correction directe Junior (2026-10-27, non commité)
+## Current status — M2 QUALIFIÉ (banc Windows réel, 27/10 23:26Z)
 
-M2 toujours NON ACCEPTÉ. Base 6dd0a62 (publiée). Corrections locales non commitées:
-- géométrie patch (bounds/core_slice) persistée et revalidée; anciens commits incomplets refusés;
-- garde anti-interblocage GC (RLock) + régression;
-- les erreurs réelles des run avec store ne sont plus masquées par un skip large.
-Validation Linux: 145 passés / 0 échec / 8 skip RAM. Les deux cas d'orchestration réelle restent NOT_RUN. Prochaine étape: revue Nono puis banc Windows zéro-skip (le KeyError bounds est cross-platform). Les entrées ci-dessous sont historiques.
+- Banc `m2_20261027_232620`: `status=PASS`, exit 0, 153 tests, **0 skip**, 0 échec, plafond artefacts non atteint (1 605 B).
+- Suites: store contract 48, I/O 8, kill matrix 20 (4 étapes × 5 itérations, processus réel tué), identity seam 6, bench diagnostics 5, **real store run 12 (dont les 2 cas d'orchestration réelle)**, M1 registry 23, M1 conservation 10, M0 witness 1, M0 harness 20.
+- Source exécutée: HEAD `d5b2db1` (feature), arbre propre, hashes avant==après (aucune mutation pendant le run). Verrous OS réels `msvcrt`/`TerminateProcess` et renommage NTFS exercés.
+- Périmètre qualifié: store durable par cellule — commits atomiques (objet → fsync → vérif → rename → index reconstructible), verrou mono-écrivain avec propriétaire, intégrité sha256, budget disque, libération des gros tableaux après commit, géométrie patch persistée et revalidée. Modes **control-only CPU** (pas de GPU).
+- NON qualifié / NON mesuré: GPU et science GPU, parité produit installé, A/B science sans pression, ENOSPC sur volume réellement plein (injecté par fault hook), coupure électrique (kill processus ≠ perte de courant).
+- Corrections de cette étape: géométrie `bounds`/`core_slice` persistée (KeyError cross-platform), interblocage GC du finaliseur (RLock), nom de sortie science réel (`mosaic_grid.fits`), erreurs réelles non masquées.
+- Conclusion: **M2 accepté et qualifié dans son périmètre déclaré.** M3 (attente ressources / générations) peut démarrer sur accord.
 
 # ZeGrid resilient run — project state
 
