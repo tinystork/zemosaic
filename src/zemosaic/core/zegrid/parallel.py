@@ -1372,6 +1372,7 @@ class BufferLedger:
         self._disk_leases: dict[int, int] = {}
         self._next_lease = 1
         self._wait_events = 0
+        self._wait_started_events = 0
         self._wait_s = 0.0
         self._reconciliations = 0
         self._surplus_released_bytes = 0
@@ -1524,6 +1525,7 @@ class BufferLedger:
                 if not waited:
                     waited = True
                     started = float(self._clock())
+                    self._wait_started_events += 1
                 self._cond.wait(poll_s)
             if waited:
                 self._wait_events += 1
@@ -1569,6 +1571,7 @@ class BufferLedger:
                 "device_leases": len(self._device_leases),
                 "disk_leases": len(self._disk_leases),
                 "credit_wait_events": int(self._wait_events),
+                "credit_wait_started_events": int(self._wait_started_events),
                 "credit_wait_s": float(self._wait_s),
                 "reconciliations": int(self._reconciliations),
                 "surplus_released_bytes": int(self._surplus_released_bytes),
@@ -1707,6 +1710,11 @@ class BoundedPipeline:
         )
         self._queue: "queue.Queue" = queue.Queue(maxsize=self._queue_max)
         self._cancel = threading.Event()
+        # ZM-ZEGRID-RESILIENT-RUN-RESUME M3: admission gate. When set, the
+        # producer starts no new unit (before credit OR allocation). It is a
+        # one-way latch for a recovery episode; cancellation remains separate.
+        self._admission_stopped = threading.Event()
+        self._admission_reason: str | None = None
         self._producer_error: BaseException | None = None
         self._consumer_error: BaseException | None = None
         self._cleanup_failures: list[str] = []
@@ -1761,8 +1769,34 @@ class BoundedPipeline:
         with self._ledger._cond:  # noqa: SLF001 - same-module primitive
             self._ledger._cond.notify_all()  # noqa: SLF001
 
+    def stop_admission(self, reason: str = "resource_pressure") -> None:
+        """Stop admitting NEW units; idempotent and independent of cancel().
+
+        M3 uses this at the first safe point of a pressure episode. The
+        producer re-checks it before acquiring credit and before allocating, so
+        no speculative unit starts after the decision. Work already produced is
+        released by the ordinary cancellation/drain path, never leaked.
+        """
+        if not self._admission_stopped.is_set():
+            self._admission_reason = str(reason)
+            self._admission_stopped.set()
+
+    def admission_stopped(self) -> bool:
+        return bool(self._admission_stopped.is_set())
+
+    def cancelled(self) -> bool:
+        """True once the one-way cancellation latch is set."""
+        return bool(self._cancel.is_set())
+
+    def ledger_snapshot(self) -> dict:
+        """Thread-safe snapshot of the credit ledger (M3 release proof)."""
+        return self._ledger.snapshot()
+
     def _cancelled(self) -> bool:
         return bool(self._cancel.is_set())
+
+    def _admission_closed(self) -> bool:
+        return bool(self._cancelled() or self._admission_stopped.is_set())
 
     def _sample_queue(self) -> int:
         depth = int(self._queue.qsize())
@@ -1800,9 +1834,11 @@ class BoundedPipeline:
     def _put(self, unit) -> None:
         """Bounded put that honours cancellation (no unbounded blocking)."""
         while True:
-            if self._cancelled():
+            if self._admission_closed():
                 self._release_unit(unit)
-                raise PipelineCancelled("producer cancelled before enqueue")
+                raise PipelineCancelled(
+                    "producer admission closed before enqueue"
+                )
             started = float(self._clock())
             try:
                 self._queue.put(unit, timeout=0.05)
@@ -1892,13 +1928,16 @@ class BoundedPipeline:
     def _producer_run(self) -> None:
         try:
             for index, task in enumerate(self._tasks):
-                if self._cancelled():
+                if self._admission_closed():
                     return
                 self._producer_task_index = int(index)
                 self._producer_task_started_at = float(self._clock())
                 # F1: credit FIRST, allocation second. A refusal/cancel here
                 # happens before any cache write or buffer materialisation.
                 pre = self._pre_acquire(task)
+                if self._admission_closed():
+                    self._release_pre(pre)
+                    return
                 _produce_started = float(self._clock())
                 try:
                     payload = self._produce(task)
@@ -1953,7 +1992,7 @@ class BoundedPipeline:
                 # not successful enqueues: every owned payload is released, so
                 # produced == released on any terminal path that finishes.
                 self._produced += 1
-                if self._cancelled():
+                if self._admission_closed():
                     self._release_unit(unit)
                     return
                 try:
@@ -2105,20 +2144,53 @@ class BoundedPipeline:
 
     # -- run ---------------------------------------------------------------
 
-    def _drain(self) -> None:
+    def _drain(self) -> dict:
+        units = 0
         while True:
             try:
                 unit = self._queue.get_nowait()
             except queue.Empty:
-                return
+                return {"units": int(units)}
             if isinstance(unit, dict) and unit.get("sentinel"):
                 continue
             try:
                 self._release_unit(unit)
+                units += 1
             except BaseException as exc:  # noqa: BLE001
                 self._cleanup_failures.append(
                     f"drain_release:{type(exc).__name__}:{exc}"
                 )
+
+    def drain_speculative(self) -> dict:
+        """Drain queued units and report the credits ACTUALLY released.
+
+        Safe to call from the recovery thread while the pipeline is still
+        ending: it only touches the queue and the ledger, both thread-safe. A
+        unit currently held by the consumer is NOT drained here; the caller
+        must wait for the consumer to relinquish it (the ledger snapshot says
+        whether the pipeline is balanced).
+        """
+        before = self._ledger.snapshot()
+        drained = self._drain()
+        after = self._ledger.snapshot()
+        return {
+            "drained_units": int(drained["units"]),
+            "cancelled_units": 0,
+            "host_released_bytes": max(
+                0,
+                int(before["host_used_bytes"]) - int(after["host_used_bytes"]),
+            ),
+            "device_released_bytes": max(
+                0,
+                int(before["device_used_bytes"])
+                - int(after["device_used_bytes"]),
+            ),
+            "disk_released_bytes": max(
+                0,
+                int(before["disk_used_bytes"]) - int(after["disk_used_bytes"]),
+            ),
+            "credits_balanced": bool(after["balanced"]),
+        }
 
     def _join_producer(self) -> bool:
         """Finite-bound join used ONLY after a terminal state."""

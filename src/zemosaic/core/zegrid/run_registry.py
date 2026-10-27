@@ -773,6 +773,10 @@ class CooperativeStopChannel:
     def wait_ack(self, timeout: float | None = None) -> bool:
         return bool(self._acked.wait(timeout))
 
+    def wait_requested(self, timeout: float | None = None) -> bool:
+        """Wait for a cooperative stop request (M3 resource wait)."""
+        return bool(self._requested.wait(timeout))
+
     def snapshot(self) -> dict:
         with self._lock:
             return {

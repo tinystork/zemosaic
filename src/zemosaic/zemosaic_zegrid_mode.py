@@ -115,6 +115,7 @@ from .core.zegrid import resource_envelope as renv
 from .core.zegrid import runtime_control as zrt
 from .core.zegrid import run_registry as zrr
 from .core.zegrid import run_store as zrs
+from .core.zegrid import resource_recovery as zrec
 from .core.zegrid import scheduler as zsched
 from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
@@ -9298,6 +9299,90 @@ def _r55_open_run_store(store_dir, *, identity, budget_bytes, session_id):
     return store, None
 
 
+class _M3RegistryStopEvent:
+    """threading.Event-like view over the M1 cooperative stop channel.
+
+    The resource waiter only needs ``is_set()`` and ``wait(delay)``; the stop
+    channel already owns a thread event, so no polling bridge is introduced.
+    """
+
+    def __init__(self, channel):
+        self._channel = channel
+
+    def is_set(self) -> bool:
+        return bool(getattr(self._channel, "requested", False))
+
+    def wait(self, timeout=None) -> bool:
+        waiter = getattr(self._channel, "wait_requested", None)
+        if waiter is None:  # pragma: no cover - spawn endpoint
+            return bool(self.is_set())
+        return bool(waiter(timeout))
+
+
+def _r55_m3_required_raw(aggregate_bytes) -> int:
+    """Raw available memory needed for the 90 % RUN budget to cover a peak."""
+    peak = max(0, int(aggregate_bytes))
+    if peak <= 0:
+        return 1
+    return max(1, (peak * rcontract.ADMIT_FACTOR_DEN + rcontract.ADMIT_FACTOR_NUM - 1)
+               // rcontract.ADMIT_FACTOR_NUM)
+
+
+def _r55_m3_observation_from_facts(facts) -> dict:
+    """Project one validated RUN fact set into the M3 observation contract."""
+    host = facts["host"]
+    sampled_ns = int(facts.get("sampled_monotonic_ns", 0) or 0)
+    return {
+        "raw_available_bytes": int(host["raw_available_bytes"]),
+        "observed_monotonic": (
+            float(sampled_ns) / 1_000_000_000.0
+            if sampled_ns > 0 else float(time.monotonic())
+        ),
+        "source": str(host.get("source", "run_checkpoint")),
+    }
+
+
+def _r55_m3_make_coordinator(
+    *, result_registry, probe, profile_requested, profile_effective,
+):
+    """Build the M3 coordinator for one run (opt-in recovery seam).
+
+    At a CPU wave boundary there is NO speculative work left to cancel: the
+    wave has returned and every accepted payload is immutable, already owned by
+    the registry/store. Releasing it would destroy validated cells. The release
+    report therefore states the real facts: admission is stopped, zero units
+    are speculative, and the credit ledger is balanced. The caller must only
+    enable the wait after that boundary (never with an in-flight consumer).
+    """
+
+    def _release():
+        return zrec.ReleaseReport(
+            stopped_admission=True,
+            cancelled_units=0,
+            drained_units=0,
+            credits_balanced=True,
+            notes=[
+                "safe CPU wave boundary: accepted payloads are immutable and "
+                "retained; no speculative unit or staging lease is owned"
+            ],
+        )
+
+    return zrec.RecoveryCoordinator(
+        run_id=str(result_registry.run_id),
+        release=_release,
+        probe=probe,
+        stop_event=_M3RegistryStopEvent(result_registry.stop),
+        profile=zrec.StorageProfilePolicy(
+            requested=str(profile_requested),
+            effective=str(profile_effective),
+        ),
+        initial_interval_s=zrec.PROBE_INITIAL_INTERVAL_S,
+        max_interval_s=zrec.PROBE_MAX_INTERVAL_S,
+        required_observations=zrec.REQUIRED_ADMISSIBLE_OBSERVATIONS,
+        min_spacing_s=zrec.MIN_ADMISSIBLE_SPACING_S,
+    )
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -10833,6 +10918,35 @@ def _run_single(
         # ONE persistent latch for the whole RUN. A mid-wave sample is only a
         # candidate for the NEXT safe boundary; it never mutates this wave.
         latch = zrt.PressureLatch()
+        # M3 (opt-in): a cancellable WAITING_RESOURCES episode at the wave
+        # boundary. Off by default so the qualified M1/M2 refusal semantics are
+        # unchanged unless the caller explicitly asks for resource waiting.
+        _m3_coordinator = None
+        if (
+            result_registry is not None
+            and bool(
+                getattr(
+                    zconfig, "zegrid_resource_recovery_enabled", False
+                )
+            )
+        ):
+            try:
+                _m3_coordinator = _r55_m3_make_coordinator(
+                    result_registry=result_registry,
+                    probe=lambda: _r55_m3_observation_from_facts(
+                        _r55_run_checkpoint_sample(disk_root)
+                    ),
+                    profile_requested=_STORAGE_REQUESTED,
+                    profile_effective=_STORAGE_EFFECTIVE,
+                )
+            except Exception as _m3_build_exc:  # fail closed to the refusal
+                _m3_coordinator = None
+                _emit(
+                    "ZeGrid: M3 resource recovery could not be armed — "
+                    f"{type(_m3_build_exc).__name__}: {_m3_build_exc}. "
+                    "The qualified refusal path is kept.",
+                    lvl="ERROR", callback=progress_callback,
+                )
 
         def _bounded_run_recovery(*, wave_index, offset, remaining_units, record,
                                   governing_fact, fresh_facts,
@@ -11167,9 +11281,14 @@ def _run_single(
                     # Fencing groundwork: results from the pre-recovery plan are
                     # older than the new generation and can no longer be
                     # accepted; the accepted prefix itself stays immutable.
-                    result_registry.advance_generation(
-                        reason="dense_to_bounded_storage"
-                    )
+                    if _m3_fence is not None:
+                        _m3_fence.advance(
+                            reason="dense_to_bounded_storage"
+                        )
+                    else:
+                        result_registry.advance_generation(
+                            reason="dense_to_bounded_storage"
+                        )
                 checkpoints.append({
                     "schema": zrt.RUN_CONTROL_SCHEMA,
                     "stage": _R55E1_RUN_STAGE,
@@ -11200,11 +11319,154 @@ def _run_single(
                         latched=latched_fact,
                     )
                 except _R55RunRefused as exc2:
-                    _terminalize_refusal(
-                        exc2, wave_index=wave_index, offset=offset,
-                        fallback_exhausted=True,
-                    )
-                    raise
+                    # M3 (opt-in): after the ONE bounded profile retry, a real
+                    # host-RAM shortage may be waited out instead of failing the
+                    # run. The release happens first (no speculative unit at a
+                    # wave boundary), then two spaced admissible observations are
+                    # required before the SAME checkpoint is re-evaluated.
+                    if (
+                        _m3_coordinator is not None
+                        and str(exc2.reason_code)
+                        == str(renv.REASON_REFUSE_HOST_RAM)
+                    ):
+                        _aggregate = int(bundle.envelope.aggregate_bytes)
+                        _deadline = getattr(
+                            zconfig,
+                            "zegrid_resource_recovery_deadline_s",
+                            None,
+                        )
+                        _deadline = (
+                            None if not _deadline else float(_deadline)
+                        )
+                        try:
+                            _m3_out = _m3_coordinator.recover(
+                                facts=_r55_m3_observation_from_facts(facts),
+                                phase=f"run_wave_{int(wave_index)}",
+                                reason_code=str(exc2.reason_code),
+                                detail=str(exc2.detail),
+                                minimum_bytes=_r55_m3_required_raw(_aggregate),
+                                structural_minimum_bytes=_aggregate,
+                                structural_capacity_bytes=(
+                                    int(facts["host"]["total_bytes"])
+                                    if facts.get("host", {}).get(
+                                        "total_bytes"
+                                    ) is not None
+                                    else None
+                                ),
+                                wait=True,
+                                deadline_s=_deadline,
+                            )
+                        except zrec.CapacityWaitCancelled as _m3_stop:
+                            result_registry.acknowledge_stop(
+                                "STOPPED_RESUMABLE",
+                                f"M3 stop during wave {int(wave_index)}",
+                            )
+                            raise _R55RunStopRequested(
+                                str(_m3_stop),
+                                record={
+                                    "schema": zrt.RUN_CONTROL_SCHEMA,
+                                    "stage": "stop",
+                                    "status": "stopped_resumable",
+                                    "wave_index": int(wave_index),
+                                    "resource_wait": _m3_coordinator.snapshot(),
+                                    "result_registry": (
+                                        result_registry.snapshot()
+                                    ),
+                                    "durable_stopped_resumable": False,
+                                    "note": (
+                                        "M3 wait cancelled; committed cells "
+                                        "remain valid, no relaunch"
+                                    ),
+                                },
+                                result_registry=result_registry,
+                            ) from _m3_stop
+                        except (
+                            zrec.StructuralCapacityRefused,
+                            zrec.CapacityWaitDeadline,
+                        ) as _m3_stop:
+                            exc2.record["m3_recovery"] = {
+                                "status": (
+                                    "capacity_infeasible"
+                                    if isinstance(
+                                        _m3_stop,
+                                        zrec.StructuralCapacityRefused,
+                                    )
+                                    else "stopped_resumable"
+                                ),
+                                "detail": str(_m3_stop),
+                                "coordinator": _m3_coordinator.snapshot(),
+                            }
+                            if isinstance(
+                                _m3_stop, zrec.CapacityWaitDeadline
+                            ):
+                                result_registry.acknowledge_stop(
+                                    "STOPPED_RESUMABLE",
+                                    str(_m3_stop),
+                                )
+                            _terminalize_refusal(
+                                exc2,
+                                wave_index=wave_index,
+                                offset=offset,
+                                fallback_exhausted=True,
+                            )
+                            raise
+                        except zrec.RecoveryError as _m3_err:
+                            exc2.record["m3_recovery"] = {
+                                "status": "failed",
+                                "detail": (
+                                    f"{type(_m3_err).__name__}: {_m3_err}"
+                                ),
+                                "coordinator": _m3_coordinator.snapshot(),
+                            }
+                            _terminalize_refusal(
+                                exc2,
+                                wave_index=wave_index,
+                                offset=offset,
+                                fallback_exhausted=True,
+                            )
+                            raise
+                        else:
+                            checkpoints.append({
+                                "schema": zrt.RUN_CONTROL_SCHEMA,
+                                "stage": _R55E1_RUN_STAGE,
+                                "wave_index": int(wave_index),
+                                "status": "resource_readmitted",
+                                "remaining_units": int(remaining_units),
+                                "reason_code": renv.REASON_REFUSE_HOST_RAM,
+                                "detail": (
+                                    "resource wait readmitted after two spaced "
+                                    "admissible observations; same geometry, "
+                                    "same science, same accepted prefix"
+                                ),
+                                "m3_recovery": _m3_out.to_dict(),
+                            })
+                            try:
+                                checkpoint = _r55_run_checkpoint(
+                                    decision=run_decision,
+                                    candidate=candidate,
+                                    mapping=mapping,
+                                    bundle=bundle,
+                                    remaining_units=remaining_units,
+                                    wave_index=wave_index,
+                                    facts=_r55_run_checkpoint_sample(
+                                        disk_root
+                                    ),
+                                    latched=latched_fact,
+                                )
+                            except _R55RunRefused as exc3:
+                                _terminalize_refusal(
+                                    exc3,
+                                    wave_index=wave_index,
+                                    offset=offset,
+                                    fallback_exhausted=True,
+                                )
+                                raise
+                    else:
+                        _terminalize_refusal(
+                            exc2, wave_index=wave_index, offset=offset,
+                            fallback_exhausted=True,
+                        )
+                        raise
 
             bundle = checkpoint["bundle"]
             candidate = checkpoint["candidate"]
@@ -11256,18 +11518,48 @@ def _run_single(
                     for _index in range(len(wave_results)):
                         _r = wave_results[_index]
                         _cid = str(_r.get("cell_id", ""))
+                        _attempt = (
+                            f"cpu-wave:{int(wave_generation)}:"
+                            f"{wave_index}:{_cid}"
+                        )
                         try:
-                            _receipt = result_registry.accept(
-                                _r,
-                                backend=str(
-                                    _r.get("backend_used") or "cpu"
-                                ),
-                                plan_generation=int(wave_generation),
-                                attempt_id=(
-                                    f"cpu-wave:{int(wave_generation)}:"
-                                    f"{wave_index}:{_cid}"
-                                ),
-                            )
+                            if _m3_fence is not None:
+                                _env = zrec.TaskGeneration(
+                                    run_id=str(result_registry.run_id),
+                                    cell_id=_cid,
+                                    attempt_id=_attempt,
+                                    plan_generation=int(wave_generation),
+                                )
+                                _out = _m3_fence.accept(
+                                    _env,
+                                    _r,
+                                    backend=str(
+                                        _r.get("backend_used") or "cpu"
+                                    ),
+                                )
+                                if not _out.accepted:
+                                    # A late result from a cancelled plan is
+                                    # never published; the run stays healthy.
+                                    _emit(
+                                        "ZeGrid: CPU result for "
+                                        f"{_cid} rejected by the M3 "
+                                        f"generation fence ({_out.reason}) — "
+                                        "not published",
+                                        lvl="WARN",
+                                        callback=progress_callback,
+                                    )
+                                    wave_results[_index] = None
+                                    continue
+                                _receipt = _out.receipt
+                            else:
+                                _receipt = result_registry.accept(
+                                    _r,
+                                    backend=str(
+                                        _r.get("backend_used") or "cpu"
+                                    ),
+                                    plan_generation=int(wave_generation),
+                                    attempt_id=_attempt,
+                                )
                         except zrr.RunRegistryError as _reg_exc:
                             _emit(
                                 "ZeGrid: CPU result acceptance failed for "
@@ -11832,15 +12124,40 @@ def _run_single(
             unit_index = int(payload.get("_unit_index", 0))
             cid = str((result or {}).get("cell_id", ""))
             try:
-                receipt = result_registry.accept(
-                    result,
-                    backend=str(result.get("backend_used") or "gpu"),
-                    plan_generation=int(gpu_dispatch_generation),
-                    attempt_id=(
-                        f"gpu-pipeline:{int(gpu_dispatch_generation)}:"
-                        f"{unit_index}:{cid}"
-                    ),
-                )
+                if _m3_fence is not None:
+                    _env = zrec.TaskGeneration(
+                        run_id=str(result_registry.run_id),
+                        cell_id=cid,
+                        attempt_id=(
+                            f"gpu-pipeline:{int(gpu_dispatch_generation)}:"
+                            f"{unit_index}:{cid}"
+                        ),
+                        plan_generation=int(gpu_dispatch_generation),
+                    )
+                    _out = _m3_fence.accept(
+                        _env,
+                        result,
+                        backend=str(result.get("backend_used") or "gpu"),
+                    )
+                    if not _out.accepted:
+                        return {
+                            "_registry_receipt": True,
+                            "accepted": False,
+                            "reason": _out.reason,
+                            "cell_id": cid,
+                            "detail": _out.detail,
+                        }
+                    receipt = _out.receipt
+                else:
+                    receipt = result_registry.accept(
+                        result,
+                        backend=str(result.get("backend_used") or "gpu"),
+                        plan_generation=int(gpu_dispatch_generation),
+                        attempt_id=(
+                            f"gpu-pipeline:{int(gpu_dispatch_generation)}:"
+                            f"{unit_index}:{cid}"
+                        ),
+                    )
             except (
                 zrr.StaleGenerationError,
                 zrr.FutureGenerationError,
@@ -12959,6 +13276,17 @@ def _run_single(
                 or "global"
             ),
         )
+    # M3: the generation fence is the single publication gate for task/payload
+    # identity (run_id, cell_id, attempt_id, plan_generation). It delegates to
+    # the M1 registry and never adopts a late result from a cancelled plan.
+    _m3_fence = (
+        None
+        if result_registry is None
+        else zrec.GenerationFence(
+            run_id=str(result_registry.run_id),
+            registry=result_registry,
+        )
+    )
     # M2: OPTIONAL durable per-cell store. It is enabled ONLY when the caller
     # configures an explicit run-store directory. Opening/committing never
     # changes the science, the budgets, the floors or the final publication; a
