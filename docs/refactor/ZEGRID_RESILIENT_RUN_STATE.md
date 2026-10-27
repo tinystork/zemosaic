@@ -1,12 +1,10 @@
-## Current status — M3 code ACCEPTÉ (ACCEPT-WITH-CONDITIONS, conditions remplies)
+## Current status — M4 code ACCEPTÉ (ACCEPT-WITH-CONDITIONS, qualification NOT_RUN)
 
-Nono review-0 = ACCEPT-WITH-CONDITIONS, aucun HIGH/MEDIUM. Conditions remplies: correctif d'alias `zrej` committé SÉPARÉMENT (`0f3584d`), défaut-off prouvé (M1/M2 verts sans le flag, 105 passed/6 skip), NOT_RUN documentés. Feature M3 commitée `1a6ebbb` ; les deux poussés sur `feat/zegrid-resilient-run-resume`. beta=231b597, main=434961a inchangées.
+Nono review-0 = ACCEPT-WITH-CONDITIONS, aucun HIGH/MEDIUM. M4 (reprise de run) commitée `1801d70` et poussée sur `feat/zegrid-resilient-run-resume`. Jauge complète + géométrie figée persistées et RESTAURÉES (jamais re-dérivées); mismatch => ResumeIncompatible; reprise sur ensemble clairsemé; run complet no-op; never par défaut; politique dense→bounded restaurée.
 
-Périmètre M3: boucle de pression opt-in (`zegrid_resource_recovery_enabled`, défaut false) — stop admission/prefetch, drain/annulation du spéculatif non committé, libération réelle crédits/staging avant attente, réduction sur faits frais, AUTO→bounded sens unique (GPU conservé si admissible), WAITING_RESOURCES léger et annulable, réadmission après 2 observations espacées, retries bornés, fence de génération (résultat tardif jamais accepté). Chemin M1/M2 qualifié préservé par défaut.
+NON QUALIFIÉ (NOT_RUN, déclaré): chemin produit complet _run_single de reprise, GPU, Windows, pression RAM réelle, FITS réelle. Kill seam produit DIFFÉRÉ à M7 (décision architecte). La reprise réelle n'est PAS revendiquée; reprise reste défaut `never` sans qualification dédiée.
 
-NON QUALIFIÉ (NOT_RUN): GPU, Windows, **pression mémoire OS réelle** (tests M3 instrumentés avec sonde RAM injectée, pas une pression physique), CUDA OOM, marqueur STOPPED_RESUMABLE (frontière M4), mélange CPU/GPU. Recovery GPU mid-pipeline différée à M4.
-
-Prochaine porte: qualification de récupération réelle sous pression mémoire sur un hôte admissible (≠ banc M1/M2 simple). M4 non lancé sans accord.
+Prochaine porte: M5 (assemblage reprenable), puis M6 (GUI/CLI + activation), puis M7 (qualification Windows incl. tranche verticale M2–M4 + kill seam produit + pression réelle M3).
 
 # ZeGrid resilient run — project state
 
