@@ -9034,6 +9034,15 @@ _RUN_STORE_PATCH_DTYPES = {
 }
 
 
+class _R55RunStoreIdentityError(RuntimeError):
+    """The durable run identity cannot be built from the real descriptors.
+
+    Explicit by design: never guess a location (no cwd, no basename) and never
+    fingerprint an arbitrary file. The product degrades to M1 conservation with
+    this message recorded as ``open_error`` (stage ``identity_build``).
+    """
+
+
 def _r55_store_plane_contract(gauge_mode) -> dict:
     planes = dict(_RUN_STORE_CORE_DTYPES)
     if str(gauge_mode) == "per_cell":
@@ -9108,23 +9117,37 @@ def _r55_build_run_store_identity(
 
     frames = []
     for order, desc in enumerate(descs or ()):
-        path = str(desc.frame_id.logical_path)
-        content_sha, nbytes = zrs.content_sha256_file(path)
+        # The logical identifier is a PORTABLE scientific id (relative to the
+        # input root); it is not a filesystem location. The real bytes live at
+        # ``source_path`` (the same path the loader uses). Hashing the logical id
+        # was the REWORK-3 defect: it resolved against the process cwd and failed
+        # (or worse, could digest a same-named decoy).
+        logical_id = str(desc.frame_id.logical_path)
+        source_path = getattr(desc, "source_path", None)
+        if not isinstance(source_path, str) or not source_path:
+            raise _R55RunStoreIdentityError(
+                f"durable identity: frame {logical_id!r} exposes no source_path; "
+                "refusing to guess a filesystem location"
+            )
+        try:
+            content_sha, nbytes = zrs.content_sha256_file(source_path)
+        except OSError as exc:
+            raise _R55RunStoreIdentityError(
+                "durable identity: source unreadable for frame "
+                f"{logical_id!r} at {source_path!r}: {exc}"
+            ) from exc
         frames.append(
             {
-                "frame_id": path,
+                "frame_id": logical_id,  # portable id, never an absolute path
                 "content_sha256": content_sha,
                 "nbytes": int(nbytes),
                 "order": int(order),
                 "role": "light",
             }
         )
-    inputs = {
-        "aggregate_sha256": _r55_sha256_json(
-            [[f["frame_id"], f["content_sha256"], f["nbytes"], f["order"]] for f in frames]
-        ),
-        "frames": frames,
-    }
+    # The aggregate is derived from CONTENT rows by the store (relocation-safe);
+    # no absolute source path ever enters the scientific identity.
+    inputs = {"frames": frames}
     layout = dict(getattr(bundle, "layout", {}) or {})
     cell_ids = sorted(str(task[0].cell_id) for task in bundle.cell_tasks)
     bounds = []

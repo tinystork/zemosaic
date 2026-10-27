@@ -12,6 +12,7 @@ and the release of large finished arrays after commit.
 | `m2_io_regression` | `tests/test_zegrid_run_store_m2_io.py` | Windows-only defects: `O_BINARY` at every `os.open` (read and write), byte-exact CRLF-like payload round-trip, byte-exact lock record, bounded orphan-lock recovery (dead owner only) |
 | `m2_kill_matrix` | `tests/test_zegrid_run_store_m2_kill.py` | a child process is KILLED during each of the four write steps (temp write, fsync, commit rename, index), 5 iterations each: only complete commits are recoverable |
 | `m2_identity_seam` | `tests/test_zegrid_resume_m2_identity.py` | the product seam that builds the run identity and opens the store, with realistic shapes (gauge arrays, non-finite values, provenance objects) — catches the REWORK-2 `Mapping` NameError on every platform |
+| `m2_bench_diagnostics` | `tests/test_zegrid_m2_bench_diagnostics.py` | the bench surfaces the real `open_stage`/`open_error` instead of source comments, and the 15-line cap cannot hide a root cause |
 | `m2_real_store_run` | `tests/test_zegrid_resume_m2_store_run.py` | REAL `run_zegrid_mode` CPU path with the store enabled: commit, RAM release, byte-identical reload, unchanged publication |
 | `m1_registry` | `tests/test_zegrid_run_registry_m1.py` | M1 non-regression (ownership/transaction/generation contract) |
 | `m1_conservation` | `tests/test_zegrid_resume_m1_conservation.py` | M1 non-regression (real orchestration conservation) |

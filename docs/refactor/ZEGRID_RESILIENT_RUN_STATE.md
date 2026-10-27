@@ -1,3 +1,19 @@
+## Publication du candidat M2 — autorisée le 2026-10-27
+
+Tristan autorise le commit et le push du correctif REWORK-3 sur `feat/zegrid-resilient-run-resume` uniquement, pour permettre la qualification Windows. Le code, les tests et le banc correspondent exactement au snapshot revu par Nono. Aucun changement sur beta/main. Les mentions « non commité/non publié » ci-dessous décrivent la situation antérieure à cette publication.
+
+M2 reste **NON ACCEPTÉ** : 126 tests Linux réussis, 8 cas non exécutés faute de RAM ; qualification Windows zéro-skip toujours requise. Prochaine étape : récupérer cette branche sous Windows, puis exécuter les contrôles ciblés et le banc complet.
+
+## Current status — M2 code review accepted; Windows qualification BLOCKED
+
+Junior disposition after Nono review-1 (2026-10-27): candidate code accepted with bench pending, **M2 milestone NOT ACCEPTED**. HEAD dae455e0befb06989ae97e7f646d78567c3f187f plus nine expected changed/new files; no commit/push. Nono found no HIGH/MEDIUM; all 13 reviewed hashes independently matched snapshot r1 before this documentation-only update.
+
+Junior independent replay: 126 passed / 0 failed / 8 RAM-gated skips. Two real-store and six M1 conservation cases remain NOT_RUN here. Windows candidate has NOT been transferred or executed: node_exec rejected the access attempt with `Invalid system.run request: raw-command-mismatch`. No alternate transport or retry used. Full Windows exit0/statusPASS/zero-skip is mandatory before M2 acceptance; M3 remains closed.
+
+Minor coverage loss (Path/None halo provenance fixtures) accepted as LOW for this bounded correction: product digest unchanged, Junior standalone serialization/determinism probe passes for both. No fourth corrective iteration justified. Nono wording that no product changed is inaccurate: mode.py identity builder changed, while run_store.py and run_registry.py stayed unchanged.
+
+Next single step: restore normal Windows tool access or arrange explicit manual transfer/execution of this exact candidate, then focused tests and full bench. Candidate is not published; do not run the old Windows checkout expecting the fixes. No beta/installed runtime changes. Historical entries below are superseded.
+
 # ZeGrid resilient run — project state
 
 ## M1 — QUALIFIÉ (banc Windows réel, 27/10 19:42Z)
@@ -208,3 +224,24 @@ reviews. Only then decide whether to start M1. No commit/push authorized.
 - [x] Linux: 39 store-contract + 20 kill-matrix cases pass; M1 (23+4) and M0 (1+20) non-regression pass.
 - [ ] NOT_RUN here: store-enabled real CPU run (2 cases) and M1 real-orchestration (6 cases) — host below the 1,200 MiB corpus floor; **all Windows execution** (bench shipped).
 - [ ] Junior verification + Nono review. Coco does not accept M2.
+
+## M2 — CURRENT state after REWORK-3 (supersedes the earlier M2 line above)
+
+- Active milestone: M2 (durable store) — implemented, **not accepted**.
+- Applied: atomic per-cell commits, reconstructible index, single-writer OS lock
+  (`LOCK` dedicated file + separate `OWNER.json`), sha256 integrity, disk budget,
+  sparse completeness, idempotent `(cell_id, attempt_id)` publication, RAM
+  release after commit; REWORK-1 (`O_BINARY` at every open, bounded dead-owner
+  lock wait); REWORK-2 (lock/owner split, `Mapping` import, open-stage
+  diagnostics); REWORK-3 (identity hashes `source_path` while keeping the
+  portable logical id; faithful lock/PID/binary-site tests; ranked bench
+  diagnostics).
+- Correction: the earlier r2 statement "tests no longer read LOCK at all" was
+  wrong; two direct reads remained and are now removed.
+- Linux evidence: store contract 39, I/O 8, kill 20, identity seam 6, bench
+  diagnostics 5, M1 registry 23, M0 witness/harness 21 — 0 failures. The two
+  real-run store cases and 6 M1 conservation cases remain **NOT_RUN** on this
+  host (RAM floor), never qualified.
+- Pending gates: short Windows focused proofs on the candidate commit, then the
+  full Windows bench (`exit 0`, `status=PASS`, zero skip); Nono review; Junior
+  acceptance. No Windows PASS claim exists.

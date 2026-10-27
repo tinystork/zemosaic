@@ -48,6 +48,7 @@ SUITES = (
     ("m2_io_regression", "tests/test_zegrid_run_store_m2_io.py"),
     ("m2_kill_matrix", "tests/test_zegrid_run_store_m2_kill.py"),
     ("m2_identity_seam", "tests/test_zegrid_resume_m2_identity.py"),
+    ("m2_bench_diagnostics", "tests/test_zegrid_m2_bench_diagnostics.py"),
     ("m2_real_store_run", "tests/test_zegrid_resume_m2_store_run.py"),
     ("m1_registry", "tests/test_zegrid_run_registry_m1.py"),
     ("m1_conservation", "tests/test_zegrid_resume_m1_conservation.py"),
@@ -64,6 +65,7 @@ PROVENANCE_FILES = (
     "tests/test_zegrid_run_store_m2_io.py",
     "tests/test_zegrid_run_store_m2_kill.py",
     "tests/test_zegrid_resume_m2_identity.py",
+    "tests/test_zegrid_m2_bench_diagnostics.py",
     "tests/test_zegrid_resume_m2_store_run.py",
 )
 
@@ -257,35 +259,112 @@ def run_pytest(
     }
 
 
-STORE_DIAGNOSTIC_KEYS = (
-    "r55_durable_store",
-    "durable store",
+#: Structured durable-store signals, ordered by diagnostic value. Bare phrases
+#: like "durable store" also appear in SOURCE COMMENTS and in the test names, so
+#: they are never selected on their own.
+STORE_STRONG_KEYS = (
     "open_error",
     "degraded_reason",
     "open_stage",
+    "r55_durable_store",
+    "durable store did not",
+    "durable store UNAVAILABLE",
+    "durable run store UNAVAILABLE",
+)
+STORE_EXCEPTIONS = (
+    "_R55RunStoreIdentityError",
+    "FileNotFoundError",
+    "StoreFormatError",
+    "StoreIntegrityError",
+    "StoreLockError",
+    "StoreDiskFullError",
+    "StoreIdentityMismatch",
+    "StoreConflictError",
+    "NameError",
+)
+
+
+def _is_source_excerpt(line: str) -> bool:
+    """Reject pytest source echoes and comments (not diagnostics)."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if stripped.startswith(("#", "def ", "class ", "async def ", "@")):
+        return True
+    if stripped.startswith(("assert ", "return ", "from ", "import ")):
+        return True
+    if "about the durable store" in stripped:
+        return True
+    return False
+
+
+ROOT_CAUSE_KEYS = (
+    "durable store did not",
+    "UNAVAILABLE",
+    "identity_build",
+    "FileNotFoundError",
+    "_R55RunStoreIdentityError",
+    "NameError",
+    "No such file",
+    "StoreFormatError",
+    "StoreIntegrityError",
+    "StoreIdentityMismatch",
 )
 
 
 def collect_store_diagnostics(results: list[dict], limit: int = 15) -> list[str]:
-    """Surface the durable-store failure text recorded by the failing suite."""
-    hits: list[str] = []
+    """Surface the REAL durable-store failure text recorded by a failing suite.
+
+    Selection is structured and RANKED, never file-order substring matching:
+    * rank 0 — pytest error lines naming a ROOT CAUSE (identity build, missing
+      file, format/integrity/identity refusal);
+    * rank 1 — non-error lines carrying the same root-cause markers (engine
+      output such as ``durable store UNAVAILABLE — stage=identity_build``);
+    * rank 2 — other pytest error lines with a store signal or store exception;
+    * rank 3 — other store signals (``open_error=``, ``degraded_reason=``...).
+
+    Source comments and code echoes are excluded, and the cap can no longer hide
+    a root cause behind lower-ranked noise.
+    """
+    buckets: dict[int, list[str]] = {0: [], 1: [], 2: [], 3: []}
     for result in results:
         log = result.get("log")
-        if not log or not result.get("failed") and not result.get("errors"):
+        if not log or (not result.get("failed") and not result.get("errors")):
             continue
         try:
             text = Path(log).read_text(errors="replace")
         except OSError:
             continue
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
+        for raw in text.splitlines():
+            stripped = raw.strip()
+            if _is_source_excerpt(stripped):
                 continue
-            if any(key in stripped for key in STORE_DIAGNOSTIC_KEYS):
-                hits.append(f"{result['suite']}: {stripped[:400]}")
-                if len(hits) >= limit:
-                    return hits
-    return hits
+            is_error_line = stripped.startswith("E   ") or stripped.startswith("E  ")
+            payload = stripped[4:].strip() if is_error_line else stripped
+            root_cause = any(key in payload for key in ROOT_CAUSE_KEYS)
+            strong = any(key in payload for key in STORE_STRONG_KEYS)
+            exception = any(name in payload for name in STORE_EXCEPTIONS)
+            if not (root_cause or strong or exception):
+                continue
+            entry = f"{result['suite']}: {payload[:400]}"
+            if root_cause and is_error_line:
+                rank = 0
+            elif root_cause:
+                rank = 1
+            elif is_error_line and (strong or exception):
+                rank = 2
+            else:
+                rank = 3
+            if entry not in buckets[rank]:
+                buckets[rank].append(entry)
+    ordered: list[str] = []
+    for rank in (0, 1, 2, 3):
+        for entry in buckets[rank]:
+            if entry not in ordered:
+                ordered.append(entry)
+            if len(ordered) >= int(limit):
+                return ordered
+    return ordered
 
 
 def decide(results: list[dict], *, cap_exceeded: bool) -> tuple[str, list[str]]:

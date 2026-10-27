@@ -259,3 +259,52 @@ NOT_RUN here (declared, not qualified):
 9. **Retention.** Nothing is auto-deleted. Orphan objects from a killed
    transaction remain (content-addressed, unreferenced) and are reported as
    such; explicit cleanup belongs to M4 and is confined to a `run_id`.
+
+---
+
+## Rework-3 (2026-10-27) — identity input contract and test fidelity
+
+**Product fix — what the identity hashes.** The real frames carry a *portable
+logical id* (`FrameDescriptor.frame_id.logical_path`, relative to the input
+root) and a separate *location* (`source_path`, the path the loader reads).
+The identity builder hashed the logical id as if it were a filesystem path:
+inside a run whose cwd is not the input folder this raised `FileNotFoundError`,
+and the store degraded to M1 without a `run.json`. It could also have digested a
+same-named decoy in the cwd. The builder now:
+
+- hashes **`source_path`** (the real bytes), never the logical id;
+- keeps the **relative logical id** in the scientific inventory, so a relocated
+  dataset with preserved ids/content keeps identical fingerprints;
+- fails explicitly (`_R55RunStoreIdentityError`) when `source_path` is absent or
+  unreadable — no cwd fallback, no basename guessing, no hashing of a
+  same-named cwd file.
+
+The aggregate stays content-only and is derived by the store, so no absolute
+path ever enters the scientific identity.
+
+**Test corrections (no product lock semantics changed).**
+
+- `LOCK` is never read through another handle while it is held (Windows denies
+  that read even in-process); the owner record is asserted while held and the
+  byte-exact placeholder/record after release.
+- The live-owner test uses an explicit readiness handshake carrying the
+  **actual interpreter pid**: a Windows venv launcher's `Popen.pid` is not the
+  interpreter that holds the lock. Cleanup kills the process tree, and the
+  orphan assertion checks the recorded pid equals the handshake pid.
+- The kill matrix kills the actual writer (process group on POSIX, tree on
+  Windows) and asserts the surviving owner record names that pid.
+- The binary-mode test asserts the real object temp-write site
+  (`tmp/<session>/obj-*.part`), the manifest temp site and the lock site
+  separately; the directory fsync site is POSIX-only. The sentinel spy restores
+  the native `O_BINARY` before calling the real `os.open`, so Windows I/O stays
+  binary under the spy.
+
+**Bench diagnostics.** `collect_store_diagnostics` ranks real failure text
+(root-cause error lines first) and excludes source comments/code echoes; the
+15-line cap can no longer hide a `identity_build` / `FileNotFoundError` behind
+noise.
+
+**Correction of the r2 report.** The r2 claim "tests no longer read `LOCK` at
+all" was materially inaccurate: two direct reads remained
+(`tests/test_zegrid_run_store_m2_io.py` while held and
+`tests/test_zegrid_resume_m2_identity.py` while held). Both are removed.

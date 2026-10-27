@@ -1,15 +1,14 @@
-"""ZM-ZEGRID-RESILIENT-RUN-RESUME M2 REWORK-2 F3 — identity/open seam unit test.
+"""ZM-ZEGRID-RESILIENT-RUN-RESUME M2 REWORK-3 — identity seam (source_path).
 
-The real-orchestration store test cannot run on a host below the corpus RAM
-floor, so the product seam that builds the run identity and opens the store was
-never executed outside Windows. This test exercises that exact seam on any
-platform, with the real shapes (descriptors, canvas, bundle, memberships, gauge,
-science config), and asserts the store really opens and publishes.
+The real descriptors carry a PORTABLE logical id (relative to the input root)
+and a separate absolute ``source_path`` used by the loader. The durable run
+identity must hash the bytes at ``source_path`` and keep the logical id as the
+scientific identifier. Hashing the logical id (the REWORK-3 defect) resolved it
+against the process cwd: it raised FileNotFoundError on the real run, and could
+even digest a same-named decoy.
 
-It also pins the two properties the Windows bench depends on:
-* a non-finite gauge value or an unhashable provenance value must not abort the
-  identity build (they are digested, not serialised raw);
-* an opened store writes ``run.json`` and a valid lock/owner pair.
+These tests run without the corpus, so they execute on any host — including the
+Linux host where the RAM-gated real-run case is skipped.
 """
 
 from __future__ import annotations
@@ -30,15 +29,25 @@ if str(SRC) not in sys.path:
 from zemosaic import zemosaic_zegrid_mode as zz  # noqa: E402
 from zemosaic.core.zegrid import run_store as zrs  # noqa: E402
 
+FRAME_BYTES = {
+    "frame_0000.fits": b"FITS-0000" + bytes([0x0A, 0x0D]) * 8,
+    "frame_0001.fits": b"FITS-0001" + bytes([0x0D, 0x0A]) * 8,
+}
+DECOY_BYTES = b"DECOY" + bytes([0x0A]) * 40
+
 
 class _FrameId:
-    def __init__(self, path: str):
-        self.logical_path = path
+    def __init__(self, logical_path: str):
+        self.logical_path = logical_path
 
 
 class _Desc:
-    def __init__(self, path: str):
-        self.frame_id = _FrameId(path)
+    """Mirror of ``geometry.FrameDescriptor`` for the identity seam."""
+
+    def __init__(self, logical_id: str, source_path: str | None):
+        self.frame_id = _FrameId(logical_id)
+        if source_path is not None:
+            self.source_path = source_path
 
 
 class _Bounds:
@@ -59,22 +68,26 @@ class _Membership:
         self.patch_ids = tuple(patch_ids)
 
 
-def _fixture(tmp_path):
-    frames = []
-    for index in range(2):
-        path = tmp_path / f"frame_{index:04d}.fits"
-        path.write_bytes(b"FITS" + bytes([0x0A, 0x0D]) * 8 + str(index).encode())
-        frames.append(_Desc(str(path)))
-    canvas = SimpleNamespace(
-        height=64,
-        width=80,
-        wcs_header="WCSLIB: synthetic header",
-        canvas_id="canvas-test",
-        resolution_deg=0.5,
-    )
+def _write_frames(root: Path) -> list[_Desc]:
+    root.mkdir(parents=True, exist_ok=True)
+    descs = []
+    for name, payload in FRAME_BYTES.items():
+        path = root / name
+        path.write_bytes(payload)
+        descs.append(_Desc(name, str(path)))
+    return descs
+
+
+def _write_decoys(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for name in FRAME_BYTES:
+        (root / name).write_bytes(DECOY_BYTES)
+
+
+def _bundle():
     cell = _Cell("r0000c0000", _Bounds(0, 0, 40, 32))
     other = _Cell("r0000c0001", _Bounds(40, 0, 80, 32))
-    bundle = SimpleNamespace(
+    return SimpleNamespace(
         layout={"nx": 2, "ny": 1},
         cpu_streaming_tile=512,
         cell_tasks=[(cell, None, None), (other, None, None)],
@@ -84,14 +97,30 @@ def _fixture(tmp_path):
         ],
         chosen_mode="stream",
     )
-    gauge = SimpleNamespace(
+
+
+def _canvas():
+    return SimpleNamespace(
+        height=64,
+        width=80,
+        wcs_header="WCSLIB: synthetic header",
+        canvas_id="canvas-test",
+        resolution_deg=0.5,
+    )
+
+
+def _gauge():
+    return SimpleNamespace(
         reference_index=0,
         exclusions=[],
         coefficients=np.linspace(0.5, 1.5, 4),
         weights=np.ones(4),
-        scalar_quality=float("nan"),  # must be digested, never serialised raw
+        scalar_quality=float("nan"),  # digested, never serialised raw
     )
-    science = SimpleNamespace(
+
+
+def _science():
+    return SimpleNamespace(
         cell_gauge_mode="per_cell",
         contract_version="zegrid-science-v1",
         rejection="sigma",
@@ -99,28 +128,87 @@ def _fixture(tmp_path):
         sigma_lower=2.5,
         rejection_algorithm="sds",
     )
-    return frames, canvas, bundle, gauge, science
 
 
-def test_m2_identity_build_then_open_publishes_a_usable_store(tmp_path, monkeypatch):
-    frames, canvas, bundle, gauge, science = _fixture(tmp_path)
-    monkeypatch.setattr(zz, "available_memory_bytes", lambda: 8 * 2 ** 20)
-
-    identity = zz._r55_build_run_store_identity(
-        run_id="run-seam-unit",
-        descs=frames,
-        canvas=canvas,
-        bundle=bundle,
+def _identity(descs, *, run_id="run-seam"):
+    return zz._r55_build_run_store_identity(
+        run_id=run_id,
+        descs=descs,
+        canvas=_canvas(),
+        bundle=_bundle(),
         halo_px=8,
-        halo_provenance={"effective_px": 8, "source": tmp_path / "prov.json"},
-        global_gauge=gauge,
-        global_frame_ids=[frames[0].frame_id.logical_path, frames[1].frame_id.logical_path],
+        halo_provenance={"effective_px": 8, "source": "unit"},
+        global_gauge=_gauge(),
+        global_frame_ids=[d.frame_id.logical_path for d in descs],
         gauge_mode="per_cell",
-        science_config=science,
+        science_config=_science(),
         workers=2,
         prefetch_units=0,
     )
-    # Identity is strict JSON and relocation-independent.
+
+
+@pytest.fixture(autouse=True)
+def _stable_memory(monkeypatch):
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: 8 * 2 ** 20)
+
+
+def test_m2_identity_hashes_source_path_not_the_logical_id(tmp_path, monkeypatch):
+    real = _write_frames(tmp_path / "data")
+    decoys = tmp_path / "cwd"
+    _write_decoys(decoys)
+
+    # The process cwd contains DIFFERENT bytes under the same names.
+    monkeypatch.chdir(decoys)
+    identity = _identity(real)
+
+    frames = identity["science_contract"]["inputs"]["frames"]
+    assert [f["frame_id"] for f in frames] == list(FRAME_BYTES)
+    for frame in frames:
+        expected = zrs._sha256_bytes(FRAME_BYTES[frame["frame_id"]])
+        assert frame["content_sha256"] == expected, (
+            f"identity hashed the wrong file for {frame['frame_id']}"
+        )
+        assert frame["content_sha256"] != zrs._sha256_bytes(DECOY_BYTES)
+    # The aggregate is content-only (relocation-independent).
+    assert identity["science_contract"]["inputs"]["aggregate_sha256"] == (
+        zrs._inputs_aggregate(frames)
+    )
+
+
+def test_m2_identity_relocation_preserves_scientific_fingerprints(tmp_path):
+    first = _write_frames(tmp_path / "run_a")
+    second = _write_frames(tmp_path / "elsewhere" / "run_b")
+    id_a = _identity(first)
+    id_b = _identity(second)
+    # Same logical ids and same content at a different absolute location.
+    assert zrs.identity_fingerprints(id_a) == zrs.identity_fingerprints(id_b)
+    assert zrs.check_identity_compatibility(id_a, id_b)["compatible"] is True
+    assert all(
+        str(frame["frame_id"]) in FRAME_BYTES
+        for frame in id_b["science_contract"]["inputs"]["frames"]
+    )
+
+
+def test_m2_identity_missing_source_path_is_explicit(tmp_path):
+    desc = _Desc("frame_0000.fits", None)
+    with pytest.raises(zz._R55RunStoreIdentityError) as err:
+        _identity([desc])
+    assert "source_path" in str(err.value)
+    assert "guessing" in str(err.value) or "no source_path" in str(err.value)
+
+
+def test_m2_identity_unreadable_source_is_explicit(tmp_path):
+    desc = _Desc("frame_0000.fits", str(tmp_path / "does_not_exist.fits"))
+    with pytest.raises(zz._R55RunStoreIdentityError) as err:
+        _identity([desc])
+    message = str(err.value)
+    assert "unreadable" in message
+    assert "does_not_exist.fits" in message
+
+
+def test_m2_identity_build_then_open_publishes_a_usable_store(tmp_path):
+    frames = _write_frames(tmp_path / "data")
+    identity = _identity(frames, run_id="run-seam-unit")
     sections = zrs.identity_fingerprints(identity)
     assert set(sections) == set(zrs.IDENTITY_SECTIONS)
     assert identity["science_contract"]["grid"]["nx"] == 2
@@ -138,37 +226,23 @@ def test_m2_identity_build_then_open_publishes_a_usable_store(tmp_path, monkeypa
         report = store.report()
         assert report["run_id"] == "run-seam-unit"
         assert report["counts"]["cells"] == 0
-        # The lock and the owner record are SEPARATE files (REWORK-2 F1).
         info = store.lock_info()
         assert info["held_by_this_store"] is True
         assert info["owner"]["pid"] == zz.os.getpid()
         assert Path(info["lock_path"]).name == "LOCK"
         assert Path(info["owner_path"]).name == "OWNER.json"
-        assert Path(info["lock_path"]).read_bytes() == zrs.LOCK_PLACEHOLDER
+        # While HELD, never read LOCK through another handle (Windows denies it).
         assert json.loads(Path(info["owner_path"]).read_text())["state"] == "held"
     finally:
         store.close()
-    # A closed store leaves a readable "released" record, not a stale lock.
+    # After release both files are readable and byte-exact.
     assert zrs.StoreLock.peek_owner(store_dir)["state"] == "released"
+    assert (store_dir / "LOCK").read_bytes() == zrs.LOCK_PLACEHOLDER
 
 
-def test_m2_identity_open_is_idempotent_and_reopens(tmp_path, monkeypatch):
-    frames, canvas, bundle, gauge, science = _fixture(tmp_path)
-    monkeypatch.setattr(zz, "available_memory_bytes", lambda: 8 * 2 ** 20)
-    identity = zz._r55_build_run_store_identity(
-        run_id="run-seam-reopen",
-        descs=frames,
-        canvas=canvas,
-        bundle=bundle,
-        halo_px=8,
-        halo_provenance=None,
-        global_gauge=gauge,
-        global_frame_ids=[f.frame_id.logical_path for f in frames],
-        gauge_mode="per_cell",
-        science_config=science,
-        workers=1,
-        prefetch_units=0,
-    )
+def test_m2_identity_open_is_idempotent_and_reopens(tmp_path):
+    frames = _write_frames(tmp_path / "data")
+    identity = _identity(frames, run_id="run-seam-reopen")
     store_dir = tmp_path / "run_store"
     first, error = zz._r55_open_run_store(
         store_dir, identity=identity, budget_bytes=0, session_id="a"

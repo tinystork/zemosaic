@@ -145,10 +145,16 @@ def payload(cell_id, seed):
 def hook(name, info):
     if name != stage:
         return
-    with open(marker, "w") as fh:
-        fh.write(name)
+    import json as _json
+    # Publish the handshake ATOMICALLY: the parent kills us the moment this
+    # path exists, so a partially written file would be a test-side race.
+    payload = _json.dumps({{"stage": name, "pid": os.getpid()}})
+    tmp_marker = marker + ".part"
+    with open(tmp_marker, "w") as fh:
+        fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
+    os.replace(tmp_marker, marker)
     # Hold the exact transaction point open until the parent kills us.
     while True:
         time.sleep(0.05)
@@ -179,6 +185,7 @@ def _run_child(tmp_path, stage, iteration):
         [sys.executable, "-c", script],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=(os.name != "nt"),
     )
     try:
         deadline = time.time() + 60
@@ -199,10 +206,24 @@ def _run_child(tmp_path, stage, iteration):
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:  # pragma: no cover
             pytest.fail("child survived SIGKILL")
-    return root
+    handshake = None
+    for _ in range(100):
+        try:
+            handshake = json.loads(marker.read_text(encoding="utf-8"))
+            break
+        except (ValueError, OSError):
+            time.sleep(0.01)
+    assert handshake is not None, "kill marker was never readable"
+    return root, int(handshake["pid"])
 
 
 def _kill(proc):
+    """Kill the ACTUAL writer (process group on POSIX, tree on Windows).
+
+    A Windows venv launcher has a different pid from the interpreter it starts;
+    ``taskkill /T`` covers that tree. On POSIX the child owns its session, so the
+    whole group (the real writer) is signalled.
+    """
     if os.name == "nt":  # pragma: no cover - Windows path
         subprocess.run(
             ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
@@ -211,9 +232,12 @@ def _kill(proc):
         )
     else:
         try:
-            os.kill(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 @pytest.mark.parametrize("stage", STAGES)
@@ -221,7 +245,7 @@ def _kill(proc):
 def test_m2_kill_during_each_write_step_leaves_only_complete_commits(
     tmp_path, stage, iteration
 ):
-    root = _run_child(tmp_path, stage, iteration)
+    root, holder_pid = _run_child(tmp_path, stage, iteration)
     store = zrs.RunCellStore.open(root, identity=None)
     try:
         report = store.report()
@@ -258,6 +282,14 @@ def test_m2_kill_during_each_write_step_leaves_only_complete_commits(
         assert completeness["complete"] == completeness["expected"] - len(
             completeness["missing"]
         )
+        # 0. The dead owner recorded on disk is the ACTUAL writer that was
+        #    killed (never merely a venv launcher pid).
+        previous = (store.report().get("lock_info") or {}).get("previous_owner")
+        assert previous is not None, "no owner record survived the kill"
+        assert int(previous["pid"]) == holder_pid, (
+            f"owner record pid {previous.get('pid')} != killed writer {holder_pid}"
+        )
+        assert zrs.owner_is_live(previous) is False
         # 2. The index is reconstructible and equals the on-disk commit set.
         assert report["index"]["rebuilt_on_open"] in (True, False)
         assert sorted(store.index()["cells"]) == sorted(

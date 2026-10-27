@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -143,16 +144,17 @@ def test_m2_every_os_open_site_requests_binary_mode(tmp_path, monkeypatch):
     root = tmp_path / "run"
     seen: list[tuple[str, int]] = []
     real_open = os.open
+    native_binary = int(getattr(os, "O_BINARY", 0))
 
     def spy(path, flags, mode=0o777):
-        # Record every open that targets the store directory. ``os.open`` is
-        # process-global, so unrelated library opens are ignored: the contract is
-        # about the durable store's own sites.
+        recorded = int(flags)
         if str(path).startswith(str(root)):
-            seen.append((str(path), int(flags)))
-        # The sentinel has no meaning for the kernel: strip it, but RECORD that
-        # the production code passed it.
-        return real_open(str(path), int(flags) & ~BINARY_SENTINEL, mode)
+            seen.append((str(path), recorded))
+        # The sentinel has no meaning for the kernel: strip it and RESTORE the
+        # platform's native O_BINARY, so real Windows I/O under the spy stays
+        # binary (the regression must not mask the very defect it guards).
+        kernel_flags = (recorded & ~BINARY_SENTINEL) | native_binary
+        return real_open(str(path), kernel_flags, mode)
 
     monkeypatch.setattr(rs.os, "O_BINARY", BINARY_SENTINEL, raising=False)
     monkeypatch.setattr(rs.os, "open", spy)
@@ -161,8 +163,6 @@ def test_m2_every_os_open_site_requests_binary_mode(tmp_path, monkeypatch):
     store.commit_cell(payload(), attempt_id="a1")
     store.close()
 
-    # Four distinct sites: directory fsync (read-only), lock file, atomic
-    # manifest/index temp write, content-addressed object write.
     assert len(seen) >= 4, f"expected at least 4 store os.open calls, saw {len(seen)}"
     missing = [
         (path, hex(flags))
@@ -170,21 +170,33 @@ def test_m2_every_os_open_site_requests_binary_mode(tmp_path, monkeypatch):
         if not flags & BINARY_SENTINEL
     ]
     assert not missing, f"store os.open without O_BINARY: {missing}"
-    # Coverage of every site that EXISTS on this platform. ``fsync_dir`` is a
-    # deliberate no-op on Windows (no directory handle to fsync), so the
-    # directory-open site is POSIX-only. That must not weaken the flag
-    # assertion above, and the test is never skipped.
-    assert any(path.endswith("LOCK") for path, _ in seen)
-    assert any(".part" in path or ".tmp-" in path for path, _ in seen)
-    assert any(os.sep + "objects" + os.sep in path for path, _ in seen)
+
+    def _has(predicate):
+        return any(predicate(path) for path, _ in seen)
+
+    tmp_marker = os.sep + "tmp" + os.sep
+    # (a) dedicated lock target
+    assert _has(lambda path: path.endswith("LOCK")), "lock open site not exercised"
+    # (b) manifest/identity/index temp write
+    assert _has(lambda path: ".tmp-" in os.path.basename(path)), (
+        "atomic manifest temp open not exercised"
+    )
+    # (c) the ACTUAL object write: run/tmp/<session>/obj-*.part (it is renamed
+    #     into objects/, never opened there: asserting an objects/ open would
+    #     only have matched the POSIX directory fsync by accident).
+    assert _has(
+        lambda path: tmp_marker in path
+        and os.path.basename(path).startswith("obj-")
+        and path.endswith(".part")
+    ), "content-addressed object temp-write site not exercised"
+    # (d) directory fsync exists on POSIX only; it stays a Windows no-op.
     if rs._IS_WINDOWS:  # pragma: no cover - exercised on the Windows bench
-        assert not any(
-            os.path.isdir(path) for path, _ in seen
-        ), "fsync_dir must stay a documented no-op on Windows"
+        assert not _has(os.path.isdir), (
+            "fsync_dir must stay a documented no-op on Windows"
+        )
     else:
-        assert any(
-            os.path.isdir(path) for path, _ in seen
-        ), "directory fsync open was not exercised on POSIX"
+        assert _has(os.path.isdir), "directory fsync open was not exercised"
+
     # And the store is still fully usable with the flag present.
     reopened = rs.RunCellStore.open(root, identity=None, read_only=True)
     assert reopened.verify_cell("r0000c0000")["valid"] is True
@@ -244,10 +256,8 @@ def test_m2_lock_record_and_placeholder_are_byte_exact(tmp_path):
 
     root = tmp_path / "run"
     store = rs.RunCellStore.open(root, identity=identity())
-    # LOCK is a dedicated lock target: byte-exact, never a record.
-    assert (root / "LOCK").read_bytes() == rs.LOCK_PLACEHOLDER
-    assert b"\r" not in (root / "LOCK").read_bytes()
-    # The owner record is separate and readable through the supported API.
+    # While HELD, LOCK must not be read through another handle (Windows denies
+    # it by design). The owner record is the supported, readable surface.
     info = store.lock_info()
     assert info["held_by_this_store"] is True
     assert info["owner"]["state"] == "held"
@@ -258,7 +268,9 @@ def test_m2_lock_record_and_placeholder_are_byte_exact(tmp_path):
     store.commit_cell(payload(), attempt_id="a1")
     store.close()
 
+    # After release the lock file is readable again: assert the exact bytes.
     assert (root / "LOCK").read_bytes() == rs.LOCK_PLACEHOLDER
+    assert b"\r" not in (root / "LOCK").read_bytes()
     released = rs.StoreLock.peek_owner(root)
     assert released is not None and released["state"] == "released"
     assert b"\r" not in (root / "OWNER.json").read_bytes()
@@ -349,22 +361,64 @@ def test_m2_exhausted_lock_wait_reports_attempts(tmp_path, monkeypatch):
     assert elapsed < 2.0
 
 
+def _terminate_tree(proc) -> None:
+    """Kill the ACTUAL writer, not just a launcher/venv shim."""
+    try:
+        if os.name == "nt":  # pragma: no cover - Windows path
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=20,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:  # pragma: no cover
+        pass
+
+
+def _wait_handshake(ready: Path, proc, timeout: float = 30.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if ready.exists():
+            try:
+                return json.loads(ready.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if proc.poll() is not None:
+            out, err = proc.communicate()
+            pytest.fail(f"child exited before ready: rc={proc.returncode} {out!r} {err!r}")
+        time.sleep(0.02)
+    pytest.fail("child never published its readiness handshake")
+
+
 def test_m2_live_owner_lock_is_never_retried_into_success(tmp_path, monkeypatch):
     root = tmp_path / "run"
     rs.RunCellStore.open(root, identity=identity()).close()
-    ready = tmp_path / "ready"
+    ready = tmp_path / "ready.json"
     holder = (
-        "import sys, time\n"
+        "import json, os, sys, time\n"
         f"sys.path.insert(0, {str(SRC)!r})\n"
         "from zemosaic.core.zegrid import run_store as rs\n"
         f"store = rs.RunCellStore.open({str(root)!r}, identity=None)\n"
-        f"open({str(ready)!r}, 'w').write('ready')\n"
+        f"fh = open({str(ready)!r}, 'w')\n"
+        "json.dump({'pid': os.getpid(),"
+        " 'process_start_token': rs.process_start_token(os.getpid()),"
+        " 'session_id': str(store.session_id)}, fh)\n"
+        "fh.flush(); os.fsync(fh.fileno()); fh.close()\n"
         "time.sleep(30)\n"
     )
     child = subprocess.Popen(
         [sys.executable, "-c", holder],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=(os.name != "nt"),
     )
     calls = {"n": 0}
     real_lock_fd = rs.StoreLock._lock_fd
@@ -375,21 +429,17 @@ def test_m2_live_owner_lock_is_never_retried_into_success(tmp_path, monkeypatch)
 
     monkeypatch.setattr(rs.StoreLock, "_lock_fd", counting)
     try:
-        deadline = time.time() + 20
-        while not ready.exists() and time.time() < deadline:
-            if child.poll() is not None:
-                out, err = child.communicate()
-                pytest.fail(f"holder died: rc={child.returncode} {out!r} {err!r}")
-            time.sleep(0.02)
-        assert ready.exists(), "holder never acquired the lock"
+        handshake = _wait_handshake(ready, child)
+        holder_pid = int(handshake["pid"])
 
-        # F1 (REWORK-2): the owner record MUST be readable while another
-        # process holds the lock. It lives outside the locked byte range, so no
-        # PermissionError is possible here (that was the Windows defect).
+        # The owner record must be readable while the lock is held, and it must
+        # name the ACTUAL interpreter, which may differ from Popen.pid when the
+        # executable is a Windows venv launcher.
         peeked = rs.StoreLock.peek_owner(root)
         assert peeked is not None, "owner record unreadable while the lock is held"
         assert peeked["state"] == "held"
-        assert int(peeked["pid"]) == int(child.pid)
+        assert int(peeked["pid"]) == holder_pid
+        assert rs.owner_is_live(peeked) is True
         assert rs.StoreLock.peek_owner(root / "LOCK") == peeked
 
         started = time.monotonic()
@@ -402,13 +452,13 @@ def test_m2_live_owner_lock_is_never_retried_into_success(tmp_path, monkeypatch)
         assert "no retry" in str(err.value)
         assert elapsed < 1.0
     finally:
-        child.kill()
-        child.wait(timeout=15)
+        _terminate_tree(child)
 
-    # Once the owner is really gone, the bounded wait recovers it.
+    # Once the ACTUAL holder is gone, the bounded wait recovers the orphan.
     store = rs.RunCellStore.open(root, identity=None)
     try:
         assert store.report()["lock_info"]["orphan_recovered"] is True
+        assert int(store.report()["lock_info"]["previous_owner"]["pid"]) == holder_pid
     finally:
         store.close()
 
