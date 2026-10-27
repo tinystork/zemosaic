@@ -1,12 +1,12 @@
-## Current status — M2 QUALIFIÉ (banc Windows réel, 27/10 23:26Z)
+## Current status — M3 code ACCEPTÉ (ACCEPT-WITH-CONDITIONS, conditions remplies)
 
-- Banc `m2_20261027_232620`: `status=PASS`, exit 0, 153 tests, **0 skip**, 0 échec, plafond artefacts non atteint (1 605 B).
-- Suites: store contract 48, I/O 8, kill matrix 20 (4 étapes × 5 itérations, processus réel tué), identity seam 6, bench diagnostics 5, **real store run 12 (dont les 2 cas d'orchestration réelle)**, M1 registry 23, M1 conservation 10, M0 witness 1, M0 harness 20.
-- Source exécutée: HEAD `d5b2db1` (feature), arbre propre, hashes avant==après (aucune mutation pendant le run). Verrous OS réels `msvcrt`/`TerminateProcess` et renommage NTFS exercés.
-- Périmètre qualifié: store durable par cellule — commits atomiques (objet → fsync → vérif → rename → index reconstructible), verrou mono-écrivain avec propriétaire, intégrité sha256, budget disque, libération des gros tableaux après commit, géométrie patch persistée et revalidée. Modes **control-only CPU** (pas de GPU).
-- NON qualifié / NON mesuré: GPU et science GPU, parité produit installé, A/B science sans pression, ENOSPC sur volume réellement plein (injecté par fault hook), coupure électrique (kill processus ≠ perte de courant).
-- Corrections de cette étape: géométrie `bounds`/`core_slice` persistée (KeyError cross-platform), interblocage GC du finaliseur (RLock), nom de sortie science réel (`mosaic_grid.fits`), erreurs réelles non masquées.
-- Conclusion: **M2 accepté et qualifié dans son périmètre déclaré.** M3 (attente ressources / générations) peut démarrer sur accord.
+Nono review-0 = ACCEPT-WITH-CONDITIONS, aucun HIGH/MEDIUM. Conditions remplies: correctif d'alias `zrej` committé SÉPARÉMENT (`0f3584d`), défaut-off prouvé (M1/M2 verts sans le flag, 105 passed/6 skip), NOT_RUN documentés. Feature M3 commitée `1a6ebbb` ; les deux poussés sur `feat/zegrid-resilient-run-resume`. beta=231b597, main=434961a inchangées.
+
+Périmètre M3: boucle de pression opt-in (`zegrid_resource_recovery_enabled`, défaut false) — stop admission/prefetch, drain/annulation du spéculatif non committé, libération réelle crédits/staging avant attente, réduction sur faits frais, AUTO→bounded sens unique (GPU conservé si admissible), WAITING_RESOURCES léger et annulable, réadmission après 2 observations espacées, retries bornés, fence de génération (résultat tardif jamais accepté). Chemin M1/M2 qualifié préservé par défaut.
+
+NON QUALIFIÉ (NOT_RUN): GPU, Windows, **pression mémoire OS réelle** (tests M3 instrumentés avec sonde RAM injectée, pas une pression physique), CUDA OOM, marqueur STOPPED_RESUMABLE (frontière M4), mélange CPU/GPU. Recovery GPU mid-pipeline différée à M4.
+
+Prochaine porte: qualification de récupération réelle sous pression mémoire sur un hôte admissible (≠ banc M1/M2 simple). M4 non lancé sans accord.
 
 # ZeGrid resilient run — project state
 
