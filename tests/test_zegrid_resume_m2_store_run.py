@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -190,6 +191,20 @@ def _run_with_store(inp: Path, out_dir: Path, store_dir: Path) -> dict:
     }
 
 
+def _require_successful_store_run(run: dict) -> None:
+    """Only an explicit pre-production planning refusal is NOT_RUN."""
+    exc = run["exception"]
+    if exc is None:
+        return
+    progressed = any(run[key] for key in ("produced", "released", "store_reports"))
+    if not progressed and isinstance(
+        exc, (zz.zal.LayoutInfeasible, zz.zpar.ModeInfeasible)
+    ):
+        pytest.skip(f"pre-case resource/setup unavailable ({exc})")
+    trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    pytest.fail(f"store-enabled real run failed:\n{trace}")
+
+
 def test_m2_real_cpu_run_commits_then_releases_and_reloads_identical_payloads(
     tmp_path,
 ):
@@ -199,15 +214,7 @@ def test_m2_real_cpu_run_commits_then_releases_and_reloads_identical_payloads(
     out_dir = base / "out"
     store_dir = base / "run_store"
     run = _run_with_store(inp, out_dir, store_dir)
-    if run["exception"] is not None:
-        exc = run["exception"]
-        pre_case = (
-            zz.zal.LayoutInfeasible,
-            zz.zpar.ModeInfeasible,
-        )
-        if isinstance(exc, pre_case):
-            pytest.skip(f"pre-case resource/setup unavailable ({exc})")
-        pytest.fail(f"store-enabled real run failed: {type(exc).__name__}: {exc}")
+    _require_successful_store_run(run)
 
     # F3: surface the product's own store diagnostics BEFORE opening the store.
     diag = _require_durable_store_active(out_dir, store_dir)
@@ -253,8 +260,7 @@ def test_m2_store_identity_refuses_a_changed_science_contract(tmp_path):
     out_dir = base / "out"
     store_dir = base / "run_store"
     run = _run_with_store(inp, out_dir, store_dir)
-    if run["exception"] is not None:
-        pytest.skip(f"pre-case setup unavailable ({run['exception']})")
+    _require_successful_store_run(run)
     _require_durable_store_active(out_dir, store_dir)
     stored = zrs.RunCellStore.open(store_dir, identity=None, read_only=True)
     identity = stored.identity
@@ -266,3 +272,21 @@ def test_m2_store_identity_refuses_a_changed_science_contract(tmp_path):
     with pytest.raises(zrs.StoreIdentityMismatch) as err:
         zrs.RunCellStore.open(store_dir, identity=changed)
     assert "science" in [r["section"] for r in err.value.reasons]
+
+
+@pytest.mark.parametrize("exc", [KeyError("bounds"), RuntimeError("store broke")])
+def test_m2_real_run_unexpected_error_is_never_skipped(exc):
+    run = dict(exception=exc, produced={}, released=[], store_reports=[])
+    with pytest.raises(pytest.fail.Exception, match=type(exc).__name__):
+        _require_successful_store_run(run)
+
+
+@pytest.mark.parametrize("kind", [zz.zal.LayoutInfeasible, zz.zpar.ModeInfeasible])
+@pytest.mark.parametrize("progress", [None, "produced", "released", "store_reports"])
+def test_m2_real_run_planning_refusal_skips_only_before_production(kind, progress):
+    run = dict(exception=kind("no capacity"), produced={}, released=[], store_reports=[])
+    if progress is not None:
+        run[progress] = ["observed"]
+    outcome = pytest.skip.Exception if progress is None else pytest.fail.Exception
+    with pytest.raises(outcome):
+        _require_successful_store_run(run)

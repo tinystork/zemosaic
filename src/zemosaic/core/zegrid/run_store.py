@@ -633,7 +633,13 @@ def owner_is_live(owner: Mapping[str, Any]) -> bool:
 
 
 _LIVE_LOCKS: dict[str, Any] = {}
-_LIVE_LOCKS_GUARD = threading.Lock()
+# Reentrant on purpose: ``RunCellStore.__del__`` -> ``close()`` -> ``release()``
+# can be invoked by the cyclic garbage collector WHILE this same thread already
+# holds the guard (for example inside ``acquire()`` while it allocates). A plain
+# ``threading.Lock`` deadlocks on that re-entry; an RLock lets the finalizer
+# finish its own release and return. The OS lock (flock/msvcrt) remains the real
+# single-writer authority, so reentrancy here never weakens mutual exclusion.
+_LIVE_LOCKS_GUARD = threading.RLock()
 
 #: Bounded re-acquire window, used ONLY when the recorded owner is provably dead
 #: (never for a live owner). Windows can release the byte-range lock a little
@@ -1882,11 +1888,32 @@ class RunCellStore:
         meta = manifest["payload_meta"]
         if not isinstance(meta, Mapping):
             raise StoreFormatError(f"commit {label}.payload_meta must be an object")
-        for forbidden in ("core", "patch"):
-            if forbidden in meta:
-                raise StoreFormatError(
-                    f"commit {label}.payload_meta may not carry {forbidden!r}"
-                )
+        if "core" in meta:
+            raise StoreFormatError(
+                f"commit {label}.payload_meta may not carry 'core'"
+            )
+        has_patch = any(name.startswith("patch.") for name in seen)
+        if has_patch:
+            # Pixels live in objects; these two scalar coordinate tuples are
+            # equally essential to the real feather-assembly consumer. Old
+            # incomplete commits are refused, never reconstructed by guessing
+            # from record.patch_bounds (which uses a different axis order).
+            geometry = _strict_mapping(
+                meta.get("patch"), f"commit {label}.payload_meta.patch",
+                ("bounds", "core_slice"),
+            )
+            for key in ("bounds", "core_slice"):
+                values = _req_seq(geometry[key], f"patch.{key}")
+                if len(values) != 4:
+                    raise StoreFormatError(f"patch.{key} must have four coordinates")
+                for value in values:
+                    _req_int(value, f"patch.{key}", minimum=0)
+                if values[1] <= values[0] or values[3] <= values[2]:
+                    raise StoreFormatError(f"patch.{key} is empty or reversed")
+        elif "patch" in meta:
+            raise StoreFormatError(
+                f"commit {label} carries patch geometry without patch planes"
+            )
         _req_str(manifest["commit_sha256"], f"commit {label}.commit_sha256")
         return dict(manifest)
 
@@ -2237,6 +2264,10 @@ class RunCellStore:
             for key, value in result.items()
             if key not in ("core", "patch")
         }
+        if result.get("patch") is not None:
+            payload_meta["patch"] = {
+                key: result["patch"][key] for key in ("bounds", "core_slice")
+            }
         payload_meta = json_safe(payload_meta, "payload_meta")
         # The declared dtype contract of the run is authoritative: refuse a
         # plane whose dtype disagrees with the frozen contract.
@@ -2554,7 +2585,12 @@ class RunCellStore:
         payload: dict[str, Any] = dict(record.manifest["payload_meta"])
         if record.status == STATUS_COMPLETE:
             core: dict[str, Any] = {}
-            patch: dict[str, Any] | None = None
+            patch_meta = payload.get("patch")
+            patch: dict[str, Any] | None = (
+                None if patch_meta is None else {
+                    key: tuple(patch_meta[key]) for key in ("bounds", "core_slice")
+                }
+            )
             for plane in record.manifest["planes"]:
                 array = self._read_array(plane)
                 name = str(plane["name"])
@@ -2568,6 +2604,20 @@ class RunCellStore:
             if patch is not None:
                 payload["patch"] = patch
         payload["cell_id"] = record.cell_id
+        gauge_mode = str(self._identity["science_contract"]["gauge"]["mode"])
+        try:
+            if record.status == STATUS_COMPLETE:
+                zrr.validate_complete_payload(payload, gauge_mode=gauge_mode)
+            else:
+                zrr.validate_empty_payload(payload, gauge_mode=gauge_mode)
+        except zrr.AcceptanceError as exc:
+            raise StoreIntegrityError(
+                f"cell {record.cell_id}: reloaded payload is invalid: {exc}"
+            ) from exc
+        if zrr.fingerprint_result(payload)["payload_sha256"] != record.payload_sha256:
+            raise StoreIntegrityError(
+                f"cell {record.cell_id}: reloaded payload fingerprint mismatch"
+            )
         payload["_store"] = {
             "schema": STORE_SCHEMA,
             "run_id": self.run_id,

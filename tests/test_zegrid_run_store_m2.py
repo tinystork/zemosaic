@@ -231,6 +231,10 @@ def test_m2_commit_publishes_verified_planes_and_roundtrips_payload(store):
     assert payload["cell_id"] == "r0000c0000"
     assert payload["status"] == "complete"
     assert payload["record"]["patch_bounds"] == [0, 0, W, H]
+    assert tuple(payload["patch"]["bounds"]) == result["patch"]["bounds"]
+    assert tuple(payload["patch"]["core_slice"]) == result["patch"]["core_slice"]
+    zrr.validate_complete_payload(payload, gauge_mode="per_cell")
+    assert zrr.fingerprint_result(payload) == zrr.fingerprint_result(result)
     for name, original in result["core"].items():
         loaded = payload["core"][name]
         assert loaded.dtype == original.dtype
@@ -878,3 +882,157 @@ def test_m2_commit_and_release_keeps_payload_when_commit_fails(tmp_path):
     assert store.verify_cell("r0000c0000")["valid"] is False
     registry.dispose()
     store.close()
+
+
+def test_m2_reopened_released_payload_preserves_real_feather_assembly(tmp_path):
+    """Exercise the actual consumer, without the RAM-gated FITS producer."""
+    from zemosaic import zemosaic_zegrid_mode as zz
+    from zemosaic.core.zegrid.geometry import GlobalCanvas
+
+    root = tmp_path / "assembly_store"
+    source = complete_result()
+    cid = source["cell_id"]
+    canvas = GlobalCanvas(
+        canvas_id="m2-roundtrip", wcs_header="", width=W, height=H,
+        resolution_deg=0.001,
+    )
+    baseline, baseline_info = zz._assemble_per_cell_feathered(
+        canvas, 1, 1, {cid: source}, halo_px=2,
+    )
+    registry = zrr.RunResultRegistry(
+        run_id="run-m2", expected_cell_ids=[cid], gauge_mode="per_cell",
+    )
+    registry.accept(source, backend="cpu", plan_generation=0, attempt_id="a1")
+    store = zrs.RunCellStore.open(root, identity=make_identity())
+    try:
+        store.commit_and_release(registry, cid, attempt_id="a1")
+        assert registry.retained_bytes == 0
+    finally:
+        store.close()
+    reopened = zrs.RunCellStore.open(root, identity=None, read_only=True)
+    try:
+        loaded = reopened.ordered_payloads(registry, [cid])[0]
+        assembled, info = zz._assemble_per_cell_feathered(
+            canvas, 1, 1, {cid: loaded}, halo_px=2,
+        )
+        assert info == baseline_info
+        for name, original in vars(baseline).items():
+            actual = getattr(assembled, name)
+            if isinstance(original, np.ndarray):
+                assert actual.dtype == original.dtype
+                assert actual.shape == original.shape
+                assert actual.tobytes() == original.tobytes(), name
+            else:
+                assert actual == original, name
+        assert zrr.fingerprint_result(loaded) == zrr.fingerprint_result(source)
+    finally:
+        reopened.close()
+        registry.dispose()
+
+
+@pytest.mark.parametrize("fault", ["missing_patch", "missing_core_slice", "bad_bounds", "extra_array"])
+def test_m2_incomplete_patch_geometry_is_rejected_on_reopen(tmp_path, fault):
+    root = tmp_path / "bad_geometry"
+    store = zrs.RunCellStore.open(root, identity=make_identity())
+    try:
+        store.commit_cell(complete_result(), attempt_id="a1")
+    finally:
+        store.close()
+    path = next((root / "commits").glob("*.json"))
+    manifest = json.loads(path.read_text())
+    meta = manifest["payload_meta"]
+    if fault == "missing_patch":
+        del meta["patch"]  # exactly the historical incomplete format
+    elif fault == "missing_core_slice":
+        del meta["patch"]["core_slice"]
+    elif fault == "bad_bounds":
+        meta["patch"]["bounds"] = [0, H, 0]
+    else:
+        meta["patch"]["science"] = [[1.0]]
+    # Even with a correct envelope digest, an incomplete payload is not usable.
+    manifest["commit_sha256"] = zrs._sha256_bytes(zrs.canonical_json(
+        {key: value for key, value in manifest.items() if key != "commit_sha256"}
+    ))
+    path.write_bytes(zrs.canonical_json(manifest))
+    reopened = zrs.RunCellStore.open(root, identity=None, read_only=True)
+    try:
+        assert reopened.report()["counts"]["cells"] == 0
+        assert reopened.verify_cell("r0000c0000")["valid"] is False
+        assert path.exists(), "rejecting old incomplete data must not delete it"
+    finally:
+        reopened.close()
+
+
+def test_m2_loaded_geometry_must_match_original_payload_digest(tmp_path):
+    root = tmp_path / "changed_geometry"
+    store = zrs.RunCellStore.open(root, identity=make_identity())
+    try:
+        store.commit_cell(complete_result(), attempt_id="a1")
+    finally:
+        store.close()
+    path = next((root / "commits").glob("*.json"))
+    manifest = json.loads(path.read_text())
+    # Valid dimensions, wrong placement: shape/array-only checks cannot catch it.
+    manifest["payload_meta"]["patch"]["core_slice"] = [1, 5, 2, 7]
+    manifest["commit_sha256"] = zrs._sha256_bytes(zrs.canonical_json(
+        {key: value for key, value in manifest.items() if key != "commit_sha256"}
+    ))
+    path.write_bytes(zrs.canonical_json(manifest))
+    reopened = zrs.RunCellStore.open(root, identity=None, read_only=True)
+    try:
+        with pytest.raises(zrs.StoreIntegrityError, match="fingerprint mismatch"):
+            reopened.load_payload("r0000c0000")
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("mode", ["global", "per_cell"])
+def test_m2_loaded_complete_and_empty_payloads_keep_registry_fingerprints(tmp_path, mode):
+    store = zrs.RunCellStore.open(tmp_path / mode, identity=make_identity(gauge_mode=mode))
+    try:
+        for result in [complete_result(mode=mode), empty_result(mode=mode)]:
+            store.commit_cell(result, attempt_id="a1")
+            loaded = store.load_payload(result["cell_id"])
+            assert zrr.fingerprint_result(loaded) == zrr.fingerprint_result(result)
+            assert ("patch" in loaded) == ("patch" in result)
+    finally:
+        store.close()
+
+
+def test_m2_gc_finalizer_does_not_deadlock_guard(tmp_path, monkeypatch):
+    """REGRESSION: an abandoned store finalizer must not re-enter the live-lock
+    guard. A plain non-reentrant Lock deadlocks when ``gc.collect()`` (triggered
+    while ``acquire()`` holds the guard) runs ``RunCellStore.__del__``."""
+    import gc
+    import threading
+
+    root = tmp_path / "gc_reentry"
+
+    def _open_pending_store():
+        pending = zrs.RunCellStore(root / "pending")
+        pending._lock = zrs.StoreLock(root / "pending" / "LOCK")
+        pending.cycle = pending  # keep one GC cycle away from the OS lock
+
+    def _open_cycle():
+        pending = zrs.RunCellStore(root / "pending")
+        pending._lock = zrs.StoreLock(root / "pending" / "LOCK")
+        pending.cycle = pending
+
+    # One store that is still referenced must keep its own lock; a second store
+    # that goes out of scope and is collected must not deadlock the guard.
+    _open_cycle()  # referenced nowhere afterwards, eligible for GC
+    store = zrs.RunCellStore.open(root / "run", identity=make_identity())
+    real_write = zrs.StoreLock._write_owner_record
+
+    def collect_then_write(self, record):
+        # The finalizer of any garbage RunCellStore runs here, while the caller
+        # thread already holds _LIVE_LOCKS_GUARD inside acquire().
+        gc.collect()
+        return real_write(self, record)
+
+    monkeypatch.setattr(zrs.StoreLock, "_write_owner_record", collect_then_write)
+    try:
+        store.commit_cell(complete_result(), attempt_id="a1")
+        assert store.report()["counts"]["cells"] == 1
+    finally:
+        store.close()

@@ -1,18 +1,10 @@
-## Publication du candidat M2 — autorisée le 2026-10-27
+## Current status — M2 correction directe Junior (2026-10-27, non commité)
 
-Tristan autorise le commit et le push du correctif REWORK-3 sur `feat/zegrid-resilient-run-resume` uniquement, pour permettre la qualification Windows. Le code, les tests et le banc correspondent exactement au snapshot revu par Nono. Aucun changement sur beta/main. Les mentions « non commité/non publié » ci-dessous décrivent la situation antérieure à cette publication.
-
-M2 reste **NON ACCEPTÉ** : 126 tests Linux réussis, 8 cas non exécutés faute de RAM ; qualification Windows zéro-skip toujours requise. Prochaine étape : récupérer cette branche sous Windows, puis exécuter les contrôles ciblés et le banc complet.
-
-## Current status — M2 code review accepted; Windows qualification BLOCKED
-
-Junior disposition after Nono review-1 (2026-10-27): candidate code accepted with bench pending, **M2 milestone NOT ACCEPTED**. HEAD dae455e0befb06989ae97e7f646d78567c3f187f plus nine expected changed/new files; no commit/push. Nono found no HIGH/MEDIUM; all 13 reviewed hashes independently matched snapshot r1 before this documentation-only update.
-
-Junior independent replay: 126 passed / 0 failed / 8 RAM-gated skips. Two real-store and six M1 conservation cases remain NOT_RUN here. Windows candidate has NOT been transferred or executed: node_exec rejected the access attempt with `Invalid system.run request: raw-command-mismatch`. No alternate transport or retry used. Full Windows exit0/statusPASS/zero-skip is mandatory before M2 acceptance; M3 remains closed.
-
-Minor coverage loss (Path/None halo provenance fixtures) accepted as LOW for this bounded correction: product digest unchanged, Junior standalone serialization/determinism probe passes for both. No fourth corrective iteration justified. Nono wording that no product changed is inaccurate: mode.py identity builder changed, while run_store.py and run_registry.py stayed unchanged.
-
-Next single step: restore normal Windows tool access or arrange explicit manual transfer/execution of this exact candidate, then focused tests and full bench. Candidate is not published; do not run the old Windows checkout expecting the fixes. No beta/installed runtime changes. Historical entries below are superseded.
+M2 toujours NON ACCEPTÉ. Base 6dd0a62 (publiée). Corrections locales non commitées:
+- géométrie patch (bounds/core_slice) persistée et revalidée; anciens commits incomplets refusés;
+- garde anti-interblocage GC (RLock) + régression;
+- les erreurs réelles des run avec store ne sont plus masquées par un skip large.
+Validation Linux: 145 passés / 0 échec / 8 skip RAM. Les deux cas d'orchestration réelle restent NOT_RUN. Prochaine étape: revue Nono puis banc Windows zéro-skip (le KeyError bounds est cross-platform). Les entrées ci-dessous sont historiques.
 
 # ZeGrid resilient run — project state
 
