@@ -103,7 +103,7 @@ from .core.zegrid import geometry as zg
 from .core.zegrid import gpu as zgpu
 from .core.zegrid import gpu_readiness as zgr
 from .core.zegrid import storage_profile as zsp
-from .core.zegrid import rejection_sink as zrs
+from .core.zegrid import rejection_sink as zrej
 from .core.zegrid import gpu_memory as zgm
 from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
@@ -2035,7 +2035,7 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
         request = zstream.build_streaming_request(config, provider.n_frames)
         if zsp.is_bounded(_profile):
             # FRESH sink for THIS cell run: never reused across cells/retries.
-            sink = zrs.BoundedCountingRejectionSink(
+            sink = zrej.BoundedCountingRejectionSink(
                 (provider.n_frames, provider.height, provider.width, provider.channels)
             )
             result = run_canonical_stack_streaming(
