@@ -1,5 +1,11 @@
 # ZeGrid resilient run — project state
 
+## M1 ACCEPT-WITH-BENCH-PENDING + branche publiée (27/10 18:5x)
+- Nono review-2: **ACCEPT-WITH-BENCH-PENDING**. Gate de preuve fail-closed confirmé sur 4 fermetures (F1 skip bénin seulement, F2 précédence échec>skip, F3 six IDs exacts, F4 observation fresh-min). Aucun défaut HIGH/MEDIUM restant. Réserves LOW/hors périmètre: dédup `status`, `mmap.size()` conservateur, A/B NOT_RUN.
+- Autorisation Tristan: push au retour de Nono sans problème. Commit `d0905dec68fd5a87c6a93ff5fa294a2b6848e3b0` (21 fichiers) + branche `feat/zegrid-resilient-run-resume` poussée sur origin. `beta` intacte à `231b597867b4d251afac6b767000c8a37e2cf3b0`. Arbre propre après commit.
+- Conditions non négociables posées par Nono: M2 ne démarre pas avant banc Windows M1 PASS sur les 6 cas; le rapport d'acceptation doit déclarer A/B NOT_RUN et Windows M1 bench NOT_RUN.
+- Prochaine action = Tristan lance le banc Windows; ensuite qualification puis M2.
+
 ## M1 r3 reprise après coupure — vérifié, revue finale en cours
 - Coco r3 livré 18:27 (callback CALLBACK_FAILED auth). Junior repris: produit HASH-IDENTIQUE au snapshot r1 (mode.py+run_registry.py), seuls3 fichiers tests/tools changés.
 - Rejoué: guards+registry+conservation38passed6skipped3.74s; M0+zero-support41passed1skip18.96s. Sondes Junior indépendantes: failed+skip=>FAIL, error+skip=>FAIL, nonzero+allPASSED=>FAIL, zero+printedFAILED=>FAIL, cap/timeout prioritaires, skips-only=>NOT_RUN, required-absent=>FAIL, unexpected exc armé ou non=>FAIL, armed-success=>FAIL, unarmed=>SKIP. Défaut reproduit hier (failed+skip=>NOT_RUN) FERMÉ.
