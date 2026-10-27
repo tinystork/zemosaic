@@ -113,6 +113,7 @@ from .core.zegrid import ram_contract as rcontract
 from .core.zegrid import resource_envelope as renv
 from .core.zegrid import runtime_control as zrt
 from .core.zegrid import run_registry as zrr
+from .core.zegrid import run_store as zrs
 from .core.zegrid import scheduler as zsched
 from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
@@ -9010,6 +9011,269 @@ def _r55_build_active_block(
     return block
 
 
+# ---------------------------------------------------------------------------
+# M2: durable run store identity + lifecycle helpers (write-path seam only)
+# ---------------------------------------------------------------------------
+
+#: Frozen dtype contract of the durable store. Each plane declares the exact
+#: dtype tokens the producers may emit; anything else is refused by the store.
+_RUN_STORE_CORE_DTYPES = {
+    "core.science_core": ["<f4", "<f8"],
+    "core.estimator_weight_sum_core": ["<f4", "<f8"],
+    "core.support_w1_core": ["<f4", "<f8"],
+    "core.support_w2_core": ["<f4", "<f8"],
+    "core.n_eff_support_core": ["<f4", "<f8"],
+    "core.valid_mask_core": ["|b1"],
+    "core.surviving_sample_count_core": ["<i4", "<i8"],
+}
+_RUN_STORE_PATCH_DTYPES = {
+    "patch.science": ["<f4", "<f8"],
+    "patch.valid_mask": ["|b1"],
+    "patch.surviving": ["<i4", "<i8"],
+}
+
+
+def _r55_store_plane_contract(gauge_mode) -> dict:
+    planes = dict(_RUN_STORE_CORE_DTYPES)
+    if str(gauge_mode) == "per_cell":
+        planes.update(_RUN_STORE_PATCH_DTYPES)
+    return {"planes": planes}
+
+
+def _r55_array_digest(value) -> str:
+    """SHA-256 of dtype/shape/raw bytes (identity helper, never retained)."""
+    import numpy as np
+
+    arr = np.ascontiguousarray(value)
+    h = hashlib.sha256()
+    h.update(arr.dtype.str.encode("ascii"))
+    h.update(zrs.canonical_json([int(v) for v in arr.shape]))
+    h.update(arr.tobytes())
+    return h.hexdigest()
+
+
+def _r55_digest_tree(value, label: str = "value"):
+    """Deterministic, JSON-safe digest tree (arrays are hashed, not inlined)."""
+    import numpy as np
+
+    if isinstance(value, np.ndarray):
+        return {
+            "__array_sha256__": _r55_array_digest(value),
+            "dtype": value.dtype.str,
+            "shape": [int(v) for v in value.shape],
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _r55_digest_tree(item, f"{label}.{key}")
+            for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _r55_digest_tree(item, f"{label}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, np.generic):
+        return _r55_digest_tree(value.item(), label)
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return {"__non_finite__": repr(value)}
+        return value
+    return {"__type__": f"{type(value).__module__}.{type(value).__qualname__}"}
+
+
+def _r55_sha256_json(value) -> str:
+    return hashlib.sha256(zrs.canonical_json(_r55_digest_tree(value))).hexdigest()
+
+
+def _r55_build_run_store_identity(
+    *,
+    run_id: str,
+    descs,
+    canvas,
+    bundle,
+    halo_px: int,
+    halo_provenance,
+    global_gauge,
+    global_frame_ids,
+    gauge_mode: str,
+    science_config,
+    workers: int | None,
+    prefetch_units: int | None,
+) -> dict:
+    """Build the frozen scientific identity of THIS run (plan §6.1)."""
+    import socket as _socket
+
+    frames = []
+    for order, desc in enumerate(descs or ()):
+        path = str(desc.frame_id.logical_path)
+        content_sha, nbytes = zrs.content_sha256_file(path)
+        frames.append(
+            {
+                "frame_id": path,
+                "content_sha256": content_sha,
+                "nbytes": int(nbytes),
+                "order": int(order),
+                "role": "light",
+            }
+        )
+    inputs = {
+        "aggregate_sha256": _r55_sha256_json(
+            [[f["frame_id"], f["content_sha256"], f["nbytes"], f["order"]] for f in frames]
+        ),
+        "frames": frames,
+    }
+    layout = dict(getattr(bundle, "layout", {}) or {})
+    cell_ids = sorted(str(task[0].cell_id) for task in bundle.cell_tasks)
+    bounds = []
+    memberships = []
+    for _row, _col, cell, _patch, mem in bundle.cell_ctxs:
+        core = cell.core
+        bounds.append(
+            [
+                str(cell.cell_id),
+                int(core.x0),
+                int(core.y0),
+                int(core.x1),
+                int(core.y1),
+            ]
+        )
+        memberships.append(
+            [
+                str(cell.cell_id),
+                [str(v) for v in mem.core_ids],
+                [str(v) for v in mem.patch_ids],
+            ]
+        )
+    canvas_shape = [int(canvas.height), int(canvas.width)]
+    canvas_block = {
+        "shape": canvas_shape,
+        "wcs_sha256": hashlib.sha256(str(canvas.wcs_header).encode("utf-8")).hexdigest(),
+        "geometry_sha256": _r55_sha256_json(
+            {
+                "canvas_id": str(getattr(canvas, "canvas_id", "")),
+                "shape": canvas_shape,
+                "resolution_deg": float(getattr(canvas, "resolution_deg", 0.0)),
+            }
+        ),
+    }
+    grid_block = {
+        "nx": int(layout.get("nx", 0) or 0) or 1,
+        "ny": int(layout.get("ny", 0) or 0) or 1,
+        "tile_px": int(getattr(bundle, "cpu_streaming_tile", 1) or 1),
+        "geometry_sha256": _r55_sha256_json(bounds),
+        "cell_ids_sha256": _r55_sha256_json(cell_ids),
+    }
+    provenance = (
+        _r55_digest_tree(halo_provenance)
+        if halo_provenance is not None
+        else {"effective_px": int(halo_px), "source": "run_parameter"}
+    )
+    halo_block = {"halo_px": int(halo_px), "provenance": provenance}
+    memberships_block = {
+        "sha256": _r55_sha256_json(memberships),
+        "n_cells": int(len(memberships)),
+    }
+    try:
+        reference_index = int(global_gauge.reference_index)
+        reference_frame_id = str(global_frame_ids[reference_index])
+    except Exception:
+        reference_index = None
+        reference_frame_id = None
+    gauge_block = {
+        "mode": str(gauge_mode),
+        "reference_frame_id": reference_frame_id,
+        "reference_frame_ids": [str(v) for v in (global_frame_ids or ())],
+        "n_exclusions": int(
+            len(getattr(global_gauge, "exclusions", ()) or ())
+        ),
+        "sha256": _r55_sha256_json(
+            {
+                "gauge": _r55_digest_tree(
+                    {
+                        key: value
+                        for key, value in vars(global_gauge).items()
+                        if key != "reference_index"
+                    }
+                    if hasattr(global_gauge, "__dict__")
+                    else {}
+                ),
+                "reference_index": reference_index,
+                "reference_frame_id": reference_frame_id,
+                "frame_ids": [str(v) for v in (global_frame_ids or ())],
+                "mode": str(gauge_mode),
+            }
+        ),
+    }
+    try:
+        science_params = _r55_digest_tree(vars(science_config))
+    except TypeError:
+        science_params = {"__type__": type(science_config).__name__}
+    science_block = {
+        "sha256": _r55_sha256_json(science_params),
+        "contract_version": str(
+            getattr(science_config, "contract_version", "zegrid-science-v1")
+        ),
+        "params": science_params,
+    }
+    backend_token = (
+        str(getattr(bundle, "chosen_mode", "") or "") and "cpu"
+    )
+    backend_block = {
+        "backend": "cpu",
+        "tile_px": int(getattr(bundle, "cpu_streaming_tile", 1) or 1),
+        "parity_qualified": False,
+    }
+    try:
+        ram = int(available_memory_bytes())
+    except Exception:
+        ram = None
+    execution_context = {
+        "available_ram_bytes": ram,
+        "workers": None if workers is None else int(workers),
+        "prefetch_units": None if prefetch_units is None else int(prefetch_units),
+        "host": _socket.gethostname(),
+        "note": (
+            "runtime-only context: a RAM/workers/prefetch change never "
+            "invalidates scientific identity"
+        ),
+    }
+    return zrs.build_run_identity(
+        run_id=str(run_id),
+        inputs=inputs,
+        canvas=canvas_block,
+        grid=grid_block,
+        halo=halo_block,
+        memberships=memberships_block,
+        gauge=gauge_block,
+        science=science_block,
+        dtypes=_r55_store_plane_contract(gauge_mode),
+        backend=backend_block,
+        execution_context=execution_context,
+    )
+
+
+def _r55_open_run_store(store_dir, *, identity, budget_bytes, session_id):
+    """Open (or create) the durable store. Returns ``(store, error)``."""
+    try:
+        budget = zrs.DiskBudget(
+            durable_cell_bytes=int(budget_bytes or 0),
+            transactional_margin_bytes=zrs.default_transactional_margin(
+                int(budget_bytes or 0) or zrs.MIN_TRANSACTIONAL_MARGIN_BYTES
+            ),
+        )
+        store = zrs.RunCellStore.open(
+            str(store_dir),
+            identity=identity,
+            budget=budget,
+            session_id=session_id,
+        )
+    except Exception as exc:  # explicit refusal, never a silent fallback
+        return None, exc
+    return store, None
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -10969,7 +11233,7 @@ def _run_single(
                         _r = wave_results[_index]
                         _cid = str(_r.get("cell_id", ""))
                         try:
-                            result_registry.accept(
+                            _receipt = result_registry.accept(
                                 _r,
                                 backend=str(
                                     _r.get("backend_used") or "cpu"
@@ -11015,6 +11279,57 @@ def _run_single(
                             )
                             _acceptance.result_registry = result_registry
                             raise _acceptance from _reg_exc
+                        # M2: durable hand-off. The store commits the accepted
+                        # payload and only THEN releases the registry's large
+                        # arrays (light receipt retained). A store failure keeps
+                        # the payload in RAM and degrades to M1 conservation.
+                        _store = _store_state["store"]
+                        if (
+                            _store is not None
+                            and _store_state["publishing"]
+                            and _receipt is not None
+                            and not _receipt.idempotent
+                        ):
+                            try:
+                                _handoff = _store.commit_and_release(
+                                    result_registry,
+                                    _cid,
+                                    attempt_id=_receipt.attempt_id,
+                                    backend=_receipt.backend,
+                                    plan_generation=int(wave_generation),
+                                )
+                            except zrs.RunStoreError as _store_exc:
+                                _store_state["publishing"] = False
+                                _store_state["degraded_reason"] = (
+                                    f"{type(_store_exc).__name__}: "
+                                    f"{_store_exc}"
+                                )
+                                _store_state["commit_errors"].append(
+                                    {
+                                        "cell_id": _cid,
+                                        "attempt_id": _receipt.attempt_id,
+                                        "error": _store_state[
+                                            "degraded_reason"
+                                        ],
+                                    }
+                                )
+                                _emit(
+                                    "ZeGrid: durable commit FAILED for "
+                                    f"{_cid} ({_store_state['degraded_reason']}"
+                                    "). Prior commits are preserved; this and "
+                                    "later cells stay in memory (no durable "
+                                    "claim, no release).",
+                                    lvl="ERROR",
+                                    callback=progress_callback,
+                                )
+                            else:
+                                _store_state["commits"] += 1
+                                _rel = _handoff.get("release") or {}
+                                if _rel.get("released"):
+                                    _store_state["released_cells"] += 1
+                                    _store_state["released_bytes"] += int(
+                                        _rel.get("released_bytes", 0)
+                                    )
                         wave_results[_index] = None
                 finally:
                     # Honest transient ownership: accepted payloads are owned by
@@ -11218,9 +11533,17 @@ def _run_single(
             terminal=terminal_info,
         )
         if result_registry is not None:
-            results_local = list(
-                result_registry.ordered_payloads(canonical_cids)
-            )
+            _store = _store_state["store"]
+            if _store is not None:
+                # Cells committed durably were released from RAM; reload them
+                # (verified, read-only) so assembly receives the exact payloads.
+                results_local = list(
+                    _store.ordered_payloads(result_registry, canonical_cids)
+                )
+            else:
+                results_local = list(
+                    result_registry.ordered_payloads(canonical_cids)
+                )
         return (
             results_local,
             meta,
@@ -12612,6 +12935,82 @@ def _run_single(
                 or "global"
             ),
         )
+    # M2: OPTIONAL durable per-cell store. It is enabled ONLY when the caller
+    # configures an explicit run-store directory. Opening/committing never
+    # changes the science, the budgets, the floors or the final publication; a
+    # store failure is logged and DEGRADES to the M1 in-memory conservation
+    # (no partial commit is ever visible, no payload is released before its
+    # commit is durable).
+    _store_state = {
+        "enabled": False,
+        "store": None,
+        "publishing": False,
+        "commits": 0,
+        "released_cells": 0,
+        "released_bytes": 0,
+        "open_error": None,
+        "degraded_reason": None,
+        "commit_errors": [],
+    }
+    _store_dir = (
+        getattr(zconfig, "zegrid_durable_store_dir", None)
+        if zconfig is not None
+        else None
+    )
+    if _store_dir and result_registry is not None:
+        _store_error = None
+        try:
+            _store_identity = _r55_build_run_store_identity(
+                run_id=str(result_registry.run_id),
+                descs=descs,
+                canvas=canvas,
+                bundle=_initial_bundle,
+                halo_px=int(halo_px),
+                halo_provenance=halo_provenance,
+                global_gauge=global_gauge,
+                global_frame_ids=global_frame_ids,
+                gauge_mode=str(
+                    getattr(science_config, "cell_gauge_mode", "global")
+                    or "global"
+                ),
+                science_config=science_config,
+                workers=workers,
+                prefetch_units=None,
+            )
+            _store_budget_bytes = int(
+                getattr(zconfig, "zegrid_durable_store_budget_bytes", 0) or 0
+            )
+            _store, _store_error = _r55_open_run_store(
+                _store_dir,
+                identity=_store_identity,
+                budget_bytes=_store_budget_bytes,
+                session_id=str(result_registry.run_id),
+            )
+        except Exception as exc:  # explicit refusal, never silent
+            _store, _store_error = None, exc
+        if _store is None:
+            _store_state["open_error"] = (
+                f"{type(_store_error).__name__}: {_store_error}"
+            )
+            _emit(
+                "ZeGrid: durable run store UNAVAILABLE — "
+                f"{_store_state['open_error']}. Continuing with in-memory "
+                "conservation only (no durable commit claimed).",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+        else:
+            _store_state.update(
+                enabled=True, store=_store, publishing=True
+            )
+            _emit(
+                "ZeGrid: durable run store ACTIVE — "
+                f"root={_store_dir} run_id={_store.run_id} "
+                f"budget={(_store.budget.to_dict() if _store.budget else None)} "
+                f"lock_orphan_recovered="
+                f"{bool((_store.report().get('lock_info') or {}).get('orphan_recovered'))}",
+                callback=progress_callback,
+            )
     # R55-E11: the ORIGINAL GPU selection/decision survives a runtime fallback.
     # The control-flow variable is cleared (the CPU path owns execution), but the
     # decision, its effective mapping and its runtime adaptation are retained so
@@ -13600,6 +13999,22 @@ def _run_single(
         per_cell_diagnostics["r55_result_registry"] = (
             result_registry.snapshot()
         )
+    # M2: durable-store audit (no payloads, no arrays). Recorded ONLY when a
+    # store was requested, so a store-less run keeps its exact manifest shape.
+    if _store_state["enabled"] or _store_state["open_error"] is not None:
+        _store = _store_state["store"]
+        per_cell_diagnostics["r55_durable_store"] = {
+            "schema": zrs.STORE_SCHEMA,
+            "requested": True,
+            "enabled": bool(_store_state["enabled"]),
+            "open_error": _store_state["open_error"],
+            "degraded_reason": _store_state["degraded_reason"],
+            "commit_errors": list(_store_state["commit_errors"]),
+            "commits": int(_store_state["commits"]),
+            "released_cells": int(_store_state["released_cells"]),
+            "released_bytes": int(_store_state["released_bytes"]),
+            "store": (None if _store is None else _store.report()),
+        }
 
     # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
     export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
@@ -13664,6 +14079,17 @@ def _run_single(
             "ZeGrid: run result registry disposed after successful publication "
             f"({_disposal.get('released_cells', 0)} cell(s), "
             f"{_disposal.get('released_bytes', 0)} B released)",
+            callback=progress_callback,
+        )
+    if _store_state["store"] is not None:
+        try:
+            _store_state["store"].close()
+        finally:
+            _store_state["publishing"] = False
+        _emit(
+            "ZeGrid: durable run store closed after successful publication "
+            f"({_store_state['commits']} durable cell commit(s), "
+            f"{_store_state['released_bytes']} B released from RAM)",
             callback=progress_callback,
         )
     results = []

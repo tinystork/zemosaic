@@ -119,6 +119,15 @@ class AcceptanceError(RunRegistryError):
     """The payload is invalid or cannot be fingerprinted/accounted."""
 
 
+class PayloadReleasedError(RunRegistryError):
+    """A released cell's payload is no longer in RAM (M2 durable hand-off).
+
+    The receipt/metadata survive; only the large arrays were released after a
+    durable commit. Callers must re-read the cell from the run store instead of
+    pretending the in-memory payload still exists.
+    """
+
+
 class UnsupportedBufferOwnerError(AcceptanceError):
     """A payload array has a backing owner this registry cannot account."""
 
@@ -683,8 +692,10 @@ class RetainedCell:
     logical_bytes: int
     retained_bytes: int
     buffer_count: int
-    payload: Mapping[str, Any] = field(repr=False)
     sequence: int
+    payload: Mapping[str, Any] | None = field(default=None, repr=False)
+    released: bool = False
+    released_bytes: int = 0
 
     def metadata(self) -> dict:
         return {
@@ -707,6 +718,8 @@ class RetainedCell:
             "retained_bytes": int(self.retained_bytes),
             "buffer_count": int(self.buffer_count),
             "sequence": int(self.sequence),
+            "released": bool(self.released),
+            "released_bytes": int(self.released_bytes),
         }
 
 
@@ -900,7 +913,10 @@ class RunResultRegistry:
         self._retained_bytes = 0
         self._memmap_bytes = 0
         self._buffer_sizes: dict[int, int] = {}
+        self._buffer_refs: dict[int, int] = {}
         self._empty_count = 0
+        self._released_count = 0
+        self._released_bytes = 0
         self._disposed = False
         self._dispose_summary: dict | None = None
         self._events: deque[dict] = deque(maxlen=int(max_events))
@@ -1126,8 +1142,10 @@ class RunResultRegistry:
             self._order.append(cell_id)
             for key, entry in accounting["buffers"].items():
                 if key in self._buffer_sizes:
+                    self._buffer_refs[key] = int(self._buffer_refs.get(key, 1)) + 1
                     continue
                 self._buffer_sizes[key] = int(entry["bytes"])
+                self._buffer_refs[key] = 1
                 self._retained_bytes += int(entry["bytes"])
                 if entry["kind"] in (
                     "memmap", "memmap_mapping", "memmap_view"
@@ -1225,6 +1243,86 @@ class RunResultRegistry:
             cell = self._cells.get(str(cell_id))
             return None if cell is None else cell.payload
 
+    def release_payload(
+        self,
+        cell_id: str,
+        *,
+        expected_payload_sha256: str | None = None,
+    ) -> dict:
+        """Release ONE cell's large arrays after a durable commit (idempotent).
+
+        The accepted record, its digest and its counts stay; only the payload
+        reference and its uniquely-owned buffers are dropped. A shared backing
+        allocation is decremented by reference and counted once, so a release
+        can never make ``retained_bytes`` lie.
+        """
+        cid = str(cell_id)
+        with self._lock:
+            if self._disposed:
+                raise RegistryClosedError("registry has been disposed")
+            cell = self._cells.get(cid)
+            if cell is None:
+                raise UnexpectedCellError(
+                    f"cell {cid} was never accepted by run {self.run_id}"
+                )
+            if expected_payload_sha256 is not None and (
+                str(expected_payload_sha256) != cell.payload_sha256
+            ):
+                raise AcceptanceError(
+                    f"cell {cid} release refused: durable payload digest "
+                    f"{expected_payload_sha256} != accepted "
+                    f"{cell.payload_sha256}"
+                )
+            if cell.released:
+                return {
+                    "schema": SCHEMA,
+                    "cell_id": cid,
+                    "released": False,
+                    "already_released": True,
+                    "payload_sha256": cell.payload_sha256,
+                    "released_bytes": 0,
+                    "cell_released_bytes": int(cell.released_bytes),
+                    "retained_bytes": int(self._retained_bytes),
+                }
+            accounting = _buffer_accounting(cell.payload)
+            freed = 0
+            for key, entry in accounting["buffers"].items():
+                refs = int(self._buffer_refs.get(key, 0)) - 1
+                if refs > 0:
+                    self._buffer_refs[key] = refs
+                    continue
+                self._buffer_refs.pop(key, None)
+                size = int(self._buffer_sizes.pop(key, 0))
+                freed += size
+                if entry["kind"] in (
+                    "memmap", "memmap_mapping", "memmap_view"
+                ):
+                    self._memmap_bytes = max(0, self._memmap_bytes - size)
+            self._retained_bytes = max(0, self._retained_bytes - freed)
+            cell.released = True
+            cell.released_bytes = int(freed)
+            cell.payload = None
+            self._released_count += 1
+            self._released_bytes += int(freed)
+            self._journal(
+                "payload_released",
+                cell_id=cid,
+                attempt_id=cell.attempt_id,
+                payload_sha256=cell.payload_sha256,
+                released_bytes=int(freed),
+                retained_bytes=int(self._retained_bytes),
+            )
+            return {
+                "schema": SCHEMA,
+                "cell_id": cid,
+                "released": True,
+                "already_released": False,
+                "payload_sha256": cell.payload_sha256,
+                "released_bytes": int(freed),
+                "cell_released_bytes": int(freed),
+                "retained_bytes": int(self._retained_bytes),
+            }
+
     def receipt(self, cell_id: str) -> AcceptanceReceipt | None:
         with self._lock:
             cell = self._cells.get(str(cell_id))
@@ -1269,6 +1367,17 @@ class RunResultRegistry:
                 raise RunRegistryError(
                     "requested payloads include unaccepted cells: "
                     + ", ".join(missing)
+                )
+            released = [
+                cid
+                for cid in ordered
+                if self._cells[cid].payload is None
+            ]
+            if released:
+                raise PayloadReleasedError(
+                    "payload(s) already released after a durable commit: "
+                    + ", ".join(released)
+                    + "; re-read them from the run store"
                 )
             return [self._cells[cid].payload for cid in ordered]
 
@@ -1328,6 +1437,8 @@ class RunResultRegistry:
                 "retained_bytes": int(self._retained_bytes),
                 "memmap_bytes": int(self._memmap_bytes),
                 "retained_buffers": len(self._buffer_sizes),
+                "released_cells": int(self._released_count),
+                "released_bytes": int(self._released_bytes),
                 "generation": int(self._generation),
                 "disposed": bool(self._disposed),
             }
@@ -1382,6 +1493,9 @@ class RunResultRegistry:
             self._cells.clear()
             self._order.clear()
             self._buffer_sizes.clear()
+            self._buffer_refs.clear()
+            self._released_count = 0
+            self._released_bytes = 0
             self._empty_count = 0
             self._logical_bytes = 0
             self._retained_bytes = 0

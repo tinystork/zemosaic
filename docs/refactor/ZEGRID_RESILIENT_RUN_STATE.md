@@ -198,3 +198,13 @@ reviews. Only then decide whether to start M1. No commit/push authorized.
 - [x] Harness + launcher copied to C:\\Users\\JarvisJunior\\Desktop\\zgprobe\\m0_witness_tool (py 37948 B SHA 8426f9bb, ps1 2324 B); py_compile OK; psutil 7.2.2.
 - [x] Installed runtime = ZeAlfie slot rt-54e8c7a8ba26 (module SHA 8ccc629 = beta 231b597 LF).
 - [ ] Real-GPU witness run (Tristan foreground; node cannot hold 300 s).
+
+## M2 — durable store (implementation, 2026-10-27)
+
+- [x] `run_store.py`: frozen run identity/jauge, atomic per-cell commits, reconstructible index, single-writer OS lock (owner = pid + start token + boot id), sha256 integrity, disk budget with reservation/margin, sparse completeness, idempotence by `(cell_id, attempt_id)`.
+- [x] M1 registry: additive `release_payload` (idempotent, refcounted, digest-checked) + `PayloadReleasedError`; no M1 semantic weakened.
+- [x] Product seam: CPU accept → durable commit → RAM release; store failure degrades to M1 conservation (no release, no durable claim); assembly reloads released cells from the verified store; publication/science/budgets/floors untouched.
+- [x] Bench `tools/zegrid_resume_m2/` (fail-closed; skip ⇒ NOT_RUN).
+- [x] Linux: 39 store-contract + 20 kill-matrix cases pass; M1 (23+4) and M0 (1+20) non-regression pass.
+- [ ] NOT_RUN here: store-enabled real CPU run (2 cases) and M1 real-orchestration (6 cases) — host below the 1,200 MiB corpus floor; **all Windows execution** (bench shipped).
+- [ ] Junior verification + Nono review. Coco does not accept M2.

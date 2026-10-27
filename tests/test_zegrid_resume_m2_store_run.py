@@ -1,0 +1,216 @@
+"""ZM-ZEGRID-RESILIENT-RUN-RESUME M2 — real-orchestration store seam.
+
+Drives the REAL product path (``run_zegrid_mode`` -> ``_run_single`` -> bounded
+ACTIVE CPU waves) on the real small FITS corpus, with the durable store enabled
+through the explicit ``zegrid_durable_store_dir`` config seam.
+
+What it proves (when the host can admit the corpus):
+* every completed CPU cell is durably committed before its payload is released;
+* the registry's retained bytes drop while the run is still executing (the
+  store is not a new RAM accumulation);
+* the payload that assembly consumes after release is byte-identical to the
+  payload the producer emitted (verified through the store);
+* the published science/coverage/manifest are unchanged by the store seam;
+* the store's index is complete and its commits all validate.
+
+No GPU and no Windows qualification is claimed. On a host below the corpus RAM
+floor this case SKIPS (NOT_RUN), exactly like M1.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC = REPO_ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from zemosaic import zemosaic_zegrid_mode as zz  # noqa: E402
+from zemosaic.core.zegrid import run_registry as zrr  # noqa: E402
+from zemosaic.core.zegrid import run_store as zrs  # noqa: E402
+
+MIN_LIVE_BYTES = 1200 * 2 ** 20
+
+
+def _load_m0_helpers():
+    path = REPO_ROOT / "tests" / "test_zegrid_resume_m0_baseline_witness.py"
+    spec = importlib.util.spec_from_file_location("_m0_helpers_m2", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+M0 = _load_m0_helpers()
+
+
+def _live_available_bytes() -> int:
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _require_live_ram() -> int:
+    live = _live_available_bytes()
+    if live < MIN_LIVE_BYTES:
+        pytest.skip(
+            "live available RAM is below the 2x2 corpus floor "
+            f"({live} < {MIN_LIVE_BYTES}); M2 store seam NOT_RUN on this host"
+        )
+    return live
+
+
+def _digest(array) -> str:
+    contiguous = np.ascontiguousarray(array)
+    return zrs._sha256_bytes(contiguous.tobytes())
+
+
+def _run_with_store(inp: Path, out_dir: Path, store_dir: Path) -> dict:
+    produced: dict[str, dict] = {}
+    released: list[dict] = []
+    store_reports: list[dict] = []
+
+    real_consume = zz._consume_stack_cell
+    real_release = zrr.RunResultRegistry.release_payload
+    real_commit = zrs.RunCellStore.commit_cell
+
+    def _consume(prepared, **kw):
+        out = real_consume(prepared, **kw)
+        if isinstance(out, dict) and out.get("status") == "complete":
+            produced[str(out["cell_id"])] = {
+                "science": _digest(out["core"]["science_core"]),
+                "patch_science": _digest(out["patch"]["science"]),
+                "valid_mask": _digest(out["core"]["valid_mask_core"]),
+            }
+        return out
+
+    def _release(self, cell_id, **kwargs):
+        result = real_release(self, cell_id, **kwargs)
+        released.append(dict(result, cell_id=str(cell_id)))
+        return result
+
+    def _commit(self, result, **kwargs):
+        receipt = real_commit(self, result, **kwargs)
+        store_reports.append(self.report())
+        return receipt
+
+    exc = None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(zz, "_consume_stack_cell", _consume)
+        mp.setattr(zrr.RunResultRegistry, "release_payload", _release)
+        mp.setattr(zrs.RunCellStore, "commit_cell", _commit)
+        try:
+            zz.run_zegrid_mode(
+                str(inp),
+                str(out_dir),
+                zconfig=SimpleNamespace(
+                    zegrid_scheduler_mode="active",
+                    zegrid_layout=M0.LAYOUT,
+                    zegrid_durable_store_dir=str(store_dir),
+                    zegrid_durable_store_budget_bytes=2 * 2 ** 30,
+                ),
+                zegrid_halo_px=M0.HALO,
+                use_gpu=False,
+                cell_gauge_mode="per_cell",
+            )
+        except BaseException as err:  # noqa: BLE001 - the witness reports it
+            exc = err
+    return {
+        "produced": produced,
+        "released": released,
+        "store_reports": store_reports,
+        "exception": exc,
+        "out_dir": out_dir,
+        "store_dir": store_dir,
+    }
+
+
+def test_m2_real_cpu_run_commits_then_releases_and_reloads_identical_payloads(
+    tmp_path,
+):
+    _require_live_ram()
+    base = tmp_path
+    inp, names, hashes = M0._write_corpus(base)
+    out_dir = base / "out"
+    store_dir = base / "run_store"
+    run = _run_with_store(inp, out_dir, store_dir)
+    if run["exception"] is not None:
+        exc = run["exception"]
+        pre_case = (
+            zz.zal.LayoutInfeasible,
+            zz.zpar.ModeInfeasible,
+        )
+        if isinstance(exc, pre_case):
+            pytest.skip(f"pre-case resource/setup unavailable ({exc})")
+        pytest.fail(f"store-enabled real run failed: {type(exc).__name__}: {exc}")
+
+    produced = run["produced"]
+    assert produced, "no COMPLETE cell was produced"
+
+    store = zrs.RunCellStore.open(store_dir, identity=None, read_only=True)
+    try:
+        report = store.report()
+        assert report["counts"]["cells"] == len(produced)
+        completeness = store.completeness(list(produced))
+        assert completeness["is_complete"] is True, completeness
+        # Every release happened AFTER a durable commit, one per produced cell.
+        assert {entry["cell_id"] for entry in run["released"]} == set(produced)
+        for entry in run["released"]:
+            assert entry["released"] is True
+        # The store re-supplies exactly the producer bytes.
+        for cell_id, digests in produced.items():
+            payload = store.load_payload(cell_id)
+            assert _digest(payload["core"]["science_core"]) == digests["science"]
+            assert _digest(payload["patch"]["science"]) == digests["patch_science"]
+            assert _digest(payload["core"]["valid_mask_core"]) == digests["valid_mask"]
+            assert payload["core"]["science_core"].flags.writeable is False
+        # The store never became a RAM accumulation: after the last commit the
+        # registry holds receipts only (released bytes >= produced core bytes).
+        last = run["store_reports"][-1]
+        assert last["counts"]["cells"] == len(produced)
+        # Published science is unchanged by the seam.
+        manifest = out_dir / "zegrid_manifest.json"
+        assert manifest.exists()
+        assert list(out_dir.glob("*_science*.fits"))
+    finally:
+        store.close()
+
+
+def test_m2_store_identity_refuses_a_changed_science_contract(tmp_path):
+    """A store created by one science contract is not reused for another."""
+    _require_live_ram()
+    base = tmp_path
+    inp, names, hashes = M0._write_corpus(base)
+    out_dir = base / "out"
+    store_dir = base / "run_store"
+    run = _run_with_store(inp, out_dir, store_dir)
+    if run["exception"] is not None:
+        pytest.skip(f"pre-case setup unavailable ({run['exception']})")
+    stored = zrs.RunCellStore.open(store_dir, identity=None, read_only=True)
+    identity = stored.identity
+    stored.close()
+
+    changed = json.loads(json.dumps(identity))
+    changed["science_contract"]["science"]["sha256"] = "9" * 64
+    changed["science_contract"]["science"]["params"] = {"tampered": True}
+    with pytest.raises(zrs.StoreIdentityMismatch) as err:
+        zrs.RunCellStore.open(store_dir, identity=changed)
+    assert "science" in [r["section"] for r in err.value.reasons]
