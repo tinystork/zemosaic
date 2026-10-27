@@ -112,6 +112,7 @@ from .core.zegrid import photometric as zphot
 from .core.zegrid import ram_contract as rcontract
 from .core.zegrid import resource_envelope as renv
 from .core.zegrid import runtime_control as zrt
+from .core.zegrid import run_registry as zrr
 from .core.zegrid import scheduler as zsched
 from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
@@ -8143,6 +8144,7 @@ def _r55_gpu_failure_record(
                     "attempted": bool(record.get("attempted")),
                     "completed": bool(record.get("completed")),
                     "discarded": bool(record.get("discarded")),
+                    "retained": bool(record.get("retained")),
                 }
                 for record in (tile_state.get("units") or [])
             ],
@@ -8419,6 +8421,50 @@ class _R55RunRefused(RuntimeError):
         self.record["storage_fallback_eligible"] = bool(
             storage_fallback_eligible
         )
+
+
+class _R55RunConservedResults(RuntimeError):
+    """M1: the run stopped while K accepted cell results are explicitly owned.
+
+    Raised instead of the historical whole-batch CPU re-run when a GPU refusal
+    happens AFTER one or more cells were accepted. Recomputing those cells on
+    CPU would double the work and silently mix backends, which is forbidden
+    until numeric parity is qualified. The retained payloads stay owned by
+    ``result_registry`` (accessible here) until the coordinator/test adapter
+    calls ``dispose()``. Nothing is published and M1 makes no durable-resume
+    claim.
+    """
+
+    def __init__(
+        self,
+        reason_code,
+        detail,
+        *,
+        record,
+        result_registry,
+        category="resource_shortage",
+    ):
+        super().__init__(f"{reason_code}: {detail}")
+        self.reason_code = str(reason_code)
+        self.detail = str(detail)
+        self.record = dict(record)
+        self.result_registry = result_registry
+        self.category = str(category)
+
+
+class _R55RunStopRequested(RuntimeError):
+    """M1: a cooperative stop was honoured at a safe boundary.
+
+    The acknowledged state is IN-MEMORY only (``STOPPED_IN_MEMORY``); M1 makes
+    no durable ``STOPPED_RESUMABLE`` claim (M2–M4). Accepted payloads remain
+    owned by ``result_registry`` until explicit disposal.
+    """
+
+    def __init__(self, reason, *, record, result_registry):
+        super().__init__(f"R55_STOP_REQUESTED: {reason}")
+        self.reason = str(reason)
+        self.record = dict(record)
+        self.result_registry = result_registry
 
 
 def _r55_run_disk_root(cache_root, output_dir) -> Path:
@@ -10467,7 +10513,8 @@ def _run_single(
         return _res, _meta
 
     def _run_r55_active_cpu_waves(*, science_cfg, start_bundle,
-                                  start_candidate, start_mapping):
+                                  start_candidate, start_mapping,
+                                  result_registry=None):
         """E1: deterministic bounded waves + a fresh checkpoint before EACH.
 
         Only the active CPU path reaches this closure. Legacy/observe keep the
@@ -10716,6 +10763,11 @@ def _run_single(
                 "manifest": False,
                 "assembly": False,
             }
+            if result_registry is not None:
+                # M1: retained accepted results stay explicitly owned and
+                # reachable from the typed refusal until disposal.
+                exc.record["result_registry"] = result_registry.snapshot()
+                exc.result_registry = result_registry
             exc.record["telemetry"] = zrt.build_run_telemetry(
                 waves=wave_telemetry,
                 checkpoints=checkpoints,
@@ -10732,6 +10784,27 @@ def _run_single(
             )
 
         while offset < total_tasks:
+            if result_registry is not None and result_registry.stop_requested:
+                result_registry.acknowledge_stop(
+                    "STOPPED_IN_MEMORY",
+                    f"stop honoured before CPU wave {wave_index}",
+                )
+                raise _R55RunStopRequested(
+                    f"stop honoured before CPU wave {wave_index}",
+                    record={
+                        "schema": zrt.RUN_CONTROL_SCHEMA,
+                        "stage": "stop",
+                        "status": "stopped_in_memory",
+                        "wave_index": int(wave_index),
+                        "result_registry": result_registry.snapshot(),
+                        "durable_stopped_resumable": False,
+                        "note": (
+                            "M1 in-memory conservation only; no disk restart "
+                            "claim"
+                        ),
+                    },
+                    result_registry=result_registry,
+                )
             remaining_units = sum(
                 1 for t in all_tasks[offset:] if t[4] is not None
             )
@@ -10741,7 +10814,7 @@ def _run_single(
                 try:
                     latched_fact = latch.consume_validated()
                 except zrt.RuntimeControlError as exc:
-                    raise _R55RunRefused(
+                    _malformed = _R55RunRefused(
                         renv.REASON_REFUSE_HOST_RAM,
                         f"malformed latched RUN fact: {exc}",
                         record={
@@ -10759,7 +10832,13 @@ def _run_single(
                                 for x in _R55E1_UNAVAILABLE_SHRINKS
                             ],
                         },
-                    ) from exc
+                    )
+                    if result_registry is not None:
+                        _malformed.result_registry = result_registry
+                        _malformed.record["result_registry"] = (
+                            result_registry.snapshot()
+                        )
+                    raise _malformed from exc
                 checkpoint = _r55_run_checkpoint(
                     decision=run_decision,
                     candidate=candidate,
@@ -10796,6 +10875,13 @@ def _run_single(
                 all_tasks = _recovery["tasks"]
                 total_tasks = len(all_tasks)
                 canonical_cids = [t[0].cell_id for t in all_tasks]
+                if result_registry is not None:
+                    # Fencing groundwork: results from the pre-recovery plan are
+                    # older than the new generation and can no longer be
+                    # accepted; the accepted prefix itself stays immutable.
+                    result_registry.advance_generation(
+                        reason="dense_to_bounded_storage"
+                    )
                 checkpoints.append({
                     "schema": zrt.RUN_CONTROL_SCHEMA,
                     "stage": _R55E1_RUN_STAGE,
@@ -10851,6 +10937,14 @@ def _run_single(
             )
             wave_tasks = bundle.cell_tasks[start:end]
             wave_units = int(len(wave_tasks))
+            # M1 REWORK-2: capture the authorised generation BEFORE the wave is
+            # dispatched. A transition that happens while the wave is in flight
+            # must not stamp old results with the new generation.
+            wave_generation = (
+                result_registry.dispatch_generation()
+                if result_registry is not None
+                else 0
+            )
             wave_t0 = time.perf_counter()
             wave_results, wave_meta = _run_cell_batch(
                 science_cfg,
@@ -10864,7 +10958,73 @@ def _run_single(
                 heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
             )
             wave_wall = time.perf_counter() - wave_t0
-            results_local.extend(wave_results)
+            if result_registry is not None:
+                # M1: accept each successful cell as its own transaction. The
+                # generation was captured at DISPATCH (before the wave), never
+                # adopted when a result arrives. A CPU wave may complete out of
+                # order; each result is independent and the registry (not this
+                # transient list) owns the payload afterwards.
+                try:
+                    for _index in range(len(wave_results)):
+                        _r = wave_results[_index]
+                        _cid = str(_r.get("cell_id", ""))
+                        try:
+                            result_registry.accept(
+                                _r,
+                                backend=str(
+                                    _r.get("backend_used") or "cpu"
+                                ),
+                                plan_generation=int(wave_generation),
+                                attempt_id=(
+                                    f"cpu-wave:{int(wave_generation)}:"
+                                    f"{wave_index}:{_cid}"
+                                ),
+                            )
+                        except zrr.RunRegistryError as _reg_exc:
+                            _emit(
+                                "ZeGrid: CPU result acceptance failed for "
+                                f"{_cid}: {_reg_exc}",
+                                lvl="ERROR",
+                                callback=progress_callback,
+                            )
+                            _acceptance = _R55RunRefused(
+                                "R55_RUN_RESULT_ACCEPTANCE",
+                                f"cell {_cid} acceptance failed: {_reg_exc}",
+                                record={
+                                    "schema": zrt.RUN_CONTROL_SCHEMA,
+                                    "status": "refused",
+                                    "reason_code": "R55_RUN_RESULT_ACCEPTANCE",
+                                    "detail": str(_reg_exc),
+                                    "wave_index": int(wave_index),
+                                    "cell_id": _cid,
+                                    "generation": int(wave_generation),
+                                    "result_registry": (
+                                        result_registry.snapshot()
+                                    ),
+                                    "publication": {
+                                        "fits": False,
+                                        "manifest": False,
+                                        "assembly": False,
+                                    },
+                                    "note": (
+                                        "Internal acceptance/schema failure, "
+                                        "not a resource shortage; accepted "
+                                        "payloads remain owned"
+                                    ),
+                                },
+                            )
+                            _acceptance.result_registry = result_registry
+                            raise _acceptance from _reg_exc
+                        wave_results[_index] = None
+                finally:
+                    # Honest transient ownership: accepted payloads are owned by
+                    # the registry; unaccepted ones are dropped, and the local
+                    # list can never retain a large array through a traceback.
+                    for _index in range(len(wave_results)):
+                        wave_results[_index] = None
+                    wave_results.clear()
+            else:
+                results_local.extend(wave_results)
             metas.append(wave_meta)
             remaining_after = sum(
                 1 for t in all_tasks[end:] if t[4] is not None
@@ -10978,9 +11138,15 @@ def _run_single(
                 f"{detail}. No FITS, manifest or science publication.",
                 lvl="ERROR", callback=progress_callback,
             )
-            raise _R55RunRefused(
+            _terminal_refused = _R55RunRefused(
                 renv.REASON_REFUSE_HOST_RAM, detail, record=record
-            ) from exc
+            )
+            if result_registry is not None:
+                _terminal_refused.result_registry = result_registry
+                _terminal_refused.record["result_registry"] = (
+                    result_registry.snapshot()
+                )
+            raise _terminal_refused from exc
         terminal_info = None
         if terminal_fact is not None:
             terminal_info = {
@@ -11051,6 +11217,10 @@ def _run_single(
             deterministic_ref=zrt.sha256_payload(run_block),
             terminal=terminal_info,
         )
+        if result_registry is not None:
+            results_local = list(
+                result_registry.ordered_payloads(canonical_cids)
+            )
         return (
             results_local,
             meta,
@@ -11065,7 +11235,7 @@ def _run_single(
 
     def _run_r55_active_gpu_units(
         *, gpu_bundle, gpu_mapping, gpu_decision, gpu_candidate=None,
-        unit_progress=None
+        unit_progress=None, result_registry=None
     ):
         """R55-E2: bounded CPU->GPU producer/consumer pipeline (single owner).
 
@@ -11282,6 +11452,18 @@ def _run_single(
                 _safe_rmtree(cache_dir, None)
 
         _unit_progress = {"done": 0}
+        # M1: capture the authorised generation at DISPATCH. The completion
+        # callback never adopts whatever generation happens to be current.
+        gpu_dispatch_generation = (
+            int(result_registry.generation)
+            if result_registry is not None
+            else 0
+        )
+        # M1: accepted GPU unit indices. The consumer runs on the CALLING thread
+        # (single owner); the set is still guarded because diagnostics/fallback
+        # readers may run while an accept is in flight in future wiring.
+        accepted_units: set[int] = set()
+        accepted_lock = threading.Lock()
 
         def _consume_guarded(payload):
             try:
@@ -11289,20 +11471,91 @@ def _run_single(
             except BaseException as exc:
                 _capture_failure("consumer", exc, payload=payload)
                 raise
-            # Report ONLY a successful, non-discarded unit. A later batch-level
-            # failure discards these results and the CPU rerun re-reports its own
-            # real cells; nothing is ever counted before ``_consume`` succeeds.
-            _unit_progress["done"] += 1
+            # Report ONLY a successful, non-idempotent acceptance. A rejected /
+            # stale / duplicate callback must not add a completion count.
             if unit_progress is not None:
                 try:
                     cid = getattr(payload.get("cell"), "cell_id", None)
                     unit_progress(int(_unit_progress["done"]), cid)
                 except Exception:
                     pass
-            return result
+            if result_registry is None:
+                _unit_progress["done"] += 1
+                return result
+            unit_index = int(payload.get("_unit_index", 0))
+            cid = str((result or {}).get("cell_id", ""))
+            try:
+                receipt = result_registry.accept(
+                    result,
+                    backend=str(result.get("backend_used") or "gpu"),
+                    plan_generation=int(gpu_dispatch_generation),
+                    attempt_id=(
+                        f"gpu-pipeline:{int(gpu_dispatch_generation)}:"
+                        f"{unit_index}:{cid}"
+                    ),
+                )
+            except (
+                zrr.StaleGenerationError,
+                zrr.FutureGenerationError,
+                zrr.DuplicateCellError,
+            ) as exc:
+                # A late/repeated callback must not contaminate the accepted
+                # state, and must not abort an otherwise healthy run. The cell
+                # simply remains pending (or keeps its first accepted record).
+                reason = (
+                    "stale_generation"
+                    if isinstance(exc, zrr.StaleGenerationError)
+                    else (
+                        "future_generation"
+                        if isinstance(exc, zrr.FutureGenerationError)
+                        else "duplicate_conflict"
+                    )
+                )
+                return {
+                    "_registry_receipt": True,
+                    "accepted": False,
+                    "reason": reason,
+                    "cell_id": cid,
+                    "detail": str(exc),
+                }
+            if not receipt.idempotent:
+                _unit_progress["done"] += 1
+            with accepted_lock:
+                accepted_units.add(int(unit_index))
+            # The pipeline keeps ONLY this lightweight receipt, never the
+            # payload: the registry is the single owner of the arrays.
+            return {
+                "_registry_receipt": True,
+                "accepted": True,
+                "cell_id": cid,
+                "receipt": receipt.to_dict(),
+            }
 
         def _consume(payload):
             unit_index = int(payload.get("_unit_index", 0))
+            if result_registry is not None and result_registry.stop_requested:
+                # M1 cooperative stop: honoured at the unit boundary, before
+                # staging/consuming new work. Accepted results stay retained.
+                result_registry.acknowledge_stop(
+                    "STOPPED_IN_MEMORY",
+                    f"stop honoured before GPU unit {unit_index}",
+                )
+                raise _R55RunStopRequested(
+                    f"stop honoured before GPU unit {unit_index}",
+                    record={
+                        "schema": zrt.RUN_CONTROL_SCHEMA,
+                        "stage": "stop",
+                        "status": "stopped_in_memory",
+                        "unit_index": int(unit_index),
+                        "result_registry": result_registry.snapshot(),
+                        "durable_stopped_resumable": False,
+                        "note": (
+                            "M1 in-memory conservation only; no disk restart "
+                            "claim"
+                        ),
+                    },
+                    result_registry=result_registry,
+                )
             if payload.get("_empty_unit"):
                 return _consume_stack_cell(payload)
 
@@ -11864,11 +12117,23 @@ def _run_single(
                     )
                 for _record in tile_state["units"]:
                     if _record.get("completed"):
-                        _record["discarded"] = True
+                        # M1: a completed unit accepted by the run registry is
+                        # RETAINED, not discarded. Only a unit whose result was
+                        # never accepted is discarded.
+                        _idx = int(_record.get("unit_index", -1))
+                        with accepted_lock:
+                            _keep = _idx in accepted_units
+                        _record["retained"] = bool(_keep)
+                        _record["discarded"] = not bool(_keep)
                     elif _record.get("status") == "executing":
                         _record["status"] = "failed"
                         _record["action"] = "fallback_cpu"
                         _record["discarded"] = True
+            if result_registry is not None:
+                _fallback_exc.telemetry = {
+                    **(getattr(_fallback_exc, "telemetry", None) or {}),
+                    "result_registry": result_registry.snapshot(),
+                }
             _fallback_pipeline = pipeline.telemetry()
             if str(_fallback_exc.reason_code) == str(zgr.REASON_REFUSE_VRAM):
                 _fallback_category = "vram_refusal"
@@ -11912,6 +12177,11 @@ def _run_single(
                 "diagnostics_path": _fallback_path,
             }
             raise
+        except _R55RunStopRequested:
+            # M1 cooperative stop: never relabel a requested stop as a GPU
+            # fallback (it must not trigger a CPU rerun or a conserved-refusal
+            # wrapper). The registry already owns every accepted payload.
+            raise
         except BaseException as exc:  # noqa: BLE001 - exactly one CPU fallback
             # Deterministic cleanup: the pipeline already released its staged
             # units; also clear any per-cell cache left by a failed worker.
@@ -11921,7 +12191,11 @@ def _run_single(
             with tile_lock:
                 for _record in tile_state["units"]:
                     if _record.get("completed"):
-                        _record["discarded"] = True
+                        _idx = int(_record.get("unit_index", -1))
+                        with accepted_lock:
+                            _keep = _idx in accepted_units
+                        _record["retained"] = bool(_keep)
+                        _record["discarded"] = not bool(_keep)
                     elif _record.get("status") == "executing":
                         _record["status"] = "failed"
                         _record["action"] = "fallback_cpu"
@@ -12013,6 +12287,13 @@ def _run_single(
             ) from exc
         wall = time.perf_counter() - t0
         pipeline_telemetry = pipeline.telemetry()
+        if result_registry is not None:
+            # The pipeline held only lightweight receipts. Assembly must receive
+            # the registry-owned payloads in canonical order (sparse identity,
+            # never list-position).
+            results = result_registry.ordered_payloads(
+                [t[0].cell_id for t in tasks]
+            )
         with tile_lock:
             tile_state["final_cause"] = "gpu_completed"
         # --- R55-E11 effective execution -------------------------------------
@@ -12097,6 +12378,7 @@ def _run_single(
                     "attempted": bool(record.get("attempted")),
                     "completed": bool(record.get("completed")),
                     "discarded": bool(record.get("discarded")),
+                    "retained": bool(record.get("retained")),
                     "prefetch_units": int(prefetch),
                     "device_peak_bytes": int(
                         (record.get("vram") or {}).get(
@@ -12305,6 +12587,31 @@ def _run_single(
     _r55_run_wave_count = 0
     _r55_run_shrink_count = 0
     _r55_gpu_run_fallback = None
+    # M1: ONE run-owned result registry for the ACTIVE paths. It is created
+    # before any cell executes, from the sparse expected cell_id set (never a
+    # 0..K prefix), and survives every pipeline/list/queue release.
+    result_registry = None
+    if scheduler_mode == zsched.MODE_ACTIVE and (
+        _r55_active_gpu_decision is not None
+        or _r55_active_decision is not None
+    ):
+        try:
+            _expected_cids = [
+                str(_task[0].cell_id) for _task in _initial_bundle.cell_tasks
+            ]
+        except Exception:  # pragma: no cover - defensive identity failure
+            _expected_cids = []
+        result_registry = zrr.RunResultRegistry(
+            run_id=(
+                f"zegrid:{start_ts}:{pass_label}:"
+                f"{int(time.time_ns())}"
+            ),
+            expected_cell_ids=_expected_cids,
+            gauge_mode=str(
+                getattr(science_config, "cell_gauge_mode", "global")
+                or "global"
+            ),
+        )
     # R55-E11: the ORIGINAL GPU selection/decision survives a runtime fallback.
     # The control-flow variable is cleared (the CPU path owns execution), but the
     # decision, its effective mapping and its runtime adaptation are retained so
@@ -12334,6 +12641,7 @@ def _run_single(
                 gpu_decision=_r55_active_gpu_decision,
                 gpu_candidate=_r55_active_candidate,
                 unit_progress=_gpu_unit_progress,
+                result_registry=result_registry,
             )
         except _R55GpuFallback as _gpu_exc:
             # EXACT whole-batch CPU fallback from a CLEAN state. Every GPU
@@ -12355,9 +12663,142 @@ def _run_single(
                 "detail": _gpu_exc.detail,
                 "telemetry": dict(_gpu_exc.telemetry),
             }
+            # M1 REWORK-1 (D): keep the original reason/type distinct instead of
+            # collapsing every post-acceptance failure into one resource label.
+            _gpu_reason = str(_gpu_exc.reason_code)
+            _gpu_detail = str(_gpu_exc.detail)
+            _gpu_pipeline = (
+                (_gpu_exc.telemetry or {}).get("pipeline") or {}
+            )
+            _gpu_consumer_error = str(
+                _gpu_pipeline.get("consumer_error")
+                or _gpu_pipeline.get("producer_error")
+                or ""
+            )
+            _resource_codes = {
+                str(renv.REASON_REFUSE_HOST_RAM),
+                str(renv.REASON_REFUSE_DISK),
+                str(zgr.REASON_REFUSE_VRAM),
+            }
+            if _gpu_reason in _resource_codes:
+                _conservation_category = "resource_shortage"
+            elif (
+                "OutOfMemory" in _gpu_detail
+                or "OutOfMemory" in _gpu_consumer_error
+                or "OOM" in _gpu_detail
+            ):
+                _conservation_category = "resource_shortage"
+            elif any(
+                token in (_gpu_detail + " " + _gpu_consumer_error)
+                for token in (
+                    "AcceptanceError",
+                    "RunRegistryError",
+                    "UnsupportedBufferOwnerError",
+                    "PayloadValidation",
+                    "DuplicateCellError",
+                    "GenerationError",
+                )
+            ):
+                _conservation_category = "acceptance_failure"
+            elif _gpu_reason == str(zgr.REASON_GPU_OBSERVATION_FAILED):
+                _conservation_category = "measurement_failure"
+            else:
+                _conservation_category = "internal_failure"
+            _r55_gpu_run_fallback["category"] = str(
+                _conservation_category
+            )
             for _t in _initial_bundle.cell_tasks:
                 if _t[4] is not None:
                     _safe_rmtree(_t[3], None)
+            _preserved_snapshot = (
+                result_registry.snapshot()
+                if result_registry is not None
+                else None
+            )
+            _preserved_accepted = int(
+                (_preserved_snapshot or {}).get("counts", {}).get(
+                    "accepted", 0
+                )
+            )
+            if _preserved_accepted > 0:
+                # M1 CONSERVATION: K accepted payloads survive the refusal.
+                # Recomputing them on CPU would double the work and silently
+                # mix backends before numeric parity is qualified, so the run
+                # stops here with the retained state explicitly owned.
+                _preserved_backends = {
+                    cell["cell_id"]: cell["backend"]
+                    for cell in (_preserved_snapshot or {}).get("cells", [])
+                }
+                _r55_gpu_run_fallback["result_conservation"] = {
+                    "accepted_cells": int(_preserved_accepted),
+                    "pending_cells": int(
+                        (_preserved_snapshot or {})
+                        .get("counts", {})
+                        .get("pending", 0)
+                    ),
+                    "backend_by_cell": dict(_preserved_backends),
+                    "cpu_reuse": "refused_no_numeric_parity_qualification",
+                }
+                _emit(
+                    "ZeGrid: R55-E2 ACTIVE GPU RUN refused "
+                    f"({_gpu_exc.reason_code}: "
+                    f"{_r55_bounded_text(_gpu_exc.detail, 600)}) AFTER "
+                    f"{_preserved_accepted} accepted cell(s). M1 keeps those "
+                    "payloads in the run registry; a whole-batch CPU rerun "
+                    "would double the work and mix backends without a "
+                    "qualified parity contract, so it is refused. No FITS, "
+                    "manifest or science was published; the retained state "
+                    "remains owned until explicit disposal.",
+                    lvl="WARN", callback=progress_callback,
+                )
+                raise _R55RunConservedResults(
+                    "R55_RUN_RESULTS_CONSERVED",
+                    (
+                        f"GPU refusal after {_preserved_accepted} accepted "
+                        "cell(s); CPU reuse refused (no numeric parity "
+                        "qualification); retained pending cells="
+                        f"{(_preserved_snapshot or {}).get('counts', {}).get('pending', 0)}"
+                    ),
+                    category=str(_conservation_category),
+                    record={
+                        "schema": zrt.RUN_CONTROL_SCHEMA,
+                        "mission": "ZM-ZEGRID-RESILIENT-RUN-RESUME-M1-20261027",
+                        "status": "refused",
+                        "reason_code": "R55_RUN_RESULTS_CONSERVED",
+                        "category": str(_conservation_category),
+                        "detail": (
+                            "GPU refusal after accepted cells; accepted "
+                            "payloads retained in memory"
+                        ),
+                        "gpu_fallback": dict(_r55_gpu_run_fallback),
+                        "result_registry": _preserved_snapshot,
+                        "accepted_cell_ids": list(
+                            (_preserved_snapshot or {}).get(
+                                "accepted_cell_ids", []
+                            )
+                        ),
+                        "pending_cell_ids": list(
+                            (_preserved_snapshot or {}).get(
+                                "pending_cell_ids", []
+                            )
+                        ),
+                        "backend_by_cell": dict(_preserved_backends),
+                        "cpu_reuse": (
+                            "refused_no_numeric_parity_qualification"
+                        ),
+                        "publication": {
+                            "fits": False,
+                            "manifest": False,
+                            "assembly": False,
+                        },
+                        "durable_resume": False,
+                        "note": (
+                            "M1 conserves accepted results DURING the run; "
+                            "it does not persist them across process exit."
+                        ),
+                    },
+                    result_registry=result_registry,
+                ) from _gpu_exc
             gpu_used = False
             # The GPU unit is no longer in flight: the CPU rerun owns execution.
             publish_runtime_concurrency(
@@ -12438,6 +12879,7 @@ def _run_single(
                 start_bundle=_r55_active_bundle,
                 start_candidate=_r55_active_candidate,
                 start_mapping=_r55_active_mapping,
+                result_registry=result_registry,
             )
         _final = _r55_active_bundle
         layout = _final.layout
@@ -12497,6 +12939,7 @@ def _run_single(
             start_bundle=_final,
             start_candidate=_r55_active_candidate,
             start_mapping=_r55_active_mapping,
+            result_registry=result_registry,
         )
         # The RUN-final bundle is the ONLY source for assembly, diagnostics and
         # the manifest. A changed mapping applied only to the NEXT wave.
@@ -13151,6 +13594,13 @@ def _run_single(
         _r55_scheduler_block, gpu_ctx
     )
 
+    # M1: publish the lightweight conservation state (never payloads) so the
+    # manifest can audit accepted/pending sparse cells and retained bytes.
+    if result_registry is not None:
+        per_cell_diagnostics["r55_result_registry"] = (
+            result_registry.snapshot()
+        )
+
     # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
     export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
     sci_path, cov_path, manifest_path = _write_outputs(
@@ -13203,6 +13653,20 @@ def _run_single(
         aggregate_peak_rss_kib=aggregate_peak_rss_kib,
         halo_provenance=_halo_provenance_pass,
     )
+
+    # M1: the run published successfully. The registry's explicit release is the
+    # single ownership hand-off; the transient ``results`` list is also dropped.
+    # (On any earlier failure the registry stays reachable from the typed
+    # exception until the coordinator disposes it.)
+    if result_registry is not None:
+        _disposal = result_registry.dispose()
+        _emit(
+            "ZeGrid: run result registry disposed after successful publication "
+            f"({_disposal.get('released_cells', 0)} cell(s), "
+            f"{_disposal.get('released_bytes', 0)} B released)",
+            callback=progress_callback,
+        )
+    results = []
 
     # ZM-PROGRESS-CONTRACT-R29: the finalize seam completes (1/1) only now that
     # the immutable science + aesthetic + coverage + manifest + run log are all

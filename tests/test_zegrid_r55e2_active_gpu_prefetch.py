@@ -621,7 +621,10 @@ def test_gpu_oom_falls_back_to_exact_whole_batch_cpu(
             # CPU fallback path: never simulate/annotate GPU work here.
             return real_consume(prepared)
         state["n"] += 1
-        if state["n"] >= 2:
+        # M1 NOTE: inject OOM on the FIRST GPU unit so this test keeps testing
+        # the K=0 exact whole-batch CPU fallback contract. An OOM after accepted
+        # cells is a different (conserved) outcome covered by the M1 tests.
+        if state["n"] >= 1:
             raise OOM("simulated CuPy OOM")
         cfg = zz._STACK_CONFIG
         zz._STACK_CONFIG = dataclasses.replace(cfg, backend="cpu")

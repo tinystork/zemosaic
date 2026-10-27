@@ -656,9 +656,13 @@ def test_e11_pipeline_shrinks_and_keeps_gpu(
 def test_e11_no_admissible_tile_falls_back_once_and_preserves_decision(
     routine_input, tmp_path_factory, monkeypatch
 ):
+    # M1 NOTE: the K=0 whole-batch fallback contract owned by this test is
+    # exercised by refusing the FIRST GPU unit. Post-acceptance refusals are
+    # intentionally no longer re-run on CPU (M1 conservation, see
+    # tests/test_zegrid_resume_m1_conservation.py).
     # 50 MiB free: not even the smallest declared GPU rung fits the 70 % budget.
     _patch_gpu(
-        monkeypatch, _sequence([2 * GIB, 2 * GIB, 2 * GIB, 50 * MIB])
+        monkeypatch, _sequence([2 * GIB, 50 * MIB, 50 * MIB])
     )
     seen_tiles: list[int] = []
     _fake_gpu_consumer(monkeypatch, seen_tiles)
