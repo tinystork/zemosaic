@@ -1,5 +1,22 @@
 # ZeGrid resilient run — project state
 
+## M1 — QUALIFIÉ (banc Windows réel, 27/10 19:42Z)
+- Banc `m1_probe_02`: `status=PASS`, exit 0, 237 s, 33 tests passés, **0 skip**, 0 échec,
+  `registry_tests_passed=23`, `required_conservation_missing=[]`, plafond artefacts non atteint.
+- Les **six** cas de conservation d'orchestration réelle ont tourné et passé sur l'hôte Windows,
+  dont `test_m1_mid_wave_generation_transition_rejects_old_results`.
+- Source exécutée: HEAD `48a072e835a52598b73b98de144fbe2424a465a7`, arbre propre, `SourceRoot`
+  = arbre de travail (pas le produit installé). Produit inchangé pendant le run
+  (`mode.py` 2152c6ca…, `run_registry.py` 1ba47fa6…, avant == après).
+- Périmètre qualifié: conservation **en mémoire pendant le run**, mode `WINDOWS_M1_CONTROL_ONLY_CPU`
+  (exécuteur GPU remplacé par l'exécuteur CPU canonique).
+- NON qualifié / NON mesuré: GPU et science GPU (`gpu_qualified=false`), parité avec le produit
+  installé (`installed_runtime_used=false`), A/B science sans pression (`NOT_RUN`), sauvegarde et
+  reprise disque (M2), GUI, mélange CPU/GPU.
+- Revue indépendante: Nono review-2 `ACCEPT-WITH-BENCH-PENDING` -> condition de banc remplie;
+  review-3 `ACCEPT` du delta de test `48a072e`.
+- Conclusion: **M1 accepté et qualifié dans son périmètre déclaré**. M2 peut démarrer.
+
 ## M1 ACCEPT-WITH-BENCH-PENDING + branche publiée (27/10 18:5x)
 - Nono review-2: **ACCEPT-WITH-BENCH-PENDING**. Gate de preuve fail-closed confirmé sur 4 fermetures (F1 skip bénin seulement, F2 précédence échec>skip, F3 six IDs exacts, F4 observation fresh-min). Aucun défaut HIGH/MEDIUM restant. Réserves LOW/hors périmètre: dédup `status`, `mmap.size()` conservateur, A/B NOT_RUN.
 - Autorisation Tristan: push au retour de Nono sans problème. Commit `d0905dec68fd5a87c6a93ff5fa294a2b6848e3b0` (21 fichiers) + branche `feat/zegrid-resilient-run-resume` poussée sur origin. `beta` intacte à `231b597867b4d251afac6b767000c8a37e2cf3b0`. Arbre propre après commit.
