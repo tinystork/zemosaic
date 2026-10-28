@@ -1,27 +1,33 @@
-## Current status — M5-B : r2 vérifié, review-2 Nono en cours (2026-10-28)
+## Current status — M5-B ACCEPTÉ (code), suites locales VERTES, push en attente (2026-10-28)
 
-Delta r2 livré par Coco (DONE, aucun commit). Vérification Junior:
-- 76 passed 0 failed (M5 assembly + publication + execution, 99.79s)
-- 39 passed 2 skipped (M2/M4, 75.85s)
-- 102 passed, 2 FAILED R23 (`test_production_export_on_custom_suffixes`,
-  `test_production_forced_failure_preserves_raw`) — tous deux `ModeInfeasible`
-  (refus RAM hôte), REPRODUITS À L'IDENTIQUE sur worktree détaché au commit de
-  base b092768 sans le delta => environnemental, pas régression r2
-  (hôte ~978 MiB dispo, 12.8 GiB swap). Ces deux tests restent NOT_RUN valides
-  pour la qualification et doivent être rejoués sur machine non contrainte.
-- F5: `ack_matches_generation` exige génération/publication/verified + pour
-  CHAQUE membre publié file/sha256/nbytes/generation; réparation dérivée de
-  `_pub_gen.outputs_state()` (autorité vérifiée), WARN non fatal, pas de
-  réécriture si ack cohérent.
-- F6: seam `available_memory_bytes`=8 GiB déclaré GLOBAL (plan/layout, préflight
-  assemblage, admission cellules, lancement), admission publication réelle,
-  témoin explicitement non qualifiant; fixture 1×1.
+M5-B accepté sur son périmètre Linux testé. Commit local
+`3384d3671c42a35a55018c3d9448aa451475e5e7` sur `feat/zegrid-resilient-run-resume`
+(parent `b092768`), NON poussé. `origin/beta=231b597867`, `origin/main=434961a8ec`
+inchangés.
 
-Revue indépendante Nono review-2 lancée (accepted/queued
-b2ec5f60-b84f-417b-be2d-8091cb02c81a) sur le delta F5/F6 uniquement.
-Hashes figés: .a2a-reports/...review-snapshot-r2.json. M5-B NON accepté.
-Pas de commit/push/M6/activation par défaut. NOT_RUN: Windows/NTFS, coupure
-électrique, GPU, M3 pression réelle, M31, RSS BLAS-scale.
+QUALIFICATION LOCALE PROPRE (après libération de RAM par Tristan, Firefox fermé):
+- M5 assembly+publication+execution: 76 passed, 0 failed.
+- M2/M4: 39 passed, 2 skipped.
+- R23/R24/R25/R18: 104 passed, 0 failed.
+=> total 219 passed, 2 skipped, 0 failed.
+Les 2 échecs R23 précédents (`test_production_export_on_custom_suffixes`,
+`test_production_forced_failure_preserves_raw`) passent maintenant avec le MÊME
+code et le MÊME commit, seule la mémoire de l'hôte ayant changé (~978 MiB puis
+~2.1 GiB disponibles) => attribution environnementale PROUVÉE, aucune régression
+M5-B. Les 2 tests ignorés restent `NOT_RUN`.
+
+Décision: Nono review-2 ACCEPT-WITH-CONDITIONS; C1 fermé par test d'exécution réel
+(repair partial/wrong/lost -> ack complet, second no-op `state.json`
+octet-identique, échec repair non fatal, pointeur/publication/digests inchangés);
+C2 écrit dans `.a2a-reports/...junior.r2-acceptance.md` — témoin 8 GiB synthétique
+explicitement NON QUALIFIANT, admission publication réelle.
+
+RESTE À FAIRE: push `3384d367` (accord Tristan), banc Windows/NTFS (flush
+O_RDONLY, rename, refus liens, no-op cross-process), RSS sur assemblage plus grand,
+puis seulement envisager l'activation par défaut.
+NOT_RUN: Windows/NTFS, coupure électrique réelle, GPU, M3 pression réelle, M31,
+RSS BLAS-scale, budgets produit sans seam, M6.
+Aucune activation: `zegrid_resource_recovery_enabled=false`, `zegrid_resume_mode=never`.
 
 ---
 ## Historique — les états ci-dessous ne remplacent pas le statut courant
