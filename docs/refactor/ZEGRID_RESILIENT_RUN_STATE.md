@@ -1,3 +1,123 @@
+## Current status — RSS Linux ACCEPTED by Junior (2026-10-28)
+
+Nono review-1 ACCEPT; F1/F2/F3 + parity-seed stop defect closed. Junior verified exact4file snapshot, **79passed/0skip/0fail**, real guarded matrix **PASS85.495s**. Cases512²/16cells,1024²/16cells,1024²/64cells; only256² dense parity (8planes+offsets) proven. Peak lifetime sampledRSS497,184,768B (**474.15MiB**, not497MiB), minimumhost1,283,166,208B, cap2, immutable storecontent,0live mappings afterclose. Five independent failed-seed cases stop beforeparity. No production/science/schema/default changes. Two correctiveiterations used.
+
+Scope: synthetic producer, real durablestore/guardedconsumer, per_cell only,20ms sampled observations; parenthash warms pagecache. NOT a universal RSS bound. FullFITS/restart, physicalM3, Windows/NTFS, hugecanvas/BLAS/deepcontributors, GPU/M31 still NOT_RUN. No default activation/M6. Evidence in agent workspace `.a2a-reports/ZM-ZEGRID-RSS-LINUX-20261028.acceptance.md`, `.junior.r2.md`, `.nono.r1.md`; raw artefacts `/home/tristan/.openclaw/workspace/.m5b-rss-linux-20261028-junior-r2/run-20261028T215419Z/`.
+
+Next: prepare a bounded real-pressure M3 Linux protocol/preflight; no pressure workload until the protocol/guards have been reviewed.
+
+---
+## Historical review progression (superseded by acceptance above)
+
+## Current Junior status — RSS REWORK-2 verified, Nono review pending (2026-10-28)
+
+Independent **79 passed**, 0skip/0fail (83.25s). Real guarded Linux matrix **PASS** (85.495s):512²/16cells,1024²/16cells,1024²/64cells; separate256² dense parity8planes+offsets equal. Peak lifetime sampledRSS497,184,768B; minimum observed host reserve1,283,166,208B; max live cells2, store content unchanged, live mappings0 after close. Independent five failure probes stop before parity; success control launches. Evidence `.a2a-reports/ZM-ZEGRID-RSS-LINUX-20261028.junior.r2.md`; artefacts `/home/tristan/.openclaw/workspace/.m5b-rss-linux-20261028-junior-r2/run-20261028T215419Z/`. Nono review required before acceptance. Synthetic scope only, NOT physicalM3/FITSfull/Windows/BLAS/GPU/M31; no activation/commit/push. HEAD8564070 unchanged.
+
+### Previous orchestration status (superseded)
+
+## Junior recovery — RSS REWORK-2 pending (2026-10-28)
+
+Independent replay: **71 passed**, 55.77s. REWORK-1 not accepted: parity seed safety-stop still launches parity child before validating seed result (mocked return137/HOST_RESERVE). Final FAIL preserved, but stop invariant violated. Evidence: `.a2a-reports/ZM-ZEGRID-RSS-LINUX-20261028.junior.r1.md` and `.junior-probes-r1.json` in agent workspace. Bounded second correction; no production change or qualification expansion. Junior matrix replay deferred until guard repaired. HEAD8564070 unchanged.
+
+## Current status — M5-B RSS Linux REWORK-2 — implemented, NOT accepted (2026-10-28)
+
+Mission `ZM-ZEGRID-RSS-LINUX-20261028`, HEAD `8564070bf534d90037cbeb3d420303d9b86da264`, branche `feat/zegrid-resilient-run-resume`. Aucun commit/push/produit/science/store-schema/default. REWORK-2 corrige le défaut résiduel F1 confirmé par Junior : la branche parité lançait l'enfant `parity` avant de valider le résultat/processus du seed de parité.
+
+Correction bornée : le seed de parité est maintenant validé immédiatement (timeout, guard breach, returncode non nul, JSON absent/invalide ou statut ≠ `SEEDED` ⇒ **FAIL**, aucun lancement de `parity`, preuve du seed conservée, un seul rapport parité, FAIL collant). Les flags de processus sont validés, pas seulement le returncode, pour le seed ET le résultat `parity` (exit 0 n'efface pas un timeout/guard enregistré). Le deadline global est revérifié après le seed ; épuisement honnête sans échec enfant ⇒ **NOT_RUN/PARTIAL**, jamais un FAIL écrasé. La précédence failure-before-refusal est conservée. Tests d'injection orchestrateur ajoutés (seed parité nonzero/timeout/guard/JSON manquant-invalide ⇒ pas d'appel `parity` ; chemin succès ⇒ `parity` lancé ; deadline épuisée ⇒ NOT_RUN sans lancement).
+
+Validation finale : **42 passed** (harnais RSS), **79 passed** (harnais + M5-A), **39 passed** (M5-B publication/execution), `git diff --check` OK, exécutable `/home/tristan/.openclaw/workspace/projects/zemosaic/.venv/bin/python` (3.13.5). Matrice réelle corrigée sur base neuve `/home/tristan/.openclaw/workspace/.m5b-rss-linux-20261028-r2`, statut **PASS**, 47.348 s, disque 107,449,414 B, MemAvailable départ 1,999,347,712 B :
+
+| cas | canvas/grille | modèle requis B | pic vie B | pic assemblage B | post-close RSS B | HWM B | échantillons RSS/hôte/assemblage | cellule pic | mapped pic B | elapsed s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| c512-g4x4 | 512²/4×4 | 38,292,584 | 408,424,448 | 408,424,448 | 402,423,808 | 412,143,616 | 185/186/19 | 2 | 2,065,920 | 0.387 |
+| c1024-g4x4 | 1024²/4×4 | 148,147,304 | 487,436,288 | 487,436,288 | 460,591,104 | 503,554,048 | 214/215/40 | 2 | 7,923,200 | 0.820 |
+| c1024-g8x8 | 1024²/8×8 | 133,720,632 | 494,325,760 | 494,325,760 | 456,863,744 | 498,294,784 | 275/276/81 | 2 | 2,065,920 | 1.644 |
+
+Chaque cas : admission réelle `ram_contract.admit_budget_bytes`, cap=2, enveloppe live armée, offsets+feather per_cell, commits et hash de CONTENU du store identiques avant/après, timelines ordonnées, arrays valides après close, `live_cells==0`. Parité dense **uniquement 256×256/4×4** : `PARITY_PASS`, `parity_launched=true`, seed et parity rc0, huit plans et offsets identiques. Les digests 512/1024 sont des sorties observées, pas une preuve d'égalité dense.
+
+Preuves : `/home/tristan/.openclaw/workspace/.m5b-rss-linux-20261028-r2/run-20261028T214814Z/` (`matrix.json`, `summary.json`, `measure.json`, `parity-256-g4x4/parity.json`, logs). Hashes : rss_bench `18e460ba…`, test RSS `c2e57ce3…`, rss_probe `9543ad3f…`. R0/R1 conservés intacts.
+
+NOT_RUN / non qualifié : FITS complet, M3 pression physique, Windows/NTFS, BLAS-scale, GPU/M31, jauge globale mesurée. M5-B RSS **non accepté** avant vérification Junior + Nono. Aucune activation/M6.
+
+---
+## Historique — M5-B RSS Linux REWORK-1 (corrigé ensuite par REWORK-2)
+
+## Current status — M5-B RSS Linux REWORK-1 — implemented, NOT accepted (2026-10-28)
+
+Mission `ZM-ZEGRID-RSS-LINUX-20261028`, HEAD `8564070bf534d90037cbeb3d420303d9b86da264`, branche `feat/zegrid-resilient-run-resume`. Aucun commit/push, aucun changement produit/science/store. REWORK-1 corrige F1/F2/F3 de la revue Junior+Nono ; les nombres r0 restent des observations provisoires et sont remplacés par ceux ci-dessous.
+
+**F1 (classification/précédence).** `cmd_measure` ne produit `REFUSED` que pour un `AssemblyCapacityError` typé, avant tout chargement/vérification/mapping, avec bloc `refusal` explicite (type, phase `preflight`, compteurs zéro, plan) ; une exception générique ou un refus après progrès écrit `ERROR`, traceback et code enfant non nul (3/4). `classify_measurement` applique d'abord timeout/guard/returncode (FAIL), ne convertit un REFUSED valide en NOT_RUN qu'après validation séparée, et refuse les REFUSED incomplets/spoofés. La matrice conserve un FAIL (plus de FAIL→PARTIAL), écrit exactement un enregistrement par cas, et ne lance pas la parité après un arrêt de sécurité/échec.
+
+**F2 (preuve de surveillance).** Le parent compte des échantillons RSS/hôte réellement valides (`valid_rss_samples`, `valid_host_samples`, `valid_paired_samples`, `valid_assembly_samples`), exige ≥2 échantillons appariés et ≥2 dans la fenêtre d'assemblage, un pic >0, une réserve hôte valide et une fenêtre d'assemblage observée. Télémesure inconnue d'un enfant vivant ⇒ abandon explicite après une courte tolérance de course de sortie ; sortie normale non faussement échouée ; absence de preuve ⇒ NOT_RUN, jamais PASS. Les checks nommés (`REQUIRED_CHECKS`) ne peuvent être vides/partiels ; `assert_real_disk` refuse explicitement un fstype inconnu.
+
+**F3 (temporalité/immuabilité).** L'enfant prend ses snapshots de commits/métadonnées avant l'assemblage et après la fermeture ; `checks.store_metadata_unchanged` est dérivé. Le parent streame le hash de CONTENU de tous les fichiers du store avant spawn et après sortie (hors RSS mesuré ; cache de pages réchauffé et documenté), et `classify_measurement` exige l'égalité. `post_close_current_rss_bytes` est capturé après `access.close()+gc.collect()`. Pic échantillonné de durée de vie et pic de fenêtre d'assemblage sont distincts. Timeline ordonnée vérifiée ; test d'injection qui modifie des octets de payload détecté.
+
+Matrice corrigée (enfant réel, store réel, admission réelle ; base `/home/tristan/.openclaw/workspace/.m5b-rss-linux-20261028-r1`), statut **PASS**, 48.714 s, disque 107,435,622 B :
+
+| cas | canvas/grille | modèle requis B | pic échantillonné vie B | delta vie B | pic assemblage B | delta assemblage B | post-close RSS B | HWM B | échantillons RSS/hôte/assemblage | cellule pic | mapped pic B | elapsed s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| c512-g4x4 | 512²/4×4 | 38,292,584 | 411,766,784 | 27,873,280 | 410,308,608 | 26,415,104 | 404,307,968 | 414,048,256 | 181/182/18 | 2 | 2,065,920 | 0.370 |
+| c1024-g4x4 | 1024²/4×4 | 148,147,304 | 487,596,032 | 103,686,144 | 487,596,032 | 103,686,144 | 463,904,768 | 503,779,328 | 213/214/40 | 2 | 7,923,200 | 0.820 |
+| c1024-g8x8 | 1024²/8×8 | 133,720,632 | 497,516,544 | 112,353,280 | 497,516,544 | 112,353,280 | 457,035,776 | 497,860,608 | 316/317/109 | 2 | 2,065,920 | 2.256 |
+
+Chaque cas : budget réel `ram_contract.admit_budget_bytes` (MemAvailable au départ 3,188,166,656 B), cap=2, enveloppe live armée, offsets+feather per_cell, commits et hash de contenu du store identiques avant/après, arrays retournés valides après close, `live_cells==0`. Parité dense **uniquement 256×256/4×4** : `PARITY_PASS`, huit plans et offsets identiques. Les digests 512/1024 sont des sorties observées, PAS une preuve d'égalité dense.
+
+Preuves : `/home/tristan/.openclaw/workspace/.m5b-rss-linux-20261028-r1/run-20261028T212811Z/` (`matrix.json`, `summary.json` à générer, `measure.json`, `parity-256-g4x4/parity.json`, logs). Tests : **34 passed** (harnais), **71 passed** (harnais+M5-A), **39 passed** (M5-B publication). Exécutable Python `/home/tristan/.openclaw/workspace/projects/zemosaic/.venv/bin/python` (3.13.5). Hashes : rss_bench `ae095125…`, test RSS `80cc9e59…`, rss_probe `9543ad3f…`, STATE `554f16a5…`.
+
+NOT_RUN / non qualifié : FITS complet, M3 pression physique, Windows/NTFS, BLAS-scale, GPU/M31, jauge globale mesurée (seul le plan metadata est montré). Identité du store synthétique (`execution_context.available_ram_bytes=4 MiB`), pas la RAM mesurée. M5-B RSS **non accepté** avant vérification Junior + Nono. Aucune activation par défaut/M6.
+
+---
+## Historique — M5-B RSS Linux r0 (PROVISOIRE, remplacé par REWORK-1)
+
+## Current status — RSS Linux r0 NON ACCEPTÉ, revue Nono en cours (2026-10-28)
+
+Mission `ZM-ZEGRID-RSS-LINUX-20261028`, HEAD `8564070bf534d90037cbeb3d420303d9b86da264`. Livraison bornée tools/tests/docs, aucun produit/commit/push. Junior **55 passed, zéro skip/échec, 44.01s**, mais sondes adversariales confirment : REFUSED+crash/timeout -> NOT_RUN; absence totale de mesures de surveillance -> PASS; checks={} -> PASS. Source : exceptions génériques converties REFUSED, FAIL matrice rétrogradé PARTIAL après cas stoppé, double append cas; hashes enfant avant/après tous calculés après, RSS annoncé post-close mesuré avant close. Parent conserve une vraie comparaison des records de commits avant/après, mais pas preuve complète d'immuabilité des payloads. Parité dense réelle limitée au256, pas512/1024.
+
+Nombres de la matrice Coco conservés comme observations PROVISOIRES, pas qualification acceptée. Grande matrice non rejouée Junior avant correction des gardes/preuves. Nono review0 accepted/queued `e3363baa-d857-498d-a2fa-0823815253ef`; attendu workspace `.a2a-reports/ZM-ZEGRID-RSS-LINUX-20261028.nono.r0.md`. Rapport Junior/sondes/snapshot/log même préfixe. Attendre callback sans polling puis REWORK borné SAME Coco sans reset; 0/3 corrections consommées. Windows/M3physique/FITS complet/BLAS/GPU/M31 restent exclus, aucune activation.
+
+---
+## Historique — livraison Coco avant vérification indépendante
+
+## Current status — M5-B RSS Linux (bounded larger canvases) — implemented, NOT accepted (2026-10-28)
+
+Mission `ZM-ZEGRID-RSS-LINUX-20261028` (implementation, no commit/push). The
+legacy `tools/zegrid_resume_m5b/rss_probe.py` (24x24 / 4 cells, produced
+payloads retained, `require_budget=False`) is now explicitly labelled a
+tiny NON-QUALIFYING witness. New `tools/zegrid_resume_m5b/rss_bench.py` adds a
+bounded measurement harness plus focused tests.
+
+Measured matrix (Linux ext4, own artifact dir under the workspace, fresh child
+per assembly; store created in a SEPARATE child one cell at a time):
+
+| case | canvas/grid | model required | sampled peak RSS | delta vs pre | post HWM | peak live cells | mapped peak | elapsed |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| c512-g4x4 | 512² / 4×4 | 38,292,584 B | 208,879,616 B | 26,460,160 B | 213,303,296 B | 2 | 2,065,920 B | 0.378 s |
+| c1024-g4x4 | 1024² / 4×4 | 148,147,304 B | 302,063,616 B | 119,820,288 B | 302,002,176 B | 2 | 7,923,200 B | 0.823 s |
+| c1024-g8x8 | 1024² / 8×8 | 133,720,632 B | 280,768,512 B | 97,734,656 B | 297,365,504 B | 2 | 2,065,920 B | 1.578 s |
+
+Each case used the REAL `ram_contract.admit_budget_bytes` (fresh
+`available_memory_bytes`, ~3.3 GiB observed at run time), the product
+`_assemble_cells_guarded` path with cap=2 and an armed live-byte envelope, and
+per_cell offsets+feather. Commits and output digests were identical
+before/after; returned arrays survived session close; `live_cells==0` after
+close. A separate-process parity case (256² / 4×4) matched the eager dense
+reference on all eight canvas planes and the offset graph exactly.
+
+Evidence: `/home/tristan/.openclaw/workspace/.m5b-rss-linux-20261028/run-20261028T210950Z/`
+(`matrix.json`, per-case `measure.json`, `parity-256-g4x4/parity.json`, logs).
+Focused harness tests: 18 passed; M5-A assembly baseline 37 passed. Whole run
+33.1 s, disk 107,406,726 B (budgets 300 s / 512 MiB).
+
+NOT qualified: full FITS product, physical M3 waiting/recovery, Windows/NTFS,
+BLAS-scale/deep-contributor canvases, and global-gauge measurement (only the
+metadata plan is shown). Synthetic producer identity `execution_context` is a
+4 MiB fixture, NOT host RAM. Host `MemAvailable` moved from ~1.3 GiB before the
+matrix to ~3.3 GiB during it (external process release): fresh observations
+were used and no value was inflated. M5-B RSS evidence is NOT accepted until
+Junior verification + Nono review. No commit/push/default activation/M6.
+
+---
+
 ## Current status — M2-READER ACCEPTÉ, intégration Linux vérifiée (2026-10-28)
 
 Mission `ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028` close : Nono review-0 ACCEPT puis décision Junior ACCEPT. Les deux échecs étaient dus au lecteur de manifeste racine périmé depuis M5-B, pas à un défaut établi du store. Le témoin résout maintenant l'identité exacte du store et CURRENT vérifié, sans repli racine. Code produit inchangé.

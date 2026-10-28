@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""M5-B controlled RSS probe — bounded assembly in an ISOLATED process.
+"""M5-B controlled RSS probe — TINY legacy witness (24x24, 4 cells).
+
+NON-QUALIFYING FOR PRODUCTION BUDGETS. This probe retains the four produced
+payloads in the same process and calls the raw ``_assemble_cells`` consumer with
+``require_budget=False``; it does not exercise the admission guard, the live
+byte envelope or an isolated producer. It remains a small historical witness
+only. Use :mod:`rss_bench` for the bounded larger-canvas Linux measurement
+(separate seeding process, real immutable store, real guarded admission).
 
 Measures, for one small synthetic store (4 cells, 24x24, 3 channels):
 
