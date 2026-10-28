@@ -425,6 +425,7 @@ def assemble_canvas_feathered(
     *,
     halo_px: int = DEFAULT_HALO_PX,
     extra_mask=None,
+    allocator=None,
 ) -> "zmosaic.AssembledCanvas":
     """Feathered assembly: weighted blend (weights sum to 1) replacing the cut.
 
@@ -438,17 +439,25 @@ def assemble_canvas_feathered(
     ``offsets`` maps ``cell_id -> (C,)`` additive offsets (from the R34c solve);
     they are applied to the science BEFORE blending (additive-only). Cells absent
     from ``patches`` are recorded as incomplete (explicit hole).
+
+    ``allocator`` (M5-A) is an OPTIONAL ``callable(shape, dtype) -> ndarray``
+    that must return a ZERO-FILLED writable array. It exists so a caller can
+    price/back the large accumulators with a scratch mapping instead of
+    anonymous RAM; ``None`` (the default, and the only production default)
+    keeps the historical ``np.zeros`` behaviour bit-for-bit. The numeric path
+    below is identical either way.
     """
     layout = build_layout(canvas, nx, ny)
     h, w = int(canvas.height), int(canvas.width)
     c = 3
-    num = np.zeros((h, w, c), dtype=np.float64)
-    wsum = np.zeros((h, w, c), dtype=np.float64)
-    stack_depth = np.zeros((h, w), dtype=np.int32)
-    owner = np.zeros((h, w), dtype=np.int32)
-    support_w1 = np.zeros((h, w), dtype=np.float64)
-    support_w2 = np.zeros((h, w), dtype=np.float64)
-    n_eff = np.zeros((h, w), dtype=np.float64)
+    alloc = np.zeros if allocator is None else allocator
+    num = alloc((h, w, c), np.float64)
+    wsum = alloc((h, w, c), np.float64)
+    stack_depth = alloc((h, w), np.int32)
+    owner = alloc((h, w), np.int32)
+    support_w1 = alloc((h, w), np.float64)
+    support_w2 = alloc((h, w), np.float64)
+    n_eff = alloc((h, w), np.float64)
     complete: list[str] = []
     incomplete: list[str] = []
 

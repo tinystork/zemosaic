@@ -94,6 +94,7 @@ from .core.canonical_streaming import (
 )
 from .core.zegrid import assembly as za
 from .core.zegrid import auto_layout as zal
+from .core.zegrid import bounded_assembly as zbas
 from .core.zegrid import cell_feather as zcf
 from .core.zegrid import cell_offset as zco
 from .core.zegrid import execution as zxe
@@ -3237,7 +3238,8 @@ def _validate_r37_diagnostic_capture(capture, holdout_cap):
 def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None, emit=None,
                                  capture=False, holdout_cap=None, output_dir=None,
                                  capture_identity=None,
-                                 r40_capture=False, r40_context=None):
+                                 r40_capture=False, r40_context=None,
+                                 patches=None):
     """R34D: apply inter-cell additive offsets + FEATHERED assembly (opt-in).
 
     Builds :class:`cell_feather.CellPatch` objects from the per-cell worker results
@@ -3256,21 +3258,25 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
     calls.
     """
     halo_px = int(zsw.HALO_PX if halo_px is None else halo_px)
-    patches: dict = {}
-    for cid, r in result_by_cid.items():
-        if r.get("status") != "complete":
-            continue
-        p = r.get("patch")
-        if not p:
-            continue
-        patches[cid] = zcf.CellPatch(
-            cell_id=cid,
-            bounds=tuple(int(v) for v in p["bounds"]),
-            core_slice=tuple(int(v) for v in p["core_slice"]),
-            science=p["science"],
-            valid_mask=p["valid_mask"],
-            surviving=p.get("surviving"),
-        )
+    # M5-A: a store-backed caller passes a BOUNDED ``patches`` Mapping whose
+    # ``__getitem__`` materialises one cell at a time. The eager dict below is
+    # kept byte-for-byte for the in-memory path (no store).
+    if patches is None:
+        patches = {}
+        for cid, r in result_by_cid.items():
+            if r.get("status") != "complete":
+                continue
+            p = r.get("patch")
+            if not p:
+                continue
+            patches[cid] = zcf.CellPatch(
+                cell_id=cid,
+                bounds=tuple(int(v) for v in p["bounds"]),
+                core_slice=tuple(int(v) for v in p["core_slice"]),
+                science=p["science"],
+                valid_mask=p["valid_mask"],
+                surviving=p.get("surviving"),
+            )
     if not patches:
         raise RuntimeError(
             "per_cell feather assembly: no complete cell patches were produced"
@@ -3465,7 +3471,7 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
 
 def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None, emit=None,
                     capture=False, holdout_cap=None, output_dir=None, capture_identity=None,
-                    r40_capture=False, r40_context=None):
+                    r40_capture=False, r40_context=None, patches=None):
     """Dispatch assembly by cell gauge mode (ZM-CELL-PHOTOMETRY-R34D).
 
     Returns ``(assembled, feather_info)``. ``"global"`` (default) -> the
@@ -3482,6 +3488,7 @@ def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None,
             capture=capture, holdout_cap=holdout_cap, output_dir=output_dir,
             capture_identity=capture_identity,
             r40_capture=r40_capture, r40_context=r40_context,
+            patches=patches,
         )
     # ZM-ZEGRID-R53: make the mode semantics explicit. The halo still drives the
     # REAL patch geometry/resources, but the anti-checkerboard feather is only
@@ -9365,6 +9372,130 @@ def _r55_open_run_store(store_dir, *, identity, budget_bytes, session_id):
     return store, None
 
 
+def _bounded_store_results(store, cell_ids, *, store_state=None):
+    """M5-A: bounded read-only view over durable cell payloads.
+
+    Returns a :class:`bounded_assembly.StoreBackedResults`: a metadata ``Sequence``
+    for the coordinator plus bounded ``descriptors``/``cores``/``patches`` views
+    for the assembly. Constructing it reads ZERO payload: each cell is verified
+    and memory-mapped only when a consumer asks for it, and at most
+    ``DEFAULT_MAX_RESIDENT_CELLS`` payloads stay mapped at once.
+
+    The access is owned by the run store state so the same session serves the
+    per-cell offset graph and the assembly (no double verification) and can be
+    audited in the manifest. It is closed with the store.
+    """
+    state = store_state if store_state is not None else {}
+    previous = state.get("assembly_access")
+    if previous is not None and not previous.session.closed:
+        try:
+            previous.close()
+        except Exception:
+            pass
+    access = zbas.StoreAssemblyAccess(
+        store,
+        max_resident_cells=int(zbas.DEFAULT_MAX_RESIDENT_CELLS),
+    )
+    state["assembly_access"] = access
+    return access.results(list(cell_ids))
+
+
+def _bounded_assembly_available_bytes():
+    """Fresh host availability under the canonical admission margin.
+
+    M5-A F1: the assembly preflight must use a REAL, freshly observed budget and
+    the SAME margin contract as admission (``ram_contract.admit_budget_bytes``,
+    90 %). Nothing is inflated here and no new floor is invented.
+    """
+    raw = int(available_memory_bytes())
+    return rcontract.admit_budget_bytes(raw), raw
+
+
+def _bounded_assembly_preflight(
+    canvas, bounded_results, *, purpose="assembly", available_bytes=None,
+    gauge_mode="per_cell", grid=None,
+):
+    """Fail-closed capacity gate BEFORE any payload load/graph/canvas work.
+
+    Metadata only: commit manifests give plane bytes and patch dimensions; the
+    canvas is priced exactly; the consumer transients and the streaming hash
+    chunk are priced conservatively. The returned plan arms the session's live
+    byte envelope, so the enforcement is not posthoc.
+    """
+    session = bounded_results.session
+    ids = list(bounded_results.descriptors.cell_ids)
+    if available_bytes is None:
+        available_bytes, raw = _bounded_assembly_available_bytes()
+        budget_source = "ram_contract.admit_budget_bytes"
+    else:
+        raw = None
+        budget_source = "caller_explicit"
+    plan = zbas.preflight_assembly(
+        session,
+        ids,
+        canvas_hw=(int(canvas.height), int(canvas.width)),
+        available_bytes=int(available_bytes),
+        purpose=str(purpose),
+        gauge_mode=str(gauge_mode),
+        grid=(None if grid is None else (int(grid[0]), int(grid[1]))),
+    )
+    # Arm the REAL byte envelope: at most the declared resident mappings.
+    # An all-empty run maps nothing, so the envelope floor is 1 B (arming it
+    # with 0 would make `enforce_live_budget` reject its own valid empty plan).
+    session.enforce_live_budget(
+        max(1, int(plan["cells"]["resident_mapped_bytes"]))
+    )
+    plan["host"] = {
+        "available_bytes": int(available_bytes),
+        "raw_available_bytes": (None if raw is None else int(raw)),
+        "budget_source": budget_source,
+    }
+    return plan
+
+
+def _assemble_cells_guarded(
+    canvas, nx, ny, mode, cores, result_by_cid, *, bounded_results=None,
+    available_bytes=None, purpose="assembly", **kwargs
+):
+    """The production assembly entry: preflight FIRST, then the consumer.
+
+    With a durable store the capacity gate runs before ``_assemble_cells`` can
+    open any payload, solve the offset graph or allocate the canvas. A refusal
+    propagates as ``AssemblyCapacityError`` (explicit, no false COMPLETE).
+    """
+    plan = None
+    if bounded_results is not None:
+        plan = _bounded_assembly_preflight(
+            canvas, bounded_results, purpose=purpose,
+            available_bytes=available_bytes,
+            gauge_mode=mode, grid=(nx, ny),
+        )
+    assembled, info = _assemble_cells(
+        canvas, nx, ny, mode, cores, result_by_cid, **kwargs
+    )
+    return assembled, info, plan
+
+
+def _validate_capture_store_compatibility(
+    store_active, *, r37_capture, r40_capture
+):
+    """Explicit refusal of a diagnostic capture on the bounded store path.
+
+    R37/R40 captures need EVERY pre-offset CellPatch simultaneously, which is
+    exactly what the bounded store assembly refuses. The check is a pure
+    predicate (no side effect, no store/identity change) so it can run BEFORE
+    any expensive run work and before the R40 capture context is even built.
+    Captures without a store remain fully supported and unchanged.
+    """
+    if bool(store_active) and (bool(r37_capture) or bool(r40_capture)):
+        raise RuntimeError(
+            "ZeGrid: diagnostic capture (R37/R40) requires all cell patches "
+            "simultaneously and cannot run on the bounded durable-store "
+            "assembly path; disable the capture or use a store-less run"
+        )
+    return None
+
+
 def _resume_generation_root(store_dir, run_id):
     """Return a NEW run root that NEVER overwrites an existing generation.
 
@@ -12153,10 +12284,12 @@ def _run_single(
         if result_registry is not None:
             _store = _store_state["store"]
             if _store is not None:
-                # Cells committed durably were released from RAM; reload them
-                # (verified, read-only) so assembly receives the exact payloads.
-                results_local = list(
-                    _store.ordered_payloads(result_registry, canonical_cids)
+                # M5-A: bounded, read-only assembly access. Nothing is
+                # materialised here: cells are verified and memory-mapped ONE at
+                # a time inside the session, so the assembly never holds every
+                # payload (nor every patch) simultaneously.
+                results_local = _bounded_store_results(
+                    _store, canonical_cids, store_state=_store_state
                 )
             else:
                 results_local = list(
@@ -13256,10 +13389,16 @@ def _run_single(
         if result_registry is not None:
             # The pipeline held only lightweight receipts. Assembly must receive
             # the registry-owned payloads in canonical order (sparse identity,
-            # never list-position).
-            results = result_registry.ordered_payloads(
-                [t[0].cell_id for t in tasks]
-            )
+            # never list-position). M5-A: with a durable store, that access is
+            # bounded and read-only instead of an eager list of every payload.
+            _store_ids = [t[0].cell_id for t in tasks]
+            _store = _store_state["store"]
+            if _store is not None:
+                results = _bounded_store_results(
+                    _store, _store_ids, store_state=_store_state
+                )
+            else:
+                results = result_registry.ordered_payloads(_store_ids)
         with tile_lock:
             tile_state["final_cause"] = "gpu_completed"
         # --- R55-E11 effective execution -------------------------------------
@@ -13850,6 +13989,16 @@ def _run_single(
                 f"{bool((_store.report().get('lock_info') or {}).get('orphan_recovered'))}",
                 callback=progress_callback,
             )
+    # M5-A REWORK-2: refuse an incompatible diagnostic-capture REQUEST right
+    # after the store is known and BEFORE any expensive run work (and before the
+    # R40 capture context is built). Pure predicate: no store/identity change,
+    # no side effect; store-less captures stay supported.
+    _validate_capture_store_compatibility(
+        _store_state["store"] is not None,
+        r37_capture=r37_diagnostic_capture,
+        r40_capture=r40_seam_capture,
+    )
+
     # R55-E11: the ORIGINAL GPU selection/decision survives a runtime fallback.
     # The control-flow variable is cleared (the CPU path owns execution), but the
     # decision, its effective mapping and its runtime adaptation are retained so
@@ -14527,7 +14676,14 @@ def _run_single(
     timings.add("per_cell_stack", block_wall)
     timings.add("cache_build", 0.0)
 
-    result_by_cid = {r["cell_id"]: r for r in results}
+    # M5-A: with a durable store the coordinator receives metadata descriptors
+    # and the assembly receives BOUNDED views; nothing is materialised eagerly.
+    _store_backed_results = isinstance(results, zbas.StoreBackedResults)
+    if _store_backed_results:
+        cores = results.cores
+        result_by_cid = results.descriptors
+    else:
+        result_by_cid = {r["cell_id"]: r for r in results}
 
     # Ordered (row-major) accounting + records, empty cells interleaved exactly
     # as the serial loop emits them.
@@ -14545,7 +14701,8 @@ def _run_single(
         cache_total_bytes += r["total_bytes"]
         cache_n_frames += r["n_frames"]
         cache_peak_bytes = max(cache_peak_bytes, r["total_bytes"])
-        cores[cid] = r["core"]
+        if not _store_backed_results:
+            cores[cid] = r["core"]
         peak_rss_kib = max(peak_rss_kib, r["peak_rss_kib"])
         if r["cleanup_failed"]:
             cleanup_failures.append(r["cache_dir"])
@@ -14576,6 +14733,7 @@ def _run_single(
         _emit("ZeGrid: assembly (R3 assemble_canvas)", callback=progress_callback)
     _assembly_rep = _reporter()
     _assembly_rep.start("assembly")
+    _bounded_preflight = None
     with timings.timed("assembly"):
         _r40_context = None
         if r40_seam_capture:
@@ -14595,16 +14753,37 @@ def _run_single(
                 block_px=int(_zbm.BLOCK_PX), channels=3,
                 protected_roots=(), repo_head=None,
             )
-        assembled, feather_info = _assemble_cells(
-            canvas, nx, ny, _gauge_mode, cores, result_by_cid,
-            halo_px=int(halo_px), emit=_emit_live,
-            capture=r37_diagnostic_capture,
-            holdout_cap=r37_diagnostic_holdout_cap,
-            output_dir=output_dir,
-            capture_identity=r37_capture_identity,
+        _validate_capture_store_compatibility(
+            _store_backed_results,
+            r37_capture=r37_diagnostic_capture,
             r40_capture=r40_seam_capture,
-            r40_context=_r40_context,
         )
+        try:
+            assembled, feather_info, _bounded_preflight = _assemble_cells_guarded(
+                canvas, nx, ny, _gauge_mode, cores, result_by_cid,
+                bounded_results=(results if _store_backed_results else None),
+                purpose="assembly",
+                halo_px=int(halo_px), emit=_emit_live,
+                capture=r37_diagnostic_capture,
+                holdout_cap=r37_diagnostic_holdout_cap,
+                output_dir=output_dir,
+                capture_identity=r37_capture_identity,
+                r40_capture=r40_seam_capture,
+                r40_context=_r40_context,
+                patches=(
+                    results.patches if _store_backed_results else None
+                ),
+            )
+        except BaseException:
+            # Exception hygiene: release the bounded session's mappings (and its
+            # refusal state) before the failure leaves this frame. Any mapping a
+            # consumer still holds stays valid and dies with that reference.
+            if _store_backed_results:
+                try:
+                    results.assembly.close()
+                except Exception:
+                    pass
+            raise
     peak_rss_kib = max(peak_rss_kib, zsw.peak_rss_kib())
     # ZM-ZEGRID-R22 honesty fix: peak_rss_kib is a SINGLE process's peak. Report
     # the batch aggregate (parent + all cell workers) as a clearly-labelled UPPER
@@ -14852,6 +15031,62 @@ def _run_single(
         _r55_scheduler_block, gpu_ctx
     )
 
+    # M5-A: bounded-assembly audit. The ENFORCEMENT is the preflight below
+    # (which ran BEFORE any payload mapping, graph solve or canvas allocation);
+    # everything recorded here is posthoc EVIDENCE, never the gate itself.
+    if _store_backed_results:
+        try:
+            _session = results.session
+            _stats = _session.stats()
+            _cap = int(_stats["max_resident_cells"])
+            _max_live = _stats.get("max_live_bytes")
+            _guard_ok = bool(
+                int(_stats["peak_live_cells"]) <= _cap
+                and (
+                    _max_live is None
+                    or int(_stats["peak_live_mapped_bytes"])
+                    <= int(_max_live)
+                )
+            )
+            per_cell_diagnostics["r55_bounded_assembly"] = {
+                "schema": zbas.SCHEMA,
+                "enforcement": {
+                    "gate": "preflight_before_payload_load",
+                    "refusal_type": "AssemblyCapacityError",
+                    "requires_real_budget": True,
+                    "budget_armed_live_bytes": (
+                        None if _max_live is None else int(_max_live)
+                    ),
+                },
+                "preflight": _bounded_preflight,
+                "access": _stats,
+                "evidence": {
+                    "guard_ok": _guard_ok,
+                    "max_resident_cells": _cap,
+                    "peak_live_cells": int(_stats["peak_live_cells"]),
+                    "peak_live_mapped_bytes": int(
+                        _stats["peak_live_mapped_bytes"]
+                    ),
+                    "policy": (
+                        "live mapped payloads (weak-ref counted, external "
+                        "views included) must stay within the armed envelope"
+                    ),
+                },
+                "note": (
+                    "posthoc statistics are EVIDENCE, not enforcement; the "
+                    "capacity gate ran before any payload was mapped. "
+                    "Read-only memory-mapped payloads; integrity + canonical "
+                    "fingerprint checked once per immutable identity per "
+                    "session (streamed hash); pre-offset commits never mutated."
+                ),
+            }
+        except Exception as _bounded_exc:  # audit only, never a silent claim
+            per_cell_diagnostics["r55_bounded_assembly"] = {
+                "schema": zbas.SCHEMA,
+                "error": f"{type(_bounded_exc).__name__}: {_bounded_exc}",
+                "note": "audit could not be computed; no bound claimed",
+            }
+
     # M1: publish the lightweight conservation state (never payloads) so the
     # manifest can audit accepted/pending sparse cells and retained bytes.
     if result_registry is not None:
@@ -14988,6 +15223,26 @@ def _run_single(
             callback=progress_callback,
         )
     if _store_state["store"] is not None:
+        # M5-A: drop the bounded assembly session BEFORE the store closes (the
+        # session may still hold mapped payloads; their views stay valid).
+        _assembly_access = _store_state.get("assembly_access")
+        if _assembly_access is not None:
+            try:
+                _assembly_stats = _assembly_access.close()
+                _emit(
+                    "ZeGrid: bounded assembly access closed "
+                    f"(peak {_assembly_stats['peak_resident_cells']} mapped "
+                    f"cell(s), {_assembly_stats['peak_resident_mapped_bytes']} B)",
+                    callback=progress_callback,
+                )
+            except Exception as _bounded_close_exc:
+                _emit(
+                    "ZeGrid: bounded assembly access close warning "
+                    f"({type(_bounded_close_exc).__name__}: {_bounded_close_exc})",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+            _store_state["assembly_access"] = None
         try:
             _store_state["store"].close()
         finally:

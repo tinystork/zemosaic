@@ -1,3 +1,160 @@
+## Current status — M5-A CODE ACCEPTÉ (2026-10-28)
+
+Nono review-2 = ACCEPT-WITH-CONDITIONS, aucun HIGH/MEDIUM bloquant. G1 fermé (le modèle facture exactement l'allocation réelle du solveur dense : A=2 425 920 B à N400/E760, total 11 754 664 B, zéro coût en global). G2 fermé (hash non contigu réellement borné : 4 308 B au lieu de 2 098 088 B pour 1 MiB strided; digests canoniques identiques; contigu zéro-copie). Garde capture ordonnée avant les travaux coûteux. Cap 2 cellules et vues externes jamais fermées de force conservés. Junior a rejoué 155 passed / 5 skipped et reproduit les deux corrections par sondes indépendantes.
+
+Périmètre M5-A: accès read-only borné au store (mmap, vérification+fingerprint une fois par identité de session), préflight de capacité métadonnées-seul branché avant tout chargement/graphe/canvas, assemblage scientifique exact (global et per_cell) et rejeu idempotent après reopen. Aucune activation par défaut, aucun changement de science/schéma/budget.
+
+CONDITIONS portées en M5-B (non acquises): mesure RSS/pic réelle de la borne (BLAS/workspace/Nfree), test d'exécution de la garde capture (store+R37/R40 refusé, sans store accepté), documentation du coût CPU du hash non contigu hors chemin chaud, conservation du cap/rétention, pas d'activation par défaut.
+
+NOT_RUN: produit complet avec store, Windows, GPU, pression réelle M3, M31, finitions/publication (M5-B). M5 n'est PAS complet.
+
+
+
+Corrections 1 et 2 livrées. Junior a rejoué 155 passed / 5 skipped (45.95 s; 148 passed hors tests RAM-gated) et vérifié par sondes indépendantes: (G1) le modèle du solveur dense facture exactement l'allocation réelle (A=2 425 920 B à N400/E760) avec un total conservateur 11 754 664 B et zéro coût en mode global; (G2) le hash non contigu est réellement borné (pic 4 308 B au lieu de 2 098 088 B pour 1 MiB strided, chunk 1 024) avec digests canoniques identiques; la garde capture s'exécute avant les effets de bord. Aucune modification de science, de schéma/identité de store, de défaut d'activation.
+
+Nono review-2 read-only en file (run b46bf446-5dde-44f5-8245-42b59a279b96). M5-A reste non accepté jusqu'à son verdict; M5-B (finitions + publication transactionnelle multifichiers) non commencé. NOT_RUN: produit complet avec store, Windows, GPU, pression réelle M3, M31. Aucun commit/push. Historique ci-dessous conservé.
+
+## Current status — M5-A REWORK-2 queued (2026-10-28)
+
+Nono review-1 FINDINGS adjudicated: dense graph underpricing and noncontiguous hash chunk violation confirmed by Junior probes/source; four-cell eager retention already covered. No proof that historical R37/R40 stores are incompatible: correction limited to testing/ordering current store+capture request guard, no blanket store rejection. Four code/test hashes unchanged, STATE orchestration-only differences understood.
+
+Second correction dispatched to SAME Coco session (no reset), accepted/queued run5720f65d-2714-4e3b-8e1d-3f9d7cc362d0. Mission ZM-ZEGRID-RESILIENT-RUN-RESUME-M5A-20261028; durable .rework2-brief.md and .junior-review1-disposition.md under workspace .a2a-reports. Expected .coco.r2.md exact-source callback; no polling. Then independent verification + Nono follow-up. Scope mode-aware dense-solve model, bounded noncontig hash, early tested capture guard; science/defaults/store identity unchanged.
+
+M5-A NOT accepted, M5-B not started, M3 realpressure/M4 fullproduct/Windows NOT_RUN. No commit/push.
+
+## Current status — M5-A r1 verified, Nono review-1 queued (2026-10-28)
+
+Junior replay: 142 passed / 5 skipped (15.47s); independent 3x3 float32/float64 global/per_cell dense parity PASS, mapped-cell peak2. Preflight now before consumer; lifetime enforcement improved. NOT ACCEPTED: graph model linear96B/cell misses actual dense solver matrices. For400cells, A alone2,425,920B > total advertised model1,137,070B (graph38,400B). Noncontiguous hash also copies outer slice (2MiB observed for1KiB chunk); current production C-order maps limit applicability of that second issue. Evidence in workspace .a2a-reports/ZM-ZEGRID-RESILIENT-RUN-RESUME-M5A-20261028.junior.r1.md and .junior-probes-r1.json.
+
+Nono read-only review-1 accepted/queued run21534f86-4a2f-402d-afc0-54fa88dc2c08; expected .nono.r1.md via exact-source callback, no polling. Then consolidate bounded REWORK-2 to SAME Coco context if findings confirmed. 1/3 corrective iterations used. M5-B not started, M3 realpressure/M4 fullproduct/Windows still NOT_RUN; no commit/push. Older status sections below are historical.
+
+## Current status — M5-A REWORK-1 queued (2026-10-28)
+
+Nono review-0 FINDINGS confirmed by Junior: production preflight missing, real mapping lifetime under-counted, repeated full-plane fingerprint copy unpriced. Code/test hashes unchanged from Junior 129 passed / 5 skipped and live-mapping probes; only orchestration STATE note differs. No acceptance.
+
+Mission ZM-ZEGRID-RESILIENT-RUN-RESUME-M5A-20261028 continues in SAME Coco session, no reset. First corrective iteration dispatched asynchronously, accepted/queued run ae9b6d8c-fde8-47a6-8d94-be1ae9ca39aa. Durable brief: workspace .a2a-reports/ZM-ZEGRID-RESILIENT-RUN-RESUME-M5A-20261028.rework1-brief.md; expected report .coco.r1.md via exact-source callback. Correct preflight + actual safe lifetime enforcement + bounded integrity hash and model; no science/default changes. Await callback, no polling, then independent verification and Nono follow-up.
+
+M5-B not started; M3 physical pressure unqualified; M4 product/Windows NOT_RUN. No commit/push. Older implementation hard-cap/verify-once claims below are historical, NOT accepted evidence.
+
+## M5-A REWORK-2 (Coco, 2026-10-28) — code-only, NOT accepted, M5-B not started
+
+REWORK-2 closes review-1 findings G1/G2 and narrows the R37/R40 guard:
+
+- **G1 (HIGH)** — `bounded_assembly.dense_solve_bytes()` prices the REAL
+  canonical dense least-squares solve from metadata only: `A(E, Nfree)`,
+  weighted `A`, previous-channel `A`, `AᵀA`, LAPACK copies, edge vectors,
+  per-node copies and a documented 25 % BLAS margin. Reference N=400/E=760:
+  `A` = 8·760·399 = **2 425 920 B** (previous model priced the WHOLE graph at
+  38 400 B). Recovery N=400: graph bound **11 754 664 B** (vs total plan
+  1 137 070 B before). Edges are the real 4-neighbour pairs of the selected
+  cells (`grid_edge_upper_bound`); `global` mode prices EXACTLY 0 (no offset
+  solve runs). Refusal carries the full preflight provenance.
+- **G2 (MEDIUM)** — `array_sha256_streaming` now hashes non-contiguous arrays
+  (strided / transposed / negative stride / channel slice) through blocks of at
+  most `chunk_bytes`: the last axis is walked in element blocks, every leading
+  index in C order. No `np.ascontiguousarray` of an arbitrary outer slice, no
+  flatten/ravel copy. Contiguous (production mmap) path stays zero-copy.
+  Canonical digest unchanged; tracemalloc peak bounded by the chunk.
+- **R37/R40** — `_validate_capture_store_compatibility()` is a pure predicate
+  called right after the store is known (before any expensive run work and
+  before the R40 capture context); a store-active capture request fails
+  explicitly, store-less captures are unchanged, no store identity/schema
+  rejection was added (no evidence justified it).
+- Manifest `r55_bounded_assembly.preflight` now publishes the solver inputs
+  (cells/edges/free), gauge mode, grid and the metadata-only/refused facts.
+- Evidence (REWORK-2): M5 file **37 passed** (26.41 s); combined M5 + M2 store +
+  M2 IO + M4 + feather/offset/R3 assembly **155 passed, 5 skipped** (36.82 s);
+  `git diff --check` OK. Including a N=400 tiny-patch store: the guarded entry
+  refuses on a 2 MiB budget with ZERO loads, verifications and solver calls.
+- NOT_RUN: full product run with the store, Windows, real-pressure assembly,
+  M31; execution order inside `_run_single` for the capture guard is verified
+  structurally + by predicate tests only. M3/M4 qualifications unchanged
+  (NOT_RUN). M5 not complete.
+
+## Current status — M5-A dispatched (2026-10-28)
+
+Night mission resumed after the sessions.reset tool-registry blocker. Reset confirmed by fresh Coco history (Reset seq1) despite RPC timeout; dispatch accepted/queued run 45ea85bd-db7a-42f2-875c-dc5111339794.
+
+Active mission: ZM-ZEGRID-RESILIENT-RUN-RESUME-M5A-20261028. M5-A is the bounded store-read/scientific-assembly slice (immutable checkpoints, exact parity, bounded working set); M5-B will cover final finishing and coherent multi-file publication. M5 is NOT accepted yet. Baseline HEAD 26be05550789a5f52bf49308072ef15842e3b0b3 clean before delegation; two store/feather baseline tests pass (3.79s).
+
+Expected report: /home/tristan/.openclaw/workspace/.a2a-reports/ZM-ZEGRID-RESILIENT-RUN-RESUME-M5A-20261028.coco.r0.md. Next: callback, independent Junior verification, then Nono review. M3 real-pressure and M4 actual product/Windows qualifications remain NOT_RUN; no default activation and no M31 run.
+
+## M5-A implementation + REWORK-1 (Coco, 2026-10-28) — code-only, NOT accepted, NOT M5
+
+M5-A (bounded store read + immutable scientific assembly) implemented on
+`feat/zegrid-resilient-run-resume` from `26be055`: no commit, no push.
+REWORK-1 corrected the three Nono/Junior findings (F1/F2/F3); the r0 claims
+below that REWORK-1 replaced (a hard "LRU cap = 2" as the bound, "verify-once"
+as a blanket statement, and an "exact" working-set model / "700 MiB" canvas)
+are OBSOLETE and must not be used as evidence.
+
+- New isolated module `core/zegrid/bounded_assembly.py`:
+  - `CellReadSession`: read-only `np.memmap` planes, integrity + canonical
+    fingerprint checked **once per immutable identity**
+    `(cell_id, attempt_id, payload_sha256)` per session, with the hash
+    **streamed** in fixed chunks (`array_sha256_streaming` /
+    `payload_sha256_streaming`, byte-identical to `run_registry`), never a
+    full-plane copy.
+  - REAL live-mapping accounting through weak references: `live_cells`,
+    `live_mappings`, `live_mapped_bytes` and their peaks count external views,
+    slices and reopen of the same cell. Enforcement happens BEFORE a new
+    mapping is opened (LRU refs dropped first, then an explicit
+    `BoundedLifetimeError` if external retention still exceeds the envelope).
+    Mappings a consumer holds are NEVER force-closed.
+  - `preflight_assembly()`: metadata-only, fail-closed capacity gate
+    (commit manifests + canvas price + conservative transient + hash chunk +
+    graph). The production path REQUIREs a real budget; `require_budget=False`
+    is the explicit diagnostic mode.
+  - `assembly_plan()`: conservative bound (not a measured RSS); canvas is
+    121 B/px at 3 channels (953,121,114 B ≈ 909 MiB for 2403×3278).
+  - `assert_bounded_usage()` reads the real live counters; an eager
+    `list(view.values())` or externally retained set now FAILS safely instead
+    of passing the guard.
+- Wiring: the store path no longer calls `ordered_payloads` eagerly;
+  `_assemble_cells_guarded()` runs the preflight BEFORE `_assemble_cells` (so
+  before any payload load, graph solve or canvas allocation) and propagation is
+  an explicit `AssemblyCapacityError` (no false COMPLETE, commits preserved).
+  `cell_feather.assemble_canvas_feathered` gained an OPTIONAL `allocator`
+  parameter (default `np.zeros`, numeric path identical). Store-less path
+  unchanged.
+- Manifest: `per_cell_diagnostics["r55_bounded_assembly"]` carries the
+  preflight plan (enforcement), the live-mapping statistics and a guard verdict
+  (evidence, not enforcement).
+- Local evidence (REWORK-1): `tests/test_zegrid_bounded_assembly_m5.py`
+  **24 passed**; M2 store 48, M2 IO 8, M4 resume 21, feather/offset/R3 assembly
+  41 passed + 5 skipped; combined **142 passed, 5 skipped** (14.44 s).
+- NOT_RUN: real product end-to-end with the store, Windows, real-pressure
+  assembly, M31. M5-B (final generation + last marker, multifile atomic
+  publication, kill at finalization) NOT started. M5 is NOT claimed complete.
+
+## Historical M5-A r0 note (superseded by REWORK-1 — do not use as evidence)
+
+M5-A (borned store read + immutable scientific assembly) implemented on
+`feat/zegrid-resilient-run-resume` from `26be055`: no commit, no push.
+
+- New isolated module `core/zegrid/bounded_assembly.py`: `CellReadSession`
+  (verify-once + read-only `np.memmap` planes, hard LRU residency cap = 2),
+  bounded `Mapping` views (`descriptors`/`cores`/`patches`), an honest
+  working-set plan (`assembly_plan`, exact canvas accumulator bytes) with an
+  explicit `AssemblyCapacityError` refusal when a budget is supplied, a defect
+  guard (`assert_bounded_usage`) and an optional scratch-backed canvas
+  allocator (not activated by default).
+- Wiring: the durable-store assembly path no longer calls
+  `ordered_payloads` eagerly; `_run_single` receives metadata descriptors and
+  bounded views, `_assemble_cells(..., patches=...)` receives the bounded patch
+  view. Store-less path unchanged (eager dict, same code). `cell_feather.
+  assemble_canvas_feathered` gained an OPTIONAL `allocator` parameter (default
+  `np.zeros`, numeric path identical).
+- Manifest: `per_cell_diagnostics["r55_bounded_assembly"]` publishes the
+  session stats + working-set model + guard verdict (no payload, no pixel).
+- Local evidence: `tests/test_zegrid_bounded_assembly_m5.py` 11 passed;
+  M2 store 48 passed; M4 resume 21 passed; feather/offset/R3 assembly 41 passed
+  + 5 skipped; M2 IO 8 passed. Two `test_zegrid_r40b2_pooled` failures are
+  PRE-EXISTING (reproduced identically in a clean worktree at `26be055`).
+- NOT_RUN: product end-to-end with the store, Windows, real-pressure assembly,
+  M31. M5-B (final generation + last marker, multifile atomic publication, kill
+  at finalization) NOT started. M5 is NOT claimed complete.
+
 ## Current status — M4 code ACCEPTÉ (ACCEPT-WITH-CONDITIONS, qualification NOT_RUN)
 
 Nono review-0 = ACCEPT-WITH-CONDITIONS, aucun HIGH/MEDIUM. M4 (reprise de run) commitée `1801d70` et poussée sur `feat/zegrid-resilient-run-resume`. Jauge complète + géométrie figée persistées et RESTAURÉES (jamais re-dérivées); mismatch => ResumeIncompatible; reprise sur ensemble clairsemé; run complet no-op; never par défaut; politique dense→bounded restaurée.
@@ -237,3 +394,10 @@ reviews. Only then decide whether to start M1. No commit/push authorized.
 - Pending gates: short Windows focused proofs on the candidate commit, then the
   full Windows bench (`exit 0`, `status=PASS`, zero skip); Nono review; Junior
   acceptance. No Windows PASS claim exists.
+
+### Junior M5-A r0 — independent gate (2026-10-28)
+
+- NOT ACCEPTED pending correction/review: 129 tests passed, 5 skipped; connected 2x2 exact parity passed.
+- Confirmed: no production capacity preflight before assembly; actual mapped-cell peak 3 vs reported cap 2, and eager 4-payload retention passes the guard. Hash/transient pricing also needs review.
+- Nono review-0 asynchronously accepted; durable Junior evidence in `.a2a-reports/ZM-ZEGRID-RESILIENT-RUN-RESUME-M5A-20261028.junior.r0.md` (workspace). Snapshot preceded this orchestration-only note.
+- Next: verify Nono findings, bounded REWORK-1 to same Coco mission session. M5-B not started; real-pressure and Windows gates unchanged. No commit/push.
