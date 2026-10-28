@@ -1,3 +1,53 @@
+## Current status — M2-READER ACCEPTÉ, intégration Linux vérifiée (2026-10-28)
+
+Mission `ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028` close : Nono review-0 ACCEPT puis décision Junior ACCEPT. Les deux échecs étaient dus au lecteur de manifeste racine périmé depuis M5-B, pas à un défaut établi du store. Le témoin résout maintenant l'identité exacte du store et CURRENT vérifié, sans repli racine. Code produit inchangé.
+
+Junior : **210 passed, zéro skip/échec** (99 M2/store/IO/crash/identité + 111 M4/M5). Les deux tests M2 réels passent, avec ordre commit durable avant release observé, rechargement core/patch/mask byte-identique et immutable, index complet, refus de contrat scientifique modifié. Sondes du helper : pointeur absent/membre corrompu malgré leurres/identité différente refusés. Le hash du test est inchangé depuis ces rejeux. Aucune parité scientifique finale store vs no-store déduite des seules formes FITS.
+
+Git : `feat/zegrid-resilient-run-resume` HEAD `fb268cb2df9892a9a783a0f72e29546bfdeae246`; lot tests M2 + STATE accepté ; Tristan a autorisé le commit et le push sur cette seule branche feature le 2026-10-28. Le SHA de publication sera consigné dans le rapport durable après vérification distante. Rapport final workspace `.a2a-reports/ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028.junior.acceptance.md`. Aucun worker actif pour cette mission.
+
+Suivis non bloquants : tests négatifs du helper à pérenniser (sondes indépendantes déjà faites), commentaires de diagnostic à clarifier, log close `peak_resident_*` à aligner sur `peak_live_*` (fermeture effective déjà exécutée, pas de fuite démontrée). Qualifications restantes : pression physique M3, Windows/NTFS réel (dual boot possible), reprise produit complète sans seams, grands RSS/BLAS, GPU/M31. Pas d'activation par défaut/M6. Les preuves historiques ne sont pas effacées.
+
+---
+## Historique — vérification et revue avant acceptation
+
+## Current status — M2-READER vérifié Junior, revue Nono en cours (2026-10-28)
+
+Mission `ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028`, HEAD `fb268cb2df9892a9a783a0f72e29546bfdeae246`. Diff borné aux tests M2 + STATE, sans code produit/commit/push. Junior : **99 passed** (M2/store/IO/crash/identité, 43.15s) + **111 passed** (M4/M5, 136.96s) = **210 passed, zéro skip/échec**. Les deux vrais tests M2 exécutés. Sondes du nouveau helper sur copies des sorties réelles : génération valide acceptée, pointeur absent/membre corrompu malgré leurres racine/identité différente refusés. Preuves `.a2a-reports/...M2-READER-20261028.junior.r0.md`, logs et JSON associés.
+
+Nono review-0 accepted/queued `ad0d6946-94c1-4f2f-a512-4d4925b05d81`; attendu `.a2a-reports/ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028.nono.r0.md`. Attendre callback sans polling. Pas d'acceptation finale avant revue. 0 correction consommée; même contexte Coco à conserver.
+
+Suivi distinct : log close utilise des clés périmées `peak_resident_*` alors que stats expose `peak_live_*`; close est exécuté avant le warning de formatage. Pas de fuite démontrée, correction diagnostic à traiter séparément. M3pression/Windows/qualification produit complète sans seams/grandsRSS restent ouverts; aucune activation.
+
+---
+## Historique — livraison Coco avant vérification Junior
+
+## Current status — M2 lecteur par génération corrigé, tests d'intégration rejoués PASS (2026-10-28)
+
+Mission `ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028`, base `fb268cb2df9892a9a783a0f72e29546bfdeae246`, branche `feat/zegrid-resilient-run-resume`. Aucun commit/push.
+
+Cause racine établie : le témoin M2 lisait encore le manifeste racine obsolète `out/zegrid_manifest.json`. Le produit n'a PAS échoué et la dégradation vers M1 n'est PAS établie. Correction bornée du lecteur de test : le run est résolu depuis l'identité du store durable (`run_id`, `identity_sha256`), puis `run_publication.resolve_current(verify_members=True, expected_identity_sha256=...)`; manifeste/science/coverage sont lus dans CETTE génération vérifiée, sans glob, sans fichier le plus récent, sans fallback racine et sans confiance dans `state.finalized` seul. L'ordre commit durable -> release est désormais prouvé par la séquence d'événements réellement observée (un commit par cellule COMPLETE, release seulement après), pas par la seule présence des fichiers. Ajout de 5 contrôles lecteur : pointeur absent, pointeur corrompu, membre corrompu malgré des leurres racine, membre absent, pointeur revendiquant un autre run — tous échouent fermé.
+
+Résultats exacts : `test_zegrid_resume_m2_store_run.py` 17 passed, 0 skipped, les DEUX tests réels exécutés (4 cellules, 4 commits, 4 releases, 55 370 541 B libérés, 0 invalid ; 2 803 776 KiB disponibles, soit ~2,67 GiB) ; store/IO M2 82 passed ; M4 21 passed ; M4 e2e 8 passed ; M5 assembly+publication 82 passed ; `git diff --check` OK.
+
+Statut : M2 NON ACCEPTÉ jusqu'à vérification Junior puis revue indépendante Nono. Les qualifications historiques M2/Windows ne sont pas effacées. Restent NON qualifiés : pression physique M3, Windows/NTFS réel, produit complet sans seams, grands RSS/BLAS, GPU, M31. NTFS n'est pas l'unique condition avant activation ; aucune activation/M6.
+
+---
+## Historique — dispatch initial M2-READER (2026-10-28)
+
+Mission `ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028`, base `fb268cb2df9892a9a783a0f72e29546bfdeae246`, branche `feat/zegrid-resilient-run-resume`. Autorisation Tristan de poursuivre M2.
+
+Correction du diagnostic précédent : la dégradation vers M1 n'est PAS établie. Junior a reproduit les deux échecs avec RAM disponible (~2809 MiB) : les tests cherchent encore `out/zegrid_manifest.json`, chemin obsolète depuis la publication par générations M5-B. Pour chacun des deux runs, CURRENT résolu avec vérification de tous les membres et de l'identité : store actif, 4 cellules committées, 4 libérées (55 370 541 B), 0 invalid, aucune erreur ouverture/commit/dégradation. Les diagnostics existent dans le manifeste de la génération. Les assertions ultérieures (parité payload, ordre release, refus identité) doivent encore être exécutées : pas d'acceptation anticipée.
+
+Baseline : `FF..........`, 2 échecs lecteur ancien / 10 pass. Preuves workspace `.a2a-reports/ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028.junior-baseline.json`; sorties conservées `/tmp/zm-m2-investigation-20261028-junior/`.
+
+Coco réinitialisé avant cette nouvelle mission (tokens0), dispatch accepted/queued `6dbd6fa8-3af7-495a-a5d4-284ce57acfb4`. Scope : lecteur de test lié à CURRENT+identité, sans fallback racine, maintien/renforcement des preuves scientifiques et refus corruption. Rapport attendu `.a2a-reports/ZM-ZEGRID-RESILIENT-RUN-RESUME-M2-READER-20261028.coco.r0.md`. Puis vérification Junior et revue indépendante Nono, sans polling. Aucun commit/push demandé au worker.
+
+M5-C code déjà publié; M2 intégration en vérification, sans effacer les qualifications historiques. Windows/NTFS, pression physique M3, qualification produit sans seams et grands RSS restent NON qualifiés; NTFS n'est pas l'unique condition avant activation. Pas d'activation/M6.
+
+---
+## Historique — diagnostic antérieur corrigé ci-dessus
+
 ## Current status — M5-C flush portable ACCEPTÉ, M2 durable-store révélé en échec (2026-10-28)
 
 M5-C ACCEPTÉ (code + tests) et publié. `_flush_member` (`run_publication.py`) ouvre
