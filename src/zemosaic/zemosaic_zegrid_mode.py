@@ -118,6 +118,7 @@ from .core.zegrid import run_registry as zrr
 from .core.zegrid import run_store as zrs
 from .core.zegrid import run_resume as zres
 from .core.zegrid import run_artifacts as zart
+from .core.zegrid import run_publication as zpub
 from .core.zegrid import resource_recovery as zrec
 from .core.zegrid import scheduler as zsched
 from .core.zegrid import vram_high_water as zvh
@@ -2244,6 +2245,15 @@ def _resume_store_budget(zconfig):
             budget_bytes or zrs.MIN_TRANSACTIONAL_MARGIN_BYTES
         ),
     )
+
+
+def _publication_available_ram_bytes():
+    """M5-B production RAM probe seam (bounded test seam, not a setting).
+
+    Production MUST obtain a fresh observation here; a failure/exception is a
+    publication refusal (F1), never an unobserved admission.
+    """
+    return int(zsw.read_available_memory())
 
 
 def _plan_bundle_auto(
@@ -9496,6 +9506,20 @@ def _validate_capture_store_compatibility(
     return None
 
 
+def _store_safe_run_id(value):
+    """Normalise a registry run_id into ONE store-safe path component.
+
+    The M1 registry uses a human-readable ``zegrid:<timestamp>:<pass>:<ns>``
+    identity; the durable store requires ``[A-Za-z0-9][A-Za-z0-9._-]*``. The
+    store identity/state/publication must use the SAME normalised id on every
+    restart, otherwise a resumable store could never be reopened.
+    """
+    import re as _re
+
+    token = _re.sub(r"[^0-9A-Za-z._-]+", "-", str(value)).strip("-._")
+    return token[:96] or "run"
+
+
 def _resume_generation_root(store_dir, run_id):
     """Return a NEW run root that NEVER overwrites an existing generation.
 
@@ -9685,6 +9709,17 @@ def _run_single(
         "invalid_isolated": None,
         "refusal": None,
     }
+    # M5-B F6: refuse an incompatible diagnostic-capture request at the TOP of
+    # the real run, BEFORE the resume bootstrap (so an already-published no-op
+    # cannot bypass it), descriptors, layout, gauge or any store open. A
+    # configured durable store is known here even if it would later fail to
+    # open: fail closed rather than risk capture effects before that failure.
+    # A store-less capture is unchanged and passes this guard.
+    _validate_capture_store_compatibility(
+        bool(_resume_store_dir),
+        r37_capture=r37_diagnostic_capture,
+        r40_capture=r40_seam_capture,
+    )
     if _resume_mode == zres.RESUME_MODE_AUTO:
         if not _resume_store_dir:
             _raise = RuntimeError(
@@ -13846,12 +13881,126 @@ def _run_single(
                 "is replayed from the immutable commits",
                 callback=progress_callback,
             )
+            # M5-B: a finalized run is a no-op ONLY when the durable publication
+            # generation resolves and every member digest verifies. A missing or
+            # corrupt companion is an explicit refusal, never a fake COMPLETE.
+            try:
+                _pub_verdict = zpub.verify_finalized(
+                    output_dir,
+                    _store.root,
+                    str(_store.run_id),
+                    expected_identity_sha256=zrs.identity_sha256(
+                        _store.identity
+                    ),
+                )
+            except zpub.PublicationError as _pub_exc:
+                _resume_runtime["publication_refusal"] = (
+                    f"{type(_pub_exc).__name__}: {_pub_exc}"
+                )
+                _emit(
+                    "ZeGrid: resume publication check REFUSED — "
+                    f"{_pub_exc}. No fake COMPLETE, no silent re-publication.",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
+                raise
+            if _pub_verdict.published:
+                _pub_gen = _pub_verdict.generation
+                _pub_outputs = (
+                    {} if _pub_gen is None else _pub_gen.outputs_state()
+                )
+                _resume_runtime["finalized_noop"] = True
+                _resume_runtime["publication"] = (
+                    None if _pub_gen is None else _pub_gen.as_report()
+                )
+                _resume_runtime["outputs"] = dict(_pub_outputs)
+                if _pub_verdict.reason != "verified_finalized":
+                    # Lost OR stale acknowledgement: the publication is durable
+                    # but the state is missing/partial/outdated. Reconcile it
+                    # WITHOUT recomputation, publication or pointer mutation.
+                    try:
+                        _prev_state = zres.read_state(_store.root)
+                        zres.write_state(
+                            _store.root,
+                            run_id=_prev_state["run_id"],
+                            expected_cell_ids=_prev_state["expected_cell_ids"],
+                            policy=zres.policy_from_snapshot(
+                                _storage_policy_snapshot()
+                            ),
+                            plan_generation=int(
+                                _prev_state["plan_generation"]
+                            ) + 1,
+                            finalized=True,
+                            gauge_sha256=_prev_state["gauge_sha256"],
+                            outputs=_pub_outputs,
+                            created_unix_ns=_prev_state["created_unix_ns"],
+                            note=_prev_state["note"],
+                        )
+                    except Exception as _ack_exc:
+                        _emit(
+                            "ZeGrid: publication is durable but the finalized "
+                            "state ack could not be repaired "
+                            f"({type(_ack_exc).__name__}: {_ack_exc}); a later "
+                            "resume reconciles from CURRENT.json again.",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+                _emit(
+                    "ZeGrid: verified no-op — publication generation "
+                    f"{_pub_gen.generation} resolves with "
+                    f"{len(_pub_gen.members)} verified member(s) "
+                    f"({_pub_verdict.reason}); no cell, assembly, finishing or "
+                    "publication work is replayed",
+                    callback=progress_callback,
+                )
+                if result_registry is not None:
+                    try:
+                        result_registry.dispose()
+                    except Exception as _dispose_exc:
+                        _emit(
+                            "ZeGrid: no-op registry dispose warning "
+                            f"({type(_dispose_exc).__name__}: {_dispose_exc})",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+                _store_state["assembly_access"] = None
+                try:
+                    _store.close()
+                finally:
+                    _store_state["publishing"] = False
+                results = []
+                # F5: same product return kind/role/path as a normal successful
+                # publication (aesthetic when present, otherwise scientific),
+                # resolved from the VERIFIED generation. No fake progress work.
+                _noop_return = (
+                    _pub_gen.path(zpub.ROLE_AESTHETIC)
+                    if zpub.ROLE_AESTHETIC in _pub_gen.members
+                    else _pub_gen.path(zpub.ROLE_SCIENCE)
+                )
+                _emit(
+                    f"ZeGrid: done (verified no-op) — science="
+                    f"{_pub_gen.path(zpub.ROLE_SCIENCE).name} "
+                    f"aesthetic="
+                    f"{_pub_gen.path(zpub.ROLE_AESTHETIC).name if zpub.ROLE_AESTHETIC in _pub_gen.members else 'n/a'} "
+                    f"generation={_pub_gen.generation} "
+                    f"output={_noop_return.name}",
+                    lvl="SUCCESS",
+                    callback=progress_callback,
+                )
+                return _noop_return
+            _emit(
+                "ZeGrid: resumed run has all cells committed but NO verified "
+                "publication generation; replaying assembly/finishing and "
+                "publishing a NEW generation (no restack of valid cells)",
+                callback=progress_callback,
+            )
     elif _store_dir and result_registry is not None:
         _store_error = None
         _store_stage = "identity_build"
+        _store_run_id = _store_safe_run_id(result_registry.run_id)
         try:
             _store_identity = _r55_build_run_store_identity(
-                run_id=str(result_registry.run_id),
+                run_id=_store_run_id,
                 descs=descs,
                 canvas=canvas,
                 bundle=_initial_bundle,
@@ -13874,13 +14023,13 @@ def _run_single(
             # M4: never overwrite an existing generation. A legacy single run
             # may still live directly in the container; M4 creates a child.
             _store_target = _resume_generation_root(
-                _store_dir, str(result_registry.run_id)
+                _store_dir, _store_run_id
             )
             _store, _store_error = _r55_open_run_store(
                 _store_target,
                 identity=_store_identity,
                 budget_bytes=_store_budget_bytes,
-                session_id=str(result_registry.run_id),
+                session_id=_store_run_id,
             )
         except Exception as exc:  # explicit refusal, never silent
             _store, _store_error = None, exc
@@ -14839,8 +14988,96 @@ def _run_single(
 
     # ZM-ZEGRID-R23 rework-3 (H1): resolve the Classic-compatible output naming
     # from the finishing config (existing export_aesthetic_fits + cleaned suffixes).
-    raw_science = np.asarray(assembled.science, dtype=np.float32)
     raw_science_path, aesthetic_path = _resolve_output_paths(output_dir, finishing_config)
+
+    # M5-B: on the opt-in durable-store path, admit the finishing + serialization
+    # RAM/disk budgets and open ONE run-owned generation BEFORE the first
+    # finishing or serialization allocation. The legacy in-place path (no store)
+    # is untouched. A refusal is explicit and leaves the durable store resumable.
+    _publication = None
+    _publication_plan = None
+    if (
+        _store_state.get("store") is not None
+        and _store_state.get("degraded_reason") is None
+    ):
+        _pub_run_id = str(_store_state["store"].run_id)
+        _pub_members = {
+            zpub.ROLE_SCIENCE: raw_science_path.name,
+            zpub.ROLE_COVERAGE: "mosaic_grid_coverage.fits",
+            zpub.ROLE_MANIFEST: "zegrid_manifest.json",
+            zpub.ROLE_RUN_LOG: RUN_LOG_NAME,
+        }
+        if aesthetic_path is not None:
+            _pub_members[zpub.ROLE_AESTHETIC] = aesthetic_path.name
+        if bool((finishing_config or {}).get("save_uint16")):
+            _pub_members[zpub.ROLE_UINT16] = "mosaic_grid_uint16.fits"
+        _pub_ram_available = None
+        _pub_ram_error = None
+        try:
+            _pub_ram_available = int(_publication_available_ram_bytes())
+        except Exception as _ram_exc:
+            _pub_ram_error = f"{type(_ram_exc).__name__}: {_ram_exc}"
+            _emit(
+                "ZeGrid: publication RAM budget UNOBSERVED "
+                f"({_pub_ram_error}); refusing production admission rather "
+                "than forging capacity — the durable store remains resumable",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+        try:
+            _publication = zpub.PublicationSession.begin(
+                output_dir,
+                _pub_run_id,
+                members=_pub_members,
+                shape_hw=(int(canvas.height), int(canvas.width)),
+                channels=int(np.shape(assembled.science)[-1]),
+                finishing_config=finishing_config,
+                available_ram_bytes=_pub_ram_available,
+                ram_probe_error=_pub_ram_error,
+                n_cells=int(len(cell_records)),
+                identity_sha256=zrs.identity_sha256(
+                    _store_state["store"].identity
+                ),
+            )
+        except zpub.PublicationCapacityError as _pub_cap:
+            _resume_runtime["publication_refusal"] = (
+                f"{type(_pub_cap).__name__}: {_pub_cap}"
+            )
+            _emit(
+                f"ZeGrid: publication REFUSED before allocation — {_pub_cap}",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise
+        _publication_plan = dict(_publication.plan)
+        per_cell_diagnostics["r55_publication"] = {
+            "schema": zpub.SCHEMA,
+            "generation": _publication.generation,
+            "generation_dir": str(_publication.generation_dir),
+            "admission": _publication_plan,
+            "required_roles": list(zpub.REQUIRED_ROLES),
+            "note": (
+                "all members are written and verified inside this generation; "
+                "CURRENT.json is the final atomic pointer and the ONLY "
+                "authority (previous generations stay valid until it moves)"
+            ),
+        }
+        raw_science_path = _publication.path_for_name(raw_science_path.name)
+        if aesthetic_path is not None:
+            aesthetic_path = _publication.path_for_name(aesthetic_path.name)
+        _emit(
+            "ZeGrid: publication generation opened — "
+            f"{_publication.generation} under "
+            f"{_publication.generation_dir} (RAM budget "
+            f"{'observed' if _publication_plan['ram']['observed'] else 'UNOBSERVED'}: "
+            f"required {_publication_plan['ram']['required_bytes']} B / "
+            f"available {_publication_plan['ram']['available_bytes']}; disk "
+            f"required {_publication_plan['disk']['required_bytes']} B / "
+            f"free {_publication_plan['disk']['free_bytes']} B)",
+            callback=progress_callback,
+        )
+
+    raw_science = np.asarray(assembled.science, dtype=np.float32)
 
     # ZM-PROGRESS-CONTRACT-R29: honest ``zegrid:finalize`` seam. It spans final
     # finishing + output publication (science/aesthetic/coverage/manifest) + the
@@ -15143,6 +15380,7 @@ def _run_single(
         halo_provenance=_halo_provenance_pass,
         r55_scheduler=_r55_scheduler_block,
         r55_run_telemetry=_r55_run_telemetry,
+        publication=_publication,
     )
 
     _write_run_log(
@@ -15168,6 +15406,56 @@ def _run_single(
         halo_provenance=_halo_provenance_pass,
     )
 
+    # M5-B: close the generation ONLY now that every member exists. The run-log
+    # copy is auxiliary (not authority); if it cannot be staged the generation
+    # is still complete without it, with an explicit warning. publication.json
+    # is written first, then ONE atomic pointer flip: before the flip the
+    # previous generation remains the only authority.
+    _published_generation = None
+    if _publication is not None:
+        try:
+            _publication.include_auxiliary(
+                zpub.ROLE_RUN_LOG, Path(output_dir) / RUN_LOG_NAME
+            )
+        except Exception as _aux_exc:
+            _publication.members.pop(zpub.ROLE_RUN_LOG, None)
+            _emit(
+                "ZeGrid: run-log copy could not be staged in the publication "
+                f"generation ({type(_aux_exc).__name__}: {_aux_exc}); the "
+                "generation is published without this auxiliary member",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+        _required_roles = [
+            zpub.ROLE_SCIENCE, zpub.ROLE_COVERAGE, zpub.ROLE_MANIFEST
+        ]
+        if zpub.ROLE_RUN_LOG in _publication.members:
+            _required_roles.append(zpub.ROLE_RUN_LOG)
+        _optional_roles = {}
+        if zpub.ROLE_AESTHETIC in _publication.members:
+            _optional_roles[zpub.ROLE_AESTHETIC] = bool(export_aesthetic)
+        if zpub.ROLE_UINT16 in _publication.members:
+            _optional_roles[zpub.ROLE_UINT16] = bool(fin_uint16 is not None)
+        _published_generation = _publication.commit(
+            required_roles=_required_roles,
+            optional_roles=_optional_roles,
+            metadata={
+                "run_id": str(_store_state["store"].run_id),
+                "gauge_mode": str(_gauge_mode),
+                "export_aesthetic": bool(export_aesthetic),
+                "uint16": bool(fin_uint16 is not None),
+            },
+        )
+        _resume_runtime["publication"] = _published_generation.as_report()
+        _emit(
+            "ZeGrid: publication generation COMMITTED — "
+            f"{_published_generation.generation} "
+            f"({len(_published_generation.members)} verified member(s), "
+            f"publication sha256 {_published_generation.publication_sha256[:16]}…); "
+            "CURRENT.json is the final atomic pointer",
+            callback=progress_callback,
+        )
+
     # M4: finalize the durable run state ONLY after the complete publication
     # (science + coverage + manifest) exists. A later auto-resume is then a
     # verified no-op, never a recomputation of valid cells.
@@ -15175,17 +15463,22 @@ def _run_single(
         try:
             _run_root = _store_state["store"].root
             _prev_state = zres.read_state(_run_root)
-            _outputs = {}
-            for _name, _path in (
-                ("science", sci_path),
-                ("coverage", cov_path),
-                ("manifest", manifest_path),
-            ):
-                if _path is not None and Path(_path).exists():
-                    _sha, _nbytes = zrs.content_sha256_file(_path)
-                    _outputs[_name] = {
-                        "sha256": _sha, "nbytes": int(_nbytes)
-                    }
+            if _published_generation is not None:
+                # M5-B: the durable generation is the reader contract; every
+                # member digest below was verified BEFORE the pointer flip.
+                _outputs = _published_generation.outputs_state()
+            else:
+                _outputs = {}
+                for _name, _path in (
+                    ("science", sci_path),
+                    ("coverage", cov_path),
+                    ("manifest", manifest_path),
+                ):
+                    if _path is not None and Path(_path).exists():
+                        _sha, _nbytes = zrs.content_sha256_file(_path)
+                        _outputs[_name] = {
+                            "sha256": _sha, "nbytes": int(_nbytes)
+                        }
             zres.write_state(
                 _run_root,
                 run_id=_prev_state["run_id"],
@@ -15606,8 +15899,19 @@ def _write_outputs(
     halo_provenance=None,
     r55_scheduler=None,
     r55_run_telemetry=None,
+    publication=None,
 ):
     output_dir = Path(output_dir)
+
+    def _published_path(candidate):
+        """M5-B: resolve a canonical name inside the run-owned generation.
+
+        Without a publication session the legacy in-place path is unchanged.
+        """
+        if publication is None:
+            return Path(candidate)
+        return publication.path_for_name(Path(candidate).name)
+
     # ZM-ZEGRID-R18: use the finished (aesthetic) science when provided (bit-equal
     # to the raw path when finishing is disabled -> ``finished_science`` is the same
     # array). The RAW science is written first (immutable reference), and the
@@ -15694,7 +15998,7 @@ def _write_outputs(
         if "vmin" in _u16_info:
             u16_header["U16VMIN"] = (float(_u16_info["vmin"]), "scaling vmin (float ADU)")
             u16_header["U16VMAX"] = (float(_u16_info["vmax"]), "scaling vmax (float ADU)")
-        uint16_path = output_dir / "mosaic_grid_uint16.fits"
+        uint16_path = _published_path(output_dir / "mosaic_grid_uint16.fits")
         _atomic_writeto(
             fits.PrimaryHDU(
                 np.ascontiguousarray(np.moveaxis(u16, -1, 0)), header=u16_header
@@ -15705,7 +16009,7 @@ def _write_outputs(
     cov_header = _canvas_header(canvas, ndim=2)
     cov_header["BUNIT"] = ("count", "per-pixel stack depth (max over channels)")
     _record_halo_cards(cov_header, halo_provenance)
-    cov_path = output_dir / "mosaic_grid_coverage.fits"
+    cov_path = _published_path(output_dir / "mosaic_grid_coverage.fits")
     _atomic_writeto(fits.PrimaryHDU(stack_depth, header=cov_header), cov_path)
 
     # ZM-ZEGRID-R24 (A2): conservative stale-aesthetic cleanup. Runs ONLY after
@@ -15725,7 +16029,16 @@ def _write_outputs(
             *([aesthetic_path.name] if aesthetic_path is not None else []),
         },
         scientific_suffix=scientific_fits_suffix,
-    )
+    ) if publication is None else {
+        "removed": [],
+        "skipped": "generation_isolated",
+        "note": (
+            "M5-B: a generation never deletes a previous valid generation or a "
+            "foreign/user file; legacy stale-aesthetic cleanup is disabled "
+            "because older generations stay authoritative until CURRENT.json "
+            "points at the new complete generation"
+        ),
+    }
 
     # ZM-ZEGRID-R24 (A1): the ``science_output_contract`` block is built here so
     # the ``aesthetic`` sub-record can be OMITTED ENTIRELY when no aesthetic FITS
@@ -16059,8 +16372,18 @@ def _write_outputs(
             sha256=str(_r40_block["sha256"]),
             nbytes=int(_r40_block["bytes"]),
         )
-    manifest_path = output_dir / "zegrid_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    manifest_path = _published_path(output_dir / "zegrid_manifest.json")
+    _manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+    if publication is None:
+        manifest_path.write_text(_manifest_bytes.decode("utf-8"))
+    else:
+        # M5-B: the manifest is a generation member; write it atomically inside
+        # the generation (its digest is recorded by publication.json).
+        zrs.atomic_write_bytes(
+            Path(manifest_path),
+            _manifest_bytes,
+            tmp_dir=Path(manifest_path).parent,
+        )
     return sci_path, cov_path, manifest_path
 
 

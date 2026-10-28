@@ -1,3 +1,89 @@
+## Current status — M5-B : r2 vérifié, review-2 Nono en cours (2026-10-28)
+
+Delta r2 livré par Coco (DONE, aucun commit). Vérification Junior:
+- 76 passed 0 failed (M5 assembly + publication + execution, 99.79s)
+- 39 passed 2 skipped (M2/M4, 75.85s)
+- 102 passed, 2 FAILED R23 (`test_production_export_on_custom_suffixes`,
+  `test_production_forced_failure_preserves_raw`) — tous deux `ModeInfeasible`
+  (refus RAM hôte), REPRODUITS À L'IDENTIQUE sur worktree détaché au commit de
+  base b092768 sans le delta => environnemental, pas régression r2
+  (hôte ~978 MiB dispo, 12.8 GiB swap). Ces deux tests restent NOT_RUN valides
+  pour la qualification et doivent être rejoués sur machine non contrainte.
+- F5: `ack_matches_generation` exige génération/publication/verified + pour
+  CHAQUE membre publié file/sha256/nbytes/generation; réparation dérivée de
+  `_pub_gen.outputs_state()` (autorité vérifiée), WARN non fatal, pas de
+  réécriture si ack cohérent.
+- F6: seam `available_memory_bytes`=8 GiB déclaré GLOBAL (plan/layout, préflight
+  assemblage, admission cellules, lancement), admission publication réelle,
+  témoin explicitement non qualifiant; fixture 1×1.
+
+Revue indépendante Nono review-2 lancée (accepted/queued
+b2ec5f60-b84f-417b-be2d-8091cb02c81a) sur le delta F5/F6 uniquement.
+Hashes figés: .a2a-reports/...review-snapshot-r2.json. M5-B NON accepté.
+Pas de commit/push/M6/activation par défaut. NOT_RUN: Windows/NTFS, coupure
+électrique, GPU, M3 pression réelle, M31, RSS BLAS-scale.
+
+---
+## Historique — les états ci-dessous ne remplacent pas le statut courant
+
+### Dispatch REWORK-2 — Junior (2026-10-28)
+
+Nono review-1 = ACCEPT-WITH-CONDITIONS, pas acceptation finale Junior. F1–F4 fermés; Junior exige les deux corrections bornées restantes avant clôture: F5 ack complet (sha seul ne suffit pas), tests vrais repair puis no-op stable/échec repair nonfatal; F6 provenance exacte du témoin RAM8GiB (global upstream, incluant assemblage, pas PLAN-only) ou seam planning restreint, fixture1x1. Sept hashes code/tests/tools inchangés, diff-checkPASS; preuves Junior218passed2skipped et sondes restent valides.
+
+SAME mission ZM-ZEGRID-RESILIENT-RUN-RESUME-M5B-20261028, SAME Coco sans reset. REWORK-2 (2/3) accepted/queued865c3343-bd94-40b3-92b8-4a9e9481ccc4. Brief workspace .a2a-reports/...M5B-20261028.rework2-brief.md; attendu .coco.r2.md exact-source callback. Prochain pas: vérification Junior puis Nono; pas de polling. M5-B NON accepté. HEADb092768, aucune publication git/commit/activationM6. Pression réelle M3, budgets produit sans seam, Windows/GPU/M31 restent NOT_RUN; aucune qualification de coupure électrique revendiquée.
+
+
+
+## Current status — M5-B REWORK-1 vérifié, Nono review-1 en file (2026-10-28)
+
+Junior a rejoué séquentiellement: M5A/B 75 passed (61.50s), M2/M4 39 passed +2 skipped (75.33s), finitions/export 104 passed (82.09s): **218 passed, 2 skipped, aucun échec**. Sondes indépendantes F1–F4 PASS: RAM inconnue refusée, retry exact zéro écriture/collision metadata immuable, ancienne génération avec marker résiduel conservée, flush FITS avant record puis pointeur (preuve d'ordre Linux).
+
+Restent à arbitrer: ack partiel avec seul sha256 valide encore déclaré verified_finalized (autorité fichiers indépendante intacte); provenance du harnais 8GiB global affecte aussi admission assemblage, pas seulement PLAN; tests repair ack production incomplets. Vrai _run_single+finitions+publication et nouveau-processus no-op exécutés sous seam ressource upstream explicite; PAS qualification budget réelle. Nouveau run_id store-safe inspecté, régressions ciblées passent.
+
+Mission ZM-ZEGRID-RESILIENT-RUN-RESUME-M5B-20261028, 1/3 corrections consommées, HEAD b092768, delta attendu, pas commit/push. Nono review-1 accepted/queued aa950173-cc61-4679-83a2-f17d626ee885, rapport attendu workspace .a2a-reports/...M5B-20261028.nono.r1.md. Preuves Junior .junior.r1.md/.junior-probes-r1.py/json et snapshot7fichiers .review-snapshot-r1.json. Attendre callback sans polling; puis adjudication et éventuel REWORK-2 SAME Coco sans reset. M5-B NON accepté. M3 pression réelle/M4 produit sans seam/Windows/GPU/M31 restent NOT_RUN; aucune activation M6.
+
+---
+## Historique — les états suivants ne remplacent pas le statut courant
+
+## Current status — M5-B REWORK-1 CODE LIVRÉ, NON ACCEPTÉ (2026-10-28)
+
+Corrections F1–F6 livrées. Aucun commit/push. Baseline `b092768e79c7833af622c0bc1c808c17b6dbefd3` inchangée.
+
+- **F1 fail-closed** : `size_finishing_and_publication()` (pur, `admitted=false`, `sizing_only`) séparé de `admit_finishing_and_publication()` ; RAM inconnue/invalide/échec de sonde ⇒ `PublicationCapacityError` avec plan honnête AVANT toute génération/allocation ; aucun override. `_run_single` refuse avant écriture raw/finitions/génération. `reattach` read-only ne crée jamais de publication.
+- **F2 immuabilité** : une génération portant `publication.json` est immuable. Retry exact = validation + retour, ZÉRO écriture (ni membre, ni record, ni pointeur). Tout changement sémantique (identité/rôles/options/metadata/canvas/digests) ⇒ collision sans écriture. Retry d'une génération plus ancienne ⇒ refus (pas de retour arrière du pointeur). Crash avant pointeur ⇒ seul le pointeur est écrit, record intact.
+- **F3 cleanup** : `publication.json` et un marqueur résiduel ne sont plus une preuve de staging jetable. Seuls sont supprimés les `gen-N` du même run, sans record, marqueur avec membres énumérés, propriétaire mort, contenu strictement membre+marker. Le reste (committed, inconnu, étranger) est conservé.
+- **F4 durabilité ordonnée** : fsync de CHAQUE membre FITS, puis `publication.json`, puis répertoires/génération/ancêtres, puis pointeur. Échec de flush avant pointeur ⇒ erreur explicite, CURRENT précédent intact. `atomic_write_bytes` fsyncait déjà son record (pas de revendication contraire).
+- **F5 no-op produit** : le no-op `_run_single` retourne le MÊME type de chemin qu'un succès normal (esthétique si présent, sinon SCI) depuis la génération vérifiée, avec notification SUCCESS terminale et libération des ressources ; l'ack état est réparé s'il est absent OU périmé, sans republier/restacker ; les lignes requises manquantes/partielles ne sont jamais « consistentes ».
+- **F6 preuves d'exécution réelles** : nouveau `tests/test_zegrid_publication_execution_m5b.py` (4 tests) : garde capture en TÊTE de `_run_single` (store+R37/R40 refusés avant descripteurs/effets, no-store passe, no-op ne contourne pas) ; run produit store-backed réel (`_run_single`, scheduler ACTIVE, petit corpus 4×320²) avec assemblage borné, finitions DBE+equalize réelles, sérialisation et publication, puis NOUVEAU processus `resume_mode=auto` où les seams coûteux (`layout`, `gauge`, `assembly`, `finishing`, écritures) tuent le process (exit 77) : no-op vérifié, chemin esthétique retourné dans la génération, digests sortie/commits/gauge/geometry inchangés ; échec de sonde RAM ⇒ refus avant raw/finitions/génération ; parité finitions off/on réelle sur la science publiée. Le run_id interne du registre (`zegrid:<ts>:...`) est normalisé en composant store-safe avant identité/état/publication (sinon le store ACTIVE ne pouvait pas s'ouvrir) ; identité et reprise utilisent le même id normalisé.
+
+Tests exécutés : **75 passed** (M5A 37 + M5B 34 + exécution 4), **39 passed/2 skipped** (M2/M4 store+e2e), **104 passed** (R23/R24/R25/R18 finitions/export). Les 3 échecs R23 observés en lançant deux suites en parallèle sont la sensibilité préexistante RAM/ordre (rejoués seuls : 104 passed) ; ils ne sont pas causés par M5-B et ne sont pas masqués. Un seam de test limite l'observation RAM du PLAN (hôte contraint) : l'admission de PUBLICATION reste une observation réelle ; ce seam est documenté et jamais une configuration produit.
+
+NOT_RUN : Windows/NTFS, GPU, pression réelle M3, produit complet M4, M31, qualification M5 ; RSS 4×24² reste une observation étroite, pas une borne BLAS. Aucune activation par défaut. Prochaine étape : vérification Junior + Nono.
+
+
+---
+## Historique — les états ci-dessous ne remplacent pas le statut courant
+
+### Dispatch REWORK-1 — Junior (2026-10-28)
+
+Nono review-0 FINDINGS vérifié par Junior: F1–F4 confirmés par sondes indépendantes, F5 retour no-op/ack stale et F6 preuves d'exécution manquantes retenus. Snapshot des cinq fichiers code/tests/tools inchangé, diff-check PASS; preuves précédentes 63 passed + sondes restent valides. Correction à la revue: publication.json est déjà fsync via atomic_write_bytes, ce sont les membres FITS et l'ordre complet à corriger. Retry identique => réutilisation sans écriture; changement de contrat => refus/nouvelle génération, pas mutation de l'autorité. Pas d'override RAM inconnue, pas de réécriture systématique des états finalisés valides.
+
+Mission ZM-ZEGRID-RESILIENT-RUN-RESUME-M5B-20261028, SAME Coco sans reset, première correction (1/3) accepted/queued run 025a3248-1c6f-42d4-83f8-518f313e426d. Brief durable workspace .a2a-reports/...M5B-20261028.rework1-brief.md, rapport attendu .coco.r1.md exact-source callback. Scope publication/admission/cleanup durable + vrai chemin production et garde capture. Prochain pas: callback, vérification indépendante puis revue Nono; aucun polling. M5-B NON accepté. Pas commit/push/activation/M6. M3 pression réelle, M4 produit/Windows, M5 Windows/GPU/M31 restent NOT_RUN.
+
+
+---
+## Current status — M5-B r0 NON ACCEPTÉ, revue Nono en file (2026-10-28)
+
+Callback Coco reçu: le timeout initial n'avait pas empêché le lancement. HEAD b092768e79c7833af622c0bc1c808c17b6dbefd3, delta attendu seulement, aucun commit/push. Junior a rejoué M5A+B: **63 passed, 26 warnings, 36.72s**, diff-check PASS.
+
+Défauts reproduits par Junior: (F1) RAM inconnue admise, même modèle 9.634GB; (F2) retry modifie publication courante avant pointeur, panne pointer => digest mismatch; (F3) cleanup supprime ancienne génération committée si marker post-commit non supprimé; (F4) pas de fsync FITS avant marqueur final (trace réelle). Source: no-op _run_single retourne None/ack stale non réparé; tests intégration/garde capture requis encore manquants. M5-B pas accepté, 0 correction consommée.
+
+Mission ZM-ZEGRID-RESILIENT-RUN-RESUME-M5B-20261028; rapports/preuves/snapshot sous workspace .a2a-reports. Nono review-0 accepted/queued run 8eee5c30-7d65-4580-903c-44cac75f2116, rapport attendu .nono.r0.md via callback exact source. Prochain pas: disposition indépendante Nono puis REWORK-1 borné à la MÊME session Coco, sans reset ni polling. Qualifications pression réelle M3 / produit+Windows M4 / Windows M5 / M31 restent NOT_RUN; aucune activation.
+
+
+---
+## Historique — M5-A et états antérieurs
+
 ## Current status — M5-A CODE ACCEPTÉ (2026-10-28)
 
 Nono review-2 = ACCEPT-WITH-CONDITIONS, aucun HIGH/MEDIUM bloquant. G1 fermé (le modèle facture exactement l'allocation réelle du solveur dense : A=2 425 920 B à N400/E760, total 11 754 664 B, zéro coût en global). G2 fermé (hash non contigu réellement borné : 4 308 B au lieu de 2 098 088 B pour 1 MiB strided; digests canoniques identiques; contigu zéro-copie). Garde capture ordonnée avant les travaux coûteux. Cap 2 cellules et vues externes jamais fermées de force conservés. Junior a rejoué 155 passed / 5 skipped et reproduit les deux corrections par sondes indépendantes.
