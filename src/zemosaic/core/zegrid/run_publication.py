@@ -1212,12 +1212,61 @@ class PublicationSession:
         )
 
     def _flush_member(self, path: Path) -> None:
-        """Flush ONE member's data to the OS durable layer (F4)."""
-        fd = os.open(
-            str(path), os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
-        )
+        """Flush ONE member's data to the OS durable layer (F4).
+
+        Write-first, read-fallback, deliberately:
+
+        * Win32: ``os.fsync`` is ``FlushFileBuffers``, which requires a handle
+          carrying write access (GENERIC_WRITE). A read-only handle cannot be
+          flushed, so the write attempt is the ONLY portable path to a durable
+          member on Windows. The member is opened ``O_RDWR`` (never
+          ``O_WRONLY``/``O_TRUNC``/``O_CREAT``): flushing must not change one
+          byte, the size, or create a file.
+        * POSIX: ``fsync`` also accepts a read-only descriptor, and a stricter
+          filesystem/ACL can refuse the write open. The ``O_RDONLY`` attempt is
+          the documented fallback for exactly that case.
+
+        The fallback is a RETRY, never a skip: if both attempts fail the
+        ``OSError`` is propagated, and ``commit`` turns it into
+        ``PublicationError`` BEFORE ``publication.json`` and BEFORE the
+        pointer, leaving the previous ``CURRENT.json`` authoritative.
+
+        Real Windows/NTFS is NOT_RUN on this Linux host: the Win32 semantics
+        above are documented platform behaviour, covered here defensively by
+        simulation, not an observed NTFS capture. ``run_store.fsync_dir``
+        already has its own documented Windows no-op and is out of scope.
+        """
+        binary = int(getattr(os, "O_BINARY", 0))
+        write_error: OSError | None = None
+        try:
+            fd = os.open(str(path), os.O_RDWR | binary)
+        except OSError as exc:
+            write_error = exc
+        else:
+            try:
+                os.fsync(fd)
+                return
+            except OSError as exc:
+                write_error = exc
+            finally:
+                os.close(fd)
+        try:
+            fd = os.open(str(path), os.O_RDONLY | binary)
+        except OSError as exc:
+            raise OSError(
+                "member flush needs a write-capable handle (Win32 "
+                "FlushFileBuffers) and the read-only fallback could not be "
+                f"opened either: {path}: {type(write_error).__name__}: "
+                f"{write_error}; {type(exc).__name__}: {exc}"
+            ) from exc
         try:
             os.fsync(fd)
+        except OSError as exc:
+            raise OSError(
+                "member flush failed on both a write and a read-only handle: "
+                f"{path}: {type(write_error).__name__}: {write_error}; "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         finally:
             os.close(fd)
 

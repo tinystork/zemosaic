@@ -1,32 +1,31 @@
-## Current status — M5-B ACCEPTÉ (code), suites locales VERTES, push en attente (2026-10-28)
+## Current status — M5-C flush portable ACCEPTÉ, M2 durable-store révélé en échec (2026-10-28)
 
-M5-B accepté sur son périmètre Linux testé. Commit local
-`3384d3671c42a35a55018c3d9448aa451475e5e7` sur `feat/zegrid-resilient-run-resume`
-(parent `b092768`), NON poussé. `origin/beta=231b597867`, `origin/main=434961a8ec`
-inchangés.
+M5-C ACCEPTÉ (code + tests) et publié. `_flush_member` (`run_publication.py`) ouvre
+désormais `O_RDWR|O_BINARY` (sans O_TRUNC/O_CREAT/O_WRONLY) puis repli `O_RDONLY`
+sur OSError; échec des deux => `PublicationError` avant `publication.json` et avant
+pointeur, CURRENT précédent intact, message « no pointer was written ». Ordre F4
+inchangé (membres -> répertoire génération -> ancêtres -> record -> pointeur).
+Motif: sous Win32 `os.fsync` = `FlushFileBuffers`, qui exige un handle avec droit
+d'écriture; `run_store.fsync_dir` garde son no-op Windows documenté (hors périmètre).
 
-QUALIFICATION LOCALE PROPRE (après libération de RAM par Tristan, Firefox fermé):
-- M5 assembly+publication+execution: 76 passed, 0 failed.
-- M2/M4: 39 passed, 2 skipped.
-- R23/R24/R25/R18: 104 passed, 0 failed.
-=> total 219 passed, 2 skipped, 0 failed.
-Les 2 échecs R23 précédents (`test_production_export_on_custom_suffixes`,
-`test_production_forced_failure_preserves_raw`) passent maintenant avec le MÊME
-code et le MÊME commit, seule la mémoire de l'hôte ayant changé (~978 MiB puis
-~2.1 GiB disponibles) => attribution environnementale PROUVÉE, aucune régression
-M5-B. Les 2 tests ignorés restent `NOT_RUN`.
+Preuves Junior (rejouées): 6 passed (nouveau `test_zegrid_publication_m5c_flush_portable.py`),
+76 passed (M5 assembly+publication+execution), 104 passed (R23/R24/R25/R18),
+`git diff --check` OK. Tests d'injection: simulation Win32 (refus lecture seule =>
+flush par handle écriture), échec total => aucun pointeur, ordre F4 instrumenté,
+octets/digests/jeu de fichiers inchangés, `fsync_dir` no-op Windows.
 
-Décision: Nono review-2 ACCEPT-WITH-CONDITIONS; C1 fermé par test d'exécution réel
-(repair partial/wrong/lost -> ack complet, second no-op `state.json`
-octet-identique, échec repair non fatal, pointeur/publication/digests inchangés);
-C2 écrit dans `.a2a-reports/...junior.r2-acceptance.md` — témoin 8 GiB synthétique
-explicitement NON QUALIFIANT, admission publication réelle.
+RÉVÉLATION M2 (pré-existante, PAS une régression M5-C): les 2 tests
+`test_m2_real_cpu_run_commits_then_releases_and_reloads_identical_payloads` et
+`test_m2_store_identity_refuses_a_changed_science_contract` étaient IGNORÉS faute
+de RAM (`MIN_LIVE_BYTES=1200 MiB`). Avec ~1.9-2.1 GiB libres ils s'exécutent et
+ÉCHOUENT: « the run published no r55_durable_store diagnostics although
+zegrid_durable_store_dir=... was configured ». Reproduction À L'IDENTIQUE sur
+worktree pristine `17af7f8` sans M5-C => défaut pré-existant du chemin produit
+store durable (dégradation probable vers M1), jamais qualifié jusqu'ici car masqué
+par le skip. M2 reste NON accepté; mission d'investigation à ouvrir.
 
-RESTE À FAIRE: push `3384d367` (accord Tristan), banc Windows/NTFS (flush
-O_RDONLY, rename, refus liens, no-op cross-process), RSS sur assemblage plus grand,
-puis seulement envisager l'activation par défaut.
-NOT_RUN: Windows/NTFS, coupure électrique réelle, GPU, M3 pression réelle, M31,
-RSS BLAS-scale, budgets produit sans seam, M6.
+NOT_RUN: Windows/NTFS réel (sémantique Win32 simulée seulement), coupure électrique
+réelle, GPU, M3 pression réelle, M31, RSS BLAS-scale, activation par défaut.
 Aucune activation: `zegrid_resource_recovery_enabled=false`, `zegrid_resume_mode=never`.
 
 ---
