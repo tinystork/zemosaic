@@ -1,3 +1,21 @@
+## Coco — M3 runner/X_b continuation r1: 1600² measured, NOT_READY (host-fit) (2026-10-29)
+
+No physical pressure. Artifacts moved out of the product checkout to `/home/tristan/.openclaw/workspace/.m3-linux-runner-20261029/`; `projects/zemosaic` is clean of the run directory. Runner now defaults to an artifact base outside any git checkout and refuses a root inside one without an explicit `--allow-inside-git`.
+
+Measured no-pressure bounded reference (1600² frames, dither ×2, grid 2×2, halo 64, fresh ext4 roots): PASS 138.8 s, 4/4 cells, 4 commits, 4 waves, peak tree RSS 1,139,167,232 B, min MemAvailable 2,013,675,520 B, **`X_b = 1,133,114,368 B`** (`r55_scheduler.execution.aggregate_bytes`). Dense at 1024² remains 1,034,015,744 B; the 1024² bounded minimum was 960,876,544 B.
+
+With `X_b = 1,133,114,368`, `required_raw = 1,259,015,965 B >` the 1 GiB reserve (condition 4 now holds) but is still below `A-P = 2,668,462,080 B`, so the bounded retry would fit after pressure: preflight is **NOT_READY** (`NO_SAFE_PRESSURE_DOSE`, `PRESSURE_CAP_INSUFFICIENT`). Reaching the M3 wait on this host needs ≈2.2–2.5 GB aggregate (~2300 px canvas), where product tree + 1 GiB reserve ≈ live `A` with no margin — the corpus that makes M3 reachable likely does not fit this 7.7 GiB host without weakening the reserve or the science. Pressure experiment still NOT_RUN.
+
+## Junior — M3 preflight+protocol ACCEPTED and published; runner/X_b mission running (2026-10-29)
+
+Nono review-1 ACCEPT (F4 closed on the protocol text; F1/F2/F3 untouched and conforming). Junior had independently replayed **26 passed (2.11 s)** and confirmed all four protocol/tool/test hashes unchanged before acceptance. Published on the feature branch as `7d0b7596ac6425f99c1787379a8d40092ed3fb38`; `origin/beta=231b597867` and `origin/main=434961a8ec` unchanged.
+
+Accepted scope is PREPARATION ONLY: read-only fail-closed feasibility tool (strict units/ranges, ancestor cgroup walk, reserve >=1 GiB, pressure/cap <=512 MiB rejected in CLI, owned exclusive JSON) plus the reviewable protocol (hook before the original sampler `:11681`, strict attribution and exclusions, one-shot bounded IPC, no fact rewriting, pre-arm latch disqualified, barrier trace required for PASS). No physical pressure, no product run, no runner at acceptance time, no GUI/CLI claim.
+
+Next mission `ZM-ZEGRID-M3-LINUX-RUNNER-20261029` dispatched in a fresh Coco context: implement the transparent exec/wait/commit/barrier observers and the owned pressure runner (experiment mode refusing by default), then measure the real bounded minimum `X_b` with a no-pressure dense+bounded reference on real ext4 and re-run the preflight with `X_b`. Accepted/queued `bbe497b3-14a6-4087-a3b6-5172135950be`; report expected `.a2a-reports/ZM-ZEGRID-M3-LINUX-RUNNER-20261029.coco.r0.md`. Host about 2.7 GiB available after the user freed memory — every observation volatile, stop rather than force.
+
+Still unqualified: physical M3 pressure, full FITS product, Windows/NTFS, BLAS/deep contributors, GPU, M31, already-bounded/repeated-pressure product path. No default activation. HEAD `7d0b759` is the accepted baseline until the next milestone lands.
+
 ## Junior — M3 protocol r2 verified, Nono review-1 in flight (2026-10-29)
 
 REWORK-2 continuation finished the interrupted 01:40 work: candidate-wave/exactly-once wording, latched-fact rule, barrier-trace fields, 5 protocol-consistency tests, fresh preflight, report. Junior independently replayed **26 passed (2.11s)** and confirmed all five file hashes match; preflight tool and its 21 tests are byte-identical to r1, so F1/F2/F3 stay conforming and untouched.

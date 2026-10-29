@@ -1,9 +1,16 @@
 # ZEGRID M3 — Linux physical-pressure qualification protocol
 
-Status: **PREPARED, NOT EXECUTED**. This document is a reviewable protocol for the
-M3 CPU wait→resume proof. It is **not** an M3 qualification and contains no PASS
-claim. Physical pressure is explicitly out of scope for the mission that wrote it
-(`ZM-ZEGRID-M3-LINUX-PREFLIGHT-20261028`).
+Status: **PREPARED, NOT EXECUTED (pressure)**. This document is a reviewable
+protocol for the M3 CPU wait→resume proof. It is **not** an M3 qualification and
+contains no PASS claim. Physical pressure is explicitly out of scope for the
+missions that wrote it (`ZM-ZEGRID-M3-LINUX-PREFLIGHT-20261028`,
+`ZM-ZEGRID-M3-LINUX-RUNNER-20261029`).
+
+Rework-2 (`ZM-ZEGRID-M3-LINUX-RUNNER-20261029`) build the two bricks §4 declared
+missing (transparent observers, owned pressure runner), measured the bounded
+minimum `X_b` from real no-pressure references, and re-ran the preflight. The
+measured result is **NOT_READY** (`BOUNDED_MIN_FITS_AT_RESERVE`); see §9. The
+pressure experiment itself remains **NOT_RUN**.
 
 - Repository: `/home/tristan/.openclaw/workspace/worktrees/zemosaic-resilient-run-resume`
 - Branch: `feat/zegrid-resilient-run-resume`
@@ -756,3 +763,143 @@ do not lower the reserve or shrink the science to force the wait.
   matching; inherited cgroup limit; weak parameter overrides; inconsistent
   telemetry; unmeasured bounded aggregate). r0 is retained as pre-fix evidence;
   rework-1 artifacts are the corrected evidence.
+
+## 9. Rework-2 result — bricks built, `X_b` measured, still NOT_READY
+
+Mission `ZM-ZEGRID-M3-LINUX-RUNNER-20261029` (branch
+`feat/zegrid-resilient-run-resume`, parent HEAD `7d0b759`). No production,
+science, schema, API or default change. Physical pressure was **not** executed.
+
+### 9.1 The two bricks now exist
+
+- `tools/zegrid_resume_m3/m3_observers.py` — harness-injected wrappers that
+  forward the ORIGINAL callables unchanged:
+  - execution trace on the real `_stack_cell` (pid, cell_id, start/end);
+  - durable-commit trace on `RunCellStore.commit_cell` (receipt forwarded);
+  - live wait trace by capturing the REAL `RecoveryCoordinator._log` through the
+    `_r55_m3_make_coordinator` factory (release/probe/policy untouched);
+  - barrier trace on `_r55_run_checkpoint_sample`, armed one-shot ONLY when the
+    caller frame is the resolved safe-wave call site (line 11681, resolved from
+    source after the `while offset < total_tasks:` anchor).
+  - **Correction to §4.2/§4.3 attribution:** the CPU wave loop is the nested
+    closure `_run_r55_active_cpu_waves`; attribution is by EXACT resolved line in
+    the product file, because the function name alone also matches the M3
+    post-wait re-sampler at `:11919`. A name-based check was observed to classify
+    real safe-site calls as `other_site`; it is no longer used.
+- `tools/zegrid_resume_m3/m3_linux_pressure_runner.py` — owned pressure runner:
+  one child, anonymous mmap + page touch in 64 MiB steps, whole-process RSS hard
+  cap 512 MiB, parent-owned sampling at 0.25 s, guard order
+  (pressure RSS/reserve → wait exit → cooperative stop → last-resort owned kill),
+  one-shot unix-socket IPC with a <=2 s ack deadline, `pressure.json`/events
+  artifacts, SIGTERM then SIGKILL only owned PIDs, no cgroups/swap/sysctl/cache
+  drops. Experiment mode is gated: it refuses before spawning anything unless
+  BOTH `--i-am-reviewed` and `M3_PRESSURE_EXPERIMENT_REVIEWED=1` are present, and
+  even then this mission's build reports
+  `REVIEWED_FLOW_NOT_EXECUTED_IN_THIS_MISSION` / NOT_RUN.
+
+### 9.2 Corpus gap found by the real product
+
+The §2.3 corpus proposal (8×512×512, grid 4×4, halo 64) is **scientifically
+inadmissible** and the product refuses it before any gauge work:
+
+```
+LayoutInfeasible: pinned layout 4x4 violates scientific floors:
+min_patch_area=104304 (limit 50000), halo_overhead=1.7337 (limit 0.5)
+```
+
+Halo 64 with a ~800 px canvas (512 frame + dither) cannot satisfy
+`max_halo_overhead=0.5` for any multi-cell grid: it needs a cell of ~570 px
+(≈2300 px canvas). The floors were NOT lowered and the halo was NOT reduced.
+The reference corpus was therefore scaled (frames 1024², dither ×2, grid 2×2,
+halo 64) — same science settings, same halo, same per_cell gauge, more pixels —
+which is admissible (`halo_overhead≈0.35`). A 1600²/4×4 attempt was also started
+and exceeded the 900 s mission budget; it is retained as an aborted-capacity
+observation, not as evidence.
+
+### 9.3 Measured `X_b` (real bounded reference, no pressure)
+
+- Dense reference: PASS, 59–60 s, 4/4 cells, 4 commits, 4 execution events,
+  peak tree RSS 783.6 MiB, aggregate 1,034,015,744 B.
+- Bounded reference: PASS, 62 s, 4/4 cells, 4 commits, 4 execution events,
+  peak tree RSS 767.8 MiB, `X_b = 960,876,544 B` from
+  `r55_scheduler.execution.aggregate_bytes` (identical value in
+  `per_cell_diagnostics.ram_contract.aggregate_bytes`), plan raw
+  `2,850,992,128 B`, plan budget `2,280,793,702 B`, layout 2×2,
+  `units_in_flight=1`, `prefetch_units=0`, 4 waves, all commits idempotent=0.
+- Dense and bounded science/coverage arrays are SHA-256 identical for this
+  corpus (`8580fe50…`/`899aba8f…`): the profile switch changed the RAM plan, not
+  the science.
+
+### 9.4 Preflight with `X_b` — NOT_READY (unchanged verdict, now measured)
+
+```
+required_raw(X_b) = ceil(10*960876544/9) = 1,067,640,605 B
+reserve R                              = 1,073,741,824 B
+```
+
+`required_raw(X_b) <= R`, so condition 4 of §3.1 fails: at the safe reserve floor
+the bounded minimum would still be admitted and M3 would never enter
+`WAITING_RESOURCES`. The tool reports three blockers —
+`BOUNDED_MIN_FITS_AT_RESERVE`, `NO_SAFE_PRESSURE_DOSE`,
+`PRESSURE_CAP_INSUFFICIENT` (a 512 MiB cap can never move `A` from ~2.7 GiB to
+1.07 GiB) — exit 2. No threshold, reserve, probe, identity or science value was
+changed to avoid this.
+
+**Consequence:** with this corpus/host, no dose within the 512 MiB cap and the
+1 GiB reserve can force the bounded minimum to refuse. The M3 wait is
+unreachable at this scale; a future experiment needs a corpus/frame budget whose
+bounded minimum exceeds `required_raw > R` (≈ >= 0.97 GiB aggregate) while
+`required_raw <= A - P` remains true for the selected dose — i.e. a larger
+science payload, not a weaker guard.
+
+### 9.5 Residual limits (unchanged or newly explicit)
+
+- Pressure experiment: **NOT_RUN** (no physical pressure was applied; guards were
+  tested only with simulated children).
+- Already-bounded / repeated-pressure integration gap (§2.6) remains open.
+- Engine-only namespace: the recovery key is still not a shipped config key.
+- Sampling is best-effort; `A-P` is planning arithmetic, never measured proof.
+- The measured `X_b` belongs to the admissible 1024²/2×2 corpus; it does not
+  describe the (inadmissible) 512²/4×4 proposal.
+
+### 9.6 Continuation r1 — 1600² measurement, still NOT_READY (host-fit limit)
+
+Artifacts were relocated OUT of the product checkout to
+`/home/tristan/.openclaw/workspace/.m3-linux-runner-20261029/`; the runner now
+defaults to a workspace artifact base outside any git checkout and refuses a
+root inside one unless `--allow-inside-git` is passed explicitly (the relocated
+workspace base is itself a notes checkout, hence the explicit override for this
+mission).
+
+One no-pressure bounded reference at frames 1600², dither ×2, grid 2×2,
+halo 64 (fresh roots, real ext4, reserve guard 1 GiB, frozen tree ceiling):
+
+```
+PASS  138.8 s  exit 0   4/4 cells, 4 commits, 4 execution events, 4 waves
+peak product tree RSS   1,139,167,232 B (1.061 GiB)   ceiling 2,073,052,864 B (not tripped)
+min MemAvailable        2,013,675,520 B (1.876 GiB)   (reserve 1 GiB never breached)
+X_b = 1,133,114,368 B  @ r55_scheduler.execution.aggregate_bytes
+      = per_cell_diagnostics.ram_contract.aggregate_bytes
+plan raw 2,516,406,272 B   plan budget 2,013,125,017 B   layout [2,2]
+```
+
+`required_raw(X_b) = ceil(10·1133114368/9) = 1,259,015,965 B`.
+Condition 4 now holds (`> R = 1,073,741,824 B`), but condition 2 fails:
+`A - P = 2,668,462,080 B` (live preflight `A` 3,056.8 MiB, `P` 512 MiB) is still
+above `required_raw(X_b)`, so the bounded retry would fit *after* pressure and
+M3 would never enter `WAITING_RESOURCES`. Preflight verdict: **NOT_READY**
+(`NO_SAFE_PRESSURE_DOSE`, `PRESSURE_CAP_INSUFFICIENT`, exit 2; the tool reports a
+required dose of 1,946,317,028 B against the 512 MiB cap).
+
+**Host-fit conclusion.** The measured scaling is sublinear (1024² → 960.9 MB,
+1600² → 1,133.1 MB, ~2.44× pixels for 1.18× aggregate). To put `required_raw`
+inside `(A-P, A]` on this host, `X_b` would need ≈ 2.24–2.5 GB aggregate, i.e.
+roughly a 2260–2400 px canvas. Extrapolating the same working-set growth, the
+product tree there is ≈ 1.5–1.8 GB; plus the mandatory 1 GiB reserve that is
+≈ 2.5–2.8 GB against a live `A` of 2.7–3.0 GiB — no safe margin, and the plan
+itself must still satisfy `X_b <= 0.8·A`. **The corpus that makes the M3 wait
+reachable most likely does not fit this 7.7 GiB host at all** without lowering
+the reserve or the science, both of which are forbidden. This is a host-capacity
+conclusion, not a product defect.
+
+The pressure experiment remains **NOT_RUN**; no physical pressure was applied.
