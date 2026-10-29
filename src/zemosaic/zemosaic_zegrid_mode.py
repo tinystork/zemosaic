@@ -69,6 +69,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 from . import eta_service as zeta
+from . import zemosaic_config as zconf
 from . import zemosaic_stack_plan as _stack_plan
 from .zegrid_halo import (
     ZEGRID_HALO_CONFIG_KEY,
@@ -8557,6 +8558,22 @@ def _r55_run_disk_root(cache_root, output_dir) -> Path:
     return Path(cache_root) if cache_root is not None else Path(output_dir)
 
 
+def format_bounded_assembly_close(stats) -> str:
+    """Format the bounded-assembly close line from the REAL counter names.
+
+    ``BoundedAssemblyAccess.close()`` exposes ``peak_live_cells`` /
+    ``peak_live_mapped_bytes`` (see ``core/zegrid/bounded_assembly.py``). The
+    historical close log read ``peak_resident_*`` and therefore raised KeyError
+    inside the best-effort ``except``, printing a warning after every successful
+    close. This helper is the single formatter (no counter semantics change).
+    """
+    return (
+        "ZeGrid: bounded assembly access closed "
+        f"(peak {int(stats['peak_live_cells'])} mapped "
+        f"cell(s), {int(stats['peak_live_mapped_bytes'])} B)"
+    )
+
+
 def _r55_run_checkpoint_sample(disk_root):
     """One fresh RUN checkpoint fact set (strict 90 % host + disk + optional)."""
     return zrt.collect_run_facts(
@@ -9657,6 +9674,7 @@ def _run_single(
     telemetry=None,
     resume_mode=zres.RESUME_MODE_NEVER,
     resume_run_id=None,
+    stop_channel=None,
 ):
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -11655,8 +11673,24 @@ def _run_single(
 
         while offset < total_tasks:
             if result_registry is not None and result_registry.stop_requested:
+                # ZM-ZEGRID-M6: a stop at a WAVE BOUNDARY is a safe boundary.
+                # When a durable store is active and healthy, every completed
+                # cell was committed atomically BEFORE the boundary, so the
+                # honest claim is STOPPED_RESUMABLE (committed work is intact,
+                # nothing was published). Without a store the M1 in-memory
+                # claim is kept unchanged.
+                _durable_stop = bool(
+                    _store_state["store"] is not None
+                    and _store_state["publishing"]
+                    and _store_state.get("degraded_reason") is None
+                )
+                _stop_status = (
+                    "stopped_resumable" if _durable_stop
+                    else "stopped_in_memory"
+                )
                 result_registry.acknowledge_stop(
-                    "STOPPED_IN_MEMORY",
+                    "STOPPED_RESUMABLE" if _durable_stop
+                    else "STOPPED_IN_MEMORY",
                     f"stop honoured before CPU wave {wave_index}",
                 )
                 raise _R55RunStopRequested(
@@ -11664,11 +11698,18 @@ def _run_single(
                     record={
                         "schema": zrt.RUN_CONTROL_SCHEMA,
                         "stage": "stop",
-                        "status": "stopped_in_memory",
+                        "status": _stop_status,
                         "wave_index": int(wave_index),
                         "result_registry": result_registry.snapshot(),
-                        "durable_stopped_resumable": False,
+                        "durable_stopped_resumable": bool(_durable_stop),
+                        "durable_commits": (
+                            int(_store_state["commits"])
+                            if _durable_stop else 0
+                        ),
                         "note": (
+                            "durable boundary stop: committed cells are "
+                            "intact, no publication was attempted"
+                            if _durable_stop else
                             "M1 in-memory conservation only; no disk restart "
                             "claim"
                         ),
@@ -12670,8 +12711,15 @@ def _run_single(
             if result_registry is not None and result_registry.stop_requested:
                 # M1 cooperative stop: honoured at the unit boundary, before
                 # staging/consuming new work. Accepted results stay retained.
+                # M6: a healthy durable store makes this a resumable boundary.
+                _durable_stop = bool(
+                    _store_state["store"] is not None
+                    and _store_state["publishing"]
+                    and _store_state.get("degraded_reason") is None
+                )
                 result_registry.acknowledge_stop(
-                    "STOPPED_IN_MEMORY",
+                    "STOPPED_RESUMABLE" if _durable_stop
+                    else "STOPPED_IN_MEMORY",
                     f"stop honoured before GPU unit {unit_index}",
                 )
                 raise _R55RunStopRequested(
@@ -12679,11 +12727,21 @@ def _run_single(
                     record={
                         "schema": zrt.RUN_CONTROL_SCHEMA,
                         "stage": "stop",
-                        "status": "stopped_in_memory",
+                        "status": (
+                            "stopped_resumable" if _durable_stop
+                            else "stopped_in_memory"
+                        ),
                         "unit_index": int(unit_index),
                         "result_registry": result_registry.snapshot(),
-                        "durable_stopped_resumable": False,
+                        "durable_stopped_resumable": bool(_durable_stop),
+                        "durable_commits": (
+                            int(_store_state["commits"])
+                            if _durable_stop else 0
+                        ),
                         "note": (
+                            "durable boundary stop: committed cells are "
+                            "intact, no publication was attempted"
+                            if _durable_stop else
                             "M1 in-memory conservation only; no disk restart "
                             "claim"
                         ),
@@ -13753,6 +13811,10 @@ def _run_single(
                 getattr(science_config, "cell_gauge_mode", "global")
                 or "global"
             ),
+            # ZM-ZEGRID-M6: an optional caller-owned cooperative-stop channel
+            # (the headless CLI installs SIGTERM/SIGINT on it). None keeps the
+            # historical process-local channel exactly as before.
+            stop_channel=stop_channel,
         )
     # M3: the generation fence is the single publication gate for task/payload
     # identity (run_id, cell_id, attempt_id, plan_generation). It delegates to
@@ -15523,9 +15585,7 @@ def _run_single(
             try:
                 _assembly_stats = _assembly_access.close()
                 _emit(
-                    "ZeGrid: bounded assembly access closed "
-                    f"(peak {_assembly_stats['peak_resident_cells']} mapped "
-                    f"cell(s), {_assembly_stats['peak_resident_mapped_bytes']} B)",
+                    format_bounded_assembly_close(_assembly_stats),
                     callback=progress_callback,
                 )
             except Exception as _bounded_close_exc:
@@ -16425,6 +16485,7 @@ def run_zegrid_mode(
     r40_output_root: str | None = None,
     r40_seam_capture_disk_budget_bytes: int | None = None,
     telemetry: object | None = None,
+    stop_channel: object | None = None,
 ) -> None:
     """Run the NEW ZeGrid engine over the input folder's FITS inventory.
 
@@ -16456,6 +16517,10 @@ def run_zegrid_mode(
     global _STACK_STORAGE_PROFILE
     _storage_policy_reset(storage_profile)
     _STACK_STORAGE_PROFILE = _STORAGE_EFFECTIVE
+    # ZM-ZEGRID-M6: validate EVERY declared run-policy key BEFORE any work. An
+    # explicit invalid value is a loud refusal (never coerced); absent keys keep
+    # the historical defaults exactly.
+    zconf.validate_zegrid_run_policy(zconfig)
     # ZM-ZEGRID-RESILIENT-RUN-RESUME-M4: resolve the launch-time resume policy
     # ONCE, strictly. "never" is the safe default; "auto" resumes a compatible
     # existing run and STOPS explicitly on incompatibility.
@@ -16896,7 +16961,8 @@ def run_zegrid_mode(
                         r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
                         telemetry=telemetry,
                         resume_mode=_resume_mode,
-                        resume_run_id=_resume_run_id)
+                        resume_run_id=_resume_run_id,
+                        stop_channel=stop_channel)
         if altz_frames:
             _run_single_guarded(altz_frames, input_folder, base_out / "grid_ALTZ",
                         progress_callback=progress_callback,
@@ -16915,7 +16981,8 @@ def run_zegrid_mode(
                         r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
                         telemetry=telemetry,
                         resume_mode=_resume_mode,
-                        resume_run_id=_resume_run_id)
+                        resume_run_id=_resume_run_id,
+                        stop_channel=stop_channel)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
               callback=progress_callback)
@@ -16936,4 +17003,5 @@ def run_zegrid_mode(
                     r40_seam_capture_disk_budget_bytes=r40_seam_capture_disk_budget_bytes,
                     telemetry=telemetry,
                     resume_mode=_resume_mode,
-                    resume_run_id=_resume_run_id)
+                    resume_run_id=_resume_run_id,
+                    stop_channel=stop_channel)

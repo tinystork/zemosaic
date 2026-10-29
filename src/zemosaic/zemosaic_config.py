@@ -49,6 +49,7 @@ import platform
 import shutil
 import logging
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,24 @@ DEFAULT_CONFIG = {
     # Root of the durable per-cell store. M4 treats it as a container that may
     # hold several run_id generations (a legacy single-run layout still opens).
     "zegrid_durable_store_dir": None,
+    # ZM-ZEGRID-M6: durable-store byte budget. None/0 = no explicit budget (the
+    # historical behaviour); a positive integer caps the store's own disk
+    # reservations. Never enabled implicitly.
+    "zegrid_durable_store_budget_bytes": None,
+    # ZM-ZEGRID-RESILIENT-RUN-RESUME-M3: opt-in host-resource recovery (a
+    # cancellable WAITING_RESOURCES episode at a wave boundary). OFF by default:
+    # with False the qualified M1/M2 refusal path is byte-for-byte unchanged.
+    "zegrid_resource_recovery_enabled": False,
+    # Optional positive deadline (seconds) for that wait. None = no deadline.
+    # Only read when recovery is explicitly enabled.
+    "zegrid_resource_recovery_deadline_s": None,
+    # ZM-ZEGRID-M6: run-contract keys that ``run_zegrid_mode`` already reads
+    # through ``getattr``. Declaring them here makes save/load round-trips
+    # explicit and puts them in the strict validation path. The defaults are
+    # exactly the values the engine used when the keys were absent.
+    "zegrid_cell_gauge_mode": None,  # None -> frozen default (global)
+    "zegrid_layout": None,           # None -> RAM-adaptive layout
+    "zegrid_sip_mode": "keep",       # "keep" (default) or "strip"
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
@@ -462,6 +481,133 @@ DEFAULT_CONFIG = {
     "stack_stat_min_finite_px_per_channel": 4096,
     # --- FIN CLES POUR LE ROGNAGE ---
 }
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-M6: strict run-policy validation
+# ---------------------------------------------------------------------------
+
+# Keys that belong to the ZeGrid run contract but were previously read only
+# through ``getattr`` with an inline default. They are declared in
+# ``DEFAULT_CONFIG`` above; this validator is the single place where an
+# explicit value is accepted or refused. It never coerces an invalid value.
+ZEGRID_RUN_POLICY_KEYS = (
+    "zegrid_durable_store_budget_bytes",
+    "zegrid_resource_recovery_enabled",
+    "zegrid_resource_recovery_deadline_s",
+    "zegrid_cell_gauge_mode",
+    "zegrid_layout",
+    "zegrid_sip_mode",
+)
+
+_ZEGRID_GAUGE_MODES = ("auto", "global", "per_cell")
+_ZEGRID_SIP_MODES = ("keep", "strip")
+
+
+def _policy_value(config: Any, key: str) -> Any:
+    """Read one run-policy key from a dict or an attribute-style config."""
+    if config is None:
+        return DEFAULT_CONFIG[key]
+    if isinstance(config, Mapping):
+        return config.get(key, DEFAULT_CONFIG[key])
+    return getattr(config, key, DEFAULT_CONFIG[key])
+
+
+def validate_zegrid_run_policy(config: Any) -> dict:
+    """Strictly validate the declared ZeGrid run-policy keys.
+
+    Returns the normalised values. ``None`` means "not requested" and resolves
+    to the documented product default. Every other value must already have the
+    right type: invalid values raise :class:`ValueError` with the offending key
+    and value, never a silent fallback or coercion. ``bool`` is rejected for
+    numeric keys (``True`` is not a byte budget or a deadline).
+    """
+    enabled_raw = _policy_value(config, "zegrid_resource_recovery_enabled")
+    if enabled_raw is None:
+        enabled = False
+    elif isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    else:
+        raise ValueError(
+            "zegrid_resource_recovery_enabled must be a boolean, got "
+            f"{type(enabled_raw).__name__}={enabled_raw!r}"
+        )
+
+    deadline_raw = _policy_value(config, "zegrid_resource_recovery_deadline_s")
+    if deadline_raw is None:
+        deadline = None
+    else:
+        if isinstance(deadline_raw, bool) or not isinstance(
+            deadline_raw, (int, float)
+        ):
+            raise ValueError(
+                "zegrid_resource_recovery_deadline_s must be a positive number "
+                f"or null, got {type(deadline_raw).__name__}={deadline_raw!r}"
+            )
+        deadline = float(deadline_raw)
+        if not (deadline > 0.0) or deadline != deadline or deadline == float("inf"):
+            raise ValueError(
+                "zegrid_resource_recovery_deadline_s must be finite and > 0, "
+                f"got {deadline_raw!r}"
+            )
+
+    budget_raw = _policy_value(config, "zegrid_durable_store_budget_bytes")
+    if budget_raw is None:
+        budget = None
+    else:
+        if isinstance(budget_raw, bool) or not isinstance(budget_raw, int):
+            raise ValueError(
+                "zegrid_durable_store_budget_bytes must be a positive integer "
+                f"or null, got {type(budget_raw).__name__}={budget_raw!r}"
+            )
+        if budget_raw <= 0:
+            raise ValueError(
+                "zegrid_durable_store_budget_bytes must be > 0 or null, "
+                f"got {budget_raw!r}"
+            )
+        budget = int(budget_raw)
+
+    gauge_raw = _policy_value(config, "zegrid_cell_gauge_mode")
+    if gauge_raw is None:
+        gauge_mode = None
+    elif isinstance(gauge_raw, str) and gauge_raw in _ZEGRID_GAUGE_MODES:
+        gauge_mode = gauge_raw
+    else:
+        raise ValueError(
+            "zegrid_cell_gauge_mode must be null or one of "
+            f"{_ZEGRID_GAUGE_MODES}, got {gauge_raw!r}"
+        )
+
+    layout_raw = _policy_value(config, "zegrid_layout")
+    if layout_raw is None:
+        layout = None
+    elif isinstance(layout_raw, str):
+        layout = layout_raw.strip() or None
+    else:
+        raise ValueError(
+            "zegrid_layout must be null or an 'NXxNY' string, got "
+            f"{type(layout_raw).__name__}={layout_raw!r}"
+        )
+
+    sip_raw = _policy_value(config, "zegrid_sip_mode")
+    if sip_raw is None:
+        sip_mode = "keep"
+    elif isinstance(sip_raw, str) and sip_raw in _ZEGRID_SIP_MODES:
+        sip_mode = sip_raw
+    else:
+        raise ValueError(
+            "zegrid_sip_mode must be one of "
+            f"{_ZEGRID_SIP_MODES}, got {sip_raw!r}"
+        )
+
+    return {
+        "zegrid_resource_recovery_enabled": enabled,
+        "zegrid_resource_recovery_deadline_s": deadline,
+        "zegrid_durable_store_budget_bytes": budget,
+        "zegrid_cell_gauge_mode": gauge_mode,
+        "zegrid_layout": layout,
+        "zegrid_sip_mode": sip_mode,
+    }
 
 
 def _home_path(*parts: str) -> str:
@@ -1047,6 +1193,11 @@ def load_config():
     # SCI-05 canonical Coverage settings + legacy radial migration (non-breaking:
     # only touches coverage/radial keys; unrelated keys preserved).
     current_config, _coverage_migration_notes = migrate_coverage_settings(current_config)
+    # ZM-ZEGRID-M6: the declared ZeGrid run-policy keys are validated here, in
+    # the single config-load path. An explicit invalid value is a loud refusal
+    # (never silently coerced to the default). Defaults and absent keys are a
+    # no-op, so existing configurations load exactly as before.
+    validate_zegrid_run_policy(current_config)
     return current_config
 
 def save_config(config_data):

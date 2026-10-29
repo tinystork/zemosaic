@@ -1,3 +1,27 @@
+## Junior — M6 ACCEPTED and published (2026-10-29)
+
+Mission `ZM-ZEGRID-M6-PRODUCT-SEAM-20261029`, base `69409fcb14d1fd13111b541a1fea15fad0630141`. Nono review-1 ACCEPT (C1 closed, C2/C3/C4 intact) after Junior re-probed the exact data-loss case on the r2 tree.
+
+Delivered, defaults unchanged (recovery `False`, deadline `None`, store budget `None`, resume `never`):
+- six run-policy keys declared in `DEFAULT_CONFIG` with strict `validate_zegrid_run_policy` called once at `run_zegrid_mode` entry — no coercion, legacy strings refused explicitly (architect decision: strict, no 0/1 migration, because a truthy string could silently enable recovery);
+- `python -m zemosaic.zegrid_cli`: real headless entry, no Qt import, exit 0/2/3, fail-closed option refusals, disk-verified publication, optional `--overwrite` recorded in the summary and refused with `--resume-mode auto` or foreign content, pre-run rejection of an existing publication in the output folder (root, `.zegrid_publications`, `grid_EQ`/`grid_ALTZ` children);
+- cooperative `SIGTERM`/`SIGINT`: sets the channel, finishes the safe boundary, returns `STOPPED_RESUMABLE` with intact atomic commits and no publication; bounded grace watchdog; Windows signals NOT_RUN;
+- `format_bounded_assembly_close` reads the real `peak_live_*` counters, so the close warning after a successful close is genuinely fixed.
+
+Evidence: **45 passed** (config-policy+close-stats, CLI incl. overwrite/freshness, cooperative stop). Junior's own runs: fresh output exit 0 (`6848e939…`/`fa7a79d0…`), second run exit 2 with byte-identical prior files, `--overwrite` exit 0 with `overwrite=true`, foreign content exit 2, `--overwrite`+resume exit 2.
+
+Still NOT_RUN / out of scope: Qt settings wiring for the six keys, Windows signal semantics, per-cell bounded-assembly close integration (PLAN budget on the tiny corpus), GPU, M31, large corpus. No activation by default, no merge to `beta`/`main`.
+
+## Junior — M6 r0 delivered and verified, Nono review-0 in flight (2026-10-29)
+
+Mission `ZM-ZEGRID-M6-PRODUCT-SEAM-20261029`, HEAD `69409fcb14d1fd13111b541a1fea15fad0630141`. Product diff: `zemosaic_config.py +151` (six declared keys, strict `validate_zegrid_run_policy`), `zemosaic_zegrid_mode.py +92/-12` (validation at entry, optional `stop_channel`, durable-vs-in-memory stop classification, close-log formatter), new `src/zemosaic/zegrid_cli.py`, four test files, `tools/zegrid_m6/make_tiny_corpus.py`. No commit/push.
+
+Defaults unchanged: recovery False, deadline None, store budget None, gauge/layout None, sip keep; `zegrid_resume_mode` still never. Junior replayed **38 passed in 25.56 s** and ran the CLI itself: corpus generator + `python -m zemosaic.zegrid_cli` -> exit 0, `COMPLETE in 6.7 s`, FITS+coverage+manifest+aesthetic, science `6848e939...`, coverage `f43ffd94...` identical to Coco r0 (reproducible).
+
+Pieces now real: a headless entry that does not import Qt and refuses contradictory options; a cooperative stop that reaches a safe boundary and reports `STOPPED_RESUMABLE` with intact atomic commits and no publication; a close log that reads the real counters.
+
+Open questions sent to review: whether the new validation could reject a legitimate legacy persisted config, and whether the CLI could accept a stale manifest in a reused output folder. Nono review-0 accepted/queued `cd0e54ac-1480-45cc-8f5a-b30086840614`. Limits unchanged: GUI wiring, Windows signals, per-cell close integration (PLAN budget), GPU/M31, large corpus all NOT_RUN. No activation, no merge.
+
 ## Junior — M3 bricks ACCEPTED and published; host-capacity decision pending (2026-10-29)
 
 Nono review-0 = ACCEPT-WITH-CONDITIONS. Condition C1 (prove the six runner invariants before any pressure) is closed by Junior line-read plus the focused tests: single owned child spawned once, 64 MiB bounded mmap steps, hard 512 MiB whole-process cap, fixed `GUARD_ORDER` (pressure RSS/reserve -> wait exit -> cooperative stop -> owned kill classified FAIL), one-shot unix-socket IPC with a <=2 s ack deadline and timeout => release + NOT_RUN, cleanup only `os.kill` on the owned PID (no killpg/pkill/killall), no cgroup/sysctl/swap/cache manipulation, experiment mode refusing before any child/socket/mmap and reporting `REVIEWED_FLOW_NOT_EXECUTED_IN_THIS_MISSION` even when granted. `30 passed` replayed.
