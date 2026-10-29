@@ -1,3 +1,13 @@
+## Junior — M3 bricks ACCEPTED and published; host-capacity decision pending (2026-10-29)
+
+Nono review-0 = ACCEPT-WITH-CONDITIONS. Condition C1 (prove the six runner invariants before any pressure) is closed by Junior line-read plus the focused tests: single owned child spawned once, 64 MiB bounded mmap steps, hard 512 MiB whole-process cap, fixed `GUARD_ORDER` (pressure RSS/reserve -> wait exit -> cooperative stop -> owned kill classified FAIL), one-shot unix-socket IPC with a <=2 s ack deadline and timeout => release + NOT_RUN, cleanup only `os.kill` on the owned PID (no killpg/pkill/killall), no cgroup/sysctl/swap/cache manipulation, experiment mode refusing before any child/socket/mmap and reporting `REVIEWED_FLOW_NOT_EXECUTED_IN_THIS_MISSION` even when granted. `30 passed` replayed.
+
+Published on the feature branch as `635be6e261fd4520f138a82a815903ef9bedfbc5` (parent `7d0b759`); `origin/beta=231b597867` and `origin/main=434961a8ec` unchanged.
+
+Measured brick: bounded reference 1600x1600/2x2 PASS in 138.8 s, peak product tree 1,139,167,232 B, min MemAvailable 2,013,675,520 B, `X_b = 1,133,114,368 B` (agrees across `r55_scheduler.execution.aggregate_bytes` and `per_cell_diagnostics.ram_contract.aggregate_bytes`). Artifacts live outside any checkout at `/home/tristan/.openclaw/workspace/.m3-linux-runner-20261029/`.
+
+Blocking measurement: preflight with `X_b` is `NOT_READY` with `NO_SAFE_PRESSURE_DOSE` and `PRESSURE_CAP_INSUFFICIENT`; refusing that minimum needs a ~1.95 GB dose against a 512 MiB cap, and the corpus that would land in the refusable window (~2300 px) needs 1.5-1.8 GB of tree plus the 1 GiB reserve against 2.7-3.0 GB live. This 7.7 GiB host cannot host the experiment under the agreed contract. Physical pressure remains NOT_RUN; no threshold, reserve, cap or science value was lowered. Awaiting an explicit host-capacity decision (larger host, explicitly reviewed alternative strategy, or defer). No activation, no M6, no beta/main merge.
+
 ## Coco — M3 runner/X_b continuation r1: 1600² measured, NOT_READY (host-fit) (2026-10-29)
 
 No physical pressure. Artifacts moved out of the product checkout to `/home/tristan/.openclaw/workspace/.m3-linux-runner-20261029/`; `projects/zemosaic` is clean of the run directory. Runner now defaults to an artifact base outside any git checkout and refuses a root inside one without an explicit `--allow-inside-git`.
