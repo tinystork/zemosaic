@@ -1,3 +1,98 @@
+## Junior — M3 protocol r2 verified, Nono review-1 in flight (2026-10-29)
+
+REWORK-2 continuation finished the interrupted 01:40 work: candidate-wave/exactly-once wording, latched-fact rule, barrier-trace fields, 5 protocol-consistency tests, fresh preflight, report. Junior independently replayed **26 passed (2.11s)** and confirmed all five file hashes match; preflight tool and its 21 tests are byte-identical to r1, so F1/F2/F3 stay conforming and untouched.
+
+Protocol now states the correct order for the designated safe wave: hook -> original unmodified `_r55_run_checkpoint_sample` (:11681) -> original unmodified `_r55_run_checkpoint` (:11712/:11779), with explicit exclusion of heartbeat (:11576), M3 coordinator probe (:11405), post-wait resampler (:11919) and GPU sites (:12705/:13036); one-shot bounded IPC (<=2 s proposal) owned by the parent observer, timeout/refusal => release + NOT_RUN; no fabrication/rewrite/clamp; pre-arm latched fact disqualified unless `latched_host.monotonic_ns >= pressure_applied`; PASS requires barrier trace `hook < pressure_applied <= sampler` plus post-arm governing fact.
+
+Fresh real preflight `NOT_READY` at 2697.0 MiB available, sole blocker `BOUNDED_AGGREGATE_NOT_MEASURED` (512 MiB dose clears the reserve at that snapshot). Volatile observation, not an M3 pass.
+
+Nono review-1 accepted/queued `e0c64fe3-cc91-4eb2-9156-e6b574f73a80`; report expected `.a2a-reports/ZM-ZEGRID-M3-LINUX-PREFLIGHT-20261028.nono.r1.md`. HEAD `a18dd12` unchanged, no production change, no pressure, no commit/push. Still missing after acceptance: transparent execution/wait/commit observers + one-shot pressure runner, real bounded-minimum measurement, then the reviewed experiment. Physical M3, FITS, Windows/NTFS, BLAS, GPU and M31 remain unqualified.
+
+## Current status — M3 preflight REWORK-2 delivered (2026-10-29), NOT an M3 pass
+
+Protocol-only F4 correction completed; preflight F1/F2/F3 unchanged and conforming.
+The pressure handshake now runs **before** the original safe-wave
+`_r55_run_checkpoint_sample(disk_root)` (`mode.py:11681`), not merely before
+`_r55_run_checkpoint`: barrier hook -> original sampler (unmodified) -> original
+checkpoint with those facts. It is attributed to the exact safe-wave call site,
+never heartbeat/M3-recovery/M3-post-wait/GPU samplers, arms exactly once only
+after K durable commits, uses one-shot bounded parent-owned IPC with explicit
+ack/timeout => NOT_RUN, never fabricates/rewrites facts, and documents the
+residual race. PASS requires `hook < pressure_applied <= sampler` for the same
+wave, no pre-arm latched fact governing, and zero post-release execution of K.
+
+Validation: **26 passed** (21 existing preflight + 5 protocol-contract tests),
+`py_compile` OK, `git diff --check` OK. Fresh read-only preflight (unique JSON
+`preflight.rework2.20261029T072352Z.json`): **NOT_READY**, exit 2, sole blocker
+`BOUNDED_AGGREGATE_NOT_MEASURED`; `MemAvailable` 2,697.0 MiB at snapshot,
+`A-512 MiB` = 2,185.0 MiB (reserve passes), ext4 `/` 22,273.6 MiB free, cgroup
+chain known-unlimited with ancestor evidence. This is one volatile snapshot, not
+a universal host fact or reservation and not an M3 qualification. No pressure,
+product run, production change, commit or push. `X_b` remains unmeasured;
+execution/wait/commit observers and the runner remain unimplemented;
+already-bounded/repeated-pressure remains a separate product gap; namespace
+scope remains ENGINE-only. Next: measure `X_b` at the pressure-governing raw
+with a no-pressure bounded reference, then re-run preflight with
+`--bounded-aggregate-bytes`. Historical Junior/Nono and prior status below are
+preserved.
+
+---
+
+## Junior — M3 protocol REWORK-2 in flight (2026-10-29)
+
+Nono review-0 = FINDINGS: preflight tool conforming (F1/F2/F3 closed), one HIGH confirmed — the protocol's pressure barrier runs after `_r55_run_checkpoint_sample` (mode.py:11681) so it cannot govern the current wave. Junior had reached the same conclusion independently. Bounded protocol-only correction dispatched to the same Coco context (rework-2, 2/3), accepted/queued `880504e9-1a93-4d87-9fc3-f2c446905cf9`; report expected `.a2a-reports/ZM-ZEGRID-M3-LINUX-PREFLIGHT-20261028.coco.r2.md`.
+
+Held constant: HEAD `a18dd12e4cc2775fc397d5bcfe9c334bbaffb205`, four tools/tests/docs files, no production change, no pressure, no runner, no commit/push. Real preflight still `NOT_READY` (1386.3 MiB at last snapshot: 512 MiB dose breaches the 1 GiB reserve by 149.7 MiB, and the bounded minimum is unmeasured). Preflight tests 21 passed. Nothing accepted or published in this mission yet; M3 physical pressure, Windows/NTFS, full FITS, BLAS, GPU and M31 remain unqualified.
+
+## Junior — M3 preflight r1 verified, independent review pending (2026-10-28)
+
+21testsPASS7.80s. Independentfixtures confirm inheritedcgroup/capfloor/telemetryfalseREADY fixed; CLIweakreserve exits3. RealpreflightNOT_READY at1386.3MiB available: selected512MiB breachesreserve and boundedminimumunknown. No pressure/productrun. Residual protocol issue: proposed handshake wraps checkpoint AFTER facts already sampled; currentwave may use prepressurefacts. Nono review to verify and scope correction. Evidence `.a2a-reports/ZM-ZEGRID-M3-LINUX-PREFLIGHT-20261028.junior.r1.md` and probes/preflight-r1. No acceptance/commit/push, HEADa18dd12 unchanged.
+
+## Junior status — M3 preflight REWORK-1 required (2026-10-28)
+
+12tests pass but independent probes confirm false READY_TO_PLAN: inheritedcgroup limit ignored, reserve/pressure policy bypass through parameters, inconsistentRAMfacts accepted. Protocol also needs mandatory actual-compute evidence for zero-recompute, not just unchangedcommitIDs. No physicalpressure/productrun executed. ActualJuniorpreflight1829.3MiB available, reserve arithmeticfits512MiB but boundedminimumunknown => NOT_READY; no demonstrated need to changehost. Same-contextboundedrework next; details `.a2a-reports/ZM-ZEGRID-M3-LINUX-PREFLIGHT-20261028.junior.r0.md`. HEADa18dd12 remains baseline; RSS accepted/published unchanged.
+
+## Current status — M3 preflight REWORK-1 delivered (2026-10-28), NOT an M3 pass
+
+Mission `ZM-ZEGRID-M3-LINUX-PREFLIGHT-20261028` rework-1 fixed the four
+Junior-confirmed false-readiness/proof gaps without pressure, product run,
+production change, commit or push. Tool/tests/protocol only; accepted RSS
+sources/tests untouched.
+
+- **F1 cgroup:** preflight now walks leaf→mount-root ancestors, takes the minimum
+  finite `memory.max`, records ancestor paths/limits, accepts a missing
+  `memory.max` only at the mount root, and fails closed on any other
+  missing/unreadable/malformed ancestor. Unknown is never unlimited.
+- **F2 contract:** public CLI/evaluator enforce reserve ≥1 GiB and selected
+  dose/cap ≤512 MiB; weaker overrides exit 3 / NOT_READY. Only stricter values
+  are accepted. A safe smaller dose window is reported; 512 MiB is a maximum,
+  not a mandatory dose.
+- **F3 telemetry:** required fields reject unknown units, non-positive
+  `MemTotal`, `MemAvailable > MemTotal`, and `SwapFree > SwapTotal`; inconsistent
+  facts cannot yield READY.
+- **F4 protocol:** zero compute of committed K is now mandatory, proven by a
+  test-only execution trace around the real `_stack_cell`/`_prepare`/`_consume`
+  path, a live `RecoveryCoordinator` journal trace, and a durable commit trace.
+  No PASS without them. Polling-until-K is replaced by a bounded test-only
+  handshake at the real `_r55_run_checkpoint` safe boundary. Already-bounded or
+  fallback-consumed pressure remains a separate unqualified product gap.
+  Env/cmdline capture removed; process fields allowlisted; 512 MiB includes
+  process overhead; sampling-latency caveat and product-tree ceiling added.
+
+Validation: **21 passed** focused tests; `py_compile` OK; `git diff --check` OK.
+Fresh read-only preflight (unique JSON
+`preflight.rework1.final.20261028T221958Z.json`): **NOT_READY**, exit 2, sole
+host blocker `BOUNDED_AGGREGATE_NOT_MEASURED`; `MemAvailable` 1,678.2 MiB,
+`A-512 MiB` = 1,166.2 MiB (reserve passes at this snapshot), ext4 `/` 22,233.6
+MiB free, cgroup chain known-unlimited with ancestor evidence. Other snapshots
+(0.8 GiB, 1.47 GiB, Junior 1,829.3 MiB) differ and are preserved as observations,
+not universal facts or reservations. No host move is mandated by the 512 MiB
+maximum; the next step is a no-pressure bounded reference to measure `X_b` at the
+pressure-governing raw, then re-run preflight with `--bounded-aggregate-bytes`.
+Historical RSS acceptance below is retained.
+
+---
+
 ## Current status — RSS Linux ACCEPTED by Junior (2026-10-28)
 
 Nono review-1 ACCEPT; F1/F2/F3 + parity-seed stop defect closed. Junior verified exact4file snapshot, **79passed/0skip/0fail**, real guarded matrix **PASS85.495s**. Cases512²/16cells,1024²/16cells,1024²/64cells; only256² dense parity (8planes+offsets) proven. Peak lifetime sampledRSS497,184,768B (**474.15MiB**, not497MiB), minimumhost1,283,166,208B, cap2, immutable storecontent,0live mappings afterclose. Five independent failed-seed cases stop beforeparity. No production/science/schema/default changes. Two correctiveiterations used.
