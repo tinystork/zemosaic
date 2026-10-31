@@ -444,7 +444,16 @@ def test_execute_reconstructs_kwargs_and_verifies(tmp_path, monkeypatch):
 
 @pytest.fixture(scope="module")
 def tiny_baseline(tmp_path_factory):
-    """One small synthetic baseline run (real engine, small 2x2 corpus)."""
+    """One small synthetic baseline run (real engine, small 2x2 corpus).
+
+    The 2x2 pin must satisfy the REAL scientific floors. A 400x600 frame canvas
+    leaves ``halo_overhead`` at 0.7731 (> 0.50) at the default 64 px halo, so
+    the fixture uses 800x1200 frames (canvas ~2983x831): ``halo_overhead``
+    becomes 0.4199 and ``min_patch_area`` 879117, both floor-feasible. Using a
+    real-floor-feasible corpus — instead of monkeypatching the floors — also
+    covers the subprocess CLI e2e test, whose child process a monkeypatch cannot
+    reach, and the second module fixture that runs after this one.
+    """
     from astropy.io import fits
     from astropy.wcs import WCS
     import numpy as np
@@ -456,7 +465,7 @@ def tiny_baseline(tmp_path_factory):
     inp.mkdir()
     centers = [(10.0, 30.0), (10.05, 30.02), (12.0, 30.0), (12.05, 30.02)]
     for i, (ra, dec) in enumerate(centers):
-        shape = (400, 600)
+        shape = (800, 1200)
         w = WCS(naxis=2)
         w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
         w.wcs.crval = [ra, dec]
