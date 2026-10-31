@@ -596,6 +596,23 @@ def _v1_record(duration_s=100.0, n_frames=20, resume=False, master_tiles=0):
     }
 
 
+def _work(n_frames=653, cell_count=170, *, input_px=None, stack_work=None,
+          canvas_px=4_000_000):
+    """Rich mandatory workload: input pixels scale with frames, stack work
+    with cells (constant per-cell work), so ratios stay inside the band."""
+    return zeta.build_workload_signature(
+        n_frames=n_frames,
+        cell_count=cell_count,
+        input_pixels_total=(
+            input_px if input_px is not None else 1_000_000 * n_frames
+        ),
+        stack_work_px=(
+            stack_work if stack_work is not None else 1_000_000 * cell_count
+        ),
+        canvas_px=canvas_px,
+    )
+
+
 def _v2_record(total_duration_s=1000.0, n_frames=653, cell_count=170):
     return zeta.build_zegrid_history_record(
         total_duration_s=total_duration_s,
@@ -608,8 +625,19 @@ def _v2_record(total_duration_s=1000.0, n_frames=653, cell_count=170):
         stage_totals={"setup": n_frames, "gauge": 2 * n_frames - 1,
                       "per_cell_stack": cell_count, "finalize": 1},
         backend="cpu",
+        workload=_work(n_frames=n_frames, cell_count=cell_count),
         workers=4,
     )
+
+
+def _ctx(n_frames=653, cell_count=170, backend="cpu"):
+    """Rich selection context (fail-closed contract: all dimensions required)."""
+    return {
+        "n_frames": n_frames,
+        "cell_count": cell_count,
+        "backend": backend,
+        "workload": _work(n_frames=n_frames, cell_count=cell_count),
+    }
 
 
 def _v2_record_with_layout(layout_s):
@@ -621,6 +649,8 @@ def _v2_record_with_layout(layout_s):
             "setup": 15.0, "layout": layout_s, "gauge": 100.0,
             "per_cell_stack": 150.0, "assembly": 20.0, "finalize": 15.0,
         },
+        backend="cpu",
+        workload=_work(),
     )
 
 
@@ -703,7 +733,7 @@ def test_priors_filter_mode_and_never_mix_v1(tmp_path):
         _v2_record(total_duration_s=1000.0, n_frames=653, cell_count=170),
         _v2_record(total_duration_s=2000.0, n_frames=653, cell_count=170),
     ]
-    priors, comparable = zeta.select_zegrid_priors(records)
+    priors, comparable = zeta.select_zegrid_priors(records, **_ctx())
     assert comparable == 2
     assert priors["zegrid:setup"] == pytest.approx(15.0)
     assert priors["zegrid:layout"] == pytest.approx(700.0)
@@ -716,17 +746,18 @@ def test_priors_median_and_outlier_resistance():
         _v2_record(total_duration_s=1000.0),
         _v2_record_with_layout(100000.0),
     ]
-    priors, comparable = zeta.select_zegrid_priors(records)
+    priors, comparable = zeta.select_zegrid_priors(records, **_ctx())
     assert comparable == 3
     assert priors["zegrid:layout"] == pytest.approx(700.0)
 
 
 # ---------------------------------------------------------------------------
-# F3: exact per-stage-total scaling
+# F2: work-ratio scaling (never exact item totals)
 # ---------------------------------------------------------------------------
 
-def test_priors_scale_by_n_frames_cell_count_fallback():
-    # Older v2 record WITHOUT stage_totals -> n_frames/cell_count fallback.
+def test_priors_scale_by_work_ratios():
+    # Record: 326 frames / 85 cells, constant per-frame and per-cell work.
+    # Current: 2x frames, 2x cells -> setup/gauge/per_cell all scale 2x.
     records = [
         zeta.build_zegrid_history_record(
             total_duration_s=1000.0,
@@ -736,9 +767,14 @@ def test_priors_scale_by_n_frames_cell_count_fallback():
                 "setup": 10.0, "layout": 700.0, "gauge": 100.0,
                 "per_cell_stack": 100.0, "assembly": 20.0, "finalize": 15.0,
             },
+            backend="cpu",
+            workload=_work(n_frames=326, cell_count=85),
         ),
     ]
-    priors, comparable = zeta.select_zegrid_priors(records, n_frames=652, cell_count=170)
+    priors, comparable = zeta.select_zegrid_priors(
+        records, n_frames=652, cell_count=170, backend="cpu",
+        workload=_work(n_frames=652, cell_count=170),
+    )
     assert comparable == 1
     assert priors["zegrid:setup"] == pytest.approx(20.0)
     assert priors["zegrid:gauge"] == pytest.approx(200.0)
@@ -746,9 +782,10 @@ def test_priors_scale_by_n_frames_cell_count_fallback():
     assert priors["zegrid:layout"] == pytest.approx(700.0)
 
 
-def test_exact_gauge_total_preferred_over_n_frames():
-    # Record: exact gauge total 100, but n_frames=1000 (raw loaded vs included
-    # descriptors mismatch). The exact total must WIN over n_frames scaling.
+def test_gauge_scales_by_input_pixels_not_exact_totals():
+    # Record and current share n_frames/cells, but the current run has 2x the
+    # input pixels (e.g. larger sensor). Gauge must scale 2x by PIXEL work.
+    # Contradictory exact item totals must never override the work ratio.
     rec = zeta.build_zegrid_history_record(
         total_duration_s=1000.0,
         n_frames=1000,
@@ -758,35 +795,46 @@ def test_exact_gauge_total_preferred_over_n_frames():
             "per_cell_stack": 100.0, "assembly": 20.0, "finalize": 15.0,
         },
         stage_totals={"setup": 1000, "gauge": 100, "per_cell_stack": 50, "finalize": 1},
+        backend="cpu",
+        workload=_work(n_frames=1000, cell_count=50, input_px=1_000_000_000),
     )
     priors, comparable = zeta.select_zegrid_priors(
         [rec],
         n_frames=1000,
         cell_count=50,
+        backend="cpu",
+        # exact totals deliberately contradict the pixel-work truth.
         stage_totals={"setup": 1000, "gauge": 200, "per_cell_stack": 50, "finalize": 1},
+        workload=_work(n_frames=1000, cell_count=50, input_px=2_000_000_000),
     )
     assert comparable == 1
-    # Exact gauge scaling: 200 * (200/100) = 400 (NOT n_frames scale 200*1=200).
     assert priors["zegrid:gauge"] == pytest.approx(400.0)
 
 
-def test_exact_per_cell_total_rescale():
+def test_per_cell_scales_by_stack_work_not_exact_totals():
     rec = zeta.build_zegrid_history_record(
         total_duration_s=1000.0,
         n_frames=653,
-        cell_count=50,
+        cell_count=100,
         stage_seconds={
             "setup": 15.0, "layout": 700.0, "gauge": 100.0,
             "per_cell_stack": 100.0, "assembly": 20.0, "finalize": 15.0,
         },
-        stage_totals={"setup": 653, "gauge": 1305, "per_cell_stack": 50, "finalize": 1},
+        stage_totals={"setup": 653, "gauge": 1305, "per_cell_stack": 100, "finalize": 1},
+        backend="cpu",
+        workload=_work(n_frames=653, cell_count=100, stack_work=100_000_000),
     )
     priors, comparable = zeta.select_zegrid_priors(
-        [rec], stage_totals={"per_cell_stack": 170}
+        [rec],
+        n_frames=653,
+        cell_count=170,
+        backend="cpu",
+        # exact cell total would give 1000; the measured work ratio (1.7x) wins.
+        stage_totals={"per_cell_stack": 1000},
+        workload=_work(n_frames=653, cell_count=170, stack_work=170_000_000),
     )
     assert comparable == 1
-    # per_cell_stack 100 * (170/50) = 340 via the exact total.
-    assert priors["zegrid:per_cell_stack"] == pytest.approx(340.0)
+    assert priors["zegrid:per_cell_stack"] == pytest.approx(170.0)
 
 
 def test_history_record_is_sanitized():

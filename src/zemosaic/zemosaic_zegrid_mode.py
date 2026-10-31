@@ -69,6 +69,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 from . import eta_service as zeta
+from . import progress_contract as zprogress
 from . import zemosaic_config as zconf
 from . import zemosaic_stack_plan as _stack_plan
 from .zegrid_halo import (
@@ -4377,8 +4378,36 @@ def _reference_provenance(global_reference_frame_id, cell_frame_ids, cell_refere
     }
 
 
-# Canonical ZeGrid phase order (used for the R14 global ETA weights).
-_PHASE_ORDER = ("setup", "layout", "gauge", "cache_build", "per_cell_stack", "assembly")
+# Canonical ZeGrid phase order (mirrors ``progress_contract.ZEGRID_PLAN``).
+# ZM-ETA-INTEGRITY-R32: ``cache_build`` is a DIAGNOSTIC frame counter fused into
+# ``per_cell_stack`` (never separate future work) and is EXCLUDED from ETA;
+# ``finalize`` is real remaining work and is INCLUDED.
+_PHASE_ORDER = ("setup", "layout", "gauge", "per_cell_stack", "assembly", "finalize")
+
+
+def _zegrid_stack_work_px(cell_ctxs) -> int:
+    """Measured per-cell stacking work: ``sum(patch_area_px * contributors)``.
+
+    ZM-ETA-INTEGRITY-R32 rework-1: the per-cell stack cost is NOT
+    ``n_frames * canvas``. It is the work the executor actually performs: for
+    every Cell, the processing-patch area times the number of member frames
+    materialised into that patch. Sanitized numeric only (no ids/paths/names),
+    so it is safe to persist in ETA history and to compare across runs.
+
+    Returns 0 when no usable cell context exists — callers must treat that as
+    "unknown" (the selection layer fails closed rather than inventing work).
+    """
+    total = 0
+    for cell_ctx in cell_ctxs or []:
+        try:
+            _row, _col, _cell, patch, membership = cell_ctx
+            area = int(patch.patch.width) * int(patch.patch.height)
+            n = len(getattr(membership, "patch_ids", ()) or ())
+        except Exception:
+            continue
+        if area > 0 and n > 0:
+            total += int(area) * int(n)
+    return int(total)
 
 
 def _fmt_throughput(items, elapsed_s, unit):
@@ -10455,12 +10484,57 @@ def _run_single(
     # intra-phase progress, live ETA, crash-breadcrumb stage, and an
     # incrementally-flushed run log (readable DURING the run, not only at the end).
     _open_run_log(output_dir, start_ts)
-    global_eta = zobs.GlobalEta(_PHASE_ORDER)
+    # ZM-ETA-INTEGRITY-R32: the run log's global ETA is produced by the SAME
+    # hybrid estimator authority as the GUI (progress_contract.ZEGRID_PLAN +
+    # fail-closed sanitized history priors). The previous independent
+    # ``GlobalEta`` counted the ACTIVE phase as future work and invented a
+    # mean-of-completed reserve for phases with no evidence, which is how the
+    # real M16 run logged ``global_eta=1m42s`` with ~4 s of assembly/finalize
+    # left. ``cache_build`` is a diagnostic id: the plan ignores it, so it can
+    # never be counted as future work.
+    _log_eta_estimator = zeta.HybridEtaEstimator(zprogress.ZEGRID_PLAN)
+    global_eta = zobs.HybridLogEta(_log_eta_estimator)
+
+    def _publish_log_eta_context(context: dict) -> None:
+        """Send the effective ETA context to the GUI (structured kwargs).
+
+        The GUI keeps its own HybridEtaEstimator; without this it cannot know
+        the EFFECTIVE backend (GPU may be frozen off / unavailable) or the
+        canvas geometry, so selection there would fail closed forever. This is
+        a plain log message with structured kwargs — it is NOT a stage/progress
+        event and cannot alter the progress contract.
+        """
+        try:
+            _emit(
+                "ZeGrid: ETA context — "
+                f"backend={context.get('backend')} "
+                f"frames={context.get('n_frames')} "
+                f"cells={context.get('cell_count')} "
+                f"input_px={context.get('input_pixels_total')} "
+                f"stack_work_px={context.get('stack_work_px')} "
+                f"canvas_px={context.get('canvas_px')}",
+                lvl="INFO",
+                callback=progress_callback,
+                zegrid_eta_context=dict(context),
+            )
+        except Exception:
+            pass
+
+    # ZM-ETA-INTEGRITY-R32 rework-1: ONE tracker owns the EFFECTIVE backend,
+    # the rich workload and prior selection. A backend change (initial, pre-
+    # execution bundle fallback, final actual backend) clears + reselects +
+    # republishes, so a degraded CPU run can never keep GPU priors.
+    _log_eta_tracker = zeta.EtaContextTracker(
+        _log_eta_estimator, publish=_publish_log_eta_context
+    )
 
     def _emit_live(msg, lvl="INFO"):
         _emit(msg, lvl=lvl, callback=progress_callback)
 
     def _stage_live(stage_str, current, total):
+        # ZM-ETA-INTEGRITY-R32: the run-log ETA consumes the SAME stable stage
+        # events as the GUI; the estimator ignores diagnostic ids (cache_build).
+        global_eta.on_stage(stage_str, current, total)
         # Worker crash-breadcrumb `stage` (3-int progress_callback form).
         if progress_callback is None:
             return
@@ -10477,7 +10551,7 @@ def _run_single(
             _emit_live,
             stage=_stage_live if emit_stage else None,
             log_line=_log_line,
-            global_eta=global_eta.estimate,
+            global_eta=global_eta,
         )
 
     # ZM-WIN-OBSERVABILITY: optional resource telemetry, driven by the SAME
@@ -10563,6 +10637,12 @@ def _run_single(
             callback=progress_callback,
         )
     _telemetry_state["use_gpu"] = bool(gpu_used)
+    # ZM-ETA-INTEGRITY-R32 rework-1: backend is a TRACKED ETA fact from the
+    # first instant it is known. A change clears + reselects + republishes.
+    try:
+        _log_eta_tracker.note_backend("gpu" if gpu_used else "cpu")
+    except Exception:
+        pass
     ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=gpu_used)
     if ignored_settings:
         for line in zin.ignored_settings_warning_lines(ignored_settings):
@@ -10596,6 +10676,23 @@ def _run_single(
             canvas = _resume_geometry[0]
         else:
             canvas = zg.build_canvas(descs)
+    # ZM-ETA-INTEGRITY-R32: the input-pixel + canvas geometry is known now
+    # (effective backend is tracked separately). The tracker reselects and
+    # republishes only when a measure actually changes.
+    try:
+        _input_px_total = 0
+        for _d in descs:
+            try:
+                _input_px_total += int(_d.width) * int(_d.height)
+            except Exception:
+                continue
+        _log_eta_tracker.note_workload(
+            n_frames=len(descs),
+            canvas_px=int(canvas.width) * int(canvas.height),
+            input_pixels_total=_input_px_total,
+        )
+    except Exception:
+        pass
     # M4 (plan §6.6): validate the frozen inventory by CONTENT before layout or
     # gauge. A moved dataset is not a change; a changed byte is a refusal.
     if _resume_boot is not None:
@@ -10643,7 +10740,6 @@ def _run_single(
     _setup_rep.end(
         throughput=_fmt_throughput(len(frames_info), timings.get("setup"), "frames/s")
     )
-    global_eta.phase_completed("setup", timings.get("setup"))
     _telemetry_stats(
         phase_name="Setup", phase_index=0, tiles_done=len(frames_info),
         tiles_total=len(frames_info),
@@ -10849,7 +10945,6 @@ def _run_single(
     _layout_rep.end(
         throughput=_fmt_throughput(nx * ny, timings.get("layout"), "cells/s")
     )
-    global_eta.phase_completed("layout", timings.get("layout"))
     _telemetry_stats(
         phase_name="Layout", phase_index=1, tiles_done=0, tiles_total=nx * ny,
     )
@@ -11306,7 +11401,6 @@ def _run_single(
             "exclusions": int(len(global_gauge.exclusions)),
         }
         _gauge_rep.end(throughput=0.0)
-        global_eta.phase_completed("gauge", 0.0)
         _emit(
             "ZeGrid: global photometric gauge RESTORED from the durable artifact "
             f"— reference {global_reference_frame_id!r} (index "
@@ -11326,7 +11420,6 @@ def _run_single(
         _gauge_rep.end(
             throughput=_fmt_throughput(len(descs), timings.get("gauge"), "frames/s")
         )
-        global_eta.phase_completed("gauge", timings.get("gauge"))
         _telemetry_stats(
             phase_name="Gauge", phase_index=2, tiles_done=0, tiles_total=nx * ny,
         )
@@ -11481,6 +11574,16 @@ def _run_single(
     cpu_fallback_tasks = _final.cpu_fallback_tasks
     cache_build_workers = int(_final.cache_build_workers)
     total_cells = int(nx * ny)
+    # ZM-ETA-INTEGRITY-R32 rework-1: cell count AND the measured per-cell stack
+    # work are known now (membership/patch areas). The tracker reselects and
+    # republishes; no prior is scaled by item counts alone.
+    try:
+        _log_eta_tracker.note_workload(
+            cell_count=total_cells,
+            stack_work_px=_zegrid_stack_work_px(cell_ctxs),
+        )
+    except Exception:
+        pass
 
     # ZM-CELL-PHOTOMETRY-R34F: "auto" resolves HERE — after the global gauge exists
     # (it already does, for progress/ETA) and the layout membership is known. It
@@ -11696,6 +11799,12 @@ def _run_single(
             lvl="WARN", callback=progress_callback,
         )
     gpu_used = bool(_final.gpu_used)
+    # Pre-execution bundle fallback: the EFFECTIVE backend just changed. Any
+    # GPU prior must be dropped before a single cell is stacked.
+    try:
+        _log_eta_tracker.note_backend("gpu" if gpu_used else "cpu")
+    except Exception:
+        pass
     if bool(gpu_used) is False and _final.gpu_pre_execution_fallback is not None:
         science_config = replace(science_config, backend="cpu")
         gpu_ctx = dict(gpu_ctx)
@@ -15745,6 +15854,12 @@ def _run_single(
     # bundle's ``None`` must not erase the evidence of what the GPU ran.
     gpu_ctx["cpu_fallback_plan"] = dict(cpu_fallback_info)
     gpu_used = bool(actually_used_gpu)
+    # Final ACTUAL backend after execution (a GPU attempt may have fallen back
+    # per-cell). Never keep GPU priors for a run that actually ran CPU.
+    try:
+        _log_eta_tracker.note_backend("gpu" if gpu_used else "cpu")
+    except Exception:
+        pass
 
     # R20 diagnostics (mirrors the R19 gauge diagnostics): effective executor,
     # parent daemon flag, workers/cells-in-flight, seconds/unit.
@@ -15812,11 +15927,9 @@ def _run_single(
     _cache_rep.end(
         throughput=_fmt_throughput(cache_total_frames, timings.get("cache_build"), "frames/s")
     )
-    global_eta.phase_completed("cache_build", timings.get("cache_build"))
     _stack_rep.end(
         throughput=_fmt_throughput(total_cells, timings.get("per_cell_stack"), "cells/s")
     )
-    global_eta.phase_completed("per_cell_stack", timings.get("per_cell_stack"))
 
     # ZM-ZEGRID-COMMIT-INTEGRITY: the end-of-stacking durable counter (ONE line),
     # then a fail-fast guard BEFORE assembly: a run with expected cells and ZERO
@@ -15909,7 +16022,6 @@ def _run_single(
     _assembly_rep.end(
         throughput=_fmt_throughput(len(assembled.complete_cells), timings.get("assembly"), "cells/s")
     )
-    global_eta.phase_completed("assembly", timings.get("assembly"))
     _telemetry_stats(
         phase_name="Assembly", phase_index=4, tiles_done=total_cells,
         tiles_total=total_cells,
@@ -16618,6 +16730,11 @@ def _run_single(
                 },
                 workers=workers,
                 backend="gpu" if gpu_used else "cpu",
+                # ZM-ETA-INTEGRITY-R32 rework-1: the tracker's measured
+                # sanitized workload (frames/cells, summed input pixels,
+                # patch_area x contributors stack work, canvas area). Never
+                # paths/names/user data; never a quadratic n_frames x pixels.
+                workload=_log_eta_tracker.workload(),
             )
         )
     except Exception:

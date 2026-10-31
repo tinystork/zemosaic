@@ -17,12 +17,27 @@ Two cooperating pieces live here:
   allocates ALREADY-OBSERVED completed-phase evidence). COMPLETED stages are
   never predicted again.
 
-* History store helpers — a backward-compatible v2 record shape on the existing
+* History store helpers — a backward-compatible record shape on the existing
   ``~/.zemosaic_eta_history.json`` path. Legacy v1 ``{duration_s, n_frames, ...}``
   records still load safely and are preserved (never mixed into ZeGrid
   per-stage priors), atomic append (unique same-dir temp + ``os.replace`` with
   guaranteed best-effort cleanup), bounded count, and fail-open on malformed/
   corrupt/unwritable files.
+
+ZM-ETA-INTEGRITY-R32 (history integrity + comparability):
+
+* ONE authoritative path seam (:data:`ETA_HISTORY_ENV_VAR`). Precedence is
+  explicit ``path=`` argument > ``ZEMOSAIC_ETA_HISTORY_PATH`` env var >
+  ``~/.zemosaic_eta_history.json``. The legacy worker history code delegates to
+  the same function, so tests (and any operator) can redirect BOTH writers
+  without mutating ``HOME``.
+* ZeGrid priors FAIL CLOSED. A record only contributes when its schema is rich
+  (``schema_v >= 3`` with an explicit ``backend`` and a numeric ``workload``
+  signature) AND it matches the current run's effective backend AND its
+  workload geometry is genuinely comparable (frames / cells / pixel work within
+  a documented ratio band). Old v2 records, CPU/GPU mixes and tiny synthetic
+  4-frame records therefore never become a learned prior for a 32-frame
+  full-resolution GPU run.
 
 Design rules (see the R30 mission + rework-1):
 
@@ -212,12 +227,6 @@ def default_cost_model(plan) -> Dict[str, float]:
         return SDS_COST_MODEL
     return ZEGRID_COST_MODEL
 
-# Stages whose prior may be scaled by their EXACT per-stage total when both the
-# current run's and the record's ``stage_totals`` are valid. ``setup``/``gauge``
-# fall back to ``n_frames`` and ``per_cell_stack`` to ``cell_count`` for older
-# v2 records lacking exact totals.
-SCALABLE_STAGES = ("setup", "gauge", "per_cell_stack")
-
 CONFIDENCE_CALIBRATING = "calibrating"
 CONFIDENCE_LOW = "low"
 CONFIDENCE_MEDIUM = "medium"
@@ -330,15 +339,146 @@ def _median_outlier_resistant(values: Sequence[float]) -> float:
 # ---------------------------------------------------------------------------
 
 ETA_HISTORY_SCHEMA_V2 = "zemosaic.eta_history.v2"
+ETA_HISTORY_SCHEMA_V3 = "zemosaic.eta_history.v3"
 ETA_HISTORY_MAX_RECORDS = 120
+
+#: Documented, process-wide history-path override. BOTH the eta service and the
+#: legacy worker history code resolve the path through :func:`eta_history_path`,
+#: so this single env var redirects both writers/readers. Used by the pytest
+#: isolation guard so no test can ever write the real HOME file. Never mutates
+#: ``HOME`` and never disables history in production (unset -> default path).
+ETA_HISTORY_ENV_VAR = "ZEMOSAIC_ETA_HISTORY_PATH"
+DEFAULT_ETA_HISTORY_NAME = ".zemosaic_eta_history.json"
+
+#: Current rich workload-signature version (bumped when the recorded geometry
+#: measures change meaning). Selection rejects any other version (fail closed).
+WORKLOAD_SIGNATURE_VERSION = 1
+
+#: Genuine-comparability band: a record's frames / cells / work measures may
+#: differ from the current run by at most this factor (either direction). Wide
+#: enough to reuse a neighbouring workload, narrow enough that a 4-frame
+#: synthetic record can never be "comparable" to a 32-frame full-resolution run
+#: (8x).
+WORKLOAD_RATIO_MAX = 2.0
+
+#: MANDATORY rich workload dimensions (ZM-ETA-INTEGRITY-R32 rework-1). A record
+#: and the current run are comparable ONLY when BOTH expose every one of these
+#: as a positive integer. Missing/nonpositive/unknown -> fail closed. This is
+#: what makes an "n_frames + cell_count only" v3 record unselectable.
+WORKLOAD_REQUIRED_FIELDS = (
+    "n_frames",
+    "cell_count",
+    "input_pixels_total",
+    "stack_work_px",
+    "canvas_px",
+)
+
+#: Per-stage WORK-RATIO scaling. The prior is multiplied by
+#: ``current_measure / record_measure`` for the mapped measure. Exact item
+#: totals are RECORDED for diagnostics but NEVER override a work ratio (an
+#: equal-pixel 16-frame and 32-frame workload must NOT double the gauge prior).
+ZEGRID_STAGE_WORK_SCALE: Dict[str, Optional[str]] = {
+    "setup": "n_frames",             # per-frame decode/descriptor overhead
+    "layout": None,                   # geometry/planner work, not pixel work
+    "gauge": "input_pixels_total",    # gauge reads every input pixel (~2n-1 passes)
+    "per_cell_stack": "stack_work_px",  # measured patch_area x contributors
+    "assembly": "canvas_px",          # mosaic output work
+    "finalize": "canvas_px",          # output write work
+}
 
 
 def eta_history_path() -> Path:
-    """Return the shared history path (compatible with the legacy v1 writer)."""
+    """Return the shared ETA history path (single authoritative seam).
+
+    Precedence: ``ZEMOSAIC_ETA_HISTORY_PATH`` (when set to a non-empty value)
+    then ``~/.zemosaic_eta_history.json``. Callers that own an explicit path
+    must pass it to :func:`resolve_eta_history_path` instead of relying on this.
+    """
     try:
-        return Path.home() / ".zemosaic_eta_history.json"
+        override = str(os.environ.get(ETA_HISTORY_ENV_VAR, "") or "").strip()
     except Exception:
-        return Path(".zemosaic_eta_history.json")
+        override = ""
+    if override:
+        return Path(override).expanduser()
+    try:
+        return Path.home() / DEFAULT_ETA_HISTORY_NAME
+    except Exception:
+        return Path(DEFAULT_ETA_HISTORY_NAME)
+
+
+def resolve_eta_history_path(explicit: Optional[Path] = None) -> Path:
+    """Resolve the history path: explicit argument > env seam > default.
+
+    The ONE precedence rule used by every reader/writer in this module and by
+    the legacy worker helpers.
+    """
+    return Path(explicit) if explicit is not None else eta_history_path()
+
+
+def normalize_backend(value) -> Optional[str]:
+    """Normalize a backend label to ``"gpu"`` / ``"cpu"`` (else ``None``).
+
+    ``None`` means UNKNOWN and is a hard fail-closed signal for ZeGrid priors:
+    an unknown backend never matches a recorded backend.
+    """
+    text = str(value or "").strip().lower()
+    if text in ("gpu", "cuda", "cupy"):
+        return "gpu"
+    if text in ("cpu",):
+        return "cpu"
+    return None
+
+
+def build_workload_signature(
+    *,
+    n_frames: Optional[int] = None,
+    cell_count: Optional[int] = None,
+    canvas_px: Optional[int] = None,
+    input_pixels_total: Optional[int] = None,
+    stack_work_px: Optional[int] = None,
+) -> Dict[str, int]:
+    """Build the sanitized numeric workload signature used for comparability.
+
+    Unambiguous, non-overlapping measures only (never paths, names or user
+    data):
+
+    * ``n_frames``           — number of frames.
+    * ``cell_count``         — number of Cells.
+    * ``input_pixels_total`` — SUM of the frame areas (``sum(w*h)``). NEVER
+                               multiplied by ``n_frames`` again: that would
+                               double-count the same pixels.
+    * ``stack_work_px``      — measured per-cell stacking work:
+                               ``sum(cell patch_area_px * contributor_count)``.
+    * ``canvas_px``          — mosaic canvas area (assembly/output work).
+
+    Missing measures are omitted (never fabricated). Comparability requires
+    EVERY field in :data:`WORKLOAD_REQUIRED_FIELDS` on both sides.
+    """
+    sig: Dict[str, int] = {"v": WORKLOAD_SIGNATURE_VERSION}
+    for key, value in (
+        ("n_frames", n_frames),
+        ("cell_count", cell_count),
+        ("input_pixels_total", input_pixels_total),
+        ("stack_work_px", stack_work_px),
+        ("canvas_px", canvas_px),
+    ):
+        ival = _safe_int(value)
+        if ival > 0:
+            sig[key] = ival
+    return sig
+
+
+def _ratio_comparable(a, b) -> bool:
+    """True iff both measures are positive and within ``WORKLOAD_RATIO_MAX``."""
+    try:
+        x = float(a)
+        y = float(b)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(x) and math.isfinite(y)) or x <= 0.0 or y <= 0.0:
+        return False
+    lo, hi = (x, y) if x <= y else (y, x)
+    return (hi / lo) <= WORKLOAD_RATIO_MAX
 
 
 def _utcnow_iso() -> str:
@@ -354,7 +494,7 @@ def load_eta_history(path: Optional[Path] = None) -> List[dict]:
     missing files return ``[]``.
     """
     try:
-        p = Path(path) if path is not None else eta_history_path()
+        p = resolve_eta_history_path(path)
         if not p.exists():
             return []
         payload = json.loads(p.read_text(encoding="utf-8"))
@@ -368,44 +508,115 @@ def load_eta_history(path: Optional[Path] = None) -> List[dict]:
         return []
 
 
+def _zegrid_current_context(
+    *,
+    backend: Optional[str],
+    workload: Optional[Mapping[str, object]],
+    n_frames: Optional[int],
+    cell_count: Optional[int],
+) -> Optional[Dict[str, object]]:
+    """Build the RICH current-run context, or ``None`` (fail closed).
+
+    Comparable selection requires the EFFECTIVE backend plus EVERY field in
+    :data:`WORKLOAD_REQUIRED_FIELDS` as a positive integer. ``n_frames`` /
+    ``cell_count`` may be supplied by explicit arguments (they are honestly
+    known from stage totals); the work/geometry measures must come from the
+    workload signature. Anything missing returns ``None`` so every caller
+    falls back to calibrating/live/fallback rather than a fabricated learned
+    ETA — a partial "n_frames + cell_count only" context is NOT comparable.
+    """
+    cur_backend = normalize_backend(backend)
+    if cur_backend is None:
+        return None
+    wl = dict(workload) if isinstance(workload, Mapping) else {}
+    if _safe_int(wl.get("n_frames")) <= 0 and _safe_int(n_frames) > 0:
+        wl["n_frames"] = _safe_int(n_frames)
+    if _safe_int(wl.get("cell_count")) <= 0 and _safe_int(cell_count) > 0:
+        wl["cell_count"] = _safe_int(cell_count)
+    for key in WORKLOAD_REQUIRED_FIELDS:
+        if _safe_int(wl.get(key)) <= 0:
+            return None
+    ctx: Dict[str, object] = {
+        key: _safe_int(wl.get(key)) for key in WORKLOAD_REQUIRED_FIELDS
+    }
+    ctx["backend"] = cur_backend
+    return ctx
+
+
+def _zegrid_record_comparable(rec: dict, ctx: Mapping[str, object]) -> bool:
+    """True iff a ZeGrid record is GENUINELY comparable to the current run.
+
+    Fail-closed dimensions (ALL mandatory, no "when both sides have it"
+    escape hatch):
+
+    * the record declares an explicit effective ``backend`` equal to the run's;
+    * the record carries a rich ``workload`` signature of the current version
+      (old v2 records without one are NEVER silently comparable);
+    * EVERY field in :data:`WORKLOAD_REQUIRED_FIELDS` is present and positive on
+      BOTH sides, and within :data:`WORKLOAD_RATIO_MAX`.
+
+    The last rule is what separates a full-resolution 32-frame GPU run from a
+    tiny 4-frame/canvas synthetic record, and what rejects a v3 record carrying
+    only ``n_frames``/``cell_count``.
+    """
+    rec_backend = normalize_backend(rec.get("backend"))
+    if rec_backend is None or rec_backend != ctx.get("backend"):
+        return False
+    wl = rec.get("workload")
+    if not isinstance(wl, Mapping) or _safe_int(wl.get("v")) != WORKLOAD_SIGNATURE_VERSION:
+        return False
+    for key in WORKLOAD_REQUIRED_FIELDS:
+        rec_val = _safe_int(wl.get(key))
+        cur_val = _safe_int(ctx.get(key))
+        if rec_val <= 0 or cur_val <= 0:
+            return False
+        if not _ratio_comparable(rec_val, cur_val):
+            return False
+    return True
+
+
 def select_zegrid_priors(
     records: Sequence[dict],
     *,
     n_frames: Optional[int] = None,
     cell_count: Optional[int] = None,
     stage_totals: Optional[Mapping[str, int]] = None,
+    backend: Optional[str] = None,
+    workload: Optional[Mapping[str, object]] = None,
 ) -> Tuple[Dict[str, float], int]:
     """Select comparable ZeGrid per-stage priors (median, outlier-resistant).
 
-    Only ``mode == "zegrid"`` v2 records with a positive finite total duration
-    and a ``stage_seconds`` dict contribute. Legacy v1 total records are NEVER
-    mixed into ZeGrid per-stage priors.
+    Comparability FAILS CLOSED (see :func:`_zegrid_record_comparable`): only
+    ``mode == "zegrid"`` rich records (``schema_v >= 3``: explicit ``backend`` +
+    numeric ``workload`` signature) with a positive finite total duration and a
+    ``stage_seconds`` dict contribute, and only when the effective backend and
+    the workload geometry genuinely match the current run. Legacy v1 total
+    records and old v2 records are NEVER mixed into ZeGrid per-stage priors.
+    A missing/unusable current context returns ``({}, 0)`` — the honest
+    calibrating/live/fallback path — never a fabricated learned ETA.
 
-    Scaling precedence (per scalable stage ``setup`` / ``gauge`` /
-    ``per_cell_stack``):
+    Scaling is by WORK RATIO (:data:`ZEGRID_STAGE_WORK_SCALE`): ``setup`` by
+    frames, ``gauge`` by ``input_pixels_total``, ``per_cell_stack`` by measured
+    ``stack_work_px``, ``assembly``/``finalize`` by ``canvas_px``.
+    ``stage_totals`` is accepted for diagnostics but NEVER overrides a work
+    ratio (an equal-input-pixel 16-frame workload must not double the gauge
+    prior). Layout is used verbatim (planner work is not pixel work).
 
-    1. EXACT per-stage total: ``record.stage_totals[stage]`` -> current
-       ``stage_totals[stage]`` when both are valid (>0).
-    2. Fallback (older v2 records missing exact totals): ``setup``/``gauge`` by
-       ``n_frames``, ``per_cell_stack`` by ``cell_count``.
-    3. Otherwise the record's duration is used verbatim.
-
-    Gauge is NEVER scaled by raw/top-level ``n_frames`` when an exact gauge
-    total exists. Returns ``(priors, comparable)`` where ``priors`` maps stable
+    Returns ``(priors, comparable)`` where ``priors`` maps stable
     ``zegrid:<name>`` ids to median seconds and ``comparable`` is the number of
     contributing records.
     """
+    ctx = _zegrid_current_context(
+        backend=backend,
+        workload=workload,
+        n_frames=n_frames,
+        cell_count=cell_count,
+    )
+    if ctx is None:
+        return {}, 0
+
     per_stage: Dict[str, List[float]] = {name: [] for name in ZEGRID_STAGE_NAMES}
     comparable = 0
-    try:
-        cur_n = int(n_frames) if n_frames else 0
-    except (TypeError, ValueError):
-        cur_n = 0
-    try:
-        cur_c = int(cell_count) if cell_count else 0
-    except (TypeError, ValueError):
-        cur_c = 0
-    cur_totals = stage_totals if isinstance(stage_totals, Mapping) else {}
 
     for rec in records:
         if not isinstance(rec, dict):
@@ -421,10 +632,10 @@ def select_zegrid_priors(
             continue
         if not math.isfinite(total) or total <= 0.0:
             continue
-        rec_n = _safe_int(rec.get("n_frames"))
-        rec_c = _safe_int(rec.get("cell_count"))
-        rec_totals = rec.get("stage_totals")
-        rec_totals = rec_totals if isinstance(rec_totals, Mapping) else {}
+        if not _zegrid_record_comparable(rec, ctx):
+            continue
+        rec_workload = rec.get("workload")
+        rec_workload = rec_workload if isinstance(rec_workload, Mapping) else {}
         contributed = False
         for name in ZEGRID_STAGE_NAMES:
             raw = stages.get(name)
@@ -437,16 +648,14 @@ def select_zegrid_priors(
             if not math.isfinite(sec) or sec <= 0.0:
                 continue
             scaled = sec
-            if name in SCALABLE_STAGES:
-                rec_exact = _safe_int(rec_totals.get(name))
-                cur_exact = _safe_int(cur_totals.get(name))
-                if cur_exact > 0 and rec_exact > 0:
-                    # EXACT per-stage total scaling (preferred).
-                    scaled = sec * (cur_exact / float(rec_exact))
-                elif name in ("setup", "gauge") and cur_n > 0 and rec_n > 0:
-                    scaled = sec * (cur_n / float(rec_n))
-                elif name == "per_cell_stack" and cur_c > 0 and rec_c > 0:
-                    scaled = sec * (cur_c / float(rec_c))
+            scale_key = ZEGRID_STAGE_WORK_SCALE.get(name)
+            if scale_key:
+                rec_measure = _safe_int(rec_workload.get(scale_key))
+                cur_measure = _safe_int(ctx.get(scale_key))
+                if rec_measure <= 0 or cur_measure <= 0:
+                    # Cannot scale honestly: never publish an unscaled prior.
+                    continue
+                scaled = sec * (cur_measure / float(rec_measure))
             if math.isfinite(scaled) and scaled > 0.0:
                 per_stage[name].append(scaled)
                 contributed = True
@@ -469,6 +678,8 @@ def select_mode_priors(
     cell_count: Optional[int] = None,
     master_tiles: Optional[int] = None,
     stage_totals: Optional[Mapping[str, int]] = None,
+    backend: Optional[str] = None,
+    workload: Optional[Mapping[str, object]] = None,
 ) -> Tuple[Dict[str, float], int]:
     """Select comparable per-stage priors for ONE mode (legacy|sds|zegrid).
 
@@ -492,6 +703,8 @@ def select_mode_priors(
             n_frames=n_frames,
             cell_count=cell_count,
             stage_totals=stage_totals,
+            backend=backend,
+            workload=workload,
         )
     raise ValueError(f"unknown mode {mode!r}")
 
@@ -706,7 +919,7 @@ def append_mode_history(
     failure the temp file is removed (best-effort) and the existing target is
     left untouched. Returns ``False`` and NEVER raises on any error.
     """
-    p = Path(path) if path is not None else eta_history_path()
+    p = resolve_eta_history_path(path)
     tmp: Optional[Path] = None
     try:
         records = load_eta_history(p)
@@ -818,25 +1031,53 @@ def build_zegrid_history_record(
     stage_totals: Optional[Mapping[str, int]] = None,
     workers: Optional[int] = None,
     backend: Optional[str] = None,
+    workload: Optional[Mapping[str, object]] = None,
+    canvas_px: Optional[int] = None,
+    input_pixels_total: Optional[int] = None,
+    stack_work_px: Optional[int] = None,
 ) -> dict:
-    """Build a sanitized, compact v2 ZeGrid history record.
+    """Build a sanitized, compact v3 ZeGrid history record.
 
-    Only numeric totals/durations and (optionally) the effective backend /
-    worker concurrency are recorded — never raw paths, frame names, or user
-    data.
+    Only numeric totals/durations, the numeric workload signature and
+    (optionally) the effective backend / worker concurrency are recorded — never
+    raw paths, frame names, or user data. ``schema_v`` is 3 (rich signature).
+
+    ``workload`` must carry the unambiguous mandatory measures understood by
+    :data:`WORKLOAD_REQUIRED_FIELDS` (``n_frames``, ``cell_count``,
+    ``input_pixels_total``, ``stack_work_px``, ``canvas_px``). ``stage_totals``
+    is stored for diagnostics only and NEVER overrides work-ratio scaling.
+    ``backend`` is normalized to ``gpu``/``cpu`` when recognizable; a record
+    without a recognizable backend is still written but will NEVER be selected
+    as a prior (fail closed).
     """
+    n = _safe_int(n_frames)
+    cells = _safe_int(cell_count)
+    wl = dict(workload) if isinstance(workload, Mapping) else {}
+    sig = build_workload_signature(
+        n_frames=_safe_int(wl.get("n_frames")) or n,
+        cell_count=_safe_int(wl.get("cell_count")) or cells,
+        input_pixels_total=(
+            _safe_int(wl.get("input_pixels_total")) or input_pixels_total
+        ),
+        stack_work_px=_safe_int(wl.get("stack_work_px")) or stack_work_px,
+        canvas_px=_safe_int(wl.get("canvas_px")) or canvas_px,
+    )
     rec: dict = {
-        "schema_v": 2,
+        "schema_v": 3,
         "mode": "zegrid",
         "ts_utc": _utcnow_iso(),
         "total_duration_s": round(float(total_duration_s), 3),
-        "n_frames": int(n_frames),
-        "cell_count": int(cell_count),
+        "n_frames": n,
+        "cell_count": cells,
         "stage_seconds": {
             name: round(float(stage_seconds.get(name, 0.0)), 3)
             for name in ZEGRID_STAGE_NAMES
         },
+        "workload": sig,
     }
+    normalized_backend = normalize_backend(backend)
+    if normalized_backend is not None:
+        rec["backend"] = normalized_backend
     if stage_totals:
         rec["stage_totals"] = {
             name: int(stage_totals[name])
@@ -848,8 +1089,6 @@ def build_zegrid_history_record(
             rec["workers"] = int(workers)
         except (TypeError, ValueError):
             pass
-    if backend:
-        rec["backend"] = str(backend)
     return rec
 
 
@@ -858,6 +1097,146 @@ def _safe_int(value) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Effective-context tracker (backend + rich workload -> prior selection)
+# ---------------------------------------------------------------------------
+
+class EtaContextTracker:
+    """Track the run's EFFECTIVE backend/workload and own ZeGrid prior selection.
+
+    ZM-ETA-INTEGRITY-R32 rework-1: the effective backend can change DOWNSTREAM of
+    the first context publication — a pre-execution bundle fallback
+    (``_final.gpu_used``) or the final actual-backend correction after execution
+    (``actually_used_gpu``). A backend change is a HARD invalidation:
+
+    1. every prior is CLEARED immediately (never keep a GPU prior after a CPU
+       fallback),
+    2. priors are reselected for the new backend (which may legitimately be
+       none), and
+    3. the new context is republished.
+
+    Workload changes (frames/cells/canvas/input pixels/stack work) reselect and
+    republish only when a value actually changes (no log noise). Pure/stdlib;
+    the estimator and publish callback are injected so this is unit-testable
+    without the engine.
+    """
+
+    def __init__(self, estimator, *, records_loader=None, publish=None) -> None:
+        self._estimator = estimator
+        self._records_loader = records_loader or load_eta_history
+        self._publish = publish
+        self._records: Optional[List[dict]] = None
+        self._backend: Optional[str] = None
+        self._workload: Dict[str, int] = {}
+
+    # -- facts -------------------------------------------------------------
+
+    def backend(self) -> Optional[str]:
+        return self._backend
+
+    def workload(self) -> Dict[str, int]:
+        """Current sanitized workload signature (missing measures omitted)."""
+        return build_workload_signature(
+            n_frames=self._workload.get("n_frames"),
+            cell_count=self._workload.get("cell_count"),
+            input_pixels_total=self._workload.get("input_pixels_total"),
+            stack_work_px=self._workload.get("stack_work_px"),
+            canvas_px=self._workload.get("canvas_px"),
+        )
+
+    def snapshot(self) -> Dict[str, object]:
+        """Publishable context (backend + rich workload)."""
+        ctx: Dict[str, object] = {"backend": self._backend}
+        for key, val in self.workload().items():
+            if key != "v":
+                ctx[key] = val
+        return ctx
+
+    # -- facts that invalidate / reselect ---------------------------------
+
+    def note_backend(self, backend) -> bool:
+        """Record the EFFECTIVE backend; hard-invalidate priors on change."""
+        normalized = normalize_backend(backend)
+        if normalized == self._backend:
+            return False
+        self._backend = normalized
+        # Clear FIRST: a backend transition must never leave the previous
+        # backend's priors in place, even if the following reselect fails.
+        try:
+            self._estimator.set_priors({}, comparable_histories=0)
+        except Exception:
+            pass
+        self.reselect()
+        self._publish_safe()
+        return True
+
+    def note_workload(
+        self,
+        *,
+        n_frames: Optional[int] = None,
+        cell_count: Optional[int] = None,
+        input_pixels_total: Optional[int] = None,
+        stack_work_px: Optional[int] = None,
+        canvas_px: Optional[int] = None,
+    ) -> bool:
+        """Record workload facts as they become known; reselect on change."""
+        changed = False
+        for key, value in (
+            ("n_frames", n_frames),
+            ("cell_count", cell_count),
+            ("input_pixels_total", input_pixels_total),
+            ("stack_work_px", stack_work_px),
+            ("canvas_px", canvas_px),
+        ):
+            ival = _safe_int(value)
+            if ival > 0 and self._workload.get(key) != ival:
+                self._workload[key] = ival
+                changed = True
+        if not changed:
+            return False
+        self.reselect()
+        self._publish_safe()
+        return True
+
+    # -- selection ---------------------------------------------------------
+
+    def reselect(self) -> Tuple[Dict[str, float], int]:
+        """Reselect priors for the CURRENT context (fail closed)."""
+        if self._estimator is None:
+            return {}, 0
+        if self._records is None:
+            try:
+                self._records = list(self._records_loader() or [])
+            except Exception:
+                self._records = []
+        priors, comparable = select_zegrid_priors(
+            self._records or [],
+            backend=self._backend,
+            workload=self.workload(),
+        )
+        try:
+            self._estimator.set_priors(priors, comparable_histories=comparable)
+        except Exception:
+            pass
+        try:
+            self._estimator.set_context(
+                n_frames=self._workload.get("n_frames"),
+                cell_count=self._workload.get("cell_count"),
+                backend=self._backend,
+            )
+        except Exception:
+            pass
+        return priors, comparable
+
+    def _publish_safe(self) -> None:
+        if self._publish is None:
+            return
+        try:
+            self._publish(self.snapshot())
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1638,17 @@ class HybridEtaEstimator:
             active_remaining = 0.0
         active_remaining = float(active_remaining)
 
-        active_smoothed = self._smooth_active(active_remaining)
+        # ZM-ETA-INTEGRITY-R32: a stage that reports its OWN completion has zero
+        # remaining work. Damping that to a phantom reserve (the ordinary
+        # downward-correction behaviour) is exactly how the run log kept ~102 s
+        # after ``per_cell_stack`` 4/4. Completion bypasses smoothing; the
+        # future floor still covers the genuinely remaining stages.
+        if total_known and st.last_current >= st.total:
+            active_remaining = 0.0
+            self._last_raw_active = 0.0
+            active_smoothed = 0.0
+        else:
+            active_smoothed = self._smooth_active(active_remaining)
         self._active_smoothed = active_smoothed
         self._future_floor = future_floor
         self._last_active_basis = active_basis

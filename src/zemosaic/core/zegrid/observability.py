@@ -129,6 +129,46 @@ class PhaseEta:
         return remaining / rate
 
 
+class HybridLogEta:
+    """Run-log global ETA driven by the SHARED hybrid estimator authority.
+
+    ZM-ETA-INTEGRITY-R32: the engine run log used to compute its own global ETA
+    from :class:`GlobalEta`, which (a) counted the ACTIVE phase as future work
+    and (b) invented a mean-of-completed reserve for phases with no evidence —
+    producing ``global_eta=1m42s`` while only seconds of assembly/finalize
+    remained. This bridge feeds the SAME :class:`~zemosaic.eta_service.HybridEtaEstimator`
+    (same plan, same priors, same phase semantics) that the GUI uses, so the run
+    log cannot contradict the structured ETA.
+
+    It is duck-typed (only ``on_stage`` / ``tick`` are required) so this module
+    stays stdlib-only and import-safe, and every call is best-effort: an
+    observability failure can never change or abort science.
+    """
+
+    def __init__(self, estimator) -> None:
+        self._estimator = estimator
+
+    def on_stage(self, stage_id: str, current: int, total: int):
+        """Forward one stable stage event (diagnostic ids are ignored by plan)."""
+        try:
+            return self._estimator.on_stage(stage_id, current, total)
+        except Exception:
+            return None
+
+    def __call__(self, _phase_eta_s: Optional[float] = None) -> Optional[float]:
+        """Current global remaining seconds (``PhaseReporter.global_eta`` form).
+
+        The reporter passes the PHASE-local ETA; it is deliberately ignored —
+        the estimator already owns the full stage state, and mixing the two
+        would recreate the double-counting defect.
+        """
+        try:
+            result = self._estimator.tick()
+            return result.remaining_seconds
+        except Exception:
+            return None
+
+
 # ---------------------------------------------------------------------------
 # Global ETA
 # ---------------------------------------------------------------------------
@@ -270,6 +310,11 @@ class PhaseReporter:
         self._last_report = (now, done)
         pct = 100.0 * done / total
         eta = self._eta.eta_seconds(total)
+        # ZM-ETA-INTEGRITY-R32: feed the stage event BEFORE asking for the global
+        # ETA so a terminal 100% of the active phase is visible to the shared
+        # estimator immediately (no one-event lag that would keep the stale
+        # phase reserve on the final progress line).
+        self._set_stage(done, total)
         g_eta = None
         if self.global_eta is not None:
             try:
@@ -282,7 +327,6 @@ class PhaseReporter:
             f"phase PROGRESS: {self.name} {done}/{total} "
             f"({pct:.1f}%){item} eta={format_eta(eta)}{g}"
         )
-        self._set_stage(done, total)
 
     # -- internals ----------------------------------------------------------
 

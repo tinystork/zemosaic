@@ -249,13 +249,33 @@ def test_wrappers_backward_compatible(tmp_path):
             "per_cell_stack": 150.0, "assembly": 20.0, "finalize": 15.0,
         },
         stage_totals={"setup": 653, "gauge": 1305, "per_cell_stack": 170, "finalize": 1},
+        backend="cpu",
+        workload=zeta.build_workload_signature(
+            n_frames=653,
+            cell_count=170,
+            input_pixels_total=653 * 1_000_000,
+            stack_work_px=170 * 1_000_000,
+            canvas_px=4_000_000,
+        ),
     )
     assert zeta.append_zegrid_history(zrec, path=p) is True
     loaded = zeta.load_eta_history(p)
     assert len(loaded) == 1
     assert loaded[0]["mode"] == "zegrid"
-    # select_zegrid_priors still returns stable zegrid:<name> ids.
-    priors, comparable = zeta.select_zegrid_priors(loaded, n_frames=653, cell_count=170)
+    # select_zegrid_priors still returns stable zegrid:<name> ids (rich context).
+    priors, comparable = zeta.select_zegrid_priors(
+        loaded,
+        n_frames=653,
+        cell_count=170,
+        backend="cpu",
+        workload=zeta.build_workload_signature(
+            n_frames=653,
+            cell_count=170,
+            input_pixels_total=653 * 1_000_000,
+            stack_work_px=170 * 1_000_000,
+            canvas_px=4_000_000,
+        ),
+    )
     assert comparable == 1
     assert "zegrid:setup" in priors
     assert "zegrid:gauge" in priors

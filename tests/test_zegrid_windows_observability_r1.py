@@ -122,6 +122,8 @@ def _qt_feed_harness(clock: _Clock):
     obj._zegrid_n_frames = None
     obj._zegrid_cell_count = None
     obj._zegrid_stage_totals = {}
+    obj._zegrid_backend = None
+    obj._zegrid_workload = {}
     obj._zegrid_eta_records = []
     obj._zegrid_eta = zeta.HybridEtaEstimator(zprogress.ZEGRID_PLAN, clock=clock)
     obj._zegrid_eta.set_priors(
@@ -197,6 +199,52 @@ def test_qt_feed_replay_keeps_cells_and_sensible_eta(monkeypatch):
     # correct plan leaves only assembly+finalize (seconds), never hours.
     assert last["remaining_seconds"] < 120.0
     assert obj._progress_agg.global_percent < 100.0
+
+
+def test_qt_adopts_engine_eta_context_for_fail_closed_selection():
+    """ZM-ETA-INTEGRITY-R32: the GUI only selects priors for a KNOWN backend.
+
+    The engine publishes the EFFECTIVE backend + workload geometry (structured
+    kwargs). A comparable GPU record must be accepted; a different backend must
+    fail closed (no priors), never a CPU/GPU mix.
+    """
+    clock = _Clock()
+    obj, _feed = _qt_feed_harness(clock)
+    record = zeta.build_zegrid_history_record(
+        total_duration_s=400.0,
+        n_frames=32,
+        cell_count=4,
+        stage_seconds={
+            "setup": 0.6, "layout": 0.3, "gauge": 100.0,
+            "per_cell_stack": 292.0, "assembly": 1.3, "finalize": 2.4,
+        },
+        stage_totals={"setup": 32, "gauge": 63, "per_cell_stack": 4, "finalize": 1},
+        backend="gpu",
+        workload=zeta.build_workload_signature(
+            n_frames=32,
+            cell_count=4,
+            input_pixels_total=32 * 100_000,
+            stack_work_px=4 * 12_000_000 * 30,
+            canvas_px=4_000_000,
+        ),
+    )
+    obj._zegrid_eta_records = [record]
+    ctx = {
+        "backend": "gpu",
+        "n_frames": 32,
+        "cell_count": 4,
+        "input_pixels_total": 32 * 100_000,
+        "stack_work_px": 4 * 12_000_000 * 30,
+        "canvas_px": 4_000_000,
+    }
+    obj._note_zegrid_eta_context(ctx)
+    priors = obj._zegrid_eta.diagnostics()["priors"]
+    assert priors.get("zegrid:per_cell_stack") == pytest.approx(292.0)
+    assert priors.get("zegrid:assembly") == pytest.approx(1.3)
+
+    # Different effective backend -> FAIL CLOSED (priors cleared).
+    obj._note_zegrid_eta_context(dict(ctx, backend="cpu"))
+    assert obj._zegrid_eta.diagnostics()["priors"] == {}
 
 
 # ---------------------------------------------------------------------------

@@ -55,7 +55,27 @@ def test_routine_end_to_end_full_pipeline(tmp_path, routine_corpus):
     )
 
     out = tmp_path / "out"
+    # ZM-ETA-INTEGRITY-R32: a REAL direct ``run_zegrid_mode`` must write its ETA
+    # history to the pytest temp seam, never to the user's HOME file.
+    from zemosaic import eta_service as zeta
+
+    hist_path = zeta.eta_history_path()
+    home_file = Path.home() / zeta.DEFAULT_ETA_HISTORY_NAME
+    home_before = home_file.stat().st_mtime_ns if home_file.exists() else None
+    assert hist_path != home_file
     zegrid.run_zegrid_mode(str(input_dir), str(out))
+    assert hist_path.exists(), "direct run wrote no ETA history under the seam"
+    records = zeta.load_eta_history(hist_path)
+    zegrid_recs = [r for r in records if r.get("mode") == "zegrid"]
+    assert zegrid_recs, "no ZeGrid history record written"
+    latest = zegrid_recs[-1]
+    assert int(latest.get("schema_v", 0)) >= 3
+    assert latest.get("backend") in ("gpu", "cpu")
+    assert isinstance(latest.get("workload"), dict)
+    assert int(latest["workload"].get("n_frames", 0)) == N_FRAMES
+    # The real HOME file is untouched (it may not exist at all).
+    home_after = home_file.stat().st_mtime_ns if home_file.exists() else None
+    assert home_after == home_before
 
     sci_path = out / "mosaic_grid.fits"
     cov_path = out / "mosaic_grid_coverage.fits"

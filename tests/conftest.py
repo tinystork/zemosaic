@@ -7,6 +7,7 @@ not each re-read the manifest + rebuild the canvas per file. See TESTING.md.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -17,9 +18,37 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from zemosaic.core.zegrid import geometry as zg  # noqa: E402
+from zemosaic import eta_service as zeta  # noqa: E402
 
 M106_LIGHTS = Path("/home/tristan/M106/lights")
 M16_LIGHTS = Path("/home/tristan/M16/quick")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_eta_history(tmp_path_factory):
+    """Force EVERY test's ETA history into pytest temp storage.
+
+    ZM-ETA-INTEGRITY-R32: the real defect was synthetic/direct engine tests
+    appending to the user's ``~/.zemosaic_eta_history.json`` (95 of 120 ZeGrid
+    records were 4-frame CPU junk). This session-scoped autouse guard sets the
+    single documented override seam (``ZEMOSAIC_ETA_HISTORY_PATH``) BEFORE any
+    test runs, so both the eta service and the legacy worker history code write
+    to a per-session temp file. It never mutates ``HOME`` and never disables
+    history (production paths are untouched when pytest is not running).
+
+    Intentional history unit tests can still pass an EXPLICIT temp path to
+    ``load_eta_history`` / ``append_*``; the explicit argument always wins.
+    """
+    target = tmp_path_factory.mktemp("eta_history") / ".zemosaic_eta_history.json"
+    previous = os.environ.get(zeta.ETA_HISTORY_ENV_VAR)
+    os.environ[zeta.ETA_HISTORY_ENV_VAR] = str(target)
+    try:
+        yield target
+    finally:
+        if previous is None:
+            os.environ.pop(zeta.ETA_HISTORY_ENV_VAR, None)
+        else:
+            os.environ[zeta.ETA_HISTORY_ENV_VAR] = previous
 
 
 @pytest.fixture(autouse=True)

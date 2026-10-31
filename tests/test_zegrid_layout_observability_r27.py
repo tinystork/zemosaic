@@ -321,10 +321,15 @@ def test_subordinate_timings_present_nonnegative_excluded_from_total():
 
 
 def test_layout_substeps_are_not_in_phase_order():
-    # _PHASE_ORDER is unchanged (frozen); sub-steps are subordinate, never phases.
+    # ZM-ETA-INTEGRITY-R32: _PHASE_ORDER mirrors progress_contract.ZEGRID_PLAN —
+    # the diagnostic ``cache_build`` frame counter is EXCLUDED (fused into
+    # per_cell_stack, never separate future work) and the real ``finalize``
+    # phase is INCLUDED. Sub-steps remain subordinate, never phases.
     assert zz._PHASE_ORDER == (
-        "setup", "layout", "gauge", "cache_build", "per_cell_stack", "assembly"
+        "setup", "layout", "gauge", "per_cell_stack", "assembly", "finalize"
     )
+    assert "cache_build" not in zz._PHASE_ORDER
+    assert "finalize" in zz._PHASE_ORDER
     assert "layout" in zz._PHASE_ORDER
     for sid in (
         zobs.LAYOUT_SUBSTEP_FOOTPRINTS,

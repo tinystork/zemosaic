@@ -2538,10 +2538,23 @@ _ETA_HISTORY_MAX_SAMPLES = 120
 
 
 def _eta_history_path() -> Path:
+    """Resolve the ETA history path through the ONE authoritative seam.
+
+    ZM-ETA-INTEGRITY-R32: the legacy worker history code must not own a second
+    path policy. It delegates to :func:`zemosaic.eta_service.eta_history_path`,
+    which applies the documented precedence (``ZEMOSAIC_ETA_HISTORY_PATH`` env
+    override > ``~/.zemosaic_eta_history.json``). That single seam is what lets
+    the pytest isolation guard redirect this legacy writer too.
+    """
     try:
-        return Path.home() / ".zemosaic_eta_history.json"
+        from . import eta_service as _zeta
+
+        return _zeta.eta_history_path()
     except Exception:
-        return Path(".zemosaic_eta_history.json")
+        try:
+            return Path.home() / ".zemosaic_eta_history.json"
+        except Exception:
+            return Path(".zemosaic_eta_history.json")
 
 
 def _load_eta_history_records(path: Path | None = None) -> list[dict[str, Any]]:

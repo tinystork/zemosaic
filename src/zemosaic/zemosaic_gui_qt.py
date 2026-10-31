@@ -1389,6 +1389,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._zegrid_stage_totals: Dict[str, int] = {}
         self._zegrid_n_frames: int | None = None
         self._zegrid_cell_count: int | None = None
+        # ZM-ETA-INTEGRITY-R32: EFFECTIVE backend + sanitized workload geometry.
+        # Learned from the engine's structured ETA-context message (the only
+        # component that knows the effective backend after GPU fallback/frozen
+        # plans). Unknown -> selection fails closed (calibrating/live), never a
+        # CPU/GPU mixed or tiny-workload prior.
+        self._zegrid_backend: str | None = None
+        self._zegrid_workload: Dict[str, int] = {}
         # ZM-ETA-ALLMODES-R31: legacy/SDS hybrid ETA authorities (same pure
         # HybridEtaEstimator reused per mode, distinct from the R29 progress
         # aggregator and from the ZeGrid authority). Created/reset lazily per
@@ -8002,6 +8009,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._zegrid_stage_totals = {}
         self._zegrid_n_frames = None
         self._zegrid_cell_count = None
+        self._zegrid_backend = None
+        self._zegrid_workload = {}
         # ZM-ETA-ALLMODES-R31 F: reset the legacy/SDS hybrid ETA authorities,
         # records/totals/write-once flags, and Roman label floors so no stale
         # estimator, ETA, or write-once state leaks run-to-run.
@@ -8241,6 +8250,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _on_worker_log_message(
         self, level: str, message_key_or_raw: Any, params: Dict[str, Any]
     ) -> None:
+        # ZM-ETA-INTEGRITY-R32: adopt the engine's effective ZeGrid ETA context
+        # (backend + workload geometry) BEFORE the generic log rendering.
+        if isinstance(params, dict):
+            _eta_ctx = params.get("zegrid_eta_context")
+            if isinstance(_eta_ctx, dict):
+                self._note_zegrid_eta_context(_eta_ctx)
         level_str = str(level) if isinstance(level, str) else str(level)
         if isinstance(message_key_or_raw, str):
             normalized_key = message_key_or_raw.strip()
@@ -8431,10 +8446,74 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 n_frames=self._zegrid_n_frames,
                 cell_count=self._zegrid_cell_count,
                 stage_totals=self._zegrid_stage_totals or None,
+                backend=self._zegrid_backend,
+                workload=zeta.build_workload_signature(
+                    n_frames=self._zegrid_n_frames,
+                    cell_count=self._zegrid_cell_count,
+                    input_pixels_total=self._zegrid_workload.get(
+                        "input_pixels_total"
+                    ),
+                    stack_work_px=self._zegrid_workload.get("stack_work_px"),
+                    canvas_px=self._zegrid_workload.get("canvas_px"),
+                ),
             )
             est.set_priors(priors, comparable_histories=comparable)
         except Exception:
             pass
+
+    def _note_zegrid_eta_context(self, payload: dict) -> None:
+        """Adopt the engine's effective backend/workload ETA context.
+
+        ZM-ETA-INTEGRITY-R32: the GUI runs the engine out-of-process, so it
+        cannot otherwise know the EFFECTIVE backend (a requested GPU may be
+        frozen off, unavailable or fall back) or the canvas geometry. The engine
+        publishes one plain log message with structured kwargs; this is the
+        bounded bridge. Anything missing stays unknown and selection fails
+        closed — a mode/workload guess is never made here.
+        """
+        if not isinstance(payload, dict):
+            return
+        changed = False
+        if "backend" in payload:
+            # An EXPLICIT backend fact always wins: an unrecognized/unknown
+            # value must clear the previous backend (and its priors) rather
+            # than silently retaining a GPU prior after a CPU fallback.
+            backend = zeta.normalize_backend(payload.get("backend"))
+            if backend != self._zegrid_backend:
+                self._zegrid_backend = backend
+                changed = True
+                if self._zegrid_eta is not None:
+                    # HARD invalidation before any reselect.
+                    try:
+                        self._zegrid_eta.set_priors({}, comparable_histories=0)
+                    except Exception:
+                        pass
+        for key in (
+            "n_frames",
+            "cell_count",
+            "input_pixels_total",
+            "stack_work_px",
+            "canvas_px",
+        ):
+            try:
+                val = int(payload.get(key) or 0)
+            except (TypeError, ValueError):
+                val = 0
+            if val > 0 and self._zegrid_workload.get(key) != val:
+                self._zegrid_workload[key] = val
+                changed = True
+        if self._zegrid_n_frames is None:
+            nf = self._zegrid_workload.get("n_frames")
+            if nf:
+                self._zegrid_n_frames = int(nf)
+                changed = True
+        if self._zegrid_cell_count is None:
+            cc = self._zegrid_workload.get("cell_count")
+            if cc:
+                self._zegrid_cell_count = int(cc)
+                changed = True
+        if changed:
+            self._reselect_zegrid_priors()
 
     def _observe_zegrid_stage_total(self, normalized: str, total: int) -> None:
         """Record a newly learned exact stage total; reselect priors on change.
@@ -8475,6 +8554,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             est.set_context(
                 n_frames=self._zegrid_n_frames,
                 cell_count=self._zegrid_cell_count,
+                backend=self._zegrid_backend,
             )
             eta = est.on_stage(normalized, int(current), int(total))
         except Exception:
