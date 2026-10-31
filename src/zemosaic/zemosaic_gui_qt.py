@@ -65,6 +65,7 @@ import shutil
 import subprocess
 import signal
 import sys
+import tempfile
 import sysconfig
 import multiprocessing
 import queue
@@ -84,6 +85,48 @@ from .zegrid_halo import (
     resolve_zegrid_halo_px,
 )
 from .core.zegrid import scheduler as zsched
+
+# ZM-ZEGRID-M6-QT-STOP-RESUME: spawn-safe cooperative stop endpoint plus the
+# read-only resume discovery/inspection used to OFFER (never to bless) a
+# durable candidate. The engine remains the authority for selection, identity,
+# state, compatibility and locking.
+try:  # pragma: no cover - import guard keeps a partial install usable
+    from .core.zegrid import run_registry as zrunreg
+    from .core.zegrid import run_resume as zresume
+    from .core.zegrid import run_store as zrunstore
+    from .core.zegrid import run_publication as zpublication
+except Exception:  # pragma: no cover
+    zrunreg = None
+    zresume = None
+    zrunstore = None
+    zpublication = None
+
+# ZM-ZEGRID-M6-QT-POLICY: the strict run-policy validator is the single
+# authority for the six declared keys. Import it directly (not through the
+# mutable ``zemosaic_config`` module attribute) so GUI tests that fake the
+# config module still exercise the real validator.
+try:  # pragma: no cover - import guard mirrors the optional config import
+    from .zemosaic_config import ZEGRID_RUN_POLICY_KEYS as _ZEGRID_RUN_POLICY_KEYS
+    from .zemosaic_config import validate_zegrid_run_policy as _validate_zegrid_run_policy
+except Exception:  # pragma: no cover - defensive
+    _validate_zegrid_run_policy = None
+    _ZEGRID_RUN_POLICY_KEYS = (
+        "zegrid_resource_recovery_enabled",
+        "zegrid_resource_recovery_deadline_s",
+        "zegrid_durable_store_budget_bytes",
+        "zegrid_cell_gauge_mode",
+        "zegrid_layout",
+        "zegrid_sip_mode",
+    )
+
+_ZEGRID_POLICY_VALID_DEFAULTS = {
+    "zegrid_resource_recovery_enabled": False,
+    "zegrid_resource_recovery_deadline_s": None,
+    "zegrid_durable_store_budget_bytes": None,
+    "zegrid_cell_gauge_mode": None,
+    "zegrid_layout": None,
+    "zegrid_sip_mode": "keep",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +178,7 @@ try:
         QGridLayout,
         QGroupBox,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QMainWindow,
@@ -549,6 +593,17 @@ class ZeMosaicQtWorker(QObject):
         self._sds_stage_total = 0
         self._worker_output_dir: str | None = None
         self._process_done_seen = False
+        # ZM-ZEGRID-M6-QT-STOP-RESUME: cooperative stop endpoint shared with the
+        # spawned worker (same mp context as its queue/process). It is created
+        # before ``Process.start`` so a stop request during a pending spawn is
+        # still delivered to the worker.
+        self._stop_channel: Any | None = None
+        self._stop_requested_at: float | None = None
+        # REWORK-2: the LAST observed cooperative snapshot, retained across the
+        # fast worker-exit/listener-finalisation race so the GUI never loses an
+        # acknowledgement that arrived just before PROCESS_DONE.
+        self._last_stop_snapshot: dict | None = None
+        self._active_step = "idle"
 
     # ------------------------------------------------------------------
     # Lifecycle management
@@ -597,6 +652,21 @@ class ZeMosaicQtWorker(QObject):
                     mp_ctx = multiprocessing
 
             queue_obj = mp_ctx.Queue()
+            # ZM-ZEGRID-M6-QT-STOP-RESUME: the cooperative stop endpoint MUST be
+            # created with the SAME spawn context as the queue/process; a
+            # thread-local CooperativeStopChannel cannot cross this boundary.
+            stop_channel = None
+            try:
+                stop_channel = zrunreg.SpawnStopChannel.create(mp_ctx)
+            except Exception:
+                stop_channel = None
+            self._stop_channel = stop_channel
+            self._stop_requested_at = None
+            effective_kwargs = dict(worker_kwargs)
+            if stop_channel is not None:
+                effective_kwargs["zegrid_stop_channel"] = stop_channel
+            else:  # never leave a stale channel/kwarg behind
+                effective_kwargs.pop("zegrid_stop_channel", None)
             # ZM-ZEGRID-R16: NON-DAEMON worker so the ZeGrid engine may spawn a
             # real PROCESS pool (a daemonic process may not create children).
             # "Dies with the GUI" is restored by a parent watchdog inside the
@@ -604,7 +674,7 @@ class ZeMosaicQtWorker(QObject):
             process = mp_ctx.Process(
                 target=run_hierarchical_mosaic_process,
                 args=(queue_obj, *worker_args),
-                kwargs=worker_kwargs,
+                kwargs=effective_kwargs,
                 daemon=False,
                 name="ZeMosaicWorkerProcessQt",
             )
@@ -620,8 +690,55 @@ class ZeMosaicQtWorker(QObject):
                     queue_obj.close()
                 except Exception:
                     pass
+            self._stop_channel = None
+            self._stop_requested_at = None
             raise RuntimeError(str(exc)) from exc
         return queue_obj, process
+
+    # ------------------------------------------------------------------
+    # Cooperative stop-and-save (ZM-ZEGRID-M6-QT-STOP-RESUME)
+    # ------------------------------------------------------------------
+    def request_cooperative_stop(self, reason: str = "stop and save requested") -> str:
+        """Ask the worker to stop at its next SAFE boundary. Never terminates.
+
+        Returns one of ``requested`` (first request), ``already_requested`` or
+        ``unavailable`` (no channel / not running). A request is NOT a save: the
+        caller must wait for the engine's acknowledgement.
+        """
+        channel = self._stop_channel
+        if channel is None or not self.is_running():
+            return "unavailable"
+        try:
+            first = bool(channel.request(str(reason)))
+        except Exception:
+            return "unavailable"
+        if first:
+            self._stop_requested_at = time.monotonic()
+        return "requested" if first else "already_requested"
+
+    def cooperative_stop_snapshot(self) -> dict | None:
+        channel = self._stop_channel
+        if channel is not None:
+            try:
+                snap = channel.snapshot()
+            except Exception:
+                snap = None
+            if snap is not None:
+                self._last_stop_snapshot = dict(snap)
+                return snap
+        # Channel already released (fast exit): return the retained snapshot.
+        return None if self._last_stop_snapshot is None else dict(self._last_stop_snapshot)
+
+    def wait_for_exit(self, timeout: float) -> bool:
+        """Wait for the worker process to exit. Never terminates it."""
+        proc = self._process
+        if proc is None:
+            return True
+        try:
+            proc.join(timeout=max(0.0, float(timeout)))
+            return not proc.is_alive()
+        except Exception:
+            return False
 
     def finalize_spawn(
         self,
@@ -637,6 +754,8 @@ class ZeMosaicQtWorker(QObject):
         self._cancelled = False
         self._sds_stage_total = 0
         self._process_done_seen = False
+        # A new spawn starts with no retained acknowledgement.
+        self._last_stop_snapshot = None
 
         listener_thread = QThread()
         listener = _WorkerQueueListener(
@@ -1067,7 +1186,17 @@ class ZeMosaicQtWorker(QObject):
                     self._process.join(timeout=0.5)
             except Exception:
                 pass
+        # Capture the final cooperative snapshot BEFORE the channel is dropped.
+        if self._stop_channel is not None:
+            try:
+                snap = self._stop_channel.snapshot()
+            except Exception:
+                snap = None
+            if snap is not None:
+                self._last_stop_snapshot = dict(snap)
         self._process = None
+        self._stop_channel = None
+        self._stop_requested_at = None
         if self._queue is not None:
             try:
                 self._queue.close()
@@ -1094,6 +1223,16 @@ class ZeMosaicQtWorker(QObject):
 
 class ZeMosaicQtMainWindow(QMainWindow):
     """Initial Qt main window skeleton with placeholder panels."""
+
+    # ZM-UNIFIED-STOP-SAVE-CAPABILITY: ONE frozen stop capability per launch.
+    # ZEGRID_DURABLE is the only capability whose run owns a durable store, a
+    # cooperative stop channel and a resumable acknowledgement. Everything else
+    # (Classic/SDS/existing-master, ZeGrid legacy/observe, ZeGrid active with
+    # checkpoint saving OFF) keeps the historical graceful SIGTERM route and
+    # never reads/creates the durable store, offers a resume prompt or claims
+    # that the run was saved/resumable.
+    STOP_CAPABILITY_ZEGRID_DURABLE = "zegrid_durable"
+    STOP_CAPABILITY_LEGACY_GRACEFUL = "legacy_graceful"
 
     def __init__(self) -> None:
         super().__init__()
@@ -1175,6 +1314,25 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._worker_start_result: tuple[bool, str | None] | None = None
         self._closing: bool = False
         self._worker_start_pending: bool = False
+        # ZM-ZEGRID-M6-QT-STOP-RESUME: the frozen mode of the run that is
+        # starting/active, and the honest state of a cooperative stop request.
+        self._pending_run_is_zegrid: bool = False
+        self._active_run_is_zegrid: bool = False
+        # ZM-UNIFIED-STOP-SAVE-CAPABILITY (A3): the capability is resolved ONCE
+        # after validation and frozen with the run. ``None`` means "not
+        # resolved yet"; routing then falls back to the historical flag so
+        # manually constructed windows/tests keep their meaning.
+        self._pending_stop_capability: str | None = None
+        self._active_stop_capability: str | None = None
+        self._active_zegrid_store_root: str | None = None
+        self._pending_zegrid_resume: Dict[str, Any] | None = None
+        self._save_stop_state: str = "idle"
+        self._save_stop_ack_state: str | None = None
+        self._save_stop_when_spawned: bool = False
+        self._close_after_safe_stop: bool = False
+        self._save_stop_timer = QTimer(self)
+        self._save_stop_timer.setInterval(150)
+        self._save_stop_timer.timeout.connect(self._poll_zegrid_save_stop)  # type: ignore[arg-type]
 
         self._stage_aliases = {
             "phase1_scan": "phase1",
@@ -1615,6 +1773,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _populate_advanced_tab(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._create_zegrid_scheduler_group())
+        layout.addWidget(self._create_zegrid_policy_group())
         layout.addWidget(self._create_quality_group())
         layout.addWidget(self._create_stacking_group())
         layout.addWidget(self._create_aesthetic_output_group())
@@ -1876,6 +2035,357 @@ class ZeMosaicQtMainWindow(QMainWindow):
         return group
 
     # ------------------------------------------------------------------
+    # ZeGrid run policy (ZM-ZEGRID-M6-QT-POLICY)
+    # ------------------------------------------------------------------
+    _ZEGRID_GAUGE_OPTIONS = (
+        (None, "qt_zegrid_gauge_opt_default", "Engine default (auto today)"),
+        ("auto", "qt_zegrid_gauge_opt_auto", "Auto (explicit)"),
+        ("global", "qt_zegrid_gauge_opt_global", "Global (one gauge)"),
+        ("per_cell", "qt_zegrid_gauge_opt_per_cell", "Per cell"),
+    )
+    _ZEGRID_SIP_OPTIONS = (
+        ("keep", "qt_zegrid_sip_opt_keep", "Keep SIP (default)"),
+        ("strip", "qt_zegrid_sip_opt_strip", "Strip SIP (legacy TAN)"),
+    )
+
+    def _create_zegrid_policy_group(self) -> QGroupBox:
+        """Editable Advanced controls for the six ZeGrid run-policy keys.
+
+        Every widget value is converted to its exact typed value; an invalid
+        persisted value is kept visible (raw text / empty combo + warning) and
+        blocks a ZeGrid start, never silently replaced by a default. All
+        controls are disabled outside an effective ZeGrid mode or while a run
+        is active, without erasing their persisted values.
+        """
+        group = QGroupBox(
+            self._tr("qt_group_zegrid_policy", "ZeGrid run policy"), self
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        self._zegrid_policy_invalid_values = {}
+        # F2: a persisted value keeps its raw type/value until the user edits
+        # the field. ``None`` and numeric strings must not be "repaired" by
+        # merely loading/collecting/saving/building an invocation.
+        self._zegrid_policy_raw_values = {}
+        self._zegrid_policy_edited_keys = set()
+
+        recovery = QCheckBox(
+            self._tr(
+                "qt_field_zegrid_recovery_label",
+                "Wait for resources during the run",
+            )
+        )
+        recovery.setToolTip(
+            self._tr(
+                "qt_field_zegrid_recovery_tip",
+                "When enabled, ZeGrid waits for memory/disk pressure to ease "
+                "during the SAME run instead of failing immediately. This is "
+                "resource recovery, NOT restart resume: it never resumes an "
+                "interrupted run after the application restarts.",
+            )
+        )
+        layout.addRow(recovery)
+        self._zegrid_recovery_checkbox = recovery
+
+        deadline_label = QLabel(
+            self._tr(
+                "qt_field_zegrid_recovery_deadline_label",
+                "Recovery deadline (seconds)",
+            )
+        )
+        deadline_edit = QLineEdit()
+        deadline_edit.setPlaceholderText(
+            self._tr(
+                "qt_field_zegrid_recovery_deadline_placeholder",
+                "empty = no deadline",
+            )
+        )
+        deadline_tip = self._tr(
+            "qt_field_zegrid_recovery_deadline_tip",
+            "Maximum wait, in seconds, for resources to become available during "
+            "this run. Fractions are accepted (for example 12.5). Leave empty "
+            "for no deadline. Only used when resource recovery is enabled.",
+        )
+        deadline_label.setToolTip(deadline_tip)
+        deadline_edit.setToolTip(deadline_tip)
+        try:
+            deadline_label.setBuddy(deadline_edit)
+        except Exception:
+            pass
+        layout.addRow(deadline_label, deadline_edit)
+        self._zegrid_recovery_deadline_label = deadline_label
+        self._zegrid_recovery_deadline_edit = deadline_edit
+
+        budget_label = QLabel(
+            self._tr(
+                "qt_field_zegrid_store_budget_label",
+                "Durable store budget (bytes)",
+            )
+        )
+        budget_edit = QLineEdit()
+        budget_edit.setPlaceholderText(
+            self._tr("qt_field_zegrid_store_budget_placeholder", "engine default")
+        )
+        budget_tip = self._tr(
+            "qt_field_zegrid_store_budget_tip",
+            "Exact disk budget for the ZeGrid durable store, in bytes. "
+            "Example: 1 GiB = 1073741824; 6 GiB = 6442450944. The value is "
+            "stored and transmitted exactly (no rounding, no clamping); values "
+            "above 2 GiB are supported. Leave empty for the engine default.",
+        )
+        budget_label.setToolTip(budget_tip)
+        budget_edit.setToolTip(budget_tip)
+        try:
+            budget_label.setBuddy(budget_edit)
+        except Exception:
+            pass
+        layout.addRow(budget_label, budget_edit)
+        self._zegrid_store_budget_label = budget_label
+        self._zegrid_store_budget_edit = budget_edit
+
+        # ZM-ZEGRID-M6-QT-STOP-RESUME: explicit opt-in checkpoint saving, and
+        # the deterministic store used by BOTH first-run commits and resume.
+        # Default OFF; the engine/CLI defaults are untouched (a store is opened
+        # only when this GUI resolves a store directory for the run).
+        save_checkpoints = QCheckBox(
+            self._tr(
+                "qt_field_zegrid_save_checkpoints_label",
+                "Save resumable checkpoints during the run",
+            )
+        )
+        save_checkpoints.setToolTip(
+            self._tr(
+                "qt_field_zegrid_save_checkpoints_tip",
+                "Commits each completed ZeGrid cell to a durable store as the "
+                "run progresses, so Stop and Save Progress can stop at a safe "
+                "boundary and a later restart can Resume without recomputing "
+                "committed cells. Off by default. This does not change other "
+                "modes.",
+            )
+        )
+        layout.addRow(save_checkpoints)
+        self._zegrid_save_checkpoints_checkbox = save_checkpoints
+
+        store_label = QLabel(
+            self._tr(
+                "qt_field_zegrid_checkpoint_store_label",
+                "Checkpoint store folder",
+            )
+        )
+        store_edit = QLineEdit()
+        store_edit.setPlaceholderText(
+            self._tr(
+                "qt_field_zegrid_checkpoint_store_placeholder",
+                "empty = <output folder>/zegrid-durable",
+            )
+        )
+        store_tip = self._tr(
+            "qt_field_zegrid_checkpoint_store_tip",
+            "Folder that holds ZeGrid run generations and their committed "
+            "cells. Leave empty for a deterministic default inside the "
+            "selected output folder. An existing folder with resumable runs is "
+            "discovered on start and offered for Resume; invalid, mismatched "
+            "or active stores are refused by the engine, never blessed here.",
+        )
+        store_label.setToolTip(store_tip)
+        store_edit.setToolTip(store_tip)
+        try:
+            store_label.setBuddy(store_edit)
+        except Exception:
+            pass
+        layout.addRow(store_label, store_edit)
+        self._zegrid_checkpoint_store_label = store_label
+        self._zegrid_checkpoint_store_edit = store_edit
+
+        checkpoint_info = QLabel("")
+        checkpoint_info.setWordWrap(True)
+        checkpoint_info.setStyleSheet("color: #555555; font-size: 11px;")
+        layout.addRow(QLabel(""), checkpoint_info)
+        self._zegrid_checkpoint_info_label = checkpoint_info
+
+        gauge_label = QLabel(
+            self._tr("qt_field_zegrid_cell_gauge_label", "Cell gauge mode")
+        )
+        gauge_combo = QComboBox()
+        gauge_combo.setEditable(False)
+        gauge_combo.setInsertPolicy(QComboBox.NoInsert)
+        for _token, _key, _fallback in self._ZEGRID_GAUGE_OPTIONS:
+            gauge_combo.addItem(self._tr(_key, _fallback), _token)
+        gauge_tip = self._tr(
+            "qt_field_zegrid_cell_gauge_tip",
+            "'Engine default' is the absent-value sentinel (None); it currently "
+            "resolves to the engine's auto strategy but is stored distinctly. "
+            "'Auto (explicit)' stores the literal token 'auto'. Both use one "
+            "global gauge when it serves every cell and otherwise switch the "
+            "whole run to per-cell gauges. 'Global' forces the single-gauge "
+            "path; 'Per cell' forces each cell to self-anchor. No choice is "
+            "rewritten to None or to a blank/default here.",
+        )
+        gauge_label.setToolTip(gauge_tip)
+        gauge_combo.setToolTip(gauge_tip)
+        try:
+            gauge_label.setBuddy(gauge_combo)
+        except Exception:
+            pass
+        layout.addRow(gauge_label, gauge_combo)
+        self._zegrid_cell_gauge_label = gauge_label
+        self._zegrid_cell_gauge_combo = gauge_combo
+
+        layout_label = QLabel(
+            self._tr("qt_field_zegrid_layout_label", "Layout (NXxNY)")
+        )
+        layout_edit = QLineEdit()
+        layout_edit.setPlaceholderText(
+            self._tr("qt_field_zegrid_layout_placeholder", "empty = automatic")
+        )
+        layout_tip = self._tr(
+            "qt_field_zegrid_layout_tip",
+            "Pin the cell grid as NXxNY (for example 2x2) for a reproducible "
+            "run. Leave empty to let the engine choose the RAM-adaptive layout. "
+            "Width and height must be positive integers.",
+        )
+        layout_label.setToolTip(layout_tip)
+        layout_edit.setToolTip(layout_tip)
+        try:
+            layout_label.setBuddy(layout_edit)
+        except Exception:
+            pass
+        layout.addRow(layout_label, layout_edit)
+        self._zegrid_layout_label = layout_label
+        self._zegrid_layout_edit = layout_edit
+
+        sip_label = QLabel(self._tr("qt_field_zegrid_sip_label", "SIP mode"))
+        sip_combo = QComboBox()
+        sip_combo.setEditable(False)
+        sip_combo.setInsertPolicy(QComboBox.NoInsert)
+        for _token, _key, _fallback in self._ZEGRID_SIP_OPTIONS:
+            sip_combo.addItem(self._tr(_key, _fallback), _token)
+        sip_tip = self._tr(
+            "qt_field_zegrid_sip_tip",
+            "Keep SIP applies the distortion coefficients correctly (default). "
+            "Strip SIP falls back to legacy-consistent plain TAN handling and "
+            "is only for compatibility with older results.",
+        )
+        sip_label.setToolTip(sip_tip)
+        sip_combo.setToolTip(sip_tip)
+        try:
+            sip_label.setBuddy(sip_combo)
+        except Exception:
+            pass
+        layout.addRow(sip_label, sip_combo)
+        self._zegrid_sip_label = sip_label
+        self._zegrid_sip_combo = sip_combo
+
+        policy_error = QLabel("")
+        policy_error.setWordWrap(True)
+        policy_error.setStyleSheet("color: #b00020; font-size: 11px;")
+        policy_error.setVisible(False)
+        layout.addRow(QLabel(""), policy_error)
+        self._zegrid_policy_error_label = policy_error
+
+        self._config_fields["zegrid_resource_recovery_enabled"] = {
+            "kind": "checkbox",
+            "widget": recovery,
+            "type": bool,
+            "value_getter": self._zegrid_recovery_enabled_value,
+        }
+        self._config_fields["zegrid_resource_recovery_deadline_s"] = {
+            "kind": "line_edit",
+            "widget": deadline_edit,
+            "type": float,
+            "value_getter": self._zegrid_recovery_deadline_value,
+        }
+        self._config_fields["zegrid_durable_store_budget_bytes"] = {
+            "kind": "line_edit",
+            "widget": budget_edit,
+            "type": int,
+            "value_getter": self._zegrid_store_budget_value,
+        }
+        self._config_fields["zegrid_qt_save_checkpoints_enabled"] = {
+            "kind": "checkbox",
+            "widget": save_checkpoints,
+            "type": bool,
+        }
+        self._config_fields["zegrid_durable_store_dir"] = {
+            "kind": "line_edit",
+            "widget": store_edit,
+            "type": str,
+            "value_getter": self._zegrid_checkpoint_store_value,
+        }
+        self._config_fields["zegrid_cell_gauge_mode"] = {
+            "kind": "combobox",
+            "widget": gauge_combo,
+            "type": str,
+            "value_getter": self._zegrid_gauge_combo_value,
+        }
+        self._config_fields["zegrid_layout"] = {
+            "kind": "line_edit",
+            "widget": layout_edit,
+            "type": str,
+            "value_getter": self._zegrid_layout_value,
+        }
+        self._config_fields["zegrid_sip_mode"] = {
+            "kind": "combobox",
+            "widget": sip_combo,
+            "type": str,
+            "value_getter": self._zegrid_sip_combo_value,
+        }
+
+        recovery.toggled.connect(self._on_zegrid_recovery_toggled)  # type: ignore[arg-type]
+        deadline_edit.textEdited.connect(
+            lambda _text=None: self._on_zegrid_policy_text_edited(
+                "zegrid_resource_recovery_deadline_s", user_edit=True
+            )
+        )
+        budget_edit.textEdited.connect(
+            lambda _text=None: self._on_zegrid_policy_text_edited(
+                "zegrid_durable_store_budget_bytes", user_edit=True
+            )
+        )
+        layout_edit.textEdited.connect(
+            lambda _text=None: self._on_zegrid_policy_text_edited(
+                "zegrid_layout", user_edit=True
+            )
+        )
+        deadline_edit.editingFinished.connect(
+            lambda: self._on_zegrid_policy_text_edited(
+                "zegrid_resource_recovery_deadline_s"
+            )
+        )
+        budget_edit.editingFinished.connect(
+            lambda: self._on_zegrid_policy_text_edited(
+                "zegrid_durable_store_budget_bytes"
+            )
+        )
+        layout_edit.editingFinished.connect(
+            lambda: self._on_zegrid_policy_text_edited("zegrid_layout")
+        )
+        gauge_combo.currentIndexChanged.connect(
+            lambda _=None: self._on_zegrid_policy_combo_changed(
+                "zegrid_cell_gauge_mode"
+            )
+        )
+        sip_combo.currentIndexChanged.connect(
+            lambda _=None: self._on_zegrid_policy_combo_changed("zegrid_sip_mode")
+        )
+
+        save_checkpoints.toggled.connect(
+            self._on_zegrid_save_checkpoints_toggled  # type: ignore[arg-type]
+        )
+        store_edit.textEdited.connect(
+            lambda _text=None: self._on_zegrid_checkpoint_store_edited(
+                user_edit=True
+            )
+        )
+        store_edit.editingFinished.connect(
+            lambda: self._on_zegrid_checkpoint_store_edited()
+        )
+
+        self._sync_zegrid_policy_from_config()
+        self._apply_zegrid_policy_control_state()
+        return group
+
+    # ------------------------------------------------------------------
     # ZeGrid anti-checkerboard smoothing (ZM-ZEGRID-R53C)
     # ------------------------------------------------------------------
     _ZEGRID_HALO_ITEM_FALLBACKS = {
@@ -2024,6 +2534,1499 @@ class ZeMosaicQtMainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # ZeGrid run policy helpers (ZM-ZEGRID-M6-QT-POLICY)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _zegrid_combo_index_for_data(combo: QComboBox, value: Any) -> int:
+        for index in range(combo.count()):
+            data = combo.itemData(index)
+            if value is None:
+                if data is None:
+                    return index
+            elif data == value:
+                return index
+        return -1
+
+    @staticmethod
+    def _parse_zegrid_layout_text(value: Any) -> tuple[int, int] | None:
+        """Parse ``NXxNY`` exactly like the engine, requiring positive dims.
+
+        ``None``/empty -> ``None`` (automatic layout). Raises ``ValueError`` for
+        anything unparseable or non-positive; nothing is rounded or dropped.
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"invalid pinned layout {value!r} (expected 'NXxNY')")
+        text = str(value).strip()
+        if not text:
+            return None
+        for separator in ("x", "X", "*", ","):
+            if separator in text:
+                parts = text.split(separator)
+                if len(parts) == 2:
+                    try:
+                        nx, ny = int(parts[0]), int(parts[1])
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"invalid pinned layout {value!r} (expected 'NXxNY')"
+                        ) from exc
+                    if nx <= 0 or ny <= 0:
+                        raise ValueError(
+                            f"invalid pinned layout {value!r} (dimensions must be > 0)"
+                        )
+                    return nx, ny
+        raise ValueError(f"invalid pinned layout {value!r} (expected 'NXxNY')")
+
+    def _zegrid_recovery_enabled_value(self) -> Any:
+        invalid = getattr(self, "_zegrid_policy_invalid_values", {})
+        if "zegrid_resource_recovery_enabled" in invalid:
+            return invalid["zegrid_resource_recovery_enabled"]
+        checkbox = getattr(self, "_zegrid_recovery_checkbox", None)
+        if checkbox is None:
+            return self.config.get("zegrid_resource_recovery_enabled", False)
+        return bool(checkbox.isChecked())
+
+    def _zegrid_policy_raw_or_edited(self, key: str, getter):
+        """Return the persisted raw value until the user deliberately edits it.
+
+        Loading widgets, collecting, saving, changing mode/language or building
+        an invocation is NOT an edit. This is what stops an invalid persisted
+        JSON type (for example ``"12.5"``) from being silently repaired into a
+        valid float/int.
+        """
+        edited = getattr(self, "_zegrid_policy_edited_keys", set())
+        raw_values = getattr(self, "_zegrid_policy_raw_values", {})
+        if key not in edited and key in raw_values:
+            return raw_values[key]
+        return getter()
+
+    def _zegrid_recovery_deadline_value(self) -> Any:
+        key = "zegrid_resource_recovery_deadline_s"
+
+        def _typed():
+            edit = getattr(self, "_zegrid_recovery_deadline_edit", None)
+            if edit is None:
+                return self.config.get(key)
+            text = edit.text().strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except (TypeError, ValueError):
+                # Keep the invalid raw text visible; the common validator refuses it.
+                return text
+
+        return self._zegrid_policy_raw_or_edited(key, _typed)
+
+    def _zegrid_store_budget_value(self) -> Any:
+        key = "zegrid_durable_store_budget_bytes"
+
+        def _typed():
+            edit = getattr(self, "_zegrid_store_budget_edit", None)
+            if edit is None:
+                return self.config.get(key)
+            text = edit.text().strip()
+            if not text:
+                return None
+            try:
+                # Python ints are unbounded: multi-GiB budgets never overflow int32.
+                return int(text, 10)
+            except (TypeError, ValueError):
+                return text
+
+        return self._zegrid_policy_raw_or_edited(key, _typed)
+
+    def _zegrid_gauge_combo_value(self) -> Any:
+        combo = getattr(self, "_zegrid_cell_gauge_combo", None)
+        if combo is None:
+            return self.config.get("zegrid_cell_gauge_mode")
+        index = combo.currentIndex()
+        if index < 0:
+            invalid = getattr(self, "_zegrid_policy_invalid_values", {})
+            return invalid.get(
+                "zegrid_cell_gauge_mode",
+                self.config.get("zegrid_cell_gauge_mode"),
+            )
+        return combo.itemData(index)
+
+    def _zegrid_layout_value(self) -> Any:
+        key = "zegrid_layout"
+
+        def _typed():
+            edit = getattr(self, "_zegrid_layout_edit", None)
+            if edit is None:
+                return self.config.get(key)
+            text = edit.text().strip()
+            return text or None
+
+        return self._zegrid_policy_raw_or_edited(key, _typed)
+
+    def _zegrid_sip_combo_value(self) -> Any:
+        combo = getattr(self, "_zegrid_sip_combo", None)
+        if combo is None:
+            return self.config.get("zegrid_sip_mode", "keep")
+        index = combo.currentIndex()
+        if index < 0:
+            invalid = getattr(self, "_zegrid_policy_invalid_values", {})
+            return invalid.get(
+                "zegrid_sip_mode", self.config.get("zegrid_sip_mode", "keep")
+            )
+        return combo.itemData(index)
+
+    # ------------------------------------------------------------------
+    # ZeGrid durable checkpoint helpers (ZM-ZEGRID-M6-QT-STOP-RESUME)
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031: new runs use the VISIBLE name.
+    # The legacy dot-prefixed directory is DISCOVERED read-only (never moved,
+    # renamed or deleted) so an existing run keeps resuming.
+    ZEGRID_DEFAULT_STORE_DIRNAME = "zegrid-durable"
+    ZEGRID_LEGACY_STORE_DIRNAME = ".zegrid-durable"
+
+    def _zegrid_checkpoint_store_value(self) -> Any:
+        edit = getattr(self, "_zegrid_checkpoint_store_edit", None)
+        if edit is None:
+            return self.config.get("zegrid_durable_store_dir")
+        text = edit.text().strip()
+        return text or None
+
+    def _zegrid_save_checkpoints_enabled(self) -> bool:
+        checkbox = getattr(self, "_zegrid_save_checkpoints_checkbox", None)
+        if checkbox is None:
+            return bool(self.config.get("zegrid_qt_save_checkpoints_enabled", False))
+        return bool(checkbox.isChecked())
+
+    def _zegrid_checkpoint_store_root(self, output_dir: Any = None) -> str | None:
+        """Deterministic store root: explicit folder else <output>/zegrid-durable.
+
+        Pure path resolution: nothing is created or read here.
+        """
+        explicit = self.config.get("zegrid_durable_store_dir")
+        if isinstance(explicit, str) and explicit.strip():
+            return str(Path(explicit).expanduser())
+        output = output_dir if output_dir is not None else self.config.get("output_dir")
+        if not output:
+            return None
+        try:
+            return str(Path(str(output)).expanduser() / self.ZEGRID_DEFAULT_STORE_DIRNAME)
+        except Exception:
+            return None
+
+    def _zegrid_store_discovery_root(self, output_dir: Any = None) -> str | None:
+        """The store root to DISCOVER runs in: visible first, legacy fallback.
+
+        New runs always write ``zegrid-durable``. An existing legacy
+        ``.zegrid-durable`` directory is only READ (never moved, renamed or
+        deleted) so an existing durable run keeps resuming.
+        """
+        visible = self._zegrid_checkpoint_store_root(output_dir)
+        if visible is None:
+            return None
+        try:
+            if Path(visible).is_dir():
+                return visible
+        except OSError:
+            return visible
+        output = (
+            output_dir if output_dir is not None else self.config.get("output_dir")
+        )
+        if not output:
+            return visible
+        try:
+            legacy = (
+                Path(str(output)).expanduser()
+                / self.ZEGRID_LEGACY_STORE_DIRNAME
+            )
+        except Exception:
+            return visible
+        try:
+            if legacy.is_dir():
+                return str(legacy)
+        except OSError:
+            return visible
+        return visible
+
+    def _resolve_stop_capability(self) -> str:
+        """Resolve the ONE stop capability of this launch (no side effects).
+
+        Runs AFTER the effective processing mode and scheduler were validated and
+        BEFORE resume preflight/spawn. It never reads, creates or mutates the
+        durable store: it only decides which capability the run owns.
+
+        ``ZEGRID_DURABLE`` requires ALL THREE of: effective mode ZeGrid, an
+        explicit/effective scheduler ``active``, and checkpoint saving ON. Any
+        other combination (Classic/SDS/existing-master, ZeGrid legacy/observe,
+        ZeGrid active with checkpoints OFF) is ``LEGACY_GRACEFUL``.
+        """
+        if self._selected_processing_mode() != "zegrid":
+            return self.STOP_CAPABILITY_LEGACY_GRACEFUL
+        raw_scheduler = self.config.get(
+            "zegrid_scheduler_mode", zsched.DEFAULT_MODE
+        )
+        try:
+            scheduler_mode = zsched.normalize_scheduler_mode(raw_scheduler)
+        except Exception:
+            # Validation already refused an invalid value for a ZeGrid start;
+            # never grant a durable capability on an unproven scheduler.
+            return self.STOP_CAPABILITY_LEGACY_GRACEFUL
+        if scheduler_mode != zsched.MODE_ACTIVE:
+            return self.STOP_CAPABILITY_LEGACY_GRACEFUL
+        if not self._zegrid_save_checkpoints_enabled():
+            return self.STOP_CAPABILITY_LEGACY_GRACEFUL
+        return self.STOP_CAPABILITY_ZEGRID_DURABLE
+
+    def _pending_capability_is_durable(self) -> bool:
+        capability = getattr(self, "_pending_stop_capability", None)
+        if capability is not None:
+            return capability == self.STOP_CAPABILITY_ZEGRID_DURABLE
+        # Historic/manual state: the old flag only ever meant a ZeGrid run.
+        return bool(getattr(self, "_pending_run_is_zegrid", False))
+
+    def _active_capability_is_durable(self) -> bool:
+        capability = getattr(self, "_active_stop_capability", None)
+        if capability is not None:
+            return capability == self.STOP_CAPABILITY_ZEGRID_DURABLE
+        # Historic/manual state: the old flag only ever meant a ZeGrid run.
+        return bool(getattr(self, "_active_run_is_zegrid", False))
+
+    def _log_stop_capability(self, capability: str) -> None:
+        """Make the effective capability explicit (never silently rewritten)."""
+        if self._selected_processing_mode() != "zegrid":
+            return
+        raw_scheduler = self.config.get(
+            "zegrid_scheduler_mode", zsched.DEFAULT_MODE
+        )
+        try:
+            scheduler_mode = zsched.normalize_scheduler_mode(raw_scheduler)
+        except Exception:
+            scheduler_mode = str(raw_scheduler)
+        checkpoints_on = self._zegrid_save_checkpoints_enabled()
+        if capability == self.STOP_CAPABILITY_ZEGRID_DURABLE:
+            self._append_log(
+                self._tr(
+                    "qt_zegrid_capability_durable",
+                    "ZeGrid stop capability: durable (scheduler=active, "
+                    "checkpoint saving ON). Stop and Save waits for the engine's "
+                    "acknowledged safe boundary before claiming the run is "
+                    "resumable.",
+                ),
+                level="info",
+            )
+            return
+        if scheduler_mode != zsched.MODE_ACTIVE:
+            self._append_log(
+                self._tr(
+                    "qt_zegrid_capability_non_durable_scheduler",
+                    "ZeGrid stop capability: graceful (scheduler={scheduler}, "
+                    "checkpoint saving {state}). Durable ZeGrid resume requires "
+                    "scheduler 'active'; this run uses the existing graceful "
+                    "stop, writes no durable checkpoint and is never reported as "
+                    "saved/resumable.",
+                ).format(
+                    scheduler=scheduler_mode,
+                    state="ON" if checkpoints_on else "OFF",
+                ),
+                level="warning",
+            )
+            return
+        self._append_log(
+            self._tr(
+                "qt_zegrid_capability_non_durable_checkpoints",
+                "ZeGrid stop capability: graceful (scheduler=active, checkpoint "
+                "saving OFF). No durable store is used and the stop is never "
+                "reported as saved/resumable.",
+            ),
+            level="info",
+        )
+
+    def _on_zegrid_save_checkpoints_toggled(self, _checked: bool = False) -> None:
+        self._sync_config_key_from_widget("zegrid_qt_save_checkpoints_enabled")
+        self._refresh_zegrid_checkpoint_info()
+
+    def _on_zegrid_checkpoint_store_edited(self, *, user_edit: bool = False) -> None:
+        if user_edit:
+            self._zegrid_policy_edited_keys.add("zegrid_durable_store_dir")
+        self._sync_config_key_from_widget("zegrid_durable_store_dir")
+        self._refresh_zegrid_checkpoint_info()
+
+    def _refresh_zegrid_checkpoint_info(self) -> None:
+        """Show the exact disks/budget the next ZeGrid run would use."""
+        label = getattr(self, "_zegrid_checkpoint_info_label", None)
+        if label is None:
+            return
+        if self._selected_processing_mode() != "zegrid":
+            label.setText("")
+            return
+        output_dir = self.config.get("output_dir")
+        store_root = self._zegrid_checkpoint_store_root(output_dir)
+        enabled = self._zegrid_save_checkpoints_enabled()
+        parts = [
+            self._tr(
+                "qt_zegrid_checkpoint_info_state",
+                "Checkpoint saving: {state}",
+            ).format(
+                state=self._tr("qt_common_on", "ON")
+                if enabled
+                else self._tr("qt_common_off", "OFF")
+            ),
+            self._tr(
+                "qt_zegrid_checkpoint_info_store",
+                "Store: {path}",
+            ).format(path=store_root or self._tr("qt_common_none", "(no output folder)")),
+        ]
+        budget = self.config.get("zegrid_durable_store_budget_bytes")
+        parts.append(
+            self._tr(
+                "qt_zegrid_checkpoint_info_budget",
+                "Store budget: {budget}",
+            ).format(
+                budget=(
+                    str(budget)
+                    if budget not in (None, "")
+                    else self._tr("qt_zegrid_checkpoint_info_budget_default", "engine default")
+                )
+            )
+        )
+        # ZM-UNIFIED-STOP-SAVE-CAPABILITY (F): never let the checkbox imply a
+        # durable resume the effective scheduler cannot provide. The persisted
+        # legacy/observe value is shown and explained, never rewritten.
+        try:
+            scheduler_mode = zsched.normalize_scheduler_mode(
+                self.config.get("zegrid_scheduler_mode", zsched.DEFAULT_MODE)
+            )
+        except Exception:
+            scheduler_mode = None
+        if enabled and scheduler_mode is not None and scheduler_mode != zsched.MODE_ACTIVE:
+            parts.append(
+                self._tr(
+                    "qt_zegrid_checkpoint_not_durable",
+                    "Durable resume unavailable with scheduler '{scheduler}': "
+                    "no durable checkpoint is written and the graceful stop is "
+                    "used. Select scheduler 'active' for durable resume.",
+                ).format(scheduler=scheduler_mode)
+            )
+        try:
+            if store_root and Path(store_root).exists():
+                usage = self._zegrid_store_usage_text(store_root)
+                if usage:
+                    parts.append(usage)
+        except Exception:
+            pass
+        try:
+            label.setText(" | ".join(str(p) for p in parts))
+        except Exception:
+            label.setText("")
+
+    @staticmethod
+    def _zegrid_store_usage_text(store_root: str) -> str | None:
+        """Best-effort READ-ONLY disk usage of an existing store folder."""
+        try:
+            total = 0
+            files = 0
+            for path in Path(store_root).rglob("*"):
+                try:
+                    if path.is_file():
+                        total += int(path.stat().st_size)
+                        files += 1
+                except OSError:
+                    continue
+                if files > 20000:  # bounded scan; never a hard claim
+                    return None
+            mib = total / (1024 * 1024)
+            return f"{mib:.1f} MiB / {files} file(s)"
+        except Exception:
+            return None
+
+    def _sync_zegrid_policy_from_config(self) -> None:
+        """Load all six widgets from config, keeping invalid raws visible."""
+        invalid: dict[str, Any] = {}
+        self._zegrid_policy_raw_values = {}
+        self._zegrid_policy_edited_keys = set()
+        recovery_raw = self.config.get("zegrid_resource_recovery_enabled", False)
+        checkbox = getattr(self, "_zegrid_recovery_checkbox", None)
+        if checkbox is not None:
+            checkbox.blockSignals(True)
+            try:
+                if recovery_raw is None:
+                    checkbox.setChecked(False)
+                    checkbox.setProperty("zegrid_policy_invalid", False)
+                elif isinstance(recovery_raw, bool):
+                    checkbox.setChecked(recovery_raw)
+                    checkbox.setProperty("zegrid_policy_invalid", False)
+                else:
+                    checkbox.setChecked(False)
+                    checkbox.setProperty("zegrid_policy_invalid", True)
+                    invalid["zegrid_resource_recovery_enabled"] = recovery_raw
+            finally:
+                checkbox.blockSignals(False)
+
+        deadline_raw = self.config.get("zegrid_resource_recovery_deadline_s")
+        self._zegrid_policy_raw_values[
+            "zegrid_resource_recovery_deadline_s"
+        ] = deadline_raw
+        deadline_edit = getattr(self, "_zegrid_recovery_deadline_edit", None)
+        if deadline_edit is not None:
+            deadline_edit.setText("" if deadline_raw is None else str(deadline_raw))
+
+        budget_raw = self.config.get("zegrid_durable_store_budget_bytes")
+        self._zegrid_policy_raw_values[
+            "zegrid_durable_store_budget_bytes"
+        ] = budget_raw
+        budget_edit = getattr(self, "_zegrid_store_budget_edit", None)
+        if budget_edit is not None:
+            budget_edit.setText("" if budget_raw is None else str(budget_raw))
+
+        save_raw = self.config.get("zegrid_qt_save_checkpoints_enabled", False)
+        if not isinstance(save_raw, bool):
+            # Never coerce a persisted non-boolean into an enabled opt-in.
+            save_raw = False
+            invalid["zegrid_qt_save_checkpoints_enabled"] = True
+        save_checkbox = getattr(self, "_zegrid_save_checkpoints_checkbox", None)
+        if save_checkbox is not None:
+            save_checkbox.blockSignals(True)
+            try:
+                save_checkbox.setChecked(bool(save_raw))
+            finally:
+                save_checkbox.blockSignals(False)
+
+        store_dir_raw = self.config.get("zegrid_durable_store_dir")
+        store_edit = getattr(self, "_zegrid_checkpoint_store_edit", None)
+        if store_edit is not None:
+            store_edit.setText("" if store_dir_raw is None else str(store_dir_raw))
+
+        self._refresh_zegrid_checkpoint_info()
+
+        gauge_combo = getattr(self, "_zegrid_cell_gauge_combo", None)
+        if gauge_combo is not None:
+            gauge_raw = self.config.get("zegrid_cell_gauge_mode")
+            gauge_index = (
+                0
+                if gauge_raw is None
+                else self._zegrid_combo_index_for_data(gauge_combo, gauge_raw)
+            )
+            gauge_combo.blockSignals(True)
+            try:
+                gauge_combo.setCurrentIndex(gauge_index)
+            finally:
+                gauge_combo.blockSignals(False)
+            gauge_combo.setProperty("zegrid_policy_invalid", gauge_index < 0)
+            if gauge_index < 0:
+                invalid["zegrid_cell_gauge_mode"] = gauge_raw
+
+        layout_raw = self.config.get("zegrid_layout")
+        self._zegrid_policy_raw_values["zegrid_layout"] = layout_raw
+        layout_edit = getattr(self, "_zegrid_layout_edit", None)
+        if layout_edit is not None:
+            layout_edit.setText("" if layout_raw is None else str(layout_raw))
+
+        sip_combo = getattr(self, "_zegrid_sip_combo", None)
+        if sip_combo is not None:
+            sip_raw = self.config.get("zegrid_sip_mode", "keep")
+            if sip_raw is None:
+                sip_raw = "keep"
+            sip_index = self._zegrid_combo_index_for_data(sip_combo, sip_raw)
+            sip_combo.blockSignals(True)
+            try:
+                sip_combo.setCurrentIndex(sip_index)
+            finally:
+                sip_combo.blockSignals(False)
+            sip_combo.setProperty("zegrid_policy_invalid", sip_index < 0)
+            if sip_index < 0:
+                invalid["zegrid_sip_mode"] = sip_raw
+
+        self._zegrid_policy_invalid_values = invalid
+        self._refresh_zegrid_policy_invalid_state()
+
+    def _refresh_zegrid_policy_invalid_state(self) -> None:
+        """Surface every invalid value inline (no silent default substitution).
+
+        The common validator is applied to the EFFECTIVE widget values, so an
+        unedited persisted ``"12.5"`` remains invalid even though the text
+        itself could be parsed as a float.
+        """
+        invalid_keys = set(getattr(self, "_zegrid_policy_invalid_values", {}))
+        if _validate_zegrid_run_policy is not None:
+            candidate = dict(self.config)
+            candidate.update(
+                {
+                    "zegrid_resource_recovery_enabled": self._zegrid_recovery_enabled_value(),
+                    "zegrid_resource_recovery_deadline_s": self._zegrid_recovery_deadline_value(),
+                    "zegrid_durable_store_budget_bytes": self._zegrid_store_budget_value(),
+                    "zegrid_cell_gauge_mode": self._zegrid_gauge_combo_value(),
+                    "zegrid_layout": self._zegrid_layout_value(),
+                    "zegrid_sip_mode": self._zegrid_sip_combo_value(),
+                }
+            )
+            try:
+                _validate_zegrid_run_policy(candidate)
+            except ValueError as exc:
+                message = str(exc)
+                matched = False
+                for key in _ZEGRID_RUN_POLICY_KEYS:
+                    if key in message:
+                        invalid_keys.add(key)
+                        matched = True
+                if not matched:
+                    invalid_keys.add("zegrid_policy")
+        try:
+            self._parse_zegrid_layout_text(self._zegrid_layout_value())
+        except ValueError:
+            invalid_keys.add("zegrid_layout")
+
+        label = getattr(self, "_zegrid_policy_error_label", None)
+        if label is None:
+            return
+        if invalid_keys:
+            template = self._tr(
+                "qt_zegrid_policy_invalid_summary",
+                "Invalid value(s): {keys}. Fix them in Advanced before starting "
+                "a ZeGrid run; nothing is silently reset to a default.",
+            )
+            try:
+                label.setText(template.format(keys=", ".join(sorted(invalid_keys))))
+            except Exception:
+                label.setText(str(template))
+            label.setVisible(True)
+        else:
+            label.setText("")
+            label.setVisible(False)
+
+    def _on_zegrid_recovery_toggled(self, _checked: bool = False) -> None:
+        invalid = getattr(self, "_zegrid_policy_invalid_values", {})
+        invalid.pop("zegrid_resource_recovery_enabled", None)
+        checkbox = getattr(self, "_zegrid_recovery_checkbox", None)
+        if checkbox is not None:
+            checkbox.setProperty("zegrid_policy_invalid", False)
+        self._sync_config_key_from_widget("zegrid_resource_recovery_enabled")
+        self._apply_zegrid_policy_control_state()
+        self._refresh_zegrid_policy_invalid_state()
+
+    def _on_zegrid_policy_text_edited(
+        self, key: str, *, user_edit: bool = False
+    ) -> None:
+        if user_edit:
+            # Only a real user edit authorises typed parsing; programmatic
+            # setText (load, translation rebuild, tests) does not.
+            self._zegrid_policy_edited_keys.add(key)
+        self._sync_config_key_from_widget(key)
+        self._refresh_zegrid_policy_invalid_state()
+
+    def _on_zegrid_policy_combo_changed(self, key: str) -> None:
+        invalid = getattr(self, "_zegrid_policy_invalid_values", {})
+        invalid.pop(key, None)
+        widget = self._config_fields.get(key, {}).get("widget")
+        if widget is not None:
+            widget.setProperty("zegrid_policy_invalid", False)
+        self._sync_config_key_from_widget(key)
+        self._refresh_zegrid_policy_invalid_state()
+
+    def _apply_zegrid_policy_control_state(self, running: bool | None = None) -> None:
+        """Disable the policy controls outside ZeGrid / while running.
+
+        Disabling never clears a persisted value: the widgets keep their text,
+        selection and checkbox state so re-enabling restores the exact choice.
+        """
+        if running is None:
+            running = bool(getattr(self, "is_processing", False))
+        enabled = self._selected_processing_mode() == "zegrid" and not bool(running)
+        checkbox = getattr(self, "_zegrid_recovery_checkbox", None)
+        if checkbox is not None:
+            checkbox.setEnabled(enabled)
+        recovery_on = bool(checkbox.isChecked()) if checkbox is not None else False
+        deadline_enabled = enabled and recovery_on
+        for widget in (
+            getattr(self, "_zegrid_recovery_deadline_edit", None),
+            getattr(self, "_zegrid_recovery_deadline_label", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(deadline_enabled)
+        for widget in (
+            getattr(self, "_zegrid_store_budget_edit", None),
+            getattr(self, "_zegrid_store_budget_label", None),
+            getattr(self, "_zegrid_cell_gauge_combo", None),
+            getattr(self, "_zegrid_cell_gauge_label", None),
+            getattr(self, "_zegrid_layout_edit", None),
+            getattr(self, "_zegrid_layout_label", None),
+            getattr(self, "_zegrid_sip_combo", None),
+            getattr(self, "_zegrid_sip_label", None),
+            getattr(self, "_zegrid_save_checkpoints_checkbox", None),
+            getattr(self, "_zegrid_checkpoint_store_edit", None),
+            getattr(self, "_zegrid_checkpoint_store_label", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _validate_zegrid_policy_for_start(self) -> bool:
+        """Strictly validate the six keys; block only an effective ZeGrid run.
+
+        The common config validator is the authority (no truthy coercion, no
+        silent default). Layout format is additionally checked with the same
+        NXxNY rule the engine uses, before any worker is spawned.
+        """
+        message: str | None = None
+        if _validate_zegrid_run_policy is None:  # pragma: no cover - defensive
+            message = self._tr(
+                "qt_zegrid_policy_validator_unavailable",
+                "ZeGrid run-policy validation is unavailable; refusing to start "
+                "a ZeGrid run.",
+            )
+        else:
+            try:
+                _validate_zegrid_run_policy(self.config)
+            except ValueError as exc:
+                template = self._tr(
+                    "qt_zegrid_policy_invalid_value",
+                    "Invalid ZeGrid run-policy value: {error}. Fix it in Advanced "
+                    "before starting a ZeGrid run.",
+                )
+                try:
+                    message = template.format(error=str(exc))
+                except Exception:
+                    message = str(template)
+            if message is None:
+                raw_layout = self.config.get("zegrid_layout")
+                try:
+                    self._parse_zegrid_layout_text(raw_layout)
+                except ValueError:
+                    template = self._tr(
+                        "qt_zegrid_layout_invalid_value",
+                        "Invalid ZeGrid layout {value}. Use NXxNY with positive "
+                        "dimensions (for example 2x2), or leave it empty for the "
+                        "automatic layout.",
+                    )
+                    try:
+                        message = template.format(value=repr(raw_layout))
+                    except Exception:
+                        message = str(template)
+
+        if message is not None:
+            if not getattr(self, "_zegrid_policy_start_warning_logged", False):
+                self._append_log(message, level="warning")
+                self._zegrid_policy_start_warning_logged = True
+            if self._selected_processing_mode() != "zegrid":
+                return True
+            QMessageBox.warning(
+                self,
+                self._tr("qt_error_invalid_config_title", "Invalid configuration"),
+                message,
+            )
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Durable resume discovery / explicit choice (ZM-ZEGRID-M6-QT-STOP-RESUME)
+    # ------------------------------------------------------------------
+    # The GUI only OFFERS candidates found by read-only inspection. The engine
+    # (run_resume + the durable store) remains the authority for identity,
+    # state, compatibility and locking; a candidate the engine refuses is never
+    # "blessed" here.
+
+    def _zegrid_new_run_store_unsafe_reason(
+        self, store_root: str | None, output_dir: Any
+    ) -> str | None:
+        """Reason a NEW run must not use this store/output pair, or None."""
+        if not store_root:
+            return self._tr(
+                "qt_zegrid_checkpoint_no_store",
+                "No checkpoint store folder is available (select an output "
+                "folder first).",
+            )
+        try:
+            store_path = Path(store_root).expanduser()
+            output_path = Path(str(output_dir)).expanduser() if output_dir else None
+        except Exception:
+            return self._tr(
+                "qt_zegrid_checkpoint_bad_path",
+                "The checkpoint store path is not a usable filesystem path.",
+            )
+        if output_path is not None:
+            try:
+                if store_path.resolve() == output_path.resolve():
+                    return self._tr(
+                        "qt_zegrid_checkpoint_store_is_output",
+                        "The checkpoint store folder must differ from the output "
+                        "folder; choose a separate store folder or output folder.",
+                    )
+            except Exception:
+                pass
+            input_dir = self.config.get("input_dir")
+            if input_dir:
+                try:
+                    store_path.resolve().relative_to(
+                        Path(str(input_dir)).expanduser().resolve()
+                    )
+                except ValueError:
+                    pass
+                except Exception:
+                    pass
+                else:
+                    return self._tr(
+                        "qt_zegrid_checkpoint_store_in_input",
+                        "The checkpoint store folder is inside the input folder; "
+                        "choose a store outside the inputs.",
+                    )
+        if store_path.exists() and store_path.is_symlink():
+            return self._tr(
+                "qt_zegrid_checkpoint_store_symlink",
+                "The checkpoint store path is a symlink; the engine refuses a "
+                "symlinked store root. Choose a real folder.",
+            )
+        if store_path.exists() and not store_path.is_dir():
+            return self._tr(
+                "qt_zegrid_checkpoint_store_not_dir",
+                "The checkpoint store path exists but is not a folder.",
+            )
+        return None
+
+    @staticmethod
+    def _zegrid_store_is_actively_locked(run_root: str) -> bool:
+        """READ-ONLY probe: is a live writer holding this generation's LOCK?
+
+        The owner record alone is NOT evidence (it survives a clean close); the
+        OS lock is the authority. A non-blocking exclusive flock is taken on a
+        private descriptor and released immediately, without writing a byte.
+        """
+        lock_path = Path(run_root) / "LOCK"
+        try:
+            if not lock_path.is_file():
+                return False
+        except OSError:
+            return False
+        if os.name == "nt":  # pragma: no cover - no Windows claim is made
+            try:
+                owner = zrunstore.StoreLock.peek_owner(run_root) if zrunstore else None
+                return bool(owner and owner.get("pid") and zrunstore.pid_alive(owner["pid"]))
+            except Exception:
+                return False
+        try:
+            import fcntl
+
+            fd = os.open(str(lock_path), os.O_RDWR)
+        except Exception:
+            return False
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            else:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                return False
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _classify_zegrid_durable_candidates(self, store_root: str) -> dict:
+        """READ-ONLY classification of every recognized generation.
+
+        Never creates, deletes, locks or modifies a store. A directory that is
+        merely present (or a generic log) is NOT a candidate: only a readable
+        ``run.json`` counts, and the resume state decides completeness.
+        """
+        info: dict[str, Any] = {
+            "store_root": store_root,
+            "candidates": [],
+            "error": None,
+        }
+        if zresume is None or zrunstore is None:  # pragma: no cover - defensive
+            info["error"] = "resume support unavailable in this installation"
+            return info
+        try:
+            entries = zresume.discover_runs(store_root)
+        except Exception as exc:
+            info["error"] = f"{type(exc).__name__}: {exc}"
+            return info
+        for entry in entries:
+            item: dict[str, Any] = {
+                "run_id": entry.get("run_id"),
+                "path": entry.get("path"),
+                "status": None,
+                "detail": None,
+                "expected_cells": None,
+            }
+            if entry.get("identity_error"):
+                item["status"] = "corrupt"
+                item["detail"] = str(entry["identity_error"])
+            else:
+                try:
+                    state = zresume.read_state(entry["path"])
+                except zresume.ResumeError as exc:
+                    item["status"] = "corrupt"
+                    item["detail"] = f"{type(exc).__name__}: {exc}"
+                else:
+                    item["status"] = "complete" if state["finalized"] else "resumable"
+                    item["expected_cells"] = len(state["expected_cell_ids"])
+            # An actually held writer lock is surfaced, never resumed blindly.
+            if self._zegrid_store_is_actively_locked(entry["path"]):
+                item["owner"] = {"lock": "held"}
+                if item["status"] in ("resumable", "complete"):
+                    item["status"] = "locked"
+            info["candidates"].append(item)
+        info["candidates"].sort(
+            key=lambda c: (str(c.get("run_id") or ""), str(c.get("path") or ""))
+        )
+        return info
+
+    @staticmethod
+    def _zegrid_durable_candidate_label(item: dict) -> str:
+        status = str(item.get("status") or "unknown")
+        run_id = str(item.get("run_id") or "<unknown run>")
+        cells = item.get("expected_cells")
+        suffix = f" ({cells} cell(s))" if cells is not None else ""
+        return f"{run_id} — {status}{suffix}"
+
+    def _ask_zegrid_resume_choice(
+        self,
+        resumable: Sequence[dict],
+        *,
+        new_run_safe: bool,
+        unsafe_reason: str | None,
+        other: Sequence[dict] = (),
+    ) -> tuple[str, str | None]:
+        """Explicit Resume / Start new / Cancel. Never auto-selects a run."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(
+            self._tr(
+                "qt_zegrid_resume_title",
+                "Unfinished ZeGrid run found",
+            )
+        )
+        lines = [
+            self._tr(
+                "qt_zegrid_resume_intro",
+                "A recognized unfinished durable run exists in the checkpoint "
+                "store. Resume keeps its committed cells; Start new creates a "
+                "new generation and never overwrites the old one.",
+            )
+        ]
+        for item in resumable:
+            lines.append(f"• {self._zegrid_durable_candidate_label(item)}")
+        for item in other:
+            lines.append(f"• {self._zegrid_durable_candidate_label(item)}")
+        if not new_run_safe and unsafe_reason:
+            lines.append(unsafe_reason)
+        box.setText("\n".join(lines))
+        resume_button = box.addButton(
+            self._tr("qt_zegrid_resume_action", "Resume…"),
+            QMessageBox.AcceptRole,
+        )
+        fresh_button = None
+        if new_run_safe:
+            fresh_button = box.addButton(
+                self._tr("qt_zegrid_start_new_action", "Start new run"),
+                QMessageBox.ActionRole,
+            )
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is resume_button:
+            if len(resumable) == 1:
+                selected = resumable[0]
+            else:
+                labels = [self._zegrid_durable_candidate_label(i) for i in resumable]
+                choice, ok = QInputDialog.getItem(
+                    self,
+                    self._tr(
+                        "qt_zegrid_resume_select_title",
+                        "Select the run generation to resume",
+                    ),
+                    self._tr(
+                        "qt_zegrid_resume_select_label",
+                        "Each generation is listed explicitly; nothing is "
+                        "chosen by creation date:",
+                    ),
+                    labels,
+                    0,
+                    False,
+                )
+                if not ok:
+                    return ("cancel", None)
+                selected = resumable[labels.index(choice)]
+            run_id = selected.get("run_id")
+            return ("resume", None if run_id is None else str(run_id))
+        if fresh_button is not None and clicked is fresh_button:
+            return ("fresh", None)
+        return ("cancel", None)
+
+    def _zegrid_publication_payload(self) -> Optional[dict]:
+        """The parsed visible-products marker, or ``None`` without publication.
+
+        Reads the small ``zemosaic_products.json`` entry point written by the
+        engine at the output root AFTER the atomic publication pointer is
+        durable. Its presence (with a generation and/or delivered root files)
+        is what makes a run a published ZeGrid run.
+        """
+        output_dir = str(self.config.get("output_dir", "") or "")
+        if not output_dir:
+            return None
+        root = _expand_to_path(output_dir)
+        if root is None:
+            return None
+        marker = root / "zemosaic_products.json"
+        try:
+            if not marker.is_file():
+                return None
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if not payload.get("generation_dir") and not payload.get("root_files"):
+            return None
+        return payload
+
+    def _zegrid_products_dir(self) -> Optional[Path]:
+        """The OUTPUT ROOT that actually CONTAINS the current products.
+
+        ZM-ZEGRID-ROOT-DELIVERABLES: the finished FITS are delivered at the
+        output root (Classic/SDS consistency), so the root — not the immutable
+        generation directory — is what the user opens. Returns ``None`` when no
+        publication exists (Classic/SDS/legacy paths).
+        """
+        if self._zegrid_publication_payload() is None:
+            return None
+        return _expand_to_path(str(self.config.get("output_dir", "") or ""))
+
+    def _zegrid_root_file_names(self, payload: dict) -> list[str]:
+        """The delivered root product names, in product order (may be empty)."""
+        root_files = payload.get("root_files")
+        if not isinstance(root_files, dict):
+            return []
+        names: list[str] = []
+        for role in ("science", "aesthetic", "coverage", "uint16", "manifest"):
+            row = root_files.get(role)
+            if not isinstance(row, dict):
+                continue
+            path = row.get("path")
+            if isinstance(path, str) and path:
+                names.append(Path(path).name)
+        return names
+
+    def _completion_message_text(self) -> str:
+        """The terminal success message, naming the delivered root products."""
+        message = self._tr(
+            "qt_log_processing_completed", "Processing completed successfully."
+        )
+        payload = (
+            self._zegrid_publication_payload() if self._zegrid_active else None
+        )
+        if payload is not None:
+            products = self._zegrid_products_dir()
+            if products is not None:
+                message = (
+                    f"{message} "
+                    + self._tr(
+                        "qt_log_products_location", "Products: {folder}"
+                    ).format(folder=str(products))
+                )
+                names = self._zegrid_root_file_names(payload)
+                if names:
+                    message = f"{message} ({', '.join(names)})"
+        return message
+
+    def _completion_open_target(self) -> Optional[Path]:
+        """Where the completion prompt opens: the OUTPUT ROOT of a publication.
+
+        A published ZeGrid run opens the output root, which now contains the
+        delivered FITS; every other case keeps today's behaviour (the
+        configured output folder).
+        """
+        products = (
+            self._zegrid_products_dir() if self._zegrid_active else None
+        )
+        if products is not None:
+            return products
+        return _expand_to_path(self.config.get("output_dir", "") or "")
+
+    def _zegrid_owned_output_names(
+        self, output_dir: Any, store_root: str | None
+    ) -> list[str]:
+        """GUI-owned output artifacts that are NOT foreign user content."""
+        names = [
+            "resource_telemetry.csv",
+            "run_config_snapshot.json",
+            "worker_last_state.json",
+            "worker_crash_breadcrumbs.jsonl",
+            "zegrid_publications",
+            ".zegrid_publications",
+            "zegrid-cache",
+            "__zegrid_cache__",
+        ]
+        if output_dir and store_root:
+            try:
+                rel = Path(store_root).expanduser().resolve().relative_to(
+                    Path(str(output_dir)).expanduser().resolve()
+                )
+            except Exception:
+                pass
+            else:
+                parts = rel.parts
+                # Only a DIRECT child of the output is safely ignorable by name.
+                # For a nested store, ignoring parts[0] would hide unrelated
+                # siblings under that ancestor; the precise subtree check below
+                # handles it instead.
+                if len(parts) == 1:
+                    names.append(parts[0])
+        return names
+
+    @staticmethod
+    def _zegrid_subtree_only_store(directory: Path, parts: tuple[str, ...]) -> bool:
+        """True only when ``directory`` contains exactly the store chain.
+
+        GUI-owned artifacts are tolerated at each level; ANY unrelated sibling
+        (a file, a publication, another folder) makes the ancestor foreign.
+        """
+        owned = {
+            "resource_telemetry.csv",
+            "run_config_snapshot.json",
+            "worker_last_state.json",
+            "worker_crash_breadcrumbs.jsonl",
+            "zegrid_run.log",
+            # Both cache generations are scratch, never store content.
+            "zegrid-cache",
+            "__zegrid_cache__",
+            # A PUBLICATION beside a nested store is NOT part of the store
+            # chain (it stays unrelated content for this strict subtree check).
+        }
+        current = directory
+        for index, part in enumerate(parts):
+            try:
+                entries = {entry.name for entry in current.iterdir()}
+            except OSError:
+                return False
+            allowed = owned | {part}
+            if any(name not in allowed for name in entries):
+                return False
+            current = current / part
+            if not current.is_dir():
+                return False
+        return True
+
+    def _zegrid_precise_foreign(
+        self,
+        out_path: Path,
+        foreign: list[str],
+        store_root: str | None,
+    ) -> list[str]:
+        """Drop ONLY a nested store's exact ancestor chain from the foreign list."""
+        remaining: list[str] = []
+        store_rel = None
+        if store_root:
+            try:
+                store_rel = Path(store_root).expanduser().resolve().relative_to(
+                    out_path.resolve()
+                )
+            except Exception:
+                store_rel = None
+        for name in foreign or []:
+            if (
+                store_rel is not None
+                and len(store_rel.parts) > 1
+                and name == store_rel.parts[0]
+                and self._zegrid_subtree_only_store(
+                    out_path / name, tuple(store_rel.parts[1:])
+                )
+            ):
+                continue
+            remaining.append(name)
+        return remaining
+
+    def _zegrid_resume_publication_ok(
+        self,
+        out_path: Path,
+        status: dict,
+        run_id: str,
+    ) -> tuple[bool, str | None]:
+        """Allow ONLY a verified publication generation of the SELECTED run.
+
+        This preserves the legitimate crash-after-CURRENT-before-finalized-ack
+        reconciliation: the engine's own verifier decides whether that same-run
+        generation is readable/complete. Any other run's publication, a
+        root-level publication, or a corrupt same-run generation is refused.
+        """
+        if zpublication is None:  # pragma: no cover - defensive
+            return False, self._tr(
+                "qt_zegrid_output_check_unavailable",
+                "Output safety checking is unavailable in this installation.",
+            )
+        # F2 (REWORK-4): publication-root ownership is checked for BOTH the
+        # committed-pointer and staged-only branches. Another run's staging or
+        # any foreign entry is refused even beside a valid CURRENT.json.
+        ownership = zpublication.inspect_publication_root_ownership(
+            out_path, str(run_id)
+        )
+        if not ownership.get("ok"):
+            return False, self._tr(
+                "qt_zegrid_resume_publication_ownership",
+                "The publication root contains content that does not belong to "
+                "the selected run ({reason}). Choose another output folder; "
+                "nothing was modified.",
+            ).format(reason=ownership.get("reason") or "unknown")
+        evidence = [str(item) for item in (status.get("evidence") or [])]
+        _publication_prefixes = tuple(
+            name + "/" for name in zpublication.PUBLICATION_DIRNAMES
+        )
+        other_evidence = [
+            item
+            for item in evidence
+            if not item.startswith(_publication_prefixes)
+        ]
+        if other_evidence:
+            return False, self._tr(
+                "qt_zegrid_resume_publication_unrelated",
+                "The output folder holds publication evidence that is not a "
+                "run-scoped generation of the selected run ({evidence}). "
+                "Choose another output folder; nothing was modified.",
+            ).format(evidence=", ".join(other_evidence))
+        my_root = zpublication.run_publication_root(out_path, run_id)
+        publications_root = zpublication.discover_publication_root(out_path)[0]
+        try:
+            pointers = sorted(publications_root.glob("*/CURRENT.json"))
+        except OSError as exc:
+            return False, self._tr(
+                "qt_zegrid_output_check_error",
+                "Output folder inspection failed: {error}",
+            ).format(error=f"{type(exc).__name__}: {exc}")
+        if not pointers:
+            # Objective 1 (REWORK-3): a same-run crash staging generation with
+            # NO CURRENT.json is legitimately resumable when its ownership can
+            # be proven read-only (dead owner, same run, declared plain members,
+            # no foreign/other-run content, no symlink/path escape). The staged
+            # bytes are never treated as COMPLETE: the engine still verifies
+            # identity/commits and publishes.
+            staging = zpublication.inspect_same_run_staging(out_path, str(run_id))
+            if staging.get("ok"):
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_resume_staging_recovery",
+                        "Same-run crash staging found (no CURRENT.json): "
+                        "resuming. The engine verifies identity/commits and "
+                        "publishes; staged bytes are not treated as complete.",
+                    ),
+                    level="info",
+                )
+                return True, None
+            return False, self._tr(
+                "qt_zegrid_resume_staging_refused",
+                "No verified publication generation exists for the selected "
+                "run, and the same-run staging cannot be proven safe ({reason}). "
+                "Nothing was modified.",
+            ).format(reason=staging.get("reason") or "unknown")
+        for pointer in pointers:
+            try:
+                payload = json.loads(pointer.read_bytes().decode("utf-8"))
+                pointer_run_id = str(payload.get("run_id"))
+            except Exception as exc:
+                return False, self._tr(
+                    "qt_zegrid_output_check_error",
+                    "Output folder inspection failed: {error}",
+                ).format(error=f"{type(exc).__name__}: {exc}")
+            if pointer_run_id != str(run_id):
+                return False, self._tr(
+                    "qt_zegrid_resume_publication_other_run",
+                    "The output folder contains a publication of another run "
+                    "({other}). Resuming {run_id} here would mix unrelated "
+                    "publications; choose another output folder. Nothing was "
+                    "modified.",
+                ).format(other=pointer_run_id, run_id=run_id)
+        try:
+            resolved = zpublication.resolve_current(str(out_path), str(run_id))
+        except Exception as exc:
+            return False, self._tr(
+                "qt_zegrid_resume_publication_unverified",
+                "The same-run publication in this output could not be verified "
+                "({error}); refusing to resume over it. Nothing was modified.",
+            ).format(error=f"{type(exc).__name__}: {exc}")
+        if Path(resolved.generation_dir).parent != my_root:
+            return False, self._tr(
+                "qt_zegrid_resume_publication_unrelated",
+                "The output publication does not belong to the selected "
+                "run root; refusing. Nothing was modified.",
+            )
+        return True, None
+
+    def _zegrid_output_preflight(
+        self,
+        output_dir: Any,
+        store_root: str | None,
+        *,
+        resume_run_id: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Fail-closed output check (same semantics as the CLI, no overwrite).
+
+        Pure read-only: nothing is created, deleted or modified on refusal.
+        """
+        if not output_dir or not str(output_dir).strip():
+            return False, self._tr(
+                "qt_zegrid_output_missing",
+                "No output folder is selected.",
+            )
+        try:
+            out_path = Path(str(output_dir)).expanduser()
+            input_dir = self.config.get("input_dir")
+            input_path = Path(str(input_dir)).expanduser() if input_dir else None
+        except Exception:
+            return False, self._tr(
+                "qt_zegrid_output_invalid_path",
+                "The output folder is not a usable filesystem path.",
+            )
+        if out_path.exists() and not out_path.is_dir():
+            return False, self._tr(
+                "qt_zegrid_output_is_file",
+                "The output path exists but is not a folder: {path}",
+            ).format(path=out_path)
+        if input_path is not None:
+            try:
+                if input_path.resolve() == out_path.resolve():
+                    return False, self._tr(
+                        "qt_zegrid_output_is_input",
+                        "The output folder must differ from the input folder.",
+                    )
+                out_path.resolve().relative_to(input_path.resolve())
+            except ValueError:
+                pass
+            except Exception:
+                pass
+            else:
+                return False, self._tr(
+                    "qt_zegrid_output_in_input",
+                    "The output folder must not be inside the input folder.",
+                )
+        if zpublication is None:  # pragma: no cover - defensive
+            return False, self._tr(
+                "qt_zegrid_output_check_unavailable",
+                "Output safety checking is unavailable in this installation.",
+            )
+        try:
+            status = zpublication.detect_previous_publication(
+                out_path,
+                ignore_names=self._zegrid_owned_output_names(
+                    output_dir, store_root
+                ),
+            )
+        except Exception as exc:
+            return False, self._tr(
+                "qt_zegrid_output_check_error",
+                "Output folder inspection failed: {error}",
+            ).format(error=f"{type(exc).__name__}: {exc}")
+        foreign = self._zegrid_precise_foreign(
+            out_path, list(status.get("foreign") or []), store_root
+        )
+        if foreign:
+            return False, self._tr(
+                "qt_zegrid_output_foreign",
+                "The output folder holds content that is not a ZeGrid "
+                "publication ({names}); those files are not ours to delete. "
+                "Choose a new output folder.",
+            ).format(names=", ".join(foreign))
+        if status.get("found"):
+            if resume_run_id is not None:
+                return self._zegrid_resume_publication_ok(
+                    out_path, status, str(resume_run_id)
+                )
+            return False, self._tr(
+                "qt_zegrid_output_previous_publication",
+                "The output folder already contains a previous ZeGrid "
+                "publication ({evidence}). Choose a new output folder; nothing "
+                "was overwritten.",
+            ).format(evidence=", ".join(status.get("evidence") or []))
+        return True, None
+
+    def _refuse_zegrid_launch(self, message: str) -> bool:
+        """Report an actionable refusal; never mutates anything."""
+        self._append_log(message, level="error")
+        QMessageBox.warning(
+            self,
+            self._tr(
+                "qt_zegrid_launch_refused_title",
+                "Cannot start ZeGrid here",
+            ),
+            message,
+        )
+        return False
+
+    def _prepare_zegrid_resume_for_start(self) -> bool:
+        """Decide fresh vs explicit resume BEFORE the worker is spawned.
+
+        Runs for every effective ZeGrid start (never for other modes), even if
+        the checkpoint checkbox is now OFF: a durable run left by a previous
+        session is still offered. Fail-closed: a fresh launch is refused for an
+        unsafe store (only when checkpoint saving is ON) and for ANY unsafe or
+        previously-published output. Returns False on cancel/refusal.
+        """
+        if self._selected_processing_mode() != "zegrid":
+            return True
+        output_dir = self.config.get("output_dir")
+        store_root = self._zegrid_checkpoint_store_root(output_dir)
+        discovery_root = self._zegrid_store_discovery_root(output_dir)
+        enabled = self._zegrid_save_checkpoints_enabled()
+        # F2: the store path is only relevant when this run would use it.
+        store_unsafe = (
+            self._zegrid_new_run_store_unsafe_reason(store_root, output_dir)
+            if enabled
+            else None
+        )
+        # F3: output safety applies to EVERY fresh ZeGrid launch, including
+        # checkbox-OFF and a leftover store from an older run.
+        output_safe, output_reason = self._zegrid_output_preflight(
+            output_dir, store_root
+        )
+        resumable: list[dict] = []
+        other: list[dict] = []
+        info: dict[str, Any] = {"candidates": [], "error": None}
+        if discovery_root and Path(discovery_root).is_dir():
+            info = self._classify_zegrid_durable_candidates(discovery_root)
+            for item in info["candidates"]:
+                if item.get("status") == "resumable":
+                    resumable.append(item)
+                else:
+                    other.append(item)
+        if info.get("error"):
+            message = self._tr(
+                "qt_zegrid_resume_discovery_error",
+                "Checkpoint store inspection failed: {error}. Resume cannot be "
+                "offered for this folder; choose another store/output folder.",
+            ).format(error=info["error"])
+            self._append_log(message, level="warning")
+            if enabled:
+                return self._refuse_zegrid_launch(message)
+        if resumable:
+            new_run_safe = bool(output_safe and store_unsafe is None)
+            unsafe_reason = output_reason or store_unsafe
+            choice, run_id = self._ask_zegrid_resume_choice(
+                resumable,
+                new_run_safe=new_run_safe,
+                unsafe_reason=unsafe_reason,
+                other=other,
+            )
+            if choice == "cancel":
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_resume_cancelled",
+                        "ZeGrid start cancelled: no run was selected.",
+                    ),
+                    level="warning",
+                )
+                return False
+            if choice == "resume":
+                # REWORK-2: output safety applies to RESUME too, before dispatch.
+                # A verified publication generation of the SELECTED run is
+                # legitimate (crash-after-CURRENT-before-finalized-ack
+                # reconciliation); another run's publication or foreign content
+                # is refused without modifying a byte.
+                resume_safe, resume_reason = self._zegrid_output_preflight(
+                    output_dir, store_root, resume_run_id=run_id
+                )
+                if not resume_safe:
+                    return self._refuse_zegrid_launch(str(resume_reason))
+                # Per-launch decision only: NEVER persisted into the config file,
+                # so a stale "auto" value can never hijack a later launch and
+                # the engine/CLI config contract on disk stays untouched.
+                self._pending_zegrid_resume = {
+                    "mode": "auto",
+                    "run_id": run_id,
+                    "store_dir": discovery_root,
+                }
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_resume_selected",
+                        "ZeGrid resume selected explicitly: run {run_id} in {store}.",
+                    ).format(run_id=run_id, store=discovery_root),
+                    level="info",
+                )
+                return True
+            # Fresh was chosen explicitly: it still has to pass BOTH preflights.
+            if not output_safe:
+                return self._refuse_zegrid_launch(str(output_reason))
+            if enabled and store_unsafe:
+                return self._refuse_zegrid_launch(
+                    self._tr(
+                        "qt_zegrid_store_unsafe",
+                        "Checkpoint store refused: {reason}. Nothing was created.",
+                    ).format(reason=store_unsafe)
+                )
+            self._pending_zegrid_resume = {
+                "mode": "never",
+                "run_id": None,
+                "store_dir": store_root if enabled else None,
+            }
+            self._append_log(
+                self._tr(
+                    "qt_zegrid_fresh_selected",
+                    "ZeGrid fresh run selected; existing generations are kept "
+                    "and never overwritten.",
+                ),
+                level="info",
+            )
+            return True
+        for item in other:
+            status = item.get("status")
+            if status == "complete":
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_complete_run_not_offered",
+                        "Durable run {run_id} is already complete; it is not "
+                        "offered as unfinished.",
+                    ).format(run_id=item.get("run_id")),
+                    level="info",
+                )
+            elif status in ("corrupt", "locked"):
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_bad_run_not_offered",
+                        "Durable run {run_id} is not offered ({status}): {detail}",
+                    ).format(
+                        run_id=item.get("run_id"),
+                        status=status,
+                        detail=item.get("detail") or "store in use by a live writer",
+                    ),
+                    level="warning",
+                )
+        # F2: every fresh checkpoint-enabled launch validates the store path,
+        # even when no candidate was found.
+        if enabled and store_unsafe:
+            return self._refuse_zegrid_launch(
+                self._tr(
+                    "qt_zegrid_store_unsafe",
+                    "Checkpoint store refused: {reason}. Nothing was created.",
+                ).format(reason=store_unsafe)
+            )
+        # F3: never overwrite a previous publication or foreign content.
+        if not output_safe:
+            return self._refuse_zegrid_launch(str(output_reason))
+        if enabled:
+            self._pending_zegrid_resume = {
+                "mode": "never",
+                "run_id": None,
+                "store_dir": store_root,
+            }
+            self._append_log(
+                self._tr(
+                    "qt_zegrid_checkpoint_fresh_store",
+                    "ZeGrid checkpoint saving is ON: durable commits will start "
+                    "with this run in {store}.",
+                ).format(store=store_root),
+                level="info",
+            )
+        else:
+            # OFF means the GUI run uses no durable store. This is a launch-only
+            # decision: the persisted config file (and therefore the CLI) keeps
+            # its own value exactly as it was.
+            self._pending_zegrid_resume = {
+                "mode": "never",
+                "run_id": None,
+                "store_dir": None,
+            }
+        return True
+
     def _validate_zegrid_scheduler_for_start(self) -> bool:
         """Sync/validate the scheduler mode and block only an effective ZeGrid run.
 
@@ -2165,6 +4168,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 scheduler_label.setEnabled(enabled)
             except Exception:
                 pass
+        self._apply_zegrid_policy_control_state(running=running)
         self._update_zegrid_scheduler_warning()
 
     def _validate_zegrid_halo_for_start(self) -> bool:
@@ -5063,6 +7067,60 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 return expanded
         return None
 
+    def _recover_config_after_policy_value_error(
+        self, exc: BaseException
+    ) -> Dict[str, Any]:
+        """Recover the six raw policy values without bypassing normal loading.
+
+        The strict loader refuses an invalid persisted policy value. To keep it
+        visible/editable, this helper loads a sanitised COPY of the file (the
+        six keys replaced by valid defaults) through the SAME loader, so every
+        unrelated migration and validation still runs, then overlays the raw
+        six values verbatim. Any other load failure keeps the old defaults-only
+        behaviour.
+        """
+        message = str(exc)
+        if not any(key in message for key in _ZEGRID_RUN_POLICY_KEYS):
+            return {}
+        if zemosaic_config is None or not hasattr(zemosaic_config, "load_config"):
+            return {}
+        config_path = self._config_path
+        if not config_path or not Path(str(config_path)).is_file():
+            return {}
+        try:
+            raw_payload = json.loads(
+                Path(str(config_path)).read_text(encoding="utf-8")
+            )
+        except Exception:
+            return {}
+        if not isinstance(raw_payload, dict):
+            return {}
+        sanitized = dict(raw_payload)
+        for key in _ZEGRID_RUN_POLICY_KEYS:
+            sanitized[key] = _ZEGRID_POLICY_VALID_DEFAULTS.get(key)
+        tmp_path: str | None = None
+        try:
+            handle, tmp_path = tempfile.mkstemp(
+                prefix="zemosaic-policy-recovery-", suffix=".json"
+            )
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                json.dump(sanitized, stream, indent=2, ensure_ascii=False)
+            loaded = zemosaic_config.load_config(tmp_path)
+        except Exception:
+            return {}
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        if not isinstance(loaded, dict):
+            return {}
+        for key in _ZEGRID_RUN_POLICY_KEYS:
+            if key in raw_payload:
+                loaded[key] = raw_payload[key]
+        return loaded
+
     def _load_config(self) -> Dict[str, Any]:
         config_data: Dict[str, Any] = {}
         notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
@@ -5081,7 +7139,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
                         {"error": str(exc)},
                     )
                 )
-                loaded_config = {}
+                # ZM-ZEGRID-M6-QT-POLICY: when the strict loader refuses a
+                # run-policy value, recover ONLY those six raw values. The rest
+                # of the file still goes through the normal loader (sanitised
+                # copy), so unrelated migrations/validation are not bypassed.
+                loaded_config = self._recover_config_after_policy_value_error(exc)
             else:
                 if not isinstance(loaded_config, dict):
                     notes.append(
@@ -5311,6 +7373,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if old_widget is not None:
             old_widget.deleteLater()
         self._config_fields = {}
+        self._zegrid_policy_invalid_values = {}
+        self._zegrid_policy_raw_values = {}
+        self._zegrid_policy_edited_keys = set()
         self.language_combo = None
         self.backend_combo = None
         self._setup_ui()
@@ -7025,6 +9090,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _on_worker_finished(self, success: bool, message: str) -> None:
         self.is_processing = False
+        # REWORK-2: consume the FINAL cooperative snapshot before dropping the
+        # per-run state, so a fast PROCESS_DONE cannot hide an acknowledgement.
+        try:
+            self._poll_zegrid_save_stop()
+        except Exception:
+            pass
         self._elapsed_timer.stop()
         # ZM-ETA-ALLMODES-R31 D.1: capture the GUI-observed wall duration BEFORE
         # clearing the run start (needed for the legacy/SDS success-only record).
@@ -7040,6 +9111,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.quit_save_button.setEnabled(False)
         except Exception:
             pass
+        # ZM-ZEGRID-M6-QT-STOP-RESUME: this run is over. Stop polling and drop
+        # the frozen per-run state; an unacknowledged save stays reported as
+        # not saved (never upgraded after the fact).
+        try:
+            self._save_stop_timer.stop()
+        except Exception:
+            pass
+        self._active_run_is_zegrid = False
+        self._active_stop_capability = None
+        self._active_zegrid_store_root = None
+        self._pending_run_is_zegrid = False
+        self._pending_stop_capability = None
+        if self._save_stop_state == "stopping" and self._save_stop_ack_state is None:
+            self._save_stop_state = "error"
+        self._maybe_complete_deferred_close()
 
         # Distinguish clean completion from user cancellation and errors.
         is_cancel = (not success) and (
@@ -7124,9 +9210,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 if self._zegrid_active:
                     self._eta_seconds_smoothed = 0.0
                     self._set_eta_display("00:00:00", force=True)
-            completion_message = self._tr(
-                "qt_log_processing_completed", "Processing completed successfully."
-            )
+            # r4: a published ZeGrid run NAMES where its products are (the
+            # immutable generation directory; the output root only carries the
+            # small discovery entry point).
+            completion_message = self._completion_message_text()
             self._append_log(completion_message, level="success")
             if self.isVisible():
                 QMessageBox.information(
@@ -7135,7 +9222,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     completion_message,
                 )
             # Optional post-run prompt to open the output folder, mirroring Tk.
-            output_dir_path = _expand_to_path(self.config.get("output_dir", "") or "")
+            # r4: for a published ZeGrid run this resolves to the generation
+            # directory that CONTAINS the products, never the bare output root.
+            output_dir_path = self._completion_open_target()
             if (
                 output_dir_path
                 and output_dir_path.is_dir()
@@ -7466,7 +9555,79 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._log_filter_handoff("worker_build_count", build_total)
         self._log_filter_handoff("worker_build_valid_wcs_count", build_valid)
 
+        # ZM-UNIFIED-STOP-SAVE-CAPABILITY (A2/E): transport the FROZEN capability
+        # with the run. Only ZEGRID_DURABLE may carry a durable store/resume
+        # plan; every other capability sends an explicit never/no-store payload
+        # so the child can never independently discover or enable a store the
+        # GUI refused.
+        capability = getattr(self, "_pending_stop_capability", None)
+        if capability is None:
+            # No capability was frozen (direct/internal caller outside
+            # ``_start_processing``): keep the historical transport rule so
+            # existing behaviour is unchanged. The launch flow ALWAYS freezes
+            # the capability before calling this method.
+            durable_capability = self._selected_processing_mode() == "zegrid"
+        else:
+            durable_capability = (
+                capability == self.STOP_CAPABILITY_ZEGRID_DURABLE
+            )
+        worker_kwargs["zegrid_stop_capability"] = (
+            self.STOP_CAPABILITY_ZEGRID_DURABLE
+            if durable_capability
+            else self.STOP_CAPABILITY_LEGACY_GRACEFUL
+        )
+        if durable_capability:
+            plan = self._pending_zegrid_resume
+            if isinstance(plan, dict):
+                worker_kwargs["zegrid_durable_store_dir"] = plan.get("store_dir")
+                worker_kwargs["zegrid_resume_mode"] = plan.get("mode")
+                worker_kwargs["zegrid_resume_run_id"] = plan.get("run_id")
+            else:
+                for key in (
+                    "zegrid_durable_store_dir",
+                    "zegrid_resume_mode",
+                    "zegrid_resume_run_id",
+                ):
+                    worker_kwargs[key] = cfg.get(key)
+        else:
+            worker_kwargs["zegrid_durable_store_dir"] = None
+            worker_kwargs["zegrid_resume_mode"] = "never"
+            worker_kwargs["zegrid_resume_run_id"] = None
+
         return (), worker_kwargs
+
+    def _apply_effective_zegrid_resume_to_snapshot(
+        self, snapshot: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Record the EFFECTIVE per-launch resume transport in the snapshot.
+
+        ``zegrid_resume_mode`` is deliberately NOT persisted in the config file
+        (a stale ``auto`` must never hijack a later launch), so the saved config
+        still holds the historical default. The run snapshot, however, must
+        describe the run that is actually about to start: when the GUI promotes
+        the launch to ``auto`` (explicit Resume selection) the snapshot records
+        ``auto`` — never a misleading ``never``. The engine receives exactly
+        these values, so snapshot == transport.
+        """
+        plan = self._pending_zegrid_resume
+        if not isinstance(plan, dict):
+            return snapshot
+        snapshot["zegrid_durable_store_dir"] = plan.get("store_dir")
+        snapshot["zegrid_resume_mode"] = plan.get("mode")
+        snapshot["zegrid_resume_run_id"] = plan.get("run_id")
+        return snapshot
+
+    def _snapshot_for_run(self) -> Dict[str, Any]:
+        """The run snapshot written for THIS launch (persisted config + plan).
+
+        The saved CONFIG keeps its historical default (``zegrid_resume_mode`` is
+        never persisted from a per-launch decision); the SNAPSHOT must describe
+        the run that is actually about to start, so the effective per-launch
+        resume transport is applied here, in ONE production call site.
+        """
+        snapshot = self._serialize_config_for_save()
+        self._apply_effective_zegrid_resume_to_snapshot(snapshot)
+        return snapshot
 
     def _log_run_config_snapshot(self, snapshot: Dict[str, Any]) -> None:
         keys_of_interest = [
@@ -7615,12 +9776,51 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _on_quit_save_clicked(self) -> None:
         if not self.is_processing:
+            # A spawn may still be in flight (the worker process is created on a
+            # background thread). Arm the request so the cooperative stop is
+            # delivered as soon as the controller has the channel, instead of
+            # pretending nothing is running or force-terminating later.
+            if getattr(self, "_worker_start_pending", False):
+                if not self._pending_capability_is_durable():
+                    # Other modes keep the historical meaning: nothing is
+                    # running yet, so there is nothing to stop-and-save.
+                    self._append_log(
+                        self._tr(
+                            "qt_log_stop_ignored",
+                            "No processing is currently running.",
+                        ),
+                        level="warning",
+                    )
+                    return
+                self._save_stop_when_spawned = True
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_stop_armed",
+                        "A worker is still being spawned; Stop and Save will be "
+                        "requested as soon as it is running.",
+                    ),
+                    level="warning",
+                )
+                try:
+                    self.quit_save_button.setEnabled(False)
+                except Exception:
+                    pass
+                return
             self._append_log(
                 self._tr("qt_log_stop_ignored", "No processing is currently running."),
                 level="warning",
             )
             return
 
+        # ZM-ZEGRID-M6-QT-STOP-RESUME: for a FROZEN ZeGrid run this is a
+        # COOPERATIVE stop at the engine's next safe boundary. The worker and
+        # the queue listener stay alive until the engine acknowledges; nothing
+        # is terminated and a request alone is never reported as "saved".
+        if self._active_capability_is_durable():
+            self._begin_zegrid_save_stop()
+            return
+
+        # Every other mode keeps the historical Quit-and-Save behaviour.
         self._append_log(
             self._tr("qt_log_quit_save_requested", "Quit and Save requested."),
             level="warning",
@@ -7638,21 +9838,237 @@ class ZeMosaicQtMainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _begin_zegrid_save_stop(self) -> None:
+        """Request a cooperative ZeGrid stop; keep the UI responsive."""
+        if (
+            self._save_stop_state in ("stopping", "acknowledged")
+            or self._save_stop_ack_state is not None
+        ):
+            self._append_log(
+                self._tr(
+                    "qt_zegrid_stop_already_pending",
+                    "Stop and Save is already pending; waiting for the engine's "
+                    "safe boundary.",
+                ),
+                level="info",
+            )
+            self._save_stop_timer.start()
+            return
+        result = self.worker_controller.request_cooperative_stop(
+            "GUI Stop and Save Progress"
+        )
+        if result == "unavailable":
+            # Never guess and never silently terminate: report the truth.
+            if self._worker_start_pending or self._save_stop_when_spawned:
+                # The save-and-close intent is LATCHED: the request is applied
+                # once when the controller/channel is ready. Do not drop it.
+                self._save_stop_when_spawned = True
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_stop_armed",
+                        "A worker is still being spawned; Stop and Save will be "
+                        "requested as soon as it is running.",
+                    ),
+                    level="warning",
+                )
+                return
+            self._close_after_safe_stop = False
+            self._append_log(
+                self._tr(
+                    "qt_zegrid_stop_unavailable",
+                    "Stop and Save is unavailable for this worker (no cooperative "
+                    "channel). Nothing was stopped or saved; use Stop to force "
+                    "termination.",
+                ),
+                level="error",
+            )
+            return
+        self._save_stop_state = "stopping"
+        self._save_stop_ack_state = None
+        # The ordinary Stop (force) button stays USABLE: it is the explicit
+        # human escape hatch while a cooperative save waits for a boundary.
+        try:
+            self.quit_save_button.setEnabled(False)
+        except Exception:
+            pass
+        self._append_log(
+            self._tr(
+                "qt_zegrid_stop_requested",
+                "ZeGrid stop requested. The worker keeps running until the "
+                "engine reaches a safe boundary and acknowledges (no forced "
+                "termination).",
+            ),
+            level="warning",
+        )
+        self._save_stop_timer.start()
+
+    def _poll_zegrid_save_stop(self) -> None:
+        if (
+            not self.is_processing
+            and not self._close_after_safe_stop
+            and self._save_stop_state != "stopping"
+        ):
+            self._save_stop_timer.stop()
+            return
+        snap = self.worker_controller.cooperative_stop_snapshot()
+        if snap is None:
+            self._save_stop_timer.stop()
+            return
+        if snap.get("acknowledged") and self._save_stop_ack_state is None:
+            ack_state = str(snap.get("ack_state") or "")
+            self._save_stop_ack_state = ack_state
+            detail = snap.get("ack_detail") or ""
+            if ack_state == "STOPPED_RESUMABLE":
+                self._save_stop_state = "resumable"
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_stop_saved",
+                        "ZeGrid stopped at a safe boundary: completed cells are "
+                        "committed and resumable. {detail}",
+                    ).format(detail=detail),
+                    level="success",
+                )
+            elif ack_state == "STOPPED_IN_MEMORY":
+                self._save_stop_state = "not_resumable"
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_stop_in_memory",
+                        "ZeGrid stopped at a safe boundary, but NOT resumable "
+                        "(no durable checkpoint store was active). {detail}",
+                    ).format(detail=detail),
+                    level="warning",
+                )
+            else:
+                self._save_stop_state = "error"
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_stop_unknown_ack",
+                        "ZeGrid acknowledged an unknown stop state {state!r}; "
+                        "treat this run as not saved. {detail}",
+                    ).format(state=ack_state, detail=detail),
+                    level="error",
+                )
+        if not self.worker_controller.is_running():
+            self._save_stop_timer.stop()
+            if self._save_stop_ack_state is None and self.is_processing:
+                self._save_stop_state = "error"
+                self._append_log(
+                    self._tr(
+                        "qt_zegrid_stop_exit_without_ack",
+                        "The worker exited without a cooperative stop "
+                        "acknowledgement. This run is NOT saved; check the log "
+                        "and the checkpoint store before resuming.",
+                    ),
+                    level="error",
+                )
+            self._maybe_complete_deferred_close()
+
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        """Close without blocking the GUI thread on a ZeGrid cooperative save.
+
+        * ZeGrid run/pending spawn: ask for an explicit choice once (Stop and
+          Save then close / Force stop / Cancel). Saving DEFERS the close
+          (event ignored) until the engine acknowledged AND the worker exited;
+          the event loop and queue listener stay alive. No automatic kill.
+        * Classic/SDS/existing-master (and a pending legacy spawn): the
+          historical SIGTERM/graceful path is preserved exactly.
+        """
+        if self._closing:
+            # A real, fully accepted close is already in progress.
+            super().closeEvent(event)
+            return
+
+        zegrid_run = bool(
+            self._active_capability_is_durable()
+            or self._pending_capability_is_durable()
+        )
+        busy = bool(self.is_processing or self._worker_start_pending)
+        if busy and zegrid_run:
+            if not self._close_after_safe_stop:
+                choice = self._ask_zegrid_close_choice()
+                if choice == "cancel":
+                    self._append_log(
+                        self._tr(
+                            "qt_zegrid_close_cancelled",
+                            "Close cancelled; the ZeGrid run continues.",
+                        ),
+                        level="info",
+                    )
+                    event.ignore()
+                    return
+                if choice == "force":
+                    self._append_log(
+                        self._tr(
+                            "qt_zegrid_close_force",
+                            "Closing: the worker is force-stopped now; this run "
+                            "is NOT reported as saved.",
+                        ),
+                        level="warning",
+                    )
+                    try:
+                        self.worker_controller.stop(graceful=False)
+                    except Exception:
+                        pass
+                    self._discard_pending_worker_start()
+                else:
+                    self._close_after_safe_stop = True
+                    self._append_log(
+                        self._tr(
+                            "qt_zegrid_close_while_saving",
+                            "Close deferred until the engine acknowledges a safe "
+                            "stop and the worker exits. The window stays "
+                            "responsive; use Stop to force termination.",
+                        ),
+                        level="warning",
+                    )
+                    if self._worker_start_pending or not self.worker_controller.is_running():
+                        # REWORK-2: the channel/controller may not be ready yet.
+                        # LATCH the request; it is delivered exactly once when
+                        # the spawn attaches (or cleaned up if the spawn fails).
+                        self._save_stop_when_spawned = True
+                        self._append_log(
+                            self._tr(
+                                "qt_zegrid_stop_armed",
+                                "A worker is still being spawned; Stop and Save "
+                                "will be requested as soon as it is running.",
+                            ),
+                            level="warning",
+                        )
+                        self._save_stop_timer.start()
+                    elif self._save_stop_state not in (
+                        "stopping",
+                        "resumable",
+                        "not_resumable",
+                        "error",
+                    ):
+                        self._begin_zegrid_save_stop()
+                    else:
+                        self._save_stop_timer.start()
+                    event.ignore()
+                    return
+            else:
+                # Already deferred: keep ignoring until ack AND exit.
+                self._maybe_complete_deferred_close()
+                event.ignore()
+                return
+        elif busy:
+            # Classic/SDS/existing-master (or a pending legacy spawn): unchanged.
+            try:
+                self.worker_controller.stop(graceful=True)
+            except Exception:
+                pass
+            self._discard_pending_worker_start()
+
         # Mark closing before any async decision completes so a pending spawn can
         # never finalize/attach after the window has started shutting down.
         self._closing = True
+        self._close_after_safe_stop = False
+        self._save_stop_when_spawned = False
         self._record_splitter_states()
         self._record_window_geometry()
         self._collect_config_from_widgets()
         self._apply_astap_concurrency_setting()
         self._save_config()
-        if self.is_processing:
-            try:
-                self.worker_controller.stop(graceful=True)
-            except Exception:
-                pass
-        self._discard_pending_worker_start()
 
         # Explicitly clean up GPU resources before the application fully closes.
         # This prevents CUDA errors during interpreter shutdown.
@@ -7673,6 +10089,58 @@ class ZeMosaicQtMainWindow(QMainWindow):
             pass
 
         super().closeEvent(event)
+
+    def _ask_zegrid_close_choice(self) -> str:
+        """Explicit close choice for a ZeGrid run. Never auto-selects force."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(
+            self._tr("qt_zegrid_close_title", "ZeGrid is still running")
+        )
+        box.setText(
+            self._tr(
+                "qt_zegrid_close_message",
+                "Stop at a safe boundary and save committed cells, then close? "
+                "The window stays open until the engine acknowledges and the "
+                "worker exits. You can also force-stop (the run is then not "
+                "saved) or cancel.",
+            )
+        )
+        save_button = box.addButton(
+            self._tr("qt_zegrid_close_save_action", "Stop and Save, then close"),
+            QMessageBox.AcceptRole,
+        )
+        force_button = box.addButton(
+            self._tr("qt_zegrid_close_force_action", "Force stop and close"),
+            QMessageBox.DestructiveRole,
+        )
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is save_button:
+            return "save"
+        if clicked is force_button:
+            return "force"
+        return "cancel"
+
+    def _maybe_complete_deferred_close(self) -> None:
+        """Finish a deferred close only after ack AND worker exit."""
+        if not self._close_after_safe_stop:
+            return
+        if self.worker_controller.is_running():
+            return
+        # Ack-before-exit already waited; an exit without ack stays honestly
+        # recorded as NOT saved by the poll/finish handlers.
+        QTimer.singleShot(0, self._complete_deferred_close)
+
+    def _complete_deferred_close(self) -> None:
+        if not self._close_after_safe_stop:
+            return
+        if self.worker_controller.is_running():
+            return
+        self._close_after_safe_stop = False
+        self.close()
 
     # ------------------------------------------------------------------
     # Filter integration helpers
@@ -7716,6 +10184,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
         if not self._validate_zegrid_scheduler_for_start():
             return
+        if not self._validate_zegrid_policy_for_start():
+            return
         use_existing_master_tiles = self._existing_master_tiles_enabled()
 
         skip_filter_ui_for_run = bool(predecided_skip_filter_ui) if predecided_skip_filter_ui is not None else False
@@ -7754,8 +10224,42 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
         if not self._validate_zegrid_scheduler_for_start():
             return
+        if not self._validate_zegrid_policy_for_start():
+            return
 
-        run_snapshot = self._serialize_config_for_save()
+        # ZM-UNIFIED-STOP-SAVE-CAPABILITY (A + A3): resolve the ONE stop
+        # capability of THIS launch now, after the effective mode/scheduler were
+        # validated and BEFORE the resume preflight/spawn, then freeze it with
+        # the run. ``_pending_run_is_zegrid`` keeps its historic name but now
+        # means "the frozen capability is ZEGRID_DURABLE".
+        stop_capability = self._resolve_stop_capability()
+        self._pending_stop_capability = stop_capability
+        self._pending_run_is_zegrid = (
+            stop_capability == self.STOP_CAPABILITY_ZEGRID_DURABLE
+        )
+        self._log_stop_capability(stop_capability)
+
+        if stop_capability == self.STOP_CAPABILITY_ZEGRID_DURABLE:
+            # ZM-ZEGRID-M6-QT-STOP-RESUME: discover recognized unfinished durable
+            # candidates in the chosen output/store and require an EXPLICIT
+            # Resume / Start new / Cancel decision before any worker is spawned.
+            # This runs ONLY for the durable capability.
+            if not self._prepare_zegrid_resume_for_start():
+                return
+        else:
+            # B: no .zegrid-durable inspection/creation/mutation and no ZeGrid
+            # resume prompt outside the durable capability. Strip any stale
+            # per-launch durable plan so nothing durable is transported (A2).
+            self._pending_zegrid_resume = {
+                "mode": "never",
+                "run_id": None,
+                "store_dir": None,
+            }
+
+        # ZM-ZEGRID-ACTIVE-RESUME-PARITY: the snapshot must agree with the
+        # engine. The per-launch resume decision is not persisted in the config
+        # file, so it is applied to the SNAPSHOT (effective value) only.
+        run_snapshot = self._snapshot_for_run()
         self._log_run_config_snapshot(run_snapshot)
         self._save_config()
 
@@ -7773,6 +10277,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._eta_calc = ETACalculator(total_items=100)
         self._eta_seconds_smoothed = None
         self._cpu_eta_override_deadline = None
+
+        # The capability was frozen before the preflight/spawn above; the flags
+        # below only reset the honest stop/save state of the new run.
+        self._save_stop_state = "idle"
+        self._save_stop_ack_state = None
 
         self._begin_async_worker_start(worker_args, worker_kwargs)
 
@@ -7913,9 +10422,31 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if self._closing:
             return
         self.is_processing = True
+        # A3: freeze the capability resolved BEFORE the spawn. Later widget or
+        # config edits can never reroute this run's stop.
+        self._active_stop_capability = self._pending_stop_capability
+        self._active_run_is_zegrid = bool(self._pending_run_is_zegrid)
+        plan = self._pending_zegrid_resume or {}
+        self._active_zegrid_store_root = (
+            plan.get("store_dir") if self._active_run_is_zegrid else None
+        )
         self._run_started_monotonic = time.monotonic()
         self._elapsed_timer.start()
         self._set_processing_state(True)
+        if getattr(self, "_save_stop_when_spawned", False):
+            self._save_stop_when_spawned = False
+            self._begin_zegrid_save_stop()
+        if self._active_run_is_zegrid:
+            # A cooperative stop request made during a pending spawn is already
+            # visible in the shared channel; keep the honest state.
+            snap = self.worker_controller.cooperative_stop_snapshot()
+            if snap and snap.get("requested"):
+                self._save_stop_state = "stopping"
+                try:
+                    self.quit_save_button.setEnabled(False)
+                except Exception:
+                    pass
+                self._save_stop_timer.start()
         self._append_log(
             self._tr("qt_log_processing_started", "Processing started."),
             level="info",
@@ -7924,9 +10455,19 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _handle_worker_start_failure(self, error_message: str | None) -> None:
         if self._closing:
             return
+        # REWORK-2: a failed spawn must not leave a latched save/close intent.
+        was_deferred_close = bool(self._close_after_safe_stop)
+        self._save_stop_when_spawned = False
+        self._close_after_safe_stop = False
+        if was_deferred_close:
+            # Nothing is running; the user's close intent is now safe to apply.
+            QTimer.singleShot(0, self.close)
         self.start_button.setEnabled(True)
         self.filter_button.setEnabled(not self._existing_master_tiles_enabled())
         self.stop_button.setEnabled(False)
+        self._pending_run_is_zegrid = False
+        self._pending_zegrid_resume = None
+        self._save_stop_when_spawned = False
         self._eta_calc = None
         self._eta_seconds_smoothed = None
         self._cpu_eta_override_deadline = None

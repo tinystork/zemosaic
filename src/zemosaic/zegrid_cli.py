@@ -40,6 +40,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from .core.zegrid import run_publication as zpub
+
 EXIT_OK = 0
 EXIT_REFUSED = 2
 EXIT_ERROR = 3
@@ -182,7 +184,7 @@ _ZEGRID_OUTPUT_FILE_RE = re.compile(r"^mosaic_grid.*\.fits$", re.IGNORECASE)
 
 def _publication_pointer(output_dir: Path) -> dict | None:
     """Return the newest durable publication pointer, or None."""
-    publications = output_dir / ".zegrid_publications"
+    publications, _legacy = zpub.discover_publication_root(output_dir)
     if not publications.is_dir():
         return None
     pointers = sorted(publications.glob("*/CURRENT.json"))
@@ -212,8 +214,9 @@ def _dir_publication_evidence(root: Path) -> list[str]:
         for path in sorted(root.glob("mosaic_grid*.fits")):
             if path.is_file():
                 evidence.append(path.name)
-        if (root / ".zegrid_publications").is_dir():
-            evidence.append(".zegrid_publications/")
+        for _name in zpub.PUBLICATION_DIRNAMES:
+            if (root / _name).is_dir():
+                evidence.append(_name + "/")
     except OSError:
         pass
     return evidence
@@ -230,58 +233,11 @@ def _manifest_is_zegrid(path: Path) -> bool:
 def _detect_previous_publication(output_dir: Path) -> dict:
     """Detect a previous ZeGrid publication and foreign content.
 
-    Publication evidence (C1 contract): ``zegrid_manifest.json``,
-    ``mosaic_grid*.fits``, or a ``.zegrid_publications/`` root/pointer.
-
-    REWORK-2: mount-segregated runs publish into ``grid_EQ/`` and
-    ``grid_ALTZ/`` subdirectories, so direct child directories are inspected
-    too. A child that holds a publication is ZeGrid-owned (not foreign) and its
-    contents are named in the refusal. ``zegrid_run.log`` and
-    ``__zegrid_cache__`` are ours but are NOT publication evidence on their own
-    (a failed first attempt must not block a retry).
+    Delegates to the shared neutral helper in ``core.zegrid.run_publication``
+    (the same code the Qt GUI preflight uses). CLI semantics are unchanged: no
+    ignore list, no implicit overwrite, foreign files are never ours to destroy.
     """
-    evidence: list[str] = []
-    foreign: list[str] = []
-    zegrid = False
-    if not output_dir.is_dir():
-        return {"found": False, "zegrid": False, "evidence": [], "foreign": []}
-
-    root_evidence = _dir_publication_evidence(output_dir)
-    evidence.extend(root_evidence)
-    if "zegrid_manifest.json" in root_evidence:
-        zegrid = bool(_manifest_is_zegrid(output_dir / "zegrid_manifest.json"))
-    if any(name.startswith("mosaic_grid") for name in root_evidence):
-        zegrid = True
-    if ".zegrid_publications/" in root_evidence:
-        zegrid = True
-
-    try:
-        entries = sorted(output_dir.iterdir())
-    except OSError:
-        entries = []
-    for entry in entries:
-        name = entry.name
-        if name in {
-            "zegrid_manifest.json", "zegrid_run.log",
-            "__zegrid_cache__", ".zegrid_publications",
-        }:
-            continue
-        if entry.is_file() and _ZEGRID_OUTPUT_FILE_RE.match(name):
-            continue
-        if entry.is_dir():
-            child = _dir_publication_evidence(entry)
-            if child:
-                evidence.extend(f"{name}/{item}" for item in child)
-                zegrid = True
-                continue
-        foreign.append(name)
-
-    return {
-        "found": bool(evidence),
-        "zegrid": bool(zegrid),
-        "evidence": sorted(set(evidence)),
-        "foreign": sorted(foreign),
-    }
+    return zpub.detect_previous_publication(output_dir)
 
 
 def validate_options(args) -> dict:
@@ -418,10 +374,11 @@ def _resolve_publication(output_dir: Path):
     the authoritative artifacts instead of trusting a return value:
     * no durable store: ``<output>/zegrid_manifest.json`` + its declared outputs;
     * durable store: the ``CURRENT.json`` pointer selects the published
-      generation under ``<output>/.zegrid_publications/<run>/``.
+      generation under the visible ``<output>/zegrid_publications/<run>/``
+      (a legacy ``.zegrid_publications`` container is read as a fallback).
     """
     base = output_dir
-    publications = output_dir / ".zegrid_publications"
+    publications, _legacy = zpub.discover_publication_root(output_dir)
     if publications.is_dir():
         pointers = sorted(publications.glob("*/CURRENT.json"))
         if pointers:
@@ -648,9 +605,9 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = EXIT_ERROR
     error_text = None
     stop_record: dict = {}
-    publication_before = (
-        resolved["output_dir"] / ".zegrid_publications"
-    ).exists()
+    publication_before = zpub.discover_publication_root(
+        resolved["output_dir"]
+    )[0].exists()
     # Any artifact this run publishes is written after this instant; an older
     # manifest in a reused output folder is therefore provably not ours.
     run_started_ns = time.time_ns()
@@ -788,7 +745,9 @@ def main(argv: list[str] | None = None) -> int:
             "durable_commits_valid": int(commits_valid),
             "publication_started": bool(
                 publication_before
-                or (resolved["output_dir"] / ".zegrid_publications").exists()
+                or zpub.discover_publication_root(
+                    resolved["output_dir"]
+                )[0].exists()
             ),
         }
     )

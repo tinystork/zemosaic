@@ -40,6 +40,17 @@ RESUME_MODES = (RESUME_MODE_AUTO, RESUME_MODE_NEVER)
 RESUME_STATE_SCHEMA = "zegrid-run-resume-state-v1"
 RESUME_STATE_VERSION = "1"
 RESUME_STATE_FILENAME = "state.json"
+# ZM-ZEGRID-ACTIVE-RESUME-PARITY: the admission inputs belong to the SCIENCE
+# identity, so they are FROZEN with the run at creation and REUSED on resume.
+# They are never re-derived from the current machine (free RAM changes the
+# chosen tile between two launches of the SAME run).
+ADMISSION_SCHEMA = "zegrid-run-admission-contract-v1"
+ADMISSION_VERSION = "1"
+ADMISSION_BACKENDS = ("cpu", "gpu")
+ADMISSION_REMEDY = (
+    "free enough memory so the frozen tile fits on this host again, or start "
+    "a NEW run in a NEW output folder (a new run freezes its own admission)"
+)
 
 
 class ResumeError(RuntimeError):
@@ -76,6 +87,50 @@ class ResumeCorruptGlobal(ResumeError):
 
 class ResumeLocked(ResumeError):
     pass
+
+
+class ResumeSchedulerUnsupported(ResumeError):
+    """Durable resume requested while the effective scheduler is not active.
+
+    The durable store, the result registry and the cooperative stop channel are
+    created ONLY by the ``active`` scheduler. A ``legacy``/``observe`` run can
+    therefore never consume a durable resume request: it is refused before any
+    store directory or lock is opened or created (fail-closed, no fallback).
+    """
+
+
+class ResumeFrozenAdmissionUnavailable(ResumeError):
+    """The run's FROZEN admission contract cannot be honoured on this host.
+
+    Raised instead of shrinking the tile, switching the backend, re-deriving
+    the admission from current RAM or silently starting a fresh run. The
+    attributes are structured so a caller/log can name the exact deficit.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        frozen_backend: str,
+        frozen_tile_px: int,
+        required_bytes: int | None = None,
+        available_bytes: int | None = None,
+        deficit_bytes: int | None = None,
+        detail: str | None = None,
+    ):
+        super().__init__(message)
+        self.frozen_backend = str(frozen_backend)
+        self.frozen_tile_px = int(frozen_tile_px)
+        self.required_bytes = (
+            None if required_bytes is None else int(required_bytes)
+        )
+        self.available_bytes = (
+            None if available_bytes is None else int(available_bytes)
+        )
+        self.deficit_bytes = (
+            None if deficit_bytes is None else int(deficit_bytes)
+        )
+        self.detail = detail
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +349,65 @@ def validate_policy(policy: Any) -> dict:
     }
 
 
+def validate_admission(admission: Any) -> dict:
+    """Strictly validate the FROZEN admission contract of one run.
+
+    The contract is written ONCE at run creation and never re-derived. It is
+    deliberately small and schema-versioned: effective ``backend``, the
+    ``tile_px`` that backend executes, and the ``parity_qualified`` flag that
+    qualifies a backend/tile change. Unknown/extra keys are refused like every
+    other durable section.
+    """
+    _strict_keys(
+        admission, "admission",
+        ("schema", "schema_version", "backend", "tile_px", "parity_qualified"),
+    )
+    if admission["schema"] != ADMISSION_SCHEMA:
+        raise ResumeStateError(
+            f"admission schema {admission['schema']!r} != {ADMISSION_SCHEMA!r}"
+        )
+    if str(admission["schema_version"]) != ADMISSION_VERSION:
+        raise ResumeStateError(
+            f"admission version {admission['schema_version']!r} is not "
+            f"supported ({ADMISSION_VERSION})"
+        )
+    backend = admission["backend"]
+    if not isinstance(backend, str) or backend not in ADMISSION_BACKENDS:
+        raise ResumeStateError(
+            "admission.backend must be one of "
+            f"{list(ADMISSION_BACKENDS)}, got {backend!r}"
+        )
+    tile_px = _as_int(admission["tile_px"], "admission.tile_px", minimum=1)
+    parity = admission["parity_qualified"]
+    if not isinstance(parity, bool):
+        raise ResumeStateError("admission.parity_qualified must be a boolean")
+    return {
+        "schema": ADMISSION_SCHEMA,
+        "schema_version": ADMISSION_VERSION,
+        "backend": str(backend),
+        "tile_px": int(tile_px),
+        "parity_qualified": bool(parity),
+    }
+
+
+def build_admission(
+    *,
+    backend: Any,
+    tile_px: Any,
+    parity_qualified: Any,
+) -> dict:
+    """Build and validate the frozen admission contract (never fabricated)."""
+    return validate_admission(
+        {
+            "schema": ADMISSION_SCHEMA,
+            "schema_version": ADMISSION_VERSION,
+            "backend": backend,
+            "tile_px": tile_px,
+            "parity_qualified": parity_qualified,
+        }
+    )
+
+
 def validate_state(raw: Any) -> dict:
     _strict_keys(
         raw, "resume state",
@@ -301,7 +415,7 @@ def validate_state(raw: Any) -> dict:
             "schema", "schema_version", "run_id", "created_unix_ns",
             "expected_cell_ids", "policy", "plan_generation", "finalized",
         ),
-        ("gauge_sha256", "outputs", "note"),
+        ("gauge_sha256", "outputs", "note", "admission"),
     )
     if raw["schema"] != RESUME_STATE_SCHEMA:
         raise ResumeStateError(
@@ -334,7 +448,7 @@ def validate_state(raw: Any) -> dict:
     outputs = raw.get("outputs")
     if outputs is not None and not isinstance(outputs, Mapping):
         raise ResumeStateError("resume state.outputs must be null or an object")
-    return {
+    normalised = {
         "schema": RESUME_STATE_SCHEMA,
         "schema_version": RESUME_STATE_VERSION,
         "run_id": run_id,
@@ -352,6 +466,13 @@ def validate_state(raw: Any) -> dict:
         "outputs": {} if outputs is None else dict(outputs),
         "note": None if raw.get("note") is None else str(raw["note"]),
     }
+    # BACKWARD COMPATIBILITY: a store written before this section exists has
+    # no ``admission`` key. It stays ABSENT (conservative: re-derive and refuse
+    # on mismatch); nothing is fabricated on load and no ``null`` placeholder
+    # is ever written for a store that genuinely has no frozen contract.
+    if raw.get("admission") is not None:
+        normalised["admission"] = validate_admission(raw["admission"])
+    return normalised
 
 
 def state_path(run_root: str | os.PathLike[str]) -> Path:
@@ -387,27 +508,36 @@ def write_state(
     outputs: Mapping[str, Any] | None = None,
     created_unix_ns: int | None = None,
     note: str | None = None,
+    admission: Mapping[str, Any] | None = None,
 ) -> dict:
-    """Atomically persist the frozen expected set and the effective policy."""
+    """Atomically persist the frozen expected set, policy and admission.
+
+    ``admission`` is the schema-versioned FROZEN admission contract of the run
+    (effective backend + ``tile_px`` + ``parity_qualified``). It is written at
+    CREATION and preserved verbatim afterwards; ``None`` keeps a store that
+    predates the section byte-compatible (the key is then omitted entirely, so
+    such a store stays on the conservative re-derive path).
+    """
     root = Path(run_root)
     cells = sorted({str(cid) for cid in expected_cell_ids})
-    state = validate_state(
-        {
-            "schema": RESUME_STATE_SCHEMA,
-            "schema_version": RESUME_STATE_VERSION,
-            "run_id": str(run_id),
-            "created_unix_ns": int(
-                time.time_ns() if created_unix_ns is None else created_unix_ns
-            ),
-            "expected_cell_ids": cells,
-            "policy": validate_policy(policy),
-            "plan_generation": int(plan_generation),
-            "finalized": bool(finalized),
-            "gauge_sha256": gauge_sha256,
-            "outputs": {} if outputs is None else dict(outputs),
-            "note": note,
-        }
-    )
+    payload = {
+        "schema": RESUME_STATE_SCHEMA,
+        "schema_version": RESUME_STATE_VERSION,
+        "run_id": str(run_id),
+        "created_unix_ns": int(
+            time.time_ns() if created_unix_ns is None else created_unix_ns
+        ),
+        "expected_cell_ids": cells,
+        "policy": validate_policy(policy),
+        "plan_generation": int(plan_generation),
+        "finalized": bool(finalized),
+        "gauge_sha256": gauge_sha256,
+        "outputs": {} if outputs is None else dict(outputs),
+        "note": note,
+    }
+    if admission is not None:
+        payload["admission"] = validate_admission(admission)
+    state = validate_state(payload)
     tmp_dir = root / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     zrs.atomic_write_bytes(
@@ -441,6 +571,8 @@ def update_policy(
         outputs=state["outputs"],
         created_unix_ns=state["created_unix_ns"],
         note=state["note"],
+        # The admission contract is FROZEN: a policy rewrite never touches it.
+        admission=state.get("admission"),
     )
 
 
@@ -521,6 +653,31 @@ class ResumeBootstrap:
                     f"resume state run_id {state['run_id']!r} != store run_id "
                     f"{store.run_id!r}"
                 )
+            # The frozen admission must be the run's OWN contract. A section
+            # that disagrees with the stored science identity is corruption:
+            # refuse instead of executing a fabricated/mixed admission.
+            frozen = state.get("admission")
+            if frozen is not None:
+                stored_backend = store.identity["science_contract"]["backend"]
+                observed = (
+                    str(frozen["backend"]),
+                    int(frozen["tile_px"]),
+                    bool(frozen["parity_qualified"]),
+                )
+                expected = (
+                    str(stored_backend["backend"]),
+                    int(stored_backend["tile_px"]),
+                    bool(stored_backend["parity_qualified"]),
+                )
+                if observed != expected:
+                    raise ResumeCorruptGlobal(
+                        "resume state admission disagrees with the stored run "
+                        f"identity: admission backend={observed[0]!r} "
+                        f"tile_px={observed[1]} parity_qualified={observed[2]} "
+                        f"!= identity backend={expected[0]!r} "
+                        f"tile_px={expected[1]} parity_qualified={expected[2]} "
+                        "(never a silent re-derivation)"
+                    )
         except Exception:
             store.close()
             raise
@@ -546,6 +703,12 @@ class ResumeBootstrap:
         return list(self.state["expected_cell_ids"])
 
     @property
+    def admission(self) -> dict | None:
+        """The FROZEN admission contract, or ``None`` for a pre-parity store."""
+        value = self.state.get("admission")
+        return None if value is None else dict(value)
+
+    @property
     def finalized(self) -> bool:
         return bool(self.state["finalized"])
 
@@ -560,13 +723,10 @@ class ResumeBootstrap:
             self.store.identity, candidate_identity
         )
         if not verdict["compatible"]:
-            reasons = "; ".join(
-                f"{item['section']}: {item.get('detail', '')}"
-                for item in verdict["reasons"]
-            )
             raise ResumeIncompatible(
                 "resume refused: the new process does not match the stored "
-                f"run identity ({reasons})",
+                "run identity — "
+                f"{zrs.describe_identity_mismatch(verdict['reasons'])}",
                 reasons=verdict["reasons"],
             )
         return verdict
@@ -816,6 +976,7 @@ class ResumeBootstrap:
             outputs=outputs or self.state["outputs"],
             created_unix_ns=self.state["created_unix_ns"],
             note=self.state["note"],
+            admission=self.state.get("admission"),
         )
         return self.state
 

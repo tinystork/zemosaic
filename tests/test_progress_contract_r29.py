@@ -417,7 +417,14 @@ def test_finalize_seam_ordering_writes_before_completion():
             elif name == "_emit":
                 for kw in node.keywords:
                     if kw.arg == "lvl" and isinstance(kw.value, ast.Constant) and kw.value.value == "SUCCESS":
-                        marks["success_emit"] = node.lineno
+                        # M5-B added a SECOND SUCCESS emit (the "verified no-op"
+                        # early-return for an already-complete resumed run), which
+                        # precedes the finalize seam. "Terminal success" is the
+                        # LAST SUCCESS emit in source order; ast.walk is not
+                        # source-ordered, so track the maximum line number.
+                        marks["success_emit"] = max(
+                            marks["success_emit"] or 0, node.lineno
+                        )
 
     for k in marks:
         assert marks[k] is not None, f"marker {k!r} not found in _run_single"

@@ -363,9 +363,75 @@ def test_missing_runtime_module_blocks():
 
 
 def test_real_repo_source_probe_reports_missing_declared_key():
+    """The real-tree probe must report the CURRENT truthful seam state.
+
+    Historically the declared key and the headless CLI were missing and this
+    test asserted their gaps. Later accepted work shipped both, so the probe
+    must now report them present and those gaps absent. Gap-detection coverage
+    is preserved separately by the synthetic-fixture test below (the name of
+    this node is kept for stable identity).
+    """
     source = pf.probe_source(REPO_ROOT)
     assert source["m3_seam_present"] is True
+    assert source["declared_recovery_config_key"] is True
+    assert source["headless_product_cli"] is True
+    report = _evaluate(
+        4 * GIB,
+        source=source,
+        bounded_aggregate_bytes=int(3.4 * GIB),
+    )
+    gap_codes = _codes(report, "gaps")
+    assert "GAP_NO_DECLARED_RECOVERY_CONFIG_KEY" not in gap_codes
+    assert "GAP_NO_HEADLESS_ZEGRID_CLI" not in gap_codes
+    # Gaps are disclosed but are not host blockers.
+    assert report["status"] == "READY_TO_PLAN"
+
+
+def _synthetic_source_tree(root: Path, *, declared_key: bool, headless_cli: bool) -> Path:
+    """Minimal tree carrying only the M3 seam tokens the probe checks."""
+    files = {
+        "src/zemosaic/zemosaic_zegrid_mode.py": (
+            "def run_zegrid_mode():\n"
+            "def _r55_m3_required_raw():\n"
+            "def _r55_m3_make_coordinator():\n"
+            "zegrid_resource_recovery_enabled\n"
+            "resource_readmitted\n"
+        ),
+        "src/zemosaic/core/zegrid/resource_recovery.py": (
+            "class RecoveryCoordinator:\n"
+            "class CapacityWaiter:\n"
+            "STATE_WAITING_RESOURCES\n"
+        ),
+        "src/zemosaic/core/zegrid/run_store.py": (
+            "def commit_cell():\n" "def commit_and_release():\n"
+        ),
+        "src/zemosaic/core/zegrid/runtime_control.py": (
+            "def collect_run_facts():\n" "MemAvailable\n"
+        ),
+        "src/zemosaic/zemosaic_config.py": (
+            'DEFAULT_CONFIG = {"zegrid_resource_recovery_enabled": False}\n'
+            if declared_key
+            else "DEFAULT_CONFIG = {}\n"
+        ),
+    }
+    if headless_cli:
+        files["src/zemosaic/zegrid_cli.py"] = "def build_parser():\ndef main():\n"
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def test_synthetic_source_still_reports_closed_gaps_when_missing(tmp_path):
+    """Gap detection must survive: a genuinely missing key/module still gaps."""
+    root = _synthetic_source_tree(
+        tmp_path / "repo", declared_key=False, headless_cli=False
+    )
+    source = pf.probe_source(root)
+    assert source["m3_seam_present"] is True
     assert source["declared_recovery_config_key"] is False
+    assert source["headless_product_cli"] is False
     report = _evaluate(
         4 * GIB,
         source=source,
@@ -374,7 +440,6 @@ def test_real_repo_source_probe_reports_missing_declared_key():
     gap_codes = _codes(report, "gaps")
     assert "GAP_NO_DECLARED_RECOVERY_CONFIG_KEY" in gap_codes
     assert "GAP_NO_HEADLESS_ZEGRID_CLI" in gap_codes
-    # Gaps are disclosed but are not host blockers.
     assert report["status"] == "READY_TO_PLAN"
 
 

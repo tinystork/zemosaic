@@ -30963,6 +30963,21 @@ def run_hierarchical_mosaic_classic_legacy(
 ####
 
 
+# ZM-ZEGRID-M6-QT-POLICY: sentinel for the six ZeGrid run-policy keys that
+# cross the GUI -> worker boundary. ``None`` is a MEANINGFUL value (null
+# clearing) for several of them, so absence must be distinguishable from an
+# explicit null. Absent -> the persisted config value is kept untouched.
+_ZEGRID_POLICY_UNSET = object()
+_ZEGRID_POLICY_TRANSPORT_KEYS = (
+    "zegrid_resource_recovery_enabled",
+    "zegrid_resource_recovery_deadline_s",
+    "zegrid_durable_store_budget_bytes",
+    "zegrid_cell_gauge_mode",
+    "zegrid_layout",
+    "zegrid_sip_mode",
+)
+
+
 @_close_zesolver_on_run_exit
 def run_hierarchical_mosaic(
     input_folder: str,
@@ -31074,6 +31089,30 @@ def run_hierarchical_mosaic(
     # ZM-ZEGRID-R55-B: explicit GUI/settings -> engine transport of the scheduler
     # mode. Absent -> the persisted config value; ``None`` there -> legacy.
     zegrid_scheduler_mode: str | None = None,
+    # ZM-ZEGRID-M6-QT-POLICY: explicit GUI -> worker transport of the six
+    # declared run-policy keys. Absent keeps the historical persisted-config
+    # behavior; an explicit ``None`` is an intentional null clearing and must
+    # NOT be confused with absence. Values are passed through verbatim: the
+    # single validator (``validate_zegrid_run_policy``) is the authority.
+    zegrid_resource_recovery_enabled: Any = _ZEGRID_POLICY_UNSET,
+    zegrid_resource_recovery_deadline_s: Any = _ZEGRID_POLICY_UNSET,
+    zegrid_durable_store_budget_bytes: Any = _ZEGRID_POLICY_UNSET,
+    zegrid_cell_gauge_mode: Any = _ZEGRID_POLICY_UNSET,
+    zegrid_layout: Any = _ZEGRID_POLICY_UNSET,
+    zegrid_sip_mode: Any = _ZEGRID_POLICY_UNSET,
+    # ZM-ZEGRID-M6-QT-STOP-RESUME: explicit GUI -> worker transport of the
+    # durable resume settings. Same absence semantics as the six policy keys:
+    # absent keeps the persisted config, an explicit value wins. The engine
+    # (run_resume / the store) stays the single authority for selection,
+    # identity, state, compatibility and locking.
+    zegrid_durable_store_dir: Any = _ZEGRID_POLICY_UNSET,
+    zegrid_resume_mode: Any = _ZEGRID_POLICY_UNSET,
+    zegrid_resume_run_id: Any = _ZEGRID_POLICY_UNSET,
+    # ZM-ZEGRID-M6-QT-STOP-RESUME: spawn-safe cooperative stop endpoint created
+    # by the caller with the SAME multiprocessing context as this worker's
+    # queue/process. ZeGrid only; every other mode ignores it. It is NOT a
+    # thread-local channel (those are not spawn-picklable).
+    zegrid_stop_channel: Any = None,
     # New optional integration points when filter ran in GUI
     filter_invoked: bool = False,
     filter_overrides: dict | None = None,
@@ -31122,6 +31161,32 @@ def run_hierarchical_mosaic(
         worker_config_cache["zegrid_scheduler_mode"] = zegrid_scheduler_mode
         try:
             setattr(zconfig, "zegrid_scheduler_mode", zegrid_scheduler_mode)
+        except Exception:
+            pass
+
+    # ZM-ZEGRID-M6-QT-POLICY: the GUI values are authoritative for this run when
+    # explicitly transported. No validation/coercion happens here: the engine's
+    # single validator rejects an invalid explicit value loudly.
+    _zegrid_policy_transport = {
+        "zegrid_resource_recovery_enabled": zegrid_resource_recovery_enabled,
+        "zegrid_resource_recovery_deadline_s": zegrid_resource_recovery_deadline_s,
+        "zegrid_durable_store_budget_bytes": zegrid_durable_store_budget_bytes,
+        "zegrid_cell_gauge_mode": zegrid_cell_gauge_mode,
+        "zegrid_layout": zegrid_layout,
+        "zegrid_sip_mode": zegrid_sip_mode,
+    }
+    _zegrid_durable_transport = {
+        "zegrid_durable_store_dir": zegrid_durable_store_dir,
+        "zegrid_resume_mode": zegrid_resume_mode,
+        "zegrid_resume_run_id": zegrid_resume_run_id,
+    }
+    _zegrid_policy_transport.update(_zegrid_durable_transport)
+    for _policy_key, _policy_value in _zegrid_policy_transport.items():
+        if _policy_value is _ZEGRID_POLICY_UNSET:
+            continue
+        worker_config_cache[_policy_key] = _policy_value
+        try:
+            setattr(zconfig, _policy_key, _policy_value)
         except Exception:
             pass
 
@@ -31362,6 +31427,10 @@ def run_hierarchical_mosaic(
                     zegrid_scheduler_mode=(worker_config_cache or {}).get(
                         "zegrid_scheduler_mode"
                     ),
+                    # ZM-ZEGRID-M6-QT-STOP-RESUME: the spawn-safe channel
+                    # reaches the engine ONLY here (ZeGrid). Classic/SDS paths
+                    # never receive it.
+                    stop_channel=zegrid_stop_channel,
                     zconfig=zconfig,
                     telemetry=_zg_telemetry,
                 )
@@ -36944,28 +37013,60 @@ def run_hierarchical_mosaic_process(
         except Exception:
             pass
     except Exception as e_proc:
+        # ZM-ZEGRID-M6-QT-STOP-RESUME: a cooperative stop acknowledged by the
+        # engine is a CANCELLATION at a safe boundary, not a crash. The engine
+        # already committed what it could; report the shared cancel key so the
+        # GUI never shows a false error (or a false success).
         try:
-            logger.exception("Worker process crashed before completion")
+            _stop_channel_obj = final_kwargs.get("zegrid_stop_channel")
+            _stop_acknowledged = bool(
+                _stop_channel_obj is not None
+                and getattr(_stop_channel_obj, "acknowledged", False)
+            )
         except Exception:
-            pass
-        _ctx_update(operation="worker_exception", phase="run_hierarchical_mosaic")
-        _emit_crash_breadcrumb(
-            "WORKER_EXCEPTION",
-            error=str(e_proc),
-            traceback=traceback.format_exc(),
-            context=_breadcrumb_context(),
-        )
-        progress_queue.put((
-            "PROCESS_ERROR",
-            None,
-            "ERROR",
-            {
-                "error": str(e_proc),
-                "crash_context": _breadcrumb_context(),
-                "breadcrumb_path": str(_CRASH_BREADCRUMB_PATH) if _CRASH_BREADCRUMB_PATH else None,
-                "last_state_path": str(_CRASH_STATE_PATH) if _CRASH_STATE_PATH else None,
-            },
-        ))
+            _stop_acknowledged = False
+        if _stop_acknowledged:
+            _ctx_update(
+                operation="worker_cooperative_stop",
+                phase="run_hierarchical_mosaic",
+            )
+            _emit_crash_breadcrumb(
+                "WORKER_COOPERATIVE_STOP",
+                detail=str(e_proc),
+                context=_breadcrumb_context(),
+            )
+            try:
+                progress_queue.put((
+                    "log_key_processing_cancelled",
+                    None,
+                    "WARN",
+                    {"reason": "cooperative_stop"},
+                ))
+            except Exception:
+                pass
+        else:
+            try:
+                logger.exception("Worker process crashed before completion")
+            except Exception:
+                pass
+            _ctx_update(operation="worker_exception", phase="run_hierarchical_mosaic")
+            _emit_crash_breadcrumb(
+                "WORKER_EXCEPTION",
+                error=str(e_proc),
+                traceback=traceback.format_exc(),
+                context=_breadcrumb_context(),
+            )
+            progress_queue.put((
+                "PROCESS_ERROR",
+                None,
+                "ERROR",
+                {
+                    "error": str(e_proc),
+                    "crash_context": _breadcrumb_context(),
+                    "breadcrumb_path": str(_CRASH_BREADCRUMB_PATH) if _CRASH_BREADCRUMB_PATH else None,
+                    "last_state_path": str(_CRASH_STATE_PATH) if _CRASH_STATE_PATH else None,
+                },
+            ))
     finally:
         try:
             hb_stop_evt.set()

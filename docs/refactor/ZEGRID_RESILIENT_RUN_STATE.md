@@ -1,3 +1,263 @@
+## Junior — ZM-ZEGRID-COMMIT-INTEGRITY-20261031 : ACCEPT (2026-10-31)
+
+Incident `/home/tristan/M106/OUT/RESUME_NEW` : store créé 01:33:40 avec 20 cellules attendues, `commits/` et `objects/` VIDES, index à zéro, mais `per_cell_stack` annoncé 0/20 → 19/20 pendant ~14 min, puis échec à l'assemblage `bounded_assembly.py:434 → run_store.py:2609 StoreNotFoundError: no durable commit for cell 'r0000c0000'`.
+
+Cause structurelle trouvée : la progression était émise par le callback de fin de worker (`mode.py:12149 _wave_progress`), donc AVANT la boucle de commit du parent (`mode.py:12680+ accept → commit_and_release`). Un chemin de commit dégradé paraissait donc sain pendant des minutes. Le code actuel commite correctement sur runs réels (tests r4/visibles verts) ⇒ l'incident lui-même reste NON reproduit ; c'est la fenêtre silencieuse qui est fermée.
+
+Livré : `StoreCommitNotDurable` (`run_store.py:189`), `require_commit` (`:2648`), vérification après `commit_and_release` (`mode.py:12726`), échec de commit TERMINAL, progression avancée seulement après commit vérifié (`_durable_wave` `mode.py:12556`), fail-fast avant assemblage `_require_durable_commits_before_assembly` (`mode.py:145`, appel `:15581`), lignes `durable_commits=N` au départ et à la fin.
+
+Vérification Junior indépendante :
+- hashes conformes : `run_store e92a470e…`, `mode f2f8d69e…`, `tests 447c75ef…`
+- nouvelle suite **6 passed** ; combiné parity+visible+commit+resume_m4+classic **92 passed**
+- **Probe A** (vérification par cellule retirée, syntaxe `ast.parse` OK) ⇒ `test_silent_commit_fails_at_the_first_cell` échoue ; hash restauré.
+- **Probe B** (fail-fast zéro-commit désactivé, syntaxe OK) ⇒ `test_zero_commit_store_refuses_assembly` échoue ; hash restauré.
+- rejeu : m6 unified + qt_stop_resume **95 passed, 1 deselected** ; gui_policy **48 passed** ; diff-check OK ; HEAD `87e98a46…` inchangé, 24 entrées sales, aucun commit.
+
+Limite documentée : la vérification par cellule est câblée sur la voie ACTIVE CPU (le chemin de l'incident) ; la voie GPU garde une progression pilotée par le registre, couverte par le garde zéro-commit avant assemblage.
+
+## Junior — ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031 : ACCEPT (2026-10-31)
+
+Demande produit de Tristan : ZeMosaic est open source, un utilisateur doit voir ce que le logiciel produit ; les dossiers de travail cachés doivent devenir visibles.
+
+Renommages livrés :
+- `.zegrid_publications` → `zegrid_publications` (`run_publication.py:65`, legacy en `:66`), découverte `discover_publication_root` (`:631`), `legacy_publication_in_use` (`:650`), écriture forcée visible `run_publication_root(for_write=True)`.
+- `.zegrid-durable` → `zegrid-durable` (`zemosaic_gui_qt.py:2684`, legacy `:2685`), découverte `_zegrid_store_discovery_root` (`:2716`).
+- `__zegrid_cache__` → `zegrid-cache` (`zemosaic_zegrid_mode.py:139`, legacy `:140`), marqueur de propriété `.zegrid-cache-owner`.
+Règle : nouveaux runs écrivent UNIQUEMENT les noms visibles ; les anciens dossiers cachés restent lisibles en secours avec une ligne de log explicite ; aucun déplacement/suppression/migration ; collision avec du contenu étranger ⇒ refus fail-closed. Listes de propriété (publication + cache) reconnaissent les deux noms ; CLI aligné.
+
+Vérification Junior indépendante :
+- hashes conformes : `run_publication b159bd3c…`, `mode f95419eb…`, `gui fe339b18…`, `cli dce57a4a…`, `tests 5316ca5b…`
+- nouvelle suite **13 passed** ; combiné parity+visible+resume_m4+classic **86 passed**
+- **Probe A** (renommage annulé) ⇒ `test_fresh_run_writes_only_visible_work_directories` échoue ; hash restauré.
+- **Probe B** (fallback legacy supprimé, syntaxe vérifiée par `ast.parse`) ⇒ `test_legacy_layout_resumes_and_verifies_without_being_moved` échoue ; hash restauré.
+- rejeu : m6 unified + qt_stop_resume **95 passed, 1 deselected** ; gui_policy **48 passed** ; diff-check OK ; HEAD `87e98a46…` inchangé, 23 entrées sales, aucun commit.
+
+Limites assumées : le dossier existant `/home/tristan/M106/OUT/RESUME` garde ses noms cachés (pas de migration) ; un `__zegrid_cache__` résiduel peut subsister ; le marqueur de propriété du cache reste un petit fichier caché dans un dossier visible.
+
+## Junior — r4 produits publiés visibles : ACCEPT (2026-10-31)
+
+Défaut réel : run `/home/tristan/M106/OUT/RESUME` finalisé (108/108, gen-1, verified) mais produits uniquement dans `.zegrid_publications/run-<id>/gen-1/` (science 94,5 Mo, aesthetic 94,5 Mo, coverage 31,5 Mo, manifest 493 Ko). Racine de sortie vide ; GUI « Processing completed successfully » puis propose d'ouvrir `output_dir` (la racine) ⇒ impression de run sans fichier.
+
+r4 : `write_visible_products` (`run_publication.py:2020`) écrit `zemosaic_products.json` + `PRODUCTS.txt` à la racine, pointant la génération immuable, après que `CURRENT.json` est durable ; `_replace_visible_pair` (`:1948`) staging puis deux `os.replace` avec rollback ; appels `mode.py:15968` (après commit) et `mode.py:14398` (reprise d'un run déjà complet). GUI : `_zegrid_products_dir` (`:3421`), `_completion_message_text` (`:3451`), `_completion_open_target` (`:3468`) ⇒ message nommant le dossier produits et ouverture de la génération, pas de la racine. Classic/SDS/legacy inchangés.
+
+Vérification Junior indépendante :
+- hashes conformes : `run_publication 0f81c498…`, `mode d4984604…`, `gui f9abcaeb…`, `tests e406c24d…`
+- parity suite **34 passed**
+- **Probe I** (écriture des marqueurs désactivée) ⇒ `test_published_products_are_visible_at_the_output_root` échoue ; hash restauré.
+- **Probe J** : premier essai INVALIDE (motif sur 3 lignes, remplacement d'une seule ⇒ SyntaxError, échec non probant) ; refaite proprement, syntaxe vérifiée par `ast.parse`, puis échec sémantique du test ; hash restauré.
+- rejeu : resume_m4 + classic **39 passed** ; m6 unified + qt_stop_resume **95 passed, 1 deselected** ; gui_policy **48 passed** ; diff-check OK ; HEAD `87e98a46…` inchangé, 22 entrées sales, aucun commit.
+
+Note : les marqueurs seront écrits pour le run déjà complet au prochain lancement de ce dossier (chemin idempotent `mode.py:14398`, sans recalcul). Aucun FITS copié, aucun lien symbolique.
+
+## Junior — r3 comptabilité de progression : ACCEPT (2026-10-31)
+
+Défaut confirmé par mesure sur le run live : le compteur de `per_cell_stack` repartait de 1/108 et le champ `item=` venait du préfixe du plan, alors que le moteur sautait correctement les cellules commitées. Mesures : 00:38:05 → 55 commits (47 anciennes + 8) affiché `9/108 item=r0000c0008` ; 00:38:50 → 57 commits affiché `11/108 item=r0000c0010`. Aucun fichier de commit ancien réécrit (mtimes 00:26–00:27 intacts) ⇒ aucun recalcul, uniquement un affichage faux et un ETA calculé sur le mauvais reste.
+
+r3 : `_resume_stack_accounting` (`mode.py:2264`, committed = complete + empty_validated, invariant committed + pending == total), `_resume_progress_line` (`:2285`), `_stack_item_cid` (`:2293`), offset appliqué à `_stack_report` (`:11392-11406`, `:11643`, `:11995`, offset posé `:14337`). ETA inchangé mais alimenté par le `done` corrigé.
+
+Vérification Junior indépendante :
+- hashes conformes : `mode.py 12c97e16…`, `tests 5d57a262…`
+- parity suite **30 passed**
+- **Probe G** (offset remis à 0) ⇒ `test_resume_progress_real_run_starts_from_the_committed_count` échoue ; hash restauré.
+- **Probe H** (label d'index de plan restauré) ⇒ même test échoue ; hash restauré.
+- rejeu : resume_m4 + classic **39 passed** ; m6 unified + qt_stop_resume **95 passed, 1 deselected** ; gui_policy **48 passed** ; diff-check OK ; HEAD `87e98a46…` inchangé, 22 entrées sales.
+
+Run live `/home/tristan/M106/OUT/RESUME` : arrêté à 00:42:20 par **WORKER_COOPERATIVE_STOP** (arrêt demandé, pas un crash) à **71/108 cellules commitées**. Store intact, admission cpu/tile80, reprise possible. Au prochain lancement le log devra afficher « 71/108 cells already committed, 37 to stack » et la progression démarrer à 71/108.
+
+## Junior — r2 backend gelé : ACCEPT (2026-10-31)
+
+Défaut réel observé par Tristan : store gelé `cpu/tile80`, relance avec GPU activé ⇒ refus « a GPU backend was selected for a CPU-frozen run ». Cause : le backend gelé n'était appliqué que dans un sens (`frozen gpu` sans GPU ⇒ refus) ; `frozen cpu` avec GPU sélectionné n'était pas forcé ⇒ plan GPU ⇒ refus d'identité.
+
+r2 : helper unique `_frozen_planning_gpu` (`mode.py:2264`) utilisé par les deux entrées de planification (décision de lancement `mode.py:10238`, builder `mode.py:4857`). `frozen cpu` ⇒ `effective_gpu=False`, une ligne de log « GPU ignored — CPU-frozen run ». `frozen gpu` sans GPU ⇒ refus typé inchangé. Store sans section et runs neufs ⇒ comportement inchangé. `legacy` intact.
+
+Vérification Junior indépendante :
+- hashes conformes : `mode.py 3d7b6380…`, `tests ab77ae5c…`, `run_resume 79dffcbf…`, `run_store d19d7169…`, `gui 3b3862a6…`
+- parity suite **26 passed**
+- **Probe E rejouée** : `frozen cpu` remis à `bool(gpu_used)` ⇒ 2 tests échouent ; hash restauré exact.
+- **Probe F rejouée** : refus GPU neutralisé ⇒ `test_frozen_gpu_backend_without_a_gpu_is_refused` échoue ; hash restauré exact.
+- Rejeu : resume_m4 + classic **39 passed** ; m6 unified + qt_stop_resume (hors synthetic) **95 passed, 1 deselected** ; gui_policy **48 passed** ; `git diff --check` OK ; HEAD `87e98a46…` inchangé, 22 entrées sales, aucun commit.
+
+Limite explicite : aucun run GPU réel, GPU simulé disponible dans les tests. Le store `/home/tristan/M106/OUT/RESUME` (admission cpu/tile80) devrait désormais reprendre en CPU sans décocher le GPU — à condition de lancer le code du worktree (`PYTHONPATH=$PWD/src zemosaic`), pas le beta périmé de l'install éditable.
+
+## Junior — ZM-ZEGRID-ACTIVE-RESUME-PARITY-20261030 : ACCEPT (2026-10-30)
+
+Nono review-0 = ACCEPT-WITH-CONDITIONS (C1 threading exhaustif, C2 refus propres, C3 non-vacuité). C2 fermée structurellement. **C1 et C3 échouaient réellement** : sonde Junior sur r0 — couper `frozen_admission=_frozen_admission` dans `_plan_request` laissait **17/17 verts**. La suite prouvait que le planificateur respecte une admission gelée qu'on lui donne, pas que la production la transmet.
+
+Rework r1 (même mission, même session) : 6 tests ajoutés (23 au total), helper `_admission_from_identity` (`mode.py:9572`), site de création `mode.py:14437`, `_snapshot_for_run` (`gui.py:9477`) comme point d'appel unique.
+
+Vérification Junior indépendante :
+- hashes conformes : `mode.py 6ab4fe53…`, `gui.py 3b3862a6…`, `tests f2b17df7…`, `run_resume 79dffcbf…`, `run_store d19d7169…`
+- **Probe A rejouée par Junior** : transmission coupée ⇒ `test_run_single_threads_the_frozen_admission_into_the_real_plan_request` **échoue** (1 failed, 1 passed) ; fichier restauré au hash exact.
+- **Probe D rejouée par Junior** : `_apply_effective_zegrid_resume_to_snapshot` retiré ⇒ `test_snapshot_for_run_applies_the_effective_resume_mode` **échoue** ; hash restauré exact.
+- Rejeu : parity **23 passed** ; resume_m4 + classic witness **39 passed** ; m6 unified + qt_stop_resume (hors synthetic) **95 passed, 1 deselected** ; gui_policy **48 passed** ; `git diff --check` OK ; HEAD `87e98a46b60afc201999eb0db1e9c0057c05ba3d` inchangé, aucun commit.
+
+Livré : admission (backend/tile_px/parity_qualified) gelée une fois à la création depuis l'identité validée, réutilisée en reprise au lieu d'être redérivée de la RAM courante ; ladder restreinte à la tuile gelée ; refus typé avec requis/disponible/déficit et remède ; stores anciens sans section ⇒ comportement conservateur inchangé ; `legacy` intact.
+
+Réserve connue, non bloquante : sensibilité d'ordre inter-modules préexistante (`test_real_tiny_run_uses_gui_policy_values` échoue seulement quand plusieurs suites M6 tournent dans le même process). Reproduite à l'identique sur la source r0 exacte ⇒ antérieure, hors périmètre.
+
+## Junior — active non reprenable comme legacy : diagnostic + mission bloquée (2026-10-30)
+
+Défaut confirmé sur `/home/tristan/M106/OUT/RESUME` : identité gelée `backend.cpu`, `tile_px=80`, `parity_qualified=false`, 108 cellules, canvas 3278x2403 ; refus à `mode.py:13968 _resume_boot.verify_identity` → `run_resume.py:577`, sections `grid` + `backend`.
+
+Cause : `run_resume.validate_policy` ne gèle que la politique de stockage (`requested/effective/fallback_count/transitions/dense_refusal`). Les entrées d'admission qui font partie de l'identité scientifique (`backend`, `tile_px`) sont **re-dérivées à chaque lancement** depuis les faits machine (`available_ram_bytes` injecté dans les faits de planification, `mode.py:9412`, PlanContext `~5948`). Une RAM libre différente ⇒ tuile différente ⇒ refus d'une reprise pourtant scientifiquement valide. `legacy` y échappe seulement parce que sa tuile est fixe.
+
+Nettoyage : le dossier n'était pas vide — `.zegrid-durable` (692K, run du 11:50) subsistait. Déplacé en `.zegrid-durable.stale-20261030-120602` (récupérable, rien supprimé). Le dossier est maintenant réellement vierge.
+
+Mission `ZM-ZEGRID-ACTIVE-RESUME-PARITY-20261030` rédigée (brief `.a2a-reports/...coco-mission.md`) : geler backend/tile_px/parity dans l'état durable, les réutiliser en reprise au lieu de les re-dériver, refus typé actionnable si la tuile gelée ne tient plus, compatibilité ascendante des stores sans la nouvelle section, message de refus avec valeurs stockées vs courantes, correction de l'incohérence `zegrid_resume_mode` (snapshot `never` alors que la porte AUTO a été franchie), `legacy` intact.
+
+**BLOQUÉ** : `sessions.reset` sur `agent:coco:main` a échoué 3 fois (`gateway request timeout for sessions.reset`), alors que `openclaw status` montre le gateway actif (2026.10.4, 122 sessions). Protocole : pas de nouvelle mission indépendante sans reset, pas de transport alternatif inventé. Mission staged, non dispatchée. Options : réessayer le reset plus tard, ou autorisation explicite de dispatcher sans reset.
+
+## Junior — ZM-UNIFIED-STOP-SAVE-CAPABILITY-20261030 : ACCEPT (2026-10-30)
+
+Nono review-0 = ACCEPT avec 3 LOW. Les trois conditions ont été fermées par Junior avant acceptation :
+
+- **L-1 (non-vacuité)** : sonde contrôlée sur `zemosaic_zegrid_mode.py` — garde désactivé temporairement, 5 tests échouent (`test_engine_refuses_durable_resume_without_active_scheduler` ×4 + `test_engine_guard_does_not_create_a_missing_store`). Fichier restauré, hash identique à celui du rapport Coco (`e2cab6ae…`). La suite ne passe donc pas à vide.
+- **L-2 (texte)** : `qt_zegrid_stop_saved` n'est émis que dans la branche `ack_state == "STOPPED_RESUMABLE"` ; `STOPPED_IN_MEMORY` dit explicitement « NOT resumable » ; la voie générique appelle `worker_controller.stop(graceful=True)` et n'affirme jamais de reprise.
+- **L-3 (flake SIGTERM)** : `tests/test_zegrid_m6_stop.py` est déjà suivi à HEAD (`87e98a4`), donc antérieur à ce delta et hors périmètre de la mission. Passes isolée + 3 runs combinés = vert. Reporté comme tâche séparée de stabilisation (attente fixe → poll borné), non requalifié en succès.
+
+État final : HEAD `87e98a46b60afc201999eb0db1e9c0057c05ba3d` inchangé, **aucun commit**, `beta`/`main` intactes. 20 entrées sales (15 modifiés + 5 non suivis), dont 18 de base préservées ; 2 ajouts de cette mission (`run_resume.py`, `tests/test_zegrid_m6_unified_stop_capability.py`).
+
+Capacité effective livrée : bouton unique, `ZEGRID_DURABLE` réservé à zegrid+active+checkpoints ON (gelé au lancement, transporté à l'enfant), tout le reste en arrêt gracieux historique ; refus typé du moteur pour une reprise durable hors `active`, avant tout store ou verrou.
+
+Restent ouverts et non bloquants : commit/push des deltas (non autorisés), preuve synthétique lourde stop→reprise en nouveau processus (bloquée par la RAM disponible), bench M3/NTFS Windows en attente du retour de Tristan.
+
+## Junior — vérification r0 du Stop-and-Save unifié (2026-10-30)
+
+Rapport Coco `.coco.r0.md` (DONE) relu et diff inspecté. HEAD toujours `87e98a46b60afc201999eb0db1e9c0057c05ba3d`, aucun commit, 20 entrées sales dont les 18 de base préservées.
+
+Garde-fou moteur vérifié en source : erreur typée `ResumeSchedulerUnsupported` (`core/zegrid/run_resume.py:81`), refus dans `_run_single` (`zemosaic_zegrid_mode.py:9757-9796`) placé après `normalize_resume_mode` et AVANT résolution du store, `_validate_capture_store_compatibility`, `ResumeBootstrap.open`, `select_run` et `RunCellStore.open`. Message actionable, pas de fallback silencieux, chemin `active` non touché.
+
+Résolveur de capacité vérifié : `_resolve_stop_capability` (`zemosaic_gui_qt.py:2712`) exige zegrid + scheduler `active` + checkpoints ON, et bascule en fail-closed sur valeur de scheduler non normalisable. Transport (`:9415`) envoie toujours `zegrid_stop_capability` et n'expédie les kwargs durables que pour `zegrid_durable`.
+
+Rejeu indépendant : nouvelle suite + caractérisation Classic = **61 passed** ; `test_zegrid_m6_qt_stop_resume.py -k "not synthetic"` = **51 passed, 1 skipped, 1 deselected** ; `test_zegrid_resume_m4.py` = **21 passed** ; `gui_policy + m6_stop` = **49 passed ×3**.
+
+**Flake observé** : un run combiné antérieur a fait échouer `test_sigterm_stops_resumably_with_intact_durable_commits` ; il passe isolément et sur 3 runs combinés consécutifs. Signalé à Nono comme risque à qualifier (timing pré-existant vs régression introduite), non requalifié comme succès.
+
+Revue Nono review-0 lancée, accepted `c81d6594-7560-4f90-b6f0-32e7f83e541c`, rapport attendu `.nono.r1.md`. Aucun commit/push.
+## Junior — plan Stop-and-Save unifié revu par Nono, mission confiée à Coco (2026-10-30)
+
+Défaut confirmé : run ZeGrid avec scheduler `legacy` persisté + checkpoints ON => le GUI prépare un plan durable et expose Stop and Save, mais registre/canal/store n'existent qu'en `active`. Aucun consommateur, aucun store, aucun ack.
+
+Plan `.a2a-reports/ZM-UNIFIED-STOP-SAVE-CAPABILITY-20261030.junior.plan.r0.md` : quatre capacités gelées par lancement (ZEGRID_DURABLE vs LEGACY_GRACEFUL), préflight/transport durable strictement réservés à active+checkpoints, bouton unique routé par capacité, textes honnêtes, aucune migration automatique de legacy/observe, préservation des caches Phase 1/Phase 5 Classic.
+
+Nono design review-0 = ACCEPT AVEC AMENDEMENTS (A1–A4 + 7 cas de matrice). A1 vérifié par Junior et il révèle un vrai trou : l'ouverture du store frais est bien gatée `active` (via result_registry), MAIS le bootstrap de reprise ouvre un store dès `resume_mode=auto` sans condition de scheduler. Le moteur doit donc refuser explicitement resume-auto/run_id hors `active` avant tout store ou verrou.
+
+Mission `ZM-UNIFIED-STOP-SAVE-CAPABILITY-20261030` confiée à Coco (reset confirmé) accepted/queued `21c4db58-6f6e-4cef-a020-d66e8e94cbcb`. Brief `.a2a-reports/...coco-mission.md`, rapport attendu `.coco.r0.md`, exact-source callback. Aucun commit/push ; aucun run utilisateur interrompu. Après callback : vérification Junior puis Nono.
+
+## Junior — code review accepted; full validation BLOCKED_RESOURCE (2026-10-30)
+
+Nono review3 ACCEPT read; only STATE changed since reviewed snapshot. Junior separately read GUI callsite/tests omitted by Nono, already executed independent86pass1resource-skip2deselected21.50s incl actual F1/F2 closures. Code-review ACCEPT scoped; mission NOT fullyaccepted: required C2 successful final-tree new-process resume pending, earlier attempt was RAM-refused (NOT an unattempted test). CurrentRAM0.86GiB, no retry/guard reduction/process termination. No new implementation warranted, no agents pending.
+
+Terminal state BLOCKED_RESOURCE for qualification. Next single step when RAM genuinely sufficient: replay only synthetic GUI stop/new-process resume and retain complete result. User's real-corpus Linux test separate; Windows not prerequisite for LinuxGUI.18dirty files preserved/HEAD87e98a46feature; no commit/push/merge. Usage doc corrected for actual engine refusal scope, exact worktree launch and uncommitted/status limitations (docs-only). Durable decision `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.junior.review3-decision.md`. Callback final private, no source-channel send.
+
+## Junior — r4 F1/F2 verified; final review3 queued (2026-10-30)
+
+User-authorized extension delivered. All15Coco hashes matched; only Junior docstring correction afterwards (stale all-members requirement), no executable change.18expected dirty files/feature HEAD87e98a46unchanged. Independent Qt+publication+own repros **86passed1skipped2deselected47warnings21.50s**; injected artifact failure test skipped on resource-preflight path (exact exception text not retained); no claim this exercised init error anew. Heavy synthetic/new-process and real12x384 excluded, MemAvailable1.01GiB. C2 remains pending after prior attempted RAM refusal.
+
+F1 empty/partial-stage resume and F2 unrelated-stage beside realCURRENT verified fixed by both persistent tests and own former repros, no mutations. C1 real publication proof closed. Evidence `.junior.r4.md`, `.review3-snapshot.json`, `.review3-brief.md`, `zm_qt_r4_junior_tests.log`, `zm_qt_r4_edges.py` in workspace .a2a-reports. Nono same-context review3 accepted/queued `ca29af93-080c-4790-98ce-7368172d43e7`; expected `.nono.r3.md`, read-only/lightweight. No polling/reset; wait callback. No commit/push/acceptance yet, no further correction automatically authorized after r4.
+
+## Junior — user authorizes bounded extension; REWORK4 queued (2026-10-30)
+
+Tristan: « oui tu peux reprendre » after iteration-cap HUMAN_GATE. One additional bounded correction F1/F2 authorized; same mission ZM-ZEGRID-M6-QT-STOP-RESUME-20261030/Coco context, no reset. Branch feat/zegrid-resilient-run-resume HEAD87e98a46 unchanged,18expected dirty files verified.
+
+REWORK4 accepted/queued `000ff96d-0281-4715-beca-9263138399d0`. Brief workspace `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.rework4.md`, expected `.coco.r4.md`. Scope permit valid dead-owner stage with zero/subset existing members (ownership, NOT completeness); refuse unrelated staged run beside validCURRENT; persistent real fixtures with read-only/no-mutation proofs. No engine/science/guard/default/legacy change. C2 successful independent final-tree new-process test still pending actual sufficient RAM; no heavy retry under shortage. Next callback: independent tests+F1/F2 probes, then focused Nono review if closed. NOT accepted/no commit/push; no polling.
+
+## Junior — final r3 checked; HUMAN_GATE iteration cap (2026-10-30)
+
+All15reported hashes match; feature HEAD87e98a46 unchanged,18expected dirty files. Junior81passed2deselected45warnings22.10s on Qt stop/resume + publication suite. Real CURRENT/corruption test and nested sibling fix verified. Additional2probes confirm REMAINING defects: (F1) same-run stage afterbegin with missing output members refused despite valid dead-owner marker and engine-owned orphan cleanup; (F2) unrelated run staging ignored beside selected validCURRENT. No data mutated/lost. Evidence mission `.junior.r3.md`, `zm_qt_r3_edges.py/.log`, `zm_qt_r3_junior_tests.log` in workspace .a2a-reports. Snapshot `.r3-final-snapshot.json` excludes subsequent STATE update.
+
+Three corrective iterations exhausted: HUMAN_GATE/NOTaccepted per AGENTS iteration cap, NO fourth dispatch/reset/self-fix. Recommend explicit one-round extension limited to F1 partial-member subset + F2 all-root ownership validation, then independent tests/review. No worker pending. C2 successful final-tree new-process resume still pending after earlier RAM refusal; available1.45GiB, no heavy retry/guard change. No commit/push/full-suite/Windows/GPU/user-data claim. Current callback source policy keeps final private; no source-channel message sent.
+
+## Junior — conditional review adjudicated; final REWORK3 queued (2026-10-30)
+
+Nono review2 ACCEPT callback means ACCEPT-WITH-CONDITIONS. Junior real12x12 publication probe closes C1 once: actual CURRENT/digests accepted, real science corruption refused, hashes unchanged by preflight. Corrected setup after initial missing-directory probe failures; final3passed2warnings3.44s. Evidence workspace `.a2a-reports/zm_qt_review2_probe.py` and log; adjudication mission `.junior.review2.md`.
+
+Two additional confirmed gaps: legitimate same-run orphan stage/noCURRENT refuses same-output GUI resume though engine finalization verifier accepts incomplete state; nested store ancestor allows hidden unrelated .zegrid_publications sibling. Bounded third/final Coco correction SAMEcontext accepted/queued `ea95fcfd-3508-46ef-9c62-322ca69cb40c`: strict read-only staging ownership validation, nested guard, persistent real-publication/adversarial tests. Brief mission `.rework3.md`, expected `.coco.r3.md`. No fourth corrective iteration. Source-reviewed normal listener waits for process exit (no confirmed new normal ack race); late commit cleanup concern not independently reproduced, no wider engine edits requested.
+
+MemAvailable0.84GiB: no costly integration retry, no lower guards. C2 successful independent final-tree new-process resume still pending after previous RAM refusal. NOT accepted/no commit/push. Prior Qt policy preserved, HEAD87e98a46/feature unchanged. Await callback/no polling or reset.
+
+## Junior — interruption recovered; targeted review2 queued (2026-10-30)
+
+Human requested recovery. Read durable Nono review1 after provider callback failure: requested source closures were NOT inspected, no new confirmed defect; not acceptance. Repository still feature HEAD87e98a46 with18expected dirty files, prior Qt policy delta preserved. Fresh MemAvailable1.16GiB: no heavy retry, no guard changes. Final-tree new-process completion gate remains pending after prior RAM refusal.
+
+Same Nono context review2 accepted/queued `78ff1d80-cd30-4a22-9c04-f3c585b23737`, exact source ranges supplied in `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.review2-brief.md`. Expected `.nono.r2.md`; lightweight review only. No agent reset/polling, no new Coco iteration. Two corrections used. Still NOT accepted, no commit/push. Await callback, then adjudicate findings and resource-dependent validation.
+
+## Junior — r2 verified, replay RAM refusal; Nono review1 queued (2026-10-30)
+
+Mission `ZM-ZEGRID-M6-QT-STOP-RESUME-20261030`, HEAD87e98a46/feature unchanged;18expected dirty files now include authorized engine change. All15Coco hashes match; diffcheckclean. Source fixes R1/R2/ack retention+early typed artifact refusal inspected. Junior174test progress: ONE failure, synthetic second-new-process resume rejects `R55_REFUSE_HOST_RAM`; other entries pass incl real12x384NaN early refusal+lock release. Final aggregate/duration truncated by tool, no invented green summary. Pre-run MemAvailable1.583GiB printed (not gated; should have deferred expensive integration); no guards weakened or repeated run. Earlier160pass was r1, not r2.
+
+Artifacts `/var/tmp/openclaw-tristan/pytest-of-tristan/pytest-47/test_synthetic_gui_built_stop_0`: originalstore3commits/finalizedFalse, observedcopystore4/finalizedTrue; execution observer proof passed, second spawned completion remains validation gate. No lost data or successful-final-publication claim. Preserve and rerun only with concrete resource improvement.
+
+Nono same-context review1 accepted/queued `1e89f558-4469-493e-b0af-7e0e28e010ef`; expected `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.nono.r1.md`. Review1snapshot/evidence junior.r2.md + review1-brief.md. Check prior issue closure and actual cleanup/staged-publication/ownership paths with lightweight probes; no heavy rerun under tight RAM. Two Coco corrections used; final correction only for consolidated material findings. Still NOTaccepted/no commit/push/user corpus/Windows/pressure. Await callback/no polling.
+
+## Junior — Nono FINDINGS adjudicated; REWORK-2 queued (2026-10-30)
+
+Mission `ZM-ZEGRID-M6-QT-STOP-RESUME-20261030`, HEAD87e98a46 unchanged; review snapshot unchanged except STATE. Nono confirms R1 resume output bypass/R2 pending close-latch and engine store-existence issue, no runtime probes. Junior corrects review imprecisions: engine file NOT modified; Junior NaN failure not reproduced (today NOT_RUN before generation due MemAvailable<2GiB); final publication is NOT prerequisite for assembly; blanket publication refusal must not break matching crash-after-CURRENT reconciliation. Durable adjudication `.junior.review0.md`.
+
+Second bounded correction SAME Coco/no reset accepted/queued `22ac92df-1763-44c2-8885-9af362ed5bfb`: resume-specific verified output/ownership checks incl nested-store ancestor; pending spawn Save-close latch + fast ack/done handling; authorized minimal engine explicit durable-artifact failure refusal before cells, lock cleanup, no strictJSON/science weakening, no all-payload RAM fallback; regression proofs. Brief `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.rework2.md`, expected `.coco.r2.md`. Two corrective iterations used; no polling/reset. After callback independently validate then Nono follow-up. Still NOT accepted, no commit/push/user-corpus/pressure/Windows claims.
+
+## Junior — Qt stop/resume r1 verified; independent review queued (2026-10-30)
+
+Mission `ZM-ZEGRID-M6-QT-STOP-RESUME-20261030`, same HEAD87e98a46. Coco recovery completed; all14reported hashes match, diffcheckclean, expected17dirty files. Junior **160passed,35warnings in115.09s** (Qt policy/stop-resume/config/scheduler/GPU-toggle + M4 + CLI), includes actual tiny new-process resume plus transparent dispatcher pending-only execution on copied store. NOT accepted: independent probes confirm resume branch bypasses foreign-output preflight, and Save-and-close during pending ZeGrid spawn loses request (deferredFalse/armedFalse/unavailable). Engine NaN-gauge degradation remains unresolved: publishingFalse but store-backed results selected on store existence; source checked, routine failure not independently replayed.
+
+Nono read-only review0 accepted/queued `cb15670f-bf24-48bc-a65c-88a9d3b83615`. Evidence `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.junior.r1.md`, review0-brief.md and review0-snapshot.json. Expected `.nono.r0.md`. Review consolidates confirmed R1/R2 + ack/finish races/output ownership and minimum safe engine handling before second Coco correction. One corrective iteration used (runtime recovery same iteration); keep Coco context/no reset. No commit/push, no user-corpus/pressure/Windows tests. Await callback, no polling.
+
+## Junior — REWORK-1 runtime interruption recovery (2026-10-30)
+
+Mission `ZM-ZEGRID-M6-QT-STOP-RESUME-20261030`. Explicit sessions_send delivery failure: session rebound. Authorized recovery: expected coco.r1 report ABSENT; one history read proves ebeaeb13 DID receive/rework, then terminal provider failure `Auth profile "deepseek:manual" is temporarily unavailable for deepseek/deepseek-v4-flash.` Last test observer failed ResumeIncompatible (test direct-call science mismatch, not a license to weaken identity). Partial edits preserved incl new run_publication.py + zegrid_cli.py changes; HEAD87e98a46 unchanged. No validation/acceptance of partial tree.
+
+ONE same-session continuation, no reset/model/transport change: accepted/queued `444986fe-63b2-49e3-9945-8dc81f692022`; completion NOT yet proved. Brief `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.recovery1.md`; new unique report expected `.coco.r1-recovery1.md`, phase still rework-1 (same corrective iteration). Finish F1-F4+triage, real dispatch observer proof, CLI safety regressions; preserve all prior changes. Await callback, no polling/retry loop. If same provider failure recurs, preserve/report runtime blocker rather than silently switch provider.
+
+## Junior — Qt stop/resume REWORK-1 queued (2026-10-30)
+
+Mission `ZM-ZEGRID-M6-QT-STOP-RESUME-20261030`, HEAD87e98a46 unchanged. Coco r0 DONE inspected; Junior **87passed,10warnings in59.06s** incl synthetic spawned stop/new-process resume; diffcheck clean and expected15dirty files incl prior accepted baseline. NOT accepted: closeEvent blocks GUI20sec then auto-kills (ack-before-exit also legacy kill); invalid store preflight computes but ignores reason without candidates (own3probes confirmed); foreign/publication output guards missing (own foreign-file probe admitted launch); integration resume kwargs bypass GUI selection and no execution-level no-recompute proof. Routine12x384 durable failure reported by Coco remains untriaged, not proved preexisting.
+
+Same Coco context, first correction accepted/queued `ebeaeb13-2df5-40b2-a605-f0700f895fd3`. Durable findings+brief `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.{junior.r0,rework1}.md`; await `.coco.r1.md` exact-source callback. Scope async safe close/no auto-kill, complete fail-closed preflight/data preservation, real GUI second-launch+execution proof and legacy regression, exact routine failure triage. No Nono yet (confirmed implementation defects). No commit/push; no real-corpus/physical pressure/Windows qualification. No polling/reset between corrections.
+
+## Junior — Qt Stop-and-Save + Resume implementation launched (2026-10-30)
+
+Mission `ZM-ZEGRID-M6-QT-STOP-RESUME-20261030`. User explicitly expands GUI integration: existing Stop and Save for ZeGrid only, preserve other modes, offer restart/crash resume from recognized incomplete checkpoints. Previous Qt-six-policy ACCEPT remains uncommitted; HEAD87e98a46 unchanged. Baseline snapshot in workspace .a2a-reports. Junior fresh targeted baseline: **69 passed,18warnings in14.06s** (GUI policy + M4 resume).
+
+Coco reset (counters0) then async accepted/queued `5a744772-80f9-429f-a0e0-f5fb4cf9a3f0`. Brief/report `.a2a-reports/ZM-ZEGRID-M6-QT-STOP-RESUME-20261030.{brief,coco.r0}.md`. Scope: explicit opt-in durable GUI checkpoints (defaultOFF), spawn-safe cooperative stop with ack/no automatic4sec kill, frozen-mode routing, honest status/close lifecycle, explicit valid incomplete-run selection and refusal/no-overwrite protections, real bounded synthetic spawn stop/new-process resume proof, legacy regression checks. No worker commits or pushes. Wait exact-source callback, then Junior independent checks and Nono review; no polling.
+
+User real-corpus Linux qualification remains user-owned; synthetic integration authorized. M3 pressure and Windows/NTFS remain unqualified; no RAM guard/science/global default changes. Existing GUI SIGTERM+4sec termination is inadequate for cooperative save and must remain confined to legacy behavior.
+
+## Junior — M6 Qt six-key wiring ACCEPTED locally (2026-10-29)
+
+Mission `ZM-ZEGRID-M6-QT-POLICY-20261029` terminal ACCEPT after two corrections. Nono review0 ACCEPT-WITH-CONDITIONS: C2 already satisfied (None/default vs literalauto docs+roundtrip); C1 now closed by persistent real-loader/recovery/migration/QTest/save regression. Junior final **112 passed, 1 deselected in11.15s**; earlier **221passed** includes real tiny GUI->dispatcher->engine first-run. Counts overlap; do not sum. Product11hashes unchanged since review; only test changed in r2, plus Junior STATE. Actual-dispatch kwargs signature assertion strengthened.
+
+Accepted delta remains UNCOMMITTED/UNPUSHED in `/home/tristan/.openclaw/workspace/worktrees/zemosaic-resilient-run-resume`, branch `feat/zegrid-resilient-run-resume`, HEAD`87e98a46b60afc201999eb0db1e9c0057c05ba3d`. Expected13files, diffcheckclean. No merge or activation; main projects checkout untouched. Full fast tier not green (one preexisting AST defect proven; other broadF/E untriaged), so this is scoped Qt acceptance only. Durable acceptance `.a2a-reports/ZM-ZEGRID-M6-QT-POLICY-20261029.junior.acceptance.md`.
+
+No active delegation remains. Next: Tristan's own full non-seamed Linux restart/resume, NOT_RUN here. M3physical/WindowsNTFS remain open. GUI Stop-and-Save/resume selector not included. Usage: `docs/refactor/ZEGRID_M6_QT_POLICY_USAGE_20261029.md`.
+
+## Junior — Nono review0 conditions, test-only REWORK2 (2026-10-29)
+
+Mission `ZM-ZEGRID-M6-QT-POLICY-20261029`: Nono ACCEPT-WITH-CONDITIONS; C1 persistent real-loader/recovery/unrelated-migration test genuinely missing, C2 None-vs-auto documentation/roundtrip ALREADY satisfied in usage doc18-23 and parameterized tests. Implementation hashes unchanged; only Junior STATE differs. Prior221passes and own real-file QTest probe remain valid. No new product defect found.
+
+Same Coco/no reset TEST-ONLY REWORK2 accepted/queued `63675e85-ed40-43b9-8bf7-ec6a7dbc7f1a`: port real-file/QTest probe into persistent suite, correct inaccurate r1 evidence claim, strengthen actual-dispatch signature test proportionately. No product/locale/doc/default changes; no full suite or user-owned Linuxrestart qualification. Expected `.a2a-reports/ZM-ZEGRID-M6-QT-POLICY-20261029.coco.r2.md`. Two corrections used (of3); no polling. Then independently replay added tests/check hashes and close conditions. Not accepted/committed/pushed yet.
+
+## Junior — M6 Qt r1 verified, Nono review-0 queued (2026-10-29)
+
+Mission `ZM-ZEGRID-M6-QT-POLICY-20261029`, HEAD87e98a46 unchanged. Independent replay **199+22 = 221 passed** (15.57s +75.38s), including actual tiny GUI-built invocation -> dispatcher -> engine producing2x2 despite disk1x1 and existing CLI/stop regressions. F1 explicit auto and F2 persisted-type coercion closed on tests/probes. Own real-loader/QTest/file-save probe passes (raw invalid values preserved, unrelated backend/GPU migrations retained, explicit edits accepted). Twelve implementation hashes match report; diffcheck clean.
+
+Coco report discrepancy: claimed persistent real strict-loader recovery+unrelated migration test is absent; Junior probe proves it once, not suite coverage. Generic bind_partial test also weak (prefilters keys). Sent to Nono for focused read-only review alongside code. Nono accepted/queued `b79e9ddc-b256-41a2-a7bd-da2d9a52dd7d`; expected `.a2a-reports/ZM-ZEGRID-M6-QT-POLICY-20261029.nono.r0.md`, exact-source callback. One Coco correction used; preserve same context, no polling. Broad fast tier NOT green (one AST failure proven baseline, others untriaged). No commit/push or acceptance yet. Complete non-seamed Linux restart/resume remains user-owned/NOT_RUN; M3physical/NTFS also open.
+
+## Junior — M6 Qt REWORK-1 queued (2026-10-29)
+
+Mission `ZM-ZEGRID-M6-QT-POLICY-20261029`, HEAD `87e98a46` unchanged. Junior targeted replay **177 passed, 1 deselected, 23 warnings in 17.49s**, but independent Qt probes confirm F1 literal valid gauge `auto` absent from combo (false invalid warning) and F2 strict-invalid persisted numeric strings silently converted into accepted numeric values. Scope corrections plus true null-clearing-to-engine and generic invocation-contract tests. Actual engine gauge default is `auto` (initial brief parenthetical global was stale); preserve None and literal auto separately, do not change science.
+
+Same Coco context, no reset: REWORK-1 accepted/queued `4004c040-0e6b-403a-ba20-936e20d238ae`; expected `.a2a-reports/ZM-ZEGRID-M6-QT-POLICY-20261029.coco.r1.md`. Junior evidence and brief are siblings. On callback: independent checks, then Nono. One of three corrections used; not accepted, no commit/push. Broad-tier AST failure reproduced on identical HEAD source, other reported F/E/timeouts untriaged; no full fast-tier-green claim. Complete non-seamed Linux restart/resume remains user-owned/NOT_RUN.
+
+## Junior — M6 Qt policy wiring in flight (2026-10-29)
+
+Mission `ZM-ZEGRID-M6-QT-POLICY-20261029`, baseline `87e98a46b60afc201999eb0db1e9c0057c05ba3d`, clean feature worktree before delegation. User explicitly requests the six Qt keys and reserves the complete non-seamed Linux restart/resume for his own later run.
+
+- Junior baseline: config-policy + scheduler Qt offscreen **33 passed in 4.40s**.
+- Coco reset confirmed counters zero; async dispatch accepted/queued `ffea56d9-7a18-4d2e-8b67-62bfc3fb6835`.
+- Scope: Advanced controls for recovery enabled/deadline, durable budget, gauge mode, layout and SIP; exact defaults unchanged; typed round-trip and actual GUI -> worker -> engine propagation; focused regressions and bounded first-run smoke only. No restart/resume qualification, pressure, global config changes or worker commit/push.
+- Durable brief/report under workspace `.a2a-reports/ZM-ZEGRID-M6-QT-POLICY-20261029.{brief,coco.r0}.md`. Await exact-source callback, independently verify, then Nono review. No polling; retain Coco context through any rework.
+- Full Linux restart/resume remains USER-OWNED/NOT_RUN; M3 physical and Windows/NTFS remain NOT_RUN. Qt Stop-and-Save/resume selector are not implied by the six policy fields.
+
 ## Junior — M6 ACCEPTED and published (2026-10-29)
 
 Mission `ZM-ZEGRID-M6-PRODUCT-SEAM-20261029`, base `69409fcb14d1fd13111b541a1fea15fad0630141`. Nono review-1 ACCEPT (C1 closed, C2/C3/C4 intact) after Junior re-probed the exact data-loss case on the r2 tree.

@@ -187,6 +187,9 @@ def test_exec_capture_guard_precedes_an_already_published_noop(tmp_path, monkeyp
             progress_callback=None,
             science_config=_science_config(),
             zconfig=SimpleNamespace(zegrid_durable_store_dir=str(store)),
+            # The active-only admission is legitimate and runs first; this test
+            # exercises the DIAGNOSTIC-CAPTURE guard that follows it.
+            scheduler_mode="active",
             resume_mode="auto",
             r37_diagnostic_capture=True,
         )

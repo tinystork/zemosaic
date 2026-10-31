@@ -186,6 +186,30 @@ class StoreConflictError(RunStoreError):
     """A different payload was offered for an already published identity."""
 
 
+class StoreCommitNotDurable(StoreIntegrityError):
+    """A cell was REPORTED as processed but its durable commit does not exist.
+
+    ZM-ZEGRID-COMMIT-INTEGRITY: progress must never advance on a cell that is
+    not durably committed. Naming the cell, the run and the store root makes
+    the condition actionable IMMEDIATELY instead of at assembly.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        run_id: str,
+        cell_id: str,
+        store_root: Any,
+        attempt_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.run_id = str(run_id)
+        self.cell_id = str(cell_id)
+        self.store_root = str(store_root)
+        self.attempt_id = None if attempt_id is None else str(attempt_id)
+
+
 class StoreClosedError(RunStoreError):
     """The store was closed; it accepts nothing further."""
 
@@ -1318,6 +1342,11 @@ def check_identity_compatibility(
                     "reference_sha256": ref_fp[section],
                     "candidate_sha256": cand_fp[section],
                     "detail": _section_detail(section),
+                    # A category alone is not actionable: every human-readable
+                    # section carries the STORED and CURRENT values so the log
+                    # and the GUI can name the real difference.
+                    "stored": _identity_section_summary(ref, section),
+                    "current": _identity_section_summary(cand, section),
                 }
             )
     same_run_id = str(ref["run_id"]) == str(cand["run_id"])
@@ -1351,6 +1380,96 @@ def check_identity_compatibility(
             "invalidates scientific identity"
         ),
     }
+
+
+IDENTITY_MISMATCH_REMEDY = (
+    "the stored science identity is never changed in place: free memory so the "
+    "stored backend/tile fits again, or start a NEW run in a NEW output folder"
+)
+
+
+def _identity_section_summary(identity: Mapping[str, Any], section: str) -> dict:
+    """Human-readable STORED/CURRENT values of one compatibility section."""
+    contract = identity["science_contract"]
+    if section == "backend":
+        block = contract["backend"]
+        return {
+            "backend": str(block["backend"]),
+            "tile_px": int(block["tile_px"]),
+            "parity_qualified": bool(block["parity_qualified"]),
+        }
+    if section == "grid":
+        block = contract["grid"]
+        return {
+            "nx": int(block["nx"]),
+            "ny": int(block["ny"]),
+            "tile_px": int(block["tile_px"]),
+            "expected_cells": int(contract["memberships"]["n_cells"]),
+        }
+    if section == "canvas":
+        return {
+            "shape": [int(v) for v in contract["canvas"]["shape"]],
+        }
+    if section == "memberships":
+        return {"n_cells": int(contract["memberships"]["n_cells"])}
+    if section == "halo":
+        return {"halo_px": int(contract["halo"]["halo_px"])}
+    if section == "inputs":
+        return {
+            "aggregate_sha256": str(contract["inputs"]["aggregate_sha256"]),
+            "frames": int(len(contract["inputs"]["frames"])),
+        }
+    if section == "gauge":
+        return {
+            "mode": str(contract["gauge"]["mode"]),
+            "sha256": str(contract["gauge"]["sha256"]),
+        }
+    if section == "science":
+        return {"sha256": str(contract["science"]["sha256"])}
+    if section == "dtypes":
+        return {"planes": sorted(str(k) for k in contract["dtypes"]["planes"])}
+    if section == "version":
+        return {
+            "schema": str(identity["schema"]),
+            "schema_version": str(identity["schema_version"]),
+            "contract_version": str(contract["contract_version"]),
+        }
+    return {}
+
+
+def describe_identity_mismatch(reasons: Sequence[Mapping[str, Any]]) -> str:
+    """Actionable one-line-per-section description of an identity refusal.
+
+    Names the STORED vs CURRENT ``backend``/``tile_px``, the canvas shape and
+    the expected cell count for the human-readable sections, then the remedy.
+    Never used to "repair" anything: it only explains a refusal.
+    """
+    parts: list[str] = []
+    for item in reasons:
+        section = str(item.get("section", "?"))
+        detail = str(item.get("detail", "") or "")
+        stored = item.get("stored")
+        current = item.get("current")
+        if isinstance(stored, Mapping) or isinstance(current, Mapping):
+            parts.append(
+                f"{section}: stored={_compact(stored)} "
+                f"current={_compact(current)}"
+                + (f" ({detail})" if detail else "")
+            )
+        elif stored is not None or current is not None:
+            parts.append(f"{section}: stored={stored!r} current={current!r}")
+        else:
+            parts.append(f"{section}: {detail}")
+    body = "; ".join(parts)
+    return f"{body} — remedy: {IDENTITY_MISMATCH_REMEDY}"
+
+
+def _compact(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return repr(value)
+    return "{" + ", ".join(
+        f"{key}={value[key]!r}" for key in sorted(value)
+    ) + "}"
 
 
 def _section_detail(section: str) -> str:
@@ -1658,14 +1777,11 @@ class RunCellStore:
             if candidate is not None:
                 verdict = check_identity_compatibility(stored, candidate)
                 if not verdict["compatible"]:
-                    reasons = "; ".join(
-                        f"{r['section']}: {r.get('detail', '')}"
-                        for r in verdict["reasons"]
-                    )
                     self._cleanup_failed_open()
                     raise StoreIdentityMismatch(
                         "run identity is incompatible with the stored run; "
-                        f"refusing silently: {reasons}",
+                        "refusing silently: "
+                        f"{describe_identity_mismatch(verdict['reasons'])}",
                         reasons=verdict["reasons"],
                     )
             self._identity = stored
@@ -2528,6 +2644,26 @@ class RunCellStore:
                 f"no durable commit for cell {cid!r} attempt {attempt_id!r}"
             )
         return record
+
+    def require_commit(self, cell_id: str, attempt_id: str | None = None):
+        """Return the durable commit or raise ``StoreCommitNotDurable``.
+
+        Cheap local lookup (in-memory commit index of the OPEN store). Called
+        immediately after a commit call returns: a cell whose commit is not
+        durable must never be reported as processed.
+        """
+        try:
+            return self.commit_record(cell_id, attempt_id)
+        except StoreNotFoundError as exc:
+            raise StoreCommitNotDurable(
+                "cell was reported processed but has NO durable commit: "
+                f"cell_id={cell_id!r} attempt_id={attempt_id!r} "
+                f"run_id={self.run_id!r} store_root={self.root}",
+                run_id=self.run_id,
+                cell_id=cell_id,
+                store_root=self.root,
+                attempt_id=attempt_id,
+            ) from exc
 
     def verify_cell(self, cell_id: str, attempt_id: str | None = None) -> dict:
         """Verify one cell commit and every declared object; never repairs."""

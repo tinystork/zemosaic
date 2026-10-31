@@ -746,9 +746,12 @@ def test_m5b_cleanup_removes_only_own_staging(tmp_path):
     # A failed staging generation of THIS run.
     orphan = _begin(out)
     (orphan.path_for(zpub.ROLE_SCIENCE)).write_bytes(b"staging")
-    # A foreign file and a foreign staging generation of another run.
-    (zpub.publication_root(out) / "user-note.txt").write_text("keep me")
+    # A foreign staging generation of another run is created FIRST (the
+    # publication container is still pristine, so ``begin`` is legitimate),
+    # then a foreign file appears. Cleanup must preserve BOTH, and the
+    # fail-closed collision rule in ``begin`` stays untouched.
     other = _begin(out, run_id="run-other")
+    (zpub.publication_root(out) / "user-note.txt").write_text("keep me")
     (other.path_for(zpub.ROLE_SCIENCE)).write_bytes(b"other")
     removed = zpub.cleanup_orphan_generations(out, RUN_ID)
     assert orphan.generation not in removed
@@ -1223,3 +1226,239 @@ def test_m5b_partial_state_rows_are_stale_not_verified(tmp_path):
     assert zpub.verify_finalized(out, run_root, RUN_ID).reason == (
         "verified_finalized"
     )
+
+
+# ---------------------------------------------------------------------------
+# 9. Visible root products + scratch: ownership evidence, not a whitelist
+# ---------------------------------------------------------------------------
+
+
+def _deliver_root_products(out, generation):
+    """Real root delivery + visible products for one committed generation."""
+    root_files = zpub.publish_root_deliverables(out, generation)
+    zpub.write_visible_products(out, generation, root_files=root_files)
+    return root_files
+
+
+def test_r1_own_root_products_and_scratch_are_not_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    # Safe scratch lifecycle: the staging dir is gone after a clean publish.
+    assert not (out / "tmp").exists()
+    status = zpub.detect_previous_publication(out)
+    assert status["found"] is True
+    assert status["zegrid"] is True
+    assert status["foreign"] == []
+    assert any(item.endswith("/") for item in status["evidence"])
+
+
+def test_r1_legacy_empty_scratch_dir_is_tolerated_only_with_own_products(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    # A folder produced before the scratch-lifecycle fix may retain an EMPTY
+    # tmp dir: tolerable, but only alongside a provably-owned products pair.
+    (out / "tmp").mkdir()
+    assert zpub.detect_previous_publication(out)["foreign"] == []
+    # Without the owned pair, the same empty dir is NOT whitelisted.
+    (out / "zemosaic_products.json").unlink()
+    assert "tmp" in zpub.detect_previous_publication(out)["foreign"]
+
+
+def test_r1_forged_products_text_without_json_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "PRODUCTS.txt").write_text(
+        "ZeMosaic ZeGrid — published products\nrun_id: forged\n",
+        encoding="utf-8",
+    )
+    status = zpub.detect_previous_publication(out)
+    assert status["foreign"] == ["PRODUCTS.txt"]
+
+
+def test_r1_products_identity_outside_container_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    payload = json.loads((out / "zemosaic_products.json").read_text(encoding="utf-8"))
+    payload["generation_dir"] = str(tmp_path / "elsewhere")
+    (out / "zemosaic_products.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    status = zpub.detect_previous_publication(out)
+    assert "zemosaic_products.json" in status["foreign"]
+    assert "PRODUCTS.txt" in status["foreign"]
+
+
+def test_r1_products_digest_disagreeing_with_pointer_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    payload = json.loads((out / "zemosaic_products.json").read_text(encoding="utf-8"))
+    payload["publication_sha256"] = "0" * 64
+    (out / "zemosaic_products.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    status = zpub.detect_previous_publication(out)
+    assert "zemosaic_products.json" in status["foreign"]
+
+
+def test_r1_scratch_with_user_content_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    scratch = out / "tmp"
+    scratch.mkdir()
+    (scratch / "user-note.txt").write_text("keep me", encoding="utf-8")
+    assert "tmp" in zpub.detect_previous_publication(out)["foreign"]
+    assert (scratch / "user-note.txt").is_file()
+
+
+def test_r1_symlinked_scratch_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    os.symlink(elsewhere, out / "tmp")
+    assert "tmp" in zpub.detect_previous_publication(out)["foreign"]
+
+
+def test_r1_symlinked_products_sidecar_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    copy = tmp_path / "PRODUCTS.txt"
+    copy.write_bytes((out / "PRODUCTS.txt").read_bytes())
+    (out / "PRODUCTS.txt").unlink()
+    os.symlink(copy, out / "PRODUCTS.txt")
+    status = zpub.detect_previous_publication(out)
+    assert "PRODUCTS.txt" in status["foreign"]
+    assert "zemosaic_products.json" in status["foreign"]
+
+
+# ---------------------------------------------------------------------------
+# 10. Ownership requires a valid, matching CURRENT pointer (rework-2 C1)
+# ---------------------------------------------------------------------------
+
+
+def _pointer_path(generation):
+    return generation.generation_dir.parent / zpub.POINTER_FILENAME
+
+
+def test_r2_missing_current_refuses_mutually_forged_sidecars(tmp_path):
+    """Two agreeing sidecars are NOT authority when CURRENT is absent."""
+    from zemosaic import zegrid_cli as cli
+
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in"
+    inp.mkdir()
+    fits.writeto(inp / "one.fits", np.zeros((H, W), dtype=np.float32))
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    committed = gen.publication_path.read_bytes()
+    committed_sha = hashlib.sha256(committed).hexdigest()
+
+    # Lost pointer: the immutable publication.json survives with its real SHA.
+    _pointer_path(gen).unlink()
+    payload = json.loads(
+        (out / zpub.PRODUCTS_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    real_sha = payload["publication_sha256"]
+    forged = "0" * 64
+    assert forged != real_sha and forged != committed_sha
+    payload["publication_sha256"] = forged
+    (out / zpub.PRODUCTS_JSON_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    text = (out / zpub.PRODUCTS_TEXT_FILENAME).read_text(encoding="utf-8")
+    (out / zpub.PRODUCTS_TEXT_FILENAME).write_text(
+        text.replace(real_sha, forged), encoding="utf-8"
+    )
+
+    before = _world_state(out)
+    assert zpub._own_products_sidecars(out) is False
+    status = zpub.detect_previous_publication(out)
+    assert "zemosaic_products.json" in status["foreign"]
+    assert "PRODUCTS.txt" in status["foreign"]
+
+    # The REAL CLI refusal path, not just the helper.
+    args = cli.build_parser().parse_args(
+        ["--input", str(inp), "--output", str(out), "--overwrite"]
+    )
+    with pytest.raises(cli.RefusedOption):
+        cli.validate_options(args)
+
+    # Neither detection nor validation mutates anything on disk.
+    assert _world_state(out) == before
+    assert gen.publication_path.read_bytes() == committed
+    assert hashlib.sha256(gen.publication_path.read_bytes()).hexdigest() == committed_sha
+
+
+def test_r2_missing_current_with_genuine_sidecars_stays_foreign(tmp_path):
+    """Even unmodified genuine sidecars confer no ownership without CURRENT."""
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    assert zpub._own_products_sidecars(out) is True
+    _pointer_path(gen).unlink()
+    assert zpub._own_products_sidecars(out) is False
+    status = zpub.detect_previous_publication(out)
+    assert "zemosaic_products.json" in status["foreign"]
+    assert "PRODUCTS.txt" in status["foreign"]
+
+
+def test_r2_malformed_current_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    _pointer_path(gen).write_text("{not-json", encoding="utf-8")
+    assert zpub._own_products_sidecars(out) is False
+    status = zpub.detect_previous_publication(out)
+    assert "zemosaic_products.json" in status["foreign"]
+    assert "PRODUCTS.txt" in status["foreign"]
+
+
+def test_r2_current_naming_another_generation_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    pointer = _pointer_path(gen)
+    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    payload["generation"] = "gen-2"
+    pointer.write_text(json.dumps(payload), encoding="utf-8")
+    assert zpub._own_products_sidecars(out) is False
+    assert "zemosaic_products.json" in zpub.detect_previous_publication(out)["foreign"]
+
+
+def test_r2_current_naming_another_run_stays_foreign(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    pointer = _pointer_path(gen)
+    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    payload["run_id"] = "run-someone-else"
+    pointer.write_text(json.dumps(payload), encoding="utf-8")
+    assert zpub._own_products_sidecars(out) is False
+
+
+def test_r2_valid_matching_current_is_still_owned(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    gen, *_ = _publish(out)
+    _deliver_root_products(out, gen)
+    assert zpub._own_products_sidecars(out) is True
+    assert zpub.detect_previous_publication(out)["foreign"] == []

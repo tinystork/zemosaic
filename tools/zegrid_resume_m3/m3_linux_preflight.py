@@ -477,6 +477,32 @@ def probe_source(repo_root: str | os.PathLike[str]) -> dict:
     declared_recovery_key = '"zegrid_resource_recovery_enabled"' in config_text
     declared_resume_key = '"zegrid_resume_mode"' in config_text
     declared_store_key = '"zegrid_durable_store_dir"' in config_text
+    # The headless CLI is a shipped product entry: detect the real module and
+    # its parser/main seam instead of hard-coding absence.
+    cli_path = repo / "src/zemosaic/zegrid_cli.py"
+    cli_text = ""
+    if cli_path.is_file():
+        try:
+            cli_text = cli_path.read_text(encoding="utf-8")
+        except OSError:
+            cli_text = ""
+    headless_cli = bool(
+        cli_text and "def build_parser(" in cli_text and "def main(" in cli_text
+    )
+    if declared_recovery_key and headless_cli:
+        activation_note = (
+            "run_zegrid_mode() is a real Python product entry; "
+            "zegrid_resource_recovery_enabled is a declared config key and a "
+            "headless ZeGrid CLI ships, so the protocol can use the shipped "
+            "entry points directly."
+        )
+    else:
+        activation_note = (
+            "run_zegrid_mode() is a real Python product entry, but this tree "
+            "lacks a declared zegrid_resource_recovery_enabled config key "
+            "and/or a headless ZeGrid CLI; enabling M3 then requires a zconfig "
+            "attribute (harness seam) until the product key exists."
+        )
     return {
         "files": checks,
         "missing_files": missing_files,
@@ -485,13 +511,8 @@ def probe_source(repo_root: str | os.PathLike[str]) -> dict:
         "declared_recovery_config_key": declared_recovery_key,
         "declared_resume_config_key": declared_resume_key,
         "declared_durable_store_config_key": declared_store_key,
-        "headless_product_cli": False,
-        "activation_note": (
-            "run_zegrid_mode() is a real Python product entry, but this tree "
-            "declares no shipped zegrid_resource_recovery_enabled config key "
-            "and no headless ZeGrid CLI. Enabling M3 therefore requires a "
-            "zconfig attribute (harness seam) until a product key exists."
-        ),
+        "headless_product_cli": headless_cli,
+        "activation_note": activation_note,
     }
 
 

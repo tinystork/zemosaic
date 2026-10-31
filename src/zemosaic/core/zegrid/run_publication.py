@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -58,11 +59,25 @@ SCHEMA = "zemosaic.zegrid.run_publication.v1"
 POINTER_SCHEMA = "zemosaic.zegrid.run_publication_pointer.v1"
 STAGING_SCHEMA = "zemosaic.zegrid.run_publication_staging.v1"
 
-PUBLICATION_DIRNAME = ".zegrid_publications"
+# ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031: the work/publication directories are
+# VISIBLE (open-source transparency). The old dot-prefixed names are read-only
+# legacy fallbacks: never moved, renamed, deleted or written by a new run.
+PUBLICATION_DIRNAME = "zegrid_publications"
+LEGACY_PUBLICATION_DIRNAME = ".zegrid_publications"
+PUBLICATION_DIRNAMES = (PUBLICATION_DIRNAME, LEGACY_PUBLICATION_DIRNAME)
+LEGACY_CACHE_DIRNAME = "__zegrid_cache__"
+CACHE_DIRNAME = "zegrid-cache"
 PUBLICATION_FILENAME = "publication.json"
 POINTER_FILENAME = "CURRENT.json"
 STAGING_FILENAME = ".staging.json"
 GENERATION_PREFIX = "gen-"
+# ZM-ZEGRID-ACTIVE-RESUME-PARITY r4: VISIBLE discovery entry point at the output
+# root. The atomic generations stay where they are (hidden directory); these two
+# small files name the CURRENT immutable generation so a completed run is not
+# invisible to the user. Never a copy of a FITS, never a symlink.
+PRODUCTS_JSON_FILENAME = "zemosaic_products.json"
+PRODUCTS_TEXT_FILENAME = "PRODUCTS.txt"
+PRODUCTS_SCHEMA = "zemosaic.zegrid.products.v1"
 
 #: Free-space kept untouched so an atomic pointer/temp write can always be
 #: rolled back. This is a real floor, never lowered to make a test pass.
@@ -609,15 +624,267 @@ class PublishedGeneration:
 
 
 def publication_root(output_dir: str | os.PathLike[str]) -> Path:
+    """The WRITE path of the publication container (always the visible name)."""
     return Path(output_dir) / PUBLICATION_DIRNAME
+
+
+def discover_publication_root(
+    output_dir: str | os.PathLike[str],
+) -> tuple[Path, bool]:
+    """Resolve the publication container for READING.
+
+    Returns ``(path, legacy)``: the visible name when it exists (or when neither
+    exists), else the legacy hidden name when ONLY it exists. Nothing is moved
+    or created here; a legacy layout is a read-only fallback.
+    """
+    root = Path(output_dir)
+    visible = root / PUBLICATION_DIRNAME
+    legacy = root / LEGACY_PUBLICATION_DIRNAME
+    if visible.exists() or visible.is_symlink():
+        return visible, False
+    if legacy.exists() or legacy.is_symlink():
+        return legacy, True
+    return visible, False
+
+
+def legacy_publication_in_use(
+    output_dir: str | os.PathLike[str],
+) -> Path | None:
+    """The legacy publication root when it is the one that will be READ."""
+    _path, legacy = discover_publication_root(output_dir)
+    if not legacy:
+        return None
+    return _path
+
+
+# ---------------------------------------------------------------------------
+# Previous-publication / foreign-content detection (shared CLI + GUI semantics)
+# ---------------------------------------------------------------------------
+
+ZEGRID_OUTPUT_FILE_RE = re.compile(r"^mosaic_grid.*\.fits$", re.IGNORECASE)
+
+
+def _dir_publication_evidence(root: Path) -> list[str]:
+    """Publication evidence directly inside one directory (no recursion)."""
+    evidence: list[str] = []
+    try:
+        if (root / "zegrid_manifest.json").is_file():
+            evidence.append("zegrid_manifest.json")
+        for path in sorted(root.glob("mosaic_grid*.fits")):
+            if path.is_file():
+                evidence.append(path.name)
+        for _name in PUBLICATION_DIRNAMES:
+            if (root / _name).is_dir():
+                evidence.append(_name + "/")
+    except OSError:
+        pass
+    return evidence
+
+
+def _manifest_is_zegrid(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_bytes().decode("utf-8"))
+        return isinstance(payload, dict) and payload.get("engine") == "zegrid"
+    except Exception:
+        return False
+
+
+def _is_plain_file(path: Path) -> bool:
+    """A real regular file, never a symlink/junction."""
+    return path.is_file() and not _is_link(path)
+
+
+def _drop_empty_scratch(tmp: Path) -> None:
+    """Remove our staging dir only when it is a plain, EMPTY directory.
+
+    Safe scratch lifecycle: ``rmdir`` alone never deletes content, so a user
+    file, a symlink or a nested directory always survives.
+    """
+    try:
+        if tmp.is_dir() and not _is_link(tmp) and not any(tmp.iterdir()):
+            tmp.rmdir()
+    except OSError:
+        pass
+
+
+def _own_products_sidecars(root: Path) -> bool:
+    """True when BOTH visible product sidecars are provably OURS.
+
+    Strong ownership evidence (all required):
+      * ``zemosaic_products.json`` and ``PRODUCTS.txt`` are plain files, never
+        symlinks/junctions;
+      * the JSON carries OUR schema and a run/generation identity;
+      * ``generation_dir`` resolves EXACTLY to this output's immutable
+        generation directory, which must be a plain existing directory;
+      * a valid, plain CURRENT pointer must exist and name the same run,
+        generation and ``publication_sha256``;
+      * ``PRODUCTS.txt`` must describe that same run/generation/digest.
+
+    Anything forged, partial, stale or linked is treated as foreign.
+    """
+    json_path = root / PRODUCTS_JSON_FILENAME
+    text_path = root / PRODUCTS_TEXT_FILENAME
+    if not _is_plain_file(json_path) or not _is_plain_file(text_path):
+        return False
+    try:
+        payload = json.loads(json_path.read_bytes().decode("utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, dict) or payload.get("schema") != PRODUCTS_SCHEMA:
+        return False
+    run_id = payload.get("run_id")
+    generation = payload.get("generation")
+    gen_dir_raw = payload.get("generation_dir")
+    pub_sha = payload.get("publication_sha256")
+    if not all(
+        isinstance(value, str) and value
+        for value in (run_id, generation, gen_dir_raw, pub_sha)
+    ):
+        return False
+    try:
+        _validate_generation_token(generation)
+    except PublicationPathError:
+        return False
+    container, _legacy = discover_publication_root(root)
+    expected = container / f"run-{_run_token(run_id)}" / generation
+    try:
+        if Path(gen_dir_raw).resolve() != expected.resolve():
+            return False
+    except OSError:
+        return False
+    if not expected.is_dir() or _is_link(expected):
+        return False
+    try:
+        pointer = _read_pointer(expected.parent)
+    except Exception:
+        return False
+    # C1 (rework-2): ownership requires a VALID, plain CURRENT pointer that
+    # commits to this exact run/generation/digest. Without it there is no
+    # proven commitment at all — two sidecars agreeing with each other (or a
+    # surviving publication.json) is not authority. A malformed/linked pointer
+    # raised above and already failed closed.
+    if pointer is None:
+        return False
+    if str(pointer.get("run_id")) != str(run_id):
+        return False
+    if str(pointer.get("generation")) != generation:
+        return False
+    if str(pointer.get("publication_sha256")) != pub_sha:
+        return False
+    try:
+        text = text_path.read_bytes().decode("utf-8")
+    except Exception:
+        return False
+    return (
+        f"run_id: {run_id}" in text
+        and f"generation: {generation} (immutable)" in text
+        and f"generation_dir: {gen_dir_raw}" in text
+        and f"publication_sha256: {pub_sha}" in text
+    )
+
+
+def _own_empty_scratch(path: Path) -> bool:
+    """True only for an EMPTY plain ``tmp`` staging dir (never a link)."""
+    if _is_link(path) or not path.is_dir():
+        return False
+    try:
+        return not any(path.iterdir())
+    except OSError:
+        return False
+
+
+def detect_previous_publication(
+    output_dir: str | os.PathLike[str],
+    *,
+    ignore_names: Iterable[str] = (),
+) -> dict:
+    """Detect a previous ZeGrid publication and foreign content.
+
+    Publication evidence (C1 contract): ``zegrid_manifest.json``,
+    ``mosaic_grid*.fits``, or a ``.zegrid_publications/`` root/pointer. Direct
+    child directories are inspected too (mount-segregated publications).
+    ``ignore_names`` lets a caller declare its OWN non-publication artifacts
+    (GUI logs, telemetry, its durable store folder) without weakening the
+    foreign-file refusal for everything else.
+    """
+    root = Path(output_dir)
+    ignore = {str(name) for name in ignore_names}
+    evidence: list[str] = []
+    foreign: list[str] = []
+    zegrid = False
+    if not root.is_dir():
+        return {"found": False, "zegrid": False, "evidence": [], "foreign": []}
+    # Our own visible sidecars are recognised only with strong evidence; a
+    # forged/partial/foreign pair stays foreign and still refuses —overwrite.
+    products_own = _own_products_sidecars(root)
+
+    root_evidence = _dir_publication_evidence(root)
+    evidence.extend(root_evidence)
+    if "zegrid_manifest.json" in root_evidence:
+        zegrid = bool(_manifest_is_zegrid(root / "zegrid_manifest.json"))
+    if any(name.startswith("mosaic_grid") for name in root_evidence):
+        zegrid = True
+    if any(name + "/" in root_evidence for name in PUBLICATION_DIRNAMES):
+        zegrid = True
+
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        name = entry.name
+        if name in ignore:
+            continue
+        if name in {
+            "zegrid_manifest.json", "zegrid_run.log",
+            LEGACY_CACHE_DIRNAME, CACHE_DIRNAME,
+            *PUBLICATION_DIRNAMES,
+        }:
+            continue
+        if entry.is_file() and ZEGRID_OUTPUT_FILE_RE.match(name):
+            continue
+        if name in (PRODUCTS_JSON_FILENAME, PRODUCTS_TEXT_FILENAME) and products_own:
+            continue
+        if name == "tmp" and products_own and _own_empty_scratch(entry):
+            continue
+        if entry.is_dir():
+            child = _dir_publication_evidence(entry)
+            if child:
+                evidence.extend(f"{name}/{item}" for item in child)
+                zegrid = True
+                continue
+        foreign.append(name)
+
+    return {
+        "found": bool(evidence),
+        "zegrid": bool(zegrid),
+        "evidence": sorted(set(evidence)),
+        "foreign": sorted(foreign),
+    }
 
 
 def _run_token(run_id: str) -> str:
     return zrs.safe_name(str(run_id), "run_id")
 
 
-def run_publication_root(output_dir: str | os.PathLike[str], run_id: str) -> Path:
-    return publication_root(output_dir) / f"run-{_run_token(run_id)}"
+def run_publication_root(
+    output_dir: str | os.PathLike[str],
+    run_id: str,
+    *,
+    for_write: bool = False,
+) -> Path:
+    """One run's publication root.
+
+    ``for_write=True`` always uses the visible name (new runs never write into a
+    legacy hidden container). Readers resolve the legacy container when the
+    visible one is absent.
+    """
+    base = (
+        publication_root(output_dir)
+        if for_write
+        else discover_publication_root(output_dir)[0]
+    )
+    return base / f"run-{_run_token(run_id)}"
 
 
 def _validate_generation_token(generation: str) -> str:
@@ -652,11 +919,283 @@ def _referenced_generation(run_root: Path) -> str | None:
     return str(pointer.get("generation"))
 
 
+def inspect_same_run_staging(
+    output_dir: str | os.PathLike[str], run_id: str
+) -> dict:
+    """READ-ONLY ownership proof for a same-run crash staging generation.
+
+    Used by callers (the Qt GUI preflight) that must decide whether a resume may
+    be OFFERED when there is no ``CURRENT.json`` yet. It never creates, deletes,
+    repairs or cleans anything, and it never treats staged bytes as COMPLETE.
+
+    ``ok`` is True only when ALL of the following hold:
+    * the publication container (``zegrid_publications``, or the legacy
+      ``.zegrid_publications`` fallback) exists as a plain directory and
+      contains ONLY the selected run's publication root (an unrelated/other-run
+      entry is refused);
+    * the run root is a plain directory and contains only ``tmp`` and ``gen-N``
+      directories (any other entry is foreign);
+    * there is NO ``CURRENT.json`` (a pointer belongs to the committed path and
+      is verified by ``resolve_current`` instead);
+    * every ``gen-N`` is a plain directory carrying a schema-valid staging
+      marker for the SAME run/generation with a DEAD owner pid;
+    * present members are declared plain files directly inside the generation;
+      absent members are allowed for incomplete staging. No extra children are
+      allowed except the staging marker and a plain ``publication.json`` record;
+      if that record exists, all declared members must exist too. Staging is
+      never reported as COMPLETE by this ownership check;
+    * no symlink/junction is used anywhere on the checked path.
+
+    A marker-less directory, a live owner, a foreign/other-run entry, a path
+    escape or a malformed marker is a refusal with a concrete reason. The engine
+    remains the authority for identity, commits and cleanup after resume.
+    """
+    out = Path(output_dir)
+    pub_root, _legacy = discover_publication_root(out)
+    run_root = run_publication_root(out, run_id)
+    result: dict = {"ok": False, "reason": None, "generations": []}
+
+    def _refuse(reason: str) -> dict:
+        result["ok"] = False
+        result["reason"] = str(reason)
+        return result
+
+    try:
+        if not pub_root.exists():
+            return _refuse("no .zegrid_publications directory exists")
+        if _is_link(pub_root) or not pub_root.is_dir():
+            return _refuse("the publication root is not a plain directory")
+        try:
+            pub_entries = sorted(pub_root.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            return _refuse(f"the publication root cannot be inspected: {exc}")
+        other_run_dirs = [
+            entry.name for entry in pub_entries if entry.name != run_root.name
+        ]
+        if other_run_dirs:
+            return _refuse(
+                "the publication root also contains unrelated run content "
+                f"({', '.join(other_run_dirs)})"
+            )
+        if not run_root.is_dir() or _is_link(run_root):
+            return _refuse("the selected run publication root is not a plain directory")
+        if (run_root / POINTER_FILENAME).exists():
+            return _refuse("CURRENT.json exists; use the committed-publication verifier")
+        try:
+            run_entries = sorted(run_root.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            return _refuse(f"the run publication root cannot be inspected: {exc}")
+
+        generations: list[str] = []
+        for entry in run_entries:
+            if entry.name == "tmp":
+                if _is_link(entry) or not entry.is_dir():
+                    return _refuse("the publication temp entry is not a plain directory")
+                continue
+            try:
+                _validate_generation_token(entry.name)
+            except PublicationPathError:
+                return _refuse(
+                    f"foreign entry in the selected run publication root: {entry.name!r}"
+                )
+            if _is_link(entry) or not entry.is_dir():
+                return _refuse(f"generation {entry.name!r} is not a plain directory")
+            generations.append(entry.name)
+        if not generations:
+            return _refuse("no staging generation exists for the selected run")
+
+        for generation in generations:
+            gen_dir = run_root / generation
+            marker = gen_dir / STAGING_FILENAME
+            if marker.is_file() and not _is_link(marker):
+                try:
+                    payload, _raw = _read_json_bytes(marker, "staging marker")
+                except PublicationError as exc:
+                    return _refuse(
+                        f"staging marker of {generation!r} is unreadable: {exc}"
+                    )
+                if payload.get("schema") != STAGING_SCHEMA:
+                    return _refuse(
+                        f"staging marker of {generation!r} has an unsupported schema"
+                    )
+                if str(payload.get("run_id")) != str(run_id):
+                    return _refuse(
+                        f"staging marker of {generation!r} belongs to another run"
+                    )
+                if str(payload.get("generation")) != str(generation):
+                    return _refuse(
+                        f"staging marker of {generation!r} names another generation"
+                    )
+                pid = payload.get("pid")
+                try:
+                    pid_int = int(pid)
+                except (TypeError, ValueError):
+                    return _refuse(
+                        f"staging marker of {generation!r} has no provable owner pid"
+                    )
+                if zrs.pid_alive(pid_int):
+                    return _refuse(
+                        f"staging generation {generation!r} is owned by a LIVE "
+                        f"writer (pid {pid_int}); not a crash artifact"
+                    )
+                declared = payload.get("members")
+                if not isinstance(declared, list) or not declared:
+                    return _refuse(
+                        f"staging marker of {generation!r} does not declare members"
+                    )
+                names: set[str] = set()
+                for item in declared:
+                    try:
+                        names.add(member_filename(item, "staging member"))
+                    except PublicationError as exc:
+                        return _refuse(
+                            f"staging marker of {generation!r} declares an unsafe "
+                            f"member: {exc}"
+                        )
+                allowed = names | {STAGING_FILENAME, PUBLICATION_FILENAME}
+                try:
+                    children = sorted(gen_dir.iterdir(), key=lambda p: p.name)
+                except OSError as exc:
+                    return _refuse(
+                        f"generation {generation!r} cannot be inspected: {exc}"
+                    )
+                for child in children:
+                    if child.name not in allowed:
+                        return _refuse(
+                            f"generation {generation!r} holds foreign content "
+                            f"({child.name!r})"
+                        )
+                    if _is_link(child) or not child.is_file():
+                        return _refuse(
+                            f"generation {generation!r} member {child.name!r} is "
+                            "not a plain file"
+                        )
+                    if (
+                        child.name != STAGING_FILENAME
+                        and child.name != PUBLICATION_FILENAME
+                        and child.name not in names
+                    ):  # pragma: no cover - redundant with 'allowed'
+                        return _refuse(
+                            f"generation {generation!r} member {child.name!r} is "
+                            "not declared by the marker"
+                        )
+                # F1 (REWORK-4): ownership is NOT completeness. A real crash may
+                # happen right after ``begin`` (zero members) or mid-writing (a
+                # subset/truncated plain file). Missing declared members are
+                # therefore tolerated here; every PRESENT child is still checked
+                # above (declared/plain/no extra/no link). Staged bytes are never
+                # reported as COMPLETE, and the engine remains the authority for
+                # identity, commits and cleanup.
+                if (gen_dir / PUBLICATION_FILENAME).is_file():
+                    missing = [
+                        name
+                        for name in sorted(names)
+                        if not (gen_dir / name).is_file()
+                        or _is_link(gen_dir / name)
+                    ]
+                    if missing:
+                        return _refuse(
+                            f"generation {generation!r} has a publication record "
+                            f"but is missing declared member(s) {missing!r}; "
+                            "the record is not trusted"
+                        )
+                result.setdefault("present_members", {})[generation] = sum(
+                    1 for name in names if (gen_dir / name).is_file()
+                )
+                continue
+
+            # No staging marker: a complete-looking record without a pointer is
+            # NOT provably OURS. Refuse conservatively and preserve it; never
+            # delete a publication record to force a resume.
+            if (gen_dir / PUBLICATION_FILENAME).is_file():
+                return _refuse(
+                    f"generation {generation!r} has a publication record but no "
+                    "staging marker; ownership is not provable, so it is left "
+                    "untouched and not resumed"
+                )
+            return _refuse(
+                f"generation {generation!r} has no staging marker; ownership is "
+                "not provable"
+            )
+
+        result["ok"] = True
+        result["generations"] = generations
+        return result
+    except Exception as exc:  # fail closed on any inspection error
+        return _refuse(f"publication staging inspection failed: {type(exc).__name__}: {exc}")
+
+
+def inspect_publication_root_ownership(
+    output_dir: str | os.PathLike[str], run_id: str
+) -> dict:
+    """READ-ONLY ownership check of the publication container for ONE run.
+
+    Applies to BOTH the committed-pointer and the staged-only resume branches:
+    the publication root must contain ONLY the selected run's root, and that
+    root may contain only ``CURRENT.json``, ``tmp`` and ``gen-N`` directories
+    (plain, never links). Any other run/foreign entry is a refusal, even when a
+    valid CURRENT exists for the selected run. Nothing is created or modified.
+    """
+    out = Path(output_dir)
+    pub_root, _legacy = discover_publication_root(out)
+    run_root = run_publication_root(out, run_id)
+    result: dict = {"ok": False, "reason": None}
+
+    def _refuse(reason: str) -> dict:
+        result["ok"] = False
+        result["reason"] = str(reason)
+        return result
+
+    try:
+        if not pub_root.is_dir() or _is_link(pub_root):
+            return _refuse("the publication root is not a plain directory")
+        try:
+            entries = sorted(pub_root.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            return _refuse(f"the publication root cannot be inspected: {exc}")
+        others = [entry.name for entry in entries if entry.name != run_root.name]
+        if others:
+            return _refuse(
+                "the publication root contains unrelated run/foreign content "
+                f"({', '.join(others)})"
+            )
+        if not run_root.is_dir() or _is_link(run_root):
+            return _refuse("the selected run publication root is not a plain directory")
+        try:
+            run_entries = sorted(run_root.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            return _refuse(f"the run publication root cannot be inspected: {exc}")
+        for entry in run_entries:
+            if entry.name == POINTER_FILENAME:
+                if _is_link(entry) or not entry.is_file():
+                    return _refuse("CURRENT.json is not a plain file")
+                continue
+            if entry.name == "tmp":
+                if _is_link(entry) or not entry.is_dir():
+                    return _refuse("the publication temp entry is not a plain directory")
+                continue
+            try:
+                _validate_generation_token(entry.name)
+            except PublicationPathError:
+                return _refuse(
+                    f"foreign entry in the selected run publication root: {entry.name!r}"
+                )
+            if _is_link(entry) or not entry.is_dir():
+                return _refuse(f"generation {entry.name!r} is not a plain directory")
+        result["ok"] = True
+        return result
+    except Exception as exc:
+        return _refuse(
+            f"publication ownership inspection failed: {type(exc).__name__}: {exc}"
+        )
+
+
 def cleanup_orphan_generations(
     output_dir: str | os.PathLike[str],
     run_id: str,
     *,
     keep_generation: str | None = None,
+    _run_root: Path | None = None,
 ) -> list[str]:
     """Remove ONLY our own uncommitted staging generations.
 
@@ -666,7 +1205,11 @@ def cleanup_orphan_generations(
     Everything else (foreign files, other runs, previous committed generations)
     is left untouched.
     """
-    run_root = run_publication_root(output_dir, run_id)
+    run_root = (
+        Path(_run_root)
+        if _run_root is not None
+        else run_publication_root(output_dir, run_id)
+    )
     if not run_root.is_dir():
         return []
     _assert_plain_dir(run_root, "run publication root")
@@ -805,17 +1348,41 @@ class PublicationSession:
             normalised[str(role)] = member_filename(filename, f"member {role}")
         if len(set(normalised.values())) != len(normalised.values()):
             raise PublicationPathError("two member roles share the same file name")
-        run_root = run_publication_root(out, run_id)
+        run_root = run_publication_root(out, run_id, for_write=True)
         pub_root = run_root.parent
         if pub_root.exists() and _is_link(pub_root):
             raise PublicationPathError(
                 f"publication root is a symlink/junction: {pub_root}"
             )
+        # ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031: the visible container must never
+        # be written into when it already holds unrelated content. Only our own
+        # run roots (``run-*`` plain directories) are tolerated here.
+        if pub_root.exists():
+            if not pub_root.is_dir():
+                raise PublicationPathError(
+                    f"publication root is not a plain directory: {pub_root}"
+                )
+            try:
+                entries = sorted(entry.name for entry in pub_root.iterdir())
+            except OSError as exc:
+                raise PublicationPathError(
+                    f"publication root cannot be inspected ({pub_root}): {exc}"
+                ) from exc
+            foreign = [
+                name for name in entries
+                if not (name.startswith("run-") and (pub_root / name).is_dir())
+            ]
+            if foreign:
+                raise PublicationPathError(
+                    "refusing to write into the publication folder "
+                    f"{pub_root}: it already contains unrelated content "
+                    f"({', '.join(foreign[:5])}); nothing was written"
+                )
         run_root.mkdir(parents=True, exist_ok=True)
         _assert_plain_dir(run_root, "run publication root")
         # Cleanup is confined to OUR uncommitted staging generations; the
         # generation referenced by CURRENT.json and every foreign file stay.
-        cleanup_orphan_generations(out, run_id)
+        cleanup_orphan_generations(out, run_id, _run_root=run_root)
         tmp_dir = run_root / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         _assert_plain_dir(tmp_dir, "publication temp dir")
@@ -1492,6 +2059,355 @@ class PublicationSession:
             identity_sha256=self.identity_sha256,
             verified=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# VISIBLE product entry point (output root)
+# ---------------------------------------------------------------------------
+
+_VISIBLE_ROLE_ORDER = (
+    ROLE_SCIENCE,
+    ROLE_AESTHETIC,
+    ROLE_UINT16,
+    ROLE_COVERAGE,
+    ROLE_MANIFEST,
+    ROLE_RUN_LOG,
+)
+_VISIBLE_ROLE_LABEL = {
+    ROLE_SCIENCE: "science",
+    ROLE_AESTHETIC: "aesthetic",
+    ROLE_UINT16: "uint16",
+    ROLE_COVERAGE: "coverage",
+    ROLE_MANIFEST: "manifest",
+    ROLE_RUN_LOG: "run_log",
+}
+
+
+# ZM-ZEGRID-ROOT-DELIVERABLES-20261031: the finished products are DELIVERED at
+# the OUTPUT ROOT under their Classic-compatible names, like Classic/SDS. The
+# immutable generation directory stays the durable archive and the source of
+# truth for resume/verification; the root copy is a convenience deliverable.
+# ``run_log`` is excluded: it is already written at the root (auxiliary).
+ROOT_DELIVERABLE_ROLES = (
+    ROLE_SCIENCE,
+    ROLE_AESTHETIC,
+    ROLE_COVERAGE,
+    ROLE_UINT16,
+    ROLE_MANIFEST,
+)
+
+
+def _root_target_matches(target: Path, sha256: str, nbytes: int) -> bool:
+    """True when the existing root file already IS the verified member bytes."""
+    if _is_link(target) or not target.is_file():
+        return False
+    try:
+        if target.stat().st_size != int(nbytes):
+            return False
+        return _stream_sha256(target)[0] == str(sha256)
+    except OSError:
+        return False
+
+
+def _copy_member_to_root(
+    source: Path,
+    target: Path,
+    *,
+    expected_sha256: str,
+    expected_nbytes: int,
+) -> None:
+    """Atomically copy ONE verified generation member onto the output root.
+
+    The bytes are streamed into a temp file beside the staging directory,
+    hashed WHILE copied and fsynced; only a byte-exact copy is renamed onto the
+    target with ``os.replace``. A mismatch or any error removes the temp file
+    and leaves a prior target byte-identical.
+    """
+    import tempfile
+
+    if _is_link(target):
+        raise PublicationPathError(f"refusing to replace a symlink: {target}")
+    tmp = target.parent / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    if _is_link(tmp):
+        raise PublicationPathError(f"root staging directory is a link: {tmp}")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(tmp))
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as out, open(source, "rb") as inp:
+            while True:
+                block = inp.read(IO_CHUNK_BYTES)
+                if not block:
+                    break
+                digest.update(block)
+                total += len(block)
+                out.write(block)
+            out.flush()
+            os.fsync(out.fileno())
+        if digest.hexdigest() != str(expected_sha256) or total != int(
+            expected_nbytes
+        ):
+            raise PublicationIntegrityError(
+                "root delivery refused: copied bytes do not match the verified "
+                f"member for {target.name}"
+            )
+        os.replace(tmp_name, target)
+        zrs.fsync_dir(target.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        _drop_empty_scratch(tmp)
+        raise
+    _drop_empty_scratch(tmp)
+
+
+def publish_root_deliverables(
+    output_dir: str | os.PathLike[str],
+    generation: PublishedGeneration,
+) -> dict:
+    """Deliver the verified generation members to the OUTPUT ROOT.
+
+    Called only AFTER ``CURRENT.json`` is durable and the generation verified.
+    Each produced role is copied under its Classic-compatible name with the
+    same atomic-write discipline as the visible markers: a temp file, an fsync,
+    then ONE ``os.replace``. A file that already carries the verified bytes is
+    left untouched (idempotent reconcile). A failure keeps the prior root file
+    byte-identical and is REPORTED, never raised: the publication stays
+    authoritative and a convenience copy must never fail the run.
+
+    Returns ``{"root_files": {role: {path, sha256, nbytes}}, "failures": [...]}``.
+    """
+    root = Path(output_dir)
+    _assert_plain_dir(root, "output root")
+    gen_dir = Path(generation.generation_dir)
+    _assert_plain_dir(gen_dir, "generation directory")
+    root_resolved = root.resolve()
+    delivered: dict[str, dict] = {}
+    failures: list[str] = []
+    for role in ROOT_DELIVERABLE_ROLES:
+        row = generation.members.get(role)
+        if row is None:
+            continue
+        try:
+            filename = member_filename(row.get("file"), f"member {role} file")
+            sha256 = str(row.get("sha256"))
+            nbytes = int(row.get("nbytes"))
+            source = gen_dir / filename
+            _plain_file(source, f"generation member {role}")
+            target = root / filename
+            if not _root_target_matches(target, sha256, nbytes):
+                _copy_member_to_root(
+                    source,
+                    target,
+                    expected_sha256=sha256,
+                    expected_nbytes=nbytes,
+                )
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            failures.append(f"{role}: {type(exc).__name__}: {exc}")
+            continue
+        delivered[str(role)] = {
+            "path": str(root_resolved / filename),
+            "sha256": sha256,
+            "nbytes": nbytes,
+        }
+    return {"root_files": delivered, "failures": failures}
+
+
+def _products_payload(
+    generation: PublishedGeneration,
+    root_files: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict:
+    gen_dir = Path(generation.generation_dir).resolve()
+    products: dict[str, dict] = {}
+    for role in _VISIBLE_ROLE_ORDER:
+        row = generation.members.get(role)
+        if row is None:
+            continue
+        products[str(role)] = {
+            "file": str(row["file"]),
+            "sha256": str(row["sha256"]),
+            "nbytes": int(row["nbytes"]),
+            "path": str(gen_dir / str(row["file"])),
+        }
+    delivered: dict[str, dict] = {}
+    for role, row in (root_files or {}).items():
+        if not isinstance(row, Mapping):
+            continue
+        delivered[str(role)] = {
+            "path": str(row.get("path", "")),
+            "sha256": str(row.get("sha256", "")),
+            "nbytes": int(row.get("nbytes", 0)),
+        }
+    produced = int(getattr(generation, "created_unix_ns", 0) or 0)
+    return {
+        "schema": PRODUCTS_SCHEMA,
+        "run_id": str(generation.run_id),
+        "generation": str(generation.generation),
+        "generation_dir": str(gen_dir),
+        "publication_sha256": str(generation.publication_sha256),
+        "produced_unix_ns": produced if produced > 0 else int(time.time_ns()),
+        "products": products,
+        "root_files": delivered,
+        "note": (
+            "finished products are DELIVERED at the output root (root_files, "
+            "atomic copies of the verified members); the IMMUTABLE generation "
+            "directory (generation_dir) remains the durable archive and the "
+            "source of truth for verification and resume"
+        ),
+    }
+
+
+def _products_text(payload: Mapping[str, Any]) -> str:
+    lines = [
+        "ZeMosaic ZeGrid — published products",
+        f"run_id: {payload['run_id']}",
+        f"generation: {payload['generation']} (immutable)",
+        f"generation_dir: {payload['generation_dir']}",
+        f"produced_unix_ns: {payload['produced_unix_ns']}",
+        f"publication_sha256: {payload['publication_sha256']}",
+        "",
+    ]
+    products = payload.get("products") or {}
+    root_files = payload.get("root_files") or {}
+    for role in _VISIBLE_ROLE_ORDER:
+        row = products.get(role)
+        if row is None:
+            continue
+        delivered = root_files.get(role)
+        if isinstance(delivered, Mapping) and delivered.get("path"):
+            lines.append(
+                f"{_VISIBLE_ROLE_LABEL.get(role, role):10s}: "
+                f"{delivered['path']} ({int(delivered['nbytes'])} B)"
+            )
+        else:
+            lines.append(
+                f"{_VISIBLE_ROLE_LABEL.get(role, role):10s}: {row['path']} "
+                f"({int(row['nbytes'])} B) [generation copy, root delivery "
+                "failed]"
+            )
+    lines += [
+        "",
+        "This file names the CURRENT published generation. The finished "
+        "products above are",
+        "delivered at the OUTPUT ROOT (atomic copies of the verified "
+        "members). The immutable",
+        "generation directory (generation_dir) remains the durable archive "
+        "and the source of",
+        "truth for verification and resume.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _replace_visible_pair(root: Path, files: Mapping[str, bytes]) -> None:
+    """Stage BOTH visible files, then replace them; rollback on failure.
+
+    A failure during staging leaves the previous files byte-identical (nothing
+    is replaced). A failure during the replace phase restores the previous bytes
+    of every file already replaced, so the pair is never torn.
+    """
+    import tempfile
+
+    tmp = root / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    previous: dict[str, bytes | None] = {}
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for name, data in files.items():
+            target = root / name
+            if _is_link(target):
+                raise PublicationPathError(
+                    f"refusing to replace a symlink: {target}"
+                )
+            previous[name] = target.read_bytes() if target.is_file() else None
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{name}.", dir=str(tmp))
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+            staged.append((Path(tmp_name), target))
+    except BaseException:
+        for path, _target in staged:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        _drop_empty_scratch(tmp)
+        raise
+    replaced: list[Path] = []
+    try:
+        for path, target in staged:
+            os.replace(path, target)
+            replaced.append(target)
+    except BaseException:
+        for target in replaced:
+            old = previous.get(target.name)
+            try:
+                if old is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    fd, tmp_name = tempfile.mkstemp(
+                        prefix=f".{target.name}.rb.", dir=str(tmp)
+                    )
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(old)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(tmp_name, target)
+            except OSError:
+                pass
+        for path, _target in staged:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        _drop_empty_scratch(tmp)
+        raise
+    _drop_empty_scratch(tmp)
+    zrs.fsync_dir(root)
+
+
+def write_visible_products(
+    output_dir: str | os.PathLike[str],
+    generation: PublishedGeneration,
+    *,
+    root_files: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict:
+    """Publish the VISIBLE entry point for ONE durable generation.
+
+    Called only AFTER ``CURRENT.json`` is durable and the generation verified.
+    Writes ``zemosaic_products.json`` (machine-readable) and ``PRODUCTS.txt``
+    (human-readable) at the OUTPUT ROOT. Both name the delivered ROOT paths
+    (``root_files``, produced by :func:`publish_root_deliverables`) while still
+    recording the immutable ``generation_dir`` for audit/resume. Idempotent for
+    the same generation; a NEW generation replaces the pointers only after it
+    is durable. A failure leaves the previous pointers byte-identical.
+    """
+    root = Path(output_dir)
+    if not root.is_dir():
+        raise PublicationPathError(f"output root is not a directory: {root}")
+    gen_dir = Path(generation.generation_dir)
+    if not gen_dir.is_dir() or _is_link(gen_dir):
+        raise PublicationPathError(
+            f"generation directory is missing or not a plain directory: {gen_dir}"
+        )
+    payload = _products_payload(generation, root_files=root_files)
+    files = {
+        PRODUCTS_JSON_FILENAME: _canonical_json_bytes(payload),
+        PRODUCTS_TEXT_FILENAME: _products_text(payload).encode("utf-8"),
+    }
+    _replace_visible_pair(root, files)
+    return payload
 
 
 # ---------------------------------------------------------------------------

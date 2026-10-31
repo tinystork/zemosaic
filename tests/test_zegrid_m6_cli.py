@@ -345,6 +345,21 @@ def test_store_overwrite_publishes_a_distinct_generation(tmp_path):
     first_pointer = first["summary"]["publication"]["pointer"]
     assert first_pointer is not None
 
+    def _generation_digests(gen_dir: Path) -> dict[str, str]:
+        import hashlib
+
+        return {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(gen_dir.iterdir())
+            if p.is_file()
+        }
+
+    first_generation_dir = Path(first_pointer["path"]).parent / str(
+        first_pointer["generation"]
+    )
+    first_generation = _generation_digests(first_generation_dir)
+    assert first_generation
+
     second = _publish(tmp_path, corpus, name="out", extra=(
         "--durable-store-dir", str(tmp_path / "storeB"),
         "--overwrite",
@@ -354,4 +369,7 @@ def test_store_overwrite_publishes_a_distinct_generation(tmp_path):
     assert second_pointer["path"] != first_pointer["path"]
     assert second_pointer["run_id"] != first_pointer["run_id"]
     assert second["summary"]["previous_publication"]["pointer"] == first_pointer
+    # The immutable first generation is preserved byte-for-byte.
+    assert first_generation_dir.is_dir()
+    assert _generation_digests(first_generation_dir) == first_generation
 

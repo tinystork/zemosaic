@@ -11,6 +11,7 @@ temporary store-free commit receipt mock.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -41,11 +42,37 @@ def _lines(path):
 
 
 def test_safe_site_resolves_to_the_cpu_wave_sampler_line():
-    line = obs.resolve_safe_sampler_line(MODE_PATH.read_text(encoding="utf-8"))
-    # 11681 in the frozen revision: the sampler that governs the CURRENT wave.
-    assert line == 11681
-    source = MODE_PATH.read_text(encoding="utf-8").splitlines()
-    assert source[line - 1].strip() == "facts = _r55_run_checkpoint_sample(disk_root)"
+    """The observer must resolve the CURRENT safe-wave sampler, not a frozen line.
+
+    The contract is: the resolver returns a real 1-based line whose stripped
+    source is exactly the sampler anchor, AND that line lives inside the CPU
+    wave sampler function (the one that also contains the wave loop head),
+    after the loop head. A drifted/removed seam therefore still fails.
+    """
+    source_text = MODE_PATH.read_text(encoding="utf-8")
+    line = obs.resolve_safe_sampler_line(source_text)
+    assert line > 0  # sanity bound: a real 1-based source line
+    lines = source_text.splitlines()
+    assert lines[line - 1].strip() == obs.CPU_WAVE_ANCHOR
+
+    tree = ast.parse(source_text)
+    enclosing = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = node.end_lineno or node.lineno
+            if node.lineno <= line <= end:
+                if enclosing is None or node.lineno > enclosing.lineno:
+                    enclosing = node
+    assert enclosing is not None, "sampler line is not inside any function"
+    end = enclosing.end_lineno or enclosing.lineno
+    loop_lines = [
+        index
+        for index, text in enumerate(lines, start=1)
+        if enclosing.lineno <= index <= end
+        and text.strip() == obs.CPU_WAVE_LOOP_ANCHOR
+    ]
+    assert loop_lines, "sampler is not inside a function holding the CPU wave loop"
+    assert loop_lines[0] < line, "sampler must follow the CPU wave loop head"
 
 
 def test_execution_observer_forwards_result_and_records_pid(tmp_path):

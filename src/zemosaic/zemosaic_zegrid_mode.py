@@ -133,7 +133,128 @@ logger = logging.getLogger("ZeMosaicWorker").getChild("zegrid_mode")
 ProgressCallback = Optional[Callable[[str, object, str], None]]
 
 # Disk cache directory name (under the per-mount output folder). NEVER /tmp.
-CACHE_DIR_NAME = "__zegrid_cache__"
+# ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031: the scratch cache is VISIBLE.
+# The legacy ``__zegrid_cache__`` is NOT read (scratch, never carried across
+# runs); it is only recognised as ZeGrid-owned by the ownership lists.
+CACHE_DIR_NAME = "zegrid-cache"
+LEGACY_CACHE_DIR_NAME = "__zegrid_cache__"
+CACHE_OWNER_FILENAME = ".zegrid-cache-owner"
+CACHE_OWNER_SCHEMA = "zemosaic.zegrid.cache.v1"
+
+
+def _require_durable_commits_before_assembly(
+    store, *, expected_cells, log_done=0
+):
+    """ZM-ZEGRID-COMMIT-INTEGRITY: fail fast on a store with ZERO commits.
+
+    A durable run that reaches assembly with expected cells but no durable
+    commit at all can only produce a late ``StoreNotFoundError`` deep inside the
+    bounded assembly. Refuse BEFORE any assembly work, naming the store root,
+    the expected count and the log-phase count.
+    """
+    attempts = int((store.report().get("counts") or {}).get("attempts") or 0)
+    if attempts == 0 and int(expected_cells) > 0:
+        raise zrs.StoreCommitNotDurable(
+            "refusing to assemble: the durable store contains ZERO commits "
+            f"while {int(expected_cells)} cells were expected "
+            f"(store_root={store.root}, run_id={store.run_id}, "
+            f"log-phase cells reported done={int(log_done)}). "
+            "Nothing durable exists; assembly is never attempted.",
+            run_id=store.run_id,
+            cell_id="<none>",
+            store_root=store.root,
+        )
+    return attempts
+
+
+def _foreign_store_content(store_dir):
+    """Reason string when ``store_dir`` holds UNRELATED content, else None.
+
+    A durable store root is recognisable by its ``run.json``; a container is
+    recognisable by ``run-*`` child directories that each carry a ``run.json``.
+    Anything else already present means the visible name is taken by user data:
+    new runs must FAIL CLOSED instead of writing into foreign content.
+    """
+    root = Path(store_dir)
+    try:
+        if not root.exists():
+            return None
+        if root.is_symlink() or not root.is_dir():
+            return "it is not a plain directory"
+        if (root / "run.json").is_file():
+            return None
+        entries = sorted(root.iterdir(), key=lambda item: item.name)
+        if not entries:
+            return None
+    except OSError as exc:
+        return f"it cannot be inspected ({exc})"
+    foreign = []
+    for entry in entries:
+        if entry.name in ("tmp", "commits", "objects"):
+            continue
+        if (
+            entry.is_dir()
+            and not entry.is_symlink()
+            and (entry / "run.json").is_file()
+        ):
+            continue
+        foreign.append(entry.name)
+    if not foreign:
+        return None
+    return "unrelated content (" + ", ".join(foreign[:5]) + ")"
+
+
+def _prepare_run_cache_root(cache_root, *, emit=None):
+    """Prepare the VISIBLE scratch cache root; refuse foreign content.
+
+    * absent -> create + write the ownership marker;
+    * present with our marker (or empty) -> reuse (a crashed run's scratch);
+    * present without our marker and non-empty -> FAIL CLOSED: the directory is
+      unrelated user content and is never written into or deleted.
+    """
+    root = Path(cache_root)
+    marker = root / CACHE_OWNER_FILENAME
+    if root.exists() or root.is_symlink():
+        if root.is_symlink() or not root.is_dir():
+            raise RuntimeError(
+                "ZeGrid: refusing to use the cache path "
+                f"{root}: it is not a plain directory (nothing was written)"
+            )
+        try:
+            entries = sorted(entry.name for entry in root.iterdir())
+        except OSError as exc:
+            raise RuntimeError(
+                "ZeGrid: the cache directory "
+                f"{root} cannot be inspected ({exc}); nothing was written"
+            ) from exc
+        if marker.is_file() and not marker.is_symlink():
+            return root
+        if entries:
+            raise RuntimeError(
+                "ZeGrid: refusing to use the cache directory "
+                f"{root}: it already contains unrelated content "
+                f"({', '.join(entries[:5])}); nothing was written. Choose "
+                "another output/temporary folder or remove that directory."
+            )
+    root.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.dumps(
+            {
+                "schema": CACHE_OWNER_SCHEMA,
+                "created_unix_ns": int(time.time_ns()),
+                "note": "ZeGrid scratch cache; safe to delete when no run is active",
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    zrs.atomic_write_bytes(marker, payload, tmp_dir=root)
+    if emit is not None:
+        try:
+            emit(f"ZeGrid: scratch cache root {root} (visible)", "INFO")
+        except Exception:
+            pass
+    return root
 # Run-log filename written into the run's output folder (the user reported it absent).
 RUN_LOG_NAME = "zegrid_run.log"
 # Streaming tile size for the R6 executor (safe, memory-bounded default).
@@ -2257,6 +2378,191 @@ def _publication_available_ram_bytes():
     return int(zsw.read_available_memory())
 
 
+def _fmt_admission_mib(value):
+    return f"{int(value) / 2**20:.1f} MiB"
+
+
+def _resume_stack_accounting(resume_plan):
+    """R3: the RUN-level progress accounting of a resumed stacking phase.
+
+    The durable plan already knows exactly which cells are committed and which
+    remain. Progress must start from that FROZEN count (never from 0) and the
+    total is always the run's expected cell count, so the visible counter is the
+    RUN's progress, not this session's local count.
+    """
+    committed = int(resume_plan["complete"]) + int(
+        resume_plan["empty_validated"]
+    )
+    total = int(resume_plan["expected"])
+    pending = [str(cid) for cid in resume_plan["pending"]]
+    if committed < 0 or total < 0 or committed + len(pending) != total:
+        raise RuntimeError(
+            "resume progress accounting is inconsistent: "
+            f"committed={committed} pending={len(pending)} expected={total}"
+        )
+    return {"committed": committed, "total": total, "pending": pending}
+
+
+def _resume_progress_line(committed, total, pending):
+    """The ONE explicit resume line (exact counts, never a percentage)."""
+    return (
+        f"ZeGrid resume: {int(committed)}/{int(total)} cells already "
+        f"committed, {int(pending)} to stack"
+    )
+
+
+def _stack_item_cid(tasks, processed):
+    """The cell ACTUALLY being processed (1-based ``processed``), or ``None``.
+
+    ``tasks`` is the executed list (the sparse PENDING set on resume). A
+    full-plan index lookup is never used: that labelled committed cells as if
+    they were being stacked again.
+    """
+    try:
+        idx = int(processed) - 1
+    except (TypeError, ValueError):
+        return None
+    if idx < 0 or idx >= len(tasks):
+        return None
+    try:
+        return str(tasks[idx][0].cell_id)
+    except Exception:
+        return None
+
+
+def _frozen_planning_gpu(frozen_admission, *, gpu_used):
+    """SINGLE-SOURCED: the planning backend of a run with a FROZEN admission.
+
+    This is the one mapping every planning entry uses (the ``_run_single``
+    launch decision, the auto plan request and the explicit bundle builder), so
+    no entry can bypass it:
+
+    * ``frozen_admission is None`` -> ``bool(gpu_used)`` (fresh run or a
+      pre-parity store: today's behaviour is unchanged);
+    * frozen ``"cpu"`` -> ``False`` — the resumed plan MUST be CPU. The run's
+      own identity is CPU-frozen, so GPU enablement/availability is ignored for
+      this launch (never a silent backend switch into a GPU identity);
+    * frozen ``"gpu"`` -> ``True`` when this process selected a GPU, otherwise
+      the typed fail-closed refusal (a frozen GPU run never silently becomes
+      CPU).
+    """
+    if frozen_admission is None:
+        return bool(gpu_used)
+    backend = str(frozen_admission["backend"])
+    if backend == "cpu":
+        return False
+    if backend == "gpu":
+        if not bool(gpu_used):
+            raise zres.ResumeFrozenAdmissionUnavailable(
+                "resume refused: the FROZEN admission of this run requires "
+                "backend='gpu', but this process selected no GPU for the "
+                "resumed plan; the backend is never switched on resume. "
+                f"Remedy: {zres.ADMISSION_REMEDY}.",
+                frozen_backend="gpu",
+                frozen_tile_px=int(frozen_admission["tile_px"]),
+                detail="no GPU available for the frozen backend",
+            )
+        return True
+    raise zres.ResumeFrozenAdmissionUnavailable(
+        "resume refused: the FROZEN admission of this run names an unknown "
+        f"backend {backend!r}; refusing to plan (no silent backend switch). "
+        f"Remedy: {zres.ADMISSION_REMEDY}.",
+        frozen_backend=backend,
+        frozen_tile_px=int(frozen_admission["tile_px"]),
+        detail="unknown frozen backend",
+    )
+
+
+def _frozen_permitted_tiles(frozen_admission, permitted_tiles):
+    """Restrict the CPU streaming ladder to the run's OWN frozen tile.
+
+    ZM-ZEGRID-ACTIVE-RESUME-PARITY: a resumed run REUSES the ``tile_px`` frozen
+    at creation instead of re-deriving it from the current free RAM. The frozen
+    tile is never replaced by a smaller/larger candidate: if it cannot be
+    honoured here the caller raises the typed refusal (fail closed).
+    """
+    if frozen_admission is None:
+        return list(permitted_tiles)
+    frozen_tile = int(frozen_admission["tile_px"])
+    if frozen_tile not in tuple(int(t) for t in CPU_STREAMING_TILE_LADDER):
+        raise zres.ResumeFrozenAdmissionUnavailable(
+            "resume refused: the FROZEN admission of this run names "
+            f"tile_px={frozen_tile}, which is not a product CPU streaming "
+            f"tile (ladder {[int(t) for t in CPU_STREAMING_TILE_LADDER]}); a "
+            "frozen tile is never replaced by a re-derived one. Remedy: "
+            f"{zres.ADMISSION_REMEDY}",
+            frozen_backend=str(frozen_admission["backend"]),
+            frozen_tile_px=frozen_tile,
+            detail="frozen tile is not in the product CPU streaming ladder",
+        )
+    if frozen_tile not in tuple(int(t) for t in permitted_tiles):
+        raise zres.ResumeFrozenAdmissionUnavailable(
+            "resume refused: the FROZEN tile_px="
+            f"{frozen_tile} is excluded by a stricter permitted ladder "
+            f"{[int(t) for t in permitted_tiles]}; the frozen tile is never "
+            "shrunk to satisfy a later ceiling. Remedy: "
+            f"{zres.ADMISSION_REMEDY}",
+            frozen_backend=str(frozen_admission["backend"]),
+            frozen_tile_px=frozen_tile,
+            detail="frozen tile excluded by the permitted ladder",
+        )
+    return [int(frozen_tile)]
+
+
+def _frozen_admission_refusal(
+    frozen_admission, *, tile_trials, budget_bytes, raw_available_bytes,
+    detail=None,
+):
+    """Build the typed, actionable refusal for an unhonourable frozen tile."""
+    frozen_tile = int(frozen_admission["tile_px"])
+    frozen_backend = str(frozen_admission["backend"])
+    worst = 0
+    for trial in tile_trials or ():
+        if int(trial.get("tile", -1)) != frozen_tile:
+            continue
+        for key in ("worst_bound_bytes", "bound_bytes", "host_stream_bound_bytes"):
+            if trial.get(key) is not None:
+                worst = max(worst, int(trial[key]))
+    required = int(worst) if worst > 0 else None
+    available = int(budget_bytes)
+    deficit = None if required is None else max(0, int(required) - available)
+    if required is not None:
+        requirement = (
+            f"requires {_fmt_admission_mib(required)} per-cell streaming "
+            f"residency while the current plan budget is "
+            f"{_fmt_admission_mib(available)} "
+            + (
+                f"(deficit {_fmt_admission_mib(deficit)})"
+                if deficit
+                else "(the joint residency still exceeds it)"
+            )
+        )
+    else:
+        requirement = (
+            f"cannot be planned under the current plan budget "
+            f"{_fmt_admission_mib(available)}"
+        )
+    message = (
+        "resume refused: the FROZEN admission of this run cannot be honoured "
+        f"on this host — frozen tile_px={frozen_tile} backend={frozen_backend} "
+        f"{requirement}; raw available RAM {int(raw_available_bytes)} B. The "
+        "frozen tile is never shrunk, the backend is never switched and no "
+        "fresh run is started silently. Remedy: "
+        f"{zres.ADMISSION_REMEDY}."
+    )
+    if detail:
+        message += f" Planner detail: {detail}"
+    return zres.ResumeFrozenAdmissionUnavailable(
+        message,
+        frozen_backend=frozen_backend,
+        frozen_tile_px=frozen_tile,
+        required_bytes=required,
+        available_bytes=available,
+        deficit_bytes=deficit,
+        detail=None if detail is None else str(detail),
+    )
+
+
 def _plan_bundle_auto(
     *,
     canvas,
@@ -2272,6 +2578,7 @@ def _plan_bundle_auto(
     active=False,
     emit=None,
     restored_geometry=None,
+    frozen_admission=None,
 ):
     """Build the initial bundle; in AUTO ACTIVE mode retry bounded ONCE.
 
@@ -2283,6 +2590,9 @@ def _plan_bundle_auto(
     unchanged (never a silent retry).
     """
     kw = dict(bundle_common or {})
+    if frozen_admission is not None:
+        # A resumed run's admission is REUSED verbatim (never re-derived).
+        kw["frozen_admission"] = frozen_admission
     if restored_geometry is not None:
         # REWORK-1: consume the frozen geometry; no layout search, no footprint
         # projection, no membership recomputation. Identity validation already
@@ -4667,6 +4977,7 @@ def _build_execution_bundle(
     max_cells_in_flight=None,
     halo_px=None,
     restored_geometry=None,
+    frozen_admission=None,
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -4702,6 +5013,17 @@ def _build_execution_bundle(
     always passes the validated value.
     """
     _halo = int(zsw.HALO_PX if halo_px is None else halo_px)
+    # ZM-ZEGRID-ACTIVE-RESUME-PARITY: the frozen admission is validated before
+    # any planning. A backend that cannot be honoured is refused here; the CPU
+    # tile then comes from the ladder restriction below, never from free RAM.
+    _frozen_admission = (
+        None
+        if frozen_admission is None
+        else zres.validate_admission(frozen_admission)
+    )
+    # SINGLE-SOURCED enforcement (both directions). The bundle can never plan a
+    # backend that the run's frozen identity does not own.
+    gpu_used = _frozen_planning_gpu(_frozen_admission, gpu_used=bool(gpu_used))
     budget_bytes = int(budget_bytes)
     raw_available_bytes = int(raw_available_bytes)
     cpu_count = int(cpu_count or os.cpu_count() or 1)
@@ -4867,6 +5189,12 @@ def _build_execution_bundle(
         ]
         if not permitted_tiles:
             permitted_tiles = [int(CPU_STREAMING_TILE_MINIMUM)]
+        # ZM-ZEGRID-ACTIVE-RESUME-PARITY: on resume the ONLY permitted CPU tile
+        # is the run's own frozen tile (never a re-derived smaller/larger one).
+        if _frozen_admission is not None:
+            permitted_tiles = _frozen_permitted_tiles(
+                _frozen_admission, permitted_tiles
+            )
 
         active = [
             (idx, len(mem.patch_ids), tuple(patch.patch_shape_hw),
@@ -5035,6 +5363,17 @@ def _build_execution_bundle(
                 break
 
         if plan is None:
+            if _frozen_admission is not None:
+                # FAIL CLOSED: the frozen tile cannot be honoured here. Never
+                # shrink the tile, never switch the backend, never relayout and
+                # never fall back to a fresh run.
+                raise _frozen_admission_refusal(
+                    _frozen_admission,
+                    tile_trials=tile_trials,
+                    budget_bytes=budget_bytes,
+                    raw_available_bytes=raw_available_bytes,
+                    detail=str(cpu_refusal),
+                )
             attempts.append({
                 "layout": [nx, ny], "refinement_rank": nx * ny,
                 "permitted_tiles": list(permitted_tiles),
@@ -8539,6 +8878,182 @@ class _R55RunConservedResults(RuntimeError):
         self.category = str(category)
 
 
+class _R55DurableStoreInitError(RuntimeError):
+    """Explicit durable checkpoint init refused BEFORE any cell admission.
+
+    Raised when the frozen resume state/gauge/geometry cannot be written (for
+    example a strict-JSON ``NaN`` refusal). The store is closed (lock released)
+    and every file stays on disk; no durable/resumable claim is made and no cell
+    is admitted. This is a typed refusal, not a degraded run.
+    """
+
+    reason_code = "R55_DURABLE_STORE_INIT"
+
+    def __init__(self, detail: object) -> None:
+        self.detail = str(detail)
+        super().__init__(f"R55_DURABLE_STORE_INIT: {self.detail}")
+
+
+def _r55_durable_coverage_ready(store_state) -> bool:
+    """True when a durable store object actually COVERS the canonical cells.
+
+    A store object alone is not coverage: if publishing is inactive (frozen
+    state/artifact write failure) or a late commit degraded it, assembly must
+    not read missing commits nor reconstruct released payloads. The caller gets
+    a typed refusal; every existing commit stays on disk.
+    """
+    if store_state.get("store") is None:
+        return False
+    if (
+        not store_state.get("publishing")
+        or store_state.get("degraded_reason") is not None
+    ):
+        raise _R55DurableStoreUnavailable(
+            "durable coverage is inactive "
+            f"(degraded_reason={store_state.get('degraded_reason')!r}); refusing "
+            "assembly from missing commits. Every commit on disk is preserved; "
+            "no payload list is reconstructed."
+        )
+    return True
+
+
+def _r55_durable_cell_coverage(store_state, expected_cell_ids, *, context="assembly"):
+    """Validate COMPLETE durable coverage of the sparse expected cell set.
+
+    ZM-ZEGRID-COMMIT-INTEGRITY r1: a store object (or a positive attempt count)
+    is NOT coverage. Before ANY lazy durable-results consumer (diagnostics,
+    assembly, publication), every EXPECTED cell must have a durable commit.
+    Returns the store, or None when no durable store is configured.
+    Raises a typed refusal naming the first missing cell, the store root and the
+    run id: zero-commit and partially-committed runs never reach assembly.
+    """
+    store = store_state.get("store")
+    if store is None:
+        return None
+    if (
+        not store_state.get("publishing")
+        or store_state.get("degraded_reason") is not None
+    ):
+        raise _R55DurableStoreUnavailable(
+            "durable coverage is inactive "
+            f"(degraded_reason={store_state.get('degraded_reason')!r}); refusing "
+            f"{context} from missing commits. Every commit on disk is preserved; "
+            "no payload list is reconstructed."
+        )
+    expected = [str(cid) for cid in expected_cell_ids]
+    missing: list[str] = []
+    ambiguous: list[str] = []
+    for cid in expected:
+        try:
+            # EXACTLY the reader's selection (bounded_assembly descriptor calls
+            # commit_record(cid)): a missing record OR several attempts (an
+            # ambiguous cell) is not coverage.
+            store.commit_record(cid)
+        except zrs.StoreNotFoundError:
+            missing.append(cid)
+        except zrs.StoreFormatError:
+            ambiguous.append(cid)
+    if ambiguous:
+        raise zrs.StoreCommitNotDurable(
+            "durable store coverage is AMBIGUOUS before "
+            f"{context}: {len(ambiguous)}/{len(expected)} expected cells have "
+            f"several durable attempts and no explicit selection (first "
+            f"cell_id={ambiguous[0]!r}, store_root={store.root}, "
+            f"run_id={store.run_id}). Nothing is assembled or published.",
+            run_id=store.run_id,
+            cell_id=ambiguous[0],
+            store_root=store.root,
+        )
+    if missing:
+        raise zrs.StoreCommitNotDurable(
+            "durable store coverage is INCOMPLETE before "
+            f"{context}: {len(missing)}/{len(expected)} expected cells have no "
+            f"durable commit (first missing cell_id={missing[0]!r}, "
+            f"store_root={store.root}, run_id={store.run_id}). Nothing is "
+            "assembled or published.",
+            run_id=store.run_id,
+            cell_id=missing[0],
+            store_root=store.root,
+        )
+    return store
+
+
+def _gpu_durable_commit(store_state, registry, cell_id, receipt, *,
+                        plan_generation, backend="gpu"):
+    """Durably commit+verify+release ONE accepted GPU unit, or fail loudly.
+
+    This is the GPU counterpart of the CPU wave commit: acceptance alone is not
+    durability. Returns True when the store committed the unit; False when no
+    durable store is publishing. Any store failure is TERMINAL
+    (``StoreCommitNotDurable``) and must not be reclassified as a GPU fallback.
+    """
+    store = store_state.get("store")
+    if store is None:
+        # No durable store configured for this run: no durable claim exists.
+        return False
+    if (
+        not store_state.get("publishing")
+        or store_state.get("degraded_reason") is not None
+    ):
+        # A CONFIGURED but unhealthy store must fail closed: never accept a GPU
+        # unit whose commit cannot be durable.
+        raise _R55DurableStoreUnavailable(
+            "durable coverage is inactive "
+            f"(publishing={store_state.get('publishing')!r}, "
+            f"degraded_reason={store_state.get('degraded_reason')!r}); refusing "
+            "a GPU unit whose commit cannot be durable."
+        )
+    attempt_id = getattr(receipt, "attempt_id", None)
+    try:
+        handoff = store.commit_and_release(
+            registry,
+            str(cell_id),
+            attempt_id=attempt_id,
+            backend=str(backend),
+            plan_generation=int(plan_generation),
+        )
+    except zrs.RunStoreError as exc:
+        store_state["publishing"] = False
+        store_state["degraded_reason"] = f"{type(exc).__name__}: {exc}"
+        raise zrs.StoreCommitNotDurable(
+            "GPU cell commit FAILED for cell "
+            f"{cell_id!r} attempt {attempt_id!r} run_id={store.run_id!r} "
+            f"store_root={store.root}: {type(exc).__name__}: {exc}",
+            run_id=store.run_id,
+            cell_id=str(cell_id),
+            store_root=store.root,
+            attempt_id=attempt_id,
+        ) from exc
+    # Verify the record is DURABLE before returning (cheap local lookup).
+    store.require_commit(str(cell_id), attempt_id)
+    store_state["commits"] = int(store_state.get("commits", 0)) + 1
+    released = (handoff.get("release") or {})
+    if released.get("released"):
+        store_state["released_cells"] = (
+            int(store_state.get("released_cells", 0)) + 1
+        )
+        store_state["released_bytes"] = (
+            int(store_state.get("released_bytes", 0))
+            + int(released.get("released_bytes", 0))
+        )
+    return True
+
+
+class _R55DurableStoreUnavailable(RuntimeError):
+    """A degraded store must not back assembly from missing commits.
+
+    Raised when a store object exists but durable coverage is not active (e.g.
+    a late commit failure). Refusing here preserves every commit and never
+    reconstructs released payloads into a full list.
+    """
+
+    reason_code = "R55_DURABLE_STORE_UNAVAILABLE"
+
+    def __init__(self, detail: object) -> None:
+        self.detail = str(detail)
+        super().__init__(f"R55_DURABLE_STORE_UNAVAILABLE: {self.detail}")
+
+
 class _R55RunStopRequested(RuntimeError):
     """M1: a cooperative stop was honoured at a safe boundary.
 
@@ -9379,6 +9894,22 @@ def _r55_build_run_store_identity(
     )
 
 
+def _admission_from_identity(identity):
+    """The run's OWN frozen admission contract, taken from its validated identity.
+
+    ZM-ZEGRID-ACTIVE-RESUME-PARITY: the effective backend and the ``tile_px``
+    that backend executes ARE part of the stored science identity, so the
+    durable admission contract is a projection of it — never a new derivation,
+    never a guess. ``identity`` must already be a validated run identity.
+    """
+    block = identity["science_contract"]["backend"]
+    return zres.build_admission(
+        backend=block["backend"],
+        tile_px=block["tile_px"],
+        parity_qualified=block["parity_qualified"],
+    )
+
+
 def _r55_open_run_store(store_dir, *, identity, budget_bytes, session_id):
     """Open (or create) the durable store. Returns ``(store, error)``."""
     try:
@@ -9700,6 +10231,44 @@ def _run_single(
     # storage policy. Geometry/gauge/memberships are validated against the
     # frozen identity later (when they exist) BEFORE any cell is admitted.
     _resume_mode = zres.normalize_resume_mode(resume_mode)
+    # ZM-UNIFIED-STOP-SAVE-CAPABILITY: durable ZeGrid resume exists ONLY for the
+    # active scheduler (its result registry, stop channel and store are created
+    # there). A legacy/observe run that requests a durable resume (mode auto or
+    # an explicit run id) is refused EXPLICITLY here — before any store
+    # directory, lock or state is opened or created — so the request can never
+    # be left for a non-existent consumer, silently fall back to a fresh run or
+    # leave an empty/locked store behind. The active path is untouched.
+    try:
+        _effective_scheduler_mode = zsched.normalize_scheduler_mode(
+            scheduler_mode
+        )
+    except Exception:
+        _effective_scheduler_mode = str(scheduler_mode)
+    _resume_run_id_requested = (
+        resume_run_id is not None and str(resume_run_id).strip() != ""
+    )
+    if _effective_scheduler_mode != zsched.MODE_ACTIVE and (
+        _resume_mode == zres.RESUME_MODE_AUTO or _resume_run_id_requested
+    ):
+        _refusal = (
+            "durable ZeGrid resume requires zegrid_scheduler_mode=active; "
+            f"effective scheduler is {scheduler_mode!r} and "
+            f"resume_mode={_resume_mode!r}"
+            + (
+                f" with resume_run_id={resume_run_id!r}"
+                if _resume_run_id_requested
+                else ""
+            )
+            + ". Refusing BEFORE opening or creating any durable store or "
+            "lock: select scheduler 'active' for durable checkpoint resume, "
+            "or launch with resume_mode=never (no durable resume)."
+        )
+        _emit(
+            f"ZeGrid: resume REFUSED — {_refusal}",
+            lvl="ERROR",
+            callback=progress_callback,
+        )
+        raise zres.ResumeSchedulerUnsupported(_refusal)
     _resume_boot = None
     _resume_plan = None
     _resume_pending_ids = None
@@ -9710,6 +10279,29 @@ def _run_single(
         if zconfig is not None
         else None
     )
+    # ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031: the VISIBLE store folder is never
+    # written into when it already holds unrelated content. A real store (a
+    # ``run.json`` root or a container of run-* generations, including a legacy
+    # ``.zegrid-durable``) passes; anything else fails closed here, before any
+    # directory, lock or state is created.
+    if _resume_store_dir:
+        _foreign_store = _foreign_store_content(_resume_store_dir)
+        if _foreign_store is not None:
+            raise RuntimeError(
+                "ZeGrid: refusing to use the durable store folder "
+                f"{_resume_store_dir}: {_foreign_store}. Nothing was written. "
+                "Choose another store folder or remove that content."
+            )
+    # ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031: ONE explicit line when the run
+    # reads/continues a legacy hidden checkpoint store. The store is used in
+    # place (never moved, renamed or migrated).
+    if _resume_store_dir and Path(str(_resume_store_dir)).name == ".zegrid-durable":
+        _emit(
+            "ZeGrid: legacy checkpoint store in use — reading "
+            f"{_resume_store_dir} (the visible 'zegrid-durable' folder is not "
+            "used; nothing was moved or renamed)",
+            callback=progress_callback,
+        )
     _resume_runtime = {
         "mode": _resume_mode,
         "run_id_requested": (
@@ -9820,6 +10412,24 @@ def _run_single(
                 f"{_resume_store_dir}; starting a NEW durable generation",
                 callback=progress_callback,
             )
+    # ZM-ZEGRID-ACTIVE-RESUME-PARITY: the admission inputs (effective backend
+    # + tile_px) belong to the SCIENCE identity, so a resumed run REUSES the
+    # contract frozen at creation instead of re-deriving it from the CURRENT
+    # free RAM. A pre-parity store has no section -> None -> today's
+    # conservative re-derive + refuse-on-mismatch behaviour is preserved.
+    _frozen_admission = (
+        None if _resume_boot is None else _resume_boot.admission
+    )
+    if _frozen_admission is not None:
+        _emit(
+            "ZeGrid: resume admission REUSED — backend="
+            f"{_frozen_admission['backend']} "
+            f"tile_px={_frozen_admission['tile_px']} "
+            "parity_qualified="
+            f"{_frozen_admission['parity_qualified']} (frozen at run "
+            "creation; never re-derived from current RAM/GPU state)",
+            callback=progress_callback,
+        )
     elif _resume_mode == zres.RESUME_MODE_NEVER:
         _emit(
             "ZeGrid: resume mode=never — launch-time reuse disabled; a NEW "
@@ -9933,6 +10543,25 @@ def _run_single(
     # available / effective / device / VRAM truth + fallback reason.
     gpu_ctx = gpu_context or {}
     gpu_used = bool(gpu_ctx.get("effective"))
+    # ZM-ZEGRID-ACTIVE-RESUME-PARITY r2: the FROZEN backend governs the whole
+    # launch, not only the tile. A CPU-frozen run must NOT build a GPU plan just
+    # because this host/enablement offers one: the effective GPU selection is
+    # forced off here (one helper, same mapping as the planner), so the ACTIVE
+    # GPU decision is never armed and the identity matches by construction.
+    _gpu_selected_by_host = bool(gpu_used)
+    gpu_used = _frozen_planning_gpu(
+        _frozen_admission, gpu_used=gpu_used
+    )
+    if _gpu_selected_by_host and not gpu_used:
+        _emit(
+            "ZeGrid: GPU ignored — CPU-frozen run: this run's frozen identity "
+            f"is backend={_frozen_admission['backend']} "
+            f"(tile_px={_frozen_admission['tile_px']}), so the resumed plan "
+            "stays CPU. A GPU offered by this host/enablement never changes a "
+            "frozen run (no config change, no backend switch).",
+            lvl="WARN",
+            callback=progress_callback,
+        )
     _telemetry_state["use_gpu"] = bool(gpu_used)
     ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=gpu_used)
     if ignored_settings:
@@ -10120,8 +10749,9 @@ def _run_single(
     _temp_root = _resolve_temp_root(
         output_dir, getattr(zconfig, "temporary_work_dir", "") if zconfig is not None else ""
     )
-    cache_root = Path(_temp_root) / CACHE_DIR_NAME
-    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_root = _prepare_run_cache_root(
+        Path(_temp_root) / CACHE_DIR_NAME, emit=_emit_live
+    )
     if str(Path(_temp_root)) != str(Path(output_dir)):
         _emit(
             f"ZeGrid: temporary work root = {_temp_root} (outputs stay in {output_dir})",
@@ -10165,10 +10795,26 @@ def _run_single(
         active=(scheduler_mode == zsched.MODE_ACTIVE),
         emit=_emit_live,
         restored_geometry=_resume_geometry,
+        frozen_admission=_frozen_admission,
     )
     try:
         with timings.timed("layout"):
             _initial_bundle = _plan_bundle_auto(**_plan_request)
+    except zres.ResumeFrozenAdmissionUnavailable as _frozen_exc:
+        # FAIL CLOSED (never shrink the tile, never switch the backend, never
+        # start a fresh run). Nothing was written: release the single-writer
+        # lock so no store/lock is left behind by the refusal.
+        _resume_runtime["refusal"] = (
+            f"{type(_frozen_exc).__name__}: {_frozen_exc}"
+        )
+        _emit(
+            f"ZeGrid: resume REFUSED — {_frozen_exc}",
+            lvl="ERROR",
+            callback=progress_callback,
+        )
+        if _resume_boot is not None:
+            _resume_boot.close()
+        raise
     except (zal.LayoutInfeasible, zpar.ModeInfeasible) as _plan_exc:
         _emit(
             "ZeGrid: NO executable plan fits the PLAN budget — refusing BEFORE the "
@@ -11005,17 +11651,28 @@ def _run_single(
     _stack_rep = _reporter()
     _cache_rep.start("cache_build", total=cache_total_frames, unit="frames")
     _stack_rep.start("per_cell_stack", total=total_cells, unit="cells")
+    # ZM-ZEGRID-ACTIVE-RESUME-PARITY r3: RUN-level progress accounting.
+    # ``offset`` = cells already committed when this process started (0 for a
+    # fresh run); every per-cell report adds it so the displayed counter is the
+    # RUN's progress over the FROZEN expected set. ``item=`` always names the
+    # cell actually being processed (the executed list), never a plan index.
+    _stack_progress = {"offset": 0, "pending": None}
+
+    def _stack_report(processed, cid, *, force=False):
+        try:
+            _done = int(_stack_progress["offset"]) + int(processed)
+            _stack_progress["last_done"] = _done
+            _stack_rep.progress(_done, item_id=cid, force=force)
+        except Exception:
+            pass
 
     def _gpu_unit_progress(done: int, cid: str | None) -> None:
         """Authoritative ACTIVE-GPU cell completion (actual cid, live)."""
-        try:
-            _stack_rep.progress(int(done), item_id=cid)
-        except Exception:
-            pass
+        _stack_report(done, cid)
         _telemetry_stats(
             phase_name="Per-cell stacking",
             phase_index=3,
-            tiles_done=int(done),
+            tiles_done=int(_stack_progress["offset"]) + int(done),
             tiles_total=int(total_cells),
         )
     # ------------------------------------------------------------------
@@ -11250,8 +11907,8 @@ def _run_single(
 
     def _cell_progress_for(tasks):
         def _cb(done, total):
-            cid = task_cids[int(done) - 1] if 0 < int(done) <= len(task_cids) else None
-            _stack_rep.progress(int(done), item_id=cid)
+            # The ACTUAL executed list: on resume it is the sparse pending set.
+            _stack_report(done, _stack_item_cid(tasks, done))
         return _cb
 
     t_block0 = time.perf_counter()
@@ -11401,6 +12058,17 @@ def _run_single(
         deterministic_checkpoints = []
         shrink_count = 0
         run_t0 = time.perf_counter()
+        # ZM-ZEGRID-COMMIT-INTEGRITY: ONE explicit line with the durable commit
+        # counter at stacking start, so a silent divergence is visible.
+        if _store_state["store"] is not None and _store_state["publishing"]:
+            _emit(
+                "ZeGrid: stacking start — durable_commits="
+                f"{int(_store_state.get('commits', 0))} "
+                f"(cells={int(total_tasks)} pending of {int(total_cells)}, "
+                f"store={_store_state['store'].root}, "
+                f"run_id={_store_state['store'].run_id})",
+                callback=progress_callback,
+            )
         # ONE persistent latch for the whole RUN. A mid-wave sample is only a
         # candidate for the NEXT safe boundary; it never mutates this wave.
         latch = zrt.PressureLatch()
@@ -11603,11 +12271,9 @@ def _run_single(
         def _wave_progress(base_offset):
             def _cb(done, _total):
                 idx = int(base_offset) + int(done)
-                cid = (
-                    canonical_cids[idx - 1]
-                    if 0 < idx <= len(canonical_cids) else None
-                )
-                _stack_rep.progress(idx, item_id=cid)
+                # ``pending_tasks`` is the executed (sparse) list: index it,
+                # never the complete canonical plan.
+                _stack_report(idx, _stack_item_cid(pending_tasks, idx))
             return _cb
 
         def _terminalize_refusal(exc, *, wave_index, offset,
@@ -12005,6 +12671,15 @@ def _run_single(
                 else 0
             )
             wave_t0 = time.perf_counter()
+            # ZM-ZEGRID-COMMIT-INTEGRITY: a DURABLE run advances its visible
+            # progress ONLY on a durable commit. The pmap callback fires when a
+            # WORKER returns, i.e. before the parent commit, so it must not move
+            # the counter here; the commit loop below reports instead.
+            _durable_wave = bool(
+                _store_state["store"] is not None
+                and _store_state["publishing"]
+                and _store_state.get("degraded_reason") is None
+            )
             wave_results, wave_meta = _run_cell_batch(
                 science_cfg,
                 int(bundle.cpu_streaming_tile),
@@ -12012,7 +12687,11 @@ def _run_single(
                 tasks=wave_tasks,
                 workers=units_bound,
                 cache_workers=int(bundle.cache_workers_per_cell),
-                progress_callback=_wave_progress(start),
+                progress_callback=(
+                    (lambda _done, _total: None)
+                    if _durable_wave
+                    else _wave_progress(start)
+                ),
                 heartbeat=_heartbeat,
                 heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
             )
@@ -12047,8 +12726,67 @@ def _run_single(
                                     ),
                                 )
                                 if not _out.accepted:
-                                    # A late result from a cancelled plan is
-                                    # never published; the run stays healthy.
+                                    # A late/duplicate result that is no longer
+                                    # required never poisons accepted state.
+                                    # But a cell the run still NEEDS (pending)
+                                    # rejected by the generation fence — e.g. a
+                                    # generation transition in the middle of a
+                                    # CPU wave — leaves a permanent hole. Fail
+                                    # closed with the typed M1 conservation
+                                    # refusal instead of leaking a lower-level
+                                    # RunRegistryError during assembly.
+                                    if _cid in set(
+                                        result_registry.pending_cell_ids()
+                                    ):
+                                        _stale = _R55RunRefused(
+                                            "R55_RUN_RESULT_ACCEPTANCE",
+                                            (
+                                                f"cell {_cid} result rejected "
+                                                "by the M3 generation fence "
+                                                f"({_out.reason}: "
+                                                f"{_out.detail or ''}); the "
+                                                "required cell cannot be "
+                                                "accepted for the current "
+                                                "generation"
+                                            ),
+                                            record={
+                                                "schema": zrt.RUN_CONTROL_SCHEMA,
+                                                "status": "refused",
+                                                "reason_code": (
+                                                    "R55_RUN_RESULT_ACCEPTANCE"
+                                                ),
+                                                "detail": (
+                                                    f"{_out.reason}: "
+                                                    f"{_out.detail or ''}"
+                                                ),
+                                                "wave_index": int(wave_index),
+                                                "cell_id": _cid,
+                                                "generation": int(
+                                                    wave_generation
+                                                ),
+                                                "result_registry": (
+                                                    result_registry.snapshot()
+                                                ),
+                                                "publication": {
+                                                    "fits": False,
+                                                    "manifest": False,
+                                                    "assembly": False,
+                                                },
+                                                "note": (
+                                                    "A required cell's result "
+                                                    "was rejected by the "
+                                                    "generation fence; "
+                                                    "previously accepted "
+                                                    "payloads remain owned "
+                                                    "and nothing is published"
+                                                ),
+                                            },
+                                        )
+                                        _stale.result_registry = result_registry
+                                        raise _stale
+                                    # A late result from a replaced plan for a
+                                    # cell that is no longer required is never
+                                    # published; the run stays healthy.
                                     _emit(
                                         "ZeGrid: CPU result for "
                                         f"{_cid} rejected by the M3 "
@@ -12141,13 +12879,34 @@ def _run_single(
                                 _emit(
                                     "ZeGrid: durable commit FAILED for "
                                     f"{_cid} ({_store_state['degraded_reason']}"
-                                    "). Prior commits are preserved; this and "
-                                    "later cells stay in memory (no durable "
-                                    "claim, no release).",
+                                    "). Refusing to continue: a cell whose "
+                                    "commit is not durable is never reported as "
+                                    "processed (fail fast, no silent degrade).",
                                     lvl="ERROR",
                                     callback=progress_callback,
                                 )
+                                # ZM-ZEGRID-COMMIT-INTEGRITY: a commit failure is
+                                # TERMINAL for a durable run. Continuing would
+                                # report processed cells that do not exist on
+                                # disk (the RESUME_NEW incident).
+                                raise zrs.StoreCommitNotDurable(
+                                    "durable commit FAILED for cell "
+                                    f"{_cid!r} attempt {_receipt.attempt_id!r} "
+                                    f"run_id={_store.run_id!r} "
+                                    f"store_root={_store.root}: "
+                                    f"{_store_state['degraded_reason']}",
+                                    run_id=_store.run_id,
+                                    cell_id=_cid,
+                                    store_root=_store.root,
+                                    attempt_id=_receipt.attempt_id,
+                                ) from _store_exc
                             else:
+                                # Verify the commit is DURABLE before anything
+                                # (progress, release counters) treats the cell as
+                                # processed. Cheap local index lookup.
+                                _store.require_commit(
+                                    _cid, _receipt.attempt_id
+                                )
                                 _store_state["commits"] += 1
                                 _rel = _handoff.get("release") or {}
                                 if _rel.get("released"):
@@ -12155,6 +12914,9 @@ def _run_single(
                                     _store_state["released_bytes"] += int(
                                         _rel.get("released_bytes", 0)
                                     )
+                                # Durable progress: advance ONLY now, on the
+                                # committed cell (never on worker completion).
+                                _stack_report(start + _index + 1, _cid)
                         wave_results[_index] = None
                 finally:
                     # Honest transient ownership: accepted payloads are owned by
@@ -12359,7 +13121,9 @@ def _run_single(
         )
         if result_registry is not None:
             _store = _store_state["store"]
-            if _store is not None:
+            if _store is not None and _r55_durable_cell_coverage(
+                _store_state, canonical_cids, context="CPU wave completion"
+            ) is not None:
                 # M5-A: bounded, read-only assembly access. Nothing is
                 # materialised here: cells are verified and memory-mapped ONE at
                 # a time inside the session, so the assembly never holds every
@@ -12621,16 +13385,17 @@ def _run_single(
             except BaseException as exc:
                 _capture_failure("consumer", exc, payload=payload)
                 raise
-            # Report ONLY a successful, non-idempotent acceptance. A rejected /
-            # stale / duplicate callback must not add a completion count.
-            if unit_progress is not None:
-                try:
-                    cid = getattr(payload.get("cell"), "cell_id", None)
-                    unit_progress(int(_unit_progress["done"]), cid)
-                except Exception:
-                    pass
             if result_registry is None:
+                # No registry => no durable claim exists for this path.
                 _unit_progress["done"] += 1
+                if unit_progress is not None:
+                    try:
+                        unit_progress(
+                            int(_unit_progress["done"]),
+                            getattr(payload.get("cell"), "cell_id", None),
+                        )
+                    except Exception:
+                        pass
                 return result
             unit_index = int(payload.get("_unit_index", 0))
             cid = str((result or {}).get("cell_id", ""))
@@ -12693,8 +13458,28 @@ def _run_single(
                     "cell_id": cid,
                     "detail": str(exc),
                 }
+            # ZM-ZEGRID-COMMIT-INTEGRITY r1: acceptance is NOT durability. The
+            # GPU consumer must commit + verify + release BEFORE the unit is
+            # reported as done (the CPU wave loop already did this).
             if not receipt.idempotent:
+                _gpu_durable_commit(
+                    _store_state,
+                    result_registry,
+                    cid,
+                    receipt,
+                    plan_generation=int(gpu_dispatch_generation),
+                    backend=str((result or {}).get("backend_used") or "gpu"),
+                )
                 _unit_progress["done"] += 1
+            else:
+                _store_g = _store_state.get("store")
+                if _store_g is not None and _store_state.get("publishing"):
+                    _store_g.require_commit(cid, receipt.attempt_id)
+            if unit_progress is not None:
+                try:
+                    unit_progress(int(_unit_progress["done"]), cid)
+                except Exception:
+                    pass
             with accepted_lock:
                 accepted_units.add(int(unit_index))
             # The pipeline keeps ONLY this lightweight receipt, never the
@@ -13374,6 +14159,12 @@ def _run_single(
             # fallback (it must not trigger a CPU rerun or a conserved-refusal
             # wrapper). The registry already owns every accepted payload.
             raise
+        except (zrs.StoreCommitNotDurable, _R55DurableStoreUnavailable):
+            # ZM-ZEGRID-COMMIT-INTEGRITY r2: a durable-commit integrity failure
+            # is TERMINAL. It must never be reclassified as a GPU fallback
+            # (which would launch a CPU rerun) nor wrapped as a conserved
+            # refusal: the store is the authority and its fault stays typed.
+            raise
         except BaseException as exc:  # noqa: BLE001 - exactly one CPU fallback
             # Deterministic cleanup: the pipeline already released its staged
             # units; also clear any per-cell cache left by a failed worker.
@@ -13486,7 +14277,11 @@ def _run_single(
             # bounded and read-only instead of an eager list of every payload.
             _store_ids = [t[0].cell_id for t in tasks]
             _store = _store_state["store"]
-            if _store is not None:
+            # COMPLETE sparse coverage (not a boolean, not attempts>0) BEFORE
+            # any lazy durable-results consumer, diagnostics included.
+            if _store is not None and _r55_durable_cell_coverage(
+                _store_state, _store_ids, context="GPU completion"
+            ) is not None:
                 results = _bounded_store_results(
                     _store, _store_ids, store_state=_store_state
                 )
@@ -13884,6 +14679,9 @@ def _run_single(
                 lvl="ERROR",
                 callback=progress_callback,
             )
+            # Nothing was admitted: release the single-writer lock so the
+            # refusal leaves no store/lock behind.
+            _resume_boot.close()
             raise
         except Exception as _resume_exc:
             _resume_runtime["refusal"] = (
@@ -13895,6 +14693,7 @@ def _run_single(
                 lvl="ERROR",
                 callback=progress_callback,
             )
+            _resume_boot.close()
             raise
         _store = _resume_boot.store
         _store_state.update(
@@ -13936,6 +14735,26 @@ def _run_single(
             "(sparse cell_id set, never a 0..K prefix)",
             callback=progress_callback,
         )
+        # R3: the stacking counter starts from the FROZEN committed count and the
+        # total stays the run's expected cell count. ONE unambiguous line, then
+        # the first PROGRESS sample is the RUN's progress (never 1/total).
+        _stack_accounting = _resume_stack_accounting(_resume_plan)
+        _stack_progress["offset"] = int(_stack_accounting["committed"])
+        _stack_progress["pending"] = list(_stack_accounting["pending"])
+        _emit(
+            _resume_progress_line(
+                _stack_accounting["committed"],
+                _stack_accounting["total"],
+                len(_stack_accounting["pending"]),
+            ),
+            callback=progress_callback,
+        )
+        _stack_report(
+            0,
+            _stack_accounting["pending"][0]
+            if _stack_accounting["pending"] else None,
+            force=True,
+        )
         if _resume_plan["is_complete"]:
             _emit(
                 "ZeGrid: resumed run is ALREADY COMPLETE — verified no-op: no "
@@ -13976,6 +14795,51 @@ def _run_single(
                     None if _pub_gen is None else _pub_gen.as_report()
                 )
                 _resume_runtime["outputs"] = dict(_pub_outputs)
+                # r4: make an ALREADY-published run discoverable again (the
+                # visible entry point is idempotent and points at the SAME
+                # immutable generation; no science/publication change).
+                # ZM-ZEGRID-ROOT-DELIVERABLES: a run that completed before the
+                # root-delivery change gains its root FITS here, without any
+                # recomputation (idempotent atomic copies).
+                if _pub_gen is not None:
+                    _reconcile_root_files: dict = {}
+                    try:
+                        _root_delivery = zpub.publish_root_deliverables(
+                            output_dir, _pub_gen
+                        )
+                        _reconcile_root_files = _root_delivery["root_files"]
+                        for _root_failure in _root_delivery["failures"]:
+                            _emit(
+                                "ZeGrid: root deliverable not published — "
+                                f"{_root_failure}; the publication remains "
+                                "authoritative and the previous root file was "
+                                "left untouched.",
+                                lvl="WARN",
+                                callback=progress_callback,
+                            )
+                    except Exception as _root_exc:
+                        _emit(
+                            "ZeGrid: products could not be delivered at the "
+                            "output root "
+                            f"({type(_root_exc).__name__}: {_root_exc}); the "
+                            "publication remains authoritative.",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+                    try:
+                        zpub.write_visible_products(
+                            output_dir,
+                            _pub_gen,
+                            root_files=_reconcile_root_files,
+                        )
+                    except Exception as _vis_exc:
+                        _emit(
+                            "ZeGrid: products entry point could not be "
+                            f"written ({type(_vis_exc).__name__}: {_vis_exc}); "
+                            "the publication itself stays authoritative.",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
                 if _pub_verdict.reason != "verified_finalized":
                     # Lost OR stale acknowledgement: the publication is durable
                     # but the state is missing/partial/outdated. Reconcile it
@@ -13997,6 +14861,7 @@ def _run_single(
                             outputs=_pub_outputs,
                             created_unix_ns=_prev_state["created_unix_ns"],
                             note=_prev_state["note"],
+                            admission=_prev_state.get("admission"),
                         )
                     except Exception as _ack_exc:
                         _emit(
@@ -14146,6 +15011,12 @@ def _run_single(
                         "M4 frozen run state: expected cell ids + effective "
                         "storage policy; never re-discovered on resume"
                     ),
+                    # ZM-ZEGRID-ACTIVE-RESUME-PARITY: freeze the run's OWN
+                    # admission contract (effective backend + tile_px + parity)
+                    # so a restart reuses it instead of re-deriving it from the
+                    # current free RAM. Written ONCE here from the validated
+                    # identity, preserved verbatim by every later state rewrite.
+                    admission=_admission_from_identity(_store_identity),
                 )
                 _store_state["state_path"] = str(
                     zres.state_path(_store.root)
@@ -14184,14 +15055,31 @@ def _run_single(
                     "resume state write failed: "
                     f"{type(_state_exc).__name__}: {_state_exc}"
                 )
+                # FAIL CLOSED (bounded REWORK-2): an explicit durable
+                # checkpoint run whose frozen state/gauge/geometry cannot be
+                # written is refused BEFORE any cell is admitted. The store is
+                # closed (lock released) and every file stays on disk; no
+                # "ACTIVE"/resumable claim and no later StoreNotFoundError from
+                # a store-backed assembly over missing commits.
+                try:
+                    _store.close()
+                except Exception:
+                    pass
+                _store_state["store"] = None
                 _emit(
-                    "ZeGrid: durable store opened but the frozen resume state "
-                    f"could not be written ({_store_state['degraded_reason']}); "
-                    "durable commits are DISABLED for this run (no resumable "
-                    "claim). Prior generations are preserved.",
+                    "ZeGrid: durable checkpoint initialization FAILED — "
+                    f"{_store_state['degraded_reason']}. Refusing this run "
+                    "before any cell admission: no FITS, no manifest, no "
+                    "durable/resumable claim. The store was closed (lock "
+                    "released) and all existing files were preserved. NaN/"
+                    "unserializable scientific values are never rewritten to "
+                    "force a store.",
                     lvl="ERROR",
                     callback=progress_callback,
                 )
+                raise _R55DurableStoreInitError(
+                    _store_state["degraded_reason"]
+                ) from _state_exc
             _emit(
                 "ZeGrid: durable run store ACTIVE — "
                 f"root={_store.root} run_id={_store.run_id} "
@@ -14930,6 +15818,22 @@ def _run_single(
     )
     global_eta.phase_completed("per_cell_stack", timings.get("per_cell_stack"))
 
+    # ZM-ZEGRID-COMMIT-INTEGRITY: the end-of-stacking durable counter (ONE line),
+    # then a fail-fast guard BEFORE assembly: a run with expected cells and ZERO
+    # durable commits must never attempt assembly (the RESUME_NEW incident).
+    _assembly_store = _store_state["store"]
+    if _assembly_store is not None and _store_state["publishing"]:
+        _durable_attempts = _require_durable_commits_before_assembly(
+            _assembly_store,
+            expected_cells=int(total_cells),
+            log_done=int(_stack_progress.get("last_done") or 0),
+        )
+        _emit(
+            f"ZeGrid: per-cell stacking complete — durable_commits="
+            f"{_durable_attempts} (cells={int(total_cells)})",
+            callback=progress_callback,
+        )
+
     # ASSEMBLY.
     _gauge_mode = getattr(science_config, "cell_gauge_mode", "global")
     feather_info = None
@@ -15509,6 +16413,66 @@ def _run_single(
             },
         )
         _resume_runtime["publication"] = _published_generation.as_report()
+        # ZM-ZEGRID-ROOT-DELIVERABLES: DELIVER the finished products at the
+        # OUTPUT ROOT first (Classic/SDS consistency), then write the visible
+        # markers that name those root paths. Both run only AFTER the pointer
+        # is durable. A delivery failure is a WARN: the publication stays
+        # authoritative and a prior root file is left byte-identical.
+        _root_files: dict = {}
+        try:
+            _root_delivery = zpub.publish_root_deliverables(
+                output_dir, _published_generation
+            )
+            _root_files = _root_delivery["root_files"]
+            for _root_failure in _root_delivery["failures"]:
+                _emit(
+                    "ZeGrid: root deliverable not published — "
+                    f"{_root_failure}; the publication remains authoritative "
+                    "and the previous root file was left untouched.",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+        except Exception as _root_exc:
+            _emit(
+                "ZeGrid: products could not be delivered at the output root "
+                f"({type(_root_exc).__name__}: {_root_exc}); the publication "
+                "remains authoritative and the previous root files were left "
+                "untouched.",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+        # r4: VISIBLE discovery entry point at the output root, written ONLY
+        # after the pointer is durable. It names the DELIVERED root paths and
+        # still records the immutable generation directory for audit/resume.
+        try:
+            _visible = zpub.write_visible_products(
+                output_dir, _published_generation, root_files=_root_files
+            )
+            _resume_runtime["visible_products"] = {
+                "json": str(
+                    Path(output_dir) / zpub.PRODUCTS_JSON_FILENAME
+                ),
+                "text": str(
+                    Path(output_dir) / zpub.PRODUCTS_TEXT_FILENAME
+                ),
+                "generation_dir": str(_visible["generation_dir"]),
+            }
+            _emit(
+                "ZeGrid: products entry point written — "
+                f"{Path(output_dir) / zpub.PRODUCTS_JSON_FILENAME} -> "
+                f"{_published_generation.generation} "
+                f"({_published_generation.generation_dir})",
+                callback=progress_callback,
+            )
+        except Exception as _visible_exc:
+            _emit(
+                "ZeGrid: products entry point could not be written "
+                f"({type(_visible_exc).__name__}: {_visible_exc}); the "
+                "publication remains authoritative and the previous pointers "
+                "were left intact.",
+                lvl="WARN",
+                callback=progress_callback,
+            )
         _emit(
             "ZeGrid: publication generation COMMITTED — "
             f"{_published_generation.generation} "
@@ -15552,6 +16516,8 @@ def _run_single(
                 outputs=_outputs,
                 created_unix_ns=_prev_state["created_unix_ns"],
                 note=_prev_state["note"],
+                # The frozen admission is never rewritten after creation.
+                admission=_prev_state.get("admission"),
             )
             _resume_runtime["finalized_noop"] = False
             _resume_runtime["outputs"] = dict(_outputs)
@@ -16544,6 +17510,17 @@ def run_zegrid_mode(
         callback=progress_callback,
     )
     _emit("ZeGrid engine activated (explicit ZeGrid mode)", callback=progress_callback)
+    # ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031: ONE explicit line when a legacy
+    # hidden publication container is the one that will be READ. Nothing is
+    # moved, renamed or migrated; the visible name stays the write target.
+    _legacy_publication_root = zpub.legacy_publication_in_use(output_folder)
+    if _legacy_publication_root is not None:
+        _emit(
+            "ZeGrid: legacy publication layout in use — reading "
+            f"{_legacy_publication_root} (the visible 'zegrid_publications' "
+            "folder is not present; nothing was moved or renamed)",
+            callback=progress_callback,
+        )
     _emit(
         "ZeGrid: storage policy — requested="
         f"{_STORAGE_REQUESTED} effective={_STORAGE_EFFECTIVE} "

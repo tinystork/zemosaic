@@ -151,6 +151,12 @@ DEFAULT_CONFIG = {
     # historical behaviour); a positive integer caps the store's own disk
     # reservations. Never enabled implicitly.
     "zegrid_durable_store_budget_bytes": None,
+    # ZM-ZEGRID-M6-QT-STOP-RESUME: GUI-only, explicit opt-in for durable
+    # checkpoint saving on ZeGrid runs. OFF by default. It never changes the
+    # engine/CLI defaults: the engine still opens a durable store only when a
+    # store directory is resolved for the run (this key makes the Qt GUI resolve
+    # one for a fresh ZeGrid run).
+    "zegrid_qt_save_checkpoints_enabled": False,
     # ZM-ZEGRID-RESILIENT-RUN-RESUME-M3: opt-in host-resource recovery (a
     # cancellable WAITING_RESOURCES episode at a wave boundary). OFF by default:
     # with False the qualified M1/M2 refusal path is byte-for-byte unchanged.
@@ -1095,8 +1101,18 @@ def migrate_coverage_settings(config):
 
     return cfg, notes
 
-def load_config():
-    config_path = Path(get_config_path())
+def load_config(config_path=None):
+    """Load and normalise the persisted configuration.
+
+    ``config_path`` is an optional explicit source used by the Qt recovery path
+    when a strict run-policy value makes the user's file unloadable: the GUI
+    sanitises only the six policy values, lets the normal loader apply every
+    other migration, then restores the raw policy values. Normal callers keep
+    the historical no-argument behaviour.
+    """
+    config_path = (
+        Path(config_path) if config_path is not None else Path(get_config_path())
+    )
     try:
         logger.info("Loading ZeMosaic config from %s", config_path)
     except Exception:

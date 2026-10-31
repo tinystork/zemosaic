@@ -572,12 +572,44 @@ def test_d_start_processing_accept_filter_sets_skip_and_builds_payload(monkeypat
     ]
     captured: dict[str, object] = {}
 
+    # HERMETIC FIXTURE (R4): the real main window must not inherit the user's
+    # preferences, previous publication or output folder. Give it an explicit
+    # config with SIBLING temporary input/output folders and a temporary config
+    # path, and never touch the real user config file.
+    inp = tmp_path / "in"
+    out = tmp_path / "out"
+    inp.mkdir()
+    out.mkdir()
+    hermetic_config = {
+        "input_dir": str(inp),
+        "output_dir": str(out),
+        "output_dir_browse_start": str(tmp_path),
+        "input_dir_browse_start": str(tmp_path),
+        "zegrid_save_checkpoints": False,
+        "zegrid_durable_store_dir": str(tmp_path / "store"),
+    }
+    monkeypatch.setattr(
+        gui.zemosaic_config, "load_config",
+        lambda *a, **k: dict(hermetic_config), raising=False,
+    )
+    monkeypatch.setattr(
+        gui.ZeMosaicQtMainWindow, "_determine_config_path",
+        lambda self: tmp_path / "zemosaic_config.json",
+    )
+
+    def _unexpected_modal(*a, **k):
+        message = a[2] if len(a) > 2 else k.get("text", "")
+        raise AssertionError(f"unexpected modal dialog: {message}")
+
+    monkeypatch.setattr(gui.QMessageBox, "warning", _unexpected_modal)
+    monkeypatch.setattr(gui.QMessageBox, "critical", _unexpected_modal)
+
     monkeypatch.setattr(gui, "run_hierarchical_mosaic_process", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(gui.QMessageBox, "question", lambda *a, **k: gui.QMessageBox.Yes)
     monkeypatch.setattr(gui.ZeMosaicQtMainWindow, "_collect_config_from_widgets", lambda self: None)
     monkeypatch.setattr(gui.ZeMosaicQtMainWindow, "_existing_master_tiles_enabled", lambda self: False)
     monkeypatch.setattr(gui.ZeMosaicQtMainWindow, "_launch_filter_dialog", lambda self: (setattr(self, "_last_filtered_header_items", items) or setattr(self, "_last_filter_overrides", {"resolved_wcs_count": 2}) or True))
-    monkeypatch.setattr(gui.ZeMosaicQtMainWindow, "_serialize_config_for_save", lambda self: {"input_dir": str(tmp_path), "output_dir": str(tmp_path / "out")})
+    monkeypatch.setattr(gui.ZeMosaicQtMainWindow, "_serialize_config_for_save", lambda self: {"input_dir": str(inp), "output_dir": str(out)})
     monkeypatch.setattr(gui.ZeMosaicQtMainWindow, "_save_config", lambda self: None)
     monkeypatch.setattr(gui.ZeMosaicQtMainWindow, "_append_log", lambda self, *a, **k: None)
 
@@ -589,6 +621,11 @@ def test_d_start_processing_accept_filter_sets_skip_and_builds_payload(monkeypat
 
     w = gui.ZeMosaicQtMainWindow()
     try:
+        # Explicit Classic mode: this test exercises the Filter handoff, not the
+        # durable-resume preflight, so no ZeGrid capability may be inferred.
+        for _name, _cb in w._mode_checkboxes.items():
+            _cb.setChecked(False)
+        assert w._selected_processing_mode() == "classic"
         w._start_processing(skip_filter_prompt=False, predecided_skip_filter_ui=None)
         kwargs = captured.get("kwargs")
         assert isinstance(kwargs, dict)
