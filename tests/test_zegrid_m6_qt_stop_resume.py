@@ -44,6 +44,7 @@ from zemosaic.core.zegrid import run_registry as zrr  # noqa: E402
 from zemosaic.core.zegrid import run_resume as zres  # noqa: E402
 from zemosaic.core.zegrid import run_publication as zpub  # noqa: E402
 from zemosaic.core.zegrid import run_store as zrs  # noqa: E402
+from zemosaic.core.zegrid import run_artifacts as zart  # noqa: E402
 
 import test_zegrid_resume_m4 as m4  # noqa: E402
 from test_zegrid_m6_gui_policy import (  # noqa: E402
@@ -1887,8 +1888,13 @@ def test_frozen_artifact_write_failure_refuses_before_any_cell(
     reopened.close()
 
 
-def test_real_routine_12x384_nan_gauge_fails_closed_before_cells(tmp_path):
+def test_real_routine_12x384_inactive_nan_gauge_writes_and_runs_cells(tmp_path):
     """Real tiny 12x384 reproducer (the corpus that exposed the NaN artifact).
+
+    FixedNormalization legitimately stores NaN coefficients for frames excluded
+    from normalization. The gauge artifact must encode them as strict JSON,
+    restore them, and let the run admit/execute cells instead of failing with
+    ``Out of range float values are not JSON compliant: nan``.
 
     If the host cannot satisfy the engine's own resource preflight, this is
     reported as NOT_RUN (skip) rather than forced.
@@ -1931,22 +1937,45 @@ def test_real_routine_12x384_nan_gauge_fails_closed_before_cells(tmp_path):
     )
     try:
         zz._stack_cell = _observe
-        with pytest.raises(zz._R55DurableStoreInitError) as exc:
-            zz.run_zegrid_mode(
-                str(inp),
-                str(out),
-                zconfig=cfg,
-                zegrid_halo_px=8,
-                use_gpu=False,
-                cell_gauge_mode="per_cell",
-            )
+        zz.run_zegrid_mode(
+            str(inp),
+            str(out),
+            zconfig=cfg,
+            zegrid_halo_px=8,
+            use_gpu=False,
+            cell_gauge_mode="per_cell",
+        )
     except (zz.zal.LayoutInfeasible, zz.zpar.ModeInfeasible) as resource_exc:
         pytest.skip(f"NOT_RUN: host resource preflight refused ({resource_exc})")
     finally:
         zz._stack_cell = real_stack
-    assert "not strict JSON" in str(exc.value)
-    assert executed == []
-    assert not list(out.glob("mosaic_grid*.fits"))
+
+    # The run got past gauge initialization and admitted/executed cells.
+    assert executed, "the gauge must be durable before cells, not a failure"
+    assert list(out.glob("mosaic_grid*.fits"))
+
+    # The on-disk gauge is strict JSON with an explicit inactive-NaN encoding.
+    raw = (store / zart.GAUGE_FILENAME).read_bytes()
+    doc = json.loads(
+        raw,
+        parse_constant=lambda token: pytest.fail(
+            f"gauge.json must not contain a {token!r} token"
+        ),
+    )
+    assert doc["schema"] == zart.GAUGE_SCHEMA
+    block = doc["coefficients"]
+    assert block["encoding"] == zart.GAUGE_COEFFICIENTS_ENCODING
+    assert block["non_finite"], "this corpus must exercise norm-inactive frames"
+    assert all(item["kind"] == "nan" for item in block["non_finite"])
+    for item in block["non_finite"]:
+        frame_index, _channel, _coefficient = item["index"]
+        assert doc["norm_active"][frame_index] is False
+        assert block["values"][item["index"][0]][item["index"][1]][
+            item["index"][2]
+        ] is None
+    assert any(active is False for active in doc["norm_active"])
+
+    # The lock/handles were released: a second writer can acquire the store.
     reopened = zrs.RunCellStore.open(store, identity=None)
     reopened.close()
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -29,11 +30,22 @@ import numpy as np
 from . import run_store as zrs
 from .run_resume import ResumeCorruptGlobal, ResumeIncompatible, ResumeStateError
 
-GAUGE_SCHEMA = "zegrid-run-gauge-v1"
+LEGACY_GAUGE_SCHEMA = "zegrid-run-gauge-v1"
+GAUGE_SCHEMA = "zegrid-run-gauge-v2"
 GEOMETRY_SCHEMA = "zegrid-run-geometry-v1"
-ARTIFACT_VERSION = "1"
+LEGACY_GAUGE_ARTIFACT_VERSION = "1"
+GAUGE_ARTIFACT_VERSION = "2"
+GEOMETRY_ARTIFACT_VERSION = "1"
+# Backwards-compatible name for the geometry version (the only artifact that
+# stayed at v1). Kept so external importers do not silently compare a bumped
+# gauge version against geometry.
+ARTIFACT_VERSION = GEOMETRY_ARTIFACT_VERSION
 GAUGE_FILENAME = "gauge.json"
 GEOMETRY_FILENAME = "geometry.json"
+
+GAUGE_COEFFICIENTS_ENCODING = "explicit-nonfinite-v1"
+_GAUGE_COEFFICIENT_DTYPES = frozenset({"<f8", ">f8", "=f8"})
+_GAUGE_EXCLUSION_STAGES = frozenset({"normalization", "weighting"})
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +107,18 @@ def _atomic_json(path: Path, payload: Mapping[str, Any], run_root: Path) -> None
     zrs.atomic_write_bytes(path, zrs.canonical_json(payload), tmp_dir=tmp)
 
 
+def _reject_json_constant(token: str):
+    raise ValueError(f"non-finite JSON number token {token!r} is forbidden")
+
+
 def _read_json(path: Path, label: str) -> dict:
     if not path.exists():
         raise ResumeStateError(f"{label} is missing at {path}")
     try:
-        value = json.loads(path.read_bytes().decode("utf-8"))
+        value = json.loads(
+            path.read_bytes().decode("utf-8"),
+            parse_constant=_reject_json_constant,
+        )
     except Exception as exc:
         raise ResumeCorruptGlobal(f"{label} at {path} is not readable JSON: {exc}") from exc
     if not isinstance(value, dict):
@@ -138,6 +157,482 @@ def gauge_fingerprint(
     )
 
 
+def _require_json_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ResumeCorruptGlobal(f"{label} must be an integer, got {value!r}")
+    return int(value)
+
+
+def _check_coefficient_shape(arr: np.ndarray, frame_count: int, *, error) -> None:
+    if (
+        arr.ndim != 3
+        or arr.shape[0] != frame_count
+        or arr.shape[1] < 1
+        or arr.shape[2] != 2
+    ):
+        raise error(
+            f"gauge coefficients shape {arr.shape} is invalid for "
+            f"{frame_count} frames; expected (N, C, 2)"
+        )
+
+
+def _check_gauge_vectors(
+    norm_active: np.ndarray,
+    weights: np.ndarray,
+    weight_active: np.ndarray,
+    *,
+    frame_count: int,
+    error,
+) -> None:
+    """Shared strict validation of the gauge's active flags and weights."""
+    for arr, label in (
+        (norm_active, "norm_active"),
+        (weight_active, "weight_active"),
+        (weights, "weights"),
+    ):
+        if arr.shape != (frame_count,):
+            raise error(f"gauge {label} shape {arr.shape} != ({frame_count},)")
+    if not np.all(np.isfinite(weights)):
+        raise error("gauge weights must be strictly finite")
+    if np.any(weights < 0.0):
+        raise error("gauge weights must be non-negative")
+    if np.any(weight_active & ~norm_active):
+        raise error("gauge weight_active must be a subset of norm_active")
+    if np.any(weights[weight_active] <= 0.0):
+        raise error("gauge weights of weight-active frames must be positive")
+    if np.any(weights[~weight_active] != 0.0):
+        raise error("gauge weights of weight-inactive frames must be exactly 0")
+
+
+def _check_coefficients_match_activity(
+    coefficients: np.ndarray, norm_active: np.ndarray, *, frame_count: int, error
+) -> None:
+    """NaN is legal ONLY on frames excluded from normalization."""
+    if np.any(np.isinf(coefficients)):
+        index = tuple(int(v) for v in np.argwhere(np.isinf(coefficients))[0])
+        raise error(
+            f"gauge coefficients contain an infinite value at index {index}; "
+            "infinity is never a valid photometric coefficient"
+        )
+    nan_mask = np.isnan(coefficients)
+    bad = nan_mask & np.asarray(norm_active, dtype=bool).reshape((frame_count, 1, 1))
+    if bool(bad.any()):
+        index = tuple(int(v) for v in np.argwhere(bad)[0])
+        raise error(
+            "gauge coefficients have a non-finite value on a norm-active frame "
+            f"at index {index}"
+        )
+
+
+def _validate_exclusions(
+    items,
+    *,
+    frame_count: int,
+    norm_active: np.ndarray,
+    weight_active: np.ndarray,
+    error,
+) -> list[dict]:
+    if not isinstance(items, (list, tuple)):
+        raise error("gauge exclusions must be a list")
+    out: list[dict] = []
+    for position, item in enumerate(items):
+        if isinstance(item, Mapping):
+            if set(item) != {"index", "stage", "reason", "detail"}:
+                raise error(
+                    f"gauge exclusion[{position}] must have exactly "
+                    "index/stage/reason/detail"
+                )
+            raw_index = item.get("index")
+            stage = item.get("stage")
+            reason = item.get("reason")
+            detail = item.get("detail")
+        else:
+            raw_index = getattr(item, "index", None)
+            stage = getattr(item, "stage", None)
+            reason = getattr(item, "reason", None)
+            detail = getattr(item, "detail", None)
+        if isinstance(raw_index, bool) or not isinstance(
+            raw_index, (int, np.integer)
+        ):
+            raise error(f"gauge exclusion[{position}].index must be an integer")
+        index = int(raw_index)
+        if not (0 <= index < frame_count):
+            raise error(
+                f"gauge exclusion[{position}].index {index} is out of range "
+                f"[0, {frame_count})"
+            )
+        if not isinstance(stage, str) or stage not in _GAUGE_EXCLUSION_STAGES:
+            raise error(
+                f"gauge exclusion[{position}].stage {stage!r} is not one of "
+                f"{sorted(_GAUGE_EXCLUSION_STAGES)}"
+            )
+        if not isinstance(reason, str) or not reason:
+            raise error(f"gauge exclusion[{position}].reason must be a non-empty string")
+        if detail is not None and not isinstance(detail, str):
+            raise error(f"gauge exclusion[{position}].detail must be null or a string")
+        if stage == "normalization" and bool(norm_active[index]):
+            raise error(
+                f"gauge normalization exclusion at frame {index} contradicts "
+                "norm_active=True"
+            )
+        if stage == "weighting" and bool(weight_active[index]):
+            raise error(
+                f"gauge weighting exclusion at frame {index} contradicts "
+                "weight_active=True"
+            )
+        out.append(
+            {"index": index, "stage": stage, "reason": reason, "detail": detail}
+        )
+    return out
+
+
+def _encode_gauge_coefficients(
+    coefficients: np.ndarray, norm_active: np.ndarray, *, frame_count: int
+) -> dict:
+    """Encode coefficients as strict JSON, preserving NaN positions and bits."""
+    arr = np.array(coefficients, dtype="<f8", copy=True)
+    _check_coefficient_shape(arr, frame_count, error=ResumeStateError)
+    active = np.asarray(norm_active, dtype=bool)
+    if active.shape != (frame_count,):
+        raise ResumeStateError(
+            f"gauge norm_active shape {active.shape} != ({frame_count},)"
+        )
+    _check_coefficients_match_activity(
+        arr, active, frame_count=frame_count, error=ResumeStateError
+    )
+    nan_mask = np.isnan(arr)
+    bits = arr.view(np.uint64)
+    non_finite = [
+        {
+            "index": [int(i), int(c), int(k)],
+            "kind": "nan",
+            "float64_bits": f"0x{int(bits[i, c, k]):016x}",
+        }
+        for i, c, k in np.argwhere(nan_mask)
+    ]
+    return {
+        "encoding": GAUGE_COEFFICIENTS_ENCODING,
+        "dtype": "<f8",
+        "shape": [int(v) for v in arr.shape],
+        "values": np.where(nan_mask, None, arr).tolist(),
+        "non_finite": non_finite,
+    }
+
+
+def _fill_coefficient_values(node, arr: np.ndarray, position: tuple, nulls: set) -> None:
+    if len(position) == arr.ndim:
+        if node is None:
+            nulls.add(position)
+            return
+        if isinstance(node, bool) or not isinstance(node, (int, float)):
+            raise ResumeCorruptGlobal(
+                f"gauge coefficient at {position} must be a number or null, "
+                f"got {type(node).__name__}"
+            )
+        try:
+            value = float(node)
+        except (OverflowError, ValueError) as exc:
+            raise ResumeCorruptGlobal(
+                f"gauge coefficient at {position} is not representable: {exc}"
+            ) from exc
+        if not math.isfinite(value):
+            raise ResumeCorruptGlobal(
+                f"gauge coefficient at {position} is a non-finite JSON number"
+            )
+        arr[position] = value
+        return
+    expected = arr.shape[len(position)]
+    if not isinstance(node, list) or len(node) != expected:
+        raise ResumeCorruptGlobal(
+            f"gauge coefficients at {position} must be a list of length {expected}"
+        )
+    for index, child in enumerate(node):
+        _fill_coefficient_values(child, arr, position + (index,), nulls)
+
+
+def _decode_gauge_coefficients(
+    block: Any, *, frame_count: int, schema_version: int
+) -> np.ndarray:
+    if schema_version == 1:
+        if not isinstance(block, list):
+            raise ResumeCorruptGlobal("legacy gauge v1 coefficients must be a list")
+        try:
+            arr = np.asarray(block, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ResumeCorruptGlobal(
+                f"legacy gauge v1 coefficients are not numeric: {exc}"
+            ) from exc
+        _check_coefficient_shape(arr, frame_count, error=ResumeCorruptGlobal)
+        if not np.all(np.isfinite(arr)):
+            raise ResumeCorruptGlobal(
+                "legacy gauge v1 carries non-finite coefficients; gauge v1 only "
+                "supports strictly finite coefficients (refusing, never repaired)"
+            )
+        return np.ascontiguousarray(arr)
+
+    if not isinstance(block, Mapping):
+        raise ResumeCorruptGlobal("gauge coefficients must be an object")
+    if set(block) != {"encoding", "dtype", "shape", "values", "non_finite"}:
+        raise ResumeCorruptGlobal(
+            "gauge coefficients must have exactly "
+            "encoding/dtype/shape/values/non_finite"
+        )
+    if block.get("encoding") != GAUGE_COEFFICIENTS_ENCODING:
+        raise ResumeCorruptGlobal(
+            f"gauge coefficients encoding {block.get('encoding')!r} is not "
+            f"supported ({GAUGE_COEFFICIENTS_ENCODING})"
+        )
+    if block.get("dtype") not in _GAUGE_COEFFICIENT_DTYPES:
+        raise ResumeCorruptGlobal(
+            f"gauge coefficients dtype {block.get('dtype')!r} is not float64"
+        )
+    shape_raw = block.get("shape")
+    if not isinstance(shape_raw, list) or len(shape_raw) != 3:
+        raise ResumeCorruptGlobal("gauge coefficients shape must be a list of 3 integers")
+    shape = tuple(
+        _require_json_int(value, "gauge coefficients shape") for value in shape_raw
+    )
+    if shape[0] != frame_count or shape[1] < 1 or shape[2] != 2:
+        raise ResumeCorruptGlobal(
+            f"gauge coefficients shape {shape} is invalid for {frame_count} frames; "
+            "expected (N, C, 2)"
+        )
+
+    arr = np.empty(shape, dtype=np.float64)
+    nulls: set[tuple] = set()
+    _fill_coefficient_values(block.get("values"), arr, (), nulls)
+
+    entries = block.get("non_finite")
+    if not isinstance(entries, list):
+        raise ResumeCorruptGlobal("gauge coefficients non_finite must be a list")
+    declared: dict[tuple, int] = {}
+    for position, item in enumerate(entries):
+        if not isinstance(item, Mapping) or set(item) != {
+            "index", "kind", "float64_bits"
+        }:
+            raise ResumeCorruptGlobal(
+                f"gauge non_finite[{position}] must have exactly "
+                "index/kind/float64_bits"
+            )
+        index_raw = item.get("index")
+        if not isinstance(index_raw, list) or len(index_raw) != 3:
+            raise ResumeCorruptGlobal(
+                f"gauge non_finite[{position}].index must be a list of 3 integers"
+            )
+        index = tuple(
+            _require_json_int(value, f"gauge non_finite[{position}].index")
+            for value in index_raw
+        )
+        if any(not (0 <= index[axis] < shape[axis]) for axis in range(3)):
+            raise ResumeCorruptGlobal(
+                f"gauge non_finite[{position}].index {index} is out of range {shape}"
+            )
+        if item.get("kind") != "nan":
+            raise ResumeCorruptGlobal(
+                f"gauge non_finite[{position}].kind must be 'nan'"
+            )
+        bits_text = item.get("float64_bits")
+        if (
+            not isinstance(bits_text, str)
+            or not bits_text.lower().startswith("0x")
+            or len(bits_text) != 18
+        ):
+            raise ResumeCorruptGlobal(
+                f"gauge non_finite[{position}].float64_bits must be a 0x-prefixed "
+                "64-bit hex string"
+            )
+        try:
+            bits = int(bits_text, 16)
+        except ValueError as exc:
+            raise ResumeCorruptGlobal(
+                f"gauge non_finite[{position}].float64_bits is not hexadecimal"
+            ) from exc
+        value = np.array([bits], dtype=np.uint64).view(np.float64)[0]
+        if not np.isnan(value):
+            raise ResumeCorruptGlobal(
+                f"gauge non_finite[{position}] declares a bit pattern that is "
+                "not NaN"
+            )
+        if index in declared:
+            raise ResumeCorruptGlobal(
+                f"gauge non_finite[{position}] duplicates index {index}"
+            )
+        declared[index] = bits
+    if set(declared) != nulls:
+        raise ResumeCorruptGlobal(
+            "gauge coefficients non_finite table does not exactly match the "
+            "null sentinels"
+        )
+    bits_view = arr.view(np.uint64)
+    for index, bits in declared.items():
+        bits_view[index] = np.uint64(bits)
+    return np.ascontiguousarray(arr)
+
+
+def _read_bool_vector(raw: Mapping[str, Any], label: str, frame_count: int) -> np.ndarray:
+    value = raw.get(label)
+    if not isinstance(value, list) or len(value) != frame_count:
+        raise ResumeCorruptGlobal(
+            f"gauge {label} must be a list of {frame_count} booleans"
+        )
+    for index, item in enumerate(value):
+        if not isinstance(item, bool):
+            raise ResumeCorruptGlobal(f"gauge {label}[{index}] must be a boolean")
+    return np.asarray(value, dtype=bool)
+
+
+def _read_weight_vector(raw: Mapping[str, Any], label: str, frame_count: int) -> np.ndarray:
+    value = raw.get(label)
+    if not isinstance(value, list) or len(value) != frame_count:
+        raise ResumeCorruptGlobal(
+            f"gauge {label} must be a list of {frame_count} numbers"
+        )
+    out = np.empty((frame_count,), dtype=np.float64)
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ResumeCorruptGlobal(f"gauge {label}[{index}] must be a number")
+        try:
+            number = float(item)
+        except (OverflowError, ValueError) as exc:
+            raise ResumeCorruptGlobal(
+                f"gauge {label}[{index}] is not representable: {exc}"
+            ) from exc
+        if not math.isfinite(number):
+            raise ResumeCorruptGlobal(
+                f"gauge {label}[{index}] must be strictly finite"
+            )
+        out[index] = number
+    return out
+
+
+def _validate_gauge_document(raw: Mapping[str, Any]) -> dict:
+    """Validate and decode a gauge document; never repairs it."""
+    schema = raw.get("schema")
+    version_raw = raw.get("schema_version")
+    if schema == LEGACY_GAUGE_SCHEMA:
+        if str(version_raw) != LEGACY_GAUGE_ARTIFACT_VERSION:
+            raise ResumeStateError(
+                f"legacy gauge artifact version {version_raw!r} is not supported "
+                f"({LEGACY_GAUGE_ARTIFACT_VERSION})"
+            )
+        schema_version = 1
+    elif schema == GAUGE_SCHEMA:
+        if str(version_raw) != GAUGE_ARTIFACT_VERSION:
+            raise ResumeStateError(
+                f"gauge artifact version {version_raw!r} is not supported "
+                f"({GAUGE_ARTIFACT_VERSION})"
+            )
+        schema_version = 2
+    else:
+        raise ResumeStateError(
+            f"gauge artifact schema {schema!r} is not supported"
+        )
+
+    run_id = raw.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise ResumeCorruptGlobal("gauge run_id must be a non-empty string")
+    identity_sha = raw.get("identity_sha256")
+    if not isinstance(identity_sha, str) or not identity_sha:
+        raise ResumeCorruptGlobal("gauge identity_sha256 must be a non-empty string")
+    gauge_sha = raw.get("gauge_sha256")
+    if (
+        not isinstance(gauge_sha, str)
+        or len(gauge_sha) != 64
+        or any(char not in "0123456789abcdef" for char in gauge_sha)
+    ):
+        raise ResumeCorruptGlobal(
+            "gauge_sha256 must be a lowercase 64-character hex digest"
+        )
+    mode = raw.get("mode")
+    if not isinstance(mode, str) or not mode:
+        raise ResumeCorruptGlobal("gauge mode must be a non-empty string")
+
+    frame_ids_raw = raw.get("frame_ids")
+    if not isinstance(frame_ids_raw, list) or not all(
+        isinstance(value, str) and value for value in frame_ids_raw
+    ):
+        raise ResumeCorruptGlobal(
+            "gauge frame_ids must be a list of non-empty strings"
+        )
+    frame_ids = tuple(frame_ids_raw)
+    frame_count = len(frame_ids)
+    if frame_count < 1:
+        raise ResumeCorruptGlobal("gauge artifact must cover at least one frame")
+    stored_count = _require_json_int(raw.get("frame_count"), "gauge frame_count")
+    if stored_count != frame_count:
+        raise ResumeCorruptGlobal("gauge frame_count disagrees with frame_ids")
+
+    reference_index = _require_json_int(
+        raw.get("reference_index"), "gauge reference_index"
+    )
+    if not (0 <= reference_index < frame_count):
+        raise ResumeCorruptGlobal(
+            f"gauge reference_index {reference_index} is out of range "
+            f"[0, {frame_count})"
+        )
+    reference_frame_id = raw.get("reference_frame_id")
+    if reference_frame_id is not None:
+        if not isinstance(reference_frame_id, str):
+            raise ResumeCorruptGlobal("gauge reference_frame_id must be null or a string")
+        if reference_frame_id != frame_ids[reference_index]:
+            raise ResumeCorruptGlobal(
+                "gauge reference_frame_id does not match "
+                f"frame_ids[{reference_index}]"
+            )
+
+    norm_active = _read_bool_vector(raw, "norm_active", frame_count)
+    weight_active = _read_bool_vector(raw, "weight_active", frame_count)
+    weights = _read_weight_vector(raw, "weights", frame_count)
+    _check_gauge_vectors(
+        norm_active,
+        weights,
+        weight_active,
+        frame_count=frame_count,
+        error=ResumeCorruptGlobal,
+    )
+    coefficients = _decode_gauge_coefficients(
+        raw.get("coefficients"),
+        frame_count=frame_count,
+        schema_version=schema_version,
+    )
+    _check_coefficients_match_activity(
+        coefficients,
+        norm_active,
+        frame_count=frame_count,
+        error=ResumeCorruptGlobal,
+    )
+    exclusions = _validate_exclusions(
+        raw.get("exclusions"),
+        frame_count=frame_count,
+        norm_active=norm_active,
+        weight_active=weight_active,
+        error=ResumeCorruptGlobal,
+    )
+    from zemosaic.core.canonical_stacking import FrameExclusion
+
+    return {
+        "schema_version": schema_version,
+        "frame_ids": frame_ids,
+        "coefficients": coefficients,
+        "norm_active": np.ascontiguousarray(norm_active),
+        "weights": np.ascontiguousarray(weights),
+        "weight_active": np.ascontiguousarray(weight_active),
+        "exclusions": tuple(
+            FrameExclusion(
+                index=item["index"],
+                stage=item["stage"],
+                reason=item["reason"],
+                detail=item["detail"],
+            )
+            for item in exclusions
+        ),
+        "exclusions_json": exclusions,
+        "reference_index": reference_index,
+        "reference_frame_id": reference_frame_id,
+        "mode": mode,
+    }
+
+
 def write_gauge_artifact(
     run_root: str | os.PathLike[str],
     *,
@@ -148,50 +643,112 @@ def write_gauge_artifact(
     frame_ids: Sequence[str],
     reference_frame_id: str | None,
 ) -> dict:
-    """Persist the COMPLETE global gauge before any cell is admitted."""
+    """Persist the COMPLETE global gauge before any cell is admitted.
+
+    Fail-closed: all validation runs BEFORE the atomic rename, so an invalid
+    in-memory gauge can never replace a previous valid ``gauge.json``.
+    """
     root = Path(run_root)
     frame_ids = tuple(str(v) for v in frame_ids)
-    if isinstance(gauge.coefficients, np.ndarray):
-        coefficients = gauge.coefficients.astype(np.float64, copy=False).tolist()
-    else:  # pragma: no cover - defensive
-        coefficients = np.asarray(gauge.coefficients, dtype=np.float64).tolist()
+    frame_count = len(frame_ids)
+    if frame_count < 1:
+        raise ResumeStateError("gauge artifact requires at least one frame id")
+    if any(not frame_id for frame_id in frame_ids):
+        raise ResumeStateError("gauge frame_ids must be non-empty strings")
+
+    raw_reference_index = gauge.reference_index
+    if isinstance(raw_reference_index, bool) or not isinstance(
+        raw_reference_index, (int, np.integer)
+    ):
+        raise ResumeStateError("gauge reference_index must be an integer")
+    reference_index = int(raw_reference_index)
+    if not (0 <= reference_index < frame_count):
+        raise ResumeStateError(
+            f"gauge reference_index {reference_index} is out of range "
+            f"[0, {frame_count})"
+        )
+    reference_frame_id_value = (
+        None if reference_frame_id is None else str(reference_frame_id)
+    )
+    if (
+        reference_frame_id_value is not None
+        and reference_frame_id_value != frame_ids[reference_index]
+    ):
+        raise ResumeStateError(
+            f"gauge reference_frame_id {reference_frame_id_value!r} does not "
+            f"match frame_ids[{reference_index}]={frame_ids[reference_index]!r}"
+        )
+
+    norm_active = np.asarray(gauge.norm_active)
+    weights = np.asarray(gauge.weights)
+    weight_active = np.asarray(gauge.weight_active)
+    coefficients = np.asarray(gauge.coefficients)
+    if norm_active.dtype != np.dtype(bool):
+        raise ResumeStateError(
+            f"gauge norm_active must be bool (got {norm_active.dtype.name})"
+        )
+    if weight_active.dtype != np.dtype(bool):
+        raise ResumeStateError(
+            f"gauge weight_active must be bool (got {weight_active.dtype.name})"
+        )
+    if weights.dtype != np.dtype(np.float64):
+        raise ResumeStateError(
+            f"gauge weights must be float64 (got {weights.dtype.name})"
+        )
+    if coefficients.dtype != np.dtype(np.float64):
+        raise ResumeStateError(
+            f"gauge coefficients must be float64 (got {coefficients.dtype.name})"
+        )
+    _check_gauge_vectors(
+        norm_active,
+        weights,
+        weight_active,
+        frame_count=frame_count,
+        error=ResumeStateError,
+    )
+    encoded_coefficients = _encode_gauge_coefficients(
+        coefficients, norm_active, frame_count=frame_count
+    )
+    exclusions = _validate_exclusions(
+        gauge.exclusions,
+        frame_count=frame_count,
+        norm_active=norm_active,
+        weight_active=weight_active,
+        error=ResumeStateError,
+    )
+
     body = {
         "schema": GAUGE_SCHEMA,
-        "schema_version": ARTIFACT_VERSION,
+        "schema_version": GAUGE_ARTIFACT_VERSION,
         "run_id": str(run_id),
         "identity_sha256": zrs.identity_sha256(identity),
         "mode": str(mode),
         "frame_ids": list(frame_ids),
-        "frame_count": int(len(frame_ids)),
-        "reference_index": int(gauge.reference_index),
-        "reference_frame_id": (
-            None if reference_frame_id is None else str(reference_frame_id)
-        ),
-        "coefficients": coefficients,
-        "norm_active": [bool(v) for v in np.asarray(gauge.norm_active)],
-        "weights": [float(v) for v in np.asarray(gauge.weights)],
-        "weight_active": [bool(v) for v in np.asarray(gauge.weight_active)],
-        "exclusions": [
-            {
-                "index": int(item.index),
-                "stage": str(item.stage),
-                "reason": str(item.reason),
-                "detail": None if item.detail is None else str(item.detail),
-            }
-            for item in gauge.exclusions
-        ],
+        "frame_count": int(frame_count),
+        "reference_index": int(reference_index),
+        "reference_frame_id": reference_frame_id_value,
+        "coefficients": encoded_coefficients,
+        "norm_active": [bool(v) for v in norm_active],
+        "weights": [float(v) for v in weights],
+        "weight_active": [bool(v) for v in weight_active],
+        "exclusions": exclusions,
         "gauge_sha256": gauge_fingerprint(
             gauge=gauge,
             mode=str(mode),
             frame_ids=frame_ids,
-            reference_frame_id=reference_frame_id,
+            reference_frame_id=reference_frame_id_value,
         ),
         "note": (
-            "M4: complete resumable global gauge. Never pickle; arrays are "
-            "inlined as strict JSON numbers. The per-Cell photometric reference "
-            "pin is stored WITH each CELL commit (plan §6.1), not re-derived."
+            "M4: complete resumable global gauge. Never pickle. Coefficients use "
+            f"{GAUGE_COEFFICIENTS_ENCODING}: finite values inline, NaN positions "
+            "as null plus an exact float64-bit table; NaN is legal only on "
+            "norm_active=False frames. The per-Cell photometric reference pin is "
+            "stored WITH each CELL commit (plan §6.1), not re-derived."
         ),
     }
+    # Validate the exact document that will be written (strict JSON, sentinels,
+    # decoded semantics) before touching the filesystem.
+    _validate_gauge_document(body)
     payload = dict(body)
     payload["artifact_sha256"] = _self_digest(body)
     _atomic_json(root / GAUGE_FILENAME, payload, root)
@@ -211,15 +768,7 @@ def read_gauge_artifact(
             "gauge artifact self-digest mismatch; refusing a corrupt gauge "
             "(never a best-effort recovery)"
         )
-    if raw.get("schema") != GAUGE_SCHEMA:
-        raise ResumeStateError(
-            f"gauge artifact schema {raw.get('schema')!r} != {GAUGE_SCHEMA!r}"
-        )
-    if str(raw.get("schema_version")) != ARTIFACT_VERSION:
-        raise ResumeStateError(
-            f"gauge artifact version {raw.get('schema_version')!r} is not "
-            f"supported ({ARTIFACT_VERSION})"
-        )
+    _validate_gauge_document(raw)
     if identity is not None:
         if str(raw.get("run_id")) != str(identity["run_id"]):
             raise ResumeCorruptGlobal("gauge artifact belongs to another run_id")
@@ -234,56 +783,24 @@ def restore_global_gauge(
     identity: Mapping[str, Any],
 ) -> tuple[Any, tuple[str, ...], str | None]:
     """Load and VALIDATE the full gauge; returns ``(gauge, frame_ids, ref_id)``."""
-    from zemosaic.core.canonical_stacking import FrameExclusion
     from zemosaic.core.canonical_streaming import FixedNormalization
 
     raw = read_gauge_artifact(run_root, identity=identity)
-    frame_ids = tuple(str(v) for v in raw["frame_ids"])
-    if int(raw["frame_count"]) != len(frame_ids):
-        raise ResumeCorruptGlobal("gauge frame_count disagrees with frame_ids")
-    n = len(frame_ids)
-    coefficients = np.asarray(raw["coefficients"], dtype=np.float64)
-    norm_active = np.asarray(raw["norm_active"], dtype=bool)
-    weights = np.asarray(raw["weights"], dtype=np.float64)
-    weight_active = np.asarray(raw["weight_active"], dtype=bool)
-    if coefficients.shape != (n, 3, 2) and coefficients.ndim != 3:
-        raise ResumeCorruptGlobal(
-            f"gauge coefficients shape {coefficients.shape} is invalid for {n} frames"
-        )
-    for arr, expected, label in (
-        (norm_active, (n,), "norm_active"),
-        (weights, (n,), "weights"),
-        (weight_active, (n,), "weight_active"),
-    ):
-        if arr.shape != expected:
-            raise ResumeCorruptGlobal(
-                f"gauge {label} shape {arr.shape} != {expected}"
-            )
-    exclusions = tuple(
-        FrameExclusion(
-            index=int(item["index"]),
-            stage=str(item["stage"]),
-            reason=str(item["reason"]),
-            detail=None if item.get("detail") is None else str(item["detail"]),
-        )
-        for item in raw["exclusions"]
-    )
+    parsed = _validate_gauge_document(raw)
     gauge = FixedNormalization(
-        reference_index=int(raw["reference_index"]),
-        coefficients=np.ascontiguousarray(coefficients),
-        norm_active=np.ascontiguousarray(norm_active),
-        weights=np.ascontiguousarray(weights),
-        weight_active=np.ascontiguousarray(weight_active),
-        exclusions=exclusions,
+        reference_index=parsed["reference_index"],
+        coefficients=parsed["coefficients"],
+        norm_active=parsed["norm_active"],
+        weights=parsed["weights"],
+        weight_active=parsed["weight_active"],
+        exclusions=parsed["exclusions"],
     )
-    stored_sha = str(
-        identity["science_contract"]["gauge"]["sha256"]
-    )
+    stored_sha = str(identity["science_contract"]["gauge"]["sha256"])
     actual_sha = gauge_fingerprint(
         gauge=gauge,
-        mode=str(raw["mode"]),
-        frame_ids=frame_ids,
-        reference_frame_id=raw.get("reference_frame_id"),
+        mode=parsed["mode"],
+        frame_ids=parsed["frame_ids"],
+        reference_frame_id=parsed["reference_frame_id"],
     )
     if actual_sha != stored_sha:
         raise ResumeIncompatible(
@@ -299,7 +816,7 @@ def restore_global_gauge(
                 }
             ],
         )
-    return gauge, frame_ids, raw.get("reference_frame_id")
+    return gauge, parsed["frame_ids"], parsed["reference_frame_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +927,7 @@ def write_geometry_artifact(
         )
     body = {
         "schema": GEOMETRY_SCHEMA,
-        "schema_version": ARTIFACT_VERSION,
+        "schema_version": GEOMETRY_ARTIFACT_VERSION,
         "run_id": str(run_id),
         "identity_sha256": zrs.identity_sha256(identity),
         "canvas": {
@@ -466,10 +983,10 @@ def read_geometry_artifact(
         raise ResumeStateError(
             f"geometry artifact schema {raw.get('schema')!r} != {GEOMETRY_SCHEMA!r}"
         )
-    if str(raw.get("schema_version")) != ARTIFACT_VERSION:
+    if str(raw.get("schema_version")) != GEOMETRY_ARTIFACT_VERSION:
         raise ResumeStateError(
             f"geometry artifact version {raw.get('schema_version')!r} is not "
-            f"supported ({ARTIFACT_VERSION})"
+            f"supported ({GEOMETRY_ARTIFACT_VERSION})"
         )
     if identity is not None:
         if str(raw.get("run_id")) != str(identity["run_id"]):

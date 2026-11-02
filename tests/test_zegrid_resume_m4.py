@@ -29,6 +29,11 @@ from zemosaic.core.zegrid import run_resume as zres  # noqa: E402
 from zemosaic.core.zegrid import run_store as zrs  # noqa: E402
 from zemosaic.core.zegrid import run_artifacts as zart  # noqa: E402
 from zemosaic.core.zegrid import geometry as zg  # noqa: E402
+from zemosaic.core.canonical_stacking import FrameExclusion  # noqa: E402
+from zemosaic.core.canonical_streaming import (  # noqa: E402
+    FixedNormalization,
+    subset_fixed_normalization,
+)
 
 TOOLS = REPO_ROOT / "tools" / "zegrid_resume_m4"
 if str(TOOLS) not in sys.path:
@@ -619,7 +624,7 @@ def test_m4_corrupt_gauge_artifact_refuses(tmp_path):
     root, _identity = _artifact_run(tmp_path)
     path = root / zart.GAUGE_FILENAME
     doc = json.loads(path.read_text())
-    doc["coefficients"][0][0][0] = 123.0
+    doc["coefficients"]["values"][0][0][0] = 123.0
     path.write_text(json.dumps(doc))
     with pytest.raises(zres.ResumeCorruptGlobal):
         zart.read_gauge_artifact(root)
@@ -644,3 +649,332 @@ def test_m4_gauge_artifact_is_never_pickle_and_is_self_described(tmp_path):
     assert doc["schema"] == zart.GAUGE_SCHEMA
     assert "artifact_sha256" in doc
     assert doc["frame_count"] == len(HARNESS.FRAME_IDS)
+
+
+# ---------------------------------------------------------------------------
+# Gauge JSON strictness / inactive-NaN encoding (ZM-GAUGE-JSON-NONFINITE)
+# ---------------------------------------------------------------------------
+
+
+def _inactive_gauge(*, with_exclusion=True):
+    """A gauge whose only excluded frame carries legitimate NaN coefficients.
+
+    The first NaN uses a NON-canonical payload (sign bit set) so a lossy
+    "NaN -> np.nan" round-trip would break the frozen array digest.
+    """
+    coefficients = np.zeros(
+        (len(HARNESS.FRAME_IDS), CHANNELS, 2), dtype=np.float64
+    )
+    coefficients[:, :, 0] = 1.0
+    coefficients[1, :, :] = np.nan
+    coefficients[1, 0, 0] = np.array(
+        [0xFFF8000000000001], dtype=np.uint64
+    ).view(np.float64)[0]
+    exclusions = (
+        (
+            FrameExclusion(
+                index=1,
+                stage="normalization",
+                reason="insufficient_common",
+                detail="synthetic norm-inactive frame",
+            ),
+        )
+        if with_exclusion
+        else ()
+    )
+    return FixedNormalization(
+        reference_index=0,
+        coefficients=coefficients,
+        norm_active=np.array([True, False]),
+        weights=np.array([1.0, 0.0], dtype=np.float64),
+        weight_active=np.array([True, False]),
+        exclusions=exclusions,
+    )
+
+
+def _inactive_run(tmp_path, *, gauge=None, run_id="run-inactive"):
+    gauge = _inactive_gauge() if gauge is None else gauge
+    rows = HARNESS.ensure_inputs(tmp_path / "in")
+    identity = HARNESS.make_identity(run_id, rows)
+    identity["science_contract"]["gauge"]["sha256"] = HARNESS.gauge_sha(gauge)
+    identity["science_contract"]["gauge"]["n_exclusions"] = len(gauge.exclusions)
+    root = tmp_path / "run"
+    store = zrs.RunCellStore.open(root, identity=identity)
+    store.close()
+    zres.write_state(
+        root,
+        run_id=run_id,
+        expected_cell_ids=HARNESS.CELL_IDS,
+        policy={
+            "requested": "auto",
+            "effective": "dense",
+            "fallback_count": 0,
+            "transitions": [],
+            "dense_refusal": None,
+        },
+        gauge_sha256=identity["science_contract"]["gauge"]["sha256"],
+        note="inactive-NaN gauge test",
+    )
+    zart.write_gauge_artifact(
+        root,
+        run_id=run_id,
+        identity=identity,
+        gauge=gauge,
+        mode="per_cell",
+        frame_ids=HARNESS.FRAME_IDS,
+        reference_frame_id=HARNESS.FRAME_IDS[0],
+    )
+    return root, identity, gauge
+
+
+def _rewrite_with_recomputed_digest(path, mutate):
+    doc = json.loads(path.read_text())
+    mutate(doc)
+    doc.pop("artifact_sha256", None)
+    doc["artifact_sha256"] = zart._self_digest(doc)
+    path.write_bytes(zrs.canonical_json(doc))
+
+
+def test_m4_inactive_nan_gauge_roundtrip_preserves_bits_and_fingerprint(tmp_path):
+    root, identity, expected = _inactive_run(tmp_path)
+    boot = zres.ResumeBootstrap.open(root)
+    try:
+        gauge, frame_ids, reference = boot.restore_gauge()
+    finally:
+        boot.close()
+
+    assert tuple(frame_ids) == HARNESS.FRAME_IDS
+    assert reference == HARNESS.FRAME_IDS[0]
+    assert np.array_equal(
+        np.isnan(gauge.coefficients), np.isnan(expected.coefficients)
+    )
+    # Exact float64 bits (including the NaN payload/sign) must survive.
+    assert np.array_equal(
+        np.ascontiguousarray(gauge.coefficients).view(np.uint64),
+        np.ascontiguousarray(expected.coefficients).view(np.uint64),
+    )
+    assert np.array_equal(gauge.norm_active, expected.norm_active)
+    assert np.array_equal(gauge.weights, expected.weights)
+    assert np.array_equal(gauge.weight_active, expected.weight_active)
+    assert gauge.exclusions == expected.exclusions
+    assert gauge.reference_index == expected.reference_index
+    assert (
+        zart.gauge_fingerprint(
+            gauge=gauge,
+            mode="per_cell",
+            frame_ids=frame_ids,
+            reference_frame_id=reference,
+        )
+        == identity["science_contract"]["gauge"]["sha256"]
+    )
+
+
+def test_m4_inactive_nan_gauge_json_has_no_non_finite_tokens(tmp_path):
+    root, _identity, _gauge = _inactive_run(tmp_path)
+    raw = (root / zart.GAUGE_FILENAME).read_bytes()
+    # A strict parser must not see ANY NaN/Infinity literal token.
+    doc = json.loads(
+        raw,
+        parse_constant=lambda token: pytest.fail(
+            f"strict JSON must not contain a {token!r} token"
+        ),
+    )
+    block = doc["coefficients"]
+    assert block["encoding"] == zart.GAUGE_COEFFICIENTS_ENCODING
+    assert block["dtype"] == "<f8"
+    assert block["shape"] == [len(HARNESS.FRAME_IDS), CHANNELS, 2]
+    assert len(block["non_finite"]) == CHANNELS * 2
+    assert all(item["kind"] == "nan" for item in block["non_finite"])
+    assert all(
+        item["float64_bits"].startswith("0x")
+        and len(item["float64_bits"]) == 18
+        for item in block["non_finite"]
+    )
+    # Every declared non-finite position is a JSON null sentinel.
+    for item in block["non_finite"]:
+        i, c, k = item["index"]
+        assert block["values"][i][c][k] is None
+    assert b"\x80\x04" not in raw  # no pickle
+
+
+def test_m4_nonfinite_active_gauge_write_is_refused_atomically(tmp_path):
+    root, identity, _gauge = _inactive_run(tmp_path)
+    path = root / zart.GAUGE_FILENAME
+    before = path.read_bytes()
+
+    active_nan = HARNESS.synthetic_gauge()
+    active_nan.coefficients[0, 0, 0] = np.nan
+    with pytest.raises(zres.ResumeStateError, match="norm-active"):
+        zart.write_gauge_artifact(
+            root,
+            run_id="run-inactive",
+            identity=identity,
+            gauge=active_nan,
+            mode="per_cell",
+            frame_ids=HARNESS.FRAME_IDS,
+            reference_frame_id=HARNESS.FRAME_IDS[0],
+        )
+    assert path.read_bytes() == before  # never a partial/incorrect artifact
+    assert not list((root / "tmp").glob(".tmp-*"))
+
+    infinite_inactive = _inactive_gauge()
+    infinite_inactive.coefficients[1, 0, 0] = np.inf
+    with pytest.raises(zres.ResumeStateError, match="infinite"):
+        zart.write_gauge_artifact(
+            root,
+            run_id="run-inactive",
+            identity=identity,
+            gauge=infinite_inactive,
+            mode="per_cell",
+            frame_ids=HARNESS.FRAME_IDS,
+            reference_frame_id=HARNESS.FRAME_IDS[0],
+        )
+    assert path.read_bytes() == before
+
+
+def _tamper_sentinel_to_finite(doc):
+    doc["coefficients"]["values"][1][0][0] = 0.0
+
+
+def _tamper_activate_nan_frame(doc):
+    doc["norm_active"][1] = True
+    doc["exclusions"] = []
+
+
+def _tamper_inactive_weight(doc):
+    doc["weights"][1] = 0.5
+
+
+def _tamper_exclusion_index(doc):
+    doc["exclusions"][0]["index"] = 99
+
+
+def _tamper_declared_bits_not_nan(doc):
+    doc["coefficients"]["non_finite"][0]["float64_bits"] = "0x3ff0000000000000"
+
+
+@pytest.mark.parametrize(
+    "mutation, match",
+    [
+        (_tamper_sentinel_to_finite, "non_finite table"),
+        (_tamper_activate_nan_frame, "norm-active"),
+        (_tamper_inactive_weight, "exactly 0"),
+        (_tamper_exclusion_index, "out of range"),
+        (_tamper_declared_bits_not_nan, "not NaN"),
+    ],
+)
+def test_m4_gauge_semantic_tampering_is_refused_after_self_digest(
+    tmp_path, mutation, match
+):
+    root, _identity, _gauge = _inactive_run(tmp_path)
+    path = root / zart.GAUGE_FILENAME
+    _rewrite_with_recomputed_digest(path, mutation)
+    with pytest.raises(zres.ResumeCorruptGlobal, match=match):
+        zart.read_gauge_artifact(root)
+
+
+def test_m4_legacy_v1_finite_gauge_is_still_readable_and_restorable(tmp_path):
+    gauge = HARNESS.synthetic_gauge()
+    rows = HARNESS.ensure_inputs(tmp_path / "in")
+    identity = HARNESS.make_identity("run-legacy", rows)
+    root = tmp_path / "run"
+    store = zrs.RunCellStore.open(root, identity=identity)
+    store.close()
+    zres.write_state(
+        root,
+        run_id="run-legacy",
+        expected_cell_ids=HARNESS.CELL_IDS,
+        policy={
+            "requested": "auto",
+            "effective": "dense",
+            "fallback_count": 0,
+            "transitions": [],
+            "dense_refusal": None,
+        },
+        gauge_sha256=identity["science_contract"]["gauge"]["sha256"],
+        note="legacy v1 gauge fixture",
+    )
+    body = {
+        "schema": zart.LEGACY_GAUGE_SCHEMA,
+        "schema_version": zart.LEGACY_GAUGE_ARTIFACT_VERSION,
+        "run_id": "run-legacy",
+        "identity_sha256": zrs.identity_sha256(identity),
+        "mode": "per_cell",
+        "frame_ids": list(HARNESS.FRAME_IDS),
+        "frame_count": len(HARNESS.FRAME_IDS),
+        "reference_index": 0,
+        "reference_frame_id": HARNESS.FRAME_IDS[0],
+        "coefficients": gauge.coefficients.tolist(),
+        "norm_active": [True, True],
+        "weights": [1.0, 0.5],
+        "weight_active": [True, True],
+        "exclusions": [],
+        "gauge_sha256": HARNESS.gauge_sha(gauge),
+        "note": "legacy v1 finite coefficients",
+    }
+    payload = dict(body)
+    payload["artifact_sha256"] = zart._self_digest(body)
+    path = root / zart.GAUGE_FILENAME
+    path.write_bytes(zrs.canonical_json(payload))
+
+    raw = zart.read_gauge_artifact(root, identity=identity)
+    assert raw["schema"] == zart.LEGACY_GAUGE_SCHEMA
+    boot = zres.ResumeBootstrap.open(root)
+    try:
+        restored, frame_ids, reference = boot.restore_gauge()
+    finally:
+        boot.close()
+    assert tuple(frame_ids) == HARNESS.FRAME_IDS
+    assert reference == HARNESS.FRAME_IDS[0]
+    assert np.array_equal(restored.coefficients, gauge.coefficients)
+    assert np.array_equal(restored.norm_active, gauge.norm_active)
+    assert np.array_equal(restored.weights, gauge.weights)
+    assert np.array_equal(restored.weight_active, gauge.weight_active)
+
+    # Legacy v1 never grows a NaN representation: a NaN token is refused.
+    broken = json.loads(path.read_text())
+    broken["coefficients"][1][0][0] = float("nan")
+    path.write_text(json.dumps(broken))
+    with pytest.raises(zres.ResumeCorruptGlobal):
+        zart.read_gauge_artifact(root)
+
+
+def test_m4_geometry_schema_version_is_not_inherited_from_gauge_bump(tmp_path):
+    root, _identity = _artifact_run(tmp_path)
+    gauge_doc = json.loads((root / zart.GAUGE_FILENAME).read_text())
+    geo_doc = json.loads((root / zart.GEOMETRY_FILENAME).read_text())
+    assert gauge_doc["schema"] == "zegrid-run-gauge-v2"
+    assert gauge_doc["schema_version"] == "2"
+    assert geo_doc["schema"] == zart.GEOMETRY_SCHEMA == "zegrid-run-geometry-v1"
+    assert geo_doc["schema_version"] == "1"
+    assert zart.ARTIFACT_VERSION == "1"
+    zart.read_geometry_artifact(root)  # unchanged geometry v1 remains readable
+
+
+def test_m4_restored_inactive_nan_gauge_feeds_production_subset(tmp_path):
+    root, identity, expected = _inactive_run(tmp_path)
+    boot = zres.ResumeBootstrap.open(root)
+    try:
+        gauge, frame_ids, _reference = boot.restore_gauge()
+        # The production Cell-normalization consumer must accept the restored
+        # gauge (shape/flags/exclusions) and preserve the inactive NaN.
+        cell = subset_fixed_normalization(gauge, frame_ids, frame_ids)
+        assert cell.frame_ids == tuple(frame_ids)
+        assert np.array_equal(
+            np.isnan(cell.coefficients), np.isnan(expected.coefficients)
+        )
+        assert np.array_equal(
+            np.ascontiguousarray(cell.coefficients).view(np.uint64),
+            np.ascontiguousarray(expected.coefficients).view(np.uint64),
+        )
+        reference_only = subset_fixed_normalization(
+            gauge, frame_ids, (frame_ids[0],)
+        )
+        assert reference_only.frame_ids == (frame_ids[0],)
+        assert reference_only.reference_index == 0
+        assert reference_only.norm_active.tolist() == [True]
+        assert boot.state["gauge_sha256"] == (
+            identity["science_contract"]["gauge"]["sha256"]
+        )
+    finally:
+        boot.close()

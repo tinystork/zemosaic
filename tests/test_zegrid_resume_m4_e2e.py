@@ -291,7 +291,7 @@ def test_m4_corrupt_gauge_artifact_refuses_without_recompute(tmp_path):
     assert killed.returncode == 9
     path = store / "gauge.json"
     doc = json.loads(path.read_text())
-    doc["coefficients"][0][0][0] = 42.0
+    doc["coefficients"]["values"][0][0][0] = 42.0
     path.write_text(json.dumps(doc))
     before = [e for e in events(log) if e["event"] == "execute"]
 
