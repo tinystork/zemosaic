@@ -319,35 +319,58 @@ def _encode_gauge_coefficients(
     }
 
 
-def _fill_coefficient_values(node, arr: np.ndarray, position: tuple, nulls: set) -> None:
-    if len(position) == arr.ndim:
-        if node is None:
-            nulls.add(position)
+def _flatten_coefficient_values(
+    node: Any, shape: tuple[int, ...], expected_total: int
+) -> tuple[list[float], set[tuple]]:
+    """Validate the nested JSON ``values`` against ``shape`` and flatten them.
+
+    The walk is proportional to the ALREADY-MATERIALISED JSON content, never to
+    the declared shape: a compact document claiming a huge dimension fails on
+    the child list length before any array proportional to that dimension is
+    allocated. ``expected_total`` also bounds the flat list for a small shape
+    fed with oversized content.
+    """
+    flat: list[float] = []
+    nulls: set[tuple] = set()
+
+    def walk(value: Any, position: tuple) -> None:
+        depth = len(position)
+        if depth == len(shape):
+            if len(flat) >= expected_total:
+                raise ResumeCorruptGlobal(
+                    "gauge coefficients contain more values than the declared shape"
+                )
+            if value is None:
+                nulls.add(position)
+                flat.append(np.nan)
+                return
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ResumeCorruptGlobal(
+                    f"gauge coefficient at {position} must be a number or null, "
+                    f"got {type(value).__name__}"
+                )
+            try:
+                number = float(value)
+            except (OverflowError, ValueError) as exc:
+                raise ResumeCorruptGlobal(
+                    f"gauge coefficient at {position} is not representable: {exc}"
+                ) from exc
+            if not math.isfinite(number):
+                raise ResumeCorruptGlobal(
+                    f"gauge coefficient at {position} is a non-finite JSON number"
+                )
+            flat.append(number)
             return
-        if isinstance(node, bool) or not isinstance(node, (int, float)):
+        expected = shape[depth]
+        if not isinstance(value, list) or len(value) != expected:
             raise ResumeCorruptGlobal(
-                f"gauge coefficient at {position} must be a number or null, "
-                f"got {type(node).__name__}"
+                f"gauge coefficients at {position} must be a list of length {expected}"
             )
-        try:
-            value = float(node)
-        except (OverflowError, ValueError) as exc:
-            raise ResumeCorruptGlobal(
-                f"gauge coefficient at {position} is not representable: {exc}"
-            ) from exc
-        if not math.isfinite(value):
-            raise ResumeCorruptGlobal(
-                f"gauge coefficient at {position} is a non-finite JSON number"
-            )
-        arr[position] = value
-        return
-    expected = arr.shape[len(position)]
-    if not isinstance(node, list) or len(node) != expected:
-        raise ResumeCorruptGlobal(
-            f"gauge coefficients at {position} must be a list of length {expected}"
-        )
-    for index, child in enumerate(node):
-        _fill_coefficient_values(child, arr, position + (index,), nulls)
+        for index, child in enumerate(value):
+            walk(child, position + (index,))
+
+    walk(node, ())
+    return flat, nulls
 
 
 def _decode_gauge_coefficients(
@@ -398,13 +421,23 @@ def _decode_gauge_coefficients(
             "expected (N, C, 2)"
         )
 
-    arr = np.empty(shape, dtype=np.float64)
-    nulls: set[tuple] = set()
-    _fill_coefficient_values(block.get("values"), arr, (), nulls)
+    expected_total = math.prod(shape)
+    flat, nulls = _flatten_coefficient_values(
+        block.get("values"), shape, expected_total
+    )
+    if len(flat) != expected_total:
+        raise ResumeCorruptGlobal(
+            f"gauge coefficients have {len(flat)} values but the shape {shape} "
+            f"declares {expected_total}"
+        )
 
     entries = block.get("non_finite")
     if not isinstance(entries, list):
         raise ResumeCorruptGlobal("gauge coefficients non_finite must be a list")
+    if len(entries) > len(flat):
+        raise ResumeCorruptGlobal(
+            "gauge coefficients non_finite has more entries than the value grid"
+        )
     declared: dict[tuple, int] = {}
     for position, item in enumerate(entries):
         if not isinstance(item, Mapping) or set(item) != {
@@ -463,6 +496,10 @@ def _decode_gauge_coefficients(
             "gauge coefficients non_finite table does not exactly match the "
             "null sentinels"
         )
+    # Allocate ONLY after the content proved the declared shape and the
+    # non-finite table was validated. The size here is the real JSON content,
+    # so a compact corrupt document never triggers a shape-sized allocation.
+    arr = np.asarray(flat, dtype=np.float64).reshape(shape)
     bits_view = arr.view(np.uint64)
     for index, bits in declared.items():
         bits_view[index] = np.uint64(bits)

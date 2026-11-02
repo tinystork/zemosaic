@@ -10,8 +10,10 @@ semantics. The end-to-end NEW-PROCESS kill/resume proof lives in
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
+import tracemalloc
 from pathlib import Path
 
 import numpy as np
@@ -978,3 +980,115 @@ def test_m4_restored_inactive_nan_gauge_feeds_production_subset(tmp_path):
         )
     finally:
         boot.close()
+
+
+# ---------------------------------------------------------------------------
+# Allocation-safety of the v2 decoder (rework-1)
+# ---------------------------------------------------------------------------
+
+_GIANT_ALLOCATION_ELEMENTS = 1_000_000
+
+
+def _guard_giant_numpy_allocations(monkeypatch):
+    """Fail the test if the decoder asks NumPy for a shape-sized allocation."""
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def wrap(name):
+        factory = getattr(np, name)
+
+        def guarded(shape, *args, **kwargs):
+            if isinstance(shape, tuple):
+                dims = tuple(int(v) for v in shape)
+            elif isinstance(shape, list):
+                dims = tuple(int(v) for v in shape)
+            else:
+                dims = (int(shape),)
+            calls.append((name, dims))
+            if math.prod(dims) > _GIANT_ALLOCATION_ELEMENTS:
+                raise AssertionError(
+                    f"np.{name} would allocate {math.prod(dims)} elements for "
+                    f"shape {dims}; a corrupt document must not do that"
+                )
+            return factory(shape, *args, **kwargs)
+
+        return guarded
+
+    for name in ("empty", "zeros", "ones", "full"):
+        monkeypatch.setattr(np, name, wrap(name))
+    return calls
+
+
+def _peak_bytes_during(func):
+    tracemalloc.start()
+    try:
+        func()
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak
+
+
+def test_m4_gauge_huge_declared_shape_is_refused_before_allocation(
+    tmp_path, monkeypatch
+):
+    root, _identity, _gauge = _inactive_run(tmp_path)
+    path = root / zart.GAUGE_FILENAME
+    calls = _guard_giant_numpy_allocations(monkeypatch)
+
+    def mutate(doc):
+        doc["coefficients"]["shape"][1] = 10 ** 12
+
+    _rewrite_with_recomputed_digest(path, mutate)
+
+    def read():
+        with pytest.raises(zres.ResumeCorruptGlobal, match="list of length"):
+            zart.read_gauge_artifact(root)
+
+    peak = _peak_bytes_during(read)
+    assert peak < 64 * 2 ** 20
+    assert all(
+        math.prod(dims) <= _GIANT_ALLOCATION_ELEMENTS for _name, dims in calls
+    )
+
+
+def _tamper_oversized_non_finite(doc):
+    doc["coefficients"]["non_finite"] = (
+        doc["coefficients"]["non_finite"] * 4
+    )
+
+
+def _tamper_huge_non_finite_index(doc):
+    doc["coefficients"]["non_finite"][0]["index"] = [0, 10 ** 12, 0]
+
+
+def _tamper_duplicate_non_finite(doc):
+    doc["coefficients"]["non_finite"].append(
+        dict(doc["coefficients"]["non_finite"][0])
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation, match",
+    [
+        (_tamper_oversized_non_finite, "more entries than the value grid"),
+        (_tamper_huge_non_finite_index, "out of range"),
+        (_tamper_duplicate_non_finite, "duplicates index"),
+    ],
+)
+def test_m4_gauge_non_finite_table_is_bounded_before_processing(
+    tmp_path, monkeypatch, mutation, match
+):
+    root, _identity, _gauge = _inactive_run(tmp_path)
+    path = root / zart.GAUGE_FILENAME
+    calls = _guard_giant_numpy_allocations(monkeypatch)
+    _rewrite_with_recomputed_digest(path, mutation)
+
+    def read():
+        with pytest.raises(zres.ResumeCorruptGlobal, match=match):
+            zart.read_gauge_artifact(root)
+
+    peak = _peak_bytes_during(read)
+    assert peak < 64 * 2 ** 20
+    assert all(
+        math.prod(dims) <= _GIANT_ALLOCATION_ELEMENTS for _name, dims in calls
+    )
