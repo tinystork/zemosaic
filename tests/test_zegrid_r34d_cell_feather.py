@@ -175,18 +175,23 @@ def test_end_to_end_feathered_no_seam_no_signal_loss(rgb):
     sci = np.asarray(assembled.science, dtype=np.float64)
     assert np.isfinite(sci).all(), "feathered assembly must have no holes here"
 
-    # Every channel lands on the anchor cell's level (per channel): no seam step.
-    anchor_lv = (
-        np.asarray(chl["r0000c0000"]) if rgb else np.full(3, levels["r0000c0000"])
-    )
+    # Every channel lands on the same GAUGE level (M1 anchor-independent zero
+    # point = support-weighted mean of the Cell levels): no seam step, and no
+    # dependence on which Cell happened to be the solver anchor.
+    lv_vec = np.array([levels[cid] for cid in sorted(levels)], dtype=np.float64)
+    if rgb:
+        cell_vecs = np.array([chl[cid] for cid in sorted(levels)], dtype=np.float64)
+        gauge_lv = cell_vecs.mean(axis=0)
+    else:
+        gauge_lv = np.full(3, lv_vec.mean())
     for c in range(3):
         body = sci[..., c]
         # Exclude the deliberate bright blob region for the flatness check.
         mask = np.ones(body.shape, bool); mask[10:14, 10:14] = False
         vals = body[mask]
-        assert np.abs(vals - anchor_lv[c]).max() < 1.5, (c, np.abs(vals - anchor_lv[c]).max())
+        assert np.abs(vals - gauge_lv[c]).max() < 1.5, (c, np.abs(vals - gauge_lv[c]).max())
     # No signal loss: the bright blob survives at full amplitude in the core interior.
-    assert np.isclose(sci[12, 12, 0], anchor_lv[0] + 50.0, atol=1.5)
+    assert np.isclose(sci[12, 12, 0], gauge_lv[0] + 50.0, atol=1.5)
 
     # NO seam step: the assembled channel is (near-)flat across the core boundary.
     row = 16  # crosses the vertical boundary x=32
@@ -201,12 +206,14 @@ def test_pure_level_shift_recovered_exactly():
     canvas, patches = _make_patches(2, 2, levels, sigma=0.2)
     graph = zcf.build_cell_offset_graph(canvas, 2, 2, patches)
     offsets = {cid: graph.offsets[i] for i, cid in enumerate(graph.cell_ids)}
+    # M1: equal core supports -> the anchor-independent zero point is the plain
+    # mean level; every Cell lands there, preserving all relative differences.
+    expected = float(np.mean(list(levels.values())))
     for cid, cp in patches.items():
         shifted = zcf.apply_additive_offsets(np.asarray(cp.science, np.float64), offsets[cid])
-        # The cell's core sky now equals the anchor level (100% additive recovery).
         y0, y1, x0, x1 = cp.core_slice
         core = shifted[y0:y1, x0:x1]
-        assert np.allclose(core, levels["r0000c0000"], atol=1.0)
+        assert np.allclose(core, expected, atol=1.0), cid
 
 
 # ---------------------------------------------------------------------------

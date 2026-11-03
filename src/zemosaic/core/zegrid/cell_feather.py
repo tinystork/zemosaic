@@ -16,10 +16,14 @@ Design decisions (Nono R34c inputs)
 * **Additive-only (I4 / binding).** Each Cell's science gets ONE scalar added per
   channel (``science += offset[channel]``). No gain, plane, or multiplicative
   term anywhere.
-* **Central anchor.** The offset graph is anchored on ``select_central_cell``
-  (offset 0); the assembled result therefore sits on the central Cell's pinned
-  reference level. The retained GLOBAL gauge pass is untouched (progress /
-  provenance).
+* **Central anchor (relative reference only).** The offset graph is anchored on
+  ``select_central_cell`` (offset 0) to remove the relative degree of freedom.
+  That pinned level is NOT the scientific zero: after the solve a deterministic
+  per-channel ZERO-POINT GAUGE (:func:`cell_offset.recenter_offsets_to_zero_point`)
+  subtracts the support-weighted mean offset from every solved Cell, so the
+  assembled additive level is invariant to which Cell was anchored (M1).
+  Disconnected Cells keep offset 0 and are excluded from the gauge (documented
+  policy; no re-anchor, no bridge).
 * **Edge weight (I1).** The default least-squares weight is the number of SHARED
   VALID overlap pixels (support-count, i.e. "area"). This mirrors the legacy
   Phase-5 inter-tile weighting (``intertile_prune_weight_mode`` = "area") and is
@@ -56,6 +60,7 @@ from .cell_offset import (
     OffsetEdge,
     edge_offset_observation,
     grid_adjacency,
+    recenter_offsets_to_zero_point,
     robust_sky_level,
     select_central_cell,
     solve_additive_offsets,
@@ -68,6 +73,7 @@ __all__ = [
     "CellPatch",
     "CellFeatherResult",
     "cell_patch_sky",
+    "cell_core_support",
     "overlap_edge_observation",
     "build_cell_offset_graph",
     "apply_additive_offsets",
@@ -121,6 +127,16 @@ class CellFeatherResult:
     disconnected: tuple[str, ...]     # cells kept at offset 0 (on_disconnected="zero")
     policy: str
     per_cell_reference: dict = field(default_factory=dict)  # cell_id -> pinned ref id
+    # M1 anti-checkerboard zero point (anchor-independent, added verbatim to all
+    # solved offsets after the solve; see ``cell_offset.recenter_offsets_to_zero_point``).
+    zeropoint_policy: str = ""
+    zeropoint_status: str = ""
+    zeropoint_constant: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float64))
+    zeropoint_total_weight: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float64))
+    zeropoint_weighted_cells: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    zeropoint_invalid_weight_entries: int = 0
+    zeropoint_fallback_channels: tuple[int, ...] = ()
+    zeropoint_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +204,61 @@ def cell_patch_sky(patch: CellPatch, *, use_core=True, **kw) -> tuple[np.ndarray
         vals = sci[:, :, ch][val[:, :, ch] & np.isfinite(sci[:, :, ch])]
         levels[ch], counts[ch] = robust_sky_level(vals, **kw)
     return levels, counts
+
+
+def cell_core_support(
+    patches: Mapping[str, "CellPatch"],
+    order: Sequence[str],
+    channels: int,
+) -> np.ndarray:
+    """Anchor-independent per-Cell support weights for the zero-point gauge.
+
+    Weight = number of CORE pixels that are both ``valid_mask`` and finite, per
+    channel. This is the same frozen shared-valid support the offset graph
+    measures, is deterministic (integer counts stored as float64) and does NOT
+    depend on the anchor, the Cell iteration order or any thread scheduling.
+
+    Returns ``(N, C)`` float64. A Cell with no usable core pixel gets weight 0
+    (explicitly excluded from the gauge; never fabricated). Shape mismatches
+    raise instead of being broadcast.
+    """
+    n = len(order)
+    c = int(channels)
+    if c < 1:
+        raise ValueError(f"channels must be >= 1, got {channels!r}")
+    out = np.zeros((n, c), dtype=np.float64)
+    for i, cid in enumerate(order):
+        cp = patches[cid]
+        sci = np.asarray(cp.science, dtype=np.float64)
+        val = np.asarray(cp.valid_mask, dtype=bool)
+        if sci.ndim == 2:
+            sci = sci[:, :, None]
+        if sci.ndim != 3:
+            raise ValueError(f"cell {cid}: science must be 2-D or 3-D")
+        if val.ndim == 2:
+            val = val[:, :, None]
+        if val.ndim != 3:
+            raise ValueError(f"cell {cid}: valid_mask must be 2-D or 3-D")
+        if sci.shape[2] == 1 and c > 1:
+            sci = np.repeat(sci, c, axis=2)
+        if val.shape[2] == 1 and c > 1:
+            val = np.repeat(val, c, axis=2)
+        if sci.shape[2] != c or val.shape[2] != c:
+            raise ValueError(
+                f"cell {cid}: channels science={sci.shape[2]} "
+                f"valid={val.shape[2]} != {c}"
+            )
+        y0, y1, x0, x1 = cp.core_slice
+        core_sci = sci[y0:y1, x0:x1]
+        core_val = val[y0:y1, x0:x1]
+        if core_sci.shape[:2] != core_val.shape[:2]:
+            raise ValueError(
+                f"cell {cid}: core science {core_sci.shape[:2]} and valid "
+                f"{core_val.shape[:2]} disagree"
+            )
+        support = core_val & np.isfinite(core_sci)
+        out[i, :] = np.count_nonzero(support, axis=(0, 1))
+    return out
 
 
 def overlap_edge_observation(
@@ -296,11 +367,26 @@ def build_cell_offset_graph(
         raise_on_disconnected=(on_disconnected == "raise"),
     )
     disconnected: tuple[str, ...] = ()
+    reachable = _reachable(order, edges, anchor)
     if on_disconnected == "zero" and not _all_reachable(order, edges, anchor):
-        disconnected = tuple(sorted(_unreachable(order, edges, anchor)))
+        disconnected = tuple(sorted(set(order) - reachable))
+
+    # M1 anti-checkerboard: the anchor only fixes a RELATIVE reference. Remove
+    # that arbitrary degree of freedom with ONE documented per-channel gauge
+    # constant so the assembled additive zero point no longer depends on which
+    # Cell was anchored. The constant is added verbatim to every SOLVED offset
+    # (anchor-connected component): all pairwise differences, edge residuals,
+    # feather weights and relative photometry are preserved exactly. Cells that
+    # the disconnected policy pinned at offset 0 are intentionally excluded from
+    # both the gauge weights and the shift (their documented "own level" policy).
+    support = cell_core_support(patches, order, channels)
+    eligible = np.array([cid in reachable for cid in order], dtype=bool)
+    offsets, gauge = recenter_offsets_to_zero_point(
+        sol.offsets, order, weights=support, eligible=eligible,
+    )
     return CellFeatherResult(
         anchor=sol.anchor,
-        offsets=sol.offsets,
+        offsets=offsets,
         cell_ids=sol.cell_ids,
         channels=sol.channels,
         edges_used=sol.edges_used,
@@ -308,6 +394,14 @@ def build_cell_offset_graph(
         weighted_residual_rms=sol.weighted_residual_rms,
         disconnected=disconnected,
         policy=on_disconnected,
+        zeropoint_policy=gauge.policy,
+        zeropoint_status=gauge.status,
+        zeropoint_constant=np.asarray(gauge.constant, dtype=np.float64),
+        zeropoint_total_weight=np.asarray(gauge.total_weight, dtype=np.float64),
+        zeropoint_weighted_cells=np.asarray(gauge.weighted_cells, dtype=np.int64),
+        zeropoint_invalid_weight_entries=int(gauge.invalid_weight_entries),
+        zeropoint_fallback_channels=tuple(gauge.fallback_channels),
+        zeropoint_reason=gauge.reason,
     )
 
 

@@ -17,7 +17,10 @@ per-channel ADDITIVE offset per Cell:
   Cell pinned to 0 (``o_anchor = 0``) — a GLOBAL solve, never a sequential chain,
   so no drift accumulates along a path.
 * **Anchor** = the Cell nearest the layout centre (deterministic; ties -> lowest
-  cell id).
+  cell id). The anchor fixes only a RELATIVE reference: the scientific additive
+  zero point is set afterwards by
+  :func:`recenter_offsets_to_zero_point` (M1, support-weighted mean gauge,
+  invariant to the anchor choice).
 
 ADDITIVE-ONLY. The model is ``science_cell += offset_cell`` (a pure level shift,
 one value per Cell per channel). There is NO per-Cell gain, plane, or any
@@ -54,6 +57,8 @@ __all__ = [
     "CellOffsetSolution",
     "DisconnectedOffsetGraphError",
     "solve_additive_offsets",
+    "ZeroPointGauge",
+    "recenter_offsets_to_zero_point",
     "chain_offsets",
 ]
 
@@ -471,6 +476,194 @@ def solve_additive_offsets(
         edges_used=n_edges,
         components=1,
     )
+
+
+# ---------------------------------------------------------------------------
+# Anchor-independent additive zero point (M1 anti-checkerboard)
+# ---------------------------------------------------------------------------
+
+#: The zero point is the SUPPORT-WEIGHTED MEAN of the solved offsets (per
+#: channel). Weights are anchor-independent (core valid+finiteness support).
+ZEROPOINT_POLICY_WEIGHTED = "support_weighted_mean"
+#: Documented fallback when the weighted total is zero/non-finite: the PLAIN
+#: mean over the eligible (solved-component) Cells. Still anchor-independent.
+ZEROPOINT_POLICY_UNIFORM = "uniform_mean_fallback"
+#: Status values recorded in the gauge/manifest.
+ZEROPOINT_STATUS_APPLIED = "applied"
+ZEROPOINT_STATUS_FALLBACK = "uniform_fallback"
+
+
+@dataclass(frozen=True)
+class ZeroPointGauge:
+    """Diagnostics for the anchor-independent additive zero point.
+
+    ``constant`` is the per-channel value SUBTRACTED from every shifted offset.
+    The policy is a gauge choice only: it adds one common scalar per channel, so
+    every pairwise offset difference (and therefore every edge residual, feather
+    weight and relative photometry) is preserved exactly.
+    """
+
+    policy: str
+    status: str
+    constant: np.ndarray            # (C,) subtracted from the shifted offsets
+    weights: np.ndarray             # (N, C) effective non-negative weights
+    total_weight: np.ndarray        # (C,) sum of effective weights
+    weighted_cells: np.ndarray      # (C,) number of contributors
+    invalid_weight_entries: int     # negative/non-finite entries zeroed + counted
+    fallback_channels: tuple[int, ...]
+    reason: str | None
+    shifted_cells: tuple[str, ...]  # cells whose offsets received the constant
+
+
+def recenter_offsets_to_zero_point(
+    offsets,
+    cell_ids: Sequence[str] | None = None,
+    *,
+    weights=None,
+    eligible=None,
+) -> tuple[np.ndarray, ZeroPointGauge]:
+    """Move additive offsets onto an ANCHOR-INDEPENDENT per-channel zero point.
+
+    The offset graph is only defined up to one additive constant per channel: an
+    anchor change adds the SAME constant ``c`` to every solved offset. This
+    helper removes that arbitrary choice by subtracting the support-weighted
+    mean of the solved offsets from every offset of the same channel. Because
+    the weights do not depend on the anchor, the resulting offsets are exactly
+    invariant to the anchor choice for a fixed graph/patches (up to the solver's
+    floating-point noise).
+
+    Args:
+        offsets: ``(N, C)`` solved additive offsets.
+        cell_ids: optional ids (length ``N``) used only for diagnostics.
+        weights: optional ``(N,)``, ``(N, 1)`` or ``(N, C)`` non-negative,
+            finite, anchor-independent scientific weights (support counts).
+            ``None`` means equal weights. Negative/non-finite entries are
+            EXCLUDED (weight 0) and counted, never silently repaired into a
+            finite offset.
+        eligible: optional bool ``(N,)`` mask or iterable of cell ids. Only
+            eligible Cells are solved by the offset graph (the anchor-connected
+            component); policy-pinned disconnected Cells are excluded so their
+            documented "keep offset 0" semantics is preserved. Default: all.
+
+    Returns:
+        ``(recentered_offsets, gauge)``. The input array is never mutated.
+
+    Raises:
+        ValueError: malformed shapes/ids, empty eligible set, or NON-FINITE
+            offsets (fail-closed: a non-finite offset is never "repaired").
+    """
+    off = np.asarray(offsets, dtype=np.float64)
+    if off.ndim != 2:
+        raise ValueError(f"offsets must be 2-D (N, C), got ndim={off.ndim}")
+    n, channels = int(off.shape[0]), int(off.shape[1])
+    if n < 1 or channels < 1:
+        raise ValueError(f"offsets shape {off.shape} must be non-empty")
+    if not np.all(np.isfinite(off)):
+        # Fail-closed: no silent NaN/Inf repair anywhere in the science path.
+        raise ValueError("offsets contain non-finite values; refusing to gauge")
+
+    ids = (
+        tuple(str(v) for v in cell_ids)
+        if cell_ids is not None
+        else tuple(str(i) for i in range(n))
+    )
+    if len(ids) != n or len(set(ids)) != n:
+        raise ValueError("cell_ids must match the offsets rows (unique, same length)")
+
+    if eligible is None:
+        eligible_mask = np.ones(n, dtype=bool)
+    else:
+        arr = np.asarray(eligible)
+        if arr.dtype == bool:
+            if arr.shape != (n,):
+                raise ValueError(
+                    f"eligible mask shape {arr.shape} != ({n},)"
+                )
+            eligible_mask = arr.copy()
+        else:
+            wanted = {str(v) for v in arr.ravel()}
+            unknown = wanted - set(ids)
+            if unknown:
+                raise ValueError(
+                    f"eligible references unknown cell(s): {sorted(unknown)[:8]}"
+                )
+            eligible_mask = np.array([cid in wanted for cid in ids], dtype=bool)
+    n_eligible = int(np.count_nonzero(eligible_mask))
+    if n_eligible < 1:
+        raise ValueError("zero-point gauge has no eligible cell")
+
+    if weights is None:
+        w = np.ones((n, channels), dtype=np.float64)
+        invalid = 0
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+        if w.ndim == 1:
+            w = w[:, None]
+        if w.ndim != 2 or w.shape[0] != n:
+            raise ValueError(f"weights must have shape ({n},) or ({n}, {channels})")
+        if w.shape[1] == 1 and channels > 1:
+            w = np.repeat(w, channels, axis=1)
+        if w.shape != (n, channels):
+            raise ValueError(
+                f"weights shape {w.shape} != ({n}, {channels})"
+            )
+        bad = ~np.isfinite(w) | (w < 0.0)
+        invalid = int(np.count_nonzero(bad))
+        w = np.where(bad, 0.0, w)
+
+    # Ineligible Cells neither contribute to the gauge nor receive the shift
+    # (their offsets are explicitly pinned by policy, not solved).
+    w = np.where(eligible_mask[:, None], w, 0.0)
+
+    # Huge finite weights may overflow the reduction; that is handled explicitly
+    # by the documented uniform fallback below, so the overflow is not noise.
+    with np.errstate(over="ignore", invalid="ignore"):
+        total = np.sum(w, axis=0)
+    constant = np.zeros(channels, dtype=np.float64)
+    fallback_channels: list[int] = []
+    any_fallback = False
+    for c in range(channels):
+        tw = float(total[c])
+        if not np.isfinite(tw) or tw <= 0.0:
+            # Documented, deterministic fallback: uniform mean over the eligible
+            # Cells (still anchor-independent).
+            fallback_channels.append(c)
+            any_fallback = True
+            w[eligible_mask, c] = 1.0
+            w[~eligible_mask, c] = 0.0
+            tw = float(np.count_nonzero(eligible_mask))
+            total[c] = tw
+        if not np.isfinite(tw) or tw <= 0.0:  # defensive; unreachable
+            raise ValueError("zero-point gauge has a zero total weight")
+        with np.errstate(over="ignore", invalid="ignore"):
+            constant[c] = float(np.sum(w[:, c] * off[:, c]) / tw)
+
+    if not np.all(np.isfinite(constant)):
+        raise ValueError("zero-point constant is non-finite; refusing to gauge")
+
+    out = off.copy()
+    shift_rows = np.flatnonzero(eligible_mask)
+    out[shift_rows, :] -= constant[None, :]
+    if not np.all(np.isfinite(out)):
+        raise ValueError("recentered offsets are non-finite; refusing")
+
+    weighted_cells = np.array(
+        [int(np.count_nonzero(w[:, c] > 0.0)) for c in range(channels)],
+        dtype=np.int64,
+    )
+    gauge = ZeroPointGauge(
+        policy=ZEROPOINT_POLICY_UNIFORM if any_fallback else ZEROPOINT_POLICY_WEIGHTED,
+        status=ZEROPOINT_STATUS_FALLBACK if any_fallback else ZEROPOINT_STATUS_APPLIED,
+        constant=constant,
+        weights=w,
+        total_weight=np.asarray(total, dtype=np.float64),
+        weighted_cells=weighted_cells,
+        invalid_weight_entries=invalid,
+        fallback_channels=tuple(fallback_channels),
+        reason="zero_total_weight" if any_fallback else None,
+        shifted_cells=tuple(ids[i] for i in shift_rows),
+    )
+    return out, gauge
 
 
 def chain_offsets(
