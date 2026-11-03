@@ -537,18 +537,42 @@ def test_layout_provenance_crosses_the_durable_geometry_boundary(
     assert int(loaded["layout"]["ny"]) == int(layout["ny"])
     assert loaded["layout"]["layout_origin"] == mode
 
-    # Manifest publication uses the same provenance: strict JSON, no silent
-    # int-key coercion by json.dumps (allow_nan=False).
+    # Manifest publication uses the same provenance. The helper must reproduce
+    # the EXACT historical inline dict (same keys, values and omissions) for
+    # every mode, and the block itself must pass the strict fail-closed boundary
+    # (json_safe / canonical_json), not merely json.dumps which silently
+    # stringifies int keys.
     manifest_layout = zz._manifest_layout_block(
         layout["nx"], layout["ny"], layout
     )
-    reloaded = json.loads(json.dumps(manifest_layout, allow_nan=False))
+    expected_manifest_layout = {
+        "nx": layout["nx"], "ny": layout["ny"],
+        "ram_budget_bytes": layout["ram_budget_bytes"],
+        "available_bytes": layout["available_bytes"],
+        "max_contributors": layout["max_contributors"],
+        "predicted_bound_bytes": layout["predicted_bound_bytes"],
+        "layout_origin": layout.get("layout_origin", "auto_refinement"),
+        **({"layout_rescue": layout["layout_rescue"]}
+           if layout.get("layout_rescue") else {}),
+    }
+    assert manifest_layout == expected_manifest_layout
+    base_keys = {
+        "nx", "ny", "ram_budget_bytes", "available_bytes", "max_contributors",
+        "predicted_bound_bytes", "layout_origin",
+    }
+    assert set(manifest_layout) == (
+        base_keys | ({"layout_rescue"} if mode == "auto_coarser_rescue" else set())
+    )
+    assert zrs.json_safe(manifest_layout, "manifest layout") == manifest_layout
+    canonical = zrs.canonical_json(manifest_layout)
+    reloaded = json.loads(canonical)
     assert reloaded["layout_origin"] == mode
     if mode == "auto_coarser_rescue":
         tiles = reloaded["layout_rescue"]["candidates_evaluated"][0][
             "stream_worst_by_tile"
         ]
         assert tiles == expected_tiles
+        assert all(isinstance(key, str) for key in tiles)
 
 
 def test_restore_geometry_consumes_frozen_rescue_without_relayout(

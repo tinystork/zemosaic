@@ -9,6 +9,7 @@ semantics. The end-to-end NEW-PROCESS kill/resume proof lives in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -533,13 +534,26 @@ def test_m4_default_config_is_never_and_store_is_a_container():
         assert second not in (tmp, child) and second.parent == tmp
 
 
+def _tree_snapshot(root):
+    """Byte-level snapshot of every file under ``root`` (path -> size+sha256)."""
+    snapshot = {}
+    for path in sorted(Path(root).rglob("*")):
+        if path.is_file():
+            data = path.read_bytes()
+            snapshot[str(path.relative_to(root))] = (
+                len(data), hashlib.sha256(data).hexdigest()
+            )
+    return snapshot
+
+
 def test_m4_partial_durable_init_without_geometry_is_never_repaired(tmp_path):
     """A durable init that failed BEFORE the geometry is not resumable.
 
     The Windows incident failed exactly at the geometry publication, after the
     state and gauge artifacts were already durable. The incomplete generation
     must refuse on resume (never re-derive/repair), and it must not be selected
-    for a NEW run: the generation-root allocator creates a sibling instead.
+    or modified for a NEW run: the generation-root allocator creates a sibling
+    and leaves every byte of the failed generation untouched.
     """
     root, _identity = _artifact_run(tmp_path)
     geometry_path = root / zart.GEOMETRY_FILENAME
@@ -557,11 +571,21 @@ def test_m4_partial_durable_init_without_geometry_is_never_repaired(tmp_path):
     finally:
         boot.close()
 
+    before = _tree_snapshot(root)
+    assert zart.GAUGE_FILENAME in before
+    assert zres.RESUME_STATE_FILENAME in before
+    assert zart.GEOMETRY_FILENAME not in before
+
     from zemosaic import zemosaic_zegrid_mode as zz
 
     replacement = zz._resume_generation_root(root, "run-artifacts")
     assert replacement != root
     assert replacement.parent == root
+    # The allocator only RETURNS a path: it creates nothing and never touches
+    # the failed generation's root, identity, state or gauge bytes.
+    assert not replacement.exists()
+    assert _tree_snapshot(root) == before
+    assert not geometry_path.exists()
 
 
 def test_m4_assembly_can_load_a_cell_absent_from_the_registry(tmp_path):
