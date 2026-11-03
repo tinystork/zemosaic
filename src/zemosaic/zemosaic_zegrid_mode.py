@@ -1270,6 +1270,22 @@ def _cpu_streaming_block(selected_tile, trials, reason, stream_worst_by_tile, in
     }
 
 
+def _tile_keyed_provenance(bounds_by_tile):
+    """Encode an internal int-keyed tile map as JSON-native provenance.
+
+    The runtime maps produced by :func:`_scan_layout_mode_aware` (and the
+    scheduler facts) are keyed by ``int`` so the ladder helpers can index them
+    directly. Anything that can cross a DURABLE boundary (geometry artifact,
+    resume state, manifest) must already be strict JSON, where object keys are
+    strings; ``json_safe`` intentionally fails closed instead of coercing.
+
+    This helper is the explicit provenance encoder: keys become decimal
+    strings, values stay exact ints, and the internal runtime map is left
+    untouched (no silent key coercion at the store boundary).
+    """
+    return {str(int(tile)): int(bound) for tile, bound in bounds_by_tile.items()}
+
+
 def _selected_admissible_bound(inmem_ok, inmem_worst, selected_tile, stream_worst_by_tile, legacy_fallback):
     """Bound the layout was ACTUALLY admitted with (ZM-ZEGRID-R36, F3).
 
@@ -1761,9 +1777,13 @@ def _choose_layout_mode_aware(
                     "min_patch_area": int(rgeom["min_patch_area"]),
                     "halo_overhead": round(float(rgeom["halo_overhead"]), 6),
                     "inmem_worst_bytes": int(rworst["inmem_worst_bytes"]),
-                    "stream_worst_by_tile": {
-                        int(k): int(v) for k, v in rworst["stream_worst_by_tile"].items()
-                    },
+                    # PERSISTED provenance: ``layout_rescue`` enters the frozen
+                    # geometry artifact (and the manifest), so its tile map is
+                    # JSON-native from birth. The runtime ``rworst`` map above
+                    # keeps int keys for the ladder helpers.
+                    "stream_worst_by_tile": _tile_keyed_provenance(
+                        rworst["stream_worst_by_tile"]
+                    ),
                     "selected_tile": (int(rselected) if rselected is not None else None),
                     "admissible_bound_bytes": _rbound,
                     "memory_ok": bool(rmemory_ok),
@@ -17187,6 +17207,26 @@ def _cell_feather_manifest_block(cell_feather_info):
     return block
 
 
+def _manifest_layout_block(nx, ny, layout):
+    """Build the public manifest ``layout`` block.
+
+    ``layout_rescue`` (auto_coarser_rescue provenance) is published in the final
+    manifest, so it must already be strict JSON. Its tile-keyed maps are encoded
+    as textual keys at creation (``_tile_keyed_provenance``); this helper keeps
+    that publication seam in ONE place so a focused test can guard it.
+    """
+    return {
+        "nx": nx, "ny": ny,
+        "ram_budget_bytes": layout["ram_budget_bytes"],
+        "available_bytes": layout["available_bytes"],
+        "max_contributors": layout["max_contributors"],
+        "predicted_bound_bytes": layout["predicted_bound_bytes"],
+        "layout_origin": layout.get("layout_origin", "auto_refinement"),
+        **({"layout_rescue": layout["layout_rescue"]}
+           if layout.get("layout_rescue") else {}),
+    }
+
+
 def _write_outputs(
     assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
     layout, science_config, peak_rss_kib, cache_report, progress_callback,
@@ -17417,14 +17457,7 @@ def _write_outputs(
         "normalization_default": DEFAULT_NORMALIZATION,
         "canvas": {"width": canvas.width, "height": canvas.height,
                    "resolution_deg": canvas.resolution_deg, "id": canvas.canvas_id},
-        "layout": {"nx": nx, "ny": ny,
-                   "ram_budget_bytes": layout["ram_budget_bytes"],
-                   "available_bytes": layout["available_bytes"],
-                   "max_contributors": layout["max_contributors"],
-                   "predicted_bound_bytes": layout["predicted_bound_bytes"],
-                   "layout_origin": layout.get("layout_origin", "auto_refinement"),
-                   **({"layout_rescue": layout["layout_rescue"]}
-                      if layout.get("layout_rescue") else {})},
+        "layout": _manifest_layout_block(nx, ny, layout),
         "layout_source": layout.get("layout_source", "auto"),
         # ZM-ZEGRID-R53b: ONE stable top-level provenance block (same shape for
         # global / per_cell / auto outcomes). It is resolved once at the product

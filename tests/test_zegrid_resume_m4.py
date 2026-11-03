@@ -533,6 +533,37 @@ def test_m4_default_config_is_never_and_store_is_a_container():
         assert second not in (tmp, child) and second.parent == tmp
 
 
+def test_m4_partial_durable_init_without_geometry_is_never_repaired(tmp_path):
+    """A durable init that failed BEFORE the geometry is not resumable.
+
+    The Windows incident failed exactly at the geometry publication, after the
+    state and gauge artifacts were already durable. The incomplete generation
+    must refuse on resume (never re-derive/repair), and it must not be selected
+    for a NEW run: the generation-root allocator creates a sibling instead.
+    """
+    root, _identity = _artifact_run(tmp_path)
+    geometry_path = root / zart.GEOMETRY_FILENAME
+    assert geometry_path.exists()
+    geometry_path.unlink()
+
+    boot = zres.ResumeBootstrap.open(root)
+    try:
+        boot.restore_gauge()  # the gauge WAS published before the failure
+        with pytest.raises(zres.ResumeStateError) as exc:
+            boot.restore_geometry()
+        assert "geometry artifact is missing" in str(exc.value)
+        # No repair, no re-derivation: the file stays absent.
+        assert not geometry_path.exists()
+    finally:
+        boot.close()
+
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    replacement = zz._resume_generation_root(root, "run-artifacts")
+    assert replacement != root
+    assert replacement.parent == root
+
+
 def test_m4_assembly_can_load_a_cell_absent_from_the_registry(tmp_path):
     """A resumed cell is not in this process' registry: reload from disk."""
     root = seeded_store(tmp_path / "run", cell_indexes=(0, 1, 2, 3))

@@ -27,6 +27,7 @@ No pixels are stacked; no full mosaic is built.
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -38,6 +39,8 @@ from zemosaic import zemosaic_zegrid_mode as zz
 from zemosaic.core.zegrid import auto_layout as zal
 from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import ram_contract as rc
+from zemosaic.core.zegrid import run_artifacts as zart
+from zemosaic.core.zegrid import run_store as zrs
 
 MIB = 2 ** 20
 LIGHTS = Path("/home/tristan/M106/lights")
@@ -354,3 +357,231 @@ def test_witness_halo64_keeps_historical_3x2(m106_witness):
     assert layout["cpu_streaming"]["selected_tile_size"] == 128
     assert layout["predicted_bound_bytes"] / MIB == pytest.approx(2646.4306640625, abs=0.01)
     assert layout["floors"]["max_halo_overhead"]["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# 7. Durable boundary: the rescue provenance must already be strict JSON
+# ---------------------------------------------------------------------------
+
+# Same frozen dtype contract as the M4 harness (identity validation is strict).
+_ARTIFACT_DTYPES = {
+    "planes": {
+        "core.science_core": ["<f4", "<f8"],
+        "core.estimator_weight_sum_core": ["<f4", "<f8"],
+        "core.support_w1_core": ["<f4", "<f8"],
+        "core.support_w2_core": ["<f4", "<f8"],
+        "core.n_eff_support_core": ["<f4", "<f8"],
+        "core.valid_mask_core": ["|b1"],
+        "core.surviving_sample_count_core": ["<i4", "<i8"],
+        "patch.science": ["<f4", "<f8"],
+        "patch.valid_mask": ["|b1"],
+        "patch.surviving": ["<i4", "<i8"],
+    }
+}
+
+
+def _cell_ctxs_for_layout(canvas, layout, halo_px, descs):
+    """Build the exact cell contexts the product would persist for a layout."""
+    grid = zg.build_layout(canvas, int(layout["nx"]), int(layout["ny"]))
+    cell_ctxs = []
+    for row, col, bounds in grid.iter_cells(canvas):
+        cid = zg.cell_id(row, col)
+        cell = zg.ZeGridCell(
+            cid, canvas.canvas_id, grid.layout_id, row, col, bounds
+        )
+        patch = zg.build_patch(canvas, cell, int(halo_px))
+        mem = zg.compute_membership(descs, canvas, cell, patch)
+        cell_ctxs.append((row, col, cell, patch, mem))
+    return cell_ctxs
+
+
+def _artifact_identity(canvas, layout, cell_ctxs, halo_px):
+    """A frozen identity whose geometry sections match the given layout."""
+    fp = zart.geometry_fingerprints(
+        canvas=canvas, layout=layout, cell_ctxs=cell_ctxs, halo_px=int(halo_px)
+    )
+    frames = [
+        {
+            "frame_id": f"frame_{index:04d}.fits",
+            "content_sha256": f"{index:064x}",
+            "nbytes": 1024 + index,
+            "order": index,
+            "role": "light",
+        }
+        for index in range(len(cell_ctxs))
+    ]
+    cell = cell_ctxs[0][2]
+    return zrs.build_run_identity(
+        run_id="r55e6-durable-layout",
+        inputs={"frames": frames},
+        canvas={
+            "shape": [int(canvas.height), int(canvas.width)],
+            "wcs_sha256": fp["canvas_wcs_sha256"],
+            "geometry_sha256": fp["canvas_geometry_sha256"],
+        },
+        grid={
+            "nx": int(layout["nx"]),
+            "ny": int(layout["ny"]),
+            "tile_px": int(cell.core.x1 - cell.core.x0),
+            "geometry_sha256": fp["grid_geometry_sha256"],
+            "cell_ids_sha256": fp["grid_cell_ids_sha256"],
+        },
+        halo={
+            "halo_px": int(halo_px),
+            "provenance": {"effective_px": int(halo_px)},
+        },
+        memberships={
+            "sha256": fp["memberships_sha256"],
+            "n_cells": fp["memberships_n_cells"],
+        },
+        gauge={"mode": "per_cell", "sha256": "2" * 64},
+        science={"sha256": "3" * 64, "contract_version": "1"},
+        dtypes=_ARTIFACT_DTYPES,
+        backend={"backend": "cpu", "tile_px": 128, "parity_qualified": False},
+        execution_context={
+            "available_ram_bytes": 8 * 2 ** 20,
+            "workers": 2,
+            "prefetch_units": 0,
+            "host": "r55e6-durable",
+            "note": "runtime only",
+        },
+    )
+
+
+def _layout_for_boundary(mode, monkeypatch):
+    """Choose the real layout for one of the three publication modes."""
+    descs = _build_3x3_corpus()
+    canvas = zg.build_canvas(descs)
+    _force_streaming(monkeypatch, 1000)
+    kwargs = {
+        "ram_budget": 10 ** 9,
+        "halo_px": 64 if mode == "auto_refinement" else 80,
+        "floors": zal.ScientificFloors(),
+        "footprints_out": [],
+    }
+    if mode == "pinned":
+        kwargs["pinned_layout"] = (2, 2)
+    layout = zz._choose_layout_mode_aware(canvas, descs, **kwargs)
+    assert layout["layout_origin"] == mode
+    return descs, canvas, layout
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["auto_refinement", "pinned", "auto_coarser_rescue"],
+)
+def test_layout_provenance_crosses_the_durable_geometry_boundary(
+    tmp_path, monkeypatch, mode
+):
+    """R55-E6 regression: the REAL durable boundary rejects int tile keys.
+
+    Before the fix, ``auto_coarser_rescue`` failed here with exactly:
+
+        StoreFormatError: restored layout.layout_rescue.candidates_evaluated[0].
+        stream_worst_by_tile has a non-string key 128
+
+    ``json_safe`` stays fail-closed; the fix is that provenance is JSON-native
+    at creation. Ordinary auto and pinned layouts are covered by the same test
+    so every layout mode that can reach the geometry artifact is exercised.
+    """
+    descs, canvas, layout = _layout_for_boundary(mode, monkeypatch)
+    halo_px = 64 if mode == "auto_refinement" else 80
+
+    # Strict pre-boundary guard: json_safe is the REAL fail-closed validator.
+    # json.dumps would silently stringify an int key and hide the bug.
+    zrs.json_safe(dict(layout), f"{mode} layout")
+
+    cell_ctxs = _cell_ctxs_for_layout(canvas, layout, halo_px, descs)
+    identity = _artifact_identity(canvas, layout, cell_ctxs, halo_px)
+    root = tmp_path / "run"
+    root.mkdir()
+
+    zart.write_geometry_artifact(
+        root,
+        run_id=str(identity["run_id"]),
+        identity=identity,
+        canvas=canvas,
+        layout=layout,
+        cell_ctxs=cell_ctxs,
+        halo_px=halo_px,
+    )
+
+    raw = (root / zart.GEOMETRY_FILENAME).read_bytes()
+    document = json.loads(raw)  # strict JSON parse of the published artifact
+    stored = document["layout"]
+    assert stored["layout_origin"] == mode
+    assert int(stored["nx"]) == int(layout["nx"])
+    assert int(stored["ny"]) == int(layout["ny"])
+
+    if mode == "auto_coarser_rescue":
+        runtime_trial = layout["layout_rescue"]["candidates_evaluated"][0]
+        stored_trial = stored["layout_rescue"]["candidates_evaluated"][0]
+        expected_tiles = {
+            str(int(tile)): int(bound)
+            for tile, bound in runtime_trial["stream_worst_by_tile"].items()
+        }
+        assert stored_trial["stream_worst_by_tile"] == expected_tiles
+        assert all(
+            isinstance(key, str)
+            for key in stored_trial["stream_worst_by_tile"]
+        )
+        # Decisions and values are unchanged: only the key encoding differs.
+        assert stored["layout_rescue"]["chosen"] == layout["layout_rescue"]["chosen"]
+        assert stored["layout_rescue"]["trigger"] == layout["layout_rescue"]["trigger"]
+    else:
+        assert "layout_rescue" not in stored
+
+    # The real reader consumes the artifact and the frozen geometry is faithful.
+    loaded = zart.read_geometry_artifact(root, identity=identity)
+    assert int(loaded["layout"]["nx"]) == int(layout["nx"])
+    assert int(loaded["layout"]["ny"]) == int(layout["ny"])
+    assert loaded["layout"]["layout_origin"] == mode
+
+    # Manifest publication uses the same provenance: strict JSON, no silent
+    # int-key coercion by json.dumps (allow_nan=False).
+    manifest_layout = zz._manifest_layout_block(
+        layout["nx"], layout["ny"], layout
+    )
+    reloaded = json.loads(json.dumps(manifest_layout, allow_nan=False))
+    assert reloaded["layout_origin"] == mode
+    if mode == "auto_coarser_rescue":
+        tiles = reloaded["layout_rescue"]["candidates_evaluated"][0][
+            "stream_worst_by_tile"
+        ]
+        assert tiles == expected_tiles
+
+
+def test_restore_geometry_consumes_frozen_rescue_without_relayout(
+    tmp_path, monkeypatch
+):
+    """A resumed run restores the frozen rescue geometry, never replans it."""
+    descs, canvas, layout = _layout_for_boundary("auto_coarser_rescue", monkeypatch)
+    halo_px = 80
+    cell_ctxs = _cell_ctxs_for_layout(canvas, layout, halo_px, descs)
+    identity = _artifact_identity(canvas, layout, cell_ctxs, halo_px)
+    root = tmp_path / "run"
+    root.mkdir()
+    zart.write_geometry_artifact(
+        root,
+        run_id=str(identity["run_id"]),
+        identity=identity,
+        canvas=canvas,
+        layout=layout,
+        cell_ctxs=cell_ctxs,
+        halo_px=halo_px,
+    )
+
+    def _never_replan(*_args, **_kwargs):
+        raise AssertionError("adaptive layout re-ran during resume")
+
+    monkeypatch.setattr(zz, "_choose_layout_mode_aware", _never_replan)
+    restored_canvas, restored_layout, restored_ctxs = zart.restore_geometry(
+        root, identity=identity
+    )
+    assert (int(restored_layout["nx"]), int(restored_layout["ny"])) == (2, 2)
+    assert restored_layout["layout_origin"] == "auto_coarser_rescue"
+    assert restored_layout["layout_rescue"]["chosen"]["nx"] == 2
+    assert [cell.cell_id for (_r, _c, cell, _p, _m) in restored_ctxs] == [
+        cell.cell_id for (_r, _c, cell, _p, _m) in cell_ctxs
+    ]
+    assert int(restored_canvas.width) == int(canvas.width)
