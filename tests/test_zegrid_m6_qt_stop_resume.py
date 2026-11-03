@@ -2451,7 +2451,7 @@ def test_valid_current_stays_authoritative_beside_old_empty_generation(
     assert _tree_digest(tmp_path) == before
 
 
-def test_legacy_markerless_residue_uses_the_same_strict_shape(
+def test_legacy_markerless_residue_is_refused_read_only(
     tmp_path, monkeypatch
 ):
     store = tmp_path / "store"
@@ -2466,8 +2466,57 @@ def test_legacy_markerless_residue_uses_the_same_strict_shape(
     assert zpub.discover_publication_root(out) == (legacy_root, True)
 
     info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is False
+    assert "legacy publication container is not resumable" in info["reason"]
+    assert info["pre_marker_residue"] == []
+
+    before = _tree_digest(tmp_path)
+    win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    assert win._prepare_zegrid_resume_for_start() is False
+    assert warnings
+    assert win._pending_zegrid_resume is None
+    assert _tree_digest(tmp_path) == before
+
+    # A new run NEVER silently switches its writes into the legacy container;
+    # the read-only preflight does not create the visible one either.
+    for_write = zpub.run_publication_root(out, run_id, for_write=True)
+    assert for_write.parent.name == zpub.PUBLICATION_DIRNAME
+    assert not (out / zpub.PUBLICATION_DIRNAME).exists()
+    assert (run_root / "gen-1").is_dir()
+    assert list((run_root / "gen-1").iterdir()) == []
+
+
+def test_legacy_staging_with_marker_remains_resumable(tmp_path, monkeypatch):
+    import shutil
+
+    import test_zegrid_publication_m5b as pubtest
+
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    pub = pubtest._begin(out, run_id=run_id, ram=_publication_ram())
+    marker = pub.generation_dir / zpub.STAGING_FILENAME
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["pid"] = 2147483647
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    visible_root = pub.generation_dir.parent
+    visible_container = visible_root.parent
+    legacy_root = out / zpub.LEGACY_PUBLICATION_DIRNAME
+    legacy_root.mkdir()
+    legacy_run_root = legacy_root / visible_root.name
+    shutil.move(str(visible_root), str(legacy_run_root))
+    visible_container.rmdir()
+    marker = legacy_run_root / pub.generation / zpub.STAGING_FILENAME
+    assert marker.is_file()
+    assert zpub.discover_publication_root(out) == (legacy_root, True)
+
+    info = zpub.inspect_same_run_staging(out, run_id)
     assert info["ok"] is True, info
-    assert info["pre_marker_residue"] == ["gen-1"]
+    assert info["generations"] == ["gen-1"]
+    assert info["pre_marker_residue"] == []
+    assert info["present_members"] == {"gen-1": 0}
 
     before = _tree_digest(tmp_path)
     win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
@@ -2475,20 +2524,9 @@ def test_legacy_markerless_residue_uses_the_same_strict_shape(
     assert warnings == []
     assert _tree_digest(tmp_path) == before
 
-    # A new run NEVER silently switches its writes into the legacy container.
     for_write = zpub.run_publication_root(out, run_id, for_write=True)
     assert for_write.parent.name == zpub.PUBLICATION_DIRNAME
     assert not (out / zpub.PUBLICATION_DIRNAME).exists()
-
-    # Strictness is identical in the legacy container: non-empty tmp refuses.
-    (run_root / "tmp" / "stray.bin").write_bytes(b"x")
-    bad = zpub.inspect_same_run_staging(out, run_id)
-    assert bad["ok"] is False and "not empty" in bad["reason"]
-    before_bad = _tree_digest(tmp_path)
-    win2, warnings2 = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
-    assert win2._prepare_zegrid_resume_for_start() is False
-    assert warnings2
-    assert _tree_digest(tmp_path) == before_bad
 
 
 def test_markerless_generation_with_fifo_marker_is_refused(tmp_path, monkeypatch):

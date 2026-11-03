@@ -992,15 +992,18 @@ def inspect_same_run_staging(
     missing/non-empty/linked/unreadable ``tmp`` is a refusal (the markerless
     path never bypasses the foreign-content rule). Any
     byte/file/subdirectory, a ``publication.json``, a link/junction or any
-    other entry in the generation keeps the refusal. Such a residue is
-    reported in ``pre_marker_residue`` and is NEVER a publication/COMPLETE.
+    other entry in the generation keeps the refusal. A markerless residue in
+    the LEGACY ``.zegrid_publications`` fallback is refused outright: a new run
+    always writes the visible container, so accepting it would inspect one
+    container and write another. Such a residue is reported in
+    ``pre_marker_residue`` and is NEVER a publication/COMPLETE.
 
     A live owner, a foreign/other-run entry, a path escape or a malformed
     marker is a refusal with a concrete reason. The engine remains the
     authority for identity, commits and cleanup after resume.
     """
     out = Path(output_dir)
-    pub_root, _legacy = discover_publication_root(out)
+    pub_root, legacy_container = discover_publication_root(out)
     run_root = run_publication_root(out, run_id)
     result: dict = {
         "ok": False,
@@ -1208,6 +1211,17 @@ def inspect_same_run_staging(
             # scratch entry has the same exact shape: present, plain and
             # strictly empty. This closes the bypass where arbitrary foreign
             # content could hide in ``tmp`` beside an accepted residue.
+            # A LEGACY container is a read-only fallback: accepting a NEW
+            # markerless residue there would inspect one container while a new
+            # run writes the visible one (split-container, unproven). Refuse
+            # explicitly instead; historical marker/CURRENT legacy runs are
+            # untouched by this rule.
+            if legacy_container:
+                return _refuse(
+                    "markerless pre-marker residue in the legacy publication "
+                    "container is not resumable; choose/use the visible "
+                    "publication container"
+                )
             if not residue_tmp_checked:
                 residue_tmp_reason = _pre_marker_tmp_reason(run_root)
                 residue_tmp_checked = True
