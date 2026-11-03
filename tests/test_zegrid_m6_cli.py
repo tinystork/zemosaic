@@ -216,6 +216,7 @@ def test_cli_real_tiny_run_produces_fits_and_manifest(tmp_path):
     assert manifest["layout"]["nx"] * manifest["layout"]["ny"] == 4
     assert manifest["outputs"]["science"] == science.name
     assert len(manifest["complete_cells"]) == 4
+    assert "stack_phase_profile" not in manifest["per_cell_diagnostics"]
 
     # A stop was never requested, no durable store, no publication pointer.
     assert summary["stop"]["requested"] is False
@@ -231,7 +232,7 @@ def test_cli_stack_phase_profiling_is_opt_in_and_lands_in_manifest(tmp_path):
         [
             "--input", str(corpus),
             "--output", str(out),
-            "--workers", "1",
+            "--workers", "2",
             "--layout", "2x2",
             "--halo-px", "8",
             "--gauge-mode", "global",
@@ -244,16 +245,23 @@ def test_cli_stack_phase_profiling_is_opt_in_and_lands_in_manifest(tmp_path):
 
     summary = json.loads(summary_path.read_text())
     manifest = json.loads(Path(summary["publication"]["manifest"]).read_text())
-    profile = manifest["per_cell_diagnostics"]["stack_phase_profile"]
-    assert profile["schema"] == "zegrid-stack-phase-profile-v1"
+    block = manifest["per_cell_diagnostics"]["stack_phase_profile"]
+    assert block["schema"] == "zegrid-stack-phase-profile-v1"
+    assert block["basis"] == "cell_identity_current_attempt"
+    profile = block["current"]
+    historical = block["historical_restored"]
     assert profile["attribution"] == "current"
     assert profile["cells_profiled"] == 4
+    assert profile["cells_in_attempt"] == 4
+    assert profile["cells_without_profile"] == 0
+    assert historical["cells_profiled"] == 0
+    assert historical["resume_attribution"]["historical_restored"] == 0
     assert profile["tiles"] > 0
     assert profile["device"]["unavailable_reasons"] == {"cpu_backend": 4}
     assert profile["resume_attribution"]["current"] == 4
     assert profile["resume_attribution"]["historical_restored"] == 0
     # Strict JSON: no NaN/Inf anywhere in the persisted block.
-    json.dumps(profile, allow_nan=False, sort_keys=True)
+    json.dumps(block, allow_nan=False, sort_keys=True)
 
 
 # ---------------------------------------------------------------------------

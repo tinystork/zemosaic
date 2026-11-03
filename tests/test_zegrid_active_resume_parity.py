@@ -1148,7 +1148,8 @@ def test_resume_progress_real_run_starts_from_the_committed_count(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _tiny_durable_run(tmp_path, *, resume_mode="never", progress=None):
+def _tiny_durable_run(tmp_path, *, resume_mode="never", progress=None,
+                      stack_profiling=False):
     corpus = tmp_path / "in"
     if not corpus.exists():
         proc = subprocess.run(
@@ -1169,6 +1170,7 @@ def _tiny_durable_run(tmp_path, *, resume_mode="never", progress=None):
         zegrid_resource_recovery_enabled=False,
         zegrid_resource_recovery_deadline_s=None,
         zegrid_sip_mode="keep",
+        zegrid_stack_phase_profiling=bool(stack_profiling),
         temporary_work_dir="",
     )
     zz.run_zegrid_mode(
@@ -1454,3 +1456,85 @@ def test_start_processing_uses_the_snapshot_builder_before_logging():
     assert built < logged < saved
     # The builder is the ONLY place that applies the per-launch decision.
     assert "self._apply_effective_zegrid_resume_to_snapshot(run_snapshot)" not in source
+
+
+# ---------------------------------------------------------------------------
+# ZM-STACK-INSTRUMENTATION REWORK-1 — resume profile attribution
+# ---------------------------------------------------------------------------
+
+def _root_manifest(out):
+    return json.loads(
+        (Path(out) / "zegrid_manifest.json").read_text(encoding="utf-8")
+    )
+
+
+def _profile_block(out):
+    manifest = _root_manifest(out)
+    return manifest["per_cell_diagnostics"]["stack_phase_profile"]
+
+
+def test_stack_profile_fresh_durable_is_current_only(tmp_path):
+    _store, out = _tiny_durable_run(tmp_path, stack_profiling=True)
+    block = _profile_block(out)
+    assert block["basis"] == "cell_identity_current_attempt"
+    assert block["current"]["cells_profiled"] == 4
+    assert block["current"]["cells_in_attempt"] == 4
+    assert block["current"]["cells_without_profile"] == 0
+    assert block["current"]["attribution"] == "current"
+    assert block["historical_restored"]["cells_profiled"] == 0
+    assert block["historical_restored"]["cells_restored"] == 0
+
+
+def test_stack_profile_all_restored_is_historical_not_current(tmp_path, monkeypatch):
+    """Reproduces the confirmed witness shape: 4 commits, 0 pending."""
+    original = zz._assemble_cells_guarded
+
+    def _stop_before_assembly(*_a, **_k):
+        raise RuntimeError("SYNTHETIC_STOP_BEFORE_ASSEMBLY")
+
+    monkeypatch.setattr(zz, "_assemble_cells_guarded", _stop_before_assembly)
+    with pytest.raises(RuntimeError, match="SYNTHETIC_STOP_BEFORE_ASSEMBLY"):
+        _tiny_durable_run(tmp_path, stack_profiling=True)
+    monkeypatch.setattr(zz, "_assemble_cells_guarded", original)
+
+    store_root, out = _tiny_durable_run(
+        tmp_path, resume_mode="auto", stack_profiling=True
+    )
+    commits = sorted((store_root / "commits").glob("*.json"))
+    assert len(commits) == 4
+    block = _profile_block(out)
+    # Nothing was re-stacked: every cell is historical evidence.
+    assert block["current"]["cells_profiled"] == 0
+    assert block["current"]["cells_in_attempt"] == 0
+    assert block["current"]["resume_attribution"]["current"] == 0
+    assert block["historical_restored"]["cells_profiled"] == 4
+    assert block["historical_restored"]["cells_restored"] == 4
+    assert block["historical_restored"]["attribution"] == "historical_restored"
+    assert block["historical_restored"]["resume_attribution"][
+        "historical_restored"
+    ] == 4
+    assert block["historical_restored"]["tiles"] == 16
+    # Stored profiles are real evidence, never a false "unavailable" label.
+    assert "unavailable_reason" not in block
+
+
+def test_stack_profile_mixed_current_and_restored_are_separate(tmp_path):
+    store_root, out = _tiny_durable_run(tmp_path, stack_profiling=True)
+    commits = sorted((store_root / "commits").glob("*.json"))
+    assert len(commits) == 4
+    for path in commits[2:]:
+        path.unlink()
+    _tiny_durable_run(tmp_path, resume_mode="auto", stack_profiling=True)
+    block = _profile_block(out)
+    assert block["current"]["cells_profiled"] == 2
+    assert block["current"]["cells_in_attempt"] == 2
+    assert block["current"]["tiles"] == 8
+    assert block["historical_restored"]["cells_profiled"] == 2
+    assert block["historical_restored"]["cells_restored"] == 2
+    assert block["historical_restored"]["tiles"] == 8
+    # No double counting: the two sides partition the four cells.
+    assert (
+        block["current"]["cells_profiled"]
+        + block["historical_restored"]["cells_profiled"]
+    ) == 4
+    json.dumps(block, allow_nan=False, sort_keys=True)

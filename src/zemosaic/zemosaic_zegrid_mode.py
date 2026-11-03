@@ -15966,39 +15966,30 @@ def _run_single(
     per_cell_diagnostics["stack_cpu_sum_s"] = round(
         sum(r.get("stack_s", 0.0) for r in results), 6
     )
-    # ZM-STACK-INSTRUMENTATION: additive default-OFF run aggregation. When
-    # profiling is OFF this key is ABSENT and the manifest is unchanged. Timing
-    # values never enter a science/coverage/durable identity hash.
+    # ZM-STACK-INSTRUMENTATION REWORK-1: attribution by ACTUAL cell identity.
+    # On a resume, only the pending cells launched in THIS attempt are current;
+    # every other result is a durable restored cell. A fresh run makes every
+    # executed cell current. The two aggregates are kept separate and are never
+    # summed; a restored descriptor's persisted profile is historical evidence.
     if _STACK_PHASE_PROFILING:
-        _stack_profiles = [
-            r.get("stack_phase_profile")
-            for r in results
-            if isinstance(r, dict)
-            and isinstance(r.get("stack_phase_profile"), dict)
-        ]
-        _prof_agg = zspp.aggregate(_stack_profiles, attribution="current")
-        if isinstance(results, zbas.StoreBackedResults):
-            _prof_agg["unavailable_reason"] = (
-                "store_backed_results_carry_descriptors_not_volatile_profiles"
-            )
-        _hist_restored = 0
-        if _resume_runtime.get("resumed"):
-            try:
-                _hist_restored = int(
-                    _resume_runtime.get("completed_cells") or 0
-                )
-            except (TypeError, ValueError):
-                _hist_restored = 0
-        _prof_agg["resume_attribution"] = {
-            "current": int(_prof_agg.get("cells_profiled", 0)),
-            "historical_restored": int(_hist_restored),
+        _current_agg, _historical_agg = zspp.aggregate_records(
+            results,
+            current_ids=(_resume_pending_ids or ()),
+            all_current=not bool(_resume_runtime.get("resumed")),
+        )
+        per_cell_diagnostics["stack_phase_profile"] = {
+            "schema": zspp.STACK_PHASE_PROFILE_SCHEMA,
+            "basis": "cell_identity_current_attempt",
+            "current": _current_agg,
+            "historical_restored": _historical_agg,
             "note": (
-                "Phase totals belong ONLY to currently executed cells. Cells "
-                "restored from a durable resume were not re-profiled and are "
-                "never summed with current resume wall time."
+                "current = cells executed in THIS attempt (resume pending set, "
+                "or all cells on a fresh run). historical_restored = profiles "
+                "read from durable resumed descriptors. The two are kept "
+                "separate and are never summed; historical work was not "
+                "re-profiled and is never added to current resume wall time."
             ),
         }
-        per_cell_diagnostics["stack_phase_profile"] = _prof_agg
     # ZM-ZEGRID-R21: which reprojection path the per-cell cache build took,
     # aggregated over every cell worker (each reports its process-local stats).
     per_cell_diagnostics["reprojection"] = zxe.merge_reproject_stats(

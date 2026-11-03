@@ -1312,7 +1312,7 @@ def _nan_axis_median(a, xp):
         return xp.nanmedian(a, axis=0)
 
 
-def _nan_axis_mean(a, xp):
+def _nan_axis_mean(a, xp, profile=None):
     """Per-column NaN-mean, BIT-EXACT across backends (ZM-ZEGRID-R22).
 
     CuPy's ``nanmean`` uses a device tree reduction whose summation order differs
@@ -1327,13 +1327,28 @@ def _nan_axis_mean(a, xp):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             return np.nanmean(a, axis=0)
+    if profile is not None:
+        import time as _time
+        _t = _time.perf_counter()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        host = np.nanmean(xp.asnumpy(a), axis=0)
-    return xp.asarray(host)
+        host = xp.asnumpy(a)
+    if profile is not None:
+        profile.add("d2h_transfer_s", _time.perf_counter() - _t)
+        _t = _time.perf_counter()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        host = np.nanmean(host, axis=0)
+    if profile is not None:
+        profile.add("host_reduction_s", _time.perf_counter() - _t)
+        _t = _time.perf_counter()
+    result = xp.asarray(host)
+    if profile is not None:
+        profile.add("h2d_transfer_s", _time.perf_counter() - _t)
+    return result
 
 
-def _nan_axis_popstd(a, xp):
+def _nan_axis_popstd(a, xp, profile=None):
     """Per-column NaN population std, BIT-EXACT across backends (ZM-ZEGRID-R22).
 
     Same host-side reduction strategy as :func:`_nan_axis_mean` (see there).
@@ -1342,13 +1357,28 @@ def _nan_axis_popstd(a, xp):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             return np.nanstd(a, axis=0)
+    if profile is not None:
+        import time as _time
+        _t = _time.perf_counter()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        host = np.nanstd(xp.asnumpy(a), axis=0)
-    return xp.asarray(host)
+        host = xp.asnumpy(a)
+    if profile is not None:
+        profile.add("d2h_transfer_s", _time.perf_counter() - _t)
+        _t = _time.perf_counter()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        host = np.nanstd(host, axis=0)
+    if profile is not None:
+        profile.add("host_reduction_s", _time.perf_counter() - _t)
+        _t = _time.perf_counter()
+    result = xp.asarray(host)
+    if profile is not None:
+        profile.add("h2d_transfer_s", _time.perf_counter() - _t)
+    return result
 
 
-def _axis_sum_f64(a, xp):
+def _axis_sum_f64(a, xp, profile=None):
     """Per-column float64 sum, BIT-EXACT across backends (ZM-ZEGRID-R22).
 
     The C2 mean-combine numerator/denominator are float64 reductions; for the GPU
@@ -1358,7 +1388,17 @@ def _axis_sum_f64(a, xp):
     """
     if xp is np:
         return np.sum(a, axis=0, dtype=np.float64)
-    return np.sum(xp.asnumpy(a), axis=0, dtype=np.float64)
+    if profile is not None:
+        import time as _time
+        _t = _time.perf_counter()
+    host = xp.asnumpy(a)
+    if profile is not None:
+        profile.add("d2h_transfer_s", _time.perf_counter() - _t)
+        _t = _time.perf_counter()
+    result = np.sum(host, axis=0, dtype=np.float64)
+    if profile is not None:
+        profile.add("host_reduction_s", _time.perf_counter() - _t)
+    return result
 
 
 def _nan_axis_quantile(a, q, xp):
@@ -1430,25 +1470,26 @@ def _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high, xp)
     return keep, degenerate
 
 
-def _kappa_sigma_step(orig2, survivor2, count, sigma_low, sigma_high, xp):
+def _kappa_sigma_step(orig2, survivor2, count, sigma_low, sigma_high, xp, profile=None):
     active = count >= 3
     masked = xp.where(survivor2, orig2, xp.nan)
     center = _nan_axis_median(masked, xp)
-    std = _nan_axis_popstd(masked, xp)
+    std = _nan_axis_popstd(masked, xp, profile=profile)
     keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high, xp)
     return survivor2 & keep, degenerate
 
 
 def _winsorized_sigma_clip_step(
-    orig2, survivor2, count, sigma_low, sigma_high, winsor_low, winsor_high, xp
+    orig2, survivor2, count, sigma_low, sigma_high, winsor_low, winsor_high, xp,
+    profile=None,
 ):
     active = count >= 3
     masked = xp.where(survivor2, orig2, xp.nan)
     q_low = _nan_axis_quantile(masked, winsor_low, xp)
     q_high = _nan_axis_quantile(masked, 1.0 - winsor_high, xp)
     winsor = xp.clip(masked, q_low[xp.newaxis, :], q_high[xp.newaxis, :])
-    center = _nan_axis_mean(winsor, xp)
-    std = _nan_axis_popstd(winsor, xp)
+    center = _nan_axis_mean(winsor, xp, profile=profile)
+    std = _nan_axis_popstd(winsor, xp, profile=profile)
     keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high, xp)
     return survivor2 & keep, degenerate
 

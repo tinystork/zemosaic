@@ -17,6 +17,7 @@ import queue
 import numpy as np
 import pytest
 
+import zemosaic.core.canonical_streaming as cs_streaming
 from zemosaic.core.canonical_engine import CanonicalStackRequest
 from zemosaic.core.canonical_streaming import (
     InMemoryCanonicalProvider,
@@ -128,6 +129,33 @@ def test_consumer_idle_counts_the_poll_that_trips_the_stall_watchdog():
     assert telemetry["cancel_reason"] == "stall_timeout"
 
 
+class _CancelOnEmptyQueue:
+    def __init__(self, pipe):
+        self._pipe = pipe
+        self.get_calls = 0
+
+    def get(self, timeout=None):  # noqa: ARG002
+        self.get_calls += 1
+        # Deterministic cancellation DURING the empty poll: the loop top will
+        # observe it on the next iteration.
+        self._pipe.cancel("empty_poll_cancel")
+        raise queue.Empty
+
+    def qsize(self):
+        return 0
+
+
+def test_consumer_idle_counts_cancellation_during_empty_poll():
+    clock = _StepClock()
+    pipe = _pipe(clock)
+    pipe._queue = _CancelOnEmptyQueue(pipe)
+    pipe._consume_loop()
+    telemetry = pipe.telemetry()
+    assert telemetry["consumer_idle_s"] == pytest.approx(0.1)
+    assert telemetry["cancel_reason"] == "empty_poll_cancel"
+    assert telemetry["producer_error"] is None
+
+
 # ---------------------------------------------------------------------------
 # 2. Profiler bounded / strict JSON / parity
 # ---------------------------------------------------------------------------
@@ -187,8 +215,8 @@ def test_profiler_on_is_bit_identical_and_strict_json():
     assert snap["device"]["unavailable_reason"] == "cpu_backend"
     for name in zspp.HOST_PHASES:
         assert name in snap["host_phases"]
-        if name == "boundary_sync_s":
-            # No GPU workspace boundary exists on the CPU backend.
+        if name in ("boundary_sync_s", "h2d_transfer_s", "d2h_transfer_s"):
+            # No GPU workspace boundary / backend transfer on the CPU path.
             assert snap["host_phases"][name]["count"] == 0
         else:
             assert snap["host_phases"][name]["count"] >= 1
@@ -246,3 +274,305 @@ def test_aggregate_refuses_malformed_entries_without_raising():
     agg = zspp.aggregate([{"schema": "nope"}, None, 42])  # type: ignore[list-item]
     assert agg["cells_profiled"] == 0
     assert agg["cells_malformed"] == 3
+
+
+def _cpu_profiled_snapshot():
+    frames, masks = _corpus()
+    request = CanonicalStackRequest(
+        images=frames,
+        geometric_support=masks,
+        normalization="none",
+        weighting="none",
+        rejection="none",
+        combine="mean",
+    )
+    profiler = zspp.StackPhaseProfiler(backend="cpu")
+    run_canonical_stack_streaming(
+        InMemoryCanonicalProvider(frames, masks),
+        request,
+        tile_size=8,
+        phase_profiler=profiler,
+    )
+    return profiler.snapshot()
+
+
+def test_aggregate_same_schema_bad_counter_is_atomic_and_never_raises():
+    snap = _cpu_profiled_snapshot()
+    snap["tiles"] = "bad"
+    agg = zspp.aggregate([snap])
+    assert agg["cells_profiled"] == 0
+    assert agg["cells_malformed"] == 1
+    json.dumps(agg, allow_nan=False, sort_keys=True)
+
+
+def test_aggregate_malformed_bucket_contributes_nothing():
+    snap = _cpu_profiled_snapshot()
+    # Damage ONE nested bucket; the whole snapshot must be rejected, not
+    # partially summed.
+    snap["host_phases"]["writes_s"]["count"] = "oops"
+    agg = zspp.aggregate([snap])
+    assert agg["cells_profiled"] == 0
+    assert agg["cells_malformed"] == 1
+    assert all(
+        bucket["total_s"] == 0.0 and bucket["count"] == 0
+        for bucket in agg["host_phases"].values()
+    )
+
+
+def test_aggregate_preserves_perturbation():
+    profiler = zspp.StackPhaseProfiler(backend="gpu")
+    profiler.add_device_span(0.1)
+    profiler.note_extra_sync(2)
+    profiler.count_tile(1)
+    agg = zspp.aggregate([profiler.snapshot()], attribution="current")
+    assert agg["perturbation"]["extra_synchronizations"] == 2
+    assert agg["perturbation"]["cuda_event_sync_per_tile"] is True
+    assert agg["perturbation"]["cells_with_cuda_event_sync"] == 1
+
+
+def test_aggregate_records_identity_split_and_missing_profiles():
+    profile = _cpu_profiled_snapshot()
+    records = [
+        {"cell_id": "a", "stack_phase_profile": profile},
+        {"cell_id": "b"},  # current pending cell with no profile (empty)
+        {"cell_id": "c", "stack_phase_profile": profile},  # restored
+        {"cell_id": "d"},  # old restored store without a profile
+    ]
+    current, historical = zspp.aggregate_records(
+        records, current_ids={"a", "b"}
+    )
+    assert current["cells_in_attempt"] == 2
+    assert current["cells_profiled"] == 1
+    assert current["cells_without_profile"] == 1
+    assert current["resume_attribution"]["current"] == 1
+    assert historical["cells_restored"] == 2
+    assert historical["cells_profiled"] == 1
+    assert historical["cells_without_profile"] == 1
+    assert historical["resume_attribution"]["historical_restored"] == 1
+
+    # All-current and all-restored boundaries use the same identity rule.
+    all_current, none_historical = zspp.aggregate_records(
+        records, current_ids=set(), all_current=True
+    )
+    assert all_current["cells_profiled"] == 2
+    assert none_historical["cells_profiled"] == 0
+    none_current, all_historical = zspp.aggregate_records(
+        records, current_ids=set()
+    )
+    assert none_current["cells_profiled"] == 0
+    assert all_historical["cells_profiled"] == 2
+    json.dumps(
+        {"current": current, "historical": historical},
+        allow_nan=False,
+        sort_keys=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. Faithful CPU-backed CuPy API double (constructor + elapsed contract)
+# ---------------------------------------------------------------------------
+
+
+class _FakeEvent:
+    """CuPy-shaped Event: keyword signature enforced, NO elapsed_time()."""
+
+    def __init__(self, block=False, disable_timing=False, interprocess=False):
+        del block, interprocess
+        _FakeCuda.created += 1
+        self.disable_timing = disable_timing
+        self.recorded = False
+
+    def record(self):
+        self.recorded = True
+
+    def synchronize(self):
+        _FakeCuda.syncs += 1
+
+
+class _FakeCuda:
+    created = 0
+    syncs = 0
+    elapsed_calls = 0
+    fail_create = False
+    fail_elapsed = False
+
+    @classmethod
+    def reset(cls):
+        cls.created = 0
+        cls.syncs = 0
+        cls.elapsed_calls = 0
+        cls.fail_create = False
+        cls.fail_elapsed = False
+
+    def Event(self, **kwargs):
+        if _FakeCuda.fail_create:
+            raise TypeError("fake Event construction failure")
+        return _FakeEvent(**kwargs)
+
+    def get_elapsed_time(self, start, end):
+        del start, end
+        _FakeCuda.elapsed_calls += 1
+        if _FakeCuda.fail_elapsed:
+            raise RuntimeError("fake elapsed failure")
+        return 1000.0  # milliseconds -> 1.0 s per tile
+
+
+class _FakeXP:
+    """NumPy-backed module distinct from ``np`` with a CuPy-shaped cuda API."""
+
+    cuda = _FakeCuda()
+    float32 = np.float32
+    newaxis = np.newaxis
+
+    def __getattr__(self, name):
+        return getattr(np, name)
+
+    @staticmethod
+    def asarray(x, *a, **k):
+        return np.asarray(x, *a, **k)
+
+    @staticmethod
+    def asnumpy(x, *a, **k):
+        return np.asarray(x, *a, **k)
+
+
+_FAKE_XP = _FakeXP()
+
+
+def _install_fake_gpu(monkeypatch):
+    monkeypatch.setattr(cs_streaming, "canonical_gpu_available", lambda: True)
+    monkeypatch.setattr(
+        cs_streaming,
+        "_get_xp",
+        lambda backend: _FAKE_XP if backend == "gpu" else np,
+    )
+    monkeypatch.setattr(
+        cs_streaming, "_release_gpu_workspace", lambda xp, **kw: None
+    )
+
+
+def _gpu_request(frames, masks, *, combine, rejection):
+    return CanonicalStackRequest(
+        images=frames,
+        geometric_support=masks,
+        normalization="none",
+        weighting="none",
+        rejection=rejection,
+        combine=combine,
+        taper="footprint",
+        backend="gpu",
+    )
+
+
+@pytest.mark.parametrize(
+    "combine,rejection",
+    [("mean", "winsorized_sigma_clip"), ("median", "kappa_sigma")],
+)
+def test_cpu_backed_cupy_double_parity_on_off(
+    monkeypatch, combine, rejection
+):
+    frames, masks = _corpus()
+    cpu_request = CanonicalStackRequest(
+        images=frames,
+        geometric_support=masks,
+        normalization="none",
+        weighting="none",
+        rejection=rejection,
+        combine=combine,
+        taper="footprint",
+        backend="cpu",
+    )
+    reference = run_canonical_stack_streaming(
+        InMemoryCanonicalProvider(frames, masks), cpu_request, tile_size=8
+    )
+    _install_fake_gpu(monkeypatch)
+    gpu_request = _gpu_request(
+        frames, masks, combine=combine, rejection=rejection
+    )
+
+    _FakeCuda.reset()
+    profiler = zspp.StackPhaseProfiler(backend="gpu")
+    on = run_canonical_stack_streaming(
+        InMemoryCanonicalProvider(frames, masks),
+        gpu_request,
+        tile_size=8,
+        phase_profiler=profiler,
+    )
+    _assert_planes_equal(reference, on)
+    snap = profiler.snapshot()
+    assert snap["backend"] == "gpu"
+    assert snap["device"]["unavailable_reason"] is None
+    assert snap["device"]["combine_event_pairs"] == snap["tiles"]
+    assert snap["device"]["combine_stream_span_s"] == pytest.approx(
+        float(snap["tiles"])
+    )
+    assert snap["perturbation"]["extra_synchronizations"] == snap["tiles"]
+    assert snap["host_phases"]["h2d_transfer_s"]["count"] > 0
+    assert snap["host_phases"]["d2h_transfer_s"]["count"] > 0
+    assert snap["host_phases"]["host_reduction_s"]["count"] > 0
+    # The double enforces the real API: two events per tile, one sync each.
+    assert _FakeCuda.created == 2 * snap["tiles"]
+    assert _FakeCuda.syncs == snap["tiles"]
+    assert _FakeCuda.elapsed_calls == snap["tiles"]
+
+    # OFF: no event, no measurement sync, no elapsed query, same science.
+    _FakeCuda.reset()
+    off = run_canonical_stack_streaming(
+        InMemoryCanonicalProvider(frames, masks), gpu_request, tile_size=8
+    )
+    _assert_planes_equal(reference, off)
+    assert _FakeCuda.created == 0
+    assert _FakeCuda.syncs == 0
+    assert _FakeCuda.elapsed_calls == 0
+
+
+def test_cupy_event_creation_failure_is_truthful(monkeypatch):
+    frames, masks = _corpus()
+    _install_fake_gpu(monkeypatch)
+    gpu_request = _gpu_request(
+        frames, masks, combine="mean", rejection="none"
+    )
+    _FakeCuda.reset()
+    _FakeCuda.fail_create = True
+    profiler = zspp.StackPhaseProfiler(backend="gpu")
+    run_canonical_stack_streaming(
+        InMemoryCanonicalProvider(frames, masks),
+        gpu_request,
+        tile_size=8,
+        phase_profiler=profiler,
+    )
+    snap = profiler.snapshot()
+    assert snap["device"]["combine_stream_span_s"] is None
+    assert snap["device"]["unavailable_reason"].startswith(
+        "cuda_event_unavailable"
+    )
+    assert snap["perturbation"]["extra_synchronizations"] == 0
+    assert snap["perturbation"]["cuda_event_sync_per_tile"] is False
+    json.dumps(snap, allow_nan=False, sort_keys=True)
+
+
+def test_cupy_elapsed_failure_still_counts_real_sync(monkeypatch):
+    frames, masks = _corpus()
+    _install_fake_gpu(monkeypatch)
+    gpu_request = _gpu_request(
+        frames, masks, combine="mean", rejection="none"
+    )
+    _FakeCuda.reset()
+    _FakeCuda.fail_elapsed = True
+    profiler = zspp.StackPhaseProfiler(backend="gpu")
+    run_canonical_stack_streaming(
+        InMemoryCanonicalProvider(frames, masks),
+        gpu_request,
+        tile_size=8,
+        phase_profiler=profiler,
+    )
+    snap = profiler.snapshot()
+    assert snap["device"]["combine_stream_span_s"] is None
+    assert snap["device"]["unavailable_reason"].startswith(
+        "cuda_event_elapsed_failed"
+    )
+    # The synchronization really happened, so it must be counted even though
+    # no elapsed value is available.
+    assert snap["perturbation"]["extra_synchronizations"] == snap["tiles"]
+    assert _FakeCuda.syncs == snap["tiles"]
+    json.dumps(snap, allow_nan=False, sort_keys=True)

@@ -770,6 +770,7 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
     # is None this adds one branch per phase point and NO timer/synchronization.
     _pf = phase_profiler
     _use_dev_events = bool(_pf is not None and xp is not np)
+    _use_transfers = bool(_pf is not None and xp is not np)
 
     def _prof_add(phase, started):
         if _pf is not None:
@@ -922,9 +923,11 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         _dev_events = None
         if _use_dev_events:
             try:
+                # CuPy API: Event(block=False, disable_timing=False, ...).
+                # There is NO enable_timing keyword (that is torch's API).
                 _dev_events = (
-                    xp.cuda.Event(enable_timing=True),
-                    xp.cuda.Event(enable_timing=True),
+                    xp.cuda.Event(disable_timing=False),
+                    xp.cuda.Event(disable_timing=False),
                 )
                 _dev_events[0].record()
             except Exception as _ev_exc:  # noqa: BLE001 - telemetry only
@@ -953,18 +956,23 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
                 # xp-generic rejection; the step primitives use the bit-exact
                 # host-side mean/std reductions (see canonical_stacking), so the
                 # survivor mask is bit-identical CPU vs GPU.
+                _t_h2d = time.perf_counter() if _use_transfers else 0.0
                 orig2 = xp.asarray(orig2_host)
                 survivor2 = xp.asarray(survivor2_host)
+                if _use_transfers:
+                    _pf.add("h2d_transfer_s", time.perf_counter() - _t_h2d)
                 degenerate_seen = xp.zeros(n_cells_t, dtype=bool)
                 for _ in range(iters):
                     count = survivor2.sum(axis=0)
                     if reject_token == "kappa_sigma":
                         new_survivor2, degenerate = _kappa_sigma_step(
-                            orig2, survivor2, count, s_low, s_high, xp
+                            orig2, survivor2, count, s_low, s_high, xp,
+                            profile=_pf,
                         )
                     else:
                         new_survivor2, degenerate = _winsorized_sigma_clip_step(
-                            orig2, survivor2, count, s_low, s_high, w_low, w_high, xp
+                            orig2, survivor2, count, s_low, s_high, w_low, w_high,
+                            xp, profile=_pf,
                         )
                     tile_iters += 1
                     degenerate_seen |= degenerate
@@ -972,28 +980,33 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
                         survivor2 = new_survivor2
                         break
                     survivor2 = new_survivor2
-                _t_rb = time.perf_counter() if _pf is not None else 0.0
+                _t_rb = time.perf_counter() if _use_transfers else 0.0
                 survivor = _as_host_numpy(survivor2, xp).reshape(n, th, tw, c)
                 degenerate_seen_host = _as_host_numpy(degenerate_seen, xp)
-                _prof_add("host_readback_s", _t_rb)
+                if _use_transfers:
+                    _pf.add("d2h_transfer_s", time.perf_counter() - _t_rb)
 
             rejection_t = initial & ~survivor
 
             # --- combine (reused reductions on the N axis, bit-exact across backends) ---
             w_positive = wmap[:, :, :, None] > 0.0
             eligible = survivor & w_positive & np.isfinite(images64)
+            _t_h2d = time.perf_counter() if _use_transfers else 0.0
             images64_xp = xp.asarray(images64)
             wmap_xp = xp.asarray(wmap[:, :, :, None])
             eligible_xp = xp.asarray(eligible)
+            if _use_transfers:
+                _pf.add("h2d_transfer_s", time.perf_counter() - _t_h2d)
             if combine_token == "mean":
                 masked_images = xp.where(eligible_xp, images64_xp, 0.0)
                 w_contrib = xp.where(eligible_xp, wmap_xp, 0.0)
                 # bit-exact float64 reductions: _axis_sum_f64 reduces on the host for
                 # the GPU backend (matching np.sum), so science is bit-identical.
-                _t_red = time.perf_counter() if _pf is not None else 0.0
-                numerator = _axis_sum_f64(masked_images * w_contrib, xp)
-                denominator = _axis_sum_f64(w_contrib, xp)
-                _prof_add("host_reduction_s", _t_red)
+                # Its D2H transfer and host reduction are attributed internally.
+                numerator = _axis_sum_f64(
+                    masked_images * w_contrib, xp, profile=_pf
+                )
+                denominator = _axis_sum_f64(w_contrib, xp, profile=_pf)
                 den_valid = denominator > 0.0
                 estimate64 = _safe_divide(numerator, denominator, np)
                 science32 = _astype_float32(estimate64, np)
@@ -1004,9 +1017,10 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
             else:  # median
                 masked = xp.where(eligible_xp, images64_xp, xp.nan)
                 median64_xp = _nan_axis_median(masked, xp)
-                _t_rb = time.perf_counter() if _pf is not None else 0.0
+                _t_rb = time.perf_counter() if _use_transfers else 0.0
                 median64 = _as_host_numpy(median64_xp, xp)
-                _prof_add("host_readback_s", _t_rb)
+                if _use_transfers:
+                    _pf.add("d2h_transfer_s", time.perf_counter() - _t_rb)
                 science32 = _astype_float32(median64, np)
                 _t_red = time.perf_counter() if _pf is not None else 0.0
                 count = eligible.sum(axis=0).astype(np.float64)
@@ -1036,14 +1050,27 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
             try:
                 _dev_events[1].record()
                 _dev_events[1].synchronize()
-                _pf.add_device_span(
-                    _dev_events[0].elapsed_time(_dev_events[1]) / 1000.0
-                )
-                _pf.note_extra_sync(1)
             except Exception as _ev_exc:  # noqa: BLE001 - telemetry only
                 _pf.note_device_unavailable(
-                    f"cuda_event_elapsed_failed: {type(_ev_exc).__name__}"
+                    f"cuda_event_sync_failed: {type(_ev_exc).__name__}"
                 )
+            else:
+                # The synchronization HAPPENED (and perturbs the run) even if
+                # the elapsed query itself fails; count it truthfully.
+                _pf.note_extra_sync(1)
+                try:
+                    # CuPy API: module-level get_elapsed_time returns ms.
+                    _pf.add_device_span(
+                        xp.cuda.get_elapsed_time(
+                            _dev_events[0], _dev_events[1]
+                        )
+                        / 1000.0
+                    )
+                except Exception as _ev_exc:  # noqa: BLE001 - telemetry only
+                    _pf.note_device_unavailable(
+                        "cuda_event_elapsed_failed: "
+                        f"{type(_ev_exc).__name__}"
+                    )
         iterations_used = max(iterations_used, tile_iters)
         _t_support = time.perf_counter() if _pf is not None else 0.0
 
