@@ -2086,6 +2086,14 @@ class BoundedPipeline:
             try:
                 unit = self._queue.get(timeout=0.05)
             except queue.Empty:
+                # Count THIS timed-out poll before any terminal return. Every
+                # queue.get() call's elapsed host wait is therefore accumulated
+                # exactly once, including the empty-poll / producer-death /
+                # stall / cancellation paths; the earlier version lost all
+                # queue.Empty timeout durations by ``continue``-ing first.
+                self._consumer_idle_s += max(
+                    0.0, float(self._clock()) - started
+                )
                 if self._producer_stalled():
                     return
                 if (
@@ -2361,6 +2369,14 @@ class BoundedPipeline:
             "ledger": ledger,
             "transfers": int(self._transfers),
             "consumer_idle_s": float(self._consumer_idle_s),
+            # R55-E2 telemetry semantics: this is HOST queue.get() waiting on the
+            # consumer (owner) thread, including every queue.Empty timeout poll.
+            # It is not a device/GPU idle measurement; asynchronous GPU work is
+            # not observed by this counter.
+            "consumer_idle_semantics": (
+                "host_consumer_queue_wait_s (all queue.get calls, including "
+                "queue.Empty timeout polls); not device/GPU idle time"
+            ),
             "credit_accounting": {
                 "mode": (
                     "pre_acquire"

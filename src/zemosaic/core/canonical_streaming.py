@@ -69,6 +69,7 @@ Scope / non-goals
 
 from __future__ import annotations
 
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -755,7 +756,7 @@ def _fixed_phase1(
 # Phase 2 — per-tile rejection / combine / support
 # ---------------------------------------------------------------------------
 
-def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, backend="cpu", rejection_sink=None) -> CanonicalStackResult:
+def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, backend="cpu", rejection_sink=None, phase_profiler=None) -> CanonicalStackResult:
     n = p1.n_frames
     h = p1.height
     w = p1.width
@@ -765,6 +766,15 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
     # stages run xp-generic on ``xp`` (NumPy or CuPy); the reductions use the
     # bit-exact host-side helpers so CPU vs GPU outputs are bit-identical.
     xp = _get_xp(backend)
+    # ZM-STACK-INSTRUMENTATION: optional, default-OFF bounded profiler. When it
+    # is None this adds one branch per phase point and NO timer/synchronization.
+    _pf = phase_profiler
+    _use_dev_events = bool(_pf is not None and xp is not np)
+
+    def _prof_add(phase, started):
+        if _pf is not None:
+            _pf.add(phase, time.perf_counter() - started)
+
 
     # Method tokens + validated rejection parameters (reused validators).
     reject_token = _resolve_reject_token(request.rejection)
@@ -844,10 +854,19 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         tw = ex1 - ex0
 
         # Gather N frames: prepared raw tile + valid; then re-apply coefficients.
+        # Profiling boundary: only provider.get_tile() calls are tile READ time;
+        # allocation, coefficient re-application and the float64 conversion are
+        # tile PREP. The two buckets are disjoint and each get() is counted once.
+        _t_prep_start = time.perf_counter() if _pf is not None else 0.0
+        _read_s = 0.0
         images_t = np.empty((n, th, tw, c), dtype=np.float32)
         valid_t = np.zeros((n, th, tw), dtype=bool)
         for i in range(n):
+            if _pf is not None:
+                _t_read = time.perf_counter()
             raw_tile, pre_valid = provider.get_tile(i, ey0, ey1, ex0, ex1)
+            if _pf is not None:
+                _read_s += time.perf_counter() - _t_read
             if not p1.norm_active[i]:
                 # normalization-excluded frame: all-NaN image, all-false valid.
                 images_t[i] = np.nan
@@ -869,6 +888,13 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
             valid_t[i] = post_valid
 
         images64 = images_t.astype(np.float64)
+        if _pf is not None:
+            _pf.add("tile_read_s", _read_s)
+            _pf.add(
+                "tile_prepare_s",
+                max(0.0, (time.perf_counter() - _t_prep_start) - _read_s),
+            )
+        _t_taper = time.perf_counter() if _pf is not None else 0.0
 
         # --- taper (footprint EDT with halo) -> estimator-weight map ---
         if taper_kind == "footprint":
@@ -891,6 +917,21 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
                 else:
                     wmap[i] = q[i] * m * a_map[i]
                 wmap[i] = np.where(valid_t[i], wmap[i], 0.0)
+        _prof_add("taper_weights_s", _t_taper)
+        _t_combine = time.perf_counter() if _pf is not None else 0.0
+        _dev_events = None
+        if _use_dev_events:
+            try:
+                _dev_events = (
+                    xp.cuda.Event(enable_timing=True),
+                    xp.cuda.Event(enable_timing=True),
+                )
+                _dev_events[0].record()
+            except Exception as _ev_exc:  # noqa: BLE001 - telemetry only
+                _dev_events = None
+                _pf.note_device_unavailable(
+                    f"cuda_event_unavailable: {type(_ev_exc).__name__}"
+                )
 
         # --- rejection + combine in a BOUNDED scope --------------------------
         # ZM-ZEGRID-R55-E11: every device temporary is created and dropped inside
@@ -931,8 +972,10 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
                         survivor2 = new_survivor2
                         break
                     survivor2 = new_survivor2
+                _t_rb = time.perf_counter() if _pf is not None else 0.0
                 survivor = _as_host_numpy(survivor2, xp).reshape(n, th, tw, c)
                 degenerate_seen_host = _as_host_numpy(degenerate_seen, xp)
+                _prof_add("host_readback_s", _t_rb)
 
             rejection_t = initial & ~survivor
 
@@ -947,8 +990,10 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
                 w_contrib = xp.where(eligible_xp, wmap_xp, 0.0)
                 # bit-exact float64 reductions: _axis_sum_f64 reduces on the host for
                 # the GPU backend (matching np.sum), so science is bit-identical.
+                _t_red = time.perf_counter() if _pf is not None else 0.0
                 numerator = _axis_sum_f64(masked_images * w_contrib, xp)
                 denominator = _axis_sum_f64(w_contrib, xp)
+                _prof_add("host_reduction_s", _t_red)
                 den_valid = denominator > 0.0
                 estimate64 = _safe_divide(numerator, denominator, np)
                 science32 = _astype_float32(estimate64, np)
@@ -959,16 +1004,22 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
             else:  # median
                 masked = xp.where(eligible_xp, images64_xp, xp.nan)
                 median64_xp = _nan_axis_median(masked, xp)
+                _t_rb = time.perf_counter() if _pf is not None else 0.0
                 median64 = _as_host_numpy(median64_xp, xp)
+                _prof_add("host_readback_s", _t_rb)
                 science32 = _astype_float32(median64, np)
+                _t_red = time.perf_counter() if _pf is not None else 0.0
                 count = eligible.sum(axis=0).astype(np.float64)
+                _prof_add("host_reduction_s", _t_red)
                 den_valid = count > 0.0
                 final_finite = np.isfinite(median64) & np.isfinite(science32)
                 valid_out = den_valid & final_finite
                 science_t = np.where(valid_out, science32, np.nan)
                 weight_sum_t = np.where(valid_out, count, 0.0)
 
+            _t_red = time.perf_counter() if _pf is not None else 0.0
             surviving_t = eligible.sum(axis=0).astype(np.int64)
+            _prof_add("host_reduction_s", _t_red)
             valid_mask_t = weight_sum_t > 0.0
 
             return (
@@ -980,7 +1031,21 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
             science_t, weight_sum_t, surviving_t, valid_mask_t,
             rejection_t, initial, degenerate_seen_host, tile_iters,
         ) = _reject_and_combine()
+        _prof_add("reject_combine_host_s", _t_combine)
+        if _dev_events is not None:
+            try:
+                _dev_events[1].record()
+                _dev_events[1].synchronize()
+                _pf.add_device_span(
+                    _dev_events[0].elapsed_time(_dev_events[1]) / 1000.0
+                )
+                _pf.note_extra_sync(1)
+            except Exception as _ev_exc:  # noqa: BLE001 - telemetry only
+                _pf.note_device_unavailable(
+                    f"cuda_event_elapsed_failed: {type(_ev_exc).__name__}"
+                )
         iterations_used = max(iterations_used, tile_iters)
+        _t_support = time.perf_counter() if _pf is not None else 0.0
 
         # --- support accumulation (per frame in order, interior written below) ---
         w1_tile = np.zeros((th, tw), dtype=np.float64)
@@ -989,6 +1054,8 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
             if active[i]:
                 w1_tile += wmap[i]
                 w2_tile += wmap[i] * wmap[i]
+        _prof_add("support_accum_s", _t_support)
+        _t_writes = time.perf_counter() if _pf is not None else 0.0
 
         # --- interior extraction + writes ---
         iy0 = y0 - ey0
@@ -1013,6 +1080,9 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         rejected_count += int(rej_int.sum())
         low_n_count += int((init_int.sum(axis=0) < 3).sum())
         degenerate_count += int(degenerate_seen_host.reshape(th, tw, c)[iy0:iy1, ix0:ix1, :].sum())
+        _prof_add("writes_s", _t_writes)
+        if _pf is not None:
+            _pf.count_tile(n)
 
         # ZM-ZEGRID-R22 (H3 rework-1) / R55-E11: release the per-tile device
         # workspace between tiles. The temporaries are unreachable now (bounded
@@ -1020,7 +1090,10 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         # genuinely unused blocks to the allocator. Never a global gc, never a
         # live-array free.
         if xp is not np:
+            _t_sync = time.perf_counter() if _pf is not None else 0.0
             _release_gpu_workspace(xp, reason="tile_boundary")
+            if _pf is not None:
+                _pf.add("boundary_sync_s", time.perf_counter() - _t_sync)
 
     # ZM-ZEGRID-R55-E11: CELL boundary. Every device temporary from the tile
     # loop is out of scope here; purge the pool before the orchestrator reads
@@ -1069,6 +1142,7 @@ def run_canonical_stack_streaming(
     tile_size=None,
     fixed: "FixedNormalization | None" = None,
     rejection_sink=None,
+    phase_profiler=None,
 ) -> CanonicalStackResult:
     """Bounded-memory canonical stack, bit-equivalent to ``run_canonical_stack``.
 
@@ -1154,7 +1228,8 @@ def run_canonical_stack_streaming(
     p1 = _fixed_phase1(provider, request, fixed)
 
     (science, weight_sum, valid_mask, surviving, support_w1, support_w2, n_eff, agg) = _phase2(
-        provider, p1, request, tile_size, backend=token, rejection_sink=rejection_sink
+        provider, p1, request, tile_size, backend=token, rejection_sink=rejection_sink,
+        phase_profiler=phase_profiler,
     )
 
     # --- post-combine RGB equalization (out-of-place, spatial-only) ---

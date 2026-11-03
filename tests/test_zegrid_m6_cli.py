@@ -222,6 +222,40 @@ def test_cli_real_tiny_run_produces_fits_and_manifest(tmp_path):
     assert not (out / ".zegrid_publications").exists()
 
 
+def test_cli_stack_phase_profiling_is_opt_in_and_lands_in_manifest(tmp_path):
+    """End-to-end activation: config -> real stack -> manifest artifact."""
+    corpus = _make_corpus(tmp_path / "in")
+    out = tmp_path / "out"
+    summary_path = tmp_path / "summary.json"
+    proc = _run(
+        [
+            "--input", str(corpus),
+            "--output", str(out),
+            "--workers", "1",
+            "--layout", "2x2",
+            "--halo-px", "8",
+            "--gauge-mode", "global",
+            "--stack-phase-profiling",
+            "--json-summary", str(summary_path),
+        ],
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+
+    summary = json.loads(summary_path.read_text())
+    manifest = json.loads(Path(summary["publication"]["manifest"]).read_text())
+    profile = manifest["per_cell_diagnostics"]["stack_phase_profile"]
+    assert profile["schema"] == "zegrid-stack-phase-profile-v1"
+    assert profile["attribution"] == "current"
+    assert profile["cells_profiled"] == 4
+    assert profile["tiles"] > 0
+    assert profile["device"]["unavailable_reasons"] == {"cpu_backend": 4}
+    assert profile["resume_attribution"]["current"] == 4
+    assert profile["resume_attribution"]["historical_restored"] == 0
+    # Strict JSON: no NaN/Inf anywhere in the persisted block.
+    json.dumps(profile, allow_nan=False, sort_keys=True)
+
+
 # ---------------------------------------------------------------------------
 # REWORK-1 C1 — a reused output folder is never silently overwritten
 # ---------------------------------------------------------------------------

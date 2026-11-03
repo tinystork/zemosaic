@@ -154,6 +154,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional path for a machine-readable JSON summary",
     )
     parser.add_argument(
+        "--stack-phase-profiling", action="store_true", default=False,
+        help=(
+            "diagnostic only: persist bounded per-cell stacking phase totals "
+            "and run aggregation (default off; no effect on science/coverage)"
+        ),
+    )
+    parser.add_argument(
         "--stop-grace-seconds", type=_positive_float,
         default=DEFAULT_STOP_GRACE_SECONDS,
         help=(
@@ -479,6 +486,7 @@ def _build_config(args, resolved) -> SimpleNamespace:
             "zegrid_durable_store_budget_bytes": args.durable_store_budget_bytes,
             "zegrid_resource_recovery_enabled": bool(args.resource_recovery),
             "zegrid_resource_recovery_deadline_s": args.resource_recovery_deadline_s,
+            "zegrid_stack_phase_profiling": bool(args.stack_phase_profiling),
         }
     )
     # Fail closed on any invalid value before the engine is even imported.

@@ -171,6 +171,10 @@ DEFAULT_CONFIG = {
     "zegrid_cell_gauge_mode": None,  # None -> frozen default (global)
     "zegrid_layout": None,           # None -> RAM-adaptive layout
     "zegrid_sip_mode": "keep",       # "keep" (default) or "strip"
+    # ZM-STACK-INSTRUMENTATION: default-OFF bounded stacking phase profiling.
+    # Diagnostic only; never a science/coverage/identity input. When False no
+    # profiler, CUDA event, extra synchronization or per-tile record is created.
+    "zegrid_stack_phase_profiling": False,
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
@@ -504,6 +508,7 @@ ZEGRID_RUN_POLICY_KEYS = (
     "zegrid_cell_gauge_mode",
     "zegrid_layout",
     "zegrid_sip_mode",
+    "zegrid_stack_phase_profiling",
 )
 
 _ZEGRID_GAUGE_MODES = ("auto", "global", "per_cell")
@@ -606,6 +611,13 @@ def validate_zegrid_run_policy(config: Any) -> dict:
             f"{_ZEGRID_SIP_MODES}, got {sip_raw!r}"
         )
 
+    profiling_raw = _policy_value(config, "zegrid_stack_phase_profiling")
+    if not isinstance(profiling_raw, bool):
+        raise ValueError(
+            "zegrid_stack_phase_profiling must be a boolean, got "
+            f"{type(profiling_raw).__name__}={profiling_raw!r}"
+        )
+
     return {
         "zegrid_resource_recovery_enabled": enabled,
         "zegrid_resource_recovery_deadline_s": deadline,
@@ -613,6 +625,7 @@ def validate_zegrid_run_policy(config: Any) -> dict:
         "zegrid_cell_gauge_mode": gauge_mode,
         "zegrid_layout": layout,
         "zegrid_sip_mode": sip_mode,
+        "zegrid_stack_phase_profiling": profiling_raw,
     }
 
 

@@ -123,6 +123,7 @@ from .core.zegrid import run_artifacts as zart
 from .core.zegrid import run_publication as zpub
 from .core.zegrid import resource_recovery as zrec
 from .core.zegrid import scheduler as zsched
+from .core.zegrid import stack_phase_profile as zspp
 from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
@@ -2126,7 +2127,7 @@ def _make_cell_provider(cache_dir, storage_profile):
 
 
 def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, tile_size=None,
-                    storage_profile=None):
+                    storage_profile=None, phase_profiler=None):
     """In-memory cell run: aligned frames resident, single-tile streaming executor.
 
     ZM-ZEGRID-R11: the in-memory path now goes through
@@ -2165,7 +2166,8 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, til
     inmem_provider = InMemoryCanonicalProvider(images, supports)
     request = zstream.build_streaming_request(config, inmem_provider.n_frames)
     result = run_canonical_stack_streaming(
-        inmem_provider, request, tile_size=tile_size, fixed=fixed
+        inmem_provider, request, tile_size=tile_size, fixed=fixed,
+        phase_profiler=phase_profiler,
     )
     sres = _build_cell_sres(result, frame_ids)
     mt = za.extract_minitile(patch, sres)
@@ -2173,7 +2175,8 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, til
 
 
 def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STREAM_TILE_SIZE,
-                     fixed=None, storage_profile=None, storage_info=None):
+                     fixed=None, storage_profile=None, storage_info=None,
+                     phase_profiler=None):
     _profile = zsp.normalize_storage_profile(
         storage_profile if storage_profile is not None else _STACK_STORAGE_PROFILE
     )
@@ -2189,10 +2192,12 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
             result = run_canonical_stack_streaming(
                 provider, request, tile_size=tile_size, fixed=fixed,
                 rejection_sink=sink,
+                phase_profiler=phase_profiler,
             )
         else:
             result = run_canonical_stack_streaming(
-                provider, request, tile_size=tile_size, fixed=fixed
+                provider, request, tile_size=tile_size, fixed=fixed,
+                phase_profiler=phase_profiler,
             )
         if storage_info is not None:
             storage_info.update({
@@ -2241,6 +2246,11 @@ _STACK_GLOBAL_FRAME_IDS = None
 _STACK_GLOBAL_REF = None
 _STACK_TILE_SIZE = STREAM_TILE_SIZE
 _STACK_CACHE_WORKERS = 1
+# ZM-STACK-INSTRUMENTATION: default-OFF bounded phase profiling for this run.
+# Read from the product config once and published to every cell worker through
+# the initializer (appended to initargs ONLY when ON, so the OFF transport stays
+# byte-identical). Never a science or identity input.
+_STACK_PHASE_PROFILING = False
 # ZM-ZEGRID-R52-OOC Lot B: the ONE storage profile for this run. Selected before
 # layout filtering and kept through PLAN/ADMIT/RUN/fallback. Default dense keeps
 # every historical byte and path unchanged; bounded is an explicit internal seam.
@@ -2746,7 +2756,7 @@ def _storage_plan_refusal(exc):
 _STACK_R40_WORKER_COORDS = None
 
 
-def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id, tile_size=STREAM_TILE_SIZE, cache_workers=1, r40_worker_coords=None):
+def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id, tile_size=STREAM_TILE_SIZE, cache_workers=1, r40_worker_coords=None, phase_profiling=False):
     """Child/parent initializer: publish the read-only per-cell stack inputs.
 
     ``r40_worker_coords`` (ZM-ZEGRID-R40-B2-C) is the OPTIONAL parent-computed
@@ -2757,7 +2767,7 @@ def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame
     """
     global _STACK_DESCS, _STACK_CANVAS, _STACK_CONFIG, _STACK_GAUGE
     global _STACK_GLOBAL_FRAME_IDS, _STACK_GLOBAL_REF, _STACK_TILE_SIZE
-    global _STACK_CACHE_WORKERS, _STACK_R40_WORKER_COORDS
+    global _STACK_CACHE_WORKERS, _STACK_R40_WORKER_COORDS, _STACK_PHASE_PROFILING
     _STACK_DESCS = descs
     _STACK_CANVAS = canvas
     _STACK_CONFIG = science_config
@@ -2767,6 +2777,7 @@ def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame
     _STACK_TILE_SIZE = tile_size
     _STACK_CACHE_WORKERS = cache_workers
     _STACK_R40_WORKER_COORDS = r40_worker_coords
+    _STACK_PHASE_PROFILING = bool(phase_profiling)
 
 
 def _resolve_cell_normalization(mode, global_gauge, global_frame_ids, provider, science_config):
@@ -4050,6 +4061,13 @@ def _consume_stack_cell(prepared, *, tile_size=None):
     cid = cell.cell_id
 
     t0 = time.perf_counter()
+    _phase_profiler = (
+        zspp.StackPhaseProfiler(
+            backend=str(getattr(_STACK_CONFIG, "backend", "cpu"))
+        )
+        if _STACK_PHASE_PROFILING
+        else None
+    )
     storage_info = {}
     if mode == "inmem" and zsp.is_bounded(storage_profile):
         raise RuntimeError(
@@ -4069,7 +4087,8 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             else None
         )
         mt, sres = _run_cell_inmem(cache_dir, patch, _STACK_CONFIG, None,
-                                   fixed=cell_fixed, tile_size=inmem_tile)
+                                   fixed=cell_fixed, tile_size=inmem_tile,
+                                   phase_profiler=_phase_profiler)
     else:
         mt, sres = _run_cell_stream(
             cache_dir, patch, _STACK_CONFIG, None,
@@ -4077,6 +4096,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             fixed=cell_fixed,
             storage_profile=storage_profile,
             storage_info=storage_info,
+            phase_profiler=_phase_profiler,
         )
     stack_s = time.perf_counter() - t0
 
@@ -4147,6 +4167,10 @@ def _consume_stack_cell(prepared, *, tile_size=None):
     _r40_sparse = _r40_maybe_worker_sparse(cid, mt, patch)
     if _r40_sparse is not None:
         result[R40_SPARSE_RESULT_KEY] = _r40_sparse
+    # ZM-STACK-INSTRUMENTATION: additive, default-OFF bounded per-cell profile.
+    # When OFF this key is absent and the result is byte-identical.
+    if _phase_profiler is not None:
+        result["stack_phase_profile"] = _phase_profiler.snapshot()
     return result
 
 
@@ -12156,7 +12180,11 @@ def _run_single(
         # candidate geometry).
         _initargs = (descs, canvas, science_cfg, global_gauge, global_frame_ids,
                      global_reference_frame_id, tile_size, _cache_workers)
-        if _r40_coords_by_cell is not None:
+        if _STACK_PHASE_PROFILING:
+            # Append ONLY when the diagnostic is ON: the OFF transport keeps its
+            # exact historical shape (r40 coords are also optional).
+            _initargs = _initargs + (_r40_coords_by_cell, True)
+        elif _r40_coords_by_cell is not None:
             _initargs = _initargs + (_r40_coords_by_cell,)
         _progress = (
             _cell_progress_for(_tasks)
@@ -12171,7 +12199,7 @@ def _run_single(
         _init_stack_worker(
             descs, canvas, science_cfg, global_gauge, global_frame_ids,
             global_reference_frame_id, tile_size, _cache_workers,
-            _r40_coords_by_cell,
+            _r40_coords_by_cell, _STACK_PHASE_PROFILING,
         )
         _res = zpar.pmap(
             _stack_cell, _tasks, workers=_workers,
@@ -13384,6 +13412,7 @@ def _run_single(
         _init_stack_worker(
             descs, canvas, gpu_cfg, global_gauge, global_frame_ids,
             global_reference_frame_id, tile, workers,
+            None, _STACK_PHASE_PROFILING,
         )
         disk_root = _r55_run_disk_root(cache_root, output_dir)
         revalidations = []
@@ -15937,6 +15966,39 @@ def _run_single(
     per_cell_diagnostics["stack_cpu_sum_s"] = round(
         sum(r.get("stack_s", 0.0) for r in results), 6
     )
+    # ZM-STACK-INSTRUMENTATION: additive default-OFF run aggregation. When
+    # profiling is OFF this key is ABSENT and the manifest is unchanged. Timing
+    # values never enter a science/coverage/durable identity hash.
+    if _STACK_PHASE_PROFILING:
+        _stack_profiles = [
+            r.get("stack_phase_profile")
+            for r in results
+            if isinstance(r, dict)
+            and isinstance(r.get("stack_phase_profile"), dict)
+        ]
+        _prof_agg = zspp.aggregate(_stack_profiles, attribution="current")
+        if isinstance(results, zbas.StoreBackedResults):
+            _prof_agg["unavailable_reason"] = (
+                "store_backed_results_carry_descriptors_not_volatile_profiles"
+            )
+        _hist_restored = 0
+        if _resume_runtime.get("resumed"):
+            try:
+                _hist_restored = int(
+                    _resume_runtime.get("completed_cells") or 0
+                )
+            except (TypeError, ValueError):
+                _hist_restored = 0
+        _prof_agg["resume_attribution"] = {
+            "current": int(_prof_agg.get("cells_profiled", 0)),
+            "historical_restored": int(_hist_restored),
+            "note": (
+                "Phase totals belong ONLY to currently executed cells. Cells "
+                "restored from a durable resume were not re-profiled and are "
+                "never summed with current resume wall time."
+            ),
+        }
+        per_cell_diagnostics["stack_phase_profile"] = _prof_agg
     # ZM-ZEGRID-R21: which reprojection path the per-cell cache build took,
     # aggregated over every cell worker (each reports its process-local stats).
     per_cell_diagnostics["reprojection"] = zxe.merge_reproject_stats(
@@ -17770,6 +17832,12 @@ def run_zegrid_mode(
     global _STACK_STORAGE_PROFILE
     _storage_policy_reset(storage_profile)
     _STACK_STORAGE_PROFILE = _STORAGE_EFFECTIVE
+    # ZM-STACK-INSTRUMENTATION: resolve the default-OFF diagnostic once, before
+    # any work. The strict validator above has already refused a non-bool value.
+    global _STACK_PHASE_PROFILING
+    _STACK_PHASE_PROFILING = bool(
+        getattr(zconfig, "zegrid_stack_phase_profiling", False)
+    ) if zconfig is not None else False
     # ZM-ZEGRID-M6: validate EVERY declared run-policy key BEFORE any work. An
     # explicit invalid value is a loud refusal (never coerced); absent keys keep
     # the historical defaults exactly.

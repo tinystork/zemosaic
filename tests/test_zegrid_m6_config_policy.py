@@ -23,6 +23,8 @@ EXPECTED_DEFAULTS = {
     "zegrid_cell_gauge_mode": None,
     "zegrid_layout": None,
     "zegrid_sip_mode": "keep",
+    # ZM-STACK-INSTRUMENTATION: additive default-OFF diagnostic key.
+    "zegrid_stack_phase_profiling": False,
 }
 
 
@@ -68,6 +70,10 @@ def test_validate_accepts_defaults_and_none():
         ("zegrid_layout", (2, 2)),
         ("zegrid_sip_mode", "stripped"),
         ("zegrid_sip_mode", True),
+        ("zegrid_stack_phase_profiling", "false"),
+        ("zegrid_stack_phase_profiling", 0),
+        ("zegrid_stack_phase_profiling", 1),
+        ("zegrid_stack_phase_profiling", None),
     ],
 )
 def test_invalid_values_are_rejected_never_coerced(key, value):
