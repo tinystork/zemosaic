@@ -2157,10 +2157,15 @@ def test_resume_accepts_empty_pre_marker_residue_read_only(tmp_path, monkeypatch
         "subdir",
         "publication",
         "marker_symlink",
+        "marker_dir",
         "gen_symlink",
         "foreign_sibling",
         "other_run",
         "current",
+        "tmp_missing",
+        "tmp_nonempty",
+        "tmp_file",
+        "tmp_symlink",
     ],
 )
 def test_pre_marker_residue_negatives_refuse_without_mutation(
@@ -2184,6 +2189,8 @@ def test_pre_marker_residue_negatives_refuse_without_mutation(
         real_marker = tmp_path / "elsewhere.staging.json"
         real_marker.write_text("{}", encoding="utf-8")
         _os.symlink(real_marker, gen / zpub.STAGING_FILENAME)
+    elif kind == "marker_dir":
+        (gen / zpub.STAGING_FILENAME).mkdir()
     elif kind == "gen_symlink":
         elsewhere = tmp_path / "empty-target"
         elsewhere.mkdir()
@@ -2195,6 +2202,18 @@ def test_pre_marker_residue_negatives_refuse_without_mutation(
         (zpub.publication_root(out) / "run-other").mkdir()
     elif kind == "current":
         (run_root / zpub.POINTER_FILENAME).write_text("{}", encoding="utf-8")
+    elif kind == "tmp_missing":
+        (run_root / "tmp").rmdir()
+    elif kind == "tmp_nonempty":
+        (run_root / "tmp" / "stray.bin").write_bytes(b"x")
+    elif kind == "tmp_file":
+        (run_root / "tmp").rmdir()
+        (run_root / "tmp").write_bytes(b"x")
+    elif kind == "tmp_symlink":
+        target = tmp_path / "tmp-target"
+        target.mkdir()
+        (run_root / "tmp").rmdir()
+        _os.symlink(target, run_root / "tmp")
 
     info = zpub.inspect_same_run_staging(out, run_id)
     assert info["ok"] is False, (kind, info)
@@ -2207,7 +2226,14 @@ def test_pre_marker_residue_negatives_refuse_without_mutation(
     assert win._pending_zegrid_resume is None
     assert _tree_digest(tmp_path) == before, kind
     assert gen.is_dir() or gen.is_symlink(), kind
-    if kind not in {"file", "subdir", "publication", "marker_symlink", "current"}:
+    if kind not in {
+        "file",
+        "subdir",
+        "publication",
+        "marker_symlink",
+        "marker_dir",
+        "current",
+    }:
         assert list(gen.iterdir()) == [], kind
 
 
@@ -2338,3 +2364,171 @@ def test_e2e_resume_complete_store_with_empty_pre_marker_residue(
     final_state = zres.read_state(store)
     assert final_state["finalized"] is True
     assert zpub.verify_finalized(out_dir, store, run_id).reason == "verified_finalized"
+
+
+def test_markerless_residue_beside_dead_owner_staging_is_explicit(
+    tmp_path, monkeypatch
+):
+    import test_zegrid_publication_m5b as pubtest
+
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    run_root, gen1 = _pre_marker_residue(out, run_id)
+    staged = pubtest._begin(out, run_id=run_id, ram=_publication_ram())
+    marker = staged.generation_dir / zpub.STAGING_FILENAME
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["pid"] = 2147483647
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is True, info
+    assert info["generations"] == ["gen-1", "gen-2"]
+    assert info["pre_marker_residue"] == ["gen-1"]
+    assert info["present_members"] == {"gen-1": 0, "gen-2": 0}
+    assert list(gen1.iterdir()) == []
+    assert zpub.verify_finalized(out, store, run_id).published is False
+
+    before = _tree_digest(tmp_path)
+    win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    assert win._prepare_zegrid_resume_for_start() is True, warnings
+    assert warnings == []
+    assert _tree_digest(tmp_path) == before
+
+
+def test_multiple_empty_markerless_generations_are_all_listed(
+    tmp_path, monkeypatch
+):
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    run_root, gen1 = _pre_marker_residue(out, run_id)
+    gen2 = run_root / "gen-2"
+    gen2.mkdir()
+
+    info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is True, info
+    assert info["generations"] == ["gen-1", "gen-2"]
+    assert info["pre_marker_residue"] == ["gen-1", "gen-2"]
+    assert info["present_members"] == {"gen-1": 0, "gen-2": 0}
+
+    before = _tree_digest(tmp_path)
+    win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    assert win._prepare_zegrid_resume_for_start() is True, warnings
+    assert warnings == []
+    assert _tree_digest(tmp_path) == before
+
+
+def test_valid_current_stays_authoritative_beside_old_empty_generation(
+    tmp_path, monkeypatch
+):
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    _pubtest, _pub, generation = _real_publication(out, run_id)
+    assert generation.generation == "gen-1"
+    run_root = zpub.run_publication_root(out, run_id)
+    (run_root / "gen-2").mkdir()
+
+    # The staging preflight refuses because a pointer exists (explicit split),
+    # and the committed path resolves the SAME authoritative generation.
+    info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is False
+    assert "CURRENT.json exists" in info["reason"]
+
+    before = _tree_digest(tmp_path)
+    win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    assert win._prepare_zegrid_resume_for_start() is True, warnings
+    assert warnings == []
+    assert zpub.resolve_current(str(out), run_id).generation == "gen-1"
+    # The verified CURRENT remains the authority: the empty gen-2 was never
+    # treated as a publication and was not mutated.
+    assert (run_root / "gen-2").is_dir()
+    assert list((run_root / "gen-2").iterdir()) == []
+    assert _tree_digest(tmp_path) == before
+
+
+def test_legacy_markerless_residue_uses_the_same_strict_shape(
+    tmp_path, monkeypatch
+):
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    legacy_root = out / zpub.LEGACY_PUBLICATION_DIRNAME
+    assert not (out / zpub.PUBLICATION_DIRNAME).exists()
+    run_root = legacy_root / f"run-{zpub._run_token(run_id)}"
+    (run_root / "tmp").mkdir(parents=True)
+    (run_root / "gen-1").mkdir()
+    assert zpub.discover_publication_root(out) == (legacy_root, True)
+
+    info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is True, info
+    assert info["pre_marker_residue"] == ["gen-1"]
+
+    before = _tree_digest(tmp_path)
+    win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    assert win._prepare_zegrid_resume_for_start() is True, warnings
+    assert warnings == []
+    assert _tree_digest(tmp_path) == before
+
+    # A new run NEVER silently switches its writes into the legacy container.
+    for_write = zpub.run_publication_root(out, run_id, for_write=True)
+    assert for_write.parent.name == zpub.PUBLICATION_DIRNAME
+    assert not (out / zpub.PUBLICATION_DIRNAME).exists()
+
+    # Strictness is identical in the legacy container: non-empty tmp refuses.
+    (run_root / "tmp" / "stray.bin").write_bytes(b"x")
+    bad = zpub.inspect_same_run_staging(out, run_id)
+    assert bad["ok"] is False and "not empty" in bad["reason"]
+    before_bad = _tree_digest(tmp_path)
+    win2, warnings2 = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    assert win2._prepare_zegrid_resume_for_start() is False
+    assert warnings2
+    assert _tree_digest(tmp_path) == before_bad
+
+
+def test_markerless_generation_with_fifo_marker_is_refused(tmp_path, monkeypatch):
+    import os as _os
+
+    if not hasattr(_os, "mkfifo"):  # pragma: no cover - Windows
+        pytest.skip("mkfifo is not available on this platform")
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    run_root, gen = _pre_marker_residue(out, run_id)
+    _os.mkfifo(gen / zpub.STAGING_FILENAME)
+
+    info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is False
+    assert "not a plain file" in info["reason"]
+    before = _tree_digest(tmp_path)
+    win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    assert win._prepare_zegrid_resume_for_start() is False
+    assert warnings
+    assert _tree_digest(tmp_path) == before
+    assert (gen / zpub.STAGING_FILENAME).exists()
+
+
+def test_markerless_residue_with_unreadable_tmp_is_refused(tmp_path, monkeypatch):
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    run_root, _gen = _pre_marker_residue(out, run_id)
+    tmp = run_root / "tmp"
+    real_iterdir = Path.iterdir
+
+    def _denied_iterdir(self):
+        if self == tmp:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(zpub.Path, "iterdir", _denied_iterdir)
+    info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is False
+    assert "cannot be inspected" in info["reason"]

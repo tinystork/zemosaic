@@ -1564,3 +1564,48 @@ def test_begin_creates_staging_on_simulated_windows_absent_target(tmp_path, monk
     assert payload["schema"] == zpub.STAGING_SCHEMA
     assert payload["run_id"] == RUN_ID
     assert payload["generation"] == pub.generation
+
+
+def test_is_link_detects_broken_symlink(tmp_path):
+    link = tmp_path / "dangling"
+    os.symlink(tmp_path / "does-not-exist", link)
+    assert zpub._is_link(link) is True
+
+
+def test_first_marker_write_failure_preserves_injected_content(
+    tmp_path, monkeypatch
+):
+    """Concurrent/partial content is NEVER removed by the safety rmdir."""
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _failed_marker_write(path, _data, **_kwargs):
+        Path(path).write_bytes(b"partial")
+        raise OSError(5, "simulated first marker write failure")
+
+    monkeypatch.setattr(zpub, "_atomic_write", _failed_marker_write)
+    with pytest.raises(OSError, match="simulated first marker write failure"):
+        _begin(out)
+    run_root = zpub.run_publication_root(out, RUN_ID)
+    generations = list(run_root.glob("gen-*"))
+    assert len(generations) == 1
+    marker = generations[0] / zpub.STAGING_FILENAME
+    assert marker.read_bytes() == b"partial"
+
+
+def test_first_marker_write_failure_preserves_injected_subdir(
+    tmp_path, monkeypatch
+):
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _failed_marker_write(path, _data, **_kwargs):
+        Path(path).parent.joinpath("concurrent").mkdir()
+        raise OSError(5, "simulated first marker write failure")
+
+    monkeypatch.setattr(zpub, "_atomic_write", _failed_marker_write)
+    with pytest.raises(OSError, match="simulated first marker write failure"):
+        _begin(out)
+    generations = list(zpub.run_publication_root(out, RUN_ID).glob("gen-*"))
+    assert len(generations) == 1
+    assert (generations[0] / "concurrent").is_dir()

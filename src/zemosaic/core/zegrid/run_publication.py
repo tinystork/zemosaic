@@ -932,6 +932,29 @@ def _referenced_generation(run_root: Path) -> str | None:
     return str(pointer.get("generation"))
 
 
+def _pre_marker_tmp_reason(run_root: Path) -> str | None:
+    """Why ``run-root/tmp`` cannot qualify beside a pre-marker residue, or None.
+
+    Read-only. The incident's exact shape is a plain, strictly EMPTY ``tmp``;
+    accepting the residue must never whitelist foreign content in ``tmp``.
+    """
+    tmp = run_root / "tmp"
+    try:
+        st = os.lstat(str(tmp))
+    except FileNotFoundError:
+        return "the pre-marker residue has no tmp directory"
+    except OSError as exc:
+        return f"the pre-marker residue tmp directory cannot be inspected: {exc}"
+    if _stat_is_link(st) or not stat.S_ISDIR(st.st_mode):
+        return "the pre-marker residue tmp entry is not a plain directory"
+    try:
+        if any(tmp.iterdir()):
+            return "the pre-marker residue tmp directory is not empty"
+    except OSError as exc:
+        return f"the pre-marker residue tmp directory cannot be inspected: {exc}"
+    return None
+
+
 def inspect_same_run_staging(
     output_dir: str | os.PathLike[str], run_id: str
 ) -> dict:
@@ -964,8 +987,12 @@ def inspect_same_run_staging(
     the run root and STRICTLY empty: that is the exact residue left by an
     interrupted first ``.staging.json`` write (the Windows
     ``PublicationPathError`` incident), which can be resumed by publishing a
-    NEW generation. Any byte/file/subdirectory, a ``publication.json``, a
-    link/junction or any other entry keeps the refusal. Such a residue is
+    NEW generation. Accepting ANY such residue additionally requires
+    ``run-root/tmp`` to be present, plain, inspectable and STRICTLY EMPTY; a
+    missing/non-empty/linked/unreadable ``tmp`` is a refusal (the markerless
+    path never bypasses the foreign-content rule). Any
+    byte/file/subdirectory, a ``publication.json``, a link/junction or any
+    other entry in the generation keeps the refusal. Such a residue is
     reported in ``pre_marker_residue`` and is NEVER a publication/COMPLETE.
 
     A live owner, a foreign/other-run entry, a path escape or a malformed
@@ -1014,6 +1041,8 @@ def inspect_same_run_staging(
             return _refuse(f"the run publication root cannot be inspected: {exc}")
 
         generations: list[str] = []
+        residue_tmp_checked = False
+        residue_tmp_reason: str | None = None
         for entry in run_entries:
             if entry.name == "tmp":
                 if _is_link(entry) or not entry.is_dir():
@@ -1175,6 +1204,15 @@ def inspect_same_run_staging(
                     f"generation {generation!r} has no staging marker and is "
                     "not empty; ownership is not provable"
                 )
+            # An empty markerless generation is only accepted when the run's
+            # scratch entry has the same exact shape: present, plain and
+            # strictly empty. This closes the bypass where arbitrary foreign
+            # content could hide in ``tmp`` beside an accepted residue.
+            if not residue_tmp_checked:
+                residue_tmp_reason = _pre_marker_tmp_reason(run_root)
+                residue_tmp_checked = True
+            if residue_tmp_reason is not None:
+                return _refuse(residue_tmp_reason)
             result["pre_marker_residue"].append(generation)
             result.setdefault("present_members", {})[generation] = 0
             continue
