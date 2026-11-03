@@ -1312,6 +1312,78 @@ def _nan_axis_median(a, xp):
         return xp.nanmedian(a, axis=0)
 
 
+def _np_nanmean_cols(host):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmean(host, axis=0)
+
+
+def _np_nanstd_cols(host):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanstd(host, axis=0)
+
+
+def _np_sum_f64_cols(host):
+    return np.sum(host, axis=0, dtype=np.float64)
+
+
+def _download_and_reduce(a, xp, profile, reducers):
+    """Download ``a`` ONCE, then apply each host reducer to that same array.
+
+    ZM-STACK-REDUCTION-BATCH: several host-side statistics are computed from the
+    exact same device array (e.g. the winsorized mean and population std). Doing
+    one ``xp.asnumpy`` per statistic re-downloaded identical bytes; this helper
+    performs a single D2H transfer and then hands the SAME host float64 array to
+    every reducer, in order.
+
+    Bit-exactness is preserved by construction: each reducer receives exactly the
+    array it received before (the host copy is deterministic), so ``np.nanmean``,
+    ``np.nanstd`` and ``np.sum(dtype=float64)`` see identical inputs with an
+    unchanged summation order. No reduction is moved to the device and no
+    arithmetic is fused.
+
+    Returns the list of host results. For the NumPy backend the reducers run
+    directly on ``a`` (no copy, no profiling, unchanged behaviour). The single
+    transfer is attributed to ``d2h_transfer_s`` and each reducer to its own
+    ``host_reduction_s`` call.
+    """
+    if xp is np:
+        return [fn(a) for fn in reducers]
+    if profile is not None:
+        import time as _time
+        _t = _time.perf_counter()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        host = xp.asnumpy(a)
+    if profile is not None:
+        profile.add("d2h_transfer_s", _time.perf_counter() - _t)
+    results = []
+    for fn in reducers:
+        if profile is not None:
+            _t = _time.perf_counter()
+        results.append(fn(host))
+        if profile is not None:
+            profile.add("host_reduction_s", _time.perf_counter() - _t)
+    return results
+
+
+def _upload_host_results(hosts, xp, profile):
+    """Return ``hosts`` on the backend module of ``a``; uploads timed singly."""
+    if xp is np:
+        return hosts
+    out = []
+    for host in hosts:
+        if profile is not None:
+            import time as _time
+            _t = _time.perf_counter()
+        result = xp.asarray(host)
+        if profile is not None:
+            profile.add("h2d_transfer_s", _time.perf_counter() - _t)
+        out.append(result)
+    return out
+
+
 def _nan_axis_mean(a, xp, profile=None):
     """Per-column NaN-mean, BIT-EXACT across backends (ZM-ZEGRID-R22).
 
@@ -1324,27 +1396,9 @@ def _nan_axis_mean(a, xp, profile=None):
     so the caller stays xp-generic.
     """
     if xp is np:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            return np.nanmean(a, axis=0)
-    if profile is not None:
-        import time as _time
-        _t = _time.perf_counter()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        host = xp.asnumpy(a)
-    if profile is not None:
-        profile.add("d2h_transfer_s", _time.perf_counter() - _t)
-        _t = _time.perf_counter()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        host = np.nanmean(host, axis=0)
-    if profile is not None:
-        profile.add("host_reduction_s", _time.perf_counter() - _t)
-        _t = _time.perf_counter()
-    result = xp.asarray(host)
-    if profile is not None:
-        profile.add("h2d_transfer_s", _time.perf_counter() - _t)
+        return _np_nanmean_cols(a)
+    (host,) = _download_and_reduce(a, xp, profile, [_np_nanmean_cols])
+    (result,) = _upload_host_results([host], xp, profile)
     return result
 
 
@@ -1354,27 +1408,9 @@ def _nan_axis_popstd(a, xp, profile=None):
     Same host-side reduction strategy as :func:`_nan_axis_mean` (see there).
     """
     if xp is np:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            return np.nanstd(a, axis=0)
-    if profile is not None:
-        import time as _time
-        _t = _time.perf_counter()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        host = xp.asnumpy(a)
-    if profile is not None:
-        profile.add("d2h_transfer_s", _time.perf_counter() - _t)
-        _t = _time.perf_counter()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        host = np.nanstd(host, axis=0)
-    if profile is not None:
-        profile.add("host_reduction_s", _time.perf_counter() - _t)
-        _t = _time.perf_counter()
-    result = xp.asarray(host)
-    if profile is not None:
-        profile.add("h2d_transfer_s", _time.perf_counter() - _t)
+        return _np_nanstd_cols(a)
+    (host,) = _download_and_reduce(a, xp, profile, [_np_nanstd_cols])
+    (result,) = _upload_host_results([host], xp, profile)
     return result
 
 
@@ -1388,16 +1424,7 @@ def _axis_sum_f64(a, xp, profile=None):
     """
     if xp is np:
         return np.sum(a, axis=0, dtype=np.float64)
-    if profile is not None:
-        import time as _time
-        _t = _time.perf_counter()
-    host = xp.asnumpy(a)
-    if profile is not None:
-        profile.add("d2h_transfer_s", _time.perf_counter() - _t)
-        _t = _time.perf_counter()
-    result = np.sum(host, axis=0, dtype=np.float64)
-    if profile is not None:
-        profile.add("host_reduction_s", _time.perf_counter() - _t)
+    (result,) = _download_and_reduce(a, xp, profile, [_np_sum_f64_cols])
     return result
 
 
@@ -1488,8 +1515,16 @@ def _winsorized_sigma_clip_step(
     q_low = _nan_axis_quantile(masked, winsor_low, xp)
     q_high = _nan_axis_quantile(masked, 1.0 - winsor_high, xp)
     winsor = xp.clip(masked, q_low[xp.newaxis, :], q_high[xp.newaxis, :])
-    center = _nan_axis_mean(winsor, xp, profile=profile)
-    std = _nan_axis_popstd(winsor, xp, profile=profile)
+    # ZM-STACK-REDUCTION-BATCH: the winsorized mean and population std are two
+    # host reductions of the SAME array. Download it once, then give each reducer
+    # the identical host float64 copy (bit-exact, arithmetic unchanged).
+    center, std = _upload_host_results(
+        _download_and_reduce(
+            winsor, xp, profile, [_np_nanmean_cols, _np_nanstd_cols]
+        ),
+        xp,
+        profile,
+    )
     keep, degenerate = _apply_sigma_interval(orig2, center, std, active, sigma_low, sigma_high, xp)
     return survivor2 & keep, degenerate
 
