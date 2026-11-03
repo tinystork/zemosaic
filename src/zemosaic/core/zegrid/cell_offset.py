@@ -534,6 +534,12 @@ def recenter_offsets_to_zero_point(
     invariant to the anchor choice for a fixed graph/patches (up to the solver's
     floating-point noise).
 
+    This is a deterministic gauge convention, not an external absolute-sky
+    measurement. It does not claim exact invariance between different layouts
+    when repartitioning changes the per-Cell photometric gauges, graph, or valid
+    support; relative edge constraints alone cannot identify that absolute
+    degree of freedom.
+
     Args:
         offsets: ``(N, C)`` solved additive offsets.
         cell_ids: optional ids (length ``N``) used only for diagnostics.

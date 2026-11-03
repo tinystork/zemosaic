@@ -118,7 +118,7 @@ class CellFeatherResult:
     """Diagnostics for the per-Cell offset + feather assembly."""
 
     anchor: str
-    offsets: np.ndarray               # (N, C) additive offsets (anchor row 0)
+    offsets: np.ndarray               # (N, C) effective, zero-point-gauged offsets
     cell_ids: tuple[str, ...]
     channels: int
     edges_used: int
@@ -416,7 +416,9 @@ def build_cell_offset_graph(
     Nodes = the Cells present in ``patches``; edges = the 4-neighbourhood pairs
     (from the layout) whose PATCHES both exist; anchor = ``anchor`` or the
     deterministic :func:`select_central_cell`. Returns a :class:`CellFeatherResult`
-    carrying the (N, C) additive offsets (anchor row 0) + diagnostics.
+    carrying the effective (N, C) additive offsets after the zero-point gauge
+    + diagnostics. The solver anchor is provenance only and is not generally 0
+    after recentering.
 
     Disconnected cells: ``on_disconnected="raise"`` (default, explicit) or
     ``"zero"`` (documented deterministic policy: unreachable Cells keep offset 0,
@@ -471,7 +473,8 @@ def build_cell_offset_graph(
     # M1 anti-checkerboard: the anchor only fixes a RELATIVE reference. Remove
     # that arbitrary degree of freedom with ONE documented per-channel gauge
     # constant so the assembled additive zero point no longer depends on which
-    # Cell was anchored. The constant is added verbatim to every SOLVED offset
+    # Cell was anchored. The constant is subtracted verbatim from every SOLVED
+    # offset
     # (anchor-connected component): all pairwise differences, edge residuals,
     # feather weights and relative photometry are preserved exactly. Cells that
     # the disconnected policy pinned at offset 0 are intentionally excluded from
