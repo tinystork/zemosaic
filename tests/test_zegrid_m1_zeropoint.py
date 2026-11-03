@@ -248,6 +248,217 @@ def test_equivalent_partition_background_is_stable():
 
 
 # ---------------------------------------------------------------------------
+# C5 — repartition under the SAME non-uniform physical support + cost witness
+# ---------------------------------------------------------------------------
+
+def _physical_support_and_field():
+    """One shared 64x64 support mask (non-uniform) and one shared field."""
+    h = w = 64
+    support = np.ones((h, w), dtype=bool)
+    support[:3, :] = False
+    support[-3:, :] = False
+    support[:, :3] = False
+    support[:, -3:] = False
+    support[10:18, 18:30] = False
+    support[40:52, 34:44] = False
+    support[5:25, 50:54] = False
+
+    def field(yy, xx):
+        return 100.0 + 0.7 * xx - 0.3 * yy + 0.004 * xx * yy
+
+    return support, field
+
+
+def _support_partition_patches(canvas, nx, ny, core_h, core_w, support, field):
+    """Cells whose level is the support-weighted mean of ONE underlying field.
+
+    ``science = field + L_cell`` with ``L_cell = mean(field | support & core)``.
+    No arranged level constants: the levels follow from the SAME field and the
+    SAME physical support in every partition.
+    """
+    halo = HALO
+    patches = {}
+    levels = {}
+    for row in range(ny):
+        for col in range(nx):
+            cid = _cid(row, col)
+            cy0, cy1 = row * core_h, (row + 1) * core_h
+            cx0, cx1 = col * core_w, (col + 1) * core_w
+            core_support = support[cy0:cy1, cx0:cx1]
+            if not core_support.any():
+                raise AssertionError(f"empty physical core support for {cid}")
+            yy_c, xx_c = np.nonzero(core_support)
+            level = float(np.mean(field(yy_c + cy0, xx_c + cx0)))
+            levels[cid] = level
+            py0, py1 = max(0, cy0 - halo), min(canvas.height, cy1 + halo)
+            px0, px1 = max(0, cx0 - halo), min(canvas.width, cx1 + halo)
+            yy, xx = np.mgrid[py0:py1, px0:px1]
+            plane = field(yy, xx) + level
+            valid = support[py0:py1, px0:px1]
+            sci = np.where(valid[:, :, None], plane[:, :, None], np.nan)
+            sci = np.repeat(sci, 3, axis=2)          # test builder only
+            valid3 = np.repeat(valid[:, :, None], 3, axis=2)
+            patches[cid] = zcf.CellPatch(
+                cell_id=cid, bounds=(py0, py1, px0, px1),
+                core_slice=(cy0 - py0, cy1 - py0, cx0 - px0, cx1 - px0),
+                science=sci.astype(np.float32), valid_mask=valid3,
+            )
+    return patches, levels
+
+
+def _raw_anchor_pinned_offsets(graph):
+    """Pre-M1 offsets: undo the production gauge constant (no reimplementation)."""
+    return {
+        cid: np.asarray(graph.offsets[i], np.float64)
+        + np.asarray(graph.zeropoint_constant, np.float64)
+        for i, cid in enumerate(graph.cell_ids)
+    }
+
+
+def test_repartition_with_shared_nonuniform_support_closes_c5():
+    h = w = 64
+    support, field = _physical_support_and_field()
+    yy, xx = np.mgrid[0:h, 0:w]
+    F = field(yy, xx)
+    global_mean = float(F[support].mean())
+    expected = F + global_mean
+
+    canvas_2x2 = _canvas(2, 2, 32, height=h, width=w)
+    p_2x2, levels_2x2 = _support_partition_patches(
+        canvas_2x2, 2, 2, 32, 32, support, field)
+    canvas_4x1 = _canvas(4, 1, 16, height=h, width=w)
+    p_4x1, levels_4x1 = _support_partition_patches(
+        canvas_4x1, 4, 1, 64, 16, support, field)
+
+    w_2x2 = zcf.cell_core_support(p_2x2, sorted(p_2x2), 3)
+    w_4x1 = zcf.cell_core_support(p_4x1, sorted(p_4x1), 3)
+    # Same channels everywhere.
+    for w in (w_2x2, w_4x1):
+        np.testing.assert_array_equal(w[:, 0], w[:, 1])
+        np.testing.assert_array_equal(w[:, 0], w[:, 2])
+    # Total PHYSICAL support is coherent across the two partitions.
+    assert int(w_2x2[:, 0].sum()) == int(support.sum())
+    assert int(w_4x1[:, 0].sum()) == int(support.sum())
+    # Cell weights are genuinely unequal, and the partitions differ.
+    assert len(np.unique(w_2x2[:, 0])) > 1
+    assert len(np.unique(w_4x1[:, 0])) > 1
+    assert not np.array_equal(np.sort(w_2x2[:, 0]), np.sort(w_4x1[:, 0]))
+
+    g_2x2 = zcf.build_cell_offset_graph(canvas_2x2, 2, 2, p_2x2)
+    g_4x1 = zcf.build_cell_offset_graph(canvas_4x1, 4, 1, p_4x1)
+    assert not g_2x2.disconnected and not g_4x1.disconnected
+    np.testing.assert_allclose(g_2x2.zeropoint_total_weight, w_2x2.sum(axis=0))
+    np.testing.assert_allclose(g_4x1.zeropoint_total_weight, w_4x1.sum(axis=0))
+
+    a_2x2 = _assemble(canvas_2x2, 2, 2, p_2x2, g_2x2)
+    a_4x1 = _assemble(canvas_4x1, 4, 1, p_4x1, g_4x1)
+    # The assembled science is the SAME field plus the SAME global zero.
+    for a in (a_2x2, a_4x1):
+        np.testing.assert_allclose(
+            np.asarray(a.science)[support, 0], expected[support], atol=1e-3
+        )
+    np.testing.assert_allclose(
+        np.asarray(a_2x2.science), np.asarray(a_4x1.science),
+        rtol=0.0, atol=1e-4,
+    )
+
+    # Anchor change on EACH connected graph: science and relative physics fixed.
+    g_2x2_b = zcf.build_cell_offset_graph(
+        canvas_2x2, 2, 2, p_2x2, anchor="r0001c0001")
+    g_4x1_b = zcf.build_cell_offset_graph(
+        canvas_4x1, 4, 1, p_4x1, anchor="r0000c0003")
+    for ga, gb in ((g_2x2, g_2x2_b), (g_4x1, g_4x1_b)):
+        assert ga.anchor != gb.anchor
+        np.testing.assert_allclose(
+            ga.weighted_residual_rms, gb.weighted_residual_rms,
+            rtol=0.0, atol=1e-9,
+        )
+        for key, delta in _pairwise(_offsets(ga)).items():
+            assert np.allclose(delta, _pairwise(_offsets(gb))[key],
+                               rtol=0.0, atol=1e-9), key
+        a_a = _assemble(canvas_2x2 if ga is g_2x2 else canvas_4x1,
+                        2 if ga is g_2x2 else 4,
+                        2 if ga is g_2x2 else 1,
+                        p_2x2 if ga is g_2x2 else p_4x1, ga)
+        a_b = _assemble(canvas_2x2 if gb is g_2x2_b else canvas_4x1,
+                        2 if gb is g_2x2_b else 4,
+                        2 if gb is g_2x2_b else 1,
+                        p_2x2 if gb is g_2x2_b else p_4x1, gb)
+        np.testing.assert_allclose(a_a.science, a_b.science, rtol=0.0, atol=1e-4)
+
+    # Gauge is a pure constant: pairwise offset differences match the raw ones.
+    for graph in (g_2x2, g_4x1):
+        raw = _raw_anchor_pinned_offsets(graph)
+        eff = _offsets(graph)
+        for key, delta in _pairwise(raw).items():
+            assert np.allclose(delta, _pairwise(eff)[key], rtol=0.0, atol=1e-9)
+
+    # NEGATIVE CONTROL: without the M1 recentering, the same partitions differ.
+    raw_2x2 = _raw_anchor_pinned_offsets(g_2x2)
+    raw_4x1 = _raw_anchor_pinned_offsets(g_4x1)
+    a_2x2_raw = zcf.assemble_canvas_feathered(
+        canvas_2x2, 2, 2, p_2x2, raw_2x2, halo_px=HALO)
+    a_4x1_raw = zcf.assemble_canvas_feathered(
+        canvas_4x1, 4, 1, p_4x1, raw_4x1, halo_px=HALO)
+    raw_partition_gap = float(np.nanmax(np.abs(
+        np.asarray(a_2x2_raw.science) - np.asarray(a_4x1_raw.science)
+    )))
+    assert raw_partition_gap > 1.0, raw_partition_gap
+    raw_2x2_anchor_b = zcf.assemble_canvas_feathered(
+        canvas_2x2, 2, 2, p_2x2,
+        _raw_anchor_pinned_offsets(g_2x2_b), halo_px=HALO)
+    raw_anchor_gap = float(np.nanmax(np.abs(
+        np.asarray(a_2x2_raw.science) - np.asarray(raw_2x2_anchor_b.science)
+    )))
+    assert raw_anchor_gap > 1.0, raw_anchor_gap
+
+
+# ---------------------------------------------------------------------------
+# Synthetic cost witness (report-only timing; no flaky threshold)
+# ---------------------------------------------------------------------------
+
+def test_support_scan_cost_witness(monkeypatch):
+    import time
+
+    h = w = 1024
+    rng = np.random.default_rng(0)
+    sci = rng.normal(100.0, 1.0, (h, w, 3)).astype(np.float32)
+    val = np.ones((h, w), dtype=bool)
+    patches = {"c": zcf.CellPatch("c", (0, h, 0, w), (0, h, 0, w), sci, val)}
+
+    real_isfinite = np.isfinite
+    shapes = []
+
+    def _spy(x, *a, **k):
+        shapes.append(tuple(np.shape(x)))
+        return real_isfinite(x, *a, **k)
+
+    monkeypatch.setattr(zcf.np, "isfinite", _spy)
+    t0 = time.perf_counter()
+    got = zcf.cell_core_support(patches, ["c"], 3)
+    elapsed = time.perf_counter() - t0
+
+    cap = int(zcf.SUPPORT_SCAN_MAX_ELEMENTS)
+    assert got.shape == (1, 3)
+    assert np.all(got == float(h * w))
+    assert shapes and all(len(shape) == 2 for shape in shapes)
+    assert max(int(np.prod(shape)) for shape in shapes) <= cap
+    bw = min(w, cap)
+    bh = max(1, cap // bw)
+    expected_calls = ((h + bh - 1) // bh) * ((w + bw - 1) // bw) * 3
+    assert len(shapes) == expected_calls
+
+    peak_bound = 3 * cap  # isfinite + and-mask + optional bool tile conversion
+    print(
+        "SUPPORT_SCAN_COST "
+        f"dims={h}x{w} elements={h*w} channels=3 calls={len(shapes)} "
+        f"tile_shape_max={max(shapes, key=lambda s: int(np.prod(s)))} "
+        f"max_tile_elements={max(int(np.prod(s)) for s in shapes)} "
+        f"cap={cap} peak_bound_bytes={peak_bound} wall_s={elapsed:.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Gauge unit contract (pure)
 # ---------------------------------------------------------------------------
 
