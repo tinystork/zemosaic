@@ -3792,7 +3792,10 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
             "weighted_cells": [int(v) for v in graph.zeropoint_weighted_cells],
             "invalid_weight_entries": int(graph.zeropoint_invalid_weight_entries),
             "fallback_channels": [int(c) for c in graph.zeropoint_fallback_channels],
-            "reason": graph.zeropoint_reason,
+            "fallback_reasons": [
+                None if r is None else str(r)
+                for r in graph.zeropoint_fallback_reasons
+            ],
             "anchor_invariant": True,
             "weights": "core_valid_finite_support_per_cell_per_channel",
         },
@@ -17078,9 +17081,10 @@ def _cell_feather_manifest_block(cell_feather_info):
             "weighted_cells": [int(v) for v in zp["weighted_cells"]],
             "invalid_weight_entries": int(zp.get("invalid_weight_entries", 0)),
             "fallback_channels": [int(c) for c in zp.get("fallback_channels", ())],
-            "reason": (
-                None if zp.get("reason") is None else str(zp["reason"])
-            ),
+            "fallback_reasons": [
+                None if r is None else str(r)
+                for r in zp.get("fallback_reasons", ())
+            ],
             "anchor_invariant": bool(zp.get("anchor_invariant", True)),
             "weights": str(
                 zp.get("weights", "core_valid_finite_support_per_cell_per_channel")

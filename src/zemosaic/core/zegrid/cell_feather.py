@@ -127,8 +127,8 @@ class CellFeatherResult:
     disconnected: tuple[str, ...]     # cells kept at offset 0 (on_disconnected="zero")
     policy: str
     per_cell_reference: dict = field(default_factory=dict)  # cell_id -> pinned ref id
-    # M1 anti-checkerboard zero point (anchor-independent, added verbatim to all
-    # solved offsets after the solve; see ``cell_offset.recenter_offsets_to_zero_point``).
+    # M1 anti-checkerboard zero point (anchor-independent, SUBTRACTED from every
+    # solved offset after the solve; see ``cell_offset.recenter_offsets_to_zero_point``).
     zeropoint_policy: str = ""
     zeropoint_status: str = ""
     zeropoint_constant: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float64))
@@ -136,7 +136,7 @@ class CellFeatherResult:
     zeropoint_weighted_cells: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
     zeropoint_invalid_weight_entries: int = 0
     zeropoint_fallback_channels: tuple[int, ...] = ()
-    zeropoint_reason: str | None = None
+    zeropoint_fallback_reasons: tuple[str | None, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +206,60 @@ def cell_patch_sky(patch: CellPatch, *, use_core=True, **kw) -> tuple[np.ndarray
     return levels, counts
 
 
+#: Maximum number of pixels materialised by ONE support-scan tile. The scan
+#: allocates at most TWO boolean tile temporaries (`isfinite` + the `& valid`
+#: result); when the source ``valid_mask`` is not already bool, one additional
+#: tile-sized bool copy is made. Exact worst-case transient is therefore
+#: ``3 * SUPPORT_SCAN_MAX_ELEMENTS`` bytes = 196 608 B (normally 2 * cap =
+#: 131 072 B), independent of patch/halo area. Channels and tiles are processed
+#: SEQUENTIALLY: no 3-D full-patch boolean is ever built. This constant bound
+#: does not change the existing RAM estimators (they price the MB-scale dense
+#: solve and canvas; this scan is O(tile), not O(N_cells * patch_pixels)).
+SUPPORT_SCAN_MAX_ELEMENTS = 65_536
+
+
+def _count_support_tiled(
+    sci, val, core_slice,
+    sci_ch: int | None, val_ch: int | None,
+) -> int:
+    """Count ``valid & finite`` pixels in a CORE slice with a bounded buffer.
+
+    ``sci``/``val`` are the SOURCE arrays (dtype preserved, never copied whole).
+    ``sci_ch``/``val_ch`` are channel indices for 3-D arrays, or ``None`` for a
+    2-D plane. Tiles are at most ``SUPPORT_SCAN_MAX_ELEMENTS`` pixels; rows and
+    columns are both clamped so even a very wide Cell stays within that bound.
+    """
+    y0, y1, x0, x1 = core_slice
+    core_h, core_w = y1 - y0, x1 - x0
+    if core_h <= 0 or core_w <= 0:
+        return 0
+    cap = int(SUPPORT_SCAN_MAX_ELEMENTS)
+    if core_w <= cap:
+        bw = core_w
+        bh = max(1, cap // core_w)
+    else:
+        bw = cap
+        bh = 1
+    total = 0
+    for by in range(y0, y1, bh):
+        ey = min(y1, by + bh)
+        for bx in range(x0, x1, bw):
+            ex = min(x1, bx + bw)
+            if sci.ndim == 3:
+                s = sci[by:ey, bx:ex, sci_ch]
+            else:
+                s = sci[by:ey, bx:ex]
+            if val.ndim == 3:
+                v = val[by:ey, bx:ex, val_ch]
+            else:
+                v = val[by:ey, bx:ex]
+            # Only the TILE is converted (and only if the source is not bool).
+            vb = np.asarray(v, dtype=bool)
+            finite = np.isfinite(s)
+            total += int(np.count_nonzero(finite & vb))
+    return total
+
+
 def cell_core_support(
     patches: Mapping[str, "CellPatch"],
     order: Sequence[str],
@@ -214,13 +268,25 @@ def cell_core_support(
     """Anchor-independent per-Cell support weights for the zero-point gauge.
 
     Weight = number of CORE pixels that are both ``valid_mask`` and finite, per
-    channel. This is the same frozen shared-valid support the offset graph
-    measures, is deterministic (integer counts stored as float64) and does NOT
-    depend on the anchor, the Cell iteration order or any thread scheduling.
+    channel. It is deterministic (integer counts stored as float64) and does NOT
+    depend on the anchor, the Cell iteration order or thread scheduling.
+
+    This is the CORE valid+finiteness SUPPORT of each Cell, not the halo-overlap
+    support measured by the graph edges: edges measure shared-valid pixels in
+    the halo strips, whereas this weight summarises a Cell's usable CORE area.
+
+    MEMORY: the source planes are used as views with their ORIGINAL dtype; no
+    full-patch float64 copy and no ``np.repeat`` is performed. Mono science or a
+    one-channel valid mask is broadcast LOGICALLY by indexing channel 0 for the
+    target channels. The ``valid & finite`` reduction is done in tiles of at
+    most :data:`SUPPORT_SCAN_MAX_ELEMENTS` pixels: at most two boolean tile
+    temporaries (plus one tile copy only if ``valid_mask`` is not bool), i.e.
+    <= 196 608 B worst case (normally 131 072 B), sequential channels — so no
+    full-patch 3-D boolean exists.
 
     Returns ``(N, C)`` float64. A Cell with no usable core pixel gets weight 0
     (explicitly excluded from the gauge; never fabricated). Shape mismatches
-    raise instead of being broadcast.
+    raise instead of being broadcast silently.
     """
     n = len(order)
     c = int(channels)
@@ -229,35 +295,55 @@ def cell_core_support(
     out = np.zeros((n, c), dtype=np.float64)
     for i, cid in enumerate(order):
         cp = patches[cid]
-        sci = np.asarray(cp.science, dtype=np.float64)
-        val = np.asarray(cp.valid_mask, dtype=bool)
+        # NO dtype conversion: an ndarray/memmap stays a view of the source.
+        sci = np.asarray(cp.science)
+        val = np.asarray(cp.valid_mask)
         if sci.ndim == 2:
-            sci = sci[:, :, None]
-        if sci.ndim != 3:
+            n_sci_ch = 1
+        elif sci.ndim == 3:
+            n_sci_ch = int(sci.shape[2])
+        else:
             raise ValueError(f"cell {cid}: science must be 2-D or 3-D")
         if val.ndim == 2:
-            val = val[:, :, None]
-        if val.ndim != 3:
+            n_val_ch = 1
+        elif val.ndim == 3:
+            n_val_ch = int(val.shape[2])
+        else:
             raise ValueError(f"cell {cid}: valid_mask must be 2-D or 3-D")
-        if sci.shape[2] == 1 and c > 1:
-            sci = np.repeat(sci, c, axis=2)
-        if val.shape[2] == 1 and c > 1:
-            val = np.repeat(val, c, axis=2)
-        if sci.shape[2] != c or val.shape[2] != c:
+        if n_sci_ch not in (1, c):
             raise ValueError(
-                f"cell {cid}: channels science={sci.shape[2]} "
-                f"valid={val.shape[2]} != {c}"
+                f"cell {cid}: science has {n_sci_ch} channel(s), expected 1 or {c}"
+            )
+        if n_val_ch not in (1, c):
+            raise ValueError(
+                f"cell {cid}: valid_mask has {n_val_ch} channel(s), expected 1 or {c}"
             )
         y0, y1, x0, x1 = cp.core_slice
-        core_sci = sci[y0:y1, x0:x1]
-        core_val = val[y0:y1, x0:x1]
-        if core_sci.shape[:2] != core_val.shape[:2]:
+        h, w = int(sci.shape[0]), int(sci.shape[1])
+        if not (0 <= y0 < y1 <= h and 0 <= x0 < x1 <= w):
             raise ValueError(
-                f"cell {cid}: core science {core_sci.shape[:2]} and valid "
-                f"{core_val.shape[:2]} disagree"
+                f"cell {cid}: core_slice {(y0, y1, x0, x1)} outside science "
+                f"{(h, w)}"
             )
-        support = core_val & np.isfinite(core_sci)
-        out[i, :] = np.count_nonzero(support, axis=(0, 1))
+        if sci.shape[:2] != val.shape[:2]:
+            raise ValueError(
+                f"cell {cid}: science {sci.shape[:2]} and valid_mask "
+                f"{val.shape[:2]} disagree"
+            )
+        if n_sci_ch == 1:
+            # Logical broadcast: one count for every target channel.
+            count = _count_support_tiled(
+                sci, val, cp.core_slice,
+                None if sci.ndim == 2 else 0,
+                None if val.ndim == 2 else 0,
+            )
+            out[i, :] = count
+            continue
+        for ch in range(c):
+            out[i, ch] = _count_support_tiled(
+                sci, val, cp.core_slice, ch,
+                0 if n_val_ch == 1 else ch,
+            )
     return out
 
 
@@ -401,7 +487,7 @@ def build_cell_offset_graph(
         zeropoint_weighted_cells=np.asarray(gauge.weighted_cells, dtype=np.int64),
         zeropoint_invalid_weight_entries=int(gauge.invalid_weight_entries),
         zeropoint_fallback_channels=tuple(gauge.fallback_channels),
-        zeropoint_reason=gauge.reason,
+        zeropoint_fallback_reasons=tuple(gauge.fallback_reasons),
     )
 
 

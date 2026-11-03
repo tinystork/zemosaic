@@ -262,7 +262,7 @@ def test_gauge_zero_weight_falls_back_to_uniform_mean():
     assert g.status == zco.ZEROPOINT_STATUS_FALLBACK
     assert g.policy == zco.ZEROPOINT_POLICY_UNIFORM
     assert g.fallback_channels == (0,)
-    assert g.reason == "zero_total_weight"
+    assert g.fallback_reasons == ("zero_total_weight",)
 
 
 def test_gauge_huge_weights_overflow_to_uniform_fallback():
@@ -273,6 +273,20 @@ def test_gauge_huge_weights_overflow_to_uniform_fallback():
     assert np.all(np.isfinite(g.constant))
     np.testing.assert_allclose(g.constant, [2.0])
     assert g.status == zco.ZEROPOINT_STATUS_FALLBACK
+    # Overflow is NOT reported as a zero weight: the reason is exact.
+    assert g.fallback_reasons == ("nonfinite_total_weight",)
+
+
+def test_gauge_mixed_fallback_reasons_per_channel():
+    """Channel 0 zero weight, channel 1 overflow: reasons stay per-channel."""
+    off = np.array([[1.0, 10.0], [3.0, 30.0]])
+    weights = np.array([[0.0, 1e308], [0.0, 1e308]])
+    out, g = zco.recenter_offsets_to_zero_point(off, ["a", "b"], weights=weights)
+    assert g.fallback_channels == (0, 1)
+    assert g.fallback_reasons == ("zero_total_weight", "nonfinite_total_weight")
+    assert g.status == zco.ZEROPOINT_STATUS_FALLBACK
+    np.testing.assert_allclose(g.constant, [2.0, 20.0])
+    np.testing.assert_allclose(out, [[-1.0, -10.0], [1.0, 10.0]])
 
 
 def test_gauge_invalid_weights_are_excluded_and_counted():
@@ -331,6 +345,169 @@ def test_gauge_empty_eligible_or_bad_shapes_raise():
 
 
 # ---------------------------------------------------------------------------
+# F1 — bounded, copy-free support scan (memory contract)
+# ---------------------------------------------------------------------------
+
+class _GuardedPlane:
+    """Array-like that refuses float64 conversion / full-array copy requests.
+
+    ``np.asarray(plane)`` (dtype=None, copy=None) yields the SOURCE array view;
+    any ``np.asarray(..., dtype=float64)`` or whole-array copy raises, which is
+    exactly the regression this test locks out.
+    """
+
+    def __init__(self, arr):
+        self._arr = arr
+        self.calls = []
+
+    def __array__(self, dtype=None, copy=None):
+        self.calls.append((dtype, copy))
+        if dtype is not None and np.dtype(dtype) == np.dtype(np.float64):
+            raise AssertionError("full-patch float64 conversion requested")
+        if copy:
+            raise AssertionError("full-patch copy requested")
+        return self._arr
+
+
+def _plain_support(sci, val, core_slice, channels):
+    """Independent reference count (small synthetic arrays only)."""
+    y0, y1, x0, x1 = core_slice
+    s = np.asarray(sci, dtype=np.float64)
+    v = np.asarray(val, dtype=bool)
+    if s.ndim == 2:
+        s = s[:, :, None]
+    if v.ndim == 2:
+        v = v[:, :, None]
+    if s.shape[2] == 1:
+        s = np.repeat(s, channels, axis=2)
+    if v.shape[2] == 1:
+        v = np.repeat(v, channels, axis=2)
+    core = v[y0:y1, x0:x1] & np.isfinite(s[y0:y1, x0:x1])
+    return np.count_nonzero(core, axis=(0, 1)).astype(np.float64)
+
+
+def test_cell_core_support_never_repeats_or_converts_whole_patch(monkeypatch):
+    canvas, patches = _make_patches(2, 2, LEVELS_2X2)
+    cid = "r0000c0000"
+    cp = patches[cid]
+    guarded_sci = _GuardedPlane(cp.science)
+    guarded_val = _GuardedPlane(cp.valid_mask)
+    guarded = zcf.CellPatch(
+        cid, cp.bounds, cp.core_slice, guarded_sci, guarded_val, cp.surviving,
+    )
+    patches_guarded = dict(patches)
+    patches_guarded[cid] = guarded
+
+    def _no_repeat(*_a, **_k):
+        raise AssertionError("np.repeat is forbidden on the support path")
+
+    monkeypatch.setattr(zcf.np, "repeat", _no_repeat)
+    got = zcf.cell_core_support(patches_guarded, sorted(patches_guarded), 3)
+    expected = np.vstack([
+        _plain_support(cp_.science, cp_.valid_mask, cp_.core_slice, 3)
+        for cp_ in (patches[k] for k in sorted(patches))
+    ])
+    np.testing.assert_array_equal(got, expected)
+    # The guarded planes were materialised as views only (no dtype/copy ask).
+    assert guarded_sci.calls and all(dt is None for dt, _c in guarded_sci.calls)
+    assert guarded_val.calls and all(dt is None for dt, _c in guarded_val.calls)
+
+
+def test_cell_core_support_tiles_isfinite_and_never_builds_3d(monkeypatch):
+    canvas, patches = _make_patches(1, 1, {"r0000c0000": 100.0}, core=10)
+    cp = patches["r0000c0000"]
+    # Force tiling with a small documented cap and record every isfinite call.
+    monkeypatch.setattr(zcf, "SUPPORT_SCAN_MAX_ELEMENTS", 32)
+    real_isfinite = np.isfinite
+    shapes = []
+
+    def _spy(x, *a, **k):
+        shapes.append(tuple(np.shape(x)))
+        return real_isfinite(x, *a, **k)
+
+    monkeypatch.setattr(zcf.np, "isfinite", _spy)
+    got = zcf.cell_core_support(patches, ["r0000c0000"], 3)
+    assert shapes, "the support scan must actually run isfinite"
+    for shape in shapes:
+        assert len(shape) == 2, shape          # never a 3-D full-patch bool
+        assert int(np.prod(shape)) <= 32, shape
+    assert got.shape == (1, 3)
+    assert np.all(got == float(10 * 10))
+
+
+def test_cell_core_support_broadcast_parity_and_nonfinite():
+    h = w = 12
+    rng = np.random.default_rng(7)
+    mono = rng.normal(100.0, 1.0, (h, w)).astype(np.float32)
+    mono[0, 0] = np.nan
+    mono[1, 1] = np.inf
+    valid2 = np.ones((h, w), bool)
+    valid2[2, 2] = False
+    sci3 = np.repeat(mono[:, :, None], 3, axis=2)
+    valid3 = np.repeat(valid2[:, :, None], 3, axis=2)
+    core = (0, h, 0, w)
+
+    variants = {
+        "mono2d": (mono, valid2),
+        "mono3d": (mono[:, :, None], valid2),
+        "rgb_2dvalid": (sci3, valid2),
+        "rgb_3dvalid": (sci3, valid3),
+    }
+    weights = {}
+    for name, (s, v) in variants.items():
+        patches = {"c": zcf.CellPatch("c", (0, h, 0, w), core, s, v)}
+        weights[name] = zcf.cell_core_support(patches, ["c"], 3)[0]
+    expected = _plain_support(sci3, valid3, core, 3)
+    for name, got in weights.items():
+        np.testing.assert_array_equal(got, expected), name
+    # NaN/Inf and invalid pixels are excluded, not fabricated.
+    assert expected[0] == h * w - 3
+    # Inputs untouched.
+    assert np.isnan(mono[0, 0]) and np.isinf(mono[1, 1])
+
+
+def test_cell_core_support_noncontiguous_planes_are_correct():
+    h = w = 16
+    base_sci = np.zeros((h, w * 2, 3), np.float32)
+    base_val = np.ones((h, w * 2, 3), bool)
+    base_sci[:, 0::2, :] = 5.0
+    base_sci[3, 0, 0] = np.nan
+    base_val[:, 0::2, :] = True
+    base_val[4, 0, 1] = False
+    sci = base_sci[:, 0::2, :]   # non-contiguous view
+    val = base_val[:, 0::2, :]   # non-contiguous view
+    assert not sci.flags["C_CONTIGUOUS"]
+    patches = {"c": zcf.CellPatch("c", (0, h, 0, w), (0, h, 0, w), sci, val)}
+    got = zcf.cell_core_support(patches, ["c"], 3)[0]
+    expected = _plain_support(sci, val, (0, h, 0, w), 3)
+    np.testing.assert_array_equal(got, expected)
+    assert expected[0] == h * w - 1
+    assert expected[1] == h * w - 1
+
+
+def test_cell_core_support_rejects_incoherent_shapes():
+    good = np.ones((4, 4, 3), np.float32)
+    val = np.ones((4, 4), bool)
+    core = (0, 4, 0, 4)
+    with pytest.raises(ValueError):
+        zcf.cell_core_support(
+            {"c": zcf.CellPatch("c", (0, 4, 0, 4), core,
+                                np.ones((4, 4, 2, 2), np.float32), val)}, ["c"], 3)
+    with pytest.raises(ValueError):
+        zcf.cell_core_support(
+            {"c": zcf.CellPatch("c", (0, 4, 0, 4), core,
+                                good, np.ones((4, 5), bool))}, ["c"], 3)
+    with pytest.raises(ValueError):
+        zcf.cell_core_support(
+            {"c": zcf.CellPatch("c", (0, 4, 0, 4), core,
+                                np.ones((4, 4, 2), np.float32), val)}, ["c"], 3)
+    with pytest.raises(ValueError):
+        zcf.cell_core_support(
+            {"c": zcf.CellPatch("c", (0, 4, 0, 4), (0, 9, 0, 4),
+                                good, val)}, ["c"], 3)
+
+
+# ---------------------------------------------------------------------------
 # Disconnected graph: pinned Cells are neither weighed nor shifted
 # ---------------------------------------------------------------------------
 
@@ -375,6 +552,8 @@ def test_wired_info_exposes_effective_offsets_and_strict_manifest_block():
     assert len(zp["constant"]) == 3
     assert all(np.isfinite(zp["constant"]))
     assert zp["invalid_weight_entries"] == 0
+    assert zp["fallback_channels"] == []
+    assert zp["fallback_reasons"] == [None, None, None]
     assert zp["weights"] == "core_valid_finite_support_per_cell_per_channel"
 
     block = zz._cell_feather_manifest_block(info_a)
@@ -394,6 +573,34 @@ def test_wired_info_exposes_effective_offsets_and_strict_manifest_block():
     assert json.dumps(deterministic, sort_keys=True, allow_nan=False) == json.dumps(
         block, sort_keys=True, allow_nan=False
     )
+
+
+def test_manifest_block_mixed_fallback_reasons_is_strict_and_exact():
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    info = {
+        "anchor": "r0000c0000", "channels": 2, "halo_px": 8,
+        "edges_used": 1, "edges_built": 1, "weighted_residual_rms": [0.0, 0.0],
+        "disconnected": [], "policy": "zero",
+        "offsets": {"r0000c0000": [0.0, 0.0], "r0000c0001": [1.0, 1.0]},
+        "zeropoint": {
+            "policy": zco.ZEROPOINT_POLICY_UNIFORM,
+            "status": zco.ZEROPOINT_STATUS_FALLBACK,
+            "constant": [0.5, 0.5],
+            "total_weight": [2.0, 2.0],
+            "weighted_cells": [2, 2],
+            "invalid_weight_entries": 0,
+            "fallback_channels": [0, 1],
+            "fallback_reasons": ["zero_total_weight", "nonfinite_total_weight"],
+            "anchor_invariant": True,
+            "weights": "core_valid_finite_support_per_cell_per_channel",
+        },
+    }
+    block = zz._cell_feather_manifest_block(info)
+    text = json.dumps(block, allow_nan=False)
+    assert json.loads(text)["zeropoint"]["fallback_reasons"] == [
+        "zero_total_weight", "nonfinite_total_weight"
+    ]
 
 
 def test_manifest_block_refuses_non_finite_offsets():

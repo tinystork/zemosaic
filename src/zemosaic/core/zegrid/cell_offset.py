@@ -511,7 +511,9 @@ class ZeroPointGauge:
     weighted_cells: np.ndarray      # (C,) number of contributors
     invalid_weight_entries: int     # negative/non-finite entries zeroed + counted
     fallback_channels: tuple[int, ...]
-    reason: str | None
+    # One entry PER CHANNEL: None when the weighted mean was used, otherwise the
+    # exact fallback cause ("zero_total_weight" vs "nonfinite_total_weight").
+    fallback_reasons: tuple[str | None, ...]
     shifted_cells: tuple[str, ...]  # cells whose offsets received the constant
 
 
@@ -621,13 +623,21 @@ def recenter_offsets_to_zero_point(
         total = np.sum(w, axis=0)
     constant = np.zeros(channels, dtype=np.float64)
     fallback_channels: list[int] = []
+    fallback_reasons: list[str | None] = [None] * channels
     any_fallback = False
     for c in range(channels):
         tw = float(total[c])
-        if not np.isfinite(tw) or tw <= 0.0:
+        reason: str | None = None
+        if not np.isfinite(tw):
+            reason = "nonfinite_total_weight"
+        elif tw <= 0.0:
+            reason = "zero_total_weight"
+        if reason is not None:
             # Documented, deterministic fallback: uniform mean over the eligible
-            # Cells (still anchor-independent).
+            # Cells (still anchor-independent). The EXACT cause is recorded per
+            # channel; it is never reported as a different reason.
             fallback_channels.append(c)
+            fallback_reasons[c] = reason
             any_fallback = True
             w[eligible_mask, c] = 1.0
             w[~eligible_mask, c] = 0.0
@@ -660,7 +670,7 @@ def recenter_offsets_to_zero_point(
         weighted_cells=weighted_cells,
         invalid_weight_entries=invalid,
         fallback_channels=tuple(fallback_channels),
-        reason="zero_total_weight" if any_fallback else None,
+        fallback_reasons=tuple(fallback_reasons),
         shifted_cells=tuple(ids[i] for i in shift_rows),
     )
     return out, gauge
