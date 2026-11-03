@@ -2098,3 +2098,243 @@ def test_other_run_staging_beside_valid_current_is_refused(
     win2, warnings2 = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
     assert win2._prepare_zegrid_resume_for_start() is True, warnings2
     assert win2._pending_zegrid_resume["mode"] == "auto"
+
+
+# ---------------------------------------------------------------------------
+# 10. ZM-WINDOWS-PUBLICATION-RESUME-20261103 — empty pre-marker residue
+# ---------------------------------------------------------------------------
+
+
+def _pre_marker_residue(out, run_id, *, generation="gen-1"):
+    """The exact residue of a failed FIRST ``.staging.json`` write."""
+    run_root = zpub.run_publication_root(out, run_id)
+    (run_root / "tmp").mkdir(parents=True)
+    gen = run_root / generation
+    gen.mkdir()
+    return run_root, gen
+
+
+def test_resume_accepts_empty_pre_marker_residue_read_only(tmp_path, monkeypatch):
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    run_root, gen = _pre_marker_residue(out, run_id)
+    assert list(gen.iterdir()) == []
+
+    info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is True, info
+    assert info["generations"] == ["gen-1"]
+    assert info["pre_marker_residue"] == ["gen-1"]
+    assert info["present_members"]["gen-1"] == 0
+    assert "publication" not in info
+    verdict = zpub.verify_finalized(out, store, run_id)
+    assert verdict.published is False and verdict.reason == "no_publication"
+
+    before = _tree_digest(tmp_path)
+    win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    logs: list[str] = []
+    monkeypatch.setattr(
+        win, "_append_log", lambda message, *a, **k: logs.append(str(message))
+    )
+    assert win._prepare_zegrid_resume_for_start() is True, warnings
+    assert warnings == []
+    assert win._pending_zegrid_resume == {
+        "mode": "auto",
+        "run_id": run_id,
+        "store_dir": str(store),
+    }
+    assert any("pre-marker residue" in line for line in logs)
+    assert _tree_digest(tmp_path) == before, "preflight mutated the residue"
+    assert list(gen.iterdir()) == []
+    assert (run_root / "tmp").is_dir()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "file",
+        "subdir",
+        "publication",
+        "marker_symlink",
+        "gen_symlink",
+        "foreign_sibling",
+        "other_run",
+        "current",
+    ],
+)
+def test_pre_marker_residue_negatives_refuse_without_mutation(
+    tmp_path, monkeypatch, kind
+):
+    import os as _os
+
+    store = tmp_path / "store"
+    run_id = _seed_partial(store, "run-partial")
+    out = tmp_path / "out"
+    out.mkdir()
+    run_root, gen = _pre_marker_residue(out, run_id)
+
+    if kind == "file":
+        (gen / "one-byte.bin").write_bytes(b"x")
+    elif kind == "subdir":
+        (gen / "nested").mkdir()
+    elif kind == "publication":
+        (gen / zpub.PUBLICATION_FILENAME).write_text("{}", encoding="utf-8")
+    elif kind == "marker_symlink":
+        real_marker = tmp_path / "elsewhere.staging.json"
+        real_marker.write_text("{}", encoding="utf-8")
+        _os.symlink(real_marker, gen / zpub.STAGING_FILENAME)
+    elif kind == "gen_symlink":
+        elsewhere = tmp_path / "empty-target"
+        elsewhere.mkdir()
+        gen.rmdir()
+        _os.symlink(elsewhere, gen)
+    elif kind == "foreign_sibling":
+        (run_root / "notes.txt").write_text("mine", encoding="utf-8")
+    elif kind == "other_run":
+        (zpub.publication_root(out) / "run-other").mkdir()
+    elif kind == "current":
+        (run_root / zpub.POINTER_FILENAME).write_text("{}", encoding="utf-8")
+
+    info = zpub.inspect_same_run_staging(out, run_id)
+    assert info["ok"] is False, (kind, info)
+    assert info["reason"]
+
+    before = _tree_digest(tmp_path)
+    win, warnings = _resume_win(tmp_path, monkeypatch, store, run_id, out=out)
+    assert win._prepare_zegrid_resume_for_start() is False, kind
+    assert warnings, kind
+    assert win._pending_zegrid_resume is None
+    assert _tree_digest(tmp_path) == before, kind
+    assert gen.is_dir() or gen.is_symlink(), kind
+    if kind not in {"file", "subdir", "publication", "marker_symlink", "current"}:
+        assert list(gen.iterdir()) == [], kind
+
+
+def test_e2e_resume_complete_store_with_empty_pre_marker_residue(
+    tmp_path, monkeypatch
+):
+    """A complete durable store + the exact Windows first-write residue resumes
+    WITHOUT restacking any cell: assembly is replayed from the commits, a NEW
+    generation is published, and ``finalized`` is written only after the
+    publication verifies."""
+    import shutil
+
+    import test_zegrid_resume_m0_baseline_witness as m0
+
+    corpus = tmp_path / "corpus"
+    inp, _names, _hashes = m0._write_corpus(corpus)
+    store = tmp_path / "durable-store"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    win = _window(
+        tmp_path,
+        monkeypatch,
+        {
+            "zegrid_qt_save_checkpoints_enabled": True,
+            "zegrid_durable_store_dir": str(store),
+            "zegrid_durable_store_budget_bytes": 2 * 2 ** 30,
+            "zegrid_layout": "2x2",
+            "zegrid_halo_px": 8,
+            "zegrid_cell_gauge_mode": "per_cell",
+        },
+    )
+    win.config["input_dir"] = str(inp)
+    win.config["output_dir"] = str(out_dir)
+    assert win._prepare_zegrid_resume_for_start() is True
+    _args, worker_kwargs = win._build_worker_invocation(skip_filter_ui=True)
+    worker_kwargs["filter_overrides"] = {"processing_mode": "zegrid"}
+
+    class _NullQueue:
+        def put(self, *_args, **_kwargs):
+            return None
+
+    # --- ONE real complete run (tiny deterministic synthetic corpus) ---------
+    zw.run_hierarchical_mosaic_process(_NullQueue(), **worker_kwargs)
+    run_id = json.loads((store / "run.json").read_text(encoding="utf-8"))["run_id"]
+    state = zres.read_state(store)
+    assert state["finalized"] is True
+    assert len(state["expected_cell_ids"]) == 4
+    assert zpub.resolve_current(str(out_dir), run_id).generation == "gen-1"
+
+    # --- Rewind EXACTLY to the Windows incident: complete commits, no CURRENT,
+    # state not finalized, and a plain EMPTY gen-1 under the exact run root ----
+    zres.write_state(
+        store,
+        run_id=state["run_id"],
+        expected_cell_ids=state["expected_cell_ids"],
+        policy=state["policy"],
+        plan_generation=state["plan_generation"],
+        finalized=False,
+        gauge_sha256=state["gauge_sha256"],
+        outputs={},
+        created_unix_ns=state["created_unix_ns"],
+        note=state["note"],
+        admission=state.get("admission"),
+    )
+    run_root = zpub.run_publication_root(out_dir, run_id)
+    shutil.rmtree(run_root)
+    (run_root / "tmp").mkdir(parents=True)
+    (run_root / "gen-1").mkdir()
+    assert zpub.verify_finalized(out_dir, store, run_id).published is False
+    info = zpub.inspect_same_run_staging(out_dir, run_id)
+    assert info["ok"] is True and info["pre_marker_residue"] == ["gen-1"]
+
+    store_before = _tree_digest(store)
+    finalized_observations: list[str] = []
+    real_write_state = zres.write_state
+
+    def _observing_write_state(*args, **kwargs):
+        if kwargs.get("finalized") is True:
+            # The durable pointer must already resolve (and verify) when the
+            # finalized flag is written.
+            finalized_observations.append(
+                zpub.resolve_current(str(out_dir), run_id).generation
+            )
+        return real_write_state(*args, **kwargs)
+
+    observed_cells: list[str] = []
+    real_stack_cell = zz._stack_cell
+
+    def _observing_stack_cell(task, *args, **kwargs):
+        observed_cells.append(str(task[0].cell_id))
+        return real_stack_cell(task, *args, **kwargs)
+
+    monkeypatch.setattr(zres, "write_state", _observing_write_state)
+    monkeypatch.setattr(zz, "_stack_cell", _observing_stack_cell)
+
+    resume_kwargs = dict(worker_kwargs)
+    resume_kwargs["zegrid_resume_mode"] = "auto"
+    resume_kwargs["zegrid_resume_run_id"] = run_id
+    resume_kwargs["zegrid_durable_store_dir"] = str(store)
+    zw.run_hierarchical_mosaic_process(_NullQueue(), **resume_kwargs)
+
+    # No cell was restacked; only the final steps were replayed.
+    assert observed_cells == [], observed_cells
+
+    # Every store artifact except the mutable state/owner metadata and tmp is
+    # byte-identical (commits, gauge, geometry, memberships): no recomputation
+    # or rewrite.
+    store_after = _tree_digest(store)
+    changed = {
+        name
+        for name in set(store_before) | set(store_after)
+        if store_before.get(name) != store_after.get(name)
+        and name not in {"state.json", "OWNER.json"}
+        and not name.startswith("tmp/")
+    }
+    assert changed == set(), changed
+
+    # The empty pre-marker residue is left intact and a NEW generation is the
+    # one published/verified. Finalized was observed only while CURRENT
+    # resolved/verified.
+    assert (run_root / "gen-1").is_dir()
+    assert list((run_root / "gen-1").iterdir()) == []
+    generation = zpub.resolve_current(str(out_dir), run_id)
+    assert generation.generation == "gen-2"
+    assert generation.verified is True
+    assert finalized_observations == ["gen-2"]
+    final_state = zres.read_state(store)
+    assert final_state["finalized"] is True
+    assert zpub.verify_finalized(out_dir, store, run_id).reason == "verified_finalized"

@@ -1462,3 +1462,105 @@ def test_r2_valid_matching_current_is_still_owned(tmp_path):
     _deliver_root_products(out, gen)
     assert zpub._own_products_sidecars(out) is True
     assert zpub.detect_previous_publication(out)["foreign"] == []
+
+
+# ---------------------------------------------------------------------------
+# 9. ZM-WINDOWS-PUBLICATION-RESUME-20261103 — absent atomic target is not a link
+# ---------------------------------------------------------------------------
+
+
+def test_windows_absent_atomic_target_is_not_a_link(tmp_path, monkeypatch):
+    """Simulated Windows first write: ``lstat`` raises FileNotFoundError."""
+    import stat as _stat
+
+    target = tmp_path / "generation" / zpub.STAGING_FILENAME
+    real_lstat = os.lstat
+
+    def _windows_lstat(path):
+        if str(path) == str(target):
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real_lstat(path)
+
+    monkeypatch.setattr(zpub.os, "lstat", _windows_lstat)
+    assert zpub._is_link(target) is False
+    # And the same target can now be created by the real atomic writer.
+    target.parent.mkdir()
+    zpub._atomic_write(target, b'{"ok": true}', tmp_dir=tmp_path)
+    assert target.read_bytes() == b'{"ok": true}'
+
+
+def test_is_link_fails_closed_on_permission_error(tmp_path, monkeypatch):
+    target = tmp_path / "denied"
+    real_lstat = os.lstat
+
+    def _denied_lstat(path):
+        if str(path) == str(target):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_lstat(path)
+
+    monkeypatch.setattr(zpub.os, "lstat", _denied_lstat)
+    assert zpub._is_link(target) is True
+
+
+def test_is_link_detects_existing_symlink(tmp_path):
+    real = tmp_path / "real.txt"
+    real.write_text("x", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    os.symlink(real, link)
+    assert zpub._is_link(link) is True
+
+
+def test_is_link_detects_simulated_windows_reparse_point(tmp_path, monkeypatch):
+    import stat as _stat
+
+    target = tmp_path / "junction"
+    real_lstat = os.lstat
+
+    def _reparse_lstat(path):
+        if str(path) == str(target):
+            return SimpleNamespace(
+                st_mode=_stat.S_IFREG,
+                st_file_attributes=_stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            )
+        return real_lstat(path)
+
+    monkeypatch.setattr(zpub.os, "lstat", _reparse_lstat)
+    assert zpub._is_link(target) is True
+
+
+def test_first_marker_write_failure_leaves_no_empty_generation(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _failed_marker_write(*_args, **_kwargs):
+        raise OSError(5, "simulated first marker write failure")
+
+    monkeypatch.setattr(zpub, "_atomic_write", _failed_marker_write)
+    with pytest.raises(OSError, match="simulated first marker write failure"):
+        _begin(out)
+    run_root = zpub.run_publication_root(out, RUN_ID)
+    assert run_root.is_dir()
+    assert list(run_root.glob("gen-*")) == []
+    assert (run_root / "tmp").is_dir()
+
+
+def test_begin_creates_staging_on_simulated_windows_absent_target(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    out.mkdir()
+    real_lstat = os.lstat
+    marker_name = zpub.STAGING_FILENAME
+
+    def _windows_lstat(path):
+        text = str(path)
+        if text.endswith(marker_name) and not os.path.exists(text):
+            raise FileNotFoundError(2, "No such file or directory", text)
+        return real_lstat(path)
+
+    monkeypatch.setattr(zpub.os, "lstat", _windows_lstat)
+    pub = _begin(out)
+    marker = pub.generation_dir / marker_name
+    assert marker.is_file()
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["schema"] == zpub.STAGING_SCHEMA
+    assert payload["run_id"] == RUN_ID
+    assert payload["generation"] == pub.generation

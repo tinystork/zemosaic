@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,25 +174,37 @@ def member_filename(name: Any, label: str = "member name") -> str:
     return name
 
 
+def _stat_is_link(st: os.stat_result) -> bool:
+    """True when one ``lstat`` result is a symlink or a Windows reparse point."""
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(
+        getattr(st, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
 def _is_link(path: Path) -> bool:
-    """True for symlinks and (where detectable) Windows junctions."""
+    """True for symlinks and (where detectable) Windows junctions.
+
+    One ``lstat`` decides everything, so the three outcomes stay distinct:
+
+    * the target does not exist (``FileNotFoundError``): NOT a link. This is
+      the ordinary case for the destination of a first atomic write; on
+      Windows ``os.lstat`` raises here (ZM-WINDOWS-PUBLICATION-RESUME-20261103)
+      and treating it as a link refused every new ``.staging.json``.
+    * the target exists and is a symlink or a reparse point (Windows
+      junction): a link, refused.
+    * any other inspection failure (``PermissionError``, ``ENOTDIR``, ...):
+      fail CLOSED as a link, never silently "plain".
+    """
     try:
-        if path.is_symlink():
-            return True
+        st = os.lstat(str(path))
+    except FileNotFoundError:
+        return False
     except OSError:
         return True
-    if os.name == "nt":  # pragma: no cover - Windows NOT_RUN on this host
-        try:
-            import stat as _stat
-
-            st = os.lstat(str(path))
-            if getattr(st, "st_file_attributes", 0) & getattr(
-                _stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
-            ):
-                return True
-        except OSError:
-            return True
-    return False
+    return _stat_is_link(st)
 
 
 def _assert_plain_dir(path: Path, label: str) -> Path:
@@ -937,8 +950,9 @@ def inspect_same_run_staging(
       directories (any other entry is foreign);
     * there is NO ``CURRENT.json`` (a pointer belongs to the committed path and
       is verified by ``resolve_current`` instead);
-    * every ``gen-N`` is a plain directory carrying a schema-valid staging
-      marker for the SAME run/generation with a DEAD owner pid;
+    * every ``gen-N`` is a plain directory that either carries a schema-valid
+      staging marker for the SAME run/generation with a DEAD owner pid, or is
+      a STRICTLY EMPTY pre-marker residue (see below);
     * present members are declared plain files directly inside the generation;
       absent members are allowed for incomplete staging. No extra children are
       allowed except the staging marker and a plain ``publication.json`` record;
@@ -946,14 +960,27 @@ def inspect_same_run_staging(
       never reported as COMPLETE by this ownership check;
     * no symlink/junction is used anywhere on the checked path.
 
-    A marker-less directory, a live owner, a foreign/other-run entry, a path
-    escape or a malformed marker is a refusal with a concrete reason. The engine
-    remains the authority for identity, commits and cleanup after resume.
+    A marker-less directory is ONLY tolerated when it is plain, directly under
+    the run root and STRICTLY empty: that is the exact residue left by an
+    interrupted first ``.staging.json`` write (the Windows
+    ``PublicationPathError`` incident), which can be resumed by publishing a
+    NEW generation. Any byte/file/subdirectory, a ``publication.json``, a
+    link/junction or any other entry keeps the refusal. Such a residue is
+    reported in ``pre_marker_residue`` and is NEVER a publication/COMPLETE.
+
+    A live owner, a foreign/other-run entry, a path escape or a malformed
+    marker is a refusal with a concrete reason. The engine remains the
+    authority for identity, commits and cleanup after resume.
     """
     out = Path(output_dir)
     pub_root, _legacy = discover_publication_root(out)
     run_root = run_publication_root(out, run_id)
-    result: dict = {"ok": False, "reason": None, "generations": []}
+    result: dict = {
+        "ok": False,
+        "reason": None,
+        "generations": [],
+        "pre_marker_residue": [],
+    }
 
     def _refuse(reason: str) -> dict:
         result["ok"] = False
@@ -1007,7 +1034,25 @@ def inspect_same_run_staging(
         for generation in generations:
             gen_dir = run_root / generation
             marker = gen_dir / STAGING_FILENAME
-            if marker.is_file() and not _is_link(marker):
+            # ``marker.is_file()`` alone is ambiguous: a link to a file, or an
+            # unreadable entry, must never be read as "no marker" (that would
+            # widen the empty-residue tolerance). Decide from ONE lstat.
+            try:
+                marker_stat = os.lstat(str(marker))
+            except FileNotFoundError:
+                marker_stat = None
+            except OSError as exc:
+                return _refuse(
+                    f"staging marker of {generation!r} cannot be inspected: {exc}"
+                )
+            if marker_stat is not None:
+                if _stat_is_link(marker_stat) or not stat.S_ISREG(
+                    marker_stat.st_mode
+                ):
+                    return _refuse(
+                        f"staging marker of {generation!r} is not a plain file"
+                    )
+            if marker_stat is not None and stat.S_ISREG(marker_stat.st_mode):
                 try:
                     payload, _raw = _read_json_bytes(marker, "staging marker")
                 except PublicationError as exc:
@@ -1104,7 +1149,7 @@ def inspect_same_run_staging(
                 )
                 continue
 
-            # No staging marker: a complete-looking record without a pointer is
+            # No staging marker. A complete-looking record without a pointer is
             # NOT provably OURS. Refuse conservatively and preserve it; never
             # delete a publication record to force a resume.
             if (gen_dir / PUBLICATION_FILENAME).is_file():
@@ -1113,10 +1158,26 @@ def inspect_same_run_staging(
                     "staging marker; ownership is not provable, so it is left "
                     "untouched and not resumed"
                 )
-            return _refuse(
-                f"generation {generation!r} has no staging marker; ownership is "
-                "not provable"
-            )
+            # ZM-WINDOWS-PUBLICATION-RESUME-20261103: an interrupted FIRST
+            # atomic write leaves a plain, STRICTLY EMPTY generation directory
+            # before any ``.staging.json`` exists. That exact residue is safe
+            # to resume: it is never treated as a publication, nothing is
+            # deleted or modified here, and the engine will publish a NEW
+            # generation. Everything else stays a refusal.
+            try:
+                children = sorted(gen_dir.iterdir(), key=lambda p: p.name)
+            except OSError as exc:
+                return _refuse(
+                    f"generation {generation!r} cannot be inspected: {exc}"
+                )
+            if children:
+                return _refuse(
+                    f"generation {generation!r} has no staging marker and is "
+                    "not empty; ownership is not provable"
+                )
+            result["pre_marker_residue"].append(generation)
+            result.setdefault("present_members", {})[generation] = 0
+            continue
 
         result["ok"] = True
         result["generations"] = generations
@@ -1420,11 +1481,24 @@ class PublicationSession:
             "members": sorted(normalised.values()),
             "note": "uncommitted staging; never authoritative until CURRENT.json",
         }
-        _atomic_write(
-            gen_dir / STAGING_FILENAME,
-            _canonical_json_bytes(marker),
-            tmp_dir=tmp_dir,
-        )
+        try:
+            _atomic_write(
+                gen_dir / STAGING_FILENAME,
+                _canonical_json_bytes(marker),
+                tmp_dir=tmp_dir,
+            )
+        except BaseException:
+            # ZM-WINDOWS-PUBLICATION-RESUME-20261103 A2: if the very first
+            # marker write fails, do not leave an empty generation behind that
+            # a later launch would have to classify. ``rmdir`` only removes an
+            # EMPTY plain directory, so any partially written/foreign content
+            # and any link is preserved (fail-closed) and the error re-raises.
+            try:
+                if not _is_link(gen_dir) and not any(gen_dir.iterdir()):
+                    gen_dir.rmdir()
+            except OSError:
+                pass
+            raise
         return cls(
             run_id=run_id,
             run_root=run_root,

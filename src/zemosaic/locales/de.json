@@ -1033,6 +1033,7 @@
     "qt_zegrid_store_unsafe": "Prüfpunkt-Speicher abgelehnt: {reason}. Es wurde nichts erstellt.",
     "qt_zegrid_checkpoint_store_symlink": "Der Pfad des Prüfpunkt-Speichers ist ein Symlink; der Motor lehnt einen symlinkten Speicher ab. Wählen Sie einen echten Ordner.",
     "qt_zegrid_resume_staging_recovery": "Gleichnamige Absturz-Staging-Generation gefunden (kein CURRENT.json): Fortsetzen. Der Motor prüft Identität/Commits und veröffentlicht; gestagte Bytes gelten nicht als vollständig.",
+    "qt_zegrid_resume_pre_marker_residue": "Leerer Pre-Marker-Rest desselben Laufs gefunden ({generations}, kein CURRENT.json): Fortsetzen. Er gilt nie als vollständige Veröffentlichung; nichts wird gelöscht oder verändert, und der Motor veröffentlicht eine NEUE Generation.",
     "qt_zegrid_resume_staging_refused": "Für den gewählten Lauf existiert keine verifizierte Veröffentlichung, und das gleichnamige Staging ist nicht sicher nachweisbar ({reason}). Es wurde nichts verändert.",
     "qt_zegrid_resume_publication_ownership": "Der Veröffentlichungsordner enthält Inhalte, die nicht zum gewählten Lauf gehören ({reason}). Wählen Sie einen anderen Ausgabeordner; es wurde nichts verändert."
 }

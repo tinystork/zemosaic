@@ -1033,6 +1033,7 @@
   "qt_zegrid_store_unsafe": "Stockage de points de reprise refusé : {reason}. Rien n’a été créé.",
   "qt_zegrid_checkpoint_store_symlink": "Le chemin du stockage est un lien symbolique ; le moteur refuse une racine de stockage liée. Choisissez un dossier réel.",
   "qt_zegrid_resume_staging_recovery": "Staging de plantage du même run détecté (sans CURRENT.json) : reprise. Le moteur vérifie l’identité/les commits et publie ; les octets préparés ne sont pas considérés comme complets.",
+  "qt_zegrid_resume_pre_marker_residue": "Résidu pré-marker vide du même run détecté ({generations}, sans CURRENT.json) : reprise. Il n’est jamais considéré comme une publication complète ; rien n’est supprimé ni modifié, et le moteur publie une NOUVELLE génération.",
   "qt_zegrid_resume_staging_refused": "Aucune publication vérifiée n’existe pour le run sélectionné, et le staging du même run ne peut pas être prouvé sûr ({reason}). Rien n’a été modifié.",
   "qt_zegrid_resume_publication_ownership": "La racine des publications contient du contenu qui n’appartient pas au run sélectionné ({reason}). Choisissez un autre dossier de sortie ; rien n’a été modifié."
 }

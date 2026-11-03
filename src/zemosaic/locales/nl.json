@@ -1033,6 +1033,7 @@
     "qt_zegrid_store_unsafe": "Controlepuntopslag geweigerd: {reason}. Er is niets aangemaakt.",
     "qt_zegrid_checkpoint_store_symlink": "Het pad van de opslag is een symbolische koppeling; de engine weigert een gekoppelde opslagroot. Kies een echte map.",
     "qt_zegrid_resume_staging_recovery": "Staging van een crash van dezelfde run gevonden (geen CURRENT.json): hervatten. De engine verifieert identiteit/commits en publiceert; gestagede bytes gelden niet als compleet.",
+    "qt_zegrid_resume_pre_marker_residue": "Leeg pre-marker-residu van dezelfde run gevonden ({generations}, geen CURRENT.json): hervatten. Het geldt nooit als volledige publicatie; er wordt niets verwijderd of gewijzigd en de engine publiceert een NIEUWE generatie.",
     "qt_zegrid_resume_staging_refused": "Er bestaat geen geverifieerde publicatie voor de geselecteerde run en de staging van dezelfde run is niet aantoonbaar veilig ({reason}). Er is niets gewijzigd.",
     "qt_zegrid_resume_publication_ownership": "De publicatieroot bevat inhoud die niet bij de geselecteerde run hoort ({reason}). Kies een andere uitvoermap; er is niets gewijzigd."
 }

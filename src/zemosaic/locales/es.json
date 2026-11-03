@@ -1033,6 +1033,7 @@
     "qt_zegrid_store_unsafe": "Almacén de puntos de control rechazado: {reason}. No se creó nada.",
     "qt_zegrid_checkpoint_store_symlink": "La ruta del almacén es un enlace simbólico; el motor rechaza una raíz de almacén con enlace simbólico. Elija una carpeta real.",
     "qt_zegrid_resume_staging_recovery": "Se encontró un staging de bloqueo del mismo run (sin CURRENT.json): reanudando. El motor verifica identidad/commits y publica; los bytes preparados no se consideran completos.",
+    "qt_zegrid_resume_pre_marker_residue": "Se encontró un residuo pre-marcador vacío del mismo run ({generations}, sin CURRENT.json): reanudando. Nunca se considera una publicación completa; no se elimina ni modifica nada, y el motor publica una NUEVA generación.",
     "qt_zegrid_resume_staging_refused": "No existe una publicación verificada para el run seleccionado y el staging del mismo run no puede probarse seguro ({reason}). No se modificó nada.",
     "qt_zegrid_resume_publication_ownership": "La raíz de publicaciones contiene contenido que no pertenece al run seleccionado ({reason}). Elija otra carpeta de salida; no se modificó nada."
 }

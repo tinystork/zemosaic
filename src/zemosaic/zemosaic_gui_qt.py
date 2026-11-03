@@ -3711,6 +3711,27 @@ class ZeMosaicQtMainWindow(QMainWindow):
             # identity/commits and publishes.
             staging = zpublication.inspect_same_run_staging(out_path, str(run_id))
             if staging.get("ok"):
+                residue = [
+                    str(name) for name in staging.get("pre_marker_residue") or []
+                ]
+                if residue:
+                    # ZM-WINDOWS-PUBLICATION-RESUME-20261103: a plain, strictly
+                    # EMPTY generation before its first marker is resumable
+                    # residue, never a publication. Nothing is deleted and the
+                    # engine publishes a NEW generation after verifying the
+                    # commits.
+                    self._append_log(
+                        self._tr(
+                            "qt_zegrid_resume_pre_marker_residue",
+                            "Same-run empty pre-marker residue found "
+                            "({generations}, no CURRENT.json): resuming. It is "
+                            "never treated as a complete publication; nothing "
+                            "is deleted or modified, and the engine publishes "
+                            "a NEW generation.",
+                        ).format(generations=", ".join(residue)),
+                        level="info",
+                    )
+                    return True, None
                 self._append_log(
                     self._tr(
                         "qt_zegrid_resume_staging_recovery",

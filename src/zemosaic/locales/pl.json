@@ -1033,6 +1033,7 @@
     "qt_zegrid_store_unsafe": "Magazyn punktów wznowienia odrzucony: {reason}. Nic nie utworzono.",
     "qt_zegrid_checkpoint_store_symlink": "Ścieżka magazynu jest dowiązaniem symbolicznym; silnik odrzuca taki katalog główny. Wybierz rzeczywisty folder.",
     "qt_zegrid_resume_staging_recovery": "Znaleziono staging awarii tego samego uruchomienia (brak CURRENT.json): wznawianie. Silnik weryfikuje tożsamość/commity i publikuje; przygotowane bajty nie są uznawane za kompletne.",
+    "qt_zegrid_resume_pre_marker_residue": "Znaleziono pusty resztkowy katalog pre-marker tego samego uruchomienia ({generations}, brak CURRENT.json): wznawianie. Nigdy nie jest uznawany za kompletną publikację; nic nie jest usuwane ani zmieniane, a silnik publikuje NOWĄ generację.",
     "qt_zegrid_resume_staging_refused": "Dla wybranego uruchomienia nie ma zweryfikowanej publikacji, a staging tego samego uruchomienia nie może być uznany za bezpieczny ({reason}). Nic nie zmieniono.",
     "qt_zegrid_resume_publication_ownership": "Katalog publikacji zawiera treści nienależące do wybranego uruchomienia ({reason}). Wybierz inny folder wyjściowy; nic nie zmieniono."
 }
