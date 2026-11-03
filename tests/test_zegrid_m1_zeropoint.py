@@ -112,6 +112,21 @@ def _assemble(canvas, nx, ny, patches, graph):
     return zcf.assemble_canvas_feathered(canvas, nx, ny, patches, _offsets(graph))
 
 
+def _results(patches):
+    """Wrap CellPatches as per-cell worker results (wired path)."""
+    return {
+        cid: {
+            "cell_id": cid, "status": "complete",
+            "patch": {
+                "bounds": cp.bounds, "core_slice": cp.core_slice,
+                "science": cp.science, "valid_mask": cp.valid_mask,
+                "surviving": None,
+            },
+        }
+        for cid, cp in patches.items()
+    }
+
+
 def _pairwise(offsets):
     ids = sorted(offsets)
     return {
@@ -459,7 +474,7 @@ def test_cell_core_support_broadcast_parity_and_nonfinite():
         weights[name] = zcf.cell_core_support(patches, ["c"], 3)[0]
     expected = _plain_support(sci3, valid3, core, 3)
     for name, got in weights.items():
-        np.testing.assert_array_equal(got, expected), name
+        np.testing.assert_array_equal(got, expected, err_msg=str(name))
     # NaN/Inf and invalid pixels are excluded, not fabricated.
     assert expected[0] == h * w - 3
     # Inputs untouched.
@@ -507,6 +522,67 @@ def test_cell_core_support_rejects_incoherent_shapes():
                                 good, val)}, ["c"], 3)
 
 
+def test_cell_core_support_mono_science_uses_each_mask_channel():
+    """F3 exact repro: 2-D science + divergent RGB mask -> [16, 0, 8]."""
+    sci = np.ones((4, 4), np.float32)
+    val = np.zeros((4, 4, 3), dtype=bool)
+    val[:, :, 0] = True       # 16 valid
+    val[0:2, :, 2] = True     # 8 valid
+    patches = {"c": zcf.CellPatch("c", (0, 4, 0, 4), (0, 4, 0, 4), sci, val)}
+    got = zcf.cell_core_support(patches, ["c"], 3)
+    np.testing.assert_array_equal(got, [[16.0, 0.0, 8.0]])
+
+
+def test_cell_core_support_exhaustive_science_mask_matrix():
+    """3x3 matrix: science {2-D, 1-ch, C} x mask {2-D, 1-ch, C}.
+
+    Divergent RGB masks + per-channel NaN/Inf + non-contiguous views; every
+    combination must match the independent per-channel reference.
+    """
+    h = w = 6
+    base_sci = np.ones((h, 2 * w, 3), np.float32)
+    base_sci[0, 0, 0] = np.nan        # ch0 lost
+    base_sci[1, 2, 1] = np.inf        # ch1 lost (mask is already all-False)
+    base_sci[2, 4, 2] = -np.inf       # ch2 lost
+    base_val = np.ones((h, 2 * w, 3), dtype=bool)
+    base_val[:, :, 1] = False         # ch1 fully invalid
+    base_val[3, 2, 2] = False         # ch2 extra loss
+    base_val[4, 6, 0] = False         # ch0 extra loss
+    base_val[5, 8, 2] = False         # ch2 extra loss (diverges from ch0)
+
+    sci3 = base_sci[:, 0::2, :]       # non-contiguous views
+    val3 = base_val[:, 0::2, :]
+    sci1 = sci3[:, :, 0:1]
+    val1 = val3[:, :, 0:1]
+    sci2 = sci3[:, :, 0]
+    val2 = val3[:, :, 0]
+    assert not sci3.flags["C_CONTIGUOUS"] and not val3.flags["C_CONTIGUOUS"]
+
+    core = (0, h, 0, w)
+    sciences = {"2d": sci2, "1ch": sci1, "3ch": sci3}
+    masks = {"2d": val2, "1ch": val1, "3ch": val3}
+    seen = {}
+    for sname, s in sciences.items():
+        for vname, v in masks.items():
+            patches = {"c": zcf.CellPatch("c", (0, h, 0, w), core, s, v)}
+            got = zcf.cell_core_support(patches, ["c"], 3)[0]
+            expected = _plain_support(s, v, core, 3)
+            np.testing.assert_array_equal(
+                got, expected, err_msg=f"{sname}/{vname}"
+            )
+            seen[(sname, vname)] = tuple(got)
+    # A 2-D / 1-channel mask is logically broadcast: all channels agree.
+    for sname in sciences:
+        for vname in ("2d", "1ch"):
+            row = seen[(sname, vname)]
+            assert row[0] == row[1] == row[2], (sname, vname, row)
+    # A 3-channel mask is honored per channel: ch1 is empty, ch0 != ch2.
+    for sname in sciences:
+        row = seen[(sname, "3ch")]
+        assert row[1] == 0.0, (sname, row)
+        assert row[0] != row[2], (sname, row)
+
+
 # ---------------------------------------------------------------------------
 # Disconnected graph: pinned Cells are neither weighed nor shifted
 # ---------------------------------------------------------------------------
@@ -521,6 +597,123 @@ def test_disconnected_zero_policy_keeps_pinned_cell_at_zero():
     assert graph.disconnected == ("r0000c0002",)
     idx = graph.cell_ids.index("r0000c0002")
     assert graph.offsets[idx, 0] == 0.0
+
+
+def _two_component_patches():
+    """2x3 grid minus its middle column -> two vertical 2-Cell components."""
+    levels = {
+        "r0000c0000": 10.0, "r0000c0001": 20.0, "r0000c0002": 100.0,
+        "r0001c0000": 14.0, "r0001c0001": 24.0, "r0001c0002": 200.0,
+    }
+    canvas, patches = _make_patches(3, 2, levels, core=16)
+    del patches["r0000c0001"]
+    del patches["r0001c0001"]
+    return canvas, patches
+
+
+def test_disconnected_provenance_is_component_scoped_and_honest():
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    canvas, patches = _two_component_patches()
+    g_left = zcf.build_cell_offset_graph(
+        canvas, 3, 2, patches, anchor="r0000c0000", on_disconnected="zero"
+    )
+    g_right = zcf.build_cell_offset_graph(
+        canvas, 3, 2, patches, anchor="r0000c0002", on_disconnected="zero"
+    )
+    assert g_left.disconnected and g_right.disconnected
+    assert (not bool(g_left.disconnected)) is False
+    assert zz._anchor_invariant_scope(g_left.disconnected) == (
+        zz.ANCHOR_INVARIANT_SCOPE_COMPONENT
+    )
+    # Inter-component anchor change really changes the science: the global
+    # invariant claim would be a lie, and must not be published.
+    a_left = _assemble(canvas, 3, 2, patches, g_left)
+    a_right = _assemble(canvas, 3, 2, patches, g_right)
+    assert not np.allclose(
+        a_left.science, a_right.science, rtol=0.0, atol=1.0, equal_nan=True
+    )
+
+    _, info = zz._assemble_per_cell_feathered(
+        canvas, 3, 2, _results(patches), halo_px=HALO
+    )
+    zp = info["zeropoint"]
+    assert zp["anchor_invariant"] is False
+    assert zp["anchor_invariant_scope"] == zz.ANCHOR_INVARIANT_SCOPE_COMPONENT
+    block = zz._cell_feather_manifest_block(info)
+    assert block["zeropoint"]["anchor_invariant"] is False
+    assert block["zeropoint"]["anchor_invariant_scope"] == (
+        zz.ANCHOR_INVARIANT_SCOPE_COMPONENT
+    )
+    assert "anchor_connected_component_only" in block["note"]
+    assert "whole graph" not in block["note"]
+    # Strict JSON + deterministic.
+    text = json.dumps(block, sort_keys=True, allow_nan=False)
+    again = zz._cell_feather_manifest_block(info)
+    assert json.dumps(again, sort_keys=True, allow_nan=False) == text
+
+
+def test_connected_provenance_claims_whole_graph():
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    canvas, patches = _make_patches(2, 2, LEVELS_2X2)
+    _, info = zz._assemble_per_cell_feathered(
+        canvas, 2, 2, _results(patches), halo_px=HALO
+    )
+    zp = info["zeropoint"]
+    assert zp["anchor_invariant"] is True
+    assert zp["anchor_invariant_scope"] == zz.ANCHOR_INVARIANT_SCOPE_WHOLE
+    block = zz._cell_feather_manifest_block(info)
+    assert block["zeropoint"]["anchor_invariant_scope"] == "whole_graph"
+    assert "whole_graph" in block["note"]
+    assert "component" not in block["note"]
+    json.dumps(block, allow_nan=False)
+
+
+def test_manifest_block_validates_channel_diagnostics_and_scope():
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    def _info(channels=3, reasons=(None, None, None), fb_channels=(),
+              invariant=True, scope="whole_graph"):
+        return {
+            "anchor": "r0000c0000", "channels": channels, "halo_px": 8,
+            "edges_used": 0, "edges_built": 0,
+            "weighted_residual_rms": [0.0] * channels,
+            "disconnected": [], "policy": "zero",
+            "offsets": {"r0000c0000": [0.0] * channels},
+            "zeropoint": {
+                "policy": zco.ZEROPOINT_POLICY_WEIGHTED,
+                "status": zco.ZEROPOINT_STATUS_APPLIED,
+                "constant": [0.0] * channels,
+                "total_weight": [1.0] * channels,
+                "weighted_cells": [1] * channels,
+                "invalid_weight_entries": 0,
+                "fallback_channels": list(fb_channels),
+                "fallback_reasons": list(reasons),
+                "anchor_invariant": invariant,
+                "anchor_invariant_scope": scope,
+                "weights": "core_valid_finite_support_per_cell_per_channel",
+            },
+        }
+
+    zz._cell_feather_manifest_block(_info())  # valid
+    with pytest.raises(ValueError):
+        zz._cell_feather_manifest_block(
+            _info(channels=3, reasons=(None, None))
+        )
+    with pytest.raises(ValueError):
+        zz._cell_feather_manifest_block(
+            _info(channels=3, reasons=(None, None, None), fb_channels=(0,))
+        )
+    with pytest.raises(ValueError):
+        zz._cell_feather_manifest_block(
+            _info(channels=3, reasons=("zero_total_weight", None, None),
+                  fb_channels=(0, 1))
+        )
+    with pytest.raises(ValueError):
+        zz._cell_feather_manifest_block(
+            _info(channels=1, reasons=(None,), invariant=False, scope="whole_graph")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +747,8 @@ def test_wired_info_exposes_effective_offsets_and_strict_manifest_block():
     assert zp["invalid_weight_entries"] == 0
     assert zp["fallback_channels"] == []
     assert zp["fallback_reasons"] == [None, None, None]
+    assert zp["anchor_invariant"] is True
+    assert zp["anchor_invariant_scope"] == zz.ANCHOR_INVARIANT_SCOPE_WHOLE
     assert zp["weights"] == "core_valid_finite_support_per_cell_per_channel"
 
     block = zz._cell_feather_manifest_block(info_a)

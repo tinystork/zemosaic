@@ -331,13 +331,24 @@ def cell_core_support(
                 f"{val.shape[:2]} disagree"
             )
         if n_sci_ch == 1:
-            # Logical broadcast: one count for every target channel.
-            count = _count_support_tiled(
-                sci, val, cp.core_slice,
-                None if sci.ndim == 2 else 0,
-                None if val.ndim == 2 else 0,
-            )
-            out[i, :] = count
+            if n_val_ch == 1:
+                # Both planes are channel-invariant: one count, logical broadcast.
+                count = _count_support_tiled(
+                    sci, val, cp.core_slice,
+                    None if sci.ndim == 2 else 0,
+                    None if val.ndim == 2 else 0,
+                )
+                out[i, :] = count
+            else:
+                # Mono/1-channel science but a PER-CHANNEL valid mask: the mask
+                # channels genuinely differ, so each target channel is counted
+                # with its own mask channel (science channel 0 is reused).
+                for ch in range(c):
+                    out[i, ch] = _count_support_tiled(
+                        sci, val, cp.core_slice,
+                        None if sci.ndim == 2 else 0,
+                        ch,
+                    )
             continue
         for ch in range(c):
             out[i, ch] = _count_support_tiled(

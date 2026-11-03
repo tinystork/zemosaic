@@ -3557,6 +3557,25 @@ def _validate_r37_diagnostic_capture(capture, holdout_cap):
     return capture, cap
 
 
+#: Provenance claim for the anchor-invariance of the zero-point gauge.
+ANCHOR_INVARIANT_SCOPE_WHOLE = "whole_graph"
+ANCHOR_INVARIANT_SCOPE_COMPONENT = "anchor_connected_component_only"
+
+
+def _anchor_invariant_scope(disconnected) -> str:
+    """Exact scope of the anchor-invariance claim for this offset graph.
+
+    A connected graph (no policy-pinned Cell) is invariant to the anchor over
+    the WHOLE graph. With ``on_disconnected="zero"`` the anchor selects which
+    component is solved, so the claim is limited to that component; it must
+    never be published as a global claim.
+    """
+    return (
+        ANCHOR_INVARIANT_SCOPE_COMPONENT if disconnected
+        else ANCHOR_INVARIANT_SCOPE_WHOLE
+    )
+
+
 def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None, emit=None,
                                  capture=False, holdout_cap=None, output_dir=None,
                                  capture_identity=None,
@@ -3766,7 +3785,9 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
                 f"cells={len(graph.cell_ids)} channels={graph.channels} "
                 f"resid_rms={[round(float(x), 6) for x in graph.weighted_residual_rms]} "
                 f"zeropoint={graph.zeropoint_status}/{graph.zeropoint_policy} "
-                f"constant={[round(float(x), 6) for x in graph.zeropoint_constant]}",
+                f"constant={[round(float(x), 6) for x in graph.zeropoint_constant]} "
+                f"anchor_invariant={not bool(graph.disconnected)} "
+                f"scope={_anchor_invariant_scope(graph.disconnected)}",
                 "INFO",
             )
         except Exception:
@@ -3796,7 +3817,8 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
                 None if r is None else str(r)
                 for r in graph.zeropoint_fallback_reasons
             ],
-            "anchor_invariant": True,
+            "anchor_invariant": not bool(graph.disconnected),
+            "anchor_invariant_scope": _anchor_invariant_scope(graph.disconnected),
             "weights": "core_valid_finite_support_per_cell_per_channel",
         },
         "halo_px": halo_px,
@@ -17043,10 +17065,10 @@ def _cell_feather_manifest_block(cell_feather_info):
 
     ``offsets`` are the offsets EFFECTIVELY applied to the science (already
     recentered by the anchor-independent zero-point gauge). The ``zeropoint``
-    sub-block records the gauge policy/constant/weights/status so a reader can
-    reproduce and audit the additive zero point. The block is validated with
-    ``allow_nan=False``: a non-finite value is a hard error (never published as
-    non-standard JSON).
+    sub-block records the gauge policy/constant/weights/status and the EXACT
+    scope of the anchor-invariance claim. The block is validated with
+    ``allow_nan=False``: a non-finite value or an incoherent diagnostic is a hard
+    error (never published as non-standard/lying JSON).
     """
     if cell_feather_info is None:
         return {"enabled": False}
@@ -17061,18 +17083,60 @@ def _cell_feather_manifest_block(cell_feather_info):
         "disconnected_cells": cell_feather_info.get("disconnected"),
         "disconnected_policy": cell_feather_info.get("policy"),
         "offsets": cell_feather_info.get("offsets"),
-        "note": (
-            "ADDITIVE-ONLY per-channel offsets (one scalar per Cell). The anchor "
-            "Cell is PROVENANCE ONLY: the additive zero point is fixed by a "
-            "deterministic per-channel support-weighted mean gauge that is "
-            "invariant to the anchor choice (constant recorded under 'zeropoint'). "
-            "Disconnected Cells keep offset 0 (recorded, no re-anchor, no bridge). "
-            "Science is weighted-feather blended (weights sum to 1); no "
-            "gain/plane."
-        ),
     }
     zp = cell_feather_info.get("zeropoint")
+    anchor_invariant = True
+    scope = ANCHOR_INVARIANT_SCOPE_WHOLE
     if zp is not None:
+        fallback_reasons = [
+            None if r is None else str(r)
+            for r in zp.get("fallback_reasons", ())
+        ]
+        fallback_channels = [int(c) for c in zp.get("fallback_channels", ())]
+        channels = block["channels"]
+        if channels is not None:
+            channels = int(channels)
+            if channels < 1:
+                raise ValueError(f"cell_feather channels must be >= 1, got {channels}")
+            if len(fallback_reasons) != channels:
+                raise ValueError(
+                    "cell_feather zeropoint fallback_reasons length "
+                    f"{len(fallback_reasons)} != channels {channels}"
+                )
+            if len(set(fallback_channels)) != len(fallback_channels):
+                raise ValueError(
+                    "cell_feather zeropoint fallback_channels contains duplicates"
+                )
+            if any(c < 0 or c >= channels for c in fallback_channels):
+                raise ValueError(
+                    "cell_feather zeropoint fallback_channels out of range"
+                )
+            reason_channels = {
+                c for c, reason in enumerate(fallback_reasons) if reason is not None
+            }
+            if set(fallback_channels) != reason_channels:
+                raise ValueError(
+                    "cell_feather zeropoint fallback_channels and "
+                    "fallback_reasons disagree"
+                )
+        anchor_invariant = bool(zp.get("anchor_invariant", True))
+        scope = str(
+            zp.get(
+                "anchor_invariant_scope",
+                ANCHOR_INVARIANT_SCOPE_WHOLE if anchor_invariant
+                else ANCHOR_INVARIANT_SCOPE_COMPONENT,
+            )
+        )
+        if anchor_invariant and scope != ANCHOR_INVARIANT_SCOPE_WHOLE:
+            raise ValueError(
+                "cell_feather zeropoint anchor_invariant=True requires scope "
+                f"{ANCHOR_INVARIANT_SCOPE_WHOLE!r}, got {scope!r}"
+            )
+        if (not anchor_invariant) and scope != ANCHOR_INVARIANT_SCOPE_COMPONENT:
+            raise ValueError(
+                "cell_feather zeropoint anchor_invariant=False requires scope "
+                f"{ANCHOR_INVARIANT_SCOPE_COMPONENT!r}, got {scope!r}"
+            )
         block["zeropoint"] = {
             "policy": str(zp["policy"]),
             "status": str(zp["status"]),
@@ -17080,16 +17144,36 @@ def _cell_feather_manifest_block(cell_feather_info):
             "total_weight": [float(v) for v in zp["total_weight"]],
             "weighted_cells": [int(v) for v in zp["weighted_cells"]],
             "invalid_weight_entries": int(zp.get("invalid_weight_entries", 0)),
-            "fallback_channels": [int(c) for c in zp.get("fallback_channels", ())],
-            "fallback_reasons": [
-                None if r is None else str(r)
-                for r in zp.get("fallback_reasons", ())
-            ],
-            "anchor_invariant": bool(zp.get("anchor_invariant", True)),
+            "fallback_channels": fallback_channels,
+            "fallback_reasons": fallback_reasons,
+            "anchor_invariant": anchor_invariant,
+            "anchor_invariant_scope": scope,
             "weights": str(
                 zp.get("weights", "core_valid_finite_support_per_cell_per_channel")
             ),
         }
+    if anchor_invariant:
+        note = (
+            "ADDITIVE-ONLY per-channel offsets (one scalar per Cell). The anchor "
+            "Cell is PROVENANCE ONLY: the additive zero point is fixed by a "
+            "deterministic per-channel support-weighted mean gauge that is "
+            "invariant to the anchor choice over the WHOLE graph "
+            "(anchor_invariant_scope='whole_graph'; constant recorded under "
+            "'zeropoint'). Science is weighted-feather blended (weights sum to "
+            "1); no gain/plane."
+        )
+    else:
+        note = (
+            "ADDITIVE-ONLY per-channel offsets (one scalar per Cell). The anchor "
+            "Cell is PROVENANCE ONLY: the additive zero point is fixed by a "
+            "deterministic per-channel support-weighted mean gauge that is "
+            "invariant to the anchor choice ONLY WITHIN the anchor-connected "
+            "component (anchor_invariant_scope='anchor_connected_component_only'); "
+            "disconnected Cells keep offset 0 by policy, so changing the anchor "
+            "to another component changes which component is solved. Science is "
+            "weighted-feather blended (weights sum to 1); no gain/plane."
+        )
+    block["note"] = note
     # ZM-ZEGRID-R37-D: compact diagnostic-capture metadata, present ONLY when
     # the explicit capture opt-in ran (disabled runs keep the previous shape).
     if cell_feather_info.get("r37_diagnostic_capture") is not None:
