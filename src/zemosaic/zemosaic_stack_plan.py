@@ -135,6 +135,11 @@ def classify_setup_failure(exc: BaseException) -> str:
     return WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL
 
 
+def is_resource_or_cancelled(exc: BaseException) -> bool:
+    """True when ``exc`` must never be converted into a sentinel/source reject."""
+    return classify_setup_failure(exc) == WCS_FAILURE_RESOURCE_OR_CANCELLED
+
+
 def _emit(msg: str, *, lvl: str = "INFO", callback: ProgressCallback = None, **kwargs) -> None:
     """Emit a `[GRID]` log and mirror it to the worker progress callback."""
 
@@ -391,12 +396,16 @@ def _extract_pixel_scale_deg(wcs_obj: object) -> float | None:
         scales = proj_plane_pixel_scales(wcs_obj)  # type: ignore[arg-type]
         vals = [abs(s.to_value(u.deg)) for s in scales]
         return float(np.mean(vals))
-    except Exception:
+    except Exception as exc:
+        if is_resource_or_cancelled(exc):
+            raise
         try:
             cdelt = np.asarray(getattr(wcs_obj, "wcs", None).cdelt, dtype=float)
             if cdelt.size >= 2:
                 return float(np.mean(np.abs(cdelt)))
-        except Exception:
+        except Exception as fallback_exc:
+            if is_resource_or_cancelled(fallback_exc):
+                raise
             return None
     return None
 
@@ -408,7 +417,9 @@ def _header_int(header, key: str) -> int | None:
         if value is None:
             return None
         return int(value)
-    except Exception:
+    except Exception as exc:
+        if is_resource_or_cancelled(exc):
+            raise
         return None
 
 
@@ -463,7 +474,9 @@ def _admit_rgb_chw_cube(header, shape) -> tuple[bool, str | None, tuple[int, int
         return False, None, None
     try:
         shape = tuple(int(n) for n in shape)
-    except Exception:
+    except Exception as exc:
+        if is_resource_or_cancelled(exc):
+            raise
         return False, "unreadable primary shape (cannot verify CHW layout)", None
     if len(shape) == 2:
         return False, None, None

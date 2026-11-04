@@ -473,6 +473,127 @@ def test_payload_boundary_ignores_cancelled_error(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# R4: no active WCS helper may absorb MemoryError/cancellation
+# ---------------------------------------------------------------------------
+
+
+def test_extract_pixel_scale_primary_memory_error_propagates(monkeypatch):
+    def _oom(_wcs):
+        raise MemoryError("primary pixel-scale OOM")
+
+    monkeypatch.setattr(zsp, "proj_plane_pixel_scales", _oom)
+    with pytest.raises(MemoryError, match="primary pixel-scale OOM"):
+        zsp._extract_pixel_scale_deg(object())
+
+
+def test_extract_pixel_scale_fallback_memory_error_propagates(monkeypatch):
+    class _CdeltOOM:
+        @property
+        def cdelt(self):
+            raise MemoryError("fallback cdelt OOM")
+
+    class _WcsWithCdelt:
+        wcs = _CdeltOOM()
+
+    def _primary_fails(_wcs):
+        raise ValueError("primary scale unavailable")
+
+    monkeypatch.setattr(zsp, "proj_plane_pixel_scales", _primary_fails)
+    with pytest.raises(MemoryError, match="fallback cdelt OOM"):
+        zsp._extract_pixel_scale_deg(_WcsWithCdelt())
+
+
+def test_header_int_memory_error_propagates():
+    class _HeaderOOM:
+        def get(self, _key):
+            raise MemoryError("header OOM")
+
+    with pytest.raises(MemoryError, match="header OOM"):
+        zsp._header_int(_HeaderOOM(), "NAXIS")
+
+
+def test_active_helper_cancellation_propagates():
+    import concurrent.futures
+
+    class _HeaderCancelled:
+        def get(self, _key):
+            raise concurrent.futures.CancelledError("header cancelled")
+
+    with pytest.raises(concurrent.futures.CancelledError):
+        zsp._header_int(_HeaderCancelled(), "NAXIS")
+    with pytest.raises(concurrent.futures.CancelledError):
+        zsp._admit_rgb_chw_cube(_HeaderCancelled(), (3, 10, 10))
+
+
+def test_mount_header_memory_error_propagates():
+    class _HeaderOOM:
+        def get(self, _key):
+            raise MemoryError("mount header OOM")
+
+    with pytest.raises(MemoryError, match="mount header OOM"):
+        zin.mount_from_header(_HeaderOOM())
+
+
+def test_mount_normalize_memory_error_propagates():
+    class _BadStr:
+        def __str__(self):
+            raise MemoryError("mount normalization OOM")
+
+    with pytest.raises(MemoryError, match="mount normalization OOM"):
+        zin.normalize_mount(_BadStr())
+
+
+def _write_minimal_tan_fits(path: Path) -> Path:
+    from astropy.io import fits
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdu = fits.PrimaryHDU(np.zeros((16, 16), dtype=np.float32))
+    hdu.header["CTYPE1"] = "RA---TAN"
+    hdu.header["CTYPE2"] = "DEC--TAN"
+    hdu.header["CRVAL1"] = 10.0
+    hdu.header["CRVAL2"] = 20.0
+    hdu.header["CRPIX1"] = 8.0
+    hdu.header["CRPIX2"] = 8.0
+    hdu.header["CDELT1"] = -0.001
+    hdu.header["CDELT2"] = 0.001
+    hdu.writeto(path, overwrite=True)
+    return path
+
+
+def test_setup_memory_error_from_pixel_scale_never_moves(tmp_path, monkeypatch):
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    src = _write_minimal_tan_fits(root / "M45" / "frame.fit")
+
+    def _oom(_wcs):
+        raise MemoryError("pixel-scale OOM on active path")
+
+    monkeypatch.setattr(zsp, "_extract_pixel_scale_deg", _oom)
+    with pytest.raises(MemoryError, match="pixel-scale OOM"):
+        zz._build_frame_descriptors([zsp.FrameInfo(path=src)], root, None)
+    _assert_source_intact_and_never_quarantined(src)
+
+
+def test_setup_value_error_from_pixel_scale_stays_terminal_and_moves(
+    tmp_path, monkeypatch
+):
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    src = _write_minimal_tan_fits(root / "M45" / "frame.fit")
+
+    def _bad_scale(_wcs):
+        raise ValueError("invalid header scale")
+
+    monkeypatch.setattr(zsp, "_extract_pixel_scale_deg", _bad_scale)
+    with pytest.raises(RuntimeError):
+        zz._build_frame_descriptors([zsp.FrameInfo(path=src)], root, None)
+    assert (root / "M45" / ziq.UNALIGNED_DIRNAME / "frame.fit").is_file()
+    assert not src.exists()
+
+
+# ---------------------------------------------------------------------------
 # C. Loader: None return activates raw fallback; both failures stay structured
 # ---------------------------------------------------------------------------
 

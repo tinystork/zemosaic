@@ -14,6 +14,7 @@ user — never by a stack plan).
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -23,6 +24,15 @@ FITS_SUFFIXES: tuple[str, ...] = (".fit", ".fits")
 
 #: Directory excluded from any inventory (quarantine).
 DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset({"unaligned_by_zemosaic"})
+
+
+def _is_resource_or_cancelled(exc: BaseException) -> bool:
+    """Never convert an OOM/cancellation into a sentinel value."""
+    if isinstance(exc, MemoryError):
+        return True
+    if type(exc).__name__ in {"CancelledError", "Cancelled", "TimeoutError"}:
+        return True
+    return isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOMEM
 
 
 def _normcase(path: Any) -> str:
@@ -142,7 +152,9 @@ def normalize_mount(value: object) -> str | None:
     if isinstance(value, (int, float)):
         try:
             iv = int(value)
-        except Exception:
+        except Exception as exc:
+            if _is_resource_or_cancelled(exc):
+                raise
             return None
         if iv == 0:
             return "ALTZ"
@@ -151,7 +163,9 @@ def normalize_mount(value: object) -> str | None:
         return None
     try:
         text = str(value).strip().upper()
-    except Exception:
+    except Exception as exc:
+        if _is_resource_or_cancelled(exc):
+            raise
         return None
     if not text:
         return None
@@ -173,7 +187,9 @@ def mount_from_header(header: object) -> str | None:
                 value = header.get(key)
             else:
                 value = header[key]  # type: ignore[index]
-        except Exception:
+        except Exception as exc:
+            if _is_resource_or_cancelled(exc):
+                raise
             value = None
         if value is None:
             continue
