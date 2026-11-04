@@ -759,14 +759,62 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback, *, si
 
     for fi in frames_info:
         if fi.wcs is None or fi.shape_hw is None:
-            ok = _stack_plan.load_frame_wcs(fi, progress_callback=progress_callback)
+            failures: list = []
+            ok = _stack_plan.load_frame_wcs(
+                fi,
+                progress_callback=progress_callback,
+                failure_out=failures,
+            )
             if not ok or fi.wcs is None or fi.shape_hw is None:
-                _reject(fi, "no usable celestial WCS/shape")
+                failure = failures[-1] if failures else None
+                if (
+                    failure is not None
+                    and failure.kind
+                    != _stack_plan.WCS_FAILURE_TERMINAL_SOURCE
+                ):
+                    # Missing/access, resource/cancellation or infrastructure/
+                    # internal: NEVER quarantine. Propagate a clear refusal
+                    # (MemoryError/cancellation keep their original type).
+                    if (
+                        failure.kind
+                        == _stack_plan.WCS_FAILURE_RESOURCE_OR_CANCELLED
+                        and failure.exception is not None
+                    ):
+                        raise failure.exception
+                    raise _stack_plan.FrameSetupRefusal(
+                        "ZeGrid setup refused for "
+                        f"{fi.path}: {failure.kind}: {failure.message}",
+                        kind=failure.kind,
+                        path=str(fi.path),
+                        exception_type=failure.exception_type,
+                    ) from failure.exception
+                reason = (
+                    failure.message
+                    if failure is not None
+                    else "no usable celestial WCS/shape"
+                )
+                _reject(fi, reason)
                 continue
         wcs = fi.wcs
         if sip_mode == "strip" and zg._has_sip(wcs):
             wcs = zg.strip_sip(wcs)
-        reason = zg.qualify_wcs(wcs)
+        try:
+            reason = zg.qualify_wcs(wcs)
+        except Exception as exc:
+            # ``qualify_wcs`` returning a reason is a terminal source reject;
+            # an EXCEPTION is unexpected/internal and must never move a file.
+            if (
+                _stack_plan.classify_setup_failure(exc)
+                == _stack_plan.WCS_FAILURE_RESOURCE_OR_CANCELLED
+            ):
+                raise
+            raise _stack_plan.FrameSetupRefusal(
+                "ZeGrid WCS qualification failed unexpectedly for "
+                f"{fi.path}: {type(exc).__name__}: {exc}",
+                kind=_stack_plan.WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL,
+                path=str(fi.path),
+                exception_type=type(exc).__name__,
+            ) from exc
         if reason is not None:
             _reject(fi, reason)
             continue

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pickle
 import subprocess
 import sys
 import threading
@@ -20,6 +21,7 @@ import pytest
 
 from zemosaic import input_inventory as zin
 from zemosaic import io_quarantine as ziq
+from zemosaic import zemosaic_stack_plan as zsp
 from zemosaic import zemosaic_utils as zu
 from zemosaic.core.zegrid import parallel as zpar
 
@@ -113,6 +115,98 @@ def test_nested_source_quarantines_next_to_itself(tmp_path):
     )
     assert not (root / "unaligned_by_zemosaic").exists()
     assert zin.scan_input_fits(root) == []
+
+
+def test_exdev_fallback_preserves_content_and_removes_source(tmp_path, monkeypatch):
+    import errno
+
+    root = tmp_path / "input"
+    src = _write(root / "light.fit", b"exdev-content")
+
+    def _no_link(_src, _dst):
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    monkeypatch.setattr(ziq.os, "link", _no_link)
+
+    result = ziq.move_to_unaligned(src, root)
+
+    assert result.status == ziq.STATUS_MOVED
+    assert Path(result.destination).read_bytes() == b"exdev-content"
+    assert not src.exists()
+    assert [p.name for p in (root / "unaligned_by_zemosaic").iterdir()] == [
+        "light.fit"
+    ]
+
+
+def test_exdev_copy_failure_cleans_reservation_and_keeps_source(
+    tmp_path, monkeypatch
+):
+    import errno
+
+    root = tmp_path / "input"
+    src = _write(root / "light.fit", b"must-survive")
+
+    def _no_link(_src, _dst):
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    def _fail_move(_src, _dst):
+        raise OSError("simulated copy failure")
+
+    monkeypatch.setattr(ziq.os, "link", _no_link)
+    monkeypatch.setattr(ziq.shutil, "move", _fail_move)
+
+    result = ziq.move_to_unaligned(src, root)
+
+    assert result.status == ziq.STATUS_FAILED
+    assert src.read_bytes() == b"must-survive"
+    assert list((root / "unaligned_by_zemosaic").iterdir()) == []
+
+
+def test_cross_process_same_basename_never_overwrites(tmp_path):
+    """Two real processes race for the same destination basename."""
+    root = tmp_path / "input"
+    src_a = _write(root / "a" / "light.fit", b"AAA")
+    src_b = _write(root / "b" / "light.fit", b"BBB")
+    repo_root = Path(__file__).resolve().parents[1]
+    code = (
+        "import sys\n"
+        "from zemosaic.io_quarantine import move_to_unaligned\n"
+        "result = move_to_unaligned(sys.argv[1], sys.argv[2])\n"
+        "print(result.status)\n"
+    )
+    env = dict(os.environ)
+    src_path = str(repo_root / "src")
+    env["PYTHONPATH"] = src_path + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", code, str(path), str(root)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        for path in (src_a, src_b)
+    ]
+    for proc in procs:
+        _out, err = proc.communicate(timeout=30)
+        assert proc.returncode == 0, err[-2000:]
+
+    files = list((root / "unaligned_by_zemosaic").iterdir())
+    assert len(files) == 2
+    assert {p.read_bytes() for p in files} == {b"AAA", b"BBB"}
+    assert not src_a.exists() and not src_b.exists()
+
+
+def test_quarantine_result_is_picklable(tmp_path):
+    root = tmp_path / "input"
+    src = _write(root / "light.fit")
+    result = ziq.move_to_unaligned(src, root)
+    clone = pickle.loads(pickle.dumps(result))
+    assert clone == result
+    assert clone.status == ziq.STATUS_MOVED
+    assert clone.destination == result.destination
 
 
 def _run_worker_wrapper(source: Path, owner_root: Path) -> tuple[str, str]:
@@ -230,6 +324,152 @@ def test_build_frame_descriptors_quarantines_wcs_reject(tmp_path, monkeypatch):
     assert (root / "M45" / "unaligned_by_zemosaic" / "bad.fit").is_file()
     # A future recursive inventory never re-ingests the rejected source.
     assert [Path(p) for p in zin.scan_input_fits(root)] == [good]
+
+
+def _assert_source_intact_and_never_quarantined(src: Path) -> None:
+    assert src.exists()
+    assert not (src.parent / ziq.UNALIGNED_DIRNAME).exists()
+
+
+def test_setup_memory_error_never_moves_source(tmp_path, monkeypatch):
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    src = _write(root / "M45" / "frame.fit")
+
+    def _oom(_path):
+        raise MemoryError("simulated allocator failure")
+
+    monkeypatch.setattr(zsp, "_open_fits_safely", _oom)
+    with pytest.raises(MemoryError, match="allocator failure"):
+        zz._build_frame_descriptors([zsp.FrameInfo(path=src)], root, None)
+    _assert_source_intact_and_never_quarantined(src)
+
+
+def test_setup_programming_error_never_moves_source(tmp_path, monkeypatch):
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    src = _write(root / "frame.fit")
+
+    def _bug(_path):
+        raise RuntimeError("programming bug")
+
+    monkeypatch.setattr(zsp, "_open_fits_safely", _bug)
+    with pytest.raises(zsp.FrameSetupRefusal) as info:
+        zz._build_frame_descriptors([zsp.FrameInfo(path=src)], root, None)
+    assert info.value.kind == zsp.WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL
+    _assert_source_intact_and_never_quarantined(src)
+
+
+def test_setup_permission_error_never_moves_source(tmp_path, monkeypatch):
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    src = _write(root / "frame.fit")
+
+    def _denied(_path):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(zsp, "_open_fits_safely", _denied)
+    with pytest.raises(zsp.FrameSetupRefusal) as info:
+        zz._build_frame_descriptors([zsp.FrameInfo(path=src)], root, None)
+    assert info.value.kind == zsp.WCS_FAILURE_MISSING_OR_ACCESS
+    _assert_source_intact_and_never_quarantined(src)
+
+
+def test_setup_missing_file_never_moves_other_source(tmp_path):
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    missing = root / "gone.fit"
+    other = _write(root / "other.fit")
+    with pytest.raises(zsp.FrameSetupRefusal) as info:
+        zz._build_frame_descriptors([zsp.FrameInfo(path=missing)], root, None)
+    assert info.value.kind == zsp.WCS_FAILURE_MISSING_OR_ACCESS
+    assert not missing.exists()
+    _assert_source_intact_and_never_quarantined(other)
+
+
+def test_setup_cancelled_never_moves_source(tmp_path, monkeypatch):
+    import concurrent.futures
+
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    src = _write(root / "frame.fit")
+
+    def _cancelled(_path):
+        raise concurrent.futures.CancelledError("cooperative cancel")
+
+    monkeypatch.setattr(zsp, "_open_fits_safely", _cancelled)
+    with pytest.raises(concurrent.futures.CancelledError):
+        zz._build_frame_descriptors([zsp.FrameInfo(path=src)], root, None)
+    _assert_source_intact_and_never_quarantined(src)
+
+
+def test_real_corrupt_fits_is_terminal_and_moved(tmp_path):
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    bad = _write(root / "M45" / "corrupt.fit", b"this is not a FITS file")
+    with pytest.raises(RuntimeError):
+        # It is a terminal source reject; with no frame left the builder raises.
+        zz._build_frame_descriptors([zsp.FrameInfo(path=bad)], root, None)
+    destination = root / "M45" / ziq.UNALIGNED_DIRNAME / "corrupt.fit"
+    assert destination.is_file()
+    assert not bad.exists()
+
+
+def test_qualify_wcs_exception_is_internal_and_never_moves(tmp_path, monkeypatch):
+    from zemosaic import zemosaic_zegrid_mode as zz
+    from zemosaic.core.zegrid import geometry as zg
+
+    root = tmp_path / "input"
+    src = _write(root / "frame.fit")
+
+    def _boom(_wcs):
+        raise RuntimeError("qualify bug")
+
+    monkeypatch.setattr(zg, "qualify_wcs", _boom)
+    with pytest.raises(zsp.FrameSetupRefusal) as info:
+        zz._build_frame_descriptors([_FrameInfo(src, _tan_wcs())], root, None)
+    assert info.value.kind == zsp.WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL
+    _assert_source_intact_and_never_quarantined(src)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        MemoryError("oom"),
+        RuntimeError("bug"),
+        zpar.ParallelPoolError("pool failed"),
+    ],
+)
+def test_payload_boundary_ignores_non_payload_errors(tmp_path, exc):
+    import concurrent.futures
+
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    src = _write(root / "frame.fit")
+    result = zz._quarantine_payload_failure(exc, root, None, phase="gauge")
+    assert result is None
+    _assert_source_intact_and_never_quarantined(src)
+
+
+def test_payload_boundary_ignores_cancelled_error(tmp_path):
+    import concurrent.futures
+
+    from zemosaic import zemosaic_zegrid_mode as zz
+
+    root = tmp_path / "input"
+    src = _write(root / "frame.fit")
+    result = zz._quarantine_payload_failure(
+        concurrent.futures.CancelledError(), root, None, phase="cell cache"
+    )
+    assert result is None
+    _assert_source_intact_and_never_quarantined(src)
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +717,135 @@ def test_pmap_preserves_structured_payload_error_across_process(tmp_path):
     assert original.path == str(tasks[info.value.index])
     assert original.primary_error == "RuntimeError: primary"
     assert original.raw_error == "OSError: CRC"
+
+
+def test_pmap_partial_submit_failure_drains_executor(monkeypatch):
+    import concurrent.futures
+
+    real_submit = concurrent.futures.ThreadPoolExecutor.submit
+    real_shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+    submit_calls = []
+    shutdowns = []
+
+    def _flaky_submit(self, fn, *args, **kwargs):
+        submit_calls.append(1)
+        if len(submit_calls) == 2:
+            raise RuntimeError("simulated partial submit failure")
+        return real_submit(self, fn, *args, **kwargs)
+
+    def _record_shutdown(self, wait=True, cancel_futures=False):
+        shutdowns.append((wait, cancel_futures))
+        return real_shutdown(
+            self, wait=wait, cancel_futures=cancel_futures
+        )
+
+    monkeypatch.setattr(
+        concurrent.futures.ThreadPoolExecutor, "submit", _flaky_submit
+    )
+    monkeypatch.setattr(
+        concurrent.futures.ThreadPoolExecutor, "shutdown", _record_shutdown
+    )
+    monkeypatch.setattr(zpar, "_parent_is_daemonic", lambda: True)
+
+    executed = []
+
+    def _worker(value):
+        executed.append(value)
+        return value
+
+    meta = {}
+    with pytest.raises(zpar.ParallelPoolError, match="submit failed"):
+        zpar.pmap(_worker, [1, 2, 3], workers=2, meta=meta)
+
+    assert shutdowns == [(True, True)]
+    assert meta["fallback"] is False
+    assert all(executed.count(v) <= 1 for v in executed)
+
+
+def test_pmap_broken_pool_is_not_a_task_error(monkeypatch):
+    import concurrent.futures
+
+    shutdowns = []
+
+    class _BrokenPool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def submit(self, fn, task):
+            future = concurrent.futures.Future()
+            future.set_exception(
+                concurrent.futures.process.BrokenProcessPool("simulated broken pool")
+            )
+            return future
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            shutdowns.append((wait, cancel_futures))
+
+    monkeypatch.setattr(
+        concurrent.futures, "ProcessPoolExecutor", _BrokenPool
+    )
+    monkeypatch.setattr(zpar, "_parent_is_daemonic", lambda: False)
+
+    meta = {}
+    with pytest.raises(zpar.ParallelPoolError) as info:
+        zpar.pmap(lambda value: value, [1, 2], workers=2, meta=meta)
+
+    assert not isinstance(info.value, zpar.ParallelTaskError)
+    assert "BrokenProcessPool" in str(info.value)
+    assert shutdowns == [(True, True)]
+    assert meta["fallback"] is False
+
+
+def test_pmap_heartbeat_failure_drains_without_replay(monkeypatch):
+    release = threading.Event()
+    running_one = threading.Event()
+    executed = []
+    executed_lock = threading.Lock()
+    heartbeat_calls = []
+
+    def _worker(value):
+        with executed_lock:
+            executed.append(value)
+        if value == 0:
+            running_one.wait(2.0)
+            raise RuntimeError("heartbeat-path failure")
+        if value == 1:
+            running_one.set()
+            release.wait(10.0)
+        return value
+
+    def _heartbeat():
+        heartbeat_calls.append(time.monotonic())
+
+    timer = threading.Timer(0.4, release.set)
+    timer.daemon = True
+    timer.start()
+
+    monkeypatch.setattr(zpar, "_parent_is_daemonic", lambda: True)
+    meta = {}
+    started_at = time.monotonic()
+    with pytest.raises(zpar.ParallelTaskError) as info:
+        zpar.pmap(
+            _worker,
+            [0, 1, 2],
+            workers=2,
+            heartbeat=_heartbeat,
+            heartbeat_interval_s=0.02,
+            meta=meta,
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert info.value.index == 0
+    assert heartbeat_calls
+    assert meta["heartbeat_calls"] >= 1
+    assert meta["fallback"] is False
+    assert elapsed >= 0.3
+    with executed_lock:
+        snapshot = list(executed)
+    time.sleep(0.2)
+    with executed_lock:
+        assert executed == snapshot
+    assert all(snapshot.count(v) <= 1 for v in snapshot)
 
 
 def test_pmap_executor_creation_failure_keeps_bounded_serial_fallback(

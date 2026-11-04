@@ -13,10 +13,11 @@ Nothing here re-implements or depends on the legacy Grid pipeline.
 from __future__ import annotations
 
 import csv
+import errno
 import logging
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -41,6 +42,97 @@ logger = logging.getLogger("ZeMosaicWorker").getChild("stack_plan")
 logger.propagate = True
 
 ProgressCallback = Optional[Callable[[str, object, str], None]]
+
+# ZM-IO-REJECT-01 rework-3: explicit setup/WCS failure classes. Only
+# ``terminal_source`` failures may be quarantined; resource/cancellation,
+# missing/access and infrastructure/internal failures must never move a source.
+WCS_FAILURE_TERMINAL_SOURCE = "terminal_source"
+WCS_FAILURE_MISSING_OR_ACCESS = "missing_or_access"
+WCS_FAILURE_RESOURCE_OR_CANCELLED = "resource_or_cancelled"
+WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL = "infrastructure_or_internal"
+
+
+@dataclass
+class WcsLoadFailure:
+    """Structured reason why :func:`load_frame_wcs` returned ``False``.
+
+    The historical ``bool`` return is preserved; callers that need to decide
+    whether a source may be quarantined pass ``failure_out=[]`` and inspect the
+    last entry.
+    """
+
+    kind: str
+    path: str
+    message: str
+    exception_type: str | None = None
+    exception: BaseException | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def should_quarantine(self) -> bool:
+        return self.kind == WCS_FAILURE_TERMINAL_SOURCE
+
+
+class FrameSetupRefusal(RuntimeError):
+    """A non-quarantinable setup/WCS failure the caller must surface."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str,
+        path: str | None = None,
+        exception_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = str(kind)
+        self.path = path
+        self.exception_type = exception_type
+
+
+def classify_setup_failure(exc: BaseException) -> str:
+    """Classify one setup/WCS exception without over-claiming source corruption.
+
+    * ``MemoryError`` / cancellation -> resource/cancelled;
+    * disappeared/permission/access filesystem errors -> missing/access;
+    * clear FITS/header/WCS format errors -> terminal source;
+    * everything unexpected (programming errors, missing infrastructure) ->
+      infrastructure/internal.
+    """
+    if isinstance(exc, MemoryError):
+        return WCS_FAILURE_RESOURCE_OR_CANCELLED
+    if type(exc).__name__ in {"CancelledError", "Cancelled", "TimeoutError"}:
+        return WCS_FAILURE_RESOURCE_OR_CANCELLED
+    if isinstance(exc, (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError)):
+        return WCS_FAILURE_MISSING_OR_ACCESS
+    if isinstance(exc, OSError):
+        code = getattr(exc, "errno", None)
+        if code in {errno.ENOMEM, errno.EAGAIN}:
+            return WCS_FAILURE_RESOURCE_OR_CANCELLED
+        if code is None:
+            # Astropy reports an empty/corrupt FITS file as OSError without an
+            # errno; that is a terminal source defect, not an access failure.
+            return WCS_FAILURE_TERMINAL_SOURCE
+        if code in {
+            errno.EACCES,
+            errno.EPERM,
+            errno.ENOENT,
+            errno.ESTALE,
+            errno.EIO,
+            errno.EINTR,
+            errno.ETIMEDOUT,
+            errno.EBUSY,
+        }:
+            return WCS_FAILURE_MISSING_OR_ACCESS
+        return WCS_FAILURE_MISSING_OR_ACCESS
+    if isinstance(exc, (ValueError, KeyError, IndexError, EOFError, UnicodeError)):
+        return WCS_FAILURE_TERMINAL_SOURCE
+    if type(exc).__name__ in {"VerifyError", "VerifyWarning"}:
+        return WCS_FAILURE_TERMINAL_SOURCE
+    if isinstance(exc, (TypeError, AttributeError, AssertionError, RuntimeError)):
+        return WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL
+    if isinstance(exc, ImportError):
+        return WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL
+    return WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL
 
 
 def _emit(msg: str, *, lvl: str = "INFO", callback: ProgressCallback = None, **kwargs) -> None:
@@ -416,12 +508,22 @@ def _admit_rgb_chw_cube(header, shape) -> tuple[bool, str | None, tuple[int, int
     return True, None, (height, width)
 
 
-def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = None) -> bool:
+def load_frame_wcs(
+    frame: FrameInfo,
+    *,
+    progress_callback: ProgressCallback = None,
+    failure_out: list[WcsLoadFailure] | None = None,
+) -> bool:
     """Populate frame.wcs and frame.shape_hw if possible.
 
     Fail-closed contract: the frame fields are cleared on entry and assigned ONLY
     on success, so a ``False`` return always means ``frame.wcs is None`` and
     ``frame.shape_hw is None`` — never a stale state from a previous success.
+
+    ``failure_out`` (optional) receives ONE :class:`WcsLoadFailure` on failure so
+    a caller can distinguish a terminal source defect (quarantinable) from a
+    missing/access, resource/cancellation or infrastructure/internal failure
+    (never quarantinable). The historical ``bool`` return is unchanged.
     """
 
     # Clear before any possible early return (astropy unavailable, open failure,
@@ -429,9 +531,29 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
     frame.wcs = None
     frame.shape_hw = None
 
-    if not (_ASTROPY_AVAILABLE and fits and WCS):
-        _emit("Astropy not available for WCS parsing", lvl="ERROR", callback=progress_callback)
+    def _fail(kind: str, message: str, exc: BaseException | None = None) -> bool:
+        if failure_out is not None:
+            failure_out.append(
+                WcsLoadFailure(
+                    kind=kind,
+                    path=str(frame.path),
+                    message=message,
+                    exception_type=(type(exc).__name__ if exc is not None else None),
+                    exception=exc,
+                )
+            )
+        _emit(
+            message,
+            lvl=("WARN" if kind == WCS_FAILURE_TERMINAL_SOURCE else "ERROR"),
+            callback=progress_callback,
+        )
         return False
+
+    if not (_ASTROPY_AVAILABLE and fits and WCS):
+        return _fail(
+            WCS_FAILURE_INFRASTRUCTURE_OR_INTERNAL,
+            "Astropy not available for WCS parsing",
+        )
     try:
         with _open_fits_safely(frame.path) as hdul:
             # ZM-WCS-02: header-only. ``PrimaryHDU.shape`` is derived from the
@@ -441,11 +563,21 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
             try:
                 raw_shape = hdul[0].shape
                 shape = tuple(int(n) for n in raw_shape) if raw_shape else None
-            except Exception:
+            except Exception as exc:
+                kind = classify_setup_failure(exc)
+                if kind != WCS_FAILURE_TERMINAL_SOURCE:
+                    return _fail(
+                        kind,
+                        f"Failed to derive FITS shape for {frame.path}: {exc}",
+                        exc,
+                    )
                 shape = None
     except Exception as exc:
-        _emit(f"Failed to open FITS {frame.path}: {exc}", lvl="ERROR", callback=progress_callback)
-        return False
+        return _fail(
+            classify_setup_failure(exc),
+            f"Failed to open FITS {frame.path}: {exc}",
+            exc,
+        )
 
     # ZM-ZEGRID-R35A: mount metadata (EQ / ALTZ) is now read from the FITS header
     # itself (EQMODE), replacing the stack_plan ``mount`` column while preserving
@@ -455,8 +587,13 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
             from .input_inventory import mount_from_header as _mount_from_header
 
             frame.mount = _mount_from_header(header)
-    except Exception:
-        pass
+    except Exception as exc:
+        if classify_setup_failure(exc) == WCS_FAILURE_RESOURCE_OR_CANCELLED:
+            return _fail(
+                WCS_FAILURE_RESOURCE_OR_CANCELLED,
+                f"Mount metadata read interrupted for {frame.path}: {exc}",
+                exc,
+            )
 
 
     # ZM-WCS-01: a 3-D primary is admitted ONLY as an unambiguous RGB CHW cube
@@ -464,14 +601,19 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
     # celestial WCS lives on axes 1-2, so it is built with ``naxis=2`` (which
     # also keeps SIP working). Every other 3-D primary is refused explicitly.
     # The 2-D primary path below keeps the historical construction unchanged.
-    cube_ok, cube_reason, cube_shape_hw = _admit_rgb_chw_cube(header, shape)
-    if cube_reason is not None:
-        _emit(
-            f"[GRID] Rejecting frame {frame.path}: {cube_reason}",
-            lvl="WARN",
-            callback=progress_callback,
+    try:
+        cube_ok, cube_reason, cube_shape_hw = _admit_rgb_chw_cube(header, shape)
+    except Exception as exc:
+        return _fail(
+            classify_setup_failure(exc),
+            f"Failed to admit RGB cube for {frame.path}: {exc}",
+            exc,
         )
-        return False
+    if cube_reason is not None:
+        return _fail(
+            WCS_FAILURE_TERMINAL_SOURCE,
+            f"Rejecting frame {frame.path}: {cube_reason}",
+        )
 
     wcs_obj = None
     try:
@@ -480,20 +622,28 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
         else:
             wcs_obj = WCS(header)
     except Exception as exc:
+        kind = classify_setup_failure(exc)
+        if kind != WCS_FAILURE_TERMINAL_SOURCE:
+            return _fail(
+                kind,
+                f"Failed to parse WCS from {frame.path}: {exc}",
+                exc,
+            )
         wcs_obj = None
-        _emit(f"[GRID] Failed to parse WCS from {frame.path}: {exc}", lvl="WARN", callback=progress_callback)
     if (
         wcs_obj is None
         or not getattr(wcs_obj, "is_celestial", False)
         or (cube_ok and getattr(wcs_obj, "pixel_n_dim", None) != 2)
     ):
-        _emit(f"[GRID] No usable celestial WCS in {frame.path}", lvl="WARN", callback=progress_callback)
-        return False
+        return _fail(
+            WCS_FAILURE_TERMINAL_SOURCE,
+            f"No usable celestial WCS in {frame.path}",
+        )
     if cube_ok:
         # DEBUG: the real M45 corpus has 1827 cubes; the admission is pinned by
         # tests, so a per-frame INFO line would only flood the worker log.
         _emit(
-            f"[GRID] RGB CHW cube {frame.path}: celestial WCS built on axes 1-2 (naxis=2)",
+            f"RGB CHW cube {frame.path}: celestial WCS built on axes 1-2 (naxis=2)",
             lvl="DEBUG",
             callback=progress_callback,
         )
@@ -506,23 +656,33 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
             elif len(shape) == 2:
                 shape_hw = (int(shape[0]), int(shape[1]))
             # 3-D primaries are fully handled by the admission gate above.
-    except Exception:
+    except Exception as exc:
+        kind = classify_setup_failure(exc)
+        if kind != WCS_FAILURE_TERMINAL_SOURCE:
+            return _fail(
+                kind,
+                f"Failed to derive image shape for {frame.path}: {exc}",
+                exc,
+            )
         shape_hw = None
     if shape_hw is None:
-        _emit(f"Cannot derive image shape for {frame.path}", lvl="WARN", callback=progress_callback)
-        return False
+        return _fail(
+            WCS_FAILURE_TERMINAL_SOURCE,
+            f"Cannot derive image shape for {frame.path}",
+        )
     try:
         px_scale = _extract_pixel_scale_deg(wcs_obj)
         if px_scale is None or not math.isfinite(px_scale) or px_scale <= 0:
-            _emit(
-                f"[GRID] Rejecting frame {frame.path}: invalid pixel scale",
-                lvl="WARN",
-                callback=progress_callback,
+            return _fail(
+                WCS_FAILURE_TERMINAL_SOURCE,
+                f"Rejecting frame {frame.path}: invalid pixel scale",
             )
-            return False
-    except Exception:
-        _emit(f"[GRID] Rejecting frame {frame.path}: pixel scale check failed", lvl="WARN", callback=progress_callback)
-        return False
+    except Exception as exc:
+        return _fail(
+            classify_setup_failure(exc),
+            f"Rejecting frame {frame.path}: pixel scale check failed ({exc})",
+            exc,
+        )
 
     # Success: publish the validated state.
     frame.wcs = wcs_obj
