@@ -309,6 +309,105 @@ def _extract_pixel_scale_deg(wcs_obj: object) -> float | None:
     return None
 
 
+def _header_int(header, key: str) -> int | None:
+    """Return ``header[key]`` as a strict int, or ``None`` when absent/invalid."""
+    try:
+        value = header.get(key)
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _third_axis_kind(ctype3: str) -> str | None:
+    """Classify a *declared* third-axis CTYPE into a coarse, explicit kind.
+
+    Only used to produce clear rejection diagnostics: any non-blank ``CTYPE3``
+    means the third axis carries a declared meaning, which is never accepted for
+    the RGB channel axis (see :func:`_admit_rgb_chw_cube`).
+    """
+    base = (ctype3 or "").strip().upper()
+    if not base:
+        return None
+    if base.startswith(("RA---", "DEC--", "GLON", "GLAT", "ELON", "ELAT", "HPLN", "HPLT",
+                        "RA", "DEC")):
+        return "celestial"
+    if base.startswith(("WAVE", "AWAV", "FREQ", "ENER", "VOPT", "VELO", "VRAD", "BETA")):
+        return "spectral"
+    if base.startswith(("TIME", "UTC", "TAI", "TT", "GPS", "MJD")):
+        return "temporal"
+    if base.startswith(("STOKES", "POL")):
+        return "polarization"
+    return "other"
+
+
+def _admit_rgb_chw_cube(header, data) -> tuple[bool, str | None, tuple[int, int] | None]:
+    """Admission gate for a 3-D primary that is an RGB CHW cube.
+
+    Returns ``(admitted, reason, shape_hw)``:
+
+    * ``(False, None, None)`` — the primary is not 3-D at all: the caller keeps
+      the historical 2-D path untouched.
+    * ``(True, None, (H, W))`` — the exact admitted class: ``NAXIS=3``,
+      ``NAXIS3=3``, data of shape ``(3, H, W)`` consistent with
+      ``NAXIS1=W``/``NAXIS2=H``, blank ``CTYPE3``. Only this class may build
+      ``WCS(header, naxis=2)``.
+    * ``(False, reason, None)`` — a 3-D primary that is *not* this exact class
+      (non-RGB, HWC/ambiguous layout, contradictory header dimensions, or a
+      declared celestial/spectral/temporal/polarization third axis).
+
+    ``WCSAXES=2`` alone is deliberately NOT accepted as proof of a channel axis:
+    the header and pixel dimensions must also agree on the CHW contract.
+    """
+    shape = getattr(data, "shape", None)
+    if shape is None:
+        if _header_int(header, "NAXIS") == 3:
+            return False, "NAXIS=3 primary without readable data (cannot verify CHW layout)", None
+        return False, None, None
+    if len(shape) == 2:
+        return False, None, None
+    if len(shape) != 3:
+        return False, f"unsupported primary dimensionality {len(shape)} (expected 2-D or 3-D)", None
+
+    naxis = _header_int(header, "NAXIS")
+    naxis3 = _header_int(header, "NAXIS3")
+    if naxis != 3:
+        return False, f"3-D data with NAXIS={naxis!r} (expected NAXIS=3)", None
+    if naxis3 != 3:
+        return False, f"third axis NAXIS3={naxis3!r} (expected 3 RGB channels)", None
+
+    channels, height, width = (int(shape[0]), int(shape[1]), int(shape[2]))
+    if channels != 3:
+        return (
+            False,
+            f"leading data axis is {channels}, expected 3 (CHW RGB; HWC/ambiguous layout refused)",
+            None,
+        )
+    if height <= 0 or width <= 0:
+        return False, f"non-positive spatial dimensions ({height}, {width})", None
+
+    hdr_w = _header_int(header, "NAXIS1")
+    hdr_h = _header_int(header, "NAXIS2")
+    if hdr_w != width or hdr_h != height:
+        return (
+            False,
+            f"header dimensions NAXIS1/NAXIS2={hdr_w!r}/{hdr_h!r} contradict data "
+            f"shape (3, {height}, {width})",
+            None,
+        )
+
+    ctype3 = str(header.get("CTYPE3", "") or "").strip()
+    if ctype3:
+        kind = _third_axis_kind(ctype3) or "other"
+        return (
+            False,
+            f"third axis declared as {kind} (CTYPE3={ctype3!r}); RGB channel axis must be blank",
+            None,
+        )
+    return True, None, (height, width)
+
+
 def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = None) -> bool:
     """Populate frame.wcs and frame.shape_hw if possible."""
 
@@ -335,25 +434,51 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
         pass
 
 
+    # ZM-WCS-01: a 3-D primary is admitted ONLY as an unambiguous RGB CHW cube
+    # (NAXIS=3, NAXIS3=3, (3, H, W), blank CTYPE3). For that single class the
+    # celestial WCS lives on axes 1-2, so it is built with ``naxis=2`` (which
+    # also keeps SIP working). Every other 3-D primary is refused explicitly.
+    # The 2-D primary path below keeps the historical construction unchanged.
+    cube_ok, cube_reason, cube_shape_hw = _admit_rgb_chw_cube(header, data)
+    if cube_reason is not None:
+        _emit(
+            f"[GRID] Rejecting frame {frame.path}: {cube_reason}",
+            lvl="WARN",
+            callback=progress_callback,
+        )
+        return False
+
     try:
-        frame.wcs = WCS(header)
+        if cube_ok:
+            frame.wcs = WCS(header, naxis=2)
+        else:
+            frame.wcs = WCS(header)
     except Exception as exc:
         frame.wcs = None
         _emit(f"[GRID] Failed to parse WCS from {frame.path}: {exc}", lvl="WARN", callback=progress_callback)
-    if frame.wcs is None or not getattr(frame.wcs, "is_celestial", False):
+    if (
+        frame.wcs is None
+        or not getattr(frame.wcs, "is_celestial", False)
+        or (cube_ok and getattr(frame.wcs, "pixel_n_dim", None) != 2)
+    ):
         _emit(f"[GRID] No usable celestial WCS in {frame.path}", lvl="WARN", callback=progress_callback)
         return False
+    if cube_ok:
+        _emit(
+            f"[GRID] RGB CHW cube {frame.path}: celestial WCS built on axes 1-2 (naxis=2)",
+            lvl="INFO",
+            callback=progress_callback,
+        )
 
     shape_hw = None
     try:
         shape = data.shape if data is not None else None
         if shape is not None:
-            if len(shape) == 2:
+            if cube_shape_hw is not None:
+                shape_hw = cube_shape_hw
+            elif len(shape) == 2:
                 shape_hw = (int(shape[0]), int(shape[1]))
-            elif len(shape) == 3:
-                # Assume either HWC or CHW; pick the last two dims as spatial
-                height, width = shape[-2], shape[-1]
-                shape_hw = (int(height), int(width))
+            # 3-D primaries are fully handled by the admission gate above.
     except Exception:
         shape_hw = None
     if shape_hw is None:
