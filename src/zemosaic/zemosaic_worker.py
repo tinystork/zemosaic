@@ -344,7 +344,16 @@ except Exception:
     _poststack_rgb_equalization = None
 
 
-UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
+try:
+    from .io_quarantine import (
+        UNALIGNED_DIRNAME as _SHARED_UNALIGNED_DIRNAME,
+        move_to_unaligned as _shared_move_to_unaligned,
+    )
+except Exception:  # pragma: no cover - import-time fallback
+    _SHARED_UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
+    _shared_move_to_unaligned = None
+
+UNALIGNED_DIRNAME = _SHARED_UNALIGNED_DIRNAME
 _UNALIGNED_LOCK = Lock()
 
 ALPHA_OPACITY_THRESHOLD = 0.5  # Mask values >= threshold are treated as opaque
@@ -794,6 +803,26 @@ def _move_to_unaligned_safe(
         ``destination_path`` is provided when a target directory is known.
     """
 
+    if _shared_move_to_unaligned is not None:
+        result = _shared_move_to_unaligned(
+            src_path, input_root, logger=logger
+        )
+        if result.status == "skipped_excluded":
+            try:
+                logger.warning("Skip move: path already excluded: %s", result.source)
+            except Exception:
+                pass
+        elif result.status == "missing":
+            try:
+                logger.debug(
+                    "Skip move: source missing (likely already moved): %s",
+                    result.source,
+                )
+            except Exception:
+                pass
+        return result.as_tuple()
+
+    # Fallback (import-time failure only): preserve the historical behaviour.
     try:
         src = Path(src_path).expanduser().resolve(strict=False)
     except Exception:
@@ -804,74 +833,34 @@ def _move_to_unaligned_safe(
     except Exception:
         root = Path(input_root)
 
-    # Skip if the source is already part of an excluded directory
     try:
         if is_path_excluded(src, EXCLUDED_DIRS):
-            try:
-                logger.warning("Skip move: path already excluded: %s", src)
-            except Exception:
-                pass
             return "skipped_excluded", None
     except Exception:
         if UNALIGNED_DIRNAME in set(src.parts):
-            try:
-                logger.warning("Skip move: path already excluded: %s", src)
-            except Exception:
-                pass
             return "skipped_excluded", None
 
     if not src.exists():
-        try:
-            logger.debug("Skip move: source missing (likely already moved): %s", src)
-        except Exception:
-            pass
         return "missing", None
 
     target_dir = root / UNALIGNED_DIRNAME
-
     with _UNALIGNED_LOCK:
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            try:
-                logger.debug("Failed to ensure unaligned dir exists (%s): %s", target_dir, exc)
-            except Exception:
-                pass
-
-    dst = target_dir / src.name
-
-    try:
-        shutil.move(str(src), str(dst))
-        try:
-            logger.info("Moved to '%s': %s", UNALIGNED_DIRNAME, dst)
         except Exception:
             pass
+
+    dst = target_dir / src.name
+    try:
+        shutil.move(str(src), str(dst))
         return "moved", dst
     except FileExistsError:
         if not src.exists():
-            try:
-                logger.debug("Move raced (already exists), keeping destination: %s", dst)
-            except Exception:
-                pass
             return "already_moved", dst
-        try:
-            logger.debug("Move skipped (destination exists): %s", dst)
-        except Exception:
-            pass
         return "conflict", dst
     except FileNotFoundError:
-        try:
-            logger.debug("Move skipped: source vanished before move: %s", src)
-        except Exception:
-            pass
         return "already_moved", dst
-    except Exception as exc:
-        try:
-            logger.warning(
-                "Move to '%s' failed for %s: %s", UNALIGNED_DIRNAME, src, exc
-            )
-        except Exception:
-            pass
+    except Exception:
         return "failed", dst
 
 

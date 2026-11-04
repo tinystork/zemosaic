@@ -467,3 +467,5 @@ couplées/testables, science préservée et anomalies isolées. Pas « beaucoup 
 fichiers » ni « moins de lignes à tout prix ».
 
 > Archaeology first. Mechanical refactor second. Science unchanged. M106 last.
+
+- [~] IO-REJECT-01 (local) : quarantaine legacy `unaligned_by_zemosaic` + stop du replay série sur erreur de frame (P0, en cours).

@@ -89,6 +89,11 @@ from .zemosaic_utils import (
     record_nonfinite_fill,
     sanitize_nonfinite_float32,
 )
+from .io_quarantine import (
+    FramePayloadError,
+    FramePayloadQuarantineError,
+    move_to_unaligned,
+)
 from .core.canonical_streaming import (
     InMemoryCanonicalProvider,
     run_canonical_stack_streaming,
@@ -713,7 +718,9 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback, *, si
     """Convert legacy ``FrameInfo`` (WCS populated) to ZeGrid ``FrameDescriptor``.
 
     Each frame's WCS is QUALIFIED (2-D celestial TAN — plain or SIP). Unqualified
-    frames are recorded (never silently dropped) and skipped; if NONE qualify a
+    frames are recorded (never silently dropped), moved to the legacy
+    ``<input_root>/unaligned_by_zemosaic`` quarantine (the exact historical
+    contract, already excluded by the scanner) and skipped; if NONE qualify a
     ``RuntimeError`` is raised (no silent degradation).
 
     ``sip_mode`` controls SIP handling:
@@ -724,18 +731,39 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback, *, si
     base = Path(input_folder).expanduser().resolve()
     descs = []
     rejected = []
+
+    def _reject(fi, reason: str) -> None:
+        move = move_to_unaligned(fi.path, base, logger=logger)
+        entry = {
+            "path": str(fi.path),
+            "reason": reason,
+            "quarantine_status": move.status,
+            "quarantine_destination": move.destination,
+        }
+        if move.detail:
+            entry["quarantine_detail"] = move.detail
+        rejected.append(entry)
+        if not move.moved:
+            _emit(
+                "ZeGrid: terminal frame rejection could not be quarantined "
+                f"({move.status}): {fi.path} — reason={reason}"
+                + (f" detail={move.detail}" if move.detail else ""),
+                lvl="WARN",
+                callback=progress_callback,
+            )
+
     for fi in frames_info:
         if fi.wcs is None or fi.shape_hw is None:
             ok = _stack_plan.load_frame_wcs(fi, progress_callback=progress_callback)
             if not ok or fi.wcs is None or fi.shape_hw is None:
-                rejected.append({"path": str(fi.path), "reason": "no usable celestial WCS/shape"})
+                _reject(fi, "no usable celestial WCS/shape")
                 continue
         wcs = fi.wcs
         if sip_mode == "strip" and zg._has_sip(wcs):
             wcs = zg.strip_sip(wcs)
         reason = zg.qualify_wcs(wcs)
         if reason is not None:
-            rejected.append({"path": str(fi.path), "reason": reason})
+            _reject(fi, reason)
             continue
         try:
             rel = Path(fi.path).resolve().relative_to(base).as_posix()
@@ -4592,6 +4620,82 @@ def _science_header(
 def _gauge_decode(frame_desc):
     """Module-level (picklable) 1-arg decode wrapper for the parallel gauge."""
     return _decode_frame_hwc(frame_desc, None)
+
+
+def _payload_error_in_chain(exc: BaseException) -> FramePayloadError | None:
+    """Return the first structured payload error in an exception chain."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, FramePayloadError):
+            return cur
+        # ``pmap`` wraps worker failures without hiding the original.
+        original = getattr(cur, "original", None)
+        if isinstance(original, FramePayloadError):
+            return original
+        cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+    return None
+
+
+def _quarantine_payload_failure(
+    exc: BaseException,
+    input_folder,
+    progress_callback,
+    *,
+    phase: str,
+) -> None:
+    """Quarantine one unreadable source and REFUSE the current run early.
+
+    Called at the parent ZeGrid boundary only. Any other exception is left to
+    the caller (this helper returns ``None``). When a payload error is found,
+    the source is moved to the legacy ``unaligned_by_zemosaic`` folder and a
+    terminal :class:`FramePayloadQuarantineError` is raised: the current plan,
+    membership and gauge are now incoherent, so no science or manifest output
+    may be produced. A fresh run/replan is required.
+    """
+    payload = _payload_error_in_chain(exc)
+    if payload is None:
+        return
+    path = payload.path
+    if not path:
+        raise FramePayloadQuarantineError(
+            "ZeGrid: a frame payload could not be decoded but its path is "
+            f"unknown ({payload}); refusing the run (a new plan/run is required)",
+            path=None,
+            destination=None,
+            move_status=None,
+        ) from exc
+    move = move_to_unaligned(path, input_folder, logger=logger)
+    if move.moved:
+        outcome = (
+            f"The source was moved to the legacy quarantine folder "
+            f"'{move.destination}' (status={move.status})."
+        )
+    else:
+        outcome = (
+            "The source was NOT quarantined "
+            f"(status={move.status}, destination={move.destination})"
+            + (f": {move.detail}" if move.detail else ".")
+        )
+    message = (
+        f"ZeGrid: source frame payload could not be decoded during {phase}: "
+        f"{path} — {payload}. {outcome} The current run "
+        "is REFUSED before any science or manifest output: the plan, frame "
+        "membership and gauge must not continue with this source. A new run / "
+        "replan is required."
+    )
+    _emit(message, lvl="ERROR", callback=progress_callback)
+    try:
+        logger.error(message)
+    except Exception:
+        pass
+    raise FramePayloadQuarantineError(
+        message,
+        path=str(path),
+        destination=move.destination,
+        move_status=move.status,
+    ) from exc
 
 
 def _reference_provenance(global_reference_frame_id, cell_frame_ids, cell_reference_frame_id, per_cell=False):
@@ -11658,12 +11762,18 @@ def _run_single(
         )
     else:
         with timings.timed("gauge"):
-            global_gauge, global_frame_ids = zphot.compute_global_gauge(
-                descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
-                progress_callback=_gauge_progress,
-                emit=_emit_live,
-                diagnostics=gauge_diagnostics,
-            )
+            try:
+                global_gauge, global_frame_ids = zphot.compute_global_gauge(
+                    descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
+                    progress_callback=_gauge_progress,
+                    emit=_emit_live,
+                    diagnostics=gauge_diagnostics,
+                )
+            except Exception as _gauge_exc:
+                _quarantine_payload_failure(
+                    _gauge_exc, input_folder, progress_callback, phase="gauge"
+                )
+                raise
         _gauge_rep.end(
             throughput=_fmt_throughput(len(descs), timings.get("gauge"), "frames/s")
         )
@@ -12365,15 +12475,21 @@ def _run_single(
             global_reference_frame_id, tile_size, _cache_workers,
             _r40_coords_by_cell, _STACK_PHASE_PROFILING,
         )
-        _res = zpar.pmap(
-            _stack_cell, _tasks, workers=_workers,
-            progress_callback=_progress, emit=_emit_live, meta=_meta,
-            initializer=_init_stack_worker,
-            initargs=_initargs,
-            serial_fallback=not gpu_attempt,
-            heartbeat=heartbeat,
-            heartbeat_interval_s=heartbeat_interval_s,
-        )
+        try:
+            _res = zpar.pmap(
+                _stack_cell, _tasks, workers=_workers,
+                progress_callback=_progress, emit=_emit_live, meta=_meta,
+                initializer=_init_stack_worker,
+                initargs=_initargs,
+                serial_fallback=not gpu_attempt,
+                heartbeat=heartbeat,
+                heartbeat_interval_s=heartbeat_interval_s,
+            )
+        except Exception as _batch_exc:
+            _quarantine_payload_failure(
+                _batch_exc, input_folder, progress_callback, phase="cell cache"
+            )
+            raise
         return _res, _meta
 
     def _run_r55_active_cpu_waves(*, science_cfg, start_bundle,
@@ -14538,6 +14654,12 @@ def _run_single(
             # refusal: the store is the authority and its fault stays typed.
             raise
         except BaseException as exc:  # noqa: BLE001 - exactly one CPU fallback
+            # ZM-IO-REJECT-01: an unreadable source is TERMINAL. Never turn it
+            # into a GPU->CPU fallback (the CPU rerun would hit the same file)
+            # and never continue with an incoherent membership.
+            _quarantine_payload_failure(
+                exc, input_folder, progress_callback, phase="cell cache"
+            )
             # Deterministic cleanup: the pipeline already released its staged
             # units; also clear any per-cell cache left by a failed worker.
             for _t in tasks:
@@ -15865,6 +15987,12 @@ def _run_single(
                 science_config, gpu_tile_size, gpu_attempt=True
             )
         except Exception as exc:
+            # ZM-IO-REJECT-01: a structured unreadable-source failure is TERMINAL
+            # and must never be reclassified as a GPU runtime failure (which
+            # would launch a pointless CPU rerun on the same bad file).
+            _quarantine_payload_failure(
+                exc, input_folder, progress_callback, phase="cell cache"
+            )
             if zgpu.is_gpu_runtime_error(exc):
                 # H1 / R36 F-M2 / R41-B: classified GPU runtime failure -> ONE
                 # bounded, FULLY re-planned CPU admission cycle on the SAME final

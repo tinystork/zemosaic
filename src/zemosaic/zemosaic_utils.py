@@ -88,6 +88,7 @@ map_coordinates = None  # Lazily imported when needed
 
 
 logger = logging.getLogger(__name__)
+from .io_quarantine import FramePayloadError  # noqa: E402  (structured loader error)
 _PREVIEW_WCS_LINEARIZED_LOGGED = False
 _PHASE5_GPU_OOM_HINT: dict[str, int | None] = {"max_chunk_bytes": None, "rows_per_chunk": None, "oom_events": 0}
 
@@ -4078,6 +4079,7 @@ def load_image_with_optional_alpha(
     header = None
     alpha = None
     info = None
+    primary_error: BaseException | None = None
     try:
         data, header, info = load_and_validate_fits(
             path,
@@ -4086,24 +4088,60 @@ def load_image_with_optional_alpha(
             progress_callback=progress_callback,
         )
         alpha = info.get("alpha_mask") if isinstance(info, dict) else None
+        if data is None:
+            # ``load_and_validate_fits`` ABSORBS its exceptions and returns
+            # ``(None, header, info)``. Treat that exactly like a raised error:
+            # the raw fallback is the documented recovery path and the original
+            # cause must never be silently replaced by a generic RuntimeError.
+            primary_error = RuntimeError(
+                "load_and_validate_fits returned no image data"
+            )
     except Exception as exc:
+        primary_error = exc
+
+    if primary_error is not None:
         _emit(
-            f"[GRID] Failed to load FITS via load_and_validate_fits ({exc}); falling back to raw read",
+            f"[GRID] Failed to load FITS via load_and_validate_fits ({primary_error}); falling back to raw read",
             lvl="WARN",
             callback=progress_callback,
         )
-        with _open_fits_safely(path) as hdul:
-            data = hdul[0].data
-            header = hdul[0].header if hasattr(hdul[0], "header") else None
-            alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
-            if alpha_hdu is not None and alpha_hdu.data is not None:
-                try:
-                    alpha = np.asarray(alpha_hdu.data, dtype=np.float32)
-                except Exception:
-                    alpha = None
+        try:
+            with _open_fits_safely(path) as hdul:
+                data = hdul[0].data
+                header = hdul[0].header if hasattr(hdul[0], "header") else None
+                alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
+                if alpha_hdu is not None and alpha_hdu.data is not None:
+                    try:
+                        alpha = np.asarray(alpha_hdu.data, dtype=np.float32)
+                    except Exception:
+                        alpha = None
+        except Exception as raw_exc:
+            from .io_quarantine import describe_exception
+
+            primary_txt = describe_exception(primary_error)
+            raw_txt = describe_exception(raw_exc)
+            raise FramePayloadError(
+                f"Failed to load frame {path}: primary loader failed "
+                f"({primary_txt}); raw fallback failed ({raw_txt})",
+                path=str(path),
+                primary_error=primary_txt,
+                raw_error=raw_txt,
+            ) from raw_exc
 
     if data is None:
-        raise RuntimeError(f"Failed to load frame {path}")
+        from .io_quarantine import describe_exception
+
+        primary_txt = (
+            describe_exception(primary_error) if primary_error is not None else None
+        )
+        raw_txt = "raw read returned no image data"
+        raise FramePayloadError(
+            f"Failed to load frame {path}: primary loader failed "
+            f"({primary_txt}); raw fallback returned no data",
+            path=str(path),
+            primary_error=primary_txt,
+            raw_error=raw_txt,
+        )
 
     raw_shape = getattr(data, "shape", None)
     raw_dtype = getattr(data, "dtype", None)

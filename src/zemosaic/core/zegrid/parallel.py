@@ -42,6 +42,44 @@ from . import ram_contract as rcontract
 
 log = logging.getLogger(__name__)
 
+
+class ParallelTaskError(RuntimeError):
+    """A worker call failed at a known task index (NEVER a pool fallback).
+
+    ZM-IO-REJECT-01: a deterministic worker failure (unreadable frame, science
+    error, programming error) must propagate with its index and original cause.
+    It must never be re-labelled ``parallel map unavailable`` nor replayed on the
+    whole wave in serial.
+    """
+
+    def __init__(self, index: int, task, original: BaseException) -> None:
+        self.index = int(index)
+        self.task = task
+        self.original = original
+        super().__init__(
+            f"parallel task failed at index {self.index} "
+            f"({type(original).__name__}: {original})"
+        )
+
+
+class ParallelPoolError(RuntimeError):
+    """The executor/pool itself failed after work had already been dispatched.
+
+    No serial replay is performed: re-running already launched tasks could
+    duplicate side effects and hides the real pool failure. A pool failure
+    BEFORE any useful work may still take the historical bounded serial
+    fallback (see :func:`pmap`).
+    """
+
+
+def _is_broken_pool_error(exc: BaseException) -> bool:
+    try:
+        from concurrent.futures.process import BrokenProcessPool
+
+        return isinstance(exc, BrokenProcessPool)
+    except Exception:  # pragma: no cover - defensive
+        return False
+
 # Fixed per-worker baseline (bytes): numpy/astropy/reproject/shapely import
 # footprint (~330 MiB, matching the R6 STREAMING_BASELINE_KIB measurement).
 # ZM-ZEGRID-R41 (L3): a SINGLE authoritative process-baseline source. The
@@ -1094,18 +1132,24 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
     )
 
     def _run_pool(pool):
-        """Ordered results with a parent-side heartbeat wait loop (no thread).
+        """Ordered results, with an optional parent-side heartbeat wait loop.
 
-        The heartbeat is called by the PARENT while futures run. No sampler
-        thread exists when ProcessPoolExecutor forks/spawns its workers.
+        ZM-IO-REJECT-01: a worker/future exception is ALWAYS surfaced as
+        :class:`ParallelTaskError` with its task index and original cause. It is
+        never reclassified as an executor failure, so it can never trigger the
+        historical whole-wave serial replay. Already submitted tasks are
+        cancelled (not re-executed).
         """
         out = [None] * total
         recorded = set()
         reported = 0
         last_call = None
+        futures = []
 
         def _call_heartbeat(now):
             nonlocal last_call
+            if heartbeat is None:
+                return
             try:
                 heartbeat()
                 if meta is not None:
@@ -1128,70 +1172,83 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                 )
             last_call = now
 
-        # Sample once BEFORE submitting (no worker is forked yet, no E1
-        # thread exists), then keep a parent-side cadence while futures run.
-        now = time.monotonic()
-        _call_heartbeat(now)
-        futures = [pool.submit(worker, task) for task in tasks]
+        def _collect(index, future):
+            try:
+                out[index] = future.result()
+            except Exception as exc:
+                for pending_future in futures:
+                    if pending_future is not future:
+                        pending_future.cancel()
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                if _is_broken_pool_error(exc):
+                    raise ParallelPoolError(
+                        "executor failed while collecting task "
+                        f"{index} ({type(exc).__name__}: {exc})"
+                    ) from exc
+                raise ParallelTaskError(index, tasks[index], exc) from exc
+            recorded.add(index)
+
+        # Sample once BEFORE submitting (no worker is forked yet), then keep a
+        # parent-side cadence while futures run.
+        if heartbeat is not None:
+            _call_heartbeat(time.monotonic())
+        try:
+            futures = [pool.submit(worker, task) for task in tasks]
+        except Exception as exc:
+            for pending_future in futures:
+                pending_future.cancel()
+            raise ParallelPoolError(
+                f"executor submit failed after {len(futures)} submitted task(s) "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
         pending = set(futures)
         while pending:
-            now = time.monotonic()
-            timeout = max(0.0, interval_s - (now - last_call))
-            done, pending = concurrent.futures.wait(
-                pending, timeout=timeout
-            )
+            if heartbeat is None:
+                done, pending = concurrent.futures.wait(pending)
+            else:
+                now = time.monotonic()
+                timeout = max(0.0, interval_s - (now - last_call))
+                done, pending = concurrent.futures.wait(
+                    pending, timeout=timeout
+                )
             for index, future in enumerate(futures):
                 if index in recorded or future not in done:
                     continue
-                out[index] = future.result()
-                recorded.add(index)
+                _collect(index, future)
             while reported < total and reported in recorded:
                 reported += 1
                 _report(reported)
-            now = time.monotonic()
-            if now - last_call >= interval_s:
-                _call_heartbeat(now)
+            if heartbeat is not None:
+                now = time.monotonic()
+                if now - last_call >= interval_s:
+                    _call_heartbeat(now)
         for index, future in enumerate(futures):
             if index not in recorded:
-                out[index] = future.result()
-                recorded.add(index)
+                _collect(index, future)
         while reported < total and reported in recorded:
             reported += 1
             _report(reported)
-        if meta is not None:
+        if heartbeat is not None and meta is not None:
             meta["heartbeat_mode"] = "parent_wait"
         return out
 
+    # Executor CREATION is the only failure that may still take the historical
+    # bounded serial fallback (no useful work has started yet). A worker/future
+    # failure below never falls back.
     try:
         if kind == "thread":
-            # ThreadPoolExecutor has no initializer; the parent already called it.
-            with Executor(max_workers=workers) as pool:
-                if heartbeat is None:
-                    out = []
-                    for i, res in enumerate(pool.map(worker, tasks)):
-                        out.append(res)
-                        _report(i + 1)
-                else:
-                    out = _run_pool(pool)
+            pool = Executor(max_workers=workers)
         else:
-            with Executor(
+            pool = Executor(
                 max_workers=workers,
                 initializer=initializer,
                 initargs=tuple(initargs),
-            ) as pool:
-                if heartbeat is None:
-                    out = []
-                    for i, res in enumerate(pool.map(worker, tasks)):
-                        out.append(res)
-                        _report(i + 1)
-                else:
-                    out = _run_pool(pool)
-        _finish(meta, t0, total)
-        return out
-    except Exception as exc:  # noqa: BLE001 - fail-safe: never let parallelism crash
+            )
+    except Exception as exc:  # noqa: BLE001 - executor creation failed
         if not serial_fallback:
-            # ZM-ZEGRID-R22: re-raise instead of the SAME-config serial retry (the
-            # caller classifies the error and owns the one-shot CPU rerun).
             raise
         log.warning(
             "[ZEGRID] parallel map unavailable (%s: %s); falling back to serial",
@@ -1210,6 +1267,32 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         out = _run_serial()
         _finish(meta, t0, total)
         return out
+
+    try:
+        with pool:
+            out = _run_pool(pool)
+        _finish(meta, t0, total)
+        return out
+    except (ParallelTaskError, ParallelPoolError):
+        # A deterministic worker failure or a mid-run pool failure is PROPAGATED.
+        # Replaying the wave in serial would re-run successful tasks and repeat
+        # the same deterministic failure.
+        if meta is not None:
+            meta["fallback"] = False
+            meta["fallback_reason"] = None
+        raise
+    except Exception as exc:  # noqa: BLE001 - pool/context failure after submission
+        if isinstance(exc, RuntimeError) and "could not start" in str(exc):
+            raise
+        log.error(
+            "[ZEGRID] parallel pool failed after dispatch (%s: %s); "
+            "no serial replay is performed",
+            type(exc).__name__,
+            exc,
+        )
+        raise ParallelPoolError(
+            f"executor failed after dispatch ({type(exc).__name__}: {exc})"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
