@@ -46,7 +46,10 @@ from zemosaic.core.canonical_engine import (
     CanonicalStackRequest,
     CanonicalStackResult,
 )
-from zemosaic.core.canonical_streaming import run_canonical_stack_streaming
+from zemosaic.core.canonical_streaming import (
+    estimate_tile_prefetch_slot_bytes,
+    run_canonical_stack_streaming,
+)
 
 from . import assembly as za
 from . import execution as zxe
@@ -65,6 +68,7 @@ __all__ = [
     "check_streaming_gate",
     "estimate_streaming_peak_kib",
     "estimate_streaming_delta_kib",
+    "estimate_tile_prefetch_slot_kib",
     "STREAMING_BASELINE_KIB",
     "TILE_WORKSPACE_BYTES_PER_CELL",
     "TILE_FIXED_OVERHEAD_KIB",
@@ -180,6 +184,37 @@ def _num_tiles(h: int, w: int, tile_size) -> int:
     return ((h + th - 1) // th) * ((w + tw - 1) // tw)
 
 
+def estimate_tile_prefetch_slot_kib(
+    n_contributors: int,
+    patch_hw: tuple[int, int],
+    tile_size,
+    channels: int = 3,
+) -> int:
+    """Host bytes retained by ONE prepared intra-cell prefetch slot (KiB).
+
+    ZM-PHASE3-TILE-PREFETCH ledger term. The slot is the maximum extended tile
+    (footprint-taper halo included, clipped to the patch) for EVERY frame:
+    float32 prepared image + bool valid + a documented fixed overhead. It is the
+    ADDITIONAL working set of the capacity-1 producer and is priced separately
+    from the planned streaming bound (which stays p=0 intra-cell), so a refused
+    slot falls back to the historical path without changing admission.
+    """
+    return int(
+        (
+            estimate_tile_prefetch_slot_bytes(
+                n_contributors,
+                int(patch_hw[0]),
+                int(patch_hw[1]),
+                channels,
+                tile_size,
+                _TAPER_HALO_PX,
+            )
+            + 1023
+        )
+        // 1024
+    )
+
+
 def estimate_streaming_peak_kib(
     n_contributors: int,
     patch_hw: tuple[int, int],
@@ -187,6 +222,7 @@ def estimate_streaming_peak_kib(
     channels: int = 3,
     *,
     storage_profile: str = "dense",
+    tile_prefetch_slots: int = 0,
 ) -> int:
     """Streaming peak-RSS estimate (KiB) with the HONEST decomposition.
 
@@ -246,7 +282,15 @@ def estimate_streaming_peak_kib(
         # identical in size to the on-disk cache).
         input_bytes = n_contributors * h * w * (channels * 4 + 1)
 
-    return STREAMING_BASELINE_KIB + workspace_kib + int(
+    prefetch_kib = (
+        0
+        if int(tile_prefetch_slots) <= 0
+        else int(tile_prefetch_slots)
+        * estimate_tile_prefetch_slot_kib(
+            n_contributors, patch_hw, tile_size, channels
+        )
+    )
+    return STREAMING_BASELINE_KIB + workspace_kib + prefetch_kib + int(
         (out_bytes + rej_bytes + input_bytes) / 1024
     )
 
@@ -258,6 +302,7 @@ def estimate_streaming_delta_kib(
     channels: int = 3,
     *,
     storage_profile: str = "dense",
+    tile_prefetch_slots: int = 0,
 ) -> int:
     """The streaming executor's ADDED peak above baseline (KiB).
 
@@ -269,6 +314,7 @@ def estimate_streaming_delta_kib(
     return estimate_streaming_peak_kib(
         n_contributors, patch_hw, tile_size, channels,
         storage_profile=storage_profile,
+        tile_prefetch_slots=tile_prefetch_slots,
     ) - STREAMING_BASELINE_KIB
 
 

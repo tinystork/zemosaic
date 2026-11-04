@@ -57,11 +57,34 @@ _NESTED_PHASES = ("h2d_transfer_s", "d2h_transfer_s", "host_reduction_s")
 _PHASE_TOPOLOGY = {
     "disjoint_phases": list(_DISJOINT_PHASES),
     "nested_inside_reject_combine_host_s": list(_NESTED_PHASES),
+    "overlap_with_tile_prefetch": {
+        "tile_read_s": (
+            "When intra-cell tile prefetch is EFFECTIVE, tile_read_s is the "
+            "consumer's WAIT for the already-prefetched tile. The wait happens "
+            "BEFORE this tile's compute (after the previous iteration ended), so "
+            "it is DISJOINT and does NOT overlap the previous tile's compute. "
+            "OFF (provider.get_tile duration) and ON (consumer wait) measure "
+            "different things: never compare tile_read_s directly across modes "
+            "and never claim its reduction as a speed-up."
+        ),
+        "producer_work_s": (
+            "Observed producer get_tile work (profiling ON only). THIS is the "
+            "read that overlaps consumer compute; it is not a consumer phase and "
+            "must not be added to the disjoint phase sum."
+        ),
+        "overlap_s": (
+            "Measured intersection of real producer get_tile intervals and real "
+            "consumer COMPUTE intervals (profiling ON only). Consumer wait time "
+            "is excluded; this is the only honest overlap/speed-credit evidence."
+        ),
+    },
     "note": (
         "The disjoint phases are non-overlapping top-level spans. The nested "
         "transfer/reduction call durations occur INSIDE reject_combine_host_s; "
         "do not add them to it (that would double count) and do not treat the "
-        "parent span as pure GPU compute (it includes host submission and gaps)."
+        "parent span as pure GPU compute (it includes host submission and gaps). "
+        "With tile prefetch OFF (the default) every listed phase keeps its "
+        "historical disjoint/nested meaning."
     ),
 }
 
@@ -101,6 +124,7 @@ class StackPhaseProfiler:
         "_device_pairs",
         "_device_reason",
         "_extra_syncs",
+        "_tile_prefetch",
     )
 
     def __init__(self, *, backend: str = "cpu") -> None:
@@ -115,6 +139,7 @@ class StackPhaseProfiler:
             None if self._backend == "gpu" else "cpu_backend"
         )
         self._extra_syncs = 0
+        self._tile_prefetch: dict | None = None
 
     # -- accumulation ------------------------------------------------------
 
@@ -139,6 +164,23 @@ class StackPhaseProfiler:
     def note_extra_sync(self, count: int = 1) -> None:
         self._extra_syncs += max(0, int(count))
 
+    def note_tile_prefetch(self, record) -> None:
+        """Attach the bounded intra-cell prefetch telemetry (default absent)."""
+        if not isinstance(record, dict):
+            return
+        # Scalar-only copy: the snapshot must stay strict JSON.
+        allowed = (
+            "schema", "requested", "admitted", "effective", "slot_bytes",
+            "required_bytes", "margin_num", "margin_den", "available_bytes",
+            "budget_bytes", "reason", "queue_capacity", "queue_max",
+            "tiles_total", "tiles_prefetched", "tiles_consumed",
+            "provider_reads", "consumer_wait_count", "consumer_wait_s",
+            "producer_work_s", "overlap_s", "producer_alive_after_join",
+        )
+        self._tile_prefetch = {
+            key: record.get(key) for key in allowed if key in record
+        }
+
     # -- serialisation -----------------------------------------------------
 
     def snapshot(self) -> dict:
@@ -149,7 +191,7 @@ class StackPhaseProfiler:
             }
             for name, (total, count) in self._phases.items()
         }
-        return {
+        out = {
             "schema": STACK_PHASE_PROFILE_SCHEMA,
             "enabled": True,
             "clock": "perf_counter_host_wall",
@@ -184,6 +226,9 @@ class StackPhaseProfiler:
                 ),
             },
         }
+        if self._tile_prefetch is not None:
+            out["tile_prefetch"] = dict(self._tile_prefetch)
+        return out
 
 
 def _parse_snapshot(snap):

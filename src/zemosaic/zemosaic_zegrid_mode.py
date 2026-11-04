@@ -2176,7 +2176,11 @@ def _run_cell_inmem(cache_dir, patch, config, progress_callback, fixed=None, til
 
 def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STREAM_TILE_SIZE,
                      fixed=None, storage_profile=None, storage_info=None,
-                     phase_profiler=None):
+                     phase_profiler=None, tile_prefetch=None,
+                     tile_prefetch_available_bytes=None,
+                     tile_prefetch_budget_bytes=None,
+                     tile_prefetch_base_aggregate_bytes=None,
+                     tile_prefetch_host_budget_bytes=None):
     _profile = zsp.normalize_storage_profile(
         storage_profile if storage_profile is not None else _STACK_STORAGE_PROFILE
     )
@@ -2193,13 +2197,28 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
                 provider, request, tile_size=tile_size, fixed=fixed,
                 rejection_sink=sink,
                 phase_profiler=phase_profiler,
+                tile_prefetch=tile_prefetch,
+                tile_prefetch_available_bytes=tile_prefetch_available_bytes,
+                tile_prefetch_budget_bytes=tile_prefetch_budget_bytes,
+                tile_prefetch_base_aggregate_bytes=tile_prefetch_base_aggregate_bytes,
+                tile_prefetch_host_budget_bytes=tile_prefetch_host_budget_bytes,
             )
         else:
             result = run_canonical_stack_streaming(
                 provider, request, tile_size=tile_size, fixed=fixed,
                 phase_profiler=phase_profiler,
+                tile_prefetch=tile_prefetch,
+                tile_prefetch_available_bytes=tile_prefetch_available_bytes,
+                tile_prefetch_budget_bytes=tile_prefetch_budget_bytes,
+                tile_prefetch_base_aggregate_bytes=tile_prefetch_base_aggregate_bytes,
+                tile_prefetch_host_budget_bytes=tile_prefetch_host_budget_bytes,
             )
         if storage_info is not None:
+            _prefetch_prov = result.provenance.get("tile_prefetch")
+            if _prefetch_prov is not None:
+                # Bounded intra-cell prefetch ledger: requested/admitted/
+                # effective, the exact slot bytes and the refusal reason.
+                storage_info["tile_prefetch"] = dict(_prefetch_prov)
             storage_info.update({
                 "profile": _profile,
                 "model": zsp.storage_model_id(_profile),
@@ -2223,7 +2242,39 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
         sres = _build_cell_sres(result, list(provider.frame_ids))
         mt = za.extract_minitile(patch, sres)
         return mt, sres
-    finally:
+    except BaseException as exc:
+        # F4 (rework R2): NEVER close the provider while a producer declared
+        # alive can still call get_tile. Arm an exact-once deferred close that
+        # runs in the producer's own final block after the thread really exits;
+        # if the thread finished in the meantime, arm returns False and we close
+        # here. The root exception is always re-raised unchanged.
+        _report = getattr(exc, "prefetch_report", None)
+        _handle = getattr(exc, "prefetch_handle", None)
+        _deferred = False
+        if (
+            isinstance(_report, dict)
+            and bool(_report.get("producer_alive_after_join"))
+            and _handle is not None
+        ):
+            try:
+                _deferred = bool(_handle.arm_deferred_close(provider.close))
+            except Exception:
+                _deferred = False
+        if _deferred:
+            if storage_info is not None:
+                storage_info["tile_prefetch_deferred_cleanup"] = True
+                storage_info[
+                    "tile_prefetch_cache_retained_due_live_prefetch"
+                ] = True
+                storage_info["tile_prefetch_producer_alive_after_join"] = True
+            try:
+                exc.tile_prefetch_deferred_cleanup = True
+            except Exception:
+                pass
+        else:
+            provider.close()
+        raise
+    else:
         # R15: release the memmap handles before the caller deletes the cache
         # (Windows: an open .npy cannot be deleted -> WinError 32).
         provider.close()
@@ -4024,6 +4075,45 @@ def _prepare_stack_cell(task):
     }
 
 
+#: Internal A/B switch for the GPU intra-cell tile prefetch. DEFAULT ``auto``
+#: (admission still decides); ``off`` forces the historical path without a
+#: rebuild. Never a GUI knob and never a science input.
+_TILE_PREFETCH_ENV = "ZEMOSAIC_ZEGRID_TILE_PREFETCH"
+
+
+def _gpu_tile_prefetch_request():
+    """Normalized GPU prefetch request from the internal env switch."""
+    token = os.environ.get(_TILE_PREFETCH_ENV, "auto").strip().lower()
+    return token if token in ("auto", "1") else None
+
+
+def _release_unit_cache(payload):
+    """Release ONE unit's aligned cache (pipeline release callback).
+
+    F4 (rework R2): when the unit carries ``_tile_prefetch_deferred_cleanup``, a
+    producer declared still alive may keep calling ``provider.get_tile`` on this
+    cache. Deleting it would be a use-after-free. The cache is then RETAINED with
+    an explicit diagnostic, and the payload records the retention; the pipeline
+    must not be read as "files deleted".
+    """
+    if not isinstance(payload, dict) or payload.get("_empty_unit"):
+        return False
+    if payload.get("_tile_prefetch_deferred_cleanup"):
+        payload["_tile_prefetch_cache_retained_due_live_prefetch"] = True
+        logging.getLogger(__name__).warning(
+            "tile prefetch producer still alive for unit %s: retaining cache %s "
+            "instead of deleting it (deferred provider close)",
+            payload.get("_unit_index"),
+            payload.get("cache_dir"),
+        )
+        return False
+    cache_dir = payload.get("cache_dir")
+    if cache_dir is None:
+        return False
+    _safe_rmtree(cache_dir, None)
+    return True
+
+
 def _consume_stack_cell(prepared, *, tile_size=None):
     """GPU/CPU owner-side consumption of ONE prepared cell (stack + crop).
 
@@ -4069,6 +4159,11 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         else None
     )
     storage_info = {}
+    # F2: RUN-boundary prefetch admission facts (None on paths without them).
+    _pf_available = None
+    _pf_budget = None
+    _pf_base = None
+    _pf_host = None
     if mode == "inmem" and zsp.is_bounded(storage_profile):
         raise RuntimeError(
             "storage_profile='bounded' received an in-memory cell task; the "
@@ -4090,14 +4185,59 @@ def _consume_stack_cell(prepared, *, tile_size=None):
                                    fixed=cell_fixed, tile_size=inmem_tile,
                                    phase_profiler=_phase_profiler)
     else:
-        mt, sres = _run_cell_stream(
-            cache_dir, patch, _STACK_CONFIG, None,
-            tile_size=int(_STACK_TILE_SIZE if tile_size is None else tile_size),
-            fixed=cell_fixed,
-            storage_profile=storage_profile,
-            storage_info=storage_info,
-            phase_profiler=_phase_profiler,
+        # ZM-PHASE3-TILE-PREFETCH: only the ZeGrid GPU file-backed path requests
+        # intra-cell prefetch, and only as ``auto``. F2 (rework R1): admission
+        # uses the AUTHORITATIVE RUN-boundary facts carried in the payload:
+        # the same-checkpoint raw MemAvailable, the admitted host aggregate and
+        # the 90 % host budget. There is no late re-read of MemAvailable and no
+        # admission on raw RAM alone. Missing facts => the executor fails closed
+        # to the historical path (never a silent bypass of the budget).
+        _gpu_prefetch = (
+            _gpu_tile_prefetch_request()
+            if str(getattr(_STACK_CONFIG, "backend", "cpu")).strip().lower() == "gpu"
+            else None
         )
+        _pf_available = (
+            prepared.get("_tile_prefetch_raw_available_bytes")
+            if isinstance(prepared, dict) else None
+        )
+        _pf_budget = (
+            prepared.get("_tile_prefetch_budget_bytes")
+            if isinstance(prepared, dict) else None
+        )
+        _pf_base = (
+            prepared.get("_tile_prefetch_base_aggregate_bytes")
+            if isinstance(prepared, dict) else None
+        )
+        _pf_host = (
+            prepared.get("_tile_prefetch_host_budget_bytes")
+            if isinstance(prepared, dict) else None
+        )
+        try:
+            mt, sres = _run_cell_stream(
+                cache_dir, patch, _STACK_CONFIG, None,
+                tile_size=int(_STACK_TILE_SIZE if tile_size is None else tile_size),
+                fixed=cell_fixed,
+                storage_profile=storage_profile,
+                storage_info=storage_info,
+                phase_profiler=_phase_profiler,
+                tile_prefetch=_gpu_prefetch,
+                tile_prefetch_available_bytes=_pf_available,
+                tile_prefetch_budget_bytes=_pf_budget,
+                tile_prefetch_base_aggregate_bytes=_pf_base,
+                tile_prefetch_host_budget_bytes=_pf_host,
+            )
+        except BaseException:
+            # F4 (rework R2): a live producer owns the provider AND the cache.
+            # Propagate a structured marker so the pipeline release NEVER deletes
+            # the cache of a unit whose prefetch thread may still be reading it.
+            if storage_info.get("tile_prefetch_deferred_cleanup"):
+                prepared["_tile_prefetch_deferred_cleanup"] = True
+                prepared[
+                    "_tile_prefetch_cache_retained_due_live_prefetch"
+                ] = True
+                prepared["_tile_prefetch_producer_alive_after_join"] = True
+            raise
     stack_s = time.perf_counter() - t0
 
     core = za.crop_all_planes_to_core(mt)
@@ -4124,6 +4264,30 @@ def _consume_stack_cell(prepared, *, tile_size=None):
     if zsp.is_bounded(storage_profile):
         record["storage_profile"] = storage_profile
         record["storage"] = dict(storage_info)
+    # Additive, request-only: honest intra-cell prefetch ledger. Absent on the
+    # CPU path and on every run that did not request it (byte-identical record).
+    if storage_info.get("tile_prefetch") is not None:
+        _pf_ledger = dict(storage_info["tile_prefetch"])
+        if _pf_base is not None:
+            _pf_ledger.setdefault("base_aggregate_bytes", int(_pf_base))
+            _pf_ledger.setdefault(
+                "host_budget_bytes",
+                None if _pf_host is None else int(_pf_host),
+            )
+            _pf_ledger.setdefault(
+                "budget_headroom_bytes",
+                None if _pf_budget is None else int(_pf_budget),
+            )
+            _pf_ledger.setdefault(
+                "projected_aggregate_bytes",
+                int(_pf_base)
+                + (
+                    int(_pf_ledger.get("required_bytes") or 0)
+                    if int(_pf_ledger.get("effective") or 0)
+                    else 0
+                ),
+            )
+        record["tile_prefetch"] = _pf_ledger
 
     # Per-cell temp reuse: delete the cache after stacking (bounded disk). R15
     # best-effort; a failure is reported so the parent can WARN + record.
@@ -13556,11 +13720,9 @@ def _run_single(
             return int(_current_peak())
 
         def _release(payload):
-            if payload.get("_empty_unit"):
-                return
-            cache_dir = payload.get("cache_dir")
-            if cache_dir is not None:
-                _safe_rmtree(cache_dir, None)
+            # F4 (rework R2): shared with the targeted release test; never
+            # deletes a cache a live prefetch producer may still read.
+            _release_unit_cache(payload)
 
         _unit_progress = {"done": 0}
         # M1: capture the authorised generation at DISPATCH. The completion
@@ -14053,6 +14215,19 @@ def _run_single(
                 )
             t_unit = time.perf_counter()
             payload["_stack_tile_size"] = int(tile_now)
+            # F2 (rework R1): carry the AUTHORITATIVE checkpoint facts for the
+            # EFFECTIVE tile (post-shrink ``check``) into the consumer. The
+            # executor admits the slot only when
+            # ``required <= raw_available`` AND
+            # ``base_aggregate + required <= host_budget``.
+            payload["_tile_prefetch_raw_available_bytes"] = int(raw)
+            payload["_tile_prefetch_base_aggregate_bytes"] = int(
+                check["host_aggregate_bytes"]
+            )
+            payload["_tile_prefetch_host_budget_bytes"] = int(budget)
+            payload["_tile_prefetch_budget_bytes"] = max(
+                0, int(budget) - int(check["host_aggregate_bytes"])
+            )
             try:
                 result = _consume_stack_cell(payload)
             except BaseException:
