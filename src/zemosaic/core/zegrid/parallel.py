@@ -1014,10 +1014,14 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
       * daemonic parent     -> ``ThreadPoolExecutor`` (a daemonic process may not
         spawn child processes; threads preserve order and share module state).
 
-    FAIL-SAFE: any failure of the parallel path (daemonic asserts, spawn/pickle
-    errors, ``OSError``, ``BrokenProcessPool``, ...) degrades to the serial loop
-    with a WARN surfaced via BOTH ``log`` and ``emit`` — a parallel failure can
-    never crash the run.
+    FAIL-SAFE: an executor CREATION failure (before any task is submitted)
+    degrades to the serial loop with a WARN surfaced via BOTH ``log`` and
+    ``emit``. A deterministic ``worker(task)`` / ``future.result()`` failure is
+    NOT a pool-unavailability event: it propagates as
+    :class:`ParallelTaskError` with its task index and original cause, cancels
+    the still-annulable tasks and NEVER replays the wave in serial (see
+    ZM-IO-REJECT-01). A mid-run pool failure propagates as
+    :class:`ParallelPoolError` without replay.
     """
     tasks = list(tasks)
     total = len(tasks)
@@ -1207,12 +1211,16 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         pending = set(futures)
         while pending:
             if heartbeat is None:
-                done, pending = concurrent.futures.wait(pending)
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
             else:
                 now = time.monotonic()
                 timeout = max(0.0, interval_s - (now - last_call))
                 done, pending = concurrent.futures.wait(
-                    pending, timeout=timeout
+                    pending,
+                    timeout=timeout,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
                 )
             for index, future in enumerate(futures):
                 if index in recorded or future not in done:
@@ -1269,19 +1277,26 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         return out
 
     try:
-        with pool:
-            out = _run_pool(pool)
-        _finish(meta, t0, total)
-        return out
+        out = _run_pool(pool)
     except (ParallelTaskError, ParallelPoolError):
         # A deterministic worker failure or a mid-run pool failure is PROPAGATED.
         # Replaying the wave in serial would re-run successful tasks and repeat
-        # the same deterministic failure.
+        # the same deterministic failure. Do NOT wait for still-running tasks
+        # here: the parent must observe the failure immediately; remaining
+        # annulable tasks are cancelled.
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         if meta is not None:
             meta["fallback"] = False
             meta["fallback_reason"] = None
         raise
     except Exception as exc:  # noqa: BLE001 - pool/context failure after submission
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         if isinstance(exc, RuntimeError) and "could not start" in str(exc):
             raise
         log.error(
@@ -1293,6 +1308,10 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         raise ParallelPoolError(
             f"executor failed after dispatch ({type(exc).__name__}: {exc})"
         ) from exc
+    else:
+        pool.shutdown(wait=True)
+        _finish(meta, t0, total)
+        return out
 
 
 # ---------------------------------------------------------------------------

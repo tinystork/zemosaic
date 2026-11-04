@@ -800,7 +800,10 @@ def _move_to_unaligned_safe(
     tuple[str, Path | None]
         ``(status, destination_path)`` where ``status`` is one of
         ``{"moved", "skipped_excluded", "missing", "already_moved", "conflict", "failed"}``.
-        ``destination_path`` is provided when a target directory is known.
+        A collision-safe successful move (the shared helper's ``moved_renamed``)
+        is reported as the historical ``"moved"`` so every existing worker
+        consumer keeps its branch. ``destination_path`` is provided when a
+        target directory is known.
     """
 
     if _shared_move_to_unaligned is not None:
@@ -820,7 +823,12 @@ def _move_to_unaligned_safe(
                 )
             except Exception:
                 pass
-        return result.as_tuple()
+        status, destination = result.as_tuple()
+        # Contract compatibility: renamed collisions are a successful legacy
+        # move, not a new status the existing worker consumers do not handle.
+        if status == "moved_renamed":
+            status = "moved"
+        return status, destination
 
     # Fallback (import-time failure only): preserve the historical behaviour.
     try:

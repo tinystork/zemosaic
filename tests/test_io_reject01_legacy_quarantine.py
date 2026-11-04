@@ -7,7 +7,11 @@ any production run are strictly out of scope.
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -96,14 +100,77 @@ def test_source_already_in_quarantine_is_skipped(tmp_path):
     assert src.exists()
 
 
-def test_worker_legacy_wrapper_keeps_tuple_contract(tmp_path):
-    from zemosaic import zemosaic_worker as zworker
+def test_nested_source_quarantines_next_to_itself(tmp_path):
+    """Legacy contract: nested frame -> its OWN sibling unaligned folder."""
+    root = tmp_path / "input"
+    src = _write(root / "M45" / "bad.fit")
 
+    result = ziq.move_to_unaligned(src, src.parent)
+
+    assert result.status == ziq.STATUS_MOVED
+    assert Path(result.destination) == (
+        root / "M45" / "unaligned_by_zemosaic" / "bad.fit"
+    )
+    assert not (root / "unaligned_by_zemosaic").exists()
+    assert zin.scan_input_fits(root) == []
+
+
+def _run_worker_wrapper(source: Path, owner_root: Path) -> tuple[str, str]:
+    """Run the legacy worker wrapper in a CLEAN subprocess.
+
+    Importing ``zemosaic_worker`` in the pytest process has a pre-existing
+    logging side effect (``ZeMosaicWorker.propagate=False``) that can silence an
+    unrelated caplog test. Isolating the witness keeps the combined suite
+    order-independent without changing production logging.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    code = (
+        "import sys\n"
+        "from zemosaic import zemosaic_worker as zworker\n"
+        "status, destination = zworker._move_to_unaligned_safe(\n"
+        "    sys.argv[1], sys.argv[2]\n"
+        ")\n"
+        "print(status)\n"
+        "print(destination)\n"
+    )
+    env = dict(os.environ)
+    src = str(repo_root / "src")
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(source), str(owner_root)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    lines = proc.stdout.strip().splitlines()
+    assert len(lines) >= 2, proc.stdout
+    return lines[0], lines[1]
+
+
+def test_worker_legacy_wrapper_keeps_tuple_contract(tmp_path):
     root = tmp_path / "input"
     src = _write(root / "light.fit")
-    status, destination = zworker._move_to_unaligned_safe(str(src), str(root))
+    status, destination = _run_worker_wrapper(src, root)
     assert status == "moved"
     assert Path(destination) == root / "unaligned_by_zemosaic" / "light.fit"
+
+
+def test_worker_legacy_wrapper_maps_collision_to_moved(tmp_path):
+    """A renamed collision is still the historical ``moved`` status."""
+    root = tmp_path / "input"
+    src = _write(root / "light.fit", b"new-source")
+    existing = _write(root / "unaligned_by_zemosaic" / "light.fit", b"old-dest")
+
+    status, destination = _run_worker_wrapper(src, root)
+
+    assert status == "moved"
+    expected = root / "unaligned_by_zemosaic" / "light__1.fit"
+    assert Path(destination) == expected
+    assert expected.read_bytes() == b"new-source"
+    assert existing.read_bytes() == b"old-dest"
+    assert not src.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +224,11 @@ def test_build_frame_descriptors_quarantines_wcs_reject(tmp_path, monkeypatch):
     assert entry["path"] == str(bad)
     assert entry["quarantine_status"] == "moved"
     assert Path(entry["quarantine_destination"]) == (
-        root / "unaligned_by_zemosaic" / "bad.fit"
+        root / "M45" / "unaligned_by_zemosaic" / "bad.fit"
     )
     assert not bad.exists()
-    assert (root / "unaligned_by_zemosaic" / "bad.fit").is_file()
-    # A future inventory never re-ingests the rejected source.
+    assert (root / "M45" / "unaligned_by_zemosaic" / "bad.fit").is_file()
+    # A future recursive inventory never re-ingests the rejected source.
     assert [Path(p) for p in zin.scan_input_fits(root)] == [good]
 
 
@@ -339,6 +406,47 @@ def _pmap_payload_worker(task):
     )
 
 
+def test_pmap_first_completed_returns_early_error_without_waiting(
+    monkeypatch, caplog
+):
+    """An early failure must not wait for a blocked later task, and pending
+    tasks must be cancelled (never executed, never replayed)."""
+    release = threading.Event()
+    started = []
+    started_lock = threading.Lock()
+
+    def _worker(value):
+        with started_lock:
+            started.append(value)
+        if value == 0:
+            raise RuntimeError("early payload failure")
+        if value in (1, 2):
+            # Deterministically occupy both running slots so a queued later task
+            # (3) cannot start before the early failure is observed.
+            release.wait(10.0)
+        return value
+
+    monkeypatch.setattr(zpar, "_parent_is_daemonic", lambda: True)
+    meta = {}
+    started_at = time.monotonic()
+    try:
+        with caplog.at_level(logging.WARNING, logger=zpar.log.name):
+            with pytest.raises(zpar.ParallelTaskError) as info:
+                zpar.pmap(_worker, [0, 1, 2, 3], workers=2, meta=meta)
+        elapsed = time.monotonic() - started_at
+    finally:
+        release.set()
+
+    assert info.value.index == 0
+    assert "early payload failure" in str(info.value)
+    assert elapsed < 5.0, f"pmap waited for the blocked task ({elapsed:.2f}s)"
+    assert meta["fallback"] is False
+    assert 3 not in started
+    assert started.count(0) == 1
+    assert "parallel map unavailable" not in caplog.text
+    assert "falling back to SERIAL" not in caplog.text
+
+
 def test_pmap_preserves_structured_payload_error_across_process(tmp_path):
     tasks = [tmp_path / "bad_a.fit", tmp_path / "bad_b.fit"]
     with pytest.raises(zpar.ParallelTaskError) as info:
@@ -403,10 +511,12 @@ def test_boundary_quarantines_source_and_refuses_run(tmp_path):
     exc = info.value
     assert exc.path == str(bad)
     assert exc.move_status == "moved"
-    assert Path(exc.destination) == root / "unaligned_by_zemosaic" / "broken.fit"
+    assert Path(exc.destination) == (
+        root / "M45" / "unaligned_by_zemosaic" / "broken.fit"
+    )
     assert not bad.exists()
     assert untouched.exists()
-    assert [p.name for p in (root / "unaligned_by_zemosaic").iterdir()] == [
+    assert [p.name for p in (root / "M45" / "unaligned_by_zemosaic").iterdir()] == [
         "broken.fit"
     ]
     text = str(exc)

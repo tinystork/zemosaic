@@ -1,9 +1,10 @@
 """ZM-IO-REJECT-01 — legacy source-quarantine contract (shared, dependency-free).
 
 The historical ZeMosaic pipeline moved terminally unusable source frames into
-``<input_root>/unaligned_by_zemosaic``. That directory is already excluded by the
-classic scanner and by :mod:`zemosaic.input_inventory`, so a rejected source can
-never be re-ingested by a later run.
+``unaligned_by_zemosaic`` *next to the source itself* (the legacy call passed
+``Path(file_path).parent`` as the owner root). That sibling directory is already
+excluded by the classic scanner and by :mod:`zemosaic.input_inventory`, so a
+rejected source can never be re-ingested by a later run.
 
 This module restores that contract as ONE shared implementation used by both the
 worker and the ZeGrid product path. It deliberately has no ZeMosaic imports (no
@@ -193,12 +194,17 @@ def _claim_and_move(src: Path, dst: Path) -> None:
 
 def move_to_unaligned(
     src_path,
-    input_root,
+    owner_root,
     *,
     logger: logging.Logger | None = None,
     max_suffix: int = MAX_COLLISION_SUFFIX,
 ) -> QuarantineResult:
-    """Move ``src_path`` into ``<input_root>/unaligned_by_zemosaic``.
+    """Move ``src_path`` into ``<owner_root>/unaligned_by_zemosaic``.
+
+    Legacy callers pass the SOURCE'S IMMEDIATE PARENT as ``owner_root`` (the
+    historical ``_move_to_unaligned_safe(file, Path(file).parent)`` contract),
+    which keeps a nested frame in its own folder instead of relocating it to the
+    global input root.
 
     Idempotent and collision-safe. A source already under the quarantine folder
     is left untouched. An existing destination is never overwritten: the move
@@ -206,7 +212,7 @@ def move_to_unaligned(
     """
     log = logger or logging.getLogger(__name__)
     src = _resolved(src_path)
-    root = _resolved(input_root)
+    root = _resolved(owner_root)
 
     if _is_in_quarantine(src):
         return QuarantineResult(STATUS_SKIPPED_EXCLUDED, str(src))

@@ -718,10 +718,11 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback, *, si
     """Convert legacy ``FrameInfo`` (WCS populated) to ZeGrid ``FrameDescriptor``.
 
     Each frame's WCS is QUALIFIED (2-D celestial TAN — plain or SIP). Unqualified
-    frames are recorded (never silently dropped), moved to the legacy
-    ``<input_root>/unaligned_by_zemosaic`` quarantine (the exact historical
-    contract, already excluded by the scanner) and skipped; if NONE qualify a
-    ``RuntimeError`` is raised (no silent degradation).
+    frames are recorded (never silently dropped), moved to the historical
+    sibling quarantine folder ``<frame parent>/unaligned_by_zemosaic`` (the exact
+    legacy ``Path(file_path).parent`` contract, already excluded by the scanner)
+    and skipped; if NONE qualify a ``RuntimeError`` is raised (no silent
+    degradation).
 
     ``sip_mode`` controls SIP handling:
       * ``"keep"``  (default) — accept and correctly apply SIP distortion.
@@ -733,7 +734,11 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback, *, si
     rejected = []
 
     def _reject(fi, reason: str) -> None:
-        move = move_to_unaligned(fi.path, base, logger=logger)
+        # Legacy location: the quarantine folder is a SIBLING of the source
+        # (``_move_to_unaligned_safe(file, Path(file).parent)``), never the
+        # global input root for a nested frame.
+        owner_root = Path(fi.path).expanduser().parent
+        move = move_to_unaligned(fi.path, owner_root, logger=logger)
         entry = {
             "path": str(fi.path),
             "reason": reason,
@@ -4649,8 +4654,9 @@ def _quarantine_payload_failure(
 
     Called at the parent ZeGrid boundary only. Any other exception is left to
     the caller (this helper returns ``None``). When a payload error is found,
-    the source is moved to the legacy ``unaligned_by_zemosaic`` folder and a
-    terminal :class:`FramePayloadQuarantineError` is raised: the current plan,
+    the source is moved to the historical sibling quarantine folder
+    ``<source parent>/unaligned_by_zemosaic`` and a terminal
+    :class:`FramePayloadQuarantineError` is raised: the current plan,
     membership and gauge are now incoherent, so no science or manifest output
     may be produced. A fresh run/replan is required.
     """
@@ -4666,7 +4672,7 @@ def _quarantine_payload_failure(
             destination=None,
             move_status=None,
         ) from exc
-    move = move_to_unaligned(path, input_folder, logger=logger)
+    move = move_to_unaligned(path, Path(path).expanduser().parent, logger=logger)
     if move.moved:
         outcome = (
             f"The source was moved to the legacy quarantine folder "
