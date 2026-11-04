@@ -342,7 +342,7 @@ def _third_axis_kind(ctype3: str) -> str | None:
     return "other"
 
 
-def _admit_rgb_chw_cube(header, data) -> tuple[bool, str | None, tuple[int, int] | None]:
+def _admit_rgb_chw_cube(header, shape) -> tuple[bool, str | None, tuple[int, int] | None]:
     """Admission gate for a 3-D primary that is an RGB CHW cube.
 
     Returns ``(admitted, reason, shape_hw)``:
@@ -359,12 +359,20 @@ def _admit_rgb_chw_cube(header, data) -> tuple[bool, str | None, tuple[int, int]
 
     ``WCSAXES=2`` alone is deliberately NOT accepted as proof of a channel axis:
     the header and pixel dimensions must also agree on the CHW contract.
+
+    ZM-WCS-02: *shape* is an immutable ``tuple`` of axis lengths obtained from
+    the header-derived ``PrimaryHDU.shape``. This gate must never receive (or
+    touch) a pixel array: the WCS/shape loader is header-only and the pixel
+    payload is validated later by the scientific decoder.
     """
-    shape = getattr(data, "shape", None)
     if shape is None:
         if _header_int(header, "NAXIS") == 3:
             return False, "NAXIS=3 primary without readable data (cannot verify CHW layout)", None
         return False, None, None
+    try:
+        shape = tuple(int(n) for n in shape)
+    except Exception:
+        return False, "unreadable primary shape (cannot verify CHW layout)", None
     if len(shape) == 2:
         return False, None, None
     if len(shape) != 3:
@@ -426,8 +434,15 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
         return False
     try:
         with _open_fits_safely(frame.path) as hdul:
-            header = hdul[0].header
-            data = hdul[0].data
+            # ZM-WCS-02: header-only. ``PrimaryHDU.shape`` is derived from the
+            # header ``NAXISn`` cards (``_axes``) and never materializes the
+            # pixel payload; ``hdul[0].data`` must not be touched here.
+            header = hdul[0].header.copy()
+            try:
+                raw_shape = hdul[0].shape
+                shape = tuple(int(n) for n in raw_shape) if raw_shape else None
+            except Exception:
+                shape = None
     except Exception as exc:
         _emit(f"Failed to open FITS {frame.path}: {exc}", lvl="ERROR", callback=progress_callback)
         return False
@@ -449,7 +464,7 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
     # celestial WCS lives on axes 1-2, so it is built with ``naxis=2`` (which
     # also keeps SIP working). Every other 3-D primary is refused explicitly.
     # The 2-D primary path below keeps the historical construction unchanged.
-    cube_ok, cube_reason, cube_shape_hw = _admit_rgb_chw_cube(header, data)
+    cube_ok, cube_reason, cube_shape_hw = _admit_rgb_chw_cube(header, shape)
     if cube_reason is not None:
         _emit(
             f"[GRID] Rejecting frame {frame.path}: {cube_reason}",
@@ -485,7 +500,6 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
 
     shape_hw = None
     try:
-        shape = data.shape if data is not None else None
         if shape is not None:
             if cube_shape_hw is not None:
                 shape_hw = cube_shape_hw

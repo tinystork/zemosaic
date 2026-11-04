@@ -263,7 +263,7 @@ def test_admission_gate_refuses_contradictory_headers(
 ) -> None:
     header = _cube_header(sip=False, pc=False, wcsaxes=False, cunit2=False)
     header_mutator(header)
-    admitted, reason, shape_hw = zsp._admit_rgb_chw_cube(header, _chw())
+    admitted, reason, shape_hw = zsp._admit_rgb_chw_cube(header, tuple(_chw().shape))
     assert admitted is False
     assert shape_hw is None
     assert reason is not None and reason_fragment in reason
@@ -273,7 +273,7 @@ def test_admission_gate_refuses_hwc_shaped_data() -> None:
     # (H, W, 3) pixels under a CHW-looking header: leading axis is not 3.
     header = _cube_header(sip=False, pc=False, wcsaxes=False, cunit2=False)
     hwc = np.zeros((H, W, 3), dtype=np.float32)
-    admitted, reason, shape_hw = zsp._admit_rgb_chw_cube(header, hwc)
+    admitted, reason, shape_hw = zsp._admit_rgb_chw_cube(header, tuple(hwc.shape))
     assert admitted is False
     assert shape_hw is None
     assert reason is not None and "leading data axis" in reason
@@ -282,7 +282,7 @@ def test_admission_gate_refuses_hwc_shaped_data() -> None:
 def test_admission_gate_refuses_non_3d_axis_count() -> None:
     header = _cube_header(sip=False, pc=False, wcsaxes=False, cunit2=False)
     four_d = np.zeros((3, 2, H, W), dtype=np.float32)
-    admitted, reason, shape_hw = zsp._admit_rgb_chw_cube(header, four_d)
+    admitted, reason, shape_hw = zsp._admit_rgb_chw_cube(header, tuple(four_d.shape))
     assert admitted is False
     assert shape_hw is None
     assert reason is not None and "dimensionality" in reason
