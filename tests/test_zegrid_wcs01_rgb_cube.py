@@ -82,15 +82,19 @@ def _cube_header(
     naxis1: int = W,
     naxis2: int = H,
     naxis3: int = 3,
+    third_axis_linear: bool = False,
 ) -> fits.Header:
     h = _wcs_core(sip=sip, pc=pc, wcsaxes=wcsaxes, cunit2=cunit2)
-    # The third WCS axis is declared as a no-op channel axis via the linear
-    # matrix only; CTYPE3 stays blank (exactly the audited corpus).
-    if pc:
-        h["PC3_3"] = 1.0
-        h["CDELT3"] = 1.0
-    else:
-        h["CD3_3"] = 1.0
+    # By default the header carries ONLY the audited real-corpus cards: the
+    # third axis has no CTYPE3 and no linear-matrix entry. ``third_axis_linear``
+    # exists solely for the witness that pins the pre-fix failure mode, where
+    # WCSLIB does see a third axis.
+    if third_axis_linear:
+        if pc:
+            h["PC3_3"] = 1.0
+            h["CDELT3"] = 1.0
+        else:
+            h["CD3_3"] = 1.0
     if ctype3 is not None:
         h["CTYPE3"] = ctype3
     h["NAXIS"] = 3
@@ -184,13 +188,20 @@ def test_chw_tan_pc_cdelt_wcsaxes2_is_admitted(tmp_path: Path) -> None:
 
 
 def test_baseline_header_without_naxis2_was_rejected(tmp_path: Path) -> None:
-    """Witness that the pre-fix construction fails on the same header class."""
+    """Witness that the pre-fix construction fails when a 3rd axis is visible.
 
-    header = _cube_header(sip=True, pc=False, wcsaxes=False, cunit2=False)
+    ``third_axis_linear=True`` only adds the linear-matrix card that makes
+    WCSLIB see three axes (the audited real-corpus headers reach the same state);
+    the admission gate itself never looks at those cards.
+    """
+
+    header = _cube_header(sip=True, pc=False, wcsaxes=False, cunit2=False, third_axis_linear=True)
     with pytest.raises(ValueError, match="naxis"):
         WCS(header)
     # And the TAN class silently degraded to a non-celestial 3-D WCS.
-    tan_header = _cube_header(sip=False, pc=False, wcsaxes=False, cunit2=False)
+    tan_header = _cube_header(
+        sip=False, pc=False, wcsaxes=False, cunit2=False, third_axis_linear=True
+    )
     assert WCS(tan_header).is_celestial is False
 
 
@@ -320,3 +331,100 @@ def test_build_frame_descriptors_serializes_qualified_2d_wcs(tmp_path: Path) -> 
     assert reloaded.pixel_n_dim == 2
     assert reloaded.is_celestial is True
     assert zg.qualify_wcs(reloaded) is None
+
+
+# ---------------------------------------------------------------------------
+# F1 — fail-closed on every refusal path (no stale state from a prior success)
+# ---------------------------------------------------------------------------
+
+def test_refusal_after_success_clears_stale_wcs_and_shape(tmp_path: Path) -> None:
+    path = tmp_path / "reused.fits"
+    ok_header = _cube_header(sip=True, pc=False, wcsaxes=False, cunit2=False)
+    _write(path, _chw(), ok_header)
+
+    fi = zsp.FrameInfo(path=path)
+    assert zsp.load_frame_wcs(fi) is True
+    assert fi.wcs is not None and fi.shape_hw == (H, W)
+
+    # Same FrameInfo, same path: the file is rewritten as a non-RGB cube.
+    bad_header = _cube_header(sip=False, pc=False, wcsaxes=False, cunit2=False, naxis3=4)
+    _write(path, _chw(channels=4), bad_header)
+
+    assert zsp.load_frame_wcs(fi) is False
+    assert fi.wcs is None
+    assert fi.shape_hw is None
+
+
+def test_refusal_after_success_on_unreadable_file_clears_state(tmp_path: Path) -> None:
+    path = tmp_path / "then_garbage.fits"
+    _write(path, _chw(), _cube_header(sip=False, pc=False, wcsaxes=False, cunit2=False))
+
+    fi = zsp.FrameInfo(path=path)
+    assert zsp.load_frame_wcs(fi) is True
+    assert fi.shape_hw == (H, W)
+
+    path.write_bytes(b"not a FITS file at all")
+
+    assert zsp.load_frame_wcs(fi) is False
+    assert fi.wcs is None
+    assert fi.shape_hw is None
+
+
+def test_refusal_after_success_on_non_celestial_wcs_clears_state(tmp_path: Path) -> None:
+    path = tmp_path / "then_noncelestial.fits"
+    _write(path, _chw(), _cube_header(sip=False, pc=False, wcsaxes=False, cunit2=False))
+
+    fi = zsp.FrameInfo(path=path)
+    assert zsp.load_frame_wcs(fi) is True
+    assert fi.wcs is not None
+
+    # 2-D primary with no celestial axes: parsing succeeds, qualification fails.
+    mono = np.zeros((H, W), dtype=np.float32)
+    flat = fits.Header()
+    flat["CTYPE1"] = "LINEAR"
+    flat["CTYPE2"] = "LINEAR"
+    flat["CRPIX1"] = W / 2.0
+    flat["CRPIX2"] = H / 2.0
+    flat["CRVAL1"] = 0.0
+    flat["CRVAL2"] = 0.0
+    flat["CDELT1"] = 1.0
+    flat["CDELT2"] = 1.0
+    _write(path, mono, flat)
+
+    assert zsp.load_frame_wcs(fi) is False
+    assert fi.wcs is None
+    assert fi.shape_hw is None
+
+
+def test_success_still_publishes_state(tmp_path: Path) -> None:
+    path = tmp_path / "ok.fits"
+    _write(path, _chw(), _cube_header(sip=False, pc=False, wcsaxes=False, cunit2=False))
+
+    fi = zsp.FrameInfo(path=path)
+    assert zsp.load_frame_wcs(fi) is True
+    assert fi.wcs is not None and fi.wcs.is_celestial is True
+    assert fi.shape_hw == (H, W)
+
+
+# ---------------------------------------------------------------------------
+# L2 — exact real-corpus signature: no artificial third-axis matrix cards
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("pc", [False, True])
+def test_exact_signature_without_third_axis_cards_is_admitted(tmp_path: Path, pc: bool) -> None:
+    header = _cube_header(sip=True, pc=pc, wcsaxes=pc, cunit2=False)
+    # Pin the header shape: no CD3_3 / PC3_3 / CDELT3 artificial declarations.
+    assert "CD3_3" not in header
+    assert "PC3_3" not in header
+    assert "CDELT3" not in header
+    assert "CTYPE3" not in header
+
+    path = _write(tmp_path / f"exact_pc{int(pc)}.fits", _chw(), header)
+    fi = zsp.FrameInfo(path=path)
+
+    assert zsp.load_frame_wcs(fi) is True
+    assert fi.shape_hw == (H, W)
+    assert fi.wcs.pixel_n_dim == 2
+    assert fi.wcs.is_celestial is True
+    assert fi.wcs.sip is not None
+    assert zg.qualify_wcs(fi.wcs) is None

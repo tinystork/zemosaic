@@ -409,7 +409,17 @@ def _admit_rgb_chw_cube(header, data) -> tuple[bool, str | None, tuple[int, int]
 
 
 def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = None) -> bool:
-    """Populate frame.wcs and frame.shape_hw if possible."""
+    """Populate frame.wcs and frame.shape_hw if possible.
+
+    Fail-closed contract: the frame fields are cleared on entry and assigned ONLY
+    on success, so a ``False`` return always means ``frame.wcs is None`` and
+    ``frame.shape_hw is None`` — never a stale state from a previous success.
+    """
+
+    # Clear before any possible early return (astropy unavailable, open failure,
+    # admission refusal, WCS parsing/qualification, shape, pixel scale).
+    frame.wcs = None
+    frame.shape_hw = None
 
     if not (_ASTROPY_AVAILABLE and fits and WCS):
         _emit("Astropy not available for WCS parsing", lvl="ERROR", callback=progress_callback)
@@ -448,25 +458,28 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
         )
         return False
 
+    wcs_obj = None
     try:
         if cube_ok:
-            frame.wcs = WCS(header, naxis=2)
+            wcs_obj = WCS(header, naxis=2)
         else:
-            frame.wcs = WCS(header)
+            wcs_obj = WCS(header)
     except Exception as exc:
-        frame.wcs = None
+        wcs_obj = None
         _emit(f"[GRID] Failed to parse WCS from {frame.path}: {exc}", lvl="WARN", callback=progress_callback)
     if (
-        frame.wcs is None
-        or not getattr(frame.wcs, "is_celestial", False)
-        or (cube_ok and getattr(frame.wcs, "pixel_n_dim", None) != 2)
+        wcs_obj is None
+        or not getattr(wcs_obj, "is_celestial", False)
+        or (cube_ok and getattr(wcs_obj, "pixel_n_dim", None) != 2)
     ):
         _emit(f"[GRID] No usable celestial WCS in {frame.path}", lvl="WARN", callback=progress_callback)
         return False
     if cube_ok:
+        # DEBUG: the real M45 corpus has 1827 cubes; the admission is pinned by
+        # tests, so a per-frame INFO line would only flood the worker log.
         _emit(
             f"[GRID] RGB CHW cube {frame.path}: celestial WCS built on axes 1-2 (naxis=2)",
-            lvl="INFO",
+            lvl="DEBUG",
             callback=progress_callback,
         )
 
@@ -484,21 +497,20 @@ def load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = No
     if shape_hw is None:
         _emit(f"Cannot derive image shape for {frame.path}", lvl="WARN", callback=progress_callback)
         return False
-    frame.shape_hw = shape_hw
     try:
-        px_scale = _extract_pixel_scale_deg(frame.wcs)
+        px_scale = _extract_pixel_scale_deg(wcs_obj)
         if px_scale is None or not math.isfinite(px_scale) or px_scale <= 0:
             _emit(
                 f"[GRID] Rejecting frame {frame.path}: invalid pixel scale",
                 lvl="WARN",
                 callback=progress_callback,
             )
-            frame.wcs = None
-            frame.shape_hw = None
             return False
     except Exception:
         _emit(f"[GRID] Rejecting frame {frame.path}: pixel scale check failed", lvl="WARN", callback=progress_callback)
-        frame.wcs = None
-        frame.shape_hw = None
         return False
+
+    # Success: publish the validated state.
+    frame.wcs = wcs_obj
+    frame.shape_hw = shape_hw
     return True
