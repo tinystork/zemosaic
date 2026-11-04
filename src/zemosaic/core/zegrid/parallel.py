@@ -1017,11 +1017,12 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
     FAIL-SAFE: an executor CREATION failure (before any task is submitted)
     degrades to the serial loop with a WARN surfaced via BOTH ``log`` and
     ``emit``. A deterministic ``worker(task)`` / ``future.result()`` failure is
-    NOT a pool-unavailability event: it propagates as
-    :class:`ParallelTaskError` with its task index and original cause, cancels
-    the still-annulable tasks and NEVER replays the wave in serial (see
-    ZM-IO-REJECT-01). A mid-run pool failure propagates as
-    :class:`ParallelPoolError` without replay.
+    NOT a pool-unavailability event: FIRST_COMPLETED detects it promptly, all
+    still-PENDING futures are cancelled, and tasks the executor already STARTED
+    are drained to quiescence by the single shutdown owner before the exception
+    propagates as :class:`ParallelTaskError` with its index and original cause.
+    The wave is NEVER replayed in serial (see ZM-IO-REJECT-01). A mid-run pool
+    failure propagates as :class:`ParallelPoolError` without replay.
     """
     tasks = list(tasks)
     total = len(tasks)
@@ -1141,8 +1142,10 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         ZM-IO-REJECT-01: a worker/future exception is ALWAYS surfaced as
         :class:`ParallelTaskError` with its task index and original cause. It is
         never reclassified as an executor failure, so it can never trigger the
-        historical whole-wave serial replay. Already submitted tasks are
-        cancelled (not re-executed).
+        historical whole-wave serial replay. FIRST_COMPLETED detects the failure
+        promptly; futures still PENDING are cancelled. Tasks the executor has
+        already STARTED are not replayable and are drained by the single
+        shutdown owner in :func:`pmap` before the exception propagates.
         """
         out = [None] * total
         recorded = set()
@@ -1180,13 +1183,11 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
             try:
                 out[index] = future.result()
             except Exception as exc:
+                # Cancel every future that has not started. Running tasks are
+                # not pre-emptible and are drained by the single shutdown owner.
                 for pending_future in futures:
                     if pending_future is not future:
                         pending_future.cancel()
-                try:
-                    pool.shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    pass
                 if _is_broken_pool_error(exc):
                     raise ParallelPoolError(
                         "executor failed while collecting task "
@@ -1276,27 +1277,37 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         _finish(meta, t0, total)
         return out
 
-    try:
-        out = _run_pool(pool)
-    except (ParallelTaskError, ParallelPoolError):
-        # A deterministic worker failure or a mid-run pool failure is PROPAGATED.
-        # Replaying the wave in serial would re-run successful tasks and repeat
-        # the same deterministic failure. Do NOT wait for still-running tasks
-        # here: the parent must observe the failure immediately; remaining
-        # annulable tasks are cancelled.
+    # SINGLE shutdown owner for both success and failure. On failure the pool is
+    # drained (wait=True) AFTER FIRST_COMPLETED detected the error and PENDING
+    # futures were cancelled. This is a bounded drain of tasks the executor had
+    # already started, never a replay and never the whole remaining wave.
+    def _shutdown_pool(*, wait: bool) -> None:
         try:
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=wait, cancel_futures=True)
+        except TypeError:  # pragma: no cover - older Python without cancel_futures
+            try:
+                pool.shutdown(wait=wait)
+            except Exception:
+                pass
         except Exception:
             pass
+
+    try:
+        out = _run_pool(pool)
+    except ParallelTaskError as exc:
+        _shutdown_pool(wait=True)
         if meta is not None:
             meta["fallback"] = False
             meta["fallback_reason"] = None
         raise
+    except ParallelPoolError as exc:
+        _shutdown_pool(wait=True)
+        if meta is not None:
+            meta["fallback"] = False
+            meta["fallback_reason"] = f"{type(exc).__name__}: {exc}"
+        raise
     except Exception as exc:  # noqa: BLE001 - pool/context failure after submission
-        try:
-            pool.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        _shutdown_pool(wait=True)
         if isinstance(exc, RuntimeError) and "could not start" in str(exc):
             raise
         log.error(
@@ -1305,11 +1316,14 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
             type(exc).__name__,
             exc,
         )
+        if meta is not None:
+            meta["fallback"] = False
+            meta["fallback_reason"] = f"{type(exc).__name__}: {exc}"
         raise ParallelPoolError(
             f"executor failed after dispatch ({type(exc).__name__}: {exc})"
         ) from exc
     else:
-        pool.shutdown(wait=True)
+        _shutdown_pool(wait=True)
         _finish(meta, t0, total)
         return out
 

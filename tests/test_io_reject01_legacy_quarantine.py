@@ -406,12 +406,13 @@ def _pmap_payload_worker(task):
     )
 
 
-def test_pmap_first_completed_returns_early_error_without_waiting(
+def test_pmap_first_completed_cancels_pending_and_drains_running(
     monkeypatch, caplog
 ):
-    """An early failure must not wait for a blocked later task, and pending
-    tasks must be cancelled (never executed, never replayed)."""
+    """FIRST_COMPLETED detects the error, PENDING tasks are cancelled, and
+    already-RUNNING tasks are drained before the exception propagates."""
     release = threading.Event()
+    running_one = threading.Event()
     started = []
     started_lock = threading.Lock()
 
@@ -419,30 +420,50 @@ def test_pmap_first_completed_returns_early_error_without_waiting(
         with started_lock:
             started.append(value)
         if value == 0:
+            # Wait until task 1 is genuinely running, then fail. This guarantees
+            # the drain has a real already-started task to wait for.
+            running_one.wait(2.0)
             raise RuntimeError("early payload failure")
-        if value in (1, 2):
-            # Deterministically occupy both running slots so a queued later task
-            # (3) cannot start before the early failure is observed.
+        if value == 1:
+            running_one.set()
+            release.wait(10.0)
+        elif value == 2:
             release.wait(10.0)
         return value
+
+    # Independent bounded releaser: the drain must NOT depend on a finally
+    # executed only after pmap returns.
+    timer = threading.Timer(0.5, release.set)
+    timer.daemon = True
+    timer.start()
 
     monkeypatch.setattr(zpar, "_parent_is_daemonic", lambda: True)
     meta = {}
     started_at = time.monotonic()
-    try:
-        with caplog.at_level(logging.WARNING, logger=zpar.log.name):
-            with pytest.raises(zpar.ParallelTaskError) as info:
-                zpar.pmap(_worker, [0, 1, 2, 3], workers=2, meta=meta)
-        elapsed = time.monotonic() - started_at
-    finally:
-        release.set()
+    with caplog.at_level(logging.WARNING, logger=zpar.log.name):
+        with pytest.raises(zpar.ParallelTaskError) as info:
+            zpar.pmap(_worker, [0, 1, 2, 3], workers=2, meta=meta)
+    elapsed = time.monotonic() - started_at
 
     assert info.value.index == 0
     assert "early payload failure" in str(info.value)
-    assert elapsed < 5.0, f"pmap waited for the blocked task ({elapsed:.2f}s)"
+    # The error was observed early, but propagation waited for the running
+    # blocked task(s) to be released and drained.
+    assert 0.4 <= elapsed < 5.0, (
+        f"expected a bounded drain around 0.5s, observed {elapsed:.2f}s"
+    )
     assert meta["fallback"] is False
+    # Task 3 was PENDING when the failure was observed and must never start.
     assert 3 not in started
-    assert started.count(0) == 1
+    # No task ran twice (no serial replay).
+    with started_lock:
+        snapshot = list(started)
+    assert snapshot.count(0) == 1
+    assert all(snapshot.count(v) <= 1 for v in snapshot)
+    # After propagation the executor is quiescent: no new side effect appears.
+    time.sleep(0.2)
+    with started_lock:
+        assert started == snapshot
     assert "parallel map unavailable" not in caplog.text
     assert "falling back to SERIAL" not in caplog.text
 
