@@ -3674,6 +3674,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "run_config_snapshot.json",
             "worker_last_state.json",
             "worker_crash_breadcrumbs.jsonl",
+            "zegrid_run.log",
+            # Product-owned terminal diagnostics: a crashed GPU/producer run
+            # leaves these at the output root, and they must never make the
+            # interrupted run look like foreign user content on relaunch.
+            "zegrid_gpu_failure.json",
+            "zegrid_gpu_failure.jsonl",
             "zegrid_publications",
             ".zegrid_publications",
             "zegrid-cache",
@@ -3709,6 +3715,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "worker_last_state.json",
             "worker_crash_breadcrumbs.jsonl",
             "zegrid_run.log",
+            "zegrid_gpu_failure.json",
+            "zegrid_gpu_failure.jsonl",
             # Both cache generations are scratch, never store content.
             "zegrid-cache",
             "__zegrid_cache__",

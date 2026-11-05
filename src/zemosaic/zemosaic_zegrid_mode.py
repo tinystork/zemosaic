@@ -8958,6 +8958,80 @@ def _r55_exception_chain(exc) -> list[dict]:
     return chain
 
 
+def _r55_normalize_task_cell_evidence(value):
+    """Normalise ONE failure-evidence value to ``(index, cell_id)``.
+
+    Supports, without guessing:
+
+    * an integer task index;
+    * a pipeline pair ``(index, canonical_task)``;
+    * a canonical task tuple/list whose first item is a cell-like object (or a
+      cell id string);
+    * a direct ZeGridCell-like object or mapping carrying ``cell_id``;
+    * mappings with ``index`` / ``cell_id`` / ``task`` keys.
+
+    A cell object NEVER yields an index (it is unknown, not derivable), so the
+    caller can distinguish ``index unknown, cell known`` from a guessed index.
+    """
+    index = None
+    cell_id = None
+
+    def _set_index(candidate):
+        nonlocal index
+        if index is None and isinstance(candidate, int) and not isinstance(
+            candidate, bool
+        ):
+            index = int(candidate)
+
+    def _set_cell(candidate):
+        nonlocal cell_id
+        if cell_id is not None or candidate is None:
+            return
+        if isinstance(candidate, str):
+            token = candidate.strip()
+            if token:
+                cell_id = token
+            return
+        raw = getattr(candidate, "cell_id", None)
+        if raw is not None:
+            token = str(raw).strip()
+            if token:
+                cell_id = token
+
+    node = value
+    seen: set[int] = set()
+    for _ in range(6):
+        if node is None:
+            break
+        if isinstance(node, Mapping):
+            _set_index(node.get("index"))
+            _set_index(node.get("task_index"))
+            _set_cell(node.get("cell_id"))
+            nested = node.get("task")
+            if nested is None and cell_id is None:
+                nested = node.get("producer_task_index")
+            node = nested
+            continue
+        if isinstance(node, (tuple, list)):
+            if id(node) in seen:
+                break
+            seen.add(id(node))
+            if not node:
+                break
+            head = node[0]
+            if isinstance(head, int) and not isinstance(head, bool):
+                _set_index(head)
+                node = node[1] if len(node) > 1 else None
+                continue
+            _set_cell(head)
+            node = head
+            continue
+        _set_index(node)
+        _set_cell(node)
+        break
+    return index, cell_id
+
+
 def _r55_pool_failure_details(exc) -> dict:
     """Truthful classification of a producer/executor pool failure.
 
@@ -8974,13 +9048,29 @@ def _r55_pool_failure_details(exc) -> dict:
         "BrokenExecutor",
     }
     matched = sorted(names & pool_names)
-    failing_index = getattr(exc, "index", None)
-    failing_cell_id = None
-    failing_task = getattr(exc, "task", None)
-    try:
-        failing_cell_id = str(failing_task[0].cell_id)
-    except Exception:
-        failing_cell_id = None
+    # Traverse the ACTUAL exception objects (not only the serialised chain) so a
+    # metadata-bearing ParallelPoolError nested behind an _R55GpuFallback or a
+    # pipeline wrapper is still found. The first ParallelPoolError wins.
+    pool_exc = None
+    current = exc
+    seen_exc: set[int] = set()
+    while current is not None and id(current) not in seen_exc:
+        seen_exc.add(id(current))
+        if isinstance(current, zpar.ParallelPoolError):
+            pool_exc = current
+            break
+        current = (
+            current.__cause__
+            if current.__cause__ is not None
+            else current.__context__
+        )
+    failing_index, failing_cell_id = _r55_normalize_task_cell_evidence(
+        getattr(pool_exc, "task", None) if pool_exc is not None else None
+    )
+    if failing_index is None and pool_exc is not None:
+        failing_index, _ = _r55_normalize_task_cell_evidence(
+            getattr(pool_exc, "index", None)
+        )
     return {
         "is_pool_failure": bool(matched),
         "matched_types": matched,
@@ -15890,16 +15980,44 @@ def _run_single(
                 _conservation_category
             )
             # Failing cell/task from the pipeline's own evidence (never guessed).
-            _failing_task_index = _gpu_pipeline.get("producer_task_index")
-            if _failing_task_index is None:
-                _failing_task_index = _gpu_pipeline.get("active_unit_index")
-            _failing_cell_id = None
+            # The value may be an integer index, a task tuple, a mapping or a
+            # direct ZeGridCell-like object; a cell object never supplies an
+            # index, so "index unknown, cell known" stays representable.
+            _evidence_index, _evidence_cell_id = _r55_normalize_task_cell_evidence(
+                _gpu_pipeline.get("producer_task_index")
+            )
+            if _evidence_index is None:
+                _active_index, _active_cell_id = _r55_normalize_task_cell_evidence(
+                    _gpu_pipeline.get("active_unit_index")
+                )
+                if _evidence_index is None:
+                    _evidence_index = _active_index
+                if _evidence_cell_id is None:
+                    _evidence_cell_id = _active_cell_id
+            if _evidence_cell_id is None and _evidence_index is not None:
+                try:
+                    if 0 <= int(_evidence_index) < len(
+                        _initial_bundle.cell_tasks
+                    ):
+                        _evidence_cell_id = str(
+                            _initial_bundle.cell_tasks[
+                                int(_evidence_index)
+                            ][0].cell_id
+                        )
+                except Exception:
+                    pass
+            if _evidence_cell_id is None:
+                _evidence_cell_id = _pool_failure.get("failing_cell_id")
+            if _evidence_index is None:
+                _evidence_index = _pool_failure.get("failing_task_index")
+            _failing_task_index = _evidence_index
+            _failing_cell_id = _evidence_cell_id
             try:
-                _failing_index_int = int(_failing_task_index)
-                if 0 <= _failing_index_int < len(_initial_bundle.cell_tasks):
-                    _failing_cell_id = str(
-                        _initial_bundle.cell_tasks[_failing_index_int][0].cell_id
-                    )
+                _failing_index_int = (
+                    None
+                    if _failing_task_index is None
+                    else int(_failing_task_index)
+                )
             except Exception:
                 _failing_index_int = None
             for _t in _initial_bundle.cell_tasks:
