@@ -758,7 +758,9 @@ def test_real_gpu_nested_producer_failure_then_gui_resume(tmp_path, monkeypatch)
 
     # TWO distinct identities, both preserved without conflation.
     inner_pool_index = record["pool_task_index"]
-    assert isinstance(inner_pool_index, int)
+    # The harness raises with the ACTUAL first frame-task index of the nested
+    # _build_one_cell_cache list, which is enumerate(planned)[0] == 0.
+    assert inner_pool_index == 0
     assert record["producer_unit_index"] == 2
     assert inner_pool_index != record["producer_unit_index"]
     assert record["failing_task_index"] == inner_pool_index  # inner alias only
