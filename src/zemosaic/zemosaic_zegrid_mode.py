@@ -8958,6 +8958,49 @@ def _r55_exception_chain(exc) -> list[dict]:
     return chain
 
 
+def _r55_pool_failure_details(exc) -> dict:
+    """Truthful classification of a producer/executor pool failure.
+
+    ``ParallelPoolError`` / ``BrokenProcessPool`` only prove that a producer
+    child pool died after work had been dispatched. They do NOT prove OOM, a
+    GPU-device failure or a science error, so they must never be relabelled as
+    one. The full type/module/message chain is preserved for diagnostics.
+    """
+    chain = _r55_exception_chain(exc)
+    names = {str(entry.get("type")) for entry in chain}
+    pool_names = {
+        "ParallelPoolError",
+        "BrokenProcessPool",
+        "BrokenExecutor",
+    }
+    matched = sorted(names & pool_names)
+    failing_index = getattr(exc, "index", None)
+    failing_cell_id = None
+    failing_task = getattr(exc, "task", None)
+    try:
+        failing_cell_id = str(failing_task[0].cell_id)
+    except Exception:
+        failing_cell_id = None
+    return {
+        "is_pool_failure": bool(matched),
+        "matched_types": matched,
+        "root_cause_type": (
+            chain[-1]["type"] if chain else type(exc).__name__
+        ),
+        "exception_chain": chain,
+        "failing_task_index": (
+            None if failing_index is None else int(failing_index)
+        ),
+        "failing_cell_id": failing_cell_id,
+        "native_cause_proven": False,
+        "note": (
+            "A producer/executor child pool died after dispatch. The native "
+            "Windows child-death cause is NOT proven here; this is not "
+            "classified as OOM, a GPU-device failure or a science error."
+        ),
+    }
+
+
 def _r55_gpu_failure_record(
     *,
     stage: str,
@@ -13210,21 +13253,101 @@ def _run_single(
                 and _store_state["publishing"]
                 and _store_state.get("degraded_reason") is None
             )
-            wave_results, wave_meta = _run_cell_batch(
-                science_cfg,
-                int(bundle.cpu_streaming_tile),
-                gpu_attempt=False,
-                tasks=wave_tasks,
-                workers=units_bound,
-                cache_workers=int(bundle.cache_workers_per_cell),
-                progress_callback=(
-                    (lambda _done, _total: None)
-                    if _durable_wave
-                    else _wave_progress(start)
-                ),
-                heartbeat=_heartbeat,
-                heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
-            )
+            try:
+                wave_results, wave_meta = _run_cell_batch(
+                    science_cfg,
+                    int(bundle.cpu_streaming_tile),
+                    gpu_attempt=False,
+                    tasks=wave_tasks,
+                    workers=units_bound,
+                    cache_workers=int(bundle.cache_workers_per_cell),
+                    progress_callback=(
+                        (lambda _done, _total: None)
+                        if _durable_wave
+                        else _wave_progress(start)
+                    ),
+                    heartbeat=_heartbeat,
+                    heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
+                )
+            except Exception as _wave_exc:
+                # ZM-P0-RESUME-INTEGRITY: a TERMINAL wave failure after accepted
+                # cells reports the ACTUAL durability of the work, never a
+                # generic "retained" claim. The original exception is the root
+                # cause and is re-raised unchanged.
+                _terminal_store = _store_state.get("store")
+                _terminal_durable = bool(
+                    _terminal_store is not None
+                    and _store_state["publishing"]
+                    and _store_state.get("degraded_reason") is None
+                )
+                _terminal_pool = _r55_pool_failure_details(_wave_exc)
+                if result_registry is not None:
+                    _terminal_snap = result_registry.snapshot()
+                    _terminal_accepted = int(
+                        _terminal_snap.get("counts", {}).get("accepted", 0)
+                    )
+                    if _terminal_durable:
+                        try:
+                            _terminal_complete = int(
+                                _terminal_store.report()
+                                .get("counts", {})
+                                .get("cells", 0)
+                            )
+                        except Exception:
+                            _terminal_complete = int(
+                                _store_state.get("commits", 0) or 0
+                            )
+                        _terminal_pending = max(
+                            0, int(total_tasks) - _terminal_complete
+                        )
+                        _emit(
+                            "ZeGrid: TERMINAL wave failure after accepted "
+                            f"cells — {type(_wave_exc).__name__}: "
+                            f"{_r55_bounded_text(_wave_exc, 600)}. Durable "
+                            f"store={_terminal_store.root} "
+                            f"run_id={_terminal_store.run_id} "
+                            f"complete={_terminal_complete} "
+                            f"pending={_terminal_pending}. Committed cells are "
+                            "reopenable/resumable; a relaunch resumes ONLY the "
+                            "pending cells."
+                            + (
+                                f" Failing cell="
+                                f"{_terminal_pool.get('failing_cell_id')} "
+                                f"task={_terminal_pool.get('failing_task_index')}."
+                                if _terminal_pool["is_pool_failure"]
+                                else ""
+                            )
+                            + (
+                                " Classification: producer/executor child pool "
+                                "died; the native cause is NOT proven and this "
+                                "is NOT classified as OOM or a GPU-device "
+                                "failure."
+                                if _terminal_pool["is_pool_failure"]
+                                else ""
+                            ),
+                            lvl="ERROR",
+                            callback=progress_callback,
+                        )
+                    else:
+                        _emit(
+                            "ZeGrid: TERMINAL wave failure after "
+                            f"{_terminal_accepted} accepted cell(s) — "
+                            f"{type(_wave_exc).__name__}: "
+                            f"{_r55_bounded_text(_wave_exc, 600)}. NO durable "
+                            "store is active: those accepted results exist "
+                            "ONLY in memory and are NOT resumable after this "
+                            "worker exits. A relaunch will recompute them."
+                            + (
+                                f" Failing cell="
+                                f"{_terminal_pool.get('failing_cell_id')} "
+                                f"task={_terminal_pool.get('failing_task_index')}."
+                                if _terminal_pool["is_pool_failure"]
+                                else ""
+                            ),
+                            lvl="ERROR",
+                            callback=progress_callback,
+                        )
+                raise
             wave_wall = time.perf_counter() - wave_t0
             if result_registry is not None:
                 # M1: accept each successful cell as its own transaction. The
@@ -15732,7 +15855,14 @@ def _run_single(
                 str(renv.REASON_REFUSE_DISK),
                 str(zgr.REASON_REFUSE_VRAM),
             }
-            if _gpu_reason in _resource_codes:
+            # ZM-P0-RESUME-INTEGRITY: a producer/executor child pool death is
+            # classified HONESTLY. It is never OOM, never a GPU-device failure
+            # and never a science error; the native child-death cause is not
+            # proven by this evidence.
+            _pool_failure = _r55_pool_failure_details(_gpu_exc)
+            if _pool_failure["is_pool_failure"]:
+                _conservation_category = "producer_pool_failure"
+            elif _gpu_reason in _resource_codes:
                 _conservation_category = "resource_shortage"
             elif (
                 "OutOfMemory" in _gpu_detail
@@ -15759,6 +15889,19 @@ def _run_single(
             _r55_gpu_run_fallback["category"] = str(
                 _conservation_category
             )
+            # Failing cell/task from the pipeline's own evidence (never guessed).
+            _failing_task_index = _gpu_pipeline.get("producer_task_index")
+            if _failing_task_index is None:
+                _failing_task_index = _gpu_pipeline.get("active_unit_index")
+            _failing_cell_id = None
+            try:
+                _failing_index_int = int(_failing_task_index)
+                if 0 <= _failing_index_int < len(_initial_bundle.cell_tasks):
+                    _failing_cell_id = str(
+                        _initial_bundle.cell_tasks[_failing_index_int][0].cell_id
+                    )
+            except Exception:
+                _failing_index_int = None
             for _t in _initial_bundle.cell_tasks:
                 if _t[4] is not None:
                     _safe_rmtree(_t[3], None)
@@ -15772,6 +15915,30 @@ def _run_single(
                     "accepted", 0
                 )
             )
+            # ZM-P0-RESUME-INTEGRITY: the terminal-failure report must match the
+            # ACTUAL durability of the accepted work. A healthy durable store
+            # keeps every accepted cell as a committed, reopenable record; an
+            # in-memory-only run loses those payloads when the worker exits.
+            _gpu_store = _store_state.get("store")
+            _gpu_durable = bool(
+                _gpu_store is not None
+                and _store_state.get("publishing")
+                and _store_state.get("degraded_reason") is None
+            )
+            _durable_complete = 0
+            _durable_pending = 0
+            if _gpu_durable:
+                try:
+                    _durable_complete = int(
+                        _gpu_store.report().get("counts", {}).get("cells", 0)
+                    )
+                except Exception:
+                    _durable_complete = int(
+                        _store_state.get("commits", 0) or 0
+                    )
+                _durable_pending = max(
+                    0, int(len(_initial_bundle.cell_tasks)) - _durable_complete
+                )
             if _preserved_accepted > 0:
                 # M1 CONSERVATION: K accepted payloads survive the refusal.
                 # Recomputing them on CPU would double the work and silently
@@ -15790,17 +15957,53 @@ def _run_single(
                     ),
                     "backend_by_cell": dict(_preserved_backends),
                     "cpu_reuse": "refused_no_numeric_parity_qualification",
+                    "durable": bool(_gpu_durable),
+                    "durable_complete_cells": int(_durable_complete),
+                    "durable_pending_cells": int(_durable_pending),
+                    "durable_store_root": (
+                        str(_gpu_store.root) if _gpu_durable else None
+                    ),
+                    "durable_run_id": (
+                        str(_gpu_store.run_id) if _gpu_durable else None
+                    ),
                 }
+                _pool_note = (
+                    f" Classification: producer/executor child pool died"
+                    f" ({', '.join(_pool_failure['matched_types'])}); the native"
+                    " child-death cause is NOT proven and this is NOT classified"
+                    " as OOM or a GPU-device failure."
+                    if _pool_failure["is_pool_failure"]
+                    else ""
+                )
+                _failing_note = (
+                    f" Failing cell={_failing_cell_id} task="
+                    f"{_failing_index_int}."
+                    if _failing_cell_id is not None
+                    else ""
+                )
+                if _gpu_durable:
+                    _retention_message = (
+                        f"{_durable_complete} cell(s) are DURABLE and "
+                        "resumable from the store "
+                        f"{_gpu_store.root} (run_id={_gpu_store.run_id}); "
+                        f"{_durable_pending} pending cell(s) remain. A relaunch "
+                        "with the same store resumes ONLY the pending cells."
+                    )
+                else:
+                    _retention_message = (
+                        "NO durable store is active: the accepted results "
+                        "exist ONLY in memory and are NOT resumable after this "
+                        "worker exits. A relaunch will recompute them."
+                    )
                 _emit(
                     "ZeGrid: R55-E2 ACTIVE GPU RUN refused "
                     f"({_gpu_exc.reason_code}: "
                     f"{_r55_bounded_text(_gpu_exc.detail, 600)}) AFTER "
-                    f"{_preserved_accepted} accepted cell(s). M1 keeps those "
-                    "payloads in the run registry; a whole-batch CPU rerun "
-                    "would double the work and mix backends without a "
-                    "qualified parity contract, so it is refused. No FITS, "
-                    "manifest or science was published; the retained state "
-                    "remains owned until explicit disposal.",
+                    f"{_preserved_accepted} accepted cell(s)."
+                    f"{_retention_message}{_failing_note}{_pool_note}"
+                    " A whole-batch CPU rerun would double the work and mix "
+                    "backends without a qualified parity contract, so it is "
+                    "refused. No FITS, manifest or science was published.",
                     lvl="WARN", callback=progress_callback,
                 )
                 raise _R55RunConservedResults(
@@ -15809,7 +16012,10 @@ def _run_single(
                         f"GPU refusal after {_preserved_accepted} accepted "
                         "cell(s); CPU reuse refused (no numeric parity "
                         "qualification); retained pending cells="
-                        f"{(_preserved_snapshot or {}).get('counts', {}).get('pending', 0)}"
+                        f"{(_preserved_snapshot or {}).get('counts', {}).get('pending', 0)}; "
+                        f"durable={bool(_gpu_durable)} "
+                        f"durable_complete={int(_durable_complete)} "
+                        f"durable_pending={int(_durable_pending)}"
                     ),
                     category=str(_conservation_category),
                     record={
@@ -15822,6 +16028,9 @@ def _run_single(
                             "GPU refusal after accepted cells; accepted "
                             "payloads retained in memory"
                         ),
+                        "failure_classification": dict(_pool_failure),
+                        "failing_task_index": _failing_index_int,
+                        "failing_cell_id": _failing_cell_id,
                         "gpu_fallback": dict(_r55_gpu_run_fallback),
                         "result_registry": _preserved_snapshot,
                         "accepted_cell_ids": list(
@@ -15843,10 +16052,24 @@ def _run_single(
                             "manifest": False,
                             "assembly": False,
                         },
-                        "durable_resume": False,
+                        "durable_resume": bool(_gpu_durable),
+                        "durable_store_root": (
+                            str(_gpu_store.root) if _gpu_durable else None
+                        ),
+                        "durable_run_id": (
+                            str(_gpu_store.run_id) if _gpu_durable else None
+                        ),
+                        "durable_complete_cells": int(_durable_complete),
+                        "durable_pending_cells": int(_durable_pending),
+                        "accepted_in_memory_only": not bool(_gpu_durable),
                         "note": (
                             "M1 conserves accepted results DURING the run; "
-                            "it does not persist them across process exit."
+                            "only a healthy durable store makes them "
+                            "reopenable/resumable across process exit."
+                            if _gpu_durable
+                            else "NO durable store: accepted results are "
+                            "in-memory only and are NOT resumable after "
+                            "worker exit."
                         ),
                     },
                     result_registry=result_registry,

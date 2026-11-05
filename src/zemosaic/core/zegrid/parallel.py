@@ -69,7 +69,16 @@ class ParallelPoolError(RuntimeError):
     duplicate side effects and hides the real pool failure. A pool failure
     BEFORE any useful work may still take the historical bounded serial
     fallback (see :func:`pmap`).
+
+    ``index``/``task`` name the task being collected when the pool died, when
+    that is known. They are diagnostic only: a child-pool death does NOT prove
+    OOM, a GPU-device failure or a science error.
     """
+
+    def __init__(self, message: str, *, index: int | None = None, task=None) -> None:
+        self.index = None if index is None else int(index)
+        self.task = task
+        super().__init__(message)
 
 
 def _is_broken_pool_error(exc: BaseException) -> bool:
@@ -1191,7 +1200,9 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                 if _is_broken_pool_error(exc):
                     raise ParallelPoolError(
                         "executor failed while collecting task "
-                        f"{index} ({type(exc).__name__}: {exc})"
+                        f"{index} ({type(exc).__name__}: {exc})",
+                        index=index,
+                        task=tasks[index],
                     ) from exc
                 raise ParallelTaskError(index, tasks[index], exc) from exc
             recorded.add(index)

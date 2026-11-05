@@ -71,6 +71,11 @@ def _qapp():
 def _window(tmp_path, monkeypatch, *, mode, scheduler=None, checkpoints=False,
             extra=None, save_store=None):
     config = dict(extra or {})
+    # This matrix owns the CHECKPOINT dimension. Keep the generic resume intent
+    # off unless a case asks for it, so the durable predicate here is exactly
+    # "ZeGrid + active + checkpoints" (resume-intent durability has its own
+    # dedicated P0 regression suite).
+    config.setdefault("resume", "off")
     if scheduler is not None:
         config["zegrid_scheduler_mode"] = scheduler
     config["zegrid_qt_save_checkpoints_enabled"] = checkpoints

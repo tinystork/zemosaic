@@ -469,3 +469,17 @@ fichiers » ni « moins de lignes à tout prix ».
 > Archaeology first. Mechanical refactor second. Science unchanged. M106 last.
 
 - [~] IO-REJECT-01 (local) : quarantaine legacy `unaligned_by_zemosaic` + stop du replay série sur erreur de frame (P0, en cours).
+
+- [x] ZM-P0-ZEGRID-RESUME-INTEGRITY (local, 2026-11-05) : l'incident Windows
+  `resume=auto` + `zegrid_resume_mode=never` + aucun store est corrigé. Un
+  intent resume non-off sur ZeGrid actif force désormais une exécution durable
+  (store déterministe, mode `auto`/sélection explicite) et est refusé avant spawn
+  si le scheduler n'est pas `active`. Snapshot == transport (store, mode/run id,
+  stop capability, intent). Les échecs producteur/pool sont classés
+  `producer_pool_failure` (jamais OOM/GPU) et le message de durabilité distingue
+  les commits reprenables des résultats uniquement en mémoire. Preuve réelle
+  deux-workers dans `tests/test_zegrid_p0_resume_integrity.py` (2 commits, échec
+  `BrokenProcessPool` contrôlé, reprise exécutant uniquement les cellules
+  pendantes, artefacts/hash préservés). La cause native de la mort du process
+  enfant Windows reste NON prouvée (voir
+  `docs/zegrid_p0_resume_integrity_20261105.md`).

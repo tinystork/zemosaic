@@ -358,6 +358,9 @@ def test_stale_persisted_auto_never_overrides_a_fresh_start(tmp_path, monkeypatc
             "zegrid_resume_run_id": "stale-run",
             "zegrid_durable_store_dir": str(tmp_path / "out" / ".zegrid-durable"),
             "zegrid_qt_save_checkpoints_enabled": False,
+            # No user-visible generic resume request: the stale persisted
+            # ZelGrid key must still never hijack this fresh start.
+            "resume": "off",
         },
     )
     # A complete generation exists: it is not offered as unfinished.
@@ -430,7 +433,9 @@ def test_explicit_durable_transport_reaches_engine_over_disk_config(
     assert zconfig.zegrid_durable_store_dir == str(
         tmp_path / "out" / "zegrid-durable"
     )
-    assert zconfig.zegrid_resume_mode == "never"
+    # The generic resume=auto promise is honoured: with no existing run the
+    # engine starts a NEW durable generation (never a contradictory no-store).
+    assert zconfig.zegrid_resume_mode == "auto"
     assert zconfig.zegrid_resume_run_id is None
     assert captured["stop_channel"] is None  # no channel for an in-process call
 
@@ -831,7 +836,7 @@ def test_synthetic_gui_built_stop_then_new_process_resume(tmp_path, monkeypatch)
     worker_kwargs["filter_overrides"] = {"processing_mode": "zegrid"}
 
     assert worker_kwargs["zegrid_durable_store_dir"] == str(store)
-    assert worker_kwargs["zegrid_resume_mode"] == "never"
+    assert worker_kwargs["zegrid_resume_mode"] == "auto"
     assert worker_kwargs["zegrid_resume_run_id"] is None
 
     ctx = multiprocessing.get_context("spawn")
@@ -1145,6 +1150,9 @@ def test_disabled_checkpoint_does_not_block_on_store_but_blocks_bad_output(
     tmp_path, monkeypatch
 ):
     win = _window(tmp_path, monkeypatch, {})
+    # The historical non-durable path is only valid when the user did not ask
+    # for resume; a generic resume=auto would (correctly) demand a durable run.
+    win.config["resume"] = "off"
     out = tmp_path / "out"
     out.mkdir()
     _set_store(win, out)  # would be store==output, but checkpoint saving is OFF
@@ -1211,7 +1219,7 @@ def test_gui_owned_output_artifacts_do_not_block_a_retry(tmp_path, monkeypatch):
     ok, calls = _prepare_fresh(win, monkeypatch, enabled=True)
     assert ok is True, calls
     assert win._pending_zegrid_resume == {
-        "mode": "never",
+        "mode": "auto",
         "run_id": None,
         "store_dir": str(out / win.ZEGRID_DEFAULT_STORE_DIRNAME),
     }

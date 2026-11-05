@@ -2754,6 +2754,104 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return visible
         return visible
 
+    def _zegrid_generic_resume_intent(self) -> str:
+        """Effective GENERIC resume intent for THIS launch (``auto`` | ``off``).
+
+        The product's generic ``resume`` key (``off``/``auto``/``force``) is the
+        user-visible resume promise. For an effective ZeGrid launch it must never
+        be contradicted by a ``zegrid_resume_mode=never`` + no-store transport.
+        Unknown values are treated as ``off`` exactly like the worker's own
+        ``_normalize_resume_mode``; ``force`` is a non-off resume request and is
+        honoured as ``auto`` on ZeGrid (there is no ZeGrid force mode).
+        """
+        try:
+            token = str(self.config.get("resume")).strip().lower()
+        except Exception:
+            return "off"
+        return "auto" if token in ("auto", "force") else "off"
+
+    def _validate_zegrid_resume_intent_for_start(self) -> bool:
+        """Refuse a resume promise the effective launch cannot keep.
+
+        Runs BEFORE the capability freeze and before any worker spawn. Criterion:
+        a user-visible generic resume request on an effective ZeGrid launch must
+        either be honoured as durable recovery or be refused with an actionable
+        message; it is NEVER silently downgraded to a fresh/non-resumable run.
+        """
+        if self._selected_processing_mode() != "zegrid":
+            return True
+        intent = self._zegrid_generic_resume_intent()
+        if intent == "off":
+            return True
+        raw_scheduler = self.config.get(
+            "zegrid_scheduler_mode", zsched.DEFAULT_MODE
+        )
+        try:
+            scheduler_mode = zsched.normalize_scheduler_mode(raw_scheduler)
+        except Exception:
+            scheduler_mode = str(raw_scheduler)
+        if scheduler_mode == zsched.MODE_ACTIVE:
+            return True
+        return self._refuse_zegrid_launch(
+            self._tr(
+                "qt_zegrid_resume_needs_active",
+                "Resume was requested (resume={intent}) for ZeGrid, but the "
+                "effective ZeGrid scheduler is {scheduler!r}. Durable "
+                "checkpoint resume and crash recovery require the 'active' "
+                "scheduler. Nothing was started. Set the ZeGrid scheduler to "
+                "'active', or set resume=off if you accept a non-resumable run.",
+            ).format(intent=intent, scheduler=scheduler_mode)
+        )
+
+    def _effective_zegrid_transport(self) -> Dict[str, Any]:
+        """The ONE per-launch ZeGrid transport (snapshot and worker agree).
+
+        ``_snapshot_for_run`` and ``_build_worker_invocation`` BOTH consume this
+        method, so the run snapshot can never claim a different store/resume/stop
+        capability than the child actually receives.
+
+        A durable capability always carries a store (explicit or deterministic
+        under the output folder). A non-durable capability always transports
+        ``never`` with NO store, so a child can never discover one the GUI
+        refused.
+        """
+        capability = getattr(self, "_pending_stop_capability", None)
+        plan = getattr(self, "_pending_zegrid_resume", None)
+        if capability is None:
+            # Direct/internal caller outside ``_start_processing``: keep the
+            # historical transport rule (ZeGrid => durable-capable). An explicit
+            # per-launch plan is authoritative even on a partial caller object.
+            durable = isinstance(plan, dict) or (
+                self._selected_processing_mode() == "zegrid"
+            )
+        else:
+            durable = capability == self.STOP_CAPABILITY_ZEGRID_DURABLE
+        if durable and isinstance(plan, dict):
+            store_dir = plan.get("store_dir")
+            mode = plan.get("mode")
+            run_id = plan.get("run_id")
+        elif durable:
+            store_dir = self.config.get("zegrid_durable_store_dir")
+            mode = self.config.get("zegrid_resume_mode")
+            run_id = self.config.get("zegrid_resume_run_id")
+        else:
+            store_dir, mode, run_id = None, "never", None
+        return {
+            "zegrid_stop_capability": (
+                self.STOP_CAPABILITY_ZEGRID_DURABLE
+                if durable
+                else self.STOP_CAPABILITY_LEGACY_GRACEFUL
+            ),
+            "zegrid_durable_store_dir": store_dir,
+            "zegrid_resume_mode": mode,
+            "zegrid_resume_run_id": run_id,
+            "resume": (
+                self._zegrid_generic_resume_intent()
+                if self._selected_processing_mode() == "zegrid"
+                else self.config.get("resume")
+            ),
+        }
+
     def _resolve_stop_capability(self) -> str:
         """Resolve the ONE stop capability of this launch (no side effects).
 
@@ -2761,10 +2859,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
         BEFORE resume preflight/spawn. It never reads, creates or mutates the
         durable store: it only decides which capability the run owns.
 
-        ``ZEGRID_DURABLE`` requires ALL THREE of: effective mode ZeGrid, an
-        explicit/effective scheduler ``active``, and checkpoint saving ON. Any
-        other combination (Classic/SDS/existing-master, ZeGrid legacy/observe,
-        ZeGrid active with checkpoints OFF) is ``LEGACY_GRACEFUL``.
+        ``ZEGRID_DURABLE`` requires effective mode ZeGrid, an explicit/effective
+        scheduler ``active``, AND a durable promise: checkpoint saving ON **or**
+        a non-off generic resume intent (``resume=auto``/``force``). The generic
+        resume promise is a user-visible contract, so it makes the launch
+        durable instead of being silently transported as ``never`` with no
+        store. Any other combination (Classic/SDS/existing-master, ZeGrid
+        legacy/observe, ZeGrid active with checkpoints OFF and resume off) is
+        ``LEGACY_GRACEFUL``.
         """
         if self._selected_processing_mode() != "zegrid":
             return self.STOP_CAPABILITY_LEGACY_GRACEFUL
@@ -2779,7 +2881,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return self.STOP_CAPABILITY_LEGACY_GRACEFUL
         if scheduler_mode != zsched.MODE_ACTIVE:
             return self.STOP_CAPABILITY_LEGACY_GRACEFUL
-        if not self._zegrid_save_checkpoints_enabled():
+        if (
+            not self._zegrid_save_checkpoints_enabled()
+            and self._zegrid_generic_resume_intent() == "off"
+        ):
             return self.STOP_CAPABILITY_LEGACY_GRACEFUL
         return self.STOP_CAPABILITY_ZEGRID_DURABLE
 
@@ -2814,9 +2919,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 self._tr(
                     "qt_zegrid_capability_durable",
                     "ZeGrid stop capability: durable (scheduler=active, "
-                    "checkpoint saving ON). Stop and Save waits for the engine's "
-                    "acknowledged safe boundary before claiming the run is "
-                    "resumable.",
+                    "checkpoint saving {state}, resume intent {intent}). Stop "
+                    "and Save waits for the engine's acknowledged safe boundary "
+                    "before claiming the run is resumable; crash recovery after "
+                    "a worker exit is available from the durable store.",
+                ).format(
+                    state="ON" if checkpoints_on else "OFF",
+                    intent=self._zegrid_generic_resume_intent(),
                 ),
                 level="info",
             )
@@ -2829,7 +2938,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     "checkpoint saving {state}). Durable ZeGrid resume requires "
                     "scheduler 'active'; this run uses the existing graceful "
                     "stop, writes no durable checkpoint and is never reported as "
-                    "saved/resumable.",
+                    "saved/resumable. CRASH RECOVERY AFTER A WORKER EXIT IS "
+                    "UNAVAILABLE for this run.",
                 ).format(
                     scheduler=scheduler_mode,
                     state="ON" if checkpoints_on else "OFF",
@@ -2841,10 +2951,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr(
                 "qt_zegrid_capability_non_durable_checkpoints",
                 "ZeGrid stop capability: graceful (scheduler=active, checkpoint "
-                "saving OFF). No durable store is used and the stop is never "
-                "reported as saved/resumable.",
+                "saving OFF, resume intent off). No durable store is used and "
+                "the stop is never reported as saved/resumable. CRASH RECOVERY "
+                "AFTER A WORKER EXIT IS UNAVAILABLE for this run: accepted "
+                "cells exist only in memory and are lost when the worker exits.",
             ),
-            level="info",
+            level="warning",
         )
 
     def _on_zegrid_save_checkpoints_toggled(self, _checked: bool = False) -> None:
@@ -3896,10 +4008,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         store_root = self._zegrid_checkpoint_store_root(output_dir)
         discovery_root = self._zegrid_store_discovery_root(output_dir)
         enabled = self._zegrid_save_checkpoints_enabled()
+        resume_intent = self._zegrid_generic_resume_intent()
+        durable_requested = bool(enabled or resume_intent != "off")
         # F2: the store path is only relevant when this run would use it.
         store_unsafe = (
             self._zegrid_new_run_store_unsafe_reason(store_root, output_dir)
-            if enabled
+            if durable_requested
             else None
         )
         # F3: output safety applies to EVERY fresh ZeGrid launch, including
@@ -3924,7 +4038,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "offered for this folder; choose another store/output folder.",
             ).format(error=info["error"])
             self._append_log(message, level="warning")
-            if enabled:
+            if durable_requested:
                 return self._refuse_zegrid_launch(message)
         if resumable:
             new_run_safe = bool(output_safe and store_unsafe is None)
@@ -3974,17 +4088,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
             # Fresh was chosen explicitly: it still has to pass BOTH preflights.
             if not output_safe:
                 return self._refuse_zegrid_launch(str(output_reason))
-            if enabled and store_unsafe:
+            if durable_requested and store_unsafe:
                 return self._refuse_zegrid_launch(
                     self._tr(
                         "qt_zegrid_store_unsafe",
                         "Checkpoint store refused: {reason}. Nothing was created.",
                     ).format(reason=store_unsafe)
                 )
+            # An EXPLICIT fresh choice with a durable promise creates a NEW
+            # generation (``never``) and KEEPS the store: durable recovery is
+            # still available for the new run, and ``never``-with-no-store is
+            # reserved for a genuinely non-durable launch.
             self._pending_zegrid_resume = {
                 "mode": "never",
                 "run_id": None,
-                "store_dir": store_root if enabled else None,
+                "store_dir": store_root if durable_requested else None,
             }
             self._append_log(
                 self._tr(
@@ -4018,9 +4136,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     ),
                     level="warning",
                 )
-        # F2: every fresh checkpoint-enabled launch validates the store path,
-        # even when no candidate was found.
-        if enabled and store_unsafe:
+        # F2: every durable launch validates the store path, even when no
+        # candidate was found.
+        if durable_requested and store_unsafe:
             return self._refuse_zegrid_launch(
                 self._tr(
                     "qt_zegrid_store_unsafe",
@@ -4030,9 +4148,22 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # F3: never overwrite a previous publication or foreign content.
         if not output_safe:
             return self._refuse_zegrid_launch(str(output_reason))
-        if enabled:
+        if durable_requested:
+            # A non-off generic resume intent honours the user-visible promise
+            # as durable recovery for THIS launch. ``auto`` is used ONLY when the
+            # store holds no candidate at all (the engine then starts a NEW
+            # durable generation and logs it). When non-resumable candidates
+            # exist (complete/corrupt/locked), a fresh generation (``never``) is
+            # the only honest choice: ``auto`` would silently select that other
+            # run. The store is kept either way, so the new run is checkpointed
+            # and a later crash/relaunch can resume it.
+            _has_candidates = bool(info["candidates"])
             self._pending_zegrid_resume = {
-                "mode": "never",
+                "mode": (
+                    "auto"
+                    if (resume_intent != "off" and not _has_candidates)
+                    else "never"
+                ),
                 "run_id": None,
                 "store_dir": store_root,
             }
@@ -9656,66 +9787,72 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._log_filter_handoff("worker_build_count", build_total)
         self._log_filter_handoff("worker_build_valid_wcs_count", build_valid)
 
-        # ZM-UNIFIED-STOP-SAVE-CAPABILITY (A2/E): transport the FROZEN capability
-        # with the run. Only ZEGRID_DURABLE may carry a durable store/resume
-        # plan; every other capability sends an explicit never/no-store payload
-        # so the child can never independently discover or enable a store the
-        # GUI refused.
-        capability = getattr(self, "_pending_stop_capability", None)
-        if capability is None:
-            # No capability was frozen (direct/internal caller outside
-            # ``_start_processing``): keep the historical transport rule so
-            # existing behaviour is unchanged. The launch flow ALWAYS freezes
-            # the capability before calling this method.
-            durable_capability = self._selected_processing_mode() == "zegrid"
-        else:
-            durable_capability = (
-                capability == self.STOP_CAPABILITY_ZEGRID_DURABLE
-            )
-        worker_kwargs["zegrid_stop_capability"] = (
-            self.STOP_CAPABILITY_ZEGRID_DURABLE
-            if durable_capability
-            else self.STOP_CAPABILITY_LEGACY_GRACEFUL
-        )
-        if durable_capability:
-            plan = self._pending_zegrid_resume
-            if isinstance(plan, dict):
-                worker_kwargs["zegrid_durable_store_dir"] = plan.get("store_dir")
-                worker_kwargs["zegrid_resume_mode"] = plan.get("mode")
-                worker_kwargs["zegrid_resume_run_id"] = plan.get("run_id")
-            else:
-                for key in (
-                    "zegrid_durable_store_dir",
-                    "zegrid_resume_mode",
-                    "zegrid_resume_run_id",
-                ):
-                    worker_kwargs[key] = cfg.get(key)
-        else:
-            worker_kwargs["zegrid_durable_store_dir"] = None
-            worker_kwargs["zegrid_resume_mode"] = "never"
-            worker_kwargs["zegrid_resume_run_id"] = None
+        # ZM-UNIFIED-STOP-SAVE-CAPABILITY (A2/E) + ZM-P0 resume integrity: ONE
+        # transport computed from the frozen capability + per-launch plan. Only
+        # ZEGRID_DURABLE may carry a durable store/resume plan; every other
+        # capability sends an explicit never/no-store payload so the child can
+        # never independently discover or enable a store the GUI refused. The
+        # run snapshot consumes the SAME method, so snapshot == transport.
+        transport = self._effective_zegrid_transport()
+        worker_kwargs["zegrid_stop_capability"] = transport[
+            "zegrid_stop_capability"
+        ]
+        worker_kwargs["zegrid_durable_store_dir"] = transport[
+            "zegrid_durable_store_dir"
+        ]
+        worker_kwargs["zegrid_resume_mode"] = transport["zegrid_resume_mode"]
+        worker_kwargs["zegrid_resume_run_id"] = transport[
+            "zegrid_resume_run_id"
+        ]
 
         return (), worker_kwargs
 
     def _apply_effective_zegrid_resume_to_snapshot(
         self, snapshot: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Record the EFFECTIVE per-launch resume transport in the snapshot.
+        """Record the EFFECTIVE per-launch transport in the snapshot.
 
         ``zegrid_resume_mode`` is deliberately NOT persisted in the config file
         (a stale ``auto`` must never hijack a later launch), so the saved config
         still holds the historical default. The run snapshot, however, must
-        describe the run that is actually about to start: when the GUI promotes
-        the launch to ``auto`` (explicit Resume selection) the snapshot records
-        ``auto`` — never a misleading ``never``. The engine receives exactly
-        these values, so snapshot == transport.
+        describe the run that is actually about to start, so it is written from
+        the ONE transport method the worker invocation also consumes. This makes
+        the invariant structural: snapshot == transport for the durable store,
+        the resume mode/run id and the stop capability.
         """
-        plan = self._pending_zegrid_resume
-        if not isinstance(plan, dict):
-            return snapshot
-        snapshot["zegrid_durable_store_dir"] = plan.get("store_dir")
-        snapshot["zegrid_resume_mode"] = plan.get("mode")
-        snapshot["zegrid_resume_run_id"] = plan.get("run_id")
+        resolver = getattr(self, "_effective_zegrid_transport", None)
+        transport = resolver() if callable(resolver) else None
+        if transport is None:
+            plan = getattr(self, "_pending_zegrid_resume", None)
+            if not isinstance(plan, dict):
+                return snapshot
+            transport = {
+                "zegrid_stop_capability": (
+                    ZeMosaicQtMainWindow.STOP_CAPABILITY_ZEGRID_DURABLE
+                ),
+                "zegrid_durable_store_dir": plan.get("store_dir"),
+                "zegrid_resume_mode": plan.get("mode"),
+                "zegrid_resume_run_id": plan.get("run_id"),
+                "resume": plan.get("mode"),
+            }
+        snapshot["zegrid_stop_capability"] = transport[
+            "zegrid_stop_capability"
+        ]
+        snapshot["zegrid_durable_store_dir"] = transport[
+            "zegrid_durable_store_dir"
+        ]
+        snapshot["zegrid_resume_mode"] = transport["zegrid_resume_mode"]
+        snapshot["zegrid_resume_run_id"] = transport[
+            "zegrid_resume_run_id"
+        ]
+        # The effective generic resume intent is part of the same promise. For
+        # ZeGrid it is normalised to auto/off; other modes keep the historical
+        # raw value (force/off semantics are theirs, not ZeGrid's).
+        try:
+            if self._selected_processing_mode() == "zegrid":
+                snapshot["resume"] = transport["resume"]
+        except AttributeError:
+            pass
         return snapshot
 
     def _snapshot_for_run(self) -> Dict[str, Any]:
@@ -10333,6 +10470,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # validated and BEFORE the resume preflight/spawn, then freeze it with
         # the run. ``_pending_run_is_zegrid`` keeps its historic name but now
         # means "the frozen capability is ZEGRID_DURABLE".
+        # ZM-P0-RESUME-INTEGRITY: a user-visible generic resume request must be
+        # honoured or refused BEFORE any spawn -- never silently downgraded.
+        if not self._validate_zegrid_resume_intent_for_start():
+            return
         stop_capability = self._resolve_stop_capability()
         self._pending_stop_capability = stop_capability
         self._pending_run_is_zegrid = (
