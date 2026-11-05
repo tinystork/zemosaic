@@ -73,6 +73,10 @@ class MetadataTests(unittest.TestCase):
 
         self.assertIsInstance(zemosaic.__version__, str)
         self.assertTrue(zemosaic.__version__)
+        installer_version = (REPO / "version.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()[0]
+        self.assertEqual(installer_version, f"ZeMosaic {zemosaic.__version__}")
 
     def test_cupy_not_a_base_dependency(self):
         if tomllib is None:

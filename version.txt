@@ -1,4 +1,4 @@
-ZeMosaic 5.0.0
+ZeMosaic 5.1.1
 Windows x64
 Installer build
 CuPy CUDA 12.x bundle
