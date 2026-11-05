@@ -602,19 +602,34 @@ def _launch_snapshot_and_transport_no_prepare(win) -> tuple[dict, dict]:
 # ---------------------------------------------------------------------------
 
 
-def test_exact_gpu_wrapper_chain_preserves_index_and_cell():
+def test_exact_gpu_wrapper_chain_preserves_inner_pool_index_only():
+    """Observed shape: wrapper -> ParallelPoolError(254) -> BrokenProcessPool.
+
+    The ParallelPoolError carries the INNER frame-task index/task. It must not
+    be mistaken for (or overwritten by) the OUTER producer unit/cell.
+    """
     from concurrent.futures.process import BrokenProcessPool
     from types import SimpleNamespace
 
-    cell = SimpleNamespace(cell_id="r0006c0005")
-    canonical_task = (cell, "patch", "cache-dir")
+    # Frame-cache-like tuple: (frame_desc, bounds, header, hw, rgb, sup,
+    # index, frame_id). It does NOT expose a cell_id.
+    frame_task = (
+        SimpleNamespace(frame_id="frame_0001.fits"),
+        "bounds",
+        "patch-header",
+        (16, 16),
+        "rgb.npy",
+        "support.npy",
+        254,
+        "frame_0001.fits",
+    )
     try:
         try:
             raise zpar.ParallelPoolError(
                 "executor failed while collecting task 254 "
                 "(BrokenProcessPool: child died)",
                 index=254,
-                task=canonical_task,
+                task=frame_task,
             ) from BrokenProcessPool("native child death")
         except zpar.ParallelPoolError as inner:
             raise zz._R55GpuFallback(
@@ -625,7 +640,8 @@ def test_exact_gpu_wrapper_chain_preserves_index_and_cell():
 
     assert details["is_pool_failure"] is True
     assert details["failing_task_index"] == 254
-    assert details["failing_cell_id"] == "r0006c0005"
+    # A frame task does not expose a cell id: never invent one.
+    assert details["failing_cell_id"] is None
     assert details["root_cause_type"] == "BrokenProcessPool"
     assert details["native_cause_proven"] is False
     chain_types = [item["type"] for item in details["exception_chain"]]
@@ -634,6 +650,17 @@ def test_exact_gpu_wrapper_chain_preserves_index_and_cell():
         "ParallelPoolError",
         "BrokenProcessPool",
     ]
+
+    # SEPARATE outer producer evidence (unit 2 -> cell r0006c0005) composes
+    # without conflating the two identities.
+    cell = SimpleNamespace(cell_id="r0006c0005")
+    identity = zz._r55_terminal_failure_evidence(
+        details, (2, (cell, "patch", "cache-dir"))
+    )
+    assert identity["pool_task_index"] == 254
+    assert identity["producer_unit_index"] == 2
+    assert identity["failing_cell_id"] == "r0006c0005"
+    assert identity["failing_task_index"] == 254  # inner alias only
 
 
 def test_direct_cell_object_evidence_never_invents_an_index():
@@ -722,21 +749,31 @@ def test_real_gpu_nested_producer_failure_then_gui_resume(tmp_path, monkeypatch)
     # No unproven causal labels.
     assert record["category"] not in ("resource_shortage", "vram_refusal")
     assert "OutOfMemory" not in json.dumps(record)
-    # Exact failing cell/task from the nested producer pmap.
-    assert record["failing_task_index"] == 2
-    assert record["durable_resume"] is True
-    assert record["accepted_in_memory_only"] is False
-    assert record["durable_complete_cells"] == 2
-    assert record["durable_pending_cells"] == 2
-    assert record["cpu_reuse"] == "refused_no_numeric_parity_qualification"
-
     run_root = _store_run_root(store_root)
     run_id = json.loads((run_root / "run.json").read_text(encoding="utf-8"))[
         "run_id"
     ]
     state = json.loads((run_root / "state.json").read_text(encoding="utf-8"))
     expected_ids = list(state["expected_cell_ids"])
+
+    # TWO distinct identities, both preserved without conflation.
+    inner_pool_index = record["pool_task_index"]
+    assert isinstance(inner_pool_index, int)
+    assert record["producer_unit_index"] == 2
+    assert inner_pool_index != record["producer_unit_index"]
+    assert record["failing_task_index"] == inner_pool_index  # inner alias only
     assert record["failing_cell_id"] == expected_ids[2]
+    assert (
+        record["failure_classification"]["failing_task_index"]
+        == inner_pool_index
+    )
+    assert record["failure_classification"]["failing_cell_id"] is None
+    assert record["durable_resume"] is True
+    assert record["accepted_in_memory_only"] is False
+    assert record["durable_complete_cells"] == 2
+    assert record["durable_pending_cells"] == 2
+    assert record["cpu_reuse"] == "refused_no_numeric_parity_qualification"
+
     committed = _commits(store_root)
     assert len(committed) == 2
     objects_before = _tree_digest(run_root / "objects")
@@ -751,7 +788,9 @@ def test_real_gpu_nested_producer_failure_then_gui_resume(tmp_path, monkeypatch)
     assert "producer/executor child pool died" in log_blob
     assert "DURABLE and resumable from the store" in log_blob
     assert f"run_id={run_id}" in log_blob
-    assert f"Failing cell={expected_ids[2]} task=2" in log_blob
+    assert f"pool task={inner_pool_index}" in log_blob
+    assert "producer unit=2" in log_blob
+    assert f"cell={expected_ids[2]}" in log_blob
     assert "NOT resumable after this worker exits" not in log_blob
     assert "whole-batch CPU rerun would double the work" in log_blob
     # No CPU whole-batch rerun executed cells: exactly the two durable commits.
@@ -827,3 +866,84 @@ def test_real_gpu_nested_producer_failure_then_gui_resume(tmp_path, monkeypatch)
     assert final_state["finalized"] is True
     generation = zpub.resolve_current(str(output), run_id)
     assert generation.path(zpub.ROLE_SCIENCE).is_file()
+
+
+def test_terminal_evidence_malformed_never_masks_primary_exception():
+    """Partial/malformed evidence yields nulls and never masks the primary."""
+    malformed_pool = zz._r55_pool_failure_details(
+        zpar.ParallelPoolError("broken", index=None, task=object())
+    )
+    identity = zz._r55_terminal_failure_evidence(
+        malformed_pool, object(), cell_tasks=None
+    )
+    assert identity == {
+        "pool_task_index": None,
+        "producer_unit_index": None,
+        "failing_cell_id": None,
+        "failing_task_index": None,
+    }
+    partial = zz._r55_terminal_failure_evidence(
+        malformed_pool, {"cell_id": None, "task": object()}, cell_tasks=None
+    )
+    assert all(value is None for value in partial.values())
+
+    primary = RuntimeError("primary pipeline failure")
+    try:
+        raise primary
+    except RuntimeError as exc:
+        # The diagnostic composition must not raise, so the ORIGINAL exception
+        # is the one that propagates.
+        zz._r55_terminal_failure_evidence(malformed_pool, object())
+        assert exc is primary
+
+
+def test_product_failure_diagnostics_do_not_block_resume_but_foreign_does(
+    tmp_path, monkeypatch
+):
+    import test_zegrid_resume_m4 as m4
+
+    win = _window(tmp_path, monkeypatch, {})
+    out = Path(win.config["output_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    store = tmp_path / "resume-store"
+    m4.seeded_store(
+        store,
+        identity=m4.make_identity(run_id="run-allow"),
+        cell_indexes=(0,),
+    )
+    win.config["zegrid_durable_store_dir"] = str(store)
+    win._zegrid_checkpoint_store_edit.setText(str(store))
+    win._on_zegrid_checkpoint_store_edited(user_edit=True)
+
+    # Product-owned terminal diagnostics from a crashed GPU run.
+    for name in (
+        "zegrid_gpu_failure.json",
+        "zegrid_gpu_failure.jsonl",
+        "zegrid_run.log",
+    ):
+        (out / name).write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        win,
+        "_ask_zegrid_resume_choice",
+        lambda *a, **k: ("resume", "run-allow"),
+    )
+    win._pending_zegrid_resume = None
+    before = _tree_digest(tmp_path)
+    assert win._prepare_zegrid_resume_for_start() is True
+    assert win._pending_zegrid_resume == {
+        "mode": "auto",
+        "run_id": "run-allow",
+        "store_dir": str(store),
+    }
+    assert _tree_digest(tmp_path) == before, "resume preflight mutated bytes"
+
+    # A genuinely unrelated file still refuses, without mutation.
+    (out / "unrelated.txt").write_text("foreign", encoding="utf-8")
+    before_foreign = _tree_digest(tmp_path)
+    win._pending_zegrid_resume = None
+    monkeypatch.setattr(
+        gui.QMessageBox, "warning", lambda *a, **k: None
+    )
+    assert win._prepare_zegrid_resume_for_start() is False
+    assert _tree_digest(tmp_path) == before_foreign

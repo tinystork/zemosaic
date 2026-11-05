@@ -9006,6 +9006,7 @@ def _r55_normalize_task_cell_evidence(value):
         if isinstance(node, Mapping):
             _set_index(node.get("index"))
             _set_index(node.get("task_index"))
+            _set_index(node.get("producer_unit_index"))
             _set_cell(node.get("cell_id"))
             nested = node.get("task")
             if nested is None and cell_id is None:
@@ -9030,6 +9031,56 @@ def _r55_normalize_task_cell_evidence(value):
         _set_cell(node)
         break
     return index, cell_id
+
+
+def _r55_terminal_failure_evidence(
+    pool_details, producer_evidence, cell_tasks=None
+) -> dict:
+    """Compose the terminal identity fields WITHOUT conflating the two indices.
+
+    * ``pool_task_index`` is the INNER executor/frame task index carried by the
+      ``ParallelPoolError`` (observed production meaning, e.g. 254).
+    * ``producer_unit_index`` is the OUTER producer unit index from the
+      ``BoundedPipeline`` / producer evidence (e.g. 2).
+    * ``failing_cell_id`` comes from the OUTER producer evidence (canonical cell
+      task at that unit index); a frame-cache task is not expected to expose a
+      cell id.
+    * ``failing_task_index`` is retained ONLY as a legacy alias for the INNER
+      pool task index; it is never the producer unit index.
+
+    Never raises on malformed evidence: unknown fields stay ``None``.
+    """
+    pool_task_index = None
+    if isinstance(pool_details, Mapping):
+        raw_pool = pool_details.get("failing_task_index")
+        if isinstance(raw_pool, int) and not isinstance(raw_pool, bool):
+            pool_task_index = int(raw_pool)
+    producer_unit_index, failing_cell_id = _r55_normalize_task_cell_evidence(
+        producer_evidence
+    )
+    if (
+        failing_cell_id is None
+        and producer_unit_index is not None
+        and cell_tasks is not None
+    ):
+        try:
+            if 0 <= int(producer_unit_index) < len(cell_tasks):
+                failing_cell_id = str(
+                    cell_tasks[int(producer_unit_index)][0].cell_id
+                )
+        except Exception:
+            failing_cell_id = None
+    return {
+        "pool_task_index": pool_task_index,
+        "producer_unit_index": (
+            None
+            if producer_unit_index is None
+            else int(producer_unit_index)
+        ),
+        "failing_cell_id": failing_cell_id,
+        # Legacy alias: INNER pool task index, never the producer unit index.
+        "failing_task_index": pool_task_index,
+    }
 
 
 def _r55_pool_failure_details(exc) -> dict:
@@ -13972,7 +14023,9 @@ def _run_single(
         failure_lock = threading.Lock()
         failure_capture: dict = {}
 
-        def _capture_failure(stage, exc, *, payload=None, task=None):
+        def _capture_failure(
+            stage, exc, *, payload=None, task=None, unit_index=None
+        ):
             try:
                 with failure_lock:
                     if failure_capture:
@@ -13990,6 +14043,11 @@ def _run_single(
                         try:
                             unit = {
                                 "producer_task_index": task[0],
+                                "producer_unit_index": (
+                                    None
+                                    if unit_index is None
+                                    else int(unit_index)
+                                ),
                                 "cell_id": str(getattr(task[0], "cell_id", "")),
                             }
                         except Exception:
@@ -14068,11 +14126,13 @@ def _run_single(
             with tile_lock:
                 return tile_state["bundle"]
 
-        def _produce(task):
+        def _produce(task, unit_index=None):
             try:
                 prepared = _prepare_stack_cell(task)
             except BaseException as exc:
-                _capture_failure("producer", exc, task=task)
+                _capture_failure(
+                    "producer", exc, task=task, unit_index=unit_index
+                )
                 raise
             if "empty_result" in prepared:
                 prepared["_empty_unit"] = True
@@ -14814,7 +14874,10 @@ def _run_single(
         host_budget_val = int(host_budget)
         pipeline = zpar.BoundedPipeline(
             tasks=indexed,
-            produce=lambda item: dict(_produce(item[1]), _unit_index=int(item[0])),
+            produce=lambda item: dict(
+                _produce(item[1], unit_index=int(item[0])),
+                _unit_index=int(item[0]),
+            ),
             consume=_consume_guarded,
             release=_release,
             prefetch_units=prefetch,
@@ -15027,6 +15090,10 @@ def _run_single(
                         tile_state, gpu_decision, initial_tile
                     ),
                     "diagnostics_path": _generic_path,
+                    # OUTER producer evidence (unit index + cell) survives the
+                    # wrapper even when the pipeline's live index is cleared.
+                    "capture_stage": _captured.get("stage"),
+                    "capture_unit": _captured.get("unit"),
                 },
             ) from exc
         wall = time.perf_counter() - t0
@@ -15979,47 +16046,42 @@ def _run_single(
             _r55_gpu_run_fallback["category"] = str(
                 _conservation_category
             )
-            # Failing cell/task from the pipeline's own evidence (never guessed).
-            # The value may be an integer index, a task tuple, a mapping or a
-            # direct ZeGridCell-like object; a cell object never supplies an
-            # index, so "index unknown, cell known" stays representable.
-            _evidence_index, _evidence_cell_id = _r55_normalize_task_cell_evidence(
-                _gpu_pipeline.get("producer_task_index")
+            # Terminal identity: THREE distinct fields, never conflated.
+            #   pool_task_index    = INNER executor/frame task index (e.g. 254);
+            #   producer_unit_index = OUTER producer unit index (e.g. 2);
+            #   failing_cell_id     = cell from OUTER producer evidence.
+            # The legacy ``failing_task_index`` is ONLY an alias of the inner
+            # pool task index, never the producer unit index.
+            _producer_evidence = _gpu_pipeline.get("producer_task_index")
+            if _producer_evidence is None:
+                _producer_evidence = (_gpu_exc.telemetry or {}).get(
+                    "capture_unit"
+                )
+            _terminal_identity = _r55_terminal_failure_evidence(
+                _pool_failure,
+                _producer_evidence,
+                cell_tasks=_initial_bundle.cell_tasks,
             )
-            if _evidence_index is None:
-                _active_index, _active_cell_id = _r55_normalize_task_cell_evidence(
-                    _gpu_pipeline.get("active_unit_index")
+            if _terminal_identity["producer_unit_index"] is None or (
+                _terminal_identity["failing_cell_id"] is None
+            ):
+                _active_identity = _r55_terminal_failure_evidence(
+                    _pool_failure,
+                    _gpu_pipeline.get("active_unit_index"),
+                    cell_tasks=_initial_bundle.cell_tasks,
                 )
-                if _evidence_index is None:
-                    _evidence_index = _active_index
-                if _evidence_cell_id is None:
-                    _evidence_cell_id = _active_cell_id
-            if _evidence_cell_id is None and _evidence_index is not None:
-                try:
-                    if 0 <= int(_evidence_index) < len(
-                        _initial_bundle.cell_tasks
-                    ):
-                        _evidence_cell_id = str(
-                            _initial_bundle.cell_tasks[
-                                int(_evidence_index)
-                            ][0].cell_id
-                        )
-                except Exception:
-                    pass
-            if _evidence_cell_id is None:
-                _evidence_cell_id = _pool_failure.get("failing_cell_id")
-            if _evidence_index is None:
-                _evidence_index = _pool_failure.get("failing_task_index")
-            _failing_task_index = _evidence_index
-            _failing_cell_id = _evidence_cell_id
-            try:
-                _failing_index_int = (
-                    None
-                    if _failing_task_index is None
-                    else int(_failing_task_index)
-                )
-            except Exception:
-                _failing_index_int = None
+                if _terminal_identity["producer_unit_index"] is None:
+                    _terminal_identity["producer_unit_index"] = (
+                        _active_identity["producer_unit_index"]
+                    )
+                if _terminal_identity["failing_cell_id"] is None:
+                    _terminal_identity["failing_cell_id"] = (
+                        _active_identity["failing_cell_id"]
+                    )
+            _pool_task_index = _terminal_identity["pool_task_index"]
+            _producer_unit_index = _terminal_identity["producer_unit_index"]
+            _failing_cell_id = _terminal_identity["failing_cell_id"]
+            _failing_task_index = _terminal_identity["failing_task_index"]
             for _t in _initial_bundle.cell_tasks:
                 if _t[4] is not None:
                     _safe_rmtree(_t[3], None)
@@ -16093,10 +16155,20 @@ def _run_single(
                     if _pool_failure["is_pool_failure"]
                     else ""
                 )
+                _identity_parts = []
+                if _pool_task_index is not None:
+                    _identity_parts.append(
+                        f"pool task={int(_pool_task_index)}"
+                    )
+                if _producer_unit_index is not None:
+                    _identity_parts.append(
+                        f"producer unit={int(_producer_unit_index)}"
+                    )
+                if _failing_cell_id is not None:
+                    _identity_parts.append(f"cell={_failing_cell_id}")
                 _failing_note = (
-                    f" Failing cell={_failing_cell_id} task="
-                    f"{_failing_index_int}."
-                    if _failing_cell_id is not None
+                    " Terminal identity: " + ", ".join(_identity_parts) + "."
+                    if _identity_parts
                     else ""
                 )
                 if _gpu_durable:
@@ -16147,7 +16219,10 @@ def _run_single(
                             "payloads retained in memory"
                         ),
                         "failure_classification": dict(_pool_failure),
-                        "failing_task_index": _failing_index_int,
+                        "pool_task_index": _pool_task_index,
+                        "producer_unit_index": _producer_unit_index,
+                        # Legacy alias: INNER pool task index only.
+                        "failing_task_index": _failing_task_index,
                         "failing_cell_id": _failing_cell_id,
                         "gpu_fallback": dict(_r55_gpu_run_fallback),
                         "result_registry": _preserved_snapshot,

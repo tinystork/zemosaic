@@ -211,11 +211,30 @@ def run_worker(
                 nested_cache_fail_at_unit is not None
                 and state["cache_builds"] == int(nested_cache_fail_at_unit)
             ):
+                # FAITHFUL nested metadata: the real pmap raises with an INNER
+                # frame-task index and the actual frame-cache task tuple. The
+                # outer producer unit index/cell come from BoundedPipeline /
+                # canonical producer evidence and are NOT injected here.
+                frame_task = task_list[0] if task_list else None
+                inner_index = None
+                try:
+                    if (
+                        isinstance(frame_task, (tuple, list))
+                        and len(frame_task) >= 7
+                        and isinstance(frame_task[6], int)
+                        and not isinstance(frame_task[6], bool)
+                    ):
+                        inner_index = int(frame_task[6])
+                except Exception:
+                    inner_index = None
+                if inner_index is None:
+                    inner_index = 0
                 raise zpar.ParallelPoolError(
-                    "executor failed while collecting task 0 "
+                    "executor failed while collecting task "
+                    f"{inner_index} "
                     "(BrokenProcessPool: simulated native child pool death)",
-                    index=prepare_state["index"],
-                    task=prepare_state["task"],
+                    index=inner_index,
+                    task=frame_task,
                 ) from BrokenProcessPool(
                     "simulated native child pool death (P0 GPU harness)"
                 )
