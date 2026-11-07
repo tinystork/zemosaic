@@ -298,3 +298,29 @@ corrigés, vérifiés et committés localement sur `feat/zegrid-adaptive-resourc
 
 F14 (WARN attendus trop bruyants, LOW) reste à corriger dans un lot ultérieur.
 Les lots F1–F10 restent ouverts.
+
+## Corrections appliquées — lots F1–F10 (hors F14) — 2026-11-07
+
+Tous les défauts matériels de l'audit ont été corrigés et vérifiés
+indépendamment par Junior, committés localement sur
+`feat/zegrid-adaptive-resources` (aucun push au moment de la rédaction) :
+
+| Défaut | Contenu | Commit | Vérification |
+| --- | --- | --- | --- |
+| F2 (HIGH) | enveloppe disque external ne facture plus le cache aligné N×patch fantôme ; `resident_unit` = staging résident exact | `b251643` | suite requise 170 passed/1 skipped |
+| F3 (HIGH) | `largest_admissible_column_batch` plancher abaissé au pixel (granularité `channels`), bit-exact vs ligne | `b251643` | idem |
+| F4 (HIGH) | external sélectionnable sous GPU (`allow_external=is_bounded`, gate sans `not effective_gpu`), pseudo-plan CPU-only | `aad9f64` | 172 passed (venv CuPy) |
+| F8 (MEDIUM) | sticky fallback (1 transition GPU→CPU/cellule), provenance `requested=gpu`/`rejection=combine=cpu`, caller publie `gpu_fallback` | `aad9f64` | idem |
+| F1 (HIGH) | `_write_outputs` sans copie plein canevas (hash+écriture bandés) | `0ed7cb2` | 29 passed + 148 passed élargie |
+| F6 (HIGH) | allocator scratch routé global + per_cell, modèle gauge-mode aware (49 B/px global vs 125 B/px per_cell) | `0ed7cb2` | idem |
+| F7 (MEDIUM) | `discard()` reporte/leve sur échec, close avant unlink, cleanup dans `finally` | `0ed7cb2` | idem |
+| F5 (HIGH) | grow A5 câblé dans l'admission ACTIVE préflight (hystérésis, borné, trail, garde A1d pinned) | `3c81aaf` | 118 passed + 74 passed |
+
+F10 (honnêteté de qualification) : la matrice `05_QUALIFICATION_MATRIX.md` et la
+fiche `ZEGRID_ADAPTIVE_RESOURCE_ENGINE_STATE_20261107.md` ont été corrigées pour
+ne plus marquer `PASS` des gates aux preuves partielles (Q40/Q41/Q50/Q60/Q64
+passent en `PARTIEL`). Ces corrections lèvent les faux refus et la dette de
+copies mémoire, mais ne ferment pas à elles seules les gates produit : les runs
+réels sur machine contrainte (grand canevas M33, rampe 4→1→4 matérielle,
+GUI ACTIVE→external GPU→scratch→FITS) restent à exécuter. F14 (WARN, LOW) est
+exclu du périmètre par décision Tristan. A1d (schéma d'identité v2) reste différé.

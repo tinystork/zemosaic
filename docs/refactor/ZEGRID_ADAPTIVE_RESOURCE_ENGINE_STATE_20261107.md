@@ -2,21 +2,22 @@
 
 Mise à jour : 2026-11-07  
 Programme : `ZM-ZEGRID-ADAPTIVE-RESOURCES-20261107`  
-État : **AUDIT_FINDINGS — qualification produit incomplète**
+État : **REWORK F1–F10 appliqué — qualification produit encore PARTIELLE (runs réels restants)**
 Contrat : [plan v2, sections 10–14](ZEGRID_ADAPTIVE_RESOURCE_ENGINE_PLAN_20261107.md)
 
 ## Verdict courant après audit transversal (2026-11-07)
 
-**L'audit est terminé; les gates produit A4/A5 ne sont pas satisfaits et A6 n'est pas qualifié.**
-Les acceptations et le journal ci-dessous sont historiques, supersédés pour leur portée produit
-par le [rapport final d'audit](../qualification/zegrid-adaptive-resources/POST_PUBLICATION_AUDIT_20261107.md).
-A2/A3 ont des primitives valides mais des manques d'intégration; A1d reste différé.
-54 tests ciblés passent; le comparatif réel5150040/418ba43 reproduit les mêmes9 échecs connus.
-Pas de modification produit ni nouvelle publication pendant l'audit.
-Le run Windows M106 `mem_fix` confirme GUI/ACTIVE/GPU70 % et publication, mais seulement en profil
-`dense`/`ram_tile`; il révèle aussi F11–F14 (identité de reprise, télémétrie et faux WARN).
-**Prochaine action unique : rework borné « reprise et alertes honnêtes » (F11–F14), puis contrat
-admission/provider et choix automatique sous-ligne (F2/F3).** Différer le gros M33.
+**Les défauts matériels F1–F13 de l'audit sont corrigés et vérifiés indépendamment** (commits
+locaux sur `feat/zegrid-adaptive-resources`) : F2/F3 (admission véridique + sous-ligne) `b251643`,
+F4/F8 (external sous GPU + fallback sticky/provenance) `aad9f64`, F1/F6/F7 (publication bandée +
+scratch global/per_cell + cleanup honnête) `0ed7cb2`, F5 (grow A5 câblé) `3c81aaf`, et
+F11/F12/F13 (reprise + télémétrie + faux échec run_log) `9fd304b`+`0cd0080` déjà poussés `91a425b`.
+**Les gates produit restent PARTIELS** : Q40/Q41/Q50/Q60/Q64 exigent des runs réels sur machine
+contrainte (grand canevas M33, rampe 4→1→4 matérielle, GUI ACTIVE→external GPU→scratch→FITS) qui
+n'ont pas encore tourné. F14 (WARN trop bruyants, LOW) est exclu par décision Tristan. A1d (schéma
+d'identité v2) reste différé. Le run de contrôle M33 GPU de Tristan (sortie
+`C:\Users\JarvisJunior\Desktop\zemosaic out\M33`) confirmait AVANT correction le refus F4
+(external verrouillé sous GPU) ; à rejouer après ces corrections.
 
 ## Autorisation réelle
 
@@ -60,8 +61,8 @@ Les champs non créés sont intentionnels avant lancement, pas des preuves manqu
 | A5 | ACCEPTED (Q50+Q51) | A5-T01 | croissance bornée inverse du shrink (39e350c) + Q50 (5 tests) ; Q51 couvert par resume_m4/p0_resume_integrity/m3_recovery (79 tests verts) |
 | A6 | RUNNING (Q60+Q64) ; Q61 BLOCKED | A6-T01 | Q60 vrais runs E2E 1/2/4 Gio bit-identiques (e9f8729, 4 tests) ; Q64 propagation GUI headless (15 tests) ; Q61 M33 Windows + Q62 Caldwell + Q63 M106/M16 reportés au test direct beta de Tristan |
 
-**Dernier gate accepté : A5_ACCEPTED (Q50+Q51).** A6 en cours (Q60/Q64 faits,
-Q61 BLOCKED, Q62/Q63 reportés au test direct beta).
+**Dernier gate accepté : A5_ACCEPTED (Q50+Q51).** A6 partiel (Q60/Q64 PARTIELS,
+Q61 BLOCKED, Q62/Q63 reportés au test direct beta). Rework F1–F13 appliqué.
 
 ## Suivi worker à renseigner seulement au dispatch réel
 

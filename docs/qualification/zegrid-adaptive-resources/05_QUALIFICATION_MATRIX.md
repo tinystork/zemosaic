@@ -22,6 +22,26 @@ scratch/OOM/croissance. Il révèle F11 (identité working-set non gelée, HIGH)
 pinned pool, MEDIUM), F13 (faux échec de livraison du run log, MEDIUM) et F14 (WARN attendus trop
 bruyants, LOW), détaillés dans le rapport final.
 
+### Corrections F1–F10 appliquées — 2026-11-07 (F10 honnêteté de qualification)
+
+Les défauts matériels de l'audit ont été corrigés et vérifiés indépendamment
+(commits locaux sur `feat/zegrid-adaptive-resources`, aucun push) :
+
+- **F2** (cache fantôme facturé) + **F3** (choix sous-ligne) — `b251643`.
+- **F4** (external sélectionnable sous GPU) + **F8** (fallback sticky + provenance
+  véridique) — `aad9f64`.
+- **F1** (copies plein canevas) + **F6** (scratch global+per_cell) + **F7**
+  (cleanup honnête) — `0ed7cb2`.
+- **F5** (câblage grow A5 dans l'admission ACTIVE préflight) — `3c81aaf`.
+- **F11/F12/F13** (reprise + télémétrie + faux échec run_log) — `9fd304b`+`0cd0080`
+  (déjà poussés `91a425b` sur beta).
+
+Ces corrections lèvent les faux refus et la dette de copies mémoire, mais **ne
+ferment pas à elles seules les gates produit** : Q40/Q41/Q50/Q60/Q64 restent
+PARTIEL tant que les runs réels (grand canevas M33, rampe 4→1→4 matérielle,
+GUI ACTIVE→external GPU→scratch→FITS) n'ont pas tourné sur machine contrainte.
+F14 (WARN trop bruyants, LOW) reste exclu du périmètre par décision Tristan.
+
 ## 1. Identités machines et corpus
 
 | Id | Machine | RAM | VRAM | Corpus | Racine |
@@ -146,7 +166,10 @@ powershell -NoProfile -Command "cd C:\chemin\zemosaic; $env:PYTHONPATH=$PWD\src;
   **byte-identiques** au témoin dense `PrimaryHDU` (même bloc header, data
   big-endian, SCIHASH, remplacement non-fini), aucune copie plein canevas à la
   dernière étape (écriture par bandes), scratch libéré après sérialisation.
-- Statut : **PASS** (Linux ; le grand canevas M33 réel reste en A6/Q61).
+- Statut : **PARTIEL** (Linux) — preuve unitaire 24×24/scratch forcé, pas un
+  canevas > budget réel, pas de `_write_outputs`/repli automatique bout-en-bout
+  ni plafond RSS mesuré. F1 (copies plein canevas) et F6 (scratch global+per_cell)
+  et F7 (cleanup honnête) sont corrigés ; le grand canevas M33 réel reste A6/Q61.
 
 ### Q41 — A4, finitions/preview + disque presque plein
 
@@ -154,7 +177,8 @@ powershell -NoProfile -Command "cd C:\chemin\zemosaic; $env:PYTHONPATH=$PWD\src;
 - Preuve : l'admission tarifie les finitions (DBE/RGB/hole-fill/uint16) de façon
   véridique, refuse sur disque presque plein **sans désactiver les finitions**
   (finishing.enabled reste True), avant toute création de génération (atomique).
-- Statut : **PASS** (Linux).
+- Statut : **PARTIEL** (Linux) — modèles/refus de publication ; aucune
+  finition/preview réelle sous ressources contraintes n'a été exercée.
 
 ### Q50 — A5, budget 4→1→4 Gio, restart
 
@@ -164,8 +188,10 @@ powershell -NoProfile -Command "cd C:\chemin\zemosaic; $env:PYTHONPATH=$PWD\src;
   depuis le maximum du treillis, les gardes refusent tout shrink/réduction
   d'octets, et un budget 1 Gio n'achète jamais un plan plus gros que 4 Gio ;
   identité scientifique gelée préservée sur toute la rampe.
-- Statut : **PASS** (Linux, budget modélisé par contrainte d'énumération ; la
-  rampe réelle 4/1 Gio matériellement contrainte reste en A6/Q60).
+- Statut : **PARTIEL** (Linux, budget modélisé par contrainte d'énumération) —
+  API/treillis uniquement, pas de rampe dynamique/restart produit ; F5 (câblage
+  grow dans l'admission ACTIVE préflight, avec hystérésis) est corrigé ; la
+  rampe réelle 4/1 Gio matériellement contrainte reste en A6/Q60.
 
 ### Q51 — A5, interruption milieu d'unité, corruption témoin
 
@@ -185,8 +211,10 @@ powershell -NoProfile -Command "cd C:\chemin\zemosaic; $env:PYTHONPATH=$PWD\src;
   (budget herméticisé via `available_memory_bytes`) à 1/2/4 Gio : FITS +
   manifest valides, coverage > 0, et science/coverage **bit-identiques** entre
   budgets — la preuve petit budget est un run réel, pas un dry-plan.
-- Statut : **PASS** (Linux 1/2/4 Gio ; Windows 1/2/4/8/16 Gio et 32 Gio non
-  qualifiés sur cet hôte — reportés au test direct beta de Tristan).
+- Statut : **PARTIEL** (Linux 1/2/4 Gio) — quatre frames, legacy explicitement,
+  budgets observés simulés ; ni plafond RSS/swap ni GUI ACTIVE ni preuve de tous
+  les nouveaux chemins. Windows 1/2/4/8/16 Gio et 32 Gio non qualifiés sur cet
+  hôte — reportés au test direct beta de Tristan.
 
 ### Q61 — A6, M33 complet Windows GPU
 
@@ -218,8 +246,9 @@ PYTHONPATH=src python3 -m zemosaic.zegrid_cli \
 
 - Preuve : `test_dispatch_propagation_witness.py` (15 tests verts) + `r53c_gui_halo`
   (le halo GUI atteint le worker et le moteur réel) + `r55e4_gui_gpu_toggle`.
-- Statut : **PASS** (propagation headless vérifiée ; le test GUI interactif
-  humain final reste à Tristan sur beta).
+- Statut : **PARTIEL** (propagation headless vérifiée) — insuffisant pour
+  GUI ACTIVE→external GPU→scratch→FITS ; le test GUI interactif humain final
+  reste à Tristan sur beta.
 
 ## 5. Commandes A0 réellement exécutées (traçabilité)
 
