@@ -706,3 +706,144 @@ class BoundedMemmapCanonicalProvider:
             _close_memmap(sup)
         batch = prepare_canonical_inputs([tile], [sup_tile])
         return batch.images[0], batch.valid_mask[0]
+
+
+class WindowedCanonicalProvider:
+    """A2a — lazy, window-of-one provider over the SAME preparation as the cache.
+
+    ``prepare(i) -> (rgb_f32, support_bool)`` returns the aligned frame in the
+    frozen order. The provider keeps at most ONE prepared frame live, so a cell
+    is never materialised as an ``N x patch`` cache. ``from_sources`` rebuilds
+    the exact preparation of :func:`build_aligned_cache_from_sources` (same
+    sorted order, same section read / WCS slice / reprojection / support).
+
+    Additive only: nothing activates this class in the product yet (A2b).
+    """
+
+    storage_domain = "windowed_sources"
+    live_window = 1
+
+    def __init__(self, prepare, n_frames, *, frame_ids=None, expected_hw=None):
+        self._prepare = prepare
+        self.n_frames = int(n_frames)
+        if self.n_frames < 0:
+            raise CanonicalStackValidationError("n_frames must be >= 0")
+        ids = (
+            tuple(str(i) for i in range(self.n_frames))
+            if frame_ids is None
+            else tuple(str(x) for x in frame_ids)
+        )
+        if len(ids) != self.n_frames:
+            raise CanonicalStackValidationError(
+                "frame_ids length must equal n_frames"
+            )
+        self.frame_ids = ids
+        self.prepared_count = 0
+        self.bytes_read = 0
+        self._index = None
+        self._rgb = None
+        self._sup = None
+        self._closed = False
+        self.height = self.width = self.channels = None
+        self.original_mono = None
+        self.original_ndim = None
+        self.original_shape = None
+        if expected_hw is not None:
+            self.height, self.width = (int(expected_hw[0]), int(expected_hw[1]))
+        if self.n_frames:
+            rgb, _sup = self._load(0)
+            h, w, c = rgb.shape
+            if expected_hw is not None and (h, w) != (int(expected_hw[0]), int(expected_hw[1])):
+                raise CanonicalStackValidationError(
+                    f"prepared frame shape {(h, w)} != expected {tuple(expected_hw)}"
+                )
+            self.height, self.width, self.channels = int(h), int(w), int(c)
+            self.original_mono = bool(c == 1)
+            self.original_ndim = 2 if self.original_mono else 3
+            self.original_shape = (h, w) if self.original_mono else (h, w, c)
+
+    @classmethod
+    def from_sources(cls, frames, prepared_paths, canvas, patch, crop_plans, *, tracker=None):
+        """Mirror ``build_aligned_cache_from_sources`` without any cache write."""
+        patch_wcs = patch.patch_wcs()
+        ordered = []
+        for f in sorted(frames, key=lambda f: f.frame_id):
+            key = f.frame_id.logical_path
+            plan = crop_plans.get(key)
+            if plan is None:
+                continue
+            prep = prepared_paths.get(key)
+            if prep is None:
+                raise ValueError(f"no prepared RGB for {key}")
+            ordered.append((f, plan, prep))
+
+        def prepare(i):
+            f, plan, prep = ordered[int(i)]
+            cropped = zxe._read_section_chw(prep, plan.source_bounds, tracker=tracker)
+            cropped_wcs = zxe.slice_wcs(f.wcs(), plan.source_bounds)
+            rgb, geom = zxe.reproject_cropped(
+                cropped, cropped_wcs, patch_wcs, patch.patch_shape_hw
+            )
+            return rgb, geom
+
+        return cls(
+            prepare,
+            len(ordered),
+            frame_ids=[f.frame_id.logical_path for f, _p, _q in ordered],
+            expected_hw=patch.patch_shape_hw,
+        )
+
+    def _load(self, i):
+        if self._closed:
+            raise RuntimeError("WindowedCanonicalProvider is closed")
+        i = int(i)
+        if i < 0 or i >= self.n_frames:
+            raise IndexError(f"frame index {i} outside [0, {self.n_frames})")
+        if self._index == i:
+            return self._rgb, self._sup
+        rgb, sup = self._prepare(i)
+        rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
+        sup = np.ascontiguousarray(np.asarray(sup, dtype=bool))
+        if rgb.ndim != 3:
+            raise CanonicalStackValidationError("prepared frame must be (H,W,C)")
+        if sup.shape != rgb.shape[:2]:
+            raise CanonicalStackValidationError("support shape must be (H,W)")
+        # Window of ONE: drop the previous frame before keeping the new one.
+        self._rgb = self._sup = None
+        self._index = i
+        self._rgb, self._sup = rgb, sup
+        self.prepared_count += 1
+        self.bytes_read += int(rgb.nbytes) + int(sup.nbytes)
+        return self._rgb, self._sup
+
+    @property
+    def shape(self):
+        return (self.height, self.width)
+
+    def get_raw_frame(self, i):
+        rgb, sup = self._load(i)
+        return np.array(rgb, copy=True), np.array(sup, copy=True)
+
+    def get_tile(self, i, y0, y1, x0, x1):
+        rgb, sup = self._load(i)
+        if self.original_mono:
+            tile = rgb[y0:y1, x0:x1]
+        else:
+            tile = rgb[y0:y1, x0:x1, :]
+        sup_tile = sup[y0:y1, x0:x1]
+        # EXACT cache-provider semantics: the returned pair is the canonical
+        # preparation of the tile, not the raw slice.
+        batch = prepare_canonical_inputs([tile], [sup_tile])
+        return batch.images[0], batch.valid_mask[0]
+
+    def close(self):
+        self._rgb = self._sup = None
+        self._index = None
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
