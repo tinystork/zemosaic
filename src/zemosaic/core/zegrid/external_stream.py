@@ -53,10 +53,13 @@ from zemosaic.core.canonical_engine import (
 )
 from zemosaic.core.canonical_stacking import (
     CanonicalStackValidationError,
+    _as_host_numpy,
     _astype_float32,
     _axis_sum_f64,
+    _get_xp,
     _kappa_sigma_step,
     _nan_axis_median,
+    _resolve_backend,
     _safe_divide,
     _validate_max_iters,
     _validate_reject_sigma,
@@ -1156,6 +1159,7 @@ def reduce_spooled_tile(
     column_batch: int,
     rejection_sink=None,
     rejection_mask=None,
+    backend: str = "cpu",
 ) -> dict:
     """Reduce ONE spooled tile with exact contiguous row micro-batches.
 
@@ -1189,6 +1193,14 @@ def reduce_spooled_tile(
         raise CanonicalStackValidationError(
             f"winsor_limit_low + winsor_limit_high must be < 1, got {w_low} + {w_high}"
         )
+
+    # A3 — backend-neutral reduction: one shared xp-generic algorithm on NumPy
+    # (CPU, default) or CuPy (GPU, opt-in). ``_resolve_backend`` raises for an
+    # unavailable GPU (never a silent CPU fallback); the rejection step
+    # primitives and the mean/median reductions are bit-exact across backends
+    # (see canonical_stacking), so CPU and GPU produce identical host outputs.
+    backend_token = _resolve_backend(backend)
+    xp = _get_xp(backend_token)
 
     active = np.asarray(p1.weight_active, dtype=bool)
     q = np.asarray(p1.weights, dtype=np.float64)
@@ -1238,33 +1250,46 @@ def reduce_spooled_tile(
             batch_iters = 0
         else:
             batch_iters = 0
+            # xp-generic rejection: the step primitives use the bit-exact
+            # host-side mean/std reductions, so the survivor mask is identical
+            # CPU vs GPU. Upload once, iterate on the device, download once.
+            orig2 = xp.asarray(orig_b)
+            survivor2 = xp.asarray(survivor_b)
+            degenerate_seen = xp.zeros(npos, dtype=bool)
             for _ in range(iters):
-                count = survivor_b.sum(axis=0)
+                count = survivor2.sum(axis=0)
                 if reject_token == "kappa_sigma":
-                    new_b, degenerate = _kappa_sigma_step(
-                        orig_b, survivor_b, count, s_low, s_high, np
+                    new2, degenerate = _kappa_sigma_step(
+                        orig2, survivor2, count, s_low, s_high, xp
                     )
                 else:
-                    new_b, degenerate = _winsorized_sigma_clip_step(
-                        orig_b, survivor_b, count, s_low, s_high,
-                        w_low, w_high, np,
+                    new2, degenerate = _winsorized_sigma_clip_step(
+                        orig2, survivor2, count, s_low, s_high,
+                        w_low, w_high, xp,
                     )
                 batch_iters += 1
-                degenerate_b |= degenerate
-                if np.array_equal(new_b, survivor_b):
-                    survivor_b = new_b
+                degenerate_seen |= degenerate
+                if bool(xp.array_equal(new2, survivor2)):
+                    survivor2 = new2
                     break
-                survivor_b = new_b
+                survivor2 = new2
+            survivor_b = _as_host_numpy(survivor2, xp)
+            degenerate_b = _as_host_numpy(degenerate_seen, xp)
         tile_iters = max(tile_iters, batch_iters)
 
         rejection_b = initial_b & ~survivor_b
         eligible_b = survivor_b & (wmap_b > 0.0) & finite_b
 
         if combine_token == "mean":
-            masked = np.where(eligible_b, orig_b, 0.0)
-            w_contrib = np.where(eligible_b, wmap_b, 0.0)
-            numerator = _axis_sum_f64(masked * w_contrib, np)
-            denominator = _axis_sum_f64(w_contrib, np)
+            images64_xp = xp.asarray(orig_b)
+            wmap_xp = xp.asarray(wmap_b)
+            eligible_xp = xp.asarray(eligible_b)
+            masked = xp.where(eligible_xp, images64_xp, 0.0)
+            w_contrib = xp.where(eligible_xp, wmap_xp, 0.0)
+            # _axis_sum_f64 reduces on the host for the GPU backend (matching
+            # np.sum), so the combined science is bit-identical CPU vs GPU.
+            numerator = _axis_sum_f64(masked * w_contrib, xp)
+            denominator = _axis_sum_f64(w_contrib, xp)
             den_valid = denominator > 0.0
             estimate64 = _safe_divide(numerator, denominator, np)
             science32 = _astype_float32(estimate64, np)
@@ -1273,8 +1298,10 @@ def reduce_spooled_tile(
             science_b = np.where(valid_out, science32, np.nan)
             weight_sum_b = np.where(valid_out, denominator, 0.0)
         else:  # median
-            masked = np.where(eligible_b, orig_b, np.nan)
-            median64 = _nan_axis_median(masked, np)
+            images64_xp = xp.asarray(orig_b)
+            eligible_xp = xp.asarray(eligible_b)
+            masked = xp.where(eligible_xp, images64_xp, xp.nan)
+            median64 = _as_host_numpy(_nan_axis_median(masked, xp), xp)
             science32 = _astype_float32(median64, np)
             count_cells = eligible_b.sum(axis=0).astype(np.float64)
             den_valid = count_cells > 0.0
@@ -1356,15 +1383,10 @@ def run_cell_streaming_external(
         raise CanonicalStackValidationError(
             f"request must be a CanonicalStackRequest, got {type(request).__name__}"
         )
-    backend = request.backend
-    if not isinstance(backend, str):
-        raise CanonicalStackValidationError("backend must be a string")
-    token = backend.strip().lower()
-    if token != "cpu":
-        raise CanonicalStackValidationError(
-            "the external working set is CPU-only in M2; "
-            f"backend {request.backend!r} is refused"
-        )
+    # A3 — the external working set now runs CPU or GPU (opt-in). ``_resolve_backend``
+    # validates the token and raises for an unavailable GPU (never a silent CPU
+    # fallback INSIDE the executor — the ZeGrid orchestrator owns the loud degrade).
+    token = _resolve_backend(request.backend)
     for attr in ("n_frames", "height", "width", "channels", "original_mono"):
         if not hasattr(provider, attr):
             raise CanonicalStackValidationError(f"provider is missing attribute {attr!r}")
@@ -1441,6 +1463,7 @@ def run_cell_streaming_external(
                     column_batch=int(column_batch),
                     rejection_sink=rejection_sink,
                     rejection_mask=rejection_mask,
+                    backend=token,
                 )
             finally:
                 spool.discard_tile(handle)
