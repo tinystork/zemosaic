@@ -989,19 +989,23 @@ def _positions_per_row(interior_width: int, channels: int) -> int:
 def batch_positions_for(
     column_batch: int, interior_width: int, channels: int
 ) -> tuple[int, int]:
-    """Return ``(rows_per_batch, positions)`` for the row-batch policy.
+    """Return ``(rows_per_batch, cols_per_batch)`` for the 2D micro-block policy.
 
-    One interior row is the atomic unit (contiguous slice + slice-addressable
-    sink). ``positions`` is the smallest multiple of that row >= the requested
-    ``column_batch`` when a row is smaller than the request, and at most the
-    request otherwise.
+    A batch is ``rows_per_batch`` interior rows by ``cols_per_batch`` interior
+    columns (``positions = rows * cols * channels``). When ``column_batch``
+    covers at least one full row, whole rows are batched. When it is smaller
+    than one full row, a single row is split into column chunks (blocks narrower
+    than a row), each at least one pixel wide, so the reduction workspace is
+    bounded below one full row.
     """
     c = _require_int(channels, "channels", minimum=1)
     iw = _require_int(interior_width, "interior_width", minimum=1)
     req = _require_int(column_batch, "column_batch", minimum=1)
-    ppr = iw * c
-    rows = max(1, req // ppr)
-    return rows, rows * ppr
+    ppr = iw * c  # positions per full row
+    if req >= ppr:
+        return req // ppr, iw
+    cols = max(1, req // c)  # whole pixels that fit the request
+    return 1, cols
 
 
 def estimate_external_working_set(
@@ -1034,7 +1038,8 @@ def estimate_external_working_set(
     amplification = 1.0  # contiguous row slices: each payload byte read once
 
     max_iw = _max_interior_width(tiles)
-    rows, positions = batch_positions_for(req, max_iw, c)
+    rows, cols = batch_positions_for(req, max_iw, c)
+    positions = rows * cols * c
     reduction_bytes = n * positions * REDUCTION_BYTES_PER_POSITION_FRAME
 
     # Inherent O(tile_area) planes: per-tile outputs + support, plus the
@@ -1060,6 +1065,7 @@ def estimate_external_working_set(
             "reduction_workspace_bytes": int(reduction_bytes),
             "column_batch": int(req),
             "rows_per_batch": int(rows),
+            "cols_per_batch": int(cols),
             "batch_positions": int(positions),
             "positions_per_row": int(_positions_per_row(max_iw, c)),
             "bytes_per_position_frame": int(REDUCTION_BYTES_PER_POSITION_FRAME),
@@ -1122,7 +1128,7 @@ def largest_admissible_column_batch(
 # Exact column-batch reduction
 # ---------------------------------------------------------------------------
 
-def _gather_row_batch(
+def _gather_block(
     images,
     weights,
     n: int,
@@ -1133,19 +1139,29 @@ def _gather_row_batch(
     w_int: int,
     a: int,
     b: int,
+    x0: int,
+    x1: int,
 ):
-    """All-N contiguous row slices for one interior row range (+ raw weights)."""
-    positions = (b - a) * w_int * c
+    """All-N contiguous slices for one interior 2D block (+ raw weights).
+
+    The block spans interior rows ``[a, b)`` and interior columns ``[x0, x1)``
+    (``x0``/``x1`` are relative to the interior left edge ``ix0``). Positions are
+    row-major over ``(row, column, channel)`` within the block — identical to the
+    full-row gather restricted to the column window ``[x0, x1)``, so a 2D tiling
+    is bit-exact with the full-row path.
+    """
+    bw = x1 - x0
+    positions = (b - a) * bw * c
     img = np.empty((n, positions), dtype=np.float32)
     wt = np.empty((n, positions), dtype=np.float64)
     for i in range(n):
         parts = []
         for iy in range(a, b):
-            start = ((iy0 + iy) * tw + ix0) * c
-            parts.append(images[i].reshape(-1)[start:start + w_int * c])
+            start = ((iy0 + iy) * tw + ix0 + x0) * c
+            parts.append(images[i].reshape(-1)[start:start + bw * c])
         img[i] = parts[0] if len(parts) == 1 else np.concatenate(parts)
         w_rows = np.asarray(
-            weights[i][iy0 + a:iy0 + b, ix0:ix0 + w_int], dtype=np.float64
+            weights[i][iy0 + a:iy0 + b, ix0 + x0:ix0 + x1], dtype=np.float64
         )
         wt[i] = np.repeat(w_rows, c, axis=1).reshape(-1)
     return img, wt
@@ -1222,7 +1238,7 @@ def reduce_spooled_tile(
             support_w1 += wi
             support_w2 += wi * wi
 
-    rows_per_batch, _positions = batch_positions_for(
+    rows_per_batch, cols_per_batch = batch_positions_for(
         column_batch, w_int, c
     )
     initial_count = 0
@@ -1233,106 +1249,108 @@ def reduce_spooled_tile(
 
     for a in range(0, h_int, rows_per_batch):
         b = min(h_int, a + rows_per_batch)
-        npos = (b - a) * w_int * c
-        img_b, w_b = _gather_row_batch(
-            images, weights, n, tw, c, iy0, ix0, w_int, a, b
-        )
-        orig_b = img_b.astype(np.float64)
-        finite_b = np.isfinite(img_b)
-        # wmap = q * (valid ? taper : 0), zero outside valid (RAM expression).
-        wmap_b = q[:, None] * w_b
-        wmap_b = np.where(finite_b, wmap_b, 0.0)
-        initial_b = active[:, None] & finite_b
+        for x0 in range(0, w_int, cols_per_batch):
+            x1 = min(w_int, x0 + cols_per_batch)
+            npos = (b - a) * (x1 - x0) * c
+            img_b, w_b = _gather_block(
+                images, weights, n, tw, c, iy0, ix0, w_int, a, b, x0, x1
+            )
+            orig_b = img_b.astype(np.float64)
+            finite_b = np.isfinite(img_b)
+            # wmap = q * (valid ? taper : 0), zero outside valid (RAM expression).
+            wmap_b = q[:, None] * w_b
+            wmap_b = np.where(finite_b, wmap_b, 0.0)
+            initial_b = active[:, None] & finite_b
 
-        survivor_b = initial_b.copy()
-        degenerate_b = np.zeros(npos, dtype=bool)
-        if reject_token == "none":
-            batch_iters = 0
-        else:
-            batch_iters = 0
-            # xp-generic rejection: the step primitives use the bit-exact
-            # host-side mean/std reductions, so the survivor mask is identical
-            # CPU vs GPU. Upload once, iterate on the device, download once.
-            orig2 = xp.asarray(orig_b)
-            survivor2 = xp.asarray(survivor_b)
-            degenerate_seen = xp.zeros(npos, dtype=bool)
-            for _ in range(iters):
-                count = survivor2.sum(axis=0)
-                if reject_token == "kappa_sigma":
-                    new2, degenerate = _kappa_sigma_step(
-                        orig2, survivor2, count, s_low, s_high, xp
-                    )
-                else:
-                    new2, degenerate = _winsorized_sigma_clip_step(
-                        orig2, survivor2, count, s_low, s_high,
-                        w_low, w_high, xp,
-                    )
-                batch_iters += 1
-                degenerate_seen |= degenerate
-                if bool(xp.array_equal(new2, survivor2)):
+            survivor_b = initial_b.copy()
+            degenerate_b = np.zeros(npos, dtype=bool)
+            if reject_token == "none":
+                batch_iters = 0
+            else:
+                batch_iters = 0
+                # xp-generic rejection: the step primitives use the bit-exact
+                # host-side mean/std reductions, so the survivor mask is identical
+                # CPU vs GPU. Upload once, iterate on the device, download once.
+                orig2 = xp.asarray(orig_b)
+                survivor2 = xp.asarray(survivor_b)
+                degenerate_seen = xp.zeros(npos, dtype=bool)
+                for _ in range(iters):
+                    count = survivor2.sum(axis=0)
+                    if reject_token == "kappa_sigma":
+                        new2, degenerate = _kappa_sigma_step(
+                            orig2, survivor2, count, s_low, s_high, xp
+                        )
+                    else:
+                        new2, degenerate = _winsorized_sigma_clip_step(
+                            orig2, survivor2, count, s_low, s_high,
+                            w_low, w_high, xp,
+                        )
+                    batch_iters += 1
+                    degenerate_seen |= degenerate
+                    if bool(xp.array_equal(new2, survivor2)):
+                        survivor2 = new2
+                        break
                     survivor2 = new2
-                    break
-                survivor2 = new2
-            survivor_b = _as_host_numpy(survivor2, xp)
-            degenerate_b = _as_host_numpy(degenerate_seen, xp)
-        tile_iters = max(tile_iters, batch_iters)
+                survivor_b = _as_host_numpy(survivor2, xp)
+                degenerate_b = _as_host_numpy(degenerate_seen, xp)
+            tile_iters = max(tile_iters, batch_iters)
 
-        rejection_b = initial_b & ~survivor_b
-        eligible_b = survivor_b & (wmap_b > 0.0) & finite_b
+            rejection_b = initial_b & ~survivor_b
+            eligible_b = survivor_b & (wmap_b > 0.0) & finite_b
 
-        if combine_token == "mean":
-            images64_xp = xp.asarray(orig_b)
-            wmap_xp = xp.asarray(wmap_b)
-            eligible_xp = xp.asarray(eligible_b)
-            masked = xp.where(eligible_xp, images64_xp, 0.0)
-            w_contrib = xp.where(eligible_xp, wmap_xp, 0.0)
-            # _axis_sum_f64 reduces on the host for the GPU backend (matching
-            # np.sum), so the combined science is bit-identical CPU vs GPU.
-            numerator = _axis_sum_f64(masked * w_contrib, xp)
-            denominator = _axis_sum_f64(w_contrib, xp)
-            den_valid = denominator > 0.0
-            estimate64 = _safe_divide(numerator, denominator, np)
-            science32 = _astype_float32(estimate64, np)
-            final_finite = np.isfinite(estimate64) & np.isfinite(science32)
-            valid_out = den_valid & final_finite
-            science_b = np.where(valid_out, science32, np.nan)
-            weight_sum_b = np.where(valid_out, denominator, 0.0)
-        else:  # median
-            images64_xp = xp.asarray(orig_b)
-            eligible_xp = xp.asarray(eligible_b)
-            masked = xp.where(eligible_xp, images64_xp, xp.nan)
-            median64 = _as_host_numpy(_nan_axis_median(masked, xp), xp)
-            science32 = _astype_float32(median64, np)
-            count_cells = eligible_b.sum(axis=0).astype(np.float64)
-            den_valid = count_cells > 0.0
-            final_finite = np.isfinite(median64) & np.isfinite(science32)
-            valid_out = den_valid & final_finite
-            science_b = np.where(valid_out, science32, np.nan)
-            weight_sum_b = np.where(valid_out, count_cells, 0.0)
+            if combine_token == "mean":
+                images64_xp = xp.asarray(orig_b)
+                wmap_xp = xp.asarray(wmap_b)
+                eligible_xp = xp.asarray(eligible_b)
+                masked = xp.where(eligible_xp, images64_xp, 0.0)
+                w_contrib = xp.where(eligible_xp, wmap_xp, 0.0)
+                # _axis_sum_f64 reduces on the host for the GPU backend (matching
+                # np.sum), so the combined science is bit-identical CPU vs GPU.
+                numerator = _axis_sum_f64(masked * w_contrib, xp)
+                denominator = _axis_sum_f64(w_contrib, xp)
+                den_valid = denominator > 0.0
+                estimate64 = _safe_divide(numerator, denominator, np)
+                science32 = _astype_float32(estimate64, np)
+                final_finite = np.isfinite(estimate64) & np.isfinite(science32)
+                valid_out = den_valid & final_finite
+                science_b = np.where(valid_out, science32, np.nan)
+                weight_sum_b = np.where(valid_out, denominator, 0.0)
+            else:  # median
+                images64_xp = xp.asarray(orig_b)
+                eligible_xp = xp.asarray(eligible_b)
+                masked = xp.where(eligible_xp, images64_xp, xp.nan)
+                median64 = _as_host_numpy(_nan_axis_median(masked, xp), xp)
+                science32 = _astype_float32(median64, np)
+                count_cells = eligible_b.sum(axis=0).astype(np.float64)
+                den_valid = count_cells > 0.0
+                final_finite = np.isfinite(median64) & np.isfinite(science32)
+                valid_out = den_valid & final_finite
+                science_b = np.where(valid_out, science32, np.nan)
+                weight_sum_b = np.where(valid_out, count_cells, 0.0)
 
-        surviving_b = eligible_b.sum(axis=0).astype(np.int64)
-        valid_mask_b = weight_sum_b > 0.0
+            surviving_b = eligible_b.sum(axis=0).astype(np.int64)
+            valid_mask_b = weight_sum_b > 0.0
 
-        # The interior is NOT contiguous in the extended tile's flat order:
-        # write it row by row into the exact interior window.
-        tile_rows = slice(iy0 + a, iy0 + b)
-        tile_cols = slice(ix0, ix0 + w_int)
-        science_t[tile_rows, tile_cols, :] = science_b.reshape(b - a, w_int, c)
-        weight_sum_t[tile_rows, tile_cols, :] = weight_sum_b.reshape(b - a, w_int, c)
-        valid_mask_t[tile_rows, tile_cols, :] = valid_mask_b.reshape(b - a, w_int, c)
-        surviving_t[tile_rows, tile_cols, :] = surviving_b.reshape(b - a, w_int, c)
+            # The interior is NOT contiguous in the extended tile's flat order:
+            # write it into the exact interior window (row range × column range).
+            tile_rows = slice(iy0 + a, iy0 + b)
+            tile_cols = slice(ix0 + x0, ix0 + x1)
+            science_t[tile_rows, tile_cols, :] = science_b.reshape(b - a, x1 - x0, c)
+            weight_sum_t[tile_rows, tile_cols, :] = weight_sum_b.reshape(b - a, x1 - x0, c)
+            valid_mask_t[tile_rows, tile_cols, :] = valid_mask_b.reshape(b - a, x1 - x0, c)
+            surviving_t[tile_rows, tile_cols, :] = surviving_b.reshape(b - a, x1 - x0, c)
 
-        block = rejection_b.reshape(n, b - a, w_int, c)
-        if rejection_sink is not None:
-            rejection_sink[:, tile.y0 + a:tile.y0 + b, tile.x0:tile.x1, :] = block
-        else:
-            rejection_mask[:, tile.y0 + a:tile.y0 + b, tile.x0:tile.x1, :] = block
+            block = rejection_b.reshape(n, b - a, x1 - x0, c)
+            if rejection_sink is not None:
+                rejection_sink[:, tile.y0 + a:tile.y0 + b, tile.x0 + x0:tile.x0 + x1, :] = block
+            else:
+                rejection_mask[:, tile.y0 + a:tile.y0 + b, tile.x0 + x0:tile.x0 + x1, :] = block
 
-        init_sum = initial_b.sum(axis=0)
-        initial_count += int(init_sum.sum())
-        rejected_count += int(rejection_b.sum())
-        low_n_count += int((init_sum < 3).sum())
-        degenerate_count += int(degenerate_b.sum())
+            init_sum = initial_b.sum(axis=0)
+            initial_count += int(init_sum.sum())
+            rejected_count += int(rejection_b.sum())
+            low_n_count += int((init_sum < 3).sum())
+            degenerate_count += int(degenerate_b.sum())
 
     return {
         "science": science_t,
