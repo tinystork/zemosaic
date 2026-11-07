@@ -701,13 +701,16 @@ def test_m5a_scratch_canvas_is_bit_identical(tmp_path):
         )
         assert_same_canvas(scratch, reference)
         assert allocator.bytes_allocated() > 0
-        assert len(list((tmp_path / "scratch").glob("*.bin"))) == 7
+        # A4: all 11 canonical accumulator planes (121 B/px) are now
+        # allocator-backed (num, wsum, science_work, science_out, stack_depth,
+        # owner, support_w1, support_w2, n_eff, valid_fraction, hole_mask).
+        assert len(list((tmp_path / "scratch").glob("*.bin"))) == 11
         assert np.array_equal(
             scratch.science, reference.science, equal_nan=True
         )
     finally:
         removed = allocator.discard()
-        assert removed == 7
+        assert removed == 11
         assert not list((tmp_path / "scratch").glob("*.bin"))
 
 

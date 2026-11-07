@@ -715,22 +715,33 @@ def assemble_canvas_feathered(
                 np.maximum(tgt, np.where(cov, sd, 0), out=tgt)
             complete.append(cid)
 
+    # A4: every canonical accumulator plane (121 B/px) is now backed by the
+    # SAME allocator, so a scratch allocator backs the WHOLE assembly instead of
+    # only the num/wsum accumulators. The numeric path is bit-for-bit the
+    # historical dense one: ``science_work`` is the float64 NaN-seeded division
+    # buffer and ``science`` is its float32 cast, both written IN-PLACE so no
+    # anonymous full-canvas copy is made at the last assembly step.
     valid_out = wsum > 0.0
-    science = np.full((h, w, c), np.nan, dtype=np.float64)
-    np.divide(num, wsum, out=science, where=valid_out)
-    science = science.astype(np.float32)
+    science_work = alloc((h, w, c), np.float64)
+    science_work[...] = np.nan
+    np.divide(num, wsum, out=science_work, where=valid_out)
+    science = alloc((h, w, c), np.float32)
+    science[...] = science_work
 
     # Coverage/diagnostics: a pixel is covered when any channel has weight.
     covered = valid_out.any(axis=-1)
-    hole_mask = ~covered
-    valid_fraction = np.mean(valid_out.astype(np.float32), axis=-1)
+    hole_mask = alloc((h, w), np.bool_)
+    np.logical_not(covered, out=hole_mask)
+    valid_fraction = alloc((h, w), np.float32)
+    valid_fraction[...] = np.mean(valid_out.astype(np.float32), axis=-1)
     # n_eff / support diagnostics: keep the (unblended) max over contributors is
     # NOT available here; report the coverage-derived n_eff proxy = sum of weights
     # per channel is already the estimator weight; use wsum for support_w1 and
-    # owner count for n_eff placeholders that are explicitly documented.
-    support_w1 = wsum[:, :, 0].copy()
-    support_w2 = (wsum[:, :, 0] ** 2).copy()
-    n_eff = owner.astype(np.float64)
+    # owner count for n_eff placeholders that are explicitly documented. Written
+    # in-place into the allocator-backed planes (bit-identical, no anonymous copy).
+    support_w1[...] = wsum[:, :, 0]
+    np.square(wsum[:, :, 0], out=support_w2)
+    n_eff[...] = owner
 
     return zmosaic.AssembledCanvas(
         canvas=canvas,
