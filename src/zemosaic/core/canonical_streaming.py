@@ -1729,6 +1729,47 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
     if xp is not np:
         _release_gpu_workspace(xp, reason="cell_boundary")
 
+    return _finalize_phase2_outputs(
+        p1,
+        science_c=science_c,
+        weight_sum_c=weight_sum_c,
+        valid_mask_c=valid_mask_c,
+        surviving_c=surviving_c,
+        support_w1=support_w1,
+        support_w2=support_w2,
+        iterations_used=iterations_used,
+        initial_count=initial_count,
+        rejected_count=rejected_count,
+        low_n_count=low_n_count,
+        degenerate_count=degenerate_count,
+        rejection_mask_out=rejection_mask_out,
+        prefetch_report=_prefetch_report,
+    )
+
+
+def _finalize_phase2_outputs(
+    p1: _Phase1,
+    *,
+    science_c,
+    weight_sum_c,
+    valid_mask_c,
+    surviving_c,
+    support_w1,
+    support_w2,
+    iterations_used: int,
+    initial_count: int,
+    rejected_count: int,
+    low_n_count: int,
+    degenerate_count: int,
+    rejection_mask_out,
+    prefetch_report,
+):
+    """Restore shapes, compute n_eff and assemble diagnostics (single source).
+
+    Extracted verbatim from :func:`_phase2` so the external column-batched
+    executor produces BYTE-IDENTICAL planes/diagnostics without duplicating
+    science code. No behaviour change for existing callers.
+    """
     # --- restore shapes + n_eff + diagnostics ---
     rejected_fraction = (rejected_count / initial_count) if initial_count > 0 else 0.0
 
@@ -1756,7 +1797,7 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
         "low_n_cell_count": low_n_count,
         "degenerate_cell_count": degenerate_count,
         "rejection_mask": rejection_mask_out,
-        "tile_prefetch": _prefetch_report,
+        "tile_prefetch": prefetch_report,
     }
 
 
@@ -1886,6 +1927,38 @@ def run_canonical_stack_streaming(
         phase_profiler=phase_profiler, tile_prefetch_plan=tile_prefetch_plan,
     )
 
+    return finalize_streaming_result(
+        provider, request, p1,
+        science=science, weight_sum=weight_sum, valid_mask=valid_mask,
+        surviving=surviving, support_w1=support_w1, support_w2=support_w2,
+        n_eff=n_eff, agg=agg, backend_token=token,
+        tile_prefetch_plan=tile_prefetch_plan,
+    )
+
+
+def finalize_streaming_result(
+    provider,
+    request: CanonicalStackRequest,
+    p1: _Phase1,
+    *,
+    science,
+    weight_sum,
+    valid_mask,
+    surviving,
+    support_w1,
+    support_w2,
+    n_eff,
+    agg,
+    backend_token: str,
+    tile_prefetch_plan,
+) -> CanonicalStackResult:
+    """Assemble the canonical result from phase-2 arrays (single source).
+
+    Extracted verbatim from :func:`run_canonical_stack_streaming` so the
+    external (column-batched) executor builds BYTE-IDENTICAL results/provenance
+    without duplicating the post-combine/equalization/provenance logic. No
+    behaviour change for existing callers.
+    """
     # --- post-combine RGB equalization (out-of-place, spatial-only) ---
     equalize_info = None
     if request.equalize_rgb:
@@ -1932,12 +2005,12 @@ def run_canonical_stack_streaming(
         "rejection": {"requested": request.rejection, "effective": _resolve_reject_token(request.rejection)},
         "combine": {"requested": request.combine, "effective": _resolve_method_token(request.combine, _COMBINE_METHODS, "combine")},
         "backend": {
-            "requested": token,
+            "requested": backend_token,
             "normalization": "cpu",
             "weighting": "cpu",
             "support": "cpu",
-            "rejection": token,
-            "combine": token,
+            "rejection": backend_token,
+            "combine": backend_token,
         },
         "reference": {"mode": reference_mode, "index": int(p1.reference_index)},
         "taper": {"kind": taper_kind, "px": float(request.taper_px), "floor": float(request.taper_floor)},
@@ -1948,12 +2021,12 @@ def run_canonical_stack_streaming(
             "weighting": _resolve_method_token(request.weighting, _WEIGHT_METHODS, "weighting"),
             "rejection": _resolve_reject_token(request.rejection),
             "combine": _resolve_method_token(request.combine, _COMBINE_METHODS, "combine"),
-            "backend_requested": token,
+            "backend_requested": backend_token,
             "backend_normalization": "cpu",
             "backend_weighting": "cpu",
             "backend_support": "cpu",
-            "backend_rejection": token,
-            "backend_combine": token,
+            "backend_rejection": backend_token,
+            "backend_combine": backend_token,
             "reference_index": int(p1.reference_index),
             "reference_mode": reference_mode,
             "taper": taper_kind,

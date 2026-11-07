@@ -455,3 +455,21 @@ La mission technique est ACCEPT seulement si :
 ## 13. Prochain pas après validation du plan
 
 Lancer une seule mission d'implémentation bornée à **M0 + M1** : dry-plan joint et ladder CPU sous 32, sans encore câbler le reducer external. Junior vérifie ensuite les faits M33 et la parité scientifique, puis délègue M2. Ne pas confier M0–M5 comme un bloc vague ni lancer un grand run avant la tranche verticale external complète.
+
+## 14. État d'implémentation (mis à jour 2026-11-07)
+
+- **M0 + M1** : acceptés par Junior, commit local `4705f83` sur
+  `feat/zegrid-auto-external-streaming` (basé sur `origin/beta=f8acdbb`).
+  Ladder CPU étendue à 8..128, ladder GPU inchangée (>= 32), dry-plan pur et
+  honnête. Aucun push.
+- **M2** : livré dans le worktree (non commité, pour revue Junior) :
+  `src/zemosaic/core/zegrid/external_stream.py` (spool disque versionné +
+  reducer exact par micro-lots de lignes + pricing géométrique) et
+  `tests/test_zegrid_m2_external_stream.py`. Parité bit-exacte validée sur
+  tuiles 32/24/16/10, lots 8/1024, none/kappa/winsor, mean/median,
+  footprint/none, RGB et mono, NaN/bords/low-N, sink count-only.
+  `canonical_streaming.py` ne reçoit que deux extractions pures
+  (`_finalize_phase2_outputs`, `finalize_streaming_result`) pour éviter toute
+  duplication de science ; comportement inchangé pour tous les appelants.
+- **M3+** : non commencés. Aucun câblage produit automatique, aucun changement
+  de défaut, halo, planchers, GPU ou GUI.
