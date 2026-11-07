@@ -249,3 +249,52 @@ Preuves durables sous `/home/tristan/.openclaw/workspace/.a2a-reports/` :
 
 L'audit est terminé; aucune correction substantielle n'a été lancée dans ce volet de vérification.
 Le prochain lot recommandé est (1), en conservant ce mission_id et la traçabilité des corrections.
+
+## Corrections appliquées — lot 1 (F11–F13) — 2026-11-07
+
+Les trois défauts du lot « contrat de reprise et alertes honnêtes » ont été
+corrigés, vérifiés et committés localement sur `feat/zegrid-adaptive-resources`
+(pas encore poussé au moment de la rédaction) :
+
+### F11 — HIGH — identité working-set de reprise non gelée — CORRIGÉ
+
+- `src/zemosaic/zemosaic_zegrid_mode.py` introduit
+  `_run_scope_bundle(active_bundle, final_bundle)`, remplace le helper local
+  `_current_bundle` par l'accesseur `_gpu_current_bundle`, et route les six
+  références extérieures invalides vers `_run_scope_bundle(_r55_active_bundle, _final)`.
+- Commit : `9fd304b` (Coco), vérifié par Junior.
+- `rg "_current_bundle\("` ne montre plus aucune référence résiduelle ;
+  `git diff --check` vide.
+
+### F12 — MEDIUM — faux AttributeError pinned pool CuPy — CORRIGÉ
+
+- `src/zemosaic/core/zegrid/gpu_memory.py` : l'absence d'un compteur
+  pinned-memory est désormais traitée comme télémétrie absente (`None`), pas
+  comme erreur ; un attribut présent qui lève est reporté honnêtement.
+- Commit : `0cd0080` (Junior).
+
+### F13 — MEDIUM — faux « root delivery failed » sur run_log — CORRIGÉ
+
+- `src/zemosaic/core/zegrid/run_publication.py` : `_products_text` distingue le
+  `run_log` auxiliaire (copie d'archive, log vivant à la racine) d'un échec de
+  livraison d'un rôle racine effectivement attendu.
+- Commit : `0cd0080` (Junior).
+
+### Témoin de reprise ACTIVE mis à jour
+
+- `tests/test_zegrid_active_resume_parity.py::test_fresh_active_tiny_run_freezes_the_admission_from_its_identity`
+  vérifie désormais que le `working_set` gelé reproduit le bloc annoncé par le
+  manifest du run (classe + `tile_size`→`tile_px` + `column_batch`), au lieu d'un
+  littéral `inmem`/`tile_px:0` erroné.
+
+### Validation
+
+- `tests/test_zegrid_active_resume_parity.py tests/test_zegrid_m5_product_e2e.py
+  tests/test_zegrid_r55e11_runtime_vram_adaptation.py tests/test_zegrid_r55c_gpu_readiness.py
+  tests/test_zegrid_publication_execution_m5b.py` → **105 passed**.
+- `tests/test_zegrid_f11_run_scope_bundle.py tests/test_zegrid_alert_integrity_f12_f13.py
+  tests/test_zegrid_m4_external_durability.py tests/test_zegrid_publication_m5b.py`
+  → **79 passed**.
+
+F14 (WARN attendus trop bruyants, LOW) reste à corriger dans un lot ultérieur.
+Les lots F1–F10 restent ouverts.
