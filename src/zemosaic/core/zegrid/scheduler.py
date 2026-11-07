@@ -121,6 +121,7 @@ __all__ = [
     "WORKERS_LADDER",
     "CPU_OS_RESERVE",
     "SHRINK_ORDER",
+    "GROW_ORDER",
     "SHRINK_REASON_CODES",
     "SchedulerError",
     "SchedulerConfigError",
@@ -157,6 +158,10 @@ __all__ = [
     "shrink_sequence",
     "assert_shrink_only",
     "assert_joint_shrink_only",
+    "next_grow",
+    "grow_sequence",
+    "assert_grow_only",
+    "assert_joint_grow_only",
     "assert_same_identity",
 ]
 
@@ -213,6 +218,12 @@ SHRINK_ORDER = (
     "units_in_flight",
     "tile_px",
     "backend",
+)
+GROW_ORDER = (
+    "tile_px",
+    "units_in_flight",
+    "workers_per_unit",
+    "prefetch_units",
 )
 SHRINK_REASON_CODES = {
     "prefetch_units": REASON_SHRINK_PREFETCH,
@@ -4091,6 +4102,165 @@ def assert_joint_shrink_only(previous: Candidate, candidate: Candidate) -> None:
     if int(candidate.disk_bytes) > int(previous.disk_bytes):
         problems.append(
             "disk_bytes increased "
+            f"{previous.disk_bytes} -> {candidate.disk_bytes}"
+        )
+    if problems:
+        raise GrowthRejected("; ".join(problems))
+
+
+def next_grow(
+    candidate: Candidate, context: PlanContext
+) -> tuple[str | None, Candidate | None]:
+    """Return the next legal growth step in the FIXED order, or ``(None, None)``.
+
+    A5: the exact inverse of :func:`next_shrink`. Order (reverse of the shrink
+    order, matching ``GROW_ORDER``): ``tile_px -> units_in_flight ->
+    workers_per_unit -> prefetch_units``. Each call performs at most ONE step, so
+    a fresh re-plan (budget rose) can grow resources prudently, one field at a
+    time, bounded by the SAME enumeration constraints as the planner.
+
+    Growth never crosses a phase boundary (``tile_px`` stays non-``None`` for a
+    streaming candidate, exactly like shrink) and never re-introduces a tile
+    into an in-memory candidate. The BACKEND is deliberately excluded: it is a
+    one-way door (GPU -> CPU only, L2 shrink-only contract), so a grow step never
+    promotes CPU -> GPU; GPU re-qualification is a fresh-plan concern, not a step.
+    """
+    if not isinstance(candidate, Candidate) or not isinstance(context, PlanContext):
+        raise SchedulerConfigError("next_grow requires Candidate + PlanContext")
+
+    # 1. tile_px: larger tile (idx-1 in the DESCENDING ladder).
+    if candidate.tile_px is not None:
+        ladder = [int(t) for t in context.tile_ladder]
+        if candidate.tile_px in ladder:
+            idx = ladder.index(candidate.tile_px)
+            if idx > 0:
+                return "tile_px", _replace_candidate(
+                    candidate, tile_px=ladder[idx - 1]
+                )
+
+    # 2. units_in_flight: +1 up to the enumeration cap k_max.
+    cpu_slots = max(0, int(context.cpu_logical) - CPU_OS_RESERVE)
+    k_max = min(cpu_slots, int(context.units_total))
+    if candidate.units_in_flight < k_max:
+        return "units_in_flight", _replace_candidate(
+            candidate, units_in_flight=candidate.units_in_flight + 1
+        )
+
+    # 3. workers_per_unit: next higher in the ladder, bounded by the per-k cap.
+    workers_values = [int(w) for w in context.workers_ladder]
+    higher = [w for w in workers_values if w > candidate.workers_per_unit]
+    if higher:
+        next_w = min(higher)
+        w_max = max(
+            1, int(context.cpu_logical) // max(1, int(candidate.units_in_flight))
+        )
+        if context.workers_cap is not None:
+            w_max = min(w_max, int(context.workers_cap))
+        if next_w <= w_max:
+            return "workers_per_unit", _replace_candidate(
+                candidate, workers_per_unit=next_w
+            )
+
+    # 4. prefetch_units: +1 up to the ladder max, respecting the slot cap.
+    prefetch_values = [int(p) for p in context.prefetch_ladder]
+    prefetch_max = max(prefetch_values) if prefetch_values else 0
+    if candidate.prefetch_units < prefetch_max:
+        nxt = candidate.prefetch_units + 1
+        if int(candidate.units_in_flight) * (1 + nxt) <= cpu_slots:
+            return "prefetch_units", _replace_candidate(
+                candidate, prefetch_units=nxt
+            )
+    return None, None
+
+
+def grow_sequence(
+    candidate: Candidate, context: PlanContext
+) -> tuple[tuple[str, Candidate], ...]:
+    """Apply the fixed growth order repeatedly until no step remains."""
+    steps: list[tuple[str, Candidate]] = []
+    current = candidate
+    while True:
+        field_name, nxt = next_grow(current, context)
+        if field_name is None or nxt is None:
+            return tuple(steps)
+        assert_grow_only(current, nxt)
+        steps.append((field_name, nxt))
+        current = nxt
+
+
+def assert_grow_only(previous: Candidate, candidate: Candidate) -> None:
+    """Reject ANY shrink or unsupported transition (growth-only contract).
+
+    The exact inverse of :func:`assert_shrink_only`: a growth step may increase
+    resources (larger tile, more concurrency/workers/prefetch) but must never
+    decrease them or cross a phase boundary. The backend must NOT change in a
+    grow step (the L2 shrink-only contract keeps it a one-way door).
+    """
+    if not isinstance(previous, Candidate) or not isinstance(candidate, Candidate):
+        raise SchedulerConfigError("growth comparison requires two Candidates")
+    problems: list[str] = []
+    if previous.backend != candidate.backend:
+        problems.append(
+            f"backend changed {previous.backend!r} -> {candidate.backend!r} "
+            "(a grow step never changes the backend)"
+        )
+    if previous.tile_px is None and candidate.tile_px is not None:
+        problems.append(
+            f"tile introduced None -> {candidate.tile_px} (inmem -> stream crosses a phase)"
+        )
+    elif previous.tile_px is not None and candidate.tile_px is None:
+        problems.append(
+            f"tile removed {previous.tile_px} -> None (stream -> inmem crosses a phase)"
+        )
+    elif (
+        previous.tile_px is not None
+        and candidate.tile_px is not None
+        and int(candidate.tile_px) < int(previous.tile_px)
+    ):
+        problems.append(
+            f"tile decreased {previous.tile_px} -> {candidate.tile_px}"
+        )
+    if int(candidate.units_in_flight) < int(previous.units_in_flight):
+        problems.append(
+            f"units_in_flight decreased {previous.units_in_flight} -> "
+            f"{candidate.units_in_flight}"
+        )
+    if int(candidate.prefetch_units) < int(previous.prefetch_units):
+        problems.append(
+            f"prefetch_units decreased {previous.prefetch_units} -> "
+            f"{candidate.prefetch_units}"
+        )
+    if int(candidate.workers_per_unit) < int(previous.workers_per_unit):
+        problems.append(
+            f"workers_per_unit decreased {previous.workers_per_unit} -> "
+            f"{candidate.workers_per_unit}"
+        )
+    if problems:
+        raise GrowthRejected("; ".join(problems))
+
+
+def assert_joint_grow_only(previous: Candidate, candidate: Candidate) -> None:
+    """Joint growth guard: no backend change and no byte shrink.
+
+    The additive inverse of :func:`assert_joint_shrink_only`: growth may increase
+    host, device and disk bytes but never decrease them. Frozen
+    layout/cells/frames/halo are still protected by :func:`assert_same_identity`.
+    """
+    assert_grow_only(previous, candidate)
+    problems: list[str] = []
+    if int(candidate.host_peak_bytes) < int(previous.host_peak_bytes):
+        problems.append(
+            "host_peak_bytes decreased "
+            f"{previous.host_peak_bytes} -> {candidate.host_peak_bytes}"
+        )
+    if int(candidate.device_peak_bytes) < int(previous.device_peak_bytes):
+        problems.append(
+            "device_peak_bytes decreased "
+            f"{previous.device_peak_bytes} -> {candidate.device_peak_bytes}"
+        )
+    if int(candidate.disk_bytes) < int(previous.disk_bytes):
+        problems.append(
+            "disk_bytes decreased "
             f"{previous.disk_bytes} -> {candidate.disk_bytes}"
         )
     if problems:
