@@ -57,6 +57,7 @@ def _probe(
 ) -> dict:
     return mode._layout_joint_plan_probe(
         canvas_px=int(canvas_px),
+        canvas_hw=(1, int(canvas_px)),
         patch_hw=tuple(int(v) for v in patch_hw),
         n_frames=int(n),
         cell_count=int(cells),
@@ -92,6 +93,11 @@ def test_feasible_layout_is_admitted_with_one_margin():
         raw * (DEFAULT_MARGIN_DEN + DEFAULT_MARGIN_NUM) + DEFAULT_MARGIN_DEN - 1
     ) // DEFAULT_MARGIN_DEN
     assert int(result["peak_bytes"]) == expected
+    # M1: A1 prices the product 16 B/px assembly convention; the real 121 B/px
+    # feathered canvas is explicitly carried as DEFERRED to A4.
+    assert result["assembly_canvas_deferred_to_a4"] is True
+    assert int(result["unpriced_assembly_canvas_bytes"]) > 0
+    assert "deferred to A4" in result["detail"]
 
 
 @pytest.mark.parametrize("gib", (1, 2, 4, 8, 16, 32))

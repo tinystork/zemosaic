@@ -1633,6 +1633,7 @@ def _choose_layout_mode_aware(
             if _worst_patch is not None:
                 _pinned_joint = _layout_joint_plan_probe(
                     canvas_px=int(canvas.width) * int(canvas.height),
+                    canvas_hw=(int(canvas.height), int(canvas.width)),
                     patch_hw=tuple(int(v) for v in _worst_patch["patch_hw"]),
                     n_frames=max(1, int(max_n)),
                     cell_count=int(nx) * int(ny),
@@ -1813,6 +1814,7 @@ def _choose_layout_mode_aware(
         ):
             joint_probe = _layout_joint_plan_probe(
                 canvas_px=int(canvas.width) * int(canvas.height),
+                canvas_hw=(int(canvas.height), int(canvas.width)),
                 patch_hw=tuple(int(v) for v in worst["patch_hw"]),
                 n_frames=max(1, int(worst["n"])),
                 cell_count=int(nx) * int(ny),
@@ -7183,6 +7185,7 @@ class _R55ActiveDecision:
 def _layout_joint_plan_probe(
     *,
     canvas_px: int,
+    canvas_hw: tuple[int, int] | None = None,
     patch_hw: tuple[int, int],
     n_frames: int,
     cell_count: int,
@@ -7208,6 +7211,14 @@ def _layout_joint_plan_probe(
     the bounded window/spool; the host aggregate is the A1 defect. A refusal is
     returned as data (never raised) so the caller can continue scanning finer
     candidates with a truthful reason.
+
+    ASSEMBLY PRICING (M1, rework-1): ``retained_core_bytes`` follows the
+    product convention (16 B/px = science RGB f32 + stack_depth f32). The REAL
+    feathered assembler allocates 121 B/px
+    (``bounded_assembly.canvas_plane_bytes``, A0 poste #4); that full-canvas
+    working set is NOT priced in A1 and is DEFERRED TO A4. The returned
+    ``unpriced_assembly_canvas_bytes`` carries the deferred amount so the
+    manifest/log cannot imply PLAN=ADMIT=RUN on assembly.
     """
     budget = int(budget_bytes)
     if budget <= 0:
@@ -7221,23 +7232,47 @@ def _layout_joint_plan_probe(
             "gauge_workers": None,
             "cache_workers": None,
             "budget_bytes": budget,
+            "unpriced_assembly_canvas_bytes": None,
+            "assembly_canvas_deferred_to_a4": True,
         }
     h, w = int(patch_hw[0]), int(patch_hw[1])
     patch_px = max(1, h * w)
     channels = 3
     canvas = int(canvas_px)
+    # M1: the real feathered assembler is 121 B/px; A1 prices the product
+    # 16 B/px convention and DEFERS this full-canvas term to A4.
+    _asm_hw = (
+        (int(canvas_hw[0]), int(canvas_hw[1]))
+        if canvas_hw is not None
+        else (1, canvas)
+    )
+    unpriced_assembly_canvas_bytes = int(
+        zbas.canvas_plane_bytes(_asm_hw, channels=channels)["total_bytes"]
+    )
     gauge_fp = int(zpar.gauge_footprint_bytes(canvas))
     cache_fp = int(zpar.cache_footprint_bytes(patch_px))
+    # L2: the caller's B_plan is AUTHORITATIVE. Derive the matching raw
+    # observation with integer arithmetic instead of re-deriving the budget
+    # from a rounded ``available_bytes`` (which silently judged another budget).
     raw_available = (
-        int(available_bytes)
-        if available_bytes is not None and int(available_bytes) > 0
-        else (budget * int(rcontract.PLAN_FACTOR_DEN)) // int(rcontract.PLAN_FACTOR_NUM)
-    )
+        int(budget) * int(rcontract.PLAN_FACTOR_DEN)
+        + int(rcontract.PLAN_FACTOR_NUM)
+        - 1
+    ) // int(rcontract.PLAN_FACTOR_NUM)
     budget_ctx = (
         int(rcontract.PLAN_FACTOR_NUM) * raw_available
     ) // int(rcontract.PLAN_FACTOR_DEN)
-    if budget_ctx <= 0:
-        budget_ctx = budget
+    while budget_ctx < int(budget):
+        raw_available += 1
+        budget_ctx = (
+            int(rcontract.PLAN_FACTOR_NUM) * raw_available
+        ) // int(rcontract.PLAN_FACTOR_DEN)
+    if budget_ctx != int(budget):
+        raise zsched.SchedulerConfigError(
+            f"layout probe cannot express budget {budget} under factor "
+            f"{rcontract.PLAN_FACTOR_NUM}/{rcontract.PLAN_FACTOR_DEN} "
+            f"(derived {budget_ctx})"
+        )
     raw_ceiling = (
         budget_ctx
         * int(renv.DEFAULT_MARGIN_DEN)
@@ -7261,7 +7296,12 @@ def _layout_joint_plan_probe(
             "gauge_workers": None,
             "cache_workers": None,
             "budget_bytes": budget_ctx,
+            "unpriced_assembly_canvas_bytes": int(unpriced_assembly_canvas_bytes),
+            "assembly_canvas_deferred_to_a4": True,
         }
+    # L3: the ladders are finite (<= 14 x 14 pairs); each pair enumerates a
+    # bounded candidate set. Measured worst case on the M33 geometry in rework-1
+    # was ~38 ms per probe after imports (no unbounded search, no I/O).
     last = None
     for gauge in _r55_worker_ladder(gauge_start):
         for cache in _r55_worker_ladder(cache_start):
@@ -7294,6 +7334,9 @@ def _layout_joint_plan_probe(
                 cpu_logical=int(os.cpu_count() or 1),
                 units_total=max(1, int(cell_count)),
                 shared_bytes=int(rcontract.PROCESS_BASELINE_BYTES),
+                # L1: inert for streaming candidates — ``per_tile_stack_bytes``
+                # has priority in ``_candidate_stack_bytes``. Kept as a valid
+                # fallback for non-streaming callers only.
                 per_unit_stack_bytes=max(1, max(added_by_tile.values())),
                 per_unit_cache_bytes=per_unit_cache,
                 per_unit_prefetch_bytes=0,
@@ -7353,13 +7396,15 @@ def _layout_joint_plan_probe(
             return {
                 "ok": True,
                 "reason_code": None,
-                "detail": "joint aggregate fits",
+                "detail": "priced phases fit (assembly canvas deferred to A4)",
                 "peak_bytes": int(plan_set.aggregate_host_peak_bytes),
                 "raw_bytes": int(plan_set.aggregate_host_peak_bytes_raw),
                 "tile_px": None if chosen.tile_px is None else int(chosen.tile_px),
                 "gauge_workers": int(gauge),
                 "cache_workers": int(cache),
                 "budget_bytes": int(budget_ctx),
+                "unpriced_assembly_canvas_bytes": int(unpriced_assembly_canvas_bytes),
+                "assembly_canvas_deferred_to_a4": True,
             }
     return {
         "ok": False,
@@ -7371,6 +7416,8 @@ def _layout_joint_plan_probe(
         "gauge_workers": None,
         "cache_workers": None,
         "budget_bytes": int(budget_ctx),
+        "unpriced_assembly_canvas_bytes": int(unpriced_assembly_canvas_bytes),
+        "assembly_canvas_deferred_to_a4": True,
     }
 
 
