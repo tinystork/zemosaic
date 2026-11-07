@@ -299,11 +299,40 @@ def test_column_batch_budget_exact_boundary():
         )
         == ppr
     )
-    # One byte short refuses honestly.
+    # F3: the floor is now ONE PIXEL (``c`` positions), not a full row, so a
+    # sub-row budget admits a sub-line batch instead of refusing.
+    pixel = c
+    assert (
+        xstream.largest_admissible_column_batch(
+            budget_bytes=pixel * per, n_frames=n, interior_width=iw, channels=c
+        )
+        == pixel
+    )
+    # Below ONE pixel it still refuses honestly.
     with pytest.raises(xstream.ExternalBudgetError):
         xstream.largest_admissible_column_batch(
-            budget_bytes=exact - 1, n_frames=n, interior_width=iw, channels=c
+            budget_bytes=pixel * per - 1,
+            n_frames=n, interior_width=iw, channels=c,
         )
+
+
+def test_column_batch_budget_sub_line_pixel_granularity():
+    """F3 audit probe: the product decider may select a sub-line batch."""
+    n, iw, c = 20_000, 32, 3
+    per = n * xstream.REDUCTION_BYTES_PER_POSITION_FRAME
+    budget = 7_440_000
+    ppr = iw * c  # 96 positions: one full row costs 59 520 000 B
+    assert ppr * per > budget
+    batch = xstream.largest_admissible_column_batch(
+        budget_bytes=budget, n_frames=n, interior_width=iw, channels=c
+    )
+    # 7 440 000 // 620 000 == 12 positions == 4 pixels x 3 channels.
+    assert batch == 12
+    assert 0 < batch < ppr
+    assert batch % c == 0
+    assert batch * per <= budget
+    # One pixel (1 860 000 B) ALWAYS fits the probe budget.
+    assert c * per == 1_860_000
 
 
 def test_column_batch_budget_largest_multiple_and_determinism():
@@ -319,6 +348,50 @@ def test_column_batch_budget_largest_multiple_and_determinism():
     )
     assert first == second == ppr * 5
     assert first * per <= budget
+
+
+def test_sub_line_column_batch_is_bit_exact_vs_full_row(tmp_path):
+    """F3: a decider-selected sub-line batch is bit-exact with full rows."""
+    frames, masks = _corpus(n=6, h=60, w=50)
+    req = _request(
+        frames, masks, rejection="winsorized_sigma_clip", combine="median",
+        taper="footprint",
+    )
+    n = len(frames)
+    iw, c = 16, 3  # tile 16 over width 50 -> full interior row width 16
+    per = n * xstream.REDUCTION_BYTES_PER_POSITION_FRAME
+    ppr = iw * c
+    budget = 8 * per  # far below one full row (48 * per)
+    batch = xstream.largest_admissible_column_batch(
+        budget_bytes=budget, n_frames=n, interior_width=iw, channels=c
+    )
+    assert 0 < batch < ppr
+    rows, cols = xstream.batch_positions_for(batch, iw, c)
+    assert rows == 1 and cols < iw  # genuinely narrower than a line
+
+    ref = run_canonical_stack_streaming(
+        InMemoryCanonicalProvider(frames, masks), req, tile_size=16
+    )
+    sub = xstream.run_cell_streaming_external(
+        InMemoryCanonicalProvider(frames, masks),
+        req,
+        tile_size=16,
+        column_batch=batch,
+        spool_root=(lambda d: (d.mkdir(), str(d))[1])(tmp_path / "sub"),
+        cell_id="c",
+        attempt_id="sub",
+    )
+    full = xstream.run_cell_streaming_external(
+        InMemoryCanonicalProvider(frames, masks),
+        req,
+        tile_size=16,
+        column_batch=ppr,
+        spool_root=(lambda d: (d.mkdir(), str(d))[1])(tmp_path / "full"),
+        cell_id="c",
+        attempt_id="full",
+    )
+    _assert_bit_exact(ref, sub)
+    _assert_bit_exact(full, sub)
 
 
 # ---------------------------------------------------------------------------

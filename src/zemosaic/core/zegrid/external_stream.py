@@ -1101,27 +1101,41 @@ def largest_admissible_column_batch(
     channels: int,
     floor_positions: int = COLUMN_BATCH_MIN,
 ) -> int:
-    """Largest multiple of one tile row that fits ``budget_bytes``.
+    """Largest PIXEL-granular batch that fits ``budget_bytes``.
 
-    The unit is one interior row (``interior_width * channels`` positions): a
-    batch is always a contiguous row range, so the reduction reads contiguous
-    slices and the rejection sink receives slice keys. Refuses when even ONE row
-    (or ``floor_positions``, whichever is larger) does not fit.
+    The unit is one pixel (``channels`` positions), NOT one interior row. A
+    batch is therefore any whole number of pixels and may be narrower than a
+    row. :func:`batch_positions_for` already turns such a request into 2D
+    micro-blocks of at least one pixel, and :func:`_gather_block` reduces them
+    bit-exactly with the full-row path (documented 2D tiling), so the product
+    decider may select a sub-line batch instead of refusing outright.
+
+    ``interior_width`` no longer floors the batch: one full row is merely the
+    natural upper shape the caller passes to
+    :func:`estimate_external_working_set`. Above one full row the result stays
+    a whole-row multiple (historical contiguous-slice behavior); below it, it
+    stays a pixel multiple. Refuses when even ONE pixel (or
+    ``floor_positions``, whichever is larger) does not fit.
     """
     budget = _require_int(budget_bytes, "budget_bytes", minimum=1)
     n = _require_int(n_frames, "n_frames", minimum=1)
     iw = _require_int(interior_width, "interior_width", minimum=1)
     c = _require_int(channels, "channels", minimum=1)
     floor = _require_int(floor_positions, "floor_positions", minimum=1)
-    ppr = iw * c
-    unit = max(ppr, floor)
+    unit = max(c, floor)  # one pixel == ``channels`` positions
     per_position = n * REDUCTION_BYTES_PER_POSITION_FRAME
     if budget < unit * per_position:
         raise ExternalBudgetError(
             f"budget {budget} B cannot hold the minimum batch of {unit} "
             f"positions x {n} frames ({unit * per_position} B required)"
         )
-    positions = (budget // per_position // ppr) * ppr
+    positions = (budget // per_position // c) * c
+    ppr = iw * c
+    if positions >= ppr:
+        # Above one full row keep the historical whole-row multiple, so the
+        # reduction still reads contiguous row slices. Only the FLOOR moved
+        # down to one pixel; the above-row granularity is unchanged.
+        positions = (positions // ppr) * ppr
     return int(max(unit, positions))
 
 

@@ -5898,9 +5898,26 @@ def _select_external_fallback(
             "free_bytes": None,
         }
     worst_patch_px = int(worst_patch_hw[0]) * int(worst_patch_hw[1])
-    cache_unit = int(
+    # ZM-ZEGRID-ADAPTIVE-RESOURCES F2: the external bounded path is
+    # SOURCE-BACKED (WindowedCanonicalProvider) and never writes the N x patch
+    # aligned cache. That cache unit is therefore NOT a disk cost of this path
+    # and must never be billed to the disk envelope. The only real staging
+    # transient left is the resident window the provider keeps alive (ONE
+    # prepared RGB f32 plane plus its bool support plane); derive it from the
+    # SAME profile-aware bounded-prefetch credit model used by PLAN/ADMIT
+    # instead of guessing. ``aligned_cache_unit`` is only the dense-profile
+    # input of that helper -- for ``bounded`` it is ignored by design.
+    aligned_cache_unit = int(
         _r55_cache_unit_bytes(
             worst_patch_px, int(max_n_frames), channels=int(channels)
+        )
+    )
+    resident_unit = int(
+        _r55_prefetch_resident_bytes(
+            storage_profile=profile,
+            per_unit_cache_bytes=aligned_cache_unit,
+            worst_patch_px=worst_patch_px,
+            channels=int(channels),
         )
     )
     result_unit = _external_result_unit_bytes(worst_patch_px, channels)
@@ -5959,7 +5976,7 @@ def _select_external_fallback(
         )
         envelope = int(
             pricing["disk"]["spool_peak_bytes_worst_tile"]
-            + cache_unit
+            + resident_unit
             + result_unit
             + pricing["disk"]["cleanup_margin_bytes"]
         )
@@ -5982,7 +5999,9 @@ def _select_external_fallback(
                 "column_batch": int(batch),
                 "spool_root": str(spool_root),
                 "pricing": pricing,
-                "cache_unit_bytes": int(cache_unit),
+                # The aligned cache is not a disk cost here (source-backed);
+                # publish the exact resident staging unit instead.
+                "resident_unit_bytes": int(resident_unit),
                 "result_unit_bytes": int(result_unit),
                 "disk_envelope_bytes": int(envelope),
                 "free_bytes": int(free),
@@ -6040,7 +6059,11 @@ def _working_set_block(
             "cleanup_margin_bytes": int(
                 pricing["disk"]["cleanup_margin_bytes"]
             ),
-            "aligned_cache_unit_bytes": int(external["cache_unit_bytes"]),
+            # The source-backed external path writes NO aligned cache; the
+            # real staging transient is the resident provider window.
+            "resident_staging_unit_bytes": int(
+                external["resident_unit_bytes"]
+            ),
             "durable_result_unit_bytes": int(external["result_unit_bytes"]),
             "disk_envelope_bytes": int(external["disk_envelope_bytes"]),
             "free_bytes_observed": int(external["free_bytes"]),

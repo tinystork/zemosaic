@@ -169,6 +169,71 @@ def test_external_refused_when_disk_envelope_does_not_fit(tmp_path, monkeypatch)
     assert decision["free_bytes"] == 1 * MIB
 
 
+def test_external_admission_does_not_bill_phantom_aligned_cache(
+    tmp_path, monkeypatch
+):
+    """F2 audit probe: N20k patch 256^2, tile 8, halo 8, 1 GiB volume.
+
+    The bounded external path is SOURCE-BACKED and never writes the aligned
+    N x patch cache (~17 GiB here), so that cache must not be billed to the
+    disk envelope. Admission must succeed and the published envelope must be
+    spool + exact resident staging + result + cleanup margin.
+    """
+    monkeypatch.setattr(zz, "_STACK_STORAGE_PROFILE", "bounded")
+    gib = 2 ** 30
+    _free(monkeypatch, gib)
+    n, hw = 20_000, (256, 256)
+    decision = zz._select_external_fallback(
+        permitted_tiles=(8,),
+        worst_patch_hw=hw,
+        max_n_frames=n,
+        channels=3,
+        budget_bytes=1 * gib,
+        halo_px=8,
+        cache_root=str(tmp_path),
+        storage_profile="bounded",
+    )
+    assert decision["refused"] is False, decision
+    assert decision["tile"] == 8
+    aligned_cache = zz._r55_cache_unit_bytes(hw[0] * hw[1], n, channels=3)
+    # The phantom term the old envelope billed really is > 10 GiB.
+    assert aligned_cache > 10 * gib
+    # ... and the admitted envelope is now far below both it and the volume.
+    assert decision["disk_envelope_bytes"] < gib
+    assert decision["disk_envelope_bytes"] < aligned_cache
+    pricing = decision["pricing"]
+    assert decision["resident_unit_bytes"] == zz._r55_prefetch_resident_bytes(
+        storage_profile="bounded",
+        per_unit_cache_bytes=aligned_cache,
+        worst_patch_px=hw[0] * hw[1],
+        channels=3,
+    )
+    assert decision["disk_envelope_bytes"] == (
+        pricing["disk"]["spool_peak_bytes_worst_tile"]
+        + decision["resident_unit_bytes"]
+        + decision["result_unit_bytes"]
+        + pricing["disk"]["cleanup_margin_bytes"]
+    )
+    # A genuine shortfall now refuses for the REAL disk size only.
+    _free(monkeypatch, 100 * MIB)
+    short = zz._select_external_fallback(
+        permitted_tiles=(8,),
+        worst_patch_hw=hw,
+        max_n_frames=n,
+        channels=3,
+        budget_bytes=1 * gib,
+        halo_px=8,
+        cache_root=str(tmp_path),
+        storage_profile="bounded",
+    )
+    assert short["refused"] is True
+    assert short["reason"] == "disk_envelope_unavailable"
+    assert short["best_envelope_bytes"] < aligned_cache
+    assert all(
+        t.get("reason_code") != "aligned_cache" for t in short["trials"]
+    )
+
+
 def test_dense_profile_never_switches_silently(tmp_path):
     decision = zz._select_external_fallback(
         permitted_tiles=zz.CPU_STREAMING_TILE_LADDER,
