@@ -87,6 +87,7 @@ __all__ = [
     "AlignedCacheBuilder",
     "BoundedMemmapCanonicalProvider",
     "MemmapCanonicalProvider",
+    "WindowedCanonicalProvider",
     "build_aligned_cache_from_sources",
     "write_aligned_cache_from_arrays",
     "cache_manifest_path",
@@ -717,7 +718,7 @@ class WindowedCanonicalProvider:
     the exact preparation of :func:`build_aligned_cache_from_sources` (same
     sorted order, same section read / WCS slice / reprojection / support).
 
-    Additive only: nothing activates this class in the product yet (A2b).
+    The bounded product path opens this provider from a serializable source recipe.
     """
 
     storage_domain = "windowed_sources"
@@ -801,6 +802,10 @@ class WindowedCanonicalProvider:
             raise IndexError(f"frame index {i} outside [0, {self.n_frames})")
         if self._index == i:
             return self._rgb, self._sup
+        # Release the previous owned window BEFORE decode/reprojection starts.
+        # If preparation raises, no stale index may resurrect the old frame.
+        self._rgb = self._sup = None
+        self._index = None
         rgb, sup = self._prepare(i)
         rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
         sup = np.ascontiguousarray(np.asarray(sup, dtype=bool))
@@ -808,8 +813,11 @@ class WindowedCanonicalProvider:
             raise CanonicalStackValidationError("prepared frame must be (H,W,C)")
         if sup.shape != rgb.shape[:2]:
             raise CanonicalStackValidationError("support shape must be (H,W)")
-        # Window of ONE: drop the previous frame before keeping the new one.
-        self._rgb = self._sup = None
+        if self.height is not None and self.width is not None:
+            if rgb.shape[:2] != (self.height, self.width):
+                raise CanonicalStackValidationError("prepared frame changed spatial shape")
+        if self.channels is not None and rgb.shape[2] != self.channels:
+            raise CanonicalStackValidationError("prepared frame changed channel count")
         self._index = i
         self._rgb, self._sup = rgb, sup
         self.prepared_count += 1

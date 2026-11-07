@@ -899,6 +899,71 @@ def _decode_frame_hwc(frame_desc, progress_callback):
     return np.ascontiguousarray(arr, dtype=np.float32)
 
 
+def _prepare_cell_source_frame(frame_desc, bounds, patch_wcs_header, patch_hw):
+    """Decode/crop/reproject one source using the historical cache math."""
+    hwc = _decode_frame_hwc(frame_desc, None)
+    crop_hwc = hwc[bounds.y0:bounds.y1, bounds.x0:bounds.x1]
+    crop_chw = np.ascontiguousarray(np.moveaxis(crop_hwc, -1, 0))
+    cropped_wcs = zxe.slice_wcs(frame_desc.wcs(), bounds)
+    rgb, geom = zxe.reproject_cropped(
+        crop_chw, cropped_wcs, WCS(patch_wcs_header), tuple(patch_hw)
+    )
+    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
+    geom = np.ascontiguousarray(np.asarray(geom, dtype=bool))
+    return rgb, geom
+
+
+@dataclass(frozen=True)
+class _CellSourceContext:
+    """Pickle-safe cell input recipe, never image arrays or a live provider.
+
+    Worker init already transports descs/canvas under spawn. The CPU preparation
+    phase freezes the same ROI plans as the cache builder, then sends this recipe
+    to the consumer (including the GPU-owner thread).
+    """
+
+    planned: tuple
+    patch_wcs_header: str
+    patch_hw: tuple
+
+    @property
+    def frame_ids(self):
+        return tuple(f.frame_id.logical_path for f, _bounds in self.planned)
+
+    def open_provider(self):
+        def prepare(index):
+            frame, bounds = self.planned[index]
+            return _prepare_cell_source_frame(
+                frame, bounds, self.patch_wcs_header, self.patch_hw
+            )
+
+        return zfp.WindowedCanonicalProvider(
+            prepare, len(self.planned), frame_ids=self.frame_ids,
+            expected_hw=self.patch_hw,
+        )
+
+
+def _plan_cell_source_frames(descs, canvas, patch, mem):
+    """One source order and one ROI policy shared by both input strategies."""
+    if descs is None or canvas is None:
+        raise RuntimeError("cell source context requires initialized descs/canvas")
+    by_id = {f.frame_id.logical_path: f for f in descs}
+    planned = []
+    for key in mem.patch_ids:  # frozen membership order, same as the cache
+        frame = by_id[key]  # missing source must never silently drop a frame
+        plan = zg.plan_source_roi(frame, canvas, patch)
+        if plan is not None:
+            planned.append((frame, plan))
+    return planned
+
+
+_CELL_INPUT_WINDOWED = "windowed_sources_v1"
+
+
+def _task_uses_windowed_sources(task):
+    return len(task) == 9 and task[8] == _CELL_INPUT_WINDOWED
+
+
 def _cell_cache_frame_worker(task):
     """Module-level (picklable) worker: decode + crop + reproject ONE (frame, cell).
 
@@ -918,15 +983,9 @@ def _cell_cache_frame_worker(task):
         index,
         frame_id,
     ) = task
-    hwc = _decode_frame_hwc(frame_desc, None)
-    crop_hwc = hwc[bounds.y0:bounds.y1, bounds.x0:bounds.x1]
-    crop_chw = np.ascontiguousarray(np.moveaxis(crop_hwc, -1, 0))
-    cropped_wcs = zxe.slice_wcs(frame_desc.wcs(), bounds)
-    rgb, geom = zxe.reproject_cropped(
-        crop_chw, cropped_wcs, WCS(patch_wcs_header), tuple(patch_hw)
+    rgb, geom = _prepare_cell_source_frame(
+        frame_desc, bounds, patch_wcs_header, patch_hw
     )
-    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
-    geom = np.ascontiguousarray(np.asarray(geom, dtype=bool))
     np.save(rgb_path, rgb)
     np.save(sup_path, geom)
     return {
@@ -954,13 +1013,7 @@ def _build_one_cell_cache(
     ``workers`` processes; the written bytes are bit-identical to the serial
     build (verified by hash in the R12 tests).
     """
-    by_id = {f.frame_id.logical_path: f for f in descs}
-    patch_frames = [by_id[k] for k in mem.patch_ids]  # mem.patch_ids is sorted
-    planned = []
-    for f in patch_frames:
-        plan = zg.plan_source_roi(f, canvas, patch)
-        if plan is not None:
-            planned.append((f, plan))
+    planned = _plan_cell_source_frames(descs, canvas, patch, mem)
     frame_ids = [f.frame_id.logical_path for f, _p in planned]
 
     cache_dir = Path(cache_dir)
@@ -2348,14 +2401,20 @@ def _build_cell_sres(result, frame_ids):
     )
 
 
-def _make_cell_provider(cache_dir, storage_profile):
+def _make_cell_provider(cache_dir, storage_profile, *, source_context=None):
     """Select the Cell provider for the admitted storage profile.
 
-    Dense returns the historical ``MemmapCanonicalProvider`` BY IDENTITY;
-    bounded returns the Lot A ``BoundedMemmapCanonicalProvider``. This is the
-    single seam Gate E instruments.
+    New bounded product tasks pass a frozen source recipe and never create an
+    aligned cache. Cache-only callers/old task tuples retain their historical
+    providers; dense always uses the cache. No implicit source/cache fallback.
     """
     profile = zsp.normalize_storage_profile(storage_profile)
+    if source_context is not None:
+        if not zsp.is_bounded(profile):
+            raise RuntimeError("source-backed cell input requires bounded storage")
+        if not isinstance(source_context, _CellSourceContext):
+            raise TypeError("invalid cell source context")
+        return source_context.open_provider()
     if zsp.is_bounded(profile):
         return zfp.BoundedMemmapCanonicalProvider(cache_dir)
     return zfp.MemmapCanonicalProvider(cache_dir)
@@ -2415,12 +2474,17 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
                      tile_prefetch_available_bytes=None,
                      tile_prefetch_budget_bytes=None,
                      tile_prefetch_base_aggregate_bytes=None,
-                     tile_prefetch_host_budget_bytes=None):
+                     tile_prefetch_host_budget_bytes=None, source_context=None):
     _profile = zsp.normalize_storage_profile(
         storage_profile if storage_profile is not None else _STACK_STORAGE_PROFILE
     )
-    provider = _make_cell_provider(cache_dir, _profile)
+    provider = (
+        _make_cell_provider(cache_dir, _profile, source_context=source_context)
+        if source_context is not None
+        else _make_cell_provider(cache_dir, _profile)
+    )
     sink = None
+    _deferred = False
     try:
         request = zstream.build_streaming_request(config, provider.n_frames)
         if zsp.is_bounded(_profile):
@@ -2460,6 +2524,10 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
                 "provider": type(provider).__name__,
                 "storage_domain": getattr(provider, "storage_domain", None),
                 "bytes_read": getattr(provider, "bytes_read", None),
+                **({
+                    "prepared_count": provider.prepared_count,
+                    "bytes_read_semantics": "prepared_aligned_bytes_not_source_io",
+                } if isinstance(provider, zfp.WindowedCanonicalProvider) else {}),
                 "open_count": getattr(provider, "open_count", None),
                 "open_failures": getattr(provider, "open_failures", None),
                 "sink": None if sink is None else {
@@ -2506,13 +2574,10 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
                 exc.tile_prefetch_deferred_cleanup = True
             except Exception:
                 pass
-        else:
-            provider.close()
         raise
-    else:
-        # R15: release the memmap handles before the caller deletes the cache
-        # (Windows: an open .npy cannot be deleted -> WinError 32).
-        provider.close()
+    finally:
+        if not _deferred:
+            provider.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2524,7 +2589,7 @@ def _run_cell_external(
     spool_root, fixed=None, storage_profile=None, storage_info=None,
     cell_id="cell", attempt_id=None, required_free_bytes=None,
     owner_token=None, owner_record=None, owner_liveness=None,
-    retain_for_commit=False,
+    retain_for_commit=False, source_context=None,
 ):
     """Run ONE cell through the exact external working set (M2 primitive).
 
@@ -2549,7 +2614,11 @@ def _run_cell_external(
                 f"{_free} B < admitted envelope {int(required_free_bytes)} B "
                 f"on {spool_root}; already-committed cells are intact"
             )
-    provider = _make_cell_provider(cache_dir, _profile)
+    provider = (
+        _make_cell_provider(cache_dir, _profile, source_context=source_context)
+        if source_context is not None
+        else _make_cell_provider(cache_dir, _profile)
+    )
     sink = None
     try:
         request = zstream.build_streaming_request(config, provider.n_frames)
@@ -2587,6 +2656,10 @@ def _run_cell_external(
                     provider, "storage_domain", None
                 ),
                 "bytes_read": getattr(provider, "bytes_read", None),
+                **({
+                    "prepared_count": provider.prepared_count,
+                    "bytes_read_semantics": "prepared_aligned_bytes_not_source_io",
+                } if isinstance(provider, zfp.WindowedCanonicalProvider) else {}),
                 "open_count": getattr(provider, "open_count", None),
                 "open_failures": getattr(provider, "open_failures", None),
                 "working_set": WORKING_SET_EXTERNAL,
@@ -4300,6 +4373,11 @@ def _prepare_stack_cell(task):
     returns either a prepared payload for :func:`_consume_stack_cell` or an
     already-final ``{"empty_result": ...}`` for an empty/zero-support cell.
     """
+    source_requested = _task_uses_windowed_sources(task)
+    if len(task) == 9:
+        if not source_requested:
+            raise ValueError("unknown cell input strategy")
+        task = task[:8]
     if len(task) == 8:
         (
             cell, patch, mem, cache_dir, mode, bound, storage_profile,
@@ -4313,6 +4391,8 @@ def _prepare_stack_cell(task):
         storage_profile = _STACK_STORAGE_PROFILE
         external_info = None
     storage_profile = zsp.normalize_storage_profile(storage_profile)
+    if source_requested and not zsp.is_bounded(storage_profile):
+        raise RuntimeError("source-backed cell task requires bounded storage")
     cid = cell.cell_id
     _patch_bounds = [int(patch.patch.x0), int(patch.patch.y0),
                      int(patch.patch.x1), int(patch.patch.y1)]
@@ -4336,10 +4416,26 @@ def _prepare_stack_cell(task):
     # concurrent cells, so the total never explodes to K x cache_build_workers).
     zxe.reset_reproject_path_stats()
     t0 = time.perf_counter()
-    manifest = _build_one_cell_cache(
-        _STACK_DESCS, _STACK_CANVAS, cell, patch, mem, cache_dir,
-        workers=int(_STACK_CACHE_WORKERS),
-    )
+    source_context = None
+    if source_requested:
+        planned = _plan_cell_source_frames(_STACK_DESCS, _STACK_CANVAS, patch, mem)
+        if not planned:
+            raise RuntimeError(f"cell {cid}: no source ROI for populated membership")
+        source_context = _CellSourceContext(
+            planned=tuple((f, plan.source_bounds) for f, plan in planned),
+            patch_wcs_header=patch.patch_wcs_header,
+            patch_hw=tuple(patch.patch_shape_hw),
+        )
+        # In-memory accounting only: never write a fake aligned-cache manifest.
+        manifest = {
+            "n_frames": len(planned), "total_bytes": 0,
+            "input_strategy": _CELL_INPUT_WINDOWED,
+        }
+    else:
+        manifest = _build_one_cell_cache(
+            _STACK_DESCS, _STACK_CANVAS, cell, patch, mem, cache_dir,
+            workers=int(_STACK_CACHE_WORKERS),
+        )
     cache_build_s = time.perf_counter() - t0
     reproject = zxe.get_reproject_path_stats().to_dict()
 
@@ -4353,7 +4449,11 @@ def _prepare_stack_cell(task):
     cell_gauge_mode = zphot.resolve_cell_gauge_mode(
         getattr(_STACK_CONFIG, "cell_gauge_mode", None)
     )
-    cell_provider = _make_cell_provider(cache_dir, storage_profile)
+    cell_provider = (
+        _make_cell_provider(cache_dir, storage_profile, source_context=source_context)
+        if source_context is not None
+        else _make_cell_provider(cache_dir, storage_profile)
+    )
     _gauge_storage = None
     try:
         cell_frame_ids = list(cell_provider.frame_ids)
@@ -4378,7 +4478,8 @@ def _prepare_stack_cell(task):
         # Explicit, DETERMINISTIC zero-support Cell: no gauge, no fabricated data.
         # (Distinct from a geometrically-empty Cell — this one HAS contributors but
         # none carry finite support.)
-        _safe_rmtree(cache_dir, None)
+        if source_context is None:
+            _safe_rmtree(cache_dir, None)
         return {"empty_result": {
             "cell_id": cid, "status": "empty", "reproject": None,
             "gauge_status": gauge_status, "gauge_detail": gauge_detail,
@@ -4415,6 +4516,7 @@ def _prepare_stack_cell(task):
         "gauge_status": gauge_status,
         "gauge_detail": gauge_detail,
         "gauge_storage": _gauge_storage,
+        **({"source_context": source_context} if source_context is not None else {}),
         **(
             {"storage_profile": storage_profile}
             if zsp.is_bounded(storage_profile) else {}
@@ -4458,6 +4560,8 @@ def _release_unit_cache(payload):
             payload.get("cache_dir"),
         )
         return False
+    if payload.get("source_context") is not None:
+        return False  # no aligned cache owned by this source-backed unit
     cache_dir = payload.get("cache_dir")
     if cache_dir is None:
         return False
@@ -4511,6 +4615,10 @@ def _consume_stack_cell(prepared, *, tile_size=None):
     )
     storage_info = {}
     external_info = prepared.get("external_info")
+    source_context = prepared.get("source_context")
+    source_kwargs = (
+        {"source_context": source_context} if source_context is not None else {}
+    )
     # F2: RUN-boundary prefetch admission facts (None on paths without them).
     _pf_available = None
     _pf_budget = None
@@ -4541,6 +4649,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             owner_token=_ext.get("owner_token"),
             owner_record=_ext.get("owner_record"),
             retain_for_commit=bool(_EXTERNAL_RETAIN_FOR_COMMIT),
+            **source_kwargs,
         )
     elif mode == "inmem":
         # ZM-ZEGRID-R22: when the cell runs on the GPU, use the VRAM-bounded tile
@@ -4567,7 +4676,8 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         # to the historical path (never a silent bypass of the budget).
         _gpu_prefetch = (
             _gpu_tile_prefetch_request()
-            if str(getattr(_STACK_CONFIG, "backend", "cpu")).strip().lower() == "gpu"
+            if source_context is None
+            and str(getattr(_STACK_CONFIG, "backend", "cpu")).strip().lower() == "gpu"
             else None
         )
         _pf_available = (
@@ -4599,6 +4709,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
                 tile_prefetch_budget_bytes=_pf_budget,
                 tile_prefetch_base_aggregate_bytes=_pf_base,
                 tile_prefetch_host_budget_bytes=_pf_host,
+                **source_kwargs,
             )
         except BaseException:
             # F4 (rework R2): a live producer owns the provider AND the cache.
@@ -4612,6 +4723,16 @@ def _consume_stack_cell(prepared, *, tile_size=None):
                 prepared["_tile_prefetch_producer_alive_after_join"] = True
             raise
     stack_s = time.perf_counter() - t0
+    if source_context is not None:
+        storage_info.update({
+            "input_strategy": _CELL_INPUT_WINDOWED,
+            "aligned_cache_bytes_written": 0,
+            "source_frames": len(source_context.planned),
+            "tile_prefetch_policy": "off_until_source_workspace_qualified",
+        })
+        # Source preparation happens lazily during gauge AND stack, not just
+        # before the gauge as with the historical cache.
+        reproject = zxe.get_reproject_path_stats().to_dict()
 
     core = za.crop_all_planes_to_core(mt)
     peak_rss = zsw.peak_rss_kib()
@@ -4671,7 +4792,9 @@ def _consume_stack_cell(prepared, *, tile_size=None):
 
     # Per-cell temp reuse: delete the cache after stacking (bounded disk). R15
     # best-effort; a failure is reported so the parent can WARN + record.
-    cleanup_failed = not _safe_rmtree(cache_dir, None)
+    cleanup_failed = (
+        False if source_context is not None else not _safe_rmtree(cache_dir, None)
+    )
 
     result = {
         "cell_id": cid, "status": "complete", "core": core, "record": record,
@@ -5940,21 +6063,25 @@ def _working_set_block(
 
 
 def _cell_task(cell, patch, mem, cache_dir, mode, bound, storage_profile, external_info=None):
-    """Build ONE cell task; dense stays the historical 6-tuple EXACTLY.
+    """Build a spawn-safe task: dense 6-tuple, bounded source-backed 9-tuple.
 
-    The bounded profile appends a 7th element so the worker knows which provider
-    and sink to use without a second scheduler or a mutable global in the child.
+    Slot 7 retains external working-set info (None for RAM streaming); slot 8
+    selects the source strategy. Descs/canvas already travel in worker initargs.
+    Old 6/7/8-tuples remain cache-backed for existing low-level cache consumers.
+    No arrays, local functions or live file handles cross the process boundary.
     """
     profile = zsp.normalize_storage_profile(storage_profile)
     task = (cell, patch, mem, cache_dir, mode, bound)
     if zsp.is_bounded(profile):
-        task = task + (profile,)
-    elif external_info is not None:
+        return task + (
+            profile,
+            None if external_info is None else dict(external_info),
+            _CELL_INPUT_WINDOWED,
+        )
+    if external_info is not None:
         raise RuntimeError(
             "external working-set tasks require the bounded storage profile"
         )
-    if external_info is not None:
-        task = task + (dict(external_info),)
     return task
 
 
@@ -6518,7 +6645,9 @@ def _build_execution_bundle(
             plan["storage"] = {
                 "profile": _profile,
                 "model": zsp.storage_model_id(_profile),
-                "provider": "BoundedMemmapCanonicalProvider",
+                "provider": "WindowedCanonicalProvider",
+                "input_strategy": _CELL_INPUT_WINDOWED,
+                "resource_bounds": "conservative_cache_model_pending_A2c",
                 "rejection": "BoundedCountingRejectionSink",
                 "fresh_sink_per_cell": True,
                 # L-1: honest real in-memory bound. The 1<<62 planner sentinel is
@@ -14070,7 +14199,7 @@ def _run_single(
                 exc.record["fallback_exhausted"] = True
             cleanup = []
             for task in all_tasks[:offset]:
-                if task[4] is None:
+                if task[4] is None or _task_uses_windowed_sources(task):
                     continue
                 cache_dir = Path(task[3])
                 existed = bool(cache_dir.exists())
@@ -14887,7 +15016,7 @@ def _run_single(
         except zrt.RuntimeControlError as exc:
             cleanup = []
             for task in all_tasks:
-                if task[4] is None:
+                if task[4] is None or _task_uses_windowed_sources(task):
                     continue
                 cache_dir = Path(task[3])
                 existed = bool(cache_dir.exists())
@@ -15960,6 +16089,8 @@ def _run_single(
                 task = item[1]
             else:
                 task = item
+            if isinstance(task, (tuple, list)) and _task_uses_windowed_sources(task):
+                return  # this unit did not create an aligned cache
             cache_dir = None
             if isinstance(task, (tuple, list)) and len(task) >= 4:
                 cache_dir = task[3]
