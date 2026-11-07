@@ -1430,6 +1430,7 @@ def _choose_layout_mode_aware(
     min_refinement_rank=None,
     max_refinement_rank=None,
     allow_external=False,
+    enforce_joint=True,
 ):
     """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
 
@@ -1621,7 +1622,8 @@ def _choose_layout_mode_aware(
         # escape hatch; RAM modes do not.
         _pinned_joint = None
         if (
-            ram_budget is not None
+            enforce_joint
+            and ram_budget is not None
             and not allow_external
             and (zsp.is_bounded(_STACK_STORAGE_PROFILE) or not inmem_ok)
         ):
@@ -1808,7 +1810,8 @@ def _choose_layout_mode_aware(
         joint_probe = None
         admissible = bool(memory_ok)
         if (
-            memory_ok
+            enforce_joint
+            and memory_ok
             and ram_budget is not None
             and (zsp.is_bounded(_STACK_STORAGE_PROFILE) or not inmem_ok)
         ):
@@ -6074,6 +6077,12 @@ def _build_execution_bundle(
                     allow_external=(
                         zsp.is_bounded(_STACK_STORAGE_PROFILE)
                         and not bool(gpu_used)
+                    ),
+                    # A1b guard: a FROZEN admission restored from a resume is
+                    # authoritative; never re-refuse an already-admitted
+                    # geometry whose cells are committed.
+                    enforce_joint=(
+                        restored_geometry is None and frozen_admission is None
                     ),
                 )
             except zal.LayoutInfeasible as _layout_exc:

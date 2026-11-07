@@ -42,6 +42,7 @@ from zemosaic.core.zegrid import geometry as zg  # noqa: E402
 from zemosaic.core.zegrid import parallel as zpar  # noqa: E402
 from zemosaic.core.zegrid import run_resume as zres  # noqa: E402
 from zemosaic.core.zegrid import run_store as zrs  # noqa: E402
+from zemosaic.core.zegrid import ram_contract as rcontract  # noqa: E402
 from zemosaic.core.zegrid import observability as zobs  # noqa: E402
 from zemosaic.core.zegrid import run_publication as zpub  # noqa: E402
 from zemosaic.core.zegrid import run_registry as zrr  # noqa: E402
@@ -398,6 +399,7 @@ def bundle_env(tmp_path, monkeypatch):
         lambda n, hw, tile=zz.STREAM_TILE_SIZE, channels=3: int(tile) * 1_000_000,
     )
     monkeypatch.setattr(zpar, "_PER_WORKER_BASELINE_BYTES", 0)
+    monkeypatch.setattr(rcontract, "PROCESS_BASELINE_BYTES", 0)
     monkeypatch.setattr(zpar, "_CACHE_PER_WORKER_FOOTPRINT_BYTES", 0)
     monkeypatch.setattr(zpar, "cache_footprint_bytes", lambda px: 0)
     monkeypatch.setattr(zpar, "gauge_footprint_bytes", lambda px: 0)
@@ -414,8 +416,11 @@ def bundle_env(tmp_path, monkeypatch):
 
 
 #: raw observation whose 4/5 PLAN budget is the value the tests reason about.
-RAW_HIGH = 375_000_000  # -> plan budget 300 MB (tile 128 fits)
-RAW_LOW = 87_500_000    # -> plan budget 70 MB (only tile <= 64 fits)
+# Rework-3: budgets MUST exceed the 340 MiB process baseline (356_515_840 B),
+# otherwise the A1b joint probe legitimately refuses a fresh pinned layout.
+# plan = floor(4/5 * raw): ~2.0 GiB vs ~1.0 GiB, two distinct tiles (128/64).
+RAW_HIGH = 375_000_000  # raw -> plan budget 300 MB (tile 128 aggregate 147.2 MB fits)
+RAW_LOW = 93_750_000    # raw -> plan budget 75 MB (tile 64 aggregate 73.6 MB fits; 80/128 refused)
 
 
 def _bundle(env, *, raw, frozen=None, gpu_used=False, vram=None):
@@ -470,8 +475,8 @@ def test_unhonourable_frozen_tile_fails_closed_with_the_deficit(bundle_env):
     assert exc.frozen_tile_px == 128
     assert exc.frozen_backend == "cpu"
     assert exc.required_bytes == 128_000_000
-    assert exc.available_bytes == 70_000_000
-    assert exc.deficit_bytes == 58_000_000
+    assert exc.available_bytes == 75_000_000
+    assert exc.deficit_bytes == 53_000_000
     message = str(exc)
     assert "frozen tile_px=128" in message
     assert "backend=cpu" in message
