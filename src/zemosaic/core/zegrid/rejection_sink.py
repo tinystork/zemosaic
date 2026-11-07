@@ -205,3 +205,32 @@ class BoundedCountingRejectionSink:
 
     def flush(self) -> None:
         self.flush_batch()
+
+    # -- transactional fallback (A3) ----------------------------------------
+    def checkpoint(self) -> dict:
+        """Snapshot the mutable counters (for a transactional tile fallback).
+
+        A failed GPU tile may have written a few interior blocks before raising
+        (OOM / CUDA error). The caller snapshots the counters BEFORE the tile,
+        then restores them if the tile is re-reduced on CPU, so a replayed tile
+        is counted exactly once (no double-counting, no loss).
+        """
+        self._check_open()
+        return {
+            "true_count": int(self.true_count),
+            "written_cells": int(self.written_cells),
+            "writes": int(self.writes),
+            "blocks": int(self.blocks),
+            "max_write_bytes": int(self.max_write_bytes),
+            "max_block_bytes": int(self.max_block_bytes),
+        }
+
+    def rollback(self, snapshot: dict) -> None:
+        """Restore the counters from :meth:`checkpoint` (undo a failed tile)."""
+        self._check_open()
+        self.true_count = int(snapshot["true_count"])
+        self.written_cells = int(snapshot["written_cells"])
+        self.writes = int(snapshot["writes"])
+        self.blocks = int(snapshot["blocks"])
+        self.max_write_bytes = int(snapshot["max_write_bytes"])
+        self.max_block_bytes = int(snapshot["max_block_bytes"])

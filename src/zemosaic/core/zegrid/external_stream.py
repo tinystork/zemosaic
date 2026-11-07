@@ -80,6 +80,7 @@ from zemosaic.core.canonical_streaming import (
     _validate_rejection_sink,
     finalize_streaming_result,
 )
+from zemosaic.core.zegrid.gpu import is_gpu_runtime_error
 
 __all__ = [
     "SPOOL_SCHEMA",
@@ -1390,6 +1391,7 @@ def run_cell_streaming_external(
     owner_liveness=None,
     stale_policy: str = "discard",
     retain_on_failure: bool = False,
+    gpu_fallback_out: dict | None = None,
 ) -> CanonicalStackResult:
     """External-working-set execution of ONE canonical request.
 
@@ -1466,6 +1468,7 @@ def run_cell_streaming_external(
         retain_on_failure=retain_on_failure,
     )
     spool = ExternalSpool(spec)
+    gpu_fallback_tiles = []
     try:
         for (y0, y1, x0, x1) in _iter_tiles(h, w, tile_size):
             handle = spool.write_tile(
@@ -1475,14 +1478,46 @@ def run_cell_streaming_external(
                 taper_floor=taper_floor,
                 halo_px=halo,
             )
+            sink_cp = (
+                rejection_sink.checkpoint() if rejection_sink is not None else None
+            )
             try:
-                tile = reduce_spooled_tile(
-                    handle, p1, request,
-                    column_batch=int(column_batch),
-                    rejection_sink=rejection_sink,
-                    rejection_mask=rejection_mask,
-                    backend=token,
-                )
+                if token == "gpu":
+                    try:
+                        tile = reduce_spooled_tile(
+                            handle, p1, request,
+                            column_batch=int(column_batch),
+                            rejection_sink=rejection_sink,
+                            rejection_mask=rejection_mask,
+                            backend="gpu",
+                        )
+                    except Exception as exc:
+                        # A3 — transactional fallback: a classified GPU runtime
+                        # failure (OOM / CUDA error) re-reduces the SAME spooled
+                        # tile on CPU (bit-exact across backends). The counting
+                        # sink is rolled back to its pre-tile checkpoint so the
+                        # replayed tile is counted exactly once. A science or
+                        # programming error is NEVER reclassified: it propagates.
+                        if not is_gpu_runtime_error(exc):
+                            raise
+                        if rejection_sink is not None:
+                            rejection_sink.rollback(sink_cp)
+                        tile = reduce_spooled_tile(
+                            handle, p1, request,
+                            column_batch=int(column_batch),
+                            rejection_sink=rejection_sink,
+                            rejection_mask=rejection_mask,
+                            backend="cpu",
+                        )
+                        gpu_fallback_tiles.append((int(y0), int(x0)))
+                else:
+                    tile = reduce_spooled_tile(
+                        handle, p1, request,
+                        column_batch=int(column_batch),
+                        rejection_sink=rejection_sink,
+                        rejection_mask=rejection_mask,
+                        backend="cpu",
+                    )
             finally:
                 spool.discard_tile(handle)
             if rejection_sink is not None:
@@ -1516,6 +1551,12 @@ def run_cell_streaming_external(
         spool.finalize_manifest(
             taper_kind=taper_kind, taper_px=taper_px, taper_floor=taper_floor
         )
+        if gpu_fallback_out is not None:
+            gpu_fallback_out.update({
+                "fallback_count": len(gpu_fallback_tiles),
+                "fallback_tiles": list(gpu_fallback_tiles),
+                "requested_backend": str(token),
+            })
         # M4: the attempt is READY (result computed) but NOT committed. The
         # caller commits the Cell durably first, then cleans it.
         spool.mark_ready()
