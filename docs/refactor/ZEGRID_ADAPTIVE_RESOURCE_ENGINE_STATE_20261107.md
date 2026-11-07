@@ -44,10 +44,10 @@ Les champs non créés sont intentionnels avant lancement, pas des preuves manqu
 | A2 | ACCEPTED | A2-T01 | A2a provider + A2b câblage source (8e56013+83f2dde) + A2c/A2d Q20/Q21 (89e1391) ; 304+ tests verts |
 | A3 | ACCEPTED (Q30+Q31) ; Q32 BLOCKED (Windows) | A3-T01 | 2D micro-blocs (b61f9fe) + GPU externe (2ce487c) + fallback transactionnel (2d065ff) + témoins Q30 (bab2b0b) et Q31 (0c2af51+1014e30) ; Q32 (cellule M33) → A6/Windows |
 | A4 | ACCEPTED (Q40+Q41) | A4-T01 | 8 commits : allocateur 11 plans (c07270f), banded_fits (9548f19), canvas_backing (476465f), câblage banded (04351a6), guarded scratch (bdbdc06), fallback production + discard (f097144), Q40 (380dcd2), Q41 (15d999e) |
-| A5 | NOT_STARTED | aucune | aucune |
+| A5 | ACCEPTED (Q50+Q51) | A5-T01 | croissance bornée inverse du shrink (39e350c) + Q50 (5 tests) ; Q51 couvert par resume_m4/p0_resume_integrity/m3_recovery (79 tests verts) |
 | A6 | NOT_STARTED | aucune | aucune |
 
-**Dernier gate accepté : A4_ACCEPTED (Q40+Q41).** A5 reste NOT_STARTED.
+**Dernier gate accepté : A5_ACCEPTED (Q50+Q51).** A6 reste NOT_STARTED.
 
 ## Suivi worker à renseigner seulement au dispatch réel
 
@@ -95,6 +95,16 @@ puis déléguer la première tâche A0 bornée selon AGENTS.md. Aucun travail A1
 avant A0_ACCEPTED. Si Tristan lance seulement A0, ne pas extrapoler à A6.
 
 ## Journal documentaire
+
+- 2026-11-07 : A5 ACCEPTED (Q50+Q51) — croissance bornée `next_grow`/`grow_sequence`/
+  `assert_grow_only`/`assert_joint_grow_only` + `GROW_ORDER` (inverse exact du
+  shrink : tile_px -> units_in_flight -> workers_per_unit -> prefetch_units,
+  borné par les mêmes contraintes d'énumération, sans promotion CPU->GPU — le
+  backend reste une porte à sens unique L2). Commit 39e350c. Q50 : 5 tests verts
+  (inverse exact depuis le maximum du treillis, gardes refusent tout shrink,
+  budget bas n'achète jamais plus). Q51 : 79 tests verts resume_m4/p0_resume_integrity/
+  m3_recovery (corruption isolée/refusée, zéro double comptage). NB : 6 tests
+  `resume_m1_conservation` échouent AUSSI à bab2b0b (préexistant).
 
 - 2026-11-07 : A4 ACCEPTED (Q40+Q41) — 8 commits. (1) `assemble_canvas_feathered`
   adosse désormais les 11 plans canoniques (121 B/px) à l'allocateur, y compris

@@ -140,13 +140,22 @@ powershell -NoProfile -Command "cd C:\chemin\zemosaic; $env:PYTHONPATH=$PWD\src;
 
 ### Q50 — A5, budget 4→1→4 Gio, restart
 
-- Linux : budgets 4/1 Gio réels.
-- Statut : **NOT_RUN**.
+- Commande : `tests/test_zegrid_a5_q50_growth.py` (5 tests, verts).
+- Preuve : `next_grow`/`grow_sequence`/`assert_grow_only`/`assert_joint_grow_only`
+  (inverse exact de l'API shrink-only) ; `grow_sequence` inverse `shrink_sequence`
+  depuis le maximum du treillis, les gardes refusent tout shrink/réduction
+  d'octets, et un budget 1 Gio n'achète jamais un plan plus gros que 4 Gio ;
+  identité scientifique gelée préservée sur toute la rampe.
+- Statut : **PASS** (Linux, budget modélisé par contrainte d'énumération ; la
+  rampe réelle 4/1 Gio matériellement contrainte reste en A6/Q60).
 
 ### Q51 — A5, interruption milieu d'unité, corruption témoin
 
 - Commandes : `tests/test_zegrid_resume_m4.py`, `tests/test_zegrid_p0_resume_integrity.py` (existants).
-- Statut local : non exécutés en A0 ; **NOT_RUN**.
+- Preuve : 79 tests verts (`resume_m4` + `p0_resume_integrity` + `m3_recovery`) :
+  cellule corrompue isolée et recalculée, corruption d'identité/geometry/gauge
+  refusée, zéro double comptage, cellules validées réutilisées.
+- Statut : **PASS** (Linux).
 
 ### Q60 — A6, E2E synthétiques 6 budgets
 
