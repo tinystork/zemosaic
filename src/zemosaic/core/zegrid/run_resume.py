@@ -361,6 +361,7 @@ def validate_admission(admission: Any) -> dict:
     _strict_keys(
         admission, "admission",
         ("schema", "schema_version", "backend", "tile_px", "parity_qualified"),
+        ("working_set",),
     )
     if admission["schema"] != ADMISSION_SCHEMA:
         raise ResumeStateError(
@@ -381,12 +382,44 @@ def validate_admission(admission: Any) -> dict:
     parity = admission["parity_qualified"]
     if not isinstance(parity, bool):
         raise ResumeStateError("admission.parity_qualified must be a boolean")
+    working_set = admission.get("working_set")
+    norm_ws = None
+    if working_set is not None:
+        if not isinstance(working_set, Mapping):
+            raise ResumeStateError("admission.working_set must be null or an object")
+        _strict_keys(
+            working_set, "admission.working_set",
+            ("class", "tile_px", "column_batch"),
+        )
+        ws_class = str(working_set["class"])
+        if ws_class not in ("inmem", "ram_tile", "external_spool"):
+            raise ResumeStateError(
+                "admission.working_set.class must be inmem|ram_tile|external_spool"
+            )
+        ws_tile = _as_int(
+            working_set["tile_px"], "admission.working_set.tile_px", minimum=1
+        )
+        ws_batch = working_set["column_batch"]
+        if ws_batch is not None:
+            ws_batch = _as_int(
+                ws_batch, "admission.working_set.column_batch", minimum=1
+            )
+        if ws_class == "external_spool" and (ws_tile is None or ws_batch is None):
+            raise ResumeStateError(
+                "admission.working_set external_spool requires tile_px and column_batch"
+            )
+        norm_ws = {
+            "class": ws_class,
+            "tile_px": int(ws_tile),
+            "column_batch": (None if ws_batch is None else int(ws_batch)),
+        }
     return {
         "schema": ADMISSION_SCHEMA,
         "schema_version": ADMISSION_VERSION,
         "backend": str(backend),
         "tile_px": int(tile_px),
         "parity_qualified": bool(parity),
+        **({} if norm_ws is None else {"working_set": norm_ws}),
     }
 
 
@@ -395,17 +428,19 @@ def build_admission(
     backend: Any,
     tile_px: Any,
     parity_qualified: Any,
+    working_set: Any = None,
 ) -> dict:
     """Build and validate the frozen admission contract (never fabricated)."""
-    return validate_admission(
-        {
-            "schema": ADMISSION_SCHEMA,
-            "schema_version": ADMISSION_VERSION,
-            "backend": backend,
-            "tile_px": tile_px,
-            "parity_qualified": parity_qualified,
-        }
-    )
+    raw = {
+        "schema": ADMISSION_SCHEMA,
+        "schema_version": ADMISSION_VERSION,
+        "backend": backend,
+        "tile_px": tile_px,
+        "parity_qualified": parity_qualified,
+    }
+    if working_set is not None:
+        raw["working_set"] = working_set
+    return validate_admission(raw)
 
 
 def validate_state(raw: Any) -> dict:

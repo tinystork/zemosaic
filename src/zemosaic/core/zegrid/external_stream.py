@@ -89,6 +89,7 @@ __all__ = [
     "ExternalSpoolStaleError",
     "ExternalSpoolCorruptError",
     "ExternalSpoolWriteError",
+    "ExternalDiskShortfall",
     "ExternalBudgetError",
     "ExternalSpoolSpec",
     "TileSpool",
@@ -150,6 +151,10 @@ class ExternalSpoolCorruptError(ExternalSpoolError):
 
 class ExternalSpoolWriteError(ExternalSpoolError):
     """Writing the spool failed (disk full, permission, I/O error)."""
+
+
+class ExternalDiskShortfall(ExternalSpoolError):
+    """A cell boundary refused to start: free space < the admitted envelope."""
 
 
 class ExternalBudgetError(ExternalSpoolError, ValueError):

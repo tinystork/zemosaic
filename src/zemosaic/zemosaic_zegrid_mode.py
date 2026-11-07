@@ -132,6 +132,7 @@ from .core.zegrid import stack_phase_profile as zspp
 from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
+from .core.zegrid import external_stream as zext
 from .core.zegrid import sweep as zsw
 from .core.zegrid.executor import ExecutorConfig
 
@@ -295,6 +296,17 @@ GPU_STREAMING_TILE_LADDER = tuple(
     int(t) for t in zsched.GPU_PRODUCT_TILE_LADDER
 )
 GPU_STREAMING_TILE_MINIMUM = int(zsched.MIN_TILE_PX)
+
+# ZM-ZEGRID-AUTO-EXTERNAL-STREAMING M3 — the durable working-set class of a
+# run. ``inmem`` and ``ram_tile`` are the historical classes; ``external_spool``
+# is the bounded RAM -> disk spool path (M2 primitive).
+WORKING_SET_INMEM = "inmem"
+WORKING_SET_RAM_TILE = "ram_tile"
+WORKING_SET_EXTERNAL = "external_spool"
+WORKING_SET_CLASSES = (
+    WORKING_SET_INMEM, WORKING_SET_RAM_TILE, WORKING_SET_EXTERNAL,
+)
+WORKING_SET_SCHEMA = "zemosaic-zegrid-working-set-v1"
 
 # Fraction of available memory the R4 in-memory bound must fit within to select
 # the in-memory path (headroom for decode/cache transients + allocator variance).
@@ -1412,6 +1424,7 @@ def _choose_layout_mode_aware(
     footprints_in=None,
     min_refinement_rank=None,
     max_refinement_rank=None,
+    allow_external=False,
 ):
     """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
 
@@ -2112,7 +2125,19 @@ def _choose_layout_mode_aware(
             }
         else:
             _refusal = {"kind": "geometry", "source": "no_budget_candidate"}
-        raise zal.LayoutInfeasible(msg, refusal=_refusal)
+        if allow_external and finest is not None:
+            # M3: no RAM mode fits, but the external working set is the NEXT
+            # class. Keep the FINEST floor-feasible geometry unchanged and let
+            # the bundle price the disk envelope before any work. This never
+            # relaxes a scientific floor and never applies to a dense request.
+            _log(
+                msg + " M3: keeping this floor-feasible layout for the external "
+                "disk working set (priced before gauge/stack).",
+                "WARN",
+            )
+            chosen = finest
+        else:
+            raise zal.LayoutInfeasible(msg, refusal=_refusal)
 
     cells = list(_iter_cell_bounds_mode_aware(
         canvas, footprints, chosen["nx"], chosen["ny"], halo_px, tile_size
@@ -2368,6 +2393,96 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
     else:
         # R15: release the memmap handles before the caller deletes the cache
         # (Windows: an open .npy cannot be deleted -> WinError 32).
+        provider.close()
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-AUTO-EXTERNAL-STREAMING M3 — external cell executor
+# ---------------------------------------------------------------------------
+
+def _run_cell_external(
+    cache_dir, patch, config, progress_callback, tile_size, column_batch,
+    spool_root, fixed=None, storage_profile=None, storage_info=None,
+    cell_id="cell", attempt_id="attempt", required_free_bytes=None,
+):
+    """Run ONE cell through the exact external working set (M2 primitive).
+
+    Same provider/request/fixed/sink contract as :func:`_run_cell_stream`, so
+    the science is bit-identical to the RAM stream path at the same tile. A
+    cell-boundary disk check refuses BEFORE the spool is written; committed
+    cells are never touched here.
+    """
+    _profile = zsp.normalize_storage_profile(
+        storage_profile if storage_profile is not None else _STACK_STORAGE_PROFILE
+    )
+    if int(required_free_bytes or 0) > 0:
+        try:
+            _free = int(shutil.disk_usage(str(spool_root)).free)
+        except Exception as exc:  # noqa: BLE001
+            raise zext.ExternalDiskShortfall(
+                f"cannot observe free space on {spool_root}: {exc}"
+            ) from exc
+        if _free < int(required_free_bytes):
+            raise zext.ExternalDiskShortfall(
+                "external working set stopped at a cell boundary: free "
+                f"{_free} B < admitted envelope {int(required_free_bytes)} B "
+                f"on {spool_root}; already-committed cells are intact"
+            )
+    provider = _make_cell_provider(cache_dir, _profile)
+    sink = None
+    try:
+        request = zstream.build_streaming_request(config, provider.n_frames)
+        sink = zrej.BoundedCountingRejectionSink(
+            (provider.n_frames, provider.height, provider.width, provider.channels)
+        )
+        result = zext.run_cell_streaming_external(
+            provider, request,
+            tile_size=int(tile_size),
+            column_batch=int(column_batch),
+            spool_root=str(spool_root),
+            fixed=fixed,
+            rejection_sink=sink,
+            cell_id=str(cell_id),
+            attempt_id=str(attempt_id),
+        )
+        if storage_info is not None:
+            storage_info.update({
+                "profile": _profile,
+                "model": zsp.storage_model_id(_profile),
+                "provider": type(provider).__name__,
+                "provider_storage_domain": getattr(
+                    provider, "storage_domain", None
+                ),
+                "bytes_read": getattr(provider, "bytes_read", None),
+                "open_count": getattr(provider, "open_count", None),
+                "open_failures": getattr(provider, "open_failures", None),
+                "working_set": WORKING_SET_EXTERNAL,
+                "external": {
+                    "tile_size": int(tile_size),
+                    "column_batch": int(column_batch),
+                    "spool_root": str(spool_root),
+                    "rejection_mask_available": (
+                        result.rejection_mask is not None
+                    ),
+                },
+                "sink": {
+                    "type": type(sink).__name__,
+                    "storage_domain": getattr(sink, "storage_domain", None),
+                    "true_count": int(sink.true_count),
+                    "written_cells": int(sink.written_cells),
+                    "writes": int(sink.writes),
+                    "flush_count": int(sink.flush_count),
+                    "max_write_bytes": int(sink.max_write_bytes),
+                    "max_block_bytes": int(sink.max_block_bytes),
+                },
+                "rejection_mask_available": (
+                    result.rejection_mask is not None
+                ),
+            })
+        sres = _build_cell_sres(result, list(provider.frame_ids))
+        mt = za.extract_minitile(patch, sres)
+        return mt, sres
+    finally:
         provider.close()
 
 
@@ -4051,11 +4166,18 @@ def _prepare_stack_cell(task):
     returns either a prepared payload for :func:`_consume_stack_cell` or an
     already-final ``{"empty_result": ...}`` for an empty/zero-support cell.
     """
-    if len(task) == 7:
+    if len(task) == 8:
+        (
+            cell, patch, mem, cache_dir, mode, bound, storage_profile,
+            external_info,
+        ) = task
+    elif len(task) == 7:
         (cell, patch, mem, cache_dir, mode, bound, storage_profile) = task
+        external_info = None
     else:
         (cell, patch, mem, cache_dir, mode, bound) = task
         storage_profile = _STACK_STORAGE_PROFILE
+        external_info = None
     storage_profile = zsp.normalize_storage_profile(storage_profile)
     cid = cell.cell_id
     _patch_bounds = [int(patch.patch.x0), int(patch.patch.y0),
@@ -4163,6 +4285,10 @@ def _prepare_stack_cell(task):
             {"storage_profile": storage_profile}
             if zsp.is_bounded(storage_profile) else {}
         ),
+        **(
+            {"external_info": dict(external_info)}
+            if external_info is not None else {}
+        ),
     }
 
 
@@ -4250,6 +4376,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         else None
     )
     storage_info = {}
+    external_info = prepared.get("external_info")
     # F2: RUN-boundary prefetch admission facts (None on paths without them).
     _pf_available = None
     _pf_budget = None
@@ -4260,7 +4387,25 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             "storage_profile='bounded' received an in-memory cell task; the "
             "admitted storage model requires the file-backed streaming path"
         )
-    if mode == "inmem":
+    if mode == "external":
+        _ext = dict(external_info or {})
+        if not _ext:
+            raise RuntimeError(
+                "external cell task is missing its working-set contract"
+            )
+        mt, sres = _run_cell_external(
+            cache_dir, patch, _STACK_CONFIG, None,
+            tile_size=int(_ext["tile_size"]),
+            column_batch=int(_ext["column_batch"]),
+            spool_root=str(_ext["spool_root"]),
+            fixed=cell_fixed,
+            storage_profile=storage_profile,
+            storage_info=storage_info,
+            cell_id=cid,
+            attempt_id=str(_ext.get("attempt_id") or "attempt0"),
+            required_free_bytes=int(_ext.get("disk_envelope_bytes") or 0),
+        )
+    elif mode == "inmem":
         # ZM-ZEGRID-R22: when the cell runs on the GPU, use the VRAM-bounded tile
         # size (never a single N x full-cell tile); CPU keeps the legacy
         # single-tile full-patch behaviour.
@@ -4355,6 +4500,13 @@ def _consume_stack_cell(prepared, *, tile_size=None):
     if zsp.is_bounded(storage_profile):
         record["storage_profile"] = storage_profile
         record["storage"] = dict(storage_info)
+    if mode == "external":
+        record["working_set"] = WORKING_SET_EXTERNAL
+        record["external"] = {
+            "tile_size": int((external_info or {}).get("tile_size")),
+            "column_batch": int((external_info or {}).get("column_batch")),
+            "spool_root": str((external_info or {}).get("spool_root")),
+        }
     # Additive, request-only: honest intra-cell prefetch ledger. Absent on the
     # CPU path and on every run that did not request it (byte-identical record).
     if storage_info.get("tile_prefetch") is not None:
@@ -5281,6 +5433,11 @@ class ExecutionBundle:
     gpu_device_workspace_bytes: int | None = None
     gpu_tile_trials: list | None = None
     storage_profile: str = zsp.STORAGE_PROFILE_DENSE
+    # ZM-ZEGRID-AUTO-EXTERNAL-STREAMING M3: the durable working-set class and
+    # the additive dry-plan/disk facts. RAM-only bundles keep the historical
+    # decision fields byte-identical; these two fields are explicitly additive.
+    stack_working_set: str = WORKING_SET_INMEM
+    working_set_block: dict | None = None
 
 
 def _r55_margin_raw_ceiling(
@@ -5384,7 +5541,222 @@ def _r55_gpu_tile_ladder(
     return tuple(out), max_tile
 
 
-def _cell_task(cell, patch, mem, cache_dir, mode, bound, storage_profile):
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-AUTO-EXTERNAL-STREAMING M3 — automatic working-set selection
+# ---------------------------------------------------------------------------
+
+def _external_result_unit_bytes(worst_patch_px, channels) -> int:
+    """Durable result bytes of ONE cell (science/support/valid/n_eff planes)."""
+    px = max(0, int(worst_patch_px))
+    c = max(1, int(channels))
+    return int(px) * c * (4 + 8 + 1 + 8) + 2 * 8 + 8
+
+
+def _external_spool_root(cache_root) -> Path:
+    """Spool root on the run's output/cache volume, never a hidden /tmp path."""
+    base = Path(cache_root) if cache_root is not None else Path.cwd()
+    return base / "external-spool"
+
+
+def _working_set_class_for_mode(mode) -> str:
+    token = str(mode)
+    if token == "external":
+        return WORKING_SET_EXTERNAL
+    if token == "inmem":
+        return WORKING_SET_INMEM
+    return WORKING_SET_RAM_TILE
+
+
+def _select_external_fallback(
+    *,
+    permitted_tiles,
+    worst_patch_hw,
+    max_n_frames,
+    channels,
+    budget_bytes,
+    halo_px,
+    cache_root,
+    storage_profile,
+) -> dict:
+    """Choose `stream_external(tile, batch)` or return a typed refusal.
+
+    PURE decision: prices the real geometry with
+    :func:`external_stream.estimate_external_working_set`, chooses the largest
+    permitted tile whose complete disk envelope fits the fresh free space, and
+    derives the column batch from the admitted PLAN budget. It never touches
+    the cache/gauge/stack and never changes the science identity.
+    """
+    profile = zsp.normalize_storage_profile(storage_profile)
+    if not zsp.is_bounded(profile):
+        return {
+            "refused": True,
+            "reason": "external_requires_bounded",
+            "detail": (
+                "no in-memory plan and no RAM streaming tile fits, and the "
+                "external working set is only admissible under the bounded "
+                "storage profile; storage_profile=dense is explicitly "
+                "requested, so it is not switched silently. Remedy: use the "
+                "AUTO storage policy (the product default) or request bounded."
+            ),
+            "trials": [],
+        }
+    spool_root = _external_spool_root(cache_root)
+    try:
+        spool_root.mkdir(parents=True, exist_ok=True)
+        free = int(shutil.disk_usage(str(spool_root)).free)
+    except Exception as exc:  # noqa: BLE001 - typed refusal below
+        return {
+            "refused": True,
+            "reason": "disk_envelope_unavailable",
+            "detail": f"cannot observe free space on {spool_root}: {exc}",
+            "trials": [],
+            "free_bytes": None,
+        }
+    worst_patch_px = int(worst_patch_hw[0]) * int(worst_patch_hw[1])
+    cache_unit = int(
+        _r55_cache_unit_bytes(
+            worst_patch_px, int(max_n_frames), channels=int(channels)
+        )
+    )
+    result_unit = _external_result_unit_bytes(worst_patch_px, channels)
+    # The reduction workspace is bounded by the PLAN budget MINUS the shared
+    # process baseline (counted once by the project envelope).
+    reduction_budget = max(
+        1, int(budget_bytes) - int(zpar._PER_WORKER_BASELINE_BYTES)
+    )
+    trials = []
+    best = None
+    for tile in permitted_tiles:
+        try:
+            batch = zext.largest_admissible_column_batch(
+                budget_bytes=int(reduction_budget),
+                n_frames=int(max_n_frames),
+                interior_width=min(int(tile), int(worst_patch_hw[1])),
+                channels=int(channels),
+            )
+        except zext.ExternalBudgetError as exc:
+            trials.append({
+                "tile": int(tile), "fits": False,
+                "reason_code": "column_batch_floor", "detail": str(exc),
+            })
+            continue
+        pricing = zext.estimate_external_working_set(
+            n_frames=int(max_n_frames),
+            height=int(worst_patch_hw[0]),
+            width=int(worst_patch_hw[1]),
+            channels=int(channels),
+            tile_size=int(tile),
+            halo_px=int(halo_px),
+            column_batch=int(batch),
+        )
+        envelope = int(
+            pricing["disk"]["spool_peak_bytes_worst_tile"]
+            + cache_unit
+            + result_unit
+            + pricing["disk"]["cleanup_margin_bytes"]
+        )
+        fits = envelope <= free
+        entry = {
+            "tile": int(tile),
+            "column_batch": int(batch),
+            "fits": bool(fits),
+            "disk_envelope_bytes": int(envelope),
+            "spool_peak_bytes": int(
+                pricing["disk"]["spool_peak_bytes_worst_tile"]
+            ),
+            "reason_code": None if fits else "disk_envelope_unavailable",
+        }
+        trials.append(entry)
+        if fits:
+            return {
+                "refused": False,
+                "tile": int(tile),
+                "column_batch": int(batch),
+                "spool_root": str(spool_root),
+                "pricing": pricing,
+                "cache_unit_bytes": int(cache_unit),
+                "result_unit_bytes": int(result_unit),
+                "disk_envelope_bytes": int(envelope),
+                "free_bytes": int(free),
+                "trials": trials,
+            }
+        if best is None or envelope < best["disk_envelope_bytes"]:
+            best = entry
+    return {
+        "refused": True,
+        "reason": "disk_envelope_unavailable",
+        "detail": (
+            "no external working set fits the fresh free space: "
+            + (
+                "best envelope "
+                f"{best['disk_envelope_bytes'] / 2**20:.1f} MiB at tile "
+                f"{best['tile']} > free {free / 2**20:.1f} MiB"
+                if best is not None
+                else f"free {free} B and no tile could be priced"
+            )
+            + "; unknown filesystem terms are not treated as zero. Remedy: "
+            "free space on the run's cache/output volume or choose a smaller "
+            "tile/plan."
+        ),
+        "trials": trials,
+        "free_bytes": int(free),
+        "best_envelope_bytes": (
+            None if best is None else int(best["disk_envelope_bytes"])
+        ),
+    }
+
+
+def _working_set_block(
+    *, working_set_class, tile, column_batch, budget_bytes,
+    raw_available_bytes, layout, tile_trials, gpu_used, gpu_tile,
+    external=None, refusal=None,
+) -> dict:
+    """Additive dry-plan/working-set block for the log and the manifest."""
+    disk = None
+    if external is not None:
+        pricing = external["pricing"]
+        disk = {
+            "schema": pricing["schema"],
+            "spool_peak_bytes_worst_tile": int(
+                pricing["disk"]["spool_peak_bytes_worst_tile"]
+            ),
+            "cumulative_writes_bytes": int(
+                pricing["disk"]["cumulative_writes_bytes"]
+            ),
+            "cumulative_reads_bytes": int(
+                pricing["disk"]["cumulative_reads_bytes"]
+            ),
+            "read_amplification": float(
+                pricing["disk"]["read_amplification"]
+            ),
+            "cleanup_margin_bytes": int(
+                pricing["disk"]["cleanup_margin_bytes"]
+            ),
+            "aligned_cache_unit_bytes": int(external["cache_unit_bytes"]),
+            "durable_result_unit_bytes": int(external["result_unit_bytes"]),
+            "disk_envelope_bytes": int(external["disk_envelope_bytes"]),
+            "free_bytes_observed": int(external["free_bytes"]),
+            "spool_root": str(external["spool_root"]),
+            "unknown_terms": list(pricing["disk"]["unknown_terms"]),
+            "unknown_bytes": None,
+        }
+    return {
+        "schema": WORKING_SET_SCHEMA,
+        "class": str(working_set_class),
+        "tile_size": (None if tile is None else int(tile)),
+        "column_batch": (None if column_batch is None else int(column_batch)),
+        "ram_budget_bytes": int(budget_bytes),
+        "raw_available_bytes": int(raw_available_bytes),
+        "layout": [int(layout[0]), int(layout[1])],
+        "refinement_rank": int(layout[0]) * int(layout[1]),
+        "cpu_ladder_trials": [dict(t) for t in (tile_trials or ())],
+        "gpu": {"used": bool(gpu_used), "tile_size": gpu_tile},
+        "disk": disk,
+        "refusal": (None if refusal is None else dict(refusal)),
+    }
+
+
+def _cell_task(cell, patch, mem, cache_dir, mode, bound, storage_profile, external_info=None):
     """Build ONE cell task; dense stays the historical 6-tuple EXACTLY.
 
     The bounded profile appends a 7th element so the worker knows which provider
@@ -5393,7 +5765,13 @@ def _cell_task(cell, patch, mem, cache_dir, mode, bound, storage_profile):
     profile = zsp.normalize_storage_profile(storage_profile)
     task = (cell, patch, mem, cache_dir, mode, bound)
     if zsp.is_bounded(profile):
-        return task + (profile,)
+        task = task + (profile,)
+    elif external_info is not None:
+        raise RuntimeError(
+            "external working-set tasks require the bounded storage profile"
+        )
+    if external_info is not None:
+        task = task + (dict(external_info),)
     return task
 
 
@@ -5513,6 +5891,10 @@ def _build_execution_bundle(
                     min_refinement_rank=rank_floor,
                     max_refinement_rank=rank_ceiling,
                     halo_px=_halo,
+                    allow_external=(
+                        zsp.is_bounded(_STACK_STORAGE_PROFILE)
+                        and not bool(gpu_used)
+                    ),
                 )
             except zal.LayoutInfeasible as _layout_exc:
                 # The final rank-window message only qualifies when THIS bundle build
@@ -5543,6 +5925,9 @@ def _build_execution_bundle(
         nx, ny = int(layout["nx"]), int(layout["ny"])
         worst_patch_px = 0
         patch_px_for_workers = 0
+        worst_patch_hw = (1, 1)
+        max_n_frames = 1
+        channels = 3  # ZeGrid cells are RGB (canonical C=3)
         for _row, _col, _cell, _patch, _mem in cell_ctxs:
             try:
                 _ph, _pw = _patch.patch_shape_hw
@@ -5551,7 +5936,10 @@ def _build_execution_bundle(
                 continue
             patch_px_for_workers = max(patch_px_for_workers, _px)
             if _mem.patch_ids:
-                worst_patch_px = max(worst_patch_px, _px)
+                if _px > worst_patch_px:
+                    worst_patch_px = _px
+                    worst_patch_hw = (int(_ph), int(_pw))
+                max_n_frames = max(max_n_frames, len(_mem.patch_ids))
         cache_worker_footprint_bytes = int(zpar.cache_footprint_bytes(worst_patch_px))
         # R55-E8: workers are budgeted from the SAME PLAN budget AND the SAME
         # 15 % margin the global envelope validation will apply. The previous
@@ -5692,6 +6080,7 @@ def _build_execution_bundle(
         gpu_fallback_reason = None
         cpu_refusal = None
         tile_trials = []
+        external_selection = None
 
         if effective_gpu:
             # R55-E8: evaluate each tile with its EXACT host streaming bound AND
@@ -5806,6 +6195,41 @@ def _build_execution_bundle(
                 chosen_tile = int(t)
                 break
 
+        if plan is None and _bounded and not effective_gpu:
+            # M3: no in-memory plan and no RAM tile fits. The next class is the
+            # external working set (disk spool), priced BEFORE any gauge/cache.
+            external_selection = _select_external_fallback(
+                permitted_tiles=permitted_tiles,
+                worst_patch_hw=worst_patch_hw,
+                max_n_frames=max_n_frames,
+                channels=channels,
+                budget_bytes=budget_bytes,
+                halo_px=_halo,
+                cache_root=cache_root,
+                storage_profile=_profile,
+            )
+            if not external_selection.get("refused"):
+                _ext_ws = int(
+                    external_selection["pricing"]["ram"][
+                        "reduction_workspace_bytes"
+                    ]
+                )
+                plan = {
+                    "mode": "external",
+                    "cells_in_flight": 1,
+                    "cache_workers_per_cell": max(1, int(_cache_workers)),
+                    "stack_total_bytes": int(_ext_ws),
+                    "cache_total_bytes": 0,
+                    "aggregate_bytes": int(shared_bytes) + int(_ext_ws),
+                    "chosen_reason": (
+                        "external working set selected: no in-memory plan and "
+                        "no RAM streaming tile fits; the complete disk "
+                        "envelope fits the fresh free space"
+                    ),
+                    "candidates": [],
+                    "external": True,
+                }
+                chosen_tile = int(external_selection["tile"])
         if plan is None:
             if _frozen_admission is not None:
                 # FAIL CLOSED: the frozen tile cannot be honoured here. Never
@@ -5848,11 +6272,12 @@ def _build_execution_bundle(
 
         cpu_streaming_tile = int(chosen_tile)
         chosen_mode = plan["mode"]
-        if _bounded and chosen_mode != "stream":
+        if _bounded and chosen_mode not in ("stream", "external"):
             raise zpar.ModeInfeasible(
-                "storage_profile='bounded' requires the streaming executor, but "
-                f"the joint planner chose {chosen_mode!r}; refusing to admit a "
-                "bounded plan whose residency the in-memory path would exceed"
+                "storage_profile='bounded' requires the streaming/external "
+                f"executor, but the joint planner chose {chosen_mode!r}; "
+                "refusing to admit a bounded plan whose residency the "
+                "in-memory path would exceed"
             )
         if _bounded:
             # L-1: the bundle planner has no profile flag, so it is fed an
@@ -5885,7 +6310,7 @@ def _build_execution_bundle(
         # R41-B (rework-2): the REPORTED stream tile is the one that will actually
         # execute a CPU stream plan — None when the CPU plan is in-memory only or
         # when no CPU fallback exists on a GPU plan (never a fake tile).
-        if (not effective_gpu) and chosen_mode == "stream":
+        if (not effective_gpu) and chosen_mode in ("stream", "external"):
             selected_cpu_tile = int(chosen_tile)
         elif cpu_fallback_plan is not None and cpu_fallback_plan.get("mode") == "stream":
             selected_cpu_tile = int(chosen_tile)
@@ -5901,9 +6326,16 @@ def _build_execution_bundle(
         _cs_reason = (
             f"joint tile selection over the permitted ladder {permitted_tiles}: "
             + (
-                f"tile {selected_cpu_tile} is the largest jointly feasible stream tile"
-                if selected_cpu_tile is not None
-                else "no CPU stream tile is used (in-memory plan or no CPU fallback)"
+                (
+                    f"tile {selected_cpu_tile} is the largest admissible "
+                    "external (disk spool) tile; no RAM tile fit"
+                )
+                if chosen_mode == "external"
+                else (
+                    f"tile {selected_cpu_tile} is the largest jointly feasible stream tile"
+                    if selected_cpu_tile is not None
+                    else "no CPU stream tile is used (in-memory plan or no CPU fallback)"
+                )
             )
         )
         layout["cpu_streaming"] = _cpu_streaming_block(
@@ -5951,6 +6383,17 @@ def _build_execution_bundle(
             )
 
         cell_tasks = []
+        _external_task_info = None
+        if chosen_mode == "external":
+            _external_task_info = {
+                "class": WORKING_SET_EXTERNAL,
+                "tile_size": int(chosen_tile),
+                "column_batch": int(external_selection["column_batch"]),
+                "spool_root": str(external_selection["spool_root"]),
+                "disk_envelope_bytes": int(
+                    external_selection["disk_envelope_bytes"]
+                ),
+            }
         for (cell, patch, mem, cache_dir, inmem_b, stream_b, gpu_stream_b) in cell_specs:
             if inmem_b is None:
                 cell_tasks.append(_cell_task(
@@ -5958,6 +6401,12 @@ def _build_execution_bundle(
             elif chosen_mode == "inmem":
                 cell_tasks.append(_cell_task(
                     cell, patch, mem, cache_dir, "inmem", inmem_b, _profile))
+            elif chosen_mode == "external":
+                cell_tasks.append(_cell_task(
+                    cell, patch, mem, cache_dir, "external",
+                    int(external_selection["pricing"]["ram"][
+                        "reduction_workspace_bytes"]),
+                    _profile, _external_task_info))
             else:
                 bound_b = (
                     gpu_stream_b
@@ -5968,10 +6417,63 @@ def _build_execution_bundle(
 
         if effective_gpu and gpu_streaming_host_peak_bytes is not None:
             per_cell_footprint = int(gpu_streaming_host_peak_bytes)
+        elif chosen_mode == "external":
+            per_cell_footprint = int(
+                external_selection["pricing"]["ram"][
+                    "reduction_workspace_bytes"
+                ]
+            )
         else:
             per_cell_footprint = max(
                 (t[5] for t in cell_tasks if t[4] is not None), default=0
             )
+
+        # M3: the honest working-set class + dry-plan facts (log + manifest).
+        # Additive only: every pre-existing RAM decision field is untouched.
+        stack_working_set = _working_set_class_for_mode(chosen_mode)
+        # Resume identity: a frozen class is never silently re-derived.
+        if _frozen_admission is not None:
+            _frozen_ws = _frozen_admission.get("working_set")
+            if (
+                _frozen_ws is not None
+                and str(_frozen_ws.get("class")) != stack_working_set
+            ):
+                raise zpar.ModeInfeasible(
+                    "frozen working-set class "
+                    f"{_frozen_ws.get('class')!r} cannot be re-derived as "
+                    f"{stack_working_set!r} on this resume; the run identity is "
+                    "not silently changed. Remedy: resume the frozen class or "
+                    "start a new run/output folder."
+                )
+            if _frozen_ws is None and stack_working_set == WORKING_SET_EXTERNAL:
+                raise zpar.ModeInfeasible(
+                    "legacy run identity has no working-set section; switching "
+                    "it to the external spool is refused (additive M3 identity). "
+                    "Remedy: start a new run/output folder for the external path."
+                )
+        working_set_block = _working_set_block(
+            working_set_class=stack_working_set,
+            tile=(selected_cpu_tile if chosen_mode != "inmem" else None),
+            column_batch=(
+                int(external_selection["column_batch"])
+                if chosen_mode == "external" else None
+            ),
+            budget_bytes=budget_bytes,
+            raw_available_bytes=raw_available_bytes,
+            layout=(nx, ny),
+            tile_trials=(
+                external_selection["trials"]
+                if chosen_mode == "external" else tile_trials
+            ),
+            gpu_used=bool(effective_gpu),
+            gpu_tile=gpu_streaming_tile,
+            external=(
+                external_selection if chosen_mode == "external" else None
+            ),
+            refusal=None,
+        )
+        layout["stack_working_set"] = stack_working_set
+        layout["working_set"] = working_set_block
 
         cpu_fallback_info = {
             "applicable": bool(effective_gpu), "feasible": False, "mode": None,
@@ -6086,6 +6588,8 @@ def _build_execution_bundle(
             ),
             gpu_tile_trials=[dict(t) for t in gpu_tile_trials],
             storage_profile=_profile,
+            stack_working_set=stack_working_set,
+            working_set_block=dict(working_set_block),
         )
 
 
@@ -12479,6 +12983,23 @@ def _run_single(
         f"backend={science_config.backend}",
         callback=progress_callback,
     )
+    _ws_block = getattr(_final, "working_set_block", None) or {}
+    _ws_class = str(getattr(_final, "stack_working_set", WORKING_SET_RAM_TILE))
+    _ws_disk = _ws_block.get("disk") if isinstance(_ws_block, dict) else None
+    _ws_extra = ""
+    if _ws_class == WORKING_SET_EXTERNAL:
+        _ws_extra = (
+            f"column_batch={_ws_block.get('column_batch')} "
+            f"spool_root={(_ws_disk or {}).get('spool_root')} "
+            f"disk_envelope={(_ws_disk or {}).get('disk_envelope_bytes', 0) / 2**20:.1f}MiB "
+            f"free_at_plan={(_ws_disk or {}).get('free_bytes_observed', 0) / 2**20:.1f}MiB "
+        )
+    _emit(
+        f"ZeGrid: working set — class={_ws_class} "
+        f"tile={cpu_streaming_tile if _ws_class != WORKING_SET_INMEM else None} "
+        f"{_ws_extra}backend={science_config.backend}",
+        callback=progress_callback,
+    )
     _emit(
         f"ZeGrid: per-cell concurrency — cells_in_flight={cells_in_flight} "
         f"(cpu={os.cpu_count()}, plan_raw={available_now / 2**30:.2f}GiB, "
@@ -17324,6 +17845,13 @@ def _run_single(
     # M4: resume audit (selected run, restored policy, sparse pending set).
     # Never payloads, never arrays.
     per_cell_diagnostics["r55_resume"] = dict(_resume_runtime)
+    # M3: the working-set class + dry-plan/disk facts (additive manifest block).
+    try:
+        per_cell_diagnostics["working_set"] = getattr(
+            _current_bundle(), "working_set_block", None
+        )
+    except Exception:
+        per_cell_diagnostics["working_set"] = None
 
     # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
     export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
@@ -18417,6 +18945,21 @@ def _write_outputs(
         ),
         "gauge_diagnostics": (gauge_diagnostics or {}),
         "per_cell_diagnostics": (per_cell_diagnostics or {}),
+        # M3: additive working-set class + dry-plan/disk facts. Omitted when no
+        # working-set block was produced, so legacy/observe bytes stay identical.
+        **(
+            {
+                "stack_working_set": (
+                    (per_cell_diagnostics or {}).get("working_set") or {}
+                ).get("class"),
+                "working_set": (
+                    (per_cell_diagnostics or {}).get("working_set")
+                ),
+            }
+            if isinstance(per_cell_diagnostics, dict)
+            and (per_cell_diagnostics.get("working_set") is not None)
+            else {}
+        ),
         # ZM-WIN-VRAM-HW: sampled VRAM high-water (MAX of gpu_used_mb observed
         # DURING the per-cell stack), never a driver-counter claim. The block is
         # always present; when sampling did not run every measurement is null
