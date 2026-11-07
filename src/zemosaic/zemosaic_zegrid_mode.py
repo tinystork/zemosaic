@@ -11931,6 +11931,16 @@ def _r55_m3_make_coordinator(
     )
 
 
+def _run_scope_bundle(active_bundle, final_bundle):
+    """F11: the ONE run-scope executable bundle.
+
+    Explicit ``is not None`` precedence (never truthiness). The active bundle
+    wins when it exists; otherwise the finalized bundle is returned. Callers
+    invoke this only after ``_final`` has been assigned on the run path.
+    """
+    return active_bundle if active_bundle is not None else final_bundle
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -14874,7 +14884,7 @@ def _run_single(
                                 # A cleanup failure is accounted, never fatal.
                                 try:
                                     _ws_b = (
-                                        _current_bundle().working_set_block or {}
+                                        _run_scope_bundle(_r55_active_bundle, _final).working_set_block or {}
                                     )
                                 except Exception:
                                     _ws_b = {}
@@ -15378,7 +15388,7 @@ def _run_single(
             with tile_lock:
                 return dict(tile_state["mapping"])
 
-        def _current_bundle():
+        def _gpu_current_bundle():
             with tile_lock:
                 return tile_state["bundle"]
 
@@ -15655,7 +15665,7 @@ def _run_single(
                 tile=int(tile_now),
                 free_bytes=int(free_vram),
                 host_budget_bytes=int(budget),
-                bundle=_current_bundle(),
+                bundle=_gpu_current_bundle(),
                 prefetch_units=int(_run_mapping["prefetch_units"]),
             )
             shrink_attempts: list[dict] = []
@@ -15667,7 +15677,7 @@ def _run_single(
                     current_tile=int(tile_now),
                     free_bytes=int(free_vram),
                     host_budget_bytes=int(budget),
-                    bundle=_current_bundle(),
+                    bundle=_gpu_current_bundle(),
                     prefetch_units=int(_run_mapping["prefetch_units"]),
                 )
                 if chosen is None:
@@ -16417,7 +16427,7 @@ def _run_single(
                 plan_budget_bytes=int(host_facts_last["budget_bytes"]),
             )
         else:
-            effective_bundle = _current_bundle()
+            effective_bundle = _gpu_current_bundle()
         runtime_tile = _r55_tile_adaptation_from_state(
             tile_state, gpu_decision, initial_tile
         )
@@ -17113,7 +17123,7 @@ def _run_single(
                 # write AFTER selection. backend/tile/parity are never rewritten.
                 try:
                     _ws_identity = (
-                        getattr(_current_bundle(), "working_set_block", None)
+                        getattr(_run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None)
                         or getattr(_initial_bundle, "working_set_block", None)
                         or {}
                     )
@@ -17145,7 +17155,7 @@ def _run_single(
                 # a live owner's spool is never stolen.
                 try:
                     _ws_scan = (
-                        getattr(_current_bundle(), "working_set_block", None)
+                        getattr(_run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None)
                         or getattr(_initial_bundle, "working_set_block", None)
                         or {}
                     )
@@ -18705,7 +18715,7 @@ def _run_single(
                 if _rec_w <= 0:
                     try:
                         _ws_blk = getattr(
-                            _current_bundle(), "working_set_block", None
+                            _run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None
                         ) or {}
                         _disk_blk = _ws_blk.get("disk") or {}
                         _rec_w = int(_n_ext_records) * int(
@@ -18725,7 +18735,7 @@ def _run_single(
     # foreign file blocks the prune rather than being destroyed).
     try:
         try:
-            _ws_prune = getattr(_current_bundle(), "working_set_block", None) or {}
+            _ws_prune = getattr(_run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None) or {}
         except Exception:
             _ws_prune = {}
         _prune_root = ((_ws_prune.get("disk") or {}).get("spool_root"))
@@ -18754,7 +18764,7 @@ def _run_single(
     # M3: the working-set class + dry-plan/disk facts (additive manifest block).
     try:
         per_cell_diagnostics["working_set"] = getattr(
-            _current_bundle(), "working_set_block", None
+            _run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None
         )
     except Exception:
         per_cell_diagnostics["working_set"] = None
