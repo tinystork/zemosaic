@@ -1616,6 +1616,55 @@ def _choose_layout_mode_aware(
         inmem_ok = (not zsp.is_bounded(_STACK_STORAGE_PROFILE)) and (
             (ram_budget is None) or (inmem_worst <= ram_budget)
         )
+        # A1b (pinned): the exact geometry stays, but it is only admitted when
+        # the FULL joint aggregate fits. External (A2) keeps its documented
+        # escape hatch; RAM modes do not.
+        _pinned_joint = None
+        if (
+            ram_budget is not None
+            and not allow_external
+            and (zsp.is_bounded(_STACK_STORAGE_PROFILE) or not inmem_ok)
+        ):
+            _worst_patch = max(
+                cells,
+                key=lambda c: int(c.get("patch_area", 0)),
+                default=None,
+            )
+            if _worst_patch is not None:
+                _pinned_joint = _layout_joint_plan_probe(
+                    canvas_px=int(canvas.width) * int(canvas.height),
+                    patch_hw=tuple(int(v) for v in _worst_patch["patch_hw"]),
+                    n_frames=max(1, int(max_n)),
+                    cell_count=int(nx) * int(ny),
+                    layout=(int(nx), int(ny)),
+                    halo_px=int(halo_px),
+                    budget_bytes=int(ram_budget),
+                    available_bytes=(
+                        None if available_bytes is None else int(available_bytes)
+                    ),
+                    storage_profile=str(_STACK_STORAGE_PROFILE),
+                    stream_added_by_tile={
+                        int(t): max(1, int(v) - int(rcontract.PROCESS_BASELINE_BYTES))
+                        for t, v in stream_worst_by_tile.items()
+                    },
+                    refinement_rank=int(nx) * int(ny),
+                    pinned=True,
+                )
+                if not _pinned_joint["ok"]:
+                    _jmsg = (
+                        f"pinned layout {nx}x{ny} refused by the joint aggregate: "
+                        f"{_pinned_joint['reason_code']}: {_pinned_joint['detail']}"
+                    )
+                    _log(_jmsg, "ERROR")
+                    raise zal.LayoutInfeasible(
+                        _jmsg,
+                        refusal={
+                            "kind": "host_ram",
+                            "source": "pinned_joint_aggregate",
+                            "budget_bytes": int(ram_budget),
+                            "joint": dict(_pinned_joint),
+                        },
+                    )
         if not inmem_ok and selected_tile is None:
             min_bound = int(stream_worst_by_tile.get(CPU_STREAMING_TILE_MINIMUM, 0))
             msg = (
@@ -1752,43 +1801,87 @@ def _choose_layout_mode_aware(
         # CPU streaming tile fits. This strictly widens the pre-R36 rule
         # (min(inmem, stream@preferred) <= budget) whenever a smaller tile helps.
         memory_ok = inmem_ok or (selected_tile is not None)
+        # A1b — a stack-only fit is NOT enough. The candidate must also pass the
+        # REAL joint PLAN (gauge + cache + stack + assembly + export, ONE 15/100
+        # margin) that previously refused it after layout was already chosen.
+        joint_probe = None
+        admissible = bool(memory_ok)
+        if (
+            memory_ok
+            and ram_budget is not None
+            and (zsp.is_bounded(_STACK_STORAGE_PROFILE) or not inmem_ok)
+        ):
+            joint_probe = _layout_joint_plan_probe(
+                canvas_px=int(canvas.width) * int(canvas.height),
+                patch_hw=tuple(int(v) for v in worst["patch_hw"]),
+                n_frames=max(1, int(worst["n"])),
+                cell_count=int(nx) * int(ny),
+                layout=(int(nx), int(ny)),
+                halo_px=int(halo_px),
+                budget_bytes=int(ram_budget),
+                available_bytes=(
+                    None if available_bytes is None else int(available_bytes)
+                ),
+                storage_profile=str(_STACK_STORAGE_PROFILE),
+                stream_added_by_tile={
+                    int(t): max(
+                        1,
+                        int(v) - int(rcontract.PROCESS_BASELINE_BYTES),
+                    )
+                    for t, v in worst["stream_worst_by_tile"].items()
+                },
+                refinement_rank=int(nx) * int(ny),
+                pinned=False,
+            )
+            admissible = bool(joint_probe["ok"])
         bound_mib = worst["cheaper_bound_bytes"] / 2**20
         inmem_mib = worst["inmem_worst_bytes"] / 2**20
         min_tile_mib = worst["stream_worst_by_tile"].get(CPU_STREAMING_TILE_MINIMUM, 0) / 2**20
         budget_mib = (ram_budget / 2**20) if ram_budget is not None else None
-        if memory_ok:
+        if admissible:
+            _joint_mib = (
+                ""
+                if not joint_probe or joint_probe.get("peak_bytes") is None
+                else f"; joint aggregate {joint_probe['peak_bytes'] / 2**20:.1f} MiB"
+            )
             _log(
                 f"layout scan: candidate {nx}x{ny} ACCEPTED "
                 f"(in-memory worst {inmem_mib:.1f} MiB"
                 f"{'; CPU streaming tile ' + str(selected_tile) + ' fits' if selected_tile is not None else ''}"
+                f"{_joint_mib}"
                 + (f"; budget {budget_mib:.1f} MiB" if budget_mib is not None else "") + ")"
             )
         else:
+            _joint_reason = (
+                ""
+                if not joint_probe or joint_probe.get("ok")
+                else f"; joint: {joint_probe['reason_code']}: {joint_probe['detail']}"
+            )
             _log(
                 f"layout scan: candidate {nx}x{ny} REJECTED — "
                 f"cheaper-mode bound {bound_mib:.1f} MiB > budget {budget_mib:.1f} MiB "
                 f"(in-memory worst {inmem_mib:.1f} MiB; no CPU streaming tile fits down "
                 f"to minimum {CPU_STREAMING_TILE_MINIMUM}, bound {min_tile_mib:.1f} MiB)"
+                + _joint_reason
             )
         candidates.append({
             "factor": factor, "nx": nx, "ny": ny,
             "bound": worst["cheaper_bound_bytes"], "worst_cell": worst,
-            "memory_ok": memory_ok, "geom": geom,
+            "memory_ok": memory_ok, "admissible": admissible,
+            "joint": joint_probe, "geom": geom,
             "inmem_ok": inmem_ok, "selected_tile": selected_tile,
             "trials": trials, "selection_reason": sel_reason,
         })
-        if memory_ok:
+        if admissible:
             # ZM-ZEGRID-R28: the returned choice is the FIRST floor-feasible +
-            # memory-admissible candidate (see the chosen loop below). Stop the
-            # production scan here rather than evaluating finer candidates that
-            # are never used. Prior rejected candidates are already in ``candidates``
-            # so ``budget_bound_choice`` and the no-fit error remain exact.
+            # memory + JOINT admissible candidate. Stop the production scan here
+            # rather than evaluating finer candidates that are never used.
             break
 
     chosen = None
     chosen_index = None
     for i, cand in enumerate(candidates):
-        if cand["memory_ok"]:
+        if cand.get("admissible", cand["memory_ok"]):
             chosen = cand
             chosen_index = i
             break
@@ -2095,6 +2188,12 @@ def _choose_layout_mode_aware(
                 f"bound {min_tile_bound / 2**20:.1f} MiB both exceed budget "
                 f"{ram_budget / 2**20:.1f} MiB (cheaper-mode bound "
                 f"{finest['bound'] / 2**20:.1f} MiB)"
+            )
+        if finest is not None and finest.get("joint") and not finest["joint"].get("ok"):
+            reasons.append(
+                "joint aggregate refused at layout: "
+                f"{finest['joint'].get('reason_code')}: "
+                f"{finest['joint'].get('detail')}"
             )
         reasons.append(
             f"min_patch_area floor ({floors.min_patch_area_px} px) / "
@@ -7078,6 +7177,201 @@ class _R55ActiveDecision:
     cache_workers: int = 0
     worker_trail: tuple = ()
     storage_profile: str = zsp.STORAGE_PROFILE_DENSE
+
+
+
+def _layout_joint_plan_probe(
+    *,
+    canvas_px: int,
+    patch_hw: tuple[int, int],
+    n_frames: int,
+    cell_count: int,
+    layout: tuple[int, int],
+    halo_px: int,
+    budget_bytes: int,
+    available_bytes: int | None,
+    storage_profile: str,
+    stream_added_by_tile,
+    refinement_rank: int = 0,
+    pinned: bool = False,
+    run_id: str = "layout-joint-probe",
+) -> dict:
+    """A1b — admit a layout only if the FULL joint CPU aggregate fits.
+
+    This is deliberately NOT a new memory formula. It builds the same
+    ``PlanContext`` + ``PhaseRequest`` set as the product PLAN/ADMIT path and
+    calls :func:`scheduler.plan`, whose ``build_plan_set`` applies the ONE
+    15/100 margin at the aggregate boundary. Layout acceptance therefore uses
+    exactly the arithmetic that previously refused the run after layout.
+
+    Scope: HOST RAM only. The disk budget is a sentinel here because A2 owns
+    the bounded window/spool; the host aggregate is the A1 defect. A refusal is
+    returned as data (never raised) so the caller can continue scanning finer
+    candidates with a truthful reason.
+    """
+    budget = int(budget_bytes)
+    if budget <= 0:
+        return {
+            "ok": True,
+            "reason_code": None,
+            "detail": "no explicit RAM budget",
+            "peak_bytes": None,
+            "raw_bytes": None,
+            "tile_px": None,
+            "gauge_workers": None,
+            "cache_workers": None,
+            "budget_bytes": budget,
+        }
+    h, w = int(patch_hw[0]), int(patch_hw[1])
+    patch_px = max(1, h * w)
+    channels = 3
+    canvas = int(canvas_px)
+    gauge_fp = int(zpar.gauge_footprint_bytes(canvas))
+    cache_fp = int(zpar.cache_footprint_bytes(patch_px))
+    raw_available = (
+        int(available_bytes)
+        if available_bytes is not None and int(available_bytes) > 0
+        else (budget * int(rcontract.PLAN_FACTOR_DEN)) // int(rcontract.PLAN_FACTOR_NUM)
+    )
+    budget_ctx = (
+        int(rcontract.PLAN_FACTOR_NUM) * raw_available
+    ) // int(rcontract.PLAN_FACTOR_DEN)
+    if budget_ctx <= 0:
+        budget_ctx = budget
+    raw_ceiling = (
+        budget_ctx
+        * int(renv.DEFAULT_MARGIN_DEN)
+        // (int(renv.DEFAULT_MARGIN_DEN) + int(renv.DEFAULT_MARGIN_NUM))
+    )
+    gauge_start = _r55_coherent_worker_count(None, raw_ceiling, gauge_fp)
+    cache_start = _r55_coherent_worker_count(None, raw_ceiling, cache_fp)
+    per_unit_cache = int(_r55_cache_unit_bytes(patch_px, max(1, int(n_frames)), channels=channels))
+    added_by_tile = {
+        int(t): max(1, int(v))
+        for t, v in dict(stream_added_by_tile).items()
+    }
+    if not added_by_tile:
+        return {
+            "ok": False,
+            "reason_code": renv.REASON_REFUSE_HOST_RAM,
+            "detail": "no streaming tile bound supplied",
+            "peak_bytes": None,
+            "raw_bytes": None,
+            "tile_px": None,
+            "gauge_workers": None,
+            "cache_workers": None,
+            "budget_bytes": budget_ctx,
+        }
+    last = None
+    for gauge in _r55_worker_ladder(gauge_start):
+        for cache in _r55_worker_ladder(cache_start):
+            facts = {
+                "gauge_workers": int(gauge),
+                "cache_workers": int(cache),
+                "gauge_footprint_bytes": gauge_fp,
+                "cache_footprint_bytes": cache_fp,
+                "canvas_px": canvas,
+                # The layout probe prices the assembly phase conservatively:
+                # retained full-canvas cores + zero halo band. The real cells
+                # can only reduce the halo term, never the canvas term.
+                "halo_band_bytes": 0,
+                "retained_core_bytes": canvas * 16,
+                "channels": channels,
+            }
+            requests = tuple(
+                replace(r, overlaps_with=(renv.PHASE_CELL_STACK_STREAM,))
+                if r.phase == renv.PHASE_ASSEMBLY
+                else r
+                for r in _r55_active_phase_requests(facts)
+            )
+            context = zsched.PlanContext(
+                phase=renv.PHASE_CELL_STACK_STREAM,
+                backend=renv.BACKEND_CPU,
+                budget_bytes=int(budget_ctx),
+                raw_available_bytes=int(raw_available),
+                factor_num=int(rcontract.PLAN_FACTOR_NUM),
+                factor_den=int(rcontract.PLAN_FACTOR_DEN),
+                cpu_logical=int(os.cpu_count() or 1),
+                units_total=max(1, int(cell_count)),
+                shared_bytes=int(rcontract.PROCESS_BASELINE_BYTES),
+                per_unit_stack_bytes=max(1, max(added_by_tile.values())),
+                per_unit_cache_bytes=per_unit_cache,
+                per_unit_prefetch_bytes=0,
+                # A2 owns disk; a sentinel isolates the host aggregate here.
+                disk_free_bytes=1 << 62,
+                layout=(int(layout[0]), int(layout[1])),
+                refinement_rank=int(refinement_rank),
+                patch_hw=(h, w),
+                halo_px=int(halo_px),
+                channels=channels,
+                n_frames=max(1, int(n_frames)),
+                tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+                prefetch_ladder=(0,),
+                workers_ladder=tuple(int(v) for v in zsched.WORKERS_LADDER),
+                per_tile_stack_bytes=dict(added_by_tile),
+                margin_num=int(renv.DEFAULT_MARGIN_NUM),
+                margin_den=int(renv.DEFAULT_MARGIN_DEN),
+                cell_ids=(),
+                frame_ids=(),
+                observation_source="layout.joint_preflight",
+                run_id=str(run_id),
+                pinned=bool(pinned),
+                storage_profile=str(storage_profile),
+            )
+            enumerated = zsched.enumerate_candidates(context)
+            feasible = [c for c in enumerated if c.feasible]
+            if not feasible:
+                # Report the BEST (smallest host peak) hard refusal, not a
+                # generic message: the layout decision must explain itself.
+                best = min(
+                    enumerated,
+                    key=lambda c: (int(c.host_peak_bytes), c.ordering_key()),
+                )
+                last = zsched.PlanRefused(
+                    best.reason_code,
+                    best.infeasible_reason
+                    or "no CPU candidate fits the hard constraints",
+                    candidates=enumerated,
+                )
+                continue
+            plan_set = None
+            for cand in sorted(feasible, key=zsched.objective_key):
+                try:
+                    plan_set = zsched.build_plan_set(
+                        context,
+                        candidate=cand,
+                        phase_requests=requests,
+                        mode=zsched.MODE_ACTIVE,
+                    )
+                    break
+                except zsched.PlanRefused as exc:
+                    last = exc
+                    continue
+            if plan_set is None:
+                continue
+            chosen = plan_set.chosen
+            return {
+                "ok": True,
+                "reason_code": None,
+                "detail": "joint aggregate fits",
+                "peak_bytes": int(plan_set.aggregate_host_peak_bytes),
+                "raw_bytes": int(plan_set.aggregate_host_peak_bytes_raw),
+                "tile_px": None if chosen.tile_px is None else int(chosen.tile_px),
+                "gauge_workers": int(gauge),
+                "cache_workers": int(cache),
+                "budget_bytes": int(budget_ctx),
+            }
+    return {
+        "ok": False,
+        "reason_code": getattr(last, "reason_code", renv.REASON_REFUSE_HOST_RAM),
+        "detail": str(getattr(last, "detail", "no coherent joint candidate fits the budget")),
+        "peak_bytes": None,
+        "raw_bytes": None,
+        "tile_px": None,
+        "gauge_workers": None,
+        "cache_workers": None,
+        "budget_bytes": int(budget_ctx),
+    }
 
 
 def _r55_active_facts(
