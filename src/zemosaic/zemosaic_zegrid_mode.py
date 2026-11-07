@@ -9508,6 +9508,95 @@ def _r55_next_materialized_shrink(*, decision, candidate, plan_obs=None):
             return name, materialized, examined
 
 
+def _r55_next_materialized_grow(*, decision, candidate, plan_obs):
+    """F5: advance ONE legal growth step and MATERIALIZE it canonically.
+
+    The exact inverse of :func:`_r55_next_materialized_shrink`:
+
+    * ``next_grow`` changes only tuple fields in ``GROW_ORDER`` (tile ->
+      units -> workers -> prefetch), never the backend (CPU->GPU is forbidden);
+    * the proposed tuple is re-enumerated through
+      ``materialize_active_candidate`` under the FRESH 4/5 PLAN observation, so
+      the accepted step carries TRUTHFUL recomputed host/disk/device projections
+      (a stale ``_replace_candidate`` projection is never used);
+    * an infeasible rung ends the walk (growing further cannot reduce bytes), so
+      the path is bounded and never skips a phase.
+
+    Returns ``(step_name, candidate, examined)`` or ``(None, None, examined)``.
+    """
+    context = _r55_active_shrink_context(decision, candidate)
+    context = replace(
+        context,
+        raw_available_bytes=int(plan_obs.raw_available_bytes),
+        factor_num=int(plan_obs.factor_num),
+        factor_den=int(plan_obs.factor_den),
+        budget_bytes=int(plan_obs.budget_bytes),
+    )
+    examined = []
+    current = candidate
+    while True:
+        name, nxt = zsched.next_grow(current, context)
+        if name is None or nxt is None:
+            return None, None, examined
+        try:
+            materialized = zsched.materialize_active_candidate(context, nxt)
+            zsched.assert_grow_only(current, materialized)
+        except zsched.SchedulerError:
+            # Growth is an OPTIONAL recovery path. A tuple the canonical
+            # enumeration does not contain (or a non-growth transition) is not a
+            # reason to fail an otherwise admissible shrunk plan: fail closed to
+            # "no grow" and keep the shrunk candidate.
+            return None, None, examined
+        examined.append(
+            {
+                "step": name,
+                "from": zsched.active_candidate_tuple(current),
+                "to": zsched.active_candidate_tuple(materialized),
+                "accepted": bool(materialized.feasible),
+                "reason_code": materialized.reason_code,
+                "detail": materialized.infeasible_reason,
+                "projections": {
+                    "host_peak_bytes": int(materialized.host_peak_bytes),
+                    "disk_bytes": int(materialized.disk_bytes),
+                    "device_peak_bytes": int(materialized.device_peak_bytes),
+                },
+            }
+        )
+        if materialized.feasible:
+            return name, materialized, examined
+        # A larger resource rung that does not fit the fresh 4/5 budget means
+        # the growth frontier is reached: stop (never a blind escalation).
+        return None, None, examined
+
+
+def _r55_grow_is_admissible(grown, plan_obs) -> bool:
+    """F5 hysteresis predicate: a grow step must fit the STRICT 4/5 budget.
+
+    Shrinking triggers above the 9/10 admission ceiling; growing requires the
+    next rung to fit the 4/5 PLAN budget. The 4/5..9/10 band is therefore a
+    dead band: a micro-rise inside it can neither grow (too tight) nor was it
+    caused by growth, so no shrink<->grow oscillation is possible.
+    """
+    return (
+        grown is not None
+        and int(grown.host_peak_bytes) <= int(plan_obs.budget_bytes)
+    )
+
+
+def _r55_active_growth_allowed(decision) -> bool:
+    """F5/A1d boundary: a FROZEN (pinned) admission is never regrown.
+
+    Pinned lives on the scheduler PlanContext (the frozen scientific identity
+    itself carries layout/cells/frames/halo only). Either CPU context being
+    pinned blocks growth; a resume restores a pinned context, so a restored
+    admission is never regrown (A1d remains deferred).
+    """
+    return not bool(
+        getattr(decision.stream_context, "pinned", False)
+        or getattr(decision.inmem_context, "pinned", False)
+    )
+
+
 def _r55_active_admit(
     *, initial_bundle, decision
 ):
@@ -9558,6 +9647,9 @@ def _r55_active_admit(
         stage="preflight",
     )
     trail = []
+    shrunk = False
+    grows = 0
+    shrink_plan_budget = None
 
     # 1) The mapped product envelope must still fit the INITIAL 80 % B_plan.
     #    (The scheduler's host model does not include the product's cache
@@ -9586,6 +9678,8 @@ def _r55_active_admit(
                 f"B_plan {bundle.envelope.budget_bytes})"
             )
         candidate = nxt
+        shrunk = True
+        shrink_plan_budget = int(bundle.envelope.budget_bytes)
         mapping = zsched.active_mapping_for_candidate(
             candidate,
             tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
@@ -9613,6 +9707,73 @@ def _r55_active_admit(
     while True:
         admit_obs = rcontract.Observation.admit(_measure())
         observations.append(admit_obs)
+        # F5 — SYMMETRIC GROWTH. Only a plan SHRUNK during admission is
+        # eligible, and only when a FRESH 4/5 PLAN observation (not the 9/10
+        # admission band) admits the next rung. This is the documented
+        # hysteresis: shrink triggers above the 9/10 ceiling, grow requires the
+        # stricter 4/5 budget, so the 4/5..9/10 band cannot oscillate. ONE
+        # field per step, backend never changes (CPU->GPU is forbidden).
+        if (
+            shrunk
+            and shrink_plan_budget is not None
+            and _r55_active_growth_allowed(decision)
+            and grows < len(zsched.GROW_ORDER)
+        ):
+            headroom_obs = rcontract.Observation.plan(
+                admit_obs.raw_available_bytes
+            )
+            gname, gnxt, gexamined = _r55_next_materialized_grow(
+                decision=decision, candidate=candidate, plan_obs=headroom_obs
+            )
+            if (
+                gname is not None
+                and int(headroom_obs.budget_bytes) > int(shrink_plan_budget)
+                and _r55_grow_is_admissible(gnxt, headroom_obs)
+            ):
+                # Publish ONLY an admitted grow step: an examined-but-refused
+                # probe must never pollute the shrink trail.
+                for entry in gexamined:
+                    trail.append(
+                        {
+                            **entry,
+                            "at": "budget_recovery",
+                            "stage": "preflight",
+                            "aggregate_bytes_before": int(
+                                bundle.envelope.aggregate_bytes
+                            ),
+                            "b_plan_bytes": int(headroom_obs.budget_bytes),
+                            "admit_raw_bytes": int(
+                                admit_obs.raw_available_bytes
+                            ),
+                        }
+                    )
+                candidate = gnxt
+                mapping = zsched.active_mapping_for_candidate(
+                    candidate,
+                    tile_ladder=tuple(
+                        int(t) for t in CPU_STREAMING_TILE_LADDER
+                    ),
+                    workers_ladder=tuple(
+                        int(w) for w in zsched.WORKERS_LADDER
+                    ),
+                )
+                bundle = _r55_active_apply(
+                    initial_bundle,
+                    mapping=mapping,
+                    facts=decision.facts,
+                    plan_raw_available_bytes=int(
+                        headroom_obs.raw_available_bytes
+                    ),
+                    plan_factor_num=int(headroom_obs.factor_num),
+                    plan_factor_den=int(headroom_obs.factor_den),
+                    plan_budget_bytes=int(headroom_obs.budget_bytes),
+                    stage="preflight",
+                )
+                grows += 1
+                shrink_plan_budget = int(headroom_obs.budget_bytes)
+                observations.append(headroom_obs)
+                history.append(bundle.envelope)
+                continue
         if bundle.envelope.aggregate_bytes <= admit_obs.budget_bytes:
             launch_obs = rcontract.Observation.launch(_measure())
             observations.append(launch_obs)
@@ -9676,6 +9837,8 @@ def _r55_active_admit(
                     attempts=tuple(observations),
                 )
             candidate = nxt
+            shrunk = True
+            shrink_plan_budget = int(plan_obs.budget_bytes)
             mapping = zsched.active_mapping_for_candidate(
                 candidate,
                 tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
