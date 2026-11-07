@@ -4,6 +4,24 @@ Statut : **matrice figée**. Les lignes non exécutées en A0 sont NOT_RUN, jama
 PASS. Les commandes utilisent des chemins réels ; les moyens indisponibles sont
 déclarés comme blocages.
 
+## Mise à jour de qualification après audit — 2026-11-07
+
+**Les critères restent figés; les verdicts PASS historiques ci-dessous ne valent plus acceptation
+produit pour Q40/Q41/Q50/Q60/Q64.** Voir le
+[rapport final](POST_PUBLICATION_AUDIT_20261107.md) et son tableau A0–A6.
+Q40/Q41/Q50 : preuves unitaires/partielles uniquement. Q60 : E2E tiny/legacy1–4Gio simulés,
+pas plafond RSS ni parcours GUI ACTIVE. Q64 : propagation, pas intégration complète.
+Q61 BLOCKED; Q62/Q63 NOT_RUN. Les primitives et parités restent des preuves utiles.
+Les anciens états A0 et les commandes ci-dessous sont conservés pour traçabilité, non comme
+statut courant. Les9 échecs connus ont désormais été reproduits sur la vraie baseline5150040
+et sur HEAD418ba43, mêmes causes (50 passed/9 failed de chaque côté).
+
+Run Windows M106 `mem_fix` ajouté comme témoin réel : GUI/ZeGrid ACTIVE/GPU70 % et publication
+réussis, mais profil `dense`/`ram_tile` uniquement. Il ne ferme donc ni external/micro-blocs, ni
+scratch/OOM/croissance. Il révèle F11 (identité working-set non gelée, HIGH), F12 (fausses erreurs
+pinned pool, MEDIUM), F13 (faux échec de livraison du run log, MEDIUM) et F14 (WARN attendus trop
+bruyants, LOW), détaillés dans le rapport final.
+
 ## 1. Identités machines et corpus
 
 | Id | Machine | RAM | VRAM | Corpus | Racine |

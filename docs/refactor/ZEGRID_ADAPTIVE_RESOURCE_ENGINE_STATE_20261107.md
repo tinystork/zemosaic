@@ -2,8 +2,21 @@
 
 Mise à jour : 2026-11-07  
 Programme : `ZM-ZEGRID-ADAPTIVE-RESOURCES-20261107`  
-État : **A0_RUNNING**  
+État : **AUDIT_FINDINGS — qualification produit incomplète**
 Contrat : [plan v2, sections 10–14](ZEGRID_ADAPTIVE_RESOURCE_ENGINE_PLAN_20261107.md)
+
+## Verdict courant après audit transversal (2026-11-07)
+
+**L'audit est terminé; les gates produit A4/A5 ne sont pas satisfaits et A6 n'est pas qualifié.**
+Les acceptations et le journal ci-dessous sont historiques, supersédés pour leur portée produit
+par le [rapport final d'audit](../qualification/zegrid-adaptive-resources/POST_PUBLICATION_AUDIT_20261107.md).
+A2/A3 ont des primitives valides mais des manques d'intégration; A1d reste différé.
+54 tests ciblés passent; le comparatif réel5150040/418ba43 reproduit les mêmes9 échecs connus.
+Pas de modification produit ni nouvelle publication pendant l'audit.
+Le run Windows M106 `mem_fix` confirme GUI/ACTIVE/GPU70 % et publication, mais seulement en profil
+`dense`/`ram_tile`; il révèle aussi F11–F14 (identité de reprise, télémétrie et faux WARN).
+**Prochaine action unique : rework borné « reprise et alertes honnêtes » (F11–F14), puis contrat
+admission/provider et choix automatique sous-ligne (F2/F3).** Différer le gros M33.
 
 ## Autorisation réelle
 
@@ -77,6 +90,11 @@ Q61 BLOCKED, Q62/Q63 reportés au test direct beta).
 
 ## État Windows et données
 
+- Témoin M106 `C:\\Users\\JarvisJunior\\Desktop\\zemosaic out\\M106\\mem_fix` inspecté :
+  terminé, 66/66 frames, ACTIVE/GPU, profil dense/ram_tile, sorties racine vérifiées.
+- Ce témoin ne force ni external, ni scratch, ni OOM, ni croissance dynamique; il ne qualifie pas
+  les grands corpus. Alertes matérielles ajoutées au rapport final sous F11–F14.
+
 - Dossier communiqué : `C:\Users\JarvisJunior\Desktop\M33\ircut`.
 - Dernière tentative de lecture : `Invalid system.run request: raw-command-mismatch`.
 - Tristan a signalé Windows planté ; cause non diagnostiquée ici.
@@ -85,7 +103,7 @@ Q61 BLOCKED, Q62/Q63 reportés au test direct beta).
 - Espace scratch disponible, chemins sources réels et empreintes : à relever en A0.
 - Aucun runtime/dossier de données Windows modifié par cette préparation.
 
-## Prochaine action unique
+## Prochaine action antérieure — historique, supersédée par l’audit
 
 A4-T01 : assemblage 121 B/px + écriture FITS transactionnelle/hachage streaming (Q40 canevas > budget, Q41 finitions/preview disque presque plein). Q32 (cellule M33 profonde) reporté à A6/Q61 (Windows indisponible).
 
