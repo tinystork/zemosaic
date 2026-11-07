@@ -761,7 +761,8 @@ def test_bounded_bundle_tasks_carry_profile_and_survive_gpu_shaped_rebuild(
     for task in bundle.cell_tasks:
         if task[4] is None:
             continue
-        assert len(task) == 7
+        assert len(task) == 9
+        assert task[8] == zz._CELL_INPUT_WINDOWED
         assert task[6] == "bounded"
         assert task[4] == "stream"
 

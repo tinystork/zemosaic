@@ -139,7 +139,8 @@ def test_external_selected_when_all_ram_tiles_refuse_and_disk_fits(tmp_path, mon
     external_tasks = [t for t in bundle.cell_tasks if t[4] == "external"]
     assert external_tasks
     for task in external_tasks:
-        assert len(task) == 8
+        assert len(task) == 9
+        assert task[8] == zz._CELL_INPUT_WINDOWED
         info = task[7]
         assert info["class"] == zz.WORKING_SET_EXTERNAL
         assert int(info["tile_size"]) == bundle.cpu_streaming_tile
@@ -185,6 +186,9 @@ def test_dense_profile_never_switches_silently(tmp_path):
 
 
 def test_ram_feasible_bundle_is_unchanged_and_additive_only(tmp_path, monkeypatch):
+    # This is a synthetic tile-selection test (64 MiB), not a physical RAM
+    # witness. Match the fixture's other zeroed overheads after A1 joint pricing.
+    monkeypatch.setattr(zz.rcontract, "PROCESS_BASELINE_BYTES", 0)
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(1 << 60))
     table = {
         128: 60 * MIB, 112: 60 * MIB, 96: 60 * MIB, 80: 60 * MIB,

@@ -30,6 +30,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import unittest.mock as mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
@@ -1178,10 +1179,11 @@ def _tiny_durable_run(tmp_path, *, resume_mode="never", progress=None,
         zegrid_stack_phase_profiling=bool(stack_profiling),
         temporary_work_dir="",
     )
-    zz.run_zegrid_mode(
-        str(corpus), str(out), progress,
-        zconfig=zconfig, zegrid_halo_px=8, use_gpu=False,
-    )
+    with mock.patch.object(zz, "available_memory_bytes", return_value=8 * 2**30):
+        zz.run_zegrid_mode(
+            str(corpus), str(out), progress,
+            zconfig=zconfig, zegrid_halo_px=8, use_gpu=False,
+        )
     return store_root, out
 
 

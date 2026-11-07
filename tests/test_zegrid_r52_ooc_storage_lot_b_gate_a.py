@@ -92,7 +92,7 @@ def test_gate_a_dense_h128_refusal_and_bounded_bundle(caldwell_headers):
     assert bundle.chosen_mode == "stream"
     assert bundle.layout.get("storage_profile") == "bounded"
     assert bundle.plan["storage"]["profile"] == "bounded"
-    assert bundle.plan["storage"]["provider"] == "BoundedMemmapCanonicalProvider"
+    assert bundle.plan["storage"]["provider"] == "WindowedCanonicalProvider"
     assert bundle.plan["storage"]["rejection"] == "BoundedCountingRejectionSink"
     assert bundle.plan["storage"]["fresh_sink_per_cell"] is True
     # L-1: the real in-memory bound is published; the 1<<62 planner sentinel is
@@ -104,7 +104,7 @@ def test_gate_a_dense_h128_refusal_and_bounded_bundle(caldwell_headers):
     # CPU admitted: every cell is a bounded streaming task.
     assert bundle.cpu_streaming_tile == 128
     assert len(bundle.cell_tasks) == 12
-    assert all(len(t) == 7 for t in bundle.cell_tasks)
+    assert all(len(t) == 9 and t[8] == zz._CELL_INPUT_WINDOWED for t in bundle.cell_tasks)
     assert all(t[4] in (None, "stream") for t in bundle.cell_tasks)
     assert all(t[6] == "bounded" for t in bundle.cell_tasks if t[4] is not None)
     assert bundle.per_cell_footprint < BUDGET_BYTES
