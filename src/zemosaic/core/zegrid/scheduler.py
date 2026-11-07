@@ -463,7 +463,20 @@ class PlanContext:
         """Normalized per-tile host bound, or ``None`` for the static path."""
         if self.per_tile_stack_bytes is None:
             return None
-        return _normalize_per_tile_stack_bytes(self.per_tile_stack_bytes)
+        # ZM-ZEGRID-AUTO-EXTERNAL-STREAMING (M1 review-0, MEDIUM): the schema
+        # floor is BACKEND-SPECIFIC, exactly like ``_validate_context``. A CPU
+        # per-tile bound may legitimately name a tile below the historical 32 px
+        # performance floor; a GPU bound may not (GPU tiles < 32 are never
+        # qualified). Validating with the CPU floor for every backend silently
+        # dropped that defence in depth.
+        return _normalize_per_tile_stack_bytes(
+            self.per_tile_stack_bytes,
+            minimum=(
+                MIN_TILE_PX
+                if self.backend == BACKEND_GPU
+                else MIN_CPU_TILE_PX
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -804,12 +817,19 @@ def _validate_context(context: PlanContext, *, allow_gpu: bool = False) -> None:
             )
 
 
-def _normalize_per_tile_stack_bytes(value) -> dict[int, int]:
+def _normalize_per_tile_stack_bytes(
+    value, *, minimum: int = MIN_CPU_TILE_PX
+) -> dict[int, int]:
     """Strictly normalize an explicit per-tile host-bound map.
 
     Accepts a mapping or a sequence of ``(tile_px, bytes)`` pairs. Rejects
     bool/float/negative entries, malformed pairs, empty maps, duplicates and
     contradictory duplicate keys. Never guesses or fills a missing tile.
+
+    ``minimum`` is the BACKEND-SPECIFIC tile floor: CPU rungs may go below the
+    historical 32 px performance floor, GPU rungs may not. Callers that own a
+    ``PlanContext`` pass its backend floor; the default keeps the CPU contract
+    for the low-level standalone use.
     """
     if isinstance(value, Mapping):
         items = tuple(value.items())
@@ -834,7 +854,7 @@ def _normalize_per_tile_stack_bytes(value) -> dict[int, int]:
         tile = _joint_int(
             item[0],
             f"per_tile_stack_bytes[{index}].tile_px",
-            minimum=MIN_CPU_TILE_PX,
+            minimum=int(minimum),
         )
         bound = _joint_int(
             item[1],

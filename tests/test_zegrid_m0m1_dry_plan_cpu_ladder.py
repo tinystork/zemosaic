@@ -176,6 +176,57 @@ def test_scheduler_rejects_cpu_below_8_and_gpu_below_32():
     zs._validate_context(_ctx((64, 32), backend=zs.BACKEND_GPU), allow_gpu=True)
 
 
+def test_per_tile_stack_map_floor_is_backend_specific():
+    """M1 review-0 MEDIUM: the schema floor must follow the context backend.
+
+    A below-32 rung is a qualified CPU tile, so a CPU per-tile map must accept
+    it. The same entry on a GPU context must stay refused, even though the entry
+    is a valid CPU rung: GPU tiles below 32 are not qualified, and the per-tile
+    map is the last defence before the candidate is priced.
+    """
+    cpu = _ctx((32, 16), per_tile_stack_bytes={32: 4096, 16: 2048})
+    assert cpu.per_tile_stack_map == {16: 2048, 32: 4096}
+
+    gpu = _ctx(
+        (32, 16),
+        backend=zs.BACKEND_GPU,
+        per_tile_stack_bytes={32: 4096, 16: 2048},
+    )
+    with pytest.raises(zs.SchedulerConfigError):
+        gpu.per_tile_stack_map
+
+    # A GPU map that honours its own >= 32 floor still normalizes.
+    gpu_ok = _ctx(
+        (64, 32),
+        backend=zs.BACKEND_GPU,
+        per_tile_stack_bytes={64: 8192, 32: 4096},
+    )
+    assert gpu_ok.per_tile_stack_map == {32: 4096, 64: 8192}
+
+
+def test_dry_plan_prefers_the_largest_rung_when_memory_is_abundant():
+    """M1 review-0 L-3: selection stays performance-first (largest feasible)."""
+    spec = zdry.DryPlanSpec(
+        raw_available_bytes=64 * 1024 * MIB,
+        plan_budget_bytes=None,
+        cells=[(8, (64, 64))],
+        layout=(2, 2),
+        refinement_rank=4,
+        halo_px=8,
+        channels=3,
+        storage_profile="bounded",
+        cpu_logical=8,
+        disk_free_bytes=10 ** 12,
+        per_unit_cache_bytes=10 ** 8,
+        # Explicitly NOT feasible in memory: the CPU streaming ladder decides.
+        in_memory_bound_by_cell=[10 ** 12],
+    )
+    report = zdry.build_dry_plan(spec)
+    assert report["cpu"]["selected_working_set"] == "ram_tile"
+    assert report["cpu"]["selected_tile"] == int(zs.PRODUCT_TILE_LADDER[0])
+    assert report["cpu"]["selected_tile"] == 128
+
+
 # ---------------------------------------------------------------------------
 # M1 — exact science parity below 32 (no tolerance, no skip)
 # ---------------------------------------------------------------------------
