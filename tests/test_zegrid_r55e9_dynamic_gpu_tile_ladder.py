@@ -216,8 +216,14 @@ def test_e9_ladder_rejects_malformed_maximums():
 
 
 def test_e9_ladder_does_not_touch_the_cpu_ladder():
-    assert zz.CPU_STREAMING_TILE_LADDER == CPU_TAIL
-    assert zz._r55_active_gpu_tile_ladder(128) == zz.CPU_STREAMING_TILE_LADDER
+    # M1: the CPU ladder is extended below 32; the GPU tail is its OWN ladder and
+    # must stay at >= 32. The CPU ladder remains a superset (never truncated by
+    # the GPU ladder's smaller tail).
+    assert zz.GPU_STREAMING_TILE_LADDER == CPU_TAIL
+    assert zz.CPU_STREAMING_TILE_LADDER[: len(CPU_TAIL)] == CPU_TAIL
+    assert zz._r55_active_gpu_tile_ladder(128) == zz.GPU_STREAMING_TILE_LADDER
+    assert 16 not in zz._r55_active_gpu_tile_ladder(128)
+    assert 8 not in zz._r55_active_gpu_tile_ladder(128)
 
 
 # ---------------------------------------------------------------------------

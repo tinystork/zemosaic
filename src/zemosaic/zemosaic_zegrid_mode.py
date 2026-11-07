@@ -282,9 +282,19 @@ R37_CAPTURE_HOLDOUT_CAP_DEFAULT = 64
 # ``32`` is the documented PERFORMANCE FLOOR (never a science floor — geometry,
 # Cell/ProcessingPatch/MiniTile, halo, gauge, weights, rejection and combine are
 # UNCHANGED). R36 never goes below 32.
-CPU_STREAMING_TILE_LADDER = (128, 112, 96, 80, 64, 48, 32)
+CPU_STREAMING_TILE_LADDER = tuple(
+    int(t) for t in zsched.PRODUCT_TILE_LADDER
+)
 CPU_STREAMING_TILE_PREFERRED = 128
-CPU_STREAMING_TILE_MINIMUM = 32
+# 8 is the qualified CPU streaming floor for M1 (exact-parity validated); 32
+# remains the historical PERFORMANCE floor only, never a science floor.
+CPU_STREAMING_TILE_MINIMUM = int(zsched.MIN_CPU_TILE_PX)
+# The GPU ladder is SEPARATE and deliberately unchanged by M1: below-32 GPU
+# tiles are not qualified, so GPU candidates remain bounded at >= 32.
+GPU_STREAMING_TILE_LADDER = tuple(
+    int(t) for t in zsched.GPU_PRODUCT_TILE_LADDER
+)
+GPU_STREAMING_TILE_MINIMUM = int(zsched.MIN_TILE_PX)
 
 # Fraction of available memory the R4 in-memory bound must fit within to select
 # the in-memory path (headroom for decode/cache transients + allocator variance).
@@ -5351,7 +5361,7 @@ def _r55_gpu_tile_ladder(
         {max_tile}
         | {
             int(t)
-            for t in CPU_STREAMING_TILE_LADDER
+            for t in GPU_STREAMING_TILE_LADDER
             if int(t) < max_tile
         },
         reverse=True,
@@ -7033,7 +7043,7 @@ def _r55_active_gpu_tile_ladder(max_tile):
     per-tile host/device maps for EVERY returned rung.
     """
     top = zrt.strict_int(max_tile, "max_tile", minimum=1)
-    if top < int(CPU_STREAMING_TILE_MINIMUM):
+    if top < int(GPU_STREAMING_TILE_MINIMUM):
         return ()
     rungs = [int(top)]
     coarse = (int(top) // 64) * 64
@@ -7041,7 +7051,7 @@ def _r55_active_gpu_tile_ladder(max_tile):
         if coarse < rungs[-1]:
             rungs.append(int(coarse))
         coarse -= 64
-    for tail_tile in CPU_STREAMING_TILE_LADDER:
+    for tail_tile in GPU_STREAMING_TILE_LADDER:
         if int(tail_tile) < rungs[-1]:
             rungs.append(int(tail_tile))
     return tuple(rungs)
@@ -7161,7 +7171,7 @@ def _r55_active_gpu_decide(
         max_n = max(max_n, int(n))
 
     max_tile = zgpu.choose_gpu_tile_size(max_n, 3, worst_hw, budget)
-    if max_tile is None or int(max_tile) < int(CPU_STREAMING_TILE_MINIMUM):
+    if max_tile is None or int(max_tile) < int(GPU_STREAMING_TILE_MINIMUM):
         raise _R55GpuRefused(
             zgr.REASON_REFUSE_VRAM,
             "no GPU streaming tile fits the fresh VRAM budget "
@@ -7181,7 +7191,7 @@ def _r55_active_gpu_decide(
         raise _R55GpuRefused(
             zgr.REASON_REFUSE_VRAM,
             "no GPU streaming tile is >= the minimum tile "
-            f"({CPU_STREAMING_TILE_MINIMUM}) within the VRAM-derived maximum "
+            f"({GPU_STREAMING_TILE_MINIMUM}) within the VRAM-derived maximum "
             f"({max_tile}); refusing rather than extrapolating",
         )
     declared_device_peaks = {

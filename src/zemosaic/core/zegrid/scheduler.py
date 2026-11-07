@@ -114,7 +114,9 @@ __all__ = [
     "active_final_plan_hash",
     "active_manifest_dict",
     "MIN_TILE_PX",
+    "MIN_CPU_TILE_PX",
     "PRODUCT_TILE_LADDER",
+    "GPU_PRODUCT_TILE_LADDER",
     "PREFETCH_LADDER",
     "WORKERS_LADDER",
     "CPU_OS_RESERVE",
@@ -191,9 +193,16 @@ ACTIVE_EXECUTABLE_PHASES = (
 )
 
 MIN_TILE_PX = 32
-# The PRODUCT ladder, in the product's preferred (descending) order. R54's
-# t16/t24 are experimental OOC tiles and are intentionally absent.
-PRODUCT_TILE_LADDER = (128, 112, 96, 80, 64, 48, 32)
+# ZM-ZEGRID-AUTO-EXTERNAL-STREAMING (M1): the CPU ladder is now qualified below
+# the historical 32 performance floor (32 remains a PERFORMANCE floor, never a
+# science floor; geometry/halo/gauge/weights/rejection/combine are unchanged).
+# The GPU ladder is deliberately NOT extended: below-32 GPU tiles are not
+# qualified in this mission and keep their own >= 32 floor.
+MIN_CPU_TILE_PX = 8
+# The PRODUCT CPU ladder, in the product's preferred (descending) order.
+PRODUCT_TILE_LADDER = (128, 112, 96, 80, 64, 48, 32, 24, 20, 16, 12, 10, 8)
+# The GPU ladder is a separate, unchanged tuple (>= MIN_TILE_PX).
+GPU_PRODUCT_TILE_LADDER = (128, 112, 96, 80, 64, 48, 32)
 PREFETCH_LADDER = (0, 1)
 WORKERS_LADDER = (1, 2, 3, 4, 6, 8, 12, 14)
 CPU_OS_RESERVE = 2
@@ -719,9 +728,12 @@ def _validate_context(context: PlanContext, *, allow_gpu: bool = False) -> None:
         raise SchedulerConfigError(f"margin {mnum}/{mden} must not exceed 1")
     if not context.tile_ladder:
         raise SchedulerConfigError("tile_ladder must not be empty")
+    # ZM-ZEGRID-AUTO-EXTERNAL-STREAMING (M1): the floor is BACKEND-SPECIFIC.
+    # CPU tiles below 32 are qualified; a GPU tile below 32 is still refused.
+    _tile_minimum = MIN_TILE_PX if context.backend == BACKEND_GPU else MIN_CPU_TILE_PX
     seen = set()
     for tile in context.tile_ladder:
-        t = require_int(tile, "tile_ladder entry", minimum=MIN_TILE_PX)
+        t = require_int(tile, "tile_ladder entry", minimum=_tile_minimum)
         if t in seen:
             raise SchedulerConfigError(f"duplicate tile {t} in ladder")
         seen.add(t)
@@ -822,7 +834,7 @@ def _normalize_per_tile_stack_bytes(value) -> dict[int, int]:
         tile = _joint_int(
             item[0],
             f"per_tile_stack_bytes[{index}].tile_px",
-            minimum=MIN_TILE_PX,
+            minimum=MIN_CPU_TILE_PX,
         )
         bound = _joint_int(
             item[1],

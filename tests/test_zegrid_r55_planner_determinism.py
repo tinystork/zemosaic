@@ -251,9 +251,16 @@ def test_product_ladder_only():
     from zemosaic import zemosaic_zegrid_mode as zz
 
     assert zs.PRODUCT_TILE_LADDER == tuple(zz.CPU_STREAMING_TILE_LADDER)
-    assert 16 not in zs.PRODUCT_TILE_LADDER
-    assert 24 not in zs.PRODUCT_TILE_LADDER
-    assert min(zs.PRODUCT_TILE_LADDER) == zs.MIN_TILE_PX == 32
+    # ZM-ZEGRID-AUTO-EXTERNAL-STREAMING M1: the CPU ladder is qualified below
+    # the historical 32 performance floor; the GPU ladder is NOT extended.
+    assert 16 in zs.PRODUCT_TILE_LADDER
+    assert 24 in zs.PRODUCT_TILE_LADDER
+    assert 8 in zs.PRODUCT_TILE_LADDER
+    assert min(zs.PRODUCT_TILE_LADDER) == zs.MIN_CPU_TILE_PX == 8
+    assert zs.MIN_TILE_PX == 32
+    assert tuple(zz.GPU_STREAMING_TILE_LADDER) == zs.GPU_PRODUCT_TILE_LADDER
+    assert min(zs.GPU_PRODUCT_TILE_LADDER) == zs.MIN_TILE_PX
+    assert not (set(zz.GPU_STREAMING_TILE_LADDER) - set(zz.CPU_STREAMING_TILE_LADDER))
 
 
 def test_calibration_in_range_and_out_of_range_never_extrapolates():
@@ -636,7 +643,7 @@ def test_shrink_sequence_uses_the_documented_order():
     assert final.prefetch_units == 0
     assert final.workers_per_unit == 1
     assert final.units_in_flight == 1
-    assert final.tile_px == 32
+    assert final.tile_px == zs.MIN_CPU_TILE_PX
 
 
 def test_growth_is_rejected_on_every_field():

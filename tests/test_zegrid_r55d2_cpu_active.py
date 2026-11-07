@@ -370,8 +370,10 @@ def test_active_mapping_rejects_gpu_prefetch_off_ladder_and_bad_workers():
         zs.active_mapping_for_candidate(_candidate(prefetch_units=1))
     assert exc.value.reason_code == re.REASON_SHRINK_PREFETCH
 
+    # A tile BELOW the qualified CPU floor is off-ladder; 16 is now a
+    # qualified CPU rung (ZM-ZEGRID-AUTO-EXTERNAL-STREAMING M1).
     with pytest.raises(zs.ActivePlanRejected) as exc:
-        zs.active_mapping_for_candidate(_candidate(tile_px=16))
+        zs.active_mapping_for_candidate(_candidate(tile_px=4))
     assert exc.value.reason_code == re.REASON_SHRINK_TILE
 
     with pytest.raises(zs.ActivePlanRejected) as exc:

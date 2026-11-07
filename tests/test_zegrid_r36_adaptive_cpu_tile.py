@@ -3,7 +3,8 @@
 Covers the R36 deliverables WITHOUT a full M16/M106 pipeline run:
 
 * the adaptive-layout planner selects the LARGEST CPU streaming tile from the
-  frozen ladder ``(128,112,96,80,64,48,32)`` whose worst-cell streaming bound fits
+  frozen ladder ``(128,112,96,80,64,48,32,24,20,16,12,10,8)`` whose worst-cell
+  streaming bound fits
   the RAM budget; a layout is admissible iff the in-memory bound fits OR some
   ladder tile fits; auto picks the first/coarsest admissible candidate; the public
   layout dict carries a ``cpu_streaming`` provenance block (never a bare
@@ -129,7 +130,7 @@ def test_comfortable_budget_selects_preferred_tile(monkeypatch):
     assert cs["adaptive"] is True
     assert cs["preferred_tile_size"] == 128
     assert cs["selected_tile_size"] == 128
-    assert cs["minimum_tile_size"] == 32
+    assert cs["minimum_tile_size"] == zz.CPU_STREAMING_TILE_MINIMUM
     assert "128" in cs["selection_reason"]
     assert cs["trials"][0]["tile"] == 128 and cs["trials"][0]["fits"] is True
     # No bare ``tile_size`` name leaked into the public provenance block.
@@ -176,7 +177,7 @@ def test_no_mode_fits_raises_layout_infeasible(monkeypatch):
         )
     msg = str(exc.value)
     assert "MiB" in msg
-    assert "32" in msg  # minimum tile stated
+    assert str(zz.CPU_STREAMING_TILE_MINIMUM) in msg  # minimum tile stated
     assert "grand" not in msg.lower()  # (sanity: no stray token)
     assert "zegrid_layout" in msg
     assert "disk-backed" in msg or "streaming" in msg
@@ -204,7 +205,7 @@ def test_pinned_no_fit_fails_loud(monkeypatch):
             canvas, descs, ram_budget=1000, floors=_tiny_floors(),
             pinned_layout=(3, 2), footprints_out=[],
         )
-    assert "32" in str(exc.value)
+    assert str(zz.CPU_STREAMING_TILE_MINIMUM) in str(exc.value)
     assert "zegrid_layout" in str(exc.value)
 
 
@@ -454,7 +455,7 @@ def test_manifest_cpu_streaming_block_contract(tmp_path, routine_corpus, monkeyp
         assert key in block, key
     assert block["preferred_tile_size"] == 128
     assert block["selected_tile_size"] == 64
-    assert block["minimum_tile_size"] == 32
+    assert block["minimum_tile_size"] == zz.CPU_STREAMING_TILE_MINIMUM
     # No BARE ``tile_size`` key in the public provenance block (R36).
     assert "tile_size" not in block
     assert "selected_tile_size" in block and "minimum_tile_size" in block
