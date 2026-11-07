@@ -2403,7 +2403,8 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
 def _run_cell_external(
     cache_dir, patch, config, progress_callback, tile_size, column_batch,
     spool_root, fixed=None, storage_profile=None, storage_info=None,
-    cell_id="cell", attempt_id="attempt", required_free_bytes=None,
+    cell_id="cell", attempt_id=None, required_free_bytes=None,
+    owner_token=None, owner_record=None, owner_liveness=None,
 ):
     """Run ONE cell through the exact external working set (M2 primitive).
 
@@ -2435,6 +2436,13 @@ def _run_cell_external(
         sink = zrej.BoundedCountingRejectionSink(
             (provider.n_frames, provider.height, provider.width, provider.channels)
         )
+        # M4: UNIQUE attempt id + deferred deletion. The parent commits the
+        # Cell durably, then calls cleanup_after_commit. A failed commit leaves
+        # the attempt in 'ready'; a retry gets a new id and discards it as stale.
+        _attempt_id = str(attempt_id) if attempt_id is not None else (
+            f"a{time.time_ns()}_{os.getpid()}"
+        )
+        spool_info = {}
         result = zext.run_cell_streaming_external(
             provider, request,
             tile_size=int(tile_size),
@@ -2443,7 +2451,12 @@ def _run_cell_external(
             fixed=fixed,
             rejection_sink=sink,
             cell_id=str(cell_id),
-            attempt_id=str(attempt_id),
+            attempt_id=_attempt_id,
+            cleanup_on_success=False,
+            spool_out=spool_info,
+            owner_token=owner_token,
+            owner_record=owner_record,
+            owner_liveness=owner_liveness,
         )
         if storage_info is not None:
             storage_info.update({
@@ -2465,6 +2478,7 @@ def _run_cell_external(
                         result.rejection_mask is not None
                     ),
                 },
+                "external_spool": dict(spool_info),
                 "sink": {
                     "type": type(sink).__name__,
                     "storage_domain": getattr(sink, "storage_domain", None),
@@ -4402,8 +4416,10 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             storage_profile=storage_profile,
             storage_info=storage_info,
             cell_id=cid,
-            attempt_id=str(_ext.get("attempt_id") or "attempt0"),
+            attempt_id=_ext.get("attempt_id"),
             required_free_bytes=int(_ext.get("disk_envelope_bytes") or 0),
+            owner_token=_ext.get("owner_token"),
+            owner_record=_ext.get("owner_record"),
         )
     elif mode == "inmem":
         # ZM-ZEGRID-R22: when the cell runs on the GPU, use the VRAM-bounded tile
@@ -5558,6 +5574,24 @@ def _external_spool_root(cache_root) -> Path:
     return base / "external-spool"
 
 
+def _external_owner_identity() -> tuple[str, dict]:
+    """Run-level spool owner (the existing lock identity, never PID alone)."""
+    try:
+        host = str(os.uname().nodename)
+    except Exception:  # pragma: no cover - non-POSIX fallback
+        host = "localhost"
+    record = {
+        "pid": int(os.getpid()),
+        "host": host,
+        "boot_id": zrs.boot_id(),
+        "process_start_token": zrs.process_start_token(int(os.getpid())),
+    }
+    token = hashlib.sha256(
+        json.dumps(record, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:32]
+    return token, record
+
+
 def _working_set_class_for_mode(mode) -> str:
     token = str(mode)
     if token == "external":
@@ -5577,6 +5611,8 @@ def _select_external_fallback(
     halo_px,
     cache_root,
     storage_profile,
+    frozen_tile=None,
+    frozen_batch=None,
 ) -> dict:
     """Choose `stream_external(tile, batch)` or return a typed refusal.
 
@@ -5600,6 +5636,9 @@ def _select_external_fallback(
             ),
             "trials": [],
         }
+    if frozen_tile is not None:
+        # A resumed external run reuses its FROZEN tile, never a re-derived one.
+        permitted_tiles = [int(frozen_tile)]
     spool_root = _external_spool_root(cache_root)
     try:
         spool_root.mkdir(parents=True, exist_ok=True)
@@ -5627,19 +5666,42 @@ def _select_external_fallback(
     trials = []
     best = None
     for tile in permitted_tiles:
-        try:
-            batch = zext.largest_admissible_column_batch(
-                budget_bytes=int(reduction_budget),
-                n_frames=int(max_n_frames),
-                interior_width=min(int(tile), int(worst_patch_hw[1])),
-                channels=int(channels),
-            )
-        except zext.ExternalBudgetError as exc:
-            trials.append({
-                "tile": int(tile), "fits": False,
-                "reason_code": "column_batch_floor", "detail": str(exc),
-            })
-            continue
+        if frozen_batch is not None:
+            # A resumed external run reuses its FROZEN column-batch policy.
+            batch = int(frozen_batch)
+            if batch < 1:
+                return {
+                    "refused": True, "reason": "frozen_batch_budget",
+                    "detail": f"frozen column_batch {batch} is invalid",
+                    "trials": [],
+                }
+            if (
+                int(max_n_frames) * batch
+                * int(zext.REDUCTION_BYTES_PER_POSITION_FRAME)
+                > int(reduction_budget)
+            ):
+                return {
+                    "refused": True, "reason": "frozen_batch_budget",
+                    "detail": (
+                        f"frozen column_batch {batch} does not fit the admitted "
+                        "reduction budget; refusing to shrink it silently"
+                    ),
+                    "trials": [],
+                }
+        else:
+            try:
+                batch = zext.largest_admissible_column_batch(
+                    budget_bytes=int(reduction_budget),
+                    n_frames=int(max_n_frames),
+                    interior_width=min(int(tile), int(worst_patch_hw[1])),
+                    channels=int(channels),
+                )
+            except zext.ExternalBudgetError as exc:
+                trials.append({
+                    "tile": int(tile), "fits": False,
+                    "reason_code": "column_batch_floor", "detail": str(exc),
+                })
+                continue
         pricing = zext.estimate_external_working_set(
             n_frames=int(max_n_frames),
             height=int(worst_patch_hw[0]),
@@ -6195,9 +6257,18 @@ def _build_execution_bundle(
                 chosen_tile = int(t)
                 break
 
+        _frozen_ws_policy = (
+            None if _frozen_admission is None
+            else _frozen_admission.get("working_set")
+        )
+        _frozen_external = bool(
+            _frozen_ws_policy
+            and str(_frozen_ws_policy.get("class")) == WORKING_SET_EXTERNAL
+        )
         if plan is None and _bounded and not effective_gpu:
-            # M3: no in-memory plan and no RAM tile fits. The next class is the
-            # external working set (disk spool), priced BEFORE any gauge/cache.
+            # M3/M4: no in-memory plan and no RAM tile fits. The next class is
+            # the external working set (disk spool), priced BEFORE any work. A
+            # resumed external run reuses its FROZEN tile and column batch.
             external_selection = _select_external_fallback(
                 permitted_tiles=permitted_tiles,
                 worst_patch_hw=worst_patch_hw,
@@ -6207,6 +6278,16 @@ def _build_execution_bundle(
                 halo_px=_halo,
                 cache_root=cache_root,
                 storage_profile=_profile,
+                frozen_tile=(
+                    int(_frozen_ws_policy["tile_px"])
+                    if _frozen_external else None
+                ),
+                frozen_batch=(
+                    int(_frozen_ws_policy["column_batch"])
+                    if _frozen_external
+                    and _frozen_ws_policy.get("column_batch") is not None
+                    else None
+                ),
             )
             if not external_selection.get("refused"):
                 _ext_ws = int(
@@ -6231,6 +6312,13 @@ def _build_execution_bundle(
                 }
                 chosen_tile = int(external_selection["tile"])
         if plan is None:
+            if _frozen_external and not _bounded:
+                raise zpar.ModeInfeasible(
+                    "the frozen working-set class external_spool requires the "
+                    "bounded storage profile, but storage_profile=dense is "
+                    "explicitly requested. Remedy: use AUTO/bounded or start a "
+                    "new run/output folder."
+                )
             if _frozen_admission is not None:
                 # FAIL CLOSED: the frozen tile cannot be honoured here. Never
                 # shrink the tile, never switch the backend, never relayout and
@@ -6384,6 +6472,7 @@ def _build_execution_bundle(
 
         cell_tasks = []
         _external_task_info = None
+        _owner_token, _owner_record = _external_owner_identity()
         if chosen_mode == "external":
             _external_task_info = {
                 "class": WORKING_SET_EXTERNAL,
@@ -6393,6 +6482,8 @@ def _build_execution_bundle(
                 "disk_envelope_bytes": int(
                     external_selection["disk_envelope_bytes"]
                 ),
+                "owner_token": _owner_token,
+                "owner_record": dict(_owner_record),
             }
         for (cell, patch, mem, cache_dir, inmem_b, stream_b, gpu_stream_b) in cell_specs:
             if inmem_b is None:
@@ -6473,6 +6564,7 @@ def _build_execution_bundle(
             refusal=None,
         )
         layout["stack_working_set"] = stack_working_set
+        working_set_block["owner_token"] = _owner_token
         layout["working_set"] = working_set_block
 
         cpu_fallback_info = {
@@ -11339,6 +11431,19 @@ def _run_single(
     resume_run_id=None,
     stop_channel=None,
 ):
+    # M4: external working-set lifecycle accounting (strict JSON, additive).
+    _ext_lifecycle = {
+        "schema": "zemosaic-zegrid-external-lifecycle-v1",
+        "attempts_created": 0,
+        "attempts_discarded_stale": 0,
+        "cleaned_committed": 0,
+        "cells_executed_external": 0,
+        "cells_reused_committed": 0,
+        "spool_bytes_written": 0,
+        "spool_bytes_read": 0,
+        "spool_retained_after_failed_commit": 0,
+        "cleanup_failures": [],
+    }
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     # ZM-ZEGRID-R53: ONE validated effective halo width for this run. The product
@@ -13000,6 +13105,23 @@ def _run_single(
         f"{_ws_extra}backend={science_config.backend}",
         callback=progress_callback,
     )
+    if (
+        int(_ext_lifecycle.get("cells_executed_external", 0)) > 0
+        or int(_ext_lifecycle.get("cells_reused_committed", 0)) > 0
+        or int(_ext_lifecycle.get("attempts_discarded_stale", 0)) > 0
+    ):
+        _emit(
+            "ZeGrid: external lifecycle — attempts_created="
+            f"{_ext_lifecycle['attempts_created']} stale_discarded="
+            f"{_ext_lifecycle['attempts_discarded_stale']} "
+            f"committed_cleaned={_ext_lifecycle['cleaned_committed']} "
+            f"executed={_ext_lifecycle['cells_executed_external']} "
+            f"reused={_ext_lifecycle['cells_reused_committed']} "
+            f"spool_bytes={_ext_lifecycle['spool_bytes_written']}/"
+            f"{_ext_lifecycle['spool_bytes_read']} "
+            f"cleanup_failures={len(_ext_lifecycle['cleanup_failures'])}",
+            callback=progress_callback,
+        )
     _emit(
         f"ZeGrid: per-cell concurrency — cells_in_flight={cells_in_flight} "
         f"(cpu={os.cpu_count()}, plan_raw={available_now / 2**30:.2f}GiB, "
@@ -14186,7 +14308,49 @@ def _run_single(
                                     backend=_receipt.backend,
                                     plan_generation=int(wave_generation),
                                 )
+                                # M4: COMMIT-THEN-DELETE. The Cell is durable;
+                                # only now may its external spool be removed.
+                                # A cleanup failure is accounted, never fatal.
+                                try:
+                                    _ws_b = (
+                                        _current_bundle().working_set_block or {}
+                                    )
+                                except Exception:
+                                    _ws_b = {}
+                                if _ws_b.get("class") == WORKING_SET_EXTERNAL:
+                                    try:
+                                        _root_b = (_ws_b.get("disk") or {}).get(
+                                            "spool_root"
+                                        )
+                                        _rep_b = zext.cleanup_after_commit(
+                                            _root_b,
+                                            _cid,
+                                            owner_token=_ws_b.get("owner_token"),
+                                        )
+                                        _ext_lifecycle["attempts_created"] += 1
+                                        _ext_lifecycle["cells_executed_external"] += 1
+                                        _ext_lifecycle["attempts_discarded_stale"] += int(
+                                            _rep_b.get("discarded_same_owner", 0)
+                                        ) + int(_rep_b.get("discarded_stale", 0))
+                                        _ext_lifecycle["cleaned_committed"] += int(
+                                            _rep_b.get("cleaned_committed", 0)
+                                        )
+                                        _ext_lifecycle["spool_bytes_written"] += int(
+                                            _ws_b["disk"]["cumulative_writes_bytes"]
+                                        )
+                                        _ext_lifecycle["spool_bytes_read"] += int(
+                                            _ws_b["disk"]["cumulative_reads_bytes"]
+                                        )
+                                        _ext_lifecycle["cleanup_failures"].extend(
+                                            _rep_b.get("failures", [])
+                                        )
+                                    except Exception as _ext_clean_exc:
+                                        _ext_lifecycle["cleanup_failures"].append({
+                                            "cell_id": _cid,
+                                            "error": f"{type(_ext_clean_exc).__name__}: {_ext_clean_exc}",
+                                        })
                             except zrs.RunStoreError as _store_exc:
+                                _ext_lifecycle["spool_retained_after_failed_commit"] += 1
                                 _store_state["publishing"] = False
                                 _store_state["degraded_reason"] = (
                                     f"{type(_store_exc).__name__}: "
@@ -16380,6 +16544,62 @@ def _run_single(
                 _store_state["state_path"] = str(
                     zres.state_path(_store.root)
                 )
+                # M4: persist the selected working-set class at the FIRST state
+                # write AFTER selection. backend/tile/parity are never rewritten.
+                try:
+                    _ws_identity = (
+                        getattr(_current_bundle(), "working_set_block", None)
+                        or getattr(_initial_bundle, "working_set_block", None)
+                        or {}
+                    )
+                    if _ws_identity.get("class"):
+                        zres.attach_working_set(
+                            _store.root,
+                            {
+                                "class": str(_ws_identity["class"]),
+                                "tile_px": int(
+                                    _ws_identity.get("tile_size") or 0
+                                ),
+                                "column_batch": (
+                                    None
+                                    if _ws_identity.get("column_batch") is None
+                                    else int(_ws_identity["column_batch"])
+                                ),
+                            },
+                        )
+                except Exception as _ws_identity_exc:
+                    _emit(
+                        "ZeGrid: working-set identity could not be frozen "
+                        f"({type(_ws_identity_exc).__name__}: "
+                        f"{_ws_identity_exc}); a resume stays conservative.",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+                # M4: clean stale/orphan attempts BEFORE the first Cell. A
+                # committed Cell's leftover spool is cleaned without recompute;
+                # a live owner's spool is never stolen.
+                try:
+                    _ws_scan = (
+                        getattr(_current_bundle(), "working_set_block", None)
+                        or getattr(_initial_bundle, "working_set_block", None)
+                        or {}
+                    )
+                    if _ws_scan.get("class") == WORKING_SET_EXTERNAL:
+                        _scan = zext.scan_spool_root(
+                            (_ws_scan.get("disk") or {}).get("spool_root"),
+                            owner_token=_ws_scan.get("owner_token"),
+                        )
+                        _ext_lifecycle["attempts_discarded_stale"] += int(
+                            _scan.get("discarded_stale", 0)
+                        ) + int(_scan.get("discarded_same_owner", 0))
+                        _ext_lifecycle["cleaned_committed"] += int(
+                            _scan.get("cleaned_committed", 0)
+                        )
+                        _ext_lifecycle["cleanup_failures"].extend(
+                            _scan.get("failures", [])
+                        )
+                except Exception:
+                    pass
                 # REWORK-1: persist the COMPLETE gauge and the frozen geometry
                 # BEFORE any cell is admitted. A restart then restores both and
                 # never re-runs compute_global_gauge or the layout search.
@@ -17845,6 +18065,14 @@ def _run_single(
     # M4: resume audit (selected run, restored policy, sparse pending set).
     # Never payloads, never arrays.
     per_cell_diagnostics["r55_resume"] = dict(_resume_runtime)
+    # M4: external lifecycle accounting (additive, strict JSON).
+    try:
+        _ext_lifecycle["cells_reused_committed"] = int(
+            _store_state.get("released_cells", 0)
+        )
+    except Exception:
+        pass
+    per_cell_diagnostics["external_lifecycle"] = dict(_ext_lifecycle)
     # M3: the working-set class + dry-plan/disk facts (additive manifest block).
     try:
         per_cell_diagnostics["working_set"] = getattr(
@@ -18945,6 +19173,16 @@ def _write_outputs(
         ),
         "gauge_diagnostics": (gauge_diagnostics or {}),
         "per_cell_diagnostics": (per_cell_diagnostics or {}),
+        **(
+            {
+                "external_lifecycle": (
+                    per_cell_diagnostics or {}
+                ).get("external_lifecycle"),
+            }
+            if isinstance(per_cell_diagnostics, dict)
+            and (per_cell_diagnostics.get("external_lifecycle") is not None)
+            else {}
+        ),
         # M3: additive working-set class + dry-plan/disk facts. Omitted when no
         # working-set block was produced, so legacy/observe bytes stay identical.
         **(

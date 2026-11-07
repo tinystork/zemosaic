@@ -362,12 +362,19 @@ def test_manifest_roundtrip_and_cleanup(tmp_path):
     assert not attempt.exists()
 
 
-def test_stale_attempt_is_refused(tmp_path):
+def test_stale_attempt_is_discarded_by_default_and_refused_on_request(tmp_path):
     stale = tmp_path / "cellA" / "attempt0"
     stale.mkdir(parents=True)
     (stale / "leftover.bin").write_bytes(b"x")
+    # M4: an owner-less/dead stale attempt is DISCARDED (fresh attempt), never
+    # silently reused as complete.
+    spool = xstream.ExternalSpool(_spec(tmp_path))
+    assert spool.state == xstream.SPOOL_STATE_WRITING
+    spool.cleanup()
+    stale.mkdir(parents=True)
+    (stale / "leftover.bin").write_bytes(b"x")
     with pytest.raises(xstream.ExternalSpoolStaleError):
-        xstream.ExternalSpool(_spec(tmp_path))
+        xstream.ExternalSpool(_spec(tmp_path, stale_policy="refuse"))
 
 
 @pytest.mark.parametrize(

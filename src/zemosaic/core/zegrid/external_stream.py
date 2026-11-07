@@ -90,6 +90,15 @@ __all__ = [
     "ExternalSpoolCorruptError",
     "ExternalSpoolWriteError",
     "ExternalDiskShortfall",
+    "ExternalSpoolLiveOwnerError",
+    "ExternalSpoolCommittedError",
+    "SPOOL_STATE_WRITING",
+    "SPOOL_STATE_READY",
+    "SPOOL_STATE_COMMITTED",
+    "classify_attempt",
+    "discard_stale_for_cell",
+    "cleanup_after_commit",
+    "scan_spool_root",
     "ExternalBudgetError",
     "ExternalSpoolSpec",
     "TileSpool",
@@ -106,6 +115,13 @@ SPOOL_MANIFEST_NAME = "manifest.json"
 SPOOL_OWNER_NAME = "ATTEMPT"
 IMAGES_NAME = "images.npy"
 WEIGHTS_NAME = "weights.npy"
+
+#: Transactional attempt states (M4). The spool is never reusable as a
+#: completed Cell until the durable store commit exists; the caller marks it.
+SPOOL_STATE_WRITING = "writing"
+SPOOL_STATE_READY = "ready"
+SPOOL_STATE_COMMITTED = "committed"
+SPOOL_STATES = (SPOOL_STATE_WRITING, SPOOL_STATE_READY, SPOOL_STATE_COMMITTED)
 
 #: Reduction bytes per (pixel-channel position x frame), excluding the optional
 #: in-flight rejection booleans (counted separately): img f32 (4) + orig f64 (8)
@@ -154,7 +170,24 @@ class ExternalSpoolWriteError(ExternalSpoolError):
 
 
 class ExternalDiskShortfall(ExternalSpoolError):
-    """A cell boundary refused to start: free space < the admitted envelope."""
+    """A cell boundary refused to start: free space < the admitted envelope.
+
+    Resumable: the run may be relaunched after freeing space; already-committed
+    Cells remain valid and must not be recomputed.
+    """
+
+    resumable = True
+    committed_cells_intact = True
+
+
+class ExternalSpoolLiveOwnerError(ExternalSpoolError):
+    """An existing spool is owned by a PROVABLY LIVE other owner (never steal)."""
+
+
+class ExternalSpoolCommittedError(ExternalSpoolError):
+    """The attempt belongs to a Cell already committed; clean it, do not reuse."""
+
+    committed = True
 
 
 class ExternalBudgetError(ExternalSpoolError, ValueError):
@@ -257,6 +290,14 @@ class ExternalSpoolSpec:
     attempt_id: str = "attempt"
     frame_ids: tuple | None = None
     created_unix_ns: int | None = None
+    # M4 transactional ownership. ``owner_token`` is an opaque run-level
+    # identity; ``owner_record`` is the run-store owner document used by the
+    # liveness predicate (never PID-only).
+    owner_token: str | None = None
+    owner_record: dict | None = None
+    owner_liveness: object | None = None
+    stale_policy: str = "discard"  # discard | refuse
+    retain_on_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -297,6 +338,237 @@ class TileSpool:
 
 
 # ---------------------------------------------------------------------------
+# M4 — transactional attempt classification / stale-or-orphan handling
+# ---------------------------------------------------------------------------
+
+def _dir_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for entry in Path(path).rglob("*"):
+            if entry.is_file():
+                try:
+                    total += int(entry.stat().st_size)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return int(total)
+
+
+def _read_attempt_marker(attempt_dir: Path) -> dict | None:
+    path = Path(attempt_dir) / SPOOL_OWNER_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a missing/corrupt marker is stale
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _owner_alive(record, liveness) -> bool:
+    if record is None:
+        return False
+    if liveness is not None:
+        try:
+            return bool(liveness(record))
+        except Exception:  # noqa: BLE001 - unprovable liveness is NOT alive
+            return False
+    try:
+        from . import run_store as _run_store
+
+        return bool(_run_store.owner_is_live(record))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _handle_existing_attempt(
+    attempt_dir: Path,
+    *,
+    owner_token,
+    owner_liveness,
+    stale_policy: str,
+) -> str:
+    """Classify an existing attempt dir; return 'live' or 'discarded'.
+
+    A committed attempt is never reused (raise); a same-owner incomplete
+    attempt is discarded (a retry gets a fresh attempt); another owner's spool
+    is only refused, never stolen.
+    """
+    marker = _read_attempt_marker(attempt_dir)
+    if marker is None:
+        if stale_policy == "refuse":
+            raise ExternalSpoolStaleError(
+                f"spool attempt has no valid owner marker: {attempt_dir}"
+            )
+        shutil.rmtree(attempt_dir, ignore_errors=True)
+        return "discarded"
+    state = str(marker.get("state") or "")
+    if state == SPOOL_STATE_COMMITTED:
+        raise ExternalSpoolCommittedError(
+            f"spool attempt belongs to a committed Cell: {attempt_dir}"
+        )
+    existing_token = marker.get("owner_token")
+    if owner_token is not None and existing_token == owner_token:
+        if stale_policy == "refuse":
+            raise ExternalSpoolStaleError(
+                f"same-owner incomplete attempt is refused: {attempt_dir}"
+            )
+        shutil.rmtree(attempt_dir, ignore_errors=True)
+        return "discarded"
+    if _owner_alive(marker.get("owner_record"), owner_liveness):
+        return "live"
+    # Liveness that cannot be PROVEN from a recorded owner document is never
+    # treated as death: stealing an unprovable owner's spool is forbidden.
+    if marker.get("owner_record") is None:
+        raise ExternalSpoolStaleError(
+            "cannot prove the existing attempt owner is dead (no owner "
+            f"record); refusing to steal it: {attempt_dir}"
+        )
+    if stale_policy == "refuse":
+        raise ExternalSpoolStaleError(
+            f"stale attempt from a dead owner is refused: {attempt_dir}"
+        )
+    shutil.rmtree(attempt_dir, ignore_errors=True)
+    return "discarded"
+
+
+def classify_attempt(attempt_dir, *, owner_liveness=None) -> dict:
+    """Strict JSON-safe classification of ONE attempt directory."""
+    path = Path(attempt_dir)
+    marker = _read_attempt_marker(path)
+    if marker is None:
+        return {
+            "path": str(path), "state": None, "owner_token": None,
+            "cell_id": None, "attempt_id": None, "committed": False,
+            "owner_alive": False, "has_manifest": (path / SPOOL_MANIFEST_NAME).exists(),
+            "bytes": _dir_bytes(path),
+        }
+    state = str(marker.get("state") or "")
+    return {
+        "path": str(path),
+        "state": state or None,
+        "owner_token": marker.get("owner_token"),
+        "cell_id": marker.get("cell_id"),
+        "attempt_id": marker.get("attempt_id"),
+        "committed": state == SPOOL_STATE_COMMITTED,
+        "owner_alive": _owner_alive(marker.get("owner_record"), owner_liveness),
+        "has_manifest": (path / SPOOL_MANIFEST_NAME).exists(),
+        "bytes": _dir_bytes(path),
+    }
+
+
+def discard_stale_for_cell(
+    root,
+    cell_id: str,
+    *,
+    owner_token=None,
+    owner_liveness=None,
+    committed_cell_ids=(),
+) -> dict:
+    """Clean stale/orphan attempts of ONE Cell; never touch a live owner.
+
+    A Cell already present in ``committed_cell_ids`` is authoritative: its
+    leftover spool is cleaned WITHOUT touching the commit and MUST NOT be
+    recomputed. A committed attempt is always cleaned. A same-owner incomplete
+    attempt is discarded (fresh retry). Another live owner's attempt is skipped.
+    """
+    root_path = _require_root(root)
+    cell = _require_component(cell_id, "cell_id")
+    cell_dir = _confined_child(root_path, cell)
+    report = {
+        "schema": "zemosaic-zegrid-external-spool-scan-v1",
+        "cell_id": cell,
+        "committed_cell": cell in set(committed_cell_ids or ()),
+        "attempts_seen": 0,
+        "discarded_stale": 0,
+        "discarded_same_owner": 0,
+        "cleaned_committed": 0,
+        "live_skipped": 0,
+        "bytes_freed": 0,
+        "failures": [],
+    }
+    if not cell_dir.is_dir():
+        return report
+    for attempt in sorted(p for p in cell_dir.iterdir() if p.is_dir()):
+        report["attempts_seen"] += 1
+        info = classify_attempt(attempt, owner_liveness=owner_liveness)
+        state = info["state"]
+        is_committed = bool(info["committed"] or report["committed_cell"])
+        if is_committed:
+            action = "cleaned_committed"
+        elif owner_token is not None and info["owner_token"] == owner_token:
+            action = "discarded_same_owner"
+        elif info["owner_alive"]:
+            action = "live_skipped"
+        else:
+            action = "discarded_stale"
+        if action == "live_skipped":
+            report["live_skipped"] += 1
+            continue
+        try:
+            shutil.rmtree(attempt, ignore_errors=False)
+            report[action] += 1
+            report["bytes_freed"] += int(info["bytes"])
+        except Exception as exc:  # noqa: BLE001 - accounted, never fatal
+            report["failures"].append(
+                {"path": str(attempt), "error": f"{type(exc).__name__}: {exc}"}
+            )
+    return report
+
+
+def cleanup_after_commit(root, cell_id: str, *, owner_token=None) -> dict:
+    """Post-commit spool cleanup for ONE Cell (commit is authoritative)."""
+    return discard_stale_for_cell(
+        root,
+        cell_id,
+        owner_token=owner_token,
+        committed_cell_ids=(cell_id,),
+    )
+
+
+def scan_spool_root(
+    root,
+    *,
+    owner_token=None,
+    owner_liveness=None,
+    committed_cell_ids=(),
+) -> dict:
+    """Scan every Cell spool under ``root`` and clean stale/orphan attempts."""
+    root_path = _require_root(root)
+    totals = {
+        "schema": "zemosaic-zegrid-external-spool-scan-root-v1",
+        "cells_scanned": 0,
+        "attempts_seen": 0,
+        "discarded_stale": 0,
+        "discarded_same_owner": 0,
+        "cleaned_committed": 0,
+        "live_skipped": 0,
+        "bytes_freed": 0,
+        "failures": [],
+    }
+    try:
+        cell_dirs = sorted(p for p in root_path.iterdir() if p.is_dir())
+    except OSError as exc:
+        totals["failures"].append({"path": str(root_path), "error": str(exc)})
+        return totals
+    for cell_dir in cell_dirs:
+        totals["cells_scanned"] += 1
+        report = discard_stale_for_cell(
+            root_path,
+            cell_dir.name,
+            owner_token=owner_token,
+            owner_liveness=owner_liveness,
+            committed_cell_ids=committed_cell_ids,
+        )
+        for key in (
+            "attempts_seen", "discarded_stale", "discarded_same_owner",
+            "cleaned_committed", "live_skipped", "bytes_freed",
+        ):
+            totals[key] += int(report.get(key, 0))
+        totals["failures"].extend(report.get("failures", []))
+    return totals
+
+
+# ---------------------------------------------------------------------------
 # Spool writer / lifecycle
 # ---------------------------------------------------------------------------
 
@@ -330,21 +602,37 @@ class ExternalSpool:
         else:
             self.frame_ids = None
         self.created_unix_ns = int(spec.created_unix_ns or time.time_ns())
+        self.owner_token = spec.owner_token
+        self.owner_record = (None if spec.owner_record is None else dict(spec.owner_record))
+        self._owner_liveness = spec.owner_liveness
+        self.stale_policy = str(spec.stale_policy)
+        if self.stale_policy not in ("discard", "refuse"):
+            raise ValueError("stale_policy must be 'discard' or 'refuse'")
+        self.retain_on_failure = bool(spec.retain_on_failure)
         self._tiles: list[TileSpool] = []
         self._finalized = False
         self._cleaned = False
+        self.state = SPOOL_STATE_WRITING
 
         cell_dir = _confined_child(self.root, self.cell_id)
         self.cell_dir = cell_dir
         attempt_dir = _confined_child(cell_dir, self.attempt_id)
         if attempt_dir.exists():
             if any(attempt_dir.iterdir()):
-                raise ExternalSpoolStaleError(
-                    f"spool attempt directory is not empty and is refused as "
-                    f"stale: {attempt_dir}"
+                resolved = _handle_existing_attempt(
+                    attempt_dir,
+                    owner_token=self.owner_token,
+                    owner_liveness=self._owner_liveness,
+                    stale_policy=self.stale_policy,
                 )
-        else:
-            attempt_dir.mkdir(parents=True, exist_ok=False)
+                if resolved == "live":
+                    raise ExternalSpoolLiveOwnerError(
+                        f"spool attempt {attempt_dir} belongs to a provably "
+                        "live owner; refusing to steal it"
+                    )
+            else:
+                attempt_dir.rmdir()
+        attempt_dir.mkdir(parents=True, exist_ok=False)
         self.attempt_dir = attempt_dir
         marker = {
             "schema": SPOOL_SCHEMA,
@@ -356,8 +644,36 @@ class ExternalSpool:
             "width": int(self.width),
             "channels": int(self.channels),
             "halo_px": int(self.halo_px),
+            "state": SPOOL_STATE_WRITING,
+            "owner_token": self.owner_token,
+            "owner_record": self.owner_record,
         }
         _atomic_json(attempt_dir / SPOOL_OWNER_NAME, marker)
+
+    # -- transactional state -------------------------------------------------
+    def mark_state(self, state: str) -> dict:
+        if state not in SPOOL_STATES:
+            raise ValueError(f"unknown spool state {state!r}")
+        if self._cleaned:
+            raise ExternalSpoolStaleError("spool already cleaned")
+        marker_path = self.attempt_dir / SPOOL_OWNER_NAME
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise ExternalSpoolCorruptError(
+                f"cannot read attempt marker {marker_path}"
+            ) from exc
+        marker["state"] = str(state)
+        marker["updated_unix_ns"] = int(time.time_ns())
+        _atomic_json(marker_path, marker)
+        self.state = str(state)
+        return marker
+
+    def mark_ready(self) -> dict:
+        return self.mark_state(SPOOL_STATE_READY)
+
+    def mark_committed(self) -> dict:
+        return self.mark_state(SPOOL_STATE_COMMITTED)
 
     # -- lifecycle ----------------------------------------------------------
     @property
@@ -1008,6 +1324,13 @@ def run_cell_streaming_external(
     cell_id: str = "cell",
     attempt_id: str = "attempt",
     keep_spool: bool = False,
+    cleanup_on_success: bool = True,
+    spool_out: dict | None = None,
+    owner_token: str | None = None,
+    owner_record: dict | None = None,
+    owner_liveness=None,
+    stale_policy: str = "discard",
+    retain_on_failure: bool = False,
 ) -> CanonicalStackResult:
     """External-working-set execution of ONE canonical request.
 
@@ -1082,6 +1405,11 @@ def run_cell_streaming_external(
         cell_id=cell_id,
         attempt_id=attempt_id,
         frame_ids=tuple(provider.frame_ids) if hasattr(provider, "frame_ids") else None,
+        owner_token=owner_token,
+        owner_record=owner_record,
+        owner_liveness=owner_liveness,
+        stale_policy=stale_policy,
+        retain_on_failure=retain_on_failure,
     )
     spool = ExternalSpool(spec)
     try:
@@ -1133,14 +1461,30 @@ def run_cell_streaming_external(
         spool.finalize_manifest(
             taper_kind=taper_kind, taper_px=taper_px, taper_floor=taper_floor
         )
+        # M4: the attempt is READY (result computed) but NOT committed. The
+        # caller commits the Cell durably first, then cleans it.
+        spool.mark_ready()
+        if spool_out is not None:
+            manifest = spool.load_manifest()
+            payload = int(manifest.get("total_payload_bytes", 0))
+            spool_out.update({
+                "attempt_id": str(spool.attempt_id),
+                "spool_root": str(spool.root),
+                "attempt_dir": str(spool.attempt_dir),
+                "state": SPOOL_STATE_READY,
+                "bytes_written": int(payload),
+                "bytes_read": int(payload),
+                "tile_count": int(manifest.get("tile_count", 0)),
+            })
     except BaseException:
-        try:
-            spool.cleanup()
-        except Exception:
-            pass
+        if not retain_on_failure:
+            try:
+                spool.cleanup()
+            except Exception:
+                pass
         raise
 
-    if not keep_spool:
+    if cleanup_on_success and not keep_spool:
         spool.cleanup()
 
     (science, weight_sum, valid_mask, surviving, support_w1, support_w2, n_eff, agg) = (

@@ -397,12 +397,16 @@ def validate_admission(admission: Any) -> dict:
                 "admission.working_set.class must be inmem|ram_tile|external_spool"
             )
         ws_tile = _as_int(
-            working_set["tile_px"], "admission.working_set.tile_px", minimum=1
+            working_set["tile_px"], "admission.working_set.tile_px", minimum=0
         )
         ws_batch = working_set["column_batch"]
         if ws_batch is not None:
             ws_batch = _as_int(
                 ws_batch, "admission.working_set.column_batch", minimum=1
+            )
+        if ws_class != "inmem" and int(ws_tile) < 1:
+            raise ResumeStateError(
+                "admission.working_set.tile_px must be >= 1 for a tiled class"
             )
         if ws_class == "external_spool" and (ws_tile is None or ws_batch is None):
             raise ResumeStateError(
@@ -579,6 +583,59 @@ def write_state(
         state_path(root), zrs.canonical_json(state), tmp_dir=tmp_dir
     )
     return state
+
+
+def attach_working_set(
+    run_root: str | os.PathLike[str],
+    working_set: Mapping[str, Any],
+) -> dict:
+    """Append the selected working-set class to the FROZEN admission (M4).
+
+    Called at the FIRST state write AFTER selection. It never rewrites the
+    frozen backend/tile/parity values: it only adds the ``working_set`` section
+    (or verifies the exact same section on a resume). A conflicting section is
+    refused; the caller must never silently re-derive the class.
+    """
+    state = read_state(run_root)
+    admission = state.get("admission")
+    if admission is None:
+        raise ResumeStateError(
+            "cannot attach a working set: the run has no frozen admission"
+        )
+    candidate = build_admission(
+        backend=admission["backend"],
+        tile_px=admission["tile_px"],
+        parity_qualified=admission["parity_qualified"],
+        working_set=working_set,
+    )["working_set"]
+    existing = admission.get("working_set")
+    if existing is not None:
+        if existing != candidate:
+            raise ResumeStateError(
+                "frozen working_set "
+                f"{existing!r} cannot be replaced by {candidate!r}; the run "
+                "identity is not silently changed"
+            )
+        return state
+    new_admission = build_admission(
+        backend=admission["backend"],
+        tile_px=admission["tile_px"],
+        parity_qualified=admission["parity_qualified"],
+        working_set=candidate,
+    )
+    return write_state(
+        run_root,
+        run_id=state["run_id"],
+        expected_cell_ids=state["expected_cell_ids"],
+        policy=state["policy"],
+        plan_generation=int(state["plan_generation"]),
+        finalized=bool(state["finalized"]),
+        gauge_sha256=state.get("gauge_sha256"),
+        outputs=state.get("outputs"),
+        created_unix_ns=int(state["created_unix_ns"]),
+        note=state.get("note"),
+        admission=new_admission,
+    )
 
 
 def update_policy(
