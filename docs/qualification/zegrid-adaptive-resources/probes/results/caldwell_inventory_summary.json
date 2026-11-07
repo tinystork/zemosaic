@@ -1,0 +1,16 @@
+{
+  "filename_tokens": {
+    "IRCUT": 816,
+    "Light": 816
+  },
+  "first": "Light_mosaic_C 11_30.0s_IRCUT_20250710-005358.fit",
+  "inventory_path": "docs/qualification/zegrid-adaptive-resources/probes/results/caldwell_ircut_inventory.jsonl",
+  "last": "Light_mosaic_C 11_30.0s_IRCUT_20250802-060327.fit",
+  "n_files": 816,
+  "ordered_inventory_sha256": "fb36d68355f1c547c653aed50c19c93e5d4cdeeeb9ba7177efc311c04c2a29e8",
+  "phase": "caldwell-inventory",
+  "root": "/home/tristan/caldwell11/lights organized/EQ/IRCUT",
+  "seconds": 13.685,
+  "total_bytes": 3393936000,
+  "wall_seconds_total": 13.708
+}

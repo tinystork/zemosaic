@@ -1,0 +1,50 @@
+{
+  "admission": {
+    "headroom_before_margin_mib": 642.4000005722046,
+    "max_raw_bytes_for_budget": 9055593516,
+    "max_raw_mib": 8636.08695602417,
+    "minimum_aggregate_exceeds_budget": true,
+    "minimum_aggregate_mib": 14856.667737960815,
+    "minimum_raw_mib": 12918.84151172638,
+    "note": "stack is charged once and the aggregate adds the 15% margin plus gauge/cache phases; the PLAN-accepted stack alone leaves less than the margin requires",
+    "stack_mib": 9289.1
+  },
+  "estimator_fit": {
+    "err_mib": 8.169335937500364,
+    "estimate_mib": 9280.9306640625,
+    "patch_hw": [
+      659,
+      502
+    ],
+    "patch_px": 330818
+  },
+  "footprints": {
+    "cache_1_worker_bytes": 367870636,
+    "cache_per_cell_1_worker_bytes": 367870636,
+    "gauge_1_worker_bytes": 3081673360,
+    "patch_px_nominal": 315411,
+    "process_baseline_bytes": 356515840
+  },
+  "logged": {
+    "budget_mib": 9931.5,
+    "canvas_px": 75698820,
+    "cells": 240,
+    "layout": [
+      12,
+      20
+    ],
+    "margin": [
+      15,
+      100
+    ],
+    "n_frames": 21818,
+    "plan_factor": [
+      4,
+      5
+    ],
+    "ram_available_at_setup_mib": 12414.3125,
+    "stream_at_20_mib": 9289.1,
+    "tile_px": 20
+  },
+  "wall_seconds_total": 1.283
+}

@@ -1,0 +1,28 @@
+{
+  "corpus_sha256": "e44d9e27fe7e55b430f999805010f170349b3a56dd83723faca4aef4931e6a72",
+  "counters": {
+    "degenerate_cell_count": 0,
+    "initial_sample_count": 557301,
+    "iterations_used": 5,
+    "low_n_cell_count": 0,
+    "rejected_fraction": 0.00933965666668461,
+    "rejected_sample_count": 5205
+  },
+  "n_frames": 48,
+  "peak_delta_over_pre_arrays_bytes": 30937088,
+  "phase": "witness-inmem",
+  "rss_before_bytes": 141316096,
+  "science_dtype": "float32",
+  "science_sha256": "266a0d2b43ef061048cfc66b35a6caf45a92976981c68fca47e2ec50c1edae7d",
+  "seconds": 0.472,
+  "shape": [
+    64,
+    64,
+    3
+  ],
+  "support_w1_sum": 35361.477194902196,
+  "support_w2_sum": 8098.40143717604,
+  "surviving_count_sha256": "0d3c0a67a37e2c47bb6ca5b675ebd48f93b4bab6b34fc538ae274431d4465991",
+  "vmhwm_bytes": 172253184,
+  "wall_seconds_total": 2.021
+}

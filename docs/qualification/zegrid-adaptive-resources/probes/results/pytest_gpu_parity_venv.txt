@@ -1,0 +1,13 @@
+..............................                                           [100%]
+=============================== warnings summary ===============================
+tests/test_sci05_canonical_gpu_parity.py::TestRejectionParity::test_all_invalid_and_mixed_validity
+  /home/tristan/.openclaw/workspace/worktrees/zemosaic-adaptive-resources/src/zemosaic/core/canonical_stacking.py:1472: RuntimeWarning: invalid value encountered in subtract
+    diff = v_hi - v_lo
+
+tests/test_sci05_canonical_gpu_parity.py::TestQuantileBitExact::test_quantile_bit_exact_vs_numpy
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/lib/python3.13/site-packages/numpy/lib/_nanfunctions_impl.py:1593: RuntimeWarning: All-NaN slice encountered
+    return fnb._ureduce(a,
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+30 passed, 2 warnings in 4.87s
+exit=0

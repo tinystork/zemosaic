@@ -1,0 +1,19 @@
+{
+  "allocation_bytes": 67108864,
+  "compute_capability": [
+    6,
+    1
+  ],
+  "cuda_device_count": 1,
+  "cuda_runtime": 12090,
+  "cupy": "14.1.1",
+  "device_name": "NVIDIA GeForce MX150",
+  "mem_free_after_bytes": 2048524288,
+  "mem_free_before_bytes": 2050621440,
+  "mem_total_bytes": 2091253760,
+  "phase": "gpu-smoke",
+  "status": "PASS_SMOKE",
+  "sum": 16777216.0,
+  "sum_expected": 16777216.0,
+  "wall_seconds_total": 2.688
+}
