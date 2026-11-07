@@ -18187,12 +18187,50 @@ def _run_single(
             r37_capture=r37_diagnostic_capture,
             r40_capture=r40_seam_capture,
         )
+        # A4: bounded assembly falls back to a scratch-backed canvas when the
+        # anonymous 121 B/px canvas does not fit the observed RAM budget. The
+        # scratch-backed canvas keeps science bit-identical (the allocator backs
+        # every canonical accumulator plane) and the final FITS is serialized in
+        # row-bands (no full-canvas copy at the last step).
+        _assembly_scratch_dir = (
+            Path(_temp_root) / "zegrid-canvas-scratch"
+            if _store_backed_results else None
+        )
+        _backing = "anonymous"
+        _assembly_allocator = None
         try:
             assembled, feather_info, _bounded_preflight, _assembly_allocator = _assemble_cells_guarded(
                 canvas, nx, ny, _gauge_mode, cores, result_by_cid,
                 bounded_results=(results if _store_backed_results else None),
                 purpose="assembly",
-                canvas_backing="anonymous",
+                canvas_backing=_backing,
+                halo_px=int(halo_px), emit=_emit_live,
+                capture=r37_diagnostic_capture,
+                holdout_cap=r37_diagnostic_holdout_cap,
+                output_dir=output_dir,
+                capture_identity=r37_capture_identity,
+                r40_capture=r40_seam_capture,
+                r40_context=_r40_context,
+                patches=(
+                    results.patches if _store_backed_results else None
+                ),
+            )
+        except zbas.AssemblyCapacityError as _anon_refusal:
+            if not _store_backed_results or _assembly_scratch_dir is None:
+                raise
+            _emit(
+                "ZeGrid: anonymous canvas does not fit the RAM budget "
+                f"({_anon_refusal}); retrying with a scratch-backed canvas "
+                "(bit-identical science, banded FITS serialization)",
+                lvl="WARN", callback=progress_callback,
+            )
+            _backing = "scratch"
+            assembled, feather_info, _bounded_preflight, _assembly_allocator = _assemble_cells_guarded(
+                canvas, nx, ny, _gauge_mode, cores, result_by_cid,
+                bounded_results=(results if _store_backed_results else None),
+                purpose="assembly",
+                canvas_backing=_backing,
+                scratch_dir=_assembly_scratch_dir,
                 halo_px=int(halo_px), emit=_emit_live,
                 capture=r37_diagnostic_capture,
                 holdout_cap=r37_diagnostic_holdout_cap,
@@ -19041,6 +19079,25 @@ def _run_single(
         lvl="SUCCESS",
         callback=progress_callback,
     )
+    # A4: release the scratch-backed canvas planes only AFTER every member is
+    # serialized (the raw science, coverage and any finished outputs are all
+    # already written). Best-effort; a discard failure is a warning, never a
+    # failed run (the files are confined to a run-owned scratch directory).
+    if _assembly_allocator is not None:
+        try:
+            _removed = _assembly_allocator.discard()
+            if _removed:
+                _emit(
+                    f"ZeGrid: scratch-backed canvas planes released "
+                    f"({_removed} file(s))",
+                    callback=progress_callback,
+                )
+        except Exception as _discard_exc:
+            _emit(
+                "ZeGrid: scratch-backed canvas planes could not be released "
+                f"({type(_discard_exc).__name__}: {_discard_exc})",
+                lvl="WARN", callback=progress_callback,
+            )
     return sci_path
 
 
