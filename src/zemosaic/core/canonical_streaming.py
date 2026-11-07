@@ -1951,6 +1951,7 @@ def finalize_streaming_result(
     agg,
     backend_token: str,
     tile_prefetch_plan,
+    backend_requested_token: str | None = None,
 ) -> CanonicalStackResult:
     """Assemble the canonical result from phase-2 arrays (single source).
 
@@ -1958,6 +1959,11 @@ def finalize_streaming_result(
     external (column-batched) executor builds BYTE-IDENTICAL results/provenance
     without duplicating the post-combine/equalization/provenance logic. No
     behaviour change for existing callers.
+
+    ``backend_requested_token`` (additive, default ``None``) lets an executor
+    that fell back report the REQUESTED backend separately from the EFFECTIVE
+    ``backend_token`` (e.g. GPU requested, CPU actually reduced). ``None`` keeps
+    the historical single-token provenance byte-for-byte.
     """
     # --- post-combine RGB equalization (out-of-place, spatial-only) ---
     equalize_info = None
@@ -1992,6 +1998,11 @@ def finalize_streaming_result(
         eq_gains = equalize_info["clipped_gains"]
 
     # --- provenance (mirrors run_canonical_stack exactly) ---
+    requested_backend = (
+        str(backend_token)
+        if backend_requested_token is None
+        else str(backend_requested_token)
+    )
     reference_mode = "explicit" if request.reference_index is not None else "auto"
     excluded_frames = [(int(e.index), e.stage, e.reason) for e in p1.exclusions]
 
@@ -2005,7 +2016,7 @@ def finalize_streaming_result(
         "rejection": {"requested": request.rejection, "effective": _resolve_reject_token(request.rejection)},
         "combine": {"requested": request.combine, "effective": _resolve_method_token(request.combine, _COMBINE_METHODS, "combine")},
         "backend": {
-            "requested": backend_token,
+            "requested": requested_backend,
             "normalization": "cpu",
             "weighting": "cpu",
             "support": "cpu",
@@ -2021,7 +2032,7 @@ def finalize_streaming_result(
             "weighting": _resolve_method_token(request.weighting, _WEIGHT_METHODS, "weighting"),
             "rejection": _resolve_reject_token(request.rejection),
             "combine": _resolve_method_token(request.combine, _COMBINE_METHODS, "combine"),
-            "backend_requested": backend_token,
+            "backend_requested": requested_backend,
             "backend_normalization": "cpu",
             "backend_weighting": "cpu",
             "backend_support": "cpu",

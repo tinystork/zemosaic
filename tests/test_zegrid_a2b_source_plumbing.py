@@ -162,6 +162,54 @@ def test_external_spool_consumes_source_recipe(tmp_path, monkeypatch):
     assert not list(root.rglob("*.npy")), "spool payload must be recycled on success"
 
 
+def test_external_caller_publishes_gpu_fallback(tmp_path, monkeypatch):
+    """F8: the product caller collects and publishes the fallback truth."""
+    descs, canvas, cell, patch, mem = corpus(tmp_path)
+    cfg = MiniTileScienceConfig(
+        normalization="sky_mean", cell_gauge_mode="per_cell", backend="gpu",
+    )
+    init(descs, canvas, cfg)
+    root = tmp_path / "spool"
+    root.mkdir()
+    real_reduce = zz.zext.reduce_spooled_tile
+    calls = {"gpu": 0, "cpu": 0}
+
+    _FakeCupyOOM = type(
+        "OutOfMemoryError", (Exception,), {"__module__": "cupy.cuda.memory"}
+    )
+
+    def _always_oom(tile, p1, request, *, column_batch,
+                    rejection_sink=None, rejection_mask=None, backend="cpu"):
+        calls[backend] += 1
+        if backend == "gpu":
+            raise _FakeCupyOOM("simulated device OOM")
+        return real_reduce(
+            tile, p1, request, column_batch=column_batch,
+            rejection_sink=rejection_sink, rejection_mask=rejection_mask,
+            backend=backend,
+        )
+
+    monkeypatch.setattr(zz.zext, "reduce_spooled_tile", _always_oom)
+    expected_tiles = len(
+        list(zz.zext._iter_tiles(patch.patch_shape_hw[0],
+                                 patch.patch_shape_hw[1], 16))
+    )
+    external = {
+        "tile_size": 16, "column_batch": 48, "spool_root": str(root),
+        "disk_envelope_bytes": 0,
+    }
+    task = zz._cell_task(cell, patch, mem, tmp_path / "no-cache", "external", 1,
+                         "bounded", external_info=external)
+    got = zz._stack_cell(task)
+    storage = got["record"]["storage"]
+    assert calls["gpu"] == 1
+    assert calls["cpu"] == expected_tiles
+    assert storage["gpu_fallback"]["fallback_count"] == 1
+    assert storage["gpu_fallback"]["requested_backend"] == "gpu"
+    assert storage["gpu_fallback"]["fallback_tiles"] == [(0, 0)]
+    assert storage["provider"] == "WindowedCanonicalProvider"
+
+
 def test_source_recipe_and_worker_initializer_under_spawn(tmp_path):
     descs, canvas, cell, patch, mem = corpus(tmp_path)
     cfg = MiniTileScienceConfig(normalization="sky_mean", cell_gauge_mode="per_cell")

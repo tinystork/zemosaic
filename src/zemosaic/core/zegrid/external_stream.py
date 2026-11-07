@@ -1421,6 +1421,12 @@ def run_cell_streaming_external(
     # validates the token and raises for an unavailable GPU (never a silent CPU
     # fallback INSIDE the executor — the ZeGrid orchestrator owns the loud degrade).
     token = _resolve_backend(request.backend)
+    # F8: the REQUESTED backend is kept for provenance; the EFFECTIVE backend
+    # starts identical and becomes "cpu" after the first classified GPU runtime
+    # failure. From then on the whole Cell reduces on CPU (sticky fallback, one
+    # GPU->CPU transition) and the published provenance names the real backend.
+    effective_token = str(token)
+    gpu_active = str(token) == "gpu"
     for attr in ("n_frames", "height", "width", "channels", "original_mono"):
         if not hasattr(provider, attr):
             raise CanonicalStackValidationError(f"provider is missing attribute {attr!r}")
@@ -1496,7 +1502,7 @@ def run_cell_streaming_external(
                 rejection_sink.checkpoint() if rejection_sink is not None else None
             )
             try:
-                if token == "gpu":
+                if gpu_active:
                     try:
                         tile = reduce_spooled_tile(
                             handle, p1, request,
@@ -1516,6 +1522,11 @@ def run_cell_streaming_external(
                             raise
                         if rejection_sink is not None:
                             rejection_sink.rollback(sink_cp)
+                        # F8: sticky fallback — ONE GPU->CPU transition per Cell.
+                        # Every following tile goes straight to CPU (no repeated
+                        # GPU attempts), and the effective backend becomes CPU.
+                        gpu_active = False
+                        effective_token = "cpu"
                         tile = reduce_spooled_tile(
                             handle, p1, request,
                             column_batch=int(column_batch),
@@ -1619,6 +1630,7 @@ def run_cell_streaming_external(
         provider, request, p1,
         science=science, weight_sum=weight_sum, valid_mask=valid_mask,
         surviving=surviving, support_w1=support_w1, support_w2=support_w2,
-        n_eff=n_eff, agg=agg, backend_token=token,
+        n_eff=n_eff, agg=agg, backend_token=effective_token,
+        backend_requested_token=token,
         tile_prefetch_plan={"requested": "off"},
     )

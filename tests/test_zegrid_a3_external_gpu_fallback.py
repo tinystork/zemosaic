@@ -144,10 +144,72 @@ def test_gpu_oom_falls_back_to_cpu_bit_exact_no_double_count(tmp_path, monkeypat
 
     _assert_bit_exact(ref, got)
     # The fallback happened and is observable.
-    assert fb["fallback_count"] >= 1
+    assert fb["fallback_count"] == 1
     assert fb["requested_backend"] == "gpu"
+    # F8: provenance separates REQUESTED (gpu) from EFFECTIVE (cpu).
+    assert got.provenance["backend"]["requested"] == "gpu"
+    assert got.provenance["backend"]["rejection"] == "cpu"
+    assert got.provenance["backend"]["combine"] == "cpu"
+    ev = got.provenance["effective_event"]
+    assert ev["backend_requested"] == "gpu"
+    assert ev["backend_rejection"] == "cpu"
+    assert ev["backend_combine"] == "cpu"
     # No double counting: the replayed tile(s) produced the same sink totals as
     # the pure-CPU reference.
+    assert _sink_counters(got_sink) == _sink_counters(ref_sink)
+
+
+def test_gpu_fallback_is_sticky_one_transition_and_effective_cpu(
+    tmp_path, monkeypatch
+):
+    """F8: N failing tiles -> ONE GPU->CPU transition; the rest go CPU direct."""
+    arrays, masks = _corpus()
+    ref_sink = BoundedCountingRejectionSink((len(arrays), 24, 24, 3))
+    ref = _run(arrays, masks, "cpu", tmp_path / "ref", sink=ref_sink,
+               normalization="sky_mean", weighting="noise_variance",
+               rejection="winsorized_sigma_clip", combine="mean",
+               taper="footprint")
+
+    real_reduce = x.reduce_spooled_tile
+    calls = {"gpu": 0, "cpu": 0}
+
+    def _always_oom(tile, p1, request, *, column_batch,
+                    rejection_sink=None, rejection_mask=None, backend="cpu"):
+        calls[backend] += 1
+        if backend == "gpu":
+            # EVERY GPU attempt fails: the sticky policy must still try GPU
+            # exactly once for the whole Cell.
+            raise _FakeCupyOOM("simulated device OOM")
+        return real_reduce(
+            tile, p1, request, column_batch=column_batch,
+            rejection_sink=rejection_sink, rejection_mask=rejection_mask,
+            backend=backend,
+        )
+
+    monkeypatch.setattr(x, "reduce_spooled_tile", _always_oom)
+    expected_tiles = len(list(x._iter_tiles(24, 24, 16)))
+    assert expected_tiles > 1
+
+    got_sink = BoundedCountingRejectionSink((len(arrays), 24, 24, 3))
+    fb = {}
+    got = _run(arrays, masks, "gpu", tmp_path / "got", sink=got_sink,
+               normalization="sky_mean", weighting="noise_variance",
+               rejection="winsorized_sigma_clip", combine="mean",
+               taper="footprint", gpu_fallback_out=fb)
+
+    _assert_bit_exact(ref, got)
+    assert calls["gpu"] == 1
+    assert calls["cpu"] == expected_tiles
+    assert fb["fallback_count"] == 1
+    assert fb["fallback_tiles"] == [(0, 0)]
+    assert fb["requested_backend"] == "gpu"
+    assert got.provenance["backend"]["requested"] == "gpu"
+    assert got.provenance["backend"]["rejection"] == "cpu"
+    assert got.provenance["backend"]["combine"] == "cpu"
+    ev = got.provenance["effective_event"]
+    assert ev["backend_requested"] == "gpu"
+    assert ev["backend_rejection"] == "cpu"
+    assert ev["backend_combine"] == "cpu"
     assert _sink_counters(got_sink) == _sink_counters(ref_sink)
 
 

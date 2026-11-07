@@ -150,6 +150,52 @@ def test_external_selected_when_all_ram_tiles_refuse_and_disk_fits(tmp_path, mon
     json.dumps(block)
 
 
+def test_external_selected_under_gpu_detection_when_bounded(
+    tmp_path, monkeypatch
+):
+    """F4: a detected GPU must not block the external working set.
+
+    No GPU tile/plan is feasible, every RAM streaming tile is refused, and the
+    bounded profile is active: the layout must be KEPT for the external class
+    (no LayoutInfeasible) and ``_select_external_fallback`` must be reached.
+    The resulting external pseudo-plan is CPU-only.
+    """
+    monkeypatch.setattr(zz, "_STACK_STORAGE_PROFILE", "bounded")
+    monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(1 << 60))
+    _free(monkeypatch, 100 * 2 ** 30)
+    # GPU detected, but the VRAM ladder yields no candidate -> no device plan.
+    monkeypatch.setattr(zz, "_r55_gpu_tile_ladder", lambda *a, **k: ((), None))
+    table = {int(t): 5 * 2 ** 30 for t in zz.CPU_STREAMING_TILE_LADDER}
+    descs = _corpus()
+    canvas = zg.build_canvas(descs)
+    real = zz._estimate_streaming_bytes
+    zz._estimate_streaming_bytes = (
+        lambda n, hw, tile=zz.STREAM_TILE_SIZE, channels=3,
+        storage_profile=None: int(table.get(int(tile), max(table.values())))
+    )
+    try:
+        bundle = zz._build_execution_bundle(
+            canvas, descs, None,
+            raw_available_bytes=2 * 2 ** 30,
+            budget_bytes=(4 * 2 * 2 ** 30) // 5,
+            gpu_used=True,
+            vram_budget_bytes=1 * 2 ** 30,
+            cpu_count=8, cache_root=str(tmp_path / "cache"),
+        )
+    finally:
+        zz._estimate_streaming_bytes = real
+    assert bundle.chosen_mode == "external"
+    assert bundle.stack_working_set == zz.WORKING_SET_EXTERNAL
+    assert bundle.working_set_block["class"] == zz.WORKING_SET_EXTERNAL
+    # The external pseudo-plan is CPU-only: no device execution is claimed.
+    assert bundle.working_set_block["gpu"]["used"] is False
+    external_tasks = [t for t in bundle.cell_tasks if t[4] == "external"]
+    assert external_tasks
+    for task in external_tasks:
+        assert len(task) == 9
+        assert task[8] == zz._CELL_INPUT_WINDOWED
+
+
 def test_external_refused_when_disk_envelope_does_not_fit(tmp_path, monkeypatch):
     monkeypatch.setattr(zz, "_STACK_STORAGE_PROFILE", "bounded")
     _free(monkeypatch, 1 * MIB)  # far below any spool peak

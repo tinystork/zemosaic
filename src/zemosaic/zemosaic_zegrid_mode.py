@@ -2633,6 +2633,7 @@ def _run_cell_external(
             f"a{time.time_ns()}_{os.getpid()}"
         )
         spool_info = {}
+        gpu_fallback = {}
         result = zext.run_cell_streaming_external(
             provider, request,
             tile_size=int(tile_size),
@@ -2647,6 +2648,7 @@ def _run_cell_external(
             owner_token=owner_token,
             owner_record=owner_record,
             owner_liveness=owner_liveness,
+            gpu_fallback_out=gpu_fallback,
         )
         if storage_info is not None:
             storage_info.update({
@@ -2673,6 +2675,10 @@ def _run_cell_external(
                     ),
                 },
                 "external_spool": dict(spool_info),
+                # F8: publish the GPU->CPU fallback truth collected by the
+                # executor (fallback_count == number of replayed tiles). This is
+                # diagnostic/manifest data, never a silent blend claim.
+                "gpu_fallback": dict(gpu_fallback),
                 "sink": {
                     "type": type(sink).__name__,
                     "storage_domain": getattr(sink, "storage_domain", None),
@@ -6226,10 +6232,14 @@ def _build_execution_bundle(
                     min_refinement_rank=rank_floor,
                     max_refinement_rank=rank_ceiling,
                     halo_px=_halo,
-                    allow_external=(
-                        zsp.is_bounded(_STACK_STORAGE_PROFILE)
-                        and not bool(gpu_used)
-                    ),
+                    # F4: the external (disk spool) working set is a valid
+                    # admission class whenever the bounded profile is active,
+                    # INDEPENDENTLY of GPU detection. A GPU may be present and
+                    # still have no jointly feasible plan; the layout must then
+                    # be kept for the external CPU reduction instead of raising
+                    # LayoutInfeasible. The GPU does not make the external class
+                    # executable on device (see the external pseudo-plan below).
+                    allow_external=zsp.is_bounded(_STACK_STORAGE_PROFILE),
                     # A1b guard: a FROZEN admission restored from a resume is
                     # authoritative; never re-refuse an already-admitted
                     # geometry whose cells are committed.
@@ -6544,7 +6554,7 @@ def _build_execution_bundle(
             _frozen_ws_policy
             and str(_frozen_ws_policy.get("class")) == WORKING_SET_EXTERNAL
         )
-        if plan is None and _bounded and not effective_gpu:
+        if plan is None and _bounded:
             # M3/M4: no in-memory plan and no RAM tile fits. The next class is
             # the external working set (disk spool), priced BEFORE any work. A
             # resumed external run reuses its FROZEN tile and column batch.
@@ -6595,6 +6605,14 @@ def _build_execution_bundle(
                     "external": True,
                 }
                 chosen_tile = int(external_selection["tile"])
+                # F4: the external pseudo-plan is CPU-only (spool + exact
+                # column reduction). A GPU was detected but is NOT part of
+                # this admission: clear the GPU execution facts so no downstream
+                # block can claim a device reduction for an external plan.
+                effective_gpu = False
+                gpu_tile_size = None
+                gpu_device_workspace_bytes = None
+                gpu_stream_by_idx = None
         if plan is None:
             if _frozen_external and not _bounded:
                 raise zpar.ModeInfeasible(
