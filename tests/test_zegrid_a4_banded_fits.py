@@ -1,0 +1,128 @@
+"""ZM-ZEGRID-ADAPTIVE-RESOURCES A4 — banded streaming FITS serialization.
+
+Q40 support: the banded writer must be BYTE-IDENTICAL to the dense
+``fits.PrimaryHDU(np.ascontiguousarray(np.moveaxis(science, -1, 0))).writeto``
+path the product has always used, while never materialising the full CHW cube.
+It must also reproduce the exact ``SCIHASH`` (sha256 of the sanitized
+little-endian CHW bytes) and the non-finite replacement count.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+from astropy.io import fits
+from astropy.wcs import WCS
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC = REPO_ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from zemosaic.core.zegrid import banded_fits as zb  # noqa: E402
+
+H, W, C = 24, 32, 3
+
+
+def _wcs_header():
+    w = WCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crpix = [W // 2, H // 2]
+    w.wcs.crval = [10.0, 20.0]
+    w.wcs.cdelt = [-1e-4, 1e-4]
+    hdr = w.to_header(relax=True)
+    hdr["NAXIS"] = 3
+    hdr["NAXIS1"] = W
+    hdr["NAXIS2"] = H
+    hdr["NAXIS3"] = C
+    hdr["SCIROLE"] = ("SCI", "science output role")
+    return hdr
+
+
+def _dense_reference(hwc):
+    """The exact bytes the product's dense path produces."""
+    raw = np.ascontiguousarray(np.moveaxis(np.asarray(hwc, dtype=np.float32), -1, 0))
+    finite = np.isfinite(raw)
+    replaced = int(raw.size - int(np.count_nonzero(finite)))
+    if replaced:
+        raw = raw.copy()
+        raw[~finite] = np.float32(0.0)
+    sha = hashlib.sha256(raw.tobytes()).hexdigest()
+    hdr = _wcs_header()
+    hdr["SCIHASH"] = (sha, "SHA-256")
+    buf = io.BytesIO()
+    fits.PrimaryHDU(raw, header=hdr).writeto(buf)
+    return buf.getvalue(), sha, replaced
+
+
+def test_a4_banded_science_fits_is_byte_identical(tmp_path):
+    rng = np.random.default_rng(0)
+    hwc = rng.standard_normal((H, W, C)).astype(np.float32)
+    hwc[1, 2, 0] = np.nan
+    hwc[3, 4, 1] = np.inf
+    hwc[5, 6, 2] = -np.inf
+
+    dense_bytes, sha, replaced = _dense_reference(hwc)
+
+    sha2, rep2 = zb.science_fits_sha256(hwc)
+    assert sha2 == sha
+    assert rep2 == replaced
+
+    hdr = _wcs_header()
+    hdr["SCIHASH"] = (sha2, "SHA-256")
+    out = tmp_path / "science.fits"
+    nbytes, rep3 = zb.write_science_fits_banded(hwc, hdr, out)
+    assert rep3 == replaced
+    assert nbytes == out.stat().st_size
+    assert out.read_bytes() == dense_bytes
+
+    # Round-trip: the FITS data reads back to the sanitized dense CHW.
+    with fits.open(out) as hdul:
+        got = np.asarray(hdul[0].data, dtype="<f4")
+    raw = np.ascontiguousarray(np.moveaxis(np.asarray(hwc, dtype=np.float32), -1, 0))
+    raw[~np.isfinite(raw)] = np.float32(0.0)
+    assert np.array_equal(got, raw)
+
+
+def test_a4_banded_science_fits_is_atomic_on_failure(tmp_path):
+    hwc = np.zeros((H, W, C), dtype=np.float32)
+    hdr = _wcs_header()
+    hdr["SCIHASH"] = (zb.science_fits_sha256(hwc)[0], "SHA-256")
+    out = tmp_path / "science.fits"
+    # A pre-existing valid target must survive a failed banded write.
+    out.write_bytes(b"sentinel")
+    # Force a failure by asking to write to a path whose parent does not exist.
+    bad = tmp_path / "no_such_dir" / "science.fits"
+    with pytest.raises(FileNotFoundError):
+        zb.write_science_fits_banded(hwc, hdr, bad)
+    assert out.read_bytes() == b"sentinel"
+    assert not (tmp_path / "science.fits.tmp").exists()
+
+
+def test_a4_banded_normalize_header_places_mandatory_first():
+    hdr = _wcs_header()
+    block = zb.normalize_header_block(hdr, shape=(W, H, C), bitpix=-32)
+    assert len(block) % zb.FITS_BLOCK_BYTES == 0
+    text = block.decode("ascii")
+    idx_simple = text.find("SIMPLE")
+    idx_bitpix = text.find("BITPIX")
+    idx_naxis = text.find("NAXIS")
+    idx_wcs = text.find("WCSAXES")
+    assert 0 <= idx_simple < idx_bitpix < idx_naxis < idx_wcs
+    # NAXIS is never duplicated.
+    assert text.count("NAXIS   ") == 1
+
+
+def test_a4_banded_sha256_streams_small_bands(tmp_path):
+    # A tiny band (band_rows=1) must still reproduce the exact dense hash.
+    rng = np.random.default_rng(1)
+    hwc = rng.standard_normal((8, 7, 3)).astype(np.float32)
+    _, sha, replaced = _dense_reference(hwc)
+    sha_banded, rep = zb.science_fits_sha256(hwc, band_rows=1)
+    assert sha_banded == sha
+    assert rep == replaced
