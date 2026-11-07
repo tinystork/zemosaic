@@ -45,9 +45,10 @@ Les champs non créés sont intentionnels avant lancement, pas des preuves manqu
 | A3 | ACCEPTED (Q30+Q31) ; Q32 BLOCKED (Windows) | A3-T01 | 2D micro-blocs (b61f9fe) + GPU externe (2ce487c) + fallback transactionnel (2d065ff) + témoins Q30 (bab2b0b) et Q31 (0c2af51+1014e30) ; Q32 (cellule M33) → A6/Windows |
 | A4 | ACCEPTED (Q40+Q41) | A4-T01 | 8 commits : allocateur 11 plans (c07270f), banded_fits (9548f19), canvas_backing (476465f), câblage banded (04351a6), guarded scratch (bdbdc06), fallback production + discard (f097144), Q40 (380dcd2), Q41 (15d999e) |
 | A5 | ACCEPTED (Q50+Q51) | A5-T01 | croissance bornée inverse du shrink (39e350c) + Q50 (5 tests) ; Q51 couvert par resume_m4/p0_resume_integrity/m3_recovery (79 tests verts) |
-| A6 | NOT_STARTED | aucune | aucune |
+| A6 | RUNNING (Q60+Q64) ; Q61 BLOCKED | A6-T01 | Q60 vrais runs E2E 1/2/4 Gio bit-identiques (e9f8729, 4 tests) ; Q64 propagation GUI headless (15 tests) ; Q61 M33 Windows + Q62 Caldwell + Q63 M106/M16 reportés au test direct beta de Tristan |
 
-**Dernier gate accepté : A5_ACCEPTED (Q50+Q51).** A6 reste NOT_STARTED.
+**Dernier gate accepté : A5_ACCEPTED (Q50+Q51).** A6 en cours (Q60/Q64 faits,
+Q61 BLOCKED, Q62/Q63 reportés au test direct beta).
 
 ## Suivi worker à renseigner seulement au dispatch réel
 
@@ -95,6 +96,16 @@ puis déléguer la première tâche A0 bornée selon AGENTS.md. Aucun travail A1
 avant A0_ACCEPTED. Si Tristan lance seulement A0, ne pas extrapoler à A6.
 
 ## Journal documentaire
+
+- 2026-11-07 : A6 en cours — Q60 vrais runs E2E synthétiques 1/2/4 Gio
+  herméticisés (e9f8729, 4 tests) : FITS+manifest valides, coverage > 0, science/
+  coverage bit-identiques entre budgets (la preuve petit budget est un run réel,
+  pas un dry-plan). Q64 : propagation GUI→backend headless vérifiée
+  (test_dispatch_propagation_witness 15 tests + r53c_gui_halo + r55e4_gui_gpu_toggle).
+  Q61 (M33 Windows GPU) BLOCKED : corpus Windows indisponible. Q62 (Caldwell
+  halo 128) et Q63 (M106/M16) : corpus réels présents, runs lourds reportés au
+  test direct beta. NB : 2 tests GUI policy (`m6_gui_policy`) échouent AUSSI à
+  bab2b0b (préexistant).
 
 - 2026-11-07 : A5 ACCEPTED (Q50+Q51) — croissance bornée `next_grow`/`grow_sequence`/
   `assert_grow_only`/`assert_joint_grow_only` + `GROW_ORDER` (inverse exact du

@@ -162,12 +162,19 @@ powershell -NoProfile -Command "cd C:\chemin\zemosaic; $env:PYTHONPATH=$PWD\src;
 - Linux : 1/2/4 Gio ; Windows : 1/2/4/8/16 Gio.
 - **32 Gio non qualifiable** sur les deux machines (RAM totale < 32 Gio) :
   déclaré non qualifié, pas inventé.
-- Statut : **NOT_RUN**.
+- Commande : `tests/test_zegrid_a6_q60_budgets.py` (4 tests, verts).
+- Preuve : vrais runs `run_zegrid_mode` E2E sur le corpus déterministe tiny
+  (budget herméticisé via `available_memory_bytes`) à 1/2/4 Gio : FITS +
+  manifest valides, coverage > 0, et science/coverage **bit-identiques** entre
+  budgets — la preuve petit budget est un run réel, pas un dry-plan.
+- Statut : **PASS** (Linux 1/2/4 Gio ; Windows 1/2/4/8/16 Gio et 32 Gio non
+  qualifiés sur cet hôte — reportés au test direct beta de Tristan).
 
 ### Q61 — A6, M33 complet Windows GPU
 
 - Commande : GUI ou CLI avec `run_config_snapshot` figé, sortie neuve.
-- Statut : **NOT_RUN**.
+- Statut : **BLOCKED** — corpus M33 Windows indisponible sur cet hôte Linux ;
+  reporté au test direct beta de Tristan (Windows + GPU réel).
 
 ### Q62 — A6, Caldwell grand canevas halo 128, Linux contraint
 
@@ -181,16 +188,20 @@ PYTHONPATH=src python3 -m zemosaic.zegrid_cli \
 
 - Note : `zemosaic.zegrid_cli` est **CPU-only by design** (documenté dans le
   module). La qualification GPU de Q62 exige le chemin GUI/worker, pas ce CLI.
-- Statut : **NOT_RUN**.
+- Statut : **NOT_RUN** (corpus réel présent, run lourd CPU ; reporté au test
+  direct beta).
 
 ### Q63 — A6, M106/M16 CPU/GPU non-régression
 
-- Statut : **NOT_RUN**.
+- Statut : **NOT_RUN** (corpus réels présents, témoins `slow` existants ;
+  reportés au test direct beta).
 
 ### Q64 — A6, GUI→backend
 
-- Test GUI offscreen + run synthétique via le chemin GUI.
-- Statut : **NOT_RUN**.
+- Preuve : `test_dispatch_propagation_witness.py` (15 tests verts) + `r53c_gui_halo`
+  (le halo GUI atteint le worker et le moteur réel) + `r55e4_gui_gpu_toggle`.
+- Statut : **PASS** (propagation headless vérifiée ; le test GUI interactif
+  humain final reste à Tristan sur beta).
 
 ## 5. Commandes A0 réellement exécutées (traçabilité)
 
