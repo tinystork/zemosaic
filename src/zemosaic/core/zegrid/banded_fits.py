@@ -180,3 +180,77 @@ def write_science_fits_banded(
     return int(h) * int(w) * int(c) * 4 + int(len(header_block)) + int(
         (-(int(h) * int(w) * int(c) * 4) % FITS_BLOCK_BYTES) % FITS_BLOCK_BYTES
     ), int(replaced)
+
+
+def coverage_fits_sha256(
+    coverage_hw: np.ndarray,
+    *,
+    fill_value: float = NONFINITE_FILL_VALUE,
+    band_rows: int = DEFAULT_BAND_ROWS,
+) -> tuple[str, int]:
+    """Stream the SHA-256 of the sanitized contiguous 2-D little-endian bytes.
+
+    ``coverage_hw`` is ``(H, W)`` float32. The dense path hashes
+    ``np.ascontiguousarray(np.asarray(stack_depth, dtype=np.float32))``; the
+    same row-bands in order reproduce those bytes without a full-plane copy.
+    """
+    height = int(coverage_hw.shape[0])
+    digest = hashlib.sha256()
+    replaced = 0
+    for y0 in range(0, height, int(band_rows)):
+        band = np.ascontiguousarray(
+            coverage_hw[y0:y0 + int(band_rows), :], dtype=np.float32
+        )
+        band, n = _sanitize_band(band, fill_value)
+        replaced += n
+        digest.update(band.tobytes())
+    return digest.hexdigest(), int(replaced)
+
+
+def write_coverage_fits_banded(
+    coverage_hw: np.ndarray,
+    header: fits.Header,
+    path: str | os.PathLike[str],
+    *,
+    fill_value: float = NONFINITE_FILL_VALUE,
+    band_rows: int = DEFAULT_BAND_ROWS,
+) -> tuple[int, int]:
+    """Atomically write ``(H, W)`` float32 as a 2-D FITS PrimaryHDU in bands.
+
+    Returns ``(nbytes, replaced_count)``. Byte-identical to
+    ``fits.PrimaryHDU(np.ascontiguousarray(coverage_hw)).writeto(...)``.
+    """
+    h, w = coverage_hw.shape
+    target = Path(path)
+    tmp = target.with_name(target.name + ".tmp")
+    header_block = normalize_header_block(
+        header, shape=(int(w), int(h)), bitpix=-32
+    )
+    replaced = 0
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(header_block)
+            for y0 in range(0, int(h), int(band_rows)):
+                band = np.ascontiguousarray(
+                    coverage_hw[y0:y0 + int(band_rows), :], dtype=np.float32
+                )
+                band, n = _sanitize_band(band, fill_value)
+                replaced += n
+                fh.write(band.astype(">f4").tobytes())
+            data_len = int(h) * int(w) * 4
+            pad = (-(int(data_len) % FITS_BLOCK_BYTES)) % FITS_BLOCK_BYTES
+            if pad:
+                fh.write(b"\x00" * pad)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:  # pragma: no cover - best effort
+            pass
+        raise
+    return int(h) * int(w) * 4 + int(len(header_block)) + int(
+        (-(int(h) * int(w) * 4) % FITS_BLOCK_BYTES) % FITS_BLOCK_BYTES
+    ), int(replaced)

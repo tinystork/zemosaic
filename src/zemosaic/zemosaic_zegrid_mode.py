@@ -101,6 +101,7 @@ from .core.canonical_streaming import (
 )
 from .core.zegrid import assembly as za
 from .core.zegrid import auto_layout as zal
+from .core.zegrid import banded_fits as zbf
 from .core.zegrid import bounded_assembly as zbas
 from .core.zegrid import cell_feather as zcf
 from .core.zegrid import cell_offset as zco
@@ -19061,20 +19062,36 @@ def _write_raw_science_fits(
     the on-disk FITS opens correctly in ASIFitsView Linux and Gwenview. The
     replaced count + fill value are recorded in the header.
     """
-    raw_science = np.asarray(assembled.science, dtype=np.float32)
-    raw_data = np.ascontiguousarray(np.moveaxis(raw_science, -1, 0))  # (3, H, W)
-    raw_data, nf_replaced = sanitize_nonfinite_float32(raw_data, fill_value=0.0)
+    # A4: when the science is scratch-backed (memmap), serialize it in row-bands
+    # so the final step never materialises a full-canvas CHW contiguous copy. The
+    # banded writer is BYTE-IDENTICAL to the dense path (same header block, same
+    # big-endian CHW data, same SCIHASH, same non-finite replacement).
+    science_scratch = isinstance(assembled.science, np.memmap)
+    if science_scratch:
+        _sha, nf_replaced = zbf.science_fits_sha256(
+            assembled.science, fill_value=0.0
+        )
+    else:
+        raw_science = np.asarray(assembled.science, dtype=np.float32)
+        raw_data = np.ascontiguousarray(np.moveaxis(raw_science, -1, 0))
+        raw_data, nf_replaced = sanitize_nonfinite_float32(raw_data, fill_value=0.0)
+        _sha = _array_sha256(raw_data)
     raw_header = _science_header(
         canvas,
         role=role,
         dtype="float32",
         dbe_state="n/a",
-        sha256=_array_sha256(raw_data),
+        sha256=_sha,
         related_file=related_file,
     )
     _record_halo_cards(raw_header, halo_provenance)
     record_nonfinite_fill(raw_header, nf_replaced)
-    _atomic_writeto(fits.PrimaryHDU(raw_data, header=raw_header), raw_science_path)
+    if science_scratch:
+        zbf.write_science_fits_banded(
+            assembled.science, raw_header, raw_science_path, fill_value=0.0
+        )
+    else:
+        _atomic_writeto(fits.PrimaryHDU(raw_data, header=raw_header), raw_science_path)
     return raw_science_path
 
 
@@ -19564,7 +19581,13 @@ def _write_outputs(
     cov_header["BUNIT"] = ("count", "per-pixel stack depth (max over channels)")
     _record_halo_cards(cov_header, halo_provenance)
     cov_path = _published_path(output_dir / "mosaic_grid_coverage.fits")
-    _atomic_writeto(fits.PrimaryHDU(stack_depth, header=cov_header), cov_path)
+    if isinstance(assembled.stack_depth, np.memmap):
+        zbf.write_coverage_fits_banded(
+            np.asarray(assembled.stack_depth, dtype=np.float32),
+            cov_header, cov_path, fill_value=0.0,
+        )
+    else:
+        _atomic_writeto(fits.PrimaryHDU(stack_depth, header=cov_header), cov_path)
 
     # ZM-ZEGRID-R24 (A2): conservative stale-aesthetic cleanup. Runs ONLY after
     # every current output above has been successfully written and BEFORE the

@@ -126,3 +126,40 @@ def test_a4_banded_sha256_streams_small_bands(tmp_path):
     sha_banded, rep = zb.science_fits_sha256(hwc, band_rows=1)
     assert sha_banded == sha
     assert rep == replaced
+
+
+def test_a4_banded_coverage_fits_is_byte_identical(tmp_path):
+    rng = np.random.default_rng(2)
+    cov = rng.standard_normal((H, W)).astype(np.float32)
+    cov[2, 3] = np.nan
+
+    # Dense reference.
+    dense_plane = np.ascontiguousarray(np.asarray(cov, dtype=np.float32))
+    finite = np.isfinite(dense_plane)
+    replaced = int(dense_plane.size - int(np.count_nonzero(finite)))
+    if replaced:
+        dense_plane = dense_plane.copy()
+        dense_plane[~finite] = np.float32(0.0)
+    sha = hashlib.sha256(dense_plane.tobytes()).hexdigest()
+
+    hdr = _wcs_header()
+    del hdr["NAXIS"]
+    del hdr["NAXIS3"]
+    hdr["NAXIS"] = 2
+    hdr["BUNIT"] = ("count", "per-pixel stack depth")
+    buf = io.BytesIO()
+    fits.PrimaryHDU(dense_plane, header=hdr).writeto(buf)
+    dense_bytes = buf.getvalue()
+
+    sha2, rep2 = zb.coverage_fits_sha256(cov)
+    assert sha2 == sha
+    assert rep2 == replaced
+
+    out = tmp_path / "coverage.fits"
+    nbytes, rep3 = zb.write_coverage_fits_banded(cov, hdr, out)
+    assert rep3 == replaced
+    assert nbytes == out.stat().st_size
+    assert out.read_bytes() == dense_bytes
+    with fits.open(out) as hdul:
+        got = np.asarray(hdul[0].data, dtype="<f4")
+    assert np.array_equal(got, dense_plane)
