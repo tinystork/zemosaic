@@ -356,8 +356,10 @@ def test_minimum_floor_matches_active_legacy_planner():
     from zemosaic.core.zegrid import gpu as legacy_gpu
 
     assert gr.MIN_VRAM_BUDGET_BYTES == legacy_gpu.GPU_MIN_VRAM_BUDGET_BYTES
-    # The legacy active budget is unchanged by R55-C.
-    assert legacy_gpu.GPU_VRAM_SAFETY_FRACTION == 0.5
+    # A1c: ONE policy shared with the ACTIVE readiness path (70 %).
+    assert legacy_gpu.GPU_VRAM_SAFETY_PERCENT == 70
+    assert legacy_gpu.GPU_VRAM_SAFETY_FRACTION == 0.70
+    assert gr.INITIAL_TARGET_PERCENT == legacy_gpu.GPU_VRAM_SAFETY_PERCENT
 
 
 def test_shrink_ladder_and_growth_rejection():

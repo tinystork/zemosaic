@@ -319,19 +319,19 @@ def test_vram_budget_and_tile_planner():
 
 
 def test_vram_budget_never_inflates():
-    """H3: free*fraction < GPU_MIN_VRAM_BUDGET_BYTES => None (degrade), never inflate."""
-    # 10 MiB free -> 5 MiB budget < 64 MiB floor -> None (NOT 64 MiB).
+    """H3: free*percent < GPU_MIN_VRAM_BUDGET_BYTES => None, never inflated."""
+    pct = zgpu.GPU_VRAM_SAFETY_PERCENT
+    # 10 MiB free -> 7 MiB budget < 64 MiB floor -> None (NOT 64 MiB).
     assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 10 * 2**20}) is None
-    # 100 MiB free -> 50 MiB < 64 MiB -> None (NOT 64 MiB).
-    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 100 * 2**20}) is None
-    # Exactly at 2x the floor (128 MiB free -> 64 MiB) -> accepted.
-    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 128 * 2**20}) == 64 * 2**20
-    # 2 GiB free -> 1 GiB budget.
-    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 2 * 2**30}) == 1 * 2**30
+    # 64 MiB free -> 44.8 MiB < 64 MiB -> None (NOT 64 MiB).
+    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 64 * 2**20}) is None
+    # Above the floor: the EXACT integer percentage, never the floor.
+    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 128 * 2**20}) == (128 * 2**20 * pct) // 100
+    assert zgpu.vram_budget_bytes({"available": True, "vram_free_bytes": 2 * 2**30}) == (2 * 2**30 * pct) // 100
     # unavailable -> None.
     assert zgpu.vram_budget_bytes({"available": False, "vram_free_bytes": 2 * 2**30}) is None
     # unknown free (falls back to total).
-    assert zgpu.vram_budget_bytes({"available": True, "vram_total_bytes": 2 * 2**30, "vram_free_bytes": None}) == 1 * 2**30
+    assert zgpu.vram_budget_bytes({"available": True, "vram_total_bytes": 2 * 2**30, "vram_free_bytes": None}) == (2 * 2**30 * pct) // 100
 
 
 def test_is_gpu_runtime_error_classifier():

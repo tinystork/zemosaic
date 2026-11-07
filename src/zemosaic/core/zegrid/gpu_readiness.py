@@ -1,8 +1,9 @@
 """ZM-ZEGRID-R55-C — portable GPU readiness + provisional VRAM policy (observe-only).
 
-This module is a *fact and contract* layer. It does not activate GPU scheduling,
-does not change the active ZeGrid GPU budget (``gpu.vram_budget_bytes`` remains
-``free x 50%`` with its 64 MiB floor), and never makes CuPy mandatory.
+This module is a *fact and contract* layer. It does not activate GPU scheduling
+and never makes CuPy mandatory. A1c unifies the VRAM policy: BOTH this module
+and the legacy tiled planner use :data:`gpu.GPU_VRAM_SAFETY_PERCENT` (70 % of
+currently free VRAM) with the same 64 MiB floor.
 
 Design invariants
 -----------------
@@ -18,9 +19,9 @@ Design invariants
 * **Pure integers**: the VRAM policy uses integer arithmetic only, refuses
   ``bool``/``float`` coercion, never inflates a budget up to a floor, and reports
   the explicit residual reserve.
-* **Provisional**: 70% of currently free VRAM is ``provisional/observe_only``.
-  It is NOT product-qualified; qualification requires real product-path HWM and
-  parity evidence in a later mission.
+* **Provisional value, ONE policy**: the 70 % of currently free VRAM is the
+  single policy shared with ``gpu.vram_budget_bytes`` (A1c). Its *qualification*
+  (real product-path HWM and parity at that budget) remains a later mission.
 * **Single owner / whole batch**: the RUN revalidation contract is shrink-only
   (75 -> 70 -> 65 -> 50 -> CPU), never grows a resource after pressure, and a
   GPU abandonment is an exact **whole-batch** CPU fallback with no mixed partial
@@ -37,6 +38,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Sequence
+
+try:  # package import: ONE policy source
+    from .gpu import GPU_VRAM_SAFETY_PERCENT
+except ImportError:  # pragma: no cover - standalone module load (no package)
+    # The readiness module is also loaded standalone by the CuPy-import guard
+    # test. Keep the same value; the package path is asserted equal in A1c tests.
+    GPU_VRAM_SAFETY_PERCENT = 70
 
 try:  # Python 3.11+; the project also supports 3.10
     import tomllib
@@ -180,7 +188,7 @@ REASONS = frozenset(
 # Provisional candidate ladder, ascending, in integer percent of CURRENTLY FREE
 # VRAM. 70 is the initial provisional target (product-owner decision R55-C).
 VRAM_LADDER = (50, 65, 70, 75)
-INITIAL_TARGET_PERCENT = 70
+INITIAL_TARGET_PERCENT = int(GPU_VRAM_SAFETY_PERCENT)
 # Progressive qualification path for a later mission (65 -> 70 -> 75).
 QUALIFICATION_LADDER = (65, 70, 75)
 

@@ -44,15 +44,21 @@ __all__ = [
     "choose_gpu_tile_size",
     "is_gpu_runtime_error",
     "GPU_VRAM_SAFETY_FRACTION",
+    "GPU_VRAM_SAFETY_PERCENT",
     "GPU_MIN_VRAM_BUDGET_BYTES",
     "GPU_WORKSPACE_BYTES_PER_CELL",
     "GPU_TILE_FIXED_OVERHEAD_BYTES",
     "GPU_TAPER_HALO_PX",
 ]
 
-# Fraction of FREE VRAM budgeted for the ZeGrid tiled workspace (leave headroom for
-# the CUDA context / allocator retention / any other process on a shared laptop GPU).
-GPU_VRAM_SAFETY_FRACTION = 0.5
+# ONE VRAM policy for BOTH the legacy tiled planner and the ACTIVE readiness
+# path (A1c). 70 % of CURRENTLY FREE VRAM, integer arithmetic, 30 % residual
+# reserve for the CUDA context / allocator retention / other processes.
+# ``GPU_VRAM_SAFETY_FRACTION`` is kept as a float alias for older callers; the
+# budget itself is computed from the integer percent so both paths agree
+# byte-for-byte.
+GPU_VRAM_SAFETY_PERCENT = 70
+GPU_VRAM_SAFETY_FRACTION = GPU_VRAM_SAFETY_PERCENT / 100.0
 
 # Absolute floor: below this the tiled GPU path cannot hold even a small tile and
 # the engine degrades loudly to exact CPU. The budget is NEVER raised up to this
@@ -140,7 +146,8 @@ def vram_budget_bytes(probe: dict) -> int | None:
 
     ``probe`` is a :func:`probe_gpu_backend` dict. Returns ``None`` when the GPU
     is unavailable, the free VRAM is unknown, OR the computed budget
-    (``free * GPU_VRAM_SAFETY_FRACTION``) is below :const:`GPU_MIN_VRAM_BUDGET_BYTES`.
+    (``free * GPU_VRAM_SAFETY_PERCENT / 100``) is below
+    :const:`GPU_MIN_VRAM_BUDGET_BYTES`.
     The budget is NEVER inflated up to the floor (H3 fix): a too-small budget
     degrades loudly to exact CPU.
     """
@@ -153,7 +160,7 @@ def vram_budget_bytes(probe: dict) -> int | None:
             return None
         free = total
     free = int(free)
-    budget = int(free * GPU_VRAM_SAFETY_FRACTION)
+    budget = (free * GPU_VRAM_SAFETY_PERCENT) // 100
     if budget < GPU_MIN_VRAM_BUDGET_BYTES:
         return None
     return budget
