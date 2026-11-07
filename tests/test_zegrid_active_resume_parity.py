@@ -996,12 +996,25 @@ def test_fresh_active_tiny_run_freezes_the_admission_from_its_identity(tmp_path)
     identity = json.loads((root / "run.json").read_text(encoding="utf-8"))
     state = json.loads((root / "state.json").read_text(encoding="utf-8"))
     block = identity["science_contract"]["backend"]
+    manifest = json.loads(
+        (tmp_path / "out" / "zegrid_manifest.json").read_text(encoding="utf-8")
+    )
+    manifest_ws = manifest["working_set"]
     assert state["admission"] == {
         "schema": zres.ADMISSION_SCHEMA,
         "schema_version": zres.ADMISSION_VERSION,
         "backend": block["backend"],
         "tile_px": block["tile_px"],
         "parity_qualified": block["parity_qualified"],
+        "working_set": {
+            "class": str(manifest_ws["class"]),
+            "tile_px": int(manifest_ws.get("tile_size") or 0),
+            "column_batch": (
+                None
+                if manifest_ws.get("column_batch") is None
+                else int(manifest_ws["column_batch"])
+            ),
+        },
     }
     assert state["admission"]["tile_px"] == identity["science_contract"]["grid"]["tile_px"]
 

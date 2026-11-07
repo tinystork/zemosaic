@@ -155,6 +155,14 @@ def device_memory_snapshot(xp=None, *, device_index: int = 0) -> dict:
         ):
             try:
                 member = getattr(pinned, attr)
+            except AttributeError:
+                # CuPy's PinnedMemoryPool normally exposes neither counter.
+                # Unsupported telemetry is truthful None, not an error.
+                continue
+            except Exception as exc:
+                errors.append(f"{key}:{type(exc).__name__}")
+                continue
+            try:
                 value = member() if callable(member) else member
                 record[key] = int(value) if value is not None else None
             except Exception as exc:

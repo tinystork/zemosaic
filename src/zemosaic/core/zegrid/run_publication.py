@@ -2408,6 +2408,12 @@ def _products_text(payload: Mapping[str, Any]) -> str:
                 f"{_VISIBLE_ROLE_LABEL.get(role, role):10s}: "
                 f"{delivered['path']} ({int(delivered['nbytes'])} B)"
             )
+        elif role not in ROOT_DELIVERABLE_ROLES:
+            lines.append(
+                f"{_VISIBLE_ROLE_LABEL.get(role, role):10s}: {row['path']} "
+                f"({int(row['nbytes'])} B) [generation archive copy; "
+                "live auxiliary at output root]"
+            )
         else:
             lines.append(
                 f"{_VISIBLE_ROLE_LABEL.get(role, role):10s}: {row['path']} "
