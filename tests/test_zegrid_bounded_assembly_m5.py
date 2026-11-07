@@ -884,7 +884,7 @@ def test_m5a_guarded_assembly_matches_dense_reference(tmp_path):
     try:
         access = zbas.StoreAssemblyAccess(store, max_resident_cells=2)
         bounded = access.results([r["cell_id"] for r in results])
-        assembled, info, plan = zz._assemble_cells_guarded(
+        assembled, info, plan, _alloc = zz._assemble_cells_guarded(
             canvas,
             NX,
             NY,
@@ -976,7 +976,7 @@ def test_m5a_real_consumer_live_peak_matches_stats(
     try:
         access = zbas.StoreAssemblyAccess(store, max_resident_cells=2)
         bounded = access.results([r["cell_id"] for r in results])
-        assembled, info, plan = zz._assemble_cells_guarded(
+        assembled, info, plan, _alloc = zz._assemble_cells_guarded(
             canvas,
             nx,
             ny,
@@ -1380,7 +1380,7 @@ def test_m5a_adequate_budget_from_real_plan_allows_assembly(tmp_path):
             grid=(NX, NY),
         )
         budget = int(plan["required_bytes"])
-        assembled, info, used = zz._assemble_cells_guarded(
+        assembled, info, used, _alloc = zz._assemble_cells_guarded(
             canvas,
             NX,
             NY,

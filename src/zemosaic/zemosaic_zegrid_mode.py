@@ -11698,7 +11698,7 @@ def _bounded_assembly_available_bytes():
 
 def _bounded_assembly_preflight(
     canvas, bounded_results, *, purpose="assembly", available_bytes=None,
-    gauge_mode="per_cell", grid=None,
+    gauge_mode="per_cell", grid=None, canvas_backing="anonymous",
 ):
     """Fail-closed capacity gate BEFORE any payload load/graph/canvas work.
 
@@ -11723,6 +11723,7 @@ def _bounded_assembly_preflight(
         purpose=str(purpose),
         gauge_mode=str(gauge_mode),
         grid=(None if grid is None else (int(grid[0]), int(grid[1]))),
+        canvas_backing=str(canvas_backing),
     )
     # Arm the REAL byte envelope: at most the declared resident mappings.
     # An all-empty run maps nothing, so the envelope floor is 1 B (arming it
@@ -11740,25 +11741,49 @@ def _bounded_assembly_preflight(
 
 def _assemble_cells_guarded(
     canvas, nx, ny, mode, cores, result_by_cid, *, bounded_results=None,
-    available_bytes=None, purpose="assembly", **kwargs
+    available_bytes=None, purpose="assembly", canvas_backing="anonymous",
+    scratch_dir=None, **kwargs
 ):
     """The production assembly entry: preflight FIRST, then the consumer.
 
     With a durable store the capacity gate runs before ``_assemble_cells`` can
     open any payload, solve the offset graph or allocate the canvas. A refusal
     propagates as ``AssemblyCapacityError`` (explicit, no false COMPLETE).
+
+    A4: ``canvas_backing="scratch"`` (with a ``scratch_dir``) backs the whole
+    feathered canvas with a :class:`~bounded_assembly.ScratchCanvasAllocator`
+    instead of anonymous RAM; the preflight prices the canvas as scratch (disk)
+    rather than RAM. ``None`` scratch_dir + scratch backing is an explicit
+    refusal (a scratch-backed canvas needs a confined scratch directory).
     """
+    backing = str(canvas_backing)
+    if backing not in ("anonymous", "scratch"):
+        raise zbas.BoundedAccessError(
+            f"unsupported canvas_backing: {canvas_backing!r}"
+        )
+    allocator = kwargs.pop("allocator", None)
+    if backing == "scratch":
+        if scratch_dir is None:
+            raise zbas.BoundedAccessError(
+                "scratch-backed assembly requires a scratch_dir"
+            )
+        if allocator is None:
+            allocator = zbas.ScratchCanvasAllocator(
+                scratch_dir, prefix="canvas-assembly"
+            )
     plan = None
     if bounded_results is not None:
         plan = _bounded_assembly_preflight(
             canvas, bounded_results, purpose=purpose,
             available_bytes=available_bytes,
             gauge_mode=mode, grid=(nx, ny),
+            canvas_backing=backing,
         )
     assembled, info = _assemble_cells(
-        canvas, nx, ny, mode, cores, result_by_cid, **kwargs
+        canvas, nx, ny, mode, cores, result_by_cid,
+        allocator=allocator, **kwargs
     )
-    return assembled, info, plan
+    return assembled, info, plan, allocator
 
 
 def _validate_capture_store_compatibility(
@@ -18163,10 +18188,11 @@ def _run_single(
             r40_capture=r40_seam_capture,
         )
         try:
-            assembled, feather_info, _bounded_preflight = _assemble_cells_guarded(
+            assembled, feather_info, _bounded_preflight, _assembly_allocator = _assemble_cells_guarded(
                 canvas, nx, ny, _gauge_mode, cores, result_by_cid,
                 bounded_results=(results if _store_backed_results else None),
                 purpose="assembly",
+                canvas_backing="anonymous",
                 halo_px=int(halo_px), emit=_emit_live,
                 capture=r37_diagnostic_capture,
                 holdout_cap=r37_diagnostic_holdout_cap,
