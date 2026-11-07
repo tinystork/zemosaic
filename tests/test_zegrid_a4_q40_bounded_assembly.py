@@ -1,6 +1,6 @@
 """ZM-ZEGRID-ADAPTIVE-RESOURCES A4 — bounded assembly + banded FITS (Q40).
 
-Q40 gate: a canvas whose canonical planes (121 B/px) exceed the available RAM
+Q40 gate: a canvas whose feathered canonical planes (125 B/px) exceed the available RAM
 budget must still produce a valid final FITS, byte-identical to the dense
 in-memory reference, with NO full-canvas CHW/plane copy at the serialization
 step. This test drives the REAL production consumers end to end:
@@ -300,8 +300,9 @@ def test_q40_scratch_assembly_and_banded_fits_byte_identical(tmp_path):
         )
         assert cov_path.read_bytes() == dense_cov_buf.getvalue()
 
-        # All 11 scratch planes were created and are removed on discard.
-        assert len(list(scratch_dir.glob("*.bin"))) == 11
+        # All 13 scratch planes (F6 includes valid_out/covered) are created and
+        # are removed on discard.
+        assert len(list(scratch_dir.glob("*.bin"))) == 13
         allocator.discard()
         assert not list(scratch_dir.glob("*.bin"))
     finally:
@@ -328,3 +329,46 @@ def test_q40_scratch_backing_requires_scratch_dir(tmp_path):
             )
     finally:
         store.close()
+
+
+def test_f6_global_assembly_honours_the_scratch_allocator(tmp_path):
+    """F6: global gauge must route the allocator (memmap science, bit-exact)."""
+    results = [
+        complete_result(0, 0, seed=0),
+        complete_result(0, 1, seed=1),
+        complete_result(1, 0, seed=2),
+        complete_result(1, 1, seed=3),
+    ]
+    canvas = make_canvas()
+    cores = {r["cell_id"]: r["core"] for r in results}
+
+    dense = zmosaic.assemble_canvas(canvas, NX, NY, cores)
+    allocator = zbas.ScratchCanvasAllocator(tmp_path / "global-scratch",
+                                           prefix="global")
+    try:
+        scratch = zmosaic.assemble_canvas(
+            canvas, NX, NY, cores, allocator=allocator
+        )
+        assert isinstance(scratch.science, np.memmap)
+        for name in ("stack_depth", "n_eff_support", "support_w1", "support_w2",
+                     "valid_fraction", "owner", "hole_mask"):
+            assert isinstance(getattr(scratch, name), np.memmap), name
+        # 8 global planes: science, depth, n_eff, w1, w2, valid_fraction, owner,
+        # hole_mask (49 B/px at 3 channels).
+        assert len(list((tmp_path / "global-scratch").glob("*.bin"))) == 8
+        assert zbas.canvas_plane_bytes(
+            (H, W), gauge_mode="global"
+        )["bytes_per_pixel"] == 49.0
+        assert zbas.canvas_plane_bytes(
+            (H, W), gauge_mode="per_cell"
+        )["bytes_per_pixel"] == 125.0
+        assert np.array_equal(scratch.science, dense.science, equal_nan=True)
+        assert np.array_equal(scratch.stack_depth, dense.stack_depth)
+        assert np.array_equal(scratch.n_eff_support, dense.n_eff_support)
+        assert np.array_equal(scratch.support_w1, dense.support_w1)
+        assert np.array_equal(scratch.support_w2, dense.support_w2)
+        assert np.array_equal(scratch.valid_fraction, dense.valid_fraction)
+        assert np.array_equal(scratch.owner, dense.owner)
+        assert np.array_equal(scratch.hole_mask, dense.hole_mask)
+    finally:
+        allocator.discard()

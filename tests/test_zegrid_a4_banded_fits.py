@@ -163,3 +163,84 @@ def test_a4_banded_coverage_fits_is_byte_identical(tmp_path):
     with fits.open(out) as hdul:
         got = np.asarray(hdul[0].data, dtype="<f4")
     assert np.array_equal(got, dense_plane)
+
+
+# ---------------------------------------------------------------------------
+# F1 (ZM-ZEGRID-ADAPTIVE-RESOURCES): _write_outputs never materialises a
+# full-canvas (3, H, W) float32 CHW copy, and the science FITS stays identical.
+# ---------------------------------------------------------------------------
+
+def test_f1_write_outputs_science_only_has_no_full_canvas_chw_copy(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    from zemosaic import zemosaic_zegrid_mode as zz
+    from zemosaic.core.zegrid import geometry as zg
+
+    h, w, c = 16, 20, 3
+    rng = np.random.default_rng(7)
+    hwc = rng.standard_normal((h, w, c)).astype(np.float32)
+    hwc[2, 3, 0] = np.nan
+    hwc[4, 5, 1] = np.inf
+
+    sci_path = tmp_path / "science_memmap.bin"
+    cov_path = tmp_path / "coverage_memmap.bin"
+    science = np.memmap(sci_path, dtype=np.float32, mode="w+", shape=(h, w, c))
+    science[...] = hwc
+    stack_depth = np.memmap(cov_path, dtype=np.int32, mode="w+", shape=(h, w))
+    stack_depth[...] = 3
+    assembled = SimpleNamespace(
+        science=science,
+        stack_depth=stack_depth,
+        complete_cells=1,
+        incomplete_cells=0,
+        hole_pixels=0,
+        coverage_pixels=h * w,
+    )
+    canvas = zg.GlobalCanvas(
+        canvas_id="f1", wcs_header=_wcs_header().tostring(),
+        width=w, height=h, resolution_deg=0.001,
+    )
+    layout = {"nx": 1, "ny": 1, "ram_budget_bytes": 0, "available_bytes": 0,
+              "max_contributors": 4, "predicted_bound_bytes": 0}
+
+    seen_chw = []
+
+    real_asc = np.ascontiguousarray
+
+    def _recording_asc(arr, *args, **kwargs):
+        a = np.asarray(arr)
+        if a.ndim == 3 and a.shape == (c, h, w):
+            seen_chw.append(tuple(a.shape))
+        return real_asc(arr, *args, **kwargs)
+
+    monkeypatch.setattr(np, "ascontiguousarray", _recording_asc)
+
+    zz._write_outputs(
+        assembled, canvas, 1, 1, tmp_path, [], {}, [],
+        layout, SimpleNamespace(normalization="sky_mean"), 0, {}, None,
+        finished_science=science, raw_science=science,
+        raw_science_path=None, aesthetic_path=None,
+        export_aesthetic_fits=False,
+    )
+
+    assert seen_chw == []  # no full-canvas CHW float32 copy at all
+    out = tmp_path / "mosaic_grid.fits"
+    assert out.exists()
+
+    # Byte-identical data + SCIHASH to the dense CHW path.
+    dense_raw = np.ascontiguousarray(np.moveaxis(hwc, -1, 0))
+    dense_raw[~np.isfinite(dense_raw)] = np.float32(0.0)
+    with fits.open(out) as hdul:
+        got = np.asarray(hdul[0].data, dtype="<f4")
+        assert np.array_equal(got, dense_raw)
+        assert hdul[0].header["SCIROLE"] == "SCI"
+        assert hdul[0].header["SCIHASH"] == hashlib.sha256(
+            dense_raw.tobytes()
+        ).hexdigest()
+    cov = tmp_path / "mosaic_grid_coverage.fits"
+    with fits.open(cov) as hdul:
+        assert np.array_equal(
+            np.asarray(hdul[0].data, dtype=np.float32),
+            np.asarray(stack_depth, dtype=np.float32),
+        )

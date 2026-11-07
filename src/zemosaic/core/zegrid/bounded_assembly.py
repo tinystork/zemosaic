@@ -99,6 +99,7 @@ __all__ = [
     "StoreBackedResults",
     "StoreAssemblyAccess",
     "ScratchCanvasAllocator",
+    "ScratchDiscardError",
     "array_sha256_streaming",
     "payload_sha256_streaming",
     "canvas_plane_bytes",
@@ -120,6 +121,24 @@ DEFAULT_HASH_CHUNK_BYTES = 1024 * 1024
 
 class BoundedAccessError(RuntimeError):
     """Base class for bounded-access/lifetime failures."""
+
+
+class ScratchDiscardError(RuntimeError):
+    """F7: scratch cleanup could not remove every file; carries the report."""
+
+    def __init__(self, report):
+        self.report = dict(report)
+        self.removed = int(report.get("removed", 0))
+        self.failures = list(report.get("failures") or ())
+        self.remaining = int(report.get("remaining", 0))
+        detail = "; ".join(
+            f"{f.get('path')}: {f.get('error')}" for f in self.failures
+        )
+        super().__init__(
+            f"scratch cleanup removed {self.removed} file(s) but "
+            f"{len(self.failures)} failed and {self.remaining} remain: {detail}"
+        )
+
 
 
 class AssemblyCapacityError(BoundedAccessError):
@@ -971,9 +990,13 @@ class StoreAssemblyAccess:
 # Honest working-set model
 # ---------------------------------------------------------------------------
 
-#: Exact plane dtypes of ``cell_feather.assemble_canvas_feathered``. The current
-#: canonical assembly costs 121 B/pixel for 3 channels (24+24+24+12+4+4+8+8+8+4+1),
-#: i.e. ~909 MiB for a 2403 x 3278 canvas — NOT the "700 MiB" once quoted.
+#: Exact plane dtypes of ``cell_feather.assemble_canvas_feathered`` (the
+#: ``per_cell`` feathered assembler). With the F6 allocator-backed intermediate
+#: masks the exact cost is 125 B/pixel for 3 channels
+#: (24+24+24+12+4+4+8+8+8+4+3+1+1), NOT 121 B/px: ``valid_out`` (3 B/px) and
+#: ``covered`` (1 B/px) are full-canvas planes too, now backed by the same
+#: allocator. The 121 B/px figure described only the previously anonymous
+#: accumulator subset and must never be advertised as the global cost.
 _CANVAS_PLANES: tuple[tuple[str, str, float], ...] = (
     ("num", "<f8", 3.0),           # (H, W, 3) accumulator
     ("wsum", "<f8", 3.0),          # (H, W, 3) weight accumulator
@@ -985,19 +1008,37 @@ _CANVAS_PLANES: tuple[tuple[str, str, float], ...] = (
     ("support_w2", "<f8", 1.0),
     ("n_eff", "<f8", 1.0),
     ("valid_fraction", "<f4", 1.0),
+    ("valid_out", "|b1", 3.0),     # (H, W, 3) per-channel validity mask
+    ("covered", "|b1", 1.0),       # (H, W) any-channel coverage
+    ("hole_mask", "|b1", 1.0),
+)
+
+#: Exact plane dtypes of the GLOBAL one-owner ``mosaic.assemble_canvas`` path.
+#: It never runs the feather blend, so it costs 49 B/pixel for 3 channels
+#: (12+4+8+8+8+4+4+1), NOT the feathered 121/125 B/px. Advertising 121 B/px for
+#: global was an over-estimate; this table is the truthful model.
+_GLOBAL_CANVAS_PLANES: tuple[tuple[str, str, float], ...] = (
+    ("science", "<f4", 3.0),
+    ("stack_depth", "<i4", 1.0),
+    ("n_eff_support", "<f8", 1.0),
+    ("support_w1", "<f8", 1.0),
+    ("support_w2", "<f8", 1.0),
+    ("valid_fraction", "<f4", 1.0),
+    ("owner", "<i4", 1.0),
     ("hole_mask", "|b1", 1.0),
 )
 
 
 def canvas_plane_bytes(
-    canvas_hw: tuple[int, int], *, channels: int = 3
+    canvas_hw: tuple[int, int], *, channels: int = 3, gauge_mode: str = "per_cell"
 ) -> dict:
-    """Exact bytes of the feathered-assembly accumulators for one canvas.
+    """Exact bytes of the assembly accumulators for one canvas.
 
-    These are ANONYMOUS allocations of the current canonical assembly (unless a
-    scratch allocator is wired in M5-B). At the canonical 3 channels this is
-    121 B/pixel: a 2403 x 3278 canvas costs 953,121,114 B (~909 MiB), NOT the
-    ~700 MiB once claimed by a partial inventory.
+    Mode-aware (F6): the ``global`` one-owner assembly allocates 8 planes / 49
+    B/px at 3 channels; the ``per_cell`` feathered assembly allocates 13 planes
+    / 125 B/px (including the allocator-backed intermediate validity masks).
+    These are anonymous RAM unless a scratch allocator is wired (``canvas_backing
+    = "scratch"``), in which case the bytes are reported on the disk line.
     """
     h, w = int(canvas_hw[0]), int(canvas_hw[1])
     if h <= 0 or w <= 0:
@@ -1005,9 +1046,18 @@ def canvas_plane_bytes(
     if int(channels) <= 0:
         raise BoundedAccessError("channels must be > 0")
     px = h * w
+    mode = str(gauge_mode)
+    if mode == "global":
+        table = _GLOBAL_CANVAS_PLANES
+    elif mode == "per_cell":
+        table = _CANVAS_PLANES
+    else:
+        raise BoundedAccessError(
+            f"unsupported gauge_mode for the canvas plane model: {mode!r}"
+        )
     planes: dict[str, dict] = {}
     total = 0
-    for name, token, mult in _CANVAS_PLANES:
+    for name, token, mult in table:
         dtype = np.dtype(token)
         items = 3 if float(mult) == 3.0 else 1
         if items == 3 and int(channels) != 3:
@@ -1022,11 +1072,15 @@ def canvas_plane_bytes(
     return {
         "canvas_hw": [h, w],
         "channels": int(channels),
+        "gauge_mode": mode,
         "pixels": int(px),
         "bytes_per_pixel": (int(total) / float(px)) if px else 0.0,
         "planes": planes,
         "total_bytes": int(total),
-        "kind": "anonymous_accumulators",
+        "kind": (
+            "global_one_owner_planes"
+            if mode == "global" else "feathered_accumulators"
+        ),
     }
 
 
@@ -1201,7 +1255,8 @@ def assembly_plan(
     * ``store_total_bytes`` — the whole durable cell set on disk (NOT resident);
     * ``resident_mapped_bytes`` — the worst case simultaneously mapped (cap ×
       the largest cells);
-    * ``canvas_bytes`` — exact anonymous accumulators (121 B/px at 3 channels);
+    * ``canvas_bytes`` — exact accumulators for the requested gauge mode
+      (49 B/px global, 125 B/px feathered per_cell at 3 channels);
     * ``transient_bytes`` — conservative consumer working copies (one cell, or
       two while the previous cell's locals overlap) + streaming hash chunk;
     * ``graph`` — conservative price of the canonical DENSE offset solve
@@ -1212,7 +1267,7 @@ def assembly_plan(
 
     ``canvas_backing`` (A4) reclassifies the canvas accumulators:
 
-    * ``"anonymous"`` (default) — the 121 B/px canvas counts against the RAM
+    * ``"anonymous"`` (default) — the mode-aware canvas bytes count against the RAM
       ``required`` (historical behaviour, unchanged);
     * ``"scratch"`` — the canvas is backed by a scratch mapping (file-backed,
       NOT anonymous RAM), so its bytes move OUT of the RAM ``required`` and are
@@ -1228,7 +1283,10 @@ def assembly_plan(
     sizes = sorted(int(v) for v in cell_plane_bytes)
     store_total = int(sum(sizes))
     resident = int(sum(sizes[-cap:])) if sizes else 0
-    canvas = canvas_plane_bytes(canvas_hw, channels=channels)
+    mode = str(gauge_mode)
+    canvas = canvas_plane_bytes(
+        canvas_hw, channels=channels, gauge_mode=mode
+    )
     transient = _per_cell_transient_bytes(
         largest_patch_hw,
         channels=channels,
@@ -1240,7 +1298,6 @@ def assembly_plan(
     n_cells = (
         int(n_cells_complete) if n_cells_complete is not None else len(sizes)
     )
-    mode = str(gauge_mode)
     if mode == "global":
         graph = {
             "mode": "global_no_solve",
@@ -1481,19 +1538,69 @@ class ScratchCanvasAllocator:
             except Exception:  # pragma: no cover - platform flush edge
                 continue
 
-    def discard(self) -> int:
-        """Unlink the scratch files (only after the canvas is no longer used)."""
+    def discard_report(self) -> dict:
+        """Flush/close mappings, unlink scratch files, and REPORT every failure.
+
+        F7: the previous ``discard`` unlinked BEFORE closing the mappings and
+        swallowed ``OSError``, then cleared its internal tracking even when the
+        file survived (a Windows sharing violation silently leaked the file and
+        made the cleanup look complete). This method:
+
+        * flushes and closes each memmap BEFORE the unlink (the correct order);
+        * records every unlink failure with its path and exception;
+        * KEEPS the tracking of files that were not removed, so a later retry
+          can still see them;
+        * returns ``{"removed", "failures", "remaining", "files"}`` and never
+          pretends success.
+        """
         removed = 0
-        for path in self._files:
+        failures: list[dict] = []
+        kept_files: list[str] = []
+        kept_arrays: list[np.ndarray] = []
+        for path, array in zip(list(self._files), list(self._arrays)):
+            try:
+                array.flush()
+            except Exception:  # pragma: no cover - platform flush edge
+                pass
+            # Close the mapping BEFORE unlinking: Windows refuses to unlink a
+            # file with a live mapping, which is exactly the probe's lock edge.
+            try:
+                mapping = getattr(array, "_mmap", None)
+                if mapping is not None and not mapping.closed:
+                    mapping.close()
+            except Exception:  # pragma: no cover - defensive close edge
+                pass
             try:
                 if os.path.exists(path):
                     os.unlink(path)
                     removed += 1
-            except OSError:  # pragma: no cover - Windows lock edge
-                continue
-        self._files.clear()
-        self._arrays.clear()
-        return removed
+            except OSError as exc:
+                failures.append({
+                    "path": str(path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                kept_files.append(path)
+                kept_arrays.append(array)
+        self._files = kept_files
+        self._arrays = kept_arrays
+        return {
+            "removed": int(removed),
+            "failures": failures,
+            "remaining": int(len(kept_files)),
+            "files": [str(p) for p in kept_files],
+        }
+
+    def discard(self) -> int:
+        """Unlink the scratch files; RAISE if any file could not be removed.
+
+        Success returns the removed count (historical callers keep working).
+        A failure raises :class:`ScratchDiscardError` carrying the exact report
+        (including ``removed == 0``) so no caller can mistake a leak for success.
+        """
+        report = self.discard_report()
+        if report["failures"]:
+            raise ScratchDiscardError(report)
+        return int(report["removed"])
 
 
 def assert_bounded_usage(

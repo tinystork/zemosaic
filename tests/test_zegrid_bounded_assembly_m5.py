@@ -701,16 +701,15 @@ def test_m5a_scratch_canvas_is_bit_identical(tmp_path):
         )
         assert_same_canvas(scratch, reference)
         assert allocator.bytes_allocated() > 0
-        # A4: all 11 canonical accumulator planes (121 B/px) are now
-        # allocator-backed (num, wsum, science_work, science_out, stack_depth,
-        # owner, support_w1, support_w2, n_eff, valid_fraction, hole_mask).
-        assert len(list((tmp_path / "scratch").glob("*.bin"))) == 11
+        # A4/F6: all 13 canonical planes (125 B/px including the
+        # allocator-backed valid_out/covered masks) are allocator-backed.
+        assert len(list((tmp_path / "scratch").glob("*.bin"))) == 13
         assert np.array_equal(
             scratch.science, reference.science, equal_nan=True
         )
     finally:
         removed = allocator.discard()
-        assert removed == 11
+        assert removed == 13
         assert not list((tmp_path / "scratch").glob("*.bin"))
 
 
@@ -1501,3 +1500,76 @@ def test_m5a_capture_guard_runs_before_capture_context_and_run_work():
     assert line.startswith("    _validate_capture_store_compatibility("), line
     # NOTE: full execution-order proof inside _run_single is NOT_RUN (no product
     # run here); this is a structural guard, the predicate itself is unit-tested.
+
+
+# ---------------------------------------------------------------------------
+# F6/F7 — truthful scratch cleanup
+# ---------------------------------------------------------------------------
+
+def test_f7_discard_reports_permission_failure_and_keeps_tracking(
+    tmp_path, monkeypatch
+):
+    import errno
+    import os as _os
+    from zemosaic.core.zegrid import bounded_assembly as zbas_local
+
+    allocator = zbas_local.ScratchCanvasAllocator(tmp_path / "scratch",
+                                                  prefix="f7")
+    allocator((4, 5), np.float32)
+    allocator((4, 5), np.float64)
+    files = list((tmp_path / "scratch").glob("*.bin"))
+    assert len(files) == 2
+
+    real_unlink = _os.unlink
+    state = {"fail": True}
+
+    def _locked(path, *args, **kwargs):
+        if state["fail"]:
+            raise PermissionError(errno.EACCES, "sharing violation", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(_os, "unlink", _locked)
+    report = allocator.discard_report()
+    assert report["removed"] == 0
+    assert report["remaining"] == 2
+    assert len(report["failures"]) == 2
+    # Tracking is KEPT for later retries; the files still exist.
+    assert len(allocator._files) == 2
+    assert all(p.exists() for p in files)
+
+    # discard() must RAISE (never pretend success) and carry removed=0.
+    with pytest.raises(zbas_local.ScratchDiscardError) as exc:
+        allocator.discard()
+    assert exc.value.removed == 0
+    assert len(exc.value.failures) == 2
+    assert len(allocator._files) == 2
+
+    # A retry after the lock clears removes them and empties the tracking.
+    state["fail"] = False
+    assert allocator.discard() == 2
+    assert allocator._files == []
+    assert not list((tmp_path / "scratch").glob("*.bin"))
+
+
+def test_f7_caller_logs_incomplete_cleanup_as_error():
+    from zemosaic import zemosaic_zegrid_mode as zz
+    from zemosaic.core.zegrid import bounded_assembly as zbas_local
+
+    class _Failing:
+        def discard_report(self):
+            return {
+                "removed": 0,
+                "failures": [{"path": "x.bin", "error": "PermissionError: locked"}],
+                "remaining": 1,
+                "files": ["x.bin"],
+            }
+
+    lines = []
+
+    def _emit(message, lvl="INFO", callback=None):
+        lines.append((lvl, str(message)))
+
+    zz._release_assembly_scratch(_Failing(), _emit, None)
+    assert lines and lines[-1][0] == "ERROR"
+    assert "removed=0" in lines[-1][1]
+    assert "remaining=1" in lines[-1][1]

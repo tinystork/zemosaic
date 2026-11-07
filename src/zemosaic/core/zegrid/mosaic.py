@@ -56,16 +56,33 @@ class AssembledCanvas:
         return int(np.count_nonzero(~self.hole_mask))
 
 
-def _empty_planes(canvas: GlobalCanvas) -> dict:
+def _empty_planes(canvas: GlobalCanvas, allocator=None) -> dict:
     h, w = canvas.height, canvas.width
+    if allocator is None:
+        return {
+            "science": np.full((h, w, 3), np.nan, dtype=np.float32),
+            "stack_depth": np.zeros((h, w), dtype=np.int32),
+            "n_eff_support": np.zeros((h, w), dtype=np.float64),
+            "support_w1": np.zeros((h, w), dtype=np.float64),
+            "support_w2": np.zeros((h, w), dtype=np.float64),
+            "valid_fraction": np.zeros((h, w), dtype=np.float32),
+            "owner": np.zeros((h, w), dtype=np.int32),
+        }
+    # F6: allocator-backed planes (scratch-backed canvas). The contract is the
+    # one ``assemble_canvas_feathered`` documents: ``allocator(shape, dtype)``
+    # returns a ZERO-FILLED writable array. Science needs the NaN hole sentinel,
+    # so initialize it in place (never an extra anonymous copy).
+    alloc = allocator
+    science = alloc((h, w, 3), np.float32)
+    science[...] = np.nan
     return {
-        "science": np.full((h, w, 3), np.nan, dtype=np.float32),
-        "stack_depth": np.zeros((h, w), dtype=np.int32),
-        "n_eff_support": np.zeros((h, w), dtype=np.float64),
-        "support_w1": np.zeros((h, w), dtype=np.float64),
-        "support_w2": np.zeros((h, w), dtype=np.float64),
-        "valid_fraction": np.zeros((h, w), dtype=np.float32),
-        "owner": np.zeros((h, w), dtype=np.int32),
+        "science": science,
+        "stack_depth": alloc((h, w), np.int32),
+        "n_eff_support": alloc((h, w), np.float64),
+        "support_w1": alloc((h, w), np.float64),
+        "support_w2": alloc((h, w), np.float64),
+        "valid_fraction": alloc((h, w), np.float32),
+        "owner": alloc((h, w), np.int32),
     }
 
 
@@ -74,6 +91,8 @@ def assemble_canvas(
     nx: int,
     ny: int,
     cores: dict[str, dict | None],
+    *,
+    allocator=None,
 ) -> AssembledCanvas:
     """Place core slices into the canvas (deterministic, one-owner, no blend).
 
@@ -86,9 +105,16 @@ def assemble_canvas(
     Raises ``AssertionError`` if a complete Cell's core shape does not match its
     layout bounds, or if two Cells would overlap (owner > 1) — the "exactly one
     owner per pixel" invariant.
+
+    ``allocator`` (F6) is an OPTIONAL ``callable(shape, dtype) -> ndarray`` that
+    must return a ZERO-FILLED writable array. When supplied, ALL eight canvas
+    planes are backed by it (file-backed scratch instead of anonymous RAM), so
+    the global gauge assembly honours the caller's bounded residency request.
+    ``None`` (the default) keeps the historical ``np.zeros``/``np.full``
+    behaviour bit-for-bit; the numeric path is identical either way.
     """
     layout = build_layout(canvas, nx, ny)
-    planes = _empty_planes(canvas)
+    planes = _empty_planes(canvas, allocator)
     complete: list[str] = []
     incomplete: list[str] = []
 
@@ -133,7 +159,11 @@ def assemble_canvas(
         # Incomplete Cells leave owner==0 holes by design (explicit, not a gap bug).
         # Only flag gaps OUTSIDE the incomplete Cell regions.
         pass
-    hole_mask = (planes["stack_depth"] == 0)
+    if allocator is None:
+        hole_mask = (planes["stack_depth"] == 0)
+    else:
+        hole_mask = allocator((canvas.height, canvas.width), np.bool_)
+        np.equal(planes["stack_depth"], 0, out=hole_mask)
     # Science where stack_depth == 0 is a coverage hole (never silently filled).
     planes["science"][hole_mask] = np.nan
 

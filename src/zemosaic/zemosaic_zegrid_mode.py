@@ -4369,7 +4369,12 @@ def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None,
             )
         except Exception:
             pass
-    return zmosaic.assemble_canvas(canvas, nx, ny, cores), None
+    # F6: route the caller's scratch allocator to the GLOBAL one-owner path too
+    # (previously it was silently dropped, producing anonymous ndarrays). The
+    # default ``None`` keeps the historical in-RAM behaviour unchanged.
+    return zmosaic.assemble_canvas(
+        canvas, nx, ny, cores, allocator=allocator
+    ), None
 
 
 def _prepare_stack_cell(task):
@@ -7379,6 +7384,7 @@ def _layout_joint_plan_probe(
     refinement_rank: int = 0,
     pinned: bool = False,
     run_id: str = "layout-joint-probe",
+    gauge_mode: str | None = None,
 ) -> dict:
     """A1b — admit a layout only if the FULL joint CPU aggregate fits.
 
@@ -7393,11 +7399,13 @@ def _layout_joint_plan_probe(
     returned as data (never raised) so the caller can continue scanning finer
     candidates with a truthful reason.
 
-    ASSEMBLY PRICING (M1, rework-1): ``retained_core_bytes`` follows the
-    product convention (16 B/px = science RGB f32 + stack_depth f32). The REAL
-    feathered assembler allocates 121 B/px
-    (``bounded_assembly.canvas_plane_bytes``, A0 poste #4); that full-canvas
-    working set is NOT priced in A1 and is DEFERRED TO A4. The returned
+    ASSEMBLY PRICING (M1, rework-1; F6 corrected): ``retained_core_bytes``
+    follows the product convention (16 B/px = science RGB f32 + stack_depth
+    f32). The canvas plane model is now GAUGE-MODE AWARE
+    (``bounded_assembly.canvas_plane_bytes``): the GLOBAL one-owner assembler
+    allocates 49 B/px at 3 channels, the per_cell feathered assembler 125 B/px.
+    Advertising 121 B/px for global was an over-estimate. That full-canvas
+    working set is NOT priced in A1 and is DEFERRED TO A4; the returned
     ``unpriced_assembly_canvas_bytes`` carries the deferred amount so the
     manifest/log cannot imply PLAN=ADMIT=RUN on assembly.
     """
@@ -7420,15 +7428,26 @@ def _layout_joint_plan_probe(
     patch_px = max(1, h * w)
     channels = 3
     canvas = int(canvas_px)
-    # M1: the real feathered assembler is 121 B/px; A1 prices the product
-    # 16 B/px convention and DEFERS this full-canvas term to A4.
+    # M1/F6: the canvas model is gauge-mode aware (global 49 B/px, feathered
+    # per_cell 125 B/px). A1 prices the product 16 B/px convention and DEFERS
+    # this full-canvas term to A4, without over-announcing the feathered cost
+    # for a global run.
     _asm_hw = (
         (int(canvas_hw[0]), int(canvas_hw[1]))
         if canvas_hw is not None
         else (1, canvas)
     )
+    _asm_mode = (
+        str(gauge_mode)
+        if gauge_mode is not None
+        else str(
+            getattr(_STACK_CONFIG, "cell_gauge_mode", "global") or "global"
+        )
+    )
     unpriced_assembly_canvas_bytes = int(
-        zbas.canvas_plane_bytes(_asm_hw, channels=channels)["total_bytes"]
+        zbas.canvas_plane_bytes(
+            _asm_hw, channels=channels, gauge_mode=_asm_mode
+        )["total_bytes"]
     )
     gauge_fp = int(zpar.gauge_footprint_bytes(canvas))
     cache_fp = int(zpar.cache_footprint_bytes(patch_px))
@@ -11820,10 +11839,21 @@ def _assemble_cells_guarded(
             gauge_mode=mode, grid=(nx, ny),
             canvas_backing=backing,
         )
-    assembled, info = _assemble_cells(
-        canvas, nx, ny, mode, cores, result_by_cid,
-        allocator=allocator, **kwargs
-    )
+    try:
+        assembled, info = _assemble_cells(
+            canvas, nx, ny, mode, cores, result_by_cid,
+            allocator=allocator, **kwargs
+        )
+    except BaseException:
+        # F7: an assembly failure must not leak the scratch mapping it may have
+        # created. Release it here (the caller never receives the allocator) and
+        # re-raise the ORIGINAL exception unchanged.
+        if allocator is not None:
+            try:
+                allocator.discard_report()
+            except Exception:
+                pass
+        raise
     return assembled, info, plan, allocator
 
 
@@ -18238,8 +18268,9 @@ def _run_single(
             r37_capture=r37_diagnostic_capture,
             r40_capture=r40_seam_capture,
         )
-        # A4: bounded assembly falls back to a scratch-backed canvas when the
-        # anonymous 121 B/px canvas does not fit the observed RAM budget. The
+        # A4/F6: bounded assembly falls back to a scratch-backed canvas when the
+        # anonymous mode-aware canvas (49 B/px global, 125 B/px feathered
+        # per_cell) does not fit the observed RAM budget. The
         # scratch-backed canvas keeps science bit-identical (the allocator backs
         # every canonical accumulator plane) and the final FITS is serialized in
         # row-bands (no full-canvas copy at the last step).
@@ -18453,702 +18484,689 @@ def _run_single(
     # completed run log, and is marked done ONLY after those writes succeed. It
     # participates in UI progress (its local 100% is still below the global 100%
     # until the explicit terminal success) but carries NO GlobalEta cost here.
-    _finalize_rep = _reporter()
-    _finalize_rep.start("finalize", total=1)
-
-    # Write the immutable pre-finishing assembled science FIRST, so a finishing
-    # exception can never destroy the scientific reference.
-    _write_raw_science_fits(
-        assembled, canvas, raw_science_path,
-        related_file=(aesthetic_path.name if aesthetic_path is not None else None),
-        halo_provenance=_halo_provenance_pass,
-    )
-
-    # ZM-ZEGRID-R18: FINAL-MOSAIC FINISHING (post-assembly, before outputs).
-    # Opt-in + fail-safe: a finishing failure WARNS and lets the run complete with
-    # the raw assembled science (never crashes a run; never silently dropped).
-    finished_science = np.asarray(assembled.science, dtype=np.float32)
-    finishing_info = {"enabled": False, "failed": False, "failure_reason": ""}
-    fin_uint16 = None
     try:
-        _fin = zfin.apply_final_mosaic_finishing(
-            assembled.science, assembled.stack_depth, config=finishing_config
+        _finalize_rep = _reporter()
+        _finalize_rep.start("finalize", total=1)
+
+        # Write the immutable pre-finishing assembled science FIRST, so a finishing
+        # exception can never destroy the scientific reference.
+        _write_raw_science_fits(
+            assembled, canvas, raw_science_path,
+            related_file=(aesthetic_path.name if aesthetic_path is not None else None),
+            halo_provenance=_halo_provenance_pass,
         )
-        finished_science = _fin.science
-        finishing_info = _fin.info
-        fin_uint16 = _fin.uint16
-        if finishing_info.get("enabled"):
-            _emit(
-                f"ZeGrid: final-mosaic finishing applied — dbe={finishing_info.get('dbe', {}).get('applied')} "
-                f"rgb_equalize={finishing_info.get('rgb_equalize', {}).get('applied')} "
-                f"uint16={finishing_info.get('uint16', {}).get('written')}",
-                callback=progress_callback,
-            )
-    except Exception as exc:
-        _emit(
-            f"ZeGrid: final-mosaic finishing FAILED ({exc}); writing raw mosaic (WARN)",
-            lvl="WARN", callback=progress_callback,
-        )
+
+        # ZM-ZEGRID-R18: FINAL-MOSAIC FINISHING (post-assembly, before outputs).
+        # Opt-in + fail-safe: a finishing failure WARNS and lets the run complete with
+        # the raw assembled science (never crashes a run; never silently dropped).
         finished_science = np.asarray(assembled.science, dtype=np.float32)
-        finishing_info = {
-            "enabled": bool(finishing_config and any([
-                finishing_config.get("dbe_enabled"),
-                finishing_config.get("rgb_equalize"),
-                finishing_config.get("save_uint16"),
-            ])),
-            "failed": True,
-            "failure_reason": repr(exc),
-        }
+        finishing_info = {"enabled": False, "failed": False, "failure_reason": ""}
         fin_uint16 = None
-
-    # R55-D2: build the active block AFTER execution so its status and final
-    # values are the ones that actually ran. It is deterministic (no timing or
-    # observed metric) and is the ONLY scheduler block in active mode.
-    if scheduler_mode == zsched.MODE_ACTIVE and (
-        _r55_active_decision is not None
-        or _r55_active_gpu_decision is not None
-    ):
-        _r55_active_ok = all(
-            r.get("status") in ("complete", "empty") for r in results
-        )
-        _r55_active_plan_set = (
-            _r55_active_decision.plan_set
-            if _r55_active_decision is not None
-            else _r55_active_gpu_decision.plan_set
-        )
-        _r55_scheduler_block = _r55_build_active_block(
-            plan_set=_r55_active_plan_set,
-            final_candidate=_r55_active_candidate,
-            mapping=_r55_active_mapping,
-            bundle=_final,
-            initial_bundle=_initial_bundle,
-            preflight_admission=_r55_active_preflight_adm,
-            launch_admission=_r55_active_launch_adm,
-            preflight_trail=_r55_active_preflight_trail,
-            launch_trail=_r55_active_launch_trail,
-            status=("executed" if _r55_active_ok else "partial"),
-            run=_r55_run_block,
-            worker_adaptation=_r55_worker_adaptation_detail(
-                (
-                    _r55_active_gpu_decision
-                    if _r55_active_gpu_decision is not None
-                    else _r55_active_decision
-                ).facts,
-                (
-                    _r55_active_gpu_decision
-                    if _r55_active_gpu_decision is not None
-                    else _r55_active_decision
-                ).worker_trail,
-            ),
-            tile_ladder=(
-                _r55_active_gpu_decision.gpu_tile_ladder
-                if _r55_active_gpu_decision is not None
-                else (
-                    _r55_gpu_retained["decision"].gpu_tile_ladder
-                    if _r55_gpu_retained is not None
-                    else None
-                )
-            ),
-        )
-        if _r55_active_gpu_decision is not None:
-            _r55_scheduler_block["gpu_execution"] = dict(
-                _r55_active_gpu_decision.qualification
-            )
-            _r55_scheduler_block["gpu_tile_decision"] = (
-                _r55_gpu_tile_decision_dict(
-                    _r55_active_gpu_decision,
-                    _r55_active_mapping,
-                    _final,
-                    runtime=(_r55_run_telemetry or {}).get(
-                        "gpu_tile_adaptation"
-                    ),
-                    legacy_probe_budget_bytes=gpu_ctx.get(
-                        "legacy_probe_vram_budget_bytes"
-                    ),
-                )
-            )
-            if _r55_run_telemetry and _r55_run_telemetry.get(
-                "gpu_tile_adaptation"
-            ):
-                _r55_scheduler_block["gpu_tile_runtime"] = dict(
-                    _r55_run_telemetry["gpu_tile_adaptation"]
-                )
-        if (
-            _r55_active_gpu_decision is None
-            and _r55_gpu_retained is not None
-        ):
-            # R55-E11: the ORIGINAL GPU decision survives the runtime fallback.
-            # Its absence after a fallback was previously unreadable (None meant
-            # both "never selected" and "selected then abandoned").
-            _ret = _r55_gpu_retained
-            _ret_runtime = dict(_ret.get("runtime_tile") or {})
-            _r55_scheduler_block["gpu_tile_decision"] = (
-                _r55_gpu_tile_decision_dict(
-                    _ret["decision"],
-                    _ret["mapping"],
-                    _ret["bundle"],
-                    runtime=(_ret_runtime or None),
-                    legacy_probe_budget_bytes=gpu_ctx.get(
-                        "legacy_probe_vram_budget_bytes"
-                    ),
-                )
-            )
-            _r55_scheduler_block["gpu_original_decision"] = {
-                "schema": _R55E11_TILE_RUNTIME_SCHEMA,
-                "reason": "runtime_fallback_preserved_selection",
-                "selected_tile_px": int(
-                    _ret["mapping"]["gpu_streaming_tile"]
-                ),
-                "effective_tile_px": _ret_runtime.get("effective_tile_px"),
-                "declared_ladder": [
-                    int(t) for t in _ret["decision"].gpu_tile_ladder
-                ],
-                "vram_percent": int(
-                    _ret["decision"].qualification["percent"]
-                ),
-                "vram_budget_bytes": int(
-                    _ret["decision"].qualification["budget_bytes"]
-                ),
-                "legacy_probe_vram_budget_bytes": gpu_ctx.get(
-                    "legacy_probe_vram_budget_bytes"
-                ),
-                "engine_provenance": _r55_engine_provenance(),
-            }
-            _r55_scheduler_block["gpu_tile_runtime"] = _ret_runtime
-            _ret_pipeline = (_ret.get("telemetry") or {}).get("pipeline")
-            if _ret_pipeline:
-                _r55_scheduler_block["gpu_fallback_pipeline"] = dict(
-                    _ret_pipeline
-                )
-        if _r55_gpu_run_fallback is not None:
-            _r55_scheduler_block["gpu_fallback"] = dict(
-                _r55_gpu_run_fallback
-            )
-        elif _r55_gpu_fallback_reason is not None:
-            _r55_scheduler_block["gpu_fallback"] = dict(
-                _r55_gpu_fallback_reason
-            )
-
-    # R55-C rework-2: the observe block was built from the SELECTED backend.
-    # Reconcile its nested readiness provenance with the backend that actually
-    # produced the whole-batch output (runtime GPU->CPU fallback included) before
-    # any manifest/output write. Never changes requested_backend or execution.
-    _r55_scheduler_block = _r55_reconcile_gpu_readiness(
-        _r55_scheduler_block, gpu_ctx
-    )
-
-    # M5-A: bounded-assembly audit. The ENFORCEMENT is the preflight below
-    # (which ran BEFORE any payload mapping, graph solve or canvas allocation);
-    # everything recorded here is posthoc EVIDENCE, never the gate itself.
-    if _store_backed_results:
         try:
-            _session = results.session
-            _stats = _session.stats()
-            _cap = int(_stats["max_resident_cells"])
-            _max_live = _stats.get("max_live_bytes")
-            _guard_ok = bool(
-                int(_stats["peak_live_cells"]) <= _cap
-                and (
-                    _max_live is None
-                    or int(_stats["peak_live_mapped_bytes"])
-                    <= int(_max_live)
-                )
+            _fin = zfin.apply_final_mosaic_finishing(
+                assembled.science, assembled.stack_depth, config=finishing_config
             )
-            per_cell_diagnostics["r55_bounded_assembly"] = {
-                "schema": zbas.SCHEMA,
-                "enforcement": {
-                    "gate": "preflight_before_payload_load",
-                    "refusal_type": "AssemblyCapacityError",
-                    "requires_real_budget": True,
-                    "budget_armed_live_bytes": (
-                        None if _max_live is None else int(_max_live)
-                    ),
-                },
-                "preflight": _bounded_preflight,
-                "access": _stats,
-                "evidence": {
-                    "guard_ok": _guard_ok,
-                    "max_resident_cells": _cap,
-                    "peak_live_cells": int(_stats["peak_live_cells"]),
-                    "peak_live_mapped_bytes": int(
-                        _stats["peak_live_mapped_bytes"]
-                    ),
-                    "policy": (
-                        "live mapped payloads (weak-ref counted, external "
-                        "views included) must stay within the armed envelope"
-                    ),
-                },
-                "note": (
-                    "posthoc statistics are EVIDENCE, not enforcement; the "
-                    "capacity gate ran before any payload was mapped. "
-                    "Read-only memory-mapped payloads; integrity + canonical "
-                    "fingerprint checked once per immutable identity per "
-                    "session (streamed hash); pre-offset commits never mutated."
-                ),
-            }
-        except Exception as _bounded_exc:  # audit only, never a silent claim
-            per_cell_diagnostics["r55_bounded_assembly"] = {
-                "schema": zbas.SCHEMA,
-                "error": f"{type(_bounded_exc).__name__}: {_bounded_exc}",
-                "note": "audit could not be computed; no bound claimed",
-            }
-
-    # M1: publish the lightweight conservation state (never payloads) so the
-    # manifest can audit accepted/pending sparse cells and retained bytes.
-    if result_registry is not None:
-        per_cell_diagnostics["r55_result_registry"] = (
-            result_registry.snapshot()
-        )
-    # M2: durable-store audit (no payloads, no arrays). Recorded ONLY when a
-    # store was requested, so a store-less run keeps its exact manifest shape.
-    if _store_state["enabled"] or _store_state["open_error"] is not None:
-        _store = _store_state["store"]
-        per_cell_diagnostics["r55_durable_store"] = {
-            "schema": zrs.STORE_SCHEMA,
-            "requested": True,
-            "enabled": bool(_store_state["enabled"]),
-            "open_stage": _store_state.get("open_stage"),
-            "open_error": _store_state["open_error"],
-            "open_traceback": _store_state.get("open_traceback"),
-            "degraded_reason": _store_state["degraded_reason"],
-            "commit_errors": list(_store_state["commit_errors"]),
-            "commits": int(_store_state["commits"]),
-            "released_cells": int(_store_state["released_cells"]),
-            "released_bytes": int(_store_state["released_bytes"]),
-            "store": (None if _store is None else _store.report()),
-        }
-    # M4: resume audit (selected run, restored policy, sparse pending set).
-    # Never payloads, never arrays.
-    per_cell_diagnostics["r55_resume"] = dict(_resume_runtime)
-    # M4: external lifecycle accounting (additive, strict JSON).
-    try:
-        _ext_lifecycle["cells_reused_committed"] = int(
-            _store_state.get("released_cells", 0)
-        )
-    except Exception:
-        pass
-    # M5: derive the executed-external count from the ACCEPTED cell records so
-    # the accounting is path-independent (a store-less/legacy run publishes no
-    # commit callback but DID execute its external cells). Records reused from a
-    # durable commit are counted separately and are never double-counted here.
-    try:
-        _n_ext_records = sum(
-            1
-            for _rec in (cell_records or ())
-            if str((_rec or {}).get("working_set")) == WORKING_SET_EXTERNAL
-            and not bool((_rec or {}).get("reused_from_commit"))
-        )
-        if _n_ext_records > int(_ext_lifecycle.get("cells_executed_external", 0)):
-            _ext_lifecycle["cells_executed_external"] = int(_n_ext_records)
-            if int(_ext_lifecycle.get("spool_bytes_written", 0)) == 0:
-                # Prefer the REAL per-cell receipts (attempt-level bytes); fall
-                # back to the predicted per-cell geometry only if absent.
-                _rec_w = 0
-                _rec_r = 0
-                for _rec in (cell_records or ()):
-                    if str((_rec or {}).get("working_set")) != WORKING_SET_EXTERNAL:
-                        continue
-                    _sp = ((_rec or {}).get("storage") or {}).get(
-                        "external_spool"
-                    ) or {}
-                    _rec_w += int(_sp.get("bytes_written") or 0)
-                    _rec_r += int(_sp.get("bytes_read") or 0)
-                if _rec_w <= 0:
-                    try:
-                        _ws_blk = getattr(
-                            _run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None
-                        ) or {}
-                        _disk_blk = _ws_blk.get("disk") or {}
-                        _rec_w = int(_n_ext_records) * int(
-                            _disk_blk.get("cumulative_writes_bytes") or 0
-                        )
-                        _rec_r = int(_n_ext_records) * int(
-                            _disk_blk.get("cumulative_reads_bytes") or 0
-                        )
-                    except Exception:
-                        pass
-                _ext_lifecycle["spool_bytes_written"] = int(_rec_w)
-                _ext_lifecycle["spool_bytes_read"] = int(_rec_r)
-    except Exception:
-        pass
-    # M5: no residue after a SUCCESSFUL external run, including the spool root
-    # itself. Only EMPTY directories are pruned (a live/late attempt or any
-    # foreign file blocks the prune rather than being destroyed).
-    try:
-        try:
-            _ws_prune = getattr(_run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None) or {}
-        except Exception:
-            _ws_prune = {}
-        _prune_root = ((_ws_prune.get("disk") or {}).get("spool_root"))
-        if not _prune_root and cache_root is not None:
-            # Legacy/store-less runs have no bundle state here, but the spool
-            # root is deterministic on the run's own cache volume.
-            _cand_root = Path(str(cache_root)) / "external-spool"
-            if _cand_root.is_dir():
-                _prune_root = str(_cand_root)
-        if _prune_root:
-            _prune_path = Path(str(_prune_root))
-            if _prune_path.is_dir():
-                for _child in sorted(_prune_path.iterdir()):
-                    if _child.is_dir():
-                        try:
-                            _child.rmdir()
-                        except OSError:
-                            pass
-                try:
-                    _prune_path.rmdir()
-                except OSError:
-                    pass
-    except Exception:
-        pass
-    per_cell_diagnostics["external_lifecycle"] = dict(_ext_lifecycle)
-    # M3: the working-set class + dry-plan/disk facts (additive manifest block).
-    try:
-        per_cell_diagnostics["working_set"] = getattr(
-            _run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None
-        )
-    except Exception:
-        per_cell_diagnostics["working_set"] = None
-
-    # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
-    export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
-    sci_path, cov_path, manifest_path = _write_outputs(
-        assembled, canvas, nx, ny, output_dir, descs, {}, cell_records,
-        layout, science_config, peak_rss_kib, cache_report, progress_callback,
-        rejected=rejected, sip_mode=sip_mode,
-        frames_loaded=len(frames_info),
-        global_reference_frame_id=global_reference_frame_id,
-        timings=timings, gpu_used=gpu_used, ignored_settings=ignored_settings,
-        ignored_run_args=ignored_run_args,
-        gauge_diagnostics=gauge_diagnostics,
-        per_cell_diagnostics=per_cell_diagnostics,
-        auto_gauge_info=auto_gauge_info,
-        cell_feather_info=feather_info,
-        finished_science=finished_science, finishing_info=finishing_info,
-        fin_uint16=fin_uint16,
-        gpu_context=gpu_ctx,
-        aggregate_peak_rss_kib=aggregate_peak_rss_kib,
-        raw_science_path=raw_science_path,
-        raw_science=raw_science,
-        aesthetic_path=aesthetic_path if export_aesthetic else None,
-        export_aesthetic_fits=export_aesthetic,
-        scientific_fits_suffix=(finishing_config or {}).get(
-            "scientific_fits_suffix", "_science"
-        ),
-        halo_provenance=_halo_provenance_pass,
-        r55_scheduler=_r55_scheduler_block,
-        r55_run_telemetry=_r55_run_telemetry,
-        publication=_publication,
-    )
-
-    _write_run_log(
-        output_dir,
-        timings,
-        start_ts=start_ts,
-        frames_loaded=len(frames_info),
-        n_included=len(descs),
-        n_rejected=len(rejected or []),
-        canvas=canvas,
-        layout=layout,
-        gpu_used=gpu_used,
-        ignored_settings=ignored_settings,
-        ignored_run_args=ignored_run_args,
-        peak_rss_kib=peak_rss_kib,
-        cache_info=cache_report,
-        global_reference_frame_id=global_reference_frame_id,
-        gauge_diagnostics=gauge_diagnostics,
-        per_cell_diagnostics=per_cell_diagnostics,
-        finishing_info=finishing_info,
-        gpu_context=gpu_ctx,
-        aggregate_peak_rss_kib=aggregate_peak_rss_kib,
-        halo_provenance=_halo_provenance_pass,
-    )
-
-    # M5-B: close the generation ONLY now that every member exists. The run-log
-    # copy is auxiliary (not authority); if it cannot be staged the generation
-    # is still complete without it, with an explicit warning. publication.json
-    # is written first, then ONE atomic pointer flip: before the flip the
-    # previous generation remains the only authority.
-    _published_generation = None
-    if _publication is not None:
-        try:
-            _publication.include_auxiliary(
-                zpub.ROLE_RUN_LOG, Path(output_dir) / RUN_LOG_NAME
-            )
-        except Exception as _aux_exc:
-            _publication.members.pop(zpub.ROLE_RUN_LOG, None)
-            _emit(
-                "ZeGrid: run-log copy could not be staged in the publication "
-                f"generation ({type(_aux_exc).__name__}: {_aux_exc}); the "
-                "generation is published without this auxiliary member",
-                lvl="WARN",
-                callback=progress_callback,
-            )
-        _required_roles = [
-            zpub.ROLE_SCIENCE, zpub.ROLE_COVERAGE, zpub.ROLE_MANIFEST
-        ]
-        if zpub.ROLE_RUN_LOG in _publication.members:
-            _required_roles.append(zpub.ROLE_RUN_LOG)
-        _optional_roles = {}
-        if zpub.ROLE_AESTHETIC in _publication.members:
-            _optional_roles[zpub.ROLE_AESTHETIC] = bool(export_aesthetic)
-        if zpub.ROLE_UINT16 in _publication.members:
-            _optional_roles[zpub.ROLE_UINT16] = bool(fin_uint16 is not None)
-        _published_generation = _publication.commit(
-            required_roles=_required_roles,
-            optional_roles=_optional_roles,
-            metadata={
-                "run_id": str(_store_state["store"].run_id),
-                "gauge_mode": str(_gauge_mode),
-                "export_aesthetic": bool(export_aesthetic),
-                "uint16": bool(fin_uint16 is not None),
-            },
-        )
-        _resume_runtime["publication"] = _published_generation.as_report()
-        # ZM-ZEGRID-ROOT-DELIVERABLES: DELIVER the finished products at the
-        # OUTPUT ROOT first (Classic/SDS consistency), then write the visible
-        # markers that name those root paths. Both run only AFTER the pointer
-        # is durable. A delivery failure is a WARN: the publication stays
-        # authoritative and a prior root file is left byte-identical.
-        _root_files: dict = {}
-        try:
-            _root_delivery = zpub.publish_root_deliverables(
-                output_dir, _published_generation
-            )
-            _root_files = _root_delivery["root_files"]
-            for _root_failure in _root_delivery["failures"]:
+            finished_science = _fin.science
+            finishing_info = _fin.info
+            fin_uint16 = _fin.uint16
+            if finishing_info.get("enabled"):
                 _emit(
-                    "ZeGrid: root deliverable not published — "
-                    f"{_root_failure}; the publication remains authoritative "
-                    "and the previous root file was left untouched.",
-                    lvl="WARN",
+                    f"ZeGrid: final-mosaic finishing applied — dbe={finishing_info.get('dbe', {}).get('applied')} "
+                    f"rgb_equalize={finishing_info.get('rgb_equalize', {}).get('applied')} "
+                    f"uint16={finishing_info.get('uint16', {}).get('written')}",
                     callback=progress_callback,
                 )
-        except Exception as _root_exc:
+        except Exception as exc:
             _emit(
-                "ZeGrid: products could not be delivered at the output root "
-                f"({type(_root_exc).__name__}: {_root_exc}); the publication "
-                "remains authoritative and the previous root files were left "
-                "untouched.",
-                lvl="WARN",
-                callback=progress_callback,
-            )
-        # r4: VISIBLE discovery entry point at the output root, written ONLY
-        # after the pointer is durable. It names the DELIVERED root paths and
-        # still records the immutable generation directory for audit/resume.
-        try:
-            _visible = zpub.write_visible_products(
-                output_dir, _published_generation, root_files=_root_files
-            )
-            _resume_runtime["visible_products"] = {
-                "json": str(
-                    Path(output_dir) / zpub.PRODUCTS_JSON_FILENAME
-                ),
-                "text": str(
-                    Path(output_dir) / zpub.PRODUCTS_TEXT_FILENAME
-                ),
-                "generation_dir": str(_visible["generation_dir"]),
-            }
-            _emit(
-                "ZeGrid: products entry point written — "
-                f"{Path(output_dir) / zpub.PRODUCTS_JSON_FILENAME} -> "
-                f"{_published_generation.generation} "
-                f"({_published_generation.generation_dir})",
-                callback=progress_callback,
-            )
-        except Exception as _visible_exc:
-            _emit(
-                "ZeGrid: products entry point could not be written "
-                f"({type(_visible_exc).__name__}: {_visible_exc}); the "
-                "publication remains authoritative and the previous pointers "
-                "were left intact.",
-                lvl="WARN",
-                callback=progress_callback,
-            )
-        _emit(
-            "ZeGrid: publication generation COMMITTED — "
-            f"{_published_generation.generation} "
-            f"({len(_published_generation.members)} verified member(s), "
-            f"publication sha256 {_published_generation.publication_sha256[:16]}…); "
-            "CURRENT.json is the final atomic pointer",
-            callback=progress_callback,
-        )
-
-    # M4: finalize the durable run state ONLY after the complete publication
-    # (science + coverage + manifest) exists. A later auto-resume is then a
-    # verified no-op, never a recomputation of valid cells.
-    if _store_state["store"] is not None and _store_state.get("degraded_reason") is None:
-        try:
-            _run_root = _store_state["store"].root
-            _prev_state = zres.read_state(_run_root)
-            if _published_generation is not None:
-                # M5-B: the durable generation is the reader contract; every
-                # member digest below was verified BEFORE the pointer flip.
-                _outputs = _published_generation.outputs_state()
-            else:
-                _outputs = {}
-                for _name, _path in (
-                    ("science", sci_path),
-                    ("coverage", cov_path),
-                    ("manifest", manifest_path),
-                ):
-                    if _path is not None and Path(_path).exists():
-                        _sha, _nbytes = zrs.content_sha256_file(_path)
-                        _outputs[_name] = {
-                            "sha256": _sha, "nbytes": int(_nbytes)
-                        }
-            zres.write_state(
-                _run_root,
-                run_id=_prev_state["run_id"],
-                expected_cell_ids=_prev_state["expected_cell_ids"],
-                policy=zres.policy_from_snapshot(_storage_policy_snapshot()),
-                plan_generation=int(_prev_state["plan_generation"]) + 1,
-                finalized=True,
-                gauge_sha256=_prev_state["gauge_sha256"],
-                outputs=_outputs,
-                created_unix_ns=_prev_state["created_unix_ns"],
-                note=_prev_state["note"],
-                # The frozen admission is never rewritten after creation.
-                admission=_prev_state.get("admission"),
-            )
-            _resume_runtime["finalized_noop"] = False
-            _resume_runtime["outputs"] = dict(_outputs)
-        except Exception as _fin_exc:
-            _emit(
-                "ZeGrid: durable run state could not be finalized "
-                f"({type(_fin_exc).__name__}: {_fin_exc}); the published "
-                "outputs stay valid but a later resume will re-verify the "
-                "commits instead of trusting a finalization flag.",
-                lvl="WARN",
-                callback=progress_callback,
-            )
-
-    # M1: the run published successfully. The registry's explicit release is the
-    # single ownership hand-off; the transient ``results`` list is also dropped.
-    # (On any earlier failure the registry stays reachable from the typed
-    # exception until the coordinator disposes it.)
-    if result_registry is not None:
-        _disposal = result_registry.dispose()
-        _emit(
-            "ZeGrid: run result registry disposed after successful publication "
-            f"({_disposal.get('released_cells', 0)} cell(s), "
-            f"{_disposal.get('released_bytes', 0)} B released)",
-            callback=progress_callback,
-        )
-    if _store_state["store"] is not None:
-        # M5-A: drop the bounded assembly session BEFORE the store closes (the
-        # session may still hold mapped payloads; their views stay valid).
-        _assembly_access = _store_state.get("assembly_access")
-        if _assembly_access is not None:
-            try:
-                _assembly_stats = _assembly_access.close()
-                _emit(
-                    format_bounded_assembly_close(_assembly_stats),
-                    callback=progress_callback,
-                )
-            except Exception as _bounded_close_exc:
-                _emit(
-                    "ZeGrid: bounded assembly access close warning "
-                    f"({type(_bounded_close_exc).__name__}: {_bounded_close_exc})",
-                    lvl="WARN",
-                    callback=progress_callback,
-                )
-            _store_state["assembly_access"] = None
-        try:
-            _store_state["store"].close()
-        finally:
-            _store_state["publishing"] = False
-        _emit(
-            "ZeGrid: durable run store closed after successful publication "
-            f"({_store_state['commits']} durable cell commit(s), "
-            f"{_store_state['released_bytes']} B released from RAM)",
-            callback=progress_callback,
-        )
-    elif _resume_boot is not None:
-        # A resumed run outside the ACTIVE registry path still holds the lock.
-        _resume_boot.close()
-    results = []
-
-    # ZM-PROGRESS-CONTRACT-R29: the finalize seam completes (1/1) only now that
-    # the immutable science + aesthetic + coverage + manifest + run log are all
-    # written. Its local 100% still leaves GLOBAL progress below 100% until the
-    # worker's explicit terminal success.
-    finalize_wall = _finalize_rep.end()
-
-    # ZM-ETA-SERVICE-R30: append ONE sanitized ZeGrid history record, best-effort,
-    # before the terminal success. ``total_duration_s`` is the honest actual wall
-    # duration of this ``_run_single`` segment from an explicit perf_counter start
-    # (F4), NOT a phase-sum guess; the per-stage ``stage_seconds`` are unchanged
-    # (``Timings`` covers setup..assembly; finalize is added here). It measures
-    # the finalize wall duration honestly WITHOUT changing science/output order —
-    # the manifest is already written, so the finalize duration simply does not
-    # retroactively appear in it (documented). A history write failure is
-    # nonfatal and cannot change output/science success, and no history is
-    # written for a failed/cancelled segment (any earlier exception raised before
-    # this point skips the write). For a split EQ/ALTZ run, one record is written
-    # per successful ``_run_single`` segment (each is a valid comparable segment;
-    # deliberate).
-    try:
-        zeta.append_zegrid_history(
-            zeta.build_zegrid_history_record(
-                total_duration_s=time.perf_counter() - run_wall_start,
-                n_frames=len(frames_info),
-                cell_count=total_cells,
-                stage_seconds={
-                    "setup": timings.get("setup"),
-                    "layout": timings.get("layout"),
-                    "gauge": timings.get("gauge"),
-                    "per_cell_stack": timings.get("per_cell_stack"),
-                    "assembly": timings.get("assembly"),
-                    "finalize": finalize_wall,
-                },
-                stage_totals={
-                    "setup": len(frames_info),
-                    "gauge": 2 * len(descs) - 1,
-                    "per_cell_stack": total_cells,
-                    "finalize": 1,
-                },
-                workers=workers,
-                backend="gpu" if gpu_used else "cpu",
-                # ZM-ETA-INTEGRITY-R32 rework-1: the tracker's measured
-                # sanitized workload (frames/cells, summed input pixels,
-                # patch_area x contributors stack work, canvas area). Never
-                # paths/names/user data; never a quadratic n_frames x pixels.
-                workload=_log_eta_tracker.workload(),
-            )
-        )
-    except Exception:
-        pass
-
-    _emit(
-        f"ZeGrid: done — science={raw_science_path.name} "
-        f"aesthetic={aesthetic_path.name if (export_aesthetic and aesthetic_path is not None) else 'n/a'} "
-        f"({assembled.science.shape}) + coverage + run log, "
-        f"complete={len(assembled.complete_cells)} incomplete={len(assembled.incomplete_cells)} "
-        f"holes={assembled.hole_pixels}px peak_rss={peak_rss_kib}KiB "
-        f"cache_total={cache_total_bytes / 2**20:.0f}MiB cache_peak={cache_peak_bytes / 2**20:.0f}MiB",
-        lvl="SUCCESS",
-        callback=progress_callback,
-    )
-    # A4: release the scratch-backed canvas planes only AFTER every member is
-    # serialized (the raw science, coverage and any finished outputs are all
-    # already written). Best-effort; a discard failure is a warning, never a
-    # failed run (the files are confined to a run-owned scratch directory).
-    if _assembly_allocator is not None:
-        try:
-            _removed = _assembly_allocator.discard()
-            if _removed:
-                _emit(
-                    f"ZeGrid: scratch-backed canvas planes released "
-                    f"({_removed} file(s))",
-                    callback=progress_callback,
-                )
-        except Exception as _discard_exc:
-            _emit(
-                "ZeGrid: scratch-backed canvas planes could not be released "
-                f"({type(_discard_exc).__name__}: {_discard_exc})",
+                f"ZeGrid: final-mosaic finishing FAILED ({exc}); writing raw mosaic (WARN)",
                 lvl="WARN", callback=progress_callback,
             )
+            finished_science = np.asarray(assembled.science, dtype=np.float32)
+            finishing_info = {
+                "enabled": bool(finishing_config and any([
+                    finishing_config.get("dbe_enabled"),
+                    finishing_config.get("rgb_equalize"),
+                    finishing_config.get("save_uint16"),
+                ])),
+                "failed": True,
+                "failure_reason": repr(exc),
+            }
+            fin_uint16 = None
+
+        # R55-D2: build the active block AFTER execution so its status and final
+        # values are the ones that actually ran. It is deterministic (no timing or
+        # observed metric) and is the ONLY scheduler block in active mode.
+        if scheduler_mode == zsched.MODE_ACTIVE and (
+            _r55_active_decision is not None
+            or _r55_active_gpu_decision is not None
+        ):
+            _r55_active_ok = all(
+                r.get("status") in ("complete", "empty") for r in results
+            )
+            _r55_active_plan_set = (
+                _r55_active_decision.plan_set
+                if _r55_active_decision is not None
+                else _r55_active_gpu_decision.plan_set
+            )
+            _r55_scheduler_block = _r55_build_active_block(
+                plan_set=_r55_active_plan_set,
+                final_candidate=_r55_active_candidate,
+                mapping=_r55_active_mapping,
+                bundle=_final,
+                initial_bundle=_initial_bundle,
+                preflight_admission=_r55_active_preflight_adm,
+                launch_admission=_r55_active_launch_adm,
+                preflight_trail=_r55_active_preflight_trail,
+                launch_trail=_r55_active_launch_trail,
+                status=("executed" if _r55_active_ok else "partial"),
+                run=_r55_run_block,
+                worker_adaptation=_r55_worker_adaptation_detail(
+                    (
+                        _r55_active_gpu_decision
+                        if _r55_active_gpu_decision is not None
+                        else _r55_active_decision
+                    ).facts,
+                    (
+                        _r55_active_gpu_decision
+                        if _r55_active_gpu_decision is not None
+                        else _r55_active_decision
+                    ).worker_trail,
+                ),
+                tile_ladder=(
+                    _r55_active_gpu_decision.gpu_tile_ladder
+                    if _r55_active_gpu_decision is not None
+                    else (
+                        _r55_gpu_retained["decision"].gpu_tile_ladder
+                        if _r55_gpu_retained is not None
+                        else None
+                    )
+                ),
+            )
+            if _r55_active_gpu_decision is not None:
+                _r55_scheduler_block["gpu_execution"] = dict(
+                    _r55_active_gpu_decision.qualification
+                )
+                _r55_scheduler_block["gpu_tile_decision"] = (
+                    _r55_gpu_tile_decision_dict(
+                        _r55_active_gpu_decision,
+                        _r55_active_mapping,
+                        _final,
+                        runtime=(_r55_run_telemetry or {}).get(
+                            "gpu_tile_adaptation"
+                        ),
+                        legacy_probe_budget_bytes=gpu_ctx.get(
+                            "legacy_probe_vram_budget_bytes"
+                        ),
+                    )
+                )
+                if _r55_run_telemetry and _r55_run_telemetry.get(
+                    "gpu_tile_adaptation"
+                ):
+                    _r55_scheduler_block["gpu_tile_runtime"] = dict(
+                        _r55_run_telemetry["gpu_tile_adaptation"]
+                    )
+            if (
+                _r55_active_gpu_decision is None
+                and _r55_gpu_retained is not None
+            ):
+                # R55-E11: the ORIGINAL GPU decision survives the runtime fallback.
+                # Its absence after a fallback was previously unreadable (None meant
+                # both "never selected" and "selected then abandoned").
+                _ret = _r55_gpu_retained
+                _ret_runtime = dict(_ret.get("runtime_tile") or {})
+                _r55_scheduler_block["gpu_tile_decision"] = (
+                    _r55_gpu_tile_decision_dict(
+                        _ret["decision"],
+                        _ret["mapping"],
+                        _ret["bundle"],
+                        runtime=(_ret_runtime or None),
+                        legacy_probe_budget_bytes=gpu_ctx.get(
+                            "legacy_probe_vram_budget_bytes"
+                        ),
+                    )
+                )
+                _r55_scheduler_block["gpu_original_decision"] = {
+                    "schema": _R55E11_TILE_RUNTIME_SCHEMA,
+                    "reason": "runtime_fallback_preserved_selection",
+                    "selected_tile_px": int(
+                        _ret["mapping"]["gpu_streaming_tile"]
+                    ),
+                    "effective_tile_px": _ret_runtime.get("effective_tile_px"),
+                    "declared_ladder": [
+                        int(t) for t in _ret["decision"].gpu_tile_ladder
+                    ],
+                    "vram_percent": int(
+                        _ret["decision"].qualification["percent"]
+                    ),
+                    "vram_budget_bytes": int(
+                        _ret["decision"].qualification["budget_bytes"]
+                    ),
+                    "legacy_probe_vram_budget_bytes": gpu_ctx.get(
+                        "legacy_probe_vram_budget_bytes"
+                    ),
+                    "engine_provenance": _r55_engine_provenance(),
+                }
+                _r55_scheduler_block["gpu_tile_runtime"] = _ret_runtime
+                _ret_pipeline = (_ret.get("telemetry") or {}).get("pipeline")
+                if _ret_pipeline:
+                    _r55_scheduler_block["gpu_fallback_pipeline"] = dict(
+                        _ret_pipeline
+                    )
+            if _r55_gpu_run_fallback is not None:
+                _r55_scheduler_block["gpu_fallback"] = dict(
+                    _r55_gpu_run_fallback
+                )
+            elif _r55_gpu_fallback_reason is not None:
+                _r55_scheduler_block["gpu_fallback"] = dict(
+                    _r55_gpu_fallback_reason
+                )
+
+        # R55-C rework-2: the observe block was built from the SELECTED backend.
+        # Reconcile its nested readiness provenance with the backend that actually
+        # produced the whole-batch output (runtime GPU->CPU fallback included) before
+        # any manifest/output write. Never changes requested_backend or execution.
+        _r55_scheduler_block = _r55_reconcile_gpu_readiness(
+            _r55_scheduler_block, gpu_ctx
+        )
+
+        # M5-A: bounded-assembly audit. The ENFORCEMENT is the preflight below
+        # (which ran BEFORE any payload mapping, graph solve or canvas allocation);
+        # everything recorded here is posthoc EVIDENCE, never the gate itself.
+        if _store_backed_results:
+            try:
+                _session = results.session
+                _stats = _session.stats()
+                _cap = int(_stats["max_resident_cells"])
+                _max_live = _stats.get("max_live_bytes")
+                _guard_ok = bool(
+                    int(_stats["peak_live_cells"]) <= _cap
+                    and (
+                        _max_live is None
+                        or int(_stats["peak_live_mapped_bytes"])
+                        <= int(_max_live)
+                    )
+                )
+                per_cell_diagnostics["r55_bounded_assembly"] = {
+                    "schema": zbas.SCHEMA,
+                    "enforcement": {
+                        "gate": "preflight_before_payload_load",
+                        "refusal_type": "AssemblyCapacityError",
+                        "requires_real_budget": True,
+                        "budget_armed_live_bytes": (
+                            None if _max_live is None else int(_max_live)
+                        ),
+                    },
+                    "preflight": _bounded_preflight,
+                    "access": _stats,
+                    "evidence": {
+                        "guard_ok": _guard_ok,
+                        "max_resident_cells": _cap,
+                        "peak_live_cells": int(_stats["peak_live_cells"]),
+                        "peak_live_mapped_bytes": int(
+                            _stats["peak_live_mapped_bytes"]
+                        ),
+                        "policy": (
+                            "live mapped payloads (weak-ref counted, external "
+                            "views included) must stay within the armed envelope"
+                        ),
+                    },
+                    "note": (
+                        "posthoc statistics are EVIDENCE, not enforcement; the "
+                        "capacity gate ran before any payload was mapped. "
+                        "Read-only memory-mapped payloads; integrity + canonical "
+                        "fingerprint checked once per immutable identity per "
+                        "session (streamed hash); pre-offset commits never mutated."
+                    ),
+                }
+            except Exception as _bounded_exc:  # audit only, never a silent claim
+                per_cell_diagnostics["r55_bounded_assembly"] = {
+                    "schema": zbas.SCHEMA,
+                    "error": f"{type(_bounded_exc).__name__}: {_bounded_exc}",
+                    "note": "audit could not be computed; no bound claimed",
+                }
+
+        # M1: publish the lightweight conservation state (never payloads) so the
+        # manifest can audit accepted/pending sparse cells and retained bytes.
+        if result_registry is not None:
+            per_cell_diagnostics["r55_result_registry"] = (
+                result_registry.snapshot()
+            )
+        # M2: durable-store audit (no payloads, no arrays). Recorded ONLY when a
+        # store was requested, so a store-less run keeps its exact manifest shape.
+        if _store_state["enabled"] or _store_state["open_error"] is not None:
+            _store = _store_state["store"]
+            per_cell_diagnostics["r55_durable_store"] = {
+                "schema": zrs.STORE_SCHEMA,
+                "requested": True,
+                "enabled": bool(_store_state["enabled"]),
+                "open_stage": _store_state.get("open_stage"),
+                "open_error": _store_state["open_error"],
+                "open_traceback": _store_state.get("open_traceback"),
+                "degraded_reason": _store_state["degraded_reason"],
+                "commit_errors": list(_store_state["commit_errors"]),
+                "commits": int(_store_state["commits"]),
+                "released_cells": int(_store_state["released_cells"]),
+                "released_bytes": int(_store_state["released_bytes"]),
+                "store": (None if _store is None else _store.report()),
+            }
+        # M4: resume audit (selected run, restored policy, sparse pending set).
+        # Never payloads, never arrays.
+        per_cell_diagnostics["r55_resume"] = dict(_resume_runtime)
+        # M4: external lifecycle accounting (additive, strict JSON).
+        try:
+            _ext_lifecycle["cells_reused_committed"] = int(
+                _store_state.get("released_cells", 0)
+            )
+        except Exception:
+            pass
+        # M5: derive the executed-external count from the ACCEPTED cell records so
+        # the accounting is path-independent (a store-less/legacy run publishes no
+        # commit callback but DID execute its external cells). Records reused from a
+        # durable commit are counted separately and are never double-counted here.
+        try:
+            _n_ext_records = sum(
+                1
+                for _rec in (cell_records or ())
+                if str((_rec or {}).get("working_set")) == WORKING_SET_EXTERNAL
+                and not bool((_rec or {}).get("reused_from_commit"))
+            )
+            if _n_ext_records > int(_ext_lifecycle.get("cells_executed_external", 0)):
+                _ext_lifecycle["cells_executed_external"] = int(_n_ext_records)
+                if int(_ext_lifecycle.get("spool_bytes_written", 0)) == 0:
+                    # Prefer the REAL per-cell receipts (attempt-level bytes); fall
+                    # back to the predicted per-cell geometry only if absent.
+                    _rec_w = 0
+                    _rec_r = 0
+                    for _rec in (cell_records or ()):
+                        if str((_rec or {}).get("working_set")) != WORKING_SET_EXTERNAL:
+                            continue
+                        _sp = ((_rec or {}).get("storage") or {}).get(
+                            "external_spool"
+                        ) or {}
+                        _rec_w += int(_sp.get("bytes_written") or 0)
+                        _rec_r += int(_sp.get("bytes_read") or 0)
+                    if _rec_w <= 0:
+                        try:
+                            _ws_blk = getattr(
+                                _run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None
+                            ) or {}
+                            _disk_blk = _ws_blk.get("disk") or {}
+                            _rec_w = int(_n_ext_records) * int(
+                                _disk_blk.get("cumulative_writes_bytes") or 0
+                            )
+                            _rec_r = int(_n_ext_records) * int(
+                                _disk_blk.get("cumulative_reads_bytes") or 0
+                            )
+                        except Exception:
+                            pass
+                    _ext_lifecycle["spool_bytes_written"] = int(_rec_w)
+                    _ext_lifecycle["spool_bytes_read"] = int(_rec_r)
+        except Exception:
+            pass
+        # M5: no residue after a SUCCESSFUL external run, including the spool root
+        # itself. Only EMPTY directories are pruned (a live/late attempt or any
+        # foreign file blocks the prune rather than being destroyed).
+        try:
+            try:
+                _ws_prune = getattr(_run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None) or {}
+            except Exception:
+                _ws_prune = {}
+            _prune_root = ((_ws_prune.get("disk") or {}).get("spool_root"))
+            if not _prune_root and cache_root is not None:
+                # Legacy/store-less runs have no bundle state here, but the spool
+                # root is deterministic on the run's own cache volume.
+                _cand_root = Path(str(cache_root)) / "external-spool"
+                if _cand_root.is_dir():
+                    _prune_root = str(_cand_root)
+            if _prune_root:
+                _prune_path = Path(str(_prune_root))
+                if _prune_path.is_dir():
+                    for _child in sorted(_prune_path.iterdir()):
+                        if _child.is_dir():
+                            try:
+                                _child.rmdir()
+                            except OSError:
+                                pass
+                    try:
+                        _prune_path.rmdir()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        per_cell_diagnostics["external_lifecycle"] = dict(_ext_lifecycle)
+        # M3: the working-set class + dry-plan/disk facts (additive manifest block).
+        try:
+            per_cell_diagnostics["working_set"] = getattr(
+                _run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None
+            )
+        except Exception:
+            per_cell_diagnostics["working_set"] = None
+
+        # Write Classic-compatible outputs (raw always; aesthetic only if checkbox).
+        export_aesthetic = bool((finishing_config or {}).get("export_aesthetic_fits", False))
+        sci_path, cov_path, manifest_path = _write_outputs(
+            assembled, canvas, nx, ny, output_dir, descs, {}, cell_records,
+            layout, science_config, peak_rss_kib, cache_report, progress_callback,
+            rejected=rejected, sip_mode=sip_mode,
+            frames_loaded=len(frames_info),
+            global_reference_frame_id=global_reference_frame_id,
+            timings=timings, gpu_used=gpu_used, ignored_settings=ignored_settings,
+            ignored_run_args=ignored_run_args,
+            gauge_diagnostics=gauge_diagnostics,
+            per_cell_diagnostics=per_cell_diagnostics,
+            auto_gauge_info=auto_gauge_info,
+            cell_feather_info=feather_info,
+            finished_science=finished_science, finishing_info=finishing_info,
+            fin_uint16=fin_uint16,
+            gpu_context=gpu_ctx,
+            aggregate_peak_rss_kib=aggregate_peak_rss_kib,
+            raw_science_path=raw_science_path,
+            raw_science=raw_science,
+            aesthetic_path=aesthetic_path if export_aesthetic else None,
+            export_aesthetic_fits=export_aesthetic,
+            scientific_fits_suffix=(finishing_config or {}).get(
+                "scientific_fits_suffix", "_science"
+            ),
+            halo_provenance=_halo_provenance_pass,
+            r55_scheduler=_r55_scheduler_block,
+            r55_run_telemetry=_r55_run_telemetry,
+            publication=_publication,
+        )
+
+        _write_run_log(
+            output_dir,
+            timings,
+            start_ts=start_ts,
+            frames_loaded=len(frames_info),
+            n_included=len(descs),
+            n_rejected=len(rejected or []),
+            canvas=canvas,
+            layout=layout,
+            gpu_used=gpu_used,
+            ignored_settings=ignored_settings,
+            ignored_run_args=ignored_run_args,
+            peak_rss_kib=peak_rss_kib,
+            cache_info=cache_report,
+            global_reference_frame_id=global_reference_frame_id,
+            gauge_diagnostics=gauge_diagnostics,
+            per_cell_diagnostics=per_cell_diagnostics,
+            finishing_info=finishing_info,
+            gpu_context=gpu_ctx,
+            aggregate_peak_rss_kib=aggregate_peak_rss_kib,
+            halo_provenance=_halo_provenance_pass,
+        )
+
+        # M5-B: close the generation ONLY now that every member exists. The run-log
+        # copy is auxiliary (not authority); if it cannot be staged the generation
+        # is still complete without it, with an explicit warning. publication.json
+        # is written first, then ONE atomic pointer flip: before the flip the
+        # previous generation remains the only authority.
+        _published_generation = None
+        if _publication is not None:
+            try:
+                _publication.include_auxiliary(
+                    zpub.ROLE_RUN_LOG, Path(output_dir) / RUN_LOG_NAME
+                )
+            except Exception as _aux_exc:
+                _publication.members.pop(zpub.ROLE_RUN_LOG, None)
+                _emit(
+                    "ZeGrid: run-log copy could not be staged in the publication "
+                    f"generation ({type(_aux_exc).__name__}: {_aux_exc}); the "
+                    "generation is published without this auxiliary member",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+            _required_roles = [
+                zpub.ROLE_SCIENCE, zpub.ROLE_COVERAGE, zpub.ROLE_MANIFEST
+            ]
+            if zpub.ROLE_RUN_LOG in _publication.members:
+                _required_roles.append(zpub.ROLE_RUN_LOG)
+            _optional_roles = {}
+            if zpub.ROLE_AESTHETIC in _publication.members:
+                _optional_roles[zpub.ROLE_AESTHETIC] = bool(export_aesthetic)
+            if zpub.ROLE_UINT16 in _publication.members:
+                _optional_roles[zpub.ROLE_UINT16] = bool(fin_uint16 is not None)
+            _published_generation = _publication.commit(
+                required_roles=_required_roles,
+                optional_roles=_optional_roles,
+                metadata={
+                    "run_id": str(_store_state["store"].run_id),
+                    "gauge_mode": str(_gauge_mode),
+                    "export_aesthetic": bool(export_aesthetic),
+                    "uint16": bool(fin_uint16 is not None),
+                },
+            )
+            _resume_runtime["publication"] = _published_generation.as_report()
+            # ZM-ZEGRID-ROOT-DELIVERABLES: DELIVER the finished products at the
+            # OUTPUT ROOT first (Classic/SDS consistency), then write the visible
+            # markers that name those root paths. Both run only AFTER the pointer
+            # is durable. A delivery failure is a WARN: the publication stays
+            # authoritative and a prior root file is left byte-identical.
+            _root_files: dict = {}
+            try:
+                _root_delivery = zpub.publish_root_deliverables(
+                    output_dir, _published_generation
+                )
+                _root_files = _root_delivery["root_files"]
+                for _root_failure in _root_delivery["failures"]:
+                    _emit(
+                        "ZeGrid: root deliverable not published — "
+                        f"{_root_failure}; the publication remains authoritative "
+                        "and the previous root file was left untouched.",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+            except Exception as _root_exc:
+                _emit(
+                    "ZeGrid: products could not be delivered at the output root "
+                    f"({type(_root_exc).__name__}: {_root_exc}); the publication "
+                    "remains authoritative and the previous root files were left "
+                    "untouched.",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+            # r4: VISIBLE discovery entry point at the output root, written ONLY
+            # after the pointer is durable. It names the DELIVERED root paths and
+            # still records the immutable generation directory for audit/resume.
+            try:
+                _visible = zpub.write_visible_products(
+                    output_dir, _published_generation, root_files=_root_files
+                )
+                _resume_runtime["visible_products"] = {
+                    "json": str(
+                        Path(output_dir) / zpub.PRODUCTS_JSON_FILENAME
+                    ),
+                    "text": str(
+                        Path(output_dir) / zpub.PRODUCTS_TEXT_FILENAME
+                    ),
+                    "generation_dir": str(_visible["generation_dir"]),
+                }
+                _emit(
+                    "ZeGrid: products entry point written — "
+                    f"{Path(output_dir) / zpub.PRODUCTS_JSON_FILENAME} -> "
+                    f"{_published_generation.generation} "
+                    f"({_published_generation.generation_dir})",
+                    callback=progress_callback,
+                )
+            except Exception as _visible_exc:
+                _emit(
+                    "ZeGrid: products entry point could not be written "
+                    f"({type(_visible_exc).__name__}: {_visible_exc}); the "
+                    "publication remains authoritative and the previous pointers "
+                    "were left intact.",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+            _emit(
+                "ZeGrid: publication generation COMMITTED — "
+                f"{_published_generation.generation} "
+                f"({len(_published_generation.members)} verified member(s), "
+                f"publication sha256 {_published_generation.publication_sha256[:16]}…); "
+                "CURRENT.json is the final atomic pointer",
+                callback=progress_callback,
+            )
+
+        # M4: finalize the durable run state ONLY after the complete publication
+        # (science + coverage + manifest) exists. A later auto-resume is then a
+        # verified no-op, never a recomputation of valid cells.
+        if _store_state["store"] is not None and _store_state.get("degraded_reason") is None:
+            try:
+                _run_root = _store_state["store"].root
+                _prev_state = zres.read_state(_run_root)
+                if _published_generation is not None:
+                    # M5-B: the durable generation is the reader contract; every
+                    # member digest below was verified BEFORE the pointer flip.
+                    _outputs = _published_generation.outputs_state()
+                else:
+                    _outputs = {}
+                    for _name, _path in (
+                        ("science", sci_path),
+                        ("coverage", cov_path),
+                        ("manifest", manifest_path),
+                    ):
+                        if _path is not None and Path(_path).exists():
+                            _sha, _nbytes = zrs.content_sha256_file(_path)
+                            _outputs[_name] = {
+                                "sha256": _sha, "nbytes": int(_nbytes)
+                            }
+                zres.write_state(
+                    _run_root,
+                    run_id=_prev_state["run_id"],
+                    expected_cell_ids=_prev_state["expected_cell_ids"],
+                    policy=zres.policy_from_snapshot(_storage_policy_snapshot()),
+                    plan_generation=int(_prev_state["plan_generation"]) + 1,
+                    finalized=True,
+                    gauge_sha256=_prev_state["gauge_sha256"],
+                    outputs=_outputs,
+                    created_unix_ns=_prev_state["created_unix_ns"],
+                    note=_prev_state["note"],
+                    # The frozen admission is never rewritten after creation.
+                    admission=_prev_state.get("admission"),
+                )
+                _resume_runtime["finalized_noop"] = False
+                _resume_runtime["outputs"] = dict(_outputs)
+            except Exception as _fin_exc:
+                _emit(
+                    "ZeGrid: durable run state could not be finalized "
+                    f"({type(_fin_exc).__name__}: {_fin_exc}); the published "
+                    "outputs stay valid but a later resume will re-verify the "
+                    "commits instead of trusting a finalization flag.",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+
+        # M1: the run published successfully. The registry's explicit release is the
+        # single ownership hand-off; the transient ``results`` list is also dropped.
+        # (On any earlier failure the registry stays reachable from the typed
+        # exception until the coordinator disposes it.)
+        if result_registry is not None:
+            _disposal = result_registry.dispose()
+            _emit(
+                "ZeGrid: run result registry disposed after successful publication "
+                f"({_disposal.get('released_cells', 0)} cell(s), "
+                f"{_disposal.get('released_bytes', 0)} B released)",
+                callback=progress_callback,
+            )
+        if _store_state["store"] is not None:
+            # M5-A: drop the bounded assembly session BEFORE the store closes (the
+            # session may still hold mapped payloads; their views stay valid).
+            _assembly_access = _store_state.get("assembly_access")
+            if _assembly_access is not None:
+                try:
+                    _assembly_stats = _assembly_access.close()
+                    _emit(
+                        format_bounded_assembly_close(_assembly_stats),
+                        callback=progress_callback,
+                    )
+                except Exception as _bounded_close_exc:
+                    _emit(
+                        "ZeGrid: bounded assembly access close warning "
+                        f"({type(_bounded_close_exc).__name__}: {_bounded_close_exc})",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+                _store_state["assembly_access"] = None
+            try:
+                _store_state["store"].close()
+            finally:
+                _store_state["publishing"] = False
+            _emit(
+                "ZeGrid: durable run store closed after successful publication "
+                f"({_store_state['commits']} durable cell commit(s), "
+                f"{_store_state['released_bytes']} B released from RAM)",
+                callback=progress_callback,
+            )
+        elif _resume_boot is not None:
+            # A resumed run outside the ACTIVE registry path still holds the lock.
+            _resume_boot.close()
+        results = []
+
+        # ZM-PROGRESS-CONTRACT-R29: the finalize seam completes (1/1) only now that
+        # the immutable science + aesthetic + coverage + manifest + run log are all
+        # written. Its local 100% still leaves GLOBAL progress below 100% until the
+        # worker's explicit terminal success.
+        finalize_wall = _finalize_rep.end()
+
+        # ZM-ETA-SERVICE-R30: append ONE sanitized ZeGrid history record, best-effort,
+        # before the terminal success. ``total_duration_s`` is the honest actual wall
+        # duration of this ``_run_single`` segment from an explicit perf_counter start
+        # (F4), NOT a phase-sum guess; the per-stage ``stage_seconds`` are unchanged
+        # (``Timings`` covers setup..assembly; finalize is added here). It measures
+        # the finalize wall duration honestly WITHOUT changing science/output order —
+        # the manifest is already written, so the finalize duration simply does not
+        # retroactively appear in it (documented). A history write failure is
+        # nonfatal and cannot change output/science success, and no history is
+        # written for a failed/cancelled segment (any earlier exception raised before
+        # this point skips the write). For a split EQ/ALTZ run, one record is written
+        # per successful ``_run_single`` segment (each is a valid comparable segment;
+        # deliberate).
+        try:
+            zeta.append_zegrid_history(
+                zeta.build_zegrid_history_record(
+                    total_duration_s=time.perf_counter() - run_wall_start,
+                    n_frames=len(frames_info),
+                    cell_count=total_cells,
+                    stage_seconds={
+                        "setup": timings.get("setup"),
+                        "layout": timings.get("layout"),
+                        "gauge": timings.get("gauge"),
+                        "per_cell_stack": timings.get("per_cell_stack"),
+                        "assembly": timings.get("assembly"),
+                        "finalize": finalize_wall,
+                    },
+                    stage_totals={
+                        "setup": len(frames_info),
+                        "gauge": 2 * len(descs) - 1,
+                        "per_cell_stack": total_cells,
+                        "finalize": 1,
+                    },
+                    workers=workers,
+                    backend="gpu" if gpu_used else "cpu",
+                    # ZM-ETA-INTEGRITY-R32 rework-1: the tracker's measured
+                    # sanitized workload (frames/cells, summed input pixels,
+                    # patch_area x contributors stack work, canvas area). Never
+                    # paths/names/user data; never a quadratic n_frames x pixels.
+                    workload=_log_eta_tracker.workload(),
+                )
+            )
+        except Exception:
+            pass
+
+        _emit(
+            f"ZeGrid: done — science={raw_science_path.name} "
+            f"aesthetic={aesthetic_path.name if (export_aesthetic and aesthetic_path is not None) else 'n/a'} "
+            f"({assembled.science.shape}) + coverage + run log, "
+            f"complete={len(assembled.complete_cells)} incomplete={len(assembled.incomplete_cells)} "
+            f"holes={assembled.hole_pixels}px peak_rss={peak_rss_kib}KiB "
+            f"cache_total={cache_total_bytes / 2**20:.0f}MiB cache_peak={cache_peak_bytes / 2**20:.0f}MiB",
+            lvl="SUCCESS",
+            callback=progress_callback,
+        )
+    finally:
+        # F7: cleanup runs even when finalization/serialization raises.
+        _release_assembly_scratch(
+            _assembly_allocator, _emit, progress_callback
+        )
     return sci_path
 
 
@@ -19583,6 +19601,54 @@ def _manifest_layout_block(nx, ny, layout):
     }
 
 
+def _release_assembly_scratch(allocator, emit, progress_callback=None):
+    """F7: release a scratch-backed canvas and REPORT the truth.
+
+    Returns the report (``removed``/``failures``/``remaining``). A zero removal
+    with surviving files is logged as an ERROR, never silently tolerated. This
+    is called from a ``finally`` so it also runs when finalization raises.
+    """
+    if allocator is None:
+        return None
+    try:
+        report = allocator.discard_report()
+    except Exception as exc:
+        try:
+            emit(
+                "ZeGrid: scratch-backed canvas cleanup FAILED "
+                f"({type(exc).__name__}: {exc}); files may remain",
+                lvl="ERROR", callback=progress_callback,
+            )
+        except Exception:
+            pass
+        return {"removed": 0, "failures": [{"error": str(exc)}], "remaining": None}
+    failures = list(report.get("failures") or ())
+    remaining = int(report.get("remaining") or 0)
+    removed = int(report.get("removed") or 0)
+    if failures or remaining:
+        try:
+            detail = "; ".join(
+                f"{f.get('path')}: {f.get('error')}" for f in failures
+            )
+            emit(
+                "ZeGrid: scratch-backed canvas cleanup INCOMPLETE — "
+                f"removed={removed}, remaining={remaining}"
+                + (f" ({detail})" if detail else ""),
+                lvl="ERROR", callback=progress_callback,
+            )
+        except Exception:
+            pass
+    elif removed:
+        try:
+            emit(
+                f"ZeGrid: scratch-backed canvas planes released ({removed} file(s))",
+                callback=progress_callback,
+            )
+        except Exception:
+            pass
+    return report
+
+
 def _write_outputs(
     assembled, canvas, nx, ny, output_dir, descs, manifests, cell_records,
     layout, science_config, peak_rss_kib, cache_report, progress_callback,
@@ -19621,26 +19687,28 @@ def _write_outputs(
     # to the raw path when finishing is disabled -> ``finished_science`` is the same
     # array). The RAW science is written first (immutable reference), and the
     # aesthetic float is written ONLY when ``export_aesthetic_fits`` (Classic naming).
+    #
+    # F1 (ZM-ZEGRID-ADAPTIVE-RESOURCES): this function must NOT materialise a
+    # full-canvas (3, H, W) float32 CHW copy. The science/cov FITS are now hashed
+    # and written in ROW-BANDS (``banded_fits``), which is BYTE-IDENTICAL to the
+    # dense ``fits.PrimaryHDU(np.ascontiguousarray(np.moveaxis(...)))`` path
+    # (same header, big-endian CHW data, SCIHASH, non-finite replacement). The
+    # coverage branch keeps the historical memmap detection; only the dense
+    # branch coerces a float32 plane.
     science = np.asarray(
         assembled.science if finished_science is None else finished_science,
         dtype=np.float32,
-    )  # (H, W, 3)
-    # ZM-FITS-INTEROP-R26: serialize ZeGrid coverage as contiguous float32
-    # (BITPIX=-32, no BSCALE/BZERO) so ASIFitsView Linux / Gwenview can read it;
-    # the exact pre-fix integer stack-depth values (0..46) are preserved.
-    stack_depth = np.ascontiguousarray(
-        np.asarray(assembled.stack_depth, dtype=np.float32)
-    )  # (H, W)
-
-    sci_data = np.ascontiguousarray(np.moveaxis(science, -1, 0))  # (3, H, W)
-    # ZM-FITS-INTEROP-R26: sanitize non-finite (NaN/+Inf/-Inf -> 0.0) in the
-    # serialized science buffer ONLY (never the in-memory ``science``/raw
-    # arrays), and keep the count for the auditable header/manifest.
-    sci_data, _sci_nf_replaced = sanitize_nonfinite_float32(sci_data, fill_value=0.0)
-    _raw_ref_chw = np.ascontiguousarray(np.moveaxis(
-        np.asarray(assembled.science if raw_science is None else raw_science,
-                   dtype=np.float32), -1, 0))
-    _raw_ref_chw, _raw_nf_replaced = sanitize_nonfinite_float32(_raw_ref_chw, fill_value=0.0)
+    )  # (H, W, 3); a view when already float32 (memmap or ndarray)
+    _raw_source = np.asarray(
+        assembled.science if raw_science is None else raw_science,
+        dtype=np.float32,
+    )
+    # Hash the sanitized contiguous CHW little-endian bytes WITHOUT building the
+    # CHW cube: the banded stream hashes exactly the bytes ``_array_sha256``
+    # would hash on a full contiguous copy.
+    _raw_sha, _raw_nf_replaced = zbf.science_fits_sha256(
+        _raw_source, fill_value=0.0
+    )
 
     # ZM-ZEGRID-R23 rework-3 (H1): Classic-compatible naming on base ``mosaic_grid``.
     # ``mosaic_grid<clean scientific suffix>.fits`` is the immutable pre-finishing
@@ -19673,19 +19741,26 @@ def _write_outputs(
 
     # Aesthetic float is emitted only when the checkbox is set.
     sci_path = aesthetic_path if aesthetic_path is not None else raw_science_path
+    _aesthetic_sha = None
     if aesthetic_path is not None:
-        # sci_data is already non-finite-sanitized (ZM-FITS-INTEROP-R26).
+        # F1: banded hash + banded write (no full-canvas CHW copy). Sanitization
+        # and SCIHASH are the same bytes as the historical dense buffer.
+        _aesthetic_sha, _sci_nf_replaced = zbf.science_fits_sha256(
+            science, fill_value=0.0
+        )
         sci_header = _science_header(
             canvas,
             role="AESTH",
             dtype="float32",
             dbe_state=dbe_state,
-            sha256=_array_sha256(sci_data),
+            sha256=_aesthetic_sha,
             related_file=raw_science_path.name,
         )
         _record_halo_cards(sci_header, halo_provenance)
         record_nonfinite_fill(sci_header, _sci_nf_replaced)
-        _atomic_writeto(fits.PrimaryHDU(sci_data, header=sci_header), aesthetic_path)
+        zbf.write_science_fits_banded(
+            science, sci_header, aesthetic_path, fill_value=0.0
+        )
     elif export_aesthetic_fits:
         # Checkbox set but no aesthetic path resolved -> do not fabricate a file.
         pass
@@ -19716,11 +19791,15 @@ def _write_outputs(
     _record_halo_cards(cov_header, halo_provenance)
     cov_path = _published_path(output_dir / "mosaic_grid_coverage.fits")
     if isinstance(assembled.stack_depth, np.memmap):
+        # F1: pass the scratch plane DIRECTLY; the banded writer slices rows so
+        # no full-canvas float32 coverage copy is allocated.
         zbf.write_coverage_fits_banded(
-            np.asarray(assembled.stack_depth, dtype=np.float32),
-            cov_header, cov_path, fill_value=0.0,
+            assembled.stack_depth, cov_header, cov_path, fill_value=0.0,
         )
     else:
+        stack_depth = np.ascontiguousarray(
+            np.asarray(assembled.stack_depth, dtype=np.float32)
+        )  # (H, W) dense branch only
         _atomic_writeto(fits.PrimaryHDU(stack_depth, header=cov_header), cov_path)
 
     # ZM-ZEGRID-R24 (A2): conservative stale-aesthetic cleanup. Runs ONLY after
@@ -19770,7 +19849,7 @@ def _write_outputs(
             "file": raw_science_path.name,
             "role": "SCI",
             "dtype": "float32",
-            "sha256": _array_sha256(_raw_ref_chw),
+            "sha256": _raw_sha,
             "nonfinite_replaced": int(_raw_nf_replaced),
             "nonfinite_fill": NONFINITE_FILL_VALUE,
         },
@@ -19781,7 +19860,7 @@ def _write_outputs(
             "role": "AESTH",
             "dtype": "float32",
             "dbe_state": dbe_state,
-            "sha256": _array_sha256(sci_data),
+            "sha256": _aesthetic_sha,
         }
 
     # Cache accounting: prefer the explicit cache_report (per-cell temp reuse)

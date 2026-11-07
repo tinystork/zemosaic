@@ -93,7 +93,8 @@ def test_feasible_layout_is_admitted_with_one_margin():
         raw * (DEFAULT_MARGIN_DEN + DEFAULT_MARGIN_NUM) + DEFAULT_MARGIN_DEN - 1
     ) // DEFAULT_MARGIN_DEN
     assert int(result["peak_bytes"]) == expected
-    # M1: A1 prices the product 16 B/px assembly convention; the real 121 B/px
+    # M1/F6: A1 prices the product 16 B/px assembly convention; the real
+    # mode-aware canvas is 49 B/px global / 125 B/px feathered per_cell.
     # feathered canvas is explicitly carried as DEFERRED to A4.
     assert result["assembly_canvas_deferred_to_a4"] is True
     assert int(result["unpriced_assembly_canvas_bytes"]) > 0

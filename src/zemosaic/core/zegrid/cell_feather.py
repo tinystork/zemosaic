@@ -715,13 +715,16 @@ def assemble_canvas_feathered(
                 np.maximum(tgt, np.where(cov, sd, 0), out=tgt)
             complete.append(cid)
 
-    # A4: every canonical accumulator plane (121 B/px) is now backed by the
-    # SAME allocator, so a scratch allocator backs the WHOLE assembly instead of
-    # only the num/wsum accumulators. The numeric path is bit-for-bit the
-    # historical dense one: ``science_work`` is the float64 NaN-seeded division
-    # buffer and ``science`` is its float32 cast, both written IN-PLACE so no
-    # anonymous full-canvas copy is made at the last assembly step.
-    valid_out = wsum > 0.0
+    # A4/F6: ALL full-canvas planes of the feathered assembly are backed by the
+    # SAME allocator — including the intermediate validity/coverage masks — so a
+    # scratch allocator backs the WHOLE assembly and no anonymous full-canvas
+    # ndarray is created below. The numeric path is bit-for-bit the historical
+    # dense one: masks are written in place, ``science_work`` is the float64
+    # NaN-seeded division buffer, ``science`` is its float32 cast, and the
+    # per-pixel validity fraction is reduced directly with ``dtype=float32``
+    # (no ``astype(float32)`` full-canvas copy).
+    valid_out = alloc((h, w, c), np.bool_)
+    np.greater(wsum, 0.0, out=valid_out)
     science_work = alloc((h, w, c), np.float64)
     science_work[...] = np.nan
     np.divide(num, wsum, out=science_work, where=valid_out)
@@ -729,11 +732,12 @@ def assemble_canvas_feathered(
     science[...] = science_work
 
     # Coverage/diagnostics: a pixel is covered when any channel has weight.
-    covered = valid_out.any(axis=-1)
+    covered = alloc((h, w), np.bool_)
+    np.any(valid_out, axis=-1, out=covered)
     hole_mask = alloc((h, w), np.bool_)
     np.logical_not(covered, out=hole_mask)
     valid_fraction = alloc((h, w), np.float32)
-    valid_fraction[...] = np.mean(valid_out.astype(np.float32), axis=-1)
+    np.mean(valid_out, axis=-1, dtype=np.float32, out=valid_fraction)
     # n_eff / support diagnostics: keep the (unblended) max over contributors is
     # NOT available here; report the coverage-derived n_eff proxy = sum of weights
     # per channel is already the estimator weight; use wsum for support_w1 and
