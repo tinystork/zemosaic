@@ -473,3 +473,77 @@ Lancer une seule mission d'implémentation bornée à **M0 + M1** : dry-plan joi
   duplication de science ; comportement inchangé pour tous les appelants.
 - **M3+** : non commencés. Aucun câblage produit automatique, aucun changement
   de défaut, halo, planchers, GPU ou GUI.
+
+## 15. Lancement des témoins du 2026-11-08
+
+État : M0–M5 implémentés et validés localement sur
+`feat/zegrid-auto-external-streaming` (HEAD `6d4309d`, base `origin/beta=f8acdbb`).
+Aucun push, merge, tag ni release. Le produit installé n'est **pas** modifié :
+le GUI doit être lancé depuis ce worktree (Linux) ou depuis une copie de ce code
+(Windows).
+
+### 15.1 TinyDebian — Caldwell halo 128
+
+```bash
+cd /home/tristan/.openclaw/workspace/worktrees/zemosaic-auto-external-streaming
+QT_QPA_PLATFORM=xcb PYTHONPATH="$PWD/src" \
+  /home/tristan/.openclaw/workspace/projects/zemosaic/.venv/bin/python \
+  -c "from zemosaic._app import main; main()"
+```
+
+Dans le GUI : corpus Caldwell, **halo 128**, dossier de sortie NEUF, scheduler
+ACTIVE, stockage AUTO (défaut), checkpoints/reprise activés. Ne pas changer le
+halo, les planchers ni les contributeurs.
+
+À vérifier dans le log :
+
+- `ZeGrid: working set — class=… tile=… column_batch=…` (la classe dit
+  `inmem`, `ram_tile` ou `external_spool`) ;
+- `ZeGrid: joint plan (ADMITTED, final) — mode=…` puis, si external,
+  `disk_envelope=…` ;
+- aucune ligne « keeping this pinned layout » si le layout est Auto ;
+- absence de `NO executable plan` alors que le disque est suffisant.
+
+Après le premier cellule : vérifier `Per-cell stacking 1/N`, un commit durable,
+et l'absence de répertoire `zegrid-cache/external-spool/<cell>` après commit.
+
+### 15.2 Windows — M33 / 22 414 frames
+
+Le code doit être appliqué sur une copie de travail Windows à partir de
+`f8acdbb` (jeu de patches `0001…0006` fourni sur le Bureau, dossier
+`zm-m5-patches`). Ne pas lancer l'application installée : elle ne contient pas
+ces changements.
+
+```bat
+cd C:\chemin\vers\zemosaic-m5
+git checkout -b feat/zegrid-auto-external-streaming f8acdbb
+git am C:\Users\JarvisJunior\Desktop\zm-m5-patches\*.patch
+
+set PYTHONPATH=%CD%\src
+python -c "from zemosaic._app import main; main()"
+```
+
+Dans le GUI : entrée IRCUT, **halo 8** (dernier réglage utilisé), sortie NEUVE,
+scheduler ACTIVE, stockage AUTO, checkpoints/reprise activés. Vérifier d'abord
+l'inventaire : au moins un fichier `_LP_` était présent dans le dossier IRCUT.
+
+À vérifier :
+
+- la classe choisie (`ram_tile` avec tuile 20 si la RAM le permet, sinon
+  `external_spool`) ;
+- `column_batch`, `spool_peak_bytes_worst_tile`, `cumulative_writes_bytes`,
+  `cumulative_reads_bytes`, `disk_envelope_bytes` dans le manifeste ;
+- un premier cellule committée avant de laisser tourner plusieurs jours ;
+- la reprise après arrêt contrôlé (les cellules committées ne sont pas
+  recalculées).
+
+### 15.3 Coût honnête attendu
+
+- `stream_external` écrit puis relit chaque valeur de tuile : trafic disque
+  ≈ 2 × les octets de spool par cellule (amplification 1.0 en lecture).
+- M33 (tuile 128, patch 64) : spool peak ≈ 1,37 Gio, écritures+lectures
+  ≈ 2,7 Gio par cellule, enveloppe disque ≈ 2,6 Gio avec cache et marge.
+- Les petites tuiles (`stream_ram`) restent préférables quand la RAM suffit :
+  elles évitent tout spool.
+- Un run interrompu reprend au dernier commit de cellule ; une tentative de
+  tuile non committée est rejouée.
