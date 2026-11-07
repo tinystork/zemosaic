@@ -4075,7 +4075,7 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
                                  capture=False, holdout_cap=None, output_dir=None,
                                  capture_identity=None,
                                  r40_capture=False, r40_context=None,
-                                 patches=None):
+                                 patches=None, allocator=None):
     """R34D: apply inter-cell additive offsets + FEATHERED assembly (opt-in).
 
     Builds :class:`cell_feather.CellPatch` objects from the per-cell worker results
@@ -4288,7 +4288,7 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
         except Exception:
             pass
     assembled = zcf.assemble_canvas_feathered(
-        canvas, nx, ny, patches, offsets, halo_px=halo_px
+        canvas, nx, ny, patches, offsets, halo_px=halo_px, allocator=allocator
     )
     info = {
         "anchor": graph.anchor,
@@ -4327,7 +4327,7 @@ def _assemble_per_cell_feathered(canvas, nx, ny, result_by_cid, *, halo_px=None,
 
 def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None, emit=None,
                     capture=False, holdout_cap=None, output_dir=None, capture_identity=None,
-                    r40_capture=False, r40_context=None, patches=None):
+                    r40_capture=False, r40_context=None, patches=None, allocator=None):
     """Dispatch assembly by cell gauge mode (ZM-CELL-PHOTOMETRY-R34D).
 
     Returns ``(assembled, feather_info)``. ``"global"`` (default) -> the
@@ -4345,6 +4345,7 @@ def _assemble_cells(canvas, nx, ny, mode, cores, result_by_cid, *, halo_px=None,
             capture_identity=capture_identity,
             r40_capture=r40_capture, r40_context=r40_context,
             patches=patches,
+            allocator=allocator,
         )
     # ZM-ZEGRID-R53: make the mode semantics explicit. The halo still drives the
     # REAL patch geometry/resources, but the anti-checkerboard feather is only

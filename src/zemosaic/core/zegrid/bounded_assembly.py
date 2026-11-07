@@ -1191,6 +1191,7 @@ def assembly_plan(
     gauge_mode: str = "per_cell",
     n_cells_complete: int | None = None,
     n_edges: int | None = None,
+    canvas_backing: str = "anonymous",
 ) -> dict:
     """Price one bounded assembly; refuse explicitly when a budget is given.
 
@@ -1208,6 +1209,14 @@ def assembly_plan(
       vectors, BLAS margin). In ``global`` mode this is exactly 0: no offset
       solve runs;
     * ``scratch_bytes`` — caller-declared scratch (M5-B generation).
+
+    ``canvas_backing`` (A4) reclassifies the canvas accumulators:
+
+    * ``"anonymous"`` (default) — the 121 B/px canvas counts against the RAM
+      ``required`` (historical behaviour, unchanged);
+    * ``"scratch"`` — the canvas is backed by a scratch mapping (file-backed,
+      NOT anonymous RAM), so its bytes move OUT of the RAM ``required`` and are
+      reported in ``scratch_bytes`` (disk line) instead.
     """
     if isinstance(max_resident_cells, bool) or not isinstance(
         max_resident_cells, int
@@ -1255,9 +1264,25 @@ def assembly_plan(
     scratch = int(scratch_bytes)
     if scratch < 0:
         raise BoundedAccessError("scratch_bytes must be >= 0")
+    backing = str(canvas_backing)
+    if backing not in ("anonymous", "scratch"):
+        raise BoundedAccessError(
+            f"unsupported canvas_backing: {canvas_backing!r}"
+        )
+    canvas_ram_bytes = (
+        int(canvas["total_bytes"]) if backing == "anonymous" else 0
+    )
+    canvas_scratch_bytes = (
+        0 if backing == "anonymous" else int(canvas["total_bytes"])
+    )
+    canvas["backing"] = backing
+    canvas["kind"] = (
+        "anonymous_accumulators" if backing == "anonymous" else "scratch_backed"
+    )
+    scratch_total = scratch + canvas_scratch_bytes
     required = int(
         resident
-        + canvas["total_bytes"]
+        + canvas_ram_bytes
         + transient["total_bytes"]
         + graph_bytes
         + scratch
@@ -1278,7 +1303,9 @@ def assembly_plan(
         "per_cell_transient_bytes": int(transient["total_bytes"]),
         "graph": graph,
         "graph_bytes": graph_bytes,
-        "scratch_bytes": scratch,
+        "canvas_backing": backing,
+        "canvas_ram_bytes": canvas_ram_bytes,
+        "scratch_bytes": scratch_total,
         "required_bytes": required,
         "available_bytes": (
             None if available_bytes is None else int(available_bytes)
@@ -1299,7 +1326,7 @@ def assembly_plan(
         raise AssemblyCapacityError(
             "bounded assembly does not fit the supplied budget: required "
             f"{required} B ({resident} B resident mapped + "
-            f"{canvas['total_bytes']} B canvas + "
+            f"{canvas_ram_bytes} B canvas (backing={backing}) + "
             f"{transient['total_bytes']} B transient + {graph_bytes} B graph + "
             f"{scratch} B scratch) > available {int(available_bytes)} B",
             plan=plan,
@@ -1321,6 +1348,7 @@ def preflight_assembly(
     scratch_bytes: int = 0,
     gauge_mode: str = "per_cell",
     grid: tuple[int, int] | None = None,
+    canvas_backing: str = "anonymous",
 ) -> dict:
     """Fail-closed assembly capacity gate, from METADATA ONLY.
 
@@ -1393,6 +1421,7 @@ def preflight_assembly(
             gauge_mode=gauge_mode,
             n_cells_complete=len(complete),
             n_edges=n_edges,
+            canvas_backing=canvas_backing,
         )
     except AssemblyCapacityError as exc:
         # The refusal must be as auditable as the accepted plan: the caller
