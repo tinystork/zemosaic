@@ -100,10 +100,12 @@ def _force_gpu_selection(monkeypatch):
 def _inject_oom_at_stack_seam(monkeypatch):
     real_run = zz.run_canonical_stack_streaming
 
-    def fake_run(provider, request, tile_size=None, fixed=None):
+    def fake_run(provider, request, tile_size=None, fixed=None, **kwargs):
         if getattr(request, "backend", "cpu") == "gpu":
             raise _FakeCupyOOM("simulated device OOM during phase-2")
-        return real_run(provider, request, tile_size=tile_size, fixed=fixed)
+        return real_run(
+            provider, request, tile_size=tile_size, fixed=fixed, **kwargs
+        )
 
     monkeypatch.setattr(zz, "run_canonical_stack_streaming", fake_run)
 

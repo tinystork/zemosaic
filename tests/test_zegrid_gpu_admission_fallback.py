@@ -193,18 +193,78 @@ def _drive_admit(monkeypatch):
     return admitted
 
 
-def _run(inp, out, *, storage=None, mode="active"):
+def _run(inp, out, *, storage=None, mode="active", progress_callback=None):
     zz.run_zegrid_mode(
         str(inp), str(out),
         zconfig=SimpleNamespace(zegrid_scheduler_mode=mode),
         zegrid_halo_px=8,
         use_gpu=True,
         storage_profile=storage,
+        progress_callback=progress_callback,
     )
 
 
 def _storage():
     return zz._storage_policy_snapshot()
+
+
+# ---------------------------------------------------------------------------
+# M6 — a PURE VRAM refusal is a device-applicability fact, not a run failure:
+# the GPU is declined (recorded) and the admitted CPU plan runs. The storage
+# profile is NEVER switched for it (VRAM does not depend on the profile).
+# ---------------------------------------------------------------------------
+
+def test_active_gpu_vram_refusal_declines_to_cpu_without_profile_switch(
+    tmp_path, gpu_seams, monkeypatch,
+):
+    inp, out = _write_corpus(tmp_path)
+    gpu_calls = _drive_decide(monkeypatch, reason=zgr.REASON_REFUSE_VRAM)
+    cpu_calls = []
+    real_cpu = zz._r55_active_decide
+
+    def _cpu_decide(**kw):
+        cpu_calls.append(kw)
+        return real_cpu(**kw)
+
+    monkeypatch.setattr(zz, "_r55_active_decide", _cpu_decide)
+    messages = []
+
+    def _cb(msg, _cur, lvl, **_kw):
+        messages.append((str(lvl), str(msg)))
+
+    with pytest.raises(_StopAfterAdmission):
+        _run(inp, out, progress_callback=_cb)
+
+    # The GPU was attempted exactly once and refused on VRAM only.
+    assert len(gpu_calls) == 1
+    assert gpu_calls[0]["profile"] == zsp.STORAGE_PROFILE_DENSE
+    # The ONE CPU admission ran on the SAME frozen demand (no profile switch).
+    assert len(cpu_calls) == 1
+    snap = _storage()
+    assert snap["requested"] == "auto"
+    assert snap["effective"] == zsp.STORAGE_PROFILE_DENSE
+    assert snap["fallback_count"] == 0
+    assert snap["transitions"] == []
+    # The decline is EXPLICIT (never silent) and carries the closed reason.
+    warnings = [m for lvl, m in messages if lvl == "WARN"]
+    assert any("ACTIVE GPU not applicable" in m for m in warnings)
+    assert any(zgr.REASON_REFUSE_VRAM in m for m in warnings)
+
+
+def test_active_gpu_disk_refusal_stays_terminal(tmp_path, gpu_seams, monkeypatch):
+    """Only VRAM is a decline: every other closed refusal stays fatal."""
+    inp, out = _write_corpus(tmp_path)
+    _drive_decide(monkeypatch, reason=renv.REASON_REFUSE_DISK)
+    cpu_calls = []
+    monkeypatch.setattr(
+        zz, "_r55_active_decide",
+        lambda **kw: cpu_calls.append(kw) or (_ for _ in ()).throw(
+            AssertionError("CPU admission must not run")
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        _run(inp, out)
+    assert cpu_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +394,11 @@ def test_forced_dense_gpu_host_refusal_stays_terminal(tmp_path, gpu_seams, monke
 @pytest.mark.parametrize(
     "reason",
     [
-        renv.REASON_REFUSE_VRAM,
+        # M6: REASON_REFUSE_VRAM moved OUT of this list on purpose. A pure
+        # device-capacity refusal is a device-applicability fact: the GPU is
+        # declined (recorded) and the admitted CPU plan continues, still without
+        # any profile switch. It is covered by
+        # test_active_gpu_vram_refusal_declines_to_cpu_without_profile_switch.
         zgr.REASON_GPU_OBSERVATION_FAILED,
         renv.REASON_REFUSE_DISK,
         zgr.REASON_GPU_PARITY_NOT_QUALIFIED,

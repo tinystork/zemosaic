@@ -872,10 +872,13 @@ def test_public_auto_double_refusal_is_loud(tmp_path, monkeypatch):
     monkeypatch.setattr(zal, "ScientificFloors", _tiny_floors)
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _HugeModel())
     # Both profiles are budget-infeasible; bounded does not magically fit.
+    # NOTE (M0/M1): the product ladder now reaches 8 px, so the infeasibility
+    # witness must stay infeasible for EVERY rung instead of relying on the old
+    # 32 px floor. Otherwise planning legitimately succeeds at tile 8.
     monkeypatch.setattr(
         zz, "_estimate_streaming_bytes",
         lambda n, hw, tile_size=zz.STREAM_TILE_SIZE, channels=3,
-        storage_profile=None: 8192 * MIB,
+        storage_profile=None: 1_000_000 * MIB,
     )
     with pytest.raises(zz.zpar.ModeInfeasible) as ei:
         zz.run_zegrid_mode(

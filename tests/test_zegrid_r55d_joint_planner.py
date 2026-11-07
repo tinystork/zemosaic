@@ -34,6 +34,14 @@ def _ctx(**overrides):
     data = dict(
         phase=re.PHASE_CELL_STACK_STREAM,
         backend=re.BACKEND_CPU,
+        # M0/M1: the CPU product ladder reaches below the 32 px GPU floor, so a
+        # GPU plan context must declare the GPU ladder. The backend floor is
+        # enforced by PlanContext itself (a GPU tile < 32 is refused).
+        tile_ladder=(
+            zs.GPU_PRODUCT_TILE_LADDER
+            if overrides.get("backend") == re.BACKEND_GPU
+            else zs.PRODUCT_TILE_LADDER
+        ),
         budget_bytes=(4 * 8 * GIB) // 5,
         raw_available_bytes=8 * GIB,
         factor_num=4,
@@ -132,7 +140,10 @@ def _profile(backend=re.BACKEND_CPU, **overrides):
     return zcal.CalibrationProfile(**data)
 
 
-def _device_peaks(tiles=zs.PRODUCT_TILE_LADDER):
+def _device_peaks(tiles=zs.GPU_PRODUCT_TILE_LADDER):
+    # The CPU product ladder now reaches below the 32 px GPU floor (M0/M1), so
+    # GPU facts must be built from the GPU ladder: a GPU tile < 32 is refused
+    # by GpuFacts itself, and those rungs are never GPU candidates.
     return {
         int(tile): int(tile) * int(tile) * 3 * 3 * 4
         for tile in tiles

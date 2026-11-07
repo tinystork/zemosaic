@@ -12306,7 +12306,13 @@ def _run_single(
                     "stage": "admission",
                     "reason_code": exc.reason_code,
                     "detail": exc.detail,
-                    "telemetry": dict(exc.telemetry),
+                    # _R55GpuFallback carries telemetry; _R55GpuRefused carries
+                    # a closed record. Either way the fallback record is exact.
+                    "telemetry": dict(
+                        getattr(exc, "telemetry", None)
+                        or getattr(exc, "record", None)
+                        or {}
+                    ),
                 }
                 _r55_active_gpu_decision = None
                 _r55_active_bundle = None
@@ -12363,14 +12369,39 @@ def _run_single(
                 )
             except _R55GpuRefused as _r55_gpu_exc:
                 _r55_dense_gpu_refusal = _r55_gpu_exc
-                if not (
+                # M6 (ZM-ZEGRID-AUTO-EXTERNAL-STREAMING): a PURE device-capacity
+                # refusal is a DEVICE-APPLICABILITY fact, not a run failure. The
+                # GPU workspace model still prices N resident frames, so a large
+                # corpus on a small device has NO GPU rung at all (the declared
+                # floor is 32 px and external GPU is out of scope). Nothing has
+                # started yet (no gauge, no stack, no cache work), and the CPU
+                # working set for the SAME frozen geometry/halo/science was
+                # already admitted by the layout phase. Declining the GPU here
+                # keeps the run exact and is RECORDED (WARN + fallback block in
+                # the manifest): it is an explicit backend decline, never a
+                # silent GPU->CPU coercion of a partial or admitted GPU plan.
+                _r55_vram_decline = (
+                    str(_r55_gpu_exc.reason_code) == str(zgr.REASON_REFUSE_VRAM)
+                    and _r55_active_gpu_decision is None
+                )
+                if _r55_vram_decline:
+                    _r55_record_gpu_cpu_fallback(_r55_gpu_exc)
+                    _emit(
+                        "ZeGrid: ACTIVE GPU not applicable on this device — "
+                        f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}. "
+                        "Declining the GPU (no partial GPU result) and keeping "
+                        "the already-admitted CPU working set; the decline is "
+                        "recorded in the manifest.",
+                        lvl="WARN", callback=progress_callback,
+                    )
+                elif not (
                     str(_r55_dense_gpu_refusal.reason_code)
                     == renv.REASON_REFUSE_HOST_RAM
                     and _storage_fallback_available()
                 ):
-                    # Not a qualified dense host-RAM refusal (VRAM, disk,
-                    # observation, qualification/parity, forced profile, or an
-                    # already-consumed fallback): terminal, unchanged.
+                    # Not a qualified dense host-RAM refusal (disk, observation,
+                    # qualification/parity, forced profile, or an already-
+                    # consumed fallback): terminal, unchanged.
                     _emit(
                         "ZeGrid: R55-E2 active GPU REFUSED before the gauge/stack — "
                         f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}",
@@ -12380,88 +12411,90 @@ def _run_single(
                         "R55-E2 active GPU refused before the gauge/stack: "
                         f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}"
                     ) from _r55_gpu_exc
-                # ONE bounded retry: same raw/budget/layout/halo/science.
-                if not _activate_bounded_storage(
-                    phase="plan_gpu_admission",
-                    reason_code=str(_r55_dense_gpu_refusal.reason_code),
-                    detail=str(_r55_dense_gpu_refusal.detail),
-                    emit=_emit_live,
-                ):
+
+                if not _r55_vram_decline:
+                    # ONE bounded retry: same raw/budget/layout/halo/science.
+                    if not _activate_bounded_storage(
+                        phase="plan_gpu_admission",
+                        reason_code=str(_r55_dense_gpu_refusal.reason_code),
+                        detail=str(_r55_dense_gpu_refusal.detail),
+                        emit=_emit_live,
+                    ):
+                        _emit(
+                            "ZeGrid: R55-E2 active GPU REFUSED before the gauge/stack "
+                            "and the bounded retry is no longer available — "
+                            f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}",
+                            lvl="ERROR", callback=progress_callback,
+                        )
+                        raise RuntimeError(
+                            "R55-E2 active GPU refused before the gauge/stack: "
+                            f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}"
+                        ) from _r55_gpu_exc
                     _emit(
-                        "ZeGrid: R55-E2 active GPU REFUSED before the gauge/stack "
-                        "and the bounded retry is no longer available — "
-                        f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}",
-                        lvl="ERROR", callback=progress_callback,
+                        "ZeGrid: dense ACTIVE GPU admission refused host RAM — "
+                        "retrying ONCE with the bounded storage profile on the SAME "
+                        "geometry/halo/science (the bounded retry is the ONLY profile "
+                        "switch; a second refusal is terminal): "
+                        f"{_r55_dense_gpu_refusal.detail}",
+                        lvl="WARN", callback=progress_callback,
                     )
-                    raise RuntimeError(
-                        "R55-E2 active GPU refused before the gauge/stack: "
-                        f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}"
-                    ) from _r55_gpu_exc
-                _emit(
-                    "ZeGrid: dense ACTIVE GPU admission refused host RAM — "
-                    "retrying ONCE with the bounded storage profile on the SAME "
-                    "geometry/halo/science (the bounded retry is the ONLY profile "
-                    "switch; a second refusal is terminal): "
-                    f"{_r55_dense_gpu_refusal.detail}",
-                    lvl="WARN", callback=progress_callback,
-                )
-                try:
-                    # Rebuild the initial bundle with the EXACT same demand. The
-                    # layout sub-step reporter already recorded the first attempt
-                    # (observability only), so the retry carries None exactly like
-                    # every other bounded rebuild.
-                    _initial_bundle = _plan_bundle_auto(
-                        **{**_plan_request, "layout_substep": None}
-                    )
-                    # EVERY derived consumer must reflect the bounded bundle:
-                    # no stale dense layout/footprints/cell contexts/workers.
-                    layout = _initial_bundle.layout
-                    footprints = _initial_bundle.footprints
-                    cell_ctxs = _initial_bundle.cell_ctxs
-                    nx, ny = int(layout["nx"]), int(layout["ny"])
-                    cpu_streaming = _initial_bundle.cpu_streaming
-                    _cs_selected = cpu_streaming.get("selected_tile_size")
-                    cpu_streaming_tile = int(_initial_bundle.cpu_streaming_tile)
-                    workers = int(_initial_bundle.gauge_workers)
-                    cache_build_workers = int(
-                        _initial_bundle.cache_build_workers
-                    )
-                    _cache_fp = zpar.cache_footprint_bytes(
-                        _initial_bundle.worst_patch_px or canvas_px
-                    )
-                    _emit(
-                        "ZeGrid: bounded storage rebuilt the initial bundle — "
-                        f"layout {nx}x{ny} ({layout['cell_count']} cells, "
-                        f"source={layout.get('layout_source', 'auto')}), CPU "
-                        f"streaming tile={_cs_selected}, gauge={workers}, "
-                        f"cache_build={cache_build_workers}, predicted bound "
-                        f"{layout['predicted_bound_bytes'] / 2**20:.1f} MiB",
-                        callback=progress_callback,
-                    )
-                    (
-                        _r55_active_gpu_decision,
-                        _r55_active_bundle,
-                        _r55_active_candidate,
-                        _r55_active_mapping,
-                        _r55_active_adm,
-                        _r55_active_trail,
-                    ) = _r55_gpu_attempt(_initial_bundle)
-                except (
-                    zal.LayoutInfeasible, zpar.ModeInfeasible,
-                ) as _r55_bounded_exc:
-                    raise _r55_double_refusal(
-                        _r55_dense_gpu_refusal, _r55_bounded_exc
-                    ) from _r55_bounded_exc
-                except _R55GpuRefused as _r55_bounded_exc:
-                    raise _r55_double_refusal(
-                        _r55_dense_gpu_refusal, _r55_bounded_exc
-                    ) from _r55_bounded_exc
-                except _R55GpuFallback as _r55_bounded_exc:
-                    # ADMIT-time pressure under the bounded profile keeps the
-                    # EXISTING typed whole-batch CPU fallback (not a coercion).
-                    _r55_record_gpu_cpu_fallback(_r55_bounded_exc)
-                else:
-                    _r55_publish_gpu_admission(fallback_count=1)
+                    try:
+                        # Rebuild the initial bundle with the EXACT same demand. The
+                        # layout sub-step reporter already recorded the first attempt
+                        # (observability only), so the retry carries None exactly like
+                        # every other bounded rebuild.
+                        _initial_bundle = _plan_bundle_auto(
+                            **{**_plan_request, "layout_substep": None}
+                        )
+                        # EVERY derived consumer must reflect the bounded bundle:
+                        # no stale dense layout/footprints/cell contexts/workers.
+                        layout = _initial_bundle.layout
+                        footprints = _initial_bundle.footprints
+                        cell_ctxs = _initial_bundle.cell_ctxs
+                        nx, ny = int(layout["nx"]), int(layout["ny"])
+                        cpu_streaming = _initial_bundle.cpu_streaming
+                        _cs_selected = cpu_streaming.get("selected_tile_size")
+                        cpu_streaming_tile = int(_initial_bundle.cpu_streaming_tile)
+                        workers = int(_initial_bundle.gauge_workers)
+                        cache_build_workers = int(
+                            _initial_bundle.cache_build_workers
+                        )
+                        _cache_fp = zpar.cache_footprint_bytes(
+                            _initial_bundle.worst_patch_px or canvas_px
+                        )
+                        _emit(
+                            "ZeGrid: bounded storage rebuilt the initial bundle — "
+                            f"layout {nx}x{ny} ({layout['cell_count']} cells, "
+                            f"source={layout.get('layout_source', 'auto')}), CPU "
+                            f"streaming tile={_cs_selected}, gauge={workers}, "
+                            f"cache_build={cache_build_workers}, predicted bound "
+                            f"{layout['predicted_bound_bytes'] / 2**20:.1f} MiB",
+                            callback=progress_callback,
+                        )
+                        (
+                            _r55_active_gpu_decision,
+                            _r55_active_bundle,
+                            _r55_active_candidate,
+                            _r55_active_mapping,
+                            _r55_active_adm,
+                            _r55_active_trail,
+                        ) = _r55_gpu_attempt(_initial_bundle)
+                    except (
+                        zal.LayoutInfeasible, zpar.ModeInfeasible,
+                    ) as _r55_bounded_exc:
+                        raise _r55_double_refusal(
+                            _r55_dense_gpu_refusal, _r55_bounded_exc
+                        ) from _r55_bounded_exc
+                    except _R55GpuRefused as _r55_bounded_exc:
+                        raise _r55_double_refusal(
+                            _r55_dense_gpu_refusal, _r55_bounded_exc
+                        ) from _r55_bounded_exc
+                    except _R55GpuFallback as _r55_bounded_exc:
+                        # ADMIT-time pressure under the bounded profile keeps the
+                        # EXISTING typed whole-batch CPU fallback (not a coercion).
+                        _r55_record_gpu_cpu_fallback(_r55_bounded_exc)
+                    else:
+                        _r55_publish_gpu_admission(fallback_count=1)
             except _R55GpuFallback as _r55_gpu_exc:
                 _r55_record_gpu_cpu_fallback(_r55_gpu_exc)
 

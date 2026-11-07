@@ -556,9 +556,11 @@ def test_c_active_gpu_reaches_the_e2_pipeline(
     seen_tiles = []
     real_stream = zz.run_canonical_stack_streaming
 
-    def spy_stream(provider, request, *, tile_size=None, fixed=None):
+    def spy_stream(provider, request, *, tile_size=None, fixed=None, **kwargs):
         seen_tiles.append(None if tile_size is None else int(tile_size))
-        return real_stream(provider, request, tile_size=tile_size, fixed=fixed)
+        return real_stream(
+            provider, request, tile_size=tile_size, fixed=fixed, **kwargs
+        )
 
     monkeypatch.setattr(zz, "run_canonical_stack_streaming", spy_stream)
     real_consume = zz._consume_stack_cell
