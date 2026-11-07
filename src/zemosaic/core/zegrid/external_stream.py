@@ -517,12 +517,26 @@ def discard_stale_for_cell(
 
 def cleanup_after_commit(root, cell_id: str, *, owner_token=None) -> dict:
     """Post-commit spool cleanup for ONE Cell (commit is authoritative)."""
-    return discard_stale_for_cell(
+    report = discard_stale_for_cell(
         root,
         cell_id,
         owner_token=owner_token,
         committed_cell_ids=(cell_id,),
     )
+    # M5: leave NO residue once every attempt of this Cell is gone. Only EMPTY
+    # directories are pruned (rmdir never removes content), so a live/late
+    # attempt or any foreign file blocks the prune instead of being destroyed.
+    try:
+        root_path = _require_root(root)
+        cell_dir = root_path / str(cell_id)
+        for candidate in (cell_dir, root_path):
+            try:
+                candidate.rmdir()
+            except OSError:
+                break
+    except Exception:
+        pass
+    return report
 
 
 def scan_spool_root(

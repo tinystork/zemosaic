@@ -308,6 +308,11 @@ WORKING_SET_CLASSES = (
 )
 WORKING_SET_SCHEMA = "zemosaic-zegrid-working-set-v1"
 
+# M5: keep the external spool alive until the parent's durable commit only when
+# a durable store is actually active. A store-less run has no commit to protect,
+# so the worker may clean immediately after the result is computed (no residue).
+_EXTERNAL_RETAIN_FOR_COMMIT = False
+
 # Fraction of available memory the R4 in-memory bound must fit within to select
 # the in-memory path (headroom for decode/cache transients + allocator variance).
 INMEM_AVAILABLE_FRAC = 0.80
@@ -1624,7 +1629,17 @@ def _choose_layout_mode_aware(
                 "'zegrid_layout' config key."
             )
             _log(msg, "ERROR")
-            raise zal.LayoutInfeasible(msg)
+            if allow_external:
+                # M5: a pinned geometry may be kept for the external working set
+                # when no RAM mode fits. Floors/geometry are unchanged; the
+                # disk envelope is priced before any work.
+                _log(
+                    msg + " M5: keeping this pinned layout for the external "
+                    "disk working set (priced before gauge/stack).",
+                    "WARN",
+                )
+            else:
+                raise zal.LayoutInfeasible(msg)
         contrib_ok = max_n >= floors.min_contributors
         warnings = []
         if not contrib_ok:
@@ -2405,6 +2420,7 @@ def _run_cell_external(
     spool_root, fixed=None, storage_profile=None, storage_info=None,
     cell_id="cell", attempt_id=None, required_free_bytes=None,
     owner_token=None, owner_record=None, owner_liveness=None,
+    retain_for_commit=False,
 ):
     """Run ONE cell through the exact external working set (M2 primitive).
 
@@ -2452,7 +2468,7 @@ def _run_cell_external(
             rejection_sink=sink,
             cell_id=str(cell_id),
             attempt_id=_attempt_id,
-            cleanup_on_success=False,
+            cleanup_on_success=not bool(retain_for_commit),
             spool_out=spool_info,
             owner_token=owner_token,
             owner_record=owner_record,
@@ -4420,6 +4436,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             required_free_bytes=int(_ext.get("disk_envelope_bytes") or 0),
             owner_token=_ext.get("owner_token"),
             owner_record=_ext.get("owner_record"),
+            retain_for_commit=bool(_EXTERNAL_RETAIN_FOR_COMMIT),
         )
     elif mode == "inmem":
         # ZM-ZEGRID-R22: when the cell runs on the GPU, use the VRAM-bounded tile
@@ -6299,9 +6316,14 @@ def _build_execution_bundle(
                     "mode": "external",
                     "cells_in_flight": 1,
                     "cache_workers_per_cell": max(1, int(_cache_workers)),
-                    "stack_total_bytes": int(_ext_ws),
-                    "cache_total_bytes": 0,
-                    "aggregate_bytes": int(shared_bytes) + int(_ext_ws),
+                    # M5: the external pseudo-plan must satisfy the SAME log/
+                    # manifest key contract as every other admitted plan. The
+                    # external class is CPU-only and serialises one Cell, so it
+                    # is never GPU-serialized.
+                    "gpu_serialized": False,
+                    "stack_total_bytes": max(int(shared_bytes), int(_ext_ws)),
+                    "cache_total_bytes": int(shared_bytes),
+                    "aggregate_bytes": max(int(shared_bytes), int(_ext_ws)),
                     "chosen_reason": (
                         "external working set selected: no in-memory plan and "
                         "no RAM streaming tile fits; the complete disk "
@@ -16164,6 +16186,8 @@ def _run_single(
         "degraded_reason": None,
         "commit_errors": [],
     }
+    global _EXTERNAL_RETAIN_FOR_COMMIT
+    _EXTERNAL_RETAIN_FOR_COMMIT = False
     _store_dir = (
         getattr(zconfig, "zegrid_durable_store_dir", None)
         if zconfig is not None
@@ -18072,6 +18096,80 @@ def _run_single(
         )
     except Exception:
         pass
+    # M5: derive the executed-external count from the ACCEPTED cell records so
+    # the accounting is path-independent (a store-less/legacy run publishes no
+    # commit callback but DID execute its external cells). Records reused from a
+    # durable commit are counted separately and are never double-counted here.
+    try:
+        _n_ext_records = sum(
+            1
+            for _rec in (cell_records or ())
+            if str((_rec or {}).get("working_set")) == WORKING_SET_EXTERNAL
+            and not bool((_rec or {}).get("reused_from_commit"))
+        )
+        if _n_ext_records > int(_ext_lifecycle.get("cells_executed_external", 0)):
+            _ext_lifecycle["cells_executed_external"] = int(_n_ext_records)
+            if int(_ext_lifecycle.get("spool_bytes_written", 0)) == 0:
+                # Prefer the REAL per-cell receipts (attempt-level bytes); fall
+                # back to the predicted per-cell geometry only if absent.
+                _rec_w = 0
+                _rec_r = 0
+                for _rec in (cell_records or ()):
+                    if str((_rec or {}).get("working_set")) != WORKING_SET_EXTERNAL:
+                        continue
+                    _sp = ((_rec or {}).get("storage") or {}).get(
+                        "external_spool"
+                    ) or {}
+                    _rec_w += int(_sp.get("bytes_written") or 0)
+                    _rec_r += int(_sp.get("bytes_read") or 0)
+                if _rec_w <= 0:
+                    try:
+                        _ws_blk = getattr(
+                            _current_bundle(), "working_set_block", None
+                        ) or {}
+                        _disk_blk = _ws_blk.get("disk") or {}
+                        _rec_w = int(_n_ext_records) * int(
+                            _disk_blk.get("cumulative_writes_bytes") or 0
+                        )
+                        _rec_r = int(_n_ext_records) * int(
+                            _disk_blk.get("cumulative_reads_bytes") or 0
+                        )
+                    except Exception:
+                        pass
+                _ext_lifecycle["spool_bytes_written"] = int(_rec_w)
+                _ext_lifecycle["spool_bytes_read"] = int(_rec_r)
+    except Exception:
+        pass
+    # M5: no residue after a SUCCESSFUL external run, including the spool root
+    # itself. Only EMPTY directories are pruned (a live/late attempt or any
+    # foreign file blocks the prune rather than being destroyed).
+    try:
+        try:
+            _ws_prune = getattr(_current_bundle(), "working_set_block", None) or {}
+        except Exception:
+            _ws_prune = {}
+        _prune_root = ((_ws_prune.get("disk") or {}).get("spool_root"))
+        if not _prune_root and cache_root is not None:
+            # Legacy/store-less runs have no bundle state here, but the spool
+            # root is deterministic on the run's own cache volume.
+            _cand_root = Path(str(cache_root)) / "external-spool"
+            if _cand_root.is_dir():
+                _prune_root = str(_cand_root)
+        if _prune_root:
+            _prune_path = Path(str(_prune_root))
+            if _prune_path.is_dir():
+                for _child in sorted(_prune_path.iterdir()):
+                    if _child.is_dir():
+                        try:
+                            _child.rmdir()
+                        except OSError:
+                            pass
+                try:
+                    _prune_path.rmdir()
+                except OSError:
+                    pass
+    except Exception:
+        pass
     per_cell_diagnostics["external_lifecycle"] = dict(_ext_lifecycle)
     # M3: the working-set class + dry-plan/disk facts (additive manifest block).
     try:
@@ -19050,6 +19148,19 @@ def _write_outputs(
         "canvas": {"width": canvas.width, "height": canvas.height,
                    "resolution_deg": canvas.resolution_deg, "id": canvas.canvas_id},
         "layout": _manifest_layout_block(nx, ny, layout),
+        # M5: the honest working-set class is additive and only published when
+        # the run actually resolved one (a plain RAM/in-memory run keeps its
+        # exact previous manifest shape).
+        **(
+            {"stack_working_set": layout["stack_working_set"]}
+            if layout.get("stack_working_set")
+            else {}
+        ),
+        **(
+            {"working_set": layout["working_set"]}
+            if layout.get("working_set")
+            else {}
+        ),
         "layout_source": layout.get("layout_source", "auto"),
         # ZM-ZEGRID-R53b: ONE stable top-level provenance block (same shape for
         # global / per_cell / auto outcomes). It is resolved once at the product
