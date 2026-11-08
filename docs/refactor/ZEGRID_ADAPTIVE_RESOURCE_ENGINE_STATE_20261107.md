@@ -15,6 +15,14 @@ Contrat : [plan v2, sections 10–14](ZEGRID_ADAPTIVE_RESOURCE_ENGINE_PLAN_20261
 - Baseline ciblée Junior : deux tests de sélection external (CPU/GPU détecté) passent, `2 passed in 38.78s`; cela ne valide pas la jonction ACTIVE.
 - Aucun push/install/runtime Windows/full M33 lancé pour ce correctif. A1d et F14 restent hors périmètre.
 
+## Acceptation ciblée Junior — 2026-11-08
+
+- Mission `ZM-ACTIVE-EXTERNAL-WIRING-20261108` : **ACCEPT**, HEAD `38636ceeec82dddacbd3b9a372e854bf635c87fe`.
+- Revue indépendante Nono r1 : ACCEPT. Aucun finding matériel restant ; vérification Junior du diff et du dépôt effectuée.
+- Validation indépendante Junior conservée : **55 passed, 792 warnings, 364.80s**. Nono : transition publique naturelle 1 passed + typage 4 passed. Pas de nouvelle exécution revendiquée à la reprise.
+- Acceptation limitée au câblage ACTIVE/external : **qualification produit Windows/M33/GUI toujours PARTIELLE**, run M33 complet NON EXÉCUTÉ. Aucun push/install/relance dans cette reprise.
+- Publication de ce correctif sur `beta` explicitement autorisée par Tristan le 2026-11-08 ; cette publication ne vaut pas qualification Windows/M33 ni autorisation d’installation.
+
 ## Implémentation worker ZM-ACTIVE-EXTERNAL-WIRING — 2026-11-08
 
 - Classe de working-set `external_spool` portée par `PlanContext`/`Candidate` (champ additif ; vide = classe RAM historique) : K=1, prefetch=0, résidence disque = enveloppe spool réelle.
