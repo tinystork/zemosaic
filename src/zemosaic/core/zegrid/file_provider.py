@@ -724,8 +724,18 @@ class WindowedCanonicalProvider:
     storage_domain = "windowed_sources"
     live_window = 1
 
-    def __init__(self, prepare, n_frames, *, frame_ids=None, expected_hw=None):
+    def __init__(
+        self, prepare, n_frames, *, frame_ids=None, expected_hw=None,
+        prepare_window=None, expected_channels=None, window_stats=None,
+    ):
         self._prepare = prepare
+        # ZM-M33 lot 1: optional WINDOWED preparation. ``prepare_window(i, y0,
+        # y1, x0, x1)`` must return the exact same pixels as preparing the whole
+        # cell and slicing that window. When absent (or when the caller asks for
+        # the full cell), the historical full-cell path is used verbatim.
+        self._prepare_window = prepare_window
+        # Caller-owned mutable counters (decoded/reprojected source pixels).
+        self._window_stats = window_stats
         self.n_frames = int(n_frames)
         if self.n_frames < 0:
             raise CanonicalStackValidationError("n_frames must be >= 0")
@@ -740,10 +750,15 @@ class WindowedCanonicalProvider:
             )
         self.frame_ids = ids
         self.prepared_count = 0
+        self.window_prepared_count = 0
+        self.full_prepared_count = 0
         self.bytes_read = 0
         self._index = None
         self._rgb = None
         self._sup = None
+        self._win_key = None
+        self._win_rgb = None
+        self._win_sup = None
         self._closed = False
         self.height = self.width = self.channels = None
         self.original_mono = None
@@ -751,7 +766,22 @@ class WindowedCanonicalProvider:
         self.original_shape = None
         if expected_hw is not None:
             self.height, self.width = (int(expected_hw[0]), int(expected_hw[1]))
-        if self.n_frames:
+        if expected_channels is not None:
+            # Declared layout: no whole-cell probe frame is prepared just to
+            # learn the shape (that probe would be a full-cell reprojection).
+            c = int(expected_channels)
+            if c < 1:
+                raise CanonicalStackValidationError("expected_channels must be >= 1")
+            self.channels = c
+            self.original_mono = bool(c == 1)
+            self.original_ndim = 2 if self.original_mono else 3
+            if self.height is not None and self.width is not None:
+                self.original_shape = (
+                    (self.height, self.width)
+                    if self.original_mono
+                    else (self.height, self.width, c)
+                )
+        elif self.n_frames:
             rgb, _sup = self._load(0)
             h, w, c = rgb.shape
             if expected_hw is not None and (h, w) != (int(expected_hw[0]), int(expected_hw[1])):
@@ -806,6 +836,9 @@ class WindowedCanonicalProvider:
         # If preparation raises, no stale index may resurrect the old frame.
         self._rgb = self._sup = None
         self._index = None
+        # ``live_window == 1``: a full-cell frame and a window never coexist.
+        self._win_key = None
+        self._win_rgb = self._win_sup = None
         rgb, sup = self._prepare(i)
         rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
         sup = np.ascontiguousarray(np.asarray(sup, dtype=bool))
@@ -821,18 +854,77 @@ class WindowedCanonicalProvider:
         self._index = i
         self._rgb, self._sup = rgb, sup
         self.prepared_count += 1
+        self.full_prepared_count += 1
         self.bytes_read += int(rgb.nbytes) + int(sup.nbytes)
         return self._rgb, self._sup
+
+    def _load_window(self, i, window):
+        """Prepare ONLY the requested patch window (bit-exact, one live window)."""
+        if self._closed:
+            raise RuntimeError("WindowedCanonicalProvider is closed")
+        i = int(i)
+        if i < 0 or i >= self.n_frames:
+            raise IndexError(f"frame index {i} outside [0, {self.n_frames})")
+        key = (i, int(window[0]), int(window[1]), int(window[2]), int(window[3]))
+        if self._win_key == key:
+            return self._win_rgb, self._win_sup
+        # Release everything BEFORE decode/reprojection starts.
+        self._win_rgb = self._win_sup = None
+        self._win_key = None
+        self._rgb = self._sup = None
+        self._index = None
+        rgb, sup = self._prepare_window(*key)
+        rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
+        sup = np.ascontiguousarray(np.asarray(sup, dtype=bool))
+        if rgb.ndim != 3:
+            raise CanonicalStackValidationError("prepared window must be (H,W,C)")
+        expected_hw = (key[2] - key[1], key[4] - key[3])
+        if (int(rgb.shape[0]), int(rgb.shape[1])) != expected_hw:
+            raise CanonicalStackValidationError(
+                f"prepared window shape {rgb.shape[:2]} != requested {expected_hw}"
+            )
+        if sup.shape != rgb.shape[:2]:
+            raise CanonicalStackValidationError("support shape must be (H,W)")
+        if self.channels is not None and rgb.shape[2] != self.channels:
+            raise CanonicalStackValidationError("prepared window changed channel count")
+        self._win_key = key
+        self._win_rgb, self._win_sup = rgb, sup
+        self.prepared_count += 1
+        self.window_prepared_count += 1
+        self.bytes_read += int(rgb.nbytes) + int(sup.nbytes)
+        return self._win_rgb, self._win_sup
 
     @property
     def shape(self):
         return (self.height, self.width)
+
+    def window_telemetry(self):
+        """Honest counters proving the window bound (source pixels actually read).
+
+        ``prepared_count`` counts EVERY preparation (window or full cell);
+        ``source_pixels_decoded``/``reprojected_pixels`` come from the real
+        section reads and real reprojection windows, never from the request.
+        """
+        out = dict(self._window_stats or {})
+        out.update({
+            "prepared_count": int(self.prepared_count),
+            "window_prepared_count": int(self.window_prepared_count),
+            "full_prepared_count": int(self.full_prepared_count),
+            "prepared_aligned_bytes": int(self.bytes_read),
+        })
+        return out
 
     def get_raw_frame(self, i):
         rgb, sup = self._load(i)
         return np.array(rgb, copy=True), np.array(sup, copy=True)
 
     def get_tile(self, i, y0, y1, x0, x1):
+        if self._prepare_window is not None:
+            # Bounded path: decode + reproject ONLY this window. The pixels are
+            # bit-identical to the full-cell preparation sliced to the window.
+            tile, sup_tile = self._load_window(i, (y0, y1, x0, x1))
+            batch = prepare_canonical_inputs([tile], [sup_tile])
+            return batch.images[0], batch.valid_mask[0]
         rgb, sup = self._load(i)
         if self.original_mono:
             tile = rgb[y0:y1, x0:x1]
@@ -847,6 +939,8 @@ class WindowedCanonicalProvider:
     def close(self):
         self._rgb = self._sup = None
         self._index = None
+        self._win_rgb = self._win_sup = None
+        self._win_key = None
         self._closed = True
 
     def __enter__(self):

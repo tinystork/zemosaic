@@ -67,6 +67,7 @@ import numpy as np
 import psutil
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.wcs.utils import pixel_to_pixel
 
 from . import eta_service as zeta
 from . import progress_contract as zprogress
@@ -914,6 +915,200 @@ def _prepare_cell_source_frame(frame_desc, bounds, patch_wcs_header, patch_hw):
     return rgb, geom
 
 
+def _section_image_hdu(hdul):
+    """Mirror the product loader's image-HDU choice on an open ``HDUList``.
+
+    Same preference order as :func:`load_and_validate_fits` (HDU 0, then
+    SCI/IMAGE/PRIMARY, then the first image HDU). Nothing is read here: only
+    the header/shape metadata is inspected.
+    """
+    try:
+        for idx, hdu in enumerate(hdul):
+            if not getattr(hdu, "is_image", False) or not hdu.shape:
+                continue
+            name = getattr(hdu, "name", "")
+            if idx == 0 or (
+                isinstance(name, str)
+                and name.upper() in ("SCI", "IMAGE", "PRIMARY")
+            ):
+                return hdu
+        for hdu in hdul:
+            if getattr(hdu, "is_image", False) and hdu.shape:
+                return hdu
+    except Exception:  # noqa: BLE001 - unreadable metadata -> caller degrades
+        return None
+    return None
+
+
+def _decode_frame_section_hwc(frame_desc, bounds):
+    """Bounded decode of ONE source region -> ``(H,W,3)`` float32.
+
+    Reproduces :func:`_decode_frame_hwc` **bit-for-bit** while reading only the
+    requested FITS section: raw dtype -> float64 -> manual BZERO/BSCALE (integer
+    dtypes only, exactly as the product loader) -> non-finite cleanup -> float32
+    -> channel replication. Returns ``None`` whenever a section read cannot
+    provably reproduce the whole-frame decode (Bayer/CFA data, whose global
+    min/max normalisation and spatial debayer are frame-global, or an
+    unexpected axis layout); the caller then degrades to the historical
+    whole-frame decode and records it. Never silently changes the science.
+    """
+    path = str(frame_desc.source_path)
+    try:
+        with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+            hdu = _section_image_hdu(hdul)
+            if hdu is None:
+                return None
+            header = hdu.header
+            if header.get("BAYERPAT", header.get("CFAIMAGE", None)):
+                return None
+            shape = tuple(int(v) for v in hdu.shape)
+            y0, y1 = int(bounds.y0), int(bounds.y1)
+            x0, x1 = int(bounds.x0), int(bounds.x1)
+            channels_first = False
+            if len(shape) == 2:
+                section = hdu.section[y0:y1, x0:x1]
+            elif len(shape) == 3:
+                if shape[0] in (1, 3) and shape[1] > 4 and shape[2] > 4:
+                    section = hdu.section[:, y0:y1, x0:x1]
+                    channels_first = True
+                elif shape[2] in (1, 3) and shape[0] > 4 and shape[1] > 4:
+                    section = hdu.section[y0:y1, x0:x1, :]
+                else:
+                    return None
+            else:
+                return None
+            raw = np.asarray(section)
+    except Exception:  # noqa: BLE001 - any section failure -> degrade
+        return None
+    if raw.size == 0:
+        return None
+    decoded_bytes = int(raw.nbytes)
+    # --- exact product-loader transform, on the section only -----------------
+    data = np.asarray(raw, dtype=np.float64)
+    if raw.dtype.kind == "i":
+        bzero = header.get("BZERO", 0.0)
+        bscale = header.get("BSCALE", 1.0)
+        if abs(float(bscale) - 1.0) > 1e-6 or abs(float(bzero)) > 1e-6:
+            data = data * float(bscale) + float(bzero)
+    if not np.all(np.isfinite(data)):
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+    arr = np.ascontiguousarray(data.astype(np.float32))
+    # --- exact HWC layout of ``load_and_validate_fits`` + ``_decode_frame_hwc``
+    if channels_first:
+        # (C, H, W) on disk -> HWC, exactly as the product loader transposes it
+        arr = np.moveaxis(arr, 0, -1)
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    elif arr.ndim == 3 and arr.shape[-1] != 3:
+        return None
+    return np.ascontiguousarray(arr, dtype=np.float32), decoded_bytes
+
+
+_WINDOW_BOUNDS_GRID = 9
+
+
+def _window_source_bounds(frame_desc, cell_bounds, patch_wcs, window):
+    """Conservative source read rect that covers ONE patch sub-window.
+
+    Samples the window's pixel-centre grid through ``patch WCS -> source WCS``
+    (the transform each target pixel uses), takes the outward integer hull plus
+    the interpolation margin, and clips to the cell's planned read rect. Clipping
+    to ``cell_bounds`` guarantees the windowed decoder never reads a source pixel
+    the historical whole-cell path could not have read, so parity is structural
+    rather than assumed. Returns ``None`` when the window cannot be covered.
+    """
+    y0, y1, x0, x1 = (int(v) for v in window)
+    if y1 <= y0 or x1 <= x0:
+        return None
+    gx = np.linspace(x0, max(x0, x1 - 1), _WINDOW_BOUNDS_GRID)
+    gy = np.linspace(y0, max(y0, y1 - 1), _WINDOW_BOUNDS_GRID)
+    mx, my = np.meshgrid(gx, gy, indexing="xy")
+    try:
+        xi, yi = pixel_to_pixel(
+            patch_wcs, frame_desc.wcs(), mx.ravel(), my.ravel()
+        )
+    except Exception:  # noqa: BLE001 - unprojectable window -> degrade
+        return None
+    if not (np.all(np.isfinite(xi)) and np.all(np.isfinite(yi))):
+        return None
+    margin = int(zg.DEFAULT_SOURCE_MARGIN_PX)
+    h, w = (int(v) for v in frame_desc.shape_hw)
+    sx0 = max(int(cell_bounds.x0), int(np.floor(xi.min() - margin)))
+    sy0 = max(int(cell_bounds.y0), int(np.floor(yi.min() - margin)))
+    sx1 = min(int(cell_bounds.x1), int(np.ceil(xi.max() + margin)) + 1)
+    sy1 = min(int(cell_bounds.y1), int(np.ceil(yi.max() + margin)) + 1)
+    sx0, sy0 = max(0, sx0), max(0, sy0)
+    sx1, sy1 = min(w, sx1), min(h, sy1)
+    out = zg.SourceBounds(sx0, sy0, sx1, sy1)
+    if out.empty:
+        # The window's preimage fell outside the cell's planned read rect (an
+        # edge/corner tile). Still never fall back to the whole frame: the cell
+        # rect is a valid, smaller bounding read and the reprojection stays
+        # bounded to the window.
+        return cell_bounds
+    return out
+
+
+def _new_source_window_stats() -> dict:
+    """Honest, additive counters for the windowed source path."""
+    return {
+        "window_prepares": 0,
+        "full_decode_fallbacks": 0,
+        "source_pixels_decoded": 0,
+        "source_bytes_decoded": 0,
+        "reprojected_pixels": 0,
+    }
+
+
+def _prepare_cell_source_window(
+    frame_desc, cell_bounds, patch_wcs_header, patch_hw, window, *, stats=None,
+):
+    """Decode/reproject ONLY the requested patch sub-window (bit-exact).
+
+    Same math as :func:`_prepare_cell_source_frame` restricted to the target
+    window: the source read is bounded by the window's preimage, the reprojection
+    is computed for that window's output pixels only, and every returned pixel is
+    byte-identical to slicing the whole-cell preparation. Any case that cannot be
+    bounded (Bayer sources, unexpected layouts, unprojectable windows) degrades to
+    the historical whole-frame decode and is counted."""
+    stats = stats if stats is not None else _new_source_window_stats()
+    window = (int(window[0]), int(window[1]), int(window[2]), int(window[3]))
+    patch_wcs = WCS(patch_wcs_header)
+    src_bounds = _window_source_bounds(
+        frame_desc, cell_bounds, patch_wcs, window
+    )
+    crop_hwc = None
+    if src_bounds is not None:
+        decoded = _decode_frame_section_hwc(frame_desc, src_bounds)
+        if decoded is not None:
+            crop_hwc, _decoded_bytes = decoded
+            crop_wcs = zxe.slice_wcs(frame_desc.wcs(), src_bounds)
+            stats["source_pixels_decoded"] += int(
+                src_bounds.width * src_bounds.height
+            )
+            stats["source_bytes_decoded"] += int(_decoded_bytes)
+    if crop_hwc is None:
+        # Explicit degradation: the historical whole-frame decode + cell crop.
+        hwc = _decode_frame_hwc(frame_desc, None)
+        crop_hwc = hwc[cell_bounds.y0:cell_bounds.y1, cell_bounds.x0:cell_bounds.x1]
+        crop_wcs = zxe.slice_wcs(frame_desc.wcs(), cell_bounds)
+        stats["full_decode_fallbacks"] += 1
+        stats["source_pixels_decoded"] += int(crop_hwc.shape[0] * crop_hwc.shape[1])
+    crop_chw = np.ascontiguousarray(np.moveaxis(crop_hwc, -1, 0))
+    rgb, geom = zxe.reproject_cropped(
+        crop_chw, crop_wcs, patch_wcs, tuple(patch_hw), window=window
+    )
+    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
+    geom = np.ascontiguousarray(np.asarray(geom, dtype=bool))
+    stats["window_prepares"] += 1
+    stats["reprojected_pixels"] += int(
+        (window[1] - window[0]) * (window[3] - window[2])
+    )
+    return rgb, geom
+
+
 @dataclass(frozen=True)
 class _CellSourceContext:
     """Pickle-safe cell input recipe, never image arrays or a live provider.
@@ -932,15 +1127,25 @@ class _CellSourceContext:
         return tuple(f.frame_id.logical_path for f, _bounds in self.planned)
 
     def open_provider(self):
+        stats = _new_source_window_stats()
+
         def prepare(index):
             frame, bounds = self.planned[index]
             return _prepare_cell_source_frame(
                 frame, bounds, self.patch_wcs_header, self.patch_hw
             )
 
+        def prepare_window(index, y0, y1, x0, x1):
+            frame, bounds = self.planned[index]
+            return _prepare_cell_source_window(
+                frame, bounds, self.patch_wcs_header, self.patch_hw,
+                (y0, y1, x0, x1), stats=stats,
+            )
+
         return zfp.WindowedCanonicalProvider(
             prepare, len(self.planned), frame_ids=self.frame_ids,
-            expected_hw=self.patch_hw,
+            expected_hw=self.patch_hw, prepare_window=prepare_window,
+            expected_channels=3, window_stats=stats,
         )
 
 
@@ -2528,6 +2733,8 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
                 **({
                     "prepared_count": provider.prepared_count,
                     "bytes_read_semantics": "prepared_aligned_bytes_not_source_io",
+                    # ZM-M33 lot 1: honest windowed-source proof counters.
+                    "source_window": provider.window_telemetry(),
                 } if isinstance(provider, zfp.WindowedCanonicalProvider) else {}),
                 "open_count": getattr(provider, "open_count", None),
                 "open_failures": getattr(provider, "open_failures", None),
@@ -2668,6 +2875,8 @@ def _run_cell_external(
                 **({
                     "prepared_count": provider.prepared_count,
                     "bytes_read_semantics": "prepared_aligned_bytes_not_source_io",
+                    # ZM-M33 lot 1: honest windowed-source proof counters.
+                    "source_window": provider.window_telemetry(),
                 } if isinstance(provider, zfp.WindowedCanonicalProvider) else {}),
                 "open_count": getattr(provider, "open_count", None),
                 "open_failures": getattr(provider, "open_failures", None),

@@ -1251,6 +1251,13 @@ def external_cell_host_components(
     )
 
     rows, cols = batch_positions_for(req, iw, c)
+    # ZM-M33 lot 1: a batch can never hold more positions than the interior
+    # tile actually has. ``batch_positions_for`` sizes rows from the request
+    # alone, so a very large ``column_batch`` could price (and later appear to
+    # allocate) several times the tile surface. Bound BOTH dimensions by the
+    # real interior geometry before pricing the batch.
+    rows = min(int(rows), ih)
+    cols = min(int(cols), iw)
     positions = rows * cols * c
     batch = external_batch_bytes(n, positions)
 
@@ -1278,9 +1285,6 @@ def external_cell_host_components(
         ),
         "batch_fixed_position_bytes": int(
             EXTERNAL_BATCH_FIXED_POSITION_BYTES
-        ),
-        "batch_bytes_per_position_frame": int(
-            EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
         ),
         "batch_total_bytes": int(batch),
         "persistent_result_bytes": int(persistent),
@@ -1356,6 +1360,11 @@ def estimate_external_working_set(
     max_iw = _max_interior_width(tiles)
     max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in tiles)
     rows, cols = batch_positions_for(req, max_iw, c)
+    # ZM-M33 lot 1: a batch never exceeds the real interior surface (same bound
+    # as ``external_cell_host_components``). Pricing and host components read
+    # the SAME positions so the published telemetry cannot disagree.
+    rows = min(int(rows), int(max_ih))
+    cols = min(int(cols), int(max_iw))
     positions = rows * cols * c
     reduction_bytes = external_batch_bytes(n, positions)
 

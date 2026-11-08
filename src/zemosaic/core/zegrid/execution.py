@@ -20,6 +20,7 @@ Prepared RGB FITS contract (produced by ``tools/zegrid_r1/prepare_rgb_fixture.py
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -234,10 +235,54 @@ def _clip_coords(shape, coords: np.ndarray) -> np.ndarray:
     return coords
 
 
+def _window_rect(
+    patch_shape_hw: tuple[int, int], window,
+) -> tuple[int, int, int, int]:
+    """Validate/normalize a patch sub-window ``(y0, y1, x0, x1)``.
+
+    ``None`` means the FULL patch: ``(0, H, 0, W)``. The returned bounds are
+    half-open, NumPy order, and always inside the patch grid. A sub-window is
+    only a *subset* of the same output pixel grid, so every target pixel keeps
+    the exact same byte value it had in the full-patch computation.
+    """
+    h, w = int(patch_shape_hw[0]), int(patch_shape_hw[1])
+    if window is None:
+        return 0, h, 0, w
+    y0, y1, x0, x1 = (int(v) for v in window)
+    if not (0 <= y0 < y1 <= h and 0 <= x0 < x1 <= w):
+        raise ValueError(
+            f"window {(y0, y1, x0, x1)} outside patch grid {(h, w)}"
+        )
+    return y0, y1, x0, x1
+
+
+def _window_output_wcs(
+    patch_wcs: WCS, patch_shape_hw: tuple[int, int], window
+) -> WCS:
+    """Sub-WCS of the patch whose pixel ``(x, y)`` is patch pixel ``(x+x0, y+y0)``.
+
+    Only used by the ``reproject_interp`` fallback, which needs an output WCS.
+    The CRPIX shift is an exact integer offset, and the SIP reference pixel (if
+    any) is shifted identically, so this WCS reproduces the SAME world
+    coordinate for every sub-window pixel as the full patch WCS does for the
+    corresponding full-patch pixel (bit-exact; verified by the parity tests).
+    """
+    y0, y1, x0, x1 = _window_rect(patch_shape_hw, window)
+    sub = copy.deepcopy(patch_wcs)
+    shift = np.array([float(x0), float(y0)], dtype=float)
+    sub.wcs.crpix = np.asarray(sub.wcs.crpix, dtype=float) - shift
+    if sub.sip is not None:
+        sub.sip = copy.deepcopy(sub.sip)
+        sub.sip.crpix = np.asarray(sub.sip.crpix, dtype=float) - shift
+    sub.array_shape = (y1 - y0, x1 - x0)
+    return sub
+
+
 def _compute_pixel_in(
     cropped_wcs: WCS,
     patch_wcs: WCS,
     patch_shape_hw: tuple[int, int],
+    window=None,
 ) -> np.ndarray:
     """Map the output pixel grid to input-pixel coordinates.
 
@@ -254,9 +299,13 @@ def _compute_pixel_in(
     ``reproject_interp`` on the M16 corpus.  (The ``reproject`` roundtrip NaN
     check is a no-op for undistorted TAN, so it is intentionally omitted.)
     """
-    h, w = patch_shape_hw
+    y0, y1, x0, x1 = _window_rect(patch_shape_hw, window)
+    # Same per-pixel transform on a SUBSET of the full output grid: the target
+    # pixel values never depend on the other target pixels (no cross-talk), so
+    # restricting the grid cannot change any retained value.
     x, y = np.meshgrid(
-        np.arange(w, dtype=float), np.arange(h, dtype=float), indexing="xy"
+        np.arange(x0, x1, dtype=float), np.arange(y0, y1, dtype=float),
+        indexing="xy",
     )
     xi, yi = pixel_to_pixel(patch_wcs, cropped_wcs, x.ravel(), y.ravel())
     return np.stack([yi, xi])
@@ -267,6 +316,7 @@ def reproject_cropped_fast(
     cropped_wcs: WCS,
     patch_wcs: WCS,
     patch_shape_hw: tuple[int, int],
+    window=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fast bilinear reprojection (bit-exact to ``reproject_interp`` on plain TAN).
 
@@ -275,7 +325,8 @@ def reproject_cropped_fast(
     the caller can fall back (this function never swallows an exception).
     """
     c = cropped_chw.shape[0]
-    h, w = patch_shape_hw
+    y0, y1, x0, x1 = _window_rect(patch_shape_hw, window)
+    h, w = y1 - y0, x1 - x0
     # Contiguous float64 planes.  Bit-exactness requires float64: ``reproject``
     # interpolates into a float64 output array, and the float32->float64 upcast
     # is lossless, so feeding float64 to ``map_coordinates`` reproduces it.
@@ -284,7 +335,9 @@ def reproject_cropped_fast(
         # Match the pre-R21 path, which silenced ``reproject_interp`` warnings
         # (e.g. TAN-singularity coordinate warnings).
         warnings.simplefilter("ignore")
-        coords = _compute_pixel_in(cropped_wcs, patch_wcs, patch_shape_hw)
+        coords = _compute_pixel_in(
+            cropped_wcs, patch_wcs, patch_shape_hw, window
+        )
     coords = _clip_coords(src.shape[1:], coords)
     reset = np.zeros(coords.shape[1], dtype=bool)
     for i in range(coords.shape[0]):
@@ -385,6 +438,7 @@ def reproject_cropped(
     patch_wcs: WCS,
     patch_shape_hw: tuple[int, int],
     *,
+    window=None,
     emit=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reproject a cropped ``(C,H,W)`` source to the exact patch shape.
@@ -400,8 +454,15 @@ def reproject_cropped(
     path actually used is recorded in the process-local
     :func:`get_reproject_path_stats` accumulator and any fallback is surfaced
     loudly (log + ``emit`` WARN, once per process).
+
+    ``window`` (ZM-M33 lot 1) restricts the OUTPUT to the half-open patch
+    sub-window ``(y0, y1, x0, x1)``; ``None`` keeps the historical full patch.
+    The window is a subset of the same output grid, so the returned pixels are
+    bit-identical to slicing the full-patch result.
     """
     c = cropped_chw.shape[0]
+    y0, y1, x0, x1 = _window_rect(patch_shape_hw, window)
+    out_shape = (y1 - y0, x1 - x0)
     eligible = (
         not _REPROJECT_FORCE_FALLBACK
         and _plain_tan_wcs(cropped_wcs)
@@ -413,7 +474,7 @@ def reproject_cropped(
         t0 = time.perf_counter()
         try:
             out, geom = reproject_cropped_fast(
-                cropped_chw, cropped_wcs, patch_wcs, patch_shape_hw
+                cropped_chw, cropped_wcs, patch_wcs, patch_shape_hw, window
             )
             _REPROJECT_STATS.record_fast(time.perf_counter() - t0)
             return out, geom
@@ -426,16 +487,20 @@ def reproject_cropped(
         fallback_reason = _FALLBACK_REASON_NON_TAN
 
     # Fallback path — the pre-R21 implementation, unchanged science.
-    out = np.empty((patch_shape_hw[0], patch_shape_hw[1], c), dtype=np.float32)
+    out = np.empty((out_shape[0], out_shape[1], c), dtype=np.float32)
     support: np.ndarray | None = None
+    out_wcs = (
+        patch_wcs if window is None
+        else _window_output_wcs(patch_wcs, patch_shape_hw, window)
+    )
     t0 = time.perf_counter()
     for ch in range(c):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             arr, footprint = reproject_interp(
                 (cropped_chw[ch], cropped_wcs),
-                output_projection=patch_wcs,
-                shape_out=patch_shape_hw,
+                output_projection=out_wcs,
+                shape_out=out_shape,
                 order=REPROJECT_ORDER,
                 return_footprint=True,
             )

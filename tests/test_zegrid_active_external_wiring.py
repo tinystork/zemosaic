@@ -24,6 +24,7 @@ import pytest
 
 from zemosaic import zemosaic_zegrid_mode as zz
 from zemosaic.core.zegrid import auto_layout as zal
+from zemosaic.core.zegrid import external_stream as xstream
 from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import parallel as zpar
 from zemosaic.core.zegrid import ram_contract as rcontract
@@ -940,9 +941,13 @@ def test_selector_distinguishes_frozen_batch_ram_from_invalid(
     tmp_path, monkeypatch
 ):
     _free(monkeypatch, 77 * GIB)
+    # ZM-M33 lot 1: the batch is now priced on the REAL interior surface, so an
+    # absurd frozen ``column_batch`` can no longer inflate the peak. A genuine
+    # HOST-RAM shortfall therefore needs a tile whose honest interior batch does
+    # not fit (the qualified 128 px tile over a 160 px patch).
     kwargs = dict(
-        permitted_tiles=(16,),
-        worst_patch_hw=(40, 40),
+        permitted_tiles=(128,),
+        worst_patch_hw=(160, 160),
         max_n_frames=100,
         channels=3,
         budget_bytes=512 * MIB,
@@ -952,7 +957,7 @@ def test_selector_distinguishes_frozen_batch_ram_from_invalid(
         observation_domain=rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     ram = zz._select_external_fallback(
-        **kwargs, frozen_tile=16, frozen_batch=10 ** 7
+        **kwargs, frozen_tile=128, frozen_batch=10 ** 7
     )
     assert ram["refused"] is True
     assert ram["reason"] == "frozen_batch_ram"
@@ -960,7 +965,7 @@ def test_selector_distinguishes_frozen_batch_ram_from_invalid(
     assert "HOST RAM" in ram["detail"]
 
     invalid = zz._select_external_fallback(
-        **kwargs, frozen_tile=16, frozen_batch=0
+        **kwargs, frozen_tile=128, frozen_batch=0
     )
     assert invalid["refused"] is True
     assert invalid["reason"] == "frozen_batch_invalid"
@@ -976,9 +981,18 @@ def test_builder_maps_external_ram_floor_to_host_ram(tmp_path, monkeypatch):
     assert "reduction" in str(exc.value).lower()
 
 
-def test_builder_maps_valid_frozen_batch_ram_to_host_ram(
+def test_builder_normalizes_oversized_frozen_batch_to_interior(
     tmp_path, monkeypatch
 ):
+    """ZM-M33 lot 1: the batch model never bills more positions than the tile.
+
+    A frozen ``column_batch`` larger than the tile interior used to inflate the
+    priced batch (``rows_per_batch`` unbounded) and fabricate a HOST-RAM refusal
+    at this small geometry. The model now clamps to the REAL interior surface,
+    so the bundle is admitted and the published host components PROVE the bound.
+    A genuine frozen-batch RAM shortfall is still covered by
+    ``test_selector_distinguishes_frozen_batch_ram_from_invalid``.
+    """
     frozen = zres.build_admission(
         backend="cpu",
         tile_px=16,
@@ -989,14 +1003,21 @@ def test_builder_maps_valid_frozen_batch_ram_to_host_ram(
             "column_batch": 10 ** 9,
         },
     )
-    with pytest.raises(zsched.PlanRefused) as exc:
-        _bundle(
-            tmp_path, monkeypatch, stream_table=None,
-            frozen_admission=frozen,
-        )
-    assert exc.value.reason_code == renv.REASON_REFUSE_HOST_RAM
-    assert exc.value.reason_code != renv.REASON_REFUSE_DISK
-    assert "frozen" in str(exc.value).lower()
+    bundle = _bundle(
+        tmp_path, monkeypatch, stream_table=None,
+        frozen_admission=frozen,
+    )
+    assert bundle.chosen_mode == "external"
+    external_tasks = [t for t in bundle.cell_tasks if t[4] == "external"]
+    assert external_tasks
+    host = external_tasks[0][7]["host_components"]
+    ih, iw = (int(v) for v in host["interior_hw"])
+    assert host["rows_per_batch"] <= ih
+    assert host["cols_per_batch"] <= iw
+    assert 1 <= host["batch_positions"] <= ih * iw * int(host["channels"])
+    assert host["batch_total_bytes"] == xstream.external_batch_bytes(
+        int(host["n_frames"]), int(host["batch_positions"])
+    )
 
 
 # ---------------------------------------------------------------------------
