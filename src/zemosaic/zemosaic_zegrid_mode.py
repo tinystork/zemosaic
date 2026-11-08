@@ -6162,6 +6162,9 @@ def _select_external_fallback(
                     n_frames=int(max_n_frames),
                     interior_width=min(int(tile), int(worst_patch_hw[1])),
                     channels=int(channels),
+                    fixed_position_bytes=int(
+                        zext.EXTERNAL_BATCH_FIXED_POSITION_BYTES
+                    ),
                 )
             except zext.ExternalBudgetError as exc:
                 trials.append({
@@ -7315,6 +7318,12 @@ def _build_execution_bundle(
                 ),
                 "combine": str(
                     external_selection.get("combine", "mean")
+                ),
+                "batch_sample_bytes_per_position_frame": int(
+                    zext.EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+                ),
+                "batch_fixed_position_bytes": int(
+                    zext.EXTERNAL_BATCH_FIXED_POSITION_BYTES
                 ),
                 "phase_budget_bytes": int(
                     external_selection["phase_budget_bytes"]
@@ -8626,6 +8635,20 @@ def _r55_external_contract(bundle) -> dict:
     if bool(components.get("equalize_rgb")) != bool(contract["equalize_rgb"]):
         raise zsched.SchedulerConfigError(
             "external host components disagree with the frozen equalize_rgb fact"
+        )
+    if int(contract.get("batch_sample_bytes_per_position_frame") or 0) != int(
+        zext.EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+    ):
+        raise zsched.SchedulerConfigError(
+            "external contract does not carry the frozen N-scaled batch "
+            "coefficient"
+        )
+    if int(contract.get("batch_fixed_position_bytes") or 0) != int(
+        zext.EXTERNAL_BATCH_FIXED_POSITION_BYTES
+    ):
+        raise zsched.SchedulerConfigError(
+            "external contract does not carry the frozen fixed per-position "
+            "batch term"
         )
     return contract
 

@@ -180,6 +180,12 @@ def equalize_rgb_medians_canonical(
     raw_gains[finite_chan] = target / med[finite_chan]
     clipped = np.clip(raw_gains, clip_lo, clip_hi).astype(np.float32)
 
+    # Release the full-patch boolean/luminance/mask arrays before the final
+    # product: after the channel gains are fixed they are no longer needed, and
+    # keeping them live would overstate the equalization host peak. This does
+    # not change any arithmetic or the returned values.
+    del finite, positive, valid_rgb, lum, mask
+
     # Out-of-place apply (never mutates the caller's array).
     result = (result * clipped).astype(np.float32)
 

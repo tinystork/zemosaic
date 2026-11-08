@@ -233,7 +233,8 @@ def test_parity_single_full_patch_tile(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_reduction_workspace_is_bounded_and_patch_independent():
-    per = xstream.REDUCTION_BYTES_PER_POSITION_FRAME
+    per = xstream.EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+    fixed = xstream.EXTERNAL_BATCH_FIXED_POSITION_BYTES
     small = xstream.estimate_external_working_set(
         n_frames=4, height=40, width=40, channels=3, tile_size=16,
         halo_px=9, column_batch=64,
@@ -250,8 +251,12 @@ def test_reduction_workspace_is_bounded_and_patch_independent():
     p_large_n = large_n["ram"]["batch_positions"]
     p_large_patch = large_patch["ram"]["batch_positions"]
     assert p_small == p_large_n == p_large_patch
-    assert small["ram"]["reduction_workspace_bytes"] == 4 * p_small * per
-    assert large_n["ram"]["reduction_workspace_bytes"] == 64 * p_large_n * per
+    assert small["ram"]["reduction_workspace_bytes"] == (
+        p_small * (4 * per + fixed)
+    )
+    assert large_n["ram"]["reduction_workspace_bytes"] == (
+        p_large_n * (64 * per + fixed)
+    )
     # Linear in N, but the PATCH area (400x400 vs 40x40) does not change it.
     assert (
         large_patch["ram"]["reduction_workspace_bytes"]
@@ -592,8 +597,9 @@ def test_m33_pricing_is_nonzero_geometry_derived_and_honest():
     assert estimate["disk"]["unknown_terms"] == list(xstream._UNKNOWN_DISK_TERMS)
     assert estimate["disk"]["unknown_bytes"] is None
     assert estimate["ram"]["reduction_workspace_bytes"] == (
-        n * estimate["ram"]["batch_positions"]
-        * xstream.REDUCTION_BYTES_PER_POSITION_FRAME
+        xstream.external_batch_bytes(
+            n, estimate["ram"]["batch_positions"]
+        )
     )
     assert estimate["ram"]["reduction_workspace_bytes"] > 0
     # Tile count is geometry-derived (4 x 4 tiles for 64 px at tile 20).

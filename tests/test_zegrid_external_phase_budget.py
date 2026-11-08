@@ -104,6 +104,36 @@ def _canvas_corpus(n=4, step_px=3600.0):
     return frames
 
 
+def _low_n_corpus(n=3, h=20, w=18, seed=11):
+    """Small n-safe corpus (the M4 helper assumes n >= 4)."""
+    rng = np.random.default_rng(seed)
+    base = np.full((h, w), 100.0)
+    yy, xx = np.mgrid[0:h, 0:w]
+    for _ in range(2):
+        cy, cx = rng.uniform(0.3, 0.7) * h, rng.uniform(0.3, 0.7) * w
+        base += 8.0 * np.exp(
+            -((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 2.5 ** 2)
+        )
+    gains = np.linspace(0.99, 1.01, n)
+    frames = []
+    for i in range(n):
+        frame = np.stack(
+            [
+                base * gains[i] * (0.99 + 0.01 * c)
+                + rng.normal(0.0, 0.7, (h, w))
+                for c in range(3)
+            ],
+            axis=-1,
+        )
+        frames.append(np.ascontiguousarray(frame.astype(np.float32)))
+    masks = [np.ones((h, w), dtype=bool) for _ in range(n)]
+    if n >= 2:
+        masks[1][:, w // 2:] = False
+    if n >= 3:
+        frames[2][2:4, 2:4, :] = np.nan
+    return frames, masks
+
+
 def _selector(tmp_path, monkeypatch, **kwargs):
     monkeypatch.setattr(zz, "_STACK_STORAGE_PROFILE", "bounded")
     base = dict(
@@ -528,8 +558,12 @@ def test_external_host_component_formula_matches_real_arrays():
     assert host["phases"]["finalize"] == (
         host["persistent_result_bytes"] + host["finalize_total_bytes"]
     )
-    assert host["reduction_batch_bytes"] == (
-        5 * 6 * zext.EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+    assert host["reduction_batch_bytes"] == zext.external_batch_bytes(5, 6)
+    assert host["batch_sample_bytes_per_position_frame"] == (
+        zext.EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+    )
+    assert host["batch_fixed_position_bytes"] == (
+        zext.EXTERNAL_BATCH_FIXED_POSITION_BYTES
     )
     assert host["phases"]["reduce"] == (
         host["persistent_result_bytes"]
@@ -668,6 +702,12 @@ def test_one_frozen_host_peak_across_bundle_task_active_manifest(
     )
     contract = bundle.external_contract
     peak = int(contract["host_peak_bytes"])
+    assert contract["batch_sample_bytes_per_position_frame"] == (
+        zext.EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+    )
+    assert contract["batch_fixed_position_bytes"] == (
+        zext.EXTERNAL_BATCH_FIXED_POSITION_BYTES
+    )
     assert bundle.per_cell_footprint == peak
     ext_tasks = [t for t in bundle.cell_tasks if t[4] == "external"]
     assert ext_tasks
@@ -776,50 +816,143 @@ def test_equalize_rgb_true_is_priced_in_the_host_peak():
     assert on["peak_bytes"] >= on["phases"]["finalize"]
 
 
-def test_batch_coefficient_bounds_every_rejection_combine_variant():
-    n, positions = 101, 37
+@pytest.mark.parametrize("n_frames", [1, 2, 3, 101])
+def test_batch_two_part_model_bounds_low_n_and_large_n(n_frames):
+    """Executable worst-live-set proof at low N and large N.
+
+    The model is ``positions * (n * sample_bytes + fixed_position_bytes)``.
+    This test enumerates the REAL ``(n, positions)`` and ``(positions,)`` arrays
+    for every rejection/combine pair, including the quantile return/condition
+    temporaries that a fixed per-sample coefficient cannot represent.
+    """
+    positions = 37
+    n = int(n_frames)
     common = [
         np.empty((n, positions), np.float32),   # img
         np.empty((n, positions), np.float64),   # weights
         np.empty((n, positions), np.float64),   # orig
         np.empty((n, positions), np.float64),   # wmap
     ] + [np.empty((n, positions), bool) for _ in range(6)]
-    coefficient = zext.EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+    common += [
+        np.empty((positions,), bool),           # degenerate_b
+        np.empty((positions,), np.int64),       # init_sum
+    ]
     for rejection in ("none", "kappa_sigma", "winsorized_sigma_clip"):
         for combine in ("mean", "median"):
-            extra = []
+            n_arrays = []
+            fixed = []
             if rejection == "kappa_sigma":
-                extra += [
-                    np.empty((n, positions), np.float64),
-                    np.empty((n, positions), np.float64),
+                n_arrays += [
+                    np.empty((n, positions), np.float64)  # masked
+                    for _ in range(2)                     # + median sort copy
                 ]
-                extra += [np.empty((n, positions), bool) for _ in range(5)]
+                n_arrays += [
+                    np.empty((n, positions), bool) for _ in range(5)
+                ]
+                fixed += [
+                    np.empty((positions,), np.float64) for _ in range(4)
+                ]  # center, std, lower, upper
+                fixed += [
+                    np.empty((positions,), bool) for _ in range(2)
+                ]  # active, degenerate
             elif rejection == "winsorized_sigma_clip":
-                extra += [
+                n_arrays += [
                     np.empty((n, positions), np.float64)
-                    for _ in range(3)
+                    for _ in range(3)  # masked, quantile sort copy, winsor
                 ]
-                extra += [np.empty((n, positions), bool) for _ in range(5)]
+                n_arrays += [
+                    np.empty((n, positions), bool) for _ in range(6)
+                ]  # valid + interval/equality/keep/keep2/and
+                fixed += [
+                    np.empty((positions,), np.int64) for _ in range(4)
+                ]  # count, eff_count, lo, hi
+                fixed += [
+                    np.empty((positions,), np.float64) for _ in range(12)
+                ]  # index/frac/v_lo/v_hi/diff/result/q_low/q_high/center/std/lower/upper
+                fixed += [
+                    np.empty((positions,), bool) for _ in range(5)
+                ]  # conditions, active, degenerate
             if combine == "mean":
-                extra += [
-                    np.empty((n, positions), np.float64)
-                    for _ in range(3)
+                n_arrays += [
+                    np.empty((n, positions), np.float64) for _ in range(3)
+                ]  # masked, w_contrib, product
+                fixed += [
+                    np.empty((positions,), np.float64) for _ in range(3)
+                ]  # numerator, denominator, estimate
+                fixed += [
+                    np.empty((positions,), bool) for _ in range(3)
                 ]
             else:
-                extra += [
-                    np.empty((n, positions), np.float64)
-                    for _ in range(3)
+                n_arrays += [
+                    np.empty((n, positions), np.float64) for _ in range(3)
+                ]  # masked, sort copy, median output
+                fixed += [np.empty((positions,), np.float64)]
+                fixed += [
+                    np.empty((positions,), bool) for _ in range(3)
                 ]
-                extra += [np.empty((n, positions), bool)]
-            live = sum(a.nbytes for a in common + extra)
-            assert live <= coefficient * n * positions, (
-                rejection, combine, live, coefficient * n * positions
+            live = sum(a.nbytes for a in common + n_arrays + fixed)
+            bound = positions * (
+                n * zext.EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+                + zext.EXTERNAL_BATCH_FIXED_POSITION_BYTES
             )
-            bound = zext.external_batch_live_bytes_per_position_frame(
+            assert live <= bound, (
+                n, rejection, combine, live, bound
+            )
+            assert bound == zext.external_batch_bytes(n, positions)
+            # The request-aware sample-only helper remains <= the sample term.
+            assert zext.external_batch_live_bytes_per_position_frame(
                 rejection, combine
-            )
-            assert live <= bound * n * positions
-            assert bound <= coefficient
+            ) <= zext.EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+
+
+def test_equalize_peak_helper_bounds_the_component():
+    for channels in (1, 3):
+        assert zext.external_equalize_peak_bytes_per_pixel(
+            channels
+        ) <= zext.EQUALIZE_RGB_BYTES_PER_PIXEL
+    assert zext.external_equalize_peak_bytes_per_pixel(3) == 36
+
+
+@pytest.mark.parametrize("n_frames", [1, 2, 3])
+def test_low_n_external_reduction_matches_ram_stream(tmp_path, n_frames):
+    """Real low-N external reduction (quantile path) vs the RAM stream."""
+    from zemosaic.core.canonical_streaming import (
+        InMemoryCanonicalProvider,
+        run_canonical_stack_streaming,
+    )
+    from test_zegrid_m4_external_durability import _request as _m4_request
+
+    frames, masks = _low_n_corpus(n=n_frames)
+    request = _m4_request(frames, masks)
+    reference = run_canonical_stack_streaming(
+        InMemoryCanonicalProvider(frames, masks), request, tile_size=16
+    )
+    result = zext.run_cell_streaming_external(
+        InMemoryCanonicalProvider(frames, masks),
+        request,
+        tile_size=16,
+        column_batch=64,
+        spool_root=str(tmp_path),
+        cell_id="c",
+        attempt_id=f"low-n-{n_frames}",
+        owner_token="OWNER",
+        owner_record={"pid": 1},
+        cleanup_on_success=True,
+    )
+    for name in (
+        "science",
+        "estimator_weight_sum",
+        "valid_mask",
+        "surviving_sample_count",
+        "support_w1",
+        "support_w2",
+        "n_eff_support",
+    ):
+        np.testing.assert_array_equal(
+            getattr(result, name),
+            getattr(reference, name),
+            err_msg=f"n={n_frames} {name}",
+        )
 
 
 @pytest.mark.slow

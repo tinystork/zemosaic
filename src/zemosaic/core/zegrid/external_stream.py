@@ -89,6 +89,10 @@ __all__ = [
     "COLUMN_BATCH_MIN",
     "REDUCTION_BYTES_PER_POSITION_FRAME",
     "EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME",
+    "EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME",
+    "EXTERNAL_BATCH_FIXED_POSITION_BYTES",
+    "external_batch_bytes",
+    "external_equalize_peak_bytes_per_pixel",
     "EXTERNAL_BATCH_COMMON_BYTES_PER_POSITION_FRAME",
     "EXTERNAL_BATCH_REJECTION_BYTES_PER_POSITION_FRAME",
     "EXTERNAL_BATCH_COMBINE_BYTES_PER_POSITION_FRAME",
@@ -191,20 +195,64 @@ EXTERNAL_BATCH_WORST_BYTES_PER_POSITION_FRAME = (
     + max(EXTERNAL_BATCH_REJECTION_BYTES_PER_POSITION_FRAME.values())
     + max(EXTERNAL_BATCH_COMBINE_BYTES_PER_POSITION_FRAME.values())
 )  # 34 + 32 + 26 = 92
-#: The executable admission coefficient is the worst-case sum plus headroom
-#: for interpreter/allocator aliasing. It is an UPPER bound for every supported
-#: rejection/combine pair (see the direct-shape tests).
-EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME = 96
+#: N-SCALED batch bytes per (position x frame). This is the worst-case sum of
+#: the arrays shaped ``(n_frames, positions)`` plus headroom. It is an UPPER
+#: bound for every supported rejection/combine pair (direct-shape tests).
+EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME = 96
+#: FIXED batch bytes per position, independent of n_frames. The quantile,
+#: rejection and combine paths allocate many ``(positions,)`` arrays
+#: (counts/effective counts/indices/low/high/fractions/selected values/
+#: differences/results/conditions, interval bounds, active/degenerate masks).
+#: 512 B/position is a conservative UPPER bound for their simultaneous live set,
+#: including the quantile return/condition temporaries at low N.
+EXTERNAL_BATCH_FIXED_POSITION_BYTES = 512
+#: Backward-compatible name: the N-scaled component only. Admission MUST use
+#: ``external_batch_bytes`` / the two-part formula, never this alone.
+EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME = (
+    EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+)
+
+#: Equalization peak per patch pixel after the safe release of the mask/lum
+#: arrays before the final product (see canonical_equalize.py). Mask stage:
+#: out-of-place copy 12 (3 ch x 4) + finite/positive/and bools 9 + valid_rgb 1
+#: + luminance 8 + mask/where bools 4 = 34. Product stage: copy 12 + product 12
+#: + astype output 12 = 36. 48 is the conservative upper bound.
+EQUALIZE_RGB_BYTES_PER_PIXEL = 48
+
+
+def external_equalize_peak_bytes_per_pixel(channels: int = 3) -> int:
+    """Conservative equalization peak B/px for the released-lifetime sequence."""
+    c = int(channels)
+    if c < 1:
+        raise ExternalBudgetError(f"channels must be >= 1, got {channels!r}")
+    copy = 4 * c
+    mask_stage = copy + c + c + c + 1 + 8 + 4
+    product_stage = copy + 4 * c + 4 * c
+    return int(max(mask_stage, product_stage))
+
+
+def external_batch_bytes(n_frames: int, positions: int) -> int:
+    """Complete batch live-set bound: N-scaled + fixed per-position terms."""
+    n = int(n_frames)
+    pos = int(positions)
+    if n < 1 or pos < 1:
+        raise ExternalBudgetError(
+            f"external batch bytes require n_frames>=1 and positions>=1, got "
+            f"{n_frames!r}, {positions!r}"
+        )
+    return int(
+        pos
+        * (
+            n * EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+            + EXTERNAL_BATCH_FIXED_POSITION_BYTES
+        )
+    )
 
 #: Finalization working set per patch pixel. The bounded
 #: ``_compute_n_eff_bounded`` uses at most: n_eff/w1_sq f64 8 + sqrt f64 8 +
 #: safe f64 8 + overflow/valid/bad/finite/negative bools 5 = 29; 40 leaves
 #: headroom and covers the restore-shape copy for mono.
 FINALIZE_WORKING_BYTES_PER_PIXEL = 40
-#: ``equalize_rgb=True`` peak per patch pixel: out-of-place float32 copy 12
-#: (3 ch x 4) + finite/positive/and bools 9 + valid_rgb 1 + luminance 4 +
-#: mask/where bools 4 + product 12 + astype result 12 = 42; 48 is conservative.
-EQUALIZE_RGB_BYTES_PER_PIXEL = 48
 
 #: Backwards-compatible public name: the truthful column-batch workspace.
 REDUCTION_BYTES_PER_POSITION_FRAME = EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
@@ -1204,7 +1252,7 @@ def external_cell_host_components(
 
     rows, cols = batch_positions_for(req, iw, c)
     positions = rows * cols * c
-    batch = n * positions * EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+    batch = external_batch_bytes(n, positions)
 
     first_write = persistent + provider_window + write_tile
     # The previous tile's outputs stay referenced through the next write_tile.
@@ -1225,9 +1273,16 @@ def external_cell_host_components(
         "rows_per_batch": int(rows),
         "cols_per_batch": int(cols),
         "batch_positions": int(positions),
-        "batch_bytes_per_position_frame": int(
-            EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+        "batch_sample_bytes_per_position_frame": int(
+            EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
         ),
+        "batch_fixed_position_bytes": int(
+            EXTERNAL_BATCH_FIXED_POSITION_BYTES
+        ),
+        "batch_bytes_per_position_frame": int(
+            EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+        ),
+        "batch_total_bytes": int(batch),
         "persistent_result_bytes": int(persistent),
         "dense_rejection_mask_bytes": int(dense_rejection),
         "finalize_n_eff_output_bytes": int(
@@ -1302,7 +1357,7 @@ def estimate_external_working_set(
     max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in tiles)
     rows, cols = batch_positions_for(req, max_iw, c)
     positions = rows * cols * c
-    reduction_bytes = n * positions * REDUCTION_BYTES_PER_POSITION_FRAME
+    reduction_bytes = external_batch_bytes(n, positions)
 
     # Inherent O(tile_area) planes: per-tile outputs + support, plus the
     # interior rejection block for one tile (only when no bounded sink is used).
@@ -1342,7 +1397,13 @@ def estimate_external_working_set(
             "cols_per_batch": int(cols),
             "batch_positions": int(positions),
             "positions_per_row": int(_positions_per_row(max_iw, c)),
-            "bytes_per_position_frame": int(REDUCTION_BYTES_PER_POSITION_FRAME),
+            "bytes_per_position_frame": int(
+                EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME
+            ),
+            "fixed_position_bytes": int(
+                EXTERNAL_BATCH_FIXED_POSITION_BYTES
+            ),
+            "batch_total_bytes": int(reduction_bytes),
             "tile_output_temporaries_bytes": int(
                 host["reduce_tile_outputs_bytes"]
             ),
@@ -1383,6 +1444,7 @@ def largest_admissible_column_batch(
     interior_width: int,
     channels: int,
     floor_positions: int = COLUMN_BATCH_MIN,
+    fixed_position_bytes: int = 0,
 ) -> int:
     """Largest PIXEL-granular batch that fits ``budget_bytes``.
 
@@ -1399,18 +1461,30 @@ def largest_admissible_column_batch(
     a whole-row multiple (historical contiguous-slice behavior); below it, it
     stays a pixel multiple. Refuses when even ONE pixel (or
     ``floor_positions``, whichever is larger) does not fit.
+
+    ``fixed_position_bytes`` is the allocation-independent ``(positions,)``
+    term (quantile/rejection/combine temporaries). The per-position cost is
+    ``n_frames * sample_bytes + fixed_position_bytes``; a fixed per-sample
+    coefficient alone is NOT a valid inversion at low N.
     """
     budget = _require_int(budget_bytes, "budget_bytes", minimum=1)
     n = _require_int(n_frames, "n_frames", minimum=1)
     iw = _require_int(interior_width, "interior_width", minimum=1)
     c = _require_int(channels, "channels", minimum=1)
     floor = _require_int(floor_positions, "floor_positions", minimum=1)
+    fixed = _require_int(fixed_position_bytes, "fixed_position_bytes")
     unit = max(c, floor)  # one pixel == ``channels`` positions
-    per_position = n * REDUCTION_BYTES_PER_POSITION_FRAME
+    # COMPLETE two-part cost: N-scaled sample arrays + fixed per-position
+    # quantile/rejection/combine arrays. Never a fixed per-sample coefficient.
+    per_position = (
+        n * EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME + int(fixed)
+    )
     if budget < unit * per_position:
         raise ExternalBudgetError(
             f"budget {budget} B cannot hold the minimum batch of {unit} "
-            f"positions x {n} frames ({unit * per_position} B required)"
+            f"positions x {n} frames ({unit * per_position} B required: "
+            f"{n} x {EXTERNAL_BATCH_SAMPLE_BYTES_PER_POSITION_FRAME} B/sample "
+            f"+ {fixed} B/position fixed)"
         )
     positions = (budget // per_position // c) * c
     ppr = iw * c
